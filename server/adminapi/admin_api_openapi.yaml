@@ -281,31 +281,38 @@ components:
 
     CacheStats:
       type: object
+      description: "Statistics of this node's local body cache. The keys are Go field names."
       properties:
-        total_size:
+        TotalSizeBytes:
           type: integer
           format: int64
-          description: "Total size of items in cache (bytes)."
-        items:
+          description: "Total size of the cached objects (bytes)."
+          example: 524288000
+        ObjectCount:
           type: integer
           format: int64
-          description: "Number of items in cache."
-        hits:
+          description: "Number of cached objects."
+          example: 1523
+        Hits:
           type: integer
           format: int64
-        misses:
+          description: "Cache hits since the cache was opened."
+          example: 45678
+        Misses:
           type: integer
           format: int64
-        hit_rate:
+          description: "Cache misses since the cache was opened."
+          example: 3421
+        HitRatio:
           type: number
-          format: float
-        capacity:
+          format: double
+          description: "Hits / (Hits + Misses), from 0 to 1; 0 before the first lookup."
+          example: 0.93
+        Uptime:
           type: integer
           format: int64
-          description: "Total cache capacity (bytes)."
-        path:
-          type: string
-          description: "Path to the cache directory."
+          description: "Time since the cache was opened, in nanoseconds."
+          example: 86400000000000
 
     CacheMetricsRecord:
       type: object
@@ -495,6 +502,26 @@ components:
             total_credentials:
               type: integer
               example: 3
+
+    AccountCredential:
+      type: object
+      description: >-
+        One credential in GET /accounts/{email}/credentials. The keys are Go field names,
+        and the timestamps are Go's default time format in the server's time zone, not RFC 3339.
+      properties:
+        Address:
+          type: string
+          format: email
+          example: "user@example.com"
+        PrimaryIdentity:
+          type: boolean
+          example: true
+        CreatedAt:
+          type: string
+          example: "2026-11-14 10:31:58.184087 +0000 UTC"
+        UpdatedAt:
+          type: string
+          example: "2026-11-14 10:31:58.184087 +0000 UTC"
 
     DeletedMessage:
       type: object
@@ -755,6 +782,73 @@ components:
         - mailbox
         - owner
         - acls
+
+    BlockedEntry:
+      type: object
+      properties:
+        ip:
+          type: string
+          example: "192.0.2.10"
+        username:
+          type: string
+          description: "Blocked username; absent for an IP-only block."
+          example: "user@example.com"
+        blocked_until:
+          type: string
+          format: date-time
+        failure_count:
+          type: integer
+          example: 5
+        first_failure:
+          type: string
+          format: date-time
+        last_failure:
+          type: string
+          format: date-time
+        protocol:
+          type: string
+          description: >-
+            Label of the rate limiter that holds the block: IMAP, POP3, ManageSieve, IMAP-PROXY,
+            POP3-PROXY, SIEVE-PROXY or user-api. These are not the server types the protocol
+            query parameter takes.
+          example: "IMAP"
+        type:
+          type: string
+          enum: [ip_username, ip]
+          description: "ip_username blocks one username from one IP; ip blocks every login from the IP."
+
+    BackendHealthInfo:
+      type: object
+      properties:
+        address:
+          type: string
+          example: "192.0.2.10:143"
+        pool:
+          type: string
+          description: "Named pool the backend belongs to; absent for a flat remote_addrs list."
+          example: "sora1"
+        is_healthy:
+          type: boolean
+        failure_count:
+          type: integer
+        consecutive_fails:
+          type: integer
+        last_failure:
+          type: string
+          format: date-time
+          description: "0001-01-01T00:00:00Z if the backend never failed."
+        last_success:
+          type: string
+          format: date-time
+          description: "0001-01-01T00:00:00Z if no connection to the backend has succeeded yet."
+        health_check_enabled:
+          type: boolean
+        is_remote_lookup:
+          type: boolean
+          description: "True for a backend named by remote lookup rather than configured."
+        in_maintenance:
+          type: boolean
+          description: "True if this proxy honors maintenance for the backend."
 
 # Global security requirement
 security:
@@ -1476,6 +1570,51 @@ paths:
                 $ref: '#/components/schemas/Error'
 
   /accounts/{email}/credentials:
+    get:
+      tags:
+        - Account Management
+      summary: List an account's credentials
+      description: Lists every credential (address) of the account the address in the path belongs to, the primary one first.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          description: "Any address (primary or alias) of the account."
+          schema:
+            type: string
+            format: email
+      responses:
+        '200':
+          description: The account's credentials.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email:
+                    type: string
+                    format: email
+                    description: "The address from the path."
+                    example: "user@example.com"
+                  credentials:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AccountCredential'
+                  count:
+                    type: integer
+                    example: 2
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     post:
       tags:
         - Account Management
@@ -1959,6 +2098,94 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /affinity/list:
+    get:
+      tags:
+        - Affinity Management
+      summary: List all backend affinities (not implemented)
+      description: |
+        Not implemented: affinities are distributed via gossip and held in memory on each node.
+        Use GET /affinity with a user and protocol to read one affinity.
+      responses:
+        '501':
+          description: Listing is not implemented.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Affinity manager not enabled on this server.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /affinity/stats:
+    get:
+      tags:
+        - Affinity Management
+      summary: Get affinity manager statistics
+      description: Statistics of this node's affinity manager.
+      responses:
+        '200':
+          description: Affinity statistics.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stats:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                      total_entries:
+                        type: integer
+                        example: 847
+                      ttl:
+                        type: string
+                        description: "Affinity TTL as a Go duration string."
+                        example: "1h0m0s"
+                      cleanup_interval:
+                        type: string
+                        description: "Cleanup interval as a Go duration string."
+                        example: "10m0s"
+                      by_protocol:
+                        type: object
+                        description: "Number of affinity entries per protocol."
+                        additionalProperties:
+                          type: integer
+                        example:
+                          imap: 512
+                          pop3: 234
+                          managesieve: 101
+                      memory_usage:
+                        type: object
+                        properties:
+                          affinity_entries:
+                            type: integer
+                          broadcast_queue:
+                            type: integer
+                            description: "Gossip broadcasts waiting to be sent."
+                          broadcast_queue_max:
+                            type: integer
+                          queue_utilization:
+                            type: number
+                            format: double
+                            description: "broadcast_queue as a percentage of broadcast_queue_max."
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Affinity manager not enabled on this server.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /cache/stats:
     get:
       tags:
@@ -2183,6 +2410,88 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /auth/blocked:
+    get:
+      tags:
+        - System Monitoring
+      summary: List currently blocked addresses
+      description: Lists the IP and IP+username blocks currently held by this node's authentication rate limiters.
+      parameters:
+        - name: protocol
+          in: query
+          schema:
+            type: string
+          description: "Only the rate limiters of this server type (imap, imap_proxy, pop3, pop3_proxy, managesieve, managesieve_proxy, userapi)."
+          example: "imap"
+      responses:
+        '200':
+          description: Blocked entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  blocked_entries:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/BlockedEntry'
+                  count:
+                    type: integer
+
+  /auth-cache/stats:
+    get:
+      tags:
+        - System Monitoring
+      summary: Get authentication cache statistics
+      description: Statistics of this node's proxy authentication cache ([auth_cache]).
+      responses:
+        '200':
+          description: |
+            Auth cache statistics, or only enabled=false and a note when the auth cache is not enabled on this node.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                  note:
+                    type: string
+                    description: "Present only when enabled is false."
+                    example: "Auth cache is not enabled. Enable it in [auth_cache] config section."
+                  total_entries:
+                    type: integer
+                    format: int64
+                    example: 1523
+                  session_hits:
+                    type: integer
+                    format: int64
+                    description: "Hits since this node started."
+                    example: 45230
+                  session_misses:
+                    type: integer
+                    format: int64
+                    description: "Misses since this node started."
+                    example: 1523
+                  hit_rate_percent:
+                    type: number
+                    format: double
+                    description: "session_hits as a percentage of session hits and misses."
+                    example: 96.74
+                  lifetime_hit_count:
+                    type: integer
+                    format: int64
+                    description: "Sum of the hit counts stored with the cached entries."
+                    example: 892451
+                required:
+                  - enabled
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /health/overview:
     get:
       tags:
@@ -2310,6 +2619,37 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+
+  /proxy/backends:
+    get:
+      tags:
+        - Health Monitoring
+      summary: Get proxy backend health
+      description: Backend health as seen by each proxy server on this node. proxies is empty on a node without proxy servers.
+      responses:
+        '200':
+          description: Backend health per proxy server.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  proxies:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        proxy_name:
+                          type: string
+                          description: "Protocol and server name, e.g. IMAP-imap-proxy, POP3-..., ManageSieve-..., LMTP-..., UserAPI-..."
+                          example: "IMAP-imap-proxy"
+                        backends:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/BackendHealthInfo'
+                  timestamp:
+                    type: string
+                    format: date-time
 
   /config:
     get:

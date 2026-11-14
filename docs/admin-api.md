@@ -585,18 +585,17 @@ Monitor and manage the local filesystem cache for message bodies.
 
 **Endpoint:** `GET /admin/cache/stats`
 
-Get current cache statistics including size, items, and hit/miss ratios.
+Get this node's cache statistics: size, object count, and hits/misses since the cache was opened. The keys are Go field names; `HitRatio` is from 0 to 1 and `Uptime` is in nanoseconds.
 
 **Response:** `200 OK`
 ```json
 {
-  "total_size": 524288000,
-  "items": 1523,
-  "hits": 45678,
-  "misses": 3421,
-  "hit_rate": 0.93,
-  "capacity": 1073741824,
-  "path": "/var/sora/cache"
+  "TotalSizeBytes": 524288000,
+  "ObjectCount": 1523,
+  "Hits": 45678,
+  "Misses": 3421,
+  "HitRatio": 0.93,
+  "Uptime": 86400000000000
 }
 ```
 
@@ -642,12 +641,20 @@ Clear the entire cache. Returns statistics before and after purge.
 {
   "message": "Cache purged successfully",
   "stats_before": {
-    "total_size": 524288000,
-    "items": 1523
+    "TotalSizeBytes": 524288000,
+    "ObjectCount": 1523,
+    "Hits": 45678,
+    "Misses": 3421,
+    "HitRatio": 0.93,
+    "Uptime": 86400000000000
   },
   "stats_after": {
-    "total_size": 0,
-    "items": 0
+    "TotalSizeBytes": 0,
+    "ObjectCount": 0,
+    "Hits": 45678,
+    "Misses": 3421,
+    "HitRatio": 0.93,
+    "Uptime": 86400000000000
   }
 }
 ```
