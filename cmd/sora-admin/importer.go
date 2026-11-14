@@ -2605,10 +2605,12 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 			// Interrupted: the database calls failed on the cancelled context. What
 			// the batch did not store is not a failure: its cache rows stay unmarked,
 			// pending for the next run, and importMessages reports the interruption.
+			// The batch returns the interruption, not the error of the call it cut
+			// short ("account not found: ... context canceled").
 			atomic.AddInt64(&i.importedMessages, int64(len(successHashes)))
 			logger.Info("Import interrupted, rest of the batch left for the next run",
 				"imported", len(successHashes), "batch_size", len(batch))
-			return err
+			return i.ctx.Err()
 		}
 		logger.Error("Batch processing failed", "error", err)
 		// Everything in uploaded that wasn't successfully inserted is already tracked if individual mode
@@ -2763,9 +2765,10 @@ func (i *Importer) importMessages() error {
 
 		batch = append(batch, msg)
 
-		// Process when batch is full
+		// Process when batch is full. A batch the interrupt ended has logged it
+		// already, and an interrupt is not a batch error.
 		if len(batch) >= i.batchSize {
-			if err := i.processBatch(batch); err != nil {
+			if err := i.processBatch(batch); err != nil && i.ctx.Err() == nil {
 				logger.Warn("Batch processing had errors", "error", err)
 			}
 			batch = batch[:0] // Reset batch
@@ -2774,7 +2777,7 @@ func (i *Importer) importMessages() error {
 
 	// Process remaining messages
 	if len(batch) > 0 {
-		if err := i.processBatch(batch); err != nil {
+		if err := i.processBatch(batch); err != nil && i.ctx.Err() == nil {
 			logger.Warn("Final batch had errors", "error", err)
 		}
 	}
