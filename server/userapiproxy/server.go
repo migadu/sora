@@ -519,11 +519,17 @@ func (s *Server) setupHandler() http.Handler {
 
 		// Auth endpoints and CORS preflights carry no JWT. A login names its user in the
 		// body and a refresh carries the user's token, so both are routed like any other
-		// request for that user: the account lives on a backend of the user's pool. A
-		// request that names nobody, such as a preflight, goes to the default pool by path
-		// hash, as before pools; without a default pool it is refused. The backend handles
-		// rate limiting, and answers a preflight with its CORS policy (allowed_origins).
-		route, err := s.routeAuthRequest(r)
+		// request for that user: the account lives on a backend of the user's pool. An
+		// auth request that names nobody goes to the default pool by path hash, as before
+		// pools; without a default pool it is refused. The backend handles rate limiting.
+		// A preflight names nobody and reaches no account: see routePreflight.
+		var route backendRoute
+		var err error
+		if isCORSPreflight(r) {
+			route, err = s.routePreflight(r)
+		} else {
+			route, err = s.routeAuthRequest(r)
+		}
 		if err != nil {
 			if errors.Is(err, errAuthBodyTooLarge) {
 				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
@@ -546,6 +552,36 @@ func (s *Server) setupHandler() http.Handler {
 // account, as it does when it is reached directly.
 func isCORSPreflight(r *http.Request) bool {
 	return r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != ""
+}
+
+// routePreflight picks the backend that answers a CORS preflight. A preflight names no
+// user, and a backend answers it in its CORS middleware (with its allowed_origins) before
+// any handler, so it reaches no account. Unlike a request that names a user it is
+// therefore not confined to one pool: it goes to the default pool (the one pool of a flat
+// remote_addrs list), and failing that (no default pool, or no backend of it available)
+// to the first pool in configuration order with a backend available. Which pool answers
+// decides whose allowed_origins applies, so every pool's backends should share them.
+func (s *Server) routePreflight(r *http.Request) (backendRoute, error) {
+	tried := ""
+	if pool, err := s.connManager.ResolvePool(""); err == nil {
+		if addr := s.connManager.GetBackendByConsistentHashInPool(pool.Name, r.URL.Path); addr != "" {
+			return s.poolRoute(addr, pool), nil
+		}
+		tried = pool.Name
+	}
+	for _, name := range s.connManager.PoolNames() {
+		if name == tried {
+			continue
+		}
+		pool, err := s.connManager.ResolvePool(name)
+		if err != nil {
+			continue // refused while its backends collide with another pool's
+		}
+		if addr := s.connManager.GetBackendByConsistentHashInPool(name, r.URL.Path); addr != "" {
+			return s.poolRoute(addr, pool), nil
+		}
+	}
+	return backendRoute{}, fmt.Errorf("no backend available for a CORS preflight")
 }
 
 // maxAuthBodyBytes bounds how much of an auth request body the proxy reads to find the
