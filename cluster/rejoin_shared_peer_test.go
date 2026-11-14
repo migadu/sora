@@ -8,6 +8,8 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/migadu/sora/config"
 )
 
 // TestSharedPeerEntryRejoinsLatePeer covers a peers entry that resolves to this
@@ -35,17 +37,29 @@ func TestSharedPeerEntryRejoinsLatePeer(t *testing.T) {
 	node := startMembershipTestNode(t, "shared-v4", fmt.Sprintf("127.0.0.1:%d", port), []string{fmt.Sprintf("localhost:%d", port)})
 	time.Sleep(150 * time.Millisecond)
 
-	latePeer := startMembershipTestNode(t, "shared-v6", fmt.Sprintf("[::1]:%d", port), nil)
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(node.GetMembers()) == 2 && len(latePeer.GetMembers()) == 2 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	latePeer, err := New(config.ClusterConfig{Enabled: true, Addr: fmt.Sprintf("[::1]:%d", port), NodeID: "shared-v6", SecretKey: membershipTestKey})
+	if err != nil {
+		t.Fatalf("start late peer: %v", err)
 	}
-	t.Fatalf("shared peer entry never joined late peer: node=%+v, latePeer=%+v",
-		node.GetMembers(), latePeer.GetMembers())
+	t.Cleanup(func() {
+		if latePeer != nil {
+			_ = latePeer.Shutdown()
+		}
+	})
+	waitForMemberCount(t, 2*time.Second, 2, node, latePeer)
+
+	// Once the entry has been satisfied and cached, a departed peer must still
+	// be joined again when it restarts without a peers list of its own.
+	err = latePeer.Shutdown()
+	latePeer = nil // Shutdown calls memberlist.Leave, which cannot run twice.
+	if err != nil {
+		t.Fatalf("stop late peer: %v", err)
+	}
+	// Allow memberlist's normal suspicion timeout to expire: these nodes bind
+	// different address families, so the leave broadcast cannot travel over UDP.
+	waitForMemberCount(t, 10*time.Second, 1, node)
+	restarted := startMembershipTestNode(t, "shared-v6", fmt.Sprintf("[::1]:%d", port), nil)
+	waitForMemberCount(t, 2*time.Second, 2, node, restarted)
 }
 
 func TestPeerSatisfiedAndMissingAddrs(t *testing.T) {
@@ -87,4 +101,3 @@ func TestPeerSatisfiedAndMissingAddrs(t *testing.T) {
 		t.Fatal("dual-stack single peer joined on IPv4 should be treated as satisfied")
 	}
 }
-
