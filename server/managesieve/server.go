@@ -906,6 +906,12 @@ func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password 
 	// Fetch credentials from database (no caching - we handle that here)
 	accountID, hashedPassword, err := s.rdb.GetCredentialForAuthWithRetry(ctx, address)
 	if err != nil {
+		if serverPkg.IsTemporaryAuthFailure(err) {
+			// The database could not be asked: no verdict on the credentials, so nothing
+			// is cached and the login is answered as a temporary failure.
+			logger.Warn("authentication unavailable", "address", address, "method", "main_db", "error", err)
+			return 0, err
+		}
 		// Equalize response timing with the wrong-password path (which runs bcrypt) so an
 		// attacker can't use response time to tell whether the account exists. (security-audit M14)
 		if errors.Is(err, consts.ErrUserNotFound) {

@@ -1002,6 +1002,8 @@ trusted_networks = []
 # - user_api_proxy: User API proxy server for load balancing
 #
 # IMPORTANT: You must configure at least one server for Sora to start.
+# Every [[server]] block needs type, name and addr; a block missing one stops
+# startup. To keep a block in the file without starting it, add enabled = false.
 
 # IMAP SERVER EXAMPLE
 # =============================================================================
@@ -1702,6 +1704,10 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 #
 # The remote_lookup service is called via HTTP GET with email interpolation.
 # The URL can contain $email placeholder which is replaced with the URL-encoded email address.
+# $ip is replaced with the client's IP address: the source of the PROXY header when the proxy
+# receives one, else the connecting peer. On lmtp_proxy the client is the delivering MTA.
+# A URL containing $ip bypasses the proxy's lookup cache: verdicts and routes may differ
+# between networks, while the cache is keyed by user. Other URLs keep the configured TTLs.
 #
 # Example URLs:
 #   "http://localhost:8080/lookup?email=$email" → GET /lookup?email=user@domain.com
@@ -1901,7 +1907,7 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # failure_ratio = 0.6             # Failure ratio threshold to open circuit (0.0-1.0, default: 0.6 = 60%)
                                     # Circuit opens when this percentage of recent requests fail
                                     # Production: Consider 0.7-0.8 for less sensitive triggering
-  # min_requests = 3                # Minimum requests before evaluating failure ratio (default: 3)
+  # min_requests = 3                # Minimum completed requests before evaluating failure ratio (default: 3)
                                     # Prevents opening circuit on very few requests
                                     # IMPORTANT: Should be ≤ max_requests to avoid getting stuck
                                     # Production: Consider 5-10 for more stable thresholds

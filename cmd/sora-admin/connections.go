@@ -240,7 +240,7 @@ Examples:
 	// Find admin API server config
 	var adminAPIAddr, adminAPIKey string
 	for _, server := range globalConfig.DynamicServers {
-		if server.Type == "http_admin_api" {
+		if server.Type == "http_admin_api" && server.IsEnabled() {
 			adminAPIAddr = server.Addr
 			adminAPIKey = server.APIKey
 			break
@@ -313,7 +313,7 @@ Examples:
 	// Find admin API server config
 	var adminAPIAddr, adminAPIKey string
 	for _, server := range globalConfig.DynamicServers {
-		if server.Type == "http_admin_api" {
+		if server.Type == "http_admin_api" && server.IsEnabled() {
 			adminAPIAddr = server.Addr
 			adminAPIKey = server.APIKey
 			break
@@ -391,7 +391,7 @@ Examples:
 	// Find admin API server config
 	var adminAPIAddr, adminAPIKey string
 	for _, server := range globalConfig.DynamicServers {
-		if server.Type == "http_admin_api" {
+		if server.Type == "http_admin_api" && server.IsEnabled() {
 			adminAPIAddr = server.Addr
 			adminAPIKey = server.APIKey
 			break

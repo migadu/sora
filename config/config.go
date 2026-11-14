@@ -584,10 +584,9 @@ type AuthRateLimiterConfig struct {
 // multiplier. Zero means "use the default" (see applyAuthRateLimitDefaults); a negative
 // value has no meaning, and the limiter does not read it consistently
 // (max_attempts_per_ip = -1 blocked an address at its first failure on one path and
-// disabled the IP block on another). TOML accepts nan and inf, which pass a sign check;
-// the limiter converts the multiplied delay to a time.Duration before capping it at
-// max_delay, and that conversion is platform-dependent for them (on amd64 +Inf becomes
-// a negative delay, which switches progressive delays off).
+// disabled the IP block on another). TOML accepts nan and inf, which pass a sign check
+// but are no growth factor. Any finite multiplier is safe: the limiter caps the
+// product at max_delay before converting it to a time.Duration.
 func (c *AuthRateLimiterConfig) Validate() error {
 	v := reflect.ValueOf(c).Elem()
 	for i := 0; i < v.NumField(); i++ {
@@ -787,7 +786,7 @@ type RemoteLookupCircuitBreakerConfig struct {
 	Interval     string  `toml:"interval"`      // Time before resetting failure counts in closed state (default: "0s" - never reset)
 	Timeout      string  `toml:"timeout"`       // Time before transitioning from open to half-open (default: "30s")
 	FailureRatio float64 `toml:"failure_ratio"` // Failure ratio threshold to open circuit (0.0-1.0, default: 0.6)
-	MinRequests  int     `toml:"min_requests"`  // Minimum requests before evaluating failure ratio (default: 3)
+	MinRequests  int     `toml:"min_requests"`  // Minimum completed requests before evaluating failure ratio (default: 3)
 }
 
 // RemoteLookupTransportConfig holds HTTP transport configuration for remote_lookup connection pooling and timeouts
@@ -865,7 +864,7 @@ func (c *RemoteLookupCircuitBreakerConfig) GetFailureRatio() float64 {
 	return c.FailureRatio
 }
 
-// GetMinRequests returns the minimum requests before evaluating failure ratio
+// GetMinRequests returns the minimum completed requests before evaluating failure ratio
 func (c *RemoteLookupCircuitBreakerConfig) GetMinRequests() uint32 {
 	if c.MinRequests <= 0 {
 		return 3 // Default: 3 requests
@@ -1063,6 +1062,9 @@ type ServerConfig struct {
 	Type string `toml:"type"`
 	Name string `toml:"name"`
 	Addr string `toml:"addr"`
+	// Enabled = false keeps the block in the file without starting or validating it.
+	// nil (absent) or true starts it. See IsEnabled.
+	Enabled *bool `toml:"enabled,omitempty"`
 
 	// Common server options
 	TLS              bool   `toml:"tls,omitempty"`
@@ -2306,10 +2308,15 @@ func (c *UploaderConfig) GetRetryIntervalWithDefault() time.Duration {
 	return interval
 }
 
-// IsEnabled checks if a server should be started based on its configuration
+// IsEnabled reports whether the block is to be started: every [[server]] block is,
+// unless it says enabled = false. An enabled block must pass Validate, which requires
+// type, name and addr; a block missing one is an error, never skipped.
 func (s *ServerConfig) IsEnabled() bool {
-	return s.Type != "" && s.Name != "" && s.Addr != ""
+	return s.Enabled == nil || *s.Enabled
 }
+
+// ServerTypes are the [[server]] types the configuration accepts.
+var ServerTypes = []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "metrics", "http_admin_api", "http_user_api", "user_api_proxy"}
 
 // ValidateServerConfig validates a server configuration
 func (s *ServerConfig) Validate() error {
@@ -2317,22 +2324,21 @@ func (s *ServerConfig) Validate() error {
 		return fmt.Errorf("server type is required")
 	}
 	if s.Name == "" {
-		return fmt.Errorf("server name is required")
+		return fmt.Errorf("server name is required (type %q, addr %q)", s.Type, s.Addr)
 	}
 	if s.Addr == "" {
-		return fmt.Errorf("server address is required")
+		return fmt.Errorf("server address is required; set enabled = false to keep a [[server]] block without starting it")
 	}
 
-	validTypes := []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "metrics", "http_admin_api", "http_user_api", "user_api_proxy"}
 	isValidType := false
-	for _, validType := range validTypes {
+	for _, validType := range ServerTypes {
 		if s.Type == validType {
 			isValidType = true
 			break
 		}
 	}
 	if !isValidType {
-		return fmt.Errorf("invalid server type '%s', must be one of: %s", s.Type, strings.Join(validTypes, ", "))
+		return fmt.Errorf("invalid server type '%s', must be one of: %s", s.Type, strings.Join(ServerTypes, ", "))
 	}
 
 	// Master credentials: a configured master username with an EMPTY master
@@ -2533,10 +2539,15 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		if s.Type == "metrics" && s.TLS {
 			logger("WARNING: Server %s (type: metrics) has 'tls' configured, but the metrics endpoint is always served over plain HTTP; terminate TLS in front of it and restrict access with 'allowed_hosts'/'api_key'", s.Name)
 		}
+		if s.Type == "metrics" && s.ProxyProtocol {
+			logger("WARNING: Server %s (type: metrics) has 'proxy_protocol' configured, but the metrics endpoint does not read PROXY protocol headers; it is ignored, and 'allowed_hosts' matches the connecting host", s.Name)
+		}
 	}
 }
 
-// GetAllServers returns all configured servers from the dynamic configuration
+// GetAllServers returns every [[server]] block that does not say enabled = false,
+// complete or not: the callers validate each one, so a block missing type, name or
+// addr is reported instead of being dropped.
 func (c *Config) GetAllServers() []ServerConfig {
 	var allServers []ServerConfig
 
@@ -2560,7 +2571,9 @@ func (c *Config) ProxyProtocolListenersMissingTrust() []string {
 	}
 	var names []string
 	for _, s := range c.GetAllServers() {
-		if s.ProxyProtocol {
+		// The metrics endpoint does not read PROXY headers (its proxy_protocol is warned
+		// about and ignored), so no peer can spoof a client IP through it.
+		if s.ProxyProtocol && s.Type != "metrics" {
 			names = append(names, s.Name)
 		}
 	}

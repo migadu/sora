@@ -279,64 +279,20 @@ func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, en
 func NewResilientDatabaseWithOptions(ctx context.Context, config *config.DatabaseConfig, enableHealthCheck bool, runMigrations bool, skipReadReplicas bool) (*ResilientDatabase, error) {
 	// Create circuit breakers
 	querySettings := circuitbreaker.DefaultSettings("database_query")
-	querySettings.MaxRequests = 10 // Allow more test requests in half-open state for faster recovery
+	querySettings.MaxRequests = databaseBreakerMaxRequests
 	querySettings.Interval = 15 * time.Second
 	querySettings.Timeout = 45 * time.Second
-	querySettings.ReadyToTrip = func(counts circuitbreaker.Counts) bool {
-		failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-
-		// In half-open state, if we've used all allowed requests and majority failed, trip immediately
-		// This prevents deadlock where circuit stays half-open forever
-		if counts.Requests >= querySettings.MaxRequests && failureRatio >= 0.6 {
-			logger.Warn("Query circuit breaker ready to trip (half-open exhausted)", "component", "RESILIENT-FAILOVER",
-				"requests", counts.Requests, "failures", counts.TotalFailures,
-				"failure_ratio", fmt.Sprintf("%.2f%%", failureRatio*100),
-				"max_requests", querySettings.MaxRequests)
-			return true
-		}
-
-		// In normal operation, require at least 8 requests to establish a pattern
-		shouldTrip := counts.Requests >= 8 && failureRatio >= 0.6
-		if shouldTrip {
-			logger.Warn("Query circuit breaker ready to trip", "component", "RESILIENT-FAILOVER",
-				"requests", counts.Requests, "failures", counts.TotalFailures,
-				"failure_ratio", fmt.Sprintf("%.2f%%", failureRatio*100),
-				"consecutive_failures", counts.ConsecutiveFailures)
-		}
-		return shouldTrip
-	}
+	querySettings.ReadyToTrip = queryBreakerReadyToTrip
 	querySettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Info("Database query circuit breaker state changed", "component", "RESILIENT-FAILOVER", "name", name, "from", from, "to", to)
 	}
 	querySettings.IsSuccessful = isBreakerSuccess
 
 	writeSettings := circuitbreaker.DefaultSettings("database_write")
-	writeSettings.MaxRequests = 10 // Allow more test requests in half-open state for faster recovery
+	writeSettings.MaxRequests = databaseBreakerMaxRequests
 	writeSettings.Interval = 10 * time.Second
 	writeSettings.Timeout = 30 * time.Second
-	writeSettings.ReadyToTrip = func(counts circuitbreaker.Counts) bool {
-		failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-
-		// In half-open state, if we've used all allowed requests and majority failed, trip immediately
-		// This prevents deadlock where circuit stays half-open forever
-		if counts.Requests >= writeSettings.MaxRequests && failureRatio >= 0.5 {
-			logger.Warn("Write circuit breaker ready to trip (half-open exhausted)", "component", "RESILIENT-FAILOVER",
-				"requests", counts.Requests, "failures", counts.TotalFailures,
-				"failure_ratio", fmt.Sprintf("%.2f%%", failureRatio*100),
-				"max_requests", writeSettings.MaxRequests)
-			return true
-		}
-
-		// In normal operation, require at least 5 requests to establish a pattern
-		shouldTrip := counts.Requests >= 5 && failureRatio >= 0.5
-		if shouldTrip {
-			logger.Warn("Write circuit breaker ready to trip", "component", "RESILIENT-FAILOVER",
-				"requests", counts.Requests, "failures", counts.TotalFailures,
-				"failure_ratio", fmt.Sprintf("%.2f%%", failureRatio*100),
-				"consecutive_failures", counts.ConsecutiveFailures)
-		}
-		return shouldTrip
-	}
+	writeSettings.ReadyToTrip = writeBreakerReadyToTrip
 	writeSettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Info("Database write circuit breaker state changed", "component", "RESILIENT-FAILOVER", "name", name, "from", from, "to", to)
 	}
@@ -377,6 +333,62 @@ func NewResilientDatabaseWithOptions(ctx context.Context, config *config.Databas
 	}
 
 	return rdb, nil
+}
+
+// databaseBreakerMaxRequests is how many test requests the database circuit breakers let
+// through while half-open: more than the default, for faster recovery.
+const databaseBreakerMaxRequests = 10
+
+// queryBreakerReadyToTrip decides when the database query circuit breaker opens.
+func queryBreakerReadyToTrip(counts circuitbreaker.Counts) bool {
+	results := counts.Results()
+	failureRatio := float64(counts.TotalFailures) / float64(results)
+
+	// In half-open state, if we've used all allowed requests and majority failed, trip immediately
+	// This prevents deadlock where circuit stays half-open forever
+	if results >= databaseBreakerMaxRequests && failureRatio >= 0.6 {
+		logger.Warn("Query circuit breaker ready to trip (half-open exhausted)", "component", "RESILIENT-FAILOVER",
+			"requests", counts.Requests, "results", results, "failures", counts.TotalFailures,
+			"failure_ratio", fmt.Sprintf("%.2f%%", failureRatio*100),
+			"max_requests", databaseBreakerMaxRequests)
+		return true
+	}
+
+	// In normal operation, require at least 8 results to establish a pattern
+	shouldTrip := results >= 8 && failureRatio >= 0.6
+	if shouldTrip {
+		logger.Warn("Query circuit breaker ready to trip", "component", "RESILIENT-FAILOVER",
+			"requests", counts.Requests, "results", results, "failures", counts.TotalFailures,
+			"failure_ratio", fmt.Sprintf("%.2f%%", failureRatio*100),
+			"consecutive_failures", counts.ConsecutiveFailures)
+	}
+	return shouldTrip
+}
+
+// writeBreakerReadyToTrip decides when the database write circuit breaker opens.
+func writeBreakerReadyToTrip(counts circuitbreaker.Counts) bool {
+	results := counts.Results()
+	failureRatio := float64(counts.TotalFailures) / float64(results)
+
+	// In half-open state, if we've used all allowed requests and majority failed, trip immediately
+	// This prevents deadlock where circuit stays half-open forever
+	if results >= databaseBreakerMaxRequests && failureRatio >= 0.5 {
+		logger.Warn("Write circuit breaker ready to trip (half-open exhausted)", "component", "RESILIENT-FAILOVER",
+			"requests", counts.Requests, "results", results, "failures", counts.TotalFailures,
+			"failure_ratio", fmt.Sprintf("%.2f%%", failureRatio*100),
+			"max_requests", databaseBreakerMaxRequests)
+		return true
+	}
+
+	// In normal operation, require at least 5 results to establish a pattern
+	shouldTrip := results >= 5 && failureRatio >= 0.5
+	if shouldTrip {
+		logger.Warn("Write circuit breaker ready to trip", "component", "RESILIENT-FAILOVER",
+			"requests", counts.Requests, "results", results, "failures", counts.TotalFailures,
+			"failure_ratio", fmt.Sprintf("%.2f%%", failureRatio*100),
+			"consecutive_failures", counts.ConsecutiveFailures)
+	}
+	return shouldTrip
 }
 
 // timeoutType defines the type of database operation.

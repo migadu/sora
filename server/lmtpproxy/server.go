@@ -279,7 +279,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		lookupCacheConfig = &defaultConfig
 	}
 
-	if lookupCacheConfig.Enabled {
+	if lookupCacheConfig.Enabled && !proxy.RemoteLookupUsesClientIP(opts.RemoteLookup) {
 		positiveTTL, err := lookupCacheConfig.GetPositiveTTL()
 		if err != nil {
 			logger.Info("LMTP Proxy: Invalid positive TTL in auth cache config, using default (5m)", "name", opts.Name, "error", err)

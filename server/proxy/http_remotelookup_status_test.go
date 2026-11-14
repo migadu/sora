@@ -64,7 +64,7 @@ func TestRoutingLookupRefusalIsNotUserNotFound(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			info, err := flat.LookupUserRoute(context.Background(), "anna@example.com")
+			info, err := flat.LookupUserRoute(context.Background(), "anna@example.com", "")
 			if !errors.Is(err, ErrRemoteLookupTransient) {
 				t.Errorf("LookupUserRoute after a %d: info %+v, err %v; want ErrRemoteLookupTransient, not user-not-found", status, info, err)
 			}
