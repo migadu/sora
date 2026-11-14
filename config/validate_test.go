@@ -87,6 +87,15 @@ func TestConfigValidate(t *testing.T) {
 		{name: "cluster secret_key of 16 bytes", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"MDEyMzQ1Njc4OWFiY2RlZg==\"\n" + imapBackend,
 			want: []problem{{"[cluster]", "cluster secret_key must be 32 bytes (got 16 bytes)"}}},
 		{name: "cluster disabled is not checked", content: "[cluster]\nenabled = false\naddr = \"0.0.0.0:7946\"\n" + imapBackend},
+		// memberlist cannot bind these either, and start-up stopped there only once the
+		// database and S3 were up. Port 0 binds a free port, which memberlist advertises.
+		{name: "cluster dynamic port", content: cluster + "addr = \"10.10.10.40:0\"\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend},
+		{name: "cluster port in addr out of range", content: cluster + "addr = \"10.10.10.40:70000\"\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend,
+			want: []problem{{"[cluster]", "cluster port 70000 is not a valid port"}}},
+		{name: "cluster negative port in addr", content: cluster + "addr = \"10.10.10.40:-1\"\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend,
+			want: []problem{{"[cluster]", "cluster port -1 is not a valid port"}}},
+		{name: "cluster port field out of range", content: cluster + "addr = \"10.10.10.40\"\nport = 70000\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend,
+			want: []problem{{"[cluster]", "cluster port 70000 is not a valid port"}}},
 		{name: "every problem, in order", content: "[servers]\ntrusted_networks = []\n\n[relay]\ntype = \"SMTP\"\n\n[uploader]\nbatch_size = 0\n" +
 			imapBackend + "proxy_protocol = true\n" + imapBackend,
 			want: []problem{
@@ -132,9 +141,13 @@ func TestConfigValidateDatabaseAndS3(t *testing.T) {
 		want    []problem
 	}{
 		{name: "mail backend", content: db + s3 + imapBackend},
-		{name: "mail backend with a read endpoint only", content: "[database.read]\nhosts = [\"db.example.com\"]\n\n" + s3 + imapBackend},
+		{name: "mail backend with write and read endpoints", content: db + "[database.read]\nhosts = [\"replica.example.com\"]\n\n" + s3 + imapBackend},
+		// Every server that queries the database writes to it: start-up connects the read
+		// endpoint and then stops with "no healthy database pools available".
+		{name: "mail backend with a read endpoint only", content: "[database.read]\nhosts = [\"db.example.com\"]\n\n" + s3 + imapBackend,
+			want: []problem{{"[database]", `server "imap" (imap) needs the database, but it is not configured in [database.write]`}}},
 		{name: "mail backend without a database", content: s3 + imapBackend,
-			want: []problem{{"[database]", `server "imap" (imap) needs the database, but it is not configured in [database.write] or [database.read]`}}},
+			want: []problem{{"[database]", `server "imap" (imap) needs the database, but it is not configured in [database.write]`}}},
 		{name: "database endpoint without hosts", content: "[database.write]\nhosts = []\n\n" + s3 + imapBackend,
 			want: []problem{{"[database]", `server "imap" (imap) needs the database`}}},
 		{name: "mail backend without S3", content: db + imapBackend,

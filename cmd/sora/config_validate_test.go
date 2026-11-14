@@ -81,6 +81,19 @@ func TestStartupChecksTheWholeFile(t *testing.T) {
 			content: storageTOML + imapBackend,
 		},
 		{
+			// The database connection needs a write host: with [database.read] alone,
+			// start-up connected the replica and then stopped with "no healthy database
+			// pools available".
+			name:    "managesieve with a read endpoint only",
+			content: "[database.read]\nhosts = [\"db.example.com\"]\n\n[[server]]\ntype = \"managesieve\"\nname = \"sieve\"\naddr = \"127.0.0.1:4190\"\n",
+			wantErr: []string{`invalid configuration - [database]: server "sieve" (managesieve) needs the database, but it is not configured in [database.write]`},
+		},
+		{
+			name:    "cluster port out of range",
+			content: "[cluster]\nenabled = true\naddr = \"10.10.10.40:70000\"\nsecret_key = \"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\"\n" + metrics,
+			wantErr: []string{"invalid configuration - [cluster]: cluster port 70000 is not a valid port"},
+		},
+		{
 			name: "every problem reported",
 			content: "[servers]\ntrusted_networks = []\n\n[relay]\ntype = \"SMTP\"\nsmtp_host = \"smtp.example.com:587\"\n" +
 				"\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\nproxy_protocol = true\n" +
