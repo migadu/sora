@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/affinitycache"
 	"github.com/migadu/sora/authcache"
 	"github.com/migadu/sora/cache"
@@ -171,10 +172,6 @@ func main() {
 
 	// Load and validate configuration
 	loadAndValidateConfig(*configPath, &cfg, errorHandler)
-
-	// Clean up default database config if user explicitly set empty sections
-	// This allows proxy-only mode without database
-	cleanupDatabaseDefaults(&cfg)
 
 	// Apply the configured bcrypt cost (clamped) for password hashing/rehash.
 	db.SetBcryptCost(cfg.GetBcryptCost())
@@ -340,27 +337,18 @@ func main() {
 	}
 }
 
-// cleanupDatabaseDefaults clears default database config if the TOML explicitly has empty sections
-// This allows proxy-only deployments without database
-func cleanupDatabaseDefaults(cfg *config.Config) {
-	// If database.write section exists but has default "localhost", clear it
-	// This happens when user has [database.write] but no hosts specified
-	if cfg.Database.Write != nil {
-		if len(cfg.Database.Write.Hosts) == 1 && cfg.Database.Write.Hosts[0] == "localhost" &&
-			cfg.Database.Write.User == "postgres" && cfg.Database.Write.Name == "sora_mail_db" {
-			// This looks like unmodified defaults - user probably wants no database
-			logger.Debug("Detected default database.write config - clearing for proxy-only mode")
-			cfg.Database.Write = nil
-		}
+// dropUndefinedDatabaseEndpoints unsets the [database.write] and [database.read]
+// endpoints the config file does not define, so a node without them (a proxy) runs
+// without a database. NewDefaultConfig seeds both endpoints only so that a table in the
+// file takes the defaults for the keys it leaves out. Whether a table is in the file is
+// read from the TOML metadata, never from its values: a table that names localhost,
+// postgres and sora_mail_db is a database the node must use.
+func dropUndefinedDatabaseEndpoints(cfg *config.Config, md toml.MetaData) {
+	if !md.IsDefined("database", "write") {
+		cfg.Database.Write = nil
 	}
-
-	// Same for read config
-	if cfg.Database.Read != nil {
-		if len(cfg.Database.Read.Hosts) == 1 && cfg.Database.Read.Hosts[0] == "localhost" &&
-			cfg.Database.Read.User == "postgres" && cfg.Database.Read.Name == "sora_mail_db" {
-			logger.Debug("Detected default database.read config - clearing for proxy-only mode")
-			cfg.Database.Read = nil
-		}
+	if !md.IsDefined("database", "read") {
+		cfg.Database.Read = nil
 	}
 }
 
@@ -429,7 +417,8 @@ func handleConfigReload(configPath string, currentCfg *config.Config, errorHandl
 // loadAndValidateConfig loads configuration from file and validates all server configurations
 func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *errors.ErrorHandler) {
 	// Load configuration from TOML file
-	if err := config.LoadConfigFromFile(configPath, cfg); err != nil {
+	md, err := config.LoadConfigFromFileWithMetadata(configPath, cfg)
+	if err != nil {
 		if os.IsNotExist(err) {
 			// If default config doesn't exist, that's okay - use defaults
 			if configPath == "config.toml" {
@@ -446,6 +435,7 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 	} else {
 		logger.Info("Loaded configuration", "path", configPath)
 	}
+	dropUndefinedDatabaseEndpoints(cfg, md)
 	if invalid := sieveengine.InvalidExtensions(cfg.Sieve.EnabledExtensions); len(invalid) > 0 {
 		logger.Warn("[sieve] enabled_extensions names extensions the engine does not support; they are ignored, and the default set is used if none remain",
 			"invalid", invalid, "effective", sieveengine.EffectiveExtensions(cfg.Sieve.EnabledExtensions))

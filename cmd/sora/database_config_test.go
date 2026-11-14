@@ -19,7 +19,6 @@ func loadStartupDatabaseConfig(t *testing.T, content string) config.Config {
 	}
 	cfg := config.NewDefaultConfig()
 	loadAndValidateConfig(path, &cfg, errors.NewErrorHandler())
-	cleanupDatabaseDefaults(&cfg)
 	return cfg
 }
 
