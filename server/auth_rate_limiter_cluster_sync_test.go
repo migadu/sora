@@ -275,3 +275,69 @@ func TestPeerDelayIsCappedByLocalMaxDelay(t *testing.T) {
 		t.Errorf("delay after peers' 8s, 2s and -1h = %v, want 8s", got)
 	}
 }
+
+// TestPeerDelayNeverAppliesToAnExemptAddress: an address this node exempts from
+// rate limiting (exempt_networks) is never delayed by it, whatever its peers
+// gossip, just as it is never blocked by it. Locally an exempt address gets no
+// IP failure entry, but the merge of a peer's failure count created one, and
+// the delay it carried applied to every login from the address until the
+// window expired: a successful login does not clear it, since clearing is
+// skipped for exempt addresses too. Peers of one protocol exempt different
+// networks during a rolling change of exempt_networks, or with two [[server]]
+// entries of the same protocol whose exempt_networks differ.
+func TestPeerDelayNeverAppliesToAnExemptAddress(t *testing.T) {
+	crl := newTestClusterRateLimiter(t)
+	crl.syncFailureCounts = true
+	crl.limiter.config.DelayStartThreshold = 2
+	crl.limiter.config.InitialDelay = time.Second
+	crl.limiter.config.MaxDelay = 30 * time.Second
+	crl.limiter.config.DelayMultiplier = 2
+	crl.limiter.exemptNetworks = []string{"192.0.2.0/24"}
+
+	now := time.Now()
+	peerDelay := func(id, ip string) {
+		t.Helper()
+		deliverRateLimitEvent(t, crl, RateLimitEvent{
+			Type:         RateLimitEventFailureCount,
+			EventID:      id,
+			IP:           ip,
+			Timestamp:    now,
+			NodeID:       "node-b",
+			Protocol:     crl.limiter.protocol,
+			FailureCount: 3,
+			LastDelay:    8 * time.Second,
+			FirstFailure: now,
+		})
+	}
+
+	ctx := context.Background()
+	exempt := &StringAddr{Addr: "192.0.2.50:40000"}
+	for range 5 {
+		crl.limiter.RecordAuthAttempt(ctx, exempt, "user@example.com", false)
+	}
+	if got := crl.limiter.GetAuthenticationDelay(exempt); got != 0 {
+		t.Fatalf("local delay of an exempt address after 5 local failures = %v, want 0", got)
+	}
+
+	peerDelay("peer-delay-exempt", "192.0.2.50")
+	if got := crl.limiter.GetAuthenticationDelay(exempt); got != 0 {
+		t.Errorf("delay of an exempt address after a peer's 8s = %v, want 0", got)
+	}
+	crl.limiter.RecordAuthAttempt(ctx, exempt, "user@example.com", true)
+	if got := crl.limiter.GetAuthenticationDelay(exempt); got != 0 {
+		t.Errorf("delay of an exempt address after a successful login = %v, want 0", got)
+	}
+	crl.limiter.ipMu.RLock()
+	_, held := crl.limiter.ipFailureCounts["192.0.2.50"]
+	crl.limiter.ipMu.RUnlock()
+	if held {
+		t.Error("a peer's failure count created an IP failure entry for an exempt address, which the local path never tracks")
+	}
+
+	// An address this node does not exempt still takes the peer's delay.
+	other := &StringAddr{Addr: "198.51.100.20:40000"}
+	peerDelay("peer-delay-not-exempt", "198.51.100.20")
+	if got := crl.limiter.GetAuthenticationDelay(other); got != 8*time.Second {
+		t.Errorf("delay of a non-exempt address after a peer's 8s = %v, want 8s", got)
+	}
+}
