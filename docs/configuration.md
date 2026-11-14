@@ -98,11 +98,13 @@ This configures the background janitorial service.
 *   `fts_retention`: How long to keep the `messages_fts_v2` row — which contains the FTS search vector (`text_body_tsv`) (default: empty — keep indefinitely). When this period expires the entire row is deleted and FTS search stops working for that message. Note: `text_body` is never persisted — it is cleared after the FTS vector is computed by the background worker.
 *   `instance_liveness_threshold`: How long an uploader instance may stay silent before it is considered gone (default: `"7d"`). A pending upload can only be performed by the instance that created it, because the message body is a file on that node's local disk, so an unfinished upload is reaped only once its owner either gave up (`uploader.max_attempts`) or stopped heartbeating for this long. Each uploader refreshes `instance_heartbeats` every minute. Keep this comfortably above any reboot or maintenance window — reaping a node that is merely rebooting deletes mail whose only copy is on its disk. An instance that has never recorded a heartbeat counts as alive, so its backlog is never reaped; the cleanup worker logs a WARN for both cases.
 
-### `[servers.*]`
+### `[[server]]`
 
-Each protocol (IMAP, LMTP, POP3, ManageSieve) has its own configuration table.
+Declare each server or proxy in a separate `[[server]]` block with a `type`, a unique `name` and an `addr`.
 
-*   `start`: A boolean to enable or disable the server.
+*   `type`: The listener type, such as `imap`, `pop3` or `imap_proxy`.
+*   `name`: A unique name identifying this server, including in logs and configuration reloads.
+*   `enabled`: Defaults to `true`. Set to `false` to keep the block without starting the server.
 *   `addr`: The listen address and port (e.g., `":143"`).
 *   `tls`: Set to `true` to enable TLS (e.g., for IMAPS on port 993). The certificate comes from the global `[tls]` section when it is enabled, otherwise from `tls_cert_file` and `tls_key_file`.
 *   `tls_verify`: With `tls = true`, require a client certificate (mutual TLS), verified against the system's trusted CAs. Leave it `false` for mail clients.
