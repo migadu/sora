@@ -545,10 +545,11 @@ func (s *Server) acceptConnections() error {
 			}
 		}
 
-		// Check connection limits before processing
+		// Check connection limits before processing. Behind a PROXY-protocol load
+		// balancer the per-IP limit counts the client its header names.
 		var releaseConn func()
 		if s.limiter != nil {
-			releaseConn, err = s.limiter.AcceptWithRealIP(conn.RemoteAddr(), "")
+			releaseConn, err = s.limiter.AcceptWithRealIP(conn.RemoteAddr(), server.GetRealClientIP(conn, server.GetProxyProtocolInfo(conn)))
 			if err != nil {
 				logger.Info("Connection rejected", "proxy", s.name, "error", err)
 				conn.Close()

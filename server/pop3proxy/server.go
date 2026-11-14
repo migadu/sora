@@ -499,7 +499,7 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 			var releaseConn func()
 			var err error
 			if s.limiter != nil {
-				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), "")
+				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), server.GetRealClientIP(netConn, proxyInfo))
 				if err != nil {
 					// DELIBERATE silent close, no banner: matches the previous
 					// accept-loop rejection (drop before any greeting), and an
