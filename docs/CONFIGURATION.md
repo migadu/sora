@@ -978,6 +978,8 @@ proxies and `user_api_proxy`. See [PROXY.md](PROXY.md).
 ### 9.13 HTTP API keys
 
 See [ADMIN_API.md](ADMIN_API.md) and [USER_API.md](USER_API.md).
+A key set on a server type not listed under "Applies to" is ignored, with a startup warning that
+names it.
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
@@ -987,7 +989,7 @@ See [ADMIN_API.md](ADMIN_API.md) and [USER_API.md](USER_API.md).
 | `jwt_secret` | string | none | `http_user_api`, `user_api_proxy` | Key that signs and checks JWTs. Without it the server is skipped. |
 | `token_duration` | duration | `"24h"` | `http_user_api` | Token lifetime. Must not be negative. |
 | `token_issuer` | string | `"sora-mail-api"` | `http_user_api` | JWT issuer. |
-| `allowed_origins` | list of strings | none | `http_user_api` | CORS origins. |
+| `allowed_origins` | list of strings | none | `http_user_api`, `user_api_proxy` | CORS origins. The proxy uses them for the errors it answers itself. |
 
 ### 9.14 Metrics server keys
 
@@ -1005,6 +1007,8 @@ See [METRICS.md](METRICS.md).
 | `hash_usernames` | bool | `true` | Replace user names by a short SHA-256 prefix in labels. |
 
 These five metric settings are global: if several `metrics` blocks exist, the last one read wins.
+`path` and these five settings are read from `metrics` blocks only; on another server type they are
+ignored, with a startup warning that names them.
 
 ---
 
