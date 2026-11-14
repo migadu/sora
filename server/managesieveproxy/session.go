@@ -398,8 +398,10 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 
 					return nil // Authentication complete from cache
 				} else {
-					// Different password on positive cache - revalidate if old enough
-					if cached.IsOld(s.server.positiveRevalidationWindow) {
+					// Different password on positive cache - revalidate if old enough, or if
+					// the two passwords are the master username form's two credentials (#949)
+					if cached.IsOld(s.server.positiveRevalidationWindow) ||
+						proxy.MasterFormOtherCredential(username, password, cached.PasswordDigest, s.server.masterUsername, s.server.masterPassword) {
 						s.DebugLog("cache hit - positive entry with different password (old enough to revalidate)", "username", username, "age", time.Since(cached.CreatedAt))
 						metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "revalidate_positive_different_pw").Inc()
 						// The database or the remote lookup decides this password, so drop

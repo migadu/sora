@@ -166,3 +166,85 @@ func TestManageSieveProxyWrongMasterPasswordLooksLikeAnotherSuffix(t *testing.T)
 		})
 	}
 }
+
+// TestManageSieveProxyMasterFormPasswordsShareTheLookupCache (#949): two passwords log in under
+// the master username form, the master password (a master login) and the account's own,
+// and the lookup cache keeps one entry for the submitted name. The entry either leaves
+// must not refuse the other as a wrong password, in either order: a fresh positive entry
+// answers any other password as a wrong one, which refused support's master login after
+// the account's own login, and the account's own login after a master one. A wrong
+// password is still answered from the account's entry exactly as under another suffix.
+func TestManageSieveProxyMasterFormPasswordsShareTheLookupCache(t *testing.T) {
+	origCost := db.BcryptCost
+	db.BcryptCost = bcrypt.MinCost
+	t.Cleanup(func() { db.BcryptCost = origCost })
+
+	hash, err := db.GenerateBcryptHash("own-password")
+	if err != nil {
+		t.Fatalf("GenerateBcryptHash: %v", err)
+	}
+	var lookups atomic.Int32
+	lookupSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lookups.Add(1)
+		json.NewEncoder(w).Encode(map[string]string{"address": "anna@example.com", "password_hash": hash})
+	}))
+	defer lookupSrv.Close()
+
+	srv, err := New(context.Background(), &resilient.ResilientDatabase{}, "localhost", ServerOptions{
+		Name: "master-form-cache", Addr: "127.0.0.1:0", RemoteAddrs: []string{"127.0.0.1:1"}, ConnectTimeout: time.Second,
+		InsecureAuth:   true,
+		MasterUsername: testMasterUsername,
+		MasterPassword: testMasterPassword,
+		RemoteLookup:   &config.RemoteLookupConfig{Enabled: true, URL: lookupSrv.URL + "/lookup?email=$email", Timeout: "2s"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.Stop()
+	limiter := &successKeyLimiter{}
+	srv.authLimiter = limiter
+	successes := func() int {
+		limiter.mu.Lock()
+		defer limiter.mu.Unlock()
+		return len(limiter.successKeys)
+	}
+
+	// login reports whether the login authenticated: a success recorded, whatever happens
+	// after it (the backend is not reachable here).
+	login := func(username, password string) (bool, error) {
+		before := successes()
+		client, remote := net.Pipe()
+		defer client.Close()
+		defer remote.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		err := (&Session{server: srv, clientConn: remote, listenerConn: remote, ctx: ctx, cancel: cancel}).authenticateUser(username, password, time.Now())
+		return successes() > before, err
+	}
+
+	masterForm := "anna@example.com@" + testMasterUsername
+	for _, order := range [][2]string{{"own-password", testMasterPassword}, {testMasterPassword, "own-password"}} {
+		srv.lookupCache.InvalidateUser(srv.name, masterForm)
+		for _, password := range order {
+			if ok, err := login(masterForm, password); !ok {
+				t.Errorf("%q, then %q under the master suffix: %q refused: %v", order[0], order[1], password, err)
+			}
+		}
+	}
+
+	// After the account's own login, a wrong password is answered from its entry without a
+	// lookup under the master suffix exactly as under another one.
+	for _, username := range []string{"anna@example.com@other", masterForm} {
+		srv.lookupCache.InvalidateUser(srv.name, username)
+		if ok, err := login(username, "own-password"); !ok {
+			t.Fatalf("%s with the account's own password: %v", username, err)
+		}
+		before := lookups.Load()
+		if ok, err := login(username, "wrong-password"); ok || !errors.Is(err, consts.ErrAuthenticationFailed) {
+			t.Errorf("%s with a wrong password: %v, want %v", username, err, consts.ErrAuthenticationFailed)
+		}
+		if n := lookups.Load() - before; n != 0 {
+			t.Errorf("%s: a wrong password after the account's own login reached the lookup service %d times, want 0 (answered from the cache)", username, n)
+		}
+	}
+}

@@ -976,8 +976,10 @@ func (s *Session) authenticateUser(username, password string) error {
 				return nil
 			} else {
 				// Different password on positive entry - always revalidate
-				// Use configured window: revalidate if entry is older than positiveRevalidationWindow
-				if cached.IsOld(s.server.positiveRevalidationWindow) {
+				// Use configured window: revalidate if entry is older than positiveRevalidationWindow,
+				// or if the two passwords are the master username form's two credentials (#949)
+				if cached.IsOld(s.server.positiveRevalidationWindow) ||
+					proxy.MasterFormOtherCredential(username, password, cached.PasswordDigest, s.server.masterUsername, s.server.masterPassword) {
 					s.DebugLog("cache positive entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt))
 					metrics.LookupCacheResults.WithLabelValues("imap_proxy", "revalidate_positive_different_pw").Inc()
 					// The database or the remote lookup decides this password, so drop
