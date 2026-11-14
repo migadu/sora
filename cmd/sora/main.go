@@ -855,6 +855,11 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			errorHandler.ValidationError("[uploader]", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
+		// The cleaner and delivery both take [cleanup] fts_retention.
+		if err := cfg.Cleanup.Validate(); err != nil {
+			errorHandler.ValidationError("[cleanup]", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
 
 		// Initialize and start the cleanup worker using configuration defaulting methods
 		gracePeriod := cfg.Cleanup.GetGracePeriodWithDefault()

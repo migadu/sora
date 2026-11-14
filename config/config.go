@@ -375,6 +375,17 @@ func (c *CleanupConfig) GetFTSRetention() (time.Duration, error) {
 	return helpers.ParseDuration(c.FTSRetention)
 }
 
+// Validate rejects a negative fts_retention. It parses, but delivery and import index only
+// mail sent after now minus the retention, which would then lie in the future, so no new
+// message would get a search row; and the cleaner prunes only for a positive retention. A
+// value that does not parse falls back to keeping every vector, like any other duration key.
+func (c *CleanupConfig) Validate() error {
+	if d, err := helpers.ParseDuration(c.FTSRetention); err == nil && d < 0 {
+		return fmt.Errorf("fts_retention must not be negative, got %q", c.FTSRetention)
+	}
+	return nil
+}
+
 // GetHealthStatusRetention parses the health status retention duration
 func (c *CleanupConfig) GetHealthStatusRetention() (time.Duration, error) {
 	if c.HealthStatusRetention == "" {

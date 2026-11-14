@@ -125,6 +125,10 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	if err := fullCfg.SharedMailboxes.Validate(); err != nil {
 		return fmt.Errorf("[shared_mailboxes]: %w", err)
 	}
+	// Imports index mail by [cleanup] fts_retention, as delivery does.
+	if err := fullCfg.Cleanup.Validate(); err != nil {
+		return fmt.Errorf("[cleanup]: %w", err)
+	}
 	// Passwords hashed here (accounts create/update, credentials add) use the server's
 	// cost: with another one a backend rehashes them at the user's next login.
 	db.SetBcryptCost(fullCfg.GetBcryptCost())

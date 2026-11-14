@@ -733,16 +733,19 @@ func ftsKeyReferencedSQL(hash, account string) string {
 // `sora-admin messages restore` can bring it back without recreating FTS data. Treating an
 // expunged row as absent here would make restored mail permanently unsearchable.
 //
-// Uses a bounded scan-window approach to limit query duration. The window walks the primary
-// key, which leads with content_hash, so the cursor is the (hash, account) pair.
-func (d *Database) GetUnusedFTSKeys(ctx context.Context, limit int) ([]FTSKey, error) {
+// One call scans a bounded part of the table: it walks the primary key, which leads with
+// content_hash, from just after the pair `after` (the zero FTSKey is the start) and stops at
+// a scan bound, at a time limit or once it has `limit` orphans. It returns the cursor to
+// pass to the next call, so that successive calls cover the whole table: the last pair it
+// examined, never one past an orphan it did not return, and the zero FTSKey once it has
+// read the last row, so the next call starts over.
+func (d *Database) GetUnusedFTSKeys(ctx context.Context, after FTSKey, limit int) ([]FTSKey, FTSKey, error) {
 	const scanWindowSize = 5000
 	const maxBatches = 200
 	const maxRunDuration = 30 * time.Second
 
 	var allKeys []FTSKey
-	lastHash := ""
-	var lastAccount int64
+	cursor := after
 	runDeadline := time.Now().Add(maxRunDuration)
 
 	for batch := 0; batch < maxBatches && len(allKeys) < limit; batch++ {
@@ -752,7 +755,7 @@ func (d *Database) GetUnusedFTSKeys(ctx context.Context, limit int) ([]FTSKey, e
 			break
 		}
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, after, ctx.Err()
 		}
 
 		query := `
@@ -769,39 +772,47 @@ func (d *Database) GetUnusedFTSKeys(ctx context.Context, limit int) ([]FTSKey, e
 			ORDER BY sw.content_hash, sw.account_id
 		`
 
-		rows, err := d.GetReadPool().Query(ctx, query, lastHash, lastAccount, scanWindowSize)
+		rows, err := d.GetReadPool().Query(ctx, query, cursor.ContentHash, cursor.AccountID, scanWindowSize)
 		if err != nil {
-			return nil, fmt.Errorf("failed to query unused FTS keys: %w", err)
+			return nil, after, fmt.Errorf("failed to query unused FTS keys: %w", err)
 		}
 
 		scanned := 0
+		full := false
 		for rows.Next() {
 			var key FTSKey
 			var orphan bool
 			if err := rows.Scan(&key.ContentHash, &key.AccountID, &orphan); err != nil {
 				rows.Close()
-				return nil, fmt.Errorf("failed to scan unused FTS keys: %w", err)
+				return nil, after, fmt.Errorf("failed to scan unused FTS keys: %w", err)
 			}
-			scanned++
-			lastHash, lastAccount = key.ContentHash, key.AccountID
-			if orphan && len(allKeys) < limit {
+			if orphan {
+				if len(allKeys) == limit {
+					full = true // the next call starts with this one
+					break
+				}
 				allKeys = append(allKeys, key)
 			}
+			scanned++
+			cursor = key
 		}
 		err = rows.Err()
 		rows.Close()
 		if err != nil {
-			return nil, fmt.Errorf("failed to read unused FTS keys: %w", err)
+			return nil, after, fmt.Errorf("failed to read unused FTS keys: %w", err)
 		}
 
-		if scanned == 0 {
+		if full {
 			break
+		}
+		if scanned < scanWindowSize {
+			return allKeys, FTSKey{}, nil // read the last row: wrap around
 		}
 
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	return allKeys, nil
+	return allKeys, cursor, nil
 }
 
 // DeleteMessagesFTSByKeyBatch deletes multiple rows from the messages_fts_v2 table.

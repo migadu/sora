@@ -143,6 +143,12 @@ Examples:
 		hasErrors = true
 	}
 
+	if err := cfg.Cleanup.Validate(); err != nil {
+		fmt.Printf("[FAIL] [cleanup] validation failed:\n")
+		fmt.Printf("   %v\n", err)
+		hasErrors = true
+	}
+
 	// Check for server name conflicts. A missing name or addr was reported above.
 	serverNames := make(map[string]bool)
 	serverAddresses := make(map[string]string) // addr -> server name
