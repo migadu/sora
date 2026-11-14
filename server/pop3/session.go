@@ -65,9 +65,10 @@ type POP3Session struct {
 	startTime        time.Time
 	memTracker       *server.SessionMemoryTracker // Memory usage tracker for this session
 
-	// trackedClientAddr is the client address this session was registered
-	// with in the connection tracker, so it is unregistered under that key.
-	// Empty when the tracker refused the session: it has nothing to release.
+	// tracked is set while the session holds a slot in the connection
+	// tracker, registered under trackedClientAddr, so the slot is released
+	// under that key, once. A session the tracker refused never holds one.
+	tracked           bool
 	trackedClientAddr string
 
 	// Session statistics for summary logging
@@ -104,6 +105,10 @@ var (
 	errInMaintenance   = &pop3server.Error{Code: "SYS/TEMP", Message: "Server in maintenance, please try again later"}
 	errMailboxTooBig   = &pop3server.Error{Code: "SYS/TEMP", Message: "Mailbox too large to open in this session"}
 	errBodyTooBig      = &pop3server.Error{Code: "SYS/TEMP", Message: "Message too large to retrieve in this session"}
+
+	// errTooManyConnections refuses a login over max_connections_per_user or
+	// max_connections_per_user_per_ip, with the reply pop3_proxy sends.
+	errTooManyConnections = &pop3server.Error{Code: "SYS/TEMP", Message: "Too many connections"}
 )
 
 // pop3AuthError builds an [AUTH]-coded response error (RFC 3206).
@@ -386,13 +391,14 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		newUserAddress, err := server.NewAddress(username)
 		if err != nil {
 			s.DebugLog("invalid username format", "error", err)
-			// Record it: an unparseable username was an unmetered authentication
-			// attempt, and it is the path a non-address master SASL username takes
-			// when it falls through to here, which must be accounted for exactly
-			// like any other failed attempt.
+			// Record and count it: an unparseable username was an unmetered
+			// authentication attempt, and it is the path a non-address master SASL
+			// username takes when it falls through to here, which must be accounted
+			// for exactly like any other failed attempt.
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
+			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
 			return 0, pop3AuthError("Invalid username format")
 		}
 		userAddress = &newUserAddress
@@ -509,6 +515,14 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		return 0, errInMaintenance
 	}
 
+	// The connection limits, also before the session takes the user: a login the tracker
+	// refuses is not logged in, so its close releases neither a count nor a tracker slot.
+	if err := s.registerConnection(accountID, userAddress.FullAddress()); err != nil {
+		s.server.authenticatedConnections.Add(-1)
+		s.InfoLog("login refused: connection limit reached", "address", userAddress.BaseAddress(), "reason", err)
+		return 0, errTooManyConnections
+	}
+
 	// Setup session state
 	s.mutex.Lock()
 	s.inboxMailboxID = inboxMailboxID.ID
@@ -529,8 +543,6 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	metrics.TrackDomainConnection("pop3", s.Domain())
 	metrics.TrackUserActivity("pop3", s.FullAddress(), "connection", 1)
 
-	// Register connection
-	s.registerConnection(userAddress.FullAddress())
 	s.startTerminationPoller()
 
 	return accountID, nil
@@ -1252,38 +1264,46 @@ func (s *POP3Session) fetchBodyFromS3(ctx context.Context, msg *db.POP3Message) 
 	return data, nil
 }
 
-// registerConnection registers the connection in the connection tracker
-func (s *POP3Session) registerConnection(email string) {
-	if s.server.connTracker != nil && s.authenticated.Load() {
-		// Use configured database query timeout for connection tracking (database INSERT)
-		queryTimeout := s.server.rdb.GetQueryTimeout()
-		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
-		defer cancel()
-
-		// The client's address, not the TCP peer: behind a proxy the peer is
-		// the proxy for every client. RemoteIP already holds the address from
-		// the PROXY header or a trusted proxy's XCLIENT (refused after login).
-		clientAddr := s.RemoteIP
-
-		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "POP3", clientAddr); err != nil {
-			s.InfoLog("rejected connection registration", "error", err)
-			return
-		}
-		s.trackedClientAddr = clientAddr
+// registerConnection takes a slot for the logging-in account in the connection
+// tracker. The error is the tracker's refusal: the account is at
+// max_connections_per_user or max_connections_per_user_per_ip.
+func (s *POP3Session) registerConnection(accountID int64, email string) error {
+	if s.server.connTracker == nil {
+		return nil
 	}
+	// Use configured database query timeout for connection tracking (database INSERT)
+	queryTimeout := s.server.rdb.GetQueryTimeout()
+	ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
+	defer cancel()
+
+	// The client's address, not the TCP peer: behind a proxy the peer is
+	// the proxy for every client. RemoteIP already holds the address from
+	// the PROXY header or a trusted proxy's XCLIENT (refused after login).
+	clientAddr := s.RemoteIP
+
+	if err := s.server.connTracker.RegisterConnection(ctx, accountID, email, "POP3", clientAddr); err != nil {
+		return err
+	}
+	s.tracked = true
+	s.trackedClientAddr = clientAddr
+	return nil
 }
 
-// unregisterConnection removes the connection from the connection tracker
+// unregisterConnection releases the session's slot in the connection tracker,
+// if it holds one.
 func (s *POP3Session) unregisterConnection() {
-	if s.server.connTracker != nil && s.authenticated.Load() && s.trackedClientAddr != "" {
-		// Use configured database query timeout for connection tracking (database DELETE)
-		queryTimeout := s.server.rdb.GetQueryTimeout()
-		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
-		defer cancel()
+	if !s.tracked {
+		return
+	}
+	s.tracked = false
 
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "POP3", s.trackedClientAddr); err != nil {
-			s.DebugLog("failed to unregister connection", "error", err)
-		}
+	// Use configured database query timeout for connection tracking (database DELETE)
+	queryTimeout := s.server.rdb.GetQueryTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "POP3", s.trackedClientAddr); err != nil {
+		s.DebugLog("failed to unregister connection", "error", err)
 	}
 }
 
