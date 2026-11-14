@@ -832,7 +832,7 @@ Each body is `{"error":"message"}` with the message below. Set the proxy's
 
 | Status | Body | When |
 |---|---|---|
-| 401 | `Authorization header required`, `Invalid authorization header format`, `Invalid or expired token` | Missing, malformed, expired or wrongly signed bearer token. |
+| 401 | `Authorization header required`, `Authorization header must be 'Bearer <token>'`, `Invalid or expired token` | Missing, malformed, expired or wrongly signed bearer token. |
 | 401 | `Invalid or expired token` | A refused refresh token, including one without usable account identity. |
 | 401 | `Invalid credentials` | A named-pool login the remote lookup refuses or does not know, as described in 12.1. |
 | 413 | `Request body too large` | A login or refresh body over 64 KiB. |
