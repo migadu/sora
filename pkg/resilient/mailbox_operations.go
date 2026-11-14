@@ -441,11 +441,11 @@ func (rd *ResilientDatabase) ResolveAccountS3Owner(ctx context.Context, accountI
 // the caller (server/imap/copy.go) can read the ids back and learn, exactly and immune to
 // concurrency, whether the copy landed. On any other error the transaction definitely did
 // not commit, so nil is returned.
-func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string) (map[imap.UID]imap.UID, []int64, error) {
+func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, held *db.HeldDestObjects) (map[imap.UID]imap.UID, []int64, error) {
 	var capturedUIDMap map[imap.UID]imap.UID
 	var capturedIDs []int64
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		uidMap, ids, err := rd.getOperationalDatabaseForOperation(ctx, true).CopyMessages(ctx, tx, uids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID)
+		uidMap, ids, err := rd.getOperationalDatabaseForOperation(ctx, true).CopyMessages(ctx, tx, uids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID, held)
 		if err != nil {
 			return nil, err
 		}

@@ -174,6 +174,28 @@ func (l *AdvisoryLockTx) TryLockAll(ctx context.Context, ids []int64) ([]bool, e
 	return acquired, nil
 }
 
+// LockSharedAll takes every id in shared mode, in the given order, waiting for any
+// exclusive holder. Shared holders do not exclude one another, so another transaction can
+// take the same ids in shared mode while this one holds them, and both exclude the
+// exclusive locks (Lock, TryLock, TryLockAll) of whoever would act on what the ids
+// guard. Cancel ctx to stop waiting; the transaction is then aborted and must be
+// released.
+func (l *AdvisoryLockTx) LockSharedAll(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	literals := make([]string, len(ids))
+	for i, id := range ids {
+		literals[i] = strconv.FormatInt(id, 10)
+	}
+	// unnest preserves array order, so the locks are taken in it.
+	sql := "SELECT pg_advisory_xact_lock_shared(id) FROM unnest(ARRAY[" + strings.Join(literals, ",") + "]::bigint[]) AS t(id)"
+	return l.run(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, sql)
+		return err
+	})
+}
+
 // Ping proves the locks are still held: it runs a statement on the transaction, which
 // fails if the session was killed or the connection dropped, taking the locks with it.
 func (l *AdvisoryLockTx) Ping(ctx context.Context) error {
