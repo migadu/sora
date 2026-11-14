@@ -309,7 +309,10 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		// an uploader reading the old one keeps its inode.
 		filePath, err = s.server.uploader.StoreLocally(contentHash, destAccountID, fullMessageBytes)
 		if err != nil {
-			ierr := s.internalError("failed to save message to disk: %v", err)
+			// The error names spool files, which mean nothing to the client: log it
+			// and answer with the cause only.
+			s.WarnLog("failed to save message to disk", "error", err)
+			ierr := s.internalError("failed to save message to disk: %v", helpers.FileErrorCause(err))
 			recordMetrics(ierr)
 			return nil, ierr
 		}
@@ -326,7 +329,8 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		s.DebugLog("message file already exists, skipping write (concurrent APPEND)", "path", expectedPath)
 	} else {
 		// Stat error (permission issue, etc.)
-		ierr := s.internalError("failed to check file existence: %v", err)
+		s.WarnLog("failed to check file existence", "error", err)
+		ierr := s.internalError("failed to check file existence: %v", helpers.FileErrorCause(err))
 		recordMetrics(ierr)
 		return nil, ierr
 	}
