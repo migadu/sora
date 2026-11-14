@@ -315,7 +315,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						s.WarnLog("impersonation target rejected (account not found)", "target_user", targetUserToImpersonate, "error", err)
 						if selfLogin {
 							// Answered by regular authentication (see the self-login note above).
-							return s.login(s.ctx, username, password, false)
+							return s.login(s.ctx, username, password, identity, false)
 						}
 						// Same reply and same accounting as a bad credential (see above).
 						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
@@ -384,36 +384,16 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					return nil
 				} else if checkMasterCredential(username, settings.masterSASLUsername) && identity != username {
-					// The authentication identity IS the master SASL username, a
-					// DIFFERENT user was named as the impersonation target, but the
-					// password is wrong. This must
-					// be recorded as an authentication failure and must not fall through
-					// to regular authentication: master SASL is a tenant-wide
-					// impersonation capability, and the regular path records nothing for
-					// it (the master SASL username is not an address), which left the
-					// credential brute-forceable at connection rate. Recorded under
-					// authKey — the master username's own bucket — so the impersonation
-					// target is not locked out.
-					//
-					// The identity != username guard keeps this off an ordinary login:
-					// RFC 4616 lets a client send an authorization identity equal to the
-					// authentication identity to mean "no impersonation", and several SASL
-					// libraries always fill the field in. For an account whose address
-					// happens to be the master SASL username, answering that from here
-					// would refuse its own password forever. Such a submission falls
-					// through to regular authentication instead, which records its own
-					// failure under the same authKey and answers authFailedError() (login.go)
-					// — so a master-password guess dressed up as a self-login is still
-					// metered, just not privileged, and is answered exactly like the correct
-					// master password: see the self-login note above.
+					// The master SASL username asking to act as somebody else, with a
+					// wrong password. Not answered from here: like any other password
+					// but the master SASL one, it falls through to regular
+					// authentication, which verifies these credentials like any other
+					// username's and answers and records their failure under the same
+					// authKey (login.go). A reply or accounting of its own, beside the
+					// authorization refusal any other username got, confirmed the master
+					// SASL username to anyone who could reach the port. Logged for the
+					// operator debugging a proxy with the wrong master SASL password.
 					s.WarnLog("master SASL authentication failed (invalid password)", "peer", server.GetAddrString(netConn.RemoteAddr()))
-					metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-					if s.server.authLimiter != nil {
-						s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authKey, false)
-					}
-					// Same response as any other bad credential: a distinct one would
-					// confirm the master SASL username to an attacker.
-					return authFailedError()
 				}
 			}
 
@@ -436,16 +416,8 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 			// 3. Regular User Authentication
 			// The user identified by `username` (authentication-identity) is logging in with `password`.
-			// If `identity` (authorization-identity) is provided and is different from `username`,
-			// it's a proxy request by a non-master user. This is typically disallowed.
-			if identity != "" && identity != username {
-				s.DebugLog("proxy login not allowed for non-master users", "username", username, "identity", identity)
-				return &imap.Error{
-					Type: imap.StatusResponseTypeNo,
-					Code: imap.ResponseCodeAuthorizationFailed,
-					Text: "Proxy login not permitted for this user.",
-				}
-			}
+			// An `identity` (authorization-identity) naming somebody else is a proxy request by a
+			// non-master user: login refuses it, but only once these credentials have checked out.
 
 			// Authenticate as `username` (authentication-identity).
 			// Use the non-gating login variant: the progressive auth delay and
@@ -456,7 +428,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			// context, so use the session context here — it is the best available
 			// signal for the AUTHENTICATE path.
 			s.DebugLog("proceeding with regular authentication", "username", username)
-			return s.login(s.ctx, username, password, false)
+			return s.login(s.ctx, username, password, identity, false)
 		}), nil
 	default:
 		s.DebugLog("unsupported authentication mechanism", "mechanism", mechanism)

@@ -226,39 +226,27 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 	}
 
 	// 2. Check for Master SASL Authentication (traditional)
-	// Entered on the authentication identity alone (constant-time comparison, to
-	// avoid a timing side-channel on the tenant-wide credential). The password is
-	// checked below rather than in this condition: a wrong master password must be
-	// rate limited and recorded here instead of falling through to regular
-	// authentication, which rejects the (non-address) master SASL username before
-	// the delay, the CanAttempt check and any RecordAuthAttempt* call — leaving the
-	// tenant-wide credential brute-forceable at connection rate.
 	// Only ever a master login when the client asked to act as somebody: the
 	// authorization identity IS the impersonation target. A submission without one
 	// cannot be a master login, so it is not answered from here at all — see the
 	// no-authorization-identity note below.
-	// A self-login (authorization identity = authentication identity) is handed on to
-	// regular authentication unless it logs in here. RFC 4616 defines authzid == authcid
-	// as "no impersonation", and several SASL libraries fill the field in unconditionally,
-	// so for an account whose address happens to be the master SASL username that shape
-	// is an ordinary login. Refusing a WRONG master password here would reject the
-	// account's own password forever; it skips this block (the trailing clause), and
-	// regular authentication records its own failure under the same key and answers
-	// errAuthFailed, so a master-password guess dressed up as a self-login is still
-	// metered. The CORRECT master password logs in here only from a peer
-	// master_sasl_allowed_networks admits and only as an account that exists (the proxy
-	// flow for that account): a gate refusal skips this block, and a target that does not
-	// exist is handed on after the lookup. Regular authentication verifies a password even
-	// for an unknown address, so refusing the master SASL password here without one let
-	// the response time confirm a guessed master SASL password. The gate refusal is logged
-	// but not recorded (no limiter is passed): regular authentication records the attempt.
-	// A target that does not parse is refused below exactly as regular authentication
-	// refuses that username.
+	// Any other password falls through to regular authentication, which verifies the
+	// credentials like any other authentication identity's (RFC 4616 section 2: the
+	// authentication identity and password first, the authorization identity second)
+	// and delays, checks, answers and records their failure under the same key. A
+	// reply or accounting of its own for a wrong master SASL password, beside the
+	// authorization refusal any other authentication identity got, confirmed the
+	// master SASL username to anyone who could reach the port.
+	// A self-login falls through too if its peer is not allowed to use the master
+	// credential, or if the account does not exist (below). This keeps its cost
+	// and cache behavior identical to a self-login using any other password.
+	// The preliminary network check is logged but leaves failure accounting to
+	// regular authentication, so the attempt is gated and recorded only once.
 	selfLogin := authzID == authnID
 	if !impersonating && authzID != "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
 		checkMasterCredential(authnID, settings.masterSASLUsername) &&
-		(!selfLogin || (checkMasterCredential(password, settings.masterSASLPassword) &&
-			s.AdmitMasterLogin(ctx, settings.masterSASLGate, nil, s.conn, s.proxyInfo(), server.AuthRateLimitKey(authnID), "master SASL self-login"))) {
+		checkMasterCredential(password, settings.masterSASLPassword) &&
+		(!selfLogin || s.AdmitMasterLogin(ctx, settings.masterSASLGate, nil, s.conn, s.proxyInfo(), server.AuthRateLimitKey(authnID), "master SASL self-login")) {
 		netConn := s.conn
 		proxyInfo := s.proxyInfo()
 		// The master SASL username is not an address, so it keeps a stable
@@ -281,16 +269,6 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 				// Same response as bad credentials so rate-limit state isn't an oracle.
 				return errAuthFailed
 			}
-		}
-
-		if !checkMasterCredential(password, settings.masterSASLPassword) {
-			s.WarnLog("master SASL authentication failed (invalid password)", "peer", server.GetAddrString(s.conn.RemoteAddr()))
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
-			// Same response as any other bad credential: a distinct one would
-			// confirm the master SASL username to an attacker.
-			return errAuthFailed
 		}
 
 		if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master SASL") {
@@ -336,6 +314,12 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 			targetAddress = &address
 			impersonating = true
 		}
+	} else if !impersonating && authzID != "" && authzID != authnID && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
+		checkMasterCredential(authnID, settings.masterSASLUsername) {
+		// The master SASL username asking to act as somebody else, with a wrong
+		// password: answered by regular authentication (see above). Logged for the
+		// operator debugging a proxy with the wrong master SASL password.
+		s.WarnLog("master SASL authentication failed (invalid password)", "peer", server.GetAddrString(s.conn.RemoteAddr()))
 	}
 
 	// Master SASL credentials submitted WITHOUT an authorization identity. There is
@@ -356,12 +340,6 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 
 	// If not using master SASL, perform regular authentication
 	if !impersonating {
-		// For regular ManageSieve, we don't support proxy authentication
-		if authzID != "" && authzID != authnID {
-			s.DebugLog("proxy authentication requires master credentials", "authz_id", authzID, "authn_id", authnID)
-			return &managesieveserver.Error{Message: msieve.Quote("Proxy authentication requires master_sasl_username and master_sasl_password to be configured")}
-		}
-
 		netConn := s.conn
 		proxyInfo := s.proxyInfo()
 		// Rate-limit key for this attempt. Canonicalised so the check and both
@@ -430,6 +408,18 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 			}
 			s.DebugLog("authentication failed")
 			return errAuthFailed
+		}
+
+		// The credentials checked out; now the authorization (RFC 4616 section 2).
+		// Acting as somebody else is the master SASL credentials' privilege, so this
+		// account may act only as itself. Refused here, not before the password, so
+		// only a client that proved its credentials learns it is not permitted:
+		// refusing it earlier answered every authentication identity but the master
+		// SASL username without a password check, which confirmed the master SASL
+		// username. Not recorded as a failure: the credentials were right.
+		if authzID != "" && authzID != authnID {
+			s.DebugLog("proxy authentication requires master credentials", "authz_id", authzID, "authn_id", authnID)
+			return &managesieveserver.Error{Message: msieve.Quote("Proxy authentication requires master credentials")}
 		}
 
 		// Record successful attempt
