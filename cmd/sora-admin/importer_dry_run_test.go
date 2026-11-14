@@ -199,7 +199,7 @@ func TestImporter_DryRunPreviewsTheImport(t *testing.T) {
 		t.Fatal(err)
 	}
 	var runErr error
-	report := captureStdout(t, func() { runErr = importer.Run() })
+	report := captureImporterStdout(t, func() { runErr = importer.Run() })
 	if runErr != nil {
 		t.Fatalf("dry run: %v", runErr)
 	}
@@ -272,9 +272,9 @@ func TestS3Importer_DryRunChangesNothing(t *testing.T) {
 	}
 }
 
-// captureStdout returns what f prints to standard output, where the dry run
+// captureImporterStdout returns what f prints to standard output, where the dry run
 // writes its report.
-func captureStdout(t *testing.T, f func()) string {
+func captureImporterStdout(t *testing.T, f func()) string {
 	t.Helper()
 	r, w, err := os.Pipe()
 	if err != nil {
