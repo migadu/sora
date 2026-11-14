@@ -91,9 +91,12 @@ type AuthRateLimiter struct {
 	// decoupled from PROXY/XCLIENT source-IP trust. (security-audit M2)
 	exemptNetworks []string
 
-	// Tier 1: IP+username blocking (fast, protects shared IPs)
-	blockedIPUsernames map[string]*BlockedIPUsernameInfo
-	ipUsernameMu       sync.RWMutex
+	// Tier 1: IP+username blocking (fast, protects shared IPs). Failure counters and
+	// blocks are kept apart, each bounded by max_ip_username_entries, so that neither
+	// the window cleanup nor making room for a counter can end a block early.
+	ipUsernameFailureCounts map[string]*IPUsernameFailureInfo
+	blockedIPUsernames      map[string]*BlockedIPUsernameInfo
+	ipUsernameMu            sync.RWMutex
 
 	// Tier 2: IP-only blocking (slow, catches distributed attacks)
 	blockedIPs      map[string]*BlockedIPInfo
@@ -133,6 +136,13 @@ type BlockedIPInfo struct {
 	Protocol     string
 }
 
+// IPUsernameFailureInfo counts the failures of an IP+username combination that is not blocked
+type IPUsernameFailureInfo struct {
+	FailureCount int
+	FirstFailure time.Time
+	LastFailure  time.Time
+}
+
 // IPFailureInfo tracks failure counts and delays for progressive delays
 type IPFailureInfo struct {
 	FailureCount int
@@ -169,16 +179,17 @@ func NewAuthRateLimiterWithTrustedNetworks(protocol, serverName, hostname string
 	}
 
 	limiter := &AuthRateLimiter{
-		config:                config,
-		protocol:              protocol,
-		serverName:            serverName,
-		hostname:              hostname,
-		exemptNetworks:        exemptNetworks,
-		blockedIPUsernames:    make(map[string]*BlockedIPUsernameInfo),
-		blockedIPs:            make(map[string]*BlockedIPInfo),
-		ipFailureCounts:       make(map[string]*IPFailureInfo),
-		usernameFailureCounts: make(map[string]*UsernameFailureInfo),
-		stopCleanup:           make(chan struct{}),
+		config:                  config,
+		protocol:                protocol,
+		serverName:              serverName,
+		hostname:                hostname,
+		exemptNetworks:          exemptNetworks,
+		ipUsernameFailureCounts: make(map[string]*IPUsernameFailureInfo),
+		blockedIPUsernames:      make(map[string]*BlockedIPUsernameInfo),
+		blockedIPs:              make(map[string]*BlockedIPInfo),
+		ipFailureCounts:         make(map[string]*IPFailureInfo),
+		usernameFailureCounts:   make(map[string]*UsernameFailureInfo),
+		stopCleanup:             make(chan struct{}),
 	}
 
 	// Initialize metrics to zero so they appear immediately in Prometheus
@@ -227,34 +238,32 @@ func (a *AuthRateLimiter) CanAttemptAuth(ctx context.Context, remoteAddr net.Add
 		ipUsernameKey := ip + "|" + username
 		a.ipUsernameMu.RLock()
 		if blocked, exists := a.blockedIPUsernames[ipUsernameKey]; exists {
-			if !blocked.BlockedUntil.IsZero() && time.Now().Before(blocked.BlockedUntil) {
+			if time.Now().Before(blocked.BlockedUntil) {
+				failureCount, blockedUntil := blocked.FailureCount, blocked.BlockedUntil // a failure renews the block in place
 				a.ipUsernameMu.RUnlock()
 				logger.Info("Auth rate limiter: Rejecting authentication (IP+username blocked)",
 					"protocol", a.protocol,
 					"ip", ip,
 					"username", username,
-					"failure_count", blocked.FailureCount,
-					"blocked_until", blocked.BlockedUntil.Format(time.RFC3339))
+					"failure_count", failureCount,
+					"blocked_until", blockedUntil.Format(time.RFC3339))
 				return &RateLimitError{
 					Reason:       "ip_username_blocked",
 					IP:           ip,
 					Username:     username,
-					FailureCount: blocked.FailureCount,
-					BlockedUntil: blocked.BlockedUntil,
+					FailureCount: failureCount,
+					BlockedUntil: blockedUntil,
 					BaseError:    ErrRateLimitExceeded,
 				}
 			}
-			// Check if block has expired (has BlockedUntil set and it's in the past)
-			if !blocked.BlockedUntil.IsZero() && time.Now().After(blocked.BlockedUntil) {
-				// Block has expired, remove it - must upgrade to write lock
-				a.ipUsernameMu.RUnlock()
-				a.ipUsernameMu.Lock()
+			// Block has expired, remove it - must upgrade to write lock, and look again
+			// under it: a failure recorded in between may have blocked the pair anew.
+			a.ipUsernameMu.RUnlock()
+			a.ipUsernameMu.Lock()
+			if blocked, exists := a.blockedIPUsernames[ipUsernameKey]; exists && !time.Now().Before(blocked.BlockedUntil) {
 				delete(a.blockedIPUsernames, ipUsernameKey)
-				a.ipUsernameMu.Unlock()
-			} else {
-				// Not blocked or still tracking failures - keep the entry
-				a.ipUsernameMu.RUnlock()
 			}
+			a.ipUsernameMu.Unlock()
 		} else {
 			a.ipUsernameMu.RUnlock()
 		}
@@ -595,7 +604,13 @@ func (a *AuthRateLimiter) clearFailureTracking(ip string) {
 	logger.Debug("Auth limiter: Cleared failure tracking after successful login", "protocol", a.protocol, "ip", ip)
 }
 
-// updateIPUsernameFailure tracks IP+username authentication failures (Tier 1: fast blocking)
+// updateIPUsernameFailure tracks IP+username authentication failures (Tier 1: fast blocking).
+// A pair is counted in ipUsernameFailureCounts until it reaches max_attempts_per_ip_username,
+// then moves to blockedIPUsernames until BlockedUntil. Each table is bounded by
+// max_ip_username_entries on its own: making room for a counter drops another counter,
+// and an active block is never dropped. When every block slot holds an active block, the
+// pair stays at its threshold and is blocked by its next failure once a slot is free
+// (Tier 2 keeps counting its address meanwhile).
 func (a *AuthRateLimiter) updateIPUsernameFailure(ip, username string, failureTime time.Time) {
 	if username == "" || a.config.MaxAttemptsPerIPUsername == 0 {
 		return // Skip if username empty or feature disabled
@@ -605,60 +620,61 @@ func (a *AuthRateLimiter) updateIPUsernameFailure(ip, username string, failureTi
 	a.ipUsernameMu.Lock()
 	defer a.ipUsernameMu.Unlock()
 
-	// Enforce size limit with LRU eviction (if configured)
-	if _, exists := a.blockedIPUsernames[ipUsernameKey]; !exists && a.config.MaxIPUsernameEntries > 0 && len(a.blockedIPUsernames) >= a.config.MaxIPUsernameEntries {
-		a.evictOldestIPUsername()
-	}
-
-	// Track failures for this IP+username combination
-	var failureCount int
-	if existing, exists := a.blockedIPUsernames[ipUsernameKey]; exists {
-		failureCount = existing.FailureCount + 1
-	} else {
-		failureCount = 1
-	}
-
-	// Check if threshold reached
-	if failureCount >= a.config.MaxAttemptsPerIPUsername {
-		blockedUntil := failureTime.Add(a.config.IPUsernameBlockDuration)
-		a.blockedIPUsernames[ipUsernameKey] = &BlockedIPUsernameInfo{
-			BlockedUntil: blockedUntil,
-			FailureCount: failureCount,
-			FirstFailure: failureTime, // Approximate
-			LastFailure:  failureTime,
-			Protocol:     a.protocol,
-			IP:           ip,
-			Username:     username,
+	if blocked, exists := a.blockedIPUsernames[ipUsernameKey]; exists {
+		if failureTime.Before(blocked.BlockedUntil) {
+			// A failure while blocked (recorded by an attempt checked before the block
+			// was set) renews the block, as reaching the threshold again would.
+			blocked.FailureCount++
+			blocked.LastFailure = failureTime
+			blocked.BlockedUntil = failureTime.Add(a.config.IPUsernameBlockDuration)
+			return
 		}
-		logger.Info("Auth rate limiter: IP+username blocked (Tier 1)",
+		delete(a.blockedIPUsernames, ipUsernameKey) // expired: the pair starts over
+	}
+
+	info, exists := a.ipUsernameFailureCounts[ipUsernameKey]
+	if !exists {
+		if a.config.MaxIPUsernameEntries > 0 && len(a.ipUsernameFailureCounts) >= a.config.MaxIPUsernameEntries {
+			a.evictOldestIPUsername()
+		}
+		info = &IPUsernameFailureInfo{FirstFailure: failureTime}
+		a.ipUsernameFailureCounts[ipUsernameKey] = info
+	}
+	info.FailureCount++
+	info.LastFailure = failureTime
+
+	if info.FailureCount < a.config.MaxAttemptsPerIPUsername {
+		return
+	}
+
+	if a.config.MaxIPUsernameEntries > 0 && len(a.blockedIPUsernames) >= a.config.MaxIPUsernameEntries && a.removeExpiredIPUsernameBlocks(failureTime) == 0 {
+		logger.Warn("Auth rate limiter: IP+username block table full of active blocks, pair not blocked (Tier 1)",
 			"protocol", a.protocol,
 			"ip", ip,
 			"username", username,
-			"failure_count", failureCount,
-			"blocked_until", blockedUntil.Format(time.RFC3339))
-
-		// TODO: Broadcast to cluster
-		if a.clusterLimiter != nil {
-			// Future: Add BroadcastBlockIPUsername method
-		}
-	} else {
-		// Update failure count even if not yet blocked
-		if existing, exists := a.blockedIPUsernames[ipUsernameKey]; exists {
-			existing.FailureCount = failureCount
-			existing.LastFailure = failureTime
-		} else {
-			// Create tracking entry (not blocked yet)
-			a.blockedIPUsernames[ipUsernameKey] = &BlockedIPUsernameInfo{
-				FailureCount: failureCount,
-				FirstFailure: failureTime,
-				LastFailure:  failureTime,
-				Protocol:     a.protocol,
-				IP:           ip,
-				Username:     username,
-				BlockedUntil: time.Time{}, // Not blocked yet
-			}
-		}
+			"failure_count", info.FailureCount,
+			"ip_username_limit", a.config.MaxIPUsernameEntries)
+		return
 	}
+
+	blockedUntil := failureTime.Add(a.config.IPUsernameBlockDuration)
+	a.blockedIPUsernames[ipUsernameKey] = &BlockedIPUsernameInfo{
+		BlockedUntil: blockedUntil,
+		FailureCount: info.FailureCount,
+		FirstFailure: info.FirstFailure,
+		LastFailure:  failureTime,
+		Protocol:     a.protocol,
+		IP:           ip,
+		Username:     username,
+	}
+	delete(a.ipUsernameFailureCounts, ipUsernameKey)
+	logger.Info("Auth rate limiter: IP+username blocked (Tier 1)",
+		"protocol", a.protocol,
+		"ip", ip,
+		"username", username,
+		"failure_count", info.FailureCount,
+		"blocked_until", blockedUntil.Format(time.RFC3339))
+	// TODO: Broadcast to cluster (future: a BroadcastBlockIPUsername method)
 }
 
 // clearIPUsernameFailure clears IP+username failure tracking after successful auth,
@@ -675,6 +691,7 @@ func (a *AuthRateLimiter) clearIPUsernameFailure(ip, username string) {
 		return
 	}
 	delete(a.blockedIPUsernames, ipUsernameKey)
+	delete(a.ipUsernameFailureCounts, ipUsernameKey)
 }
 
 // updateUsernameFailure tracks username authentication failures (cluster-synchronized)
@@ -765,15 +782,16 @@ func (a *AuthRateLimiter) cleanupRoutine(interval time.Duration) {
 func (a *AuthRateLimiter) cleanupExpiredEntries() {
 	now := time.Now()
 
-	// Clean up expired IP+username blocks (Tier 1)
+	// Clean up expired IP+username blocks and old IP+username failure tracking (Tier 1).
+	// The window ages out counters only: a block lasts until BlockedUntil.
 	a.ipUsernameMu.Lock()
-	expiredIPUsernameBlocks := 0
+	expiredIPUsernameBlocks := a.removeExpiredIPUsernameBlocks(now)
+	expiredIPUsernameFailures := 0
 	ipUsernameCutoff := now.Add(-a.config.IPUsernameWindowDuration)
-	for key, blocked := range a.blockedIPUsernames {
-		// Remove if block expired or entry is old
-		if (!blocked.BlockedUntil.IsZero() && now.After(blocked.BlockedUntil)) || blocked.LastFailure.Before(ipUsernameCutoff) {
-			delete(a.blockedIPUsernames, key)
-			expiredIPUsernameBlocks++
+	for key, info := range a.ipUsernameFailureCounts {
+		if info.LastFailure.Before(ipUsernameCutoff) {
+			delete(a.ipUsernameFailureCounts, key)
+			expiredIPUsernameFailures++
 		}
 	}
 	a.ipUsernameMu.Unlock()
@@ -813,9 +831,10 @@ func (a *AuthRateLimiter) cleanupExpiredEntries() {
 	}
 	a.usernameMu.Unlock()
 
-	if expiredIPUsernameBlocks > 0 || expiredBlocks > 0 || expiredFailures > 0 || expiredUsernames > 0 {
+	if expiredIPUsernameBlocks > 0 || expiredIPUsernameFailures > 0 || expiredBlocks > 0 || expiredFailures > 0 || expiredUsernames > 0 {
 		logger.Debug("Auth limiter: Cleaned up expired entries", "protocol", a.protocol,
 			"expired_ip_username_blocks", expiredIPUsernameBlocks,
+			"expired_ip_username_failures", expiredIPUsernameFailures,
 			"expired_ip_blocks", expiredBlocks,
 			"expired_ip_failures", expiredFailures,
 			"expired_username_failures", expiredUsernames)
@@ -823,7 +842,8 @@ func (a *AuthRateLimiter) cleanupExpiredEntries() {
 
 	// Update Prometheus metrics every cleanup cycle
 	a.ipUsernameMu.RLock()
-	totalIPUsername := len(a.blockedIPUsernames)
+	totalIPUsernameBlocks := len(a.blockedIPUsernames)
+	totalIPUsername := len(a.ipUsernameFailureCounts) + totalIPUsernameBlocks
 	a.ipUsernameMu.RUnlock()
 
 	a.ipMu.RLock()
@@ -846,6 +866,7 @@ func (a *AuthRateLimiter) cleanupExpiredEntries() {
 	if a.cleanupCounter%10 == 0 {
 		logger.Info("Auth rate limiter stats", "protocol", a.protocol,
 			"ip_username_entries", totalIPUsername,
+			"ip_username_blocks", totalIPUsernameBlocks,
 			"ip_username_limit", a.config.MaxIPUsernameEntries,
 			"blocked_ips", totalBlockedIPs,
 			"ip_failure_entries", totalIPFailures,
@@ -862,8 +883,10 @@ func (a *AuthRateLimiter) GetStats(ctx context.Context, windowDuration time.Dura
 
 	// Collect in-memory stats
 	a.ipUsernameMu.RLock()
-	blockedIPUsernameCount := len(a.blockedIPUsernames)
+	ipUsernameCounters := len(a.ipUsernameFailureCounts)
+	ipUsernameBlocks := len(a.blockedIPUsernames)
 	a.ipUsernameMu.RUnlock()
+	blockedIPUsernameCount := ipUsernameCounters + ipUsernameBlocks
 
 	a.ipMu.RLock()
 	blockedIPCount := len(a.blockedIPs)
@@ -876,7 +899,7 @@ func (a *AuthRateLimiter) GetStats(ctx context.Context, windowDuration time.Dura
 
 	stats := map[string]any{
 		"enabled":              true,
-		"blocked_ip_usernames": blockedIPUsernameCount, // Tier 1: IP+username blocks
+		"blocked_ip_usernames": blockedIPUsernameCount, // Tier 1: IP+username entries (counters and blocks)
 		"blocked_ips":          blockedIPCount,         // Tier 2: IP-only blocks
 		"tracked_ips":          trackedIPs,
 		"tracked_usernames":    trackedUsernames,
@@ -888,7 +911,7 @@ func (a *AuthRateLimiter) GetStats(ctx context.Context, windowDuration time.Dura
 			"ip_limit":                a.config.MaxIPEntries,
 			"username_entries":        trackedUsernames,
 			"username_limit":          a.config.MaxUsernameEntries,
-			"ip_username_utilization": roundToTwoDecimals(float64(blockedIPUsernameCount) / float64(max(a.config.MaxIPUsernameEntries, 1)) * 100),
+			"ip_username_utilization": roundToTwoDecimals(float64(max(ipUsernameCounters, ipUsernameBlocks)) / float64(max(a.config.MaxIPUsernameEntries, 1)) * 100), // the limit bounds each table
 			"ip_utilization":          roundToTwoDecimals(float64(trackedIPs) / float64(max(a.config.MaxIPEntries, 1)) * 100),
 			"username_utilization":    roundToTwoDecimals(float64(trackedUsernames) / float64(max(a.config.MaxUsernameEntries, 1)) * 100),
 		},
@@ -977,10 +1000,12 @@ func (a *AuthRateLimiter) Stop() {
 	close(a.stopCleanup)
 }
 
-// evictOldestIPUsername removes the oldest IP+username entry by FirstFailure time
+// evictOldestIPUsername drops the IP+username failure counter with the oldest
+// FirstFailure to make room in ipUsernameFailureCounts. Blocks live in blockedIPUsernames
+// and are not touched.
 // Caller must hold ipUsernameMu write lock
 func (a *AuthRateLimiter) evictOldestIPUsername() {
-	if len(a.blockedIPUsernames) == 0 {
+	if len(a.ipUsernameFailureCounts) == 0 {
 		return
 	}
 
@@ -988,7 +1013,7 @@ func (a *AuthRateLimiter) evictOldestIPUsername() {
 	var oldestTime time.Time
 	first := true
 
-	for key, info := range a.blockedIPUsernames {
+	for key, info := range a.ipUsernameFailureCounts {
 		if first || info.FirstFailure.Before(oldestTime) {
 			oldestKey = key
 			oldestTime = info.FirstFailure
@@ -997,9 +1022,23 @@ func (a *AuthRateLimiter) evictOldestIPUsername() {
 	}
 
 	if oldestKey != "" {
-		delete(a.blockedIPUsernames, oldestKey)
+		delete(a.ipUsernameFailureCounts, oldestKey)
 		logger.Debug("Auth limiter: Evicted oldest IP+username entry (size limit)", "protocol", a.protocol, "key", oldestKey, "first_failure", oldestTime)
 	}
+}
+
+// removeExpiredIPUsernameBlocks deletes the IP+username blocks that ended by now and
+// returns how many it deleted.
+// Caller must hold ipUsernameMu write lock
+func (a *AuthRateLimiter) removeExpiredIPUsernameBlocks(now time.Time) int {
+	removed := 0
+	for key, blocked := range a.blockedIPUsernames {
+		if !now.Before(blocked.BlockedUntil) {
+			delete(a.blockedIPUsernames, key)
+			removed++
+		}
+	}
+	return removed
 }
 
 // evictOldestIP drops the failure counter with the oldest FirstFailure to make room

@@ -1338,15 +1338,20 @@ auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expire
 # its size limit, the oldest entries (by FirstFailure time) are evicted using LRU policy.
 # max_ip_entries evicts the counters of addresses that are not blocked first and never removes
 # an IP block: a block lasts until ip_block_duration ends.
+# max_ip_username_entries bounds the IP+username failure counters and, separately, the
+# IP+username blocks. Making room evicts counters only: a block lasts until
+# ip_username_block_duration ends. While max_ip_username_entries pairs are blocked at once, a
+# further pair that reaches max_attempts_per_ip_username is blocked only once a block has
+# ended (max_attempts_per_ip keeps counting its address).
 # There is no unlimited setting: 0, like any key left out, takes the default.
 #
 # RECOMMENDED VALUES:
-# - Default (100k/50k/50k): Suitable for most deployments, ~40MB per protocol max
-# - High-traffic (200k/100k/100k): For servers with >50k users, ~80MB per protocol max
-# - Low-memory (25k/10k/10k): For constrained environments, ~10MB per protocol max
+# - Default (100k/50k/50k): Suitable for most deployments, ~65MB per protocol max
+# - High-traffic (200k/100k/100k): For servers with >50k users, ~130MB per protocol max
+# - Low-memory (25k/10k/10k): For constrained environments, ~16MB per protocol max
 #
 # MEMORY CALCULATION:
-# - IP+Username entries: ~250 bytes each × max_ip_username_entries
+# - IP+Username entries: ~250 bytes each × max_ip_username_entries × 2 (counters and blocks)
 # - IP entries: ~150 bytes each × max_ip_entries
 # - Username entries: ~150 bytes each × max_username_entries
 #

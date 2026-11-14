@@ -116,7 +116,7 @@ func TestSuccessClearsCountersOfUnblockedAddress(t *testing.T) {
 	_, ipTracked := limiter.ipFailureCounts["203.0.113.9"]
 	limiter.ipMu.RUnlock()
 	limiter.ipUsernameMu.RLock()
-	_, pairTracked := limiter.blockedIPUsernames["203.0.113.9|user@example.com"]
+	_, pairTracked := limiter.ipUsernameFailureCounts["203.0.113.9|user@example.com"]
 	limiter.ipUsernameMu.RUnlock()
 	if ipTracked || pairTracked {
 		t.Errorf("success left counters behind: ip=%v ip+username=%v", ipTracked, pairTracked)
@@ -406,7 +406,9 @@ func TestIPUsernameTablesConcurrentUse(t *testing.T) {
 	}
 	wg.Wait()
 
-	if n := limiter.GetStats(ctx, time.Minute)["blocked_ip_usernames"].(int); n > 2*limit {
-		t.Errorf("%d IP+username entries, want at most %d (counters and blocks each bounded by %d)", n, 2*limit, limit)
+	limiter.ipUsernameMu.RLock()
+	defer limiter.ipUsernameMu.RUnlock()
+	if c, b := len(limiter.ipUsernameFailureCounts), len(limiter.blockedIPUsernames); c > limit || b > limit {
+		t.Errorf("%d IP+username counters and %d blocks, want at most %d of each", c, b, limit)
 	}
 }
