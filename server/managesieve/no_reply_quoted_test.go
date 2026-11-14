@@ -58,10 +58,10 @@ func TestNoRepliesAreQuotedStrings(t *testing.T) {
 		name, command, want string
 	}{
 		{"wrong master SASL password", plain("user@example.com", "master", "wrong"), `NO "Authentication failed"`},
-		{"unparsable identity", plain("", "not-an-address", "password"), `NO "Invalid username format"`},
+		{"unparsable identity", plain("", "not-an-address", "password"), `NO "Authentication failed"`},
 		{"authorization identity without master SASL", plain("other@example.com", "user@example.com", "password"),
 			`NO "Proxy authentication requires master_sasl_username and master_sasl_password to be configured"`},
-		{"LOGIN with an unparsable address", `LOGIN "not-an-address" "password"`, `NO "Invalid address"`},
+		{"LOGIN with an unparsable address", `LOGIN "not-an-address" "password"`, `NO "Authentication failed"`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			conn, reader, _ := dialManageSieve(t, srv)
