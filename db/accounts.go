@@ -371,8 +371,9 @@ var (
 	ErrCrossDomainPrimaryChange = errors.New("cannot change the primary identity to a different domain on an account that already has messages: this would split message storage across domains")
 	// ErrInvalidAccountRequest wraps the errors CreateAccount, CreateAccountWithCredentials
 	// and UpdateAccount return for a request that cannot succeed as written (malformed
-	// address, no or several primaries, an address twice, unknown hash type, ...), so a
-	// caller can tell a bad request from a database failure.
+	// address, no or several primaries, an address twice, unknown hash type, a password
+	// over bcrypt's 72 bytes, ...), so a caller can tell a bad request from a database
+	// failure.
 	ErrInvalidAccountRequest = errors.New("invalid account request")
 )
 
