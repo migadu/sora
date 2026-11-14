@@ -2930,6 +2930,93 @@ func (c *Config) ValidateTrustedNetworks() error {
 	return err
 }
 
+// HasMailBackend reports whether an enabled server stores mail (imap, lmtp, pop3). Such a
+// node runs the upload worker, the cleaner and the local cache, so it reads [uploader]
+// and [cleanup].
+func (c *Config) HasMailBackend() bool {
+	for _, s := range c.GetAllServers() {
+		if s.Type == "imap" || s.Type == "lmtp" || s.Type == "pop3" {
+			return true
+		}
+	}
+	return false
+}
+
+// Problem is one reason Validate refuses a file: the part of the file it is about, as
+// an operator finds it ("server 'imap'", "[relay]", "trusted_networks"), and what is
+// wrong there.
+type Problem struct {
+	Section string
+	Err     error
+}
+
+// Validate runs the shared configuration checks used by sora before service setup and
+// by `sora-admin config validate`, returning every problem these checks find.
+//
+// What a node does not run is not checked: [uploader] and [cleanup] only with a mail
+// backend. Service setup still checks required database and S3 settings, S3 timeout,
+// external connectivity and the node's disk; passing Validate does not check those.
+func (c *Config) Validate() []Problem {
+	var problems []Problem
+	add := func(section string, err error) {
+		if err != nil {
+			problems = append(problems, Problem{Section: section, Err: err})
+		}
+	}
+
+	servers := c.GetAllServers()
+	for i := range servers {
+		add(fmt.Sprintf("server '%s'", servers[i].Name), servers[i].Validate())
+	}
+
+	// Named backend pools are validated as a whole: the checks cross the [[pool]] blocks
+	// and the proxy servers that route into them.
+	add("[[pool]]", c.ValidatePools())
+	add("[relay]", c.Relay.Validate())
+	// One malformed trusted_networks entry would leave LMTP admission with no peers.
+	add("trusted_networks", c.ValidateTrustedNetworks())
+	add("[shared_mailboxes]", c.SharedMailboxes.Validate())
+
+	// Fail closed: a listener that accepts PROXY protocol with an empty trusted_networks
+	// would let any reachable host spoof the client IP via a PROXY header. (security-audit M2)
+	if missing := c.ProxyProtocolListenersMissingTrust(); len(missing) > 0 {
+		add("trusted_networks", fmt.Errorf("proxy_protocol is enabled on server(s) %s but [servers] trusted_networks is empty; "+
+			"set trusted_networks to your trusted proxy IPs/CIDRs (otherwise any client could spoof its "+
+			"source IP via a PROXY header)", strings.Join(missing, ", ")))
+	}
+
+	// A block without a name or addr is reported by its own Validate above.
+	names := make(map[string]bool)
+	addrs := make(map[string]string) // addr -> server name
+	for _, s := range servers {
+		if s.Name != "" {
+			if names[s.Name] {
+				add("server configuration", fmt.Errorf("duplicate server name '%s' found. Each server must have a unique name", s.Name))
+			}
+			names[s.Name] = true
+		}
+		if s.Addr != "" {
+			if other, exists := addrs[s.Addr]; exists {
+				add("server configuration", fmt.Errorf("duplicate server address '%s' found. Server '%s' and '%s' cannot bind to the same address", s.Addr, other, s.Name))
+			} else {
+				addrs[s.Addr] = s.Name
+			}
+		}
+	}
+	if len(servers) == 0 {
+		add("servers", fmt.Errorf("no servers configured. Please configure at least one server in a [[server]] section"))
+	}
+
+	if c.HasMailBackend() {
+		// The cleaner and the upload worker both take [uploader] max_attempts.
+		add("[uploader]", c.Uploader.Validate())
+		// The cleaner and delivery both take [cleanup] fts_retention.
+		add("[cleanup]", c.Cleanup.Validate())
+	}
+
+	return problems
+}
+
 // broadPrivateRanges are the full RFC1918 / IPv6-ULA / link-local supernets. Trusting any
 // of these whole-cloth grants client-IP spoofing and rate-limit exemption to every host on
 // the private network — almost always wider than intended. (security-audit M2)
