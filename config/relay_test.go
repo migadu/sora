@@ -11,8 +11,14 @@ import (
 // the given extra keys, the way the server loads its configuration.
 func loadRelayConfig(t *testing.T, smtpHost, extra string) RelayConfig {
 	t.Helper()
+	return loadRelayBlock(t, "type = \"smtp\"\nsmtp_host = \""+smtpHost+"\"\n"+extra)
+}
+
+// loadRelayBlock loads a config file whose [relay] block holds keys.
+func loadRelayBlock(t *testing.T, keys string) RelayConfig {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "relay.toml")
-	content := "[relay]\ntype = \"smtp\"\nsmtp_host = \"" + smtpHost + "\"\n" + extra + "\n"
+	content := "[relay]\n" + keys + "\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -53,44 +59,51 @@ func TestRelaySMTPTLSDefaults(t *testing.T) {
 	}
 }
 
-// TestRelaySMTPTransportWarning checks that startup can warn about a relay
-// connection that is plaintext or does not verify the relay's certificate, unless
-// the relay is on loopback.
-func TestRelaySMTPTransportWarning(t *testing.T) {
+// TestRelayTransportWarning checks that startup can warn about a relay connection
+// that is plaintext or does not verify the relay's certificate, unless the relay is
+// on loopback. This holds for both relay types: an http:// URL sends the relayed
+// mail and the auth_token in plaintext just as smtp_tls = false does.
+func TestRelayTransportWarning(t *testing.T) {
+	smtp := func(host, extra string) string {
+		return "type = \"smtp\"\nsmtp_host = \"" + host + "\"\n" + extra
+	}
+	http := func(url string) string {
+		return "type = \"http\"\nhttp_url = \"" + url + "\"\nauth_token = \"secret\""
+	}
 	tests := []struct {
 		name     string
-		host     string
-		extra    string
+		block    string
 		wantWarn string // substring of the warning, "" for no warning
 	}{
-		{name: "defaults", host: "smtp.example.com:587", wantWarn: ""},
-		{name: "plaintext to remote host", host: "smtp.example.com:25", extra: "smtp_tls = false", wantWarn: "plaintext"},
-		{name: "plaintext to remote IP", host: "192.0.2.10:25", extra: "smtp_tls = false", wantWarn: "plaintext"},
-		{name: "unverified to remote host", host: "smtp.example.com:465", extra: "smtp_tls_verify = false", wantWarn: "not verified"},
-		{name: "plaintext to 127.0.0.1", host: "127.0.0.1:25", extra: "smtp_tls = false", wantWarn: ""},
-		{name: "plaintext to ::1", host: "[::1]:25", extra: "smtp_tls = false", wantWarn: ""},
-		{name: "plaintext to localhost", host: "localhost:25", extra: "smtp_tls = false", wantWarn: ""},
-		{name: "unverified to localhost", host: "localhost:465", extra: "smtp_tls_verify = false", wantWarn: ""},
+		{name: "smtp defaults", block: smtp("smtp.example.com:587", ""), wantWarn: ""},
+		{name: "smtp plaintext to remote host", block: smtp("smtp.example.com:25", "smtp_tls = false"), wantWarn: "plaintext"},
+		{name: "smtp plaintext to remote IP", block: smtp("192.0.2.10:25", "smtp_tls = false"), wantWarn: "plaintext"},
+		{name: "smtp unverified to remote host", block: smtp("smtp.example.com:465", "smtp_tls_verify = false"), wantWarn: "not verified"},
+		{name: "smtp plaintext to 127.0.0.1", block: smtp("127.0.0.1:25", "smtp_tls = false"), wantWarn: ""},
+		{name: "smtp plaintext to ::1", block: smtp("[::1]:25", "smtp_tls = false"), wantWarn: ""},
+		{name: "smtp plaintext to localhost", block: smtp("localhost:25", "smtp_tls = false"), wantWarn: ""},
+		{name: "smtp unverified to localhost", block: smtp("localhost:465", "smtp_tls_verify = false"), wantWarn: ""},
+		{name: "http over https", block: http("https://api.example.com/v1/mail/deliver"), wantWarn: ""},
+		{name: "http plaintext to remote host", block: http("http://api.example.com/v1/mail/deliver"), wantWarn: "plaintext"},
+		{name: "http plaintext to remote IP", block: http("http://192.0.2.10:8080/deliver"), wantWarn: "plaintext"},
+		{name: "http plaintext upper-case scheme", block: http("HTTP://api.example.com/deliver"), wantWarn: "plaintext"},
+		{name: "http plaintext to localhost", block: http("http://localhost:8080/deliver"), wantWarn: ""},
+		{name: "http plaintext to 127.0.0.1", block: http("http://127.0.0.1/deliver"), wantWarn: ""},
+		{name: "http plaintext to ::1", block: http("http://[::1]:8080/deliver"), wantWarn: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			relay := loadRelayConfig(t, tt.host, tt.extra)
-			got := relay.SMTPTransportWarning()
+			relay := loadRelayBlock(t, tt.block)
+			got := relay.TransportWarning()
 			if tt.wantWarn == "" {
 				if got != "" {
-					t.Errorf("SMTPTransportWarning() = %q, want none", got)
+					t.Errorf("TransportWarning() = %q, want none", got)
 				}
 				return
 			}
 			if !strings.Contains(got, tt.wantWarn) {
-				t.Errorf("SMTPTransportWarning() = %q, want it to mention %q", got, tt.wantWarn)
+				t.Errorf("TransportWarning() = %q, want it to mention %q", got, tt.wantWarn)
 			}
 		})
-	}
-
-	// An HTTP relay has no SMTP transport to warn about.
-	httpRelay := RelayConfig{Type: "http", HTTPURL: "https://api.example.com/v1/mail/deliver"}
-	if got := httpRelay.SMTPTransportWarning(); got != "" {
-		t.Errorf("http relay: SMTPTransportWarning() = %q, want none", got)
 	}
 }

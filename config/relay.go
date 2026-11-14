@@ -2,6 +2,7 @@ package config
 
 import (
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -77,20 +78,29 @@ func (r *RelayConfig) GetSMTPTLSVerify() bool {
 	return r.SMTPTLSVerify == nil || *r.SMTPTLSVerify
 }
 
-// SMTPTransportWarning returns a warning for startup when the SMTP relay connection
-// to a non-loopback host is plaintext or does not verify the relay's certificate,
-// and "" otherwise. Either exposes relayed mail (Sieve redirects, vacation replies)
-// to an on-path attacker, who can read it or, without verification, impersonate
-// the relay.
-func (r *RelayConfig) SMTPTransportWarning() string {
-	if !r.IsSMTP() || isLoopbackHostPort(r.SMTPHost) {
-		return ""
-	}
-	if !r.GetSMTPTLS() {
-		return "[relay] smtp_tls = false: mail is relayed in plaintext to a non-loopback host"
-	}
-	if !r.GetSMTPTLSVerify() {
-		return "[relay] smtp_tls_verify = false: the relay's TLS certificate is not verified, so any host on the path can impersonate it"
+// TransportWarning returns a warning for startup when the relay connection to a
+// non-loopback host is plaintext (smtp_tls = false, or an http:// http_url) or does
+// not verify the relay's certificate (smtp_tls_verify = false), and "" otherwise.
+// Either exposes relayed mail (Sieve redirects, vacation replies), and for the HTTP
+// relay the auth_token, to an on-path attacker, who can read it or, without
+// verification, impersonate the relay.
+func (r *RelayConfig) TransportWarning() string {
+	switch {
+	case r.IsSMTP():
+		if isLoopbackHostPort(r.SMTPHost) {
+			return ""
+		}
+		if !r.GetSMTPTLS() {
+			return "[relay] smtp_tls = false: mail is relayed in plaintext to a non-loopback host"
+		}
+		if !r.GetSMTPTLSVerify() {
+			return "[relay] smtp_tls_verify = false: the relay's TLS certificate is not verified, so any host on the path can impersonate it"
+		}
+	case r.IsHTTP():
+		u, err := url.Parse(r.HTTPURL)
+		if err == nil && strings.EqualFold(u.Scheme, "http") && !isLoopbackHostPort(u.Host) {
+			return "[relay] http_url is http://: mail and the auth_token are relayed in plaintext to a non-loopback host"
+		}
 	}
 	return ""
 }
