@@ -40,8 +40,8 @@ func TestMailboxExistsAsksTheMailstore(t *testing.T) {
 			if err != nil {
 				t.Fatalf("evaluate: %v", err)
 			}
-			if result.Mailbox != tc.want {
-				t.Errorf("filed into %q, want %s", result.Mailbox, tc.want)
+			if len(result.Mailboxes) != 1 || result.Mailboxes[0] != tc.want {
+				t.Errorf("filed into %q, want [%s]", result.Mailboxes, tc.want)
 			}
 		})
 	}
