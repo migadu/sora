@@ -20,6 +20,49 @@ func sameStagedFile(legacyFile, activeFile string) bool {
 	return os.SameFile(legacyInfo, activeInfo)
 }
 
+// firstStagedBody checks physical targets once each. It is used for a cyclic alias:
+// an empty cycle strands nothing, but a nonempty one must not hide a body just because
+// its target was already visited under a different account path.
+func firstStagedBody(entryPath string) (string, error) {
+	visited := make(map[string]bool)
+	var walk func(string) (string, error)
+	walk = func(entryPath string) (string, error) {
+		root, err := filepath.EvalSymlinks(entryPath)
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", nil
+		}
+		if err != nil || visited[root] {
+			return "", err
+		}
+		visited[root] = true
+		found := ""
+		err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(root, p)
+			if err != nil {
+				return err
+			}
+			logicalPath := filepath.Join(entryPath, rel)
+			if d.Type()&fs.ModeSymlink != 0 {
+				found, err = walk(logicalPath)
+				if err != nil {
+					return err
+				}
+			} else if d.Type().IsRegular() {
+				found = logicalPath
+			}
+			if found != "" {
+				return fs.SkipAll
+			}
+			return nil
+		})
+		return found, err
+	}
+	return walk(entryPath)
+}
+
 // CheckLegacyStaging refuses to start the uploader on path when path is the current
 // default staging directory (newDefault) and legacyPath, the default of earlier releases,
 // still holds staged bodies. A node upgraded without setting [uploader] path would look for
@@ -51,11 +94,21 @@ func CheckLegacyStaging(path, newDefault, legacyPath string) error {
 		if err != nil {
 			return false, err
 		}
-		if ancestors[root] {
+		// Identical physical subtrees make every relative body path reachable under
+		// the active spool, without inspecting the subtree's files individually.
+		if activeRoot, err := filepath.EvalSymlinks(filepath.Join(path, logicalRel)); err == nil && activeRoot == root {
 			return true, nil
 		}
 		if empty[root] {
 			return false, nil
+		}
+		if ancestors[root] {
+			var err error
+			found, err = firstStagedBody(entryPath)
+			if err == nil && found == "" {
+				empty[root] = true
+			}
+			return found != "", err
 		}
 		ancestors[root] = true
 		defer delete(ancestors, root)
