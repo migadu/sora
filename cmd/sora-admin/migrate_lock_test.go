@@ -5,12 +5,14 @@ package main
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/testutils"
 )
 
@@ -42,6 +44,15 @@ func TestMigrateCommands_TakeNoSessionLevelAdvisoryLock(t *testing.T) {
 	if locks := proxy.SessionAdvisoryLockStatements(); len(locks) > 0 {
 		t.Fatalf("sora-admin migrate issued %d session-level advisory lock statement(s): %q", len(locks), locks)
 	}
+	sawVersionTable := false
+	for _, s := range proxy.Statements() {
+		if strings.Contains(s, "schema_migrations") {
+			sawVersionTable = true
+		}
+	}
+	if !sawVersionTable {
+		t.Fatal("the proxy recorded no schema_migrations statement; the test is not observing sora-admin migrate")
+	}
 }
 
 // sora-admin migrate up/down/force must not run while a sora instance is migrating:
@@ -68,11 +79,13 @@ func TestMigrateCommands_RefusedWhileTheMigrationLeaderLockIsHeld(t *testing.T) 
 	t.Cleanup(func() { globalConfig.Database.Write = saved })
 	globalConfig.Database.Write = cfg.Write
 
-	m, closer, err := getMigrateInstance(ctx)
+	_, closer, err := getMigrateInstance(ctx)
 	if err == nil {
-		_ = m
 		closer.Close()
 		t.Fatal("sora-admin migrate got a migration instance while another migrator holds the leader lock")
+	}
+	if !errors.Is(err, db.ErrMigrationInProgress) {
+		t.Fatalf("getMigrateInstance failed with %v, want db.ErrMigrationInProgress", err)
 	}
 }
 
