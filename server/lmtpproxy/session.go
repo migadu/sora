@@ -27,6 +27,7 @@ type Session struct {
 	clientConn            net.Conn            // Reassigned on STARTTLS; writes must hold mu (sendGracefulShutdownMessage reads it from the Stop goroutine)
 	listenerConn          net.Conn            // The accepted connection, never reassigned: its SoraConn carries the JA4 and username, which the TLS conn above it after STARTTLS does not
 	startTLSInProgress    bool                // Between the 220 to STARTTLS and the end of its handshake, under mu: the client reads neither plaintext nor, yet, TLS
+	greeted               bool                // The 220 greeting has been written, under mu: before it the implicit-TLS handshake may be pending, and a notice written then would wait for it
 	backendConn           net.Conn            // Reassigned on backend connect/STARTTLS/error; writes must hold mu (same reason)
 	backendRoute          *proxy.BackendRoute // Authorization of the held socket; survives per-recipient routing and transaction resets
 	backendReader         *bufio.Reader
@@ -165,6 +166,9 @@ func (s *Session) handleConnection() {
 		s.DebugLog("Failed to send greeting", "error", err)
 		return
 	}
+	s.mu.Lock()
+	s.greeted = true
+	s.mu.Unlock()
 
 	// Handle commands until we get RCPT TO
 	for {

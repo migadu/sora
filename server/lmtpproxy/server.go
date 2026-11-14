@@ -601,9 +601,14 @@ func (s *Server) sendGracefulShutdownMessage() {
 
 	// Step 2: Write 421 shutdown message directly to clientConn: the TLS
 	// connection after STARTTLS, and nothing while STARTTLS is negotiating.
+	// Nothing either before the session's greeting: its implicit-TLS handshake
+	// may still be pending, and the write would wait for it (up to the
+	// handshake deadline, holding session.mu, one session after another) or,
+	// before the handshake has started, be refused. Step 4 closes such a
+	// session, which also ends its handshake.
 	for _, session := range activeSessions {
 		session.mu.Lock()
-		if session.clientConn != nil && !session.startTLSInProgress {
+		if session.clientConn != nil && session.greeted && !session.startTLSInProgress {
 			_, _ = fmt.Fprint(session.clientConn, "421 4.3.2 Service shutting down, please try again later\r\n")
 		}
 		session.mu.Unlock()
