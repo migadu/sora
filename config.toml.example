@@ -224,7 +224,8 @@ storage_provider = "s3"                         # Certificate storage backend (c
 # sync_interval = "5m"                          # Interval to check S3 for certificate updates (e.g., "5m", "10m", "1h"). Default: "5m"
 #                                               # Set to "0" to disable periodic sync. When enabled, all cluster nodes will automatically
 #                                               # download renewed certificates from S3 without restart. This ensures all nodes serve the
-#                                               # same certificate even when the leader renews it.
+#                                               # same certificate even when the leader renews it. It also writes to S3 any
+#                                               # certificate a node could only store locally while S3 refused writes.
 
 # OPTIONAL: Local filesystem fallback for S3 outages (enabled by default)
 # enable_fallback = true                        # Enable local filesystem fallback when S3 is unavailable (default: true)
@@ -241,9 +242,12 @@ endpoint = "s3.amazonaws.com"                   # S3-compatible storage endpoint
                                                 # Can include protocol (https:// or http://) or omit it - protocol is automatically added based on disable_tls setting if not present
 disable_tls = false                             # Disable TLS for S3 endpoint (when true, uses http:// instead of https://). Useful for local MinIO setups.
                                                 # Note: Ignored if endpoint already includes a protocol scheme
-debug = false                                   # Enable detailed S3 request/response tracing (impacts performance)
-# access_key = ""                               # AWS/S3 access key (optional - uses IAM credentials chain if omitted)
-# secret_key = ""                               # AWS/S3 secret key (optional - uses IAM credentials chain if omitted)
+debug = false                                   # Log every S3 request and response at INFO (impacts performance)
+# region = "us-east-1"                          # Region requests are signed for. AWS refuses a signature for another region
+#                                               # than the bucket's. Default: AWS_REGION / the shared AWS config, else "us-east-1".
+# access_key = ""                               # AWS/S3 access key (optional - without both keys the AWS default credential
+# secret_key = ""                               # chain is used: environment, shared credentials file, web identity, container
+#                                               # or instance role)
 # server_side_encryption = "AES256"             # Encryption asked of the store on every certificate write. Default: "AES256".
                                                 # Every object here is private key material (each certificate PEM bundle ends with
                                                 # its private key, and "acme_account+key" is the ACME account key), so protection

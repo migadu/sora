@@ -277,6 +277,7 @@ type TLSLetsEncryptS3Config struct {
 	Bucket     string `toml:"bucket"`      // S3 bucket for certificate storage
 	Endpoint   string `toml:"endpoint"`    // S3-compatible storage endpoint (default: "s3.amazonaws.com")
 	DisableTLS bool   `toml:"disable_tls"` // Disable TLS for S3 endpoint (useful for local MinIO setups)
+	Region     string `toml:"region"`      // Signing region (default: AWS_REGION or the shared AWS config, else "us-east-1")
 	Debug      bool   `toml:"debug"`       // Enable detailed S3 request/response tracing
 	AccessKey  string `toml:"access_key"`  // AWS credentials (optional, uses default chain)
 	SecretKey  string `toml:"secret_key"`  // AWS credentials (optional)
