@@ -37,7 +37,7 @@ require (
 	modernc.org/sqlite v1.56.0
 )
 
-replace github.com/emersion/go-smtp => github.com/migadu/go-smtp v0.0.0-20261114133104-00ce2a0f75d0
+replace github.com/emersion/go-smtp => github.com/migadu/go-smtp v0.0.0-20261114134723-02d04d2e163e
 
 replace github.com/emersion/go-message => github.com/migadu/go-message v0.0.0-20260705121217-8814c0e56d68
 
