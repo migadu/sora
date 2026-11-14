@@ -222,17 +222,12 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					return nil
 				}
 
-				// Record failed master password authentication
-				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-				if s.server.authLimiter != nil {
-					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authKey, false)
-				}
-
-				// Answer exactly like any other bad credential: a distinct reply is
-				// reachable with only the master USERNAME and confirms it to an
-				// attacker (see login.go). Reason kept for the operator at WARN.
+				// Answer exactly like any other bad credential, at the same cost: a
+				// distinct reply, or a quicker one, is reachable with only the master
+				// USERNAME and confirms it to an attacker (see login.go). Reason kept for
+				// the operator at WARN.
 				s.WarnLog("master username authentication failed (invalid master password)")
-				return authFailedError()
+				return s.refuseLikeWrongPassword(s.ctx, username, password, netConn, proxyInfo, authKey)
 			}
 
 			// 2. Check for Master SASL Authentication (traditional SASL proxy authentication)
@@ -263,10 +258,10 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					// Network gate, anchored to the real socket peer (NetConn().RemoteAddr()),
 					// which PROXY/XCLIENT/ID forwarding cannot rewrite. Pass nil limiter so
-					// failure accounting happens once in refuseMasterSASLImpersonation after
+					// failure accounting happens once in refuseLikeWrongPassword after
 					// equalizing password-verification work with regular authentication.
 					if !s.AdmitMasterLogin(s.ctx, settings.masterSASLGate, nil, netConn, proxyInfo, authKey, "master SASL") {
-						return s.refuseMasterSASLImpersonation(s.ctx, username, password, netConn, proxyInfo, authKey)
+						return s.refuseLikeWrongPassword(s.ctx, username, password, netConn, proxyInfo, authKey)
 					}
 
 					// Master SASL credentials match. The user to log in as is the
@@ -281,7 +276,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					if err != nil {
 						// Same reply, accounting, and password-verification work as a bad credential.
 						s.WarnLog("impersonation target rejected (address not in the correct format)", "target_user", targetUserToImpersonate, "error", err)
-						return s.refuseMasterSASLImpersonation(s.ctx, username, password, netConn, proxyInfo, authKey)
+						return s.refuseLikeWrongPassword(s.ctx, username, password, netConn, proxyInfo, authKey)
 					}
 
 					AccountID, err := s.server.rdb.GetMasterLoginTargetWithRetry(s.ctx, address.BaseAddress())
@@ -315,7 +310,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 							return s.login(s.ctx, username, password, identity, false)
 						}
 						// Same reply, accounting, and password-verification work as a bad credential.
-						return s.refuseMasterSASLImpersonation(s.ctx, username, password, netConn, proxyInfo, authKey)
+						return s.refuseLikeWrongPassword(s.ctx, username, password, netConn, proxyInfo, authKey)
 					}
 
 					// Get primary email address for this account
@@ -433,14 +428,17 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 	}
 }
 
-// refuseMasterSASLImpersonation answers a refused non-self master SASL login
-// with the same password-verification work, lookup-cache update, rate-limit
-// accounting, and error reply that a wrong password receives via regular
-// authentication (#846), without exposing AUTHORIZATIONFAILED if username
-// happens to name an account whose own password equals master_sasl_password.
-func (s *IMAPSession) refuseMasterSASLImpersonation(ctx context.Context, username, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) error {
-	if authnAddr, err := server.NewAddress(username); err == nil &&
-		!(len(s.server.masterUsername) > 0 && authnAddr.HasSuffix() && checkMasterCredential(authnAddr.Suffix(), s.server.masterUsername)) {
+// refuseLikeWrongPassword refuses a login that must not succeed with what regular
+// authentication gives username with a wrong password: the credential check of its
+// base address (password verification and lookup-cache update), whose verdict is
+// discarded, then the same rate-limit accounting and reply. A refusal that skipped the
+// check would be answered one verification sooner and confirm what made it one. Used
+// for a refused master SASL impersonation (#846), which must not answer
+// AUTHORIZATIONFAILED when username names an account whose own password is the master
+// SASL password, and for a wrong password in the master username form (#801), which
+// must not log in even when it is the account's own password.
+func (s *IMAPSession) refuseLikeWrongPassword(ctx context.Context, username, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) error {
+	if authnAddr, err := server.NewAddress(username); err == nil {
 		if _, authErr := s.server.Authenticate(ctx, authnAddr.BaseAddress(), password); authErr != nil {
 			if errors.Is(authErr, context.Canceled) || errors.Is(authErr, context.DeadlineExceeded) {
 				s.InfoLog("authentication cancelled due to server shutdown")

@@ -32,8 +32,23 @@ func TestStartupChecksTheWholeFile(t *testing.T) {
 			wantErr: []string{"invalid configuration - [cleanup]: fts_retention must not be negative"},
 		},
 		{
+			// A negative grace_period hard-deletes expunged mail at the next cleaner cycle (#667).
+			name:    "cleanup grace_period negative on a mail backend",
+			content: "[cleanup]\ngrace_period = \"-14d\"\n" + imapBackend,
+			wantErr: []string{`invalid configuration - [cleanup]: grace_period must not be negative, got "-14d"`},
+		},
+		{
+			name:    "cleanup instance_liveness_threshold 0 on a mail backend",
+			content: "[cleanup]\ninstance_liveness_threshold = \"0\"\n" + imapBackend,
+			wantErr: []string{`invalid configuration - [cleanup]: instance_liveness_threshold must be positive, got "0"`},
+		},
+		{
 			name:    "uploader concurrency 0 on a proxy",
 			content: "[uploader]\nconcurrency = 0\n" + imapProxy,
+		},
+		{
+			name:    "cleanup grace_period negative on a proxy",
+			content: "[cleanup]\ngrace_period = \"-14d\"\n" + imapProxy,
 		},
 		{
 			name: "every problem reported",
