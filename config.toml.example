@@ -1267,6 +1267,7 @@ auth_rate_limit.max_username_entries = 50000      # Max username tracking entrie
 # Cache authentication results to reduce database queries and improve performance.
 # ENABLED BY DEFAULT with sensible settings. Only configure to override defaults or disable;
 # keys left out of the table keep their defaults (a table without "enabled" leaves it on).
+# Exception: http_user_api and user_api_proxy cache only when the table is present.
 # [server.lookup_cache]
 # enabled = true                          # Enable authentication and routing lookup caching for this server (default: true)
 # positive_ttl = "5m"                     # How long to cache successful authentications (default: 5m)
