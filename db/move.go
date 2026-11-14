@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -47,20 +48,35 @@ func LockS3ObjectsSharedInTx(ctx context.Context, tx pgx.Tx, accountID int64, co
 	return nil
 }
 
+// ErrMoveSourceChanged is returned by MoveMessages when a source row owned by another
+// account than the destination no longer has the content hash the caller made its body
+// available for under the destination owner's S3 path. Nothing is written; reading the
+// source again and moving anew can succeed.
+var ErrMoveSourceChanged = errors.New("a source message changed during the move")
+
 // MoveMessages moves the messages with the given UIDs from srcMailboxID into
 // destMailboxID, owned by destAccountID, within the caller's transaction, and returns a
 // map of old UIDs to new UIDs.
 //
 // A moved row of another account is re-keyed to destAccountID's S3 path
-// (destS3Domain/destS3Localpart). It is uploaded exactly when its body is in
-// destObjects: the bodies whose object under that path the caller made exist while tx
-// held their locks in shared mode (LockS3ObjectsSharedInTx), so the cleaner cannot have
-// deleted it since and cannot until these rows commit. Any other re-keyed row is staged
-// for an upload under the owner's path, from the staging file the caller linked there.
-// Whether the source row is uploaded says nothing about the owner's key: an upload of
-// the source that finished after the caller looked wrote only the source's key.
-// destObjects may be nil, as it is when every source row belongs to destAccountID.
-func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, destObjects []string) (map[imap.UID]imap.UID, error) {
+// (destS3Domain/destS3Localpart), where the caller must first have made its body
+// available (its object, or the staging file of the upload restagePendingUploads
+// queues). sourceHashes holds, by source UID, the content hash each such row had when
+// the caller did so, and the row is moved only if it still has it: sora-admin import
+// rekey renames a body's hash (RekeyContentHash) under no lock the caller takes, and a
+// row moved under the new hash would point at a key nothing wrote. A renamed source fails
+// the move with ErrMoveSourceChanged before anything is written. The check is made once
+// the source rows are locked, so their hashes cannot change again before tx ends.
+//
+// A re-keyed row is uploaded exactly when its body is in destObjects: the bodies whose
+// object under that path the caller made exist while tx held their locks in shared mode
+// (LockS3ObjectsSharedInTx), so the cleaner cannot have deleted it since and cannot until
+// these rows commit. Any other re-keyed row is staged for an upload under the owner's
+// path, from the staging file the caller linked there. Whether the source row is uploaded
+// says nothing about the owner's key: an upload of the source that finished after the
+// caller looked wrote only the source's key. sourceHashes and destObjects may be nil, as
+// they are when every source row belongs to destAccountID.
+func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string, destObjects []string) (map[imap.UID]imap.UID, error) {
 	// Map to store the original UID to new UID mapping
 	messageUIDMap := make(map[imap.UID]imap.UID)
 	if destObjects == nil {
@@ -87,7 +103,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	// Every unseen-mutating path (MOVE, EXPUNGE, STORE) acquires the mailbox_stats
 	// row first and message rows second, so they cannot deadlock against each other.
 	rows, err := tx.Query(ctx, `
-		SELECT id, uid, account_id FROM messages
+		SELECT id, uid, account_id, content_hash FROM messages
 		WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL
 		ORDER BY uid
 		FOR UPDATE
@@ -105,8 +121,15 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	for rows.Next() {
 		var messageID, sourceAccountID int64
 		var sourceUID imap.UID
-		if err := rows.Scan(&messageID, &sourceUID, &sourceAccountID); err != nil {
+		var contentHash string
+		if err := rows.Scan(&messageID, &sourceUID, &sourceAccountID, &contentHash); err != nil {
 			return nil, fmt.Errorf("failed to scan message ID and UID: %w", err)
+		}
+		// The row is locked now, so its hash is the one the INSERT below copies: a row
+		// re-keyed to the owner must still have the hash the caller made its body
+		// available for under the owner's key (sourceHashes).
+		if sourceAccountID != destAccountID && contentHash != sourceHashes[sourceUID] {
+			return nil, fmt.Errorf("%w: UID %d", ErrMoveSourceChanged, sourceUID)
 		}
 		messageIDs = append(messageIDs, messageID)
 		sourceUIDsForMap = append(sourceUIDsForMap, sourceUID)
