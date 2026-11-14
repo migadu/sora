@@ -362,7 +362,16 @@ func handleRelayRequeue(_ context.Context) {
 
 	// The queue does the move, so requeue keeps the order its own writers rely on: a
 	// running server's worker picks the message up on its next resync of pending/.
+	// NewDiskQueue creates missing directories, and created by `sudo sora-admin` they
+	// would belong to root, where the server, running as its own user, cannot queue:
+	// requeue only works on a queue the server has made.
 	queuePath := cfg.Relay.GetQueuePath()
+	for _, dir := range []string{"failed", "pending"} {
+		if _, err := os.Stat(filepath.Join(queuePath, dir)); err != nil {
+			fmt.Fprintf(os.Stderr, "Error accessing relay queue: %v\n", err)
+			os.Exit(1)
+		}
+	}
 	queue, err := relayqueue.NewDiskQueue(queuePath, cfg.Relay.Queue.MaxAttempts, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error accessing relay queue: %v\n", err)
