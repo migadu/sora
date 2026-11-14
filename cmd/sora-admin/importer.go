@@ -1315,6 +1315,19 @@ func (i *Importer) scanMaildir() error {
 	// This channel will be used by the producer (filepath.Walk) to send files to consumers (workers).
 	filesToProcess := make(chan fileToProcess, i.jobs*10) // Buffered channel
 
+	// refuse reports a file the import does not take, and drops the row an earlier run
+	// cached for it (the key the INSERT OR IGNORE below keeps it by): the import phase
+	// imports every cached row, so it would otherwise import what this scan refuses.
+	refuse := func(file fileToProcess, err error) {
+		logger.Warn("Invalid message", "path", file.path, "error", err)
+		i.recordFailedPath(file.path, fmt.Sprintf("invalid message: %v", err))
+		atomic.AddInt64(&i.failedMessages, 1)
+		if _, derr := i.sqliteDB.Exec("DELETE FROM messages WHERE filename = ? AND mailbox = ?",
+			file.filename, file.mailboxName); derr != nil {
+			logger.Warn("Failed to drop the cached row of a refused message", "path", file.path, "error", derr)
+		}
+	}
+
 	// Start worker goroutines
 	for w := 0; w < i.jobs; w++ {
 		wg.Add(1)
@@ -1326,9 +1339,7 @@ func (i *Importer) scanMaildir() error {
 				// never reaches the cache is otherwise invisible to every later count.
 				hash, size, err := hashFile(file.path, i.options.MaxMessageSize)
 				if errors.Is(err, errMessageTooLarge) {
-					logger.Warn("Invalid message", "path", file.path, "error", err)
-					i.recordFailedPath(file.path, fmt.Sprintf("invalid message: %v", err))
-					atomic.AddInt64(&i.failedMessages, 1)
+					refuse(file, err)
 					continue
 				}
 				if err != nil {
@@ -1340,9 +1351,7 @@ func (i *Importer) scanMaildir() error {
 
 				// Validate message
 				if err := i.validateMessage(size); err != nil {
-					logger.Warn("Invalid message", "path", file.path, "error", err)
-					i.recordFailedPath(file.path, fmt.Sprintf("invalid message: %v", err))
-					atomic.AddInt64(&i.failedMessages, 1)
+					refuse(file, err)
 					continue
 				}
 
@@ -1937,6 +1946,18 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 			if err != nil {
 				logger.Warn("Failed to decompress file", "path", msg.path, "error", err)
 				i.recordFailedPath(msg.path, fmt.Sprintf("decompression error: %v", err))
+				atomic.AddInt64(&i.failedMessages, 1)
+				return
+			}
+
+			// The scan's size check does not cover these bytes: the row may be one an
+			// earlier run cached under a higher limit, for a file this scan did not
+			// visit (--paths-file), and the file may have changed since the scan. The
+			// cached size may be stale for the same reasons, so the check is on what
+			// would be stored.
+			if err := i.validateMessage(int64(len(content))); err != nil {
+				logger.Warn("Invalid message", "path", msg.path, "error", err)
+				i.recordFailedPath(msg.path, fmt.Sprintf("invalid message: %v", err))
 				atomic.AddInt64(&i.failedMessages, 1)
 				return
 			}
