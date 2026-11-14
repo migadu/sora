@@ -63,8 +63,14 @@ type ClusterRateLimiter struct {
 	limiter        *AuthRateLimiter
 	clusterManager *cluster.Manager
 
-	// Outgoing gossip
-	queue *gossipQueue
+	// Outgoing gossip. IP blocks and unblocks have a tier of their own that is
+	// drained first: every failed login queues a username failure and, past
+	// the delay threshold, a failure count, and within a transmit tier
+	// memberlist hands out the largest message first, so during an attack -
+	// when a block matters most - username failures for long addresses would
+	// otherwise hold the block off the wire until it went stale.
+	blocks *gossipQueue
+	queue  *gossipQueue
 
 	// Duplicate suppression for received events
 	dedup gossipDedup
@@ -92,6 +98,7 @@ func NewClusterRateLimiter(limiter *AuthRateLimiter, clusterMgr *cluster.Manager
 		clusterManager:    clusterMgr,
 		syncBlocks:        syncBlocks,
 		syncFailureCounts: syncFailureCounts,
+		blocks:            newGossipQueue("rate-limit-blocks:"+limiter.protocol, clusterMgr, maxRateLimitEventQueueSize),
 		queue:             newGossipQueue("rate-limit:"+limiter.protocol, clusterMgr, maxRateLimitEventQueueSize),
 	}
 
@@ -219,14 +226,21 @@ func (crl *ClusterRateLimiter) queueEvent(event RateLimitEvent) {
 		return
 	}
 
-	crl.queue.enqueue(encoded)
+	switch event.Type {
+	case RateLimitEventBlockIP, RateLimitEventUnblockIP:
+		crl.blocks.enqueue(encoded)
+	default:
+		crl.queue.enqueue(encoded)
+	}
 }
 
 // GetBroadcasts returns events to broadcast (called by cluster manager).
 // memberlist calls this once per gossip target, so an event stays queued until
-// it has been transmitted often enough to have reached the cluster.
+// it has been transmitted often enough to have reached the cluster. Blocks go
+// first, within half of the datagram so a burst of them cannot stall the
+// failure counts behind it.
 func (crl *ClusterRateLimiter) GetBroadcasts(overhead, limit int) [][]byte {
-	return crl.queue.GetBroadcasts(overhead, limit)
+	return drainTiers(nil, crl.blocks, crl.queue, overhead, limit)
 }
 
 // HandleClusterEvent processes a rate limit event from another node

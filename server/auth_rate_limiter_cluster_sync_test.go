@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -97,4 +98,33 @@ func TestPeerFailureCountNeverLowersTheLocalCount(t *testing.T) {
 	if !crl.limiter.IsIPBlocked(other) {
 		t.Error("a peer's count of 9 plus a local failure did not block the address")
 	}
+}
+
+// TestClusterBlockIsNotStarvedByFailureEvents: during a credential-stuffing run
+// every failed login queues a username failure, and memberlist hands out the
+// largest message of a transmit tier first. Username failures for long
+// addresses outsize a block, so the one event that makes the block cluster-wide
+// waited behind every one of them, and was the first fresh event pruned once
+// the queue overflowed.
+func TestClusterBlockIsNotStarvedByFailureEvents(t *testing.T) {
+	crl := newTestClusterRateLimiter(t)
+	crl.syncBlocks = true
+	crl.syncFailureCounts = true
+
+	now := time.Now()
+	crl.BroadcastBlockIP("192.0.2.40", now.Add(time.Minute), 10, now)
+	for i := range 200 {
+		crl.BroadcastUsernameFailure(fmt.Sprintf("a-rather-long-mailbox-name-%04d@customer-domain.example.com", i))
+	}
+
+	for _, msg := range crl.GetBroadcasts(gossipPerMsgOverhead, gossipUDPLimit) {
+		event, err := decodeRateLimitEvent(msg)
+		if err != nil {
+			t.Fatalf("decode broadcast: %v", err)
+		}
+		if event.Type == RateLimitEventBlockIP {
+			return
+		}
+	}
+	t.Error("the first datagram carried username failures and left the IP block queued behind them")
 }
