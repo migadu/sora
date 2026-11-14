@@ -453,9 +453,14 @@ Then Sora posts JSON to `endpoint`, with `Authorization: Bearer <auth_token>` wh
 |---|---|
 | `type` | `spam` or `ham`. |
 | `message` | The message after stripping. |
+| `message_base64` | The message after stripping, byte for byte, standard base64 (RFC 4648 section 4). Only present when it is not valid UTF-8. |
 | `user` | The address of the user who moved it. |
 | `source_mailbox`, `dest_mailbox` | The folder names. |
 | `timestamp` | When the report was built (RFC 3339). |
+
+As in the [HTTP relay request](#3-the-http-relay-request), each byte of `message` that is not valid
+UTF-8 is replaced with U+FFFD; the endpoint takes the message from `message_base64` when it is
+present and from `message` otherwise.
 
 A `2xx` answer is success. Anything else is a failure.
 
