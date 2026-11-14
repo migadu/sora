@@ -49,53 +49,58 @@ var reloadableServerSettings = map[string][]string{
 }
 
 // reloadServers hands each running server its [[server]] block from newCfg, the config
-// a SIGHUP re-read, by name, and reports the settings that block changed but the
-// server's ReloadConfig does not apply, as the global report does for [cleanup] and the
-// like. A server not in newCfg is left as it is. The config each server started with,
-// deps.config, is read and never written.
+// a SIGHUP re-read, by name, and reports what the reload leaves for a restart: the
+// settings a block changed that its server does not apply (all of them for a server
+// that does not reload: metrics, or one not registered yet), a block removed from the
+// file, whose server keeps running, and a block added to it, which is not started. The
+// config the servers started with, deps.config, is read and never written.
 func (deps *serverDependencies) reloadServers(newCfg *config.Config) {
-	deps.runningServersMux.Lock()
-	serverCount := len(deps.runningServers)
-	deps.runningServersMux.Unlock()
-
-	if serverCount == 0 {
-		return
-	}
-
 	newServers := newCfg.GetAllServers()
-	serversByName := make(map[string]config.ServerConfig, len(newServers))
+	newByName := make(map[string]config.ServerConfig, len(newServers))
 	for _, s := range newServers {
-		serversByName[s.Name] = s
+		newByName[s.Name] = s
 	}
 	startedServers := deps.config.GetAllServers()
-	startedByName := make(map[string]config.ServerConfig, len(startedServers))
-	for _, s := range startedServers {
-		startedByName[s.Name] = s
-	}
+	startedByName := make(map[string]bool, len(startedServers))
 
 	deps.runningServersMux.Lock()
 	defer deps.runningServersMux.Unlock()
-	for name, srv := range deps.runningServers {
-		newServerCfg, ok := serversByName[name]
+	for _, started := range startedServers {
+		name := started.Name
+		startedByName[name] = true
+		newServerCfg, ok := newByName[name]
 		if !ok {
+			logger.Info("Config reload: server removed or set to enabled = false, but it keeps running until a restart", "server", name, "type", started.Type)
 			continue
 		}
-		// Re-validate before applying: keeps the fail-closed startup guards
-		// (e.g. master_username with an empty master_password) effective on
-		// SIGHUP reload. Invalid new config is skipped; the server keeps
-		// running on its previous, already-validated config.
-		if err := newServerCfg.Validate(); err != nil {
-			logger.Error("Skipping reload: invalid new server config", "server", name, "error", err)
-			continue
-		}
-		if err := srv.ReloadConfig(newServerCfg); err != nil {
-			logger.Error("Failed to reload server config", "server", name, "error", err)
-		}
-		if started, ok := startedByName[name]; ok {
-			changed := started.RestartRequiredChanges(newServerCfg, reloadableServerSettings[started.Type])
-			if len(changed) > 0 {
-				logger.Info("Config reload: server settings changed but require restart to take effect", "server", name, "fields", changed)
+		var reloadable []string
+		if srv, running := deps.runningServers[name]; running {
+			// Re-validate before applying: keeps the fail-closed startup guards
+			// (e.g. master_username with an empty master_password) effective on
+			// SIGHUP reload. Invalid new config is skipped; the server keeps
+			// running on its previous, already-validated config.
+			if err := newServerCfg.Validate(); err != nil {
+				logger.Error("Skipping reload: invalid new server config", "server", name, "error", err)
+				continue
 			}
+			if err := srv.ReloadConfig(newServerCfg); err != nil {
+				logger.Error("Failed to reload server config", "server", name, "error", err)
+			}
+			reloadable = reloadableServerSettings[started.Type]
+		}
+		// Both configurations are enabled; omitted and explicit true are equivalent.
+		started.Enabled, newServerCfg.Enabled = nil, nil
+		if changed := started.RestartRequiredChanges(newServerCfg, reloadable); len(changed) > 0 {
+			logger.Info("Config reload: server settings changed but require restart to take effect", "server", name, "fields", changed)
+		}
+	}
+	for _, s := range newServers {
+		if !startedByName[s.Name] {
+			if err := s.Validate(); err != nil {
+				logger.Error("Config reload: invalid server config; a restart will refuse to start with it", "server", s.Name, "type", s.Type, "error", err)
+				continue
+			}
+			logger.Info("Config reload: server added or enabled but not running; it is not started until restart", "server", s.Name, "type", s.Type)
 		}
 	}
 }

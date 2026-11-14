@@ -12,6 +12,16 @@ import (
 // Sort implements the SORT extension (RFC 5256), SORT=DISPLAY extension (RFC 5957),
 // and ESORT extension (RFC 5267). It returns sorted message data according to the provided criteria.
 func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sortCriteria []imap.SortCriterion, charset string, searchCriteria *imap.SearchCriteria, options *imap.SortOptions) (*imap.SortData, error) {
+	if err := s.requireCapability(imap.CapSort, "SORT"); err != nil {
+		return nil, err
+	}
+	for _, c := range sortCriteria {
+		if c.Key == imap.SortKeyDisplayFrom || c.Key == imap.SortKeyDisplayTo {
+			if err := s.requireCapability(imap.CapSortDisplay, "SORT "+string(c.Key)); err != nil {
+				return nil, err
+			}
+		}
+	}
 	ctx = s.pinnedContext(ctx)
 
 	// Reject pathologically complex/deep criteria before decoding or building a query.

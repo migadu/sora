@@ -305,13 +305,13 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	if lookupCacheConfig.Enabled && !proxy.RemoteLookupUsesClientIP(opts.RemoteLookup) {
-		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
-		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
-		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault(opts.Name)
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault(opts.Name)
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(opts.Name)
 		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// Parse positive revalidation window from config (used for password change detection)
-		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault()
+		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(opts.Name)
 
 		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("ManageSieve Proxy: Lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)

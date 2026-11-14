@@ -1,10 +1,13 @@
 package adminapi
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
+	"time"
 )
 
 // AffinitySetRequest represents a request to set user affinity
@@ -20,6 +23,16 @@ type AffinityGetResponse struct {
 	Protocol string `json:"protocol"`
 	Backend  string `json:"backend"`
 	Found    bool   `json:"found"`
+}
+
+// AffinityListEntry is one affinity in GET /admin/affinity/list
+type AffinityListEntry struct {
+	User       string    `json:"user"`
+	Protocol   string    `json:"protocol"`
+	Backend    string    `json:"backend"`
+	AssignedAt time.Time `json:"assigned_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	NodeID     string    `json:"node_id"` // node that assigned the affinity
 }
 
 // handleAffinitySet handles POST /admin/affinity - set affinity for a user
@@ -106,14 +119,12 @@ func (s *Server) handleAffinityGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := map[string]any{
-		"user":     user,
-		"protocol": protocol,
-		"backend":  backend,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	s.writeJSON(w, http.StatusOK, AffinityGetResponse{
+		User:     user,
+		Protocol: protocol,
+		Backend:  backend,
+		Found:    true,
+	})
 }
 
 // handleAffinityDelete handles DELETE /admin/affinity?user=x&protocol=y - delete affinity for a user
@@ -145,19 +156,41 @@ func (s *Server) handleAffinityDelete(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleAffinityList handles GET /admin/affinity/list - list all affinities
+// handleAffinityList handles GET /admin/affinity/list[?protocol=x][&backend=y] - lists
+// this node's affinities, optionally of one protocol or one backend. Every node applies
+// the affinities the others gossip, so any node of a converged cluster lists the same set.
 func (s *Server) handleAffinityList(w http.ResponseWriter, r *http.Request) {
+	protocol := strings.ToLower(r.URL.Query().Get("protocol"))
+	backend := r.URL.Query().Get("backend")
+
 	// Check if affinity manager is available
 	if s.affinityManager == nil {
 		http.Error(w, `{"error": "Affinity manager not enabled on this server"}`, http.StatusServiceUnavailable)
 		return
 	}
 
-	// Note: The AffinityManager interface doesn't have a List method
-	// Affinities are distributed via gossip and stored in memory on each node
-	// To list all affinities, you would need to query each node individually
-	// or extend the AffinityManager interface to support listing
-	http.Error(w, `{"error": "List operation not yet implemented - affinities are distributed via gossip. Use GET with specific user/protocol to check affinity."}`, http.StatusNotImplemented)
+	affinities := []AffinityListEntry{}
+	for _, e := range s.affinityManager.List() {
+		if (protocol != "" && e.Protocol != protocol) || (backend != "" && e.Backend != backend) {
+			continue
+		}
+		affinities = append(affinities, AffinityListEntry{
+			User:       e.Username,
+			Protocol:   e.Protocol,
+			Backend:    e.Backend,
+			AssignedAt: e.AssignedAt,
+			ExpiresAt:  e.ExpiresAt,
+			NodeID:     e.NodeID,
+		})
+	}
+	slices.SortFunc(affinities, func(a, b AffinityListEntry) int {
+		return cmp.Or(strings.Compare(a.User, b.User), strings.Compare(a.Protocol, b.Protocol))
+	})
+
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"affinities": affinities,
+		"count":      len(affinities),
+	})
 }
 
 // handleAffinityStats handles GET /admin/affinity/stats - returns affinity statistics

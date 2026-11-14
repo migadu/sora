@@ -531,13 +531,13 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	if !lookupCacheConfig.Enabled {
 		logger.Info("IMAP: Lookup cache disabled", "name", name)
 	} else {
-		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
-		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
-		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault(name)
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault(name)
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(name)
 
 		maxSize := lookupCacheConfig.GetMaxSize()
 
-		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault()
+		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(name)
 
 		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("IMAP: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
@@ -1760,6 +1760,26 @@ var alwaysAdvertisedCaps = imap.CapSet{
 	imap.CapUTF8Accept:   {},
 }
 
+// sortExtensions extend the SORT command and imply it, which go-imap's Has
+// does not know: SORT=DISPLAY is advertised by "A server that supports the
+// full [SORT] extension as well as both the DISPLAYFROM and DISPLAYTO sort
+// criteria" (RFC 5957 §1), and servers advertising ESORT "support the return
+// options specified in [ESEARCH] in the SORT command" (RFC 5267 §3.1).
+var sortExtensions = imap.CapSet{
+	imap.CapSortDisplay: {},
+	imap.CapESort:       {},
+}
+
+// capImplies reports whether capability by implies capability c: go-imap's own
+// Has, so it follows the library, and sortExtensions.
+func capImplies(by, c imap.Cap) bool {
+	if (imap.CapSet{by: {}}).Has(c) {
+		return true
+	}
+	_, ok := sortExtensions[by]
+	return ok && c == imap.CapSort
+}
+
 // disableCapabilities removes the named capabilities from caps and returns
 // the ones it removed. go-imap's CapSet.Has also reports a capability that
 // another one in the set implies, and builds both the CAPABILITY response and
@@ -1767,10 +1787,10 @@ var alwaysAdvertisedCaps = imap.CapSet{
 // into the base protocol (IDLE, ESEARCH, SEARCHRES, MOVE, NAMESPACE, UIDPLUS,
 // ...), QRESYNC implies CONDSTORE (RFC 7162 §3.2.3). Deleting only the named key
 // left such a capability advertised and usable, so whatever implies it is
-// removed too. For IMAP4rev2 that downgrades the server or session to
-// IMAP4rev1, where go-imap lists each remaining extension on its own. The
-// implication test is go-imap's own Has, so it follows the library. A name in
-// alwaysAdvertisedCaps is skipped: nothing removed here can withdraw it.
+// removed too (see capImplies). For IMAP4rev2 that downgrades the server or
+// session to IMAP4rev1, where go-imap lists each remaining extension on its
+// own. A name in alwaysAdvertisedCaps is skipped: nothing removed here can
+// withdraw it.
 func disableCapabilities(caps imap.CapSet, names []string) []string {
 	var removed []string
 	for _, name := range names {
@@ -1783,7 +1803,7 @@ func disableCapabilities(caps imap.CapSet, names []string) []string {
 			removed = append(removed, name)
 		}
 		for other := range caps {
-			if (imap.CapSet{other: {}}).Has(c) {
+			if capImplies(other, c) {
 				delete(caps, other)
 				removed = append(removed, string(other))
 			}

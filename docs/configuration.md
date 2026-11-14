@@ -67,8 +67,10 @@ A table that the file leaves out is not configured: a node with neither (a proxy
 This section is for your S3-compatible object storage, where message bodies are stored.
 
 *   `endpoint`: The URL of your S3 provider (e.g., `s3.amazonaws.com` or a local MinIO `minio.example.com:9000`).
-*   `access_key` & `secret_key`: Your S3 credentials.
+*   `access_key` & `secret_key`: Your S3 credentials. Leave both out to take them from the AWS default credential chain (environment, shared credentials file, web identity, container or instance role).
 *   `bucket`: The name of the S3 bucket to use.
+*   `region`: The region requests are signed for (default: `AWS_REGION` or the shared AWS config, else `us-east-1`). AWS refuses a signature for another region than the bucket's; S3-compatible stores generally accept any.
+*   `debug`: Log every S3 request and response at INFO.
 *   `encrypt`: Set to `true` to enable client-side encryption. If enabled, you **must** provide a secure 32-byte `encryption_key`. **Losing this key means losing access to all your email bodies.**
 
 ### `[local_cache]` and `[uploader]`

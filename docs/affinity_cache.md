@@ -28,6 +28,7 @@ The affinity cache is only meaningful when **cluster mode** and **server affinit
 |---|---|
 | Cluster enabled + affinity enabled + cache\_path set | ✅ Yes |
 | Cluster enabled + affinity enabled + cache\_path empty | ❌ No (in-memory only) |
+| Cluster enabled + affinity disabled | ❌ No (no affinity manager) |
 | Cluster disabled | ❌ No (no affinity manager) |
 
 The cache is **strictly optional**. If it fails to initialize, the proxy continues with in-memory-only affinity (rebuilt from gossip). If writes fail, errors are logged but operations continue normally.
@@ -48,7 +49,7 @@ cache_path = "/var/cache/sora/affinity_cache.db"
 
 | Parameter | Default | Description |
 |---|---|---|
-| `enabled` | `false` | Enable cluster-wide server affinity |
+| `enabled` | `true` | Enable cluster-wide server affinity. `false` runs no affinity manager: no proxy on the node keeps affinity and no cache is opened |
 | `ttl` | `24h` | How long an affinity mapping persists before expiring |
 | `cleanup_interval` | `1h` | How often expired affinities are cleaned up |
 | `cache_path` | `""` (disabled) | Path to SQLite database for persistent affinity. Empty = in-memory only |

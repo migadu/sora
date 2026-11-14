@@ -8,6 +8,9 @@ import (
 )
 
 func (s *IMAPSession) Namespace(ctx context.Context) (*imap.NamespaceData, error) {
+	if err := s.requireCapability(imap.CapNamespace, "NAMESPACE"); err != nil {
+		return nil, err
+	}
 	data := &imap.NamespaceData{
 		Personal: []imap.NamespaceDescriptor{
 			{

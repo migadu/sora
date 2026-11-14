@@ -343,13 +343,13 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 	if opts.LookupCache != nil && opts.LookupCache.Enabled && !proxy.RemoteLookupUsesClientIP(opts.RemoteLookup) {
 		lookupCacheConfig := opts.LookupCache
 
-		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
-		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
-		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault(opts.Name)
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault(opts.Name)
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(opts.Name)
 
 		maxSize := lookupCacheConfig.GetMaxSize()
 
-		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault()
+		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(opts.Name)
 
 		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("User API Proxy: Route lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)

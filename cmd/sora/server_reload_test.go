@@ -105,6 +105,72 @@ func TestServerReloadRejectsBlockWithoutAddr(t *testing.T) {
 	}
 }
 
+// enabled = false on a running server's block takes effect at the next restart: the
+// reload says so instead of passing over the block in silence, and does not hand the
+// server a block that is no longer validated.
+func TestServerReloadReportsBlockDisabledWhileRunning(t *testing.T) {
+	logs := captureReloadLogs(t)
+	deps, reloaders := runningDeps(t, config.ServerConfig{Type: "pop3", Name: "pop3", Addr: ":110"})
+
+	disabled := false
+	deps.reloadServers(reloadedConfig(config.ServerConfig{Type: "pop3", Name: "pop3", Addr: ":110", Enabled: &disabled}))
+
+	if got := reloaders["pop3"].reloaded; len(got) != 0 {
+		t.Fatalf("ReloadConfig got %+v, want no call", got)
+	}
+	if out := logs.String(); !hasLineWith(out, "server=pop3", "enabled = false", "restart") {
+		t.Errorf("no notice that disabling pop3 needs a restart:\n%s", out)
+	}
+}
+
+// A block that was not started (enabled = false at startup, or added since) and is
+// enabled now starts at the next restart, and the reload says so; if the block is
+// invalid, the reload says that the restart will refuse it.
+func TestServerReloadReportsBlockEnabledWhileNotRunning(t *testing.T) {
+	logs := captureReloadLogs(t)
+	disabled := false
+	deps, _ := runningDeps(t, config.ServerConfig{Type: "pop3", Name: "pop3", Addr: ":110"})
+	deps.config.DynamicServers = append(deps.config.DynamicServers,
+		config.ServerConfig{Type: "imap", Name: "imap", Addr: ":143", Enabled: &disabled})
+
+	deps.reloadServers(reloadedConfig(
+		config.ServerConfig{Type: "pop3", Name: "pop3", Addr: ":110"},
+		config.ServerConfig{Type: "imap", Name: "imap", Addr: ":143"},
+		config.ServerConfig{Type: "lmtp", Name: "lmtp", Addr: ":24"},
+		config.ServerConfig{Type: "managesieve", Name: "sieve"},
+	))
+
+	out := logs.String()
+	for _, name := range []string{"imap", "lmtp"} {
+		if !hasLineWith(out, "server="+name, "not running", "restart") {
+			t.Errorf("no notice that starting %s needs a restart:\n%s", name, out)
+		}
+	}
+	if !hasLineWith(out, "server=sieve", "refuse", "server address is required") {
+		t.Errorf("no error that the added sieve block lacks its addr:\n%s", out)
+	}
+	if hasLineWith(out, "server=pop3", "restart") {
+		t.Errorf("pop3, unchanged and running, reported as needing a restart:\n%s", out)
+	}
+}
+
+// enabled = true is what an absent enabled means: writing it into a running server's
+// block changes nothing, so the reload has no restart to report.
+func TestServerReloadExplicitEnabledTrueIsNoChange(t *testing.T) {
+	logs := captureReloadLogs(t)
+	deps, reloaders := runningDeps(t, config.ServerConfig{Type: "pop3", Name: "pop3", Addr: ":110"})
+
+	enabled := true
+	deps.reloadServers(reloadedConfig(config.ServerConfig{Type: "pop3", Name: "pop3", Addr: ":110", Enabled: &enabled}))
+
+	if got := reloaders["pop3"].reloaded; len(got) != 1 {
+		t.Fatalf("ReloadConfig got %+v, want the new config once", got)
+	}
+	if out := logs.String(); strings.Contains(out, "restart") {
+		t.Errorf("enabled = true on a running server reported as needing a restart:\n%s", out)
+	}
+}
+
 // Every setting in the table is one RestartRequiredChanges can name (a table name such
 // as "timeouts" would match nothing and so silence nothing), under a real server type.
 func TestReloadableServerSettingsAreRealKeys(t *testing.T) {
@@ -205,5 +271,57 @@ func TestServerReloadReportsDebugRequiresRestart(t *testing.T) {
 				t.Errorf("missing debug restart notice: %s", logs.String())
 			}
 		})
+	}
+}
+
+// A reload neither starts a [[server]] block added to the file nor stops one removed
+// from it. Both went unmentioned (#282); they are reported as needing a restart.
+func TestServerReloadReportsAddedAndRemovedServers(t *testing.T) {
+	logs := captureReloadLogs(t)
+	imap := config.ServerConfig{Type: "imap", Name: "imap", Addr: ":143"}
+	deps, reloaders := runningDeps(t, imap, config.ServerConfig{Type: "pop3", Name: "pop3", Addr: ":110"})
+
+	deps.reloadServers(reloadedConfig(imap, config.ServerConfig{Type: "lmtp", Name: "lmtp", Addr: ":24"}))
+
+	out := logs.String()
+	if !hasLineWith(out, "server=pop3", "removed", "restart") {
+		t.Errorf("no notice that the removed pop3 server keeps running until a restart:\n%s", out)
+	}
+	if !hasLineWith(out, "server=lmtp", "added", "restart") {
+		t.Errorf("no notice that the added lmtp server starts only on a restart:\n%s", out)
+	}
+	if hasLineWith(out, "server=imap ", "restart") {
+		t.Errorf("the unchanged imap server reported:\n%s", out)
+	}
+	if got := len(reloaders["imap"].reloaded); got != 1 {
+		t.Errorf("imap reloaded %d times, want 1", got)
+	}
+	if got := len(reloaders["pop3"].reloaded); got != 0 {
+		t.Errorf("the removed pop3 server reloaded %d times, want 0", got)
+	}
+}
+
+// A server that has no ReloadConfig (metrics), or has not registered for reload yet
+// (still starting), applies nothing a reload reads, so every change to its block needs a
+// restart. These went unreported: the report covered registered servers only.
+func TestServerReloadReportsServersThatDoNotReload(t *testing.T) {
+	logs := captureReloadLogs(t)
+	deps := &serverDependencies{config: config.NewDefaultConfig()}
+	deps.config.DynamicServers = []config.ServerConfig{
+		{Type: "metrics", Name: "metrics", Addr: ":9090"},
+		{Type: "http_user_api", Name: "user-api", Addr: ":8081", AllowedOrigins: []string{"https://mail.example.com"}},
+	}
+
+	deps.reloadServers(reloadedConfig(
+		config.ServerConfig{Type: "metrics", Name: "metrics", Addr: ":9091"},
+		config.ServerConfig{Type: "http_user_api", Name: "user-api", Addr: ":8081", AllowedOrigins: []string{"https://webmail.example.com"}},
+	))
+
+	out := logs.String()
+	if !hasLineWith(out, "server=metrics", "require restart", "addr") {
+		t.Errorf("no restart notice naming addr for the metrics server:\n%s", out)
+	}
+	if !hasLineWith(out, "server=user-api", "require restart", "allowed_origins") {
+		t.Errorf("no restart notice naming allowed_origins for a user-api not running yet:\n%s", out)
 	}
 }
