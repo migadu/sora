@@ -141,7 +141,7 @@ type POP3ServerOptions struct {
 	MasterPassword              string
 	MasterSASLUsername          string
 	MasterSASLPassword          string
-	MasterSASLAllowedNetworks   []string // Source networks allowed to use master SASL (empty = any, anchored to real socket peer)
+	MasterSASLAllowedNetworks   []string // Source networks allowed to use master SASL and the master-username form (empty = any, anchored to real socket peer)
 	MaxConnections              int
 	MaxConnectionsPerIP         int
 	MaxConnectionsPerUser       int      // Maximum connections per user (0=unlimited) - used for local tracking on backends

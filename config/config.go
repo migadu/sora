@@ -1082,10 +1082,12 @@ type ServerConfig struct {
 	MasterSASLUsername string `toml:"master_sasl_username,omitempty"`
 	MasterSASLPassword string `toml:"master_sasl_password,omitempty"`
 	// MasterSASLAllowedNetworks optionally restricts which source networks may use
-	// master SASL credentials to impersonate users on this backend. It is anchored to
-	// the real socket peer (not forwardable via PROXY/XCLIENT/IMAP ID), so it should
-	// list the proxy hosts. Empty = disabled (master SASL allowed from any source —
-	// legacy behavior; relies solely on network isolation + secret secrecy).
+	// master credentials to impersonate users on this backend: master SASL and the
+	// master-username form (user@domain@master_username) alike, on IMAP, POP3 and
+	// ManageSieve. It is anchored to the real socket peer (not forwardable via
+	// PROXY/XCLIENT/IMAP ID), so it should list the proxy hosts. Empty = disabled
+	// (master logins allowed from any source — legacy behavior; relies solely on
+	// network isolation + secret secrecy).
 	MasterSASLAllowedNetworks []string `toml:"master_sasl_allowed_networks,omitempty"`
 
 	// STARTTLS on the listening port (requires tls = true): IMAP, LMTP, ManageSieve, POP3 and their proxies
