@@ -18,6 +18,10 @@ import (
 // This sentinel error allows protocol handlers to provide appropriate responses (e.g., IMAP BYE with ALERT)
 var ErrRateLimitExceeded = errors.New("rate limit exceeded")
 
+// ErrIPBlocked is the refusal of a connection from a client whose IP the auth rate
+// limiter blocks (Tier 2, IsIPBlocked / IsIPBlockedWithProxy).
+var ErrIPBlocked = errors.New("IP blocked by auth rate limiter")
+
 // RateLimitError contains details about why rate limiting was triggered
 type RateLimitError struct {
 	Reason       string // "ip_blocked" or "ip_username_blocked"

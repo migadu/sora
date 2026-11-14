@@ -18,16 +18,17 @@ import (
 // many connections, as opposed to the server being full (max_connections).
 var ErrMaxConnectionsPerIP = errors.New("maximum connections per IP reached")
 
-// IsProxiedClientRefusal reports whether err, a ConnectionLimiter refusal, refused the
-// client a PROXY header named over that client's own max_connections_per_ip. Such a
-// refusal is answered with a protocol reply after the TLS handshake instead of a silent
-// close: the PROXY peer is a proxy or load balancer (the header is only read from a
-// trusted peer), and a sora proxy that sees the socket close before its TLS handshake
-// counts a backend failure, quarantining the backend for every user over one client.
-// Every other refusal stays a silent close, so a flooder connecting directly is told
-// nothing.
+// IsProxiedClientRefusal reports whether err refused the client a PROXY header named for
+// a reason of that client's own: over its max_connections_per_ip (ErrMaxConnectionsPerIP)
+// or with its IP blocked by the auth rate limiter (ErrIPBlocked). Such a refusal is
+// answered with a protocol reply after the TLS handshake instead of a silent close: the
+// PROXY peer is a proxy or load balancer (the header is only read from a trusted peer),
+// and a sora proxy that sees the socket close before its TLS handshake counts a backend
+// failure, quarantining the backend for every user over one client. Every other refusal
+// stays a silent close, so a flooder connecting directly is told nothing.
 func IsProxiedClientRefusal(err error, proxyInfo *ProxyProtocolInfo) bool {
-	return proxyInfo != nil && proxyInfo.SrcIP != "" && errors.Is(err, ErrMaxConnectionsPerIP)
+	return proxyInfo != nil && proxyInfo.SrcIP != "" &&
+		(errors.Is(err, ErrMaxConnectionsPerIP) || errors.Is(err, ErrIPBlocked))
 }
 
 // ConnectionLimiter manages connection limits for protocol servers
