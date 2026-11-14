@@ -1213,14 +1213,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 		case "managesieve":
 			go startDynamicManageSieveServer(ctx, deps, server, errChan)
 		case "metrics":
-			// Configure metrics collection settings
-			metrics.Configure(
-				server.EnableUserMetrics,
-				server.GetEnableDomainMetrics(),
-				server.GetUserMetricsThreshold(),
-				server.GetMaxTrackedUsers(),
-				server.GetHashUsernames(),
-			)
+			configureMetrics(server)
 			go startDynamicMetricsServer(ctx, deps, server, errChan)
 		case "imap_proxy":
 			go startDynamicIMAPProxyServer(ctx, deps, server, errChan)
@@ -1764,6 +1757,18 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 	deps.registerServer(serverConfig.Name, s)
 
 	s.Start(errChan)
+}
+
+// configureMetrics applies a metrics block's collection settings. A tuning key the
+// block leaves out keeps the default a node without a metrics block has.
+func configureMetrics(server config.ServerConfig) {
+	metrics.Configure(
+		server.EnableUserMetrics,
+		server.GetEnableDomainMetrics(),
+		server.GetUserMetricsThreshold(),
+		server.GetMaxTrackedUsers(),
+		server.GetHashUsernames(),
+	)
 }
 
 func startDynamicMetricsServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
