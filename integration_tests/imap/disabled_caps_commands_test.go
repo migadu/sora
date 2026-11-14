@@ -4,6 +4,7 @@ package imap_test
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"net"
 	"slices"
@@ -116,6 +117,10 @@ func TestIMAP_DisabledCapsRefusesListThreadAndUIDPlus(t *testing.T) {
 			c.wantBad(`LIST "" ("INBOX" "Arch")`)
 			c.wantBad(`LIST "" "*" RETURN (SPECIAL-USE)`)
 			c.wantBad(`LIST (SPECIAL-USE) "" "*"`)
+			// Every attribute sora supports belongs to a default mailbox, so
+			// CREATE ... USE would fail with NO [USEATTR] anyway; free \Archive
+			// so that a CREATE that is not refused creates Arch.
+			c.clearSpecialUse(`\Archive`)
 			c.wantBad(`CREATE Arch (USE (\Archive))`)
 			if resp := c.mustOK(`LIST "" "Arch"`); strings.Contains(resp, "* LIST ") {
 				t.Errorf("a refused CREATE created the mailbox:\n%s", resp)
@@ -146,10 +151,12 @@ func TestIMAP_DisabledCapsRefusesListThreadAndUIDPlus(t *testing.T) {
 // disabledCapsClient is a raw IMAP connection, logged in, to a server built
 // with configure.
 type disabledCapsClient struct {
-	t    *testing.T
-	conn net.Conn
-	r    *bufio.Reader
-	tagN int
+	t       *testing.T
+	server  *common.TestServer
+	account common.TestAccount
+	conn    net.Conn
+	r       *bufio.Reader
+	tagN    int
 }
 
 // dialDisabledCaps starts a server with configure, connects and logs in; with
@@ -165,7 +172,7 @@ func dialDisabledCaps(t *testing.T, configure func(*imapserver.IMAPServerOptions
 		t.Fatalf("dial failed: %v", err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	c := &disabledCapsClient{t: t, conn: conn, r: bufio.NewReader(conn)}
+	c := &disabledCapsClient{t: t, server: server, account: account, conn: conn, r: bufio.NewReader(conn)}
 	if _, err := c.r.ReadString('\n'); err != nil {
 		t.Fatalf("read greeting failed: %v", err)
 	}
@@ -200,6 +207,25 @@ func (c *disabledCapsClient) wantBad(cmd string) {
 	resp := c.do(cmd)
 	if lines := strings.Split(strings.TrimSpace(resp), "\r\n"); !strings.Contains(lines[len(lines)-1], " BAD ") {
 		c.t.Errorf("%s: want BAD, got:\n%s", cmd, resp)
+	}
+}
+
+// clearSpecialUse takes special-use attribute attr off the account's mailbox
+// that has it, in the database.
+func (c *disabledCapsClient) clearSpecialUse(attr string) {
+	c.t.Helper()
+	ctx := context.Background()
+	accountID, err := c.server.ResilientDB.GetAccountIDByEmailWithRetry(ctx, c.account.Email)
+	if err != nil {
+		c.t.Fatalf("account ID: %v", err)
+	}
+	tag, err := c.server.ResilientDB.GetOperationalDatabase().WritePool.Exec(ctx,
+		"UPDATE mailboxes SET special_use = NULL WHERE account_id = $1 AND special_use = $2", accountID, attr)
+	if err != nil {
+		c.t.Fatalf("clear %s: %v", attr, err)
+	}
+	if tag.RowsAffected() != 1 {
+		c.t.Fatalf("clear %s: %d mailboxes had it, want 1", attr, tag.RowsAffected())
 	}
 }
 
