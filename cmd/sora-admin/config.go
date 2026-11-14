@@ -128,10 +128,13 @@ Examples:
 		}
 	}
 
-	// Check for server name conflicts
+	// Check for server name conflicts. A missing name or addr was reported above.
 	serverNames := make(map[string]bool)
 	serverAddresses := make(map[string]string) // addr -> server name
 	for _, server := range allServers {
+		if server.Name == "" || server.Addr == "" {
+			continue
+		}
 		if serverNames[server.Name] {
 			fmt.Printf("[FAIL] Duplicate server name '%s' found\n", server.Name)
 			fmt.Printf("   Each server must have a unique name\n")

@@ -459,8 +459,13 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 
 	// Get all configured servers
 	allServers := cfg.GetAllServers()
+	for _, server := range cfg.DynamicServers {
+		if !server.IsEnabled() {
+			logger.Info("Server block has enabled = false - not starting it", "server", server.Name, "type", server.Type)
+		}
+	}
 
-	// Validate all server configurations
+	// Validate all server configurations, including a block that lacks type, name or addr
 	for _, server := range allServers {
 		if err := server.Validate(); err != nil {
 			errorHandler.ValidationError(fmt.Sprintf("server '%s'", server.Name), err)

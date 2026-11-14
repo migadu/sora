@@ -1061,6 +1061,9 @@ type ServerConfig struct {
 	Type string `toml:"type"`
 	Name string `toml:"name"`
 	Addr string `toml:"addr"`
+	// Enabled = false keeps the block in the file without starting or validating it.
+	// nil (absent) or true starts it. See IsEnabled.
+	Enabled *bool `toml:"enabled,omitempty"`
 
 	// Common server options
 	TLS              bool   `toml:"tls,omitempty"`
@@ -2304,9 +2307,11 @@ func (c *UploaderConfig) GetRetryIntervalWithDefault() time.Duration {
 	return interval
 }
 
-// IsEnabled checks if a server should be started based on its configuration
+// IsEnabled reports whether the block is to be started: every [[server]] block is,
+// unless it says enabled = false. An enabled block must pass Validate, which requires
+// type, name and addr; a block missing one is an error, never skipped.
 func (s *ServerConfig) IsEnabled() bool {
-	return s.Type != "" && s.Name != "" && s.Addr != ""
+	return s.Enabled == nil || *s.Enabled
 }
 
 // ValidateServerConfig validates a server configuration
@@ -2315,10 +2320,10 @@ func (s *ServerConfig) Validate() error {
 		return fmt.Errorf("server type is required")
 	}
 	if s.Name == "" {
-		return fmt.Errorf("server name is required")
+		return fmt.Errorf("server name is required (type %q, addr %q)", s.Type, s.Addr)
 	}
 	if s.Addr == "" {
-		return fmt.Errorf("server address is required")
+		return fmt.Errorf("server address is required; set enabled = false to keep a [[server]] block without starting it")
 	}
 
 	validTypes := []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "metrics", "http_admin_api", "http_user_api", "user_api_proxy"}
@@ -2534,7 +2539,9 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	}
 }
 
-// GetAllServers returns all configured servers from the dynamic configuration
+// GetAllServers returns every [[server]] block that does not say enabled = false,
+// complete or not: the callers validate each one, so a block missing type, name or
+// addr is reported instead of being dropped.
 func (c *Config) GetAllServers() []ServerConfig {
 	var allServers []ServerConfig
 
