@@ -1900,14 +1900,16 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # - HALF-OPEN: Testing recovery, limited requests allowed to check if endpoint recovered
   #
   # RECOVERY PROCESS:
-  # 1. Circuit opens after failure_ratio threshold reached (default: 60% of last 3 requests fail)
+  # 1. Circuit opens once min_requests answers have completed (default: 3) and failure_ratio of them
+  #    (default: 60%) were failures, counted since the breaker last changed state (or per interval, if set)
   # 2. Waits for timeout period (default: 30s)
   # 3. Transitions to half-open and allows max_requests concurrent test requests (default: 3)
   # 4. If tests succeed → circuit closes and normal operation resumes
   # 5. If tests fail → circuit re-opens and waits another timeout period
   #
-  # IMPORTANT: Only server errors (5xx), timeouts, and network failures trigger the circuit breaker.
-  # Valid responses like 404 (user not found) do NOT count as failures.
+  # IMPORTANT: These count as failures: network errors, timeouts, 5xx, 408, 429, a 2xx other than
+  # 200, and a 200 that is not JSON with address and password_hash. 404, 3xx, 401, 403 and the
+  # other 4xx do NOT count, nor does a 200 whose password_hash sora cannot verify.
   #
   # PRODUCTION RECOMMENDATIONS:
   # - timeout: 60s-300s (longer allows more time for service recovery)

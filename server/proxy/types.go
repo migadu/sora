@@ -19,7 +19,7 @@ const (
 	AuthUserNotFound           AuthResult = iota // User doesn't exist in remotelookup - fallback controlled by lookup_local_users
 	AuthSuccess                                  // User found and authenticated - proceed with routing
 	AuthFailed                                   // User found but auth failed - reject, no fallback
-	AuthTemporarilyUnavailable                   // Auth service temporarily unavailable - fallback controlled by lookup_local_users
+	AuthTemporarilyUnavailable                   // Auth service gave no verdict - temporary failure, never a fallback to the local database
 )
 
 // String returns a human-readable representation of AuthResult
