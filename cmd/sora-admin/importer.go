@@ -892,23 +892,19 @@ func (i *Importer) performDryRun() error {
 			dateStr = info.ModTime().Format("2006-01-02 15:04")
 		}
 
-		// Try to get subject from message content (first few hundred bytes)
-		if file, err := os.Open(path); err == nil {
-			buffer := make([]byte, 1024)
-			if n, err := file.Read(buffer); err == nil {
-				content := string(buffer[:n])
-				// Simple subject extraction
-				if idx := strings.Index(strings.ToLower(content), "subject:"); idx != -1 {
-					subjectLine := content[idx+8:]
-					if endIdx := strings.Index(subjectLine, "\n"); endIdx != -1 {
-						subject = strings.TrimSpace(subjectLine[:endIdx])
-						if len(subject) > 50 {
-							subject = subject[:47] + "..."
-						}
+		// Try to get subject from the first KB of the message, decompressed as the
+		// import reads it
+		if head := messageHead(path, 1024); head != "" {
+			// Simple subject extraction
+			if idx := strings.Index(strings.ToLower(head), "subject:"); idx != -1 {
+				subjectLine := head[idx+8:]
+				if endIdx := strings.Index(subjectLine, "\n"); endIdx != -1 {
+					subject = strings.TrimSpace(subjectLine[:endIdx])
+					if len(subject) > 50 {
+						subject = subject[:47] + "..."
 					}
 				}
 			}
-			file.Close()
 		}
 
 		if subject == "" || subject == "\r" {
@@ -1013,29 +1009,74 @@ func (i *Importer) printSummary() error {
 	return nil
 }
 
+// errMessageTooLarge is the scan's refusal of a message larger than the import takes.
+var errMessageTooLarge = errors.New("message too large")
+
 // hashFile returns the content hash (helpers.HashContent) and size of the message in a
 // maildir file, decompressing it the way the upload does. It streams the file, so the
 // scan never holds a whole message in memory.
-func hashFile(path string) (string, int64, error) {
+//
+// It reads no more of the message than the import takes: maxSize bytes, capped at
+// consts.MaxStoredMessageSize (also the default when maxSize is 0 or less), and, for
+// a compressed file, no more than the upload decompresses (maxDecompressedSize).
+// Past that it fails with errMessageTooLarge without reading the rest: a compressed file
+// of a few hundred bytes can expand to gigabytes, and hashing all of it only to refuse
+// it afterwards keeps a scan worker busy for as long as that takes.
+func hashFile(path string, maxSize int64) (string, int64, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", 0, err
 	}
 	defer file.Close()
 
-	reader, _, err := maildirContentReader(file)
+	reader, compressed, err := maildirContentReader(file)
 	if err != nil {
 		return "", 0, err
 	}
 	defer reader.Close()
 
+	limit := maxSize
+	if limit <= 0 || limit > consts.MaxStoredMessageSize {
+		limit = consts.MaxStoredMessageSize
+	}
+	if compressed && limit > maxDecompressedSize {
+		limit = maxDecompressedSize
+	}
+	src := io.LimitReader(reader, limit+1)
+
 	hasher := helpers.NewContentHasher()
-	size, err := io.Copy(hasher, reader)
+	size, err := io.Copy(hasher, src)
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to hash file: %w", err)
 	}
+	if size > limit {
+		return "", 0, fmt.Errorf("%w: more than %d bytes", errMessageTooLarge, limit)
+	}
 
 	return hex.EncodeToString(hasher.Sum(nil)), size, nil
+}
+
+// messageHead returns up to n bytes from the start of the message in a maildir file,
+// decompressed as the import reads it (maildirContentReader), or "" when the file cannot
+// be read.
+func messageHead(path string, n int) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	reader, _, err := maildirContentReader(file)
+	if err != nil {
+		return ""
+	}
+	defer reader.Close()
+
+	// A short read is a message under n bytes, and a stream that breaks further on still
+	// starts with the bytes read so far.
+	buf := make([]byte, n)
+	got, _ := io.ReadFull(reader, buf)
+	return string(buf[:got])
 }
 
 // legacyImportHash is the content hash sora-admin import used before it switched to
@@ -1283,7 +1324,13 @@ func (i *Importer) scanMaildir() error {
 				// Use streaming hash function
 				// Every file the scan drops is reported by path at the end: a message that
 				// never reaches the cache is otherwise invisible to every later count.
-				hash, size, err := hashFile(file.path)
+				hash, size, err := hashFile(file.path, i.options.MaxMessageSize)
+				if errors.Is(err, errMessageTooLarge) {
+					logger.Warn("Invalid message", "path", file.path, "error", err)
+					i.recordFailedPath(file.path, fmt.Sprintf("invalid message: %v", err))
+					atomic.AddInt64(&i.failedMessages, 1)
+					continue
+				}
 				if err != nil {
 					logger.Warn("Failed to hash file", "path", file.path, "error", err)
 					i.recordFailedPath(file.path, fmt.Sprintf("read/hash error: %v", err))
@@ -1711,6 +1758,10 @@ func (z *maildirZstdReader) Close() error {
 	return nil
 }
 
+// maxDecompressedSize bounds the decompression of a compressed maildir file, so a
+// compression bomb cannot exhaust memory in the upload or keep the scan busy.
+const maxDecompressedSize = 256 << 20 // 256 MiB
+
 // decompressIfNeeded returns the message stored in a maildir file's content (see
 // maildirContentReader): the content itself, or its decompression.
 func decompressIfNeeded(content []byte) ([]byte, error) {
@@ -1723,8 +1774,6 @@ func decompressIfNeeded(content []byte) ([]byte, error) {
 		return content, nil
 	}
 
-	// Bound decompression to avoid a compression bomb exhausting memory.
-	const maxDecompressedSize = 256 << 20 // 256 MiB
 	decompressed, err := io.ReadAll(io.LimitReader(reader, maxDecompressedSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to decompress content: %w", err)
