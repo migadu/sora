@@ -120,3 +120,52 @@ func TestWarmupIntervalConcurrentAccess(t *testing.T) {
 		t.Error("Expected timestamp to be stored after concurrent access")
 	}
 }
+
+// countWarmupTimes returns the number of entries in s.lastWarmupTimes.
+func countWarmupTimes(s *IMAPServer) int {
+	n := 0
+	s.lastWarmupTimes.Range(func(key, value any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
+// TestWarmupTimesDropExpiredEntries checks that lastWarmupTimes does not keep every
+// account warmed since start-up. An entry older than warmup_interval suppresses
+// nothing, so recording a new warmup drops it; entries still inside the interval stay.
+func TestWarmupTimesDropExpiredEntries(t *testing.T) {
+	s := &IMAPServer{name: "test", warmupInterval: time.Hour}
+
+	now := time.Now()
+	for id := int64(1); id <= 100; id++ {
+		s.lastWarmupTimes.Store(id, now.Add(-2*time.Hour)) // expired
+	}
+	s.lastWarmupTimes.Store(int64(500), now.Add(-30*time.Minute)) // still suppresses
+
+	// The cache is nil, so executeWarmup records the warmup and returns.
+	s.executeWarmup(warmupJob{accountID: 1000, mailboxNames: []string{"INBOX"}, messageCount: 10})
+
+	for _, id := range []int64{500, 1000} {
+		if _, ok := s.lastWarmupTimes.Load(id); !ok {
+			t.Errorf("account %d is inside the interval but was dropped", id)
+		}
+	}
+	if n := countWarmupTimes(s); n != 2 {
+		t.Errorf("lastWarmupTimes has %d entries, want 2 (the 100 expired entries dropped)", n)
+	}
+}
+
+// TestWarmupTimesNotKeptWithoutInterval checks that warmup_interval = 0, which warms
+// at every login, keeps no entries at all: none of them could suppress a warmup.
+func TestWarmupTimesNotKeptWithoutInterval(t *testing.T) {
+	s := &IMAPServer{name: "test", warmupInterval: 0}
+
+	for id := int64(1); id <= 50; id++ {
+		s.executeWarmup(warmupJob{accountID: id, mailboxNames: []string{"INBOX"}, messageCount: 10})
+	}
+
+	if n := countWarmupTimes(s); n != 0 {
+		t.Errorf("lastWarmupTimes has %d entries with a zero interval, want 0", n)
+	}
+}

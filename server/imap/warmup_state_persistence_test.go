@@ -439,3 +439,45 @@ func TestWarmupStateTimestampAccuracy(t *testing.T) {
 		t.Errorf("Timestamp mismatch: stored %d, loaded %d", ts.Unix(), loaded.Unix())
 	}
 }
+
+// TestWarmupStateIsPerServer covers IMAP servers that share one cache, as every
+// type = "imap" server of a process does: each must get its own entries back after a
+// restart, whichever order the servers stop and start in. With one shared file, the
+// server that starts first takes the entries of the server that stopped last, and the
+// others get nothing.
+func TestWarmupStateIsPerServer(t *testing.T) {
+	plain, _ := testWarmupStateServer(t, 24*time.Hour)
+	plain.name = "imap"
+	tls := &IMAPServer{name: "imaps", warmupInterval: 24 * time.Hour, cache: plain.cache, enableWarmup: true}
+
+	warmedAt := time.Now().Add(-time.Hour).Truncate(time.Second)
+	plain.lastWarmupTimes.Store(int64(1), warmedAt)
+	tls.lastWarmupTimes.Store(int64(2), warmedAt)
+
+	// Shutdown: imap stops first, imaps last.
+	plain.persistWarmupState()
+	tls.persistWarmupState()
+
+	// Restart: imap starts first.
+	plain2 := &IMAPServer{name: "imap", warmupInterval: 24 * time.Hour, cache: plain.cache, enableWarmup: true}
+	tls2 := &IMAPServer{name: "imaps", warmupInterval: 24 * time.Hour, cache: plain.cache, enableWarmup: true}
+	plain2.loadWarmupState()
+	tls2.loadWarmupState()
+
+	for _, tc := range []struct {
+		srv        *IMAPServer
+		own, other int64
+	}{
+		{plain2, 1, 2},
+		{tls2, 2, 1},
+	} {
+		if raw, ok := tc.srv.lastWarmupTimes.Load(tc.own); !ok {
+			t.Errorf("server %q lost its own entry for account %d across the restart", tc.srv.name, tc.own)
+		} else if got := raw.(time.Time); !got.Equal(warmedAt) {
+			t.Errorf("server %q: account %d warmed at %v, want %v", tc.srv.name, tc.own, got, warmedAt)
+		}
+		if _, ok := tc.srv.lastWarmupTimes.Load(tc.other); ok {
+			t.Errorf("server %q loaded account %d, which another server warmed", tc.srv.name, tc.other)
+		}
+	}
+}
