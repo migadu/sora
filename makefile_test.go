@@ -14,20 +14,38 @@ import (
 	"testing"
 )
 
-// makeDryRun prints the commands `make target` would run (make -n), with env added to
-// the environment.
-func makeDryRun(t *testing.T, env []string, target string) string {
+// runMake runs make with args and returns its standard output. The environment is this
+// process's with env added, less the variables that would make the result depend on how
+// the test was started: make's own (when run from `make tests`, MAKEFLAGS carries that
+// make's command-line variables) and the database names under test.
+func runMake(t *testing.T, env []string, args ...string) string {
 	t.Helper()
 	if _, err := exec.LookPath("make"); err != nil {
 		t.Skip("make not installed")
 	}
-	cmd := exec.Command("make", "-n", target)
-	cmd.Env = append(os.Environ(), env...)
-	out, err := cmd.CombinedOutput()
+	cmd := exec.Command("make", args...)
+	for _, kv := range os.Environ() {
+		switch name, _, _ := strings.Cut(kv, "="); name {
+		case "MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEOVERRIDES", "DB_NAME", "SORA_TEST_DB_NAME":
+		default:
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	cmd.Env = append(cmd.Env, env...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("make -n %s: %v\n%s", target, err, out)
+		t.Fatalf("make %s: %v\n%s%s", strings.Join(args, " "), err, out, stderr.String())
 	}
 	return string(out)
+}
+
+// makeDryRun prints the commands `make target` would run (make -n), with env added to
+// the environment.
+func makeDryRun(t *testing.T, env []string, target string) string {
+	t.Helper()
+	return runMake(t, env, "-n", target)
 }
 
 // TestMakeResetTestDBResetsTheTestsDatabase: the test helpers use SORA_TEST_DB_NAME
@@ -41,6 +59,44 @@ func TestMakeResetTestDBResetsTheTestsDatabase(t *testing.T) {
 	}
 	if strings.Contains(out, "|| true") || strings.Contains(out, "/dev/null") {
 		t.Errorf("reset-test-db hides a failed reset:\n%s", out)
+	}
+}
+
+// TestMakeTargetsTestTheDatabaseResetTestDBResets: the database reset-test-db resets and
+// the SORA_TEST_DB_NAME the targets' tests see are one database, named by
+// SORA_TEST_DB_NAME or by `make DB_NAME=...`. A DB_NAME in the environment is ignored:
+// it is a generic name that may be set for some other database, and reset-test-db drops
+// the whole schema of the database it resets.
+func TestMakeTargetsTestTheDatabaseResetTestDBResets(t *testing.T) {
+	printer := filepath.Join(t.TempDir(), "print.mk")
+	if err := os.WriteFile(printer, []byte("print-test-db:\n\t@echo \"$$SORA_TEST_DB_NAME\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const other = "DB_NAME=sora_other_example"
+	for _, tc := range []struct {
+		name string
+		env  []string
+		args []string
+		want string
+	}{
+		{"default", nil, nil, "sora_test_db"},
+		{"SORA_TEST_DB_NAME", []string{"SORA_TEST_DB_NAME=sora_branch_example"}, nil, "sora_branch_example"},
+		{"DB_NAME in the environment", []string{other}, nil, "sora_test_db"},
+		{"DB_NAME in the environment and SORA_TEST_DB_NAME", []string{other, "SORA_TEST_DB_NAME=sora_branch_example"}, nil, "sora_branch_example"},
+		{"SORA_TEST_DB_NAME argument and DB_NAME in the environment", []string{other}, []string{"SORA_TEST_DB_NAME=sora_arg_example"}, "sora_arg_example"},
+		{"DB_NAME argument", []string{"SORA_TEST_DB_NAME=sora_branch_example"}, []string{"DB_NAME=sora_arg_example"}, "sora_arg_example"},
+		{"DB_NAME and SORA_TEST_DB_NAME arguments", nil, []string{"DB_NAME=sora_arg_example", "SORA_TEST_DB_NAME=sora_branch_example"}, "sora_arg_example"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reset := runMake(t, tc.env, append([]string{"-n", "reset-test-db"}, tc.args...)...)
+			if !strings.Contains(reset, `SORA_TEST_DB_NAME="`+tc.want+`"`) {
+				t.Errorf("reset-test-db does not reset %s:\n%s", tc.want, reset)
+			}
+			tests := runMake(t, tc.env, append([]string{"-s", "-f", "Makefile", "-f", printer, "print-test-db"}, tc.args...)...)
+			if got := strings.TrimSpace(tests); got != tc.want {
+				t.Errorf("the targets' tests use SORA_TEST_DB_NAME=%q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
