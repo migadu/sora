@@ -113,6 +113,10 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 		datePrefix = tablePrefix + "."
 	}
 
+	// go-imap passes a search <date> as midnight UTC of that day, and ON / SENTON d as
+	// Since = d, Before = d + 24h. RFC 9051 §6.4.4: SINCE is "within or later than the
+	// specified date" (>= its midnight), BEFORE "earlier than the specified date" (< its
+	// midnight: a message at exactly that midnight is within the day, not before it).
 	if !criteria.Since.IsZero() {
 		param := nextParam()
 		args[param] = criteria.Since
@@ -121,7 +125,7 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 	if !criteria.Before.IsZero() {
 		param := nextParam()
 		args[param] = criteria.Before
-		conditions = append(conditions, fmt.Sprintf("%sinternal_date <= @%s", datePrefix, param))
+		conditions = append(conditions, fmt.Sprintf("%sinternal_date < @%s", datePrefix, param))
 	}
 	if !criteria.SentSince.IsZero() {
 		param := nextParam()
@@ -131,7 +135,7 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 	if !criteria.SentBefore.IsZero() {
 		param := nextParam()
 		args[param] = criteria.SentBefore
-		conditions = append(conditions, fmt.Sprintf("%ssent_date <= @%s", datePrefix, param))
+		conditions = append(conditions, fmt.Sprintf("%ssent_date < @%s", datePrefix, param))
 	}
 
 	// Message size

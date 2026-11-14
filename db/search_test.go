@@ -128,6 +128,37 @@ func TestBuildSearchHeaderConditions(t *testing.T) {
 	}
 }
 
+// TestBuildSearchDateConditions pins the date comparison operators (#593). go-imap
+// passes a search <date> as midnight UTC of that day, and ON d as Since = d,
+// Before = d + 24h. RFC 9051 §6.4.4: BEFORE / SENTBEFORE match a date "earlier than
+// the specified date", so the upper bound excludes midnight of that day; SINCE /
+// SENTSINCE match one "within or later than", so the lower bound includes it.
+func TestBuildSearchDateConditions(t *testing.T) {
+	var db *Database // builder does not dereference the receiver
+	day := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name     string
+		criteria *imap.SearchCriteria
+		want     string
+	}{
+		{"SINCE", &imap.SearchCriteria{Since: day}, "m.internal_date >= @p1"},
+		{"BEFORE", &imap.SearchCriteria{Before: day}, "m.internal_date < @p1"},
+		{"SENTSINCE", &imap.SearchCriteria{SentSince: day}, "m.sent_date >= @p1"},
+		{"SENTBEFORE", &imap.SearchCriteria{SentBefore: day}, "m.sent_date < @p1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			paramCounter := 0
+			condition, args, err := db.buildSearchCriteriaWithPrefix(tt.criteria, "p", &paramCounter, "m")
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, condition)
+			assert.Equal(t, day, args["p1"])
+		})
+	}
+}
+
 // TestCanUseTextUnion verifies eligibility for the TEXT UNION rewrite. The decision
 // is a pure function of the criteria, so a nil *Database suffices.
 func TestCanUseTextUnion(t *testing.T) {
