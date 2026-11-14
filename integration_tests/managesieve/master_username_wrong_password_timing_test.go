@@ -5,6 +5,7 @@ package managesieve
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,5 +82,95 @@ func TestManageSieve_MasterUsernameWrongPasswordIsNotAMasterUsernameOracle(t *te
 				}
 			})
 		}
+	}
+}
+
+// TestManageSieve_MasterUsernameRefusalsCostAWrongMasterPassword (#801): every refusal of
+// the CORRECT master password in the master username form costs what a wrong master
+// password costs, one password verification, as well as being answered like one. A wrong
+// master password is refused after the regular check of the base address; a refusal that
+// skips it (the source is outside master_sasl_allowed_networks, the target does not parse
+// or has no account) is answered one verification sooner and confirms the guessed
+// password, to a peer the gate keeps out, without completing an authentication. The
+// verifications are counted, not timed (#782).
+func TestManageSieve_MasterUsernameRefusalsCostAWrongMasterPassword(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+
+	const masterUser, masterPass = "masteruser", "master-secret"
+
+	start := func(allowedNetworks []string) string {
+		address := common.GetRandomAddress(t)
+		srv, err := managesieve.New(context.Background(), "test-master-username-refusals", "localhost", address, rdb,
+			managesieve.ManageSieveServerOptions{
+				Config:                    &config.Config{},
+				InsecureAuth:              true,
+				MasterUsername:            masterUser,
+				MasterPassword:            masterPass,
+				MasterSASLAllowedNetworks: allowedNetworks,
+				LookupCache:               &config.LookupCacheConfig{Enabled: false},
+			})
+		if err != nil {
+			t.Fatalf("Failed to create ManageSieve server: %v", err)
+		}
+		errChan := make(chan error, 1)
+		go func() { srv.Start(errChan) }()
+		time.Sleep(100 * time.Millisecond)
+		t.Cleanup(func() { srv.Close() })
+		return address
+	}
+	open := start(nil)
+	gated := start([]string{"10.0.0.0/8"}) // loopback is outside it
+
+	counted := func(probe func() string) (string, int) {
+		before := testutils.PasswordVerifications()
+		reply := probe()
+		return reply, testutils.PasswordVerifications() - before
+	}
+	login := func(address, username, password string) func() string {
+		return func() string { return msLogin(t, address, username, password) }
+	}
+	authPlain := func(address, authzID, authnID, password string) func() string {
+		return func() string { return msAuthPlain(t, address, authzID, authnID, password) }
+	}
+
+	masterForm := account.Email + "@" + masterUser
+	unknownForm := fmt.Sprintf("nobody-%d@example.com@%s", time.Now().UnixNano(), masterUser)
+
+	type refusal struct {
+		name  string
+		probe func() string
+	}
+	for _, verb := range []struct {
+		name  string
+		wrong func() string
+		cases []refusal
+	}{
+		{"AUTHENTICATE_PLAIN", authPlain(open, "", masterForm, "wrong-password"), []refusal{
+			{"source_not_allowed", authPlain(gated, "", masterForm, masterPass)},
+			{"malformed_target", authPlain(open, "not-an-address", masterForm, masterPass)},
+			{"unknown_target", authPlain(open, "", unknownForm, masterPass)},
+		}},
+		{"LOGIN", login(open, masterForm, "wrong-password"), []refusal{
+			{"source_not_allowed", login(gated, masterForm, masterPass)},
+			{"unknown_target", login(open, unknownForm, masterPass)},
+		}},
+	} {
+		t.Run(verb.name, func(t *testing.T) {
+			wrongReply, wrongVerified := counted(verb.wrong)
+			if !strings.HasPrefix(wrongReply, "NO") || wrongVerified != 1 {
+				t.Fatalf("control: wrong master password: %q after %d password verifications, want a refusal after 1", wrongReply, wrongVerified)
+			}
+			for _, c := range verb.cases {
+				reply, verified := counted(c.probe)
+				if reply != wrongReply {
+					t.Errorf("%s: %q, a wrong master password: %q", c.name, reply, wrongReply)
+				}
+				if verified != wrongVerified {
+					t.Errorf("%s: refused after %d password verifications, a wrong master password after %d: the response time confirms the master password", c.name, verified, wrongVerified)
+				}
+			}
+		})
 	}
 }
