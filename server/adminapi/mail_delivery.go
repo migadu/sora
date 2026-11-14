@@ -215,6 +215,16 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 		messageID = fmt.Sprintf("<%d.http-delivery@%s>", time.Now().UnixNano(), s.hostname)
 	}
 
+	// Every delivered body is staged by the upload worker, which runs only on a node with
+	// an imap, pop3 or lmtp server. Without one this node cannot deliver to anyone: that
+	// is the node's state, not the request's fault, so answer 503 and let the injector
+	// retry (on another node) rather than bounce the message on a 400.
+	if s.uploader == nil {
+		w.Header().Set("Retry-After", "60")
+		s.writeError(w, http.StatusServiceUnavailable, "Mail delivery not available on this node: no upload worker")
+		return
+	}
+
 	// Process delivery for each recipient (LMTP-style per-recipient status)
 	response := DeliverMailResponse{
 		Success:    true,
@@ -271,12 +281,6 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 	status := RecipientStatus{
 		Email:    recipient,
 		Accepted: false,
-	}
-
-	// Check if uploader is configured (required for mail delivery)
-	if s.uploader == nil {
-		status.Error = "Mail delivery not configured: uploader not available"
-		return status
 	}
 
 	// Create logger with recipient prefix

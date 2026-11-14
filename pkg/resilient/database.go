@@ -104,6 +104,7 @@ import (
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/retry"
+	"github.com/migadu/sora/server"
 )
 
 // DatabasePool represents a single database connection pool with health tracking
@@ -218,6 +219,7 @@ func isQuerySuccessful(err error) bool {
 		errors.Is(err, consts.ErrNotPermitted) ||
 		errors.Is(err, consts.ErrDBNotFound) ||
 		errors.Is(err, consts.ErrMessageExists) ||
+		errors.Is(err, server.ErrInvalidAddress) ||
 		errors.Is(err, pgx.ErrNoRows) {
 		return true
 	}
@@ -245,6 +247,7 @@ func isWriteSuccessful(err error) bool {
 		errors.Is(err, consts.ErrDBNotFound) ||
 		errors.Is(err, consts.ErrDBUniqueViolation) ||
 		errors.Is(err, consts.ErrMessageExists) ||
+		errors.Is(err, server.ErrInvalidAddress) ||
 		errors.Is(err, pgx.ErrNoRows) {
 		return true
 	}
@@ -538,6 +541,7 @@ func (rd *ResilientDatabase) isBusinessLogicError(err error) bool {
 		errors.Is(err, consts.ErrDBNotFound) ||
 		errors.Is(err, consts.ErrDBUniqueViolation) ||
 		errors.Is(err, consts.ErrMessageExists) ||
+		errors.Is(err, server.ErrInvalidAddress) ||
 		errors.Is(err, pgx.ErrNoRows)
 }
 
@@ -567,7 +571,6 @@ func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, arg
 	var rows pgx.Rows
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		queryCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
 
 		result, cbErr := rd.queryBreaker.Execute(func() (any, error) {
 			r, queryErr := pool.Query(queryCtx, sql, args...)
@@ -575,20 +578,42 @@ func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, arg
 		})
 
 		if cbErr != nil {
+			cancel()
 			if !rd.isRetryableError(cbErr) {
-				// For non-retryable errors, we'll break the retry loop by returning nil from WithRetry
-				// and handle the error outside
-				return cbErr
+				return retry.Stop(cbErr)
 			}
 			logger.Debug("Retrying query due to retryable error", "error", cbErr)
 			return cbErr // It's retryable, so return the error to signal a retry.
 		}
 
-		rows = result.(pgx.Rows)
+		// pgx reads the rows under queryCtx until they are closed, so the context
+		// lives as long as the rows do.
+		rows = &cancelOnCloseRows{Rows: result.(pgx.Rows), cancel: cancel}
 		return nil
 	}, config)
 
 	return rows, err
+}
+
+// cancelOnCloseRows releases the query's timeout context once the rows are done:
+// when the caller closes them, or when Next reports the end (pgx closes rows itself
+// then, so a caller that drains them need not call Close).
+type cancelOnCloseRows struct {
+	pgx.Rows
+	cancel context.CancelFunc
+}
+
+func (r *cancelOnCloseRows) Next() bool {
+	if r.Rows.Next() {
+		return true
+	}
+	r.cancel()
+	return false
+}
+
+func (r *cancelOnCloseRows) Close() {
+	r.Rows.Close()
+	r.cancel()
 }
 
 // resilientRow implements the pgx.Row interface to defer the Scan operation
@@ -958,12 +983,19 @@ func createDatabasePool(ctx context.Context, host string, dbConfig *config.Datab
 
 	// Note: We use Write endpoint config even for read pools because db.NewDatabaseFromConfig
 	// expects Write to be populated. The actual pool type is tracked by the poolType parameter.
+	//
+	// A dedicated read pool keeps heavy writes from starving reads, which only matters on a
+	// host that serves both: a write host when [database.read] is not configured. A replica
+	// takes no writes, and with [database.read] the write hosts take reads only as a
+	// fallback, so every other host gets one pool of max_connections.
+	readEndpointConfigured := dbConfig.Read != nil && len(dbConfig.Read.Hosts) > 0
 	tempConfig := &config.DatabaseConfig{
-		Debug:            dbConfig.GetDebug(),
-		MigrationTimeout: dbConfig.MigrationTimeout,
-		FetchChunkSize:   dbConfig.FetchChunkSize,
-		Write:            &singleHostEndpoint,
-		PoolTypeOverride: poolType, // Pass the actual pool type for logging
+		Debug:               dbConfig.GetDebug(),
+		MigrationTimeout:    dbConfig.MigrationTimeout,
+		FetchChunkSize:      dbConfig.FetchChunkSize,
+		Write:               &singleHostEndpoint,
+		PoolTypeOverride:    poolType, // Pass the actual pool type for logging
+		ReadsShareWritePool: poolType != "write" || readEndpointConfigured,
 	}
 
 	database, err := db.NewDatabaseFromConfig(ctx, tempConfig, runMigrations)
@@ -1369,55 +1401,45 @@ func (rd *ResilientDatabase) StartPoolMetrics(ctx context.Context) {
 	}()
 }
 
-// collectAggregatedPoolStats gathers stats from all write and read pools and updates metrics
-func (rd *ResilientDatabase) collectAggregatedPoolStats() {
-	rd.failoverManager.mu.RLock()
-	defer rd.failoverManager.mu.RUnlock()
+// rolePool is one pgx pool the failover manager opened, with the role it serves.
+type rolePool struct {
+	role string // "write" or "read"
+	host string
+	pool *pgxpool.Pool
+}
 
-	// Import metrics package for accessing the metrics
-	// Note: This assumes the metrics package is imported at the top of the file
-
-	// Collect stats from all write pools
-	var totalWriteConns, idleWriteConns, inUseWriteConns int32
-	for _, pool := range rd.failoverManager.writePools {
-		if pool.database != nil && pool.database.WritePool != nil {
-			stats := pool.database.WritePool.Stat()
-			totalWriteConns += stats.TotalConns()
-			idleWriteConns += stats.IdleConns()
-			inUseWriteConns += stats.AcquiredConns()
+// allPools lists every distinct pgx pool the manager opened, each once: the write
+// hosts' WritePools as "write", and as "read" every other pool reads are served from
+// (a write host's dedicated read pool, a replica's pool). A pool shared by reads and
+// writes counts as "write". Caller holds fm.mu.
+func (fm *RuntimeFailoverManager) allPools() []rolePool {
+	var pools []rolePool
+	seen := make(map[*pgxpool.Pool]bool)
+	add := func(role string, p *DatabasePool, pool *pgxpool.Pool) {
+		if pool == nil || seen[pool] {
+			return
+		}
+		seen[pool] = true
+		pools = append(pools, rolePool{role: role, host: p.host, pool: pool})
+	}
+	for _, p := range fm.writePools {
+		if p.database != nil {
+			add("write", p, p.database.WritePool)
 		}
 	}
-
-	// Update aggregated write pool metrics
-	if len(rd.failoverManager.writePools) > 0 {
-		metrics.DBPoolTotalConns.WithLabelValues("write").Set(float64(totalWriteConns))
-		metrics.DBPoolIdleConns.WithLabelValues("write").Set(float64(idleWriteConns))
-		metrics.DBPoolInUseConns.WithLabelValues("write").Set(float64(inUseWriteConns))
-	}
-
-	// Collect stats from read pools only if they are distinct from write pools
-	if rd.failoverManager.readPoolsAreDistinct() {
-		var totalReadConns, idleReadConns, inUseReadConns int32
-		for _, pool := range rd.failoverManager.readPools {
-			if pool.database != nil && pool.database.ReadPool != nil {
-				stats := pool.database.ReadPool.Stat()
-				totalReadConns += stats.TotalConns()
-				idleReadConns += stats.IdleConns()
-				inUseReadConns += stats.AcquiredConns()
+	for _, group := range [][]*DatabasePool{fm.writePools, fm.readPools} {
+		for _, p := range group {
+			if p.database != nil {
+				add("read", p, p.database.ReadPool)
 			}
 		}
-
-		// Update aggregated read pool metrics
-		metrics.DBPoolTotalConns.WithLabelValues("read").Set(float64(totalReadConns))
-		metrics.DBPoolIdleConns.WithLabelValues("read").Set(float64(idleReadConns))
-		metrics.DBPoolInUseConns.WithLabelValues("read").Set(float64(inUseReadConns))
-	} else {
-		// If read pools are not distinct, ensure their metrics are zeroed out
-		// to avoid reporting stale or incorrect data.
-		metrics.DBPoolTotalConns.WithLabelValues("read").Set(0)
-		metrics.DBPoolIdleConns.WithLabelValues("read").Set(0)
-		metrics.DBPoolInUseConns.WithLabelValues("read").Set(0)
 	}
+	return pools
+}
+
+// collectAggregatedPoolStats updates the pool gauges from every pool the manager opened.
+func (rd *ResilientDatabase) collectAggregatedPoolStats() {
+	rd.reportPools(false)
 }
 
 // StartPoolHealthMonitoring starts background monitoring of connection pool health
@@ -1448,75 +1470,54 @@ func (rd *ResilientDatabase) StartPoolHealthMonitoring(ctx context.Context) {
 	}()
 }
 
-// monitorAggregatedPoolHealth performs periodic health checks and updates metrics for all pools
+// monitorAggregatedPoolHealth updates the pool gauges and checks every pool for exhaustion.
 func (rd *ResilientDatabase) monitorAggregatedPoolHealth() {
-	rd.failoverManager.mu.RLock()
-	defer rd.failoverManager.mu.RUnlock()
-
-	// Monitor write pools
-	rd.monitorPoolGroup(rd.failoverManager.writePools, "write")
-
-	// Monitor read pools only if they are distinct
-	if rd.failoverManager.readPoolsAreDistinct() {
-		rd.monitorPoolGroup(rd.failoverManager.readPools, "read")
-	}
+	rd.reportPools(true)
 }
 
-// monitorPoolGroup monitors a group of database pools (write or read)
-func (rd *ResilientDatabase) monitorPoolGroup(pools []*DatabasePool, poolType string) {
-	var (
-		totalConns      int32
-		idleConns       int32
-		acquiredConns   int32
-		maxConns        int32
-		exhaustionCount int
-	)
+// reportPools sets the sora_db_pool_* gauges per role, summed over every pool the
+// manager opened (allPools). With checkExhaustion it also counts and logs the pools
+// above 95% utilization and logs a summary per role.
+func (rd *ResilientDatabase) reportPools(checkExhaustion bool) {
+	rd.failoverManager.mu.RLock()
+	pools := rd.failoverManager.allPools()
+	rd.failoverManager.mu.RUnlock()
 
-	for _, pool := range pools {
-		if pool.database == nil {
-			continue
-		}
-
-		var poolToCheck *pgxpool.Pool
-		if poolType == "write" && pool.database.WritePool != nil {
-			poolToCheck = pool.database.WritePool
-		} else if poolType == "read" && pool.database.ReadPool != nil {
-			poolToCheck = pool.database.ReadPool
-		}
-
-		if poolToCheck != nil {
-			stats := poolToCheck.Stat()
+	for _, role := range []string{"write", "read"} {
+		var totalConns, idleConns, acquiredConns int32
+		var poolCount, exhaustionCount int
+		for _, p := range pools {
+			if p.role != role {
+				continue
+			}
+			stats := p.pool.Stat()
+			poolCount++
 			totalConns += stats.TotalConns()
 			idleConns += stats.IdleConns()
 			acquiredConns += stats.AcquiredConns()
-			maxConns += stats.MaxConns()
 
-			// Check for pool exhaustion (>95% utilization)
-			if stats.MaxConns() > 0 {
+			if checkExhaustion && stats.MaxConns() > 0 {
 				utilization := float64(stats.AcquiredConns()) / float64(stats.MaxConns())
 				if utilization > 0.95 {
 					exhaustionCount++
-					logger.Warn("Database pool near exhaustion", "component", "RESILIENT-FAILOVER", "type",
-						poolType, pool.host, utilization*100)
+					logger.Warn("Database pool near exhaustion", "component", "RESILIENT-FAILOVER",
+						"type", role, "host", p.host, "utilization_pct", utilization*100)
 				}
 			}
-
-			// Check for slow connection acquisition
-			// Note: pgxpool.Stat() doesn't provide acquisition duration directly
-			// This would need to be tracked separately or estimated
 		}
+
+		metrics.DBPoolTotalConns.WithLabelValues(role).Set(float64(totalConns))
+		metrics.DBPoolIdleConns.WithLabelValues(role).Set(float64(idleConns))
+		metrics.DBPoolInUseConns.WithLabelValues(role).Set(float64(acquiredConns))
+
+		if !checkExhaustion || poolCount == 0 {
+			continue
+		}
+		if exhaustionCount > 0 {
+			metrics.DBPoolExhaustion.WithLabelValues(role).Add(float64(exhaustionCount))
+		}
+		logger.Info("Pools health status", "component", "RESILIENT-FAILOVER", "type", role, "total_conns", totalConns, "idle", idleConns, "in_use", acquiredConns, "pools", poolCount)
 	}
-
-	// Update aggregated metrics
-	metrics.DBPoolTotalConns.WithLabelValues(poolType).Set(float64(totalConns))
-	metrics.DBPoolIdleConns.WithLabelValues(poolType).Set(float64(idleConns))
-	metrics.DBPoolInUseConns.WithLabelValues(poolType).Set(float64(acquiredConns))
-
-	if exhaustionCount > 0 {
-		metrics.DBPoolExhaustion.WithLabelValues(poolType).Add(float64(exhaustionCount))
-	}
-
-	logger.Info("Pools health status", "component", "RESILIENT-FAILOVER", "type", poolType, "total_conns", totalConns, "idle", idleConns, "in_use", acquiredConns, "pools", len(pools))
 }
 
 // GetOrCreateMailboxByNameWithRetry retrieves a mailbox by name, creating it if it doesn't exist.

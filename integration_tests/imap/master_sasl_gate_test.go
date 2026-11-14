@@ -108,8 +108,8 @@ func setupIMAPGate(t *testing.T, allowedNetworks []string, limiter server.AuthRa
 
 // TestIMAP_MasterSASLGate_BlocksOffNetwork proves that when master_sasl_allowed_networks
 // is set to a range that excludes the connecting socket, master SASL impersonation is
-// refused — while the support-facing master *username* path and regular auth still work
-// (the gate is scoped to master SASL only).
+// refused while regular auth still works. The master-username form is gated too; see
+// TestIMAP_MasterUsernameGate_BlocksOffNetwork.
 func TestIMAP_MasterSASLGate_BlocksOffNetwork(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -133,23 +133,6 @@ func TestIMAP_MasterSASLGate_BlocksOffNetwork(t *testing.T) {
 		} else {
 			t.Logf("✓ master SASL correctly denied off-network: %v", err)
 		}
-	})
-
-	t.Run("master username (support path) still works", func(t *testing.T) {
-		c, err := imapclient.DialInsecure(server.Address, nil)
-		if err != nil {
-			t.Fatalf("dial: %v", err)
-		}
-		defer c.Logout()
-
-		// Support logs in with user@domain@MASTER_USERNAME — not gated by network.
-		if err := c.Login(account.Email+"@"+masterUsername, masterPassword).Wait(); err != nil {
-			t.Fatalf("master username login should not be gated, but failed: %v", err)
-		}
-		if _, err := c.Select("INBOX", nil).Wait(); err != nil {
-			t.Fatalf("select after master username login: %v", err)
-		}
-		t.Log("✓ master username path unaffected by master_sasl_allowed_networks")
 	})
 
 	t.Run("regular auth still works", func(t *testing.T) {
