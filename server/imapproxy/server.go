@@ -67,7 +67,7 @@ type Server struct {
 	useStartTLS        bool        // The listener is plaintext and sessions upgrade it on STARTTLS
 	startTLSConfig     *tls.Config // What sessions upgrade with on STARTTLS (set by Start); nil when STARTTLS is not offered
 	enableAffinity     bool
-	wg                 sync.WaitGroup
+	sessions           server.SessionGroup // Session goroutines, which Stop drains
 	ctx                context.Context
 	cancel             context.CancelFunc
 	authLimiter        server.AuthLimiter
@@ -559,10 +559,7 @@ func (s *Server) acceptConnections() error {
 			}
 		}
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-
+		started := s.sessions.Go(func() {
 			// Track proxy connection
 			metrics.ConnectionsTotal.WithLabelValues("imap_proxy", s.name, s.hostname).Inc()
 			metrics.ConnectionsCurrent.WithLabelValues("imap_proxy", s.name, s.hostname).Inc()
@@ -599,7 +596,15 @@ func (s *Server) acceptConnections() error {
 			// Note: removeSession is called in session.close(), which is deferred in handleConnection()
 			// This ensures cleanup happens when the session ends, not when the goroutine exits
 			session.handleConnection()
-		}()
+		})
+		if !started {
+			// Stop is draining the sessions and no longer waits for new ones.
+			conn.Close()
+			if releaseConn != nil {
+				releaseConn()
+			}
+			return nil
+		}
 	}
 }
 
@@ -647,16 +652,9 @@ func (s *Server) Stop() error {
 		listener.Close()
 	}
 
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(30 * time.Second) {
 		logger.Info("Proxy server stopped gracefully", "proxy", s.name)
-	case <-time.After(30 * time.Second):
+	} else {
 		logger.Warn("Proxy server stop timeout", "proxy", s.name)
 	}
 

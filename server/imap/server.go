@@ -339,7 +339,7 @@ type IMAPServer struct {
 	// Active connection tracking for graceful shutdown
 	activeConnsMutex sync.RWMutex
 	activeConns      map[*imapserver.Conn]struct{}
-	sessionsWg       sync.WaitGroup // Tracks active sessions for graceful drain
+	sessions         serverPkg.SessionGroup // Tracks active sessions for graceful drain
 }
 
 type IMAPServerOptions struct {
@@ -912,6 +912,16 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		}
 	}
 
+	// Count the session for Close's drain; the session's Close counts it out.
+	// go-imap's Close does not wait for connection goroutines, so this can
+	// run after the drain began, which no longer waits for new sessions.
+	if !s.sessions.Add() {
+		return nil, nil, &imap.Error{
+			Type: imap.StatusResponseTypeBye,
+			Text: "Server shutting down, please reconnect",
+		}
+	}
+
 	// Connection limits are handled at the listener level
 	sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
@@ -1034,9 +1044,6 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 
 	// Track active connection for graceful shutdown
 	s.trackConnection(conn)
-
-	// Track session in WaitGroup for graceful drain
-	s.sessionsWg.Add(1)
 
 	// Log proxy session ID if present for end-to-end tracing
 	if proxyInfo != nil && proxyInfo.ProxySessionID != "" {
@@ -1225,16 +1232,9 @@ func (s *IMAPServer) Close() {
 
 // waitForSessionsDrain waits for all active sessions to finish with a timeout
 func (s *IMAPServer) waitForSessionsDrain(timeout time.Duration) {
-	done := make(chan struct{})
-	go func() {
-		s.sessionsWg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(timeout) {
 		logger.Debug("IMAP: All sessions drained gracefully", "name", s.name)
-	case <-time.After(timeout):
+	} else {
 		logger.Debug("IMAP: Session drain timeout, forcing shutdown", "name", s.name, "timeout", timeout)
 	}
 }

@@ -132,12 +132,8 @@ func TestIDExpiredProxyTTLDropsConnection(t *testing.T) {
 	if got := testutil.ToFloat64(gauge); got != 0 {
 		t.Errorf("connections gauge = %v after the connection ended, want 0", got)
 	}
-	done := make(chan struct{})
-	go func() { srv.sessionsWg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Error("sessionsWg.Wait did not return after the only session ended")
+	if !srv.sessions.Drain(time.Second) {
+		t.Error("the session drain did not end after the only session ended")
 	}
 	if strings.Contains(golog.String(), "panic") {
 		t.Errorf("go-imap recovered a panic:\n%s", golog.String())
@@ -148,20 +144,18 @@ func TestIDExpiredProxyTTLDropsConnection(t *testing.T) {
 // connection's session counts out once, not twice.
 func TestIDExpiredProxyTTLKeepsDrainCountWithOtherSessions(t *testing.T) {
 	srv, addr, _ := newTTLTestServer(t, "ttl-drain")
-	srv.sessionsWg.Add(1) // another open session
+	srv.sessions.Add() // another open session
 
 	sendExpiredTTL(t, addr)
 	waitFor(t, "the session to close", func() bool { return srv.totalConnections.Load() <= 0 })
 
-	done := make(chan struct{})
-	go func() { srv.sessionsWg.Wait(); close(done) }()
-	select {
-	case <-done:
-		t.Fatal("sessionsWg.Wait returned while another counted session is still open")
-	case <-time.After(300 * time.Millisecond):
+	if srv.sessions.Drain(300 * time.Millisecond) {
+		t.Fatal("the session drain ended while another counted session is still open")
 	}
-	srv.sessionsWg.Done() // the other session ends
-	<-done
+	srv.sessions.Done() // the other session ends
+	if !srv.sessions.Drain(time.Second) {
+		t.Fatal("the session drain did not end after the other session ended")
+	}
 }
 
 // Close is safe to call twice: the second call changes no counter.
@@ -172,7 +166,8 @@ func TestIMAPSessionCloseIsIdempotent(t *testing.T) {
 	s.Protocol = "IMAP"
 
 	srv.totalConnections.Add(1)
-	srv.sessionsWg.Add(2) // this session and another one still open
+	srv.sessions.Add() // this session
+	srv.sessions.Add() // another one, still open
 
 	s.Close()
 	s.Close()
@@ -180,15 +175,13 @@ func TestIMAPSessionCloseIsIdempotent(t *testing.T) {
 	if got := srv.totalConnections.Load(); got != 0 {
 		t.Errorf("totalConnections = %d after two Close calls, want 0", got)
 	}
-	done := make(chan struct{})
-	go func() { srv.sessionsWg.Wait(); close(done) }()
-	select {
-	case <-done:
-		t.Fatal("sessionsWg.Wait returned while another counted session is still open")
-	case <-time.After(200 * time.Millisecond):
+	if srv.sessions.Drain(200 * time.Millisecond) {
+		t.Fatal("the session drain ended while another counted session is still open")
 	}
-	srv.sessionsWg.Done() // the other session ends
-	<-done
+	srv.sessions.Done() // the other session ends
+	if !srv.sessions.Drain(time.Second) {
+		t.Fatal("the session drain did not end after the other session ended")
+	}
 }
 
 // A TTL that arrives already spent is the same loop as one this hop spends: the
@@ -260,5 +253,32 @@ func TestIDMalformedProxyTTLIgnoresForwarding(t *testing.T) {
 				t.Errorf("valid TTL 5 was not echoed as 4:\n%s", rest)
 			}
 		})
+	}
+}
+
+// A session that would start after Close began draining the sessions (go-imap's
+// Close does not wait for connection goroutines) is refused with a BYE instead of
+// being counted behind the drain's back.
+func TestSessionStartingWhileDrainingIsRefused(t *testing.T) {
+	srv, addr, _ := newTTLTestServer(t, "drain-refuse")
+	if !srv.sessions.Drain(time.Second) {
+		t.Fatal("the drain of a server without sessions did not end")
+	}
+
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	line, err := bufio.NewReader(c).ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading the greeting: %v", err)
+	}
+	if !strings.HasPrefix(line, "* BYE ") {
+		t.Fatalf("greeting while the sessions drain = %q, want a BYE", strings.TrimSpace(line))
+	}
+	if got := srv.totalConnections.Load(); got != 0 {
+		t.Errorf("totalConnections = %d for a refused session, want 0", got)
 	}
 }

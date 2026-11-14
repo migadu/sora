@@ -66,7 +66,7 @@ type Server struct {
 	tlsConfig          *tls.Config // What the listener serves with (server.ListenerTLS); nil without tls
 	connManager        *proxy.ConnectionManager
 	connTracker        *server.ConnectionTracker
-	wg                 sync.WaitGroup
+	sessions           server.SessionGroup // Session goroutines, which Stop drains
 	ctx                context.Context
 	cancel             context.CancelFunc
 	enableAffinity     bool
@@ -613,16 +613,19 @@ func (s *Server) acceptConnections() error {
 		// inflate the gauges. PROXY protocol info is discovered there via
 		// the wrapper-chain walk.
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		started := s.sessions.Go(func() {
 			defer func() {
 				if r := recover(); r != nil {
 					logger.Error("ManageSieve Proxy: panic in connection handler", "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
 			s.msLibServer.Load().ServeConn(conn)
-		}()
+		})
+		if !started {
+			// Stop is draining the sessions and no longer waits for new ones.
+			conn.Close()
+			return nil
+		}
 	}
 }
 
@@ -670,16 +673,9 @@ func (s *Server) Stop() error {
 		listener.Close()
 	}
 
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(30 * time.Second) {
 		logger.Debug("ManageSieve Proxy: Server stopped gracefully", "name", s.name)
-	case <-time.After(30 * time.Second):
+	} else {
 		logger.Debug("ManageSieve Proxy: Server stop timeout", "name", s.name)
 	}
 

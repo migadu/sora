@@ -66,7 +66,7 @@ type POP3ProxyServer struct {
 	masterPassword     string
 	connManager        *proxy.ConnectionManager
 	connTracker        *server.ConnectionTracker
-	wg                 sync.WaitGroup
+	sessions           server.SessionGroup // Session goroutines, which Stop drains
 	enableAffinity     bool
 	authLimiter        server.AuthLimiter
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
@@ -653,16 +653,19 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 		// connections never inflate the gauges (they have no session to
 		// decrement them).
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		started := s.sessions.Go(func() {
 			defer func() {
 				if r := recover(); r != nil {
 					logger.Error("POP3 Proxy: panic in connection handler", "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
 			s.pop3libServer.Load().ServeConn(conn)
-		}()
+		})
+		if !started {
+			// Stop is draining the sessions and no longer waits for new ones.
+			conn.Close()
+			return nil
+		}
 	}
 }
 
@@ -711,16 +714,9 @@ func (s *POP3ProxyServer) Stop() error {
 		lib.Close()
 	}
 
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(30 * time.Second) {
 		logger.Debug("POP3 Proxy: Server stopped gracefully", "name", s.name)
-	case <-time.After(30 * time.Second):
+	} else {
 		logger.Debug("POP3 Proxy: Server stop timeout", "proxy", s.name)
 	}
 
