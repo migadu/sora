@@ -213,10 +213,13 @@ func (r *BackendRoute) DialContext(ctx context.Context, network, address string)
 // RecordDialOutcome feeds the outcome of a connection to this route's backend (TCP,
 // PROXY header and TLS handshake; err nil on success) to the health that routing reads,
 // for a caller that dials through its own transport instead of ConnectWithProxy (the
-// User API proxy). It counts what ConnectWithProxy counts: a backend outside the pools
-// has no health entry; a dial the proxy refused itself (maintenance, pool ownership) says
-// nothing about the backend; and a failure counts only while the caller's context is
-// live, as a dial its caller abandoned cannot be told from one the backend timed out.
+// User API proxy). It counts a pool member's dials as ConnectWithProxy does: a dial the
+// proxy refused itself (maintenance, pool ownership) says nothing about the backend, and
+// a failure counts only while the caller's context is live, as a dial its caller
+// abandoned cannot be told from one the backend timed out. A backend outside the pools
+// (a lookup pin) is not recorded: ConnectWithProxy keeps such pins in a record of their
+// own (IsRemoteLookupBackendHealthy) to refuse them early, but the User API proxy dials a
+// pin whatever its health, so nothing would read it.
 func (r *BackendRoute) RecordDialOutcome(ctx context.Context, err error) {
 	cm := r.manager
 	if !cm.HasBackend(r.addr) {
