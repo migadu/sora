@@ -1,12 +1,22 @@
 package lmtpproxy
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/proxy"
 )
 
 // TestConnectionTracker_MultiRCPTDoesNotLeak verifies that an LMTP proxy session
@@ -107,5 +117,113 @@ func TestConnectionTracker_BackendReconnectDoesNotLeak(t *testing.T) {
 
 	if got := tracker.GetLocalConnectionCount(1); got != 0 {
 		t.Fatalf("leak: expected account 1 local count=0 after close(), got %d", got)
+	}
+}
+
+// TestConnectionTracker_BackendRestartOnTheWire drives the real command loop of
+// #903: one LMTP connection delivers to user@example.com, the backend restarts
+// (it drops the connection on RSET), and the client's next MAIL FROM and RCPT TO
+// for the same recipient make the proxy reconnect. The session must count once
+// for the account while it lasts and leave nothing in the tracker after QUIT.
+func TestConnectionTracker_BackendRestartOnTheWire(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	var connections atomic.Int32
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			id := connections.Add(1)
+			go func() {
+				defer conn.Close()
+				conn.SetDeadline(time.Now().Add(10 * time.Second))
+				io.WriteString(conn, "220 backend ready\r\n")
+				reader := bufio.NewReader(conn)
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if id == 1 && strings.HasPrefix(strings.ToUpper(line), "RSET") {
+						return // the first backend connection is lost: a restart
+					}
+					io.WriteString(conn, "250 OK\r\n")
+				}
+			}()
+		}
+	}()
+	lookup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"address": r.URL.Query().Get("email")})
+	}))
+	t.Cleanup(lookup.Close)
+	srv, err := New(context.Background(), nil, "test-host", ServerOptions{
+		Name: "reconnect", RemoteAddrs: []string{ln.Addr().String()}, RemotePort: 24, ConnectTimeout: time.Second,
+		RemoteLookup: &config.RemoteLookupConfig{Enabled: true, URL: lookup.URL + "?email=$email", Timeout: "1s"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Stop() })
+	tracker := server.NewConnectionTracker("LMTP", "", "", "test-instance", nil, 0, 0, 1000, false)
+	t.Cleanup(tracker.Stop)
+	srv.SetConnectionTracker(tracker)
+	account := proxy.DeriveAccountIDFromEmail("user@example.com")
+
+	front, accepted := net.Pipe()
+	t.Cleanup(func() { front.Close() })
+	sess := newSession(srv, accepted, nil)
+	done := make(chan struct{})
+	go func() { defer close(done); sess.handleConnection() }()
+	front.SetDeadline(time.Now().Add(5 * time.Second))
+	reader := bufio.NewReader(front)
+	read := func() string {
+		t.Helper()
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(line) < 4 || line[3] != '-' {
+				return strings.TrimSpace(line)
+			}
+		}
+	}
+	require := func(line, prefix string) {
+		t.Helper()
+		if _, err := fmt.Fprintf(front, "%s\r\n", line); err != nil {
+			t.Fatal(err)
+		}
+		if resp := read(); !strings.HasPrefix(resp, prefix) {
+			t.Fatalf("%s: %s, want %s", line, resp, prefix)
+		}
+	}
+	if greeting := read(); !strings.HasPrefix(greeting, "220") {
+		t.Fatal(greeting)
+	}
+	require("LHLO client.example.com", "250")
+	require("MAIL FROM:<sender@example.com>", "250")
+	require("RCPT TO:<user@example.com>", "250")
+	require("RSET", "250") // the backend drops the connection here
+	require("MAIL FROM:<sender@example.com>", "250")
+	require("RCPT TO:<user@example.com>", "250") // the proxy reconnects
+	if n := connections.Load(); n != 2 {
+		t.Fatalf("backend connections = %d, want 2 (the second RCPT must reconnect)", n)
+	}
+	if got := tracker.GetLocalConnectionCount(account); got != 1 {
+		t.Errorf("one LMTP connection must count once for the account, got %d", got)
+	}
+	require("QUIT", "221")
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session did not finish after QUIT")
+	}
+	if got := tracker.GetLocalConnectionCount(account); got != 0 {
+		t.Fatalf("leak: account count after QUIT = %d, want 0", got)
 	}
 }
