@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"slices"
+	"strings"
 	"syscall"
 )
 
@@ -38,6 +39,12 @@ func (cm *ConnectionManager) BindBackendRoute(poolName, addr string) (*BackendRo
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
+		if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+			host = host[1 : len(host)-1]
+		}
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
 	}
 	r.names = append(cm.configuredHostnamesOfLocked(addr), host)
 	if !cm.HasNamedPools() {
