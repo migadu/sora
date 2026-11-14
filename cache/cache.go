@@ -67,6 +67,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -91,6 +92,14 @@ const DataDir = "data"
 const IndexDB = "cache_index.db"
 const PurgeBatchSize = 1000
 const NumShards = 256
+
+// tmpInfix marks the temporary file a write puts next to its final path:
+// <path>.tmp.<suffix>. Final names are hex and never hold it.
+const tmpInfix = ".tmp."
+
+// staleTmpAge is how old a temporary file must be before the shard sweep removes it: a
+// write finishes with its file within seconds, so one this old was cut off by a crash.
+const staleTmpAge = time.Hour
 
 // ErrObjectTooLarge is returned when attempting to cache an object that exceeds the size
 // limit: max_object_size, or one shard's share of the capacity (see tooLarge).
@@ -382,12 +391,14 @@ func (c *Cache) Delete(contentHash string) error {
 	path := c.GetPathForContentHash(contentHash)
 	shard := c.getShard(contentHash)
 
+	// The file and its row go under the shard lock, as in every removal: a Put of the
+	// object in between would otherwise lose its row and leave a file without one.
+	shard.mu.Lock()
 	err := os.Remove(path)
 	if err != nil && !os.IsNotExist(err) {
+		shard.mu.Unlock()
 		return fmt.Errorf("failed to delete file: %w", err)
 	}
-
-	shard.mu.Lock()
 	_, dbErr := shard.db.Exec(`DELETE FROM cache_index WHERE path = ?`, path)
 	shard.mu.Unlock()
 
@@ -415,7 +426,7 @@ func (c *Cache) MoveIn(sourcePath string, contentHash string) error {
 	if _, err := os.Stat(targetPath); err == nil {
 		logger.Info("Cache: File already exists in cache - removing source", "target", targetPath, "source", sourcePath)
 		_ = os.Remove(sourcePath)
-		return c.trackFile(shard, targetPath)
+		return c.trackPlaced(shard, targetPath)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
@@ -427,12 +438,12 @@ func (c *Cache) MoveIn(sourcePath string, contentHash string) error {
 			if copyErr := c.copyAndRemove(sourcePath, targetPath); copyErr != nil {
 				return copyErr
 			}
-			return c.trackFile(shard, targetPath)
+			return c.trackPlaced(shard, targetPath)
 		}
 		return fmt.Errorf("failed to move file into cache: %w", err)
 	}
 
-	return c.trackFile(shard, targetPath)
+	return c.trackPlaced(shard, targetPath)
 }
 
 // copyAndRemove is a fallback for os.Rename when crossing device boundaries (EXDEV)
@@ -446,7 +457,7 @@ func (c *Cache) copyAndRemove(src, dst string) error {
 	// Copy to a temporary name and rename: by the time MoveIn runs, the message row
 	// is already marked uploaded, so a reader may open dst at any moment and must
 	// never see it half-written.
-	tmp := dst + ".tmp." + fmt.Sprintf("%d", time.Now().UnixNano())
+	tmp := dst + tmpInfix + fmt.Sprintf("%d", time.Now().UnixNano())
 	destFile, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to create destination file for copy: %w", err)
@@ -517,7 +528,7 @@ func (c *Cache) Put(contentHash string, data []byte) error {
 	// Write to temp file first to avoid partial reads by concurrent requests
 	b := make([]byte, 4)
 	rand.Read(b)
-	tempPath := path + ".tmp." + fmt.Sprintf("%d_%x", time.Now().UnixNano(), b)
+	tempPath := path + tmpInfix + fmt.Sprintf("%d_%x", time.Now().UnixNano(), b)
 	file, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to create cache file: %w", err)
@@ -543,7 +554,22 @@ func (c *Cache) Put(contentHash string, data []byte) error {
 	}
 
 	shard := c.getShard(contentHash)
-	return c.trackFile(shard, path)
+	return c.trackPlaced(shard, path)
+}
+
+// trackPlaced indexes a file Put or MoveIn has just put in place at path, and removes it
+// again when the index does not take it. Every eviction starts from the index and Get
+// serves the file without looking at it, so a file left without its row would stay on
+// disk for good, outside the capacity (#768). The body is content-addressed: the next
+// miss fetches it again.
+func (c *Cache) trackPlaced(shard *cacheShard, path string) error {
+	err := c.trackFile(shard, path)
+	if err != nil {
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			logger.Warn("Cache: Failed to remove a file the index did not take", "path", path, "error", rmErr)
+		}
+	}
+	return err
 }
 
 func (c *Cache) trackFile(shard *cacheShard, path string) error {
@@ -583,7 +609,14 @@ func (c *Cache) trackFile(shard *cacheShard, path string) error {
 // is done or the cache is closed. The server starts it once; New does not.
 func (c *Cache) StartPurgeLoop(ctx context.Context) {
 	go func() {
+		// Each cycle sweeps one shard, so all 256 take 256 purge intervals (128 days at
+		// the default 12h). The rotation follows the clock rather than starting over at
+		// shard 00: a node restarted more often than that would otherwise sweep its first
+		// few shards again and again and never the rest.
 		staleShardIdx := 0
+		if c.purgeInterval > 0 {
+			staleShardIdx = int(time.Now().UnixNano() / int64(c.purgeInterval) % NumShards)
+		}
 		c.runPurgeCycle(ctx, &staleShardIdx)
 
 		ticker := time.NewTicker(c.purgeInterval)
@@ -604,16 +637,21 @@ func (c *Cache) StartPurgeLoop(ctx context.Context) {
 
 func (c *Cache) runPurgeCycle(ctx context.Context, staleShardIdx *int) {
 	logger.Info("Cache: running cache purge cycle")
+
+	// The shard's sweep comes first, so this cycle's capacity purge covers what it indexed.
+	shard := c.shards[*staleShardIdx]
+	if err := c.removeStaleEntriesForShard(ctx, shard); err != nil {
+		logger.Error("Cache: Stale DB entry cleanup error for shard", "error", err, "shard", *staleShardIdx)
+	}
+	if err := c.sweepShardFiles(ctx, *staleShardIdx); err != nil {
+		logger.Error("Cache: File sweep error for shard", "error", err, "shard", *staleShardIdx)
+	}
+
 	if err := c.PurgeIfNeeded(ctx); err != nil {
 		logger.Warn("Cache: Purge failed", "error", err)
 	}
 	if err := c.PurgeOrphanedContentHashes(ctx); err != nil {
 		logger.Error("Cache: Orphan cleanup error", "error", err)
-	}
-
-	shard := c.shards[*staleShardIdx]
-	if err := c.removeStaleEntriesForShard(ctx, shard); err != nil {
-		logger.Error("Cache: Stale DB entry cleanup error for shard", "error", err, "shard", *staleShardIdx)
 	}
 
 	*staleShardIdx = (*staleShardIdx + 1) % NumShards
@@ -729,21 +767,11 @@ func (c *Cache) getPurgeCandidatesForShard(ctx context.Context, shard *cacheShar
 	return pathsToPurge, nil
 }
 
+// PurgeAll empties the cache. The index is cleared before the files are removed: a write
+// landing in between then leaves at most a row without its file, which the stale-entry
+// sweep drops and Get treats as a miss, never a file whose row the clearing drops, which
+// no eviction would ever reach (#768).
 func (c *Cache) PurgeAll(ctx context.Context) error {
-	dataDir := filepath.Join(c.basePath, DataDir)
-
-	entries, err := os.ReadDir(dataDir)
-	if err == nil {
-		for _, entry := range entries {
-			if entry.IsDir() && len(entry.Name()) == 2 {
-				fullPath := filepath.Join(dataDir, entry.Name())
-				if err := os.RemoveAll(fullPath); err != nil {
-					logger.Error("Cache: Failed to remove directory during PurgeAll", "path", fullPath, "error", err)
-				}
-			}
-		}
-	}
-
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var errs []error
@@ -764,6 +792,19 @@ func (c *Cache) PurgeAll(ctx context.Context) error {
 		}(c.shards[i])
 	}
 	wg.Wait()
+
+	dataDir := filepath.Join(c.basePath, DataDir)
+	entries, err := os.ReadDir(dataDir)
+	if err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() && len(entry.Name()) == 2 {
+				fullPath := filepath.Join(dataDir, entry.Name())
+				if err := os.RemoveAll(fullPath); err != nil {
+					logger.Error("Cache: Failed to remove directory during PurgeAll", "path", fullPath, "error", err)
+				}
+			}
+		}
+	}
 
 	if len(errs) > 0 {
 		return fmt.Errorf("failed to clear cache index, encountered %d errors", len(errs))
@@ -822,8 +863,16 @@ func (c *Cache) PurgeOrphanedContentHashes(ctx context.Context) error {
 		for _, hash := range contentHashes {
 			if !existingMap[hash] {
 				p := hashToPath[hash]
-				os.Remove(p)
+				// The row goes only with its file, and both under the shard lock, as in
+				// the capacity purge: a row dropped next to a file that stays (a failed
+				// remove, or a Put of the object in between) leaves that file outside
+				// every eviction (#768).
 				shard.mu.Lock()
+				if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+					shard.mu.Unlock()
+					logger.Warn("Cache: Failed to delete orphaned file", "path", p, "error", err)
+					continue
+				}
 				shard.db.Exec(`DELETE FROM cache_index WHERE path = ?`, p)
 				shard.mu.Unlock()
 				purged++
@@ -858,10 +907,100 @@ func (c *Cache) removeStaleEntriesForShard(ctx context.Context, shard *cacheShar
 
 	for _, p := range stalePaths {
 		shard.mu.Lock()
-		shard.db.ExecContext(ctx, `DELETE FROM cache_index WHERE path = ?`, p)
+		// Checked again under the lock: a Put of the object may have put its file back
+		// since, and its row must stay with it (#768).
+		if _, err := os.Lstat(p); os.IsNotExist(err) {
+			shard.db.ExecContext(ctx, `DELETE FROM cache_index WHERE path = ?`, p)
+		}
 		shard.mu.Unlock()
 	}
 	return nil
+}
+
+// sweepShardFiles walks shard idx's directory data/XX for what the index lost: a file
+// under its final name without a row is indexed, so the capacity and the orphan purge
+// cover it again, and a temporary file older than staleTmpAge is removed. A write cut off
+// by a crash leaves them (one between its rename and its index insert, one before its
+// rename); nothing else reaches them, as every eviction starts from the index and Get
+// serves a file without indexing it (#768). Directories stay (#645).
+func (c *Cache) sweepShardFiles(ctx context.Context, idx int) error {
+	shard := c.shards[idx]
+
+	shard.mu.Lock()
+	rows, err := shard.db.QueryContext(ctx, `SELECT path FROM cache_index`)
+	shard.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("failed to query cache index: %w", err)
+	}
+	indexed := make(map[string]struct{})
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err == nil {
+			indexed[p] = struct{}{}
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read cache index: %w", err)
+	}
+
+	var added, addedSize int64
+	var removedTmp int
+	staleBefore := time.Now().Add(-staleTmpAge)
+	dir := filepath.Join(c.basePath, DataDir, fmt.Sprintf("%02x", idx))
+	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if !os.IsNotExist(err) {
+				logger.Warn("Cache: Failed to read path during file sweep", "path", path, "error", err)
+			}
+			return nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		if strings.Contains(d.Name(), tmpInfix) {
+			if info, err := d.Info(); err == nil && info.ModTime().Before(staleBefore) {
+				if err := os.Remove(path); err == nil {
+					removedTmp++
+				} else if !os.IsNotExist(err) {
+					logger.Warn("Cache: Failed to remove stale temporary file", "path", path, "error", err)
+				}
+			}
+			return nil
+		}
+		if _, ok := indexed[path]; ok {
+			return nil
+		}
+		// Under the lock, as every removal takes its file and row under it: a file
+		// removed since is not indexed again.
+		shard.mu.Lock()
+		defer shard.mu.Unlock()
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		res, err := shard.db.ExecContext(ctx,
+			`INSERT OR IGNORE INTO cache_index (path, size, mod_time) VALUES (?, ?, ?)`,
+			path, info.Size(), info.ModTime())
+		if err != nil {
+			logger.Warn("Cache: Failed to index file during file sweep", "path", path, "error", err)
+			return nil
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			shard.size += info.Size()
+			added++
+			addedSize += info.Size()
+		}
+		return nil
+	})
+	if added > 0 || removedTmp > 0 {
+		logger.Info("Cache: File sweep took back files the index lost", "shard", fmt.Sprintf("%02x", idx),
+			"indexed", added, "indexed_bytes", addedSize, "removed_tmp", removedTmp)
+	}
+	return err
 }
 
 // GetStats returns current cache statistics
