@@ -1,7 +1,9 @@
 package imap
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/migadu/go-imap"
 )
@@ -33,8 +35,8 @@ func TestValidateSearchCriteria_RejectsDeepNestingWithNo(t *testing.T) {
 	if imapErr.Type != imap.StatusResponseTypeNo {
 		t.Errorf("expected NO response, got %v", imapErr.Type)
 	}
-	if imapErr.Code != imap.ResponseCode("SERVERLIMIT") {
-		t.Errorf("expected SERVERLIMIT code, got %v", imapErr.Code)
+	if imapErr.Code != imap.ResponseCodeLimit {
+		t.Errorf("expected LIMIT code, got %v", imapErr.Code)
 	}
 }
 
@@ -55,8 +57,8 @@ func TestValidateSearchCriteria_RejectsWideFanOutWithNo(t *testing.T) {
 	}
 	if imapErr, ok := err.(*imap.Error); !ok || imapErr.Type != imap.StatusResponseTypeNo {
 		t.Fatalf("expected NO *imap.Error, got %T (%v)", err, err)
-	} else if imapErr.Code != imap.ResponseCode("SERVERLIMIT") {
-		t.Errorf("expected SERVERLIMIT code, got %v", imapErr.Code)
+	} else if imapErr.Code != imap.ResponseCodeLimit {
+		t.Errorf("expected LIMIT code, got %v", imapErr.Code)
 	}
 }
 
@@ -77,6 +79,30 @@ func TestValidateSearchCriteria_AcceptsTypicalCriteria(t *testing.T) {
 	for i, c := range cases {
 		if err := s.validateSearchCriteria("SEARCH", c); err != nil {
 			t.Errorf("case %d: expected typical criteria to pass, got %v", i, err)
+		}
+	}
+}
+
+// Well-formed searches that match no message, or every message, are answered,
+// not refused: RFC 3501 §7.1.3 reserves BAD for "a protocol-level error in the
+// client's command", and a date span has no limit (#283).
+func TestValidateSearchCriteria_AcceptsSearchesThatMatchNothingOrAll(t *testing.T) {
+	s := &IMAPSession{}
+	day := func(y int, m time.Month, d int) time.Time { return time.Date(y, m, d, 0, 0, 0, 0, time.UTC) }
+
+	for name, criteria := range map[string]*imap.SearchCriteria{
+		"SINCE after BEFORE":         {Since: day(2025, 3, 1), Before: day(2025, 1, 1)},
+		"SENTSINCE after SENTBEFORE": {SentSince: day(2025, 3, 1), SentBefore: day(2025, 1, 1)},
+		"LARGER over SMALLER":        {Larger: 5000, Smaller: 10},
+		"LARGER equal to SMALLER":    {Larger: 10, Smaller: 10},
+		"empty BODY":                 {Body: []string{""}},
+		"empty TEXT":                 {Text: []string{""}},
+		"date span over a year":      {Since: day(2024, 1, 1), Before: day(2025, 3, 1)},
+		"sent date span over a year": {SentSince: day(2024, 1, 1), SentBefore: day(2025, 3, 1)},
+		"long Message-ID":            {Header: []imap.SearchCriteriaHeaderField{{Key: "Message-ID", Value: "<" + strings.Repeat("x", 300) + "@example.com>"}}},
+	} {
+		if err := s.validateSearchCriteria("SEARCH", criteria); err != nil {
+			t.Errorf("%s: refused with %v", name, err)
 		}
 	}
 }
