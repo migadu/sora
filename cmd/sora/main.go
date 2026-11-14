@@ -1173,6 +1173,10 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 				}
 			}()
 		}
+		// Arm renewal for the certificates already cached. Not before this point: one
+		// that is due is renewed at once, and that order needs the issuance fence
+		// (installed with the manager) and HTTP-01 (enabled by HTTPHandler above).
+		deps.tlsManager.StartRenewals()
 	}
 
 	// Start all configured servers dynamically

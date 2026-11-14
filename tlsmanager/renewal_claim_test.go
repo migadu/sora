@@ -135,10 +135,44 @@ func TestCachedCertificateIsRenewedWithoutAHandshake(t *testing.T) {
 		t.Fatalf("storing certificate: %v", err)
 	}
 
-	m.prewarmCertificates()
+	m.StartRenewals()
 
 	if !waitFor(5*time.Second, func() bool { return acme.orders.Load() > 0 }) {
 		t.Fatal("a certificate inside its renewal window was not renewed: no order reached the ACME server without a handshake")
+	}
+}
+
+// TestBuildingTheManagerOrdersNothing: the server builds the manager before it installs
+// the issuance fence and before it enables HTTP-01. A renewal started while the manager
+// is being built would order without the cluster-wide claim (reading the fence while
+// SetCertificateFence writes it) and could try tls-alpn-01 only, so building the manager
+// must not load the cached certificates; renewals start once the node is wired.
+func TestBuildingTheManagerOrdersNothing(t *testing.T) {
+	const domain = "mail.example.com"
+	ctx := context.Background()
+
+	_, endpoint := newStubS3(t)
+	shared := newStubS3Cache(t, endpoint)
+	accountKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	if err := shared.Put(ctx, "acme_account+key", encodeECDSAKeyPEM(t, accountKey)); err != nil {
+		t.Fatalf("seeding ACME account key: %v", err)
+	}
+	if err := shared.Put(ctx, domain, dueForRenewal(t, domain)); err != nil {
+		t.Fatalf("seeding certificate: %v", err)
+	}
+
+	coordinator := &fakeCoordinator{}
+	coordinator.leader.Store(true)
+	_, acmeHits := newTestClusterManager(t, endpoint, coordinator, func(le *config.TLSLetsEncryptConfig) {
+		le.FallbackDir = t.TempDir()
+	})
+
+	time.Sleep(500 * time.Millisecond)
+	if hits := acmeHits.Load(); hits != 0 {
+		t.Errorf("building the manager sent %d requests to the ACME server, before the issuance fence could be installed", hits)
 	}
 }
 

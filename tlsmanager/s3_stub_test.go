@@ -171,8 +171,8 @@ func newTestClusterManager(t *testing.T, s3Endpoint string, clusterMgr clusterCo
 	}
 
 	// Redirect the directory only: the rest of the ACME client is what production builds.
-	// It has to happen before the manager is built, which loads the cached certificates
-	// and can start a renewal.
+	// It happens before the manager is built, so that nothing building it starts can reach
+	// Let's Encrypt.
 	acmeHits, directoryURL := newStubACME(t)
 	productionDirectory := acmeDirectoryURL
 	acmeDirectoryURL = directoryURL

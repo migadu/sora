@@ -77,8 +77,8 @@ const (
 )
 
 // SetCertificateFence installs the cluster-wide issuance fence. It must be called before
-// the first TLS handshake; a nil fence leaves gossip leadership as the only gate, which is
-// all a node without a database can do.
+// StartRenewals and the first TLS handshake; a nil fence leaves gossip leadership as the
+// only gate, which is all a node without a database can do.
 func (m *Manager) SetCertificateFence(fence CertificateFence) {
 	m.claimMu.Lock()
 	defer m.claimMu.Unlock()
@@ -416,10 +416,9 @@ func (m *Manager) initLetsEncryptProvider() error {
 	}
 	logger.Info("Certificates will be stored in S3 bucket", "bucket", leCfg.S3.Bucket)
 
-	// Pre-warm certificates from cache into autocert's state
-	// This ensures that existing certificates in S3 are loaded immediately at startup
-	// instead of waiting for the first TLS handshake (which might timeout/fail)
-	m.prewarmCertificates()
+	// Certificates already in the cache are loaded by StartRenewals, not here: loading
+	// one that is due renews it at once, and the caller has not yet installed the
+	// issuance fence or enabled HTTP-01.
 
 	// Start certificate sync worker if configured
 	if leCfg.SyncInterval != "" && leCfg.SyncInterval != "0" {
@@ -574,17 +573,21 @@ func (m *Manager) clearRateLimit(domain string) {
 	delete(m.rateLimitMap, domain)
 }
 
-// prewarmCertificates loads every certificate the cache holds for a configured domain
-// into autocert. Loading a certificate is what starts autocert's renewal timer for it,
-// and on its own autocert loads one only inside a handshake for that domain: a node that
-// serves no handshake for a domain - the leader, when clients are sent to other nodes -
-// would never renew it.
+// StartRenewals loads every certificate the cache holds for a configured domain into
+// autocert. Loading a certificate is what starts autocert's renewal timer for it, and on
+// its own autocert loads one only inside a handshake for that domain: a node that serves
+// no handshake for a domain - the leader, when clients are sent to other nodes - would
+// never renew it.
 //
 // A certificate past its renewal point is renewed as soon as it is loaded, by the node
 // that may issue. On the others the order is refused at the issuance fence and autocert
 // retries, picking up the renewed certificate once it has reached their cache. Domains
 // without a certificate in the cache are left to their first handshake, as before.
-func (m *Manager) prewarmCertificates() {
+//
+// Call it once this node can complete an order: after SetCertificateFence, so that the
+// order takes the cluster-wide claim, and after HTTPHandler, without which autocert
+// tries tls-alpn-01 only. It does nothing for a manager that does not use Let's Encrypt.
+func (m *Manager) StartRenewals() {
 	if m.autocertMgr == nil || m.autocertMgr.Cache == nil || m.config.LetsEncrypt == nil {
 		return
 	}
