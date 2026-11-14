@@ -1,6 +1,7 @@
 package imapproxy
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -80,13 +81,23 @@ func (s *Session) sendForwardingParametersToBackend() error {
 		}
 	}()
 
-	// Read backend response (we expect "* ID (...)" followed by "A002 OK"). The tagged
+	// Read backend response (we expect "* ID (...)" followed by the tagged OK). The tagged
 	// reply ends the exchange whatever its status (RFC 9051 section 2.2.2). The read is
 	// bounded like every other backend read: RFC 2971 section 3.3 keeps a
 	// well-formed ID response far below 64 KiB (at most 30 pairs of a field of up to 30
 	// octets and a value of up to 1024).
+	warnedTooLong := false
 	for {
 		response, err := server.ReadBoundedLine(s.backendReader, 65536)
+		if errors.Is(err, server.ErrLineTooLong) {
+			// ReadBoundedLine drained the line. Read on to the tagged reply: the login
+			// goes on after a failed ID, and AUTHENTICATE would take that reply for its own.
+			if !warnedTooLong {
+				s.WarnLog("skipping oversized line in backend ID response", "backend", s.serverAddr)
+				warnedTooLong = true
+			}
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("failed to read ID response: %w", err)
 		}

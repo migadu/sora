@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -122,19 +123,61 @@ func TestSendForwardingParametersIDReplyStatus(t *testing.T) {
 
 // The ID response is read with a bound, like every other backend reply: RFC 2971 section
 // 3.3 caps a well-formed one (at most 30 field-value pairs, fields of at most 30 octets
-// and values of at most 1024), so a longer line is a misbehaving backend.
+// and values of at most 1024), so a longer line is a misbehaving backend. The proxy
+// skips such a line without holding it and reads on to the tagged ID reply: the login
+// goes on to AUTHENTICATE after the ID, which must not take the ID's reply for its own.
 func TestSendForwardingParametersBoundsIDResponseLine(t *testing.T) {
-	addr := fakeStatusBackend(t, "* OK ready\r\n", map[string]func(string) string{
-		"ID": func(tag string) string {
-			return "* ID (\"name\" \"" + strings.Repeat("x", 70000) + "\")\r\n" + tag + " OK ID completed\r\n"
-		},
-	})
-	sess, err := connectToTestBackend(t, addr, proxy.BackendSettings{})
+	const lineSize = 16 << 20
+	// Built before the measurement below, and written in pieces, so that the backend
+	// side allocates nothing while the proxy reads.
+	oversized := []byte("* ID (\"name\" \"" + strings.Repeat("x", lineSize) + "\")\r\n")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(10 * time.Second))
+		io.WriteString(conn, "* OK ready\r\n")
+		r := bufio.NewReader(conn)
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				return
+			}
+			tag, rest, _ := strings.Cut(line, " ")
+			switch command, _, _ := strings.Cut(rest, " "); command {
+			case "ID":
+				for b := oversized; len(b) > 0; b = b[min(len(b), 64<<10):] {
+					conn.Write(b[:min(len(b), 64<<10)])
+				}
+				io.WriteString(conn, tag+" OK ID completed\r\n")
+			case "AUTHENTICATE":
+				io.WriteString(conn, tag+" OK Logged in\r\n")
+			}
+		}
+	}()
+	sess, err := connectToTestBackend(t, ln.Addr().String(), proxy.BackendSettings{})
 	if err != nil {
 		t.Fatalf("connectToBackend: %v", err)
 	}
-	if err := sess.sendForwardingParametersToBackend(); !errors.Is(err, server.ErrLineTooLong) {
-		t.Fatalf("sendForwardingParametersToBackend = %v, want %v", err, server.ErrLineTooLong)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	err = sess.sendForwardingParametersToBackend()
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatalf("sendForwardingParametersToBackend: %v", err)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated >= lineSize {
+		t.Errorf("reading the ID response allocated %d bytes for a %d-byte line, want it bounded", allocated, lineSize)
+	}
+	if _, err := sess.authenticateToBackend(); err != nil {
+		t.Fatalf("authenticateToBackend after the oversized ID line: %v", err)
 	}
 }
 
