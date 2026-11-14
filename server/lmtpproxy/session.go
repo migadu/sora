@@ -871,8 +871,9 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				"method", "cache",
 				"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
-			// The reply the fresh lookup that cached it gave: a cache hit must
-			// neither bounce where the miss deferred nor defer where it bounced.
+			// The reply a fresh lookup from the same source gives now: a remote
+			// lookup negative gets the reply its 404 got, a database negative is
+			// still deferred while no default-pool backend is healthy.
 			return s.userNotFoundError(cached.FromRemoteLookup)
 		} else {
 			// User found - use cached routing info
