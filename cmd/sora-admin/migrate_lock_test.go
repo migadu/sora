@@ -75,3 +75,43 @@ func TestMigrateCommands_RefusedWhileTheMigrationLeaderLockIsHeld(t *testing.T) 
 		t.Fatal("sora-admin migrate got a migration instance while another migrator holds the leader lock")
 	}
 }
+
+// The migration driver runs migrations both ways and records the version as
+// golang-migrate expects: down one step, force, up again.
+func TestMigrateCommands_DownForceUpRoundTrip(t *testing.T) {
+	cfg := adminTestDBConfig(t)
+	saved := globalConfig.Database.Write
+	t.Cleanup(func() { globalConfig.Database.Write = saved })
+	globalConfig.Database.Write = cfg.Write
+
+	m, closer, err := getMigrateInstance(context.Background())
+	if err != nil {
+		t.Fatalf("getMigrateInstance: %v", err)
+	}
+	defer closer.Close()
+
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		t.Fatalf("up: %v", err)
+	}
+	latest, dirty, err := m.Version()
+	if err != nil || dirty {
+		t.Fatalf("version after up: %d dirty %v err %v", latest, dirty, err)
+	}
+
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("down one step: %v", err)
+	}
+	if v, dirty, err := m.Version(); err != nil || dirty || v != latest-1 {
+		t.Fatalf("version after down: %d dirty %v err %v, want %d clean", v, dirty, err, latest-1)
+	}
+
+	if err := m.Force(int(latest - 1)); err != nil {
+		t.Fatalf("force: %v", err)
+	}
+	if err := m.Up(); err != nil {
+		t.Fatalf("up again: %v", err)
+	}
+	if v, dirty, err := m.Version(); err != nil || dirty || v != latest {
+		t.Fatalf("version after up again: %d dirty %v err %v, want %d clean", v, dirty, err, latest)
+	}
+}

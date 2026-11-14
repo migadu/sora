@@ -6,13 +6,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/fs"
+	"io"
 	"os"
 	"strconv"
 
 	"github.com/golang-migrate/migrate/v4"
-	pgxv5 "github.com/golang-migrate/migrate/v4/database/pgx/v5"
-	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/migadu/sora/db" // Import the db package to access MigrationsFS
 	"github.com/migadu/sora/logger"
@@ -50,7 +49,8 @@ func printMigrateUsage() {
 
 The 'version' subcommand can be run safely while sora instances are running (it queries
 schema_migrations directly without acquiring locks). The 'up', 'down', and 'force'
-subcommands require stopping sora instances first.
+subcommands require stopping sora instances first; they take the migration leader lock
+and refuse to run while a starting instance holds it.
 
 Usage:
   sora-admin migrate <subcommand> [options]
@@ -222,7 +222,12 @@ func handleMigrateForce(ctx context.Context) {
 	showVersion(m)
 }
 
-func getMigrateInstance(ctx context.Context) (*migrate.Migrate, *sql.DB, error) {
+// getMigrateInstance connects to the first [database.write] host and returns a
+// golang-migrate instance held under the migration leader lock (db.OpenMigrate): it
+// never runs alongside a starting sora instance's migrations, and it takes no
+// session-level lock that a transaction-mode pooler would strand. Close the returned
+// io.Closer when done.
+func getMigrateInstance(ctx context.Context) (*migrate.Migrate, io.Closer, error) {
 	dbCfg := globalConfig.Database.Write
 	if dbCfg == nil || len(dbCfg.Hosts) == 0 {
 		return nil, nil, errors.New("write database configuration is missing or has no hosts")
@@ -235,45 +240,27 @@ func getMigrateInstance(ctx context.Context) (*migrate.Migrate, *sql.DB, error) 
 	connString := fmt.Sprintf("postgres://%s:%s@%s:%v/%s?sslmode=%s",
 		dbCfg.User, dbCfg.Password, dbCfg.Hosts[0], dbCfg.Port, dbCfg.Name, sslMode)
 
-	sqlDB, err := sql.Open("pgx", connString)
+	pool, err := pgxpool.New(ctx, connString)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to open sql.DB for migrations: %w", err)
+		return nil, nil, fmt.Errorf("failed to create connection pool for migrations: %w", err)
 	}
-
-	if err := sqlDB.PingContext(ctx); err != nil {
-		sqlDB.Close()
-		return nil, nil, fmt.Errorf("failed to ping database: %w", err)
-	}
-
-	// Use the exported MigrationsFS from the db package. The go:embed directive
-	// includes the 'migrations' directory, so we create a sub-filesystem.
-	migrations, err := fs.Sub(db.MigrationsFS, "migrations")
+	m, session, err := (&db.Database{WritePool: pool}).OpenMigrate(ctx)
 	if err != nil {
-		sqlDB.Close()
-		return nil, nil, fmt.Errorf("failed to get migrations subdirectory: %w", err)
-	}
-
-	sourceDriver, err := iofs.New(migrations, ".")
-	if err != nil {
-		sqlDB.Close()
-		return nil, nil, fmt.Errorf("failed to create migration source driver: %w", err)
-	}
-
-	dbDriver, err := pgxv5.WithInstance(sqlDB, &pgxv5.Config{})
-	if err != nil {
-		sqlDB.Close()
-		return nil, nil, fmt.Errorf("failed to create migration db driver: %w", err)
-	}
-
-	m, err := migrate.NewWithInstance("iofs", sourceDriver, "pgx5", dbDriver)
-	if err != nil {
-		sqlDB.Close()
-		return nil, nil, fmt.Errorf("failed to create migrate instance: %w", err)
+		pool.Close()
+		return nil, nil, fmt.Errorf("failed to start migration: %w", err)
 	}
 
 	m.Log = &migrationLogger{}
-	return m, sqlDB, nil
+	return m, closerFunc(func() error {
+		err := session.Close()
+		pool.Close()
+		return err
+	}), nil
 }
+
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
 
 func showVersion(m *migrate.Migrate) {
 	version, dirty, err := m.Version()
