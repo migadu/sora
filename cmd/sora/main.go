@@ -1351,7 +1351,7 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 			"max_per_user_per_ip", 0,
 		)
 
-		tracker := server.NewConnectionTracker(protocol, serverName, hostname, instanceID, nil, 0, 0, 0, false)
+		tracker := server.NewProxyConnectionTracker(protocol, serverName, hostname, instanceID, nil, 0, 0, 0, false)
 		if tracker != nil {
 			srv.SetConnectionTracker(tracker)
 		}
@@ -1387,7 +1387,7 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 
 	logger.Info("Proxy: Starting gossip connection tracker", "protocol", protocol, "name", serverName, "instance", instanceID, "max_per_user", maxConnectionsPerUser, "max_per_user_per_ip", maxConnectionsPerUserPerIP)
 
-	tracker := server.NewConnectionTracker(protocol, serverName, hostname, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize, false)
+	tracker := server.NewProxyConnectionTracker(protocol, serverName, hostname, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize, false)
 	if tracker != nil {
 		srv.SetConnectionTracker(tracker)
 	}

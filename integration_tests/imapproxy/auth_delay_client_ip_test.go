@@ -137,7 +137,7 @@ func TestIMAPProxy_AuthDelay_UsesRealClientIP(t *testing.T) {
 	}
 
 	delays := func() float64 {
-		return testutil.ToFloat64(metrics.AuthDelayCompleted.WithLabelValues("IMAP-PROXY"))
+		return testutil.ToFloat64(metrics.AuthDelayCompleted.WithLabelValues("imap_proxy"))
 	}
 
 	// Two failures push the real client's failure count to the delay threshold.

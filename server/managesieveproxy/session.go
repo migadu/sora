@@ -280,7 +280,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// meant the delay never fired in exactly the deployment proxies exist for.
 	realClientIP, _ := server.GetConnectionIPs(s.clientConn, s.proxyInfo)
 	remoteAddr := &server.StringAddr{Addr: realClientIP}
-	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-PROXY"); err != nil {
+	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "managesieve_proxy"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
 			s.InfoLog("delay queue full, rejecting connection", "username", username)
