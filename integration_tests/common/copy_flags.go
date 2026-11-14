@@ -15,8 +15,9 @@ import (
 
 // SieveFlagsBySubject maps each mailbox of accountID that holds a live message with
 // the given subject to that copy's flags, lower-cased and sorted, with the RFC 9979
-// attachment keyword delivery adds to every message left out. A test that delivers
-// one message into several mailboxes reads the flags each copy was stored with.
+// attachment keyword delivery adds to every message left out; a copy without one
+// fails the test. A test that delivers one message into several mailboxes reads the
+// flags each copy was stored with.
 func SieveFlagsBySubject(t *testing.T, rdb *resilient.ResilientDatabase, accountID int64, subject string) map[string][]string {
 	t.Helper()
 	rows, err := rdb.QueryWithRetry(context.Background(), `
@@ -46,10 +47,17 @@ func SieveFlagsBySubject(t *testing.T, rdb *resilient.ResilientDatabase, account
 		for _, f := range db.BitwiseToFlags(bits) {
 			flags = append(flags, strings.ToLower(string(f)))
 		}
+		attachmentKeywords := 0
 		for _, f := range custom {
 			if f = strings.ToLower(f); f != "$hasattachment" && f != "$hasnoattachment" {
 				flags = append(flags, f)
+			} else {
+				attachmentKeywords++
 			}
+		}
+		// Every copy is stored with the attachment keyword, whatever its own flags.
+		if attachmentKeywords != 1 {
+			t.Errorf("copy of %q in %s has keywords %v, want exactly one RFC 9979 attachment keyword", subject, mailbox, custom)
 		}
 		slices.Sort(flags)
 		copies[mailbox] = flags

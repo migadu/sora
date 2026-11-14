@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"slices"
 	"time"
 
 	"github.com/emersion/go-message"
@@ -230,7 +229,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		d.Logger.Log("Invalid body structure detected, using fallback: %v", bsErr)
 	}
 	bodyStructure := &bodyStructureVal
-	deliveryFlags := db.WithAttachmentKeyword(sieveFlags, messageBytes, true)
+	// Classified once: every copy gets the keyword next to its own Sieve flags.
+	attachmentKeyword, attachmentKnown := helpers.AttachmentKeyword(messageBytes)
+	deliveryFlags := db.WithClassifiedAttachmentKeyword(sieveFlags, attachmentKeyword, attachmentKnown, true)
 
 	// Extract recipients
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
@@ -285,11 +286,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// their pending_uploads rows can never name a file that is not staged yet - the
 	// uploader treats a missing local file as permanently lost content.
 	for _, c := range copies {
-		// A copy with the first one's flags needs no second attachment classification.
-		flags := deliveryFlags
-		if !slices.Equal(c.Flags, sieveFlags) {
-			flags = db.WithAttachmentKeyword(c.Flags, messageBytes, true)
-		}
+		flags := db.WithClassifiedAttachmentKeyword(c.Flags, attachmentKeyword, attachmentKnown, true)
 		err := d.SaveMessageToMailbox(ctx, recipient, c.Mailbox, messageBytes, messageEntity, plaintextBody, flags, contentHash, bodyStructure)
 		// A duplicate copy is an accepted delivery, as it is in LMTP: the copy is
 		// already in the mailbox, so a resubmission must not fail the delivery.
