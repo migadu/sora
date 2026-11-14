@@ -97,6 +97,18 @@ func TestIdleTimeoutTrigger(t *testing.T) {
 // account and DATA, so the next thing to send is the message content.
 func startDataTransfer(t *testing.T, server *common.TestServer, account common.TestAccount) *LMTPClient {
 	t.Helper()
+	client := startTransaction(t, server, account)
+	client.SendCommand("DATA")
+	if resp, err := client.ReadResponse(); err != nil || !strings.HasPrefix(resp, "354") {
+		t.Fatalf("DATA: %q, %v", resp, err)
+	}
+	return client
+}
+
+// startTransaction opens a session to server and sends the envelope for
+// account, so the next thing to send is DATA or BDAT.
+func startTransaction(t *testing.T, server *common.TestServer, account common.TestAccount) *LMTPClient {
+	t.Helper()
 	client, err := NewLMTPClient(server.Address)
 	if err != nil {
 		t.Fatalf("Failed to connect to LMTP server: %v", err)
@@ -113,10 +125,6 @@ func startDataTransfer(t *testing.T, server *common.TestServer, account common.T
 		if resp, err := client.ReadResponse(); err != nil || !strings.HasPrefix(resp, "250") {
 			t.Fatalf("%s: %q, %v", cmd, resp, err)
 		}
-	}
-	client.SendCommand("DATA")
-	if resp, err := client.ReadResponse(); err != nil || !strings.HasPrefix(resp, "354") {
-		t.Fatalf("DATA: %q, %v", resp, err)
 	}
 	return client
 }
@@ -223,5 +231,30 @@ func TestDataTimeoutBoundsTransfer(t *testing.T) {
 	}
 	if extra, err := client.ReadResponse(); err == nil {
 		t.Fatalf("Expected the connection closed after DataTimeout, read %q", extra)
+	}
+}
+
+// TestBDATStallIsTemporaryFailure verifies that a BDAT chunk that stops
+// arriving is answered with a temporary failure. go-smtp writes this reply
+// itself, before the session has the message; a 5xx would make the sending MTA
+// bounce a message it can deliver on a later attempt.
+func TestBDATStallIsTemporaryFailure(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupLMTPServerWithIdleTimeout(t, time.Second)
+	defer server.Close()
+
+	client := startTransaction(t, server, account)
+	fmt.Fprintf(client.conn, "BDAT 1000 LAST\r\nFrom: sender@example.org\r\nSubject: stalled\r\n\r\nfirst line\r\n")
+
+	resp, err := client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read the BDAT reply: %v", err)
+	}
+	if !strings.HasPrefix(resp, "421 4.4.2") {
+		t.Fatalf("Expected 421 4.4.2 for a stalled BDAT chunk, got: %s", resp)
+	}
+	if extra, err := client.ReadResponse(); err == nil {
+		t.Fatalf("Expected the connection closed after the stalled chunk, read %q", extra)
 	}
 }
