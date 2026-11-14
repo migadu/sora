@@ -1216,10 +1216,10 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 			// Configure metrics collection settings
 			metrics.Configure(
 				server.EnableUserMetrics,
-				server.EnableDomainMetrics,
-				server.UserMetricsThreshold,
-				server.MaxTrackedUsers,
-				server.HashUsernames,
+				server.GetEnableDomainMetrics(),
+				server.GetUserMetricsThreshold(),
+				server.GetMaxTrackedUsers(),
+				server.GetHashUsernames(),
 			)
 			go startDynamicMetricsServer(ctx, deps, server, errChan)
 		case "imap_proxy":
