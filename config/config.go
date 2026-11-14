@@ -546,6 +546,28 @@ type AuthRateLimiterConfig struct {
 	ExemptNetworks []string `toml:"exempt_networks,omitempty"`
 }
 
+// Validate rejects negative counts, durations and multipliers. Zero means "use the
+// default" (see applyAuthRateLimitDefaults); a negative value has no meaning, and the
+// limiter does not read it consistently (max_attempts_per_ip = -1 blocked an address
+// at its first failure on one path and disabled the IP block on another).
+func (c *AuthRateLimiterConfig) Validate() error {
+	v := reflect.ValueOf(c).Elem()
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Field(i)
+		negative := false
+		switch f.Kind() {
+		case reflect.Int, reflect.Int64: // int counts and time.Duration
+			negative = f.Int() < 0
+		case reflect.Float64:
+			negative = f.Float() < 0
+		}
+		if negative {
+			return fmt.Errorf("auth_rate_limit.%s must not be negative, got %v", tomlKey(v.Type().Field(i)), f.Interface())
+		}
+	}
+	return nil
+}
+
 // DefaultAuthRateLimiterConfig returns sensible defaults for authentication rate limiting
 func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 	return AuthRateLimiterConfig{
@@ -2044,6 +2066,12 @@ func (s *ServerConfig) Validate() error {
 	}
 	if s.MasterSASLUsername != "" && s.MasterSASLPassword == "" {
 		return fmt.Errorf("server %q: master_sasl_username is set but master_sasl_password is empty; refusing to start (an empty password would allow impersonation of any account)", s.Name)
+	}
+
+	if s.AuthRateLimit != nil {
+		if err := s.AuthRateLimit.Validate(); err != nil {
+			return fmt.Errorf("server %q: %w", s.Name, err)
+		}
 	}
 
 	return nil

@@ -1208,6 +1208,7 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # --- AUTHENTICATION RATE LIMITING ---
 # Two-tier blocking system protects shared IPs while catching distributed attacks
 # Use dotted notation for nested config within [[server]] array element
+# A key left out or set to 0 takes its default; a negative value stops startup.
 auth_rate_limit.enabled = false                   # Enable authentication rate limiting.
 
 # TIER 1: Fast IP+username blocking (protects shared IPs like corporate gateways)
