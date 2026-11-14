@@ -245,8 +245,8 @@ func TestRemoveLocalFile(t *testing.T) {
 	baseDir := t.TempDir()
 	worker := &UploadWorker{path: baseDir}
 
-	t.Run("removes file and empty parents", func(t *testing.T) {
-		dir := filepath.Join(baseDir, "123", "subdir")
+	t.Run("removes file and keeps the account directory", func(t *testing.T) {
+		dir := filepath.Join(baseDir, "123")
 		err := os.MkdirAll(dir, 0755)
 		require.NoError(t, err)
 
@@ -260,11 +260,7 @@ func TestRemoveLocalFile(t *testing.T) {
 		_, err = os.Stat(filePath)
 		assert.True(t, os.IsNotExist(err), "file should be removed")
 		_, err = os.Stat(dir)
-		assert.True(t, os.IsNotExist(err), "parent dir should be removed")
-		_, err = os.Stat(filepath.Dir(dir))
-		assert.True(t, os.IsNotExist(err), "grandparent dir should be removed")
-		_, err = os.Stat(baseDir)
-		assert.NoError(t, err, "base dir should not be removed")
+		assert.NoError(t, err, "account dir must stay: a delivery may be about to stage into it (#573)")
 	})
 
 	t.Run("does not remove non-empty parent", func(t *testing.T) {

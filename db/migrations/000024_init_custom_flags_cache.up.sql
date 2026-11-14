@@ -6,7 +6,25 @@
 --
 -- Solution: Change column default to '[]'::jsonb so all new rows are initialized automatically.
 
--- First, backfill existing NULL entries
+-- First, backfill existing NULL entries. NULL means "not yet populated": 000009 left
+-- it on every mailbox that existed then, and 000022 copied those mailboxes' keywords
+-- into message_state without touching the cache. So fill each NULL cache from
+-- message_state, as the Go fallback for a NULL cache reads it, and only then turn
+-- the rest into '[]'. Until #613 this file went straight to '[]', which dropped those
+-- keywords from the mailbox's FLAGS; golang-migrate records only the version, so a
+-- database at or past 24 never runs this again, and a fresh install has no rows.
+UPDATE mailbox_stats st
+SET custom_flags_cache = k.keywords
+FROM (
+    SELECT ms.mailbox_id, jsonb_agg(DISTINCT kw.flag ORDER BY kw.flag) AS keywords
+    FROM message_state ms
+    JOIN messages m ON m.id = ms.message_id
+    CROSS JOIN LATERAL jsonb_array_elements_text(ms.custom_flags) AS kw(flag)
+    WHERE m.expunged_at IS NULL AND kw.flag !~ '^\\'
+    GROUP BY ms.mailbox_id
+) k
+WHERE st.mailbox_id = k.mailbox_id AND st.custom_flags_cache IS NULL;
+
 UPDATE mailbox_stats
 SET custom_flags_cache = '[]'::jsonb
 WHERE custom_flags_cache IS NULL;

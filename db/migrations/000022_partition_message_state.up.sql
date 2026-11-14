@@ -1,6 +1,15 @@
 -- Migration 022: Vertical Partitioning of Message State
 -- Extracts highly mutable fields (flags, custom_flags, updated_modseq) into a side table
 -- to enable HOT (Heap Only Tuples) updates on the massive messages table.
+--
+-- The copy of the flags into message_state below was missing from this file from
+-- April 2026 until #613, while the DROP COLUMNs stayed. Where 22 was first deployed
+-- the copy was evidently made out of band (this file drops a sync trigger that no
+-- migration creates). A database that ran 22 without such a copy lost the flags and
+-- keywords of every message it held; they can be recovered only from a backup taken
+-- before the upgrade. golang-migrate records only the version, so a database at or
+-- past 22 never runs this file again, and on a fresh install messages is empty and
+-- the copy does nothing.
 
 BEGIN;
 
@@ -13,6 +22,31 @@ CREATE TABLE IF NOT EXISTS message_state (
     updated_modseq BIGINT,
     CONSTRAINT max_custom_flags_check CHECK (jsonb_array_length(custom_flags) <= 50)
 );
+
+-- Copy every message's flags. Until the columns are dropped below they hold the
+-- authoritative flags, so a row already present (copied ahead of the upgrade) is
+-- overwritten where it differs. messages is locked against writes first, or a flag
+-- change committed after the copy would be lost with the columns; creating the
+-- table's foreign key takes the same lock, but not when the table already exists.
+-- The message_state triggers do not exist yet, so mailbox_stats is left alone: its
+-- unseen_count already counts these flags, and 000024 fills the keyword caches that
+-- are still NULL.
+-- On a large database the copy can be made ahead, in id-range batches of this same
+-- INSERT after the CREATE TABLE above; this statement then rewrites only the rows
+-- whose flags changed since.
+LOCK TABLE messages IN SHARE ROW EXCLUSIVE MODE;
+INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
+SELECT id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq FROM messages
+ON CONFLICT (message_id) DO UPDATE SET
+    mailbox_id = EXCLUDED.mailbox_id,
+    flags = EXCLUDED.flags,
+    custom_flags = EXCLUDED.custom_flags,
+    flags_changed_at = EXCLUDED.flags_changed_at,
+    updated_modseq = EXCLUDED.updated_modseq
+WHERE (message_state.mailbox_id, message_state.flags, message_state.custom_flags,
+       message_state.flags_changed_at, message_state.updated_modseq)
+    IS DISTINCT FROM (EXCLUDED.mailbox_id, EXCLUDED.flags, EXCLUDED.custom_flags,
+                      EXCLUDED.flags_changed_at, EXCLUDED.updated_modseq);
 
 -- Indexes for the new state table
 CREATE INDEX IF NOT EXISTS idx_message_state_mailbox_id_updated_modseq ON message_state (mailbox_id, updated_modseq) WHERE updated_modseq IS NOT NULL;
