@@ -1228,20 +1228,10 @@ func (s *Session) authenticateUser(username, password string) error {
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 			metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 
-			// Only cache definitive authentication failures, NOT transient errors
-			// Definitive failures: user not found, wrong password (from bcrypt.CompareHashAndPassword)
-			// Do NOT cache: DB connection errors, timeouts, etc (let circuit breakers handle those)
-			isDefinitiveFailure := errors.Is(err, consts.ErrUserNotFound) ||
-				strings.Contains(err.Error(), "hashedPassword is not the hash") || // bcrypt wrong password
-				strings.Contains(err.Error(), "user not found")
-
-			// Determine failure reason for logging
-			reason := "transient_error"
-			if errors.Is(err, consts.ErrUserNotFound) || strings.Contains(err.Error(), "user not found") {
-				reason = "user_not_found"
-			} else if strings.Contains(err.Error(), "hashedPassword is not the hash") {
-				reason = "invalid_password"
-			}
+			// Only cache definitive authentication failures (user not found, wrong
+			// password), NOT transient errors (DB connection errors, timeouts, etc):
+			// circuit breakers handle those.
+			reason, isDefinitiveFailure := proxy.ClassifyDBAuthFailure(err)
 
 			if isDefinitiveFailure {
 				s.DebugLog("caching definitive auth failure", "username", username)

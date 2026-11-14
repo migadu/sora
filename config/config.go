@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"net"
+	"net/http"
 	"os"
 	"reflect"
 	"strconv"
@@ -1065,10 +1066,10 @@ type ServerConfig struct {
 	// Metrics specific
 	Path                 string `toml:"path,omitempty"`
 	EnableUserMetrics    bool   `toml:"enable_user_metrics,omitempty"`
-	EnableDomainMetrics  bool   `toml:"enable_domain_metrics,omitempty"`
-	UserMetricsThreshold int    `toml:"user_metrics_threshold,omitempty"`
-	MaxTrackedUsers      int    `toml:"max_tracked_users,omitempty"`
-	HashUsernames        bool   `toml:"hash_usernames,omitempty"`
+	EnableDomainMetrics  *bool  `toml:"enable_domain_metrics,omitempty"`  // nil = default (true); see GetEnableDomainMetrics
+	UserMetricsThreshold *int   `toml:"user_metrics_threshold,omitempty"` // nil = default (1000); see GetUserMetricsThreshold
+	MaxTrackedUsers      *int   `toml:"max_tracked_users,omitempty"`      // nil = default (1000); see GetMaxTrackedUsers
+	HashUsernames        *bool  `toml:"hash_usernames,omitempty"`         // nil = default (true); see GetHashUsernames
 
 	// Auth rate limiting (embedded)
 	AuthRateLimit *AuthRateLimiterConfig `toml:"auth_rate_limit,omitempty"`
@@ -1844,6 +1845,41 @@ func (s *ServerConfig) GetRemoteHealthChecks() bool {
 	return *s.RemoteHealthChecks
 }
 
+// Metrics tuning keys: a key left out of the metrics block keeps the same default
+// as pkg/metrics uses on a node without one.
+
+// GetEnableDomainMetrics returns enable_domain_metrics (default: true).
+func (s *ServerConfig) GetEnableDomainMetrics() bool {
+	if s.EnableDomainMetrics == nil {
+		return true
+	}
+	return *s.EnableDomainMetrics
+}
+
+// GetUserMetricsThreshold returns user_metrics_threshold (default: 1000).
+func (s *ServerConfig) GetUserMetricsThreshold() int {
+	if s.UserMetricsThreshold == nil {
+		return 1000
+	}
+	return *s.UserMetricsThreshold
+}
+
+// GetMaxTrackedUsers returns max_tracked_users (default: 1000).
+func (s *ServerConfig) GetMaxTrackedUsers() int {
+	if s.MaxTrackedUsers == nil {
+		return 1000
+	}
+	return *s.MaxTrackedUsers
+}
+
+// GetHashUsernames returns hash_usernames (default: true).
+func (s *ServerConfig) GetHashUsernames() bool {
+	if s.HashUsernames == nil {
+		return true
+	}
+	return *s.HashUsernames
+}
+
 // Configuration defaulting methods with logging
 func (s *ServerConfig) GetAppendLimitWithDefault() int64 {
 	limit, err := s.GetAppendLimit()
@@ -2084,7 +2120,39 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
+	if s.Type == "metrics" {
+		if s.Path != "" && !strings.HasPrefix(s.Path, "/") {
+			return fmt.Errorf("server %q: metrics path %q must begin with '/'", s.Name, s.Path)
+		}
+		if err := validateMetricsPattern(s.MetricsPath()); err != nil {
+			return fmt.Errorf("server %q: invalid metrics path %q: %w", s.Name, s.Path, err)
+		}
+	}
+
 	return nil
+}
+
+// ServeMux parses patterns when registering a handler and panics on invalid
+// ones. Validate with that same parser before the metrics goroutine starts.
+func validateMetricsPattern(pattern string) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("%v", p)
+		}
+	}()
+	http.NewServeMux().HandleFunc(pattern, func(http.ResponseWriter, *http.Request) {})
+	return nil
+}
+
+// MetricsPath returns the HTTP path the metrics handler is served on. An unset
+// path defaults to "/metrics": net/http.ServeMux panics on an empty pattern,
+// and the panic would run in the metrics goroutine, taking the whole process
+// down with it.
+func (s *ServerConfig) MetricsPath() string {
+	if s.Path == "" {
+		return "/metrics"
+	}
+	return s.Path
 }
 
 // WarnUnusedConfigOptions logs warnings for config options that don't apply to this server type

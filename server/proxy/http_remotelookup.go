@@ -51,7 +51,7 @@ type HTTPRemoteLookupClient struct {
 	authToken              string // Bearer token for HTTP authentication
 	client                 *http.Client
 	breaker                *circuitbreaker.CircuitBreaker
-	remotePort             int // Default port for backend connections when not in server address
+	remotePort             int // Port for a server address without one (0 = leave it port-less)
 	remoteTLS              bool
 	remoteTLSUseStartTLS   bool
 	remoteTLSVerify        bool
@@ -205,6 +205,13 @@ func NewHTTPRemoteLookupClient(
 		client: &http.Client{
 			Timeout:   timeout,
 			Transport: transport,
+			// Never follow redirects. The https-or-loopback rule is checked only for the
+			// configured URL, so a followed redirect could send the request and its bearer
+			// token anywhere and take the answer there as the lookup result. A 3xx is
+			// handled by LookupUserRouteWithClientIP itself (user not found).
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 		breaker:                breaker,
 		remotePort:             remotePort,
@@ -305,7 +312,7 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 			// Network error or timeout - this is transient
 			return nil, fmt.Errorf("%w: HTTP request failed: %v", ErrRemoteLookupTransient, err)
 		}
-		defer resp.Body.Close()
+		defer drainAndClose(resp)
 
 		// Check status code first - for error responses, status code is all we need
 		// Don't waste time reading/parsing body for non-200 responses
@@ -506,30 +513,30 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 	return info, AuthSuccess, nil
 }
 
+// drainAndClose reads what is left of a small answer body before closing it. An HTTP/1.1
+// body closed before EOF makes the transport drop the connection, so without this every
+// not-found (404, 3xx) or error answer would cost the next lookup a new TCP and TLS
+// handshake. Like net/http's redirect follower, it reads at most 2 KiB and skips bodies
+// announced as larger.
+func drainAndClose(resp *http.Response) {
+	const maxDrainBytes = 2 << 10
+	if resp.ContentLength == -1 || resp.ContentLength <= maxDrainBytes {
+		_, _ = io.CopyN(io.Discard, resp.Body, maxDrainBytes)
+	}
+	_ = resp.Body.Close()
+}
+
 // verifyPassword verifies a password against a hash
 func (c *HTTPRemoteLookupClient) verifyPassword(password, hash string) bool {
 	err := db.VerifyPassword(hash, password)
 	return err == nil
 }
 
-// normalizeServerAddress ensures the server address has a port
+// normalizeServerAddress gives a server address without a port the client's default
+// port, the same way a port-less pool or remote_addrs backend gets the proxy's
+// remote_port (a bare IPv6 literal is one host, not host:port).
 func (c *HTTPRemoteLookupClient) normalizeServerAddress(addr string) string {
-	addr = strings.TrimSpace(addr)
-	if addr == "" {
-		return addr
-	}
-
-	// If already has port, return as-is
-	if strings.Contains(addr, ":") {
-		return addr
-	}
-
-	// Add configured default port, or 143 if not specified
-	defaultPort := c.remotePort
-	if defaultPort == 0 {
-		defaultPort = 143 // Default IMAP port
-	}
-	return fmt.Sprintf("%s:%d", addr, defaultPort)
+	return normalizeHostPort(strings.TrimSpace(addr), c.remotePort)
 }
 
 // DeriveAccountIDFromEmail creates a stable, unique int64 ID from an email address
@@ -570,7 +577,7 @@ func (c *HTTPRemoteLookupClient) HealthCheck(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("HTTP remotelookup endpoint unreachable: %w", err)
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp)
 
 	// Accept any response that's not a 5xx error
 	// (we expect 400 for missing email parameter, which is fine for health check)

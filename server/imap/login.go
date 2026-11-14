@@ -167,7 +167,27 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 			// Use base address (without suffix) to get account
 			AccountID, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, addressParsed.BaseAddress())
 			if err != nil {
-				return err
+				// Check if error is due to context cancellation (server shutdown)
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					s.InfoLog("master username auth cancelled due to server shutdown")
+					return &imap.Error{
+						Type: imap.StatusResponseTypeNo,
+						Code: imap.ResponseCodeUnavailable,
+						Text: server.ErrServerShuttingDown.Error(),
+					}
+				}
+
+				// Same reply and same accounting as a bad credential, as in the
+				// AUTHENTICATE PLAIN master path (sasl.go). This site is reachable
+				// ONLY with the correct master password, so a distinguishable reply,
+				// or a failure the master credential is not charged for, confirms a
+				// guessed tenant-wide password without completing an authentication.
+				s.WarnLog("impersonation target rejected (account not found)", "target_user", addressParsed.BaseAddress(), "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
+				if s.server.authLimiter != nil {
+					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+				}
+				return authFailedError()
 			}
 
 			// Get primary email address for this account

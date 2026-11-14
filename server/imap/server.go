@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"os"
 	"regexp"
@@ -253,7 +254,7 @@ type IMAPServer struct {
 	useStartTLS    bool // tlsConfig upgrades a plaintext listener on STARTTLS instead of wrapping it
 	masterUsername []byte
 	masterPassword []byte
-	appendLimit    int64
+	appendLimit    uint32 // effective APPENDLIMIT: default applied, clamped to 32 bits (see effectiveAppendLimit)
 	ftsRetention   time.Duration
 	version        string
 	config         *config.Config       // Full config reference for shared mailboxes
@@ -421,6 +422,23 @@ type IMAPServerOptions struct {
 	SpamTraining *spamtraining.Client
 }
 
+// effectiveAppendLimit resolves the configured append_limit to the value the
+// server advertises (APPENDLIMIT=, STATUS APPENDLIMIT) and enforces. A value
+// of 0 or less means the default. RFC 7889 §5 writes the limit as an RFC 3501
+// "number", an "Unsigned 32-bit integer (0 <= n < 4,294,967,296)", so a larger
+// value is clamped to math.MaxUint32: converting it with uint32() wrapped
+// "4gb" to 0, which advertised APPENDLIMIT=0 and refused every APPEND.
+func effectiveAppendLimit(name string, configured int64) uint32 {
+	if configured <= 0 {
+		return DefaultAppendLimit
+	}
+	if configured > math.MaxUint32 {
+		logger.Warn("IMAP: append_limit exceeds the largest APPENDLIMIT IMAP can express; clamping", "name", name, "append_limit", configured, "clamped_to", uint64(math.MaxUint32))
+		return math.MaxUint32
+	}
+	return uint32(configured)
+}
+
 func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
 	logger.Debug("IMAP: Creating server", "name", name, "tls", options.TLS, "cert", options.TLSCertFile, "key", options.TLSKeyFile)
 	// Validate required dependencies
@@ -580,7 +598,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		uploader:                     uploadWorker,
 		cache:                        cache,
 		lookupCache:                  lookupCache,
-		appendLimit:                  options.AppendLimit,
+		appendLimit:                  effectiveAppendLimit(name, options.AppendLimit),
 		ftsRetention:                 options.FTSRetention,
 		version:                      options.Version,
 		config:                       options.Config,

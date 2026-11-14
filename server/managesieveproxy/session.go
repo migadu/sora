@@ -88,9 +88,10 @@ func (s *Session) AuthenticatePlain(_ context.Context, _, username, password str
 		if errors.As(err, &rateLimitErr) {
 			return &managesieveserver.Error{Message: `"Authentication failed"`, Close: true}
 		}
-		// Check if error is due to server shutdown or temporary unavailability
+		// Server shutdown or a service the login depends on is down: a temporary
+		// failure, RFC 5804 section 1.3 TRYLATER.
 		if server.IsTemporaryAuthFailure(err) {
-			return &managesieveserver.Error{Code: "UNAVAILABLE", Message: "Service temporarily unavailable, please try again later"}
+			return &managesieveserver.Error{Code: "TRYLATER", Message: "Service temporarily unavailable, please try again later"}
 		}
 		return &managesieveserver.Error{Message: `"Authentication failed"`}
 	}
@@ -99,8 +100,10 @@ func (s *Session) AuthenticatePlain(_ context.Context, _, username, password str
 	backendConnStart := time.Now()
 	if err := s.connectToBackendAndAuth(); err != nil {
 		s.DebugLog("backend connection/auth failed", "error", err)
+		// The client's credentials were accepted and the backend failed: a
+		// temporary failure, RFC 5804 section 1.3 TRYLATER.
 		if server.IsTemporaryAuthFailure(err) || server.IsBackendError(err) {
-			return &managesieveserver.Error{Code: "UNAVAILABLE", Message: "Backend server temporarily unavailable"}
+			return &managesieveserver.Error{Code: "TRYLATER", Message: "Backend server temporarily unavailable"}
 		}
 		return &managesieveserver.Error{Message: `"Backend server error"`}
 	}
@@ -648,19 +651,9 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				return server.ErrServerShuttingDown
 			}
 
-			// Determine failure reason for logging
-			reason := "transient_error"
-			if errors.Is(err, consts.ErrUserNotFound) || strings.Contains(err.Error(), "user not found") {
-				reason = "user_not_found"
-			} else if strings.Contains(err.Error(), "hashedPassword is not the hash") {
-				reason = "invalid_password"
-			}
-
 			// Cache negative result (authentication failed)
 			// Only cache auth failures, not transient DB errors
-			isDefinitiveFailure := errors.Is(err, consts.ErrUserNotFound) ||
-				strings.Contains(err.Error(), "hashedPassword is not the hash") ||
-				strings.Contains(err.Error(), "user not found")
+			reason, isDefinitiveFailure := proxy.ClassifyDBAuthFailure(err)
 
 			if isDefinitiveFailure {
 				if s.server.lookupCache != nil {
@@ -783,7 +776,7 @@ func (s *Session) connectToBackendAndAuth() error {
 		// Invalidate the cache so the next attempt re-resolves routing: a
 		// cached ServerAddress may be stale (e.g. account moved backends).
 		s.invalidateLookupCache("backend connect failure")
-		// Wrap with the sentinel so the client sees (UNAVAILABLE) instead of a
+		// Wrap with the sentinel so the client sees (TRYLATER) instead of a
 		// generic "Backend server error".
 		return fmt.Errorf("%w: failed to connect to backend: %w", server.ErrBackendConnectionFailed, err)
 	}
