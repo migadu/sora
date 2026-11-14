@@ -15,6 +15,7 @@ import (
 	msieve "github.com/migadu/go-managesieve/managesieve"
 	"github.com/migadu/go-sieve"
 	"github.com/migadu/go-sieve/interp"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 )
 
@@ -409,7 +410,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 	for sender, vacation := range data.VacationResponses {
 		// RFC 5230 §4.1: clamp to the site's supported range before converting
 		// to time.Duration, which would overflow for large Sieve numbers.
-		days := max(1, min(vacation.Days, 365))
+		days := max(1, min(vacation.Days, consts.MaxVacationDays))
 		duration := time.Duration(days) * 24 * time.Hour
 		allowed, err := execPolicy.VacationResponseAllowed(timeoutCtx, data, sender, vacation.ResponseIdentity, duration)
 		if err != nil || !allowed {

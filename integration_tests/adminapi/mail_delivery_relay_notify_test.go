@@ -45,7 +45,7 @@ func TestAdminAPI_DeliverMail_WakesRelayWorker(t *testing.T) {
 
 	rq := &captureRelayQueue{}
 	worker := &countingRelayWorker{}
-	server, _ := setupHTTPAPIServerWithUploaderOptions(t, func(o *adminapi.ServerOptions) {
+	server, _ := setupHTTPAPIServerWithOptions(t, func(o *adminapi.ServerOptions) {
 		o.RelayQueue = rq
 		o.RelayWorker = worker
 	})
