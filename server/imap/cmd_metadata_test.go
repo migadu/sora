@@ -46,3 +46,30 @@ func TestValidateMetadataEntryInvalidNamesAreBAD(t *testing.T) {
 		}
 	}
 }
+
+// RFC 5464 §3.2: entry names "MUST NOT contain non-ASCII characters" and "are
+// case-insensitive". Case folding happens before validation, so it must not
+// turn a non-ASCII name into an ASCII one: Unicode lower-casing maps U+212A
+// KELVIN SIGN to "k" and U+0130 to "i".
+func TestCanonicalMetadataEntryKeepsNonASCIIInvalid(t *testing.T) {
+	for _, entry := range []string{
+		"/private/K",
+		"/shared/commentİ",
+		"/PRIVATE/Key",
+	} {
+		canon := canonicalMetadataEntry(entry)
+		var imapErr *imap.Error
+		if err := validateMetadataEntry(canon); !errors.As(err, &imapErr) || imapErr.Type != imap.StatusResponseTypeBad {
+			t.Errorf("validateMetadataEntry(canonicalMetadataEntry(%q) = %q) = %v, want BAD", entry, canon, err)
+		}
+	}
+
+	for entry, want := range map[string]string{
+		"/PRIVATE/Vendor/Example.COM/X": "/private/vendor/example.com/x",
+		"/shared/comment":               "/shared/comment",
+	} {
+		if got := canonicalMetadataEntry(entry); got != want {
+			t.Errorf("canonicalMetadataEntry(%q) = %q, want %q", entry, got, want)
+		}
+	}
+}

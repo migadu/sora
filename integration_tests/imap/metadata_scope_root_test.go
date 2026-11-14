@@ -51,6 +51,18 @@ func TestIMAP_MetadataScopeRootIsBAD(t *testing.T) {
 	_, tagged = rc.cmd("C", "SETMETADATA \"\" ({10+}\r\n/private/\x01 \"x\")")
 	require.True(t, strings.HasPrefix(tagged, "C BAD"), "control character: %s", tagged)
 
+	// Non-ASCII is invalid as well, including a character that Unicode
+	// lower-casing folds to ASCII (U+212A KELVIN SIGN to "k"): case folding
+	// must not turn it into the valid name /private/k.
+	for _, command := range []string{
+		"SETMETADATA \"\" ({12+}\r\n/private/\xe2\x84\xaa \"x\")",
+		"GETMETADATA \"\" ({12+}\r\n/private/\xe2\x84\xaa)",
+	} {
+		untagged, tagged := rc.cmd("K", command)
+		require.True(t, strings.HasPrefix(tagged, "K BAD"), "%q: %s", command, tagged)
+		require.Empty(t, untagged, "%q", command)
+	}
+
 	ctx := context.Background()
 	accountID, err := server.ResilientDB.GetAccountIDByAddressWithRetry(ctx, account.Email)
 	require.NoError(t, err)
@@ -58,7 +70,7 @@ func TestIMAP_MetadataScopeRootIsBAD(t *testing.T) {
 	require.NoError(t, err)
 	for _, mailboxID := range []*int64{nil, &inbox.ID} {
 		stored, err := server.ResilientDB.GetMetadataWithRetry(ctx, accountID, mailboxID,
-			[]string{"/private/", "/shared/", "/private", "/shared", "/private/\x01"}, nil)
+			[]string{"/private/", "/shared/", "/private", "/shared", "/private/\x01", "/private/k"}, nil)
 		require.NoError(t, err)
 		require.Empty(t, stored.Entries, "mailboxID=%v", mailboxID)
 	}
