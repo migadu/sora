@@ -476,9 +476,23 @@ func (s *Server) start(ctx context.Context) error {
 func (s *Server) setupRoutes() http.Handler {
 	mux := http.NewServeMux()
 
-	// Account management routes
+	// Account management routes. {email} is one segment of the escaped path, which
+	// r.PathValue decodes once: a "/" in a local part (atext, RFC 5322 §3.2.3)
+	// arrives as %2F and is part of the address, never a separator (RFC 3986 §2.4).
 	mux.HandleFunc("/admin/accounts", routeHandler("POST", s.handleCreateAccount))
-	mux.HandleFunc("/admin/accounts/", s.handleAccountOperations)
+	mux.HandleFunc("/admin/accounts/{email}", multiMethodHandler(map[string]http.HandlerFunc{
+		"GET":    s.handleGetAccount,
+		"PUT":    s.handleUpdateAccount,
+		"DELETE": s.handleDeleteAccount,
+	}))
+	mux.HandleFunc("/admin/accounts/{email}/exists", routeHandler("GET", s.handleAccountExists))
+	mux.HandleFunc("/admin/accounts/{email}/restore", routeHandler("POST", s.handleRestoreAccount))
+	mux.HandleFunc("/admin/accounts/{email}/credentials", multiMethodHandler(map[string]http.HandlerFunc{
+		"GET":  s.handleListCredentials,
+		"POST": s.handleAddCredential,
+	}))
+	mux.HandleFunc("/admin/accounts/{email}/messages/deleted", routeHandler("GET", s.handleListDeletedMessages))
+	mux.HandleFunc("/admin/accounts/{email}/messages/restore", routeHandler("POST", s.handleRestoreMessages))
 
 	// Domain-scoped account management routes
 	mux.HandleFunc("/admin/domains/", s.handleDomainOperations)
@@ -487,13 +501,16 @@ func (s *Server) setupRoutes() http.Handler {
 	mux.HandleFunc("/admin/usage/accounts", routeHandler("GET", s.handleAccountUsage))
 
 	// Credential management routes
-	mux.HandleFunc("/admin/credentials/", s.handleCredentialOperations)
+	mux.HandleFunc("/admin/credentials/{email}", multiMethodHandler(map[string]http.HandlerFunc{
+		"GET":    s.handleGetCredential,
+		"DELETE": s.handleDeleteCredential,
+	}))
 
 	// Connection management routes
 	mux.HandleFunc("/admin/connections", routeHandler("GET", s.handleListConnections))
 	mux.HandleFunc("/admin/connections/stats", routeHandler("GET", s.handleConnectionStats))
 	mux.HandleFunc("/admin/connections/kick", routeHandler("POST", s.handleKickConnections))
-	mux.HandleFunc("/admin/connections/user/", routeHandler("GET", s.handleGetUserConnections))
+	mux.HandleFunc("/admin/connections/user/{email}", routeHandler("GET", s.handleGetUserConnections))
 
 	// Cache management routes
 	mux.HandleFunc("/admin/cache/stats", routeHandler("GET", s.handleCacheStats))
@@ -544,82 +561,6 @@ func (s *Server) setupRoutes() http.Handler {
 	handler = s.allowedHostsMiddleware(handler)
 
 	return handler
-}
-
-// handleAccountOperations routes account-related operations
-func (s *Server) handleAccountOperations(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
-
-	// Check for message-related operations first (before checking for account /restore)
-	if strings.Contains(path, "/messages/deleted") {
-		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.handleListDeletedMessages(w, r)
-		return
-	}
-	if strings.Contains(path, "/messages/restore") {
-		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.handleRestoreMessages(w, r)
-		return
-	}
-
-	// Check for account-level sub-operations
-	if strings.HasSuffix(path, "/restore") {
-		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.handleRestoreAccount(w, r)
-		return
-	}
-	if strings.HasSuffix(path, "/exists") {
-		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.handleAccountExists(w, r)
-		return
-	}
-	if strings.Contains(path, "/credentials") {
-		switch r.Method {
-		case "GET":
-			s.handleListCredentials(w, r)
-		case "POST":
-			s.handleAddCredential(w, r)
-		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		}
-		return
-	}
-
-	// Otherwise it's a basic account operation
-	switch r.Method {
-	case "GET":
-		s.handleGetAccount(w, r)
-	case "PUT":
-		s.handleUpdateAccount(w, r)
-	case "DELETE":
-		s.handleDeleteAccount(w, r)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-// handleCredentialOperations routes credential operations
-func (s *Server) handleCredentialOperations(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case "GET":
-		s.handleGetCredential(w, r)
-	case "DELETE":
-		s.handleDeleteCredential(w, r)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
 }
 
 // handleDomainOperations routes domain-scoped operations
@@ -993,8 +934,7 @@ func (s *Server) handleAccountUsage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAccountExists(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/accounts/{email}/exists
-	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/exists")
+	email := r.PathValue("email")
 
 	ctx := r.Context()
 
@@ -1018,8 +958,7 @@ func (s *Server) handleAccountExists(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/accounts/{email}
-	email := extractLastPathSegment(r.URL.Path)
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	accountDetails, err := s.rdb.GetAccountDetailsWithRetry(ctx, email)
@@ -1042,8 +981,7 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	// Extract email from path: /admin/accounts/{email}
-	email := extractLastPathSegment(r.URL.Path)
+	email := r.PathValue("email")
 
 	var req UpdateAccountRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1087,8 +1025,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/accounts/{email}
-	email := extractLastPathSegment(r.URL.Path)
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	if r.URL.Query().Get("purge") == "true" {
@@ -1128,8 +1065,7 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRestoreAccount(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/accounts/{email}/restore
-	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/restore")
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	err := s.rdb.RestoreAccountWithRetry(ctx, email)
@@ -1160,8 +1096,7 @@ func (s *Server) handleRestoreAccount(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	// Extract email from path: /admin/accounts/{email}/credentials
-	primaryEmail := extractPathParam(r.URL.Path, "/admin/accounts/", "/credentials")
+	primaryEmail := r.PathValue("email")
 
 	var req AddCredentialRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1230,8 +1165,7 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/accounts/{email}/credentials
-	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/credentials")
+	email := r.PathValue("email")
 
 	ctx := r.Context()
 
@@ -1258,8 +1192,7 @@ func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetCredential(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/credentials/{email}
-	email := extractLastPathSegment(r.URL.Path)
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	// Get detailed credential information using the same logic as CLI
@@ -1278,8 +1211,7 @@ func (s *Server) handleGetCredential(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/credentials/{email}
-	email := extractLastPathSegment(r.URL.Path)
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	// Resolved first: once the credential is gone, the address names no account.
@@ -1578,8 +1510,7 @@ func (s *Server) handleConnectionStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/connections/user/{email}
-	email := extractLastPathSegment(r.URL.Path)
+	email := r.PathValue("email")
 
 	if len(s.connectionTrackers) == 0 {
 		// No connection trackers available

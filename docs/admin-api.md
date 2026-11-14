@@ -98,6 +98,10 @@ The default base URL depends on your configuration:
 
 All endpoints are prefixed with `/admin/`.
 
+An `{email}` in a path is one path segment: percent-encode it (`url.PathEscape`,
+`encodeURIComponent`), so a `/` in the local part goes as `%2F`. An unencoded `/` separates
+segments, and such a request answers `404`.
+
 ## API Endpoints
 
 ### Account Management

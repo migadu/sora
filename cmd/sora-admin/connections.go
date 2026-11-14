@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -482,15 +483,16 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 	}
 
 	// Build URL based on whether user email is specified
-	var url string
+	var endpoint string
 	if userEmail != "" {
-		url = fmt.Sprintf("%s/admin/connections/user/%s", cfg.HTTPAPIAddr, userEmail)
+		// One path segment: a "/" in the local part goes as %2F (RFC 3986 §2.2).
+		endpoint = fmt.Sprintf("%s/admin/connections/user/%s", cfg.HTTPAPIAddr, url.PathEscape(userEmail))
 	} else {
-		url = fmt.Sprintf("%s/admin/connections", cfg.HTTPAPIAddr)
+		endpoint = fmt.Sprintf("%s/admin/connections", cfg.HTTPAPIAddr)
 	}
 
 	// Create request
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
