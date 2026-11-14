@@ -432,26 +432,6 @@ components:
         last_error:
           type: string
 
-    AuthStats:
-      type: object
-      description: "Statistics about authentication attempts."
-      properties:
-        total_attempts:
-          type: integer
-        successful_attempts:
-          type: integer
-        failed_attempts:
-          type: integer
-        unique_ips:
-          type: integer
-        unique_usernames:
-          type: integer
-        unique_protocols:
-          type: integer
-        window_duration:
-          type: string
-          example: "24h0m0s"
-
     CredentialDetails:
       type: object
       description: "Detailed information about a specific credential including associated account details."
@@ -2381,34 +2361,42 @@ paths:
     get:
       tags:
         - System Monitoring
-      summary: Get authentication statistics
-      parameters:
-        - name: window
-          in: query
-          schema:
-            type: string
-            default: "24h"
-          description: "Time window for statistics (e.g., '1h', '30m')."
+      summary: Describe authentication failure tracking
+      description: |
+        Returns no counters. Failed logins are tracked in memory by each server's
+        authentication rate limiter, per address, and expire on their own; this endpoint
+        answers the same fixed description of that tracking on every call. For the
+        addresses blocked right now use GET /auth/blocked. Attempt counts are exported
+        as the Prometheus counter sora_authentication_attempts_total.
+
+        Query parameters are ignored; the window parameter of older versions is still
+        accepted.
       responses:
         '200':
-          description: Authentication statistics.
+          description: A fixed description of the authentication failure tracking.
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  stats:
-                    $ref: '#/components/schemas/AuthStats'
-                  window:
+                  implementation:
                     type: string
-                  window_seconds:
-                    type: integer
-        '500':
-          description: Internal server error.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+                    example: "in-memory"
+                  tracking_mode:
+                    type: string
+                    example: "per-address rate limiting with automatic expiry"
+                  available_stats:
+                    type: object
+                    properties:
+                      blocked_entries:
+                        type: string
+                        example: "GET /admin/auth/blocked"
+                  access_methods:
+                    type: object
+                    properties:
+                      blocked_list:
+                        type: string
+                        example: "GET /admin/auth/blocked - list currently blocked addresses"
 
   /auth/blocked:
     get:
