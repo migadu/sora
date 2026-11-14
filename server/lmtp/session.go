@@ -937,8 +937,10 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, s.User.Address.FullAddress())
 			for _, redirectTo := range result.RedirectTo {
 				if err := s.sendToExternalRelay(s.sender.FullAddress(), redirectTo, relayBytes); err != nil {
-					s.DebugLog("error enqueuing redirected message, falling back to inbox", "redirect_to", redirectTo, "error", err)
-					// Continue processing even if queue fails, store in INBOX as fallback
+					// Delivery goes on: the message is kept in INBOX unless a fileinto
+					// stores it (Result.Destinations). Say so where an operator will see
+					// it, as the Admin API path does: the user's redirect did not happen.
+					s.WarnLog("sieve redirect could not be queued", "redirect_to", redirectTo, "error", err)
 					redirectFailed = true
 					continue
 				}

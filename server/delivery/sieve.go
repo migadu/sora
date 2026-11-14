@@ -104,7 +104,7 @@ func (s *StandardSieveExecutor) sieveExtensions() []string {
 
 // ExecuteSieve executes Sieve scripts and returns the outcome for this delivery. It
 // performs the script's non-storage side effects (redirect, vacation) itself; storing
-// the message — including any `fileinto :copy` target — is left to the caller, which
+// the message — in every mailbox of SieveOutcome — is left to the caller, which
 // must do it from SieveOutcome.MessageBytes.
 func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient RecipientInfo, messageEntity *message.Entity, fullMessageBytes []byte) (*SieveOutcome, error) {
 	// Default to INBOX with the message unmodified
@@ -162,8 +162,8 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 
 	// Apply header edits if any (RFC 5293 - editheader extension), before the caller
 	// hashes and stores the body, exactly as the LMTP path does: content_hash must
-	// describe the edited bytes, and every copy of this delivery - the redirected one and
-	// the :copy below included - is made from them.
+	// describe the edited bytes, and every copy of this delivery - the redirected ones and
+	// every stored one - is made from them.
 	if len(result.HeaderEdits) > 0 {
 		edited, editErr := sieveengine.ApplyHeaderEdits(outcome.MessageBytes, result.HeaderEdits)
 		if editErr != nil {
