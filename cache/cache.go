@@ -108,10 +108,9 @@ var ErrObjectTooLarge = errors.New("object size exceeds limit")
 type cacheShard struct {
 	db *sql.DB
 	mu sync.Mutex
-	// size is an upper bound on the bytes the shard's index tracks, guarded by mu. It is
-	// measured when the shard is opened and by every purge of it, and grows with every
-	// object tracked. Removals other than a purge's leave it high, which costs at most
-	// one needless purge check.
+	// size tracks the bytes in the shard's index, guarded by mu. Local inserts,
+	// replacements and removals update it; opening or purging the shard measures it
+	// again because another process (such as sora-admin) can change the shared index.
 	size int64
 }
 
@@ -399,7 +398,7 @@ func (c *Cache) Delete(contentHash string) error {
 		shard.mu.Unlock()
 		return fmt.Errorf("failed to delete file: %w", err)
 	}
-	_, dbErr := shard.db.Exec(`DELETE FROM cache_index WHERE path = ?`, path)
+	dbErr := deleteIndexRowLocked(context.Background(), shard, path)
 	shard.mu.Unlock()
 
 	if dbErr != nil {
@@ -572,20 +571,42 @@ func (c *Cache) trackPlaced(shard *cacheShard, path string) error {
 	return err
 }
 
+func deleteIndexRowLocked(ctx context.Context, shard *cacheShard, path string) error {
+	var oldSize int64
+	hasOld := shard.db.QueryRowContext(ctx, `SELECT size FROM cache_index WHERE path = ?`, path).Scan(&oldSize) == nil
+	res, err := shard.db.ExecContext(ctx, `DELETE FROM cache_index WHERE path = ?`, path)
+	if err != nil {
+		return err
+	}
+	if hasOld {
+		if n, _ := res.RowsAffected(); n > 0 {
+			shard.size -= oldSize
+		}
+	}
+	return nil
+}
+
 func (c *Cache) trackFile(shard *cacheShard, path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("failed to stat file for tracking: %w", err)
 	}
 
+	now := time.Now()
+	// Best-effort sync of on-disk mtime with placement time so a later crash-recovery
+	// sweep (sweepShardFiles) does not see an older staging mtime either.
+	_ = os.Chtimes(path, now, now)
+
 	shardCapacity := c.capacity / NumShards
 	shard.mu.Lock()
+	var oldSize int64
+	_ = shard.db.QueryRow(`SELECT size FROM cache_index WHERE path = ?`, path).Scan(&oldSize)
 	_, err = shard.db.Exec(
 		`INSERT OR REPLACE INTO cache_index (path, size, mod_time) VALUES (?, ?, ?)`,
-		path, info.Size(), info.ModTime(),
+		path, info.Size(), now,
 	)
 	if err == nil {
-		shard.size += info.Size()
+		shard.size += info.Size() - oldSize
 	}
 	full := shard.size > shardCapacity
 	shard.mu.Unlock()
@@ -885,7 +906,7 @@ func (c *Cache) PurgeOrphanedContentHashes(ctx context.Context) error {
 					logger.Warn("Cache: Failed to delete orphaned file", "path", p, "error", err)
 					continue
 				}
-				shard.db.Exec(`DELETE FROM cache_index WHERE path = ?`, p)
+				_ = deleteIndexRowLocked(ctx, shard, p)
 				shard.mu.Unlock()
 				purged++
 			}
@@ -922,7 +943,7 @@ func (c *Cache) removeStaleEntriesForShard(ctx context.Context, shard *cacheShar
 		// Checked again under the lock: a Put of the object may have put its file back
 		// since, and its row must stay with it (#768).
 		if _, err := os.Lstat(p); os.IsNotExist(err) {
-			shard.db.ExecContext(ctx, `DELETE FROM cache_index WHERE path = ?`, p)
+			_ = deleteIndexRowLocked(ctx, shard, p)
 		}
 		shard.mu.Unlock()
 	}

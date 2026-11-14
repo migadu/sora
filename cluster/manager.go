@@ -410,10 +410,11 @@ func (m *Manager) rejoinLoop(peers []string, defaultPort int, interval time.Dura
 
 		var joined, unreachable, unresolved, elsewhere []string
 		var joinErr error
+		self := m.selfAddrPort()
 		members := m.memberAddrs()
 		isMember := func(a netip.AddrPort) bool { return members[a] }
 		for _, peer := range peers {
-			if slices.ContainsFunc(resolved[peer], isMember) {
+			if len(resolved[peer]) > 0 && peerSatisfied(resolved[peer], self, members) {
 				continue
 			}
 			addrs := m.resolvePeer(peer, defaultPort)
@@ -422,19 +423,31 @@ func (m *Manager) rejoinLoop(peers []string, defaultPort int, interval time.Dura
 				unresolved = append(unresolved, peer)
 				continue
 			}
-			if slices.ContainsFunc(addrs, isMember) {
+			if peerSatisfied(addrs, self, members) {
 				continue
 			}
-			// Join the addresses resolved here rather than the entry: memberlist
-			// would resolve it again, and log a warning every round for a name
-			// that does not resolve.
-			if _, err := m.memberlist.Join(joinAddrs(peer, addrs)); err != nil {
+			missing := missingPeerAddrs(addrs, self, members)
+			if len(missing) == 0 {
+				continue
+			}
+			// Join the missing addresses resolved here rather than the entry:
+			// memberlist would resolve it again, dial self or already-joined peers,
+			// and log a warning every round for a name that does not resolve.
+			n, err := m.memberlist.Join(joinAddrs(peer, missing))
+			members = m.memberAddrs()
+			if peerSatisfied(addrs, self, members) {
+				joined = append(joined, peer)
+				continue
+			}
+			if err != nil {
+				if n > 0 && slices.ContainsFunc(missing, isMember) {
+					joined = append(joined, peer)
+				}
 				unreachable = append(unreachable, peer)
 				joinErr = err
 				continue
 			}
-			members = m.memberAddrs()
-			if slices.ContainsFunc(addrs, isMember) {
+			if slices.ContainsFunc(missing, isMember) {
 				joined = append(joined, peer)
 			} else {
 				// It answered, but no member advertises the address it was
@@ -471,6 +484,60 @@ func (m *Manager) rejoinLoop(peers []string, defaultPort int, interval time.Dura
 			logger.Warn("Cluster: Configured peers answer on an address no member advertises - list each node's cluster addr in peers; until then they are joined again", "peers", elsewhere, "every", interval)
 		}
 	}
+}
+
+// selfAddrPort returns this node's advertised memberlist address and port.
+func (m *Manager) selfAddrPort() netip.AddrPort {
+	self := m.memberlist.LocalNode()
+	addr, _ := netip.AddrFromSlice(self.Addr)
+	return netip.AddrPortFrom(addr.Unmap(), self.Port)
+}
+
+// peerSatisfied reports whether addrs (the resolved addresses of one configured
+// peers entry) are already represented in members, ignoring self.
+//
+// Two shapes share this check:
+//   - One dual-stack host (1 IPv4 + 1 IPv6): memberlist binds a single IP, so
+//     only one family's address appears in members; once that family's address
+//     is a member, the host is present and must not be re-joined every round.
+//   - One DNS name for several nodes (or localhost on dual-stack, where self is
+//     one family and another node is the other): within an address family, each
+//     distinct IP:port is a distinct node, so every non-self address of at least
+//     one present family must be a member before the entry is satisfied.
+func peerSatisfied(addrs []netip.AddrPort, self netip.AddrPort, members map[netip.AddrPort]bool) bool {
+	hasV4, allV4 := false, true
+	hasV6, allV6 := false, true
+	for _, a := range addrs {
+		if a == self {
+			continue
+		}
+		if a.Addr().Is4() {
+			hasV4 = true
+			if !members[a] {
+				allV4 = false
+			}
+		} else {
+			hasV6 = true
+			if !members[a] {
+				allV6 = false
+			}
+		}
+	}
+	if !hasV4 && !hasV6 {
+		return true
+	}
+	return (hasV4 && allV4) || (hasV6 && allV6)
+}
+
+// missingPeerAddrs returns the non-self addresses in addrs that are not in members.
+func missingPeerAddrs(addrs []netip.AddrPort, self netip.AddrPort, members map[netip.AddrPort]bool) []netip.AddrPort {
+	var missing []netip.AddrPort
+	for _, a := range addrs {
+		if a != self && !members[a] {
+			missing = append(missing, a)
+		}
+	}
+	return missing
 }
 
 // memberAddrs returns the addresses the current members (alive or suspect, this
