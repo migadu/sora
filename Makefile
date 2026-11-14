@@ -79,12 +79,13 @@ TEST_FLAGS = -v -tags=integration -count=1 -timeout=$(TEST_TIMEOUT) $(RACE_FLAG)
 SLOWLORIS_TIMEOUT = $(if $(RACE),35m,25m)
 SLOWLORIS_FLAGS = -v -tags=integration -count=1 -timeout=$(SLOWLORIS_TIMEOUT) $(RACE_FLAG)
 # The test database: SORA_TEST_DB_NAME, which the test helpers read, or sora_test_db.
-# Exported so that tests run by these targets use the database reset-test-db reset,
-# also when DB_NAME is given to make.
-ifndef DB_NAME
+# `make DB_NAME=...` overrides it. A DB_NAME in the environment does not: that generic
+# name may be set for some other database, whose schema reset-test-db would drop.
+# SORA_TEST_DB_NAME is set to it, also over a command-line value, and exported, so
+# that the tests these targets run use the database reset-test-db reset.
 DB_NAME := $(or $(SORA_TEST_DB_NAME),sora_test_db)
-endif
-export SORA_TEST_DB_NAME := $(DB_NAME)
+override SORA_TEST_DB_NAME := $(DB_NAME)
+export SORA_TEST_DB_NAME
 DB_USER = postgres
 DB_HOST = localhost
 DB_PORT = 5432
@@ -320,6 +321,13 @@ help:
 	@echo "  integration-tests-config        - Configuration tests"
 	@echo "  integration-tests-sora-admin    - Import/export tests"
 	@echo "  integration-tests-relay         - Relay (SMTP/HTTP) tests"
+	@echo "  integration-tests-delivery      - Delivery (Sieve, vacation, attachments) tests"
+	@echo "  integration-tests-pools         - Named backend pool tests"
+	@echo "  integration-tests-tls           - Proxy TLS and STARTTLS tests"
+	@echo "  integration-tests-packages      - Integration tests in db, pkg/resilient, server, tlsmanager, ..."
+	@echo ""
+	@echo "  The integration targets reset and test SORA_TEST_DB_NAME's database"
+	@echo "  (default sora_test_db), or DB_NAME's: 'make integration-tests DB_NAME=x'"
 	@echo ""
 	@echo "Cross-compilation targets:"
 	@echo "  build-linux-musl - Cross-compile static binaries for Linux with musl"
