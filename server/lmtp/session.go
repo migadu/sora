@@ -1243,11 +1243,12 @@ func (s *LMTPSession) notifyRelayWorker() {
 // by the Sieve engine's VacationOracle.
 func (s *LMTPSession) handleVacationResponse(ctx context.Context, reply sieveengine.VacationReply, originalMessage *message.Entity) error {
 	handler := &delivery.StandardVacationHandler{
-		Hostname:       s.HostName,
-		RelayQueue:     s.backend.relayQueue,
-		Logger:         &lmtpDeliveryLogger{s: s},
-		IsOwnedAddress: s.backend.rdb.IsAddressOwnedByAccountWithRetry,
-		RelayNotify:    s.notifyRelayWorker,
+		Hostname:          s.HostName,
+		RelayQueue:        s.backend.relayQueue,
+		Logger:            &lmtpDeliveryLogger{s: s},
+		IsOwnedAddress:    s.backend.rdb.IsAddressOwnedByAccountWithRetry,
+		IsAnyOwnedAddress: s.backend.rdb.IsAnyAddressOwnedByAccountWithRetry,
+		RelayNotify:       s.notifyRelayWorker,
 	}
 	return handler.HandleVacationResponse(ctx, s.AccountID(), reply, s.sender, &s.User.Address, originalMessage)
 }

@@ -2000,6 +2000,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '503':
+          description: Affinity manager not enabled on this server.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     post:
       tags:
         - Affinity Management
@@ -2095,6 +2101,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '503':
+          description: Affinity manager not enabled on this server.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     delete:
       tags:
         - Affinity Management
@@ -2146,6 +2158,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Affinity manager not enabled on this server.
           content:
             application/json:
               schema:

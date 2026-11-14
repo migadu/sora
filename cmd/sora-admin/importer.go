@@ -599,7 +599,7 @@ func (i *Importer) processSubscriptions() error {
 
 	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
 	if err != nil {
-		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
+		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", i.email, err, i.email)
 	}
 	user := server.NewUser(address, accountID)
 
@@ -682,7 +682,7 @@ func (i *Importer) importSieveScript() error {
 
 	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
 	if err != nil {
-		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
+		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", i.email, err, i.email)
 	}
 	user := server.NewUser(address, accountID)
 
@@ -796,7 +796,7 @@ func (i *Importer) performDryRun() error {
 
 	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
 	if err != nil {
-		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
+		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", i.email, err, i.email)
 	}
 	user := server.NewUser(address, accountID)
 
@@ -1238,7 +1238,7 @@ func (i *Importer) scanMaildir() error {
 		// Check if there's a Maildir subdirectory (common mistake)
 		possibleMaildir := filepath.Join(cleanPath, "Maildir")
 		if isMaildirFolder(possibleMaildir) {
-			return fmt.Errorf("path '%s' is not a valid maildir root.\nDid you mean to use '%s' instead?\nThe path should point directly to a maildir (containing cur/, new/, tmp/ directories)", cleanPath, possibleMaildir)
+			return fmt.Errorf("path '%s' is not a valid maildir root.\nDid you mean to use '%s' instead?\nThe path should point directly to a maildir (containing cur/ or new/)", cleanPath, possibleMaildir)
 		}
 
 		// Check for other common maildir subdirectories
@@ -1254,11 +1254,11 @@ func (i *Importer) scanMaildir() error {
 				}
 			}
 			if len(suggestions) > 0 {
-				return fmt.Errorf("path '%s' is not a valid maildir root.\nFound possible maildir(s): %s\nThe path should point directly to a maildir (containing cur/, new/, tmp/ directories)", cleanPath, strings.Join(suggestions, ", "))
+				return fmt.Errorf("path '%s' is not a valid maildir root.\nFound possible maildir(s): %s\nThe path should point directly to a maildir (containing cur/ or new/)", cleanPath, strings.Join(suggestions, ", "))
 			}
 		}
 
-		return fmt.Errorf("path '%s' is not a valid maildir root (must contain cur/, new/, and tmp/ directories)", cleanPath)
+		return fmt.Errorf("path '%s' is not a valid maildir root (must contain cur/ or new/)", cleanPath)
 	}
 
 	// --- Parallel Processing Setup ---

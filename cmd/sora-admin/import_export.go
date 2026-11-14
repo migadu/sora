@@ -72,7 +72,7 @@ Usage:
 
 Options:
   --email string          Email address for the account to import mail to (required)
-  --maildir-path string   Path to the maildir root directory (must contain cur/, new/, tmp/) (required)
+  --maildir-path string   Path to the maildir root directory (must contain cur/ or new/) (required)
   --jobs int              Number of parallel import jobs (default: 4)
   --batch-size int        Number of messages to process in each batch (default: 20)
   --batch-transaction     Use single transaction per batch (20x faster but less resilient, default: false)
@@ -95,7 +95,7 @@ Options:
                           (default: [cleanup] fts_retention from the config; unset = index all)
   --config string        Path to TOML configuration file (required)
 
-IMPORTANT: --maildir-path must point to a maildir root directory (containing cur/, new/, tmp/ subdirectories),
+IMPORTANT: --maildir-path must point to a maildir root directory (containing cur/ or new/ subdirectories),
 not to a parent directory containing multiple maildirs.
 
 The --incremental flag controls whether to use the SQLite cache to skip already-imported messages:
@@ -399,9 +399,10 @@ Options:
   --end-date string       Export only messages before this date (YYYY-MM-DD)
   --config string        Path to TOML configuration file (required)
 
-The exporter creates a SQLite database (sora-export.db) in the maildir path to track
-exported messages and avoid duplicates. If exporting to an existing maildir, messages
-with the same content hash will be skipped unless --overwrite-flags is specified.
+The exporter keeps a SQLite database (sora-maildir.db, the same file import maildir uses)
+in the maildir path to track exported messages and avoid duplicates. If exporting to an
+existing maildir, messages with the same content hash will be skipped unless
+--overwrite-flags is specified.
 
 Examples:
   # Export all mail to a new maildir
@@ -528,7 +529,6 @@ Subcommands:
   maildir        Import maildir data
   s3             Import messages from S3 storage (recovery scenario)
   rekey          Re-key bodies an older import stored under their SHA-256 digest
-  fix-subscriptions  Fix subscription status for default mailboxes
 
 Examples:
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir

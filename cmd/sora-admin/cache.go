@@ -50,7 +50,7 @@ func handleCacheStats(ctx context.Context) {
 		fmt.Printf(`Show local cache size and object count
 
 Usage:
-  sora-admin cache-stats [options]
+  sora-admin cache stats [options]
 
 Options:
   --config string        Path to TOML configuration file (required)
@@ -62,8 +62,8 @@ This command shows:
   - Cache capacity and maximum object size
 
 Examples:
-  sora-admin cache-stats
-  sora-admin cache-stats --config /path/to/config.toml
+  sora-admin cache stats
+  sora-admin cache stats --config /path/to/config.toml
 `)
 	}
 
@@ -90,7 +90,7 @@ func handleCachePurge(ctx context.Context) {
 		fmt.Printf(`Clear all cached objects
 
 Usage:
-  sora-admin cache-purge [options]
+  sora-admin cache purge [options]
 
 Options:
   --config string        Path to TOML configuration file (required)
@@ -100,9 +100,9 @@ This command removes all cached objects from the local cache directory
 and clears the cache index database. This action cannot be undone.
 
 Examples:
-  sora-admin cache-purge
-  sora-admin cache-purge --confirm
-  sora-admin cache-purge --config /path/to/config.toml --confirm
+  sora-admin cache purge
+  sora-admin cache purge --confirm
+  sora-admin cache purge --config /path/to/config.toml --confirm
 `)
 	}
 
