@@ -79,7 +79,7 @@ type CircuitBreakerSettings struct {
 	Interval     time.Duration // Time before resetting failure counts in closed state
 	Timeout      time.Duration // Time before transitioning from open to half-open
 	FailureRatio float64       // Failure ratio threshold to open circuit (0.0-1.0)
-	MinRequests  uint32        // Minimum requests before evaluating failure ratio
+	MinRequests  uint32        // Minimum completed requests before evaluating failure ratio
 }
 
 // TransportSettings holds HTTP transport configuration for connection pooling and timeouts
@@ -135,9 +135,11 @@ func NewHTTPRemoteLookupClient(
 	minRequests := cbSettings.MinRequests
 
 	settings.ReadyToTrip = func(counts circuitbreaker.Counts) bool {
-		// Open circuit if failure ratio exceeds threshold
-		ratio := float64(counts.TotalFailures) / float64(counts.Requests)
-		return counts.Requests >= minRequests && ratio >= failureRatio
+		// Pending requests have no verdict yet, including with a configured
+		// counting interval. Take both the minimum and ratio over results.
+		results := counts.Results()
+		ratio := float64(counts.TotalFailures) / float64(results)
+		return results >= minRequests && ratio >= failureRatio
 	}
 	settings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Warn("remotelookup: Circuit breaker state changed", "name", name, "from", from, "to", to)
@@ -269,11 +271,9 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 	result, err := c.breaker.Execute(func() (any, error) {
 		// Build request URL by interpolating placeholders:
 		// - $email: user email (MasterAddress - includes master token but not +detail)
-		// - $ip: client IP address
+		// - $ip: client IP address; empty when the caller has none, never the literal placeholder
 		requestURL := strings.ReplaceAll(c.baseURL, "$email", url.QueryEscape(lookupEmail))
-		if clientIP != "" {
-			requestURL = strings.ReplaceAll(requestURL, "$ip", url.QueryEscape(clientIP))
-		}
+		requestURL = strings.ReplaceAll(requestURL, "$ip", url.QueryEscape(clientIP))
 
 		// Add route_only parameter if requested (for master username authentication)
 		if routeOnly {

@@ -60,6 +60,22 @@ func TestAdminAPI_DeliverMail_RunsDefaultSieveAndCreate(t *testing.T) {
 			want:   "INBOX",
 		},
 		{name: "default fileinto :create of an invalid detail keeps", detail: "a/./b", want: "INBOX"},
+		// Issue #457: an empty hierarchy level is refused as a "." level is, and a
+		// trailing delimiter is no part of the name (RFC 3501 §6.3.3: "the name
+		// created is without the trailing hierarchy delimiter"), so neither makes a
+		// mailbox with an empty level ("x/", "Trail/").
+		{
+			name:   "user fileinto :create of a name with an empty level keeps",
+			script: []string{`require ["fileinto", "mailbox"];`, `fileinto :create "x//y";`},
+			want:   "INBOX",
+		},
+		{name: "default fileinto :create of a detail with an empty level keeps", detail: "x//y", want: "INBOX"},
+		{
+			name:   "user fileinto :create of a name with a trailing delimiter",
+			script: []string{`require ["fileinto", "mailbox"];`, `fileinto :create "Trail/";`},
+			want:   "Trail",
+		},
+		{name: "default fileinto :create of a detail with a trailing delimiter", detail: "foo/", want: "foo"},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -112,6 +128,16 @@ func TestAdminAPI_DeliverMail_RunsDefaultSieveAndCreate(t *testing.T) {
 			}
 			if mailbox != tc.want {
 				t.Errorf("stored in %s, want %s", mailbox, tc.want)
+			}
+
+			mailboxes, err := server.rdb.GetMailboxesWithRetry(ctx, accountID, false)
+			if err != nil {
+				t.Fatalf("list mailboxes: %v", err)
+			}
+			for _, mb := range mailboxes {
+				if mb.Name == "" || strings.HasPrefix(mb.Name, "/") || strings.HasSuffix(mb.Name, "/") || strings.Contains(mb.Name, "//") {
+					t.Errorf("created mailbox %q with an empty hierarchy level", mb.Name)
+				}
 			}
 		})
 	}

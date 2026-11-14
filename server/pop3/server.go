@@ -227,31 +227,13 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	if !lookupCacheConfig.Enabled {
 		logger.Info("POP3: Lookup cache disabled", "name", name)
 	} else {
-		positiveTTL, err := time.ParseDuration(lookupCacheConfig.PositiveTTL)
-		if err != nil || lookupCacheConfig.PositiveTTL == "" {
-			logger.Info("POP3: Using default positive TTL (5m)", "name", name)
-			positiveTTL = 5 * time.Minute
-		}
-
-		negativeTTL, err := time.ParseDuration(lookupCacheConfig.NegativeTTL)
-		if err != nil || lookupCacheConfig.NegativeTTL == "" {
-			logger.Info("POP3: Using default negative TTL (1m)", "name", name)
-			negativeTTL = 1 * time.Minute
-		}
-
-		cleanupInterval, err := time.ParseDuration(lookupCacheConfig.CleanupInterval)
-		if err != nil || lookupCacheConfig.CleanupInterval == "" {
-			logger.Info("POP3: Using default cleanup interval (5m)", "name", name)
-			cleanupInterval = 5 * time.Minute
-		}
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()
 
 		maxSize := lookupCacheConfig.GetMaxSize()
 
-		positiveRevalidationWindow, err := lookupCacheConfig.GetPositiveRevalidationWindow()
-		if err != nil {
-			logger.Info("POP3: Invalid positive revalidation window in auth cache config, using default (30s)", "name", name, "error", err)
-			positiveRevalidationWindow = 30 * time.Second
-		}
+		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault()
 
 		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("POP3: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
@@ -979,6 +961,12 @@ func (s *POP3Server) Authenticate(ctx context.Context, address, password string)
 	// Fetch credentials from database (no caching - we handle that here)
 	accountID, hashedPassword, err := s.rdb.GetCredentialForAuthWithRetry(ctx, address)
 	if err != nil {
+		if serverPkg.IsTemporaryAuthFailure(err) {
+			// The database could not be asked: no verdict on the credentials, so nothing
+			// is cached and the login is answered as a temporary failure.
+			logger.Warn("authentication unavailable", "address", address, "method", "main_db", "error", err)
+			return 0, err
+		}
 		// Equalize response timing with the wrong-password path (which runs bcrypt) so an
 		// attacker can't use response time to tell whether the account exists. (security-audit M14)
 		if errors.Is(err, consts.ErrUserNotFound) {

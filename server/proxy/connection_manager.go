@@ -1065,19 +1065,9 @@ func (cm *ConnectionManager) RecordRemoteLookupFailure(backend string) bool {
 	return false
 }
 
-// AuthenticateAndRoute delegates to the routing lookup if available
-func (cm *ConnectionManager) AuthenticateAndRoute(ctx context.Context, email, password string) (*UserRoutingInfo, AuthResult, error) {
-	return cm.AuthenticateAndRouteWithOptions(ctx, email, password, false)
-}
-
-// AuthenticateAndRouteWithOptions performs authentication and routing with additional options
-// routeOnly: if true, skip password validation and only return routing info (for master username auth)
-func (cm *ConnectionManager) AuthenticateAndRouteWithOptions(ctx context.Context, email, password string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
-	return cm.AuthenticateAndRouteWithClientIP(ctx, email, password, "", routeOnly)
-}
-
 // AuthenticateAndRouteWithClientIP performs authentication and routing with client IP and additional options
-// clientIP: client IP address to include in remotelookup URL (supports $ip placeholder)
+// clientIP: the real client's IP (the PROXY header source when there is one), the
+// remotelookup URL's $ip placeholder
 // routeOnly: if true, skip password validation and only return routing info (for master username auth)
 func (cm *ConnectionManager) AuthenticateAndRouteWithClientIP(ctx context.Context, email, password, clientIP string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
 	if cm.routingLookup == nil {
@@ -2102,13 +2092,14 @@ func (cm *ConnectionManager) HasRouting() bool {
 }
 
 // LookupUserRoute performs a user routing lookup if configured.
-// Note: This is routing-only lookup, so password is empty.
-func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email string) (*UserRoutingInfo, error) {
+// Note: This is routing-only lookup, so password is empty. clientIP is the real
+// client's IP, the remotelookup URL's $ip placeholder.
+func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email, clientIP string) (*UserRoutingInfo, error) {
 	if !cm.HasRouting() || email == "" {
 		return nil, nil
 	}
 	// Use routeOnly=true for LMTP routing lookups (no authentication, only routing info needed)
-	info, authResult, err := cm.routingLookup.LookupUserRouteWithOptions(ctx, email, "", true)
+	info, authResult, err := cm.routingLookup.LookupUserRouteWithClientIP(ctx, email, "", clientIP, true)
 	if err != nil {
 		return nil, err
 	}
@@ -2122,6 +2113,7 @@ func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email string) 
 type RouteParams struct {
 	Ctx                   context.Context
 	Username              string
+	ClientIP              string // Real client IP (PROXY header source when present), the lookup's $ip
 	Protocol              string // "imap", "pop3", "managesieve", "lmtp"
 	IsRemoteLookupAccount bool
 	RoutingInfo           *UserRoutingInfo
@@ -2160,7 +2152,7 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 		lookupTimeout := cm.GetRemoteLookupTimeout()
 		routingCtx, routingCancel := context.WithTimeout(params.Ctx, lookupTimeout)
 		var lookupErr error
-		result.RoutingInfo, lookupErr = cm.LookupUserRoute(routingCtx, params.Username)
+		result.RoutingInfo, lookupErr = cm.LookupUserRoute(routingCtx, params.Username, params.ClientIP)
 		routingCancel()
 		if lookupErr != nil && cm.HasNamedPools() {
 			// No answer is no pool: routing on would put the user in the default pool,

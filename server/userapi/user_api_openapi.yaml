@@ -126,6 +126,9 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/Mailbox'
+                  count:
+                    type: integer
+                    description: Number of mailboxes in the list.
         '401':
           $ref: '#/components/responses/Unauthorized'
 
@@ -656,6 +659,10 @@ components:
   schemas:
     Mailbox:
       type: object
+      description: |
+        `total`, `unseen`, `uid_next` and `uid_validity` are what IMAP STATUS reports as
+        MESSAGES, UNSEEN, UIDNEXT and UIDVALIDITY. All four are 0 for a shared mailbox
+        the user may list but not read (ACL right `l` without `r`).
       properties:
         name:
           type: string
@@ -665,16 +672,29 @@ components:
           example: INBOX
         subscribed:
           type: boolean
-        total_messages:
+        total:
           type: integer
-        unseen_messages:
+          description: Number of messages in the mailbox.
+          example: 142
+        unseen:
           type: integer
-        uidvalidity:
+          description: Number of messages without the `\Seen` flag.
+          example: 5
+        uid_next:
           type: integer
           format: int64
-        uidnext:
+          description: |
+            The UID the next message added to the mailbox will get (RFC 9051 §2.3.1.1).
+            It changes whenever a message is added, even one expunged afterwards, so a
+            client can poll it to notice new mail.
+          example: 143
+        uid_validity:
           type: integer
           format: int64
+          description: |
+            The mailbox's UIDVALIDITY. UIDs and `uid_next` can only be compared with
+            earlier values while it stays the same.
+          example: 1234567890
 
     SettableFlag:
       type: string
