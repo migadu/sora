@@ -356,28 +356,24 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		}
 
 		if err != nil {
-			// Categorize the error type to determine fallback behavior. A malformed
-			// answer arrives as ErrRemoteLookupTransient: a broken lookup service.
-			if errors.Is(err, proxy.ErrRemoteLookupTransient) {
-				// Check if this is due to context cancellation (server shutdown)
-				if errors.Is(err, server.ErrServerShuttingDown) {
-					s.InfoLog("remotelookup cancelled due to server shutdown")
-					metrics.RemoteLookupResult.WithLabelValues("pop3", "shutdown").Inc()
-					return server.ErrServerShuttingDown
-				}
-
-				// Transient error (network, 5xx, circuit breaker) - NEVER fallback to DB
-				// These are service availability issues, not "user not found" cases.
-				// Nothing is wrong with the client's credentials: answer a temporary
-				// failure (-ERR [SYS/TEMP]) and do not charge the auth rate limiter, or
-				// clients retrying during an outage get delayed and blocked.
-				s.WarnLog("remotelookup transient error - service unavailable", "error", err)
-				metrics.RemoteLookupResult.WithLabelValues("pop3", "transient_error_rejected").Inc()
-				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
-				return server.ErrAuthServiceUnavailable
-			} else {
-				// Unknown error type - fallthrough to main DB auth
+			// Check if this is due to context cancellation (server shutdown)
+			if errors.Is(err, server.ErrServerShuttingDown) {
+				s.InfoLog("remotelookup cancelled due to server shutdown")
+				metrics.RemoteLookupResult.WithLabelValues("pop3", "shutdown").Inc()
+				return server.ErrServerShuttingDown
 			}
+
+			// An error is no verdict on the user, whatever its kind (network, 5xx,
+			// circuit breaker, a malformed answer, or one this proxy cannot classify):
+			// NEVER fall back to the database. Only a definite "not found" does, and
+			// only with lookup_local_users (below); without it this node may have no
+			// database at all. Nothing is wrong with the client's credentials: answer a
+			// temporary failure (-ERR [SYS/TEMP]) and do not charge the auth rate
+			// limiter, or clients retrying during an outage get delayed and blocked.
+			s.WarnLog("remotelookup transient error - service unavailable", "error", err)
+			metrics.RemoteLookupResult.WithLabelValues("pop3", "transient_error_rejected").Inc()
+			metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+			return server.ErrAuthServiceUnavailable
 		} else {
 			switch authResult {
 			case proxy.AuthSuccess:
