@@ -1108,12 +1108,11 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # Disabled capabilities are not announced in CAPABILITY responses and cannot be
 # used: what they add is refused, e.g. with MOVE disabled the MOVE command gets
 # BAD, with STATUS=SIZE disabled so does STATUS (SIZE), with UIDPLUS disabled
-# UID EXPUNGE. Disabling LIST-EXTENDED refuses its generic selection/return
+# UID EXPUNGE, with CREATE-SPECIAL-USE disabled CREATE's USE parameter (even
+# USE ()). Disabling LIST-EXTENDED refuses its generic selection/return
 # options and parenthesized pattern lists; plain LIST, LSUB and options with
 # their own advertised capabilities (SPECIAL-USE, LIST-STATUS) keep working.
-# ID cannot be refused, so disabling ID only stops announcing it. Disabling
-# CREATE-SPECIAL-USE refuses attribute assignment, but an empty CREATE USE ()
-# parameter is still accepted and behaves as ordinary CREATE.
+# ID cannot be refused, so disabling ID only stops announcing it.
 #
 # This is different from client_filters which apply based on client identity.
 # Use this when you want to disable capabilities for ALL clients on this server.
