@@ -39,6 +39,11 @@ type ManageSieveSession struct {
 	useMasterDB bool   // Pin session to master DB after a write to ensure consistency
 	releaseConn func() // Function to release connection from limiter
 	startTime   time.Time
+
+	// trackedClientAddr is the client address this session was registered
+	// with in the connection tracker, so it is unregistered under that key.
+	// Empty when the tracker refused the session: it has nothing to release.
+	trackedClientAddr string
 }
 
 var (
@@ -85,6 +90,10 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 	var impersonating bool
 	var targetAddress *server.Address
 
+	// One copy of the master SASL settings for the whole login, however a config
+	// reload replaces them meanwhile.
+	settings := s.server.settings.Load()
+
 	// 1. Check for Master Username Authentication (user@domain.com@MASTER_USERNAME)
 	if parseErr == nil && len(s.server.masterUsername) > 0 && authnParsed.HasSuffix() && checkMasterCredential(authnParsed.Suffix(), s.server.masterUsername) {
 		// Rate-limit the master-password check. The master password is a
@@ -117,6 +126,9 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 
 		// Suffix matches MasterUsername, authenticate with MasterPassword
 		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
+			if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
+				return errAuthFailed
+			}
 			// The success is NOT recorded here. A success clears this key's Tier-1 count
 			// and, via clearFailureTracking, the source IP's Tier-2 count and any active
 			// block. Recording it before the impersonation target is resolved would mean a
@@ -183,10 +195,6 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		}
 	}
 
-	// One copy of the master SASL settings for the whole login, however a config
-	// reload replaces them meanwhile.
-	settings := s.server.settings.Load()
-
 	// 2. Check for Master SASL Authentication (traditional)
 	// Entered on the authentication identity alone (constant-time comparison, to
 	// avoid a timing side-channel on the tenant-wide credential). The password is
@@ -245,17 +253,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 			return errAuthFailed
 		}
 
-		// Network gate: master SASL is a tenant-wide impersonation
-		// capability. Anchored to the real socket peer (cannot be forged
-		// via PROXY/XCLIENT forwarding).
-		if !settings.masterSASLGate.Allowed(s.conn.RemoteAddr()) {
-			s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(s.conn.RemoteAddr()))
-			// Recorded exactly like a wrong master password: reachable ONLY with the
-			// correct one, so an uncharged failure diverges at the block threshold and
-			// confirms the guess.
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
+		if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master SASL") {
 			return errAuthFailed
 		}
 		s.DebugLog("master sasl user authenticated, attempting impersonation", "authn_id", authnID, "authz_id", authzID)
@@ -449,6 +447,10 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 	if len(s.server.masterUsername) > 0 && address.HasSuffix() && checkMasterCredential(address.Suffix(), s.server.masterUsername) {
 		// Suffix matches MasterUsername, authenticate with MasterPassword
 		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
+			if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
+				return errAuthFailed
+			}
 			s.DebugLog("master username authentication successful", "address", address.BaseAddress(), "master_username", address.Suffix())
 			authSuccess = true
 			masterAuthUsed = true
@@ -956,25 +958,28 @@ func (s *ManageSieveSession) registerConnection(ctx context.Context, email strin
 		ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 		defer cancel()
 
-		clientAddr := server.GetAddrString(s.conn.RemoteAddr())
+		// The client's address, not the TCP peer: behind a proxy the peer is
+		// the proxy for every client. RemoteIP already holds the address from
+		// the PROXY header.
+		clientAddr := s.RemoteIP
 
 		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "ManageSieve", clientAddr); err != nil {
 			s.InfoLog("rejected connection registration", "error", err)
+			return
 		}
+		s.trackedClientAddr = clientAddr
 	}
 }
 
 // unregisterConnection removes the connection from the connection tracker
 func (s *ManageSieveSession) unregisterConnection() {
-	if s.server.connTracker != nil && s.User != nil {
+	if s.server.connTracker != nil && s.User != nil && s.trackedClientAddr != "" {
 		// Use configured database query timeout for connection tracking (database DELETE)
 		queryTimeout := s.server.rdb.GetQueryTimeout()
 		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 		defer cancel()
 
-		clientAddr := server.GetAddrString(s.conn.RemoteAddr())
-
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "ManageSieve", clientAddr); err != nil {
+		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "ManageSieve", s.trackedClientAddr); err != nil {
 			s.WarnLog("failed to unregister connection", "error", err)
 		}
 	}

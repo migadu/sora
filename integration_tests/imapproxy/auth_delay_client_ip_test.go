@@ -74,16 +74,18 @@ func setupIMAPProxyWithIncomingPROXYAndRateLimiting(t *testing.T, rdb *resilient
 // RemoteAddr() is the load balancer, which never accumulates failures, so the delay
 // never fired for anyone.
 //
-// The assertion is on the sora_auth_delay_completed_total counter, whose "ip" label
-// records exactly which address the delay was computed for: no timing thresholds.
+// The assertions are on the sora_auth_delay_completed_total counter: the real
+// client's third attempt is delayed, and another client behind the same load
+// balancer is not. No timing thresholds.
 func TestIMAPProxy_AuthDelay_UsesRealClientIP(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	backendServer, account := common.SetupIMAPServerWithMaster(t)
 	defer backendServer.Close()
 
-	const clientIP = "203.0.113.77" // the "real" client behind the load balancer
-	const lbIP = "127.0.0.1"        // the load balancer (the socket peer)
+	const clientIP = "203.0.113.77"      // the "real" client behind the load balancer
+	const otherClientIP = "203.0.113.87" // another client behind the same load balancer
+	const lbIP = "127.0.0.1"             // the load balancer (the socket peer)
 
 	proxyAddr := common.GetRandomAddress(t)
 	proxy := setupIMAPProxyWithIncomingPROXYAndRateLimiting(t, backendServer.ResilientDB, proxyAddr, []string{backendServer.Address}, server.AuthRateLimiterConfig{
@@ -101,7 +103,7 @@ func TestIMAPProxy_AuthDelay_UsesRealClientIP(t *testing.T) {
 	defer proxy.Close()
 
 	// One IMAP LOGIN through a PROXY-protocol header announcing clientIP.
-	loginBehindLB := func(password string) string {
+	loginBehindLB := func(clientIP, password string) string {
 		conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
 		if err != nil {
 			t.Fatalf("dial: %v", err)
@@ -134,31 +136,36 @@ func TestIMAPProxy_AuthDelay_UsesRealClientIP(t *testing.T) {
 		return strings.TrimSpace(resp)
 	}
 
-	delaysFor := func(ip string) float64 {
-		return testutil.ToFloat64(metrics.AuthDelayCompleted.WithLabelValues("IMAP-PROXY", ip))
+	delays := func() float64 {
+		return testutil.ToFloat64(metrics.AuthDelayCompleted.WithLabelValues("IMAP-PROXY"))
 	}
-
-	clientBefore := delaysFor(clientIP)
-	lbBefore := delaysFor(lbIP)
 
 	// Two failures push the real client's failure count to the delay threshold.
 	for i := 0; i < 2; i++ {
-		if resp := loginBehindLB(fmt.Sprintf("wrong-password-%d", i)); strings.Contains(resp, "a001 OK") {
+		if resp := loginBehindLB(clientIP, fmt.Sprintf("wrong-password-%d", i)); strings.Contains(resp, "a001 OK") {
 			t.Fatalf("attempt %d: login should have failed, got %q", i+1, resp)
 		}
 	}
 
-	// The third attempt must be delayed, and the delay must be attributed to the real
-	// client IP carried in the PROXY header.
-	if resp := loginBehindLB("wrong-password-2"); strings.Contains(resp, "a001 OK") {
+	// The third attempt from the same client must be delayed.
+	before := delays()
+	if resp := loginBehindLB(clientIP, "wrong-password-2"); strings.Contains(resp, "a001 OK") {
 		t.Fatalf("attempt 3: login should have failed, got %q", resp)
 	}
-
-	if got := delaysFor(clientIP) - clientBefore; got < 1 {
+	if got := delays() - before; got < 1 {
 		t.Fatalf("no progressive auth delay was applied for the real client %s (delta=%v): the delay is keyed on the load balancer address, so it never fires behind a proxy", clientIP, got)
 	}
-	if got := delaysFor(lbIP) - lbBefore; got != 0 {
-		t.Fatalf("auth delay was attributed to the load balancer %s (delta=%v) instead of the real client", lbIP, got)
+
+	// Another client behind the same load balancer has no failures of its own and
+	// must not be delayed. This catches the delay and the failure count both being
+	// keyed on the load balancer, which the metric (labelled by protocol only)
+	// cannot attribute.
+	before = delays()
+	if resp := loginBehindLB(otherClientIP, "wrong-password-0"); strings.Contains(resp, "a001 OK") {
+		t.Fatalf("other client: login should have failed, got %q", resp)
 	}
-	t.Logf("✓ progressive auth delay applied and attributed to the real client IP %s", clientIP)
+	if got := delays() - before; got != 0 {
+		t.Fatalf("auth delay was applied to %s, which never failed (delta=%v): the delay is keyed on the load balancer %s instead of the real client", otherClientIP, got, lbIP)
+	}
+	t.Logf("✓ progressive auth delay applied to the real client IP %s only", clientIP)
 }
