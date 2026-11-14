@@ -1564,22 +1564,29 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 	// A tracker keeps one entry per account ID, with the address of the session that
 	// created it. The address is resolved to its account, as POST /admin/connections/kick
 	// resolves it, so the account's entries are listed whichever of its addresses names
-	// it. An entry created under the address is listed too: a remote lookup account,
-	// which the database does not know, is keyed by an ID derived from the address the
-	// lookup answered, and that is the address its entry keeps.
+	// it. An entry created under any address of the account is listed too: a proxy keys
+	// a session that remote lookup authenticated by an ID derived from the address the
+	// lookup answered (proxy.DeriveAccountIDFromEmail), not by the database's account ID,
+	// even when the database holds the account, and that address is the one its entry
+	// keeps. Without an account in the database (a lookup service's own account, or the
+	// database cannot be asked) the entries created under the address itself are listed.
 	//
 	// Unlike GET /admin/connections, a tracker that knows the account only through
 	// gossip is listed too (local count 0): it reports the sessions on other nodes.
 	var accountID int64 // 0: the database names no account for the address
+	addresses := []string{email}
 	if s.rdb != nil {
-		id, err := s.rdb.GetAccountIDByEmailWithRetry(r.Context(), email)
+		id, accountAddresses, err := s.rdb.GetAccountAddressesWithRetry(r.Context(), email)
 		switch {
 		case err == nil:
-			accountID = id
+			accountID, addresses = id, append(accountAddresses, email)
 		case !errors.Is(err, consts.ErrUserNotFound):
 			logger.Warn("HTTP API: Cannot resolve account; listing only the entries created under the address",
 				"name", s.name, "email", email, "error", err)
 		}
+	}
+	createdUnder := func(username string) bool {
+		return slices.ContainsFunc(addresses, func(a string) bool { return strings.EqualFold(a, username) })
 	}
 	userConnections := make([]ConnectionInfo, 0)
 
@@ -1590,7 +1597,7 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 		instanceID := tracker.GetInstanceID()
 		conns := tracker.GetAllConnections()
 		for _, connInfo := range conns {
-			if (accountID != 0 && connInfo.AccountID == accountID) || strings.EqualFold(connInfo.Username, email) {
+			if (accountID != 0 && connInfo.AccountID == accountID) || createdUnder(connInfo.Username) {
 				userConnections = append(userConnections, newConnectionInfo(trackerKey, connInfo.GetLocalCount(instanceID), connInfo))
 			}
 		}
