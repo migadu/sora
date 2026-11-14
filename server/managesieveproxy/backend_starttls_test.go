@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +24,8 @@ type fakeSieveBackend struct {
 	implicitTLS   bool   // the listener speaks TLS from the first byte
 	startTLSReply string // reply to STARTTLS; "" refuses it with NO
 	afterTLSCaps  string // sent in one write with the capabilities that follow the handshake
+	greeting      string // sent on connect in place of fakeSieveCapabilities
+	tlsGreeting   string // sent after the handshake in place of fakeSieveCapabilities
 }
 
 // start serves one connection and returns its address and a function that waits for
@@ -43,6 +46,13 @@ func (b fakeSieveBackend) start(t *testing.T) (addr string, commands func() []st
 	if reply == "" {
 		reply = "NO \"STARTTLS not available\"\r\n"
 	}
+	greeting, tlsGreeting := b.greeting, b.tlsGreeting
+	if greeting == "" {
+		greeting = fakeSieveCapabilities
+	}
+	if tlsGreeting == "" {
+		tlsGreeting = fakeSieveCapabilities
+	}
 	var mu sync.Mutex
 	var got []string
 	done := make(chan struct{})
@@ -59,7 +69,7 @@ func (b fakeSieveBackend) start(t *testing.T) (addr string, commands func() []st
 			conn = tls.Server(raw, tlsConfig)
 		}
 		r := bufio.NewReader(conn)
-		io.WriteString(conn, fakeSieveCapabilities)
+		io.WriteString(conn, greeting)
 		for {
 			line, err := r.ReadString('\n')
 			if err != nil {
@@ -82,7 +92,7 @@ func (b fakeSieveBackend) start(t *testing.T) (addr string, commands func() []st
 				return
 			}
 			conn, r = secure, bufio.NewReader(secure)
-			io.WriteString(conn, fakeSieveCapabilities+b.afterTLSCaps)
+			io.WriteString(conn, tlsGreeting+b.afterTLSCaps)
 		}
 	}()
 	return ln.Addr().String(), func() []string {
@@ -118,6 +128,7 @@ func connectSieveBackend(t *testing.T, addr string, settings proxy.BackendSettin
 	sess := &Session{
 		server:                &Server{name: "test", hostname: "test-host", connManager: cm},
 		clientConn:            clientA,
+		listenerConn:          clientA,
 		ctx:                   context.Background(),
 		username:              "user@example.com",
 		routingInfo:           route,
@@ -198,6 +209,97 @@ func TestConnectToBackendRefusesDataAfterSTARTTLSResponse(t *testing.T) {
 	}
 	if !server.IsBackendError(err) {
 		t.Errorf("connectToBackendAndAuth = %v, want a backend error", err)
+	}
+}
+
+// A capability list ends with OK, NO or BYE (RFC 5804 section 4: response-capability =
+// *(single-capability) response-oknobye), matched case-insensitively. A backend refusing
+// the connection (a sora backend over its max_connections_per_ip answers
+// NO (TRYLATER) "Too many connections") must end the greeting at once with the backend's
+// line, not be read on as a capability line until EOF or the read deadline. The fake
+// backend keeps the connection open after its refusal.
+func TestConnectToBackendReportsRefusingGreeting(t *testing.T) {
+	const tooMany = `NO (TRYLATER) "Too many connections"`
+	startTLS := proxy.BackendSettings{TLS: true, TLSUseStartTLS: true}
+	for _, tc := range []struct {
+		name     string
+		backend  fakeSieveBackend
+		settings proxy.BackendSettings
+		refusal  string
+		commands []string // what the backend receives before the proxy hangs up
+	}{
+		{"NO greeting", fakeSieveBackend{greeting: tooMany + "\r\n"}, proxy.BackendSettings{}, tooMany, nil},
+		{"BYE after capabilities", fakeSieveBackend{greeting: "\"IMPLEMENTATION\" \"fake\"\r\nBYE \"Server shutting down\"\r\n"},
+			proxy.BackendSettings{}, `BYE "Server shutting down"`, nil},
+		{"lower-case bye", fakeSieveBackend{greeting: "bye\r\n"}, proxy.BackendSettings{}, "bye", nil},
+		{"NO after STARTTLS", fakeSieveBackend{startTLSReply: "OK\r\n", tlsGreeting: tooMany + "\r\n"}, startTLS, tooMany, []string{"STARTTLS"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, commands := tc.backend.start(t)
+			_, err := connectSieveBackend(t, addr, tc.settings, nil)
+			if !errors.Is(err, server.ErrBackendConnectionFailed) || !strings.HasSuffix(err.Error(), "backend refused the connection: "+tc.refusal) {
+				t.Fatalf("connectToBackendAndAuth = %v, want a backend connection failure carrying %q", err, tc.refusal)
+			}
+			if got := commands(); !slices.Equal(got, tc.commands) {
+				t.Errorf("backend received %q, want %q", got, tc.commands)
+			}
+		})
+	}
+}
+
+// The OK that ends the greeting is matched case-insensitively too (RFC 5804 section 4):
+// a lower-case "ok" is not a capability line to read past.
+func TestConnectToBackendEndsGreetingAtLowerCaseOK(t *testing.T) {
+	addr, commands := fakeSieveBackend{greeting: "\"IMPLEMENTATION\" \"fake\"\r\n\"NOTIFY\" \"mailto\"\r\nok\r\n"}.start(t)
+	sess, err := connectSieveBackend(t, addr, proxy.BackendSettings{}, nil)
+	if err != nil {
+		t.Fatalf("connectToBackendAndAuth: %v", err)
+	}
+	sess.backendConn.Close()
+	if got := commands(); len(got) != 1 || !strings.HasPrefix(got[0], "AUTHENTICATE \"PLAIN\" ") {
+		t.Errorf("backend received %q, want AUTHENTICATE", got)
+	}
+}
+
+func TestConnectToBackendCapabilityLiteralsAreNotStatusReplies(t *testing.T) {
+	for _, greeting := range []string{
+		"{2}\r\nNO\r\nOK\r\n",
+		"\"IMPLEMENTATION\" {3}\r\nBYE\r\nOK\r\n",
+		"{2}\r\nNO {3}\r\nBYE\r\nOK\r\n",
+		"\"IMPLEMENTATION\" {6}\r\nNO\r\nOK\r\nOK\r\n",
+		"OK {2}\r\nNO\r\n",
+		"OK (XTEST ({2}\r\nNO))\r\n",
+		"{0}\r\n {3}\r\nBYE\r\nOK\r\n",
+	} {
+		t.Run(greeting, func(t *testing.T) {
+			addr, commands := fakeSieveBackend{greeting: greeting}.start(t)
+			sess, err := connectSieveBackend(t, addr, proxy.BackendSettings{}, nil)
+			if err != nil {
+				t.Fatalf("connectToBackendAndAuth: %v", err)
+			}
+			sess.backendConn.Close()
+			if got := commands(); len(got) != 1 || !strings.HasPrefix(got[0], "AUTHENTICATE \"PLAIN\" ") {
+				t.Errorf("backend received %q, want AUTHENTICATE", got)
+			}
+		})
+	}
+}
+
+func TestBackendCapabilityLiteralBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name, input string
+		want        error
+	}{
+		{"oversized declaration without payload", "{8193}\r\n", server.ErrLineTooLong},
+		{"truncated literal", "{3}\r\nNO", io.EOF},
+		{"record bound includes literal payload", "{8190}\r\n", server.ErrLineTooLong},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := readBackendCapabilityRecord(bufio.NewReader(strings.NewReader(tc.input)))
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("reading capability record: %v, want %v", err, tc.want)
+			}
+		})
 	}
 }
 
