@@ -995,9 +995,12 @@ master_sasl_password = ""     # Password for master_sasl_username.
 # master SASL secret can log in as any user. As defense-in-depth, restrict which
 # source networks may use master SASL below. The check is anchored to the real TCP
 # peer (NOT forgeable via PROXY/XCLIENT/IMAP ID forwarding), so list the PROXY hosts,
-# not end-client IPs. Support staff use master_username at the proxy front door and
-# are unaffected by this list. Empty = disabled (any source accepted — legacy behavior;
-# a startup WARNING is logged when master SASL is set without this gate).
+# not end-client IPs. The same list also restricts the master_username form
+# (user@domain@master_username) on this server, since it impersonates any user too.
+# Support staff who use master_username at the proxy front door are unaffected: the
+# proxy checks it itself and reaches the backend with master SASL from a proxy host.
+# Empty = disabled (any source accepted — legacy behavior; a startup WARNING is
+# logged when master SASL is set without this gate).
 master_sasl_allowed_networks = []   # e.g. ["10.0.0.0/24", "192.168.1.10"]
 # Master SASL requires a SASL authorization identity (the user to impersonate).
 # A submission without one is NOT a master login: it is handled as an ordinary

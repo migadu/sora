@@ -314,15 +314,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 			// confirm the master SASL username to an attacker.
 			return 0, errAuthFailed
 		}
-		if !settings.masterSASLGate.Allowed(netConn.RemoteAddr()) {
-			s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(netConn.RemoteAddr()))
-			// Recorded exactly like a wrong master password: this site is reachable ONLY
-			// with the correct one, so a failure the credential is not charged for
-			// diverges from a wrong password at the block threshold and confirms the
-			// guess. The master-username gate below already did this.
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
+		if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master SASL") {
 			return 0, errAuthFailed
 		}
 		s.DebugLog("master sasl password authentication successful", "base_address", identity)
@@ -393,11 +385,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		// Master username authentication: user@domain.com@MASTER_USERNAME
 		if len(s.server.masterUsername) > 0 && userAddress.HasSuffix() && checkMasterCredential(userAddress.Suffix(), s.server.masterUsername) {
 			if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
-				if !settings.masterSASLGate.Allowed(netConn.RemoteAddr()) {
-					s.WarnLog("master username credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(netConn.RemoteAddr()))
-					if s.server.authLimiter != nil {
-						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-					}
+				if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
 					return 0, errAuthFailed
 				}
 				s.DebugLog("master username authentication successful", "base_address", userAddress.BaseAddress(), "master_username", userAddress.Suffix())

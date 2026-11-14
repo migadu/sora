@@ -358,7 +358,7 @@ type IMAPServerOptions struct {
 	MasterPassword              []byte
 	MasterSASLUsername          []byte
 	MasterSASLPassword          []byte
-	MasterSASLAllowedNetworks   []string // Source networks allowed to use master SASL (empty = any, anchored to real socket peer)
+	MasterSASLAllowedNetworks   []string // Source networks allowed to use master SASL and the master-username form (empty = any, anchored to real socket peer)
 	AppendLimit                 int64
 	MaxConnections              int
 	MaxConnectionsPerIP         int

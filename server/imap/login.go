@@ -164,6 +164,10 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 	if len(s.server.masterUsername) > 0 && addressParsed.HasSuffix() && checkMasterCredential(addressParsed.Suffix(), s.server.masterUsername) {
 		// Suffix matches MasterUsername, authenticate with MasterPassword
 		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
+			if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
+				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
+				return authFailedError()
+			}
 			// Use base address (without suffix) to get account
 			AccountID, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, addressParsed.BaseAddress())
 			if err != nil {

@@ -85,6 +85,10 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 	var impersonating bool
 	var targetAddress *server.Address
 
+	// One copy of the master SASL settings for the whole login, however a config
+	// reload replaces them meanwhile.
+	settings := s.server.settings.Load()
+
 	// 1. Check for Master Username Authentication (user@domain.com@MASTER_USERNAME)
 	if parseErr == nil && len(s.server.masterUsername) > 0 && authnParsed.HasSuffix() && checkMasterCredential(authnParsed.Suffix(), s.server.masterUsername) {
 		// Rate-limit the master-password check. The master password is a
@@ -117,6 +121,9 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 
 		// Suffix matches MasterUsername, authenticate with MasterPassword
 		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
+			if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
+				return errAuthFailed
+			}
 			// The success is NOT recorded here. A success clears this key's Tier-1 count
 			// and, via clearFailureTracking, the source IP's Tier-2 count and any active
 			// block. Recording it before the impersonation target is resolved would mean a
@@ -183,10 +190,6 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		}
 	}
 
-	// One copy of the master SASL settings for the whole login, however a config
-	// reload replaces them meanwhile.
-	settings := s.server.settings.Load()
-
 	// 2. Check for Master SASL Authentication (traditional)
 	// Entered on the authentication identity alone (constant-time comparison, to
 	// avoid a timing side-channel on the tenant-wide credential). The password is
@@ -245,17 +248,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 			return errAuthFailed
 		}
 
-		// Network gate: master SASL is a tenant-wide impersonation
-		// capability. Anchored to the real socket peer (cannot be forged
-		// via PROXY/XCLIENT forwarding).
-		if !settings.masterSASLGate.Allowed(s.conn.RemoteAddr()) {
-			s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(s.conn.RemoteAddr()))
-			// Recorded exactly like a wrong master password: reachable ONLY with the
-			// correct one, so an uncharged failure diverges at the block threshold and
-			// confirms the guess.
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
+		if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master SASL") {
 			return errAuthFailed
 		}
 		s.DebugLog("master sasl user authenticated, attempting impersonation", "authn_id", authnID, "authz_id", authzID)
@@ -449,6 +442,10 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 	if len(s.server.masterUsername) > 0 && address.HasSuffix() && checkMasterCredential(address.Suffix(), s.server.masterUsername) {
 		// Suffix matches MasterUsername, authenticate with MasterPassword
 		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
+			if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
+				return errAuthFailed
+			}
 			s.DebugLog("master username authentication successful", "address", address.BaseAddress(), "master_username", address.Suffix())
 			authSuccess = true
 			masterAuthUsed = true
