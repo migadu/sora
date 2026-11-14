@@ -178,16 +178,13 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 	if opts.RemoteLookup != nil && opts.RemoteLookup.Enabled {
 		remotelookupClient, err := proxy.InitializeRemoteLookup("userapi", opts.RemoteLookup, opts.RemotePort)
 		if err != nil {
-			logger.Warn("User API Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
-			if len(opts.Pools) > 0 || !opts.RemoteLookup.ShouldLookupLocalUsers() {
-				cancel()
-				return nil, fmt.Errorf("remotelookup initialization failed: %w", err)
-			}
-			logger.Info("User API Proxy: Continuing with consistent hash fallback", "name", opts.Name)
-		} else {
-			routingLookup = remotelookupClient
-			logger.Info("User API Proxy: RemoteLookup enabled", "name", opts.Name)
+			// Also with lookup_local_users, which adds the database for the users the
+			// lookup does not know and does not make the lookup optional.
+			cancel()
+			return nil, fmt.Errorf("remotelookup initialization failed: %w", err)
 		}
+		routingLookup = remotelookupClient
+		logger.Info("User API Proxy: RemoteLookup enabled", "name", opts.Name)
 	}
 
 	// Create connection manager with routing lookup
