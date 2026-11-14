@@ -83,10 +83,11 @@ type Server struct {
 	// the proxy eventually refuses every connection (permanent DoS).
 	connReleases   map[net.Conn]func()
 	connReleasesMu sync.Mutex
-	httpServer     *http.Server
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
+	httpServer   *http.Server
+	shutdownMu   sync.Mutex
+	shutdownDone chan struct{}
+	ctx          context.Context
+	cancel       context.CancelFunc
 
 	// Base transports retain the server's dial policy. Proxied requests use a
 	// bounded cache partitioned by pool, verification policy and DNS snapshot;
@@ -430,11 +431,15 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 
 // Start starts the User API proxy server
 func (s *Server) Start() error {
+	if s.ctx.Err() != nil {
+		return nil
+	}
+
 	// Setup HTTP handler (with PROXY protocol support if enabled)
 	handler := s.setupHandler()
 
 	// Create HTTP server
-	s.httpServer = &http.Server{
+	httpServer := &http.Server{
 		Addr:         s.addr,
 		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
@@ -458,8 +463,19 @@ func (s *Server) Start() error {
 			s.cancel()
 			return err
 		}
-		s.httpServer.TLSConfig = tlsConfig
+		httpServer.TLSConfig = tlsConfig
 	}
+
+	s.shutdownMu.Lock()
+	if s.ctx.Err() != nil {
+		s.shutdownMu.Unlock()
+		return nil
+	}
+	s.httpServer = httpServer
+	shutdownDone := make(chan struct{})
+	s.shutdownDone = shutdownDone
+	s.shutdownMu.Unlock()
+	defer close(shutdownDone)
 
 	// Start connection limiter cleanup if enabled
 	if s.limiter != nil {
@@ -467,12 +483,14 @@ func (s *Server) Start() error {
 	}
 
 	// Graceful shutdown
+	httpShutdownDone := make(chan struct{})
 	go func() {
+		defer close(httpShutdownDone)
 		<-s.ctx.Done()
 		logger.Info("User API Proxy: Shutting down server", "name", s.name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			logger.Warn("User API Proxy: Error shutting down server", "name", s.name, "error", err)
 		}
 	}()
@@ -487,6 +505,8 @@ func (s *Server) Start() error {
 	// Create listener
 	listener, err := net.Listen("tcp", s.addr)
 	if err != nil {
+		s.cancel()
+		<-httpShutdownDone
 		return fmt.Errorf("failed to create listener: %w", err)
 	}
 
@@ -500,12 +520,26 @@ func (s *Server) Start() error {
 	// backends are told the client is.
 	listener = server.WrapProxyProtocolHTTP(listener, s.proxyReader, "USER-API-PROXY")
 
+	if s.ctx.Err() != nil {
+		listener.Close()
+		<-httpShutdownDone
+		return nil
+	}
+
 	// Start serving. The certificate is in TLSConfig already: certificate
 	// files passed here would be loaded again, on top of the global one.
 	if s.tls {
-		return s.httpServer.ServeTLS(listener, "", "")
+		err = httpServer.ServeTLS(listener, "", "")
+	} else {
+		err = httpServer.Serve(listener)
 	}
-	return s.httpServer.Serve(listener)
+	if errors.Is(err, http.ErrServerClosed) && s.ctx.Err() != nil {
+		<-httpShutdownDone
+		return nil
+	}
+	s.cancel()
+	<-httpShutdownDone
+	return err
 }
 
 // setupHandler creates the HTTP handler with reverse proxy logic
@@ -1363,22 +1397,24 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 func (s *Server) Stop() error {
 	logger.Info("User API Proxy: Stopping", "name", s.name)
 
+	s.shutdownMu.Lock()
 	s.cancel()
+	shutdownDone := s.shutdownDone
+	s.shutdownMu.Unlock()
+
 	s.closeBackendIdleConnections()
 
-	// HTTP server shutdown is handled by the graceful shutdown goroutine
-	// Wait for it to complete
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	// HTTP server shutdown is handled by the graceful shutdown goroutine;
+	// wait for Start (and httpServer.Shutdown) to complete.
+	if shutdownDone != nil {
+		select {
+		case <-shutdownDone:
+			logger.Info("User API Proxy: Server stopped gracefully", "name", s.name)
+		case <-time.After(30 * time.Second):
+			logger.Warn("User API Proxy: Server stop timeout", "name", s.name)
+		}
+	} else {
 		logger.Info("User API Proxy: Server stopped gracefully", "name", s.name)
-	case <-time.After(30 * time.Second):
-		logger.Warn("User API Proxy: Server stop timeout", "name", s.name)
 	}
 
 	return nil
