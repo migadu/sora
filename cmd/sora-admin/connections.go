@@ -119,8 +119,8 @@ This command uses the HTTP API to broadcast a kick event via the gossip protocol
 All cluster nodes will receive the kick and terminate matching connections within ~100ms.
 
 Configuration Requirements:
-  - http_api_addr must be set in config (e.g., "http://localhost:8080")
-  - http_api_key must be set in config
+  - [admin_cli] addr must be set in config (e.g., "http://localhost:8080")
+  - [admin_cli] api_key must be set in config
 
 Examples:
   sora-admin --config config.toml connections kick --user user@example.com
@@ -450,7 +450,6 @@ Examples:
   sora-admin connections list
   sora-admin connections list --user user@example.com
   sora-admin connections kick --user user@example.com
-  sora-admin connections kick --all
 
 Use 'sora-admin connections <subcommand> --help' for detailed help.
 `)
@@ -636,7 +635,15 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 		"----", "--------", "--------", "-----", "------", "-----------")
 
 	// Print connection details. Each row is an account on one tracker, so the totals are
-	// the sums of its Local and Remote columns, not the number of rows.
+	// connections, not the number of rows. Local is the tracker's own sessions and is
+	// summed. Remote is what other nodes report for the account and protocol, which every
+	// tracker of that protocol on this node hears: it is counted once per account and
+	// protocol, as "stats connection --user" does.
+	type accountProtocol struct {
+		accountID int64
+		protocol  string
+	}
+	remote := make(map[accountProtocol]int)
 	totalLocal, totalRemote := 0, 0
 	for _, conn := range filteredConnections {
 		email := conn.Email
@@ -659,7 +666,8 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 		// Calculate remote count (Total - Local)
 		remoteCount := conn.TotalCount - conn.LocalCount
 		totalLocal += conn.LocalCount
-		totalRemote += remoteCount
+		key := accountProtocol{conn.AccountID, conn.Protocol}
+		remote[key] = max(remote[key], remoteCount)
 
 		fmt.Printf("%-25s %-12s %-30s %-12d %-12d %-20s\n",
 			email,
@@ -668,6 +676,9 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 			conn.LocalCount,
 			remoteCount,
 			conn.LastUpdate.Format("2006-01-02 15:04:05"))
+	}
+	for _, n := range remote {
+		totalRemote += n
 	}
 
 	fmt.Printf("\nTotal connections: %d local, %d remote\n", totalLocal, totalRemote)
@@ -681,7 +692,7 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 func kickConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, serverAddr, clientAddr string, all, autoConfirm bool) error {
 	// Gossip-based kick requires user email (we need accountID)
 	if userEmail == "" && !all {
-		return fmt.Errorf("--user is required for gossip-based kick (or use --all)")
+		return fmt.Errorf("--user is required for gossip-based kick")
 	}
 
 	// serverAddr and clientAddr filtering not supported with gossip

@@ -1149,7 +1149,7 @@ func loadCAFile(path string) (*x509.CertPool, error) {
 //   - the hardening of backendTLSConfig, verifying certificates when verify is set;
 //   - the roots: a member of a named pool is verified against its pool's remote_tls_ca_file
 //     (the system roots without one): a certificate belongs to the host, however routing
-//     reached it. Any other backend uses the server's remote_tls_ca_file (POP3) or the
+//     reached it. Any other backend uses the server's remote_tls_ca_file or the
 //     system roots;
 //   - the name: a pool or remote_addrs entry configured by hostname is dialed at an address
 //     the name resolved to, but the certificate is issued for the name. ServerName (SNI) is

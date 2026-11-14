@@ -20,6 +20,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
+	"golang.org/x/net/idna"
 )
 
 // ClientCapabilityFilter defines capability filtering rules for specific clients
@@ -300,7 +301,7 @@ type TLSLetsEncryptS3Config struct {
 // TLSLetsEncryptConfig holds Let's Encrypt automatic certificate management configuration
 type TLSLetsEncryptConfig struct {
 	Email           string                 `toml:"email"`            // Email for Let's Encrypt notifications
-	Domains         []string               `toml:"domains"`          // Domains for certificate (supports multiple)
+	Domains         []string               `toml:"domains"`          // Domains for certificate (supports multiple). Loaded as autocert names: lowercase A-labels without a trailing dot (normalizeDomains)
 	DefaultDomain   string                 `toml:"default_domain"`   // Default domain to use when client doesn't provide SNI (optional, defaults to first domain in list)
 	StorageProvider string                 `toml:"storage_provider"` // Certificate storage backend (currently only "s3")
 	S3              TLSLetsEncryptS3Config `toml:"s3"`               // S3 storage configuration
@@ -308,6 +309,50 @@ type TLSLetsEncryptConfig struct {
 	EnableFallback  *bool                  `toml:"enable_fallback"`  // Enable local filesystem fallback when S3 is unavailable (default: true). Pointer so an absent key is distinguishable from an explicit false.
 	FallbackDir     string                 `toml:"fallback_dir"`     // Local directory for certificate fallback when S3 is unavailable (default: "/var/lib/sora/certs")
 	SyncInterval    string                 `toml:"sync_interval"`    // Interval to check S3 for certificate updates (e.g., "5m"). Default: 5m. Set to "0" to disable periodic sync.
+}
+
+// normalizeDomains rewrites domains and default_domain to the names autocert keeps their
+// certificates under. The certificate sync and the startup pre-warm read the cache under
+// the configured names, so a name kept as written ("Mail.Example.com") had the leader's
+// renewals synced into a local file autocert never reads. A name autocert cannot serve is
+// dropped with a warning; autocert.HostWhitelist drops it silently.
+func (c *TLSLetsEncryptConfig) normalizeDomains() {
+	var domains []string
+	for _, configured := range c.Domains {
+		name, err := AutocertName(configured)
+		if err != nil {
+			warnf("[tls.letsencrypt] domains: ignoring %q, no certificate can be served for it: %v", configured, err)
+			continue
+		}
+		if !slices.Contains(domains, name) {
+			domains = append(domains, name)
+		}
+	}
+	c.Domains = domains
+
+	if c.DefaultDomain != "" {
+		name, err := AutocertName(c.DefaultDomain)
+		if err != nil {
+			warnf("[tls.letsencrypt] default_domain: ignoring %q, clients without SNI get the first domain's certificate: %v", c.DefaultDomain, err)
+		}
+		c.DefaultDomain = name
+	}
+}
+
+// AutocertName returns the name autocert keeps a domain's certificates under: the server
+// name folded by idna.Lookup.ToASCII (lowercase, A-label) without a trailing dot, as
+// autocert.Manager.GetCertificate derives it from a ClientHello. It fails for a name
+// GetCertificate refuses. sora-admin's tls commands name cache entries with it too.
+func AutocertName(domain string) (string, error) {
+	name, err := idna.Lookup.ToASCII(domain)
+	if err != nil {
+		return "", err
+	}
+	name = strings.TrimSuffix(name, ".")
+	if !strings.Contains(strings.Trim(name, "."), ".") {
+		return "", errors.New("server name component count invalid")
+	}
+	return name, nil
 }
 
 // TLSConfig holds TLS/SSL configuration
@@ -373,6 +418,17 @@ func (c *CleanupConfig) GetFTSRetention() (time.Duration, error) {
 		return 0, nil // 0 means keep vectors forever (default)
 	}
 	return helpers.ParseDuration(c.FTSRetention)
+}
+
+// Validate rejects a negative fts_retention. It parses, but delivery and import index only
+// mail sent after now minus the retention, which would then lie in the future, so no new
+// message would get a search row; and the cleaner prunes only for a positive retention. A
+// value that does not parse falls back to keeping every vector, like any other duration key.
+func (c *CleanupConfig) Validate() error {
+	if d, err := helpers.ParseDuration(c.FTSRetention); err == nil && d < 0 {
+		return fmt.Errorf("fts_retention must not be negative, got %q", c.FTSRetention)
+	}
+	return nil
 }
 
 // GetHealthStatusRetention parses the health status retention duration
@@ -1057,7 +1113,7 @@ type ServerLimitsConfig struct {
 	SearchRateLimitBurst  *int   `toml:"search_rate_limit_burst,omitempty"`   // Searches allowed back to back (default: search_rate_limit_per_min)
 	ThreadMaxMessages     int    `toml:"thread_max_messages,omitempty"`       // Maximum matches per THREAD command (IMAP backend only, <=0 uses default: 50000)
 	RedirectRateLimit     *int   `toml:"redirect_rate_limit,omitempty"`       // Redirect rate limit (per account across the window, 0=unlimited, default: 100)
-	RedirectRateWindow    string `toml:"redirect_rate_window,omitempty"`      // Redirect rate limit time window (default: 1h)
+	RedirectRateWindow    string `toml:"redirect_rate_window,omitempty"`      // Redirect rate limit time window (must be positive, default: 1h)
 	MaxRedirectHops       *int   `toml:"max_redirect_hops,omitempty"`         // Max times one message may be redirected before suppression (mail-loop backstop, 0=unlimited, default: 2)
 	SessionMemoryLimit    string `toml:"session_memory_limit,omitempty"`      // Per-session memory limit (default: 100mb, 0=unlimited)
 	MaxAuthErrors         int    `toml:"max_auth_errors,omitempty"`           // Maximum authentication errors before disconnection (default: 2)
@@ -1072,7 +1128,7 @@ type ServerTimeoutsConfig struct {
 	CommandTimeout             string                            `toml:"command_timeout,omitempty"`              // Maximum idle time before disconnection (default: protocol-specific)
 	AbsoluteSessionTimeout     string                            `toml:"absolute_session_timeout,omitempty"`     // Maximum total session duration (default: 24h)
 	MinBytesPerMinute          int64                             `toml:"min_bytes_per_minute,omitempty"`         // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
-	SchedulerShardCount        int                               `toml:"scheduler_shard_count,omitempty"`        // Number of timeout scheduler shards (default: 0 = runtime.NumCPU(), -1 = runtime.NumCPU()/2 for physical cores)
+	SchedulerShardCount        int                               `toml:"scheduler_shard_count,omitempty"`        // Not applied (warned about): the one timeout scheduler of the process is sized by [timeout_scheduler] shard_count
 	IMAPCommandTimeouts        *CommandTimeoutsConfig            `toml:"imap_command_timeouts,omitempty"`        // Per-command hard execution timeouts (IMAP only)
 	ManageSieveCommandTimeouts *ManageSieveCommandTimeoutsConfig `toml:"managesieve_command_timeouts,omitempty"` // Per-command hard execution timeouts (ManageSieve only)
 	POP3CommandTimeouts        *POP3CommandTimeoutsConfig        `toml:"pop3_command_timeouts,omitempty"`        // Per-command hard execution timeouts (POP3 only)
@@ -1871,6 +1927,11 @@ func (s *ServerConfig) defaultCommandTimeout() time.Duration {
 		return 30 * time.Minute
 	case "managesieve", "managesieve_proxy":
 		return 3 * time.Minute // 3 minutes for ManageSieve
+	case "lmtp":
+		// RFC 5321 §4.5.3.2.7: "An SMTP server SHOULD have a timeout of at least
+		// 5 minutes while it is awaiting the next command from the sender", and
+		// RFC 2033 §4 makes LMTP identical to SMTP except as it says.
+		return 5 * time.Minute
 	default:
 		return 2 * time.Minute // Default: 2 minutes
 	}
@@ -2468,6 +2529,16 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
+	// The Sieve redirect rate limit (LMTP and Admin API delivery) counts the redirects
+	// newer than now - redirect_rate_window. A zero or negative window counts none, so
+	// every redirect would be allowed; redirect_rate_limit = 0 is how the limit is
+	// switched off. An unparsable window falls back to the 1h default at startup.
+	if (s.Type == "lmtp" || s.Type == "http_admin_api") && s.Limits != nil && s.Limits.RedirectRateWindow != "" {
+		if window, err := helpers.ParseDuration(s.Limits.RedirectRateWindow); err == nil && window <= 0 {
+			return fmt.Errorf("server %q: limits.redirect_rate_window must be positive, got %q (set limits.redirect_rate_limit = 0 to disable the limit)", s.Name, s.Limits.RedirectRateWindow)
+		}
+	}
+
 	// A proxy dials a backend address without a port at its remote_port, or at its enabled
 	// lookup's remote_port for a lookup-routed one. No other server reads either, and a
 	// disabled lookup is never initialized.
@@ -2539,11 +2610,17 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	if s.TLSVerify && !s.TLS {
 		logger("WARNING: Server %s (type: %s) has 'tls_verify' configured without 'tls = true'; it is ignored and no client certificate is required", s.Name, s.Type)
 	}
+	if s.Timeouts != nil && s.Timeouts.SchedulerShardCount != 0 {
+		logger("WARNING: Server %s (type: %s) has 'timeouts.scheduler_shard_count' configured, but it has no effect: all servers share one timeout scheduler, sized by [timeout_scheduler] shard_count", s.Name, s.Type)
+	}
 
 	// Check proxy-only options on non-proxy servers
 	if !strings.HasSuffix(s.Type, "_proxy") {
 		if len(s.RemoteAddrs) > 0 {
 			logger("WARNING: Server %s (type: %s) has 'remote_addrs' configured, but this only applies to proxy servers", s.Name, s.Type)
+		}
+		if s.RemoteTLSCAFile != "" {
+			logger("WARNING: Server %s (type: %s) has 'remote_tls_ca_file' configured, but this only applies to proxy servers", s.Name, s.Type)
 		}
 		if s.RemoteTLS {
 			logger("WARNING: Server %s (type: %s) has 'remote_tls' configured, but this only applies to proxy servers", s.Name, s.Type)
@@ -2578,7 +2655,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	case "imap":
 		// IMAP server
 		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 		if s.RemoteUseIDCommand {
 			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
@@ -2587,25 +2664,39 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	case "lmtp":
 		// LMTP server
 		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 		if s.RemoteUseXCLIENT {
 			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
 		}
+		// Its only timeout setting is timeouts.command_timeout (the idle timeout).
+		s.warnKeysNotApplied(logger, "the LMTP server does not apply it",
+			configKey{"timeouts.absolute_session_timeout", s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != ""},
+			configKey{"timeouts.min_bytes_per_minute", s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0},
+			configKey{"auth_idle_timeout", s.AuthIdleTimeout != ""},
+			configKey{"limits.session_memory_limit", s.Limits != nil && s.Limits.SessionMemoryLimit != ""})
+		// MTAs deliver many messages at once from few addresses.
+		s.warnKeysNotApplied(logger, "the LMTP server limits only its total connections (max_connections)",
+			configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
+			configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+			configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 
 	case "pop3":
 		// POP3 server
 		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 
 	case "managesieve":
-		// ManageSieve server - no proxy-specific warnings needed (handled above)
+		// ManageSieve server
+		if len(s.SupportedExtensions) > 0 {
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but a ManageSieve server offers the [sieve] enabled_extensions; this only applies to ManageSieve proxy servers", s.Name, s.Type)
+		}
 
 	case "imap_proxy":
 		// IMAP proxy
 		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers/proxies", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 		if s.MaxScriptSize != "" {
 			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
@@ -2617,7 +2708,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	case "pop3_proxy":
 		// POP3 proxy
 		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers/proxies", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 		if s.MaxScriptSize != "" {
 			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
@@ -2632,7 +2723,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	case "lmtp_proxy":
 		// LMTP proxy
 		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers/proxies", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 		if s.MaxScriptSize != "" {
 			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
@@ -2640,6 +2731,16 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		if s.RemoteUseIDCommand {
 			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
 		}
+		// Its timeouts are auth_idle_timeout and timeouts.absolute_session_timeout.
+		s.warnKeysNotApplied(logger, "the LMTP proxy does not apply it",
+			configKey{"timeouts.command_timeout", s.Timeouts != nil && s.Timeouts.CommandTimeout != ""},
+			configKey{"timeouts.min_bytes_per_minute", s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0})
+		// MTAs deliver many messages at once from few addresses, and an LMTP client
+		// does not log in as a user.
+		s.warnKeysNotApplied(logger, "the LMTP proxy limits only its total connections (max_connections)",
+			configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
+			configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+			configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 
 	case "managesieve_proxy":
 		// ManageSieve proxy
@@ -2656,7 +2757,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	case "metrics", "http_admin_api", "http_user_api":
 		// HTTP servers - warn about protocol-specific options
 		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 		if s.MaxScriptSize != "" {
 			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
@@ -2669,6 +2770,22 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		}
 		if s.Type == "metrics" && s.ProxyProtocol {
 			logger("WARNING: Server %s (type: metrics) has 'proxy_protocol' configured, but the metrics endpoint does not read PROXY protocol headers; it is ignored, and 'allowed_hosts' matches the connecting host", s.Name)
+		}
+	}
+}
+
+// configKey is a server setting by its TOML key, and whether the block sets it.
+type configKey struct {
+	name string
+	set  bool
+}
+
+// warnKeysNotApplied warns about each of keys the block sets, which its server type
+// accepts but does not apply, for reason.
+func (s *ServerConfig) warnKeysNotApplied(logger func(format string, args ...any), reason string, keys ...configKey) {
+	for _, k := range keys {
+		if k.set {
+			logger("WARNING: Server %s (type: %s) has '%s' configured, but %s", s.Name, s.Type, k.name, reason)
 		}
 	}
 }
@@ -2761,6 +2878,35 @@ func LoadConfigFromFile(configPath string, cfg *Config) error {
 	return err
 }
 
+// LoadServerConfig loads the file at configPath into cfg as the server runs with it. cfg
+// starts from NewDefaultConfig, so a setting the file leaves out takes the server's
+// default, not the zero value. sora-admin loads its file with it too: it works on the
+// same spool, cache and database, and an unset [uploader] path read as "" made `uploader
+// resolve` look for staged bodies in its working directory.
+//
+// A [database.write] or [database.read] endpoint the file does not define is unset, so a
+// node without one (a proxy) runs without that database. NewDefaultConfig seeds both only
+// so that a table in the file takes the defaults for the keys it leaves out. Whether a
+// table is in the file is read from the TOML metadata, never from its values: a table
+// that names localhost, postgres and sora_mail_db is a database the node must use.
+//
+// A file that does not exist leaves cfg at those defaults, without database endpoints,
+// and returns the error from os.ReadFile.
+func LoadServerConfig(configPath string, cfg *Config) error {
+	*cfg = NewDefaultConfig()
+	md, err := LoadConfigFromFileWithMetadata(configPath, cfg)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if !md.IsDefined("database", "write") {
+		cfg.Database.Write = nil
+	}
+	if !md.IsDefined("database", "read") {
+		cfg.Database.Read = nil
+	}
+	return err
+}
+
 // LoadConfigFromFileWithMetadata is LoadConfigFromFile that also returns the file's TOML
 // metadata. cfg is usually seeded by NewDefaultConfig, so after the load a value equal to
 // its default may be the default or may be set by the file; MetaData.IsDefined tells them
@@ -2812,6 +2958,23 @@ func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaDa
 
 	// Trim whitespace from all string fields in the configuration
 	trimStringFields(reflect.ValueOf(cfg).Elem())
+
+	if cfg.TLS.LetsEncrypt != nil {
+		cfg.TLS.LetsEncrypt.normalizeDomains()
+		for i := range cfg.DynamicServers {
+			srv := &cfg.DynamicServers[i]
+			if srv.TLSDefaultDomain == "" {
+				continue
+			}
+			name, err := AutocertName(srv.TLSDefaultDomain)
+			if err != nil {
+				warnf("server %q: ignoring tls_default_domain %q, clients without SNI use the global default: %v", srv.Name, srv.TLSDefaultDomain, err)
+			}
+			// The per-listener SNI-less override reaches the same whitelist as
+			// default_domain, before autocert can normalize it itself.
+			srv.TLSDefaultDomain = name
+		}
+	}
 
 	// Apply default values for fields where the Go zero value differs from the desired default
 	applyConfigDefaults(cfg)

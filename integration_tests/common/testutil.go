@@ -25,7 +25,6 @@ import (
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
-	"github.com/migadu/sora/pkg/spamtraining"
 	soraserver "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/imap"
 	"github.com/migadu/sora/server/lmtp"
@@ -190,15 +189,9 @@ type TestAccount struct {
 
 // IMAPServerOpts contains optional configuration for IMAP server setup
 type IMAPServerOpts struct {
-	SpamTrainingEnabled           bool
-	SpamTrainingEndpoint          string
-	SpamTrainingToken             string
-	SpamTrainingCircuitThreshold  int
-	SpamTrainingCircuitTimeout    string
-	SpamTrainingCircuitMaxRequest int
-	SearchRateLimitPerMin         int
-	SearchRateLimitWindow         time.Duration
-	SearchRateLimitBurst          int
+	SearchRateLimitPerMin int
+	SearchRateLimitWindow time.Duration
+	SearchRateLimitBurst  int
 	// SharedMailboxes replaces the default shared mailbox settings (enabled, users
 	// may create shared mailboxes and grant "anyone").
 	SharedMailboxes   *config.SharedMailboxesConfig
@@ -815,7 +808,7 @@ func SetupIMAPServerForUploadRaceWithS3(t *testing.T, s3Storage *storage.S3Stora
 	}, account
 }
 
-// SetupIMAPServerWithOptions creates an IMAP server with custom options (e.g., spam training)
+// SetupIMAPServerWithOptions creates an IMAP server with custom options (e.g., search rate limits)
 func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer, TestAccount) {
 	t.Helper()
 	if opts == nil {
@@ -868,41 +861,6 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 		testConfig.SharedMailboxes = *opts.SharedMailboxes
 	}
 
-	// Configure spam training if enabled
-	var spamTrainingClient *spamtraining.Client
-	if opts != nil && opts.SpamTrainingEnabled {
-		cfg := &config.SpamTrainingConfig{
-			Enabled:           true,
-			Endpoint:          opts.SpamTrainingEndpoint,
-			AuthToken:         opts.SpamTrainingToken,
-			Timeout:           "10s",
-			MaxMessageSize:    "10mb",
-			MaxAttachmentSize: "5mb",
-			Async:             true,
-			CircuitBreaker: config.SpamTrainingCircuitBreakerConfig{
-				Threshold:   opts.SpamTrainingCircuitThreshold,
-				Timeout:     opts.SpamTrainingCircuitTimeout,
-				MaxRequests: opts.SpamTrainingCircuitMaxRequest,
-			},
-		}
-
-		// Set defaults if not specified
-		if cfg.CircuitBreaker.Threshold == 0 {
-			cfg.CircuitBreaker.Threshold = 5
-		}
-		if cfg.CircuitBreaker.Timeout == "" {
-			cfg.CircuitBreaker.Timeout = "30s"
-		}
-		if cfg.CircuitBreaker.MaxRequests == 0 {
-			cfg.CircuitBreaker.MaxRequests = 3
-		}
-
-		spamTrainingClient, err = spamtraining.NewClient(cfg)
-		if err != nil {
-			t.Fatalf("Failed to create spam training client: %v", err)
-		}
-	}
-
 	server, err := imap.New(
 		context.Background(),
 		"test",
@@ -915,7 +873,6 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 		imap.IMAPServerOptions{
 			InsecureAuth:          true, // Allow PLAIN auth (no TLS in tests)
 			Config:                testConfig,
-			SpamTraining:          spamTrainingClient,
 			SearchRateLimitPerMin: opts.SearchRateLimitPerMin,
 			SearchRateLimitWindow: opts.SearchRateLimitWindow,
 			SearchRateLimitBurst:  opts.SearchRateLimitBurst,
@@ -946,9 +903,6 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 			}
 		case <-time.After(1 * time.Second):
 			// Timeout waiting for server to shut down
-		}
-		if spamTrainingClient != nil {
-			spamTrainingClient.Close() // stops its worker goroutines
 		}
 		// Clean up temporary directory
 		os.RemoveAll(tempDir)

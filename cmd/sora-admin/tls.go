@@ -16,10 +16,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/storage"
 	"github.com/migadu/sora/tlsmanager"
-	"golang.org/x/net/idna"
 )
 
 func handleTLSCommand(ctx context.Context) {
@@ -61,7 +61,8 @@ Usage:
   sora-admin tls list [options]
 
 Options:
-  --cache-dir string    Local autocert cache directory (default: /var/cache/sora/autocert)
+  --cache-dir string    Local autocert cache directory (default: [tls.letsencrypt] fallback_dir,
+                        else /var/lib/sora/certs)
   --details             Show detailed certificate information (expiry, type, etc.)
   --json                Output in JSON format
   --config string       Path to TOML configuration file (required)
@@ -460,23 +461,14 @@ func tryDecodeDomain(s3Key string) string {
 	return hash[:16] + "..." // Show first 16 chars of hash
 }
 
-// autocertName returns the name autocert caches a domain's certificates under: the
-// server name folded by idna.Lookup.ToASCII (lowercase, Punycode) without a trailing
-// dot, as autocert.Manager.GetCertificate derives it from the TLS ClientHello.
+// autocertName returns the name autocert caches a domain's certificates under, as the
+// server loads its configured domains (config.AutocertName). It refuses names such as
+// "." or "..", which must never name the cache directory.
 func autocertName(domain string) (string, error) {
 	domain = strings.TrimSpace(domain)
-	// Match autocert.Manager.GetCertificate's component check as well as its
-	// normalization. In particular, "." or ".." must never name the cache directory.
-	if !strings.Contains(strings.Trim(domain, "."), ".") {
-		return "", fmt.Errorf("invalid domain %q: server name component count invalid", domain)
-	}
-	name, err := idna.Lookup.ToASCII(domain)
+	name, err := config.AutocertName(domain)
 	if err != nil {
 		return "", fmt.Errorf("invalid domain %q: %w", domain, err)
-	}
-	name = strings.TrimSuffix(name, ".")
-	if name == "" {
-		return "", fmt.Errorf("invalid domain %q", domain)
 	}
 	return name, nil
 }

@@ -3,11 +3,9 @@ package pop3proxy
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -255,6 +253,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		RemoteAddrs:        options.RemoteAddrs,
 		RemotePort:         options.RemotePort,
 		Settings:           proxy.BackendSettings{TLS: options.RemoteTLS, TLSUseStartTLS: options.RemoteTLSUseStartTLS, TLSVerify: options.RemoteTLSVerify, UseProxyProtocol: options.RemoteUseProxyProtocol},
+		RemoteTLSCAFile:    options.RemoteTLSCAFile,
 		ConnectTimeout:     connectTimeout,
 		RoutingLookup:      routingLookup,
 		ServerName:         options.Name,
@@ -275,29 +274,6 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// up without a restart; remote_dns_refresh tunes or disables that.
 	if options.RemoteDNSRefresh != nil {
 		connManager.SetResolveRefreshInterval(*options.RemoteDNSRefresh)
-	}
-
-	// Custom CA for backend certificate verification (private-CA or
-	// self-signed backends): keeps remote_tls_verify usable instead of
-	// forcing it off.
-	if options.RemoteTLSCAFile != "" {
-		pem, err := os.ReadFile(options.RemoteTLSCAFile)
-		if err != nil {
-			if routingLookup != nil {
-				routingLookup.Close()
-			}
-			serverCancel()
-			return nil, fmt.Errorf("failed to read remote_tls_ca_file: %w", err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			if routingLookup != nil {
-				routingLookup.Close()
-			}
-			serverCancel()
-			return nil, fmt.Errorf("remote_tls_ca_file %q contains no usable certificates", options.RemoteTLSCAFile)
-		}
-		connManager.SetRemoteTLSRootCAs(pool)
 	}
 
 	// Resolve addresses to expand hostnames to IPs
@@ -499,7 +475,7 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 			var releaseConn func()
 			var err error
 			if s.limiter != nil {
-				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), "")
+				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), server.GetRealClientIP(netConn, proxyInfo))
 				if err != nil {
 					// DELIBERATE silent close, no banner: matches the previous
 					// accept-loop rejection (drop before any greeting), and an
@@ -883,16 +859,23 @@ func (s *POP3ProxyServer) ReloadConfig(cfg config.ServerConfig) error {
 		reloaded = append(reloaded, "max_auth_errors")
 	}
 
-	// Update timeouts (affect new connections only)
-	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != next.authIdleTimeout {
+	// Update timeouts (affect new connections only). A value that does not parse
+	// keeps the running one (start-up, which has none, uses the default).
+	if timeout, err := cfg.GetAuthIdleTimeout(); err != nil {
+		logger.Warn("POP3 proxy config reload: invalid auth_idle_timeout, keeping the running value", "name", s.name, "error", err, "running", next.authIdleTimeout)
+	} else if timeout != next.authIdleTimeout {
 		next.authIdleTimeout = timeout
 		reloaded = append(reloaded, "auth_idle_timeout")
 	}
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("POP3 proxy config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.commandTimeout)
+	} else if timeout != next.commandTimeout {
 		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("POP3 proxy config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
