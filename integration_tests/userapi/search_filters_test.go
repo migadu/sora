@@ -4,10 +4,12 @@ package userapi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -155,6 +157,41 @@ func TestUserAPI_SearchRejectsMalformedFilters(t *testing.T) {
 		resp.Body.Close()
 		if resp.StatusCode != tt.want {
 			t.Errorf("search %s: status %d, want %d", tt.query, resp.StatusCode, tt.want)
+		}
+	}
+}
+
+// TestUserAPI_SearchRejectsMalformedQuery: q is bound as PostgreSQL text, in the header
+// substring tests and in plainto_tsquery, which refuses a NUL and bytes that are not UTF-8
+// (SQLSTATE 22021). Such a q is the client's malformed input, as the filters above are, so
+// it is a 400 naming q and never reaches the database; it once answered 500 (#859).
+func TestUserAPI_SearchRejectsMalformedQuery(t *testing.T) {
+	h := newBodyStateHarness(t)
+	for _, tt := range []struct {
+		query string
+		want  int
+	}{
+		{"q=%00", http.StatusBadRequest},
+		{"q=report%00draft", http.StatusBadRequest},
+		{"q=%FF", http.StatusBadRequest},
+		{"q=caf%C3", http.StatusBadRequest}, // truncated two-byte sequence
+		{"q=%C3%A9t%C3%A9", http.StatusOK},
+	} {
+		resp := h.tc.makeRequest(t, "GET", "/user/mailboxes/INBOX/search?"+tt.query, nil)
+		var body struct {
+			Error string `json:"error"`
+		}
+		err := json.NewDecoder(resp.Body).Decode(&body)
+		resp.Body.Close()
+		if resp.StatusCode != tt.want {
+			t.Errorf("search %s: status %d (%q), want %d", tt.query, resp.StatusCode, body.Error, tt.want)
+			continue
+		}
+		if err != nil {
+			t.Errorf("search %s: decode body: %v", tt.query, err)
+		}
+		if tt.want == http.StatusBadRequest && !strings.Contains(body.Error, "'q'") {
+			t.Errorf("search %s: error %q does not name q", tt.query, body.Error)
 		}
 	}
 }

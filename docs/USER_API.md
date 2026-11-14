@@ -557,7 +557,7 @@ its results, and all supplied filters must match:
 | `subject` | Literal substring of the subject, ignoring case. |
 | `unseen=true` | Only messages without `\\Seen`, including messages with no stored flags. |
 
-The text filters have no wildcard syntax. A `from` or `subject` containing a NUL or
+The text filters have no wildcard syntax. A `q`, `from` or `subject` containing a NUL or
 invalid UTF-8 is refused with `400 Bad Request`.
 
 Response `200`:
@@ -582,7 +582,7 @@ Response `200`:
 
 | Status | Body `error` |
 |---|---|
-| 400 | `Invalid mailbox name`, `Search query parameter 'q' is required` |
+| 400 | `Invalid mailbox name`, `Search query parameter 'q' is required`, `Search query parameter 'q' must be UTF-8 text without NUL`, `Search filters 'from' and 'subject' must be UTF-8 text without NUL` |
 | 404 | `Mailbox not found` (also a shared mailbox without `r`) |
 | 500 | `Failed to search messages` |
 
