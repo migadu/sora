@@ -169,6 +169,7 @@ func verifyS3Storage(ctx context.Context, cfg AdminConfig, email string, showMis
 		!cfg.S3.DisableTLS, // useSSL = !DisableTLS
 		false,              // no debug
 		s3Timeout,          // timeout
+		storage.WithRegion(cfg.S3.Region),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize S3 storage: %w", err)
@@ -672,6 +673,7 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 		!cfg.S3.DisableTLS,
 		false,
 		s3Timeout,
+		storage.WithRegion(cfg.S3.Region),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize S3 storage: %w", err)

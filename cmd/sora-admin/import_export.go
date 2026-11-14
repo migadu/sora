@@ -211,7 +211,7 @@ Examples:
 		if err != nil {
 			logger.Fatalf("Failed to parse S3 timeout: %v", err)
 		}
-		s3, err = storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout)
+		s3, err = storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout, storage.WithRegion(globalConfig.S3.Region))
 		if err != nil {
 			logger.Fatalf("Failed to connect to S3: %v", err)
 		}
@@ -301,7 +301,7 @@ func handleImportS3(ctx context.Context) {
 	if err != nil {
 		logger.Fatalf("Failed to parse S3 timeout: %v", err)
 	}
-	s3, err := storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout)
+	s3, err := storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout, storage.WithRegion(globalConfig.S3.Region))
 	if err != nil {
 		logger.Fatalf("Failed to connect to S3: %v", err)
 	}
@@ -479,7 +479,7 @@ Examples:
 	if err != nil {
 		logger.Fatalf("Failed to parse S3 timeout: %v", err)
 	}
-	s3, err := storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout)
+	s3, err := storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout, storage.WithRegion(globalConfig.S3.Region))
 	if err != nil {
 		logger.Fatalf("Failed to connect to S3: %v", err)
 	}
