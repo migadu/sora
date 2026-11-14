@@ -124,7 +124,8 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	if err := fullCfg.SharedMailboxes.Validate(); err != nil {
 		return fmt.Errorf("[shared_mailboxes]: %w", err)
 	}
-	// Imports index mail by [cleanup] fts_retention, as delivery does.
+	// Imports index mail by [cleanup] fts_retention, as delivery does. The server refuses
+	// the other [cleanup] values Validate rejects too.
 	if err := fullCfg.Cleanup.Validate(); err != nil {
 		return fmt.Errorf("[cleanup]: %w", err)
 	}
