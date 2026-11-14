@@ -2886,14 +2886,12 @@ type Problem struct {
 	Err     error
 }
 
-// Validate runs every check of the whole file that stops sora at start-up, and returns
-// all the problems it finds, none for a file the server starts with. sora runs it before
-// it starts anything and `sora-admin config validate` runs it too, so the command cannot
-// pass a file the server refuses or refuse one the server starts with.
+// Validate runs the shared configuration checks used by sora before service setup and
+// by `sora-admin config validate`, returning every problem these checks find.
 //
 // What a node does not run is not checked: [uploader] and [cleanup] only with a mail
-// backend. Start-up checks the rest as it sets up the services: that the database and S3
-// its servers need are configured, and what is on the node's disk.
+// backend. Service setup still checks required database and S3 settings, S3 timeout,
+// external connectivity and the node's disk; passing Validate does not check those.
 func (c *Config) Validate() []Problem {
 	var problems []Problem
 	add := func(section string, err error) {

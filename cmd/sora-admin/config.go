@@ -101,7 +101,7 @@ func handleConfigValidate(_ context.Context) {
 		os.Exit(1)
 	}
 
-	// The same checks the server runs before it starts anything.
+	// The shared checks the server runs before service setup.
 	problems := cfg.Validate()
 	for _, p := range problems {
 		fmt.Printf("[FAIL] %s:\n   %v\n", p.Section, p.Err)
@@ -223,10 +223,13 @@ Description:
   - Detecting duplicate keys (warns and uses first occurrence)
   - Detecting unknown/deprecated keys (warns)
   - Detecting common typos (e.g., 'f' instead of 'false')
-  - Running the checks the server makes before it starts: the [[server]]
+  - Running the shared checks the server makes before service setup: the [[server]]
     blocks (at least one; no duplicate names or addresses), [[pool]], [relay],
     trusted_networks, [shared_mailboxes], and [uploader] and [cleanup] when a
     mail backend (imap, lmtp, pop3) runs. Every problem is reported.
+
+  This does not check required database/S3 settings, S3 timeout, connectivity,
+  or the node's disk. Those are still checked when services start.
 
   Exit codes:
     0 - Configuration is valid (warnings OK)
