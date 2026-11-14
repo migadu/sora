@@ -169,6 +169,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 	// First, safely read necessary session state and decode the sequence numbers all within a single read lock
 	var selectedMailboxID int64
 	var selectedMailboxOwnerID int64
+	var selectedExamined bool
 	var sessionTrackerSnapshot *imapserver.SessionTracker
 	var decodedNumSet imap.NumSet
 
@@ -198,6 +199,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 
 	selectedMailboxID = s.selectedMailbox.ID
 	selectedMailboxOwnerID = s.selectedMailbox.AccountID
+	selectedExamined = s.selectedExamined.Load()
 	sessionTrackerSnapshot = s.sessionTracker
 
 	// Capture modseq before unlocking
@@ -263,9 +265,14 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 	}
 
 	// Determine if this FETCH implicitly marks messages as \Seen: any BODY[] or
-	// BINARY[] that is not the .PEEK form (RFC 9051 §6.4.5).
-	markSeen := slices.ContainsFunc(options.BodySection, func(bs *imap.FetchItemBodySection) bool { return !bs.Peek }) ||
-		slices.ContainsFunc(options.BinarySection, func(bs *imap.FetchItemBinarySection) bool { return !bs.Peek })
+	// BINARY[] that is not the .PEEK form (RFC 9051 §6.4.5). Not in a mailbox
+	// opened with EXAMINE, where "No changes to the permanent state of the
+	// mailbox, including per-user state, are permitted" (RFC 9051 §6.3.3). A
+	// SELECT that the ACL made read-only is not EXAMINE (RFC 9051 §6.3.2); the
+	// 's' right below decides there.
+	markSeen := !selectedExamined &&
+		(slices.ContainsFunc(options.BodySection, func(bs *imap.FetchItemBodySection) bool { return !bs.Peek }) ||
+			slices.ContainsFunc(options.BinarySection, func(bs *imap.FetchItemBinarySection) bool { return !bs.Peek }))
 
 	// RFC 4314 §5.1.1: a FETCH that would implicitly set \Seen MUST NOT do so when the
 	// user lacks the 's' right on the mailbox. The owner always holds every right, so
