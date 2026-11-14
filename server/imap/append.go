@@ -23,6 +23,8 @@ import (
 
 // errAppendLiteralTooLarge marks an APPEND refused because the literal does not fit the
 // session memory budget. Distinct from a network read failure: the literal is never read.
+// A literal larger than the whole budget never gets here (AppendLimit, NO [TOOBIG]), so
+// this is one the budget can take once the memory the session holds is freed.
 var errAppendLiteralTooLarge = errors.New("append literal exceeds the session memory budget")
 
 // readAppendLiteral reads the APPEND literal into memory. It returns the bytes read

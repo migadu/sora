@@ -83,7 +83,7 @@ func poolTransferDNS(t *testing.T) *atomic.Bool {
 
 type poolTransferLookup struct{ scriptedLookup }
 
-func (*poolTransferLookup) LookupUserRouteWithOptions(_ context.Context, email, _ string, _ bool) (*proxy.UserRoutingInfo, proxy.AuthResult, error) {
+func (*poolTransferLookup) LookupUserRouteWithClientIP(_ context.Context, email, _, _ string, _ bool) (*proxy.UserRoutingInfo, proxy.AuthResult, error) {
 	pool := "a"
 	if strings.HasPrefix(email, "b@") {
 		pool = "b"

@@ -89,6 +89,22 @@ func TestServerReloadSaysNothingWhenEverythingChangedWasApplied(t *testing.T) {
 	}
 }
 
+// A block that lost its addr in an edit is invalid: the reload says so, instead of
+// passing over the block in silence, and the server keeps the config it has.
+func TestServerReloadRejectsBlockWithoutAddr(t *testing.T) {
+	logs := captureReloadLogs(t)
+	deps, reloaders := runningDeps(t, config.ServerConfig{Type: "pop3", Name: "pop3", Addr: ":110"})
+
+	deps.reloadServers(reloadedConfig(config.ServerConfig{Type: "pop3", Name: "pop3"}))
+
+	if got := reloaders["pop3"].reloaded; len(got) != 0 {
+		t.Fatalf("ReloadConfig got %+v, want no call", got)
+	}
+	if out := logs.String(); !hasLineWith(out, "Skipping reload", "server=pop3", "server address is required") {
+		t.Errorf("no error naming pop3 and its missing addr:\n%s", out)
+	}
+}
+
 // Every setting in the table is one RestartRequiredChanges can name (a table name such
 // as "timeouts" would match nothing and so silence nothing), under a real server type.
 func TestReloadableServerSettingsAreRealKeys(t *testing.T) {

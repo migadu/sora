@@ -3,6 +3,7 @@ package resilient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/retry"
+	"github.com/migadu/sora/server"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -17,8 +19,22 @@ var (
 	ErrInvalidCredentials = errors.New("invalid credentials")
 )
 
+// credentialLookupError classifies a failed credential lookup. consts.ErrUserNotFound
+// is a verdict on the login and is returned as is. Any other error (the database is
+// down or too slow, the circuit breaker is open, the login's context ended) says
+// nothing about the credentials, so it is wrapped in server.ErrAuthServiceUnavailable:
+// the login is answered as a temporary failure and not counted as a failed one.
+func credentialLookupError(err error) error {
+	if errors.Is(err, consts.ErrUserNotFound) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", server.ErrAuthServiceUnavailable, err)
+}
+
 // GetCredentialForAuthWithRetry retrieves credentials for authentication with retry logic.
 // Used by backend servers (IMAP, POP3, ManageSieve) which have direct database access.
+// A failed lookup returns consts.ErrUserNotFound or an error wrapping
+// server.ErrAuthServiceUnavailable (see credentialLookupError).
 func (rd *ResilientDatabase) GetCredentialForAuthWithRetry(ctx context.Context, address string) (accountID int64, hashedPassword string, err error) {
 	config := retry.BackoffConfig{
 		InitialInterval: 250 * time.Millisecond,
@@ -44,7 +60,7 @@ func (rd *ResilientDatabase) GetCredentialForAuthWithRetry(ctx context.Context, 
 
 	result, err := rd.executeReadWithRetry(ctx, config, timeoutAuth, op, consts.ErrUserNotFound)
 	if err != nil {
-		return 0, "", err
+		return 0, "", credentialLookupError(err)
 	}
 
 	cred := result.(credResult)
@@ -137,7 +153,9 @@ func (rd *ResilientDatabase) GetCredentialForTokenWithRetry(ctx context.Context,
 // AUTH RATE LIMITING: This method does not perform any rate limiting. Rate
 // limiting is handled by the proxy server layer (authLimiter) which records
 // success/failure AFTER this method returns. The auth cache is transparent
-// to the rate limiter.
+// to the rate limiter. An error wrapping server.ErrAuthServiceUnavailable means
+// the database could not be asked (see credentialLookupError): it is not a
+// failed login and must not be recorded as one.
 //
 // AUTH CACHE BEHAVIOR (when enabled via SetAuthCache):
 //  1. Check the local SQLite cache first (~0.1ms)
@@ -210,7 +228,7 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 			db.DummyVerifyPassword(password)
 		}
 		// NOTE: No logging here - let the calling server log with proper context
-		return 0, err // Return error from fetching credentials
+		return 0, credentialLookupError(err)
 	}
 
 	cred := result.(credResult)

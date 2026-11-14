@@ -4,6 +4,7 @@ package resilient_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/migadu/sora/consts"
@@ -48,4 +49,40 @@ func TestGetOrCreateMailboxByNameWithRetry_Hierarchical(t *testing.T) {
 	// Ensure the child path properly inherits from parent A/B
 	// Since path is hex encoded, we can fetch it. It should be 48 chars long (16 * 3 levels).
 	assert.Equal(t, 48, len(childC.Path), "Path should be 48 chars (3 levels of nesting)")
+}
+
+// TestGetOrCreateMailboxByNameWithRetry_HierarchyLevels is issue #457. The
+// get-or-create behind Sieve fileinto :create, the Admin API and the importer names
+// a mailbox as IMAP CREATE does: a trailing delimiter is no part of the name (RFC
+// 3501 §6.3.3: "the name created is without the trailing hierarchy delimiter"),
+// and a name with an empty, "." or ".." level is refused with
+// ErrMailboxInvalidName before anything is created, so no mailbox with an empty
+// level ("x/", "") ever appears.
+func TestGetOrCreateMailboxByNameWithRetry_HierarchyLevels(t *testing.T) {
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	ctx := context.Background()
+
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, account.Email)
+	require.NoError(t, err)
+
+	trailing, err := rdb.GetOrCreateMailboxByNameWithRetry(ctx, accountID, "Foo/")
+	require.NoError(t, err)
+	assert.Equal(t, "Foo", trailing.Name)
+	plain, err := rdb.GetOrCreateMailboxByNameWithRetry(ctx, accountID, "Foo")
+	require.NoError(t, err)
+	assert.Equal(t, trailing.ID, plain.ID, `"Foo/" and "Foo" must name one mailbox`)
+
+	for _, name := range []string{"x//y", "/lead", "/", "", "a/../b", "a/./b", ".."} {
+		_, err := rdb.GetOrCreateMailboxByNameWithRetry(ctx, accountID, name)
+		assert.ErrorIs(t, err, consts.ErrMailboxInvalidName, "name %q", name)
+	}
+
+	mailboxes, err := rdb.GetMailboxesWithRetry(ctx, accountID, false)
+	require.NoError(t, err)
+	for _, mb := range mailboxes {
+		assert.False(t, mb.Name == "" || strings.HasPrefix(mb.Name, "/") || strings.HasSuffix(mb.Name, "/") ||
+			strings.Contains(mb.Name, "//"), "mailbox %q has an empty hierarchy level", mb.Name)
+		assert.NotContains(t, []string{"x", "a"}, mb.Name, "a refused name created its parent %q", mb.Name)
+	}
 }

@@ -5,10 +5,18 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 )
+
+// RemoteLookupUsesClientIP reports whether lookup results can depend on the client's
+// network. The proxy lookup caches are keyed by user, so these lookups must bypass
+// both authentication and route caches rather than reuse another network's verdict.
+func RemoteLookupUsesClientIP(cfg *config.RemoteLookupConfig) bool {
+	return cfg != nil && cfg.Enabled && strings.Contains(cfg.URL, "$ip")
+}
 
 // validateRemoteLookupURL requires https:// for non-loopback hosts. A plaintext
 // remote-lookup endpoint exposes the user's password and the returned password hash
@@ -51,6 +59,9 @@ var implicitTLSBackendPorts = map[string]int{
 func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig, serverRemotePort int) (UserRoutingLookup, error) {
 	if cfg == nil || !cfg.Enabled {
 		return nil, nil
+	}
+	if RemoteLookupUsesClientIP(cfg) {
+		logger.Info("RemoteLookup: Bypassing user-keyed lookup cache because URL uses $ip", "protocol", protocol)
 	}
 
 	if cfg.URL == "" {

@@ -139,8 +139,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
 			return
 		}
+		// The database could not be asked: a temporary failure, not counted as a
+		// failed login.
 		logger.Warn("HTTP Mail API: Error retrieving credentials", "name", s.name, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "Authentication failed")
+		s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
 		return
 	}
 

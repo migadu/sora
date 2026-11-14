@@ -45,6 +45,26 @@ func MailboxNameHasTraversal(name string) bool {
 	return false
 }
 
+// MailboxNameToCreate returns the name of the mailbox that creating name makes, or
+// consts.ErrMailboxInvalidName when it makes none. Trailing hierarchy delimiters are
+// dropped, as IMAP CREATE drops them: "the name created is without the trailing
+// hierarchy delimiter" (RFC 3501 §6.3.3). Every level left must be non-empty and
+// neither "." nor ".." (MailboxNameHasTraversal), so "x//y" or "/y" is refused
+// instead of creating a parent "x/" or "" on the way.
+func MailboxNameToCreate(name string) (string, error) {
+	delim := string(consts.MailboxDelimiter)
+	name = strings.TrimRight(name, delim)
+	if name == "" {
+		return "", consts.ErrMailboxInvalidName
+	}
+	for _, level := range strings.Split(name, delim) {
+		if level == "" || level == "." || level == ".." {
+			return "", consts.ErrMailboxInvalidName
+		}
+	}
+	return name, nil
+}
+
 // MailboxNameIsBelow reports whether name is a descendant of ancestor in the
 // mailbox hierarchy. Mailbox names are case-insensitive.
 func MailboxNameIsBelow(name, ancestor string) bool {
