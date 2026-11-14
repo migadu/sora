@@ -480,8 +480,10 @@ sync_failure_counts = true                      # Synchronize progressive delay 
 # When enabled, users are consistently routed to the same backend server across all proxy nodes
 # for better cache locality and connection reuse. Affinity automatically updates when backends fail.
 # NOTE: Affinity is ONLY for non-remote_lookup users. RemoteLookup routes are always authoritative.
+# The proxies' enable_affinity uses this affinity: with enabled = false no proxy on the node
+# keeps affinity, and users are routed by consistent hash.
 [cluster.affinity]
-enabled = false                                 # Enable cluster-wide server affinity (default: false)
+enabled = true                                  # Enable cluster-wide server affinity (default: true)
 ttl = "24h"                                     # How long affinity persists (default: "24h")
 cleanup_interval = "1h"                         # How often to clean up expired affinities (default: "1h")
 # cache_path = "/var/cache/sora/affinity_cache.db" # SQLite path for persistent affinity (survives restarts)
@@ -658,7 +660,10 @@ fts_retention = ""                # How long to keep FTS search vectors (text_bo
                                   # NOTE: one row per (body, account), so at a given retention the
                                   # prune volume scales with how widely bodies are shared.
                                   # WARNING: Setting this removes search capability for old messages. Use with caution.
-health_status_retention = "30d"   # How long to retain health status history in the database.
+health_status_retention = "30d"   # How long a node's health_status rows (one per component, no history) may go
+                                  # without an update before they are deleted: this removes nodes that stopped.
+                                  # A running node rewrites each row at least every 20 checks (20 minutes at the
+                                  # longest check interval), so keep this well above that.
 instance_liveness_threshold = "7d" # How long an uploader instance must be silent before it counts as gone.
                                   # A pending upload can only be performed by the instance that created it
                                   # (the message body is a file on that node's local disk), so messages whose
@@ -976,9 +981,11 @@ shard_count = 0  # Default: 0 (runtime.NumCPU())
 # (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16): on a shared/multi-tenant network that lets
 # any neighbor spoof client IPs and bypass rate limiting (startup logs a warning if you do).
 #
+# - Every entry is an IP address or a CIDR (the server refuses to start otherwise).
 # - proxy_protocol listeners REQUIRE a non-empty list here (the server refuses to start otherwise).
-# - LMTP delivery admission is independent of this and still accepts RFC1918 by default,
-#   so leaving this empty does NOT break mail delivery.
+# - LMTP delivery admission (lmtp and lmtp_proxy) still accepts loopback and RFC1918 when
+#   this is empty, so leaving it empty does NOT break mail delivery. A non-empty list
+#   replaces that default: only the listed hosts may deliver.
 #
 # trusted_networks = ["10.20.0.5/32", "10.20.0.6/32"]   # e.g. only your two proxy hosts
 trusted_networks = []
@@ -1752,12 +1759,15 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 # BEHAVIOR:
 # - HTTP GET request is made for each authentication attempt
 # - Circuit breaker protects against service failures (60% failure rate triggers open state)
-# - Password formats: bcrypt ($2a$...), SSHA512 ({SSHA512}...), SHA512 ({SHA512}...), BLF-CRYPT ($2b$...)
+# - Password formats: bcrypt ($2a$/$2b$/$2y$...), or Dovecot's {BLF-CRYPT} and {CRYPT} (bcrypt),
+#   {SSHA512} and {SHA512}; scheme and .b64/.base64/.hex suffix in any case, as in Dovecot
 # - If HTTP endpoint returns 404/3xx → respects lookup_local_users setting (user partitioning)
 # - If HTTP endpoint returns 401/403 → authentication rejected (no fallback); the way to refuse an account
 # - If HTTP endpoint returns other 4xx/5xx, or a 200 that is not JSON with address and password_hash
 #   → service unavailable (no verdict on the password), ALWAYS reject (no fallback); 5xx, 408, 429
-#   and malformed 200s also count toward the circuit breaker
+#   and malformed 200s also count toward the circuit breaker. So is a 200 whose password_hash is
+#   not in a format above (it says nothing about the password), but it does not count toward the
+#   breaker
 # - If HTTP endpoint returns 200 with data but auth fails → connection REJECTED (no fallback)
 # - Server addresses normalized: a missing port is filled in as described for "server" above
 # - Timeout for HTTP requests is configurable (default: 5s)

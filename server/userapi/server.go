@@ -168,13 +168,13 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		// Parse TTL and other config values
 		lookupCacheConfig := options.LookupCache
 
-		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
-		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
-		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault(options.Name)
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault(options.Name)
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(options.Name)
 
 		maxSize := lookupCacheConfig.GetMaxSize()
 
-		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault()
+		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(options.Name)
 
 		authCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("User API: Lookup cache enabled", "name", options.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)

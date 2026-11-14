@@ -41,7 +41,7 @@ components:
           example: "s3cr3t_p4ssw0rd"
         password_hash:
           type: string
-          description: "Pre-computed password hash (bcrypt, SSHA512, etc.). Cannot be used together with password."
+          description: "Pre-computed password hash: a bare bcrypt hash ($2a$, $2b$, $2y$), or Dovecot's {BLF-CRYPT}, {CRYPT} with a bcrypt hash, {SSHA512} or {SHA512}, with the scheme and a .b64, .base64 or .hex suffix in any case. A value sora cannot verify is refused with 400. Cannot be used together with password."
           example: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
       required:
         - email
@@ -60,6 +60,7 @@ components:
           format: password
         password_hash:
           type: string
+          description: "Pre-computed password hash: a bare bcrypt hash ($2a$, $2b$, $2y$), or Dovecot's {BLF-CRYPT}, {CRYPT} with a bcrypt hash, {SSHA512} or {SHA512}, with the scheme and a .b64, .base64 or .hex suffix in any case. A value sora cannot verify is refused with 400. Cannot be used together with password."
         is_primary:
           type: boolean
         hash_type:
@@ -82,7 +83,7 @@ components:
           example: "new_s3cr3t_p4ssw0rd"
         password_hash:
           type: string
-          description: "Pre-computed password hash (bcrypt, SSHA512, etc.). Cannot be used together with password."
+          description: "Pre-computed password hash: a bare bcrypt hash ($2a$, $2b$, $2y$), or Dovecot's {BLF-CRYPT}, {CRYPT} with a bcrypt hash, {SSHA512} or {SHA512}, with the scheme and a .b64, .base64 or .hex suffix in any case. A value sora cannot verify is refused with 400. Cannot be used together with password."
           example: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
       anyOf:
         - required: ["password"]
@@ -103,7 +104,7 @@ components:
           example: "s3cr3t_p4ssw0rd_for_alias"
         password_hash:
           type: string
-          description: "Pre-computed password hash (bcrypt, SSHA512, etc.) for the new credential. Cannot be used together with password."
+          description: "Pre-computed password hash: a bare bcrypt hash ($2a$, $2b$, $2y$), or Dovecot's {BLF-CRYPT}, {CRYPT} with a bcrypt hash, {SSHA512} or {SHA512}, with the scheme and a .b64, .base64 or .hex suffix in any case. A value sora cannot verify is refused with 400. Cannot be used together with password."
           example: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
       required:
         - email
@@ -1126,6 +1127,7 @@ paths:
             - A `credentials` entry with a `password` whose `hash_type` is not `bcrypt` or `ssha512`
             - An invalid email address
             - A `password` longer than 72 bytes hashed with bcrypt (the default), bcrypt's limit
+            - A `password_hash` sora cannot verify (no or an unsupported scheme, data that does not decode or has the wrong length)
             - In a `credentials` array: no or several `is_primary` entries, or the same address twice
           content:
             application/json:
@@ -1249,6 +1251,7 @@ paths:
             - Both `password` and `password_hash` provided (only one allowed)
             - An invalid email address in the path
             - A `password` longer than 72 bytes (bcrypt's limit)
+            - A `password_hash` sora cannot verify (no or an unsupported scheme, data that does not decode or has the wrong length)
           content:
             application/json:
               schema:
@@ -1700,6 +1703,7 @@ paths:
             - Neither `password` nor `password_hash` provided  
             - Both `password` and `password_hash` provided (only one allowed)
             - `email` does not parse as an address
+            - A `password_hash` sora cannot verify (no or an unsupported scheme, data that does not decode or has the wrong length)
           content:
             application/json:
               schema:
@@ -2659,6 +2663,7 @@ paths:
       tags:
         - Health Monitoring
       summary: Get health status for a component
+      description: "The current status only. One row is kept per component and server, rewritten when the status changes and every 20 checks while it holds, so there is no history: history=true is answered with 400. The sora_component_health_status metric gives the status over time."
       parameters:
         - name: hostname
           in: path
@@ -2670,46 +2675,19 @@ paths:
           required: true
           schema:
             type: string
-        - name: history
-          in: query
-          schema:
-            type: boolean
-          description: "If true, returns historical health data instead of the current status."
-        - name: since
-          in: query
-          schema:
-            type: string
-            format: date-time
-          description: "If history=true, return records after this timestamp (RFC3339). Defaults to 24 hours ago."
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            default: 100
-          description: "If history=true, limit the number of historical records returned."
       responses:
         '200':
-          description: Current or historical health status for the component.
+          description: Current health status for the component.
           content:
             application/json:
               schema:
-                oneOf:
-                  - $ref: '#/components/schemas/HealthStatus'
-                  - type: object
-                    properties:
-                      hostname:
-                        type: string
-                      component:
-                        type: string
-                      history:
-                        type: array
-                        items:
-                          $ref: '#/components/schemas/HealthStatus'
-                      count:
-                        type: integer
-                      since:
-                        type: string
-                        format: date-time
+                $ref: '#/components/schemas/HealthStatus'
+        '400':
+          description: history=true was requested; no health history is recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Component health status not found.
           content:
