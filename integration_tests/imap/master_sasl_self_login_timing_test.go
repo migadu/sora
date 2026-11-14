@@ -10,36 +10,11 @@ import (
 	"time"
 
 	"github.com/migadu/sora/config"
-	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
 	serverImap "github.com/migadu/sora/server/imap"
 	"github.com/migadu/sora/storage"
+	"github.com/migadu/sora/testutils"
 )
-
-// passwordVerification raises the bcrypt cost for the rest of the test (the
-// integration harness runs at the minimum, where a verification is no slower than
-// a database round trip) and estimates the time one verification takes. Scheduling
-// can inflate even the fastest sample, so timing assertions run outside -short
-// (#782); short runs retain the functional and accounting checks.
-func passwordVerification(t *testing.T) time.Duration {
-	if testing.Short() {
-		return 0
-	}
-	saved := db.BcryptCost
-	db.BcryptCost = 10
-	t.Cleanup(func() { db.BcryptCost = saved })
-
-	db.DummyVerifyPassword("warm-up") // generates the dummy hash at this cost
-	floor := time.Duration(1 << 62)
-	for range 3 {
-		start := time.Now()
-		db.DummyVerifyPassword("wrong-password")
-		if took := time.Since(start); took < floor {
-			floor = took
-		}
-	}
-	return floor
-}
 
 // TestIMAP_MasterSASLSelfLoginTimingIsNotAPasswordOracle (#760): a master SASL
 // self-login (authorization identity = authentication identity = the master SASL
@@ -50,12 +25,13 @@ func passwordVerification(t *testing.T) time.Duration {
 // master SASL password used to be answered from the master SASL block without one
 // (the target lookup found nothing, or the gate refused the peer), so the response
 // time confirmed a guessed master SASL password. Both cache modes are covered:
-// backend negative entries revalidate on every attempt.
+// backend negative entries revalidate on every attempt. The verifications are
+// counted, not timed (#782): a wall-clock floor calibrated under CPU contention fails
+// a correct login that runs after the contention eases.
 func TestIMAP_MasterSASLSelfLoginTimingIsNotAPasswordOracle(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	rdb := common.SetupTestDatabase(t)
 
-	verification := passwordVerification(t)
 	saslUser := fmt.Sprintf("proxy-%d@example.com", time.Now().UnixNano())
 	const saslPass = "master-sasl-secret"
 
@@ -91,24 +67,22 @@ func TestIMAP_MasterSASLSelfLoginTimingIsNotAPasswordOracle(t *testing.T) {
 			time.Sleep(100 * time.Millisecond)
 			t.Cleanup(func() { srv.Close() })
 
-			timed := func(password string) (string, time.Duration) {
-				start := time.Now()
+			counted := func(password string) (string, int) {
+				before := testutils.PasswordVerifications()
 				reply := imapAuthPlain(t, address, saslUser, saslUser, password)
-				return reply, time.Since(start)
+				return reply, testutils.PasswordVerifications() - before
 			}
-			wrongReply, wrongTook := timed("wrong-password")
-			masterReply, masterTook := timed(saslPass)
+			wrongReply, wrongVerified := counted("wrong-password")
+			masterReply, masterVerified := counted(saslPass)
 
 			if masterReply != wrongReply {
 				t.Fatalf("self-login answered differently by password:\n  wrong password:  %q\n  master password: %q", wrongReply, masterReply)
 			}
-			if !testing.Short() {
-				if wrongTook < verification/2 {
-					t.Fatalf("wrong password answered in %v, under half a password verification (%v)", wrongTook, verification)
-				}
-				if masterTook < verification/2 {
-					t.Errorf("master SASL password answered in %v, wrong password in %v (one password verification: %v): the response time confirms the master SASL password", masterTook, wrongTook, verification)
-				}
+			if wrongVerified != 1 {
+				t.Fatalf("wrong password answered after %d password verifications, want 1", wrongVerified)
+			}
+			if masterVerified != wrongVerified {
+				t.Errorf("master SASL password answered after %d password verifications, wrong password after %d: the response time confirms the master SASL password", masterVerified, wrongVerified)
 			}
 		})
 	}
