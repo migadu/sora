@@ -105,6 +105,72 @@ func TestServerReloadRejectsBlockWithoutAddr(t *testing.T) {
 	}
 }
 
+// enabled = false on a running server's block takes effect at the next restart: the
+// reload says so instead of passing over the block in silence, and does not hand the
+// server a block that is no longer validated.
+func TestServerReloadReportsBlockDisabledWhileRunning(t *testing.T) {
+	logs := captureReloadLogs(t)
+	deps, reloaders := runningDeps(t, config.ServerConfig{Type: "pop3", Name: "pop3", Addr: ":110"})
+
+	disabled := false
+	deps.reloadServers(reloadedConfig(config.ServerConfig{Type: "pop3", Name: "pop3", Addr: ":110", Enabled: &disabled}))
+
+	if got := reloaders["pop3"].reloaded; len(got) != 0 {
+		t.Fatalf("ReloadConfig got %+v, want no call", got)
+	}
+	if out := logs.String(); !hasLineWith(out, "server=pop3", "enabled = false", "restart") {
+		t.Errorf("no notice that disabling pop3 needs a restart:\n%s", out)
+	}
+}
+
+// A block that was not started (enabled = false at startup, or added since) and is
+// enabled now starts at the next restart, and the reload says so; if the block is
+// invalid, the reload says that the restart will refuse it.
+func TestServerReloadReportsBlockEnabledWhileNotRunning(t *testing.T) {
+	logs := captureReloadLogs(t)
+	disabled := false
+	deps, _ := runningDeps(t, config.ServerConfig{Type: "pop3", Name: "pop3", Addr: ":110"})
+	deps.config.DynamicServers = append(deps.config.DynamicServers,
+		config.ServerConfig{Type: "imap", Name: "imap", Addr: ":143", Enabled: &disabled})
+
+	deps.reloadServers(reloadedConfig(
+		config.ServerConfig{Type: "pop3", Name: "pop3", Addr: ":110"},
+		config.ServerConfig{Type: "imap", Name: "imap", Addr: ":143"},
+		config.ServerConfig{Type: "lmtp", Name: "lmtp", Addr: ":24"},
+		config.ServerConfig{Type: "managesieve", Name: "sieve"},
+	))
+
+	out := logs.String()
+	for _, name := range []string{"imap", "lmtp"} {
+		if !hasLineWith(out, "server="+name, "not running", "restart") {
+			t.Errorf("no notice that starting %s needs a restart:\n%s", name, out)
+		}
+	}
+	if !hasLineWith(out, "server=sieve", "refuse", "server address is required") {
+		t.Errorf("no error that the added sieve block lacks its addr:\n%s", out)
+	}
+	if hasLineWith(out, "server=pop3", "restart") {
+		t.Errorf("pop3, unchanged and running, reported as needing a restart:\n%s", out)
+	}
+}
+
+// enabled = true is what an absent enabled means: writing it into a running server's
+// block changes nothing, so the reload has no restart to report.
+func TestServerReloadExplicitEnabledTrueIsNoChange(t *testing.T) {
+	logs := captureReloadLogs(t)
+	deps, reloaders := runningDeps(t, config.ServerConfig{Type: "pop3", Name: "pop3", Addr: ":110"})
+
+	enabled := true
+	deps.reloadServers(reloadedConfig(config.ServerConfig{Type: "pop3", Name: "pop3", Addr: ":110", Enabled: &enabled}))
+
+	if got := reloaders["pop3"].reloaded; len(got) != 1 {
+		t.Fatalf("ReloadConfig got %+v, want the new config once", got)
+	}
+	if out := logs.String(); strings.Contains(out, "restart") {
+		t.Errorf("enabled = true on a running server reported as needing a restart:\n%s", out)
+	}
+}
+
 // Every setting in the table is one RestartRequiredChanges can name (a table name such
 // as "timeouts" would match nothing and so silence nothing), under a real server type.
 func TestReloadableServerSettingsAreRealKeys(t *testing.T) {
