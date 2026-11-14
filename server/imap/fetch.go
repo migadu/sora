@@ -274,7 +274,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 		(slices.ContainsFunc(options.BodySection, func(bs *imap.FetchItemBodySection) bool { return !bs.Peek }) ||
 			slices.ContainsFunc(options.BinarySection, func(bs *imap.FetchItemBinarySection) bool { return !bs.Peek }))
 
-	// RFC 4314 §5.1.1: a FETCH that would implicitly set \Seen MUST NOT do so when the
+	// RFC 4314 §4: a FETCH that would implicitly set \Seen MUST NOT do so when the
 	// user lacks the 's' right on the mailbox. The owner always holds every right, so
 	// only shared-mailbox grantees incur the permission check. Fail closed (suppress the
 	// implicit \Seen) if the check itself errors.

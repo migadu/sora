@@ -556,7 +556,7 @@ func TestACL_SetACL_RejectsUnrecognizedRights(t *testing.T) {
 	t.Logf("✓ baseline grant preserved after rejected SETACLs: %s", rights.String())
 }
 
-// TestACL_FetchDoesNotImplicitlySetSeenWithoutSeenRight verifies RFC 4314 §5.1.1:
+// TestACL_FetchDoesNotImplicitlySetSeenWithoutSeenRight verifies RFC 4314 §4:
 // a non-PEEK BODY[] or BINARY[] FETCH must NOT implicitly set \Seen when the user
 // lacks the 's' right, and MUST set it once the 's' right is granted.
 func TestACL_FetchDoesNotImplicitlySetSeenWithoutSeenRight(t *testing.T) {
@@ -627,7 +627,7 @@ func TestACL_FetchDoesNotImplicitlySetSeenWithoutSeenRight(t *testing.T) {
 			}
 
 			if fetchSeenAsOwner(t, c1, sharedMailbox) {
-				t.Errorf("message marked \\Seen by a user lacking the 's' right (RFC 4314 §5.1.1 violation)")
+				t.Errorf("message marked \\Seen by a user lacking the 's' right (RFC 4314 §4 violation)")
 			} else {
 				t.Logf("✓ \\Seen not set for FETCH %s by user without 's' right", tc.name)
 			}
