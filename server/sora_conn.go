@@ -142,7 +142,10 @@ func CopyWithDeadline(ctx context.Context, dst net.Conn, src net.Conn, direction
 // This replaces multiple nested wrappers (timeoutConn, ja4CaptureConn, proxyProtocolConn)
 // with a single, unified implementation.
 type SoraConn struct {
-	net.Conn // Underlying connection (TLS or plain TCP)
+	// Underlying connection (TLS or plain TCP). A deferred TLS handshake replaces it
+	// with the *tls.Conn under closeMutex (SoraTLSConn.PerformHandshake), so Close
+	// and the connection accessors other goroutines call read it under closeMutex too.
+	net.Conn
 	// Cached remote address string to avoid touching the underlying connection
 	// during shutdown/unregister which could race with Close()
 	remoteAddr string
@@ -583,7 +586,8 @@ func (c *SoraConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// Close stops the timeout checker and closes the connection
+// Close stops the timeout checker and closes the connection: the TLS connection
+// once a deferred handshake has published it, the transport before that.
 func (c *SoraConn) Close() error {
 	c.closeMutex.Lock()
 	if !c.closed {
@@ -592,9 +596,10 @@ func (c *SoraConn) Close() error {
 		// Unregister from global timeout scheduler
 		unregisterConn(c)
 	}
+	conn := c.Conn
 	c.closeMutex.Unlock()
 
-	return c.Conn.Close()
+	return conn.Close()
 }
 
 // GetJA4Fingerprint returns the captured JA4 TLS fingerprint
@@ -670,7 +675,24 @@ func (c *SoraConn) GetProtocol() string {
 
 // Unwrap returns the underlying connection (for compatibility with unwrapping patterns)
 func (c *SoraConn) Unwrap() net.Conn {
+	c.closeMutex.Lock()
+	defer c.closeMutex.Unlock()
 	return c.Conn
+}
+
+// Address and deadline methods may run concurrently with a deferred handshake.
+// Snapshot the current connection before forwarding, without holding closeMutex
+// during socket operations that may block or need Close to interrupt them.
+func (c *SoraConn) LocalAddr() net.Addr  { return c.Unwrap().LocalAddr() }
+func (c *SoraConn) RemoteAddr() net.Addr { return c.Unwrap().RemoteAddr() }
+func (c *SoraConn) SetDeadline(t time.Time) error {
+	return c.Unwrap().SetDeadline(t)
+}
+func (c *SoraConn) SetReadDeadline(t time.Time) error {
+	return c.Unwrap().SetReadDeadline(t)
+}
+func (c *SoraConn) SetWriteDeadline(t time.Time) error {
+	return c.Unwrap().SetWriteDeadline(t)
 }
 
 // CheckedTimeouts are the limits the timeout checker enforces on a connection; a zero
@@ -1033,7 +1055,18 @@ func (c *SoraTLSConn) PerformHandshake() error {
 		logger.Warn("Failed to clear handshake deadline", "proto", c.connConfig.Protocol, "error", err)
 	}
 
-	// Replace the underlying connection in SoraConn with the TLS connection
+	// Replace the underlying connection in SoraConn with the TLS connection, and
+	// register with the timeout scheduler, under closeMutex: Close can run on
+	// another goroutine (a server shutting down) at any point of the handshake.
+	// A Close that came first has closed the transport and unregistered the
+	// connection, so the handshake fails rather than publish a closed connection
+	// and leave it registered.
+	c.SoraConn.closeMutex.Lock()
+	defer c.SoraConn.closeMutex.Unlock()
+	if c.SoraConn.closed {
+		c.handshakeErr = net.ErrClosed
+		return c.handshakeErr
+	}
 	c.SoraConn.Conn = c.tlsConn
 
 	// NOW register with timeout scheduler, after TLS handshake is complete

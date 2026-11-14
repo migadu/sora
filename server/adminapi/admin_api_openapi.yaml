@@ -1875,9 +1875,13 @@ paths:
         Kicks the account on this node's connection trackers (or on those of one protocol)
         and broadcasts the kick to the cluster, where each node ends the account's sessions
         and drops its cached logins.
-        An address the database does not know (a remote lookup user) is kicked by the
-        account ID derived from it, as the proxies derive it. The response does not count
-        sessions: they end within seconds, as each node applies the kick.
+        The account is kicked by its database account ID and by the ID derived from each
+        of its addresses: a proxy keys a session that remote lookup authenticated by the ID
+        derived from the address the lookup answered, also when the database holds the
+        account. An address the database does not know (a lookup service's own account) is
+        kicked by the ID derived from it. When the database cannot be asked, nothing is
+        kicked and the answer is 500. The response does not count sessions: they end
+        within seconds, as each node applies the kick.
       requestBody:
         required: true
         content:
@@ -1922,7 +1926,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '500':
-          description: The kick could not be issued on any tracker.
+          description: The database cannot resolve the address (nothing was kicked), or the kick could not be issued on any tracker.
           content:
             application/json:
               schema:
