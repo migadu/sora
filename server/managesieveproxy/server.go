@@ -303,29 +303,13 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	if lookupCacheConfig.Enabled {
-		positiveTTL, err := lookupCacheConfig.GetPositiveTTL()
-		if err != nil {
-			logger.Info("ManageSieve Proxy: Invalid positive TTL in auth cache config, using default (5m)", "name", opts.Name, "error", err)
-			positiveTTL = 5 * time.Minute
-		}
-		negativeTTL, err := lookupCacheConfig.GetNegativeTTL()
-		if err != nil {
-			logger.Info("ManageSieve Proxy: Invalid negative TTL in auth cache config, using default (1m)", "name", opts.Name, "error", err)
-			negativeTTL = 1 * time.Minute
-		}
-		cleanupInterval, err := lookupCacheConfig.GetCleanupInterval()
-		if err != nil {
-			logger.Info("ManageSieve Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", opts.Name, "error", err)
-			cleanupInterval = 5 * time.Minute
-		}
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()
 		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// Parse positive revalidation window from config (used for password change detection)
-		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()
-		if err != nil {
-			logger.Info("ManageSieve Proxy: Invalid positive revalidation window in auth cache config, using default (30s)", "name", opts.Name, "error", err)
-			positiveRevalidationWindow = 30 * time.Second
-		}
+		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault()
 
 		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("ManageSieve Proxy: Lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)

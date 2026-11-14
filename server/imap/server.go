@@ -514,31 +514,13 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	if !lookupCacheConfig.Enabled {
 		logger.Info("IMAP: Lookup cache disabled", "name", name)
 	} else {
-		positiveTTL, err := time.ParseDuration(lookupCacheConfig.PositiveTTL)
-		if err != nil || lookupCacheConfig.PositiveTTL == "" {
-			logger.Info("IMAP: Using default positive TTL (5m)", "name", name)
-			positiveTTL = 5 * time.Minute
-		}
-
-		negativeTTL, err := time.ParseDuration(lookupCacheConfig.NegativeTTL)
-		if err != nil || lookupCacheConfig.NegativeTTL == "" {
-			logger.Info("IMAP: Using default negative TTL (1m)", "name", name)
-			negativeTTL = 1 * time.Minute
-		}
-
-		cleanupInterval, err := time.ParseDuration(lookupCacheConfig.CleanupInterval)
-		if err != nil || lookupCacheConfig.CleanupInterval == "" {
-			logger.Info("IMAP: Using default cleanup interval (5m)", "name", name)
-			cleanupInterval = 5 * time.Minute
-		}
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()
 
 		maxSize := lookupCacheConfig.GetMaxSize()
 
-		positiveRevalidationWindow, err := lookupCacheConfig.GetPositiveRevalidationWindow()
-		if err != nil {
-			logger.Info("IMAP: Invalid positive revalidation window in auth cache config, using default (30s)", "name", name, "error", err)
-			positiveRevalidationWindow = 30 * time.Second
-		}
+		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault()
 
 		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("IMAP: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
