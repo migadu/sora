@@ -220,3 +220,22 @@ func TestPOP3_PerUserPerIPLimitCountsXCLIENTForwardedClientAddress(t *testing.T)
 	}
 	waitTrackedEmpty(t, tracker)
 }
+
+// Behind a layer-4 load balancer that sends PROXY headers, an XCLIENT is the
+// client's own: it cannot replace the address the header gave, so a client
+// cannot claim a fresh address for each connection and escape the per-IP
+// count (#540). It is still answered +OK, as for a pop3_proxy that sends a
+// PROXY header and XCLIENT together.
+func TestPOP3_PerUserPerIPLimitIgnoresXCLIENTFromProxiedClient(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	addr, account, tracker := setupPOP3PerUserPerIPBehindProxy(t, 1)
+
+	for i := 1; i <= 2; i++ {
+		c := dialProxiedPOP3(t, addr, "198.51.100.66")
+		if resp := c.do(fmt.Sprintf("XCLIENT ADDR=203.0.113.%d PORT=51000 TTL=5", i)); !strings.HasPrefix(resp, "+OK") {
+			t.Fatalf("XCLIENT from 198.51.100.66 behind the load balancer: %q", resp)
+		}
+		c.tryLogin(account)
+	}
+	expectTrackedPerIP(t, tracker, map[string]int{"198.51.100.66": 1})
+}

@@ -151,8 +151,8 @@ func TestIMAP_PerUserPerIPLimitIgnoresIDFromProxiedClient(t *testing.T) {
 }
 
 // The connection is unregistered under the address it was registered with,
-// even when an ID after LOGIN changed the session's client address; otherwise
-// the first address keeps a connection that is gone.
+// and an ID after LOGIN does not change the session's client address (#540);
+// otherwise the first address keeps a connection that is gone.
 func TestIMAP_PerUserPerIPLimitReleasedUnderRegisteredAddress(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	server, account := setupPerUserPerIPBehindProxy(t, 1)
