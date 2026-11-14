@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -510,5 +511,122 @@ func TestSubmitTrainingDoesNotFollowRedirects(t *testing.T) {
 				t.Errorf("Location was requested %d time(s), want 0 (redirects must not be followed)", n)
 			}
 		})
+	}
+}
+
+// bodyTransport answers every request with status and body, without a network.
+type bodyTransport struct {
+	status int
+	header http.Header
+	body   io.ReadCloser
+}
+
+func (t *bodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		req.Body.Close()
+	}
+	return &http.Response{
+		Status:        http.StatusText(t.status),
+		StatusCode:    t.status,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        t.header,
+		Body:          t.body,
+		ContentLength: -1,
+		Request:       req,
+	}, nil
+}
+
+// TestSubmitTrainingBoundsResponseBody: of the endpoint's answer only the status is
+// needed, and for a refusal a short excerpt of the body for the error. However large
+// a body an accepted, redirected or refused submission is answered with, only a
+// bounded part of it is read, and the body is closed.
+func TestSubmitTrainingBoundsResponseBody(t *testing.T) {
+	const bodySize = 8 << 20
+	const maxRead = 4 << 10
+	for _, tc := range []struct {
+		status  int
+		wantErr bool
+	}{
+		{http.StatusOK, false},
+		{http.StatusFound, true},
+		{http.StatusBadRequest, true},
+		{http.StatusInternalServerError, true},
+	} {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			c, err := NewClient(&config.SpamTrainingConfig{Enabled: true, Endpoint: "http://training.example.com/train"})
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
+			t.Cleanup(c.Close)
+
+			body := &countingReader{remaining: bodySize, closed: make(chan struct{})}
+			header := http.Header{}
+			if tc.status >= 300 && tc.status < 400 {
+				header.Set("Location", "http://training.example.com/landing")
+			}
+			c.httpClient.Transport = &bodyTransport{status: tc.status, header: header, body: body}
+
+			err = c.SubmitTraining(context.Background(), &TrainingRequest{Type: TrainingTypeSpam, Message: "body", User: "user@example.com"})
+			if gotErr := err != nil; gotErr != tc.wantErr {
+				t.Fatalf("SubmitTraining = %v for a %d answer, want error: %v", err, tc.status, tc.wantErr)
+			}
+			if got := body.read.Load(); got > maxRead {
+				t.Errorf("read %d bytes of a %d-byte response body, want at most %d", got, bodySize, maxRead)
+			}
+			select {
+			case <-body.closed:
+			default:
+				t.Error("response body was not closed")
+			}
+			if err == nil {
+				return
+			}
+			if n := len(err.Error()); n > maxRead {
+				t.Errorf("error message is %d bytes long, want at most %d", n, maxRead)
+			}
+			if tc.status >= 400 && !strings.Contains(err.Error(), "xxxx") {
+				t.Errorf("error %q does not quote the start of the response body", err)
+			}
+		})
+	}
+}
+
+// TestSubmitTrainingReusesConnection: a short answer is read to its end, so the
+// transport keeps the connection for the next submission rather than opening a new
+// one each time, whether the submission was accepted or refused.
+func TestSubmitTrainingReusesConnection(t *testing.T) {
+	var conns, requests atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if requests.Add(1) == 2 {
+			http.Error(w, "try again later", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, `{"status":"ok"}`)
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	c, err := NewClient(&config.SpamTrainingConfig{Enabled: true, Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(c.Close)
+
+	for i, wantErr := range []bool{false, true, false} {
+		err := c.SubmitTraining(context.Background(), &TrainingRequest{Type: TrainingTypeSpam, Message: "body", User: "user@example.com"})
+		if gotErr := err != nil; gotErr != wantErr {
+			t.Fatalf("submission %d = %v, want error: %v", i+1, err, wantErr)
+		}
+	}
+	if got := conns.Load(); got != 1 {
+		t.Errorf("3 submissions opened %d connections, want 1", got)
 	}
 }

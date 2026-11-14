@@ -658,9 +658,10 @@ func (am *AffinityManager) cleanup() {
 	}
 }
 
-// List returns the unexpired affinities this node holds, in no particular order. Every
-// node applies the affinities the others gossip, so on a converged cluster each node
-// lists the same set.
+// List returns the unexpired affinities this node holds, in no particular order: those
+// it assigned and those it received by gossip. Affinities have no push/pull full-state
+// exchange, so a node that was down or joined after an affinity was gossiped does not
+// hold it, and two nodes can list different sets.
 func (am *AffinityManager) List() []affinitycache.AffinityEntry {
 	if am == nil || !am.enabled {
 		return nil

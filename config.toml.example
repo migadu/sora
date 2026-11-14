@@ -180,7 +180,13 @@ encryption_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd
 #
 # IMPORTANT: You cannot mix both approaches!
 # - If [tls] enabled = true → all servers use global TLS, ignore per-server tls_cert_file/tls_key_file
+#   (every server type alike; a server that sets them anyway logs a warning naming them at startup)
 # - If [tls] enabled = false → each server needs its own tls_cert_file/tls_key_file
+#
+# tls_verify = true on a [[server]] with tls = true requires a client certificate (mutual TLS) on
+# that listener, whichever of the two supplies the server's certificate; clients without one are
+# refused. Client certificates are verified against the system's trusted CAs. Leave it false for
+# mail clients, and on a backend that proxies reach over remote_tls (proxies present none).
 #
 # RECOMMENDATION: Use global TLS with Let's Encrypt for automatic certificate management
 
@@ -1106,7 +1112,9 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # Disable specific IMAP capabilities for ALL clients connecting to this server.
 # Disabled capabilities are not announced in CAPABILITY responses and cannot be
 # used: what they add is refused, e.g. with MOVE disabled the MOVE command gets
-# BAD, and with STATUS=SIZE disabled so does STATUS (SIZE).
+# BAD, and with STATUS=SIZE disabled so does STATUS (SIZE). Not yet for
+# THREAD=*, MULTISEARCH, UIDPLUS, CREATE-SPECIAL-USE, LIST-EXTENDED, SPECIAL-USE
+# and ID: disabling one of those only stops announcing it.
 #
 # This is different from client_filters which apply based on client identity.
 # Use this when you want to disable capabilities for ALL clients on this server.
@@ -1491,7 +1499,7 @@ tls_use_starttls = false
 # tls_default_domain = "managesieve.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
 tls_cert_file = "/path/to/your/managesieve.crt"
 tls_key_file = "/path/to/your/managesieve.key"
-tls_verify = true
+tls_verify = false            # true requires client certificates (mutual TLS); clients without one are refused
 proxy_protocol = false        # Enable PROXY protocol support for ManageSieve
 proxy_protocol_timeout = "5s"
 # proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
@@ -1625,7 +1633,7 @@ tls = false
 tls_use_starttls = false              # With tls = true: plaintext port offering STARTTLS (usually :143) instead of implicit TLS (:993)
 tls_cert_file = ""
 tls_key_file = ""
-tls_verify = true
+tls_verify = false                    # true requires client certificates (mutual TLS); clients without one are refused
 # tls_default_domain = "imap.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this proxy.
 
 # --- BACKEND TLS CONFIGURATION ---
@@ -1775,9 +1783,10 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 # - If HTTP endpoint returns 401/403 → authentication rejected (no fallback); the way to refuse an account
 # - If HTTP endpoint returns other 4xx/5xx, or a 200 that is not JSON with address and password_hash
 #   → service unavailable (no verdict on the password), ALWAYS reject (no fallback); 5xx, 408, 429
-#   and malformed 200s also count toward the circuit breaker. So is a 200 whose password_hash is
-#   not in a format above (it says nothing about the password), but it does not count toward the
-#   breaker
+#   and malformed 200s also count toward the circuit breaker
+# - If HTTP endpoint returns 200 with a password_hash not in a format above → service unavailable
+#   too (no verdict on the password: refuse an account with 401/403, not with a placeholder hash);
+#   not counted toward the circuit breaker
 # - If HTTP endpoint returns 200 with data but auth fails → connection REJECTED (no fallback)
 # - Server addresses normalized: a missing port is filled in as described for "server" above
 # - Timeout for HTTP requests is configurable (default: 5s)
@@ -2080,7 +2089,7 @@ tls = false
 tls_use_starttls = false              # With tls = true: plaintext port offering STLS (RFC 2595) instead of implicit TLS
 tls_cert_file = ""
 tls_key_file = ""
-tls_verify = true
+tls_verify = false                    # true requires client certificates (mutual TLS); clients without one are refused
 # tls_default_domain = "pop3.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this proxy.
 
 # --- BACKEND TLS CONFIGURATION ---
@@ -2145,7 +2154,7 @@ tls = false
 tls_use_starttls = false              # Use STARTTLS on listening port (client connections)
 tls_cert_file = ""
 tls_key_file = ""
-tls_verify = true
+tls_verify = false                    # true requires client certificates (mutual TLS); clients without one are refused
 # tls_default_domain = "managesieve.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this proxy.
 
 # --- BACKEND TLS CONFIGURATION ---
@@ -2202,7 +2211,7 @@ tls = false
 tls_use_starttls = false              # Use STARTTLS on listening port (client connections)
 tls_cert_file = ""
 tls_key_file = ""
-tls_verify = true
+tls_verify = false                    # true requires client certificates (mutual TLS); clients without one are refused
 # tls_default_domain = "lmtp.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this proxy.
 
 # --- BACKEND TLS CONFIGURATION ---
@@ -2282,8 +2291,8 @@ api_key = "your-secret-api-key-here"  # REQUIRED for API access.
 # read_only_api_key = ""      # [OPTIONAL] Second key that may only make GET requests (monitoring, dashboards). Must differ from api_key.
 allowed_hosts = []            # Empty = all hosts (not recommended for production).
 tls = false
-tls_cert_file = ""            # Static cert file (or use Let's Encrypt autocert from [tls] section)
-tls_key_file = ""             # Static key file (or use Let's Encrypt autocert from [tls] section)
+tls_cert_file = ""            # Static cert file; ignored when the global [tls] section is enabled
+tls_key_file = ""             # Static key file; ignored when the global [tls] section is enabled
 tls_default_domain = ""       # [OPTIONAL] Default domain for SNI-less connections (uses global default_domain if not set)
 tls_verify = false
 proxy_protocol = false        # Enable PROXY protocol support for HTTP API
@@ -2293,7 +2302,7 @@ proxy_protocol_timeout = "5s"
 # NOTE: Uses global [relay] configuration for /admin/mail/deliver endpoint
 # NOTE: /admin/mail/deliver stages bodies through this node's upload worker, which runs only when the
 #       node also has an imap, pop3 or lmtp server; elsewhere it answers 503 (a start-up warning says so)
-# NOTE: When tls=true and tls_cert_file/tls_key_file are empty, uses Let's Encrypt autocert from [tls] section
+# NOTE: When tls=true and the global [tls] section is enabled, its certificate is used (tls_cert_file/tls_key_file are ignored)
 
 
 # HTTP USER API SERVER EXAMPLE
@@ -2316,12 +2325,12 @@ token_issuer = "sora-mail-api" # JWT issuer field (optional, for token validatio
 allowed_origins = ["*"]       # CORS allowed origins for web clients. Use specific origins in production: ["https://mail.example.com"]
 allowed_hosts = []            # IP addresses allowed to access API. Empty = all hosts.
 tls = false
-tls_cert_file = ""            # Static cert file (or use Let's Encrypt autocert from [tls] section)
-tls_key_file = ""             # Static key file (or use Let's Encrypt autocert from [tls] section)
+tls_cert_file = ""            # Static cert file; ignored when the global [tls] section is enabled
+tls_key_file = ""             # Static key file; ignored when the global [tls] section is enabled
 tls_default_domain = ""       # [OPTIONAL] Default domain for SNI-less connections (uses global default_domain if not set)
 tls_verify = false
 
-# NOTE: When tls=true and tls_cert_file/tls_key_file are empty, uses Let's Encrypt autocert from [tls] section
+# NOTE: When tls=true and the global [tls] section is enabled, its certificate is used (tls_cert_file/tls_key_file are ignored)
 
 
 # USER API PROXY SERVER EXAMPLE

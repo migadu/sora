@@ -1043,11 +1043,11 @@ func (c *RemoteLookupConfig) GetRemotePort() (int, error) {
 	default:
 		return 0, fmt.Errorf("invalid type for remote_port: %T", v)
 	}
-	port := int(p)
-	if port < 0 || port > 65535 {
-		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", port)
+	// Range-check before converting to int: TOML integers are int64 even on 32-bit targets.
+	if p < 0 || p > 65535 {
+		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", p)
 	}
-	return port, nil
+	return int(p), nil
 }
 
 // ServerLimitsConfig holds resource limits for a server
@@ -2164,11 +2164,11 @@ func (s *ServerConfig) GetRemotePort() (int, error) {
 	default:
 		return 0, fmt.Errorf("invalid type for remote_port: %T", v)
 	}
-	port := int(p)
-	if port < 0 || port > 65535 {
-		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", port)
+	// Range-check before converting to int: TOML integers are int64 even on 32-bit targets.
+	if p < 0 || p > 65535 {
+		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", p)
 	}
-	return port, nil
+	return int(p), nil
 }
 
 // GetRemoteHealthChecks returns whether backend health checking is enabled.
@@ -2468,6 +2468,20 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
+	// A proxy dials a backend address without a port at its remote_port, or at its enabled
+	// lookup's remote_port for a lookup-routed one. No other server reads either, and a
+	// disabled lookup is never initialized.
+	if strings.HasSuffix(s.Type, "_proxy") {
+		if _, err := s.GetRemotePort(); err != nil {
+			return fmt.Errorf("server %q: invalid remote_port: %w", s.Name, err)
+		}
+		if s.RemoteLookup != nil && s.RemoteLookup.Enabled {
+			if _, err := s.RemoteLookup.GetRemotePort(); err != nil {
+				return fmt.Errorf("server %q: invalid remote_lookup.remote_port: %w", s.Name, err)
+			}
+		}
+	}
+
 	if s.Type == "metrics" {
 		if s.Path != "" && !strings.HasPrefix(s.Path, "/") {
 			return fmt.Errorf("server %q: metrics path %q must begin with '/'", s.Name, s.Path)
@@ -2519,6 +2533,11 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		default:
 			logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured, but this only applies to IMAP, LMTP, ManageSieve and POP3 servers and proxies", s.Name, s.Type)
 		}
+	}
+	// tls_verify asks the TLS handshake for a client certificate; without TLS
+	// there is no handshake to ask in.
+	if s.TLSVerify && !s.TLS {
+		logger("WARNING: Server %s (type: %s) has 'tls_verify' configured without 'tls = true'; it is ignored and no client certificate is required", s.Name, s.Type)
 	}
 
 	// Check proxy-only options on non-proxy servers
