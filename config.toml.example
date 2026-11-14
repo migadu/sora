@@ -2426,6 +2426,8 @@ tls_verify = false
 #remote_tls = false                  # Use HTTPS for backend connections
 #remote_tls_verify = true            # Verify backend TLS certificates
 #remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots; only for backends in no [[pool]].
+#auth_rate_limit.enabled = true      # Rate limit every login through the proxy, including those it refuses itself (named pools);
+                                    # leave it off on the http_user_api backends behind it. Keys as in the IMAP example above.
 
 # IMPORTANT: Backend User API servers should configure allowed_hosts to trust this proxy
 # Backend configuration example:

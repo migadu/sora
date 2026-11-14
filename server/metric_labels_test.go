@@ -173,13 +173,14 @@ func TestAuthRateLimiterMetricsUseServerType(t *testing.T) {
 
 	// The names the servers give NewAuthRateLimiter*.
 	for name, want := range map[string]string{
-		"IMAP":        "imap",
-		"POP3":        "pop3",
-		"ManageSieve": "managesieve",
-		"IMAP-PROXY":  "imap_proxy",
-		"POP3-PROXY":  "pop3_proxy",
-		"SIEVE-PROXY": "managesieve_proxy",
-		"user-api":    "userapi",
+		"IMAP":           "imap",
+		"POP3":           "pop3",
+		"ManageSieve":    "managesieve",
+		"IMAP-PROXY":     "imap_proxy",
+		"POP3-PROXY":     "pop3_proxy",
+		"SIEVE-PROXY":    "managesieve_proxy",
+		"user-api":       "userapi",
+		"USER-API-PROXY": "userapi_proxy",
 	} {
 		t.Run(name, func(t *testing.T) {
 			serverName := "limiter-711-" + name
