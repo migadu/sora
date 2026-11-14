@@ -272,18 +272,10 @@ func TestEvictionOrderByFirstFailure(t *testing.T) {
 		time.Now().Add(-1 * time.Minute),  // newest
 	}
 
-	// Manually create entries with specific FirstFailure times
-	limiter.ipUsernameMu.Lock()
-	for i, t := range times {
-		username := fmt.Sprintf("user%d@example.com", i+1)
-		key := fmt.Sprintf("192.168.1.100|%s", username)
-		limiter.ipUsernameFailureCounts[key] = &IPUsernameFailureInfo{
-			FailureCount: 1,
-			FirstFailure: t,
-			LastFailure:  t,
-		}
+	// Record failures with these FirstFailure times, not in time order
+	for _, i := range []int{1, 0, 2} {
+		limiter.updateIPUsernameFailure("192.168.1.100", fmt.Sprintf("user%d@example.com", i+1), times[i])
 	}
-	limiter.ipUsernameMu.Unlock()
 
 	// Add 4th entry - should evict user1 (oldest FirstFailure)
 	time.Sleep(10 * time.Millisecond)

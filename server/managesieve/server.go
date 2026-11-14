@@ -408,10 +408,19 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 			// Limiter checks. DELIBERATE silent close, no banner: matches the
 			// previous accept-loop rejection (drop before any greeting), and
 			// a "NO too many connections" banner would tell a flooder exactly
-			// when the limiter engages so they can pace under it.
+			// when the limiter engages so they can pace under it. The
+			// exception is a client a PROXY peer named over its per-IP limit:
+			// that peer is a proxy, which fails the client's login on the
+			// reply but would count a silent close against the backend.
 			releaseConn, err := s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), clientIP)
 			if err != nil {
-				return nil, fmt.Errorf("%w: %w", managesieveserver.ErrSilentReject, err)
+				if !serverPkg.IsProxiedClientRefusal(err, proxyInfo) {
+					return nil, fmt.Errorf("%w: %w", managesieveserver.ErrSilentReject, err)
+				}
+				if _, hsErr := serverPkg.PerformDeferredTLSHandshake(netConn); hsErr != nil {
+					return nil, fmt.Errorf("%w: TLS handshake: %w", managesieveserver.ErrSilentReject, hsErr)
+				}
+				return nil, fmt.Errorf("%w: %w", errTooManyConnections, err)
 			}
 
 			// Implicit-TLS listeners (SoraTLSListener) defer the TLS

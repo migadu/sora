@@ -620,7 +620,7 @@ type AuthRateLimiterConfig struct {
 	DelayMultiplier     float64       `toml:"delay_multiplier"`      // Delay increase factor
 
 	// Memory safety limits (prevents unbounded growth during burst attacks)
-	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Maximum IP+username tracking entries (default: 100000)
+	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Maximum IP+username failure counters, and separately blocks (default: 100000)
 	MaxIPEntries         int `toml:"max_ip_entries"`          // Maximum IP failure tracking entries (default: 50000)
 	MaxUsernameEntries   int `toml:"max_username_entries"`    // Maximum username tracking entries (default: 50000)
 
@@ -707,7 +707,7 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 		DelayMultiplier:     2.0,              // Double delay each time
 
 		// Memory safety limits (prevents OOM during burst attacks)
-		MaxIPUsernameEntries: 100000, // ~25MB per protocol at capacity
+		MaxIPUsernameEntries: 100000, // counters and blocks each: ~50MB per protocol at capacity
 		MaxIPEntries:         50000,  // ~7.5MB per protocol at capacity
 		MaxUsernameEntries:   50000,  // ~7.5MB per protocol at capacity
 	}
@@ -2338,11 +2338,22 @@ func (s *ServerConfig) GetAuthIdleTimeoutWithDefault() time.Duration {
 	return timeout
 }
 
+// GetMaxMessageSizeWithDefault returns max_message_size (LMTP, LMTP proxy, Admin API
+// delivery), at start-up and on a reload, capped at consts.MaxStoredMessageSize: a
+// larger message would be read in full and then refused by the database insert, and
+// the LMTP proxy would advertise a SIZE no backend accepts. RFC 1870 section 5: "The
+// fixed maximum message size is defined as the message size of the largest message
+// that a server is ever willing to accept. [...] The fixed maximum message size may
+// be an implementation artifact of the SMTP server".
 func (s *ServerConfig) GetMaxMessageSizeWithDefault() int64 {
 	size, err := s.GetMaxMessageSize()
 	if err != nil {
 		warnf("Failed to parse max message size for server '%s': %v, using default (50MB)", s.Name, err)
 		return 52428800 // 50MB default
+	}
+	if size > consts.MaxStoredMessageSize {
+		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
+		return consts.MaxStoredMessageSize
 	}
 	return size
 }

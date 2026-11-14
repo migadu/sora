@@ -160,6 +160,34 @@ func TestParseTrustedNetworks_IPv6AutoSubnet(t *testing.T) {
 	}
 }
 
+// A bare IPv4-mapped IPv6 address is the single IPv4 host it maps. Appending "/32" to its
+// text turned it into the IPv6 network ::/32, which matches no IPv4 client (the intended
+// host included) and matches ::1 and every other address whose first 32 bits are zero.
+func TestParseTrustedNetworks_IPv4MappedBareIP(t *testing.T) {
+	networks, err := ParseTrustedNetworks([]string{"::ffff:192.0.2.5"})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(networks) != 1 {
+		t.Fatalf("Expected 1 network, got %d", len(networks))
+	}
+	network := networks[0]
+
+	if got := network.String(); got != "192.0.2.5/32" {
+		t.Errorf("network = %s, want 192.0.2.5/32", got)
+	}
+	for _, ip := range []string{"192.0.2.5", "::ffff:192.0.2.5"} {
+		if !network.Contains(net.ParseIP(ip)) {
+			t.Errorf("network %s does not contain %s", network, ip)
+		}
+	}
+	for _, ip := range []string{"192.0.2.6", "::ffff:192.0.2.6", "::1", "::", "0:0:1::1"} {
+		if network.Contains(net.ParseIP(ip)) {
+			t.Errorf("network %s contains %s", network, ip)
+		}
+	}
+}
+
 func TestParseTrustedNetworks_RealWorldExample(t *testing.T) {
 	// This is the exact case from the error message
 	input := []string{"54.38.178.38"}
@@ -198,6 +226,11 @@ func TestIPInNetworks(t *testing.T) {
 		{"mixed list, bare hit", "192.168.1.5", []string{"10.0.0.0/8", "192.168.1.5"}, true},
 		{"bare IPv6 -> /128 match", "2001:db8::1", []string{"2001:db8::1"}, true},
 		{"IPv6 canonicalization", "2001:0db8::0:1", []string{"2001:db8::1"}, true},
+		{"bare IPv4-mapped matches its IPv4 host", "192.0.2.5", []string{"::ffff:192.0.2.5"}, true},
+		{"bare IPv4-mapped matches its mapped form", "::ffff:192.0.2.5", []string{"::ffff:192.0.2.5"}, true},
+		{"bare IPv4-mapped no match other IPv4", "192.0.2.6", []string{"::ffff:192.0.2.5"}, false},
+		{"bare IPv4-mapped no match ::1", "::1", []string{"::ffff:192.0.2.5"}, false},
+		{"bare IPv4-mapped no match ::/32 address", "0:0:1::1", []string{"::ffff:192.0.2.5"}, false},
 		{"invalid entry skipped, valid wins", "10.0.0.1", []string{"not-an-ip", "10.0.0.0/8"}, true},
 		{"all entries invalid", "10.0.0.1", []string{"not-an-ip", "garbage"}, false},
 		{"empty list", "10.0.0.1", nil, false},

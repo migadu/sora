@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -360,8 +361,9 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 		// Storage, the database, the staging limit, or a commit whose outcome is
 		// unknown: the message may land on a retry (or already has, and the retry is
 		// absorbed by the delivery-hash check). Never a 4xx the injector would honour
-		// by dropping the message.
-		status.Transient = true
+		// by dropping the message. A message too large to store never lands, so that
+		// one is the request's fault, as a body above max_message_size is.
+		status.Transient = !errors.Is(err, delivery.ErrMessageTooLarge)
 		return status
 	}
 

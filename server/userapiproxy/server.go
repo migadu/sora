@@ -284,14 +284,30 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		}
 		return conn, nil
 	}
+	// Each connection's outcome, once it is usable or has failed (after the TLS handshake
+	// if there is one), is recorded against the backend the request was routed to:
+	// routing passes over a backend that failed three connections in a row, as on the
+	// other proxies, instead of sending its users there for a 502 while it is down.
+	// http.Transport dials with a context detached from the request's cancellation: a
+	// dial outlives a client that went away, and counts when it fails on its own; only a
+	// dial CloseIdleConnections cancels once no request waits for it goes uncounted.
+	recordDial := func(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dial(ctx, network, addr)
+			if route, ok := ctx.Value(backendRouteKey).(*proxy.BackendRoute); ok {
+				route.RecordDialOutcome(ctx, err)
+			}
+			return conn, err
+		}
+	}
 	// The TLS leg is set up here rather than by the transport, with the connection
 	// manager's config for the address dialed (proxy.BackendClientTLS): a pool member is
 	// verified against its pool's CA file, and by the name it was configured with although
 	// the transport dials the address that name resolved to.
 	newTransport := func(verify bool) *http.Transport {
 		return &http.Transport{
-			DialContext: dialBackend,
-			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			DialContext: recordDial(dialBackend),
+			DialTLSContext: recordDial(func(ctx context.Context, network, addr string) (net.Conn, error) {
 				conn, err := dialBackend(ctx, network, addr)
 				if err != nil {
 					return nil, err
@@ -308,7 +324,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 					return nil, err
 				}
 				return tlsConn, nil
-			},
+			}),
 			MaxIdleConns:          100,
 			MaxIdleConnsPerHost:   10,
 			IdleConnTimeout:       90 * time.Second,
@@ -503,7 +519,7 @@ func (s *Server) setupHandler() http.Handler {
 			claims, err := s.extractAndValidateToken(r)
 			if err != nil {
 				logger.Warn("User API Proxy: Authentication failed", "name", s.name, "path", r.URL.Path, "error", err)
-				s.writeError(w, r, "Unauthorized", http.StatusUnauthorized)
+				s.writeError(w, r, unauthorizedMessage(err), http.StatusUnauthorized)
 				return
 			}
 
@@ -549,13 +565,21 @@ func (s *Server) setupHandler() http.Handler {
 }
 
 // writeError answers r with an error the proxy writes itself, no backend having answered.
-// It carries the CORS headers of the proxy's allowed_origins, as the backend's own errors
-// carry the backend's: without them a browser hands the page a network error instead of
-// the status, and a web client cannot tell an expired token from an outage. A forwarded
-// response carries the backend's CORS headers and must get none here.
+// The body is the User API's error, {"error": msg} as application/json (the backend's
+// writeError, docs/user-api.md "Error Response Format"), so a client reads it as it reads
+// the backend's. It carries the CORS headers of the proxy's allowed_origins, as the
+// backend's own errors carry the backend's: without them a browser hands the page a
+// network error instead of the status, and a web client cannot tell an expired token from
+// an outage. A forwarded response carries the backend's CORS headers and must get none here.
 func (s *Server) writeError(w http.ResponseWriter, r *http.Request, msg string, code int) {
-	server.SetCORSHeaders(w.Header(), r.Header.Get("Origin"), s.settings.Load().allowedOrigins)
-	http.Error(w, msg, code)
+	h := w.Header()
+	server.SetCORSHeaders(h, r.Header.Get("Origin"), s.settings.Load().allowedOrigins)
+	h.Set("Content-Type", "application/json")
+	h.Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(code)
+	if err := json.NewEncoder(w).Encode(map[string]string{"error": msg}); err != nil {
+		logger.Debug("User API Proxy: Failed to write error response", "name", s.name, "status", code, "error", err)
+	}
 }
 
 // isCORSPreflight reports whether r is a CORS-preflight request: an OPTIONS request with
@@ -572,8 +596,9 @@ func isCORSPreflight(r *http.Request) bool {
 // any handler, so it reaches no account. Unlike a request that names a user it is
 // therefore not confined to one pool: it goes to the default pool (the one pool of a flat
 // remote_addrs list), and failing that (no default pool, or no backend of it available)
-// to the first pool in configuration order with a backend available. Which pool answers
-// decides whose allowed_origins applies, so every pool's backends should share them.
+// to the first pool in configuration order with a backend available (neither in
+// maintenance nor marked unhealthy). Which pool answers decides whose allowed_origins
+// applies, so every pool's backends should share them.
 func (s *Server) routePreflight(r *http.Request) (backendRoute, error) {
 	tried := ""
 	if pool, err := s.connManager.ResolvePool(""); err == nil {
@@ -732,6 +757,9 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 // backend's own siblings (refused if its named pool cannot be identified) without
 // setting affinity, so the pin takes the user back when maintenance ends; an affinity to
 // one is dropped and the user routed afresh, so the new affinity keeps them there after it.
+// A backend marked unhealthy (three failed connections in a row) is passed over the same
+// way by affinity and consistent hash, but not by a pin: the lookup's answer is
+// definitive, as on the other proxies.
 //
 // forAuth is set for a login or refresh, which carries no token yet: anyone can name any
 // user in one, so it reads affinity but never writes it (no gossip per made-up user).
@@ -882,14 +910,17 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 		if backend, found := s.affinityManager.GetBackend(email, "userapi"); found {
 			// Affinity is gossip-synced and persisted: honor it only inside the user's pool
 			// (a user the lookup moved to another pool must not follow a stale entry), only
-			// when restrict_to_pool allows it (a poisoned entry from another node), and
-			// never to a backend in maintenance.
-			if s.connManager.PoolHasBackend(pool.Name, backend) && s.connManager.AllowRemoteLookupBackend(backend) && !s.connManager.InMaintenance(backend) {
+			// when restrict_to_pool allows it (a poisoned entry from another node), never
+			// to a backend in maintenance, and never to one marked unhealthy. Health is read
+			// without auto-recovery, as the other proxies' affinity does: a user who failed
+			// over stays on the new backend when the old one comes back.
+			if s.connManager.PoolHasBackend(pool.Name, backend) && s.connManager.AllowRemoteLookupBackend(backend) &&
+				!s.connManager.InMaintenance(backend) && s.connManager.IsBackendHealthyForAffinity(backend) {
 				logger.Debug("User API Proxy: Using affinity backend", "name", s.name, "user", email, "backend", backend, "pool", pool.Name)
 				return s.poolRoute(backend, pool), nil
 			}
 			if !forAuth {
-				logger.Info("User API Proxy: Affinity backend not in the user's pool or in maintenance - deleting affinity", "name", s.name, "user", email, "backend", backend, "pool", pool.Name)
+				logger.Info("User API Proxy: Affinity backend not in the user's pool, in maintenance or unhealthy - deleting affinity", "name", s.name, "user", email, "backend", backend, "pool", pool.Name)
 				s.affinityManager.DeleteBackend(email, "userapi")
 			}
 		}
@@ -1024,17 +1055,37 @@ func (s *Server) validateToken(tokenString string) (*JWTClaims, error) {
 	return nil, fmt.Errorf("invalid token claims")
 }
 
+// The refusals of extractAndValidateToken that unauthorizedMessage tells apart.
+var (
+	errNoAuthHeader  = errors.New("authorization header required")
+	errNotBearerAuth = errors.New("authorization header must be 'Bearer <token>'")
+)
+
+// unauthorizedMessage is the 401 message for a token extractAndValidateToken refused with
+// err: the User API's own for the same refusal (userapi jwtAuthMiddleware), so a token the
+// proxy refuses is answered as a backend answers it.
+func unauthorizedMessage(err error) string {
+	switch {
+	case errors.Is(err, errNoAuthHeader):
+		return "Authorization header required"
+	case errors.Is(err, errNotBearerAuth):
+		return "Authorization header must be 'Bearer <token>'"
+	default:
+		return "Invalid or expired token"
+	}
+}
+
 // extractAndValidateToken extracts and validates JWT token from request
 func (s *Server) extractAndValidateToken(r *http.Request) (*JWTClaims, error) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
-		return nil, fmt.Errorf("authorization header required")
+		return nil, errNoAuthHeader
 	}
 
 	// Extract token from "Bearer <token>"
 	parts := strings.SplitN(authHeader, " ", 2)
 	if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-		return nil, fmt.Errorf("authorization header must be 'Bearer <token>'")
+		return nil, errNotBearerAuth
 	}
 
 	tokenString := parts[1]
