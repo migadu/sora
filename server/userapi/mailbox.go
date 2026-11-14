@@ -113,6 +113,17 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 			info.Unseen = summary.UnseenCount
 			info.UIDNext = summary.UIDNext
 		}
+		if info.Unseen < 0 {
+			// The unseen_count cache can drift below zero; repair it from message_state
+			// as IMAP STATUS and LIST-STATUS do, and clamp if the repair fails.
+			logger.Warn("HTTP Mail API: Negative unseen_count, recomputing", "name", s.name, "mailbox", mb.Name, "unseen_count", info.Unseen)
+			repaired, err := s.rdb.RecomputeMailboxUnseenWithRetry(ctx, mb.ID)
+			if err != nil {
+				logger.Warn("HTTP Mail API: Error recomputing unseen_count", "name", s.name, "mailbox", mb.Name, "error", err)
+				repaired = 0
+			}
+			info.Unseen = int(repaired)
+		}
 		mailboxInfos = append(mailboxInfos, info)
 	}
 
