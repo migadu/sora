@@ -950,8 +950,9 @@ cache_path = "/var/lib/sora/affinity_cache.db"
 - At startup, entries that have not expired are loaded, except for users gossip has already
   provided.
 - Every change (set, update, delete, also those received by gossip) is written to the file in the
-  background, each write with a 2-second limit. Gossip changes apply only if newer than what the
-  node has. Pending writes finish at shutdown.
+  background, in the order the changes were made, each write with a 2-second limit. A key changed
+  again before its write starts is written once, with its latest state. Gossip changes apply only
+  if newer than what the node has. Pending writes finish at shutdown.
 - Expired entries are removed from memory and from the file every `cleanup_interval`.
 - The directory must exist; Sora does not create it. The file gets mode `0600`, WAL mode.
 - A corrupt file is deleted and recreated as for the auth cache. Any other error is logged
