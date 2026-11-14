@@ -866,7 +866,10 @@ enabled_extensions = []
 #
 # OPERATION:
 # - Move TO Junk folder   → Submit as SPAM training
-# - Move FROM Junk folder → Submit as HAM (not spam) training
+# - Move FROM Junk folder → Submit as HAM (not spam) training,
+#                           except a move to Trash (a delete), which is not submitted
+# Junk and Trash are the folders with the RFC 6154 \Junk and \Trash
+# special-use attributes, whatever their names.
 #
 # TRAINING REQUEST FORMAT (JSON POST to endpoint):
 # {
