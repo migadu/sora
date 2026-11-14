@@ -254,7 +254,7 @@ func main() {
 	// soft-wait cap). Clamped to a sane range inside the setter.
 	sieveengine.SetScriptExecutionTimeout(cfg.Sieve.GetMaxExecutionTime())
 
-	// Initialize logging with zap logger
+	// Initialize logging (log/slog, through the logger package)
 	logFile, err := logger.Initialize(cfg.Logging)
 	if err != nil {
 		fmt.Fprintf(logger.Stderr(), "SORA: Warning initializing logger: %v\n", err)
@@ -550,7 +550,7 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 
 	// Check if any server is configured
 	if len(allServers) == 0 {
-		errorHandler.ValidationError("servers", fmt.Errorf("no servers configured. Please configure at least one server in the [[servers]] section"))
+		errorHandler.ValidationError("servers", fmt.Errorf("no servers configured. Please configure at least one server in a [[server]] section"))
 		os.Exit(errorHandler.WaitForExit())
 	}
 
@@ -564,19 +564,19 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 func logInstanceIdentity(identity config.NodeIdentity) {
 	osHostname, err := os.Hostname()
 
-	// Warn only about the identity that is actually unsafe. A node_id that differs from
-	// the hostname is the normal, intended configuration, so it must not warn on every
+	// Warn only about the identity that is actually unsafe. An instance_id that differs
+	// from the hostname is the normal, intended configuration, so it must not warn on every
 	// boot; an id that no live instance owns is instead reported - by name, and only when
 	// one really exists - by the cleanup worker (cleaner.reportStrandedInstances).
 	if identity.InstanceID == config.FallbackInstanceID {
 		logger.Warn("Instance ID could not be derived from the host - using the fallback identity. "+
-			"Set cluster.node_id to a unique name per node: a shared instance id makes two nodes claim "+
+			"Set [uploader] instance_id to a unique name per node: a shared instance id makes two nodes claim "+
 			"each other's pending uploads, whose message bodies only exist on the node that queued them",
 			"instance_id", identity.InstanceID, "error", err)
 	} else {
 		source := "hostname"
 		if identity.InstanceID != osHostname {
-			source = "cluster.node_id"
+			source = "uploader.instance_id"
 		}
 		logger.Info("Resolved instance ID", "instance_id", identity.InstanceID, "source", source,
 			"note", "owner of this node's pending_uploads and instance_heartbeats rows; drain the upload queue before changing it")
@@ -1314,7 +1314,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 		switch server.Type {
 		case "imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy":
 			if (server.InsecureAuth || !server.TLS) && helpers.BindIsPubliclyReachable(server.Addr) {
-				logger.Warn("plaintext authentication is allowed without TLS on a publicly reachable address; configure TLS or set insecure_auth=false",
+				logger.Warn("plaintext authentication is allowed without TLS on a publicly reachable address; set tls = true and leave insecure_auth off (insecure_auth = false alone has no effect without TLS)",
 					"type", server.Type, "name", server.Name, "addr", server.Addr)
 			}
 		case "metrics":

@@ -65,7 +65,7 @@ type DatabaseConfig struct {
 	Debug            bool                    `toml:"debug"`             // Enable SQL query logging
 	QueryTimeout     string                  `toml:"query_timeout"`     // Default timeout for all database queries (default: "30s")
 	SearchTimeout    string                  `toml:"search_timeout"`    // Specific timeout for complex search queries (default: "60s")
-	WriteTimeout     string                  `toml:"write_timeout"`     // Timeout for write operations (default: "10s")
+	WriteTimeout     string                  `toml:"write_timeout"`     // Timeout for write operations (default: "15s")
 	LockTimeout      string                  `toml:"lock_timeout"`      // Max time a statement waits for a row lock before failing (default: "10s"; "0" disables)
 	MigrationTimeout string                  `toml:"migration_timeout"` // Timeout for auto-migrations at startup (default: "2m")
 	FetchChunkSize   int                     `toml:"fetch_chunk_size"`  // Number of messages to fetch per chunk for large result sets (default: 5000)
@@ -532,7 +532,7 @@ type UploaderConfig struct {
 	MaxAttempts        int    `toml:"max_attempts"`
 	RetryInterval      string `toml:"retry_interval"`
 	CleanupGracePeriod string `toml:"cleanup_grace_period"` // Minimum age of a local upload file before cleanup considers it (default: "1h"). Must exceed the longest possible DB transaction to avoid the race where a file is deleted before its pending_upload record commits.
-	MaxStagingSize     string `toml:"max_staging_size"`     // Maximum size of the global upload staging queue (e.g. "100gb"). If set and exceeded, new appends are rejected.
+	MaxStagingSize     string `toml:"max_staging_size"`     // Maximum size of this node's own upload staging backlog (e.g. "100gb"); other nodes' backlogs do not count. If set and exceeded, new appends are rejected.
 }
 
 // DefaultUploaderMaxAttempts is [uploader] max_attempts when the key is absent.
@@ -936,8 +936,8 @@ type RemoteLookupTransportConfig struct {
 	MaxIdleConnsPerHost   int    `toml:"max_idle_conns_per_host"` // Maximum idle connections per host (default: 100)
 	MaxConnsPerHost       int    `toml:"max_conns_per_host"`      // Maximum total connections per host, 0 = unlimited (default: 0)
 	IdleConnTimeout       string `toml:"idle_conn_timeout"`       // How long idle connections stay open (default: "90s")
-	DialTimeout           string `toml:"dial_timeout"`            // TCP connection timeout including DNS (default: "30s")
-	TLSHandshakeTimeout   string `toml:"tls_handshake_timeout"`   // TLS handshake timeout (default: "30s")
+	DialTimeout           string `toml:"dial_timeout"`            // TCP connection timeout including DNS (default: "10s")
+	TLSHandshakeTimeout   string `toml:"tls_handshake_timeout"`   // TLS handshake timeout (default: "10s")
 	ExpectContinueTimeout string `toml:"expect_continue_timeout"` // 100-continue timeout (default: "1s")
 	KeepAlive             string `toml:"keep_alive"`              // TCP keep-alive interval (default: "30s")
 }
@@ -1222,9 +1222,9 @@ type ServerConfig struct {
 	// Connection limits
 	MaxConnections             int `toml:"max_connections,omitempty"`
 	MaxConnectionsPerIP        int `toml:"max_connections_per_ip,omitempty"`
-	MaxConnectionsPerUser      int `toml:"max_connections_per_user,omitempty"`        // Cluster-wide per-user limit (proxy only, requires cluster mode)
+	MaxConnectionsPerUser      int `toml:"max_connections_per_user,omitempty"`        // Per-user limit: IMAP/POP3/ManageSieve servers count per server block on this node; their proxies count cluster-wide, in cluster mode only
 	MaxConnectionsPerUserPerIP int `toml:"max_connections_per_user_per_ip,omitempty"` // Local per-user-per-IP limit
-	ListenBacklog              int `toml:"listen_backlog,omitempty"`                  // TCP listen backlog size (0=system default, typically 128-512; recommended: 4096-8192)
+	ListenBacklog              int `toml:"listen_backlog,omitempty"`                  // TCP listen backlog size (0 = 1024; recommended: 4096-8192)
 
 	// IMAP specific
 	AppendLimit        string `toml:"append_limit,omitempty"`
@@ -1248,11 +1248,14 @@ type ServerConfig struct {
 	MaxMessageSize string `toml:"max_message_size,omitempty"` // Maximum size for incoming LMTP messages
 
 	// Auth security
-	InsecureAuth bool `toml:"insecure_auth,omitempty"` // Allow PLAIN auth over non-TLS connections (default: false for ManageSieve, true for IMAP/LMTP behind proxy)
+	// InsecureAuth allows plaintext authentication over non-TLS connections (default:
+	// false). Without tls = true it is allowed regardless: the IMAP, POP3, ManageSieve and
+	// LMTP servers and the IMAP, POP3 and ManageSieve proxies apply insecure_auth || !tls.
+	InsecureAuth bool `toml:"insecure_auth,omitempty"`
 
 	// ManageSieve specific
 	MaxScriptSize       string   `toml:"max_script_size,omitempty"`
-	SupportedExtensions []string `toml:"supported_extensions,omitempty"` // List of supported Sieve extensions (additional to builtins)
+	SupportedExtensions []string `toml:"supported_extensions,omitempty"` // managesieve_proxy only: Sieve extensions to advertise (additional to builtins); a managesieve server uses [sieve] enabled_extensions
 
 	// Proxy specific
 	RemoteAddrs            []string `toml:"remote_addrs,omitempty"`
@@ -1795,7 +1798,7 @@ func (s *ServerConfig) GetRemoteDNSRefresh() (*time.Duration, error) {
 
 func (s *ServerConfig) GetAuthIdleTimeout() (time.Duration, error) {
 	if s.AuthIdleTimeout == "" {
-		// Default: 2 minutes idle during authentication for all proxy types
+		// Default: 2 minutes idle during authentication, for every server type
 		return 2 * time.Minute, nil
 	}
 	return helpers.ParseDuration(s.AuthIdleTimeout)
@@ -2677,7 +2680,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 		if s.RemoteUseXCLIENT {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP and POP3 proxy servers", s.Name, s.Type)
 		}
 		// Its only timeout setting is timeouts.command_timeout (the idle timeout).
 		s.warnKeysNotApplied(logger, "the LMTP server does not apply it",
@@ -2712,7 +2715,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
 		}
 		if s.RemoteUseXCLIENT {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP and POP3 proxy servers", s.Name, s.Type)
 		}
 
 	case "pop3_proxy":
@@ -2725,9 +2728,6 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		}
 		if s.RemoteUseIDCommand {
 			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
-		}
-		if s.RemoteUseXCLIENT {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
 		}
 
 	case "lmtp_proxy":
@@ -2761,7 +2761,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
 		}
 		if s.RemoteUseXCLIENT {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP and POP3 proxy servers", s.Name, s.Type)
 		}
 
 	case "metrics", "http_admin_api", "http_user_api":
@@ -3003,22 +3003,8 @@ func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaDa
 // applyConfigDefaults sets default values for config fields where the desired default
 // differs from Go's zero value. Called after loading config from file.
 func applyConfigDefaults(cfg *Config) {
-	// Set default remote_health_checks = true for all proxy servers.
-	// NOTE: Since TOML/Go doesn't distinguish between "not set" and "set to false",
-	// we cannot reliably detect if the user explicitly disabled health checks.
-	// Users MUST explicitly set remote_health_checks = true in their config if they
-	// want health checks enabled (which is the recommended default).
-	// This is acceptable because:
-	// 1. The field name is self-documenting (remote_health_checks = true is obvious)
-	// 2. The example config shows remote_health_checks = true
-	// 3. The safe/recommended default is "enabled" (true)
-	// 4. Users who want to disable must be explicit (remote_health_checks = false)
-	//
-	// Alternative considered: Use *bool (pointer) to distinguish nil/true/false,
-	// but that would require refactoring all config access. Deferred for now.
-
-	// For now, we do nothing here - users must explicitly set remote_health_checks = true
-	// in their config file. The config.toml.example shows this as the default.
+	// remote_health_checks needs nothing here: it is a *bool, and GetRemoteHealthChecks
+	// treats a key left out of the config as true.
 
 	// Apply auth rate limiter defaults for enabled rate limiters
 	// When auth_rate_limit.enabled = true is set without other fields,

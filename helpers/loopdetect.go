@@ -24,7 +24,7 @@ const (
 
 	// DefaultMaxRedirectHops is the default cap on how many times one message may be
 	// redirected by Sora before further redirects are suppressed (mail-loop backstop).
-	// Configurable per server via [servers.*.limits] max_redirect_hops.
+	// Configurable per server via [server.limits] max_redirect_hops in a [[server]] block.
 	DefaultMaxRedirectHops = 2
 )
 

@@ -158,7 +158,7 @@ type POP3ServerOptions struct {
 	CommandTimeout              time.Duration             // Maximum idle time before disconnection
 	CommandTimeoutOverrides     map[string]time.Duration  // Per-command hard execution timeouts (overrides defaults)
 	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = no limit; go-pop3 enforces it)
-	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
+	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = disabled)
 	InsecureAuth                bool                      // Allow PLAIN auth over non-TLS connections (default: true for backends behind proxy)
 	Config                      *config.Config            // Full config for shared settings like connection tracking timeouts
 }

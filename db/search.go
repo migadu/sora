@@ -979,10 +979,10 @@ func (db *Database) buildFTSPrefilterQuery(criteria *imap.SearchCriteria, mailbo
 // message that has no FTS row at all, which silently degrades the LEFT JOIN to an inner
 // join and drops that message from the result.
 //
-// Messages with no FTS row are ordinary, not exceptional: bodies over 64 KB are never
-// staged, empty bodies are skipped, and PruneOldMessageVectors deletes rows once
-// fts_retention expires. A negated FTS criterion (NOT BODY "x") is TRUE for exactly those
-// messages, so the WHERE placement would also discard every true negative.
+// Messages with no FTS row are ordinary, not exceptional: empty bodies are never staged,
+// nor are messages already older than fts_retention, and PruneOldMessageVectors deletes
+// rows once fts_retention expires. A negated FTS criterion (NOT BODY "x") is TRUE for
+// exactly those messages, so the WHERE placement would also discard every true negative.
 //
 // The scope is written as a constant rather than as "mc.account_id = m.account_id" because
 // the composite GIN on (account_id, text_body_tsv) needs a constant to build a scan key
