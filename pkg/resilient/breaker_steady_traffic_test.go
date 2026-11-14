@@ -123,3 +123,20 @@ func TestDatabaseBreakersOpenOnSlowFailuresUnderSteadyTraffic(t *testing.T) {
 		})
 	}
 }
+
+// Taking the ratio over results must not let a few failures trip a breaker just because
+// many requests are in flight: the minimum is a number of results, too.
+func TestDatabaseBreakerRulesNeedEnoughResults(t *testing.T) {
+	if queryBreakerReadyToTrip(circuitbreaker.Counts{Requests: 50, TotalFailures: 7, ConsecutiveFailures: 7}) {
+		t.Error("query breaker trips on 7 failed results, want at least 8")
+	}
+	if writeBreakerReadyToTrip(circuitbreaker.Counts{Requests: 50, TotalFailures: 4, ConsecutiveFailures: 4}) {
+		t.Error("write breaker trips on 4 failed results, want at least 5")
+	}
+	if !queryBreakerReadyToTrip(circuitbreaker.Counts{Requests: 50, TotalFailures: 8, ConsecutiveFailures: 8}) {
+		t.Error("query breaker does not trip on 8 failed results of 8")
+	}
+	if queryBreakerReadyToTrip(circuitbreaker.Counts{Requests: 50, TotalSuccesses: 6, TotalFailures: 8}) {
+		t.Error("query breaker trips at a 57% failure ratio, want 60%")
+	}
+}

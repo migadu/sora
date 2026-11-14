@@ -345,23 +345,24 @@ const databaseBreakerMaxRequests = 10
 
 // queryBreakerReadyToTrip decides when the database query circuit breaker opens.
 func queryBreakerReadyToTrip(counts circuitbreaker.Counts) bool {
-	failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+	results := counts.Results()
+	failureRatio := float64(counts.TotalFailures) / float64(results)
 
 	// In half-open state, if we've used all allowed requests and majority failed, trip immediately
 	// This prevents deadlock where circuit stays half-open forever
-	if counts.Requests >= databaseBreakerMaxRequests && failureRatio >= 0.6 {
+	if results >= databaseBreakerMaxRequests && failureRatio >= 0.6 {
 		logger.Warn("Query circuit breaker ready to trip (half-open exhausted)", "component", "RESILIENT-FAILOVER",
-			"requests", counts.Requests, "failures", counts.TotalFailures,
+			"requests", counts.Requests, "results", results, "failures", counts.TotalFailures,
 			"failure_ratio", fmt.Sprintf("%.2f%%", failureRatio*100),
 			"max_requests", databaseBreakerMaxRequests)
 		return true
 	}
 
-	// In normal operation, require at least 8 requests to establish a pattern
-	shouldTrip := counts.Requests >= 8 && failureRatio >= 0.6
+	// In normal operation, require at least 8 results to establish a pattern
+	shouldTrip := results >= 8 && failureRatio >= 0.6
 	if shouldTrip {
 		logger.Warn("Query circuit breaker ready to trip", "component", "RESILIENT-FAILOVER",
-			"requests", counts.Requests, "failures", counts.TotalFailures,
+			"requests", counts.Requests, "results", results, "failures", counts.TotalFailures,
 			"failure_ratio", fmt.Sprintf("%.2f%%", failureRatio*100),
 			"consecutive_failures", counts.ConsecutiveFailures)
 	}
@@ -370,23 +371,24 @@ func queryBreakerReadyToTrip(counts circuitbreaker.Counts) bool {
 
 // writeBreakerReadyToTrip decides when the database write circuit breaker opens.
 func writeBreakerReadyToTrip(counts circuitbreaker.Counts) bool {
-	failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+	results := counts.Results()
+	failureRatio := float64(counts.TotalFailures) / float64(results)
 
 	// In half-open state, if we've used all allowed requests and majority failed, trip immediately
 	// This prevents deadlock where circuit stays half-open forever
-	if counts.Requests >= databaseBreakerMaxRequests && failureRatio >= 0.5 {
+	if results >= databaseBreakerMaxRequests && failureRatio >= 0.5 {
 		logger.Warn("Write circuit breaker ready to trip (half-open exhausted)", "component", "RESILIENT-FAILOVER",
-			"requests", counts.Requests, "failures", counts.TotalFailures,
+			"requests", counts.Requests, "results", results, "failures", counts.TotalFailures,
 			"failure_ratio", fmt.Sprintf("%.2f%%", failureRatio*100),
 			"max_requests", databaseBreakerMaxRequests)
 		return true
 	}
 
-	// In normal operation, require at least 5 requests to establish a pattern
-	shouldTrip := counts.Requests >= 5 && failureRatio >= 0.5
+	// In normal operation, require at least 5 results to establish a pattern
+	shouldTrip := results >= 5 && failureRatio >= 0.5
 	if shouldTrip {
 		logger.Warn("Write circuit breaker ready to trip", "component", "RESILIENT-FAILOVER",
-			"requests", counts.Requests, "failures", counts.TotalFailures,
+			"requests", counts.Requests, "results", results, "failures", counts.TotalFailures,
 			"failure_ratio", fmt.Sprintf("%.2f%%", failureRatio*100),
 			"consecutive_failures", counts.ConsecutiveFailures)
 	}
