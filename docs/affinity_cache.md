@@ -48,7 +48,7 @@ cache_path = "/var/cache/sora/affinity_cache.db"
 
 | Parameter | Default | Description |
 |---|---|---|
-| `enabled` | `false` | Enable cluster-wide server affinity |
+| `enabled` | `true` | Enable cluster-wide server affinity. `false` runs no affinity manager: no proxy on the node keeps affinity and no cache is opened |
 | `ttl` | `24h` | How long an affinity mapping persists before expiring |
 | `cleanup_interval` | `1h` | How often expired affinities are cleaned up |
 | `cache_path` | `""` (disabled) | Path to SQLite database for persistent affinity. Empty = in-memory only |

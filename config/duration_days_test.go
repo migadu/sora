@@ -144,8 +144,31 @@ auth_rate_limit.exempt_networks = ["192.0.2.0/24"]
 	}
 }
 
+// LoadConfigFromFile trims every string it decodes, so " 2d " is a valid
+// lookup_cache duration. The auth_rate_limit durations are parsed while the file
+// is decoded, before that trim, and take the same value.
+func TestAuthRateLimitDurationIsTrimmed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := "[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \":143\"\n\n[server.lookup_cache]\npositive_ttl = \" 2d \"\n\n[server.auth_rate_limit]\nip_block_duration = \" 2d \"\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var cfg Config
+	if err := LoadConfigFromFile(path, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	srv := cfg.DynamicServers[0]
+	if got, err := srv.LookupCache.GetPositiveTTL(); err != nil || got != twoDays {
+		t.Fatalf(`positive_ttl = " 2d ": got %v, %v; want %v`, got, err, twoDays)
+	}
+	if got := srv.AuthRateLimit.IPBlockDuration; got != twoDays {
+		t.Errorf(`ip_block_duration = " 2d ": got %v, want %v`, got, twoDays)
+	}
+}
+
 // The lookup_cache durations take days too, and an unparsable value falls back
-// to the key's absent default with a WARN naming the key (#417, #399).
+// to the key's absent default with a WARN naming the key and the server whose
+// [server.lookup_cache] it is: every server has its own table (#417, #399).
 func TestLookupCacheDurationsAcceptDays(t *testing.T) {
 	days := LookupCacheConfig{PositiveTTL: "2d", NegativeTTL: "2d", CleanupInterval: "2d", PositiveRevalidationWindow: "2d"}
 	absent := LookupCacheConfig{}
@@ -158,7 +181,7 @@ func TestLookupCacheDurationsAcceptDays(t *testing.T) {
 
 	for key, get := range map[string]struct {
 		parse       func(*LookupCacheConfig) (time.Duration, error)
-		withDefault func(*LookupCacheConfig) time.Duration
+		withDefault func(*LookupCacheConfig, string) time.Duration
 	}{
 		"positive_ttl":                 {(*LookupCacheConfig).GetPositiveTTL, (*LookupCacheConfig).GetPositiveTTLWithDefault},
 		"negative_ttl":                 {(*LookupCacheConfig).GetNegativeTTL, (*LookupCacheConfig).GetNegativeTTLWithDefault},
@@ -173,11 +196,11 @@ func TestLookupCacheDurationsAcceptDays(t *testing.T) {
 			t.Fatalf("absent %s: %v", key, err)
 		}
 		buf.Reset()
-		if got := get.withDefault(&invalid); got != want {
+		if got := get.withDefault(&invalid, "imap-backend"); got != want {
 			t.Errorf("invalid %s = %v, want the absent-key default %v", key, got, want)
 		}
-		if out := buf.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "lookup_cache."+key) {
-			t.Errorf("invalid %s: logged %q, want a WARN record naming it", key, out)
+		if out := buf.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "lookup_cache."+key) || !strings.Contains(out, "imap-backend") {
+			t.Errorf("invalid %s: logged %q, want a WARN record naming it and the server", key, out)
 		}
 	}
 }
