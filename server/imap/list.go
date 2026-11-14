@@ -173,8 +173,8 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 					if s.GetCapabilities().Has(imap.CapCondStore) && options.ReturnStatus.HighestModSeq {
 						statusData.HighestModSeq = summary.HighestModSeq
 					}
-					if options.ReturnStatus.AppendLimit && s.server.appendLimit > 0 {
-						limit := uint32(s.server.appendLimit)
+					if options.ReturnStatus.AppendLimit {
+						limit := s.server.appendLimit
 						statusData.AppendLimit = &limit
 					}
 					if options.ReturnStatus.Size {

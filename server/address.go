@@ -125,8 +125,25 @@ func ParseAddressWithMasterToken(input string) (Address, error) {
 	return NewAddress(input)
 }
 
-// NewAddress is an alias for ParseAddressWithMasterToken for backward compatibility
+// NewAddress is an alias for ParseAddressWithMasterToken for backward compatibility.
+// Every error it returns matches ErrInvalidAddress.
 func NewAddress(input string) (Address, error) {
+	addr, err := parseAddress(input)
+	if err != nil {
+		return Address{}, addressError{err}
+	}
+	return addr, nil
+}
+
+// addressError is a NewAddress failure. Its text is the reason alone, and it matches
+// ErrInvalidAddress, so a caller several layers up (the Admin API, the database circuit
+// breaker) tells an address that does not parse from a failure without matching text.
+type addressError struct{ error }
+
+func (e addressError) Unwrap() error        { return e.error }
+func (e addressError) Is(target error) bool { return target == ErrInvalidAddress }
+
+func parseAddress(input string) (Address, error) {
 	// Normalize: trim (but don't lowercase yet - need to preserve suffix case)
 	input = strings.TrimSpace(input)
 

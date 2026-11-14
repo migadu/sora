@@ -26,7 +26,8 @@ var (
 	// ErrUserNotFoundTempFail indicates user not found but with temp failure response (450)
 	ErrUserNotFoundTempFail = errors.New("user not found (temporary failure)")
 
-	// ErrInvalidAddress indicates that the recipient address is syntactically invalid (permanent failure - 550)
+	// ErrInvalidAddress indicates that an address is syntactically invalid (for an LMTP
+	// recipient a permanent failure - 550). Every NewAddress error matches it.
 	ErrInvalidAddress = errors.New("invalid address")
 )
 
@@ -85,7 +86,8 @@ func IsTransientError(err error) bool {
 }
 
 // IsTemporaryAuthFailure checks if an authentication error is temporary (server shutdown, service unavailable)
-// and should result in an UNAVAILABLE response rather than AUTHENTICATIONFAILED.
+// and should be answered as a temporary failure rather than as a wrong password: IMAP NO [UNAVAILABLE],
+// POP3 -ERR [SYS/TEMP], ManageSieve NO (TRYLATER).
 func IsTemporaryAuthFailure(err error) bool {
 	if err == nil {
 		return false
