@@ -180,3 +180,68 @@ func TestIMAP_Examine_Close_Succeeds(t *testing.T) {
 		t.Errorf("CLOSE after SELECT should have expunged the \\Deleted message: NumMessages = %d, want 1", sd.NumMessages)
 	}
 }
+
+// TestIMAP_Examine_FetchDoesNotSetSeen: RFC 9051 §6.3.3 says of a mailbox
+// opened with EXAMINE: "No changes to the permanent state of the mailbox,
+// including per-user state, are permitted." FETCH BODY[] and BINARY[], which
+// set \Seen in a read-write mailbox (§6.4.5), leave it alone there (#1041).
+func TestIMAP_Examine_FetchDoesNotSetSeen(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("login failed: %v", err)
+	}
+	for range 2 {
+		appendCmd := c.Append("INBOX", int64(len(binaryFetchTestMessage)), nil)
+		if _, err := appendCmd.Write([]byte(binaryFetchTestMessage)); err != nil {
+			t.Fatalf("APPEND write failed: %v", err)
+		}
+		if err := appendCmd.Close(); err != nil {
+			t.Fatalf("APPEND close failed: %v", err)
+		}
+		if _, err := appendCmd.Wait(); err != nil {
+			t.Fatalf("APPEND failed: %v", err)
+		}
+	}
+
+	if _, err := c.Select("INBOX", &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
+		t.Fatalf("EXAMINE failed: %v", err)
+	}
+	for _, tc := range []struct {
+		name  string
+		seq   uint32
+		fetch *imap.FetchOptions
+	}{
+		{"BODY[]", 1, &imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{{}}}},
+		{"BINARY[1]", 2, &imap.FetchOptions{BinarySection: []*imap.FetchItemBinarySection{{Part: []int{1}}}}},
+	} {
+		if _, err := c.Fetch(imap.SeqSetNum(tc.seq), tc.fetch).Collect(); err != nil {
+			t.Fatalf("FETCH %d (%s) after EXAMINE failed: %v", tc.seq, tc.name, err)
+		}
+	}
+
+	// A read-write SELECT shows what the EXAMINE session left behind.
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("SELECT failed: %v", err)
+	}
+	msgs, err := c.Fetch(imap.SeqSetNum(1, 2), &imap.FetchOptions{Flags: true}).Collect()
+	if err != nil {
+		t.Fatalf("FETCH FLAGS failed: %v", err)
+	}
+	for _, msg := range msgs {
+		for _, f := range msg.Flags {
+			if f == imap.FlagSeen {
+				t.Errorf("message %d is \\Seen after a FETCH in a mailbox opened with EXAMINE", msg.SeqNum)
+			}
+		}
+	}
+}
