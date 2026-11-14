@@ -1416,7 +1416,7 @@ proxy_protocol_timeout = "5s"
 
 # --- MESSAGE SIZE LIMITING ---
 # Maximum size for incoming LMTP messages to prevent memory exhaustion attacks
-max_message_size = "50mb"     # Maximum message size (default: 50MB, 0 = unlimited)
+max_message_size = "50mb"     # Maximum message size (default: 50MB; 0 also means 50MB, there is no unlimited)
 
 # --- SIEVE REDIRECT LIMITS ---
 # Applied when a delivery runs the recipient's Sieve script: by lmtp servers and by
