@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -151,6 +152,37 @@ func TestImporter_IncrementalRunKeepsMessagesDeletedInSora(t *testing.T) {
 			}
 		})
 	}
+
+	// A cache written before the stamp existed has every row unstamped. The first run
+	// after the upgrade checks them and stamps the ones it finds in the account, so from
+	// then on a deletion in Sora is respected.
+	t.Run("cache from before the stamp", func(t *testing.T) {
+		const email = "rerun-legacy@example.com"
+		accountID := rerunAccount(t, rdb, email)
+		maildir := rerunMaildir(t, 3)
+
+		runImport(t, rdb, maildir, email, opts)
+		cache, err := sql.Open("sqlite", filepath.Join(maildir, "sora-maildir.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = cache.Exec(`UPDATE messages SET account_id = NULL`)
+		cache.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		runImport(t, rdb, maildir, email, opts) // the first run after the upgrade
+		if _, err := rdb.GetOperationalDatabase().WritePool.Exec(ctx,
+			`UPDATE messages SET expunged_at = now() WHERE account_id = $1 AND subject = $2`, accountID, "Message 1"); err != nil {
+			t.Fatal(err)
+		}
+
+		runImport(t, rdb, maildir, email, opts)
+		if got := liveSubjects(t, rdb, accountID); slices.Contains(got, "Message 1") || len(got) != 2 {
+			t.Errorf("after the run following the upgrade the account has %q; want Message 0 and Message 2 only", got)
+		}
+	})
 
 	t.Run("another account", func(t *testing.T) {
 		first := rerunAccount(t, rdb, "rerun-first@example.com")
