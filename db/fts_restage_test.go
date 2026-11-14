@@ -24,7 +24,10 @@ func TestRestageFTSCreatesDestinationPair(t *testing.T) {
 		t.Skip("Skipping database integration test in short mode")
 	}
 
-	db, _, accountID, mailboxID := setupCleanerTestDatabase(t)
+	// A database of its own: ProcessFTSBatch below polls the whole FTS queue oldest first,
+	// so in the shared database 500 rows queued by other packages or earlier runs would
+	// fill the batch before it reached this test's row.
+	db, _, accountID, mailboxID := setupCleanerTestDatabaseWithSuffix(t, "_ftsqueue")
 	defer db.Close()
 
 	ctx := context.Background()
