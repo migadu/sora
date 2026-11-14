@@ -335,3 +335,21 @@ func TestMultipleRedirects(t *testing.T) {
 		})
 	}
 }
+
+// Evaluate decides which addresses a message is redirected to, but whether one is
+// relayed is decided later, by delivery: the relay may be missing or refuse it, and
+// the message is then kept instead. So evaluation charges nothing against the rate
+// limit (#327); delivery charges each address it actually queued or sent.
+func TestEvaluateDoesNotChargeRedirects(t *testing.T) {
+	ro := &countingRedirectOracle{}
+	res, err := evalRedirectScript(t, `redirect "one@example.com"; redirect "two@example.org";`, ro, 100)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if res.Action != ActionRedirect || len(res.RedirectTo) != 2 {
+		t.Fatalf("expected a redirect to two addresses, got %s %v", res.Action, res.RedirectTo)
+	}
+	if ro.recorded != 0 {
+		t.Errorf("evaluation charged %d redirects before any was relayed", ro.recorded)
+	}
+}
