@@ -26,7 +26,7 @@ bcrypt_cost = 12
 # ADMIN CLI CONFIGURATION (for sora-admin tool)
 # =============================================================================
 # Configuration for the sora-admin CLI tool to connect to the HTTP Admin API server.
-# Required for commands like 'sora-admin stats auth', 'stats connection', 'connections list', 'connections kick', etc.
+# Required for commands like 'sora-admin stats blocked', 'stats connection', 'connections list', 'connections kick', etc.
 
 [admin_cli]
 addr = "http://localhost:8080"              # HTTP Admin API endpoint address (use https:// if TLS is enabled)
