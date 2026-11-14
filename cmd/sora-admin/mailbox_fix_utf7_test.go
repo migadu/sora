@@ -5,6 +5,9 @@ package main
 import (
 	"context"
 	"os"
+	"regexp"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/migadu/sora/config"
@@ -36,17 +39,7 @@ func TestMailboxFixUTF7KeepsHierarchy(t *testing.T) {
 	}
 	require.NoError(t, rdb.CreateMailboxWithRetry(ctx, accountID, "Cé", nil))
 
-	previousConfig, previousArgs := globalConfig, os.Args
-	t.Cleanup(func() { globalConfig, os.Args = previousConfig, previousArgs })
-	name := os.Getenv("SORA_TEST_DB_NAME")
-	if name == "" {
-		name = "sora_test_db"
-	}
-	globalConfig.Database = config.DatabaseConfig{Write: &config.DatabaseEndpointConfig{
-		Hosts: []string{"localhost"}, Port: "5432", User: "postgres", Name: name,
-	}}
-	os.Args = []string{"sora-admin", "mailbox", "fix-utf7", "--email", account.Email}
-	handleMailboxFixUTF7(ctx)
+	runMailboxFixUTF7(t, ctx, account.Email)
 
 	path := func(t *testing.T, name string) string {
 		t.Helper()
@@ -83,4 +76,69 @@ func TestMailboxFixUTF7KeepsHierarchy(t *testing.T) {
 	t.Run("parent not a candidate", func(t *testing.T) {
 		requireChildOf(t, "Tom&-Jerry/Résumé", "Tom&-Jerry")
 	})
+}
+
+// TestMailboxFixUTF7DryRunMatchesRun: --dry-run lists the renames the run makes. It
+// writes nothing, so it has to carry each rename down to the children itself, as the
+// rename does in the database: a child is renamed under its parent's new name, a child
+// whose own level needs no decoding just moves with its parent, and a parent that is
+// no candidate keeps its name.
+func TestMailboxFixUTF7DryRunMatchesRun(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	ctx := context.Background()
+	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, account.Email)
+	require.NoError(t, err)
+
+	for _, name := range []string{
+		"A&AOk-/B&AOk-/C",           // B is renamed under A's new name, C moves with B
+		"Parent/R&AOk-pertoire/Sub", // Sub moves with its parent
+		"Tom&-Jerry/R&AOk-sum&AOk-", // the parent is no candidate and keeps its name
+	} {
+		_, err := rdb.ResolveOrCreateMailboxPathWithRetry(ctx, accountID, name)
+		require.NoError(t, err, "create %q", name)
+	}
+
+	line := regexp.MustCompile(`(?m)^\s+(?:WOULD RENAME|OK)\s+account_id=\d+\s+(".*")\s+->\s+(".*")$`)
+	renames := func(out string) []string {
+		var got []string
+		for _, m := range line.FindAllStringSubmatch(out, -1) {
+			got = append(got, m[1]+" -> "+m[2])
+		}
+		sort.Strings(got)
+		return got
+	}
+	predicted := renames(runMailboxFixUTF7(t, ctx, account.Email, "--dry-run"))
+	made := renames(runMailboxFixUTF7(t, ctx, account.Email))
+
+	require.Equal(t, []string{
+		`"A&AOk-" -> "Aé"`,
+		`"Aé/B&AOk-" -> "Aé/Bé"`,
+		`"Parent/R&AOk-pertoire" -> "Parent/Répertoire"`,
+		`"Tom&-Jerry/R&AOk-sum&AOk-" -> "Tom&-Jerry/Résumé"`,
+	}, made)
+	require.Equal(t, made, predicted, "the dry run must list the renames the run makes")
+}
+
+// runMailboxFixUTF7 runs "sora-admin mailbox fix-utf7" for one account against the
+// test database and returns what it printed.
+func runMailboxFixUTF7(t *testing.T, ctx context.Context, email string, flags ...string) string {
+	t.Helper()
+	previousConfig, previousArgs := globalConfig, os.Args
+	t.Cleanup(func() { globalConfig, os.Args = previousConfig, previousArgs })
+	name := os.Getenv("SORA_TEST_DB_NAME")
+	if name == "" {
+		name = "sora_test_db"
+	}
+	globalConfig.Database = config.DatabaseConfig{Write: &config.DatabaseEndpointConfig{
+		Hosts: []string{"localhost"}, Port: "5432", User: "postgres", Name: name,
+	}}
+	os.Args = append([]string{"sora-admin", "mailbox", "fix-utf7", "--email", email}, flags...)
+	out := captureStdout(t, func() error {
+		handleMailboxFixUTF7(ctx)
+		return nil
+	})
+	t.Logf("%s\n%s", strings.Join(os.Args[2:], " "), out)
+	return out
 }
