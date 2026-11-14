@@ -13,9 +13,12 @@ const MaxReferencesBytes = 2000
 // A References field grows by one ID per reply, the parent's last (RFC 5322 §3.6.4), and
 // RFC 5256 §2.2 links a message to its last reference, so when the list does not fit,
 // whole IDs are dropped from the middle: the first ID (the thread's root) and as many of
-// the last ones as fit are kept, which is how RFC 5537 §3.4.4 trims References. Should
-// the first and the parent not fit together, the parent is kept. No ID is ever cut: a
-// partial one would match no message and link the message to a dummy.
+// the last ones as fit are kept. This uses the middle-removal approach of the Netnews
+// rule in RFC 5537 §3.4.4; the database bound can prevent retaining all three IDs that
+// rule requires (the first and last two). Should the first and the parent not fit
+// together, the parent is kept. No ID is ever cut: a partial one would match no message
+// and link the message to a dummy. Only the derived database value is bounded; the
+// message's original header is unchanged.
 func TrimReferences(ids []string, maxBytes int) string {
 	kept := make([]string, 0, len(ids))
 	size := -1 // the joined length: every ID plus a space between each two
