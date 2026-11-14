@@ -1,12 +1,12 @@
 -- Migration 009: Performance optimizations for top 5 queries
 -- Targets queries identified in database-performance-analysis.md
 --
--- ZERO-DOWNTIME DEPLOYMENT:
---   1. First run the pre-migration script manually (outside a transaction):
---      psql -d DATABASE -f 000009_performance_optimizations_pre.sql
---      This creates indexes CONCURRENTLY (non-blocking) and populates the cache.
---   2. Then apply this migration normally via golang-migrate.
---      Indexes use IF NOT EXISTS, so pre-created indexes are skipped.
+-- ZERO-DOWNTIME DEPLOYMENT: the pre-migration script this migration was written with is
+-- not in this repository. The file runs as one transaction, so its index builds hold
+-- write locks on messages and mailboxes, and the ADD COLUMN's ACCESS EXCLUSIVE lock on
+-- mailbox_stats, until the last build ends. On a large database build the three indexes
+-- below by hand first, outside a transaction, with CREATE INDEX CONCURRENTLY IF NOT EXISTS
+-- and exactly the names and definitions used below; this migration then skips them.
 
 -- ============================================================================
 -- 1. CUSTOM FLAGS CACHE (Query #5: 8.80% of load, 27.4M calls)
@@ -23,11 +23,11 @@
 
 ALTER TABLE mailbox_stats ADD COLUMN IF NOT EXISTS custom_flags_cache JSONB DEFAULT NULL;
 
--- NOTE: Cache population is handled by the pre-migration script
--- (000009_performance_optimizations_pre.sql) using batched updates.
--- New messages will be handled by the trigger below.
--- Mailboxes not yet populated will have NULL in the cache,
--- and the Go code falls back to the full scan query.
+-- NOTE: nothing here fills the cache of existing mailboxes. Their rows stay NULL, the Go
+-- code falls back to the full scan for them, and the trigger below rebuilds a mailbox's
+-- cache on its next custom-flag change. Migration 000024 later sets every cache still
+-- NULL to '[]', after which keywords set before this migration, in a mailbox whose cache
+-- was never rebuilt, are missing from the cache and from that mailbox's FLAGS.
 
 -- Trigger function to maintain custom_flags_cache when message flags change
 CREATE OR REPLACE FUNCTION maintain_custom_flags_cache()

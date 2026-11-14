@@ -4,6 +4,7 @@ package httpapi
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -67,5 +68,55 @@ func TestAdminAPI_DeliverMail_WakesRelayWorker(t *testing.T) {
 	}
 	if n := worker.notified.Load(); n != int32(len(queued)) {
 		t.Errorf("relay worker woken %d times for %d queued messages %v", n, len(queued), queued)
+	}
+}
+
+// TestAdminAPI_DeliverMail_VacationPersonalMessageCheck is the RFC 5230 §4.5 personal
+// message check on /admin/mail/deliver against the credentials table, which issue #487
+// answers in one query for all of the original's recipients. The account's own address
+// with a +detail counts as the account's; a message that names neither the account nor
+// an :addresses entry gets no reply. The second case is the one that fails if the Admin
+// API stops wiring the batched ownership lookup: without it the check is skipped and
+// every message is answered.
+func TestAdminAPI_DeliverMail_VacationPersonalMessageCheck(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	rq := &captureRelayQueue{}
+	server, _ := setupHTTPAPIServerWithOptions(t, func(o *adminapi.ServerOptions) {
+		o.RelayQueue = rq
+	})
+	defer server.Close()
+
+	script := "require \"vacation\";\r\nvacation \"I am away.\";\r\n"
+	for _, tc := range []struct {
+		name    string
+		to      func(email string) string
+		replies int
+	}{
+		{name: "own address with +detail", to: func(email string) string {
+			local, domain, _ := strings.Cut(email, "@")
+			return "list@example.net, " + local + "+tag@" + domain
+		}, replies: 1},
+		{name: "account not named", to: func(string) string {
+			return "list@example.net, other@example.net"
+		}, replies: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := len(rq.enqueued())
+			marker := fmt.Sprintf("personal-%d", time.Now().UnixNano())
+			deliverMessageWithScript(t, server, script, marker, func(email string) string {
+				return "From: sender@example.org\r\nTo: " + tc.to(email) + "\r\nSubject: personal?\r\n" +
+					"Message-ID: <" + marker + "@example.org>\r\n\r\nbody\r\n"
+			})
+			replies := 0
+			for _, typ := range rq.enqueued()[before:] {
+				if typ == "vacation" {
+					replies++
+				}
+			}
+			if replies != tc.replies {
+				t.Errorf("%d vacation replies, want %d", replies, tc.replies)
+			}
+		})
 	}
 }

@@ -557,30 +557,9 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			// Load TLS config: Use global TLS manager config if available, otherwise load from files
-			var tlsConfig *tls.Config
-			if s.server.tlsConfig != nil {
-				// Use global TLS manager (e.g., Let's Encrypt autocert)
-				tlsConfig = s.server.tlsConfig
-			} else if s.server.tlsCertFile != "" && s.server.tlsKeyFile != "" {
-				// Load from cert files
-				cert, err := tls.LoadX509KeyPair(s.server.tlsCertFile, s.server.tlsKeyFile)
-				if err != nil {
-					s.DebugLog("Failed to load TLS certificate", "error", err)
-					s.sendResponse("454 4.3.0 TLS not available due to configuration error")
-					continue
-				}
-
-				tlsConfig = &tls.Config{
-					MinVersion:    tls.VersionTLS12,
-					Certificates:  []tls.Certificate{cert},
-					ClientAuth:    tls.NoClientCert,
-					Renegotiation: tls.RenegotiateNever,
-				}
-				if s.server.tlsVerify {
-					tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-				}
-			} else {
+			// The listener's TLS config, resolved once in New (server.ListenerTLS).
+			tlsConfig := s.server.tlsConfig
+			if tlsConfig == nil {
 				s.DebugLog("STARTTLS config error")
 				s.sendResponse("454 4.3.0 TLS not available due to configuration error")
 				continue

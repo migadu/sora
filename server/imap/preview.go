@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"container/list"
 	"context"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -206,15 +205,11 @@ func (s *IMAPSession) localPreview(msg *db.Message) (string, previewLocalState) 
 // with the message is a leftover of an interrupted write and is ignored, as
 // loadMessageBody ignores it.
 func (s *IMAPSession) previewFromFile(path string, size int) (string, previewLocalState) {
-	f, err := os.Open(path)
-	if err != nil {
+	f := openLocalBody(path, size)
+	if f == nil {
 		return "", previewLocalMiss
 	}
 	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil || !fi.Mode().IsRegular() || !bodyLenMatches(fi.Size(), size) {
-		return "", previewLocalMiss
-	}
 	if !s.memoryAvailable(previewMemReserve) {
 		return "", previewLocalLimited
 	}

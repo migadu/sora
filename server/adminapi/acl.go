@@ -60,25 +60,25 @@ func (s *Server) aclContext(r *http.Request) context.Context {
 func (s *Server) handleACLGrant(w http.ResponseWriter, r *http.Request) {
 	var req ACLGrantRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "Invalid request body"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
 	// Validate required fields
 	if strings.TrimSpace(req.Owner) == "" {
-		http.Error(w, `{"error": "owner is required"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "owner is required")
 		return
 	}
 	if req.Mailbox == "" {
-		http.Error(w, `{"error": "mailbox is required"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "mailbox is required")
 		return
 	}
 	if req.Identifier == "" {
-		http.Error(w, `{"error": "identifier is required"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "identifier is required")
 		return
 	}
 	if req.Rights == "" {
-		http.Error(w, `{"error": "rights is required"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "rights is required")
 		return
 	}
 
@@ -112,21 +112,21 @@ func (s *Server) handleACLGrant(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleACLRevoke(w http.ResponseWriter, r *http.Request) {
 	var req ACLRevokeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "Invalid request body"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
 	// Validate required fields
 	if strings.TrimSpace(req.Owner) == "" {
-		http.Error(w, `{"error": "owner is required"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "owner is required")
 		return
 	}
 	if req.Mailbox == "" {
-		http.Error(w, `{"error": "mailbox is required"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "mailbox is required")
 		return
 	}
 	if req.Identifier == "" {
-		http.Error(w, `{"error": "identifier is required"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "identifier is required")
 		return
 	}
 
@@ -165,11 +165,11 @@ func (s *Server) handleACLList(w http.ResponseWriter, r *http.Request) {
 
 	// Validate required parameters
 	if strings.TrimSpace(owner) == "" {
-		http.Error(w, `{"error": "owner parameter is required"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "owner parameter is required")
 		return
 	}
 	if mailbox == "" {
-		http.Error(w, `{"error": "mailbox parameter is required"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "mailbox parameter is required")
 		return
 	}
 

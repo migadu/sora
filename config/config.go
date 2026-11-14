@@ -1043,11 +1043,11 @@ func (c *RemoteLookupConfig) GetRemotePort() (int, error) {
 	default:
 		return 0, fmt.Errorf("invalid type for remote_port: %T", v)
 	}
-	port := int(p)
-	if port < 0 || port > 65535 {
-		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", port)
+	// Range-check before converting to int: TOML integers are int64 even on 32-bit targets.
+	if p < 0 || p > 65535 {
+		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", p)
 	}
-	return port, nil
+	return int(p), nil
 }
 
 // ServerLimitsConfig holds resource limits for a server
@@ -1072,7 +1072,7 @@ type ServerTimeoutsConfig struct {
 	CommandTimeout             string                            `toml:"command_timeout,omitempty"`              // Maximum idle time before disconnection (default: protocol-specific)
 	AbsoluteSessionTimeout     string                            `toml:"absolute_session_timeout,omitempty"`     // Maximum total session duration (default: 24h)
 	MinBytesPerMinute          int64                             `toml:"min_bytes_per_minute,omitempty"`         // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
-	SchedulerShardCount        int                               `toml:"scheduler_shard_count,omitempty"`        // Number of timeout scheduler shards (default: 0 = runtime.NumCPU(), -1 = runtime.NumCPU()/2 for physical cores)
+	SchedulerShardCount        int                               `toml:"scheduler_shard_count,omitempty"`        // Not applied (warned about): the one timeout scheduler of the process is sized by [timeout_scheduler] shard_count
 	IMAPCommandTimeouts        *CommandTimeoutsConfig            `toml:"imap_command_timeouts,omitempty"`        // Per-command hard execution timeouts (IMAP only)
 	ManageSieveCommandTimeouts *ManageSieveCommandTimeoutsConfig `toml:"managesieve_command_timeouts,omitempty"` // Per-command hard execution timeouts (ManageSieve only)
 	POP3CommandTimeouts        *POP3CommandTimeoutsConfig        `toml:"pop3_command_timeouts,omitempty"`        // Per-command hard execution timeouts (POP3 only)
@@ -1871,6 +1871,11 @@ func (s *ServerConfig) defaultCommandTimeout() time.Duration {
 		return 30 * time.Minute
 	case "managesieve", "managesieve_proxy":
 		return 3 * time.Minute // 3 minutes for ManageSieve
+	case "lmtp":
+		// RFC 5321 §4.5.3.2.7: "An SMTP server SHOULD have a timeout of at least
+		// 5 minutes while it is awaiting the next command from the sender", and
+		// RFC 2033 §4 makes LMTP identical to SMTP except as it says.
+		return 5 * time.Minute
 	default:
 		return 2 * time.Minute // Default: 2 minutes
 	}
@@ -2164,11 +2169,11 @@ func (s *ServerConfig) GetRemotePort() (int, error) {
 	default:
 		return 0, fmt.Errorf("invalid type for remote_port: %T", v)
 	}
-	port := int(p)
-	if port < 0 || port > 65535 {
-		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", port)
+	// Range-check before converting to int: TOML integers are int64 even on 32-bit targets.
+	if p < 0 || p > 65535 {
+		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", p)
 	}
-	return port, nil
+	return int(p), nil
 }
 
 // GetRemoteHealthChecks returns whether backend health checking is enabled.
@@ -2468,6 +2473,20 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
+	// A proxy dials a backend address without a port at its remote_port, or at its enabled
+	// lookup's remote_port for a lookup-routed one. No other server reads either, and a
+	// disabled lookup is never initialized.
+	if strings.HasSuffix(s.Type, "_proxy") {
+		if _, err := s.GetRemotePort(); err != nil {
+			return fmt.Errorf("server %q: invalid remote_port: %w", s.Name, err)
+		}
+		if s.RemoteLookup != nil && s.RemoteLookup.Enabled {
+			if _, err := s.RemoteLookup.GetRemotePort(); err != nil {
+				return fmt.Errorf("server %q: invalid remote_lookup.remote_port: %w", s.Name, err)
+			}
+		}
+	}
+
 	if s.Type == "metrics" {
 		if s.Path != "" && !strings.HasPrefix(s.Path, "/") {
 			return fmt.Errorf("server %q: metrics path %q must begin with '/'", s.Name, s.Path)
@@ -2520,11 +2539,22 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured, but this only applies to IMAP, LMTP, ManageSieve and POP3 servers and proxies", s.Name, s.Type)
 		}
 	}
+	// tls_verify asks the TLS handshake for a client certificate; without TLS
+	// there is no handshake to ask in.
+	if s.TLSVerify && !s.TLS {
+		logger("WARNING: Server %s (type: %s) has 'tls_verify' configured without 'tls = true'; it is ignored and no client certificate is required", s.Name, s.Type)
+	}
+	if s.Timeouts != nil && s.Timeouts.SchedulerShardCount != 0 {
+		logger("WARNING: Server %s (type: %s) has 'timeouts.scheduler_shard_count' configured, but it has no effect: all servers share one timeout scheduler, sized by [timeout_scheduler] shard_count", s.Name, s.Type)
+	}
 
 	// Check proxy-only options on non-proxy servers
 	if !strings.HasSuffix(s.Type, "_proxy") {
 		if len(s.RemoteAddrs) > 0 {
 			logger("WARNING: Server %s (type: %s) has 'remote_addrs' configured, but this only applies to proxy servers", s.Name, s.Type)
+		}
+		if s.RemoteTLSCAFile != "" {
+			logger("WARNING: Server %s (type: %s) has 'remote_tls_ca_file' configured, but this only applies to proxy servers", s.Name, s.Type)
 		}
 		if s.RemoteTLS {
 			logger("WARNING: Server %s (type: %s) has 'remote_tls' configured, but this only applies to proxy servers", s.Name, s.Type)
@@ -2559,7 +2589,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	case "imap":
 		// IMAP server
 		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 		if s.RemoteUseIDCommand {
 			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
@@ -2568,25 +2598,39 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	case "lmtp":
 		// LMTP server
 		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 		if s.RemoteUseXCLIENT {
 			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
 		}
+		// Its only timeout setting is timeouts.command_timeout (the idle timeout).
+		s.warnKeysNotApplied(logger, "the LMTP server does not apply it",
+			configKey{"timeouts.absolute_session_timeout", s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != ""},
+			configKey{"timeouts.min_bytes_per_minute", s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0},
+			configKey{"auth_idle_timeout", s.AuthIdleTimeout != ""},
+			configKey{"limits.session_memory_limit", s.Limits != nil && s.Limits.SessionMemoryLimit != ""})
+		// MTAs deliver many messages at once from few addresses.
+		s.warnKeysNotApplied(logger, "the LMTP server limits only its total connections (max_connections)",
+			configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
+			configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+			configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 
 	case "pop3":
 		// POP3 server
 		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 
 	case "managesieve":
-		// ManageSieve server - no proxy-specific warnings needed (handled above)
+		// ManageSieve server
+		if len(s.SupportedExtensions) > 0 {
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but a ManageSieve server offers the [sieve] enabled_extensions; this only applies to ManageSieve proxy servers", s.Name, s.Type)
+		}
 
 	case "imap_proxy":
 		// IMAP proxy
 		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers/proxies", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 		if s.MaxScriptSize != "" {
 			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
@@ -2598,7 +2642,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	case "pop3_proxy":
 		// POP3 proxy
 		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers/proxies", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 		if s.MaxScriptSize != "" {
 			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
@@ -2613,7 +2657,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	case "lmtp_proxy":
 		// LMTP proxy
 		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers/proxies", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 		if s.MaxScriptSize != "" {
 			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
@@ -2621,6 +2665,16 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		if s.RemoteUseIDCommand {
 			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
 		}
+		// Its timeouts are auth_idle_timeout and timeouts.absolute_session_timeout.
+		s.warnKeysNotApplied(logger, "the LMTP proxy does not apply it",
+			configKey{"timeouts.command_timeout", s.Timeouts != nil && s.Timeouts.CommandTimeout != ""},
+			configKey{"timeouts.min_bytes_per_minute", s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0})
+		// MTAs deliver many messages at once from few addresses, and an LMTP client
+		// does not log in as a user.
+		s.warnKeysNotApplied(logger, "the LMTP proxy limits only its total connections (max_connections)",
+			configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
+			configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+			configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 
 	case "managesieve_proxy":
 		// ManageSieve proxy
@@ -2637,7 +2691,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	case "metrics", "http_admin_api", "http_user_api":
 		// HTTP servers - warn about protocol-specific options
 		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 		if s.MaxScriptSize != "" {
 			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
@@ -2650,6 +2704,22 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		}
 		if s.Type == "metrics" && s.ProxyProtocol {
 			logger("WARNING: Server %s (type: metrics) has 'proxy_protocol' configured, but the metrics endpoint does not read PROXY protocol headers; it is ignored, and 'allowed_hosts' matches the connecting host", s.Name)
+		}
+	}
+}
+
+// configKey is a server setting by its TOML key, and whether the block sets it.
+type configKey struct {
+	name string
+	set  bool
+}
+
+// warnKeysNotApplied warns about each of keys the block sets, which its server type
+// accepts but does not apply, for reason.
+func (s *ServerConfig) warnKeysNotApplied(logger func(format string, args ...any), reason string, keys ...configKey) {
+	for _, k := range keys {
+		if k.set {
+			logger("WARNING: Server %s (type: %s) has '%s' configured, but %s", s.Name, s.Type, k.name, reason)
 		}
 	}
 }
@@ -2739,6 +2809,35 @@ func TrustedNetworksHaveBroadPrivateRanges(networks []string) bool {
 // All other syntax errors will cause the server to fail with helpful error messages
 func LoadConfigFromFile(configPath string, cfg *Config) error {
 	_, err := LoadConfigFromFileWithMetadata(configPath, cfg)
+	return err
+}
+
+// LoadServerConfig loads the file at configPath into cfg as the server runs with it. cfg
+// starts from NewDefaultConfig, so a setting the file leaves out takes the server's
+// default, not the zero value. sora-admin loads its file with it too: it works on the
+// same spool, cache and database, and an unset [uploader] path read as "" made `uploader
+// resolve` look for staged bodies in its working directory.
+//
+// A [database.write] or [database.read] endpoint the file does not define is unset, so a
+// node without one (a proxy) runs without that database. NewDefaultConfig seeds both only
+// so that a table in the file takes the defaults for the keys it leaves out. Whether a
+// table is in the file is read from the TOML metadata, never from its values: a table
+// that names localhost, postgres and sora_mail_db is a database the node must use.
+//
+// A file that does not exist leaves cfg at those defaults, without database endpoints,
+// and returns the error from os.ReadFile.
+func LoadServerConfig(configPath string, cfg *Config) error {
+	*cfg = NewDefaultConfig()
+	md, err := LoadConfigFromFileWithMetadata(configPath, cfg)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if !md.IsDefined("database", "write") {
+		cfg.Database.Write = nil
+	}
+	if !md.IsDefined("database", "read") {
+		cfg.Database.Read = nil
+	}
 	return err
 }
 

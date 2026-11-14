@@ -104,7 +104,7 @@ func TestVacationSuppressionRecordedOnlyOnSend(t *testing.T) {
 		reply := evaluateVacation(t, oracle, "bob@external.com")
 
 		rq := &orderedRelayQueue{oracle: oracle}
-		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane}
+		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane, IsAnyOwnedAddress: ownsAny(ownsJane)}
 		// The account is not in To/Cc, so HandleVacationResponse must not reply.
 		orig := makeMessage(map[string]string{"From": "bob@external.com", "To": "list@example.com"})
 

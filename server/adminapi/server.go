@@ -68,10 +68,7 @@ type Server struct {
 	maxConnections int                  // Max concurrent connections; 0 -> unlimited
 	server         *http.Server
 	tls            bool
-	tlsConfig      *tls.Config // TLS config from manager (takes precedence) or nil
-	tlsCertFile    string
-	tlsKeyFile     string
-	tlsVerify      bool
+	tlsConfig      *tls.Config // What the listener serves with (server.ListenerTLS); nil without tls
 	hostname       string
 	// instanceID is the upload-lease key (pending_uploads.instance_id), distinct from
 	// hostname, which is the SMTP-visible name stamped into Received headers.
@@ -241,13 +238,18 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		return nil, err
 	}
 
-	// Validate TLS configuration
+	// The certificate source and tls_verify follow the rule every listener
+	// shares (server.ListenerTLS).
+	var tlsConfig *tls.Config
 	if options.TLS {
-		// If TLSConfig is provided (from manager), use it. Otherwise require cert files.
-		if options.TLSConfig == nil {
-			if options.TLSCertFile == "" || options.TLSKeyFile == "" {
-				return nil, fmt.Errorf("TLS certificate and key files are required when TLS is enabled (or use TLS manager)")
-			}
+		var err error
+		tlsConfig, err = server.ListenerTLS{
+			Protocol: "Admin API", Name: options.Name,
+			CertFile: options.TLSCertFile, KeyFile: options.TLSKeyFile, Verify: options.TLSVerify,
+			Global: options.TLSConfig,
+		}.Config()
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -280,10 +282,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		maxMessageSize:     options.MaxMessageSize,
 		maxConnections:     options.MaxConnections,
 		tls:                options.TLS,
-		tlsConfig:          options.TLSConfig,
-		tlsCertFile:        options.TLSCertFile,
-		tlsKeyFile:         options.TLSKeyFile,
-		tlsVerify:          options.TLSVerify,
+		tlsConfig:          tlsConfig,
 		hostname:           options.Hostname,
 		instanceID:         options.InstanceID,
 		uploadMaxAttempts:  options.UploadMaxAttempts,
@@ -453,31 +452,12 @@ func (s *Server) start(ctx context.Context) error {
 		listener = netutil.LimitListener(listener, s.maxConnections)
 	}
 
-	// Start server with or without TLS
+	// Start server with or without TLS. The certificate is in TLSConfig
+	// already: certificate files passed to ServeTLS would be loaded again and
+	// served, next to the global certificate, to clients that send no SNI.
 	if s.tls {
-		// Use TLS config from manager if provided, otherwise create one for static certs
-		var tlsConfig *tls.Config
-		if s.tlsConfig != nil {
-			// Clone the manager's TLS config
-			tlsConfig = s.tlsConfig.Clone()
-		} else {
-			// Create new TLS config for static certificates
-			tlsConfig = &tls.Config{
-				MinVersion:    tls.VersionTLS12,
-				Renegotiation: tls.RenegotiateNever,
-			}
-		}
-
-		// Apply client verification settings
-		if s.tlsVerify {
-			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-		} else {
-			tlsConfig.ClientAuth = tls.NoClientCert
-		}
-		s.server.TLSConfig = tlsConfig
-
-		// Serve with TLS using the listener
-		return s.server.ServeTLS(listener, s.tlsCertFile, s.tlsKeyFile)
+		s.server.TLSConfig = s.tlsConfig
+		return s.server.ServeTLS(listener, "", "")
 	}
 	return s.server.Serve(listener)
 }

@@ -327,40 +327,19 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		server.listenBacklog = 1024 // Default backlog
 	}
 
-	// Setup TLS: the global [tls] manager's config when there is one, the
-	// per-server certificate files otherwise.
-	if options.TLS && options.TLSConfig != nil {
-		if options.TLSCertFile != "" || options.TLSKeyFile != "" {
-			logger.Warn("POP3: tls_cert_file/tls_key_file ignored - global [tls] is enabled", "name", name)
-		}
-		server.tlsConfig = options.TLSConfig
-	} else if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
-		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
+	// The certificate source and tls_verify follow the rule every listener
+	// shares (serverPkg.ListenerTLS).
+	if options.TLS {
+		tlsConfig, err := serverPkg.ListenerTLS{
+			Protocol: "POP3", Name: name,
+			CertFile: options.TLSCertFile, KeyFile: options.TLSKeyFile, Verify: options.TLSVerify,
+			Global: options.TLSConfig, ALPN: []string{"pop3"},
+		}.Config()
 		if err != nil {
 			serverCancel()
-			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, err
 		}
-		server.tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12, // Allow older TLS versions for better compatibility
-			ClientAuth:               tls.NoClientCert,
-			ServerName:               hostname,
-			PreferServerCipherSuites: true, // Prefer server cipher suites over client cipher suites
-			NextProtos:               []string{"pop3"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-
-		// Set InsecureSkipVerify if requested (for self-signed certificates)
-		// This setting on the server listener is intended to control client certificate
-		// verification, which is now explicitly disabled via `ClientAuth: tls.NoClientCert`.
-		if !options.TLSVerify {
-			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
-			logger.Debug("POP3: WARNING - TLS certificate verification not enforced", "name", name)
-		}
-	} else if options.TLS {
-		// Without a certificate the listener would be plaintext on the port meant for TLS.
-		serverCancel()
-		return nil, fmt.Errorf("TLS enabled for POP3 [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", name)
+		server.tlsConfig = tlsConfig
 	}
 
 	// Start connection limiter cleanup

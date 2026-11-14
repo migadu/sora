@@ -34,7 +34,7 @@ func TestDelivery_VacationResponseIdentity(t *testing.T) {
 			executor := &delivery.StandardSieveExecutor{
 				DeliveryCtx:     &delivery.DeliveryContext{Ctx: ctx, RDB: rdb, Logger: testLogger{t}, MetricsLabel: "http_delivery"},
 				VacationOracle:  &delivery.VacationOracle{RDB: rdb},
-				VacationHandler: &delivery.StandardVacationHandler{Hostname: "m", RelayQueue: q, IsOwnedAddress: rdb.IsAddressOwnedByAccountWithRetry},
+				VacationHandler: &delivery.StandardVacationHandler{Hostname: "m", RelayQueue: q, IsOwnedAddress: rdb.IsAddressOwnedByAccountWithRetry, IsAnyOwnedAddress: rdb.IsAnyAddressOwnedByAccountWithRetry},
 			}
 			from, err := server.NewAddress(fmt.Sprintf("identity-%d@example.net", time.Now().UnixNano()))
 			require.NoError(t, err)
