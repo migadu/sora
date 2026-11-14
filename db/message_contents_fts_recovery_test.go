@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/migadu/go-imap"
 	"github.com/stretchr/testify/require"
@@ -14,7 +15,7 @@ import (
 // A real COPY restage can lose its only vector source to source-account purge.
 // Recovery may replace only empty placeholders with known-positive legacy vectors.
 func TestFTSRecoverMessageContentsRepairsEmptyDestinations(t *testing.T) {
-	for _, mode := range []string{"queued", "poisoned", "legacy text without known vector"} {
+	for _, mode := range []string{"queued", "poisoned", "legacy text without known vector", "concurrent worker poisons", "concurrent worker supplies vector"} {
 		t.Run(mode, func(t *testing.T) {
 			skipDatabaseTestInShortMode(t)
 			ctx := context.Background()
@@ -55,7 +56,7 @@ func TestFTSRecoverMessageContentsRepairsEmptyDestinations(t *testing.T) {
 			_, err = pool.Exec(ctx, `UPDATE messages_fts_v2 SET created_at='2000-01-01',sent_date='2001-01-01'
     WHERE content_hash='hash_indexed' AND account_id=$1`, f.accountID)
 			require.NoError(t, err)
-			if mode != "queued" {
+			if mode == "poisoned" || mode == "legacy text without known vector" {
 				tx, err = pool.Begin(ctx)
 				require.NoError(t, err)
 				_, err = database.ProcessFTSBatch(ctx, tx, 100)
@@ -73,8 +74,37 @@ func TestFTSRecoverMessageContentsRepairsEmptyDestinations(t *testing.T) {
 			_, err = pool.Exec(ctx, string(script))
 			require.NoError(t, err, "the recovery script must remain reloadable")
 			var restored int
-			require.NoError(t, pool.QueryRow(ctx, `SELECT inserted FROM sora_fts_recover_batch(NULL,100)`).Scan(&restored))
-			if mode == "legacy text without known vector" {
+			if strings.HasPrefix(mode, "concurrent worker") {
+				worker, err := pool.Begin(ctx)
+				require.NoError(t, err)
+				defer worker.Rollback(ctx)
+				word := ""
+				if mode == "concurrent worker supplies vector" {
+					word = "current fox"
+				}
+				_, err = worker.Exec(ctx, `UPDATE messages_fts_v2 SET text_body_tsv=to_tsvector('simple',$2)
+					WHERE content_hash='hash_indexed' AND account_id=$1`, f.accountID, word)
+				require.NoError(t, err)
+				conn, err := pool.Acquire(ctx)
+				require.NoError(t, err)
+				defer conn.Release()
+				pid := conn.Conn().PgConn().PID()
+				recoveryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+				done := make(chan error, 1)
+				go func() {
+					done <- conn.QueryRow(recoveryCtx, `SELECT inserted FROM sora_fts_recover_batch(NULL,100)`).Scan(&restored)
+				}()
+				require.Eventually(t, func() bool {
+					var waiting bool
+					return pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid=$1 AND NOT granted)`, pid).Scan(&waiting) == nil && waiting
+				}, 5*time.Second, 10*time.Millisecond)
+				require.NoError(t, worker.Commit(ctx))
+				require.NoError(t, <-done)
+			} else {
+				require.NoError(t, pool.QueryRow(ctx, `SELECT inserted FROM sora_fts_recover_batch(NULL,100)`).Scan(&restored))
+			}
+			if mode == "legacy text without known vector" || mode == "concurrent worker supplies vector" {
 				require.Zero(t, restored)
 			} else {
 				require.Equal(t, 1, restored)
@@ -112,8 +142,14 @@ func TestFTSRecoverMessageContentsRepairsEmptyDestinations(t *testing.T) {
 			}
 			results, err := database.SearchMessagesWithCriteria(ctx, f.mailboxID, f.accountID, &imap.SearchCriteria{Body: []string{"zebra"}}, 100, 3)
 			require.NoError(t, err)
-			if mode == "legacy text without known vector" {
+			if mode == "legacy text without known vector" || mode == "concurrent worker supplies vector" {
 				require.Empty(t, results)
+				if mode == "concurrent worker supplies vector" {
+					results, err := database.SearchMessagesWithCriteria(ctx, f.mailboxID, f.accountID,
+						&imap.SearchCriteria{Body: []string{"fox"}}, 100, 3)
+					require.NoError(t, err)
+					require.Len(t, results, 1, "recovery must preserve the worker's newly committed vector")
+				}
 			} else {
 				require.Len(t, results, 1)
 			}
