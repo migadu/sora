@@ -53,6 +53,22 @@ func TestImporter_DovecotSubscriptionsFile(t *testing.T) {
 			want:    []string{"INBOX", "Work/Projects", "Vendors"},
 			notWant: []string{"V\t2"},
 		},
+		{
+			// Dovecot drops the CR of a CRLF line; an unversioned Maildir++ file
+			// separates levels with '.', as the folder directories do.
+			name:    "dovecot unversioned Maildir++ with CRLF",
+			file:    "INBOX\r\nWork.Projects\r\n",
+			want:    []string{"INBOX", "Work/Projects"},
+			notWant: []string{"INBOX\r", "Work.Projects", "Work.Projects\r"},
+		},
+		{
+			// The folder import trims a name and refuses one with TAB, CR or LF,
+			// so a subscription must name the mailbox that import gives the folder.
+			name:    "names resolved like the folder import",
+			file:    "V\t2\n\n Sent Items \nBad\x01nName\nGood\n",
+			want:    []string{"Sent", "Good"},
+			notWant: []string{" Sent Items ", "Bad\nName"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			email := fmt.Sprintf("subs-%d@example.com", n)
