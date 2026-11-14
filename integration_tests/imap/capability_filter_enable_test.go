@@ -122,3 +122,34 @@ func TestIMAP_ClientFilterOnRev2OnlyServerKeepsIMAP4rev2(t *testing.T) {
 	c.mustOK("SELECT INBOX")
 	c.mustOK("MOVE 1 Moved")
 }
+
+// SELECT (CONDSTORE) is a CONDSTORE enabling command just as ENABLE CONDSTORE
+// is, and RFC 7162 §3.1 makes the server "include mod-sequence data in all
+// subsequent untagged FETCH responses (until the connection is closed)" after
+// any of them. A filter matched by a later ID kept taking CONDSTORE, and with it
+// MODSEQ, away from such a client. What the client has not enabled is still
+// withdrawn.
+func TestIMAP_ClientFilterAfterCondStoreEnablingCommandKeepsCondStore(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	c := dialDisabledCaps(t, enableFilter, false)
+	c.appendMessage()
+
+	if resp := c.mustOK("SELECT INBOX (CONDSTORE)"); !strings.Contains(resp, "[HIGHESTMODSEQ ") {
+		t.Fatalf("SELECT INBOX (CONDSTORE): want HIGHESTMODSEQ, got:\n%s", resp)
+	}
+	c.mustOK(`ID ("name" "buggy")`)
+
+	caps := advertisedCaps(t, c.mustOK("CAPABILITY"))
+	if !slices.Contains(caps, "CONDSTORE") {
+		t.Errorf("CAPABILITY after SELECT (CONDSTORE) and ID lost CONDSTORE: %v", caps)
+	}
+	for _, gone := range []string{"IMAP4rev2", "UIDPLUS", "MOVE", "QRESYNC"} {
+		if slices.Contains(caps, gone) {
+			t.Errorf("CAPABILITY still offers %s, which the filter withdraws and the client did not enable: %v", gone, caps)
+		}
+	}
+	if resp := c.mustOK(`STORE 1 +FLAGS (\Flagged)`); !strings.Contains(resp, "MODSEQ (") {
+		t.Errorf("STORE after SELECT (CONDSTORE): untagged FETCH without MODSEQ:\n%s", resp)
+	}
+	c.wantBad("UID EXPUNGE 1:*")
+}
