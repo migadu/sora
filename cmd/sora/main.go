@@ -475,6 +475,11 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 		os.Exit(errorHandler.WaitForExit())
 	}
 
+	if err := cfg.Relay.Validate(); err != nil {
+		errorHandler.ValidationError("[relay]", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+
 	// Fail closed: a listener that accepts PROXY protocol with an empty trusted_networks
 	// would let any reachable host spoof the client IP via a PROXY header. (security-audit M2)
 	if missing := cfg.ProxyProtocolListenersMissingTrust(); len(missing) > 0 {
@@ -1004,6 +1009,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 				// would be 250-accepted into pending/ and sit there forever. Refuse to
 				// start rather than accept mail into a dead end.
 				errorHandler.FatalError("configure relay", fmt.Errorf("unsupported [relay] type %q: expected \"smtp\" or \"http\"", cfg.Relay.Type))
+				os.Exit(errorHandler.WaitForExit())
 			}
 
 			if relayHandler != nil {
