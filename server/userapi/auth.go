@@ -181,6 +181,21 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Verify password
 	if err := db.VerifyPassword(hashedPassword, req.Password); err != nil {
+		if errors.Is(err, db.ErrUnverifiableHash) {
+			// No password matches the stored hash, so this is no verdict on the submitted
+			// one: the stored data is at fault, and only an administrator can repair it.
+			// Answered like a database outage, as the proxies and the backends do: a
+			// temporary failure, not counted as a failed login (a block earned on it
+			// would outlast the repair), nothing cached. A login cached for this address
+			// was verified against another hash than the one now stored, so it is
+			// dropped: while it stays, every password that misses it is answered here,
+			// uncounted, and the cached one still signs in. VerifyPassword logged why,
+			// without the address.
+			s.authCache.Invalidate(req.Email)
+			logger.Warn("User API: authentication unavailable", "name", s.name, "email", req.Email, "reason", "unverifiable_hash", "error", err)
+			s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
+			return
+		}
 		// Cache negative result if cache enabled (result=2 for invalid password)
 		if s.authCache != nil {
 			s.authCache.SetFailure(req.Email, 2)
