@@ -114,3 +114,47 @@ func TestCertificateStoredAfterDeletionReachesS3(t *testing.T) {
 		t.Error("S3 holds something other than the certificate stored after the deletion")
 	}
 }
+
+// TestExpiredCertificateIsNotWrittenBack: sora-admin tls clean removes expired
+// certificates from S3 and leaves no deletion marker, since a node may hold a valid
+// replacement under the same name that S3 has yet to receive. The sync must still not
+// write an expired local copy back - it is of no use to any node - and drops it instead.
+func TestExpiredCertificateIsNotWrittenBack(t *testing.T) {
+	const domain = "mail.example.com"
+	ctx := context.Background()
+
+	stub, endpoint := newStubS3(t)
+	fallbackDir := t.TempDir()
+	m, _ := newTestLetsEncryptManager(t, endpoint, func(le *config.TLSLetsEncryptConfig) {
+		le.FallbackDir = fallbackDir
+	})
+	shared := newStubS3Cache(t, endpoint)
+
+	expired := certCacheEntry(t, domain, 1, time.Now().Add(-91*24*time.Hour), time.Now().Add(-24*time.Hour))
+	if err := shared.Put(ctx, domain, expired); err != nil {
+		t.Fatalf("seeding S3: %v", err)
+	}
+	if err := m.syncCertificateFromS3(ctx, domain); err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+	localPath := filepath.Join(fallbackDir, domain)
+	if _, err := os.Stat(localPath); err != nil {
+		t.Fatalf("initial sync did not cache the certificate locally: %v", err)
+	}
+
+	// What tls clean does to the bucket: the object goes, no marker is left.
+	stub.mu.Lock()
+	delete(stub.objects, "/certs/"+S3ObjectKey(domain))
+	stub.mu.Unlock()
+
+	if err := m.syncCertificateFromS3(ctx, domain); err != nil {
+		t.Fatalf("sync after the clean: %v", err)
+	}
+
+	if data, err := shared.Get(ctx, domain); !errors.Is(err, autocert.ErrCacheMiss) {
+		t.Errorf("S3 after the sync: %d bytes, err = %v; the expired certificate was written back", len(data), err)
+	}
+	if _, err := os.Stat(localPath); !os.IsNotExist(err) {
+		t.Errorf("expired local copy still in %s (stat err = %v)", fallbackDir, err)
+	}
+}

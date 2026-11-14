@@ -522,3 +522,47 @@ func TestTLSDeletionSticksOnRunningNodes(t *testing.T) {
 		})
 	}
 }
+
+// TestTLSCleanKeepsANodesValidReplacement: tls clean deletes expired certificates only.
+// A node that renewed a certificate while S3 refused its writes holds the valid
+// replacement locally while S3 still holds the expired one. After the clean, the node
+// must write its replacement to S3, not drop it as a certificate the clean deleted.
+func TestTLSCleanKeepsANodesValidReplacement(t *testing.T) {
+	const name = "mail.example.com"
+	ctx := context.Background()
+	_, endpoint := newTLSStubS3(t)
+	cfg := tlsTestConfig(endpoint)
+
+	s3, err := tlsmanager.NewS3Cache(cfg.TLS.LetsEncrypt.S3)
+	if err != nil {
+		t.Fatalf("NewS3Cache: %v", err)
+	}
+	if err := s3.Put(ctx, name, certificateEntry(t, name, 1, time.Now().Add(-24*time.Hour))); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	nodeDir := t.TempDir()
+	replacement := certificateEntry(t, name, 2, time.Now().Add(60*24*time.Hour))
+	if err := os.WriteFile(filepath.Join(nodeDir, name), replacement, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cleanTLSCertificates(ctx, cfg, t.TempDir(), false, true); err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+
+	startSyncingNode(t, cfg, nodeDir)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		got, err := s3.Get(ctx, name)
+		if err == nil && bytes.Equal(got, replacement) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("S3 does not hold the node's valid replacement after the clean (err = %v)", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(filepath.Join(nodeDir, name)); err != nil {
+		t.Errorf("the node lost its valid replacement: %v", err)
+	}
+}
