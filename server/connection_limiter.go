@@ -222,26 +222,28 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 	if cl.maxPerIP > 0 && !exempt {
 		// Use cluster-wide tracking if available, otherwise use local tracking
 		if cl.ipTracker != nil {
-			// Cluster mode: increment cluster-wide counter
-			cl.ipTracker.IncrementIP(trackingIP)
-			perIP = int64(cl.ipTracker.GetIPCount(trackingIP))
+			// Cluster mode: the tracker checks the cluster-wide count and counts
+			// the connection at once, so concurrent accepts from one IP, on this
+			// listener or a sibling of it on this node, can't overshoot maxPerIP.
+			count, ok := cl.ipTracker.TryIncrementIP(trackingIP, cl.maxPerIP)
+			if !ok {
+				cl.currentTotal.Add(-1)
+				return nil, fmt.Errorf("%w for %s (%d/%d)", ErrMaxConnectionsPerIP, trackingIP, count, cl.maxPerIP)
+			}
+			perIP = int64(count)
 		} else {
 			// Local mode: increment local counter using lock-free LoadOrStore
 			value, _ := cl.perIPConnections.LoadOrStore(trackingIP, &atomic.Int64{})
 			ipCounter = value.(*atomic.Int64)
 			perIP = ipCounter.Add(1)
-		}
 
-		// Post-increment per-IP guard, mirroring the total-counter guard above: close the
-		// check/increment TOCTOU so concurrent accepts from one IP can't overshoot maxPerIP.
-		if perIP > int64(cl.maxPerIP) {
-			if cl.ipTracker != nil {
-				cl.ipTracker.DecrementIP(trackingIP)
-			} else if ipCounter != nil {
+			// Post-increment per-IP guard, mirroring the total-counter guard above: close the
+			// check/increment TOCTOU so concurrent accepts from one IP can't overshoot maxPerIP.
+			if perIP > int64(cl.maxPerIP) {
 				ipCounter.Add(-1)
+				cl.currentTotal.Add(-1)
+				return nil, fmt.Errorf("%w for %s (%d/%d)", ErrMaxConnectionsPerIP, trackingIP, cl.maxPerIP, cl.maxPerIP)
 			}
-			cl.currentTotal.Add(-1)
-			return nil, fmt.Errorf("%w for %s (%d/%d)", ErrMaxConnectionsPerIP, trackingIP, cl.maxPerIP, cl.maxPerIP)
 		}
 
 		if realClientIP != "" {
