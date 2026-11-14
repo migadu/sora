@@ -1098,7 +1098,9 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # Disable specific IMAP capabilities for ALL clients connecting to this server.
 # Disabled capabilities are not announced in CAPABILITY responses and cannot be
 # used: what they add is refused, e.g. with MOVE disabled the MOVE command gets
-# BAD, and with STATUS=SIZE disabled so does STATUS (SIZE).
+# BAD, and with STATUS=SIZE disabled so does STATUS (SIZE). Not yet for
+# THREAD=*, MULTISEARCH, UIDPLUS, CREATE-SPECIAL-USE, LIST-EXTENDED, SPECIAL-USE
+# and ID: disabling one of those only stops announcing it.
 #
 # This is different from client_filters which apply based on client identity.
 # Use this when you want to disable capabilities for ALL clients on this server.
