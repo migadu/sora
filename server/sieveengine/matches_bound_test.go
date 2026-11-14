@@ -54,15 +54,15 @@ if body :raw :matches "*NEEDLE*" {
 	}
 
 	// Needle well within the cap -> matched -> fileinto "Matched".
-	if res, _ := eval(bodyWithNeedleAt(1024)); res.Action != ActionFileInto || res.Mailbox != "Matched" {
-		t.Fatalf("needle within cap: expected fileinto Matched, got action=%q mailbox=%q", res.Action, res.Mailbox)
+	if res, _ := eval(bodyWithNeedleAt(1024)); res.Action != ActionFileInto || strings.Join(res.Mailboxes, ",") != "Matched" {
+		t.Fatalf("needle within cap: expected fileinto Matched, got action=%q mailbox=%q", res.Action, strings.Join(res.Mailboxes, ","))
 	}
 
 	// Needle planted beyond the cap -> truncated away -> no match -> implicit
 	// keep, and the evaluation stays well under the 2s script budget.
 	res, elapsed := eval(bodyWithNeedleAt(inputCap + 50_000))
 	if res.Action != ActionKeep {
-		t.Fatalf("needle past cap: expected keep (truncated, no match), got action=%q mailbox=%q", res.Action, res.Mailbox)
+		t.Fatalf("needle past cap: expected keep (truncated, no match), got action=%q mailbox=%q", res.Action, strings.Join(res.Mailboxes, ","))
 	}
 	if elapsed > time.Second {
 		t.Errorf("bounded match took too long (%v); expected sub-second after truncation", elapsed)
@@ -91,7 +91,7 @@ if header :matches "Subject" "ticket-*" {
 	if err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
-	if res.Action != ActionFileInto || res.Mailbox != "Tickets/42" {
-		t.Fatalf("expected fileinto Tickets/42 from captured wildcard, got action=%q mailbox=%q", res.Action, res.Mailbox)
+	if res.Action != ActionFileInto || strings.Join(res.Mailboxes, ",") != "Tickets/42" {
+		t.Fatalf("expected fileinto Tickets/42 from captured wildcard, got action=%q mailbox=%q", res.Action, strings.Join(res.Mailboxes, ","))
 	}
 }

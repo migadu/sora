@@ -216,8 +216,8 @@ keep;
 		t.Errorf("Expected Copy=true (explicit keep after fileinto), got false")
 	}
 
-	if result.Mailbox != "Spam" {
-		t.Errorf("Expected Mailbox=Spam, got %s", result.Mailbox)
+	if strings.Join(result.Mailboxes, ",") != "Spam" {
+		t.Errorf("Expected Mailbox=Spam, got %s", strings.Join(result.Mailboxes, ","))
 	}
 }
 
@@ -258,8 +258,8 @@ fileinto "Spam";
 		t.Errorf("Expected Copy=false (no explicit keep), got true")
 	}
 
-	if result.Mailbox != "Spam" {
-		t.Errorf("Expected Mailbox=Spam, got %s", result.Mailbox)
+	if strings.Join(result.Mailboxes, ",") != "Spam" {
+		t.Errorf("Expected Mailbox=Spam, got %s", strings.Join(result.Mailboxes, ","))
 	}
 }
 
@@ -369,8 +369,8 @@ func TestVacationAlongsideEveryAction(t *testing.T) {
 	}{
 		{name: "implicit keep", want: Result{Action: ActionKeep}},
 		{name: "keep", command: `keep;`, want: Result{Action: ActionKeep}},
-		{name: "fileinto", command: `fileinto "Archive";`, want: Result{Action: ActionFileInto, Mailbox: "Archive"}},
-		{name: "fileinto :copy", command: `fileinto :copy "Archive";`, want: Result{Action: ActionFileInto, Mailbox: "Archive", Copy: true}},
+		{name: "fileinto", command: `fileinto "Archive";`, want: Result{Action: ActionFileInto, Mailboxes: []string{"Archive"}}},
+		{name: "fileinto :copy", command: `fileinto :copy "Archive";`, want: Result{Action: ActionFileInto, Mailboxes: []string{"Archive"}, Copy: true}},
 		{name: "redirect", command: `redirect "elsewhere@example.net";`, want: Result{Action: ActionRedirect, RedirectTo: []string{"elsewhere@example.net"}}},
 		{name: "discard", command: `discard;`, want: Result{Action: ActionDiscard}},
 	}
@@ -398,11 +398,11 @@ func TestVacationAlongsideEveryAction(t *testing.T) {
 				t.Fatalf("Failed to evaluate script: %v", err)
 			}
 
-			if result.Action != tt.want.Action || result.Mailbox != tt.want.Mailbox ||
+			if result.Action != tt.want.Action || !slices.Equal(result.Mailboxes, tt.want.Mailboxes) ||
 				!slices.Equal(result.RedirectTo, tt.want.RedirectTo) || result.Copy != tt.want.Copy {
 				t.Errorf("got action %s mailbox %q redirect %q copy %v, want %s %q %q %v",
-					result.Action, result.Mailbox, result.RedirectTo, result.Copy,
-					tt.want.Action, tt.want.Mailbox, tt.want.RedirectTo, tt.want.Copy)
+					result.Action, strings.Join(result.Mailboxes, ","), result.RedirectTo, result.Copy,
+					tt.want.Action, tt.want.Mailboxes, tt.want.RedirectTo, tt.want.Copy)
 			}
 			if result.Vacation == nil {
 				t.Fatalf("the vacation reply was dropped next to %s", result.Action)
@@ -724,8 +724,8 @@ if body :contains "URGENT" {
 			if result.Action != tt.expectedAction {
 				t.Errorf("Expected action %s, got %s", tt.expectedAction, result.Action)
 			}
-			if result.Action == ActionFileInto && result.Mailbox != tt.expectedBox {
-				t.Errorf("Expected mailbox %s, got %s", tt.expectedBox, result.Mailbox)
+			if result.Action == ActionFileInto && strings.Join(result.Mailboxes, ",") != tt.expectedBox {
+				t.Errorf("Expected mailbox %s, got %s", tt.expectedBox, strings.Join(result.Mailboxes, ","))
 			}
 		})
 	}

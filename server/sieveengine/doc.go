@@ -85,8 +85,11 @@
 //		// Script error
 //	}
 //
-//	// Apply result actions
-//	if result.Mailbox != "" {
-//		deliverToMailbox(result.Mailbox)
+//	// Apply result actions: relay every redirect, then store every copy
+//	for _, addr := range result.RedirectTo {
+//		relay(addr)
+//	}
+//	for _, dest := range result.Destinations(false) {
+//		deliverToMailbox(dest.Mailbox)
 //	}
 package sieveengine
