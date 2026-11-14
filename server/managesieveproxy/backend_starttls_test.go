@@ -304,6 +304,51 @@ func TestConnectToBackendAuthenticateReplyStatus(t *testing.T) {
 	}
 }
 
+// The string of an OK may be a literal: RFC 5804 section 4, response-ok = "OK" [SP "("
+// resp-code ")"] [SP string] CRLF, string = quoted / literal-c2s / literal-s2c. The
+// proxy reads the whole reply. After STARTTLS the literal is not data sent behind the
+// OK; after AUTHENTICATE it is not left in the reader the relay forwards to the client.
+func TestConnectToBackendReadsLiteralInStatusReply(t *testing.T) {
+	const literal = "{14}\r\nLogged in.\r\nOK\r\n" // a line break and a status word inside
+	t.Run("STARTTLS", func(t *testing.T) {
+		addr, commands := fakeSieveBackend{startTLSReply: "OK " + literal}.start(t)
+		sess, err := connectSieveBackend(t, addr, proxy.BackendSettings{TLS: true, TLSUseStartTLS: true}, nil)
+		if sess.backendConn != nil {
+			defer sess.backendConn.Close()
+		}
+		if err != nil {
+			t.Fatalf("connectToBackendAndAuth: %v", err)
+		}
+		if _, upgraded := sess.backendConn.(*tls.Conn); !upgraded {
+			t.Errorf("backendConn after STARTTLS is %T, want *tls.Conn", sess.backendConn)
+		}
+		sess.backendConn.Close()
+		if got := commands(); len(got) != 2 || got[0] != "STARTTLS" || !strings.HasPrefix(got[1], "AUTHENTICATE \"PLAIN\" ") {
+			t.Errorf("backend received %q, want STARTTLS, AUTHENTICATE", got)
+		}
+	})
+	t.Run("AUTHENTICATE", func(t *testing.T) {
+		addr, commands := fakeSieveBackend{authReply: "OK " + literal}.start(t)
+		sess, err := connectSieveBackend(t, addr, proxy.BackendSettings{}, nil)
+		if sess.backendConn != nil {
+			defer sess.backendConn.Close()
+		}
+		if err != nil {
+			t.Fatalf("connectToBackendAndAuth: %v", err)
+		}
+		// The fake backend sends nothing more until the next command, so anything the
+		// relay could read now is left over from the AUTHENTICATE reply.
+		sess.backendConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		if extra, err := sess.backendReader.ReadString('\n'); extra != "" || err == nil {
+			t.Errorf("relay would forward %q to the client after login (read error %v), want nothing", extra, err)
+		}
+		sess.backendConn.Close()
+		if got := commands(); len(got) != 1 || !strings.HasPrefix(got[0], "AUTHENTICATE \"PLAIN\" ") {
+			t.Errorf("backend received %q, want AUTHENTICATE", got)
+		}
+	})
+}
+
 // A capability list ends with OK, NO or BYE (RFC 5804 section 4: response-capability =
 // *(single-capability) response-oknobye), matched case-insensitively. A backend refusing
 // the connection (a sora backend over its max_connections_per_ip answers
