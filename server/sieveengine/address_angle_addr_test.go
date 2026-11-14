@@ -2,6 +2,7 @@ package sieveengine
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -46,7 +47,7 @@ if address :is ["to", "cc"] ["user@example.com", "josé@example.com"] {
 				t.Fatalf("evaluate: %v", err)
 			}
 			if result.Action != tc.want {
-				t.Errorf("action = %s (mailbox %q), want %s", result.Action, result.Mailbox, tc.want)
+				t.Errorf("action = %s (mailbox %q), want %s", result.Action, strings.Join(result.Mailboxes, ","), tc.want)
 			}
 		})
 	}

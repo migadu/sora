@@ -1004,7 +1004,8 @@ func createDatabasePool(ctx context.Context, host string, dbConfig *config.Datab
 	// A dedicated read pool keeps heavy writes from starving reads, which only matters on a
 	// host that serves both: a write host when [database.read] is not configured. A replica
 	// takes no writes, and with [database.read] the write hosts take reads only as a
-	// fallback, so every other host gets one pool of max_connections.
+	// fallback (no healthy replica, or sora-admin, which skips the replicas), where the
+	// reads share the write pool. Every other host gets one pool of max_connections.
 	readEndpointConfigured := dbConfig.Read != nil && len(dbConfig.Read.Hosts) > 0
 	tempConfig := &config.DatabaseConfig{
 		Debug:               dbConfig.GetDebug(),
