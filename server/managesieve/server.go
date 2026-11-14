@@ -803,7 +803,11 @@ func (s *ManageSieveServer) ReloadConfig(cfg config.ServerConfig) error {
 		next.minBytesPerMinute = bpm
 		reloaded = append(reloaded, "min_bytes_per_minute")
 	}
-	if maxSize := cfg.GetMaxScriptSizeWithDefault(); maxSize != next.maxScriptSize {
+	// A value that does not parse keeps the running limit (start-up, which has none,
+	// uses the default).
+	if maxSize, err := cfg.GetMaxScriptSize(); err != nil {
+		logger.Warn("ManageSieve config reload: invalid max_script_size, keeping the running value", "name", s.name, "error", err, "running", next.maxScriptSize)
+	} else if maxSize != next.maxScriptSize {
 		next.maxScriptSize = maxSize
 		reloaded = append(reloaded, "max_script_size")
 	}

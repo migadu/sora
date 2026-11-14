@@ -1700,11 +1700,21 @@ func IMAPAppendLimit(servers []ServerConfig) (int64, error) {
 	return 0, fmt.Errorf("no IMAP server configured")
 }
 
+// GetMaxScriptSize returns the ManageSieve script size limit. Omitted or zero is the
+// 16KB default; there is no unlimited setting (go-managesieve reads a limit of 0 as
+// none, and would then accept a script literal of any length).
 func (s *ServerConfig) GetMaxScriptSize() (int64, error) {
 	if s.MaxScriptSize == "" {
 		return 16 * 1024, nil // 16KB default
 	}
-	return helpers.ParseSize(s.MaxScriptSize)
+	size, err := helpers.ParseSize(s.MaxScriptSize)
+	if err != nil {
+		return 0, err
+	}
+	if size == 0 {
+		return 16 * 1024, nil
+	}
+	return size, nil
 }
 
 func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
