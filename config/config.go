@@ -1654,6 +1654,24 @@ func (s *ServerConfig) GetRedirectRateWindow() (time.Duration, error) {
 	return time.Hour, nil // Default: 1 hour
 }
 
+// LongestRedirectRateWindow returns the longest redirect_rate_window of the enabled
+// servers that apply the Sieve redirect rate limit, LMTP and the Admin API, and at
+// least the default (1h), which a server also uses for a window that does not parse.
+// The limit counts redirect_log rows within the window, so the cleaner keeps them at
+// least this long.
+func (c *Config) LongestRedirectRateWindow() time.Duration {
+	longest := time.Hour
+	for _, server := range c.GetAllServers() {
+		if server.Type != "lmtp" && server.Type != "http_admin_api" {
+			continue
+		}
+		if window, err := server.GetRedirectRateWindow(); err == nil && window > longest {
+			longest = window
+		}
+	}
+	return longest
+}
+
 // GetMaxRedirectHops returns how many times one message may be redirected before
 // further redirects are suppressed (mail-loop backstop). 0 means unlimited.
 func (s *ServerConfig) GetMaxRedirectHops() int {

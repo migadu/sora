@@ -851,9 +851,10 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		deps.ftsRetention = ftsRetention
 		healthStatusRetention := cfg.Cleanup.GetHealthStatusRetentionWithDefault()
 		instanceLiveness := cfg.Cleanup.GetInstanceLivenessThresholdWithDefault()
+		redirectRateWindow := cfg.LongestRedirectRateWindow()
 
 		cleanupErrChan := make(chan error, 1)
-		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, cfg.Uploader.MaxAttempts, instanceLiveness, cleanupErrChan)
+		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, redirectRateWindow, cfg.Uploader.MaxAttempts, instanceLiveness, cleanupErrChan)
 		deps.ftsWorker = fts.NewWorker(deps.resilientDB)
 
 		// Start error listener for cleanup worker
