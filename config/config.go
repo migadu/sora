@@ -2593,6 +2593,16 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	if s.ReadOnlyAPIKey != "" && s.Type != "http_admin_api" {
 		logger("WARNING: Server %s (type: %s) has 'read_only_api_key' configured, but this only applies to http_admin_api servers", s.Name, s.Type)
 	}
+	// Only the servers that check passwords themselves build a failed-login limiter.
+	// The Admin API (bearer key), the metrics endpoint, LMTP and the LMTP and User API
+	// proxies never read this table.
+	if s.AuthRateLimit != nil && s.AuthRateLimit.Enabled {
+		switch s.Type {
+		case "imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "http_user_api":
+		default:
+			logger("WARNING: Server %s (type: %s) has 'auth_rate_limit' enabled, but this only applies to imap, pop3, managesieve, their proxies and http_user_api servers; failed attempts on this server are not counted, delayed or blocked", s.Name, s.Type)
+		}
+	}
 	if s.TLSUseStartTLS {
 		switch s.Type {
 		case "imap", "lmtp", "managesieve", "pop3", "imap_proxy", "lmtp_proxy", "managesieve_proxy", "pop3_proxy":

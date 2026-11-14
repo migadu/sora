@@ -52,6 +52,22 @@ func TestWarnUnusedConfigOptions_KeysTheServerTypeDoesNotApply(t *testing.T) {
 		{"lmtp_proxy absolute_session_timeout", ServerConfig{Type: "lmtp_proxy", Timeouts: timeouts(ServerTimeoutsConfig{AbsoluteSessionTimeout: "5m"})}, ""},
 		{"lmtp_proxy auth_idle_timeout", ServerConfig{Type: "lmtp_proxy", AuthIdleTimeout: "2m"}, ""},
 
+		// auth_rate_limit: only servers that check passwords build the limiter. The
+		// Admin API compares a bearer key and answers 403 at once, every time (#504).
+		{"http_admin_api auth_rate_limit", ServerConfig{Type: "http_admin_api", AuthRateLimit: &AuthRateLimiterConfig{Enabled: true}}, "auth_rate_limit"},
+		{"metrics auth_rate_limit", ServerConfig{Type: "metrics", AuthRateLimit: &AuthRateLimiterConfig{Enabled: true}}, "auth_rate_limit"},
+		{"lmtp auth_rate_limit", ServerConfig{Type: "lmtp", AuthRateLimit: &AuthRateLimiterConfig{Enabled: true}}, "auth_rate_limit"},
+		{"lmtp_proxy auth_rate_limit", ServerConfig{Type: "lmtp_proxy", AuthRateLimit: &AuthRateLimiterConfig{Enabled: true}}, "auth_rate_limit"},
+		{"user_api_proxy auth_rate_limit", ServerConfig{Type: "user_api_proxy", AuthRateLimit: &AuthRateLimiterConfig{Enabled: true}}, "auth_rate_limit"},
+		{"http_admin_api auth_rate_limit disabled", ServerConfig{Type: "http_admin_api", AuthRateLimit: &AuthRateLimiterConfig{Enabled: false}}, ""},
+		{"imap auth_rate_limit", ServerConfig{Type: "imap", AuthRateLimit: &AuthRateLimiterConfig{Enabled: true}}, ""},
+		{"pop3 auth_rate_limit", ServerConfig{Type: "pop3", AuthRateLimit: &AuthRateLimiterConfig{Enabled: true}}, ""},
+		{"managesieve auth_rate_limit", ServerConfig{Type: "managesieve", AuthRateLimit: &AuthRateLimiterConfig{Enabled: true}}, ""},
+		{"imap_proxy auth_rate_limit", ServerConfig{Type: "imap_proxy", AuthRateLimit: &AuthRateLimiterConfig{Enabled: true}}, ""},
+		{"pop3_proxy auth_rate_limit", ServerConfig{Type: "pop3_proxy", AuthRateLimit: &AuthRateLimiterConfig{Enabled: true}}, ""},
+		{"managesieve_proxy auth_rate_limit", ServerConfig{Type: "managesieve_proxy", AuthRateLimit: &AuthRateLimiterConfig{Enabled: true}}, ""},
+		{"http_user_api auth_rate_limit", ServerConfig{Type: "http_user_api", AuthRateLimit: &AuthRateLimiterConfig{Enabled: true}}, ""},
+
 		// The same keys on servers that apply them.
 		{"imap min_bytes_per_minute", ServerConfig{Type: "imap", Timeouts: timeouts(ServerTimeoutsConfig{MinBytesPerMinute: 512}), MaxConnectionsPerIP: 10}, ""},
 		{"pop3_proxy command_timeout", ServerConfig{Type: "pop3_proxy", Timeouts: timeouts(ServerTimeoutsConfig{CommandTimeout: "10m"}), MaxConnectionsPerIP: 10}, ""},
