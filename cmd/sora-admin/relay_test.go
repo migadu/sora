@@ -346,3 +346,53 @@ func TestRelayDeleteAllLeavesHeldMessagesIntact(t *testing.T) {
 		t.Errorf("acquired To=%q body=%q; want To=%q body=%q", msg.To, gotBody, "keep@example.org", wantBody)
 	}
 }
+
+func TestDeleteAllMessagesInQueueDir(t *testing.T) {
+	queuePath := t.TempDir()
+	q, err := relayqueue.NewDiskQueue(queuePath, 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingDir := filepath.Join(queuePath, "pending")
+
+	if err := q.Enqueue("a@example.com", "b@example.org", "redirect", []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Enqueue("c@example.com", "d@example.org", "redirect", []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	_, abort, err := q.Hold("h@example.com", "k@example.org", "redirect", []byte("held"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer abort()
+	scratch := filepath.Join(pendingDir, ".tmp-scratch")
+	if err := os.WriteFile(scratch, []byte("scratch"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stagingMsg := filepath.Join(pendingDir, "unpaired-staging.msg")
+	if err := os.WriteFile(stagingMsg, []byte("staging"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := deleteAllMessagesInQueueDir(pendingDir)
+	if err != nil {
+		t.Fatalf("deleteAllMessagesInQueueDir: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", deleted)
+	}
+	for _, keep := range []string{scratch, stagingMsg} {
+		if _, err := os.Stat(keep); err != nil {
+			t.Errorf("expected %s to remain untouched: %v", filepath.Base(keep), err)
+		}
+	}
+	abort()
+	entries, err := os.ReadDir(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected only scratch and unpaired .msg to remain after abort, got %d entries", len(entries))
+	}
+}
