@@ -612,7 +612,8 @@ const DefaultUploaderMaxAttempts = 20
 // refused by PostgreSQL, and max_attempts <= 0 leases nothing and fails the cleaner's
 // failed-upload pass. A negative cleanup_grace_period puts the orphan cleanup's cutoff
 // in the future, so it removes staged bodies whose pending_uploads row is still in an
-// uncommitted delivery transaction.
+// uncommitted delivery transaction. An unparseable cleanup_grace_period is refused
+// too: start-up exits on it, as there is no fallback.
 func (c *UploaderConfig) Validate() error {
 	for _, f := range []struct {
 		key   string
@@ -626,7 +627,11 @@ func (c *UploaderConfig) Validate() error {
 			return fmt.Errorf("[uploader] %s must be positive, got %d", f.key, f.value)
 		}
 	}
-	if d, err := c.GetCleanupGracePeriod(); err == nil && d <= 0 {
+	d, err := c.GetCleanupGracePeriod()
+	if err != nil {
+		return fmt.Errorf("[uploader] cleanup_grace_period: %w", err)
+	}
+	if d <= 0 {
 		return fmt.Errorf("[uploader] cleanup_grace_period must be positive, got %q", c.CleanupGracePeriod)
 	}
 	return nil
