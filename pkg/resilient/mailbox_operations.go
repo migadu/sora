@@ -277,18 +277,32 @@ func (rd *ResilientDatabase) GetActiveAccountIDByAddressWithRetry(ctx context.Co
 	return result.(int64), nil
 }
 
+// CreateDefaultMailboxesWithRetry is EnsureDefaultMailboxesWithRetry for a caller that
+// reads the mailboxes from the writer anyway, or not at all.
 func (rd *ResilientDatabase) CreateDefaultMailboxesWithRetry(ctx context.Context, AccountID int64) error {
+	_, err := rd.EnsureDefaultMailboxesWithRetry(ctx, AccountID)
+	return err
+}
+
+// EnsureDefaultMailboxesWithRetry creates the account's default mailboxes unless the
+// read pool already shows its INBOX. onWriter reports that the read pool did not: the
+// mailboxes were then created (or found) on the writer, and a replica that has not
+// replayed that yet does not have them, so a caller that goes on to read them must
+// read from the writer.
+func (rd *ResilientDatabase) EnsureDefaultMailboxesWithRetry(ctx context.Context, AccountID int64) (onWriter bool, err error) {
 	// Every RCPT, login and API delivery calls this; for every account but a brand-new
 	// one the mailboxes exist. Answer that from a single read before paying for a
 	// write transaction (BEGIN + SET LOCAL + EXISTS + COMMIT on the write pool).
 	if has, err := rd.getOperationalDatabaseForOperation(ctx, false).HasInbox(ctx, AccountID); err == nil && has {
-		return nil
+		return false, nil
 	}
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(ctx, true).CreateDefaultMailboxes(ctx, tx, AccountID)
 	}
-	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
-	return err
+	if _, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (rd *ResilientDatabase) PollMailboxStatsWithRetry(ctx context.Context, mailboxIDs []int64, sinceModSeq uint64) ([]db.MailboxStatsRow, error) {

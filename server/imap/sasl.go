@@ -169,7 +169,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					}
 
 					// Ensure default mailboxes for the impersonated user
-					if dbErr := s.server.rdb.CreateDefaultMailboxesWithRetry(s.ctx, AccountID); dbErr != nil {
+					if dbErr := s.createDefaultMailboxes(s.ctx, AccountID); dbErr != nil {
 						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
 					}
 
@@ -313,7 +313,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					}
 
 					// Ensure default mailboxes for the impersonated user
-					if dbErr := s.server.rdb.CreateDefaultMailboxesWithRetry(s.ctx, AccountID); dbErr != nil {
+					if dbErr := s.createDefaultMailboxes(s.ctx, AccountID); dbErr != nil {
 						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
 					}
 
