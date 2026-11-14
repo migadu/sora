@@ -1111,6 +1111,10 @@ func isValidContentHash(hash string) bool {
 func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []byte) (*string, error) {
 	path := w.FilePath(contentHash, accountID)
 	dir := filepath.Dir(path)
+	// Nothing removes an account's staging directory once it exists, so it is still
+	// there when the OpenFile below runs. The uploader used to remove it as soon as the
+	// account's last staged file left, which could land between these two calls and
+	// fail the delivery with ENOENT. An empty directory left behind costs one inode.
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
@@ -1214,14 +1218,15 @@ func (w *UploadWorker) isTransientS3Error(err error) bool {
 	return false
 }
 
+// RemoveLocalFile removes a staged body. The account's staging directory stays, even
+// when empty: a delivery may have just created it and be about to stage into it (see
+// StoreLocally).
 func (w *UploadWorker) RemoveLocalFile(path string) error {
 	size := fileSize(path)
 	if err := os.Remove(path); err != nil {
 		logger.Warn("Uploader: Uploaded but could not delete file", "path", path, "error", err)
 	} else {
 		w.addStagingSize(-size)
-		stopAt, _ := filepath.Abs(w.path)
-		removeEmptyParents(path, stopAt)
 	}
 	return nil
 }
@@ -1361,22 +1366,6 @@ func (w *UploadWorker) IsStagingLimitExceeded(additionalSize int64) bool {
 	return currentSize+additionalSize > w.maxStagingSize
 }
 
-func removeEmptyParents(path, stopAt string) {
-	for {
-		parent := filepath.Dir(path)
-		if parent == stopAt || parent == "." || parent == "/" {
-			break
-		}
-		// Try removing the parent directory
-		err := os.Remove(parent)
-		if err != nil {
-			// Stop if not empty or permission denied
-			break
-		}
-		path = parent
-	}
-}
-
 // stagedFile is a file in the staging tree that the cleanup scan has yet to resolve
 // against the pending_uploads table.
 type stagedFile struct {
@@ -1421,8 +1410,6 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 	var filesChecked, filesRemoved int64
 	var totalSize int64
 
-	stopAt, _ := filepath.Abs(w.path)
-
 	// Candidate files grouped by account, resolved one batch at a time. A lookup
 	// failure leaves its whole group on disk: an unanswered query is not evidence
 	// that the message was already uploaded.
@@ -1453,7 +1440,6 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 				totalSize += file.size
 				w.addStagingSize(-file.size)
 				logger.Info("UploaderCleanup: Removed orphaned file", "hash", file.contentHash, "account_id", accountID, "size", file.size)
-				removeEmptyParents(file.path, stopAt)
 			}
 		}
 	}
