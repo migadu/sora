@@ -40,9 +40,10 @@ type ManageSieveSession struct {
 	releaseConn func() // Function to release connection from limiter
 	startTime   time.Time
 
-	// trackedClientAddr is the client address this session was registered
-	// with in the connection tracker, so it is unregistered under that key.
-	// Empty when the tracker refused the session: it has nothing to release.
+	// tracked is set while the session holds a slot in the connection
+	// tracker, registered under trackedClientAddr, so the slot is released
+	// under that key, once. A session the tracker refused never holds one.
+	tracked           bool
 	trackedClientAddr string
 }
 
@@ -63,6 +64,10 @@ var (
 	errServerBusy      = &managesieveserver.Error{Message: msieve.Quote("Server busy, try again later")}
 	errSessionClosed   = &managesieveserver.Error{Message: msieve.Quote("Session closed"), Close: true}
 	errDelayQueueFul   = &managesieveserver.Error{Message: msieve.Quote("Too many concurrent authentication attempts. Please try again later.")}
+
+	// errTooManyConnections refuses a login over max_connections_per_user or
+	// max_connections_per_user_per_ip, with the reply managesieve_proxy sends.
+	errTooManyConnections = &managesieveserver.Error{Code: "TRYLATER", Message: "Too many connections"}
 )
 
 // authUnavailable reports whether a failed Authenticate says nothing about the
@@ -559,20 +564,28 @@ func (s *ManageSieveSession) completeAuthentication(ctx context.Context, address
 	}
 	defer release()
 
-	s.User = server.NewUser(address, accountID)
-
-	// Increment authenticated connections counter
-	s.server.authenticatedConnections.Add(1)
-
 	// Log authentication success. Regular auth via Authenticate() already
 	// logs in server.go with cached/method; master auth is logged here.
 	if masterAuthUsed {
 		duration := time.Since(start)
 		s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 	}
+	metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "success").Inc()
+
+	// The connection limits come before the session takes the user: a login the
+	// tracker refuses is not logged in, so its close releases neither a count
+	// nor a tracker slot.
+	if err := s.registerConnection(ctx, accountID, address.FullAddress()); err != nil {
+		s.InfoLog("login refused: connection limit reached", "address", address.BaseAddress(), "reason", err)
+		return errTooManyConnections
+	}
+
+	s.User = server.NewUser(address, accountID)
+
+	// Increment authenticated connections counter
+	s.server.authenticatedConnections.Add(1)
 
 	// Track successful authentication
-	metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "success").Inc()
 	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("managesieve", s.server.name, s.server.hostname).Inc()
 	metrics.CriticalOperationDuration.WithLabelValues("managesieve_authentication").Observe(time.Since(start).Seconds())
 
@@ -580,9 +593,6 @@ func (s *ManageSieveSession) completeAuthentication(ctx context.Context, address
 	// prevent a race: if the session closes between counter increments and
 	// flag setting, cleanup won't decrement.
 	s.authenticated = true
-
-	// Register connection for tracking
-	s.registerConnection(ctx, address.FullAddress())
 
 	// Start termination poller to check for kick commands
 	s.startTerminationPoller()
@@ -978,40 +988,48 @@ func (s *ManageSieveSession) Close() error {
 	}
 }
 
-// registerConnection registers the connection in the connection tracker.
-// It runs synchronously within the authenticating command, so it is bounded
-// by the per-command context (plus the query timeout).
-func (s *ManageSieveSession) registerConnection(ctx context.Context, email string) {
-	if s.server.connTracker != nil && s.User != nil {
-		// Use configured database query timeout for connection tracking (database INSERT)
-		queryTimeout := s.server.rdb.GetQueryTimeout()
-		ctx, cancel := context.WithTimeout(ctx, queryTimeout)
-		defer cancel()
-
-		// The client's address, not the TCP peer: behind a proxy the peer is
-		// the proxy for every client. RemoteIP already holds the address from
-		// the PROXY header.
-		clientAddr := s.RemoteIP
-
-		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "ManageSieve", clientAddr); err != nil {
-			s.InfoLog("rejected connection registration", "error", err)
-			return
-		}
-		s.trackedClientAddr = clientAddr
+// registerConnection takes a slot for the logging-in account in the connection
+// tracker. The error is the tracker's refusal: the account is at
+// max_connections_per_user or max_connections_per_user_per_ip. It runs
+// synchronously within the authenticating command, so it is bounded by the
+// per-command context (plus the query timeout).
+func (s *ManageSieveSession) registerConnection(ctx context.Context, accountID int64, email string) error {
+	if s.server.connTracker == nil {
+		return nil
 	}
+	// Use configured database query timeout for connection tracking (database INSERT)
+	queryTimeout := s.server.rdb.GetQueryTimeout()
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	// The client's address, not the TCP peer: behind a proxy the peer is
+	// the proxy for every client. RemoteIP already holds the address from
+	// the PROXY header.
+	clientAddr := s.RemoteIP
+
+	if err := s.server.connTracker.RegisterConnection(ctx, accountID, email, "ManageSieve", clientAddr); err != nil {
+		return err
+	}
+	s.tracked = true
+	s.trackedClientAddr = clientAddr
+	return nil
 }
 
-// unregisterConnection removes the connection from the connection tracker
+// unregisterConnection releases the session's slot in the connection tracker,
+// if it holds one.
 func (s *ManageSieveSession) unregisterConnection() {
-	if s.server.connTracker != nil && s.User != nil && s.trackedClientAddr != "" {
-		// Use configured database query timeout for connection tracking (database DELETE)
-		queryTimeout := s.server.rdb.GetQueryTimeout()
-		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
-		defer cancel()
+	if !s.tracked {
+		return
+	}
+	s.tracked = false
 
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "ManageSieve", s.trackedClientAddr); err != nil {
-			s.WarnLog("failed to unregister connection", "error", err)
-		}
+	// Use configured database query timeout for connection tracking (database DELETE)
+	queryTimeout := s.server.rdb.GetQueryTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "ManageSieve", s.trackedClientAddr); err != nil {
+		s.WarnLog("failed to unregister connection", "error", err)
 	}
 }
 
