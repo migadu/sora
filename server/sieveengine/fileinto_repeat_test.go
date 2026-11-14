@@ -46,10 +46,25 @@ func TestRepeatedFileintoTarget(t *testing.T) {
 			script: "require [\"fileinto\", \"copy\", \"mailbox\"];\nfileinto :copy \"Projects\";\nfileinto :create \"Projects\";\n",
 			want:   []Destination{{Mailbox: "Projects", Create: true}},
 		},
+		{
+			name:   "explicit keep before repeated target",
+			script: `require ["fileinto", "copy"]; keep; fileinto :copy "Archive"; fileinto "Archive";`,
+			want:   []Destination{{Mailbox: "Archive"}, {Mailbox: "INBOX"}},
+		},
+		{
+			name:   "discard after repeated copies",
+			script: `require ["fileinto", "copy"]; fileinto :copy "Archive"; fileinto :copy "Archive"; discard;`,
+			want:   []Destination{{Mailbox: "Archive"}},
+		},
+		{
+			name:   "repeat through a variable",
+			script: `require ["fileinto", "copy", "variables"]; set "box" "Archive"; fileinto :copy "Archive"; fileinto "${box}";`,
+			want:   []Destination{{Mailbox: "Archive"}},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			executor, err := NewSieveExecutorWithExtensions(tt.script, []string{"fileinto", "copy", "mailbox"})
+			executor, err := NewSieveExecutorWithExtensions(tt.script, []string{"fileinto", "copy", "mailbox", "variables"})
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
