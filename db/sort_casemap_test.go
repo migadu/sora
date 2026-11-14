@@ -46,10 +46,14 @@ func TestSortCasemapKeys(t *testing.T) {
 		return got
 	}
 
-	// Letters with a decomposition, ASCII punctuation and digits: right under any LC_CTYPE.
+	// Letters with a canonical decomposition, ASCII punctuation and digits: right under any
+	// LC_CTYPE. So are compatibility characters that decompose to lowercase letters (the
+	// ordinal in "Mª", "ℓ", "㎏", mathematical letters): RFC 5051 titlecases before it
+	// decomposes, so those letters stay lowercase in the prepared key.
 	common := []string{
 		"Émile", "Émile", "Ezra", "a_b", "a1@example.com", "a@example.com",
 		"Ångström", "naïve façade", "Zoë [x] ^y` {z}", "",
+		"Mª José", "Nº 5", "ℓ", "2㎏", "\U0001D401\U0001D428\U0001D425\U0001D41D", // 𝐁𝐨𝐥𝐝
 	}
 	for _, s := range common {
 		want := rfc5051Casemap(s)
@@ -68,7 +72,9 @@ func TestSortCasemapKeys(t *testing.T) {
 	if sqlKey("upper($1::text)", "ђ") != "Ђ" {
 		t.Skip("database LC_CTYPE maps ASCII only")
 	}
-	for _, s := range []string{"Øystein", "Łukasz", "Ђорђе", "Іван", "Ωμέγα"} {
+	// The digraphs are stored lowercased; upper() returns their uppercase form, which the
+	// key maps to the titlecase form as the subject key does.
+	for _, s := range []string{"Øystein", "Łukasz", "Ђорђе", "Іван", "Ωμέγα", "Ǆemal", "ǅemal", "Ljiljana ǉ"} {
 		require.Equal(t, rfc5051Casemap(s), sqlKey(addressCasemapKey("$1::text"), strings.ToLower(s)), "address %q", s)
 	}
 }
