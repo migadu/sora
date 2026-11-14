@@ -55,11 +55,13 @@ func (m *mockCache) Delete(ctx context.Context, name string) error {
 
 // stubS3 is a minimal S3-compatible endpoint for tests: HEAD on the bucket succeeds,
 // GET returns a stored object or a NoSuchKey 404, PUT stores, DELETE removes.
-// Setting getStatus makes every GET fail with that status, simulating an S3 outage.
+// Setting getStatus (putStatus) makes every GET (PUT) fail with that status,
+// simulating an S3 outage.
 type stubS3 struct {
 	mu        sync.Mutex
 	objects   map[string][]byte
 	getStatus int
+	putStatus int
 }
 
 func newStubS3(t *testing.T) (*stubS3, string) {
@@ -77,9 +79,15 @@ func (s *stubS3) failGets(status int) {
 	s.getStatus = status
 }
 
+func (s *stubS3) failPuts(status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.putStatus = status
+}
+
 func (s *stubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	getStatus := s.getStatus
+	getStatus, putStatus := s.getStatus, s.putStatus
 	data, found := s.objects[r.URL.Path]
 	s.mu.Unlock()
 
@@ -97,6 +105,10 @@ func (s *stubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Write(data)
 		}
 	case http.MethodPut:
+		if putStatus != 0 {
+			http.Error(w, "s3 backend failure", putStatus)
+			return
+		}
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
