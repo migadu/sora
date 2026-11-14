@@ -227,7 +227,7 @@ type LMTPServerOptions struct {
 	MaxRedirectHops             int
 	CommandTimeoutOverrides     map[string]time.Duration // Per-command hard execution timeouts (overrides defaults)
 	IdleTimeout                 time.Duration            // Maximum wait for the next command or for more message content (0 = default 5m); enforced by go-smtp
-	DataTimeout                 time.Duration            // Maximum time to receive one message's content (0 = DefaultDataTimeout)
+	DataTimeout                 time.Duration            // Maximum time to receive one DATA body or BDAT chunk (0 = DefaultDataTimeout)
 }
 
 func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
@@ -377,9 +377,10 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// same timer race each other and can duplicate the notice).
 	//
 	// ReadTimeout bounds each wait for input, also during DATA and BDAT
-	// content (RFC 5321 section 4.5.3.2: "a timer is set ... for each buffer
-	// of the data transfer"), so a large message on a slow link is not cut
-	// off after 5 minutes. DataTimeout bounds the whole content transfer.
+	// content (the model RFC 5321 section 4.5.3.2 gives the sending side: "a
+	// timer is set ... for each buffer of the data transfer"), so a large
+	// message on a slow link is not cut off after 5 minutes. DataTimeout
+	// bounds one DATA body or one BDAT chunk as a whole.
 	s.ReadTimeout = 5 * time.Minute
 	if options.IdleTimeout > 0 {
 		s.ReadTimeout = options.IdleTimeout
