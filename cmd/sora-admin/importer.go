@@ -547,42 +547,7 @@ func (i *Importer) processSubscriptions() error {
 		return fmt.Errorf("failed to read subscriptions file: %w", err)
 	}
 
-	lines := strings.Split(string(content), "\n")
-
-	// Parse Dovecot subscriptions format
-	// First line should be version (e.g., "V\t2")
-	if len(lines) == 0 {
-		return fmt.Errorf("empty subscriptions file")
-	}
-
-	// Skip version line and empty lines, collect folder names
-	var folders []string
-	for i, line := range lines {
-		line = strings.TrimSpace(line)
-		if i == 0 {
-			// Skip version line (e.g., "V\t2")
-			if strings.HasPrefix(line, "V\t") || strings.HasPrefix(line, "V ") {
-				continue
-			}
-		}
-		if line != "" && !strings.HasPrefix(line, "V") {
-			// Handle tab-separated folder names on the same line
-			// Some Dovecot versions may have multiple folders per line separated by tabs
-			if strings.Contains(line, "\t") {
-				// Split by tabs and add each non-empty part as a separate folder
-				parts := strings.Split(line, "\t")
-				for _, part := range parts {
-					part = strings.TrimSpace(part)
-					if part != "" {
-						folders = append(folders, part)
-					}
-				}
-			} else {
-				folders = append(folders, line)
-			}
-		}
-	}
-
+	folders := parseDovecotSubscriptions(string(content))
 	if len(folders) == 0 {
 		logger.Info("No folders found in subscriptions file")
 		return nil
@@ -616,6 +581,8 @@ func (i *Importer) processSubscriptions() error {
 		} else {
 			folderName = decoded
 		}
+		// The folder import maps these names, so the subscription must too.
+		folderName = specialFolderName(folderName)
 
 		// Subscriptions are name-based (migration 000046), so record the subscription
 		// directly without materializing a mailbox. Dovecot permits subscriptions to
@@ -1088,23 +1055,27 @@ func (i *Importer) resolveMailboxName(path string) (string, error) {
 			return "", fmt.Errorf("invalid characters in mailbox name")
 		}
 
-		mailboxName = strings.TrimSpace(mailboxName)
-
-		// Handle special folder name mappings
-		switch strings.ToLower(mailboxName) {
-		case "sent", "sent items", "sent mail":
-			mailboxName = "Sent"
-		case "drafts", "draft":
-			mailboxName = "Drafts"
-		case "trash", "deleted", "deleted items":
-			mailboxName = "Trash"
-		case "junk", "spam":
-			mailboxName = "Junk"
-		case "archive", "archives":
-			mailboxName = "Archive"
-		}
+		mailboxName = specialFolderName(strings.TrimSpace(mailboxName))
 	}
 	return mailboxName, nil
+}
+
+// specialFolderName maps the names other mail systems give their special folders
+// ("Sent Items", "Spam", ...) to Sora's.
+func specialFolderName(name string) string {
+	switch strings.ToLower(name) {
+	case "sent", "sent items", "sent mail":
+		return "Sent"
+	case "drafts", "draft":
+		return "Drafts"
+	case "trash", "deleted", "deleted items":
+		return "Trash"
+	case "junk", "spam":
+		return "Junk"
+	case "archive", "archives":
+		return "Archive"
+	}
+	return name
 }
 
 // parseMaildirFlags extracts IMAP flags from a maildir filename.
@@ -2645,7 +2616,9 @@ func (i *Importer) keywordsForMessagePath(path string) map[int]string {
 	}
 	keywordsPath := filepath.Join(dir, "dovecot-keywords")
 	kws := i.dovecotKeywords
-	if dir != filepath.Clean(i.maildirPath) {
+	// Like the root (INBOX) file, read in NewImporter, a folder's file is read only
+	// with --dovecot.
+	if i.options.Dovecot && dir != filepath.Clean(i.maildirPath) {
 		if _, err := os.Stat(keywordsPath); err == nil {
 			parsed, perr := parseKeywordsFile(keywordsPath)
 			if perr != nil {
