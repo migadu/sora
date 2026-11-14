@@ -91,3 +91,105 @@ func TestIdleTimeoutTrigger(t *testing.T) {
 		t.Logf("✅ Idle timeout metric increased exactly once: %.0f → %.0f", initialIdleTimeouts, newIdleTimeouts)
 	}
 }
+
+// startDataTransfer opens a session to server and sends the envelope for
+// account and DATA, so the next thing to send is the message content.
+func startDataTransfer(t *testing.T, server *common.TestServer, account common.TestAccount) *LMTPClient {
+	t.Helper()
+	client, err := NewLMTPClient(server.Address)
+	if err != nil {
+		t.Fatalf("Failed to connect to LMTP server: %v", err)
+	}
+	t.Cleanup(func() { client.conn.Close() })
+	client.conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+	client.SendCommand("LHLO client.example.org")
+	if _, err := client.ReadMultilineResponse(); err != nil {
+		t.Fatalf("LHLO: %v", err)
+	}
+	for _, cmd := range []string{"MAIL FROM:<sender@example.org>", fmt.Sprintf("RCPT TO:<%s>", account.Email)} {
+		client.SendCommand(cmd)
+		if resp, err := client.ReadResponse(); err != nil || !strings.HasPrefix(resp, "250") {
+			t.Fatalf("%s: %q, %v", cmd, resp, err)
+		}
+	}
+	client.SendCommand("DATA")
+	if resp, err := client.ReadResponse(); err != nil || !strings.HasPrefix(resp, "354") {
+		t.Fatalf("DATA: %q, %v", resp, err)
+	}
+	return client
+}
+
+// trickleBody sends a message of lines body lines, one every interval,
+// stopping at the first write error.
+func trickleBody(client *LMTPClient, lines int, interval time.Duration) {
+	if _, err := fmt.Fprintf(client.conn, "From: sender@example.org\r\nSubject: slow sender\r\n\r\n"); err != nil {
+		return
+	}
+	for i := 0; i < lines; i++ {
+		if _, err := fmt.Fprintf(client.conn, "body line %d of a message sent slowly but steadily\r\n", i); err != nil {
+			return
+		}
+		time.Sleep(interval)
+	}
+}
+
+// TestDataOutlastsIdleTimeout verifies that the idle timeout bounds each wait
+// for message content, not the whole DATA transfer (RFC 5321 section 4.5.3.2:
+// "a timer is set for each SMTP command and for each buffer of the data
+// transfer"). A body that keeps arriving for three times the idle timeout is
+// delivered.
+func TestDataOutlastsIdleTimeout(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupLMTPServerWithIdleTimeout(t, time.Second)
+	defer server.Close()
+
+	client := startDataTransfer(t, server, account)
+	trickleBody(client, 30, 100*time.Millisecond) // 3s, a line every 100ms
+	client.conn.Write([]byte(".\r\n"))
+
+	resp, err := client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read the DATA reply: %v", err)
+	}
+	if !strings.HasPrefix(resp, "250") {
+		t.Fatalf("A body still arriving after the idle timeout was refused: %s", resp)
+	}
+}
+
+// TestDataStallClosesConnection verifies that a client that stops sending in
+// the middle of the body gets a temporary failure, and that the connection is
+// then closed instead of reading the rest of the message as commands. The
+// disconnect is counted once in the idle metric.
+func TestDataStallClosesConnection(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupLMTPServerWithIdleTimeout(t, time.Second)
+	defer server.Close()
+
+	before := testutil.ToFloat64(metrics.ConnectionTimeoutsTotal.WithLabelValues("lmtp", "test", "localhost", "idle"))
+
+	client := startDataTransfer(t, server, account)
+	fmt.Fprintf(client.conn, "From: sender@example.org\r\nSubject: stalled\r\n\r\nfirst line\r\n")
+
+	resp, err := client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read the DATA reply: %v", err)
+	}
+	if !strings.HasPrefix(resp, "421 4.4.2") {
+		t.Fatalf("Expected 421 4.4.2 for a stalled body, got: %s", resp)
+	}
+
+	// What the client sends next is the rest of its message, not a command.
+	client.SendCommand("NOOP")
+	if extra, err := client.ReadResponse(); err == nil {
+		t.Fatalf("Expected the connection closed after the stalled body, read %q", extra)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	after := testutil.ToFloat64(metrics.ConnectionTimeoutsTotal.WithLabelValues("lmtp", "test", "localhost", "idle"))
+	if after-before != 1 {
+		t.Errorf("Expected the idle timeout metric to increase by 1, got %+.0f", after-before)
+	}
+}
