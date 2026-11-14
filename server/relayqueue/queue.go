@@ -217,10 +217,10 @@ func lastError(metadata QueuedMessage) string {
 
 // CleanupOldFailedMessages removes failed messages older than the retention period.
 // Returns the number of messages cleaned up.
-// If retentionPeriod is 0, cleanup is disabled (messages kept forever).
+// If retentionPeriod is 0, cleanup is disabled (messages kept forever). So it is for a
+// negative one, against which every failed message would be overdue.
 func (q *DiskQueue) CleanupOldFailedMessages(retentionPeriod time.Duration) (int, error) {
-	// If retention is 0, cleanup is disabled
-	if retentionPeriod == 0 {
+	if retentionPeriod <= 0 {
 		return 0, nil
 	}
 

@@ -3064,6 +3064,9 @@ func (c *Config) Validate() []Problem {
 	// and the proxy servers that route into them.
 	add("[[pool]]", c.ValidatePools())
 	add("[relay]", c.Relay.Validate())
+	if c.Relay.IsQueueEnabled() {
+		add("[relay.queue]", c.Relay.Queue.Validate())
+	}
 	// One malformed trusted_networks entry would leave LMTP admission with no peers.
 	add("trusted_networks", c.ValidateTrustedNetworks())
 	add("[shared_mailboxes]", c.SharedMailboxes.Validate())

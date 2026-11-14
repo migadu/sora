@@ -256,7 +256,7 @@ may then receive it twice.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `path` | string | `"/var/spool/sora/relay"` | The queue directory. |
-| `worker_interval` | duration | `"1m"` | How often the worker runs a pass. An invalid value logs a warning and uses `1m`. |
+| `worker_interval` | duration | `"1m"` | How often the worker runs a pass. `0` or less stops startup. An invalid value logs a warning and uses `1m`. |
 | `batch_size` | integer | `100` | Most messages sent in one pass. `0` or less means 100. |
 | `concurrency` | integer | `5` | Most messages sent at the same time. `0` or less means 5. |
 | `max_attempts` | integer | `10` | Attempts before a message moves to the failed queue. `0` or less means 10. |
@@ -264,7 +264,7 @@ may then receive it twice.
 | `circuit_breaker_threshold` | integer | `5` | Temporary failures in a row that open the breaker. |
 | `circuit_breaker_timeout` | duration | `"30s"` | How long the breaker stays open before it lets trial messages through. An invalid value stops startup. |
 | `circuit_breaker_max_requests` | integer | `3` | Trial messages allowed while the breaker is half open. |
-| `failed_retention` | duration | `"168h"` (7 days) | How long a message stays in `failed/`, counted from its last attempt. `0` or less also means 7 days; there is no way to keep failed messages forever. An invalid value stops startup. |
+| `failed_retention` | duration | `"168h"` (7 days) | How long a message stays in `failed/`, counted from its last attempt. `0` keeps failed messages until they are deleted or requeued. A negative or invalid value stops startup. |
 | `cleanup_interval` | duration | `"1h"` | How often the cleanup pass runs. An invalid value stops startup. |
 
 Durations accept Go syntax (`"90s"`, `"1h30m"`) and whole days (`"7d"`).
@@ -310,7 +310,8 @@ That is about 103 hours (4 days and 7 hours) from the first attempt to the last,
 ### The failed queue
 
 A message in `failed/` is never retried on its own. It stays until `failed_retention` has passed
-since its last attempt, and the cleanup pass then deletes it for good, logging a warning:
+since its last attempt (with `failed_retention = "0"`, until someone deletes or requeues it), and
+the cleanup pass then deletes it for good, logging a warning:
 
 ```text
 RelayQueue: Deleted permanently failed message after retention - no copy remains
@@ -346,7 +347,7 @@ so run them on the node that owns the queue. They refuse to run when `[relay] ty
 
 | Command | What it does |
 |---|---|
-| `sora-admin relay stats --config FILE` | Counts the messages in each directory. |
+| `sora-admin relay stats --config FILE` | Counts the messages in each directory. Reports a queue the server has not created yet, and does not create it. |
 | `sora-admin relay list --config FILE [--queue pending\|processing\|failed] [--limit 100]` | Lists messages (default queue `pending`). |
 | `sora-admin relay show --config FILE --id ID [--queue pending]` | Shows one message's metadata. |
 | `sora-admin relay delete --config FILE --id ID\|all [--queue failed] --confirm` | Deletes one message or all messages of a queue (default queue `failed`). |

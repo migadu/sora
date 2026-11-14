@@ -90,11 +90,21 @@ func failedRelayMessage(t *testing.T, queuePath string) (string, []byte) {
 	return msg.ID, body
 }
 
+// relayQueue creates an empty relay queue the way the server does and returns its path.
+func relayQueue(t *testing.T) string {
+	t.Helper()
+	queuePath := t.TempDir()
+	if _, err := relayqueue.NewDiskQueue(queuePath, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	return queuePath
+}
+
 // #328 item 1: with no max_attempts or worker_interval configured, stats printed the raw
 // zero values instead of the defaults the server runs with.
 func TestRelayStatsPrintsEffectiveSettings(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
-		out := runRelay(t, t.TempDir(), "", "stats")
+		out := runRelay(t, relayQueue(t), "", "stats")
 		for _, want := range []string{"Max Attempts:     10\n", "Worker Interval:  1m0s\n"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("stats output does not contain %q:\n%s", want, out)
@@ -103,7 +113,7 @@ func TestRelayStatsPrintsEffectiveSettings(t *testing.T) {
 	})
 
 	t.Run("configured", func(t *testing.T) {
-		out := runRelay(t, t.TempDir(), "max_attempts = 3\nworker_interval = \"30s\"\n", "stats")
+		out := runRelay(t, relayQueue(t), "max_attempts = 3\nworker_interval = \"30s\"\n", "stats")
 		for _, want := range []string{"Max Attempts:     3\n", "Worker Interval:  30s\n"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("stats output does not contain %q:\n%s", want, out)
@@ -253,4 +263,37 @@ func TestRelayRequeueDoesNotRepairAnIncompleteQueue(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(queuePath, "processing")); !os.IsNotExist(err) {
 		t.Fatalf("requeue created processing/ (stat: %v)\n%s", err, out)
 	}
+}
+
+// stats only reads the queue, so on a node whose server has never created it, it must
+// not create it either (#643): made by `sudo sora-admin`, pending/ would belong to root,
+// and the server, running as its own user, could not queue into it. Like list, it says
+// the queue does not exist.
+func TestRelayStatsDoesNotCreateTheQueue(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		queuePath := filepath.Join(t.TempDir(), "relay")
+		out := runRelay(t, queuePath, "", "stats")
+		if _, err := os.Stat(queuePath); !os.IsNotExist(err) {
+			t.Fatalf("stats created the relay queue at %s (stat: %v)\n%s", queuePath, err, out)
+		}
+		if !strings.Contains(out, "does not exist") {
+			t.Errorf("stats does not say the queue does not exist:\n%s", out)
+		}
+	})
+
+	t.Run("incomplete", func(t *testing.T) {
+		queuePath := t.TempDir()
+		for _, dir := range []string{"failed", "pending"} {
+			if err := os.Mkdir(filepath.Join(queuePath, dir), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		out := runRelay(t, queuePath, "", "stats")
+		if _, err := os.Stat(filepath.Join(queuePath, "processing")); !os.IsNotExist(err) {
+			t.Fatalf("stats created processing/ (stat: %v)\n%s", err, out)
+		}
+		if !strings.Contains(out, "does not exist") {
+			t.Errorf("stats does not say the queue does not exist:\n%s", out)
+		}
+	})
 }
