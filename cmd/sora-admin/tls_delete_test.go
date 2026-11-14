@@ -278,6 +278,59 @@ func TestTLSDeleteKeyFailsWhenNotFound(t *testing.T) {
 	}
 }
 
+// TestTLSDeleteKeyExactMatchWins: a key that exists is deleted, also when it is the
+// prefix of another key; only a trailing "..." makes it a prefix.
+func TestTLSDeleteKeyExactMatchWins(t *testing.T) {
+	for _, arg := range []string{"autocert/cert-test", "test"} {
+		t.Run(arg, func(t *testing.T) {
+			stub, endpoint := newTLSStubS3(t)
+			cfg := tlsTestConfig(endpoint)
+			stub.put("certs", "autocert/cert-test", []byte("short"))
+			stub.put("certs", "autocert/cert-test2", []byte("long"))
+
+			if err := deleteTLSCertificate(context.Background(), cfg, t.TempDir(), "", arg, false); err != nil {
+				t.Fatalf("deleteTLSCertificate(--key %s): %v", arg, err)
+			}
+			if got, want := stub.keys(), []string{"/certs/autocert/cert-test2"}; !slices.Equal(got, want) {
+				t.Errorf("S3 objects after delete = %v, want %v", got, want)
+			}
+		})
+	}
+
+	t.Run("trailing dots stay a prefix", func(t *testing.T) {
+		stub, endpoint := newTLSStubS3(t)
+		cfg := tlsTestConfig(endpoint)
+		stub.put("certs", "autocert/cert-test", []byte("short"))
+		stub.put("certs", "autocert/cert-test2", []byte("long"))
+		before := stub.keys()
+
+		if err := deleteTLSCertificate(context.Background(), cfg, t.TempDir(), "", "autocert/cert-test...", false); err == nil {
+			t.Fatal("deleteTLSCertificate succeeded for a prefix matching two keys")
+		}
+		if got := stub.keys(); !slices.Equal(got, before) {
+			t.Errorf("S3 objects changed: %v, want %v", got, before)
+		}
+	})
+}
+
+// TestTLSDeleteKeyLongPrefix: a value that is not a key is a prefix whatever its
+// length; "autocert/cert-" plus 50 hex digits is 64 characters.
+func TestTLSDeleteKeyLongPrefix(t *testing.T) {
+	stub, endpoint := newTLSStubS3(t)
+	cfg := tlsTestConfig(endpoint)
+	putServerCertificates(t, cfg, "other.example.com")
+	unrelated := stub.keys()
+	putServerCertificates(t, cfg, "mail.example.com")
+	prefix := tlsmanager.S3ObjectKey("mail.example.com")[:64]
+
+	if err := deleteTLSCertificate(context.Background(), cfg, t.TempDir(), "", prefix, false); err != nil {
+		t.Fatalf("deleteTLSCertificate(--key %s): %v", prefix, err)
+	}
+	if got := stub.keys(); !slices.Equal(got, unrelated) {
+		t.Errorf("S3 objects after delete = %v, want only the unrelated domain's %v", got, unrelated)
+	}
+}
+
 // TestTLSCacheUsesServerKeys: tls cache reads the objects the server wrote and stores
 // them under the names autocert's DirCache reads, whatever the case of --domain.
 func TestTLSCacheUsesServerKeys(t *testing.T) {
