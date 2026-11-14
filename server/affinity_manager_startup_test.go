@@ -199,6 +199,9 @@ func TestAffinityGossipDuringStartupLoadIsPersisted(t *testing.T) {
 	}
 
 	peerAffinity.SetBackend(user, "new:143", "imap")
+	// The handler accepts gossip during the load but applies it only after the
+	// snapshot is ready, so timestamp checks see the persisted assignment.
+	store.releaseLoad()
 	select {
 	case e := <-store.sets:
 		if e.Username != user || e.Backend != "new:143" {
@@ -208,10 +211,54 @@ func TestAffinityGossipDuringStartupLoadIsPersisted(t *testing.T) {
 		t.Error("a SET gossiped while the node read its affinity file was never written to the file")
 	}
 
-	store.releaseLoad()
 	am := <-started
 	t.Cleanup(am.Stop)
 	if backend, _ := am.GetBackend(user, "imap"); backend != "new:143" {
 		t.Errorf("after startup the node routes by %q, want the gossiped new:143", backend)
+	}
+}
+
+// A delayed SET or UPDATE can be older than the startup snapshot. It must wait
+// for that snapshot before the normal last-write-wins check runs; otherwise it
+// replaces both the in-memory assignment and its newer durable row.
+func TestAffinityStartupChecksQueuedEventAgainstStoredTimestamp(t *testing.T) {
+	for _, typ := range []AffinityEventType{AffinityEventSet, AffinityEventUpdate} {
+		t.Run(string(typ), func(t *testing.T) {
+			node := newAffinityTestCluster(t, "startup-order", nil)
+			path := filepath.Join(t.TempDir(), "affinity.db")
+			store, err := affinitycache.New(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now()
+			const user = "user@example.com"
+			if err := store.Set(context.Background(), affinitycache.AffinityEntry{Username: user, Protocol: "imap", Backend: "new:143", AssignedAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Hour), NodeID: "startup-order"}); err != nil {
+				t.Fatal(err)
+			}
+			am := newStopTestAffinityManager(store)
+			am.clusterManager = node
+			am.startupLoaded = make(chan struct{})
+			event, err := encodeAffinityEvent(AffinityEvent{Type: typ, Username: user, Protocol: "imap", Backend: "old:143", Timestamp: now.Add(-time.Minute), TTL: time.Hour, NodeID: "peer"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan struct{})
+			go func() { defer close(done); am.HandleClusterEvent(event) }()
+			select {
+			case <-done:
+				t.Error("gossip was applied before the initial snapshot loaded")
+			case <-time.After(20 * time.Millisecond):
+			}
+			am.loadPersisted(context.Background())
+			close(am.startupLoaded)
+			<-done
+			if got, _ := am.GetBackend(user, "imap"); got != "new:143" {
+				t.Errorf("older gossip replaced newer persisted assignment with %q", got)
+			}
+			am.Stop()
+			if got, _ := persistedBackend(t, path, user); got != "new:143" {
+				t.Errorf("older gossip overwrote newer durable row with %q", got)
+			}
+		})
 	}
 }

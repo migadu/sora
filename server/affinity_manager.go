@@ -81,6 +81,10 @@ type AffinityManager struct {
 	// gossip handler and the writers read it without a lock.
 	persistStore AffinityPersistStore
 
+	// Incoming events wait until the initial disk snapshot is loaded, so an
+	// older SET cannot overwrite a newer row before its timestamp is known.
+	startupLoaded chan struct{}
+
 	// Configuration
 	enabled         bool
 	defaultTTL      time.Duration
@@ -129,8 +133,10 @@ func NewAffinityManager(clusterMgr *cluster.Manager, enabled bool, ttl, cleanupI
 //
 // clusterMgr has already joined the cluster, so gossip arrives from the moment
 // the handler is registered. The store is attached before that, so that every
-// event applied is also written, and loaded after, so that no event received
-// while the file is read is lost; loadPersisted keeps what those events did.
+// event applied is also written. The handler is registered before the file is
+// read, but waits for that initial snapshot: queued events then pass through
+// the normal timestamp checks against the loaded state, so an older SET cannot
+// replace a newer persisted assignment while the file is being read.
 func NewAffinityManagerWithStore(ctx context.Context, clusterMgr *cluster.Manager, enabled bool, ttl, cleanupInterval time.Duration, store AffinityPersistStore) *AffinityManager {
 	if !enabled || clusterMgr == nil {
 		if store != nil {
@@ -153,6 +159,7 @@ func NewAffinityManagerWithStore(ctx context.Context, clusterMgr *cluster.Manage
 		affinityMap:     make(map[string]*AffinityInfo),
 		clusterManager:  clusterMgr,
 		persistStore:    store,
+		startupLoaded:   make(chan struct{}),
 		enabled:         enabled,
 		defaultTTL:      ttl,
 		cleanupInterval: cleanupInterval,
@@ -165,6 +172,7 @@ func NewAffinityManagerWithStore(ctx context.Context, clusterMgr *cluster.Manage
 	clusterMgr.RegisterAffinityBroadcaster(am.GetBroadcasts)
 
 	am.loadPersisted(ctx)
+	close(am.startupLoaded)
 
 	// Start background routines
 	go am.cleanupRoutine()
@@ -176,11 +184,10 @@ func NewAffinityManagerWithStore(ctx context.Context, clusterMgr *cluster.Manage
 
 // loadPersisted loads the unexpired entries of the persistent store into the
 // in-memory map, so that users are routed to their previous backends from the
-// start. Gossip is applied meanwhile, and the result must be the one loading
-// the file first would have given: a key gossip has already set keeps that
-// newer affinity (written through when it was applied), and a row that a
-// delete received meanwhile removes is not loaded and is deleted from the
-// store, as the delete would have done had the row been loaded before it.
+// start. The constructor queues incoming gossip until this snapshot has loaded;
+// those events are then applied against its timestamps. Existing in-memory
+// entries and tombstones are retained when loading a manager that already has
+// state.
 func (am *AffinityManager) loadPersisted(ctx context.Context) {
 	if am.persistStore == nil {
 		return
@@ -513,6 +520,9 @@ func (am *AffinityManager) GetBroadcasts(overhead, limit int) [][]byte {
 
 // HandleClusterEvent processes an affinity event from another node
 func (am *AffinityManager) HandleClusterEvent(data []byte) {
+	if am.startupLoaded != nil {
+		<-am.startupLoaded
+	}
 	event, err := decodeAffinityEvent(data)
 	if err != nil {
 		logger.Warn("Affinity: Failed to decode affinity event", "error", err)
