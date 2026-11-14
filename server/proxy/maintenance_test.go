@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"sort"
 	"strings"
@@ -206,6 +207,64 @@ func TestSessionDrainer_PacesClosesAndStopsWhenMaintenanceEnds(t *testing.T) {
 		if gap := closedAt[i].Sub(closedAt[i-1]); gap < 30*time.Millisecond {
 			t.Fatalf("closes %d and %d were %v apart; rate 20/s must space them ~50ms", i-1, i, gap)
 		}
+	}
+}
+
+// A positive kick rate below about 1.08e-10/s puts the pause between two closes beyond
+// the time.Duration range. Go leaves that float-to-integer conversion implementation-
+// dependent: on amd64 it yields math.MinInt64, so the pause would fire at once and close
+// every session back to back. However tiny the rate, the second close must wait.
+func TestSessionDrainer_TinyKickRateStaysPaced(t *testing.T) {
+	for _, rate := range []float64{1e-10, 1e-12, 1e-300, math.SmallestNonzeroFloat64} {
+		t.Run(fmt.Sprint(rate), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var closed atomic.Int32
+			targets := func() []DrainTarget {
+				out := make([]DrainTarget, 3)
+				for i := range out {
+					out[i] = DrainTarget{Backend: "10.0.0.5:143", Close: func() { closed.Add(1) }}
+				}
+				return out
+			}
+
+			m := NewMaintenance()
+			StartSessionDrainer(ctx, m, rate, targets, nil, "test")
+			m.Set([]string{"10.0.0.5"})
+
+			waitFor(t, func() bool { return closed.Load() > 0 })
+			time.Sleep(100 * time.Millisecond)
+			if n := closed.Load(); n != 1 {
+				t.Fatalf("kick_rate %g closed %d sessions back to back; the second close must wait", rate, n)
+			}
+		})
+	}
+}
+
+// The other extreme: a rate so high that the pause rounds to zero closes every session
+// without waiting, as asked, instead of stalling or panicking.
+func TestSessionDrainer_HugeKickRateDrainsAtOnce(t *testing.T) {
+	for _, rate := range []float64{2e9, 1e300, math.MaxFloat64} {
+		t.Run(fmt.Sprint(rate), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var closed atomic.Int32
+			targets := func() []DrainTarget {
+				out := make([]DrainTarget, 50)
+				for i := range out {
+					out[i] = DrainTarget{Backend: "10.0.0.5:143", Close: func() { closed.Add(1) }}
+				}
+				return out
+			}
+
+			m := NewMaintenance()
+			StartSessionDrainer(ctx, m, rate, targets, nil, "test")
+			m.Set([]string{"10.0.0.5"})
+
+			waitFor(t, func() bool { return closed.Load() == 50 })
+		})
 	}
 }
 
