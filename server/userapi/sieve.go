@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"net/url"
 
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/logger"
@@ -70,8 +69,7 @@ func (s *Server) handleGetFilter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract script name from path: /user/filters/{name}
-	name := extractPathParam(r.URL.Path, "/user/filters/", "")
-	name, err = url.QueryUnescape(name)
+	name, err := pathName(r, "/user/filters/", "")
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid script name")
 		return
@@ -126,8 +124,7 @@ func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract script name from path: /user/filters/{name}
-	name := extractPathParam(r.URL.Path, "/user/filters/", "")
-	name, err = url.QueryUnescape(name)
+	name, err := pathName(r, "/user/filters/", "")
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid script name")
 		return
@@ -195,8 +192,7 @@ func (s *Server) handleDeleteFilter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract script name from path: /user/filters/{name}
-	name := extractPathParam(r.URL.Path, "/user/filters/", "")
-	name, err = url.QueryUnescape(name)
+	name, err := pathName(r, "/user/filters/", "")
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid script name")
 		return
@@ -235,8 +231,7 @@ func (s *Server) handleActivateFilter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract script name from path: /user/filters/{name}/activate
-	name := extractPathParam(r.URL.Path, "/user/filters/", "/activate")
-	name, err = url.QueryUnescape(name)
+	name, err := pathName(r, "/user/filters/", "/activate")
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid script name")
 		return
