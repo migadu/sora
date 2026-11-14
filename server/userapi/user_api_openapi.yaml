@@ -837,8 +837,8 @@ components:
         message_id:
           type: string
           description: |
-            The Message-ID header, without angle brackets. A message delivered without
-            one has an ID Sora generated, in angle brackets.
+            The Message-ID header, without angle brackets. A message stored without a
+            Message-ID that parses has an ID Sora generated, in angle brackets.
           example: abc123@example.com
         in_reply_to:
           type: string

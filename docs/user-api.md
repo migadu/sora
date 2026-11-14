@@ -423,8 +423,8 @@ List messages in a mailbox with pagination.
 - `size` - Size of the raw message in octets
 - `flags` - System flags, with their backslash
 - `custom_flags` - IMAP keywords; omitted when there are none
-- `message_id` - The Message-ID header, without angle brackets. A message delivered
-  without one has an ID Sora generated, in angle brackets
+- `message_id` - The Message-ID header, without angle brackets. A message stored without
+  a Message-ID that parses has an ID Sora generated, in angle brackets
 - `in_reply_to` - The message IDs of the In-Reply-To header, without angle brackets and
   separated by spaces; omitted when there are none
 - `references` - The message IDs of the References header, in the same form. Only
@@ -813,9 +813,10 @@ activated; replacing a script keeps its active state.
 ```
 
 **Errors:**
-- `400 Bad Request` - Invalid script name, or the script does not compile against the
-  extensions reported by `GET /user/filters/capabilities` (the error says why). A script
-  that does not compile is never stored: delivery would skip it whole.
+- `400 Bad Request` - Invalid script name, `script` missing or empty, or the script does
+  not compile against the extensions reported by `GET /user/filters/capabilities` (the
+  error says why). A script that does not compile is never stored: delivery would skip it
+  whole.
 - `409 Conflict` - A new script would exceed the per-account limit of 100 scripts
   (ManageSieve answers `NO (QUOTA/MAXSCRIPTS)`); delete one first. Updating an existing
   script is not affected.
