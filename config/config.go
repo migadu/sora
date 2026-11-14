@@ -319,7 +319,7 @@ type TLSLetsEncryptConfig struct {
 func (c *TLSLetsEncryptConfig) normalizeDomains() {
 	var domains []string
 	for _, configured := range c.Domains {
-		name, err := autocertName(configured)
+		name, err := AutocertName(configured)
 		if err != nil {
 			warnf("[tls.letsencrypt] domains: ignoring %q, no certificate can be served for it: %v", configured, err)
 			continue
@@ -331,7 +331,7 @@ func (c *TLSLetsEncryptConfig) normalizeDomains() {
 	c.Domains = domains
 
 	if c.DefaultDomain != "" {
-		name, err := autocertName(c.DefaultDomain)
+		name, err := AutocertName(c.DefaultDomain)
 		if err != nil {
 			warnf("[tls.letsencrypt] default_domain: ignoring %q, clients without SNI get the first domain's certificate: %v", c.DefaultDomain, err)
 		}
@@ -339,11 +339,11 @@ func (c *TLSLetsEncryptConfig) normalizeDomains() {
 	}
 }
 
-// autocertName returns the name autocert keeps a domain's certificates under: the server
+// AutocertName returns the name autocert keeps a domain's certificates under: the server
 // name folded by idna.Lookup.ToASCII (lowercase, A-label) without a trailing dot, as
 // autocert.Manager.GetCertificate derives it from a ClientHello. It fails for a name
-// GetCertificate refuses.
-func autocertName(domain string) (string, error) {
+// GetCertificate refuses. sora-admin's tls commands name cache entries with it too.
+func AutocertName(domain string) (string, error) {
 	name, err := idna.Lookup.ToASCII(domain)
 	if err != nil {
 		return "", err
@@ -2966,7 +2966,7 @@ func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaDa
 			if srv.TLSDefaultDomain == "" {
 				continue
 			}
-			name, err := autocertName(srv.TLSDefaultDomain)
+			name, err := AutocertName(srv.TLSDefaultDomain)
 			if err != nil {
 				warnf("server %q: ignoring tls_default_domain %q, clients without SNI use the global default: %v", srv.Name, srv.TLSDefaultDomain, err)
 			}
