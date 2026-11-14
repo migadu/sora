@@ -183,12 +183,15 @@ func TestRelayValidateMalformedEndpointsHideCredentials(t *testing.T) {
 		{Type: "http", HTTPURL: "user:private-relay-token@relay.example/send"},
 		{Type: "smtp", SMTPHost: "smtp://user:private-relay-token@smtp.example:587"},
 		{Type: "smtp", SMTPHost: "user:private-relay-token@smtp.example:587"},
+		// The parser's reason quotes the part of the password before the "/" as a
+		// port: `invalid port ":private" after host` (#806).
+		{Type: "http", HTTPURL: "https://user:private/relay-token@relay.example/send"},
 	} {
 		err := relay.Validate()
 		if err == nil {
 			t.Fatalf("invalid relay endpoint was accepted: %#v", relay)
 		}
-		if strings.Contains(err.Error(), "private-relay-token") {
+		if strings.Contains(err.Error(), "private") {
 			t.Errorf("validation exposed endpoint credentials: %v", err)
 		}
 	}

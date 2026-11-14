@@ -30,7 +30,7 @@ func RemoteLookupUsesClientIP(cfg *config.RemoteLookupConfig) bool {
 func validateRemoteLookupURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("invalid remotelookup.url: %w", err)
+		return fmt.Errorf("invalid remotelookup.url: %w", config.MaskURLError(err))
 	}
 	if u.Hostname() == "" {
 		return fmt.Errorf("invalid remotelookup.url: no host")
@@ -45,7 +45,7 @@ func validateRemoteLookupURL(rawURL string) error {
 	}
 	for _, clientIP := range []string{"192.0.2.1", "2001:db8::1", ""} {
 		if _, err := url.Parse(remoteLookupRequestURL(rawURL, "user@example.com", clientIP, false)); err != nil {
-			return fmt.Errorf("invalid remotelookup.url: lookup requests cannot be built: %w", err)
+			return fmt.Errorf("invalid remotelookup.url: lookup requests cannot be built: %w", config.MaskURLError(err))
 		}
 	}
 	if u.Scheme == "https" {
@@ -125,7 +125,7 @@ func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig, ser
 	}
 
 	hasAuth := cfg.AuthToken != ""
-	logger.Debug("RemoteLookup: Initializing HTTP remotelookup (NO caching)", "url", cfg.URL, "timeout", timeout, "remote_port", remotePort, "auth_enabled", hasAuth)
+	logger.Debug("RemoteLookup: Initializing HTTP remotelookup (NO caching)", "url", config.MaskEndpointURL(cfg.URL), "timeout", timeout, "remote_port", remotePort, "auth_enabled", hasAuth)
 
 	// Parse circuit breaker settings
 	var cbSettings *CircuitBreakerSettings

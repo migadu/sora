@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/emersion/go-smtp"
+	"github.com/migadu/sora/config"
 	soralogger "github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
@@ -348,7 +349,7 @@ func (r *HTTPRelayHandler) SendToExternalRelay(from string, to string, messageBy
 		})
 		// Check if circuit breaker is open
 		if errors.Is(err, circuitbreaker.ErrCircuitBreakerOpen) {
-			soralogger.Warn("HTTP Relay: Circuit breaker is OPEN - skipping delivery", "url", r.HTTPURL)
+			soralogger.Warn("HTTP Relay: Circuit breaker is OPEN - skipping delivery", "url", config.MaskEndpointURL(r.HTTPURL))
 			metrics.LMTPExternalRelay.WithLabelValues("circuit_breaker_open").Inc()
 			return fmt.Errorf("HTTP relay circuit breaker is open: %w", err)
 		}
@@ -386,8 +387,9 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 	req, err := http.NewRequest("POST", r.HTTPURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-		// Invalid URL is a configuration error (permanent)
-		return &RelayError{Err: fmt.Errorf("failed to create HTTP request: %w", err), Permanent: true}
+		// Invalid URL is a configuration error (permanent). The error quotes http_url,
+		// which may carry credentials, as does any error from Do.
+		return &RelayError{Err: fmt.Errorf("failed to create HTTP request: %w", config.MaskURLError(err)), Permanent: true}
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -399,7 +401,7 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 	if err != nil {
 		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
 		// Network/connection errors are temporary
-		return &RelayError{Err: fmt.Errorf("failed to send HTTP relay request: %w", err), Permanent: false}
+		return &RelayError{Err: fmt.Errorf("failed to send HTTP relay request: %w", config.MaskURLError(err)), Permanent: false}
 	}
 	defer func() {
 		// Read the body to EOF so the transport keeps the connection for the
@@ -418,7 +420,7 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 		err := fmt.Errorf("HTTP relay returned error status: %d", resp.StatusCode)
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			err = fmt.Errorf("HTTP relay returned redirect status %d to %q; redirects are not followed, so [relay] http_url must be the final URL",
-				resp.StatusCode, resp.Header.Get("Location"))
+				resp.StatusCode, config.MaskEndpointURL(resp.Header.Get("Location")))
 		}
 		return &RelayError{Err: err, Permanent: permanent}
 	}
