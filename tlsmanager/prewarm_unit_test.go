@@ -18,7 +18,7 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 )
 
-// TestPrewarmingLoadsFromCache tests that prewarmCertificates calls Cache.Get
+// TestPrewarmingLoadsFromCache tests that StartRenewals calls Cache.Get
 // and GetCertificate for each configured domain
 func TestPrewarmingLoadsFromCache(t *testing.T) {
 	domain := "test.example.com"
@@ -42,7 +42,7 @@ func TestPrewarmingLoadsFromCache(t *testing.T) {
 	// Reset counters before pre-warming
 	cache.resetCounters()
 
-	// Directly test Cache.Get() (what prewarmCertificates does first)
+	// Directly test Cache.Get() (what StartRenewals does first)
 	data, err := cache.Get(ctx, domain)
 	if err != nil {
 		t.Fatalf("Cache.Get failed: %v", err)
@@ -62,7 +62,7 @@ func TestPrewarmingLoadsFromCache(t *testing.T) {
 	t.Logf("SUCCESS: Pre-warming loads from cache as expected")
 }
 
-// TestPrewarmingSkipsMissingCerts tests that prewarmCertificates gracefully skips
+// TestPrewarmingSkipsMissingCerts tests that StartRenewals gracefully skips
 // domains that don't have certificates in cache
 func TestPrewarmingSkipsMissingCerts(t *testing.T) {
 	domain := "missing.example.com"
@@ -71,7 +71,7 @@ func TestPrewarmingSkipsMissingCerts(t *testing.T) {
 	// Create tracking cache with NO certificate stored
 	cache := newTrackingCache()
 
-	// Directly test Cache.Get() (what prewarmCertificates does)
+	// Directly test Cache.Get() (what StartRenewals does)
 	_, err := cache.Get(ctx, domain)
 	if err != autocert.ErrCacheMiss {
 		t.Fatalf("Expected ErrCacheMiss for missing cert, got: %v", err)
@@ -88,7 +88,7 @@ func TestPrewarmingSkipsMissingCerts(t *testing.T) {
 	t.Logf("SUCCESS: Pre-warming gracefully handles missing certificates")
 }
 
-// TestPrewarmingMultipleDomains tests that prewarmCertificates handles multiple domains
+// TestPrewarmingMultipleDomains tests that StartRenewals handles multiple domains
 func TestPrewarmingMultipleDomains(t *testing.T) {
 	domains := []string{"domain1.example.com", "domain2.example.com", "domain3.example.com"}
 	ctx := context.Background()

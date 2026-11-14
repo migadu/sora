@@ -27,7 +27,7 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 	// Validate email address format using server.NewAddress
 	address, err := server.NewAddress(req.Email)
 	if err != nil {
-		return 0, fmt.Errorf("invalid email address: %w", err)
+		return 0, fmt.Errorf("%w: invalid email address: %w", ErrInvalidAccountRequest, err)
 	}
 
 	normalizedEmail := address.FullAddress()
@@ -44,7 +44,7 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 
 	if err == nil {
 		if deletedAt != nil {
-			return 0, fmt.Errorf("cannot create account with email %s: an account with this email is in deletion grace period", normalizedEmail)
+			return 0, fmt.Errorf("%w: cannot create account with email %s: an account with this email is in deletion grace period", consts.ErrAccountAlreadyExists, normalizedEmail)
 		}
 		return 0, fmt.Errorf("%w: account with email %s already exists", consts.ErrAccountAlreadyExists, normalizedEmail)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
@@ -59,7 +59,7 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 	} else {
 		// Generate hash from password
 		if req.Password == "" {
-			return 0, fmt.Errorf("either password or password_hash must be provided")
+			return 0, fmt.Errorf("%w: either password or password_hash must be provided", ErrInvalidAccountRequest)
 		}
 
 		switch req.HashType {
@@ -74,7 +74,7 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 				return 0, fmt.Errorf("failed to generate bcrypt hash: %w", err)
 			}
 		default:
-			return 0, fmt.Errorf("unsupported hash type: %s", req.HashType)
+			return 0, fmt.Errorf("%w: %w: %s", ErrInvalidAccountRequest, ErrUnsupportedHashType, req.HashType)
 		}
 	}
 
@@ -146,7 +146,7 @@ func (db *Database) AddCredential(ctx context.Context, tx pgx.Tx, req AddCredent
 				return fmt.Errorf("failed to generate bcrypt hash: %w", err)
 			}
 		default:
-			return fmt.Errorf("unsupported hash type: %s", req.NewHashType)
+			return fmt.Errorf("%w: %w: %s", ErrInvalidAccountRequest, ErrUnsupportedHashType, req.NewHashType)
 		}
 	}
 
@@ -195,14 +195,14 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 	// Validate email address format using server.NewAddress
 	address, err := server.NewAddress(req.Email)
 	if err != nil {
-		return fmt.Errorf("invalid email address: %w", err)
+		return fmt.Errorf("%w: invalid email address: %w", ErrInvalidAccountRequest, err)
 	}
 
 	normalizedEmail := address.FullAddress()
 
 	// Validate that we have at least one operation to perform
 	if req.Password == "" && req.PasswordHash == "" && !req.MakePrimary {
-		return fmt.Errorf("either password, password_hash, or make-primary must be specified")
+		return fmt.Errorf("%w: either password, password_hash, or make-primary must be specified", ErrInvalidAccountRequest)
 	}
 
 	// Check if account exists
@@ -236,7 +236,7 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 				return fmt.Errorf("failed to generate bcrypt hash: %w", err)
 			}
 		default:
-			return fmt.Errorf("unsupported hash type: %s", req.HashType)
+			return fmt.Errorf("%w: %w: %s", ErrInvalidAccountRequest, ErrUnsupportedHashType, req.HashType)
 		}
 	}
 
@@ -363,6 +363,12 @@ var (
 	// storage keys (s3_domain) are captured per-message from the then-current primary, so such
 	// a switch would split one account's objects across two S3 domain prefixes.
 	ErrCrossDomainPrimaryChange = errors.New("cannot change the primary identity to a different domain on an account that already has messages: this would split message storage across domains")
+	// ErrInvalidAccountRequest wraps the errors CreateAccount, CreateAccountWithCredentials
+	// and UpdateAccount return for a request that cannot succeed as written (malformed
+	// address, no or several primaries, an address twice, unknown hash type, a password
+	// over bcrypt's 72 bytes, ...), so a caller can tell a bad request from a database
+	// failure.
+	ErrInvalidAccountRequest = errors.New("invalid account request")
 )
 
 // accountHasMessages reports whether the account has any rows in the messages table.
@@ -1049,7 +1055,7 @@ type CreateAccountWithCredentialsRequest struct {
 // CreateAccountWithCredentials creates a new account with multiple credentials atomically
 func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx, req CreateAccountWithCredentialsRequest) (int64, error) {
 	if len(req.Credentials) == 0 {
-		return 0, fmt.Errorf("at least one credential must be provided")
+		return 0, fmt.Errorf("%w: at least one credential must be provided", ErrInvalidAccountRequest)
 	}
 
 	// Validate credentials and ensure exactly one primary
@@ -1059,13 +1065,13 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 			primaryCount++
 		}
 		if cred.Email == "" {
-			return 0, fmt.Errorf("credential %d: email is required", i+1)
+			return 0, fmt.Errorf("%w: credential %d: email is required", ErrInvalidAccountRequest, i+1)
 		}
 		if cred.Password == "" && cred.PasswordHash == "" {
-			return 0, fmt.Errorf("credential %d: either password or password_hash must be provided", i+1)
+			return 0, fmt.Errorf("%w: credential %d: either password or password_hash must be provided", ErrInvalidAccountRequest, i+1)
 		}
 		if cred.Password != "" && cred.PasswordHash != "" {
-			return 0, fmt.Errorf("credential %d: cannot specify both password and password_hash", i+1)
+			return 0, fmt.Errorf("%w: credential %d: cannot specify both password and password_hash", ErrInvalidAccountRequest, i+1)
 		}
 		if cred.HashType == "" {
 			req.Credentials[i].HashType = "bcrypt" // Default hash type
@@ -1079,10 +1085,10 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 
 	// Ensure exactly one primary credential
 	if primaryCount == 0 {
-		return 0, fmt.Errorf("exactly one credential must be marked as primary")
+		return 0, fmt.Errorf("%w: exactly one credential must be marked as primary", ErrInvalidAccountRequest)
 	}
 	if primaryCount > 1 {
-		return 0, fmt.Errorf("only one credential can be marked as primary")
+		return 0, fmt.Errorf("%w: only one credential can be marked as primary", ErrInvalidAccountRequest)
 	}
 
 	// Validate and normalize all email addresses
@@ -1090,7 +1096,7 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 	for i, cred := range req.Credentials {
 		address, err := server.NewAddress(cred.Email)
 		if err != nil {
-			return 0, fmt.Errorf("credential %d: invalid email address: %w", i+1, err)
+			return 0, fmt.Errorf("%w: credential %d: invalid email address: %w", ErrInvalidAccountRequest, i+1, err)
 		}
 		normalizedEmails[i] = address.FullAddress()
 	}
@@ -1099,7 +1105,7 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 	emailSet := make(map[string]bool)
 	for i, email := range normalizedEmails {
 		if emailSet[email] {
-			return 0, fmt.Errorf("credential %d: duplicate email address: %s", i+1, email)
+			return 0, fmt.Errorf("%w: credential %d: duplicate email address: %s", ErrInvalidAccountRequest, i+1, email)
 		}
 		emailSet[email] = true
 	}
@@ -1117,7 +1123,7 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 
 		if err == nil {
 			if deletedAt != nil {
-				return 0, fmt.Errorf("credential %d: cannot create account with email %s: an account with this email is in deletion grace period", i+1, email)
+				return 0, fmt.Errorf("%w: credential %d: cannot create account with email %s: an account with this email is in deletion grace period", consts.ErrAccountAlreadyExists, i+1, email)
 			}
 			return 0, fmt.Errorf("%w: credential %d: account with email %s already exists", consts.ErrAccountAlreadyExists, i+1, email)
 		} else if !errors.Is(err, pgx.ErrNoRows) {
@@ -1153,7 +1159,7 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 					return 0, fmt.Errorf("credential %d: failed to generate bcrypt hash: %w", i+1, err)
 				}
 			default:
-				return 0, fmt.Errorf("credential %d: unsupported hash type: %s", i+1, cred.HashType)
+				return 0, fmt.Errorf("%w: credential %d: %w: %s", ErrInvalidAccountRequest, i+1, ErrUnsupportedHashType, cred.HashType)
 			}
 		}
 

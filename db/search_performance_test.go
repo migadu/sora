@@ -45,12 +45,12 @@ type PerformanceTestSuite struct {
 	accountID int64
 	mailboxID int64
 	config    PerformanceTestConfig
-	t         *testing.T
+	t         testing.TB
 	nextUID   int64 // Track the next available UID
 }
 
 // NewPerformanceTestSuite creates a new performance test suite
-func NewPerformanceTestSuite(t *testing.T, config PerformanceTestConfig) *PerformanceTestSuite {
+func NewPerformanceTestSuite(t testing.TB, config PerformanceTestConfig) *PerformanceTestSuite {
 	if testing.Short() {
 		config = FastPerformanceConfig
 		t.Logf("Using fast performance config for short tests: %+v", config)
@@ -608,7 +608,7 @@ func BenchmarkSearchOperations(b *testing.B) {
 	}
 
 	ctx := context.Background()
-	pts := NewPerformanceTestSuite(&testing.T{}, FastPerformanceConfig)
+	pts := NewPerformanceTestSuite(b, FastPerformanceConfig)
 	defer pts.Close()
 
 	// Create test data once

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/server/sieveengine"
 )
@@ -166,6 +168,11 @@ func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
 	// Create or update script
 	script, err := s.rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, name, req.Script)
 	if err != nil {
+		if errors.Is(err, db.ErrSieveScriptLimitReached) {
+			// Permanent until a script is deleted (ManageSieve: NO (QUOTA/MAXSCRIPTS)).
+			s.writeError(w, http.StatusConflict, fmt.Sprintf("Too many Sieve scripts (maximum %d); delete one first", db.MaxScriptsPerAccount()))
+			return
+		}
 		logger.Warn("HTTP Mail API: Error creating/updating Sieve script", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to save script")
 		return
