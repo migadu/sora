@@ -343,15 +343,62 @@ func (c *TLSLetsEncryptConfig) normalizeDomains() {
 // autocert.Manager.GetCertificate derives it from a ClientHello. It fails for a name
 // GetCertificate refuses. sora-admin's tls commands name cache entries with it too.
 func AutocertName(domain string) (string, error) {
+	if domain == "" {
+		return "", errors.New("missing server name")
+	}
+	if strings.ContainsAny(domain, `/\`) {
+		return "", errors.New("server name contains path separator")
+	}
 	name, err := idna.Lookup.ToASCII(domain)
 	if err != nil {
 		return "", err
 	}
 	name = strings.TrimSuffix(name, ".")
-	if !strings.Contains(strings.Trim(name, "."), ".") {
+	if len(name) == 0 || len(name) > 253 {
+		return "", errors.New("server name length invalid")
+	}
+	if net.ParseIP(name) != nil {
+		return "", errors.New("server name must not be an IP address")
+	}
+	labels := strings.Split(name, ".")
+	if len(labels) < 2 {
 		return "", errors.New("server name component count invalid")
 	}
+	for _, label := range labels {
+		if !isValidAutocertLabel(label) {
+			return "", fmt.Errorf("invalid server name label %q", label)
+		}
+	}
+	if isAllASCIIDigits(labels[len(labels)-1]) {
+		return "", errors.New("server name top-level domain must not be all-numeric")
+	}
 	return name, nil
+}
+
+func isValidAutocertLabel(label string) bool {
+	if len(label) == 0 || len(label) > 63 {
+		return false
+	}
+	if label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(label); i++ {
+		c := label[i]
+		if ('a' <= c && c <= 'z') || ('0' <= c && c <= '9') || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isAllASCIIDigits(label string) bool {
+	for i := 0; i < len(label); i++ {
+		if label[i] < '0' || label[i] > '9' {
+			return false
+		}
+	}
+	return len(label) > 0
 }
 
 // TLSConfig holds TLS/SSL configuration
