@@ -1,8 +1,10 @@
 package userapi
 
 import (
+	"maps"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 )
 
@@ -75,7 +77,7 @@ func extractLastPathSegment(path string) string {
 }
 
 // routeHandler wraps an http.HandlerFunc with method checking
-func routeHandler(method string, handler http.HandlerFunc) http.HandlerFunc {
+func (s *Server) routeHandler(method string, handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "OPTIONS" {
 			// Allow OPTIONS for CORS preflight
@@ -83,7 +85,7 @@ func routeHandler(method string, handler http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if r.Method != method {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, method)
 			return
 		}
 		handler(w, r)
@@ -91,7 +93,8 @@ func routeHandler(method string, handler http.HandlerFunc) http.HandlerFunc {
 }
 
 // multiMethodHandler allows multiple HTTP methods for a single route
-func multiMethodHandler(handlers map[string]http.HandlerFunc) http.HandlerFunc {
+func (s *Server) multiMethodHandler(handlers map[string]http.HandlerFunc) http.HandlerFunc {
+	allowed := slices.Sorted(maps.Keys(handlers))
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "OPTIONS" {
 			// Allow OPTIONS for CORS preflight
@@ -102,6 +105,20 @@ func multiMethodHandler(handlers map[string]http.HandlerFunc) http.HandlerFunc {
 			handler(w, r)
 			return
 		}
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		s.methodNotAllowed(w, allowed...)
 	}
+}
+
+// methodNotAllowed answers a method the endpoint does not serve: 405 with the
+// documented JSON error and, as RFC 9110 section 15.5.6 requires, an Allow
+// header listing the methods the endpoint does serve.
+func (s *Server) methodNotAllowed(w http.ResponseWriter, allowed ...string) {
+	w.Header().Set("Allow", strings.Join(allowed, ", "))
+	s.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+}
+
+// notFound answers a path no endpoint serves with the documented JSON error,
+// in place of ServeMux's text/plain "404 page not found".
+func (s *Server) notFound(w http.ResponseWriter, _ *http.Request) {
+	s.writeError(w, http.StatusNotFound, "Not found")
 }

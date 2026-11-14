@@ -987,7 +987,8 @@ The User API uses standard HTTP status codes and returns JSON error responses.
 | 400 | Bad Request | Invalid request parameters or body |
 | 401 | Unauthorized | Missing or invalid JWT token |
 | 403 | Forbidden | Operation not allowed (e.g., delete INBOX) |
-| 404 | Not Found | Resource not found |
+| 404 | Not Found | Resource not found, or no endpoint at that path |
+| 405 | Method Not Allowed | The endpoint does not serve the method; the `Allow` header lists the ones it does |
 | 409 | Conflict | Resource already exists |
 | 500 | Internal Server Error | Server error |
 
