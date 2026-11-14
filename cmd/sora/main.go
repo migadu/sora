@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -172,6 +171,9 @@ func (deps *serverDependencies) relayWorkerOption() lmtp.RelayWorkerNotifier {
 }
 
 func main() {
+	// Before anything else: until SIGHUP is taken, it terminates the process.
+	sighup := listenForSIGHUP()
+
 	errorHandler := errors.NewErrorHandler()
 	cfg := config.NewDefaultConfig()
 
@@ -292,37 +294,12 @@ func main() {
 		defer deps.spamTrainingClient.Close()
 	}
 
-	// SIGHUP handler for config reload - set up AFTER deps is created so the running
-	// servers are registered. Global settings are only reported (handleConfigReload
-	// leaves deps.config as it is); each server reloads its own.
-	reloadChan := make(chan os.Signal, 1)
-	signal.Notify(reloadChan, syscall.SIGHUP)
-	go func() {
-		for range reloadChan {
-			// newsyslog sends SIGHUP after rotating the log file: reopen it first,
-			// so the reload below is logged into the new file.
-			if err := logger.Reopen(); err != nil {
-				logger.Error("SIGHUP: log file not reopened", "error", err)
-			}
-			logger.Info("SIGHUP received - reloading configuration", "config", *configPath)
-
-			// Re-read the full config for per-server dispatch
-			newCfg := config.NewDefaultConfig()
-			if err := config.LoadConfigFromFile(*configPath, &newCfg); err != nil {
-				logger.Error("Config reload failed - keeping current config", "error", err)
-				continue
-			}
-
-			// Report the global settings that need a restart
-			handleConfigReload(*configPath, &deps.config, errorHandler)
-
-			// Dispatch per-server reload to running servers
-			deps.reloadServers(&newCfg)
-		}
-	}()
-
 	// Start all configured servers
 	errChan := startServers(ctx, deps)
+
+	// From here a SIGHUP reloads the configuration, and one that came during start-up
+	// does now.
+	sighup.start(func() { deps.reloadConfig(*configPath) })
 
 	// Wait for shutdown signal or error
 	select {
@@ -371,72 +348,64 @@ func dropUndefinedDatabaseEndpoints(cfg *config.Config, md toml.MetaData) {
 	}
 }
 
-// handleConfigReload reports the global settings a reload changed but cannot apply.
-// Their consumers took them at start-up, or (for [shared_mailboxes]) read the
-// process-wide config with no lock, so the running config is left as it is and a
-// change takes effect on restart. Per-server settings are reloaded by each server's
-// ReloadConfig, which the SIGHUP handler calls after this.
-func handleConfigReload(configPath string, currentCfg *config.Config, errorHandler *errors.ErrorHandler) {
-	newCfg := config.NewDefaultConfig()
+// readConfigFile reads the config file for start-up and for a reload alike: the
+// defaults, the file over them, and no database endpoint the file leaves out. Reading
+// both the same way is what lets a reload compare the two configs key by key. On an
+// error it returns what it has, which start-up uses when the default config.toml is
+// missing.
+func readConfigFile(configPath string) (config.Config, error) {
+	cfg := config.NewDefaultConfig()
+	md, err := config.LoadConfigFromFileWithMetadata(configPath, &cfg)
+	dropUndefinedDatabaseEndpoints(&cfg, md)
+	return cfg, err
+}
 
-	// Re-read config file
-	if err := config.LoadConfigFromFile(configPath, &newCfg); err != nil {
+// reloadConfig is what a SIGHUP does once the servers run. It reads the file once and
+// hands that one config to both halves of the reload, the global report and the
+// per-server reload, so they cannot act on two versions of the file.
+func (deps *serverDependencies) reloadConfig(configPath string) {
+	logger.Info("SIGHUP received - reloading configuration", "config", configPath)
+	newCfg, err := readConfigFile(configPath)
+	if err != nil {
 		logger.Error("Config reload failed - keeping current config", "error", err)
 		return
 	}
+	handleConfigReload(&deps.config, &newCfg)
+	deps.reloadServers(&newCfg)
+}
 
-	// Logging level changes require restart (logger doesn't support runtime level change)
-	if newCfg.Logging.Level != currentCfg.Logging.Level {
-		logger.Info("Config reload: logging.level changed but requires restart to take effect",
-			"current", currentCfg.Logging.Level, "new", newCfg.Logging.Level)
-	}
+// reloadableGlobalSettings are the global settings a change to which takes effect
+// without restarting sora, so a reload does not report them. None of sora's own is
+// among them: their consumers took them at start-up, or (for [shared_mailboxes]) read
+// the process-wide config with no lock, so a reload leaves the running config as it is.
+// [admin_cli] is sora-admin's, which reads the file on every run; sora never reads it.
+var reloadableGlobalSettings = []string{
+	"admin_cli.addr", "admin_cli.api_key", "admin_cli.insecure_skip_verify", "admin_cli.import_message_limit",
+}
 
-	// The cleaner is configured once, at start-up.
-	if newCfg.Cleanup != currentCfg.Cleanup {
-		logger.Info("Config reload: [cleanup] changed but requires restart to take effect",
-			"current", currentCfg.Cleanup, "new", newCfg.Cleanup)
-	}
-
-	// IMAP sessions read [shared_mailboxes] from the process-wide config with no lock,
-	// so a reload must not write it (and a session that has seen the shared namespace
-	// would lose it midway).
-	if newCfg.SharedMailboxes != currentCfg.SharedMailboxes {
-		logger.Info("Config reload: [shared_mailboxes] changed but requires restart to take effect",
-			"current", currentCfg.SharedMailboxes, "new", newCfg.SharedMailboxes)
-	}
-
-	// The [sieve] section is read once at startup by every consumer (LMTP, the
-	// Admin and User APIs, ManageSieve; max_execution_time at process start), so a
-	// change takes effect on restart. It used to be reported as reloaded, and
-	// whenever the list was non-empty, not only when it changed.
-	if !reflect.DeepEqual(newCfg.Sieve, currentCfg.Sieve) {
-		logger.Info("Config reload: [sieve] changed but requires restart to take effect",
-			"current", currentCfg.Sieve, "new", newCfg.Sieve)
-	}
-	// [backend_maintenance] tunes the poller and the drains, which start with the proxies.
-	if newCfg.Maintenance != currentCfg.Maintenance {
-		logger.Info("Config reload: [backend_maintenance] changed but requires restart to take effect",
-			"current", currentCfg.Maintenance, "new", newCfg.Maintenance)
-	}
-
-	// IMAP takes the [metadata] limits at start-up.
-	if newCfg.Metadata != currentCfg.Metadata {
-		logger.Info("Config reload: [metadata] changed but requires restart to take effect",
-			"current", currentCfg.Metadata, "new", newCfg.Metadata)
+// handleConfigReload reports the global settings next, the config a SIGHUP read,
+// changes from current, the running one, and leaves current as it is. Every one of
+// them takes effect on restart. Each server's [[server]] block is reloadServers' to
+// report, and its ReloadConfig's to apply.
+func handleConfigReload(current, next *config.Config) {
+	// Names only: values include passwords and keys.
+	if changed := current.RestartRequiredChanges(next, reloadableGlobalSettings); len(changed) > 0 {
+		logger.Info("Config reload: global settings changed but require restart to take effect", "fields", changed)
 	}
 
 	// Every server and proxy takes trusted_networks at start-up: until a restart, the
 	// networks they started with stay trusted and added ones are not.
-	if !slices.Equal(newCfg.Servers.TrustedNetworks, currentCfg.Servers.TrustedNetworks) {
+	if !slices.Equal(next.Servers.TrustedNetworks, current.Servers.TrustedNetworks) {
 		logger.Warn("Config reload: servers.trusted_networks changed but requires restart to take effect; the networks the servers started with stay trusted until then",
-			"current", currentCfg.Servers.TrustedNetworks, "new", newCfg.Servers.TrustedNetworks)
+			"current", current.Servers.TrustedNetworks, "new", next.Servers.TrustedNetworks)
 	}
 }
 
 // loadAndValidateConfig loads configuration from file and validates all server configurations
 func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *errors.ErrorHandler) {
 	// Load configuration from TOML file
-	md, err := config.LoadConfigFromFileWithMetadata(configPath, cfg)
+	loaded, err := readConfigFile(configPath)
+	*cfg = loaded
 	if err != nil {
 		if os.IsNotExist(err) {
 			// If default config doesn't exist, that's okay - use defaults
@@ -454,7 +423,6 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 	} else {
 		logger.Info("Loaded configuration", "path", configPath)
 	}
-	dropUndefinedDatabaseEndpoints(cfg, md)
 	if invalid := sieveengine.InvalidExtensions(cfg.Sieve.EnabledExtensions); len(invalid) > 0 {
 		logger.Warn("[sieve] enabled_extensions names extensions the engine does not support; they are ignored, and the default set is used if none remain",
 			"invalid", invalid, "effective", sieveengine.EffectiveExtensions(cfg.Sieve.EnabledExtensions))
