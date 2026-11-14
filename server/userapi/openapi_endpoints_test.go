@@ -86,6 +86,18 @@ func TestOpenAPIDeleteMessageResponse(t *testing.T) {
 	}
 }
 
+// handleDeleteMailbox refuses INBOX, and a shared mailbox without the 'x' right, with
+// 403 (#992).
+func TestOpenAPIDeleteMailboxResponse(t *testing.T) {
+	op := openAPIOperation(t, "/mailboxes/{name}", "delete")
+	if _, ok := yamlSection(op, 8, "'403':"); !ok {
+		t.Error("DELETE /mailboxes/{name} does not list 403")
+	}
+	if resp, ok := yamlSection(op, 8, "'400':"); ok && strings.Contains(resp, "INBOX") {
+		t.Errorf("DELETE /mailboxes/{name} documents the INBOX refusal as 400; it is 403:\n%s", resp)
+	}
+}
+
 func assertShapes(t *testing.T, what string, documented, wire []string) {
 	t.Helper()
 	if spec, got := strings.Join(documented, ", "), strings.Join(wire, ", "); spec != got {

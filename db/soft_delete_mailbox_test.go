@@ -470,3 +470,46 @@ func TestSoftDeleteMailbox_UpdateMessageFlagsReturnsNotFound(t *testing.T) {
 		assert.NotErrorIs(t, err, consts.ErrNotPermitted)
 	})
 }
+
+// A grantee who can see a shared mailbox but lacks the 'x' (delete mailbox) right
+// (RFC 4314 §2.1) is refused with consts.ErrNotPermitted, which the User API answers
+// 403, and the mailbox stays live. An untyped error was answered 500 (issue #992).
+func TestDeleteMailboxForUser_SharedWithoutDeleteRightIsNotPermitted(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db := setupTestDatabase(t)
+	defer db.Close()
+
+	domain := fmt.Sprintf("softdelacl%d.example.com", time.Now().UnixNano())
+	baseCtx := context.Background()
+	sharedCtx := context.WithValue(baseCtx, consts.ConfigContextKey, &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/"},
+	})
+
+	ownerID, _ := setupAccountWithInbox(t, db, baseCtx, "owner@"+domain)
+	granteeEmail := "grantee@" + domain
+	granteeID, _ := setupAccountWithInbox(t, db, baseCtx, granteeEmail)
+
+	const mboxName = "Shared/Team"
+	tx, err := db.GetWritePool().Begin(sharedCtx)
+	require.NoError(t, err)
+	defer tx.Rollback(baseCtx)
+	require.NoError(t, db.CreateMailbox(sharedCtx, tx, ownerID, mboxName, nil))
+	require.NoError(t, tx.Commit(sharedCtx))
+
+	require.NoError(t, db.GrantMailboxAccessByIdentifier(sharedCtx, ownerID, granteeEmail, mboxName, "lr"))
+
+	err = db.DeleteMailboxForUser(sharedCtx, granteeID, mboxName)
+	require.ErrorIs(t, err, consts.ErrNotPermitted)
+
+	_, err = db.GetMailboxByName(sharedCtx, ownerID, mboxName)
+	require.NoError(t, err, "a refused delete must leave the mailbox live")
+
+	// With the 'x' right the same request deletes it.
+	require.NoError(t, db.GrantMailboxAccessByIdentifier(sharedCtx, ownerID, granteeEmail, mboxName, "lrx"))
+	require.NoError(t, db.DeleteMailboxForUser(sharedCtx, granteeID, mboxName))
+	_, err = db.GetMailboxByName(sharedCtx, ownerID, mboxName)
+	require.ErrorIs(t, err, consts.ErrMailboxNotFound)
+}
