@@ -656,7 +656,11 @@ func (b *LMTPServerBackend) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	next := *b.settings.Load()
 
-	if maxSize := cfg.GetMaxMessageSizeWithDefault(); maxSize != next.maxMessageSize {
+	// A value that does not parse keeps the running limit (start-up, which has none,
+	// uses the default).
+	if maxSize, err := cfg.GetMaxMessageSize(); err != nil {
+		logger.Warn("LMTP config reload: invalid max_message_size, keeping the running value", "name", b.name, "error", err, "running", next.maxMessageSize)
+	} else if maxSize != next.maxMessageSize {
 		next.maxMessageSize = maxSize
 		reloaded = append(reloaded, "max_message_size")
 	}

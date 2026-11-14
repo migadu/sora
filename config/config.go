@@ -646,7 +646,15 @@ type AuthRateLimiterConfig struct {
 // disabled the IP block on another). TOML accepts nan and inf, which pass a sign check
 // but are no growth factor. Any finite multiplier is safe: the limiter caps the
 // product at max_delay before converting it to a time.Duration.
+//
+// It also rejects an exempt_networks entry that is neither an IP address nor a CIDR.
+// The limiter's match skips such an entry, so it would exempt nobody, and the host the
+// operator meant to exempt would be counted and blocked with nothing in the log to say
+// why. A malformed [servers] trusted_networks entry is refused the same way.
 func (c *AuthRateLimiterConfig) Validate() error {
+	if invalid := helpers.InvalidNetworkEntries(c.ExemptNetworks); len(invalid) > 0 {
+		return fmt.Errorf("auth_rate_limit.exempt_networks has entries that are neither an IP address nor a CIDR: %q", invalid)
+	}
 	v := reflect.ValueOf(c).Elem()
 	for i := 0; i < v.NumField(); i++ {
 		f := v.Field(i)
@@ -1767,11 +1775,27 @@ func (s *ServerConfig) GetMaxScriptSize() (int64, error) {
 	return size, nil
 }
 
+// GetMaxMessageSize returns max_message_size (LMTP, LMTP proxy, Admin API delivery),
+// 50 MB when omitted, capped at consts.MaxStoredMessageSize: a larger message would be
+// read in full and then refused by the database insert, and the LMTP proxy would
+// advertise a SIZE no backend accepts. RFC 1870 section 5: "The fixed maximum message
+// size is defined as the message size of the largest message that a server is ever
+// willing to accept. [...] The fixed maximum message size may be an implementation
+// artifact of the SMTP server". A value that does not parse is an error: start-up falls
+// back to the default (GetMaxMessageSizeWithDefault), a reload keeps the running limit.
 func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
 	if s.MaxMessageSize == "" {
 		return 50 * 1024 * 1024, nil // 50MB default
 	}
-	return helpers.ParseSize(s.MaxMessageSize)
+	size, err := helpers.ParseSize(s.MaxMessageSize)
+	if err != nil {
+		return 0, err
+	}
+	if size > consts.MaxStoredMessageSize {
+		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
+		return consts.MaxStoredMessageSize, nil
+	}
+	return size, nil
 }
 
 func (s *ServerConfig) GetConnectTimeout() (time.Duration, error) {
@@ -2339,22 +2363,13 @@ func (s *ServerConfig) GetAuthIdleTimeoutWithDefault() time.Duration {
 	return timeout
 }
 
-// GetMaxMessageSizeWithDefault returns max_message_size (LMTP, LMTP proxy, Admin API
-// delivery), at start-up and on a reload, capped at consts.MaxStoredMessageSize: a
-// larger message would be read in full and then refused by the database insert, and
-// the LMTP proxy would advertise a SIZE no backend accepts. RFC 1870 section 5: "The
-// fixed maximum message size is defined as the message size of the largest message
-// that a server is ever willing to accept. [...] The fixed maximum message size may
-// be an implementation artifact of the SMTP server".
+// GetMaxMessageSizeWithDefault returns GetMaxMessageSize for start-up, which has no
+// running limit to keep: a value that does not parse is the 50 MB default.
 func (s *ServerConfig) GetMaxMessageSizeWithDefault() int64 {
 	size, err := s.GetMaxMessageSize()
 	if err != nil {
 		warnf("Failed to parse max message size for server '%s': %v, using default (50MB)", s.Name, err)
 		return 52428800 // 50MB default
-	}
-	if size > consts.MaxStoredMessageSize {
-		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
-		return consts.MaxStoredMessageSize
 	}
 	return size
 }
