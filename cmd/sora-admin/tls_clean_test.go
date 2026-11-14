@@ -26,7 +26,7 @@ import (
 // autocertEntry returns a cache entry as autocert writes one (the private key PEM, then
 // the certificate PEM) holding a self-signed certificate for domain that expires at
 // notAfter, with an RSA key when useRSA is set and an ECDSA P-256 key otherwise.
-func autocertEntry(t *testing.T, domain string, useRSA bool, notAfter time.Time) []byte {
+func tlsCleanAutocertEntry(t *testing.T, domain string, useRSA bool, notAfter time.Time) []byte {
 	t.Helper()
 	var key crypto.Signer
 	var keyBlock *pem.Block
@@ -81,8 +81,8 @@ func putExpiredEntries(t *testing.T, cfg AdminConfig, cacheDir, domain string) {
 	t.Helper()
 	expired := time.Now().Add(-24 * time.Hour)
 	for name, data := range map[string][]byte{
-		domain:          autocertEntry(t, domain, false, expired),
-		domain + "+rsa": autocertEntry(t, domain, true, expired),
+		domain:          tlsCleanAutocertEntry(t, domain, false, expired),
+		domain + "+rsa": tlsCleanAutocertEntry(t, domain, true, expired),
 	} {
 		putServerEntry(t, cfg, name, data)
 		if err := os.WriteFile(filepath.Join(cacheDir, name), data, 0600); err != nil {
@@ -101,8 +101,8 @@ func TestTLSCleanRemovesExpiredLocalCopies(t *testing.T) {
 
 	valid := time.Now().Add(60 * 24 * time.Hour)
 	for name, data := range map[string][]byte{
-		"other.example.com":     autocertEntry(t, "other.example.com", false, valid),
-		"other.example.com+rsa": autocertEntry(t, "other.example.com", true, valid),
+		"other.example.com":     tlsCleanAutocertEntry(t, "other.example.com", false, valid),
+		"other.example.com+rsa": tlsCleanAutocertEntry(t, "other.example.com", true, valid),
 	} {
 		putServerEntry(t, cfg, name, data)
 		if err := os.WriteFile(filepath.Join(cacheDir, name), data, 0600); err != nil {
@@ -135,8 +135,8 @@ func TestTLSCleanKeepsValidLocalCopy(t *testing.T) {
 	putExpiredEntries(t, cfg, cacheDir, "mail.example.com")
 	valid := time.Now().Add(60 * 24 * time.Hour)
 	renewals := map[string][]byte{
-		"mail.example.com":     autocertEntry(t, "mail.example.com", false, valid),
-		"mail.example.com+rsa": autocertEntry(t, "mail.example.com", true, valid),
+		"mail.example.com":     tlsCleanAutocertEntry(t, "mail.example.com", false, valid),
+		"mail.example.com+rsa": tlsCleanAutocertEntry(t, "mail.example.com", true, valid),
 	}
 	for name, data := range renewals {
 		if err := os.WriteFile(filepath.Join(cacheDir, name), data, 0600); err != nil {
@@ -210,7 +210,7 @@ func TestTLSCleanStaysInTheCacheDir(t *testing.T) {
 	if err := os.WriteFile(victim, []byte("not a certificate"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	stub.put("certs", tlsmanager.S3ObjectKey("../victim"), autocertEntry(t, "../victim", false, time.Now().Add(-24*time.Hour)))
+	stub.put("certs", tlsmanager.S3ObjectKey("../victim"), tlsCleanAutocertEntry(t, "../victim", false, time.Now().Add(-24*time.Hour)))
 
 	if err := cleanTLSCertificates(context.Background(), cfg, cacheDir, false, true); err != nil {
 		t.Fatalf("cleanTLSCertificates: %v", err)

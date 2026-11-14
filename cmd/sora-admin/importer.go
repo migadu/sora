@@ -2371,8 +2371,6 @@ func (i *Importer) rollbackBatchFromPostgreSQL(accountID int64, successList []st
 	return nil
 }
 
-// markBatchInS QLite marks messages as uploaded in SQLite cache
-// Called AFTER PostgreSQL commit in batch mode
 // shortHash abbreviates a content hash for logging. It is length-safe: these strings
 // reach the log from error paths, and a panic while reporting an error loses the error.
 func shortHash(hash string) string {
@@ -2390,6 +2388,18 @@ type markedMessage struct {
 	mailbox string
 }
 
+// sqliteMarkTimeout bounds markBatchInSQLite. Marking one batch is a short local
+// transaction: running into this means the cache file is stuck (locked, stalled disk).
+var sqliteMarkTimeout = 30 * time.Second
+
+// markBatchInSQLite marks the cache rows of messages whose PostgreSQL rows are
+// committed, so that an --incremental run skips them.
+//
+// The messages are already in the mailbox when this runs, so the mark is detached from
+// the import's cancellation (SIGINT/SIGTERM cancel i.ctx): an interrupt that abandoned
+// it would count committed messages as failed and leave their rows unmarked, and the
+// next --incremental run would read and upload those files again. The timeout still
+// bounds it, and is reported as the timeout it is.
 func (i *Importer) markBatchInSQLite(marked []markedMessage) error {
 	if len(marked) == 0 {
 		return nil
@@ -2397,72 +2407,53 @@ func (i *Importer) markBatchInSQLite(marked []markedMessage) error {
 
 	logger.Info("Marking batch in SQLite", "count", len(marked))
 
-	// Create a context with timeout to prevent hanging
-	ctx, cancel := context.WithTimeout(i.ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(i.ctx), sqliteMarkTimeout)
 	defer cancel()
 
-	// Use a channel to handle the transaction with timeout
-	type result struct {
-		err error
+	if err := i.markRowsInSQLite(ctx, marked); err != nil {
+		// Nothing but the deadline ends ctx: it does not inherit i.ctx's cancellation.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("SQLite transaction timed out after %s: %w", sqliteMarkTimeout, err)
+		}
+		return err
 	}
-	done := make(chan result, 1)
 
-	go func() {
-		tx, err := i.sqliteDB.Begin()
-		if err != nil {
-			done <- result{err: fmt.Errorf("failed to begin SQLite transaction: %w", err)}
-			return
-		}
-		defer tx.Rollback()
+	logger.Info("SQLite transaction committed successfully")
+	return nil
+}
 
-		logger.Info("SQLite transaction started")
-
-		// Scoped to (hash, mailbox): s3_uploaded is what an incremental import filters
-		// on, so marking by hash alone would hide every other mailbox's copy of this
-		// content from the next run even though it was never imported.
-		stmt, err := tx.Prepare(`
-			UPDATE messages
-			SET s3_uploaded = 1, s3_uploaded_at = ?
-			WHERE hash = ? AND mailbox = ?
-		`)
-		if err != nil {
-			done <- result{err: fmt.Errorf("failed to prepare SQLite statement: %w", err)}
-			return
-		}
-		defer stmt.Close()
-
-		logger.Info("SQLite statement prepared, executing updates")
-
-		now := time.Now()
-		for idx, m := range marked {
-			if _, err := stmt.Exec(now, m.hash, m.mailbox); err != nil {
-				done <- result{err: fmt.Errorf("failed to update SQLite for hash %s in %s: %w",
-					shortHash(m.hash), m.mailbox, err)}
-				return
-			}
-			if (idx+1)%5 == 0 {
-				logger.Info("SQLite update progress", "completed", idx+1, "total", len(marked))
-			}
-		}
-
-		logger.Info("All SQLite updates executed, committing")
-
-		if err := tx.Commit(); err != nil {
-			done <- result{err: fmt.Errorf("failed to commit SQLite transaction: %w", err)}
-			return
-		}
-
-		logger.Info("SQLite transaction committed successfully")
-		done <- result{err: nil}
-	}()
-
-	// Wait for completion or timeout
-	select {
-	case res := <-done:
-		return res.err
-	case <-ctx.Done():
-		return fmt.Errorf("SQLite transaction timed out after 30 seconds")
+func (i *Importer) markRowsInSQLite(ctx context.Context, marked []markedMessage) error {
+	tx, err := i.sqliteDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin SQLite transaction: %w", err)
 	}
+	defer tx.Rollback()
+
+	// Scoped to (hash, mailbox): s3_uploaded is what an incremental import filters
+	// on, so marking by hash alone would hide every other mailbox's copy of this
+	// content from the next run even though it was never imported.
+	stmt, err := tx.PrepareContext(ctx, `
+		UPDATE messages
+		SET s3_uploaded = 1, s3_uploaded_at = ?
+		WHERE hash = ? AND mailbox = ?
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare SQLite statement: %w", err)
+	}
+	defer stmt.Close()
+
+	now := time.Now()
+	for _, m := range marked {
+		if _, err := stmt.ExecContext(ctx, now, m.hash, m.mailbox); err != nil {
+			return fmt.Errorf("failed to update SQLite for hash %s in %s: %w",
+				shortHash(m.hash), m.mailbox, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit SQLite transaction: %w", err)
+	}
+	return nil
 }
 
 // processBatch processes a batch of messages with sequential S3 uploads
@@ -2477,8 +2468,10 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 	logger.Info("Upload phase complete", "uploaded", len(uploaded), "batch_size", len(batch))
 
 	if len(uploaded) == 0 {
-		logger.Warn("All S3 uploads in batch failed")
-		atomic.AddInt64(&i.failedMessages, int64(len(batch)))
+		// uploadBatchToS3 already counted and recorded each message it dropped. The
+		// others were skipped by a cancellation, which importMessages reports: they
+		// were never attempted, so they are not failures.
+		logger.Warn("No message in the batch was uploaded", "batch_size", len(batch))
 		return nil
 	}
 

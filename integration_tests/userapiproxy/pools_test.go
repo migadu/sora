@@ -182,13 +182,13 @@ func TestUserAPIProxyPools(t *testing.T) {
 		t.Fatalf("after user B: backend A served %d, B served %d; want 4 and 2", a, b)
 	}
 
-	// A pool this proxy lacks, and a user the lookup does not know (no default pool):
-	// refused, no backend touched.
+	// A pool this proxy lacks (a temporary failure), and a user the lookup does not know
+	// (no default pool; refused like a wrong password): no backend touched.
 	if status, _ := login(userX); status != http.StatusServiceUnavailable {
 		t.Errorf("login for an unknown pool = %d, want 503", status)
 	}
-	if status, _ := login(userNone); status != http.StatusServiceUnavailable {
-		t.Errorf("login for a user without a pool and no default = %d, want 503", status)
+	if status, _ := login(userNone); status != http.StatusUnauthorized {
+		t.Errorf("login for a user the lookup does not know, and no default pool = %d, want 401", status)
 	}
 	if a, b := backendA.count.Load(), backendB.count.Load(); a != 4 || b != 2 {
 		t.Errorf("refused logins reached a backend: A %d, B %d", a, b)

@@ -459,10 +459,13 @@ It iterates through all accounts and purges each one using the resumable
 expunge-then-cleanup pattern.
 
 WARNING: This is IRREVERSIBLE and will delete:
-  - All accounts with emails ending in @<domain>
+  - All accounts whose primary address is in @<domain>
   - All their messages (from S3 and database)
   - All their mailboxes
   - All their credentials
+  - Every other address in @<domain>: aliases of accounts whose primary
+    address is elsewhere (those accounts are kept, without these aliases),
+    even when no account has its primary address in the domain
 
 The operation is RESUMABLE - you can interrupt with Ctrl+C and re-run
 the same command to continue where you left off.
