@@ -18,14 +18,16 @@ import (
 
 // DBOutage is a TCP relay between one ResilientDatabase and the test PostgreSQL. While
 // an outage is on, every relayed connection is dropped and new ones are closed as soon
-// as they are accepted, as when PostgreSQL goes down behind a pooler; the other
-// connections to the test database are not affected.
+// as they are accepted, as when PostgreSQL goes down behind a pooler, or, during a
+// stall, held open and never answered, as when it hangs; the other connections to the
+// test database are not affected.
 type DBOutage struct {
 	ln     net.Listener
 	target string
 
 	mu    sync.Mutex
 	down  bool
+	stall bool
 	conns map[net.Conn]struct{}
 }
 
@@ -47,6 +49,8 @@ func SetupTestDatabaseWithOutage(t *testing.T) (*resilient.ResilientDatabase, *D
 	go o.serve()
 
 	cfg := &config.DatabaseConfig{
+		// The timeout logins run into while the database stalls.
+		WriteTimeout: "1s",
 		Write: &config.DatabaseEndpointConfig{
 			Hosts: []string{ln.Addr().String()},
 			User:  "postgres",
@@ -66,21 +70,33 @@ func SetupTestDatabaseWithOutage(t *testing.T) (*resilient.ResilientDatabase, *D
 }
 
 // Begin makes the database unreachable.
-func (o *DBOutage) Begin() {
+func (o *DBOutage) Begin() { o.begin(false) }
+
+// Stall makes the database hang: it drops the relayed connections and leaves new ones
+// unanswered, so every query runs into its timeout.
+func (o *DBOutage) Stall() { o.begin(true) }
+
+func (o *DBOutage) begin(stall bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.down = true
+	o.stall = stall
 	for c := range o.conns {
 		c.Close()
 		delete(o.conns, c)
 	}
 }
 
-// End makes the database reachable again.
+// End makes the database reachable again, and drops the connections a stall held.
 func (o *DBOutage) End() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.down = false
+	o.stall = false
+	for c := range o.conns {
+		c.Close()
+		delete(o.conns, c)
+	}
 }
 
 func (o *DBOutage) serve() {
@@ -94,6 +110,9 @@ func (o *DBOutage) serve() {
 }
 
 func (o *DBOutage) relay(client net.Conn) {
+	if o.hold(client) {
+		return
+	}
 	if !o.track(client) {
 		client.Close()
 		return
@@ -118,6 +137,18 @@ func (o *DBOutage) relay(client net.Conn) {
 	_, _ = io.Copy(client, upstream)
 	client.Close()
 	<-done
+}
+
+// hold keeps c open and unanswered during a stall (End drops it); it reports whether
+// it did.
+func (o *DBOutage) hold(c net.Conn) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.down || !o.stall {
+		return false
+	}
+	o.conns[c] = struct{}{}
+	return true
 }
 
 // track registers c so Begin can drop it; it reports false during an outage.
