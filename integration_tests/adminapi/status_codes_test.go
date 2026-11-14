@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,6 +100,25 @@ func TestAccountWriteStatusCodes(t *testing.T) {
 	t.Run("update invalid address is 400", func(t *testing.T) {
 		expect(t, "PUT", "/admin/accounts/not-an-address", adminapi.UpdateAccountRequest{Password: "pw-123456"}, http.StatusBadRequest)
 	})
+
+	// bcrypt hashes at most 72 bytes, so a longer password is one the client must change.
+	tooLong := strings.Repeat("p", 73)
+
+	t.Run("create with a password over 72 bytes is 400", func(t *testing.T) {
+		expect(t, "POST", "/admin/accounts", adminapi.CreateAccountRequest{Email: unique("longpw-create"), Password: tooLong}, http.StatusBadRequest)
+	})
+
+	t.Run("credentials with a password over 72 bytes is 400", func(t *testing.T) {
+		c := cred(unique("longpw-cred"), true)
+		c.Password = tooLong
+		expect(t, "POST", "/admin/accounts", createWith(c), http.StatusBadRequest)
+	})
+
+	t.Run("update with a password over 72 bytes is 400", func(t *testing.T) {
+		email := unique("longpw-update")
+		create(t, email)
+		expect(t, "PUT", "/admin/accounts/"+email, adminapi.UpdateAccountRequest{Password: tooLong}, http.StatusBadRequest)
+	})
 }
 
 // GET /admin/health/servers/{hostname}/components/{component}: 404 only when there is no
@@ -148,19 +168,35 @@ func TestHealthComponentStatusCodes(t *testing.T) {
 // the node's database write circuit breaker, which would refuse every write on the node
 // (deliveries included) until it closes again.
 func TestBadAccountRequestsKeepWritesAvailable(t *testing.T) {
-	server := setupHTTPAPIServer(t)
-	defer server.Close()
+	for _, tc := range []struct {
+		name string
+		bad  func(i int) adminapi.CreateAccountRequest
+	}{
+		{"invalid address", func(int) adminapi.CreateAccountRequest {
+			return adminapi.CreateAccountRequest{Email: "not-an-address", Password: "pw-123456"}
+		}},
+		{"password over 72 bytes", func(i int) adminapi.CreateAccountRequest {
+			email := fmt.Sprintf("longpw-%d-%d@example.com", i, time.Now().UnixNano())
+			return adminapi.CreateAccountRequest{Email: email, Password: strings.Repeat("p", 73)}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A server of its own: a fresh database handle, so a fresh write breaker.
+			server := setupHTTPAPIServer(t)
+			defer server.Close()
 
-	for i := 0; i < 4; i++ {
-		resp, body := server.makeRequest(t, "POST", "/admin/accounts", adminapi.CreateAccountRequest{Email: "not-an-address", Password: "pw-123456"})
-		if resp.StatusCode < 400 {
-			t.Fatalf("invalid address accepted: %d %s", resp.StatusCode, body)
-		}
-	}
+			for i := 0; i < 4; i++ {
+				resp, body := server.makeRequest(t, "POST", "/admin/accounts", tc.bad(i))
+				if resp.StatusCode < 400 {
+					t.Fatalf("bad request accepted: %d %s", resp.StatusCode, body)
+				}
+			}
 
-	email := fmt.Sprintf("after-bad-requests-%d@example.com", time.Now().UnixNano())
-	resp, body := server.makeRequest(t, "POST", "/admin/accounts", adminapi.CreateAccountRequest{Email: email, Password: "pw-123456"})
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("valid create after invalid ones: got %d, want 201. Body: %s", resp.StatusCode, body)
+			email := fmt.Sprintf("after-bad-requests-%d@example.com", time.Now().UnixNano())
+			resp, body := server.makeRequest(t, "POST", "/admin/accounts", adminapi.CreateAccountRequest{Email: email, Password: "pw-123456"})
+			if resp.StatusCode != http.StatusCreated {
+				t.Fatalf("valid create after bad ones: got %d, want 201. Body: %s", resp.StatusCode, body)
+			}
+		})
 	}
 }

@@ -389,9 +389,11 @@ func TestPasswordEdgeCases(t *testing.T) {
 	t.Run("very long password", func(t *testing.T) {
 		longPassword := strings.Repeat("a", 1000)
 		_, err := GenerateBcryptHash(longPassword)
-		// bcrypt has a 72-byte limit, so this should fail
+		// bcrypt has a 72-byte limit, so this should fail, as a request error
+		// (the caller's 400), not as a failure of the server
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "password length exceeds 72 bytes")
+		assert.ErrorIs(t, err, ErrInvalidAccountRequest)
 	})
 
 	t.Run("unicode password", func(t *testing.T) {
