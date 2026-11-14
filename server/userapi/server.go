@@ -48,6 +48,7 @@ type Server struct {
 	storage                    *storage.S3Storage
 	rs3                        *resilient.ResilientS3Storage // storage behind retries + breaker; nil when storage is
 	uploader                   *uploader.UploadWorker
+	uploadMaxAttempts          int // [uploader] max_attempts for a node without uploader; see ServerOptions
 	cache                      *cache.Cache
 	authCache                  *lookupcache.LookupCache
 	positiveRevalidationWindow time.Duration
@@ -77,7 +78,12 @@ type ServerOptions struct {
 	// Uploader is this node's upload worker: bodies not yet in S3 are read from its
 	// staging spool, and its max_attempts tells a body still on its way from one the
 	// worker has given up on (see loadMessageBody). Optional.
-	Uploader                    *uploader.UploadWorker
+	Uploader *uploader.UploadWorker
+	// UploadMaxAttempts is [uploader] max_attempts, used when there is no Uploader (a
+	// User API node without imap, lmtp or pop3): the uploaders give up on a body after
+	// that many attempts, so it is gone, not "retry later". 0 counts every pending
+	// upload as on its way.
+	UploadMaxAttempts           int
 	AuthRateLimit               server.AuthRateLimiterConfig
 	LookupCache                 *config.LookupCacheConfig // Authentication cache configuration
 	TLS                         bool
@@ -180,10 +186,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 			cleanupInterval = 5 * time.Minute
 		}
 
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize == 0 {
-			maxSize = 10000
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()
 		if err != nil {
@@ -223,6 +226,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		rs3:                        newResilientStorage(options.Storage),
 		cache:                      options.Cache,
 		uploader:                   options.Uploader,
+		uploadMaxAttempts:          options.UploadMaxAttempts,
 		authCache:                  authCache,
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		authLimiter:                authLimiter,
@@ -551,7 +555,9 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 
 		// Check if origin is allowed
 		allowedOrigins := s.settings.Load().allowedOrigins
-		if origin != "" && len(allowedOrigins) > 0 {
+		if len(allowedOrigins) > 0 {
+			// The first matching entry decides: "*" answers with a literal "*",
+			// a listed origin is reflected with credentials.
 			allowed := false
 			wildcard := false
 			for _, allowedOrigin := range allowedOrigins {
@@ -560,10 +566,19 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 					wildcard = true
 					break
 				}
-				if allowedOrigin == origin {
+				if origin != "" && allowedOrigin == origin {
 					allowed = true
 					break
 				}
+			}
+			// Fetch Standard, "CORS protocol and HTTP caches": a "*" is sent on
+			// every response, CORS request or not, and needs no Vary; an answer
+			// that depends on the request's Origin needs Vary: Origin on every
+			// response, including the ones that do not reflect it, or a cache can
+			// answer one origin with a response stored for another. The answer is
+			// the same "*" for everyone only when "*" is the first entry.
+			if allowedOrigins[0] != "*" {
+				w.Header().Add("Vary", "Origin")
 			}
 
 			if allowed {

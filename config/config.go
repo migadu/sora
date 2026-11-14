@@ -6,8 +6,10 @@ import (
 	"log"
 	"math"
 	"net"
+	"net/http"
 	"os"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -527,9 +529,9 @@ type AuthRateLimiterConfig struct {
 	DelayMultiplier     float64       `toml:"delay_multiplier"`      // Delay increase factor
 
 	// Memory safety limits (prevents unbounded growth during burst attacks)
-	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Maximum IP+username tracking entries (0 = unlimited, default: 100000)
-	MaxIPEntries         int `toml:"max_ip_entries"`          // Maximum IP failure tracking entries (0 = unlimited, default: 50000)
-	MaxUsernameEntries   int `toml:"max_username_entries"`    // Maximum username tracking entries (0 = unlimited, default: 50000)
+	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Maximum IP+username tracking entries (default: 100000)
+	MaxIPEntries         int `toml:"max_ip_entries"`          // Maximum IP failure tracking entries (default: 50000)
+	MaxUsernameEntries   int `toml:"max_username_entries"`    // Maximum username tracking entries (default: 50000)
 
 	// Networks exempt from IP-based blocking (Tier 1 IP+username and Tier 2 IP-only).
 	// Username statistics are still tracked even for exempt IPs.
@@ -544,6 +546,38 @@ type AuthRateLimiterConfig struct {
 	//   - exempt_networks = []           → exempt nobody (every IP is rate-limited)
 	//   - exempt_networks = ["a", "b"]   → exempt only these CIDRs
 	ExemptNetworks []string `toml:"exempt_networks,omitempty"`
+}
+
+// Validate rejects negative counts, durations and multipliers, and a NaN or infinite
+// multiplier. Zero means "use the default" (see applyAuthRateLimitDefaults); a negative
+// value has no meaning, and the limiter does not read it consistently
+// (max_attempts_per_ip = -1 blocked an address at its first failure on one path and
+// disabled the IP block on another). TOML accepts nan and inf, which pass a sign check;
+// the limiter converts the multiplied delay to a time.Duration before capping it at
+// max_delay, and that conversion is platform-dependent for them (on amd64 +Inf becomes
+// a negative delay, which switches progressive delays off).
+func (c *AuthRateLimiterConfig) Validate() error {
+	v := reflect.ValueOf(c).Elem()
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Field(i)
+		problem := ""
+		switch {
+		case f.CanInt(): // int counts and time.Duration
+			if f.Int() < 0 {
+				problem = "must not be negative"
+			}
+		case f.CanFloat():
+			if x := f.Float(); math.IsNaN(x) || math.IsInf(x, 0) {
+				problem = "must be a finite number"
+			} else if x < 0 {
+				problem = "must not be negative"
+			}
+		}
+		if problem != "" {
+			return fmt.Errorf("auth_rate_limit.%s %s, got %v", tomlKey(v.Type().Field(i)), problem, f.Interface())
+		}
+	}
+	return nil
 }
 
 // DefaultAuthRateLimiterConfig returns sensible defaults for authentication rate limiting
@@ -582,9 +616,11 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 	}
 }
 
-// LookupCacheConfig holds configuration for authentication result caching
+// LookupCacheConfig holds configuration for authentication result caching.
+// A [server.lookup_cache] table is decoded on top of DefaultLookupCacheConfig
+// (see UnmarshalTOML), so the keys it leaves out, enabled included, keep their defaults.
 type LookupCacheConfig struct {
-	Enabled                    bool   `toml:"enabled"`                      // Enable in-memory caching of authentication results
+	Enabled                    bool   `toml:"enabled"`                      // Enable in-memory caching of authentication results (default: true; the User API and its proxy cache only with a lookup_cache table)
 	PositiveTTL                string `toml:"positive_ttl"`                 // TTL for successful auth (default: "5m")
 	NegativeTTL                string `toml:"negative_ttl"`                 // TTL for failed auth (default: "1m")
 	MaxSize                    int    `toml:"max_size"`                     // Maximum number of cached entries (default: 50000)
@@ -602,6 +638,50 @@ func DefaultLookupCacheConfig() LookupCacheConfig {
 		CleanupInterval:            "5m",  // Clean up expired entries every 5 minutes
 		PositiveRevalidationWindow: "30s", // Allow password change detection after 30 seconds
 	}
+}
+
+// tomlErrorPosition matches the position prefix of a toml decode error,
+// capturing the key: `toml: line 1 (last key "enabled"): `.
+var tomlErrorPosition = regexp.MustCompile(`^toml: (?:line \d+ )?\(last key "([^"]*)"\): `)
+
+// UnmarshalTOML decodes a [server.lookup_cache] table on top of
+// DefaultLookupCacheConfig, so a table that only tunes, say, positive_ttl leaves
+// the cache enabled with the default max_size. Decoded field by field, an omitted
+// enabled would be false and turn the cache off.
+func (c *LookupCacheConfig) UnmarshalTOML(data any) error {
+	table, ok := data.(map[string]any)
+	if !ok {
+		return fmt.Errorf("lookup_cache must be a table, got %T", data)
+	}
+	// Decode the table's own keys again, into a copy of the defaults. The plain
+	// type has no UnmarshalTOML, so this decodes field by field.
+	var buf strings.Builder
+	if err := toml.NewEncoder(&buf).Encode(table); err != nil {
+		return fmt.Errorf("lookup_cache: %w", err)
+	}
+	type plain LookupCacheConfig
+	decoded := plain(DefaultLookupCacheConfig())
+	md, err := toml.Decode(buf.String(), &decoded)
+	if err != nil {
+		// The line in err is one of the re-encoded table, not of the file; the
+		// outer decoder adds the table's own line. Keep the key and the reason.
+		return errors.New(tomlErrorPosition.ReplaceAllString(err.Error(), "$1: "))
+	}
+	// The outer decoder counts every key of a table handled here as decoded, so
+	// report unknown ones here.
+	for _, key := range md.Undecoded() {
+		log.Printf("WARNING: Unknown key 'lookup_cache.%s' will be ignored", key)
+	}
+	*c = LookupCacheConfig(decoded)
+	return nil
+}
+
+// GetMaxSize returns max_size, or the default (50000) when it is zero or negative.
+func (c *LookupCacheConfig) GetMaxSize() int {
+	if c.MaxSize <= 0 {
+		return DefaultLookupCacheConfig().MaxSize
+	}
+	return c.MaxSize
 }
 
 // GetPositiveTTL parses and returns the positive TTL duration
@@ -1033,10 +1113,10 @@ type ServerConfig struct {
 	// Metrics specific
 	Path                 string `toml:"path,omitempty"`
 	EnableUserMetrics    bool   `toml:"enable_user_metrics,omitempty"`
-	EnableDomainMetrics  bool   `toml:"enable_domain_metrics,omitempty"`
-	UserMetricsThreshold int    `toml:"user_metrics_threshold,omitempty"`
-	MaxTrackedUsers      int    `toml:"max_tracked_users,omitempty"`
-	HashUsernames        bool   `toml:"hash_usernames,omitempty"`
+	EnableDomainMetrics  *bool  `toml:"enable_domain_metrics,omitempty"`  // nil = default (true); see GetEnableDomainMetrics
+	UserMetricsThreshold *int   `toml:"user_metrics_threshold,omitempty"` // nil = default (1000); see GetUserMetricsThreshold
+	MaxTrackedUsers      *int   `toml:"max_tracked_users,omitempty"`      // nil = default (1000); see GetMaxTrackedUsers
+	HashUsernames        *bool  `toml:"hash_usernames,omitempty"`         // nil = default (true); see GetHashUsernames
 
 	// Auth rate limiting (embedded)
 	AuthRateLimit *AuthRateLimiterConfig `toml:"auth_rate_limit,omitempty"`
@@ -1812,6 +1892,41 @@ func (s *ServerConfig) GetRemoteHealthChecks() bool {
 	return *s.RemoteHealthChecks
 }
 
+// Metrics tuning keys: a key left out of the metrics block keeps the same default
+// as pkg/metrics uses on a node without one.
+
+// GetEnableDomainMetrics returns enable_domain_metrics (default: true).
+func (s *ServerConfig) GetEnableDomainMetrics() bool {
+	if s.EnableDomainMetrics == nil {
+		return true
+	}
+	return *s.EnableDomainMetrics
+}
+
+// GetUserMetricsThreshold returns user_metrics_threshold (default: 1000).
+func (s *ServerConfig) GetUserMetricsThreshold() int {
+	if s.UserMetricsThreshold == nil {
+		return 1000
+	}
+	return *s.UserMetricsThreshold
+}
+
+// GetMaxTrackedUsers returns max_tracked_users (default: 1000).
+func (s *ServerConfig) GetMaxTrackedUsers() int {
+	if s.MaxTrackedUsers == nil {
+		return 1000
+	}
+	return *s.MaxTrackedUsers
+}
+
+// GetHashUsernames returns hash_usernames (default: true).
+func (s *ServerConfig) GetHashUsernames() bool {
+	if s.HashUsernames == nil {
+		return true
+	}
+	return *s.HashUsernames
+}
+
 // Configuration defaulting methods with logging
 func (s *ServerConfig) GetAppendLimitWithDefault() int64 {
 	limit, err := s.GetAppendLimit()
@@ -2046,7 +2161,45 @@ func (s *ServerConfig) Validate() error {
 		return fmt.Errorf("server %q: master_sasl_username is set but master_sasl_password is empty; refusing to start (an empty password would allow impersonation of any account)", s.Name)
 	}
 
+	if s.AuthRateLimit != nil {
+		if err := s.AuthRateLimit.Validate(); err != nil {
+			return fmt.Errorf("server %q: %w", s.Name, err)
+		}
+	}
+
+	if s.Type == "metrics" {
+		if s.Path != "" && !strings.HasPrefix(s.Path, "/") {
+			return fmt.Errorf("server %q: metrics path %q must begin with '/'", s.Name, s.Path)
+		}
+		if err := validateMetricsPattern(s.MetricsPath()); err != nil {
+			return fmt.Errorf("server %q: invalid metrics path %q: %w", s.Name, s.Path, err)
+		}
+	}
+
 	return nil
+}
+
+// ServeMux parses patterns when registering a handler and panics on invalid
+// ones. Validate with that same parser before the metrics goroutine starts.
+func validateMetricsPattern(pattern string) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("%v", p)
+		}
+	}()
+	http.NewServeMux().HandleFunc(pattern, func(http.ResponseWriter, *http.Request) {})
+	return nil
+}
+
+// MetricsPath returns the HTTP path the metrics handler is served on. An unset
+// path defaults to "/metrics": net/http.ServeMux panics on an empty pattern,
+// and the panic would run in the metrics goroutine, taking the whole process
+// down with it.
+func (s *ServerConfig) MetricsPath() string {
+	if s.Path == "" {
+		return "/metrics"
+	}
+	return s.Path
 }
 
 // WarnUnusedConfigOptions logs warnings for config options that don't apply to this server type
