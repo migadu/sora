@@ -481,7 +481,7 @@ components:
           example: 1042
         ContentHash:
           type: string
-          description: "BLAKE3 hash of the message body, its S3 object name."
+          description: "BLAKE3 hash of the message body, the last segment of its S3 key (<domain>/<local part>/<hash>)."
         InstanceID:
           type: string
           description: "The node that staged the body; only that node can upload it."
@@ -2604,7 +2604,7 @@ paths:
           schema:
             type: string
             format: date-time
-          description: "Return metrics recorded after this timestamp (RFC3339). Defaults to 24 hours ago."
+          description: "Return metrics recorded at or after this timestamp (RFC3339). Defaults to 24 hours ago."
         - name: limit
           in: query
           schema:
