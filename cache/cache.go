@@ -102,7 +102,7 @@ const tmpInfix = ".tmp."
 const staleTmpAge = time.Hour
 
 // ErrObjectTooLarge is returned when attempting to cache an object that exceeds the size
-// limit: max_object_size, or one shard's share of the capacity (see tooLarge).
+// limit: max_object_size, or one shard's share of the capacity (see TooLarge).
 var ErrObjectTooLarge = errors.New("object size exceeds limit")
 
 type cacheShard struct {
@@ -243,11 +243,12 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval
 	return c, nil
 }
 
-// tooLarge reports whether an object of size bytes is refused: above max_object_size, or
+// TooLarge reports whether an object of size bytes is refused: above max_object_size, or
 // above its shard's share of the capacity. Capacity is enforced per shard, so an object
 // larger than that share cannot stay cached: writing it would evict every other object
-// of its shard and then the object itself.
-func (c *Cache) tooLarge(size int64) bool {
+// of its shard and then the object itself. Put and MoveIn refuse such an object with
+// ErrObjectTooLarge; a caller that would have to download it first asks here instead.
+func (c *Cache) TooLarge(size int64) bool {
 	return size > c.maxObjectSize || size > c.capacity/NumShards
 }
 
@@ -412,10 +413,10 @@ func (c *Cache) Delete(contentHash string) error {
 // MoveIn moves a file into the cache directory structure and tracks it.
 // The file at sourcePath will be removed (either by rename or explicit removal if it already exists).
 // This is typically used to move a downloaded temp file into the cache.
-// A file the cache does not take (see tooLarge) is refused with ErrObjectTooLarge and,
+// A file the cache does not take (see TooLarge) is refused with ErrObjectTooLarge and,
 // as when the move itself fails, left for the caller to remove.
 func (c *Cache) MoveIn(sourcePath string, contentHash string) error {
-	if info, err := os.Stat(sourcePath); err == nil && c.tooLarge(info.Size()) {
+	if info, err := os.Stat(sourcePath); err == nil && c.TooLarge(info.Size()) {
 		return ErrObjectTooLarge
 	}
 
@@ -514,7 +515,7 @@ func (c *Cache) Get(contentHash string) ([]byte, error) {
 
 // Put writes an object to the cache.
 func (c *Cache) Put(contentHash string, data []byte) error {
-	if c.tooLarge(int64(len(data))) {
+	if c.TooLarge(int64(len(data))) {
 		return ErrObjectTooLarge
 	}
 

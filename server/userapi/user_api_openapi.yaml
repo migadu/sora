@@ -271,8 +271,7 @@ paths:
                 properties:
                   messages:
                     type: array
-                    nullable: true
-                    description: The matching messages, or null when there are none.
+                    description: The matching messages; empty when there are none.
                     items:
                       $ref: '#/components/schemas/Message'
                   total:
@@ -332,8 +331,7 @@ paths:
                 properties:
                   messages:
                     type: array
-                    nullable: true
-                    description: The matching messages, or null when there are none.
+                    description: The matching messages; empty when there are none.
                     items:
                       $ref: '#/components/schemas/Message'
                   total:
@@ -796,8 +794,7 @@ components:
 
     SystemFlags:
       type: array
-      nullable: true
-      description: System flags set on the message, with their backslash; null when none are set.
+      description: System flags set on the message, with their backslash; empty when none are set.
       items:
         type: string
         enum: ['\Seen', '\Answered', '\Flagged', '\Deleted', '\Draft']
@@ -848,8 +845,7 @@ components:
           example: boss@example.com
         to:
           type: array
-          nullable: true
-          description: The addresses of the To header; null when there are none.
+          description: The addresses of the To header; empty when there are none.
           items:
             type: string
           example: ['user@example.com']

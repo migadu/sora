@@ -1655,6 +1655,14 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 				continue
 			}
 
+			// Skip a body the cache refuses for its size before downloading it: Put would
+			// only refuse it after the full S3 GET, at every warmup interval.
+			if s.cache.TooLarge(body.Size) {
+				logger.Debug("IMAP: Warmup - skipping, object too large for cache", "name", s.name, "hash", contentHash, "size", body.Size)
+				skippedCount++
+				continue
+			}
+
 			// Check if already in cache
 			exists, err := s.cache.Exists(contentHash)
 			if err != nil {

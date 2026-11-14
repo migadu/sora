@@ -193,6 +193,43 @@ func TestGlobalReloadReportsAnInvalidRelay(t *testing.T) {
 	}
 }
 
+// The relay worker also takes [relay.queue] at start-up. A worker_interval of zero or
+// less, or a negative failed_retention, is refused by start-up (#643), so a reload
+// reports it as an error, as it does an invalid [relay]: the restart it asks for would
+// not start.
+func TestGlobalReloadReportsAnInvalidRelayQueue(t *testing.T) {
+	const relay = "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp2.example.com:587\"\n\n[relay.queue]\n"
+	tests := []struct {
+		name    string
+		queue   string
+		wantErr string // part of the error-level report, "" for none
+	}{
+		{name: "valid", queue: "worker_interval = \"30s\"\nfailed_retention = \"0\"", wantErr: ""},
+		{name: "worker_interval 0", queue: "worker_interval = \"0\"", wantErr: "worker_interval must be positive"},
+		{name: "worker_interval negative", queue: "worker_interval = \"-1m\"", wantErr: "worker_interval must be positive"},
+		{name: "failed_retention negative", queue: "failed_retention = \"-1h\"", wantErr: "failed_retention must not be negative"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureReloadLogs(t)
+			cfg := startupConfig()
+
+			handleConfigReload(&cfg, reloadedFrom(t, relay+tt.queue+"\n"))
+
+			out := logs.String()
+			if tt.wantErr == "" {
+				if strings.Contains(out, "level=ERROR") {
+					t.Errorf("a valid [relay.queue] was reported as an error:\n%s", out)
+				}
+				return
+			}
+			if !hasLineWith(out, "level=ERROR", "[relay.queue]", tt.wantErr) {
+				t.Errorf("no error-level report naming %q:\n%s", tt.wantErr, out)
+			}
+		})
+	}
+}
+
 // IMAP sessions read the shared *config.Config with no lock (NAMESPACE, LIST, SELECT,
 // CREATE, NOTIFY read SharedMailboxes; the DB layer reads DefaultRights through the
 // context). A reload must not write it while they do. Fails under -race on a writer.

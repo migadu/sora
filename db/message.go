@@ -647,13 +647,21 @@ func (db *Database) GetDeletedMessageUIDsAndSeqs(ctx context.Context, mailboxID 
 	return results, rows.Err()
 }
 
+// WarmupObject is a body the cache warmup may fetch: the S3 object its message row points
+// at, and the message's size, so the warmup can pass over a body the cache would refuse
+// without downloading it.
+type WarmupObject struct {
+	ContentObject
+	Size int64
+}
+
 // GetRecentMessagesForWarmup fetches the most recent messages from specified mailboxes for cache warming.
 // Returns a map of mailboxName -> the bodies of up to messageCount of its most recent messages. Each
 // body is the S3 object its message row points at, under the address it was stored with, which is
 // not the account's primary address once that has changed.
-func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]ContentObject, error) {
+func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]WarmupObject, error) {
 	if messageCount <= 0 {
-		return make(map[string][]ContentObject), nil
+		return make(map[string][]WarmupObject), nil
 	}
 
 	// Check if account has any mailboxes - skip warmup for new accounts to avoid noise
@@ -663,10 +671,10 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID in
 	}
 	if mailboxCount == 0 {
 		// New account with no mailboxes yet - skip warmup silently
-		return make(map[string][]ContentObject), nil
+		return make(map[string][]WarmupObject), nil
 	}
 
-	result := make(map[string][]ContentObject)
+	result := make(map[string][]WarmupObject)
 
 	for _, mailboxName := range mailboxNames {
 		mailbox, err := db.GetMailboxByName(ctx, AccountID, mailboxName)
@@ -678,7 +686,7 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID in
 		// The most recent messages by UID, which the (mailbox_id, uid) index returns in
 		// order, instead of sorting the mailbox by internal_date.
 		rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
-			SELECT s3_domain, s3_localpart, content_hash
+			SELECT s3_domain, s3_localpart, content_hash, size
 			FROM messages
 			WHERE mailbox_id = $1 AND expunged_at IS NULL
 			ORDER BY uid DESC
@@ -687,7 +695,7 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID in
 			logger.Debug("WarmUp: failed to get recent messages", "mailbox", mailboxName, "account_id", AccountID, "err", err)
 			continue
 		}
-		objects, err := pgx.CollectRows(rows, pgx.RowToStructByPos[ContentObject])
+		objects, err := pgx.CollectRows(rows, pgx.RowToStructByPos[WarmupObject])
 		if err != nil {
 			logger.Debug("WarmUp: failed to read recent messages", "mailbox", mailboxName, "account_id", AccountID, "err", err)
 			continue

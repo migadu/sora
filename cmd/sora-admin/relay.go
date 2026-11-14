@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,6 +42,25 @@ func handleRelayCommand(ctx context.Context) {
 	}
 }
 
+// openExistingRelayQueue opens the relay queue at queuePath without creating any of its
+// directories. NewDiskQueue creates the missing ones, and created by `sudo sora-admin`
+// they would belong to root, where the server, running as its own user, cannot queue:
+// these commands only work on a queue the server has made. A missing directory is
+// reported as the *fs.PathError from os.Stat.
+func openExistingRelayQueue(queuePath string, maxAttempts int) (*relayqueue.DiskQueue, error) {
+	for _, dir := range []string{"failed", "pending", "processing"} {
+		path := filepath.Join(queuePath, dir)
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("%s is not a directory", path)
+		}
+	}
+	return relayqueue.NewDiskQueue(queuePath, maxAttempts, nil)
+}
+
 func handleRelayStats(_ context.Context) {
 	flags := flag.NewFlagSet("relay stats", flag.ExitOnError)
 	flags.Parse(os.Args[3:])
@@ -52,9 +73,16 @@ func handleRelayStats(_ context.Context) {
 		os.Exit(1)
 	}
 
-	// Create queue instance (just for stats, doesn't start worker)
+	// Open the queue just for stats (no worker). On a node whose server has not created it
+	// yet there is nothing to count, so say so, as list does.
 	queuePath := cfg.Relay.GetQueuePath()
-	queue, err := relayqueue.NewDiskQueue(queuePath, cfg.Relay.Queue.MaxAttempts, nil)
+	queue, err := openExistingRelayQueue(queuePath, cfg.Relay.Queue.MaxAttempts)
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) && errors.Is(err, fs.ErrNotExist) {
+		fmt.Printf("Queue directory does not exist: %s\n", pathErr.Path)
+		fmt.Println("The server creates the relay queue when it starts with [relay] configured.")
+		return
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error accessing relay queue: %v\n", err)
 		os.Exit(1)
@@ -362,23 +390,8 @@ func handleRelayRequeue(_ context.Context) {
 
 	// The queue does the move, so requeue keeps the order its own writers rely on: a
 	// running server's worker picks the message up on its next resync of pending/.
-	// NewDiskQueue creates missing directories, and created by `sudo sora-admin` they
-	// would belong to root, where the server, running as its own user, cannot queue:
-	// requeue only works on a queue the server has made.
 	queuePath := cfg.Relay.GetQueuePath()
-	for _, dir := range []string{"failed", "pending", "processing"} {
-		path := filepath.Join(queuePath, dir)
-		info, err := os.Stat(path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error accessing relay queue: %v\n", err)
-			os.Exit(1)
-		}
-		if !info.IsDir() {
-			fmt.Fprintf(os.Stderr, "Error accessing relay queue: %s is not a directory\n", path)
-			os.Exit(1)
-		}
-	}
-	queue, err := relayqueue.NewDiskQueue(queuePath, cfg.Relay.Queue.MaxAttempts, nil)
+	queue, err := openExistingRelayQueue(queuePath, cfg.Relay.Queue.MaxAttempts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error accessing relay queue: %v\n", err)
 		os.Exit(1)
