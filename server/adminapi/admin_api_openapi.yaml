@@ -1939,7 +1939,7 @@ paths:
       tags:
         - Connection Management
       summary: Get connections for a specific user
-      description: One entry per connection tracker on this node that knows the account. The address is resolved to its account in the database, as /connections/kick resolves it, so the account is found under any of its addresses. An entry whose email is the address (case-insensitively) is listed too, which is how a remote lookup account, unknown to the database, is found. Unlike /connections, a tracker that knows the account only through gossip is listed too, with local_count 0.
+      description: Entries from this node's connection trackers, one per tracked account ID and tracker. A remote lookup service that answers different addresses of the account can produce multiple tracked IDs and entries for it. The address is resolved to its account in the database, as /connections/kick resolves it, so the account is found under any of its addresses. An entry whose email is any address of the account (case-insensitively) is listed too, which is how a session a proxy authenticated through remote lookup (keyed by an ID derived from the address the lookup answered) is found; an address unknown to the database lists the entries whose email is that address. Unlike /connections, a tracker that knows the account only through gossip is listed too, with local_count 0.
       parameters:
         - name: email
           in: path

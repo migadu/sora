@@ -411,6 +411,41 @@ func (db *Database) GetAccountIDByAddress(ctx context.Context, address string) (
 	return accountID, nil
 }
 
+// GetAccountAddresses returns the ID of the account that address is a credential of, as
+// GetAccountIDByAddress does, and every address of that account (address included), in
+// one query. It returns consts.ErrUserNotFound when no account has the address.
+func (db *Database) GetAccountAddresses(ctx context.Context, address string) (int64, []string, error) {
+	normalizedAddress := strings.ToLower(strings.TrimSpace(address))
+	if normalizedAddress == "" {
+		return 0, nil, errors.New("address cannot be empty")
+	}
+
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+		SELECT account_id, address FROM credentials
+		WHERE account_id = (SELECT account_id FROM credentials WHERE LOWER(address) = $1)`, normalizedAddress)
+	if err != nil {
+		return 0, nil, fmt.Errorf("database error fetching account addresses: %w", err)
+	}
+	defer rows.Close()
+
+	var accountID int64
+	var addresses []string
+	for rows.Next() {
+		var addr string
+		if err := rows.Scan(&accountID, &addr); err != nil {
+			return 0, nil, fmt.Errorf("database error scanning account addresses: %w", err)
+		}
+		addresses = append(addresses, addr)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, fmt.Errorf("database error fetching account addresses: %w", err)
+	}
+	if len(addresses) == 0 {
+		return 0, nil, consts.ErrUserNotFound
+	}
+	return accountID, addresses, nil
+}
+
 // GetActiveAccountIDByAddress retrieves the account ID for a given credential address,
 // ensuring the account is not deleted. This is the preferred method for LMTP/SMTP
 // recipient validation where we need to reject deleted accounts.
