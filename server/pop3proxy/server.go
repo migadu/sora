@@ -352,7 +352,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		// Parse positive revalidation window from config (used for password change detection)
 		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(options.Name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("pop3_proxy", options.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("POP3 Proxy: Lookup cache enabled", "name", options.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	} else {
 		logger.Info("POP3 Proxy: Lookup cache disabled", "name", options.Name)

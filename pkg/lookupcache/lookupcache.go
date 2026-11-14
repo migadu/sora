@@ -10,6 +10,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -54,10 +55,67 @@ type CacheEntry struct {
 	IsNegative       bool
 }
 
+// cacheItem is what the cache holds per key: its own copy of the entry and the
+// entry's links in the expiry queue of its class.
+type cacheItem struct {
+	entry      CacheEntry
+	key        string
+	prev, next *cacheItem
+}
+
+// expiryQueue is a doubly linked list of cache items in ExpiresAt order,
+// earliest first.
+type expiryQueue struct {
+	front, back *cacheItem
+}
+
+// push links it into the queue in ExpiresAt order. Entries stamped with the
+// class TTL under the cache lock expire no earlier than any entry queued
+// before them, so they go straight to the back; only an entry that brings its
+// own ExpiresAt (Set, GetOrFetch) walks back from there to its place.
+func (q *expiryQueue) push(it *cacheItem) {
+	prev := q.back
+	for prev != nil && it.entry.ExpiresAt.Before(prev.entry.ExpiresAt) {
+		prev = prev.prev
+	}
+	it.prev = prev
+	if prev != nil {
+		it.next = prev.next
+		prev.next = it
+	} else {
+		it.next = q.front
+		q.front = it
+	}
+	if it.next != nil {
+		it.next.prev = it
+	} else {
+		q.back = it
+	}
+}
+
+// unlink removes it from the queue.
+func (q *expiryQueue) unlink(it *cacheItem) {
+	if it.prev != nil {
+		it.prev.next = it.next
+	} else {
+		q.front = it.next
+	}
+	if it.next != nil {
+		it.next.prev = it.prev
+	} else {
+		q.back = it.prev
+	}
+	it.prev, it.next = nil, nil
+}
+
 // LookupCache provides in-memory caching for authentication results
 type LookupCache struct {
-	mu              sync.RWMutex
-	entries         map[string]*CacheEntry
+	mu      sync.RWMutex
+	entries map[string]*cacheItem
+	// positive and negative queue the entries of each TTL class in expiry
+	// order, so the entry that expires first is at one of their fronts.
+	positive, negative expiryQueue
+
 	positiveTTL     time.Duration
 	negativeTTL     time.Duration
 	maxSize         int
@@ -75,13 +133,17 @@ type LookupCache struct {
 	// Metrics
 	hits   uint64
 	misses uint64
+	// This cache's series of the per-cache gauges.
+	entriesGauge prometheus.Gauge
+	hitRateGauge prometheus.Gauge
 
 	// Cleanup counter for periodic memory reporting
 	cleanupCounter uint64
 }
 
-// New creates a new authentication cache instance
-func New(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval time.Duration, positiveRevalidationWindow time.Duration) *LookupCache {
+// New creates a new authentication cache instance for the server named serverName
+// of type protocol ("imap", "imap_proxy", "userapi", ...), which label its gauges.
+func New(protocol, serverName string, positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval time.Duration, positiveRevalidationWindow time.Duration) *LookupCache {
 	if maxSize <= 0 {
 		maxSize = 10000
 	}
@@ -93,7 +155,7 @@ func New(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval ti
 	}
 
 	cache := &LookupCache{
-		entries:                    make(map[string]*CacheEntry),
+		entries:                    make(map[string]*cacheItem),
 		positiveTTL:                positiveTTL,
 		negativeTTL:                negativeTTL,
 		maxSize:                    maxSize,
@@ -101,6 +163,8 @@ func New(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval ti
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		stopCleanup:                make(chan struct{}),
 		cleanupStopped:             make(chan struct{}),
+		entriesGauge:               metrics.LookupCacheEntriesTotal.WithLabelValues(protocol, serverName),
+		hitRateGauge:               metrics.LookupCacheHitRate.WithLabelValues(protocol, serverName),
 	}
 
 	// Start background cleanup goroutine
@@ -136,7 +200,7 @@ func (c *LookupCache) Authenticate(address, password string) (accountID int64, f
 	cached, exists := c.entries[address]
 	var entry CacheEntry
 	if exists {
-		entry = *cached
+		entry = cached.entry
 	}
 	c.mu.RUnlock()
 
@@ -202,25 +266,20 @@ func (c *LookupCache) Authenticate(address, password string) (accountID int64, f
 
 // SetSuccess caches a successful authentication result
 func (c *LookupCache) SetSuccess(address string, accountID int64, hashedPassword string, password string) {
+	digest := NewPasswordDigest(password)
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Enforce max size with simple eviction (oldest entries first)
-	if len(c.entries) >= c.maxSize {
-		c.evictOldest()
-	}
-
 	now := time.Now()
-	c.entries[address] = &CacheEntry{
+	c.store(address, &CacheEntry{
 		AccountID:      accountID,
 		HashedPassword: hashedPassword,
-		PasswordDigest: NewPasswordDigest(password),
+		PasswordDigest: digest,
 		Result:         AuthSuccess,
 		CreatedAt:      now,
 		ExpiresAt:      now.Add(c.positiveTTL),
-	}
-
-	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+	})
 }
 
 // SetFailure caches a failed authentication result (user not found or invalid password)
@@ -239,20 +298,13 @@ func (c *LookupCache) SetFailure(address string, result int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Enforce max size with simple eviction (oldest entries first)
-	if len(c.entries) >= c.maxSize {
-		c.evictOldest()
-	}
-
 	now := time.Now()
-	c.entries[address] = &CacheEntry{
+	c.store(address, &CacheEntry{
 		Result:     authResult,
 		CreatedAt:  now,
 		ExpiresAt:  now.Add(c.negativeTTL),
 		IsNegative: true,
-	}
-
-	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+	})
 }
 
 // Invalidate removes a specific entry from the cache (e.g., after password change).
@@ -264,8 +316,10 @@ func (c *LookupCache) Invalidate(address string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	delete(c.entries, address)
-	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+	if it, exists := c.entries[address]; exists {
+		c.remove(it)
+	}
+	c.entriesGauge.Set(float64(len(c.entries)))
 }
 
 // InvalidateUser removes the entry for a serverName/username pair, using the
@@ -291,35 +345,62 @@ func (c *LookupCache) InvalidateAccount(accountID int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for key, entry := range c.entries {
-		if !entry.IsNegative && entry.AccountID == accountID {
-			delete(c.entries, key)
+	for _, it := range c.entries {
+		if !it.entry.IsNegative && it.entry.AccountID == accountID {
+			c.remove(it)
 		}
 	}
-	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+	c.entriesGauge.Set(float64(len(c.entries)))
 }
 
-// evictOldest removes the oldest entry from the cache
-// Caller must hold the write lock
-func (c *LookupCache) evictOldest() {
-	if len(c.entries) == 0 {
-		return
+// queue returns the expiry queue of an entry's TTL class.
+func (c *LookupCache) queue(e *CacheEntry) *expiryQueue {
+	if e.IsNegative {
+		return &c.negative
 	}
+	return &c.positive
+}
 
-	var oldestKey string
-	var oldestTime time.Time
-	first := true
-
-	for key, entry := range c.entries {
-		if first || entry.ExpiresAt.Before(oldestTime) {
-			oldestKey = key
-			oldestTime = entry.ExpiresAt
-			first = false
+// store caches a copy of entry under key, replacing the key's entry if it has
+// one. Only a new key grows the cache, so only a new key in a full cache
+// evicts another entry first.
+// Caller must hold the write lock.
+func (c *LookupCache) store(key string, entry *CacheEntry) {
+	it, exists := c.entries[key]
+	if exists {
+		c.queue(&it.entry).unlink(it)
+	} else {
+		if len(c.entries) >= c.maxSize {
+			c.evict()
 		}
+		it = &cacheItem{key: key}
+		c.entries[key] = it
 	}
+	it.entry = *entry
+	c.queue(&it.entry).push(it)
+	c.entriesGauge.Set(float64(len(c.entries)))
+}
 
-	if oldestKey != "" {
-		delete(c.entries, oldestKey)
+// remove deletes it from the cache.
+// Caller must hold the write lock.
+func (c *LookupCache) remove(it *cacheItem) {
+	c.queue(&it.entry).unlink(it)
+	delete(c.entries, it.key)
+}
+
+// evict makes room for one entry by removing the entry that expires first: an
+// expired one if there is any, otherwise the live entry with the least time
+// left. That keeps the positive entries of recent logins when a spray of
+// failed logins fills the cache with short-lived negative ones. Each queue is
+// in expiry order, so the victim is the earlier of the two fronts.
+// Caller must hold the write lock.
+func (c *LookupCache) evict() {
+	victim := c.negative.front
+	if p := c.positive.front; p != nil && (victim == nil || p.entry.ExpiresAt.Before(victim.entry.ExpiresAt)) {
+		victim = p
+	}
+	if victim != nil {
+		c.remove(victim)
 	}
 }
 
@@ -348,16 +429,16 @@ func (c *LookupCache) cleanup() {
 	now := time.Now()
 	removed := 0
 
-	for key, entry := range c.entries {
-		if now.After(entry.ExpiresAt) {
-			delete(c.entries, key)
+	for _, q := range []*expiryQueue{&c.positive, &c.negative} {
+		for q.front != nil && now.After(q.front.entry.ExpiresAt) {
+			c.remove(q.front)
 			removed++
 		}
 	}
 
 	if removed > 0 {
 		logger.Info("LookupCache: Cleanup removed expired entries", "removed", removed, "remaining", len(c.entries))
-		metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+		c.entriesGauge.Set(float64(len(c.entries)))
 	}
 
 	// Update hit rate metric
@@ -367,8 +448,8 @@ func (c *LookupCache) cleanup() {
 	successEntries := 0
 	userNotFoundEntries := 0
 	invalidPasswordEntries := 0
-	for _, entry := range c.entries {
-		switch entry.Result {
+	for _, it := range c.entries {
+		switch it.entry.Result {
 		case AuthSuccess:
 			successEntries++
 		case AuthUserNotFound:
@@ -408,7 +489,7 @@ func (c *LookupCache) updateHitRateMetric() {
 	total := hits + misses
 	if total > 0 {
 		hitRate := float64(hits) / float64(total) * 100
-		metrics.LookupCacheHitRate.Set(hitRate)
+		c.hitRateGauge.Set(hitRate)
 	}
 }
 
@@ -454,7 +535,8 @@ func (c *LookupCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.entries = make(map[string]*CacheEntry)
+	c.entries = make(map[string]*cacheItem)
+	c.positive, c.negative = expiryQueue{}, expiryQueue{}
 	atomic.StoreUint64(&c.hits, 0)
 	atomic.StoreUint64(&c.misses, 0)
 
@@ -479,10 +561,10 @@ func (c *LookupCache) Get(serverName, username string) (*CacheEntry, bool) {
 	key := makeKey(serverName, username)
 
 	c.mu.RLock()
-	entry, exists := c.entries[key]
+	it, exists := c.entries[key]
 	var entryCopy CacheEntry
 	if exists {
-		entryCopy = *entry
+		entryCopy = it.entry
 	}
 	c.mu.RUnlock()
 
@@ -515,11 +597,6 @@ func (c *LookupCache) Set(serverName, username string, entry *CacheEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Enforce max size with simple eviction (oldest entries first)
-	if len(c.entries) >= c.maxSize {
-		c.evictOldest()
-	}
-
 	// Determine TTL based on result type if not already set
 	if entry.ExpiresAt.IsZero() {
 		var ttl time.Duration
@@ -532,8 +609,7 @@ func (c *LookupCache) Set(serverName, username string, entry *CacheEntry) {
 		entry.ExpiresAt = time.Now().Add(ttl)
 	}
 
-	c.entries[key] = entry
-	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+	c.store(key, entry)
 }
 
 // Refresh extends the TTL of an existing cache entry
@@ -544,20 +620,23 @@ func (c *LookupCache) Refresh(serverName, username string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	entry, exists := c.entries[key]
+	it, exists := c.entries[key]
 	if !exists {
 		return false
 	}
 
 	// Extend TTL based on entry type
 	var ttl time.Duration
-	if entry.IsNegative {
+	if it.entry.IsNegative {
 		ttl = c.negativeTTL
 	} else {
 		ttl = c.positiveTTL
 	}
 
-	entry.ExpiresAt = time.Now().Add(ttl)
+	q := c.queue(&it.entry)
+	q.unlink(it)
+	it.entry.ExpiresAt = time.Now().Add(ttl)
+	q.push(it)
 	return true
 }
 
@@ -588,10 +667,10 @@ func (c *LookupCache) GetOrFetch(serverName, username string, fetchFn func() (*C
 
 	// Try cache first
 	c.mu.RLock()
-	entry, exists := c.entries[key]
+	it, exists := c.entries[key]
 	var entryCopy CacheEntry
 	if exists {
-		entryCopy = *entry
+		entryCopy = it.entry
 	}
 	c.mu.RUnlock()
 
@@ -617,15 +696,7 @@ func (c *LookupCache) GetOrFetch(serverName, username string, fetchFn func() (*C
 		// Cache the result
 		c.mu.Lock()
 		defer c.mu.Unlock()
-
-		// Enforce max size with simple eviction (oldest entries first)
-		if len(c.entries) >= c.maxSize {
-			c.evictOldest()
-		}
-
-		// Store in cache
-		c.entries[key] = fetchedEntry
-		metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+		c.store(key, fetchedEntry)
 
 		return fetchedEntry, nil
 	})
@@ -634,8 +705,7 @@ func (c *LookupCache) GetOrFetch(serverName, username string, fetchFn func() (*C
 		return nil, false, err
 	}
 
-	entry = result.(*CacheEntry)
-	entryCopy = *entry
+	entryCopy = *result.(*CacheEntry)
 
 	// Log if this was a shared fetch (thundering herd prevented)
 	if shared {

@@ -178,7 +178,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 
 		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(options.Name)
 
-		authCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		authCache = lookupcache.New("userapi", options.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("User API: Lookup cache enabled", "name", options.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
@@ -514,57 +514,9 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-
-		// Check if origin is allowed
-		allowedOrigins := s.settings.Load().allowedOrigins
-		if len(allowedOrigins) > 0 {
-			// The first matching entry decides: "*" answers with a literal "*",
-			// a listed origin is reflected with credentials.
-			allowed := false
-			wildcard := false
-			for _, allowedOrigin := range allowedOrigins {
-				if allowedOrigin == "*" {
-					allowed = true
-					wildcard = true
-					break
-				}
-				if origin != "" && allowedOrigin == origin {
-					allowed = true
-					break
-				}
-			}
-			// Fetch Standard, "CORS protocol and HTTP caches": a "*" is sent on
-			// every response, CORS request or not, and needs no Vary; an answer
-			// that depends on the request's Origin needs Vary: Origin on every
-			// response, including the ones that do not reflect it, or a cache can
-			// answer one origin with a response stored for another. The answer is
-			// the same "*" for everyone only when "*" is the first entry.
-			if allowedOrigins[0] != "*" {
-				w.Header().Add("Vary", "Origin")
-			}
-
-			if allowed {
-				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-				w.Header().Set("Access-Control-Max-Age", "3600")
-				// A cross-origin reader sees only the CORS-safelisted response
-				// headers and the ones named here (Fetch Standard, "CORS filtered
-				// response"): Retry-After on a 503 for a body not available yet,
-				// Content-Disposition on /raw. Static, so it needs no Vary.
-				w.Header().Set("Access-Control-Expose-Headers", "Retry-After, Content-Disposition")
-				if wildcard {
-					// A wildcard origin must NOT be combined with credentials (CORS spec):
-					// reflecting a concrete origin + Allow-Credentials lets any site make
-					// credentialed cross-origin reads. Emit literal "*" without credentials.
-					w.Header().Set("Access-Control-Allow-Origin", "*")
-				} else {
-					// Specific configured origin: safe to reflect and allow credentials.
-					w.Header().Set("Access-Control-Allow-Origin", origin)
-					w.Header().Set("Access-Control-Allow-Credentials", "true")
-				}
-			}
-		}
+		// The CORS policy is shared with the User API proxy, which applies it to the
+		// responses it writes itself.
+		server.SetCORSHeaders(w.Header(), r.Header.Get("Origin"), s.settings.Load().allowedOrigins)
 
 		// Handle preflight requests
 		if r.Method == "OPTIONS" {

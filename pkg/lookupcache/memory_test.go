@@ -17,7 +17,7 @@ func TestLookupCache_MemoryCleanup(t *testing.T) {
 	}
 
 	// Create cache with very short TTLs and frequent cleanup
-	cache := New(50*time.Millisecond, 50*time.Millisecond, 10000, 100*time.Millisecond, 30*time.Second)
+	cache := New("test", "test", 50*time.Millisecond, 50*time.Millisecond, 10000, 100*time.Millisecond, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	password := "testpassword"
@@ -49,7 +49,7 @@ func TestLookupCache_MemoryCleanup(t *testing.T) {
 // TestLookupCache_MaxSizeEnforcement verifies that cache never exceeds max size
 func TestLookupCache_MaxSizeEnforcement(t *testing.T) {
 	maxSize := 100
-	cache := New(1*time.Second, 1*time.Second, maxSize, 1*time.Second, 30*time.Second)
+	cache := New("test", "test", 1*time.Second, 1*time.Second, maxSize, 1*time.Second, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	password := "testpassword"
@@ -88,7 +88,7 @@ func TestLookupCache_NoLeakAfterStop(t *testing.T) {
 	// Create and stop many caches
 	numCaches := 10
 	for i := 0; i < numCaches; i++ {
-		cache := New(1*time.Second, 1*time.Second, 100, 100*time.Millisecond, 30*time.Second)
+		cache := New("test", "test", 1*time.Second, 1*time.Second, 100, 100*time.Millisecond, 30*time.Second)
 
 		// Add some entries
 		password := "testpassword"
@@ -125,7 +125,7 @@ func TestLookupCache_NoLeakAfterStop(t *testing.T) {
 // TestLookupCache_ExpiredNotRemovedOnRead verifies that expired entries remain in map until cleanup
 // This is a performance optimization - we don't delete on every read, only during periodic cleanup
 func TestLookupCache_ExpiredNotRemovedOnRead(t *testing.T) {
-	cache := New(50*time.Millisecond, 50*time.Millisecond, 100, 10*time.Second, 30*time.Second) // Long cleanup interval
+	cache := New("test", "test", 50*time.Millisecond, 50*time.Millisecond, 100, 10*time.Second, 30*time.Second) // Long cleanup interval
 	defer cache.Stop(context.Background())
 
 	password := "testpassword"

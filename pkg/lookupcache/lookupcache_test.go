@@ -11,7 +11,7 @@ import (
 
 func TestLookupCache_SuccessfulAuth(t *testing.T) {
 	// Use long TTLs and cleanup interval to prevent race with cleanup goroutine
-	cache := New(10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
+	cache := New("test", "test", 10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	// Create a test password hash
@@ -68,7 +68,7 @@ func TestLookupCache_SuccessfulAuth(t *testing.T) {
 
 func TestLookupCache_FailureCache(t *testing.T) {
 	// Use long TTLs and cleanup interval to prevent race with cleanup goroutine
-	cache := New(10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
+	cache := New("test", "test", 10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	address := "nonexistent@example.com"
@@ -90,7 +90,7 @@ func TestLookupCache_FailureCache(t *testing.T) {
 }
 
 func TestLookupCache_Expiration(t *testing.T) {
-	cache := New(50*time.Millisecond, 100*time.Millisecond, 100, 1*time.Second, 30*time.Second)
+	cache := New("test", "test", 50*time.Millisecond, 100*time.Millisecond, 100, 1*time.Second, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	password := "testpassword"
@@ -117,7 +117,7 @@ func TestLookupCache_Expiration(t *testing.T) {
 
 func TestLookupCache_Invalidation(t *testing.T) {
 	// Use long cleanup interval to prevent race with cleanup goroutine
-	cache := New(1*time.Second, 1*time.Second, 100, 1*time.Hour, 30*time.Second)
+	cache := New("test", "test", 1*time.Second, 1*time.Second, 100, 1*time.Hour, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	password := "testpassword"
@@ -151,7 +151,7 @@ func TestLookupCache_Invalidation(t *testing.T) {
 func TestLookupCache_MaxSize(t *testing.T) {
 	maxSize := 5
 	// Use long cleanup interval to prevent race with cleanup goroutine
-	cache := New(1*time.Second, 1*time.Second, maxSize, 1*time.Hour, 30*time.Second)
+	cache := New("test", "test", 1*time.Second, 1*time.Second, maxSize, 1*time.Hour, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	password := "testpassword"
@@ -171,7 +171,7 @@ func TestLookupCache_MaxSize(t *testing.T) {
 }
 
 func TestLookupCache_CleanupExpired(t *testing.T) {
-	cache := New(50*time.Millisecond, 50*time.Millisecond, 100, 100*time.Millisecond, 30*time.Second)
+	cache := New("test", "test", 50*time.Millisecond, 50*time.Millisecond, 100, 100*time.Millisecond, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	password := "testpassword"
@@ -201,7 +201,7 @@ func TestLookupCache_CleanupExpired(t *testing.T) {
 
 func TestLookupCache_PasswordChangeInvalidation(t *testing.T) {
 	// Use long TTL and cleanup interval to prevent race with cleanup
-	cache := New(10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
+	cache := New("test", "test", 10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	address := "user@example.com"
@@ -267,7 +267,7 @@ func TestLookupCache_PasswordChangeInvalidation(t *testing.T) {
 
 func TestLookupCache_MemoryGrowthPrevention(t *testing.T) {
 	// Simulate production config: 30s TTL, 5min cleanup
-	cache := New(30*time.Second, 5*time.Second, 10000, 5*time.Minute, 30*time.Second)
+	cache := New("test", "test", 30*time.Second, 5*time.Second, 10000, 5*time.Minute, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	password := "testpassword"
@@ -294,7 +294,7 @@ func TestLookupCache_MemoryGrowthPrevention(t *testing.T) {
 
 func TestLookupCache_CleanupRemovesExpiredEntries(t *testing.T) {
 	// Use short TTL and fast cleanup to test cleanup loop
-	cache := New(500*time.Millisecond, 500*time.Millisecond, 1000, 100*time.Millisecond, 30*time.Second)
+	cache := New("test", "test", 500*time.Millisecond, 500*time.Millisecond, 1000, 100*time.Millisecond, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	password := "testpassword"
@@ -330,7 +330,7 @@ func TestLookupCache_CleanupRemovesExpiredEntries(t *testing.T) {
 
 func TestLookupCache_ContinuousCleanupPreventsGrowth(t *testing.T) {
 	// Create cache with short TTL and frequent cleanup
-	cache := New(200*time.Millisecond, 200*time.Millisecond, 10000, 50*time.Millisecond, 30*time.Second)
+	cache := New("test", "test", 200*time.Millisecond, 200*time.Millisecond, 10000, 50*time.Millisecond, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	password := "testpassword"
@@ -364,7 +364,7 @@ func TestLookupCache_ContinuousCleanupPreventsGrowth(t *testing.T) {
 
 func TestLookupCache_CleanupLogsRemovedEntries(t *testing.T) {
 	// Test that cleanup actually logs when it removes entries
-	cache := New(100*time.Millisecond, 100*time.Millisecond, 100, 100*time.Millisecond, 30*time.Second)
+	cache := New("test", "test", 100*time.Millisecond, 100*time.Millisecond, 100, 100*time.Millisecond, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	password := "testpassword"
@@ -396,7 +396,7 @@ func TestLookupCache_CleanupLogsRemovedEntries(t *testing.T) {
 // TestLookupCache_NegativeCacheAllowsRevalidation verifies that negative cache entries
 // ALWAYS allow revalidation to handle cases where users are created or passwords changed
 func TestLookupCache_NegativeCacheAllowsRevalidation(t *testing.T) {
-	cache := New(10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
+	cache := New("test", "test", 10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	address := "test@example.com"
@@ -451,7 +451,7 @@ func TestLookupCache_NegativeCacheAllowsRevalidation(t *testing.T) {
 // TestLookupCache_PositiveCacheDifferentPasswordAllowsRevalidation verifies that trying
 // a different password on a cached positive entry always allows revalidation (no brute force protection in cache)
 func TestLookupCache_PositiveCacheDifferentPasswordAllowsRevalidation(t *testing.T) {
-	cache := New(10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
+	cache := New("test", "test", 10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	address := "test@example.com"

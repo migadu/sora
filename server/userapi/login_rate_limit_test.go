@@ -38,7 +38,7 @@ func TestCachedLoginFromBlockedIPIsRefused(t *testing.T) {
 		t.Fatal("setup: address is not blocked")
 	}
 
-	cache := lookupcache.New(5*time.Minute, time.Minute, 100, 5*time.Minute, 30*time.Second)
+	cache := lookupcache.New("test", "test", 5*time.Minute, time.Minute, 100, 5*time.Minute, 30*time.Second)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

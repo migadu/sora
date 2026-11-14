@@ -97,7 +97,8 @@ func TestCommandTimeout(t *testing.T) {
 	t.Logf("✅ Command timeout test passed - server operates correctly with 10s timeout enabled")
 }
 
-// TestCommandTimeoutMetrics verifies that IMAP command timeout metrics are properly initialized
+// TestCommandTimeoutMetrics verifies that the IMAP command timeout threshold metric is set.
+// The timeouts themselves are counted in sora_connection_timeouts_total.
 func TestCommandTimeoutMetrics(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -111,33 +112,6 @@ func TestCommandTimeoutMetrics(t *testing.T) {
 		t.Errorf("Expected threshold 3 seconds, got %.0f seconds", thresholdValue)
 	}
 	t.Logf("✅ CommandTimeoutThresholdSeconds[imap] = 3 seconds")
-
-	// Verify timeout counter can be incremented (direct metrics test)
-	initialCount := testutil.ToFloat64(metrics.CommandTimeoutsTotal.WithLabelValues("imap", "TEST"))
-	t.Logf("Initial timeout count: %.0f", initialCount)
-
-	// Increment the counter
-	metrics.CommandTimeoutsTotal.WithLabelValues("imap", "TEST").Inc()
-
-	// Verify it increased
-	newCount := testutil.ToFloat64(metrics.CommandTimeoutsTotal.WithLabelValues("imap", "TEST"))
-	if newCount != initialCount+1 {
-		t.Errorf("Expected count to increase by 1, got %.0f (was %.0f)", newCount, initialCount)
-	}
-	t.Logf("✅ CommandTimeoutsTotal[imap,TEST] = %.0f (increased by 1)", newCount)
-
-	// Test multiple increments
-	metrics.CommandTimeoutsTotal.WithLabelValues("imap", "SELECT").Inc()
-	metrics.CommandTimeoutsTotal.WithLabelValues("imap", "SELECT").Inc()
-	metrics.CommandTimeoutsTotal.WithLabelValues("imap", "SELECT").Inc()
-
-	selectCount := testutil.ToFloat64(metrics.CommandTimeoutsTotal.WithLabelValues("imap", "SELECT"))
-	if selectCount != 3 {
-		t.Errorf("Expected SELECT count to be 3, got %.0f", selectCount)
-	}
-	t.Logf("✅ CommandTimeoutsTotal[imap,SELECT] = %.0f", selectCount)
-
-	t.Logf("✅ All command timeout metrics working correctly")
 }
 
 // TestIdleTimeoutTrigger verifies that idle connections are actually closed after the timeout period

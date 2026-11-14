@@ -3,6 +3,7 @@ package resilient
 import (
 	"context"
 
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 )
 
@@ -19,6 +20,29 @@ func (rdb *ResilientDatabase) GetAccountIDByEmailWithRetry(ctx context.Context, 
 		return 0, err
 	}
 	return result.(int64), nil
+}
+
+// GetAccountAddressesWithRetry returns the account an address belongs to and all of that
+// account's addresses (db.GetAccountAddresses) with retry logic.
+func (rdb *ResilientDatabase) GetAccountAddressesWithRetry(ctx context.Context, address string) (int64, []string, error) {
+	type accountAddresses struct {
+		id        int64
+		addresses []string
+	}
+	op := func(ctx context.Context) (any, error) {
+		id, addresses, err := rdb.getOperationalDatabaseForOperation(ctx, false).GetAccountAddresses(ctx, address)
+		if err != nil {
+			return nil, err
+		}
+		return accountAddresses{id, addresses}, nil
+	}
+
+	result, err := rdb.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrUserNotFound)
+	if err != nil {
+		return 0, nil, err
+	}
+	r := result.(accountAddresses)
+	return r.id, r.addresses, nil
 }
 
 // GetMailboxesForUserWithRetry retrieves all mailboxes for an account with retry logic
