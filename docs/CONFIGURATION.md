@@ -66,21 +66,21 @@ only some sections (`[database]`, `[s3]`, `[local_cache]`, `[uploader]`, `[clean
 
 ### Unknown keys
 
-A key Sora does not know is ignored, and Sora prints a warning that names it:
+A key Sora does not know is ignored, and Sora logs a warning that names it (console format):
 
 ```
-WARNING: Configuration file 'config.toml' contains unknown keys that will be ignored:
-WARNING:   - servers.imap
-WARNING:   - servers.imap.start
-WARNING:   - servers.imap.addr
-WARNING: These keys may be typos or deprecated settings. Please review your configuration.
+level=WARN msg="Configuration file 'config.toml': unknown key 'servers.imap' will be ignored (a typo or a deprecated setting?)"
+level=WARN msg="Configuration file 'config.toml': unknown key 'servers.imap.start' will be ignored (a typo or a deprecated setting?)"
+level=WARN msg="Configuration file 'config.toml': unknown key 'servers.imap.addr' will be ignored (a typo or a deprecated setting?)"
 ```
 
 An unknown table is listed together with each key in it.
 
 The key keeps its default, so a misspelt key silently does nothing. Read these warnings after every
-change. At startup they are printed to standard error, before logging is set up, so they do not
-reach a log file named in `[logging] output`. On a `SIGHUP` reload they go through the logger.
+change. At startup the file is read before logging is set up, so Sora holds them and writes them to
+the `[logging]` output once it is open, at its level. If startup stops before that, for example on a
+check in [section 4](#4-checks-at-startup) that runs before logging is set up, they are written to
+standard error with the error. On a `SIGHUP` reload they go through the logger.
 
 ### Duplicate keys
 
