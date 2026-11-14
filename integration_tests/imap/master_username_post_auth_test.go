@@ -124,8 +124,12 @@ func createAccountWithoutMailboxes(t *testing.T, rdb *resilient.ResilientDatabas
 	if err != nil {
 		t.Fatalf("Failed to list the new account's mailboxes: %v", err)
 	}
-	if len(mailboxes) != 0 {
-		t.Fatalf("the new account already has %d mailboxes before any login, want 0", len(mailboxes))
+	// GetMailboxes includes shared mailboxes made visible by other fixtures' anyone
+	// ACLs. Only this account's own mailboxes would invalidate the fresh-account setup.
+	for _, mailbox := range mailboxes {
+		if mailbox.AccountID == accountID {
+			t.Fatalf("the new account already owns mailbox %q before any login, want none", mailbox.Name)
+		}
 	}
 	return email, password
 }
