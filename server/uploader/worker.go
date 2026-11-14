@@ -1130,8 +1130,15 @@ func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []
 	// delivery of the same bytes would adopt ("file exists, skip write") and a reader
 	// would serve. The rename also keeps a concurrent reader or uploader on the old
 	// inode, so a rewrite never changes bytes under an open descriptor.
-	tmpPath := path + ".tmp"
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	//
+	// The temporary name is this call's own, created exclusively: two stagings of the
+	// same body (duplicate APPENDs or deliveries that both passed their caller's Stat)
+	// run here at once. With a shared name the first rename took the name from under
+	// the second, which then failed with ENOENT, and a second open with O_TRUNC could
+	// empty an inode the first was about to rename into place as staged. Each writer
+	// now fills its own inode and renames a complete file over <hash>.
+	tmpPath := fmt.Sprintf("%s.%016x.tmp", path, rand.Uint64())
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create file %s: %w", tmpPath, err)
 	}
