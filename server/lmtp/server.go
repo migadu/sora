@@ -126,7 +126,7 @@ type reloadableSettings struct {
 }
 
 // messageSizeLimit is the largest message accepted: max_message_size, or
-// DefaultMaxMessageSize when it is unset.
+// DefaultMaxMessageSize when it is unset or zero.
 func (s *reloadableSettings) messageSizeLimit() int64 {
 	if s.maxMessageSize > 0 {
 		return s.maxMessageSize
