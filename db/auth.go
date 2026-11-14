@@ -232,6 +232,20 @@ func GenerateBcryptHash(password string) (string, error) {
 	return blfCryptPrefix + string(hash), nil
 }
 
+// ErrUnsupportedHashType is returned for a hash type new passwords are not hashed with.
+var ErrUnsupportedHashType = errors.New("unsupported hash type")
+
+// ValidateNewHashType checks that hashType is one a new password is hashed with:
+// bcrypt or ssha512. Unsalted SHA-512 is still verified for legacy credentials
+// (VerifyPassword) but no longer written.
+func ValidateNewHashType(hashType string) error {
+	switch hashType {
+	case "bcrypt", "ssha512":
+		return nil
+	}
+	return fmt.Errorf("%w %q: use bcrypt or ssha512", ErrUnsupportedHashType, hashType)
+}
+
 // VerifyPassword checks if the provided password matches the stored password hash.
 // It supports bcrypt, BLF-CRYPT, SSHA512, and SHA512 formats with different encodings.
 // A wrong password is reported as ErrInvalidCredentials (errors.Is) for every scheme;

@@ -134,8 +134,8 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		return nil, err
 	}
 
-	if options.TokenDuration == 0 {
-		options.TokenDuration = 24 * time.Hour // Default to 24 hours
+	if options.TokenDuration <= 0 {
+		options.TokenDuration = 24 * time.Hour // Default to 24 hours; a negative lifetime would mint expired tokens
 	}
 	if options.TokenDuration > maxTokenDuration {
 		logger.Warn("User API: token_duration exceeds maximum; clamping",
@@ -186,10 +186,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 			cleanupInterval = 5 * time.Minute
 		}
 
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize == 0 {
-			maxSize = 10000
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()
 		if err != nil {
@@ -422,7 +419,10 @@ func (s *Server) SetupRoutes() http.Handler {
 
 // handleMailboxWithName routes mailbox operations that include a mailbox name
 func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
+	// The endpoint is picked by what follows the name, in the escaped path (an
+	// encoded "/" belongs to the name, see pathName) and only after a name: a
+	// DELETE of the top-level mailbox "search" deletes that mailbox.
+	path := strings.TrimPrefix(escapedRoutingPath(r), "/user/mailboxes/")
 
 	// Check for subscribe/unsubscribe operations
 	if strings.HasSuffix(path, "/subscribe") {
@@ -506,10 +506,12 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 
 // handleFilterOperations routes Sieve filter operations
 func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
+	// As in handleMailboxWithName: /activate is matched only after a script
+	// name, so a script named "activate" is addressed by that name.
+	path := strings.TrimPrefix(escapedRoutingPath(r), "/user/filters/")
 
 	// Check for capabilities endpoint
-	if strings.HasSuffix(path, "/capabilities") {
+	if path == "capabilities" {
 		if r.Method != "GET" {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return

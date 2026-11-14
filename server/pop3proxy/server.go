@@ -381,10 +381,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 			logger.Info("POP3 Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", options.Name, "error", err)
 			cleanupInterval = 5 * time.Minute
 		}
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize <= 0 {
-			maxSize = 10000
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// Parse positive revalidation window from config (used for password change detection)
 		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()

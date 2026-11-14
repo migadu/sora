@@ -164,6 +164,10 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 	if len(s.server.masterUsername) > 0 && addressParsed.HasSuffix() && checkMasterCredential(addressParsed.Suffix(), s.server.masterUsername) {
 		// Suffix matches MasterUsername, authenticate with MasterPassword
 		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
+			if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
+				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
+				return authFailedError()
+			}
 			// Use base address (without suffix) to get account
 			AccountID, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, addressParsed.BaseAddress())
 			if err != nil {
@@ -240,14 +244,6 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 
 			// Start termination poller to check for kick commands
 			s.startTerminationPoller()
-
-			// Clear auth idle timeout after successful authentication
-			// Post-auth timeouts are handled by SoraConn (command_timeout)
-			if s.server.authIdleTimeout > 0 {
-				if err := netConn.SetReadDeadline(time.Time{}); err != nil {
-					s.WarnLog("failed to clear auth idle timeout", "error", err)
-				}
-			}
 
 			return nil
 		}
@@ -361,14 +357,6 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 
 	// Trigger cache warmup for the authenticated user
 	s.triggerCacheWarmup()
-
-	// Clear auth idle timeout after successful authentication
-	// Post-auth timeouts are handled by SoraConn (command_timeout)
-	if s.server.authIdleTimeout > 0 {
-		if err := netConn.SetReadDeadline(time.Time{}); err != nil {
-			s.WarnLog("failed to clear auth idle timeout", "error", err)
-		}
-	}
 
 	return nil
 }

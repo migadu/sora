@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-smtp"
+	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/server/delivery"
 )
 
@@ -304,6 +305,117 @@ func TestSMTPRelayStartTLS(t *testing.T) {
 	msg := backend.messages[0]
 	if msg.From != from {
 		t.Errorf("Expected from %s, got %s", from, msg.From)
+	}
+}
+
+// startTLSTestSMTPServer serves SMTP on a loopback listener. With implicitTLS the
+// listener is TLS from the first byte; otherwise tlsConfig (if non-nil) is offered
+// through STARTTLS, and a nil tlsConfig means the server never advertises STARTTLS.
+func startTLSTestSMTPServer(t *testing.T, tlsConfig *tls.Config, implicitTLS bool) (string, *testSMTPBackend) {
+	t.Helper()
+	backend := &testSMTPBackend{}
+	server := smtp.NewServer(backend)
+	server.Domain = "test.example.com"
+
+	var listener net.Listener
+	var err error
+	if implicitTLS {
+		listener, err = tls.Listen("tcp", "127.0.0.1:0", tlsConfig)
+	} else {
+		server.TLSConfig = tlsConfig
+		listener, err = net.Listen("tcp", "127.0.0.1:0")
+	}
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+	go func() {
+		if err := server.Serve(listener); err != nil && !strings.Contains(err.Error(), "use of closed") {
+			t.Logf("SMTP server error: %v", err)
+		}
+	}()
+	t.Cleanup(func() { server.Close() })
+	return listener.Addr().String(), backend
+}
+
+// TestSMTPRelayVerifiesCertificate checks that with TLSVerify the relay refuses a
+// certificate it cannot verify, over both STARTTLS and implicit TLS, and delivers
+// nothing. RFC 3207 §6: "Ignoring this step completely invalidates using TLS for
+// security." The failure is temporary so the queue retries it (§6: "retry TLS at a
+// later time").
+func TestSMTPRelayVerifiesCertificate(t *testing.T) {
+	// A certificate that is valid for the dialed address but signed by nobody the
+	// client trusts: only chain verification can reject it.
+	certFile, keyFile, _ := common.GenerateTestTLSCert(t, nil, nil)
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		t.Fatalf("Failed to load test certificate: %v", err)
+	}
+	serverTLS := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+
+	for _, implicitTLS := range []bool{false, true} {
+		name := "STARTTLS"
+		if implicitTLS {
+			name = "implicit TLS"
+		}
+		t.Run(name, func(t *testing.T) {
+			addr, backend := startTLSTestSMTPServer(t, serverTLS, implicitTLS)
+			handler := &delivery.SMTPRelayHandler{
+				SMTPHost:     addr,
+				UseTLS:       true,
+				TLSVerify:    true,
+				UseStartTLS:  !implicitTLS,
+				MetricsLabel: "integration_test",
+				Logger:       &integrationLogger{t: t},
+			}
+
+			err := handler.SendToExternalRelay("sender@example.com", "recipient@example.com",
+				[]byte("Subject: Verify\r\n\r\nmust not be delivered\r\n"))
+			if err == nil {
+				t.Fatal("relay accepted an unverifiable certificate")
+			}
+			if !strings.Contains(err.Error(), "certificate") {
+				t.Errorf("expected a certificate verification error, got: %v", err)
+			}
+			if delivery.IsPermanentError(err) {
+				t.Errorf("certificate failure classified permanent, want temporary (retry later): %v", err)
+			}
+			backend.mu.Lock()
+			defer backend.mu.Unlock()
+			if len(backend.messages) != 0 {
+				t.Fatalf("message delivered despite the failed verification: %d message(s)", len(backend.messages))
+			}
+		})
+	}
+}
+
+// TestSMTPRelayStartTLSRequired checks that a relay configured for STARTTLS does
+// not fall back to plaintext when the server does not offer STARTTLS (as after an
+// on-path attacker strips "250-STARTTLS"). RFC 3207 §6: clients "MUST be able to be
+// configured to require successful TLS negotiation ... before messages can be
+// successfully transferred."
+func TestSMTPRelayStartTLSRequired(t *testing.T) {
+	addr, backend := startTLSTestSMTPServer(t, nil, false)
+	handler := &delivery.SMTPRelayHandler{
+		SMTPHost:     addr,
+		UseTLS:       true,
+		TLSVerify:    true,
+		UseStartTLS:  true,
+		MetricsLabel: "integration_test",
+		Logger:       &integrationLogger{t: t},
+	}
+
+	err := handler.SendToExternalRelay("sender@example.com", "recipient@example.com",
+		[]byte("Subject: Stripped\r\n\r\nmust not be delivered\r\n"))
+	if err == nil {
+		t.Fatal("relay delivered without STARTTLS")
+	}
+	if !strings.Contains(err.Error(), "STARTTLS") {
+		t.Errorf("expected a STARTTLS error, got: %v", err)
+	}
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	if len(backend.messages) != 0 {
+		t.Fatalf("message delivered in plaintext: %d message(s)", len(backend.messages))
 	}
 }
 
