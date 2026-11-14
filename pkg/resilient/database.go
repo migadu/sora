@@ -1159,6 +1159,12 @@ func (rd *ResilientDatabase) getHealthyDatabaseWithFailover(isWrite bool) *db.Da
 	for i := 1; i <= numPools; i++ {
 		nextIdx := (currentIdx + i) % numPools
 		if pools[nextIdx].isHealthy.Load() {
+			if nextIdx == currentIdx {
+				// The last candidate is the current pool, which the health check marked
+				// healthy again while we looked: no switch, and in particular no
+				// RetireWriter on the pool that stays the writer.
+				return pools[currentIdx].database
+			}
 			// Found a healthy pool, switch to it.
 			if isWrite {
 				fm.currentWriteIdx.Store(int64(nextIdx))
