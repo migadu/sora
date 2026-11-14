@@ -1002,7 +1002,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					&serverLogger{},
 					cbConfig,
 				)
-				logger.Info("Relay handler configured: type=http", "url", cfg.Relay.HTTPURL, "cb_threshold", cbThreshold, "cb_timeout", cbTimeout, "cb_max_requests", cbMaxRequests)
+				logger.Info("Relay handler configured: type=http", "url", config.MaskEndpointURL(cfg.Relay.HTTPURL), "cb_threshold", cbThreshold, "cb_timeout", cbTimeout, "cb_max_requests", cbMaxRequests)
 			}
 			if warning := cfg.Relay.TransportWarning(); warning != "" {
 				logger.Warn(warning)
@@ -1186,7 +1186,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			deps.spamTrainingClient = nil
 		} else {
 			logger.Info("Spam training client initialized",
-				"endpoint", cfg.SpamTraining.Endpoint,
+				"endpoint", config.MaskEndpointURL(cfg.SpamTraining.Endpoint),
 				"cb_threshold", cfg.SpamTraining.CircuitBreaker.GetThreshold())
 		}
 	}
