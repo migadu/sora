@@ -819,7 +819,8 @@ activated; replacing a script keeps its active state.
 - `409 Conflict` - A new script would exceed the per-account limit of 100 scripts
   (ManageSieve answers `NO (QUOTA/MAXSCRIPTS)`); delete one first. Updating an existing
   script is not affected.
-- `413 Request Entity Too Large` - Script exceeds `max_script_size`
+- `413 Request Entity Too Large` - Script exceeds `max_script_size`, or the request body
+  is larger than the server reads for one script
 
 **Example:**
 ```bash

@@ -586,7 +586,9 @@ paths:
         '409':
           description: A new script would exceed the limit of 100 scripts per account
         '413':
-          description: The script is larger than `max_script_size`
+          description: |
+            The script is larger than `max_script_size`, or the request body is larger
+            than the server reads for one script
 
     delete:
       tags:

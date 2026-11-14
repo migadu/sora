@@ -139,6 +139,12 @@ func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
 
 	var req SieveScriptRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// A body over the read cap is too large, not malformed (RFC 9110 section 15.5.14).
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.writeError(w, http.StatusRequestEntityTooLarge, "Request body exceeds maximum size")
+			return
+		}
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
