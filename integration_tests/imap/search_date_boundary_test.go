@@ -157,14 +157,73 @@ func TestIMAP_SearchDateKeysDayBoundaries(t *testing.T) {
 		{"SENTSINCE 2-Jan-2025", sentGroup, imap.SearchCriteria{SentSince: jan2}, []string{"sent 2-Jan 00:00 UTC"}},
 	}
 
-	search := func(t *testing.T, criteria imap.SearchCriteria, scope []imap.UID) []imap.UID {
+	// SEARCH, SORT, THREAD and ESEARCH IN (MULTISEARCH) all take their criteria
+	// through the same builder, so each must draw the day boundary alike.
+	type command struct {
+		name string
+		run  func(criteria *imap.SearchCriteria) ([]imap.UID, error)
+	}
+	uidSearch := command{"UID SEARCH", func(criteria *imap.SearchCriteria) ([]imap.UID, error) {
+		data, err := c.UIDSearch(criteria, nil).Wait()
+		if err != nil {
+			return nil, err
+		}
+		return data.AllUIDs(), nil
+	}}
+	commands := []command{
+		uidSearch,
+		{"UID SORT", func(criteria *imap.SearchCriteria) ([]imap.UID, error) {
+			data, err := c.UIDSort(&imapclient.SortOptions{
+				SearchCriteria: criteria,
+				SortCriteria:   []imap.SortCriterion{{Key: imap.SortKeyArrival}},
+			}).Wait()
+			if err != nil {
+				return nil, err
+			}
+			return data.UIDs, nil
+		}},
+		{"UID THREAD", func(criteria *imap.SearchCriteria) ([]imap.UID, error) {
+			threads, err := c.UIDThread(&imapclient.ThreadOptions{
+				Algorithm:      imap.ThreadOrderedSubject,
+				SearchCriteria: criteria,
+			}).Wait()
+			if err != nil {
+				return nil, err
+			}
+			var uids []imap.UID
+			var walk func([]imap.ThreadData)
+			walk = func(threads []imap.ThreadData) {
+				for _, thread := range threads {
+					for _, uid := range thread.Chain {
+						uids = append(uids, imap.UID(uid))
+					}
+					walk(thread.SubThreads)
+				}
+			}
+			walk(threads)
+			return uids, nil
+		}},
+		{"ESEARCH IN (MAILBOXES INBOX)", func(criteria *imap.SearchCriteria) ([]imap.UID, error) {
+			results, err := c.MultiSearch(&imap.SearchSource{Mailboxes: []string{"INBOX"}}, criteria,
+				&imap.SearchOptions{ReturnAll: true}).Wait()
+			if err != nil {
+				return nil, err
+			}
+			var uids []imap.UID
+			for _, r := range results {
+				uids = append(uids, r.AllUIDs()...)
+			}
+			return uids, nil
+		}},
+	}
+
+	search := func(t *testing.T, cmd command, criteria imap.SearchCriteria, scope []imap.UID) []imap.UID {
 		t.Helper()
 		criteria.UID = []imap.UIDSet{imap.UIDSetNum(scope...)}
-		data, err := c.UIDSearch(&criteria, nil).Wait()
+		got, err := cmd.run(&criteria)
 		if err != nil {
-			t.Fatalf("UID SEARCH failed: %v", err)
+			t.Fatalf("%s failed: %v", cmd.name, err)
 		}
-		got := data.AllUIDs()
 		slices.Sort(got)
 		return got
 	}
@@ -176,8 +235,10 @@ func TestIMAP_SearchDateKeysDayBoundaries(t *testing.T) {
 				want = append(want, uidOf[name])
 			}
 			slices.Sort(want)
-			if got := search(t, tt.criteria, groupUIDs[tt.group]); !slices.Equal(got, want) {
-				t.Errorf("UID SEARCH %s = %v, want %v", tt.key, got, want)
+			for _, cmd := range commands {
+				if got := search(t, cmd, tt.criteria, groupUIDs[tt.group]); !slices.Equal(got, want) {
+					t.Errorf("%s %s = %v, want %v", cmd.name, tt.key, got, want)
+				}
 			}
 		})
 	}
@@ -195,10 +256,10 @@ func TestIMAP_SearchDateKeysDayBoundaries(t *testing.T) {
 		y, mo, d := f.InternalDate.Date() // in the zone the server reported
 		reported := day(y, mo, d)
 		t.Run(fmt.Sprintf("UID %d INTERNALDATE %s", f.UID, f.InternalDate.Format("02-Jan-2006 15:04:05 -0700")), func(t *testing.T) {
-			if got := search(t, on(reported), []imap.UID{f.UID}); !slices.Equal(got, []imap.UID{f.UID}) {
+			if got := search(t, uidSearch, on(reported), []imap.UID{f.UID}); !slices.Equal(got, []imap.UID{f.UID}) {
 				t.Errorf("UID %d not found by ON %s", f.UID, reported.Format("2-Jan-2006"))
 			}
-			if got := search(t, imap.SearchCriteria{Before: reported}, []imap.UID{f.UID}); len(got) != 0 {
+			if got := search(t, uidSearch, imap.SearchCriteria{Before: reported}, []imap.UID{f.UID}); len(got) != 0 {
 				t.Errorf("UID %d found by BEFORE %s", f.UID, reported.Format("2-Jan-2006"))
 			}
 		})
