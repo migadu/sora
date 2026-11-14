@@ -36,7 +36,7 @@ func TestAdminAPIConnections_StorageNodeIntegration(t *testing.T) {
 	opts := adminapi.ServerOptions{
 		Addr:               "127.0.0.1:0", // random port
 		APIKey:             "test-key-16-chars-long",
-		ConnectionTrackers: deps.connectionTrackers,
+		ConnectionTrackers: deps.connectionTrackersSnapshot,
 	}
 	// adminapi.Start will bind and listen in background
 	_ = adminapi.Start(ctx, nil, opts, errChan)

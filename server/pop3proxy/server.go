@@ -223,7 +223,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// Initialize remotelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
 	if options.RemoteLookup != nil && options.RemoteLookup.Enabled {
-		remotelookupClient, err := proxy.InitializeRemoteLookup("pop3", options.RemoteLookup)
+		remotelookupClient, err := proxy.InitializeRemoteLookup("pop3", options.RemoteLookup, options.RemotePort)
 		if err != nil {
 			logger.Debug("POP3 Proxy: Failed to initialize remotelookup client", "proxy", options.Name, "error", err)
 			if !options.RemoteLookup.ShouldLookupLocalUsers() {
@@ -381,10 +381,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 			logger.Info("POP3 Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", options.Name, "error", err)
 			cleanupInterval = 5 * time.Minute
 		}
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize <= 0 {
-			maxSize = 10000
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// Parse positive revalidation window from config (used for password change detection)
 		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()

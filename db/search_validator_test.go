@@ -1,6 +1,7 @@
 package db
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -14,7 +15,6 @@ func TestNewSearchCriteriaValidator(t *testing.T) {
 
 	assert.Equal(t, 1000, validator.MaxSearchTermLength)
 	assert.Equal(t, 50, validator.MaxSearchTerms)
-	assert.Equal(t, 365*24*time.Hour, validator.MaxDateRange)
 	assert.Equal(t, 10, validator.MaxTextSearchTerms)
 	assert.Equal(t, 20, validator.MaxSequenceRanges)
 	assert.Equal(t, 20, validator.MaxFlagFilters)
@@ -139,29 +139,33 @@ func TestValidateDateRanges(t *testing.T) {
 			sentBefore:  now.AddDate(0, 0, -30),
 			expectError: false,
 		},
+		// A range that is empty is a valid search that matches nothing, not a
+		// protocol error (RFC 3501 §7.1.3 reserves BAD for those).
 		{
 			name:        "since after before",
 			since:       now,
 			before:      now.AddDate(0, 0, -30),
-			expectError: true,
+			expectError: false,
 		},
 		{
 			name:        "sent since after sent before",
 			sentSince:   now,
 			sentBefore:  now.AddDate(0, 0, -30),
-			expectError: true,
+			expectError: false,
 		},
+		// The span of a date range is not limited: an open-ended one is larger
+		// and was always accepted.
 		{
-			name:        "date range too large",
+			name:        "date range over a year",
 			since:       now.AddDate(-2, 0, 0), // 2 years ago
 			before:      now,
-			expectError: true,
+			expectError: false,
 		},
 		{
-			name:        "sent date range too large",
+			name:        "sent date range over a year",
 			sentSince:   now.AddDate(-2, 0, 0), // 2 years ago
 			sentBefore:  now,
-			expectError: true,
+			expectError: false,
 		},
 	}
 
@@ -214,17 +218,16 @@ func TestValidateTextTerms(t *testing.T) {
 			expectError: true,
 			errorField:  "Text",
 		},
+		// An empty string is a substring of every field (RFC 3501 §6.4.4).
 		{
 			name:        "empty body term",
 			body:        []string{"valid", ""},
-			expectError: true,
-			errorField:  "Body",
+			expectError: false,
 		},
 		{
 			name:        "empty text term",
 			text:        []string{"valid", ""},
-			expectError: true,
-			errorField:  "Text",
+			expectError: false,
 		},
 		{
 			name:        "body term too long",
@@ -324,12 +327,13 @@ func TestValidateHeaders(t *testing.T) {
 			},
 			expectError: true,
 		},
+		// Only the general term length limit applies to a Message-ID.
 		{
-			name: "message-id too long",
+			name: "long message-id",
 			headers: []imap.SearchCriteriaHeaderField{
-				{Key: "message-id", Value: string(make([]byte, 256))},
+				{Key: "message-id", Value: "<" + strings.Repeat("x", 300) + "@example.com>"},
 			},
-			expectError: true,
+			expectError: false,
 		},
 		{
 			name: "valid message-id",
@@ -427,17 +431,18 @@ func TestValidateSizeFilters(t *testing.T) {
 			smaller:     5000,
 			expectError: false,
 		},
+		// No message satisfies both: a valid search that matches nothing.
 		{
 			name:        "larger >= smaller",
 			larger:      5000,
 			smaller:     1000,
-			expectError: true,
+			expectError: false,
 		},
 		{
 			name:        "larger == smaller",
 			larger:      1000,
 			smaller:     1000,
-			expectError: true,
+			expectError: false,
 		},
 		{
 			name:        "only larger set",

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/bzip2"
 	"compress/gzip"
@@ -87,6 +88,10 @@ type msgInfo struct {
 	hash     string
 	size     int64
 	mailbox  string
+	// imported is the cache row's s3_uploaded mark: an earlier run imported the file
+	// under hash (recoverOrphanedSQLiteState clears the mark when the account has no
+	// live row with that hash).
+	imported bool
 }
 
 // uploadedMsg represents a successfully uploaded message
@@ -1008,9 +1013,9 @@ func (i *Importer) printSummary() error {
 	return nil
 }
 
-// hashFile calculates the SHA256 hash of a file, decompressing if it's gzip compressed.
-// This streams the file content to handle potential gzip decompression without loading
-// the entire file into memory.
+// hashFile returns the content hash (helpers.HashContent) and size of the message in a
+// maildir file, decompressing it the way the upload does. It streams the file, so the
+// scan never holds a whole message in memory.
 func hashFile(path string) (string, int64, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -1018,32 +1023,12 @@ func hashFile(path string) (string, int64, error) {
 	}
 	defer file.Close()
 
-	// Read magic bytes to check for gzip
-	magic := make([]byte, 2)
-	n, err := file.Read(magic)
-	if err != nil && err != io.EOF {
+	reader, _, err := maildirContentReader(file)
+	if err != nil {
 		return "", 0, err
 	}
 
-	// Seek back to start
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return "", 0, err
-	}
-
-	var reader io.Reader = file
-
-	// If gzip magic number is present, wrap with gzip.Reader
-	if n == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
-		gzReader, err := gzip.NewReader(file)
-		if err != nil {
-			return "", 0, fmt.Errorf("failed to create gzip reader: %w", err)
-		}
-		defer gzReader.Close()
-		reader = gzReader
-	}
-
-	// Calculate hash of the (decompressed) content
-	hasher := sha256.New()
+	hasher := helpers.NewContentHasher()
 	size, err := io.Copy(hasher, reader)
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to hash file: %w", err)
@@ -1052,10 +1037,12 @@ func hashFile(path string) (string, int64, error) {
 	return hex.EncodeToString(hasher.Sum(nil)), size, nil
 }
 
-// HashContent calculates the SHA256 hash of the given content.
-func HashContent(content []byte) string {
-	hash := sha256.Sum256(content)
-	return hex.EncodeToString(hash[:])
+// legacyImportHash is the content hash sora-admin import used before it switched to
+// helpers.HashContent: the hex SHA-256 of the message. Only a SQLite cache such a version
+// wrote still holds it.
+func legacyImportHash(content []byte) string {
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
 }
 
 // resolveMailboxName determines the mailbox name from the maildir path
@@ -1642,57 +1629,59 @@ func (i *Importer) getOrCreateMailbox(ctx context.Context, AccountID int64, name
 	return mailbox, err
 }
 
-// decompressIfNeeded checks if content is gzip compressed and decompresses it if needed.
-// This is required for Dovecot maildir imports where messages may be compressed using
-// the zlib plugin (configured with mail_compression_save = gz).
-// The function checks for the gzip magic number (0x1f 0x8b) and decompresses if present.
-func decompressIfNeeded(content []byte) ([]byte, error) {
-	// Check for gzip magic number (1f 8b)
-	if len(content) >= 2 && content[0] == 0x1f && content[1] == 0x8b {
-		reader, err := gzip.NewReader(bytes.NewReader(content))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
-		}
-		defer reader.Close()
-
-		// Bound decompression to avoid a gzip bomb exhausting memory.
-		const maxDecompressedSize = 256 << 20 // 256 MiB
-		decompressed, err := io.ReadAll(io.LimitReader(reader, maxDecompressedSize+1))
-		if err != nil {
-			return nil, fmt.Errorf("failed to decompress gzip content: %w", err)
-		}
-		if len(decompressed) > maxDecompressedSize {
-			return nil, fmt.Errorf("decompressed gzip content exceeds %d bytes", maxDecompressedSize)
-		}
-
-		return decompressed, nil
+// maildirContentReader returns a reader over the message stored in a maildir file: the file
+// itself, or its decompression when Dovecot's zlib plugin stored it gzip- or bzip2-
+// compressed (mail_compression_save = gz / bz2). compressed reports which. The scan's hash
+// and the upload both read through it, so they always see the same bytes.
+func maildirContentReader(r io.Reader) (content io.Reader, compressed bool, err error) {
+	br := bufio.NewReader(r)
+	magic, err := br.Peek(4)
+	if err != nil && err != io.EOF {
+		return nil, false, err
 	}
 
-	// bzip2 (Dovecot zlib plugin with bz2): "BZh" + block size digit.
-	if len(content) >= 4 && content[0] == 'B' && content[1] == 'Z' && content[2] == 'h' && content[3] >= '1' && content[3] <= '9' {
-		const maxDecompressedSize = 256 << 20
-		decompressed, err := io.ReadAll(io.LimitReader(bzip2.NewReader(bytes.NewReader(content)), maxDecompressedSize+1))
+	switch {
+	case len(magic) >= 2 && magic[0] == 0x1f && magic[1] == 0x8b:
+		zr, err := gzip.NewReader(br)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decompress bzip2 content: %w", err)
+			return nil, false, fmt.Errorf("failed to create gzip reader: %w", err)
 		}
-		if len(decompressed) > maxDecompressedSize {
-			return nil, fmt.Errorf("decompressed bzip2 content exceeds %d bytes", maxDecompressedSize)
-		}
-		return decompressed, nil
-	}
-
+		return zr, true, nil
+	case len(magic) == 4 && magic[0] == 'B' && magic[1] == 'Z' && magic[2] == 'h' && magic[3] >= '1' && magic[3] <= '9':
+		// bzip2: "BZh" + block size digit.
+		return bzip2.NewReader(br), true, nil
 	// Compressions this tool cannot read must fail loudly: hashing and uploading the
 	// compressed bytes as if they were the message would store garbage under a valid-
 	// looking hash (Dovecot's zlib plugin also writes zstd and lz4).
-	if len(content) >= 4 && content[0] == 0x28 && content[1] == 0xb5 && content[2] == 0x2f && content[3] == 0xfd {
-		return nil, fmt.Errorf("zstd-compressed maildir file is not supported; decompress it first")
+	case len(magic) == 4 && magic[0] == 0x28 && magic[1] == 0xb5 && magic[2] == 0x2f && magic[3] == 0xfd:
+		return nil, false, fmt.Errorf("zstd-compressed maildir file is not supported; decompress it first")
+	case len(magic) == 4 && magic[0] == 0x04 && magic[1] == 0x22 && magic[2] == 0x4d && magic[3] == 0x18:
+		return nil, false, fmt.Errorf("lz4-compressed maildir file is not supported; decompress it first")
 	}
-	if len(content) >= 4 && content[0] == 0x04 && content[1] == 0x22 && content[2] == 0x4d && content[3] == 0x18 {
-		return nil, fmt.Errorf("lz4-compressed maildir file is not supported; decompress it first")
+	return br, false, nil
+}
+
+// decompressIfNeeded returns the message stored in a maildir file's content (see
+// maildirContentReader): the content itself, or its decompression.
+func decompressIfNeeded(content []byte) ([]byte, error) {
+	reader, compressed, err := maildirContentReader(bytes.NewReader(content))
+	if err != nil {
+		return nil, err
+	}
+	if !compressed {
+		return content, nil
 	}
 
-	// Content is not gzipped, return as-is
-	return content, nil
+	// Bound decompression to avoid a gzip or bzip2 bomb exhausting memory.
+	const maxDecompressedSize = 256 << 20 // 256 MiB
+	decompressed, err := io.ReadAll(io.LimitReader(reader, maxDecompressedSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decompress content: %w", err)
+	}
+	if len(decompressed) > maxDecompressedSize {
+		return nil, fmt.Errorf("decompressed content exceeds %d bytes", maxDecompressedSize)
+	}
+	return decompressed, nil
 }
 
 // parseMessageMetadata extracts metadata from message content
@@ -1843,7 +1832,7 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 				}
 			}
 
-			// Decompress if the file is gzip compressed (Dovecot compression)
+			// Decompress if Dovecot stored the file compressed
 			content, err = decompressIfNeeded(content)
 			if err != nil {
 				logger.Warn("Failed to decompress file", "path", msg.path, "error", err)
@@ -1858,7 +1847,14 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 			// the content_hash of the database row. If the file changed in place under
 			// the same name, uploading the new bytes under the old hash would overwrite
 			// the object an existing row references, with no signal anywhere.
-			if got := hashBytes(content); got != msg.hash {
+			//
+			// One mismatch is not a change: a sora-admin from before the switch to
+			// helpers.HashContent imported the unchanged file under the SHA-256 of its
+			// content. That hash is kept, so the batch insert recognises the row the
+			// earlier run inserted (its duplicate check is on message_id and content_hash)
+			// instead of importing the message a second time under the new hash.
+			if got := helpers.HashContent(content); got != msg.hash &&
+				!(msg.imported && msg.hash == legacyImportHash(content)) {
 				logger.Warn("File content changed since the scan; using its current hash",
 					"path", msg.path, "scanned_hash", msg.hash, "current_hash", got)
 				if _, uerr := i.sqliteDB.Exec("UPDATE messages SET hash = ?, size = ?, s3_uploaded = 0 WHERE path = ? AND mailbox = ?",
@@ -2516,10 +2512,10 @@ func (i *Importer) importMessages() error {
 	var query string
 	if i.options.Incremental {
 		// Incremental mode: only load messages not yet uploaded
-		query = `SELECT path, filename, hash, size, mailbox FROM messages WHERE s3_uploaded = 0 ORDER BY mailbox, path`
+		query = `SELECT path, filename, hash, size, mailbox, COALESCE(s3_uploaded, 0) = 1 FROM messages WHERE s3_uploaded = 0 ORDER BY mailbox, path`
 	} else {
 		// Non-incremental mode: load all messages
-		query = `SELECT path, filename, hash, size, mailbox FROM messages ORDER BY mailbox, path`
+		query = `SELECT path, filename, hash, size, mailbox, COALESCE(s3_uploaded, 0) = 1 FROM messages ORDER BY mailbox, path`
 	}
 
 	rows, err := i.sqliteDB.Query(query)
@@ -2531,7 +2527,7 @@ func (i *Importer) importMessages() error {
 	for rows.Next() {
 		var msg msgInfo
 		if err := rows.Scan(&msg.path, &msg.filename, &msg.hash,
-			&msg.size, &msg.mailbox); err != nil {
+			&msg.size, &msg.mailbox, &msg.imported); err != nil {
 			logger.Info("Failed to scan row", "error", err)
 			continue
 		}
@@ -2592,13 +2588,6 @@ func (i *Importer) getProgressPrefix() string {
 	percentage := float64(processed) * 100.0 / float64(total)
 
 	return fmt.Sprintf("[%d/%d %.1f%%]", processed, total, percentage)
-}
-
-// hashBytes is hashFile for bytes already in memory: the same SHA-256 hex digest over
-// the (decompressed) message content.
-func hashBytes(content []byte) string {
-	sum := sha256.Sum256(content)
-	return hex.EncodeToString(sum[:])
 }
 
 // parseKeywordsFile reads one dovecot-keywords file ("<index> <keyword>" per line,
