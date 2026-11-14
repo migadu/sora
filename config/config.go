@@ -546,23 +546,33 @@ type AuthRateLimiterConfig struct {
 	ExemptNetworks []string `toml:"exempt_networks,omitempty"`
 }
 
-// Validate rejects negative counts, durations and multipliers. Zero means "use the
-// default" (see applyAuthRateLimitDefaults); a negative value has no meaning, and the
-// limiter does not read it consistently (max_attempts_per_ip = -1 blocked an address
-// at its first failure on one path and disabled the IP block on another).
+// Validate rejects negative counts, durations and multipliers, and a NaN or infinite
+// multiplier. Zero means "use the default" (see applyAuthRateLimitDefaults); a negative
+// value has no meaning, and the limiter does not read it consistently
+// (max_attempts_per_ip = -1 blocked an address at its first failure on one path and
+// disabled the IP block on another). TOML accepts nan and inf, which pass a sign check;
+// the limiter converts the multiplied delay to a time.Duration before capping it at
+// max_delay, and that conversion is platform-dependent for them (on amd64 +Inf becomes
+// a negative delay, which switches progressive delays off).
 func (c *AuthRateLimiterConfig) Validate() error {
 	v := reflect.ValueOf(c).Elem()
 	for i := 0; i < v.NumField(); i++ {
 		f := v.Field(i)
-		negative := false
-		switch f.Kind() {
-		case reflect.Int, reflect.Int64: // int counts and time.Duration
-			negative = f.Int() < 0
-		case reflect.Float64:
-			negative = f.Float() < 0
+		problem := ""
+		switch {
+		case f.CanInt(): // int counts and time.Duration
+			if f.Int() < 0 {
+				problem = "must not be negative"
+			}
+		case f.CanFloat():
+			if x := f.Float(); math.IsNaN(x) || math.IsInf(x, 0) {
+				problem = "must be a finite number"
+			} else if x < 0 {
+				problem = "must not be negative"
+			}
 		}
-		if negative {
-			return fmt.Errorf("auth_rate_limit.%s must not be negative, got %v", tomlKey(v.Type().Field(i)), f.Interface())
+		if problem != "" {
+			return fmt.Errorf("auth_rate_limit.%s %s, got %v", tomlKey(v.Type().Field(i)), problem, f.Interface())
 		}
 	}
 	return nil

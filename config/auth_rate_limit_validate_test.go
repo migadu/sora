@@ -73,3 +73,23 @@ func TestAuthRateLimitValidValuesAccepted(t *testing.T) {
 		}
 	}
 }
+
+// TOML allows nan and inf, and both pass a "not negative" check. Neither is a
+// multiplier: the limiter converts LastDelay*delay_multiplier to a time.Duration
+// before capping it at max_delay, and on amd64 that conversion turns +Inf into the
+// minimum int64, a negative delay that switches progressive delays off.
+func TestAuthRateLimitNonFiniteMultiplierRejected(t *testing.T) {
+	for _, value := range []string{"nan", "inf", "+inf", "-inf"} {
+		for _, enabled := range []string{"true", "false"} {
+			s := decodeAuthRateLimitServer(t, "enabled = "+enabled+"\ndelay_multiplier = "+value+"\n")
+			err := s.Validate()
+			if err == nil {
+				t.Errorf("enabled = %s, delay_multiplier = %s: accepted", enabled, value)
+				continue
+			}
+			if !strings.Contains(err.Error(), "delay_multiplier") {
+				t.Errorf("delay_multiplier = %s: error %q does not name the key", value, err)
+			}
+		}
+	}
+}
