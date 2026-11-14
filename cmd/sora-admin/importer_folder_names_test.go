@@ -64,3 +64,24 @@ func TestEncodedPrintableASCIIIsNotDecoded(t *testing.T) {
 	_, err = decodeMailboxLevelUTF7("Parent/a&AC8-b")
 	assert.Error(t, err)
 }
+
+// TestUndecodableLevelStaysBelowDecodedParent: a folder level that is not valid
+// modified UTF-7 keeps its raw name, but the levels above it are still decoded. The
+// parent folder ".Donn&AOk-es" is imported as "Données", so its child must be named
+// below it; keeping the whole raw name put the child below a second, auto-created
+// "Donn&AOk-es" that no folder of the maildir names.
+func TestUndecodableLevelStaysBelowDecodedParent(t *testing.T) {
+	parent, err := importedFolderName("Donn&AOk-es")
+	require.NoError(t, err)
+	require.Equal(t, "Données", parent)
+
+	for _, tc := range []struct{ raw, want string }{
+		{"Donn&AOk-es/a&AC8-b", "Données/a&AC8-b"}, // encoded '/'
+		{"Donn&AOk-es/&2AA-", "Données/&2AA-"},     // lone surrogate
+		{"Donn&AOk-es/R&D/&APw-bersicht", "Données/R&D/übersicht"},
+	} {
+		name, err := importedFolderName(tc.raw)
+		require.NoError(t, err, tc.raw)
+		assert.Equal(t, tc.want, name, tc.raw)
+	}
+}
