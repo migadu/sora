@@ -62,6 +62,20 @@ func evalRedirect(t *testing.T, target string, vacOracle VacationOracle, redirec
 	return res
 }
 
+// relayAll charges every redirect address as delivery does once it has queued or
+// sent each one.
+func relayAll(t *testing.T, res Result) {
+	t.Helper()
+	if res.RecordRedirect == nil {
+		return
+	}
+	for range res.RedirectTo {
+		if err := res.RecordRedirect(context.Background()); err != nil {
+			t.Fatalf("RecordRedirect: %v", err)
+		}
+	}
+}
+
 // (3) Address validation: malformed / multiple / empty targets must be denied and
 // the message kept; a single valid address still relays (no over-blocking).
 func TestRedirectTargetValidation(t *testing.T) {
@@ -127,6 +141,7 @@ func TestRedirectRateLimit(t *testing.T) {
 		if res.Action != ActionRedirect {
 			t.Fatalf("expected redirect under the limit, got %s", res.Action)
 		}
+		relayAll(t, res)
 		if ro.recordedN != 1 {
 			t.Errorf("expected exactly 1 RecordRedirect call, got %d", ro.recordedN)
 		}
@@ -157,6 +172,9 @@ func TestRedirectRateLimit(t *testing.T) {
 		if res.Action != ActionRedirect {
 			t.Fatalf("expected redirect with limit 0 (unlimited), got %s", res.Action)
 		}
+		if res.RecordRedirect != nil {
+			t.Errorf("disabled limit must leave nothing to charge")
+		}
 		if ro.recordedN != 0 {
 			t.Errorf("disabled limit must not touch the oracle, got %d records", ro.recordedN)
 		}
@@ -166,6 +184,9 @@ func TestRedirectRateLimit(t *testing.T) {
 		res := evalRedirect(t, "forward@example.com", newMockVacationOracle(), nil, 100, time.Hour, cleanRedirectCtx())
 		if res.Action != ActionRedirect {
 			t.Fatalf("expected redirect with nil oracle (unlimited), got %s", res.Action)
+		}
+		if res.RecordRedirect != nil {
+			t.Errorf("nil oracle must leave nothing to charge")
 		}
 	})
 
@@ -193,7 +214,8 @@ func evalRedirectScript(t *testing.T, script string, ro RedirectOracle, limit in
 }
 
 // The rate limit is charged for the redirects delivery is asked to make (#230),
-// not for every redirect command the script happened to run.
+// not for every redirect command the script happened to run. relayAll stands in
+// for a delivery that relays every address it is given.
 func TestRedirectRateLimitChargesWhatIsRelayed(t *testing.T) {
 	t.Run("redirect cancelled by fileinto is not charged", func(t *testing.T) {
 		ro := &configurableRedirectOracle{}
@@ -205,6 +227,7 @@ func TestRedirectRateLimitChargesWhatIsRelayed(t *testing.T) {
 		if res.Action != ActionFileInto {
 			t.Fatalf("expected fileinto, got %s", res.Action)
 		}
+		relayAll(t, res)
 		if ro.recordedN != 0 {
 			t.Errorf("no redirect is relayed, but %d were charged", ro.recordedN)
 		}
@@ -219,6 +242,7 @@ func TestRedirectRateLimitChargesWhatIsRelayed(t *testing.T) {
 		if res.Action != ActionRedirect {
 			t.Fatalf("expected redirect, got %s", res.Action)
 		}
+		relayAll(t, res)
 		if ro.recordedN != 1 {
 			t.Errorf("one address is relayed, but %d redirects were charged", ro.recordedN)
 		}
@@ -239,6 +263,7 @@ func TestRedirectRateLimitChargesWhatIsRelayed(t *testing.T) {
 		if res.Action != ActionKeep {
 			t.Fatalf("expected keep after a failed script, got %s", res.Action)
 		}
+		relayAll(t, res)
 		if ro.recordedN != 0 {
 			t.Errorf("nothing is relayed, but %d redirects were charged", ro.recordedN)
 		}
@@ -329,6 +354,7 @@ func TestMultipleRedirects(t *testing.T) {
 			if res.Copy != tt.wantCopy {
 				t.Errorf("Copy = %v, want %v", res.Copy, tt.wantCopy)
 			}
+			relayAll(t, res)
 			if ro.recorded != tt.wantRecorded {
 				t.Errorf("charged %d redirects, want %d", ro.recorded, tt.wantRecorded)
 			}
@@ -351,5 +377,9 @@ func TestEvaluateDoesNotChargeRedirects(t *testing.T) {
 	}
 	if ro.recorded != 0 {
 		t.Errorf("evaluation charged %d redirects before any was relayed", ro.recorded)
+	}
+	relayAll(t, res)
+	if ro.recorded != 2 {
+		t.Errorf("delivery relayed 2 redirects, but %d were charged", ro.recorded)
 	}
 }

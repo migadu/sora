@@ -2401,6 +2401,12 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		redirectRateWindow = time.Hour
 	}
 
+	// A nil *relayqueue.Worker must stay a nil interface, not one holding a nil pointer.
+	var relayWorker adminapi.RelayWorkerNotifier
+	if deps.relayWorker != nil {
+		relayWorker = deps.relayWorker
+	}
+
 	return adminapi.ServerOptions{
 		Name:               serverConfig.Name,
 		Addr:               serverConfig.Addr,
@@ -2412,6 +2418,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		Storage:            deps.storage,
 		PurgeWorker:        deps.purgeWorker,
 		RelayQueue:         deps.relayQueue, // Global relay queue
+		RelayWorker:        relayWorker,     // woken for redirects and vacation replies, as on LMTP
 		MaxMessageSize:     serverConfig.GetMaxMessageSizeWithDefault(),
 		MaxConnections:     serverConfig.MaxConnections,
 		TLS:                serverConfig.TLS,

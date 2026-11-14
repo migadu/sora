@@ -82,6 +82,7 @@ type StandardSieveExecutor struct {
 	VacationHandler    VacationHandler
 	RelayHandler       RelayHandler
 	RelayQueue         RelayQueue // Optional: disk-based queue for relay retry
+	RelayNotify        func()     // Optional: wakes the relay worker after a redirect is enqueued
 	RedirectRateLimit  int
 	RedirectRateWindow time.Duration
 	MaxRedirectHops    int
@@ -227,12 +228,8 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 			from := recipient.FromAddress.FullAddress()
 			relayed := s.RelayQueue != nil || s.RelayHandler != nil
 			for _, redirectTo := range result.RedirectTo {
-				// Try immediate delivery first if queue is not configured
-				if s.RelayQueue == nil && s.RelayHandler != nil {
-					if err := s.RelayHandler.SendToExternalRelay(from, redirectTo, relayBytes); err != nil {
-						relayed = false
-					}
-				} else if s.RelayQueue != nil {
+				switch {
+				case s.RelayQueue != nil:
 					// Queue for background delivery with retry
 					if err := s.RelayQueue.Enqueue(from, redirectTo, "redirect", relayBytes); err != nil {
 						// Failed to enqueue: keep the message in INBOX rather than fail the
@@ -242,6 +239,25 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 						logger.Warn("Sieve redirect could not be queued; message kept in INBOX instead",
 							"account_id", recipient.AccountID, "redirect_to", redirectTo, "error", err)
 						relayed = false
+						continue
+					}
+					if s.RelayNotify != nil {
+						s.RelayNotify()
+					}
+				case s.RelayHandler != nil:
+					// No queue: relay immediately
+					if err := s.RelayHandler.SendToExternalRelay(from, redirectTo, relayBytes); err != nil {
+						relayed = false
+						continue
+					}
+				default:
+					continue // no relay at all; relayed is false
+				}
+				// Only a redirect that was queued or sent counts against the rate limit.
+				if result.RecordRedirect != nil {
+					if err := result.RecordRedirect(ctx); err != nil {
+						logger.Warn("Sieve redirect could not be charged against the rate limit",
+							"account_id", recipient.AccountID, "redirect_to", redirectTo, "error", err)
 					}
 				}
 			}

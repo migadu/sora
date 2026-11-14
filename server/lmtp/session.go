@@ -984,6 +984,12 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 					continue
 				}
 				s.DebugLog("successfully queued message for relay delivery", "redirect_to", redirectTo)
+				// Only a queued redirect counts against the rate limit.
+				if result.RecordRedirect != nil {
+					if err := result.RecordRedirect(ctx); err != nil {
+						s.WarnLog("failed to charge redirect against the rate limit", "redirect_to", redirectTo, "error", err)
+					}
+				}
 			}
 			if relayed {
 				// If :copy is not specified and every relay succeeded, we don't store the message locally
