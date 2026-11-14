@@ -796,7 +796,7 @@ max_total_size = 1048576       # Maximum total metadata size per account (1MB). 
 
 [shared_mailboxes]
 enabled = false                  # Enable shared mailbox functionality (default: false)
-namespace_prefix = "Shared/"     # IMAP namespace prefix for shared mailboxes (e.g., "Shared/" or "#shared/")
+namespace_prefix = "Shared/"     # IMAP namespace prefix for shared mailboxes (e.g., "Shared/" or "#shared/"); must end with "/"
 allow_user_create = false        # Allow users to create shared mailboxes over IMAP (false = admin-only: sora-admin mailbox create)
 allow_anyone_identifier = false  # Allow granting rights to "anyone" (every user in the owner's domain); existing grants stay until revoked
 default_rights = "lrswipkxtea"   # Default ACL rights for shared mailbox creators (full rights by default)
