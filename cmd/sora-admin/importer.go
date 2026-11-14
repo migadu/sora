@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -32,6 +31,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/pkg/sqlitefile"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/sieveengine"
 	_ "modernc.org/sqlite"
@@ -177,19 +177,6 @@ type Importer struct {
 // database is waited for up to 5 seconds.
 const maildirCacheParams = "_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL"
 
-// sqliteFileDSN returns the DSN that opens the SQLite database at path with params: a
-// file: URI of the absolute path. modernc.org/sqlite cuts any other DSN at its first
-// '?' and reads the rest as parameters, so a plain path with a '?' in it would open a
-// different file. In the URI the path is percent-encoded and SQLite decodes it, so a
-// '?', '#' or '%' in it stays part of the file name.
-func sqliteFileDSN(path, params string) (string, error) {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve database path %s: %w", path, err)
-	}
-	return (&url.URL{Scheme: "file", Path: absPath, RawQuery: params}).String(), nil
-}
-
 // NewImporter creates a new Importer instance.
 func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ImporterOptions) (*Importer, error) {
 	// Always create SQLite database in the maildir path to persist maildir state
@@ -201,7 +188,7 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		logger.Info("Incremental mode disabled - will read all files (database still created for tracking)", "path", dbPath)
 	}
 
-	dsn, err := sqliteFileDSN(dbPath, maildirCacheParams)
+	dsn, err := sqlitefile.DSN(dbPath, maildirCacheParams)
 	if err != nil {
 		return nil, err
 	}
