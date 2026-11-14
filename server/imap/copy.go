@@ -103,11 +103,12 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	}
 
 	// ensureDestObject makes the body readable under the destination owner's S3 path.
-	// It runs under GetS3ObjectLockID(destination account, hash), the lock the cleaner
-	// holds while it re-checks that nothing references an object and deletes it: without
-	// it, an object whose only rows for this account are expunged can be deleted between
-	// the existence check and the copy, and the new message row would point at nothing
-	// (the 404 NoSuchKey hazard the APPEND dedup and IsContentHashUploaded describe).
+	// It runs under the body's S3 object lock (GetS3ObjectLockID, one per content hash
+	// whatever the account), the lock the cleaner holds while it re-checks that nothing
+	// references an object and deletes it: without it, an object whose only rows for this
+	// account are expunged can be deleted between the existence check and the copy, and
+	// the new message row would point at nothing (the 404 NoSuchKey hazard the APPEND
+	// dedup and IsContentHashUploaded describe).
 	ensureDestObject := func(contentHash, sourceKey, destKey string) error {
 		return s.server.rdb.ExecuteWithS3ObjectLock(ctx, contentHash, destMailbox.AccountID, func(ctx context.Context) error {
 			exists, err := s.server.s3.ExistsWithRetry(ctx, destKey)

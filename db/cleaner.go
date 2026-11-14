@@ -53,10 +53,12 @@ func (d *Database) ReleaseCleanupLock(ctx context.Context, tx pgx.Tx) error {
 
 // GetS3ObjectLockID returns the advisory lock of the stored bodies with this content hash.
 // Every S3 delete holds it across its reference re-check and the delete (the cleaner and
-// the account purge, sora-admin import rekey), and everything that makes a row point at
-// the object or writes it takes it first (the uploader's write gate, restore,
-// cross-account COPY, rekey's new object), so a claim is either seen by the re-check or
-// made after the delete.
+// the account purge, sora-admin import rekey), and these claims take it before they make
+// a row point at the object or write it: the uploader's write gate, restore,
+// cross-account COPY, rekey's new object. Such a claim is either seen by the re-check or
+// made after the delete. Cross-account MOVE (#744) and sora-admin import maildir/s3
+// (#788) do not take it yet, and the cleaner's re-check looks only at the candidate's
+// own account (#776).
 //
 // The account does not enter the lock. An object is <s3_domain>/<s3_localpart>/<hash>,
 // keyed by the address a row's account had when the row was written, so rows of
