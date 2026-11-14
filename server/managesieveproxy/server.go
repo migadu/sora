@@ -197,7 +197,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Initialize remotelookup client if configured
-	routingLookup, err := proxy.InitializeRemoteLookup("managesieve", opts.RemoteLookup)
+	routingLookup, err := proxy.InitializeRemoteLookup("managesieve", opts.RemoteLookup, opts.RemotePort)
 	if err != nil {
 		logger.Debug("ManageSieve Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
 		if opts.RemoteLookup != nil && !opts.RemoteLookup.ShouldLookupLocalUsers() {
@@ -318,10 +318,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			logger.Info("ManageSieve Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", opts.Name, "error", err)
 			cleanupInterval = 5 * time.Minute
 		}
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize <= 0 {
-			maxSize = 10000
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// Parse positive revalidation window from config (used for password change detection)
 		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()

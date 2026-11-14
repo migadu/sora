@@ -212,14 +212,11 @@ func (hi *HealthIntegration) RegisterRemoteLookupCheck(remotelookupClient Remote
 	}
 	hi.monitor.RegisterCheck(remotelookupCheck)
 
-	// If the client has a circuit breaker, register it too
+	// If the client has a circuit breaker, register it too, as
+	// circuit_breaker_<checkName> (RegisterCircuitBreakerCheck adds the prefix)
 	if clientWithBreaker, ok := remotelookupClient.(RemoteLookupWithCircuitBreaker); ok {
 		if breaker := clientWithBreaker.GetCircuitBreaker(); breaker != nil {
-			cbName := "remotelookup_http_circuit_breaker"
-			if serverName != "" {
-				cbName = fmt.Sprintf("remotelookup_http_circuit_breaker_%s", serverName)
-			}
-			hi.RegisterCircuitBreakerCheck(cbName, breaker)
+			hi.RegisterCircuitBreakerCheck(checkName, breaker)
 		}
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/circuitbreaker"
+	"github.com/migadu/sora/server"
 )
 
 // TestDatabaseBreakerIsSuccessful pins down which errors the database circuit breakers
@@ -30,6 +31,7 @@ import (
 func TestDatabaseBreakerIsSuccessful(t *testing.T) {
 	imapUnavailable := &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeUnavailable, Text: "Message body temporarily unavailable, please retry"}
 	imapServerBug := &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeServerBug, Text: "boom"}
+	_, badAddress := server.NewAddress("not-an-address")
 
 	tests := []struct {
 		name    string
@@ -50,6 +52,7 @@ func TestDatabaseBreakerIsSuccessful(t *testing.T) {
 		{"pgx.ErrNoRows", pgx.ErrNoRows, false},
 		{"pgx.ErrNoRows wrapped", fmt.Errorf("lookup: %w", pgx.ErrNoRows), false},
 		{"search result limit", db.ErrSearchTooManyResults, false},
+		{"address that does not parse", fmt.Errorf("invalid email address: %w", badAddress), false},
 		{"wrapped search result limit", fmt.Errorf("search: %w", db.ErrSearchTooManyResults), false},
 		{"ErrDBUniqueViolation", consts.ErrDBUniqueViolation, false},
 		{"pg deadlock 40P01", &pgconn.PgError{Code: "40P01"}, false},

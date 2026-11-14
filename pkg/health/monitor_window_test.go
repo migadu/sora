@@ -50,8 +50,8 @@ func TestSustainedOutageIsReportedUnhealthy(t *testing.T) {
 	hm := NewHealthMonitor()
 	hm.RegisterCheck(check)
 
-	// Start() is required: performCheck derives its per-check context from
-	// hm.ctx. Started with a long interval, the background ticker never fires
+	// Start() is required: the test runs performCheck under the monitor's
+	// context, hm.ctx. Started with a long interval, the background ticker never fires
 	// during the test.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -60,7 +60,7 @@ func TestSustainedOutageIsReportedUnhealthy(t *testing.T) {
 
 	// Phase 1: a long, healthy life.
 	for i := 0; i < healthyChecks; i++ {
-		hm.performCheck(check)
+		hm.performCheck(hm.ctx, check)
 	}
 	if status, _ := hm.GetCheckStatus(componentName); status != StatusHealthy {
 		t.Fatalf("setup: after %d successful checks status = %q, want %q",
@@ -70,7 +70,7 @@ func TestSustainedOutageIsReportedUnhealthy(t *testing.T) {
 	// Phase 2: the backend dies completely. Every subsequent check fails.
 	failing.Store(true)
 	for i := 0; i < outageChecks; i++ {
-		hm.performCheck(check)
+		hm.performCheck(hm.ctx, check)
 	}
 
 	status, ok := hm.GetCheckStatus(componentName)
@@ -159,7 +159,7 @@ func TestBootTimeOutageIsReportedUnhealthyImmediately(t *testing.T) {
 
 	// Every check from the very first one fails: the component has never worked.
 	for i := 1; i <= unhealthyConsecutiveFailures; i++ {
-		hm.performCheck(check)
+		hm.performCheck(hm.ctx, check)
 
 		status, _ := hm.GetCheckStatus(componentName)
 		overall := hm.GetOverallStatus()
@@ -192,7 +192,7 @@ func TestBlipAfterHealthyHistoryDoesNotEscalate(t *testing.T) {
 	hm, check := newFailingCheck(t, componentName, &failing)
 
 	for i := 0; i < 50; i++ {
-		hm.performCheck(check)
+		hm.performCheck(hm.ctx, check)
 	}
 	if status, _ := hm.GetCheckStatus(componentName); status != StatusHealthy {
 		t.Fatalf("setup: status = %q after 50 successful checks, want %q", status, StatusHealthy)
@@ -200,14 +200,14 @@ func TestBlipAfterHealthyHistoryDoesNotEscalate(t *testing.T) {
 
 	// A single blip, then immediate recovery.
 	failing.Store(true)
-	hm.performCheck(check)
+	hm.performCheck(hm.ctx, check)
 	if status, _ := hm.GetCheckStatus(componentName); status != StatusDegraded {
 		t.Errorf("status = %q after ONE failed check following a long healthy run, want %q",
 			status, StatusDegraded)
 	}
 
 	failing.Store(false)
-	hm.performCheck(check)
+	hm.performCheck(hm.ctx, check)
 	if status, _ := hm.GetCheckStatus(componentName); status != StatusHealthy {
 		t.Errorf("status = %q after the component recovered from a single blip, want %q",
 			status, StatusHealthy)
@@ -215,14 +215,14 @@ func TestBlipAfterHealthyHistoryDoesNotEscalate(t *testing.T) {
 
 	// Two consecutive failures are still not enough evidence.
 	failing.Store(true)
-	hm.performCheck(check)
-	hm.performCheck(check)
+	hm.performCheck(hm.ctx, check)
+	hm.performCheck(hm.ctx, check)
 	if status, _ := hm.GetCheckStatus(componentName); status != StatusDegraded {
 		t.Errorf("status = %q after %d consecutive failures following a healthy run, want %q",
 			status, unhealthyConsecutiveFailures-1, StatusDegraded)
 	}
 
-	hm.performCheck(check)
+	hm.performCheck(hm.ctx, check)
 	if status, _ := hm.GetCheckStatus(componentName); status != StatusUnhealthy {
 		t.Errorf("status = %q after %d consecutive failures, want %q",
 			status, unhealthyConsecutiveFailures, StatusUnhealthy)
@@ -240,13 +240,13 @@ func TestRecoveryAfterBootTimeOutageRestoresDebounce(t *testing.T) {
 
 	hm, check := newFailingCheck(t, componentName, &failing)
 
-	hm.performCheck(check)
+	hm.performCheck(hm.ctx, check)
 	if status, _ := hm.GetCheckStatus(componentName); status != StatusUnhealthy {
 		t.Fatalf("setup: status = %q on a component that never succeeded, want %q", status, StatusUnhealthy)
 	}
 
 	failing.Store(false)
-	hm.performCheck(check)
+	hm.performCheck(hm.ctx, check)
 	if status, _ := hm.GetCheckStatus(componentName); status != StatusHealthy {
 		t.Fatalf("status = %q after the component finally came up, want %q", status, StatusHealthy)
 	}
@@ -255,7 +255,7 @@ func TestRecoveryAfterBootTimeOutageRestoresDebounce(t *testing.T) {
 	}
 
 	failing.Store(true)
-	hm.performCheck(check)
+	hm.performCheck(hm.ctx, check)
 	if status, _ := hm.GetCheckStatus(componentName); status != StatusDegraded {
 		t.Errorf("status = %q after a single failure following recovery, want %q; a component that has\n"+
 			"  proven it works must be debounced like any other", status, StatusDegraded)
