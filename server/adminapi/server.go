@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -2010,7 +2009,6 @@ func (s *Server) handleAuthBlocked(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Request) {
 	// Extract email from path: /admin/accounts/{email}/messages/deleted
 	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/messages/deleted")
-	email, _ = url.QueryUnescape(email) // Decode URL-encoded characters
 	ctx := r.Context()
 
 	// Parse query parameters
@@ -2085,7 +2083,6 @@ func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	// Extract email from path: /admin/accounts/{email}/messages/restore
 	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/messages/restore")
-	email, _ = url.QueryUnescape(email) // Decode URL-encoded characters
 	ctx := r.Context()
 
 	var req struct {
