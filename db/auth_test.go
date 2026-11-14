@@ -5,6 +5,7 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -389,9 +390,11 @@ func TestPasswordEdgeCases(t *testing.T) {
 	t.Run("very long password", func(t *testing.T) {
 		longPassword := strings.Repeat("a", 1000)
 		_, err := GenerateBcryptHash(longPassword)
-		// bcrypt has a 72-byte limit, so this should fail
+		// bcrypt has a 72-byte limit, so this should fail, as a request error
+		// (the caller's 400), not as a failure of the server
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "password length exceeds 72 bytes")
+		assert.ErrorIs(t, err, ErrInvalidAccountRequest)
 	})
 
 	t.Run("unicode password", func(t *testing.T) {
@@ -415,6 +418,65 @@ func TestPasswordEdgeCases(t *testing.T) {
 		for _, hash := range malformedHashes {
 			err := VerifyPassword(hash, "password")
 			assert.Error(t, err, "Hash: %s", hash)
+		}
+	})
+}
+
+// TestVerifyPasswordMismatchIsErrInvalidCredentials pins that a wrong password is
+// reported as ErrInvalidCredentials whatever scheme the stored hash uses, and that
+// a hash which cannot be checked at all is not. The proxies decide on this whether
+// a failed login is definitive (cached, logged as invalid_password) or a fault: an
+// SSHA512/SHA512 mismatch used to be a bare "invalid password" error that they took
+// for a transient database error (#342).
+func TestVerifyPasswordMismatchIsErrInvalidCredentials(t *testing.T) {
+	const password = "testPassword123"
+
+	bcryptHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	require.NoError(t, err)
+	ssha512B64, err := GenerateSSHA512Hash(password)
+	require.NoError(t, err)
+	ssha512Hex, err := GenerateSSHA512HashHex(password)
+	require.NoError(t, err)
+
+	schemes := []struct {
+		name string
+		hash string
+	}{
+		{"bcrypt", string(bcryptHash)},
+		{"BLF-CRYPT", blfCryptPrefix + string(bcryptHash)},
+		{"SSHA512", ssha512B64},
+		{"SSHA512.HEX", ssha512Hex},
+		{"SHA512", GenerateSHA512Hash(password)},
+		{"SHA512.HEX", GenerateSHA512HashHex(password)},
+	}
+	for _, s := range schemes {
+		t.Run(s.name, func(t *testing.T) {
+			require.NoError(t, VerifyPassword(s.hash, password))
+
+			err := VerifyPassword(s.hash, "wrongPassword")
+			if !errors.Is(err, ErrInvalidCredentials) {
+				t.Fatalf("VerifyPassword with a wrong password = %v, want an error matching ErrInvalidCredentials", err)
+			}
+		})
+	}
+
+	t.Run("bcrypt keeps its own sentinel", func(t *testing.T) {
+		err := VerifyPassword(string(bcryptHash), "wrongPassword")
+		assert.ErrorIs(t, err, bcrypt.ErrMismatchedHashAndPassword)
+	})
+
+	t.Run("unverifiable hash is not a mismatch", func(t *testing.T) {
+		for _, hash := range []string{
+			"{INVALID}hash",
+			"{SHA512}invalidbase64!@#",
+			"{SSHA512}tooshort",
+			"$2a$invalidcost$hash",
+			"",
+		} {
+			err := VerifyPassword(hash, password)
+			if err == nil || errors.Is(err, ErrInvalidCredentials) {
+				t.Errorf("VerifyPassword(%q) = %v, want a non-nil error that is not ErrInvalidCredentials", hash, err)
+			}
 		}
 	})
 }

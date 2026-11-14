@@ -148,6 +148,28 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 			},
 			wantWarnings: []string{"remote_use_id_command", "IMAP proxy"},
 		},
+		{
+			// The metrics endpoint does not read PROXY headers (#272).
+			name: "metrics with proxy_protocol",
+			serverConfig: ServerConfig{
+				Type:          "metrics",
+				Name:          "metrics-test",
+				Addr:          ":9090",
+				ProxyProtocol: true,
+			},
+			wantWarnings: []string{"proxy_protocol", "metrics"},
+		},
+		{
+			name: "IMAP proxy with proxy_protocol",
+			serverConfig: ServerConfig{
+				Type:          "imap_proxy",
+				Name:          "imap-proxy-test",
+				Addr:          ":143",
+				RemoteAddrs:   []string{"backend1:143"},
+				ProxyProtocol: true,
+			},
+			wantWarnings: nil,
+		},
 	}
 
 	for _, tt := range tests {

@@ -212,23 +212,31 @@ List all mailboxes with message counts and metadata.
       "name": "INBOX",
       "path": "INBOX",
       "subscribed": true,
-      "total_messages": 142,
-      "unseen_messages": 5,
-      "uidvalidity": 1234567890,
-      "uidnext": 143
+      "total": 142,
+      "unseen": 5,
+      "uid_next": 143,
+      "uid_validity": 1234567890
     },
     {
       "name": "Sent",
       "path": "Sent",
       "subscribed": true,
-      "total_messages": 87,
-      "unseen_messages": 0,
-      "uidvalidity": 1234567891,
-      "uidnext": 88
+      "total": 87,
+      "unseen": 0,
+      "uid_next": 88,
+      "uid_validity": 1234567891
     }
-  ]
+  ],
+  "count": 2
 }
 ```
+
+`total`, `unseen`, `uid_next` and `uid_validity` are what IMAP STATUS reports as
+MESSAGES, UNSEEN, UIDNEXT and UIDVALIDITY. `uid_next` is the UID the next message
+added to the mailbox will get; it changes whenever a message is added, even one
+expunged afterwards, so a client can poll it to notice new mail while `uid_validity`
+stays the same. All four are 0 for a shared mailbox you may list but not read (ACL
+right `l` without `r`).
 
 **Example:**
 ```bash
@@ -274,7 +282,7 @@ curl -X POST http://localhost:8081/user/mailboxes \
 **Notes:**
 - Use `/` separator for hierarchical mailboxes
 - Mailbox names are case-sensitive
-- Special characters should be URL-encoded in paths
+- In a path, percent-encode special characters in a name once (RFC 3986): `/` as `%2F`, a space as `%20`, `%` as `%25`. A `+` is a plus sign, not a space
 
 **Errors:**
 - `400 Bad Request` - Invalid mailbox name
@@ -332,6 +340,9 @@ curl -X POST http://localhost:8081/user/mailboxes/Archive/subscribe \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
+**Errors:**
+- `404 Not Found` - Mailbox does not exist
+
 #### Unsubscribe from Mailbox
 
 **Endpoint:** `POST /user/mailboxes/{name}/unsubscribe`
@@ -350,6 +361,9 @@ Mark a mailbox as unsubscribed.
 curl -X POST http://localhost:8081/user/mailboxes/Spam/unsubscribe \
   -H "Authorization: Bearer your-jwt-token"
 ```
+
+**Errors:**
+- `404 Not Found` - Mailbox does not exist
 
 ### Message Operations
 
@@ -578,6 +592,12 @@ curl -X PATCH http://localhost:8081/user/messages/12345 \
   }'
 ```
 
+In a mailbox shared with you, each flag needs its ACL right, as with IMAP `STORE`
+(RFC 4314 §4): `s` for `\Seen`, `t` for `\Deleted`, `w` for every other flag and
+keyword. Flags you may not change are left as they are; if that is all of them the
+answer is `403 Forbidden`. A message in a shared mailbox you cannot read (`r`) is
+`404 Not Found`, as are the `GET` endpoints for it.
+
 #### Delete Message
 
 **Endpoint:** `DELETE /user/messages/{id}`
@@ -598,6 +618,8 @@ curl -X DELETE http://localhost:8081/user/messages/12345 \
 ```
 
 **Note:** Messages are soft-deleted and can be restored within the grace period using the Admin API.
+
+In a mailbox shared with you this needs the `t` right (`403 Forbidden` without it).
 
 ### Search
 
@@ -747,6 +769,9 @@ Create a new filter or update an existing one.
 - `400 Bad Request` - Invalid script name, or the script does not compile against the
   extensions reported by `GET /user/filters/capabilities` (the error says why). A script
   that does not compile is never stored: delivery would skip it whole.
+- `409 Conflict` - A new script would exceed the per-account limit of 100 scripts
+  (ManageSieve answers `NO (QUOTA/MAXSCRIPTS)`); delete one first. Updating an existing
+  script is not affected.
 - `413 Request Entity Too Large` - Script exceeds `max_script_size`
 
 **Example:**

@@ -28,6 +28,8 @@ const (
 	// failures are intermittent rather than consecutive.
 	unhealthyFailureRate = 0.5
 	recentOutcomeWindow  = 10
+	// Refresh stable health_status rows so retention only removes stopped nodes.
+	statusReportEvery = 20
 )
 
 // failureWindow is a ring of the most recent check outcomes.
@@ -84,9 +86,13 @@ type HealthCheck struct {
 
 	// CheckCount and FailCount are lifetime totals reported to operators; the
 	// status is derived from these recent-outcome fields instead.
-	consecutiveFails int
-	recent           failureWindow
-	everSucceeded    bool
+	consecutiveFails  int
+	recent            failureWindow
+	everSucceeded     bool
+	checksSinceReport int
+
+	// stop ends the goroutine running this check. Set and called under HealthMonitor.mu.
+	stop context.CancelFunc
 }
 
 type HealthMonitor struct {
@@ -106,6 +112,9 @@ func NewHealthMonitor() *HealthMonitor {
 	}
 }
 
+// RegisterCheck adds a check, replacing any check of the same name. On a running
+// monitor the check starts at once: the proxies register theirs (remote lookup) while
+// they start, after Start.
 func (hm *HealthMonitor) RegisterCheck(check *HealthCheck) {
 	if check.Interval == 0 {
 		check.Interval = 30 * time.Second
@@ -117,10 +126,17 @@ func (hm *HealthMonitor) RegisterCheck(check *HealthCheck) {
 	check.Enabled = true
 
 	hm.mu.Lock()
+	defer hm.mu.Unlock()
+	if old, ok := hm.checks[check.Name]; ok && old.stop != nil {
+		old.stop()
+	}
 	hm.checks[check.Name] = check
-	hm.mu.Unlock()
+	if hm.ctx != nil {
+		hm.startCheckLocked(check)
+	}
 }
 
+// AddStatusCallback reports the first result, changes, and every 20 stable checks.
 func (hm *HealthMonitor) AddStatusCallback(callback func(name string, status ComponentStatus)) {
 	hm.mu.Lock()
 	hm.statusCallbacks = append(hm.statusCallbacks, callback)
@@ -128,24 +144,34 @@ func (hm *HealthMonitor) AddStatusCallback(callback func(name string, status Com
 }
 
 func (hm *HealthMonitor) Start(ctx context.Context) {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
 	hm.ctx, hm.cancel = context.WithCancel(ctx)
-
-	hm.mu.RLock()
 	for _, check := range hm.checks {
-		if check.Enabled {
-			go hm.runHealthCheck(check)
-		}
+		hm.startCheckLocked(check)
 	}
-	hm.mu.RUnlock()
+}
+
+// startCheckLocked runs check on its own goroutine until the monitor stops or the
+// check is replaced. hm.mu must be held.
+func (hm *HealthMonitor) startCheckLocked(check *HealthCheck) {
+	if !check.Enabled {
+		return
+	}
+	ctx, cancel := context.WithCancel(hm.ctx)
+	check.stop = cancel
+	go hm.runHealthCheck(ctx, check)
 }
 
 func (hm *HealthMonitor) Stop() {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
 	if hm.cancel != nil {
 		hm.cancel()
 	}
 }
 
-func (hm *HealthMonitor) runHealthCheck(check *HealthCheck) {
+func (hm *HealthMonitor) runHealthCheck(ctx context.Context, check *HealthCheck) {
 	ticker := time.NewTicker(check.Interval)
 	defer ticker.Stop()
 
@@ -155,48 +181,53 @@ func (hm *HealthMonitor) runHealthCheck(check *HealthCheck) {
 	// to allow the application to fully initialize and avoid context cancellation issues
 	for {
 		select {
-		case <-hm.ctx.Done():
+		case <-ctx.Done():
 			logger.Info("Health: Monitoring stopped due to context cancellation", "check", check.Name)
 			return
 		case <-ticker.C:
-			hm.performCheck(check)
+			hm.performCheck(ctx, check)
 		}
 	}
 }
 
-func (hm *HealthMonitor) performCheck(check *HealthCheck) {
-	// Recover from panics within a health check to prevent the monitor goroutine from crashing.
-	defer func() {
-		if r := recover(); r != nil {
-			// A panic is a critical failure, so we mark the component as unhealthy.
-			err := fmt.Errorf("panic: %v", r)
-			logger.Error("Health: PANIC during check for component", "component", check.Name, "error", err)
-
-			check.mu.Lock()
-			check.Status = StatusUnhealthy
-			check.LastError = err
-			check.mu.Unlock()
-
-			hm.notifyStatusChange(check.Name, StatusUnhealthy)
-			hm.updateOverallStatus()
-		}
-	}()
-
-	ctx, cancel := context.WithTimeout(hm.ctx, check.Timeout)
+// performCheck runs check once under runCtx, the context the check runs under. A run
+// whose runCtx ends meanwhile (the check was replaced, or the monitor stopped) is
+// discarded: the name may belong to a replacement by then, and "context canceled"
+// says nothing about the component.
+func (hm *HealthMonitor) performCheck(runCtx context.Context, check *HealthCheck) {
+	ctx, cancel := context.WithTimeout(runCtx, check.Timeout)
 	defer cancel()
 
 	// Time the health check
 	startTime := time.Now()
 
-	// Perform the actual check first (no lock needed)
-	err := check.Check(ctx)
+	// Only the supplied check runs under recovery; a panic follows the same
+	// cancellation and publication rules as an ordinary result.
+	err, panicked := func() (err error, panicked bool) {
+		defer func() {
+			if r := recover(); r != nil {
+				err, panicked = fmt.Errorf("panic: %v", r), true
+			}
+		}()
+		return check.Check(ctx), false
+	}()
+	duration := time.Since(startTime).Seconds()
+
+	// Registration and publication share the monitor lock. Acquire locks in
+	// the same order as updateOverallStatus, and check cancellation after both:
+	// this run may have been canceled while it waited to publish.
+	hm.mu.Lock()
+	check.mu.Lock()
+	if runCtx.Err() != nil || hm.checks[check.Name] != check {
+		check.mu.Unlock()
+		hm.mu.Unlock()
+		return
+	}
 
 	// Record duration metric
-	duration := time.Since(startTime).Seconds()
 	metrics.ComponentHealthCheckDuration.WithLabelValues(check.Name, "").Observe(duration)
 
 	// Now update the check state with proper locking
-	check.mu.Lock()
 	check.CheckCount++
 	check.LastCheck = time.Now()
 	check.recent.record(err != nil)
@@ -212,13 +243,16 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 		// component is down. Anything less is a blip. A component that has
 		// never once succeeded has no healthy history to call a blip against,
 		// so it escalates on its first failure.
-		if !check.everSucceeded || check.consecutiveFails >= unhealthyConsecutiveFailures || check.recent.sustained(unhealthyFailureRate) {
+		if panicked || !check.everSucceeded || check.consecutiveFails >= unhealthyConsecutiveFailures || check.recent.sustained(unhealthyFailureRate) {
 			check.Status = StatusUnhealthy
 		} else {
 			check.Status = StatusDegraded
 		}
 
 		logger.Warn("Health check failed", "check", check.Name, "error", err, "status", check.Status, "failure_rate", check.recent.rate(), "consecutive_failures", check.consecutiveFails)
+		if panicked {
+			logger.Error("Health: PANIC during check for component", "component", check.Name, "error", err)
+		}
 	} else {
 		check.LastError = nil
 		check.consecutiveFails = 0
@@ -233,6 +267,12 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 	}
 
 	currentStatus := check.Status
+	changed := previousStatus != currentStatus || isFirstCheck
+	check.checksSinceReport++
+	report := changed || check.checksSinceReport >= statusReportEvery
+	if report {
+		check.checksSinceReport = 0
+	}
 	check.mu.Unlock()
 
 	// Record health check metrics
@@ -252,25 +292,26 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 	}
 	metrics.ComponentHealthStatus.WithLabelValues(check.Name, "").Set(statusValue)
 
-	if previousStatus != currentStatus || isFirstCheck {
+	if changed {
 		if isFirstCheck {
 			logger.Info("Health: Check initialized", "check", check.Name, "status", currentStatus)
 		} else {
 			logger.Info("Health: Check status changed", "check", check.Name, "from", previousStatus, "to", currentStatus)
 		}
-		hm.notifyStatusChange(check.Name, currentStatus)
 	}
+	if report {
+		hm.notifyStatusChangeLocked(check.Name, currentStatus)
+	}
+	hm.mu.Unlock()
 
 	hm.updateOverallStatus()
 }
 
-func (hm *HealthMonitor) notifyStatusChange(name string, status ComponentStatus) {
-	hm.mu.RLock()
-	callbacks := make([]func(string, ComponentStatus), len(hm.statusCallbacks))
-	copy(callbacks, hm.statusCallbacks)
-	hm.mu.RUnlock()
-
-	for _, callback := range callbacks {
+// notifyStatusChangeLocked dispatches an accepted result before registration may
+// replace it. Callbacks run asynchronously, so they can reenter the monitor.
+// hm.mu must be held; no callback is invoked synchronously under it.
+func (hm *HealthMonitor) notifyStatusChangeLocked(name string, status ComponentStatus) {
+	for _, callback := range hm.statusCallbacks {
 		go callback(name, status)
 	}
 }

@@ -97,8 +97,8 @@ func (s *IMAPSession) Status(ctx context.Context, mboxName string, options *imap
 	if s.GetCapabilities().Has(imap.CapCondStore) && options.HighestModSeq {
 		statusData.HighestModSeq = summary.HighestModSeq
 	}
-	if options.AppendLimit && s.server.appendLimit > 0 {
-		limit := uint32(s.server.appendLimit)
+	if options.AppendLimit {
+		limit := s.server.appendLimit
 		statusData.AppendLimit = &limit
 	}
 	if options.Size {

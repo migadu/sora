@@ -1,13 +1,15 @@
 package server
 
 import (
+	"context"
 	"net"
 
 	"github.com/migadu/sora/helpers"
 )
 
-// MasterSASLNetworkGate restricts which source networks may use master SASL
-// credentials to impersonate users on a backend server.
+// MasterSASLNetworkGate restricts which source networks may use master
+// credentials (master SASL and the master-username form) to impersonate users on
+// a backend server. Applied through Session.AdmitMasterLogin.
 //
 // It MUST be anchored to the real socket peer (net.Conn.RemoteAddr), never to a
 // client-asserted address. The PROXY protocol, the IMAP ID command, and XCLIENT can
@@ -79,6 +81,31 @@ func (g *MasterSASLNetworkGate) Allowed(realPeer net.Addr) bool {
 		if network.Contains(ip) {
 			return true
 		}
+	}
+	return false
+}
+
+// AdmitMasterLogin applies gate to a master login whose credential has already been
+// verified: master SASL, or the master-username form "user@domain@<master_username>".
+// Both impersonate any account with one tenant-wide password, so one list confines
+// both, on every protocol. form names the credential in the log ("master SASL",
+// "master username").
+//
+// It reports whether the login may proceed. A refusal is logged and recorded under
+// authKey exactly like a wrong master password, and the caller must answer it exactly
+// like one too: this point is reachable only with the CORRECT password, so a refusal
+// that is worded or charged differently (an uncharged failure diverges from a wrong
+// password at the block threshold) confirms a guessed password to a peer that is not
+// even allowed to use it.
+//
+// The gate reads conn's real socket peer, never a forwarded client address.
+func (s *Session) AdmitMasterLogin(ctx context.Context, gate *MasterSASLNetworkGate, limiter AuthLimiter, conn net.Conn, proxyInfo *ProxyProtocolInfo, authKey, form string) bool {
+	if gate.Allowed(conn.RemoteAddr()) {
+		return true
+	}
+	s.WarnLog(form+" credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", GetAddrString(conn.RemoteAddr()))
+	if limiter != nil {
+		limiter.RecordAuthAttemptWithProxy(ctx, conn, proxyInfo, authKey, false)
 	}
 	return false
 }

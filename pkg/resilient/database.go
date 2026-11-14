@@ -71,6 +71,9 @@
 //   - Open: Too many failures, reject immediately
 //   - Half-open: Testing recovery
 //
+// Only the database failing counts against them (see isDatabaseFailure): an error the
+// database answered with, such as a rejected request, is a success.
+//
 // # Transient Error Detection
 //
 // The package automatically detects and retries transient errors:
@@ -86,6 +89,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -115,9 +119,11 @@ type DatabasePool struct {
 	failCount   atomic.Int64
 }
 
-// FailedReplica tracks a read replica that failed to connect at startup
-type FailedReplica struct {
+// FailedHost tracks a database host (read replica or write host) that failed to
+// connect at startup; it is retried until it connects.
+type FailedHost struct {
 	host           string
+	poolType       string // "write" or "read"
 	endpointConfig *config.DatabaseEndpointConfig
 	lastAttempt    time.Time
 	attemptCount   int
@@ -128,23 +134,23 @@ type FailedReplica struct {
 type RuntimeFailoverManager struct {
 	writePools      []*DatabasePool
 	readPools       []*DatabasePool
-	failedReplicas  []*FailedReplica // Read replicas that failed at startup
+	failedHosts     []*FailedHost // Hosts that failed to connect at startup
 	currentWriteIdx atomic.Int64
 	currentReadIdx  atomic.Int64
-	config          *config.DatabaseConfig
-	healthCheckStop chan struct{}
-	healthCheckWg   sync.WaitGroup // Wait for background goroutines to finish
-	mu              sync.RWMutex
+	// readsUseWritePools describes which hosts the readPools slice contains.
+	// readsOnWritePools records a runtime fallback from unhealthy replicas.
+	readsUseWritePools atomic.Bool
+	readsOnWritePools  atomic.Bool
+	config             *config.DatabaseConfig
+	healthCheckStop    chan struct{}
+	healthCheckWg      sync.WaitGroup
+	mu                 sync.RWMutex
 }
 
-// readPoolsAreDistinct checks if the read pools are a separate set from the write pools.
+// readPoolsAreDistinct reports whether the read pools are replicas rather than the
+// write pools serving reads.
 func (fm *RuntimeFailoverManager) readPoolsAreDistinct() bool {
-	// If there are no read pools or no write pools, they can't be distinct.
-	if len(fm.readPools) == 0 || len(fm.writePools) == 0 {
-		return false
-	}
-	// Slices are distinct if their first elements' memory addresses are different.
-	return &fm.readPools[0] != &fm.writePools[0]
+	return !fm.readsUseWritePools.Load()
 }
 
 type ResilientDatabase struct {
@@ -191,74 +197,72 @@ func (rd *ResilientDatabase) SetAuthCache(cache authCacheInterface) {
 	rd.authCache = cache
 }
 
-// isQuerySuccessful reports whether a database query error should be treated as a
-// success by the query circuit breaker — i.e. it is an expected application/protocol
-// outcome rather than a database system failure. Extracted as a named function so the
-// classification is unit-testable.
-func isQuerySuccessful(err error) bool {
+// isDatabaseFailure reports whether err shows the database failing: unreachable or
+// dropping the connection, timing out, out of resources, shutting down, or reporting an
+// internal error. Only these count against the circuit breakers. Anything else is an
+// answer from a working database or a decision made without it — a not-found, a
+// constraint violation, a rejected request, an *imap.Error from a stream callback — and
+// counting it would let a few bad requests (say, deleting a primary credential three
+// times) open the write breaker and refuse every write on the node, deliveries
+// included. The rule goes by the kind of error rather than an allowlist of application
+// errors, so a new rejection cannot trip a breaker by being left off a list.
+func isDatabaseFailure(err error) bool {
 	if err == nil {
+		return false
+	}
+	// The breaker refusing a request: the database is considered unavailable.
+	if errors.Is(err, circuitbreaker.ErrCircuitBreakerOpen) || errors.Is(err, circuitbreaker.ErrTooManyRequests) {
 		return true
 	}
-	// An *imap.Error returned through a streaming callback (e.g. a FETCH whose body is
-	// temporarily unavailable from S3) is an IMAP protocol/application outcome, not a
-	// database system failure — the underlying query already succeeded. Don't let it trip
-	// the DB breaker, which would escalate an S3 outage into a DB-read outage.
-	var imapErr *imap.Error
-	if errors.As(err, &imapErr) {
+	// The caller giving up (client gone, shutdown) says nothing about the database.
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	var connectErr *pgconn.ConnectError
+	if errors.As(err, &connectErr) {
 		return true
 	}
-	// Business logic errors that should NOT trip the circuit breaker.
-	if errors.Is(err, db.ErrSearchTooManyResults) ||
-		errors.Is(err, consts.ErrUserNotFound) ||
-		errors.Is(err, consts.ErrMailboxNotFound) ||
-		errors.Is(err, consts.ErrMailboxHasChildren) ||
-		errors.Is(err, consts.ErrMessageNotAvailable) ||
-		errors.Is(err, consts.ErrMailboxAlreadyExists) ||
-		errors.Is(err, consts.ErrAccountAlreadyExists) ||
-		errors.Is(err, consts.ErrNotPermitted) ||
-		errors.Is(err, consts.ErrDBNotFound) ||
-		errors.Is(err, consts.ErrMessageExists) ||
-		errors.Is(err, pgx.ErrNoRows) {
-		return true
-	}
-	return false // Actual system failure
-}
-
-// isWriteSuccessful is the write-breaker counterpart of isQuerySuccessful. In addition to
-// the query cases it tolerates unique-constraint violations and self-resolving transient
-// PostgreSQL errors (deadlock / serialization failure), which are retried.
-func isWriteSuccessful(err error) bool {
-	if err == nil {
-		return true
-	}
-	var imapErr *imap.Error
-	if errors.As(err, &imapErr) {
-		return true
-	}
-	if errors.Is(err, consts.ErrUserNotFound) ||
-		errors.Is(err, consts.ErrMailboxNotFound) ||
-		errors.Is(err, consts.ErrMailboxHasChildren) ||
-		errors.Is(err, consts.ErrMessageNotAvailable) ||
-		errors.Is(err, consts.ErrMailboxAlreadyExists) ||
-		errors.Is(err, consts.ErrAccountAlreadyExists) ||
-		errors.Is(err, consts.ErrNotPermitted) ||
-		errors.Is(err, consts.ErrDBNotFound) ||
-		errors.Is(err, consts.ErrDBUniqueViolation) ||
-		errors.Is(err, consts.ErrMessageExists) ||
-		errors.Is(err, pgx.ErrNoRows) {
-		return true
-	}
-	// Transient PostgreSQL errors (deadlock, serialization failure) are retried and should
-	// not count as circuit breaker failures — they are self-resolving.
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		switch pgErr.Code {
-		case "40P01", // deadlock detected
-			"40001": // serialization failure
-			return true
-		}
+		return isDatabaseFailureSQLState(pgErr.Code)
 	}
-	return false // Actual system failure
+	// The connection broke or timed out (pgx wraps the net/io error it read).
+	var netErr net.Error
+	return errors.As(err, &netErr) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, pgconn.ErrConnClosed) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// isDatabaseFailureSQLState reports whether a PostgreSQL error code is the server failing
+// rather than refusing the statement (PostgreSQL documentation, Appendix A "PostgreSQL
+// Error Codes"). Data exceptions (22), integrity constraint violations (23), syntax or
+// access rule violations (42), transaction rollbacks such as deadlocks (40) and the rest
+// are answers to the statement.
+func isDatabaseFailureSQLState(code string) bool {
+	switch code {
+	case "25006", // read_only_sql_transaction: the write pool reached a standby after a failover
+		"55P03": // lock_not_available: lock_timeout elapsed waiting for a row lock
+		return true
+	}
+	if len(code) != 5 {
+		return false
+	}
+	switch code[:2] {
+	case "08", // Connection Exception (PgBouncer reports its own failures as 08P01)
+		"53", // Insufficient Resources: disk full, out of memory, too many connections
+		"57", // Operator Intervention: shutdown, cannot connect now, statement_timeout
+		"58", // System Error (errors external to PostgreSQL itself)
+		"XX": // Internal Error
+		return true
+	}
+	return false
+}
+
+// isBreakerSuccess is the IsSuccessful predicate of both database circuit breakers.
+func isBreakerSuccess(err error) bool {
+	return !isDatabaseFailure(err)
 }
 
 func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, enableHealthCheck bool, runMigrations bool) (*ResilientDatabase, error) {
@@ -304,9 +308,7 @@ func NewResilientDatabaseWithOptions(ctx context.Context, config *config.Databas
 	querySettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Info("Database query circuit breaker state changed", "component", "RESILIENT-FAILOVER", "name", name, "from", from, "to", to)
 	}
-	// Configure IsSuccessful to treat business logic errors as successes
-	// Only system errors (connection failures, timeouts, etc.) should count as failures
-	querySettings.IsSuccessful = isQuerySuccessful
+	querySettings.IsSuccessful = isBreakerSuccess
 
 	writeSettings := circuitbreaker.DefaultSettings("database_write")
 	writeSettings.MaxRequests = 10 // Allow more test requests in half-open state for faster recovery
@@ -338,9 +340,7 @@ func NewResilientDatabaseWithOptions(ctx context.Context, config *config.Databas
 	writeSettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Info("Database write circuit breaker state changed", "component", "RESILIENT-FAILOVER", "name", name, "from", from, "to", to)
 	}
-	// Configure IsSuccessful to treat business logic errors as successes
-	// Only system errors (connection failures, timeouts, etc.) should count as failures
-	writeSettings.IsSuccessful = isWriteSuccessful
+	writeSettings.IsSuccessful = isBreakerSuccess
 
 	// Create failover manager
 	failoverManager, err := newRuntimeFailoverManager(ctx, config, runMigrations, skipReadReplicas)
@@ -457,6 +457,29 @@ func (rd *ResilientDatabase) GetDatabase() *db.Database {
 	return rd.getCurrentDatabase()
 }
 
+// PingReadPools pings, on every read host, the pool reads are served from: each
+// replica's, or the write hosts' while reads use them. The error names every host that
+// failed.
+func (rd *ResilientDatabase) PingReadPools(ctx context.Context) error {
+	rd.failoverManager.mu.RLock()
+	pools := append([]*DatabasePool(nil), rd.failoverManager.readPools...)
+	rd.failoverManager.mu.RUnlock()
+
+	errs := make([]error, len(pools))
+	var wg sync.WaitGroup
+	for i, p := range pools {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := p.database.ReadPool.Ping(ctx); err != nil {
+				errs[i] = fmt.Errorf("read pool %s: %w", p.host, err)
+			}
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
 // GetQueryTimeout returns the configured query timeout for read operations
 // This is useful when code needs to create its own context with appropriate timeout
 func (rd *ResilientDatabase) GetQueryTimeout() time.Duration {
@@ -520,25 +543,13 @@ func (rd *ResilientDatabase) isRetryableError(err error) bool {
 	return false
 }
 
-// isBusinessLogicError checks if an error is a business logic error that should not
-// be logged at WARN level (e.g., user not found, already exists, etc.)
-func (rd *ResilientDatabase) isBusinessLogicError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// Check against all business logic errors that are treated as success by circuit breaker
-	return errors.Is(err, consts.ErrUserNotFound) ||
-		errors.Is(err, consts.ErrMailboxNotFound) ||
-		errors.Is(err, consts.ErrMailboxHasChildren) ||
-		errors.Is(err, consts.ErrMessageNotAvailable) ||
-		errors.Is(err, consts.ErrMailboxAlreadyExists) ||
-		errors.Is(err, consts.ErrAccountAlreadyExists) ||
-		errors.Is(err, consts.ErrNotPermitted) ||
-		errors.Is(err, consts.ErrDBNotFound) ||
-		errors.Is(err, consts.ErrDBUniqueViolation) ||
-		errors.Is(err, consts.ErrMessageExists) ||
-		errors.Is(err, pgx.ErrNoRows)
+// logsWriteErrorAtWarn reports whether an error from a write through the breaker is
+// logged at WARN: a retryable error (a deadlock or serialization failure, which is retried
+// and does not count against the breaker, or a connection timeout), or the database
+// failing while the breaker is not CLOSED. Anything else, such as a rejected request or a
+// not-found, is logged at DEBUG.
+func (rd *ResilientDatabase) logsWriteErrorAtWarn(err error, state circuitbreaker.State) bool {
+	return rd.isRetryableError(err) || (isDatabaseFailure(err) && state != circuitbreaker.StateClosed)
 }
 
 func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -567,7 +578,6 @@ func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, arg
 	var rows pgx.Rows
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		queryCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
 
 		result, cbErr := rd.queryBreaker.Execute(func() (any, error) {
 			r, queryErr := pool.Query(queryCtx, sql, args...)
@@ -575,20 +585,42 @@ func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, arg
 		})
 
 		if cbErr != nil {
+			cancel()
 			if !rd.isRetryableError(cbErr) {
-				// For non-retryable errors, we'll break the retry loop by returning nil from WithRetry
-				// and handle the error outside
-				return cbErr
+				return retry.Stop(cbErr)
 			}
 			logger.Debug("Retrying query due to retryable error", "error", cbErr)
 			return cbErr // It's retryable, so return the error to signal a retry.
 		}
 
-		rows = result.(pgx.Rows)
+		// pgx reads the rows under queryCtx until they are closed, so the context
+		// lives as long as the rows do.
+		rows = &cancelOnCloseRows{Rows: result.(pgx.Rows), cancel: cancel}
 		return nil
 	}, config)
 
 	return rows, err
+}
+
+// cancelOnCloseRows releases the query's timeout context once the rows are done:
+// when the caller closes them, or when Next reports the end (pgx closes rows itself
+// then, so a caller that drains them need not call Close).
+type cancelOnCloseRows struct {
+	pgx.Rows
+	cancel context.CancelFunc
+}
+
+func (r *cancelOnCloseRows) Next() bool {
+	if r.Rows.Next() {
+		return true
+	}
+	r.cancel()
+	return false
+}
+
+func (r *cancelOnCloseRows) Close() {
+	r.Rows.Close()
+	r.cancel()
 }
 
 // resilientRow implements the pgx.Row interface to defer the Scan operation
@@ -683,9 +715,7 @@ func (rd *ResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions pgx
 			state := rd.writeBreaker.State()
 			counts := rd.writeBreaker.Counts()
 
-			// Log at WARN only for system failures or when breaker is not CLOSED
-			// Business logic errors log at DEBUG to reduce noise
-			if !rd.isBusinessLogicError(cbErr) && (rd.isRetryableError(cbErr) || state != circuitbreaker.StateClosed) {
+			if rd.logsWriteErrorAtWarn(cbErr, state) {
 				logger.Warn("Write operation failed through circuit breaker", "component", "RESILIENT-FAILOVER",
 					"error", cbErr, "breaker_state", state, "total_failures", counts.TotalFailures,
 					"total_requests", counts.Requests, "consecutive_failures", counts.ConsecutiveFailures)
@@ -825,28 +855,39 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 	manager := &RuntimeFailoverManager{
 		writePools:      make([]*DatabasePool, 0),
 		readPools:       make([]*DatabasePool, 0),
-		failedReplicas:  make([]*FailedReplica, 0),
+		failedHosts:     make([]*FailedHost, 0),
 		config:          config,
 		healthCheckStop: make(chan struct{}),
 	}
 
 	// Create database pools for all write hosts
 	// NOTE: We create write pools SEQUENTIALLY (not in parallel like read pools) because:
-	// 1. Only the first pool runs migrations (requires exclusive migration lock)
-	// 2. Only the first pool acquires advisory lock (requires connection)
-	// 3. Parallel creation could cause connection pool exhaustion during startup
+	// 1. Migrations run once, through the first write host that connects (requires
+	//    exclusive migration lock); a host that is down does not skip them
+	// 2. Parallel creation could cause connection pool exhaustion during startup
 	if config.Write != nil && len(config.Write.Hosts) > 0 {
+		migrationsPending := runMigrations
 		for i, host := range config.Write.Hosts {
-			// Only run migrations and acquire lock for the very first write pool.
-			isFirstPool := (i == 0)
-
 			logger.Info("Creating write pool", "component", "RESILIENT-FAILOVER", "host", host, "index", i, "total", len(config.Write.Hosts))
 
-			pool, err := createDatabasePool(ctx, host, config, config.Write, "write", runMigrations && isFirstPool)
+			pool, err := createDatabasePool(ctx, host, config, config.Write, "write", migrationsPending)
 			if err != nil {
-				logger.Error("Failed to create write pool for host", "component", "RESILIENT-FAILOVER", "host", host, "error", err)
+				// The schema is shared by every write host: a node must not start on a
+				// schema whose migration failed, however many hosts it could reach.
+				if errors.Is(err, db.ErrMigrationFailed) {
+					return nil, err
+				}
+				logger.Error("Failed to create write pool for host, will retry periodically", "component", "RESILIENT-FAILOVER", "host", host, "error", err)
+				manager.failedHosts = append(manager.failedHosts, &FailedHost{
+					host:           host,
+					poolType:       "write",
+					endpointConfig: config.Write,
+					lastAttempt:    time.Now(),
+					attemptCount:   1,
+				})
 				continue
 			}
+			migrationsPending = false
 
 			dbPool := &DatabasePool{
 				database: pool,
@@ -894,13 +935,13 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 				logger.Warn("Failed to connect to read replica, will retry periodically", "component", "RESILIENT-FAILOVER", "host", result.host, "error", result.err)
 
 				// Track this failed replica for reconnection attempts
-				failedReplica := &FailedReplica{
+				manager.failedHosts = append(manager.failedHosts, &FailedHost{
 					host:           result.host,
+					poolType:       "read",
 					endpointConfig: config.Read,
 					lastAttempt:    time.Now(),
 					attemptCount:   1,
-				}
-				manager.failedReplicas = append(manager.failedReplicas, failedReplica)
+				})
 				continue
 			}
 
@@ -922,8 +963,8 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 		if successCount > 0 {
 			logger.Info("Successfully connected to read replicas", "component", "RESILIENT-FAILOVER", "success_count", successCount, "total", len(config.Read.Hosts))
 		}
-		if len(manager.failedReplicas) > 0 {
-			logger.Info("Read replicas failed at startup, will attempt reconnection", "component", "RESILIENT-FAILOVER", "failed_count", len(manager.failedReplicas))
+		if failed := len(config.Read.Hosts) - successCount; failed > 0 {
+			logger.Info("Read replicas failed at startup, will attempt reconnection", "component", "RESILIENT-FAILOVER", "failed_count", failed)
 		}
 	}
 
@@ -937,6 +978,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 			logger.Info("No read pools configured, using write pools for read operations", "component", "RESILIENT-FAILOVER")
 		}
 		manager.readPools = manager.writePools
+		manager.readsUseWritePools.Store(true)
 		manager.currentReadIdx.Store(manager.currentWriteIdx.Load())
 	}
 
@@ -958,12 +1000,20 @@ func createDatabasePool(ctx context.Context, host string, dbConfig *config.Datab
 
 	// Note: We use Write endpoint config even for read pools because db.NewDatabaseFromConfig
 	// expects Write to be populated. The actual pool type is tracked by the poolType parameter.
+	//
+	// A dedicated read pool keeps heavy writes from starving reads, which only matters on a
+	// host that serves both: a write host when [database.read] is not configured. A replica
+	// takes no writes, and with [database.read] the write hosts take reads only as a
+	// fallback (no healthy replica, or sora-admin, which skips the replicas), where the
+	// reads share the write pool. Every other host gets one pool of max_connections.
+	readEndpointConfigured := dbConfig.Read != nil && len(dbConfig.Read.Hosts) > 0
 	tempConfig := &config.DatabaseConfig{
-		Debug:            dbConfig.GetDebug(),
-		MigrationTimeout: dbConfig.MigrationTimeout,
-		FetchChunkSize:   dbConfig.FetchChunkSize,
-		Write:            &singleHostEndpoint,
-		PoolTypeOverride: poolType, // Pass the actual pool type for logging
+		Debug:               dbConfig.GetDebug(),
+		MigrationTimeout:    dbConfig.MigrationTimeout,
+		FetchChunkSize:      dbConfig.FetchChunkSize,
+		Write:               &singleHostEndpoint,
+		PoolTypeOverride:    poolType, // Pass the actual pool type for logging
+		ReadsShareWritePool: poolType != "write" || readEndpointConfigured,
 	}
 
 	database, err := db.NewDatabaseFromConfig(ctx, tempConfig, runMigrations)
@@ -1064,6 +1114,9 @@ func (rd *ResilientDatabase) getHealthyDatabaseWithFailover(isWrite bool) *db.Da
 	rd.failoverManager.mu.RUnlock()
 
 	if isHealthy {
+		if !isWrite && rd.failoverManager.readsOnWritePools.CompareAndSwap(true, false) {
+			logger.Info("Read operations are back on a read replica", "component", "RESILIENT-FAILOVER", "pool", currentPool.host)
+		}
 		return currentPool.database
 	}
 
@@ -1097,6 +1150,22 @@ func (rd *ResilientDatabase) getHealthyDatabaseWithFailover(isWrite bool) *db.Da
 				logger.Info("Switched read operations from unhealthy pool to healthy pool", "component", "RESILIENT-FAILOVER", "from", pools[currentIdx].host, "to", pools[nextIdx].host)
 			}
 			return pools[nextIdx].database
+		}
+	}
+
+	// No read replica is healthy: serve reads from a healthy write pool, as startup does
+	// when every replica is down, rather than from a replica known to be failing.
+	if !isWrite && rd.failoverManager.readPoolsAreDistinct() {
+		writePools := rd.failoverManager.writePools
+		writeIdx := int(rd.failoverManager.currentWriteIdx.Load())
+		for i := 0; i < len(writePools); i++ {
+			p := writePools[(writeIdx+i)%len(writePools)]
+			if p.isHealthy.Load() {
+				if rd.failoverManager.readsOnWritePools.CompareAndSwap(false, true) {
+					logger.Warn("No healthy read replica, serving read operations from the write pool", "component", "RESILIENT-FAILOVER", "pool", p.host)
+				}
+				return p.database
+			}
 		}
 	}
 
@@ -1163,8 +1232,8 @@ func (rd *ResilientDatabase) performHealthChecks(ctx context.Context) {
 		}
 	}
 
-	// Attempt to reconnect to failed read replicas
-	rd.attemptReconnectFailedReplicas(ctx)
+	// Attempt to reconnect to hosts that failed at startup
+	rd.attemptReconnectFailedHosts(ctx)
 }
 
 // isReadOnlyTransactionError returns true when err is a PostgreSQL
@@ -1263,23 +1332,21 @@ func (rd *ResilientDatabase) checkPoolHealth(ctx context.Context, pool *Database
 	}
 }
 
-// attemptReconnectFailedReplicas tries to reconnect to read replicas that failed at startup
-func (rd *ResilientDatabase) attemptReconnectFailedReplicas(ctx context.Context) {
-	rd.failoverManager.mu.Lock()
-	defer rd.failoverManager.mu.Unlock()
+// attemptReconnectFailedHosts tries to reconnect to the read replicas and write hosts
+// that failed at startup. It connects without holding the manager's lock: an attempt can
+// take the whole connect timeout, and every database operation takes that lock. It runs
+// on the health-check goroutine only, so no two attempts race for one host.
+func (rd *ResilientDatabase) attemptReconnectFailedHosts(ctx context.Context) {
+	fm := rd.failoverManager
+	fm.mu.RLock()
+	failedHosts := append([]*FailedHost(nil), fm.failedHosts...)
+	fm.mu.RUnlock()
 
-	if len(rd.failoverManager.failedReplicas) == 0 {
-		return
-	}
-
-	// Process failed replicas (iterate backwards so we can remove items)
-	for i := len(rd.failoverManager.failedReplicas) - 1; i >= 0; i-- {
-		replica := rd.failoverManager.failedReplicas[i]
-
-		replica.mu.Lock()
-		timeSinceLastAttempt := time.Since(replica.lastAttempt)
-		attemptCount := replica.attemptCount
-		replica.mu.Unlock()
+	for _, failed := range failedHosts {
+		failed.mu.Lock()
+		timeSinceLastAttempt := time.Since(failed.lastAttempt)
+		attemptCount := failed.attemptCount
+		failed.mu.Unlock()
 
 		// Use exponential backoff: 30s, 1m, 2m, 5m, 10m, then every 10m
 		var backoffDuration time.Duration
@@ -1301,45 +1368,57 @@ func (rd *ResilientDatabase) attemptReconnectFailedReplicas(ctx context.Context)
 		}
 
 		// Attempt reconnection
-		logger.Info("Attempting to reconnect to read replica", "component", "RESILIENT-FAILOVER", "host", replica.host, "attempt", attemptCount+1)
+		logger.Info("Attempting to reconnect to database host", "component", "RESILIENT-FAILOVER", "type", failed.poolType, "host", failed.host, "attempt", attemptCount+1)
 
-		pool, err := createDatabasePool(ctx, replica.host, rd.config, replica.endpointConfig, "read", false)
+		pool, err := createDatabasePool(ctx, failed.host, rd.config, failed.endpointConfig, failed.poolType, false)
 
-		replica.mu.Lock()
-		replica.lastAttempt = time.Now()
-		replica.attemptCount++
-		replica.mu.Unlock()
+		failed.mu.Lock()
+		failed.lastAttempt = time.Now()
+		failed.attemptCount++
+		failed.mu.Unlock()
 
 		if err != nil {
-			logger.Debug("Failed to reconnect to read replica", "component", "RESILIENT-FAILOVER", "host", replica.host, "error", err)
+			logger.Debug("Failed to reconnect to database host", "component", "RESILIENT-FAILOVER", "type", failed.poolType, "host", failed.host, "error", err)
 			continue
 		}
 
 		// Success! Add the pool and remove from failed list
-		logger.Info("Successfully reconnected to read replica", "component", "RESILIENT-FAILOVER", "host", replica.host)
+		logger.Info("Successfully reconnected to database host", "component", "RESILIENT-FAILOVER", "type", failed.poolType, "host", failed.host)
 
 		dbPool := &DatabasePool{
 			database: pool,
-			host:     replica.host,
+			host:     failed.host,
 		}
 		dbPool.isHealthy.Store(true)
 
-		// If we were using write pools as fallback, switch to the new read pool
-		wasUsingWritePoolsForReads := !rd.failoverManager.readPoolsAreDistinct()
-
-		rd.failoverManager.readPools = append(rd.failoverManager.readPools, dbPool)
-
-		// If this is the first read pool (was using write pools before), set it as current
-		if wasUsingWritePoolsForReads {
-			rd.failoverManager.currentReadIdx.Store(int64(len(rd.failoverManager.readPools) - 1))
+		fm.mu.Lock()
+		if failed.poolType == "write" {
+			// Keep the slices in sync while write hosts also serve reads, without
+			// appending into a backing array that readPools may still share.
+			writePools := fm.writePools
+			fm.writePools = append(writePools[:len(writePools):len(writePools)], dbPool)
+			if fm.readsUseWritePools.Load() {
+				fm.readPools = fm.writePools
+			}
+		} else if fm.readsUseWritePools.Load() {
+			// The first replica replaces the write hosts as the read pool set.
+			fm.readPools = []*DatabasePool{dbPool}
+			fm.currentReadIdx.Store(0)
+			fm.readsUseWritePools.Store(false)
 			logger.Info("Switching from write pools to dedicated read replica for read operations", "component", "RESILIENT-FAILOVER")
+		} else {
+			readPools := fm.readPools
+			fm.readPools = append(readPools[:len(readPools):len(readPools)], dbPool)
 		}
 
-		// Remove from failed replicas list
-		rd.failoverManager.failedReplicas = append(
-			rd.failoverManager.failedReplicas[:i],
-			rd.failoverManager.failedReplicas[i+1:]...,
-		)
+		// Remove from failed hosts list
+		for i, f := range fm.failedHosts {
+			if f == failed {
+				fm.failedHosts = append(fm.failedHosts[:i], fm.failedHosts[i+1:]...)
+				break
+			}
+		}
+		fm.mu.Unlock()
 	}
 }
 
@@ -1369,55 +1448,45 @@ func (rd *ResilientDatabase) StartPoolMetrics(ctx context.Context) {
 	}()
 }
 
-// collectAggregatedPoolStats gathers stats from all write and read pools and updates metrics
-func (rd *ResilientDatabase) collectAggregatedPoolStats() {
-	rd.failoverManager.mu.RLock()
-	defer rd.failoverManager.mu.RUnlock()
+// rolePool is one pgx pool the failover manager opened, with the role it serves.
+type rolePool struct {
+	role string // "write" or "read"
+	host string
+	pool *pgxpool.Pool
+}
 
-	// Import metrics package for accessing the metrics
-	// Note: This assumes the metrics package is imported at the top of the file
-
-	// Collect stats from all write pools
-	var totalWriteConns, idleWriteConns, inUseWriteConns int32
-	for _, pool := range rd.failoverManager.writePools {
-		if pool.database != nil && pool.database.WritePool != nil {
-			stats := pool.database.WritePool.Stat()
-			totalWriteConns += stats.TotalConns()
-			idleWriteConns += stats.IdleConns()
-			inUseWriteConns += stats.AcquiredConns()
+// allPools lists every distinct pgx pool the manager opened, each once: the write
+// hosts' WritePools as "write", and as "read" every other pool reads are served from
+// (a write host's dedicated read pool, a replica's pool). A pool shared by reads and
+// writes counts as "write". Caller holds fm.mu.
+func (fm *RuntimeFailoverManager) allPools() []rolePool {
+	var pools []rolePool
+	seen := make(map[*pgxpool.Pool]bool)
+	add := func(role string, p *DatabasePool, pool *pgxpool.Pool) {
+		if pool == nil || seen[pool] {
+			return
+		}
+		seen[pool] = true
+		pools = append(pools, rolePool{role: role, host: p.host, pool: pool})
+	}
+	for _, p := range fm.writePools {
+		if p.database != nil {
+			add("write", p, p.database.WritePool)
 		}
 	}
-
-	// Update aggregated write pool metrics
-	if len(rd.failoverManager.writePools) > 0 {
-		metrics.DBPoolTotalConns.WithLabelValues("write").Set(float64(totalWriteConns))
-		metrics.DBPoolIdleConns.WithLabelValues("write").Set(float64(idleWriteConns))
-		metrics.DBPoolInUseConns.WithLabelValues("write").Set(float64(inUseWriteConns))
-	}
-
-	// Collect stats from read pools only if they are distinct from write pools
-	if rd.failoverManager.readPoolsAreDistinct() {
-		var totalReadConns, idleReadConns, inUseReadConns int32
-		for _, pool := range rd.failoverManager.readPools {
-			if pool.database != nil && pool.database.ReadPool != nil {
-				stats := pool.database.ReadPool.Stat()
-				totalReadConns += stats.TotalConns()
-				idleReadConns += stats.IdleConns()
-				inUseReadConns += stats.AcquiredConns()
+	for _, group := range [][]*DatabasePool{fm.writePools, fm.readPools} {
+		for _, p := range group {
+			if p.database != nil {
+				add("read", p, p.database.ReadPool)
 			}
 		}
-
-		// Update aggregated read pool metrics
-		metrics.DBPoolTotalConns.WithLabelValues("read").Set(float64(totalReadConns))
-		metrics.DBPoolIdleConns.WithLabelValues("read").Set(float64(idleReadConns))
-		metrics.DBPoolInUseConns.WithLabelValues("read").Set(float64(inUseReadConns))
-	} else {
-		// If read pools are not distinct, ensure their metrics are zeroed out
-		// to avoid reporting stale or incorrect data.
-		metrics.DBPoolTotalConns.WithLabelValues("read").Set(0)
-		metrics.DBPoolIdleConns.WithLabelValues("read").Set(0)
-		metrics.DBPoolInUseConns.WithLabelValues("read").Set(0)
 	}
+	return pools
+}
+
+// collectAggregatedPoolStats updates the pool gauges from every pool the manager opened.
+func (rd *ResilientDatabase) collectAggregatedPoolStats() {
+	rd.reportPools(false)
 }
 
 // StartPoolHealthMonitoring starts background monitoring of connection pool health
@@ -1448,75 +1517,54 @@ func (rd *ResilientDatabase) StartPoolHealthMonitoring(ctx context.Context) {
 	}()
 }
 
-// monitorAggregatedPoolHealth performs periodic health checks and updates metrics for all pools
+// monitorAggregatedPoolHealth updates the pool gauges and checks every pool for exhaustion.
 func (rd *ResilientDatabase) monitorAggregatedPoolHealth() {
-	rd.failoverManager.mu.RLock()
-	defer rd.failoverManager.mu.RUnlock()
-
-	// Monitor write pools
-	rd.monitorPoolGroup(rd.failoverManager.writePools, "write")
-
-	// Monitor read pools only if they are distinct
-	if rd.failoverManager.readPoolsAreDistinct() {
-		rd.monitorPoolGroup(rd.failoverManager.readPools, "read")
-	}
+	rd.reportPools(true)
 }
 
-// monitorPoolGroup monitors a group of database pools (write or read)
-func (rd *ResilientDatabase) monitorPoolGroup(pools []*DatabasePool, poolType string) {
-	var (
-		totalConns      int32
-		idleConns       int32
-		acquiredConns   int32
-		maxConns        int32
-		exhaustionCount int
-	)
+// reportPools sets the sora_db_pool_* gauges per role, summed over every pool the
+// manager opened (allPools). With checkExhaustion it also counts and logs the pools
+// above 95% utilization and logs a summary per role.
+func (rd *ResilientDatabase) reportPools(checkExhaustion bool) {
+	rd.failoverManager.mu.RLock()
+	pools := rd.failoverManager.allPools()
+	rd.failoverManager.mu.RUnlock()
 
-	for _, pool := range pools {
-		if pool.database == nil {
-			continue
-		}
-
-		var poolToCheck *pgxpool.Pool
-		if poolType == "write" && pool.database.WritePool != nil {
-			poolToCheck = pool.database.WritePool
-		} else if poolType == "read" && pool.database.ReadPool != nil {
-			poolToCheck = pool.database.ReadPool
-		}
-
-		if poolToCheck != nil {
-			stats := poolToCheck.Stat()
+	for _, role := range []string{"write", "read"} {
+		var totalConns, idleConns, acquiredConns int32
+		var poolCount, exhaustionCount int
+		for _, p := range pools {
+			if p.role != role {
+				continue
+			}
+			stats := p.pool.Stat()
+			poolCount++
 			totalConns += stats.TotalConns()
 			idleConns += stats.IdleConns()
 			acquiredConns += stats.AcquiredConns()
-			maxConns += stats.MaxConns()
 
-			// Check for pool exhaustion (>95% utilization)
-			if stats.MaxConns() > 0 {
+			if checkExhaustion && stats.MaxConns() > 0 {
 				utilization := float64(stats.AcquiredConns()) / float64(stats.MaxConns())
 				if utilization > 0.95 {
 					exhaustionCount++
-					logger.Warn("Database pool near exhaustion", "component", "RESILIENT-FAILOVER", "type",
-						poolType, pool.host, utilization*100)
+					logger.Warn("Database pool near exhaustion", "component", "RESILIENT-FAILOVER",
+						"type", role, "host", p.host, "utilization_pct", utilization*100)
 				}
 			}
-
-			// Check for slow connection acquisition
-			// Note: pgxpool.Stat() doesn't provide acquisition duration directly
-			// This would need to be tracked separately or estimated
 		}
+
+		metrics.DBPoolTotalConns.WithLabelValues(role).Set(float64(totalConns))
+		metrics.DBPoolIdleConns.WithLabelValues(role).Set(float64(idleConns))
+		metrics.DBPoolInUseConns.WithLabelValues(role).Set(float64(acquiredConns))
+
+		if !checkExhaustion || poolCount == 0 {
+			continue
+		}
+		if exhaustionCount > 0 {
+			metrics.DBPoolExhaustion.WithLabelValues(role).Add(float64(exhaustionCount))
+		}
+		logger.Info("Pools health status", "component", "RESILIENT-FAILOVER", "type", role, "total_conns", totalConns, "idle", idleConns, "in_use", acquiredConns, "pools", poolCount)
 	}
-
-	// Update aggregated metrics
-	metrics.DBPoolTotalConns.WithLabelValues(poolType).Set(float64(totalConns))
-	metrics.DBPoolIdleConns.WithLabelValues(poolType).Set(float64(idleConns))
-	metrics.DBPoolInUseConns.WithLabelValues(poolType).Set(float64(acquiredConns))
-
-	if exhaustionCount > 0 {
-		metrics.DBPoolExhaustion.WithLabelValues(poolType).Add(float64(exhaustionCount))
-	}
-
-	logger.Info("Pools health status", "component", "RESILIENT-FAILOVER", "type", poolType, "total_conns", totalConns, "idle", idleConns, "in_use", acquiredConns, "pools", len(pools))
 }
 
 // GetOrCreateMailboxByNameWithRetry retrieves a mailbox by name, creating it if it doesn't exist.

@@ -17,6 +17,7 @@ import (
 	"github.com/migadu/go-managesieve/managesieve"
 	"github.com/migadu/go-managesieve/managesieveserver"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
@@ -88,9 +89,10 @@ func (s *Session) AuthenticatePlain(_ context.Context, _, username, password str
 		if errors.As(err, &rateLimitErr) {
 			return &managesieveserver.Error{Message: `"Authentication failed"`, Close: true}
 		}
-		// Check if error is due to server shutdown or temporary unavailability
+		// Server shutdown or a service the login depends on is down: a temporary
+		// failure, RFC 5804 section 1.3 TRYLATER.
 		if server.IsTemporaryAuthFailure(err) {
-			return &managesieveserver.Error{Code: "UNAVAILABLE", Message: "Service temporarily unavailable, please try again later"}
+			return &managesieveserver.Error{Code: "TRYLATER", Message: "Service temporarily unavailable, please try again later"}
 		}
 		return &managesieveserver.Error{Message: `"Authentication failed"`}
 	}
@@ -99,8 +101,10 @@ func (s *Session) AuthenticatePlain(_ context.Context, _, username, password str
 	backendConnStart := time.Now()
 	if err := s.connectToBackendAndAuth(); err != nil {
 		s.DebugLog("backend connection/auth failed", "error", err)
+		// The client's credentials were accepted and the backend failed: a
+		// temporary failure, RFC 5804 section 1.3 TRYLATER.
 		if server.IsTemporaryAuthFailure(err) || server.IsBackendError(err) {
-			return &managesieveserver.Error{Code: "UNAVAILABLE", Message: "Backend server temporarily unavailable"}
+			return &managesieveserver.Error{Code: "TRYLATER", Message: "Backend server temporarily unavailable"}
 		}
 		return &managesieveserver.Error{Message: `"Backend server error"`}
 	}
@@ -277,7 +281,33 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		return err
 	}
 
-	// Check cache first (before rate limiter to avoid delays for cached successful auth)
+	// Check if the authentication attempt is allowed by the rate limiter using proxy-aware methods.
+	// Before the lookup cache: a blocked address or IP+username pair is refused whether or
+	// not the answer is cached (the cache only saves the database work), and a cached
+	// success must not be recorded for an attempt the limiter would have refused.
+	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey); err != nil {
+		// Check if this is a rate limit error
+		var rateLimitErr *server.RateLimitError
+		if errors.As(err, &rateLimitErr) {
+			s.InfoLog("rate limit exceeded",
+				"username", username,
+				"reason", rateLimitErr.Reason,
+				"failure_count", rateLimitErr.FailureCount,
+				"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
+
+			// Track rate limiting
+			metrics.ProtocolErrors.WithLabelValues("managesieve_proxy", "AUTH", "rate_limited", "client_error").Inc()
+
+			// Return the error - caller will send appropriate ManageSieve response
+			return rateLimitErr
+		}
+
+		// Unknown rate limiting error
+		metrics.ProtocolErrors.WithLabelValues("managesieve_proxy", "AUTH", "rate_limited", "client_error").Inc()
+		return err
+	}
+
+	// Check cache
 	// Use server name as cache key to avoid collisions between different proxies/servers
 	if s.server.lookupCache != nil {
 		if cached, found := s.server.lookupCache.Get(s.server.name, username); found {
@@ -295,6 +325,8 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					// by rate limiting, not by extending cache TTL.
 					s.DebugLog("cache hit - negative entry with same password", "username", username, "age", time.Since(cached.CreatedAt))
 					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
+					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
+					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 					return consts.ErrAuthenticationFailed
 				} else {
 					// Different password - ALWAYS revalidate (user might have fixed their password)
@@ -364,6 +396,11 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 						// Different password but too fresh
 						s.DebugLog("cache hit - positive entry with different password (too fresh)", "username", username, "age", time.Since(cached.CreatedAt))
 						metrics.CacheOperationsTotal.WithLabelValues("get", "hit_positive_fresh").Inc()
+						// Cost what a failed login for an unknown address costs, or the instant
+						// answer shows that this address has an account. (#346)
+						db.DummyVerifyPassword(password)
+						s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
+						metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 						return consts.ErrAuthenticationFailed
 					}
 				}
@@ -373,29 +410,6 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			s.DebugLog("cache miss", "username", username)
 			metrics.CacheOperationsTotal.WithLabelValues("get", "miss").Inc()
 		}
-	}
-
-	// Check if the authentication attempt is allowed by the rate limiter using proxy-aware methods
-	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey); err != nil {
-		// Check if this is a rate limit error
-		var rateLimitErr *server.RateLimitError
-		if errors.As(err, &rateLimitErr) {
-			s.InfoLog("rate limit exceeded",
-				"username", username,
-				"reason", rateLimitErr.Reason,
-				"failure_count", rateLimitErr.FailureCount,
-				"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
-
-			// Track rate limiting
-			metrics.ProtocolErrors.WithLabelValues("managesieve_proxy", "AUTH", "rate_limited", "client_error").Inc()
-
-			// Return the error - caller will send appropriate ManageSieve response
-			return rateLimitErr
-		}
-
-		// Unknown rate limiting error
-		metrics.ProtocolErrors.WithLabelValues("managesieve_proxy", "AUTH", "rate_limited", "client_error").Inc()
-		return err
 	}
 
 	// Parse username to check for master username or token suffix
@@ -459,15 +473,8 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		}
 
 		if err != nil {
-			// Categorize the error type to determine fallback behavior
-			if errors.Is(err, proxy.ErrRemoteLookupInvalidResponse) {
-				// Invalid response from remotelookup (malformed 2xx) - this is a server bug, fail hard
-				s.WarnLog("remotelookup invalid response - server bug", "error", err)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return fmt.Errorf("remotelookup server error: invalid response")
-			}
-
+			// Categorize the error type to determine fallback behavior. A malformed
+			// answer arrives as ErrRemoteLookupTransient: a broken lookup service.
 			if errors.Is(err, proxy.ErrRemoteLookupTransient) {
 				// Check if this is due to context cancellation (server shutdown)
 				if errors.Is(err, server.ErrServerShuttingDown) {
@@ -477,12 +484,14 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				}
 
 				// Transient error (network, 5xx, circuit breaker) - NEVER fallback to DB
-				// These are service availability issues, not "user not found" cases
-				s.DebugLog("remotelookup transient error - service unavailable", "error", err)
+				// These are service availability issues, not "user not found" cases.
+				// Nothing is wrong with the client's credentials: answer a temporary
+				// failure (NO (TRYLATER)) and do not charge the auth rate limiter, or
+				// clients retrying during an outage get delayed and blocked.
+				s.WarnLog("remotelookup transient error - service unavailable", "error", err)
 				metrics.RemoteLookupResult.WithLabelValues("managesieve", "transient_error_rejected").Inc()
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return fmt.Errorf("remotelookup service unavailable")
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+				return server.ErrAuthServiceUnavailable
 			} else {
 				// Unknown error type - log and fallthrough
 				s.WarnLog("remotelookup unknown error - attempting fallback", "error", err)
@@ -580,7 +589,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				// RemoteLookup service is temporarily unavailable - tell user to retry later
 				s.WarnLog("remotelookup service temporarily unavailable")
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
-				return fmt.Errorf("authentication service temporarily unavailable, please try again later")
+				return server.ErrAuthServiceUnavailable
 
 			case proxy.AuthUserNotFound:
 				// User not found in remotelookup (404/3xx)
@@ -648,19 +657,9 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				return server.ErrServerShuttingDown
 			}
 
-			// Determine failure reason for logging
-			reason := "transient_error"
-			if errors.Is(err, consts.ErrUserNotFound) || strings.Contains(err.Error(), "user not found") {
-				reason = "user_not_found"
-			} else if strings.Contains(err.Error(), "hashedPassword is not the hash") {
-				reason = "invalid_password"
-			}
-
 			// Cache negative result (authentication failed)
 			// Only cache auth failures, not transient DB errors
-			isDefinitiveFailure := errors.Is(err, consts.ErrUserNotFound) ||
-				strings.Contains(err.Error(), "hashedPassword is not the hash") ||
-				strings.Contains(err.Error(), "user not found")
+			reason, isDefinitiveFailure := proxy.ClassifyDBAuthFailure(err)
 
 			if isDefinitiveFailure {
 				if s.server.lookupCache != nil {
@@ -783,7 +782,7 @@ func (s *Session) connectToBackendAndAuth() error {
 		// Invalidate the cache so the next attempt re-resolves routing: a
 		// cached ServerAddress may be stale (e.g. account moved backends).
 		s.invalidateLookupCache("backend connect failure")
-		// Wrap with the sentinel so the client sees (UNAVAILABLE) instead of a
+		// Wrap with the sentinel so the client sees (TRYLATER) instead of a
 		// generic "Backend server error".
 		return fmt.Errorf("%w: failed to connect to backend: %w", server.ErrBackendConnectionFailed, err)
 	}

@@ -208,7 +208,8 @@ type POP3ProxyServerOptions struct {
 	MaxAuthErrors int // Maximum authentication errors before disconnection (0 = use default)
 
 	// Cluster support
-	ClusterManager *cluster.Manager // Optional: enables cluster-wide per-IP limiting
+	ClusterManager       *cluster.Manager                  // Optional: shares per-IP connection counts and auth rate limits with the cluster
+	ClusterRateLimitSync config.ClusterRateLimitSyncConfig // [cluster.rate_limit_sync]; read only with ClusterManager
 }
 
 func New(appCtx context.Context, hostname, addr string, rdb *resilient.ResilientDatabase, options POP3ProxyServerOptions) (*POP3ProxyServer, error) {
@@ -223,7 +224,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// Initialize remotelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
 	if options.RemoteLookup != nil && options.RemoteLookup.Enabled {
-		remotelookupClient, err := proxy.InitializeRemoteLookup("pop3", options.RemoteLookup)
+		remotelookupClient, err := proxy.InitializeRemoteLookup("pop3", options.RemoteLookup, options.RemotePort)
 		if err != nil {
 			logger.Debug("POP3 Proxy: Failed to initialize remotelookup client", "proxy", options.Name, "error", err)
 			if !options.RemoteLookup.ShouldLookupLocalUsers() {
@@ -307,6 +308,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("POP3-PROXY", options.Name, hostname, options.AuthRateLimit, options.TrustedProxies)
 	server.RegisterRateLimiter("pop3_proxy", options.Name, authLimiter)
+	authLimiter.JoinCluster(options.ClusterManager, options.ClusterRateLimitSync)
 
 	// Initialize connection limiter with trusted networks
 	var limiter *server.ConnectionLimiter
@@ -381,10 +383,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 			logger.Info("POP3 Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", options.Name, "error", err)
 			cleanupInterval = 5 * time.Minute
 		}
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize <= 0 {
-			maxSize = 10000
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// Parse positive revalidation window from config (used for password change detection)
 		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()

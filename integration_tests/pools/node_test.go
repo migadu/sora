@@ -249,8 +249,8 @@ timeout = "5s"
 		if resp := sieveAuth(t, sieveAddr, live); !strings.HasPrefix(resp, "OK") {
 			t.Fatalf("live user: %s", resp)
 		}
-		if resp := sieveAuth(t, sieveAddr, dead); !strings.HasPrefix(resp, "NO") {
-			t.Fatalf("dead pool: %s, want NO", resp)
+		if resp := sieveAuth(t, sieveAddr, dead); !strings.HasPrefix(resp, "NO (TRYLATER)") {
+			t.Fatalf("dead pool: %s, want NO (TRYLATER)", resp)
 		}
 	})
 	t.Run("LMTP", func(t *testing.T) {
