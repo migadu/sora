@@ -246,24 +246,22 @@ func canonicalMetadataEntry(entry string) string {
 }
 
 // validateMetadataEntry validates a (canonicalised) metadata entry name per
-// RFC 5464 §3.1 / §4.2.1: entry names live under the /private or /shared
-// hierarchies and, being astrings, may contain any character EXCEPT "*", "%",
-// non-ASCII octets, and control characters. Pass the canonical form.
+// RFC 5464 §3.2: the name lives under /private or /shared with at least one
+// more component, has no empty component (no "//", no trailing "/", so the
+// bare scope roots are not entry names), and contains no "*", "%", non-ASCII
+// octets or control characters. "Invalid entry names result in a BAD response
+// in any IMAP command in which they are used" (§3.2). Pass the canonical form.
 func validateMetadataEntry(entry string) error {
 	if entry == "" {
-		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeClientBug,
-			Text: "metadata entry name cannot be empty",
-		}
+		return invalidMetadataEntry("metadata entry name cannot be empty")
 	}
 
 	if !strings.HasPrefix(entry, "/private/") && !strings.HasPrefix(entry, "/shared/") {
-		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeClientBug,
-			Text: "metadata entry must start with /private/ or /shared/",
-		}
+		return invalidMetadataEntry("metadata entry must start with /private/ or /shared/")
+	}
+
+	if strings.HasSuffix(entry, "/") || strings.Contains(entry, "//") {
+		return invalidMetadataEntry(`metadata entry cannot end with "/" or contain "//"`)
 	}
 
 	// RFC 5464 forbids "*", "%", non-ASCII, and control characters (incl. DEL);
@@ -271,13 +269,17 @@ func validateMetadataEntry(entry string) error {
 	for i := 0; i < len(entry); i++ {
 		ch := entry[i]
 		if ch < 0x20 || ch >= 0x7f || ch == '*' || ch == '%' {
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeClientBug,
-				Text: fmt.Sprintf("metadata entry contains invalid character: %q", string(ch)),
-			}
+			return invalidMetadataEntry(fmt.Sprintf("metadata entry contains invalid character: %q", string(ch)))
 		}
 	}
 
 	return nil
+}
+
+func invalidMetadataEntry(text string) error {
+	return &imap.Error{
+		Type: imap.StatusResponseTypeBad,
+		Code: imap.ResponseCodeClientBug,
+		Text: text,
+	}
 }
