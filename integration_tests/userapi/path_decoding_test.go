@@ -140,3 +140,60 @@ func TestPathNamesDecodedOnce(t *testing.T) {
 		}
 	})
 }
+
+// TestNameEqualToEndpointIsAName checks that the endpoint suffixes (/messages,
+// /search, /subscribe, /unsubscribe, /activate) are only recognised after a
+// name: a top-level mailbox or a script whose whole name is an endpoint word is
+// still addressed as that name.
+func TestNameEqualToEndpointIsAName(t *testing.T) {
+	tc := setupTestServer(t)
+	tc.JWTToken = tc.loginFor(t, tc.TestUser.Email, tc.TestUser.Password)
+	ctx := context.Background()
+	accountID := tc.accountID(t)
+
+	do := func(t *testing.T, method, path string, body any) int {
+		t.Helper()
+		resp := tc.makeRequest(t, method, path, body)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	for _, name := range []string{"messages", "search", "subscribe", "unsubscribe"} {
+		t.Run("Mailbox_"+name, func(t *testing.T) {
+			if got := do(t, "POST", "/user/mailboxes", map[string]string{"name": name}); got != http.StatusCreated {
+				t.Fatalf("create mailbox %q: status %d, want 201", name, got)
+			}
+			if got := do(t, "GET", "/user/mailboxes/"+name+"/messages", nil); got != http.StatusOK {
+				t.Errorf("GET /user/mailboxes/%s/messages: status %d, want 200", name, got)
+			}
+			if got := do(t, "DELETE", "/user/mailboxes/"+name, nil); got != http.StatusOK {
+				t.Errorf("DELETE /user/mailboxes/%s: status %d, want 200", name, got)
+			}
+			if _, err := tc.RDB.GetMailboxByNameWithRetry(ctx, accountID, name); err == nil {
+				t.Errorf("mailbox %q still exists after DELETE", name)
+			}
+		})
+	}
+
+	t.Run("Filter_activate", func(t *testing.T) {
+		path := "/user/filters/activate"
+		if got := do(t, "PUT", path, map[string]string{"script": "keep;"}); got != http.StatusOK {
+			t.Fatalf("PUT %s: status %d, want 200", path, got)
+		}
+		if got := do(t, "GET", path, nil); got != http.StatusOK {
+			t.Errorf("GET %s: status %d, want 200", path, got)
+		}
+		if got := do(t, "POST", path+"/activate", nil); got != http.StatusOK {
+			t.Errorf("POST %s/activate: status %d, want 200", path, got)
+		}
+		if got := do(t, "DELETE", path, nil); got != http.StatusOK {
+			t.Errorf("DELETE %s: status %d, want 200", path, got)
+		}
+		if _, err := tc.RDB.GetScriptByNameWithRetry(ctx, "activate", accountID); err == nil {
+			t.Errorf("script %q still exists after DELETE", "activate")
+		}
+		if got := do(t, "GET", "/user/filters/capabilities", nil); got != http.StatusOK {
+			t.Errorf("GET /user/filters/capabilities: status %d, want 200", got)
+		}
+	})
+}
