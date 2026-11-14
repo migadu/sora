@@ -345,28 +345,38 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail string,
 		// Group by protocol. result.Count is the number of entries (one per tracker that
 		// knows the account), not of connections. An entry's total is its tracker's own
 		// sessions plus those other nodes report for the protocol, so the sessions on
-		// other nodes are in every entry of the protocol: they are counted once.
+		// other nodes are in every entry for that account and protocol: count them
+		// once. An address reused by another account can still match the old account's
+		// open sessions, so remote counts of different account IDs stay separate.
 		type protocolCount struct{ local, remote int }
-		protocolCounts := make(map[string]protocolCount)
+		type accountProtocol struct {
+			accountID int64
+			protocol  string
+		}
+		counts := make(map[accountProtocol]protocolCount)
 		for _, conn := range result.Connections {
-			c := protocolCounts[conn.Protocol]
+			key := accountProtocol{conn.AccountID, conn.Protocol}
+			c := counts[key]
 			c.local += conn.LocalCount
 			c.remote = max(c.remote, conn.TotalCount-conn.LocalCount)
-			protocolCounts[conn.Protocol] = c
+			counts[key] = c
+		}
+		protocolCounts := make(map[string]int)
+		for key, c := range counts {
+			protocolCounts[key.protocol] += c.local + c.remote
 		}
 		protocols := make([]string, 0, len(protocolCounts))
 		total := 0
 		for protocol, c := range protocolCounts {
 			protocols = append(protocols, protocol)
-			total += c.local + c.remote
+			total += c
 		}
 		sort.Strings(protocols)
 		fmt.Printf("Total connections: %d\n\n", total)
 
 		fmt.Println("By Protocol:")
 		for _, protocol := range protocols {
-			c := protocolCounts[protocol]
-			fmt.Printf("  %-12s %d\n", protocol+":", c.local+c.remote)
+			fmt.Printf("  %-12s %d\n", protocol+":", protocolCounts[protocol])
 		}
 		fmt.Println()
 

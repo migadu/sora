@@ -92,4 +92,20 @@ func TestConnectionTotalsCountConnectionsNotEntries(t *testing.T) {
 			t.Errorf("By Protocol has no line \"IMAP: 6\":\n%s", out)
 		}
 	})
+
+	t.Run("stats connection --user, reused address on different accounts", func(t *testing.T) {
+		// The endpoint matches the session's login address. Reassigning that address
+		// leaves existing sessions alone, so both account IDs can still be listed.
+		cfg := serveAdminAPIJSON(t, `{"email":"a@example.com","connections":[
+			{"protocol":"IMAP","instance":"IMAP-node-1-imap-proxy","account_id":1,"email":"a@example.com","local_count":1,"total_count":4},
+			{"protocol":"IMAP","instance":"IMAP-node-1-imap-proxy","account_id":2,"email":"a@example.com","local_count":2,"total_count":6}
+		],"count":2}`)
+		out := captureStdout(t, func() error { return showConnectionStats(ctx, cfg, "a@example.com", false) })
+		if want := "Total connections: 10\n"; !strings.Contains(out, want) {
+			t.Errorf("output does not contain %q:\n%s", want, out)
+		}
+		if row := rowFields(out, "IMAP:"); len(row) != 2 || row[1] != "10" {
+			t.Errorf("By Protocol has no line \"IMAP: 10\":\n%s", out)
+		}
+	})
 }
