@@ -208,6 +208,60 @@ var disabledCapCommands = []struct {
 		_, err := s.Sort(context.Background(), imapserver.NumKindSeq, []imap.SortCriterion{{Key: imap.SortKeyDisplayFrom}}, "UTF-8", &imap.SearchCriteria{}, &imap.SortOptions{ReturnAll: true})
 		return err
 	}},
+	{"THREAD=REFERENCES", "THREAD REFERENCES", threadCall(imap.ThreadReferences)},
+	{"THREAD=REFS", "THREAD REFS", threadCall(imap.ThreadRefs)},
+	{"THREAD=ORDEREDSUBJECT", "THREAD ORDEREDSUBJECT", threadCall(imap.ThreadOrderedSubject)},
+	{"MULTISEARCH", "ESEARCH IN (personal)", func(s *IMAPSession) error {
+		_, err := s.MultiSearch(context.Background(), &imap.SearchSource{Personal: true}, &imap.SearchCriteria{}, &imap.SearchOptions{ReturnAll: true})
+		return err
+	}},
+	{"UIDPLUS", "UID EXPUNGE", func(s *IMAPSession) error {
+		uids := imap.UIDSetNum(1)
+		return s.Expunge(context.Background(), nil, &uids)
+	}},
+	{"CREATE-SPECIAL-USE", "CREATE (USE (\\Archive))", func(s *IMAPSession) error {
+		return s.Create(context.Background(), "Arch", &imap.CreateOptions{SpecialUse: []imap.MailboxAttr{imap.MailboxAttrArchive}})
+	}},
+	{"SPECIAL-USE", "LIST (SPECIAL-USE)", func(s *IMAPSession) error {
+		return s.List(context.Background(), nil, "", []string{"*"}, &imap.ListOptions{SelectSpecialUse: true})
+	}},
+	{"SPECIAL-USE", "LIST RETURN (SPECIAL-USE)", func(s *IMAPSession) error {
+		return s.List(context.Background(), nil, "", []string{"*"}, &imap.ListOptions{ReturnSpecialUse: true})
+	}},
+	{"LIST-STATUS", "LIST RETURN (STATUS (MESSAGES))", func(s *IMAPSession) error {
+		return s.List(context.Background(), nil, "", []string{"*"}, &imap.ListOptions{ReturnStatus: &imap.StatusOptions{NumMessages: true}})
+	}},
+}
+
+func threadCall(algorithm imap.ThreadAlgorithm) func(s *IMAPSession) error {
+	return func(s *IMAPSession) error {
+		_, err := s.Thread(context.Background(), imapserver.NumKindSeq, algorithm, "UTF-8", &imap.SearchCriteria{})
+		return err
+	}
+}
+
+// keptCommands are commands that stay in the base protocol, or belong to
+// another capability, when cap is disabled: refusing them would take away more
+// than the capability added.
+var keptCommands = []struct {
+	cap  string
+	name string
+	call func(s *IMAPSession) error
+}{
+	{"UIDPLUS", "EXPUNGE", func(s *IMAPSession) error {
+		return s.Expunge(context.Background(), nil, nil)
+	}},
+	{"CREATE-SPECIAL-USE", "CREATE", func(s *IMAPSession) error {
+		return s.Create(context.Background(), "Plain", &imap.CreateOptions{})
+	}},
+	{"SPECIAL-USE", "LIST", func(s *IMAPSession) error {
+		return s.List(context.Background(), nil, "", []string{"*"}, &imap.ListOptions{})
+	}},
+	{"LIST-STATUS", "LIST", func(s *IMAPSession) error {
+		return s.List(context.Background(), nil, "", []string{"*"}, &imap.ListOptions{})
+	}},
+	{"THREAD=REFERENCES", "THREAD REFS", threadCall(imap.ThreadRefs)},
+	{"THREAD=REFS", "THREAD ORDEREDSUBJECT", threadCall(imap.ThreadOrderedSubject)},
 }
 
 func assertRefusedAsBad(t *testing.T, how, name string, err error) {
@@ -219,8 +273,10 @@ func assertRefusedAsBad(t *testing.T, how, name string, err error) {
 }
 
 // disabled_caps stopped only the advertising of MOVE, NAMESPACE, STATUS=SIZE,
-// METADATA and SORT: their commands kept working (#508). RFC 9051 §6 gives
-// "BAD - command unknown or arguments invalid" as the result of each command.
+// METADATA and SORT (#508), and of THREAD=*, MULTISEARCH, UIDPLUS,
+// CREATE-SPECIAL-USE, SPECIAL-USE and LIST-STATUS (#578): their commands kept
+// working. RFC 9051 §6 gives "BAD - command unknown or arguments invalid" as the
+// result of each command.
 func TestDisabledCaps_RefusesCommandsOfDisabledCapability(t *testing.T) {
 	for _, tc := range disabledCapCommands {
 		srv := newDisabledCapsTestServer(t, IMAPServerOptions{DisabledCaps: []string{tc.cap}})
@@ -244,5 +300,20 @@ func TestClientFilter_RefusesCommandsOfDisabledCapability(t *testing.T) {
 		s.sessionCaps.Store(caps)
 		err := callHandler(func() error { return tc.call(s) })
 		assertRefusedAsBad(t, "client filter disable_caps = ["+tc.cap+"]", tc.name, err)
+	}
+}
+
+// Disabling THREAD=*, MULTISEARCH, UIDPLUS, CREATE-SPECIAL-USE, SPECIAL-USE or
+// LIST-STATUS refuses only what that capability adds (#578): EXPUNGE, CREATE
+// without USE, a plain LIST and the THREAD algorithms still offered keep working.
+func TestDisabledCaps_KeepsCommandsOutsideDisabledCapability(t *testing.T) {
+	for _, tc := range keptCommands {
+		srv := newDisabledCapsTestServer(t, IMAPServerOptions{DisabledCaps: []string{tc.cap}})
+		s := newDisabledCapsTestSession(srv)
+		err := callHandler(func() error { return tc.call(s) })
+		var imapErr *imap.Error
+		if errors.As(err, &imapErr) && imapErr.Type == imap.StatusResponseTypeBad {
+			t.Errorf("disabled_caps = [%s]: %s was refused: %v", tc.cap, tc.name, err)
+		}
 	}
 }

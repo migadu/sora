@@ -73,7 +73,7 @@ type POP3ProxySession struct {
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
 	submittedUsername     string // Username exactly as submitted by the client (lookup-cache key)
 	utf8Requested         bool   // Client enabled UTF8 pre-auth; mirrored to the backend before AUTH (RFC 6856)
-	connRejected          bool   // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
+	connRegistered        bool   // connTracker.RegisterConnection accepted this session: close() unregisters only then
 	closed                bool   // Guards close() against double teardown (guarded by mutex)
 	pop3Conn              *pop3server.Conn
 }
@@ -1096,9 +1096,13 @@ func (s *POP3ProxySession) close() {
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits
 	// Background goroutine was causing leaks when server shutdown or high load prevented execution
 	// NOTE: accountID can be 0 for remotelookup accounts, so we don't check accountID > 0
-	// Skip unregister when registration was rejected; otherwise we would
-	// decrement a slot this session never held (limit erosion for the account).
-	if s.server.connTracker != nil && !s.connRejected {
+	// Only a session the tracker registered unregisters. The account ID is set
+	// as soon as the client's credentials are accepted, before the backend leg
+	// and the registration: a session whose backend leg failed, or whose
+	// registration was refused, holds no slot, and unregistering it would free
+	// the slot of another session of the account from the same IP.
+	if s.server.connTracker != nil && s.connRegistered {
+		s.connRegistered = false // the slot is released once, however often close() runs
 		// Use a new background context for this final operation, as s.ctx is likely already cancelled.
 		// UnregisterConnection is fast (in-memory only), so this won't block for long
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -1131,7 +1135,10 @@ func (s *POP3ProxySession) registerConnection() error {
 	defer cancel()
 
 	if s.server.connTracker != nil {
-		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "POP3", s.RemoteIP)
+		if err := s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "POP3", s.RemoteIP); err != nil {
+			return err
+		}
+		s.connRegistered = true
 	}
 	return nil
 }
@@ -1428,7 +1435,6 @@ func (s *POP3ProxySession) doLogin(ctx context.Context, username, password strin
 
 	if err := s.registerConnection(); err != nil {
 		s.InfoLog("connection rejected by connection tracker", "error", err)
-		s.connRejected = true
 		return &pop3server.Error{Code: "SYS/TEMP", Message: "Too many connections", Close: true}
 	}
 

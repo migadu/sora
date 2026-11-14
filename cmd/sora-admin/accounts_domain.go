@@ -37,16 +37,17 @@ func purgeDomainWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilient
 		return fmt.Errorf("failed to get accounts for domain: %w", err)
 	}
 
+	// With no account left the domain's cross-domain aliases are still removed below: a
+	// domain may hold only aliases, and a re-run after an alias failed finds no account.
 	if len(accounts) == 0 {
 		fmt.Printf("No accounts found for domain: %s\n", domain)
-		return nil
+	} else {
+		fmt.Printf("Found %d account(s) to purge:\n", len(accounts))
+		for i, acct := range accounts {
+			fmt.Printf("  %d. %s (ID: %d)\n", i+1, acct.PrimaryEmail, acct.AccountID)
+		}
+		fmt.Printf("\n")
 	}
-
-	fmt.Printf("Found %d account(s) to purge:\n", len(accounts))
-	for i, acct := range accounts {
-		fmt.Printf("  %d. %s (ID: %d)\n", i+1, acct.PrimaryEmail, acct.AccountID)
-	}
-	fmt.Printf("\n")
 
 	// Purge each account using the same logic as single account purge
 	successCount := 0
@@ -92,6 +93,9 @@ func purgeDomainWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilient
 	aliasAddrs, err := rdb.GetAliasCredentialsByDomain(ctx, domain)
 	if err != nil {
 		return fmt.Errorf("failed to scan for cross-domain aliases: %w", err)
+	}
+	if len(accounts) == 0 && len(aliasAddrs) == 0 {
+		return nil
 	}
 
 	aliasDeleted := 0
