@@ -1110,7 +1110,7 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 		}
 		if cred.Password != "" {
 			if err := ValidateNewHashType(req.Credentials[i].HashType); err != nil {
-				return 0, fmt.Errorf("credential %d: %w", i+1, err)
+				return 0, fmt.Errorf("%w: credential %d: %w", ErrInvalidAccountRequest, i+1, err)
 			}
 		}
 		if cred.PasswordHash != "" {

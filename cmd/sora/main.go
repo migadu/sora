@@ -439,6 +439,12 @@ func handleConfigReload(current, next *config.Config) {
 		logger.Warn("Config reload: servers.trusted_networks changed but requires restart to take effect; the networks the servers started with stay trusted until then",
 			"current", current.Servers.TrustedNetworks, "new", next.Servers.TrustedNetworks)
 	}
+
+	// The relay handler is built at start-up and keeps the [relay] it started with. One
+	// that start-up refuses is an error, not just a change: a restart would fail.
+	if err := next.Relay.Validate(); err != nil {
+		logger.Error("Config reload: [relay] is invalid and the server will not start with this config; the relay the server started with stays in use", "error", err)
+	}
 }
 
 // loadAndValidateConfig loads configuration from file and validates all server configurations
@@ -1349,7 +1355,21 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 
 	// Other proxy protocols use cluster-wide gossip tracking.
 	if clusterMgr == nil {
-		logger.Debug("Proxy: Connection tracking disabled (requires cluster mode)", "protocol", protocol, "name", serverName)
+		// Nothing else counts a user's connections through the proxy, so the per-user
+		// limits the block sets are not applied.
+		var limits []any
+		if maxConnectionsPerUser != 0 {
+			limits = append(limits, "max_connections_per_user", maxConnectionsPerUser)
+		}
+		if maxConnectionsPerUserPerIP != 0 {
+			limits = append(limits, "max_connections_per_user_per_ip", maxConnectionsPerUserPerIP)
+		}
+		if len(limits) == 0 {
+			logger.Debug("Proxy: Connection tracking disabled (requires cluster mode)", "protocol", protocol, "name", serverName)
+			return nil, ""
+		}
+		logger.Warn("Proxy: per-user connection limits are not applied without [cluster]: the proxy counts a user's connections only through the cluster connection tracker",
+			append([]any{"protocol", protocol, "name", serverName}, limits...)...)
 		return nil, ""
 	}
 
@@ -1385,14 +1405,14 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 	// Parse search rate limit window
 	searchRateLimitWindow, err := serverConfig.GetSearchRateLimitWindow()
 	if err != nil {
-		logger.Info("IMAP: Invalid search rate limit window - using default (1 minute)", "name", serverConfig.Name, "error", err)
+		logger.Warn("IMAP: Invalid limits.search_rate_limit_window - using default (1 minute)", "name", serverConfig.Name, "error", err)
 		searchRateLimitWindow = time.Minute
 	}
 
 	// Parse session memory limit
 	sessionMemoryLimit, err := serverConfig.GetSessionMemoryLimit()
 	if err != nil {
-		logger.Info("IMAP: Invalid session memory limit - using default (100MB)", "name", serverConfig.Name, "error", err)
+		logger.Warn("IMAP: Invalid limits.session_memory_limit - using default (100MB)", "name", serverConfig.Name, "error", err)
 		sessionMemoryLimit = 100 * 1024 * 1024
 	}
 
@@ -1400,7 +1420,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 	// default it is not downloaded for a preview either.
 	previewS3MaxSize, err := serverConfig.GetPreviewS3MaxSize(deps.config.LocalCache.GetMaxObjectSizeWithDefault())
 	if err != nil {
-		logger.Info("IMAP: Invalid preview_s3_max_size - using the cache's max_object_size", "name", serverConfig.Name, "error", err)
+		logger.Warn("IMAP: Invalid limits.preview_s3_max_size - using the cache's max_object_size", "name", serverConfig.Name, "error", err)
 		previewS3MaxSize = deps.config.LocalCache.GetMaxObjectSizeWithDefault()
 	}
 	previewOptions := imap.PreviewOptions{
@@ -1564,7 +1584,7 @@ func buildLMTPServerOptions(deps *serverDependencies, serverConfig config.Server
 
 	redirectRateWindow, err := serverConfig.GetRedirectRateWindow()
 	if err != nil {
-		logger.Info("LMTP: Invalid redirect rate window - using default (1 hour)", "name", serverConfig.Name, "error", err)
+		logger.Warn("LMTP: Invalid limits.redirect_rate_window - using default (1 hour)", "name", serverConfig.Name, "error", err)
 		redirectRateWindow = time.Hour
 	}
 
@@ -1615,7 +1635,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 
 	sessionMemoryLimit, err := serverConfig.GetSessionMemoryLimit()
 	if err != nil {
-		logger.Info("POP3: Invalid session memory limit - using default (100MB)", "name", serverConfig.Name, "error", err)
+		logger.Warn("POP3: Invalid limits.session_memory_limit - using default (100MB)", "name", serverConfig.Name, "error", err)
 		sessionMemoryLimit = 100 * 1024 * 1024
 	}
 
@@ -2403,7 +2423,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 
 	redirectRateWindow, err := serverConfig.GetRedirectRateWindow()
 	if err != nil {
-		logger.Info("Admin API: Invalid redirect rate window - using default (1 hour)", "name", serverConfig.Name, "error", err)
+		logger.Warn("Admin API: Invalid limits.redirect_rate_window - using default (1 hour)", "name", serverConfig.Name, "error", err)
 		redirectRateWindow = time.Hour
 	}
 

@@ -11,10 +11,10 @@ const SecretMask = "***MASKED***"
 
 // MaskSecrets replaces, in place, every non-empty string setting of cfg that is tagged
 // `secret:"true"`, or sits under such a field, with SecretMask, through nested blocks,
-// pointers and lists. An unset secret stays empty, so the output still tells it apart
-// from a set one. Mark a new secret setting with the tag rather than masking it at a
-// call site; TestConfigDumpMasksEverySecretField in cmd/sora-admin fails for one that
-// looks like a secret and is left untagged.
+// pointers, interfaces, maps and lists. An unset secret stays empty, so the output still
+// tells it apart from a set one. Mark a new secret setting with the tag rather than
+// masking it at a call site; TestConfigDumpMasksEverySecretField in cmd/sora-admin fails
+// for one that looks like a secret and is left untagged.
 // URL credentials are also masked in otherwise public strings (see maskURLCredentials),
 // keeping the endpoint's scheme, host and path useful for debugging.
 func MaskSecrets(cfg *Config) {
@@ -27,6 +27,16 @@ func maskSecrets(v reflect.Value, secret bool) {
 		if !v.IsNil() {
 			maskSecrets(v.Elem(), secret)
 		}
+	case reflect.Interface:
+		if !v.IsNil() {
+			elem := v.Elem()
+			cp := reflect.New(elem.Type()).Elem()
+			cp.Set(elem)
+			maskSecrets(cp, secret)
+			if v.CanSet() {
+				v.Set(cp)
+			}
+		}
 	case reflect.Struct:
 		typ := v.Type()
 		for i := 0; i < typ.NumField(); i++ {
@@ -38,6 +48,14 @@ func maskSecrets(v reflect.Value, secret bool) {
 		for i := 0; i < v.Len(); i++ {
 			maskSecrets(v.Index(i), secret)
 		}
+	case reflect.Map:
+		for iter := v.MapRange(); iter.Next(); {
+			val := iter.Value()
+			cp := reflect.New(val.Type()).Elem()
+			cp.Set(val)
+			maskSecrets(cp, secret)
+			v.SetMapIndex(iter.Key(), cp)
+		}
 	case reflect.String:
 		if secret && v.String() != "" {
 			v.SetString(SecretMask)
@@ -47,32 +65,92 @@ func maskSecrets(v reflect.Value, secret bool) {
 	}
 }
 
-// maskURLCredentials masks the credentials a URL can carry: its userinfo (HTTP Basic)
-// and the value of every query parameter. Endpoint APIs authenticate with query
-// parameters of any name (api_key, token, sig, ...), so no name tells a credential
-// from a routing parameter. Parameter names, scheme, host, port, path and fragment
-// are kept; a value that is not a URL is returned unchanged.
+// maskURLCredentials masks the credentials any URL in value can carry: its userinfo
+// (HTTP Basic) and the value of every query parameter. Endpoint APIs authenticate with
+// query parameters of any name (api_key, token, sig, ...), so no name tells a credential
+// from a routing parameter. Sub-scheme prefixes (jdbc:postgresql://...), leading slashes
+// or whitespace, embedded URLs in paths/fragments, and comma- or space-separated URLs
+// preserve their surrounding text, scheme, host, port, path and fragment; a malformed
+// credential-bearing URL is replaced whole with SecretMask.
 func maskURLCredentials(value string) string {
-	start := strings.Index(value, "://")
-	if start < 0 {
+	if !strings.Contains(value, "://") {
 		return value
 	}
-	authority := value[start+3:]
+
+	var out strings.Builder
+	s := value
+	for {
+		colonSlash := strings.Index(s, "://")
+		if colonSlash < 0 {
+			out.WriteString(s)
+			break
+		}
+		schemeStart := schemeStartAt(s, colonSlash)
+		afterColonSlash := colonSlash + 3
+		urlEnd := findURLEnd(s, schemeStart, afterColonSlash)
+
+		if schemeStart == colonSlash {
+			// No valid RFC 3986 scheme precedes "://": fail closed if the candidate
+			// carries userinfo or query parameters, otherwise leave it unchanged.
+			candidate := s[afterColonSlash:urlEnd]
+			authority := candidate
+			if end := strings.IndexAny(authority, "/?#"); end >= 0 {
+				authority = authority[:end]
+			}
+			beforeFragment, _, _ := strings.Cut(candidate, "#")
+			if strings.Contains(authority, "@") || strings.Contains(beforeFragment, "?") {
+				return SecretMask
+			}
+			out.WriteString(s[:afterColonSlash])
+			s = s[afterColonSlash:]
+			continue
+		}
+
+		out.WriteString(s[:schemeStart])
+		masked, failed := maskSingleURL(s[schemeStart:urlEnd])
+		if failed {
+			return SecretMask
+		}
+		out.WriteString(masked)
+		s = s[urlEnd:]
+	}
+	return out.String()
+}
+
+func maskSingleURL(value string) (string, bool) {
+	start := strings.Index(value, "://")
+	if start < 0 {
+		return value, false
+	}
+	rest := value[start+3:]
+	authority := rest
 	if end := strings.IndexAny(authority, "/?#"); end >= 0 {
 		authority = authority[:end]
 	}
 	beforeFragment, _, _ := strings.Cut(value, "#")
-	if !strings.Contains(authority, "@") && !strings.Contains(beforeFragment, "?") {
-		return value
+	hasQuery := strings.Contains(beforeFragment, "?")
+	// A second "://" with no query before it means findURLEnd saw no path, fragment,
+	// query, or list separator before that "://" (e.g. unencoded "://" in userinfo).
+	if strings.Contains(rest, "://") && !hasQuery {
+		return SecretMask, true
+	}
+	if !strings.Contains(authority, "@") && !hasQuery {
+		return value, false
 	}
 	u, err := url.Parse(value)
 	if err != nil {
 		// The dump accepts unvalidated endpoint strings. Do not print credentials
 		// just because another part of their URL has an invalid escape or port.
-		return SecretMask
+		return SecretMask, true
 	}
 	if u.User == nil && u.RawQuery == "" {
-		return value
+		if strings.Contains(authority, "@") {
+			return SecretMask, true
+		}
+		if _, query, ok := strings.Cut(beforeFragment, "?"); ok && query != "" {
+			return SecretMask, true
+		}
+		return value, false
 	}
 	if u.User != nil {
 		if _, hasPassword := u.User.Password(); hasPassword {
@@ -82,7 +160,100 @@ func maskURLCredentials(value string) string {
 		}
 	}
 	u.RawQuery = maskQueryValues(u.RawQuery)
-	return u.String()
+	return u.String(), false
+}
+
+// findURLEnd returns the end offset in s of the URL whose scheme starts at schemeStart
+// and whose "://" ends at afterColonSlash.
+func findURLEnd(s string, schemeStart, afterColonSlash int) int {
+	urlEnd := len(s)
+	searchFrom := afterColonSlash
+	for searchFrom < len(s) {
+		rel := strings.Index(s[searchFrom:], "://")
+		if rel < 0 {
+			break
+		}
+		nextColon := searchFrom + rel
+		nextScheme := afterColonSlash + schemeStartAt(s[afterColonSlash:], nextColon-afterColonSlash)
+		between := s[afterColonSlash:nextScheme]
+
+		if hashIdx := strings.IndexByte(between, '#'); hashIdx >= 0 {
+			urlEnd = afterColonSlash + hashIdx
+			break
+		}
+		if qIdx := strings.IndexByte(between, '?'); qIdx >= 0 {
+			// If whitespace separates a standalone second URL (with no '&' continuing
+			// an outer query after it), end at that whitespace; otherwise keep the
+			// whole query so maskQueryValues masks every parameter, stopping only if a
+			// later #fragment itself embeds another URL.
+			if wsIdx := strings.IndexFunc(between[qIdx:], func(r rune) bool {
+				return r == ' ' || r == '\t' || r == '\r' || r == '\n'
+			}); wsIdx >= 0 && !strings.Contains(s[nextScheme:], "&") {
+				urlEnd = afterColonSlash + qIdx + wsIdx
+				break
+			}
+			if hashAfter := strings.IndexByte(s[nextScheme:], '#'); hashAfter >= 0 && strings.Contains(s[nextScheme+hashAfter:], "://") {
+				urlEnd = nextScheme + hashAfter
+			}
+			break
+		}
+
+		// No '#' or '?' before nextScheme: check for a list separator or path boundary.
+		end := nextScheme
+		if end > afterColonSlash && s[end-1] == ':' {
+			sub := afterColonSlash + schemeStartAt(s[afterColonSlash:], end-1-afterColonSlash)
+			if sub < end-1 && sub > afterColonSlash && isURLListSep(s[sub-1]) {
+				end = sub
+			}
+		}
+		for end > afterColonSlash && isURLListSep(s[end-1]) {
+			end--
+		}
+		if end < nextScheme {
+			urlEnd = end
+			break
+		}
+		if slashIdx := strings.LastIndexByte(between, '/'); slashIdx >= 0 {
+			urlEnd = afterColonSlash + slashIdx + 1
+			break
+		}
+
+		// Still inside authority with no boundary (e.g. unencoded "://" in userinfo):
+		// keep together so maskSingleURL fails closed.
+		searchFrom = nextColon + 3
+	}
+
+	for urlEnd > schemeStart && isASCIIWhitespace(s[urlEnd-1]) {
+		urlEnd--
+	}
+	return urlEnd
+}
+
+func schemeStartAt(s string, colonSlash int) int {
+	start := colonSlash
+	for start > 0 && isSchemeChar(s[start-1]) {
+		start--
+	}
+	for start < colonSlash && !isASCIILetter(s[start]) {
+		start++
+	}
+	return start
+}
+
+func isASCIILetter(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+func isSchemeChar(b byte) bool {
+	return isASCIILetter(b) || (b >= '0' && b <= '9') || b == '+' || b == '-' || b == '.'
+}
+
+func isASCIIWhitespace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\r' || b == '\n'
+}
+
+func isURLListSep(b byte) bool {
+	return isASCIIWhitespace(b) || b == ',' || b == ';'
 }
 
 // urlTemplates are the query values remote lookup replaces per request

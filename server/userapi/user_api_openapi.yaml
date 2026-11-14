@@ -304,17 +304,21 @@ paths:
             type: string
         - name: from
           in: query
-          description: Filter by sender email
+          description: |
+            Only messages whose sender's address or name contains this text
+            (case-insensitive, literal). ANDed with `q`.
           schema:
             type: string
         - name: subject
           in: query
-          description: Filter by subject
+          description: |
+            Only messages whose subject contains this text (case-insensitive,
+            literal). ANDed with `q`.
           schema:
             type: string
         - name: unseen
           in: query
-          description: Only unseen messages
+          description: Only messages without the \Seen flag when `true`. ANDed with `q`.
           schema:
             type: boolean
       responses:

@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 )
@@ -73,14 +74,21 @@ func (d *Database) ListRekeyCandidates(ctx context.Context, accountID int64, aft
 // references any more is deleted. Both decisions use ftsKeyReferencedSQL, the predicate of the
 // orphan sweep, so a row another account (or another S3 path) still needs is kept. The text,
 // vector and sent_date are copied rather than recomputed: the vector is the only copy of the
-// indexed text.
+// indexed text. First, a row of the old hash still waiting for the FTS worker gets its vector
+// (fillWaitingFTSRows): the sibling the worker would copy it from may be the row deleted
+// here, and the waiting row's copy under the new hash has no sibling at all.
+//
+// COPY and MOVE take the account's rekey lock shared before they read a source row's hash
+// (lockRekeySources), and this takes it exclusively, so every row that carries the old hash
+// is seen: a copy that read the old hash has ended by then, and a later one reads the new
+// hash.
 //
 // The sweep and the stagers coordinate through advisory locks on hashtext(hash) (see
 // DeleteMessagesFTSByKeyBatch). The new hash's rows are written under the shared lock, as
 // delivery does, so a sweep cannot delete a row the uncommitted messages need. The old hash's
 // rows are deleted under the exclusive lock, as the sweep does, so a delivery or COPY still
-// staging that hash is waited for and its rows are seen. Both are taken before any row is
-// touched, so this cannot wait on a lock while holding row locks.
+// staging that hash is waited for and its rows are seen. All the locks are taken before any
+// row is touched, so this cannot wait on a lock while holding row locks.
 func (d *Database) RekeyContentHash(ctx context.Context, tx pgx.Tx, accountID int64, obj ContentObject, newHash string) (int64, error) {
 	var pending bool
 	if err := tx.QueryRow(ctx,
@@ -92,6 +100,10 @@ func (d *Database) RekeyContentHash(ctx context.Context, tx pgx.Tx, accountID in
 		return 0, ErrRekeyUploadPending
 	}
 
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int4, hashint8($2::int8))",
+		consts.SoraContentRekeyLockClassID, accountID); err != nil {
+		return 0, fmt.Errorf("failed to lock the account against copies: %w", err)
+	}
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, hashtext($2))",
 		consts.SoraFTSOrphanSweepLockClassID, obj.ContentHash); err != nil {
 		return 0, fmt.Errorf("failed to lock the old hash's fts rows: %w", err)
@@ -118,6 +130,10 @@ func (d *Database) RekeyContentHash(ctx context.Context, tx pgx.Tx, accountID in
 		return 0, fmt.Errorf("failed to re-key messages: %w", err)
 	}
 
+	if err := fillWaitingFTSRows(ctx, tx, obj.ContentHash); err != nil {
+		return 0, err
+	}
+
 	// Every parameter is cast: in "INSERT ... SELECT $2" PostgreSQL would deduce $2 as text
 	// in the select list and as varchar in the comparisons.
 	if _, err := tx.Exec(ctx, `
@@ -139,6 +155,46 @@ func (d *Database) RekeyContentHash(ctx context.Context, tx pgx.Tx, accountID in
 	}
 
 	return tag.RowsAffected(), nil
+}
+
+// fillWaitingFTSRows gives the rows of hash that wait for a sibling's vector -- no text, no
+// vector, as restageFTS writes them for a copy into another account and stageFTS for a body
+// another account has indexed -- what the FTS worker would give them: the hash's vector, or,
+// while the hash's text is not tokenised yet, that text. It does not skip a row the worker has
+// polled: the worker fills it from a sibling that stays until this transaction commits, and
+// the update then finds it filled.
+func fillWaitingFTSRows(ctx context.Context, tx pgx.Tx, hash string) error {
+	if _, err := tx.Exec(ctx, `
+		UPDATE messages_fts_v2 t
+		SET text_body_tsv = s.tsv, text_body = CASE WHEN s.tsv IS NULL THEN s.text END
+		FROM (SELECT `+ftsSourceVectorSQL("$1::varchar(64)")+` AS tsv,
+		             (SELECT v.text_body FROM messages_fts_v2 v
+		               WHERE v.content_hash = $1::varchar(64) AND v.text_body IS NOT NULL LIMIT 1) AS text) s
+		WHERE t.content_hash = $1::varchar(64) AND t.text_body_tsv IS NULL AND t.text_body IS NULL
+		  AND (s.tsv IS NOT NULL OR s.text IS NOT NULL)`, hash); err != nil {
+		return fmt.Errorf("failed to fill waiting fts rows of the old hash: %w", err)
+	}
+	return nil
+}
+
+// lockRekeySources takes, in shared mode, the rekey lock of every account that owns one of
+// the rows uids name in srcMailboxID. COPY and MOVE take it before they read a source row's
+// hash or lock the row, and RekeyContentHash takes it exclusively, so a rekey never runs
+// between that read and the commit: it would not see the copied rows and would delete the
+// FTS row of the old hash they need. A copy that reads after a rekey reads the new hash (and
+// refuses it for another account: ErrCopySourceChanged, ErrMoveSourceChanged). It may be
+// taken while holding mailbox row locks, which a rekey never waits for.
+//
+// One lock per account, not per body, so a bulk copy cannot fill the lock table. The rows
+// are read unlocked, expunged or not: a rekey changes a row's hash, never its account.
+func lockRekeySources(ctx context.Context, tx pgx.Tx, srcMailboxID int64, uids *[]imap.UID) error {
+	if _, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock_shared($1::int4, hashint8(a.account_id))
+		FROM (SELECT DISTINCT account_id FROM messages WHERE mailbox_id = $2 AND uid = ANY($3)) a`,
+		consts.SoraContentRekeyLockClassID, srcMailboxID, uids); err != nil {
+		return fmt.Errorf("failed to lock the source accounts against a rekey: %w", err)
+	}
+	return nil
 }
 
 // IsContentObjectReferenced reports whether any message row, of any account and expunged or
