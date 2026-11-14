@@ -135,6 +135,25 @@ func (deps *serverDependencies) registerServer(name string, server ConfigReloade
 	deps.runningServers[name] = server
 }
 
+// relayQueueOption is the relay queue as the servers' delivery.RelayQueue option: a nil
+// interface on a node without [relay]. Assigning the nil *relayqueue.DiskQueue directly
+// would store a nil pointer in a non-nil interface, so every "relay not configured" check
+// (RelayQueue == nil) would take the configured branch and call Enqueue on the nil queue.
+func (deps *serverDependencies) relayQueueOption() delivery.RelayQueue {
+	if deps.relayQueue == nil {
+		return nil
+	}
+	return deps.relayQueue
+}
+
+// relayWorkerOption is relayQueueOption for the worker LMTP wakes after an enqueue.
+func (deps *serverDependencies) relayWorkerOption() lmtp.RelayWorkerNotifier {
+	if deps.relayWorker == nil {
+		return nil
+	}
+	return deps.relayWorker
+}
+
 func main() {
 	errorHandler := errors.NewErrorHandler()
 	cfg := config.NewDefaultConfig()
@@ -1523,8 +1542,8 @@ func buildLMTPServerOptions(deps *serverDependencies, serverConfig config.Server
 	return lmtp.LMTPServerOptions{
 		InstanceID:              deps.instanceID,
 		MaintenanceGate:         deps.maintenanceGate,
-		RelayQueue:              deps.relayQueue,  // Global relay queue
-		RelayWorker:             deps.relayWorker, // Global relay worker for immediate processing
+		RelayQueue:              deps.relayQueueOption(),  // Global relay queue; nil without [relay]
+		RelayWorker:             deps.relayWorkerOption(), // Global relay worker for immediate processing
 		TLSVerify:               serverConfig.TLSVerify,
 		TLS:                     serverConfig.TLS,
 		TLSCertFile:             serverConfig.TLSCertFile,
@@ -2418,7 +2437,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		Uploader:           deps.uploadWorker,
 		Storage:            deps.storage,
 		PurgeWorker:        deps.purgeWorker,
-		RelayQueue:         deps.relayQueue, // Global relay queue
+		RelayQueue:         deps.relayQueueOption(), // Global relay queue; nil without [relay]
 		MaxMessageSize:     serverConfig.GetMaxMessageSizeWithDefault(),
 		MaxConnections:     serverConfig.MaxConnections,
 		TLS:                serverConfig.TLS,
