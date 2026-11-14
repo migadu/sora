@@ -1233,7 +1233,7 @@ The Admin API has no request or authentication rate limiting of its own. A missi
 - **`allowed_hosts`**: the IP addresses and CIDR ranges allowed to use the API. A request from any other address is answered `403 {"error": "Host not allowed"}` before its key is compared. An empty list allows every client.
 - **A long random `api_key`** (and `read_only_api_key`): 32 or more random characters, so that guessing one is not practical at any request rate.
 - **`max_connections`**: caps the concurrent connections of the listener, all clients together (`0`, the default, means unlimited). `max_connections_per_ip` does not apply to the Admin API.
-- **A reverse proxy** in front of it, for per-client request or failed-authentication limits.
+- **A reverse proxy** in front of it, for per-client request or failed-authentication limits. `allowed_hosts` then matches the proxy's address, not the client's: the API never reads `X-Forwarded-For` or `X-Real-IP`. Restrict clients in the proxy, or have the proxy send a PROXY protocol header and set `proxy_protocol = true` (headers are accepted only from `trusted_networks`; any other connection is refused).
 
 ## Best Practices
 
