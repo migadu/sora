@@ -668,7 +668,8 @@ Full-text search messages in a mailbox.
 - `unseen=true` - Only unseen messages
 
 The filters are optional, case-insensitive and literal (no wildcards); each one that is
-given narrows the result for `q`.
+given narrows the result for `q`. A `from` or `subject` that holds a NUL or bytes that are
+not UTF-8 is refused with `400 Bad Request`.
 
 **Response:** `200 OK`
 ```json
