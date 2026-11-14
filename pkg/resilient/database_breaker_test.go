@@ -93,11 +93,8 @@ func TestDatabaseBreakerIsSuccessful(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := !isQuerySuccessful(tt.err); got != tt.failure {
-				t.Errorf("query breaker counts %v as a failure: %v, want %v", tt.err, got, tt.failure)
-			}
-			if got := !isWriteSuccessful(tt.err); got != tt.failure {
-				t.Errorf("write breaker counts %v as a failure: %v, want %v", tt.err, got, tt.failure)
+			if got := !isBreakerSuccess(tt.err); got != tt.failure {
+				t.Errorf("breakers count %v as a failure: %v, want %v", tt.err, got, tt.failure)
 			}
 		})
 	}
