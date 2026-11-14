@@ -205,7 +205,7 @@ func handleConfigDump(_ context.Context) {
 	// Parse additional flags after the subcommand
 	flagSet := flag.NewFlagSet("config-dump", flag.ExitOnError)
 	flagSet.StringVar(&format, "format", "toml", "Output format: toml or json")
-	flagSet.BoolVar(&maskSecrets, "mask-secrets", true, "Mask sensitive values (passwords, keys)")
+	flagSet.BoolVar(&maskSecrets, "mask-secrets", true, "Mask sensitive values (passwords, keys, URL userinfo and query values)")
 	flagSet.Usage = func() {
 		fmt.Printf(`Dump the parsed configuration for debugging
 
@@ -214,7 +214,8 @@ Usage:
 
 Options:
   --format FORMAT      Output format: toml or json (default: toml)
-  --mask-secrets       Mask sensitive values like passwords (default: true)
+  --mask-secrets       Mask sensitive values: passwords, keys, and the userinfo
+                       and query values of URLs (default: true)
 
 Examples:
   sora-admin --config sora.config.toml config dump
