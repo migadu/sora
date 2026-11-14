@@ -392,8 +392,12 @@ func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
 	}
 
 	info.FailureCount = max(info.FailureCount, event.FailureCount)
-	if event.LastDelay > info.LastDelay {
-		info.LastDelay = event.LastDelay
+	// A peer's delay is capped by this node's max_delay, as every local step
+	// is in updateFailureTracking. Peers of one protocol may run with other
+	// limits (a rolling change of max_delay, or two [[server]] entries of the
+	// same protocol), and a longer delay of theirs must not apply here.
+	if delay := min(event.LastDelay, crl.limiter.config.MaxDelay); delay > info.LastDelay {
+		info.LastDelay = delay
 	}
 	if !event.FirstFailure.IsZero() && event.FirstFailure.Before(info.FirstFailure) {
 		info.FirstFailure = event.FirstFailure

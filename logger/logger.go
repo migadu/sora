@@ -421,6 +421,7 @@ func Initialize(cfg config.LoggingConfig) (*LogFile, error) {
 	l := slog.New(handler)
 	globalLogger.Store(l)
 	slog.SetDefault(l)
+	release(handler) // what was logged since Hold
 
 	return logFile, nil
 }
@@ -499,6 +500,7 @@ func ErrorContext(ctx context.Context, msg string, args ...any) {
 // Fatal logs a fatal message and exits
 func Fatal(msg string, args ...any) {
 	Get().Error(msg, args...)
+	Sync()
 	os.Exit(1)
 }
 
@@ -540,10 +542,16 @@ func Errorf(format string, args ...any) {
 // Fatalf logs a fatal message with formatting and exits (compatibility)
 func Fatalf(format string, args ...any) {
 	Get().Error(fmt.Sprintf(format, args...))
+	Sync()
 	os.Exit(1)
 }
 
-// Sync flushes any buffered log entries (no-op for slog, kept for compatibility)
+// Sync writes to stderr what Hold keeps when Initialize has not run, for a process that
+// stops before its logging is configured. Otherwise there is nothing to flush: slog does
+// not buffer.
 func Sync() error {
+	if held.Load() != nil {
+		release(slog.NewTextHandler(os.Stderr, nil))
+	}
 	return nil
 }

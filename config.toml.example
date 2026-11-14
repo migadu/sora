@@ -1559,6 +1559,10 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # for a lookup that fails or answers nothing usable: with pools, no answer is never a
 # guess at the default pool.
 #
+# A User API proxy sends a CORS preflight, which names no user and reaches no account,
+# to the default pool, else to the first pool in this file's order with a backend
+# available. Give the http_user_api backends of every pool the same allowed_origins.
+#
 # A backend in maintenance (see BACKEND MAINTENANCE) is skipped inside its pool. A user
 # the API pins with "server" to a backend in maintenance is routed among the other
 # members of that backend's pool, and refused when its pool is unknown or none is
@@ -2358,6 +2362,9 @@ tls_verify = false
 #remote_addrs = ["backend1:8081", "backend2:8081", "backend3:8081"]  # Backend User API servers
 #remote_port = 8081                  # Default backend port if not specified in remote_addrs
 #jwt_secret = "your-secret-jwt-signing-key-here"  # REQUIRED: Same JWT secret as backend servers
+#allowed_origins = ["https://mail.example.com"]  # Same list as the backends' allowed_origins. CORS headers for the errors the proxy
+                                    # answers itself (401 for a refused token, 502/503 when no backend answers), so a browser client
+                                    # can read them; responses a backend answers carry the backend's own. Empty = none.
 #max_connections = 10000             # Maximum total concurrent connections (0 = unlimited)
 #max_connections_per_ip = 100        # Maximum connections per client IP (0 = unlimited)
 #connect_timeout = "10s"             # Timeout for establishing backend connections
