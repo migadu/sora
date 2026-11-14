@@ -7,7 +7,8 @@ import (
 )
 
 // Dovecot's subscriptions file, as src/lib-storage/list/subscription-file.c reads and
-// writes it. A version 2 file starts with exactly dovecotSubscriptionsV2Header; each
+// writes it. Dovecot's version 2 header is dovecotSubscriptionsV2Header; this importer
+// also accepts it after CRLF conversion. Each
 // line after it is one mailbox name whose hierarchy levels are joined with TAB, each
 // level tab-escaped (str_append_tabescaped). A file without that header is the old
 // unversioned format, one storage name per line (index_storage_set_subscribed writes
