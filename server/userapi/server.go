@@ -589,6 +589,15 @@ func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 	s.writeJSON(w, status, map[string]string{"error": message})
 }
 
+// writeTokenRefused answers 401 for a bearer token the request presented and that was
+// refused: expired, malformed, badly signed, or no longer valid for its account. The
+// challenge says error="invalid_token" (RFC 6750 section 3.1), so a client can tell it
+// apart from a request that carried no token.
+func (s *Server) writeTokenRefused(w http.ResponseWriter) {
+	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, true)
+	s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+}
+
 // getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {

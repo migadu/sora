@@ -1075,7 +1075,7 @@ The Admin API uses standard HTTP status codes and returns JSON error responses.
 | 201 | Created | Resource created successfully |
 | 207 | Multi-Status | Partial success (e.g., partial mail delivery) |
 | 400 | Bad Request | Invalid request parameters or body |
-| 401 | Unauthorized | Missing or invalid API key |
+| 401 | Unauthorized | Missing or non-Bearer `Authorization` header; carries `WWW-Authenticate: Bearer realm="admin-api"` |
 | 403 | Forbidden | Operation not allowed |
 | 404 | Not Found | Resource not found |
 | 409 | Conflict | Resource already exists |
