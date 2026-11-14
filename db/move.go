@@ -42,7 +42,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	`, srcMailboxID, ids)
 	if err != nil {
 		logger.Error("Database: failed to query source messages", "err", err)
-		return nil, consts.ErrInternalError
+		return nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 	defer rows.Close()
 
@@ -75,7 +75,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + $1 WHERE id = $2 RETURNING highest_uid`, numToMove, destMailboxID).Scan(&newHighestUID)
 	if err != nil {
 		logger.Error("Database: failed to update highest UID", "err", err)
-		return nil, consts.ErrDBUpdateFailed
+		return nil, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 	}
 
 	// Calculate the new UIDs for the moved messages.

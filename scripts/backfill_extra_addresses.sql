@@ -121,10 +121,10 @@ DECLARE
 	n bigint;
 	total bigint := 0;
 BEGIN
-	IF p_batch <= 0 THEN
+	IF p_batch IS NULL OR p_batch <= 0 THEN
 		RAISE EXCEPTION 'p_batch must be positive, got %', p_batch;
 	END IF;
-	IF p_sleep_ms < 0 THEN
+	IF p_sleep_ms IS NULL OR p_sleep_ms < 0 THEN
 		RAISE EXCEPTION 'p_sleep_ms must not be negative, got %', p_sleep_ms;
 	END IF;
 	SELECT min(id), COALESCE(hi, max(id)) INTO lo_bound, hi FROM messages;

@@ -751,7 +751,7 @@ type ConnectionInfo struct {
 	LocalCount int       `json:"local_count"` // the account's sessions on this tracker
 	TotalCount int       `json:"total_count"` // LocalCount plus the sessions other nodes report for the protocol through gossip
 	LastUpdate time.Time `json:"last_update"`
-	Email      string    `json:"email"` // address the sessions logged in with
+	Email      string    `json:"email"` // address of the session that created the entry (the recipient on an LMTP proxy)
 }
 
 // UserConnectionInfo is one entry of GET /admin/connections/user/{email}. Unlike
@@ -2043,8 +2043,7 @@ func (s *Server) handleAuthBlocked(w http.ResponseWriter, r *http.Request) {
 // Message restoration handlers
 
 func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/accounts/{email}/messages/deleted
-	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/messages/deleted")
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	// Parse query parameters
@@ -2117,8 +2116,7 @@ func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	// Extract email from path: /admin/accounts/{email}/messages/restore
-	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/messages/restore")
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	var req struct {

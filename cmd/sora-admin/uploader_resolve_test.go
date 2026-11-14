@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -46,4 +50,28 @@ func TestStagedBodyState(t *testing.T) {
 	assert.Equal(t, stagedSizeMismatch, stagedBodyState(path, 5), "wrong size")
 
 	assert.Equal(t, stagedAbsent, stagedBodyState(dir, 4), "a directory is not a body")
+}
+
+// With the default [uploader] path, the bodies a previous release staged under its /tmp
+// default are intact but not where resolve looks: it would [DELETE] their messages. It
+// must refuse before touching the database, as the server refuses to start.
+func TestResolveRefusesWhileLegacySpoolHoldsBodies(t *testing.T) {
+	legacy := filepath.Join(t.TempDir(), "uploads")
+	body := filepath.Join(legacy, "42", strings.Repeat("a", 64))
+	require.NoError(t, os.MkdirAll(filepath.Dir(body), 0o755))
+	require.NoError(t, os.WriteFile(body, []byte("staged"), 0o644))
+
+	saved := legacyUploaderPath
+	legacyUploaderPath = legacy
+	t.Cleanup(func() { legacyUploaderPath = saved })
+
+	var cfg AdminConfig
+	cfg.Uploader.Path = config.DefaultUploaderPath
+	cfg.Uploader.MaxAttempts = 1
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := resolveFailedUploads(ctx, cfg, false, 1)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), body, "the error names the stranded body")
 }

@@ -63,9 +63,9 @@ func TestExtraAddressesBackfillMatchesWriter(t *testing.T) {
 	// A zero batch never advances hi; a negative one walks upwards forever.
 	// Reject these before the procedure starts its transaction-control loop.
 	for _, tc := range []struct {
-		batch, sleep int
+		batch, sleep any
 		want         string
-	}{{0, 100, "p_batch must be positive"}, {-1, 100, "p_batch must be positive"}, {5000, -1, "p_sleep_ms must not be negative"}} {
+	}{{0, 100, "p_batch must be positive"}, {-1, 100, "p_batch must be positive"}, {nil, 100, "p_batch must be positive"}, {5000, -1, "p_sleep_ms must not be negative"}, {5000, nil, "p_sleep_ms must not be negative"}} {
 		_, err = tx.Exec(ctx, "SAVEPOINT invalid_settings")
 		require.NoError(t, err)
 		_, err = tx.Exec(ctx, "CALL sora_backfill_extra_addresses(NULL, $1, $2)", tc.batch, tc.sleep)

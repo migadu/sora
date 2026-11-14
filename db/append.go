@@ -119,7 +119,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	// Get the source message IDs and UIDs
 	rows, err := tx.Query(ctx, `SELECT id, uid, account_id FROM messages WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL ORDER BY uid`, srcMailboxID, uids)
 	if err != nil {
-		return nil, nil, consts.ErrInternalError
+		return nil, nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 	defer rows.Close()
 
@@ -149,7 +149,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	numToCopy := int64(len(messageIDs))
 	err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + $1 WHERE id = $2 RETURNING highest_uid`, numToCopy, destMailboxID).Scan(&newHighestUID)
 	if err != nil {
-		return nil, nil, consts.ErrDBUpdateFailed
+		return nil, nil, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 	}
 
 	// Calculate the new UIDs for the copied messages.
@@ -507,7 +507,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			)`, options.MailboxID).Scan(&hasMessages)
 		if err != nil {
 			logger.Error("Database: failed to check for existing messages", "err", err)
-			return 0, 0, consts.ErrDBQueryFailed
+			return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBQueryFailed, err)
 		}
 
 		// Get current UIDVALIDITY
@@ -515,7 +515,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		err = tx.QueryRow(ctx, `SELECT uid_validity FROM mailboxes WHERE id = $1`, options.MailboxID).Scan(&currentUIDValidity)
 		if err != nil {
 			logger.Error("Database: failed to query current UIDVALIDITY", "err", err)
-			return 0, 0, consts.ErrDBQueryFailed
+			return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBQueryFailed, err)
 		}
 
 		if hasMessages {
@@ -543,7 +543,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 					options.MailboxID, *options.PreservedUIDValidity)
 				if err != nil {
 					logger.Error("Database: failed to update UIDVALIDITY", "err", err)
-					return 0, 0, consts.ErrDBUpdateFailed
+					return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 				}
 				logger.Info("Database: set UIDVALIDITY for first preserved message",
 					"mailbox_id", options.MailboxID, "from", currentUIDValidity, "to", *options.PreservedUIDValidity)
@@ -564,14 +564,14 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			options.MailboxID, uidToUse).Scan(&highestUID)
 		if err != nil {
 			logger.Error("Database: failed to update highest UID with preserved UID", "err", err)
-			return 0, 0, consts.ErrDBUpdateFailed
+			return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 		}
 	} else {
 		// Atomically increment and get the new highest UID for the mailbox
 		err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + 1 WHERE id = $1 RETURNING highest_uid`, options.MailboxID).Scan(&highestUID)
 		if err != nil {
 			logger.Error("Database: failed to update highest UID", "err", err)
-			return 0, 0, consts.ErrDBUpdateFailed
+			return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 		}
 		uidToUse = highestUID
 	}
@@ -595,7 +595,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	} else if err != pgx.ErrNoRows {
 		// Unexpected error
 		logger.Error("Database: failed to check for duplicate message", "err", err)
-		return 0, 0, consts.ErrDBQueryFailed
+		return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBQueryFailed, err)
 	}
 	// err == pgx.ErrNoRows means no exact duplicate found, continue with insert
 
@@ -616,7 +616,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			return 0, existingUID, consts.ErrMessageExists
 		} else if err != pgx.ErrNoRows {
 			logger.Error("Database: failed to check for duplicate delivery", "err", err)
-			return 0, 0, consts.ErrDBQueryFailed
+			return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBQueryFailed, err)
 		}
 	}
 
@@ -751,7 +751,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		} else {
 			logger.Error("Database: failed to insert message into database", "err", err)
 		}
-		return 0, 0, consts.ErrDBInsertFailed
+		return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBInsertFailed, err)
 	}
 
 	// Check if content is already uploaded for this account UNDER THIS ROW'S KEY (content
@@ -784,7 +784,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	`, options.ContentHash, upload.AccountID, options.S3Domain, options.S3Localpart).Scan(&alreadyUploaded)
 	if err != nil {
 		logger.Error("Database: failed to check if content already uploaded", "content_hash", upload.ContentHash, "err", err)
-		return 0, 0, consts.ErrDBQueryFailed
+		return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBQueryFailed, err)
 	}
 
 	if alreadyUploaded {
@@ -796,7 +796,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		`, messageRowId)
 		if err != nil {
 			logger.Error("Database: failed to mark message as uploaded (dedup)", "content_hash", upload.ContentHash, "err", err)
-			return 0, 0, consts.ErrDBUpdateFailed
+			return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 		}
 		logger.Info("Database: message marked as uploaded via content deduplication",
 			"content_hash", truncateHash(options.ContentHash), "account_id", upload.AccountID)
@@ -824,7 +824,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		)
 		if err != nil {
 			logger.Error("Database: failed to insert into pending_uploads", "content_hash", upload.ContentHash, "err", err)
-			return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
+			return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBInsertFailed, err) // Transaction will rollback
 		}
 		logger.Info("Database: pending_upload created",
 			"content_hash", truncateHash(options.ContentHash), "account_id", upload.AccountID)
@@ -903,7 +903,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 			)`, options.MailboxID).Scan(&hasMessages)
 		if err != nil {
 			logger.Error("Database: failed to check for existing messages", "err", err)
-			return 0, 0, consts.ErrDBQueryFailed
+			return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBQueryFailed, err)
 		}
 
 		// Get current UIDVALIDITY
@@ -911,7 +911,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		err = tx.QueryRow(ctx, `SELECT uid_validity FROM mailboxes WHERE id = $1`, options.MailboxID).Scan(&currentUIDValidity)
 		if err != nil {
 			logger.Error("Database: failed to query current UIDVALIDITY", "err", err)
-			return 0, 0, consts.ErrDBQueryFailed
+			return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBQueryFailed, err)
 		}
 
 		if hasMessages {
@@ -939,7 +939,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 					options.MailboxID, *options.PreservedUIDValidity)
 				if err != nil {
 					logger.Error("Database: failed to update UIDVALIDITY", "err", err)
-					return 0, 0, consts.ErrDBUpdateFailed
+					return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 				}
 				logger.Info("Database: set UIDVALIDITY for first preserved message",
 					"mailbox_id", options.MailboxID, "from", currentUIDValidity, "to", *options.PreservedUIDValidity)
@@ -960,7 +960,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 			options.MailboxID, uidToUse).Scan(&highestUID)
 		if err != nil {
 			logger.Error("Database: failed to update highest UID with preserved UID", "err", err)
-			return 0, 0, consts.ErrDBUpdateFailed
+			return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 		}
 	} else {
 		// Atomically increment and get the new highest UID for the mailbox
@@ -968,7 +968,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + 1 WHERE id = $1 RETURNING highest_uid`, options.MailboxID).Scan(&highestUID)
 		if err != nil {
 			logger.Error("Database: failed to update highest UID", "err", err)
-			return 0, 0, consts.ErrDBUpdateFailed
+			return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 		}
 		uidToUse = highestUID
 	}
@@ -992,7 +992,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	} else if err != pgx.ErrNoRows {
 		// Unexpected error
 		logger.Error("Database: failed to check for duplicate message", "err", err)
-		return 0, 0, consts.ErrDBQueryFailed
+		return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBQueryFailed, err)
 	}
 	// err == pgx.ErrNoRows means no exact duplicate found, continue with insert
 
@@ -1121,7 +1121,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		} else {
 			logger.Error("Database: failed to insert message into database", "err", err)
 		}
-		return 0, 0, consts.ErrDBInsertFailed
+		return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBInsertFailed, err)
 	}
 
 	if shouldStageFTS(options.FTSRetention, options.SentDate, time.Now()) {

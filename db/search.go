@@ -2,7 +2,6 @@ package db
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -247,34 +246,42 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 			}
 			args[param] = lowerValue
 			conditions = append(conditions, fmt.Sprintf("LOWER(%smessage_id) = @%s", datePrefix, param))
-		case "in-reply-to":
+		case "in-reply-to", "references":
+			// Both headers hold message IDs, which threading clients search with
+			// the angle brackets they are written with. The columns store the IDs
+			// without brackets, separated by single spaces (in_reply_to from
+			// migration 000001, "references" from 000036), so the term is matched
+			// against the bracketed list rebuilt from them (msgIDListExpr).
+			column := datePrefix + "in_reply_to"
+			if lowerKey == "references" {
+				column = datePrefix + `"references"`
+			}
 			param := nextParam()
 			args[param] = lowerValue
-			conditions = append(conditions, fmt.Sprintf("LOWER(%sin_reply_to) = @%s", datePrefix, param))
-		case "references":
-			// The References header holds a space-separated chain of Message-IDs.
-			// Threading clients search it for a containing Message-ID, so match
-			// as a substring against the dedicated column added in migration 000036.
-			param := nextParam()
-			args[param] = lowerValue
-			conditions = append(conditions, substringCond(fmt.Sprintf(`LOWER(%s"references")`, datePrefix), "@"+param))
+			// An absent header yields NULL; turn it into FALSE before NOT/OR.
+			conditions = append(conditions, "COALESCE("+substringCond(msgIDListExpr(column), "@"+param)+", FALSE)")
 		case "from", "to", "cc":
-			// RFC 9051 §6.4.4 defines FROM, TO and CC on the envelope's address lists, so the
-			// term may match any name or address of the header: the first one, in the
-			// *_sort columns, or any other, in that header's section of extra_addresses.
-			// Every column is stored lowercased. This allows searching for "peter" to find
-			// "peter@whatever.com" or "Peter Smith".
+			// Match the first address's sort columns and this header's extra section.
 			param := nextParam()
 			args[param] = lowerValue
 			conditions = append(conditions, addressHeaderCond(datePrefix, lowerKey, "@"+param))
-		case "bcc", "reply-to":
-			// BCC and Reply-To don't have dedicated sort columns, fall back to JSONB search
-			recipientJSONParam := nextParam()
-			// Use json.Marshal to safely build JSONB value (handles special characters in search values)
-			recipientEntry := []map[string]string{{"type": lowerKey, "email": lowerValue}}
-			recipientJSON, _ := json.Marshal(recipientEntry)
-			args[recipientJSONParam] = string(recipientJSON)
-			conditions = append(conditions, fmt.Sprintf(`%srecipients_json @> @%s::jsonb`, datePrefix, recipientJSONParam))
+		case "bcc", "reply-to", "sender":
+			// No dedicated columns: recipients_json holds every address of these
+			// headers, typed by header name and in its original case. The term is a
+			// substring of one address or display name of that header, compared
+			// case-insensitively. JSONB containment compared the whole address,
+			// case-sensitively. These are rare searches; like References they are
+			// filtered from the mailbox's rows (recipients_json is deliberately
+			// not in idx_messages_mailbox_headers).
+			typeParam := nextParam()
+			args[typeParam] = lowerKey
+			param := nextParam()
+			args[param] = lowerValue
+			conditions = append(conditions, fmt.Sprintf(
+				"EXISTS (SELECT 1 FROM jsonb_array_elements(%srecipients_json) r WHERE r->>'type' = @%s AND (%s OR %s))",
+				datePrefix, typeParam,
+				substringCond("LOWER(r->>'email')", "@"+param),
+				substringCond("LOWER(r->>'name')", "@"+param)))
 		default:
 			// HEADER search on a header without a dedicated, indexed column
 			// (e.g. List-ID, X-*). Sora stores no raw-header representation to
@@ -642,6 +649,16 @@ func buildTextSearchBranches(text string, args pgx.NamedArgs, paramPrefix string
 // WHERE treats as false, exactly as LIKE did.
 func substringCond(expr, placeholder string) string {
 	return fmt.Sprintf("strpos(%s, %s) > 0", expr, placeholder)
+}
+
+// msgIDListExpr rebuilds a message-ID header field from a column that stores its IDs
+// without angle brackets, separated by single spaces ("a0@x b1@y" becomes
+// "<a0@x> <b1@y>"), lowercased, so a search term written the way the field is, with
+// brackets and possibly several IDs, is a substring of it (RFC 3501 §6.4.4). An empty
+// column (the header was absent) yields NULL, which matches nothing; an empty term
+// then tests for the header's presence, as RFC 9051 §6.4.4 describes.
+func msgIDListExpr(column string) string {
+	return fmt.Sprintf(`'<' || replace(LOWER(NULLIF(%s, '')), ' ', '> <') || '>'`, column)
 }
 
 // headerSubstringCond is the TEXT header predicate: the bound term as a substring of any

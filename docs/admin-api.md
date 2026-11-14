@@ -485,7 +485,7 @@ Monitor and manage active client connections to the mail server.
 
 **Endpoint:** `GET /admin/connections`
 
-List the accounts with sessions on this node: one entry per account and connection tracker, not per session. `instance` is the tracker key (`<PROTOCOL>-<server name>` on a backend, `<PROTOCOL>-<host name>-<server name>` on a proxy) and `protocol` its first part. `local_count` is the account's sessions on this tracker; `total_count` adds the sessions other nodes report for the protocol through gossip. Accounts this node knows only through gossip are not listed. Without connection trackers the response has no entries and a `note` instead of `source`.
+List the accounts with sessions on this node: one entry per account and connection tracker, not per session. `instance` is the tracker key (`<PROTOCOL>-<server name>` on a backend, `<PROTOCOL>-<cluster node_id>-<server name>` on a proxy, with the host name in place of the node_id outside cluster mode, where the LMTP proxy is the only proxy that tracks sessions) and `protocol` its first part. `email` is the address of the session that created the entry (the login address, or the recipient on an LMTP proxy). `local_count` is the account's sessions on this tracker; `total_count` adds the sessions other nodes report for the protocol through gossip (backends and LMTP proxies do not gossip, so there it equals `local_count`). `last_update` also moves when gossip about the account arrives, even if no count changed. Accounts this node knows only through gossip are not listed. Without connection trackers the response has no entries and a `note` instead of `source`.
 
 **Response:** `200 OK`
 ```json
@@ -510,7 +510,7 @@ List the accounts with sessions on this node: one entry per account and connecti
 
 **Endpoint:** `GET /admin/connections/stats`
 
-Get the number of active connections on this node, every session counted, in total and per connection tracker. Trackers are keyed `<PROTOCOL>-<server name>` on a backend and `<PROTOCOL>-<host name>-<server name>` on a proxy. Connections other nodes report through gossip are not included. For a cluster total, sum the proxy nodes or the backend nodes, not both: a session through a proxy is counted by the proxy and again by its backend (also within one node that runs both).
+Get the number of active connections on this node, every session counted, in total and per connection tracker. Trackers are keyed `<PROTOCOL>-<server name>` on a backend and `<PROTOCOL>-<cluster node_id>-<server name>` on a proxy (the host name in place of the node_id outside cluster mode). Connections other nodes report through gossip are not included. For a cluster total, sum the proxy nodes or the backend nodes, not both: a session through a proxy is counted by the proxy and again by its backend (also within one node that runs both).
 
 **Response:** `200 OK`
 ```json
@@ -564,7 +564,7 @@ curl -X POST http://localhost:8080/admin/connections/kick \
 
 **Endpoint:** `GET /admin/connections/user/{email}`
 
-Get the user's entries on this node's connection trackers, matched by the address the sessions logged in with (case-insensitive). Unlike `GET /admin/connections`, `protocol` is the whole tracker key, there is no `instance`, and a tracker that knows the account only through gossip is listed with `local_count` 0.
+Get the user's entries on this node's connection trackers, matched case-insensitively against each entry's `email`: an account whose entry was created by an alias login is found only under that alias. Unlike `GET /admin/connections`, `protocol` is the whole tracker key, there is no `instance`, and a tracker that knows the account only through gossip is listed with `local_count` 0.
 
 **Response:** `200 OK`
 ```json
@@ -728,7 +728,7 @@ Get list of failed S3 uploads.
 
 ### Authentication Statistics
 
-Failed logins are tracked in memory by each server's authentication rate limiter, per address, and expire on their own. The API exposes the addresses those limiters currently block; attempt counts are exported as the Prometheus counter `sora_authentication_attempts_total`.
+Failed logins are tracked in memory by each server's authentication rate limiter, per address, and expire on their own. The API exposes the addresses those limiters currently block. IMAP, POP3 and ManageSieve attempt counts (servers and proxies) are exported as the Prometheus counter `sora_authentication_attempts_total`; User API logins are not counted there.
 
 #### Get Authentication Statistics
 
@@ -1262,7 +1262,7 @@ The Admin API implements rate limiting based on authentication attempts and API 
 
 4. **Rotate API keys periodically**
 
-5. **Monitor authentication statistics** for suspicious activity
+5. **Monitor blocked addresses** ([`GET /admin/auth/blocked`](#list-blocked-addresses)) and the `sora_authentication_attempts_total` counter for suspicious activity
 
 ### Performance
 
