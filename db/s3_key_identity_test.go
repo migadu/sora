@@ -98,7 +98,7 @@ func TestMoveMessagesKeepsSourceS3KeyForSameAccount(t *testing.T) {
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	uids := []imap.UID{srcUID}
-	uidMap, err := db.MoveMessages(ctx, tx, &uids, inboxID, archive.ID, accountID, "example.com", "renamed", "test-instance")
+	uidMap, err := db.MoveMessages(ctx, tx, &uids, inboxID, archive.ID, accountID, "example.com", "renamed", "test-instance", nil)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit(ctx))
 	require.Len(t, uidMap, 1)

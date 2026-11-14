@@ -103,7 +103,7 @@ func TestCrossAccountMessageOwnership(t *testing.T) {
 	// The message is still in srcMailbox, so we can just move it.
 	uids2 := []imap.UID{imap.UID(srcUID)}
 
-	uidMap2, err := rdb.MoveMessagesWithRetry(ctx, &uids2, srcMailbox.ID, destMailbox.ID, accountID_B, domainB, localB, "test-instance")
+	uidMap2, err := rdb.MoveMessagesWithRetry(ctx, &uids2, srcMailbox.ID, destMailbox.ID, accountID_B, domainB, localB, "test-instance", nil, nil)
 	require.NoError(t, err)
 	require.Len(t, uidMap2, 1)
 
