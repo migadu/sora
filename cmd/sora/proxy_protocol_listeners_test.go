@@ -71,9 +71,6 @@ var proxyProtocolListeners = map[string]proxyProtocolListener{
 	},
 }
 
-// proxyProtocolServerTypes are the [[server]] types the configuration accepts.
-var proxyProtocolServerTypes = []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "metrics", "http_admin_api", "http_user_api", "user_api_proxy"}
-
 // Server types whose listener does not read PROXY headers. Startup must say so when
 // proxy_protocol is set on one, and must not require trusted_networks for it.
 var withoutProxyProtocol = map[string]bool{"metrics": true}
@@ -85,7 +82,7 @@ var withoutProxyProtocol = map[string]bool{"metrics": true}
 // pop3_proxy, managesieve_proxy, lmtp_proxy and http_admin_api blocks used to drop the
 // setting, so the header reached the protocol as client data.
 func TestProxyProtocolReachesEveryListener(t *testing.T) {
-	for _, serverType := range proxyProtocolServerTypes {
+	for _, serverType := range config.ServerTypes {
 		t.Run(serverType, func(t *testing.T) {
 			sc := config.ServerConfig{Type: serverType, Name: serverType + "-pp", ProxyProtocol: true}
 
