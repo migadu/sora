@@ -47,6 +47,8 @@ func TestWarnUnusedConfigOptions_KeysTheServerTypeDoesNotApply(t *testing.T) {
 		{"lmtp_proxy command_timeout", ServerConfig{Type: "lmtp_proxy", Timeouts: timeouts(ServerTimeoutsConfig{CommandTimeout: "0"})}, "timeouts.command_timeout"},
 		{"lmtp_proxy min_bytes_per_minute", ServerConfig{Type: "lmtp_proxy", Timeouts: timeouts(ServerTimeoutsConfig{MinBytesPerMinute: 512})}, "timeouts.min_bytes_per_minute"},
 		{"lmtp_proxy max_connections_per_ip", ServerConfig{Type: "lmtp_proxy", MaxConnectionsPerIP: 20}, "max_connections_per_ip"},
+		{"lmtp_proxy max_connections_per_user", ServerConfig{Type: "lmtp_proxy", MaxConnectionsPerUser: 10}, "max_connections_per_user"},
+		{"lmtp_proxy max_connections_per_user_per_ip", ServerConfig{Type: "lmtp_proxy", MaxConnectionsPerUserPerIP: 5}, "max_connections_per_user_per_ip"},
 		{"lmtp_proxy absolute_session_timeout", ServerConfig{Type: "lmtp_proxy", Timeouts: timeouts(ServerTimeoutsConfig{AbsoluteSessionTimeout: "5m"})}, ""},
 		{"lmtp_proxy auth_idle_timeout", ServerConfig{Type: "lmtp_proxy", AuthIdleTimeout: "2m"}, ""},
 
