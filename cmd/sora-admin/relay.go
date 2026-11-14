@@ -452,7 +452,7 @@ Examples:
   sora-admin relay requeue --config config.toml --id all --confirm
 
 Notes:
-  - The relay queue must be enabled in config.toml
+  - The relay queue is used whenever [relay] is configured (there is no separate switch)
   - Use --confirm flag for destructive operations (delete, requeue)
   - Queue types: pending, processing, failed
   - Requeue resets attempt count and clears error history
