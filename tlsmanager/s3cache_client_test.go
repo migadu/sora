@@ -2,10 +2,13 @@ package tlsmanager
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -141,5 +144,46 @@ func TestS3CacheDebugLogsRequests(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "HEAD /certs") {
 		t.Errorf("debug = true logged no S3 request; log:\n%s", logs.String())
+	}
+}
+
+// TestS3CacheWithoutDebugWritesNothingToStderr: the server logs through the logger
+// package, and with debug = false the S3 client logged nothing at all. The SDK's config
+// loader installs a logger of its own on os.Stderr, which writes "Response has no
+// supported checksum" for every GET from a store that returns no checksum header, as
+// the stub (and many S3-compatible stores) does.
+func TestS3CacheWithoutDebugWritesNothingToStderr(t *testing.T) {
+	isolateAWSEnvironment(t)
+	logs := &syncBuffer{}
+	prev := logger.Swap(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { logger.Swap(prev) })
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	stderr := os.Stderr
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = stderr })
+	captured := make(chan []byte)
+	go func() {
+		out, _ := io.ReadAll(r)
+		captured <- out
+	}()
+
+	_, endpoint := newStubS3(t)
+	cache := newStubS3Cache(t, endpoint)
+	ctx := context.Background()
+	if err := cache.Put(ctx, "mail.example.com", []byte("certificate")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if _, err := cache.Get(ctx, "mail.example.com"); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	os.Stderr = stderr
+	w.Close()
+	if out := <-captured; len(out) != 0 {
+		t.Errorf("debug = false wrote to stderr, outside the server log:\n%s", out)
 	}
 }

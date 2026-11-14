@@ -153,6 +153,10 @@ func NewS3Cache(cfg config.TLSLetsEncryptS3Config, opts ...S3CacheOption) (*S3Ca
 		loadOpts = append(loadOpts,
 			awsconfig.WithClientLogMode(aws.LogRequest|aws.LogResponse|aws.LogRetries),
 			awsconfig.WithLogger(s3DebugLogger{}))
+	} else {
+		// The loader's own default logger writes to os.Stderr, past the server log - for
+		// one, a warning on every GET from a store that returns no checksum header.
+		loadOpts = append(loadOpts, awsconfig.WithLogger(logging.Nop{}))
 	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
