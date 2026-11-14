@@ -97,6 +97,10 @@ type AuthRateLimiter struct {
 	ipUsernameFailureCounts map[string]*IPUsernameFailureInfo
 	blockedIPUsernames      map[string]*BlockedIPUsernameInfo
 	ipUsernameMu            sync.RWMutex
+	// No later than the earliest BlockedUntil in blockedIPUsernames (zero: not known), so
+	// that a full block table is searched for a block that has ended only once one can
+	// have ended, not on every failure. Guarded by ipUsernameMu.
+	ipUsernameBlocksEarliestEnd time.Time
 
 	// Tier 2: IP-only blocking (slow, catches distributed attacks)
 	blockedIPs      map[string]*BlockedIPInfo
@@ -651,7 +655,8 @@ func (a *AuthRateLimiter) updateIPUsernameFailure(ip, username string, failureTi
 		return
 	}
 
-	if a.config.MaxIPUsernameEntries > 0 && len(a.blockedIPUsernames) >= a.config.MaxIPUsernameEntries && a.removeExpiredIPUsernameBlocks(failureTime) == 0 {
+	if a.config.MaxIPUsernameEntries > 0 && len(a.blockedIPUsernames) >= a.config.MaxIPUsernameEntries &&
+		(failureTime.Before(a.ipUsernameBlocksEarliestEnd) || a.removeExpiredIPUsernameBlocks(failureTime) == 0) {
 		logger.Warn("Auth rate limiter: IP+username block table full of active blocks, pair not blocked (Tier 1)",
 			"protocol", a.protocol,
 			"ip", ip,
@@ -670,6 +675,10 @@ func (a *AuthRateLimiter) updateIPUsernameFailure(ip, username string, failureTi
 		Protocol:     a.protocol,
 		IP:           ip,
 		Username:     username,
+	}
+	if blockedUntil.Before(a.ipUsernameBlocksEarliestEnd) {
+		// failureTime was taken before the lock: an earlier block can be stored later
+		a.ipUsernameBlocksEarliestEnd = blockedUntil
 	}
 	delete(a.ipUsernameFailureCounts, ipUsernameKey)
 	logger.Info("Auth rate limiter: IP+username blocked (Tier 1)",
@@ -1031,17 +1040,21 @@ func (a *AuthRateLimiter) evictOldestIPUsername() {
 	}
 }
 
-// removeExpiredIPUsernameBlocks deletes the IP+username blocks that ended by now and
-// returns how many it deleted.
+// removeExpiredIPUsernameBlocks deletes the IP+username blocks that ended by now,
+// records when the earliest of the remaining ones ends and returns how many it deleted.
 // Caller must hold ipUsernameMu write lock
 func (a *AuthRateLimiter) removeExpiredIPUsernameBlocks(now time.Time) int {
 	removed := 0
+	var earliestEnd time.Time
 	for key, blocked := range a.blockedIPUsernames {
 		if !now.Before(blocked.BlockedUntil) {
 			delete(a.blockedIPUsernames, key)
 			removed++
+		} else if earliestEnd.IsZero() || blocked.BlockedUntil.Before(earliestEnd) {
+			earliestEnd = blocked.BlockedUntil
 		}
 	}
+	a.ipUsernameBlocksEarliestEnd = earliestEnd
 	return removed
 }
 

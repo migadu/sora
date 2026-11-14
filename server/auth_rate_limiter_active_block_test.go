@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/migadu/sora/logger"
 )
 
 // requireBlocked fails the test unless CanAttemptAuth refuses addr/username with
@@ -395,6 +399,75 @@ func TestIPUsernameBlockRenewalNeverShortensBlock(t *testing.T) {
 	}
 	if blocked.FailureCount != 2 {
 		t.Errorf("failure count %d, want 2", blocked.FailureCount)
+	}
+}
+
+// A full block table is searched for a block that has ended only once the earliest one
+// can have ended. A block stored with an earlier end than those already there (its
+// failure time was taken first) moves that point, so its slot is reused once it ends.
+func TestIPUsernameFullBlockTableReusesOutOfOrderBlock(t *testing.T) {
+	limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+		Enabled:                  true,
+		MaxAttemptsPerIPUsername: 1,
+		IPUsernameBlockDuration:  time.Minute,
+		IPUsernameWindowDuration: time.Hour,
+		CleanupInterval:          time.Hour,
+		MaxIPUsernameEntries:     2,
+	})
+	defer limiter.Stop()
+	t0 := time.Now()
+	fail := func(ip string, at time.Duration) {
+		limiter.updateIPUsernameFailure(ip, "user@example.com", t0.Add(at))
+	}
+	isBlocked := func(ip string) bool {
+		limiter.ipUsernameMu.RLock()
+		defer limiter.ipUsernameMu.RUnlock()
+		_, ok := limiter.blockedIPUsernames[ip+"|user@example.com"]
+		return ok
+	}
+
+	fail("198.51.100.1", 20*time.Second) // blocked until t0+80s
+	fail("198.51.100.2", 30*time.Second) // blocked until t0+90s: the table is full
+	fail("198.51.100.3", 40*time.Second) // no block has ended: not blocked
+	if isBlocked("198.51.100.3") {
+		t.Fatal("a block was stored in a table full of active blocks")
+	}
+
+	// .1's block is gone (as when CanAttemptAuth removes it), and a failure taken
+	// before the others is stored in its slot.
+	limiter.ipUsernameMu.Lock()
+	delete(limiter.blockedIPUsernames, "198.51.100.1|user@example.com")
+	limiter.ipUsernameMu.Unlock()
+	fail("198.51.100.4", 10*time.Second) // blocked until t0+70s
+
+	fail("198.51.100.5", 75*time.Second) // .4's block has ended: .5 takes its slot
+	if !isBlocked("198.51.100.5") {
+		t.Error("a block that had ended kept its slot in a full table")
+	}
+}
+
+// Failed logins of a pair that has reached its threshold while the block table is full
+// of active blocks: each one must not search the whole table.
+func BenchmarkIPUsernameFailureAtFullBlockTable(b *testing.B) {
+	const entries = 100000
+	prev := logger.Swap(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	b.Cleanup(func() { logger.Swap(prev) })
+	limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+		Enabled:                  true,
+		MaxAttemptsPerIPUsername: 1,
+		IPUsernameBlockDuration:  time.Hour,
+		IPUsernameWindowDuration: time.Hour,
+		CleanupInterval:          time.Hour,
+		MaxIPUsernameEntries:     entries,
+	})
+	defer limiter.Stop()
+	t0 := time.Now()
+	for i := 0; i < entries; i++ {
+		limiter.updateIPUsernameFailure("198.51.100.1", fmt.Sprintf("user%d@example.com", i), t0)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		limiter.updateIPUsernameFailure("203.0.113.1", "user@example.com", t0)
 	}
 }
 
