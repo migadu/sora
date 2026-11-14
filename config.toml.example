@@ -666,6 +666,8 @@ smtp_use_starttls = true                          # Use STARTTLS (port 587) inst
 # smtp_tls_key_file = "/path/to/client.key"      # Client key for mTLS (optional)
 
 # HTTP API Relay Configuration (when type="http")
+# http_url must answer the POST itself: redirects are not followed, and a 3xx answer
+# is a temporary failure (the message stays queued and is retried).
 # http_url = "https://api.example.com/v1/mail/deliver"  # HTTP API endpoint
 # auth_token = "your-bearer-token"                      # Bearer token for Authorization header
 
@@ -839,6 +841,8 @@ enabled_extensions = []
 enabled = false
 
 # HTTP endpoint to submit training data (POST requests with JSON payload)
+# Must answer the POST itself: redirects are not followed, and a 3xx answer is a
+# failed submission.
 # Example: "https://spam-filter.example.com/train"
 # endpoint = "https://your-spam-service.example.com/api/train"
 
