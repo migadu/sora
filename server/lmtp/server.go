@@ -35,7 +35,10 @@ const DefaultMaxMessageSize = 50 * 1024 * 1024
 // (security-audit M13)
 const defaultLMTPMaxConnections = 1000
 
-// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+// getProxyProtocolTrustedProxies returns the hosts trusted to send PROXY headers: the
+// ProxyProtocolTrustedProxies option if set, otherwise trusted_networks. No config key
+// sets that option (there is no proxy_protocol_trusted_proxies, #542), so in a running
+// server PROXY trust is always [servers] trusted_networks.
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {
 		return proxyProtocolTrusted
