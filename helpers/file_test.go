@@ -32,6 +32,8 @@ func TestFileErrorCause(t *testing.T) {
 			Err: &os.LinkError{Op: "rename", Old: path, New: path + ".tmp", Err: syscall.EACCES}}, syscall.EACCES},
 		{"nested link and path errors", &os.LinkError{Op: "rename", Old: path, New: path + ".tmp",
 			Err: &fs.PathError{Op: "write", Path: path, Err: syscall.EROFS}}, syscall.EROFS},
+		{"ordinary wrapper inside path error", &fs.PathError{Op: "write", Path: path,
+			Err: fmt.Errorf("bad spool path %s: %w", path, syscall.EACCES)}, syscall.EACCES},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
