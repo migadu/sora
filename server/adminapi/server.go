@@ -743,7 +743,7 @@ type ConnectionInfo struct {
 	LocalCount int       `json:"local_count"` // the account's sessions on this tracker
 	TotalCount int       `json:"total_count"` // LocalCount plus the sessions other nodes report for the protocol through gossip
 	LastUpdate time.Time `json:"last_update"`
-	Email      string    `json:"email"` // address the sessions logged in with
+	Email      string    `json:"email"` // address of the session that created the entry (the recipient on an LMTP proxy)
 }
 
 // UserConnectionInfo is one entry of GET /admin/connections/user/{email}. Unlike
