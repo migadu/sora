@@ -223,8 +223,13 @@ func SetBcryptCost(cost int) {
 
 // GenerateBcryptHash creates a new bcrypt hash with the BLF-CRYPT prefix
 // Returns a string in the format {BLF-CRYPT}bcrypt_hash
+// A password over bcrypt's 72-byte limit is the caller's request error and wraps
+// ErrInvalidAccountRequest.
 func GenerateBcryptHash(password string) (string, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), BcryptCost)
+	if errors.Is(err, bcrypt.ErrPasswordTooLong) {
+		return "", fmt.Errorf("%w: %w", ErrInvalidAccountRequest, err)
+	}
 	if err != nil {
 		return "", fmt.Errorf("error generating bcrypt hash: %w", err)
 	}

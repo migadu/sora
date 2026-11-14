@@ -363,7 +363,12 @@ type CircuitBreakerConfig struct {
 	MaxRequests int           // Max requests in half-open state (default: 3)
 }
 
-// NewRelayHandlerFromConfig creates the appropriate relay handler based on configuration with circuit breaker
+// NewRelayHandlerFromConfig creates the appropriate relay handler based on configuration with circuit breaker.
+//
+// The breaker trips on consecutive failures, which a success resets, so its counts are
+// never cleared on a timer (Interval 0). With a counting window, an attempt that takes
+// longer than the window to fail (a blackholed relay's 30 s dial, a hung one's 5 min
+// command timeout) has its result dropped, and a dead relay never opens the breaker.
 func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsLabel string, useTLS, tlsVerify, useStartTLS bool, tlsCertFile, tlsKeyFile, heloHost string, logger Logger, cbConfig CircuitBreakerConfig) RelayHandler {
 	// Apply defaults if not set
 	if cbConfig.Threshold <= 0 {
@@ -382,7 +387,7 @@ func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsL
 		cb := circuitbreaker.NewCircuitBreaker(circuitbreaker.Settings{
 			Name:        "smtp_relay",
 			MaxRequests: uint32(cbConfig.MaxRequests),
-			Interval:    10 * time.Second,
+			Interval:    0, // counts cleared only by state changes; see above
 			Timeout:     cbConfig.Timeout,
 			ReadyToTrip: func(counts circuitbreaker.Counts) bool {
 				return counts.ConsecutiveFailures >= uint32(cbConfig.Threshold)
@@ -420,7 +425,7 @@ func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsL
 		cb := circuitbreaker.NewCircuitBreaker(circuitbreaker.Settings{
 			Name:        "http_relay",
 			MaxRequests: uint32(cbConfig.MaxRequests),
-			Interval:    10 * time.Second,
+			Interval:    0, // counts cleared only by state changes; see above
 			Timeout:     cbConfig.Timeout,
 			ReadyToTrip: func(counts circuitbreaker.Counts) bool {
 				return counts.ConsecutiveFailures >= uint32(cbConfig.Threshold)

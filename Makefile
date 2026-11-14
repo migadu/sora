@@ -6,6 +6,7 @@
 	integration-tests-pop3-connection-limits integration-tests-managesieve-connection-limits \
 	integration-tests-proxy-connection-limits integration-tests-adminapi integration-tests-userapi \
 	integration-tests-config integration-tests-sora-admin integration-tests-relay \
+	integration-tests-delivery integration-tests-pools integration-tests-tls integration-tests-packages \
 	integration-tests-quick integration-tests-imap-quick integration-tests-race integration-tests-quick-race \
 	performance-tests performance-tests-short
 
@@ -77,14 +78,21 @@ TEST_FLAGS = -v -tags=integration -count=1 -timeout=$(TEST_TIMEOUT) $(RACE_FLAG)
 # wall-clock sleeps (~7m + ~9.5m run serially), so they get a larger timeout.
 SLOWLORIS_TIMEOUT = $(if $(RACE),35m,25m)
 SLOWLORIS_FLAGS = -v -tags=integration -count=1 -timeout=$(SLOWLORIS_TIMEOUT) $(RACE_FLAG)
-DB_NAME = sora_test_db
+# The test database: SORA_TEST_DB_NAME, which the test helpers read, or sora_test_db.
+# `make DB_NAME=...` overrides it. A DB_NAME in the environment does not: that generic
+# name may be set for some other database, whose schema reset-test-db would drop.
+# SORA_TEST_DB_NAME is set to it, also over a command-line value, and exported, so
+# that the tests these targets run use the database reset-test-db reset.
+DB_NAME := $(or $(SORA_TEST_DB_NAME),sora_test_db)
+override SORA_TEST_DB_NAME := $(DB_NAME)
+export SORA_TEST_DB_NAME
 DB_USER = postgres
 DB_HOST = localhost
 DB_PORT = 5432
 
 # Reset test database to clean state using native Go (no psql dependency)
 reset-test-db:
-	@SORA_TEST_DB_NAME="$(DB_NAME)" DB_HOST="$(DB_HOST)" DB_PORT="$(DB_PORT)" DB_USER="$(DB_USER)" go run ./scripts/reset-test-db/main.go > /dev/null 2>&1 || true
+	@SORA_TEST_DB_NAME="$(DB_NAME)" DB_HOST="$(DB_HOST)" DB_PORT="$(DB_PORT)" DB_USER="$(DB_USER)" go run ./scripts/reset-test-db/main.go
 
 # Run all integration tests (requires PostgreSQL)
 integration-tests: integration-tests-sora integration-tests-imap integration-tests-imap-slowloris integration-tests-lmtp integration-tests-pop3 \
@@ -93,7 +101,8 @@ integration-tests: integration-tests-sora integration-tests-imap integration-tes
 	integration-tests-connection-limits integration-tests-lmtp-connection-limits \
 	integration-tests-pop3-connection-limits integration-tests-managesieve-connection-limits \
 	integration-tests-proxy-connection-limits integration-tests-adminapi integration-tests-userapi \
-	integration-tests-config integration-tests-sora-admin integration-tests-relay
+	integration-tests-config integration-tests-sora-admin integration-tests-relay \
+	integration-tests-delivery integration-tests-pools integration-tests-tls integration-tests-packages
 
 # Run integration tests in quick mode (skip long-running tests like slowloris)
 integration-tests-quick: integration-tests-sora integration-tests-imap-quick integration-tests-lmtp integration-tests-pop3 \
@@ -102,7 +111,8 @@ integration-tests-quick: integration-tests-sora integration-tests-imap-quick int
 	integration-tests-connection-limits integration-tests-lmtp-connection-limits \
 	integration-tests-pop3-connection-limits integration-tests-managesieve-connection-limits \
 	integration-tests-proxy-connection-limits integration-tests-adminapi integration-tests-userapi \
-	integration-tests-config integration-tests-sora-admin integration-tests-relay
+	integration-tests-config integration-tests-sora-admin integration-tests-relay \
+	integration-tests-delivery integration-tests-pools integration-tests-tls integration-tests-packages
 
 # Race-detector variants of the aggregate targets
 integration-tests-race:
@@ -208,6 +218,26 @@ integration-tests-relay:
 	@echo "Running relay integration tests..."
 	@cd integration_tests/relay && go test $(TEST_FLAGS) .
 
+integration-tests-delivery: reset-test-db
+	@echo "Running delivery integration tests..."
+	@cd integration_tests/delivery && go test $(TEST_FLAGS) .
+
+integration-tests-pools: reset-test-db
+	@echo "Running backend pool integration tests..."
+	@cd integration_tests/pools && go test $(TEST_FLAGS) .
+
+integration-tests-tls: reset-test-db
+	@echo "Running TLS integration tests..."
+	@cd integration_tests/tls && go test $(TEST_FLAGS) .
+
+# Integration-tagged tests that live next to the code they test. ./db under the race
+# detector needs a longer timeout than the other packages.
+INTEGRATION_CODE_PKGS = ./db ./pkg/resilient ./server ./server/lmtp ./server/lmtpproxy ./server/proxy ./tlsmanager
+CODE_PKGS_TIMEOUT = $(if $(RACE),60m,30m)
+integration-tests-packages: reset-test-db
+	@echo "Running integration tests in $(INTEGRATION_CODE_PKGS)..."
+	@go test -v -tags=integration -count=1 -timeout=$(CODE_PKGS_TIMEOUT) $(RACE_FLAG) $(INTEGRATION_CODE_PKGS)
+
 # Performance tests
 performance-tests:
 	@echo "Running search performance tests..."
@@ -226,9 +256,11 @@ performance-tests:
 	@echo "Search benchmarks..."
 	@go test -v ./db -bench "BenchmarkSearchOperations" -benchtime=5s -timeout 5m
 
+# -short skips every test that needs PostgreSQL, so the quick variant runs the basic
+# performance test rather than the full one in short mode.
 performance-tests-short:
 	@echo "Running quick performance validation tests..."
-	@go test -v ./db -run "TestSearchPerformance" -short -timeout 2m
+	@go test -v ./db -run "TestSearchPerformanceBasic" -timeout 2m
 
 # Cross-compile with musl libc for Linux
 build-linux-musl:
@@ -296,6 +328,13 @@ help:
 	@echo "  integration-tests-sora-admin    - Import/export tests"
 	@echo "  integration-tests-sora          - Server wiring (cmd/sora) tests"
 	@echo "  integration-tests-relay         - Relay (SMTP/HTTP) tests"
+	@echo "  integration-tests-delivery      - Delivery (Sieve, vacation, attachments) tests"
+	@echo "  integration-tests-pools         - Named backend pool tests"
+	@echo "  integration-tests-tls           - Proxy TLS and STARTTLS tests"
+	@echo "  integration-tests-packages      - Integration tests in db, pkg/resilient, server, tlsmanager, ..."
+	@echo ""
+	@echo "  The integration targets reset and test SORA_TEST_DB_NAME's database"
+	@echo "  (default sora_test_db), or DB_NAME's: 'make integration-tests DB_NAME=x'"
 	@echo ""
 	@echo "Cross-compilation targets:"
 	@echo "  build-linux-musl - Cross-compile static binaries for Linux with musl"

@@ -702,6 +702,12 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		EnvelopeTo:   envelopeTo,
 		Header:       messageContent.Header.Map(),
 		Message:      fullMessageBytes,
+		MailboxExists: func(ctx context.Context, mailbox string) (bool, error) {
+			if s.useMasterDB {
+				ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+			}
+			return delivery.CanFileInto(ctx, s.backend.rdb, s.AccountID(), mailbox)
+		},
 	}
 
 	// Always run the default script first as a "before script"
@@ -984,6 +990,12 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 					continue
 				}
 				s.DebugLog("successfully queued message for relay delivery", "redirect_to", redirectTo)
+				// Only a queued redirect counts against the rate limit.
+				if result.RecordRedirect != nil {
+					if err := result.RecordRedirect(ctx); err != nil {
+						s.WarnLog("failed to charge redirect against the rate limit", "redirect_to", redirectTo, "error", err)
+					}
+				}
 			}
 			if relayed {
 				// If :copy is not specified and every relay succeeded, we don't store the message locally
@@ -1268,30 +1280,31 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
-	// If :create flag is set, use GetOrCreateMailboxByNameWithRetry
-	var mailbox *db.DBMailbox
-	var err error
-	if createMailbox {
-		s.DebugLog("creating mailbox if it doesn't exist", "mailbox", mailboxName)
-		mailbox, err = s.backend.rdb.GetOrCreateMailboxByNameWithRetry(ctx, s.AccountID(), mailboxName)
-		if err != nil {
-			return fmt.Errorf("failed to get or create mailbox '%s': %v", mailboxName, err)
-		}
-		s.DebugLog("mailbox ready for delivery", "mailbox", mailboxName, "mailbox_id", mailbox.ID)
-	} else {
-		// Normal behavior: get mailbox, fallback to INBOX if not found
-		mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), mailboxName)
-		if err != nil {
-			if err == consts.ErrMailboxNotFound {
-				s.WarnLog("mailbox not found, falling back to inbox", "mailbox", mailboxName)
-				mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), consts.MailboxInbox)
-				if err != nil {
-					return fmt.Errorf("failed to get INBOX mailbox: %v", err)
-				}
-			} else {
-				return fmt.Errorf("failed to get mailbox '%s': %v", mailboxName, err)
+	// Resolve the name as for any fileinto: the user's own mailbox, else one shared
+	// with the user. :create (RFC 5490 §3.2) creates the mailbox only "if needed":
+	// "If the mailbox already exists, this argument is ignored", and a shared one
+	// exists for this user. It never makes a personal mailbox in the shared
+	// namespace, where a namesake would shadow a shared mailbox in later lookups.
+	mailbox, err := s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), mailboxName)
+	if errors.Is(err, consts.ErrMailboxNotFound) && createMailbox {
+		if s.backend.sharedMailboxes.InNamespace(mailboxName) {
+			s.WarnLog("fileinto :create refused in the shared namespace", "mailbox", mailboxName)
+		} else {
+			s.DebugLog("creating mailbox", "mailbox", mailboxName)
+			mailbox, err = s.backend.rdb.GetOrCreateMailboxByNameWithRetry(ctx, s.AccountID(), mailboxName)
+			if err != nil {
+				return fmt.Errorf("failed to get or create mailbox '%s': %v", mailboxName, err)
 			}
 		}
+	}
+	if errors.Is(err, consts.ErrMailboxNotFound) {
+		s.WarnLog("mailbox not found, falling back to inbox", "mailbox", mailboxName)
+		mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), consts.MailboxInbox)
+		if err != nil {
+			return fmt.Errorf("failed to get INBOX mailbox: %v", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("failed to get mailbox '%s': %v", mailboxName, err)
 	}
 
 	// Enforce the insert ('i') right for shared mailboxes owned by another account: a
