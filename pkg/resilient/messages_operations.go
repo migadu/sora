@@ -203,21 +203,51 @@ func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]i
 	return result.(map[imap.UID]imap.UID), nil
 }
 
-// ensureDestObjects runs ensure for every hash while tx holds their locks, keeping tx
-// alive with a statement whenever destObjectKeepalive has passed since the last one.
-func (rd *ResilientDatabase) ensureDestObjects(ctx context.Context, tx pgx.Tx, hashes []string, ensure func(ctx context.Context, contentHash string) error) error {
-	lastStatement := time.Now()
-	for _, hash := range hashes {
-		if time.Since(lastStatement) >= destObjectKeepalive {
-			pingCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
-			_, err := tx.Exec(pingCtx, "SELECT 1")
-			cancel()
-			if err != nil {
-				return fmt.Errorf("failed to keep the move transaction alive: %w", err)
+// ensureDestObjects runs ensure for every hash while tx holds their locks. The
+// keepalive also runs during a single slow S3 request. Only its goroutine uses tx
+// during this phase; it is joined before the caller starts any database writes.
+func (rd *ResilientDatabase) ensureDestObjects(ctx context.Context, tx pgx.Tx, hashes []string, ensure func(ctx context.Context, contentHash string) error) (resultErr error) {
+	ensureCtx, cancelEnsure := context.WithCancel(ctx)
+	defer cancelEnsure()
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(destObjectKeepalive)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				done <- nil
+				return
+			case <-ctx.Done():
+				// The caller's deadline is not a database failure. The S3 callback
+				// observes the same cancellation and retains its error classification.
+				done <- nil
+				return
+			case <-ticker.C:
+				pingCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
+				_, err := tx.Exec(pingCtx, "SELECT 1")
+				cancel()
+				if err != nil {
+					cancelEnsure()
+					if ctx.Err() != nil {
+						done <- nil
+					} else {
+						done <- fmt.Errorf("failed to keep the move transaction alive: %w", err)
+					}
+					return
+				}
 			}
-			lastStatement = time.Now()
 		}
-		if err := ensure(ctx, hash); err != nil {
+	}()
+	defer func() {
+		close(stop)
+		if err := <-done; err != nil {
+			resultErr = err
+		}
+	}()
+	for _, hash := range hashes {
+		if err := ensure(ensureCtx, hash); err != nil {
 			return &DestObjectError{ContentHash: hash, Err: err}
 		}
 	}
