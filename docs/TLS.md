@@ -363,10 +363,11 @@ Every `sync_interval` (default `5m`) a background worker compares the local copy
 `domains` (ECDSA and RSA) with the copy in S3. If S3 holds a newer certificate, it replaces the
 local copy and logs `CertSync: Updating certificate from S3`. This is how a node picks up a
 certificate that another node renewed (section 8). A certificate that only the local copy holds,
-stored while S3 refused writes, is written to S3. A certificate that `sora-admin tls delete` or
-`tls clean` removed from S3 is not: those commands leave a deletion marker
-(`autocert/deleted-<hash>`) next to it, and a local copy stored no later than the deletion is
-removed instead (`CertSync: Certificate was deleted from S3 after this node stored it`).
+stored while S3 refused writes, is written to S3. Two kinds are not, and their local copy is
+removed instead: an expired certificate, which is what `sora-admin tls clean` deletes, and one
+that `sora-admin tls delete` removed from S3 after this node stored it. `tls delete` leaves a
+deletion marker (`autocert/deleted-<hash>`) next to each certificate it deletes for this
+(`CertSync: Certificate was deleted from S3 after this node stored it`).
 `sync_interval = "0"` turns the worker off.
 
 ---
@@ -527,9 +528,12 @@ Backend-leg keys (`remote_tls`, `remote_tls_use_starttls`, `remote_tls_verify`,
 `sora-admin tls` works on the Let's Encrypt bucket from `[tls.letsencrypt.s3]` and on the local
 directory of the host you run it on (`--cache-dir`, default `fallback_dir` or
 `/var/lib/sora/certs`). It does not touch other nodes' directories or the certificates a running
-Sora holds in memory. `delete` and `clean` leave a deletion marker in S3 for each certificate, and
-every node's sync worker then removes its local copy instead of writing it back to S3 (section 7);
-a node keeps serving a certificate it has already loaded until it restarts or renews it:
+Sora holds in memory. After `delete` and `clean`, every node's sync worker removes its local copy
+of a deleted certificate instead of writing it back to S3 (section 7), but a node keeps serving a
+certificate it has already loaded until it restarts or renews it. A replacement for a deleted
+certificate is ordered only by a node that may issue (the cluster leader, or each node without
+`[cluster]`) and holds no copy: restart it once its sync has run. A node that may not issue and
+restarts before the replacement is in S3 has no certificate for the name:
 
 | Command | What it does |
 |---|---|

@@ -191,10 +191,23 @@ func (m *Manager) syncCertificateFromS3(ctx context.Context, domain string) erro
 // that, until the write succeeds.
 //
 // S3 also lacks a certificate that an operator deleted with sora-admin, which every node
-// still holds locally. sora-admin leaves a deletion marker for it, and a local copy stored
-// no later than that deletion is removed instead: written back, it would undo the delete
-// on every node at their next sync.
+// still holds locally. sora-admin tls delete leaves a deletion marker for it, and a local
+// copy stored no later than that deletion is removed instead: written back, it would undo
+// the delete on every node at their next sync. An expired copy is removed too, marker or
+// not: no node can serve it, and expired certificates are what sora-admin tls clean
+// deletes. tls clean leaves no marker, because a node may hold a valid replacement under
+// the same name that S3 has yet to receive.
 func publishLocalCertificate(ctx context.Context, fallbackCache *FallbackCache, domain string, data []byte) error {
+	if info, err := parseCertificate(data); err == nil && time.Now().After(info.NotAfter) {
+		if err := fallbackCache.fallback.Delete(ctx, domain); err != nil {
+			logger.Warn("CertSync: Failed to remove the expired local copy of a certificate S3 lacks", "domain", domain, "error", err)
+			return err
+		}
+		logger.Info("CertSync: Certificate held only on this node has expired - removed the local copy", "domain", domain,
+			"not_after", info.NotAfter.Format(time.RFC3339))
+		return nil
+	}
+
 	deleted, err := fallbackCache.deletedSinceStored(ctx, domain)
 	if err != nil {
 		logger.Warn("CertSync: Cannot tell whether the certificate held only on this node was deleted from S3 - not writing it back, will retry", "domain", domain, "error", err)

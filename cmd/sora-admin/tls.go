@@ -135,6 +135,11 @@ Running servers hold their certificates in their local fallback cache too. The d
 leaves a deletion marker in S3, and at its next certificate sync (sync_interval, default
 5m) each server removes its local copy instead of writing it back to S3. A server keeps
 serving a certificate it has already loaded until it restarts or renews it.
+
+A replacement is ordered only by a server that may issue (the cluster leader, or each
+server without [cluster]) and holds no copy, so restart that server after its next sync.
+A server that may not issue and restarts before the replacement is in S3 has no
+certificate for the name.
 `)
 	}
 
@@ -188,9 +193,9 @@ Options:
   --force               Skip confirmation prompt
   --config string       Path to TOML configuration file (required)
 
-This command deletes only expired certificates from both S3 and local cache. Like
-delete, it leaves a deletion marker in S3 for each, so that running servers remove their
-local copies at their next certificate sync instead of writing them back.
+This command deletes only expired certificates from both S3 and local cache. Running
+servers never write an expired certificate back to S3; each removes its own expired copy
+at its next certificate sync.
 
 Examples:
   # Clean expired certificates (with confirmation)
@@ -1035,19 +1040,9 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		}
 	}
 
-	marks := make([]string, 0, len(expiredCerts))
-	for _, cert := range expiredCerts {
-		marks = append(marks, cert.S3Key)
-	}
-	cache, err := tlsmanager.OpenS3Cache(s3cfg)
-	if err != nil {
-		return fmt.Errorf("failed to open the certificate cache: %w", err)
-	}
-	if err := markDeleted(ctx, cache, marks); err != nil {
-		return err
-	}
-
-	// Delete expired certificates
+	// Delete expired certificates. No deletion marker: a node's certificate sync never
+	// writes an expired certificate back to S3, and a marker, which covers every copy of
+	// the name, would make a node drop a valid replacement that S3 has yet to receive.
 	deleted := 0
 	for _, cert := range expiredCerts {
 		if err := s3store.Delete(cert.S3Key); err != nil {
@@ -1069,8 +1064,6 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			}
 		}
 	}
-
-	remarkDeleted(ctx, cache, marks)
 
 	fmt.Printf("\nDeleted %d expired certificate(s)\n", deleted)
 	return nil
