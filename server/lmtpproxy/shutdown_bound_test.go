@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -43,14 +44,31 @@ func TestShutdownNoticeDoesNotHoldSessionMutexDuringWrite(t *testing.T) {
 
 func TestShutdownNoticeBoundedForUnresponsiveGreetedClient(t *testing.T) {
 	srv := newImplicitTLSServer(t)
-	serverEnd, client := net.Pipe()
-	t.Cleanup(func() { client.Close() })
+	var clients []net.Conn
+	for range 3 {
+		serverEnd, client := net.Pipe()
+		clients = append(clients, client)
+		sess := newSession(srv, serverEnd, nil)
+		sess.greeted = true
+		srv.registerSession(sess)
+	}
+	serverEnd, responsive := net.Pipe()
+	clients = append(clients, responsive)
 	sess := newSession(srv, serverEnd, nil)
 	sess.greeted = true
 	srv.registerSession(sess)
 	done := make(chan struct{})
 	go func() { defer close(done); srv.sendGracefulShutdownMessage() }()
-	t.Cleanup(func() { client.Close(); <-done })
+	t.Cleanup(func() {
+		for _, client := range clients {
+			client.Close()
+		}
+		<-done
+	})
+	responsive.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if line, err := bufio.NewReader(responsive).ReadString('\n'); err != nil || !strings.HasPrefix(line, "421 ") {
+		t.Fatalf("unresponsive peers delayed the readable client's notice: %q, %v", line, err)
+	}
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
