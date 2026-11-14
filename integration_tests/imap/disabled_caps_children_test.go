@@ -3,6 +3,7 @@
 package imap_test
 
 import (
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -48,11 +49,14 @@ func TestIMAP_DisabledChildrenKeepsReturnChildren(t *testing.T) {
 			c.mustOK("CREATE Parent/Child")
 			c.mustOK("SUBSCRIBE Parent")
 			c.mustOK("SUBSCRIBE Parent/Child")
+			c.mustOK("SUBSCRIBE Parent/Gone") // no mailbox: \NonExistent
 
-			want := map[string]string{"Parent": `\HasChildren`, "Parent/Child": `\HasNoChildren`}
-			for _, cmd := range []string{
-				`LIST "" "Parent*" RETURN (CHILDREN)`,
-				`LIST (SUBSCRIBED) "" "Parent*" RETURN (CHILDREN)`,
+			live := map[string]string{"Parent": `\HasChildren`, "Parent/Child": `\HasNoChildren`}
+			subscribed := map[string]string{"Parent/Gone": `\HasNoChildren`}
+			maps.Copy(subscribed, live)
+			for cmd, want := range map[string]map[string]string{
+				`LIST "" "Parent*" RETURN (CHILDREN)`:              live,
+				`LIST (SUBSCRIBED) "" "Parent*" RETURN (CHILDREN)`: subscribed,
 			} {
 				resp := c.mustOK(cmd)
 				for mailbox, attr := range want {

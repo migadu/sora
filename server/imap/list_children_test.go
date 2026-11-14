@@ -70,3 +70,41 @@ func TestList_ReturnChildrenWithChildrenDisabled(t *testing.T) {
 		}
 	}
 }
+
+// A \NonExistent name in a LIST (SUBSCRIBED) answer is a LIST response too, and
+// RFC 5258 §4 says "If the CHILDREN return option is present, the server MUST
+// return these attributes". It has \HasChildren when a mailbox the user can see
+// lives under it (§3.5: "\NonExistent \HasChildren", e.g. a shared mailbox whose
+// parent is not visible), \HasNoChildren otherwise. With CHILDREN advertised or
+// not, the answer was "\NonExistent" alone.
+func TestList_ReturnChildrenOnNonExistentNames(t *testing.T) {
+	mboxes := []*db.DBMailbox{
+		// Visible without its parent, as a shared mailbox granted on its own.
+		{ID: 1, Name: "Shared/Team/Sub", Subscribed: true},
+	}
+	subscribed := map[string]string{"gone": "Gone", "shared/team/sub": "Shared/Team/Sub"}
+	recursive := &imap.ListOptions{SelectSubscribed: true, SelectRecursiveMatch: true, ReturnChildren: true}
+
+	for name, opts := range map[string]IMAPServerOptions{
+		"CHILDREN advertised": {},
+		"CHILDREN disabled":   {DisabledCaps: []string{"CHILDREN"}},
+	} {
+		caps := newDisabledCapsTestServer(t, opts).caps
+		for _, tc := range []struct {
+			pattern, mailbox string
+			want             imap.MailboxAttr
+		}{
+			{"*", "Gone", imap.MailboxAttrHasNoChildren},
+			{"Shared/%", "Shared/Team", imap.MailboxAttrHasChildren},
+		} {
+			l := buildSubscribedList("", []string{tc.pattern}, recursive, mboxes, subscribed, caps, "")
+			i := slices.IndexFunc(l, func(d imap.ListData) bool { return d.Mailbox == tc.mailbox })
+			if i < 0 {
+				t.Fatalf("%s: LIST (SUBSCRIBED RECURSIVEMATCH) \"\" %q RETURN (CHILDREN): no response for %s: %+v", name, tc.pattern, tc.mailbox, l)
+			}
+			if attrs := l[i].Attrs; !slices.Contains(attrs, imap.MailboxAttrNonExistent) || !slices.Contains(attrs, tc.want) {
+				t.Errorf("%s: LIST (SUBSCRIBED RECURSIVEMATCH) \"\" %q RETURN (CHILDREN): %s has %v, want \\NonExistent and %s", name, tc.pattern, tc.mailbox, attrs, tc.want)
+			}
+		}
+	}
+}
