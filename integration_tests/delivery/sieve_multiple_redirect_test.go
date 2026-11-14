@@ -37,6 +37,14 @@ func (q *refusingRelayQueue) Enqueue(from, to, messageType string, messageBytes 
 	return q.captureRelayQueue.Enqueue(from, to, messageType, messageBytes)
 }
 
+// Hold refuses the address as Enqueue does, and records the rest when committed.
+func (q *refusingRelayQueue) Hold(from, to, messageType string, messageBytes []byte) (func() error, func(), error) {
+	if to == q.refuse {
+		return nil, nil, fmt.Errorf("relay queue refused %s", to)
+	}
+	return q.captureRelayQueue.Hold(from, to, messageType, messageBytes)
+}
+
 // TestDelivery_SieveMultipleRedirects_PartialFailureKeepsMessage: when one of
 // several redirects cannot be handed to the relay, the others still go out and
 // the message is kept in INBOX, as it is when a single redirect fails.

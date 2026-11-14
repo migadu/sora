@@ -16,12 +16,13 @@ import (
 	lmtpserver "github.com/migadu/sora/server/lmtp"
 )
 
-// TestLMTP_SieveRedirectWithoutCopyStagesNothing is #548: a single redirect without
-// :copy stores nothing, so its body need not be staged for upload. A staged and
-// abandoned file sits in the spool until the orphan sweep and counts against the
-// staging limit meanwhile, for every message an account forwards. The body is
-// staged only when handoff fails and the message is kept. Multiple targets retain
-// staging before handoff so a partial handoff cannot precede a staging failure.
+// TestLMTP_SieveRedirectWithoutCopyStagesNothing is #548: a redirect without :copy
+// stores nothing, so its body need not be staged for upload. A staged and abandoned
+// file sits in the spool until the orphan sweep and counts against the staging limit
+// meanwhile, for every message an account forwards. The body is staged only when
+// handoff fails and the message is kept. Several targets are no different: they are
+// held in the relay queue until the delivery can no longer fail (#452), so a partial
+// handoff cannot precede a staging failure.
 func TestLMTP_SieveRedirectWithoutCopyStagesNothing(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -30,13 +31,12 @@ func TestLMTP_SieveRedirectWithoutCopyStagesNothing(t *testing.T) {
 		script string
 		queue  delivery.RelayQueue
 		kept   bool
-		staged bool
 	}{
-		{"single redirect queued", `redirect "one@example.com";`, &captureRelayQueue{}, false, false},
-		{"duplicate target queued once", `redirect "one@example.com"; redirect "one@example.com";`, &captureRelayQueue{}, false, false},
-		{"single redirect refused", `redirect "two@example.org";`, &refusingRelayQueue{refuse: "two@example.org"}, true, true},
-		{"multiple redirects queued", `redirect "one@example.com"; redirect "two@example.org";`, &captureRelayQueue{}, false, true},
-		{"queue refuses one address", `redirect "one@example.com"; redirect "two@example.org";`, &refusingRelayQueue{refuse: "two@example.org"}, true, true},
+		{"single redirect queued", `redirect "one@example.com";`, &captureRelayQueue{}, false},
+		{"duplicate target queued once", `redirect "one@example.com"; redirect "one@example.com";`, &captureRelayQueue{}, false},
+		{"single redirect refused", `redirect "two@example.org";`, &refusingRelayQueue{refuse: "two@example.org"}, true},
+		{"multiple redirects queued", `redirect "one@example.com"; redirect "two@example.org";`, &captureRelayQueue{}, false},
+		{"queue refuses one address", `redirect "one@example.com"; redirect "two@example.org";`, &refusingRelayQueue{refuse: "two@example.org"}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			imapSrv, account := common.SetupIMAPServer(t)
@@ -71,14 +71,8 @@ func TestLMTP_SieveRedirectWithoutCopyStagesNothing(t *testing.T) {
 				if n := countInMailbox(t, rdb, accountID, "INBOX"); n != 0 {
 					t.Errorf("INBOX holds %d copies, want 0", n)
 				}
-				if tc.staged {
-					if len(staged) == 0 {
-						t.Error("multiple redirect targets must stage before relay handoff")
-					}
-				} else {
-					for name := range staged {
-						t.Errorf("a single pure redirect was staged in the upload spool: %s", name)
-					}
+				for name := range staged {
+					t.Errorf("a pure redirect was staged in the upload spool: %s", name)
 				}
 				return
 			}

@@ -26,6 +26,14 @@ func (q *refusingRelayQueue) Enqueue(from, to, messageType string, messageBytes 
 	return q.captureRelayQueue.Enqueue(from, to, messageType, messageBytes)
 }
 
+// Hold refuses the address as Enqueue does, and records the rest when committed.
+func (q *refusingRelayQueue) Hold(from, to, messageType string, messageBytes []byte) (func() error, func(), error) {
+	if to == q.refuse {
+		return nil, nil, fmt.Errorf("relay queue refused %s", to)
+	}
+	return q.captureRelayQueue.Hold(from, to, messageType, messageBytes)
+}
+
 // TestLMTP_SieveRedirect_ChargesOnlyWhatIsRelayed is #327 on the LMTP path: the
 // redirect rate limit counts redirects that were queued. A redirect with no relay
 // queue to take it, or one the queue refused, keeps the message in INBOX and must
