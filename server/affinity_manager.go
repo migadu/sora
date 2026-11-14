@@ -709,21 +709,30 @@ func (am *AffinityManager) Stop() {
 		return
 	}
 	close(am.stopCleanup)
+	am.stopPersistence(affinityPersistDrainTimeout)
+}
 
-	// Refuse new persistence writes and wait for the started ones: affinity
-	// changes continue while proxies drain their sessions and the Admin API
-	// finishes requests. If writes are still running at the timeout the store
-	// stays open, since closing it would fail them; the process is exiting.
-	if !am.persistWrites.Drain(affinityPersistDrainTimeout) {
-		logger.Warn("Affinity: Persistence writes still running at shutdown, leaving the store open", "timeout", affinityPersistDrainTimeout)
-		return
-	}
-
-	if am.persistStore != nil {
-		if err := am.persistStore.Close(); err != nil {
-			logger.Warn("Affinity: Failed to close persist store", "error", err)
+func (am *AffinityManager) stopPersistence(timeout time.Duration) {
+	closeStore := func() {
+		if am.persistStore != nil {
+			if err := am.persistStore.Close(); err != nil {
+				logger.Warn("Affinity: Failed to close persist store", "error", err)
+			}
 		}
 	}
+	// Refuse new persistence writes and wait for the started ones: affinity
+	// changes continue while proxies drain their sessions and the Admin API
+	// finishes requests. At the timeout return without closing under a write,
+	// but finish closing the store when the admitted writes eventually end.
+	if !am.persistWrites.Drain(timeout) {
+		logger.Warn("Affinity: Persistence writes still running at shutdown, closing the store after they finish", "timeout", timeout)
+		go func() {
+			am.persistWrites.wait()
+			closeStore()
+		}()
+		return
+	}
+	closeStore()
 }
 
 // GetStats returns affinity statistics

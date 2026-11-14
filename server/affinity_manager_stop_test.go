@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -195,5 +196,96 @@ func TestAffinityPersistenceRacingStop(t *testing.T) {
 		if m := store.misuses(); len(m) > 0 {
 			t.Errorf("iteration %d: %v", i, m)
 		}
+	}
+}
+
+func TestAffinityStopPreservesStartedWritesAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "affinity.db")
+	store, err := affinitycache.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := store.Set(context.Background(), affinitycache.AffinityEntry{
+		Username: "removed@example.com", Protocol: "imap", Backend: "old:143",
+		AssignedAt: now, ExpiresAt: now.Add(time.Hour), NodeID: "node-b",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	am := newStopTestAffinityManager(store)
+	am.LoadPersistedAffinities(context.Background())
+	am.handleAffinityDelete(AffinityEvent{Username: "removed@example.com", Protocol: "imap", Timestamp: now.Add(time.Second)})
+	am.handleAffinitySet(AffinityEvent{
+		Username: "kept@example.com", Protocol: "imap", Backend: "kept:143",
+		Timestamp: now, TTL: time.Hour, NodeID: "node-b",
+	})
+	am.Stop()
+
+	// A late cluster event still updates memory, but must not reach the store
+	// that Stop has closed or be present when that file is opened again.
+	am.handleAffinitySet(AffinityEvent{
+		Username: "late@example.com", Protocol: "imap", Backend: "late:143",
+		Timestamp: now, TTL: time.Hour, NodeID: "node-b",
+	})
+	if backend, found := am.GetBackend("late@example.com", "imap"); !found || backend != "late:143" {
+		t.Fatal("a late event must still update the in-memory map")
+	}
+	reopened, err := affinitycache.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := newStopTestAffinityManager(reopened)
+	t.Cleanup(restarted.Stop)
+	restarted.LoadPersistedAffinities(context.Background())
+	if backend, found := restarted.GetBackend("kept@example.com", "imap"); !found || backend != "kept:143" {
+		t.Fatalf("restart lost an admitted set: %q, found=%v", backend, found)
+	}
+	for _, user := range []string{"removed@example.com", "late@example.com"} {
+		if backend, found := restarted.GetBackend(user, "imap"); found {
+			t.Errorf("restart loaded %s as %q", user, backend)
+		}
+	}
+}
+
+func TestAffinityStopTimeoutEventuallyClosesStore(t *testing.T) {
+	store := &stopAffinityStore{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	var release sync.Once
+	defer release.Do(func() { close(store.release) })
+	am := newStopTestAffinityManager(store)
+	now := time.Now()
+	am.persistSetAsync("user@example.com", "imap", "192.0.2.1:143", "node-1", now, now.Add(time.Hour))
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("the write never started")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		am.stopPersistence(20 * time.Millisecond)
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("persistence shutdown ignored its deadline")
+	}
+	if store.isClosed() {
+		t.Fatal("the timeout closed the store under an admitted write")
+	}
+	am.persistDeleteAsync("user@example.com", "imap")
+	release.Do(func() { close(store.release) })
+	for deadline := time.Now().Add(time.Second); !store.isClosed(); {
+		if time.Now().After(deadline) {
+			t.Fatal("the store remained open after pending writes finished")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-store.entered:
+		t.Error("a write submitted after the timeout reached the store")
+	default:
+	}
+	if misuse := store.misuses(); len(misuse) != 0 {
+		t.Errorf("store misused after bounded shutdown: %v", misuse)
 	}
 }

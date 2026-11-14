@@ -39,6 +39,13 @@ func (g *SessionGroup) Done() {
 	g.wg.Done()
 }
 
+// wait refuses new registrations and waits without a timeout. It lets a caller
+// finish resource cleanup after a bounded Drain has returned.
+func (g *SessionGroup) wait() {
+	g.BeginDrain()
+	g.wg.Wait()
+}
+
 // Go runs session in a new goroutine registered in the group and reports true,
 // or reports false without running it once Drain has begun.
 func (g *SessionGroup) Go(session func()) bool {
