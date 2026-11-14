@@ -140,7 +140,7 @@ func TestMoveMessages(t *testing.T) {
 	defer tx.Rollback(ctx)
 
 	uids := []imap.UID{messageUID}
-	uidMapping, err := db.MoveMessages(ctx, tx, &uids, srcMailboxID, destMailboxID, accountID, "example.com", "user", "", nil)
+	uidMapping, err := db.MoveMessages(ctx, tx, &uids, srcMailboxID, destMailboxID, accountID, "example.com", "user", "", nil, nil)
 	assert.NoError(t, err)
 	assert.NotEmpty(t, uidMapping)
 	assert.Contains(t, uidMapping, messageUID)
@@ -174,7 +174,7 @@ func TestMoveMessages(t *testing.T) {
 	defer tx2.Rollback(ctx)
 
 	nonExistentUIDs := []imap.UID{9999}
-	uidMapping, err = db.MoveMessages(ctx, tx2, &nonExistentUIDs, srcMailboxID, destMailboxID, accountID, "example.com", "user", "", nil)
+	uidMapping, err = db.MoveMessages(ctx, tx2, &nonExistentUIDs, srcMailboxID, destMailboxID, accountID, "example.com", "user", "", nil, nil)
 	assert.NoError(t, err)
 	assert.Empty(t, uidMapping) // No messages to move
 
