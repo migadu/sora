@@ -219,14 +219,8 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 
 	// If no config provided, use defaults and enable cache
 	if lookupCacheConfig == nil {
-		lookupCacheConfig = &config.LookupCacheConfig{
-			Enabled:                    true,
-			PositiveTTL:                "5m",
-			NegativeTTL:                "1m",
-			MaxSize:                    10000,
-			CleanupInterval:            "5m",
-			PositiveRevalidationWindow: "30s",
-		}
+		defaultConfig := config.DefaultLookupCacheConfig()
+		lookupCacheConfig = &defaultConfig
 	}
 
 	// Only disable if explicitly set to false
@@ -251,10 +245,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 			cleanupInterval = 5 * time.Minute
 		}
 
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize == 0 {
-			maxSize = 10000
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		positiveRevalidationWindow, err := lookupCacheConfig.GetPositiveRevalidationWindow()
 		if err != nil {

@@ -82,7 +82,7 @@ func verifySSHA512(hashedPassword, password string) error {
 	// Compare the hashes using constant-time comparison to prevent timing attacks
 	if subtle.ConstantTimeCompare(storedHash, calculatedHash) != 1 {
 		logger.Debug("verifySSHA512: Hash mismatch", "salt_len", len(salt), "hash_prefix", hashPrefix)
-		return errors.New("invalid password")
+		return ErrInvalidCredentials
 	}
 
 	logger.Debug("verifySSHA512: Verification SUCCESS", "salt_len", len(salt), "hash_prefix", hashPrefix)
@@ -109,18 +109,24 @@ func verifySHA512(hashedPassword, password string) error {
 
 	// Compare the hashes using constant-time comparison to prevent timing attacks
 	if subtle.ConstantTimeCompare(storedHash, calculatedHash) != 1 {
-		return errors.New("invalid password")
+		return ErrInvalidCredentials
 	}
 
 	return nil
 }
 
-// verifyBcrypt checks if the provided password matches the bcrypt hashed password
+// verifyBcrypt checks if the provided password matches the bcrypt hashed password,
+// with or without the {BLF-CRYPT} prefix. A mismatch matches both ErrInvalidCredentials
+// and bcrypt.ErrMismatchedHashAndPassword.
 func verifyBcrypt(hashedPassword, password string) error {
 	// For {BLF-CRYPT}, remove the prefix unconditionally
 	hashedPassword = strings.TrimPrefix(hashedPassword, blfCryptPrefix)
 
-	return bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password))
+	err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password))
+	if errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+		return fmt.Errorf("%w: %w", ErrInvalidCredentials, err)
+	}
+	return err
 }
 
 // GenerateSSHA512Hash creates a new SSHA512 password hash with a random salt
@@ -240,8 +246,10 @@ func ValidateNewHashType(hashType string) error {
 	return fmt.Errorf("%w %q: use bcrypt or ssha512", ErrUnsupportedHashType, hashType)
 }
 
-// verifyPassword checks if the provided password matches the stored password hash
-// It supports bcrypt, BLF-CRYPT, SSHA512, and SHA512 formats with different encodings
+// VerifyPassword checks if the provided password matches the stored password hash.
+// It supports bcrypt, BLF-CRYPT, SSHA512, and SHA512 formats with different encodings.
+// A wrong password is reported as ErrInvalidCredentials (errors.Is) for every scheme;
+// any other error means the stored hash could not be checked.
 func VerifyPassword(hashedPassword, password string) error {
 	start := time.Now()
 	var hashType string
@@ -288,7 +296,7 @@ func VerifyPassword(hashedPassword, password string) error {
 		strings.HasPrefix(hashedPassword, bcryptPrefix2y):
 		// Standard bcrypt format
 		hashType = "bcrypt"
-		err = bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password))
+		err = verifyBcrypt(hashedPassword, password)
 		return err
 
 	default:

@@ -86,7 +86,8 @@ func IsTransientError(err error) bool {
 }
 
 // IsTemporaryAuthFailure checks if an authentication error is temporary (server shutdown, service unavailable)
-// and should result in an UNAVAILABLE response rather than AUTHENTICATIONFAILED.
+// and should be answered as a temporary failure rather than as a wrong password: IMAP NO [UNAVAILABLE],
+// POP3 -ERR [SYS/TEMP], ManageSieve NO (TRYLATER).
 func IsTemporaryAuthFailure(err error) bool {
 	if err == nil {
 		return false
