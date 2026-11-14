@@ -66,9 +66,10 @@ var (
 )
 
 // authUnavailable reports whether a failed Authenticate says nothing about the
-// credentials: the database could not be asked, or the command was cut short. Such a
-// login is answered TRYLATER (RFC 5804 section 1.3) and not counted as a failed one,
-// or clients retrying a saved password through a database outage stay blocked after it.
+// credentials: the database could not be asked, the stored hash cannot be checked, or
+// the command was cut short. Such a login is answered TRYLATER (RFC 5804 section 1.3)
+// and not counted as a failed one, or clients retrying a saved password through a
+// database outage stay blocked after it.
 func authUnavailable(err error) bool {
 	return server.IsTemporaryAuthFailure(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
