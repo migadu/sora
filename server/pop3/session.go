@@ -65,6 +65,11 @@ type POP3Session struct {
 	startTime        time.Time
 	memTracker       *server.SessionMemoryTracker // Memory usage tracker for this session
 
+	// trackedClientAddr is the client address this session was registered
+	// with in the connection tracker, so it is unregistered under that key.
+	// Empty when the tracker refused the session: it has nothing to release.
+	trackedClientAddr string
+
 	// Session statistics for summary logging
 	messagesRetrieved int // Messages retrieved with RETR
 	messagesDeleted   int // Messages marked for deletion with DELE
@@ -1242,25 +1247,28 @@ func (s *POP3Session) registerConnection(email string) {
 		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
 		defer cancel()
 
-		clientAddr := server.GetAddrString(s.conn.RemoteAddr())
+		// The client's address, not the TCP peer: behind a proxy the peer is
+		// the proxy for every client. RemoteIP already holds the address from
+		// the PROXY header or a trusted proxy's XCLIENT (refused after login).
+		clientAddr := s.RemoteIP
 
 		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "POP3", clientAddr); err != nil {
 			s.InfoLog("rejected connection registration", "error", err)
+			return
 		}
+		s.trackedClientAddr = clientAddr
 	}
 }
 
 // unregisterConnection removes the connection from the connection tracker
 func (s *POP3Session) unregisterConnection() {
-	if s.server.connTracker != nil && s.authenticated.Load() {
+	if s.server.connTracker != nil && s.authenticated.Load() && s.trackedClientAddr != "" {
 		// Use configured database query timeout for connection tracking (database DELETE)
 		queryTimeout := s.server.rdb.GetQueryTimeout()
 		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 		defer cancel()
 
-		clientAddr := server.GetAddrString(s.conn.RemoteAddr())
-
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "POP3", clientAddr); err != nil {
+		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "POP3", s.trackedClientAddr); err != nil {
 			s.DebugLog("failed to unregister connection", "error", err)
 		}
 	}

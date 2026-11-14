@@ -1,5 +1,5 @@
 .PHONY: all clean build sora sora-admin install tests tests-race reset-test-db build-test-sora-admin \
-	integration-tests integration-tests-imap integration-tests-imap-slowloris integration-tests-lmtp integration-tests-pop3 \
+	integration-tests integration-tests-sora integration-tests-imap integration-tests-imap-slowloris integration-tests-lmtp integration-tests-pop3 \
 	integration-tests-managesieve integration-tests-imapproxy integration-tests-lmtpproxy \
 	integration-tests-pop3proxy integration-tests-managesieveproxy integration-tests-userapiproxy \
 	integration-tests-connection-limits integration-tests-lmtp-connection-limits \
@@ -87,7 +87,7 @@ reset-test-db:
 	@SORA_TEST_DB_NAME="$(DB_NAME)" DB_HOST="$(DB_HOST)" DB_PORT="$(DB_PORT)" DB_USER="$(DB_USER)" go run ./scripts/reset-test-db/main.go > /dev/null 2>&1 || true
 
 # Run all integration tests (requires PostgreSQL)
-integration-tests: integration-tests-imap integration-tests-imap-slowloris integration-tests-lmtp integration-tests-pop3 \
+integration-tests: integration-tests-sora integration-tests-imap integration-tests-imap-slowloris integration-tests-lmtp integration-tests-pop3 \
 	integration-tests-managesieve integration-tests-imapproxy integration-tests-lmtpproxy \
 	integration-tests-pop3proxy integration-tests-managesieveproxy integration-tests-userapiproxy \
 	integration-tests-connection-limits integration-tests-lmtp-connection-limits \
@@ -96,7 +96,7 @@ integration-tests: integration-tests-imap integration-tests-imap-slowloris integ
 	integration-tests-config integration-tests-sora-admin integration-tests-relay
 
 # Run integration tests in quick mode (skip long-running tests like slowloris)
-integration-tests-quick: integration-tests-imap-quick integration-tests-lmtp integration-tests-pop3 \
+integration-tests-quick: integration-tests-sora integration-tests-imap-quick integration-tests-lmtp integration-tests-pop3 \
 	integration-tests-managesieve integration-tests-imapproxy integration-tests-lmtpproxy \
 	integration-tests-pop3proxy integration-tests-managesieveproxy integration-tests-userapiproxy \
 	integration-tests-connection-limits integration-tests-lmtp-connection-limits \
@@ -198,6 +198,12 @@ integration-tests-sora-admin: reset-test-db
 	@echo "Running sora-admin integration tests..."
 	@cd cmd/sora-admin && go test $(TEST_FLAGS) .
 
+# Integration tests of the server binary's own wiring (config -> server options). cmd/sora
+# is package main, so they cannot live under integration_tests/.
+integration-tests-sora: reset-test-db
+	@echo "Running sora server wiring integration tests..."
+	@cd cmd/sora && go test $(TEST_FLAGS) .
+
 integration-tests-relay:
 	@echo "Running relay integration tests..."
 	@cd integration_tests/relay && go test $(TEST_FLAGS) .
@@ -288,6 +294,7 @@ help:
 	@echo "Other integration tests:"
 	@echo "  integration-tests-config        - Configuration tests"
 	@echo "  integration-tests-sora-admin    - Import/export tests"
+	@echo "  integration-tests-sora          - Server wiring (cmd/sora) tests"
 	@echo "  integration-tests-relay         - Relay (SMTP/HTTP) tests"
 	@echo ""
 	@echo "Cross-compilation targets:"
