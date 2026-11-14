@@ -91,6 +91,9 @@ type AuthRateLimiter struct {
 	// decoupled from PROXY/XCLIENT source-IP trust. (security-audit M2)
 	exemptNetworks []string
 
+	// Addresses are keyed by clientIPOf, so one client spelled several ways
+	// (::ffff:192.0.2.1, 2001:0DB8::1) has one set of counters and blocks.
+
 	// Tier 1: IP+username blocking (fast, protects shared IPs). Failure counters and
 	// blocks are kept apart, each bounded by max_ip_username_entries, so that neither
 	// the window cleanup nor making room for a counter can end a block early.
@@ -248,10 +251,7 @@ func (a *AuthRateLimiter) CanAttemptAuth(ctx context.Context, remoteAddr net.Add
 		return nil
 	}
 
-	ip, _, err := net.SplitHostPort(remoteAddr.String())
-	if err != nil {
-		ip = remoteAddr.String()
-	}
+	ip := clientIPOf(remoteAddr.String())
 
 	// Exempt networks are never rate limited (decoupled from PROXY/XCLIENT trust)
 	if a.isRateLimitExempt(ip) {
@@ -354,10 +354,7 @@ func (a *AuthRateLimiter) IsIPBlocked(remoteAddr net.Addr) bool {
 		return false // Rate limiting disabled or Tier 2 disabled
 	}
 
-	ip, _, err := net.SplitHostPort(remoteAddr.String())
-	if err != nil {
-		ip = remoteAddr.String()
-	}
+	ip := clientIPOf(remoteAddr.String())
 
 	// Exempt networks are never blocked (Tier 2)
 	if a.isRateLimitExempt(ip) {
@@ -387,14 +384,9 @@ func (a *AuthRateLimiter) IsIPBlockedWithProxy(conn net.Conn, proxyInfo *ProxyPr
 	// Determine real client IP (with PROXY protocol support)
 	var realClientIP string
 	if proxyInfo != nil && proxyInfo.SrcIP != "" {
-		realClientIP = proxyInfo.SrcIP
+		realClientIP = clientIPOf(proxyInfo.SrcIP)
 	} else {
-		ip, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-		if err != nil {
-			realClientIP = conn.RemoteAddr().String()
-		} else {
-			realClientIP = ip
-		}
+		realClientIP = clientIPOf(conn.RemoteAddr().String())
 	}
 
 	// Exempt networks are never blocked (Tier 2)
@@ -447,6 +439,7 @@ func (a *AuthRateLimiter) RecordAuthAttemptWithProxy(ctx context.Context, conn n
 
 	// Extract real client IP and proxy IP
 	clientIP, proxyIP := GetConnectionIPs(conn, proxyInfo)
+	clientIP = clientIPOf(clientIP)
 
 	now := time.Now()
 	isExempt := a.isRateLimitExempt(clientIP)
@@ -497,10 +490,7 @@ func (a *AuthRateLimiter) RecordAuthAttempt(ctx context.Context, remoteAddr net.
 		return
 	}
 
-	ip, _, err := net.SplitHostPort(remoteAddr.String())
-	if err != nil {
-		ip = remoteAddr.String()
-	}
+	ip := clientIPOf(remoteAddr.String())
 
 	now := time.Now()
 	isExempt := a.isRateLimitExempt(ip)
@@ -533,10 +523,7 @@ func (a *AuthRateLimiter) GetAuthenticationDelay(remoteAddr net.Addr) time.Durat
 		return 0
 	}
 
-	ip, _, err := net.SplitHostPort(remoteAddr.String())
-	if err != nil {
-		ip = remoteAddr.String()
-	}
+	ip := clientIPOf(remoteAddr.String())
 
 	a.ipMu.RLock()
 	defer a.ipMu.RUnlock()

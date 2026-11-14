@@ -99,10 +99,8 @@ func applyAuthenticationDelayWithManager(ctx context.Context, limiter any, remot
 		return nil
 	}
 
-	ip, _, err := net.SplitHostPort(remoteAddr.String())
-	if err != nil {
-		ip = remoteAddr.String()
-	}
+	// One slot count per client, however its address is spelled (see clientIPOf).
+	ip := clientIPOf(remoteAddr.String())
 
 	// Try to acquire a delay slot (non-blocking)
 	if !dm.tryAcquire(ip) {

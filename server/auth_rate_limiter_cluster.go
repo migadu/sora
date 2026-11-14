@@ -278,6 +278,10 @@ func (crl *ClusterRateLimiter) HandleClusterEvent(data []byte) {
 		return
 	}
 
+	// The limiter keys addresses in canonical form (clientIPOf); a peer on a
+	// build that keyed them as given may spell this one another way.
+	event.IP = clientIPOf(event.IP)
+
 	switch event.Type {
 	case RateLimitEventBlockIP:
 		crl.handleBlockIP(event)
