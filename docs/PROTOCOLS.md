@@ -331,7 +331,7 @@ list depends on the connection state:
 | `ESEARCH`, `SEARCHRES` | RFC 4731, RFC 5182 | |
 | `LIST-EXTENDED`, `LIST-STATUS` | RFC 5258, RFC 5819 | |
 | `STATUS=SIZE` | RFC 8438 | |
-| `CHILDREN` | RFC 3348 | |
+| `CHILDREN` | RFC 3348 | When removed (section 6), `\HasChildren` / `\HasNoChildren` are sent only for `LIST ... RETURN (CHILDREN)`, which `LIST-EXTENDED` keeps (RFC 5258 §4). |
 | `NAMESPACE` | RFC 2342 | Section 5.3. |
 | `MOVE` | RFC 6851 | |
 | `BINARY` | RFC 3516 | |
