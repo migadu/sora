@@ -218,7 +218,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 				m.content_hash,
 				CASE WHEN m.account_id = $6 THEN m.uploaded ELSE m.content_hash = ANY($10::text[]) END AS uploaded,
 				m.message_id, m.in_reply_to, m."references",
-				m.subject, m.sent_date, m.sent_utc_offset, m.internal_date, m.size,
+				m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown, m.internal_date, m.size,
 				m.body_structure, m.recipients_json,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses,
 				m.id AS original_id,
@@ -235,14 +235,14 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		inserted AS (
 			INSERT INTO messages (
 				account_id, content_hash, uploaded, message_id, in_reply_to, "references",
-				subject, sent_date, sent_utc_offset, internal_date, size,
+				subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 				body_structure, recipients_json, s3_domain, s3_localpart,
 				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
 				mailbox_id, mailbox_path, created_modseq, uid
 			)
 			SELECT
 				$6 AS account_id, content_hash, uploaded, message_id, in_reply_to, "references",
-				subject, sent_date, sent_utc_offset, internal_date, size,
+				subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 				body_structure, recipients_json,
 				-- The S3 key is per row: the body lives under whatever the account's primary
 				-- address was when the source row was written, and readers build their GET
@@ -407,7 +407,7 @@ type InsertMessageOptions struct {
 	Size                 int64
 	Subject              string
 	PlaintextBody        string
-	SentDate             time.Time
+	SentDate             time.Time // the Date: header; zero when none parses (see storedSentDate)
 	InReplyTo            []string
 	References           []string
 	BodyStructure        *imap.BodyStructure
@@ -509,6 +509,21 @@ func sentUTCOffset(sentDate time.Time) *int32 {
 	return &o
 }
 
+// storedSentDate returns the messages.sent_date and sent_date_unknown values for a message,
+// whose InternalDate the caller has already defaulted. A message without a Date: header that
+// parses has no sent date, and SORT and THREAD use its INTERNALDATE instead (RFC 5256 §2.2:
+// "If the sent date cannot be determined (a Date: header is missing or cannot be parsed), the
+// INTERNALDATE for that message is used as the sent date"). sent_date_unknown records that
+// sent_date is that substitute, so the ENVELOPE reports the date as NIL (RFC 9051 §7.5.2,
+// BuildEnvelope); it is NULL, not false, for every other message.
+func storedSentDate(options *InsertMessageOptions) (sentDate time.Time, unknown *bool) {
+	if options.SentDate.IsZero() {
+		t := true
+		return options.InternalDate, &t
+	}
+	return options.SentDate, nil
+}
+
 func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *InsertMessageOptions, upload PendingUpload) (messageID int64, uid int64, err error) {
 	start := time.Now()
 	defer func() {
@@ -549,6 +564,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	if options.InternalDate.IsZero() {
 		options.InternalDate = time.Now()
 	}
+	sentDate, sentDateUnknown := storedSentDate(options)
 
 	var highestUID int64
 	var uidToUse int64
@@ -742,9 +758,9 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	err = tx.QueryRow(ctx, `
 		WITH inserted AS (
 			INSERT INTO messages
-				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, delivery_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, in_reply_to, "references", body_structure, recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
+				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, delivery_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, sent_date_unknown, in_reply_to, "references", body_structure, recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
 			VALUES
-				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @delivery_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @sent_utc_offset, @in_reply_to, @references, @body_structure, @recipients_json, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses)
+				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @delivery_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @sent_utc_offset, @date_unknown, @in_reply_to, @references, @body_structure, @recipients_json, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses)
 			RETURNING id
 		)
 		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
@@ -765,8 +781,9 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		"internal_date":   options.InternalDate,
 		"size":            options.Size,
 		"subject":         saneSubject,
-		"sent_date":       options.SentDate,
-		"sent_utc_offset": sentUTCOffset(options.SentDate),
+		"sent_date":       sentDate,
+		"sent_utc_offset": sentUTCOffset(sentDate),
+		"date_unknown":    sentDateUnknown,
 		"in_reply_to":     saneInReplyToStr,
 		"references":      saneReferencesStr,
 		"body_structure":  bodyStructureData,
@@ -894,7 +911,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	// are secured. This safely enqueues the raw payloads for the background daemon
 	// to asynchronously perform the expensive to_tsvector() conversion. If this fails, the message is still
 	// delivered and uploaded to S3 — it just won't be FTS-searchable.
-	if shouldStageFTS(options.FTSRetention, options.SentDate, time.Now()) {
+	if shouldStageFTS(options.FTSRetention, sentDate, time.Now()) {
 		// Decide what to store in messages_fts_v2.
 		// Very large bodies (>64KB) are truncated to their first 64KB, which is all that
 		// gets indexed; the full content is always available in S3.
@@ -915,7 +932,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 
 		textBodyStr, _ := textBodyArg.(string)
 		if textBodyStr != "" {
-			stageFTS(ctx, tx, options.ContentHash, options.AccountID, textBodyArg, options.SentDate)
+			stageFTS(ctx, tx, options.ContentHash, options.AccountID, textBodyArg, sentDate)
 		}
 	}
 
@@ -946,6 +963,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	if options.InternalDate.IsZero() {
 		options.InternalDate = time.Now()
 	}
+	sentDate, sentDateUnknown := storedSentDate(options)
 
 	var highestUID int64
 	var uidToUse int64
@@ -1114,9 +1132,9 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	err = tx.QueryRow(ctx, `
 		WITH inserted AS (
 			INSERT INTO messages
-				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
+				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, sent_date_unknown, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
 			VALUES
-				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @sent_utc_offset, @in_reply_to, @references, @body_structure, @recipients_json, true, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses)
+				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @sent_utc_offset, @date_unknown, @in_reply_to, @references, @body_structure, @recipients_json, true, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses)
 			RETURNING id
 		)
 		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
@@ -1136,8 +1154,9 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		"internal_date":   options.InternalDate,
 		"size":            options.Size,
 		"subject":         saneSubject,
-		"sent_date":       options.SentDate,
-		"sent_utc_offset": sentUTCOffset(options.SentDate),
+		"sent_date":       sentDate,
+		"sent_utc_offset": sentUTCOffset(sentDate),
+		"date_unknown":    sentDateUnknown,
 		"in_reply_to":     saneInReplyToStr,
 		"references":      saneReferencesStr,
 		"body_structure":  bodyStructureData,
@@ -1184,7 +1203,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBInsertFailed, err)
 	}
 
-	if shouldStageFTS(options.FTSRetention, options.SentDate, time.Now()) {
+	if shouldStageFTS(options.FTSRetention, sentDate, time.Now()) {
 		// Decide what to store in messages_fts_v2.
 		// Very large bodies (>64KB) are truncated to their first 64KB, which is all that
 		// gets indexed; the full content is always available in S3.
@@ -1206,7 +1225,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		// expected for old/large messages and is handled gracefully downstream (unsearchable).
 		textBodyStr, _ := textBodyArg.(string)
 		if textBodyStr != "" {
-			stageFTS(ctx, tx, options.ContentHash, options.AccountID, textBodyArg, options.SentDate)
+			stageFTS(ctx, tx, options.ContentHash, options.AccountID, textBodyArg, sentDate)
 		}
 	}
 
@@ -1280,6 +1299,8 @@ func (d *Database) InsertMessagesBatch(
 		ToEmailSort        string
 		CcEmailSort        string
 		ExtraAddresses     string
+		SentDate           time.Time
+		SentDateUnknown    *bool
 		AssignedUID        int64
 	}
 
@@ -1308,6 +1329,7 @@ func (d *Database) InsertMessagesBatch(
 		if opt.InternalDate.IsZero() {
 			opt.InternalDate = time.Now()
 		}
+		sentDate, sentDateUnknown := storedSentDate(opt)
 
 		saneRecipients := make([]helpers.Recipient, len(opt.Recipients))
 		for j, r := range opt.Recipients {
@@ -1371,6 +1393,8 @@ func (d *Database) InsertMessagesBatch(
 			ToEmailSort:        toEmailSort,
 			CcEmailSort:        ccEmailSort,
 			ExtraAddresses:     extraAddresses,
+			SentDate:           sentDate,
+			SentDateUnknown:    sentDateUnknown,
 		})
 		messageIDs = append(messageIDs, saneMessageID)
 		contentHashes = append(contentHashes, opt.ContentHash)
@@ -1514,9 +1538,9 @@ func (d *Database) InsertMessagesBatch(
 		batch.Queue(`
 			WITH inserted AS (
 				INSERT INTO messages
-					(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
+					(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, sent_date_unknown, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
 				VALUES
-					($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $27, $13, $14, $15, $16, $17, nextval('messages_modseq'), $18, $19, $20, $21, $22, $23, $26)
+					($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $27, $28, $13, $14, $15, $16, $17, nextval('messages_modseq'), $18, $19, $20, $21, $22, $23, $26)
 				RETURNING id
 			)
 			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
@@ -1524,10 +1548,10 @@ func (d *Database) InsertMessagesBatch(
 			RETURNING message_id
 		`,
 			p.Opt.AccountID, mailboxID, p.SaneMailboxName, p.AssignedUID, p.SaneMessageID, p.Opt.ContentHash,
-			p.Opt.S3Domain, p.Opt.S3Localpart, p.Opt.InternalDate, p.Opt.Size, p.SaneSubject, p.Opt.SentDate,
+			p.Opt.S3Domain, p.Opt.S3Localpart, p.Opt.InternalDate, p.Opt.Size, p.SaneSubject, p.SentDate,
 			p.SaneInReplyToStr, p.SaneReferencesStr, p.BodyStructureData, p.RecipientsJSON, uploaded, p.SubjectSort,
 			p.FromNameSort, p.FromEmailSort, p.ToNameSort, p.ToEmailSort, p.CcEmailSort,
-			p.BitwiseFlags, p.CustomKeywordsJSON, p.ExtraAddresses, sentUTCOffset(p.Opt.SentDate),
+			p.BitwiseFlags, p.CustomKeywordsJSON, p.ExtraAddresses, sentUTCOffset(p.SentDate), p.SentDateUnknown,
 		)
 
 		if !uploaded && p.Upload != nil {
@@ -1538,7 +1562,7 @@ func (d *Database) InsertMessagesBatch(
 			`, p.Upload.InstanceID, p.Upload.ContentHash, p.Upload.Size, p.Upload.AccountID)
 		}
 
-		if shouldStageFTS(p.Opt.FTSRetention, p.Opt.SentDate, ftsNow) {
+		if shouldStageFTS(p.Opt.FTSRetention, p.SentDate, ftsNow) {
 			const maxStoredBodySize = 64 * 1024 // 64 KB
 			var textBodyArg any = p.SanePlaintextBody
 
@@ -1557,7 +1581,7 @@ func (d *Database) InsertMessagesBatch(
 					ftsHashesSeen[p.Opt.ContentHash] = struct{}{}
 					ftsHashesToLock = append(ftsHashesToLock, p.Opt.ContentHash)
 				}
-				batch.Queue(ftsStageV2SQL, p.Opt.ContentHash, p.Opt.AccountID, textBodyArg, p.Opt.SentDate)
+				batch.Queue(ftsStageV2SQL, p.Opt.ContentHash, p.Opt.AccountID, textBodyArg, p.SentDate)
 			}
 		}
 	}
@@ -1601,7 +1625,7 @@ func (d *Database) InsertMessagesBatch(
 			}
 		}
 
-		if shouldStageFTS(p.Opt.FTSRetention, p.Opt.SentDate, ftsNow) {
+		if shouldStageFTS(p.Opt.FTSRetention, p.SentDate, ftsNow) {
 			textBodyStr, _ := p.SanePlaintextBody, false
 			if len(p.SanePlaintextBody) > 64*1024 {
 				textBodyStr = "..." // Mocked just to check if we queued it

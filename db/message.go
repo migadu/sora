@@ -31,7 +31,8 @@ type Message struct {
 	FlagsChangedAt *time.Time // Time when the flags were last changed
 	Subject        string     // Subject of the message
 	InternalDate   time.Time  // The internal date the message was received
-	SentDate       time.Time  // The date the message was sent
+	SentDate       time.Time  // The date the message was sent; its INTERNALDATE when NoDateHeader
+	NoDateHeader   bool       // No Date: header that parses (sent_date_unknown): the ENVELOPE date is NIL
 	Size           int        // Size of the message in bytes
 	MessageID      string     // Unique Message-ID from the message headers
 	InReplyTo      string
@@ -245,7 +246,7 @@ func streamMessagesWhereChunked(ctx context.Context, run MessageStreamDBRunner, 
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
 			m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq,
 			0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
@@ -418,7 +419,7 @@ func streamAllActiveMessagesRawChunked(ctx context.Context, run MessageStreamDBR
 		SELECT
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
 			m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
@@ -469,7 +470,7 @@ func scanMessages(rows pgx.Rows, includeBodyStructure bool) ([]Message, error) {
 		}
 		scanArgs = append(scanArgs,
 			&msg.CreatedModSeq, &msg.UpdatedModSeq,
-			&msg.ExpungedModSeq, &msg.Seq, &msg.FlagsChangedAt, &msg.Subject, &msg.SentDate, &msg.MessageID,
+			&msg.ExpungedModSeq, &msg.Seq, &msg.FlagsChangedAt, &msg.Subject, &msg.SentDate, &msg.NoDateHeader, &msg.MessageID,
 			&msg.InReplyTo, &recipientsJSON,
 		)
 
@@ -581,7 +582,7 @@ func (db *Database) GetMessagesByFlag(ctx context.Context, mailboxID int64, flag
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
 			m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq,
 			0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND (ms.flags & $2) != 0 AND m.expunged_at IS NULL

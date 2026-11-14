@@ -244,13 +244,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	mailHeader := mail.Header{Header: messageEntity.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
+	sentDate, _ := mailHeader.Date() // zero without a Date: header that parses (db.InsertMessageOptions.SentDate)
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
-
-	if sentDate.IsZero() {
-		sentDate = time.Now()
-	}
 
 	// Calculate content hash
 	contentHash := helpers.HashContent(messageBytes)
@@ -621,13 +617,9 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 	mailHeader := mail.Header{Header: messageEntity.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
+	sentDate, _ := mailHeader.Date() // zero without a Date: header that parses (db.InsertMessageOptions.SentDate)
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
-
-	if sentDate.IsZero() {
-		sentDate = time.Now()
-	}
 
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
 
