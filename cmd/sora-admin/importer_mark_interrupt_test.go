@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/migadu/sora/db"
 	"github.com/stretchr/testify/assert"
@@ -74,4 +75,25 @@ func TestImportInterruptAfterCommitCountsTheBatchImported(t *testing.T) {
 	imported, pending := uploadedCounts(t, maildirPath)
 	assert.Equal(t, 2, imported, "committed messages were left unmarked; the next --incremental run re-imports them")
 	assert.Equal(t, 0, pending)
+}
+
+// Detached from the interrupt, the mark is still bounded, and a real timeout is
+// reported as one.
+func TestMarkBatchInSQLiteReportsARealTimeout(t *testing.T) {
+	saved := sqliteMarkTimeout
+	sqliteMarkTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { sqliteMarkTimeout = saved })
+
+	importer, err := NewImporter(context.Background(), newCleanupDBMaildir(t, 0), "user@example.com", 1, nil, nil, ImporterOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { importer.Close() })
+
+	// The cache has a single connection; hold it, as a stuck writer would.
+	conn, err := importer.sqliteDB.Conn(context.Background())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	err = importer.markBatchInSQLite([]markedMessage{{hash: "somehash", mailbox: "INBOX"}})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Contains(t, err.Error(), "timed out after 50ms")
 }
