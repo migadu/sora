@@ -117,6 +117,32 @@ func TestAdminAPI_UserConnections_FindsAccountUnderAnyAddress(t *testing.T) {
 		})
 	}
 
+	t.Run("simultaneous remote lookup addresses are all listed", func(t *testing.T) {
+		wanted := make(map[float64]bool)
+		for _, address := range []string{rlPrimary, rlAlias} {
+			id := proxy.DeriveAccountIDFromEmail(address)
+			wanted[float64(id)] = true
+			if err := s.tracker.RegisterConnection(context.Background(), id, address, "IMAP", "192.0.2.3:50000"); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { s.tracker.UnregisterConnection(context.Background(), id, "IMAP", "192.0.2.3:50000") })
+		}
+		for _, address := range []string{rlPrimary, rlAlias} {
+			entries := s.userConnections(t, address)
+			if len(entries) != len(wanted) {
+				t.Fatalf("%s listed %d entries, want both remote lookup IDs: %v", address, len(entries), entries)
+			}
+			seen := make(map[float64]bool)
+			for _, entry := range entries {
+				id := entry["account_id"].(float64)
+				if !wanted[id] || seen[id] {
+					t.Errorf("%s listed unexpected or duplicate account ID: %v", address, entry)
+				}
+				seen[id] = true
+			}
+		}
+	})
+
 	t.Run("kick under the alias ends the session listed under it", func(t *testing.T) {
 		s.request(t, "POST", "/admin/connections/kick", map[string]string{"user_email": alias}, http.StatusOK)
 		waitClosed(t, byPrimary, "the session the alias names")
