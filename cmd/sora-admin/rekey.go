@@ -73,8 +73,17 @@ func readStoredBody(store interface {
 // content_hash from its snapshot without waiting for row locks. Server write transactions are
 // bounded by the database write_timeout (10 to 15 seconds by default), so after this delay
 // every row that will ever carry the old hash has committed, and the reference check that
-// precedes the delete sees it. A variable so tests can shorten it.
-var rekeyOldObjectDelay = 30 * time.Second
+// precedes the delete sees it. handleImportRekey raises it to oldObjectDelayFor the
+// configured write_timeout; a variable so tests can shorten it.
+var rekeyOldObjectDelay = rekeyMinOldObjectDelay
+
+const rekeyMinOldObjectDelay = 30 * time.Second
+
+// oldObjectDelayFor is the delay for a database whose write transactions are bounded by
+// writeTimeout: twice that, and never less than rekeyMinOldObjectDelay.
+func oldObjectDelayFor(writeTimeout time.Duration) time.Duration {
+	return max(rekeyMinOldObjectDelay, 2*writeTimeout)
+}
 
 type rekeyOptions struct {
 	DryRun     bool
@@ -436,6 +445,12 @@ Examples:
 			os.Exit(1)
 		}
 	}
+
+	writeTimeout, err := globalConfig.Database.GetWriteTimeout()
+	if err != nil {
+		logger.Fatalf("Invalid database write_timeout: %v", err)
+	}
+	rekeyOldObjectDelay = oldObjectDelayFor(writeTimeout)
 
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {

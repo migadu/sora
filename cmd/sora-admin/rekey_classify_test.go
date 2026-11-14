@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -101,6 +102,20 @@ func TestParseRekeyCursor(t *testing.T) {
 	for _, bad := range []string{"", "abc123", "example.com/abc123", "/user/abc123", "example.com/user/"} {
 		if _, err := parseRekeyCursor(bad); err == nil {
 			t.Errorf("parseRekeyCursor(%q) succeeded, want an error", bad)
+		}
+	}
+}
+
+// TestOldObjectDelayCoversWriteTimeout: the old object outlives every write transaction that
+// may still copy the old hash, however long the configured write_timeout lets one run.
+func TestOldObjectDelayCoversWriteTimeout(t *testing.T) {
+	for _, tc := range []struct{ writeTimeout, want time.Duration }{
+		{10 * time.Second, 30 * time.Second},
+		{15 * time.Second, 30 * time.Second},
+		{60 * time.Second, 2 * time.Minute},
+	} {
+		if got := oldObjectDelayFor(tc.writeTimeout); got != tc.want {
+			t.Errorf("oldObjectDelayFor(%s) = %s, want %s", tc.writeTimeout, got, tc.want)
 		}
 	}
 }
