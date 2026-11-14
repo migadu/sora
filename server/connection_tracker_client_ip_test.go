@@ -133,3 +133,23 @@ func TestConnectionTracker_SnapshotCanonicalisesClientIP(t *testing.T) {
 		t.Fatal("client with two connections via a peer admitted a third with per-user-per-IP limit 2")
 	}
 }
+
+func TestConnectionTracker_DeferredEventsCanonicaliseClientIP(t *testing.T) {
+	ct := NewConnectionTracker("IMAP", "test", "localhost", "instance-1", nil, 10, 1, 0, false)
+	defer ct.Stop()
+	now := time.Now()
+	ct.handleUnregister(ConnectionEvent{
+		AccountID: 1, Protocol: "IMAP", InstanceID: "instance-2",
+		ClientAddr: "[2001:0DB8:0:0:0:0:0:1]:1111", Timestamp: now.Add(time.Millisecond),
+	})
+	ct.handleRegister(ConnectionEvent{
+		AccountID: 1, Username: "user@example.com", Protocol: "IMAP", InstanceID: "instance-2",
+		ClientAddr: "2001:db8::1", Timestamp: now,
+	})
+	if got := ct.GetConnectionCount(1); got != 0 {
+		t.Fatalf("out-of-order events with equivalent IP spellings left %d connections, want 0", got)
+	}
+	if err := ct.RegisterConnection(t.Context(), 1, "user@example.com", "IMAP", "[2001:db8::1]:2222"); err != nil {
+		t.Fatalf("a closed peer connection kept the local slot occupied: %v", err)
+	}
+}
