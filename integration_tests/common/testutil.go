@@ -3,6 +3,7 @@
 package common
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
@@ -2466,6 +2468,39 @@ func GetTestConfigPath(t testing.TB) string {
 		panic(err)
 	}
 	return configPath
+}
+
+// GetTestConfigPathForTestDB returns the path of a config for a sora-admin subprocess:
+// config-test.toml, rewritten into a temporary file naming SORA_TEST_DB_NAME's database
+// when that is set. The server fixtures use SORA_TEST_DB_NAME, but sora-admin reads only
+// its --config, which names sora_test_db: given that unchanged, it works in another
+// database than the test.
+func GetTestConfigPathForTestDB(t *testing.T) string {
+	t.Helper()
+	configPath := GetTestConfigPath(t)
+	name := os.Getenv("SORA_TEST_DB_NAME")
+	if name == "" {
+		return configPath
+	}
+	var settings map[string]any
+	if _, err := toml.DecodeFile(configPath, &settings); err != nil {
+		t.Fatalf("decode %s: %v", configPath, err)
+	}
+	database, _ := settings["database"].(map[string]any)
+	for _, key := range []string{"write", "read"} {
+		if endpoint, ok := database[key].(map[string]any); ok {
+			endpoint["name"] = name
+		}
+	}
+	var encoded bytes.Buffer
+	if err := toml.NewEncoder(&encoded).Encode(settings); err != nil {
+		t.Fatalf("encode test config: %v", err)
+	}
+	rewritten := filepath.Join(t.TempDir(), "config-test.toml")
+	if err := os.WriteFile(rewritten, encoded.Bytes(), 0o600); err != nil {
+		t.Fatalf("write %s: %v", rewritten, err)
+	}
+	return rewritten
 }
 
 // GetSoraAdminBinary returns the absolute path to the sora-admin binary used by

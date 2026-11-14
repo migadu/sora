@@ -18,7 +18,7 @@ require (
 	github.com/hashicorp/memberlist v0.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/k3a/html2text v1.4.0
-	github.com/migadu/go-imap v1.2.3
+	github.com/migadu/go-imap v1.2.4-0.20261114105329-c6665575dab2
 	github.com/migadu/go-managesieve v0.1.4-0.20261111064008-c40a1d686eed
 	github.com/migadu/go-pop3 v0.1.5-0.20261111064228-de4f7d66d394
 	github.com/migadu/go-sieve v1.4.4
@@ -60,7 +60,6 @@ require (
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/hashicorp/go-sockaddr v1.0.7 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
-	github.com/jackc/pgerrcode v0.0.0-20250907135507-afb5586c32a6 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect

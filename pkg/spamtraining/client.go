@@ -65,6 +65,13 @@ func NewClient(cfg *config.SpamTrainingConfig) (*Client, error) {
 			MaxIdleConnsPerHost: 10,
 			IdleConnTimeout:     90 * time.Second,
 		},
+		// Never follow a redirect: a followed 301/302/303 turns the POST into a
+		// body-less GET whose 2xx would count as accepted, and a 307/308 replays
+		// the message and the bearer token to the Location. The 3xx reaches the
+		// status check in submitHTTP as a failure.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
 	// Get circuit breaker settings
@@ -166,6 +173,10 @@ func (c *Client) submitHTTP(ctx context.Context, req *TrainingRequest) error {
 	body, _ := io.ReadAll(resp.Body)
 
 	// Check response status
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return fmt.Errorf("training endpoint returned redirect status %d to %q; redirects are not followed, so [spam_training] endpoint must be the final URL",
+			resp.StatusCode, resp.Header.Get("Location"))
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("training endpoint returned status %d: %s", resp.StatusCode, string(body))
 	}

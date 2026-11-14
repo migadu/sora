@@ -3,7 +3,9 @@ package delivery
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +19,14 @@ import (
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/sieveengine"
 )
+
+// DefaultSieveScript is the built-in script every delivery runs before the user's
+// own: it files spam into Junk and a +detail recipient into the detail folder. Both
+// delivery paths run it and merge its result with the user script's
+// (MergeSieveResults), so one message is filed the same way whichever way it came.
+//
+//go:embed default.sieve
+var DefaultSieveScript string
 
 // SieveOutcome is the result of evaluating a recipient's Sieve script for one delivery.
 type SieveOutcome struct {
@@ -35,6 +45,9 @@ type SieveOutcome struct {
 	// body locally: SaveMessageToMailbox writes a pending_uploads row, and the uploader
 	// treats a pending upload whose local file is missing as permanent content loss.
 	CopyMailboxes []string
+	// CreateMailboxes are the fileinto :create targets (RFC 5490 §3.2): the caller
+	// creates each missing mailbox before saving the copies.
+	CreateMailboxes []string
 }
 
 // SieveExecutor interface defines the contract for Sieve script execution.
@@ -102,6 +115,32 @@ func (s *StandardSieveExecutor) sieveExtensions() []string {
 	return s.SieveExtensions
 }
 
+// evaluate runs one script for the recipient. A script that does not compile or
+// fails at run time is a keep (RFC 5228 §2.10.6), which leaves the default script's
+// result standing when merged.
+func (s *StandardSieveExecutor) evaluate(ctx context.Context, recipient RecipientInfo, sieveCtx sieveengine.Context, script, source string) sieveengine.Result {
+	keep := sieveengine.Result{Action: sieveengine.ActionKeep}
+	// go-sieve rejects every `require` when no extension list is supplied, so an
+	// unset list would silently degrade fileinto/vacation scripts to a plain INBOX
+	// keep. Compile with the same configured set the LMTP path uses, so one script
+	// cannot behave differently depending on which ingress delivered the message.
+	compiled, err := sieveengine.SharedScriptCache().GetOrCompile(script, s.sieveExtensions())
+	if err != nil {
+		metrics.SieveExecutions.WithLabelValues(s.DeliveryCtx.MetricsLabel, "failure").Inc()
+		s.DeliveryCtx.Logger.Log("Failed to compile the %s Sieve script: %v", source, err)
+		return keep
+	}
+	executor := compiled.NewExecutor(recipient.AccountID, s.VacationOracle, s.VacationOracle, s.RedirectRateLimit, s.RedirectRateWindow, s.MaxRedirectHops)
+	result, err := executor.Evaluate(ctx, sieveCtx)
+	if err != nil {
+		metrics.SieveExecutions.WithLabelValues(s.DeliveryCtx.MetricsLabel, "failure").Inc()
+		s.DeliveryCtx.Logger.Log("The %s Sieve script failed: %v", source, err)
+		return keep
+	}
+	metrics.SieveExecutions.WithLabelValues(s.DeliveryCtx.MetricsLabel, "success").Inc()
+	return result
+}
+
 // ExecuteSieve executes Sieve scripts and returns the outcome for this delivery. It
 // performs the script's non-storage side effects (redirect, vacation) itself; storing
 // the message — in every mailbox of SieveOutcome — is left to the caller, which
@@ -127,37 +166,16 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		Message:      fullMessageBytes,
 	}
 
-	// Get user's active script
+	// The built-in default script runs first, as on LMTP, and the user's script then
+	// takes the message over or keeps the default's filing (MergeSieveResults). A
+	// script that fails to compile or run leaves the result before it standing.
+	result := s.evaluate(ctx, recipient, sieveCtx, DefaultSieveScript, "default")
 	activeScript, err := s.DeliveryCtx.RDB.GetActiveScriptWithRetry(ctx, recipient.AccountID)
 	if err != nil && err != consts.ErrDBNotFound {
-		// Non-critical error, continue with INBOX delivery
-		return outcome, nil
-	}
-
-	var result sieveengine.Result
-	if activeScript != nil {
-		// Execute user script
-		// go-sieve rejects every `require` when no extension list is supplied, so an
-		// unset list would silently degrade fileinto/vacation scripts to a plain INBOX
-		// keep. Compile with the same configured set the LMTP path uses, so one script
-		// cannot behave differently depending on which ingress delivered the message.
-		compiled, err := sieveengine.SharedScriptCache().GetOrCompile(activeScript.Script, s.sieveExtensions())
-		if err != nil {
-			metrics.SieveExecutions.WithLabelValues(s.DeliveryCtx.MetricsLabel, "failure").Inc()
-			return outcome, nil
-		}
-		executor := compiled.NewExecutor(recipient.AccountID, s.VacationOracle, s.VacationOracle, s.RedirectRateLimit, s.RedirectRateWindow, s.MaxRedirectHops)
-
-		result, err = executor.Evaluate(ctx, sieveCtx)
-		if err != nil {
-			metrics.SieveExecutions.WithLabelValues(s.DeliveryCtx.MetricsLabel, "failure").Inc()
-			return outcome, nil
-		}
-
-		metrics.SieveExecutions.WithLabelValues(s.DeliveryCtx.MetricsLabel, "success").Inc()
-	} else {
-		// No script, keep in INBOX
-		result = sieveengine.Result{Action: sieveengine.ActionKeep}
+		s.DeliveryCtx.Logger.Log("Failed to get the active Sieve script, using the default script's result: %v", err)
+	} else if activeScript != nil {
+		userResult := s.evaluate(ctx, recipient, sieveCtx, activeScript.Script, "user")
+		result, _ = MergeSieveResults(result, userResult)
 	}
 
 	// Apply header edits if any (RFC 5293 - editheader extension), before the caller
@@ -242,9 +260,60 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		return outcome, nil
 	}
 	outcome.MailboxName = destinations[0].Mailbox
+	for _, dest := range destinations {
+		if dest.Create {
+			outcome.CreateMailboxes = append(outcome.CreateMailboxes, dest.Mailbox)
+		}
+	}
 	for _, dest := range destinations[1:] {
 		outcome.CopyMailboxes = append(outcome.CopyMailboxes, dest.Mailbox)
 	}
 
 	return outcome, nil
+}
+
+// MergeSieveResults decides what the default script and the user script together
+// ask of delivery. A user script that kept, implicitly or explicitly, leaves where
+// the message goes to the default script, whatever it decided, and the two results
+// are merged by keepDefaultAction; it reports keptDefault then. A user script that
+// took an explicit fileinto, redirect or discard took the message over, and its
+// result stands alone: the default script's flags, header edits and reply are all
+// replaced, the reply with them, since the user script overruled that run entirely.
+func MergeSieveResults(defaultResult, userResult sieveengine.Result) (merged sieveengine.Result, keptDefault bool) {
+	if userResult.Action == sieveengine.ActionKeep {
+		return keepDefaultAction(defaultResult, userResult), true
+	}
+	return userResult, false
+}
+
+// keepDefaultAction merges the result of a user script that ended in a keep into
+// the default script's, whose action then stands, be it a filing or a keep of its
+// own: the user script only left where the message goes to the default. Everything
+// else it did still happens, after the default script's work as the two ran: its
+// flags join the default's, its header edits follow the default's, and its vacation
+// reply goes out (RFC 5230 §4.7), seeing those edits as RFC 5293 §7 requires. A user
+// reply takes precedence; otherwise the default script's independent vacation reply
+// still stands.
+func keepDefaultAction(defaultResult, userResult sieveengine.Result) sieveengine.Result {
+	merged := defaultResult
+	merged.Flags = mergeFlags(defaultResult.Flags, userResult.Flags)
+	merged.HeaderEdits = slices.Concat(defaultResult.HeaderEdits, userResult.HeaderEdits)
+	if userResult.Vacation != nil {
+		merged.Vacation = userResult.Vacation
+	}
+	return merged
+}
+
+// mergeFlags returns a's flags, then b's, without repeats. Flag names are
+// case-insensitive (RFC 5232 §3), and the first spelling seen is kept.
+func mergeFlags(a, b []string) []string {
+	merged := make([]string, 0, len(a)+len(b))
+	seen := make(map[string]bool, len(a)+len(b))
+	for _, flag := range slices.Concat(a, b) {
+		if key := strings.ToLower(flag); !seen[key] {
+			seen[key] = true
+			merged = append(merged, flag)
+		}
+	}
+	return merged
 }

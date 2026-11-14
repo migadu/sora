@@ -1,129 +1,136 @@
 package spamtraining
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
 	"strings"
 
 	"github.com/emersion/go-message"
+	"github.com/emersion/go-message/textproto"
 )
+
+// maxMIMEDepth bounds how many multipart levels StripAttachments descends.
+// Each level holds its own parser buffer; deeper subtrees are dropped.
+const maxMIMEDepth = 32
+
+const noTextPlaceholder = "[No text content - attachments stripped for spam training]\n"
 
 // StripAttachments removes all attachments from a MIME message body,
 // keeping only text/plain and text/html parts for spam training.
-// Returns the modified message body without attachments.
+//
+// The text parts are found at any depth and kept byte for byte, headers and
+// encoded body alike, so every header still describes the bytes that follow
+// it. The multiparts that hold them keep their header and boundary; only the
+// other parts and the preamble and epilogue are left out. A single-part
+// message is returned as is.
 func StripAttachments(messageBody []byte) ([]byte, error) {
-	// Parse the message using go-message
-	entity, err := message.Read(bytes.NewReader(messageBody))
+	br := bufio.NewReader(bytes.NewReader(messageBody))
+	header, err := textproto.ReadHeader(br)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse message: %w", err)
 	}
-
-	// If it's not multipart, return as-is (simple text message)
-	if !entity.Header.Has("Content-Type") {
+	if mediaType, _ := partType(header, false); !strings.HasPrefix(mediaType, "multipart/") {
 		return messageBody, nil
 	}
 
-	mediaType, _, _ := entity.Header.ContentType()
-	if !strings.HasPrefix(mediaType, "multipart/") {
-		// Single-part message, return as-is
-		return messageBody, nil
+	var buf bytes.Buffer
+	kept, err := writeTextParts(&buf, header, br, false, 0)
+	if err != nil {
+		return nil, err
+	}
+	if kept {
+		buf.WriteString("\r\n")
+		return buf.Bytes(), nil
 	}
 
-	// Process multipart message and extract only text parts
-	multipartReader := entity.MultipartReader()
-	if multipartReader == nil {
-		// Not actually multipart, return original
-		return messageBody, nil
+	// No text anywhere: the message header with a placeholder body.
+	buf.Reset()
+	header.Del("Content-Transfer-Encoding")
+	header.Set("Content-Type", "text/plain; charset=utf-8")
+	if err := textproto.WriteHeader(&buf, header); err != nil {
+		return nil, fmt.Errorf("failed to write header: %w", err)
+	}
+	buf.WriteString(noTextPlaceholder)
+	return buf.Bytes(), nil
+}
+
+// partType returns the media type and parameters of an entity. A missing
+// Content-Type means text/plain, or message/rfc822 for a direct child of a
+// multipart/digest (RFC 2046 section 5.1.1).
+func partType(header textproto.Header, inDigest bool) (string, map[string]string) {
+	if inDigest && !header.Has("Content-Type") {
+		return "message/rfc822", nil
+	}
+	h := message.Header{Header: header}
+	mediaType, params, _ := h.ContentType()
+	return mediaType, params
+}
+
+// writeTextParts writes the entity to w if it is a text/plain or text/html
+// part, or a multipart holding one at any depth, with every other part left
+// out. It reports whether anything was written; when nothing was, w is left
+// as it was. On an error w may hold part of the entity, which the caller
+// truncates.
+func writeTextParts(w *bytes.Buffer, header textproto.Header, body io.Reader, inDigest bool, depth int) (bool, error) {
+	mediaType, params := partType(header, inDigest)
+	switch {
+	case mediaType == "text/plain" || mediaType == "text/html":
+		if err := textproto.WriteHeader(w, header); err != nil {
+			return false, fmt.Errorf("failed to write part header: %w", err)
+		}
+		if _, err := io.Copy(w, body); err != nil {
+			return false, fmt.Errorf("failed to read part body: %w", err)
+		}
+		return true, nil
+	case !strings.HasPrefix(mediaType, "multipart/") || depth >= maxMIMEDepth:
+		return false, nil
 	}
 
-	// Collect text parts
-	var textParts [][]byte
-	hasTextPart := false
-
+	// The original boundary is reused: it cannot occur inside the parts it
+	// delimited (RFC 2046 section 5.1.1), and leaving parts out cannot make
+	// it occur.
+	start := w.Len()
+	if err := textproto.WriteHeader(w, header); err != nil {
+		return false, fmt.Errorf("failed to write multipart header: %w", err)
+	}
+	boundary := params["boundary"]
+	mr := textproto.NewMultipartReader(body, boundary)
+	kept := false
 	for {
-		part, err := multipartReader.NextPart()
+		part, err := mr.NextPart()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("failed to read multipart: %w", err)
+			return false, fmt.Errorf("failed to read multipart: %w", err)
 		}
 
-		partMediaType, _, _ := part.Header.ContentType()
-
-		// Only include text/plain and text/html parts
-		if partMediaType == "text/plain" || partMediaType == "text/html" {
-			hasTextPart = true
-
-			// Read part body
-			partBody, err := io.ReadAll(part.Body)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read part body: %w", err)
-			}
-
-			// Build this part with headers
-			var partBuf bytes.Buffer
-			fields := part.Header.Fields()
-			for fields.Next() {
-				partBuf.WriteString(fields.Key())
-				partBuf.WriteString(": ")
-				partBuf.WriteString(fields.Value())
-				partBuf.WriteString("\r\n")
-			}
-			partBuf.WriteString("\r\n")
-			partBuf.Write(partBody)
-
-			textParts = append(textParts, partBuf.Bytes())
+		// The CRLF before a boundary delimiter belongs to the delimiter
+		// (RFC 2046 section 5.1.1), so the part body read here excludes it.
+		mark := w.Len()
+		if kept {
+			w.WriteString("\r\n")
+		}
+		w.WriteString("--" + boundary + "\r\n")
+		// A part that does not parse, such as a nested multipart without a
+		// boundary or without its close delimiter, is left out like any
+		// part without text, as it was before the walk descended. If it is
+		// this multipart's own stream that broke, the next NextPart says so.
+		ok, err := writeTextParts(w, part.Header, part, mediaType == "multipart/digest", depth+1)
+		if ok && err == nil {
+			kept = true
+		} else {
+			w.Truncate(mark)
 		}
 	}
-
-	// Build new message
-	var buf bytes.Buffer
-
-	// Write all headers except Content-Type
-	fields := entity.Header.Fields()
-	for fields.Next() {
-		key := fields.Key()
-		if key != "Content-Type" {
-			buf.WriteString(key)
-			buf.WriteString(": ")
-			buf.WriteString(fields.Value())
-			buf.WriteString("\r\n")
-		}
+	if !kept {
+		w.Truncate(start)
+		return false, nil
 	}
-
-	// If no text parts found, create a simple text message
-	if !hasTextPart {
-		buf.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
-		buf.WriteString("\r\n")
-		buf.WriteString("[No text content - attachments stripped for spam training]\n")
-		return buf.Bytes(), nil
-	}
-
-	// If only one text part, make it a simple message
-	if len(textParts) == 1 {
-		buf.Write(textParts[0])
-		return buf.Bytes(), nil
-	}
-
-	// Multiple text parts - create multipart/alternative
-	boundary := "spam-training-boundary"
-	buf.WriteString("Content-Type: multipart/alternative; boundary=\"")
-	buf.WriteString(boundary)
-	buf.WriteString("\"\r\n\r\n")
-
-	for _, part := range textParts {
-		buf.WriteString("--")
-		buf.WriteString(boundary)
-		buf.WriteString("\r\n")
-		buf.Write(part)
-		buf.WriteString("\r\n")
-	}
-
-	buf.WriteString("--")
-	buf.WriteString(boundary)
-	buf.WriteString("--\r\n")
-
-	return buf.Bytes(), nil
+	// The line break ending the close delimiter is left to the caller: in a
+	// nested multipart it is the one before the parent's next delimiter.
+	w.WriteString("\r\n--" + boundary + "--")
+	return true, nil
 }

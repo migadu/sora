@@ -107,15 +107,15 @@ func applyAuthenticationDelayWithManager(ctx context.Context, limiter any, remot
 	// Try to acquire a delay slot (non-blocking)
 	if !dm.tryAcquire(ip) {
 		// Queue full for this IP - fast-reject to prevent goroutine exhaustion
-		metrics.AuthDelayRejections.WithLabelValues(protocol, ip).Inc()
+		metrics.AuthDelayRejections.WithLabelValues(protocol).Inc()
 		logger.Info("Auth delay: Queue full, rejecting connection", "protocol", protocol, "ip", ip, "delay", delay)
 		return ErrDelayQueueFull
 	}
 	defer dm.release(ip)
 
 	// Track queue depth
-	metrics.AuthDelayQueueDepth.WithLabelValues(protocol, ip).Inc()
-	defer metrics.AuthDelayQueueDepth.WithLabelValues(protocol, ip).Dec()
+	metrics.AuthDelayQueueDepth.WithLabelValues(protocol).Inc()
+	defer metrics.AuthDelayQueueDepth.WithLabelValues(protocol).Dec()
 
 	logger.Debug("Auth delay: Applying delay", "protocol", protocol, "delay", delay, "ip", ip)
 
@@ -126,12 +126,12 @@ func applyAuthenticationDelayWithManager(ctx context.Context, limiter any, remot
 	select {
 	case <-timer.C:
 		// Delay completed normally
-		metrics.AuthDelayCompleted.WithLabelValues(protocol, ip).Inc()
+		metrics.AuthDelayCompleted.WithLabelValues(protocol).Inc()
 		logger.Debug("Auth delay: Delay completed", "protocol", protocol, "ip", ip)
 		return nil
 	case <-ctx.Done():
 		// Context cancelled (connection closed, server shutdown, etc.)
-		metrics.AuthDelayCancelled.WithLabelValues(protocol, ip).Inc()
+		metrics.AuthDelayCancelled.WithLabelValues(protocol).Inc()
 		logger.Debug("Auth delay: Delay cancelled", "protocol", protocol, "ip", ip, "error", ctx.Err())
 		return ctx.Err()
 	}

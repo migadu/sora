@@ -67,16 +67,17 @@ func setupPOP3ProxyWithIncomingPROXYAndRateLimiting(t *testing.T, rdb *resilient
 // TestPOP3Proxy_AuthDelay_UsesRealClientIP proves the progressive authentication
 // delay is keyed on the real client IP from the PROXY header, not on the upstream
 // load balancer's address (see the IMAP proxy counterpart for the full rationale).
-// The assertion is on the sora_auth_delay_completed_total counter's "ip" label: no
-// timing thresholds.
+// The assertions are on the sora_auth_delay_completed_total counter: no timing
+// thresholds.
 func TestPOP3Proxy_AuthDelay_UsesRealClientIP(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	backendServer, account := common.SetupPOP3ServerWithMaster(t)
 	defer backendServer.Close()
 
-	const clientIP = "203.0.113.78" // the "real" client behind the load balancer
-	const lbIP = "127.0.0.1"        // the load balancer (the socket peer)
+	const clientIP = "203.0.113.78"      // the "real" client behind the load balancer
+	const otherClientIP = "203.0.113.88" // another client behind the same load balancer
+	const lbIP = "127.0.0.1"             // the load balancer (the socket peer)
 
 	proxyAddr := common.GetRandomAddress(t)
 	proxy := setupPOP3ProxyWithIncomingPROXYAndRateLimiting(t, backendServer.ResilientDB, proxyAddr, []string{backendServer.Address}, server.AuthRateLimiterConfig{
@@ -93,7 +94,7 @@ func TestPOP3Proxy_AuthDelay_UsesRealClientIP(t *testing.T) {
 	})
 	defer proxy.Close()
 
-	loginBehindLB := func(password string) string {
+	loginBehindLB := func(clientIP, password string) string {
 		conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
 		if err != nil {
 			t.Fatalf("dial: %v", err)
@@ -126,27 +127,36 @@ func TestPOP3Proxy_AuthDelay_UsesRealClientIP(t *testing.T) {
 		return strings.TrimSpace(resp)
 	}
 
-	delaysFor := func(ip string) float64 {
-		return testutil.ToFloat64(metrics.AuthDelayCompleted.WithLabelValues("POP3-PROXY", ip))
+	delays := func() float64 {
+		return testutil.ToFloat64(metrics.AuthDelayCompleted.WithLabelValues("POP3-PROXY"))
 	}
 
-	clientBefore := delaysFor(clientIP)
-	lbBefore := delaysFor(lbIP)
-
+	// Two failures push the real client's failure count to the delay threshold.
 	for i := 0; i < 2; i++ {
-		if resp := loginBehindLB(fmt.Sprintf("wrong-password-%d", i)); strings.HasPrefix(resp, "+OK") {
+		if resp := loginBehindLB(clientIP, fmt.Sprintf("wrong-password-%d", i)); strings.HasPrefix(resp, "+OK") {
 			t.Fatalf("attempt %d: login should have failed, got %q", i+1, resp)
 		}
 	}
-	if resp := loginBehindLB("wrong-password-2"); strings.HasPrefix(resp, "+OK") {
+
+	// The third attempt from the same client must be delayed.
+	before := delays()
+	if resp := loginBehindLB(clientIP, "wrong-password-2"); strings.HasPrefix(resp, "+OK") {
 		t.Fatalf("attempt 3: login should have failed, got %q", resp)
 	}
-
-	if got := delaysFor(clientIP) - clientBefore; got < 1 {
+	if got := delays() - before; got < 1 {
 		t.Fatalf("no progressive auth delay was applied for the real client %s (delta=%v): the delay is keyed on the load balancer address, so it never fires behind a proxy", clientIP, got)
 	}
-	if got := delaysFor(lbIP) - lbBefore; got != 0 {
-		t.Fatalf("auth delay was attributed to the load balancer %s (delta=%v) instead of the real client", lbIP, got)
+
+	// Another client behind the same load balancer has no failures of its own and
+	// must not be delayed. This catches the delay and the failure count both being
+	// keyed on the load balancer, which the metric (labelled by protocol only)
+	// cannot attribute.
+	before = delays()
+	if resp := loginBehindLB(otherClientIP, "wrong-password-0"); strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("other client: login should have failed, got %q", resp)
 	}
-	t.Logf("✓ progressive auth delay applied and attributed to the real client IP %s", clientIP)
+	if got := delays() - before; got != 0 {
+		t.Fatalf("auth delay was applied to %s, which never failed (delta=%v): the delay is keyed on the load balancer %s instead of the real client", otherClientIP, got, lbIP)
+	}
+	t.Logf("✓ progressive auth delay applied to the real client IP %s only", clientIP)
 }
