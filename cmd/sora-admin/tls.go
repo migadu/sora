@@ -385,9 +385,9 @@ func listTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, 
 				logger.Warn("Failed to download certificate from S3", "key", obj.Key, "error", err)
 				certInfo.CertType = "Error"
 			} else {
-				defer reader.Close()
 				// Read certificate data
 				certData, err := io.ReadAll(reader)
+				reader.Close()
 				if err != nil {
 					logger.Warn("Failed to read certificate from S3", "key", obj.Key, "error", err)
 					certInfo.CertType = "Error"
@@ -432,12 +432,10 @@ func listTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, 
 
 func tryDecodeDomain(s3Key string) string {
 	// Extract hash from key: autocert/cert-<hash>
-	parts := strings.Split(s3Key, "cert-")
-	if len(parts) != 2 {
+	hash, ok := strings.CutPrefix(s3Key, "autocert/cert-")
+	if !ok {
 		return "unknown"
 	}
-
-	hash := parts[1]
 
 	// Try common domains
 	commonDomains := []string{
@@ -458,7 +456,10 @@ func tryDecodeDomain(s3Key string) string {
 		}
 	}
 
-	return hash[:16] + "..." // Show first 16 chars of hash
+	// Show at most the first 16 characters. The "..." marks the name as not decoded,
+	// even when nothing was cut: parseCertificateData then takes the certificate's own
+	// name, and checkLocalCache and tls clean never take it for a local cache file.
+	return hash[:min(len(hash), 16)] + "..."
 }
 
 // autocertName returns the name autocert caches a domain's certificates under, as the
