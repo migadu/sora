@@ -411,10 +411,12 @@ node_id = ""                                    # Unique node ID (default: hostn
                                                 # uploader.cleanup_grace_period. Before changing this, stop delivery to the
                                                 # node and wait until it owns no pending_uploads rows.
 peers = []                                      # Seed nodes for cluster discovery (e.g., ["node-1.example.com:7946", "[2001:db8::41]:7946"])
-                                                # A port-less entry uses this node's gossip port. Any entry that names this
-                                                # node's own address is ignored with a warning, so one list can be shared
-                                                # by every node. Peers that are not members (after a partition or a
-                                                # restart) are joined again every 10 seconds.
+                                                # A port-less entry uses this node's gossip port. An entry that names only
+                                                # this node's own address is ignored with a warning, so one list can be
+                                                # shared by every node. Peers that are not members (after a partition or a
+                                                # restart) are joined again every 10 seconds; list each node by the address
+                                                # it advertises (its addr): an entry naming several nodes counts as present
+                                                # while any one of them, this node included, is a member.
 secret_key = ""                                 # Cluster encryption key: base64-encoded 32-byte key.
                                                 # REQUIRED whenever cluster mode is enabled — the server refuses to
                                                 # start without it (gossip carries auth/rate-limit/kick state that an

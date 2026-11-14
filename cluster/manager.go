@@ -369,7 +369,7 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 
 	// Keep the configured peers in the cluster for the life of the process
 	if len(peers) > 0 {
-		go m.rejoinLoop(peers, mlConfig.BindPort)
+		go m.rejoinLoop(peers, mlConfig.BindPort, rejoinInterval)
 	}
 
 	logger.Info("Cluster manager started", "node_id", nodeID, "addr", selfAddr, "peers", peers)
@@ -377,7 +377,8 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	return m, nil
 }
 
-// rejoinInterval is how often configured peers that are not members are joined again
+// rejoinInterval is how often configured peers that are not members are joined
+// again. A variable so that tests can shorten it; New reads it once.
 var rejoinInterval = 10 * time.Second
 
 // rejoinLoop joins the configured peers that are not members, for as long as the
@@ -386,13 +387,16 @@ var rejoinInterval = 10 * time.Second
 // GossipToTheDeadTime has passed. The two sides of a partition that outlasts
 // that, or a peer that restarted knowing nobody, would otherwise stay apart until
 // one of them restarts.
-func (m *Manager) rejoinLoop(peers []string, defaultPort int) {
-	ticker := time.NewTicker(rejoinInterval)
+func (m *Manager) rejoinLoop(peers []string, defaultPort int, interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	// The peers missing at the previous attempt, so that a peer that stays away
-	// is reported when it goes and when it comes back, not every interval.
+	// What the previous round reported, so that a peer that stays away is
+	// reported when it goes and when it comes back, not every interval.
 	reported := ""
+	// The addresses each peer resolved to last time: a peer that is a member
+	// there is not looked up again, so a healthy cluster makes no DNS queries.
+	resolved := make(map[string][]netip.AddrPort, len(peers))
 	for {
 		select {
 		case <-m.ctx.Done():
@@ -400,58 +404,108 @@ func (m *Manager) rejoinLoop(peers []string, defaultPort int) {
 		case <-ticker.C:
 		}
 
-		missing := m.peersNotMembers(peers, defaultPort)
-		key := strings.Join(missing, " ")
-		if len(missing) == 0 {
-			if reported != "" {
-				logger.Info("Cluster: All configured peers are members")
+		var joined, unreachable, unresolved, elsewhere []string
+		var joinErr error
+		members := m.memberAddrs()
+		isMember := func(a netip.AddrPort) bool { return members[a] }
+		for _, peer := range peers {
+			if slices.ContainsFunc(resolved[peer], isMember) {
+				continue
 			}
-			reported = ""
-			continue
+			addrs := m.resolvePeer(peer, defaultPort)
+			resolved[peer] = addrs
+			if len(addrs) == 0 {
+				unresolved = append(unresolved, peer)
+				continue
+			}
+			if slices.ContainsFunc(addrs, isMember) {
+				continue
+			}
+			// Join the addresses resolved here rather than the entry: memberlist
+			// would resolve it again, and log a warning every round for a name
+			// that does not resolve.
+			if _, err := m.memberlist.Join(joinAddrs(peer, addrs)); err != nil {
+				unreachable = append(unreachable, peer)
+				joinErr = err
+				continue
+			}
+			members = m.memberAddrs()
+			if slices.ContainsFunc(addrs, isMember) {
+				joined = append(joined, peer)
+			} else {
+				// It answered, but no member advertises the address it was
+				// reached on, so it is joined again (a full state exchange)
+				// every round.
+				elsewhere = append(elsewhere, peer)
+			}
 		}
 
-		n, err := m.memberlist.Join(missing)
-		changed := key != reported
+		if len(joined) > 0 {
+			logger.Info("Cluster: Rejoined configured peers", "peers", joined, "members", m.memberlist.NumMembers())
+		}
+
+		key := ""
+		if len(unreachable)+len(unresolved)+len(elsewhere) > 0 {
+			key = fmt.Sprint(unreachable, unresolved, elsewhere)
+		}
+		if key == reported {
+			continue
+		}
 		reported = key
-		switch {
-		case err != nil && changed:
-			logger.Warn("Cluster: Configured peers are not members and could not be joined - retrying", "peers", missing, "every", rejoinInterval, "error", err)
-		case err != nil:
-			logger.Debug("Cluster: Rejoin failed", "peers", missing, "error", err)
-		case changed:
-			logger.Info("Cluster: Rejoined configured peers", "peers", missing, "contacted", n, "members", m.memberlist.NumMembers())
-		default:
-			logger.Debug("Cluster: Rejoined configured peers", "peers", missing, "contacted", n)
+		if key == "" {
+			logger.Info("Cluster: All configured peers are members")
+			continue
+		}
+		if len(unreachable)+len(unresolved) > 0 {
+			args := []any{"unreachable", unreachable, "unresolved", unresolved, "every", interval}
+			if joinErr != nil {
+				args = append(args, "error", joinErr)
+			}
+			logger.Warn("Cluster: Configured peers are not members and could not be joined - retrying", args...)
+		}
+		if len(elsewhere) > 0 {
+			logger.Warn("Cluster: Configured peers answer on an address no member advertises - list each node's cluster addr in peers; until then they are joined again", "peers", elsewhere, "every", interval)
 		}
 	}
 }
 
-// peersNotMembers returns the configured peers that no current member answers to
-func (m *Manager) peersNotMembers(peers []string, defaultPort int) []string {
+// memberAddrs returns the addresses the current members (alive or suspect, this
+// node included) advertise
+func (m *Manager) memberAddrs() map[netip.AddrPort]bool {
 	members := make(map[netip.AddrPort]bool)
 	for _, n := range m.memberlist.Members() {
 		if addr, ok := netip.AddrFromSlice(n.Addr); ok {
 			members[netip.AddrPortFrom(addr.Unmap(), n.Port)] = true
 		}
 	}
-
-	var missing []string
-	for _, peer := range peers {
-		if !slices.ContainsFunc(m.resolvePeer(peer, defaultPort), func(a netip.AddrPort) bool { return members[a] }) {
-			missing = append(missing, peer)
-		}
-	}
-	return missing
+	return members
 }
 
-// excludeOwnAddress splits the configured peers into the ones that do not name
-// this node and the ones that do
+// joinAddrs spells the resolved addresses of a peers entry for memberlist's Join,
+// keeping the entry's "name/" prefix
+func joinAddrs(peer string, addrs []netip.AddrPort) []string {
+	name := ""
+	if i := strings.Index(peer, "/"); i >= 0 {
+		name = peer[:i+1]
+	}
+	targets := make([]string, len(addrs))
+	for i, a := range addrs {
+		targets[i] = name + a.String()
+	}
+	return targets
+}
+
+// excludeOwnAddress splits the configured peers into the ones that name other
+// nodes and the ones that name only this node. An entry that stands for this
+// node and others as well (one DNS name for the whole cluster, or localhost on a
+// dual-stack host) is how this node finds the others, so it is kept.
 func (m *Manager) excludeOwnAddress(peers []string, selfIP net.IP, selfPort, defaultPort int) (others, own []string) {
 	addr, _ := netip.AddrFromSlice(selfIP)
 	self := netip.AddrPortFrom(addr.Unmap(), uint16(selfPort))
+	notSelf := func(a netip.AddrPort) bool { return a != self }
 
 	for _, peer := range peers {
-		if slices.Contains(m.resolvePeer(peer, defaultPort), self) {
+		if addrs := m.resolvePeer(peer, defaultPort); len(addrs) > 0 && !slices.ContainsFunc(addrs, notSelf) {
 			own = append(own, peer)
 		} else {
 			others = append(others, peer)
