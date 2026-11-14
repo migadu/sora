@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
 )
@@ -157,13 +156,8 @@ func TestSieveCommands(t *testing.T) {
 func setupSieveTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 	t.Helper()
 
-	var cfg AdminConfig
-	if _, err := toml.DecodeFile("../../config-test.toml", &cfg); err != nil {
-		t.Fatalf("Failed to load test configuration: %v", err)
-	}
-
 	ctx := context.Background()
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, true)
+	rdb, err := resilient.NewResilientDatabase(ctx, configTestDatabase(t), false, true)
 	if err != nil {
 		t.Fatalf("Failed to create resilient database: %v", err)
 	}
