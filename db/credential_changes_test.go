@@ -183,9 +183,11 @@ func TestPruneCredentialChanges_DropsOnlyRowsBeforeTheCutoff(t *testing.T) {
 
 	cutoff := dbNow(t, db).Add(-7 * 24 * time.Hour)
 	inTx(t, db, func(tx pgx.Tx) {
-		pruned, err := db.PruneCredentialChanges(ctx, tx, cutoff)
+		// No assertion on the count: every node's watcher, and any test running one
+		// against this database meanwhile, prunes the same rows, so the old one may
+		// already be gone.
+		_, err := db.PruneCredentialChanges(ctx, tx, cutoff)
 		require.NoError(t, err)
-		require.GreaterOrEqual(t, pruned, int64(1))
 	})
 
 	rows, err := db.GetWritePool().Query(ctx, `SELECT account_id FROM credential_changes WHERE account_id = ANY($1)`, []int64{oldID, recentID})
