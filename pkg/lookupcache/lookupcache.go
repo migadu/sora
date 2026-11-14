@@ -186,7 +186,8 @@ func (e *CacheEntry) IsOld(duration time.Duration) bool {
 // Authenticate attempts to authenticate using cached data
 // Returns:
 //   - (accountID, true, nil) on cache hit with successful authentication
-//   - (0, false, nil) if not in cache or needs revalidation (caller should check database)
+//   - (0, false, nil) if not in cache or needs revalidation (caller should check database);
+//     a fresh positive entry the password does not match is dropped first
 //   - (0, false, error) on cached authentication failure (caller should NOT check database)
 //
 // Uses password-aware revalidation to detect password changes while preventing rapid brute force attempts
@@ -249,7 +250,16 @@ func (c *LookupCache) Authenticate(address, password string) (accountID int64, f
 		// User might have changed their password, or they're trying a wrong password.
 		// Either way, we need to check with the database to verify.
 		// Brute force protection is handled by protocol-level rate limiting, not by the cache.
-		logger.Debug("Auth cache: positive entry revalidation allowed (different password)", "address", address, "age", time.Since(entry.CreatedAt))
+		//
+		// The database decides this password, so drop the entry before the caller
+		// asks: a verdict writes a new entry anyway (SetSuccess or SetFailure). An
+		// outage gives none, and the login is answered as a temporary failure that the
+		// rate limiter does not count. Kept, the entry would still sign in its
+		// password, so every guess during the outage would be checked against it,
+		// unseen by the rate limiter, until the entry was older than the revalidation
+		// window. The SQLite auth cache and the proxies drop a missed entry the same way.
+		logger.Debug("Auth cache: positive entry dropped for revalidation (different password)", "address", address, "age", time.Since(entry.CreatedAt))
+		c.Invalidate(address)
 		return 0, false, nil
 	}
 
