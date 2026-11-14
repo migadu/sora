@@ -113,6 +113,12 @@ func (s *Server) multiMethodHandler(handlers map[string]http.HandlerFunc) http.H
 // documented JSON error and, as RFC 9110 section 15.5.6 requires, an Allow
 // header listing the methods the endpoint does serve.
 func (s *Server) methodNotAllowed(w http.ResponseWriter, allowed ...string) {
+	// The CORS middleware accepts OPTIONS for every endpoint. Include it in
+	// Allow as well as the methods handled by the endpoint itself. Clone first:
+	// multiMethodHandler shares its allowed slice between concurrent requests.
+	if !slices.Contains(allowed, http.MethodOptions) {
+		allowed = append(slices.Clone(allowed), http.MethodOptions)
+	}
 	w.Header().Set("Allow", strings.Join(allowed, ", "))
 	s.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 }

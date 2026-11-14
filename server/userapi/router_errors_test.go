@@ -87,9 +87,18 @@ func TestRouterErrorsAreJSON(t *testing.T) {
 			got := strings.Split(allow, ", ")
 			slices.Sort(got)
 			want := slices.Clone(tt.allow)
+			want = append(want, http.MethodOptions)
 			slices.Sort(want)
 			if !slices.Equal(got, want) {
-				t.Errorf("Allow = %q, want the methods %v", allow, tt.allow)
+				t.Errorf("Allow = %q, want the methods %v", allow, want)
+			}
+
+			// OPTIONS is served by the CORS middleware on the same endpoint,
+			// so its presence in Allow reflects actual supported behavior.
+			options := httptest.NewRecorder()
+			handler.ServeHTTP(options, httptest.NewRequest(http.MethodOptions, tt.path, nil))
+			if options.Code != http.StatusOK {
+				t.Errorf("OPTIONS status = %d, want %d", options.Code, http.StatusOK)
 			}
 		})
 	}
