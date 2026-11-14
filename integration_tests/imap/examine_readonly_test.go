@@ -3,7 +3,11 @@
 package imap_test
 
 import (
+	"fmt"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	imap "github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapclient"
@@ -216,16 +220,33 @@ func TestIMAP_Examine_FetchDoesNotSetSeen(t *testing.T) {
 	if _, err := c.Select("INBOX", &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
 		t.Fatalf("EXAMINE failed: %v", err)
 	}
+	bodySection := &imap.FetchItemBodySection{}
+	binarySection := &imap.FetchItemBinarySection{Part: []int{1}}
 	for _, tc := range []struct {
 		name  string
 		seq   uint32
 		fetch *imap.FetchOptions
+		data  func(*imapclient.FetchMessageBuffer) []byte
+		want  string
 	}{
-		{"BODY[]", 1, &imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{{}}}},
-		{"BINARY[1]", 2, &imap.FetchOptions{BinarySection: []*imap.FetchItemBinarySection{{Part: []int{1}}}}},
+		{"BODY[]", 1, &imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{bodySection}},
+			func(m *imapclient.FetchMessageBuffer) []byte { return m.FindBodySection(bodySection) }, binaryFetchTestMessage},
+		{"BINARY[1]", 2, &imap.FetchOptions{BinarySection: []*imap.FetchItemBinarySection{binarySection}},
+			func(m *imapclient.FetchMessageBuffer) []byte { return m.FindBinarySection(binarySection) }, "hello world"},
 	} {
-		if _, err := c.Fetch(imap.SeqSetNum(tc.seq), tc.fetch).Collect(); err != nil {
+		msgs, err := c.Fetch(imap.SeqSetNum(tc.seq), tc.fetch).Collect()
+		if err != nil {
 			t.Fatalf("FETCH %d (%s) after EXAMINE failed: %v", tc.seq, tc.name, err)
+		}
+		// The FETCH still returns the data, and reports no flag change.
+		if len(msgs) != 1 {
+			t.Fatalf("FETCH %d (%s) after EXAMINE: got %d messages, want 1", tc.seq, tc.name, len(msgs))
+		}
+		if got := string(tc.data(msgs[0])); got != tc.want {
+			t.Errorf("FETCH %d (%s) after EXAMINE returned %q, want %q", tc.seq, tc.name, got, tc.want)
+		}
+		if slices.Contains(msgs[0].Flags, imap.FlagSeen) {
+			t.Errorf("FETCH %d (%s) after EXAMINE reported FLAGS %v", tc.seq, tc.name, msgs[0].Flags)
 		}
 	}
 
@@ -237,11 +258,53 @@ func TestIMAP_Examine_FetchDoesNotSetSeen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FETCH FLAGS failed: %v", err)
 	}
+	if len(msgs) != 2 {
+		t.Fatalf("FETCH 1:2 (FLAGS): got %d messages, want 2", len(msgs))
+	}
 	for _, msg := range msgs {
-		for _, f := range msg.Flags {
-			if f == imap.FlagSeen {
-				t.Errorf("message %d is \\Seen after a FETCH in a mailbox opened with EXAMINE", msg.SeqNum)
-			}
+		if slices.Contains(msg.Flags, imap.FlagSeen) {
+			t.Errorf("message %d is \\Seen after a FETCH in a mailbox opened with EXAMINE", msg.SeqNum)
 		}
+	}
+}
+
+// TestIMAP_Examine_NotifyMessageNewDoesNotSetSeen: NOTIFY's MessageNew
+// fetch-att list (RFC 5465 §5.2) is answered through FETCH, so a BODY[] there
+// must not set \Seen in a mailbox opened with EXAMINE either (RFC 9051 §6.3.3).
+func TestIMAP_Examine_NotifyMessageNewDoesNotSetSeen(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+	login := fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password)
+
+	watcher := dialRawIMAP(t, server.Address)
+	watcher.do(login)
+	watcher.do("EXAMINE INBOX")
+	watcher.do("NOTIFY SET (SELECTED (MessageNew (UID BODY[]) MessageExpunge))")
+
+	other := dialRawIMAP(t, server.Address)
+	other.do(login)
+	other.appendMsg("INBOX", binaryFetchTestMessage)
+
+	// The NOTIFY pump delivers asynchronously; NOOP collects what arrived.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		untagged, _ := watcher.do("NOOP")
+		if resp := strings.Join(untagged, "\r\n"); strings.Contains(resp, "BODY[]") {
+			if seenFlagsRe.MatchString(resp) {
+				t.Errorf("NOTIFY MessageNew FETCH after EXAMINE reported \\Seen:\n%s", resp)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timeout waiting for the NOTIFY MessageNew FETCH (BODY[])")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	other.do("SELECT INBOX")
+	if untagged, _ := other.do("FETCH 1 (FLAGS)"); seenFlagsRe.MatchString(strings.Join(untagged, "\r\n")) {
+		t.Errorf("NOTIFY MessageNew FETCH (BODY[]) set \\Seen in a mailbox opened with EXAMINE: %v", untagged)
 	}
 }
