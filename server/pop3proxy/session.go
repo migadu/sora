@@ -556,11 +556,12 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				return server.ErrServerShuttingDown
 			}
 
-			// The database could not be asked, so nothing is known about the credentials:
-			// a temporary failure (-ERR [SYS/TEMP]), neither counted as a failed login nor
-			// cached.
-			if server.IsTemporaryAuthFailure(err) {
-				s.WarnLog("authentication unavailable", "method", "main_db", "error", err)
+			// The database could not be asked, or the stored hash cannot be checked, so
+			// nothing is known about the credentials: a temporary failure (-ERR
+			// [SYS/TEMP]), neither counted as a failed login nor cached.
+			if proxy.IsTemporaryDBAuthFailure(err) {
+				reason, _ := proxy.ClassifyDBAuthFailure(err)
+				s.WarnLog("authentication unavailable", "reason", reason, "method", "main_db", "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
 				return server.ErrAuthServiceUnavailable
 			}
