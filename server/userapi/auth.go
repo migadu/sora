@@ -127,6 +127,20 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The email goes to the credential lookup as submitted, so parse it first, as every
+	// other protocol does: a value that is not an address is a failed login, not a
+	// database error (which is answered below as an outage). A suffix
+	// (user@example.com@SUFFIX, the master-username and token forms) names no
+	// credential here either.
+	if addr, parseErr := server.NewAddress(req.Email); parseErr != nil || addr.HasSuffix() {
+		logger.Debug("User API: Login email is not an address", "name", s.name, "ip", clientIP, "email", req.Email)
+		if s.authLimiter != nil {
+			s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
+		}
+		s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+		return
+	}
+
 	// Check cache (if enabled)
 	if s.authCache != nil {
 		cachedAccountID, found, cacheErr := s.authCache.Authenticate(req.Email, req.Password)
@@ -210,6 +224,13 @@ generateToken:
 	// can skip the DB, so fetch it here for both paths).
 	_, epoch, err := s.rdb.GetCredentialEpochWithRetry(ctx, req.Email)
 	if err != nil {
+		if errors.Is(err, consts.ErrUserNotFound) {
+			// No active account any more: deleted since its credentials were cached
+			// (or since the lookup above). Refused, as the refresh refuses it.
+			logger.Info("HTTP Mail API: Refusing login for deleted/unknown account", "name", s.name, "email", req.Email)
+			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+			return
+		}
 		logger.Warn("HTTP Mail API: Error fetching credential epoch", "name", s.name, "error", err)
 		s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
 		return
