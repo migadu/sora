@@ -120,33 +120,37 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 	// row it can see references, which the moved rows are not until that transaction
 	// commits. A body still staged locally is linked to the owner's staging path instead,
 	// for the upload MoveMessages re-stages.
-	type destObject struct{ sourceKey, destKey string }
+	type destObject struct {
+		sourceKey, destKey string
+		sourcePending      bool
+	}
 	destObjects := make(map[string]destObject)
 	var destHashes []string
 	for _, msg := range messages {
 		if msg.AccountID == destMailbox.AccountID {
 			continue // Same owner: body already lives under the correct S3 path.
 		}
-		if msg.IsUploaded {
-			if _, seen := destObjects[msg.ContentHash]; !seen {
-				destObjects[msg.ContentHash] = destObject{
-					sourceKey: helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash),
-					destKey:   helpers.NewS3Key(destS3Domain, destS3Localpart, msg.ContentHash),
-				}
-				destHashes = append(destHashes, msg.ContentHash)
+		if !msg.IsUploaded {
+			if s.server.uploader == nil {
+				continue
 			}
-		} else if s.server.uploader != nil {
-			// Body is still staged locally under the source account. Hardlink it to
-			// the owner's staging path so the uploader (re-staged in MoveMessages)
-			// uploads it under the owner's path. Failing here would silently lose the
-			// body, so treat it as fatal rather than warning and proceeding.
-			sourcePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
-			destPath := s.server.uploader.FilePath(msg.ContentHash, destMailbox.AccountID)
-			if sourcePath != destPath {
-				if err := helpers.LinkOrCopyFile(sourcePath, destPath); err != nil {
-					return s.internalError("failed to stage local file for cross-account move: %v", err)
-				}
+			// A local body is linked for the owner's pending upload. If its staging
+			// file is on another node, defer the S3 fallback to the locked phase.
+			staged, err := s.stageCrossAccountBody("move", msg.ContentHash, msg.AccountID, destMailbox.AccountID)
+			if err != nil {
+				return err
 			}
+			if staged {
+				continue
+			}
+		}
+		if _, seen := destObjects[msg.ContentHash]; !seen {
+			destObjects[msg.ContentHash] = destObject{
+				sourceKey:     helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash),
+				destKey:       helpers.NewS3Key(destS3Domain, destS3Localpart, msg.ContentHash),
+				sourcePending: !msg.IsUploaded,
+			}
+			destHashes = append(destHashes, msg.ContentHash)
 		}
 	}
 
@@ -176,7 +180,7 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 	if err != nil {
 		var destErr *resilient.DestObjectError
 		if errors.As(err, &destErr) {
-			return s.internalError("failed to copy S3 object for message: %v", destErr.Err)
+			return s.crossAccountObjectError(destObjects[destErr.ContentHash].sourcePending, destErr.Err)
 		}
 		return s.internalError("failed to move messages: %v", err)
 	}

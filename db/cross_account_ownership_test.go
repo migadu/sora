@@ -4,6 +4,7 @@ package db_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -73,7 +74,7 @@ func TestCrossAccountMessageOwnership(t *testing.T) {
 	uids := []imap.UID{imap.UID(srcUID)}
 
 	// Copy from A to B using resilient operations
-	uidMap, _, err := rdb.CopyMessagesWithRetry(ctx, &uids, srcMailbox.ID, destMailbox.ID, accountID_B, domainB, localB, "test-instance")
+	uidMap, _, err := rdb.CopyMessagesWithRetry(ctx, &uids, srcMailbox.ID, destMailbox.ID, accountID_B, domainB, localB, "test-instance", map[imap.UID]string{imap.UID(srcUID): contentHash})
 	require.NoError(t, err)
 	require.Len(t, uidMap, 1)
 
@@ -115,4 +116,78 @@ func TestCrossAccountMessageOwnership(t *testing.T) {
 	assert.Equal(t, accountID_B, destAccountID)
 	assert.Equal(t, domainB, destDomain)
 	assert.Equal(t, localB, destLocalpart)
+}
+
+// TestCopyMessagesRefusesSourceRenamedSinceCaller pins CopyMessages' contract for a copy
+// into another account (#761): a source row is copied only with the hash the caller made
+// its body available for under the owner's key (sourceHashes). A row with any other hash,
+// as one sora-admin import rekey renamed after the caller read it, or a row the caller gave
+// no hash for, fails the whole copy before anything is written.
+func TestCopyMessagesRefusesSourceRenamedSinceCaller(t *testing.T) {
+	rdb := common.SetupTestDatabase(t)
+	ctx := context.Background()
+
+	accountA := common.CreateTestAccount(t, rdb)
+	accountB := common.CreateTestAccount(t, rdb)
+	accountID_A, err := rdb.GetAccountIDByAddressWithRetry(ctx, accountA.Email)
+	require.NoError(t, err)
+	accountID_B, err := rdb.GetAccountIDByAddressWithRetry(ctx, accountB.Email)
+	require.NoError(t, err)
+	srcMailbox, err := rdb.GetOrCreateMailboxByNameWithRetry(ctx, accountID_A, "INBOX")
+	require.NoError(t, err)
+	destMailbox, err := rdb.GetOrCreateMailboxByNameWithRetry(ctx, accountID_B, "Shared")
+	require.NoError(t, err)
+
+	hashes := map[imap.UID]string{}
+	var uids []imap.UID
+	for i, hash := range []string{
+		"1111222233334444555566667777888899990000aaaabbbbccccddddeeee0761",
+		"2222333344445555666677778888999900001111bbbbccccddddeeeeffff0761",
+	} {
+		_, uid, err := rdb.InsertMessageWithRetry(ctx, &db.InsertMessageOptions{
+			AccountID:     accountID_A,
+			MailboxID:     srcMailbox.ID,
+			MailboxName:   srcMailbox.Name,
+			S3Domain:      "example.com",
+			S3Localpart:   "user_a",
+			ContentHash:   hash,
+			MessageID:     fmt.Sprintf("<renamed-source-%d@example.com>", i),
+			InternalDate:  time.Now(),
+			Size:          1024,
+			Subject:       "Renamed source",
+			PlaintextBody: "Hello",
+			SentDate:      time.Now(),
+		}, db.PendingUpload{ContentHash: hash, InstanceID: "test", Size: 1024, AccountID: accountID_A})
+		require.NoError(t, err)
+		hashes[imap.UID(uid)] = hash
+		uids = append(uids, imap.UID(uid))
+	}
+
+	destState := func() (rows int, highestUID int64) {
+		require.NoError(t, rdb.QueryRowWithRetry(ctx, `
+			SELECT (SELECT COUNT(*) FROM messages WHERE mailbox_id = $1), highest_uid
+			FROM mailboxes WHERE id = $1`, destMailbox.ID).Scan(&rows, &highestUID))
+		return rows, highestUID
+	}
+	_, highestBefore := destState()
+
+	renamed := map[imap.UID]string{uids[0]: hashes[uids[0]], uids[1]: "0761" + hashes[uids[1]][4:]}
+	missing := map[imap.UID]string{uids[0]: hashes[uids[0]]}
+	for name, sourceHashes := range map[string]map[imap.UID]string{"renamed": renamed, "missing": missing} {
+		_, _, err := rdb.CopyMessagesWithRetry(ctx, &uids, srcMailbox.ID, destMailbox.ID, accountID_B, "example.net", "user_b", "test-instance", sourceHashes)
+		require.ErrorIs(t, err, db.ErrCopySourceChanged, name)
+		rows, highest := destState()
+		assert.Zero(t, rows, "%s: a refused copy wrote rows", name)
+		assert.Equal(t, highestBefore, highest, "%s: a refused copy allocated UIDs", name)
+	}
+
+	uidMap, _, err := rdb.CopyMessagesWithRetry(ctx, &uids, srcMailbox.ID, destMailbox.ID, accountID_B, "example.net", "user_b", "test-instance", hashes)
+	require.NoError(t, err)
+	require.Len(t, uidMap, 2)
+	for _, uid := range uids {
+		var hash string
+		require.NoError(t, rdb.QueryRowWithRetry(ctx, `SELECT content_hash FROM messages WHERE mailbox_id = $1 AND uid = $2`,
+			destMailbox.ID, uidMap[uid]).Scan(&hash))
+		assert.Equal(t, hashes[uid], hash)
+	}
 }

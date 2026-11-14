@@ -5,11 +5,12 @@ package resilient
 import (
 	"context"
 	"errors"
+	"testing"
+	"time"
+
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/circuitbreaker"
-	"testing"
-	"time"
 )
 
 func TestMoveSingleLongObjectKeepsTransactionAlive(t *testing.T) {

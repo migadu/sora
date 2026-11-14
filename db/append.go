@@ -92,6 +92,12 @@ const (
 
 var extraAddressesValue = strings.NewReplacer("\t", " ", "\n", " ")
 
+// ErrCopySourceChanged is returned by CopyMessages when a source row owned by another
+// account than the destination no longer has the content hash the caller made its body
+// available for under the destination owner's S3 path. Nothing is written; reading the
+// source again and copying anew can succeed.
+var ErrCopySourceChanged = errors.New("a source message changed during the copy")
+
 func truncateHash(hash string) string {
 	if len(hash) > 12 {
 		return hash[:12]
@@ -108,7 +114,17 @@ func truncateHash(hash string) string {
 // caller that loses the COMMIT acknowledgement (ErrCommitOutcomeUnknown) can read them back
 // to learn — exactly, and immune to concurrency — whether the copy actually landed. See
 // server/imap/copy.go for that resolution.
-func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string) (map[imap.UID]imap.UID, []int64, error) {
+//
+// A copy of a row owned by another account than destAccountID is re-keyed to
+// destAccountID's S3 path, where the caller must first have made the body available (its
+// object, or the staging file of the upload restagePendingUploads queues). sourceHashes
+// holds, by source UID, the content hash each such row had when the caller did so, and
+// the row is copied only if it still has it: sora-admin import rekey renames a body's hash
+// (RekeyContentHash) under no lock the copy takes, and a copy under the new hash would
+// point at a key nothing wrote. A renamed source fails the copy with ErrCopySourceChanged
+// before anything commits. The check is made by the INSERT, the statement that copies the
+// rows' hashes; once inserted, a copy keeps its hash whatever happens to the source.
+func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string) (map[imap.UID]imap.UID, []int64, error) {
 	messageUIDMap := make(map[imap.UID]imap.UID)
 	if srcMailboxID == destMailboxID {
 		return nil, nil, fmt.Errorf("source and destination mailboxes cannot be the same")
@@ -125,7 +141,8 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 
 	var messageIDs []int64
 	var sourceUIDsForMap []imap.UID
-	crossAccount := false // any source row owned by another account: see restageFTS
+	var expectedHashes []string // per message: sourceHashes, checked for re-keyed rows only
+	crossAccount := false       // any source row owned by another account: see restageFTS
 	for rows.Next() {
 		var messageID, sourceAccountID int64
 		var sourceUID imap.UID
@@ -134,6 +151,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		}
 		messageIDs = append(messageIDs, messageID)
 		sourceUIDsForMap = append(sourceUIDsForMap, sourceUID)
+		expectedHashes = append(expectedHashes, sourceHashes[sourceUID])
 		crossAccount = crossAccount || sourceAccountID != destAccountID
 	}
 	if err = rows.Err(); err != nil {
@@ -195,7 +213,11 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 				d.new_uid,
 				d.custom_flags_canon
 			FROM messages m
-			JOIN unnest($3::bigint[], $4::bigint[], $5::jsonb[]) AS d(message_id, new_uid, custom_flags_canon) ON m.id = d.message_id
+			JOIN unnest($3::bigint[], $4::bigint[], $5::jsonb[], $9::text[]) AS d(message_id, new_uid, custom_flags_canon, expected_hash) ON m.id = d.message_id
+			-- A row re-keyed to another account is copied only with the hash whose body the
+			-- caller made available under the owner's key (sourceHashes); a row left out
+			-- here fails the copy below.
+			WHERE m.account_id = $6 OR m.content_hash = d.expected_hash
 		),
 		inserted AS (
 			INSERT INTO messages (
@@ -233,7 +255,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 			RETURNING message_id
 		)
 		SELECT id FROM inserted ORDER BY uid
-	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart)
+	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart, expectedHashes)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to batch copy messages: %w", err)
 	}
@@ -249,6 +271,9 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	insRows.Close()
 	if err := insRows.Err(); err != nil {
 		return nil, nil, fmt.Errorf("error iterating new message ids: %w", err)
+	}
+	if len(newMessageIDs) != len(messageIDs) {
+		return nil, nil, fmt.Errorf("%w: copied %d of %d messages", ErrCopySourceChanged, len(newMessageIDs), len(messageIDs))
 	}
 
 	// Re-stage uploads for any copied rows whose body is not yet in S3, so the
