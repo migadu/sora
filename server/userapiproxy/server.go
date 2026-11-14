@@ -108,6 +108,7 @@ type ServerOptions struct {
 	Pools                    []proxy.PoolSpec // Named backend pools ([[pool]] blocks); when set, RemoteAddrs is unused and each pool brings its own backend-leg settings
 	RemotePort               int              // Default port for backends if not in address
 	JWTSecret                string           // JWT secret for token validation
+	AllowedOrigins           []string         // CORS allowed origins (allowed_origins) of the responses the proxy writes itself
 	TLS                      bool
 	TLSCertFile              string
 	TLSKeyFile               string
