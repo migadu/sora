@@ -39,6 +39,11 @@ type ManageSieveSession struct {
 	useMasterDB bool   // Pin session to master DB after a write to ensure consistency
 	releaseConn func() // Function to release connection from limiter
 	startTime   time.Time
+
+	// trackedClientAddr is the client address this session was registered
+	// with in the connection tracker, so it is unregistered under that key.
+	// Empty when the tracker refused the session: it has nothing to release.
+	trackedClientAddr string
 }
 
 var (
@@ -956,25 +961,28 @@ func (s *ManageSieveSession) registerConnection(ctx context.Context, email strin
 		ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 		defer cancel()
 
-		clientAddr := server.GetAddrString(s.conn.RemoteAddr())
+		// The client's address, not the TCP peer: behind a proxy the peer is
+		// the proxy for every client. RemoteIP already holds the address from
+		// the PROXY header.
+		clientAddr := s.RemoteIP
 
 		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "ManageSieve", clientAddr); err != nil {
 			s.InfoLog("rejected connection registration", "error", err)
+			return
 		}
+		s.trackedClientAddr = clientAddr
 	}
 }
 
 // unregisterConnection removes the connection from the connection tracker
 func (s *ManageSieveSession) unregisterConnection() {
-	if s.server.connTracker != nil && s.User != nil {
+	if s.server.connTracker != nil && s.User != nil && s.trackedClientAddr != "" {
 		// Use configured database query timeout for connection tracking (database DELETE)
 		queryTimeout := s.server.rdb.GetQueryTimeout()
 		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 		defer cancel()
 
-		clientAddr := server.GetAddrString(s.conn.RemoteAddr())
-
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "ManageSieve", clientAddr); err != nil {
+		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "ManageSieve", s.trackedClientAddr); err != nil {
 			s.WarnLog("failed to unregister connection", "error", err)
 		}
 	}
