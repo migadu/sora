@@ -90,6 +90,6 @@
 //		relay(addr)
 //	}
 //	for _, dest := range result.Destinations(false) {
-//		deliverToMailbox(dest.Mailbox)
+//		deliverToMailbox(dest.Mailbox, dest.Flags)
 //	}
 package sieveengine

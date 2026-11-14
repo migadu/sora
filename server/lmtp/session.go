@@ -939,25 +939,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	s.InfoLog("executing sieve action", "action", result.Action)
 
-	// Flags set by the Sieve script via imap4flags (RFC 5232: setflag/addflag/
-	// removeflag). The Sieve engine resolves them into result.Flags; apply them to
-	// every locally stored copy. Sanitize to drop NIL/empty values and anything
-	// that is not a valid IMAP flag-keyword -- a Sieve script is the one flag
-	// source that never passes an IMAP parser, so this is where an unencodable
-	// keyword would otherwise enter the system.
-	rawSieveFlags := helpers.StringsToFlags(result.Flags)
-	sieveFlags := helpers.SanitizeFlags(rawSieveFlags)
-	if len(sieveFlags) > 0 {
-		s.InfoLog("sieve set flags on message", "flags", result.Flags)
-	}
-	// Dropping a flag silently would leave the user's script looking like it
-	// worked; name the rejected keywords so support can point at the line.
-	if rejected := helpers.DroppedFlags(rawSieveFlags, sieveFlags); len(rejected) > 0 {
-		s.WarnLog("sieve set invalid IMAP keywords, dropped",
-			"flags", strings.Join(rejected, ","),
-			"reason", "not a valid IMAP flag-keyword (RFC 9051 §9: ASCII atom, no specials)")
-	}
-
 	// Classify and extract the final stored MIME once, after editheader, and
 	// reuse both results for every destination. The structure
 	// gets the same validation and fallback as APPEND's and the Admin API's:
@@ -967,7 +948,36 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		s.WarnLog("storing a fallback body structure", "error", bsErr)
 	}
 	bodyStructure := &bodyStructureVal
-	sieveFlags = db.WithAttachmentKeyword(sieveFlags, fullMessageBytes, true)
+
+	// Flags set by the Sieve script via imap4flags (RFC 5232) belong to one stored
+	// copy, the one its keep or fileinto stores (Destination.Flags). storedFlags
+	// turns them into the flags the copy is stored with, once for each distinct
+	// list, so copies sharing one classify the attachment once. Sanitize to drop
+	// NIL/empty values and anything that is not a valid IMAP flag-keyword -- a
+	// Sieve script is the one flag source that never passes an IMAP parser, so
+	// this is where an unencodable keyword would otherwise enter the system.
+	storedFlagsByList := make(map[string][]imap.Flag)
+	storedFlags := func(names []string) []imap.Flag {
+		key := fmt.Sprintf("%q", names)
+		if flags, ok := storedFlagsByList[key]; ok {
+			return flags
+		}
+		raw := helpers.StringsToFlags(names)
+		flags := helpers.SanitizeFlags(raw)
+		if len(flags) > 0 {
+			s.InfoLog("sieve set flags on message", "flags", names)
+		}
+		// Dropping a flag silently would leave the user's script looking like it
+		// worked; name the rejected keywords so support can point at the line.
+		if rejected := helpers.DroppedFlags(raw, flags); len(rejected) > 0 {
+			s.WarnLog("sieve set invalid IMAP keywords, dropped",
+				"flags", strings.Join(rejected, ","),
+				"reason", "not a valid IMAP flag-keyword (RFC 9051 §9: ASCII atom, no specials)")
+		}
+		flags = db.WithAttachmentKeyword(flags, fullMessageBytes, true)
+		storedFlagsByList[key] = flags
+		return flags
+	}
 
 	// Store every requested copy before any redirect is handed to the relay. A
 	// temporary storage failure makes the sender retry the whole delivery.
@@ -996,7 +1006,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	for _, dest := range destinations {
 		mailboxNames = append(mailboxNames, dest.Mailbox)
 		err = s.saveMessageToMailbox(ctx, dest.Mailbox, fullMessageBytes, contentHash, deliveryHash,
-			subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, dest.Create, sieveFlags)
+			subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, dest.Create, storedFlags(dest.Flags))
 		if err == nil {
 			continue
 		}
