@@ -616,18 +616,18 @@ Rules:
 
 - Only these names can be removed: `IMAP4rev1`, `IMAP4rev2`, `LITERAL+`, `MOVE`, `IDLE`,
   `UIDPLUS`, `ESEARCH`, `SEARCHRES`, `ESORT`, `SORT`, `SORT=DISPLAY`, `SPECIAL-USE`,
-  `CREATE-SPECIAL-USE`, `LIST-STATUS`, `STATUS=SIZE`, `BINARY`, `CONDSTORE`, `QRESYNC`, `NOTIFY`,
-  `CHILDREN`, `ID`, `NAMESPACE`, `METADATA`, `THREAD=REFERENCES`, `THREAD=REFS`,
-  `THREAD=ORDEREDSUBJECT`, `MULTISEARCH`, and `PREVIEW` when enabled. Any other name is ignored
-  (logged at debug level).
+  `CREATE-SPECIAL-USE`, `LIST-EXTENDED`, `LIST-STATUS`, `STATUS=SIZE`, `BINARY`, `CONDSTORE`,
+  `QRESYNC`, `NOTIFY`, `CHILDREN`, `ID`, `NAMESPACE`, `METADATA`, `THREAD=REFERENCES`,
+  `THREAD=REFS`, `THREAD=ORDEREDSUBJECT`, `MULTISEARCH`, and `PREVIEW` when enabled. Any other
+  name is ignored (logged at debug level).
 - `IMAP4rev2` includes `NAMESPACE`, `UNSELECT`, `UIDPLUS`, `ESEARCH`, `SEARCHRES`, `ENABLE`,
   `IDLE`, `SASL-IR`, `LIST-EXTENDED`, `LIST-STATUS`, `MOVE`, `LITERAL-`, `STATUS=SIZE` and
   `CHILDREN`. Removing one of these with `disabled_caps` also removes `IMAP4rev2`, so clients fall
   back to IMAP4rev1 and really lose the extension, and Sora logs it. `client_filters` follows the
   same rule (see below).
 - `SASL-IR`, `STARTTLS`, `LOGINDISABLED`, `AUTH=PLAIN`, `UNSELECT`, `ENABLE`, `UTF8=ACCEPT`,
-  `LIST-EXTENDED`, `ACL`, `RIGHTS=` and `APPENDLIMIT=` cannot be removed this way. The first four
-  follow `tls`, `tls_use_starttls` and `insecure_auth`.
+  `ACL`, `RIGHTS=` and `APPENDLIMIT=` cannot be removed this way. The first four follow `tls`,
+  `tls_use_starttls` and `insecure_auth`.
 - Do not remove both `IMAP4rev1` and `IMAP4rev2`.
 - Most commands and modifiers of a removed extension are also refused by the library, so a client
   that ignores the list cannot use them.
