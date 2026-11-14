@@ -603,9 +603,11 @@ func (i *Importer) processSubscriptions() error {
 	user := server.NewUser(address, accountID)
 
 	// Ensure default mailboxes exist first
-	if err := i.rdb.CreateDefaultMailboxesWithRetry(i.ctx, user.AccountID()); err != nil {
-		logger.Info("Warning: Failed to create default mailboxes", "email", i.email, "error", err)
-		// Don't fail the subscription processing, as mailboxes might already exist
+	if !i.options.DryRun {
+		if err := i.rdb.CreateDefaultMailboxesWithRetry(i.ctx, user.AccountID()); err != nil {
+			logger.Info("Warning: Failed to create default mailboxes", "email", i.email, "error", err)
+			// Don't fail the subscription processing, as mailboxes might already exist
+		}
 	}
 
 	// Process each subscribed folder
@@ -615,6 +617,11 @@ func (i *Importer) processSubscriptions() error {
 			logger.Warn("Failed to decode Modified UTF-7 subscription folder name, using raw name", "name", folderName, "error", decErr)
 		} else {
 			folderName = decoded
+		}
+
+		if i.options.DryRun {
+			logger.Info("DRY RUN: Would subscribe to mailbox", "name", folderName)
+			continue
 		}
 
 		// Subscriptions are name-based (migration 000046), so record the subscription
@@ -790,12 +797,6 @@ func (i *Importer) performDryRun() error {
 		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
 	}
 	user := server.NewUser(address, accountID)
-
-	// Proactively ensure default mailboxes exist for this user
-	if err := i.rdb.CreateDefaultMailboxesWithRetry(i.ctx, user.AccountID()); err != nil {
-		logger.Info("Warning: Failed to create default mailboxes", "email", i.email, "error", err)
-		// Don't fail the dry run, as mailboxes might already exist
-	}
 
 	// Query the SQLite database for messages
 	var query string
@@ -1490,8 +1491,18 @@ func (i *Importer) syncMailboxState() error {
 			continue
 		}
 
-		// Get or create the mailbox
-		mailbox, err := i.getOrCreateMailbox(i.ctx, user.AccountID(), mailboxName)
+		// Get or create the mailbox; a dry run only looks it up.
+		var mailbox *db.DBMailbox
+		if i.options.DryRun {
+			mailbox, err = i.rdb.GetMailboxByNameWithRetry(i.ctx, user.AccountID(), mailboxName)
+			if errors.Is(err, consts.ErrMailboxNotFound) {
+				logger.Info("DRY RUN: Would create mailbox with the Dovecot UIDVALIDITY", "mailbox", mailboxName,
+					"uidvalidity", uidList.UIDValidity)
+				continue
+			}
+		} else {
+			mailbox, err = i.getOrCreateMailbox(i.ctx, user.AccountID(), mailboxName)
+		}
 		if err != nil {
 			logger.Info("Warning: Failed to get/create mailbox for state sync", "mailbox", mailboxName, "error", err)
 			continue
@@ -1542,6 +1553,13 @@ func (i *Importer) syncMailboxState() error {
 		highestUID := int64(0)
 		if uidList.NextUID > 0 {
 			highestUID = int64(uidList.NextUID) - 1
+		}
+
+		if i.options.DryRun {
+			logger.Info("DRY RUN: Would update UIDVALIDITY and highest_uid", "mailbox", mailboxName,
+				"old_uidvalidity", currentUIDValidity, "new_uidvalidity", uidList.UIDValidity,
+				"highest_uid", highestUID)
+			continue
 		}
 
 		_, err = db.WritePool.Exec(i.ctx, `UPDATE mailboxes SET uid_validity = $2, highest_uid = $3 WHERE id = $1`,
