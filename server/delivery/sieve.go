@@ -48,6 +48,10 @@ type SieveOutcome struct {
 	// CreateMailboxes are the fileinto :create targets (RFC 5490 §3.2): the caller
 	// creates each missing mailbox before saving the copies.
 	CreateMailboxes []string
+	// Redirect hands every redirect to the relay, after all requested copies are stored.
+	// RedirectOnly has no requested copy: call Redirect first, keeping INBOX only if it fails.
+	Redirect     func() bool
+	RedirectOnly bool
 }
 
 // SieveExecutor interface defines the contract for Sieve script execution.
@@ -142,10 +146,9 @@ func (s *StandardSieveExecutor) evaluate(ctx context.Context, recipient Recipien
 	return result
 }
 
-// ExecuteSieve executes Sieve scripts and returns the outcome for this delivery. It
-// performs the script's non-storage side effects (redirect, vacation) itself; storing
-// the message — in every mailbox of SieveOutcome — is left to the caller, which
-// must do it from SieveOutcome.MessageBytes.
+// ExecuteSieve executes Sieve scripts and sends the vacation reply. The caller
+// stores every requested copy from SieveOutcome.MessageBytes before invoking
+// SieveOutcome.Redirect. A redirect-only delivery uses INBOX only if handoff fails.
 func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient RecipientInfo, messageEntity *message.Entity, fullMessageBytes []byte) (*SieveOutcome, error) {
 	// Default to INBOX with the message unmodified
 	outcome := &SieveOutcome{
@@ -218,12 +221,51 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		_ = s.VacationHandler.HandleVacationResponse(ctx, recipient.AccountID, *result.Vacation, recipient.FromAddress, recipient.Address, outcome.MessageEntity)
 	}
 
+	if len(result.RedirectTo) > 0 {
+		outcome.Redirect = func() bool {
+			return s.relayRedirects(ctx, recipient, result, outcome.MessageBytes, outcome.MessageEntity)
+		}
+	}
+
+	if result.Action == sieveengine.ActionDiscard && result.Rejected {
+		action, reason := result.RejectLogFields()
+		s.DeliveryCtx.Logger.Log("Sieve %s treated as discard, no bounce sent: %q", action, reason)
+	}
+
+	// Compute the requested copies before relaying. With no requested copy the
+	// caller tries the redirect first, using INBOX only when handoff fails.
+	destinations := result.Destinations(false)
+	if len(destinations) == 0 {
+		if outcome.Redirect != nil {
+			outcome.RedirectOnly = true
+			outcome.MailboxName = consts.MailboxInbox
+			return outcome, nil
+		}
+		outcome.MailboxName = ""
+		outcome.Discarded = true
+		return outcome, nil
+	}
+	outcome.MailboxName = destinations[0].Mailbox
+	for _, dest := range destinations {
+		if dest.Create {
+			outcome.CreateMailboxes = append(outcome.CreateMailboxes, dest.Mailbox)
+		}
+	}
+	for _, dest := range destinations[1:] {
+		outcome.CopyMailboxes = append(outcome.CopyMailboxes, dest.Mailbox)
+	}
+
+	return outcome, nil
+}
+
+// relayRedirects hands every redirect to the relay and charges only successful handoffs.
+func (s *StandardSieveExecutor) relayRedirects(ctx context.Context, recipient RecipientInfo, result sieveengine.Result, messageBytes []byte, messageEntity *message.Entity) bool {
 	// Every redirect is relayed, whatever else the script did with the message.
 	redirectFailed := false
 	if len(result.RedirectTo) > 0 {
 		if recipient.FromAddress != nil && (s.RelayQueue != nil || s.RelayHandler != nil) {
 			// Stamp the outgoing copy with an incremented hop count (loop backstop).
-			relayBytes := helpers.PrependHeaderLine(outcome.MessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(helpers.RedirectHopCount(helpers.HeaderGetter(outcome.MessageEntity.Header.Map()))+1))
+			relayBytes := helpers.PrependHeaderLine(messageBytes, helpers.RedirectLoopHeader, strconv.Itoa(helpers.RedirectHopCount(helpers.HeaderGetter(messageEntity.Header.Map()))+1))
 			// Attribute this redirect to the script owner, replacing any earlier or
 			// sender-supplied attribution. Aliases still use the account's primary address.
 			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, recipient.Address.FullAddress())
@@ -259,31 +301,7 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		}
 	}
 
-	if result.Action == sieveengine.ActionDiscard && result.Rejected {
-		action, reason := result.RejectLogFields()
-		s.DeliveryCtx.Logger.Log("Sieve %s treated as discard, no bounce sent: %q", action, reason)
-	}
-
-	// One copy in every fileinto target, and in INBOX when the message is kept (or a
-	// failed redirect left it stored nowhere). The copies are deferred to the caller,
-	// which saves them once the body has been staged locally (see CopyMailboxes).
-	destinations := result.Destinations(redirectFailed)
-	if len(destinations) == 0 {
-		outcome.MailboxName = ""
-		outcome.Discarded = true
-		return outcome, nil
-	}
-	outcome.MailboxName = destinations[0].Mailbox
-	for _, dest := range destinations {
-		if dest.Create {
-			outcome.CreateMailboxes = append(outcome.CreateMailboxes, dest.Mailbox)
-		}
-	}
-	for _, dest := range destinations[1:] {
-		outcome.CopyMailboxes = append(outcome.CopyMailboxes, dest.Mailbox)
-	}
-
-	return outcome, nil
+	return !redirectFailed
 }
 
 // MergeSieveResults decides what the default script and the user script together
