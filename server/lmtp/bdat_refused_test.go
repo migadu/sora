@@ -11,8 +11,8 @@ import (
 
 // go-smtp advertises CHUNKING on every LMTP backend. A client sends a BDAT chunk right
 // behind the command line without waiting for the reply, so a BDAT refused for a missing
-// MAIL or RCPT must still read and drop its chunk, or the chunk is read as LMTP commands
-// (#614). RFC 3030 section 2: "If a failure occurs after a BDAT command is received, the
+// MAIL or RCPT, or for its arguments, must still read and drop its chunk, or the chunk is
+// read as LMTP commands (#614). RFC 3030 section 2: "If a failure occurs after a BDAT command is received, the
 // receiver-SMTP MUST accept and discard the associated message data before sending the
 // appropriate 5XX or 4XX code."
 func TestRefusedBDATChunkIsNotReadAsCommands(t *testing.T) {
@@ -24,9 +24,13 @@ func TestRefusedBDATChunkIsNotReadAsCommands(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		before []string
+		args   string // after the chunk size
+		reply  string
 	}{
-		{"no MAIL", nil},
-		{"no RCPT", []string{"MAIL FROM:<sender@example.org>"}},
+		{"no MAIL", nil, " LAST", "502 "},
+		{"no RCPT", []string{"MAIL FROM:<sender@example.org>"}, " LAST", "502 "},
+		{"unknown argument", nil, " FIRST", "501 "},
+		{"too many arguments", nil, " LAST LAST", "501 "},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, addr := startAdmissionTestBackend(t, []string{"127.0.0.0/8"}, false)
@@ -60,9 +64,9 @@ func TestRefusedBDATChunkIsNotReadAsCommands(t *testing.T) {
 				}
 			}
 
-			fmt.Fprintf(conn, "BDAT %d LAST\r\n%sNOOP\r\n", len(chunk), chunk)
-			if line := readReplyLine(t, r); !strings.HasPrefix(line, "502 ") {
-				t.Fatalf("BDAT without a recipient: %q, want 502", line)
+			fmt.Fprintf(conn, "BDAT %d%s\r\n%sNOOP\r\n", len(chunk), tc.args, chunk)
+			if line := readReplyLine(t, r); !strings.HasPrefix(line, tc.reply) {
+				t.Fatalf("BDAT: %q, want %q", line, tc.reply)
 			}
 			if line := readReplyLine(t, r); line != noopReply {
 				t.Fatalf("next reply after the refused BDAT: %q, want the NOOP reply %q; the chunk was read as commands", line, noopReply)
