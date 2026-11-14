@@ -350,7 +350,13 @@ func (crl *ClusterRateLimiter) handleUnblockIP(event RateLimitEvent) {
 	logger.Debug("Cluster limiter: Applied cluster unblock", "protocol", crl.limiter.protocol, "ip", event.IP, "from_node", event.NodeID)
 }
 
-// handleFailureCount updates progressive delay tracking from another node
+// handleFailureCount merges progressive delay tracking from another node.
+//
+// Both nodes count failures of the same address, so a peer's count says the
+// address failed at least that often: it raises this node's count and never
+// lowers it. Taking the newest count instead let a peer that had seen fewer
+// failures reset the count of a node close to blocking the address, so an
+// attack spread over two nodes could stay under max_attempts_per_ip on both.
 func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
 	if !crl.syncFailureCounts {
 		return
@@ -359,21 +365,25 @@ func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
 	crl.limiter.ipMu.Lock()
 	defer crl.limiter.ipMu.Unlock()
 
-	// Check if we already have more recent failure info for this IP
-	existing, exists := crl.limiter.ipFailureCounts[event.IP]
-	if exists && existing.LastFailure.After(event.Timestamp) {
-		return
+	info, exists := crl.limiter.ipFailureCounts[event.IP]
+	if !exists {
+		info = &IPFailureInfo{FirstFailure: event.FirstFailure}
+		crl.limiter.ipFailureCounts[event.IP] = info
 	}
 
-	// Update failure count
-	crl.limiter.ipFailureCounts[event.IP] = &IPFailureInfo{
-		FailureCount: event.FailureCount,
-		FirstFailure: event.FirstFailure,
-		LastFailure:  event.Timestamp,
-		LastDelay:    event.LastDelay,
+	info.FailureCount = max(info.FailureCount, event.FailureCount)
+	if event.LastDelay > info.LastDelay {
+		info.LastDelay = event.LastDelay
+	}
+	if !event.FirstFailure.IsZero() && event.FirstFailure.Before(info.FirstFailure) {
+		info.FirstFailure = event.FirstFailure
+	}
+	if event.Timestamp.After(info.LastFailure) {
+		info.LastFailure = event.Timestamp
 	}
 
-	logger.Debug("Cluster limiter: Updated failure count", "protocol", crl.limiter.protocol, "ip", event.IP, "from_node", event.NodeID, "failures", event.FailureCount, "delay", event.LastDelay)
+	logger.Debug("Cluster limiter: Merged failure count", "protocol", crl.limiter.protocol, "ip", event.IP, "from_node", event.NodeID,
+		"peer_failures", event.FailureCount, "failures", info.FailureCount, "delay", info.LastDelay)
 }
 
 // handleUsernameFailure applies a username failure from another node
