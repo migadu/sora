@@ -547,7 +547,17 @@ The body part uses the per-account search index, which the background worker fil
 delivery and which `fts_retention` may prune. A message that is not indexed can still match by
 its headers. See [SEARCH.md](SEARCH.md).
 
-There are no other parameters; `q` is plain text, with no field prefixes or operators.
+`q` is required plain text, with no field prefixes or operators. Optional filters narrow
+its results, and all supplied filters must match:
+
+| Parameter | Meaning |
+|---|---|
+| `from` | Literal substring of any sender's address or display name, ignoring case. |
+| `subject` | Literal substring of the subject, ignoring case. |
+| `unseen=true` | Only messages without `\\Seen`, including messages with no stored flags. |
+
+The text filters have no wildcard syntax. A `from` or `subject` containing a NUL or
+invalid UTF-8 is refused with `400 Bad Request`.
 
 Response `200`:
 
