@@ -649,7 +649,17 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		}
 	}
 
-	// Initialize S3 storage if needed
+	// Check the staging path before any uploader or cleanup worker starts.
+	if storageServicesNeeded {
+		// The default [uploader] path moved off /tmp. Before any worker starts, refuse to
+		// strand bodies a previous release staged at the old default.
+		if err := uploader.CheckLegacyStaging(cfg.Uploader.Path, config.DefaultUploaderPath, config.LegacyDefaultUploaderPath); err != nil {
+			errorHandler.ValidationError("uploader path", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+	}
+
+	// Initialize S3 storage for mail services or a User API body reader.
 	if s3Needed {
 		// Ensure required S3 arguments are provided only if needed
 		if cfg.S3.AccessKey == "" || cfg.S3.SecretKey == "" || cfg.S3.Bucket == "" {
@@ -708,7 +718,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	if cfg.AuthCache.Enabled {
 		acPath := cfg.AuthCache.Path
 		if acPath == "" {
-			acPath = "/tmp/sora/auth_cache.db"
+			acPath = config.DefaultAuthCachePath
 		}
 		acMaxAge := cfg.AuthCache.GetMaxAgeWithDefault()
 		acPurgeUnused := cfg.AuthCache.GetPurgeUnusedWithDefault()
@@ -1213,6 +1223,10 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 				}
 			}()
 		}
+		// Arm renewal for the certificates already cached. Not before this point: one
+		// that is due is renewed at once, and that order needs the issuance fence
+		// (installed with the manager) and HTTP-01 (enabled by HTTPHandler above).
+		deps.tlsManager.StartRenewals()
 	}
 
 	// Start all configured servers dynamically
@@ -1579,6 +1593,7 @@ func buildLMTPServerOptions(deps *serverDependencies, serverConfig config.Server
 		RedirectRateLimit:       serverConfig.GetRedirectRateLimit(),
 		RedirectRateWindow:      redirectRateWindow,
 		MaxRedirectHops:         serverConfig.GetMaxRedirectHops(),
+		SharedMailboxes:         deps.config.SharedMailboxes,
 		CommandTimeoutOverrides: lmtpCommandTimeoutOverrides,
 	}
 }
@@ -1895,6 +1910,8 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		TrustedProxies:           deps.config.Servers.TrustedNetworks,
 		MaxConnections:           serverConfig.MaxConnections,
 		MaxConnectionsPerIP:      serverConfig.MaxConnectionsPerIP,
+		ClusterManager:           deps.clusterManager,
+		ClusterRateLimitSync:     deps.config.Cluster.RateLimitSync,
 		TrustedNetworks:          deps.config.Servers.TrustedNetworks,
 		ListenBacklog:            serverConfig.ListenBacklog,
 		MaxAuthErrors:            serverConfig.GetMaxAuthErrors(),
@@ -2026,6 +2043,8 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		TrustedProxies:           deps.config.Servers.TrustedNetworks,
 		MaxConnections:           serverConfig.MaxConnections,
 		MaxConnectionsPerIP:      serverConfig.MaxConnectionsPerIP,
+		ClusterManager:           deps.clusterManager,
+		ClusterRateLimitSync:     deps.config.Cluster.RateLimitSync,
 		TrustedNetworks:          deps.config.Servers.TrustedNetworks,
 		ListenBacklog:            serverConfig.ListenBacklog,
 		LookupCache:              serverConfig.LookupCache,
@@ -2150,6 +2169,8 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		TrustedProxies:           deps.config.Servers.TrustedNetworks,
 		MaxConnections:           serverConfig.MaxConnections,
 		MaxConnectionsPerIP:      serverConfig.MaxConnectionsPerIP,
+		ClusterManager:           deps.clusterManager,
+		ClusterRateLimitSync:     deps.config.Cluster.RateLimitSync,
 		TrustedNetworks:          deps.config.Servers.TrustedNetworks,
 		ListenBacklog:            serverConfig.ListenBacklog,
 		Debug:                    serverConfig.Debug,
@@ -2403,6 +2424,12 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		redirectRateWindow = time.Hour
 	}
 
+	// A nil *relayqueue.Worker must stay a nil interface, not one holding a nil pointer.
+	var relayWorker adminapi.RelayWorkerNotifier
+	if deps.relayWorker != nil {
+		relayWorker = deps.relayWorker
+	}
+
 	options := adminapi.ServerOptions{
 		Name:               serverConfig.Name,
 		Addr:               serverConfig.Addr,
@@ -2415,6 +2442,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		Storage:            deps.storage,
 		PurgeWorker:        deps.purgeWorker,
 		RelayQueue:         deps.relayQueueOption(), // Global relay queue; nil without [relay]
+		RelayWorker:        relayWorker,             // woken for redirects and vacation replies, as on LMTP
 		MaxMessageSize:     serverConfig.GetMaxMessageSizeWithDefault(),
 		MaxConnections:     serverConfig.MaxConnections,
 		TLS:                serverConfig.TLS,

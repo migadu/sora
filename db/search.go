@@ -1174,6 +1174,7 @@ func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID)
 
 func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, orderByClause string, limit, mailboxMessageCount int) ([]SearchMessageResult, error) {
 	criteria = cloneSearchCriteria(criteria)
+	dropEmptyTextTerms(criteria)
 	if criteriaContainsUIDWildcard(criteria) {
 		if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, criteria); err != nil {
 			return nil, err
@@ -1485,6 +1486,39 @@ func cloneSearchCriteria(c *imap.SearchCriteria) *imap.SearchCriteria {
 		}
 	}
 	return &out
+}
+
+// dropEmptyTextTerms removes empty BODY and TEXT terms from criteria and from its
+// nested NOT and OR criteria. "Note that the empty string is a substring" (RFC 9051
+// §6.4.4), so such a term matches every message, which is what leaving it out of
+// the conjunction does: an empty criteria node builds as 1=1. Searched as written
+// it would match none, since plainto_tsquery of an empty string has no lexemes.
+// The slices are replaced, not edited, so a shallow clone's caller is untouched.
+func dropEmptyTextTerms(c *imap.SearchCriteria) {
+	if c == nil {
+		return
+	}
+	nonEmpty := func(terms []string) []string {
+		if !slices.Contains(terms, "") {
+			return terms
+		}
+		out := make([]string, 0, len(terms))
+		for _, term := range terms {
+			if term != "" {
+				out = append(out, term)
+			}
+		}
+		return out
+	}
+	c.Body = nonEmpty(c.Body)
+	c.Text = nonEmpty(c.Text)
+	for i := range c.Not {
+		dropEmptyTextTerms(&c.Not[i])
+	}
+	for i := range c.Or {
+		dropEmptyTextTerms(&c.Or[i][0])
+		dropEmptyTextTerms(&c.Or[i][1])
+	}
 }
 
 // SearchMessagesWithCriteria retrieves only lightweight message metadata needed for IMAP SEARCH requests.

@@ -1124,6 +1124,9 @@ paths:
             - Neither `password` nor `password_hash` provided
             - Both `password` and `password_hash` provided (only one allowed)
             - A `credentials` entry with a `password` whose `hash_type` is not `bcrypt` or `ssha512`
+            - An invalid email address
+            - A `password` longer than 72 bytes hashed with bcrypt (the default), bcrypt's limit
+            - In a `credentials` array: no or several `is_primary` entries, or the same address twice
           content:
             application/json:
               schema:
@@ -1142,7 +1145,7 @@ paths:
                   value:
                     error: "Cannot specify both password and password_hash"
         '409':
-          description: Account with this email already exists.
+          description: An address already belongs to an account, or to a deleted account still in its grace period (restore or purge it first).
           content:
             application/json:
               schema:
@@ -1244,6 +1247,8 @@ paths:
             Invalid request body. Common causes:
             - Neither `password` nor `password_hash` provided
             - Both `password` and `password_hash` provided (only one allowed)
+            - An invalid email address in the path
+            - A `password` longer than 72 bytes (bcrypt's limit)
           content:
             application/json:
               schema:

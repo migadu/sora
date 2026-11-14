@@ -229,7 +229,7 @@ func TestIMAP_SearchRes(t *testing.T) {
 		c := newConn(t)
 		uids := setupMailbox(t, c, "SR_SaveNo")
 		for _, failing := range []struct{ criteria, want string }{
-			{strings.TrimSpace(strings.Repeat(fmt.Sprintf("UID %d ", uids[0]), 21)), "NO [SERVERLIMIT]"},
+			{strings.TrimSpace(strings.Repeat(fmt.Sprintf("UID %d ", uids[0]), 21)), "NO [LIMIT]"},
 			{fmt.Sprintf("CHARSET ISO-8859-1 UID %d", uids[1]), "NO [BADCHARSET]"},
 		} {
 			for _, cmd := range searchCommands {
@@ -244,13 +244,13 @@ func TestIMAP_SearchRes(t *testing.T) {
 
 	t.Run("RefusedSaveKeepsDollar", func(t *testing.T) {
 		// RFC 5182 §2.1: a SAVE search refused with BAD leaves "$" as it was, whether
-		// sora refuses it (an impossible size range) or go-imap does (an unknown key).
+		// sora refuses it (an empty header field name) or go-imap does (an unknown key).
 		c := newConn(t)
 		uids := setupMailbox(t, c, "SR_SaveBad")
 		want := []imap.UID{uids[0], uids[2], uids[4]}
 		c.do(`UID SEARCH RETURN (SAVE) SEEN`)
 		for _, cmd := range searchCommands {
-			for _, criteria := range []string{"LARGER 10 SMALLER 5", "NO-SUCH-KEY"} {
+			for _, criteria := range []string{`HEADER "" x`, "NO-SUCH-KEY"} {
 				if got := c.status(cmd + " RETURN (SAVE) " + criteria); !strings.HasPrefix(got, "BAD") {
 					t.Fatalf("%s %s: %s, want BAD", cmd, criteria, got)
 				}
