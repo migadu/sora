@@ -159,6 +159,7 @@ func TestTooManyFileintoTargetsIsAnError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%d targets: %v", MaxFileintoTargets, err)
 	}
+	relayAll(t, result)
 	if len(result.Mailboxes) != MaxFileintoTargets || ro.recordedN != 1 {
 		t.Errorf("%d targets: filed into %d, charged %d redirects, want %d and 1", MaxFileintoTargets, len(result.Mailboxes), ro.recordedN, MaxFileintoTargets)
 	}
