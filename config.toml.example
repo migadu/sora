@@ -976,9 +976,11 @@ shard_count = 0  # Default: 0 (runtime.NumCPU())
 # (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16): on a shared/multi-tenant network that lets
 # any neighbor spoof client IPs and bypass rate limiting (startup logs a warning if you do).
 #
+# - Every entry is an IP address or a CIDR (the server refuses to start otherwise).
 # - proxy_protocol listeners REQUIRE a non-empty list here (the server refuses to start otherwise).
-# - LMTP delivery admission is independent of this and still accepts RFC1918 by default,
-#   so leaving this empty does NOT break mail delivery.
+# - LMTP delivery admission (lmtp and lmtp_proxy) still accepts loopback and RFC1918 when
+#   this is empty, so leaving it empty does NOT break mail delivery. A non-empty list
+#   replaces that default: only the listed hosts may deliver.
 #
 # trusted_networks = ["10.20.0.5/32", "10.20.0.6/32"]   # e.g. only your two proxy hosts
 trusted_networks = []

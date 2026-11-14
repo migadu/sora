@@ -426,8 +426,12 @@ func handleConfigReload(configPath string, currentCfg *config.Config, errorHandl
 	}
 
 	// Every server and proxy takes trusted_networks at start-up: until a restart, the
-	// networks they started with stay trusted and added ones are not.
-	if !slices.Equal(newCfg.Servers.TrustedNetworks, currentCfg.Servers.TrustedNetworks) {
+	// networks they started with stay trusted and added ones are not. A malformed entry
+	// is an error: the server would not start with this file.
+	if err := newCfg.ValidateTrustedNetworks(); err != nil {
+		logger.Error("Config reload: servers.trusted_networks is invalid and the server will not start with this config; the networks the servers started with stay trusted",
+			"error", err)
+	} else if !slices.Equal(newCfg.Servers.TrustedNetworks, currentCfg.Servers.TrustedNetworks) {
 		logger.Warn("Config reload: servers.trusted_networks changed but requires restart to take effect; the networks the servers started with stay trusted until then",
 			"current", currentCfg.Servers.TrustedNetworks, "new", newCfg.Servers.TrustedNetworks)
 	}
@@ -488,6 +492,12 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 		os.Exit(errorHandler.WaitForExit())
 	}
 
+	// One malformed trusted_networks entry would leave LMTP admission with no peers.
+	if err := cfg.ValidateTrustedNetworks(); err != nil {
+		errorHandler.ValidationError("trusted_networks", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+
 	if err := cfg.SharedMailboxes.Validate(); err != nil {
 		errorHandler.ValidationError("[shared_mailboxes]", err)
 		os.Exit(errorHandler.WaitForExit())
@@ -507,7 +517,8 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 	// the insecure-wide pattern. (security-audit M2)
 	if len(cfg.Servers.TrustedNetworks) == 0 {
 		logger.Info("trusted_networks is empty (fail-closed default): PROXY/XCLIENT client-IP forwarding and " +
-			"auth rate-limit exemption are disabled; LMTP still accepts delivery from default private ranges. " +
+			"auth rate-limit exemption are disabled; LMTP and lmtp_proxy still accept delivery from the default " +
+			"private ranges (loopback and RFC 1918). " +
 			"Set [servers] trusted_networks to your proxy IPs to enable forwarding/exemption.")
 	} else if config.TrustedNetworksHaveBroadPrivateRanges(cfg.Servers.TrustedNetworks) {
 		logger.Warn("trusted_networks includes whole private ranges (e.g. 10.0.0.0/8): every host on those " +

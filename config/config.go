@@ -2680,6 +2680,15 @@ func (c *Config) ProxyProtocolListenersMissingTrust() []string {
 	return names
 }
 
+// ValidateTrustedNetworks checks that every [servers] trusted_networks entry is an IP
+// address or a CIDR. The servers parse the list as a whole when they start, so one
+// malformed entry would leave them with none: the LMTP backend and lmtp_proxy would
+// refuse every connection.
+func (c *Config) ValidateTrustedNetworks() error {
+	_, err := helpers.ParseTrustedNetworks(c.Servers.TrustedNetworks)
+	return err
+}
+
 // broadPrivateRanges are the full RFC1918 / IPv6-ULA / link-local supernets. Trusting any
 // of these whole-cloth grants client-IP spoofing and rate-limit exemption to every host on
 // the private network — almost always wider than intended. (security-audit M2)
