@@ -103,7 +103,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 				Addr:             ":2525",
 				RemoteUseXCLIENT: true,
 			},
-			wantWarnings: []string{"remote_use_xclient", "LMTP proxy"},
+			wantWarnings: []string{"remote_use_xclient", "LMTP and POP3 proxy"},
 		},
 		{
 			name: "IMAP with remote_tls_use_starttls",
@@ -116,6 +116,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 			wantWarnings: []string{"remote_tls_use_starttls", "proxy"},
 		},
 		{
+			// The POP3 proxy forwards the client to its backends with XCLIENT.
 			name: "POP3 proxy with remote_use_xclient",
 			serverConfig: ServerConfig{
 				Type:             "pop3_proxy",
@@ -124,7 +125,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 				RemoteAddrs:      []string{"backend1:110"},
 				RemoteUseXCLIENT: true,
 			},
-			wantWarnings: []string{"remote_use_xclient", "LMTP proxy"},
+			wantWarnings: nil,
 		},
 		{
 			name: "IMAP proxy with remote_use_xclient",
@@ -135,7 +136,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 				RemoteAddrs:      []string{"backend1:143"},
 				RemoteUseXCLIENT: true,
 			},
-			wantWarnings: []string{"remote_use_xclient", "LMTP proxy"},
+			wantWarnings: []string{"remote_use_xclient", "LMTP and POP3 proxy"},
 		},
 		{
 			name: "LMTP proxy with remote_use_id_command",

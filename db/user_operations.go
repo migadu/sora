@@ -277,9 +277,9 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
 		-- Account-scoped in the JOIN ON clause, never in WHERE: this is a LEFT JOIN whose
 		-- FTS predicate sits inside an OR with header substring predicates, so a WHERE-side
-		-- account qual would drop every message that has no FTS row (bodies over 64KB are
-		-- never staged, empty bodies are skipped, retention prunes old rows) even when its
-		-- subject or sender matched.
+		-- account qual would drop every message that has no FTS row (empty bodies are
+		-- never staged, retention prunes old rows) even when its subject or sender
+		-- matched.
 		LEFT JOIN messages_fts_v2 mf
 		       ON mf.content_hash = m.content_hash AND mf.account_id = $4
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id

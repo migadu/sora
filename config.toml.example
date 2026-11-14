@@ -1338,15 +1338,20 @@ auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expire
 # its size limit, the oldest entries (by FirstFailure time) are evicted using LRU policy.
 # max_ip_entries evicts the counters of addresses that are not blocked first and never removes
 # an IP block: a block lasts until ip_block_duration ends.
+# max_ip_username_entries bounds the IP+username failure counters and, separately, the
+# IP+username blocks. Making room evicts counters only: a block lasts until
+# ip_username_block_duration ends. While max_ip_username_entries pairs are blocked at once, a
+# further pair that reaches max_attempts_per_ip_username is blocked only once a block has
+# ended (max_attempts_per_ip keeps counting its address).
 # There is no unlimited setting: 0, like any key left out, takes the default.
 #
 # RECOMMENDED VALUES:
-# - Default (100k/50k/50k): Suitable for most deployments, ~40MB per protocol max
-# - High-traffic (200k/100k/100k): For servers with >50k users, ~80MB per protocol max
-# - Low-memory (25k/10k/10k): For constrained environments, ~10MB per protocol max
+# - Default (100k/50k/50k): Suitable for most deployments, ~65MB per protocol max
+# - High-traffic (200k/100k/100k): For servers with >50k users, ~130MB per protocol max
+# - Low-memory (25k/10k/10k): For constrained environments, ~16MB per protocol max
 #
 # MEMORY CALCULATION:
-# - IP+Username entries: ~250 bytes each × max_ip_username_entries
+# - IP+Username entries: ~250 bytes each × max_ip_username_entries × 2 (counters and blocks)
 # - IP entries: ~150 bytes each × max_ip_entries
 # - Username entries: ~150 bytes each × max_username_entries
 #
@@ -1366,7 +1371,8 @@ auth_rate_limit.max_username_entries = 50000      # Max username tracking entrie
 # negative_ttl = "1m"                     # How long to cache failed auth attempts (default: 1m)
 #                                         # Helps mitigate brute force attacks by preventing repeated database queries
 #                                         # Note: Brute force protection itself is handled by protocol-level rate limiting
-# max_size = 50000                        # Maximum cached entries (default: 50000, LRU eviction)
+# max_size = 50000                        # Maximum cached entries (default: 50000). When full, the entry that expires
+#                                         # first makes room (an expired one, else the one with least time left)
 # cleanup_interval = "5m"                 # How often to remove expired entries (default: 5m)
 # positive_revalidation_window = "30s"    # Revalidation window for successful auth with different password (default: 30s)
 #                                         # Protects against unauthorized access when password changes
@@ -1790,7 +1796,9 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 # - Password formats: bcrypt ($2a$/$2b$/$2y$...), or Dovecot's {BLF-CRYPT} and {CRYPT} (bcrypt),
 #   {SSHA512} and {SHA512}; scheme and .b64/.base64/.hex suffix in any case, as in Dovecot
 # - If HTTP endpoint returns 404/3xx → respects lookup_local_users setting (user partitioning)
-# - If HTTP endpoint returns 401/403 → authentication rejected (no fallback); the way to refuse an account
+# - If HTTP endpoint returns 401/403 → authentication rejected (no fallback); the way to refuse an account.
+#   On a route-only lookup too: an LMTP recipient gets the user_not_found_response reply (never the
+#   local database), and with [[pool]] blocks the route is refused (temporary failure), never the default pool
 # - If HTTP endpoint returns other 4xx/5xx, or a 200 that is not JSON with address and password_hash
 #   → service unavailable (no verdict on the password), ALWAYS reject (no fallback); 5xx, 408, 429
 #   and malformed 200s also count toward the circuit breaker
@@ -1881,7 +1889,8 @@ lookup_local_users = true             # Check local DB when remote returns 404/3
 
 # user_not_found_response = "reject"  # LMTP ONLY: Response when user not found and lookup_local_users=false
                                       # Controls SMTP response code when remote_lookup returns 404 (user not found)
-                                      # and lookup_local_users=false (no database fallback)
+                                      # and lookup_local_users=false (no database fallback), and when it refuses
+                                      # the recipient with 401/403 (whatever lookup_local_users says)
                                       #
                                       # OPTIONS:
                                       #   "reject"   (default) → 550 5.1.1 User unknown (permanent failure)
@@ -1895,7 +1904,7 @@ lookup_local_users = true             # Check local DB when remote returns 404/3
                                       #
                                       # NOTE: This setting ONLY affects LMTP proxy behavior for unknown recipients.
                                       #       IMAP/POP3/ManageSieve proxies always reject unknown users (no retry semantics).
-                                      #       This setting is IGNORED when lookup_local_users=true (database fallback enabled).
+                                      #       For a 404 it is IGNORED when lookup_local_users=true (database fallback enabled).
                                       #
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
