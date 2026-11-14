@@ -685,7 +685,8 @@ curl "http://localhost:8081/user/mailboxes/INBOX/search?q=report&subject=quarter
 
 **Search Capabilities:**
 - Full-text search using PostgreSQL full-text search
-- Searches subject, from, to, and body
+- Matches `q` as a substring of the subject and of every From, To and Cc name and
+  address, and as words of the body
 - Case-insensitive
 - Supports combining filters
 

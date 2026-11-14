@@ -296,7 +296,9 @@ paths:
         - $ref: '#/components/parameters/MailboxName'
         - name: q
           in: query
-          description: Search query
+          description: |
+            Search query, matched case-insensitively as a substring of the subject and of
+            every From, To and Cc name and address, and as words of the body.
           required: true
           schema:
             type: string
