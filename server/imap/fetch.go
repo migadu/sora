@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/migadu/go-imap"
@@ -261,14 +262,10 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 		}
 	}
 
-	// Determine if this FETCH implicitly marks messages as \Seen (any non-PEEK body section)
-	markSeen := false
-	for _, bs := range options.BodySection {
-		if !bs.Peek {
-			markSeen = true
-			break
-		}
-	}
+	// Determine if this FETCH implicitly marks messages as \Seen: any BODY[] or
+	// BINARY[] that is not the .PEEK form (RFC 9051 §6.4.5).
+	markSeen := slices.ContainsFunc(options.BodySection, func(bs *imap.FetchItemBodySection) bool { return !bs.Peek }) ||
+		slices.ContainsFunc(options.BinarySection, func(bs *imap.FetchItemBinarySection) bool { return !bs.Peek })
 
 	// RFC 4314 §5.1.1: a FETCH that would implicitly set \Seen MUST NOT do so when the
 	// user lacks the 's' right on the mailbox. The owner always holds every right, so
