@@ -445,6 +445,12 @@ func handleConfigReload(current, next *config.Config) {
 	if err := next.Relay.Validate(); err != nil {
 		logger.Error("Config reload: [relay] is invalid and the server will not start with this config; the relay the server started with stays in use", "error", err)
 	}
+	// So is the relay worker with its [relay.queue] settings.
+	if next.Relay.IsQueueEnabled() {
+		if err := next.Relay.Queue.Validate(); err != nil {
+			logger.Error("Config reload: [relay.queue] is invalid and the server will not start with this config; the relay worker keeps the settings it started with", "error", err)
+		}
+	}
 }
 
 // loadAndValidateConfig loads configuration from file and validates all server configurations

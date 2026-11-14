@@ -819,7 +819,14 @@ func (exporter *Exporter) exportSubscriptions(accountID int64) error {
 		return fmt.Errorf("failed to fetch subscriptions for export: %w", err)
 	}
 
-	return os.WriteFile(subscriptionsPath, []byte(formatDovecotSubscriptions(names)), 0644)
+	// Dovecot's Maildir++ subscriptions file stores Modified UTF-7 mailbox names,
+	// matching parseDovecotSubscriptions + importedFolderName (DecodeModifiedUTF7) on import.
+	encoded := make([]string, len(names))
+	for i, name := range names {
+		encoded[i] = helpers.EncodeModifiedUTF7(name)
+	}
+
+	return os.WriteFile(subscriptionsPath, []byte(formatDovecotSubscriptions(encoded)), 0644)
 }
 
 // getProgressPrefix returns a progress prefix for log messages
