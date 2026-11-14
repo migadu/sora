@@ -70,14 +70,14 @@ func TestHeaderSearchCriteriaBindLiteralTerms(t *testing.T) {
 		criteria *imap.SearchCriteria
 		exprs    []string
 	}{
-		{"FROM", header("From"), []string{"m.from_email_sort", "m.from_name_sort", `split_part(COALESCE(m.extra_addresses, ''), E'\n', 1)`}},
-		{"TO", header("To"), []string{"m.to_email_sort", "m.to_name_sort", `split_part(COALESCE(m.extra_addresses, ''), E'\n', 2)`}},
-		{"CC", header("Cc"), []string{"m.cc_email_sort", `split_part(COALESCE(m.extra_addresses, ''), E'\n', 3)`}},
+		{"FROM", header("From"), []string{"m.from_email_sort", "m.from_name_sort", `split_part(m.extra_addresses, E'\n', 1)`}},
+		{"TO", header("To"), []string{"m.to_email_sort", "m.to_name_sort", `split_part(m.extra_addresses, E'\n', 2)`}},
+		{"CC", header("Cc"), []string{"m.cc_email_sort", `split_part(m.extra_addresses, E'\n', 3)`}},
 		{"SUBJECT", header("Subject"), []string{"LOWER(m.subject)"}},
 		{"HEADER References", header("References"), []string{`'<' || replace(LOWER(NULLIF(m."references", '')), ' ', '> <') || '>'`}},
 		{"HEADER In-Reply-To", header("In-Reply-To"), []string{`'<' || replace(LOWER(NULLIF(m.in_reply_to, '')), ' ', '> <') || '>'`}},
 		{"BCC", header("Bcc"), []string{"LOWER(r->>'email')", "LOWER(r->>'name')"}},
-		{"TEXT", &imap.SearchCriteria{Text: []string{"Support@Equishark.com"}}, []string{"LOWER(m.subject)", "m.from_email_sort", "m.to_name_sort", "m.cc_email_sort", "COALESCE(m.extra_addresses, '')"}},
+		{"TEXT", &imap.SearchCriteria{Text: []string{"Support@Equishark.com"}}, []string{"LOWER(m.subject)", "m.from_email_sort", "m.to_name_sort", "m.cc_email_sort", "m.extra_addresses"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
