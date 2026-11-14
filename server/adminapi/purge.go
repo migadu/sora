@@ -6,6 +6,7 @@ import (
 
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/server"
 )
 
 // handlePurgeAccount serves DELETE /admin/accounts/{email}?purge=true. It is a request:
@@ -18,6 +19,10 @@ func (s *Server) handlePurgeAccount(w http.ResponseWriter, r *http.Request, emai
 
 	accountID, requestedAt, err := s.rdb.RequestAccountPurgeWithRetry(ctx, email)
 	if err != nil {
+		if errors.Is(err, server.ErrInvalidAddress) {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, err.Error())
 			return
