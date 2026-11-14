@@ -67,9 +67,12 @@ var (
 // anyoneAllowed reports whether rights may be granted to "anyone": not when the
 // shared mailbox config in ctx has allow_anyone_identifier off (its default). A
 // caller without that config in ctx, a direct database caller, is not restricted.
+// The config's enabled does not matter: a grant needs a mailbox that is already
+// shared (is_shared), which a caller with sharing off (sora-admin with a config
+// without [shared_mailboxes], a node that had sharing turned off) still finds.
 func anyoneAllowed(ctx context.Context) bool {
 	cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config)
-	return !ok || cfg == nil || !cfg.SharedMailboxes.Enabled || cfg.SharedMailboxes.AllowAnyoneIdentifier
+	return !ok || cfg == nil || cfg.SharedMailboxes.AllowAnyoneIdentifier
 }
 
 // ErrInvalidACLRight is returned by ValidateACLRights for a character that is not
