@@ -48,7 +48,7 @@ type DatabaseEndpointConfig struct {
 	Password           string   `toml:"password"`
 	Name               string   `toml:"name"`
 	TLSMode            bool     `toml:"tls"`
-	MaxConnections     int      `toml:"max_connections"`      // Maximum number of connections in the pool
+	MaxConnections     int      `toml:"max_connections"`      // Maximum number of connections in the pool (per host; without [database.read] a write host has a second, read pool of the same size)
 	MinConnections     int      `toml:"min_connections"`      // Minimum number of connections in the pool (eagerly created on startup)
 	MinIdleConnections int      `toml:"min_idle_connections"` // Minimum number of idle connections (lazily maintained, superior to min_connections)
 	MaxConnLifetime    string   `toml:"max_conn_lifetime"`    // Maximum lifetime of a connection
@@ -68,6 +68,10 @@ type DatabaseConfig struct {
 	Write            *DatabaseEndpointConfig `toml:"write"`             // Write database configuration
 	Read             *DatabaseEndpointConfig `toml:"read"`              // Read database configuration (can have multiple hosts for load balancing)
 	PoolTypeOverride string                  `toml:"-"`                 // Internal: Override pool type in logs (not in config file)
+	// Internal (not in config file): with Read unset, serve reads from the write pool
+	// instead of opening a dedicated read pool to the same host. The resilient layer sets
+	// it for every host that does not serve both reads and writes.
+	ReadsShareWritePool bool `toml:"-"`
 }
 
 // GetMaxConnLifetime parses the max connection lifetime duration for an endpoint

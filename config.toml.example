@@ -93,6 +93,11 @@ tls = false                   # Enable TLS/SSL for database connection. Recommen
 
 # --- WRITE DATABASE CONNECTION POOL SETTINGS ---
 # Fine-tune write database connection management for optimal performance.
+# The settings apply per host and per pool. Without [database.read], each write host
+# also serves the reads through a second, dedicated pool with these same settings (so
+# writes cannot starve reads), and the process can open up to twice max_connections
+# (and keeps twice min_idle_connections) to that host. With [database.read], each
+# write host gets one pool.
 max_connections = 50            # Maximum connections in the write pool. Should be < PostgreSQL max_connections.
 min_connections = 0             # Minimum connections eagerly created on startup (default: 0 to avoid connection spikes).
 min_idle_connections = 5        # Minimum idle connections lazily maintained (recommended: 5-20 for low latency, superior to min_connections).
@@ -105,7 +110,7 @@ query_timeout = "30s"           # Per-endpoint timeout for individual database q
 # =============================================================================
 # Read replica database endpoint(s) for SELECT operations. Can specify multiple
 # hosts for load balancing across read replicas. If not configured, read
-# operations will use the write database connection pool.
+# operations use a dedicated read pool to each write host (see above).
 
 [database.read]
 hosts = ["localhost"]         # Database server hosts for read operations. Can specify multiple for load balancing.
@@ -117,6 +122,7 @@ tls = false                   # Enable TLS/SSL for read database connections.
 
 # --- READ DATABASE CONNECTION POOL SETTINGS ---
 # Fine-tune read database connection management for optimal performance.
+# Each read host gets one pool with these settings.
 max_connections = 100           # Maximum connections in the read pool. Can be higher than write pool.
 min_connections = 0             # Minimum connections eagerly created on startup (default: 0 to avoid connection spikes).
 min_idle_connections = 10       # Minimum idle connections lazily maintained (recommended: 10-50 for read-heavy workloads).
