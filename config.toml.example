@@ -1255,24 +1255,9 @@ limits.thread_max_messages = 50000
 # limits.preview_s3_burst = 200          # Back to back (default: min(200, positive preview_s3_per_min)).
 # limits.preview_s3_node_per_min = 3000  # For the whole server per minute (default: 3000, 0 = unlimited).
 # limits.preview_s3_max_size = "5mb"     # Largest message downloaded (unset or 0: [local_cache] max_object_size).
-limits.redirect_rate_limit = 100         # Maximum SIEVE redirects per user (default: 100, set to 0 to disable).
-limits.redirect_rate_window = "1h"       # Time window for redirect rate limiting (default: "1h"). Must be positive
-                                         # on lmtp and http_admin_api servers: sora refuses to start with a zero or
-                                         # negative window, and a SIGHUP reload with one keeps that server's running
-                                         # settings (disable the limit with redirect_rate_limit = 0). The cleaner keeps
-                                         # the redirect records for [cleanup] grace_period or the longest window of
-                                         # the LMTP and Admin API servers on the node that runs it, whichever is
-                                         # longer. A window longer than grace_period needs that window on every
-                                         # node with an imap, pop3 or lmtp server (they all run the cleaner).
-limits.max_redirect_hops = 2             # Max times one message may be redirected before suppression — mail-loop
-                                         # backstop, counted via the X-Sora-Loop header (default: 2; 1 = allow a
-                                         # single redirect then stop; 0 = unlimited). Delivered-To loop detection
-                                         # still applies regardless of this value.
-limits.max_auth_errors = 2               # Maximum authentication errors before disconnection (default: 2).
-                                         # Applies to proxy servers only (imap_proxy, pop3_proxy, managesieve_proxy).
-                                         # Protects against malformed commands and protocol abuse during authentication.
-                                         # Recommended: 2-5 for most deployments.
-                                         # Note: Backend servers use protocol libraries with built-in validation.
+# The Sieve redirect limits are set on lmtp and http_admin_api servers (see the LMTP example),
+# max_auth_errors on the proxies. Each limits key set on a server type that does not apply it
+# is ignored, with a warning at startup.
 
 # --- TIMEOUT CONFIGURATION ---
 # Multi-layered timeout protection against various DoS attacks
@@ -1421,6 +1406,24 @@ proxy_protocol_timeout = "5s"
 # --- MESSAGE SIZE LIMITING ---
 # Maximum size for incoming LMTP messages to prevent memory exhaustion attacks
 max_message_size = "50mb"     # Maximum message size (default: 50MB, 0 = unlimited)
+
+# --- SIEVE REDIRECT LIMITS ---
+# Applied when a delivery runs the recipient's Sieve script: by lmtp servers and by
+# http_admin_api servers (/admin/mail/deliver). Other server types ignore them, with a
+# warning at startup.
+limits.redirect_rate_limit = 100         # Maximum SIEVE redirects per user (default: 100, set to 0 to disable).
+limits.redirect_rate_window = "1h"       # Time window for redirect rate limiting (default: "1h"). Must be positive
+                                         # on lmtp and http_admin_api servers: sora refuses to start with a zero or
+                                         # negative window, and a SIGHUP reload with one keeps that server's running
+                                         # settings (disable the limit with redirect_rate_limit = 0). The cleaner keeps
+                                         # the redirect records for [cleanup] grace_period or the longest window of
+                                         # the LMTP and Admin API servers on the node that runs it, whichever is
+                                         # longer. A window longer than grace_period needs that window on every
+                                         # node with an imap, pop3 or lmtp server (they all run the cleaner).
+limits.max_redirect_hops = 2             # Max times one message may be redirected before suppression — mail-loop
+                                         # backstop, counted via the X-Sora-Loop header (default: 2; 1 = allow a
+                                         # single redirect then stop; 0 = unlimited). Delivered-To loop detection
+                                         # still applies regardless of this value.
 
 # --- TIMEOUT CONFIGURATION ---
 # The LMTP server's only connection timeout. absolute_session_timeout, min_bytes_per_minute,
@@ -1644,8 +1647,10 @@ addr = ":1143"                # Proxy listen address. Must be different from bac
 remote_addrs = ["backend1.example.com:143", "backend2.example.com:143", "backend3.example.com:143"]
 max_connections = 5000                  # Max connections to this proxy instance (aggregates multiple clients)
 max_connections_per_ip = 500            # Cluster-wide in cluster mode. High for corporate gateways (~100 users), catches DoS
-max_connections_per_user = 20           # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
-max_connections_per_user_per_ip = 8     # Per user per IP - slightly higher for proxies
+# The two per-user limits are counted by the cluster connection tracker: without [cluster]
+# they are not applied, and startup warns.
+max_connections_per_user = 20           # Cluster-wide limit per user (requires [cluster], 0 = unlimited)
+max_connections_per_user_per_ip = 8     # Per user per IP - slightly higher for proxies (requires [cluster])
 master_sasl_username = "proxyuser"
 master_sasl_password = "proxypass"
 
@@ -1750,6 +1755,13 @@ enable_affinity = true        # Enable user-to-backend affinity (requires [clust
 timeouts.command_timeout = "0"              # Idle timeout. Set to "0" to disable (REQUIRED for IMAP proxy; default when absent or invalid: 30m).
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration from connect to disconnect (default: 24h).
 timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
+
+# --- AUTHENTICATION ERROR LIMIT ---
+limits.max_auth_errors = 2                  # Number of protocol errors before authentication (unknown or malformed commands,
+                                            # logins refused without TLS) at which the proxy disconnects (default: 2).
+                                            # Wrong passwords do not count: auth_rate_limit handles those.
+                                            # Protects against protocol abuse during authentication. Recommended: 2-5.
+                                            # Only the imap_proxy, pop3_proxy and managesieve_proxy servers apply it.
 
 # --- HTTP-BASED USER ROUTING (REMOTE_LOOKUP) ---
 # Advanced feature for routing users to specific backend servers via HTTP API.
@@ -2108,8 +2120,8 @@ addr = ":1110"                # Proxy listen address. Must be different from bac
 remote_addrs = ["backend1.example.com:110", "backend2.example.com:110"]
 max_connections = 2000
 max_connections_per_ip = 200            # Cluster-wide in cluster mode. High for gateways, POP3 is typically sequential
-max_connections_per_user = 5            # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
-max_connections_per_user_per_ip = 3     # POP3 rarely needs multiple simultaneous connections
+max_connections_per_user = 5            # Cluster-wide limit per user (requires [cluster], 0 = unlimited)
+max_connections_per_user_per_ip = 3     # POP3 rarely needs multiple simultaneous connections (requires [cluster])
 master_sasl_username = "proxyuser"
 master_sasl_password = "proxypass"
 
@@ -2156,6 +2168,9 @@ timeouts.command_timeout = "0"              # Maximum idle time (default when ab
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24h)
 timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
 
+# --- AUTHENTICATION ERROR LIMIT ---
+limits.max_auth_errors = 2                  # Disconnect at this many protocol errors before authentication (default: 2). See the IMAP proxy example above.
+
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)
 
@@ -2171,8 +2186,8 @@ addr = ":14190"               # Proxy listen address. Must be different from bac
 remote_addrs = ["backend1.example.com:4190", "backend2.example.com:4190"]
 max_connections = 500
 max_connections_per_ip = 100            # Cluster-wide in cluster mode. Low volume protocol, moderate limit sufficient
-max_connections_per_user = 5            # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
-max_connections_per_user_per_ip = 3     # Administrative operations, low concurrency needed
+max_connections_per_user = 5            # Cluster-wide limit per user (requires [cluster], 0 = unlimited)
+max_connections_per_user_per_ip = 3     # Administrative operations, low concurrency needed (requires [cluster])
 insecure_auth = false                 # Allow plaintext auth. SECURITY: Should be false in production.
 master_sasl_username = "proxyuser"
 master_sasl_password = "proxypass"
@@ -2211,6 +2226,9 @@ enable_affinity = true        # Enable user-to-backend affinity (requires [clust
 timeouts.command_timeout = "0"              # Maximum idle time (default when absent or invalid: 3m)
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24h)
 timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
+
+# --- AUTHENTICATION ERROR LIMIT ---
+limits.max_auth_errors = 2                  # Disconnect at this many protocol errors before authentication (default: 2). See the IMAP proxy example above.
 
 # NOTE: SIEVE extensions are configured globally in the [sieve] section.
 # The proxy should match capabilities from backend servers.
@@ -2325,6 +2343,11 @@ tls_default_domain = ""       # [OPTIONAL] Default domain for SNI-less connectio
 tls_verify = false
 proxy_protocol = false        # Enable PROXY protocol support for HTTP API
 proxy_protocol_timeout = "5s"
+
+# Sieve redirect limits for /admin/mail/deliver, as on the LMTP server above:
+# limits.redirect_rate_limit = 100      # (default: 100, 0 = unlimited)
+# limits.redirect_rate_window = "1h"    # (default: "1h", must be positive)
+# limits.max_redirect_hops = 2          # (default: 2, 0 = unlimited)
 
 # NOTE: Uses global [relay] configuration for /admin/mail/deliver endpoint
 # NOTE: /admin/mail/deliver stages bodies through this node's upload worker, which runs only when the

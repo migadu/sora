@@ -61,7 +61,7 @@ You need the cluster when you want any of the following:
 
 | You want | Why it needs the cluster |
 |---|---|
-| `max_connections_per_user` or `max_connections_per_user_per_ip` on an IMAP, POP3 or ManageSieve **proxy** | A proxy only tracks per-user connections in cluster mode. Without the cluster these two keys have no effect on a proxy, even on a single proxy node. |
+| `max_connections_per_user` or `max_connections_per_user_per_ip` on an IMAP, POP3 or ManageSieve **proxy** | A proxy only tracks per-user connections in cluster mode. Without the cluster these two keys have no effect on a proxy, even on a single proxy node, and startup logs a warning naming them. |
 | To kick a user's proxy sessions with `sora-admin connections kick` or the admin API | The kick reaches proxy sessions only through the cluster's connection tracker. |
 | `enable_affinity = true` on a proxy | The affinity store only exists in cluster mode, with `[cluster.affinity] enabled = true`. |
 | Several nodes that use Let's Encrypt with one S3 bucket | Without the cluster every node orders and renews certificates on its own. See [TLS.md](TLS.md#8-lets-encrypt-in-a-cluster). |
