@@ -515,6 +515,13 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		return 0, errInMaintenance
 	}
 
+	if masterAuthUsed {
+		s.InfoLog("authentication successful", "address", userAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", time.Since(start).Seconds()))
+	}
+	// Counted before the connection limits: a login they refuse passed the credential
+	// check, and counts as a success, as on the IMAP and ManageSieve backends.
+	metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "success").Inc()
+
 	// The connection limits, also before the session takes the user: a login the tracker
 	// refuses is not logged in, so its close releases neither a count nor a tracker slot.
 	if err := s.registerConnection(accountID, userAddress.FullAddress()); err != nil {
@@ -531,11 +538,6 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	s.useMasterDB.Store(true)
 	s.mutex.Unlock()
 
-	if masterAuthUsed {
-		s.InfoLog("authentication successful", "address", userAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", time.Since(start).Seconds()))
-	}
-
-	metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "success").Inc()
 	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
 	s.authenticated.Store(true)
 

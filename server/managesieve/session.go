@@ -400,11 +400,11 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		targetAddress = &address
 	}
 
-	if err := s.completeAuthentication(ctx, *targetAddress, accountID, impersonating, start); err != nil {
-		return err
-	}
-	success = true
-	return nil
+	err := s.completeAuthentication(ctx, *targetAddress, accountID, impersonating, start)
+	// completeAuthentication counts the attempt a success once it holds the
+	// session lock, a login it then refuses at the connection limits included.
+	success = err == nil || errors.Is(err, errTooManyConnections)
+	return err
 }
 
 // Login implements the non-standard LOGIN verb the backend has historically
