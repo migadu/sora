@@ -119,8 +119,8 @@ func truncateHash(hash string) string {
 // destAccountID's S3 path, where the caller must first have made the body available (its
 // object, or the staging file of the upload restagePendingUploads queues). sourceHashes
 // holds, by source UID, the content hash each such row had when the caller did so, and
-// the row is copied only if it still has it: sora-admin import rekey renames a body's hash
-// (RekeyContentHash) under no lock the copy takes, and a copy under the new hash would
+// the row is copied only if it still has it: sora-admin import rekey can rename a body's
+// hash before this copy takes its source-account lock, and a copy under the new hash would
 // point at a key nothing wrote. A renamed source fails the copy with ErrCopySourceChanged
 // before anything commits. The check is made by the INSERT, the statement that copies the
 // rows' hashes; once inserted, a copy keeps its hash whatever happens to the source.
@@ -196,6 +196,11 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	// destination never ends up reporting two cases of the same keyword.
 	customFlagsCanon, err := db.canonicalizeMovedCustomFlags(ctx, tx, destMailboxID, messageIDs)
 	if err != nil {
+		return nil, nil, err
+	}
+
+	// From here to the commit a rekey must not rename a source: the INSERT reads its hash.
+	if err := lockRekeySources(ctx, tx, srcMailboxID, uids); err != nil {
 		return nil, nil, err
 	}
 
@@ -337,9 +342,10 @@ func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailbo
 // Callers skip it when every source row already belongs to the destination account. That
 // account's row for the body is then anchored by the source row itself, which stays in
 // messages (MOVE only expunges it, and the orphan sweep counts expunged rows), so the sweep
-// cannot delete the row and there is nothing to insert. The skip matters: the shared lock
-// below is one entry per distinct body in PostgreSQL's server-wide lock table, held until
-// commit, and a bulk same-account MOVE is the common case.
+// cannot delete the row and there is nothing to insert. A rekey, which renames the source
+// row's hash, waits for the copy (lockRekeySources) and so sees the copied rows too. The
+// skip matters: the shared lock below is one entry per distinct body in PostgreSQL's
+// server-wide lock table, held until commit, and a bulk same-account MOVE is the common case.
 //
 // Do not replace the lock with a "row already exists" pre-check. A row that exists can be an
 // orphan the sweep is about to delete, and the sweep cannot see the uncommitted message that

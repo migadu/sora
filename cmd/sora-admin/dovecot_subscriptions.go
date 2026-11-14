@@ -7,7 +7,8 @@ import (
 )
 
 // Dovecot's subscriptions file, as src/lib-storage/list/subscription-file.c reads and
-// writes it. A version 2 file starts with exactly dovecotSubscriptionsV2Header; each
+// writes it. Dovecot's version 2 header is dovecotSubscriptionsV2Header; this importer
+// also accepts it after CRLF conversion. Each
 // line after it is one mailbox name whose hierarchy levels are joined with TAB, each
 // level tab-escaped (str_append_tabescaped). A file without that header is the old
 // unversioned format, one storage name per line (index_storage_set_subscribed writes
@@ -15,26 +16,31 @@ import (
 // (src/lib-storage/list/mailbox-list-maildir.c).
 const dovecotSubscriptionsV2Header = "V\t2\n\n"
 
-// soraSubscriptionsHeader is what sora-admin export wrote before it followed Dovecot's
-// format: the version line with one newline, then '/'-separated names. Dovecot reads
-// such a file as unversioned; the importer reads it as sora-admin meant it.
-const soraSubscriptionsHeader = "V\t2\n"
+// dovecotSubscriptionsHeaderLine opens both Dovecot's version 2 format (followed by an
+// empty line) and what sora-admin export wrote before it followed Dovecot's format (the
+// version line with one newline, then '/'-separated names). Matching it after dropping
+// an optional CR handles files whose line endings were converted to CRLF.
+const dovecotSubscriptionsHeaderLine = "V\t2"
 
 // parseDovecotSubscriptions returns the mailbox names in a subscriptions file, with
 // their hierarchy levels joined by Sora's delimiter. The names are still in the
 // encoding of the maildir's folder names (modified UTF-7 for Dovecot).
 func parseDovecotSubscriptions(content string) []string {
 	delim := string(consts.MailboxDelimiter)
-	version2 := strings.HasPrefix(content, dovecotSubscriptionsV2Header)
+	version2 := false
 	// An unversioned Dovecot file separates levels with '.' (Maildir++), which the
 	// folder import, resolveMailboxName, turns into '/' in the directory names too.
 	unversioned := false
-	switch {
-	case version2:
-		content = content[len(dovecotSubscriptionsV2Header):]
-	case strings.HasPrefix(content, soraSubscriptionsHeader):
-		content = content[len(soraSubscriptionsHeader):]
-	default:
+	if firstLine, rest, ok := strings.Cut(content, "\n"); ok && strings.TrimSuffix(firstLine, "\r") == dovecotSubscriptionsHeaderLine {
+		if secondLine, afterBlank, ok := strings.Cut(rest, "\n"); ok && strings.TrimSuffix(secondLine, "\r") == "" {
+			version2 = true
+			content = afterBlank
+		} else {
+			content = rest
+		}
+	} else if strings.TrimSuffix(content, "\r") == dovecotSubscriptionsHeaderLine {
+		return nil
+	} else {
 		unversioned = true
 	}
 
