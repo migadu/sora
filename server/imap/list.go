@@ -363,7 +363,11 @@ func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.
 		attributes = append(attributes, imap.MailboxAttrNoSelect)
 	}
 
-	if serverCaps.Has(imap.CapChildren) {
+	// RFC 5258 §4: "If the CHILDREN return option is present, the server MUST
+	// return these attributes even if their computation is expensive." The
+	// option belongs to LIST-EXTENDED, which stays advertised when CHILDREN is
+	// disabled; without it a disabled CHILDREN keeps them off.
+	if serverCaps.Has(imap.CapChildren) || options.ReturnChildren {
 		if mbox.HasChildren {
 			attributes = append(attributes, imap.MailboxAttrHasChildren)
 		} else {
