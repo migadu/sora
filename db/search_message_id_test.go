@@ -155,11 +155,11 @@ func TestMessageIDSearchSQL(t *testing.T) {
 		equality  bool
 		wantBound string
 	}{
-		{"<Support@Equishark.com>", true, "support@equishark.com"},
-		{"Support@Equishark.com", false, "support@equishark.com"},
-		{"equishark", false, "equishark"},
+		{"<Support@Example.COM>", true, "support@example.com"},
+		{"Support@Example.COM", false, "support@example.com"},
+		{"example", false, "example"},
 		{"<support@", false, "<support@"},
-		{"@equishark.com>", false, "@equishark.com>"},
+		{"@example.com>", false, "@example.com>"},
 		{"", false, ""},
 		{"<>", false, "<>"},
 		{"<a> <b>", false, "<a> <b>"},
