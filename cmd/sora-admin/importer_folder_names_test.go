@@ -48,3 +48,19 @@ func TestPathsFileNamesFoldersLikeResolveMailboxName(t *testing.T) {
 	}
 	assert.ElementsMatch(t, []string{"INBOX", "Sent", "Work/Projects"}, got)
 }
+
+// TestEncodedPrintableASCIIIsNotDecoded: modified BASE64 must not encode printable
+// US-ASCII (RFC 3501 §5.1.3), so "&AC8-" is not a '/' that adds a level. The import
+// keeps such a folder's raw name and fix-utf7 refuses to decode the level.
+func TestEncodedPrintableASCIIIsNotDecoded(t *testing.T) {
+	name, err := importedFolderName("a&AC8-b")
+	require.NoError(t, err)
+	assert.Equal(t, "a&AC8-b", name)
+
+	name, err = importedFolderName("Work/&AGE-")
+	require.NoError(t, err)
+	assert.Equal(t, "Work/&AGE-", name)
+
+	_, err = decodeMailboxLevelUTF7("Parent/a&AC8-b")
+	assert.Error(t, err)
+}
