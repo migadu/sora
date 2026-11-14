@@ -1123,9 +1123,10 @@ paths:
             - Missing required field `email`
             - Neither `password` nor `password_hash` provided
             - Both `password` and `password_hash` provided (only one allowed)
+            - A `credentials` entry with a `password` whose `hash_type` is not `bcrypt` or `ssha512`
             - An invalid email address
             - A `password` longer than 72 bytes hashed with bcrypt (the default), bcrypt's limit
-            - In a `credentials` array: no or several `is_primary` entries, the same address twice, or an unknown `hash_type`
+            - In a `credentials` array: no or several `is_primary` entries, or the same address twice
           content:
             application/json:
               schema:
@@ -1624,6 +1625,12 @@ paths:
                   count:
                     type: integer
                     example: 2
+        '400':
+          description: The address does not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Account not found.
           content:

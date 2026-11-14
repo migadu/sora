@@ -258,33 +258,13 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 			}
 			param := nextParam()
 			args[param] = lowerValue
-			// An absent header yields NULL, which must be FALSE before NOT/OR
-			// combine it with other criteria. In particular NOT HEADER ... ""
-			// tests absence, while HEADER ... "" still tests presence.
+			// An absent header yields NULL; turn it into FALSE before NOT/OR.
 			conditions = append(conditions, "COALESCE("+substringCond(msgIDListExpr(column), "@"+param)+", FALSE)")
-		case "from":
+		case "from", "to", "cc":
+			// Match the first address's sort columns and this header's extra section.
 			param := nextParam()
-			// Support partial matching on both email address and display name
-			// This allows searching for "peter" to find "peter@whatever.com" or "Peter Smith"
-			// Note: *_sort columns are already lowercase
 			args[param] = lowerValue
-			conditions = append(conditions, fmt.Sprintf("(%s OR %s)",
-				substringCond(datePrefix+"from_email_sort", "@"+param),
-				substringCond(datePrefix+"from_name_sort", "@"+param)))
-		case "to":
-			param := nextParam()
-			// Support partial matching on both email address and display name
-			// Note: *_sort columns are already lowercase
-			args[param] = lowerValue
-			conditions = append(conditions, fmt.Sprintf("(%s OR %s)",
-				substringCond(datePrefix+"to_email_sort", "@"+param),
-				substringCond(datePrefix+"to_name_sort", "@"+param)))
-		case "cc":
-			param := nextParam()
-			// Support partial email matching using indexed cc_email_sort column
-			// Note: CC doesn't have a name_sort column, only email
-			args[param] = lowerValue
-			conditions = append(conditions, substringCond(datePrefix+"cc_email_sort", "@"+param))
+			conditions = append(conditions, addressHeaderCond(datePrefix, lowerKey, "@"+param))
 		case "bcc", "reply-to", "sender":
 			// No dedicated columns: recipients_json holds every address of these
 			// headers, typed by header name and in its original case. The term is a
@@ -594,7 +574,7 @@ func criteriaContainsFTS(c *imap.SearchCriteria) bool {
 // mailbox the planner degrades to a full mailbox scan with a per-row probe into
 // the FTS table (measured at 24s vs 13.6s for the UNION form). The rewrite splits the
 // term into a header branch (an index-only scan of the mailbox's rows on
-// idx_messages_mailbox_headers; see substringCond) UNION an indexable body branch (FTS GIN
+// idx_messages_mailbox_headers_v2; see substringCond) UNION an indexable body branch (FTS GIN
 // on messages_fts_v2) that can be prefiltered per account.
 //
 // Eligibility is intentionally conservative — exactly one top-level TEXT term, no
@@ -653,7 +633,8 @@ func buildTextSearchBranches(text string, args pgx.NamedArgs, paramPrefix string
 // address) and does not depend on the mailbox at all, so it can never be bounded by the
 // owner's data. strpos is not indexable, which forces the planner onto a mailbox index.
 // Filtering the heap that way reads ~3.5 KB of row per message, which is the 38 s above;
-// idx_messages_mailbox_headers (migration 000052) carries every column the lightweight
+// idx_messages_mailbox_headers_v2 (migration 000059, replacing 000052's
+// idx_messages_mailbox_headers) carries every column the lightweight
 // search projection and these predicates reference, so the same statement runs as an Index
 // Only Scan over ~200 bytes per message instead (TestHeaderSearchIsIndexOnly). Keep it that
 // way: a messages.* column referenced by the lightweight search that is not in the index
@@ -681,8 +662,9 @@ func msgIDListExpr(column string) string {
 }
 
 // headerSubstringCond is the TEXT header predicate: the bound term as a substring of any
-// searchable header column (subject plus the from/to/cc sort columns). prefix is the
-// messages table alias with its trailing dot, or "" when the columns are unqualified.
+// searchable header column (subject, the from/to/cc sort columns and every other From/To/Cc
+// address in extra_addresses). prefix is the messages table alias with its trailing dot, or
+// "" when the columns are unqualified.
 func headerSubstringCond(prefix, placeholder string) string {
 	return "(" + strings.Join([]string{
 		substringCond(fmt.Sprintf("LOWER(%ssubject)", prefix), placeholder),
@@ -691,7 +673,36 @@ func headerSubstringCond(prefix, placeholder string) string {
 		substringCond(prefix+"to_email_sort", placeholder),
 		substringCond(prefix+"to_name_sort", placeholder),
 		substringCond(prefix+"cc_email_sort", placeholder),
+		substringCond(fmt.Sprintf("COALESCE(%sextra_addresses, '')", prefix), placeholder),
 	}, " OR ") + ")"
+}
+
+// addressHeaderSortColumns are the first-address columns of each address header, and
+// addressHeaderSection its section of extra_addresses (see extraAddressesSectionSep).
+var (
+	addressHeaderSortColumns = map[string][]string{
+		"from": {"from_email_sort", "from_name_sort"},
+		"to":   {"to_email_sort", "to_name_sort"},
+		"cc":   {"cc_email_sort"},
+	}
+	addressHeaderSection = map[string]int{"from": 1, "to": 2, "cc": 3}
+)
+
+// addressHeaderCond is the FROM/TO/CC predicate: the bound term as a substring of the
+// header's first name or address, or of any other one in its extra_addresses section.
+// header is "from", "to" or "cc"; prefix as for headerSubstringCond.
+//
+// The section is split out of the column COALESCEd to the empty string: a NULL column (a
+// row written before migration 000059) then means "no other addresses" and the predicate
+// stays two-valued, so NOT FROM/TO/CC keeps those rows instead of dropping them on a NULL.
+func addressHeaderCond(prefix, header, placeholder string) string {
+	var conds []string
+	for _, col := range addressHeaderSortColumns[header] {
+		conds = append(conds, substringCond(prefix+col, placeholder))
+	}
+	section := fmt.Sprintf(`split_part(COALESCE(%sextra_addresses, ''), E'\n', %d)`, prefix, addressHeaderSection[header])
+	conds = append(conds, substringCond(section, placeholder))
+	return "(" + strings.Join(conds, " OR ") + ")"
 }
 
 // Sort columns carried through the UNION CTE (in addition to the branch's data
