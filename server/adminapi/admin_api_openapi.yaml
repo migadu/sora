@@ -220,37 +220,65 @@ components:
 
     ConnectionInfo:
       type: object
+      description: "An account with sessions on one of this node's connection trackers: one entry per account and tracker, not per session. Accounts this node knows only through gossip are not listed."
       properties:
-        ID:
-          type: integer
-          format: int64
-        AccountID:
-          type: integer
-          format: int64
-        Protocol:
+        protocol:
           type: string
+          description: "The tracker key up to its first dash."
           example: "IMAP"
-        ClientAddr:
+        instance:
           type: string
-          example: "192.168.1.100:54321"
-        ServerAddr:
+          description: "The tracker key: <PROTOCOL>-<server name> on a backend, <PROTOCOL>-<host name>-<server name> on a proxy."
+          example: "IMAP-node1-imap-proxy"
+        account_id:
+          type: integer
+          format: int64
+          example: 123
+        email:
           type: string
-          example: "10.0.1.10:143"
-        InstanceID:
-          type: string
-          example: "sora-instance-1"
-        ConnectedAt:
-          type: string
-          format: date-time
-        LastActivity:
-          type: string
-          format: date-time
-        ShouldTerminate:
-          type: boolean
-        Email:
-          type: string
-          format: email
+          description: "Address the account's sessions logged in with."
           example: "user@example.com"
+        local_count:
+          type: integer
+          description: "The account's sessions on this tracker."
+          example: 2
+        total_count:
+          type: integer
+          description: "local_count plus the account's sessions on the same protocol that other nodes' trackers report through gossip."
+          example: 3
+        last_update:
+          type: string
+          format: date-time
+          description: "When the tracker last changed this account's counts."
+
+    UserConnectionInfo:
+      type: object
+      description: "The account on one of this node's connection trackers. Unlike ConnectionInfo, protocol is the whole tracker key, and a tracker that knows the account only through gossip is listed too, with local_count 0."
+      properties:
+        protocol:
+          type: string
+          description: "The tracker key: <PROTOCOL>-<server name> on a backend, <PROTOCOL>-<host name>-<server name> on a proxy."
+          example: "IMAP-node1-imap-proxy"
+        account_id:
+          type: integer
+          format: int64
+          example: 123
+        email:
+          type: string
+          description: "Address the account's sessions logged in with."
+          example: "user@example.com"
+        local_count:
+          type: integer
+          description: "The account's sessions on this tracker."
+          example: 2
+        total_count:
+          type: integer
+          description: "local_count plus the account's sessions on the same protocol that other nodes' trackers report through gossip."
+          example: 3
+        last_update:
+          type: string
+          format: date-time
+          description: "When the tracker last changed this account's counts."
 
     ConnectionStats:
       type: object
@@ -1632,10 +1660,11 @@ paths:
     get:
       tags:
         - Connection Management
-      summary: List all active connections
+      summary: List the accounts with sessions on this node
+      description: One entry per account and connection tracker on this node; local_count is the number of sessions.
       responses:
         '200':
-          description: A list of active connections.
+          description: The accounts with sessions on this node's connection trackers.
           content:
             application/json:
               schema:
@@ -1647,6 +1676,13 @@ paths:
                       $ref: '#/components/schemas/ConnectionInfo'
                   count:
                     type: integer
+                    description: Number of entries in connections.
+                  source:
+                    type: string
+                    example: "in-memory connection tracker"
+                  note:
+                    type: string
+                    description: Present, with no entries, when this node has no connection trackers.
         '500':
           description: Internal server error.
           content:
@@ -1715,6 +1751,7 @@ paths:
       tags:
         - Connection Management
       summary: Get connections for a specific user
+      description: One entry per connection tracker on this node that knows the account, matched by the address the sessions logged in with (case-insensitive).
       parameters:
         - name: email
           in: path
@@ -1724,7 +1761,7 @@ paths:
             format: email
       responses:
         '200':
-          description: A list of connections for the user.
+          description: The user's entries on this node's connection trackers.
           content:
             application/json:
               schema:
@@ -1736,9 +1773,16 @@ paths:
                   connections:
                     type: array
                     items:
-                      $ref: '#/components/schemas/ConnectionInfo'
+                      $ref: '#/components/schemas/UserConnectionInfo'
                   count:
                     type: integer
+                    description: Number of entries in connections.
+                  source:
+                    type: string
+                    example: "in-memory connection tracker"
+                  note:
+                    type: string
+                    description: Present, with no entries, when this node has no connection trackers.
         '500':
           description: Internal server error.
           content:
