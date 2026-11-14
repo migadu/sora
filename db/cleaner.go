@@ -51,11 +51,24 @@ func (d *Database) ReleaseCleanupLock(ctx context.Context, tx pgx.Tx) error {
 	return nil
 }
 
-// GetS3ObjectLockID generates a stable int64 lock ID for a given object pair.
-// Uses FNV-1a to ensure consistency across nodes.
-func GetS3ObjectLockID(accountID int64, contentHash string) int64 {
+// GetS3ObjectLockID returns the advisory lock of the stored bodies with this content hash.
+// Every S3 delete holds it across its reference re-check and the delete (the cleaner and
+// the account purge, sora-admin import rekey), and everything that makes a row point at
+// the object or writes it takes it first (the uploader's write gate, restore,
+// cross-account COPY, rekey's new object), so a claim is either seen by the re-check or
+// made after the delete.
+//
+// The account does not enter the lock. An object is <s3_domain>/<s3_localpart>/<hash>,
+// keyed by the address a row's account had when the row was written, so rows of
+// different accounts can point at one object: an address that moved to another account
+// brings that account's new rows onto the keys of the mail stored under it. A lock per
+// (account, hash) let a claim made for one account run alongside a delete made for
+// another, which then removed the body under the new row (#557). Bodies stored under
+// other keys with the same hash share the lock as well; that only serializes them.
+// FNV-1a keeps it the same on every node.
+func GetS3ObjectLockID(_ int64, contentHash string) int64 {
 	h := fnv.New64a()
-	h.Write([]byte(fmt.Sprintf("%d:%s", accountID, contentHash)))
+	h.Write([]byte(contentHash))
 	return int64(h.Sum64())
 }
 
