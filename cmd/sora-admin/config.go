@@ -101,71 +101,18 @@ func handleConfigValidate(_ context.Context) {
 		os.Exit(1)
 	}
 
-	// Validate all server configurations
-	allServers := cfg.GetAllServers()
-
-	if len(allServers) == 0 {
-		fmt.Printf("[WARN] Warning: No servers configured\n")
-		fmt.Printf("   Please configure at least one server in the config file\n\n")
+	// The same checks the server runs before it starts anything.
+	problems := cfg.Validate()
+	for _, p := range problems {
+		fmt.Printf("[FAIL] %s:\n   %v\n", p.Section, p.Err)
 	}
-
-	hasErrors := false
-	for _, server := range allServers {
-		if err := server.Validate(); err != nil {
-			fmt.Printf("[FAIL] Server '%s' validation failed:\n", server.Name)
-			fmt.Printf("   %v\n", err)
-			hasErrors = true
-		}
-	}
-
-	if err := cfg.ValidateTrustedNetworks(); err != nil {
-		fmt.Printf("[FAIL] trusted_networks validation failed:\n   %v\n", err)
-		hasErrors = true
-	}
-
-	if err := cfg.Relay.Validate(); err != nil {
-		fmt.Printf("[FAIL] [relay] validation failed:\n")
-		fmt.Printf("   %v\n", err)
-		hasErrors = true
-	}
-
-	if err := cfg.Cleanup.Validate(); err != nil {
-		fmt.Printf("[FAIL] [cleanup] validation failed:\n")
-		fmt.Printf("   %v\n", err)
-		hasErrors = true
-	}
-
-	// Check for server name conflicts. A missing name or addr was reported above.
-	serverNames := make(map[string]bool)
-	serverAddresses := make(map[string]string) // addr -> server name
-	for _, server := range allServers {
-		if server.Name == "" || server.Addr == "" {
-			continue
-		}
-		if serverNames[server.Name] {
-			fmt.Printf("[FAIL] Duplicate server name '%s' found\n", server.Name)
-			fmt.Printf("   Each server must have a unique name\n")
-			hasErrors = true
-		}
-		serverNames[server.Name] = true
-
-		// Check for address conflicts
-		if existingServerName, exists := serverAddresses[server.Addr]; exists {
-			fmt.Printf("[FAIL] Duplicate server address '%s' found\n", server.Addr)
-			fmt.Printf("   Server '%s' and '%s' cannot bind to the same address\n",
-				existingServerName, server.Name)
-			hasErrors = true
-		}
-		serverAddresses[server.Addr] = server.Name
-	}
-
-	if hasErrors {
+	if len(problems) > 0 {
 		fmt.Printf("\n[FAIL] Configuration validation FAILED with errors\n")
 		os.Exit(1)
 	}
 
 	fmt.Printf("[OK] Configuration is valid!\n")
-	if len(allServers) > 0 {
+	if allServers := cfg.GetAllServers(); len(allServers) > 0 {
 		fmt.Printf("\nConfigured servers:\n")
 		for _, server := range allServers {
 			fmt.Printf("  - %s listening on %s\n", server.Name, server.Addr)
@@ -276,8 +223,10 @@ Description:
   - Detecting duplicate keys (warns and uses first occurrence)
   - Detecting unknown/deprecated keys (warns)
   - Detecting common typos (e.g., 'f' instead of 'false')
-  - Validating server configurations
-  - Checking for conflicts (duplicate names, addresses)
+  - Running the checks the server makes before it starts: the [[server]]
+    blocks (at least one; no duplicate names or addresses), [[pool]], [relay],
+    trusted_networks, [shared_mailboxes], and [uploader] and [cleanup] when a
+    mail backend (imap, lmtp, pop3) runs. Every problem is reported.
 
   Exit codes:
     0 - Configuration is valid (warnings OK)
