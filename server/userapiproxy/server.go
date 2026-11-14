@@ -957,7 +957,13 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route back
 	// The backend did not answer (the default handler's bare 502): ReverseProxy calls this
 	// before it has copied any backend header, so the response is the proxy's own.
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		logger.Warn("User API Proxy: Backend request failed", "name", s.name, "backend", route.addr, "error", err)
+		if r.Context().Err() != nil {
+			// The client went away (or the server is stopping) before the backend
+			// answered: no backend failed, and nobody reads the 502.
+			logger.Debug("User API Proxy: Client gone before the backend answered", "name", s.name, "backend", route.addr, "error", err)
+		} else {
+			logger.Warn("User API Proxy: Backend request failed", "name", s.name, "backend", route.addr, "error", err)
+		}
 		s.writeError(w, r, "Bad gateway", http.StatusBadGateway)
 	}
 

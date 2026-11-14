@@ -1,16 +1,21 @@
 package userapiproxy
 
 import (
+	"bytes"
+	"context"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/userapi"
@@ -255,5 +260,74 @@ func TestUserAPIProxy_ReloadAllowedOrigins(t *testing.T) {
 	}
 	if got := allowOrigin(); got != "" {
 		t.Errorf("after a reload clearing allowed_origins: Access-Control-Allow-Origin = %q, want none", got)
+	}
+}
+
+// syncBuffer is a bytes.Buffer the logger and the test can use at once.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// The 502 handler is also called when the client goes away before the backend answers
+// (a browser navigating away, an aborted fetch). That is no backend failure: it must not
+// be logged as one at WARN, while a backend that cannot be reached still is.
+func TestUserAPIProxy_ClientGoneIsNotLoggedAsBackendFailure(t *testing.T) {
+	logs := &syncBuffer{}
+	prev := logger.Swap(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { logger.Swap(prev) })
+	valid := corsTestToken(t, time.Hour)
+	get := func(handler http.Handler, ctx context.Context) {
+		r := httptest.NewRequest(http.MethodGet, "/user/mailboxes", nil).WithContext(ctx)
+		r.Header.Set("Origin", corsTestOrigin)
+		r.Header.Set("Authorization", "Bearer "+valid)
+		handler.ServeHTTP(httptest.NewRecorder(), r)
+	}
+	warned := func(backend string) bool {
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(line, "level=WARN") && strings.Contains(line, backend) {
+				return true
+			}
+		}
+		return false
+	}
+
+	arrived := make(chan struct{}, 1)
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrived <- struct{}{}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(slow.Close)
+	slowAddr := strings.TrimPrefix(slow.URL, "http://")
+	s, m := newCORSTestProxy(t, slowAddr, nil)
+	m.Set(nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		<-arrived
+		cancel()
+	}()
+	get(s.setupHandler(), ctx)
+	if warned(slowAddr) {
+		t.Errorf("client gone before the backend answered: logged at WARN:\n%s", logs.String())
+	}
+
+	dead := deadBackend(t)
+	s, m = newCORSTestProxy(t, dead, nil)
+	m.Set(nil)
+	get(s.setupHandler(), t.Context())
+	if !warned(dead) {
+		t.Errorf("unreachable backend: no WARN logged:\n%s", logs.String())
 	}
 }
