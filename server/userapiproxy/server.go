@@ -519,7 +519,7 @@ func (s *Server) setupHandler() http.Handler {
 			claims, err := s.extractAndValidateToken(r)
 			if err != nil {
 				logger.Warn("User API Proxy: Authentication failed", "name", s.name, "path", r.URL.Path, "error", err)
-				s.writeError(w, r, "Unauthorized", http.StatusUnauthorized)
+				s.writeError(w, r, unauthorizedMessage(err), http.StatusUnauthorized)
 				return
 			}
 
@@ -565,13 +565,21 @@ func (s *Server) setupHandler() http.Handler {
 }
 
 // writeError answers r with an error the proxy writes itself, no backend having answered.
-// It carries the CORS headers of the proxy's allowed_origins, as the backend's own errors
-// carry the backend's: without them a browser hands the page a network error instead of
-// the status, and a web client cannot tell an expired token from an outage. A forwarded
-// response carries the backend's CORS headers and must get none here.
+// The body is the User API's error, {"error": msg} as application/json (the backend's
+// writeError, docs/user-api.md "Error Response Format"), so a client reads it as it reads
+// the backend's. It carries the CORS headers of the proxy's allowed_origins, as the
+// backend's own errors carry the backend's: without them a browser hands the page a
+// network error instead of the status, and a web client cannot tell an expired token from
+// an outage. A forwarded response carries the backend's CORS headers and must get none here.
 func (s *Server) writeError(w http.ResponseWriter, r *http.Request, msg string, code int) {
-	server.SetCORSHeaders(w.Header(), r.Header.Get("Origin"), s.settings.Load().allowedOrigins)
-	http.Error(w, msg, code)
+	h := w.Header()
+	server.SetCORSHeaders(h, r.Header.Get("Origin"), s.settings.Load().allowedOrigins)
+	h.Set("Content-Type", "application/json")
+	h.Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(code)
+	if err := json.NewEncoder(w).Encode(map[string]string{"error": msg}); err != nil {
+		logger.Debug("User API Proxy: Failed to write error response", "name", s.name, "status", code, "error", err)
+	}
 }
 
 // isCORSPreflight reports whether r is a CORS-preflight request: an OPTIONS request with
@@ -1047,17 +1055,37 @@ func (s *Server) validateToken(tokenString string) (*JWTClaims, error) {
 	return nil, fmt.Errorf("invalid token claims")
 }
 
+// The refusals of extractAndValidateToken that unauthorizedMessage tells apart.
+var (
+	errNoAuthHeader  = errors.New("authorization header required")
+	errNotBearerAuth = errors.New("authorization header must be 'Bearer <token>'")
+)
+
+// unauthorizedMessage is the 401 message for a token extractAndValidateToken refused with
+// err: the User API's own for the same refusal (userapi jwtAuthMiddleware), so a token the
+// proxy refuses is answered as a backend answers it.
+func unauthorizedMessage(err error) string {
+	switch {
+	case errors.Is(err, errNoAuthHeader):
+		return "Authorization header required"
+	case errors.Is(err, errNotBearerAuth):
+		return "Authorization header must be 'Bearer <token>'"
+	default:
+		return "Invalid or expired token"
+	}
+}
+
 // extractAndValidateToken extracts and validates JWT token from request
 func (s *Server) extractAndValidateToken(r *http.Request) (*JWTClaims, error) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
-		return nil, fmt.Errorf("authorization header required")
+		return nil, errNoAuthHeader
 	}
 
 	// Extract token from "Bearer <token>"
 	parts := strings.SplitN(authHeader, " ", 2)
 	if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-		return nil, fmt.Errorf("authorization header must be 'Bearer <token>'")
+		return nil, errNotBearerAuth
 	}
 
 	tokenString := parts[1]
