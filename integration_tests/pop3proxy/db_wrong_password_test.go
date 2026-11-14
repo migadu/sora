@@ -29,12 +29,13 @@ func TestPOP3ProxyDBWrongPasswordCachedForEveryHashScheme(t *testing.T) {
 	for _, hashType := range []string{"bcrypt", "ssha512", "sha512"} {
 		t.Run(hashType, func(t *testing.T) {
 			email := fmt.Sprintf("wrong-pw-%s-%d@example.com", hashType, time.Now().UnixNano())
-			if _, err := rdb.CreateAccountWithRetry(context.Background(), db.CreateAccountRequest{
-				Email:     email,
-				Password:  "right-password",
-				HashType:  hashType,
-				IsPrimary: true,
-			}); err != nil {
+			req := db.CreateAccountRequest{Email: email, Password: "right-password", HashType: hashType, IsPrimary: true}
+			if hashType == "sha512" {
+				// New passwords are no longer hashed with unsalted SHA-512 (#446): a
+				// legacy credential arrives pre-computed.
+				req = db.CreateAccountRequest{Email: email, PasswordHash: db.GenerateSHA512Hash("right-password"), IsPrimary: true}
+			}
+			if _, err := rdb.CreateAccountWithRetry(context.Background(), req); err != nil {
 				t.Fatalf("Failed to create %s account: %v", hashType, err)
 			}
 

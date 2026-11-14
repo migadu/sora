@@ -24,7 +24,11 @@ func TestClassifyDBAuthFailure(t *testing.T) {
 		{"unknown address", consts.ErrUserNotFound, "user_not_found", true},
 		{"wrong SSHA512 password", db.VerifyPassword(ssha512, "wrong"), "invalid_password", true},
 		{"wrong SHA512 password", db.VerifyPassword(db.GenerateSHA512Hash("secret"), "wrong"), "invalid_password", true},
-		{"unparseable stored hash", db.VerifyPassword("{SSHA512}tooshort", "secret"), "transient_error", false},
+		// A stored hash that cannot be checked is neither a wrong password nor a database
+		// failure: it has its own reason, and is not cached.
+		{"unparseable stored hash", db.VerifyPassword("{SSHA512}tooshort", "secret"), "unverifiable_hash", false},
+		{"unsupported scheme", db.VerifyPassword("{SHA512-CRYPT}$6$saltsaltsaltsalt$Uz0B733KLAcpeAFT5hlALRwUMzwqxSoBO9VG7Ph8v7auZDaXL8PutBQPqOVLMvwy0rORlpwlXHm83Z4uAhgLB0", "secret"), "unverifiable_hash", false},
+		{"password in the hash field", db.VerifyPassword("Secret-2026", "Secret-2026"), "unverifiable_hash", false},
 		{"database error", fmt.Errorf("database error during authentication: %w", errors.New("connection refused")), "transient_error", false},
 	}
 	for _, tt := range tests {
