@@ -330,7 +330,7 @@ type IMAPServer struct {
 	idSupportURL string
 
 	// Command timeout and throughput enforcement
-	authIdleTimeout time.Duration    // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
+	authIdleTimeout time.Duration    // Idle timeout during authentication phase (pre-auth only, 0 = go-imap default of 30s)
 	commandTimeouts *CommandTimeouts // Per-command hard execution timeouts (nil = use defaults)
 
 	// The settings ReloadConfig replaces; see reloadableSettings.
@@ -409,7 +409,7 @@ type IMAPServerOptions struct {
 	MetadataMaxEntriesPerServer  int
 	MetadataMaxTotalSize         int
 	// Command timeout and throughput enforcement
-	AuthIdleTimeout         time.Duration            // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
+	AuthIdleTimeout         time.Duration            // Idle timeout during authentication phase (pre-auth only, 0 = go-imap default of 30s)
 	CommandTimeout          time.Duration            // Maximum idle time before disconnection
 	CommandTimeoutOverrides map[string]time.Duration // Per-command hard execution timeouts (overrides defaults)
 	AbsoluteSessionTimeout  time.Duration            // Maximum total session duration (0 = no absolute limit)
@@ -853,6 +853,10 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		NewSession:   s.newSession,
 		Logger:       log.Default(),
 		InsecureAuth: options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured
+		// go-imap owns the read deadline and re-arms it before every command;
+		// this is its wait for the next command until the client has
+		// authenticated. Afterwards SoraConn's checker applies command_timeout.
+		AuthIdleTimeout: s.authIdleTimeout,
 		// IsTLS unwraps Sora's connection layers (connectionLimitingConn ->
 		// SoraTLSConn -> *tls.Conn) to detect implicit TLS. Without it, go-imap's
 		// default `conn.(*tls.Conn)` assertion fails on our wrapped connections
@@ -969,13 +973,6 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 
 	// Extract underlying net.Conn for setting timeouts and proxy protocol handling
 	netConn := conn.NetConn()
-
-	// Set auth idle timeout if configured (applies during pre-auth phase only)
-	if s.authIdleTimeout > 0 {
-		if err := netConn.SetReadDeadline(time.Now().Add(s.authIdleTimeout)); err != nil {
-			logger.Warn("IMAP: Failed to set auth idle timeout", "name", s.name, "error", err)
-		}
-	}
 
 	// Initialize session with full server capabilities
 	// These will be filtered in GetCapabilities() when JA4 fingerprint becomes available
