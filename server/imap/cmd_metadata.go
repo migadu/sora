@@ -22,6 +22,18 @@ func (s *IMAPSession) GetMetadata(ctx context.Context, mailbox string, entries [
 
 	s.DebugLog("GETMETADATA command", "mailbox", mailbox, "entries", entries)
 
+	// Canonicalise (case-fold) and validate entry names first: RFC 5464 §3.2
+	// makes entry names case-insensitive and requires BAD for invalid entry
+	// names in any IMAP command, before rejecting wildcard mailbox names with NO.
+	canonEntries := make([]string, len(entries))
+	for i, entry := range entries {
+		canonEntries[i] = canonicalMetadataEntry(entry)
+		if err := validateMetadataEntry(canonEntries[i]); err != nil {
+			return nil, err
+		}
+	}
+	entries = canonEntries
+
 	// RFC 5464 does not support wildcard mailbox names in GETMETADATA
 	// SnappyMail webmail incorrectly sends "*" as the mailbox parameter
 	// Reject wildcards with a clear error message
@@ -33,17 +45,6 @@ func (s *IMAPSession) GetMetadata(ctx context.Context, mailbox string, entries [
 			Text: "GETMETADATA does not support wildcard mailbox names. Use empty string \"\" for server metadata or a specific mailbox name.",
 		}
 	}
-
-	// Canonicalise (case-fold) and validate entry names. RFC 5464 §3.2 makes
-	// entry names case-insensitive, so we query using the canonical form.
-	canonEntries := make([]string, len(entries))
-	for i, entry := range entries {
-		canonEntries[i] = canonicalMetadataEntry(entry)
-		if err := validateMetadataEntry(canonEntries[i]); err != nil {
-			return nil, err
-		}
-	}
-	entries = canonEntries
 
 	var mailboxID *int64
 	var mailboxName string
