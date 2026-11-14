@@ -13,6 +13,10 @@
 -- A row that already exists is left as it is. It needs messages_fts_v2: on a database between
 -- 23 and 49, migrate first.
 --
+-- Run it BEFORE `sora-admin import rekey`. Rekey moves a body imported under its SHA-256
+-- digest to its BLAKE3 hash in messages and messages_fts_v2, but not in message_contents, so
+-- afterwards the vector stored under the old hash matches no message and is not copied.
+--
 -- WHO NEEDS IT. A database that ran 23 before #791, unless the vectors were copied out of
 -- band at the time. This counts, in a sample of message_contents, the bodies that a message's
 -- mailbox owner has no messages_fts_v2 row for. A nonzero result confirms missing rows;
