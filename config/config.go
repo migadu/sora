@@ -319,7 +319,7 @@ type TLSLetsEncryptConfig struct {
 func (c *TLSLetsEncryptConfig) normalizeDomains() {
 	var domains []string
 	for _, configured := range c.Domains {
-		name, err := autocertName(configured)
+		name, err := AutocertName(configured)
 		if err != nil {
 			warnf("[tls.letsencrypt] domains: ignoring %q, no certificate can be served for it: %v", configured, err)
 			continue
@@ -331,7 +331,7 @@ func (c *TLSLetsEncryptConfig) normalizeDomains() {
 	c.Domains = domains
 
 	if c.DefaultDomain != "" {
-		name, err := autocertName(c.DefaultDomain)
+		name, err := AutocertName(c.DefaultDomain)
 		if err != nil {
 			warnf("[tls.letsencrypt] default_domain: ignoring %q, clients without SNI get the first domain's certificate: %v", c.DefaultDomain, err)
 		}
@@ -339,11 +339,11 @@ func (c *TLSLetsEncryptConfig) normalizeDomains() {
 	}
 }
 
-// autocertName returns the name autocert keeps a domain's certificates under: the server
+// AutocertName returns the name autocert keeps a domain's certificates under: the server
 // name folded by idna.Lookup.ToASCII (lowercase, A-label) without a trailing dot, as
 // autocert.Manager.GetCertificate derives it from a ClientHello. It fails for a name
-// GetCertificate refuses.
-func autocertName(domain string) (string, error) {
+// GetCertificate refuses. sora-admin's tls commands name cache entries with it too.
+func AutocertName(domain string) (string, error) {
 	name, err := idna.Lookup.ToASCII(domain)
 	if err != nil {
 		return "", err
@@ -1745,11 +1745,21 @@ func IMAPAppendLimit(servers []ServerConfig) (int64, error) {
 	return 0, fmt.Errorf("no IMAP server configured")
 }
 
+// GetMaxScriptSize returns the ManageSieve script size limit. Omitted or zero is the
+// 16KB default; there is no unlimited setting (go-managesieve reads a limit of 0 as
+// none, and would then accept a script literal of any length).
 func (s *ServerConfig) GetMaxScriptSize() (int64, error) {
 	if s.MaxScriptSize == "" {
 		return 16 * 1024, nil // 16KB default
 	}
-	return helpers.ParseSize(s.MaxScriptSize)
+	size, err := helpers.ParseSize(s.MaxScriptSize)
+	if err != nil {
+		return 0, err
+	}
+	if size == 0 {
+		return 16 * 1024, nil
+	}
+	return size, nil
 }
 
 func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
@@ -2771,6 +2781,14 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		if s.Type == "metrics" && s.ProxyProtocol {
 			logger("WARNING: Server %s (type: metrics) has 'proxy_protocol' configured, but the metrics endpoint does not read PROXY protocol headers; it is ignored, and 'allowed_hosts' matches the connecting host", s.Name)
 		}
+		// A metrics listener's allowed_hosts is fixed at startup, so this is where an
+		// unusable entry is reported. The Admin and User APIs report theirs when they
+		// install a list, which a reload can replace.
+		if s.Type == "metrics" {
+			for _, entry := range helpers.InvalidNetworkEntries(s.AllowedHosts) {
+				logger("WARNING: Server %s (type: metrics) has 'allowed_hosts' entry %q, which is not an IP address or CIDR and matches no client", s.Name, entry)
+			}
+		}
 	}
 }
 
@@ -2966,7 +2984,7 @@ func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaDa
 			if srv.TLSDefaultDomain == "" {
 				continue
 			}
-			name, err := autocertName(srv.TLSDefaultDomain)
+			name, err := AutocertName(srv.TLSDefaultDomain)
 			if err != nil {
 				warnf("server %q: ignoring tls_default_domain %q, clients without SNI use the global default: %v", srv.Name, srv.TLSDefaultDomain, err)
 			}

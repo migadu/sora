@@ -281,6 +281,31 @@ func TestTLSAutocertNameRejectsNonDomainPaths(t *testing.T) {
 	}
 }
 
+// TestTLSAutocertNameIsTheServersName: the tls commands must name a domain's cache entries
+// exactly as the server loads [tls.letsencrypt] domains. sora-admin counted labels before
+// the IDNA fold and the server after it, so a domain written with ideographic full stops
+// was mail.example.com to the server and an invalid domain to tls delete --domain.
+func TestTLSAutocertNameIsTheServersName(t *testing.T) {
+	for _, domain := range []string{"Mail。Example。com", "Bücher.example.com.", "MAIL.example.com"} {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		content := "[tls.letsencrypt]\ndomains = [\"" + domain + "\"]\n"
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var cfg config.Config
+		if err := config.LoadServerConfig(path, &cfg); err != nil {
+			t.Fatalf("loading config: %v", err)
+		}
+		if len(cfg.TLS.LetsEncrypt.Domains) != 1 {
+			t.Fatalf("server loaded %q as %q", domain, cfg.TLS.LetsEncrypt.Domains)
+		}
+		want := cfg.TLS.LetsEncrypt.Domains[0]
+		if got, err := autocertName(domain); err != nil || got != want {
+			t.Errorf("autocertName(%q) = %q, %v; the server loads it as %q", domain, got, err, want)
+		}
+	}
+}
+
 // TestTLSCacheSkipsDomainsAutocertCannotServe: autocert.HostWhitelist silently drops a
 // configured domain that idna.Lookup refuses, so the server runs and serves the others.
 // tls cache must do the same for the configured list instead of stopping at that entry;

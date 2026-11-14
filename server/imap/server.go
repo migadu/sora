@@ -543,21 +543,26 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		logger.Info("IMAP: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
-	// Parse warmup timeout with default fallback
+	// Parse warmup timeout with default fallback. Zero or a negative timeout would
+	// cancel every warmup before its first query, so it falls back too.
 	warmupTimeout := 5 * time.Minute // Default timeout
 	if options.WarmupTimeout != "" {
-		if parsed, err := helpers.ParseDuration(options.WarmupTimeout); err != nil {
-			logger.Debug("IMAP: WARNING - invalid warmup_timeout, using default", "name", name, "value", options.WarmupTimeout, "error", err, "default", warmupTimeout)
+		parsed, err := helpers.ParseDuration(options.WarmupTimeout)
+		if err == nil && parsed <= 0 {
+			err = errors.New("must be positive")
+		}
+		if err != nil {
+			logger.Warn("IMAP: invalid warmup_timeout, using the default", "name", name, "value", options.WarmupTimeout, "error", err, "default", warmupTimeout)
 		} else {
 			warmupTimeout = parsed
 		}
 	}
 
-	// Parse warmup interval with default fallback
+	// Parse warmup interval with default fallback. Zero warms at every login.
 	warmupInterval := 24 * time.Hour // Default: only warmup once per day per user
 	if options.WarmupInterval != "" {
 		if parsed, err := helpers.ParseDuration(options.WarmupInterval); err != nil {
-			logger.Debug("IMAP: WARNING - invalid warmup_interval, using default", "name", name, "value", options.WarmupInterval, "error", err, "default", warmupInterval)
+			logger.Warn("IMAP: invalid warmup_interval, using the default", "name", name, "value", options.WarmupInterval, "error", err, "default", warmupInterval)
 		} else {
 			warmupInterval = parsed
 		}
@@ -767,24 +772,11 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	s.idVendor = options.IDVendor
 	s.idSupportURL = options.IDSupportURL
 
-	// Create connection limiter with trusted networks from server configuration
-	// For IMAP backend:
-	// - If PROXY protocol is enabled: only connections from trusted networks allowed, no per-IP limiting
-	// - If PROXY protocol is disabled: trusted networks bypass per-IP limits, others are limited per-IP
-	var limiterTrustedNets []string
-	var limiterMaxPerIP int
-
-	if options.ProxyProtocol {
-		// PROXY protocol enabled: use trusted networks, disable per-IP limiting
-		limiterTrustedNets = options.TrustedNetworks
-		limiterMaxPerIP = 0 // No per-IP limiting when PROXY protocol is enabled
-	} else {
-		// PROXY protocol disabled: use trusted networks for per-IP bypass
-		limiterTrustedNets = options.TrustedNetworks
-		limiterMaxPerIP = options.MaxConnectionsPerIP
-	}
-
-	s.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("IMAP", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
+	// Create the connection limiter. max_connections_per_ip counts the client a PROXY
+	// header names when there is one, else the socket peer, and trusted_networks
+	// exempt the counted address: a trusted proxy or load balancer passes the limit
+	// on to its clients and is only exempt itself when it names none.
+	s.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("IMAP", options.MaxConnections, options.MaxConnectionsPerIP, options.TrustedNetworks)
 
 	// Set listen backlog with reasonable default
 	s.listenBacklog = options.ListenBacklog
@@ -1035,9 +1027,6 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	session.HostName = s.hostname
 	session.Stats = s
 	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "IMAP", session.InfoLog)
-
-	// Log connection at INFO level
-	session.InfoLog("connected")
 
 	greeting := &imapserver.GreetingData{
 		PreAuth: false,

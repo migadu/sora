@@ -151,9 +151,9 @@ func TestProxyProtocolConnectionLimitsRealClientIP(t *testing.T) {
 
 	// Test scenario:
 	// - Server allows 10 total connections, 2 per IP
-	// - Connections come from untrusted proxy (10.0.0.1)
+	// - Connections come from a trusted PROXY peer (localhost)
 	// - Real client IPs are 192.168.1.100 (should hit per-IP limit after 2 connections)
-	// - PROXY protocol should use real client IP for per-IP limiting
+	// - PROXY protocol should use real client IP for per-IP limiting (#539)
 
 	trustedNetworks := []string{"127.0.0.0/8"} // localhost is trusted for PROXY protocol
 	server, address := setupIMAPServerWithProxyProtocol(t, 10, 2, trustedNetworks)
@@ -215,16 +215,10 @@ func TestProxyProtocolConnectionLimitsRealClientIP(t *testing.T) {
 	}
 
 	// Try to read from third connection - should fail or get connection closed
-	// However, due to architectural limitation, it will succeed because the proxy itself is trusted
 	conn3.SetReadDeadline(time.Now().Add(1 * time.Second))
 	n, err = conn3.Read(buffer)
 	if err == nil && n > 0 {
-		response := string(buffer[:n])
-		t.Logf("ARCHITECTURAL LIMITATION: Third connection from same client IP was accepted (proxy is trusted)")
-		t.Logf("Response: %s", strings.TrimSpace(response))
-		t.Logf("Note: When proxy IP is in trusted networks, it bypasses per-IP limits for all real client IPs")
-		// This is expected behavior currently - see TestProxyProtocolArchitecturalLimitation
-		return
+		t.Fatalf("third connection from the same real client IP was accepted (%s), want max_connections_per_ip = 2 to refuse it", strings.TrimSpace(string(buffer[:n])))
 	}
 
 	t.Logf("Third connection from same real client IP properly rejected: %v", err)
@@ -288,10 +282,10 @@ func TestProxyProtocolTrustedNetworkBypassesPerIPLimit(t *testing.T) {
 
 	// Test scenario:
 	// - Server allows 10 total connections, 2 per IP
-	// - Proxy (localhost) is in trusted networks
-	// - Trusted networks should bypass per-IP limits completely
+	// - Proxy (localhost) is in trusted networks, and so is the client it names
+	// - A client in trusted networks bypasses per-IP limits
 
-	trustedNetworks := []string{"127.0.0.0/8"} // localhost is trusted
+	trustedNetworks := []string{"127.0.0.0/8", "10.0.0.0/24"} // localhost and the client are trusted
 	server, address := setupIMAPServerWithProxyProtocol(t, 10, 2, trustedNetworks)
 	defer server.Close()
 
@@ -304,10 +298,10 @@ func TestProxyProtocolTrustedNetworkBypassesPerIPLimit(t *testing.T) {
 		}
 	}()
 
-	// Multiple connections from the same trusted proxy should all succeed
+	// Multiple connections from the same trusted client should all succeed
 	// even though they exceed per-IP limit
 	for i := 0; i < 5; i++ {
-		conn := connectWithProxyHeader(t, address, fmt.Sprintf("192.168.1.%d", 100+i), 12345+i)
+		conn := connectWithProxyHeader(t, address, "10.0.0.7", 12345+i)
 		connections = append(connections, conn)
 
 		// Verify connection works
@@ -323,50 +317,7 @@ func TestProxyProtocolTrustedNetworkBypassesPerIPLimit(t *testing.T) {
 		}
 	}
 
-	t.Logf("Successfully established 5 connections from trusted proxy (localhost), bypassing per-IP limits")
-}
-
-func TestProxyProtocolCurrentBehaviorTrustedProxiesBypassLimits(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
-
-	// Test documents current behavior:
-	// - PROXY protocol trusts localhost (127.0.0.0/8) for header parsing
-	// - Connection limiting ALSO trusts localhost (same trusted networks list)
-	// - Trusted proxies bypass per-IP limits completely
-	// - This is current correct behavior for operational safety
-
-	trustedNetworks := []string{"127.0.0.0/8"} // localhost trusted for both PROXY and connection limiting
-	server, address := setupIMAPServerWithProxyProtocol(t, 10, 2, trustedNetworks)
-	defer server.Close()
-
-	var connections []net.Conn
-	defer func() {
-		for _, conn := range connections {
-			if conn != nil {
-				conn.Close()
-			}
-		}
-	}()
-
-	// Multiple connections from trusted proxy should all succeed (bypass per-IP limits)
-	for i := 0; i < 5; i++ {
-		conn := connectWithProxyHeader(t, address, "192.168.1.100", 12345+i)
-		connections = append(connections, conn)
-
-		// Verify connection works
-		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		buffer := make([]byte, 1000)
-		n, err := conn.Read(buffer)
-		if err != nil || n == 0 {
-			t.Fatalf("Failed to read IMAP welcome banner from connection %d: %v", i+1, err)
-		}
-		response := string(buffer[:n])
-		if !strings.Contains(response, "* OK") {
-			t.Fatalf("Connection %d: Expected IMAP welcome banner, got: %s", i+1, strings.TrimSpace(response))
-		}
-	}
-
-	t.Logf("Successfully established 5 connections from trusted proxy with same real client IP - trusted proxies bypass per-IP limits (current correct behavior)")
+	t.Logf("Successfully established 5 connections from a trusted client behind the trusted proxy, bypassing per-IP limits")
 }
 
 func TestProxyProtocolDifferentRealClientIPsAllowed(t *testing.T) {
@@ -374,7 +325,7 @@ func TestProxyProtocolDifferentRealClientIPsAllowed(t *testing.T) {
 
 	// Test scenario:
 	// - PROXY protocol trusts localhost for header parsing
-	// - Connection limiting does NOT trust localhost (empty trusted networks)
+	// - Connection limiting counts the real client each header names, not localhost
 	// - Connections have different real client IPs via PROXY headers
 	// - Each real client IP should be allowed up to the per-IP limit
 
@@ -416,54 +367,4 @@ func TestProxyProtocolDifferentRealClientIPsAllowed(t *testing.T) {
 	}
 
 	t.Logf("Successfully established 6 total connections from 3 different real client IPs (2 each)")
-}
-
-func TestProxyProtocolArchitecturalLimitation(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
-
-	// This test demonstrates a current architectural limitation:
-	// - We cannot test real client IP per-IP limiting with current architecture
-	// - PROXY protocol trust and connection limiting trust use the same configuration
-	// - If proxy is trusted for PROXY protocol, it also bypasses per-IP limits
-	// - If proxy is not trusted, PROXY headers are rejected entirely
-	// - This creates a Catch-22 where real client IP limiting cannot be tested
-
-	t.Log("ARCHITECTURAL LIMITATION IDENTIFIED:")
-	t.Log("1. PROXY protocol requires trusted proxy to accept headers")
-	t.Log("2. Connection limiter treats same trusted proxy as unlimited")
-	t.Log("3. Real client IP is extracted but per-IP limits are bypassed")
-	t.Log("4. Cannot test per-IP blocking of real client IPs with current architecture")
-	t.Log("5. ENHANCEMENT NEEDED: Separate PROXY trust from connection limiting trust")
-
-	// Current behavior verification:
-	trustedNetworks := []string{"127.0.0.0/8"}
-	server, address := setupIMAPServerWithProxyProtocol(t, 10, 1, trustedNetworks) // maxPerIP = 1 to test blocking
-	defer server.Close()
-
-	var connections []net.Conn
-	defer func() {
-		for _, conn := range connections {
-			if conn != nil {
-				conn.Close()
-			}
-		}
-	}()
-
-	// Even with maxPerIP = 1, multiple connections from same real client IP succeed
-	// because trusted proxy bypasses per-IP limits
-	for i := 0; i < 3; i++ {
-		conn := connectWithProxyHeader(t, address, "192.168.1.100", 12345+i)
-		connections = append(connections, conn)
-
-		// All connections succeed despite maxPerIP = 1
-		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		buffer := make([]byte, 1000)
-		n, err := conn.Read(buffer)
-		if err != nil || n == 0 {
-			t.Fatalf("Connection %d failed (should succeed due to trusted proxy): %v", i+1, err)
-		}
-	}
-
-	t.Log("RESULT: All 3 connections succeeded despite maxPerIP=1 (trusted proxy bypasses limits)")
-	t.Log("CONCLUSION: Real client IP per-IP blocking cannot be tested with current architecture")
 }

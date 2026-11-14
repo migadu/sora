@@ -236,6 +236,17 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// not the resolved s.username, which can differ for token/master/+detail logins.
 	s.submittedUsername = username
 
+	// Parse once (regular addresses and the user@domain.com@SUFFIX form alike). The base
+	// address, without +detail or @SUFFIX, names the user in every line this attempt logs,
+	// refusals included, until a successful login replaces it with the resolved address;
+	// the raw name stands in when it does not parse.
+	parsedAddr, parseErr := server.NewAddress(username)
+	if parseErr == nil {
+		s.username = parsedAddr.BaseAddress()
+	} else {
+		s.username = username
+	}
+
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
 	// Empty passwords are never valid under any condition
 	if password == "" {
@@ -350,13 +361,10 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					s.accountID = cached.AccountID
 					s.isRemoteLookupAccount = cached.FromRemoteLookup
 
-					// Otherwise parse username to extract base address
+					// The resolved address when the entry has one; otherwise s.username
+					// keeps the base address set above.
 					if cached.ActualEmail != "" {
 						s.username = cached.ActualEmail
-					} else if parsedAddr, parseErr := server.NewAddress(username); parseErr == nil {
-						s.username = parsedAddr.BaseAddress() // Use base address (without @SUFFIX)
-					} else {
-						s.username = username // Fallback
 					}
 
 					// Rebuild the routing info from the entry whether it carries an explicit
@@ -419,9 +427,6 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	var usernameForRemoteLookup string
 	var masterAuthValidated bool
 
-	// Parse username (handles both regular addresses and addresses with @SUFFIX)
-	parsedAddr, parseErr := server.NewAddress(username)
-
 	if parseErr == nil && parsedAddr.HasSuffix() {
 		// Has suffix - check if it matches configured master username
 		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), s.server.masterUsername) {
@@ -473,30 +478,24 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		}
 
 		if err != nil {
-			// Categorize the error type to determine fallback behavior. A malformed
-			// answer arrives as ErrRemoteLookupTransient: a broken lookup service.
-			if errors.Is(err, proxy.ErrRemoteLookupTransient) {
-				// Check if this is due to context cancellation (server shutdown)
-				if errors.Is(err, server.ErrServerShuttingDown) {
-					s.InfoLog("remotelookup cancelled due to server shutdown")
-					metrics.RemoteLookupResult.WithLabelValues("managesieve", "shutdown").Inc()
-					return server.ErrServerShuttingDown
-				}
-
-				// Transient error (network, 5xx, circuit breaker) - NEVER fallback to DB
-				// These are service availability issues, not "user not found" cases.
-				// Nothing is wrong with the client's credentials: answer a temporary
-				// failure (NO (TRYLATER)) and do not charge the auth rate limiter, or
-				// clients retrying during an outage get delayed and blocked.
-				s.WarnLog("remotelookup transient error - service unavailable", "error", err)
-				metrics.RemoteLookupResult.WithLabelValues("managesieve", "transient_error_rejected").Inc()
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
-				return server.ErrAuthServiceUnavailable
-			} else {
-				// Unknown error type - log and fallthrough
-				s.WarnLog("remotelookup unknown error - attempting fallback", "error", err)
-				// Fallthrough to main DB auth
+			// Check if this is due to context cancellation (server shutdown)
+			if errors.Is(err, server.ErrServerShuttingDown) {
+				s.InfoLog("remotelookup cancelled due to server shutdown")
+				metrics.RemoteLookupResult.WithLabelValues("managesieve", "shutdown").Inc()
+				return server.ErrServerShuttingDown
 			}
+
+			// An error is no verdict on the user, whatever its kind (network, 5xx,
+			// circuit breaker, a malformed answer, or one this proxy cannot classify):
+			// NEVER fall back to the database. Only a definite "not found" does, and
+			// only with lookup_local_users (below); without it this node may have no
+			// database at all. Nothing is wrong with the client's credentials: answer a
+			// temporary failure (NO (TRYLATER)) and do not charge the auth rate
+			// limiter, or clients retrying during an outage get delayed and blocked.
+			s.WarnLog("remotelookup transient error - service unavailable", "error", err)
+			metrics.RemoteLookupResult.WithLabelValues("managesieve", "transient_error_rejected").Inc()
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+			return server.ErrAuthServiceUnavailable
 		} else {
 			switch authResult {
 			case proxy.AuthSuccess:
@@ -673,11 +672,19 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				return server.ErrServerShuttingDown
 			}
 
-			// The database could not be asked, so nothing is known about the credentials:
-			// a temporary failure (NO (TRYLATER)), neither counted as a failed login nor
-			// cached.
-			if server.IsTemporaryAuthFailure(err) {
-				s.WarnLog("authentication unavailable", "method", "main_db", "error", err)
+			// The database could not be asked, or the stored hash cannot be checked, so
+			// nothing is known about the credentials: a temporary failure (NO
+			// (TRYLATER)), neither counted as a failed login nor cached.
+			if proxy.IsTemporaryDBAuthFailure(err) {
+				reason, _ := proxy.ClassifyDBAuthFailure(err)
+				// A login this username has in the lookup cache was verified against
+				// another hash than the one now stored. Drop it: while it stays, every
+				// password that misses it is answered here, uncounted, and the cached
+				// one still signs in, an unmetered guessing oracle until it expires.
+				if errors.Is(err, db.ErrUnverifiableHash) {
+					s.invalidateLookupCache("unverifiable stored hash")
+				}
+				s.WarnLog("authentication unavailable", "reason", reason, "method", "main_db", "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
 				return server.ErrAuthServiceUnavailable
 			}

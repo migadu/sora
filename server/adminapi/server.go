@@ -308,6 +308,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		readOnlyAPIKey: options.ReadOnlyAPIKey,
 		allowedHosts:   options.AllowedHosts,
 	})
+	warnUnusableAllowedHosts(options.Name, options.AllowedHosts)
 
 	return s, nil
 }
@@ -365,6 +366,7 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	// it does at startup: every host is allowed.
 	if !slices.Equal(cfg.AllowedHosts, next.allowedHosts) {
 		next.allowedHosts = slices.Clone(cfg.AllowedHosts)
+		warnUnusableAllowedHosts(s.name, next.allowedHosts)
 		reloaded = append(reloaded, "allowed_hosts")
 	}
 
@@ -616,7 +618,9 @@ func (s *Server) allowedHostsMiddleware(next http.Handler) http.Handler {
 		clientIP := getClientIP(r)
 
 		// Single shared check: allowedHosts entries may be CIDRs or bare IPs (incl. IPv6,
-		// matched by value rather than string form). See helpers.IPInNetworks.
+		// matched by value rather than string form). See helpers.IPInNetworks. Any other
+		// entry (a host name, a typo) matches no client; warnUnusableAllowedHosts reports
+		// it once per list.
 		allowed := helpers.IPInNetworks(net.ParseIP(clientIP), allowedHosts)
 
 		if !allowed {
@@ -626,6 +630,14 @@ func (s *Server) allowedHostsMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// warnUnusableAllowedHosts logs the allowed_hosts entries that are not an IP address
+// or CIDR, when a list is configured (startup) or replaced (reload).
+func warnUnusableAllowedHosts(name string, allowedHosts []string) {
+	for _, entry := range helpers.InvalidNetworkEntries(allowedHosts) {
+		logger.Warn("HTTP API: allowed_hosts entry is not an IP address or CIDR and matches no client", "name", name, "entry", entry)
+	}
 }
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
@@ -1561,13 +1573,27 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Collect connections for this user from all trackers
-	// Filter by email string matching (case-insensitive) - no database lookup needed
-	// The connection tracker already stores the username (email) via gossip
+	// A tracker keeps one entry per account ID, with the address of the session that
+	// created it. The address is resolved to its account, as POST /admin/connections/kick
+	// resolves it, so the account's entries are listed whichever of its addresses names
+	// it. An entry created under the address is listed too: a remote lookup account,
+	// which the database does not know, is keyed by an ID derived from the address the
+	// lookup answered, and that is the address its entry keeps.
+	//
 	// Unlike GET /admin/connections, a tracker that knows the account only through
 	// gossip is listed too (local count 0): it reports the sessions on other nodes.
+	var accountID int64 // 0: the database names no account for the address
+	if s.rdb != nil {
+		id, err := s.rdb.GetAccountIDByEmailWithRetry(r.Context(), email)
+		switch {
+		case err == nil:
+			accountID = id
+		case !errors.Is(err, consts.ErrUserNotFound):
+			logger.Warn("HTTP API: Cannot resolve account; listing only the entries created under the address",
+				"name", s.name, "email", email, "error", err)
+		}
+	}
 	userConnections := make([]ConnectionInfo, 0)
-	emailLower := strings.ToLower(email)
 
 	for trackerKey, tracker := range trackers {
 		if tracker == nil {
@@ -1576,8 +1602,7 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 		instanceID := tracker.GetInstanceID()
 		conns := tracker.GetAllConnections()
 		for _, connInfo := range conns {
-			// Match email case-insensitively
-			if strings.ToLower(connInfo.Username) == emailLower {
+			if (accountID != 0 && connInfo.AccountID == accountID) || strings.EqualFold(connInfo.Username, email) {
 				userConnections = append(userConnections, newConnectionInfo(trackerKey, connInfo.GetLocalCount(instanceID), connInfo))
 			}
 		}
@@ -2176,6 +2201,7 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 			},
 			"credential_management": {
 				"GET /admin/credentials/{email}",
+				"DELETE /admin/credentials/{email}",
 			},
 			"message_restoration": {
 				"GET /admin/accounts/{email}/messages/deleted",
@@ -2204,9 +2230,28 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 			"auth_statistics": {
 				"GET /admin/auth/stats",
 				"GET /admin/auth/blocked",
+				"GET /admin/auth-cache/stats",
+			},
+			"proxy_monitoring": {
+				"GET /admin/proxy/backends",
 			},
 			"system_information": {
 				"GET /admin/config",
+			},
+			"mail_delivery": {
+				"POST /admin/mail/deliver",
+			},
+			"acl_management": {
+				"POST /admin/mailboxes/acl/grant",
+				"POST /admin/mailboxes/acl/revoke",
+				"GET /admin/mailboxes/acl",
+			},
+			"affinity_management": {
+				"GET /admin/affinity",
+				"POST /admin/affinity",
+				"DELETE /admin/affinity",
+				"GET /admin/affinity/list",
+				"GET /admin/affinity/stats",
 			},
 		},
 	})
