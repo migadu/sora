@@ -708,6 +708,13 @@ func (s *IMAPSession) decodeBinary(ctx context.Context, bodyData *[]byte, bodyDa
 			s.freeSectionCopies(b.charged)
 			return nil, s.unknownCTE(msg.UID)
 		}
+		if section.Partial != nil {
+			// A <partial> is a slice of the whole decoded section. Keep only the
+			// slice, which is what is charged: the sections are held until the
+			// response is written, and one command line can name the same part
+			// thousands of times.
+			buf = bytes.Clone(buf)
+		}
 		charged, ok := s.chargeSectionCopy(len(buf))
 		if !ok {
 			s.freeSectionCopies(b.charged)
