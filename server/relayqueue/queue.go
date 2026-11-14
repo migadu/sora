@@ -1014,7 +1014,8 @@ func (q *DiskQueue) writeDataAtomic(path string, data []byte, owner *fileOwner) 
 }
 
 // syncDir fsyncs a directory to ensure renamed and newly created entries are durable.
-func syncDir(dir string) error {
+// Variable so tests can pause between a rename into pending/ and the caller's next step.
+var syncDir = func(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return err
