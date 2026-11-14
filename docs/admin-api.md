@@ -643,12 +643,18 @@ Clear the entire cache. Returns statistics before and after purge.
   "stats_before": {
     "TotalSizeBytes": 524288000,
     "ObjectCount": 1523,
-    ...
+    "Hits": 45678,
+    "Misses": 3421,
+    "HitRatio": 0.93,
+    "Uptime": 86400000000000
   },
   "stats_after": {
     "TotalSizeBytes": 0,
     "ObjectCount": 0,
-    ...
+    "Hits": 45678,
+    "Misses": 3421,
+    "HitRatio": 0.93,
+    "Uptime": 86400000000000
   }
 }
 ```
