@@ -268,6 +268,46 @@ func TestSessionDrainer_HugeKickRateDrainsAtOnce(t *testing.T) {
 	}
 }
 
+// drainInterval is the same on every architecture: never negative, saturated at the
+// longest Duration for a rate too small to represent, and non-increasing as the rate grows.
+func TestDrainInterval_Extremes(t *testing.T) {
+	cases := []struct {
+		rate float64
+		want time.Duration
+	}{
+		{0, 100 * time.Millisecond}, // not positive finite: default 10/s
+		{-1, 100 * time.Millisecond},
+		{math.NaN(), 100 * time.Millisecond},
+		{math.Inf(1), 100 * time.Millisecond},
+		{math.Inf(-1), 100 * time.Millisecond},
+		{math.SmallestNonzeroFloat64, math.MaxInt64}, // quotient is +Inf
+		{1e-300, math.MaxInt64},
+		{1e-12, math.MaxInt64},
+		{1e-10, math.MaxInt64},                            // 1e19ns, just past the range
+		{float64(time.Second) / (1 << 63), math.MaxInt64}, // exactly 2^63ns
+		{1e-9, time.Duration(1e18)},
+		{1, time.Second},
+		{20, 50 * time.Millisecond},
+		{1e9, time.Nanosecond},
+		{2e9, 0}, // half a nanosecond truncates to no pause, as asked
+		{math.MaxFloat64, 0},
+	}
+	for _, c := range cases {
+		if got := drainInterval(c.rate); got != c.want {
+			t.Errorf("drainInterval(%g) = %d, want %d", c.rate, got, c.want)
+		}
+	}
+
+	prev := time.Duration(math.MaxInt64)
+	for rate := 1e-11; rate < 1e-9; rate *= 1.01 {
+		got := drainInterval(rate)
+		if got <= 0 || got > prev {
+			t.Fatalf("drainInterval(%g) = %d after %d: must stay positive and non-increasing", rate, got, prev)
+		}
+		prev = got
+	}
+}
+
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
