@@ -984,7 +984,7 @@ What a proxy needs PostgreSQL for:
 A node that runs only proxies, all of them with a remote lookup and none with
 `lookup_local_users = true`, does not need PostgreSQL to check users and can leave `[database]`
 out. It logs
-`Skipping database initialization - running in proxy-only mode with remote_lookup`.
+`Skipping database initialization - no server on this node queries it`.
 
 On a node without database access:
 
