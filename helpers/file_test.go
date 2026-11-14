@@ -34,6 +34,10 @@ func TestFileErrorCause(t *testing.T) {
 			Err: &fs.PathError{Op: "write", Path: path, Err: syscall.EROFS}}, syscall.EROFS},
 		{"ordinary wrapper inside path error", &fs.PathError{Op: "write", Path: path,
 			Err: fmt.Errorf("bad spool path %s: %w", path, syscall.EACCES)}, syscall.EACCES},
+		{"multiple wrapped causes inside path error", &fs.PathError{Op: "write", Path: path,
+			Err: fmt.Errorf("flush %s: %w; close %s.tmp: %w", path, syscall.EIO, path, syscall.EBADF)}, syscall.EIO},
+		{"joined causes inside path error", &fs.PathError{Op: "write", Path: path,
+			Err: errors.Join(fmt.Errorf("flush %s: %w", path, syscall.EIO), syscall.EBADF)}, syscall.EIO},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -65,5 +69,9 @@ func TestFileErrorCause(t *testing.T) {
 	var pathErr *fs.PathError
 	if !errors.As(got, &pathErr) {
 		t.Error("sanitized error lost structured filesystem cause")
+	}
+	opaque := &fs.PathError{Op: "write", Path: path, Err: errors.New("opaque fault at " + path)}
+	if got := FileErrorCause(opaque); strings.Contains(got.Error(), path) {
+		t.Errorf("opaque filesystem leaf exposed the path: %v", got)
 	}
 }
