@@ -149,6 +149,12 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 			wantErr: []string{"fts_retention must not be negative"},
 		},
 		{
+			// A negative grace_period hard-deletes expunged mail at the next cleaner cycle.
+			name:    "cleanup grace_period negative on a mail backend",
+			content: "[cleanup]\ngrace_period = \"-14d\"\n" + imapBackend,
+			wantErr: []string{`grace_period must not be negative, got "-14d"`},
+		},
+		{
 			name:    "shared namespace_prefix without delimiter",
 			content: "[shared_mailboxes]\nenabled = true\nnamespace_prefix = \"Shared\"\n" + imapBackend,
 			wantErr: []string{`namespace_prefix "Shared"`},
