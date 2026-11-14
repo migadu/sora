@@ -583,7 +583,7 @@ func proxiesWithAffinity(cfg config.Config) []string {
 	var names []string
 	for _, s := range cfg.GetAllServers() {
 		switch s.Type {
-		case "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy":
+		case "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy":
 			if s.EnableAffinity {
 				names = append(names, s.Name)
 			}

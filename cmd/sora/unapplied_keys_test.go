@@ -21,6 +21,20 @@ import (
 	"github.com/migadu/sora/server/userapiproxy"
 )
 
+// User API affinity now follows enable_affinity, including the startup warning
+// when no cluster affinity manager is available.
+func TestProxiesWithAffinityIncludesUserAPIProxy(t *testing.T) {
+	disabled := false
+	cfg := config.Config{DynamicServers: []config.ServerConfig{
+		{Type: "user_api_proxy", Name: "api-affinity", EnableAffinity: true},
+		{Type: "user_api_proxy", Name: "api-no-affinity"},
+		{Type: "user_api_proxy", Name: "api-disabled", EnableAffinity: true, Enabled: &disabled},
+	}}
+	if names := proxiesWithAffinity(cfg); len(names) != 1 || names[0] != "api-affinity" {
+		t.Fatalf("proxies needing the no-manager warning = %v, want [api-affinity]", names)
+	}
+}
+
 // The LMTP backend's command_timeout is its idle timeout (#290). It was never passed,
 // so the server always used its built-in 5 minutes.
 func TestBuildLMTPServerOptions_CommandTimeoutIsTheIdleTimeout(t *testing.T) {
