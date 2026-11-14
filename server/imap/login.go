@@ -55,19 +55,24 @@ func (s *IMAPSession) createDefaultMailboxes(ctx context.Context, accountID int6
 // Login handles the IMAP LOGIN command. It always applies the authentication
 // gate (progressive delay + rate-limit check) before authenticating.
 func (s *IMAPSession) Login(ctx context.Context, address, password string) error {
-	return s.login(ctx, address, password, true)
+	return s.login(ctx, address, password, "", true)
 }
 
 // login authenticates address/password. applyGate controls whether the
 // progressive authentication delay and per-IP/username rate-limit check are
 // applied here.
 //
+// authzid is the SASL authorization identity, empty for LOGIN. One naming somebody
+// other than address is refused, but only after the credentials checked out: RFC
+// 4616 section 2 verifies the authentication identity and password first, then that
+// they permit acting as the authorization identity.
+//
 // The LOGIN command passes applyGate=true. The SASL PLAIN handler (sasl.go)
 // passes applyGate=false for the regular-user path because it has ALREADY
 // applied the delay + rate-limit once for the AUTHENTICATE command. Without
 // this, AUTHENTICATE would apply both twice — roughly doubling auth latency and
 // double-counting against the rate limiter relative to LOGIN.
-func (s *IMAPSession) login(ctx context.Context, address, password string, applyGate bool) error {
+func (s *IMAPSession) login(ctx context.Context, address, password, authzid string, applyGate bool) error {
 	authStart := time.Now()
 
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
@@ -288,6 +293,25 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 			}
 
 			return authFailedError()
+		}
+	}
+
+	// The credentials checked out; now the authorization (RFC 4616 section 2). Acting
+	// as somebody else is the master SASL credentials' privilege (sasl.go), so this
+	// account may act only as itself. Refused here, not before the password, so only a
+	// client that proved its credentials learns it is not permitted, which is what RFC
+	// 5530 section 3 defines AUTHORIZATIONFAILED as: "Authentication succeeded in using
+	// the authentication identity, but the server cannot or will not allow the
+	// authentication identity to act as the requested authorization identity".
+	// Refusing it earlier answered every username but the master SASL one without a
+	// password check, which confirmed the master SASL username. Not recorded as a
+	// failure: the credentials were right.
+	if authzid != "" && authzid != address {
+		s.DebugLog("proxy login not allowed for non-master users", "username", address, "identity", authzid)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeAuthorizationFailed,
+			Text: "Proxy login not permitted for this user.",
 		}
 	}
 
