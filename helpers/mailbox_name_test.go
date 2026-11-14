@@ -60,6 +60,15 @@ func TestMailboxNameToCreate(t *testing.T) {
 		{"a/./b", "", false},
 		{"..", "", false},
 		{"Foo/.", "", false},
+		{"Jos\u00e9/\u00dcber", "Jos\u00e9/\u00dcber", true}, // non-ASCII UTF-8 is a name
+		// Characters PostgreSQL cannot store in text (NUL, invalid UTF-8) and the
+		// ones db.CreateMailbox refuses: a Sieve name taken from a header can hold
+		// any of them.
+		{"a\x00b", "", false},
+		{"caf\xe9", "", false},
+		{"a/\xff/b", "", false},
+		{"a\tb", "", false},
+		{"a\r\nb", "", false},
 	}
 	for _, tt := range tests {
 		got, err := MailboxNameToCreate(tt.name)

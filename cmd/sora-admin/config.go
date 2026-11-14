@@ -244,40 +244,7 @@ Examples:
 
 	// Mask secrets if requested
 	if maskSecrets {
-		if cfg.Database.Write != nil {
-			cfg.Database.Write.Password = "***MASKED***"
-		}
-		if cfg.Database.Read != nil {
-			cfg.Database.Read.Password = "***MASKED***"
-		}
-		cfg.S3.AccessKey = "***MASKED***"
-		cfg.S3.SecretKey = "***MASKED***"
-		cfg.S3.EncryptionKey = "***MASKED***"
-		cfg.TLS.CertFile = "***MASKED***"
-		cfg.TLS.KeyFile = "***MASKED***"
-		if cfg.TLS.LetsEncrypt != nil {
-			cfg.TLS.LetsEncrypt.S3.AccessKey = "***MASKED***"
-			cfg.TLS.LetsEncrypt.S3.SecretKey = "***MASKED***"
-		}
-		cfg.Cluster.SecretKey = "***MASKED***"
-		for i := range cfg.DynamicServers {
-			sc := &cfg.DynamicServers[i]
-			if sc.APIKey != "" {
-				sc.APIKey = "***MASKED***"
-			}
-			if sc.ReadOnlyAPIKey != "" {
-				sc.ReadOnlyAPIKey = "***MASKED***"
-			}
-			if sc.JWTSecret != "" {
-				sc.JWTSecret = "***MASKED***"
-			}
-			if sc.MasterPassword != "" {
-				sc.MasterPassword = "***MASKED***"
-			}
-			if sc.MasterSASLPassword != "" {
-				sc.MasterSASLPassword = "***MASKED***"
-			}
-		}
+		config.MaskSecrets(&cfg)
 	}
 
 	// Output in requested format
