@@ -5,17 +5,20 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"maps"
 	"math"
 	"net"
 	"net/http"
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 )
 
@@ -611,6 +614,13 @@ func (c *AuthRateLimiterConfig) Validate() error {
 	return nil
 }
 
+// UnmarshalTOML decodes an auth_rate_limit table field by field, with its
+// durations parsed like every other duration key (see decodeTable).
+func (c *AuthRateLimiterConfig) UnmarshalTOML(data any) error {
+	type plain AuthRateLimiterConfig
+	return decodeTable("auth_rate_limit", data, (*plain)(c))
+}
+
 // DefaultAuthRateLimiterConfig returns sensible defaults for authentication rate limiting
 func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 	return AuthRateLimiterConfig{
@@ -680,19 +690,56 @@ var tomlErrorPosition = regexp.MustCompile(`^toml: (?:line \d+ )?\(last key "([^
 // the cache enabled with the default max_size. Decoded field by field, an omitted
 // enabled would be false and turn the cache off.
 func (c *LookupCacheConfig) UnmarshalTOML(data any) error {
-	table, ok := data.(map[string]any)
-	if !ok {
-		return fmt.Errorf("lookup_cache must be a table, got %T", data)
-	}
-	// Decode the table's own keys again, into a copy of the defaults. The plain
-	// type has no UnmarshalTOML, so this decodes field by field.
-	var buf strings.Builder
-	if err := toml.NewEncoder(&buf).Encode(table); err != nil {
-		return fmt.Errorf("lookup_cache: %w", err)
-	}
 	type plain LookupCacheConfig
 	decoded := plain(DefaultLookupCacheConfig())
-	md, err := toml.Decode(buf.String(), &decoded)
+	if err := decodeTable("lookup_cache", data, &decoded); err != nil {
+		return err
+	}
+	*c = LookupCacheConfig(decoded)
+	return nil
+}
+
+// decodeTable decodes data, the table the toml package hands an UnmarshalTOML
+// method, into v, a pointer to a struct type without one: the table is encoded
+// again and decoded field by field. name is the table's key, for messages.
+//
+// A time.Duration field is parsed with helpers.ParseDuration, like every other
+// duration key, so it takes whole days ("1d"). Left to the toml package it would
+// take time.ParseDuration syntax only, and a bare integer as nanoseconds; here an
+// integer has no unit, so it is an error as "900" is for the other keys.
+func decodeTable(name string, data any, v any) error {
+	table, ok := data.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%s must be a table, got %T", name, data)
+	}
+	table = maps.Clone(table)
+	typ := reflect.TypeOf(v).Elem()
+	for i := range typ.NumField() {
+		field := typ.Field(i)
+		if field.Type != reflect.TypeOf(time.Duration(0)) {
+			continue
+		}
+		key := tomlKey(field)
+		value, ok := table[key]
+		if !ok {
+			continue
+		}
+		s, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("%s: a duration is a string with a unit, such as \"15m\" or \"1d\", got %v", key, value)
+		}
+		d, err := helpers.ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("%s: %w", key, err)
+		}
+		table[key] = int64(d) // the toml package decodes an integer into a time.Duration as nanoseconds
+	}
+
+	var buf strings.Builder
+	if err := toml.NewEncoder(&buf).Encode(table); err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	md, err := toml.Decode(buf.String(), v)
 	if err != nil {
 		// The line in err is one of the re-encoded table, not of the file; the
 		// outer decoder adds the table's own line. Keep the key and the reason.
@@ -701,9 +748,8 @@ func (c *LookupCacheConfig) UnmarshalTOML(data any) error {
 	// The outer decoder counts every key of a table handled here as decoded, so
 	// report unknown ones here.
 	for _, key := range md.Undecoded() {
-		log.Printf("WARNING: Unknown key 'lookup_cache.%s' will be ignored", key)
+		log.Printf("WARNING: Unknown key '%s.%s' will be ignored", name, key)
 	}
-	*c = LookupCacheConfig(decoded)
 	return nil
 }
 
@@ -715,36 +761,69 @@ func (c *LookupCacheConfig) GetMaxSize() int {
 	return c.MaxSize
 }
 
+// The lookup_cache durations a key gets when it is absent.
+const (
+	defaultLookupCachePositiveTTL                = 5 * time.Minute
+	defaultLookupCacheNegativeTTL                = 1 * time.Minute
+	defaultLookupCacheCleanupInterval            = 5 * time.Minute
+	defaultLookupCachePositiveRevalidationWindow = 30 * time.Second
+)
+
 // GetPositiveTTL parses and returns the positive TTL duration
 func (c *LookupCacheConfig) GetPositiveTTL() (time.Duration, error) {
-	if c.PositiveTTL == "" {
-		return 5 * time.Minute, nil
-	}
-	return time.ParseDuration(c.PositiveTTL)
+	return parseLookupCacheDuration(c.PositiveTTL, defaultLookupCachePositiveTTL)
+}
+
+// GetPositiveTTLWithDefault returns positive_ttl, or its default if the value cannot be parsed.
+func (c *LookupCacheConfig) GetPositiveTTLWithDefault() time.Duration {
+	return lookupCacheDurationWithDefault("positive_ttl", c.PositiveTTL, defaultLookupCachePositiveTTL)
 }
 
 // GetNegativeTTL parses and returns the negative TTL duration
 func (c *LookupCacheConfig) GetNegativeTTL() (time.Duration, error) {
-	if c.NegativeTTL == "" {
-		return 1 * time.Minute, nil
-	}
-	return time.ParseDuration(c.NegativeTTL)
+	return parseLookupCacheDuration(c.NegativeTTL, defaultLookupCacheNegativeTTL)
+}
+
+// GetNegativeTTLWithDefault returns negative_ttl, or its default if the value cannot be parsed.
+func (c *LookupCacheConfig) GetNegativeTTLWithDefault() time.Duration {
+	return lookupCacheDurationWithDefault("negative_ttl", c.NegativeTTL, defaultLookupCacheNegativeTTL)
 }
 
 // GetCleanupInterval parses and returns the cleanup interval duration
 func (c *LookupCacheConfig) GetCleanupInterval() (time.Duration, error) {
-	if c.CleanupInterval == "" {
-		return 5 * time.Minute, nil
-	}
-	return time.ParseDuration(c.CleanupInterval)
+	return parseLookupCacheDuration(c.CleanupInterval, defaultLookupCacheCleanupInterval)
+}
+
+// GetCleanupIntervalWithDefault returns cleanup_interval, or its default if the value cannot be parsed.
+func (c *LookupCacheConfig) GetCleanupIntervalWithDefault() time.Duration {
+	return lookupCacheDurationWithDefault("cleanup_interval", c.CleanupInterval, defaultLookupCacheCleanupInterval)
 }
 
 // GetPositiveRevalidationWindow parses and returns the positive revalidation window duration
 func (c *LookupCacheConfig) GetPositiveRevalidationWindow() (time.Duration, error) {
-	if c.PositiveRevalidationWindow == "" {
-		return 30 * time.Second, nil
+	return parseLookupCacheDuration(c.PositiveRevalidationWindow, defaultLookupCachePositiveRevalidationWindow)
+}
+
+// GetPositiveRevalidationWindowWithDefault returns positive_revalidation_window, or its
+// default if the value cannot be parsed.
+func (c *LookupCacheConfig) GetPositiveRevalidationWindowWithDefault() time.Duration {
+	return lookupCacheDurationWithDefault("positive_revalidation_window", c.PositiveRevalidationWindow, defaultLookupCachePositiveRevalidationWindow)
+}
+
+func parseLookupCacheDuration(value string, def time.Duration) (time.Duration, error) {
+	if value == "" {
+		return def, nil
 	}
-	return time.ParseDuration(c.PositiveRevalidationWindow)
+	return helpers.ParseDuration(value)
+}
+
+func lookupCacheDurationWithDefault(key, value string, def time.Duration) time.Duration {
+	d, err := parseLookupCacheDuration(value, def)
+	if err != nil {
+		warnf("Failed to parse lookup_cache.%s: %v, using default (%s)", key, err, def)
+		return def
+	}
+	return d
 }
 
 // RemoteLookupConfig holds configuration for HTTP-based user routing
@@ -1235,6 +1314,26 @@ func (c SharedMailboxesConfig) InNamespace(name string) bool {
 	// use that same rule, or a case variant can bypass shared namespace policy.
 	name, prefix := strings.ToLower(name), strings.ToLower(c.NamespacePrefix)
 	return strings.HasPrefix(name, prefix) || name == strings.TrimSuffix(prefix, "/")
+}
+
+// Validate checks namespace_prefix when sharing is enabled. The personal namespace has
+// the empty prefix, so InNamespace tells shared names apart by the prefix alone, and the
+// prefix must be a mailbox name followed by the hierarchy delimiter: an empty prefix puts
+// every mailbox in the shared namespace, and "Shared" also takes in "SharedDocs".
+func (c SharedMailboxesConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	delim := string(consts.MailboxDelimiter)
+	root, ok := strings.CutSuffix(c.NamespacePrefix, delim)
+	if !ok || slices.Contains(strings.Split(root, delim), "") {
+		return fmt.Errorf("namespace_prefix %q must be a mailbox name followed by the hierarchy delimiter %q, such as \"Shared/\"",
+			c.NamespacePrefix, delim)
+	}
+	if strings.EqualFold(root, consts.MailboxInbox) {
+		return fmt.Errorf("namespace_prefix %q conflicts with the reserved personal INBOX", c.NamespacePrefix)
+	}
+	return nil
 }
 
 // AdminCLIConfig holds configuration for sora-admin CLI tool

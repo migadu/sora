@@ -232,7 +232,7 @@ integration-tests-tls: reset-test-db
 
 # Integration-tagged tests that live next to the code they test. ./db under the race
 # detector needs a longer timeout than the other packages.
-INTEGRATION_CODE_PKGS = ./db ./pkg/resilient ./server ./server/lmtp ./server/lmtpproxy ./server/proxy ./tlsmanager
+INTEGRATION_CODE_PKGS = ./db ./pkg/health ./pkg/resilient ./server ./server/lmtp ./server/lmtpproxy ./server/proxy ./tlsmanager
 CODE_PKGS_TIMEOUT = $(if $(RACE),60m,30m)
 integration-tests-packages: reset-test-db
 	@echo "Running integration tests in $(INTEGRATION_CODE_PKGS)..."

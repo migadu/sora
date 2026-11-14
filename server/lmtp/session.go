@@ -1268,7 +1268,16 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 		} else {
 			s.DebugLog("creating mailbox", "mailbox", mailboxName)
 			mailbox, err = s.backend.rdb.GetOrCreateMailboxByNameWithRetry(ctx, s.AccountID(), mailboxName)
-			if err != nil {
+			if errors.Is(err, consts.ErrMailboxInvalidName) {
+				// No mailbox can have that name. "Failure to create the specified
+				// mailbox is considered to be an error" (RFC 5490 §3.2), and on an
+				// error implementations "do an implicit keep" (RFC 5228 §2.10.6):
+				// INBOX, below. Failing the delivery would only have it retried until
+				// it bounces, and through the default script's +detail filing any
+				// sender picks the name.
+				s.WarnLog("fileinto :create of an invalid mailbox name", "mailbox", mailboxName, "error", err)
+				err = consts.ErrMailboxNotFound
+			} else if err != nil {
 				return fmt.Errorf("failed to get or create mailbox '%s': %v", mailboxName, err)
 			}
 		}

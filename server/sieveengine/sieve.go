@@ -801,7 +801,16 @@ func (r Result) Destinations(redirectFailed bool) []Destination {
 		dests = append(dests, Destination{Mailbox: mailbox, Create: create})
 	}
 	for _, mailbox := range r.Mailboxes {
-		add(mailbox, slices.Contains(r.CreateMailboxes, mailbox))
+		create := slices.Contains(r.CreateMailboxes, mailbox)
+		if create {
+			// The copy goes into the mailbox :create makes: "Foo" for "Foo/" (RFC 3501
+			// §6.3.3). A name that makes none stays as it is; creating it fails, and
+			// delivery keeps the message instead.
+			if name, err := helpers.MailboxNameToCreate(mailbox); err == nil {
+				mailbox = name
+			}
+		}
+		add(mailbox, create)
 	}
 	if r.Action == ActionKeep || r.Copy || (redirectFailed && len(dests) == 0) {
 		add(consts.MailboxInbox, false)
