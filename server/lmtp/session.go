@@ -254,10 +254,12 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 	if err != nil {
 		s.WarnLog("invalid to address", "error", err)
 		recordMetrics("failure")
+		// RFC 5321 4.2.2: 553 "mailbox name not allowed (e.g., mailbox syntax
+		// incorrect)"; RFC 3463 X.1.3 "Bad destination mailbox address syntax".
 		return &smtp.SMTPError{
-			Code:         513,
-			EnhancedCode: smtp.EnhancedCode{5, 0, 1},
-			Message:      "Invalid recipient",
+			Code:         553,
+			EnhancedCode: smtp.EnhancedCode{5, 1, 3},
+			Message:      "Invalid recipient address syntax",
 		}
 	}
 	fullAddress := toAddress.FullAddress()
@@ -466,16 +468,16 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// Enforce message size limit BEFORE reading into memory to prevent DoS
 	// Default: 50MB (configurable). Without limit, malicious senders could
 	// deliver 50+ MB messages × concurrent connections causing memory exhaustion.
-	limitToUse := settings.maxMessageSize
-	if limitToUse <= 0 {
-		limitToUse = DefaultMaxMessageSize // 50MB fallback
-	}
+	limitToUse := settings.messageSizeLimit()
 
 	// Add 1 byte to detect when limit is exceeded
 	reader := io.LimitReader(r, limitToUse+1)
 
 	_, err := io.Copy(&buf, reader)
-	if err != nil {
+	// go-smtp's DATA reader stops at the same limit (Server.MaxMessageBytesFunc) with
+	// ErrDataTooLarge: the message is too big, which is no read error.
+	tooLarge := int64(buf.Len()) > limitToUse || errors.Is(err, smtp.ErrDataTooLarge)
+	if err != nil && !tooLarge {
 		// Read errors during DATA command:
 		// - unexpected EOF: client disconnected, incomplete transmission, or malformed message stream
 		// - context canceled: timeout or shutdown
@@ -505,7 +507,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	// Check if message exceeds configured limit
 	// LimitReader allows reading limitToUse+1 bytes to detect oversized messages
-	if int64(buf.Len()) > limitToUse {
+	if tooLarge {
 		s.WarnLog("message size exceeds limit", "size", buf.Len(), "limit", limitToUse)
 		recordMetrics("failure")
 		return &smtp.SMTPError{

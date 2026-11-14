@@ -125,6 +125,15 @@ type reloadableSettings struct {
 	debug          bool
 }
 
+// messageSizeLimit is the largest message accepted: max_message_size, or
+// DefaultMaxMessageSize when it is unset or zero.
+func (s *reloadableSettings) messageSizeLimit() int64 {
+	if s.maxMessageSize > 0 {
+		return s.maxMessageSize
+	}
+	return DefaultMaxMessageSize
+}
+
 type LMTPServerBackend struct {
 	addr     string
 	name     string
@@ -360,6 +369,12 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// Our session processes one recipient at a time (Rcpt overwrites).
 	// This makes the behavior explicit and advertises LIMITS RCPTMAX=1 in LHLO,
 	// so the MTA sends each recipient in a separate transaction.
+
+	// The message size limit, asked for at every use so a reload of max_message_size
+	// applies: LHLO advertises it as "SIZE <n>", MAIL refuses a larger SIZE= declaration
+	// with 552 5.3.4 before any body is sent (RFC 1870 sections 4 and 6.1), and the DATA
+	// reader stops at it (Data still checks its own copy of the settings).
+	s.MaxMessageBytesFunc = func() int64 { return backend.settings.Load().messageSizeLimit() }
 
 	// Bound idle/slow connections so a held connection cannot pin a goroutine
 	// indefinitely (slowloris). Generous values: legit transactions finish in
