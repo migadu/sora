@@ -98,13 +98,16 @@ This configures the background janitorial service.
 *   `fts_retention`: How long to keep the `messages_fts_v2` row — which contains the FTS search vector (`text_body_tsv`) (default: empty — keep indefinitely). When this period expires the entire row is deleted and FTS search stops working for that message. Note: `text_body` is never persisted — it is cleared after the FTS vector is computed by the background worker.
 *   `instance_liveness_threshold`: How long an uploader instance may stay silent before it is considered gone (default: `"7d"`). A pending upload can only be performed by the instance that created it, because the message body is a file on that node's local disk, so an unfinished upload is reaped only once its owner either gave up (`uploader.max_attempts`) or stopped heartbeating for this long. Each uploader refreshes `instance_heartbeats` every minute. Keep this comfortably above any reboot or maintenance window — reaping a node that is merely rebooting deletes mail whose only copy is on its disk. An instance that has never recorded a heartbeat counts as alive, so its backlog is never reaped; the cleanup worker logs a WARN for both cases.
 
-### `[servers.*]`
+### `[[server]]`
 
-Each protocol (IMAP, LMTP, POP3, ManageSieve) has its own configuration table.
+Declare each server or proxy in a separate `[[server]]` block with a `type`, a unique `name` and an `addr`.
 
-*   `start`: A boolean to enable or disable the server.
+*   `type`: The listener type, such as `imap`, `pop3` or `imap_proxy`.
+*   `name`: A unique name identifying this server, including in logs and configuration reloads.
+*   `enabled`: Defaults to `true`. Set to `false` to keep the block without starting the server.
 *   `addr`: The listen address and port (e.g., `":143"`).
-*   `tls`: Set to `true` to enable TLS (e.g., for IMAPS on port 993). You must also provide `tls_cert_file` and `tls_key_file`.
+*   `tls`: Set to `true` to enable TLS (e.g., for IMAPS on port 993). The certificate comes from the global `[tls]` section when it is enabled, otherwise from `tls_cert_file` and `tls_key_file`.
+*   `tls_verify`: With `tls = true`, require a client certificate (mutual TLS), verified against the system's trusted CAs. Leave it `false` for mail clients.
 *   `max_connections`: Limits the total concurrent connections to this server.
 *   `auth_rate_limit`: Contains settings to enable and configure brute-force authentication protection.
 *   `proxy_protocol`: Contains settings to enable PROXY protocol, which is essential for seeing real client IPs when Sora is behind a load balancer. **Only enable this if you are behind a trusted proxy.**
@@ -161,9 +164,11 @@ Proxy servers also support the same multi-layered timeout protection as direct p
 *   `absolute_session_timeout`: Maximum total session duration (default: `"24h"`, or `"5m"` for `lmtp_proxy`). Set `"0"` to disable this limit. Defaults are the same at startup and after SIGHUP.
 *   `min_bytes_per_minute`: Slowloris guard, same semantics as for backends (default: `0`, disabled).
 
-Timeout settings reloaded by SIGHUP apply to new connections. Changing `debug` on
-`lmtp`, `lmtp_proxy`, or `imap_proxy` requires a restart because their protocol
-writers are configured at startup; SIGHUP reports that requirement.
+Timeout settings reloaded by SIGHUP apply to new connections. A reloaded value that
+does not parse is logged at WARN and the running value is kept (at startup it falls
+back to the default). Changing `debug` on `lmtp`, `lmtp_proxy`, or `imap_proxy`
+requires a restart because their protocol writers are configured at startup; SIGHUP
+reports that requirement.
 
 **Important:** When configuring timeout values for proxies, ensure the proxy's `command_timeout` is **longer** than any backend timeout values (including `proxy_protocol_timeout` if PROXY protocol is enabled on backends). This prevents the proxy from timing out while waiting for backend responses.
 
