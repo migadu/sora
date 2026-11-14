@@ -191,7 +191,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 			return authFailedError()
 		}
 		// Use base address (without suffix) to get account
-		AccountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, addressParsed.BaseAddress())
+		AccountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, addressParsed.BaseAddress())
 		if err != nil {
 			// Check if error is due to context cancellation (server shutdown)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -200,6 +200,19 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 					Type: imap.StatusResponseTypeNo,
 					Code: imap.ResponseCodeUnavailable,
 					Text: server.ErrServerShuttingDown.Error(),
+				}
+			}
+
+			// The database could not be asked, so nothing is known about the target:
+			// a temporary failure (RFC 5530 section 3), not a failed login charged to
+			// the master credential.
+			if server.IsTemporaryAuthFailure(err) {
+				s.WarnLog("impersonation target lookup unavailable", "target_user", addressParsed.BaseAddress(), "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeUnavailable,
+					Text: server.ErrAuthServiceUnavailable.Error(),
 				}
 			}
 

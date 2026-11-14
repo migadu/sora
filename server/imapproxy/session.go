@@ -1205,7 +1205,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	if masterAuthValidated {
 		// Master authentication already validated - just get account ID
 		s.DebugLog("master auth already validated, getting account ID from main database")
-		accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+		accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
 		if err != nil {
 			// Check if error is due to session context cancellation (server shutdown)
 			// Note: Must check s.ctx.Err(), not just the query error, because the query context
@@ -1213,6 +1213,15 @@ func (s *Session) authenticateUser(username, password string) error {
 			if s.ctx.Err() != nil {
 				s.InfoLog("master auth cancelled due to server shutdown")
 				return server.ErrServerShuttingDown
+			}
+
+			// The database could not be asked, so nothing is known about the target: a
+			// temporary failure (NO [UNAVAILABLE]), not a failed login charged to the master
+			// credential. The bare sentinel, because the reply carries the error's text.
+			if server.IsTemporaryAuthFailure(err) {
+				s.WarnLog("authentication unavailable", "method", "master", "user", address.BaseAddress(), "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+				return server.ErrAuthServiceUnavailable
 			}
 
 			s.InfoLog("master auth failed - account not found", "user", address.BaseAddress(), "error", err)

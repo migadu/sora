@@ -171,8 +171,16 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 				return errAuthFailed
 			}
 
-			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+			accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
 			if err != nil {
+				// The database could not be asked, or the command was cut short, so
+				// nothing is known about the target: TRYLATER (RFC 5804 section 1.3),
+				// not a failed login charged to the master credential.
+				if authUnavailable(err) {
+					outcome = "unavailable"
+					s.WarnLog("impersonation target lookup unavailable", "target_user", targetUserToImpersonate, "error", err)
+					return errTryLater
+				}
 				// Same reply and same accounting as a bad credential (see above).
 				s.WarnLog("impersonation target rejected (account not found)", "target_user", targetUserToImpersonate, "error", err)
 				if s.server.authLimiter != nil {
@@ -282,8 +290,14 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		// Resolve the account by the base address (stripping any +detail
 		// or @suffix), consistent with the master-username path above and
 		// the IMAP/POP3 backends.
-		accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+		accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
 		if err != nil {
+			// Unavailable: see the master-username path above.
+			if authUnavailable(err) {
+				outcome = "unavailable"
+				s.WarnLog("impersonation target lookup unavailable", "target_user", authzID, "error", err)
+				return errTryLater
+			}
 			// Same reply and same accounting as a bad credential (see above).
 			s.WarnLog("impersonation target rejected (account not found)", "target_user", authzID, "error", err)
 			if s.server.authLimiter != nil {
@@ -469,8 +483,14 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 			authSuccess = true
 			masterAuthUsed = true
 			// Use base address (without suffix) to get account
-			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+			accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
 			if err != nil {
+				// Unavailable: a temporary failure, see AuthenticatePlain.
+				if authUnavailable(err) {
+					s.WarnLog("impersonation target lookup unavailable", "target_user", address.BaseAddress(), "error", err)
+					metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "unavailable").Inc()
+					return errTryLater
+				}
 				s.WarnLog("failed to get account id", "address", address.BaseAddress(), "error", err)
 				if s.server.authLimiter != nil {
 					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
