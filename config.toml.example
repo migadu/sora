@@ -26,7 +26,7 @@ bcrypt_cost = 12
 # ADMIN CLI CONFIGURATION (for sora-admin tool)
 # =============================================================================
 # Configuration for the sora-admin CLI tool to connect to the HTTP Admin API server.
-# Required for commands like 'sora-admin stats auth', 'stats connection', 'connections list', 'connections kick', etc.
+# Required for commands like 'sora-admin stats blocked', 'stats connection', 'connections list', 'connections kick', etc.
 
 [admin_cli]
 addr = "http://localhost:8080"              # HTTP Admin API endpoint address (use https:// if TLS is enabled)
@@ -97,7 +97,8 @@ tls = false                   # Enable TLS/SSL for database connection. Recommen
 # also serves the reads through a second, dedicated pool with these same settings (so
 # writes cannot starve reads), and the process can open up to twice max_connections
 # (and keeps twice min_idle_connections) to that host. With [database.read], each
-# write host gets one pool.
+# write host gets one pool, and while no read replica is healthy all reads fall back to
+# that pool, so its max_connections must leave room for them.
 max_connections = 50            # Maximum connections in the write pool. Should be < PostgreSQL max_connections.
 min_connections = 0             # Minimum connections eagerly created on startup (default: 0 to avoid connection spikes).
 min_idle_connections = 5        # Minimum idle connections lazily maintained (recommended: 5-20 for low latency, superior to min_connections).
@@ -379,6 +380,8 @@ enabled = false                                 # Enable cluster mode (default: 
 #   addr = "10.10.10.40:7946"         # Specific IP with port (recommended)
 #   addr = "10.10.10.40"              # Specific IP (uses port from 'port' field below)
 #   addr = "192.168.1.100:7946"       # Private network IP
+#   addr = "[2001:db8::40]:7946"      # IPv6 with port (brackets required with a port)
+#   addr = "2001:db8::40"             # IPv6 (uses port from 'port' field below)
 #
 # INVALID (WILL FAIL):
 #   addr = "0.0.0.0:7946"             # Cannot use 0.0.0.0 - other nodes cannot reach you
@@ -419,10 +422,13 @@ node_id = ""                                    # Unique node ID (default: hostn
                                                 # instance claims them and the cleaner deletes them once they pass
                                                 # uploader.cleanup_grace_period. Before changing this, stop delivery to the
                                                 # node and wait until it owns no pending_uploads rows.
-peers = []                                      # Initial seed nodes for cluster discovery (e.g., ["node-1.example.com:7946", "node-2.example.com:7946"])
-                                                # IMPORTANT: Do NOT include this node's own node_id in the peers list!
-                                                # Only list OTHER nodes in the cluster. Self-references will be filtered out
-                                                # automatically and a warning will be logged.
+peers = []                                      # Seed nodes for cluster discovery (e.g., ["node-1.example.com:7946", "[2001:db8::41]:7946"])
+                                                # A port-less entry uses this node's gossip port. An entry that names only
+                                                # this node's own address is ignored with a warning, so one list can be
+                                                # shared by every node. Peers that are not members (after a partition or a
+                                                # restart) are joined again every 10 seconds; list each node by the address
+                                                # it advertises (its addr): an entry naming several nodes counts as present
+                                                # while any one of them, this node included, is a member.
 secret_key = ""                                 # Cluster encryption key: base64-encoded 32-byte key.
                                                 # REQUIRED whenever cluster mode is enabled — the server refuses to
                                                 # start without it (gossip carries auth/rate-limit/kick state that an
@@ -873,8 +879,9 @@ enabled = false
 # timeout = "10s"
 
 # Maximum message size to submit (default: "10mb")
-# Messages larger than this are skipped (not submitted for training)
-# Attachments are already stripped, so this applies to the text content size
+# Messages larger than this are skipped (not submitted for training). The size is
+# the stored message size, attachments included, so a larger message is skipped
+# before its body is fetched from S3.
 # max_message_size = "10mb"
 
 # Maximum attachment size threshold (default: "0")
@@ -888,6 +895,16 @@ enabled = false
 # When false, MOVE command waits for training submission to complete
 # RECOMMENDED: Keep true to avoid slowing down IMAP operations
 # async = true
+
+# Workers that fetch and submit training messages, process-wide (default: 4)
+# At most this many message bodies are fetched and sent at once, however many
+# messages a MOVE touches.
+# workers = 4
+
+# Messages waiting for a worker (default: 1000)
+# A message moved while the queue is full is not submitted; it is counted in
+# sora_spam_training_messages_total{result="dropped"}.
+# queue_size = 1000
 
 # Circuit breaker configuration for training endpoint
 # Protects against cascading failures if the training endpoint becomes unavailable
@@ -1085,6 +1102,8 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # UIDPLUS, LIST-STATUS, STATUS=SIZE, CHILDREN, ...) also removes IMAP4rev2, so
 # the server offers IMAP4rev1 with its remaining extensions; disabling CONDSTORE
 # also removes QRESYNC. client_filters follow the same rule.
+# SASL-IR, LITERAL-, UNSELECT, ENABLE and UTF8=ACCEPT are always advertised with
+# IMAP4rev1 and cannot be disabled; naming them only logs a warning.
 # STARTTLS, LOGINDISABLED and AUTH=PLAIN follow tls, tls_use_starttls and
 # insecure_auth; disabled_caps does not change them.
 
@@ -1288,6 +1307,8 @@ auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expire
 # Memory safety limits (prevents unbounded growth during burst attacks)
 # These limits protect against memory exhaustion when under sustained attack. When a map exceeds
 # its size limit, the oldest entries (by FirstFailure time) are evicted using LRU policy.
+# max_ip_entries evicts the counters of addresses that are not blocked first and never removes
+# an IP block: a block lasts until ip_block_duration ends.
 # There is no unlimited setting: 0, like any key left out, takes the default.
 #
 # RECOMMENDED VALUES:
@@ -1681,6 +1702,10 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 #
 # The remote_lookup service is called via HTTP GET with email interpolation.
 # The URL can contain $email placeholder which is replaced with the URL-encoded email address.
+# $ip is replaced with the client's IP address: the source of the PROXY header when the proxy
+# receives one, else the connecting peer. On lmtp_proxy the client is the delivering MTA.
+# A URL containing $ip bypasses the proxy's lookup cache: verdicts and routes may differ
+# between networks, while the cache is keyed by user. Other URLs keep the configured TTLs.
 #
 # Example URLs:
 #   "http://localhost:8080/lookup?email=$email" → GET /lookup?email=user@domain.com
@@ -1880,7 +1905,7 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # failure_ratio = 0.6             # Failure ratio threshold to open circuit (0.0-1.0, default: 0.6 = 60%)
                                     # Circuit opens when this percentage of recent requests fail
                                     # Production: Consider 0.7-0.8 for less sensitive triggering
-  # min_requests = 3                # Minimum requests before evaluating failure ratio (default: 3)
+  # min_requests = 3                # Minimum completed requests before evaluating failure ratio (default: 3)
                                     # Prevents opening circuit on very few requests
                                     # IMPORTANT: Should be ≤ max_requests to avoid getting stuck
                                     # Production: Consider 5-10 for more stable thresholds

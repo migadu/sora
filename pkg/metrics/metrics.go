@@ -689,3 +689,14 @@ var (
 		[]string{"protocol"},
 	)
 )
+
+// Spam training metrics
+var (
+	SpamTrainingMessagesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_spam_training_messages_total",
+			Help: "Messages moved to or from Junk, by spam training outcome (submitted, failed, too_large, dropped)",
+		},
+		[]string{"result"},
+	)
+)

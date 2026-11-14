@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -65,6 +66,17 @@ func (r *RelayConfig) IsHTTP() bool {
 // IsQueueEnabled returns true if relay is configured (queue is always enabled when relay is configured)
 func (r *RelayConfig) IsQueueEnabled() bool {
 	return r.IsConfigured()
+}
+
+// Validate checks that a configured relay has a type the server can send with. Any
+// [relay] type turns the relay queue on, but only "smtp" and "http" (exactly) have a
+// handler, so any other type would queue every Sieve redirect and vacation reply with
+// no worker to send it.
+func (r *RelayConfig) Validate() error {
+	if !r.IsConfigured() || r.IsSMTP() || r.IsHTTP() {
+		return nil
+	}
+	return fmt.Errorf("unsupported [relay] type %q: expected \"smtp\" or \"http\"", r.Type)
 }
 
 // GetSMTPTLS reports whether the SMTP relay connection uses TLS (default true).

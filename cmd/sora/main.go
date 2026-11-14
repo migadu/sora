@@ -288,6 +288,9 @@ func main() {
 	if deps.relayWorker != nil {
 		defer deps.relayWorker.Stop()
 	}
+	if deps.spamTrainingClient != nil {
+		defer deps.spamTrainingClient.Close()
+	}
 
 	// SIGHUP handler for config reload - set up AFTER deps is created so the running
 	// servers are registered. Global settings are only reported (handleConfigReload
@@ -477,6 +480,11 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 	// and the proxy servers that route into them.
 	if err := cfg.ValidatePools(); err != nil {
 		errorHandler.ValidationError("[[pool]]", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+
+	if err := cfg.Relay.Validate(); err != nil {
+		errorHandler.ValidationError("[relay]", err)
 		os.Exit(errorHandler.WaitForExit())
 	}
 
@@ -1021,6 +1029,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 				// would be 250-accepted into pending/ and sit there forever. Refuse to
 				// start rather than accept mail into a dead end.
 				errorHandler.FatalError("configure relay", fmt.Errorf("unsupported [relay] type %q: expected \"smtp\" or \"http\"", cfg.Relay.Type))
+				os.Exit(errorHandler.WaitForExit())
 			}
 
 			if relayHandler != nil {
@@ -1903,6 +1912,8 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseIDCommand:       serverConfig.RemoteUseIDCommand,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -2036,6 +2047,8 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseXCLIENT:         serverConfig.RemoteUseXCLIENT,
 		RemoteUseUTF8:            serverConfig.RemoteUseUTF8,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -2163,6 +2176,8 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		RemoteTLSUseStartTLS:     serverConfig.RemoteTLSUseStartTLS,
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -2290,6 +2305,8 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseXCLIENT:         serverConfig.RemoteUseXCLIENT,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -2469,6 +2486,10 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		MaxRedirectHops:    serverConfig.GetMaxRedirectHops(),
 		SieveExtensions:    deps.config.Sieve.EnabledExtensions,
 		SharedMailboxes:    deps.config.SharedMailboxes,
+		// Incoming PROXY headers, accepted only from trusted_networks.
+		ProxyProtocol:        serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout: serverConfig.GetProxyProtocolTimeoutWithDefault(),
+		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
 	}
 	// Set only when the feature is on: a nil pointer stored in an interface field is a
 	// non-nil interface, and the handlers tell "not enabled on this node" by comparing
