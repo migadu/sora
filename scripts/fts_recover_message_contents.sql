@@ -15,11 +15,13 @@
 --
 -- WHO NEEDS IT. A database that ran 23 before #791, unless the vectors were copied out of
 -- band at the time. This counts, in a sample of message_contents, the bodies that a message's
--- mailbox owner has no messages_fts_v2 row for; 0 means there is nothing to recover. With
+-- mailbox owner has no messages_fts_v2 row for. A nonzero result confirms missing rows;
+-- zero in a sample is not proof that every row has been recovered. Include queued text as
+-- well as vectors. For an exhaustive check, remove LIMIT 10000. With
 -- fts_retention set, rows older than it are missing from messages_fts_v2 on purpose, so add
 -- AND sent_date > now() - interval '<retention>' to the sample:
 --   SELECT count(*) FROM (SELECT content_hash FROM message_contents
---                         WHERE text_body_tsv IS NOT NULL LIMIT 10000) mc
+--                         WHERE text_body_tsv IS NOT NULL OR text_body IS NOT NULL LIMIT 10000) mc
 --   WHERE EXISTS (SELECT 1 FROM messages m LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
 --                 WHERE m.content_hash = mc.content_hash
 --                   AND NOT EXISTS (SELECT 1 FROM messages_fts_v2 v
@@ -34,6 +36,10 @@
 -- content_hash order and prints after each batch the CALL that resumes after it. Re-running is
 -- a no-op for rows already copied. Arguments: (after_hash, batch_bodies, sleep_ms), default
 -- (NULL, 5000, 100); raise sleep_ms if replica lag grows, since replicas serve searches.
+-- An older binary can write a hash or a new owner behind the current cursor. Before treating
+-- recovery as complete, stop/drain every binary that still writes message_contents, then
+-- run the procedure again from NULL and perform the exhaustive missing-row check above.
+-- Resuming from a printed cursor alone cannot recover such late writes behind it.
 --
 -- COST. Every message_contents row with a vector or text is read once, and every messages row
 -- holding its body (to find the mailbox owner). A copied row is a messages_fts_v2 insert with
@@ -42,7 +48,8 @@
 --
 -- Afterwards: DROP PROCEDURE sora_fts_recover_message_contents(varchar, int, int);
 --             DROP FUNCTION sora_fts_recover_batch(varchar, int);
--- message_contents is then read by nothing and can be dropped to free its space.
+-- Only after old writers are drained and the final full pass/check succeeds can
+-- message_contents be dropped to free its space. Do not drop it during a rolling upgrade.
 
 -- One batch: the next p_batch bodies after p_after that have a vector or text. Returns the rows
 -- added, the bodies read and the last of them, where the next batch starts.
