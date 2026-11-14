@@ -278,3 +278,30 @@ func TestConfigDumpMasksEverySecretField(t *testing.T) {
 		})
 	}
 }
+
+// `config dump` shows the configuration the server runs with. A [database.write] or
+// [database.read] endpoint the file does not define is not one the server uses (a
+// proxy runs without a database); the dump used to show the built-in localhost one.
+func TestConfigDumpShowsTheDatabaseEndpointsTheServerUses(t *testing.T) {
+	for _, tc := range []struct {
+		name, toml          string
+		wantWrite, wantRead bool
+	}{
+		{"no endpoint", "[database]\nquery_timeout = \"10s\"\n", false, false},
+		{"write endpoint only", "[database.write]\nhosts = [\"db1.example.com\"]\n", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dump := runConfigDump(t, []byte(tc.toml), "toml")
+			if got := strings.Contains(dump, "[database.write]"); got != tc.wantWrite {
+				t.Errorf("dump shows [database.write]: %v, want %v\n%s", got, tc.wantWrite, dump)
+			}
+			if got := strings.Contains(dump, "[database.read]"); got != tc.wantRead {
+				t.Errorf("dump shows [database.read]: %v, want %v\n%s", got, tc.wantRead, dump)
+			}
+			// A table in the file takes the server's defaults for the keys it leaves out.
+			if tc.wantWrite && !strings.Contains(dump, `name = "sora_mail_db"`) {
+				t.Errorf("dump does not show the default database name for [database.write]:\n%s", dump)
+			}
+		})
+	}
+}

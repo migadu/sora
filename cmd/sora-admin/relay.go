@@ -362,7 +362,22 @@ func handleRelayRequeue(_ context.Context) {
 
 	// The queue does the move, so requeue keeps the order its own writers rely on: a
 	// running server's worker picks the message up on its next resync of pending/.
+	// NewDiskQueue creates missing directories, and created by `sudo sora-admin` they
+	// would belong to root, where the server, running as its own user, cannot queue:
+	// requeue only works on a queue the server has made.
 	queuePath := cfg.Relay.GetQueuePath()
+	for _, dir := range []string{"failed", "pending", "processing"} {
+		path := filepath.Join(queuePath, dir)
+		info, err := os.Stat(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error accessing relay queue: %v\n", err)
+			os.Exit(1)
+		}
+		if !info.IsDir() {
+			fmt.Fprintf(os.Stderr, "Error accessing relay queue: %s is not a directory\n", path)
+			os.Exit(1)
+		}
+	}
 	queue, err := relayqueue.NewDiskQueue(queuePath, cfg.Relay.Queue.MaxAttempts, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error accessing relay queue: %v\n", err)
@@ -443,7 +458,7 @@ Examples:
   sora-admin relay requeue --config config.toml --id all --confirm
 
 Notes:
-  - The relay queue must be enabled in config.toml
+  - The relay queue is used whenever [relay] is configured (there is no separate switch)
   - Use --confirm flag for destructive operations (delete, requeue)
   - Queue types: pending, processing, failed
   - Requeue resets attempt count and clears error history

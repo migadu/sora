@@ -648,11 +648,13 @@ func (db *Database) GetDeletedMessageUIDsAndSeqs(ctx context.Context, mailboxID 
 	return results, rows.Err()
 }
 
-// GetRecentMessagesForWarmup fetches the most recent messages from specified mailboxes for cache warming
-// Returns a map of mailboxName -> []contentHash for the most recent messages
-func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
+// GetRecentMessagesForWarmup fetches the most recent messages from specified mailboxes for cache warming.
+// Returns a map of mailboxName -> the bodies of up to messageCount of its most recent messages. Each
+// body is the S3 object its message row points at, under the address it was stored with, which is
+// not the account's primary address once that has changed.
+func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]ContentObject, error) {
 	if messageCount <= 0 {
-		return make(map[string][]string), nil
+		return make(map[string][]ContentObject), nil
 	}
 
 	// Check if account has any mailboxes - skip warmup for new accounts to avoid noise
@@ -662,45 +664,38 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID in
 	}
 	if mailboxCount == 0 {
 		// New account with no mailboxes yet - skip warmup silently
-		return make(map[string][]string), nil
+		return make(map[string][]ContentObject), nil
 	}
 
-	result := make(map[string][]string)
+	result := make(map[string][]ContentObject)
 
 	for _, mailboxName := range mailboxNames {
 		mailbox, err := db.GetMailboxByName(ctx, AccountID, mailboxName)
 		if err != nil {
-			log.Printf("WarmUp: failed to get mailbox '%s' for user %d: %v", mailboxName, AccountID, err)
+			logger.Debug("WarmUp: failed to get mailbox", "mailbox", mailboxName, "account_id", AccountID, "error", err)
 			continue // Skip this mailbox if not found
 		}
 
-		// Create search criteria to get all messages (no filters)
-		criteria := &imap.SearchCriteria{}
-
-		// Get the most recent messages. Use SearchMessagesWithCriteria to trigger the
-		// fast-path ORDER BY uid DESC which operates in O(1) via indices, instead of
-		// forcing a massive in-memory ordering on internal_date.
-		messages, err := db.SearchMessagesWithCriteria(ctx, mailbox.ID, mailbox.AccountID, criteria, messageCount, 0)
+		// The most recent messages by UID, which the (mailbox_id, uid) index returns in
+		// order, instead of sorting the mailbox by internal_date.
+		rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+			SELECT s3_domain, s3_localpart, content_hash
+			FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			ORDER BY uid DESC
+			LIMIT $2`, mailbox.ID, messageCount)
 		if err != nil {
-
-			log.Printf("WarmUp: failed to get recent messages for mailbox '%s': %v", mailboxName, err)
+			logger.Debug("WarmUp: failed to get recent messages", "mailbox", mailboxName, "account_id", AccountID, "error", err)
+			continue
+		}
+		objects, err := pgx.CollectRows(rows, pgx.RowToStructByPos[ContentObject])
+		if err != nil {
+			logger.Debug("WarmUp: failed to read recent messages", "mailbox", mailboxName, "account_id", AccountID, "error", err)
 			continue
 		}
 
-		// Extract content hashes for the most recent messages (up to messageCount)
-		var contentHashes []string
-		for i, message := range messages {
-			if i >= messageCount {
-				break
-			}
-			if message.ContentHash != "" {
-				contentHashes = append(contentHashes, message.ContentHash)
-			}
-		}
-
-		if len(contentHashes) > 0 {
-			result[mailboxName] = contentHashes
-			log.Printf("WarmUp: prepared %d content hashes for mailbox '%s'", len(contentHashes), mailboxName)
+		if len(objects) > 0 {
+			result[mailboxName] = objects
 		}
 	}
 

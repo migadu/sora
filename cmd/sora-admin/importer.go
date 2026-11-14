@@ -599,7 +599,7 @@ func (i *Importer) processSubscriptions() error {
 
 	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
 	if err != nil {
-		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
+		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", i.email, err, i.email)
 	}
 	user := server.NewUser(address, accountID)
 
@@ -682,7 +682,7 @@ func (i *Importer) importSieveScript() error {
 
 	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
 	if err != nil {
-		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
+		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", i.email, err, i.email)
 	}
 	user := server.NewUser(address, accountID)
 
@@ -796,7 +796,7 @@ func (i *Importer) performDryRun() error {
 
 	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
 	if err != nil {
-		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
+		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", i.email, err, i.email)
 	}
 	user := server.NewUser(address, accountID)
 
@@ -925,7 +925,7 @@ func (i *Importer) performDryRun() error {
 
 		// Show flags if preserve-flags is enabled
 		if i.options.PreserveFlags {
-			flags := i.parseMaildirFlags(filename)
+			flags := i.parseMaildirFlagsWith(filename, i.keywordsForMessagePath(path))
 			if len(flags) > 0 {
 				var flagNames []string
 				for _, flag := range flags {
@@ -1100,14 +1100,10 @@ func specialFolderName(name string) string {
 	return name
 }
 
-// parseMaildirFlags extracts IMAP flags from a maildir filename.
-func (i *Importer) parseMaildirFlags(filename string) []imap.Flag {
-	return i.parseMaildirFlagsWith(filename, i.dovecotKeywords)
-}
-
-// parseMaildirFlagsWith is parseMaildirFlags with an explicit keyword map: the a-z
-// keyword letters in a maildir filename are indexes into the dovecot-keywords file OF
-// THAT FOLDER, and every folder has its own file and numbering (keywordsForMessagePath).
+// parseMaildirFlagsWith extracts IMAP flags from a maildir filename. The a-z keyword
+// letters in it are indexes into the dovecot-keywords file OF THAT FOLDER, and every
+// folder has its own file and numbering, so keywords is keywordsForMessagePath's map
+// for the message.
 func (i *Importer) parseMaildirFlagsWith(filename string, keywords map[int]string) []imap.Flag {
 	var flags []imap.Flag
 
@@ -1242,7 +1238,7 @@ func (i *Importer) scanMaildir() error {
 		// Check if there's a Maildir subdirectory (common mistake)
 		possibleMaildir := filepath.Join(cleanPath, "Maildir")
 		if isMaildirFolder(possibleMaildir) {
-			return fmt.Errorf("path '%s' is not a valid maildir root.\nDid you mean to use '%s' instead?\nThe path should point directly to a maildir (containing cur/, new/, tmp/ directories)", cleanPath, possibleMaildir)
+			return fmt.Errorf("path '%s' is not a valid maildir root.\nDid you mean to use '%s' instead?\nThe path should point directly to a maildir (containing cur/ or new/)", cleanPath, possibleMaildir)
 		}
 
 		// Check for other common maildir subdirectories
@@ -1258,11 +1254,11 @@ func (i *Importer) scanMaildir() error {
 				}
 			}
 			if len(suggestions) > 0 {
-				return fmt.Errorf("path '%s' is not a valid maildir root.\nFound possible maildir(s): %s\nThe path should point directly to a maildir (containing cur/, new/, tmp/ directories)", cleanPath, strings.Join(suggestions, ", "))
+				return fmt.Errorf("path '%s' is not a valid maildir root.\nFound possible maildir(s): %s\nThe path should point directly to a maildir (containing cur/ or new/)", cleanPath, strings.Join(suggestions, ", "))
 			}
 		}
 
-		return fmt.Errorf("path '%s' is not a valid maildir root (must contain cur/, new/, and tmp/ directories)", cleanPath)
+		return fmt.Errorf("path '%s' is not a valid maildir root (must contain cur/ or new/)", cleanPath)
 	}
 
 	// --- Parallel Processing Setup ---
@@ -2596,8 +2592,10 @@ func parseKeywordsFile(path string) (map[int]string, error) {
 // keywordsForMessagePath returns the keyword map that applies to a message file:
 // Dovecot keeps a dovecot-keywords file PER FOLDER, each with its own index → name
 // numbering, so the letters in a file under .Sent/cur/ mean whatever .Sent/dovecot-
-// keywords says — not what the root file says. A folder without its own file falls
-// back to the root map (INBOX's), which is also what a single-folder maildir has.
+// keywords says — not what the root file says. A folder without its own file, or
+// whose file cannot be read, has no keywords: Dovecot clears the list when the file
+// does not exist (maildir-keywords.c, maildir_keywords_sync), so the root map
+// (INBOX's) names nothing outside the root.
 // Results are cached per folder directory; safe for the parallel workers.
 func (i *Importer) keywordsForMessagePath(path string) map[int]string {
 	// path is <folder>/{cur,new}/<file>
@@ -2608,14 +2606,16 @@ func (i *Importer) keywordsForMessagePath(path string) map[int]string {
 		return kws
 	}
 	keywordsPath := filepath.Join(dir, "dovecot-keywords")
-	kws := i.dovecotKeywords
+	var kws map[int]string
 	// Like the root (INBOX) file, read in NewImporter, a folder's file is read only
 	// with --dovecot.
-	if i.options.Dovecot && dir != filepath.Clean(i.maildirPath) {
+	if dir == filepath.Clean(i.maildirPath) {
+		kws = i.dovecotKeywords
+	} else if i.options.Dovecot {
 		if _, err := os.Stat(keywordsPath); err == nil {
 			parsed, perr := parseKeywordsFile(keywordsPath)
 			if perr != nil {
-				logger.Warn("Failed to parse folder dovecot-keywords, using the root map", "path", keywordsPath, "error", perr)
+				logger.Warn("Failed to read folder dovecot-keywords, importing its messages without keywords", "path", keywordsPath, "error", perr)
 			} else {
 				kws = parsed
 				logger.Info("Loaded folder dovecot-keywords", "path", keywordsPath, "count", len(parsed))

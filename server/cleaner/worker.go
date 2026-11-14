@@ -15,6 +15,7 @@ package cleaner
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"time"
@@ -71,7 +72,7 @@ type DatabaseManager interface {
 	ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error) error
 	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
 	PruneOldMessageVectorsWithRetry(ctx context.Context, retention time.Duration) (int64, error)
-	GetUnusedFTSKeysWithRetry(ctx context.Context, limit int) ([]db.FTSKey, error)
+	GetUnusedFTSKeysWithRetry(ctx context.Context, after db.FTSKey, limit int) ([]db.FTSKey, db.FTSKey, error)
 	DeleteMessagesFTSByKeyBatchWithRetry(ctx context.Context, keys []db.FTSKey) (int64, error)
 	DeleteFTSRowsForAccountWithRetry(ctx context.Context, accountID int64, limit int) (int64, error)
 	// GetDanglingAccountsForFinalDeletionWithRetry lists soft-deleted accounts with no
@@ -101,6 +102,7 @@ type CleanupWorker struct {
 	gracePeriod           time.Duration
 	maxAgeRestriction     time.Duration
 	ftsRetention          time.Duration // How long to keep FTS vectors
+	ftsSweepCursor        db.FTSKey     // Where the next messages_fts_v2 orphan sweep resumes
 	healthStatusRetention time.Duration
 	redirectLogRetention  time.Duration // The redirect rate window or grace_period, whichever is longer
 	uploadMaxAttempts     int           // Uploader max_attempts: an upload is only given up on beyond it
@@ -124,6 +126,11 @@ func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.C
 	// (an IMAP- or POP3-only backend) knows no window but the 1h default.
 	redirectLogRetention := max(gracePeriod, redirectRateWindow)
 
+	// The orphan sweep starts at a random point rather than at the lowest hash: a node
+	// restarted more often than it takes to cover messages_fts_v2 would otherwise never get
+	// past the same low end of the table. Content hashes are hex.
+	ftsSweepStart := db.FTSKey{ContentHash: fmt.Sprintf("%016x", rand.Uint64())}
+
 	return &CleanupWorker{
 		rdb:                   rdb,         // *resilient.ResilientDatabase implements DatabaseManager
 		s3:                    resilientS3, // *resilient.ResilientS3Storage implements S3Manager
@@ -132,6 +139,7 @@ func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.C
 		gracePeriod:           gracePeriod,
 		maxAgeRestriction:     maxAgeRestriction,
 		ftsRetention:          ftsRetention,
+		ftsSweepCursor:        ftsSweepStart,
 		healthStatusRetention: healthStatusRetention,
 		redirectLogRetention:  redirectLogRetention,
 		uploadMaxAttempts:     uploadMaxAttempts,
@@ -569,7 +577,9 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	// If a user permanently deletes an email (S3 object deleted), their FTS vector
 	// is orphaned in messages_fts_v2. The vector TTL (Phase 2a) eventually kills it,
 	// but sweeping guarantees we don't leak vectors infinitely if fts_retention = 0.
-	orphanKeys, err := w.rdb.GetUnusedFTSKeysWithRetry(ctx, db.BATCH_PURGE_SIZE)
+	// One run scans a bounded part of the table, so each run resumes where the previous
+	// one stopped and wraps around at the end.
+	orphanKeys, nextCursor, err := w.rdb.GetUnusedFTSKeysWithRetry(ctx, w.ftsSweepCursor, db.BATCH_PURGE_SIZE)
 	if err != nil {
 		logger.Error("Cleanup: Failed to list unused FTS keys for global cleanup", "error", err)
 		return fmt.Errorf("failed to list unused FTS keys for global cleanup: %w", err)
@@ -581,11 +591,13 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 
 		deletedCount, err := w.rdb.DeleteMessagesFTSByKeyBatchWithRetry(ctx, orphanKeys)
 		if err != nil {
+			nextCursor = w.ftsSweepCursor // the next run scans these rows again
 			logger.Error("Cleanup: Failed to batch delete from messages_fts_v2 - will be retried on next run", "error", err)
 		} else if deletedCount > 0 {
 			logger.Info("Cleanup: Deleted orphaned FTS vectors", "count", deletedCount)
 		}
 	}
+	w.ftsSweepCursor = nextCursor
 
 	// --- Phase 3: Final account deletion ---
 	// After all associated data (S3 objects, messages, etc.) has been cleaned up,
