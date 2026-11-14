@@ -565,6 +565,11 @@ func (c *HTTPRemoteLookupClient) HealthCheck(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create health check request: %w", err)
 	}
+	// Authenticate like a lookup, so an endpoint that requires the token sees no
+	// unauthenticated requests from the proxies.
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
