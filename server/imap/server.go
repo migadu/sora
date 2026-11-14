@@ -1903,6 +1903,10 @@ func (s *IMAPServer) GetLookupCache() *lookupcache.LookupCache {
 // Authenticate authenticates a user with caching support.
 // This method wraps the database authentication with an optional lookup cache layer.
 // The cache decorates the database call - this is the proper architectural pattern.
+// An error wrapping server.ErrAuthServiceUnavailable (server.IsTemporaryAuthFailure)
+// is no verdict on the password: the database could not be asked, or the stored hash
+// cannot be checked. It is answered as a temporary failure and not counted as a failed
+// login.
 func (s *IMAPServer) Authenticate(ctx context.Context, address, password string) (accountID int64, err error) {
 	// Check context before any work
 	if err := ctx.Err(); err != nil {
@@ -1954,17 +1958,25 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 
 	// Verify password
 	if err := db.VerifyPassword(hashedPassword, password); err != nil {
-		reason := "invalid_password"
 		if errors.Is(err, db.ErrUnverifiableHash) {
-			// No password matches the stored hash: not a wrong password, so nothing is
-			// cached. VerifyPassword logged why, without the address.
-			reason = "unverifiable_hash"
-		} else if s.lookupCache != nil {
-			// Cache negative result for invalid password if enabled
-			// AuthInvalidPassword = 2 (from lookupcache package)
+			// No password matches the stored hash, so this is no verdict on the submitted
+			// one: the stored data is at fault, and only an administrator can repair it.
+			// Answered like a database outage, as the proxies do: a temporary failure,
+			// not counted as a failed login (a block earned on it would outlast the
+			// repair), nothing cached. A login cached for this address was verified
+			// against another hash than the one now stored, so it is dropped: while it
+			// stays, every password that misses it is answered here, uncounted, and the
+			// cached one still signs in. VerifyPassword logged why, without the address.
+			s.lookupCache.Invalidate(address)
+			logger.Warn("authentication unavailable", "address", address, "reason", "unverifiable_hash", "method", "main_db", "error", err)
+			return 0, fmt.Errorf("%w: %w", serverPkg.ErrAuthServiceUnavailable, err)
+		}
+		// Cache negative result for invalid password if enabled
+		// AuthInvalidPassword = 2 (from lookupcache package)
+		if s.lookupCache != nil {
 			s.lookupCache.SetFailure(address, 2)
 		}
-		logger.Info("authentication failed", "address", address, "reason", reason, "cached", false, "method", "main_db")
+		logger.Info("authentication failed", "address", address, "reason", "invalid_password", "cached", false, "method", "main_db")
 		return 0, err
 	}
 

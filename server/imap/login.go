@@ -253,10 +253,10 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 				}
 			}
 
-			// The database could not be asked, so nothing is known about the credentials:
-			// a temporary failure (RFC 5530 section 3, "a subsystem is down"), not counted
-			// as a failed login, or clients retrying a saved password through an outage
-			// stay blocked after it.
+			// The database could not be asked, or the stored hash cannot be checked, so
+			// nothing is known about the credentials: a temporary failure (RFC 5530
+			// section 3, "a subsystem is down"), not counted as a failed login, or clients
+			// retrying a saved password through an outage stay blocked after it.
 			if server.IsTemporaryAuthFailure(err) {
 				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
 				return &imap.Error{

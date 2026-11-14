@@ -1027,6 +1027,7 @@ func hashFile(path string) (string, int64, error) {
 	if err != nil {
 		return "", 0, err
 	}
+	defer reader.Close()
 
 	hasher := helpers.NewContentHasher()
 	size, err := io.Copy(hasher, reader)
@@ -1617,8 +1618,8 @@ func (i *Importer) getOrCreateMailbox(ctx context.Context, AccountID int64, name
 // compressed with gz, bz2, lz4 or zstd. Like Dovecot's compression_detect_handler(), it
 // goes by the magic bytes, never by the file name. compressed reports whether it
 // decompresses. The scan's hash and the upload both read through it, so they always see
-// the same bytes.
-func maildirContentReader(r io.Reader) (content io.Reader, compressed bool, err error) {
+// the same bytes. The caller closes content, which hands a zstd decoder back for reuse.
+func maildirContentReader(r io.Reader) (content io.ReadCloser, compressed bool, err error) {
 	br := bufio.NewReader(r)
 	magic, err := br.Peek(len(dovecotLZ4Magic)) // the longest magic
 	if err != nil && err != io.EOF {
@@ -1634,18 +1635,15 @@ func maildirContentReader(r io.Reader) (content io.Reader, compressed bool, err 
 		return zr, true, nil
 	case len(magic) >= 4 && bytes.HasPrefix(magic, []byte("BZh")) && magic[3] >= '1' && magic[3] <= '9':
 		// bzip2: "BZh" + block size digit.
-		return bzip2.NewReader(br), true, nil
+		return io.NopCloser(bzip2.NewReader(br)), true, nil
 	case bytes.HasPrefix(magic, []byte(dovecotLZ4Magic)):
 		zr, err := newDovecotLZ4Reader(br)
 		if err != nil {
 			return nil, false, err
 		}
-		return zr, true, nil
+		return io.NopCloser(zr), true, nil
 	case bytes.HasPrefix(magic, []byte{0x28, 0xb5, 0x2f, 0xfd}):
-		// zstd. The window, which the decoder holds in memory, is capped at the 128 MiB
-		// libzstd (and so Dovecot) decodes by default, ZSTD_WINDOWLOG_LIMIT_DEFAULT. A
-		// single-goroutine decoder needs no Close.
-		zr, err := zstd.NewReader(br, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(1<<27))
+		zr, err := newMaildirZstdReader(br)
 		if err != nil {
 			return nil, false, fmt.Errorf("failed to create zstd reader: %w", err)
 		}
@@ -1659,7 +1657,52 @@ func maildirContentReader(r io.Reader) (content io.Reader, compressed bool, err 
 	case bytes.HasPrefix(magic, []byte{0x04, 0x22, 0x4d, 0x18}):
 		return nil, false, fmt.Errorf("lz4-compressed maildir file is not supported; decompress it first")
 	}
-	return br, false, nil
+	return io.NopCloser(br), false, nil
+}
+
+// zstdDecoders holds the zstd decoders of maildir files no one is reading. On the first
+// block of a frame a decoder allocates its history, the frame's window and up to 1 MiB
+// more, and keeps it across Reset. Dovecot's default level writes a 2 MiB window however
+// small the message, so a decoder per file would allocate 3 MiB per message, in the scan
+// and again in the upload.
+var zstdDecoders sync.Pool
+
+// maildirZstdReader reads one zstd-compressed maildir file through a reused decoder.
+type maildirZstdReader struct {
+	d *zstd.Decoder
+}
+
+func newMaildirZstdReader(r io.Reader) (*maildirZstdReader, error) {
+	d, _ := zstdDecoders.Get().(*zstd.Decoder)
+	if d == nil {
+		// The window, which the decoder holds in memory, is capped at the 128 MiB libzstd
+		// (and so Dovecot) decodes by default, ZSTD_WINDOWLOG_LIMIT_DEFAULT. A
+		// single-goroutine decoder decodes in the caller's goroutine and starts none of
+		// its own.
+		var err error
+		d, err = zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(1<<27))
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := d.Reset(r); err != nil {
+		return nil, err
+	}
+	return &maildirZstdReader{d: d}, nil
+}
+
+func (z *maildirZstdReader) Read(p []byte) (int, error) {
+	return z.d.Read(p)
+}
+
+// Close hands the decoder back for the next file, without its reference to this one.
+func (z *maildirZstdReader) Close() error {
+	if z.d != nil {
+		z.d.Reset(nil)
+		zstdDecoders.Put(z.d)
+		z.d = nil
+	}
+	return nil
 }
 
 // decompressIfNeeded returns the message stored in a maildir file's content (see
@@ -1669,6 +1712,7 @@ func decompressIfNeeded(content []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer reader.Close()
 	if !compressed {
 		return content, nil
 	}

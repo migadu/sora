@@ -273,7 +273,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		return nil, ierr
 	}
 
-	// Safety guard: Reject if global staging limit is exceeded
+	// Safety guard: Reject if this node's staging limit is exceeded
 	if s.server.uploader.IsStagingLimitExceeded(int64(len(fullMessageBytes))) {
 		s.WarnLog("rejecting APPEND due to upload staging size limit exceeded")
 		imapErr := &imap.Error{
