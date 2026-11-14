@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -35,6 +36,109 @@ func newACMENewOrderRequest(t *testing.T, domain string) *http.Request {
 }
 
 type okRoundTripper struct{}
+
+type orderRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f orderRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestCacheMissOrderRetryReleasesClaimAfterPut(t *testing.T) {
+	const domain = "retry.example.com"
+	ctx := context.Background()
+	fence := newFakeFence()
+	nodeA, nodeB := splitBrainNode(fence), splitBrainNode(fence)
+	gate := newIssuanceGate(emptyCache{}, nodeA)
+	if _, err := gate.Get(ctx, domain); !errors.Is(err, autocert.ErrCacheMiss) {
+		t.Fatalf("Get: %v", err)
+	}
+	for _, transportFailure := range []bool{false, true} {
+		rt := &issuanceFence{manager: nodeA, base: orderRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			if transportFailure {
+				return nil, io.ErrUnexpectedEOF
+			}
+			return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+		})}
+		resp, _ := rt.RoundTrip(newACMENewOrderRequest(t, domain))
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}
+	rt := &issuanceFence{manager: nodeA, base: okRoundTripper{}}
+	if _, err := rt.RoundTrip(newACMENewOrderRequest(t, domain)); err != nil {
+		t.Fatalf("retry newOrder: %v", err)
+	}
+	if err := gate.Put(ctx, domain, []byte("cert")); err != nil {
+		t.Fatal(err)
+	}
+	if err := nodeB.refuseIssuance(domain); err != nil {
+		t.Fatalf("completed retry retained claim: %v", err)
+	}
+}
+
+func TestFailedRenewalDoesNotLeaveCacheMissOrderReference(t *testing.T) {
+	const domain = "mixed.example.com"
+	ctx := context.Background()
+	fence := newFakeFence()
+	nodeA, nodeB := splitBrainNode(fence), splitBrainNode(fence)
+	gate := newIssuanceGate(emptyCache{}, nodeA)
+	if _, err := gate.Get(ctx, domain); !errors.Is(err, autocert.ErrCacheMiss) {
+		t.Fatalf("Get: %v", err)
+	}
+	// The newOrder payload identifies the domain, not RSA/ECDSA. A sibling RSA
+	// renewal can arrive before this ECDSA cache miss's order, and fail later.
+	failedRenewal, err := nodeA.refuseOrderIssuance(domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := &issuanceFence{manager: nodeA, base: okRoundTripper{}}
+	if _, err := rt.RoundTrip(newACMENewOrderRequest(t, domain)); err != nil {
+		t.Fatal(err)
+	}
+	nodeA.dropFailedOrderRef(failedRenewal)
+	if err := gate.Put(ctx, domain, []byte("ecdsa-cert")); err != nil {
+		t.Fatal(err)
+	}
+	if err := nodeB.refuseIssuance(domain); err != nil {
+		t.Fatalf("failed sibling renewal retained completed order's claim: %v", err)
+	}
+}
+
+func TestLateNewOrderFailureDoesNotDropNewClaimReference(t *testing.T) {
+	const domain = "late.example.com"
+	ctx := context.Background()
+	fence := newFakeFence()
+	nodeA, nodeB := splitBrainNode(fence), splitBrainNode(fence)
+	oldRef, err := nodeA.refuseOrderIssuance(domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Let the old lease expire while its HTTP request is still outstanding.
+	nodeA.claimMu.Lock()
+	old := nodeA.issuanceClaims[domain]
+	old.expires = time.Now().Add(-time.Second)
+	nodeA.issuanceClaims[domain] = old
+	nodeA.claimMu.Unlock()
+	old.release(ctx)
+	rt := &issuanceFence{manager: nodeA, base: okRoundTripper{}}
+	for range 2 {
+		if _, err := rt.RoundTrip(newACMENewOrderRequest(t, domain)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nodeA.dropFailedOrderRef(oldRef)
+	gate := newIssuanceGate(emptyCache{}, nodeA)
+	if err := gate.Put(ctx, domain, []byte("ecdsa")); err != nil {
+		t.Fatal(err)
+	}
+	if err := nodeB.refuseIssuance(domain); !errors.Is(err, errIssuanceDeferred) {
+		t.Fatalf("late failure released new sibling's claim: %v", err)
+	}
+	if err := gate.Put(ctx, domain+"+rsa", []byte("rsa")); err != nil {
+		t.Fatal(err)
+	}
+	if err := nodeB.refuseIssuance(domain); err != nil {
+		t.Fatalf("completed claim: %v", err)
+	}
+}
 
 func (okRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
 	return &http.Response{

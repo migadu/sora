@@ -61,14 +61,20 @@ type Manager struct {
 
 // issuanceClaim is a claim this node holds on the certificate fence.
 // autocert orders ECDSA ("<domain>") and RSA ("<domain>+rsa") certificates
-// under the same domain; missedKeys and renewalOrders keep a fast variant's
+// under the same domain; missedKeys and orders keep a fast variant's
 // Put from releasing the domain's claim while the sibling variant still orders.
 type issuanceClaim struct {
-	release         func(context.Context)
-	expires         time.Time           // when the fence lets the claim go by itself; no later than its own expiry
-	missedKeys      map[string]struct{} // cache keys that missed Get and have not yet completed Put
-	unmatchedMisses int                 // Get misses not yet paired with an ACME newOrder
-	renewalOrders   int                 // ACME newOrders started without a preceding Get miss
+	release    func(context.Context)
+	expires    time.Time           // when the fence lets the claim go by itself; no later than its own expiry
+	missedKeys map[string]struct{} // cache keys that missed Get and have not yet completed Put
+	orders     int                 // accepted newOrder attempts not yet completed by Put
+}
+
+// issuanceOrderRef records the reference taken by one newOrder attempt. A failed
+// attempt must undo its own reference without touching a newer claim.
+type issuanceOrderRef struct {
+	domain  string
+	expires time.Time
 }
 
 // CertificateFence is a store that cannot be partitioned into two writable copies, used
@@ -101,10 +107,10 @@ func (m *Manager) SetCertificateFence(fence CertificateFence) {
 // holdIssuance reports whether this node may order a certificate for domain, taking the
 // cluster-wide claim if one is available.
 func (m *Manager) holdIssuance(domain string) error {
-	return m.holdIssuanceWith(domain, "", false)
+	return m.holdIssuanceWith(domain, "", nil)
 }
 
-func (m *Manager) holdIssuanceWith(domain, cacheKey string, isNewOrder bool) error {
+func (m *Manager) holdIssuanceWith(domain, cacheKey string, orderRef *issuanceOrderRef) error {
 	if m.certFence == nil {
 		// No shared store - a proxy-only node has no database. Gossip leadership is then
 		// the only fence there is, which is the behavior this deployment already had.
@@ -121,15 +127,11 @@ func (m *Manager) holdIssuanceWith(domain, cacheKey string, isNewOrder bool) err
 			}
 			if _, exists := claim.missedKeys[cacheKey]; !exists {
 				claim.missedKeys[cacheKey] = struct{}{}
-				claim.unmatchedMisses++
 			}
 		}
-		if isNewOrder {
-			if claim.unmatchedMisses > 0 {
-				claim.unmatchedMisses--
-			} else {
-				claim.renewalOrders++
-			}
+		if orderRef != nil {
+			*orderRef = issuanceOrderRef{domain: domain, expires: claim.expires}
+			claim.orders++
 		}
 	}
 
@@ -175,19 +177,20 @@ func (m *Manager) holdIssuanceWith(domain, cacheKey string, isNewOrder bool) err
 	return nil
 }
 
-// dropFailedOrderRef drops an unmatched renewal order count when ACME rejects newOrder
-// itself, while leaving the claim entry intact until expiry if no sibling order finishes.
-func (m *Manager) dropFailedOrderRef(domain string) {
+// dropFailedOrderRef drops this attempt's reference when newOrder fails.
+// Cache misses still reserve their variants until a Put or expiry. A late
+// failure from an expired claim must not change a newer claim's bookkeeping.
+func (m *Manager) dropFailedOrderRef(ref issuanceOrderRef) {
 	m.claimMu.Lock()
 	defer m.claimMu.Unlock()
-	claim, held := m.issuanceClaims[domain]
-	if !held {
+	claim, held := m.issuanceClaims[ref.domain]
+	if !held || !claim.expires.Equal(ref.expires) {
 		return
 	}
-	if claim.renewalOrders > 0 {
-		claim.renewalOrders--
-		m.issuanceClaims[domain] = claim
+	if claim.orders > 0 {
+		claim.orders--
 	}
+	m.issuanceClaims[ref.domain] = claim
 }
 
 // releaseIssuance gives up this node's claim once the order has produced a certificate,
@@ -203,20 +206,15 @@ func (m *Manager) releaseKeyIssuance(domain, cacheKey string) {
 		m.claimMu.Unlock()
 		return
 	}
-	if cacheKey != "" && claim.missedKeys != nil {
-		if _, wasMissed := claim.missedKeys[cacheKey]; wasMissed {
-			delete(claim.missedKeys, cacheKey)
-			if claim.unmatchedMisses > len(claim.missedKeys) {
-				claim.unmatchedMisses = len(claim.missedKeys)
-			}
-		} else if claim.renewalOrders > 0 {
-			claim.renewalOrders--
-		}
-	} else if claim.renewalOrders > 0 {
-		claim.renewalOrders--
+	delete(claim.missedKeys, cacheKey)
+	// Every certificate Put completes an order, whether its variant missed Get
+	// or was renewed. newOrder does not identify the key algorithm, so pairing
+	// attempts with arbitrary misses would miscount retries and mixed variants.
+	if claim.orders > 0 {
+		claim.orders--
 	}
 
-	if time.Now().Before(claim.expires) && (len(claim.missedKeys) > 0 || claim.renewalOrders > 0) {
+	if time.Now().Before(claim.expires) && (len(claim.missedKeys) > 0 || claim.orders > 0) {
 		m.issuanceClaims[domain] = claim
 		m.claimMu.Unlock()
 		return

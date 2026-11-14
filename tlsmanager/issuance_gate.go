@@ -101,18 +101,20 @@ func (m *Manager) mayIssue() bool {
 // refuseIssuance reports why this node must not order a certificate for domain now, or
 // nil if it may.
 func (m *Manager) refuseIssuance(domain string) error {
-	return m.refuseIssuanceWith(domain, "", false)
+	return m.refuseIssuanceWith(domain, "", nil)
 }
 
 func (m *Manager) refuseKeyIssuance(domain, cacheKey string) error {
-	return m.refuseIssuanceWith(domain, cacheKey, false)
+	return m.refuseIssuanceWith(domain, cacheKey, nil)
 }
 
-func (m *Manager) refuseOrderIssuance(domain string) error {
-	return m.refuseIssuanceWith(domain, "", true)
+func (m *Manager) refuseOrderIssuance(domain string) (issuanceOrderRef, error) {
+	var ref issuanceOrderRef
+	err := m.refuseIssuanceWith(domain, "", &ref)
+	return ref, err
 }
 
-func (m *Manager) refuseIssuanceWith(domain, cacheKey string, isNewOrder bool) error {
+func (m *Manager) refuseIssuanceWith(domain, cacheKey string, orderRef *issuanceOrderRef) error {
 	if !m.mayIssue() {
 		leader := m.clusterManager.GetLeaderID()
 		// Debug because a waiting handshake arrives here on every poll; the wait itself
@@ -129,7 +131,7 @@ func (m *Manager) refuseIssuanceWith(domain, cacheKey string, isNewOrder bool) e
 	// Last: leadership above says this node SHOULD issue, the fence says whether it MAY.
 	// Under a partition the check above passes on both sides, because each side elected
 	// its own leader; only one of them can hold the claim.
-	return m.holdIssuanceWith(domain, cacheKey, isNewOrder)
+	return m.holdIssuanceWith(domain, cacheKey, orderRef)
 }
 
 // awaitIssuedCertificate waits, bounded, for a certificate ordered by the cluster leader
@@ -192,15 +194,16 @@ func (f *issuanceFence) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	var claimed []string
+	var claimed []issuanceOrderRef
 	for _, domain := range domains {
-		if refusal := f.manager.refuseOrderIssuance(domain); refusal != nil {
+		ref, refusal := f.manager.refuseOrderIssuance(domain)
+		if refusal != nil {
 			for _, d := range claimed {
 				f.manager.dropFailedOrderRef(d)
 			}
 			return nil, refusal
 		}
-		claimed = append(claimed, domain)
+		claimed = append(claimed, ref)
 	}
 	resp, err := f.base.RoundTrip(req)
 	if err != nil || (resp != nil && resp.StatusCode >= 400) {
