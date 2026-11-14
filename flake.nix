@@ -21,6 +21,7 @@
             pkgs.delve
             pkgs.postgresql
             pkgs.garage
+            pkgs.openssl # shellHook: rpc_secret and tokens in garage.toml
           ];
           env = {
             LANG = "en_US.UTF-8";
