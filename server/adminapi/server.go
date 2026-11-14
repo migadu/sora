@@ -474,79 +474,82 @@ func (s *Server) setupRoutes() http.Handler {
 	// Account management routes. {email} is one segment of the escaped path, which
 	// r.PathValue decodes once: a "/" in a local part (atext, RFC 5322 §3.2.3)
 	// arrives as %2F and is part of the address, never a separator (RFC 3986 §2.4).
-	mux.HandleFunc("/admin/accounts", routeHandler("POST", s.handleCreateAccount))
-	mux.HandleFunc("/admin/accounts/{email}", multiMethodHandler(map[string]http.HandlerFunc{
+	mux.HandleFunc("/admin/accounts", s.routeHandler("POST", s.handleCreateAccount))
+	mux.HandleFunc("/admin/accounts/{email}", s.multiMethodHandler(map[string]http.HandlerFunc{
 		"GET":    s.handleGetAccount,
 		"PUT":    s.handleUpdateAccount,
 		"DELETE": s.handleDeleteAccount,
 	}))
-	mux.HandleFunc("/admin/accounts/{email}/exists", routeHandler("GET", s.handleAccountExists))
-	mux.HandleFunc("/admin/accounts/{email}/restore", routeHandler("POST", s.handleRestoreAccount))
-	mux.HandleFunc("/admin/accounts/{email}/credentials", multiMethodHandler(map[string]http.HandlerFunc{
+	mux.HandleFunc("/admin/accounts/{email}/exists", s.routeHandler("GET", s.handleAccountExists))
+	mux.HandleFunc("/admin/accounts/{email}/restore", s.routeHandler("POST", s.handleRestoreAccount))
+	mux.HandleFunc("/admin/accounts/{email}/credentials", s.multiMethodHandler(map[string]http.HandlerFunc{
 		"GET":  s.handleListCredentials,
 		"POST": s.handleAddCredential,
 	}))
-	mux.HandleFunc("/admin/accounts/{email}/messages/deleted", routeHandler("GET", s.handleListDeletedMessages))
-	mux.HandleFunc("/admin/accounts/{email}/messages/restore", routeHandler("POST", s.handleRestoreMessages))
+	mux.HandleFunc("/admin/accounts/{email}/messages/deleted", s.routeHandler("GET", s.handleListDeletedMessages))
+	mux.HandleFunc("/admin/accounts/{email}/messages/restore", s.routeHandler("POST", s.handleRestoreMessages))
 
 	// Domain-scoped account management routes
 	mux.HandleFunc("/admin/domains/", s.handleDomainOperations)
 
 	// Usage: every account's storage, page by page
-	mux.HandleFunc("/admin/usage/accounts", routeHandler("GET", s.handleAccountUsage))
+	mux.HandleFunc("/admin/usage/accounts", s.routeHandler("GET", s.handleAccountUsage))
 
 	// Credential management routes
-	mux.HandleFunc("/admin/credentials/{email}", multiMethodHandler(map[string]http.HandlerFunc{
+	mux.HandleFunc("/admin/credentials/{email}", s.multiMethodHandler(map[string]http.HandlerFunc{
 		"GET":    s.handleGetCredential,
 		"DELETE": s.handleDeleteCredential,
 	}))
 
 	// Connection management routes
-	mux.HandleFunc("/admin/connections", routeHandler("GET", s.handleListConnections))
-	mux.HandleFunc("/admin/connections/stats", routeHandler("GET", s.handleConnectionStats))
-	mux.HandleFunc("/admin/connections/kick", routeHandler("POST", s.handleKickConnections))
-	mux.HandleFunc("/admin/connections/user/{email}", routeHandler("GET", s.handleGetUserConnections))
+	mux.HandleFunc("/admin/connections", s.routeHandler("GET", s.handleListConnections))
+	mux.HandleFunc("/admin/connections/stats", s.routeHandler("GET", s.handleConnectionStats))
+	mux.HandleFunc("/admin/connections/kick", s.routeHandler("POST", s.handleKickConnections))
+	mux.HandleFunc("/admin/connections/user/{email}", s.routeHandler("GET", s.handleGetUserConnections))
 
 	// Cache management routes
-	mux.HandleFunc("/admin/cache/stats", routeHandler("GET", s.handleCacheStats))
-	mux.HandleFunc("/admin/cache/metrics", routeHandler("GET", s.handleCacheMetrics))
-	mux.HandleFunc("/admin/cache/purge", routeHandler("POST", s.handleCachePurge))
+	mux.HandleFunc("/admin/cache/stats", s.routeHandler("GET", s.handleCacheStats))
+	mux.HandleFunc("/admin/cache/metrics", s.routeHandler("GET", s.handleCacheMetrics))
+	mux.HandleFunc("/admin/cache/purge", s.routeHandler("POST", s.handleCachePurge))
 
 	// Uploader routes
-	mux.HandleFunc("/admin/uploader/status", routeHandler("GET", s.handleUploaderStatus))
-	mux.HandleFunc("/admin/uploader/failed", routeHandler("GET", s.handleFailedUploads))
+	mux.HandleFunc("/admin/uploader/status", s.routeHandler("GET", s.handleUploaderStatus))
+	mux.HandleFunc("/admin/uploader/failed", s.routeHandler("GET", s.handleFailedUploads))
 
 	// Authentication statistics routes
-	mux.HandleFunc("/admin/auth/stats", routeHandler("GET", s.handleAuthStats))
-	mux.HandleFunc("/admin/auth/blocked", routeHandler("GET", s.handleAuthBlocked))
-	mux.HandleFunc("/admin/auth-cache/stats", routeHandler("GET", s.handleAuthCacheStats))
+	mux.HandleFunc("/admin/auth/stats", s.routeHandler("GET", s.handleAuthStats))
+	mux.HandleFunc("/admin/auth/blocked", s.routeHandler("GET", s.handleAuthBlocked))
+	mux.HandleFunc("/admin/auth-cache/stats", s.routeHandler("GET", s.handleAuthCacheStats))
 
-	// Health monitoring routes
-	mux.HandleFunc("/admin/health/overview", routeHandler("GET", s.handleHealthOverview))
-	mux.HandleFunc("/admin/health/servers/", s.handleHealthOperations)
+	// Health monitoring routes. Every path under /admin/health/servers/ is GET only.
+	mux.HandleFunc("/admin/health/overview", s.routeHandler("GET", s.handleHealthOverview))
+	mux.HandleFunc("/admin/health/servers/", s.routeHandler("GET", s.handleHealthOperations))
 
 	// Proxy backend health routes
-	mux.HandleFunc("/admin/proxy/backends", routeHandler("GET", s.handleProxyBackends))
+	mux.HandleFunc("/admin/proxy/backends", s.routeHandler("GET", s.handleProxyBackends))
 
 	// System configuration and status routes
-	mux.HandleFunc("/admin/config", routeHandler("GET", s.handleConfigInfo))
+	mux.HandleFunc("/admin/config", s.routeHandler("GET", s.handleConfigInfo))
 
 	// Mail delivery route
-	mux.HandleFunc("/admin/mail/deliver", routeHandler("POST", s.handleDeliverMail))
+	mux.HandleFunc("/admin/mail/deliver", s.routeHandler("POST", s.handleDeliverMail))
 
 	// ACL management routes
-	mux.HandleFunc("/admin/mailboxes/acl/grant", routeHandler("POST", s.handleACLGrant))
-	mux.HandleFunc("/admin/mailboxes/acl/revoke", routeHandler("POST", s.handleACLRevoke))
-	mux.HandleFunc("/admin/mailboxes/acl", routeHandler("GET", s.handleACLList))
+	mux.HandleFunc("/admin/mailboxes/acl/grant", s.routeHandler("POST", s.handleACLGrant))
+	mux.HandleFunc("/admin/mailboxes/acl/revoke", s.routeHandler("POST", s.handleACLRevoke))
+	mux.HandleFunc("/admin/mailboxes/acl", s.routeHandler("GET", s.handleACLList))
 
 	// Affinity management routes
-	mux.HandleFunc("/admin/affinity", multiMethodHandler(map[string]http.HandlerFunc{
+	mux.HandleFunc("/admin/affinity", s.multiMethodHandler(map[string]http.HandlerFunc{
 		"GET":    s.handleAffinityGet,
 		"POST":   s.handleAffinitySet,
 		"DELETE": s.handleAffinityDelete,
 	}))
-	mux.HandleFunc("/admin/affinity/list", routeHandler("GET", s.handleAffinityList))
-	mux.HandleFunc("/admin/affinity/stats", routeHandler("GET", s.handleAffinityStats))
+	mux.HandleFunc("/admin/affinity/list", s.routeHandler("GET", s.handleAffinityList))
+	mux.HandleFunc("/admin/affinity/stats", s.routeHandler("GET", s.handleAffinityStats))
+
+	// Every other path (ServeMux's own 404 is text/plain)
+	mux.HandleFunc("/", s.notFound)
 
 	// Wrap with middleware (in reverse order - last applied is outermost).
 	// The host allowlist is outermost so off-allowlist clients are rejected before
@@ -564,37 +567,24 @@ func (s *Server) handleDomainOperations(w http.ResponseWriter, r *http.Request) 
 
 	// Check for /admin/domains/{domain}/accounts
 	if strings.Contains(path, "/accounts") {
-		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.handleListAccountsByDomain(w, r)
+		s.routeHandler("GET", s.handleListAccountsByDomain)(w, r)
 		return
 	}
 
 	// Unknown domain operation
-	http.Error(w, "Not found", http.StatusNotFound)
+	s.notFound(w, r)
 }
 
-// handleHealthOperations routes health monitoring operations
+// handleHealthOperations routes health monitoring operations (GET only, checked
+// by the route's wrapper)
 func (s *Server) handleHealthOperations(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
-
 	// Check if it's a component-specific operation
-	if strings.Contains(path, "/components/") {
-		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+	if strings.Contains(r.URL.Path, "/components/") {
 		s.handleHealthStatusByComponent(w, r)
 		return
 	}
 
 	// Otherwise it's a host-level operation
-	if r.Method != "GET" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	s.handleHealthStatusByHost(w, r)
 }
 
