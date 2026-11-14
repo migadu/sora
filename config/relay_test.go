@@ -107,3 +107,37 @@ func TestRelayTransportWarning(t *testing.T) {
 		})
 	}
 }
+
+// TestRelayValidateType: [relay] type is "smtp" or "http", exactly, or the section is
+// absent. Anything else used to create the relay queue with no worker to drain it, so
+// every Sieve redirect and vacation reply was accepted into pending/ and never sent (#277).
+func TestRelayValidateType(t *testing.T) {
+	tests := []struct {
+		name    string
+		block   string
+		wantErr string // substring of the error, "" for a valid section
+	}{
+		{name: "no relay", block: "", wantErr: ""},
+		{name: "smtp", block: "type = \"smtp\"\nsmtp_host = \"smtp.example.com:587\"", wantErr: ""},
+		{name: "http", block: "type = \"http\"\nhttp_url = \"https://api.example.com/deliver\"", wantErr: ""},
+		{name: "smtp with surrounding spaces", block: "type = \" smtp \"\nsmtp_host = \"smtp.example.com:587\"", wantErr: ""},
+		{name: "upper-case SMTP", block: "type = \"SMTP\"\nsmtp_host = \"smtp.example.com:587\"", wantErr: `unsupported [relay] type "SMTP"`},
+		{name: "mixed-case Http", block: "type = \"Http\"\nhttp_url = \"https://api.example.com/deliver\"", wantErr: `unsupported [relay] type "Http"`},
+		{name: "lmtp", block: "type = \"lmtp\"\nsmtp_host = \"smtp.example.com:24\"", wantErr: `unsupported [relay] type "lmtp"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			relay := loadRelayBlock(t, tt.block)
+			err := relay.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Validate() = %v, want an error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}

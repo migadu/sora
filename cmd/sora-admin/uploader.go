@@ -11,10 +11,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
+
+// legacyUploaderPath is config.LegacyDefaultUploaderPath, a variable for tests.
+var legacyUploaderPath = config.LegacyDefaultUploaderPath
 
 func handleUploaderCommand(ctx context.Context) {
 	if len(os.Args) < 3 {
@@ -129,6 +133,13 @@ Examples:
 }
 
 func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, limit int) error {
+	// [DELETE] below rests on the body being absent from cfg.Uploader.Path. With the
+	// default path, bodies a previous release staged under its /tmp default are not
+	// there, yet intact: refuse, as the server does at start.
+	if err := uploader.CheckLegacyStaging(cfg.Uploader.Path, config.DefaultUploaderPath, legacyUploaderPath); err != nil {
+		return err
+	}
+
 	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)

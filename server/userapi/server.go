@@ -242,6 +242,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		allowedOrigins: options.AllowedOrigins,
 		allowedHosts:   options.AllowedHosts,
 	})
+	warnUnusableAllowedHosts(options.Name, options.AllowedHosts)
 
 	return s, nil
 }
@@ -273,6 +274,7 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	}
 	if !slices.Equal(cfg.AllowedHosts, next.allowedHosts) {
 		next.allowedHosts = slices.Clone(cfg.AllowedHosts)
+		warnUnusableAllowedHosts(s.name, next.allowedHosts)
 		reloaded = append(reloaded, "allowed_hosts")
 	}
 
@@ -644,29 +646,21 @@ func getClientIP(r *http.Request) string {
 	return host
 }
 
+// isIPAllowed reports whether clientIP matches an IP or CIDR entry of allowedHosts.
+// An entry that is neither (a host name, a typo) matches no client but does not stop
+// the other entries from matching; warnUnusableAllowedHosts reports it once per list.
 func isIPAllowed(clientIP string, allowedHosts []string) bool {
-	networks, err := helpers.ParseTrustedNetworks(allowedHosts)
-	if err != nil {
-		logger.Warn("userapi: failed to parse allowed hosts as CIDR, falling back to literal matching", "error", err)
-		for _, allowedHost := range allowedHosts {
-			if allowedHost == clientIP {
-				return true
-			}
-		}
-		return false
-	}
+	return helpers.IPInNetworks(net.ParseIP(clientIP), allowedHosts)
+}
 
-	ip := net.ParseIP(clientIP)
-	if ip == nil {
-		return false
-	}
-
-	for _, network := range networks {
-		if network.Contains(ip) {
-			return true
+// warnUnusableAllowedHosts logs the allowed_hosts entries that are not an IP address
+// or CIDR, when a list is configured (startup) or replaced (reload).
+func warnUnusableAllowedHosts(name string, allowedHosts []string) {
+	for _, entry := range allowedHosts {
+		if _, err := helpers.ParseTrustedNetworks([]string{entry}); err != nil {
+			logger.Warn("HTTP Mail API: allowed_hosts entry is not an IP address or CIDR and matches no client", "name", name, "entry", entry)
 		}
 	}
-	return false
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {

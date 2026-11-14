@@ -160,9 +160,10 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// (the S3 object key, cache key and upload-dedup key) must describe the bytes that are
 	// actually stored.
 	var mailboxName string
-	var copyMailbox string     // Sieve `fileinto :copy` target, saved once the body is staged
-	var createMailbox string   // Sieve `fileinto :create` target, created if missing
-	var sieveFlags []imap.Flag // flags set by the Sieve script (imap4flags, RFC 5232)
+	var relayAfterStore func() bool
+	var copyMailboxes []string   // further Sieve destinations, saved once the body is staged
+	var createMailboxes []string // Sieve fileinto :create targets, created if missing
+	var sieveFlags []imap.Flag   // flags set by the Sieve script (imap4flags, RFC 5232)
 
 	if recipient.TargetMailbox != "" {
 		// Use explicit target mailbox (bypasses Sieve - for migrations)
@@ -186,9 +187,19 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			return result, nil
 		}
 
+		if outcome.RedirectOnly {
+			if outcome.Redirect() {
+				result.Discarded = true
+				result.Success = true
+				return result, nil
+			}
+		} else {
+			relayAfterStore = outcome.Redirect
+		}
+
 		mailboxName = outcome.MailboxName
-		copyMailbox = outcome.CopyMailbox
-		createMailbox = outcome.CreateMailbox
+		copyMailboxes = outcome.CopyMailboxes
+		createMailboxes = outcome.CreateMailboxes
 		sieveFlags = outcome.Flags
 		// Adopt any header edits the script made (RFC 5293) before anything is derived
 		// from the message.
@@ -256,26 +267,28 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	}
 
 	ctx := d.Ctx
-	if createMailbox != "" {
+	if len(createMailboxes) > 0 {
 		// The mailbox is created on the writer, and a replica may not have it yet when
 		// the target is resolved below: read from the writer from here on, or the
 		// message would fall back to INBOX (as LMTP does, which pins every delivery).
 		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-		if err := d.createMissingMailbox(ctx, recipient, createMailbox); err != nil {
-			result.ErrorMessage = fmt.Sprintf("Failed to create Sieve fileinto :create target %s: %v", createMailbox, err)
-			return result, err
+		for _, createMailbox := range createMailboxes {
+			if err := d.createMissingMailbox(ctx, recipient, createMailbox); err != nil {
+				result.ErrorMessage = fmt.Sprintf("Failed to create Sieve fileinto :create target %s: %v", createMailbox, err)
+				return result, err
+			}
 		}
 	}
 
-	// Sieve `fileinto :copy`: save the second copy now that the body is on disk, so its
-	// pending_uploads row can never name a file that is not staged yet - the uploader
-	// treats a missing local file as permanently lost content.
-	if copyMailbox != "" {
+	// The further copies Sieve asked for: save them now that the body is on disk, so
+	// their pending_uploads rows can never name a file that is not staged yet - the
+	// uploader treats a missing local file as permanently lost content.
+	for _, copyMailbox := range copyMailboxes {
 		err := d.SaveMessageToMailbox(ctx, recipient, copyMailbox, messageBytes, messageEntity, plaintextBody, deliveryFlags, contentHash, bodyStructure)
 		// A duplicate copy is an accepted delivery, as it is in LMTP: the copy is
 		// already in the mailbox, so a resubmission must not fail the delivery.
 		if err != nil && !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
-			result.ErrorMessage = fmt.Sprintf("Failed to save Sieve :copy to %s: %v", copyMailbox, err)
+			result.ErrorMessage = fmt.Sprintf("Failed to save Sieve copy to %s: %v", copyMailbox, err)
 			return result, err
 		}
 	}
@@ -350,6 +363,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			result.Success = true
 			result.MailboxName = mailbox.Name
 			result.MessageUID = uint32(messageUID)
+			if relayAfterStore != nil {
+				relayAfterStore()
+			}
 			// Don't notify uploader for duplicates
 			return result, nil
 		}
@@ -380,6 +396,10 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 
 	// Notify uploader
 	d.Uploader.NotifyUploadQueued()
+
+	if relayAfterStore != nil {
+		relayAfterStore()
+	}
 
 	// Track metrics
 	metrics.MessageThroughput.WithLabelValues(d.MetricsLabel, "delivered", "success").Inc()
@@ -439,6 +459,25 @@ func (d *DeliveryContext) LookupRecipient(ctx context.Context, recipient string)
 		Address:   &primaryAddr, // Primary address (for S3 keys, metrics, etc.)
 		ToAddress: &toAddress,   // Recipient address as sent (may include +alias)
 	}, nil
+}
+
+// CanFileInto reports whether a message for accountID can be filed into the mailbox
+// named name: one of the account's own, or one shared with it with the insert right
+// (RFC 4314 'i'), resolved the way delivery resolves a fileinto target. It is the
+// Sieve mailboxexists test (RFC 5490 §3.1): the mailbox exists "and each allows the
+// user in whose context the Sieve script runs to "deliver" messages into it".
+func CanFileInto(ctx context.Context, rdb *resilient.ResilientDatabase, accountID int64, name string) (bool, error) {
+	mailbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, name)
+	if errors.Is(err, consts.ErrMailboxNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if mailbox.AccountID == accountID {
+		return true, nil
+	}
+	return rdb.CheckMailboxPermissionWithRetry(ctx, mailbox.ID, accountID, db.ACLRightInsert)
 }
 
 // createMissingMailbox carries out a Sieve fileinto :create (RFC 5490 §3.2): it

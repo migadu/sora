@@ -70,8 +70,8 @@ func TestHandleVacationResponse(t *testing.T) {
 			t.Fatalf("expected 1 enqueue, got %d", len(rq.calls))
 		}
 		call := rq.calls[0]
-		if call.from != owner {
-			t.Errorf("envelope sender = %q, want %q (owned)", call.from, owner)
+		if call.from != "" {
+			t.Errorf("envelope sender = %q, want the null reverse-path (RFC 5230 §5.1)", call.from)
 		}
 		if call.to != "bob@external.com" {
 			t.Errorf("envelope recipient = %q, want bob@external.com", call.to)
@@ -137,8 +137,8 @@ func TestHandleVacationResponse(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse message: %v", err)
 		}
-		if call.from != alias || ent.Header.Get("From") != alias {
-			t.Errorf("owned :from alias not used: envelope = %q, From = %q", call.from, ent.Header.Get("From"))
+		if ent.Header.Get("From") != alias {
+			t.Errorf("owned :from alias not used: From = %q", ent.Header.Get("From"))
 		}
 		if got := ent.Header.Get(helpers.RedirectedByHeader); got != owner {
 			t.Errorf("%s = %q, want script owner %q", helpers.RedirectedByHeader, got, owner)
@@ -164,8 +164,12 @@ func TestHandleVacationResponse(t *testing.T) {
 		if len(rq.calls) != 1 {
 			t.Fatalf("expected 1 enqueue, got %d", len(rq.calls))
 		}
-		if rq.calls[0].from != owner {
-			t.Errorf("unowned :from should fall back to %q, got %q", owner, rq.calls[0].from)
+		ent, err := message.Read(bytes.NewReader(rq.calls[0].body))
+		if err != nil {
+			t.Fatalf("parse message: %v", err)
+		}
+		if got := ent.Header.Get("From"); got != owner {
+			t.Errorf("unowned :from should fall back to %q, got %q", owner, got)
 		}
 	})
 

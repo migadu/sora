@@ -485,26 +485,24 @@ Monitor and manage active client connections to the mail server.
 
 **Endpoint:** `GET /admin/connections`
 
-Retrieve all active connections across all protocols.
+List the accounts with sessions on this node: one entry per account and connection tracker, not per session. `instance` is the tracker key (`<PROTOCOL>-<server name>` on a backend, `<PROTOCOL>-<cluster node_id>-<server name>` on a proxy, with the host name in place of the node_id outside cluster mode, where the LMTP proxy is the only proxy that tracks sessions) and `protocol` its first part. `email` is the address of the session that created the entry (the login address, or the recipient on an LMTP proxy). `local_count` is the account's sessions on this tracker; `total_count` adds the sessions other nodes report for the protocol through gossip (backends and LMTP proxies do not gossip, so there it equals `local_count`). `last_update` also moves when gossip about the account arrives, even if no count changed. Accounts this node knows only through gossip are not listed. Without connection trackers the response has no entries and a `note` instead of `source`.
 
 **Response:** `200 OK`
 ```json
 {
   "connections": [
     {
-      "ID": 1,
-      "AccountID": 123,
-      "Protocol": "IMAP",
-      "ClientAddr": "192.168.1.100:54321",
-      "ServerAddr": "10.0.1.10:143",
-      "InstanceID": "sora-instance-1",
-      "ConnectedAt": "2024-01-20T09:15:00Z",
-      "LastActivity": "2024-01-20T09:20:00Z",
-      "ShouldTerminate": false,
-      "Email": "user@example.com"
+      "protocol": "IMAP",
+      "instance": "IMAP-node1-imap-proxy",
+      "account_id": 123,
+      "email": "user@example.com",
+      "local_count": 2,
+      "total_count": 3,
+      "last_update": "2024-01-20T09:20:00Z"
     }
   ],
-  "count": 1
+  "count": 1,
+  "source": "in-memory connection tracker"
 }
 ```
 
@@ -512,7 +510,7 @@ Retrieve all active connections across all protocols.
 
 **Endpoint:** `GET /admin/connections/stats`
 
-Get the number of active connections on this node, every session counted, in total and per connection tracker. Trackers are keyed `<PROTOCOL>-<server name>` on a backend and `<PROTOCOL>-<host name>-<server name>` on a proxy. Connections other nodes report through gossip are not included. For a cluster total, sum the proxy nodes or the backend nodes, not both: a session through a proxy is counted by the proxy and again by its backend (also within one node that runs both).
+Get the number of active connections on this node, every session counted, in total and per connection tracker. Trackers are keyed `<PROTOCOL>-<server name>` on a backend and `<PROTOCOL>-<cluster node_id>-<server name>` on a proxy (the host name in place of the node_id outside cluster mode). Connections other nodes report through gossip are not included. For a cluster total, sum the proxy nodes or the backend nodes, not both: a session through a proxy is counted by the proxy and again by its backend (also within one node that runs both).
 
 **Response:** `200 OK`
 ```json
@@ -566,14 +564,24 @@ curl -X POST http://localhost:8080/admin/connections/kick \
 
 **Endpoint:** `GET /admin/connections/user/{email}`
 
-Get all active connections for a specific user.
+Get the user's entries on this node's connection trackers, matched case-insensitively against each entry's `email`: an account whose entry was created by an alias login is found only under that alias. Unlike `GET /admin/connections`, `protocol` is the whole tracker key, there is no `instance`, and a tracker that knows the account only through gossip is listed with `local_count` 0.
 
 **Response:** `200 OK`
 ```json
 {
   "email": "user@example.com",
-  "connections": [...],
-  "count": 3
+  "connections": [
+    {
+      "protocol": "IMAP-node1-imap-proxy",
+      "account_id": 123,
+      "email": "user@example.com",
+      "local_count": 2,
+      "total_count": 3,
+      "last_update": "2024-01-20T09:20:00Z"
+    }
+  ],
+  "count": 1,
+  "source": "in-memory connection tracker"
 }
 ```
 
@@ -720,7 +728,7 @@ Get list of failed S3 uploads.
 
 ### Authentication Statistics
 
-Failed logins are tracked in memory by each server's authentication rate limiter, per address, and expire on their own. The API exposes the addresses those limiters currently block; attempt counts are exported as the Prometheus counter `sora_authentication_attempts_total`.
+Failed logins are tracked in memory by each server's authentication rate limiter, per address, and expire on their own. The API exposes the addresses those limiters currently block. IMAP, POP3 and ManageSieve attempt counts (servers and proxies) are exported as the Prometheus counter `sora_authentication_attempts_total`; User API logins are not counted there.
 
 #### Get Authentication Statistics
 
@@ -832,14 +840,12 @@ Get health status for all components on a specific server.
 
 **Endpoint:** `GET /admin/health/servers/{hostname}/components/{component}`
 
-Get current or historical health status for a specific component.
+Get the current health status of a specific component. Only the current status is kept
+(one row per component and server, rewritten when the status changes and every 20 checks
+while it holds), so there is no history: `history=true` is answered with `400 Bad Request`.
+Use the `sora_component_health_status` metric for the status over time.
 
-**Query Parameters:**
-- `history=true` - Return historical data instead of current
-- `since=2024-01-20T00:00:00Z` - Start time for history
-- `limit=100` - Maximum records to return
-
-**Response (Current):** `200 OK`
+**Response:** `200 OK`
 ```json
 {
   "component_name": "database_write",
@@ -851,17 +857,6 @@ Get current or historical health status for a specific component.
   "metadata": {
     "latency_ms": 5
   }
-}
-```
-
-**Response (History):** `200 OK`
-```json
-{
-  "hostname": "mail-server-01",
-  "component": "database_write",
-  "history": [...],
-  "count": 48,
-  "since": "2024-01-20T00:00:00Z"
 }
 ```
 
@@ -1160,8 +1155,8 @@ curl http://localhost:8080/admin/health/overview \
 curl http://localhost:8080/admin/health/servers/mail-server-01 \
   -H "Authorization: Bearer your-api-key"
 
-# Get component health history
-curl "http://localhost:8080/admin/health/servers/mail-server-01/components/database_write?history=true&limit=50" \
+# Get the current status of one component
+curl http://localhost:8080/admin/health/servers/mail-server-01/components/database \
   -H "Authorization: Bearer your-api-key"
 
 # Get cache statistics
@@ -1254,7 +1249,7 @@ The Admin API implements rate limiting based on authentication attempts and API 
 
 4. **Rotate API keys periodically**
 
-5. **Monitor authentication statistics** for suspicious activity
+5. **Monitor blocked addresses** ([`GET /admin/auth/blocked`](#list-blocked-addresses)) and the `sora_authentication_attempts_total` counter for suspicious activity
 
 ### Performance
 
