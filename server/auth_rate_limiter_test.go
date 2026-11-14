@@ -121,6 +121,7 @@ func TestAuthRateLimiterProgressiveDelayStaysWithinMaxDelay(t *testing.T) {
 		failures   int
 	}{
 		{"default doubling", time.Second, 30 * time.Second, 2, 1000},
+		{"initial delay above cap", 2 * time.Second, time.Second, 2, 10},
 		{"large finite multiplier", time.Second, 30 * time.Second, 1e20, 1000},
 		{"largest finite multiplier", time.Second, 30 * time.Second, math.MaxFloat64, 1000},
 		{"doubling past the duration range", time.Second, time.Duration(math.MaxInt64), 2, 1000},

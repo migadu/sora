@@ -534,7 +534,7 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 
 	if info.FailureCount >= a.config.DelayStartThreshold {
 		if info.LastDelay == 0 {
-			info.LastDelay = a.config.InitialDelay
+			info.LastDelay = min(a.config.InitialDelay, a.config.MaxDelay)
 		} else {
 			// Cap in float64 and convert only a product below max_delay, which
 			// always fits a time.Duration. Converting an out-of-range product is
