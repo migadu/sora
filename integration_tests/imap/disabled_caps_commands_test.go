@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
@@ -165,6 +166,9 @@ func dialDisabledCaps(t *testing.T, configure func(*imapserver.IMAPServerOptions
 		t.Fatalf("dial failed: %v", err)
 	}
 	t.Cleanup(func() { conn.Close() })
+	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
 	c := &disabledCapsClient{t: t, conn: conn, r: bufio.NewReader(conn)}
 	if _, err := c.r.ReadString('\n'); err != nil {
 		t.Fatalf("read greeting failed: %v", err)
@@ -212,5 +216,39 @@ func (c *disabledCapsClient) appendMessage() {
 	}
 	if resp := h3ReadTagged(c.t, c.r, "a1"); !strings.Contains(resp, "a1 OK ") {
 		c.t.Fatalf("APPEND not OK:\n%s", resp)
+	}
+}
+
+// The LIST options have independent capability strings (RFC 5258 section 3).
+// RFC 6154 section 5.2 explicitly shows SPECIAL-USE without LIST-EXTENDED.
+func TestIMAP_DisabledListExtendedKeepsIndependentOptions(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	for _, identify := range []bool{false, true} {
+		t.Run(fmt.Sprintf("client_filter=%v", identify), func(t *testing.T) {
+			c := dialDisabledCaps(t, func(o *imapserver.IMAPServerOptions) {
+				if identify {
+					o.CapabilityFilters = []config.ClientCapabilityFilter{{ClientName: "^buggy$", DisableCaps: []string{"LIST-EXTENDED"}}}
+				} else {
+					o.DisabledCaps = []string{"LIST-EXTENDED"}
+				}
+			}, identify)
+			capLine, _, _ := strings.Cut(c.do("CAPABILITY"), "\r\n")
+			caps := strings.Fields(capLine)
+			if slices.Contains(caps, "LIST-EXTENDED") || !slices.Contains(caps, "SPECIAL-USE") || !slices.Contains(caps, "LIST-STATUS") {
+				t.Fatalf("independent LIST-option capabilities changed: %s", capLine)
+			}
+			for _, cmd := range []string{
+				`LIST "" "*" RETURN (SPECIAL-USE)`,
+				`LIST (SPECIAL-USE) "" "*"`,
+				`LIST "" "INBOX" RETURN (STATUS (MESSAGES))`,
+				`LIST (SPECIAL-USE) "" "*" RETURN (STATUS (MESSAGES) SPECIAL-USE)`,
+			} {
+				c.mustOK(cmd)
+			}
+			// Specialized options do not authorize generic extended syntax.
+			c.wantBad(`LIST (SUBSCRIBED SPECIAL-USE) "" "*"`)
+			c.wantBad(`LIST "" ("INBOX") RETURN (SPECIAL-USE)`)
+			c.mustOK("NOOP")
+		})
 	}
 }
