@@ -345,7 +345,7 @@ type IMAPServer struct {
 	// Active connection tracking for graceful shutdown
 	activeConnsMutex sync.RWMutex
 	activeConns      map[*imapserver.Conn]struct{}
-	sessionsWg       sync.WaitGroup // Tracks active sessions for graceful drain
+	sessions         serverPkg.SessionGroup // Tracks active sessions for graceful drain
 }
 
 type IMAPServerOptions struct {
@@ -892,6 +892,21 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 }
 
 func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+	// Count accepted work before TLS: shutdown must also drain handshakes.
+	// Transfer the registration to IMAPSession.Close only after initialization.
+	if !s.sessions.Add() {
+		return nil, nil, &imap.Error{
+			Type: imap.StatusResponseTypeBye,
+			Text: "Server shutting down, please reconnect",
+		}
+	}
+	initialized := false
+	defer func() {
+		if !initialized {
+			s.sessions.Done()
+		}
+	}()
+
 	// Complete the deferred TLS handshake here, in go-imap's per-connection
 	// goroutine — NOT in the accept loop, where one slow TLS client would
 	// serialize behind the handshake deadline and stall every other client.
@@ -1045,9 +1060,9 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 
 	// Track active connection for graceful shutdown
 	s.trackConnection(conn)
-
-	// Track session in WaitGroup for graceful drain
-	s.sessionsWg.Add(1)
+	if s.sessions.IsDraining() {
+		serverPkg.RawConn(conn.NetConn()).Close()
+	}
 
 	// Log proxy session ID if present for end-to-end tracing
 	if proxyInfo != nil && proxyInfo.ProxySessionID != "" {
@@ -1059,6 +1074,7 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	// Wrap the session so every IMAP command records throughput/latency metrics
 	// in one place (see metered.go). The wrapper embeds *IMAPSession, so all
 	// optional extension interfaces remain satisfied.
+	initialized = true
 	return newMeteredSession(session), greeting, nil
 }
 
@@ -1202,6 +1218,7 @@ func (s *IMAPServer) SetConnTracker(tracker *serverPkg.ConnectionTracker) {
 }
 
 func (s *IMAPServer) Close() {
+	s.sessions.BeginDrain()
 	s.preview.close()
 
 	// Unregister rate limiter from global registry
@@ -1236,16 +1253,9 @@ func (s *IMAPServer) Close() {
 
 // waitForSessionsDrain waits for all active sessions to finish with a timeout
 func (s *IMAPServer) waitForSessionsDrain(timeout time.Duration) {
-	done := make(chan struct{})
-	go func() {
-		s.sessionsWg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(timeout) {
 		logger.Debug("IMAP: All sessions drained gracefully", "name", s.name)
-	case <-time.After(timeout):
+	} else {
 		logger.Debug("IMAP: Session drain timeout, forcing shutdown", "name", s.name, "timeout", timeout)
 	}
 }
