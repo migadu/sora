@@ -92,14 +92,24 @@
 //	// Apply result actions: store every copy, then relay every redirect. A store
 //	// that fails is retried by the sender, and a redirect relayed before it would
 //	// go out again on every retry. With no copy to store (a redirect without
-//	// :copy) relay first, and keep the message in INBOX only if a redirect failed.
+//	// :copy), a single target can be relayed before staging. Multiple targets
+//	// must be staged first: partial handoff followed by a staging failure would
+//	// send the accepted targets another copy on retry. Keep an INBOX fallback
+//	// only if a redirect failed.
 //	dests := result.Destinations(false)
 //	relayAfterStore := len(dests) > 0
+//	if !relayAfterStore && len(result.RedirectTo) > 1 {
+//		if err := stageMessage(); err != nil {
+//			return err // stop before any relay handoff
+//		}
+//	}
 //	if !relayAfterStore && !relay(result.RedirectTo) {
 //		dests = result.Destinations(true)
 //	}
 //	for _, dest := range dests {
-//		deliverToMailbox(dest.Mailbox)
+//		if err := deliverToMailbox(dest.Mailbox); err != nil {
+//			return err // stop before any relay handoff
+//		}
 //	}
 //	if relayAfterStore {
 //		relay(result.RedirectTo)

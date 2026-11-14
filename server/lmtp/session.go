@@ -896,17 +896,20 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	}
 
 	// Store every requested copy before any redirect is handed to the relay. A
-	// temporary storage failure makes the sender retry the whole delivery. A
-	// redirect without :copy has no copy to wait for: it is relayed now, before the
-	// body is staged, for the same reason as a discard, and the message is staged
-	// and kept in INBOX only when a redirect could not be queued.
+	// temporary storage failure makes the sender retry the whole delivery.
+	// A single redirect without :copy has no copy to wait for: relay it before
+	// staging, and stage an INBOX fallback only if handoff fails. Multiple targets
+	// still stage first: a partial handoff followed by a staging failure would
+	// otherwise requeue the accepted targets on the sender's retry.
 	destinations := result.Destinations(false)
 	relayAfterStore := len(destinations) > 0 && len(result.RedirectTo) > 0
-	if len(destinations) == 0 && len(result.RedirectTo) > 0 && !s.relayRedirects(ctx, result, messageContent, fullMessageBytes) {
+	// RedirectTo contains unique targets (SieveExecutor.Evaluate removes repeats).
+	relayAfterStaging := len(destinations) == 0 && len(result.RedirectTo) > 1
+	if len(destinations) == 0 && len(result.RedirectTo) == 1 && !s.relayRedirects(ctx, result, messageContent, fullMessageBytes) {
 		// Redirect-only delivery needs an INBOX fallback when handoff fails.
 		destinations = result.Destinations(true)
 	}
-	if len(destinations) == 0 {
+	if len(destinations) == 0 && !relayAfterStaging {
 		s.DebugLog("redirect without :copy - skipping local delivery")
 		recordMetrics("success")
 		return nil
@@ -952,6 +955,14 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		// Stat error (permission issue, etc.)
 		recordMetrics("failure")
 		return s.InternalError("failed to check file existence: %v", err)
+	}
+
+	if relayAfterStaging {
+		if s.relayRedirects(ctx, result, messageContent, fullMessageBytes) {
+			recordMetrics("success")
+			return nil
+		}
+		destinations = result.Destinations(true)
 	}
 
 	s.InfoLog("executing sieve action", "action", result.Action)
