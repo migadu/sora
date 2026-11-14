@@ -35,6 +35,10 @@ func TestServerConfigValidateMetricsPath(t *testing.T) {
 		{name: "unset", path: ""},
 		{name: "absolute", path: "/metrics"},
 		{name: "relative", path: "metrics", wantErr: true},
+		{name: "unclosed wildcard", path: "/metrics/{", wantErr: true},
+		{name: "duplicate wildcard", path: "/metrics/{name}/{name}", wantErr: true},
+		{name: "invalid wildcard", path: "/metrics/{bad-name}", wantErr: true},
+		{name: "valid wildcard", path: "/metrics/{name}"},
 	}
 
 	for _, tt := range tests {
