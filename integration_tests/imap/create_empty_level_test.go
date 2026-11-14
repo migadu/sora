@@ -33,7 +33,9 @@ func TestCreateRenameRefuseEmptyHierarchyLevel(t *testing.T) {
 		t.Fatalf("Login failed: %v", err)
 	}
 
-	for _, name := range []string{"x//y", "/lead", "x//y/", "a/b//c"} {
+	// A TAB, which the database refuses in any name, is refused as cleanly, not with
+	// NO [SERVERBUG] once the database refuses it.
+	for _, name := range []string{"x//y", "/lead", "x//y/", "a/b//c", "t/tab\tname"} {
 		t.Run("CREATE "+name, func(t *testing.T) {
 			requireResponseCode(t, c.Create(name, nil).Wait(), imap.ResponseCodeCannot, "CREATE "+name)
 		})
@@ -42,7 +44,7 @@ func TestCreateRenameRefuseEmptyHierarchyLevel(t *testing.T) {
 	if err := c.Create("Plain", nil).Wait(); err != nil {
 		t.Fatalf("CREATE Plain: %v", err)
 	}
-	for _, to := range []string{"r//s", "/lead2", "p//q/"} {
+	for _, to := range []string{"u/tab\tname", "r//s", "/lead2", "p//q/"} {
 		t.Run("RENAME Plain "+to, func(t *testing.T) {
 			requireResponseCode(t, c.Rename("Plain", to, nil).Wait(), imap.ResponseCodeCannot, "RENAME Plain "+to)
 		})
@@ -73,7 +75,7 @@ func TestCreateRenameRefuseEmptyHierarchyLevel(t *testing.T) {
 		}
 	}
 	// No refused name may have created a parent on the way.
-	for _, parent := range []string{"x", "a", "a/b", "r", "p", "i"} {
+	for _, parent := range []string{"x", "a", "a/b", "r", "p", "i", "t", "u"} {
 		if names[parent] {
 			t.Errorf("refused name created the parent %q", parent)
 		}
