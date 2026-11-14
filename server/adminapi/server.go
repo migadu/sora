@@ -62,6 +62,7 @@ type Server struct {
 	storage        *storage.S3Storage
 	purgeWorker    *cleaner.PurgeWorker // this node's purge worker, nil on a node without object storage
 	relayQueue     delivery.RelayQueue  // Global relay queue for mail delivery
+	relayWorker    RelayWorkerNotifier  // woken after mail delivery queues a message; nil waits for its next pass
 	maxMessageSize int64                // Max accepted mail-injection body size (bytes); 0 -> default
 	maxConnections int                  // Max concurrent connections; 0 -> unlimited
 	server         *http.Server
@@ -100,6 +101,11 @@ func (s *Server) DrainSessions() int64 {
 	return s.deliveriesOpen.Load()
 }
 
+// RelayWorkerNotifier wakes the relay worker to send newly queued mail at once.
+type RelayWorkerNotifier interface {
+	NotifyQueued()
+}
+
 // ServerOptions holds configuration options for the HTTP API server
 type ServerOptions struct {
 	Name               string
@@ -113,6 +119,7 @@ type ServerOptions struct {
 	Storage            *storage.S3Storage
 	PurgeWorker        *cleaner.PurgeWorker // woken when a purge is requested on this node; nil without object storage
 	RelayQueue         delivery.RelayQueue  // Global relay queue for mail delivery
+	RelayWorker        RelayWorkerNotifier  // Global relay worker, woken for what mail delivery queues (nil: next pass)
 	MaxMessageSize     int64                // Max accepted mail-injection body size (bytes); 0 -> 50MB default
 	MaxConnections     int                  // Max concurrent connections; 0 -> unlimited
 	TLS                bool
@@ -267,6 +274,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		storage:            options.Storage,
 		purgeWorker:        options.PurgeWorker,
 		relayQueue:         options.RelayQueue,
+		relayWorker:        options.RelayWorker,
 		maxMessageSize:     options.MaxMessageSize,
 		maxConnections:     options.MaxConnections,
 		tls:                options.TLS,
@@ -824,12 +832,17 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 
 		accountID, err := s.rdb.CreateAccountWithCredentialsWithRetry(ctx, createReq)
 		if err != nil {
-			if errors.Is(err, consts.ErrDBUniqueViolation) {
+			switch {
+			case errors.Is(err, consts.ErrAccountAlreadyExists):
+				s.writeError(w, http.StatusConflict, err.Error())
+			case errors.Is(err, db.ErrInvalidAccountRequest):
+				s.writeError(w, http.StatusBadRequest, err.Error())
+			case errors.Is(err, consts.ErrDBUniqueViolation):
 				s.writeError(w, http.StatusConflict, "One or more email addresses already exist")
-				return
+			default:
+				logger.Warn("HTTP API: Error creating account with credentials", "name", s.name, "error", err)
+				s.writeError(w, http.StatusInternalServerError, "Failed to create account with credentials")
 			}
-			logger.Warn("HTTP API: Error creating account with credentials", "name", s.name, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "Failed to create account with credentials")
 			return
 		}
 
@@ -871,12 +884,17 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 
 		accountID, err := s.rdb.CreateAccountWithRetry(ctx, createReq)
 		if err != nil {
-			if errors.Is(err, consts.ErrDBUniqueViolation) {
+			switch {
+			case errors.Is(err, consts.ErrAccountAlreadyExists):
+				s.writeError(w, http.StatusConflict, err.Error())
+			case errors.Is(err, db.ErrInvalidAccountRequest):
+				s.writeError(w, http.StatusBadRequest, err.Error())
+			case errors.Is(err, consts.ErrDBUniqueViolation):
 				s.writeError(w, http.StatusConflict, "Account already exists")
-				return
+			default:
+				logger.Warn("HTTP API: Error creating account", "name", s.name, "error", err)
+				s.writeError(w, http.StatusInternalServerError, "Failed to create account")
 			}
-			logger.Warn("HTTP API: Error creating account", "name", s.name, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "Failed to create account")
 			return
 		}
 
@@ -1036,8 +1054,15 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 
 	err := s.rdb.UpdateAccountWithRetry(ctx, updateReq)
 	if err != nil {
-		logger.Warn("HTTP API: Error updating account", "name", s.name, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "Failed to update account")
+		switch {
+		case errors.Is(err, consts.ErrUserNotFound):
+			s.writeError(w, http.StatusNotFound, "Account not found")
+		case errors.Is(err, db.ErrInvalidAccountRequest):
+			s.writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			logger.Warn("HTTP API: Error updating account", "name", s.name, "error", err)
+			s.writeError(w, http.StatusInternalServerError, "Failed to update account")
+		}
 		return
 	}
 
@@ -1170,7 +1195,7 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 
 	err = s.rdb.AddCredentialWithRetry(ctx, addReq)
 	if err != nil {
-		if errors.Is(err, server.ErrInvalidAddress) {
+		if errors.Is(err, server.ErrInvalidAddress) || errors.Is(err, db.ErrInvalidAccountRequest) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -1809,7 +1834,11 @@ func (s *Server) handleHealthStatusByComponent(w http.ResponseWriter, r *http.Re
 		// Get current health status
 		status, err := s.rdb.GetHealthStatusWithRetry(ctx, hostname, component)
 		if err != nil {
-			// This could be a normal "not found" case, so don't log as a server error
+			logger.Warn("HTTP API: Error getting health status", "name", s.name, "hostname", hostname, "component", component, "error", err)
+			s.writeError(w, http.StatusInternalServerError, "Failed to get health status")
+			return
+		}
+		if status == nil {
 			s.writeError(w, http.StatusNotFound, "Health status not found")
 			return
 		}

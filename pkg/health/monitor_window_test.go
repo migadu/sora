@@ -142,13 +142,6 @@ func newFailingCheck(t *testing.T, name string, failing *atomic.Bool) (*HealthMo
 // TestSustainedOutageIsReportedUnhealthy: a component that is hard-down from its
 // very first check has no healthy history to debounce against, so the
 // consecutive-failure threshold must not hold it at "degraded".
-//
-// pkg/degradation/strategy.go:344 escalates an unhealthy "database" to
-// LevelEmergency, while a single degraded component maps to LevelMinor
-// (strategy.go:342), which activates no load-shedding strategy at all
-// (shouldActivateStrategy, strategy.go:395). Every check interval spent at
-// "degraded" is an interval where the process keeps accepting work it cannot
-// serve.
 func TestBootTimeOutageIsReportedUnhealthyImmediately(t *testing.T) {
 	const componentName = "database"
 
@@ -168,7 +161,7 @@ func TestBootTimeOutageIsReportedUnhealthyImmediately(t *testing.T) {
 			t.Errorf(
 				"component %q reports %q after failed check #%d, with zero successful checks ever; want %q.\n"+
 					"  the component has never once succeeded, so there is no healthy baseline to call this a blip\n"+
-					"  overall system status: %q (degradation level for a lone degraded component is minor, which sheds no load)",
+					"  overall system status: %q",
 				componentName, status, i, StatusUnhealthy, overall)
 		}
 		if overall != StatusUnhealthy {
@@ -176,8 +169,7 @@ func TestBootTimeOutageIsReportedUnhealthyImmediately(t *testing.T) {
 				overall, i, componentName, StatusUnhealthy)
 		}
 		if !hm.IsUnhealthy(componentName) {
-			t.Errorf("IsUnhealthy(%q) = false after failed check #%d; pkg/degradation only reaches LevelEmergency when this is true",
-				componentName, i)
+			t.Errorf("IsUnhealthy(%q) = false after failed check #%d", componentName, i)
 		}
 	}
 }

@@ -332,6 +332,9 @@ curl -X POST http://localhost:8081/user/mailboxes/Archive/subscribe \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
+**Errors:**
+- `404 Not Found` - Mailbox does not exist
+
 #### Unsubscribe from Mailbox
 
 **Endpoint:** `POST /user/mailboxes/{name}/unsubscribe`
@@ -350,6 +353,9 @@ Mark a mailbox as unsubscribed.
 curl -X POST http://localhost:8081/user/mailboxes/Spam/unsubscribe \
   -H "Authorization: Bearer your-jwt-token"
 ```
+
+**Errors:**
+- `404 Not Found` - Mailbox does not exist
 
 ### Message Operations
 
@@ -578,6 +584,12 @@ curl -X PATCH http://localhost:8081/user/messages/12345 \
   }'
 ```
 
+In a mailbox shared with you, each flag needs its ACL right, as with IMAP `STORE`
+(RFC 4314 §4): `s` for `\Seen`, `t` for `\Deleted`, `w` for every other flag and
+keyword. Flags you may not change are left as they are; if that is all of them the
+answer is `403 Forbidden`. A message in a shared mailbox you cannot read (`r`) is
+`404 Not Found`, as are the `GET` endpoints for it.
+
 #### Delete Message
 
 **Endpoint:** `DELETE /user/messages/{id}`
@@ -598,6 +610,8 @@ curl -X DELETE http://localhost:8081/user/messages/12345 \
 ```
 
 **Note:** Messages are soft-deleted and can be restored within the grace period using the Admin API.
+
+In a mailbox shared with you this needs the `t` right (`403 Forbidden` without it).
 
 ### Search
 
@@ -747,6 +761,9 @@ Create a new filter or update an existing one.
 - `400 Bad Request` - Invalid script name, or the script does not compile against the
   extensions reported by `GET /user/filters/capabilities` (the error says why). A script
   that does not compile is never stored: delivery would skip it whole.
+- `409 Conflict` - A new script would exceed the per-account limit of 100 scripts
+  (ManageSieve answers `NO (QUOTA/MAXSCRIPTS)`); delete one first. Updating an existing
+  script is not affected.
 - `413 Request Entity Too Large` - Script exceeds `max_script_size`
 
 **Example:**
