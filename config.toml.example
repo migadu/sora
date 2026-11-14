@@ -480,8 +480,10 @@ sync_failure_counts = true                      # Synchronize progressive delay 
 # When enabled, users are consistently routed to the same backend server across all proxy nodes
 # for better cache locality and connection reuse. Affinity automatically updates when backends fail.
 # NOTE: Affinity is ONLY for non-remote_lookup users. RemoteLookup routes are always authoritative.
+# The proxies' enable_affinity uses this affinity: with enabled = false no proxy on the node
+# keeps affinity, and users are routed by consistent hash.
 [cluster.affinity]
-enabled = false                                 # Enable cluster-wide server affinity (default: false)
+enabled = true                                  # Enable cluster-wide server affinity (default: true)
 ttl = "24h"                                     # How long affinity persists (default: "24h")
 cleanup_interval = "1h"                         # How often to clean up expired affinities (default: "1h")
 # cache_path = "/var/cache/sora/affinity_cache.db" # SQLite path for persistent affinity (survives restarts)
