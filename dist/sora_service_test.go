@@ -5,6 +5,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -106,6 +107,28 @@ func TestSystemdUnitDoesNotRequirePostgreSQL(t *testing.T) {
 	}
 }
 
+// soraWritableDirs lists every directory sora writes by default, or with the paths
+// config.toml.example suggests.
+func soraWritableDirs(t *testing.T) []struct{ what, dir string } {
+	t.Helper()
+	defaults := config.NewDefaultConfig()
+	var example config.Config
+	if err := config.LoadConfigFromFile(filepath.Join("..", "config.toml.example"), &example); err != nil {
+		t.Fatalf("load config.toml.example: %v", err)
+	}
+	return []struct{ what, dir string }{
+		{"default [uploader] path", defaults.Uploader.Path},
+		{"default [local_cache] path", defaults.LocalCache.Path},
+		{"default [auth_cache] path", path.Dir(defaults.AuthCache.Path)},
+		{"default [relay.queue] path", defaults.Relay.GetQueuePath()},
+		{"default TLS fallback_dir", tlsmanager.DefaultFallbackDir},
+		{"config.toml.example [uploader] path", example.Uploader.Path},
+		{"config.toml.example [local_cache] path", example.LocalCache.Path},
+		{"config.toml.example [auth_cache] path", path.Dir(example.AuthCache.Path)},
+		{"config.toml.example [relay.queue] path", example.Relay.GetQueuePath()},
+	}
+}
+
 // TestSystemdUnitKeepsSoraPathsWritableAndPersistent: every directory sora writes by
 // default, or with the paths config.toml.example suggests, must be writable under the
 // unit's ProtectSystem=strict and must survive a restart. The uploader directory holds
@@ -118,24 +141,7 @@ func TestSystemdUnitKeepsSoraPathsWritableAndPersistent(t *testing.T) {
 	}
 	roots := unit.persistentWritableRoots()
 
-	defaults := config.NewDefaultConfig()
-	var example config.Config
-	if err := config.LoadConfigFromFile(filepath.Join("..", "config.toml.example"), &example); err != nil {
-		t.Fatalf("load config.toml.example: %v", err)
-	}
-
-	dirs := []struct{ what, dir string }{
-		{"default [uploader] path", defaults.Uploader.Path},
-		{"default [local_cache] path", defaults.LocalCache.Path},
-		{"default [auth_cache] path", path.Dir(defaults.AuthCache.Path)},
-		{"default [relay.queue] path", defaults.Relay.GetQueuePath()},
-		{"default TLS fallback_dir", tlsmanager.DefaultFallbackDir},
-		{"config.toml.example [uploader] path", example.Uploader.Path},
-		{"config.toml.example [local_cache] path", example.LocalCache.Path},
-		{"config.toml.example [auth_cache] path", path.Dir(example.AuthCache.Path)},
-		{"config.toml.example [relay.queue] path", example.Relay.GetQueuePath()},
-	}
-	for _, d := range dirs {
+	for _, d := range soraWritableDirs(t) {
 		if d.dir == "" || d.dir == "." {
 			t.Errorf("%s is not set", d.what)
 			continue
@@ -176,6 +182,44 @@ func TestSystemdUnitKeepsSoraDirectoriesPrivate(t *testing.T) {
 		}
 		if m&0o007 != 0 {
 			t.Errorf("%s= directories get mode %s, open to every local account; set %sMode=0750", key, mode, key)
+		}
+	}
+}
+
+// TestRCScriptCreatesSoraDirectories: the FreeBSD script runs sora as an unprivileged
+// user, which cannot create a directory under /var. Every directory sora writes by default
+// must be under one the start precmd creates for that user, or sora cannot start: the
+// local cache and the uploader directory are fatal at start-up.
+func TestRCScriptCreatesSoraDirectories(t *testing.T) {
+	script, err := os.ReadFile("sora.rc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// : ${sora_spooldir:="/var/spool/sora"}
+	defaults := map[string]string{}
+	for _, m := range regexp.MustCompile(`(?m)^: \$\{(sora_\w+):="([^"]*)"\}`).FindAllStringSubmatch(string(script), -1) {
+		defaults[m[1]] = m[2]
+	}
+	// install -d -o ${sora_user} -g ${sora_group} -m 750 ${sora_spooldir}
+	var created []string
+	for _, m := range regexp.MustCompile(`(?m)^\s*install -d .*\$\{(sora_\w+)\}\s*$`).FindAllStringSubmatch(string(script), -1) {
+		dir, ok := defaults[m[1]]
+		if !ok {
+			t.Fatalf("install -d of ${%s}, which has no default", m[1])
+		}
+		created = append(created, dir)
+	}
+
+	for _, d := range soraWritableDirs(t) {
+		ok := false
+		for _, root := range created {
+			if under(d.dir, root) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			t.Errorf("%s %q is not under a directory the start precmd creates %v", d.what, d.dir, created)
 		}
 	}
 }

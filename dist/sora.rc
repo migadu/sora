@@ -24,6 +24,8 @@ load_rc_config $name
 : ${sora_config:="/usr/local/etc/sora/config.toml"}
 : ${sora_logdir:="/var/log/sora"}
 : ${sora_spooldir:="/var/spool/sora"}
+: ${sora_cachedir:="/var/cache/sora"}
+: ${sora_statedir:="/var/lib/sora"}
 
 pidfile="/var/run/${name}.pid"
 command="/usr/local/bin/sora"
@@ -36,9 +38,14 @@ start_precmd="sora_precmd"
 
 sora_precmd()
 {
-    # Ensure required directories exist
+    # Ensure required directories exist. sora runs as ${sora_user} and cannot create
+    # them under /var itself. The defaults: [uploader] and [relay.queue] path under the
+    # spool, [local_cache] and [auth_cache] path under the cache, TLS fallback_dir under
+    # the state directory.
     install -d -o ${sora_user} -g ${sora_group} -m 750 ${sora_logdir}
     install -d -o ${sora_user} -g ${sora_group} -m 750 ${sora_spooldir}
+    install -d -o ${sora_user} -g ${sora_group} -m 750 ${sora_cachedir}
+    install -d -o ${sora_user} -g ${sora_group} -m 750 ${sora_statedir}
 }
 
 run_rc_command "$1"
