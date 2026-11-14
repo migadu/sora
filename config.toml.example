@@ -97,7 +97,8 @@ tls = false                   # Enable TLS/SSL for database connection. Recommen
 # also serves the reads through a second, dedicated pool with these same settings (so
 # writes cannot starve reads), and the process can open up to twice max_connections
 # (and keeps twice min_idle_connections) to that host. With [database.read], each
-# write host gets one pool.
+# write host gets one pool, and while no read replica is healthy all reads fall back to
+# that pool, so its max_connections must leave room for them.
 max_connections = 50            # Maximum connections in the write pool. Should be < PostgreSQL max_connections.
 min_connections = 0             # Minimum connections eagerly created on startup (default: 0 to avoid connection spikes).
 min_idle_connections = 5        # Minimum idle connections lazily maintained (recommended: 5-20 for low latency, superior to min_connections).

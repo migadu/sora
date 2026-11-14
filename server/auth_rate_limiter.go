@@ -534,10 +534,16 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 
 	if info.FailureCount >= a.config.DelayStartThreshold {
 		if info.LastDelay == 0 {
-			info.LastDelay = a.config.InitialDelay
+			info.LastDelay = min(a.config.InitialDelay, a.config.MaxDelay)
 		} else {
-			info.LastDelay = time.Duration(float64(info.LastDelay) * a.config.DelayMultiplier)
-			if info.LastDelay > a.config.MaxDelay {
+			// Cap in float64 and convert only a product below max_delay, which
+			// always fits a time.Duration. Converting an out-of-range product is
+			// implementation-defined (math.MinInt64 on amd64): that negative delay
+			// slipped under the cap and callers skipped the delay altogether.
+			next := float64(info.LastDelay) * a.config.DelayMultiplier
+			if next < float64(a.config.MaxDelay) {
+				info.LastDelay = time.Duration(next)
+			} else {
 				info.LastDelay = a.config.MaxDelay
 			}
 		}

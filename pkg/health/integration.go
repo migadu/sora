@@ -77,9 +77,8 @@ func (hi *HealthIntegration) registerStandardChecks() {
 			Interval: 30 * time.Second,
 			Timeout:  10 * time.Second,
 			Critical: false,
-			Check: func(ctx context.Context) error {
-				return hi.database.GetDatabase().ReadPool.Ping(ctx)
-			},
+			// What reads are served from: the replicas, or the write hosts without them.
+			Check: hi.database.PingReadPools,
 		}
 		hi.monitor.RegisterCheck(dbReadCheck)
 	}
