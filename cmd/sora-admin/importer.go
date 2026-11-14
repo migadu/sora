@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -171,6 +172,24 @@ type Importer struct {
 	batchSize int // default: 20
 }
 
+// maildirCacheParams are the connection settings of sora-maildir.db, for import and
+// export alike: WAL lets readers and the writer work concurrently, and a locked
+// database is waited for up to 5 seconds.
+const maildirCacheParams = "_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL"
+
+// sqliteFileDSN returns the DSN that opens the SQLite database at path with params: a
+// file: URI of the absolute path. modernc.org/sqlite cuts any other DSN at its first
+// '?' and reads the rest as parameters, so a plain path with a '?' in it would open a
+// different file. In the URI the path is percent-encoded and SQLite decodes it, so a
+// '?', '#' or '%' in it stays part of the file name.
+func sqliteFileDSN(path, params string) (string, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve database path %s: %w", path, err)
+	}
+	return (&url.URL{Scheme: "file", Path: absPath, RawQuery: params}).String(), nil
+}
+
 // NewImporter creates a new Importer instance.
 func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ImporterOptions) (*Importer, error) {
 	// Always create SQLite database in the maildir path to persist maildir state
@@ -182,10 +201,11 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		logger.Info("Incremental mode disabled - will read all files (database still created for tracking)", "path", dbPath)
 	}
 
-	// Open SQLite with proper settings for concurrent access
-	// WAL mode enables concurrent readers and writers
-	// _busy_timeout=5000 means wait up to 5 seconds if database is locked
-	sqliteDB, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL")
+	dsn, err := sqliteFileDSN(dbPath, maildirCacheParams)
+	if err != nil {
+		return nil, err
+	}
+	sqliteDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
 	}
