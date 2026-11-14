@@ -178,8 +178,8 @@ logs, rate limits and per-IP limits.
 - `proxy_protocol_timeout` (default `5s`) bounds the wait for the header.
 - On IMAP, a version 2 header may carry the client's JA4 TLS fingerprint and the proxy's session
   ID; Sora uses both (section 6).
-- With `proxy_protocol = true`, IMAP, POP3 and ManageSieve do not apply `max_connections_per_ip`:
-  every connection arrives from a proxy address.
+- `max_connections_per_ip` counts the client the header names. That client is exempt only when its
+  own address is in `trusted_networks`, not because the load balancer's is.
 
 The PROXY protocol and how Sora's own proxies use it are described in [PROXY.md](PROXY.md).
 
@@ -195,7 +195,10 @@ The PROXY protocol and how Sora's own proxies use it are described in [PROXY.md]
 
 A connection over `max_connections` or `max_connections_per_ip` is closed at once, without a
 greeting. On IMAP, a connection from an address that the auth rate limiter has blocked is closed
-the same way.
+the same way. The exception is a client a PROXY header names that is over `max_connections_per_ip`,
+or blocked on IMAP: it gets a refusal greeting after the TLS handshake (IMAP `* BYE`, POP3
+`-ERR [SYS/TEMP]`, ManageSieve `NO (TRYLATER)`), so that a proxy in front fails only that client's
+login and does not count a backend failure. See [SECURITY.md](SECURITY.md#4-connection-limits).
 
 The per-user limits on a backend count sessions on that one server block only. A login over the
 limit is refused and the session stays unauthenticated: IMAP answers
