@@ -1990,12 +1990,17 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 
 	// Verify password
 	if err := db.VerifyPassword(hashedPassword, password); err != nil {
-		// Cache negative result for invalid password if enabled
-		if s.lookupCache != nil {
+		reason := "invalid_password"
+		if errors.Is(err, db.ErrUnverifiableHash) {
+			// No password matches the stored hash: not a wrong password, so nothing is
+			// cached. VerifyPassword logged why, without the address.
+			reason = "unverifiable_hash"
+		} else if s.lookupCache != nil {
+			// Cache negative result for invalid password if enabled
 			// AuthInvalidPassword = 2 (from lookupcache package)
 			s.lookupCache.SetFailure(address, 2)
 		}
-		logger.Info("authentication failed", "address", address, "reason", "invalid_password", "cached", false, "method", "main_db")
+		logger.Info("authentication failed", "address", address, "reason", reason, "cached", false, "method", "main_db")
 		return 0, err
 	}
 
