@@ -432,8 +432,10 @@ List messages in a mailbox with pagination.
 - `content_hash` - BLAKE3 hash of the raw message, hex-encoded
 - `has_attachments` - See below
 
-Addresses are bare email addresses, without display names. No message headers or body
-are included: `GET /user/messages/{id}/raw` returns the message as stored.
+Addresses are bare email addresses, without display names. Empty `to` and `flags`
+are currently `null`; a message list or search with no matches also sends
+`"messages": null`. No message headers or body are included:
+`GET /user/messages/{id}/raw` returns the message as stored.
 
 `has_attachments` comes from the RFC 9979 keywords Sora sets when it stores a message
 (on delivery and on IMAP APPEND): `true` for `$hasattachment`, `false` for
