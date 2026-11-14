@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -273,15 +274,16 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail string,
 	}
 
 	// Build URL based on whether user email is specified
-	var url string
+	var endpoint string
 	if userEmail != "" {
-		url = fmt.Sprintf("%s/admin/connections/user/%s", cfg.HTTPAPIAddr, userEmail)
+		// One path segment: a "/" in the local part goes as %2F (RFC 3986 §2.2).
+		endpoint = fmt.Sprintf("%s/admin/connections/user/%s", cfg.HTTPAPIAddr, url.PathEscape(userEmail))
 	} else {
-		url = fmt.Sprintf("%s/admin/connections/stats", cfg.HTTPAPIAddr)
+		endpoint = fmt.Sprintf("%s/admin/connections/stats", cfg.HTTPAPIAddr)
 	}
 
 	// Create request
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -339,13 +341,15 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail string,
 
 		fmt.Printf("Active Connections for User: %s\n", userEmail)
 		fmt.Printf("==========================================\n\n")
-		fmt.Printf("Total connections: %d\n\n", result.Count)
-
-		// Group by protocol
+		// Group by protocol. result.Count is the number of entries (one per tracker that
+		// knows the account), not of connections: the total is the sum of the counts.
 		protocolCounts := make(map[string]int)
+		total := 0
 		for _, conn := range result.Connections {
 			protocolCounts[conn.Protocol] += conn.TotalCount
+			total += conn.TotalCount
 		}
+		fmt.Printf("Total connections: %d\n\n", total)
 
 		fmt.Println("By Protocol:")
 		for protocol, count := range protocolCounts {

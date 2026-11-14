@@ -40,12 +40,13 @@ func (a AuthResult) String() string {
 
 // RemoteLookup error types for distinguishing failure modes
 var (
-	// ErrRemoteLookupTransient represents a transient error (network issue, 5xx, circuit breaker open)
-	// Fallback behavior is controlled by lookup_local_users config
+	// ErrRemoteLookupTransient represents a transient error: the lookup service gave no
+	// verdict on the user (network issue, timeout, 5xx, a 4xx other than 401/403/404, a
+	// malformed 200, circuit breaker open). It is never a wrong password.
 	ErrRemoteLookupTransient = errors.New("remotelookup transient error")
 
-	// ErrRemoteLookupInvalidResponse represents an invalid 2xx response (malformed JSON, missing required fields)
-	// This is a server bug - should fail hard, no fallback
+	// ErrRemoteLookupInvalidResponse represents an invalid 200 response (malformed JSON, missing
+	// required fields): a lookup service bug. Always returned wrapped in ErrRemoteLookupTransient.
 	ErrRemoteLookupInvalidResponse = errors.New("remotelookup invalid response")
 
 	// ErrUnknownPool is returned when a route names a pool this proxy does not have:

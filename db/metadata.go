@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -23,25 +24,31 @@ const (
 type MetadataError struct {
 	Type    MetadataErrorType
 	Message string
+	MaxSize int // MetadataErrMaxSize: the largest value accepted, in octets
 }
 
 func (e *MetadataError) Error() string {
 	return e.Message
 }
 
-// ResponseCode returns the RFC 5464 METADATA response code for this error.
-func (e *MetadataError) ResponseCode() string {
+// ResponseCode returns the response code of the tagged NO for this error.
+// RFC 5464 §4.3 defines "[METADATA MAXSIZE NNN]", NNN being "the maximum
+// octet count that it is willing to accept", "[METADATA TOOMANY]" and
+// "[METADATA NOPRIVATE]". It has none for the account's total metadata size;
+// that is RFC 5530's OVERQUOTA: "The user would be over quota after the
+// operation."
+func (e *MetadataError) ResponseCode() imap.ResponseCode {
 	switch e.Type {
 	case MetadataErrMaxSize:
-		return "METADATA MAXSIZE"
+		return imap.MetadataMaxSizeResponseCode(uint32(min(int64(e.MaxSize), math.MaxUint32)))
 	case MetadataErrTooMany:
-		return "METADATA TOOMANY"
+		return imap.ResponseCodeMetadataTooMany
 	case MetadataErrQuotaExceeded:
-		return "METADATA TOOMANY" // Use TOOMANY for quota as well
+		return imap.ResponseCodeOverQuota
 	case MetadataErrNoPrivate:
-		return "METADATA NOPRIVATE"
+		return imap.ResponseCodeMetadataNoPrivate
 	default:
-		return "NO"
+		return imap.ResponseCodeLimit
 	}
 }
 
@@ -201,6 +208,7 @@ func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 					return &MetadataError{
 						Type:    MetadataErrMaxSize,
 						Message: fmt.Sprintf("metadata entry %q exceeds max size of %d bytes", entryName, limits.MaxEntrySize),
+						MaxSize: limits.MaxEntrySize,
 					}
 				}
 			}

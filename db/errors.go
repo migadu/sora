@@ -18,7 +18,9 @@ var (
 	// ErrMessageNotFound indicates that a message was not found in the database
 	ErrMessageNotFound = errors.New("message not found")
 
-	// ErrInvalidCredentials indicates that the provided credentials are invalid
+	// ErrInvalidCredentials is what VerifyPassword returns (possibly wrapped) when the
+	// password does not match the stored hash, whatever its scheme. A hash that cannot
+	// be checked at all (unknown scheme, malformed data) is a different error.
 	ErrInvalidCredentials = errors.New("invalid credentials")
 
 	// ErrDuplicateAccount indicates that an account with the given email already exists

@@ -96,6 +96,10 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			if parseErr == nil && len(s.server.masterUsername) > 0 && usernameParsed.HasSuffix() && checkMasterCredential(usernameParsed.Suffix(), s.server.masterUsername) {
 				// Suffix matches MasterUsername, authenticate with MasterPassword
 				if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
+					if !s.AdmitMasterLogin(s.ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
+						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
+						return authFailedError()
+					}
 					// Determine target user to impersonate
 					targetUserToImpersonate := identity
 					if targetUserToImpersonate == "" {
@@ -201,14 +205,6 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// Trigger cache warmup for the authenticated user (if configured)
 					s.triggerCacheWarmup()
 
-					// Clear auth idle timeout after successful authentication
-					// Post-auth timeouts are handled by SoraConn (command_timeout)
-					if s.server.authIdleTimeout > 0 {
-						if err := netConn.SetReadDeadline(time.Time{}); err != nil {
-							s.WarnLog("failed to clear auth idle timeout", "error", err)
-						}
-					}
-
 					return nil
 				}
 
@@ -235,22 +231,10 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 				if checkMasterCredential(username, settings.masterSASLUsername) &&
 					checkMasterCredential(password, settings.masterSASLPassword) {
 
-					// Network gate: master SASL is a tenant-wide impersonation capability,
-					// so it may optionally be restricted to the proxy hosts. Anchored to the
-					// real socket peer (NetConn().RemoteAddr()), which cannot be forged via
-					// PROXY/XCLIENT/ID forwarding (those only rewrite s.RemoteIP/s.ProxyIP).
-					if !settings.masterSASLGate.Allowed(netConn.RemoteAddr()) {
-						s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(netConn.RemoteAddr()))
+					// Network gate, anchored to the real socket peer (NetConn().RemoteAddr()),
+					// which PROXY/XCLIENT/ID forwarding cannot rewrite.
+					if !s.AdmitMasterLogin(s.ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master SASL") {
 						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-						// Recorded and answered exactly like a wrong master password.
-						// This site is reachable ONLY with the CORRECT one, so anything
-						// that distinguishes it — a different reply, or a failure the
-						// credential is not charged for, which diverges at the block
-						// threshold — confirms a guessed tenant-wide password to a peer
-						// that is not even allowed to use it. The reason stays in the log.
-						if s.server.authLimiter != nil {
-							s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authKey, false)
-						}
 						return authFailedError()
 					}
 
@@ -351,14 +335,6 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					// Trigger cache warmup for the authenticated user (if configured)
 					s.triggerCacheWarmup()
-
-					// Clear auth idle timeout after successful authentication
-					// Post-auth timeouts are handled by SoraConn (command_timeout)
-					if s.server.authIdleTimeout > 0 {
-						if err := netConn.SetReadDeadline(time.Time{}); err != nil {
-							s.WarnLog("failed to clear auth idle timeout", "error", err)
-						}
-					}
 
 					return nil
 				} else if checkMasterCredential(username, settings.masterSASLUsername) && identity != username {
