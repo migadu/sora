@@ -269,21 +269,7 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 
 	// Execute HTTP request through circuit breaker (NO caching - handled at ConnectionManager level)
 	result, err := c.breaker.Execute(func() (any, error) {
-		// Build request URL by interpolating placeholders:
-		// - $email: user email (MasterAddress - includes master token but not +detail)
-		// - $ip: client IP address; empty when the caller has none, never the literal placeholder
-		requestURL := strings.ReplaceAll(c.baseURL, "$email", url.QueryEscape(lookupEmail))
-		requestURL = strings.ReplaceAll(requestURL, "$ip", url.QueryEscape(clientIP))
-
-		// Add route_only parameter if requested (for master username authentication)
-		if routeOnly {
-			// Check if URL already has query parameters
-			if strings.Contains(requestURL, "?") {
-				requestURL += "&route_only=true"
-			} else {
-				requestURL += "?route_only=true"
-			}
-		}
+		requestURL := remoteLookupRequestURL(c.baseURL, lookupEmail, clientIP, routeOnly)
 
 		logger.Debug("remotelookup: Requesting lookup", "user", lookupEmail, "client_ip", clientIP, "url", requestURL, "route_only", routeOnly)
 
@@ -583,6 +569,28 @@ func DeriveAccountIDFromEmail(email string) int64 {
 	}
 
 	return id
+}
+
+// remoteLookupRequestURL builds a lookup request URL from the configured template by
+// interpolating its placeholders:
+//   - $email: user email (MasterAddress - includes master token but not +detail)
+//   - $ip: client IP address; empty when the caller has none, never the literal placeholder
+//
+// validateRemoteLookupURL checks the template through this same function.
+func remoteLookupRequestURL(template, email, clientIP string, routeOnly bool) string {
+	requestURL := strings.ReplaceAll(template, "$email", url.QueryEscape(email))
+	requestURL = strings.ReplaceAll(requestURL, "$ip", url.QueryEscape(clientIP))
+
+	// Add route_only parameter if requested (for master username authentication)
+	if routeOnly {
+		// Check if URL already has query parameters
+		if strings.Contains(requestURL, "?") {
+			requestURL += "&route_only=true"
+		} else {
+			requestURL += "?route_only=true"
+		}
+	}
+	return requestURL
 }
 
 // HealthCheck performs a health check on the HTTP remotelookup endpoint
