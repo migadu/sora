@@ -143,7 +143,7 @@ APPEND reads the message into the session's memory budget, so the APPENDLIMIT a 
 [servers.lmtp]
 max_message_size = "50mb"  # Maximum size for incoming messages
 ```
-A `max_message_size` above 2147483647 bytes (the largest message sora can store) is clamped to it with a warning, on LMTP, the LMTP proxy (the `SIZE` it advertises) and the Admin API delivery alike. `sora-admin import-maildir` skips a larger message whatever its limit says.
+A `max_message_size` above 2147483647 bytes (the largest message sora can store) is clamped to it with a warning, on LMTP, the LMTP proxy (the `SIZE` it advertises) and the Admin API delivery alike. A delivery adds its `Received` and `Delivered-To` headers (and any Sieve header edits) after that check, so a message they take past the ceiling is refused as too large before it is stored (LMTP 552, an Admin API client error rather than a retry). `sora-admin import-maildir` skips a larger message whatever its limit says.
 
 When a message exceeds the configured limit:
 - **IMAP**: Returns `[TOOBIG]` response code (RFC 7889)
