@@ -907,6 +907,15 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 	}
 	liveCount := liveUploaded + liveNotUploaded
 
+	// Rows are marked not uploaded while their body waits in the spool of the node that
+	// received it: with a pending upload that is an upload in progress, not a lost body.
+	uploadPending := false
+	if liveNotUploaded > 0 {
+		if uploadPending, err = rdb.PendingUploadExistsWithRetry(ctx, hash, accountID); err != nil {
+			return fmt.Errorf("failed to check for a pending upload: %w", err)
+		}
+	}
+
 	fmt.Printf("  Live: %d (uploaded: %d, not uploaded: %d)\n", liveCount, liveUploaded, liveNotUploaded)
 	fmt.Printf("  Expunged (pending cleanup): %d\n", expungedCount)
 
@@ -953,6 +962,9 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 		}
 	case exists && liveUploaded > 0:
 		fmt.Printf("[OK] Everything looks good\n")
+	case !exists && uploadPending:
+		fmt.Printf("[OK] Upload pending: the body is not in S3 yet, it waits for the uploader on the node that received it\n")
+		fmt.Printf("  Do not delete these messages. If the upload stays pending, see 'sora-admin uploader status'.\n")
 	case !exists && liveNotUploaded > 0:
 		fmt.Printf("[FAIL] Problem detected: Content missing from S3 and messages marked as not uploaded\n")
 		fmt.Printf("  This likely indicates stuck uploads from the race condition bug\n")

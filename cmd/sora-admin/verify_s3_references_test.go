@@ -253,6 +253,37 @@ func TestVerifyS3NotUploadedRowWithoutPendingUploadIsMissing(t *testing.T) {
 	assert.Zero(t, result.NotUploaded, "a row with no pending upload was counted as an upload in progress")
 }
 
+// TestVerifyHashPendingUploadIsNotStuck: `verify hash` on a body whose upload is still
+// pending found no object and live rows marked not uploaded, and called that a stuck
+// upload whose messages are safe to delete. The body waits in the receiving node's
+// spool; deleting those rows loses the message. A row whose pending upload is gone is
+// still reported as the failure it is.
+func TestVerifyHashPendingUploadIsNotStuck(t *testing.T) {
+	f := newRekeyFixture(t)
+	_, endpoint := newMemS3(t)
+	cfg := verifyTestConfig(t, endpoint)
+
+	accountID, domain, localpart := f.account("verify-hash-pending")
+	pendingHash := helpers.HashContent(f.body("pending"))
+	pendingID := f.insert(accountID, "INBOX", domain, localpart, pendingHash, f.body("pending"), "<pending-"+f.nonce+"@example.org>")
+	f.exec("UPDATE messages SET uploaded = FALSE WHERE id = $1", pendingID)
+	f.exec("INSERT INTO pending_uploads (instance_id, content_hash, size, account_id) VALUES ('verify-test', $1, 10, $2)",
+		pendingHash, accountID)
+
+	out := captureStdout(t, func() error {
+		return verifyContentHash(f.ctx, cfg, pendingHash, localpart+"@"+domain, false, false, "", "")
+	})
+	assert.NotContains(t, out, "Safe to delete", "a pending upload was called safe to delete:\n%s", out)
+	assert.Contains(t, out, "Upload pending", "a pending upload was not reported as pending:\n%s", out)
+
+	// Without the pending upload nothing will write the body: that stays a failure.
+	f.exec("DELETE FROM pending_uploads WHERE content_hash = $1 AND account_id = $2", pendingHash, accountID)
+	out = captureStdout(t, func() error {
+		return verifyContentHash(f.ctx, cfg, pendingHash, localpart+"@"+domain, false, false, "", "")
+	})
+	assert.Contains(t, out, "[FAIL] Problem detected: Content missing from S3", "a stranded row was not reported:\n%s", out)
+}
+
 // TestVerifyS3FixOrphanedRechecksBeforeDelete: an object reported orphaned can be
 // claimed before --fix-orphaned reaches it (a delivery of the same body re-uploads it).
 // The delete re-checks under the body's object lock and keeps it.
