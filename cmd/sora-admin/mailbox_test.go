@@ -349,7 +349,7 @@ func TestMailboxPurge(t *testing.T) {
 	t.Logf("✅ Verified all S3 objects exist before purge")
 
 	// Perform purge
-	err = purgeMailboxMessages(ctx, rdb, s3Mock, accountID, testMailboxName)
+	err = purgeMailboxMessages(ctx, rdb, accountID, testMailboxName)
 	if err != nil {
 		t.Fatalf("Failed to purge mailbox: %v", err)
 	}

@@ -10,6 +10,9 @@ import (
 )
 
 func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet imap.NumSet, dest string) error {
+	if err := s.requireCapability(imap.CapMove, "MOVE"); err != nil {
+		return err
+	}
 	ctx = s.pinnedContext(ctx)
 
 	// First, safely read necessary session state
