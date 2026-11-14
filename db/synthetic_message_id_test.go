@@ -42,8 +42,8 @@ func TestBuildEnvelopeSyntheticMessageIDIsNIL(t *testing.T) {
 
 // TestSyntheticMessageIDNotReportedAsHeader stores messages through the live and importer
 // paths with and without a Message-ID, and checks every reader that reports message_id as
-// the message's header: the IMAP ENVELOPE, THREAD's input and the User API's list, search
-// and single-message views.
+// the message's header: the IMAP ENVELOPE, THREAD's input, the User API's list, search
+// and single-message views, and the Admin API / sora-admin deleted-message listing.
 func TestSyntheticMessageIDNotReportedAsHeader(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -149,6 +149,73 @@ func TestSyntheticMessageIDNotReportedAsHeader(t *testing.T) {
 			msg, err := db.GetMessageByID(ctx, accountID, m.rowID)
 			require.NoError(t, err)
 			assert.Equal(t, want[m.uid], msg.MessageID, "uid %d", m.uid)
+		}
+	})
+
+	t.Run("ListDeletedMessages", func(t *testing.T) {
+		historical := insert("historical", "<1700000000000000000@INBOX>", false)
+
+		var email string
+		require.NoError(t, db.GetReadPool().QueryRow(ctx,
+			`SELECT address FROM credentials WHERE account_id = $1 AND primary_identity`, accountID).Scan(&email))
+
+		expungeTx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer expungeTx.Rollback(ctx)
+		_, err = db.ExpungeMessageUIDs(ctx, expungeTx, mailboxID,
+			imap.UID(live.uid), imap.UID(imported.uid), imap.UID(historical.uid), imap.UID(present.uid))
+		require.NoError(t, err)
+		require.NoError(t, expungeTx.Commit(ctx))
+
+		wantByRowID := map[int64]string{
+			live.rowID:       "",
+			imported.rowID:   "",
+			historical.rowID: "",
+			present.rowID:    "present-851@example.com",
+		}
+
+		deleted, err := db.ListDeletedMessages(ctx, ListDeletedMessagesParams{Email: email})
+		require.NoError(t, err)
+		require.Len(t, deleted, len(wantByRowID))
+		for _, m := range deleted {
+			expected, ok := wantByRowID[m.ID]
+			require.True(t, ok, "unexpected row id %d", m.ID)
+			assert.Equal(t, expected, m.MessageID, "row id %d", m.ID)
+		}
+
+		// RestoreMessages resolves rows from messages directly, so stripping synthetic
+		// IDs in ListDeletedMessages leaves both ID-based and criteria-based restores
+		// and duplicate detection untouched.
+		restoreTx1, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer restoreTx1.Rollback(ctx)
+		restored, err := db.RestoreMessages(ctx, restoreTx1, RestoreMessagesParams{
+			Email:      email,
+			MessageIDs: []int64{imported.rowID, historical.rowID},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, int64(2), restored)
+		require.NoError(t, restoreTx1.Commit(ctx))
+
+		inbox := "INBOX"
+		restoreTx2, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer restoreTx2.Rollback(ctx)
+		restored, err = db.RestoreMessages(ctx, restoreTx2, RestoreMessagesParams{
+			Email:       email,
+			MailboxPath: &inbox,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, int64(2), restored)
+		require.NoError(t, restoreTx2.Commit(ctx))
+
+		for _, m := range []stored{live, imported, historical} {
+			var storedID string
+			var expungedAt *time.Time
+			require.NoError(t, db.GetReadPool().QueryRow(ctx,
+				`SELECT message_id, expunged_at FROM messages WHERE id = $1`, m.rowID).Scan(&storedID, &expungedAt))
+			assert.Nil(t, expungedAt, "row id %d should be restored", m.rowID)
+			assert.True(t, strings.HasPrefix(storedID, "<"), "stored synthetic message_id %q for row %d", storedID, m.rowID)
 		}
 	})
 }
