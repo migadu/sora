@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -104,5 +105,62 @@ func TestDatabaseReadPoolCheck_SeesTheReplica(t *testing.T) {
 	defer cancel2()
 	if err := check.Check(checkCtx2); err == nil {
 		t.Fatal("database_read_pool reports healthy while the only read replica is down")
+	}
+}
+
+// A replica that is already down when the node starts is kept out of the read pools
+// (reads fall back to the write hosts) and retried in the background. It is just as
+// down as one that fails later, so database_read_pool must report it too: otherwise
+// the same outage reads unhealthy on a node started before it and healthy on a node
+// started during it.
+func TestDatabaseReadPoolCheck_SeesAReplicaDownSinceStartup(t *testing.T) {
+	name := os.Getenv("SORA_TEST_DB_NAME")
+	if name == "" {
+		name = "sora_test_db"
+	}
+	// A port nothing listens on: the replica refuses connections from the start.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	down := ln.Addr().String()
+	ln.Close()
+	up := startKillableProxy(t, "localhost:5432").addr
+
+	for _, tc := range []struct {
+		name     string
+		replicas []string
+	}{
+		{"only replica down", []string{down}},
+		{"one of two replicas down", []string{up, down}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.DatabaseConfig{
+				Write: &config.DatabaseEndpointConfig{Hosts: []string{"localhost"}, Port: "5432", User: "postgres", Name: name},
+				Read:  &config.DatabaseEndpointConfig{Hosts: tc.replicas, User: "postgres", Name: name},
+			}
+			ctx := context.Background()
+			rdb, err := resilient.NewResilientDatabase(ctx, cfg, false, false)
+			if err != nil {
+				t.Skipf("PostgreSQL not available: %v", err)
+			}
+			defer rdb.Close()
+
+			hi := NewHealthIntegration(rdb)
+			hi.registerStandardChecks()
+			check := hi.monitor.checks["database_read_pool"]
+			if check == nil {
+				t.Fatal("database_read_pool check is not registered")
+			}
+			checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			err = check.Check(checkCtx)
+			if err == nil {
+				t.Fatalf("database_read_pool reports healthy while replica %s has been down since startup", down)
+			}
+			if !strings.Contains(err.Error(), down) {
+				t.Fatalf("database_read_pool error does not name the replica that is down (%s): %v", down, err)
+			}
+		})
 	}
 }
