@@ -77,3 +77,46 @@ func TestDisabledCaps_KeepsFetchBinaryWithBinaryOrIMAP4rev2(t *testing.T) {
 		}
 	}
 }
+
+// notifyMessageNewFetch is NOTIFY SET (SELECTED (MessageNew (<fetch>)
+// MessageExpunge)).
+func notifyMessageNewFetch(fetch *imap.FetchOptions) *imap.NotifyOptions {
+	return &imap.NotifyOptions{Items: []imap.NotifyItem{{
+		MailboxSpec:     imap.NotifyMailboxSpecSelected,
+		Events:          []imap.NotifyEvent{imap.NotifyEventMessageNew, imap.NotifyEventMessageExpunge},
+		MessageNewFetch: fetch,
+	}}}
+}
+
+func callSetNotify(s *IMAPSession, options *imap.NotifyOptions) error {
+	return callHandler(func() error {
+		return s.SetNotify(context.Background(), options, nil)
+	})
+}
+
+// NOTIFY's MessageNew fetch-atts (RFC 5465 §5.2) are FETCH items that Fetch
+// answers for each new message. Without BINARY and IMAP4rev2, NOTIFY SET must
+// refuse BINARY's items with BAD (RFC 5465 §3.1) instead of accepting a watch
+// whose every MessageNew FETCH then fails.
+func TestDisabledCaps_RefusesNotifyFetchBinaryWithoutBinaryAndIMAP4rev2(t *testing.T) {
+	disabled := []string{"BINARY", "IMAP4rev2"}
+	srv := newDisabledCapsTestServer(t, IMAPServerOptions{DisabledCaps: disabled})
+	s := newDisabledCapsTestSession(srv)
+	s.ctx = context.Background()
+	for _, tc := range fetchBinaryItems {
+		assertRefusedAsBad(t, fmt.Sprintf("disabled_caps = %v", disabled), "NOTIFY MessageNew "+tc.name, callSetNotify(s, notifyMessageNewFetch(tc.options)))
+	}
+}
+
+func TestDisabledCaps_KeepsNotifyFetchBinaryWithBinaryOrIMAP4rev2(t *testing.T) {
+	for _, disabled := range [][]string{{"BINARY"}, {"IMAP4rev2"}, nil} {
+		srv := newDisabledCapsTestServer(t, IMAPServerOptions{DisabledCaps: disabled})
+		s := newDisabledCapsTestSession(srv)
+		s.ctx = context.Background()
+		for _, tc := range fetchBinaryItems {
+			if err := callSetNotify(s, notifyMessageNewFetch(tc.options)); err != nil {
+				t.Errorf("disabled_caps = %v: NOTIFY MessageNew %s: %v", disabled, tc.name, err)
+			}
+		}
+	}
+}
