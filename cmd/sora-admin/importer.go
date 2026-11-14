@@ -337,6 +337,10 @@ func (i *Importer) finish(runErr error) {
 	switch {
 	case !i.options.CleanupDB:
 		logger.Info("Maildir database saved", "path", i.dbPath)
+	case i.options.DryRun:
+		// A dry run imports nothing and promises no changes, and the file may hold an
+		// earlier run's record (previewing the retry of a partly failed run).
+		logger.Info("Dry run, keeping the import database", "path", i.dbPath)
 	case runErr != nil:
 		logger.Warn("Import did not complete, keeping the import database for the next run", "path", i.dbPath, "error", runErr)
 	default:
@@ -452,7 +456,14 @@ func (i *Importer) recoverOrphanedSQLiteState() error {
 
 // Run starts the import process.
 func (i *Importer) Run() (err error) {
-	defer func() { i.finish(err) }()
+	defer func() {
+		if p := recover(); p != nil {
+			// A run that panicked did not complete: err is still nil here.
+			i.finish(fmt.Errorf("import aborted: %v", p))
+			panic(p)
+		}
+		i.finish(err)
+	}()
 
 	// Recovery: Check for messages marked in SQLite but not in PostgreSQL
 	// This can happen if PostgreSQL commit failed after SQLite update
@@ -529,13 +540,18 @@ func (i *Importer) Run() (err error) {
 	// Only proceed with import if we have messages
 	if totalCount == 0 {
 		logger.Info("No messages to import")
-		i.printSieveOutcome()
-		return nil
-	}
-
-	logger.Info("Starting import process", "count", totalCount)
-	if err := i.importMessages(); err != nil {
-		return fmt.Errorf("failed to import messages: %w", err)
+		if i.failedMessages == 0 {
+			i.printSieveOutcome()
+			return nil
+		}
+		// Every message still to import failed in the scan (unreadable, empty, over
+		// the size limit): the run did not import everything, so report it as any
+		// other run with failed messages.
+	} else {
+		logger.Info("Starting import process", "count", totalCount)
+		if err := i.importMessages(); err != nil {
+			return fmt.Errorf("failed to import messages: %w", err)
+		}
 	}
 
 	if err := i.printSummary(); err != nil {

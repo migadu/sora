@@ -125,7 +125,7 @@ Examples:
   # Import from specific paths file
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --paths-file failed_paths.txt
 
-  # Import with cleanup (removes SQLite database after completion)
+  # Import with cleanup (removes the SQLite database after a successful import)
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --cleanup-db
 
   # Import from Dovecot with subscriptions and custom keywords
