@@ -776,7 +776,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			s.backend.redirectRateWindow,
 			s.backend.maxRedirectHops,
 		)
-		defaultResult, defaultEvalErr := defaultSieveExecutor.Evaluate(ctx, sieveCtx)
+		defaultResult, defaultEvalErr := defaultSieveExecutor.Evaluate(readCtx, sieveCtx)
 		if defaultEvalErr != nil {
 			metrics.SieveExecutions.WithLabelValues("lmtp", "failure").Inc()
 			s.WarnLog("default sieve script evaluation error", "error", defaultEvalErr)
@@ -812,7 +812,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				s.backend.redirectRateWindow,
 				s.backend.maxRedirectHops,
 			)
-			userResult, userEvalErr := userSieveExecutor.Evaluate(ctx, sieveCtx)
+			userResult, userEvalErr := userSieveExecutor.Evaluate(readCtx, sieveCtx)
 			if userEvalErr != nil {
 				metrics.SieveExecutions.WithLabelValues("lmtp", "failure").Inc()
 				s.WarnLog("user sieve script evaluation error", "error", userEvalErr)
@@ -880,7 +880,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// a discarded one included, and after the header edits, which it has to see
 	// (RFC 5293 §7).
 	if result.Vacation != nil {
-		if err := s.handleVacationResponse(ctx, *result.Vacation, messageContent); err != nil {
+		if err := s.handleVacationResponse(readCtx, *result.Vacation, messageContent); err != nil {
 			s.DebugLog("error handling vacation response", "error", err)
 			// Continue processing even if vacation response fails
 		}
@@ -1255,6 +1255,9 @@ func (s *LMTPSession) notifyRelayWorker() {
 // all live there. The send decision and per-sender rate-limiting are handled upstream
 // by the Sieve engine's VacationOracle.
 func (s *LMTPSession) handleVacationResponse(ctx context.Context, reply sieveengine.VacationReply, originalMessage *message.Entity) error {
+	if s.useMasterDB {
+		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	}
 	handler := &delivery.StandardVacationHandler{
 		Hostname:          s.HostName,
 		RelayQueue:        s.backend.relayQueue,
