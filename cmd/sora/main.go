@@ -2385,6 +2385,9 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 	}
 
 	options := buildAdminAPIServerOptions(deps, serverConfig)
+	if options.Uploader == nil {
+		logger.Warn("HTTP Admin API: no upload worker on this node (no imap, pop3 or lmtp server), POST /admin/mail/deliver will answer 503", "name", serverConfig.Name)
+	}
 
 	srv, err := adminapi.New(deps.resilientDB, options)
 	if err != nil {

@@ -2199,6 +2199,8 @@ proxy_protocol_timeout = "5s"
 # proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # NOTE: Uses global [relay] configuration for /admin/mail/deliver endpoint
+# NOTE: /admin/mail/deliver stages bodies through this node's upload worker, which runs only when the
+#       node also has an imap, pop3 or lmtp server; elsewhere it answers 503 (a start-up warning says so)
 # NOTE: When tls=true and tls_cert_file/tls_key_file are empty, uses Let's Encrypt autocert from [tls] section
 
 
