@@ -35,6 +35,9 @@ func TestHTTPRelayErrorsHideURLCredentials(t *testing.T) {
 		if r.URL.Path == "/malformed" {
 			location = "https://fixture-user:fixture/password@relay.example.invalid/send?api_key=fixture-query-secret"
 		}
+		if r.URL.Path == "/relative-malformed" {
+			location = "//fixture-user:fixture/password@relay.example.invalid/send?api_key=fixture-query-secret"
+		}
 		w.Header().Set("Location", location)
 		w.WriteHeader(http.StatusMovedPermanently)
 	}))
@@ -46,6 +49,7 @@ func TestHTTPRelayErrorsHideURLCredentials(t *testing.T) {
 		{"unparsable", "https://fixture-user:fixture/password@relay.example.invalid/send"},
 		{"redirect", "http://fixture-user:fixture-password@" + redirectHost + "/send?api_key=fixture-query-secret"},
 		{"malformed redirect", redirect.URL + "/malformed"},
+		{"scheme-relative malformed redirect", redirect.URL + "/relative-malformed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := &HTTPRelayHandler{HTTPURL: tc.url}

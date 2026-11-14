@@ -89,23 +89,32 @@ func (endpointTimeoutError) Timeout() bool   { return true }
 func (endpointTimeoutError) Temporary() bool { return true }
 
 func TestMaskURLErrorHidesMalformedRedirect(t *testing.T) {
-	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Location", "https://fixture-user:fixture/password@host.invalid/send?token=fixture-token")
-		w.WriteHeader(http.StatusMovedPermanently)
-	}))
-	defer endpoint.Close()
-	client := endpoint.Client()
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	_, err := client.Get(endpoint.URL)
-	if err == nil {
-		t.Fatal("malformed redirect was unexpectedly accepted")
-	}
-	masked := MaskURLError(err)
-	if strings.Contains(masked.Error(), "fixture") {
-		t.Errorf("malformed redirect leaked credentials: %v", masked)
-	}
-	if !strings.Contains(masked.Error(), "failed to parse Location header") || !strings.Contains(masked.Error(), "invalid port") {
-		t.Errorf("masking lost useful error categories: %v", masked)
+	for _, location := range []string{
+		"https://fixture-user:fixture/password@host.invalid/send?token=fixture-token",
+		"//fixture-user:fixture/password@host.invalid/send?token=fixture-token",
+		"/%zz?token=fixture-token",
+	} {
+		t.Run(location, func(t *testing.T) {
+			endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", location)
+				w.WriteHeader(http.StatusMovedPermanently)
+			}))
+			defer endpoint.Close()
+			client := endpoint.Client()
+			client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+			_, err := client.Get(endpoint.URL)
+			if err == nil {
+				t.Fatal("malformed redirect was unexpectedly accepted")
+			}
+			masked := MaskURLError(err)
+			if strings.Contains(masked.Error(), "fixture") {
+				t.Errorf("malformed redirect leaked credentials: %v", masked)
+			}
+			if !strings.Contains(masked.Error(), "failed to parse Location header") ||
+				(!strings.Contains(masked.Error(), "invalid port") && !strings.Contains(masked.Error(), "invalid URL escape")) {
+				t.Errorf("masking lost useful error categories: %v", masked)
+			}
+		})
 	}
 }
 

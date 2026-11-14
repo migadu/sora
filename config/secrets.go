@@ -122,6 +122,26 @@ func maskURLErrorText(text string) string {
 	if shown := maskURLCredentials(text); shown != text {
 		return maskURLCredentials(maskQuoted(text))
 	}
+	// Location can also be a network-path or relative reference, with no "://"
+	// for maskURLCredentials to find. net/http quotes that reference with %q.
+	for rest := text; ; {
+		i := strings.IndexByte(rest, '"')
+		if i < 0 {
+			break
+		}
+		quoted, err := strconv.QuotedPrefix(rest[i:])
+		if err != nil {
+			if MaskEndpointURL(rest[i:]) != rest[i:] {
+				return maskURLCredentials(maskQuoted(text))
+			}
+			break
+		}
+		value, _ := strconv.Unquote(quoted)
+		if MaskEndpointURL(value) != value {
+			return maskURLCredentials(maskQuoted(text))
+		}
+		rest = rest[i+len(quoted):]
+	}
 	return text
 }
 
