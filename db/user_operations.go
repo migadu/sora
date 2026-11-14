@@ -252,9 +252,20 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 // row past it so the caller can tell a result clipped at the cap from a complete one.
 const UserAPISearchLimit = 100
 
+// UserAPISearchFilter narrows a User API search. Each set field is ANDed with the query;
+// the zero value applies no filter.
+type UserAPISearchFilter struct {
+	// From is a case-insensitive substring of a From name or address, as IMAP SEARCH FROM.
+	From string
+	// Subject is a case-insensitive substring of the subject, as IMAP SEARCH SUBJECT.
+	Subject string
+	// UnseenOnly keeps only messages without \Seen.
+	UnseenOnly bool
+}
+
 // SearchMessagesInMailbox performs full-text search. It returns at most
 // UserAPISearchLimit messages, newest first, and whether more matches were left out.
-func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64, mailboxPath string, query string) ([]*DBMessage, bool, error) {
+func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64, mailboxPath string, query string, filter UserAPISearchFilter) ([]*DBMessage, bool, error) {
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
 		return nil, false, err
@@ -293,12 +304,31 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 			-- The IS NOT NULL is required for the PARTIAL composite GIN to be usable.
 			OR (mf.text_body_tsv IS NOT NULL AND mf.text_body_tsv @@ plainto_tsquery('simple', $3))
 		)
+		__FILTER_COND__
 		ORDER BY m.internal_date DESC
 		LIMIT $5
 	`
 
+	args := []any{mailbox.ID, strings.ToLower(query), query, mailbox.AccountID, UserAPISearchLimit + 1}
+	// The filters are the IMAP SEARCH FROM, SUBJECT and UNSEEN predicates (search.go):
+	// strpos() on columns idx_messages_mailbox_headers_v2 carries, and an inline
+	// \Seen bit test. Absent state is zero flags, as in the returned metadata.
+	filterCond := ""
+	if filter.From != "" {
+		args = append(args, strings.ToLower(filter.From))
+		filterCond += " AND " + addressHeaderCond("m.", "from", fmt.Sprintf("$%d", len(args)))
+	}
+	if filter.Subject != "" {
+		args = append(args, strings.ToLower(filter.Subject))
+		filterCond += " AND " + substringCond("LOWER(m.subject)", fmt.Sprintf("$%d", len(args)))
+	}
+	if filter.UnseenOnly {
+		filterCond += fmt.Sprintf(" AND (ms.flags IS NULL OR (ms.flags & %d) = 0)", FlagSeen)
+	}
+
 	searchQuery = strings.Replace(searchQuery, "__HEADER_COND__", headerSubstringCond("m.", "$2"), 1)
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, searchQuery, mailbox.ID, strings.ToLower(query), query, mailbox.AccountID, UserAPISearchLimit+1)
+	searchQuery = strings.Replace(searchQuery, "__FILTER_COND__", filterCond, 1)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, searchQuery, args...)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to search messages: %w", err)
 	}
@@ -528,7 +558,8 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 		       m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 't'),
 		       m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 'w')
 		FROM messages m
-		WHERE m.id = $1 AND m.expunged_at IS NULL
+		JOIN mailboxes mb ON mb.id = m.mailbox_id
+		WHERE m.id = $1 AND m.expunged_at IS NULL AND mb.deleted_at IS NULL
 		  AND (m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 'r'))
 	`, messageID, accountID).Scan(&mailboxID, &ownerID, &maySeen, &mayDelete, &mayWrite)
 
@@ -570,8 +601,9 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 	err = tx.QueryRow(ctx, `
 		SELECT ms.flags, ms.custom_flags
 		FROM messages m
+		JOIN mailboxes mb ON mb.id = m.mailbox_id
 		JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL
+		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL AND mb.deleted_at IS NULL
 	`, messageID, ownerID).Scan(&currentFlags, &currentCustomFlags)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return consts.ErrDBNotFound

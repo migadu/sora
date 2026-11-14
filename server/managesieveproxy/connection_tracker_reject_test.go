@@ -19,7 +19,7 @@ func TestMSCloseSkipsUnregisterWhenRejected(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	tracker := server.NewConnectionTracker("test-managesieve", "", "", "instance-1", nil, 0, 0, 1000, false)
+	tracker := server.NewConnectionTracker("test-managesieve", "", "", "instance-1", nil, 1, 0, 1000, false)
 	defer tracker.Stop()
 
 	srv := &Server{
@@ -46,7 +46,11 @@ func TestMSCloseSkipsUnregisterWhenRejected(t *testing.T) {
 		accountID:    42,
 		clientAddr:   clientAddr,
 		startTime:    time.Now(),
-		connRejected: true, // this session's registration was rejected
+	}
+
+	// max_connections_per_user = 1: the tracker refuses this session.
+	if err := sess.registerConnection(); err == nil {
+		t.Fatal("registerConnection accepted a second session with max_connections_per_user = 1")
 	}
 
 	sess.close()

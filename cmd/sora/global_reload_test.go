@@ -145,6 +145,54 @@ trusted_networks = ["127.0.0.0/8", "10.0.0.0/8"]
 	}
 }
 
+// The relay handler is built at start-up, so a reload only reports a changed [relay] as
+// needing a restart. A [relay] that start-up refuses (an unsupported type, #277, or no
+// usable smtp_host or http_url, #532) is an error, as an invalid trusted_networks is:
+// the restart the reload asks for would not start. The http_url is quoted masked, since
+// the reload writes the error to the server log.
+func TestGlobalReloadReportsAnInvalidRelay(t *testing.T) {
+	tests := []struct {
+		name    string
+		relay   string
+		wantErr string // part of the error-level report, "" for none
+	}{
+		{name: "valid smtp", relay: "type = \"smtp\"\nsmtp_host = \"smtp2.example.com:587\"", wantErr: ""},
+		{name: "valid http", relay: "type = \"http\"\nhttp_url = \"https://api.example.com/deliver\"", wantErr: ""},
+		{name: "unsupported type", relay: "type = \"lmtp\"\nsmtp_host = \"smtp2.example.com:24\"", wantErr: "unsupported [relay] type"},
+		{name: "smtp without smtp_host", relay: "type = \"smtp\"", wantErr: "requires smtp_host as host:port"},
+		{name: "smtp_host without port", relay: "type = \"smtp\"\nsmtp_host = \"smtp2.example.com\"", wantErr: "must be host:port"},
+		{name: "http without http_url", relay: "type = \"http\"", wantErr: "requires http_url"},
+		{name: "http_url other scheme", relay: "type = \"http\"\nhttp_url = \"ftp://api.example.com/deliver?key=fixture-relay-secret\"", wantErr: "must be an absolute http:// or https:// URL"},
+		{name: "http_url without scheme hides query", relay: "type = \"http\"\nhttp_url = \"api.example.com/deliver?key=fixture-relay-secret\"", wantErr: "must be an absolute http:// or https:// URL"},
+		{name: "smtp URL hides userinfo", relay: "type = \"smtp\"\nsmtp_host = \"smtp://user:fixture-relay-secret@smtp.example.com:587\"", wantErr: "must be host:port"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureReloadLogs(t)
+			cfg := startupConfig()
+
+			handleConfigReload(&cfg, reloadedFrom(t, "[relay]\n"+tt.relay+"\n"))
+
+			if cfg.Relay.IsConfigured() {
+				t.Errorf("relay = %+v after the reload, want the start-up one (none)", cfg.Relay)
+			}
+			out := logs.String()
+			if tt.wantErr == "" {
+				if strings.Contains(out, "level=ERROR") {
+					t.Errorf("a valid [relay] was reported as an error:\n%s", out)
+				}
+				return
+			}
+			if !hasLineWith(out, "level=ERROR", "[relay]", tt.wantErr) {
+				t.Errorf("no error-level report naming %q:\n%s", tt.wantErr, out)
+			}
+			if strings.Contains(out, "fixture-relay-secret") {
+				t.Errorf("the report quotes http_url unmasked:\n%s", out)
+			}
+		})
+	}
+}
+
 // IMAP sessions read the shared *config.Config with no lock (NAMESPACE, LIST, SELECT,
 // CREATE, NOTIFY read SharedMailboxes; the DB layer reads DefaultRights through the
 // context). A reload must not write it while they do. Fails under -race on a writer.
