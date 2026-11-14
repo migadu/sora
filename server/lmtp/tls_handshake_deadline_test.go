@@ -10,9 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // A connection to the implicit-TLS listener that opens TCP and never sends a
@@ -25,40 +27,11 @@ func TestImplicitTLSSilentConnectionReleasesSlot(t *testing.T) {
 		t.Skip("waits for the TLS handshake deadline")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := l.Addr().String()
-	l.Close()
-
-	b, err := New(ctx, "tls-deadline", "localhost", addr, &storage.S3Storage{}, &resilient.ResilientDatabase{}, &uploader.UploadWorker{}, LMTPServerOptions{
-		TLS:            true,
-		TLSConfig:      &tls.Config{Certificates: []tls.Certificate{selfSignedTestCert(t)}},
-		MaxConnections: 1,
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	go b.Start(make(chan error, 1))
-	defer b.Close()
+	b, addr := startImplicitTLSBackend(t, "tls-deadline")
 
 	// The silent connection is the first one the server sees: no probe dial
 	// that would itself take the only slot.
-	var silent net.Conn
-	for deadline := time.Now().Add(3 * time.Second); ; {
-		silent, err = net.Dial("tcp", addr)
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("server did not start: %v", err)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	silent := dialFirstConnection(t, addr)
 	defer silent.Close()
 
 	waitFor(t, 3*time.Second, "the silent connection takes the slot", func() bool {
@@ -68,7 +41,7 @@ func TestImplicitTLSSilentConnectionReleasesSlot(t *testing.T) {
 	// Send nothing. The server must close the connection on its own.
 	start := time.Now()
 	silent.SetReadDeadline(time.Now().Add(20 * time.Second))
-	_, err = io.Copy(io.Discard, silent)
+	_, err := io.Copy(io.Discard, silent)
 	if ne, ok := err.(net.Error); ok && ne.Timeout() {
 		t.Fatalf("connection that never handshakes still open after %v", time.Since(start).Round(time.Second))
 	}
@@ -98,6 +71,85 @@ func TestImplicitTLSSilentConnectionReleasesSlot(t *testing.T) {
 		if strings.HasPrefix(line, "250 ") {
 			break
 		}
+	}
+}
+
+// A plain-text client on the implicit-TLS port (#335 item 3) is told so and
+// counted in sora_connection_timeouts_total{reason="plain_text_on_tls_port"},
+// as on the other implicit-TLS listeners, and gives back its slot. Before, the
+// handshake failed on its first line with nothing sent back or counted.
+func TestImplicitTLSPlainTextClientRejected(t *testing.T) {
+	const name = "tls-plaintext"
+	b, addr := startImplicitTLSBackend(t, name)
+	rejected := metrics.ConnectionTimeoutsTotal.WithLabelValues("lmtp", name, "localhost", "plain_text_on_tls_port")
+	before := testutil.ToFloat64(rejected)
+
+	conn := dialFirstConnection(t, addr)
+	defer conn.Close()
+	// A client that speaks first, as `printf 'LHLO x\r\n' | nc` does. One
+	// that waits for a greeting sends nothing the probe could see, and gets
+	// the handshake deadline as in TestImplicitTLSSilentConnectionReleasesSlot.
+	io.WriteString(conn, "LHLO client.example.com\r\n")
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got, err := io.ReadAll(conn)
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("plain-text connection still open, server sent %q", got)
+	}
+	if !strings.Contains(string(got), "Plain-text connection attempted on TLS port") {
+		t.Fatalf("plain-text client on the TLS port got %q (err=%v), want the plain-text notice", got, err)
+	}
+	if strings.Contains(string(got), "220") {
+		t.Fatalf("greeting leaked in plain text: %q", got)
+	}
+
+	waitFor(t, 3*time.Second, "the rejection is counted", func() bool {
+		return testutil.ToFloat64(rejected) == before+1
+	})
+	waitFor(t, 3*time.Second, "the slot is released", func() bool {
+		return b.limiter.GetStats().TotalConnections == 0
+	})
+}
+
+// startImplicitTLSBackend starts an LMTP backend on an implicit-TLS listener
+// with a single max_connections slot, stopped when the test ends.
+func startImplicitTLSBackend(t *testing.T, name string) (*LMTPServerBackend, string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	b, err := New(ctx, name, "localhost", addr, &storage.S3Storage{}, &resilient.ResilientDatabase{}, &uploader.UploadWorker{}, LMTPServerOptions{
+		TLS:            true,
+		TLSConfig:      &tls.Config{Certificates: []tls.Certificate{selfSignedTestCert(t)}},
+		MaxConnections: 1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	go b.Start(make(chan error, 1))
+	t.Cleanup(func() { b.Close() })
+	return b, addr
+}
+
+// dialFirstConnection dials addr until the server listens, so the connection
+// it returns is the first the server accepts.
+func dialFirstConnection(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	for deadline := time.Now().Add(3 * time.Second); ; {
+		conn, err := net.Dial("tcp", addr)
+		if err == nil {
+			return conn
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server did not start: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
