@@ -228,6 +228,8 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 	// RFC 3501 §6.3.2: remember whether the mailbox was opened with EXAMINE so
 	// mutating commands (STORE, EXPUNGE) can be rejected on a read-only selection.
 	s.selectedReadOnly.Store(isReadOnly)
+	// RFC 9051 §6.3.3: EXAMINE itself, which also keeps FETCH from setting \Seen.
+	s.selectedExamined.Store(options != nil && options.ReadOnly)
 	s.mailboxTracker = imapserver.NewMailboxTracker(s.currentNumMessages.Load())
 	s.sessionTracker = s.mailboxTracker.NewSession()
 	s.savedSearchUIDs = nil // RFC 5182: the "$" saved result is reset on mailbox change

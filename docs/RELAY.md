@@ -211,6 +211,12 @@ Each message is a pair of files with the same id (a UUID): `<id>.msg` is the raw
 renames it, writing the body before the metadata, so a crash never leaves metadata pointing at a
 half-written body.
 
+A Sieve redirect is written while its delivery is still running, with its metadata named
+`<id>.held`, which the worker does not pick up. Once the delivery has stored everything it stores,
+`<id>.held` is renamed to `<id>.json`; if the delivery fails, both files are removed. The sender
+retries a failed delivery, so a redirect queued by the failed attempt would otherwise go out once
+per attempt.
+
 ```json
 {
   "id": "<uuid>",
@@ -332,8 +338,9 @@ Requeueing resets the attempt count and the error history.
 ### Crash debris
 
 The cleanup pass also removes, once they are more than an hour old: leftover temporary files
-(`.tmp-*`) in any of the three directories, and a body or metadata file in `pending/` whose
-partner is missing in both `pending/` and `processing/`. Each removal is logged
+(`.tmp-*`) in any of the three directories, a body or metadata file in `pending/` whose partner is
+missing in both `pending/` and `processing/`, and a held redirect (`<id>.held` and its body) whose
+delivery never finished. Each removal is logged
 (`RelayQueue: Removed orphaned queue file`).
 
 ---

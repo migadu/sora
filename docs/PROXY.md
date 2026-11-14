@@ -243,9 +243,9 @@ With `auth_token` set, the request carries `Authorization: Bearer <auth_token>`.
 
 The URL must use `https://`, unless its host is `localhost` or a loopback address. Sora refuses to
 start a proxy with a plain `http://` URL to any other host, because the request and answer carry
-password hashes. (With `lookup_local_users = true`, a proxy instead logs the error and runs without
-the remote lookup, checking every user in PostgreSQL. The User API proxy does so only when the file
-has no `[[pool]]` blocks.)
+password hashes. It also refuses a URL with `$email` or `$ip` in the host, and a `timeout`,
+`circuit_breaker` or `transport` duration it cannot parse, with `lookup_local_users` or without.
+`sora-admin config validate` fails the file for the same reasons.
 
 ### 4.2 The answer
 
@@ -950,8 +950,9 @@ cache_path = "/var/lib/sora/affinity_cache.db"
 - At startup, entries that have not expired are loaded, except for users gossip has already
   provided.
 - Every change (set, update, delete, also those received by gossip) is written to the file in the
-  background, each write with a 2-second limit. Gossip changes apply only if newer than what the
-  node has. Pending writes finish at shutdown.
+  background, in the order the changes were made, each write with a 2-second limit. A key changed
+  again before its write starts is written once, with its latest state. Gossip changes apply only
+  if newer than what the node has. Pending writes finish at shutdown.
 - Expired entries are removed from memory and from the file every `cleanup_interval`.
 - The directory must exist; Sora does not create it. The file gets mode `0600`, WAL mode.
 - A corrupt file is deleted and recreated as for the auth cache. Any other error is logged
@@ -1083,7 +1084,7 @@ On `SIGHUP` the proxies apply these `[[server]]` keys:
 | `imap_proxy` | `limits.max_auth_errors`, `auth_idle_timeout`, `timeouts.command_timeout`, `timeouts.absolute_session_timeout`, `timeouts.min_bytes_per_minute`, `master_sasl_username`, `master_sasl_password` |
 | `pop3_proxy`, `managesieve_proxy` | the same, and `debug` |
 | `lmtp_proxy` | `timeouts.absolute_session_timeout`, `max_message_size` |
-| `user_api_proxy` | `jwt_secret` |
+| `user_api_proxy` | `jwt_secret`, `allowed_origins` |
 
 Everything else in this document needs a restart: `remote_addrs`, `[[pool]]`, `[server.remote_lookup]`,
 `[server.lookup_cache]`, the backend-leg keys, `[auth_cache]`, `[backend_maintenance]` and

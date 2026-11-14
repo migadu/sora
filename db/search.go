@@ -127,15 +127,19 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 		args[param] = criteria.Before
 		conditions = append(conditions, fmt.Sprintf("%sinternal_date < @%s", datePrefix, param))
 	}
+	// SENTSINCE / SENTBEFORE compare the day of the Date: header in its own zone (#867). The
+	// test looks the row up by its id, which is ambiguous unqualified in the legacy seqnum
+	// statement (message_seqs has one too); that statement passes no prefix, but it too
+	// names its messages row m.
+	sentAlias := tablePrefix
+	if sentAlias == "" {
+		sentAlias = "m"
+	}
 	if !criteria.SentSince.IsZero() {
-		param := nextParam()
-		args[param] = criteria.SentSince
-		conditions = append(conditions, fmt.Sprintf("%ssent_date >= @%s", datePrefix, param))
+		conditions = append(conditions, sentDayCond(sentAlias, ">=", criteria.SentSince, args, nextParam))
 	}
 	if !criteria.SentBefore.IsZero() {
-		param := nextParam()
-		args[param] = criteria.SentBefore
-		conditions = append(conditions, fmt.Sprintf("%ssent_date < @%s", datePrefix, param))
+		conditions = append(conditions, sentDayCond(sentAlias, "<", criteria.SentBefore, args, nextParam))
 	}
 
 	// Message size
@@ -395,6 +399,33 @@ func addressCasemapKey(expr string) string {
 	return subjectCasemapKey(fmt.Sprintf("upper(normalize(%s, NFD))", expr))
 }
 
+// sentDayCond is the SENTSINCE (op ">=") or SENTBEFORE (op "<") test of the Date: header
+// "disregarding time and timezone" (RFC 9051 §6.4.4) against day, the searched date as
+// midnight UTC. The day meant is the one the header names in its own zone: its wall-clock
+// time, sent_date shifted by sent_utc_offset, compared with day as if both were UTC. A row
+// without an offset (written before migration 000060) counts as UTC, as it always was.
+//
+// sent_utc_offset is deliberately not in idx_messages_mailbox_headers_v2, and naming it on
+// the messages row would turn every date search back into a heap filter over the whole
+// mailbox (the 38 s case in substringCond). No stored offset exceeds maxSentUTCOffset, so a
+// message sent further than that from day is decided by sent_date alone, from the index;
+// the offset is read by primary key, through message_sent_utc_offset (migration 000060, which
+// says why not a subquery), only for the messages in between.
+func sentDayCond(alias, op string, day time.Time, args pgx.NamedArgs, nextParam func() string) string {
+	band := time.Duration(maxSentUTCOffset) * time.Second
+	// Every zone agrees on a match where sent_date op sure holds, and on no match where
+	// sent_date op edge fails; only in between does the zone decide.
+	sure, edge := day.Add(band), day.Add(-band)
+	if op == "<" {
+		sure, edge = edge, sure
+	}
+	dayParam, sureParam, edgeParam := nextParam(), nextParam(), nextParam()
+	args[dayParam], args[sureParam], args[edgeParam] = day, sure, edge
+	headerTime := fmt.Sprintf("%[1]s.sent_date + make_interval(secs => COALESCE(message_sent_utc_offset(%[1]s.id), 0))", alias)
+	return fmt.Sprintf("(%[1]s.sent_date %[2]s @%[3]s OR (%[1]s.sent_date %[2]s @%[4]s AND %[5]s %[2]s @%[6]s))",
+		alias, op, sureParam, edgeParam, headerTime, dayParam)
+}
+
 // buildSortOrderClause builds an SQL ORDER BY clause from IMAP sort criteria
 func (db *Database) buildSortOrderClause(sortCriteria []imap.SortCriterion) string {
 	return db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
@@ -537,8 +568,8 @@ func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix str
 	return finalCondition, args, nil
 }
 
-// needsComplexQuery determines if the search criteria requires the complex CTE query
-// with ROW_NUMBER() and messages_fts_v2 JOIN, or if we can use the optimized simple query
+// needsComplexQuery determines if the search criteria requires one of the full-text
+// query shapes (messages_fts_v2), or if we can use the optimized simple query
 func (db *Database) needsComplexQuery(criteria *imap.SearchCriteria, orderByClause string) bool {
 	// Need complex query for full-text search
 	if len(criteria.Body) > 0 || len(criteria.Text) > 0 {
@@ -648,10 +679,9 @@ func criteriaContainsFTS(c *imap.SearchCriteria) bool {
 // Eligibility is intentionally conservative — exactly one top-level TEXT term, no
 // BODY term, and no FTS nested in OR/NOT — so the decomposition is a simple two-branch
 // UNION with no disjunction cross-product. Everything else falls back to the existing
-// complex-fast path unchanged. This is a strict subset of the complex-fast conditions
-// (needsSeqNumSearch must be false, ORDER BY must not need seqnum).
-func (db *Database) canUseTextUnion(criteria *imap.SearchCriteria, needsSeqNumSearch bool, orderByClause string) bool {
-	if criteria == nil || needsSeqNumSearch {
+// complex-fast path unchanged.
+func (db *Database) canUseTextUnion(criteria *imap.SearchCriteria, orderByClause string) bool {
+	if criteria == nil {
 		return false
 	}
 	if len(criteria.Text) != 1 || len(criteria.Body) != 0 {
@@ -924,8 +954,8 @@ const ftsCTEThreshold = 10000
 // terms once each, account-scoped, instead of probing the FTS table per message. See
 // ftsCTEThreshold for why the choice is made by mailbox size, and buildFTSPrefilterQuery for
 // the shape.
-func (db *Database) canUseFTSPrefilter(criteria *imap.SearchCriteria, needsSeqNumSearch bool, orderByClause string, mailboxMessageCount int) bool {
-	if needsSeqNumSearch || mailboxMessageCount < ftsCTEThreshold {
+func (db *Database) canUseFTSPrefilter(criteria *imap.SearchCriteria, orderByClause string, mailboxMessageCount int) bool {
+	if mailboxMessageCount < ftsCTEThreshold {
 		return false
 	}
 	if strings.Contains(strings.ToLower(orderByClause), "seqnum") {
@@ -1166,7 +1196,12 @@ func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums [
 		}
 		uidBySeq[uint32(seq)] = imap.UID(uid)
 	}
-	return uidBySeq, rows.Err()
+	// An error the server raises while the statement runs (a statement timeout, a
+	// dropped connection) arrives here rather than from Query.
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to map sequence numbers to UIDs: %w", err)
+	}
+	return uidBySeq, nil
 }
 
 // appendSeqSetNums includes zero as a marker for a target-mailbox '*' lookup.
@@ -1207,32 +1242,6 @@ func seqSetToUIDSet(set imap.SeqSet, uidBySeq map[uint32]imap.UID) imap.UIDSet {
 		uidSet = append(uidSet, uidRange)
 	}
 	return uidSet
-}
-
-func criteriaContainsUIDWildcard(c *imap.SearchCriteria) bool {
-	if c == nil {
-		return false
-	}
-	for _, set := range c.UID {
-		for _, r := range set {
-			if r.Start == 0 || r.Stop == 0 {
-				return true
-			}
-		}
-	}
-	for i := range c.Not {
-		if criteriaContainsUIDWildcard(&c.Not[i]) {
-			return true
-		}
-	}
-	for i := range c.Or {
-		for j := range c.Or[i] {
-			if criteriaContainsUIDWildcard(&c.Or[i][j]) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // collectSeqNums appends every sequence number c's sequence sets name as a range end,
@@ -1311,10 +1320,12 @@ func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID)
 func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, orderByClause string, limit, mailboxMessageCount int) ([]SearchMessageResult, error) {
 	criteria = cloneSearchCriteria(criteria)
 	dropEmptyTextTerms(criteria)
-	if criteriaContainsUIDWildcard(criteria) {
-		if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, criteria); err != nil {
-			return nil, err
-		}
+	isSearchAll := isCriteriaSearchAll(criteria)
+	// Sequence-set keys and UID '*' are resolved to the UIDs they name now, so every
+	// query shape below filters on m.uid and none has to number the mailbox. If that
+	// fails, so does the search.
+	if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, criteria); err != nil {
+		return nil, err
 	}
 	if err := db.canonicalizeSearchCriteriaKeywords(ctx, nil, mailboxID, criteria); err != nil {
 		return nil, err
@@ -1328,47 +1339,7 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 	var whereArgs pgx.NamedArgs
 	var err error
 
-	// Determine query complexity up front. This may be refined below: a
-	// seqnum→UID rewrite can downgrade an otherwise-complex query to a simple
-	// one, so the result limit is computed afterwards from the final value.
 	isComplexQuery := db.needsComplexQuery(criteria, orderByClause)
-	isSearchAll := isCriteriaSearchAll(criteria)
-
-	needsSeqNumSearch := false
-	var checkSeqNum func(*imap.SearchCriteria) bool
-	checkSeqNum = func(c *imap.SearchCriteria) bool {
-		if c == nil {
-			return false
-		}
-		if len(c.SeqNum) > 0 {
-			return true
-		}
-		for _, n := range c.Not {
-			if checkSeqNum(&n) {
-				return true
-			}
-		}
-		for _, pair := range c.Or {
-			if checkSeqNum(&pair[0]) || checkSeqNum(&pair[1]) {
-				return true
-			}
-		}
-		return false
-	}
-	needsSeqNumSearch = checkSeqNum(criteria)
-	// If ordering uses sequence numbers dynamically, we can't push it down
-	if strings.Contains(strings.ToLower(orderByClause), "seqnum") {
-		needsSeqNumSearch = true
-	}
-
-	if needsSeqNumSearch && !strings.Contains(strings.ToLower(orderByClause), "seqnum") {
-		// If we only need seqnum for WHERE filtering, we can map the SeqSets to UIDSets
-		// and completely bypass the catastrophic ROW_NUMBER() materialization!
-		if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, criteria); err == nil {
-			needsSeqNumSearch = false
-			isComplexQuery = db.needsComplexQuery(criteria, orderByClause)
-		}
-	}
 
 	resultLimit = resolveResultLimit(limit, isSearchAll)
 	// Read one extra row to distinguish a complete result at the cap from an
@@ -1431,7 +1402,7 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 		}
 		metricsLabel = "search_messages_simple"
 
-	} else if db.canUseTextUnion(criteria, needsSeqNumSearch, orderByClause) {
+	} else if db.canUseTextUnion(criteria, orderByClause) {
 		// TEXT UNION path: split the single mixed-table TEXT OR into an index-only
 		// header branch UNION an indexable body branch (FTS GIN on messages_fts_v2),
 		// avoiding the full-mailbox-scan + per-row probe the combined OR forces on large
@@ -1446,7 +1417,7 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 			metricsLabel = "search_messages_complex_text_union_prefilter"
 		}
 
-	} else if db.canUseFTSPrefilter(criteria, needsSeqNumSearch, orderByClause, mailboxMessageCount) {
+	} else if db.canUseFTSPrefilter(criteria, orderByClause, mailboxMessageCount) {
 		// LARGE-MAILBOX path: evaluate the account's body matches once instead of probing
 		// the FTS table per message. See ftsCTEThreshold for the measured crossover.
 		finalQueryString, whereArgs, err = db.buildFTSPrefilterQuery(criteria, mailboxID, accountID, ftsLightBranchSelect+", "+textUnionSortColumnsLight, ftsLightOuterSelect, orderByClause, resultLimit, &paramCounter)
@@ -1455,9 +1426,9 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 		}
 		metricsLabel = "search_messages_complex_prefilter"
 
-	} else if !needsSeqNumSearch {
-		// Modern Complex path: We need FTS or JSONB generic headers, BUT we do NOT need SeqNum filtering.
-		// Thus, we can push down complex where clauses (FTS joins) into the CTE too!
+	} else {
+		// Per-message probe path: the body terms are tested against each message's
+		// account-scoped FTS row (see ftsCTEThreshold for when this is the cheaper form).
 		whereCondition, whereArgs, err = db.buildSearchCriteriaWithPrefix(criteria, "p", &paramCounter, "m")
 		if err != nil {
 			return nil, err
@@ -1505,51 +1476,6 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 		}
 		metricsLabel = "search_messages_complex_fast"
 
-	} else {
-		// Legacy Complex path: Use CTE with empty table prefix because SeqNum filtering REQUIRES evaluating Sequence IDs BEFORE where
-		whereCondition, whereArgs, err = db.buildSearchCriteriaWithPrefix(criteria, "p", &paramCounter, "")
-		if err != nil {
-			return nil, err
-		}
-		whereArgs["mailboxID"] = mailboxID
-		whereArgs["accountID"] = accountID
-
-		if orderByClause == "" {
-			// The legacy CTE path's outer query joins message_seqs (seq.uid) and
-			// messages (m.uid), so the default ORDER BY must qualify uid as m.uid to
-			// avoid an ambiguous column reference (SQLSTATE 42702).
-			orderByClause = "ORDER BY m.uid DESC"
-		}
-
-		const complexQuery = `
-		WITH message_seqs AS (
-			SELECT
-				m.id, m.uid,
-				ROW_NUMBER() OVER(ORDER BY uid) as seqnum
-			FROM messages m
-			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL
-		)
-		SELECT 
-			m.id, m.uid, m.mailbox_id, m.content_hash, m.created_modseq, ms.updated_modseq, m.expunged_modseq, seq.seqnum
-		FROM message_seqs seq
-		INNER JOIN messages m ON m.id = seq.id
-		` + ftsScopedJoin + `
-		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id`
-
-		innerOrderByClause := orderByClause
-		if db.needsIndexScanBiasBuster(criteria) {
-			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
-			if innerOrderByClause == orderByClause {
-				innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
-			}
-		}
-		if resultLimit > 0 {
-			finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", complexQuery, whereCondition, innerOrderByClause, resultLimit)
-		} else {
-			// No limit for SEARCH ALL
-			finalQueryString = fmt.Sprintf("%s WHERE %s %s", complexQuery, whereCondition, innerOrderByClause)
-		}
-		metricsLabel = "search_messages_complex_legacy"
 	}
 
 	start := time.Now()
@@ -1670,8 +1596,8 @@ func (db *Database) SearchMessagesWithCriteria(ctx context.Context, mailboxID, a
 func (db *Database) SearchMessagesSorted(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion, limit, mailboxMessageCount int) ([]SearchMessageResult, error) {
 	// Every query path in getSearchMessagesQueryExecutor aliases the messages table
 	// as "m". The complex paths additionally LEFT JOIN messages_fts_v2 (which also has
-	// a sent_date column) and the seqnum CTE joins message_seqs (which also has
-	// uid), so an unqualified ORDER BY column would be ambiguous (SQLSTATE 42702).
+	// a sent_date column), so an unqualified ORDER BY column would be ambiguous
+	// (SQLSTATE 42702).
 	// Always qualify sort columns with "m.".
 	orderBy := db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
 

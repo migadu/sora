@@ -129,7 +129,10 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 		}
 
 		if msgID != nil {
-			msg.MessageID = *msgID
+			// A synthetic ID is no Message-ID: RFC 5256 §3 (BASE.6.4.THREAD,
+			// REFERENCES step 1(A)) gives such a message a unique one, which no
+			// reference can name.
+			msg.MessageID = headerMessageID(*msgID)
 		}
 		if inReplyTo != nil {
 			msg.InReplyTo = *inReplyTo

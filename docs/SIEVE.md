@@ -399,6 +399,10 @@ redirect actions in one run make the run fail, and the message is then handled a
   - `X-Redirected-By: <primary address of the account that owns the script>`. Any
     `X-Redirected-By` already in the message is removed first.
 
+A redirect is handed to the relay only after the delivery has stored every copy it stores. A
+delivery that fails (`451` on LMTP, an error from the Admin API) relays nothing, so the sender's
+retry relays each address once.
+
 If queueing fails, the message is kept in INBOX and Sora logs
 `Sieve redirect could not be queued; message kept in INBOX instead` at warning level. Without
 `:copy` (and without `keep`), once every address is queued the message is not stored locally:

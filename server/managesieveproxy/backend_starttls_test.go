@@ -26,6 +26,7 @@ type fakeSieveBackend struct {
 	afterTLSCaps  string // sent in one write with the capabilities that follow the handshake
 	greeting      string // sent on connect in place of fakeSieveCapabilities
 	tlsGreeting   string // sent after the handshake in place of fakeSieveCapabilities
+	authReply     string // reply to every other command (the AUTHENTICATE); "" answers OK
 }
 
 // start serves one connection and returns its address and a function that waits for
@@ -45,6 +46,10 @@ func (b fakeSieveBackend) start(t *testing.T) (addr string, commands func() []st
 	reply := b.startTLSReply
 	if reply == "" {
 		reply = "NO \"STARTTLS not available\"\r\n"
+	}
+	authReply := b.authReply
+	if authReply == "" {
+		authReply = "OK\r\n"
 	}
 	greeting, tlsGreeting := b.greeting, b.tlsGreeting
 	if greeting == "" {
@@ -80,11 +85,13 @@ func (b fakeSieveBackend) start(t *testing.T) (addr string, commands func() []st
 			got = append(got, line)
 			mu.Unlock()
 			if !strings.EqualFold(line, "STARTTLS") {
-				io.WriteString(conn, "OK\r\n")
+				io.WriteString(conn, authReply)
 				continue
 			}
 			io.WriteString(conn, reply)
-			if !strings.HasPrefix(reply, "OK") {
+			// Any reply starting with the letters OK goes on to the handshake, so a proxy
+			// that takes it for an OK gets as far as authenticating.
+			if len(reply) < 2 || !strings.EqualFold(reply[:2], "OK") {
 				continue
 			}
 			secure := tls.Server(conn, tlsConfig)
@@ -212,6 +219,136 @@ func TestConnectToBackendRefusesDataAfterSTARTTLSResponse(t *testing.T) {
 	}
 }
 
+// The reply to STARTTLS is OK when its first atom is OK in any case: RFC 5804 section 4,
+// response-starttls = (response-ok response-capability) / response-nobye, response-ok =
+// "OK" [SP "(" resp-code ")"] [SP string] CRLF, and "Implementations MUST accept these
+// strings in a case-insensitive fashion". OKAY, or OK run into its string, is not an OK:
+// the proxy must not go on to the handshake after it.
+func TestConnectToBackendSTARTTLSReplyStatus(t *testing.T) {
+	for _, tc := range []struct {
+		reply string
+		ok    bool
+	}{
+		{"OK \"Begin TLS negotiation now.\"\r\n", true},
+		{"ok \"Begin TLS negotiation now.\"\r\n", true},
+		{"Ok\r\n", true},
+		{"oK (XTEST) \"Begin TLS negotiation now.\"\r\n", true},
+		{"OKAY \"Begin TLS negotiation now.\"\r\n", false},
+		{"OK\"Begin TLS negotiation now.\"\r\n", false},
+	} {
+		t.Run(strings.TrimSpace(tc.reply), func(t *testing.T) {
+			addr, commands := fakeSieveBackend{startTLSReply: tc.reply}.start(t)
+			sess, err := connectSieveBackend(t, addr, proxy.BackendSettings{TLS: true, TLSUseStartTLS: true}, nil)
+			_, upgraded := sess.backendConn.(*tls.Conn)
+			if sess.backendConn != nil {
+				sess.backendConn.Close()
+			}
+			got := commands()
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("connectToBackendAndAuth: %v", err)
+				}
+				if !upgraded {
+					t.Errorf("backendConn after STARTTLS is %T, want *tls.Conn", sess.backendConn)
+				}
+				if len(got) != 2 || got[0] != "STARTTLS" || !strings.HasPrefix(got[1], "AUTHENTICATE \"PLAIN\" ") {
+					t.Errorf("backend received %q, want STARTTLS, AUTHENTICATE", got)
+				}
+				return
+			}
+			if !errors.Is(err, server.ErrBackendConnectionFailed) || !strings.HasSuffix(err.Error(), "backend STARTTLS failed: "+strings.TrimSpace(tc.reply)) {
+				t.Errorf("connectToBackendAndAuth = %v, want a backend connection failure carrying %q", err, strings.TrimSpace(tc.reply))
+			}
+			if !slices.Equal(got, []string{"STARTTLS"}) {
+				t.Errorf("backend received %q, want STARTTLS alone", got)
+			}
+		})
+	}
+}
+
+// The reply to AUTHENTICATE is matched the same way: RFC 5804 section 4,
+// response-authenticate = *(string CRLF) ((response-ok [response-capability]) /
+// response-nobye), case-insensitive. A lower-case ok logs the user in; OKAY, or OK run
+// into its string, is the backend failing the proxy's login.
+func TestConnectToBackendAuthenticateReplyStatus(t *testing.T) {
+	for _, tc := range []struct {
+		reply string
+		ok    bool
+	}{
+		{"OK \"Logged in.\"\r\n", true},
+		{"ok \"Logged in.\"\r\n", true},
+		{"Ok\r\n", true},
+		{"oK (XTEST) \"Logged in.\"\r\n", true},
+		{"OKAY \"Logged in.\"\r\n", false},
+		{"OK\"Logged in.\"\r\n", false},
+	} {
+		t.Run(strings.TrimSpace(tc.reply), func(t *testing.T) {
+			addr, commands := fakeSieveBackend{authReply: tc.reply}.start(t)
+			sess, err := connectSieveBackend(t, addr, proxy.BackendSettings{}, nil)
+			if sess.backendConn != nil {
+				sess.backendConn.Close()
+			}
+			if got := commands(); len(got) != 1 || !strings.HasPrefix(got[0], "AUTHENTICATE \"PLAIN\" ") {
+				t.Errorf("backend received %q, want AUTHENTICATE", got)
+			}
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("connectToBackendAndAuth: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, server.ErrBackendAuthFailed) || !strings.HasSuffix(err.Error(), ": "+strings.TrimSpace(tc.reply)) {
+				t.Errorf("connectToBackendAndAuth = %v, want a backend login failure carrying %q", err, strings.TrimSpace(tc.reply))
+			}
+		})
+	}
+}
+
+// The string of an OK may be a literal: RFC 5804 section 4, response-ok = "OK" [SP "("
+// resp-code ")"] [SP string] CRLF, string = quoted / literal-c2s / literal-s2c. The
+// proxy reads the whole reply. After STARTTLS the literal is not data sent behind the
+// OK; after AUTHENTICATE it is not left in the reader the relay forwards to the client.
+func TestConnectToBackendReadsLiteralInStatusReply(t *testing.T) {
+	const literal = "{14}\r\nLogged in.\r\nOK\r\n" // a line break and a status word inside
+	t.Run("STARTTLS", func(t *testing.T) {
+		addr, commands := fakeSieveBackend{startTLSReply: "OK " + literal}.start(t)
+		sess, err := connectSieveBackend(t, addr, proxy.BackendSettings{TLS: true, TLSUseStartTLS: true}, nil)
+		if sess.backendConn != nil {
+			defer sess.backendConn.Close()
+		}
+		if err != nil {
+			t.Fatalf("connectToBackendAndAuth: %v", err)
+		}
+		if _, upgraded := sess.backendConn.(*tls.Conn); !upgraded {
+			t.Errorf("backendConn after STARTTLS is %T, want *tls.Conn", sess.backendConn)
+		}
+		sess.backendConn.Close()
+		if got := commands(); len(got) != 2 || got[0] != "STARTTLS" || !strings.HasPrefix(got[1], "AUTHENTICATE \"PLAIN\" ") {
+			t.Errorf("backend received %q, want STARTTLS, AUTHENTICATE", got)
+		}
+	})
+	t.Run("AUTHENTICATE", func(t *testing.T) {
+		addr, commands := fakeSieveBackend{authReply: "OK " + literal}.start(t)
+		sess, err := connectSieveBackend(t, addr, proxy.BackendSettings{}, nil)
+		if sess.backendConn != nil {
+			defer sess.backendConn.Close()
+		}
+		if err != nil {
+			t.Fatalf("connectToBackendAndAuth: %v", err)
+		}
+		// The fake backend sends nothing more until the next command, so anything the
+		// relay could read now is left over from the AUTHENTICATE reply.
+		sess.backendConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		if extra, err := sess.backendReader.ReadString('\n'); extra != "" || err == nil {
+			t.Errorf("relay would forward %q to the client after login (read error %v), want nothing", extra, err)
+		}
+		sess.backendConn.Close()
+		if got := commands(); len(got) != 1 || !strings.HasPrefix(got[0], "AUTHENTICATE \"PLAIN\" ") {
+			t.Errorf("backend received %q, want AUTHENTICATE", got)
+		}
+	})
+}
+
 // A capability list ends with OK, NO or BYE (RFC 5804 section 4: response-capability =
 // *(single-capability) response-oknobye), matched case-insensitively. A backend refusing
 // the connection (a sora backend over its max_connections_per_ip answers
@@ -295,7 +432,7 @@ func TestBackendCapabilityLiteralBounds(t *testing.T) {
 		{"record bound includes literal payload", "{8190}\r\n", server.ErrLineTooLong},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := readBackendCapabilityRecord(bufio.NewReader(strings.NewReader(tc.input)))
+			_, err := readBackendRecord(bufio.NewReader(strings.NewReader(tc.input)))
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("reading capability record: %v, want %v", err, tc.want)
 			}

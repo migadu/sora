@@ -325,6 +325,8 @@ type IMAPServer struct {
 	warmupSemaphore     chan struct{}  // Semaphore for sync warmups
 	warmupWg            sync.WaitGroup // Tracks active warmup workers for graceful shutdown
 	warmupStopOnce      sync.Once      // Ensures warmup channel is closed only once
+	warmupMu            sync.RWMutex   // Read-held by async enqueues, write-held by stopWarmupWorkers to close warmupQueue
+	warmupStopped       bool           // Set under warmupMu when warmupQueue is closed; nothing is sent after that
 	lastWarmupTimes     sync.Map       // map[int64]time.Time - last warmup start per account, see recordWarmup
 	warmupSweptAt       atomic.Int64   // UnixNano of the last sweep of expired lastWarmupTimes entries
 
@@ -1520,10 +1522,16 @@ func (s *IMAPServer) startWarmupWorkers() {
 
 // stopWarmupWorkers gracefully shuts down the warmup worker pool.
 // Closes the queue channel (no more jobs accepted) and waits for in-flight jobs to finish.
+// Sessions keep running commands until they drain, so a login can still ask for a
+// warmup after this: the queue is closed under warmupMu with warmupStopped set, and
+// WarmupCache checks the flag under the same lock before it sends.
 func (s *IMAPServer) stopWarmupWorkers() {
 	if s.warmupQueue != nil {
 		s.warmupStopOnce.Do(func() {
+			s.warmupMu.Lock()
+			s.warmupStopped = true
 			close(s.warmupQueue)
+			s.warmupMu.Unlock()
 			// Wait for workers to finish current jobs with timeout
 			done := make(chan struct{})
 			go func() {
@@ -1570,6 +1578,16 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, AccountID int64, mailboxNa
 	}
 
 	if async {
+		// Once the workers are stopped the queue is closed, and a send on a closed
+		// channel panics even in a select with a default: check under the lock that
+		// stopWarmupWorkers closes it under. The send never blocks, so holding the
+		// read lock across it cannot hold up the stop.
+		s.warmupMu.RLock()
+		defer s.warmupMu.RUnlock()
+		if s.warmupStopped {
+			logger.Debug("IMAP: Warmup skipped - warmup workers stopped", "name", s.name, "account_id", AccountID)
+			return nil
+		}
 		// Non-blocking enqueue to the bounded worker pool queue.
 		// If queue is full, we skip warmup but do NOT stamp lastWarmupTimes,
 		// so the user will get a warmup attempt on their next login.
@@ -1803,24 +1821,26 @@ var alwaysAdvertisedCaps = imap.CapSet{
 	imap.CapUTF8Accept:   {},
 }
 
-// sortExtensions extend the SORT command and imply it, which go-imap's Has
-// does not know: SORT=DISPLAY is advertised by "A server that supports the
-// full [SORT] extension as well as both the DISPLAYFROM and DISPLAYTO sort
-// criteria" (RFC 5957 §1), and servers advertising ESORT "support the return
-// options specified in [ESEARCH] in the SORT command" (RFC 5267 §3.1).
-var sortExtensions = imap.CapSet{
-	imap.CapSortDisplay: {},
-	imap.CapESort:       {},
-}
-
 // capImplies reports whether capability by implies capability c: go-imap's own
-// Has, so it follows the library, and sortExtensions.
+// Has, so it follows the library, plus the extension dependencies Has does not
+// model:
+//   - SORT=DISPLAY (RFC 5957 §1) and ESORT (RFC 5267 §3.1) extend SORT;
+//   - SEARCHRES (RFC 5182 §2.1), ESORT (RFC 5267 §3.1) and MULTISEARCH
+//     (RFC 7377 §1, §2) require ESEARCH;
+//   - CREATE-SPECIAL-USE requires SPECIAL-USE (RFC 6154 §3).
 func capImplies(by, c imap.Cap) bool {
 	if (imap.CapSet{by: {}}).Has(c) {
 		return true
 	}
-	_, ok := sortExtensions[by]
-	return ok && c == imap.CapSort
+	switch c {
+	case imap.CapSort:
+		return by == imap.CapSortDisplay || by == imap.CapESort
+	case imap.CapESearch:
+		return by == imap.CapSearchRes || by == imap.CapESort || by == imap.CapMultiSearch
+	case imap.CapSpecialUse:
+		return by == imap.CapCreateSpecialUse
+	}
+	return false
 }
 
 // disableCapabilities removes the named capabilities from caps and returns
@@ -1830,10 +1850,10 @@ func capImplies(by, c imap.Cap) bool {
 // into the base protocol (IDLE, ESEARCH, SEARCHRES, MOVE, NAMESPACE, UIDPLUS,
 // ...), QRESYNC implies CONDSTORE (RFC 7162 §3.2.3). Deleting only the named key
 // left such a capability advertised and usable, so whatever implies it is
-// removed too (see capImplies). For IMAP4rev2 that downgrades the server or
-// session to IMAP4rev1, where go-imap lists each remaining extension on its
-// own. A name in alwaysAdvertisedCaps is skipped: nothing removed here can
-// withdraw it.
+// removed transitively too (see capImplies). For IMAP4rev2 that downgrades the
+// server or session to IMAP4rev1, where go-imap lists each remaining extension
+// on its own. A name in alwaysAdvertisedCaps is skipped: nothing removed here
+// can withdraw it.
 func disableCapabilities(caps imap.CapSet, names []string) []string {
 	var removed []string
 	for _, name := range names {
@@ -1845,10 +1865,16 @@ func disableCapabilities(caps imap.CapSet, names []string) []string {
 			delete(caps, c)
 			removed = append(removed, name)
 		}
-		for other := range caps {
-			if capImplies(other, c) {
-				delete(caps, other)
-				removed = append(removed, string(other))
+		queue := []imap.Cap{c}
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			for other := range caps {
+				if capImplies(other, cur) {
+					delete(caps, other)
+					removed = append(removed, string(other))
+					queue = append(queue, other)
+				}
 			}
 		}
 	}

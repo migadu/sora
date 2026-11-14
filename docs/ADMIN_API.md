@@ -182,13 +182,9 @@ instead (`Address`, `TotalPending`, `ID`); the sections below name each one.
 {"error": "Account not found"}
 ```
 
-There are exceptions where the body is plain text from Go's HTTP library:
-
-- `405` for a known path with the wrong method: `Method not allowed`.
-- `404` for a path that matches no route: `404 page not found`; and under `/admin/domains/`
-  for anything but `.../accounts`: `Not found`.
-- Some ACL and affinity errors (missing fields, the affinity `503`) have a JSON body but are
-  sent with `Content-Type: text/plain`.
+A method the path does not serve is `405 {"error":"Method not allowed"}` with an `Allow`
+header listing the methods it does serve; a path no endpoint has is
+`404 {"error":"Not found"}`.
 
 **Status codes** used across the API:
 
@@ -201,8 +197,8 @@ There are exceptions where the body is plain text from Go's HTTP library:
 | 400 | The request is wrong: bad JSON, a missing field, a bad parameter, or a refused change. |
 | 401 | No or malformed `Authorization` header. |
 | 403 | Wrong key, the read-only key on a write, or client address not in `allowed_hosts`. |
-| 404 | The account, credential, mailbox or record does not exist. |
-| 405 | Wrong method for the path. |
+| 404 | The account, credential, mailbox or record does not exist, or no endpoint has the path. |
+| 405 | Wrong method for the path; `Allow` lists the methods it serves. |
 | 409 | An address already exists. |
 | 500 | Server-side failure. |
 | 503 | A component this endpoint needs is not running on this node, or the backend is in maintenance. |

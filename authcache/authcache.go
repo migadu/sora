@@ -60,8 +60,12 @@ type Cache struct {
 	// Protects write operations to SQLite (reads are concurrent via WAL)
 	mu sync.Mutex
 
-	// Tracks pending async goroutines (e.g., last_used updates)
-	wg sync.WaitGroup
+	// Tracks pending async goroutines (e.g., last_used updates). They
+	// register under closeMu and only until closed is set, so that none
+	// starts once Close has begun (see goAsync).
+	closeMu sync.Mutex
+	closed  bool
+	wg      sync.WaitGroup
 }
 
 // New creates a new authentication cache backed by a SQLite database at dbPath.
@@ -225,11 +229,10 @@ func (c *Cache) Get(ctx context.Context, address string) (accountID int64, hashe
 		return 0, "", fmt.Errorf("auth cache query error: %w", err)
 	}
 
-	// Update last_used and hit_count asynchronously
+	// Update last_used and hit_count asynchronously (skipped once Close has
+	// begun; the lookup still answers).
 	now := time.Now().Unix()
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
+	c.goAsync(func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if _, err := c.db.Exec(`
@@ -239,7 +242,7 @@ func (c *Cache) Get(ctx context.Context, address string) (accountID int64, hashe
 		`, now, address); err != nil {
 			logger.Warn("AuthCache: Failed to update last_used", "address", address, "error", err)
 		}
-	}()
+	})
 
 	c.hits.Add(1)
 	metrics.AuthCacheOperations.WithLabelValues("hit").Inc()
@@ -382,8 +385,29 @@ func (c *Cache) Stats(ctx context.Context) (totalEntries, lifetimeHits int64, hi
 	return
 }
 
-// Close waits for pending async operations and closes the underlying SQLite database.
+// goAsync runs f in a new goroutine that Close waits for, or not at all once
+// Close has begun. Registering under closeMu orders every wg.Add before
+// Close's wg.Wait, as sync.WaitGroup requires, so no update can start after
+// the wait and reach the closed database.
+func (c *Cache) goAsync(f func()) {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+	if c.closed {
+		return
+	}
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		f()
+	}()
+}
+
+// Close stops starting async operations, waits for the pending ones and
+// closes the underlying SQLite database.
 func (c *Cache) Close() error {
+	c.closeMu.Lock()
+	c.closed = true
+	c.closeMu.Unlock()
 	c.wg.Wait() // Wait for pending async goroutines (last_used updates)
 	if c.db != nil {
 		return c.db.Close()

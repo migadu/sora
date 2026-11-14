@@ -247,11 +247,9 @@ message (section 7). Times are RFC 3339.
 {"error": "Mailbox not found"}
 ```
 
-with these plain-text exceptions from Go's HTTP library:
-
-- `405 Method not allowed` for a known path with the wrong method;
-- `404 Not found` for `/user/mailboxes/{name}` with a method other than `DELETE`;
-- `404 page not found` for a path that matches no route.
+A method the path does not serve is `405 {"error":"Method not allowed"}` with an `Allow`
+header listing the methods it does serve; a path no endpoint has is
+`404 {"error":"Not found"}`.
 
 **Status codes:**
 
@@ -262,7 +260,8 @@ with these plain-text exceptions from Go's HTTP library:
 | 400 | Bad request: bad JSON, a missing or invalid field or parameter, a script that does not compile. |
 | 401 | No, bad or expired token; failed login. |
 | 403 | Client address not in `allowed_hosts`; deleting `INBOX`; or changing flags or deleting a message in a shared mailbox without the right. |
-| 404 | Mailbox, message or script not found. |
+| 404 | Mailbox, message or script not found, or no endpoint has the path. |
+| 405 | Wrong method for the path; `Allow` lists the methods it serves. |
 | 409 | Mailbox already exists, or has child mailboxes. |
 | 410 | The message body is gone for good. |
 | 413 | Sieve script over 65536 bytes. |
@@ -558,7 +557,7 @@ its results, and all supplied filters must match:
 | `subject` | Literal substring of the subject, ignoring case. |
 | `unseen=true` | Only messages without `\\Seen`, including messages with no stored flags. |
 
-The text filters have no wildcard syntax. A `from` or `subject` containing a NUL or
+The text filters have no wildcard syntax. A `q`, `from` or `subject` containing a NUL or
 invalid UTF-8 is refused with `400 Bad Request`.
 
 Response `200`:
@@ -583,7 +582,7 @@ Response `200`:
 
 | Status | Body `error` |
 |---|---|
-| 400 | `Invalid mailbox name`, `Search query parameter 'q' is required` |
+| 400 | `Invalid mailbox name`, `Search query parameter 'q' is required`, `Search query parameter 'q' must be UTF-8 text without NUL`, `Search filters 'from' and 'subject' must be UTF-8 text without NUL` |
 | 404 | `Mailbox not found` (also a shared mailbox without `r`) |
 | 500 | `Failed to search messages` |
 
@@ -707,8 +706,8 @@ return messages in this shape:
   "size": 48211,
   "flags": ["\\Seen"],
   "custom_flags": ["$Work", "$hasattachment"],
-  "message_id": "<abc@example.com>",
-  "in_reply_to": "<xyz@example.com>",
+  "message_id": "abc@example.com",
+  "in_reply_to": "xyz@example.com",
   "content_hash": "4f1c...",
   "has_attachments": true
 }
@@ -727,7 +726,7 @@ return messages in this shape:
 | `size` | Bytes. |
 | `flags` | System flags. `[]` when there are none. |
 | `custom_flags` | Keywords. Left out when there are none. |
-| `message_id`, `in_reply_to` | From the headers. |
+| `message_id`, `in_reply_to` | From the headers, without angle brackets; `in_reply_to` holds its IDs separated by spaces and is left out when there are none. `message_id` is `""` when the message has no `Message-ID` that parses. |
 | `references` | The `References` header; only in `GET /user/messages/{id}`. |
 | `content_hash` | The hash that names the stored body. Messages with the same content share it. |
 | `has_attachments` | From the RFC 9979 keywords: `true` with `$hasattachment`, `false` with `$hasnoattachment`, left out when the message carries neither (mail Sora stored before it set them, or mail it could not inspect). |
@@ -856,6 +855,7 @@ call the API through the proxy.
 |---|---|---|
 | `type`, `name`, `addr` | required | `user_api_proxy`, a name, the listen address. |
 | `jwt_secret` | none | Must equal the backends' `jwt_secret`. Empty: the proxy is skipped with `User API proxy server enabled but no JWT secret configured - skipping`. Under 32 bytes or the placeholder: Sora refuses to start. Reloaded on SIGHUP, with the same rules as on the backend. |
+| `allowed_origins` | `[]` | CORS origins of the errors the proxy answers itself (12.3); set it to the backends' list. Reloaded on SIGHUP. |
 | `remote_addrs` | none | Backend `host:port` list. Either this or `[[pool]]` blocks are required. |
 | `remote_port` | none | Port for backends listed without one. |
 | `remote_tls` | `false` | Speak HTTPS to the backends. |
@@ -875,7 +875,8 @@ call the API through the proxy.
 | `[server.remote_lookup]` | off | Route lookups; see [PROXY.md](PROXY.md). |
 | `[server.lookup_cache]` | off | Caches lookup answers; same keys and defaults as in section 2. |
 
-`allowed_hosts`, `token_duration` and `token_issuer` have no effect on this proxy. Affinity is
+`allowed_hosts`, `token_duration` and `token_issuer` have no effect on this proxy; set in its block,
+each is reported with a startup warning. Affinity is
 used when the block sets `enable_affinity = true` and the cluster runs its affinity store
 (`[cluster.affinity] enabled = true`). The proxy's HTTP
 limits are fixed: 30 seconds to read a request and 30 seconds to write a response, 120 seconds

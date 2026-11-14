@@ -1361,16 +1361,14 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 			return nil, "", err
 		}
 
-		// Record failure in health tracking only if the caller's context is still live.
-		// ctx.Err() is the only usable discriminator: a dial that exhausted its own
-		// connect_timeout — the black-holed backend case — also reports as
-		// context.DeadlineExceeded, so the error identity cannot tell a dead backend
-		// apart from a caller-side timeout or cancellation (slow remote_lookup consuming
-		// the deadline, client disconnect, global timeout).
-		if ctx.Err() == nil {
+		// Record failure in health tracking only if the caller still had time: a slow
+		// remote_lookup consuming the deadline, a client disconnect or a global timeout
+		// is not the backend's failure. See callerGaveUp.
+		callerDone := callerGaveUp(ctx)
+		if !callerDone {
 			cm.RecordConnectionFailure(addr)
 		}
-		logger.Warn("Failed to connect to backend (round-robin)", "addr", addr, "error", err, "ctx_err", ctx.Err(), "server", cm.serverName)
+		logger.Warn("Failed to connect to backend (round-robin)", "addr", addr, "error", err, "ctx_err", ctx.Err(), "caller_done", callerDone, "server", cm.serverName)
 	}
 
 	if inMaintenance > 0 && inMaintenance == len(currentRemoteAddrs) {
@@ -1379,6 +1377,23 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 		return nil, "", fmt.Errorf("all remote servers are in maintenance")
 	}
 	return nil, "", fmt.Errorf("all remote servers are unavailable")
+}
+
+// callerGaveUp reports whether a failed backend dial is down to the caller rather than
+// the backend: ctx was canceled or its deadline has passed. Such a failure says nothing
+// about the backend and must not count against its health.
+//
+// ctx.Err() alone lags the deadline: it is set only once the context's timer has run,
+// while net.Dialer reads ctx.Deadline() itself and refuses a dial whose budget is spent
+// with an i/o timeout before then. The returned error cannot decide it either: a dial
+// that exhausted its own connect_timeout (a black-holed backend) is a timeout too, and
+// that one is the backend's failure while the caller still has time left.
+func callerGaveUp(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	deadline, ok := ctx.Deadline()
+	return ok && !time.Now().Before(deadline)
 }
 
 // tryPreferredAddress attempts to connect to a preferred address (from affinity or remotelookup).
@@ -1454,22 +1469,21 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 		return conn, preferredAddr, nil, false // No fallback
 	}
 
-	// Connection failed. Mark it as unhealthy if it's in our managed list.
+	// Connection failed. Mark it as unhealthy if it's in our managed list, but only if
+	// the caller still had time, as on the round-robin path (callerGaveUp).
 	if isInList {
-		// Only record failure if the caller's context is still live. Same discriminator as
-		// the round-robin path: a dial that exhausted its own connect_timeout reports as
-		// context.DeadlineExceeded even though ctx never expired, so only ctx.Err() tells a
-		// dead backend apart from a caller-side timeout or cancellation.
-		if ctx.Err() == nil {
+		callerDone := callerGaveUp(ctx)
+		if !callerDone {
 			cm.RecordConnectionFailure(preferredAddr)
 		}
-		logger.Warn("Failed to connect to preferred backend", "addr", preferredAddr, "error", err, "is_remotelookup", isRemoteLookupRoute, "ctx_err", ctx.Err(), "server", cm.serverName)
+		logger.Warn("Failed to connect to preferred backend", "addr", preferredAddr, "error", err, "is_remotelookup", isRemoteLookupRoute, "ctx_err", ctx.Err(), "caller_done", callerDone, "server", cm.serverName)
 	} else if isRemoteLookupRoute {
-		// Track remote lookup backend failure (not in pool), same discriminator as above.
-		if ctx.Err() == nil {
+		// Track remote lookup backend failure (not in pool), same rule as above.
+		callerDone := callerGaveUp(ctx)
+		if !callerDone {
 			cm.RecordRemoteLookupFailure(preferredAddr)
 		}
-		logger.Warn("Failed to connect to remote lookup backend (not in pool)", "addr", preferredAddr, "error", err, "ctx_err", ctx.Err(), "server", cm.serverName)
+		logger.Warn("Failed to connect to remote lookup backend (not in pool)", "addr", preferredAddr, "error", err, "ctx_err", ctx.Err(), "caller_done", callerDone, "server", cm.serverName)
 	}
 
 	if isRemoteLookupRoute {
