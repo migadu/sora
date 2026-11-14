@@ -325,6 +325,8 @@ type IMAPServer struct {
 	warmupSemaphore     chan struct{}  // Semaphore for sync warmups
 	warmupWg            sync.WaitGroup // Tracks active warmup workers for graceful shutdown
 	warmupStopOnce      sync.Once      // Ensures warmup channel is closed only once
+	warmupMu            sync.RWMutex   // Read-held by async enqueues, write-held by stopWarmupWorkers to close warmupQueue
+	warmupStopped       bool           // Set under warmupMu when warmupQueue is closed; nothing is sent after that
 	lastWarmupTimes     sync.Map       // map[int64]time.Time - last warmup start per account, see recordWarmup
 	warmupSweptAt       atomic.Int64   // UnixNano of the last sweep of expired lastWarmupTimes entries
 
@@ -1520,10 +1522,16 @@ func (s *IMAPServer) startWarmupWorkers() {
 
 // stopWarmupWorkers gracefully shuts down the warmup worker pool.
 // Closes the queue channel (no more jobs accepted) and waits for in-flight jobs to finish.
+// Sessions keep running commands until they drain, so a login can still ask for a
+// warmup after this: the queue is closed under warmupMu with warmupStopped set, and
+// WarmupCache checks the flag under the same lock before it sends.
 func (s *IMAPServer) stopWarmupWorkers() {
 	if s.warmupQueue != nil {
 		s.warmupStopOnce.Do(func() {
+			s.warmupMu.Lock()
+			s.warmupStopped = true
 			close(s.warmupQueue)
+			s.warmupMu.Unlock()
 			// Wait for workers to finish current jobs with timeout
 			done := make(chan struct{})
 			go func() {
@@ -1570,6 +1578,16 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, AccountID int64, mailboxNa
 	}
 
 	if async {
+		// Once the workers are stopped the queue is closed, and a send on a closed
+		// channel panics even in a select with a default: check under the lock that
+		// stopWarmupWorkers closes it under. The send never blocks, so holding the
+		// read lock across it cannot hold up the stop.
+		s.warmupMu.RLock()
+		defer s.warmupMu.RUnlock()
+		if s.warmupStopped {
+			logger.Debug("IMAP: Warmup skipped - warmup workers stopped", "name", s.name, "account_id", AccountID)
+			return nil
+		}
 		// Non-blocking enqueue to the bounded worker pool queue.
 		// If queue is full, we skip warmup but do NOT stamp lastWarmupTimes,
 		// so the user will get a warmup attempt on their next login.
