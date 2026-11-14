@@ -45,10 +45,16 @@ ProtectHome=true
 #   /var/lib/sora     TLS fallback_dir (StateDirectory)
 #   /var/cache/sora   [local_cache] path, [auth_cache] path (CacheDirectory)
 #   /var/log/sora     [logging] output, when a file (LogsDirectory)
+# systemd resets the State/Cache/Logs directories to their *DirectoryMode= at every start
+# (0755 when unset). The cache holds message bodies and the logs hold addresses: 0750,
+# like /var/spool/sora.
 PrivateTmp=true
 StateDirectory=sora
+StateDirectoryMode=0750
 CacheDirectory=sora
+CacheDirectoryMode=0750
 LogsDirectory=sora
+LogsDirectoryMode=0750
 ReadWritePaths=/var/spool/sora
 
 # File descriptor limits (for many concurrent connections)

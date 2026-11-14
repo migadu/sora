@@ -5,6 +5,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -149,6 +150,32 @@ func TestSystemdUnitKeepsSoraPathsWritableAndPersistent(t *testing.T) {
 		if !ok {
 			t.Errorf("%s %q is not under a persistent writable directory of the unit %v (PrivateTmp=%v)",
 				d.what, d.dir, roots, unit["Service"]["PrivateTmp"])
+		}
+	}
+}
+
+// TestSystemdUnitKeepsSoraDirectoriesPrivate: at every start systemd gives each
+// StateDirectory=, CacheDirectory= and LogsDirectory= directory the access mode of its
+// *DirectoryMode= setting, 0755 when unset, whatever an administrator set (systemd.exec(5),
+// "Automatic directory creation"). The local cache keeps message bodies in 0644 files and
+// the log file is 0644: under a directory open to others every local account can read
+// them. With the earlier /tmp defaults they sat in the unit's private /tmp.
+func TestSystemdUnitKeepsSoraDirectoriesPrivate(t *testing.T) {
+	unit := parseSystemdUnit(t, "sora.service")
+	for _, key := range []string{"StateDirectory", "CacheDirectory", "LogsDirectory"} {
+		if len(unit.words("Service", key)) == 0 {
+			continue
+		}
+		mode := "0755"
+		if got := unit["Service"][key+"Mode"]; len(got) > 0 {
+			mode = got[len(got)-1]
+		}
+		m, err := strconv.ParseUint(mode, 8, 32)
+		if err != nil {
+			t.Fatalf("%sMode=%s: %v", key, mode, err)
+		}
+		if m&0o007 != 0 {
+			t.Errorf("%s= directories get mode %s, open to every local account; set %sMode=0750", key, mode, key)
 		}
 	}
 }
