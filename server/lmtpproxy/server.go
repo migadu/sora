@@ -280,9 +280,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	if lookupCacheConfig.Enabled && !proxy.RemoteLookupUsesClientIP(opts.RemoteLookup) {
-		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
-		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
-		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault(opts.Name)
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault(opts.Name)
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(opts.Name)
 		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// LMTP proxy doesn't do password validation, so positive revalidation window is not needed (use 0)
