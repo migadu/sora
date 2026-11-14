@@ -189,6 +189,58 @@ func TestCopyMessagesTakesOverHeldDestObjects(t *testing.T) {
 	require.ErrorIs(t, err, db.ErrDBLockTimeout)
 	require.Zero(t, destRows(), "a copy whose object locks were lost must not commit")
 
+	// An exclusive locker queued behind the caller's shared lock (a restore of the body)
+	// waits for the caller, and the caller waits for this copy. A take-over that queued
+	// behind it would close the circle outside PostgreSQL's deadlock detector, so all
+	// three would wait for a timeout: the copy must be refused at once instead.
+	queuedBehind, err := rdb.LockS3ObjectsShared(ctx, idB, []string{heldHash})
+	require.NoError(t, err)
+	defer queuedBehind.Release()
+	restore, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	restoreLocked := make(chan error, 1)
+	go func() {
+		_, err := restore.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, db.GetS3ObjectLockID(idB, heldHash))
+		restoreLocked <- err
+	}()
+	restoreReturned := false
+	defer func() {
+		// On a failed assertion: let the queued locker through before rolling it back, or
+		// the rollback waits for its statement forever.
+		queuedBehind.Release()
+		if !restoreReturned {
+			<-restoreLocked
+		}
+		_ = restore.Rollback(ctx)
+	}()
+	lockID := uint64(db.GetS3ObjectLockID(idB, heldHash))
+	queueDeadline := time.Now().Add(10 * time.Second)
+	for {
+		var queued bool
+		require.NoError(t, pool.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM pg_locks
+			               WHERE locktype = 'advisory' AND NOT granted AND mode = 'ExclusiveLock'
+			                 AND classid = $1::bigint::oid AND objid = $2::bigint::oid AND objsubid = 1)`,
+			int64(lockID>>32), int64(lockID&0xffffffff)).Scan(&queued))
+		if queued {
+			break
+		}
+		require.True(t, time.Now().Before(queueDeadline), "the exclusive locker never queued")
+		time.Sleep(10 * time.Millisecond)
+	}
+	copyCtx, cancelCopy := context.WithTimeout(ctx, 5*time.Second)
+	started := time.Now()
+	_, _, err = rdb.CopyMessagesWithRetry(copyCtx, &uids, src.ID, dest.ID, idB, "example.net", "user_b", "test-instance",
+		&db.HeldDestObjects{Lock: queuedBehind, Hashes: map[string]bool{heldHash: true}})
+	cancelCopy()
+	require.ErrorIs(t, err, db.ErrDBLockTimeout, "the take-over must be refused, not wait behind the queued exclusive locker")
+	assert.Less(t, time.Since(started), 2*time.Second, "the take-over must not wait")
+	require.Zero(t, destRows(), "a refused take-over must not commit")
+	queuedBehind.Release()
+	restoreReturned = true
+	require.NoError(t, <-restoreLocked, "the exclusive locker gets the lock once the caller lets go")
+	require.NoError(t, restore.Rollback(ctx))
+
 	lock, err := rdb.LockS3ObjectsShared(ctx, idB, []string{heldHash})
 	require.NoError(t, err)
 	defer lock.Release()
