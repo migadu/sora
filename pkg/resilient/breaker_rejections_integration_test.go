@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/pkg/circuitbreaker"
@@ -81,6 +82,98 @@ func TestRejectedWritesKeepWriteBreakerClosed(t *testing.T) {
 				t.Errorf("valid write after rejected writes: %v", err)
 			}
 		})
+	}
+}
+
+// The database failing inside a write still counts when the db layer reports it through
+// one of its own sentinels (InsertMessage's consts.ErrDBUpdateFailed and the like): the
+// breakers go by the kind of error, so a sentinel that dropped the database's error would
+// read as an answer from a working database, and deliveries against a failing database
+// would never open the write breaker. Here InsertMessage's highest_uid UPDATE waits on a
+// row lock and its backend is terminated (57P01) while it waits.
+func TestDatabaseFailureBehindDBSentinelCountsAgainstWriteBreaker(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	ctx := context.Background()
+
+	setup := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, setup)
+	accountID, err := setup.GetAccountIDByAddressWithRetry(ctx, account.Email)
+	if err != nil {
+		t.Fatalf("account id: %v", err)
+	}
+	inbox, err := setup.GetMailboxByNameWithRetry(ctx, accountID, "INBOX")
+	if err != nil {
+		t.Fatalf("INBOX: %v", err)
+	}
+
+	pool := setup.GetDatabase().WritePool
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin blocker: %v", err)
+	}
+	defer blocker.Rollback(context.Background())
+	var blockerPID uint32
+	if err := blocker.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&blockerPID); err != nil {
+		t.Fatalf("blocker pid: %v", err)
+	}
+	if _, err := blocker.Exec(ctx, "SELECT id FROM mailboxes WHERE id = $1 FOR UPDATE", inbox.ID); err != nil {
+		t.Fatalf("lock INBOX row: %v", err)
+	}
+
+	rdb := common.SetupTestDatabase(t)
+	for i := 1; i <= 3; i++ {
+		now := time.Now()
+		opts := &db.InsertMessageOptions{
+			AccountID:     accountID,
+			MailboxID:     inbox.ID,
+			MailboxName:   "INBOX",
+			S3Domain:      "example.com",
+			S3Localpart:   "breaker",
+			ContentHash:   fmt.Sprintf("breaker-hash-%d-%d", i, now.UnixNano()),
+			MessageID:     fmt.Sprintf("<breaker-%d-%d@example.com>", i, now.UnixNano()),
+			InternalDate:  now,
+			Size:          128,
+			Subject:       "breaker",
+			PlaintextBody: "body",
+			SentDate:      now,
+			InReplyTo:     []string{},
+		}
+		upload := db.PendingUpload{AccountID: accountID, ContentHash: opts.ContentHash, InstanceID: "test", Size: 128}
+
+		done := make(chan error, 1)
+		go func() {
+			_, _, err := rdb.InsertMessageWithRetry(ctx, opts, upload)
+			done <- err
+		}()
+
+		// Terminate the insert's backend once it waits on the blocker's row lock.
+		var waiterPID uint32
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			err := pool.QueryRow(ctx, "SELECT pid FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid))", blockerPID).Scan(&waiterPID)
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("attempt %d: insert never waited on the row lock: %v", i, err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if _, err := pool.Exec(ctx, "SELECT pg_terminate_backend($1)", waiterPID); err != nil {
+			t.Fatalf("attempt %d: terminate backend %d: %v", i, waiterPID, err)
+		}
+
+		err := <-done
+		if err == nil {
+			t.Fatalf("attempt %d: insert succeeded on a terminated connection", i)
+		}
+		if !errors.Is(err, consts.ErrDBUpdateFailed) {
+			t.Errorf("attempt %d: got %v, want %v", i, err, consts.ErrDBUpdateFailed)
+		}
+	}
+
+	if state := rdb.GetWriteBreakerState(); state != circuitbreaker.StateOpen {
+		t.Errorf("write breaker %s after three writes failed by the database, want %s", state, circuitbreaker.StateOpen)
 	}
 }
 
