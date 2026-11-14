@@ -1123,6 +1123,7 @@ paths:
             - Missing required field `email`
             - Neither `password` nor `password_hash` provided
             - Both `password` and `password_hash` provided (only one allowed)
+            - A `credentials` entry with a `password` whose `hash_type` is not `bcrypt` or `ssha512`
           content:
             application/json:
               schema:
@@ -1619,6 +1620,12 @@ paths:
                   count:
                     type: integer
                     example: 2
+        '400':
+          description: The address does not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Account not found.
           content:
