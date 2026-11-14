@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/migadu/sora/logger"
 )
 
 // requireBlocked fails the test unless CanAttemptAuth refuses addr/username with
@@ -365,6 +369,175 @@ func TestIPUsernameBlockTableReusesExpiredBlocks(t *testing.T) {
 	}
 }
 
+// A failure's time is taken before the Tier 1 lock, so a failure can be stored after a
+// later one. Recorded while its pair is blocked, it must not end the block earlier than
+// the later failure did.
+func TestIPUsernameBlockRenewalNeverShortensBlock(t *testing.T) {
+	limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+		Enabled:                  true,
+		MaxAttemptsPerIPUsername: 1,
+		IPUsernameBlockDuration:  time.Minute,
+		IPUsernameWindowDuration: time.Hour,
+		CleanupInterval:          time.Hour,
+	})
+	defer limiter.Stop()
+	const key = "198.51.100.1|user@example.com"
+	t0 := time.Now()
+
+	limiter.updateIPUsernameFailure("198.51.100.1", "user@example.com", t0.Add(20*time.Second))
+	limiter.updateIPUsernameFailure("198.51.100.1", "user@example.com", t0.Add(10*time.Second))
+
+	limiter.ipUsernameMu.RLock()
+	defer limiter.ipUsernameMu.RUnlock()
+	blocked, ok := limiter.blockedIPUsernames[key]
+	if !ok {
+		t.Fatal("pair not blocked")
+	}
+	if want := t0.Add(80 * time.Second); blocked.BlockedUntil.Before(want) {
+		t.Errorf("block ends %v after t0, want %v: an earlier failure shortened it",
+			blocked.BlockedUntil.Sub(t0), want.Sub(t0))
+	}
+	if blocked.FailureCount != 2 {
+		t.Errorf("failure count %d, want 2", blocked.FailureCount)
+	}
+}
+
+// A full block table is searched for a block that has ended only once the earliest one
+// can have ended. A block stored with an earlier end than those already there (its
+// failure time was taken first) moves that point, so its slot is reused once it ends.
+func TestIPUsernameFullBlockTableReusesOutOfOrderBlock(t *testing.T) {
+	limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+		Enabled:                  true,
+		MaxAttemptsPerIPUsername: 1,
+		IPUsernameBlockDuration:  time.Minute,
+		IPUsernameWindowDuration: time.Hour,
+		CleanupInterval:          time.Hour,
+		MaxIPUsernameEntries:     2,
+	})
+	defer limiter.Stop()
+	t0 := time.Now()
+	fail := func(ip string, at time.Duration) {
+		limiter.updateIPUsernameFailure(ip, "user@example.com", t0.Add(at))
+	}
+	isBlocked := func(ip string) bool {
+		limiter.ipUsernameMu.RLock()
+		defer limiter.ipUsernameMu.RUnlock()
+		_, ok := limiter.blockedIPUsernames[ip+"|user@example.com"]
+		return ok
+	}
+
+	fail("198.51.100.1", 20*time.Second) // blocked until t0+80s
+	fail("198.51.100.2", 30*time.Second) // blocked until t0+90s: the table is full
+	fail("198.51.100.3", 40*time.Second) // no block has ended: not blocked
+	if isBlocked("198.51.100.3") {
+		t.Fatal("a block was stored in a table full of active blocks")
+	}
+
+	// .1's block is gone (as when CanAttemptAuth removes it), and a failure taken
+	// before the others is stored in its slot.
+	limiter.ipUsernameMu.Lock()
+	delete(limiter.blockedIPUsernames, "198.51.100.1|user@example.com")
+	limiter.ipUsernameMu.Unlock()
+	fail("198.51.100.4", 10*time.Second) // blocked until t0+70s
+
+	fail("198.51.100.5", 75*time.Second) // .4's block has ended: .5 takes its slot
+	if !isBlocked("198.51.100.5") {
+		t.Error("a block that had ended kept its slot in a full table")
+	}
+}
+
+// CanAttemptAuth removes a block that has ended after trading its read lock for the
+// write lock. A failure that blocks the address (or pair) anew in between must survive
+// that removal. The window is short, so the race is retried many times.
+func TestExpiredBlockRemovalKeepsNewBlock(t *testing.T) {
+	prev := logger.Swap(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() { logger.Swap(prev) })
+	const (
+		ip       = "203.0.113.7"
+		username = "user@example.com"
+		key      = ip + "|" + username
+		rounds   = 30000
+	)
+	ctx := context.Background()
+	addr := &StringAddr{Addr: ip}
+
+	race := func(t *testing.T, limiter *AuthRateLimiter, reset func(), fail func(), reason string) {
+		for i := 0; i < rounds; i++ {
+			reset()
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			wg.Add(2)
+			go func() { defer wg.Done(); <-start; _ = limiter.CanAttemptAuth(ctx, addr, username) }()
+			go func() { defer wg.Done(); <-start; fail() }()
+			close(start)
+			wg.Wait()
+			var rlErr *RateLimitError
+			if err := limiter.CanAttemptAuth(ctx, addr, username); !errors.As(err, &rlErr) || rlErr.Reason != reason {
+				t.Fatalf("round %d: the block set by the last failure was removed (CanAttemptAuth = %v)", i, err)
+			}
+		}
+	}
+
+	t.Run("ip", func(t *testing.T) {
+		limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+			Enabled:             true,
+			MaxAttemptsPerIP:    3,
+			IPBlockDuration:     time.Hour,
+			IPWindowDuration:    time.Hour,
+			CleanupInterval:     time.Hour,
+			DelayStartThreshold: 100,
+		})
+		defer limiter.Stop()
+		race(t, limiter, func() {
+			limiter.ipMu.Lock()
+			defer limiter.ipMu.Unlock()
+			limiter.blockedIPs[ip] = &BlockedIPInfo{BlockedUntil: time.Now().Add(-time.Second)}
+			limiter.ipFailureCounts[ip] = &IPFailureInfo{FailureCount: 2, FirstFailure: time.Now()}
+		}, func() { limiter.updateFailureTracking(ip, time.Now()) }, "ip_blocked")
+	})
+
+	t.Run("ip_username", func(t *testing.T) {
+		limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+			Enabled:                  true,
+			MaxAttemptsPerIPUsername: 1,
+			IPUsernameBlockDuration:  time.Hour,
+			IPUsernameWindowDuration: time.Hour,
+			CleanupInterval:          time.Hour,
+		})
+		defer limiter.Stop()
+		race(t, limiter, func() {
+			limiter.ipUsernameMu.Lock()
+			defer limiter.ipUsernameMu.Unlock()
+			limiter.blockedIPUsernames[key] = &BlockedIPUsernameInfo{BlockedUntil: time.Now().Add(-time.Second)}
+		}, func() { limiter.updateIPUsernameFailure(ip, username, time.Now()) }, "ip_username_blocked")
+	})
+}
+
+// Failed logins of a pair that has reached its threshold while the block table is full
+// of active blocks: each one must not search the whole table.
+func BenchmarkIPUsernameFailureAtFullBlockTable(b *testing.B) {
+	const entries = 100000
+	prev := logger.Swap(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	b.Cleanup(func() { logger.Swap(prev) })
+	limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+		Enabled:                  true,
+		MaxAttemptsPerIPUsername: 1,
+		IPUsernameBlockDuration:  time.Hour,
+		IPUsernameWindowDuration: time.Hour,
+		CleanupInterval:          time.Hour,
+		MaxIPUsernameEntries:     entries,
+	})
+	defer limiter.Stop()
+	t0 := time.Now()
+	for i := 0; i < entries; i++ {
+		limiter.updateIPUsernameFailure("198.51.100.1", fmt.Sprintf("user%d@example.com", i), t0)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		limiter.updateIPUsernameFailure("203.0.113.1", "user@example.com", t0)
+	}
+}
+
 // Concurrent failures, successes, checks and cleanups on a few pairs at the size limit,
 // for the race detector; afterwards the Tier 1 tables are still within their bounds.
 func TestIPUsernameTablesConcurrentUse(t *testing.T) {
@@ -410,5 +583,29 @@ func TestIPUsernameTablesConcurrentUse(t *testing.T) {
 	defer limiter.ipUsernameMu.RUnlock()
 	if c, b := len(limiter.ipUsernameFailureCounts), len(limiter.blockedIPUsernames); c > limit || b > limit {
 		t.Errorf("%d IP+username counters and %d blocks, want at most %d of each", c, b, limit)
+	}
+}
+
+// Out-of-order failures must preserve an IP-wide block just as they do for a pair.
+func TestIPBlockRenewalNeverShortensBlock(t *testing.T) {
+	limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+		Enabled: true, MaxAttemptsPerIP: 1, IPBlockDuration: time.Minute,
+		IPWindowDuration: time.Hour, CleanupInterval: time.Hour, DelayStartThreshold: 100,
+	})
+	defer limiter.Stop()
+	t0 := time.Now()
+	limiter.updateFailureTracking("198.51.100.1", t0.Add(20*time.Second))
+	limiter.updateFailureTracking("198.51.100.1", t0.Add(10*time.Second))
+	limiter.ipMu.RLock()
+	defer limiter.ipMu.RUnlock()
+	blocked := limiter.blockedIPs["198.51.100.1"]
+	if want := t0.Add(80 * time.Second); blocked.BlockedUntil.Before(want) {
+		t.Fatalf("block ends %v after t0, want %v", blocked.BlockedUntil.Sub(t0), want.Sub(t0))
+	}
+	if !blocked.LastFailure.Equal(t0.Add(20 * time.Second)) {
+		t.Errorf("last failure = %v, want latest captured failure", blocked.LastFailure)
+	}
+	if blocked.FailureCount != 2 {
+		t.Errorf("failure count = %d, want 2", blocked.FailureCount)
 	}
 }

@@ -55,7 +55,7 @@ type ImporterOptions struct {
 	BatchSize            int           // Number of messages to process in each batch (default: 20)
 	BatchTransactionMode bool          // Use single transaction per batch (faster but less resilient, default: false)
 	Incremental          bool          // Use SQLite cache to skip already-imported messages (default: false = always read all)
-	MaxMessageSize       int64         // Maximum message size to import (bytes, 0 = use default)
+	MaxMessageSize       int64         // Maximum message size to import (bytes); 0 or above consts.MaxStoredMessageSize means that maximum
 	PathsFile            string        // Path to a file containing a list of relative or absolute paths to import
 	FTSRetention         time.Duration // Skip the search row for messages sent before this window (0 = index all)
 }
@@ -1016,8 +1016,9 @@ var errMessageTooLarge = errors.New("message too large")
 // maildir file, decompressing it the way the upload does. It streams the file, so the
 // scan never holds a whole message in memory.
 //
-// It reads no more of the message than the import takes: maxSize bytes (0 = no limit)
-// and, for a compressed file, no more than the upload decompresses (maxDecompressedSize).
+// It reads no more of the message than the import takes: maxSize bytes, capped at
+// consts.MaxStoredMessageSize (also the default when maxSize is 0 or less), and, for
+// a compressed file, no more than the upload decompresses (maxDecompressedSize).
 // Past that it fails with errMessageTooLarge without reading the rest: a compressed file
 // of a few hundred bytes can expand to gigabytes, and hashing all of it only to refuse
 // it afterwards keeps a scan worker busy for as long as that takes.
@@ -1035,20 +1036,20 @@ func hashFile(path string, maxSize int64) (string, int64, error) {
 	defer reader.Close()
 
 	limit := maxSize
-	if compressed && (limit <= 0 || limit > maxDecompressedSize) {
+	if limit <= 0 || limit > consts.MaxStoredMessageSize {
+		limit = consts.MaxStoredMessageSize
+	}
+	if compressed && limit > maxDecompressedSize {
 		limit = maxDecompressedSize
 	}
-	var src io.Reader = reader
-	if limit > 0 {
-		src = io.LimitReader(reader, limit+1)
-	}
+	src := io.LimitReader(reader, limit+1)
 
 	hasher := helpers.NewContentHasher()
 	size, err := io.Copy(hasher, src)
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to hash file: %w", err)
 	}
-	if limit > 0 && size > limit {
+	if size > limit {
 		return "", 0, fmt.Errorf("%w: more than %d bytes", errMessageTooLarge, limit)
 	}
 
@@ -1190,11 +1191,19 @@ func (i *Importer) parseMaildirFlagsWith(filename string, keywords map[int]strin
 	return flags
 }
 
-// validateMessage performs basic validation on a message. hashFile has already refused
-// one larger than the import takes.
+// validateMessage performs basic validation on a message. Its size limit is
+// MaxMessageSize, never above consts.MaxStoredMessageSize: the database refuses a
+// larger message, so it is skipped here instead of being read and uploaded first.
 func (i *Importer) validateMessage(size int64) error {
 	if size == 0 {
 		return errors.New("empty message")
+	}
+	limit := i.options.MaxMessageSize
+	if limit <= 0 || limit > consts.MaxStoredMessageSize {
+		limit = consts.MaxStoredMessageSize
+	}
+	if size > limit {
+		return fmt.Errorf("message too large: %d bytes (max: %d)", size, limit)
 	}
 	return nil
 }

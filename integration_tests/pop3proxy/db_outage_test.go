@@ -69,8 +69,9 @@ func TestPOP3ProxyLoginDuringDatabaseOutage(t *testing.T) {
 // gives no verdict, so the attempt is answered -ERR [SYS/TEMP] and is not counted in the
 // auth rate limiter. The cached login must go with it, or the cached password still signs
 // in and every guess during the outage is checked against it, unseen by the rate limiter,
-// until the entry expires. Once the database is back the user logs in: the guesses were
-// not counted.
+// until the entry expires. Only the miss ends it: before the guesses, the cached
+// password still signs in during the outage. Once the database is back the user logs
+// in: the guesses were not counted.
 func TestPOP3ProxyDatabaseOutageDropsCachedLogin(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -88,6 +89,10 @@ func TestPOP3ProxyDatabaseOutageDropsCachedLogin(t *testing.T) {
 	}
 	outage.Begin()
 	time.Sleep(2 * common.LookupCacheRevalidationWindow)
+
+	if reply := pop3ProxyPassReply(t, proxyAddr, account.Email, account.Password); !strings.HasPrefix(reply, "+OK") {
+		t.Fatalf("PASS with the cached password during the outage, before any guess: %q, want +OK (a cached login serves until a password misses it)", reply)
+	}
 
 	for i := 1; i <= 3; i++ {
 		if reply := pop3ProxyPassReply(t, proxyAddr, account.Email, fmt.Sprintf("guess-%d", i)); !strings.HasPrefix(reply, "-ERR [SYS/TEMP]") {

@@ -2,12 +2,31 @@ package main
 
 import (
 	"encoding/hex"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/migadu/sora/helpers"
 )
+
+// A configured limit above the storage ceiling is clamped before adding the
+// overflow-detection byte. MaxInt64+1 otherwise makes LimitReader return EOF
+// immediately, incorrectly hashing an ordinary message as empty.
+func TestImportHashHugeConfiguredLimit(t *testing.T) {
+	content := []byte("From: a@example.com\r\nSubject: limit\r\n\r\nbody\r\n")
+	path := filepath.Join(t.TempDir(), "message")
+	if err := os.WriteFile(path, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+	hash, size, err := hashFile(path, math.MaxInt64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash != helpers.HashContent(content) || size != int64(len(content)) {
+		t.Fatalf("hashFile = (%s, %d), want (%s, %d)", hash, size, helpers.HashContent(content), len(content))
+	}
+}
 
 // bzip2MessageHex is `printf 'From: a@example.com\r\nSubject: bz\r\n\r\nbody\r\n' | bzip2 -9`:
 // the standard library has no bzip2 writer.

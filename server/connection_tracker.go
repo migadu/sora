@@ -6,6 +6,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -421,14 +422,34 @@ func (ct *ConnectionTracker) unregisterLocked(accountID int64, protocol, clientA
 	}
 }
 
-// clientIPOf strips the port from a "host:port" client address. An address
-// without a port is already an IP, IPv6 included: cutting "2001:db8::1" at
-// its last colon would give every address in 2001:db8::/112 one key.
+// clientIPOf returns the per-user-per-IP key of a client address: the IP
+// without its port, in canonical form. An address without a port is already
+// an IP, IPv6 included: cutting "2001:db8::1" at its last colon would give
+// every address in 2001:db8::/112 one key. The address arrives as text (PROXY
+// v1 header, ID forwarding), so one client can be spelled several ways
+// (2001:0DB8::1, ::ffff:192.0.2.1); each must map to the one key. A host that
+// is not an IP is kept as given.
 func clientIPOf(clientAddr string) string {
-	if host, _, err := net.SplitHostPort(clientAddr); err == nil {
-		return host
+	host := clientAddr
+	if h, _, err := net.SplitHostPort(clientAddr); err == nil {
+		host = h
 	}
-	return clientAddr
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return ip.Unmap().String()
+	}
+	return host
+}
+
+// canonicalPerIPCounts re-keys a peer's per-IP counts by clientIPOf. A peer
+// keys by its own spelling of each client (a build before canonical keys by
+// the address as given), and the counts must add up under the keys this
+// tracker uses.
+func canonicalPerIPCounts(counts map[string]int) map[string]int {
+	out := make(map[string]int, len(counts))
+	for ip, count := range counts {
+		out[clientIPOf(ip)] += count
+	}
+	return out
 }
 
 // getClusterWideIPCount calculates the cluster-wide connection count for a specific IP
@@ -1277,7 +1298,7 @@ func (ct *ConnectionTracker) reconcileState(snapshot *ConnectionStateSnapshot) {
 		// The snapshot contains only the sending instance's per-IP counts
 		if len(remoteData.PerIPCount) > 0 {
 			// Replace entire map for this instance (authoritative)
-			info.PerIPCountByInstance[snapshot.InstanceID] = remoteData.PerIPCount
+			info.PerIPCountByInstance[snapshot.InstanceID] = canonicalPerIPCounts(remoteData.PerIPCount)
 			reconciledCount++
 		} else {
 			// Empty PerIPCount means no IP tracking for this instance - remove it
