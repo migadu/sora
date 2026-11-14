@@ -24,8 +24,11 @@ type CredentialChanges struct {
 }
 
 // GetCredentialChangesSince returns the accounts whose logins changed at or after since,
-// each once. It reads the pool the context selects; a lagging replica only delays a
-// change to a later read, which goes back far enough to see it.
+// each once. It reads the pool the context selects, which must be the primary's
+// (credchanges.Watcher reads through GetCredentialChangesSinceWithRetry, which pins it):
+// the next read starts from ReadAt less a fixed window, and a replica's ReadAt is its own
+// clock however far behind its data is, so a replica lagging by more than the window
+// would make the reader step past changes for good.
 func (db *Database) GetCredentialChangesSince(ctx context.Context, since time.Time) (CredentialChanges, error) {
 	var c CredentialChanges
 	// An aggregate without GROUP BY returns its one row with no input, so the clock comes

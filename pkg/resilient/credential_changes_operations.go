@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/retry"
 )
@@ -21,12 +22,16 @@ var credentialChangesRetryConfig = retry.BackoffConfig{
 }
 
 // GetCredentialChangesSinceWithRetry returns the accounts whose logins changed since the
-// given time (see db.GetCredentialChangesSince). One attempt only.
+// given time (see db.GetCredentialChangesSince). One attempt only, on the primary: each
+// read starts from the clock of the previous one less a fixed window, and a replica
+// answers with its own clock whatever it has replayed, so a replica lagging by more than
+// that window would make the reader step past a change that no later read sees.
 func (rd *ResilientDatabase) GetCredentialChangesSinceWithRetry(ctx context.Context, since time.Time) (db.CredentialChanges, error) {
+	masterCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetCredentialChangesSince(ctx, since)
+		return rd.getOperationalDatabaseForOperation(ctx, true).GetCredentialChangesSince(ctx, since)
 	}
-	result, err := rd.executeReadWithRetry(ctx, credentialChangesRetryConfig, timeoutRead, op)
+	result, err := rd.executeReadWithRetry(masterCtx, credentialChangesRetryConfig, timeoutRead, op)
 	if err != nil {
 		return db.CredentialChanges{}, err
 	}
