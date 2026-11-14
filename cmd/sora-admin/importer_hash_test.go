@@ -77,14 +77,14 @@ func TestImportHashIsDeliveryHash(t *testing.T) {
 				t.Errorf("hashFile size = %d, want the message size %d", size, len(tt.message))
 			}
 
-			// The upload hashes what decompressIfNeeded returns; it must be the same
+			// The upload hashes what readMessage returns; it must be the same
 			// message, or every file is reported as changed since the scan.
-			content, err := decompressIfNeeded(tt.onDisk)
+			content, err := readMessage(path, 0)
 			if err != nil {
-				t.Fatalf("decompressIfNeeded: %v", err)
+				t.Fatalf("readMessage: %v", err)
 			}
 			if string(content) != string(tt.message) {
-				t.Errorf("decompressIfNeeded = %q, want %q", content, tt.message)
+				t.Errorf("readMessage = %q, want %q", content, tt.message)
 			}
 		})
 	}
