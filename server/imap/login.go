@@ -274,6 +274,21 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 	if err != nil {
 		s.DebugLog("authentication failed", "error", err)
 
+		// The database could not be asked, so nothing is known about the credentials:
+		// a temporary failure (RFC 5530 section 3, "a subsystem is down"), not counted
+		// as a failed login, or clients retrying a saved password through an outage
+		// stay blocked after it. Checked before the context errors below: a lookup that
+		// ran into its timeout because the database hangs carries DeadlineExceeded too,
+		// and is not a shutdown.
+		if server.IsTemporaryAuthFailure(err) {
+			metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeUnavailable,
+				Text: server.ErrAuthServiceUnavailable.Error(),
+			}
+		}
+
 		// Check if error is due to context cancellation (server shutdown)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			// Server is shutting down - return temporary failure without recording as auth failure
@@ -282,19 +297,6 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeUnavailable,
 				Text: server.ErrServerShuttingDown.Error(),
-			}
-		}
-
-		// The database could not be asked, so nothing is known about the credentials:
-		// a temporary failure (RFC 5530 section 3, "a subsystem is down"), not counted
-		// as a failed login, or clients retrying a saved password through an outage
-		// stay blocked after it.
-		if server.IsTemporaryAuthFailure(err) {
-			metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeUnavailable,
-				Text: server.ErrAuthServiceUnavailable.Error(),
 			}
 		}
 
