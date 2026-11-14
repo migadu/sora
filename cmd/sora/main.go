@@ -833,6 +833,12 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			}
 		}()
 
+		// The cleaner and the upload worker both take [uploader] max_attempts.
+		if err := cfg.Uploader.Validate(); err != nil {
+			errorHandler.ValidationError("[uploader]", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+
 		// Initialize and start the cleanup worker using configuration defaulting methods
 		gracePeriod := cfg.Cleanup.GetGracePeriodWithDefault()
 		wakeInterval := cfg.Cleanup.GetWakeIntervalWithDefault()
@@ -2460,6 +2466,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		AllowedHosts:       serverConfig.AllowedHosts,
 		Cache:              deps.cacheInstance,
 		Uploader:           deps.uploadWorker,
+		UploadMaxAttempts:  deps.config.Uploader.MaxAttempts,
 		Storage:            deps.storage,
 		PurgeWorker:        deps.purgeWorker,
 		RelayQueue:         deps.relayQueueOption(), // Global relay queue; nil without [relay]

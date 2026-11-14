@@ -664,7 +664,7 @@ Get status of the S3 upload queue.
 
 **Query Parameters:**
 - `show_failed=true` - Include list of recent failed uploads
-- `max_attempts=5` - Failure threshold
+- `max_attempts=N` - Failure threshold (default: `[uploader] max_attempts`, 20 unless configured)
 - `failed_limit=10` - Limit failed uploads returned
 
 **Response:** `200 OK`
@@ -690,7 +690,7 @@ Get status of the S3 upload queue.
 Get list of failed S3 uploads.
 
 **Query Parameters:**
-- `max_attempts=5` - Failure threshold
+- `max_attempts=N` - Failure threshold (default: `[uploader] max_attempts`, 20 unless configured)
 - `limit=50` - Maximum records to return
 
 **Response:** `200 OK`
