@@ -45,9 +45,24 @@ func (q *refusingRelayQueue) Hold(from, to, messageType string, messageBytes []b
 	return q.captureRelayQueue.Hold(from, to, messageType, messageBytes)
 }
 
+// commitRefusingRelayQueue holds every address but cannot hand one of them over when it
+// is committed, as DiskQueue's commit fails when its rename or directory fsync does.
+type commitRefusingRelayQueue struct {
+	captureRelayQueue
+	refuse string
+}
+
+func (q *commitRefusingRelayQueue) Hold(from, to, messageType string, messageBytes []byte) (func() error, func(), error) {
+	if to == q.refuse {
+		return func() error { return fmt.Errorf("relay queue could not commit %s", to) }, func() {}, nil
+	}
+	return q.captureRelayQueue.Hold(from, to, messageType, messageBytes)
+}
+
 // TestDelivery_SieveMultipleRedirects_PartialFailureKeepsMessage: when one of
 // several redirects cannot be handed to the relay, the others still go out and
-// the message is kept in INBOX, as it is when a single redirect fails.
+// the message is kept in INBOX, as it is when a single redirect fails. So it is
+// when the queue took the address but could not hand it over after all.
 func TestDelivery_SieveMultipleRedirects_PartialFailureKeepsMessage(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	imapSrv, account, fake := common.SetupIMAPServerWithRealS3(t)
@@ -59,28 +74,41 @@ func TestDelivery_SieveMultipleRedirects_PartialFailureKeepsMessage(t *testing.T
 
 	script := "redirect \"one@example.com\";\r\nredirect \"two@example.org\";\r\nredirect \"three@example.net\";\r\n"
 	dctx := newSieveDeliveryContext(t, rdb, fake, accountID, script)
-	rq := &refusingRelayQueue{refuse: "two@example.org"}
-	dctx.SieveExecutor.(*delivery.StandardSieveExecutor).RelayQueue = rq
 
 	addr, err := server.NewAddress(account.Email)
 	require.NoError(t, err)
 	sender, err := server.NewAddress("sender@example.com")
 	require.NoError(t, err)
 	recipient := delivery.RecipientInfo{AccountID: accountID, Address: &addr, ToAddress: &addr, FromAddress: &sender}
-	inboxBefore := countLiveInMailbox(t, rdb, accountID, "INBOX")
 
-	msg := []byte(fmt.Sprintf("From: sender@example.com\r\nTo: %s\r\nSubject: partial\r\nMessage-ID: <%d@example.com>\r\n\r\nbody\r\n",
-		account.Email, time.Now().UnixNano()))
-	res, err := dctx.DeliverMessage(recipient, msg)
-	require.NoError(t, err)
-	require.True(t, res.Success, "delivery must succeed (result=%+v)", res)
+	for _, tc := range []struct {
+		name string
+		rq   interface {
+			delivery.RelayQueue
+			snapshot() []relayItem
+		}
+	}{
+		{"refused when held", &refusingRelayQueue{refuse: "two@example.org"}},
+		{"refused when handed over", &commitRefusingRelayQueue{refuse: "two@example.org"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dctx.SieveExecutor.(*delivery.StandardSieveExecutor).RelayQueue = tc.rq
+			inboxBefore := countLiveInMailbox(t, rdb, accountID, "INBOX")
 
-	var got []string
-	for _, it := range rq.snapshot() {
-		got = append(got, it.to)
+			msg := []byte(fmt.Sprintf("From: sender@example.com\r\nTo: %s\r\nSubject: partial\r\nMessage-ID: <%d@example.com>\r\n\r\nbody\r\n",
+				account.Email, time.Now().UnixNano()))
+			res, err := dctx.DeliverMessage(recipient, msg)
+			require.NoError(t, err)
+			require.True(t, res.Success, "delivery must succeed (result=%+v)", res)
+
+			var got []string
+			for _, it := range tc.rq.snapshot() {
+				got = append(got, it.to)
+			}
+			assert.Equal(t, []string{"one@example.com", "three@example.net"}, got, "the other addresses must still be relayed")
+			assert.Equal(t, 1, countLiveInMailbox(t, rdb, accountID, "INBOX")-inboxBefore, "the message must be kept when a redirect fails")
+		})
 	}
-	assert.Equal(t, []string{"one@example.com", "three@example.net"}, got, "the other addresses must still be relayed")
-	assert.Equal(t, 1, countLiveInMailbox(t, rdb, accountID, "INBOX")-inboxBefore, "the message must be kept when a redirect fails")
 }
 
 // TestDelivery_SieveMultipleRedirects is issue #230 on the Admin API /deliver path:

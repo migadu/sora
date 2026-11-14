@@ -37,6 +37,9 @@ func TestLMTP_SieveRedirectWithoutCopyStagesNothing(t *testing.T) {
 		{"single redirect refused", `redirect "two@example.org";`, &refusingRelayQueue{refuse: "two@example.org"}, true},
 		{"multiple redirects queued", `redirect "one@example.com"; redirect "two@example.org";`, &captureRelayQueue{}, false},
 		{"queue refuses one address", `redirect "one@example.com"; redirect "two@example.org";`, &refusingRelayQueue{refuse: "two@example.org"}, true},
+		// Held, but not handed over after all: the message is kept (RFC 5228 §4.2).
+		{"single handoff fails after hold", `redirect "two@example.org";`, &commitRefusingRelayQueue{refuse: "two@example.org"}, true},
+		{"one handoff fails after hold", `redirect "one@example.com"; redirect "two@example.org";`, &commitRefusingRelayQueue{refuse: "two@example.org"}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			imapSrv, account := common.SetupIMAPServer(t)

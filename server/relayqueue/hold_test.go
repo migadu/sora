@@ -113,3 +113,36 @@ func TestCleanupOrphansRemovesDeadHold(t *testing.T) {
 		t.Errorf("pending holds %v, want the live hold's two files", files)
 	}
 }
+
+// TestHoldCommitFailureRemovesMessage: a commit that cannot rename the held metadata
+// reports the failure and removes the body, so that the worker can never send a message
+// whose delivery kept it instead.
+func TestHoldCommitFailureRemovesMessage(t *testing.T) {
+	q, err := NewDiskQueue(t.TempDir(), 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, abort, err := q.Hold("from@example.com", "to@example.org", "redirect", []byte("held body"))
+	if err != nil {
+		t.Fatalf("Hold: %v", err)
+	}
+	defer abort()
+	for _, name := range pendingFiles(t, q) {
+		if filepath.Ext(name) == heldExt {
+			if err := os.Remove(filepath.Join(q.pendingDir, name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if err := commit(); err == nil {
+		t.Fatal("commit without its held metadata succeeded")
+	}
+	if files := pendingFiles(t, q); len(files) != 0 {
+		t.Errorf("pending holds %v after a failed commit, want nothing", files)
+	}
+	q.pending.invalidate()
+	if msg, _, err := q.AcquireNext(); err != nil || msg != nil {
+		t.Errorf("AcquireNext after a failed commit = %v, %v; want nothing", msg, err)
+	}
+}
