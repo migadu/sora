@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -68,15 +69,75 @@ func (r *RelayConfig) IsQueueEnabled() bool {
 	return r.IsConfigured()
 }
 
-// Validate checks that a configured relay has a type the server can send with. Any
-// [relay] type turns the relay queue on, but only "smtp" and "http" (exactly) have a
-// handler, so any other type would queue every Sieve redirect and vacation reply with
-// no worker to send it.
+// Validate checks that a configured relay has a type the server can send with and a
+// destination to send to. Any [relay] type turns the relay queue on, but only "smtp"
+// and "http" (exactly) have a handler, so any other type would queue every Sieve
+// redirect and vacation reply with no worker to send it. Likewise a handler without a
+// usable smtp_host or http_url fails every attempt, as a temporary error, until the
+// message is moved to failed/.
 func (r *RelayConfig) Validate() error {
-	if !r.IsConfigured() || r.IsSMTP() || r.IsHTTP() {
+	switch {
+	case !r.IsConfigured():
 		return nil
+	case r.IsSMTP():
+		return r.validateSMTPHost()
+	case r.IsHTTP():
+		return r.validateHTTPURL()
 	}
 	return fmt.Errorf("unsupported [relay] type %q: expected \"smtp\" or \"http\"", r.Type)
+}
+
+// validateSMTPHost checks that smtp_host is a host:port the SMTP handler can dial: it
+// dials smtp_host as given, with no default port.
+func (r *RelayConfig) validateSMTPHost() error {
+	if r.SMTPHost == "" {
+		return errors.New(`[relay] type "smtp" requires smtp_host as host:port`)
+	}
+	host, port, err := net.SplitHostPort(r.SMTPHost)
+	if err != nil {
+		return fmt.Errorf("[relay] smtp_host %q must be host:port: %w", r.SMTPHost, err)
+	}
+	if host == "" {
+		// net.Dial would take the local system for it.
+		return fmt.Errorf("[relay] smtp_host %q has no host", r.SMTPHost)
+	}
+	if !validDialPort(port) {
+		return fmt.Errorf("[relay] smtp_host %q has no valid port", r.SMTPHost)
+	}
+	return nil
+}
+
+// validateHTTPURL checks that http_url is a URL the HTTP handler can post to: absolute,
+// http or https, with a host. The error quotes http_url masked as the config dump
+// shows it, since a query value may be the relay's API key.
+func (r *RelayConfig) validateHTTPURL() error {
+	if r.HTTPURL == "" {
+		return errors.New(`[relay] type "http" requires http_url`)
+	}
+	shown := maskURLCredentials(r.HTTPURL)
+	u, err := url.Parse(r.HTTPURL)
+	if err != nil {
+		// The *url.Error repeats the unmasked URL; keep only its reason.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
+		}
+		return fmt.Errorf("[relay] http_url %q is not a valid URL: %w", shown, err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return fmt.Errorf("[relay] http_url %q must be an absolute http:// or https:// URL with a host", shown)
+	}
+	if port := u.Port(); port != "" && !validDialPort(port) {
+		return fmt.Errorf("[relay] http_url %q has no valid port", shown)
+	}
+	return nil
+}
+
+// validDialPort reports whether port is a TCP port a dial can reach, resolved as
+// net.Dial resolves it: a number from 1 to 65535, or a known service name.
+func validDialPort(port string) bool {
+	p, err := net.LookupPort("tcp", port)
+	return err == nil && p > 0
 }
 
 // GetSMTPTLS reports whether the SMTP relay connection uses TLS (default true).
