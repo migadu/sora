@@ -1022,9 +1022,12 @@ listen_backlog = 4096               # TCP listen backlog size (0 = default 1024)
 
 # --- IMAP-SPECIFIC CONFIGURATION ---
 append_limit = "25mb"         # Maximum message size for IMAP APPEND, advertised as APPENDLIMIT.
-                              # Empty or "0" = the 25mb default. IMAP carries the limit as a 32-bit
-                              # number, so a value above 4294967295 bytes (4 GiB - 1) is clamped
-                              # to it, with a warning at startup.
+                              # Empty or "0" = the 25mb default. A value above 2147483647 bytes
+                              # (2 GiB - 1, the largest message sora can store) is clamped to it,
+                              # with a warning at startup. APPEND reads the message into the
+                              # session's memory budget, so APPENDLIMIT is never above
+                              # [server.limits] session_memory_limit (default 100mb); a warning
+                              # at startup says when that lowers it.
 
 # --- MASTER USER AUTHENTICATION ---
 master_username = ""          # Master username for administrative IMAP access (e.g., for proxies).
