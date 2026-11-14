@@ -488,6 +488,11 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 		os.Exit(errorHandler.WaitForExit())
 	}
 
+	if err := cfg.SharedMailboxes.Validate(); err != nil {
+		errorHandler.ValidationError("[shared_mailboxes]", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+
 	// Fail closed: a listener that accepts PROXY protocol with an empty trusted_networks
 	// would let any reachable host spoof the client IP via a PROXY header. (security-audit M2)
 	if missing := cfg.ProxyProtocolListenersMissingTrust(); len(missing) > 0 {

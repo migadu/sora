@@ -11,11 +11,13 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 )
 
@@ -1235,6 +1237,26 @@ func (c SharedMailboxesConfig) InNamespace(name string) bool {
 	// use that same rule, or a case variant can bypass shared namespace policy.
 	name, prefix := strings.ToLower(name), strings.ToLower(c.NamespacePrefix)
 	return strings.HasPrefix(name, prefix) || name == strings.TrimSuffix(prefix, "/")
+}
+
+// Validate checks namespace_prefix when sharing is enabled. The personal namespace has
+// the empty prefix, so InNamespace tells shared names apart by the prefix alone, and the
+// prefix must be a mailbox name followed by the hierarchy delimiter: an empty prefix puts
+// every mailbox in the shared namespace, and "Shared" also takes in "SharedDocs".
+func (c SharedMailboxesConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	delim := string(consts.MailboxDelimiter)
+	root, ok := strings.CutSuffix(c.NamespacePrefix, delim)
+	if !ok || slices.Contains(strings.Split(root, delim), "") {
+		return fmt.Errorf("namespace_prefix %q must be a mailbox name followed by the hierarchy delimiter %q, such as \"Shared/\"",
+			c.NamespacePrefix, delim)
+	}
+	if strings.EqualFold(root, consts.MailboxInbox) {
+		return fmt.Errorf("namespace_prefix %q conflicts with the reserved personal INBOX", c.NamespacePrefix)
+	}
+	return nil
 }
 
 // AdminCLIConfig holds configuration for sora-admin CLI tool
