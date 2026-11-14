@@ -199,6 +199,11 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		return nil, nil, err
 	}
 
+	// From here to the commit a rekey must not rename a source: the INSERT reads its hash.
+	if err := lockRekeySources(ctx, tx, srcMailboxID, uids); err != nil {
+		return nil, nil, err
+	}
+
 	// Batch insert the copied messages and their state in one round trip. The
 	// message_state INSERT is a data-modifying CTE, which PostgreSQL executes to
 	// completion exactly once regardless of whether the primary query reads its
@@ -337,9 +342,10 @@ func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailbo
 // Callers skip it when every source row already belongs to the destination account. That
 // account's row for the body is then anchored by the source row itself, which stays in
 // messages (MOVE only expunges it, and the orphan sweep counts expunged rows), so the sweep
-// cannot delete the row and there is nothing to insert. The skip matters: the shared lock
-// below is one entry per distinct body in PostgreSQL's server-wide lock table, held until
-// commit, and a bulk same-account MOVE is the common case.
+// cannot delete the row and there is nothing to insert. A rekey, which renames the source
+// row's hash, waits for the copy (lockRekeySources) and so sees the copied rows too. The
+// skip matters: the shared lock below is one entry per distinct body in PostgreSQL's
+// server-wide lock table, held until commit, and a bulk same-account MOVE is the common case.
 //
 // Do not replace the lock with a "row already exists" pre-check. A row that exists can be an
 // orphan the sweep is about to delete, and the sweep cannot see the uncommitted message that
