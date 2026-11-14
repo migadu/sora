@@ -984,10 +984,13 @@ An invalid duration or size in this section is logged as a warning and the defau
 | `max_age_restriction` | duration | none | Expunge messages whose row is older than this. Empty turns it off. |
 | `fts_retention` | duration | none (keep) | How long search vectors are kept. See [SEARCH.md](SEARCH.md). |
 | `health_status_retention` | duration | `"30d"` | Age at which health status rows are deleted. `"0"` keeps them. |
-| `instance_liveness_threshold` | duration | `"7d"` | How long a node must be silent before its unuploaded mail may be reaped. Zero or negative uses the default. |
+| `instance_liveness_threshold` | duration | `"7d"` | How long a node must be silent before its unuploaded mail may be reaped. Must be positive. |
 | `purge_poll_interval` | duration | `"30s"` | How often the purge worker looks for accounts to purge. At least 5 seconds. |
 
-An invalid duration in this section is logged as a warning and the default is used.
+An invalid duration in this section is logged as a warning and the default is used. A
+negative `grace_period`, `max_age_restriction`, `fts_retention` or `health_status_retention`,
+and an `instance_liveness_threshold` of zero or less, are refused at start-up and by
+`sora-admin config validate`.
 
 ### `[metadata]`
 

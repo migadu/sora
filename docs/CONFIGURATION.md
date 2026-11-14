@@ -507,7 +507,7 @@ See [STORAGE.md](STORAGE.md) and, for `fts_retention`, [SEARCH.md](SEARCH.md).
 | `max_age_restriction` | duration | none | Expunge messages older than this. Unset means no limit. |
 | `fts_retention` | duration | none | Delete search vectors of messages older than this. Unset keeps them. |
 | `health_status_retention` | duration | `"30d"` | Rows of the `health_status` table not updated for this long are deleted. |
-| `instance_liveness_threshold` | duration | `"7d"` | How long an uploader instance must be silent before its unuploaded messages are reaped. A value of 0 or less means the default. |
+| `instance_liveness_threshold` | duration | `"7d"` | How long an uploader instance must be silent before its unuploaded messages are reaped. Must be positive. |
 | `purge_poll_interval` | duration | `"30s"` | How often the purge worker looks for accounts marked for purging. |
 
 ### 8.8 IMAP METADATA limits (`[metadata]`)
