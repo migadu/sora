@@ -33,7 +33,35 @@ func extractPathParam(path, prefix, suffix string) string {
 // "+" is a plus (RFC 3986), not the form encoding of a space. The routers that
 // pick the endpoint by suffix must look at the escaped path too.
 func pathName(r *http.Request, prefix, suffix string) (string, error) {
-	return url.PathUnescape(extractPathParam(r.URL.EscapedPath(), prefix, suffix))
+	return url.PathUnescape(extractPathParam(escapedRoutingPath(r), prefix, suffix))
+}
+
+// escapedRoutingPath normalizes percent-encoded unreserved characters (RFC 3986
+// section 6.2.2.2), so encoded route words match the same routes ServeMux accepts.
+// Reserved characters stay escaped: in particular, %2F inside a name must not
+// become an endpoint separator, and %25 must not cause a second decoding.
+func escapedRoutingPath(r *http.Request) string {
+	path := r.URL.EscapedPath()
+	if !strings.Contains(path, "%") {
+		return path
+	}
+	var out strings.Builder
+	out.Grow(len(path))
+	for i := 0; i < len(path); i++ {
+		if path[i] == '%' && i+2 < len(path) {
+			decoded, err := url.PathUnescape(path[i : i+3])
+			if err == nil {
+				c := decoded[0]
+				if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("-._~", rune(c)) {
+					out.WriteByte(c)
+					i += 2
+					continue
+				}
+			}
+		}
+		out.WriteByte(path[i])
+	}
+	return out.String()
 }
 
 // extractLastPathSegment extracts the last segment from a path

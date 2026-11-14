@@ -85,6 +85,17 @@ func TestPathNamesDecodedOnce(t *testing.T) {
 		}
 	})
 
+	t.Run("Mailbox_EncodedRouteWords", func(t *testing.T) {
+		name := fmt.Sprintf("Route-%d", n)
+		createMailbox(t, name)
+		for _, base := range []string{"/%75ser/mailboxes/", "/user/%6Dailboxes/", "/user/mailboxes/"} {
+			path := base + name + "/%6Dessages"
+			if got := do(t, "GET", path, nil); got != http.StatusOK {
+				t.Errorf("GET %s: status %d, want 200", path, got)
+			}
+		}
+	})
+
 	t.Run("Mailbox_EncodedSlashIsPartOfName", func(t *testing.T) {
 		// The last level of this name is also an endpoint name; encoded, it is
 		// still the mailbox being deleted, not the /search endpoint.
@@ -137,6 +148,24 @@ func TestPathNamesDecodedOnce(t *testing.T) {
 		}
 		if decoded := fmt.Sprintf("f.-%d", n); scriptExists(decoded) {
 			t.Errorf("PUT %s stored a script named %q", path, decoded)
+		}
+	})
+
+	t.Run("Filter_EncodedRouteWords", func(t *testing.T) {
+		path := fmt.Sprintf("/user/%%66ilters/route-%d", n)
+		for _, c := range []struct {
+			method string
+			path   string
+			body   any
+		}{
+			{"PUT", path, map[string]string{"script": "keep;"}},
+			{"GET", path, nil},
+			{"POST", path + "/%61ctivate", nil},
+			{"DELETE", path, nil},
+		} {
+			if got := do(t, c.method, c.path, c.body); got != http.StatusOK {
+				t.Errorf("%s %s: status %d, want 200", c.method, c.path, got)
+			}
 		}
 	})
 }

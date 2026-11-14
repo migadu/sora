@@ -418,7 +418,7 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	// The endpoint is picked by what follows the name, in the escaped path (an
 	// encoded "/" belongs to the name, see pathName) and only after a name: a
 	// DELETE of the top-level mailbox "search" deletes that mailbox.
-	path := strings.TrimPrefix(r.URL.EscapedPath(), "/user/mailboxes/")
+	path := strings.TrimPrefix(escapedRoutingPath(r), "/user/mailboxes/")
 
 	// Check for subscribe/unsubscribe operations
 	if strings.HasSuffix(path, "/subscribe") {
@@ -504,7 +504,7 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) {
 	// As in handleMailboxWithName: /activate is matched only after a script
 	// name, so a script named "activate" is addressed by that name.
-	path := strings.TrimPrefix(r.URL.EscapedPath(), "/user/filters/")
+	path := strings.TrimPrefix(escapedRoutingPath(r), "/user/filters/")
 
 	// Check for capabilities endpoint
 	if path == "capabilities" {
