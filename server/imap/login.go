@@ -187,23 +187,16 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 	var AccountID int64
 	method := "main_db"
 
-	// Master username authentication: user@domain.com@MASTER_USERNAME
-	// Check if suffix matches configured MasterUsername
-	if len(s.server.masterUsername) > 0 && addressParsed.HasSuffix() && checkMasterCredential(addressParsed.Suffix(), s.server.masterUsername) {
-		// Suffix matches MasterUsername, authenticate with MasterPassword
-		if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, s.server.masterPassword) {
-			// Master username suffix matched but the password was wrong. Answer exactly like
-			// any other bad credential: a distinct "Invalid master credentials" reply is
-			// reachable with only the master USERNAME (no secret), so it confirms the
-			// configured master username to anyone who can reach the port - the precondition
-			// for every other master-form attack. At the same cost too: any other suffix is
-			// answered after the regular check of the base address, so a refusal without
-			// it confirms the master username by its response time (#801). The reason is
-			// kept for the operator at WARN.
-			s.WarnLog("master username authentication failed (invalid master password)")
-			return s.refuseLikeWrongPassword(ctx, address, password, netConn, proxyInfo, authKey)
-		}
-
+	// Master username authentication: user@domain.com@MASTER_USERNAME, with the master
+	// password. Any other password in that form is not answered here: it is the base
+	// address's own login, checked below as under any other suffix. Its answer must not
+	// depend on whether the suffix is the master username: a distinct reply, a quicker
+	// one (#801), or a refusal of the account's own password (#949) confirms the
+	// configured master username, the precondition for every other master-form attack.
+	// Its failure is still recorded under authKey, the master credential's key, so
+	// guesses at the master password stay metered; only a success is the account's.
+	masterForm := len(s.server.masterUsername) > 0 && addressParsed.HasSuffix() && checkMasterCredential(addressParsed.Suffix(), s.server.masterUsername)
+	if masterForm && len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
 		if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
 			metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 			return authFailedError()
@@ -248,9 +241,9 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 		}
 		method = "master"
 	} else {
-		// Regular authentication - use the already parsed address
-		// If it has a suffix but didn't match MasterUsername, fall through to regular auth
-		// (this allows the suffix to be used for remotelookup in proxy scenarios)
+		// Regular authentication - use the already parsed address. A suffix other than
+		// the master username (a remotelookup token in proxy scenarios), or the master
+		// username without the master password, is ignored: the base address is checked.
 
 		s.DebugLog("authentication attempt", "address", addressParsed.BaseAddress())
 
@@ -281,6 +274,11 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 					Code: imap.ResponseCodeUnavailable,
 					Text: server.ErrAuthServiceUnavailable.Error(),
 				}
+			}
+
+			if masterForm {
+				// Kept for the operator debugging a client with the wrong master password.
+				s.WarnLog("master username authentication failed (invalid master password)")
 			}
 
 			// Record failed authentication
@@ -350,9 +348,12 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 	metrics.TrackDomainConnection("imap", addressParsed.Domain())
 	metrics.TrackUserActivity("imap", addressParsed.BaseAddress(), "connection", 1)
 
-	// Record successful authentication
+	// Record successful authentication: a master login under the master credential's
+	// key, any other under the account's, the master form with its own password too
+	// (#949): under the master key it would clear the failed guesses at the master
+	// password.
 	if s.server.authLimiter != nil {
-		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, true)
+		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, server.AuthSuccessRateLimitKey(address, password, s.server.masterUsername, s.server.masterPassword), true)
 	}
 
 	// Register connection for tracking
