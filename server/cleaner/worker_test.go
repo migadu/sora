@@ -154,6 +154,7 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 	maxAge := 365 * 24 * time.Hour
 	ftsRetention := 0 * time.Hour // Don't prune vectors in this test
 	healthRetention := 30 * 24 * time.Hour
+	redirectRetention := time.Hour
 
 	worker := &CleanupWorker{
 		rdb:                   mockDB,
@@ -163,6 +164,7 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 		maxAgeRestriction:     maxAge,
 		ftsRetention:          ftsRetention,
 		healthStatusRetention: healthRetention,
+		redirectLogRetention:  redirectRetention,
 	}
 
 	// --- Mock expectations ---
@@ -172,8 +174,8 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 	mockDB.On("CleanupFailedUploadsWithRetry", ctx, gracePeriod).Return(int64(1), nil).Once()
 	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, gracePeriod).Return(int64(1), nil).Once()
 	mockDB.On("PurgeSoftDeletedMailboxesWithRetry", ctx, mock.Anything).Return(int64(3), nil).Once()
-	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, gracePeriod).Return(int64(2), nil).Once()
-	mockDB.On("CleanupOldRedirectsWithRetry", ctx, gracePeriod).Return(int64(0), nil).Once()
+	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, vacationHistoryRetention).Return(int64(2), nil).Once()
+	mockDB.On("CleanupOldRedirectsWithRetry", ctx, redirectRetention).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, healthRetention).Return(int64(20), nil).Once()
 
 	// Phase 1: User-scoped cleanup

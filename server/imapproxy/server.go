@@ -250,7 +250,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Initialize remotelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
 	if opts.RemoteLookup.Enabled {
-		remotelookupClient, err := proxy.InitializeRemoteLookup("imap", opts.RemoteLookup)
+		remotelookupClient, err := proxy.InitializeRemoteLookup("imap", opts.RemoteLookup, opts.RemotePort)
 		if err != nil {
 			logger.Error("Failed to initialize remotelookup client", "proxy", opts.Name, "error", err)
 			if !opts.RemoteLookup.ShouldLookupLocalUsers() {
@@ -392,10 +392,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			logger.Info("IMAP Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", opts.Name, "error", err)
 			cleanupInterval = 5 * time.Minute
 		}
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize <= 0 {
-			maxSize = 10000
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("IMAP Proxy: Lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)

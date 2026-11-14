@@ -18,6 +18,7 @@ func TestNew_ClampsTokenDuration(t *testing.T) {
 		want       time.Duration
 	}{
 		{name: "zero uses default", configured: 0, want: 24 * time.Hour},
+		{name: "negative uses default", configured: -time.Hour, want: 24 * time.Hour},
 		{name: "under cap preserved", configured: 48 * time.Hour, want: 48 * time.Hour},
 		{name: "at cap preserved", configured: maxTokenDuration, want: maxTokenDuration},
 		{name: "over cap clamped", configured: 8760 * time.Hour, want: maxTokenDuration},
