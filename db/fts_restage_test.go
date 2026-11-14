@@ -298,7 +298,7 @@ func TestSameAccountMoveCopyTakeNoFTSLocks(t *testing.T) {
 		require.NoError(t, err)
 		defer tx.Rollback(ctx)
 		copyUIDs := append([]imap.UID(nil), uids...)
-		copied, _, err := db.CopyMessages(ctx, tx, &copyUIDs, inboxID, archiveID, accountID, "domain", "part", "test-instance")
+		copied, _, err := db.CopyMessages(ctx, tx, &copyUIDs, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil)
 		require.NoError(t, err)
 		require.Len(t, copied, n)
 		assert.Equal(t, 0, ftsLocksHeld(t, ctx, tx), "a same-account COPY took one FTS lock per body")
@@ -337,7 +337,7 @@ func TestCrossAccountMoveCopyStageDestinationFTSRow(t *testing.T) {
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	copyUIDs := []imap.UID{9701}
-	_, _, err = db.CopyMessages(ctx, tx, &copyUIDs, inboxA, sharedB, ownerB, "example.net", "b", "test-instance")
+	_, _, err = db.CopyMessages(ctx, tx, &copyUIDs, inboxA, sharedB, ownerB, "example.net", "b", "test-instance", nil)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit(ctx))
 

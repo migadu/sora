@@ -70,7 +70,7 @@ func TestCopyMessagesKeepsSourceS3KeyForSameAccount(t *testing.T) {
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	uids := []imap.UID{srcUID}
-	_, newIDs, err := db.CopyMessages(ctx, tx, &uids, inboxID, archive.ID, accountID, "example.com", "renamed", "test-instance")
+	_, newIDs, err := db.CopyMessages(ctx, tx, &uids, inboxID, archive.ID, accountID, "example.com", "renamed", "test-instance", nil)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit(ctx))
 	require.Len(t, newIDs, 1)

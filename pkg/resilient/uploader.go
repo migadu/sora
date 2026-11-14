@@ -3,6 +3,7 @@ package resilient
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,10 +14,11 @@ import (
 // --- Uploader Worker Wrappers ---
 
 // ExecuteWithS3ObjectLock runs executionFunc while holding the per-object advisory lock
-// that the cleaner's S3 deletion takes as well (db.GetS3ObjectLockID). Cross-account IMAP
-// COPY holds it around its server-side copy; an upload only passes db.PassS3WriteGate and
-// holds nothing across its transfer. The lock is held in a db.AdvisoryLockTx for exactly
-// the duration of executionFunc: transaction-scoped,
+// that the cleaner's S3 deletion takes as well (db.GetS3ObjectLockID). sora-admin import
+// rekey holds it around its server-side copy (cross-account IMAP COPY, whose rows must
+// commit before the lock goes, uses LockS3ObjectsShared); an upload only passes
+// db.PassS3WriteGate and holds nothing across its transfer. The lock is held in a
+// db.AdvisoryLockTx for exactly the duration of executionFunc: transaction-scoped,
 // so it is released with its backend whatever pooler the write pool goes through, and
 // held in a transaction that is otherwise idle and read-only, so the S3 transfer inside
 // executionFunc pins one pooled connection but no write transaction, snapshot or xid.
@@ -51,6 +53,33 @@ func (rd *ResilientDatabase) ExecuteWithS3ObjectLock(ctx context.Context, conten
 		return fmt.Errorf("S3 object lock was lost while the guarded work ran: %w", err)
 	}
 	return nil
+}
+
+// LockS3ObjectsShared takes the per-object advisory locks of accountID's contentHashes in
+// shared mode (db.AdvisoryLockTx.LockSharedAll), in id order, in a lock transaction it
+// returns to the caller, who must Release it. Shared holders do not exclude one another,
+// but they keep out the cleaner's deletion of these objects, which try-locks them in
+// exclusive mode. A cross-account COPY holds them while it makes the objects exist under
+// the destination owner's key and hands them to its copy transaction (db.HeldDestObjects).
+// It waits for a current exclusive holder for at most 30 seconds.
+func (rd *ResilientDatabase) LockS3ObjectsShared(ctx context.Context, accountID int64, contentHashes []string) (*db.AdvisoryLockTx, error) {
+	lockCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	lock, err := rd.getOperationalDatabaseForOperation(ctx, true).BeginAdvisoryLockTx(lockCtx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]int64, len(contentHashes))
+	for i, hash := range contentHashes {
+		ids[i] = db.GetS3ObjectLockID(accountID, hash)
+	}
+	slices.Sort(ids)
+	if err := lock.LockSharedAll(lockCtx, ids); err != nil {
+		lock.Release()
+		return nil, err
+	}
+	return lock, nil
 }
 
 func (rd *ResilientDatabase) AcquireAndLeasePendingUploadsWithRetry(ctx context.Context, instanceId string, limit int, retryInterval time.Duration, maxAttempts int) ([]db.PendingUpload, error) {
