@@ -15,8 +15,8 @@ const SecretMask = "***MASKED***"
 // from a set one. Mark a new secret setting with the tag rather than masking it at a
 // call site; TestConfigDumpMasksEverySecretField in cmd/sora-admin fails for one that
 // looks like a secret and is left untagged.
-// URL userinfo is also masked in otherwise public strings, keeping the endpoint's
-// scheme, host and path useful for debugging without exposing Basic credentials.
+// URL credentials are also masked in otherwise public strings (see maskURLCredentials),
+// keeping the endpoint's scheme, host and path useful for debugging.
 func MaskSecrets(cfg *Config) {
 	maskSecrets(reflect.ValueOf(cfg).Elem(), false)
 }
@@ -42,12 +42,17 @@ func maskSecrets(v reflect.Value, secret bool) {
 		if secret && v.String() != "" {
 			v.SetString(SecretMask)
 		} else {
-			v.SetString(maskURLUserInfo(v.String()))
+			v.SetString(maskURLCredentials(v.String()))
 		}
 	}
 }
 
-func maskURLUserInfo(value string) string {
+// maskURLCredentials masks the credentials a URL can carry: its userinfo (HTTP Basic)
+// and the value of every query parameter. Endpoint APIs authenticate with query
+// parameters of any name (api_key, token, sig, ...), so no name tells a credential
+// from a routing parameter. Parameter names, scheme, host, port, path and fragment
+// are kept; a value that is not a URL is returned unchanged.
+func maskURLCredentials(value string) string {
 	start := strings.Index(value, "://")
 	if start < 0 {
 		return value
@@ -56,7 +61,8 @@ func maskURLUserInfo(value string) string {
 	if end := strings.IndexAny(authority, "/?#"); end >= 0 {
 		authority = authority[:end]
 	}
-	if !strings.Contains(authority, "@") {
+	beforeFragment, _, _ := strings.Cut(value, "#")
+	if !strings.Contains(authority, "@") && !strings.Contains(beforeFragment, "?") {
 		return value
 	}
 	u, err := url.Parse(value)
@@ -65,6 +71,9 @@ func maskURLUserInfo(value string) string {
 		// just because another part of their URL has an invalid escape or port.
 		return SecretMask
 	}
+	if u.User == nil && u.RawQuery == "" {
+		return value
+	}
 	if u.User != nil {
 		if _, hasPassword := u.User.Password(); hasPassword {
 			u.User = url.UserPassword(SecretMask, SecretMask)
@@ -72,5 +81,28 @@ func maskURLUserInfo(value string) string {
 			u.User = url.User(SecretMask)
 		}
 	}
+	u.RawQuery = maskQueryValues(u.RawQuery)
 	return u.String()
+}
+
+// urlTemplates are the query values remote lookup replaces per request
+// (server/proxy/http_remotelookup.go): placeholders, never credentials.
+var urlTemplates = map[string]bool{"$email": true, "$ip": true}
+
+// maskQueryValues masks every non-empty value of a raw query, as written, so a
+// percent-encoded value is masked whole. Only "&" separates parameters: a ";" stays
+// inside the masked value. A component without "=" is masked whole, since it may
+// be a bare token.
+func maskQueryValues(rawQuery string) string {
+	params := strings.Split(rawQuery, "&")
+	for i, param := range params {
+		prefix, value := "", param
+		if name, v, ok := strings.Cut(param, "="); ok {
+			prefix, value = name+"=", v
+		}
+		if value != "" && !urlTemplates[value] {
+			params[i] = prefix + SecretMask
+		}
+	}
+	return strings.Join(params, "&")
 }

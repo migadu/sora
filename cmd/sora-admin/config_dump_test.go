@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -109,7 +111,7 @@ auth_token = "example-lookup-token"
 func TestConfigDumpMasksURLUserInfo(t *testing.T) {
 	urls := []string{
 		"https://admin-user:admin-password@admin.example.invalid:8443/admin",
-		"https://relay-user:relay-password@relay.example.invalid/send%2Fmail?mode=fixture#fragment",
+		"https://relay-user:relay-password@relay.example.invalid/send%2Fmail#fragment",
 		"https://training-user@training.example.invalid/train",
 		"https://lookup%40user:lookup%40password@[::1]:8443/lookup",
 		"https://storage-user:storage-password@s3.example.invalid/bucket",
@@ -155,7 +157,7 @@ url = %q
 					u.User = url.User(config.SecretMask)
 				}
 				if !strings.Contains(out, u.String()) {
-					t.Error("masked URL lost its scheme, host, port, path, query or fragment")
+					t.Error("masked URL lost its scheme, host, port, path or fragment")
 				}
 			}
 			if strings.Contains(out, "fixture-api-key") {
@@ -166,6 +168,63 @@ url = %q
 			for _, original := range append(urls, "fixture-api-key") {
 				if !strings.Contains(unmasked, original) {
 					t.Error("--mask-secrets=false changed a fixture credential")
+				}
+			}
+		})
+	}
+}
+
+// Endpoint APIs authenticate with query parameters of any name, so the masked dump
+// masks every query value, percent-encoded or not, and keeps the parameter names (#596).
+func TestConfigDumpMasksURLQueryValues(t *testing.T) {
+	const m = config.SecretMask
+	endpoints := []struct{ key, in, want string }{
+		{"[relay] http_url",
+			"https://relay.example.invalid/send?api_key=fixture-query-secret",
+			"https://relay.example.invalid/send?api_key=" + m},
+		{"[spam_training] endpoint",
+			"https://training.example.invalid/train?api%5Fkey=fixture%2Dencoded%2Dsecret&empty=&fixture-bare-token#fragment",
+			"https://training.example.invalid/train?api%5Fkey=" + m + "&empty=&" + m + "#fragment"},
+		{"[server.remote_lookup] url",
+			"https://lookup-user@lookup.example.invalid/lookup?email=$email&token=fixture-lookup-secret",
+			"https://%2A%2A%2AMASKED%2A%2A%2A@lookup.example.invalid/lookup?email=$email&token=" + m},
+	}
+	content := []byte(fmt.Sprintf(`
+[relay]
+http_url = %q
+[spam_training]
+endpoint = %q
+[[server]]
+type = "imap_proxy"
+name = "fixture"
+addr = "127.0.0.1:0"
+[server.remote_lookup]
+url = %q
+`, endpoints[0].in, endpoints[1].in, endpoints[2].in))
+	secrets := []string{"fixture-query-secret", "fixture%2Dencoded%2Dsecret", "fixture-encoded-secret", "fixture-bare-token", "fixture-lookup-secret", "lookup-user"}
+	quote := map[string]func(string) string{
+		"toml": strconv.Quote,
+		"json": func(s string) string { b, _ := json.Marshal(s); return string(b) },
+	}
+
+	for _, format := range []string{"toml", "json"} {
+		t.Run(format, func(t *testing.T) {
+			out := runConfigDump(t, content, format)
+			for _, secret := range secrets {
+				if strings.Contains(out, secret) {
+					t.Errorf("dump prints the fixture query credential %q", secret)
+				}
+			}
+			for _, e := range endpoints {
+				if !strings.Contains(out, quote[format](e.want)) {
+					t.Errorf("%s: dump lacks %s", e.key, quote[format](e.want))
+				}
+			}
+
+			unmasked := runConfigDumpWithMask(t, content, format, "false")
+			for _, e := range endpoints {
+				if !strings.Contains(unmasked, quote[format](e.in)) {
+					t.Errorf("%s: --mask-secrets=false changed the URL", e.key)
 				}
 			}
 		})
