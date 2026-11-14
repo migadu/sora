@@ -69,6 +69,10 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 
 	// Get messages from database
 	messages, err := s.rdb.GetMessagesForMailboxWithRetry(ctx, accountID, mailboxName, limit, offset, unseenOnly)
+	if errors.Is(err, consts.ErrMailboxNotFound) {
+		ctx = readFromWriter(ctx)
+		messages, err = s.rdb.GetMessagesForMailboxWithRetry(ctx, accountID, mailboxName, limit, offset, unseenOnly)
+	}
 	if err != nil {
 		if errors.Is(err, consts.ErrMailboxNotFound) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
@@ -128,6 +132,9 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 
 	// Perform search
 	messages, truncated, err := s.rdb.SearchMessagesInMailboxWithRetry(ctx, accountID, mailboxName, searchQuery)
+	if errors.Is(err, consts.ErrMailboxNotFound) {
+		messages, truncated, err = s.rdb.SearchMessagesInMailboxWithRetry(readFromWriter(ctx), accountID, mailboxName, searchQuery)
+	}
 	if err != nil {
 		if errors.Is(err, consts.ErrMailboxNotFound) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")

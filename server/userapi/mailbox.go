@@ -1,9 +1,11 @@
 package userapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/migadu/sora/logger"
@@ -30,6 +32,15 @@ type CreateMailboxRequest struct {
 	Name string `json:"name"`
 }
 
+// readFromWriter sends ctx's reads to the writer. The API is stateless, so a request
+// cannot tell whether the read pool has replayed what an earlier request wrote on
+// the writer, such as the default mailboxes its login created (handleLogin). A read
+// that finds no mailbox on the read pool asks the writer again before answering
+// none or 404, as POP3 and LMTP read from the writer once they have created them.
+func readFromWriter(ctx context.Context) context.Context {
+	return context.WithValue(ctx, consts.UseMasterDBKey, true)
+}
+
 // handleListMailboxes returns all mailboxes for the authenticated user
 func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -47,6 +58,14 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 	// subscriptions table (migration 000046), not the vestigial mailboxes.subscribed
 	// column, so we filter locally rather than pushing subscribedOnly into the query.
 	mailboxes, err := s.rdb.GetMailboxesForUserWithRetry(ctx, accountID, false)
+	if err == nil && !slices.ContainsFunc(mailboxes, func(mb *db.DBMailbox) bool {
+		return mb.AccountID == accountID && strings.EqualFold(mb.Name, "INBOX")
+	}) {
+		// The login made INBOX, which cannot be deleted; the read pool has not
+		// replayed it yet.
+		ctx = readFromWriter(ctx)
+		mailboxes, err = s.rdb.GetMailboxesForUserWithRetry(ctx, accountID, false)
+	}
 	if err != nil {
 		logger.Warn("HTTP Mail API: Error retrieving mailboxes", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve mailboxes")
