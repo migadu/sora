@@ -38,6 +38,14 @@ var standardBackendPorts = map[string]int{
 	"lmtp":        24,
 }
 
+// implicitTLSBackendPorts are the registered implicit TLS ports (RFC 8314 §3.1 "pop3s"
+// 995, §3.2 "imaps" 993), used when the lookup's backend leg is remote_tls without
+// STARTTLS. ManageSieve and LMTP have no such port and keep their standard one.
+var implicitTLSBackendPorts = map[string]int{
+	"imap": 993,
+	"pop3": 995,
+}
+
 // InitializeRemoteLookup creates an HTTP remotelookup client from configuration.
 // serverRemotePort is the proxy's own remote_port (0 when unset).
 func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig, serverRemotePort int) (UserRoutingLookup, error) {
@@ -88,9 +96,13 @@ func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig, ser
 	}
 	// A lookup answer naming a server without a port is dialed at the lookup's own
 	// remote_port, else at the proxy's remote_port (what its port-less pool and
-	// remote_addrs backends get), else at the protocol's standard port.
+	// remote_addrs backends get), else at the protocol's standard port for the backend
+	// leg this lookup configures (implicit TLS or not).
 	if remotePort == 0 {
 		remotePort = serverRemotePort
+	}
+	if remotePort == 0 && cfg.RemoteTLS && !cfg.RemoteTLSUseStartTLS {
+		remotePort = implicitTLSBackendPorts[protocol]
 	}
 	if remotePort == 0 {
 		remotePort = standardBackendPorts[protocol]

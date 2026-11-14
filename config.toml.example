@@ -1653,7 +1653,8 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 #   * If port is omitted: "192.168.1.10" or "backend.example.com"
 #     → The remote_port below is appended; without it the proxy's own remote_port,
 #       and without that the protocol's standard port (IMAP 143, POP3 110,
-#       ManageSieve 4190, LMTP 24). A bare IPv6 address is a host without a port.
+#       ManageSieve 4190, LMTP 24; with remote_tls but not remote_tls_use_starttls,
+#       IMAP 993 and POP3 995). A bare IPv6 address is a host without a port.
 # - account_id: Account ID for tracking/metrics (integer, must be > 0)
 #
 # Example JSON Response (with port):
