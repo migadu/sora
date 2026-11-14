@@ -81,12 +81,11 @@ func fallbackToTruncate(ctx context.Context, conn *pgx.Conn) {
 	// Disable triggers
 	_, _ = conn.Exec(ctx, "SET session_replication_role = replica;")
 
-	// Drop schema_migrations to ensure migrations run from scratch on errors
-	_, _ = conn.Exec(ctx, "DROP TABLE IF EXISTS schema_migrations;")
-
 	// Every table in public, whatever the migrations have added since this was written:
-	// a fixed list goes stale, and a table missing from it keeps its rows.
-	rows, err := conn.Query(ctx, "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+	// a fixed list goes stale, and a table missing from it keeps its rows. Except
+	// schema_migrations: the tables stay, so their version must stay too, or the next
+	// run starts again at 000001 and fails on CREATE TABLE accounts.
+	rows, err := conn.Query(ctx, "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> 'schema_migrations'")
 	if err != nil {
 		log.Fatalf("Fatal error listing tables: %v", err)
 	}
