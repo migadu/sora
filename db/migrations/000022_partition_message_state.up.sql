@@ -29,8 +29,8 @@ CREATE TABLE IF NOT EXISTS message_state (
 -- change committed after the copy would be lost with the columns; creating the
 -- table's foreign key takes the same lock, but not when the table already exists.
 -- The message_state triggers do not exist yet, so mailbox_stats is left alone: its
--- unseen_count already counts these flags, and 000024 fills the keyword caches that
--- are still NULL.
+-- unseen_count already counts these flags, and 000024 adds these keywords to the
+-- keyword caches that lack them.
 -- On a large database the copy can be made ahead, in id-range batches of this same
 -- INSERT after the CREATE TABLE above; this statement then rewrites only the rows
 -- whose flags changed since.
