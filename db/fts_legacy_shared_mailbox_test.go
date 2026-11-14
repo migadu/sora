@@ -119,7 +119,7 @@ func TestLegacySharedMailboxMessagesStaySearchable(t *testing.T) {
 	})
 
 	t.Run("sweep keeps the owner-keyed row", func(t *testing.T) {
-		keys, err := db.GetUnusedFTSKeys(ctx, 1_000_000)
+		keys, _, err := db.GetUnusedFTSKeys(ctx, FTSKey{}, 1_000_000)
 		require.NoError(t, err)
 		for _, k := range keys {
 			assert.False(t, k.ContentHash == legacyHash && k.AccountID == ownerID,

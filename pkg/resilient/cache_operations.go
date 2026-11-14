@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/db"
 )
 
 // --- Cache Helper Wrappers ---
@@ -23,7 +24,7 @@ func (rd *ResilientDatabase) FindExistingContentHashesWithRetry(ctx context.Cont
 	return result.([]string), nil
 }
 
-func (rd *ResilientDatabase) GetRecentMessagesForWarmupWithRetry(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
+func (rd *ResilientDatabase) GetRecentMessagesForWarmupWithRetry(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]db.ContentObject, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).GetRecentMessagesForWarmup(ctx, AccountID, mailboxNames, messageCount)
 	}
@@ -34,7 +35,7 @@ func (rd *ResilientDatabase) GetRecentMessagesForWarmupWithRetry(ctx context.Con
 	if result == nil {
 		return nil, nil
 	}
-	return result.(map[string][]string), nil
+	return result.(map[string][]db.ContentObject), nil
 }
 
 // --- Cache Metrics Wrappers ---

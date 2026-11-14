@@ -221,3 +221,36 @@ func TestRelayRequeueWritesBodyBeforeMetadata(t *testing.T) {
 		}
 	}
 }
+
+// requeue on a node whose relay queue the server never created must not create it:
+// made by `sudo sora-admin`, pending/ and failed/ would belong to root, and the server,
+// running as its own user, could not queue into them.
+func TestRelayRequeueDoesNotCreateTheQueue(t *testing.T) {
+	queuePath := filepath.Join(t.TempDir(), "relay")
+	for _, id := range []string{"all", "3f2b9c1e-8d4a-4f6b-9a7e-2c5d1e0f4b8a"} {
+		out, err := relayCommand(t, queuePath, "", "requeue", "--id", id, "--confirm").CombinedOutput()
+		if err == nil {
+			t.Errorf("requeue --id %s on a queue that does not exist succeeded:\n%s", id, out)
+		}
+		if _, err := os.Stat(queuePath); !os.IsNotExist(err) {
+			t.Fatalf("requeue --id %s created the relay queue at %s (stat: %v)\n%s", id, queuePath, err, out)
+		}
+	}
+}
+
+// Opening an incomplete existing queue must not create a root-owned processing directory.
+func TestRelayRequeueDoesNotRepairAnIncompleteQueue(t *testing.T) {
+	queuePath := t.TempDir()
+	for _, dir := range []string{"failed", "pending"} {
+		if err := os.Mkdir(filepath.Join(queuePath, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := relayCommand(t, queuePath, "", "requeue", "--id", "all", "--confirm").CombinedOutput()
+	if err == nil {
+		t.Errorf("requeue on an incomplete queue succeeded:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(queuePath, "processing")); !os.IsNotExist(err) {
+		t.Fatalf("requeue created processing/ (stat: %v)\n%s", err, out)
+	}
+}
