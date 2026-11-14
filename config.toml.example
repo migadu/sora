@@ -444,8 +444,10 @@ max_event_queue_size = 50000                    # Max events per protocol queue 
 # When enabled, failed authentication attempts on one node immediately block the IP
 # on all other nodes, providing cluster-wide brute-force protection.
 # Applies to the IMAP, POP3 and ManageSieve proxies, each sharing with the proxies of
-# the same protocol; in cluster mode their max_connections_per_ip is cluster-wide too.
-# Backend servers and the User API keep per-node limits.
+# the same protocol. In cluster mode their max_connections_per_ip is cluster-wide as
+# well, whatever this section says: it caps an address across all proxy nodes, not
+# on each. Backend servers, the LMTP proxy, the User API and the User API proxy keep
+# per-node limits.
 [cluster.rate_limit_sync]
 enabled = true                                  # Enable cluster-wide rate limiting (default: true if cluster enabled)
 sync_blocks = true                              # Synchronize IP blocks across nodes (default: true)
@@ -1528,7 +1530,7 @@ name = "imap-proxy-1"
 addr = ":1143"                # Proxy listen address. Must be different from backend IMAP port.
 remote_addrs = ["backend1.example.com:143", "backend2.example.com:143", "backend3.example.com:143"]
 max_connections = 5000                  # Max connections to this proxy instance (aggregates multiple clients)
-max_connections_per_ip = 500            # High for corporate gateways (~100 users), catches DoS
+max_connections_per_ip = 500            # Cluster-wide in cluster mode. High for corporate gateways (~100 users), catches DoS
 max_connections_per_user = 20           # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
 max_connections_per_user_per_ip = 8     # Per user per IP - slightly higher for proxies
 master_sasl_username = "proxyuser"
@@ -1971,7 +1973,7 @@ name = "pop3-proxy-1"
 addr = ":1110"                # Proxy listen address. Must be different from backend POP3 port.
 remote_addrs = ["backend1.example.com:110", "backend2.example.com:110"]
 max_connections = 2000
-max_connections_per_ip = 200            # High for gateways, POP3 is typically sequential so less needed
+max_connections_per_ip = 200            # Cluster-wide in cluster mode. High for gateways, POP3 is typically sequential
 max_connections_per_user = 5            # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
 max_connections_per_user_per_ip = 3     # POP3 rarely needs multiple simultaneous connections
 master_sasl_username = "proxyuser"
@@ -2035,7 +2037,7 @@ name = "managesieve-proxy-1"
 addr = ":14190"               # Proxy listen address. Must be different from backend ManageSieve port.
 remote_addrs = ["backend1.example.com:4190", "backend2.example.com:4190"]
 max_connections = 500
-max_connections_per_ip = 100            # Low volume protocol, moderate limit sufficient
+max_connections_per_ip = 100            # Cluster-wide in cluster mode. Low volume protocol, moderate limit sufficient
 max_connections_per_user = 5            # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
 max_connections_per_user_per_ip = 3     # Administrative operations, low concurrency needed
 insecure_auth = false                 # Allow plaintext auth. SECURITY: Should be false in production.
