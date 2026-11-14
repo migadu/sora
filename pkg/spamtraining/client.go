@@ -71,6 +71,9 @@ var (
 // jobTimeout bounds one job: fetching the body and submitting it.
 const jobTimeout = 60 * time.Second
 
+// maxResponseBodyBytes bounds how much of the training endpoint's answer is read.
+const maxResponseBodyBytes = 1 << 10
+
 // Client handles spam training submissions to remote endpoint. A fixed pool of
 // workers serves a bounded queue, so however many messages are moved, at most one
 // body per worker, each no larger than max_message_size, is held at a time.
@@ -315,8 +318,10 @@ func (c *Client) submitHTTP(ctx context.Context, req *TrainingRequest) error {
 	}
 	defer resp.Body.Close()
 
-	// Read response body for error details
-	body, _ := io.ReadAll(resp.Body)
+	// Only a refusal's body is used, quoted in the error. Read at most
+	// maxResponseBodyBytes: a short body is read to its end, so the transport keeps
+	// the connection, and a longer one is cut off and its connection closed.
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 
 	// Check response status
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
