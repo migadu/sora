@@ -565,6 +565,24 @@ func logInstanceIdentity(identity config.NodeIdentity) {
 		"note", "SMTP-visible name of this node: protocol greetings, Received 'by' host, vacation Message-ID domain")
 }
 
+// serverNeedsDatabase reports whether a server queries the database. The mail backends,
+// the ManageSieve backend and the HTTP APIs keep their accounts there. A mail proxy
+// authenticates its users there (the LMTP proxy looks up its recipients) unless a remote
+// lookup answers for all of them, which takes remote_lookup enabled with
+// lookup_local_users = false. The User API proxy leaves logins to its backends; it only
+// checks a local user's token there, with lookup_local_users = true.
+func serverNeedsDatabase(s config.ServerConfig) bool {
+	switch s.Type {
+	case "imap", "lmtp", "pop3", "managesieve", "http_admin_api", "http_user_api":
+		return true
+	case "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy":
+		return s.RemoteLookup == nil || !s.RemoteLookup.Enabled || s.RemoteLookup.ShouldLookupLocalUsers()
+	case "user_api_proxy":
+		return s.RemoteLookup != nil && s.RemoteLookup.ShouldLookupLocalUsers()
+	}
+	return false
+}
+
 // initializeServices initializes all core services (S3, database, cache, workers) if storage services are needed
 func initializeServices(ctx context.Context, cfg config.Config, errorHandler *errors.ErrorHandler) (*serverDependencies, error) {
 	// This node's two names, resolved together so they cannot drift apart.
@@ -586,28 +604,19 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	allServers := cfg.GetAllServers()
 	storageServicesNeeded := false
 	userAPIServed := false
-	databaseNeeded := false
+	var databaseUser *config.ServerConfig // the first server that queries the database
 
 	// Check if database is actually configured
 	// Database is configured if either write or read has valid hosts
 	databaseConfigured := (cfg.Database.Write != nil && len(cfg.Database.Write.Hosts) > 0) ||
 		(cfg.Database.Read != nil && len(cfg.Database.Read.Hosts) > 0)
 
-	for _, server := range allServers {
+	for i, server := range allServers {
+		if databaseUser == nil && serverNeedsDatabase(server) {
+			databaseUser = &allServers[i]
+		}
 		if server.Type == "imap" || server.Type == "lmtp" || server.Type == "pop3" {
 			storageServicesNeeded = true
-			databaseNeeded = true
-			break
-		}
-		// Check if proxy servers need database (when lookup_local_users=true)
-		if server.Type == "imap_proxy" || server.Type == "pop3_proxy" || server.Type == "managesieve_proxy" || server.Type == "lmtp_proxy" || server.Type == "user_api_proxy" {
-			if server.RemoteLookup != nil && server.RemoteLookup.ShouldLookupLocalUsers() {
-				databaseNeeded = true
-			}
-		}
-		// Admin API and User API need database for account management
-		if server.Type == "http_admin_api" || server.Type == "http_user_api" {
-			databaseNeeded = true
 		}
 		if server.Type == "http_user_api" {
 			userAPIServed = true
@@ -615,16 +624,9 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	}
 
 	// If database is needed but not configured, that's an error
-	if databaseNeeded && !databaseConfigured {
-		errorHandler.ValidationError("database configuration", fmt.Errorf("database is required for configured servers but not configured in [database.write] or [database.read]"))
+	if databaseUser != nil && !databaseConfigured {
+		errorHandler.ValidationError("database configuration", fmt.Errorf("server %q (%s) needs the database, but it is not configured in [database.write] or [database.read]", databaseUser.Name, databaseUser.Type))
 		os.Exit(errorHandler.WaitForExit())
-	}
-
-	// Override: if database is not configured at all, force databaseNeeded to false
-	// This allows proxy-only mode without database config
-	if !databaseConfigured {
-		databaseNeeded = false
-		logger.Info("Database not configured - forcing proxy-only mode (lookup_local_users will be treated as false)")
 	}
 
 	deps := &serverDependencies{
@@ -696,7 +698,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 	// Initialize the resilient database with runtime failover (if needed)
 	var err error
-	if databaseNeeded {
+	if databaseUser != nil {
 		logger.Info("Connecting to database with resilient failover configuration")
 		deps.resilientDB, err = resilient.NewResilientDatabase(ctx, &cfg.Database, true, true)
 		if err != nil {
@@ -704,7 +706,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			os.Exit(1)
 		}
 	} else {
-		logger.Info("Skipping database initialization - running in proxy-only mode with remote_lookup")
+		logger.Info("Skipping database initialization - no server on this node queries it")
 	}
 
 	// Start database metrics and health monitoring if database is available
