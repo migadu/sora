@@ -197,7 +197,9 @@ spare at the login peak (for example after a restart, when every client logs in 
 
 - bcrypt hashes the server writes (Admin API account and credential changes);
 - bcrypt hashes `sora-admin` writes (`accounts create`, `accounts update`, `credentials add`);
-- the rehash target.
+- the rehash target;
+- what a failed login costs: the dummy check for an unknown address, and the least a wrong
+  password costs whatever the stored hash (section 6).
 
 **Rehash.** After a successful login that was checked against PostgreSQL, Sora looks at the stored
 hash. If it is bcrypt (with or without `{BLF-CRYPT}`) and its cost differs from `bcrypt_cost`, higher
@@ -237,7 +239,12 @@ This is the order on an IMAP, POP3 or ManageSieve backend. The code is in `serve
    deleted accounts. The query runs on the read pool and is retried up to two times on errors.
 10. **Unknown address.** Sora runs a bcrypt check against a dummy hash at the current cost, so that
     the reply takes about as long as for a wrong password. The address does not leak through timing.
-11. **Verify** the password against the hash (section 4).
+11. **Verify** the password against the hash (section 4). A wrong password costs at least one
+    bcrypt check at `bcrypt_cost`, whatever the stored hash: after a failed SHA-512 check Sora runs
+    one against a dummy hash, and after a failed check of a bcrypt hash below `bcrypt_cost` one at
+    each cost from the hash's up to `bcrypt_cost` - 1, which adds up to one check at `bcrypt_cost`.
+    A wrong password then takes about as long as an unknown address, whatever the account's scheme.
+    A bcrypt hash above `bcrypt_cost` takes longer, until the rehash (section 5) brings it down.
 12. **Failure.** The attempt is recorded for the rate limiter and the reply is the "bad credentials"
     reply of the protocol. A database error is not a failed login: it gets a temporary failure
     (below).
@@ -709,7 +716,7 @@ Log lines (INFO unless noted), with the session's fields:
 | `Auth delay: Queue full, rejecting connection` | The limit of section 10.4 was hit. |
 | `Auth rate limiter stats` | Every 10th cleanup: table sizes and caps. |
 | `Rehash: Successfully rehashed and updated password` | Section 5. |
-| `Slow password verification` | A hash check took more than 100 ms. bcrypt at the default cost often takes about that long, so expect this line. |
+| `Slow password verification` | A hash check took more than 100 ms. bcrypt at the default cost often takes about that long, so expect this line. A wrong password takes about that long whatever the scheme (section 6). |
 | WARN `master username authentication failed (invalid master password)` | Section 8. |
 | WARN `master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting` | Section 8.3. |
 
