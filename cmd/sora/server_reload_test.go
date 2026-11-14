@@ -326,3 +326,100 @@ func TestServerReloadReportsServersThatDoNotReload(t *testing.T) {
 		t.Errorf("no restart notice naming allowed_origins for a user-api not running yet:\n%s", out)
 	}
 }
+
+// Start-up refuses duplicate [[server]] names. A SIGHUP reload that mapped newServers by
+// name silently let the last block win, handing a running server a copy-pasted block's
+// settings and logging duplicate added blocks as merely waiting for restart.
+func TestServerReloadRefusesDuplicateServerNames(t *testing.T) {
+	logs := captureReloadLogs(t)
+	deps, reloaders := runningDeps(t,
+		config.ServerConfig{
+			Type: "imap", Name: "imap", Addr: ":143",
+			MasterSASLUsername: "admin", MasterSASLPassword: "secret",
+		},
+		config.ServerConfig{Type: "pop3", Name: "pop3", Addr: ":110"},
+	)
+
+	deps.reloadServers(reloadedConfig(
+		config.ServerConfig{
+			Type: "imap", Name: "imap", Addr: ":143",
+			MasterSASLUsername: "admin", MasterSASLPassword: "secret",
+		},
+		config.ServerConfig{
+			Type: "imap", Name: "imap", Addr: ":993",
+		},
+		config.ServerConfig{
+			Type: "pop3", Name: "pop3", Addr: ":110",
+			MasterSASLUsername: "pop3-admin", MasterSASLPassword: "pop3-secret",
+		},
+		config.ServerConfig{Type: "lmtp", Name: "lmtp", Addr: ":24"},
+		config.ServerConfig{Type: "lmtp", Name: "lmtp", Addr: ":25"},
+	))
+
+	if got := reloaders["imap"].reloaded; len(got) != 0 {
+		t.Fatalf("ReloadConfig for duplicate server name imap got %+v, want no call", got)
+	}
+	if got := reloaders["pop3"].reloaded; len(got) != 1 || got[0].MasterSASLUsername != "pop3-admin" {
+		t.Fatalf("ReloadConfig for unaffected pop3 got %+v, want 1 call with updated settings", got)
+	}
+
+	out := logs.String()
+	if !hasLineWith(out, "level=ERROR", "server=imap", "duplicate server name") {
+		t.Errorf("no error refusing duplicate running server name imap:\n%s", out)
+	}
+	if !hasLineWith(out, "level=ERROR", "server=lmtp", "duplicate server name") {
+		t.Errorf("no error refusing duplicate added server name lmtp:\n%s", out)
+	}
+	if hasLineWith(out, "server=lmtp", "added or enabled") {
+		t.Errorf("duplicate added server name lmtp logged as merely awaiting restart:\n%s", out)
+	}
+}
+
+// A [[server]] block that keeps its name while changing type replaces one protocol with
+// another on the next restart. ReloadConfig must not hand the new type's block to the
+// running server, and none of the block's changed fields may be silenced as applied.
+func TestServerReloadSkipsReloadWhenServerTypeChanged(t *testing.T) {
+	t.Run("valid new type", func(t *testing.T) {
+		logs := captureReloadLogs(t)
+		deps, reloaders := runningDeps(t, config.ServerConfig{
+			Type: "imap", Name: "front", Addr: ":143",
+			MasterSASLUsername: "admin", MasterSASLPassword: "secret",
+		})
+
+		deps.reloadServers(reloadedConfig(config.ServerConfig{
+			Type: "imap_proxy", Name: "front", Addr: ":143",
+			MasterSASLUsername: "proxy-admin", MasterSASLPassword: "proxy-secret",
+		}))
+
+		if got := reloaders["front"].reloaded; len(got) != 0 {
+			t.Fatalf("ReloadConfig got %+v across a type change, want no call", got)
+		}
+		out := logs.String()
+		if !hasLineWith(out, "level=WARN", "server=front", "imap", "imap_proxy") {
+			t.Errorf("no warning about server type change on front:\n%s", out)
+		}
+		for _, key := range []string{"type", "master_sasl_username", "master_sasl_password"} {
+			if !reportsRestart(out, key) {
+				t.Errorf("no restart notice naming %s when ReloadConfig was skipped for type change:\n%s", key, out)
+			}
+		}
+	})
+
+	t.Run("invalid new type", func(t *testing.T) {
+		logs := captureReloadLogs(t)
+		deps, reloaders := runningDeps(t, config.ServerConfig{
+			Type: "imap", Name: "front", Addr: ":143",
+		})
+
+		deps.reloadServers(reloadedConfig(config.ServerConfig{
+			Type: "unknown_proto", Name: "front", Addr: ":143",
+		}))
+
+		if got := reloaders["front"].reloaded; len(got) != 0 {
+			t.Fatalf("ReloadConfig got %+v for invalid type, want no call", got)
+		}
+		if out := logs.String(); !hasLineWith(out, "Skipping reload", "server=front", "invalid server type") {
+			t.Errorf("no invalid server type error for front:\n%s", out)
+		}
+	})
+}
