@@ -38,17 +38,21 @@ func newDisabledCapsTestServer(t *testing.T, opts IMAPServerOptions) *IMAPServer
 func TestDisabledCaps_RemovesRev2ImpliedCapabilities(t *testing.T) {
 	srv := newDisabledCapsTestServer(t, IMAPServerOptions{DisabledCaps: []string{"IDLE", "ESEARCH"}})
 
-	for _, c := range []imap.Cap{imap.CapIdle, imap.CapESearch, imap.CapIMAP4rev2} {
+	for _, c := range []imap.Cap{
+		imap.CapIdle, imap.CapESearch, imap.CapIMAP4rev2,
+		imap.CapSearchRes, imap.CapESort, imap.CapMultiSearch,
+	} {
 		if srv.caps.Has(c) {
 			t.Errorf("disabled_caps = [IDLE ESEARCH]: server capabilities still have %s", c)
 		}
 	}
-	// Dropping IMAP4rev2 must not take anything else away: the server keeps
-	// speaking IMAP4rev1 with each remaining extension listed on its own.
+	// Dropping IMAP4rev2 and ESEARCH must not take unrelated capabilities away:
+	// the server keeps speaking IMAP4rev1 with each remaining extension listed
+	// on its own, including SORT and SORT=DISPLAY.
 	for _, c := range []imap.Cap{
 		imap.CapIMAP4rev1, imap.CapMove, imap.CapNamespace, imap.CapUIDPlus,
-		imap.CapSearchRes, imap.CapListStatus, imap.CapStatusSize, imap.CapChildren,
-		imap.CapListExtended, imap.CapCondStore, imap.CapQResync,
+		imap.CapSort, imap.CapSortDisplay, imap.CapListStatus, imap.CapStatusSize,
+		imap.CapChildren, imap.CapListExtended, imap.CapCondStore, imap.CapQResync,
 	} {
 		if !srv.caps.Has(c) {
 			t.Errorf("disabled_caps = [IDLE ESEARCH] also removed %s", c)
@@ -150,6 +154,84 @@ func TestDisabledCaps_RemovesSortExtensions(t *testing.T) {
 	}
 }
 
+// SEARCHRES (RFC 5182 §2.1), ESORT (RFC 5267 §3.1) and MULTISEARCH (RFC 7377)
+// require ESEARCH, so disabling ESEARCH via disabled_caps or client_filters
+// must withdraw all three while keeping SORT and SORT=DISPLAY (#1011).
+// Disabling any one of the three alone keeps ESEARCH.
+func TestDisabledCaps_RemovesESearchExtensions(t *testing.T) {
+	srv := newDisabledCapsTestServer(t, IMAPServerOptions{DisabledCaps: []string{"ESEARCH"}})
+	for _, c := range []imap.Cap{imap.CapESearch, imap.CapIMAP4rev2, imap.CapSearchRes, imap.CapESort, imap.CapMultiSearch} {
+		if srv.caps.Has(c) {
+			t.Errorf("disabled_caps = [ESEARCH]: server capabilities still have %s", c)
+		}
+	}
+	for _, c := range []imap.Cap{imap.CapIMAP4rev1, imap.CapSort, imap.CapSortDisplay} {
+		if !srv.caps.Has(c) {
+			t.Errorf("disabled_caps = [ESEARCH] also removed %s", c)
+		}
+	}
+
+	filterSrv := newDisabledCapsTestServer(t, IMAPServerOptions{CapabilityFilters: []config.ClientCapabilityFilter{{
+		ClientName:  "^buggy$",
+		DisableCaps: []string{"ESEARCH"},
+	}}})
+	caps := filterSrv.caps.Copy()
+	filterSrv.filterCapabilitiesForClient(caps, &imap.IDData{Name: "buggy"}, "")
+	for _, c := range []imap.Cap{imap.CapESearch, imap.CapIMAP4rev2, imap.CapSearchRes, imap.CapESort, imap.CapMultiSearch} {
+		if caps.Has(c) {
+			t.Errorf("client filter disable_caps = [ESEARCH]: session capabilities still have %s", c)
+		}
+	}
+	for _, c := range []imap.Cap{imap.CapIMAP4rev1, imap.CapSort, imap.CapSortDisplay} {
+		if !caps.Has(c) {
+			t.Errorf("client filter disable_caps = [ESEARCH] also removed %s", c)
+		}
+	}
+
+	for _, name := range []string{"SEARCHRES", "ESORT", "MULTISEARCH"} {
+		srv := newDisabledCapsTestServer(t, IMAPServerOptions{DisabledCaps: []string{name}})
+		if !srv.caps.Has(imap.CapESearch) {
+			t.Errorf("disabled_caps = [%s] removed ESEARCH", name)
+		}
+	}
+}
+
+// CREATE-SPECIAL-USE requires SPECIAL-USE (RFC 6154 §3), so disabling
+// SPECIAL-USE via disabled_caps or client_filters must remove
+// CREATE-SPECIAL-USE too, without dropping IMAP4rev2 (#1011). Disabling
+// CREATE-SPECIAL-USE alone keeps SPECIAL-USE.
+func TestDisabledCaps_RemovesCreateSpecialUseWithSpecialUse(t *testing.T) {
+	srv := newDisabledCapsTestServer(t, IMAPServerOptions{DisabledCaps: []string{"SPECIAL-USE"}})
+	for _, c := range []imap.Cap{imap.CapSpecialUse, imap.CapCreateSpecialUse} {
+		if srv.caps.Has(c) {
+			t.Errorf("disabled_caps = [SPECIAL-USE]: server capabilities still have %s", c)
+		}
+	}
+	if !srv.caps.Has(imap.CapIMAP4rev2) {
+		t.Error("disabled_caps = [SPECIAL-USE] removed IMAP4rev2, which does not imply SPECIAL-USE")
+	}
+
+	filterSrv := newDisabledCapsTestServer(t, IMAPServerOptions{CapabilityFilters: []config.ClientCapabilityFilter{{
+		ClientName:  "^buggy$",
+		DisableCaps: []string{"SPECIAL-USE"},
+	}}})
+	caps := filterSrv.caps.Copy()
+	filterSrv.filterCapabilitiesForClient(caps, &imap.IDData{Name: "buggy"}, "")
+	for _, c := range []imap.Cap{imap.CapSpecialUse, imap.CapCreateSpecialUse} {
+		if caps.Has(c) {
+			t.Errorf("client filter disable_caps = [SPECIAL-USE]: session capabilities still have %s", c)
+		}
+	}
+	if !caps.Has(imap.CapIMAP4rev2) {
+		t.Error("client filter disable_caps = [SPECIAL-USE] removed IMAP4rev2")
+	}
+
+	onlyCreate := newDisabledCapsTestServer(t, IMAPServerOptions{DisabledCaps: []string{"CREATE-SPECIAL-USE"}})
+	if !onlyCreate.caps.Has(imap.CapSpecialUse) {
+		t.Error("disabled_caps = [CREATE-SPECIAL-USE] removed SPECIAL-USE")
+	}
+}
+
 // newDisabledCapsTestSession returns a session of srv with no user, mailbox or
 // database behind it.
 func newDisabledCapsTestSession(srv *IMAPServer) *IMAPSession {
@@ -215,11 +297,18 @@ var disabledCapCommands = []struct {
 		_, err := s.MultiSearch(context.Background(), &imap.SearchSource{Personal: true}, &imap.SearchCriteria{}, &imap.SearchOptions{ReturnAll: true})
 		return err
 	}},
+	{"ESEARCH", "ESEARCH IN (personal)", func(s *IMAPSession) error {
+		_, err := s.MultiSearch(context.Background(), &imap.SearchSource{Personal: true}, &imap.SearchCriteria{}, &imap.SearchOptions{ReturnAll: true})
+		return err
+	}},
 	{"UIDPLUS", "UID EXPUNGE", func(s *IMAPSession) error {
 		uids := imap.UIDSetNum(1)
 		return s.Expunge(context.Background(), nil, &uids)
 	}},
 	{"CREATE-SPECIAL-USE", "CREATE (USE (\\Archive))", func(s *IMAPSession) error {
+		return s.Create(context.Background(), "Arch", &imap.CreateOptions{SpecialUse: []imap.MailboxAttr{imap.MailboxAttrArchive}})
+	}},
+	{"SPECIAL-USE", "CREATE (USE (\\Archive))", func(s *IMAPSession) error {
 		return s.Create(context.Background(), "Arch", &imap.CreateOptions{SpecialUse: []imap.MailboxAttr{imap.MailboxAttrArchive}})
 	}},
 	{"SPECIAL-USE", "LIST (SPECIAL-USE)", func(s *IMAPSession) error {
@@ -256,6 +345,17 @@ var keptCommands = []struct {
 	}},
 	{"SPECIAL-USE", "LIST", func(s *IMAPSession) error {
 		return s.List(context.Background(), nil, "", []string{"*"}, &imap.ListOptions{})
+	}},
+	{"SPECIAL-USE", "CREATE", func(s *IMAPSession) error {
+		return s.Create(context.Background(), "Plain", &imap.CreateOptions{})
+	}},
+	{"ESEARCH", "SORT", func(s *IMAPSession) error {
+		_, err := s.Sort(context.Background(), imapserver.NumKindSeq, []imap.SortCriterion{{Key: imap.SortKeyDate}}, "UTF-8", &imap.SearchCriteria{}, &imap.SortOptions{ReturnAll: true})
+		return err
+	}},
+	{"ESEARCH", "SORT (DISPLAYFROM)", func(s *IMAPSession) error {
+		_, err := s.Sort(context.Background(), imapserver.NumKindSeq, []imap.SortCriterion{{Key: imap.SortKeyDisplayFrom}}, "UTF-8", &imap.SearchCriteria{}, &imap.SortOptions{ReturnAll: true})
+		return err
 	}},
 	{"LIST-STATUS", "LIST", func(s *IMAPSession) error {
 		return s.List(context.Background(), nil, "", []string{"*"}, &imap.ListOptions{})

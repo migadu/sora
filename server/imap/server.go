@@ -1821,24 +1821,26 @@ var alwaysAdvertisedCaps = imap.CapSet{
 	imap.CapUTF8Accept:   {},
 }
 
-// sortExtensions extend the SORT command and imply it, which go-imap's Has
-// does not know: SORT=DISPLAY is advertised by "A server that supports the
-// full [SORT] extension as well as both the DISPLAYFROM and DISPLAYTO sort
-// criteria" (RFC 5957 §1), and servers advertising ESORT "support the return
-// options specified in [ESEARCH] in the SORT command" (RFC 5267 §3.1).
-var sortExtensions = imap.CapSet{
-	imap.CapSortDisplay: {},
-	imap.CapESort:       {},
-}
-
 // capImplies reports whether capability by implies capability c: go-imap's own
-// Has, so it follows the library, and sortExtensions.
+// Has, so it follows the library, plus the extension dependencies Has does not
+// model:
+//   - SORT=DISPLAY (RFC 5957 §1) and ESORT (RFC 5267 §3.1) extend SORT;
+//   - SEARCHRES (RFC 5182 §2.1), ESORT (RFC 5267 §3.1) and MULTISEARCH
+//     (RFC 7377 §1, §2) require ESEARCH;
+//   - CREATE-SPECIAL-USE requires SPECIAL-USE (RFC 6154 §3).
 func capImplies(by, c imap.Cap) bool {
 	if (imap.CapSet{by: {}}).Has(c) {
 		return true
 	}
-	_, ok := sortExtensions[by]
-	return ok && c == imap.CapSort
+	switch c {
+	case imap.CapSort:
+		return by == imap.CapSortDisplay || by == imap.CapESort
+	case imap.CapESearch:
+		return by == imap.CapSearchRes || by == imap.CapESort || by == imap.CapMultiSearch
+	case imap.CapSpecialUse:
+		return by == imap.CapCreateSpecialUse
+	}
+	return false
 }
 
 // disableCapabilities removes the named capabilities from caps and returns
@@ -1848,10 +1850,10 @@ func capImplies(by, c imap.Cap) bool {
 // into the base protocol (IDLE, ESEARCH, SEARCHRES, MOVE, NAMESPACE, UIDPLUS,
 // ...), QRESYNC implies CONDSTORE (RFC 7162 §3.2.3). Deleting only the named key
 // left such a capability advertised and usable, so whatever implies it is
-// removed too (see capImplies). For IMAP4rev2 that downgrades the server or
-// session to IMAP4rev1, where go-imap lists each remaining extension on its
-// own. A name in alwaysAdvertisedCaps is skipped: nothing removed here can
-// withdraw it.
+// removed transitively too (see capImplies). For IMAP4rev2 that downgrades the
+// server or session to IMAP4rev1, where go-imap lists each remaining extension
+// on its own. A name in alwaysAdvertisedCaps is skipped: nothing removed here
+// can withdraw it.
 func disableCapabilities(caps imap.CapSet, names []string) []string {
 	var removed []string
 	for _, name := range names {
@@ -1863,10 +1865,16 @@ func disableCapabilities(caps imap.CapSet, names []string) []string {
 			delete(caps, c)
 			removed = append(removed, name)
 		}
-		for other := range caps {
-			if capImplies(other, c) {
-				delete(caps, other)
-				removed = append(removed, string(other))
+		queue := []imap.Cap{c}
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			for other := range caps {
+				if capImplies(other, cur) {
+					delete(caps, other)
+					removed = append(removed, string(other))
+					queue = append(queue, other)
+				}
 			}
 		}
 	}
