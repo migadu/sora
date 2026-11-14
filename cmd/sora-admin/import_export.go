@@ -28,6 +28,8 @@ func handleImportCommand(ctx context.Context) {
 		handleImportMaildir(ctx)
 	case "s3":
 		handleImportS3(ctx)
+	case "rekey":
+		handleImportRekey(ctx)
 	case "--help", "-h":
 		printImportUsage()
 	default:
@@ -525,6 +527,7 @@ Usage:
 Subcommands:
   maildir        Import maildir data
   s3             Import messages from S3 storage (recovery scenario)
+  rekey          Re-key bodies an older import stored under their SHA-256 digest
   fix-subscriptions  Fix subscription status for default mailboxes
 
 Examples:
@@ -533,6 +536,7 @@ Examples:
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot
   sora-admin import s3 --email user@example.com --dry-run
   sora-admin import s3 --email user@example.com --workers 5 --batch-size 500
+  sora-admin import rekey --email user@example.com --dry-run
 
 Use 'sora-admin import <subcommand> --help' for detailed help.
 `)
