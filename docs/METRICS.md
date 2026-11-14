@@ -149,6 +149,13 @@ The `sora_auth_delay_*` metrics only exist while `[server.auth_rate_limit]` is e
 method of a server (LOGIN, AUTHENTICATE, master user) counts under it. Per-address detail is in
 the log and in `GET /admin/auth/blocked`. See [AUTHENTICATION.md](AUTHENTICATION.md).
 
+Upgrade note: `sora_auth_rate_limiter_*`, `sora_auth_delay_*` and
+`sora_connection_tracker_*` previously used labels such as `IMAP`, `IMAP-PROXY`,
+`SIEVE-PROXY` and `IMAP-LOGIN`. Update dashboard and alert selectors to the server-type
+values above. Queries must account for both spellings while a rolling upgrade still
+has nodes running the previous version. Auth-delay log `protocol` fields use the new
+server-type values too.
+
 ### 3.3 Commands and protocol errors
 
 | Metric | Type | Labels | Meaning |
