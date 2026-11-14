@@ -197,7 +197,7 @@ type ClusterRateLimitSyncConfig struct {
 
 // ClusterAffinityConfig holds configuration for cluster-wide server affinity
 type ClusterAffinityConfig struct {
-	Enabled         bool   `toml:"enabled"`          // Enable cluster-wide affinity (default: false)
+	Enabled         bool   `toml:"enabled"`          // Enable cluster-wide affinity (default: true; only read with [cluster] enabled)
 	TTL             string `toml:"ttl"`              // How long affinity persists (default: "24h")
 	CleanupInterval string `toml:"cleanup_interval"` // How often to clean up expired affinities (default: "1h")
 	CachePath       string `toml:"cache_path"`       // SQLite path for persistent affinity (default: "" = disabled)
@@ -1554,6 +1554,10 @@ func NewDefaultConfig() Config {
 				Enabled:           true,
 				SyncBlocks:        true,
 				SyncFailureCounts: true,
+			},
+			// On by default: cluster nodes ran affinity before this key was read.
+			Affinity: ClusterAffinityConfig{
+				Enabled: true,
 			},
 		},
 	}
