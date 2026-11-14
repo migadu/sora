@@ -45,32 +45,24 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
-	// Reject path-traversal segments ("." / "..") up front with a clean client
-	// error. These names would let the maildir exporter escape its target
-	// directory; db.CreateMailbox enforces this too, but checking here avoids a
-	// misleading SERVERBUG response and short-circuits parent auto-creation.
-	if helpers.MailboxNameHasTraversal(name) {
-		s.DebugLog("rejecting mailbox name with path traversal segment", "name", name)
+	// RFC 9051 §6.3.4: a trailing hierarchy separator is an intent marker, and
+	// "the name created is without the trailing hierarchy delimiter", so CREATE
+	// "foo/" creates the mailbox "foo". Trimmed before the existence check, the
+	// shared-namespace check and creation so the name is canonical. Each superior
+	// name CREATE makes is a level of the name, so an empty level ("x//y",
+	// "/lead") is refused up front with a clean client error before any parent is
+	// created, as is a "." / ".." level, which would let the maildir exporter
+	// escape its target directory. db.CreateMailbox refuses these names too.
+	created, err := helpers.MailboxNameToCreate(name)
+	if err != nil {
+		s.DebugLog("rejecting invalid mailbox name", "name", name)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeCannot,
 			Text: "Invalid mailbox name",
 		}
 	}
-
-	// RFC 3501 §6.3.3: a trailing hierarchy separator is an intent marker
-	// ("this mailbox may have inferiors"), not part of the stored name — so
-	// CREATE "foo/" creates the mailbox "foo". Trim it before the existence
-	// check, the shared-namespace check, and creation so the name is canonical.
-	name = strings.TrimRight(name, string(consts.MailboxDelimiter))
-	if name == "" {
-		s.DebugLog("rejecting empty mailbox name after trimming trailing separators")
-		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeCannot,
-			Text: "Invalid mailbox name",
-		}
-	}
+	name = created
 
 	// Add config to context for shared mailbox detection
 	if s.server.config != nil {
@@ -92,7 +84,7 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 	}
 
 	// Check if mailbox already exists
-	_, err := s.server.rdb.GetMailboxByNameForRightWithRetry(ctx, AccountID, name, db.ACLRightCreate)
+	_, err = s.server.rdb.GetMailboxByNameForRightWithRetry(ctx, AccountID, name, db.ACLRightCreate)
 	if err == nil {
 		s.DebugLog("mailbox already exists", "mailbox", name)
 		return &imap.Error{
