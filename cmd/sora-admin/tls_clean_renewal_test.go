@@ -85,3 +85,27 @@ func TestTLSCleanRemovesEveryExpiredVersion(t *testing.T) {
 		t.Errorf("S3 objects after clean = %v, want only the valid domain's %v", got, valid)
 	}
 }
+
+// TestTLSCleanAfterVersioningWasTurnedOn: the bucket got versioning after the name was
+// first stored, as the clean notes advise for a bucket without it, so the oldest version
+// is the "null" one from before. Deleting the expired version clean read brings that
+// one back. It has expired too, and has no version of its own to name, so clean deletes
+// the name the way it does on a bucket without versions, and reports no failure.
+func TestTLSCleanAfterVersioningWasTurnedOn(t *testing.T) {
+	stub, endpoint := newVersionedTLSStubS3(t)
+	cfg := tlsTestConfig(endpoint)
+	path := "/certs/" + tlsmanager.S3ObjectKey("mail.example.com")
+	beforeVersioning := tlsCleanAutocertEntry(t, "mail.example.com", false, time.Now().Add(-120*24*time.Hour))
+	stub.mu.Lock()
+	stub.objects[path] = beforeVersioning
+	stub.versions[path] = []tlsStubVersion{{id: "null", data: beforeVersioning}}
+	stub.mu.Unlock()
+	putServerEntry(t, cfg, "mail.example.com", tlsCleanAutocertEntry(t, "mail.example.com", false, time.Now().Add(-24*time.Hour)))
+
+	if err := cleanTLSCertificates(context.Background(), cfg, t.TempDir(), false, true); err != nil {
+		t.Fatalf("cleanTLSCertificates: %v", err)
+	}
+	if got := stub.keys(); len(got) != 0 {
+		t.Errorf("S3 objects after clean = %v, want none", got)
+	}
+}

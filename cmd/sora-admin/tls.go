@@ -1169,16 +1169,22 @@ func deleteExpiredS3Object(ctx context.Context, s3store *storage.S3Storage, key,
 		if err != nil {
 			return fmt.Errorf("read back after deleting version %s: %w", version, err)
 		}
-		if next == "" || next == version {
+		if next == version {
 			return fmt.Errorf("version %s is still served after it was deleted", version)
 		}
 		var info CertificateInfo
 		if err := parseCertificate(data, &info); err != nil {
-			return fmt.Errorf("parse version %s, served after deleting version %s: %w", next, version, err)
+			return fmt.Errorf("parse the object served after deleting version %s: %w", version, err)
 		}
 		if !info.Expiry.Before(now) {
 			logger.Info("Kept a valid certificate stored under the name of an expired one", "key", key, "version", next, "expiry", info.Expiry)
 			return nil
+		}
+		if next == "" {
+			// An expired version without an id of its own, such as the "null" one
+			// stored before versioning was turned on: delete by name, as on a bucket
+			// without versions.
+			return s3store.DeleteContext(ctx, key)
 		}
 		version = next
 	}
