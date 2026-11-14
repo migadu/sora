@@ -114,6 +114,8 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 func (s *IMAPSession) threadOrderedSubject(numKind imapserver.NumKind, messages []db.ThreadMessageResult) []imap.ThreadData {
 	// 1. Sort messages by subject, then by sent date, then by mailbox order. UID
 	// order is sequence order, and UID is always set; Seq is 0 for UID THREAD.
+	// SubjectSort arrives in i;unicode-casemap form, so comparing its octets is
+	// that collation (RFC 5256 §7, RFC 5051 §2).
 	sort.Slice(messages, func(i, j int) bool {
 		if messages[i].SubjectSort != messages[j].SubjectSort {
 			return messages[i].SubjectSort < messages[j].SubjectSort

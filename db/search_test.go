@@ -697,7 +697,7 @@ func TestBuildSortOrderClause(t *testing.T) {
 		{
 			name:     "sort by subject",
 			criteria: []imap.SortCriterion{{Key: imap.SortKeySubject, Reverse: false}},
-			expected: "m.subject_sort ASC",
+			expected: subjectCasemapKey("m.subject_sort") + ` COLLATE "C" ASC`,
 		},
 		{
 			name:     "sort by size",
