@@ -874,8 +874,8 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 			Endpoint:          opts.SpamTrainingEndpoint,
 			AuthToken:         opts.SpamTrainingToken,
 			Timeout:           "10s",
-			MaxMessageSize:    "10MB",
-			MaxAttachmentSize: "5MB",
+			MaxMessageSize:    "10mb",
+			MaxAttachmentSize: "5mb",
 			Async:             true,
 			CircuitBreaker: config.SpamTrainingCircuitBreakerConfig{
 				Threshold:   opts.SpamTrainingCircuitThreshold,

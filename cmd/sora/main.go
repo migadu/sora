@@ -256,6 +256,9 @@ func main() {
 	if deps.relayWorker != nil {
 		defer deps.relayWorker.Stop()
 	}
+	if deps.spamTrainingClient != nil {
+		defer deps.spamTrainingClient.Close()
+	}
 
 	// SIGHUP handler for config reload - set up AFTER deps is created so the running
 	// servers are registered. Global settings are only reported (handleConfigReload
