@@ -205,6 +205,13 @@ func NewHTTPRemoteLookupClient(
 		client: &http.Client{
 			Timeout:   timeout,
 			Transport: transport,
+			// Never follow redirects. The https-or-loopback rule is checked only for the
+			// configured URL, so a followed redirect could send the request and its bearer
+			// token anywhere and take the answer there as the lookup result. A 3xx is
+			// handled by LookupUserRouteWithClientIP itself (user not found).
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 		breaker:                breaker,
 		remotePort:             remotePort,
