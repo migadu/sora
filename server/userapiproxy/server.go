@@ -689,10 +689,10 @@ var errAuthBodyTooLarge = errors.New("auth request body too large")
 // not be the user's pool.
 var errRefreshTokenRefused = errors.New("refresh token refused")
 
-// errUserRefused is, with named pools, a user the remote lookup does not know (404/3xx)
-// while lookup_local_users is off, or one whose account it refuses (401/403): a verdict
-// on the user, not an outage. No pool may answer for that user, so routeUser routes the
-// request nowhere.
+// errUserRefused is a user the remote lookup does not know (404/3xx) while
+// lookup_local_users is off, or one whose account it refuses (401/403): a verdict on the
+// user, not an outage. No backend may answer for that user, with named pools or a flat
+// remote_addrs list, so routeUser routes the request nowhere.
 var errUserRefused = errors.New("user refused by the remote lookup")
 
 // errLoginRefused is a login the proxy refuses itself: one for an errUserRefused user, at
@@ -891,8 +891,11 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 // is refused rather than routed into the default pool, because the backends trust the
 // token's account ID and a backend of another pool holds another tenant's account under
 // it. With lookup_local_users, a JWT request the lookup does not know also has to
-// identify an active local account before it can enter the default pool. A user the
-// lookup does not know (without lookup_local_users) or refuses is errUserRefused.
+// identify an active local account before it can enter the default pool.
+//
+// A user the lookup does not know (without lookup_local_users) or refuses is
+// errUserRefused, with named pools or a flat remote_addrs list. A flat list is one pool:
+// a lookup that fails still routes into it, as before pools.
 //
 // A backend in maintenance is never picked. A pin to one routes the user among that
 // backend's own siblings (refused if its named pool cannot be identified) without
@@ -972,9 +975,10 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 		case routingInfo == nil && result == proxy.AuthUserNotFound:
 			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, IsNegative: true})
 			notFound = true
-		case routingInfo == nil && result == proxy.AuthFailed && named:
-			// 401/403: the lookup refuses the account, a verdict and not an outage. Not
-			// cached, as the lookup client caches no refusal.
+		case routingInfo == nil && result == proxy.AuthFailed:
+			// 401/403: the lookup refuses the account, a verdict and not an outage, with
+			// no fallback, a flat list included. Not cached, as the lookup client caches
+			// no refusal.
 			return backendRoute{}, fmt.Errorf("%w: %w", errUserRefused, proxy.ErrRemoteLookupRefused)
 		case routingInfo == nil:
 			logger.Warn("User API Proxy: RemoteLookup gave no route", "name", s.name, "user", email, "result", result)
@@ -1012,10 +1016,11 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, PoolName: routingInfo.PoolName})
 		}
 	}
+	if notFound && !s.lookupLocalUsers {
+		// With a flat list too: its backends would log the user in from their database.
+		return backendRoute{}, fmt.Errorf("%w: not known to the remote lookup, and lookup_local_users is off", errUserRefused)
+	}
 	if notFound && named {
-		if !s.lookupLocalUsers {
-			return backendRoute{}, fmt.Errorf("%w: not known to the remote lookup, and lookup_local_users is off", errUserRefused)
-		}
 		// A valid JWT from another pool may carry the ID of an unrelated local
 		// account. A lookup miss is not evidence that its owner is a local user.
 		// Logins are authenticated by the backend. Requests carrying a token,

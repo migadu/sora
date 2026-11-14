@@ -372,7 +372,6 @@ SQL from the criteria and picks one of these shapes. Each shape has its own `ope
 | TEXT union, prefiltered | As above, in a mailbox of 10,000 messages or more. | `search_messages_complex_text_union_prefilter` |
 | Prefiltered body search | A `BODY` or `TEXT` term, in a mailbox of 10,000 messages or more. | `search_messages_complex_prefilter` |
 | Per-message body probe | A `BODY` or `TEXT` term in a smaller mailbox. | `search_messages_complex_fast` |
-| Sequence-number path | Rare: sequence numbers that could not be turned into UIDs first. | `search_messages_complex_legacy` |
 | THREAD | Every `THREAD`. Joins the FTS table only when the criteria contain `BODY` or `TEXT`. | `search_thread` |
 
 The two body shapes differ like this:
@@ -390,7 +389,7 @@ User API have no count and always use the per-message probe.
 Other details:
 
 - A search by sequence numbers first turns them into UIDs with one query, so the main query
-  filters on UIDs.
+  filters on UIDs. If that query fails, the search fails.
 - Keywords in the criteria are matched in the case the mailbox already uses for them.
 - Searches read from the read endpoint, or from the write endpoint when the session has written
   something (see [DATABASE.md](DATABASE.md#5-which-queries-use-which-endpoint)).

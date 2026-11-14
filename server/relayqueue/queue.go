@@ -18,6 +18,10 @@ const (
 	// tempFilePrefix marks the scratch files written by writeDataAtomic.
 	tempFilePrefix = ".tmp-"
 
+	// heldExt names the metadata of a held message (Hold): the worker only looks for
+	// ".json", which commit renames it to.
+	heldExt = ".held"
+
 	// orphanGracePeriod is how long a half-written message pair or a leftover temp
 	// file must sit untouched before CleanupOrphans reclaims it. Every write path
 	// holds q.mu, so anything older than this is crash debris rather than a write
@@ -294,10 +298,11 @@ func (q *DiskQueue) CleanupOldFailedMessages(retentionPeriod time.Duration) (int
 }
 
 // CleanupOrphans removes crash debris that no other path reclaims: temp files from an
-// interrupted atomic write, pending bodies whose metadata was never written, and
-// pending metadata whose body is missing (which AcquireNext can never deliver and
-// re-reads and error-logs on every scan). Only files untouched for orphanGracePeriod
-// are removed. Returns the number of files deleted.
+// interrupted atomic write, pending bodies whose metadata was never written (a Hold
+// never committed or aborted among them), and pending metadata whose body is missing
+// (which AcquireNext can never deliver and re-reads and error-logs on every scan).
+// Only files untouched for orphanGracePeriod are removed. Returns the number of files
+// deleted.
 func (q *DiskQueue) CleanupOrphans() (int, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -369,6 +374,9 @@ func (q *DiskQueue) CleanupOrphans() (int, error) {
 			counterpart = id + ".msg"
 		case ".msg":
 			counterpart = id + ".json"
+		case heldExt:
+			// A hold never committed or aborted: its process died before the delivery
+			// was acknowledged. Its body, without a .json, goes too.
 		default:
 			continue
 		}
@@ -395,6 +403,24 @@ func (q *DiskQueue) CleanupOrphans() (int, error) {
 
 // Enqueue adds a new message to the relay queue
 func (q *DiskQueue) Enqueue(from, to, messageType string, messageBytes []byte) error {
+	commit, _, err := q.Hold(from, to, messageType, messageBytes)
+	if err != nil {
+		return err
+	}
+	return commit()
+}
+
+// Hold writes a message to the queue without handing it to the worker yet: commit
+// does that, and abort removes the message instead (and does nothing after commit). A
+// Sieve redirect is held while the delivery that runs it can still fail: the sender
+// retries a failed delivery, and a redirect handed over by an earlier attempt would be
+// relayed again by every retry.
+//
+// Hold does every write that can run out of disk. Its metadata gets a name the worker
+// does not look for, and commit only renames it to the one it does. A hold whose
+// process died before commit or abort is removed by CleanupOrphans: the delivery it
+// belonged to was never acknowledged, so its sender delivers it again.
+func (q *DiskQueue) Hold(from, to, messageType string, messageBytes []byte) (commit func() error, abort func(), err error) {
 	start := time.Now()
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -422,25 +448,73 @@ func (q *DiskQueue) Enqueue(from, to, messageType string, messageBytes []byte) e
 	if err := q.writeDataAtomic(messagePath, messageBytes, nil); err != nil {
 		metrics.RelayQueueOperations.WithLabelValues("enqueue", "error").Inc()
 		metrics.RelayQueueOperationDuration.WithLabelValues("enqueue").Observe(time.Since(start).Seconds())
-		return fmt.Errorf("failed to write message: %w", err)
+		return nil, nil, fmt.Errorf("failed to write message: %w", err)
 	}
 
 	// Write metadata atomically
-	metadataPath := filepath.Join(q.pendingDir, id+".json")
-	if err := q.writeFileAtomic(metadataPath, metadata); err != nil {
+	heldPath := filepath.Join(q.pendingDir, id+heldExt)
+	if err := q.writeFileAtomic(heldPath, metadata); err != nil {
 		// Clean up the body if metadata write fails
 		os.Remove(messagePath)
 		metrics.RelayQueueOperations.WithLabelValues("enqueue", "error").Inc()
 		metrics.RelayQueueOperationDuration.WithLabelValues("enqueue").Observe(time.Since(start).Seconds())
-		return fmt.Errorf("failed to write metadata: %w", err)
+		return nil, nil, fmt.Errorf("failed to write metadata: %w", err)
 	}
+	// The time the delivery holding the message takes is not the queue's.
+	holdTime := time.Since(start)
 
-	q.pending.add(id, metadata.NextRetry)
+	settled := false // committed or aborted; guarded by q.mu
+	commit = func() error {
+		start := time.Now()
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		if settled {
+			return fmt.Errorf("relay message %s was already committed or aborted", id)
+		}
+		settled = true
+		observe := func(result string) {
+			metrics.RelayQueueOperations.WithLabelValues("enqueue", result).Inc()
+			metrics.RelayQueueOperationDuration.WithLabelValues("enqueue").Observe((holdTime + time.Since(start)).Seconds())
+		}
 
-	metrics.RelayQueueOperations.WithLabelValues("enqueue", "success").Inc()
-	metrics.RelayQueueOperationDuration.WithLabelValues("enqueue").Observe(time.Since(start).Seconds())
-	logger.Info("RelayQueue: Enqueued message", "type", messageType, "id", id, "from", from, "to", to)
-	return nil
+		metadataPath := filepath.Join(q.pendingDir, id+".json")
+		err := os.Rename(heldPath, metadataPath)
+		if err == nil {
+			// The rename must be durable before the caller acknowledges the delivery:
+			// for a redirect without :copy this message is the only copy.
+			err = syncDir(q.pendingDir)
+		}
+		if err != nil {
+			// Not handed over: remove the message so that the worker cannot send what
+			// the caller keeps instead (a resync may already have listed the name).
+			os.Remove(metadataPath)
+			os.Remove(heldPath)
+			os.Remove(messagePath)
+			observe("error")
+			return fmt.Errorf("failed to commit metadata: %w", err)
+		}
+
+		q.pending.add(id, metadata.NextRetry)
+
+		observe("success")
+		logger.Info("RelayQueue: Enqueued message", "type", messageType, "id", id, "from", from, "to", to)
+		return nil
+	}
+	abort = func() {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		if settled {
+			return
+		}
+		settled = true
+		for _, path := range []string{heldPath, messagePath} {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				// CleanupOrphans removes it once its grace period is over.
+				logger.Warn("RelayQueue: Failed to remove held message", "file", path, "error", err)
+			}
+		}
+	}
+	return commit, abort, nil
 }
 
 // Requeue moves a message from failed/ back to pending/ with its attempts and error

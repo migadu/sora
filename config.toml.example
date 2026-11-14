@@ -1829,10 +1829,9 @@ limits.max_auth_errors = 2                  # Number of protocol errors before a
 # - If HTTP endpoint returns 404/3xx → respects lookup_local_users setting (user partitioning)
 # - If HTTP endpoint returns 401/403 → authentication rejected (no fallback); the way to refuse an account.
 #   On a route-only lookup too: an LMTP recipient gets the user_not_found_response reply, with or
-#   without [[pool]] blocks, and is never looked up in the local database; with [[pool]] blocks the
-#   User API proxy answers a login 401 as a wrong password (see NAMED BACKEND POOLS), and any other
-#   route-only refusal (a User API request carrying a token: 503) is a temporary failure, never the
-#   default pool
+#   without [[pool]] blocks, and is never looked up in the local database; the User API proxy, with
+#   [[pool]] blocks or remote_addrs, answers a login 401 as a wrong password (see NAMED BACKEND
+#   POOLS), and a request carrying a token 503, never sending either to a backend
 # - If HTTP endpoint returns other 4xx/5xx, or a 200 that is not JSON with address and password_hash
 #   → service unavailable (no verdict on the password), ALWAYS reject (no fallback); 5xx, 408, 429
 #   and malformed 200s also count toward the circuit breaker

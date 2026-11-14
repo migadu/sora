@@ -785,10 +785,11 @@ remote_use_proxy_protocol = true
    unchanged. A malformed body or a login without a usable email and password goes to
    the default pool, or the first pool in configuration order with an available backend,
    which answers it without looking up an account. A refused refresh token gets `401`
-   from the proxy. Normally the backend checks the password. With named pools, a login
-   the lookup refuses (`401`/`403`) or does not know (`404`/`3xx`, with
-   `lookup_local_users` off) instead gets `401 {"error":"Invalid credentials"}` after
-   one dummy password verification, and reaches no backend.
+   from the proxy. Normally the backend checks the password. A login the lookup refuses
+   (`401`/`403`) or does not know (`404`/`3xx`, with `lookup_local_users` off) instead
+   gets `401 {"error":"Invalid credentials"}` after one dummy password verification, and
+   reaches no backend, with named pools or `remote_addrs`. A request carrying a token for
+   such a user, and its refresh, get `503 Service unavailable`.
 
    With `[server.auth_rate_limit]` on the proxy, the proxy rate limits every login with an
    email and a password before routing it: the progressive delay, then the blocks, a blocked
@@ -797,6 +798,7 @@ remote_use_proxy_protocol = true
    delays and blocks do not depend on whether the lookup knows the addresses it tries. Leave
    the limiter off on the backends behind the proxy: they see only the logins for addresses
    the lookup knows. See [AUTHENTICATION.md](AUTHENTICATION.md#10-authentication-rate-limiting).
+
 2. **Every other request** must carry a valid token, except a CORS preflight (12.3). The proxy
    checks the signature with its own `jwt_secret` and the expiry (not the issuer; the backend
    checks that), and routes by the token's `email`. A missing or bad token gets
@@ -844,10 +846,10 @@ Each body is `{"error":"message"}` with the message below. Set the proxy's
 |---|---|---|
 | 401 | `Authorization header required`, `Authorization header must be 'Bearer <token>'`, `Invalid or expired token` | Missing, malformed, expired or wrongly signed bearer token. |
 | 401 | `Invalid or expired token` | A refused refresh token, including one without usable account identity. |
-| 401 | `Invalid credentials` | A named-pool login the remote lookup refuses or does not know, or a login the proxy's rate limiter blocks, as described in 12.1. |
+| 401 | `Invalid credentials` | A login the remote lookup refuses or does not know, or a login the proxy's rate limiter blocks, as described in 12.1. |
 | 413 | `Request body too large` | A login or refresh body over 64 KiB. |
 | 429 | `Too many concurrent authentication attempts. Please try again later.` | Too many logins from the client are waiting out a progressive delay at once. |
-| 503 | `Service unavailable` | No route for the user, or the backend maintenance list has not been read yet after start-up. |
+| 503 | `Service unavailable` | No route for the user (including a token whose user the remote lookup refuses or does not know), or the backend maintenance list has not been read yet after start-up. |
 | 503 | `Backend route unavailable` | The chosen backend could not be bound to a connection. |
 | 502 | `Bad gateway` | The backend request failed. |
 | 500 | `Internal server error` | The backend request could not be constructed. |
