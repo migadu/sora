@@ -388,11 +388,15 @@ Examples:
 		fmt.Printf("Failed to check whether mailbox '%s' is shared: %v\n", *oldName, err)
 		os.Exit(1)
 	}
-	if helpers.MailboxNameHasTraversal(*newName) ||
-		(globalConfig.SharedMailboxes.Enabled && globalConfig.SharedMailboxes.InNamespace(*newName) != isShared) {
+	// As on IMAP RENAME, a trailing delimiter is no part of the new name, and a name
+	// with an empty, "." or ".." level is refused.
+	created, nameErr := helpers.MailboxNameToCreate(*newName)
+	if nameErr != nil ||
+		(globalConfig.SharedMailboxes.Enabled && globalConfig.SharedMailboxes.InNamespace(created) != isShared) {
 		fmt.Println("Failed to rename mailbox: invalid destination or shared namespace boundary")
 		os.Exit(1)
 	}
+	*newName = created
 	if helpers.MailboxNameIsBelow(*newName, mbox.Name) {
 		fmt.Println("Failed to rename mailbox: a mailbox cannot be renamed to a name below itself")
 		os.Exit(1)
