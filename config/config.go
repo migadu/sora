@@ -1889,10 +1889,18 @@ func (s *ServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(s.ProxyProtocolTimeout)
 }
 
-// GetSearchRateLimitWindow parses the search rate limit window duration
+// GetSearchRateLimitWindow parses the search rate limit window duration. A zero or
+// negative window is an error: the rate limiter would replace it with the default.
 func (s *ServerConfig) GetSearchRateLimitWindow() (time.Duration, error) {
 	if s.Limits != nil && s.Limits.SearchRateLimitWindow != "" {
-		return helpers.ParseDuration(s.Limits.SearchRateLimitWindow)
+		window, err := helpers.ParseDuration(s.Limits.SearchRateLimitWindow)
+		if err != nil {
+			return 0, err
+		}
+		if window <= 0 {
+			return 0, fmt.Errorf("limits.search_rate_limit_window must be positive, got %q", s.Limits.SearchRateLimitWindow)
+		}
+		return window, nil
 	}
 	return time.Minute, nil // Default: 1 minute
 }
