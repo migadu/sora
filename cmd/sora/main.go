@@ -1042,13 +1042,20 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 	// Initialize cluster manager if enabled
 	if cfg.Cluster.Enabled {
-		logger.Info("Initializing cluster manager")
-		deps.clusterManager, err = cluster.New(cfg.Cluster)
-		if err != nil {
-			errorHandler.FatalError("initialize cluster manager", err)
-			os.Exit(errorHandler.WaitForExit())
+		// Open the persistent affinity store, if configured, before joining the cluster:
+		// the affinity manager writes every gossip event it applies to the store, and
+		// affinity gossip that arrives between the join and the manager's creation finds
+		// no handler and is dropped, so nothing slow may run there.
+		var affinityStore server.AffinityPersistStore
+		if cfg.Cluster.Affinity.Enabled && cfg.Cluster.Affinity.CachePath != "" {
+			store, err := affinitycache.New(cfg.Cluster.Affinity.CachePath)
+			if err != nil {
+				logger.Error("Failed to initialize affinity cache - continuing without persistence", "path", cfg.Cluster.Affinity.CachePath, "error", err)
+			} else {
+				affinityStore = store
+				logger.Info("Affinity cache initialized", "path", cfg.Cluster.Affinity.CachePath)
+			}
 		}
-		logger.Info("Cluster manager initialized", "node_id", deps.clusterManager.GetNodeID(), "members", deps.clusterManager.GetMemberCount(), "leader", deps.clusterManager.GetLeaderID())
 
 		affinityTTL, err := cfg.Cluster.Affinity.GetTTL()
 		if err != nil {
@@ -1062,19 +1069,13 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			affinityCleanup = 1 * time.Hour
 		}
 
-		// Open the persistent affinity store, if configured, before creating the affinity
-		// manager: the node has already joined the cluster, and every gossip event the
-		// manager applies, also while it loads the store, must be written to the store.
-		var affinityStore server.AffinityPersistStore
-		if cfg.Cluster.Affinity.Enabled && cfg.Cluster.Affinity.CachePath != "" {
-			store, err := affinitycache.New(cfg.Cluster.Affinity.CachePath)
-			if err != nil {
-				logger.Error("Failed to initialize affinity cache - continuing without persistence", "path", cfg.Cluster.Affinity.CachePath, "error", err)
-			} else {
-				affinityStore = store
-				logger.Info("Affinity cache initialized", "path", cfg.Cluster.Affinity.CachePath)
-			}
+		logger.Info("Initializing cluster manager")
+		deps.clusterManager, err = cluster.New(cfg.Cluster)
+		if err != nil {
+			errorHandler.FatalError("initialize cluster manager", err)
+			os.Exit(errorHandler.WaitForExit())
 		}
+		logger.Info("Cluster manager initialized", "node_id", deps.clusterManager.GetNodeID(), "members", deps.clusterManager.GetMemberCount(), "leader", deps.clusterManager.GetLeaderID())
 
 		// Initialize affinity manager for cluster-wide user-to-backend affinity. With
 		// [cluster.affinity] enabled = false there is none: proxies with enable_affinity
