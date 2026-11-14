@@ -657,6 +657,19 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
 
+	// Safety guard: Reject if global staging limit is exceeded. Checked before Sieve runs,
+	// as on the Admin API path: the MTA retries a 452, and a refused attempt must not have
+	// sent a vacation reply or charged redirects to the rate limit first.
+	if s.backend.uploader.IsStagingLimitExceeded(int64(len(fullMessageBytes))) {
+		s.WarnLog("rejecting delivery due to upload staging size limit exceeded")
+		recordMetrics("failure")
+		return &smtp.SMTPError{
+			Code:         452,
+			EnhancedCode: smtp.EnhancedCode{4, 3, 1},
+			Message:      "Insufficient system storage",
+		}
+	}
+
 	// SIEVE script processing (BEFORE storing locally)
 	// We need to run Sieve and apply header edits BEFORE storing the message,
 	// so that the stored file has the modified headers
@@ -837,18 +850,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// Check if file already exists to prevent race condition:
 	// If a duplicate arrives while uploader is processing the first copy,
 	// we don't want to overwrite/delete the file the uploader is reading.
-
-	// Safety guard: Reject if global staging limit is exceeded
-	if s.backend.uploader.IsStagingLimitExceeded(int64(len(fullMessageBytes))) {
-		s.WarnLog("rejecting delivery due to upload staging size limit exceeded")
-		recordMetrics("failure")
-		return &smtp.SMTPError{
-			Code:         452,
-			EnhancedCode: smtp.EnhancedCode{4, 3, 1},
-			Message:      "Insufficient system storage",
-		}
-	}
-
 	expectedPath := s.backend.uploader.FilePath(contentHash, s.AccountID())
 	var filePath *string
 	if info, err := os.Stat(expectedPath); os.IsNotExist(err) || (err == nil && info.Size() != int64(len(fullMessageBytes))) {
