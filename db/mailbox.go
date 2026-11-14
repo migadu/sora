@@ -349,17 +349,12 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 	// "INBOX" (RFC 3501 §5.1); other names keep their as-typed case.
 	name = helpers.CanonicalMailboxName(name)
 
-	// Validate mailbox name doesn't contain problematic characters
-	if strings.ContainsAny(name, "\t\r\n\x00") {
-		logger.Error("Database: attempted to create mailbox with invalid characters", "name", name, "account_id", AccountID)
-		return consts.ErrMailboxInvalidName
-	}
-
-	// Reject "." / ".." path segments: such names would let the maildir
-	// exporter escape its target directory (path traversal) when the hierarchy
-	// is materialised on disk.
-	if helpers.MailboxNameHasTraversal(name) {
-		logger.Error("Database: attempted to create mailbox with path traversal segment", "name", name, "account_id", AccountID)
+	// Refuse a name with a TAB, CR, LF or NUL, an empty level ("x//y", "/lead",
+	// "x/", "") or a "." / ".." level. The last would let the maildir exporter
+	// escape its target directory (path traversal) when the hierarchy is
+	// materialised on disk. Callers check first; this covers any later one.
+	if !helpers.MailboxNameValid(name) {
+		logger.Error("Database: attempted to create mailbox with an invalid name", "name", name, "account_id", AccountID)
 		return consts.ErrMailboxInvalidName
 	}
 
@@ -1118,19 +1113,10 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailbox
 }
 
 func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64) error {
-	if newName == "" {
-		return consts.ErrMailboxInvalidName
-	}
-
-	// Validate mailbox name doesn't contain problematic characters
-	if strings.ContainsAny(newName, "\t\r\n\x00") {
-		logger.Error("Database: attempted to rename mailbox to name with invalid characters", "name", newName, "account_id", AccountID)
-		return consts.ErrMailboxInvalidName
-	}
-
-	// Reject "." / ".." path segments to prevent maildir-export path traversal.
-	if helpers.MailboxNameHasTraversal(newName) {
-		logger.Error("Database: attempted to rename mailbox to name with path traversal segment", "name", newName, "account_id", AccountID)
+	// The same names createMailbox refuses: control characters, empty levels and
+	// "." / ".." levels (maildir-export path traversal).
+	if !helpers.MailboxNameValid(newName) {
+		logger.Error("Database: attempted to rename mailbox to an invalid name", "name", newName, "account_id", AccountID)
 		return consts.ErrMailboxInvalidName
 	}
 

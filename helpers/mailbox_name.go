@@ -78,6 +78,14 @@ func MailboxNameToCreate(name string) (string, error) {
 	return name, nil
 }
 
+// MailboxNameValid reports whether name can be stored as a mailbox's name: it is
+// one MailboxNameToCreate accepts as it is, with no trailing hierarchy delimiter to
+// drop. The database layer checks every name it creates or renames to with it.
+func MailboxNameValid(name string) bool {
+	created, err := MailboxNameToCreate(name)
+	return err == nil && created == name
+}
+
 // MailboxNameIsBelow reports whether name is a descendant of ancestor in the
 // mailbox hierarchy. Mailbox names are case-insensitive.
 func MailboxNameIsBelow(name, ancestor string) bool {
