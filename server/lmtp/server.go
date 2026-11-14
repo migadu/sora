@@ -370,36 +370,18 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	backend.defaultSieveScript = compiledDefault
 	logger.Debug("default sieve script parsed and cached", "name", backend.name)
 
-	// Set up TLS config: Support both file-based certificates and global TLS manager
-	// 1. Per-server TLS: cert files provided (for both implicit TLS and STARTTLS)
-	// 2. Global TLS: options.TLS=true, no cert files, global TLS config provided (for both implicit TLS and STARTTLS)
-	// 3. No TLS: options.TLS=false
-	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
-		// Scenario 1: Per-server TLS with explicit cert files
-		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
+	// One TLS config for implicit TLS and STARTTLS; the certificate source and
+	// tls_verify follow the rule every listener shares (server.ListenerTLS).
+	if options.TLS {
+		tlsConfig, err := server.ListenerTLS{
+			Protocol: "LMTP", Name: name,
+			CertFile: options.TLSCertFile, KeyFile: options.TLSKeyFile, Verify: options.TLSVerify,
+			Global: options.TLSConfig, ALPN: []string{"lmtp"},
+		}.Config()
 		if err != nil {
-			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, err
 		}
-		backend.tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			ClientAuth:               tls.NoClientCert,
-			ServerName:               hostname,
-			PreferServerCipherSuites: true,
-			NextProtos:               []string{"lmtp"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-
-		if !options.TLSVerify {
-			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
-			logger.Debug("LMTP: WARNING - Client TLS certificate verification not enforced", "name", name)
-		}
-	} else if options.TLS && options.TLSConfig != nil {
-		// Scenario 2: Global TLS manager (works for both implicit TLS and STARTTLS)
-		backend.tlsConfig = options.TLSConfig
-	} else if options.TLS {
-		// TLS enabled but no cert files and no global TLS config provided
-		return nil, fmt.Errorf("TLS enabled for LMTP [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", name)
+		backend.tlsConfig = tlsConfig
 	}
 
 	s := smtp.NewServer(backend)

@@ -2510,6 +2510,11 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured, but this only applies to IMAP, LMTP, ManageSieve and POP3 servers and proxies", s.Name, s.Type)
 		}
 	}
+	// tls_verify asks the TLS handshake for a client certificate; without TLS
+	// there is no handshake to ask in.
+	if s.TLSVerify && !s.TLS {
+		logger("WARNING: Server %s (type: %s) has 'tls_verify' configured without 'tls = true'; it is ignored and no client certificate is required", s.Name, s.Type)
+	}
 
 	// Check proxy-only options on non-proxy servers
 	if !strings.HasSuffix(s.Type, "_proxy") {

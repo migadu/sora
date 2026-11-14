@@ -254,15 +254,19 @@ Use static certificate files:
 [tls]
 enabled = true
 provider = "file"
+cert_file = "/path/to/cert.pem"
+key_file = "/path/to/key.pem"
 
-# Then configure per-server:
-[[servers]]
+# Then enable TLS per server:
+[[server]]
 type = "imap"
 addr = ":993"
 tls = true
-tls_cert_file = "/path/to/cert.pem"
-tls_key_file = "/path/to/key.pem"
 ```
+
+With `[tls]` enabled, every server type with `tls = true` uses its certificate; a server's own
+`tls_cert_file`/`tls_key_file` are ignored, with a startup warning naming them. `tls_verify = true`
+on a server requires a client certificate on that listener whichever source supplies the server's.
 
 #### Let's Encrypt with Automatic Renewal
 
