@@ -16,6 +16,7 @@ import (
 // and `uploader status` report them all as given up, and `uploader resolve` treats live
 // uploads as written off.
 func TestLoadAdminConfig_DefaultsUploaderMaxAttempts(t *testing.T) {
+	keepBcryptCost(t)
 	want := config.NewDefaultConfig().Uploader.MaxAttempts
 	if want <= 0 {
 		t.Fatalf("test setup: server default max_attempts is %d", want)
@@ -45,13 +46,23 @@ func TestLoadAdminConfig_DefaultsUploaderMaxAttempts(t *testing.T) {
 	}
 }
 
+// keepBcryptCost restores db.BcryptCost when t ends; every test that calls
+// loadAdminConfig takes it. loadAdminConfig applies the file's bcrypt_cost (12 when
+// unset) process-wide, while the integration build of this package hashes at
+// bcrypt.MinCost (integration_tests/common): without the restore every later test
+// that creates an account hashes at cost 12, several times slower (more under -race).
+func keepBcryptCost(t *testing.T) {
+	t.Helper()
+	saved := db.BcryptCost
+	t.Cleanup(func() { db.BcryptCost = saved })
+}
+
 // TestLoadAdminConfig_AppliesBcryptCost (#316): passwords sora-admin hashes (accounts
 // create/update, credentials add) use the top-level bcrypt_cost, as the server's do. With
 // the package default instead, a backend rehashes the password at the user's next login
 // because the cost differs.
 func TestLoadAdminConfig_AppliesBcryptCost(t *testing.T) {
-	saved := db.BcryptCost
-	t.Cleanup(func() { db.BcryptCost = saved })
+	keepBcryptCost(t)
 	defaults := config.NewDefaultConfig()
 
 	for _, tc := range []struct {
