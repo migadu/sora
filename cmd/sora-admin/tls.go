@@ -464,7 +464,13 @@ func tryDecodeDomain(s3Key string) string {
 // server name folded by idna.Lookup.ToASCII (lowercase, Punycode) without a trailing
 // dot, as autocert.Manager.GetCertificate derives it from the TLS ClientHello.
 func autocertName(domain string) (string, error) {
-	name, err := idna.Lookup.ToASCII(strings.TrimSpace(domain))
+	domain = strings.TrimSpace(domain)
+	// Match autocert.Manager.GetCertificate's component check as well as its
+	// normalization. In particular, "." or ".." must never name the cache directory.
+	if !strings.Contains(strings.Trim(domain, "."), ".") {
+		return "", fmt.Errorf("invalid domain %q: server name component count invalid", domain)
+	}
+	name, err := idna.Lookup.ToASCII(domain)
 	if err != nil {
 		return "", fmt.Errorf("invalid domain %q: %w", domain, err)
 	}

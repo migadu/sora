@@ -267,3 +267,16 @@ func TestTLSCacheUsesServerKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestTLSAutocertNameRejectsNonDomainPaths(t *testing.T) {
+	for _, domain := range []string{"", ".", "..", "...", "localhost", "../outside.example.com", "outside.example.com/file"} {
+		t.Run(domain, func(t *testing.T) {
+			if name, err := autocertName(domain); err == nil {
+				t.Fatalf("invalid domain %q became cache file %q", domain, name)
+			}
+		})
+	}
+	if name, err := autocertName("Mail.Example.COM."); err != nil || name != "mail.example.com" {
+		t.Fatalf("trailing-dot normalization = %q, %v", name, err)
+	}
+}
