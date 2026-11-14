@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/cache"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
@@ -46,6 +47,11 @@ const (
 	s3DeleteBatchSize = 500
 )
 
+// vacationHistoryRetention is how long a vacation_responses row is kept: the longest
+// Sieve vacation :days, the period in which a sender "is not responded to" again (RFC
+// 5230 §4.1). A shorter retention would let a second reply out within the period.
+const vacationHistoryRetention = consts.MaxVacationDays * 24 * time.Hour
+
 // DatabaseManager defines the interface for database operations required by the cleaner.
 // This allows for mocking in tests.
 type DatabaseManager interface {
@@ -56,7 +62,7 @@ type DatabaseManager interface {
 	GetStrandedUploadInstancesWithRetry(ctx context.Context, maxAttempts int, livenessThreshold time.Duration) ([]db.StrandedUploadInstance, error)
 	CleanupSoftDeletedAccountsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
 	PurgeSoftDeletedMailboxesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
-	CleanupOldVacationResponsesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
+	CleanupOldVacationResponsesWithRetry(ctx context.Context, olderThan time.Duration) (int64, error)
 	CleanupOldRedirectsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
 	CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error)
@@ -444,8 +450,10 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		logger.Info("Cleanup: Purged soft-deleted mailboxes", "count", purgedMailboxCount)
 	}
 
-	// Clean up old vacation responses.
-	vacationCount, err = w.rdb.CleanupOldVacationResponsesWithRetry(ctx, w.gracePeriod)
+	// Clean up old vacation responses. A row is what stops a second reply to its sender
+	// within the script's :days, so it is kept for the longest :days Sora honours, not
+	// for grace_period, the deletion window of expunged messages.
+	vacationCount, err = w.rdb.CleanupOldVacationResponsesWithRetry(ctx, vacationHistoryRetention)
 	if err != nil {
 		logger.Error("Cleanup: Failed to clean up old vacation responses", "error", err)
 		// Continue with S3 cleanup even if vacation cleanup fails

@@ -172,7 +172,7 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 	mockDB.On("CleanupFailedUploadsWithRetry", ctx, gracePeriod).Return(int64(1), nil).Once()
 	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, gracePeriod).Return(int64(1), nil).Once()
 	mockDB.On("PurgeSoftDeletedMailboxesWithRetry", ctx, mock.Anything).Return(int64(3), nil).Once()
-	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, gracePeriod).Return(int64(2), nil).Once()
+	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, vacationHistoryRetention).Return(int64(2), nil).Once()
 	mockDB.On("CleanupOldRedirectsWithRetry", ctx, gracePeriod).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, healthRetention).Return(int64(20), nil).Once()
 

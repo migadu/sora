@@ -51,6 +51,15 @@ func (db *Database) ClaimVacationResponse(ctx context.Context, tx pgx.Tx, accoun
 	if recent {
 		return false, nil
 	}
+	// The new period supersedes the key's older history: a later claim needs only the
+	// most recent response, and the history is kept for the longest :days, so the
+	// older rows would only make the table grow.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM vacation_responses
+		WHERE account_id = $1 AND sender_address = $2 AND response_identity = $3
+	`, accountID, senderAddress, responseIdentity); err != nil {
+		return false, fmt.Errorf("supersede vacation response history: %w", err)
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO vacation_responses (account_id, sender_address, response_identity, response_date, created_at)
 		VALUES ($1, $2, $3, clock_timestamp(), clock_timestamp())
