@@ -123,8 +123,15 @@ type rekeyedObject struct {
 	committed time.Time
 }
 
+type rekeyDB interface {
+	PendingUploadExistsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error)
+	ExecuteWithS3ObjectLock(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error
+	RekeyContentHashWithRetry(ctx context.Context, accountID int64, obj db.ContentObject, newHash string) (int64, error)
+	IsContentObjectReferencedWithRetry(ctx context.Context, obj db.ContentObject) (bool, error)
+}
+
 type rekeyRun struct {
-	rdb       *resilient.ResilientDatabase
+	rdb       rekeyDB
 	store     objectStorage
 	accountID int64
 	opts      rekeyOptions
