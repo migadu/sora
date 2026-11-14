@@ -1394,14 +1394,17 @@ max_message_size = "50mb"     # Maximum message size (default: 50MB, 0 = unlimit
 # The LMTP server's only connection timeout. absolute_session_timeout, min_bytes_per_minute,
 # auth_idle_timeout and limits.session_memory_limit do not apply to it.
 timeouts.command_timeout = "5m"  # Idle time between commands before 421 and disconnect
-                                 # (default: 5m, the RFC 5321 §4.5.3.2.7 floor; "0" = the default)
+                                 # (default: 5m, the RFC 5321 §4.5.3.2.7 floor; "0" = the default).
+                                 # It also bounds receiving a message: the read deadline set for the
+                                 # DATA command is not extended while the data arrives, so a message
+                                 # that takes longer is refused with 421 and the MTA retries it.
 
 # --- PER-COMMAND EXECUTION TIMEOUTS (optional) ---
 # Hard caps on server-side work, mirroring imap_command_timeouts. On expiry
 # the command answers 4xx and the upstream MTA queues and retries — mail is
 # never lost. The DATA cap covers only the delivery pipeline (SIEVE, spool,
-# DB insert); wire reception from a slow MTA is governed by the read timeout,
-# not this cap. "0" disables a specific cap.
+# DB insert); wire reception from a slow MTA is governed by command_timeout
+# above, not this cap. "0" disables a specific cap.
 # timeouts.lmtp_command_timeouts.rcpt = "10s"  # RCPT (default: 10s, recipient validation)
 # timeouts.lmtp_command_timeouts.data = "60s"  # DATA processing (default: 60s — generous: a cap firing
                                                # after the DB commit but before the 250 reply means the
