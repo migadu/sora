@@ -198,7 +198,9 @@ run after it, so with `[logging] output` set to a file their lines go to that fi
 | An IMAP, POP3 or LMTP server is configured and `[s3] endpoint` is empty | `S3 endpoint not specified` |
 | A server that needs the database is configured and there is no database endpoint (see [section 3](#3-defaults)) | `database is required for configured servers but not configured in [database.write] or [database.read]` |
 | `[servers] trusted_networks` has an entry that is neither an IP address nor a CIDR block | names the invalid entry |
+| A server's `auth_rate_limit.exempt_networks` has an entry that is neither an IP address nor a CIDR block | `server "<name>": auth_rate_limit.exempt_networks has entries that are neither an IP address nor a CIDR: [...]` |
 | `[relay] type` is set to something other than `"smtp"` or `"http"` | `unsupported [relay] type ...` |
+| An IMAP, POP3 or LMTP server is configured and `[cleanup]` has a negative `grace_period`, `max_age_restriction`, `fts_retention` or `health_status_retention`, or an `instance_liveness_threshold` of zero or less | `[cleanup]: <key> must not be negative, got "<value>"` or `[cleanup]: instance_liveness_threshold must be positive, got "<value>"` |
 | `[timeout_scheduler] shard_count` is below -1 | `FATAL: operation 'initialize timeout scheduler' failed: invalid shard count: <n> (must be >= -1)` |
 
 The address check compares the strings, so `":143"` and `"0.0.0.0:143"` pass it and fail later when
@@ -507,7 +509,7 @@ See [STORAGE.md](STORAGE.md) and, for `fts_retention`, [SEARCH.md](SEARCH.md).
 | `max_age_restriction` | duration | none | Expunge messages older than this. Unset means no limit. |
 | `fts_retention` | duration | none | Delete search vectors of messages older than this. Unset keeps them. |
 | `health_status_retention` | duration | `"30d"` | Rows of the `health_status` table not updated for this long are deleted. |
-| `instance_liveness_threshold` | duration | `"7d"` | How long an uploader instance must be silent before its unuploaded messages are reaped. A value of 0 or less means the default. |
+| `instance_liveness_threshold` | duration | `"7d"` | How long an uploader instance must be silent before its unuploaded messages are reaped. Must be positive. |
 | `purge_poll_interval` | duration | `"30s"` | How often the purge worker looks for accounts marked for purging. |
 
 ### 8.8 IMAP METADATA limits (`[metadata]`)

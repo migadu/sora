@@ -2,8 +2,12 @@ package db
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"testing"
+	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -342,4 +346,127 @@ func TestSoftDeleteMailbox_DownMigrationDoesNotOrphanMessages(t *testing.T) {
 		"SELECT COUNT(*) FROM messages WHERE id IN ($1, $2) AND expunged_at IS NOT NULL AND mailbox_path = 'Legacy'",
 		m1, m2).Scan(&preserved))
 	assert.Equal(t, 2, preserved, "down migration must expunge tombstone messages with mailbox_path preserved")
+}
+
+// TestSoftDeleteMailbox_UpdateMessageFlagsReturnsNotFound verifies that once a mailbox
+// is soft-deleted (mailboxes.deleted_at IS NOT NULL), UpdateMessageFlags returns
+// consts.ErrDBNotFound (HTTP 404) — matching GetMessageByID — rather than mutating
+// flags for the owner/writer or returning consts.ErrNotPermitted (HTTP 403) for a
+// read-only shared-mailbox grantee.
+func TestSoftDeleteMailbox_UpdateMessageFlagsReturnsNotFound(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db := setupTestDatabase(t)
+	defer db.Close()
+
+	domain := fmt.Sprintf("softdelflags%d.example.com", time.Now().UnixNano())
+	baseCtx := context.Background()
+	sharedCtx := context.WithValue(baseCtx, consts.ConfigContextKey, &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/"},
+	})
+
+	ownerID, _ := setupAccountWithInbox(t, db, baseCtx, "owner@"+domain)
+	readerEmail := "reader@" + domain
+	readerID, _ := setupAccountWithInbox(t, db, baseCtx, readerEmail)
+	writerEmail := "writer@" + domain
+	writerID, _ := setupAccountWithInbox(t, db, baseCtx, writerEmail)
+
+	const mboxName = "Shared/Project"
+	tx, err := db.GetWritePool().Begin(sharedCtx)
+	require.NoError(t, err)
+	defer tx.Rollback(baseCtx)
+	require.NoError(t, db.CreateMailbox(sharedCtx, tx, ownerID, mboxName, nil))
+	require.NoError(t, tx.Commit(sharedCtx))
+
+	mbox, err := db.GetMailboxByName(sharedCtx, ownerID, mboxName)
+	require.NoError(t, err)
+
+	// Grant read-only ('lr') to reader and read+write ('lrsw') to writer.
+	require.NoError(t, db.GrantMailboxAccessByIdentifier(sharedCtx, ownerID, readerEmail, mboxName, "lr"))
+	require.NoError(t, db.GrantMailboxAccessByIdentifier(sharedCtx, ownerID, writerEmail, mboxName, "lrsw"))
+
+	msgID := insertTestMessage(t, db, ownerID, mbox.ID, mboxName, "FlagTarget", "<flagtarget@example.com>")
+
+	// Sanity check while mailbox is live: reader can read, and attempting to set \Flagged yields ErrNotPermitted.
+	_, err = db.GetMessageByID(baseCtx, readerID, msgID)
+	require.NoError(t, err)
+	err = db.UpdateMessageFlags(baseCtx, readerID, msgID, []string{"\\Flagged"}, nil)
+	require.ErrorIs(t, err, consts.ErrNotPermitted)
+
+	readState := func(t *testing.T) (int, []string) {
+		t.Helper()
+		var flags int
+		var rawCustom []byte
+		require.NoError(t, db.GetWritePool().QueryRow(baseCtx,
+			`SELECT flags, custom_flags FROM message_state WHERE message_id = $1`, msgID).Scan(&flags, &rawCustom))
+		var custom []string
+		if len(rawCustom) > 0 {
+			require.NoError(t, json.Unmarshal(rawCustom, &custom))
+		}
+		return flags, custom
+	}
+	origFlags, origCustom := readState(t)
+
+	// Soft-delete the shared mailbox (leaving its messages unexpunged until background sweep).
+	txDel, err := db.GetWritePool().Begin(sharedCtx)
+	require.NoError(t, err)
+	defer txDel.Rollback(baseCtx)
+	require.NoError(t, db.SoftDeleteMailbox(sharedCtx, txDel, mbox.ID, ownerID))
+
+	// The first lookup can still see this uncommitted mailbox as live. Stop the
+	// flag update at its mailbox lock, then commit the delete: the second read
+	// must recheck visibility rather than mutate the tombstoned message.
+	var deletingPID int
+	require.NoError(t, txDel.QueryRow(baseCtx, `SELECT pg_backend_pid()`).Scan(&deletingPID))
+	updateCtx, cancelUpdate := context.WithTimeout(baseCtx, 10*time.Second)
+	defer cancelUpdate()
+	updateDone := make(chan error, 1)
+	go func() {
+		updateDone <- db.UpdateMessageFlags(updateCtx, ownerID, msgID, []string{"\\Flagged", "Work"}, nil)
+	}()
+	require.Eventually(t, func() bool {
+		var blocked int
+		err := db.GetWritePool().QueryRow(baseCtx, `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE $1 = ANY(pg_blocking_pids(pid))`, deletingPID).Scan(&blocked)
+		return err == nil && blocked > 0
+	}, 5*time.Second, 10*time.Millisecond, "flag update never reached the mailbox lock")
+	require.NoError(t, txDel.Commit(sharedCtx))
+	require.ErrorIs(t, <-updateDone, consts.ErrDBNotFound)
+
+	// GetMessageByID hides the message immediately for everyone.
+	for name, caller := range map[string]int64{"owner": ownerID, "writer": writerID, "reader": readerID} {
+		_, err := db.GetMessageByID(baseCtx, caller, msgID)
+		require.ErrorIs(t, err, consts.ErrDBNotFound, "GetMessageByID for %s on soft-deleted mailbox", name)
+	}
+
+	t.Run("owner gets ErrDBNotFound and does not mutate flags", func(t *testing.T) {
+		err := db.UpdateMessageFlags(baseCtx, ownerID, msgID, []string{"\\Flagged", "Work"}, []string{"\\Seen"})
+		assert.ErrorIs(t, err, consts.ErrDBNotFound)
+
+		gotFlags, gotCustom := readState(t)
+		assert.Equal(t, origFlags, gotFlags, "flags must not be mutated on a soft-deleted mailbox")
+		assert.Equal(t, origCustom, gotCustom, "custom_flags must not be mutated on a soft-deleted mailbox")
+	})
+
+	t.Run("shared writer gets ErrDBNotFound and does not mutate flags", func(t *testing.T) {
+		err := db.UpdateMessageFlags(baseCtx, writerID, msgID, []string{"\\Flagged"}, nil)
+		assert.ErrorIs(t, err, consts.ErrDBNotFound)
+
+		gotFlags, gotCustom := readState(t)
+		assert.Equal(t, origFlags, gotFlags, "flags must not be mutated by shared writer on a soft-deleted mailbox")
+		assert.Equal(t, origCustom, gotCustom, "custom_flags must not be mutated by shared writer on a soft-deleted mailbox")
+	})
+
+	t.Run("shared reader without write right gets ErrDBNotFound instead of ErrNotPermitted", func(t *testing.T) {
+		err := db.UpdateMessageFlags(baseCtx, readerID, msgID, []string{"\\Flagged"}, nil)
+		assert.ErrorIs(t, err, consts.ErrDBNotFound)
+		assert.NotErrorIs(t, err, consts.ErrNotPermitted)
+
+		err = db.UpdateMessageFlags(baseCtx, readerID, msgID, []string{"\\Deleted"}, nil)
+		assert.ErrorIs(t, err, consts.ErrDBNotFound)
+		assert.NotErrorIs(t, err, consts.ErrNotPermitted)
+	})
 }

@@ -98,6 +98,12 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		return nil, fmt.Errorf("failed to lock mailbox stats for move on mailboxes %d and %d: %w", srcMailboxID, destMailboxID, err)
 	}
 
+	// From here to the commit a rekey must not rename a source. The row locks below would
+	// hold it off too, but a rekey waiting for them holds the FTS lock restageFTS needs.
+	if err := lockRekeySources(ctx, tx, srcMailboxID, ids); err != nil {
+		return nil, err
+	}
+
 	// Lock source message rows early (before INSERT triggers) to establish a
 	// consistent lock ordering: mailbox_stats row locks → row locks on source rows.
 	// Every unseen-mutating path (MOVE, EXPUNGE, STORE) acquires the mailbox_stats

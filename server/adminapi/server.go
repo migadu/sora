@@ -1159,10 +1159,16 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	parsedPrimary, err := server.NewAddress(primaryEmail)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid email address: %v", err))
+		return
+	}
+
 	ctx := r.Context()
 
 	// 1. Get the account ID for the primary email address in the path.
-	accountID, err := s.rdb.GetActiveAccountIDByAddressWithRetry(ctx, primaryEmail)
+	accountID, err := s.rdb.GetActiveAccountIDByAddressWithRetry(ctx, parsedPrimary.FullAddress())
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, "Account not found for the specified primary email")
@@ -1233,10 +1239,15 @@ func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetCredential(w http.ResponseWriter, r *http.Request) {
 	email := r.PathValue("email")
+	parsed, err := server.NewAddress(email)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid email address: %v", err))
+		return
+	}
 	ctx := r.Context()
 
 	// Get detailed credential information using the same logic as CLI
-	credentialDetails, err := s.rdb.GetCredentialDetailsWithRetry(ctx, email)
+	credentialDetails, err := s.rdb.GetCredentialDetailsWithRetry(ctx, parsed.FullAddress())
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, err.Error())
@@ -1309,18 +1320,39 @@ func (s *Server) trackers() map[string]*server.ConnectionTracker {
 // account) has its derived ID only. A failed lookup is an error: the derived ID alone
 // would leave the sessions of a database account open.
 func (s *Server) sessionAccountIDs(ctx context.Context, address string) ([]int64, error) {
+	parsed, err := server.NewAddress(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid email address: %w", err)
+	}
+	normalized := parsed.FullAddress()
+	raw := strings.ToLower(strings.TrimSpace(address))
+	derivedIDs := func(extra ...string) []int64 {
+		var ids []int64
+		for _, a := range append(extra, normalized, raw) {
+			if a == "" {
+				continue
+			}
+			if id := proxy.DeriveAccountIDFromEmail(a); !slices.Contains(ids, id) {
+				ids = append(ids, id)
+			}
+		}
+		return ids
+	}
+	if s.rdb == nil {
+		return derivedIDs(), nil
+	}
 	// Revocation must see newly added credentials even while read replicas lag.
 	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-	accountID, addresses, err := s.rdb.GetAccountAddressesWithRetry(ctx, address)
+	accountID, addresses, err := s.rdb.GetAccountAddressesWithRetry(ctx, normalized)
 	if errors.Is(err, consts.ErrUserNotFound) {
-		return []int64{proxy.DeriveAccountIDFromEmail(address)}, nil
+		return derivedIDs(), nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	ids := []int64{accountID}
-	for _, a := range addresses {
-		if id := proxy.DeriveAccountIDFromEmail(a); !slices.Contains(ids, id) {
+	for _, id := range derivedIDs(addresses...) {
+		if !slices.Contains(ids, id) {
 			ids = append(ids, id)
 		}
 	}
@@ -1466,6 +1498,10 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "user_email is required for kick operation")
 		return
 	}
+	if _, err := server.NewAddress(req.UserEmail); err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid email address: %v", err))
+		return
+	}
 
 	trackers := s.trackers()
 	if len(trackers) == 0 {
@@ -1596,6 +1632,12 @@ func (s *Server) handleConnectionStats(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request) {
 	email := r.PathValue("email")
+	parsed, err := server.NewAddress(email)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid email address: %v", err))
+		return
+	}
+	normalizedEmail := parsed.FullAddress()
 
 	trackers := s.trackers()
 	if len(trackers) == 0 {
@@ -1622,12 +1664,15 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 	// Unlike GET /admin/connections, a tracker that knows the account only through
 	// gossip is listed too (local count 0): it reports the sessions on other nodes.
 	var accountID int64 // 0: the database names no account for the address
-	addresses := []string{email}
+	addresses := []string{normalizedEmail}
+	if !strings.EqualFold(normalizedEmail, email) {
+		addresses = append(addresses, email)
+	}
 	if s.rdb != nil {
-		id, accountAddresses, err := s.rdb.GetAccountAddressesWithRetry(r.Context(), email)
+		id, accountAddresses, err := s.rdb.GetAccountAddressesWithRetry(r.Context(), normalizedEmail)
 		switch {
 		case err == nil:
-			accountID, addresses = id, append(accountAddresses, email)
+			accountID, addresses = id, append(accountAddresses, addresses...)
 		case !errors.Is(err, consts.ErrUserNotFound):
 			logger.Warn("HTTP API: Cannot resolve account; listing only the entries created under the address",
 				"name", s.name, "email", email, "error", err)
@@ -2040,6 +2085,11 @@ func (s *Server) handleAuthBlocked(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Request) {
 	email := r.PathValue("email")
+	parsed, err := server.NewAddress(email)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid email address: %v", err))
+		return
+	}
 	ctx := r.Context()
 
 	// Parse query parameters
@@ -2050,7 +2100,7 @@ func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Reques
 
 	// Build parameters
 	params := db.ListDeletedMessagesParams{
-		Email: email,
+		Email: parsed.FullAddress(),
 		Limit: 100, // default limit
 	}
 
@@ -2142,9 +2192,15 @@ func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	parsed, err := server.NewAddress(email)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid email address: %v", err))
+		return
+	}
+
 	// Build parameters
 	params := db.RestoreMessagesParams{
-		Email:       email,
+		Email:       parsed.FullAddress(),
 		MessageIDs:  req.MessageIDs,
 		MailboxPath: req.MailboxPath,
 	}
