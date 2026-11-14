@@ -174,7 +174,7 @@ instead (`Address`, `TotalPending`, `ID`); the sections below name each one.
   `2026-03-01 09:30:00.123456 +0000 UTC`.
 - Nullable times in the upload queue are objects: `{"Time":"...","Valid":true}`.
 
-**Empty lists** are sometimes `[]` and sometimes `null`. Treat both as empty.
+**Empty lists** are `[]`, never `null`.
 
 **Errors** are JSON objects with one field:
 

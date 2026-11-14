@@ -117,7 +117,8 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 	}
 	defer rows.Close()
 
-	var messages []DeletedMessage
+	// Never nil: an empty result is the JSON array [], not null.
+	messages := []DeletedMessage{}
 	for rows.Next() {
 		var msg DeletedMessage
 		err := rows.Scan(
