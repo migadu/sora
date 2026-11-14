@@ -65,6 +65,11 @@ type POP3Session struct {
 	startTime        time.Time
 	memTracker       *server.SessionMemoryTracker // Memory usage tracker for this session
 
+	// trackedClientAddr is the client address this session was registered
+	// with in the connection tracker, so it is unregistered under that key.
+	// Empty when the tracker refused the session: it has nothing to release.
+	trackedClientAddr string
+
 	// Session statistics for summary logging
 	messagesRetrieved int // Messages retrieved with RETR
 	messagesDeleted   int // Messages marked for deletion with DELE
@@ -314,15 +319,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 			// confirm the master SASL username to an attacker.
 			return 0, errAuthFailed
 		}
-		if !settings.masterSASLGate.Allowed(netConn.RemoteAddr()) {
-			s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(netConn.RemoteAddr()))
-			// Recorded exactly like a wrong master password: this site is reachable ONLY
-			// with the correct one, so a failure the credential is not charged for
-			// diverges from a wrong password at the block threshold and confirms the
-			// guess. The master-username gate below already did this.
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
+		if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master SASL") {
 			return 0, errAuthFailed
 		}
 		s.DebugLog("master sasl password authentication successful", "base_address", identity)
@@ -393,11 +390,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		// Master username authentication: user@domain.com@MASTER_USERNAME
 		if len(s.server.masterUsername) > 0 && userAddress.HasSuffix() && checkMasterCredential(userAddress.Suffix(), s.server.masterUsername) {
 			if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
-				if !settings.masterSASLGate.Allowed(netConn.RemoteAddr()) {
-					s.WarnLog("master username credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(netConn.RemoteAddr()))
-					if s.server.authLimiter != nil {
-						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-					}
+				if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
 					return 0, errAuthFailed
 				}
 				s.DebugLog("master username authentication successful", "base_address", userAddress.BaseAddress(), "master_username", userAddress.Suffix())
@@ -1242,25 +1235,28 @@ func (s *POP3Session) registerConnection(email string) {
 		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
 		defer cancel()
 
-		clientAddr := server.GetAddrString(s.conn.RemoteAddr())
+		// The client's address, not the TCP peer: behind a proxy the peer is
+		// the proxy for every client. RemoteIP already holds the address from
+		// the PROXY header or a trusted proxy's XCLIENT (refused after login).
+		clientAddr := s.RemoteIP
 
 		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "POP3", clientAddr); err != nil {
 			s.InfoLog("rejected connection registration", "error", err)
+			return
 		}
+		s.trackedClientAddr = clientAddr
 	}
 }
 
 // unregisterConnection removes the connection from the connection tracker
 func (s *POP3Session) unregisterConnection() {
-	if s.server.connTracker != nil && s.authenticated.Load() {
+	if s.server.connTracker != nil && s.authenticated.Load() && s.trackedClientAddr != "" {
 		// Use configured database query timeout for connection tracking (database DELETE)
 		queryTimeout := s.server.rdb.GetQueryTimeout()
 		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 		defer cancel()
 
-		clientAddr := server.GetAddrString(s.conn.RemoteAddr())
-
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "POP3", clientAddr); err != nil {
+		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "POP3", s.trackedClientAddr); err != nil {
 			s.DebugLog("failed to unregister connection", "error", err)
 		}
 	}

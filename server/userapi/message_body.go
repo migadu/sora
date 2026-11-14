@@ -118,13 +118,20 @@ func (s *Server) readStagedBody(message *db.DBMessage) ([]byte, bool) {
 // still lease, or a row already marked uploaded elsewhere, means the body is on its way.
 // A database error counts as pending (a retry is safer than "gone"). Reads the master:
 // the pending row and the message row committed together.
+//
+// A node without its own uploader (User API only) takes max_attempts from [uploader]:
+// a row the uploaders gave up on is never leased again, so "retry later" would be
+// answered until the cleaner reaps it.
 func (s *Server) bodyUploadStillPending(ctx context.Context, message *db.DBMessage) bool {
 	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	var pending bool
 	var err error
-	if s.uploader != nil {
+	switch {
+	case s.uploader != nil:
 		pending, err = s.rdb.PendingUploadRetryableWithRetry(ctx, message.ContentHash, message.AccountID, s.uploader.MaxAttempts())
-	} else {
+	case s.uploadMaxAttempts > 0:
+		pending, err = s.rdb.PendingUploadRetryableWithRetry(ctx, message.ContentHash, message.AccountID, s.uploadMaxAttempts)
+	default:
 		pending, err = s.rdb.PendingUploadExistsWithRetry(ctx, message.ContentHash, message.AccountID)
 	}
 	if err != nil {

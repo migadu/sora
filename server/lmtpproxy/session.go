@@ -871,10 +871,10 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				"method", "cache",
 				"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
-			// The same decision a fresh miss makes (tempfail configured, or no
-			// healthy backend to verify against) — a cache hit must not bounce
-			// where the miss would have deferred.
-			return s.userNotFoundError()
+			// The reply a fresh lookup from the same source gives now: a remote
+			// lookup negative gets the reply its 404 got, a database negative is
+			// still deferred while no default-pool backend is healthy.
+			return s.userNotFoundError(cached.FromRemoteLookup)
 		} else {
 			// User found - use cached routing info
 			metrics.CacheOperationsTotal.WithLabelValues("get", "hit").Inc()
@@ -1002,17 +1002,15 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 					"response", response)
 				metrics.RemoteLookupResult.WithLabelValues("lmtp", "user_not_found_"+response).Inc()
 
-				// Cache negative result to protect remotelookup
+				// Cache negative result to protect remotelookup. FromRemoteLookup lets a
+				// cache hit give the reply given here (userNotFoundError).
 				s.server.lookupCache.Set(s.server.name, originalAddress, &lookupcache.CacheEntry{
-					Result:     lookupcache.AuthUserNotFound,
-					IsNegative: true,
+					Result:           lookupcache.AuthUserNotFound,
+					IsNegative:       true,
+					FromRemoteLookup: true,
 				})
 
-				// Return appropriate error based on configuration
-				if response == "tempfail" {
-					return server.ErrUserNotFoundTempFail
-				}
-				return server.ErrUserNotFound
+				return s.userNotFoundError(true)
 			}
 		}
 	} else {
@@ -1815,14 +1813,22 @@ func (s *Session) forwardSimpleCommand(command string) (reply string, ok bool) {
 }
 
 // userNotFoundError is the error for a recipient known not to exist, whether the
-// knowledge is fresh or cached. It re-runs the decision the fresh lookup makes, so a
-// negative-cache hit can neither turn a configured tempfail into a bounce nor bypass the
-// all-backends-down guard (a proxy that cannot verify anything must not bounce).
-func (s *Session) userNotFoundError() error {
-	if !s.server.connManager.HasHealthyPoolBackends() {
-		return server.ErrUserNotFoundTempFail
+// knowledge is fresh or cached, so that a negative-cache hit gets the reply the fresh
+// lookup gave. fromRemoteLookup says who reported the recipient unknown:
+//   - the remote lookup, the authority on its users: 550, or 450 when
+//     user_not_found_response = "tempfail". Backend health does not enter into it.
+//   - the proxy's own database, which may lag the backends: 550 only while a backend
+//     of the default pool is healthy, else 450 (a proxy that cannot verify anything
+//     must not bounce). user_not_found_response does not apply to the database
+//     fallback.
+func (s *Session) userNotFoundError(fromRemoteLookup bool) error {
+	if fromRemoteLookup {
+		if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.GetUserNotFoundResponse() == "tempfail" {
+			return server.ErrUserNotFoundTempFail
+		}
+		return server.ErrUserNotFound
 	}
-	if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.GetUserNotFoundResponse() == "tempfail" {
+	if !s.server.connManager.HasHealthyPoolBackends() {
 		return server.ErrUserNotFoundTempFail
 	}
 	return server.ErrUserNotFound

@@ -3,7 +3,6 @@ package userapi
 import (
 	"errors"
 	"net/http"
-	"net/url"
 	"strconv"
 
 	"github.com/migadu/sora/logger"
@@ -31,8 +30,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract mailbox name from path: /user/mailboxes/{name}/messages
-	mailboxName := extractPathParam(r.URL.Path, "/user/mailboxes/", "/messages")
-	mailboxName, err = url.QueryUnescape(mailboxName)
+	mailboxName, err := pathName(r, "/user/mailboxes/", "/messages")
 	if err != nil || mailboxName == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
 		return
@@ -114,8 +112,7 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract mailbox name from path: /user/mailboxes/{name}/search
-	mailboxName := extractPathParam(r.URL.Path, "/user/mailboxes/", "/search")
-	mailboxName, err = url.QueryUnescape(mailboxName)
+	mailboxName, err := pathName(r, "/user/mailboxes/", "/search")
 	if err != nil || mailboxName == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
 		return
