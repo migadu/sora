@@ -179,17 +179,14 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	if opts.RemoteLookup.Enabled {
 		remotelookupClient, err := proxy.InitializeRemoteLookup("lmtp", opts.RemoteLookup, opts.RemotePort)
 		if err != nil {
-			logger.Debug("LMTP Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
-			if !opts.RemoteLookup.ShouldLookupLocalUsers() {
-				cancel()
-				return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
-			}
-			logger.Debug("LMTP Proxy: Continuing without remotelookup - local lookup enabled", "name", opts.Name)
-		} else {
-			routingLookup = remotelookupClient
-			if opts.Debug {
-				logger.Debug("LMTP Proxy: RemoteLookup client initialized successfully", "name", opts.Name)
-			}
+			// Also with lookup_local_users, which adds the database for the users the
+			// lookup does not know and does not make the lookup optional.
+			cancel()
+			return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
+		}
+		routingLookup = remotelookupClient
+		if opts.Debug {
+			logger.Debug("LMTP Proxy: RemoteLookup client initialized successfully", "name", opts.Name)
 		}
 	}
 

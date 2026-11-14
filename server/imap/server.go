@@ -1984,11 +1984,9 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 			// one: the stored data is at fault, and only an administrator can repair it.
 			// Answered like a database outage, as the proxies do: a temporary failure,
 			// not counted as a failed login (a block earned on it would outlast the
-			// repair), nothing cached. A login cached for this address was verified
-			// against another hash than the one now stored, so it is dropped: while it
-			// stays, every password that misses it is answered here, uncounted, and the
-			// cached one still signs in. VerifyPassword logged why, without the address.
-			s.lookupCache.Invalidate(address)
+			// repair), nothing cached. A cached login this password missed was dropped
+			// before the database was asked (LookupCache.Authenticate), so it cannot
+			// answer the next guess. VerifyPassword logged why, without the address.
 			logger.Warn("authentication unavailable", "address", address, "reason", "unverifiable_hash", "method", "main_db", "error", err)
 			return 0, fmt.Errorf("%w: %w", serverPkg.ErrAuthServiceUnavailable, err)
 		}

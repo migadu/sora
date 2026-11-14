@@ -198,12 +198,10 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Initialize remotelookup client if configured
 	routingLookup, err := proxy.InitializeRemoteLookup("managesieve", opts.RemoteLookup, opts.RemotePort)
 	if err != nil {
-		logger.Debug("ManageSieve Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
-		if opts.RemoteLookup != nil && !opts.RemoteLookup.ShouldLookupLocalUsers() {
-			cancel()
-			return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
-		}
-		logger.Debug("ManageSieve Proxy: Continuing without remotelookup - local lookup enabled", "name", opts.Name)
+		// Also with lookup_local_users, which adds the database for the users the
+		// lookup does not know and does not make the lookup optional.
+		cancel()
+		return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
 	}
 	// Create connection manager with routing
 	connManager, err := proxy.NewConnectionManagerFromOptions(proxy.ManagerOptions{
