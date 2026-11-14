@@ -268,6 +268,14 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// notifyRelayWorker wakes the relay worker so a redirect or vacation reply a delivery
+// queued goes out at once, as on LMTP, instead of on the worker's next pass.
+func (s *Server) notifyRelayWorker() {
+	if s.relayWorker != nil {
+		s.relayWorker.NotifyQueued()
+	}
+}
+
 // deliverToRecipient delivers a message to a single recipient using the delivery package
 func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest, recipient string, messageBytes []byte, _ *message.Entity) RecipientStatus {
 	status := RecipientStatus{
@@ -287,17 +295,19 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 		RelayQueue:     s.relayQueue,
 		Logger:         logger,
 		IsOwnedAddress: s.rdb.IsAddressOwnedByAccountWithRetry,
+		RelayNotify:    s.notifyRelayWorker,
 	}
 
 	deliveryCtx := &delivery.DeliveryContext{
-		Ctx:          ctx,
-		RDB:          s.rdb,
-		Uploader:     s.uploader,
-		Hostname:     s.hostname,
-		InstanceID:   s.instanceID,
-		FTSRetention: s.ftsRetention,
-		MetricsLabel: "http_delivery",
-		Logger:       logger,
+		Ctx:             ctx,
+		RDB:             s.rdb,
+		Uploader:        s.uploader,
+		Hostname:        s.hostname,
+		InstanceID:      s.instanceID,
+		FTSRetention:    s.ftsRetention,
+		MetricsLabel:    "http_delivery",
+		Logger:          logger,
+		SharedMailboxes: s.sharedMailboxes,
 	}
 
 	sieveExecutor := &delivery.StandardSieveExecutor{
@@ -305,6 +315,7 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 		VacationOracle:     vacationOracle,
 		VacationHandler:    vacationHandler,
 		RelayQueue:         s.relayQueue,
+		RelayNotify:        s.notifyRelayWorker,
 		RedirectRateLimit:  s.redirectRateLimit,
 		RedirectRateWindow: s.redirectRateWindow,
 		MaxRedirectHops:    s.maxRedirectHops,

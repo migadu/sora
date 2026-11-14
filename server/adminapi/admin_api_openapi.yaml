@@ -220,37 +220,65 @@ components:
 
     ConnectionInfo:
       type: object
+      description: "An account with sessions on one of this node's connection trackers: one entry per account and tracker, not per session. Accounts this node knows only through gossip are not listed."
       properties:
-        ID:
-          type: integer
-          format: int64
-        AccountID:
-          type: integer
-          format: int64
-        Protocol:
+        protocol:
           type: string
+          description: "The tracker key up to its first dash."
           example: "IMAP"
-        ClientAddr:
+        instance:
           type: string
-          example: "192.168.1.100:54321"
-        ServerAddr:
+          description: "The tracker key: <PROTOCOL>-<server name> on a backend, <PROTOCOL>-<cluster node_id>-<server name> on a proxy (the host name in place of the node_id outside cluster mode, where the LMTP proxy is the only proxy that tracks sessions)."
+          example: "IMAP-node1-imap-proxy"
+        account_id:
+          type: integer
+          format: int64
+          example: 123
+        email:
           type: string
-          example: "10.0.1.10:143"
-        InstanceID:
-          type: string
-          example: "sora-instance-1"
-        ConnectedAt:
-          type: string
-          format: date-time
-        LastActivity:
-          type: string
-          format: date-time
-        ShouldTerminate:
-          type: boolean
-        Email:
-          type: string
-          format: email
+          description: "The address of the session that created the entry: the login address, or the recipient on an LMTP proxy."
           example: "user@example.com"
+        local_count:
+          type: integer
+          description: "The account's sessions on this tracker."
+          example: 2
+        total_count:
+          type: integer
+          description: "local_count plus the account's sessions on the same protocol that other nodes' trackers report through gossip. Backends and LMTP proxies do not gossip, so there it equals local_count."
+          example: 3
+        last_update:
+          type: string
+          format: date-time
+          description: "When the tracker last updated the entry: a session opened or closed, or gossip about the account arrived (including the periodic full-state exchange, which changes no count)."
+
+    UserConnectionInfo:
+      type: object
+      description: "The account on one of this node's connection trackers. Unlike ConnectionInfo, protocol is the whole tracker key, and a tracker that knows the account only through gossip is listed too, with local_count 0."
+      properties:
+        protocol:
+          type: string
+          description: "The tracker key: <PROTOCOL>-<server name> on a backend, <PROTOCOL>-<cluster node_id>-<server name> on a proxy (the host name in place of the node_id outside cluster mode, where the LMTP proxy is the only proxy that tracks sessions)."
+          example: "IMAP-node1-imap-proxy"
+        account_id:
+          type: integer
+          format: int64
+          example: 123
+        email:
+          type: string
+          description: "The address of the session that created the entry: the login address, or the recipient on an LMTP proxy."
+          example: "user@example.com"
+        local_count:
+          type: integer
+          description: "The account's sessions on this tracker."
+          example: 2
+        total_count:
+          type: integer
+          description: "local_count plus the account's sessions on the same protocol that other nodes' trackers report through gossip. Backends and LMTP proxies do not gossip, so there it equals local_count."
+          example: 3
+        last_update:
+          type: string
+          format: date-time
+          description: "When the tracker last updated the entry: a session opened or closed, or gossip about the account arrived (including the periodic full-state exchange, which changes no count)."
 
     ConnectionStats:
       type: object
@@ -261,7 +289,7 @@ components:
           example: 150
         connections_by_protocol:
           type: object
-          description: "total_connections per connection tracker, keyed <PROTOCOL>-<server name> on a backend and <PROTOCOL>-<host name>-<server name> on a proxy."
+          description: "total_connections per connection tracker, keyed <PROTOCOL>-<server name> on a backend and <PROTOCOL>-<cluster node_id>-<server name> on a proxy (the host name in place of the node_id outside cluster mode)."
           additionalProperties:
             type: integer
           example:
@@ -1095,6 +1123,9 @@ paths:
             - Missing required field `email`
             - Neither `password` nor `password_hash` provided
             - Both `password` and `password_hash` provided (only one allowed)
+            - An invalid email address
+            - A `password` longer than 72 bytes hashed with bcrypt (the default), bcrypt's limit
+            - In a `credentials` array: no or several `is_primary` entries, the same address twice, or an unknown `hash_type`
           content:
             application/json:
               schema:
@@ -1113,7 +1144,7 @@ paths:
                   value:
                     error: "Cannot specify both password and password_hash"
         '409':
-          description: Account with this email already exists.
+          description: An address already belongs to an account, or to a deleted account still in its grace period (restore or purge it first).
           content:
             application/json:
               schema:
@@ -1215,6 +1246,8 @@ paths:
             Invalid request body. Common causes:
             - Neither `password` nor `password_hash` provided
             - Both `password` and `password_hash` provided (only one allowed)
+            - An invalid email address in the path
+            - A `password` longer than 72 bytes (bcrypt's limit)
           content:
             application/json:
               schema:
@@ -1763,10 +1796,11 @@ paths:
     get:
       tags:
         - Connection Management
-      summary: List all active connections
+      summary: List the accounts with sessions on this node
+      description: One entry per account and connection tracker on this node; local_count is the number of sessions.
       responses:
         '200':
-          description: A list of active connections.
+          description: The accounts with sessions on this node's connection trackers.
           content:
             application/json:
               schema:
@@ -1778,6 +1812,13 @@ paths:
                       $ref: '#/components/schemas/ConnectionInfo'
                   count:
                     type: integer
+                    description: Number of entries in connections.
+                  source:
+                    type: string
+                    example: "in-memory connection tracker"
+                  note:
+                    type: string
+                    description: Present, with no entries, when this node has no connection trackers.
         '500':
           description: Internal server error.
           content:
@@ -1846,6 +1887,7 @@ paths:
       tags:
         - Connection Management
       summary: Get connections for a specific user
+      description: One entry per connection tracker on this node that knows the account, matched case-insensitively against the entry's email, so an account whose entry was created by an alias login is found only under that alias.
       parameters:
         - name: email
           in: path
@@ -1855,7 +1897,7 @@ paths:
             format: email
       responses:
         '200':
-          description: A list of connections for the user.
+          description: The user's entries on this node's connection trackers.
           content:
             application/json:
               schema:
@@ -1867,9 +1909,16 @@ paths:
                   connections:
                     type: array
                     items:
-                      $ref: '#/components/schemas/ConnectionInfo'
+                      $ref: '#/components/schemas/UserConnectionInfo'
                   count:
                     type: integer
+                    description: Number of entries in connections.
+                  source:
+                    type: string
+                    example: "in-memory connection tracker"
+                  note:
+                    type: string
+                    description: Present, with no entries, when this node has no connection trackers.
         '500':
           description: Internal server error.
           content:
@@ -2375,8 +2424,9 @@ paths:
         Returns no counters. Failed logins are tracked in memory by each server's
         authentication rate limiter, per address, and expire on their own; this endpoint
         answers the same fixed description of that tracking on every call. For the
-        addresses blocked right now use GET /auth/blocked. Attempt counts are exported
-        as the Prometheus counter sora_authentication_attempts_total.
+        addresses blocked right now use GET /auth/blocked. IMAP, POP3 and ManageSieve
+        attempt counts (servers and proxies) are exported as the Prometheus counter
+        sora_authentication_attempts_total; User API logins are not counted there.
 
         Query parameters are ignored; the window parameter of older versions is still
         accepted.

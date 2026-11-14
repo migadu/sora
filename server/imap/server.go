@@ -330,7 +330,7 @@ type IMAPServer struct {
 	idSupportURL string
 
 	// Command timeout and throughput enforcement
-	authIdleTimeout time.Duration    // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
+	authIdleTimeout time.Duration    // Idle timeout during authentication phase (pre-auth only, 0 = go-imap default of 30s)
 	commandTimeouts *CommandTimeouts // Per-command hard execution timeouts (nil = use defaults)
 
 	// The settings ReloadConfig replaces; see reloadableSettings.
@@ -409,7 +409,7 @@ type IMAPServerOptions struct {
 	MetadataMaxEntriesPerServer  int
 	MetadataMaxTotalSize         int
 	// Command timeout and throughput enforcement
-	AuthIdleTimeout         time.Duration            // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
+	AuthIdleTimeout         time.Duration            // Idle timeout during authentication phase (pre-auth only, 0 = go-imap default of 30s)
 	CommandTimeout          time.Duration            // Maximum idle time before disconnection
 	CommandTimeoutOverrides map[string]time.Duration // Per-command hard execution timeouts (overrides defaults)
 	AbsoluteSessionTimeout  time.Duration            // Maximum total session duration (0 = no absolute limit)
@@ -704,6 +704,11 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 
 		// Only add the filter if all regex patterns are valid
 		if isValid {
+			for _, capStr := range filter.DisableCaps {
+				if _, ok := alwaysAdvertisedCaps[imap.Cap(capStr)]; ok {
+					logger.Warn("IMAP: Capability filter cannot disable capability, go-imap always advertises it with IMAP4rev1", "name", name, "capability", capStr, "reason", filter.Reason)
+				}
+			}
 			validFilters = append(validFilters, filter)
 		}
 	}
@@ -721,7 +726,9 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// Remove globally disabled capabilities from the server
 	if len(options.DisabledCaps) > 0 {
 		for _, capStr := range options.DisabledCaps {
-			if !s.caps.Has(imap.Cap(capStr)) {
+			if _, ok := alwaysAdvertisedCaps[imap.Cap(capStr)]; ok {
+				logger.Warn("IMAP: Cannot disable capability, go-imap always advertises it with IMAP4rev1", "name", name, "capability", capStr)
+			} else if !s.caps.Has(imap.Cap(capStr)) {
 				logger.Debug("IMAP: WARNING - Cannot disable capability, not found in defaults", "name", name, "capability", capStr)
 			}
 		}
@@ -853,6 +860,10 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		NewSession:   s.newSession,
 		Logger:       log.Default(),
 		InsecureAuth: options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured
+		// go-imap owns the read deadline and re-arms it before every command;
+		// this is its wait for the next command until the client has
+		// authenticated. Afterwards SoraConn's checker applies command_timeout.
+		AuthIdleTimeout: s.authIdleTimeout,
 		// IsTLS unwraps Sora's connection layers (connectionLimitingConn ->
 		// SoraTLSConn -> *tls.Conn) to detect implicit TLS. Without it, go-imap's
 		// default `conn.(*tls.Conn)` assertion fails on our wrapped connections
@@ -969,13 +980,6 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 
 	// Extract underlying net.Conn for setting timeouts and proxy protocol handling
 	netConn := conn.NetConn()
-
-	// Set auth idle timeout if configured (applies during pre-auth phase only)
-	if s.authIdleTimeout > 0 {
-		if err := netConn.SetReadDeadline(time.Now().Add(s.authIdleTimeout)); err != nil {
-			logger.Warn("IMAP: Failed to set auth idle timeout", "name", s.name, "error", err)
-		}
-	}
 
 	// Initialize session with full server capabilities
 	// These will be filtered in GetCapabilities() when JA4 fingerprint becomes available
@@ -1741,6 +1745,21 @@ func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, client
 	return disabledCaps
 }
 
+// alwaysAdvertisedCaps are the capabilities go-imap lists on every IMAP4rev1
+// server whatever the configured set holds (imapserver availableCaps: SASL-IR
+// and LITERAL- before login, UNSELECT, ENABLE and UTF8=ACCEPT after it), so
+// neither disabled_caps nor client_filters can withdraw them. All but
+// UTF8=ACCEPT are implied by IMAP4rev2, and LITERAL- also by LITERAL+:
+// removing those for them would downgrade the server and leave them advertised
+// all the same.
+var alwaysAdvertisedCaps = imap.CapSet{
+	imap.CapSASLIR:       {},
+	imap.CapLiteralMinus: {},
+	imap.CapUnselect:     {},
+	imap.CapEnable:       {},
+	imap.CapUTF8Accept:   {},
+}
+
 // disableCapabilities removes the named capabilities from caps and returns
 // the ones it removed. go-imap's CapSet.Has also reports a capability that
 // another one in the set implies, and builds both the CAPABILITY response and
@@ -1750,11 +1769,15 @@ func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, client
 // left such a capability advertised and usable, so whatever implies it is
 // removed too. For IMAP4rev2 that downgrades the server or session to
 // IMAP4rev1, where go-imap lists each remaining extension on its own. The
-// implication test is go-imap's own Has, so it follows the library.
+// implication test is go-imap's own Has, so it follows the library. A name in
+// alwaysAdvertisedCaps is skipped: nothing removed here can withdraw it.
 func disableCapabilities(caps imap.CapSet, names []string) []string {
 	var removed []string
 	for _, name := range names {
 		c := imap.Cap(name)
+		if _, ok := alwaysAdvertisedCaps[c]; ok {
+			continue
+		}
 		if _, ok := caps[c]; ok {
 			delete(caps, c)
 			removed = append(removed, name)

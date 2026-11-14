@@ -230,28 +230,28 @@ type ClusterConfig struct {
 	Affinity          ClusterAffinityConfig      `toml:"affinity"`             // Server affinity configuration
 }
 
+// splitClusterAddr splits addr into host and port. addr is a host or IP address,
+// IPv6 bare or bracketed ("2001:db8::40", "[2001:db8::40]"), with an optional
+// port ("10.0.0.40:7946", "[2001:db8::40]:7946"). port is "" when addr has none.
+func splitClusterAddr(addr string) (host, port string) {
+	if h, p, err := net.SplitHostPort(addr); err == nil {
+		return h, p
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]"), ""
+}
+
 // GetBindAddr returns the bind address by parsing the addr field
 func (c *ClusterConfig) GetBindAddr() string {
-	if c.Addr == "" {
-		return ""
-	}
-	// Parse addr to extract just the IP (not port)
-	if strings.Contains(c.Addr, ":") {
-		parts := strings.Split(c.Addr, ":")
-		return parts[0]
-	}
-	return c.Addr
+	host, _ := splitClusterAddr(c.Addr)
+	return host
 }
 
 // GetBindPort returns the bind port from addr or the port field
 func (c *ClusterConfig) GetBindPort() int {
 	// If addr contains a port, use that
-	if c.Addr != "" && strings.Contains(c.Addr, ":") {
-		parts := strings.Split(c.Addr, ":")
-		if len(parts) == 2 {
-			if port, err := strconv.Atoi(parts[1]); err == nil {
-				return port
-			}
+	if _, p := splitClusterAddr(c.Addr); p != "" {
+		if port, err := strconv.Atoi(p); err == nil {
+			return port
 		}
 	}
 
@@ -277,6 +277,7 @@ type TLSLetsEncryptS3Config struct {
 	Bucket     string `toml:"bucket"`      // S3 bucket for certificate storage
 	Endpoint   string `toml:"endpoint"`    // S3-compatible storage endpoint (default: "s3.amazonaws.com")
 	DisableTLS bool   `toml:"disable_tls"` // Disable TLS for S3 endpoint (useful for local MinIO setups)
+	Region     string `toml:"region"`      // Signing region (default: AWS_REGION or the shared AWS config, else "us-east-1")
 	Debug      bool   `toml:"debug"`       // Enable detailed S3 request/response tracing
 	AccessKey  string `toml:"access_key"`  // AWS credentials (optional, uses default chain)
 	SecretKey  string `toml:"secret_key"`  // AWS credentials (optional)
@@ -1266,7 +1267,7 @@ func (s *SieveConfig) GetMaxExecutionTime() time.Duration {
 // restarts and prevent thundering herd on the PostgreSQL database.
 type AuthCacheConfig struct {
 	Enabled         bool   `toml:"enabled"`          // Enable persistent auth cache (default: false)
-	Path            string `toml:"path"`             // SQLite database path (default: "/tmp/sora/auth_cache.db")
+	Path            string `toml:"path"`             // SQLite database path (default: DefaultAuthCachePath)
 	MaxAge          string `toml:"max_age"`          // Max age for cached entries (default: "24h")
 	CleanupInterval string `toml:"cleanup_interval"` // How often to purge old entries (default: "1h")
 	PurgeUnused     string `toml:"purge_unused"`     // Purge entries unused for this duration (default: "168h" = 7 days)
@@ -1432,6 +1433,20 @@ func (c *Config) GetBcryptCost() int {
 	return cost
 }
 
+// Default local paths. Nothing sora must keep across a restart defaults to /tmp: a
+// staged upload is the only copy of its message body until it reaches S3, and /tmp is
+// emptied at boot on most systems and on every stop under systemd's PrivateTmp=. The
+// directories match dist/sora.service (/var/spool/sora, CacheDirectory=sora).
+const (
+	DefaultUploaderPath   = "/var/spool/sora/uploads"
+	DefaultLocalCachePath = "/var/cache/sora/cache"
+	DefaultAuthCachePath  = "/var/cache/sora/auth_cache.db"
+
+	// LegacyDefaultUploaderPath is the [uploader] path default of earlier releases.
+	// Bodies a node staged there are stranded if it starts with the new default.
+	LegacyDefaultUploaderPath = "/tmp/sora/uploads"
+)
+
 // NewDefaultConfig creates a Config struct with default values.
 func NewDefaultConfig() Config {
 	return Config{
@@ -1489,7 +1504,7 @@ func NewDefaultConfig() Config {
 		LocalCache: LocalCacheConfig{
 			Capacity:           "1gb",
 			MaxObjectSize:      "5mb",
-			Path:               "/tmp/sora/cache",
+			Path:               DefaultLocalCachePath,
 			MetricsInterval:    "5m",
 			MetricsRetention:   "30d",
 			PurgeInterval:      "12h",
@@ -1498,6 +1513,9 @@ func NewDefaultConfig() Config {
 			WarmupMessageCount: 50,
 			WarmupMailboxes:    []string{"INBOX"},
 			WarmupAsync:        true,
+		},
+		AuthCache: AuthCacheConfig{
+			Path: DefaultAuthCachePath,
 		},
 		Metadata: MetadataConfig{
 			MaxEntrySize:         65536,   // 64KB per entry
@@ -1520,11 +1538,19 @@ func NewDefaultConfig() Config {
 			TrustedNetworks: nil,
 		},
 		Uploader: UploaderConfig{
-			Path:          "/tmp/sora/uploads",
+			Path:          DefaultUploaderPath,
 			BatchSize:     10,
 			Concurrency:   20,
 			MaxAttempts:   DefaultUploaderMaxAttempts,
 			RetryInterval: "30s",
+		},
+		Cluster: ClusterConfig{
+			// Only read with [cluster] enabled; on by default as documented.
+			RateLimitSync: ClusterRateLimitSyncConfig{
+				Enabled:           true,
+				SyncBlocks:        true,
+				SyncFailureCounts: true,
+			},
 		},
 	}
 }
@@ -2579,10 +2605,19 @@ func TrustedNetworksHaveBroadPrivateRanges(networks []string) bool {
 //
 // All other syntax errors will cause the server to fail with helpful error messages
 func LoadConfigFromFile(configPath string, cfg *Config) error {
+	_, err := LoadConfigFromFileWithMetadata(configPath, cfg)
+	return err
+}
+
+// LoadConfigFromFileWithMetadata is LoadConfigFromFile that also returns the file's TOML
+// metadata. cfg is usually seeded by NewDefaultConfig, so after the load a value equal to
+// its default may be the default or may be set by the file; MetaData.IsDefined tells them
+// apart.
+func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaData, error) {
 	// Read the file content first
 	content, err := os.ReadFile(configPath)
 	if err != nil {
-		return err
+		return toml.MetaData{}, err
 	}
 
 	// Try to decode - capture metadata to check for unknown keys
@@ -2600,17 +2635,17 @@ func LoadConfigFromFile(configPath string, cfg *Config) error {
 			cleanedContent, cleanErr := removeDuplicateKeysFromTOML(string(content))
 			if cleanErr != nil {
 				// If we can't clean it, return a helpful error
-				return enhanceConfigError(err)
+				return toml.MetaData{}, enhanceConfigError(err)
 			}
 
 			// Try decoding the cleaned content
 			metadata, err = toml.Decode(cleanedContent, cfg)
 			if err != nil {
-				return enhanceConfigError(err)
+				return toml.MetaData{}, enhanceConfigError(err)
 			}
 		} else {
 			// For other errors, provide enhanced error messages
-			return enhanceConfigError(err)
+			return toml.MetaData{}, enhanceConfigError(err)
 		}
 	}
 
@@ -2629,7 +2664,7 @@ func LoadConfigFromFile(configPath string, cfg *Config) error {
 	// Apply default values for fields where the Go zero value differs from the desired default
 	applyConfigDefaults(cfg)
 
-	return nil
+	return metadata, nil
 }
 
 // applyConfigDefaults sets default values for config fields where the desired default

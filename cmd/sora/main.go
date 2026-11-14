@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/affinitycache"
 	"github.com/migadu/sora/authcache"
 	"github.com/migadu/sora/cache"
@@ -188,10 +189,6 @@ func main() {
 	// Load and validate configuration
 	loadAndValidateConfig(*configPath, &cfg, errorHandler)
 
-	// Clean up default database config if user explicitly set empty sections
-	// This allows proxy-only mode without database
-	cleanupDatabaseDefaults(&cfg)
-
 	// Apply the configured bcrypt cost (clamped) for password hashing/rehash.
 	db.SetBcryptCost(cfg.GetBcryptCost())
 
@@ -291,6 +288,9 @@ func main() {
 	if deps.relayWorker != nil {
 		defer deps.relayWorker.Stop()
 	}
+	if deps.spamTrainingClient != nil {
+		defer deps.spamTrainingClient.Close()
+	}
 
 	// SIGHUP handler for config reload - set up AFTER deps is created so the running
 	// servers are registered. Global settings are only reported (handleConfigReload
@@ -356,27 +356,18 @@ func main() {
 	}
 }
 
-// cleanupDatabaseDefaults clears default database config if the TOML explicitly has empty sections
-// This allows proxy-only deployments without database
-func cleanupDatabaseDefaults(cfg *config.Config) {
-	// If database.write section exists but has default "localhost", clear it
-	// This happens when user has [database.write] but no hosts specified
-	if cfg.Database.Write != nil {
-		if len(cfg.Database.Write.Hosts) == 1 && cfg.Database.Write.Hosts[0] == "localhost" &&
-			cfg.Database.Write.User == "postgres" && cfg.Database.Write.Name == "sora_mail_db" {
-			// This looks like unmodified defaults - user probably wants no database
-			logger.Debug("Detected default database.write config - clearing for proxy-only mode")
-			cfg.Database.Write = nil
-		}
+// dropUndefinedDatabaseEndpoints unsets the [database.write] and [database.read]
+// endpoints the config file does not define, so a node without them (a proxy) runs
+// without a database. NewDefaultConfig seeds both endpoints only so that a table in the
+// file takes the defaults for the keys it leaves out. Whether a table is in the file is
+// read from the TOML metadata, never from its values: a table that names localhost,
+// postgres and sora_mail_db is a database the node must use.
+func dropUndefinedDatabaseEndpoints(cfg *config.Config, md toml.MetaData) {
+	if !md.IsDefined("database", "write") {
+		cfg.Database.Write = nil
 	}
-
-	// Same for read config
-	if cfg.Database.Read != nil {
-		if len(cfg.Database.Read.Hosts) == 1 && cfg.Database.Read.Hosts[0] == "localhost" &&
-			cfg.Database.Read.User == "postgres" && cfg.Database.Read.Name == "sora_mail_db" {
-			logger.Debug("Detected default database.read config - clearing for proxy-only mode")
-			cfg.Database.Read = nil
-		}
+	if !md.IsDefined("database", "read") {
+		cfg.Database.Read = nil
 	}
 }
 
@@ -445,7 +436,8 @@ func handleConfigReload(configPath string, currentCfg *config.Config, errorHandl
 // loadAndValidateConfig loads configuration from file and validates all server configurations
 func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *errors.ErrorHandler) {
 	// Load configuration from TOML file
-	if err := config.LoadConfigFromFile(configPath, cfg); err != nil {
+	md, err := config.LoadConfigFromFileWithMetadata(configPath, cfg)
+	if err != nil {
 		if os.IsNotExist(err) {
 			// If default config doesn't exist, that's okay - use defaults
 			if configPath == "config.toml" {
@@ -462,6 +454,7 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 	} else {
 		logger.Info("Loaded configuration", "path", configPath)
 	}
+	dropUndefinedDatabaseEndpoints(cfg, md)
 	if invalid := sieveengine.InvalidExtensions(cfg.Sieve.EnabledExtensions); len(invalid) > 0 {
 		logger.Warn("[sieve] enabled_extensions names extensions the engine does not support; they are ignored, and the default set is used if none remain",
 			"invalid", invalid, "effective", sieveengine.EffectiveExtensions(cfg.Sieve.EnabledExtensions))
@@ -575,6 +568,24 @@ func logInstanceIdentity(identity config.NodeIdentity) {
 		"note", "SMTP-visible name of this node: protocol greetings, Received 'by' host, vacation Message-ID domain")
 }
 
+// serverNeedsDatabase reports whether a server queries the database. The mail backends,
+// the ManageSieve backend and the HTTP APIs keep their accounts there. A mail proxy
+// authenticates its users there (the LMTP proxy looks up its recipients) unless a remote
+// lookup answers for all of them, which takes remote_lookup enabled with
+// lookup_local_users = false. The User API proxy leaves logins to its backends; it only
+// checks a local user's token there, with lookup_local_users = true.
+func serverNeedsDatabase(s config.ServerConfig) bool {
+	switch s.Type {
+	case "imap", "lmtp", "pop3", "managesieve", "http_admin_api", "http_user_api":
+		return true
+	case "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy":
+		return s.RemoteLookup == nil || !s.RemoteLookup.Enabled || s.RemoteLookup.ShouldLookupLocalUsers()
+	case "user_api_proxy":
+		return s.RemoteLookup != nil && s.RemoteLookup.ShouldLookupLocalUsers()
+	}
+	return false
+}
+
 // initializeServices initializes all core services (S3, database, cache, workers) if storage services are needed
 func initializeServices(ctx context.Context, cfg config.Config, errorHandler *errors.ErrorHandler) (*serverDependencies, error) {
 	// This node's two names, resolved together so they cannot drift apart.
@@ -596,28 +607,19 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	allServers := cfg.GetAllServers()
 	storageServicesNeeded := false
 	userAPIServed := false
-	databaseNeeded := false
+	var databaseUser *config.ServerConfig // the first server that queries the database
 
 	// Check if database is actually configured
 	// Database is configured if either write or read has valid hosts
 	databaseConfigured := (cfg.Database.Write != nil && len(cfg.Database.Write.Hosts) > 0) ||
 		(cfg.Database.Read != nil && len(cfg.Database.Read.Hosts) > 0)
 
-	for _, server := range allServers {
+	for i, server := range allServers {
+		if databaseUser == nil && serverNeedsDatabase(server) {
+			databaseUser = &allServers[i]
+		}
 		if server.Type == "imap" || server.Type == "lmtp" || server.Type == "pop3" {
 			storageServicesNeeded = true
-			databaseNeeded = true
-			break
-		}
-		// Check if proxy servers need database (when lookup_local_users=true)
-		if server.Type == "imap_proxy" || server.Type == "pop3_proxy" || server.Type == "managesieve_proxy" || server.Type == "lmtp_proxy" || server.Type == "user_api_proxy" {
-			if server.RemoteLookup != nil && server.RemoteLookup.ShouldLookupLocalUsers() {
-				databaseNeeded = true
-			}
-		}
-		// Admin API and User API need database for account management
-		if server.Type == "http_admin_api" || server.Type == "http_user_api" {
-			databaseNeeded = true
 		}
 		if server.Type == "http_user_api" {
 			userAPIServed = true
@@ -625,16 +627,9 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	}
 
 	// If database is needed but not configured, that's an error
-	if databaseNeeded && !databaseConfigured {
-		errorHandler.ValidationError("database configuration", fmt.Errorf("database is required for configured servers but not configured in [database.write] or [database.read]"))
+	if databaseUser != nil && !databaseConfigured {
+		errorHandler.ValidationError("database configuration", fmt.Errorf("server %q (%s) needs the database, but it is not configured in [database.write] or [database.read]", databaseUser.Name, databaseUser.Type))
 		os.Exit(errorHandler.WaitForExit())
-	}
-
-	// Override: if database is not configured at all, force databaseNeeded to false
-	// This allows proxy-only mode without database config
-	if !databaseConfigured {
-		databaseNeeded = false
-		logger.Info("Database not configured - forcing proxy-only mode (lookup_local_users will be treated as false)")
 	}
 
 	deps := &serverDependencies{
@@ -659,7 +654,17 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		}
 	}
 
-	// Initialize S3 storage if needed
+	// Check the staging path before any uploader or cleanup worker starts.
+	if storageServicesNeeded {
+		// The default [uploader] path moved off /tmp. Before any worker starts, refuse to
+		// strand bodies a previous release staged at the old default.
+		if err := uploader.CheckLegacyStaging(cfg.Uploader.Path, config.DefaultUploaderPath, config.LegacyDefaultUploaderPath); err != nil {
+			errorHandler.ValidationError("uploader path", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+	}
+
+	// Initialize S3 storage for mail services or a User API body reader.
 	if s3Needed {
 		// Ensure required S3 arguments are provided only if needed
 		if cfg.S3.AccessKey == "" || cfg.S3.SecretKey == "" || cfg.S3.Bucket == "" {
@@ -696,7 +701,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 	// Initialize the resilient database with runtime failover (if needed)
 	var err error
-	if databaseNeeded {
+	if databaseUser != nil {
 		logger.Info("Connecting to database with resilient failover configuration")
 		deps.resilientDB, err = resilient.NewResilientDatabase(ctx, &cfg.Database, true, true)
 		if err != nil {
@@ -704,7 +709,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			os.Exit(1)
 		}
 	} else {
-		logger.Info("Skipping database initialization - running in proxy-only mode with remote_lookup")
+		logger.Info("Skipping database initialization - no server on this node queries it")
 	}
 
 	// Start database metrics and health monitoring if database is available
@@ -718,7 +723,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	if cfg.AuthCache.Enabled {
 		acPath := cfg.AuthCache.Path
 		if acPath == "" {
-			acPath = "/tmp/sora/auth_cache.db"
+			acPath = config.DefaultAuthCachePath
 		}
 		acMaxAge := cfg.AuthCache.GetMaxAgeWithDefault()
 		acPurgeUnused := cfg.AuthCache.GetPurgeUnusedWithDefault()
@@ -1223,6 +1228,10 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 				}
 			}()
 		}
+		// Arm renewal for the certificates already cached. Not before this point: one
+		// that is due is renewed at once, and that order needs the issuance fence
+		// (installed with the manager) and HTTP-01 (enabled by HTTPHandler above).
+		deps.tlsManager.StartRenewals()
 	}
 
 	// Start all configured servers dynamically
@@ -1589,6 +1598,7 @@ func buildLMTPServerOptions(deps *serverDependencies, serverConfig config.Server
 		RedirectRateLimit:       serverConfig.GetRedirectRateLimit(),
 		RedirectRateWindow:      redirectRateWindow,
 		MaxRedirectHops:         serverConfig.GetMaxRedirectHops(),
+		SharedMailboxes:         deps.config.SharedMailboxes,
 		CommandTimeoutOverrides: lmtpCommandTimeoutOverrides,
 	}
 }
@@ -1905,6 +1915,8 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		TrustedProxies:           deps.config.Servers.TrustedNetworks,
 		MaxConnections:           serverConfig.MaxConnections,
 		MaxConnectionsPerIP:      serverConfig.MaxConnectionsPerIP,
+		ClusterManager:           deps.clusterManager,
+		ClusterRateLimitSync:     deps.config.Cluster.RateLimitSync,
 		TrustedNetworks:          deps.config.Servers.TrustedNetworks,
 		ListenBacklog:            serverConfig.ListenBacklog,
 		MaxAuthErrors:            serverConfig.GetMaxAuthErrors(),
@@ -2036,6 +2048,8 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		TrustedProxies:           deps.config.Servers.TrustedNetworks,
 		MaxConnections:           serverConfig.MaxConnections,
 		MaxConnectionsPerIP:      serverConfig.MaxConnectionsPerIP,
+		ClusterManager:           deps.clusterManager,
+		ClusterRateLimitSync:     deps.config.Cluster.RateLimitSync,
 		TrustedNetworks:          deps.config.Servers.TrustedNetworks,
 		ListenBacklog:            serverConfig.ListenBacklog,
 		LookupCache:              serverConfig.LookupCache,
@@ -2160,6 +2174,8 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		TrustedProxies:           deps.config.Servers.TrustedNetworks,
 		MaxConnections:           serverConfig.MaxConnections,
 		MaxConnectionsPerIP:      serverConfig.MaxConnectionsPerIP,
+		ClusterManager:           deps.clusterManager,
+		ClusterRateLimitSync:     deps.config.Cluster.RateLimitSync,
 		TrustedNetworks:          deps.config.Servers.TrustedNetworks,
 		ListenBacklog:            serverConfig.ListenBacklog,
 		Debug:                    serverConfig.Debug,
@@ -2413,6 +2429,12 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		redirectRateWindow = time.Hour
 	}
 
+	// A nil *relayqueue.Worker must stay a nil interface, not one holding a nil pointer.
+	var relayWorker adminapi.RelayWorkerNotifier
+	if deps.relayWorker != nil {
+		relayWorker = deps.relayWorker
+	}
+
 	options := adminapi.ServerOptions{
 		Name:               serverConfig.Name,
 		Addr:               serverConfig.Addr,
@@ -2425,6 +2447,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		Storage:            deps.storage,
 		PurgeWorker:        deps.purgeWorker,
 		RelayQueue:         deps.relayQueueOption(), // Global relay queue; nil without [relay]
+		RelayWorker:        relayWorker,             // woken for redirects and vacation replies, as on LMTP
 		MaxMessageSize:     serverConfig.GetMaxMessageSizeWithDefault(),
 		MaxConnections:     serverConfig.MaxConnections,
 		TLS:                serverConfig.TLS,

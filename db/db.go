@@ -60,7 +60,6 @@ package db
 
 import (
 	"context"
-	"database/sql"
 	"embed"
 	"errors"
 	"fmt"
@@ -70,7 +69,6 @@ import (
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
-	pgxv5 "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -322,42 +320,14 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 		// WE ARE THE LEADER.
 		logger.Info("Database: acquired migration leader lock, proceeding with migrations")
 
-		// Set up sqlDB and run golang-migrate WITHOUT an artificial timeout that would
-		// kill our own migration. We use the startup context directly.
-		sqlDB, err := sql.Open("pgx", db.WritePool.Config().ConnString())
+		// Run golang-migrate WITHOUT an artificial timeout that would kill our own
+		// migration. We use the startup context directly. Its driver takes no lock of
+		// its own: the leader lock held above serialises the migrators.
+		m, err := newMigrate(ctx, db.WritePool.Config().ConnConfig.Copy())
 		if err != nil {
-			return fmt.Errorf("failed to open a temporary sql.DB for migrations: %w", err)
+			return err
 		}
-		sqlDB.SetMaxOpenConns(1)
-		sqlDB.SetMaxIdleConns(1)
-		defer sqlDB.Close()
-
-		if err := sqlDB.PingContext(ctx); err != nil {
-			return fmt.Errorf("failed to ping temporary DB for migrations: %w", err)
-		}
-
-		dbDriver, err := pgxv5.WithInstance(sqlDB, &pgxv5.Config{
-			MultiStatementEnabled: false, // Prevents PL/pgSQL parsing issues
-		})
-		if err != nil {
-			return fmt.Errorf("failed to create migration db driver: %w", err)
-		}
-
-		// Re-initialize source driver strictly for golang-migrate execution
-		migrations, err := fs.Sub(MigrationsFS, "migrations")
-		if err != nil {
-			return fmt.Errorf("failed to get migrations subdirectory: %w", err)
-		}
-
-		sourceDriver, err := iofs.New(migrations, ".")
-		if err != nil {
-			return fmt.Errorf("failed to create migration source driver: %w", err)
-		}
-
-		m, err := migrate.NewWithInstance("iofs", sourceDriver, "pgx5", dbDriver)
-		if err != nil {
-			return fmt.Errorf("failed to create migrate instance: %w", err)
-		}
+		defer m.Close()
 
 		m.Log = &migrationLogger{}
 
@@ -631,6 +601,10 @@ func (db *Database) checkHostHealth(ctx context.Context, fm *FailoverManager, ho
 	fm.MarkHostHealthy(host.Host)
 }
 
+// ErrMigrationFailed wraps a NewDatabaseFromConfig error that came from running the
+// schema migrations, after the pools had connected.
+var ErrMigrationFailed = errors.New("database migration failed")
+
 // NewDatabaseFromConfig creates a new database connection with read/write split configuration
 func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig, runMigrations bool) (*Database, error) {
 	if dbConfig.Write == nil {
@@ -696,7 +670,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 		}
 		if err := db.migrate(ctx, migrationTimeout); err != nil {
 			db.Close()
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", ErrMigrationFailed, err)
 		}
 	}
 
