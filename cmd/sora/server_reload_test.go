@@ -105,6 +105,26 @@ func TestServerReloadRejectsBlockWithoutAddr(t *testing.T) {
 	}
 }
 
+// A reload whose auth_rate_limit.exempt_networks has an entry that is not an IP address
+// or CIDR is refused for that server, naming the entry, as a restart would refuse it;
+// the server keeps the config it has (#709).
+func TestServerReloadRejectsInvalidExemptNetworks(t *testing.T) {
+	logs := captureReloadLogs(t)
+	deps, reloaders := runningDeps(t, config.ServerConfig{Type: "imap", Name: "imap", Addr: ":143"})
+
+	deps.reloadServers(reloadedConfig(config.ServerConfig{
+		Type: "imap", Name: "imap", Addr: ":143",
+		AuthRateLimit: &config.AuthRateLimiterConfig{Enabled: true, ExemptNetworks: []string{"webmail.example.com"}},
+	}))
+
+	if got := reloaders["imap"].reloaded; len(got) != 0 {
+		t.Fatalf("ReloadConfig got %+v, want no call", got)
+	}
+	if out := logs.String(); !hasLineWith(out, "Skipping reload", "server=imap", "exempt_networks", "webmail.example.com") {
+		t.Errorf("no error naming imap and the invalid exempt_networks entry:\n%s", out)
+	}
+}
+
 // enabled = false on a running server's block takes effect at the next restart: the
 // reload says so instead of passing over the block in silence, and does not hand the
 // server a block that is no longer validated.

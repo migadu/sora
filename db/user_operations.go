@@ -558,7 +558,8 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 		       m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 't'),
 		       m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 'w')
 		FROM messages m
-		WHERE m.id = $1 AND m.expunged_at IS NULL
+		JOIN mailboxes mb ON mb.id = m.mailbox_id
+		WHERE m.id = $1 AND m.expunged_at IS NULL AND mb.deleted_at IS NULL
 		  AND (m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 'r'))
 	`, messageID, accountID).Scan(&mailboxID, &ownerID, &maySeen, &mayDelete, &mayWrite)
 
@@ -600,8 +601,9 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 	err = tx.QueryRow(ctx, `
 		SELECT ms.flags, ms.custom_flags
 		FROM messages m
+		JOIN mailboxes mb ON mb.id = m.mailbox_id
 		JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL
+		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL AND mb.deleted_at IS NULL
 	`, messageID, ownerID).Scan(&currentFlags, &currentCustomFlags)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return consts.ErrDBNotFound
@@ -777,6 +779,11 @@ func (db *Database) DeleteMailboxForUser(ctx context.Context, accountID int64, m
 		return errors.New("cannot delete INBOX")
 	}
 
+	// Pin pre-transaction mailbox resolution and shared-mailbox ACL checks to the
+	// writer so a lagging read replica cannot answer 404 or stale rights for a
+	// mailbox or grant written moments earlier (e.g. login default mailboxes or
+	// POST /user/mailboxes).
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
 		return err
@@ -802,6 +809,7 @@ func (db *Database) DeleteMailboxForUser(ctx context.Context, accountID int64, m
 
 // SubscribeToMailbox marks mailbox as subscribed
 func (db *Database) SubscribeToMailbox(ctx context.Context, accountID int64, mailboxPath string) error {
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
 		return err
@@ -823,6 +831,7 @@ func (db *Database) SubscribeToMailbox(ctx context.Context, accountID int64, mai
 
 // UnsubscribeFromMailbox marks mailbox as unsubscribed
 func (db *Database) UnsubscribeFromMailbox(ctx context.Context, accountID int64, mailboxPath string) error {
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
 		return err
