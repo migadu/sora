@@ -2328,73 +2328,58 @@ func (i *Importer) markBatchInSQLite(marked []markedMessage) error {
 
 	logger.Info("Marking batch in SQLite", "count", len(marked))
 
-	// Create a context with timeout to prevent hanging
+	// The transaction is bound to the timeout and its outcome is the result: when this
+	// returns an error, nothing was marked. --batch-transaction answers an error by
+	// deleting the batch from PostgreSQL, and recoverOrphanedSQLiteState trusts a row
+	// stamped with the account without checking PostgreSQL, so a mark may never be
+	// committed after the caller was told it failed (a goroutine left running past the
+	// timeout could do exactly that). An expired context interrupts a stalled statement.
 	ctx, cancel := context.WithTimeout(i.ctx, 30*time.Second)
 	defer cancel()
 
-	// Use a channel to handle the transaction with timeout
-	type result struct {
-		err error
+	tx, err := i.sqliteDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin SQLite transaction: %w", err)
 	}
-	done := make(chan result, 1)
+	defer tx.Rollback()
 
-	go func() {
-		tx, err := i.sqliteDB.Begin()
-		if err != nil {
-			done <- result{err: fmt.Errorf("failed to begin SQLite transaction: %w", err)}
-			return
-		}
-		defer tx.Rollback()
+	logger.Info("SQLite transaction started")
 
-		logger.Info("SQLite transaction started")
-
-		// Scoped to (hash, mailbox): s3_uploaded is what an incremental import filters
-		// on, so marking by hash alone would hide every other mailbox's copy of this
-		// content from the next run even though it was never imported. The account
-		// stamp tells recoverOrphanedSQLiteState the message reached this account.
-		stmt, err := tx.Prepare(`
-			UPDATE messages
-			SET s3_uploaded = 1, s3_uploaded_at = ?, account_id = NULLIF(?, 0)
-			WHERE hash = ? AND mailbox = ?
-		`)
-		if err != nil {
-			done <- result{err: fmt.Errorf("failed to prepare SQLite statement: %w", err)}
-			return
-		}
-		defer stmt.Close()
-
-		logger.Info("SQLite statement prepared, executing updates")
-
-		now := time.Now()
-		for idx, m := range marked {
-			if _, err := stmt.Exec(now, i.accountID, m.hash, m.mailbox); err != nil {
-				done <- result{err: fmt.Errorf("failed to update SQLite for hash %s in %s: %w",
-					shortHash(m.hash), m.mailbox, err)}
-				return
-			}
-			if (idx+1)%5 == 0 {
-				logger.Info("SQLite update progress", "completed", idx+1, "total", len(marked))
-			}
-		}
-
-		logger.Info("All SQLite updates executed, committing")
-
-		if err := tx.Commit(); err != nil {
-			done <- result{err: fmt.Errorf("failed to commit SQLite transaction: %w", err)}
-			return
-		}
-
-		logger.Info("SQLite transaction committed successfully")
-		done <- result{err: nil}
-	}()
-
-	// Wait for completion or timeout
-	select {
-	case res := <-done:
-		return res.err
-	case <-ctx.Done():
-		return fmt.Errorf("SQLite transaction timed out after 30 seconds")
+	// Scoped to (hash, mailbox): s3_uploaded is what an incremental import filters
+	// on, so marking by hash alone would hide every other mailbox's copy of this
+	// content from the next run even though it was never imported. The account
+	// stamp tells recoverOrphanedSQLiteState the message reached this account.
+	stmt, err := tx.PrepareContext(ctx, `
+		UPDATE messages
+		SET s3_uploaded = 1, s3_uploaded_at = ?, account_id = NULLIF(?, 0)
+		WHERE hash = ? AND mailbox = ?
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare SQLite statement: %w", err)
 	}
+	defer stmt.Close()
+
+	logger.Info("SQLite statement prepared, executing updates")
+
+	now := time.Now()
+	for idx, m := range marked {
+		if _, err := stmt.ExecContext(ctx, now, i.accountID, m.hash, m.mailbox); err != nil {
+			return fmt.Errorf("failed to update SQLite for hash %s in %s: %w",
+				shortHash(m.hash), m.mailbox, err)
+		}
+		if (idx+1)%5 == 0 {
+			logger.Info("SQLite update progress", "completed", idx+1, "total", len(marked))
+		}
+	}
+
+	logger.Info("All SQLite updates executed, committing")
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit SQLite transaction: %w", err)
+	}
+
+	logger.Info("SQLite transaction committed successfully")
+	return nil
 }
 
 // processBatch processes a batch of messages with sequential S3 uploads
