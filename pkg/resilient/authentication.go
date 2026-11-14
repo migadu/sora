@@ -113,10 +113,12 @@ func (rd *ResilientDatabase) GetCredentialEpochWithRetry(ctx context.Context, ad
 // This eliminates the "thundering herd" problem on proxy restart where thousands
 // of clients reconnect simultaneously.
 //
-// TIMING: every failed login costs exactly one password verification, whether
-// the address is unknown, the password is wrong, or the account's hash was
-// cached, so response time does not reveal which addresses have an account
-// (security-audit M14; the backends equalise the same way).
+// TIMING: a failed login costs one password verification whether the address
+// is unknown, the password is wrong, or the account's hash was cached, so
+// response time does not reveal which addresses have an account (security-audit
+// M14; the backends equalise the same way). The exception is a cached hash that
+// a password change has made stale: the first failed login after the change
+// checks both the stale hash and the current one, and drops the stale entry.
 func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address, password string) (accountID int64, err error) {
 	// The cached hash Step 1 already verified the password against, and the result.
 	var mismatchedHash string
