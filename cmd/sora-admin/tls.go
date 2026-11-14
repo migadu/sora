@@ -1163,6 +1163,10 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	notFound := 0
 	now := time.Now()
 
+	// A certificate that could not be downloaded or written fails the command, so a
+	// script pre-warming a node's cache can tell; the others are still cached.
+	var failures []error
+
 	for _, configured := range domainsToCache {
 		// Honor cancellation between domains (each iteration may issue slow S3 downloads)
 		if err := ctx.Err(); err != nil {
@@ -1200,6 +1204,7 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 					notFound++
 				} else {
 					logger.Warn("Failed to download certificate from S3", "domain", domain, "type", variant.name, "error", err)
+					failures = append(failures, fmt.Errorf("download %s certificate for %s (S3 object %s): %w", variant.name, domain, s3Key, err))
 				}
 				continue
 			}
@@ -1208,6 +1213,7 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			reader.Close()
 			if err != nil {
 				logger.Warn("Failed to read certificate from S3", "domain", domain, "type", variant.name, "error", err)
+				failures = append(failures, fmt.Errorf("read %s certificate for %s (S3 object %s): %w", variant.name, domain, s3Key, err))
 				continue
 			}
 
@@ -1239,6 +1245,7 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			// Write to local cache
 			if err := os.WriteFile(localPath, certData, 0600); err != nil {
 				logger.Warn("Failed to write certificate to local cache", "path", localPath, "error", err)
+				failures = append(failures, fmt.Errorf("write %s certificate for %s: %w", variant.name, domain, err))
 				continue
 			}
 
@@ -1258,6 +1265,10 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	}
 	if notFound > 0 {
 		fmt.Printf("  Not found: %d (not in S3)\n", notFound)
+	}
+	if len(failures) > 0 {
+		fmt.Printf("  Failed:    %d (not cached)\n", len(failures))
+		return fmt.Errorf("%d certificate(s) could not be cached: %w", len(failures), errors.Join(failures...))
 	}
 
 	return nil
