@@ -18,7 +18,7 @@ type SpamTrainingConfig struct {
 	Endpoint string `toml:"endpoint"`
 
 	// Authentication token for the training endpoint (Bearer token)
-	AuthToken string `toml:"auth_token"`
+	AuthToken string `toml:"auth_token" secret:"true"`
 
 	// Timeout for HTTP requests to the training endpoint
 	Timeout string `toml:"timeout"`

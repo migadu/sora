@@ -60,6 +60,7 @@ func TestLMTP_SieveFileIntoCreateNames(t *testing.T) {
 		detail string // recipient +detail, filed by the default script
 		script string // the user's active script, "" for none
 		want   string // the one mailbox the message must be stored in
+		header string // an extra header line, "" for none
 	}{
 		{name: "parent level", script: `require ["fileinto", "mailbox"]; fileinto :create "a/../b";`, want: "INBOX"},
 		{name: "dot level from the detail", detail: "a/./b", want: "INBOX"},
@@ -69,6 +70,26 @@ func TestLMTP_SieveFileIntoCreateNames(t *testing.T) {
 		{name: "copy to a parent level", script: `require ["fileinto", "mailbox", "copy"]; fileinto :copy :create "a/../b";`, want: "INBOX"},
 		{name: "trailing delimiter", script: `require ["fileinto", "mailbox"]; fileinto :create "Foo/";`, want: "Foo"},
 		{name: "trailing delimiter from the detail", detail: "foo/", want: "foo"},
+		// A NUL or a byte that is not UTF-8 cannot be stored in a PostgreSQL text
+		// value: such a name made the mailbox lookup fail with SQLSTATE 22021, and
+		// every attempt was answered 451, with :create or without. A script that
+		// files by a header value hands the sender that choice: a raw 8-bit header
+		// or an encoded-word decoding to a NUL.
+		{name: "NUL", script: `require ["fileinto", "mailbox", "encoded-character"]; fileinto :create "a${hex:00}b";`, want: "INBOX"},
+		{name: "invalid UTF-8", script: `require ["fileinto", "mailbox", "encoded-character"]; fileinto :create "a${hex:ff}b";`, want: "INBOX"},
+		{name: "invalid UTF-8 without create", script: `require ["fileinto", "encoded-character"]; fileinto "a${hex:ff}b";`, want: "INBOX"},
+		{
+			name:   "8-bit header value",
+			script: `require ["fileinto", "mailbox", "variables"]; if header :matches "X-Folder" "*" { fileinto :create "${1}"; }`,
+			header: "X-Folder: caf\xe9",
+			want:   "INBOX",
+		},
+		{
+			name:   "header encoded-word with a NUL",
+			script: `require ["fileinto", "mailbox", "variables"]; if header :matches "X-Folder" "*" { fileinto :create "${1}"; }`,
+			header: "X-Folder: =?UTF-8?Q?a=00b?=",
+			want:   "INBOX",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -115,15 +136,17 @@ func TestLMTP_SieveFileIntoCreateNames(t *testing.T) {
 					t.Fatalf("%s: %s", cmd, resp)
 				}
 			}
-			msg := strings.Join([]string{
+			lines := []string{
 				"From: sender@example.com",
 				"To: " + rcpt,
 				"Subject: " + subject,
 				"Message-ID: <" + subject + "@example.com>",
 				"Date: " + time.Now().Format(time.RFC1123Z),
-				"",
-				"body",
-			}, "\r\n")
+			}
+			if tc.header != "" {
+				lines = append(lines, tc.header)
+			}
+			msg := strings.Join(append(lines, "", "body"), "\r\n")
 			if err := c.SendCommand(msg + "\r\n."); err != nil {
 				t.Fatalf("send message: %v", err)
 			}

@@ -150,6 +150,23 @@ func (s *IMAPSession) GetCapabilities() imap.CapSet {
 	return s.server.caps
 }
 
+// requireCapability refuses a command, or a command argument, that capability
+// c adds when this session does not offer c. disabled_caps and client_filters
+// take c out of CAPABILITY, but go-imap still hands the command to any session
+// that implements it. The refusal is the one go-imap gives a session without
+// the command: BAD, which RFC 9051 §6 lists for every command as "command
+// unknown or arguments invalid".
+func (s *IMAPSession) requireCapability(c imap.Cap, what string) error {
+	if s.GetCapabilities().Has(c) {
+		return nil
+	}
+	return &imap.Error{
+		Type: imap.StatusResponseTypeBad,
+		Code: imap.ResponseCodeClientBug,
+		Text: what + " is not supported",
+	}
+}
+
 // condStoreEnabled reports whether it is correct to emit a MODSEQ data item in a
 // FETCH-style response for this session. Per RFC 7162 §3.2 that requires two things:
 // the client must have become CONDSTORE-aware on this connection (issued a

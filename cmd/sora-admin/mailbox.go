@@ -11,7 +11,6 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
-	"github.com/migadu/sora/storage"
 )
 
 // handleMailboxCommand handles the 'mailbox' command
@@ -286,41 +285,12 @@ Examples:
 		os.Exit(1)
 	}
 
-	// If purge flag is set, purge all messages from S3 and database
+	// If purge flag is set, expunge every message now. Only rows are touched: the
+	// cleaner reclaims them and their S3 objects after the grace period.
 	if *purge {
 		fmt.Printf("Purging all messages from mailbox '%s'...\n", *mailbox)
 
-		// Initialize S3 storage
-		useSSL := !globalConfig.S3.DisableTLS
-		s3Timeout, err := globalConfig.S3.GetTimeout()
-		if err != nil {
-			fmt.Printf("Invalid S3 timeout configuration: %v\n", err)
-			os.Exit(1)
-		}
-		s3Storage, err := storage.New(
-			globalConfig.S3.Endpoint,
-			globalConfig.S3.AccessKey,
-			globalConfig.S3.SecretKey,
-			globalConfig.S3.Bucket,
-			useSSL,
-			false,     // debug mode
-			s3Timeout, // timeout
-			storage.WithRegion(globalConfig.S3.Region),
-		)
-		if err != nil {
-			fmt.Printf("Failed to initialize S3 storage: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Enable encryption if configured
-		if globalConfig.S3.Encrypt {
-			if err := s3Storage.EnableEncryption(globalConfig.S3.EncryptionKey); err != nil {
-				fmt.Printf("Failed to enable S3 encryption: %v\n", err)
-				os.Exit(1)
-			}
-		}
-
-		err = purgeMailboxMessages(ctx, rdb, s3Storage, accountID, *mailbox)
+		err = purgeMailboxMessages(ctx, rdb, accountID, *mailbox)
 		if err != nil {
 			fmt.Printf("Failed to purge messages: %v\n", err)
 			os.Exit(1)
@@ -835,9 +805,9 @@ For more information on a subcommand, run:
   sora-admin mailbox <subcommand> --help`)
 }
 
-// purgeMailboxMessages purges all messages from a mailbox and its children
-// by deleting them from both S3 and the database immediately
-func purgeMailboxMessages(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage objectStorage, accountID int64, mailboxName string) error {
+// purgeMailboxMessages expunges all messages of a mailbox and its children. The cleaner
+// deletes the rows and their S3 objects after the grace period, so no S3 client is needed.
+func purgeMailboxMessages(ctx context.Context, rdb *resilient.ResilientDatabase, accountID int64, mailboxName string) error {
 	// Get the mailbox
 	mbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, mailboxName)
 	if err != nil {
@@ -866,7 +836,6 @@ func purgeMailboxMessages(ctx context.Context, rdb *resilient.ResilientDatabase,
 	for _, msg := range messages {
 		messageIDs = append(messageIDs, msg.ID) // rows already expunged are left as they are
 	}
-	_ = s3Storage // objects are reclaimed by the cleaner, not here
 
 	fmt.Printf("Expunging %d messages (objects are reclaimed by the cleaner after the grace period)...\n", len(messageIDs))
 	expunged, err := rdb.ExpungeMessagesByIDsWithRetry(ctx, messageIDs)

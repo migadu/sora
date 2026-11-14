@@ -9,6 +9,11 @@ import (
 )
 
 func (s *IMAPSession) Status(ctx context.Context, mboxName string, options *imap.StatusOptions) (*imap.StatusData, error) {
+	if options.Size {
+		if err := s.requireCapability(imap.CapStatusSize, "STATUS SIZE"); err != nil {
+			return nil, err
+		}
+	}
 	ctx = s.pinnedContext(ctx)
 
 	// First phase: Read validation with read lock

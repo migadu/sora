@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/migadu/sora/logger"
@@ -209,7 +211,7 @@ Options:
   --protocol string  Protocol: imap, pop3, or managesieve (required)
   --backend string   Backend server address, e.g., 192.168.1.10:993 (required)
 
-Note: This command calls the admin API HTTP endpoint. The affinity will be gossiped
+Note: This command calls the Admin API named by [admin_cli]. The affinity will be gossiped
       to all nodes in the cluster automatically.
 
 Examples:
@@ -237,23 +239,6 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Find admin API server config
-	var adminAPIAddr, adminAPIKey string
-	for _, server := range globalConfig.DynamicServers {
-		if server.Type == "http_admin_api" && server.IsEnabled() {
-			adminAPIAddr = server.Addr
-			adminAPIKey = server.APIKey
-			break
-		}
-	}
-
-	if adminAPIAddr == "" {
-		logger.Fatalf("No http_admin_api server found in config")
-	}
-	if adminAPIKey == "" {
-		logger.Fatalf("Admin API server found but missing api_key in config")
-	}
-
 	// Call admin API
 	reqBody := map[string]string{
 		"user":     *userEmail,
@@ -261,8 +246,10 @@ Examples:
 		"backend":  *backendAddr,
 	}
 
-	respData, err := callAdminAPI(ctx, adminAPIAddr, adminAPIKey, "POST", "/admin/affinity", reqBody)
-	if err != nil {
+	var resp struct {
+		Message string `json:"message"`
+	}
+	if err := callAdminAPI(ctx, globalConfig, "POST", "/admin/affinity", nil, reqBody, &resp); err != nil {
 		logger.Fatalf("Failed to set affinity: %v", err)
 	}
 
@@ -270,8 +257,8 @@ Examples:
 	fmt.Printf("  User: %s\n", *userEmail)
 	fmt.Printf("  Protocol: %s\n", *protocol)
 	fmt.Printf("  Backend: %s\n", *backendAddr)
-	if msg, ok := respData["message"].(string); ok {
-		fmt.Printf("  %s\n", msg)
+	if resp.Message != "" {
+		fmt.Printf("  %s\n", resp.Message)
 	}
 }
 
@@ -310,44 +297,89 @@ Examples:
 
 	*protocol = strings.ToLower(*protocol)
 
-	// Find admin API server config
-	var adminAPIAddr, adminAPIKey string
-	for _, server := range globalConfig.DynamicServers {
-		if server.Type == "http_admin_api" && server.IsEnabled() {
-			adminAPIAddr = server.Addr
-			adminAPIKey = server.APIKey
-			break
-		}
+	// The Admin API answers 200 with the backend, or 404 when the user has no affinity.
+	var resp struct {
+		Backend string `json:"backend"`
 	}
-
-	if adminAPIAddr == "" {
-		logger.Fatalf("No http_admin_api server found in config")
+	query := url.Values{"user": {*userEmail}, "protocol": {*protocol}}
+	err := callAdminAPI(ctx, globalConfig, "GET", "/admin/affinity", query, nil, &resp)
+	var apiErr *adminAPIStatusError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+		fmt.Printf("No affinity found for user %s and protocol %s\n", *userEmail, *protocol)
+		return
 	}
-	if adminAPIKey == "" {
-		logger.Fatalf("Admin API server found but missing api_key in config")
-	}
-
-	// Call admin API
-	url := fmt.Sprintf("/admin/affinity?user=%s&protocol=%s", *userEmail, *protocol)
-	respData, err := callAdminAPI(ctx, adminAPIAddr, adminAPIKey, "GET", url, nil)
 	if err != nil {
 		logger.Fatalf("Failed to get affinity: %v", err)
 	}
 
-	found, _ := respData["found"].(bool)
-	if !found {
-		fmt.Printf("No affinity found for user %s and protocol %s\n", *userEmail, *protocol)
+	fmt.Printf("Affinity for %s (%s):\n", *userEmail, *protocol)
+	fmt.Printf("  Backend: %s\n", resp.Backend)
+}
+
+func handleListAffinity(ctx context.Context) {
+	fs := flag.NewFlagSet("affinity list", flag.ExitOnError)
+
+	protocol := fs.String("protocol", "", "Only affinities of this protocol")
+	backendAddr := fs.String("backend", "", "Only affinities to this backend server address")
+
+	fs.Usage = func() {
+		fmt.Printf(`List backend server affinities
+
+Usage:
+  sora-admin affinity list [options]
+
+Options:
+  --config string    Path to TOML configuration file (required)
+  --protocol string  Only affinities of this protocol, e.g. imap
+  --backend string   Only affinities to this backend server address, e.g. 192.168.1.10:993
+
+Note: This command lists the affinities held by the node whose Admin API [admin_cli]
+      names. Every node applies the affinities the others gossip, so each node of a
+      converged cluster holds the same set.
+
+Examples:
+  sora-admin affinity list --config config.toml
+  sora-admin affinity list --config config.toml --backend 192.168.1.10:993
+`)
+	}
+
+	if err := fs.Parse(os.Args[3:]); err != nil {
+		logger.Fatalf("Error parsing flags: %v", err)
+	}
+
+	query := url.Values{}
+	if *protocol != "" {
+		query.Set("protocol", strings.ToLower(*protocol))
+	}
+	if *backendAddr != "" {
+		query.Set("backend", *backendAddr)
+	}
+
+	var resp struct {
+		Affinities []struct {
+			User      string    `json:"user"`
+			Protocol  string    `json:"protocol"`
+			Backend   string    `json:"backend"`
+			ExpiresAt time.Time `json:"expires_at"`
+			NodeID    string    `json:"node_id"`
+		} `json:"affinities"`
+	}
+	if err := callAdminAPI(ctx, globalConfig, "GET", "/admin/affinity/list", query, nil, &resp); err != nil {
+		logger.Fatalf("Failed to list affinities: %v", err)
+	}
+
+	if len(resp.Affinities) == 0 {
+		fmt.Println("No affinities found.")
 		return
 	}
 
-	backend, _ := respData["backend"].(string)
-	fmt.Printf("Affinity for %s (%s):\n", *userEmail, *protocol)
-	fmt.Printf("  Backend: %s\n", backend)
-}
-
-func handleListAffinity(_ context.Context) {
-	fmt.Println("List operation not yet supported - affinities are distributed via gossip.")
-	fmt.Println("Use 'get' with specific user/protocol to check individual affinities.")
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "User\tProtocol\tBackend\tExpires\tAssigned by")
+	for _, a := range resp.Affinities {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", a.User, a.Protocol, a.Backend, a.ExpiresAt.Format(time.RFC3339), a.NodeID)
+	}
+	tw.Flush()
+	fmt.Printf("\nTotal: %d\n", len(resp.Affinities))
 }
 
 func handleDeleteAffinity(ctx context.Context) {
@@ -367,7 +399,7 @@ Options:
   --user string      User email address (required)
   --protocol string  Protocol: imap, pop3, or managesieve (required)
 
-Note: This command calls the admin API HTTP endpoint. The deletion will be gossiped
+Note: This command calls the Admin API named by [admin_cli]. The deletion will be gossiped
       to all nodes in the cluster automatically.
 
 Examples:
@@ -388,35 +420,19 @@ Examples:
 
 	*protocol = strings.ToLower(*protocol)
 
-	// Find admin API server config
-	var adminAPIAddr, adminAPIKey string
-	for _, server := range globalConfig.DynamicServers {
-		if server.Type == "http_admin_api" && server.IsEnabled() {
-			adminAPIAddr = server.Addr
-			adminAPIKey = server.APIKey
-			break
-		}
+	var resp struct {
+		Message string `json:"message"`
 	}
-
-	if adminAPIAddr == "" {
-		logger.Fatalf("No http_admin_api server found in config")
-	}
-	if adminAPIKey == "" {
-		logger.Fatalf("Admin API server found but missing api_key in config")
-	}
-
-	// Call admin API
-	url := fmt.Sprintf("/admin/affinity?user=%s&protocol=%s", *userEmail, *protocol)
-	respData, err := callAdminAPI(ctx, adminAPIAddr, adminAPIKey, "DELETE", url, nil)
-	if err != nil {
+	query := url.Values{"user": {*userEmail}, "protocol": {*protocol}}
+	if err := callAdminAPI(ctx, globalConfig, "DELETE", "/admin/affinity", query, nil, &resp); err != nil {
 		logger.Fatalf("Failed to delete affinity: %v", err)
 	}
 
 	fmt.Printf("[OK] Affinity deleted successfully and gossiped to cluster\n")
 	fmt.Printf("  User: %s\n", *userEmail)
 	fmt.Printf("  Protocol: %s\n", *protocol)
-	if msg, ok := respData["message"].(string); ok {
-		fmt.Printf("  %s\n", msg)
+	if resp.Message != "" {
+		fmt.Printf("  %s\n", resp.Message)
 	}
 }
 
@@ -449,15 +465,18 @@ Usage:
 Subcommands:
   set      Set backend affinity for a user (gossiped to all nodes)
   get      Get backend affinity for a user
+  list     List backend affinities, optionally of one protocol or backend
   delete   Remove backend affinity for a user (gossiped to all nodes)
   help     Show this help message
 
 Note: Affinity is managed via the cluster gossip protocol. Changes are automatically
-      propagated to all nodes. The admin API must be enabled in your config.
+      propagated to all nodes. The commands call the Admin API named by [admin_cli]
+      (addr, api_key, insecure_skip_verify).
 
 Examples:
   sora-admin affinity set --config config.toml --user user@example.com --protocol imap --backend 192.168.1.10:993
   sora-admin affinity get --config config.toml --user user@example.com --protocol imap
+  sora-admin affinity list --config config.toml --backend 192.168.1.10:993
   sora-admin affinity delete --config config.toml --user user@example.com --protocol imap
 
 Use 'sora-admin affinity <subcommand> --help' for detailed help.
@@ -753,51 +772,66 @@ func kickConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 	return nil
 }
 
-func callAdminAPI(ctx context.Context, addr, apiKey, method, path string, body any) (map[string]any, error) {
+// adminAPIStatusError is an Admin API answer other than 200 OK.
+type adminAPIStatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *adminAPIStatusError) Error() string {
+	return fmt.Sprintf("API returned status %d: %s", e.StatusCode, e.Body)
+}
+
+// callAdminAPI sends a request to the Admin API that [admin_cli] names, with its API key
+// and TLS settings like every other HTTP command, and decodes the JSON answer into out.
+// query is encoded into the URL (an address may hold "+", "&" or "#"). An answer other
+// than 200 OK is an *adminAPIStatusError.
+func callAdminAPI(ctx context.Context, cfg AdminConfig, method, path string, query url.Values, body, out any) error {
+	client, err := createHTTPAPIClient(cfg)
+	if err != nil {
+		return err
+	}
+
 	var reqBody io.Reader
 	if body != nil {
 		jsonData, err := json.Marshal(body)
 		if err != nil {
-			return nil, fmt.Errorf("failed to marshal request body: %w", err)
+			return fmt.Errorf("failed to marshal request body: %w", err)
 		}
-		reqBody = bytes.NewBuffer(jsonData)
+		reqBody = bytes.NewReader(jsonData)
 	}
 
-	// Build URL - ensure addr has scheme
-	url := addr
-	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-		url = "http://" + url
+	endpoint := cfg.HTTPAPIAddr + path
+	if len(query) > 0 {
+		endpoint += "?" + query.Encode()
 	}
-	url = url + path
 
-	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return fmt.Errorf("failed to create request: %w", err)
 	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.HTTPAPIKey)
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return fmt.Errorf("failed to read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(respBody))
+		return &adminAPIStatusError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(respBody))}
 	}
 
-	var result map[string]any
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+	if err := json.Unmarshal(respBody, out); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
 	}
-
-	return result, nil
+	return nil
 }

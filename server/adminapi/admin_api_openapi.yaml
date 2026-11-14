@@ -1978,6 +1978,10 @@ paths:
                   backend:
                     type: string
                     example: "192.168.1.10:993"
+                  found:
+                    type: boolean
+                    description: "Always true in a 200 answer; a missing affinity is a 404."
+                    example: true
         '400':
           description: Missing or invalid parameters.
           content:
@@ -2151,17 +2155,62 @@ paths:
     get:
       tags:
         - Affinity Management
-      summary: List all backend affinities (not implemented)
+      summary: List backend affinities
       description: |
-        Not implemented: affinities are distributed via gossip and held in memory on each node.
-        Use GET /affinity with a user and protocol to read one affinity.
+        Lists the unexpired affinities this node holds, sorted by user and protocol. Every node
+        applies the affinities the others gossip, so any node of a converged cluster lists the
+        same set.
+      parameters:
+        - name: protocol
+          in: query
+          required: false
+          schema:
+            type: string
+          description: "Only affinities of this protocol (case-insensitive)"
+          example: "imap"
+        - name: backend
+          in: query
+          required: false
+          schema:
+            type: string
+          description: "Only affinities to this backend address"
+          example: "192.168.1.10:993"
       responses:
-        '501':
-          description: Listing is not implemented.
+        '200':
+          description: The affinities.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                type: object
+                properties:
+                  affinities:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        user:
+                          type: string
+                          format: email
+                          example: "user@example.com"
+                        protocol:
+                          type: string
+                          example: "imap"
+                        backend:
+                          type: string
+                          example: "192.168.1.10:993"
+                        assigned_at:
+                          type: string
+                          format: date-time
+                        expires_at:
+                          type: string
+                          format: date-time
+                        node_id:
+                          type: string
+                          description: "Node that assigned the affinity"
+                          example: "node-1"
+                  count:
+                    type: integer
+                    example: 1
         '503':
           description: Affinity manager not enabled on this server.
           content:
@@ -2614,6 +2663,7 @@ paths:
       tags:
         - Health Monitoring
       summary: Get health status for a component
+      description: "The current status only. One row is kept per component and server, rewritten when the status changes and every 20 checks while it holds, so there is no history: history=true is answered with 400. The sora_component_health_status metric gives the status over time."
       parameters:
         - name: hostname
           in: path
@@ -2625,46 +2675,19 @@ paths:
           required: true
           schema:
             type: string
-        - name: history
-          in: query
-          schema:
-            type: boolean
-          description: "If true, returns historical health data instead of the current status."
-        - name: since
-          in: query
-          schema:
-            type: string
-            format: date-time
-          description: "If history=true, return records after this timestamp (RFC3339). Defaults to 24 hours ago."
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            default: 100
-          description: "If history=true, limit the number of historical records returned."
       responses:
         '200':
-          description: Current or historical health status for the component.
+          description: Current health status for the component.
           content:
             application/json:
               schema:
-                oneOf:
-                  - $ref: '#/components/schemas/HealthStatus'
-                  - type: object
-                    properties:
-                      hostname:
-                        type: string
-                      component:
-                        type: string
-                      history:
-                        type: array
-                        items:
-                          $ref: '#/components/schemas/HealthStatus'
-                      count:
-                        type: integer
-                      since:
-                        type: string
-                        format: date-time
+                $ref: '#/components/schemas/HealthStatus'
+        '400':
+          description: history=true was requested; no health history is recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Component health status not found.
           content:
