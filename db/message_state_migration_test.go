@@ -9,6 +9,7 @@ import (
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/migadu/go-imap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,8 +48,24 @@ func TestMessageStateMigrationKeepsFlags(t *testing.T) {
 	}
 
 	type seeded struct {
-		mailboxID, seenID, unseenID int64
-		seenModSeq                  int64
+		accountID, mailboxID, seenID, unseenID int64
+		seenModSeq                             int64
+	}
+	// insert stores a message in the pre-22 schema, its flags on the messages row.
+	insert := func(t *testing.T, pool *pgxpool.Pool, s seeded, uid, flags int, keywords string) (id, updatedModSeq int64) {
+		t.Helper()
+		require.NoError(t, pool.QueryRow(ctx, `
+			INSERT INTO messages (account_id, mailbox_id, uid, s3_domain, s3_localpart, content_hash,
+			                      recipients_json, message_id, sent_date, internal_date, size,
+			                      body_structure, flags, custom_flags, flags_changed_at,
+			                      created_modseq, updated_modseq)
+			VALUES ($1, $2, $3, 'example.com', 'user', $6, '[]', $7,
+			        now(), now(), 100, 'body', $4, $5::jsonb,
+			        now(), nextval('messages_modseq'), nextval('messages_modseq'))
+			RETURNING id, updated_modseq`,
+			s.accountID, s.mailboxID, uid, flags, keywords,
+			fmt.Sprintf("hash_%d", uid), fmt.Sprintf("<%d@example.com>", uid)).Scan(&id, &updatedModSeq))
+		return id, updatedModSeq
 	}
 	// seed stores, in the pre-22 schema, one \Seen message carrying a keyword and one
 	// unseen message without keywords.
@@ -60,28 +77,12 @@ func TestMessageStateMigrationKeepsFlags(t *testing.T) {
 		pool := database.GetWritePool()
 
 		var s seeded
-		var accountID int64
-		require.NoError(t, pool.QueryRow(ctx, `INSERT INTO accounts DEFAULT VALUES RETURNING id`).Scan(&accountID))
+		require.NoError(t, pool.QueryRow(ctx, `INSERT INTO accounts DEFAULT VALUES RETURNING id`).Scan(&s.accountID))
 		require.NoError(t, pool.QueryRow(ctx, `
 			INSERT INTO mailboxes (account_id, name, uid_validity, highest_uid)
-			VALUES ($1, 'INBOX', 1, 2) RETURNING id`, accountID).Scan(&s.mailboxID))
-		insert := func(uid, flags int, keywords string) (id, updatedModSeq int64) {
-			t.Helper()
-			require.NoError(t, pool.QueryRow(ctx, `
-				INSERT INTO messages (account_id, mailbox_id, uid, s3_domain, s3_localpart, content_hash,
-				                      recipients_json, message_id, sent_date, internal_date, size,
-				                      body_structure, flags, custom_flags, flags_changed_at,
-				                      created_modseq, updated_modseq)
-				VALUES ($1, $2, $3, 'example.com', 'user', $6, '[]', $7,
-				        now(), now(), 100, 'body', $4, $5::jsonb,
-				        now(), nextval('messages_modseq'), nextval('messages_modseq'))
-				RETURNING id, updated_modseq`,
-				accountID, s.mailboxID, uid, flags, keywords,
-				fmt.Sprintf("hash_%d", uid), fmt.Sprintf("<%d@example.com>", uid)).Scan(&id, &updatedModSeq))
-			return id, updatedModSeq
-		}
-		s.seenID, s.seenModSeq = insert(1, FlagSeen, `["$Work"]`)
-		s.unseenID, _ = insert(2, 0, `[]`)
+			VALUES ($1, 'INBOX', 1, 3) RETURNING id`, s.accountID).Scan(&s.mailboxID))
+		s.seenID, s.seenModSeq = insert(t, pool, s, 1, FlagSeen, `["$Work"]`)
+		s.unseenID, _ = insert(t, pool, s, 2, 0, `[]`)
 		return s
 	}
 
@@ -233,8 +234,14 @@ func TestMessageStateMigrationKeepsFlags(t *testing.T) {
 		assertState("message_state", "message_id")
 	})
 
-	for _, existingCache := range []string{"null", `["$Reserved"]`} {
-		t.Run("keyword cache "+existingCache, func(t *testing.T) {
+	// The registry only grows: 000024 adds the keywords of the mailbox's live messages
+	// and never removes one, so a listed keyword no message carries stays listed.
+	for _, tc := range []struct{ existing, expected string }{
+		{"null", `["$Work"]`},
+		{`["$Reserved"]`, `["$Reserved", "$Work"]`},
+		{`["$Reserved", "$Work"]`, `["$Reserved", "$Work"]`},
+	} {
+		t.Run("keyword cache "+tc.existing, func(t *testing.T) {
 			m := migrateTo(t, 21)
 			s := seed(t)
 			database, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(t), false)
@@ -242,17 +249,41 @@ func TestMessageStateMigrationKeepsFlags(t *testing.T) {
 			defer database.Close()
 			pool := database.GetWritePool()
 			_, err = pool.Exec(ctx, `UPDATE mailbox_stats SET custom_flags_cache = NULLIF($1::jsonb, 'null'::jsonb)
-				WHERE mailbox_id = $2`, existingCache, s.mailboxID)
+				WHERE mailbox_id = $2`, tc.existing, s.mailboxID)
 			require.NoError(t, err)
 			require.NoError(t, m.Migrate(24))
 			var cache []byte
 			require.NoError(t, pool.QueryRow(ctx, `SELECT custom_flags_cache FROM mailbox_stats WHERE mailbox_id = $1`,
 				s.mailboxID).Scan(&cache))
-			expected := existingCache
-			if existingCache == "null" {
-				expected = `["$Work"]`
-			}
-			assert.JSONEq(t, expected, string(cache), "only an uninitialized cache should be filled")
+			assert.JSONEq(t, tc.expected, string(cache), "the registry must keep its keywords and list every live one")
 		})
 	}
+
+	// 000009 left existing mailboxes' caches NULL. From 000019 on, the cache triggers
+	// union a keyword change into COALESCE(cache, '[]'), so the first keyword set on a
+	// database running at 19 to 23 turns a NULL cache into one holding only that
+	// keyword. 000024 must still list the keywords set before 000009.
+	t.Run("cache made partial before 24 is completed", func(t *testing.T) {
+		m := migrateTo(t, 8)
+		s := seed(t)
+		require.NoError(t, m.Migrate(21))
+		database, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(t), false)
+		require.NoError(t, err)
+		insert(t, database.GetWritePool(), s, 3, FlagSeen, `["$Later"]`)
+		var cache []byte
+		err = database.GetWritePool().QueryRow(ctx,
+			`SELECT custom_flags_cache FROM mailbox_stats WHERE mailbox_id = $1`, s.mailboxID).Scan(&cache)
+		database.Close()
+		require.NoError(t, err)
+		require.JSONEq(t, `["$Later"]`, string(cache), "precondition: the 000019 trigger leaves a partial cache")
+
+		upgrade(t, m)
+		database, err = NewDatabaseFromConfig(ctx, makeTestDBConfig(t), false)
+		require.NoError(t, err)
+		defer database.Close()
+		keywordsInUse, err := database.GetUniqueCustomFlagsForMailbox(ctx, s.mailboxID)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"$Later", "$Work"}, keywordsInUse,
+			"the mailbox keyword registry must list every keyword its messages carry")
+	})
 }
