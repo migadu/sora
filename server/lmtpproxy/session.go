@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -252,6 +253,14 @@ func (s *Session) handleConnection() {
 			fromParam, found := findParameter(args, "FROM:")
 			if !found {
 				s.sendResponse("501 5.5.4 Syntax error in MAIL command (missing FROM)")
+				continue
+			}
+			// The backend never sees the SIZE parameter, so the limit advertised in LHLO
+			// is checked here, before the MTA sends the body (RFC 1870 section 6.1). A
+			// refused MAIL starts no transaction and leaves the current one alone.
+			if reply := declaredSizeReply(args, s.settings.maxMessageSize); reply != "" {
+				s.InfoLog("MAIL refused for its SIZE parameter", "limit", s.settings.maxMessageSize, "response", reply)
+				s.sendResponse(reply)
 				continue
 			}
 			// Note: extractAddress can return an empty string for a null sender "<>", which is valid.
@@ -1726,6 +1735,29 @@ func hasSMTPUTF8Param(args []string) bool {
 		}
 	}
 	return false
+}
+
+// declaredSizeReply checks the SIZE parameter of MAIL (RFC 1870 section 6) against
+// limit, the size advertised in LHLO: the 552 reply for a declared size above it
+// (section 6.1 (2)), and "" otherwise or when there is no limit. A value that is no
+// number is let through, as it always was here: the body is still checked by the
+// backend, and refusing it would stop all delivery from a client that sends one.
+func declaredSizeReply(args []string, limit int64) string {
+	if limit <= 0 {
+		return ""
+	}
+	for _, arg := range args {
+		key, value, _ := strings.Cut(arg, "=")
+		if !strings.EqualFold(key, "SIZE") {
+			continue
+		}
+		size, err := strconv.ParseUint(value, 10, 64)
+		if errors.Is(err, strconv.ErrRange) || (err == nil && size > uint64(limit)) {
+			return "552 5.3.4 Message size exceeds fixed maximum message size"
+		}
+		return ""
+	}
+	return ""
 }
 
 // isSMTPUTF8Capability reports whether an LHLO reply line ("250-SMTPUTF8" or
