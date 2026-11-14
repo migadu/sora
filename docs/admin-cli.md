@@ -104,6 +104,8 @@ Checks the health of the system's components (Database, S3) and reports the stat
 
 Dumps the fully resolved configuration, including defaults and environment variable overrides, to standard output. This is useful for debugging configuration issues.
 
+Secrets are masked by default: passwords, keys and tokens, and in any URL its userinfo and every query value (parameter names are kept, and the remote lookup `$email` and `$ip` placeholders are shown). `--mask-secrets=false` prints the values as configured.
+
 ```bash
 ./sora-admin -config ... config dump
 ```
