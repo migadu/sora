@@ -659,7 +659,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		}
 	}
 
-	// Initialize S3 storage if needed
+	// Check the staging path before any uploader or cleanup worker starts.
 	if storageServicesNeeded {
 		// The default [uploader] path moved off /tmp. Before any worker starts, refuse to
 		// strand bodies a previous release staged at the old default.
@@ -667,7 +667,6 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			errorHandler.ValidationError("uploader path", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
-
 	}
 
 	// Initialize S3 storage for mail services or a User API body reader.

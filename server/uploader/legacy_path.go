@@ -17,26 +17,42 @@ func CheckLegacyStaging(path, newDefault, legacyPath string) error {
 	if filepath.Clean(path) != filepath.Clean(newDefault) {
 		return nil
 	}
-	// The uploader followed a symlinked directory (one way to have kept the /tmp default
-	// on persistent storage), and WalkDir does not: walk its target.
-	root, err := filepath.EvalSymlinks(legacyPath)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("cannot check %s for bodies staged under the previous default [uploader] path: %w", legacyPath, err)
-	}
+	// The uploader follows symlinks in the root, account directories and body
+	// paths. WalkDir does not: visit link targets explicitly, once each so a
+	// cycle in an otherwise empty spool cannot keep startup stuck here.
 	found := ""
-	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	visited := make(map[string]bool)
+	var walk func(string) error
+	walk = func(path string) error {
+		root, err := filepath.EvalSymlinks(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil // A missing directory or dangling link holds no body.
+		}
 		if err != nil {
 			return err
 		}
-		if d.Type().IsRegular() {
-			found = p
-			return fs.SkipAll
+		if visited[root] {
+			return nil
 		}
-		return nil
-	})
+		visited[root] = true
+		return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.Type()&fs.ModeSymlink != 0 {
+				if err := walk(p); err != nil {
+					return err
+				}
+			} else if d.Type().IsRegular() {
+				found = p
+			}
+			if found != "" {
+				return fs.SkipAll
+			}
+			return nil
+		})
+	}
+	err := walk(legacyPath)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}

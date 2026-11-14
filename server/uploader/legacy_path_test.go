@@ -87,3 +87,53 @@ func TestCheckLegacyStagingFollowsSymlink(t *testing.T) {
 		t.Errorf("dangling legacy symlink: %v", err)
 	}
 }
+
+func TestCheckLegacyStagingFollowsNestedSymlink(t *testing.T) {
+	for _, directory := range []bool{true, false} {
+		name := "body file"
+		if directory {
+			name = "account directory"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			legacy, persistent := filepath.Join(root, "old"), filepath.Join(root, "persistent")
+			if err := os.MkdirAll(persistent, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			body := filepath.Join(persistent, strings.Repeat("a", 64))
+			if err := os.WriteFile(body, []byte("staged"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			link, target := filepath.Join(legacy, "42"), persistent
+			if !directory {
+				link, target = filepath.Join(link, strings.Repeat("a", 64)), body
+			}
+			if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+			newDefault := filepath.Join(root, "new")
+			if err := CheckLegacyStaging(newDefault, newDefault, legacy); err == nil {
+				t.Fatal("legacy spool reaches a staged body through a nested symlink; want refusal")
+			}
+		})
+	}
+}
+
+func TestCheckLegacyStagingSymlinkCycleWithoutBodies(t *testing.T) {
+	root := t.TempDir()
+	legacy := filepath.Join(root, "old")
+	account := filepath.Join(legacy, "42")
+	if err := os.MkdirAll(account, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(legacy, filepath.Join(account, "cycle")); err != nil {
+		t.Fatal(err)
+	}
+	newDefault := filepath.Join(root, "new")
+	if err := CheckLegacyStaging(newDefault, newDefault, legacy); err != nil {
+		t.Errorf("empty legacy spool with a symlink cycle: %v", err)
+	}
+}
