@@ -7,6 +7,7 @@ import (
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
 )
@@ -126,10 +127,14 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 	}
 	destObjects := make(map[string]destObject)
 	var destHashes []string
+	// The hash each cross-account body is made available for below. MoveMessages moves a
+	// source only if it still has it, since a rekey can rename it before the rows are locked.
+	sourceHashes := make(map[imap.UID]string)
 	for _, msg := range messages {
 		if msg.AccountID == destMailbox.AccountID {
 			continue // Same owner: body already lives under the correct S3 path.
 		}
+		sourceHashes[msg.UID] = msg.ContentHash
 		if !msg.IsUploaded {
 			if s.server.uploader == nil {
 				continue
@@ -176,11 +181,23 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		return s.server.s3.CopyWithRetry(ctx, obj.sourceKey, obj.destKey)
 	}
 
-	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname, destHashes, ensureDestObject)
+	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname, sourceHashes, destHashes, ensureDestObject)
 	if err != nil {
 		var destErr *resilient.DestObjectError
 		if errors.As(err, &destErr) {
 			return s.crossAccountObjectError(destObjects[destErr.ContentHash].sourcePending, destErr.Err)
+		}
+		if errors.Is(err, db.ErrMoveSourceChanged) {
+			// A source body was renamed (sora-admin import rekey) after it was made
+			// available above, under the old hash. Nothing was written; a new MOVE reads the
+			// new hash. RFC 5530 §3: INUSE, "The operation may succeed if the client tries
+			// again later."
+			s.InfoLog("MOVE source changed during the move; answering retryable NO", "error", err)
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeInUse,
+				Text: "Messages changed during the move, please retry",
+			}
 		}
 		return s.internalError("failed to move messages: %v", err)
 	}
