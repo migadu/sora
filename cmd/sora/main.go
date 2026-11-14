@@ -1497,6 +1497,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			WarmupMailboxes:              deps.config.LocalCache.WarmupMailboxes,
 			WarmupAsync:                  deps.config.LocalCache.WarmupAsync,
 			WarmupTimeout:                deps.config.LocalCache.WarmupTimeout,
+			WarmupInterval:               deps.config.LocalCache.WarmupInterval,
 			CapabilityFilters:            serverConfig.ClientFilters,
 			DisabledCaps:                 serverConfig.DisabledCaps,
 			AdditionalCaps:               serverConfig.AdditionalCaps,

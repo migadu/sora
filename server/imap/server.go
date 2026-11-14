@@ -1584,8 +1584,10 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 
 	logger.Debug("IMAP: Starting cache warmup", "name", s.name, "account_id", job.accountID, "message_count", job.messageCount, "mailboxes", job.mailboxNames)
 
-	// Get recent message content hashes from database through cache
-	messageHashes, err := s.cache.GetRecentMessagesForWarmup(warmupCtx, job.accountID, job.mailboxNames, job.messageCount)
+	// Get the bodies of the recent messages, each with the S3 key its message row was
+	// stored under. The key keeps the address that was primary when the body was stored,
+	// so it cannot be rebuilt from the account's current primary address.
+	messageBodies, err := s.rdb.GetRecentMessagesForWarmupWithRetry(warmupCtx, job.accountID, job.mailboxNames, job.messageCount)
 	if err != nil {
 		logger.Debug("IMAP: Failed to get recent messages for warmup", "name", s.name, "error", err)
 		metrics.WarmupOperationsTotal.WithLabelValues(s.name, "error").Inc()
@@ -1593,9 +1595,9 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 	}
 
 	totalHashes := 0
-	for mailbox, hashes := range messageHashes {
-		totalHashes += len(hashes)
-		logger.Debug("IMAP: Warmup found messages in mailbox", "name", s.name, "count", len(hashes), "mailbox", mailbox)
+	for mailbox, bodies := range messageBodies {
+		totalHashes += len(bodies)
+		logger.Debug("IMAP: Warmup found messages in mailbox", "name", s.name, "count", len(bodies), "mailbox", mailbox)
 	}
 
 	if totalHashes == 0 {
@@ -1604,20 +1606,13 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 		return
 	}
 
-	// Get user's primary email for S3 key construction
-	address, err := s.rdb.GetPrimaryEmailForAccountWithRetry(warmupCtx, job.accountID)
-	if err != nil {
-		logger.Debug("IMAP: Warmup - failed to get primary address", "name", s.name, "account_id", job.accountID, "error", err)
-		metrics.WarmupOperationsTotal.WithLabelValues(s.name, "error").Inc()
-		return
-	}
-
 	warmedCount := 0
 	skippedCount := 0
 
 	// Pre-fetch each message content
-	for _, hashes := range messageHashes {
-		for _, contentHash := range hashes {
+	for _, bodies := range messageBodies {
+		for _, body := range bodies {
+			contentHash := body.ContentHash
 			// Check for context cancellation
 			select {
 			case <-warmupCtx.Done():
@@ -1646,10 +1641,8 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 				continue // Already cached
 			}
 
-			// Build S3 key and fetch from S3 (best-effort)
-			s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), contentHash)
-
-			reader, fetchErr := s.s3.GetWithRetry(warmupCtx, s3Key)
+			// Fetch from S3 (best-effort)
+			reader, fetchErr := s.s3.GetWithRetry(warmupCtx, body.Key())
 			if fetchErr != nil {
 				logger.Debug("IMAP: Warmup - skipping, failed to fetch from S3", "name", s.name, "hash", contentHash, "error", fetchErr)
 				skippedCount++
