@@ -239,10 +239,26 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			// authorization identity IS the impersonation target. A submission without
 			// one cannot be a master login, so it is not answered from here at all —
 			// see the no-authorization-identity note below.
+			//
+			// A self-login (authorization identity = authentication identity) is handed
+			// on to regular authentication unless it logs in here, as a self-login with
+			// a wrong password is (see the wrong-password branch below). The master
+			// SASL password logs in here only from a peer master_sasl_allowed_networks
+			// admits and only as an account that exists (imapproxy logging in an
+			// account whose address is the master SASL username): a gate refusal skips
+			// this block, and a target that does not exist is handed on after the
+			// lookup. Regular authentication verifies a password even for an unknown
+			// address, so refusing the master SASL password here without one let the
+			// response time confirm a guessed master SASL password. The gate refusal is
+			// logged but not recorded (no limiter is passed): regular authentication
+			// records the attempt. A target that does not parse is refused below
+			// exactly as regular authentication refuses that username.
 			if identity != "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 {
+				selfLogin := identity == username
 				// Check if the provided authentication identity and password match the server's master SASL credentials
 				if checkMasterCredential(username, settings.masterSASLUsername) &&
-					checkMasterCredential(password, settings.masterSASLPassword) {
+					checkMasterCredential(password, settings.masterSASLPassword) &&
+					(!selfLogin || s.AdmitMasterLogin(s.ctx, settings.masterSASLGate, nil, netConn, proxyInfo, authKey, "master SASL self-login")) {
 
 					// Network gate, anchored to the real socket peer (NetConn().RemoteAddr()),
 					// which PROXY/XCLIENT/ID forwarding cannot rewrite.
@@ -296,8 +312,12 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 							}
 						}
 
-						// Same reply and same accounting as a bad credential (see above).
 						s.WarnLog("impersonation target rejected (account not found)", "target_user", targetUserToImpersonate, "error", err)
+						if selfLogin {
+							// Answered by regular authentication (see the self-login note above).
+							return s.login(s.ctx, username, password, identity, false)
+						}
+						// Same reply and same accounting as a bad credential (see above).
 						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 						if s.server.authLimiter != nil {
 							s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authKey, false)

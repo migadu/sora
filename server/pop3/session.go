@@ -301,9 +301,16 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	// or accounting of its own for a wrong master SASL password, beside the
 	// authorization refusal any other username got, confirmed the master SASL
 	// username to anyone who could reach the port.
+	// A self-login falls through too if its peer is not allowed to use the master
+	// credential, or if the account does not exist (below). This keeps its cost
+	// and cache behavior identical to a self-login using any other password.
+	// The preliminary network check is logged but leaves failure accounting to
+	// regular authentication, so the attempt is gated and recorded only once.
+	selfLogin := identity == username
 	if identity != "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
 		checkMasterCredential(username, settings.masterSASLUsername) &&
-		checkMasterCredential(password, settings.masterSASLPassword) {
+		checkMasterCredential(password, settings.masterSASLPassword) &&
+		(!selfLogin || s.AdmitMasterLogin(ctx, settings.masterSASLGate, nil, netConn, proxyInfo, authKey, "master SASL self-login")) {
 		if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master SASL") {
 			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
 			return 0, errAuthFailed
@@ -345,18 +352,22 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
 				return 0, errTempUnavailable
 			}
-			// Same reply and same accounting as a bad credential (see above).
 			s.WarnLog("impersonation target rejected (account not found)", "target_user", targetAddr.BaseAddress(), "error", err)
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+			if !selfLogin {
+				// Same reply and same accounting as a bad credential (see above).
+				if s.server.authLimiter != nil {
+					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+				}
+				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
+				return 0, errAuthFailed
 			}
-			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
-			return 0, errAuthFailed
+			// A self-login: answered by regular authentication below (see above).
+		} else {
+			authSuccess = true
+			masterAuthUsed = true
+			// The session belongs to the impersonated account, not the master credential.
+			userAddress = &targetAddr
 		}
-		authSuccess = true
-		masterAuthUsed = true
-		// The session belongs to the impersonated account, not the master credential.
-		userAddress = &targetAddr
 	} else if identity != "" && identity != username && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
 		checkMasterCredential(username, settings.masterSASLUsername) {
 		// The master SASL username asking to act as somebody else, with a wrong

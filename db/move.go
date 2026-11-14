@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
@@ -11,9 +14,58 @@ import (
 	"github.com/migadu/sora/logger"
 )
 
-func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string) (map[imap.UID]imap.UID, error) {
+// LockS3ObjectsSharedInTx takes the S3 object locks (GetS3ObjectLockID) of accountID's
+// contentHashes in shared mode on tx, in id order, waiting for an exclusive holder (for at
+// most the transaction's lock_timeout). They last until tx ends. Shared holders do not
+// exclude one another; they keep out every exclusive locker of the same objects: the
+// cleaner's and the purge's deletes (which only try the lock and skip a busy object), a
+// restore, sora-admin rekey, and the uploader's write gate.
+//
+// The statement carries the ids as literals, so it goes over the simple protocol and
+// leaves no portal or snapshot behind: a transaction that holds the locks across S3 round
+// trips before its first write idles with neither a transaction id nor an xmin, and so
+// holds back neither VACUUM nor CREATE INDEX CONCURRENTLY.
+func LockS3ObjectsSharedInTx(ctx context.Context, tx pgx.Tx, accountID int64, contentHashes []string) error {
+	if len(contentHashes) == 0 {
+		return nil
+	}
+	ids := make([]int64, len(contentHashes))
+	for i, hash := range contentHashes {
+		ids[i] = GetS3ObjectLockID(accountID, hash)
+	}
+	slices.Sort(ids)
+	ids = slices.Compact(ids)
+	literals := make([]string, len(ids))
+	for i, id := range ids {
+		literals[i] = strconv.FormatInt(id, 10)
+	}
+	// unnest preserves array order, so the locks are taken in it.
+	sql := "SELECT pg_advisory_xact_lock_shared(id) FROM unnest(ARRAY[" + strings.Join(literals, ",") + "]::bigint[]) AS t(id)"
+	if _, err := tx.Exec(ctx, sql); err != nil {
+		return fmt.Errorf("failed to lock S3 objects: %w", err)
+	}
+	return nil
+}
+
+// MoveMessages moves the messages with the given UIDs from srcMailboxID into
+// destMailboxID, owned by destAccountID, within the caller's transaction, and returns a
+// map of old UIDs to new UIDs.
+//
+// A moved row of another account is re-keyed to destAccountID's S3 path
+// (destS3Domain/destS3Localpart). It is uploaded exactly when its body is in
+// destObjects: the bodies whose object under that path the caller made exist while tx
+// held their locks in shared mode (LockS3ObjectsSharedInTx), so the cleaner cannot have
+// deleted it since and cannot until these rows commit. Any other re-keyed row is staged
+// for an upload under the owner's path, from the staging file the caller linked there.
+// Whether the source row is uploaded says nothing about the owner's key: an upload of
+// the source that finished after the caller looked wrote only the source's key.
+// destObjects may be nil, as it is when every source row belongs to destAccountID.
+func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, destObjects []string) (map[imap.UID]imap.UID, error) {
 	// Map to store the original UID to new UID mapping
 	messageUIDMap := make(map[imap.UID]imap.UID)
+	if destObjects == nil {
+		destObjects = []string{} // = ANY(NULL) would be NULL, not false
+	}
 
 	// Per RFC 6851, moving to the same mailbox is allowed and assigns new UIDs.
 	// This is useful for "refreshing" messages with new UIDs.
@@ -190,12 +242,15 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					mailbox_id, mailbox_path, created_modseq, uid
 				)
 				SELECT
-					$6 AS account_id, content_hash, uploaded, message_id, in_reply_to,
+					$6 AS account_id, content_hash,
+					CASE WHEN src_account_id = $6 THEN uploaded ELSE content_hash = ANY($9::text[]) END AS uploaded,
+					message_id, in_reply_to,
 					subject, sent_date, internal_date, size,
 					body_structure, recipients_json,
 					-- Same-account moves keep the source row's S3 key (the object lives there);
 					-- only a move into another account's mailbox is re-keyed to the owner,
-					-- whose copy of the object the caller has made first (server/imap/move.go).
+					-- whose copy of the object the caller has made in this transaction
+					-- (destObjects, above).
 					CASE WHEN src_account_id = $6 THEN src_s3_domain ELSE $7 END AS s3_domain,
 					CASE WHEN src_account_id = $6 THEN src_s3_localpart ELSE $8 END AS s3_localpart,
 					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
@@ -211,7 +266,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 			FROM inserted i
 			JOIN src_data s ON s.new_uid = i.uid
 			JOIN message_state ms ON ms.message_id = s.original_id
-		`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart)
+		`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart, destObjects)
 		if err != nil {
 			logger.Error("Database: failed to batch insert messages into destination mailbox", "err", err)
 			return nil, fmt.Errorf("failed to move messages: %w", err)
