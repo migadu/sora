@@ -87,6 +87,39 @@ func TestCommandHelpSendsNoRequest(t *testing.T) {
 	}
 }
 
+// TestConfigValidateHelp: `config validate --help` prints its usage and exits 0, as
+// `config --help` promises ("config <subcommand> --help"), wherever --config is. It
+// validated the file instead, and without --config printed "Error: --config is
+// required" and exited 1.
+func TestConfigValidateHelp(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte("[database]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"no config", []string{"config", "validate", "--help"}},
+		{"no config -h", []string{"config", "validate", "-h"}},
+		{"config before", []string{"--config", configPath, "config", "validate", "--help"}},
+		{"config after", []string{"config", "validate", "--config", configPath, "-h"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, code := runAdminMain(t, tc.args...)
+			if code != 0 {
+				t.Errorf("exit code %d, want 0:\n%s", code, out)
+			}
+			if !strings.Contains(out, "Usage:") {
+				t.Errorf("no usage printed:\n%s", out)
+			}
+			if strings.Contains(out, "Validating configuration file") || strings.Contains(out, "Error:") {
+				t.Errorf("--help did not stop at the usage:\n%s", out)
+			}
+		})
+	}
+}
+
 // TestAffinityCacheStatusPartialMemoryUsage (#316 item 5): a memory_usage block without
 // broadcast_queue_max or queue_utilization (another server version) is printed as far as
 // it goes instead of panicking.

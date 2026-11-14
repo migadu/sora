@@ -33,6 +33,7 @@ node_id = "gossip-name-distinct"
 // populated by a direct toml.Decode and empty in production.
 func loadAdminConfigFromString(t *testing.T, body string) AdminConfig {
 	t.Helper()
+	keepBcryptCost(t)
 
 	path := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
