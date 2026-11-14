@@ -275,21 +275,21 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 			}
 		}
 
-		if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master SASL") {
-			return errAuthFailed
+		if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, nil, netConn, proxyInfo, authKey, "master SASL") {
+			err, out := s.refuseMasterSASLImpersonation(ctx, authnParsed, parseErr, password, netConn, proxyInfo, authKey)
+			outcome = out
+			return err
 		}
 		s.DebugLog("master sasl user authenticated, attempting impersonation", "authn_id", authnID, "authz_id", authzID)
 
 		// Log in as the authzID without a password check
 		address, err := server.NewAddress(authzID)
 		if err != nil {
-			// Same reply and same accounting as a bad credential: see the
-			// master-username path above.
+			// Same reply, accounting, and password-verification work as a bad credential (#846).
 			s.WarnLog("impersonation target rejected (address not in the correct format)", "target_user", authzID, "error", err)
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
-			return errAuthFailed
+			refusalErr, out := s.refuseMasterSASLImpersonation(ctx, authnParsed, parseErr, password, netConn, proxyInfo, authKey)
+			outcome = out
+			return refusalErr
 		}
 
 		// Resolve the account by the base address (stripping any +detail
@@ -305,11 +305,10 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 			}
 			s.WarnLog("impersonation target rejected (account not found)", "target_user", authzID, "error", err)
 			if !selfLogin {
-				// Same reply and same accounting as a bad credential (see above).
-				if s.server.authLimiter != nil {
-					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-				}
-				return errAuthFailed
+				// Same reply, accounting, and password-verification work as a bad credential (#846).
+				refusalErr, out := s.refuseMasterSASLImpersonation(ctx, authnParsed, parseErr, password, netConn, proxyInfo, authKey)
+				outcome = out
+				return refusalErr
 			}
 			// A self-login: answered by regular authentication below (see above),
 			// already gated here.
@@ -443,6 +442,27 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 	}
 	success = true
 	return nil
+}
+
+// refuseMasterSASLImpersonation answers a refused non-self master SASL login
+// with the same password-verification work, lookup-cache update, rate-limit
+// accounting, and error reply that a wrong password receives via regular
+// authentication (#846), without exposing proxy-auth errors if authnParsed
+// happens to name an account whose own password equals master_sasl_password.
+func (s *ManageSieveSession) refuseMasterSASLImpersonation(ctx context.Context, authnParsed server.Address, parseErr error, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) (error, string) {
+	if parseErr == nil &&
+		!(len(s.server.masterUsername) > 0 && authnParsed.HasSuffix() && checkMasterCredential(authnParsed.Suffix(), s.server.masterUsername)) {
+		if _, authErr := s.server.Authenticate(ctx, authnParsed.BaseAddress(), password); authErr != nil {
+			if authUnavailable(authErr) {
+				s.DebugLog("authentication unavailable", "error", authErr)
+				return errTryLater, "unavailable"
+			}
+		}
+	}
+	if s.server.authLimiter != nil {
+		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+	}
+	return errAuthFailed, "failure"
 }
 
 // Login implements the non-standard LOGIN verb the backend has historically

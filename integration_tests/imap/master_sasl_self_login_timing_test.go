@@ -87,3 +87,79 @@ func TestIMAP_MasterSASLSelfLoginTimingIsNotAPasswordOracle(t *testing.T) {
 		})
 	}
 }
+
+// TestIMAP_MasterSASLRefusalTimingIsNotAPasswordOracle: when a SASL PLAIN login
+// carries an authorization identity other than its address-shaped master SASL
+// authentication identity, #786 sends wrong passwords through regular
+// authentication (costing one password verification), so a master SASL refusal —
+// peer outside master_sasl_allowed_networks, malformed target, or unknown target —
+// must also cost one password verification rather than answering in zero.
+func TestIMAP_MasterSASLRefusalTimingIsNotAPasswordOracle(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+
+	saslUser := fmt.Sprintf("proxy-%d@example.com", time.Now().UnixNano())
+	unknownTarget := fmt.Sprintf("nobody-%d@example.com", time.Now().UnixNano())
+	const saslPass = "master-sasl-secret"
+
+	for _, tc := range []struct {
+		name         string
+		saslUser     string
+		saslPass     string
+		networks     []string
+		authzID      string
+		cacheEnabled bool
+		wantVerified int
+	}{
+		{"peer_outside_allowed_networks", saslUser, saslPass, []string{"192.0.2.0/24"}, account.Email, false, 1},
+		{"cached_peer_outside_allowed_networks", saslUser, saslPass, []string{"192.0.2.0/24"}, account.Email, true, 1},
+		{"malformed_target", saslUser, saslPass, nil, "not-an-address", false, 1},
+		{"cached_malformed_target", saslUser, saslPass, nil, "not-an-address", true, 1},
+		{"unknown_target", saslUser, saslPass, nil, unknownTarget, false, 1},
+		{"cached_unknown_target", saslUser, saslPass, nil, unknownTarget, true, 1},
+		{"non_address_master_username", "proxy-master", saslPass, nil, unknownTarget, false, 0},
+		{"account_owned_master_username", account.Email, account.Password, nil, unknownTarget, false, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			address := common.GetRandomAddress(t)
+			srv, err := serverImap.New(context.Background(), "test-master-sasl-refusal-timing", "localhost", address,
+				&storage.S3Storage{}, rdb, nil, nil,
+				serverImap.IMAPServerOptions{
+					InsecureAuth:              true,
+					MasterSASLUsername:        []byte(tc.saslUser),
+					MasterSASLPassword:        []byte(tc.saslPass),
+					MasterSASLAllowedNetworks: tc.networks,
+					LookupCache:               &config.LookupCacheConfig{Enabled: tc.cacheEnabled},
+				})
+			if err != nil {
+				t.Fatalf("Failed to create IMAP server: %v", err)
+			}
+			go func() {
+				if err := srv.Serve(address); err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+					t.Logf("IMAP server stopped: %v", err)
+				}
+			}()
+			time.Sleep(100 * time.Millisecond)
+			t.Cleanup(func() { srv.Close() })
+
+			counted := func(password string) (string, int) {
+				before := testutils.PasswordVerifications()
+				reply := imapAuthPlain(t, address, tc.authzID, tc.saslUser, password)
+				return reply, testutils.PasswordVerifications() - before
+			}
+			wrongReply, wrongVerified := counted("wrong-password")
+			masterReply, masterVerified := counted(tc.saslPass)
+
+			if masterReply != wrongReply {
+				t.Fatalf("refusal answered differently by password:\n  wrong password:  %q\n  master password: %q", wrongReply, masterReply)
+			}
+			if wrongVerified != tc.wantVerified {
+				t.Fatalf("wrong password answered after %d password verifications, want %d", wrongVerified, tc.wantVerified)
+			}
+			if masterVerified != wrongVerified {
+				t.Errorf("master SASL password answered after %d password verifications, wrong password after %d: the response time confirms the master SASL password", masterVerified, wrongVerified)
+			}
+		})
+	}
+}
