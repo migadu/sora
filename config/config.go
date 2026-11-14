@@ -646,7 +646,15 @@ type AuthRateLimiterConfig struct {
 // disabled the IP block on another). TOML accepts nan and inf, which pass a sign check
 // but are no growth factor. Any finite multiplier is safe: the limiter caps the
 // product at max_delay before converting it to a time.Duration.
+//
+// It also rejects an exempt_networks entry that is neither an IP address nor a CIDR.
+// The limiter's match skips such an entry, so it would exempt nobody, and the host the
+// operator meant to exempt would be counted and blocked with nothing in the log to say
+// why. A malformed [servers] trusted_networks entry is refused the same way.
 func (c *AuthRateLimiterConfig) Validate() error {
+	if invalid := helpers.InvalidNetworkEntries(c.ExemptNetworks); len(invalid) > 0 {
+		return fmt.Errorf("auth_rate_limit.exempt_networks has entries that are neither an IP address nor a CIDR: %q", invalid)
+	}
 	v := reflect.ValueOf(c).Elem()
 	for i := 0; i < v.NumField(); i++ {
 		f := v.Field(i)
