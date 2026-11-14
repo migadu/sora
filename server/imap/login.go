@@ -159,152 +159,107 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 		}
 	}
 
+	// The account the session is for, and how it was authenticated. Both branches
+	// below only establish these; the session is then set up by ONE path after
+	// them, so a master login prepares the account exactly like a regular one
+	// (default mailboxes, cache warmup, connection tracking, kick poller).
+	var AccountID int64
+	method := "main_db"
+
 	// Master username authentication: user@domain.com@MASTER_USERNAME
 	// Check if suffix matches configured MasterUsername
 	if len(s.server.masterUsername) > 0 && addressParsed.HasSuffix() && checkMasterCredential(addressParsed.Suffix(), s.server.masterUsername) {
 		// Suffix matches MasterUsername, authenticate with MasterPassword
-		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
-			if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
-				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-				return authFailedError()
-			}
-			// Use base address (without suffix) to get account
-			AccountID, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, addressParsed.BaseAddress())
-			if err != nil {
-				// Check if error is due to context cancellation (server shutdown)
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					s.InfoLog("master username auth cancelled due to server shutdown")
-					return &imap.Error{
-						Type: imap.StatusResponseTypeNo,
-						Code: imap.ResponseCodeUnavailable,
-						Text: server.ErrServerShuttingDown.Error(),
-					}
-				}
-
-				// Same reply and same accounting as a bad credential, as in the
-				// AUTHENTICATE PLAIN master path (sasl.go). This site is reachable
-				// ONLY with the correct master password, so a distinguishable reply,
-				// or a failure the master credential is not charged for, confirms a
-				// guessed tenant-wide password without completing an authentication.
-				s.WarnLog("impersonation target rejected (account not found)", "target_user", addressParsed.BaseAddress(), "error", err)
-				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-				if s.server.authLimiter != nil {
-					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-				}
-				return authFailedError()
-			}
-
-			// Get primary email address for this account
-			// User.Address should always be the primary address (not the login address with suffix)
-			primaryAddr, err := s.server.rdb.GetPrimaryEmailForAccountWithRetry(ctx, AccountID)
-			if err != nil {
-				return s.internalError("failed to get primary email: %v", err)
-			}
-
-			if !s.server.maintenanceGate.Admit(&s.server.authenticatedConnections, "imap") {
-				return s.refusedInMaintenance()
-			}
-			duration := time.Since(authStart)
-
-			// Log authentication with alias detection
-			loginAddr := addressParsed.BaseAddress()
-			if loginAddr != primaryAddr.FullAddress() {
-				s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-			} else {
-				s.InfoLog("authentication successful", "address", loginAddr, "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-			}
-
-			// Prometheus metrics - successful authentication
-			metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
-			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
-
-			// IMPORTANT: Set user state AFTER incrementing both counters to prevent race condition
-			// If session closes between counter increments and user state setting, cleanup won't decrement
-			s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
-			s.Session.User = &s.IMAPUser.User
-
-			// Record successful authentication
+		if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, s.server.masterPassword) {
+			// Record failed master password authentication
+			metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
 
-			// Register connection for tracking
-			if err := s.registerConnection(addressParsed.BaseAddress()); err != nil {
-				// Connection limit reached - undo authentication and reject
-				s.server.authenticatedConnections.Add(-1)
-				metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Dec()
-				s.IMAPUser = nil
-				s.Session.User = nil
+			// Master username suffix matched but the password was wrong. Answer exactly like
+			// any other bad credential: a distinct "Invalid master credentials" reply is
+			// reachable with only the master USERNAME (no secret), so it confirms the
+			// configured master username to anyone who can reach the port - the precondition
+			// for every other master-form attack. The reason is kept for the operator at WARN.
+			s.WarnLog("master username authentication failed (invalid master password)")
+			return authFailedError()
+		}
+
+		if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
+			metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
+			return authFailedError()
+		}
+		// Use base address (without suffix) to get account
+		AccountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, addressParsed.BaseAddress())
+		if err != nil {
+			// Check if error is due to context cancellation (server shutdown)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.InfoLog("master username auth cancelled due to server shutdown")
 				return &imap.Error{
 					Type: imap.StatusResponseTypeNo,
-					Code: imap.ResponseCodeLimit,
-					Text: "Maximum connections reached",
+					Code: imap.ResponseCodeUnavailable,
+					Text: server.ErrServerShuttingDown.Error(),
 				}
 			}
 
-			// Start termination poller to check for kick commands
-			s.startTerminationPoller()
-
-			return nil
-		}
-
-		// Record failed master password authentication
-		metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-		if s.server.authLimiter != nil {
-			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-		}
-
-		// Master username suffix matched but the password was wrong. Answer exactly like
-		// any other bad credential: a distinct "Invalid master credentials" reply is
-		// reachable with only the master USERNAME (no secret), so it confirms the
-		// configured master username to anyone who can reach the port - the precondition
-		// for every other master-form attack. The reason is kept for the operator at WARN.
-		s.WarnLog("master username authentication failed (invalid master password)")
-		return authFailedError()
-	}
-
-	// Regular authentication - use the already parsed address
-	// If it has a suffix but didn't match MasterUsername, fall through to regular auth
-	// (this allows the suffix to be used for remotelookup in proxy scenarios)
-
-	s.DebugLog("authentication attempt", "address", addressParsed.BaseAddress())
-
-	// Use base address (without +detail and without suffix) for authentication
-	AccountID, err := s.server.Authenticate(ctx, addressParsed.BaseAddress(), password)
-	if err != nil {
-		s.DebugLog("authentication failed", "error", err)
-
-		// Check if error is due to context cancellation (server shutdown)
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			// Server is shutting down - return temporary failure without recording as auth failure
-			s.InfoLog("authentication cancelled due to server shutdown")
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeUnavailable,
-				Text: server.ErrServerShuttingDown.Error(),
+			// Same reply and same accounting as a bad credential, as in the
+			// AUTHENTICATE PLAIN master path (sasl.go). This site is reachable
+			// ONLY with the correct master password, so a distinguishable reply,
+			// or a failure the master credential is not charged for, confirms a
+			// guessed tenant-wide password without completing an authentication.
+			s.WarnLog("impersonation target rejected (account not found)", "target_user", addressParsed.BaseAddress(), "error", err)
+			metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
+			if s.server.authLimiter != nil {
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
+			return authFailedError()
 		}
+		method = "master"
+	} else {
+		// Regular authentication - use the already parsed address
+		// If it has a suffix but didn't match MasterUsername, fall through to regular auth
+		// (this allows the suffix to be used for remotelookup in proxy scenarios)
 
-		// The database could not be asked, so nothing is known about the credentials:
-		// a temporary failure (RFC 5530 section 3, "a subsystem is down"), not counted
-		// as a failed login, or clients retrying a saved password through an outage
-		// stay blocked after it.
-		if server.IsTemporaryAuthFailure(err) {
-			metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeUnavailable,
-				Text: server.ErrAuthServiceUnavailable.Error(),
+		s.DebugLog("authentication attempt", "address", addressParsed.BaseAddress())
+
+		// Use base address (without +detail and without suffix) for authentication
+		AccountID, err = s.server.Authenticate(ctx, addressParsed.BaseAddress(), password)
+		if err != nil {
+			s.DebugLog("authentication failed", "error", err)
+
+			// Check if error is due to context cancellation (server shutdown)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				// Server is shutting down - return temporary failure without recording as auth failure
+				s.InfoLog("authentication cancelled due to server shutdown")
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeUnavailable,
+					Text: server.ErrServerShuttingDown.Error(),
+				}
 			}
-		}
 
-		// Record failed authentication
-		metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-		if s.server.authLimiter != nil {
-			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-		}
+			// The database could not be asked, so nothing is known about the credentials:
+			// a temporary failure (RFC 5530 section 3, "a subsystem is down"), not counted
+			// as a failed login, or clients retrying a saved password through an outage
+			// stay blocked after it.
+			if server.IsTemporaryAuthFailure(err) {
+				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeUnavailable,
+					Text: server.ErrAuthServiceUnavailable.Error(),
+				}
+			}
 
-		return authFailedError()
+			// Record failed authentication
+			metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
+			if s.server.authLimiter != nil {
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+			}
+
+			return authFailedError()
+		}
 	}
 
 	// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
@@ -328,9 +283,9 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 	// Log authentication with alias detection
 	loginAddr := addressParsed.BaseAddress()
 	if loginAddr != primaryAddr.FullAddress() {
-		s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID, "cached", false, "method", "main_db", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+		s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID, "cached", false, "method", method, "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 	} else {
-		s.InfoLog("authentication successful", "address", loginAddr, "account_id", AccountID, "cached", false, "method", "main_db", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+		s.InfoLog("authentication successful", "address", loginAddr, "account_id", AccountID, "cached", false, "method", method, "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 	}
 
 	// Prometheus metrics - successful authentication
