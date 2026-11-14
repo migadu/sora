@@ -59,6 +59,12 @@ func (d *migrationDriver) Run(migration io.Reader) error {
 		return nil
 	}
 	if _, err := d.conn.Exec(context.Background(), query); err != nil {
+		// A migration with an explicit BEGIN...COMMIT that fails mid-way leaves
+		// the pinned session in an aborted transaction (TxStatus 'E'); roll it
+		// back so Version/SetVersion on this connection do not fail with 25P02.
+		if d.conn.PgConn() != nil && d.conn.PgConn().TxStatus() != 'I' {
+			_, _ = d.conn.Exec(context.Background(), "ROLLBACK")
+		}
 		return migrationError(query, err)
 	}
 	return nil
