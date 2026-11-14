@@ -91,3 +91,53 @@ func TestTrackersOfAProtocolOnOneNodeCountEachOther(t *testing.T) {
 		}
 	})
 }
+
+func TestTrackersOfAProtocolOnOneNodeSerializeLastSlot(t *testing.T) {
+	for _, perIP := range []bool{false, true} {
+		t.Run(fmt.Sprintf("perIP=%t", perIP), func(t *testing.T) {
+			node := newSingleNodeCluster(t, "last-slot")
+			maxUser, maxIP := 1, 0
+			if perIP {
+				maxUser, maxIP = 0, 1
+			}
+			a := NewConnectionTracker("IMAP", "a", "mail", "a", node, maxUser, maxIP, 0, false)
+			defer a.Stop()
+			b := NewConnectionTracker("IMAP", "b", "mail", "b", node, maxUser, maxIP, 0, false)
+			defer b.Stop()
+			for accountID := int64(1); accountID <= 100; accountID++ {
+				start := make(chan struct{})
+				type result struct {
+					tracker *ConnectionTracker
+					addr    string
+					err     error
+				}
+				results := make(chan result, 2)
+				for i, tracker := range []*ConnectionTracker{a, b} {
+					addr := []string{"[2001:db8::1]:40000", "[2001:0DB8:0:0:0:0:0:1]:40001"}[i]
+					go func() {
+						<-start
+						results <- result{tracker, addr, tracker.RegisterConnection(context.Background(), accountID,
+							"user@example.com", "IMAP", addr)}
+					}()
+				}
+				close(start)
+				first, second := <-results, <-results
+				if (first.err == nil) == (second.err == nil) {
+					t.Fatalf("last slot must admit exactly one listener: %v, %v", first.err, second.err)
+				}
+				for _, r := range []result{first, second} {
+					if r.err == nil {
+						if err := r.tracker.UnregisterConnection(context.Background(), accountID, "IMAP", r.addr); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			}
+			a.node.mu.Lock()
+			defer a.node.mu.Unlock()
+			if len(a.node.counts) != 0 {
+				t.Fatalf("shared counts retain closed sessions: %v", a.node.counts)
+			}
+		})
+	}
+}
