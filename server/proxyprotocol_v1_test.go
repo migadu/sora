@@ -2,9 +2,12 @@ package server
 
 import (
 	"bufio"
+	"fmt"
 	"io"
+	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The PROXY v1 line must match the HAProxy PROXY protocol specification
@@ -96,5 +99,113 @@ func TestParseProxyV1Accepts(t *testing.T) {
 				t.Errorf("after the header the connection reads %q", rest)
 			}
 		})
+	}
+}
+
+// On the server-speaks-first protocols (IMAP, POP3, LMTP, ManageSieve) the sender
+// writes the PROXY header and then waits for the greeting, so ReadProxyHeader must
+// decide on the bytes the header itself contains. The shortest header, the v1
+// short form "PROXY UNKNOWN\r\n", is 15 bytes (haproxy doc/proxy-protocol.txt
+// section 2.1); waiting for a 16th byte holds the connection until the PROXY
+// timeout and then drops it. For UNKNOWN the session keeps the connection's own
+// addresses.
+func TestReadProxyHeaderServerSpeaksFirst(t *testing.T) {
+	v2, err := GenerateProxyV2Header("192.0.2.1", 51000, "192.0.2.10", 143, "TCP")
+	if err != nil {
+		t.Fatalf("GenerateProxyV2Header: %v", err)
+	}
+	for _, mode := range []string{"required", "optional"} {
+		for _, tt := range []struct {
+			name, header, protocol, clientIP string
+		}{
+			{"v1 UNKNOWN short form", "PROXY UNKNOWN\r\n", "UNKNOWN", "127.0.0.1"},
+			{"v1 TCP4", "PROXY TCP4 192.0.2.1 192.0.2.10 51000 143\r\n", "TCP4", "192.0.2.1"},
+			{"v2 TCP4", string(v2), "", "192.0.2.1"},
+		} {
+			t.Run(mode+"/"+tt.name, func(t *testing.T) {
+				testReadProxyHeaderServerSpeaksFirst(t, mode, tt.header, tt.protocol, tt.clientIP)
+			})
+		}
+	}
+}
+
+func testReadProxyHeaderServerSpeaksFirst(t *testing.T, mode, header, protocol, clientIP string) {
+	const timeout = 2 * time.Second
+	reader, err := NewProxyProtocolReader("TEST", ProxyProtocolConfig{
+		Enabled:        true,
+		Mode:           mode,
+		TrustedProxies: []string{"127.0.0.0/8"},
+		Timeout:        timeout.String(),
+	})
+	if err != nil {
+		t.Fatalf("NewProxyProtocolReader: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	// The sender: the header, then nothing until the greeting.
+	sent := make(chan error, 1)
+	go func() {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			sent <- err
+			return
+		}
+		defer c.Close()
+		c.SetDeadline(time.Now().Add(2 * timeout))
+		if _, err := c.Write([]byte(header)); err != nil {
+			sent <- err
+			return
+		}
+		greeting, err := bufio.NewReader(c).ReadString('\n')
+		if err != nil {
+			sent <- err
+			return
+		}
+		if greeting != "* OK\r\n" {
+			sent <- fmt.Errorf("read greeting %q", greeting)
+			return
+		}
+		_, err = c.Write([]byte("A1 LOGOUT\r\n"))
+		sent <- err
+	}()
+
+	conn, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer conn.Close()
+
+	start := time.Now()
+	info, wrapped, err := reader.ReadProxyHeader(conn)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("%q: ReadProxyHeader failed after %v: %v", header, elapsed, err)
+	}
+	if elapsed >= timeout/2 {
+		t.Errorf("%q: ReadProxyHeader took %v (PROXY timeout %v)", header, elapsed, timeout)
+	}
+	if info == nil || (protocol != "" && info.Protocol != protocol) {
+		t.Fatalf("%q parsed as %+v, want protocol %q", header, info, protocol)
+	}
+	if got := GetRealClientIP(conn, info); got != clientIP {
+		t.Errorf("%q: client IP %q, want %q", header, got, clientIP)
+	}
+
+	// The header, and nothing after it, is consumed: the session greets and
+	// reads the sender's first command.
+	wrapped.SetDeadline(time.Now().Add(timeout))
+	if _, err := wrapped.Write([]byte("* OK\r\n")); err != nil {
+		t.Fatalf("greeting: %v", err)
+	}
+	line, err := bufio.NewReader(wrapped).ReadString('\n')
+	if err != nil || line != "A1 LOGOUT\r\n" {
+		t.Errorf("after the header the session reads %q, %v", line, err)
+	}
+	if err := <-sent; err != nil {
+		t.Errorf("sender: %v", err)
 	}
 }
