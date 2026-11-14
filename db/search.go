@@ -1111,7 +1111,12 @@ func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums [
 		}
 		uidBySeq[uint32(seq)] = imap.UID(uid)
 	}
-	return uidBySeq, rows.Err()
+	// An error the server raises while the statement runs (a statement timeout, a
+	// dropped connection) arrives here rather than from Query.
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to map sequence numbers to UIDs: %w", err)
+	}
+	return uidBySeq, nil
 }
 
 // appendSeqSetNums includes zero as a marker for a target-mailbox '*' lookup.

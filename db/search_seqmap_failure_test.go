@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/migadu/go-imap"
 	"github.com/stretchr/testify/require"
@@ -79,4 +80,48 @@ func TestSearchFailsWhenSequenceMappingFails(t *testing.T) {
 				"the search must report the mapping failure, got: %v", err)
 		})
 	}
+}
+
+// A mapping statement that the server rejects while it runs reports its error after
+// Query has returned (pgx hands it over through rows.Err). The search must still say
+// that the sequence mapping is what failed, and keep the server's error as the cause.
+func TestSearchNamesSequenceMappingFailedDuringExecution(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	database := setupTestDatabase(t)
+	defer database.Close()
+	ctx := context.Background()
+
+	ts := time.Now().UnixNano()
+	accountID := createTestAccount(t, database, fmt.Sprintf("seqmapexec_%d@example.com", ts), "password")
+	mailboxID := seedDenseMailbox(t, database, accountID, fmt.Sprintf("SeqMapExec_%d", ts), 10)
+
+	// On these connections, and only on them, "messages" resolves to a session-local
+	// view whose uid fails to compute (pg_temp is searched first for relations), so
+	// the mapping statement prepares fine and fails on its first row.
+	poolCfg := database.ReadPool.Config().Copy()
+	afterConnect := poolCfg.AfterConnect
+	poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		if afterConnect != nil {
+			if err := afterConnect(ctx, conn); err != nil {
+				return err
+			}
+		}
+		_, err := conn.Exec(ctx, `CREATE TEMP VIEW messages AS
+			SELECT id, mailbox_id, expunged_at, uid / 0 AS uid FROM public.messages`)
+		return err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	require.NoError(t, err)
+	defer pool.Close()
+	failing := &Database{WritePool: database.WritePool, ReadPool: pool}
+
+	criteria := imap.SearchCriteria{SeqNum: []imap.SeqSet{{imap.SeqRange{Start: 1, Stop: 5}}}}
+	_, err = failing.SearchMessagesWithCriteria(ctx, mailboxID, accountID, &criteria, 0, 10)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "failed to map sequence numbers to UIDs")
+	var pgErr *pgconn.PgError
+	require.Truef(t, errors.As(err, &pgErr), "the server's error must stay the cause, got: %v", err)
+	require.Equal(t, "22012", pgErr.Code, "division_by_zero from the view")
 }
