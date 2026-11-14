@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 )
@@ -130,6 +132,109 @@ func accountMailboxState(t *testing.T, rdb *resilient.ResilientDatabase, account
 	return state
 }
 
+// TestImporter_DryRunPreviewsTheImport checks that a --dovecot dry run reports what
+// the import would do. The import resolves every folder among the account's own
+// mailboxes, so a same-named mailbox another owner shares with the account is not
+// the one it writes to: the dry run must not report that mailbox's UIDVALIDITY as
+// the one it would change, nor skip a message because that mailbox holds it. It
+// also says that the import would create the missing default mailboxes.
+func TestImporter_DryRunPreviewsTheImport(t *testing.T) {
+	rdb := setupTestDatabase(t)
+	defer rdb.Close()
+	ctx := context.Background()
+
+	const ownerEmail, email, team = "owner@example.com", "user@example.com", "Shared/Team"
+	createSimpleTestAccount(t, rdb, ownerEmail, "testpassword123")
+	createSimpleTestAccount(t, rdb, email, "testpassword123")
+	ownerID, err := rdb.GetAccountIDByAddressWithRetry(ctx, ownerEmail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := testMessage{uid: 7, filename: "1700000003.M3P3.host", flags: "S", subject: "team",
+		from: "a@example.com", to: "team@example.com", date: time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)}
+
+	// The owner's Shared/Team holds the message and is shared with the user.
+	ownerMaildir := filepath.Join(t.TempDir(), "Maildir")
+	createMaildirFolder(t, ownerMaildir)
+	createMaildirFolder(t, filepath.Join(ownerMaildir, ".Shared.Team"))
+	createMessagesInMaildir(t, filepath.Join(ownerMaildir, ".Shared.Team"), []testMessage{msg})
+	ownerImport, err := NewImporter(ctx, ownerMaildir, ownerEmail, 1, rdb, nil, ImporterOptions{TestMode: true, BatchSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ownerImport.Run(); err != nil {
+		t.Fatalf("owner import: %v", err)
+	}
+	if _, err := rdb.GetOperationalDatabase().WritePool.Exec(ctx,
+		`UPDATE mailboxes SET is_shared = TRUE, owner_domain = 'example.com' WHERE account_id = $1 AND name = $2`,
+		ownerID, team); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.GrantMailboxAccessByIdentifierWithRetry(ctx, ownerID, email, team, "lr"); err != nil {
+		t.Fatal(err)
+	}
+	if shared, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, team); err != nil || shared.AccountID != ownerID {
+		t.Fatalf("the user does not see the owner's %s: %+v, %v", team, shared, err)
+	}
+
+	// The user's maildir has a folder of the same name holding the same message.
+	maildir := filepath.Join(t.TempDir(), "Maildir")
+	createMaildirFolder(t, maildir)
+	teamDir := filepath.Join(maildir, ".Shared.Team")
+	createMaildirFolder(t, teamDir)
+	createMessagesInMaildir(t, teamDir, []testMessage{msg})
+	createDovecotUIDList(t, teamDir, 4444, 8, []testMessage{msg})
+	if err := os.WriteFile(filepath.Join(maildir, "subscriptions"), []byte("V\t2\n\nINBOX\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := common.CaptureLogs(t)
+	importer, err := NewImporter(ctx, maildir, email, 1, rdb, nil,
+		ImporterOptions{DryRun: true, Dovecot: true, PreserveUIDs: true, TestMode: true, BatchSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	report := captureStdout(t, func() { runErr = importer.Run() })
+	if runErr != nil {
+		t.Fatalf("dry run: %v", runErr)
+	}
+
+	if !strings.Contains(report, "IMPORT "+msg.filename) {
+		t.Errorf("the dry run does not report importing %s into the user's own %s:\n%s", msg.filename, team, report)
+	}
+	logs.WaitForLine(t, "DRY RUN: Would create mailbox with the Dovecot UIDVALIDITY", "mailbox="+team, "uidvalidity=4444")
+	logs.WaitForLine(t, "DRY RUN: Would create any missing default mailboxes")
+
+	// The import does what the dry run said: it creates the user's own Shared/Team
+	// with the Dovecot UIDVALIDITY and imports the message into it.
+	importer, err = NewImporter(ctx, maildir, email, 1, rdb, nil,
+		ImporterOptions{Dovecot: true, PreserveUIDs: true, TestMode: true, BatchSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := importer.Run(); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	ownID, err := rdb.GetOwnedMailboxIDByNameWithRetry(ctx, accountID, team)
+	if err != nil {
+		t.Fatalf("the import did not create the user's own %s: %v", team, err)
+	}
+	var uidValidity, messages int64
+	if err := rdb.GetOperationalDatabase().ReadPool.QueryRow(ctx, `SELECT uid_validity,
+		(SELECT COUNT(*) FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL) FROM mailboxes WHERE id = $1`,
+		ownID).Scan(&uidValidity, &messages); err != nil {
+		t.Fatal(err)
+	}
+	if uidValidity != 4444 || messages != 1 {
+		t.Errorf("the user's own %s has uidvalidity=%d and %d messages, want 4444 and 1", team, uidValidity, messages)
+	}
+}
+
 // TestS3Importer_DryRunChangesNothing is TestImporter_DryRunChangesNothing for
 // `import s3 --dry-run`, whose analysis created the default mailboxes as well.
 func TestS3Importer_DryRunChangesNothing(t *testing.T) {
@@ -165,4 +270,27 @@ func TestS3Importer_DryRunChangesNothing(t *testing.T) {
 	if fmt.Sprint(after) != fmt.Sprint(before) {
 		t.Errorf("dry run changed the account\nbefore: %v\nafter:  %v", before, after)
 	}
+}
+
+// captureStdout returns what f prints to standard output, where the dry run
+// writes its report.
+func captureStdout(t *testing.T, f func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make(chan string)
+	go func() {
+		b, _ := io.ReadAll(r)
+		out <- string(b)
+	}()
+	stdout := os.Stdout
+	os.Stdout = w
+	func() {
+		defer func() { os.Stdout = stdout }()
+		f()
+	}()
+	w.Close()
+	return <-out
 }

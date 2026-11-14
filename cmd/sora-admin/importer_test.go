@@ -42,14 +42,14 @@ func newMockResilientDatabase() *mockResilientDatabase {
 	}
 }
 
-func (m *mockResilientDatabase) GetMailboxByNameWithRetry(ctx context.Context, accountID int64, name string) (*db.DBMailbox, error) {
+func (m *mockResilientDatabase) GetOwnedMailboxIDByNameWithRetry(ctx context.Context, accountID int64, name string) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.getMailboxByNameCalls++
 	if mailbox, ok := m.mailboxes[name]; ok {
-		return mailbox, nil
+		return mailbox.ID, nil
 	}
-	return nil, consts.ErrMailboxNotFound
+	return 0, consts.ErrMailboxNotFound
 }
 
 func (m *mockResilientDatabase) CreateMailboxWithRetry(ctx context.Context, accountID int64, name string, parentID *int64) error {
