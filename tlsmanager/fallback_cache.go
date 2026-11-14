@@ -249,6 +249,33 @@ func (fc *FallbackCache) Delete(ctx context.Context, name string) error {
 	return nil
 }
 
+// deletionRecords is implemented by a primary cache that records the deletions sora-admin
+// makes (S3Cache).
+type deletionRecords interface {
+	DeletedAt(ctx context.Context, name string) (time.Time, error)
+}
+
+// deletedSinceStored reports whether the certificate cached under name was deleted from
+// the primary cache at or after the time this node stored its local copy. Such a copy is
+// one the operator deleted; a copy stored later, while S3 refused writes, is not.
+func (fc *FallbackCache) deletedSinceStored(ctx context.Context, name string) (bool, error) {
+	records, ok := fc.primary.(deletionRecords)
+	if !ok {
+		return false, nil
+	}
+	deletedAt, err := records.DeletedAt(ctx, name)
+	if err != nil || deletedAt.IsZero() {
+		return false, err
+	}
+	// autocert.DirCache keeps an entry in a file of that name, written to a temporary
+	// file and renamed into place, so its modification time is when it was stored.
+	info, err := os.Stat(filepath.Join(fc.fallbackDir, filepath.Clean("/"+name)))
+	if err != nil {
+		return false, err
+	}
+	return !info.ModTime().After(deletedAt), nil
+}
+
 // GetFallbackDir returns the local fallback directory path
 func (fc *FallbackCache) GetFallbackDir() string {
 	return fc.fallbackDir

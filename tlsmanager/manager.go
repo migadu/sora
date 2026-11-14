@@ -287,7 +287,7 @@ func (m *Manager) initLetsEncryptProvider() error {
 	}
 
 	// Initialize S3 cache
-	s3cache, err := NewS3Cache(leCfg.S3, encryptionOptions(leCfg.S3)...)
+	s3cache, err := OpenS3Cache(leCfg.S3)
 	if err != nil {
 		return fmt.Errorf("failed to initialize S3 cache: %w", err)
 	}

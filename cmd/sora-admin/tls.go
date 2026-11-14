@@ -130,6 +130,11 @@ Examples:
 
   # Dry run to see what would be deleted
   sora-admin tls delete --domain imap.example.com --dry-run --config config.toml
+
+Running servers hold their certificates in their local fallback cache too. The delete
+leaves a deletion marker in S3, and at its next certificate sync (sync_interval, default
+5m) each server removes its local copy instead of writing it back to S3. A server keeps
+serving a certificate it has already loaded until it restarts or renews it.
 `)
 	}
 
@@ -183,7 +188,9 @@ Options:
   --force               Skip confirmation prompt
   --config string       Path to TOML configuration file (required)
 
-This command deletes only expired certificates from both S3 and local cache.
+This command deletes only expired certificates from both S3 and local cache. Like
+delete, it leaves a deletion marker in S3 for each, so that running servers remove their
+local copies at their next certificate sync instead of writing them back.
 
 Examples:
   # Clean expired certificates (with confirmation)
@@ -738,6 +745,7 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 
 	var keysToDelete []string // S3 objects that exist
 	var localFiles []string   // local cache files that exist
+	var marks []string        // certificate keys to mark deleted
 
 	if domain != "" {
 		name, err := autocertName(domain)
@@ -751,6 +759,9 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 		// exists is deleted and counted: storage.DeleteContext succeeds for a missing key.
 		for _, entry := range []string{name, name + "+rsa"} {
 			key := tlsmanager.S3ObjectKey(entry)
+			// Marked even when S3 lacks it: a running node may hold a copy it has yet
+			// to write to S3, and the domain's certificates are what is being deleted.
+			marks = append(marks, key)
 			exists, _, err := s3store.ExistsContext(ctx, key)
 			if err != nil {
 				return fmt.Errorf("failed to look up %s in S3: %w", key, err)
@@ -858,6 +869,17 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 		return nil
 	}
 
+	if domain == "" {
+		marks = keysToDelete
+	}
+	cache, err := tlsmanager.OpenS3Cache(s3cfg)
+	if err != nil {
+		return fmt.Errorf("failed to open the certificate cache: %w", err)
+	}
+	if err := markDeleted(ctx, cache, marks); err != nil {
+		return err
+	}
+
 	var failures []error
 	deleted := 0
 	for _, key := range keysToDelete {
@@ -882,6 +904,7 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 		logger.Info("Deleted certificate from local cache", "path", localPath)
 		removed++
 	}
+	remarkDeleted(ctx, cache, marks)
 
 	fmt.Printf("\nDeleted %d certificate(s) from S3 and %d file(s) from the local cache\n", deleted, removed)
 	if len(failures) > 0 {
@@ -1012,6 +1035,18 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		}
 	}
 
+	marks := make([]string, 0, len(expiredCerts))
+	for _, cert := range expiredCerts {
+		marks = append(marks, cert.S3Key)
+	}
+	cache, err := tlsmanager.OpenS3Cache(s3cfg)
+	if err != nil {
+		return fmt.Errorf("failed to open the certificate cache: %w", err)
+	}
+	if err := markDeleted(ctx, cache, marks); err != nil {
+		return err
+	}
+
 	// Delete expired certificates
 	deleted := 0
 	for _, cert := range expiredCerts {
@@ -1035,8 +1070,35 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		}
 	}
 
+	remarkDeleted(ctx, cache, marks)
+
 	fmt.Printf("\nDeleted %d expired certificate(s)\n", deleted)
 	return nil
+}
+
+// markDeleted records in the bucket that the certificates stored under keys are deleted
+// now (tlsmanager.S3Cache.MarkDeleted). Every running server holds its certificates in
+// its local fallback cache as well, and its certificate sync writes a certificate that S3
+// lacks back to S3 unless a marker shows that it was deleted after the server stored its
+// copy. Call it before deleting the objects, so that no server finds one missing without
+// a marker, and remarkDeleted after.
+func markDeleted(ctx context.Context, cache *tlsmanager.S3Cache, keys []string) error {
+	at := time.Now()
+	for _, key := range keys {
+		if err := cache.MarkDeleted(ctx, key, at); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// remarkDeleted moves the deletion markers past the deletion itself, so that a copy a
+// server downloaded while the objects were being deleted counts as deleted too. The
+// markers written before the deletion still stand if this fails.
+func remarkDeleted(ctx context.Context, cache *tlsmanager.S3Cache, keys []string) {
+	if err := markDeleted(ctx, cache, keys); err != nil {
+		logger.Warn("Failed to update the deletion markers after the delete", "error", err)
+	}
 }
 
 func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, specificDomain string, force bool) error {

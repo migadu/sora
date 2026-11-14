@@ -96,6 +96,12 @@ func (c *S3Cache) validateEncryption() error {
 	return nil
 }
 
+// OpenS3Cache opens the certificate cache cfg describes as the server does, with the
+// server-side encryption the configuration asks for.
+func OpenS3Cache(cfg config.TLSLetsEncryptS3Config) (*S3Cache, error) {
+	return NewS3Cache(cfg, encryptionOptions(cfg)...)
+}
+
 // NewS3Cache creates a new S3-backed autocert cache using AWS SDK.
 func NewS3Cache(cfg config.TLSLetsEncryptS3Config, opts ...S3CacheOption) (*S3Cache, error) {
 	ctx := context.Background()
@@ -168,6 +174,22 @@ func (c *S3Cache) Get(ctx context.Context, key string) ([]byte, error) {
 
 	logger.Debug("S3-Cache: Getting certificate", "key", key, "s3_key", s3Key)
 
+	data, err := c.getObject(ctx, s3Key)
+	if errors.Is(err, autocert.ErrCacheMiss) {
+		logger.Debug("S3-Cache: Certificate not found (cache miss)", "key", key)
+		return nil, err
+	}
+	if err != nil {
+		logger.Error("S3-Cache: Failed to get object from S3", "key", key, "error", err)
+		return nil, err
+	}
+
+	logger.Debug("S3-Cache: Successfully retrieved certificate", "key", key, "bytes", len(data))
+	return data, nil
+}
+
+// getObject reads the object s3Key. A missing object is autocert.ErrCacheMiss.
+func (c *S3Cache) getObject(ctx context.Context, s3Key string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, s3OperationTimeout)
 	defer cancel()
 
@@ -185,11 +207,9 @@ func (c *S3Cache) Get(ctx context.Context, key string) ([]byte, error) {
 		var responseError *awshttp.ResponseError
 		if errors.As(err, &responseError) {
 			if responseError.HTTPStatusCode() == http.StatusNotFound {
-				logger.Debug("S3-Cache: Certificate not found (cache miss)", "key", key)
 				return nil, autocert.ErrCacheMiss
 			}
 		}
-		logger.Error("S3-Cache: Failed to get object from S3", "key", key, "error", err)
 		return nil, fmt.Errorf("failed to get object from S3: %w", err)
 	}
 	defer result.Body.Close()
@@ -197,11 +217,8 @@ func (c *S3Cache) Get(ctx context.Context, key string) ([]byte, error) {
 	// Read object data
 	data, err := io.ReadAll(result.Body)
 	if err != nil {
-		logger.Error("S3-Cache: Failed to read object data", "error", err)
 		return nil, fmt.Errorf("failed to read object: %w", err)
 	}
-
-	logger.Debug("S3-Cache: Successfully retrieved certificate", "key", key, "bytes", len(data))
 	return data, nil
 }
 
@@ -211,6 +228,20 @@ func (c *S3Cache) Put(ctx context.Context, key string, data []byte) error {
 
 	logger.Debug("S3-Cache: Putting certificate", "key", key, "s3_key", s3Key, "bytes", len(data))
 
+	if err := c.putObject(ctx, s3Key, data); err != nil {
+		// The algorithm is logged because a store that does not implement it rejects the
+		// write outright, and that reads as a plain upload failure otherwise.
+		logger.Error("S3-Cache: Failed to upload certificate to S3", "key", key,
+			"server_side_encryption", c.sseAlgorithm, "error", err)
+		return err
+	}
+
+	logger.Debug("S3-Cache: Successfully stored certificate", "key", key)
+	return nil
+}
+
+// putObject writes data to the object s3Key with the configured server-side encryption.
+func (c *S3Cache) putObject(ctx context.Context, s3Key string, data []byte) error {
 	ctx, cancel := context.WithTimeout(ctx, s3OperationTimeout)
 	defer cancel()
 
@@ -229,17 +260,45 @@ func (c *S3Cache) Put(ctx context.Context, key string, data []byte) error {
 	}
 
 	// Upload to S3
-	_, err := c.client.PutObject(ctx, input)
-	if err != nil {
-		// The algorithm is logged because a store that does not implement it rejects the
-		// write outright, and that reads as a plain upload failure otherwise.
-		logger.Error("S3-Cache: Failed to upload certificate to S3", "key", key,
-			"server_side_encryption", c.sseAlgorithm, "error", err)
+	if _, err := c.client.PutObject(ctx, input); err != nil {
 		return fmt.Errorf("failed to upload to S3: %w", err)
 	}
-
-	logger.Debug("S3-Cache: Successfully stored certificate", "key", key)
 	return nil
+}
+
+// MarkDeleted records in the bucket that the certificate stored under the object key
+// certKey (see S3ObjectKey) was deleted, at the given time. sora-admin calls it before it
+// deletes the object: every node holds the certificate in its local fallback cache too,
+// and its certificate sync writes a certificate that S3 lacks back to S3 unless the
+// marker shows it was deleted after the node stored its copy. A key that holds no
+// certificate cache entry has no marker and is ignored.
+func (c *S3Cache) MarkDeleted(ctx context.Context, certKey string, at time.Time) error {
+	marker, ok := deletionMarkerKey(certKey)
+	if !ok {
+		return nil
+	}
+	if err := c.putObject(ctx, marker, []byte(at.UTC().Format(time.RFC3339Nano))); err != nil {
+		return fmt.Errorf("recording the deletion of %s: %w", certKey, err)
+	}
+	return nil
+}
+
+// DeletedAt reports when the certificate cached under name was last deleted from the
+// bucket by sora-admin, and the zero time if it never was.
+func (c *S3Cache) DeletedAt(ctx context.Context, name string) (time.Time, error) {
+	marker, _ := deletionMarkerKey(S3ObjectKey(name))
+	data, err := c.getObject(ctx, marker)
+	if errors.Is(err, autocert.ErrCacheMiss) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	at, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(data)))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("deletion marker %s: %w", marker, err)
+	}
+	return at, nil
 }
 
 // Delete removes certificate data from S3.
@@ -275,8 +334,14 @@ func (c *S3Cache) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// s3KeyPrefix is the bucket prefix every S3 cache entry is stored under.
-const s3KeyPrefix = "autocert/"
+const (
+	// s3KeyPrefix is the bucket prefix every S3 cache entry is stored under.
+	s3KeyPrefix = "autocert/"
+	// certKeyPrefix and deletionMarkerPrefix name, followed by the hash of a cache entry
+	// name, the object that holds the entry and the one that records its deletion.
+	certKeyPrefix        = s3KeyPrefix + "cert-"
+	deletionMarkerPrefix = s3KeyPrefix + "deleted-"
+)
 
 // S3ObjectKey returns the bucket key the S3 cache stores the autocert cache entry name
 // under. autocert names a domain's ECDSA certificate "<domain>" and its RSA one
@@ -284,6 +349,17 @@ const s3KeyPrefix = "autocert/"
 // use this so that they address exactly the objects the server reads and writes.
 func S3ObjectKey(name string) string {
 	return s3KeyPrefix + hashKey(name)
+}
+
+// deletionMarkerKey returns the key of the object that records the deletion of the cache
+// entry stored under certKey. The marker carries the same hash, so that a certificate
+// deleted by its object key alone is marked as well as one deleted by name.
+func deletionMarkerKey(certKey string) (string, bool) {
+	hash, ok := strings.CutPrefix(certKey, certKeyPrefix)
+	if !ok || hash == "" {
+		return "", false
+	}
+	return deletionMarkerPrefix + hash, true
 }
 
 // hashKey creates a deterministic hash of the certificate key for S3 storage.

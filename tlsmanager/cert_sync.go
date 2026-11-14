@@ -189,7 +189,26 @@ func (m *Manager) syncCertificateFromS3(ctx context.Context, domain string) erro
 // S3, where the other nodes read it. FallbackCache.Put keeps a certificate locally when S3
 // refuses the write and retries S3 once; the sync worker retries every interval after
 // that, until the write succeeds.
+//
+// S3 also lacks a certificate that an operator deleted with sora-admin, which every node
+// still holds locally. sora-admin leaves a deletion marker for it, and a local copy stored
+// no later than that deletion is removed instead: written back, it would undo the delete
+// on every node at their next sync.
 func publishLocalCertificate(ctx context.Context, fallbackCache *FallbackCache, domain string, data []byte) error {
+	deleted, err := fallbackCache.deletedSinceStored(ctx, domain)
+	if err != nil {
+		logger.Warn("CertSync: Cannot tell whether the certificate held only on this node was deleted from S3 - not writing it back, will retry", "domain", domain, "error", err)
+		return err
+	}
+	if deleted {
+		if err := fallbackCache.fallback.Delete(ctx, domain); err != nil {
+			logger.Warn("CertSync: Failed to remove the local copy of a certificate deleted from S3", "domain", domain, "error", err)
+			return err
+		}
+		logger.Info("CertSync: Certificate was deleted from S3 after this node stored it - removed the local copy", "domain", domain)
+		return nil
+	}
+
 	if err := fallbackCache.primary.Put(ctx, domain, data); err != nil {
 		logger.Warn("CertSync: Certificate held only on this node could not be written to S3 - will retry", "domain", domain, "error", err)
 		return err
