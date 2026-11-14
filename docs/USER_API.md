@@ -239,7 +239,8 @@ Because the path ends in an operation name, a mailbox whose last level is called
 mailbox with one of those names cannot be listed or searched.
 
 **Responses** are JSON with `Content-Type: application/json`, except the message body and raw
-message (section 7). Times are RFC 3339.
+message (section 7). Times are RFC 3339, except a token's `expires_at`, which is Unix seconds
+(section 3.1).
 
 **Errors** are JSON objects with an `error` field:
 
@@ -269,7 +270,7 @@ with these plain-text exceptions from Go's HTTP library:
 | 422 | A message would have more than 50 keywords. |
 | 429 | Too many logins waiting on a delay. |
 | 500 | Server error. |
-| 503 | Message body not available yet, or storage unreachable (with `Retry-After`). |
+| 503 | Message body not available yet, or storage unreachable (with `Retry-After`); a database error at login or refresh. |
 
 **Access control.** The `allowed_hosts` check runs first on every request, the login
 included: `403 {"error":"Host not allowed"}`. Then CORS (section 11), then the token. The
@@ -401,7 +402,8 @@ A mailbox that does not exist gives `404 Mailbox not found`.
 Messages are addressed by their `id`, a number that identifies the message row across the
 whole system. The `id`-based endpoints (7.2 to 7.7) work on every message the account can list,
 in its own mailboxes and in shared mailboxes, subject to the mailbox's ACL as in IMAP: the `r`
-right to read a message, the write and delete rights to change its flags.
+right to read a message; to change its flags, `s` for `\Seen`, `t` for `\Deleted` and `w` for
+every other flag and keyword (RFC 4314 section 2.1).
 
 ### 7.1 List a mailbox's messages
 
