@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
@@ -127,28 +128,47 @@ func TestBuildSearchHeaderConditions(t *testing.T) {
 // Before = d + 24h. RFC 9051 §6.4.4: BEFORE / SENTBEFORE match a date "earlier than
 // the specified date", so the upper bound excludes midnight of that day; SINCE /
 // SENTSINCE match one "within or later than", so the lower bound includes it.
+//
+// The SENT* keys compare the day the Date: header names in its own zone (#867): the
+// header's wall-clock time, sent_date shifted by sent_utc_offset, against the date. The
+// offset is read by primary key, and only for a message sent within a day of the date
+// (p2 decides every message outside that band, p3 bounds the band), so the mailbox scan
+// itself stays on the header covering index.
 func TestBuildSearchDateConditions(t *testing.T) {
 	var db *Database // builder does not dereference the receiver
 	day := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	dayBefore, dayAfter := day.Add(-24*time.Hour), day.Add(24*time.Hour)
+	const headerTime = "m.sent_date + make_interval(secs => COALESCE(message_sent_utc_offset(m.id), 0))"
 
 	tests := []struct {
 		name     string
 		criteria *imap.SearchCriteria
+		prefix   string
 		want     string
+		args     pgx.NamedArgs
 	}{
-		{"SINCE", &imap.SearchCriteria{Since: day}, "m.internal_date >= @p1"},
-		{"BEFORE", &imap.SearchCriteria{Before: day}, "m.internal_date < @p1"},
-		{"SENTSINCE", &imap.SearchCriteria{SentSince: day}, "m.sent_date >= @p1"},
-		{"SENTBEFORE", &imap.SearchCriteria{SentBefore: day}, "m.sent_date < @p1"},
+		{"SINCE", &imap.SearchCriteria{Since: day}, "m", "m.internal_date >= @p1", pgx.NamedArgs{"p1": day}},
+		{"BEFORE", &imap.SearchCriteria{Before: day}, "m", "m.internal_date < @p1", pgx.NamedArgs{"p1": day}},
+		{"SENTSINCE", &imap.SearchCriteria{SentSince: day}, "m",
+			"(m.sent_date >= @p2 OR (m.sent_date >= @p3 AND " + headerTime + " >= @p1))",
+			pgx.NamedArgs{"p1": day, "p2": dayAfter, "p3": dayBefore}},
+		{"SENTBEFORE", &imap.SearchCriteria{SentBefore: day}, "m",
+			"(m.sent_date < @p2 OR (m.sent_date < @p3 AND " + headerTime + " < @p1))",
+			pgx.NamedArgs{"p1": day, "p2": dayBefore, "p3": dayAfter}},
+		// The legacy seqnum statement passes no prefix, but its messages alias is m, and an
+		// unqualified id would be ambiguous there (message_seqs has one too).
+		{"SENTSINCE without prefix", &imap.SearchCriteria{SentSince: day}, "",
+			"(m.sent_date >= @p2 OR (m.sent_date >= @p3 AND " + headerTime + " >= @p1))",
+			pgx.NamedArgs{"p1": day, "p2": dayAfter, "p3": dayBefore}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			paramCounter := 0
-			condition, args, err := db.buildSearchCriteriaWithPrefix(tt.criteria, "p", &paramCounter, "m")
+			condition, args, err := db.buildSearchCriteriaWithPrefix(tt.criteria, "p", &paramCounter, tt.prefix)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, condition)
-			assert.Equal(t, day, args["p1"])
+			assert.Equal(t, tt.args, args)
 		})
 	}
 }
