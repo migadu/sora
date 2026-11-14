@@ -32,8 +32,9 @@ import (
 // nor received mail without an INBOX for the whole session. The same login must
 // also trigger the cache warmup a regular login triggers.
 //
-// The regular LOGIN subtest is the control: it shows that the fixture really
-// starts without mailboxes and that the warmup is observable.
+// The regular LOGIN subtest is the control: it shows that the checks pass for a
+// login that prepares the account and that the warmup is observable. The fixture
+// itself checks that every account starts without mailboxes.
 func TestIMAP_MasterUsername_LoginPreparesFreshAccount(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -101,19 +102,30 @@ func TestIMAP_MasterUsername_LoginPreparesFreshAccount(t *testing.T) {
 }
 
 // createAccountWithoutMailboxes creates an account the way account creation
-// does, with no mailboxes, unlike common.CreateTestAccount.
+// does, with no mailboxes, unlike common.CreateTestAccount. It fails the test if
+// the account already has a mailbox, since every check after the login would
+// then pass without the login having created anything.
 func createAccountWithoutMailboxes(t *testing.T, rdb *resilient.ResilientDatabase) (email, password string) {
 	t.Helper()
 
 	email = fmt.Sprintf("fresh-%d@example.com", time.Now().UnixNano())
 	password = "s3cur3p4ss!"
-	if _, err := rdb.CreateAccountWithRetry(context.Background(), db.CreateAccountRequest{
+	accountID, err := rdb.CreateAccountWithRetry(context.Background(), db.CreateAccountRequest{
 		Email:     email,
 		Password:  password,
 		HashType:  "bcrypt",
 		IsPrimary: true,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("Failed to create test account: %v", err)
+	}
+
+	mailboxes, err := rdb.GetMailboxesWithRetry(context.Background(), accountID, false)
+	if err != nil {
+		t.Fatalf("Failed to list the new account's mailboxes: %v", err)
+	}
+	if len(mailboxes) != 0 {
+		t.Fatalf("the new account already has %d mailboxes before any login, want 0", len(mailboxes))
 	}
 	return email, password
 }
