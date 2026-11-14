@@ -1831,22 +1831,31 @@ func readMessage(path string, maxSize int64) ([]byte, error) {
 	defer reader.Close()
 
 	limit := importSizeLimit(maxSize, compressed)
-	var buf bytes.Buffer
-	if fi, err := file.Stat(); err == nil && !compressed {
+	src := io.LimitReader(reader, limit+1)
+	var content []byte
+	if fi, serr := file.Stat(); serr == nil && !compressed {
 		// An uncompressed file is the message: allocate it at once, as os.ReadFile
-		// does, with room for the read that sees the end of it (bytes.MinRead).
-		buf.Grow(int(min(fi.Size(), limit)) + bytes.MinRead)
+		// does, with room for the read that sees the end of it (bytes.MinRead). One
+		// above the limit is read to the byte past it, and is allocated no more.
+		buf := bytes.NewBuffer(make([]byte, 0, int(min(fi.Size(), limit+1))+bytes.MinRead))
+		_, err = buf.ReadFrom(src)
+		content = buf.Bytes()
+	} else {
+		// A decompressed size is known only once read. The batch holds the message
+		// until the insert, and io.ReadAll leaves far less spare capacity than a
+		// bytes.Buffer, which doubles.
+		content, err = io.ReadAll(src)
 	}
-	if _, err := buf.ReadFrom(io.LimitReader(reader, limit+1)); err != nil {
+	if err != nil {
 		if compressed {
 			return nil, fmt.Errorf("failed to decompress content: %w", err)
 		}
 		return nil, err
 	}
-	if int64(buf.Len()) > limit {
+	if int64(len(content)) > limit {
 		return nil, fmt.Errorf("%w: more than %d bytes", errMessageTooLarge, limit)
 	}
-	return buf.Bytes(), nil
+	return content, nil
 }
 
 // parseMessageMetadata extracts metadata from message content
