@@ -516,7 +516,7 @@ func (s *Server) setupHandler() http.Handler {
 			claims, err := s.extractAndValidateToken(r)
 			if err != nil {
 				logger.Warn("User API Proxy: Authentication failed", "name", s.name, "path", r.URL.Path, "error", err)
-				s.writeError(w, r, unauthorizedMessage(err), http.StatusUnauthorized)
+				s.writeUnauthorized(w, r, err)
 				return
 			}
 
@@ -1052,24 +1052,28 @@ func (s *Server) validateToken(tokenString string) (*JWTClaims, error) {
 	return nil, fmt.Errorf("invalid token claims")
 }
 
-// The refusals of extractAndValidateToken that unauthorizedMessage tells apart.
+// The refusals of extractAndValidateToken that writeUnauthorized tells apart.
 var (
 	errNoAuthHeader  = errors.New("authorization header required")
 	errNotBearerAuth = errors.New("authorization header must be 'Bearer <token>'")
 )
 
-// unauthorizedMessage is the 401 message for a token extractAndValidateToken refused with
-// err: the User API's own for the same refusal (userapi jwtAuthMiddleware), so a token the
-// proxy refuses is answered as a backend answers it.
-func unauthorizedMessage(err error) string {
+// writeUnauthorized answers r, whose token extractAndValidateToken refused with err, as
+// the User API answers the same refusal (userapi jwtAuthMiddleware), so a token the proxy
+// refuses is answered as a backend answers it: the same message and the same Bearer
+// challenge, which RFC 9110 section 15.5.2 requires on every 401. A request without a
+// bearer token gets the challenge without an error code, a refused token
+// error="invalid_token" (RFC 6750 section 3.1).
+func (s *Server) writeUnauthorized(w http.ResponseWriter, r *http.Request, err error) {
+	msg, tokenRefused := "Invalid or expired token", true
 	switch {
 	case errors.Is(err, errNoAuthHeader):
-		return "Authorization header required"
+		msg, tokenRefused = "Authorization header required", false
 	case errors.Is(err, errNotBearerAuth):
-		return "Authorization header must be 'Bearer <token>'"
-	default:
-		return "Invalid or expired token"
+		msg, tokenRefused = "Authorization header must be 'Bearer <token>'", false
 	}
+	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, tokenRefused)
+	s.writeError(w, r, msg, http.StatusUnauthorized)
 }
 
 // extractAndValidateToken extracts and validates JWT token from request
