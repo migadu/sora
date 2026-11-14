@@ -88,9 +88,10 @@ func (s *Session) AuthenticatePlain(_ context.Context, _, username, password str
 		if errors.As(err, &rateLimitErr) {
 			return &managesieveserver.Error{Message: `"Authentication failed"`, Close: true}
 		}
-		// Check if error is due to server shutdown or temporary unavailability
+		// Server shutdown or a service the login depends on is down: a temporary
+		// failure, RFC 5804 section 1.3 TRYLATER.
 		if server.IsTemporaryAuthFailure(err) {
-			return &managesieveserver.Error{Code: "UNAVAILABLE", Message: "Service temporarily unavailable, please try again later"}
+			return &managesieveserver.Error{Code: "TRYLATER", Message: "Service temporarily unavailable, please try again later"}
 		}
 		return &managesieveserver.Error{Message: `"Authentication failed"`}
 	}
@@ -477,12 +478,14 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				}
 
 				// Transient error (network, 5xx, circuit breaker) - NEVER fallback to DB
-				// These are service availability issues, not "user not found" cases
-				s.DebugLog("remotelookup transient error - service unavailable", "error", err)
+				// These are service availability issues, not "user not found" cases.
+				// Nothing is wrong with the client's credentials: answer a temporary
+				// failure (NO (TRYLATER)) and do not charge the auth rate limiter, or
+				// clients retrying during an outage get delayed and blocked.
+				s.WarnLog("remotelookup transient error - service unavailable", "error", err)
 				metrics.RemoteLookupResult.WithLabelValues("managesieve", "transient_error_rejected").Inc()
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return fmt.Errorf("remotelookup service unavailable")
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+				return server.ErrAuthServiceUnavailable
 			} else {
 				// Unknown error type - log and fallthrough
 				s.WarnLog("remotelookup unknown error - attempting fallback", "error", err)
@@ -580,7 +583,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				// RemoteLookup service is temporarily unavailable - tell user to retry later
 				s.WarnLog("remotelookup service temporarily unavailable")
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
-				return fmt.Errorf("authentication service temporarily unavailable, please try again later")
+				return server.ErrAuthServiceUnavailable
 
 			case proxy.AuthUserNotFound:
 				// User not found in remotelookup (404/3xx)

@@ -1066,12 +1066,14 @@ func (s *Session) authenticateUser(username, password string) error {
 				}
 
 				// Transient error (network, 5xx, circuit breaker) - NEVER fallback to DB
-				// These are service availability issues, not "user not found" cases
+				// These are service availability issues, not "user not found" cases.
+				// Nothing is wrong with the client's credentials: answer a temporary
+				// failure (NO [UNAVAILABLE]) and do not charge the auth rate limiter, or
+				// clients retrying during an outage get delayed and blocked.
 				s.WarnLog("remotelookup transient error - service unavailable", "error", err)
 				metrics.RemoteLookupResult.WithLabelValues("imap", "transient_error_rejected").Inc()
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return fmt.Errorf("remotelookup service unavailable")
+				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+				return server.ErrAuthServiceUnavailable
 			} else {
 				// Unknown error type - fallthrough to main DB auth
 			}
