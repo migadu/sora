@@ -719,11 +719,11 @@ return messages in this shape:
 | `mailbox_id`, `mailbox_path` | The mailbox it is in. |
 | `subject` | The decoded `Subject`. |
 | `from` | The first `From` address, address only (no display name). |
-| `to`, `cc`, `bcc` | Addresses only. `cc` is filled in lists, search results and `GET /user/messages/{id}`; `bcc` only in lists. Empty lists are left out (or `null` for `to`). |
+| `to`, `cc`, `bcc` | Addresses only. `cc` is filled in lists, search results and `GET /user/messages/{id}`; `bcc` only in lists. `to` is always present (`[]` when the message has none); empty `cc` and `bcc` are left out. |
 | `date` | The message's `Date` header, as stored. |
 | `internal_date` | When the message arrived in Sora. |
 | `size` | Bytes. |
-| `flags` | System flags. `null` when there are none. |
+| `flags` | System flags. `[]` when there are none. |
 | `custom_flags` | Keywords. Left out when there are none. |
 | `message_id`, `in_reply_to` | From the headers. |
 | `references` | The `References` header; only in `GET /user/messages/{id}`. |

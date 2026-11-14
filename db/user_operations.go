@@ -35,7 +35,6 @@ type DBMessage struct {
 	MessageID    string    `json:"message_id"`
 	InReplyTo    string    `json:"in_reply_to,omitempty"`
 	References   string    `json:"references,omitempty"`
-	Recipients   []string  `json:"recipients,omitempty"`
 	ContentHash  string    `json:"content_hash"`
 	S3Domain     string    `json:"-"`
 	AccountID    int64     `json:"-"` // owner of the row (the pending-upload key, with ContentHash)
@@ -52,8 +51,11 @@ type DBMessage struct {
 // setRecipients fills From, To, Cc and Bcc from recipients_json. It is stored as a
 // list of helpers.Recipient ({type, email, name}; db/append.go), the list IMAP FETCH
 // ENVELOPE reads too (db/fetch.go); list, search and get-by-ID all decode it here so
-// their recipient fields cannot drift apart.
+// their recipient fields cannot drift apart. To is never nil: unlike cc and bcc it
+// is not omitempty, and the API documents it as an array, so a message without a To
+// address sends [] rather than null.
 func (msg *DBMessage) setRecipients(recipientsJSON []byte) {
+	msg.To = []string{}
 	if len(recipientsJSON) == 0 {
 		return
 	}
@@ -208,7 +210,8 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 	}
 	defer rows.Close()
 
-	var messages []*DBMessage
+	// Never nil: an empty result is the JSON array [], not null.
+	messages := []*DBMessage{}
 	for rows.Next() {
 		msg := &DBMessage{}
 		var customFlagsJSON []byte
@@ -334,7 +337,8 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 	}
 	defer rows.Close()
 
-	var messages []*DBMessage
+	// Never nil: an empty result is the JSON array [], not null.
+	messages := []*DBMessage{}
 	for rows.Next() {
 		msg := &DBMessage{}
 		var customFlagsJSON []byte
@@ -858,7 +862,8 @@ func bitwiseFlagsToStrings(flags any) []string {
 		return []string{}
 	}
 
-	var result []string
+	// Never nil: a message without system flags sends "flags": [], not null.
+	result := []string{}
 	if bitwiseFlags&FlagSeen != 0 {
 		result = append(result, "\\Seen")
 	}
