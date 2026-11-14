@@ -2111,6 +2111,10 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 
 // insertBatchToDB inserts all uploaded messages in a batch
 // It groups messages by mailbox and uses the highly-optimized InsertMessagesFromImporterBatchWithRetry
+//
+// It returns an error only before it stores anything, or when the import is
+// interrupted (i.ctx cancelled): it then stops and returns the messages committed
+// before the interrupt along with the error, and leaves the rest uncounted.
 func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, error) {
 	// Get user info once
 	address, err := server.NewAddress(i.email)
@@ -2139,6 +2143,9 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 		// Get/create mailbox (cached)
 		mailbox, err := i.getOrCreateMailbox(i.ctx, user.AccountID(), up.msg.mailbox)
 		if err != nil {
+			if i.ctx.Err() != nil {
+				return nil, err // interrupted; nothing is stored yet
+			}
 			logger.Error("Failed to get or create mailbox", "mailbox", up.msg.mailbox, "error", err)
 			i.recordFailedPath(up.msg.path, fmt.Sprintf("mailbox error: %v", err))
 			atomic.AddInt64(&i.failedMessages, 1)
@@ -2191,6 +2198,11 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 
 			_, _, insertedHashesBatch, err := i.rdb.InsertMessagesFromImporterBatchWithRetry(i.ctx, opts)
 			if err != nil {
+				if i.ctx.Err() != nil {
+					// Interrupted: inserting the chunk message by message on the
+					// cancelled context would only fail each one.
+					return successHashes, err
+				}
 				{
 					// The batch failed as a whole — a unique violation the dedup did not
 					// catch, or one message that could not be prepared (the batch refuses
@@ -2202,6 +2214,9 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 					for _, gm := range chunk {
 						_, _, indErr := i.rdb.InsertMessageFromImporterWithRetry(i.ctx, gm.opt)
 						if indErr != nil {
+							if i.ctx.Err() != nil {
+								return successHashes, indErr // interrupted
+							}
 							if errors.Is(indErr, consts.ErrUIDConflict) {
 								// The preserved UID is already taken in the target mailbox: the
 								// message was NOT stored. A "skip" would hide a lost message.
@@ -2527,10 +2542,17 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 
 	logger.Info("Upload phase complete", "uploaded", len(uploaded), "batch_size", len(batch))
 
+	// An interrupt (SIGINT/SIGTERM cancel i.ctx) stops the batch before its insert
+	// phase, whose database calls would only fail on the cancelled context. Uploads
+	// that saw it returned without counting their message, and none of the batch is
+	// stored yet: what was not counted stays pending for the next run.
+	if err := i.ctx.Err(); err != nil {
+		logger.Info("Import interrupted, batch left for the next run", "uploaded", len(uploaded), "batch_size", len(batch))
+		return err
+	}
+
 	if len(uploaded) == 0 {
-		// uploadBatchToS3 already counted and recorded each message it dropped. The
-		// others were skipped by a cancellation, which importMessages reports: they
-		// were never attempted, so they are not failures.
+		// uploadBatchToS3 already counted and recorded each message it dropped.
 		logger.Warn("No message in the batch was uploaded", "batch_size", len(batch))
 		return nil
 	}
@@ -2551,9 +2573,9 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 		// Need to update SQLite after since each message commits individually
 		logger.Info("Using individual transaction mode")
 		successHashes, err = i.insertBatchToDB(uploaded)
-		if err != nil {
-			// insertBatchToDB fails only before it stores anything (address or
-			// account lookup), so none of the batch was imported.
+		if err != nil && i.ctx.Err() == nil {
+			// Unless interrupted, insertBatchToDB fails only before it stores
+			// anything (address or account lookup), so none of the batch was imported.
 			logger.Error("DB inserts failed", "error", err)
 			for _, up := range uploaded {
 				i.recordFailedPath(up.msg.path, fmt.Sprintf("db insert error: %v", err))
@@ -2562,6 +2584,8 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 			return err
 		}
 
+		// After an interrupt err is set, and successHashes holds the messages
+		// committed before it: they are marked like any others.
 		logger.Info("DB inserts complete, marking in SQLite", "count", len(successHashes))
 
 		// Phase 3: Mark successful messages in SQLite cache
@@ -2577,6 +2601,15 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 	}
 
 	if err != nil {
+		if i.ctx.Err() != nil {
+			// Interrupted: the database calls failed on the cancelled context. What
+			// the batch did not store is not a failure: its cache rows stay unmarked,
+			// pending for the next run, and importMessages reports the interruption.
+			atomic.AddInt64(&i.importedMessages, int64(len(successHashes)))
+			logger.Info("Import interrupted, rest of the batch left for the next run",
+				"imported", len(successHashes), "batch_size", len(batch))
+			return err
+		}
 		logger.Error("Batch processing failed", "error", err)
 		// Everything in uploaded that wasn't successfully inserted is already tracked if individual mode
 		// Let's ensure BatchTransactionMode logs all if it aborted
