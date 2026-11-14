@@ -127,6 +127,11 @@ func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 				"ip", logIP,
 				"reason", "IP blocked by rate limiter (Tier 2)")
 			releaseConn() // Release the connection limit
+			if serverPkg.IsProxiedClientRefusal(serverPkg.ErrIPBlocked, proxyInfo) {
+				// Answered like the per-IP refusal above, so that one blocked
+				// client does not cost the proxy's backend its health.
+				return &connectionLimitingConn{Conn: conn, proxyInfo: proxyInfo, refusal: serverPkg.ErrIPBlocked}, nil
+			}
 			conn.Close()
 			continue // Try to accept the next connection
 		}
@@ -151,7 +156,7 @@ type connectionLimitingConn struct {
 	net.Conn
 	releaseFunc func()
 	proxyInfo   *serverPkg.ProxyProtocolInfo
-	refusal     error // non-nil: the limiter refused the client, and newSession answers it
+	refusal     error // non-nil: a limiter refused the client, and newSession answers it
 	closeMu     sync.Mutex
 	closed      bool
 }
@@ -929,10 +934,18 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		}
 	}
 
-	// Connection limits are handled at the listener level, which passes on a refused
-	// client a PROXY peer named so that the refusal is answered here, after the TLS
-	// handshake.
+	// Connection limits and Tier 2 IP blocks are handled at the listener level, which
+	// passes on a refused client a PROXY peer named so that the refusal is answered
+	// here, after the TLS handshake.
 	if lc, ok := conn.NetConn().(*connectionLimitingConn); ok && lc.refusal != nil {
+		if errors.Is(lc.refusal, serverPkg.ErrIPBlocked) {
+			// The reply the IMAP proxy gives a client the auth rate limiter blocks.
+			return nil, nil, &imap.Error{
+				Type: imap.StatusResponseTypeBye,
+				Code: imap.ResponseCodeAlert,
+				Text: "Too many failed authentication attempts. Please try again later.",
+			}
+		}
 		return nil, nil, &imap.Error{
 			Type: imap.StatusResponseTypeBye,
 			Code: imap.ResponseCodeLimit,
