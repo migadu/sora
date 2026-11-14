@@ -989,7 +989,8 @@ func (s *Session) authenticateUser(username, password string) error {
 				}
 			}
 		}
-	} else {
+	} else if s.server.lookupCache != nil {
+		// A disabled cache (nil) reads nothing and counts nothing.
 		s.DebugLog("cache miss", "username", username)
 		metrics.LookupCacheResults.WithLabelValues("imap_proxy", "miss").Inc()
 	}
