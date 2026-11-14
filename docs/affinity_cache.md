@@ -84,7 +84,7 @@ HandleClusterEvent(gossip data)
   └── Persist to SQLite (async goroutine, non-blocking)
 ```
 
-All SQLite writes use fire-and-forget goroutines with a 2-second timeout. A `sync.WaitGroup` tracks pending writes to ensure they complete during graceful shutdown.
+All SQLite writes use fire-and-forget goroutines with a 2-second timeout. A `SessionGroup` tracks them: once shutdown begins it refuses new writes (the in-memory map still changes) and waits for the started ones before the store is closed.
 
 ### Cleanup
 
@@ -132,10 +132,11 @@ On server shutdown:
 
 1. `AffinityManager.Stop()` is called via `defer` in `main()`
 2. Background cleanup and broadcast goroutines are stopped
-3. `wg.Wait()` blocks until all pending async SQLite writes complete
-4. The SQLite database is closed cleanly
+3. New SQLite writes are refused: an affinity change made from here on (a proxy still draining its sessions, an Admin API request finishing) is not persisted
+4. The writes already started are waited for (up to 10 seconds)
+5. The SQLite database is closed cleanly; if writes were still running at the timeout it is left open instead, since closing it would fail them
 
-This ensures no data is lost during shutdown and the WAL is properly checkpointed.
+This ensures no write reaches the closed store and the WAL is properly checkpointed.
 
 ## Monitoring
 
