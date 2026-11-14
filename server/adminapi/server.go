@@ -1989,8 +1989,7 @@ func (s *Server) handleAuthBlocked(w http.ResponseWriter, r *http.Request) {
 // Message restoration handlers
 
 func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/accounts/{email}/messages/deleted
-	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/messages/deleted")
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	// Parse query parameters
@@ -2063,8 +2062,7 @@ func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	// Extract email from path: /admin/accounts/{email}/messages/restore
-	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/messages/restore")
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	var req struct {
