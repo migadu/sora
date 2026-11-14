@@ -165,13 +165,19 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	var createMailboxes []string // Sieve fileinto :create targets, created if missing
 	var sieveFlags []imap.Flag   // flags set by the Sieve script (imap4flags, RFC 5232)
 
+	// The delivery reads from the writer, as LMTP does once RCPT has looked the
+	// recipient up: LookupRecipient creates an account's default mailboxes on first
+	// delivery, a fileinto :create target is created below, and a read replica may not
+	// have replayed either yet, so INBOX itself could be "not found".
+	ctx := context.WithValue(d.Ctx, consts.UseMasterDBKey, true)
+
 	if recipient.TargetMailbox != "" {
 		// Use explicit target mailbox (bypasses Sieve - for migrations)
 		mailboxName = recipient.TargetMailbox
 	} else {
 		// Execute Sieve scripts
 		outcome, err := d.SieveExecutor.ExecuteSieve(
-			d.Ctx,
+			ctx,
 			recipient,
 			messageEntity,
 			messageBytes,
@@ -266,17 +272,10 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		return result, fmt.Errorf("failed to check file existence: %w", err)
 	}
 
-	ctx := d.Ctx
-	if len(createMailboxes) > 0 {
-		// The mailbox is created on the writer, and a replica may not have it yet when
-		// the target is resolved below: read from the writer from here on, or the
-		// message would fall back to INBOX (as LMTP does, which pins every delivery).
-		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-		for _, createMailbox := range createMailboxes {
-			if err := d.createMissingMailbox(ctx, recipient, createMailbox); err != nil {
-				result.ErrorMessage = fmt.Sprintf("Failed to create Sieve fileinto :create target %s: %v", createMailbox, err)
-				return result, err
-			}
+	for _, createMailbox := range createMailboxes {
+		if err := d.createMissingMailbox(ctx, recipient, createMailbox); err != nil {
+			result.ErrorMessage = fmt.Sprintf("Failed to create Sieve fileinto :create target %s: %v", createMailbox, err)
+			return result, err
 		}
 	}
 
