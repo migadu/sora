@@ -6,6 +6,7 @@ import (
 	"compress/bzip2"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -87,6 +88,10 @@ type msgInfo struct {
 	hash     string
 	size     int64
 	mailbox  string
+	// imported is the cache row's s3_uploaded mark: an earlier run imported the file
+	// under hash (recoverOrphanedSQLiteState clears the mark when the account has no
+	// live row with that hash).
+	imported bool
 }
 
 // uploadedMsg represents a successfully uploaded message
@@ -1032,6 +1037,14 @@ func hashFile(path string) (string, int64, error) {
 	return hex.EncodeToString(hasher.Sum(nil)), size, nil
 }
 
+// legacyImportHash is the content hash sora-admin import used before it switched to
+// helpers.HashContent: the hex SHA-256 of the message. Only a SQLite cache such a version
+// wrote still holds it.
+func legacyImportHash(content []byte) string {
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
+}
+
 // resolveMailboxName determines the mailbox name from the maildir path
 func (i *Importer) resolveMailboxName(path string) (string, error) {
 	cleanPath := filepath.Clean(i.maildirPath)
@@ -1834,7 +1847,14 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 			// the content_hash of the database row. If the file changed in place under
 			// the same name, uploading the new bytes under the old hash would overwrite
 			// the object an existing row references, with no signal anywhere.
-			if got := helpers.HashContent(content); got != msg.hash {
+			//
+			// One mismatch is not a change: a sora-admin from before the switch to
+			// helpers.HashContent imported the unchanged file under the SHA-256 of its
+			// content. That hash is kept, so the batch insert recognises the row the
+			// earlier run inserted (its duplicate check is on message_id and content_hash)
+			// instead of importing the message a second time under the new hash.
+			if got := helpers.HashContent(content); got != msg.hash &&
+				!(msg.imported && msg.hash == legacyImportHash(content)) {
 				logger.Warn("File content changed since the scan; using its current hash",
 					"path", msg.path, "scanned_hash", msg.hash, "current_hash", got)
 				if _, uerr := i.sqliteDB.Exec("UPDATE messages SET hash = ?, size = ?, s3_uploaded = 0 WHERE path = ? AND mailbox = ?",
@@ -2492,10 +2512,10 @@ func (i *Importer) importMessages() error {
 	var query string
 	if i.options.Incremental {
 		// Incremental mode: only load messages not yet uploaded
-		query = `SELECT path, filename, hash, size, mailbox FROM messages WHERE s3_uploaded = 0 ORDER BY mailbox, path`
+		query = `SELECT path, filename, hash, size, mailbox, COALESCE(s3_uploaded, 0) = 1 FROM messages WHERE s3_uploaded = 0 ORDER BY mailbox, path`
 	} else {
 		// Non-incremental mode: load all messages
-		query = `SELECT path, filename, hash, size, mailbox FROM messages ORDER BY mailbox, path`
+		query = `SELECT path, filename, hash, size, mailbox, COALESCE(s3_uploaded, 0) = 1 FROM messages ORDER BY mailbox, path`
 	}
 
 	rows, err := i.sqliteDB.Query(query)
@@ -2507,7 +2527,7 @@ func (i *Importer) importMessages() error {
 	for rows.Next() {
 		var msg msgInfo
 		if err := rows.Scan(&msg.path, &msg.filename, &msg.hash,
-			&msg.size, &msg.mailbox); err != nil {
+			&msg.size, &msg.mailbox, &msg.imported); err != nil {
 			logger.Info("Failed to scan row", "error", err)
 			continue
 		}
