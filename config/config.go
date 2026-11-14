@@ -2579,10 +2579,19 @@ func TrustedNetworksHaveBroadPrivateRanges(networks []string) bool {
 //
 // All other syntax errors will cause the server to fail with helpful error messages
 func LoadConfigFromFile(configPath string, cfg *Config) error {
+	_, err := LoadConfigFromFileWithMetadata(configPath, cfg)
+	return err
+}
+
+// LoadConfigFromFileWithMetadata is LoadConfigFromFile that also returns the file's TOML
+// metadata. cfg is usually seeded by NewDefaultConfig, so after the load a value equal to
+// its default may be the default or may be set by the file; MetaData.IsDefined tells them
+// apart.
+func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaData, error) {
 	// Read the file content first
 	content, err := os.ReadFile(configPath)
 	if err != nil {
-		return err
+		return toml.MetaData{}, err
 	}
 
 	// Try to decode - capture metadata to check for unknown keys
@@ -2600,17 +2609,17 @@ func LoadConfigFromFile(configPath string, cfg *Config) error {
 			cleanedContent, cleanErr := removeDuplicateKeysFromTOML(string(content))
 			if cleanErr != nil {
 				// If we can't clean it, return a helpful error
-				return enhanceConfigError(err)
+				return toml.MetaData{}, enhanceConfigError(err)
 			}
 
 			// Try decoding the cleaned content
 			metadata, err = toml.Decode(cleanedContent, cfg)
 			if err != nil {
-				return enhanceConfigError(err)
+				return toml.MetaData{}, enhanceConfigError(err)
 			}
 		} else {
 			// For other errors, provide enhanced error messages
-			return enhanceConfigError(err)
+			return toml.MetaData{}, enhanceConfigError(err)
 		}
 	}
 
@@ -2629,7 +2638,7 @@ func LoadConfigFromFile(configPath string, cfg *Config) error {
 	// Apply default values for fields where the Go zero value differs from the desired default
 	applyConfigDefaults(cfg)
 
-	return nil
+	return metadata, nil
 }
 
 // applyConfigDefaults sets default values for config fields where the desired default

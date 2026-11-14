@@ -60,6 +60,8 @@ This section configures Sora's connection to PostgreSQL. For resilience and scal
 
 Each section allows you to configure hosts, port, user, password, database name, and connection pool settings (`max_conns`, `min_conns`, etc.).
 
+A table that the file leaves out is not configured: a node with neither (a proxy that does not look up local users) runs without a database. A table that is present is used even when its values are the defaults (host `localhost`, user `postgres`, database `sora_mail_db`), and the keys it leaves out take those defaults.
+
 ### `[s3]`
 
 This section is for your S3-compatible object storage, where message bodies are stored.
