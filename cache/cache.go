@@ -68,6 +68,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -98,6 +99,11 @@ var ErrObjectTooLarge = errors.New("object size exceeds limit")
 type cacheShard struct {
 	db *sql.DB
 	mu sync.Mutex
+	// size is an upper bound on the bytes the shard's index tracks, guarded by mu. It is
+	// measured when the shard is opened and by every purge of it, and grows with every
+	// object tracked. Removals other than a purge's leave it high, which costs at most
+	// one needless purge check.
+	size int64
 }
 
 type Cache struct {
@@ -185,7 +191,7 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval
 
 	for i := 0; i < NumShards; i++ {
 		shardHex := fmt.Sprintf("%02x", i)
-		dbPath := filepath.Join(basePath, fmt.Sprintf("cache_index_%s.db", shardHex))
+		dbPath := shardIndexPath(basePath, i)
 		db, err := sql.Open("sqlite", dbPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open cache index DB for shard %s: %w", shardHex, err)
@@ -210,12 +216,57 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval
 			return nil, fmt.Errorf("failed to initialize cache index schema for shard %s: %w", shardHex, err)
 		}
 
-		c.shards[i] = &cacheShard{db: db}
+		shard := &cacheShard{db: db}
+		if err := db.QueryRow(`SELECT COALESCE(SUM(size), 0) FROM cache_index`).Scan(&shard.size); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to measure cache index for shard %s: %w", shardHex, err)
+		}
+		c.shards[i] = shard
 	}
 
+	// No purge loop here: the server starts the one it runs with StartPurgeLoop, and
+	// sora-admin opens the cache of a running server.
 	go c.processAccessLog()
-	c.StartPurgeLoop(context.Background())
 	return c, nil
+}
+
+func shardIndexPath(basePath string, shard int) string {
+	return filepath.Join(basePath, fmt.Sprintf("cache_index_%02x.db", shard))
+}
+
+// Usage returns the number of objects the index of the cache at basePath tracks and
+// their total size. It opens the index read-only and changes nothing: no purge runs,
+// and a path that holds no cache is an error rather than a new cache. (SQLite still
+// creates an index's -wal and -shm files when no other connection, such as a running
+// server's, has.) sora-admin reports on the cache of a running server with it.
+func Usage(basePath string) (objects, totalSize int64, err error) {
+	basePath = strings.TrimSpace(basePath)
+	if basePath == "" {
+		return 0, 0, fmt.Errorf("cache base path cannot be empty")
+	}
+	if basePath, err = filepath.Abs(basePath); err != nil {
+		return 0, 0, err
+	}
+	for i := 0; i < NumShards; i++ {
+		dbPath := shardIndexPath(basePath, i)
+		if _, err := os.Stat(dbPath); err != nil {
+			return 0, 0, fmt.Errorf("no cache index at %s: %w", dbPath, err)
+		}
+		dsn := (&url.URL{Scheme: "file", Path: dbPath, RawQuery: "mode=ro&_pragma=busy_timeout(5000)"}).String()
+		db, err := sql.Open("sqlite", dsn)
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to open cache index %s: %w", dbPath, err)
+		}
+		var n, size int64
+		err = db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(size), 0) FROM cache_index`).Scan(&n, &size)
+		db.Close()
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to read cache index %s: %w", dbPath, err)
+		}
+		objects += n
+		totalSize += size
+	}
+	return objects, totalSize, nil
 }
 
 func (c *Cache) processAccessLog() {
@@ -335,7 +386,13 @@ func (c *Cache) Delete(contentHash string) error {
 // MoveIn moves a file into the cache directory structure and tracks it.
 // The file at sourcePath will be removed (either by rename or explicit removal if it already exists).
 // This is typically used to move a downloaded temp file into the cache.
+// A file larger than the cache's max object size is refused with ErrObjectTooLarge; on
+// that and every other error the file is left for the caller to remove.
 func (c *Cache) MoveIn(sourcePath string, contentHash string) error {
+	if info, err := os.Stat(sourcePath); err == nil && info.Size() > c.maxObjectSize {
+		return ErrObjectTooLarge
+	}
+
 	targetPath := c.GetPathForContentHash(contentHash)
 	shard := c.getShard(contentHash)
 
@@ -431,6 +488,10 @@ func (c *Cache) Get(contentHash string) ([]byte, error) {
 
 // Put writes an object to the cache.
 func (c *Cache) Put(contentHash string, data []byte) error {
+	if int64(len(data)) > c.maxObjectSize {
+		return ErrObjectTooLarge
+	}
+
 	path := c.GetPathForContentHash(contentHash)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -450,9 +511,6 @@ func (c *Cache) Put(contentHash string, data []byte) error {
 		os.Remove(tempPath) // Clean up temp file if rename fails
 	}()
 
-	if int64(len(data)) > c.maxObjectSize {
-		return ErrObjectTooLarge
-	}
 	_, err = file.Write(data)
 	if err != nil {
 		return fmt.Errorf("failed to write cache file: %w", err)
@@ -478,20 +536,35 @@ func (c *Cache) trackFile(shard *cacheShard, path string) error {
 		return fmt.Errorf("failed to stat file for tracking: %w", err)
 	}
 
+	shardCapacity := c.capacity / NumShards
 	shard.mu.Lock()
 	_, err = shard.db.Exec(
 		`INSERT OR REPLACE INTO cache_index (path, size, mod_time) VALUES (?, ?, ?)`,
 		path, info.Size(), info.ModTime(),
 	)
+	if err == nil {
+		shard.size += info.Size()
+	}
+	full := shard.size > shardCapacity
 	shard.mu.Unlock()
 
 	if err != nil {
 		return fmt.Errorf("failed to update cache index: %w", err)
 	}
 
+	// Hold the capacity as objects come in, not only at the next purge cycle: that runs
+	// every purge_interval, and the uploader moves every body it uploads in.
+	if full {
+		if err := c.purgeShardIfNeeded(context.Background(), shard, shardCapacity); err != nil {
+			logger.Warn("Cache: Purge after write failed", "error", err)
+		}
+	}
+
 	return nil
 }
 
+// StartPurgeLoop runs a purge cycle at once and then every purge interval, until ctx
+// is done or the cache is closed. The server starts it once; New does not.
 func (c *Cache) StartPurgeLoop(ctx context.Context) {
 	go func() {
 		dirCleanupShardIdx := 0
@@ -640,7 +713,14 @@ func (c *Cache) purgeShardIfNeeded(ctx context.Context, shard *cacheShard, capac
 			continue
 		}
 		removeEmptyParents(item.path, dataDir)
-		_, dbErr := shard.db.ExecContext(ctx, `DELETE FROM cache_index WHERE path = ?`, item.path)
+		res, dbErr := shard.db.ExecContext(ctx, `DELETE FROM cache_index WHERE path = ?`, item.path)
+		if dbErr == nil {
+			// Only the purge that removed the row counts it: two purges of a shard can
+			// pick the same candidates.
+			if n, _ := res.RowsAffected(); n > 0 {
+				shard.size -= item.size
+			}
+		}
 		shard.mu.Unlock()
 		if dbErr != nil {
 			logger.Warn("Cache: Failed to delete DB entry during purge", "path", item.path, "error", dbErr)
@@ -661,6 +741,7 @@ func (c *Cache) getPurgeCandidatesForShard(ctx context.Context, shard *cacheShar
 	if err != nil {
 		return nil, fmt.Errorf("failed to query total shard size: %w", err)
 	}
+	shard.size = currentSize
 
 	if currentSize <= capacity {
 		return nil, nil
@@ -725,6 +806,8 @@ func (c *Cache) PurgeAll(ctx context.Context) error {
 				errMu.Lock()
 				errs = append(errs, err)
 				errMu.Unlock()
+			} else {
+				shard.size = 0
 			}
 			shard.mu.Unlock()
 		}(c.shards[i])

@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -115,6 +118,85 @@ func TestUserConnectionsListFiltersByProtocolAndInstance(t *testing.T) {
 		}
 		if row := rowFields(out, "IMAP "); len(row) < 2 || row[1] != "node-1-imap-proxy" {
 			t.Errorf("Details row %q, want Protocol IMAP and Instance node-1-imap-proxy:\n%s", row, out)
+		}
+	})
+}
+
+// gossipRegister hands each tracker the register event another node gossips for a session.
+func gossipRegister(t *testing.T, accountID int64, username, clientAddr string, trackers ...*server.ConnectionTracker) {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(server.ConnectionEvent{
+		Type:       server.ConnectionEventRegister,
+		EventID:    fmt.Sprintf("node-2-%d-%s", accountID, clientAddr),
+		AccountID:  accountID,
+		Username:   username,
+		Protocol:   "IMAP",
+		ClientAddr: clientAddr,
+		Timestamp:  time.Now(),
+		NodeID:     "node-2",
+		InstanceID: "node-2-imap-proxy",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tracker := range trackers {
+		tracker.HandleClusterEvent(buf.Bytes())
+	}
+}
+
+// Every gossip tracker of a protocol on a node hears the other nodes' sessions, so an
+// account's entries on two IMAP proxy listeners (143 and 993) both carry its sessions on
+// other nodes in total_count. "connections list" summed Remote over the entries and
+// printed those sessions once per listener; "stats connection --user" counts them once.
+func TestConnectionsListCountsRemoteSessionsOnce(t *testing.T) {
+	imap := server.NewConnectionTracker("IMAP", "imap-proxy", "host", "node-1-imap-proxy", nil, 0, 0, 0, true)
+	imaps := server.NewConnectionTracker("IMAP", "imaps-proxy", "host", "node-1-imaps-proxy", nil, 0, 0, 0, true)
+	t.Cleanup(imap.Stop)
+	t.Cleanup(imaps.Stop)
+	ctx := context.Background()
+	// anna: one session here on 993 and two on node-2. bob: one session here on each
+	// listener and one on node-2.
+	for _, s := range []struct {
+		tracker   *server.ConnectionTracker
+		accountID int64
+		username  string
+		addr      string
+	}{
+		{imaps, 1, "anna@example.com", "192.0.2.1:50000"},
+		{imap, 2, "bob@example.com", "192.0.2.2:50000"},
+		{imaps, 2, "bob@example.com", "192.0.2.2:50001"},
+	} {
+		if err := s.tracker.RegisterConnection(ctx, s.accountID, s.username, "IMAP", s.addr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gossipRegister(t, 1, "anna@example.com", "198.51.100.1:40000", imap, imaps)
+	gossipRegister(t, 1, "anna@example.com", "198.51.100.2:40000", imap, imaps)
+	gossipRegister(t, 2, "bob@example.com", "198.51.100.3:40000", imap, imaps)
+	cfg := startTrackerAdminAPI(t, map[string]*server.ConnectionTracker{
+		"IMAP-node-1-imap-proxy":  imap,
+		"IMAP-node-1-imaps-proxy": imaps,
+	})
+
+	for _, tc := range []struct {
+		name, user, protocol, want string
+	}{
+		{"connections list", "", "", "Total connections: 3 local, 3 remote\n"},
+		{"connections list --user", "anna@example.com", "", "Total connections: 1 local, 2 remote\n"},
+		{"connections list --user --protocol IMAP", "anna@example.com", "IMAP", "Total connections: 1 local, 2 remote\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := captureStdout(t, func() error { return listConnections(ctx, cfg, tc.user, "", tc.protocol, "") })
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("output does not contain %q:\n%s", tc.want, out)
+			}
+		})
+	}
+
+	t.Run("stats connection --user", func(t *testing.T) {
+		out := captureStdout(t, func() error { return showConnectionStats(ctx, cfg, "anna@example.com", false) })
+		if want := "Total connections: 3\n"; !strings.Contains(out, want) {
+			t.Errorf("output does not contain %q:\n%s", want, out)
 		}
 	})
 }
