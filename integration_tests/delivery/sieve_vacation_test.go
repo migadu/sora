@@ -70,10 +70,11 @@ func TestDelivery_SieveVacation_AlongsideOtherActions(t *testing.T) {
 	executor := dctx.SieveExecutor.(*delivery.StandardSieveExecutor)
 	executor.RelayQueue = rq
 	executor.VacationHandler = &delivery.StandardVacationHandler{
-		Hostname:       "delivery-host",
-		RelayQueue:     rq,
-		Logger:         testLogger{t},
-		IsOwnedAddress: rdb.IsAddressOwnedByAccountWithRetry,
+		Hostname:          "delivery-host",
+		RelayQueue:        rq,
+		Logger:            testLogger{t},
+		IsOwnedAddress:    rdb.IsAddressOwnedByAccountWithRetry,
+		IsAnyOwnedAddress: rdb.IsAnyAddressOwnedByAccountWithRetry,
 	}
 
 	addr, err := server.NewAddress(account.Email)
