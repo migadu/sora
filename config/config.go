@@ -785,7 +785,7 @@ type RemoteLookupCircuitBreakerConfig struct {
 	Interval     string  `toml:"interval"`      // Time before resetting failure counts in closed state (default: "0s" - never reset)
 	Timeout      string  `toml:"timeout"`       // Time before transitioning from open to half-open (default: "30s")
 	FailureRatio float64 `toml:"failure_ratio"` // Failure ratio threshold to open circuit (0.0-1.0, default: 0.6)
-	MinRequests  int     `toml:"min_requests"`  // Minimum requests before evaluating failure ratio (default: 3)
+	MinRequests  int     `toml:"min_requests"`  // Minimum completed requests before evaluating failure ratio (default: 3)
 }
 
 // RemoteLookupTransportConfig holds HTTP transport configuration for remote_lookup connection pooling and timeouts
@@ -863,7 +863,7 @@ func (c *RemoteLookupCircuitBreakerConfig) GetFailureRatio() float64 {
 	return c.FailureRatio
 }
 
-// GetMinRequests returns the minimum requests before evaluating failure ratio
+// GetMinRequests returns the minimum completed requests before evaluating failure ratio
 func (c *RemoteLookupCircuitBreakerConfig) GetMinRequests() uint32 {
 	if c.MinRequests <= 0 {
 		return 3 // Default: 3 requests
