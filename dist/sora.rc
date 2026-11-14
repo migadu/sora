@@ -34,7 +34,8 @@ procname="/usr/local/bin/sora"
 command="/usr/sbin/daemon"
 command_args="-f -p ${pidfile} -u ${sora_user} -o ${sora_logdir}/sora.out ${procname} --config ${sora_config}"
 
-# SIGHUP triggers config reload
+# SIGHUP triggers config reload. rc.subr provides reload only when extra_commands lists it.
+extra_commands="reload"
 sig_reload="HUP"
 
 start_precmd="sora_precmd"

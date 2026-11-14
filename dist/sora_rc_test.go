@@ -10,28 +10,39 @@ import (
 )
 
 // rcSubrStub stands in for FreeBSD's /etc/rc.subr. Its run_rc_command reports what the
-// real one acts on (rc.subr(8), run_rc_command): it starts "$command $rc_flags
-// $command_args" through su(1) when ${name}_user is set, and status, stop and reload find
-// the process with check_pidfile "$pidfile" "${procname:-$command}" and signal that PID
-// (reload with $sig_reload). It then runs the start precmd with install(1) stubbed.
+// real one acts on (rc.subr(8), run_rc_command): it accepts only the directives in
+// $_keywords (reload only when $extra_commands lists it; anything else is "unknown
+// directive" and exit 1), starts "$command $rc_flags $command_args" through su(1) when
+// ${name}_user is set, and status, stop and reload find the process with check_pidfile
+// "$pidfile" "${procname:-$command}" and signal that PID (reload with $sig_reload). It
+// then runs the directive's precmd with install(1) stubbed.
 const rcSubrStub = `
 load_rc_config() { eval "$TEST_RC_CONF"; }
 install() { echo "install=$*"; }
 run_rc_command() {
-	eval _user=\$${name}_user
-	echo "command=$command"
-	echo "command_args=$command_args"
-	echo "pidfile=$pidfile"
-	echo "procname=$procname"
-	echo "name_user=$_user"
-	echo "sig_reload=$sig_reload"
-	if [ -n "$start_precmd" ]; then $start_precmd; fi
+	rc_arg=$1
+	_keywords="start stop restart rcvar enable disable delete enabled describe extracommands $extra_commands"
+	if [ -n "${procname:-$command}" ]; then _keywords="$_keywords status poll"; fi
+	for _elem in $_keywords; do
+		if [ "$_elem" != "$rc_arg" ]; then continue; fi
+		eval _user=\$${name}_user _precmd=\$${rc_arg}_precmd
+		echo "command=$command"
+		echo "command_args=$command_args"
+		echo "pidfile=$pidfile"
+		echo "procname=$procname"
+		echo "name_user=$_user"
+		echo "sig_reload=$sig_reload"
+		if [ -n "$_precmd" ]; then $_precmd; fi
+		return 0
+	done
+	echo "$0: unknown directive '$rc_arg'." >&2
+	exit 1
 }
 `
 
-// runRCScript runs dist/sora.rc against rcSubrStub, with rcConf evaluated where the real
-// script's load_rc_config reads /etc/rc.conf, and returns its report.
-func runRCScript(t *testing.T, rcConf string) (vars map[string]string, installs []string) {
+// runRCScript runs "dist/sora.rc rcArg" against rcSubrStub, with rcConf evaluated where the
+// real script's load_rc_config reads /etc/rc.conf, and returns its report.
+func runRCScript(t *testing.T, rcArg, rcConf string) (vars map[string]string, installs []string) {
 	t.Helper()
 	script, err := os.ReadFile("sora.rc")
 	if err != nil {
@@ -54,11 +65,11 @@ func runRCScript(t *testing.T, rcConf string) (vars map[string]string, installs 
 	if out, err := exec.Command("sh", "-n", rc).CombinedOutput(); err != nil {
 		t.Fatalf("sh -n sora.rc: %v\n%s", err, out)
 	}
-	cmd := exec.Command("sh", rc, "start")
+	cmd := exec.Command("sh", rc, rcArg)
 	cmd.Env = append(os.Environ(), "TEST_RC_CONF="+rcConf)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("sh sora.rc start: %v\n%s", err, out)
+		t.Fatalf("sh sora.rc %s: %v\n%s", rcArg, err, out)
 	}
 	vars = map[string]string{}
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
@@ -86,7 +97,7 @@ func TestRCScriptDetachesAndWritesPidfile(t *testing.T) {
 		{"sora_user=mailer", "mailer"},
 	} {
 		t.Run("user="+tc.user, func(t *testing.T) {
-			vars, installs := runRCScript(t, tc.rcConf)
+			vars, installs := runRCScript(t, "start", tc.rcConf)
 			args := strings.Fields(vars["command_args"])
 			flag := func(f string) string {
 				if i := slices.Index(args, f); i >= 0 && i+1 < len(args) {
@@ -125,5 +136,19 @@ func TestRCScriptDetachesAndWritesPidfile(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestRCScriptReloadSignalsSora: rc.subr runs reload only when the script lists it in
+// extra_commands ("Note that `reload' isn't provided by default, it should be enabled via
+// $extra_commands"). Without it `service sora reload` fails with "unknown directive" and
+// sora never gets the SIGHUP that reloads its configuration and reopens its log file.
+func TestRCScriptReloadSignalsSora(t *testing.T) {
+	vars, _ := runRCScript(t, "reload", "")
+	if vars["sig_reload"] != "HUP" {
+		t.Errorf("sig_reload = %q, want HUP", vars["sig_reload"])
+	}
+	if vars["procname"] != "/usr/local/bin/sora" {
+		t.Errorf("procname = %q: reload must signal the sora process in %s", vars["procname"], vars["pidfile"])
 	}
 }
