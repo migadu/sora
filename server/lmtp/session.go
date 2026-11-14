@@ -385,7 +385,10 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 			}
 		}
 		recordMetrics("failure")
-		return s.InternalError("failed to create default mailboxes: %v", err)
+		// The reply text reaches the sender in a delay or bounce notice: the database
+		// error stays in the log.
+		s.WarnLog("failed to create default mailboxes", "error", err)
+		return s.InternalError("failed to create default mailboxes")
 	}
 
 	// Get primary email address for this account
