@@ -19,7 +19,7 @@ import (
 
 // [local_cache] warmup_interval reaches the IMAP backend (#291). The backend
 // remembers a user's last warmup across a restart only while it is within the
-// interval: it reads the warmups from the state file in the cache directory when
+// interval: it reads the warmups from its state file in the cache directory when
 // it starts and writes back the ones still within the interval when it stops.
 // Each case is decided the other way by the built-in 24 hours.
 func TestDynamicIMAPServerUsesWarmupInterval(t *testing.T) {
@@ -40,8 +40,8 @@ func TestDynamicIMAPServerUsesWarmupInterval(t *testing.T) {
 			}
 			t.Cleanup(func() { c.Close() })
 
-			const accountID = 42
-			statePath := filepath.Join(dir, ".sora_warmup_state")
+			const accountID, serverName = 42, "imap-warmup-interval"
+			statePath := filepath.Join(dir, ".sora_warmup_state."+serverName)
 			state := fmt.Sprintf("%d %d\n", accountID, time.Now().Add(-tt.age).Unix())
 			if err := os.WriteFile(statePath, []byte(state), 0o600); err != nil {
 				t.Fatal(err)
@@ -66,7 +66,7 @@ func TestDynamicIMAPServerUsesWarmupInterval(t *testing.T) {
 				config:        cfg,
 				serverManager: &serverManager{},
 			}
-			serverConfig := config.ServerConfig{Type: "imap", Name: "imap-warmup-interval", Addr: addr}
+			serverConfig := config.ServerConfig{Type: "imap", Name: serverName, Addr: addr}
 
 			ctx, cancel := context.WithCancel(context.Background())
 			errChan := make(chan error, 1)

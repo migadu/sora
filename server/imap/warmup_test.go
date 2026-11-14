@@ -169,3 +169,29 @@ func TestWarmupTimesNotKeptWithoutInterval(t *testing.T) {
 		t.Errorf("lastWarmupTimes has %d entries with a zero interval, want 0", n)
 	}
 }
+
+// TestWarmupTimesSweptOncePerInterval checks that the sweep of expired entries runs at
+// most once per interval rather than on every warmup: an entry that expires after a
+// sweep stays until the interval has passed since that sweep.
+func TestWarmupTimesSweptOncePerInterval(t *testing.T) {
+	s := &IMAPServer{name: "test", warmupInterval: time.Hour}
+	now := time.Now()
+
+	s.recordWarmup(1, now) // the first warmup sweeps
+	s.lastWarmupTimes.Store(int64(2), now.Add(-2*time.Hour))
+
+	s.recordWarmup(3, now.Add(time.Minute))
+	if _, ok := s.lastWarmupTimes.Load(int64(2)); !ok {
+		t.Error("expired entry swept again within the interval of the last sweep")
+	}
+
+	s.recordWarmup(4, now.Add(time.Hour))
+	if _, ok := s.lastWarmupTimes.Load(int64(2)); ok {
+		t.Error("expired entry kept after the interval since the last sweep had passed")
+	}
+	for _, id := range []int64{3, 4} {
+		if _, ok := s.lastWarmupTimes.Load(id); !ok {
+			t.Errorf("account %d is inside the interval but was swept", id)
+		}
+	}
+}

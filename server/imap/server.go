@@ -9,7 +9,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -323,7 +325,8 @@ type IMAPServer struct {
 	warmupSemaphore     chan struct{}  // Semaphore for sync warmups
 	warmupWg            sync.WaitGroup // Tracks active warmup workers for graceful shutdown
 	warmupStopOnce      sync.Once      // Ensures warmup channel is closed only once
-	lastWarmupTimes     sync.Map       // map[int64]time.Time - tracks last warmup time per user
+	lastWarmupTimes     sync.Map       // map[int64]time.Time - last warmup start per account, see recordWarmup
+	warmupSweptAt       atomic.Int64   // UnixNano of the last sweep of expired lastWarmupTimes entries
 
 	// Highest UID at the last read-write SELECT per mailbox (server-wide, not
 	// per-session). Used to compute NumRecent across sessions per RFC 3501 §2.3.2.
@@ -1362,9 +1365,19 @@ func (s *IMAPServer) DrainSessions() int64 {
 	return s.authenticatedConnections.Load()
 }
 
-// warmupStateFile is the filename for persisting warmup timestamps across restarts.
-// Stored in the cache directory alongside the cache index database.
+// warmupStateFile prefixes the file that keeps an IMAP server's warmup timestamps
+// across restarts, in the cache directory alongside the cache index database. Every
+// IMAP server of a process shares that cache, so the file is named after the server
+// (warmupStatePath): with one file for all of them, the first server to start took
+// every entry and the last one to stop overwrote the others'.
 const warmupStateFile = ".sora_warmup_state"
+
+// warmupStatePath returns this server's warmup state file. Server names are unique in
+// the configuration; escaping keeps a "/" in one inside the cache directory and keeps
+// distinct names distinct.
+func (s *IMAPServer) warmupStatePath() string {
+	return filepath.Join(s.cache.GetBasePath(), warmupStateFile+"."+url.PathEscape(s.name))
+}
 
 // persistWarmupState saves lastWarmupTimes to disk so that after restart,
 // users whose caches are still warm don't trigger unnecessary warmup storms.
@@ -1375,7 +1388,7 @@ func (s *IMAPServer) persistWarmupState() {
 		return
 	}
 
-	path := s.cache.GetBasePath() + "/" + warmupStateFile
+	path := s.warmupStatePath()
 
 	f, err := os.CreateTemp(s.cache.GetBasePath(), ".warmup_state_*.tmp")
 	if err != nil {
@@ -1432,7 +1445,11 @@ func (s *IMAPServer) loadWarmupState() {
 		return
 	}
 
-	path := s.cache.GetBasePath() + "/" + warmupStateFile
+	// The file every IMAP server used to share is not read: the server that starts
+	// first would take the others' entries. Remove it so it does not linger.
+	os.Remove(filepath.Join(s.cache.GetBasePath(), warmupStateFile))
+
+	path := s.warmupStatePath()
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -1581,6 +1598,31 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, AccountID int64, mailboxNa
 	return nil
 }
 
+// recordWarmup stamps the account's warmup as starting at now, so that its logins
+// within warmupInterval do not warm it again. An entry older than the interval
+// suppresses nothing, so at most once per interval the stamp also sweeps the expired
+// entries out: the map then holds at most the accounts warmed within two intervals,
+// not every account warmed since start-up. With no interval nothing is suppressed, so
+// nothing is kept.
+func (s *IMAPServer) recordWarmup(accountID int64, now time.Time) {
+	if s.warmupInterval <= 0 {
+		return
+	}
+	s.lastWarmupTimes.Store(accountID, now)
+
+	swept := s.warmupSweptAt.Load()
+	if now.UnixNano()-swept < int64(s.warmupInterval) || !s.warmupSweptAt.CompareAndSwap(swept, now.UnixNano()) {
+		return // swept within the interval, or another warmup is sweeping
+	}
+	s.lastWarmupTimes.Range(func(key, value any) bool {
+		if now.Sub(value.(time.Time)) >= s.warmupInterval {
+			// Not Delete: a warmup may have stamped the account since Range read it.
+			s.lastWarmupTimes.CompareAndDelete(key, value)
+		}
+		return true
+	})
+}
+
 // executeWarmup performs the actual cache warmup work for a single user.
 // Called by worker goroutines (async) or directly (sync).
 // Stamps lastWarmupTimes only on successful execution start (after dedup check passes again).
@@ -1596,7 +1638,7 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 	}
 
 	// Stamp NOW - we're about to do the work. This prevents duplicate work for this user.
-	s.lastWarmupTimes.Store(job.accountID, time.Now())
+	s.recordWarmup(job.accountID, time.Now())
 	metrics.WarmupOperationsTotal.WithLabelValues(s.name, "started").Inc()
 
 	// Defensive nil check - cache may not be initialized in edge cases or tests

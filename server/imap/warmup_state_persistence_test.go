@@ -49,7 +49,7 @@ func createTestCache(basePath string) (*cache.Cache, error) {
 // TestWarmupStatePersistAndLoad tests the full round-trip:
 // persist state → load state → verify entries match
 func TestWarmupStatePersistAndLoad(t *testing.T) {
-	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+	s, _ := testWarmupStateServer(t, 24*time.Hour)
 
 	// Store some warmup times
 	now := time.Now()
@@ -61,7 +61,7 @@ func TestWarmupStatePersistAndLoad(t *testing.T) {
 	s.persistWarmupState()
 
 	// Verify file was created
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 	if _, err := os.Stat(statePath); os.IsNotExist(err) {
 		t.Fatal("Expected warmup state file to exist after persist")
 	}
@@ -89,7 +89,7 @@ func TestWarmupStatePersistAndLoad(t *testing.T) {
 
 // TestWarmupStatePersistFiltersExpired verifies that expired entries are not persisted
 func TestWarmupStatePersistFiltersExpired(t *testing.T) {
-	s, tmpDir := testWarmupStateServer(t, 1*time.Hour)
+	s, _ := testWarmupStateServer(t, 1*time.Hour)
 
 	now := time.Now()
 	s.lastWarmupTimes.Store(int64(100), now.Add(-30*time.Minute)) // 30m ago — within 1h interval
@@ -115,7 +115,7 @@ func TestWarmupStatePersistFiltersExpired(t *testing.T) {
 	}
 
 	// Verify file was cleaned up
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
 		t.Error("Expected state file to be removed after load")
 	}
@@ -149,9 +149,9 @@ func TestWarmupStateLoadFiltersExpired(t *testing.T) {
 
 // TestWarmupStateCorruptFile verifies that a corrupt file is handled gracefully
 func TestWarmupStateCorruptFile(t *testing.T) {
-	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+	s, _ := testWarmupStateServer(t, 24*time.Hour)
 
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 
 	// Write garbage to the state file
 	err := os.WriteFile(statePath, []byte("this is not valid data\x00\xff\xfe binary garbage\n"), 0644)
@@ -180,9 +180,9 @@ func TestWarmupStateCorruptFile(t *testing.T) {
 
 // TestWarmupStatePartiallyCorruptFile verifies that valid entries before corruption are loaded
 func TestWarmupStatePartiallyCorruptFile(t *testing.T) {
-	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+	s, _ := testWarmupStateServer(t, 24*time.Hour)
 
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 
 	// Write a file with some valid entries followed by garbage
 	now := time.Now()
@@ -237,9 +237,9 @@ func TestWarmupStateMissingFile(t *testing.T) {
 
 // TestWarmupStateEmptyFile verifies that an empty file is handled gracefully
 func TestWarmupStateEmptyFile(t *testing.T) {
-	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+	s, _ := testWarmupStateServer(t, 24*time.Hour)
 
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 	err := os.WriteFile(statePath, []byte(""), 0644)
 	if err != nil {
 		t.Fatalf("Failed to write empty file: %v", err)
@@ -264,9 +264,9 @@ func TestWarmupStateEmptyFile(t *testing.T) {
 
 // TestWarmupStateMalformedLines verifies various malformed line formats
 func TestWarmupStateMalformedLines(t *testing.T) {
-	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+	s, _ := testWarmupStateServer(t, 24*time.Hour)
 
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 	now := time.Now()
 
 	content := fmt.Sprintf(
@@ -323,7 +323,7 @@ func TestWarmupStateAtomicWrite(t *testing.T) {
 
 	s.persistWarmupState()
 
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 
 	// Verify the file exists and has content
 	data, err := os.ReadFile(statePath)
@@ -340,7 +340,7 @@ func TestWarmupStateAtomicWrite(t *testing.T) {
 		t.Fatalf("Failed to read dir: %v", err)
 	}
 	for _, entry := range entries {
-		if entry.Name() != warmupStateFile && entry.Name() != "data" && !strings.HasPrefix(entry.Name(), "cache_index") {
+		if entry.Name() != filepath.Base(statePath) && entry.Name() != "data" && !strings.HasPrefix(entry.Name(), "cache_index") {
 			t.Errorf("Unexpected file in cache dir: %s (possible leaked temp file)", entry.Name())
 		}
 	}
@@ -373,12 +373,12 @@ func TestWarmupStateLoadNilCache(t *testing.T) {
 
 // TestWarmupStatePersistEmpty verifies persist with no entries creates a valid (empty) file
 func TestWarmupStatePersistEmpty(t *testing.T) {
-	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+	s, _ := testWarmupStateServer(t, 24*time.Hour)
 
 	// No entries stored — persist should still create the file
 	s.persistWarmupState()
 
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 	data, err := os.ReadFile(statePath)
 	if err != nil {
 		t.Fatalf("Failed to read state file: %v", err)
@@ -479,5 +479,45 @@ func TestWarmupStateIsPerServer(t *testing.T) {
 		if _, ok := tc.srv.lastWarmupTimes.Load(tc.other); ok {
 			t.Errorf("server %q loaded account %d, which another server warmed", tc.srv.name, tc.other)
 		}
+	}
+}
+
+// TestWarmupStateIgnoresSharedFile checks that the file every IMAP server used to
+// share is removed at load without being read: whichever server started first would
+// take the entries the others warmed.
+func TestWarmupStateIgnoresSharedFile(t *testing.T) {
+	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+
+	shared := filepath.Join(tmpDir, warmupStateFile)
+	if err := os.WriteFile(shared, []byte(fmt.Sprintf("7 %d\n", time.Now().Add(-time.Hour).Unix())), 0644); err != nil {
+		t.Fatalf("Failed to write shared state file: %v", err)
+	}
+
+	s.loadWarmupState()
+
+	if _, ok := s.lastWarmupTimes.Load(int64(7)); ok {
+		t.Error("Expected the shared state file not to be loaded")
+	}
+	if _, err := os.Stat(shared); !os.IsNotExist(err) {
+		t.Error("Expected the shared state file to be removed")
+	}
+}
+
+// TestWarmupStatePathStaysInCacheDir checks that every server name, whatever it
+// contains, maps to its own file directly in the cache directory.
+func TestWarmupStatePathStaysInCacheDir(t *testing.T) {
+	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+
+	seen := make(map[string]string)
+	for _, name := range []string{"imap", "../imap", "a/b", "a%2Fb", "imap 993"} {
+		s.name = name
+		path := s.warmupStatePath()
+		if filepath.Dir(path) != tmpDir {
+			t.Errorf("server %q: state file %q is outside the cache directory %q", name, path, tmpDir)
+		}
+		if other, dup := seen[path]; dup {
+			t.Errorf("servers %q and %q share the state file %q", other, name, path)
+		}
+		seen[path] = name
 	}
 }

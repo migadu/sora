@@ -465,7 +465,7 @@ alone: one copy serves every account on the node.
 <[local_cache] path>/
   data/ab/cd/<the remaining 60 characters of the hash>   one file per body
   cache_index_00.db … cache_index_ff.db                  256 SQLite index files (WAL mode)
-  .sora_warmup_state                                     warmup times, written at shutdown
+  .sora_warmup_state.<server name>                       one IMAP server's warmup times, written at shutdown
 ```
 
 The index records each file's size and when it was last read. It is split into 256 shards by
@@ -498,8 +498,9 @@ messages opens quickly.
   `warmup_mailboxes` (default `["INBOX"]`) from S3 into the cache, skipping bodies already
   cached.
 - One account is warmed at most once every `warmup_interval` (default 24 hours) per server.
-  The time of each warmup is saved in `.sora_warmup_state` at shutdown and read back at
-  startup, so a restart does not warm every account again.
+  Each IMAP server saves the time of each warmup in its own `.sora_warmup_state.<server name>`
+  (the name percent-encoded) at shutdown and reads it back at startup, so a restart does not
+  warm every account again. Warmups older than the interval are dropped from memory too.
 - With `warmup_async = true` (the default), the warmup runs in the background. Ten workers
   per IMAP server process a queue of 50; a warmup that finds the queue full is dropped and
   tried at the next login. With `warmup_async = false`, the login waits for the warmup.
