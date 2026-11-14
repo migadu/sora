@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
@@ -57,6 +58,9 @@ func TestIMAP_DisabledBinaryFetchItems(t *testing.T) {
 				t.Fatalf("dial failed: %v", err)
 			}
 			t.Cleanup(func() { conn.Close() })
+			if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+				t.Fatalf("set connection deadline: %v", err)
+			}
 			r := bufio.NewReader(conn)
 			if _, err := r.ReadString('\n'); err != nil {
 				t.Fatalf("read greeting failed: %v", err)
@@ -103,6 +107,12 @@ func TestIMAP_DisabledBinaryFetchItems(t *testing.T) {
 				}
 			}
 
+			// IMAP4rev2 includes only BINARY's FETCH side. Refuse a
+			// synchronizing literal8 APPEND before requesting its bytes.
+			if resp := do("APPEND INBOX ~{4}"); !strings.HasPrefix(status(resp), "BAD ") {
+				t.Fatalf("literal8 APPEND with BINARY disabled: want BAD, got:\n%s", resp)
+			}
+
 			// "hello world" in base64, so BINARY answers differ from BODY's.
 			msg := "From: a@example.com\r\nTo: b@example.com\r\nSubject: binary\r\n" +
 				"MIME-Version: 1.0\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n" +
@@ -124,6 +134,21 @@ func TestIMAP_DisabledBinaryFetchItems(t *testing.T) {
 					if !strings.Contains(resp, "BINARY.SIZE[1] 11") {
 						t.Errorf("%s: want BINARY.SIZE[1] 11, got:\n%s", cmd, resp)
 					}
+				}
+				// Decoding must preserve NUL and non-ASCII octets through a
+				// literal8, with SIZE and partial offsets measured after decoding
+				// (RFC 9051 sections 6.4.5 and 7.5.2).
+				binaryMsg := "From: a@example.com\r\nTo: b@example.com\r\n" +
+					"MIME-Version: 1.0\r\nContent-Type: application/octet-stream\r\n" +
+					"Content-Transfer-Encoding: base64\r\n\r\nAAH/YQ==\r\n"
+				mustOK(fmt.Sprintf("APPEND INBOX {%d+}\r\n%s", len(binaryMsg), binaryMsg))
+				resp := mustOK("FETCH 2 (BINARY.PEEK[1] BINARY.SIZE[1])")
+				if !strings.Contains(resp, "BINARY[1] ~{4}\r\n\x00\x01\xffa") || !strings.Contains(resp, "BINARY.SIZE[1] 4") {
+					t.Errorf("decoded binary octets or size mismatch: %q", resp)
+				}
+				resp = mustOK("UID FETCH 2 (BINARY.PEEK[1]<1.2>)")
+				if !strings.Contains(resp, "BINARY[1]<1> ~{2}\r\n\x01\xff") {
+					t.Errorf("decoded partial offset/bytes mismatch: %q", resp)
 				}
 			} else {
 				for _, cmd := range []string{"FETCH 1 (BINARY.PEEK[1])", "FETCH 1 (BINARY.SIZE[1])", "FETCH 1 (FLAGS BINARY.PEEK[1])", "UID FETCH 1:* (BINARY[1])"} {
