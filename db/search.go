@@ -359,7 +359,8 @@ const octetCollation = ` COLLATE "C"`
 // own example: U+01C4 becomes U+0044 U+007A U+030C). The only letters the stored key
 // cannot reproduce are the Georgian Mkhedruli ones: they are their own titlecase, but
 // strings.ToUpper stored them as Mtavruli. THREAD reads the same expression, so SORT
-// (SUBJECT) and THREAD agree on which subjects are equal.
+// (SUBJECT) and THREAD agree on which subjects are equal. addressCasemapKey finishes its
+// uppercased value the same way.
 func subjectCasemapKey(col string) string {
 	return fmt.Sprintf("normalize(translate(%s, '%s', '%s'), NFKD)", col, upperDigraphs, titleDigraphs)
 }
@@ -373,12 +374,25 @@ const (
 
 // addressCasemapKey is the i;unicode-casemap form of an expression over the lowercased
 // name and address columns (sortColumnsFor). PostgreSQL has no per-code-point titlecase, so
-// upper() stands in for it: the two differ on a few code points only, such as the
-// digraphs above, and ICU's upper() turns "ß" into "SS". The decomposition runs first, so
-// a letter that has one is uppercased through its base letter, which even an ASCII-only
-// upper() (a database with LC_CTYPE C) gets right.
+// upper() stands in for it, in RFC 5051's order: case mapping before the compatibility
+// decomposition.
+//
+//   - normalize(NFD) first splits canonical decompositions only, so a precomposed letter
+//     is uppercased through its base letter, which even an ASCII-only upper() (a database
+//     with LC_CTYPE C) gets right.
+//   - upper(), then subjectCasemapKey's digraph translate, so DŽ-type digraphs end up in
+//     titlecase.
+//   - normalize(NFKD) last, so a compatibility character that decomposes to lowercase
+//     letters ("ª", "ℓ", "㎏", mathematical letters) keeps them lowercase, as RFC 5051
+//     does. Decomposing it before upper() would uppercase them.
+//
+// Where upper() is not the titlecase, it follows LC_CTYPE: ICU's full case mapping turns
+// "ß" into "SS" and "ﬁ"-type ligatures into two letters, upper() maps the iota subscript
+// that NFD splits off Greek vowels to a capital iota and Georgian Mkhedruli to Mtavruli,
+// and an ASCII-only upper() leaves lowercase every letter without a canonical
+// decomposition (Ø, Ł, Cyrillic, Greek, fullwidth Latin).
 func addressCasemapKey(expr string) string {
-	return fmt.Sprintf("upper(normalize(%s, NFKD))", expr)
+	return subjectCasemapKey(fmt.Sprintf("upper(normalize(%s, NFD))", expr))
 }
 
 // buildSortOrderClause builds an SQL ORDER BY clause from IMAP sort criteria
