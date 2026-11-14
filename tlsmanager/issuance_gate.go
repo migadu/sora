@@ -63,9 +63,10 @@ func (g *issuanceGate) Get(ctx context.Context, name string) ([]byte, error) {
 func (g *issuanceGate) Put(ctx context.Context, name string, data []byte) error {
 	err := g.underlying.Put(ctx, name, data)
 	// The order is finished either way - a failed Put does not mean it is still running -
-	// so give back this variant's share of the cluster-wide claim regardless.
+	// so give back this variant's share of the cluster-wide claim regardless. ctx is the
+	// context of the exchange that ordered the certificate, which names its orders.
 	if domain, isCertificate := certificateDomain(name); isCertificate {
-		g.manager.releaseKeyIssuance(domain, name)
+		g.manager.releaseKeyIssuance(domain, name, exchangeEnd(ctx))
 	}
 	return err
 }

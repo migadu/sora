@@ -3,14 +3,26 @@ package tlsmanager
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
+	"math/big"
 	"net/http"
+	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )
 
@@ -498,5 +510,130 @@ func TestPutCompletesEveryOrderOfItsExchange(t *testing.T) {
 	}
 	if err := nodeB.refuseIssuance(domain); err != nil {
 		t.Fatalf("the exchange stored its certificate but its first order still holds the claim: %v", err)
+	}
+}
+
+// newIssuingACME starts an ACME server that issues every order at once - the order is
+// ready without authorizations, and finalize signs the CSR's key with a test CA - and
+// returns its directory URL.
+func newIssuingACME(t *testing.T) string {
+	t.Helper()
+
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	ca := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+
+	var nonce atomic.Int64
+	var mu sync.Mutex
+	var issued []byte
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	withNonce := func(w http.ResponseWriter) {
+		w.Header().Set("Replay-Nonce", fmt.Sprintf("nonce-%d", nonce.Add(1)))
+	}
+	order := func(w http.ResponseWriter, status int, body map[string]any) {
+		withNonce(w)
+		w.Header().Set("Location", srv.URL+"/order/1")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(body)
+	}
+	mux.HandleFunc("/directory", func(w http.ResponseWriter, r *http.Request) {
+		withNonce(w)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"newNonce":%q,"newAccount":%q,"newOrder":%q}`,
+			srv.URL+"/nonce", srv.URL+"/account", srv.URL+"/order")
+	})
+	mux.HandleFunc("/nonce", func(w http.ResponseWriter, r *http.Request) {
+		withNonce(w)
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/account", func(w http.ResponseWriter, r *http.Request) {
+		withNonce(w)
+		w.Header().Set("Location", srv.URL+"/account/1")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":"valid"}`)
+	})
+	mux.HandleFunc("/order", func(w http.ResponseWriter, r *http.Request) {
+		order(w, http.StatusCreated, map[string]any{"status": "ready", "finalize": srv.URL + "/finalize"})
+	})
+	mux.HandleFunc("/finalize", func(w http.ResponseWriter, r *http.Request) {
+		var jws struct{ Payload string }
+		var finalize struct{ CSR string }
+		body, _ := io.ReadAll(r.Body)
+		payload, _ := base64.RawURLEncoding.DecodeString(func() string { json.Unmarshal(body, &jws); return jws.Payload }())
+		json.Unmarshal(payload, &finalize)
+		der, _ := base64.RawURLEncoding.DecodeString(finalize.CSR)
+		csr, err := x509.ParseCertificateRequest(der)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		leaf, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+			SerialNumber: big.NewInt(2),
+			Subject:      pkix.Name{CommonName: csr.Subject.CommonName},
+			DNSNames:     csr.DNSNames,
+			NotBefore:    time.Now().Add(-time.Minute),
+			NotAfter:     time.Now().Add(12 * time.Hour),
+			KeyUsage:     x509.KeyUsageDigitalSignature,
+			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		}, ca, csr.PublicKey, caKey)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		mu.Lock()
+		issued = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf})
+		mu.Unlock()
+		order(w, http.StatusOK, map[string]any{"status": "valid", "certificate": srv.URL + "/cert"})
+	})
+	mux.HandleFunc("/cert", func(w http.ResponseWriter, r *http.Request) {
+		withNonce(w)
+		w.Header().Set("Content-Type", "application/pem-certificate-chain")
+		mu.Lock()
+		defer mu.Unlock()
+		w.Write(issued)
+	})
+	return srv.URL + "/directory"
+}
+
+// End to end through autocert: a Put completes only the orders of its own exchange,
+// which works only because autocert sends the newOrder and stores the certificate
+// under one context. If it ever stopped doing so, the order would hold the claim until
+// its exchange's deadline, and this test would catch that.
+func TestIssuedCertificateCompletesItsOrder(t *testing.T) {
+	const domain = "mail.example.com"
+	fence := newFakeFence()
+	nodeA, nodeB := splitBrainNode(fence), splitBrainNode(fence)
+	am := &autocert.Manager{
+		Prompt:     autocert.AcceptTOS,
+		HostPolicy: autocert.HostWhitelist(domain),
+		Cache:      newIssuanceGate(autocert.DirCache(t.TempDir()), nodeA),
+		Client: &acme.Client{
+			DirectoryURL: newIssuingACME(t),
+			HTTPClient:   &http.Client{Transport: &issuanceFence{manager: nodeA, base: http.DefaultTransport}},
+		},
+	}
+
+	if _, err := am.GetCertificate(ecdsaClientHello(domain)); err != nil {
+		t.Fatalf("first issuance: %v", err)
+	}
+	if got := fence.grantCount(); got != 1 {
+		t.Fatalf("fence grants = %d, want 1: the issuance must have taken the claim", got)
+	}
+	if err := nodeB.refuseIssuance(domain); err != nil {
+		t.Fatalf("the certificate is stored but its order still holds the claim: %v", err)
 	}
 }

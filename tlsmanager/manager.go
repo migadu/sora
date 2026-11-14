@@ -70,12 +70,14 @@ type Manager struct {
 // issuanceClaimTTL whatever still runs under it, so an order started late under one
 // can still be running when its sibling's order takes a fresh claim, and neither
 // newOrder nor Put says which claim an order ran under. Each reference therefore
-// lasts until its own autocert exchange is over, across claims.
+// lasts until its own autocert exchange is over, across claims. The exchange is what
+// names an order: autocert sends the newOrder and stores the certificate under the
+// same context, so the end of that context ties a Put to the orders it completes.
 type issuanceClaim struct {
 	release    func(context.Context) // nil while this node holds no claim
 	expires    time.Time             // when the fence lets the claim go by itself; no later than its own expiry
 	missedKeys map[string]time.Time  // cache keys that missed Get and have not yet completed Put, until their exchange ends
-	orders     []time.Time           // accepted newOrder attempts not yet completed by Put, by when their exchange ends
+	orders     []time.Time           // accepted newOrder attempts not yet completed by their exchange's Put, by when that exchange ends
 }
 
 // issuanceOrderRef records the reference taken by one newOrder attempt, so a failed
@@ -109,7 +111,8 @@ func (c *issuanceClaim) busy() bool {
 // exchangeEnd is when work started under ctx - a cache miss or an order - can no longer
 // store a certificate. autocert runs each exchange, from the cache read through the
 // order to the Put, under one context with a deadline: five minutes for a handshake,
-// ten for a renewal.
+// ten for a renewal. Work started under a context without a deadline gets an end of
+// its own, so no Put completes it and it holds the claim until then.
 func exchangeEnd(ctx context.Context) time.Time {
 	if deadline, ok := ctx.Deadline(); ok {
 		return deadline.Add(issuanceStoreGrace)
@@ -252,29 +255,29 @@ func (m *Manager) dropFailedOrderRef(ref issuanceOrderRef) {
 // releaseIssuance gives up this node's claim once the order has produced a certificate,
 // so a renewal does not have to wait out issuanceClaimTTL.
 func (m *Manager) releaseIssuance(domain string) {
-	m.releaseKeyIssuance(domain, "")
+	m.releaseKeyIssuance(domain, "", time.Time{})
 }
 
-func (m *Manager) releaseKeyIssuance(domain, cacheKey string) {
+// releaseKeyIssuance completes the work of a Put of cacheKey's certificate: the cache
+// miss on cacheKey, and the orders of the exchange that ends at until, the one the Put
+// was made under.
+func (m *Manager) releaseKeyIssuance(domain, cacheKey string, until time.Time) {
 	m.claimMu.Lock()
 	claim, held := m.issuanceClaims[domain]
 	if !held {
 		m.claimMu.Unlock()
 		return
 	}
-	// Finished exchanges first, so that none of them can stand in for this Put's order.
 	claim.prune(time.Now())
 	delete(claim.missedKeys, cacheKey)
-	// Every certificate Put completes an order, whether its variant missed Get
-	// or was renewed. newOrder does not identify the key algorithm, so pairing
-	// attempts with arbitrary misses would miscount retries and mixed variants.
-	// Nor does a Put identify the claim its order ran under, so it completes the
-	// order whose exchange ends first. If the Put was in fact a later order's, the
-	// later reference is left for the earlier order's Put: the claim is held too
-	// long at worst, never given away while one of this node's orders still runs.
-	if len(claim.orders) > 0 {
-		claim.dropOrder(slices.MinFunc(claim.orders, time.Time.Compare))
-	}
+	// A Put completes the orders of its own exchange, whichever variant it stores:
+	// newOrder does not identify the key algorithm, so orders are not paired with
+	// misses. All of them, as the exchange is over: autocert starts a new order for
+	// each challenge type it tries. A Put made under another exchange completes none.
+	// autocert makes such Puts: GetCertificate stores the certificate again for every
+	// handshake that only waited for another's order, and that Put must not stand in
+	// for a sibling's order that is still running.
+	claim.orders = slices.DeleteFunc(claim.orders, until.Equal)
 
 	if claim.busy() {
 		m.issuanceClaims[domain] = claim
