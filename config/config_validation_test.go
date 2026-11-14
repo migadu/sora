@@ -365,3 +365,17 @@ func TestWarnTLSVerifyWithoutTLS(t *testing.T) {
 		})
 	}
 }
+
+// allowed_hosts matches IP addresses and CIDRs only; a host name matches no client.
+// A metrics listener's list is fixed at startup, so that is where such an entry must be
+// reported (#460). The Admin and User APIs report theirs when they install a list.
+func TestWarnUnusedConfigOptions_MetricsAllowedHostsNotIP(t *testing.T) {
+	cfg := ServerConfig{Type: "metrics", Name: "prometheus", AllowedHosts: []string{"10.0.0.0/8", "scraper.example.com", "192.0.2.7"}}
+	var warnings []string
+	cfg.WarnUnusedConfigOptions(func(format string, args ...any) {
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+	})
+	if len(warnings) != 1 || !strings.Contains(warnings[0], `"scraper.example.com"`) || !strings.Contains(warnings[0], "prometheus") || !strings.Contains(warnings[0], "matches no client") {
+		t.Fatalf("expected one warning naming the host-name entry, got %v", warnings)
+	}
+}

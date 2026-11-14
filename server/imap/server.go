@@ -510,7 +510,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	}
 
 	// Initialize search rate limiter
-	searchRateLimiter := serverPkg.NewSearchRateLimiter("IMAP", options.SearchRateLimitPerMin, options.SearchRateLimitWindow, options.SearchRateLimitBurst)
+	searchRateLimiter := serverPkg.NewSearchRateLimiter("imap", options.SearchRateLimitPerMin, options.SearchRateLimitWindow, options.SearchRateLimitBurst)
 	threadMaxMessages := options.ThreadMaxMessages
 	if threadMaxMessages <= 0 {
 		threadMaxMessages = config.DefaultThreadMaxMessages
@@ -539,25 +539,30 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 
 		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("imap", name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("IMAP: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
-	// Parse warmup timeout with default fallback
+	// Parse warmup timeout with default fallback. Zero or a negative timeout would
+	// cancel every warmup before its first query, so it falls back too.
 	warmupTimeout := 5 * time.Minute // Default timeout
 	if options.WarmupTimeout != "" {
-		if parsed, err := helpers.ParseDuration(options.WarmupTimeout); err != nil {
-			logger.Debug("IMAP: WARNING - invalid warmup_timeout, using default", "name", name, "value", options.WarmupTimeout, "error", err, "default", warmupTimeout)
+		parsed, err := helpers.ParseDuration(options.WarmupTimeout)
+		if err == nil && parsed <= 0 {
+			err = errors.New("must be positive")
+		}
+		if err != nil {
+			logger.Warn("IMAP: invalid warmup_timeout, using the default", "name", name, "value", options.WarmupTimeout, "error", err, "default", warmupTimeout)
 		} else {
 			warmupTimeout = parsed
 		}
 	}
 
-	// Parse warmup interval with default fallback
+	// Parse warmup interval with default fallback. Zero warms at every login.
 	warmupInterval := 24 * time.Hour // Default: only warmup once per day per user
 	if options.WarmupInterval != "" {
 		if parsed, err := helpers.ParseDuration(options.WarmupInterval); err != nil {
-			logger.Debug("IMAP: WARNING - invalid warmup_interval, using default", "name", name, "value", options.WarmupInterval, "error", err, "default", warmupInterval)
+			logger.Warn("IMAP: invalid warmup_interval, using the default", "name", name, "value", options.WarmupInterval, "error", err, "default", warmupInterval)
 		} else {
 			warmupInterval = parsed
 		}
@@ -1021,10 +1026,7 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	session.Id = idgen.New()
 	session.HostName = s.hostname
 	session.Stats = s
-	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "IMAP", session.InfoLog)
-
-	// Log connection at INFO level
-	session.InfoLog("connected")
+	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "imap", session.InfoLog)
 
 	greeting := &imapserver.GreetingData{
 		PreAuth: false,

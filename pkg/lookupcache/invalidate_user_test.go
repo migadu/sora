@@ -17,7 +17,7 @@ func invalidateTestContext() (context.Context, context.CancelFunc) {
 // with the resolved email while entries were keyed on the submitted username
 // (imapproxy review M2, 2026-07-03).
 func TestInvalidateUserKeyParity(t *testing.T) {
-	c := New(5*time.Minute, 1*time.Minute, 100, 5*time.Minute, 30*time.Second)
+	c := New("test", "test", 5*time.Minute, 1*time.Minute, 100, 5*time.Minute, 30*time.Second)
 	defer func() {
 		ctx, cancel := invalidateTestContext()
 		defer cancel()
@@ -60,7 +60,7 @@ func TestInvalidateUserKeyParity(t *testing.T) {
 // the submitted username: invalidating with the resolved base address does NOT
 // remove an entry keyed on the token form.
 func TestInvalidateResolvedUsernameMisses(t *testing.T) {
-	c := New(5*time.Minute, 1*time.Minute, 100, 5*time.Minute, 30*time.Second)
+	c := New("test", "test", 5*time.Minute, 1*time.Minute, 100, 5*time.Minute, 30*time.Second)
 	defer func() {
 		ctx, cancel := invalidateTestContext()
 		defer cancel()
@@ -89,7 +89,7 @@ func TestInvalidateResolvedUsernameMisses(t *testing.T) {
 // lets the account sign in, whichever address and key format it was cached under,
 // and nothing else.
 func TestInvalidateAccount(t *testing.T) {
-	c := New(5*time.Minute, 1*time.Minute, 100, 5*time.Minute, 30*time.Second)
+	c := New("test", "test", 5*time.Minute, 1*time.Minute, 100, 5*time.Minute, 30*time.Second)
 	defer func() {
 		ctx, cancel := invalidateTestContext()
 		defer cancel()

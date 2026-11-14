@@ -574,7 +574,7 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	}
 
 	// Initialize the mutex helper
-	s.mutexHelper = server.NewMutexTimeoutHelper(&s.mutex, sessionCtx, "LMTP", logFunc)
+	s.mutexHelper = server.NewMutexTimeoutHelper(&s.mutex, sessionCtx, "lmtp", logFunc)
 
 	// Log connection with connection counters
 	activeCount := b.activeConnections.Load()

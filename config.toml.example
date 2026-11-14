@@ -599,7 +599,7 @@ refuse_after = "30s"               # How long a backend in maintenance still acc
 [local_cache]
 path = "/var/cache/sora/cache" # Filesystem path for cache storage (default: "/var/cache/sora/cache"). Must be writable. Fast storage (SSD) recommended.
 capacity = "1gb"              # Maximum total cache size (e.g., "100mb", "1gb"). LRU eviction when exceeded.
-max_object_size = "5mb"       # Maximum size for individual cached objects. Prevents large messages from dominating cache.
+max_object_size = "5mb"       # Maximum size for individual cached objects. Prevents large messages from dominating cache. Also capped at capacity/256 (the cache's 256 shards each hold that much).
 metrics_interval = "5m"       # How often cache hit/miss ratios are stored in the database.
 metrics_retention = "30d"     # How long to retain cache metrics in the database.
 purge_interval = "12h"        # How often to run cache cleanup (orphaned and stale entry removal, capacity re-check). Capacity is also enforced as objects are added.
@@ -1493,7 +1493,7 @@ name = "main-managesieve"
 addr = ":4190"
 max_connections = 200
 max_connections_per_ip = 3
-max_script_size = "16kb"      # Maximum size for a SIEVE script.
+max_script_size = "16kb"      # Maximum size for a SIEVE script (default "16kb"; "0" also means the default, there is no unlimited setting).
 # NOTE: SIEVE extensions are configured globally in the [sieve] section above.
 # This allows consistent extension support across LMTP delivery and ManageSieve script validation.
 insecure_auth = false                            # Allow plaintext auth. SECURITY: Should be false in production.
@@ -1558,6 +1558,10 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # never sent to another pool. The same happens for a pool name this proxy lacks, and
 # for a lookup that fails or answers nothing usable: with pools, no answer is never a
 # guess at the default pool.
+#
+# A User API proxy sends a CORS preflight, which names no user and reaches no account,
+# to the default pool, else to the first pool in this file's order with a backend
+# available. Give the http_user_api backends of every pool the same allowed_origins.
 #
 # A backend in maintenance (see BACKEND MAINTENANCE) is skipped inside its pool. A user
 # the API pins with "server" to a backend in maintenance is routed among the other
@@ -2299,7 +2303,8 @@ name = "admin-api"
 addr = ":8080"
 api_key = "your-secret-api-key-here"  # REQUIRED for API access.
 # read_only_api_key = ""      # [OPTIONAL] Second key that may only make GET requests (monitoring, dashboards). Must differ from api_key.
-allowed_hosts = []            # Empty = all hosts (not recommended for production).
+allowed_hosts = []            # IP/CIDR allow-list, e.g. ["10.0.1.0/24", "192.0.2.10"]; host names are not resolved
+                              # and match no client. Empty = all hosts (not recommended for production).
 tls = false
 tls_cert_file = ""            # Static cert file; ignored when the global [tls] section is enabled
 tls_key_file = ""             # Static key file; ignored when the global [tls] section is enabled
@@ -2333,7 +2338,7 @@ token_duration = "24h"        # JWT token validity duration (e.g., "24h", "7d", 
                               # at /user/auth/refresh, so a leaked token survives at most one token_duration.
 token_issuer = "sora-mail-api" # JWT issuer field (optional, for token validation).
 allowed_origins = ["*"]       # CORS allowed origins for web clients. Use specific origins in production: ["https://mail.example.com"]
-allowed_hosts = []            # IP addresses allowed to access API. Empty = all hosts.
+allowed_hosts = []            # IP/CIDR allow-list; host names are not resolved and match no client. Empty = all hosts.
 tls = false
 tls_cert_file = ""            # Static cert file; ignored when the global [tls] section is enabled
 tls_key_file = ""             # Static key file; ignored when the global [tls] section is enabled

@@ -54,6 +54,7 @@ type reloadableSettings struct {
 // Server represents a User API proxy server
 type Server struct {
 	name                       string
+	hostname                   string // labels the metrics, like every other server's hostname
 	addr                       string
 	connManager                *proxy.ConnectionManager
 	remoteUseProxyProtocol     bool // the server's own PROXY-header setting; a named pool's setting overrides it per route
@@ -353,12 +354,13 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 
 		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(opts.Name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("userapi_proxy", opts.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("User API Proxy: Route lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
 	s := &Server{
 		name:                       opts.Name,
+		hostname:                   config.ResolveMailHostname(),
 		addr:                       opts.Addr,
 		connManager:                connManager,
 		remoteUseProxyProtocol:     opts.RemoteUseProxyProtocol,
@@ -478,9 +480,9 @@ func (s *Server) setupHandler() http.Handler {
 		r = r.WithContext(context.WithValue(r.Context(), clientIPKey, s.getRealClientIP(r)))
 
 		// Track metrics
-		metrics.ConnectionsTotal.WithLabelValues("userapi_proxy", s.name, "").Inc()
-		metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, "").Inc()
-		defer metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, "").Dec()
+		metrics.ConnectionsTotal.WithLabelValues("userapi_proxy", s.name, s.hostname).Inc()
+		metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, s.hostname).Inc()
+		defer metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, s.hostname).Dec()
 
 		// Fail closed until the backend maintenance list has been read: any backend
 		// might be in maintenance (proxy.Maintenance.Loaded).
@@ -517,11 +519,17 @@ func (s *Server) setupHandler() http.Handler {
 
 		// Auth endpoints and CORS preflights carry no JWT. A login names its user in the
 		// body and a refresh carries the user's token, so both are routed like any other
-		// request for that user: the account lives on a backend of the user's pool. A
-		// request that names nobody, such as a preflight, goes to the default pool by path
-		// hash, as before pools; without a default pool it is refused. The backend handles
-		// rate limiting, and answers a preflight with its CORS policy (allowed_origins).
-		route, err := s.routeAuthRequest(r)
+		// request for that user: the account lives on a backend of the user's pool. An
+		// auth request that names nobody goes to the default pool by path hash, as before
+		// pools; without a default pool it is refused. The backend handles rate limiting.
+		// A preflight names nobody and reaches no account: see routePreflight.
+		var route backendRoute
+		var err error
+		if isCORSPreflight(r) {
+			route, err = s.routePreflight(r)
+		} else {
+			route, err = s.routeAuthRequest(r)
+		}
 		if err != nil {
 			if errors.Is(err, errAuthBodyTooLarge) {
 				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
@@ -544,6 +552,36 @@ func (s *Server) setupHandler() http.Handler {
 // account, as it does when it is reached directly.
 func isCORSPreflight(r *http.Request) bool {
 	return r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != ""
+}
+
+// routePreflight picks the backend that answers a CORS preflight. A preflight names no
+// user, and a backend answers it in its CORS middleware (with its allowed_origins) before
+// any handler, so it reaches no account. Unlike a request that names a user it is
+// therefore not confined to one pool: it goes to the default pool (the one pool of a flat
+// remote_addrs list), and failing that (no default pool, or no backend of it available)
+// to the first pool in configuration order with a backend available. Which pool answers
+// decides whose allowed_origins applies, so every pool's backends should share them.
+func (s *Server) routePreflight(r *http.Request) (backendRoute, error) {
+	tried := ""
+	if pool, err := s.connManager.ResolvePool(""); err == nil {
+		if addr := s.connManager.GetBackendByConsistentHashInPool(pool.Name, r.URL.Path); addr != "" {
+			return s.poolRoute(addr, pool), nil
+		}
+		tried = pool.Name
+	}
+	for _, name := range s.connManager.PoolNames() {
+		if name == tried {
+			continue
+		}
+		pool, err := s.connManager.ResolvePool(name)
+		if err != nil {
+			continue // refused while its backends collide with another pool's
+		}
+		if addr := s.connManager.GetBackendByConsistentHashInPool(name, r.URL.Path); addr != "" {
+			return s.poolRoute(addr, pool), nil
+		}
+	}
+	return backendRoute{}, fmt.Errorf("no backend available for a CORS preflight")
 }
 
 // maxAuthBodyBytes bounds how much of an auth request body the proxy reads to find the
@@ -720,16 +758,16 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			// positive_ttl to allow periodic revalidation via remotelookup, so that when
 			// a domain moves backends, active users eventually pick up the new backend.
 			logger.Debug("User API Proxy: Using cached route", "name", s.name, "user", email, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
-			metrics.LookupCacheHitsTotal.Inc()
+			metrics.LookupCacheResults.WithLabelValues("userapi_proxy", "hit").Inc()
 			return s.serverRoute(cached.ServerAddress), nil
 		}
 		if havePool {
-			metrics.LookupCacheHitsTotal.Inc()
+			metrics.LookupCacheResults.WithLabelValues("userapi_proxy", "hit").Inc()
 		} else {
 			if found {
 				logger.Debug("User API Proxy: Cache miss (refused entry)", "name", s.name, "user", email)
 			}
-			metrics.LookupCacheMissesTotal.Inc()
+			metrics.LookupCacheResults.WithLabelValues("userapi_proxy", "miss").Inc()
 		}
 	}
 
