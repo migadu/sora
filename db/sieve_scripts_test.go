@@ -142,3 +142,28 @@ func TestRenameScript(t *testing.T) {
 		assert.NoError(t, err)
 	})
 }
+
+// TestScriptNameNotStorable: a name PostgreSQL cannot hold (a NUL, invalid UTF-8)
+// names no script. GetScriptByName and RenameScript answer ErrDBNotFound for it, as
+// for any unknown name, instead of the database's SQLSTATE 22021, which callers
+// took for a database failure (ManageSieve NO (TRYLATER), User API 500).
+func TestScriptNameNotStorable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	database := setupTestDatabase(t)
+	defer database.Close()
+	ctx := context.Background()
+	accountID := createTestAccountForSieve(t, database, ctx)
+
+	for _, name := range []string{"a\x00b", "\xff", "caf\xc3"} {
+		_, err := database.GetScriptByName(ctx, name, accountID)
+		assert.ErrorIs(t, err, consts.ErrDBNotFound, "GetScriptByName(%q)", name)
+
+		err = inSieveTx(t, database, ctx, func(tx pgx.Tx) error {
+			return database.RenameScript(ctx, tx, accountID, name, "renamed")
+		})
+		assert.ErrorIs(t, err, consts.ErrDBNotFound, "RenameScript(%q)", name)
+	}
+}

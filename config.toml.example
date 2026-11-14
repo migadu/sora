@@ -1131,9 +1131,15 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # A capability another one implies is removed together with it: disabling an
 # extension IMAP4rev2 includes (IDLE, ESEARCH, SEARCHRES, MOVE, NAMESPACE,
 # UIDPLUS, LIST-STATUS, STATUS=SIZE, CHILDREN, ...) also removes IMAP4rev2, so
-# the server offers IMAP4rev1 with its remaining extensions; disabling CONDSTORE
-# also removes QRESYNC; disabling SORT also removes SORT=DISPLAY and ESORT.
-# client_filters follow the same rule.
+# the server offers IMAP4rev1 with its remaining extensions; disabling ESEARCH
+# also removes SEARCHRES, ESORT and MULTISEARCH; disabling CONDSTORE also
+# removes QRESYNC; disabling SORT also removes SORT=DISPLAY and ESORT; disabling
+# SPECIAL-USE also removes CREATE-SPECIAL-USE.
+# client_filters follow the same rule, except that a filter never takes away
+# what the connection has already enabled (ENABLE IMAP4rev2/CONDSTORE/QRESYNC,
+# any CONDSTORE enabling command, IMAP4rev2 on a server without IMAP4rev1):
+# a client that sends ID after ENABLE IMAP4rev2 keeps IMAP4rev2 and every
+# extension it includes.
 # IMAP4rev2 includes BINARY's FETCH items but not its APPEND extension, so
 # disabling BINARY keeps IMAP4rev2 and refuses only APPEND with a literal8;
 # FETCH BINARY, BINARY.PEEK and BINARY.SIZE are refused once IMAP4rev2 is

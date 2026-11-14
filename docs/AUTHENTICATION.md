@@ -642,7 +642,13 @@ The wait of section 10.3 comes before the reply in every case.
 ### 10.8 Scope
 
 - Each `[[server]]` block has its own limiter, in memory. Failures on the IMAP listener do not count
-  on the POP3 listener, and two IMAP listeners on one node count separately.
+  on the POP3 listener, and two IMAP backend listeners on one node count separately.
+- In cluster mode, with `[cluster.rate_limit_sync] enabled` (the default), the `imap_proxy`,
+  `pop3_proxy` and `managesieve_proxy` limiters share their state with the proxies of the same type
+  on every node, their own node included: Tier 2 blocks (`sync_blocks`), Tier 2 counts from
+  `delay_start_threshold` on (`sync_failure_counts`), and the name statistics. A shared count only
+  raises a listener's own, its `exempt_networks` are not counted, and a shared wait is capped at its
+  `max_delay`. Tier 1 blocks stay on the listener that set them.
 - A restart forgets all counts and blocks.
 - `auth_rate_limit` is read at startup. A SIGHUP reload does not change it.
 

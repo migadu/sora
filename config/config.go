@@ -2658,16 +2658,16 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
-	// A proxy dials a backend address without a port at its remote_port, or at its enabled
-	// lookup's remote_port for a lookup-routed one. No other server reads either, and a
+	// A proxy dials a backend address without a port at its remote_port, and builds a
+	// lookup client from its enabled remote_lookup. No other server reads either, and a
 	// disabled lookup is never initialized.
 	if strings.HasSuffix(s.Type, "_proxy") {
 		if _, err := s.GetRemotePort(); err != nil {
 			return fmt.Errorf("server %q: invalid remote_port: %w", s.Name, err)
 		}
 		if s.RemoteLookup != nil && s.RemoteLookup.Enabled {
-			if _, err := s.RemoteLookup.GetRemotePort(); err != nil {
-				return fmt.Errorf("server %q: invalid remote_lookup.remote_port: %w", s.Name, err)
+			if err := s.RemoteLookup.Validate(); err != nil {
+				return fmt.Errorf("server %q: %w", s.Name, err)
 			}
 		}
 	}
@@ -2709,8 +2709,10 @@ func (s *ServerConfig) MetricsPath() string {
 
 // WarnUnusedConfigOptions logs warnings for config options that don't apply to this server type
 func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...any)) {
-	if s.ReadOnlyAPIKey != "" && s.Type != "http_admin_api" {
-		logger("WARNING: Server %s (type: %s) has 'read_only_api_key' configured, but this only applies to http_admin_api servers", s.Name, s.Type)
+	for _, k := range serverTypeKeys {
+		if k.set(s) && !slices.Contains(k.appliedBy, s.Type) {
+			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "))
+		}
 	}
 	// Only these filter clients by address. Every other type, the User API proxy
 	// included, serves every client whatever the list says.
@@ -2932,6 +2934,35 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			}
 		}
 	}
+}
+
+// serverTypeKeys is each [[server]] key that only some server types read, with
+// those types. Every type accepts every key; WarnUnusedConfigOptions reports one
+// set on a type not listed.
+var serverTypeKeys = []struct {
+	name      string
+	set       func(*ServerConfig) bool
+	appliedBy []string
+}{
+	// The mail servers and proxies open their listener with this backlog; the
+	// HTTP servers listen with the kernel's default.
+	{"listen_backlog", func(s *ServerConfig) bool { return s.ListenBacklog != 0 }, []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
+	{"api_key", func(s *ServerConfig) bool { return s.APIKey != "" }, []string{"metrics", "http_admin_api"}},
+	{"read_only_api_key", func(s *ServerConfig) bool { return s.ReadOnlyAPIKey != "" }, []string{"http_admin_api"}},
+	// The User API backend issues the tokens; the proxy checks them and sets the
+	// CORS headers of the errors it answers itself.
+	{"jwt_secret", func(s *ServerConfig) bool { return s.JWTSecret != "" }, []string{"http_user_api", "user_api_proxy"}},
+	{"allowed_origins", func(s *ServerConfig) bool { return len(s.AllowedOrigins) > 0 }, []string{"http_user_api", "user_api_proxy"}},
+	{"token_duration", func(s *ServerConfig) bool { return s.TokenDuration != "" }, []string{"http_user_api"}},
+	{"token_issuer", func(s *ServerConfig) bool { return s.TokenIssuer != "" }, []string{"http_user_api"}},
+	// The metrics listener's path, and the collection settings only a metrics
+	// block applies (configureMetrics).
+	{"path", func(s *ServerConfig) bool { return s.Path != "" }, []string{"metrics"}},
+	{"enable_user_metrics", func(s *ServerConfig) bool { return s.EnableUserMetrics }, []string{"metrics"}},
+	{"enable_domain_metrics", func(s *ServerConfig) bool { return s.EnableDomainMetrics != nil }, []string{"metrics"}},
+	{"user_metrics_threshold", func(s *ServerConfig) bool { return s.UserMetricsThreshold != nil }, []string{"metrics"}},
+	{"max_tracked_users", func(s *ServerConfig) bool { return s.MaxTrackedUsers != nil }, []string{"metrics"}},
+	{"hash_usernames", func(s *ServerConfig) bool { return s.HashUsernames != nil }, []string{"metrics"}},
 }
 
 // serverLimitKeys is every [server.limits] key with the server types whose start

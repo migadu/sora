@@ -237,6 +237,7 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 		}
 
 		msg.setRecipients(recipientsJSON)
+		msg.MessageID = headerMessageID(msg.MessageID)
 
 		// Convert bitwise flags to string array
 		msg.Flags = bitwiseFlagsToStrings(flagsBitmask)
@@ -361,6 +362,7 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 		}
 
 		msg.setRecipients(recipientsJSON)
+		msg.MessageID = headerMessageID(msg.MessageID)
 
 		msg.Flags = bitwiseFlagsToStrings(flagsBitmask)
 		msg.HasAttachments = hasAttachmentsFromKeywords(msg.CustomFlags)
@@ -533,6 +535,7 @@ func (db *Database) GetMessageByID(ctx context.Context, accountID int64, message
 	}
 
 	msg.setRecipients(recipientsJSON)
+	msg.MessageID = headerMessageID(msg.MessageID)
 
 	msg.Flags = bitwiseFlagsToStrings(flagsBitmask)
 	msg.HasAttachments = hasAttachmentsFromKeywords(msg.CustomFlags)

@@ -629,6 +629,16 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	}
 	defer listener.Close()
 
+	// cmd/sora calls Close from a watcher on the application context that
+	// races Start, and go-smtp's Close closes only the listeners Serve has
+	// already registered: a listener created after it would be served until
+	// the process exits. Close it on shutdown, as the POP3 and ManageSieve
+	// servers do.
+	go func() {
+		<-b.appCtx.Done()
+		listener.Close()
+	}()
+
 	// Wrap listener with connection limiting
 	limitedListener := &connectionLimitingListener{
 		Listener: listener,

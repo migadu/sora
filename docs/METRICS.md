@@ -66,7 +66,8 @@ user metrics on, it can show user names, and with `hash_usernames = false` it sh
 text.
 
 The five `enable_*`, `user_metrics_threshold`, `max_tracked_users` and `hash_usernames` settings
-apply to the whole process. With several `metrics` blocks, the last one in the file wins.
+apply to the whole process, but only a `metrics` block sets them: in another block they are ignored,
+with a startup warning. With several `metrics` blocks, the last one in the file wins.
 
 The metrics server is not reloaded by `SIGHUP`: restart Sora to change it. See
 [CONFIGURATION.md](CONFIGURATION.md#6-reloading-with-sighup).
