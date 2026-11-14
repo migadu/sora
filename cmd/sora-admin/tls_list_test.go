@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"maps"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -25,6 +26,13 @@ import (
 // as autocert caches it: the private key, then the certificate chain.
 func expiredAutocertEntry(t *testing.T, name string) []byte {
 	t.Helper()
+	return autocertEntry(t, name, time.Now().Add(-24*time.Hour))
+}
+
+// autocertEntry returns a certificate for name valid until notAfter, encoded as
+// autocert caches it: the private key, then the certificate chain.
+func autocertEntry(t *testing.T, name string, notAfter time.Time) []byte {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -33,8 +41,8 @@ func expiredAutocertEntry(t *testing.T, name string) []byte {
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: name},
 		DNSNames:     []string{name},
-		NotBefore:    time.Now().Add(-48 * time.Hour),
-		NotAfter:     time.Now().Add(-24 * time.Hour),
+		NotBefore:    notAfter.Add(-90 * 24 * time.Hour),
+		NotAfter:     notAfter,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
@@ -153,5 +161,70 @@ func TestTLSCleanShortCertName(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cacheDir, "test")); err != nil {
 		t.Errorf("tls clean removed the unrelated local file %q: %v", "test", err)
+	}
+}
+
+// TestTLSListLocalCacheIsTheObjectsOwnCopy: a local fallback cache file is the copy of
+// the one object the server's S3 cache keys by its name. An older certificate for the
+// same domain kept under another key (here autocert/cert-old) is not in the local
+// cache, although the domain's own entry is.
+func TestTLSListLocalCacheIsTheObjectsOwnCopy(t *testing.T) {
+	stub, endpoint := newTLSStubS3(t)
+	cfg := tlsTestConfig(endpoint)
+	cacheDir := t.TempDir()
+	serverKey := tlsmanager.S3ObjectKey("mail.example.com")
+	stub.put("certs", serverKey, autocertEntry(t, "mail.example.com", time.Now().Add(60*24*time.Hour)))
+	stub.put("certs", "autocert/cert-old", expiredAutocertEntry(t, "mail.example.com"))
+	writeLocalCertificates(t, cacheDir, "mail.example.com")
+
+	out := captureStdout(t, func() error {
+		return listTLSCertificates(context.Background(), cfg, cacheDir, false, true)
+	})
+
+	var listed []struct {
+		Domain       string `json:"domain"`
+		S3Key        string `json:"s3Key"`
+		InLocalCache bool   `json:"inLocalCache"`
+	}
+	if err := json.Unmarshal([]byte(out), &listed); err != nil {
+		t.Fatalf("tls list --json printed invalid JSON: %v\n%s", err, out)
+	}
+	inCache := make(map[string]bool)
+	for _, c := range listed {
+		if c.Domain != "mail.example.com" {
+			t.Errorf("%s listed as domain %q, want mail.example.com", c.S3Key, c.Domain)
+		}
+		inCache[c.S3Key] = c.InLocalCache
+	}
+	want := map[string]bool{serverKey: true, "autocert/cert-old": false}
+	if !maps.Equal(inCache, want) {
+		t.Errorf("in local cache by S3 key = %v, want %v", inCache, want)
+	}
+}
+
+// TestTLSCleanRemovesOnlyTheObjectsOwnLocalCopy: tls clean removes the local fallback
+// cache file of an expired entry the server keeps under that name, but an expired
+// certificate kept under another key (here an old copy of the domain's certificate at
+// autocert/cert-old) does not take the local copy of the domain's current entry.
+func TestTLSCleanRemovesOnlyTheObjectsOwnLocalCopy(t *testing.T) {
+	stub, endpoint := newTLSStubS3(t)
+	cfg := tlsTestConfig(endpoint)
+	cacheDir := t.TempDir()
+	currentKey := tlsmanager.S3ObjectKey("mail.example.com")
+	expiredKey := tlsmanager.S3ObjectKey("gone.example.com")
+	stub.put("certs", currentKey, autocertEntry(t, "mail.example.com", time.Now().Add(60*24*time.Hour)))
+	stub.put("certs", expiredKey, expiredAutocertEntry(t, "gone.example.com"))
+	stub.put("certs", "autocert/cert-old", expiredAutocertEntry(t, "mail.example.com"))
+	writeLocalCertificates(t, cacheDir, "mail.example.com", "gone.example.com")
+
+	captureStdout(t, func() error {
+		return cleanTLSCertificates(context.Background(), cfg, cacheDir, false, true)
+	})
+
+	if got, want := stub.keys(), []string{"/certs/" + currentKey}; !slices.Equal(got, want) {
+		t.Errorf("S3 objects after clean = %v, want %v", got, want)
+	}
+	if got, want := localNames(t, cacheDir), []string{"mail.example.com"}; !slices.Equal(got, want) {
+		t.Errorf("local cache after clean = %v, want %v", got, want)
 	}
 }
