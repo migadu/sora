@@ -521,3 +521,33 @@ func TestWarmupStatePathStaysInCacheDir(t *testing.T) {
 		seen[path] = name
 	}
 }
+
+// Names remain distinct on case-insensitive filesystems and fit within a
+// filesystem component even when the accepted server name itself is long.
+func TestWarmupStateNamesArePortable(t *testing.T) {
+	base, _ := testWarmupStateServer(t, time.Hour)
+	for _, names := range [][2]string{
+		{"imap-case", "IMAP-case"},
+		{strings.Repeat("long/server/", 40), strings.Repeat("long/server/", 40) + "other"},
+	} {
+		a := &IMAPServer{name: names[0], cache: base.cache, warmupInterval: time.Hour}
+		b := &IMAPServer{name: names[1], cache: base.cache, warmupInterval: time.Hour}
+		a.lastWarmupTimes.Store(int64(1), time.Now())
+		b.lastWarmupTimes.Store(int64(2), time.Now())
+		a.persistWarmupState()
+		b.persistWarmupState()
+		a.lastWarmupTimes.Clear()
+		b.lastWarmupTimes.Clear()
+		a.loadWarmupState()
+		b.loadWarmupState()
+		if _, ok := a.lastWarmupTimes.Load(int64(1)); !ok {
+			t.Errorf("server %q lost its own persisted entry", a.name)
+		}
+		if _, ok := a.lastWarmupTimes.Load(int64(2)); ok {
+			t.Errorf("server %q loaded the other server's entry", a.name)
+		}
+		if _, ok := b.lastWarmupTimes.Load(int64(2)); !ok {
+			t.Errorf("server %q lost its own persisted entry", b.name)
+		}
+	}
+}

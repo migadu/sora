@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"net"
 	"os"
@@ -41,7 +42,7 @@ func TestDynamicIMAPServerUsesWarmupInterval(t *testing.T) {
 			t.Cleanup(func() { c.Close() })
 
 			const accountID, serverName = 42, "imap-warmup-interval"
-			statePath := filepath.Join(dir, ".sora_warmup_state."+serverName)
+			statePath := filepath.Join(dir, fmt.Sprintf(".sora_warmup_state.%x", sha256.Sum256([]byte(serverName))))
 			state := fmt.Sprintf("%d %d\n", accountID, time.Now().Add(-tt.age).Unix())
 			if err := os.WriteFile(statePath, []byte(state), 0o600); err != nil {
 				t.Fatal(err)

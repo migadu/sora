@@ -3,13 +3,13 @@ package imap
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1373,10 +1373,10 @@ func (s *IMAPServer) DrainSessions() int64 {
 const warmupStateFile = ".sora_warmup_state"
 
 // warmupStatePath returns this server's warmup state file. Server names are unique in
-// the configuration; escaping keeps a "/" in one inside the cache directory and keeps
-// distinct names distinct.
+// the configuration. A fixed-length lowercase digest keeps arbitrary names within
+// one filesystem component, including on case-insensitive filesystems.
 func (s *IMAPServer) warmupStatePath() string {
-	return filepath.Join(s.cache.GetBasePath(), warmupStateFile+"."+url.PathEscape(s.name))
+	return filepath.Join(s.cache.GetBasePath(), fmt.Sprintf("%s.%x", warmupStateFile, sha256.Sum256([]byte(s.name))))
 }
 
 // persistWarmupState saves lastWarmupTimes to disk so that after restart,
