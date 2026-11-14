@@ -35,7 +35,7 @@ func TestStableComponentIsReportedPeriodically(t *testing.T) {
 	defer hm.Stop()
 
 	for i := 0; i < checks; i++ {
-		hm.performCheck(check)
+		hm.performCheck(ctx, check)
 	}
 
 	// Callbacks run in goroutines of their own; give them a moment.

@@ -485,26 +485,24 @@ Monitor and manage active client connections to the mail server.
 
 **Endpoint:** `GET /admin/connections`
 
-Retrieve all active connections across all protocols.
+List the accounts with sessions on this node: one entry per account and connection tracker, not per session. `instance` is the tracker key (`<PROTOCOL>-<server name>` on a backend, `<PROTOCOL>-<host name>-<server name>` on a proxy) and `protocol` its first part. `local_count` is the account's sessions on this tracker; `total_count` adds the sessions other nodes report for the protocol through gossip. Accounts this node knows only through gossip are not listed. Without connection trackers the response has no entries and a `note` instead of `source`.
 
 **Response:** `200 OK`
 ```json
 {
   "connections": [
     {
-      "ID": 1,
-      "AccountID": 123,
-      "Protocol": "IMAP",
-      "ClientAddr": "192.168.1.100:54321",
-      "ServerAddr": "10.0.1.10:143",
-      "InstanceID": "sora-instance-1",
-      "ConnectedAt": "2024-01-20T09:15:00Z",
-      "LastActivity": "2024-01-20T09:20:00Z",
-      "ShouldTerminate": false,
-      "Email": "user@example.com"
+      "protocol": "IMAP",
+      "instance": "IMAP-node1-imap-proxy",
+      "account_id": 123,
+      "email": "user@example.com",
+      "local_count": 2,
+      "total_count": 3,
+      "last_update": "2024-01-20T09:20:00Z"
     }
   ],
-  "count": 1
+  "count": 1,
+  "source": "in-memory connection tracker"
 }
 ```
 
@@ -566,14 +564,24 @@ curl -X POST http://localhost:8080/admin/connections/kick \
 
 **Endpoint:** `GET /admin/connections/user/{email}`
 
-Get all active connections for a specific user.
+Get the user's entries on this node's connection trackers, matched by the address the sessions logged in with (case-insensitive). Unlike `GET /admin/connections`, `protocol` is the whole tracker key, there is no `instance`, and a tracker that knows the account only through gossip is listed with `local_count` 0.
 
 **Response:** `200 OK`
 ```json
 {
   "email": "user@example.com",
-  "connections": [...],
-  "count": 3
+  "connections": [
+    {
+      "protocol": "IMAP-node1-imap-proxy",
+      "account_id": 123,
+      "email": "user@example.com",
+      "local_count": 2,
+      "total_count": 3,
+      "last_update": "2024-01-20T09:20:00Z"
+    }
+  ],
+  "count": 1,
+  "source": "in-memory connection tracker"
 }
 ```
 

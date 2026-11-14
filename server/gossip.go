@@ -200,9 +200,13 @@ func (g *gossipQueue) numQueued() int {
 // The critical tier is capped at half of what remains, so a burst of kicks
 // cannot take a whole datagram and hold ordinary events off the wire; if half
 // cannot carry a single critical message the whole remainder is offered so that
-// one always gets out. critical may be nil for sources that have no such tier.
+// one always gets out. heartbeat and critical may be nil for sources that have
+// no such tier.
 func drainTiers(heartbeat, critical, ordinary *gossipQueue, overhead, limit int) [][]byte {
-	msgs := heartbeat.GetBroadcasts(overhead, limit)
+	var msgs [][]byte
+	if heartbeat != nil {
+		msgs = heartbeat.GetBroadcasts(overhead, limit)
+	}
 	used := wireBytes(msgs, overhead)
 
 	if critical != nil {
