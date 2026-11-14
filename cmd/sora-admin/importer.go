@@ -485,8 +485,8 @@ func (i *Importer) Run() error {
 		}
 	}
 
-	// Recovery: Check for messages marked in SQLite but not in PostgreSQL
-	// This can happen if PostgreSQL commit failed after SQLite update
+	// Recovery: re-arm the cached rows marked imported, but not stamped with this
+	// account, whose message is not in it (see recoverOrphanedSQLiteState).
 	if err := i.recoverOrphanedSQLiteState(); err != nil {
 		logger.Warn("Failed to recover orphaned SQLite state", "error", err)
 		// Non-fatal - continue with import
@@ -2407,7 +2407,8 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 
 	if i.options.BatchTransactionMode {
 		// Fast path: Single transaction for entire batch (20x faster)
-		// SQLite is updated BEFORE PostgreSQL commit (atomicity guaranteed)
+		// SQLite is updated AFTER the PostgreSQL commit (rolled back by compensation
+		// if that update fails)
 		logger.Info("Using batch transaction mode")
 		successHashes, err = i.insertBatchToDBWithTransaction(uploaded)
 	} else {
