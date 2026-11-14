@@ -386,13 +386,14 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		newUserAddress, err := server.NewAddress(username)
 		if err != nil {
 			s.DebugLog("invalid username format", "error", err)
-			// Record it: an unparseable username was an unmetered authentication
-			// attempt, and it is the path a non-address master SASL username takes
-			// when it falls through to here, which must be accounted for exactly
-			// like any other failed attempt.
+			// Record and count it: an unparseable username was an unmetered
+			// authentication attempt, and it is the path a non-address master SASL
+			// username takes when it falls through to here, which must be accounted
+			// for exactly like any other failed attempt.
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
+			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
 			return 0, pop3AuthError("Invalid username format")
 		}
 		userAddress = &newUserAddress

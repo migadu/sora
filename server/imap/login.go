@@ -145,10 +145,11 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 		s.DebugLog("failed to parse address", "error", err)
 		// Track invalid address format as client error
 		metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "invalid_address", "client_error").Inc()
-		// Record it: an unparseable address was an unmetered authentication
-		// attempt, and it is the path a non-address master SASL username takes
-		// when it falls through to here (sasl.go section 2), which must be
-		// accounted for exactly like any other failed attempt.
+		// Record and count it: an unparseable address was an unmetered
+		// authentication attempt, and it is the path a non-address master SASL
+		// username takes when it falls through to here (sasl.go section 2), which
+		// must be accounted for exactly like any other failed attempt.
+		metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 		if s.server.authLimiter != nil {
 			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 		}
