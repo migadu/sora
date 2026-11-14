@@ -419,13 +419,34 @@ func (c *CleanupConfig) GetFTSRetention() (time.Duration, error) {
 	return helpers.ParseDuration(c.FTSRetention)
 }
 
-// Validate rejects a negative fts_retention. It parses, but delivery and import index only
-// mail sent after now minus the retention, which would then lie in the future, so no new
-// message would get a search row; and the cleaner prunes only for a positive retention. A
-// value that does not parse falls back to keeping every vector, like any other duration key.
+// Validate rejects durations that parse but have a sign the cleaner cannot use.
+//
+//   - grace_period: every cleaner threshold is now minus the grace period, so a negative
+//     one lies in the future and expunged mail and soft-deleted accounts are hard-deleted
+//     at the next cycle, with no restore window.
+//   - max_age_restriction, health_status_retention: the cleaner acts only on a positive
+//     value, so a negative one turns the restriction or the pruning off without a word.
+//   - fts_retention: delivery and import index only mail sent after now minus the
+//     retention, which would then lie in the future, so no new message would get a search
+//     row; and the cleaner prunes only for a positive retention.
+//   - instance_liveness_threshold must be positive. The runtime getter retains its
+//     default fallback for non-positive values as a safety net.
+//
+// An unset key does not parse here and takes its default; a value that does not parse
+// falls back to the default too, like any other duration key.
 func (c *CleanupConfig) Validate() error {
-	if d, err := helpers.ParseDuration(c.FTSRetention); err == nil && d < 0 {
-		return fmt.Errorf("fts_retention must not be negative, got %q", c.FTSRetention)
+	for _, f := range []struct{ key, value string }{
+		{"grace_period", c.GracePeriod},
+		{"max_age_restriction", c.MaxAgeRestriction},
+		{"fts_retention", c.FTSRetention},
+		{"health_status_retention", c.HealthStatusRetention},
+	} {
+		if d, err := helpers.ParseDuration(f.value); err == nil && d < 0 {
+			return fmt.Errorf("%s must not be negative, got %q", f.key, f.value)
+		}
+	}
+	if d, err := helpers.ParseDuration(c.InstanceLivenessThreshold); err == nil && d <= 0 {
+		return fmt.Errorf("instance_liveness_threshold must be positive, got %q", c.InstanceLivenessThreshold)
 	}
 	return nil
 }
@@ -1868,10 +1889,18 @@ func (s *ServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(s.ProxyProtocolTimeout)
 }
 
-// GetSearchRateLimitWindow parses the search rate limit window duration
+// GetSearchRateLimitWindow parses the search rate limit window duration. A zero or
+// negative window is an error: the rate limiter would replace it with the default.
 func (s *ServerConfig) GetSearchRateLimitWindow() (time.Duration, error) {
 	if s.Limits != nil && s.Limits.SearchRateLimitWindow != "" {
-		return helpers.ParseDuration(s.Limits.SearchRateLimitWindow)
+		window, err := helpers.ParseDuration(s.Limits.SearchRateLimitWindow)
+		if err != nil {
+			return 0, err
+		}
+		if window <= 0 {
+			return 0, fmt.Errorf("limits.search_rate_limit_window must be positive, got %q", s.Limits.SearchRateLimitWindow)
+		}
+		return window, nil
 	}
 	return time.Minute, nil // Default: 1 minute
 }
@@ -3025,7 +3054,7 @@ func (c *Config) Validate() []Problem {
 	if c.HasMailBackend() {
 		// The cleaner and the upload worker both take [uploader] max_attempts.
 		add("[uploader]", c.Uploader.Validate())
-		// The cleaner and delivery both take [cleanup] fts_retention.
+		// The cleaner takes [cleanup]; delivery takes its fts_retention too.
 		add("[cleanup]", c.Cleanup.Validate())
 	}
 
@@ -3103,13 +3132,25 @@ func LoadServerConfig(configPath string, cfg *Config) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if !md.IsDefined("database", "write") {
+	if !hasTOMLPathFold(md, "database", "write") {
 		cfg.Database.Write = nil
 	}
-	if !md.IsDefined("database", "read") {
+	if !hasTOMLPathFold(md, "database", "read") {
 		cfg.Database.Read = nil
 	}
 	return err
+}
+
+func hasTOMLPathFold(md toml.MetaData, p1, p2 string) bool {
+	if md.IsDefined(p1, p2) {
+		return true
+	}
+	for _, k := range md.Keys() {
+		if len(k) >= 2 && strings.EqualFold(k[0], p1) && strings.EqualFold(k[1], p2) {
+			return true
+		}
+	}
+	return false
 }
 
 // LoadConfigFromFileWithMetadata is LoadConfigFromFile that also returns the file's TOML
