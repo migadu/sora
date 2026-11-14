@@ -13,6 +13,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/storage"
@@ -65,7 +66,7 @@ func handleVerifyS3(ctx context.Context) {
 
 	email := fs.String("email", "", "Email address to verify (required)")
 	showMissing := fs.Bool("show-missing", false, "Show detailed list of missing/orphaned objects")
-	fixOrphaned := fs.Bool("fix-orphaned", false, "Delete orphaned S3 objects not in DB")
+	fixOrphaned := fs.Bool("fix-orphaned", false, "Delete S3 objects that nothing in the DB references")
 	fixMissing := fs.Bool("fix-missing", false, "Mark DB messages with missing S3 objects as not uploaded")
 	dryRun := fs.Bool("dry-run", false, "Report issues without making changes")
 	batchSize := fs.Int("batch-size", 1000, "Number of messages to check in each batch")
@@ -81,7 +82,10 @@ Options:
   --email string       Email address to verify (required)
   --config string      Path to TOML configuration file (required)
   --show-missing       Show detailed list of missing/orphaned/corrupt objects
-  --fix-orphaned       Delete orphaned S3 objects not in DB
+  --fix-orphaned       Delete orphaned S3 objects: objects that no message row
+                       (of any account, expunged or not) and no pending upload
+                       references. Expunged messages keep their bodies until the
+                       cleaner removes them after the grace period.
   --fix-missing        Mark DB messages with missing S3 objects as not uploaded
   --dry-run            Report issues without making changes
   --batch-size int     Number of messages to check in each batch (default: 1000)
@@ -94,8 +98,11 @@ Options:
 This command performs bidirectional verification:
   1. DB → S3: Checks that all database messages exist in S3
                (with --deep: also that each body downloads, decrypts, and
-                re-hashes correctly)
-  2. S3 → DB: Checks that all S3 objects exist in the database
+                re-hashes correctly). Messages whose upload is still
+                pending are counted, not checked.
+  2. S3 → DB: Checks that every S3 object under the address is referenced
+               by a message row (of any account, expunged or not) or a
+               pending upload
 
 Examples:
   # Basic verification (read-only, HEAD only)
@@ -136,6 +143,7 @@ Examples:
 type verificationResult struct {
 	MessagesInDB  int
 	ObjectsInS3   int
+	NotUploaded   int // rows whose body still waits for a pending upload: no object expected yet
 	MissingFromS3 []string
 	OrphanedInS3  []string
 	CorruptInS3   []string
@@ -203,6 +211,9 @@ func verifyS3Storage(ctx context.Context, cfg AdminConfig, email string, showMis
 		return fmt.Errorf("DB → S3 check failed: %w", err)
 	}
 	fmt.Printf("  [OK] Checked %d messages\n", result.CheckedDBToS3)
+	if result.NotUploaded > 0 {
+		fmt.Printf("  [INFO] %d not uploaded yet (upload pending), not checked\n", result.NotUploaded)
+	}
 	if len(result.MissingFromS3) > 0 {
 		fmt.Printf("  [FAIL] %d missing from S3\n", len(result.MissingFromS3))
 	}
@@ -216,19 +227,19 @@ func verifyS3Storage(ctx context.Context, cfg AdminConfig, email string, showMis
 
 	// Phase 2: Check S3 → DB (objects exist in DB)
 	fmt.Printf("[2/2] Checking S3 → DB (objects exist in DB)...\n")
-	if err := checkS3ToDB(ctx, rdb, s3Storage, accountID, email, result); err != nil {
+	if err := checkS3ToDB(ctx, rdb, s3Storage, email, result, batchSize); err != nil {
 		return fmt.Errorf("S3 → DB check failed: %w", err)
 	}
 	fmt.Printf("  [OK] Found %d S3 objects\n", result.ObjectsInS3)
 	if len(result.OrphanedInS3) > 0 {
-		fmt.Printf("  [FAIL] %d orphaned objects (not in DB)\n", len(result.OrphanedInS3))
+		fmt.Printf("  [FAIL] %d orphaned objects (nothing in the DB references them)\n", len(result.OrphanedInS3))
 	}
 	fmt.Println()
 
 	// Apply fixes if requested
 	if (fixOrphaned || fixMissing) && !dryRun {
 		fmt.Printf("Applying fixes...\n")
-		if err := applyFixes(ctx, rdb, s3Storage, result, fixOrphaned, fixMissing); err != nil {
+		if err := applyFixes(ctx, rdb, s3Storage, accountID, result, fixOrphaned, fixMissing); err != nil {
 			return fmt.Errorf("failed to apply fixes: %w", err)
 		}
 		fmt.Println()
@@ -267,7 +278,6 @@ func checkDBToS3(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storag
 	}
 
 	result.MessagesInDB = len(messages)
-	result.CheckedDBToS3 = len(messages)
 
 	// Deduplicate by S3 key: many messages can reference the same content hash,
 	// and a deep check transfers the whole body — no need to download it twice.
@@ -282,6 +292,12 @@ func checkDBToS3(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storag
 
 		batch := messages[i:end]
 		for _, msg := range batch {
+			if msg.UploadPending {
+				// The body still waits for the uploader on the node that stored it.
+				result.NotUploaded++
+				continue
+			}
+			result.CheckedDBToS3++
 			if seen[msg.S3Key] {
 				continue
 			}
@@ -324,7 +340,14 @@ func hashFromS3Key(s3Key string) string {
 	return s3Key[idx+1:]
 }
 
-func checkS3ToDB(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage *storage.S3Storage, accountID int64, email string, result *verificationResult) error {
+// checkS3ToDB lists the objects under the address and records those that nothing
+// references as orphans. An object is referenced while a message row points at its key,
+// of any account (a key carries the address it was written under, and an address can
+// move between accounts) and expunged or not (an expunged message can be restored with
+// its body until the cleaner removes it after the grace period), or while an upload of
+// its body is pending (db.UnreferencedContentObjects). References are read after each
+// object was listed, so an upload that lands meanwhile is seen with the row it is for.
+func checkS3ToDB(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage *storage.S3Storage, email string, result *verificationResult, batchSize int) error {
 	// Parse email to get domain and localpart
 	parts := strings.Split(email, "@")
 	if len(parts) != 2 {
@@ -336,16 +359,20 @@ func checkS3ToDB(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storag
 	// Construct S3 prefix for the user
 	prefix := fmt.Sprintf("%s/%s/", domain, localpart)
 
-	// Get all DB messages for quick lookup
-	messages, err := rdb.GetAllMessagesForUserVerificationWithRetry(ctx, accountID)
-	if err != nil {
-		return fmt.Errorf("failed to get messages: %w", err)
-	}
-
-	// Create a map for fast lookup
-	dbKeys := make(map[string]bool, len(messages))
-	for _, msg := range messages {
-		dbKeys[msg.S3Key] = true
+	var batch []db.ContentObject
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		orphans, err := rdb.UnreferencedContentObjectsWithRetry(ctx, batch)
+		if err != nil {
+			return fmt.Errorf("failed to check references: %w", err)
+		}
+		for _, o := range orphans {
+			result.OrphanedInS3 = append(result.OrphanedInS3, o.Key())
+		}
+		batch = batch[:0]
+		return nil
 	}
 
 	// List all S3 objects with the prefix
@@ -355,26 +382,69 @@ func checkS3ToDB(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storag
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case err := <-errCh:
-			if err != nil {
-				return fmt.Errorf("S3 list error: %w", err)
-			}
 		case object, ok := <-objectCh:
 			if !ok {
-				return nil // Done
+				// The lister closes errCh before objectCh, keeping an error it sent.
+				if err := <-errCh; err != nil {
+					return fmt.Errorf("S3 list error: %w", err)
+				}
+				return flush()
 			}
 
+			hash := strings.TrimPrefix(object.Key, prefix)
+			if hash == "" || strings.Contains(hash, "/") {
+				// Not a body of this address: a folder marker, or another address's
+				// object (a local part may contain "/", so the prefix of "user" also
+				// lists the keys of "user/x").
+				continue
+			}
 			result.ObjectsInS3++
-
-			// Check if this S3 key exists in the database
-			if !dbKeys[object.Key] {
-				result.OrphanedInS3 = append(result.OrphanedInS3, object.Key)
+			batch = append(batch, db.ContentObject{S3Domain: domain, S3Localpart: localpart, ContentHash: hash})
+			if len(batch) >= batchSize {
+				if err := flush(); err != nil {
+					return err
+				}
 			}
 		}
 	}
 }
 
-func applyFixes(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage *storage.S3Storage, result *verificationResult, fixOrphaned, fixMissing bool) error {
+// contentObjectFromKey splits an S3 key <domain>/<localpart>/<hash> into its parts. A
+// domain and a hash never contain "/", a local part may.
+func contentObjectFromKey(key string) (db.ContentObject, bool) {
+	first, last := strings.Index(key, "/"), strings.LastIndex(key, "/")
+	if first <= 0 || last <= first+1 || last == len(key)-1 {
+		return db.ContentObject{}, false
+	}
+	return db.ContentObject{S3Domain: key[:first], S3Localpart: key[first+1 : last], ContentHash: key[last+1:]}, true
+}
+
+// deleteOrphanedObject deletes the object at key unless something references it by now,
+// and reports whether it did. Like every S3 delete (the cleaner's, the purge's, rekey's),
+// it holds the body's object lock across the re-check and the delete: an upload, restore
+// or cross-account COPY of the body is either seen by the re-check or waits for the
+// delete to finish (see db.PassS3WriteGate).
+func deleteOrphanedObject(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage *storage.S3Storage, accountID int64, key string) (bool, error) {
+	obj, ok := contentObjectFromKey(key)
+	if !ok {
+		return false, fmt.Errorf("unexpected S3 key %q", key)
+	}
+	deleted := false
+	err := rdb.ExecuteWithS3ObjectLock(ctx, obj.ContentHash, accountID, func(ctx context.Context) error {
+		referenced, err := rdb.IsContentObjectReferencedWithRetry(ctx, obj)
+		if err != nil || referenced {
+			return err
+		}
+		if err := s3Storage.DeleteContext(ctx, key); err != nil {
+			return err
+		}
+		deleted = true
+		return nil
+	})
+	return deleted, err
+}
+
+func applyFixes(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage *storage.S3Storage, accountID int64, result *verificationResult, fixOrphaned, fixMissing bool) error {
 	var wg sync.WaitGroup
 	errors := make(chan error, 2)
 
@@ -384,14 +454,23 @@ func applyFixes(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage
 		go func() {
 			defer wg.Done()
 			fmt.Printf("  Deleting %d orphaned S3 objects...\n", len(result.OrphanedInS3))
+			kept := 0
 			for _, key := range result.OrphanedInS3 {
-				if err := s3Storage.Delete(key); err != nil {
+				deleted, err := deleteOrphanedObject(ctx, rdb, s3Storage, accountID, key)
+				if err != nil {
 					errors <- fmt.Errorf("failed to delete S3 key %s: %w", key, err)
 					return
 				}
-				result.FixedOrphaned++
+				if deleted {
+					result.FixedOrphaned++
+				} else {
+					kept++
+				}
 			}
 			fmt.Printf("  [OK] Deleted %d orphaned objects\n", result.FixedOrphaned)
+			if kept > 0 {
+				fmt.Printf("  [OK] Kept %d objects referenced again since the check\n", kept)
+			}
 		}()
 	}
 
@@ -431,6 +510,9 @@ func printVerificationSummary(result *verificationResult, showMissing, dryRun, f
 	fmt.Printf("Summary:\n")
 	fmt.Printf("  Messages in DB:        %d\n", result.MessagesInDB)
 	fmt.Printf("  Objects in S3:         %d\n", result.ObjectsInS3)
+	if result.NotUploaded > 0 {
+		fmt.Printf("  Not uploaded yet:      %d\n", result.NotUploaded)
+	}
 	fmt.Printf("  Missing from S3:       %d\n", len(result.MissingFromS3))
 	fmt.Printf("  Orphaned in S3:        %d\n", len(result.OrphanedInS3))
 	if len(result.CorruptInS3) > 0 {
@@ -825,6 +907,15 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 	}
 	liveCount := liveUploaded + liveNotUploaded
 
+	// Rows are marked not uploaded while their body waits in the spool of the node that
+	// received it: with a pending upload that is an upload in progress, not a lost body.
+	uploadPending := false
+	if liveNotUploaded > 0 {
+		if uploadPending, err = rdb.PendingUploadExistsWithRetry(ctx, hash, accountID); err != nil {
+			return fmt.Errorf("failed to check for a pending upload: %w", err)
+		}
+	}
+
 	fmt.Printf("  Live: %d (uploaded: %d, not uploaded: %d)\n", liveCount, liveUploaded, liveNotUploaded)
 	fmt.Printf("  Expunged (pending cleanup): %d\n", expungedCount)
 
@@ -871,6 +962,9 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 		}
 	case exists && liveUploaded > 0:
 		fmt.Printf("[OK] Everything looks good\n")
+	case !exists && uploadPending:
+		fmt.Printf("[OK] Upload pending: the body is not in S3 yet, it waits for the uploader on the node that received it\n")
+		fmt.Printf("  Do not delete these messages. If the upload stays pending, see 'sora-admin uploader status'.\n")
 	case !exists && liveNotUploaded > 0:
 		fmt.Printf("[FAIL] Problem detected: Content missing from S3 and messages marked as not uploaded\n")
 		fmt.Printf("  This likely indicates stuck uploads from the race condition bug\n")

@@ -352,6 +352,10 @@ type MessageS3Info struct {
 	S3Domain    string
 	S3Localpart string
 	S3Key       string
+	// UploadPending is true while the body waits for the uploader (not uploaded, and a
+	// pending upload of it exists): no object is expected yet. A row not uploaded with no
+	// pending upload is waiting for nothing, and its object is checked like any other.
+	UploadPending bool
 }
 
 // MessageHashInfo represents message info for content hash verification
@@ -368,10 +372,12 @@ type MessageHashInfo struct {
 // GetAllMessagesForUserVerification retrieves S3 info for all non-expunged messages for a user
 func (db *Database) GetAllMessagesForUserVerification(ctx context.Context, accountID int64) ([]MessageS3Info, error) {
 	query := `
-		SELECT id, content_hash, s3_domain, s3_localpart
-		FROM messages
-		WHERE account_id = $1 AND expunged_at IS NULL
-		ORDER BY id
+		SELECT m.id, m.content_hash, m.s3_domain, m.s3_localpart,
+		       NOT m.uploaded AND EXISTS (SELECT 1 FROM pending_uploads pu
+		                                  WHERE pu.content_hash = m.content_hash AND pu.account_id = m.account_id)
+		FROM messages m
+		WHERE m.account_id = $1 AND m.expunged_at IS NULL
+		ORDER BY m.id
 	`
 
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, accountID)
@@ -383,7 +389,7 @@ func (db *Database) GetAllMessagesForUserVerification(ctx context.Context, accou
 	var messages []MessageS3Info
 	for rows.Next() {
 		var msg MessageS3Info
-		err := rows.Scan(&msg.ID, &msg.ContentHash, &msg.S3Domain, &msg.S3Localpart)
+		err := rows.Scan(&msg.ID, &msg.ContentHash, &msg.S3Domain, &msg.S3Localpart, &msg.UploadPending)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan message: %w", err)
 		}
