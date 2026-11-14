@@ -647,6 +647,9 @@ components:
         error:
           type: string
           example: "Recipient not found"
+        transient:
+          type: boolean
+          description: "Present and true when the failure is the server's (database, storage), not the request's: retry the delivery."
 
     DeliverMailResponse:
       type: object
@@ -2720,3 +2723,25 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '503':
+          description: |
+            Not deliverable now; retry after the Retry-After header. Sent when this backend is in
+            maintenance or this node has no upload worker (no imap, pop3 or lmtp server
+            configured), both with an Error body, and when the only recipient failed for a
+            server-side reason (DeliverMailResponse with transient set on the recipient).
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+              description: "Seconds to wait before retrying."
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/Error'
+                  - $ref: '#/components/schemas/DeliverMailResponse'
+              examples:
+                no_upload_worker:
+                  summary: Node without an upload worker
+                  value:
+                    error: "Mail delivery not available on this node: no upload worker"

@@ -37,14 +37,13 @@ func readSMTPResponse(t *testing.T, reader *bufio.Reader, what string) string {
 }
 
 // TestLMTPImplicitTLSWithProxyProtocol covers the PROXY protocol + implicit
-// TLS combination on the LMTP backend. Unlike the other protocols, LMTP uses
-// crypto/tls's eager listener (no deferred handshake): before the
-// listener-composition fix the PROXY reader sat OUTSIDE the TLS conn, so its
-// first read triggered the server-side handshake against the plaintext
-// "PROXY ..." line and every connection failed (Shape B). With the PROXY
-// listener inside, crypto/tls handshakes lazily through the PROXY conn —
-// including when the client coalesces the header and ClientHello into one
-// segment. STARTTLS mode is unaffected by the fix.
+// TLS combination on the LMTP backend. Before the listener-composition fix
+// the PROXY reader sat OUTSIDE the TLS conn, so its first read triggered the
+// server-side handshake against the plaintext "PROXY ..." line and every
+// connection failed (Shape B). With the PROXY listener inside, the deferred
+// handshake (SoraTLSListener, run on the connection's first I/O) reads
+// through the PROXY conn — including when the client coalesces the header
+// and ClientHello into one segment. STARTTLS mode is unaffected by the fix.
 func TestLMTPImplicitTLSWithProxyProtocol(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
