@@ -105,3 +105,47 @@ func TestImportCountsEachMessageOfAFailedBatchOnce(t *testing.T) {
 		assert.Equal(t, 2, pending, "both messages are left for the next run")
 	})
 }
+
+// A file the scan cannot read is reported by the scan. A cache row an earlier run left
+// for it must not be read again by the import and reported a second time (#546).
+func TestImportCountsAFileTheScanCouldNotReadOnce(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a file whatever its permission bits")
+	}
+	const unreadable = "1700000001.M1P1.host:2,S"
+
+	for _, tc := range []struct {
+		name string
+		// failFirst makes the first run's inserts fail, which leaves its rows pending.
+		failFirst   bool
+		incremental bool
+	}{
+		{name: "re-run of an imported maildir"},
+		{name: "incremental retry of a failed run", failFirst: true, incremental: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			maildirPath := newCleanupDBMaildir(t, 2)
+			first := newMockResilientDatabase()
+			if tc.failFirst {
+				first.insertMessageShouldFail = true
+				first.insertMessageError = errors.New("simulated insert failure")
+			}
+			_ = newTestModeImporter(t, maildirPath, first, ImporterOptions{}).Run()
+
+			path := filepath.Join(maildirPath, "cur", unreadable)
+			require.NoError(t, os.Chmod(path, 0))
+			t.Cleanup(func() { _ = os.Chmod(path, 0644) })
+
+			importer := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), ImporterOptions{Incremental: tc.incremental})
+			err := importer.Run()
+			require.Error(t, err)
+			assert.Equal(t, "import completed with 1 failed messages", err.Error())
+			assert.Equal(t, int64(1), importer.failedMessages,
+				"the summary's Failed count differs from the messages that failed")
+			if paths := recordedFailedPaths(importer); assert.Len(t, paths, 1, "each failed message is listed once") {
+				assert.Equal(t, unreadable, filepath.Base(paths[0]))
+			}
+			assert.Equal(t, int64(1), importer.importedMessages, "the readable message is imported")
+		})
+	}
+}
