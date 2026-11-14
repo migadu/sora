@@ -17,6 +17,7 @@ import (
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/imapproxy"
 	"github.com/migadu/sora/server/lmtpproxy"
 	"github.com/migadu/sora/server/managesieveproxy"
@@ -354,4 +355,153 @@ func TestRemoteLookupWithoutClientIPSendsNoPlaceholder(t *testing.T) {
 	if want := "email=anna%40example.com&ip=&route_only=true"; rawQuery != want {
 		t.Errorf("lookup query = %q, want %q", rawQuery, want)
 	}
+}
+
+// proxyHeaderBackend is a backend that records the source address of the PROXY header
+// each connection opens with. A proxy dials it with remote_use_proxy_protocol.
+func proxyHeaderBackend(t *testing.T) (addr string, srcIP <-chan string) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	reader, err := server.NewProxyProtocolReader("TEST-BACKEND", server.ProxyProtocolConfig{Enabled: true, TrustedProxies: trusted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch := make(chan string, 1)
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				info, _, err := reader.ReadProxyHeader(c)
+				src := "no PROXY header"
+				if err == nil && info != nil {
+					src = info.SrcIP
+				}
+				select {
+				case ch <- src:
+				default:
+				}
+			}()
+		}
+	}()
+	return l.Addr().String(), ch
+}
+
+// pinningLookup answers every lookup with the user, a password hash and backend.
+func pinningLookup(t *testing.T, backend string) *config.RemoteLookupConfig {
+	t.Helper()
+	hash, err := db.GenerateBcryptHash("secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup := newIPLookup(t)
+	lookup.answer = func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"address": "anna@example.com", "password_hash": hash, "server": backend, "account_id": 1,
+		})
+	}
+	rl := lookup.config()
+	rl.RemoteUseProxyProtocol = true
+	return rl
+}
+
+func assertBackendPROXYSource(t *testing.T, srcIP <-chan string) {
+	t.Helper()
+	select {
+	case got := <-srcIP:
+		if got != proxiedClientIP {
+			t.Errorf("backend PROXY header source = %q, want %q (the client named in the incoming PROXY header)", got, proxiedClientIP)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the backend was never dialed")
+	}
+}
+
+// TestBackendPROXYHeaderNamesTheProxiedClient: with remote_use_proxy_protocol, the
+// PROXY header a proxy sends its backend names the client of the incoming PROXY
+// header, not the load balancer the proxy's socket is connected to.
+func TestBackendPROXYHeaderNamesTheProxiedClient(t *testing.T) {
+	plain := base64.StdEncoding.EncodeToString([]byte("\x00anna@example.com\x00secret"))
+
+	t.Run("imap", func(t *testing.T) {
+		backend, srcIP := proxyHeaderBackend(t)
+		conn, r := dialProxied(t, startIMAPProxy(t, pinningLookup(t, backend), []string{backend}))
+		readUntil(t, r, "* OK")
+		send(t, conn, "a1 LOGIN anna@example.com secret")
+		assertBackendPROXYSource(t, srcIP)
+	})
+
+	t.Run("pop3", func(t *testing.T) {
+		backend, srcIP := proxyHeaderBackend(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		addr := freeAddr(t)
+		s, err := pop3proxy.New(ctx, "localhost", addr, &resilient.ResilientDatabase{}, pop3proxy.POP3ProxyServerOptions{
+			Name: "ip", RemoteAddrs: []string{backend}, RemoteLookup: pinningLookup(t, backend), ConnectTimeout: 2 * time.Second,
+			ProxyProtocol: true, TrustedNetworks: trusted, TrustedProxies: trusted, InsecureAuth: true,
+		})
+		if err != nil {
+			t.Fatalf("pop3proxy.New: %v", err)
+		}
+		go func() { _ = s.Start() }()
+		defer s.Stop()
+		conn, r := dialProxied(t, addr)
+		readUntil(t, r, "+OK")
+		send(t, conn, "USER anna@example.com")
+		readUntil(t, r, "+OK", "-ERR")
+		send(t, conn, "PASS secret")
+		assertBackendPROXYSource(t, srcIP)
+	})
+
+	t.Run("managesieve", func(t *testing.T) {
+		backend, srcIP := proxyHeaderBackend(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		addr := freeAddr(t)
+		s, err := managesieveproxy.New(ctx, &resilient.ResilientDatabase{}, "localhost", managesieveproxy.ServerOptions{
+			Name: "ip", Addr: addr, RemoteAddrs: []string{backend}, RemoteLookup: pinningLookup(t, backend), ConnectTimeout: 2 * time.Second,
+			ProxyProtocol: true, TrustedNetworks: trusted, TrustedProxies: trusted, InsecureAuth: true,
+		})
+		if err != nil {
+			t.Fatalf("managesieveproxy.New: %v", err)
+		}
+		go func() { _ = s.Start() }()
+		defer s.Stop()
+		conn, r := dialProxied(t, addr)
+		readUntil(t, r, "OK")
+		send(t, conn, `AUTHENTICATE "PLAIN" "`+plain+`"`)
+		assertBackendPROXYSource(t, srcIP)
+	})
+
+	t.Run("lmtp", func(t *testing.T) {
+		backend, srcIP := proxyHeaderBackend(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		addr := freeAddr(t)
+		s, err := lmtpproxy.New(ctx, &resilient.ResilientDatabase{}, "localhost", lmtpproxy.ServerOptions{
+			Name: "ip", Addr: addr, RemoteAddrs: []string{backend}, RemoteLookup: pinningLookup(t, backend), ConnectTimeout: 2 * time.Second,
+			ProxyProtocol: true, TrustedProxies: trusted,
+		})
+		if err != nil {
+			t.Fatalf("lmtpproxy.New: %v", err)
+		}
+		go func() { _ = s.Start() }()
+		defer s.Stop()
+		conn, r := dialProxied(t, addr)
+		readUntil(t, r, "220")
+		send(t, conn, "LHLO mta.example.org")
+		readUntil(t, r, "250 ")
+		send(t, conn, "MAIL FROM:<sender@example.org>")
+		readUntil(t, r, "2", "4", "5")
+		send(t, conn, "RCPT TO:<anna@example.com>")
+		assertBackendPROXYSource(t, srcIP)
+	})
 }
