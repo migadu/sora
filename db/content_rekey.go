@@ -100,10 +100,19 @@ func (d *Database) RekeyContentHash(ctx context.Context, tx pgx.Tx, accountID in
 		return 0, fmt.Errorf("failed to lock the new hash's fts rows: %w", err)
 	}
 
+	// A message stored without a Message-ID carries syntheticMessageID(hash, mailbox),
+	// <hash@mailbox.synthetic.invalid>, and the importer's duplicate check matches on
+	// (message_id, content_hash). The id moves with the hash, or a re-import, which derives
+	// it from the new hash, would store the message a second time.
 	tag, err := tx.Exec(ctx, `
-		UPDATE messages SET content_hash = $5, updated_at = now()
+		UPDATE messages SET content_hash = $5,
+		       message_id = CASE WHEN starts_with(message_id, $6::text) AND message_id LIKE '%.synthetic.invalid>'
+		                         THEN $7::text || substr(message_id, length($6::text) + 1)
+		                         ELSE message_id END,
+		       updated_at = now()
 		WHERE account_id = $1 AND s3_domain = $2 AND s3_localpart = $3 AND content_hash = $4`,
-		accountID, obj.S3Domain, obj.S3Localpart, obj.ContentHash, newHash)
+		accountID, obj.S3Domain, obj.S3Localpart, obj.ContentHash, newHash,
+		"<"+obj.ContentHash+"@", "<"+newHash+"@")
 	if err != nil {
 		return 0, fmt.Errorf("failed to re-key messages: %w", err)
 	}

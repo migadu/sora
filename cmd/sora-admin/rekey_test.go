@@ -288,6 +288,52 @@ func TestRekeyLegacySHA256Imports(t *testing.T) {
 	assert.True(t, ok)
 }
 
+// TestRekeyMovesSyntheticMessageID: a message without a Message-ID header is stored with a
+// synthetic one derived from its content hash (<hash@mailbox.synthetic.invalid>), so the
+// importer's (message_id, content_hash) duplicate check recognises it on a re-import. The
+// re-key must move that id with the hash: a re-import derives it from the BLAKE3 hash and
+// would otherwise store the message a second time.
+func TestRekeyMovesSyntheticMessageID(t *testing.T) {
+	f := newRekeyFixture(t)
+	accountID, domain, local := f.account("synthetic")
+	messageIDOf := func(row int64) string {
+		var id string
+		require.NoError(t, f.rdb.GetOperationalDatabase().GetWritePool().QueryRow(f.ctx,
+			"SELECT message_id FROM messages WHERE id = $1", row).Scan(&id))
+		return id
+	}
+
+	body := f.body("synthetic")
+	oldHash, newHash := sha256Hex(body), helpers.HashContent(body)
+	row := f.insert(accountID, "INBOX", domain, local, oldHash, body, "")
+	f.put(helpers.NewS3Key(domain, local, oldHash), body)
+	require.Equal(t, "<"+oldHash+"@INBOX.synthetic.invalid>", messageIDOf(row))
+
+	// A real Message-ID that happens to contain the hash is not synthetic: it stays.
+	other := f.body("real id")
+	otherHash := sha256Hex(other)
+	realID := "<" + otherHash + "@example.org>"
+	otherRow := f.insert(accountID, "INBOX", domain, local, otherHash, other, realID)
+	f.put(helpers.NewS3Key(domain, local, otherHash), other)
+
+	report, err := rekeyAccount(f.ctx, f.rdb, f.store, accountID, rekeyOptions{BatchSize: 10, Jobs: 1})
+	require.NoError(t, err)
+	require.Equal(t, 2, report.Rekeyed)
+	assert.Equal(t, "<"+newHash+"@INBOX.synthetic.invalid>", messageIDOf(row))
+	assert.Equal(t, realID, messageIDOf(otherRow))
+
+	// Import the same file again, as the importer does: no Message-ID, BLAKE3 hash.
+	inbox, err := f.rdb.GetMailboxByNameWithRetry(f.ctx, accountID, "INBOX")
+	require.NoError(t, err)
+	var bs imap.BodyStructure = &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain"}
+	inserted, _, _, err := f.rdb.InsertMessagesFromImporterBatchWithRetry(f.ctx, []*db.InsertMessageOptions{{
+		AccountID: accountID, MailboxID: inbox.ID, MailboxName: "INBOX", S3Domain: domain, S3Localpart: local,
+		ContentHash: newHash, InternalDate: time.Now(), SentDate: time.Now(), Size: int64(len(body)), BodyStructure: &bs,
+	}})
+	require.NoError(t, err)
+	assert.Empty(t, inserted, "the re-import stored a second copy of a message without a Message-ID")
+}
+
 // TestRekeyOldObjectWaitsAndRechecks: the old object is deleted only after the delay, and
 // only if no row has claimed it meanwhile (here: a row written with the old hash after the
 // re-key committed, as a COPY that read its source before the re-key would).
