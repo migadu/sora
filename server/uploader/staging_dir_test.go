@@ -116,3 +116,59 @@ func TestConcurrentStagingsOfOneBody(t *testing.T) {
 	}
 	require.Len(t, names, rounds, "only the staged bodies may remain, no temporary files: %v", names)
 }
+
+func TestStagingRenameFailureCleansTemporaryFileAndCanRetry(t *testing.T) {
+	const hash = "f76ce87800000000000000000000000000000000000000000000000000000814"
+	w := &UploadWorker{path: t.TempDir()}
+	path := w.FilePath(hash, 814)
+	body := []byte("complete staged body\r\n")
+	// Renaming a regular file over a directory must fail after the temporary
+	// file has been fully written and closed.
+	require.NoError(t, os.MkdirAll(path, 0755))
+	_, err := w.StoreLocally(hash, 814, body)
+	require.Error(t, err)
+	entries, err := os.ReadDir(filepath.Dir(path))
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "the failed rename must remove only its own temporary file")
+	require.True(t, entries[0].IsDir(), "the failed rename must preserve the destination")
+	require.Equal(t, int64(0), w.currentStagingSize)
+
+	require.NoError(t, os.Remove(path))
+	_, err = w.StoreLocally(hash, 814, body)
+	require.NoError(t, err)
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, body, got)
+	require.Equal(t, int64(len(body)), w.currentStagingSize)
+	entries, err = os.ReadDir(filepath.Dir(path))
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "a retry leaves only the completed body")
+}
+
+func TestUniqueStagingTempFilesRespectCleanupGraceAndCancellation(t *testing.T) {
+	const hash = "f76ce87800000000000000000000000000000000000000000000000000000814"
+	w := &UploadWorker{path: t.TempDir()}
+	path, err := w.StoreLocally(hash, 814, []byte("complete staged body\r\n"))
+	require.NoError(t, err)
+	oldTemp := *path + ".0123456789abcdef.tmp"
+	recentTemp := *path + ".fedcba9876543210.tmp"
+	for _, name := range []string{oldTemp, recentTemp} {
+		require.NoError(t, os.WriteFile(name, []byte("unfinished body"), 0644))
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, os.Chtimes(oldTemp, old, old))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.NoError(t, w.cleanupOrphanedFiles(ctx))
+	_, err = os.Stat(oldTemp)
+	require.NoError(t, err, "a canceled cleanup must leave even an old temporary file alone")
+
+	require.NoError(t, w.cleanupOrphanedFiles(context.Background()))
+	_, err = os.Stat(oldTemp)
+	require.True(t, os.IsNotExist(err), "a crash leftover with the new suffix must be swept")
+	for _, name := range []string{recentTemp, *path, filepath.Dir(*path)} {
+		_, err = os.Stat(name)
+		require.NoError(t, err, "cleanup must preserve recent files and the account directory")
+	}
+}
