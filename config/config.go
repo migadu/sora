@@ -769,32 +769,34 @@ func decodeTable(name string, data any, v any) error {
 	if !ok {
 		return fmt.Errorf("%s must be a table, got %T", name, data)
 	}
-	table = maps.Clone(table)
+	decoded := maps.Clone(table)
 	typ := reflect.TypeOf(v).Elem()
 	for i := range typ.NumField() {
 		field := typ.Field(i)
 		if field.Type != reflect.TypeOf(time.Duration(0)) {
 			continue
 		}
-		key := tomlKey(field)
-		value, ok := table[key]
-		if !ok {
-			continue
+		// The toml package decodes a key into a field it matches only
+		// case-insensitively too ("IP_Block_Duration"), so every such key is parsed.
+		for key, value := range table {
+			if !strings.EqualFold(key, tomlKey(field)) {
+				continue
+			}
+			s, ok := value.(string)
+			if !ok {
+				return fmt.Errorf("%s: a duration is a string with a unit, such as \"15m\" or \"1d\", got %v", key, value)
+			}
+			// Parsed here, before LoadConfigFromFile trims every string, so trim it the same way.
+			d, err := helpers.ParseDuration(strings.TrimSpace(s))
+			if err != nil {
+				return fmt.Errorf("%s: %w", key, err)
+			}
+			decoded[key] = int64(d) // the toml package decodes an integer into a time.Duration as nanoseconds
 		}
-		s, ok := value.(string)
-		if !ok {
-			return fmt.Errorf("%s: a duration is a string with a unit, such as \"15m\" or \"1d\", got %v", key, value)
-		}
-		// Parsed here, before LoadConfigFromFile trims every string, so trim it the same way.
-		d, err := helpers.ParseDuration(strings.TrimSpace(s))
-		if err != nil {
-			return fmt.Errorf("%s: %w", key, err)
-		}
-		table[key] = int64(d) // the toml package decodes an integer into a time.Duration as nanoseconds
 	}
 
 	var buf strings.Builder
-	if err := toml.NewEncoder(&buf).Encode(table); err != nil {
+	if err := toml.NewEncoder(&buf).Encode(decoded); err != nil {
 		return fmt.Errorf("%s: %w", name, err)
 	}
 	md, err := toml.Decode(buf.String(), v)
