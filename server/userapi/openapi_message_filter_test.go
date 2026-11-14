@@ -2,8 +2,10 @@ package userapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -113,17 +115,25 @@ func jsonShape(v any) string {
 // sorted. An array's type names its items' type, and a $ref is followed.
 func openAPIPropertyShapes(t *testing.T, schema string) []string {
 	t.Helper()
+	return propertyShapes(t, openAPISchemaBlock(t, schema), 8)
+}
+
+// propertyShapes returns "name: type" for each property in block named on a line
+// indented by indent spaces, sorted.
+func propertyShapes(t *testing.T, block string, indent int) []string {
+	t.Helper()
 	type property struct {
 		name string
 		body []string
 	}
+	propertyName := regexp.MustCompile(fmt.Sprintf(`^ {%d}([A-Za-z_]+):\s*$`, indent))
 	var props []*property
 	var cur *property
-	for _, line := range strings.Split(openAPISchemaBlock(t, schema), "\n") {
-		if m := openAPIPropertyName.FindStringSubmatch(line); m != nil {
+	for _, line := range strings.Split(block, "\n") {
+		if m := propertyName.FindStringSubmatch(line); m != nil {
 			cur = &property{name: m[1]}
 			props = append(props, cur)
-		} else if cur != nil && strings.HasPrefix(line, strings.Repeat(" ", 10)) {
+		} else if cur != nil && strings.HasPrefix(line, strings.Repeat(" ", indent+2)) {
 			cur.body = append(cur.body, line)
 		} else if line != "" {
 			cur = nil
@@ -131,7 +141,7 @@ func openAPIPropertyShapes(t *testing.T, schema string) []string {
 	}
 	shapes := make([]string, 0, len(props))
 	for _, p := range props {
-		shapes = append(shapes, p.name+": "+openAPIShape(t, p.name, p.body, 10))
+		shapes = append(shapes, p.name+": "+openAPIShape(t, p.name, p.body, indent+2))
 	}
 	slices.Sort(shapes)
 	return shapes
