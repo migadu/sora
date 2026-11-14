@@ -101,6 +101,11 @@ func freeAddr(t *testing.T) string {
 // dialProxied connects to addr as a trusted load balancer forwarding proxiedClientIP.
 func dialProxied(t *testing.T, addr string) (net.Conn, *bufio.Reader) {
 	t.Helper()
+	return dialProxiedIP(t, addr, proxiedClientIP)
+}
+
+func dialProxiedIP(t *testing.T, addr, clientIP string) (net.Conn, *bufio.Reader) {
+	t.Helper()
 	var conn net.Conn
 	var err error
 	deadline := time.Now().Add(5 * time.Second)
@@ -117,7 +122,7 @@ func dialProxied(t *testing.T, addr string) (net.Conn, *bufio.Reader) {
 	t.Cleanup(func() { conn.Close() })
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 	_, port, _ := net.SplitHostPort(addr)
-	if _, err := fmt.Fprintf(conn, "PROXY TCP4 %s 127.0.0.1 51000 %s\r\n", proxiedClientIP, port); err != nil {
+	if _, err := fmt.Fprintf(conn, "PROXY TCP4 %s 127.0.0.1 51000 %s\r\n", clientIP, port); err != nil {
 		t.Fatalf("write PROXY header: %v", err)
 	}
 	return conn, bufio.NewReader(conn)

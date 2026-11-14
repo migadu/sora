@@ -340,7 +340,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 	// Initialize route lookup cache if configured
 	var lookupCache *lookupcache.LookupCache
 	var positiveRevalidationWindow time.Duration
-	if opts.LookupCache != nil && opts.LookupCache.Enabled {
+	if opts.LookupCache != nil && opts.LookupCache.Enabled && !proxy.RemoteLookupUsesClientIP(opts.RemoteLookup) {
 		lookupCacheConfig := opts.LookupCache
 
 		positiveTTL, err := time.ParseDuration(lookupCacheConfig.PositiveTTL)
