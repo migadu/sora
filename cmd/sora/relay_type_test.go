@@ -14,12 +14,13 @@ import (
 const loadConfigHelperEnv = "SORA_LOAD_CONFIG_HELPER_PATH"
 
 // TestLoadAndValidateConfigHelper is not a test: it is the server's start-up
-// configuration check, run by TestStartupRefusesUnsupportedRelayType in a process of
-// its own because a refused configuration exits.
+// configuration check, run by TestStartupRefusesUnsupportedRelayType and
+// TestStartupRefusesIncompleteServerBlock in a process of its own because a refused
+// configuration exits.
 func TestLoadAndValidateConfigHelper(t *testing.T) {
 	path := os.Getenv(loadConfigHelperEnv)
 	if path == "" {
-		t.Skip("helper process for TestStartupRefusesUnsupportedRelayType")
+		t.Skip("helper process for the start-up configuration tests")
 	}
 	cfg := config.NewDefaultConfig()
 	loadAndValidateConfig(path, &cfg, errors.NewErrorHandler())
