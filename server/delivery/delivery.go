@@ -210,6 +210,11 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			return result, nil
 		}
 
+		if outcome.AbortRedirect != nil {
+			// A delivery that fails is retried by its caller, which holds the
+			// redirects again: drop the ones this attempt has not handed over.
+			defer outcome.AbortRedirect()
+		}
 		if outcome.RedirectOnly {
 			if outcome.Redirect() {
 				result.Discarded = true

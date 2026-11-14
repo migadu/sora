@@ -959,8 +959,9 @@ defaults to `[tls.letsencrypt] fallback_dir`, or `/var/lib/sora/certs`.
 Notes on `delete`:
 
 - Give exactly one of `--domain` and `--key`.
-- `--key` takes the full S3 key as `tls list --details` shows it (`autocert/cert-...`). A shorter
-  value, or one ending in `...`, is treated as a prefix; it must match exactly one key.
+- `--key` takes the full S3 key as `tls list --details` shows it (`autocert/cert-...`). A value
+  that is not a key in the bucket, or one ending in `...`, is treated as a prefix; it must match
+  exactly one key. A key that exists is deleted even when it is also the prefix of another key.
 - `--domain` deletes both the ECDSA and the RSA certificate of the domain, from S3 and from the
   local mirror.
 - `--key` leaves the local mirror alone.

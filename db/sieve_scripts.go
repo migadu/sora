@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/helpers"
 )
 
 type SieveScript struct {
@@ -64,6 +65,12 @@ func (db *Database) GetActiveScript(ctx context.Context, AccountID int64) (*Siev
 }
 
 func (db *Database) GetScriptByName(ctx context.Context, name string, AccountID int64) (*SieveScript, error) {
+	// A name PostgreSQL cannot hold (a NUL, invalid UTF-8) names no script, as in
+	// GetMailboxByName. Querying with it fails with SQLSTATE 22021, which callers took
+	// for a database failure: ManageSieve answered NO (TRYLATER), the User API 500.
+	if !helpers.TextStorable(name) {
+		return nil, consts.ErrDBNotFound
+	}
 	var script SieveScript
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, "SELECT id, name, script, active, updated_at FROM sieve_scripts WHERE name = $1 AND account_id = $2", name, AccountID).Scan(&script.ID, &script.Name, &script.Script, &script.Active, &script.UpdatedAt)
 	if err != nil {
@@ -134,6 +141,9 @@ func (db *Database) UpdateScript(ctx context.Context, tx pgx.Tx, scriptID, Accou
 // Because the rename is a single UPDATE, there is no read-then-write window: the
 // UNIQUE (account_id, name) constraint resolves name collisions atomically.
 func (db *Database) RenameScript(ctx context.Context, tx pgx.Tx, AccountID int64, oldName, newName string) error {
+	if !helpers.TextStorable(oldName) { // names no script, see GetScriptByName
+		return consts.ErrDBNotFound
+	}
 	tag, err := tx.Exec(ctx, `
 		UPDATE sieve_scripts SET name = $1, updated_at = now()
 		WHERE name = $2 AND account_id = $3

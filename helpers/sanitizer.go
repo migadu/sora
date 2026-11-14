@@ -8,6 +8,13 @@ import (
 	"github.com/migadu/go-imap"
 )
 
+// TextStorable reports whether s can be a PostgreSQL text value: valid UTF-8 without
+// a NUL. PostgreSQL refuses any other string as a text parameter (SQLSTATE 22021), so a
+// lookup by such a name can find nothing and is answered "not found" without a query.
+func TextStorable(s string) bool {
+	return utf8.ValidString(s) && strings.IndexByte(s, 0) < 0
+}
+
 // SanitizeUTF8 removes invalid UTF-8 sequences and NULL bytes from a string.
 // PostgreSQL's text type does not allow NULL bytes (0x00) even though they are valid UTF-8.
 // This function ensures the string is safe to store in any PostgreSQL text column.

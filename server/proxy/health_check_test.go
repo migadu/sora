@@ -1105,6 +1105,156 @@ func TestDialTimeoutMarksPreferredPoolBackendUnhealthy(t *testing.T) {
 	}
 }
 
+// elapsedDeadlineCtx is a caller context caught between its deadline passing and its
+// timer running: Deadline is in the past while Done is still open and Err is nil. Every
+// context.WithTimeout passes through this state as it expires, for as long as the
+// scheduler takes to run its timer, and net.Dialer refuses a dial inside it from the
+// deadline alone. Holding the state still makes that window deterministic.
+type elapsedDeadlineCtx struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c elapsedDeadlineCtx) Deadline() (time.Time, bool) { return c.deadline, true }
+
+func newElapsedDeadlineCtx(t *testing.T) context.Context {
+	t.Helper()
+	parent, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return elapsedDeadlineCtx{Context: parent, deadline: time.Now().Add(-time.Millisecond)}
+}
+
+// TestCallerDeadlineIsNotChargedToBackend covers every path that charges a failed dial
+// to a backend's health (#862). A caller whose deadline has passed has its dial refused
+// by net.Dialer before ctx.Err() says so, and three such refusals quarantined a healthy,
+// listening backend. A backend that exhausts its own connect_timeout while the caller
+// still has time left must keep counting: both fail as a timeout, so the returned error
+// cannot tell them apart.
+func TestCallerDeadlineIsNotChargedToBackend(t *testing.T) {
+	poolHealth := func(cm *ConnectionManager, backend string) (int, bool) {
+		return poolHealthSnapshot(t, cm, backend).FailureCount, cm.IsBackendHealthy(backend)
+	}
+	remoteLookupHealth := func(cm *ConnectionManager, backend string) (int, bool) {
+		cm.healthMu.RLock()
+		failures := 0
+		if h, ok := cm.remoteLookupHealth[backend]; ok {
+			failures = h.FailureCount
+		}
+		cm.healthMu.RUnlock()
+		return failures, cm.IsRemoteLookupBackendHealthy(backend)
+	}
+	closeConn := func(conn net.Conn) {
+		if conn != nil {
+			conn.Close()
+		}
+	}
+
+	paths := []struct {
+		name string
+		// outsidePool: the dialed backend is a lookup pin outside the manager's pool.
+		outsidePool bool
+		connect     func(ctx context.Context, cm *ConnectionManager, backend string) error
+		health      func(cm *ConnectionManager, backend string) (failures int, healthy bool)
+	}{
+		{
+			name: "round_robin",
+			connect: func(ctx context.Context, cm *ConnectionManager, _ string) error {
+				conn, _, err := cm.ConnectWithProxy(ctx, "", "", 0, "", 0, nil)
+				closeConn(conn)
+				return err
+			},
+			health: poolHealth,
+		},
+		{
+			name: "preferred_pool_backend",
+			connect: func(ctx context.Context, cm *ConnectionManager, backend string) error {
+				conn, _, err := cm.ConnectWithProxy(ctx, backend, "", 0, "", 0, nil)
+				closeConn(conn)
+				return err
+			},
+			health: poolHealth,
+		},
+		{
+			name:        "remote_lookup_outside_pool",
+			outsidePool: true,
+			connect: func(ctx context.Context, cm *ConnectionManager, backend string) error {
+				info := &UserRoutingInfo{ServerAddress: backend, IsRemoteLookupAccount: true}
+				conn, _, err := cm.ConnectWithProxy(ctx, backend, "", 0, "", 0, info)
+				closeConn(conn)
+				return err
+			},
+			health: remoteLookupHealth,
+		},
+		{
+			// The User API proxy dials through a bound route and reports the outcome.
+			name: "route_dial_outcome",
+			connect: func(ctx context.Context, cm *ConnectionManager, backend string) error {
+				route, err := cm.BindBackendRoute("", backend)
+				if err != nil {
+					t.Fatalf("BindBackendRoute(%s): %v", backend, err)
+				}
+				conn, err := route.DialContext(ctx, "tcp", backend)
+				route.RecordDialOutcome(ctx, err)
+				closeConn(conn)
+				return err
+			},
+			health: poolHealth,
+		},
+	}
+
+	newManager := func(t *testing.T, outsidePool bool, connectTimeout time.Duration) (*ConnectionManager, string) {
+		t.Helper()
+		backend, _ := listen(t)
+		pool := []string{backend}
+		if outsidePool {
+			other, _ := listen(t)
+			pool = []string{other}
+		}
+		cm, err := NewConnectionManager(pool, 0, false, false, false, connectTimeout)
+		if err != nil {
+			t.Fatalf("Failed to create connection manager: %v", err)
+		}
+		return cm, backend
+	}
+
+	for _, p := range paths {
+		t.Run(p.name+"/elapsed_caller_deadline", func(t *testing.T) {
+			// A connect_timeout the healthy backend never comes near: only the
+			// caller's deadline can refuse these dials.
+			cm, backend := newManager(t, p.outsidePool, 5*time.Second)
+			for i := 0; i < 3; i++ {
+				ctx := newElapsedDeadlineCtx(t)
+				if err := p.connect(ctx, cm, backend); err == nil {
+					t.Fatalf("attempt %d: dial succeeded on an elapsed caller deadline", i)
+				}
+				if ctx.Err() != nil {
+					t.Fatalf("attempt %d: ctx.Err()=%v, the test must hold the caller in the window before Err is set", i, ctx.Err())
+				}
+			}
+			if failures, healthy := p.health(cm, backend); failures != 0 || !healthy {
+				t.Errorf("healthy listening backend charged for the caller's elapsed deadline: FailureCount=%d healthy=%v, want 0/true", failures, healthy)
+			}
+		})
+
+		t.Run(p.name+"/backend_timeout_with_live_caller_deadline", func(t *testing.T) {
+			// A 1ns connect_timeout: the backend's own budget runs out while the
+			// caller's deadline is a minute away.
+			cm, backend := newManager(t, p.outsidePool, time.Nanosecond)
+			for i := 0; i < 3; i++ {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				err := p.connect(ctx, cm, backend)
+				cancel()
+				if err == nil {
+					t.Fatalf("attempt %d: expected the dial to exhaust its 1ns connect timeout", i)
+				}
+			}
+			if failures, healthy := p.health(cm, backend); failures != 3 || healthy {
+				t.Errorf("dial timeouts of the backend's own while the caller had time left: FailureCount=%d healthy=%v, want 3/false", failures, healthy)
+			}
+		})
+	}
+}
+
 // TestConnectBudgetCoversFallbackDials pins the deadline the proxies put around one
 // ConnectWithProxy call. connect_timeout is a per-dial budget, so an overall deadline
 // equal to it lets a black-holed preferred backend consume everything and every

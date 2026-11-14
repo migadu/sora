@@ -473,11 +473,15 @@ func autocertName(domain string) (string, error) {
 }
 
 func parseCertificateData(data []byte, info *CertificateInfo) {
+	_ = parseCertificate(data, info)
+}
+
+func parseCertificate(data []byte, info *CertificateInfo) error {
 	// autocert stores: private key PEM + certificate PEM
 	// We need to skip the private key and parse the certificate
 
 	// Try to find certificate PEM block
-	var certPEM []byte
+	var certBlock *pem.Block
 	remaining := data
 
 	for {
@@ -487,29 +491,22 @@ func parseCertificateData(data []byte, info *CertificateInfo) {
 		}
 
 		if block.Type == "CERTIFICATE" {
-			certPEM = pem.EncodeToMemory(block)
+			certBlock = block
 			break
 		}
 
 		remaining = rest
 	}
 
-	if certPEM == nil {
+	if certBlock == nil {
 		info.CertType = "Invalid"
-		return
+		return errors.New("no CERTIFICATE PEM block found")
 	}
 
-	// Parse certificate
-	block, _ := pem.Decode(certPEM)
-	if block == nil {
-		info.CertType = "Invalid"
-		return
-	}
-
-	cert, err := x509.ParseCertificate(block.Bytes)
+	cert, err := x509.ParseCertificate(certBlock.Bytes)
 	if err != nil {
 		info.CertType = "Parse Error"
-		return
+		return err
 	}
 
 	// Extract information
@@ -553,6 +550,11 @@ func parseCertificateData(data []byte, info *CertificateInfo) {
 	default:
 		info.CertType = cert.PublicKeyAlgorithm.String()
 	}
+
+	if info.Expiry.IsZero() {
+		return errors.New("certificate has zero expiry")
+	}
+	return nil
 }
 
 // autocertCacheName returns the autocert cache name ("<domain>" or "<domain>+rsa") that
@@ -602,8 +604,10 @@ func expiredLocalCopy(cacheDir, cacheName string, now time.Time) (string, error)
 		return "", fmt.Errorf("failed to read local cache file %s: %w", localPath, err)
 	}
 	var local CertificateInfo
-	parseCertificateData(data, &local)
-	if local.Expiry.After(now) {
+	if err := parseCertificate(data, &local); err != nil {
+		return "", fmt.Errorf("failed to parse local cache file %s: %w", localPath, err)
+	}
+	if !local.Expiry.Before(now) {
 		return "", nil
 	}
 	return localPath, nil
@@ -800,21 +804,33 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 			fmt.Printf("  Local file: %s\n", localPath)
 		}
 	} else {
-		// Delete by specific S3 key or prefix
-		// Support full key, hash, or partial hash
+		// Delete by S3 key: a full key, a hash, or a prefix of either. A trailing "..."
+		// (as tls list truncates keys) marks a prefix. Any other value is looked up as
+		// a key first, so an existing key is deleted even when it is also the prefix
+		// of another key, and it is taken as a prefix only when it is not a key.
 		searchKey := s3Key
 		if !strings.HasPrefix(searchKey, "autocert/") {
 			searchKey = "autocert/cert-" + searchKey
 		}
+		prefix, isPrefix := strings.CutSuffix(searchKey, "...")
 
-		// If the key looks partial (ends with ...), do a prefix search
-		needsPrefixSearch := strings.HasSuffix(s3Key, "...") || len(s3Key) < 64
+		if !isPrefix {
+			// storage.DeleteContext succeeds for a missing key, so look first: a key
+			// that is not there must not be reported as deleted.
+			exists, _, err := s3store.ExistsContext(ctx, searchKey)
+			if err != nil {
+				return fmt.Errorf("failed to look up %s in S3: %w", searchKey, err)
+			}
+			if exists {
+				keysToDelete = []string{searchKey}
+				fmt.Printf("Deleting certificate: %s\n", searchKey)
+			}
+		}
 
-		if needsPrefixSearch {
+		if len(keysToDelete) == 0 {
 			// Search for matching certificates by prefix
 			fmt.Printf("Searching for certificates matching prefix: %s\n", searchKey)
 
-			prefix := strings.TrimSuffix(searchKey, "...")
 			objChan, errChan := s3store.ListObjects(ctx, "autocert/", false)
 
 			var matches []string
@@ -859,18 +875,6 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 
 			keysToDelete = matches
 			fmt.Printf("Found matching certificate: %s\n", matches[0])
-		} else {
-			// storage.DeleteContext succeeds for a missing key, so look first: a key
-			// that is not there must fail rather than be reported as deleted.
-			exists, _, err := s3store.ExistsContext(ctx, searchKey)
-			if err != nil {
-				return fmt.Errorf("failed to look up %s in S3: %w", searchKey, err)
-			}
-			if !exists {
-				return fmt.Errorf("certificate not found in S3: %s", searchKey)
-			}
-			keysToDelete = []string{searchKey}
-			fmt.Printf("Deleting certificate: %s\n", searchKey)
 		}
 	}
 
@@ -980,6 +984,13 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			}
 			certInfo.Domain, certInfo.CacheName = tryDecodeDomain(obj.Key, cfg.TLS.LetsEncrypt.Domains)
 
+			// autocert stores its ACME account key under "acme_account+key" (or legacy
+			// "acme_account.key"), which S3Cache hashes under autocert/cert- as a
+			// private-key-only PEM entry with no certificate.
+			if obj.Key == tlsmanager.S3ObjectKey("acme_account+key") || obj.Key == tlsmanager.S3ObjectKey("acme_account.key") {
+				continue
+			}
+
 			// Download and parse certificate to check expiry
 			reader, err := s3store.GetContext(ctx, obj.Key)
 			if err != nil {
@@ -996,10 +1007,14 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 				continue
 			}
 
-			parseCertificateData(certData, &certInfo)
+			if err := parseCertificate(certData, &certInfo); err != nil {
+				logger.Warn("Failed to parse certificate", "key", obj.Key, "error", err)
+				failures = append(failures, fmt.Errorf("parse S3 object %s: %w", obj.Key, err))
+				continue
+			}
 
 			// Check if expired
-			if !certInfo.Expiry.IsZero() && certInfo.Expiry.Before(now) {
+			if certInfo.Expiry.Before(now) {
 				expiredCerts = append(expiredCerts, certInfo)
 			}
 
@@ -1029,10 +1044,14 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			logger.Warn("Cannot tell the local cache name of an expired certificate, leaving the local cache alone for it", "key", cert.S3Key)
 			continue
 		}
-		if cert.LocalPath, err = expiredLocalCopy(cacheDir, cert.CacheName, now); err != nil {
-			return err
+		localPath, err := expiredLocalCopy(cacheDir, cert.CacheName, now)
+		if err != nil {
+			logger.Warn("Failed to inspect local cache file, leaving it alone", "path", filepath.Join(cacheDir, cert.CacheName), "error", err)
+			failures = append(failures, err)
+			continue
 		}
-		cert.InLocalCache = cert.LocalPath != ""
+		cert.LocalPath = localPath
+		cert.InLocalCache = localPath != ""
 	}
 
 	// Display expired certificates

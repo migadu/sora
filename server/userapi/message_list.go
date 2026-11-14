@@ -138,6 +138,10 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "Search query parameter 'q' is required")
 		return
 	}
+	if !validSearchText(searchQuery) {
+		s.writeError(w, http.StatusBadRequest, "Search query parameter 'q' must be UTF-8 text without NUL")
+		return
+	}
 
 	// The documented filters, each ANDed with q. unseen is parsed as in the list endpoint.
 	filter := db.UserAPISearchFilter{

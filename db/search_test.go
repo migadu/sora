@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
@@ -27,7 +28,7 @@ func TestSearchConstants(t *testing.T) {
 //     numbers to UID ranges and then served by the optimized "simple" path —
 //     without the unnecessary messages_fts join used by the complex paths.
 //   - A search that also carries an FTS term (BODY) stays on the complex-fast
-//     path, because recomputing complexity after the rewrite still sees the FTS
+//     path, because complexity is decided after the rewrite, which keeps the FTS
 //     criteria.
 //
 // The assertions key off the per-path Prometheus query counters, which is the
@@ -51,7 +52,6 @@ func TestSeqNumSearchQueryPathSelection(t *testing.T) {
 	t.Run("PureSeqNumUsesSimplePath", func(t *testing.T) {
 		simpleBefore := pathCount("search_messages_simple")
 		fastBefore := pathCount("search_messages_complex_fast")
-		legacyBefore := pathCount("search_messages_complex_legacy")
 
 		criteria := &imap.SearchCriteria{
 			SeqNum: []imap.SeqSet{{imap.SeqRange{Start: 1, Stop: 5}}},
@@ -64,17 +64,14 @@ func TestSeqNumSearchQueryPathSelection(t *testing.T) {
 			"pure SeqNum search should be rewritten to UIDs and use the simple query path")
 		assert.Equal(t, 0.0, pathCount("search_messages_complex_fast")-fastBefore,
 			"pure SeqNum search must not use the complex-fast (messages_fts join) path")
-		assert.Equal(t, 0.0, pathCount("search_messages_complex_legacy")-legacyBefore,
-			"pure SeqNum search must not use the legacy ROW_NUMBER path")
 	})
 
 	t.Run("SeqNumWithFTSStaysComplex", func(t *testing.T) {
 		simpleBefore := pathCount("search_messages_simple")
 		fastBefore := pathCount("search_messages_complex_fast")
-		legacyBefore := pathCount("search_messages_complex_legacy")
 
-		// BODY keeps the query complex even after the seqnum→UID rewrite, so the
-		// recompute must NOT downgrade it to the simple path. The FTS term may
+		// BODY keeps the query complex after the seqnum→UID rewrite, so it must
+		// NOT be downgraded to the simple path. The FTS term may
 		// match zero rows in the test environment; only the chosen path matters.
 		criteria := &imap.SearchCriteria{
 			SeqNum: []imap.SeqSet{{imap.SeqRange{Start: 1, Stop: 5}}},
@@ -87,8 +84,6 @@ func TestSeqNumSearchQueryPathSelection(t *testing.T) {
 			"SeqNum+BODY search must not be downgraded to the simple path")
 		assert.Equal(t, 1.0, pathCount("search_messages_complex_fast")-fastBefore,
 			"SeqNum+BODY search should use the complex-fast path (FTS, no ROW_NUMBER)")
-		assert.Equal(t, 0.0, pathCount("search_messages_complex_legacy")-legacyBefore,
-			"SeqNum+BODY search should not need the legacy ROW_NUMBER path")
 	})
 }
 
@@ -133,28 +128,47 @@ func TestBuildSearchHeaderConditions(t *testing.T) {
 // Before = d + 24h. RFC 9051 §6.4.4: BEFORE / SENTBEFORE match a date "earlier than
 // the specified date", so the upper bound excludes midnight of that day; SINCE /
 // SENTSINCE match one "within or later than", so the lower bound includes it.
+//
+// The SENT* keys compare the day the Date: header names in its own zone (#867): the
+// header's wall-clock time, sent_date shifted by sent_utc_offset, against the date. The
+// offset is read by primary key, and only for a message sent within a day of the date
+// (p2 decides every message outside that band, p3 bounds the band), so the mailbox scan
+// itself stays on the header covering index.
 func TestBuildSearchDateConditions(t *testing.T) {
 	var db *Database // builder does not dereference the receiver
 	day := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	dayBefore, dayAfter := day.Add(-24*time.Hour), day.Add(24*time.Hour)
+	const headerTime = "m.sent_date + make_interval(secs => COALESCE(message_sent_utc_offset(m.id), 0))"
 
 	tests := []struct {
 		name     string
 		criteria *imap.SearchCriteria
+		prefix   string
 		want     string
+		args     pgx.NamedArgs
 	}{
-		{"SINCE", &imap.SearchCriteria{Since: day}, "m.internal_date >= @p1"},
-		{"BEFORE", &imap.SearchCriteria{Before: day}, "m.internal_date < @p1"},
-		{"SENTSINCE", &imap.SearchCriteria{SentSince: day}, "m.sent_date >= @p1"},
-		{"SENTBEFORE", &imap.SearchCriteria{SentBefore: day}, "m.sent_date < @p1"},
+		{"SINCE", &imap.SearchCriteria{Since: day}, "m", "m.internal_date >= @p1", pgx.NamedArgs{"p1": day}},
+		{"BEFORE", &imap.SearchCriteria{Before: day}, "m", "m.internal_date < @p1", pgx.NamedArgs{"p1": day}},
+		{"SENTSINCE", &imap.SearchCriteria{SentSince: day}, "m",
+			"(m.sent_date >= @p2 OR (m.sent_date >= @p3 AND " + headerTime + " >= @p1))",
+			pgx.NamedArgs{"p1": day, "p2": dayAfter, "p3": dayBefore}},
+		{"SENTBEFORE", &imap.SearchCriteria{SentBefore: day}, "m",
+			"(m.sent_date < @p2 OR (m.sent_date < @p3 AND " + headerTime + " < @p1))",
+			pgx.NamedArgs{"p1": day, "p2": dayBefore, "p3": dayAfter}},
+		// The legacy seqnum statement passes no prefix, but its messages alias is m, and an
+		// unqualified id would be ambiguous there (message_seqs has one too).
+		{"SENTSINCE without prefix", &imap.SearchCriteria{SentSince: day}, "",
+			"(m.sent_date >= @p2 OR (m.sent_date >= @p3 AND " + headerTime + " >= @p1))",
+			pgx.NamedArgs{"p1": day, "p2": dayAfter, "p3": dayBefore}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			paramCounter := 0
-			condition, args, err := db.buildSearchCriteriaWithPrefix(tt.criteria, "p", &paramCounter, "m")
+			condition, args, err := db.buildSearchCriteriaWithPrefix(tt.criteria, "p", &paramCounter, tt.prefix)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, condition)
-			assert.Equal(t, day, args["p1"])
+			assert.Equal(t, tt.args, args)
 		})
 	}
 }
@@ -167,7 +181,6 @@ func TestCanUseTextUnion(t *testing.T) {
 	tests := []struct {
 		name          string
 		criteria      *imap.SearchCriteria
-		needsSeqNum   bool
 		orderByClause string
 		want          bool
 	}{
@@ -208,12 +221,6 @@ func TestCanUseTextUnion(t *testing.T) {
 			want: false,
 		},
 		{
-			name:        "needsSeqNumSearch is ineligible",
-			criteria:    &imap.SearchCriteria{Text: []string{"invoice"}},
-			needsSeqNum: true,
-			want:        false,
-		},
-		{
 			name:          "ORDER BY seqnum is ineligible",
 			criteria:      &imap.SearchCriteria{Text: []string{"invoice"}},
 			orderByClause: "ORDER BY seqnum DESC",
@@ -223,7 +230,7 @@ func TestCanUseTextUnion(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := db.canUseTextUnion(tt.criteria, tt.needsSeqNum, tt.orderByClause)
+			got := db.canUseTextUnion(tt.criteria, tt.orderByClause)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -690,7 +697,7 @@ func TestBuildSortOrderClause(t *testing.T) {
 		{
 			name:     "sort by subject",
 			criteria: []imap.SortCriterion{{Key: imap.SortKeySubject, Reverse: false}},
-			expected: "m.subject_sort ASC",
+			expected: subjectCasemapKey("m.subject_sort") + ` COLLATE "C" ASC`,
 		},
 		{
 			name:     "sort by size",

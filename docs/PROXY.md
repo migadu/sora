@@ -243,9 +243,9 @@ With `auth_token` set, the request carries `Authorization: Bearer <auth_token>`.
 
 The URL must use `https://`, unless its host is `localhost` or a loopback address. Sora refuses to
 start a proxy with a plain `http://` URL to any other host, because the request and answer carry
-password hashes. (With `lookup_local_users = true`, a proxy instead logs the error and runs without
-the remote lookup, checking every user in PostgreSQL. The User API proxy does so only when the file
-has no `[[pool]]` blocks.)
+password hashes. It also refuses a URL with `$email` or `$ip` in the host, and a `timeout`,
+`circuit_breaker` or `transport` duration it cannot parse, with `lookup_local_users` or without.
+`sora-admin config validate` fails the file for the same reasons.
 
 ### 4.2 The answer
 
@@ -1006,7 +1006,7 @@ with `database is required for configured servers but not configured in [databas
 | No pool for the route, pin unavailable, no backend reachable, backend login failed | `NO [UNAVAILABLE] Backend server temporarily unavailable` then `* BYE` | `-ERR [SYS/TEMP] Backend server temporarily unavailable` | `NO (UNAVAILABLE) "Backend server temporarily unavailable"` | `451 4.4.1 Backend connection failed` | `503` |
 | Remote lookup unavailable (timeout, 5xx, breaker open) | `NO [UNAVAILABLE]` | `-ERR [SYS/TEMP]` | `NO (UNAVAILABLE)` | `451 4.4.3 Service temporarily unavailable, please try again later` | pools: `503`; no pools: routed by hash |
 | Remote lookup invalid answer | `NO Authentication failed` | `-ERR [AUTH] Authentication failed` | `NO "Authentication failed"` | `451 4.4.3` | as above |
-| User not found | `NO Authentication failed` | `-ERR [AUTH] Authentication failed` | `NO "Authentication failed"` | `550 5.1.1 User unknown` or `450 4.1.1` | no pools: routed by hash, the backend answers; pools: `503` unless `lookup_local_users` |
+| User not found | `NO Authentication failed` | `-ERR [AUTH] Authentication failed` | `NO "Authentication failed"` | `550 5.1.1 User unknown` or `450 4.1.1` | login: `401 Invalid credentials`; with a token: `503`; unless `lookup_local_users` |
 | Proxy shutting down | `NO [UNAVAILABLE]` | `-ERR [SYS/TEMP]` | `NO (UNAVAILABLE)` | `421 4.3.2` | |
 | Maintenance list never loaded | as "no backend reachable" | | | | `503` |
 
