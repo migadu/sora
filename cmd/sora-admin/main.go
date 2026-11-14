@@ -128,6 +128,10 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	if err := fullCfg.SharedMailboxes.Validate(); err != nil {
 		return fmt.Errorf("[shared_mailboxes]: %w", err)
 	}
+	// Imports index mail by [cleanup] fts_retention, as delivery does.
+	if err := fullCfg.Cleanup.Validate(); err != nil {
+		return fmt.Errorf("[cleanup]: %w", err)
+	}
 	// The server refuses to start with these; max_attempts <= 0 would count every pending
 	// upload as parked.
 	if err := fullCfg.Uploader.Validate(); err != nil {

@@ -573,15 +573,24 @@ func (rd *ResilientDatabase) PruneOldMessageVectorsWithRetry(ctx context.Context
 	}
 	return result.(int64), nil
 }
-func (rd *ResilientDatabase) GetUnusedFTSKeysWithRetry(ctx context.Context, batchSize int) ([]db.FTSKey, error) {
+func (rd *ResilientDatabase) GetUnusedFTSKeysWithRetry(ctx context.Context, after db.FTSKey, batchSize int) ([]db.FTSKey, db.FTSKey, error) {
+	type scanResult struct {
+		keys []db.FTSKey
+		next db.FTSKey
+	}
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetUnusedFTSKeys(ctx, batchSize)
+		keys, next, err := rd.getOperationalDatabaseForOperation(ctx, false).GetUnusedFTSKeys(ctx, after, batchSize)
+		if err != nil {
+			return nil, err
+		}
+		return scanResult{keys: keys, next: next}, nil
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutSearch, op)
 	if err != nil {
-		return nil, err
+		return nil, after, err
 	}
-	return result.([]db.FTSKey), nil
+	res := result.(scanResult)
+	return res.keys, res.next, nil
 }
 
 func (rd *ResilientDatabase) DeleteMessagesFTSByKeyBatchWithRetry(ctx context.Context, keys []db.FTSKey) (int64, error) {
