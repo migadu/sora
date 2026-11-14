@@ -378,7 +378,7 @@ func listTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, 
 
 			// Try to determine domain from key
 			// Format: autocert/cert-<sha256(domain)> or autocert/cert-<sha256(domain+rsa)>
-			certInfo.Domain = tryDecodeDomain(obj.Key, cfg.TLS.LetsEncrypt.Domains)
+			certInfo.Domain, certInfo.CacheName = tryDecodeDomain(obj.Key, cfg.TLS.LetsEncrypt.Domains)
 
 			// Download certificate from S3 to parse it
 			reader, err := s3store.Get(obj.Key)
@@ -433,29 +433,31 @@ func listTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, 
 
 // tryDecodeDomain names the object at s3Key by the configured domain (the
 // [tls.letsencrypt] domains, loaded as autocert names) whose ECDSA ("<domain>") or RSA
-// ("<domain>+rsa") cache entry the server's S3 cache keeps there. The key is a hash of
-// the entry name, so any other object, such as one of a domain no longer configured, is
-// shown by a hash prefix.
-func tryDecodeDomain(s3Key string, domains []string) string {
+// ("<domain>+rsa") cache entry the server's S3 cache keeps there. It returns the display
+// label and that entry's autocert cache name, which is also the name of its file in the
+// local fallback cache, so the copy is found even when the object holds no readable
+// certificate. The key is a hash of the entry name, so any other object, such as one of
+// a domain no longer configured, is labelled by a hash prefix, with no cache name.
+func tryDecodeDomain(s3Key string, domains []string) (label, cacheName string) {
 	// Extract hash from key: autocert/cert-<hash>
 	hash, ok := strings.CutPrefix(s3Key, "autocert/cert-")
 	if !ok {
-		return "unknown"
+		return "unknown", ""
 	}
 
 	for _, domain := range domains {
 		switch s3Key {
 		case tlsmanager.S3ObjectKey(domain):
-			return domain
+			return domain, domain
 		case tlsmanager.S3ObjectKey(domain + "+rsa"):
-			return domain + " (RSA)"
+			return domain + " (RSA)", domain + "+rsa"
 		}
 	}
 
 	// Show at most the first 16 characters. The "..." marks the name as not decoded,
 	// even when nothing was cut: parseCertificateData then takes the certificate's own
-	// name, and checkLocalCache and tls clean never take it for a local cache file.
-	return hash[:min(len(hash), 16)] + "..."
+	// name.
+	return hash[:min(len(hash), 16)] + "...", ""
 }
 
 // autocertName returns the name autocert caches a domain's certificates under, as the
@@ -518,7 +520,11 @@ func parseCertificateData(data []byte, info *CertificateInfo) {
 	info.SerialNumber = cert.SerialNumber.String()
 	info.KeyAlgorithm = cert.PublicKeyAlgorithm.String()
 	info.SigAlgorithm = cert.SignatureAlgorithm.String()
-	info.CacheName = autocertCacheName(info.S3Key, cert)
+	if info.CacheName == "" {
+		// Not a configured domain's entry: find the cache name among the certificate's
+		// own names. A configured one is the key's preimage already.
+		info.CacheName = autocertCacheName(info.S3Key, cert)
+	}
 
 	// Extract actual domain from certificate (if Domain is still a hash)
 	if strings.Contains(info.Domain, "...") || info.Domain == "unknown" {
@@ -972,7 +978,7 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			certInfo := CertificateInfo{
 				S3Key: obj.Key,
 			}
-			certInfo.Domain = tryDecodeDomain(obj.Key, cfg.TLS.LetsEncrypt.Domains)
+			certInfo.Domain, certInfo.CacheName = tryDecodeDomain(obj.Key, cfg.TLS.LetsEncrypt.Domains)
 
 			// Download and parse certificate to check expiry
 			reader, err := s3store.GetContext(ctx, obj.Key)
