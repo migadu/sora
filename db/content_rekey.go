@@ -63,8 +63,9 @@ func (d *Database) ListRekeyCandidates(ctx context.Context, accountID int64, aft
 
 // RekeyContentHash moves accountID's message rows that point at obj to newHash, under the
 // same S3 domain and localpart, and returns how many rows it moved. The object
-// <S3Domain>/<S3Localpart>/<newHash> must already hold the same bytes; the old object is left
-// for the caller to delete once IsContentObjectReferenced says nothing points at it.
+// <S3Domain>/<S3Localpart>/<newHash> must already hold the same bytes. The old object must
+// remain for readers holding a pre-rekey snapshot. Deletion requires drained mail nodes
+// and IsContentObjectReferenced reporting that no database rows point at it.
 //
 // The rows' FTS data moves with them. messages_fts_v2 is keyed by (content_hash, account_id)
 // and belongs to the mailbox owner, so every row of the old hash whose account now references

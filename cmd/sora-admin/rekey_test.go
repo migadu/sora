@@ -190,7 +190,7 @@ func TestRekeyLegacySHA256Imports(t *testing.T) {
 	assert.Equal(t, legacyOld, f.hashOf(legacyInbox))
 	assert.Equal(t, objectsBefore, f.store.ObjectCount())
 
-	report, err = rekeyAccount(f.ctx, f.rdb, f.store, accountA, rekeyOptions{BatchSize: 2, Jobs: 3})
+	report, err = rekeyAccount(f.ctx, f.rdb, f.store, accountA, rekeyOptions{DeleteOldObjects: true, BatchSize: 2, Jobs: 3})
 	require.NoError(t, err)
 	assert.Equal(t, 5, report.Legacy)
 	assert.Equal(t, 4, report.Rekeyed, "legacy, reused, expunged, shared")
@@ -275,7 +275,7 @@ func TestRekeyLegacySHA256Imports(t *testing.T) {
 
 	// Account B's run moves its row onto the object A's run wrote, and the old object,
 	// referenced by nothing now, goes.
-	report, err = rekeyAccount(f.ctx, f.rdb, f.store, accountB, rekeyOptions{BatchSize: 10, Jobs: 1})
+	report, err = rekeyAccount(f.ctx, f.rdb, f.store, accountB, rekeyOptions{DeleteOldObjects: true, BatchSize: 10, Jobs: 1})
 	require.NoError(t, err)
 	assert.Equal(t, 1, report.Rekeyed)
 	assert.Equal(t, 1, report.Reused)
@@ -335,6 +335,37 @@ func TestRekeyMovesSyntheticMessageID(t *testing.T) {
 	assert.Empty(t, inserted, "the re-import stored a second copy of a message without a Message-ID")
 }
 
+// POP3 retains its message list for the session, and a long IMAP FETCH can retain
+// the same old key. Moving the database row must leave that snapshot readable.
+func TestRekeyKeepsOldObjectsForExistingReadersByDefault(t *testing.T) {
+	f := newRekeyFixture(t)
+	accountID, domain, local := f.account("reader")
+	body := f.body("reader")
+	oldHash, newHash := sha256Hex(body), helpers.HashContent(body)
+	row := f.insert(accountID, "INBOX", domain, local, oldHash, body, "reader-"+f.nonce)
+	oldKey := helpers.NewS3Key(domain, local, oldHash)
+	f.put(oldKey, body)
+	inbox, err := f.rdb.GetMailboxByNameWithRetry(f.ctx, accountID, "INBOX")
+	require.NoError(t, err)
+	snapshot, err := f.rdb.ListMessagesForPOP3WithRetry(f.ctx, inbox.ID, 10)
+	require.NoError(t, err)
+	require.Len(t, snapshot, 1)
+
+	report, err := rekeyAccount(f.ctx, f.rdb, f.store, accountID, rekeyOptions{BatchSize: 10, Jobs: 1})
+	require.NoError(t, err)
+	require.Equal(t, 1, report.Rekeyed)
+	assert.Equal(t, newHash, f.hashOf(row))
+	assert.Zero(t, report.OldDeleted, "the default run must not delete a live reader's key")
+	assert.Equal(t, 1, report.OldRetained)
+	assert.Equal(t, []string{oldKey}, report.RetainedKeys)
+
+	msg := snapshot[0]
+	readerKey := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
+	got, err := readStoredBody(f.store, readerKey)
+	require.NoError(t, err, "an existing POP3 session still fetches this old key")
+	assert.Equal(t, body, got)
+}
+
 // TestRekeyOldObjectWaitsAndRechecks: the old object is deleted only after the delay, and
 // only if no row has claimed it meanwhile (here: a row written with the old hash after the
 // re-key committed, as a COPY that read its source before the re-key would).
@@ -348,7 +379,7 @@ func TestRekeyOldObjectWaitsAndRechecks(t *testing.T) {
 	oldKey := helpers.NewS3Key(domain, local, oldHash)
 	f.put(oldKey, body)
 
-	r := &rekeyRun{rdb: f.rdb, store: f.store, accountID: accountID, opts: rekeyOptions{BatchSize: 10, Jobs: 1},
+	r := &rekeyRun{rdb: f.rdb, store: f.store, accountID: accountID, opts: rekeyOptions{DeleteOldObjects: true, BatchSize: 10, Jobs: 1},
 		report: &rekeyReport{}, written: map[db.ContentObject]bool{}}
 	obj := db.ContentObject{S3Domain: domain, S3Localpart: local, ContentHash: oldHash}
 	r.processObject(f.ctx, obj)
@@ -418,4 +449,31 @@ func TestRekeyJobsFitTheWritePool(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, report.Failed)
 	assert.Equal(t, 2, report.Rekeyed)
+}
+
+func TestRekeyRefusesAWritePoolThatCannotFitOneJob(t *testing.T) {
+	f := newRekeyFixture(t)
+	cfg := adminTestDBConfig(t)
+	cfg.Write.MaxConnections = 1
+	cfg.WriteTimeout = "100ms"
+	rdb, err := resilient.NewResilientDatabase(f.ctx, cfg, false, false)
+	require.NoError(t, err)
+	t.Cleanup(rdb.Close)
+	accountID, domain, local := f.account("single-connection")
+	body := f.body("single-connection")
+	hash := sha256Hex(body)
+	row := f.insert(accountID, "INBOX", domain, local, hash, body, "single-"+f.nonce)
+	f.put(helpers.NewS3Key(domain, local, hash), body)
+
+	report, err := rekeyAccount(f.ctx, rdb, f.store, accountID, rekeyOptions{Jobs: 1})
+	require.ErrorContains(t, err, "at least 2 write-pool connections")
+	require.NotNil(t, report)
+	assert.Zero(t, report.Checked, "refuse before any object is touched")
+	assert.Equal(t, hash, f.hashOf(row))
+	assert.Equal(t, 1, f.store.ObjectCount())
+
+	// Classification does not hold a lock connection and remains available.
+	report, err = rekeyAccount(f.ctx, rdb, f.store, accountID, rekeyOptions{DryRun: true, Jobs: 1})
+	require.NoError(t, err)
+	assert.Equal(t, 1, report.Legacy)
 }

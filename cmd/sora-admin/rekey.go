@@ -86,24 +86,27 @@ func oldObjectDelayFor(writeTimeout time.Duration) time.Duration {
 }
 
 type rekeyOptions struct {
-	DryRun     bool
-	BatchSize  int
-	Jobs       int
-	StartAfter db.ContentObject // resume after this object; the zero value starts at the beginning
-	Progress   io.Writer        // per-batch progress lines; nil for none
+	DryRun           bool
+	DeleteOldObjects bool // Opt-in only after all mail nodes and readers have drained.
+	BatchSize        int
+	Jobs             int
+	StartAfter       db.ContentObject // resume after this object; the zero value starts at the beginning
+	Progress         io.Writer        // per-batch progress lines; nil for none
 }
 
 // rekeyReport is what a run found and did. Lists hold S3 keys, with the error where there
 // was one.
 type rekeyReport struct {
-	Checked      int   // bodies downloaded and classified
-	Current      int   // already under their BLAKE3 key
-	Legacy       int   // under their SHA-256 key (in a dry run, the ones that would be re-keyed)
-	Rekeyed      int   // legacy bodies whose rows were moved to the BLAKE3 key
-	RowsUpdated  int64 // message rows moved
-	Written      int   // BLAKE3 objects written
-	Reused       int   // BLAKE3 objects that already held the body
-	OldDeleted   int   // old SHA-256 objects deleted
+	Checked      int      // bodies downloaded and classified
+	Current      int      // already under their BLAKE3 key
+	Legacy       int      // under their SHA-256 key (in a dry run, the ones that would be re-keyed)
+	Rekeyed      int      // legacy bodies whose rows were moved to the BLAKE3 key
+	RowsUpdated  int64    // message rows moved
+	Written      int      // BLAKE3 objects written
+	Reused       int      // BLAKE3 objects that already held the body
+	OldDeleted   int      // old SHA-256 objects deleted
+	OldRetained  int      // old objects kept by the default live-reader-safe policy
+	RetainedKeys []string // bounded sample; a later cleanup needs its own manifest
 	OldKept      []string
 	OldLeft      []string
 	Unrecognised []string
@@ -132,7 +135,7 @@ type rekeyRun struct {
 	// in order, so a body re-keyed early comes round again under its new key; it was just
 	// verified and needs no second download.
 	written map[db.ContentObject]bool
-	// oldObjects are the SHA-256 objects whose rows moved, waiting for rekeyOldObjectDelay.
+	// oldObjects are queued only for explicit deletion, after rekeyOldObjectDelay.
 	oldObjects []rekeyedObject
 }
 
@@ -144,8 +147,9 @@ type rekeyRun struct {
 //  2. under the S3 object lock of the new key (the lock the cleaner takes before it deletes
 //     an object), makes sure the BLAKE3 object holds the body, writing it unless an intact
 //     copy is already there, and moves the account's rows to it (db.RekeyContentHash);
-//  3. after rekeyOldObjectDelay, under the old key's lock, deletes the old object if nothing
-//     references it any more.
+//  3. retains the old object for readers holding a pre-rekey snapshot. Only with
+//     DeleteOldObjects (all mail nodes drained), deletes it after rekeyOldObjectDelay
+//     under the old key's lock, if nothing references it any more.
 //
 // Every step is idempotent, so a failed or interrupted run is repaired by running again.
 // The report is returned even with an error.
@@ -159,10 +163,16 @@ func rekeyAccount(ctx context.Context, rdb *resilient.ResilientDatabase, store o
 	// A job holds one write-pool connection for its S3 object lock and needs a second one
 	// for the re-key transaction it runs under that lock. Jobs whose locks held every
 	// connection would each wait for a second one until the write timeout failed them.
-	if poolSize := int(rdb.GetOperationalDatabase().GetWritePool().Stat().MaxConns()); opts.Jobs > max(1, poolSize/2) {
-		opts.Jobs = max(1, poolSize/2)
-		if opts.Progress != nil {
-			fmt.Fprintf(opts.Progress, "  Running %d jobs: each needs 2 of the %d connections of the database write pool\n", opts.Jobs, poolSize)
+	if !opts.DryRun {
+		poolSize := int(rdb.GetOperationalDatabase().GetWritePool().Stat().MaxConns())
+		if poolSize < 2 {
+			return &rekeyReport{Cursor: opts.StartAfter}, fmt.Errorf("rekey requires at least 2 write-pool connections; configure database.write.max_connections >= 2 (got %d)", poolSize)
+		}
+		if opts.Jobs > poolSize/2 {
+			opts.Jobs = poolSize / 2
+			if opts.Progress != nil {
+				fmt.Fprintf(opts.Progress, "  Running %d jobs: each needs 2 of the %d connections of the database write pool\n", opts.Jobs, poolSize)
+			}
 		}
 	}
 	r := &rekeyRun{
@@ -279,7 +289,14 @@ func (r *rekeyRun) processObject(ctx context.Context, obj db.ContentObject) {
 		r.report.Rekeyed++
 		r.report.RowsUpdated += rows
 		r.written[newObj] = true
-		r.oldObjects = append(r.oldObjects, rekeyedObject{old: obj, committed: committed})
+		if r.opts.DeleteOldObjects {
+			r.oldObjects = append(r.oldObjects, rekeyedObject{old: obj, committed: committed})
+		} else {
+			r.report.OldRetained++
+			if len(r.report.RetainedKeys) < 100 {
+				r.report.RetainedKeys = append(r.report.RetainedKeys, obj.Key())
+			}
+		}
 	}
 }
 
@@ -297,8 +314,8 @@ func (r *rekeyRun) moveBody(ctx context.Context, obj, newObj db.ContentObject, c
 	}
 
 	err = r.rdb.ExecuteWithS3ObjectLock(ctx, newObj.ContentHash, r.accountID, func(ctx context.Context) error {
-		// An object already under the new key is reused only if it holds the body: the old
-		// object, the one copy known to be good, is deleted afterwards.
+		// An object already under the new key is reused only if it holds the body.
+		// The old object stays unless deletion was requested for drained mail nodes.
 		if existing, err := readStoredBody(r.store, newObj.Key()); err != nil || helpers.HashContent(existing) != newObj.ContentHash {
 			if err := r.store.Put(newObj.Key(), bytes.NewReader(content), int64(len(content))); err != nil {
 				return fmt.Errorf("failed to write %s: %w", newObj.Key(), err)
@@ -315,6 +332,9 @@ func (r *rekeyRun) moveBody(ctx context.Context, obj, newObj db.ContentObject, c
 // deleteOldObjects deletes the queued old objects whose delay has passed. With wait it waits
 // for the rest and deletes them too.
 func (r *rekeyRun) deleteOldObjects(ctx context.Context, wait bool) {
+	if !r.opts.DeleteOldObjects {
+		return
+	}
 	var waiting []rekeyedObject
 	for _, o := range r.oldObjects {
 		due := o.committed.Add(rekeyOldObjectDelay)
@@ -382,6 +402,7 @@ func handleImportRekey(ctx context.Context) {
 	fs := flag.NewFlagSet("import rekey", flag.ExitOnError)
 	email := fs.String("email", "", "Email address of the account to repair (required)")
 	dryRun := fs.Bool("dry-run", false, "Download and classify the bodies and report, without changing anything")
+	deleteOld := fs.Bool("delete-old-objects", false, "Delete unreferenced old objects only when all mail nodes and readers are drained (default: retain)")
 	batchSize := fs.Int("batch-size", 100, "Number of stored bodies listed and processed per batch")
 	jobs := fs.Int("jobs", 4, "Number of bodies downloaded and re-keyed in parallel")
 	startAfter := fs.String("start-after", "", "Resume after this S3 key (domain/localpart/hash), as printed by an interrupted run")
@@ -399,9 +420,18 @@ This command downloads every uploaded body the account's messages point at
 (bodies of MTA deliveries excepted: those were always BLAKE3) and hashes it.
 A body stored under its SHA-256 digest is written under its BLAKE3 key (an
 intact object already there is reused), the account's message and full-text
-search rows are moved to the BLAKE3 hash, and the old object is deleted once
-nothing references it, at least 30 seconds later. Bodies already under their
-BLAKE3 key, and objects whose bytes match neither digest, are left alone.
+search rows are moved to the BLAKE3 hash. Old objects are retained by default:
+existing POP3 sessions and long IMAP FETCHes can still hold their old keys.
+Bodies already under their BLAKE3 key, and objects whose bytes match neither
+digest, are left alone.
+
+Use --delete-old-objects only for a maintenance run after every mail node,
+reader and writer has drained. It deletes old objects when nothing references
+them, after at least twice write_timeout (minimum 30 seconds). This delay
+covers writers only; it cannot protect a live POP3 session or IMAP FETCH.
+The default run does not clean up retained keys on a later rerun, because
+the message rows already point at BLAKE3. Later cleanup needs a separate
+retained-key inventory and reference checks after draining the mail nodes.
 
 Every step is idempotent: a failed or interrupted run can be repeated, or
 resumed with --start-after. Do not run it while an import into the account is
@@ -413,6 +443,8 @@ Usage:
 Options:
   --email string        Email address of the account to repair (required)
   --dry-run             Download and classify the bodies and report, change nothing
+  --delete-old-objects  Opt in to deletion only after all mail nodes/readers drain
+                        (default: retain the old objects for existing readers)
   --batch-size int      Stored bodies listed and processed per batch (default: 100)
   --jobs int            Bodies downloaded and re-keyed in parallel (default: 4)
   --start-after string  Resume after this S3 key (domain/localpart/hash), as
@@ -484,11 +516,12 @@ Examples:
 	}
 	start := time.Now()
 	report, runErr := rekeyAccount(ctx, rdb, s3, accountID, rekeyOptions{
-		DryRun:     *dryRun,
-		BatchSize:  *batchSize,
-		Jobs:       *jobs,
-		StartAfter: cursor,
-		Progress:   os.Stdout,
+		DryRun:           *dryRun,
+		DeleteOldObjects: *deleteOld,
+		BatchSize:        *batchSize,
+		Jobs:             *jobs,
+		StartAfter:       cursor,
+		Progress:         os.Stdout,
 	})
 	printRekeyReport(report, *email, *dryRun, time.Since(start))
 	if runErr != nil {
@@ -514,6 +547,7 @@ func printRekeyReport(r *rekeyReport, email string, dryRun bool, elapsed time.Du
 		fmt.Printf("  BLAKE3 objects written:        %d\n", r.Written)
 		fmt.Printf("  BLAKE3 objects reused:         %d\n", r.Reused)
 		fmt.Printf("  Old objects deleted:           %d\n", r.OldDeleted)
+		fmt.Printf("  Old objects retained for readers: %d\n", r.OldRetained)
 	}
 	fmt.Printf("  Duration:                      %s\n", elapsed.Round(time.Millisecond))
 
@@ -521,11 +555,12 @@ func printRekeyReport(r *rekeyReport, email string, dryRun bool, elapsed time.Du
 	printRekeyList("Unreadable (missing or a read error; see 'verify s3')", r.Unreadable)
 	printRekeyList("Skipped, an upload of the body is pending (run again later)", r.Pending)
 	printRekeyList("Failed (run again)", r.Failed)
+	printRekeyList("Retained old objects (sample; deletion requires drained mail nodes)", r.RetainedKeys)
 	printRekeyList("Old objects kept, still referenced (run again; rows of another account need that account's run)", r.OldKept)
 	if len(r.OldLeft) > 0 {
 		printRekeyList("Old objects not deleted", r.OldLeft)
-		fmt.Printf("  Their rows moved, so nothing should reference them any more. Before deleting one,\n")
-		fmt.Printf("  check it with: sora-admin verify hash --email %s --hash <hash>\n", email)
+		fmt.Printf("  Retain these until mail nodes, readers and writers have drained. Deletion also\n")
+		fmt.Printf("  requires checking message and pending-upload references across every account.\n")
 	}
 }
 
