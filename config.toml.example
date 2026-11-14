@@ -9,7 +9,8 @@
 # - Copy this file to config.toml and modify the values for your deployment
 # - All sections and options are documented with their default values
 # - Duration values accept Go duration format: "1h", "30m", "5s", "100ms"
-# - Size values accept common suffixes: "1gb", "100mb", "5kb"
+# - Size values accept b, kb, mb, gb and tb suffixes in any case (powers of
+#   1024): "1gb", "100MB", "5kb"; a bare number is bytes
 #
 # CONFIG VALIDATION:
 # - Unknown keys will log warnings but are ignored (helps detect typos)
