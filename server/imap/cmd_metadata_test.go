@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -70,6 +71,48 @@ func TestCanonicalMetadataEntryKeepsNonASCIIInvalid(t *testing.T) {
 	} {
 		if got := canonicalMetadataEntry(entry); got != want {
 			t.Errorf("canonicalMetadataEntry(%q) = %q, want %q", entry, got, want)
+		}
+	}
+}
+
+// RFC 5464 §3.2: "Entry names are case-insensitive." go-imap hands SETMETADATA
+// entries to the session as a map keyed by the names as sent, so /private/A
+// and /private/a arrive as two keys of one entry, in no order. Folding them
+// into one canonical key kept whichever Go's map iteration visited last, so
+// either value could be stored. Such a command is refused with BAD before
+// anything is written. The test session has no database: a handler that does
+// not refuse the command up front panics on it.
+func TestSetMetadataSameEntryInTwoCasesIsBAD(t *testing.T) {
+	srv := newDisabledCapsTestServer(t, IMAPServerOptions{})
+	s := newDisabledCapsTestSession(srv)
+	if !s.GetCapabilities().Has(imap.CapMetadata) {
+		t.Fatal("test server does not offer METADATA")
+	}
+
+	one := []byte("1")
+	for _, names := range [][]string{
+		{"/private/A", "/private/a"},
+		{"/SHARED/comment", "/shared/Comment"},
+		{"/private/x", "/Private/Vendor/Example.com/K", "/private/vendor/example.COM/k"},
+	} {
+		entries := make(map[string]*[]byte, len(names))
+		for i, name := range names {
+			if i%2 == 0 {
+				entries[name] = &one
+			} else {
+				entries[name] = nil
+			}
+		}
+		for _, mailbox := range []string{"", "INBOX"} {
+			err := callHandler(func() error { return s.SetMetadata(context.Background(), mailbox, entries) })
+			var imapErr *imap.Error
+			if !errors.As(err, &imapErr) {
+				t.Errorf("SetMetadata(%q, %q) = %v, want BAD", mailbox, names, err)
+				continue
+			}
+			if imapErr.Type != imap.StatusResponseTypeBad || imapErr.Code != imap.ResponseCodeClientBug {
+				t.Errorf("SetMetadata(%q, %q) answered %s [%s], want BAD [CLIENTBUG]", mailbox, names, imapErr.Type, imapErr.Code)
+			}
 		}
 	}
 }
