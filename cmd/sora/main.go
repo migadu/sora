@@ -439,6 +439,12 @@ func handleConfigReload(current, next *config.Config) {
 		logger.Warn("Config reload: servers.trusted_networks changed but requires restart to take effect; the networks the servers started with stay trusted until then",
 			"current", current.Servers.TrustedNetworks, "new", next.Servers.TrustedNetworks)
 	}
+
+	// The relay handler is built at start-up and keeps the [relay] it started with. One
+	// that start-up refuses is an error, not just a change: a restart would fail.
+	if err := next.Relay.Validate(); err != nil {
+		logger.Error("Config reload: [relay] is invalid and the server will not start with this config; the relay the server started with stays in use", "error", err)
+	}
 }
 
 // loadAndValidateConfig loads configuration from file and validates all server configurations
