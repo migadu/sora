@@ -1493,7 +1493,7 @@ name = "main-managesieve"
 addr = ":4190"
 max_connections = 200
 max_connections_per_ip = 3
-max_script_size = "16kb"      # Maximum size for a SIEVE script.
+max_script_size = "16kb"      # Maximum size for a SIEVE script (default "16kb"; "0" also means the default, there is no unlimited setting).
 # NOTE: SIEVE extensions are configured globally in the [sieve] section above.
 # This allows consistent extension support across LMTP delivery and ManageSieve script validation.
 insecure_auth = false                            # Allow plaintext auth. SECURITY: Should be false in production.

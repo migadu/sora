@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"slices"
 	"strings"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -114,7 +114,7 @@ func (db *Database) getAllFlagsForMessages(ctx context.Context, tx pgx.Tx, messa
 		allFlags := BitwiseToFlags(bitwiseFlags)
 		var customKeywords []string
 		if err := json.Unmarshal(customFlagsJSON, &customKeywords); err != nil {
-			log.Printf("Database: error unmarshalling custom_flags for message %d: %v", msgID, err)
+			logger.Error("Database: failed to unmarshal custom_flags", "message_id", msgID, "err", err)
 			continue
 		}
 
