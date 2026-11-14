@@ -67,7 +67,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -334,7 +333,13 @@ func (c *Cache) processAccessLog() {
 	}
 }
 
-// GetPathForContentHash returns the absolute filesystem path for a content hash
+// GetPathForContentHash returns the absolute filesystem path for a content hash:
+// data/XX/YY/<rest of the hash>.
+//
+// The fan-out directories data/XX and data/XX/YY are created by the first write into them
+// and never removed again (only PurgeAll removes them): a writer creates its directory and
+// then puts its file into it, so removing a directory that looks empty would pull it out
+// from under a writer in between, which then fails (#645). There are at most 256 × 256.
 func (c *Cache) GetPathForContentHash(contentHash string) string {
 	if len(contentHash) < 4 {
 		return filepath.Join(c.basePath, DataDir, contentHash)
@@ -381,9 +386,6 @@ func (c *Cache) Delete(contentHash string) error {
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to delete file: %w", err)
 	}
-
-	dataDir := filepath.Join(c.basePath, DataDir)
-	removeEmptyParents(path, dataDir)
 
 	shard.mu.Lock()
 	_, dbErr := shard.db.Exec(`DELETE FROM cache_index WHERE path = ?`, path)
@@ -581,8 +583,8 @@ func (c *Cache) trackFile(shard *cacheShard, path string) error {
 // is done or the cache is closed. The server starts it once; New does not.
 func (c *Cache) StartPurgeLoop(ctx context.Context) {
 	go func() {
-		dirCleanupShardIdx := 0
-		c.runPurgeCycle(ctx, &dirCleanupShardIdx)
+		staleShardIdx := 0
+		c.runPurgeCycle(ctx, &staleShardIdx)
 
 		ticker := time.NewTicker(c.purgeInterval)
 		defer ticker.Stop()
@@ -594,13 +596,13 @@ func (c *Cache) StartPurgeLoop(ctx context.Context) {
 			case <-c.stopChan:
 				return
 			case <-ticker.C:
-				c.runPurgeCycle(ctx, &dirCleanupShardIdx)
+				c.runPurgeCycle(ctx, &staleShardIdx)
 			}
 		}
 	}()
 }
 
-func (c *Cache) runPurgeCycle(ctx context.Context, dirCleanupShardIdx *int) {
+func (c *Cache) runPurgeCycle(ctx context.Context, staleShardIdx *int) {
 	logger.Info("Cache: running cache purge cycle")
 	if err := c.PurgeIfNeeded(ctx); err != nil {
 		logger.Warn("Cache: Purge failed", "error", err)
@@ -609,75 +611,12 @@ func (c *Cache) runPurgeCycle(ctx context.Context, dirCleanupShardIdx *int) {
 		logger.Error("Cache: Orphan cleanup error", "error", err)
 	}
 
-	shard := c.shards[*dirCleanupShardIdx]
+	shard := c.shards[*staleShardIdx]
 	if err := c.removeStaleEntriesForShard(ctx, shard); err != nil {
-		logger.Error("Cache: Stale DB entry cleanup error for shard", "error", err, "shard", *dirCleanupShardIdx)
-	}
-	if err := c.cleanupStaleDirectoriesForShard(*dirCleanupShardIdx); err != nil {
-		logger.Error("Cache: Stale dir cleanup error for shard", "error", err, "shard", *dirCleanupShardIdx)
+		logger.Error("Cache: Stale DB entry cleanup error for shard", "error", err, "shard", *staleShardIdx)
 	}
 
-	*dirCleanupShardIdx = (*dirCleanupShardIdx + 1) % NumShards
-}
-
-func (c *Cache) cleanupStaleDirectoriesForShard(shardIdx int) error {
-	shardPrefix := fmt.Sprintf("%02x", shardIdx)
-	shardDir := filepath.Join(c.basePath, DataDir, shardPrefix)
-
-	if _, err := os.Stat(shardDir); os.IsNotExist(err) {
-		return nil
-	}
-
-	return filepath.WalkDir(shardDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			var pathError *fs.PathError
-			if errors.As(err, &pathError) && errors.Is(pathError.Err, os.ErrNotExist) && pathError.Path == path {
-				return nil
-			}
-			logger.Error("Cache: Error walking path", "path", path, "error", err)
-			return err
-		}
-		if !d.IsDir() {
-			return nil
-		}
-
-		if path == filepath.Join(c.basePath, DataDir) {
-			return nil
-		}
-
-		removeErr := os.Remove(path)
-		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) && !isDirNotEmptyError(removeErr) {
-			logger.Warn("Cache: Unexpected error removing directory", "path", path, "error", removeErr)
-		}
-		return nil
-	})
-}
-
-// removeEmptyParents climbs the directory tree from path upwards and removes empty directories,
-// stopping at stopDir (or when a directory is not empty).
-func removeEmptyParents(path, stopDir string) {
-	dir := filepath.Dir(path)
-	for {
-		if len(dir) <= len(stopDir) || !strings.HasPrefix(dir, stopDir) {
-			break
-		}
-		err := os.Remove(dir)
-		if err != nil {
-			break
-		}
-		dir = filepath.Dir(dir)
-	}
-}
-
-// isDirNotEmptyError checks if the error from os.Remove is due to the directory not being empty.
-func isDirNotEmptyError(err error) bool {
-	var pathErr *os.PathError
-	if errors.As(err, &pathErr) {
-		return errors.Is(pathErr.Err, syscall.ENOTEMPTY) ||
-			errors.Is(pathErr.Err, syscall.EEXIST) || // Some systems return EEXIST for non-empty dir
-			strings.Contains(pathErr.Err.Error(), "directory not empty")
-	}
-	return false
+	*staleShardIdx = (*staleShardIdx + 1) % NumShards
 }
 
 func (c *Cache) PurgeIfNeeded(ctx context.Context) error {
@@ -717,7 +656,6 @@ func (c *Cache) purgeShardIfNeeded(ctx context.Context, shard *cacheShard, capac
 		return nil
 	}
 
-	dataDir := filepath.Join(c.basePath, DataDir)
 	for _, item := range pathsToPurge {
 		shard.mu.Lock()
 		removeErr := os.Remove(item.path)
@@ -726,7 +664,6 @@ func (c *Cache) purgeShardIfNeeded(ctx context.Context, shard *cacheShard, capac
 			shard.mu.Unlock()
 			continue
 		}
-		removeEmptyParents(item.path, dataDir)
 		res, dbErr := shard.db.ExecContext(ctx, `DELETE FROM cache_index WHERE path = ?`, item.path)
 		if dbErr == nil {
 			// Only the purge that removed the row counts it: two purges of a shard can
@@ -886,7 +823,6 @@ func (c *Cache) PurgeOrphanedContentHashes(ctx context.Context) error {
 			if !existingMap[hash] {
 				p := hashToPath[hash]
 				os.Remove(p)
-				removeEmptyParents(p, filepath.Join(c.basePath, DataDir))
 				shard.mu.Lock()
 				shard.db.Exec(`DELETE FROM cache_index WHERE path = ?`, p)
 				shard.mu.Unlock()

@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1196,4 +1197,56 @@ func TestBackendHealthReadsAreSynchronized(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+// One failed connection attempt counts once against the backend's health: the
+// round-robin fallback does not dial the preferred backend that just failed a second
+// time in the same attempt (#703). Here the backend closes every connection before the
+// TLS handshake, as a backend's connection limiter does, and the proxy dials it with
+// implicit TLS and PROXY, the setup in which the second dial turned one refused client
+// connection into two failures and a second one quarantined the backend.
+func TestFailedPreferredBackendIsDialedOncePerAttempt(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	var accepted atomic.Int32
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted.Add(1)
+			c.Close()
+		}
+	}()
+	backendAddr := ln.Addr().String()
+
+	cm, err := NewConnectionManager([]string{backendAddr}, 993, true /* remote_tls */, false, true /* PROXY */, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to create connection manager: %v", err)
+	}
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		conn, _, err := cm.ConnectWithProxy(context.Background(), backendAddr, "192.0.2.10", 51000, "127.0.0.1", 993, nil)
+		if conn != nil {
+			conn.Close()
+		}
+		if err == nil {
+			t.Fatalf("attempt %d: connected to a backend that closes every connection", attempt)
+		}
+		// The backend counts a connection before closing it, and the dial fails only
+		// once it is closed, so the count is final when ConnectWithProxy returns.
+		if n := int(accepted.Load()); n != attempt {
+			t.Errorf("after attempt %d the backend was dialed %d times, want %d (one dial per attempt)", attempt, n, attempt)
+		}
+		if fails := poolHealthSnapshot(t, cm, backendAddr).ConsecutiveFails; fails != attempt {
+			t.Errorf("after attempt %d ConsecutiveFails = %d, want %d (one per attempt)", attempt, fails, attempt)
+		}
+		if healthy := cm.IsBackendHealthy(backendAddr); healthy != (attempt < 3) {
+			t.Errorf("after attempt %d backend healthy = %v, want it marked unhealthy at the third failed attempt and not before", attempt, healthy)
+		}
+	}
 }
