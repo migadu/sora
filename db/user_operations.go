@@ -783,6 +783,11 @@ func (db *Database) DeleteMailboxForUser(ctx context.Context, accountID int64, m
 		return errors.New("cannot delete INBOX")
 	}
 
+	// Pin pre-transaction mailbox resolution and shared-mailbox ACL checks to the
+	// writer so a lagging read replica cannot answer 404 or stale rights for a
+	// mailbox or grant written moments earlier (e.g. login default mailboxes or
+	// POST /user/mailboxes).
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
 		return err
@@ -808,6 +813,7 @@ func (db *Database) DeleteMailboxForUser(ctx context.Context, accountID int64, m
 
 // SubscribeToMailbox marks mailbox as subscribed
 func (db *Database) SubscribeToMailbox(ctx context.Context, accountID int64, mailboxPath string) error {
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
 		return err
@@ -829,6 +835,7 @@ func (db *Database) SubscribeToMailbox(ctx context.Context, accountID int64, mai
 
 // UnsubscribeFromMailbox marks mailbox as unsubscribed
 func (db *Database) UnsubscribeFromMailbox(ctx context.Context, accountID int64, mailboxPath string) error {
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
 		return err
