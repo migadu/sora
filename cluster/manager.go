@@ -378,7 +378,7 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 }
 
 // rejoinInterval is how often configured peers that are not members are joined again
-const rejoinInterval = 10 * time.Second
+var rejoinInterval = 10 * time.Second
 
 // rejoinLoop joins the configured peers that are not members, for as long as the
 // manager runs. memberlist never contacts a node again once it has marked it dead

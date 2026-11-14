@@ -3,11 +3,14 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -168,8 +171,10 @@ func TestNewIgnoresItsOwnAddressInPeers(t *testing.T) {
 		host  string
 		peers func(port int) []string
 	}{
+		// Not localhost: on a dual-stack host it also names [::1], which may be
+		// another node (TestPeerNamingThisNodeAndOthersIsJoined).
 		{"IPv4", "127.0.0.1", func(port int) []string {
-			return []string{fmt.Sprintf("127.0.0.1:%d", port), "127.0.0.1", fmt.Sprintf("localhost:%d", port)}
+			return []string{fmt.Sprintf("127.0.0.1:%d", port), "127.0.0.1", fmt.Sprintf("[::ffff:127.0.0.1]:%d", port)}
 		}},
 		{"IPv6", "::1", func(port int) []string {
 			return []string{fmt.Sprintf("[::1]:%d", port), "::1", fmt.Sprintf("[0:0:0:0:0:0:0:1]:%d", port)}
@@ -238,6 +243,124 @@ func TestConfiguredPeerIsRejoinedAfterItLeft(t *testing.T) {
 
 	restarted := startMembershipTestNode(t, "rejoin-seed", seedAddr, nil)
 	waitForMemberCount(t, 20*time.Second, 2, restarted, member)
+}
+
+// TestPeerNamingThisNodeAndOthersIsJoined: one host name can stand for several
+// nodes, this one among them (a DNS name for the whole cluster, or localhost on a
+// dual-stack host). Such an entry is how this node finds the others, so it must
+// be joined, not dropped as this node's own address.
+func TestPeerNamingThisNodeAndOthersIsJoined(t *testing.T) {
+	addrs, err := net.DefaultResolver.LookupNetIP(context.Background(), "ip", "localhost")
+	hasAddr := func(want string) bool {
+		return slices.ContainsFunc(addrs, func(a netip.Addr) bool { return a.Unmap() == netip.MustParseAddr(want) })
+	}
+	if err != nil || !hasAddr("127.0.0.1") || !hasAddr("::1") {
+		t.Skipf("localhost resolves to %v (%v), want both 127.0.0.1 and ::1", addrs, err)
+	}
+
+	port := freeDualLoopbackPort(t)
+	other := startMembershipTestNode(t, "localhost-v6", fmt.Sprintf("[::1]:%d", port), nil)
+	node := startMembershipTestNode(t, "localhost-v4", fmt.Sprintf("127.0.0.1:%d", port), []string{fmt.Sprintf("localhost:%d", port)})
+
+	waitForMemberCount(t, 5*time.Second, 2, node, other)
+}
+
+// TestRejoinReportsPeersOnce: the rejoin loop reports a configured peer that stays
+// away when it goes and when it comes back, not every round. That holds for a
+// name that does not resolve too (memberlist logs a warning each time it is
+// handed one), and a peer that answers on an address no member advertises (a
+// forwarded port, a DNS name for another address) is said to be one: it can
+// never count as a member, so it is joined, a full state exchange, every round.
+func TestRejoinReportsPeersOnce(t *testing.T) {
+	prev := rejoinInterval
+	rejoinInterval = 100 * time.Millisecond
+	t.Cleanup(func() { rejoinInterval = prev })
+
+	logs := recordLogs(t)
+	seedAddr := fmt.Sprintf("127.0.0.1:%d", freeLoopbackPort(t, "127.0.0.1"))
+	seed := startMembershipTestNode(t, "report-seed", seedAddr, nil)
+
+	// A TCP forwarder: memberlist joins over TCP, so the seed answers on it, but
+	// the seed advertises seedAddr.
+	fwd, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { fwd.Close() })
+	var forwarded atomic.Int32
+	go func() {
+		for {
+			in, err := fwd.Accept()
+			if err != nil {
+				return
+			}
+			forwarded.Add(1)
+			go func() {
+				defer in.Close()
+				out, err := net.Dial("tcp", seedAddr)
+				if err != nil {
+					return
+				}
+				defer out.Close()
+				go func() { _, _ = io.Copy(out, in) }()
+				_, _ = io.Copy(in, out)
+			}()
+		}
+	}()
+
+	const unresolvable = "peer.invalid:7946" // RFC 6761 section 6.4
+	member := startMembershipTestNode(t, "report-member", "127.0.0.1:0", []string{fwd.Addr().String(), unresolvable})
+	waitForMemberCount(t, 5*time.Second, 2, seed, member)
+
+	// The startup join plus several rejoin rounds, each joining the forwarder.
+	deadline := time.Now().Add(15 * time.Second)
+	for forwarded.Load() < 6 {
+		if time.Now().After(deadline) {
+			t.Fatalf("forwarder used %d times, want a startup join and 5 rejoin rounds", forwarded.Load())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	warnings := func(text string) []string {
+		logs.mu.Lock()
+		defer logs.mu.Unlock()
+		var found []string
+		for _, r := range logs.records {
+			if line := recordText(r); r.Level == slog.LevelWarn && strings.Contains(line, text) {
+				found = append(found, line)
+			}
+		}
+		return found
+	}
+
+	// memberlist warns once, for the startup join; the rejoin loop once after it.
+	if got := warnings("peer.invalid"); len(got) != 2 {
+		t.Errorf("%d warnings name the unresolvable peer, want 2 (startup join, rejoin loop):\n%s", len(got), strings.Join(got, "\n"))
+	}
+	if got := warnings(fwd.Addr().String()); len(got) != 1 || !strings.Contains(got[0], "no member advertises") {
+		t.Errorf("warnings naming the forwarded peer = %q, want one saying no member advertises its address", got)
+	}
+}
+
+// freeDualLoopbackPort returns a port that is free for TCP and UDP on both
+// 127.0.0.1 and ::1.
+func freeDualLoopbackPort(t *testing.T) int {
+	t.Helper()
+	for range 20 {
+		port := freeLoopbackPort(t, "127.0.0.1")
+		l, err := net.Listen("tcp", fmt.Sprintf("[::1]:%d", port))
+		if err != nil {
+			continue
+		}
+		u, err := net.ListenPacket("udp", fmt.Sprintf("[::1]:%d", port))
+		l.Close()
+		if err == nil {
+			u.Close()
+			return port
+		}
+	}
+	t.Skip("no port free on both 127.0.0.1 and ::1")
+	return 0
 }
 
 func waitForMemberCount(t *testing.T, timeout time.Duration, want int, nodes ...*Manager) {
