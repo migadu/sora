@@ -130,3 +130,42 @@ func TestCapacityEnforcedOnWrite(t *testing.T) {
 		})
 	}
 }
+
+// capacity is enforced per shard, at capacity/256 each. An object larger than its
+// shard's share cannot stay cached: writing it evicts every other object of the shard
+// and then the object itself. It is refused like one above max_object_size.
+func TestObjectAboveShardCapacityIsRefused(t *testing.T) {
+	writers := map[string]func(t *testing.T, c *Cache, hash string, data []byte) error{
+		"Put": func(t *testing.T, c *Cache, hash string, data []byte) error {
+			return c.Put(hash, data)
+		},
+		"MoveIn": func(t *testing.T, c *Cache, hash string, data []byte) error {
+			srcPath := filepath.Join(t.TempDir(), hash)
+			require.NoError(t, os.WriteFile(srcPath, data, 0644))
+			return c.MoveIn(srcPath, hash)
+		},
+	}
+	for name, write := range writers {
+		t.Run(name, func(t *testing.T) {
+			// 100 bytes per shard, max_object_size well above that; randomDataAndHash
+			// puts every object in shard 00.
+			c, err := New(t.TempDir(), 100*NumShards, 1024, time.Hour, time.Hour, nil)
+			require.NoError(t, err)
+			defer c.Close()
+
+			var small []string
+			for i := 0; i < 2; i++ {
+				data, hash := randomDataAndHash(t, 40)
+				require.NoError(t, write(t, c, hash, data))
+				small = append(small, hash)
+			}
+
+			data, hash := randomDataAndHash(t, 150)
+			assert.ErrorIs(t, write(t, c, hash, data), ErrObjectTooLarge)
+			assert.False(t, fileExists(c, hash), "an object above its shard's capacity was cached")
+			for _, h := range small {
+				assert.True(t, fileExists(c, h), "writing an object above its shard's capacity evicted the shard")
+			}
+		})
+	}
+}

@@ -826,7 +826,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	if w.cache != nil {
 		if err := w.cache.MoveIn(filePath, upload.ContentHash); err != nil {
 			if errors.Is(err, cache.ErrObjectTooLarge) {
-				logger.Debug("Uploader: Uploaded hash is larger than the cache's max_object_size - deleting local file", "hash", upload.ContentHash, "size", upload.Size)
+				logger.Debug("Uploader: Uploaded hash is too large for the cache - deleting local file", "hash", upload.ContentHash, "size", upload.Size)
 			} else {
 				logger.Error("Uploader: Failed to move uploaded hash to cache - deleting local file", "hash", upload.ContentHash, "error", err)
 			}
