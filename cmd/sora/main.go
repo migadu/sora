@@ -2615,6 +2615,14 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		return
 	}
 
+	// Register remotelookup health check if remotelookup is enabled
+	if routingLookup := server.GetConnectionManager().GetRoutingLookup(); routingLookup != nil {
+		if healthChecker, ok := routingLookup.(health.RemoteLookupHealthChecker); ok {
+			deps.healthIntegration.RegisterRemoteLookupCheck(healthChecker, serverConfig.Name)
+			logger.Info("Registered remotelookup health check for User API proxy", "name", serverConfig.Name)
+		}
+	}
+
 	// User API requests are routed one by one: nothing to drain.
 	deps.attachBackendMaintenance(ctx, "UserAPI-"+serverConfig.Name, server.GetConnectionManager(), nil)
 
