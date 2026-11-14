@@ -122,8 +122,10 @@ func deleteStoredBody(ctx context.Context, store objectStorage, key string) erro
 }
 
 // rekeyOldObjectDelay is how long the old object of a re-keyed body is kept before it is
-// deleted. A transaction that read a message row before the re-key committed can still write
-// a row with the old hash afterwards: COPY inserts its rows with INSERT ... SELECT, which takes
+// deleted. COPY and MOVE copy a source row's hash under the account's rekey lock (see
+// db.RekeyContentHash), so on a server that takes it no copy of the account's rows can write
+// the old hash once the re-key has committed. A server still running an older build, as during
+// a rolling upgrade, can: its COPY inserts its rows with INSERT ... SELECT, which takes
 // content_hash from its snapshot without waiting for row locks. Server write transactions are
 // bounded by the database write_timeout (10 to 15 seconds by default), so after this delay
 // every row that will ever carry the old hash has committed, and the reference check that
