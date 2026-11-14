@@ -432,6 +432,35 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 		return nil, fmt.Errorf("unsupported PROXY v2 command: %d", command)
 	}
 
+	// Section 2.2 defines the address families AF_UNSPEC (0x0), AF_INET (0x1),
+	// AF_INET6 (0x2) and AF_UNIX (0x3, not supported here) and the transport
+	// protocols UNSPEC (0x0), STREAM (0x1) and DGRAM (0x2): "other values are
+	// unspecified and must not be emitted in version 2 of this protocol and must
+	// be rejected as invalid by receivers".
+	if addressFamily > 0x2 {
+		return nil, fmt.Errorf("unsupported address family: %d", addressFamily)
+	}
+	if protocol > 0x2 {
+		return nil, fmt.Errorf("invalid transport protocol: %d", protocol)
+	}
+
+	// For an UNSPEC family or transport "the receiver should ignore address
+	// information": the connection keeps its real endpoints, as for LOCAL.
+	if addressFamily == 0x0 || protocol == 0x0 {
+		if length > 0 {
+			skipData := make([]byte, length)
+			_, err := io.ReadFull(reader, skipData)
+			if err != nil {
+				return nil, fmt.Errorf("failed to skip UNSPEC address data: %w", err)
+			}
+		}
+		return &ProxyProtocolInfo{
+			Version:  2,
+			Command:  "UNKNOWN",
+			Protocol: "UNKNOWN",
+		}, nil
+	}
+
 	// Read address information based on family
 	var srcIP, dstIP string
 	var srcPort, dstPort int
@@ -480,7 +509,7 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 			ProxySessionID: extractProxySessionIDFromTLVs(tlvs),
 		}, nil
 
-	case 0x2: // AF_INET6 (IPv6)
+	default: // 0x2 AF_INET6 (IPv6)
 		if length < 36 {
 			return nil, fmt.Errorf("insufficient data for IPv6 addresses")
 		}
@@ -523,24 +552,6 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 			JA4Fingerprint: extractJA4FromTLVs(tlvs),
 			ProxySessionID: extractProxySessionIDFromTLVs(tlvs),
 		}, nil
-
-	case 0x0: // AF_UNSPEC (UNKNOWN)
-		// Skip the data
-		if length > 0 {
-			skipData := make([]byte, length)
-			_, err := io.ReadFull(reader, skipData)
-			if err != nil {
-				return nil, fmt.Errorf("failed to skip UNKNOWN address data: %w", err)
-			}
-		}
-		return &ProxyProtocolInfo{
-			Version:  2,
-			Command:  "UNKNOWN",
-			Protocol: "UNKNOWN",
-		}, nil
-
-	default:
-		return nil, fmt.Errorf("unsupported address family: %d", addressFamily)
 	}
 }
 
