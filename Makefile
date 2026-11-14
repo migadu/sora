@@ -6,6 +6,7 @@
 	integration-tests-pop3-connection-limits integration-tests-managesieve-connection-limits \
 	integration-tests-proxy-connection-limits integration-tests-adminapi integration-tests-userapi \
 	integration-tests-config integration-tests-sora-admin integration-tests-relay \
+	integration-tests-delivery integration-tests-pools integration-tests-tls integration-tests-packages \
 	integration-tests-quick integration-tests-imap-quick integration-tests-race integration-tests-quick-race \
 	performance-tests performance-tests-short
 
@@ -77,14 +78,20 @@ TEST_FLAGS = -v -tags=integration -count=1 -timeout=$(TEST_TIMEOUT) $(RACE_FLAG)
 # wall-clock sleeps (~7m + ~9.5m run serially), so they get a larger timeout.
 SLOWLORIS_TIMEOUT = $(if $(RACE),35m,25m)
 SLOWLORIS_FLAGS = -v -tags=integration -count=1 -timeout=$(SLOWLORIS_TIMEOUT) $(RACE_FLAG)
-DB_NAME = sora_test_db
+# The test database: SORA_TEST_DB_NAME, which the test helpers read, or sora_test_db.
+# Exported so that tests run by these targets use the database reset-test-db reset,
+# also when DB_NAME is given to make.
+ifndef DB_NAME
+DB_NAME := $(or $(SORA_TEST_DB_NAME),sora_test_db)
+endif
+export SORA_TEST_DB_NAME := $(DB_NAME)
 DB_USER = postgres
 DB_HOST = localhost
 DB_PORT = 5432
 
 # Reset test database to clean state using native Go (no psql dependency)
 reset-test-db:
-	@SORA_TEST_DB_NAME="$(DB_NAME)" DB_HOST="$(DB_HOST)" DB_PORT="$(DB_PORT)" DB_USER="$(DB_USER)" go run ./scripts/reset-test-db/main.go > /dev/null 2>&1 || true
+	@SORA_TEST_DB_NAME="$(DB_NAME)" DB_HOST="$(DB_HOST)" DB_PORT="$(DB_PORT)" DB_USER="$(DB_USER)" go run ./scripts/reset-test-db/main.go
 
 # Run all integration tests (requires PostgreSQL)
 integration-tests: integration-tests-imap integration-tests-imap-slowloris integration-tests-lmtp integration-tests-pop3 \
@@ -93,7 +100,8 @@ integration-tests: integration-tests-imap integration-tests-imap-slowloris integ
 	integration-tests-connection-limits integration-tests-lmtp-connection-limits \
 	integration-tests-pop3-connection-limits integration-tests-managesieve-connection-limits \
 	integration-tests-proxy-connection-limits integration-tests-adminapi integration-tests-userapi \
-	integration-tests-config integration-tests-sora-admin integration-tests-relay
+	integration-tests-config integration-tests-sora-admin integration-tests-relay \
+	integration-tests-delivery integration-tests-pools integration-tests-tls integration-tests-packages
 
 # Run integration tests in quick mode (skip long-running tests like slowloris)
 integration-tests-quick: integration-tests-imap-quick integration-tests-lmtp integration-tests-pop3 \
@@ -102,7 +110,8 @@ integration-tests-quick: integration-tests-imap-quick integration-tests-lmtp int
 	integration-tests-connection-limits integration-tests-lmtp-connection-limits \
 	integration-tests-pop3-connection-limits integration-tests-managesieve-connection-limits \
 	integration-tests-proxy-connection-limits integration-tests-adminapi integration-tests-userapi \
-	integration-tests-config integration-tests-sora-admin integration-tests-relay
+	integration-tests-config integration-tests-sora-admin integration-tests-relay \
+	integration-tests-delivery integration-tests-pools integration-tests-tls integration-tests-packages
 
 # Race-detector variants of the aggregate targets
 integration-tests-race:
@@ -202,6 +211,26 @@ integration-tests-relay:
 	@echo "Running relay integration tests..."
 	@cd integration_tests/relay && go test $(TEST_FLAGS) .
 
+integration-tests-delivery: reset-test-db
+	@echo "Running delivery integration tests..."
+	@cd integration_tests/delivery && go test $(TEST_FLAGS) .
+
+integration-tests-pools: reset-test-db
+	@echo "Running backend pool integration tests..."
+	@cd integration_tests/pools && go test $(TEST_FLAGS) .
+
+integration-tests-tls: reset-test-db
+	@echo "Running TLS integration tests..."
+	@cd integration_tests/tls && go test $(TEST_FLAGS) .
+
+# Integration-tagged tests that live next to the code they test. ./db under the race
+# detector needs a longer timeout than the other packages.
+INTEGRATION_CODE_PKGS = ./db ./pkg/resilient ./server ./server/lmtp ./server/lmtpproxy ./server/proxy ./tlsmanager
+CODE_PKGS_TIMEOUT = $(if $(RACE),60m,30m)
+integration-tests-packages: reset-test-db
+	@echo "Running integration tests in $(INTEGRATION_CODE_PKGS)..."
+	@go test -v -tags=integration -count=1 -timeout=$(CODE_PKGS_TIMEOUT) $(RACE_FLAG) $(INTEGRATION_CODE_PKGS)
+
 # Performance tests
 performance-tests:
 	@echo "Running search performance tests..."
@@ -220,9 +249,11 @@ performance-tests:
 	@echo "Search benchmarks..."
 	@go test -v ./db -bench "BenchmarkSearchOperations" -benchtime=5s -timeout 5m
 
+# -short skips every test that needs PostgreSQL, so the quick variant runs the basic
+# performance test rather than the full one in short mode.
 performance-tests-short:
 	@echo "Running quick performance validation tests..."
-	@go test -v ./db -run "TestSearchPerformance" -short -timeout 2m
+	@go test -v ./db -run "TestSearchPerformanceBasic" -timeout 2m
 
 # Cross-compile with musl libc for Linux
 build-linux-musl:
