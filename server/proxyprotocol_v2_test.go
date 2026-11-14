@@ -24,6 +24,10 @@ var (
 		0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
 		0xC7, 0x38, 0x00, 0x8F,
 	}
+	// Two 108-byte AF_UNIX paths: /run/client.sock -> /run/sora.sock
+	proxyV2UnixBlock = append(
+		append([]byte("/run/client.sock"), make([]byte, 108-len("/run/client.sock"))...),
+		append([]byte("/run/sora.sock"), make([]byte, 108-len("/run/sora.sock"))...)...)
 )
 
 // The lowest 4 bits of the 14th byte are the transport protocol. haproxy
@@ -43,6 +47,9 @@ func TestParseProxyV2RejectsInvalidTransport(t *testing.T) {
 		{"AF_INET6 transport 0xF", 0x2F, proxyV2IPv6Block},
 		{"AF_UNSPEC transport 0x3", 0x03, nil},
 		{"AF_UNSPEC transport 0xF", 0x0F, nil},
+		{"AF_UNIX transport 0x3", 0x33, proxyV2UnixBlock},
+		{"family 0x4", 0x41, proxyV2IPv4Block},
+		{"family 0xF", 0xF1, proxyV2IPv6Block},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			h := proxyV2Header(0x21, tt.famProto, tt.block)
@@ -73,6 +80,12 @@ func TestParseProxyV2Accepts(t *testing.T) {
 		{"AF_INET6 UNSPEC ignores addresses", 0x21, 0x20, proxyV2IPv6Block, "UNKNOWN", "UNKNOWN", "", "", 0, 0},
 		{"AF_UNSPEC UNSPEC", 0x21, 0x00, nil, "UNKNOWN", "UNKNOWN", "", "", 0, 0},
 		{"AF_UNSPEC STREAM ignores addresses", 0x21, 0x01, proxyV2IPv4Block, "UNKNOWN", "UNKNOWN", "", "", 0, 0},
+		// AF_UNIX is a valid family this receiver does not implement: it "automatically
+		// falls back to the UNSPEC mode for the valid combinations above that it does
+		// not support".
+		{"UNIX stream falls back to UNSPEC", 0x21, 0x31, proxyV2UnixBlock, "UNKNOWN", "UNKNOWN", "", "", 0, 0},
+		{"UNIX datagram falls back to UNSPEC", 0x21, 0x32, proxyV2UnixBlock, "UNKNOWN", "UNKNOWN", "", "", 0, 0},
+		{"AF_UNIX UNSPEC ignores addresses", 0x21, 0x30, proxyV2UnixBlock, "UNKNOWN", "UNKNOWN", "", "", 0, 0},
 		{"TCP over IPv4", 0x21, 0x11, proxyV2IPv4Block, "PROXY", "TCP4", "192.0.2.1", "192.0.2.10", 51000, 143},
 		{"UDP over IPv4", 0x21, 0x12, proxyV2IPv4Block, "PROXY", "UDP4", "192.0.2.1", "192.0.2.10", 51000, 143},
 		{"TCP over IPv6", 0x21, 0x21, proxyV2IPv6Block, "PROXY", "TCP6", "2001:db8::1", "2001:db8::10", 51000, 143},

@@ -433,20 +433,23 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 	}
 
 	// Section 2.2 defines the address families AF_UNSPEC (0x0), AF_INET (0x1),
-	// AF_INET6 (0x2) and AF_UNIX (0x3, not supported here) and the transport
-	// protocols UNSPEC (0x0), STREAM (0x1) and DGRAM (0x2): "other values are
-	// unspecified and must not be emitted in version 2 of this protocol and must
-	// be rejected as invalid by receivers".
-	if addressFamily > 0x2 {
-		return nil, fmt.Errorf("unsupported address family: %d", addressFamily)
+	// AF_INET6 (0x2) and AF_UNIX (0x3) and the transport protocols UNSPEC (0x0),
+	// STREAM (0x1) and DGRAM (0x2): "other values are unspecified and must not be
+	// emitted in version 2 of this protocol and must be rejected as invalid by
+	// receivers".
+	if addressFamily > 0x3 {
+		return nil, fmt.Errorf("invalid address family: %d", addressFamily)
 	}
 	if protocol > 0x2 {
 		return nil, fmt.Errorf("invalid transport protocol: %d", protocol)
 	}
 
 	// For an UNSPEC family or transport "the receiver should ignore address
-	// information": the connection keeps its real endpoints, as for LOCAL.
-	if addressFamily == 0x0 || protocol == 0x0 {
+	// information": the connection keeps its real endpoints, as for LOCAL. AF_UNIX
+	// is valid but not implemented here, and a receiver "automatically falls back
+	// to the UNSPEC mode for the valid combinations above that it does not
+	// support".
+	if addressFamily == 0x0 || addressFamily == 0x3 || protocol == 0x0 {
 		if length > 0 {
 			skipData := make([]byte, length)
 			_, err := io.ReadFull(reader, skipData)
