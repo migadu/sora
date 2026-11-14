@@ -60,7 +60,9 @@ func (rd *ResilientDatabase) ExecuteWithS3ObjectLock(ctx context.Context, conten
 // returns to the caller, who must Release it. Shared holders do not exclude one another,
 // but they keep out the cleaner's deletion of these objects, which try-locks them in
 // exclusive mode. A cross-account COPY holds them while it makes the objects exist under
-// the destination owner's key and hands them to its copy transaction (db.HeldDestObjects).
+// the destination owner's key and hands them to its copy transaction (db.HeldDestObjects),
+// so it keeps this transaction's pooled connection while the copy acquires a second one
+// (see "Connection Poolers" in docs/deployment.md for sizing a pool for that).
 // It waits for a current exclusive holder for at most 30 seconds.
 func (rd *ResilientDatabase) LockS3ObjectsShared(ctx context.Context, accountID int64, contentHashes []string) (*db.AdvisoryLockTx, error) {
 	lockCtx, cancel := context.WithTimeout(ctx, 30*time.Second)

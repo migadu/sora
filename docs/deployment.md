@@ -147,14 +147,14 @@ Sora works behind PgBouncer in any pooling mode, including transaction pooling. 
 Some of those locks span an S3 round trip, so they keep one pooled connection (one server connection behind the pooler) checked out while that round trip runs:
 
 - the cleaner: two on the node running a cycle, the cycle lock for the whole cycle plus the per-batch lock during each S3 delete;
-- IMAP COPY between accounts: one per copy in flight, held across the S3 existence check and copy.
+- IMAP COPY into another account's mailbox, of a body already in S3: one per copy in flight, held from the S3 existence check and copy until the copy's own write transaction commits, so while that transaction runs the copy has two connections checked out. It holds the first while it waits for the second, so copies alone can exhaust a pool smaller than twice their number; they then wait on one another until `write_timeout`.
 
 An upload holds no lock across its transfer. Before writing it takes and at once releases the per-object lock in a single statement, which orders the write after any delete of the same body already under way; every later delete sees the upload's pending row and leaves the body alone. The same statement leases that row to that one upload (`pending_uploads.lease_until` and `lease_owner`, renewed while the transfer runs). The lease is exclusive: another upload of the same row is deferred while it is live, and only the owner can renew, release or finalize it. Nothing deletes a leased row but its owner's finalize, so account deletion and purge wait for it. An upload therefore uses a pooled connection only for its few short statements, and `[uploader] concurrency` is bounded by S3, not by the pool.
 
 Size the pooler's pool for the write user with that in mind:
 
 ```
-pool_size >= 2 + headroom for interactive writes, cross-account copies and short uploader statements
+pool_size >= 2 + 2 × concurrent cross-account copies + headroom for interactive writes and short uploader statements
 ```
 
 A pool sized only for short IMAP/LMTP transactions can still queue mail delivery behind the cleaner's S3 deletes, most visibly during an S3 outage when those deletes sit in retry.
