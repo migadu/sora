@@ -96,3 +96,35 @@ func TestVacationPersonalMessageHeaders(t *testing.T) {
 		})
 	}
 }
+
+// TestVacationScriptAddressesArePersonal is issue #326 (1): an address the script
+// lists in :addresses belongs to the recipient for the personal message check (RFC
+// 5230 §4.5, item 3), compared without regard to case.
+func TestVacationScriptAddressesArePersonal(t *testing.T) {
+	const owner = "jane@example.com"
+	owns := func(_ context.Context, _ int64, addr string) (bool, error) {
+		return strings.EqualFold(addr, owner), nil
+	}
+	original := makeMessage(map[string]string{"From": "bob@example.org", "To": "jane@example.net", "Subject": "Hello"})
+	for _, tc := range []struct {
+		name      string
+		addresses []string
+		replies   int
+	}{
+		{name: "listed", addresses: []string{"Jane@Example.net"}, replies: 1},
+		{name: "not listed", addresses: []string{"someone@example.net"}, replies: 0},
+		{name: "none", replies: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rq := &captureRelayQueue{}
+			h := &StandardVacationHandler{Hostname: "mail.example.com", RelayQueue: rq, IsOwnedAddress: owns}
+			reply := sieveengine.VacationReply{Body: "I am away.", Addresses: tc.addresses}
+			if err := h.HandleVacationResponse(context.Background(), 1, reply, vacAddr(t, "bob@example.org"), vacAddr(t, owner), original); err != nil {
+				t.Fatalf("HandleVacationResponse: %v", err)
+			}
+			if len(rq.calls) != tc.replies {
+				t.Errorf("replies = %d, want %d", len(rq.calls), tc.replies)
+			}
+		})
+	}
+}

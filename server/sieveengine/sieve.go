@@ -140,9 +140,12 @@ type Result struct {
 // for this sender and response identity already checked.
 type VacationReply struct {
 	From    string // the :from address; delivery uses it only if the account owns it
-	Subject string
+	Subject string // the :subject, or "Auto: " and the original subject (RFC 5230 §5.3)
 	Body    string // the reason
 	IsMime  bool
+	// Addresses is the :addresses list: addresses of the recipient besides the
+	// account's own, for the personal message check (RFC 5230 §4.5).
+	Addresses []string
 
 	// ClaimResponse atomically consumes the :days window for this sender and
 	// response identity. It is nil without a VacationOracle. Delivery calls it
@@ -414,6 +417,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 			Subject:       vacation.Subject,
 			Body:          vacation.Body,
 			IsMime:        vacation.IsMime,
+			Addresses:     vacation.Addresses,
 			ClaimResponse: execPolicy.vacationClaimer(sender, vacation.ResponseIdentity, duration),
 		}
 		break

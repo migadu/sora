@@ -56,20 +56,32 @@ func shouldSuppressVacation(sender *server.Address, originalMessage *message.Ent
 	return helpers.ShouldSuppressAuto(envFrom, headerGet)
 }
 
-// recipientIsAddressed reports whether at least one of the account's addresses appears in
-// the message's To or Cc header (RFC 5230 §4.5 "personal message" rule). It prevents
-// auto-replying to mail the user received only via Bcc, or via an alias/list not present
-// in To/Cc — classic backscatter. Ownership (not a literal match) is used so aliases and
-// plus-addressed recipients still count. Returns an error only if the ownership lookup fails.
-func (h *StandardVacationHandler) recipientIsAddressed(ctx context.Context, accountID int64, originalMessage *message.Entity) (bool, error) {
+// personalMessageFields are the header fields RFC 5230 §4.5 looks for the recipient in:
+// "Vacation" MUST NOT respond to a message unless the recipient user's email address is
+// in a "To", "Cc", "Bcc", "Resent-To", "Resent-Cc", or "Resent-Bcc" line of the original
+// message.
+var personalMessageFields = []string{"To", "Cc", "Bcc", "Resent-To", "Resent-Cc", "Resent-Bcc"}
+
+// recipientIsAddressed reports whether one of the recipient's addresses appears in the
+// message's personalMessageFields (RFC 5230 §4.5 "personal message" rule). It prevents
+// auto-replying to mail the user received only via a stripped Bcc, or via an alias/list
+// not named there — classic backscatter. The recipient's addresses are those the account
+// owns (ownership, not a literal match, so aliases and plus-addressed recipients count)
+// and the script's :addresses. Returns an error only if the ownership lookup fails.
+func (h *StandardVacationHandler) recipientIsAddressed(ctx context.Context, accountID int64, scriptAddresses []string, originalMessage *message.Entity) (bool, error) {
 	hdr := mail.Header{Header: originalMessage.Header}
 	var recipients []*mail.Address
-	for _, field := range []string{"To", "Cc"} {
+	for _, field := range personalMessageFields {
 		if list, err := hdr.AddressList(field); err == nil {
 			recipients = append(recipients, list...)
 		}
 	}
 	for _, a := range recipients {
+		for _, own := range scriptAddresses {
+			if strings.EqualFold(strings.TrimSpace(own), a.Address) {
+				return true, nil
+			}
+		}
 		// Check the address as written and its base form (without +detail). Credentials
 		// are stored without plus-addressing detail, and a plus-addressed or aliased
 		// recipient is still a personal recipient — so jane+tag@ must not be suppressed.
@@ -159,16 +171,16 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 		return nil
 	}
 
-	// RFC 5230 §4.5: only auto-reply to "personal" mail — at least one of the account's
-	// addresses must appear in To/Cc. Avoids backscatter to Bcc'd or list/alias mail the
-	// user wasn't directly addressed on. On lookup error, fail open and proceed (the
-	// null-sender/Auto-Submitted/per-sender-period protections still apply).
+	// RFC 5230 §4.5: only auto-reply to "personal" mail — one of the recipient's
+	// addresses must appear in To/Cc/Bcc/Resent-*. Avoids backscatter to Bcc'd or
+	// list/alias mail the user wasn't directly addressed on. On lookup error, fail open
+	// and proceed (the null-sender/Auto-Submitted/per-sender-period protections still apply).
 	if h.IsOwnedAddress != nil {
-		addressed, err := h.recipientIsAddressed(ctx, AccountID, originalMessage)
+		addressed, err := h.recipientIsAddressed(ctx, AccountID, reply.Addresses, originalMessage)
 		if err != nil {
-			h.log("[VACATION] To/Cc ownership check failed, proceeding: %v", err)
+			h.log("[VACATION] recipient ownership check failed, proceeding: %v", err)
 		} else if !addressed {
-			h.log("[VACATION] suppressed: account address not in To/Cc (not a personal message)")
+			h.log("[VACATION] suppressed: no recipient address in To/Cc/Bcc/Resent-* (not a personal message)")
 			return nil
 		}
 	}
@@ -180,7 +192,9 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 		vacationFrom = owned
 	}
 
-	vacationSubject := "Auto: Out of Office"
+	// The interpreter supplies the :subject or the RFC 5230 §5.3 default ("Auto: " and
+	// the original subject); the fixed subject is for a reply built without one.
+	vacationSubject := "Automated reply"
 	if reply.Subject != "" {
 		vacationSubject = reply.Subject
 	}
@@ -249,12 +263,17 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 		}
 	}
 
-	// Send via external relay or queue. A failure from here on is lost for the rest
-	// of the :days window, and the session trace (h.log) is debug-level on both LMTP
-	// and the Admin API, so it is also reported at Warn where an operator sees it.
+	// Send via external relay or queue, from the null reverse-path. RFC 5230 §5.1: "The
+	// SMTP MAIL FROM address of the message envelope SHOULD be set to <>"; a bounce of
+	// the reply then goes nowhere, instead of to the user (RFC 3834 §3.3).
+	//
+	// A failure from here on is lost for the rest of the :days window, and the session
+	// trace (h.log) is debug-level on both LMTP and the Admin API, so it is also
+	// reported at Warn where an operator sees it.
+	const nullReversePath = ""
 	if h.RelayQueue != nil {
 		// Queue for background delivery with retry
-		if err := h.RelayQueue.Enqueue(vacationFrom, fromAddr.FullAddress(), "vacation", vacationMessage.Bytes()); err != nil {
+		if err := h.RelayQueue.Enqueue(nullReversePath, fromAddr.FullAddress(), "vacation", vacationMessage.Bytes()); err != nil {
 			h.log("[VACATION] Failed to enqueue vacation response: %v", err)
 			logger.Warn("Sieve vacation reply could not be queued; the response period is consumed",
 				"account_id", AccountID, "sender", fromAddr.FullAddress(), "error", err)
@@ -265,7 +284,7 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 		}
 		return nil
 	} else if h.RelayHandler != nil {
-		if err := h.RelayHandler.SendToExternalRelay(vacationFrom, fromAddr.FullAddress(), vacationMessage.Bytes()); err != nil {
+		if err := h.RelayHandler.SendToExternalRelay(nullReversePath, fromAddr.FullAddress(), vacationMessage.Bytes()); err != nil {
 			h.log("[VACATION] Failed to relay vacation response: %v", err)
 			logger.Warn("Sieve vacation reply could not be relayed; the response period is consumed",
 				"account_id", AccountID, "sender", fromAddr.FullAddress(), "error", err)
