@@ -2658,16 +2658,16 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
-	// A proxy dials a backend address without a port at its remote_port, or at its enabled
-	// lookup's remote_port for a lookup-routed one. No other server reads either, and a
+	// A proxy dials a backend address without a port at its remote_port, and builds a
+	// lookup client from its enabled remote_lookup. No other server reads either, and a
 	// disabled lookup is never initialized.
 	if strings.HasSuffix(s.Type, "_proxy") {
 		if _, err := s.GetRemotePort(); err != nil {
 			return fmt.Errorf("server %q: invalid remote_port: %w", s.Name, err)
 		}
 		if s.RemoteLookup != nil && s.RemoteLookup.Enabled {
-			if _, err := s.RemoteLookup.GetRemotePort(); err != nil {
-				return fmt.Errorf("server %q: invalid remote_lookup.remote_port: %w", s.Name, err)
+			if err := s.RemoteLookup.Validate(); err != nil {
+				return fmt.Errorf("server %q: %w", s.Name, err)
 			}
 		}
 	}

@@ -125,6 +125,26 @@ func TestServerReloadRejectsInvalidExemptNetworks(t *testing.T) {
 	}
 }
 
+// A reload whose enabled remote_lookup the proxy could not build its lookup client from
+// is refused for that server, as a restart would refuse it; the server keeps the config
+// it has (#853).
+func TestServerReloadRejectsInvalidRemoteLookup(t *testing.T) {
+	logs := captureReloadLogs(t)
+	running := config.ServerConfig{Type: "imap_proxy", Name: "imap-proxy", Addr: ":1143", RemoteAddrs: []string{"192.0.2.10:143"}}
+	deps, reloaders := runningDeps(t, running)
+
+	next := running
+	next.RemoteLookup = &config.RemoteLookupConfig{Enabled: true, URL: "https://$email.lookup.example.com/lookup"}
+	deps.reloadServers(reloadedConfig(next))
+
+	if got := reloaders["imap-proxy"].reloaded; len(got) != 0 {
+		t.Fatalf("ReloadConfig got %+v, want no call", got)
+	}
+	if out := logs.String(); !hasLineWith(out, "Skipping reload", "server=imap-proxy", "remote_lookup.url", "allowed only in the path and query") {
+		t.Errorf("no error naming imap-proxy and its remote_lookup.url:\n%s", out)
+	}
+}
+
 // enabled = false on a running server's block takes effect at the next restart: the
 // reload says so instead of passing over the block in silence, and does not hand the
 // server a block that is no longer validated.
