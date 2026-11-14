@@ -476,6 +476,34 @@ func (db *Database) GetCredentialEpoch(ctx context.Context, address string) (acc
 	return accountID, epoch, nil
 }
 
+// GetCredentialForToken returns what a User API login needs in one read: the account,
+// the password hash to check, and the credential's epoch (see GetCredentialEpoch) for the
+// token. Read together, the epoch is always that of the hash checked; read apart, a
+// password changed in between would leave a token from the old password carrying the new
+// epoch, which every refresh accepts. Returns consts.ErrUserNotFound when the credential is
+// missing or the account is out of service.
+func (db *Database) GetCredentialForToken(ctx context.Context, address string) (accountID int64, hashedPassword string, epoch time.Time, err error) {
+	normalizedAddress := strings.ToLower(strings.TrimSpace(address))
+	if normalizedAddress == "" {
+		return 0, "", time.Time{}, errors.New("address cannot be empty")
+	}
+
+	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT c.account_id, c.password, c.updated_at
+		FROM credentials c
+		JOIN accounts a ON c.account_id = a.id
+		WHERE LOWER(c.address) = $1 AND a.deleted_at IS NULL
+	`, normalizedAddress).Scan(&accountID, &hashedPassword, &epoch)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, "", time.Time{}, consts.ErrUserNotFound
+		}
+		logger.Error("Database: error fetching credential for token", "address", normalizedAddress, "err", err)
+		return 0, "", time.Time{}, fmt.Errorf("database error fetching credential: %w", err)
+	}
+	return accountID, hashedPassword, epoch, nil
+}
+
 // GetAccountIDByAddress retrieves the main user ID associated with a given identity (address)
 // by looking it up in the `credentials` table.
 func (db *Database) GetAccountIDByAddress(ctx context.Context, address string) (int64, error) {

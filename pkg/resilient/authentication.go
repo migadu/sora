@@ -88,6 +88,42 @@ func (rd *ResilientDatabase) GetCredentialEpochWithRetry(ctx context.Context, ad
 	return res.ID, res.Epoch, nil
 }
 
+// GetCredentialForTokenWithRetry retrieves, in one read, the account ID, password hash
+// and password epoch a User API login checks and issues its token with, requiring the
+// account to be active (see db.GetCredentialForToken).
+func (rd *ResilientDatabase) GetCredentialForTokenWithRetry(ctx context.Context, address string) (accountID int64, hashedPassword string, epoch time.Time, err error) {
+	config := retry.BackoffConfig{
+		InitialInterval: 250 * time.Millisecond,
+		MaxInterval:     2 * time.Second,
+		Multiplier:      1.5,
+		Jitter:          true,
+		MaxRetries:      2,
+		OperationName:   "db_credential_for_token",
+	}
+
+	type tokenCredential struct {
+		ID    int64
+		Hash  string
+		Epoch time.Time
+	}
+
+	op := func(ctx context.Context) (any, error) {
+		id, hash, ep, dbErr := rd.getOperationalDatabaseForOperation(ctx, false).GetCredentialForToken(ctx, address)
+		if dbErr != nil {
+			return nil, dbErr
+		}
+		return tokenCredential{ID: id, Hash: hash, Epoch: ep}, nil
+	}
+
+	result, err := rd.executeReadWithRetry(ctx, config, timeoutAuth, op, consts.ErrUserNotFound)
+	if err != nil {
+		return 0, "", time.Time{}, err
+	}
+
+	cred := result.(tokenCredential)
+	return cred.ID, cred.Hash, cred.Epoch, nil
+}
+
 // AuthenticateWithRetry handles the full authentication flow with resilience.
 // It fetches credentials from PostgreSQL, verifies the password, and triggers
 // a rehash if necessary.

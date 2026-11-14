@@ -34,6 +34,7 @@ import (
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/adminapi"
 	"github.com/migadu/sora/server/cleaner"
+	"github.com/migadu/sora/server/credchanges"
 	"github.com/migadu/sora/server/delivery"
 	"github.com/migadu/sora/server/fts"
 	"github.com/migadu/sora/server/imap"
@@ -733,6 +734,13 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		acMaxAge := cfg.AuthCache.GetMaxAgeWithDefault()
 		acPurgeUnused := cfg.AuthCache.GetPurgeUnusedWithDefault()
 		acCleanupInterval := cfg.AuthCache.GetCleanupIntervalWithDefault()
+		// A restarted node drops what its cache kept of logins changed while it was down
+		// by reading credential_changes back as far as the cache reaches, which is only
+		// as far as that table keeps rows.
+		if acMaxAge > credchanges.Retention {
+			logger.Warn("AuthCache: max_age capped to the retention of credential changes", "max_age", acMaxAge, "capped_to", credchanges.Retention)
+			acMaxAge = credchanges.Retention
+		}
 
 		// Ensure parent directory exists
 		if dir := filepath.Dir(acPath); dir != "" && dir != "." {
@@ -1201,6 +1209,9 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 	// the backend servers admit their sessions through deps.maintenanceGate.
 	deps.maintenance = startBackendMaintenance(ctx, deps)
 	startSessionsReport(ctx, deps)
+	// Before any server starts too: the persistent auth cache may hold a login that
+	// changed while this node was down.
+	startCredentialChanges(ctx, deps)
 
 	// Start HTTP-01 challenge server for Let's Encrypt if using autocert
 	if deps.tlsManager != nil {
@@ -1317,7 +1328,9 @@ func proxyTrackerInstanceID(clusterMgr *cluster.Manager, hostname, serverName st
 
 // startConnectionTrackerForProxy initializes and starts a connection tracker for a proxy server (with gossip).
 // Returns both the tracker and the map key to use for registration.
-func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, clusterMgr *cluster.Manager, clusterCfg *config.ClusterConfig, srv interface {
+// authCache, when not nil, is the node's persistent auth cache: a kick or forgotten
+// logins drop the account from it too.
+func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, clusterMgr *cluster.Manager, clusterCfg *config.ClusterConfig, authCache *authcache.Cache, srv interface {
 	SetConnectionTracker(*server.ConnectionTracker)
 }) (*server.ConnectionTracker, string) {
 	instanceID := proxyTrackerInstanceID(clusterMgr, hostname, serverName)
@@ -1363,6 +1376,9 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 
 	tracker := server.NewConnectionTracker(protocol, serverName, hostname, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize, false)
 	if tracker != nil {
+		if authCache != nil {
+			tracker.SetAuthCache(authCache)
+		}
 		srv.SetConnectionTracker(tracker)
 	}
 
@@ -1958,7 +1974,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker, mapKey := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker, mapKey := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, deps.authCacheInstance, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
 		deps.connectionTrackers[mapKey] = tracker
@@ -2088,7 +2104,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker, mapKey := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker, mapKey := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, deps.authCacheInstance, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
 		deps.connectionTrackers[mapKey] = tracker
@@ -2217,7 +2233,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	}
 
 	// Start connection tracker if enabled.
-	if tracker, mapKey := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker, mapKey := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, deps.authCacheInstance, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
 		deps.connectionTrackers[mapKey] = tracker
@@ -2338,7 +2354,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker, mapKey := startConnectionTrackerForProxy("LMTP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker, mapKey := startConnectionTrackerForProxy("LMTP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, deps.authCacheInstance, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
 		deps.connectionTrackers[mapKey] = tracker

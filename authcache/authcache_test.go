@@ -253,6 +253,33 @@ func TestInvalidateAccount(t *testing.T) {
 	}
 }
 
+// TestInvalidateAccounts drops every entry of several accounts in one statement: the
+// credential-change poll hands over all the accounts changed in its window at once.
+func TestInvalidateAccounts(t *testing.T) {
+	c := newTestCache(t)
+	ctx := context.Background()
+
+	c.Put(ctx, "alice@example.com", 42, "hash1")
+	c.Put(ctx, "alias@example.com", 42, "hash1")
+	c.Put(ctx, "bob@example.com", 43, "hash2")
+	c.Put(ctx, "carol@example.com", 99, "hash3")
+
+	if err := c.InvalidateAccounts(ctx, []int64{42, 43, 1000}); err != nil {
+		t.Fatalf("InvalidateAccounts() error: %v", err)
+	}
+	for _, addr := range []string{"alice@example.com", "alias@example.com", "bob@example.com"} {
+		if _, _, err := c.Get(ctx, addr); err != ErrCacheMiss {
+			t.Errorf("%s should be invalidated, Get() = %v", addr, err)
+		}
+	}
+	if id, _, err := c.Get(ctx, "carol@example.com"); err != nil || id != 99 {
+		t.Errorf("carol (another account) = %d, %v; want 99, nil", id, err)
+	}
+	if err := c.InvalidateAccounts(ctx, nil); err != nil {
+		t.Errorf("InvalidateAccounts(nil) error: %v", err)
+	}
+}
+
 func TestStats(t *testing.T) {
 	c := newTestCache(t)
 	ctx := context.Background()

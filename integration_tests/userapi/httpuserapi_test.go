@@ -44,6 +44,13 @@ func (tc *TestContext) accountID(t *testing.T) int64 {
 // setupTestServer creates a test HTTP server with all dependencies
 func setupTestServer(t *testing.T) *TestContext {
 	t.Helper()
+	return setupTestServerWith(t, nil)
+}
+
+// setupTestServerWith is setupTestServer with configure applied to the server's options
+// before the server is created.
+func setupTestServerWith(t *testing.T, configure func(*userapi.ServerOptions)) *TestContext {
+	t.Helper()
 
 	// Skip if database unavailable
 	common.SkipIfDatabaseUnavailable(t)
@@ -65,6 +72,9 @@ func setupTestServer(t *testing.T) *TestContext {
 		Storage:        nil, // Can be nil for metadata-only tests
 		Cache:          nil, // Can be nil for tests
 		TLS:            false,
+	}
+	if configure != nil {
+		configure(&serverOptions)
 	}
 
 	server, err := userapi.New(rdb, serverOptions)
