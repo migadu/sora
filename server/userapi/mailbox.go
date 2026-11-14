@@ -9,16 +9,20 @@ import (
 	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 )
 
-// MailboxInfo represents mailbox information for API responses
+// MailboxInfo represents mailbox information for API responses. Total, Unseen,
+// UIDNext and UIDValidity are what IMAP STATUS reports as MESSAGES, UNSEEN, UIDNEXT
+// and UIDVALIDITY; all four are 0 for a mailbox the user may list but not read.
 type MailboxInfo struct {
-	Name       string `json:"name"`
-	Path       string `json:"path"`
-	Subscribed bool   `json:"subscribed"`
-	Total      int    `json:"total"`
-	Unseen     int    `json:"unseen"`
-	UIDNext    int64  `json:"uid_next"`
+	Name        string `json:"name"`
+	Path        string `json:"path"`
+	Subscribed  bool   `json:"subscribed"`
+	Total       int    `json:"total"`
+	Unseen      int    `json:"unseen"`
+	UIDNext     int64  `json:"uid_next"`
+	UIDValidity uint32 `json:"uid_validity"`
 }
 
 // CreateMailboxRequest represents the request to create a new mailbox
@@ -60,34 +64,66 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 		subscribedSet[strings.ToLower(n)] = true
 	}
 
-	// Convert to API response format with counts
-	mailboxInfos := make([]MailboxInfo, 0, len(mailboxes))
+	listed := make([]*db.DBMailbox, 0, len(mailboxes))
 	for _, mb := range mailboxes {
-		isSubscribed := subscribedSet[strings.ToLower(mb.Name)]
-		if subscribedOnly && !isSubscribed {
-			continue
+		if !subscribedOnly || subscribedSet[strings.ToLower(mb.Name)] {
+			listed = append(listed, mb)
 		}
-		// Get message counts
-		total, err := s.rdb.GetMessageCountForMailboxWithRetry(ctx, accountID, mb.Name)
-		if err != nil {
-			logger.Warn("HTTP Mail API: Error getting message count", "name", s.name, "mailbox", mb.Name, "error", err)
-			total = 0 // Continue with zero count on error
-		}
+	}
 
-		unseen, err := s.rdb.GetUnseenCountForMailboxWithRetry(ctx, accountID, mb.Name)
-		if err != nil {
-			logger.Warn("HTTP Mail API: Error getting unseen count", "name", s.name, "mailbox", mb.Name, "error", err)
-			unseen = 0 // Continue with zero count on error
-		}
+	// UIDNEXT (mailboxes.highest_uid + 1) of every listed mailbox in one query.
+	ids := make([]int64, len(listed))
+	for i, mb := range listed {
+		ids[i] = mb.ID
+	}
+	summaries, err := s.rdb.GetMailboxSummariesBatchWithRetry(ctx, ids)
+	if err != nil {
+		// Continue with uid_next 0, as the counts do on error.
+		logger.Warn("HTTP Mail API: Error getting mailbox summaries", "name", s.name, "error", err)
+	}
 
-		mailboxInfos = append(mailboxInfos, MailboxInfo{
+	// Convert to API response format with counts
+	mailboxInfos := make([]MailboxInfo, 0, len(listed))
+	for _, mb := range listed {
+		info := MailboxInfo{
 			Name:       mb.Name,
 			Path:       mb.Name, // Same as name for now
-			Subscribed: isSubscribed,
-			Total:      total,
-			Unseen:     unseen,
-			UIDNext:    0, // Will be populated when needed
-		})
+			Subscribed: subscribedSet[strings.ToLower(mb.Name)],
+		}
+
+		// RFC 4314 §4: STATUS needs the "r" right. A shared mailbox listed with only "l"
+		// (lookup) shows its name and nothing about its contents, as in IMAP LIST-STATUS.
+		readable := mb.AccountID == accountID
+		if !readable {
+			readable, err = s.rdb.CheckMailboxPermissionWithRetry(ctx, mb.ID, accountID, db.ACLRightRead)
+			if err != nil {
+				logger.Warn("HTTP Mail API: Error checking read right", "name", s.name, "mailbox", mb.Name, "error", err)
+				readable = false
+			}
+		}
+		if !readable {
+			mailboxInfos = append(mailboxInfos, info)
+			continue
+		}
+
+		// Get message counts
+		info.Total, err = s.rdb.GetMessageCountForMailboxWithRetry(ctx, accountID, mb.Name)
+		if err != nil {
+			logger.Warn("HTTP Mail API: Error getting message count", "name", s.name, "mailbox", mb.Name, "error", err)
+			info.Total = 0 // Continue with zero count on error
+		}
+
+		info.Unseen, err = s.rdb.GetUnseenCountForMailboxWithRetry(ctx, accountID, mb.Name)
+		if err != nil {
+			logger.Warn("HTTP Mail API: Error getting unseen count", "name", s.name, "mailbox", mb.Name, "error", err)
+			info.Unseen = 0 // Continue with zero count on error
+		}
+
+		info.UIDValidity = mb.UIDValidity
+		if summary, ok := summaries[mb.ID]; ok {
+			info.UIDNext = summary.UIDNext
+		}
+		mailboxInfos = append(mailboxInfos, info)
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
