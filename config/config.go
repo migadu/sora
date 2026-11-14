@@ -1527,6 +1527,14 @@ func NewDefaultConfig() Config {
 			MaxAttempts:   DefaultUploaderMaxAttempts,
 			RetryInterval: "30s",
 		},
+		Cluster: ClusterConfig{
+			// Only read with [cluster] enabled; on by default as documented.
+			RateLimitSync: ClusterRateLimitSyncConfig{
+				Enabled:           true,
+				SyncBlocks:        true,
+				SyncFailureCounts: true,
+			},
+		},
 	}
 }
 
