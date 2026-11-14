@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -230,9 +231,35 @@ func (s *IMAPSession) applyCapabilityFilters() {
 	// Apply capability filtering based on client identification and/or TLS fingerprint
 	disabledCaps := s.server.filterCapabilitiesForClient(caps, s.clientID, s.ja4Fingerprint)
 
+	// A filter matched after the client enabled an extension (an ID sent after
+	// ENABLE IMAP4rev2, say) gives the extension back: "Once enabled using
+	// ENABLE, each extension remains active until the IMAP connection is
+	// closed" (RFC 9051 §6.3.1). For IMAP4rev2 that keeps every extension it
+	// includes (MOVE, UIDPLUS, IDLE, ESEARCH, ...), whose commands the session
+	// would otherwise refuse while go-imap goes on serving IMAP4rev2.
+	var kept []string
+	for c := range s.enabledCaps() {
+		if _, offered := s.server.caps[c]; !offered {
+			continue
+		}
+		if _, ok := caps[c]; !ok {
+			caps[c] = struct{}{}
+			kept = append(kept, string(c))
+		}
+	}
+	if len(kept) > 0 {
+		slices.Sort(kept)
+		disabledCaps = slices.DeleteFunc(disabledCaps, func(name string) bool {
+			return caps.Has(imap.Cap(name))
+		})
+	}
+
 	// Atomic store - safe for concurrent access
 	s.sessionCaps.Store(caps)
 
+	if len(kept) > 0 {
+		s.InfoLog("capability filters partly applied, the connection has enabled what they disable", "kept", kept)
+	}
 	if len(disabledCaps) > 0 {
 		var clientInfo string
 		if s.clientID != nil {
@@ -244,6 +271,20 @@ func (s *IMAPSession) applyCapabilityFilters() {
 		}
 		s.InfoLog("capability filters applied", "client", clientInfo, "disabled", disabledCaps, "enabled", len(caps), "total", originalCapCount)
 	}
+}
+
+// enabledCaps returns the extensions this connection has enabled: those the
+// client named in ENABLE, and IMAP4rev2 on a server that does not offer
+// IMAP4rev1, where go-imap serves every connection IMAP4rev2.
+func (s *IMAPSession) enabledCaps() imap.CapSet {
+	if s.conn == nil {
+		return nil
+	}
+	enabled := s.conn.EnabledCaps()
+	if s.conn.IsIMAP4rev2() {
+		enabled[imap.CapIMAP4rev2] = struct{}{}
+	}
+	return enabled
 }
 
 // pinnedContext returns ctx marked to read from the master DB when the session is
