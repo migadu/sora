@@ -119,6 +119,12 @@ func TestAccountWriteStatusCodes(t *testing.T) {
 		create(t, email)
 		expect(t, "PUT", "/admin/accounts/"+email, adminapi.UpdateAccountRequest{Password: tooLong}, http.StatusBadRequest)
 	})
+
+	t.Run("add credential with a password over 72 bytes is 400", func(t *testing.T) {
+		email := unique("longpw-alias-owner")
+		create(t, email)
+		expect(t, "POST", "/admin/accounts/"+email+"/credentials", adminapi.AddCredentialRequest{Email: unique("longpw-alias"), Password: tooLong}, http.StatusBadRequest)
+	})
 }
 
 // GET /admin/health/servers/{hostname}/components/{component}: 404 only when there is no

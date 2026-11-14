@@ -1162,7 +1162,7 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 
 	err = s.rdb.AddCredentialWithRetry(ctx, addReq)
 	if err != nil {
-		if errors.Is(err, server.ErrInvalidAddress) {
+		if errors.Is(err, server.ErrInvalidAddress) || errors.Is(err, db.ErrInvalidAccountRequest) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
