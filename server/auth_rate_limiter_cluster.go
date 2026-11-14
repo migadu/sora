@@ -294,9 +294,14 @@ func (crl *ClusterRateLimiter) HandleClusterEvent(data []byte) {
 	}
 }
 
-// handleBlockIP applies an IP block from another node
+// handleBlockIP applies an IP block from another node.
+//
+// A block of an address this node exempts from rate limiting is not held, as
+// the local path never blocks it: no check here would refuse the address, so
+// the entry would only list it as blocked (GetBlockedEntries, blocked_ips)
+// while this node lets it through.
 func (crl *ClusterRateLimiter) handleBlockIP(event RateLimitEvent) {
-	if !crl.syncBlocks {
+	if !crl.syncBlocks || crl.limiter.isRateLimitExempt(event.IP) {
 		return
 	}
 
