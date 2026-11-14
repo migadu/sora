@@ -1198,7 +1198,7 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 		// set it arms the SoraConn idle checker, which owns idle enforcement:
 		// it tracks activity in both directions (an in-flight backend->client
 		// response keeps the session alive), emits the idle metric and the
-		// [IN-USE] notice, and closes the connection, which unblocks the read
+		// idle notice, and closes the connection, which unblocks the read
 		// below. Arming this deadline with the same value raced the checker
 		// and could deliver the notice twice, so it is only a stale-connection
 		// backstop well past the knob (the role CopyWithDeadline plays on the
@@ -1253,7 +1253,7 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 				// the client a reason (whole-write atomic, so it cannot
 				// byte-interleave with the backend->client copy).
 				metrics.ConnectionTimeoutsTotal.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "idle").Inc()
-				_, _ = s.clientConn.Write([]byte("-ERR [IN-USE] Idle timeout, please reconnect\r\n"))
+				_, _ = s.clientConn.Write([]byte("-ERR Idle timeout, please reconnect\r\n"))
 				return
 			}
 			if err != io.EOF && !isClosingError(err) {

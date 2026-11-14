@@ -187,8 +187,10 @@ func TestSessionMaxTimeoutSendsError(t *testing.T) {
 		}
 		if strings.HasPrefix(line, "-ERR") && strings.Contains(line, "session duration") {
 			foundError = true
-			if !strings.Contains(line, "[IN-USE]") {
-				t.Errorf("Expected '[IN-USE]' response code in error message, got: %s", line)
+			// No response code: RFC 2449 section 8.1.2 [IN-USE] says the login
+			// succeeded with the maildrop locked, which a timeout is not.
+			if strings.Contains(line, "[") {
+				t.Errorf("Expected no response code in the session timeout notice, got: %s", line)
 			}
 			t.Logf("✓ Received expected error message: %s", strings.TrimSpace(line))
 			break
@@ -207,7 +209,7 @@ func TestSlowThroughputTimeoutInfo(t *testing.T) {
 
 	t.Log("✓ Slow throughput timeout mechanism is implemented")
 	t.Log("  Trigger: Data transfer rate below min_bytes_per_minute after 2 minutes")
-	t.Log("  Message: -ERR [IN-USE] Connection too slow, please reconnect")
+	t.Log("  Message: -ERR Connection too slow, please reconnect")
 	t.Log("  (Full integration test would require >2 minutes to execute)")
 }
 

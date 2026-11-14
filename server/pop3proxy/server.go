@@ -551,18 +551,20 @@ func (s *POP3ProxyServer) connConfig() server.SoraConnConfig {
 		MinBytesPerMinute:    settings.minBytesPerMinute,
 		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0 || settings.minBytesPerMinute > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
-			// Send POP3 error response before closing
-			// RFC 1939 doesn't define specific timeout response codes, but [IN-USE] is commonly used
+			// Best-effort notice before closing. It answers no command and
+			// carries no response code: [IN-USE] says a login succeeded with
+			// the maildrop locked (RFC 2449 section 8.1.2), and no RFC 2449 or
+			// RFC 3206 code describes a timeout.
 			var message string
 			switch reason {
 			case "idle":
-				message = "-ERR [IN-USE] Idle timeout, please reconnect\r\n"
+				message = "-ERR Idle timeout, please reconnect\r\n"
 			case "slow_throughput":
-				message = "-ERR [IN-USE] Connection too slow, please reconnect\r\n"
+				message = "-ERR Connection too slow, please reconnect\r\n"
 			case "session_max":
-				message = "-ERR [IN-USE] Maximum session duration exceeded, please reconnect\r\n"
+				message = "-ERR Maximum session duration exceeded, please reconnect\r\n"
 			default:
-				message = "-ERR [IN-USE] Connection timeout, please reconnect\r\n"
+				message = "-ERR Connection timeout, please reconnect\r\n"
 			}
 			_, _ = fmt.Fprint(conn, message)
 		},
