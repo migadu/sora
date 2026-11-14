@@ -1049,7 +1049,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The old password stops working now, not when a cached login expires.
-	s.forgetAccountLogins(s.trackedAccountID(ctx, email), email)
+	s.forgetAccountLogins(s.trackedAccountIDs(ctx, email), email)
 
 	s.writeJSON(w, http.StatusOK, map[string]string{
 		"message": "Account updated successfully",
@@ -1065,7 +1065,7 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accountID := s.trackedAccountID(ctx, email)
+	accountIDs := s.trackedAccountIDs(ctx, email)
 	err := s.rdb.DeleteAccountWithRetry(ctx, email)
 	if err != nil {
 		if errors.Is(err, server.ErrInvalidAddress) {
@@ -1088,7 +1088,7 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 
 	// A deleted account is signed out everywhere, and cannot sign back in from a
 	// cached login.
-	s.endAccountSessions(accountID, email)
+	s.endAccountSessions(accountIDs, email)
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"email":   email,
@@ -1247,7 +1247,7 @@ func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 	ctx := r.Context()
 
 	// Resolved first: once the credential is gone, the address names no account.
-	accountID := s.trackedAccountID(ctx, email)
+	accountIDs := s.trackedAccountIDs(ctx, email)
 	err := s.rdb.DeleteCredentialWithRetry(ctx, email)
 	if err != nil {
 		if errors.Is(err, server.ErrInvalidAddress) {
@@ -1271,7 +1271,7 @@ func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// The address stops signing in now, not when a cached login expires.
-	s.forgetAccountLogins(accountID, email)
+	s.forgetAccountLogins(accountIDs, email)
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"email":   email,
@@ -1291,54 +1291,75 @@ func (s *Server) trackers() map[string]*server.ConnectionTracker {
 	return s.connectionTrackers()
 }
 
-// trackedAccountID resolves the account an account change applies to, for
-// endAccountSessions and forgetAccountLogins. It is zero when this node has no
-// servers to tell, or when the address names no account.
-func (s *Server) trackedAccountID(ctx context.Context, address string) int64 {
-	if len(s.trackers()) == 0 {
-		return 0
+// sessionAccountIDs returns every account ID the connection trackers can hold the
+// sessions and cached logins of the account address names under. A server that
+// authenticates against the database keys them by the database's account ID. A proxy
+// keys a login remote lookup answered by the ID derived from the address the lookup
+// answered (proxy.DeriveAccountIDFromEmail), even when the database holds the account,
+// and the lookup may answer any address of the account, so the IDs derived from all of
+// them are included. An address the database does not know (a lookup service's own
+// account) has its derived ID only. A failed lookup is an error: the derived ID alone
+// would leave the sessions of a database account open.
+func (s *Server) sessionAccountIDs(ctx context.Context, address string) ([]int64, error) {
+	accountID, addresses, err := s.rdb.GetAccountAddressesWithRetry(ctx, address)
+	if errors.Is(err, consts.ErrUserNotFound) {
+		return []int64{proxy.DeriveAccountIDFromEmail(address)}, nil
 	}
-	accountID, err := s.rdb.GetAccountIDByEmailWithRetry(ctx, address)
 	if err != nil {
-		if !errors.Is(err, consts.ErrUserNotFound) {
-			logger.Warn("HTTP API: Cannot resolve account; its sessions and cached logins are left as they are",
-				"name", s.name, "email", address, "error", err)
-		}
-		return 0
+		return nil, err
 	}
-	return accountID
+	ids := []int64{accountID}
+	for _, a := range addresses {
+		if id := proxy.DeriveAccountIDFromEmail(a); !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
 }
 
-// endAccountSessions closes the account's sessions on this node's servers and,
-// through the trackers that gossip, on their cluster peers. A kick also drops the
-// account's cached logins.
-func (s *Server) endAccountSessions(accountID int64, address string) {
-	if accountID == 0 {
-		return
+// trackedAccountIDs resolves the account an account change applies to, for
+// endAccountSessions and forgetAccountLogins (see sessionAccountIDs). It is empty
+// when this node has no servers to tell, or when the account cannot be resolved.
+func (s *Server) trackedAccountIDs(ctx context.Context, address string) []int64 {
+	if len(s.trackers()) == 0 {
+		return nil
 	}
+	ids, err := s.sessionAccountIDs(ctx, address)
+	if err != nil {
+		logger.Warn("HTTP API: Cannot resolve account; its sessions and cached logins are left as they are",
+			"name", s.name, "email", address, "error", err)
+	}
+	return ids
+}
+
+// endAccountSessions closes the sessions held under the account IDs on this node's
+// servers and, through the trackers that gossip, on their cluster peers. A kick also
+// drops the account's cached logins.
+func (s *Server) endAccountSessions(accountIDs []int64, address string) {
 	for key, tracker := range s.trackers() {
 		if tracker == nil {
 			continue
 		}
-		if err := tracker.KickUser(accountID, key); err != nil {
-			logger.Warn("HTTP API: Error ending sessions", "name", s.name, "email", address, "tracker", key, "error", err)
+		for _, accountID := range accountIDs {
+			if err := tracker.KickUser(accountID, key); err != nil {
+				logger.Warn("HTTP API: Error ending sessions", "name", s.name, "email", address, "tracker", key, "error", err)
+			}
 		}
 	}
 }
 
-// forgetAccountLogins drops the account's cached logins on this node's servers
-// and, through the trackers that gossip, on their cluster peers, so that its next
-// login is checked against the database. Its sessions are left alone.
-func (s *Server) forgetAccountLogins(accountID int64, address string) {
-	if accountID == 0 {
-		return
-	}
+// forgetAccountLogins drops the cached logins held under the account IDs on this
+// node's servers and, through the trackers that gossip, on their cluster peers, so
+// that the account's next login is checked afresh. Its sessions are left alone.
+func (s *Server) forgetAccountLogins(accountIDs []int64, address string) {
 	for key, tracker := range s.trackers() {
 		if tracker == nil {
 			continue
 		}
-		if err := tracker.ForgetLogins(accountID, address); err != nil {
-			logger.Warn("HTTP API: Error dropping cached logins", "name", s.name, "email", address, "tracker", key, "error", err)
+		for _, accountID := range accountIDs {
+			if err := tracker.ForgetLogins(accountID, address); err != nil {
+				logger.Warn("HTTP API: Error dropping cached logins", "name", s.name, "email", address, "tracker", key, "error", err)
+			}
 		}
 	}
 }
@@ -1431,19 +1452,9 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// Require user email for gossip-based kick
-	if req.UserEmail == "" {
+	if strings.TrimSpace(req.UserEmail) == "" {
 		s.writeError(w, http.StatusBadRequest, "user_email is required for kick operation")
 		return
-	}
-
-	// Get account ID from email
-	// Try database first (for local accounts)
-	accountID, err := s.rdb.GetAccountIDByEmailWithRetry(ctx, req.UserEmail)
-	if err != nil {
-		// User not found in database - could be a remotelookup account
-		// Derive accountID from email (same logic as remotelookup)
-		accountID = proxy.DeriveAccountIDFromEmail(req.UserEmail)
-		logger.Info("HTTP API: User not in database, using derived accountID for kick", "name", s.name, "email", req.UserEmail, "derived_account_id", accountID)
 	}
 
 	trackers := s.trackers()
@@ -1494,6 +1505,15 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Every ID the account's sessions can be held under: the database account ID and the
+	// IDs a proxy derives for remote lookup logins.
+	accountIDs, err := s.sessionAccountIDs(ctx, req.UserEmail)
+	if err != nil {
+		logger.Warn("HTTP API: Cannot resolve account to kick", "name", s.name, "email", req.UserEmail, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "Failed to resolve account")
+		return
+	}
+
 	// Kick user on all matching trackers
 	kickedProtocols := []string{}
 	for _, item := range trackersToKick {
@@ -1502,13 +1522,19 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if err := item.tracker.KickUser(accountID, item.key); err != nil {
-			logger.Warn("HTTP API: Error kicking user on tracker", "name", s.name, "email", req.UserEmail, "tracker", item.key, "error", err)
+		kicked := true
+		for _, accountID := range accountIDs {
+			if err := item.tracker.KickUser(accountID, item.key); err != nil {
+				logger.Warn("HTTP API: Error kicking user on tracker", "name", s.name, "email", req.UserEmail, "account_id", accountID, "tracker", item.key, "error", err)
+				kicked = false
+			}
+		}
+		if !kicked {
 			continue
 		}
 
 		kickedProtocols = append(kickedProtocols, item.key)
-		logger.Info("HTTP API: Kicked user on tracker", "name", s.name, "email", req.UserEmail, "account_id", accountID, "tracker", item.key)
+		logger.Info("HTTP API: Kicked user on tracker", "name", s.name, "email", req.UserEmail, "account_ids", accountIDs, "tracker", item.key)
 	}
 
 	if len(kickedProtocols) == 0 {
