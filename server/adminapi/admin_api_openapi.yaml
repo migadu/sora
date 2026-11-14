@@ -1479,7 +1479,7 @@ paths:
                         Size: 2048
                     total: 2
         '400':
-          description: Invalid request parameters.
+          description: Invalid request parameters, or the address does not parse.
           content:
             application/json:
               schema:
@@ -1566,7 +1566,7 @@ paths:
                     restored: 5
                     message: "Successfully restored 5 messages"
         '400':
-          description: Invalid request. No restoration criteria provided or invalid parameters.
+          description: Invalid request. No restoration criteria provided, invalid parameters, or the address does not parse.
           content:
             application/json:
               schema:
@@ -1700,7 +1700,7 @@ paths:
             - Missing required field `email`
             - Neither `password` nor `password_hash` provided  
             - Both `password` and `password_hash` provided (only one allowed)
-            - `email` does not parse as an address
+            - Path `email` or body `email` does not parse as an address
             - A `password_hash` sora cannot verify (no or an unsupported scheme, data that does not decode or has the wrong length)
           content:
             application/json:
@@ -1759,6 +1759,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CredentialDetails'
+        '400':
+          description: The address does not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Credential not found.
           content:
@@ -1917,7 +1923,7 @@ paths:
                     type: string
                     example: "Kick event broadcast to cluster. Connections will be terminated within seconds."
         '400':
-          description: The body is not JSON, or user_email is missing or blank.
+          description: The body is not JSON, or user_email is missing, blank, or does not parse as an address.
           content:
             application/json:
               schema:
@@ -1978,6 +1984,12 @@ paths:
                   note:
                     type: string
                     description: Present, with no entries, when this node has no connection trackers.
+        '400':
+          description: The address does not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error.
           content:
