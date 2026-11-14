@@ -895,6 +895,26 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		return nil
 	}
 
+	// Store every requested copy before any redirect is handed to the relay. A
+	// temporary storage failure makes the sender retry the whole delivery.
+	// A single redirect without :copy has no copy to wait for: relay it before
+	// staging, and stage an INBOX fallback only if handoff fails. Multiple targets
+	// still stage first: a partial handoff followed by a staging failure would
+	// otherwise requeue the accepted targets on the sender's retry.
+	destinations := result.Destinations(false)
+	relayAfterStore := len(destinations) > 0 && len(result.RedirectTo) > 0
+	// RedirectTo contains unique targets (SieveExecutor.Evaluate removes repeats).
+	relayAfterStaging := len(destinations) == 0 && len(result.RedirectTo) > 1
+	if len(destinations) == 0 && len(result.RedirectTo) == 1 && !s.relayRedirects(ctx, result, messageContent, fullMessageBytes) {
+		// Redirect-only delivery needs an INBOX fallback when handoff fails.
+		destinations = result.Destinations(true)
+	}
+	if len(destinations) == 0 && !relayAfterStaging {
+		s.DebugLog("redirect without :copy - skipping local delivery")
+		recordMetrics("success")
+		return nil
+	}
+
 	// Store message locally for background upload to S3
 	// This happens AFTER Sieve processing and header edits, so we store the modified message
 	// Check if file already exists to prevent race condition:
@@ -935,6 +955,14 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		// Stat error (permission issue, etc.)
 		recordMetrics("failure")
 		return s.InternalError("failed to check file existence: %v", err)
+	}
+
+	if relayAfterStaging {
+		if s.relayRedirects(ctx, result, messageContent, fullMessageBytes) {
+			recordMetrics("success")
+			return nil
+		}
+		destinations = result.Destinations(true)
 	}
 
 	s.InfoLog("executing sieve action", "action", result.Action)
@@ -979,26 +1007,8 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		return flags
 	}
 
-	// Store every requested copy before any redirect is handed to the relay. A
-	// temporary storage failure makes the sender retry the whole delivery.
-	destinations := result.Destinations(false)
-	relayAfterStore := len(destinations) > 0 && len(result.RedirectTo) > 0
-	if len(destinations) == 0 && len(result.RedirectTo) > 0 {
-		if s.relayRedirects(ctx, result, messageContent, fullMessageBytes) {
-			recordMetrics("success")
-			return nil
-		}
-		// Redirect-only delivery needs an INBOX fallback when handoff fails.
-		destinations = result.Destinations(true)
-	}
-
 	// Store one copy in every fileinto target, and in INBOX when the message is kept
 	// (or a failed redirect left it stored nowhere).
-	if len(destinations) == 0 {
-		s.DebugLog("redirect without :copy - skipping local delivery")
-		recordMetrics("success")
-		return nil
-	}
 	if result.Action == sieveengine.ActionKeep {
 		s.DebugLog("sieve keep action")
 	}

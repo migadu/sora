@@ -79,17 +79,39 @@
 //	}
 //	`
 //
-//	env := sieveengine.NewEnv(AccountID, messageData)
-//	result, err := sieveengine.Execute(script, env)
+//	compiled, err := sieveengine.CompileScript(script, sieveengine.DefaultSieveExtensions)
 //	if err != nil {
-//		// Script error
+//		// Script does not compile: keep the message
+//	}
+//	executor := compiled.NewExecutor(accountID, vacationOracle, redirectOracle, rateLimit, rateWindow, maxHops)
+//	result, err := executor.Evaluate(ctx, sieveengine.Context{ /* envelope, header, message */ })
+//	if err != nil {
+//		// Script error: implicit keep (RFC 5228 §2.10.6)
 //	}
 //
-//	// Apply result actions: relay every redirect, then store every copy
-//	for _, addr := range result.RedirectTo {
-//		relay(addr)
+//	// Apply result actions: store every copy, then relay every redirect. A store
+//	// that fails is retried by the sender, and a redirect relayed before it would
+//	// go out again on every retry. With no copy to store (a redirect without
+//	// :copy), a single target can be relayed before staging. Multiple targets
+//	// must be staged first: partial handoff followed by a staging failure would
+//	// send the accepted targets another copy on retry. Keep an INBOX fallback
+//	// only if a redirect failed.
+//	dests := result.Destinations(false)
+//	relayAfterStore := len(dests) > 0
+//	if !relayAfterStore && len(result.RedirectTo) > 1 {
+//		if err := stageMessage(); err != nil {
+//			return err // stop before any relay handoff
+//		}
 //	}
-//	for _, dest := range result.Destinations(false) {
-//		deliverToMailbox(dest.Mailbox, dest.Flags)
+//	if !relayAfterStore && !relay(result.RedirectTo) {
+//		dests = result.Destinations(true)
+//	}
+//	for _, dest := range dests {
+//		if err := deliverToMailbox(dest.Mailbox, dest.Flags); err != nil {
+//			return err // stop before any relay handoff
+//		}
+//	}
+//	if relayAfterStore {
+//		relay(result.RedirectTo)
 //	}
 package sieveengine

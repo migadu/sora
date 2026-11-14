@@ -470,12 +470,20 @@ func (rd *ResilientDatabase) GetDatabase() *db.Database {
 }
 
 // PingReadPools pings, on every read host, the pool reads are served from: each
-// replica's, or the write hosts' while reads use them. The error names every host that
-// failed.
+// replica's, or the write hosts' while reads use them. A replica that has not connected
+// since startup is not in the read pools yet; it fails the check as it would had it gone
+// down later. The error names every host that failed.
 func (rd *ResilientDatabase) PingReadPools(ctx context.Context) error {
-	rd.failoverManager.mu.RLock()
-	pools := append([]*DatabasePool(nil), rd.failoverManager.readPools...)
-	rd.failoverManager.mu.RUnlock()
+	fm := rd.failoverManager
+	fm.mu.RLock()
+	pools := append([]*DatabasePool(nil), fm.readPools...)
+	var unconnected []error
+	for _, f := range fm.failedHosts {
+		if f.poolType == "read" {
+			unconnected = append(unconnected, fmt.Errorf("read replica %s: not connected since startup, reconnecting in the background", f.host))
+		}
+	}
+	fm.mu.RUnlock()
 
 	errs := make([]error, len(pools))
 	var wg sync.WaitGroup
@@ -489,7 +497,7 @@ func (rd *ResilientDatabase) PingReadPools(ctx context.Context) error {
 		}()
 	}
 	wg.Wait()
-	return errors.Join(errs...)
+	return errors.Join(append(errs, unconnected...)...)
 }
 
 // GetQueryTimeout returns the configured query timeout for read operations
