@@ -34,9 +34,36 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, `{"error": "bad request"}`, http.StatusBadRequest)
 			},
-			expectAuthResult: AuthFailed,
-			expectErrorType:  nil,
-			description:      "4xx errors (except 401/403/404) should be treated as auth failed (client error, not service failure)",
+			expectAuthResult: AuthTemporarilyUnavailable,
+			expectErrorType:  ErrRemoteLookupTransient,
+			description:      "4xx errors (except 401/403/404) say nothing about the credentials: service unavailable, as the lookup contract documents",
+		},
+		{
+			name: "408_RequestTimeout",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, `{"error": "request timeout"}`, http.StatusRequestTimeout)
+			},
+			expectAuthResult: AuthTemporarilyUnavailable,
+			expectErrorType:  ErrRemoteLookupTransient,
+			description:      "408 (RFC 9110 section 15.5.9) is the lookup service timing out, not a wrong password",
+		},
+		{
+			name: "429_TooManyRequests",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, `{"error": "slow down"}`, http.StatusTooManyRequests)
+			},
+			expectAuthResult: AuthTemporarilyUnavailable,
+			expectErrorType:  ErrRemoteLookupTransient,
+			description:      "429 (RFC 6585 section 4) is the lookup service rate-limiting this proxy, not a wrong password",
+		},
+		{
+			name: "422_UnprocessableContent",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, `{"error": "unprocessable"}`, http.StatusUnprocessableEntity)
+			},
+			expectAuthResult: AuthTemporarilyUnavailable,
+			expectErrorType:  ErrRemoteLookupTransient,
+			description:      "4xx errors (except 401/403/404) say nothing about the credentials: service unavailable, as the lookup contract documents",
 		},
 		{
 			name: "500_ServerError",
@@ -62,9 +89,9 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 				w.Write([]byte("this is not json"))
 			},
-			expectAuthResult: AuthFailed,
+			expectAuthResult: AuthTemporarilyUnavailable,
 			expectErrorType:  ErrRemoteLookupInvalidResponse,
-			description:      "200 with invalid JSON should return ErrRemoteLookupInvalidResponse",
+			description:      "200 with invalid JSON (e.g. a maintenance page) is a broken lookup service: temporary, ErrRemoteLookupInvalidResponse",
 		},
 		{
 			name: "200_MissingAddress",
@@ -76,7 +103,7 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 					// address is missing (required)
 				})
 			},
-			expectAuthResult: AuthFailed,
+			expectAuthResult: AuthTemporarilyUnavailable,
 			expectErrorType:  ErrRemoteLookupInvalidResponse,
 			description:      "200 with missing address should return ErrRemoteLookupInvalidResponse",
 		},
@@ -90,7 +117,7 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 					"server":        "backend:143",
 				})
 			},
-			expectAuthResult: AuthFailed,
+			expectAuthResult: AuthTemporarilyUnavailable,
 			expectErrorType:  ErrRemoteLookupInvalidResponse,
 			description:      "200 with empty address should return ErrRemoteLookupInvalidResponse",
 		},
@@ -104,7 +131,7 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 					// password_hash is missing
 				})
 			},
-			expectAuthResult: AuthFailed,
+			expectAuthResult: AuthTemporarilyUnavailable,
 			expectErrorType:  ErrRemoteLookupInvalidResponse,
 			description:      "200 with missing password_hash should return ErrRemoteLookupInvalidResponse",
 		},
@@ -118,7 +145,7 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 					"server":        "backend:143",
 				})
 			},
-			expectAuthResult: AuthFailed,
+			expectAuthResult: AuthTemporarilyUnavailable,
 			expectErrorType:  ErrRemoteLookupInvalidResponse,
 			description:      "200 with empty password_hash should return ErrRemoteLookupInvalidResponse",
 		},
@@ -192,7 +219,13 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 				} else if !errors.Is(err, tt.expectErrorType) {
 					t.Errorf("%s: expected error type %v, got %v", tt.description, tt.expectErrorType, err)
 				}
-			} else if tt.expectAuthResult == AuthUserNotFound {
+			}
+			// The proxies branch on the error, not on the result: a temporary answer
+			// without ErrRemoteLookupTransient is handled by the session as something else.
+			if tt.expectAuthResult == AuthTemporarilyUnavailable && !errors.Is(err, ErrRemoteLookupTransient) {
+				t.Errorf("%s: temporary answer without ErrRemoteLookupTransient: %v", tt.description, err)
+			}
+			if tt.expectErrorType == nil && tt.expectAuthResult == AuthUserNotFound {
 				// For user not found cases, routingInfo should be nil and no error
 				if routingInfo != nil {
 					t.Errorf("%s: expected nil routing info for user not found, got %+v", tt.description, routingInfo)

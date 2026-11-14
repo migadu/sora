@@ -40,12 +40,12 @@ func TestReconnectedReplicaMakesReadPoolsDistinct(t *testing.T) {
 	}
 
 	// The replica comes back.
-	for _, f := range manager.failedReplicas {
+	for _, f := range manager.failedHosts {
 		f.host = "localhost"
 		f.lastAttempt = time.Now().Add(-time.Hour)
 	}
 	rd := &ResilientDatabase{failoverManager: manager, config: cfg}
-	rd.attemptReconnectFailedReplicas(ctx)
+	rd.attemptReconnectFailedHosts(ctx)
 
 	if !manager.readPoolsAreDistinct() {
 		t.Fatalf("reads moved to the reconnected replica, but the read pools are still taken for the write pools "+
