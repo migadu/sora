@@ -705,13 +705,25 @@ var (
 // header's first name or address, or of any other one in its extra_addresses section.
 // header is "from", "to" or "cc"; prefix as for headerSubstringCond. A NULL column (see
 // anyOf) does not match, so NOT FROM/TO/CC keeps rows written before those columns existed.
+//
+// Each column is read through NULLIF, which turns an empty column into NULL: an empty
+// column holds no name or address of the header, yet the empty string is a substring of
+// it, so strpos() matched it with an empty term. The empty term is how a client tests for
+// the header (RFC 9051 §6.4.4: a zero-length string "matches all messages that have a
+// header field with the specified field-name"), so it must match a message with at least
+// one name or address in the header and nothing else. A non-empty term never matched an
+// empty column anyway. NULLIF reads no other column, so the predicate stays covered by
+// idx_messages_mailbox_headers_v2.
 func addressHeaderCond(prefix, header, placeholder string) string {
+	nonEmpty := func(expr string) string {
+		return substringCond(fmt.Sprintf("NULLIF(%s, '')", expr), placeholder)
+	}
 	var conds []string
 	for _, col := range addressHeaderSortColumns[header] {
-		conds = append(conds, substringCond(prefix+col, placeholder))
+		conds = append(conds, nonEmpty(prefix+col))
 	}
 	section := fmt.Sprintf(`split_part(%sextra_addresses, E'\n', %d)`, prefix, addressHeaderSection[header])
-	conds = append(conds, substringCond(section, placeholder))
+	conds = append(conds, nonEmpty(section))
 	return anyOf(conds)
 }
 
