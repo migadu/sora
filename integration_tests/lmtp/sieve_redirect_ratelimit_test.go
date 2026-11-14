@@ -25,12 +25,13 @@ type captureRelayQueue struct {
 
 type relayItem struct {
 	from, to, msgType string
+	body              []byte
 }
 
 func (q *captureRelayQueue) Enqueue(from, to, messageType string, messageBytes []byte) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.enqueued = append(q.enqueued, relayItem{from: from, to: to, msgType: messageType})
+	q.enqueued = append(q.enqueued, relayItem{from: from, to: to, msgType: messageType, body: messageBytes})
 	return nil
 }
 
