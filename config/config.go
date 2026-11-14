@@ -2468,6 +2468,13 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
+	// A disabled lookup is never initialized, so its remote_port is never used.
+	if s.RemoteLookup != nil && s.RemoteLookup.Enabled {
+		if _, err := s.RemoteLookup.GetRemotePort(); err != nil {
+			return fmt.Errorf("server %q: invalid remote_lookup.remote_port: %w", s.Name, err)
+		}
+	}
+
 	if s.Type == "metrics" {
 		if s.Path != "" && !strings.HasPrefix(s.Path, "/") {
 			return fmt.Errorf("server %q: metrics path %q must begin with '/'", s.Name, s.Path)
