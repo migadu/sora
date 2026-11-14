@@ -1144,7 +1144,7 @@ node.
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `latest` | `false` | `true`: the latest record of each instance, and the other parameters are ignored. |
+| `latest` | `false` | `true`: the latest record of each `instance_id` and `server_hostname` pair, and the other parameters are ignored. |
 | `instance_id` | all | Only this instance. |
 | `since` | 24 hours ago | RFC 3339 only. |
 | `limit` | `100` | Most records. A value that is not a positive number means 100. |

@@ -2593,7 +2593,7 @@ paths:
           in: query
           schema:
             type: boolean
-          description: "If true, returns only the latest metric record for each instance, and the other parameters are ignored."
+          description: "If true, returns only the latest metric record for each instance_id and server_hostname pair, and the other parameters are ignored."
         - name: instance_id
           in: query
           schema:
