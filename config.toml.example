@@ -983,7 +983,10 @@ listen_backlog = 4096               # TCP listen backlog size (0 = default 1024)
                               # Small backlog causes SYN queue to fill, leading to ~60s connection delays.
 
 # --- IMAP-SPECIFIC CONFIGURATION ---
-append_limit = "25mb"         # Maximum message size for IMAP APPEND. Empty = no limit.
+append_limit = "25mb"         # Maximum message size for IMAP APPEND, advertised as APPENDLIMIT.
+                              # Empty or "0" = the 25mb default. IMAP carries the limit as a 32-bit
+                              # number, so a value above 4294967295 bytes (4 GiB - 1) is clamped
+                              # to it, with a warning at startup.
 
 # --- MASTER USER AUTHENTICATION ---
 master_username = ""          # Master username for administrative IMAP access (e.g., for proxies).
