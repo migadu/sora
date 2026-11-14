@@ -17,13 +17,36 @@ func RemoteLookupUsesClientIP(cfg *config.RemoteLookupConfig) bool {
 	return cfg != nil && cfg.Enabled && strings.Contains(cfg.URL, "$ip")
 }
 
-// validateRemoteLookupURL requires https:// for non-loopback hosts. A plaintext
-// remote-lookup endpoint exposes the user's password and the returned password hash
-// to an on-path attacker, who can also forge the backend-routing response.
+// validateRemoteLookupURL checks that the template yields a request URL for every
+// lookup, and requires https:// for non-loopback hosts. A plaintext remote-lookup
+// endpoint exposes the user's password and the returned password hash to an on-path
+// attacker, who can also forge the backend-routing response.
+//
+// The template itself parsing is not enough: the client substitutes $email and $ip
+// with url.QueryEscape, so in the host they become %40 or %3A, which net/url refuses,
+// and every lookup would fail before a request is sent. Placeholders therefore belong
+// in the path and query, and sample request URLs are built the way the client builds
+// them (an IPv4, an IPv6 and no client IP) and parsed.
 func validateRemoteLookupURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("invalid remotelookup.url: %w", err)
+		return fmt.Errorf("invalid remotelookup.url: %w", config.MaskURLError(err))
+	}
+	if u.Hostname() == "" {
+		return fmt.Errorf("invalid remotelookup.url: no host")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("invalid remotelookup.url: scheme must be http or https (got %q)", u.Scheme)
+	}
+	for _, placeholder := range []string{"$email", "$ip"} {
+		if strings.Contains(u.Host, placeholder) {
+			return fmt.Errorf("invalid remotelookup.url: %s is allowed only in the path and query, not in the host %q", placeholder, u.Host)
+		}
+	}
+	for _, clientIP := range []string{"192.0.2.1", "2001:db8::1", ""} {
+		if _, err := url.Parse(remoteLookupRequestURL(rawURL, "user@example.com", clientIP, false)); err != nil {
+			return fmt.Errorf("invalid remotelookup.url: lookup requests cannot be built: %w", config.MaskURLError(err))
+		}
 	}
 	if u.Scheme == "https" {
 		return nil
@@ -102,7 +125,7 @@ func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig, ser
 	}
 
 	hasAuth := cfg.AuthToken != ""
-	logger.Debug("RemoteLookup: Initializing HTTP remotelookup (NO caching)", "url", cfg.URL, "timeout", timeout, "remote_port", remotePort, "auth_enabled", hasAuth)
+	logger.Debug("RemoteLookup: Initializing HTTP remotelookup (NO caching)", "url", config.MaskEndpointURL(cfg.URL), "timeout", timeout, "remote_port", remotePort, "auth_enabled", hasAuth)
 
 	// Parse circuit breaker settings
 	var cbSettings *CircuitBreakerSettings

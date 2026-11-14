@@ -191,6 +191,10 @@ type UploadWorker struct {
 
 	maxStagingSize     int64
 	currentStagingSize int64 // Atomic tracker for this instance's own staging backlog (max_staging_size)
+	// stagingPathLocks serializes per-path stat + rename/remove + currentStagingSize
+	// accounting so concurrent stagings and removals of the same body cannot drift
+	// currentStagingSize, while keeping temp-file writes and fsyncs parallel outside it.
+	stagingPathLocks [stagingPathLockStripes]sync.Mutex
 	// lastStallReport is when the current stall episode was last reported, in Unix
 	// nanoseconds; 0 means no episode is in progress. Atomic, like currentStagingSize.
 	lastStallReport int64
@@ -202,6 +206,24 @@ type UploadWorker struct {
 	backoffMu       sync.Mutex
 	backoffUntil    time.Time
 	backoffFailures int
+}
+
+const stagingPathLockStripes = 64
+
+// stagingPathLock returns the striped mutex guarding path's on-disk replacement/removal
+// and its matching currentStagingSize delta.
+func (w *UploadWorker) stagingPathLock(path string) *sync.Mutex {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	clean := filepath.Clean(path)
+	var h uint64 = offset64
+	for i := 0; i < len(clean); i++ {
+		h ^= uint64(clean[i])
+		h *= prime64
+	}
+	return &w.stagingPathLocks[h%stagingPathLockStripes]
 }
 
 // uploadOutcome classifies what one lease of a pending upload achieved.
@@ -824,7 +846,19 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	// Move the uploaded file to the global cache (if a cache is configured).
 	// If the move fails, or no cache is present, delete the local file.
 	if w.cache != nil {
-		if err := w.cache.MoveIn(filePath, upload.ContentHash); err != nil {
+		pathMu := w.stagingPathLock(filePath)
+		pathMu.Lock()
+		size := fileSize(filePath)
+		err := w.cache.MoveIn(filePath, upload.ContentHash)
+		if err == nil {
+			w.addStagingSize(-size)
+		} else if size > 0 {
+			if _, statErr := os.Stat(filePath); os.IsNotExist(statErr) {
+				w.addStagingSize(-size)
+			}
+		}
+		pathMu.Unlock()
+		if err != nil {
 			if errors.Is(err, cache.ErrObjectTooLarge) {
 				logger.Debug("Uploader: Uploaded hash is too large for the cache - deleting local file", "hash", upload.ContentHash, "size", upload.Size)
 			} else {
@@ -834,7 +868,6 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 				// Log is inside RemoveLocalFile
 			}
 		} else {
-			w.addStagingSize(-upload.Size)
 			logger.Info("Uploader: Moved hash to cache after upload", "hash", upload.ContentHash)
 		}
 	} else {
@@ -1120,10 +1153,6 @@ func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []
 		return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
-	// Bytes already accounted for at this path: an overwrite replaces them rather
-	// than adding to the spool.
-	previousSize := fileSize(path)
-
 	// Write to a temporary name, fsync, then rename into place. The final path is
 	// only ever a complete, durable file: a crash mid-write leaves a stray .tmp that
 	// nobody reads (and the orphan sweep removes), never a truncated body that a later
@@ -1156,9 +1185,21 @@ func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []
 		os.Remove(tmpPath)
 		return nil, fmt.Errorf("failed to close file %s: %w", tmpPath, err)
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+
+	// Bytes already accounted for at this path are sampled under the per-path lock
+	// right around the rename so concurrent stagings of the same body replace rather
+	// than multiply the counted size, while temp-file I/O and fsyncs run in parallel.
+	pathMu := w.stagingPathLock(path)
+	pathMu.Lock()
+	previousSize := fileSize(path)
+	renameErr := os.Rename(tmpPath, path)
+	if renameErr == nil {
+		w.addStagingSize(int64(len(data)) - previousSize)
+	}
+	pathMu.Unlock()
+	if renameErr != nil {
 		os.Remove(tmpPath)
-		return nil, fmt.Errorf("failed to move %s into place: %w", tmpPath, err)
+		return nil, fmt.Errorf("failed to move %s into place: %w", tmpPath, renameErr)
 	}
 
 	// Fsync the parent directory to ensure the directory entry is durable.
@@ -1166,8 +1207,6 @@ func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []
 		logger.Warn("Uploader: Failed to fsync directory (non-fatal)", "dir", dir, "error", err)
 		// Non-fatal: the file data is already synced, directory entry may survive without this
 	}
-
-	w.addStagingSize(int64(len(data)) - previousSize)
 
 	return &path, nil
 }
@@ -1230,11 +1269,16 @@ func (w *UploadWorker) isTransientS3Error(err error) bool {
 // when empty: a delivery may have just created it and be about to stage into it (see
 // StoreLocally).
 func (w *UploadWorker) RemoveLocalFile(path string) error {
+	pathMu := w.stagingPathLock(path)
+	pathMu.Lock()
 	size := fileSize(path)
-	if err := os.Remove(path); err != nil {
-		logger.Warn("Uploader: Uploaded but could not delete file", "path", path, "error", err)
-	} else {
+	err := os.Remove(path)
+	if err == nil {
 		w.addStagingSize(-size)
+	}
+	pathMu.Unlock()
+	if err != nil {
+		logger.Warn("Uploader: Uploaded but could not delete file", "path", path, "error", err)
 	}
 	return nil
 }
@@ -1356,10 +1400,14 @@ func (w *UploadWorker) addStagingSize(delta int64) {
 	if delta == 0 {
 		return
 	}
-	if size := atomic.AddInt64(&w.currentStagingSize, delta); size < 0 {
+	for {
+		cur := atomic.LoadInt64(&w.currentStagingSize)
 		// Removing files this process never counted - orphans left by a previous run -
-		// can drive the running total below zero.
-		atomic.CompareAndSwapInt64(&w.currentStagingSize, size, 0)
+		// must clamp at zero rather than driving the running total below zero.
+		next := max(cur+delta, 0)
+		if atomic.CompareAndSwapInt64(&w.currentStagingSize, cur, next) {
+			return
+		}
 	}
 }
 
@@ -1440,14 +1488,32 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 				if _, stillQueued := existing[file.contentHash]; stillQueued {
 					continue
 				}
-				if removeErr := os.Remove(file.path); removeErr != nil {
+				pathMu := w.stagingPathLock(file.path)
+				pathMu.Lock()
+				// A delivery may have replaced this old candidate while the lookup
+				// was in flight, before its new pending row committed. Recheck the
+				// grace period under the same lock as staging and removal.
+				info, statErr := os.Stat(file.path)
+				if statErr != nil || info.ModTime().After(cutoffTime) {
+					pathMu.Unlock()
+					if statErr != nil && !os.IsNotExist(statErr) {
+						logger.Warn("UploaderCleanup: Failed to stat orphan candidate", "path", file.path, "error", statErr)
+					}
+					continue
+				}
+				size := info.Size()
+				removeErr := os.Remove(file.path)
+				if removeErr == nil {
+					w.addStagingSize(-size)
+				}
+				pathMu.Unlock()
+				if removeErr != nil {
 					logger.Warn("UploaderCleanup: Failed to remove orphaned file", "path", file.path, "error", removeErr)
 					continue
 				}
 				filesRemoved++
-				totalSize += file.size
-				w.addStagingSize(-file.size)
-				logger.Info("UploaderCleanup: Removed orphaned file", "hash", file.contentHash, "account_id", accountID, "size", file.size)
+				totalSize += size
+				logger.Info("UploaderCleanup: Removed orphaned file", "hash", file.contentHash, "account_id", accountID, "size", size)
 			}
 		}
 	}
@@ -1511,13 +1577,14 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 		// Validate content hash
 		if !isValidContentHash(contentHash) {
 			logger.Warn("UploaderCleanup: Invalid content hash in path", "path", path)
-			// Remove invalid files
+			// Remove invalid files (such as <hash>.<16hex>.tmp crash leftovers).
+			// Do not subtract info.Size() from currentStagingSize: non-content-hash
+			// files were never staged into place or counted in currentStagingSize.
 			if removeErr := os.Remove(path); removeErr != nil {
 				logger.Warn("UploaderCleanup: Failed to remove invalid file", "path", path, "error", removeErr)
 			} else {
 				filesRemoved++
 				totalSize += info.Size()
-				w.addStagingSize(-info.Size())
 				logger.Info("UploaderCleanup: Removed invalid file", "path", path)
 			}
 			return nil

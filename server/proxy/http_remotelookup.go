@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
@@ -269,28 +270,14 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 
 	// Execute HTTP request through circuit breaker (NO caching - handled at ConnectionManager level)
 	result, err := c.breaker.Execute(func() (any, error) {
-		// Build request URL by interpolating placeholders:
-		// - $email: user email (MasterAddress - includes master token but not +detail)
-		// - $ip: client IP address; empty when the caller has none, never the literal placeholder
-		requestURL := strings.ReplaceAll(c.baseURL, "$email", url.QueryEscape(lookupEmail))
-		requestURL = strings.ReplaceAll(requestURL, "$ip", url.QueryEscape(clientIP))
+		requestURL := remoteLookupRequestURL(c.baseURL, lookupEmail, clientIP, routeOnly)
 
-		// Add route_only parameter if requested (for master username authentication)
-		if routeOnly {
-			// Check if URL already has query parameters
-			if strings.Contains(requestURL, "?") {
-				requestURL += "&route_only=true"
-			} else {
-				requestURL += "?route_only=true"
-			}
-		}
-
-		logger.Debug("remotelookup: Requesting lookup", "user", lookupEmail, "client_ip", clientIP, "url", requestURL, "route_only", routeOnly)
+		logger.Debug("remotelookup: Requesting lookup", "user", lookupEmail, "client_ip", clientIP, "url", config.MaskEndpointURL(requestURL), "route_only", routeOnly)
 
 		// Make HTTP request
 		req, err := http.NewRequestWithContext(ctx, "GET", requestURL, nil)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
+			return nil, fmt.Errorf("failed to create request: %w", config.MaskURLError(err))
 		}
 
 		// Add Bearer token authentication if configured
@@ -310,7 +297,7 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 				return nil, fmt.Errorf("%w: %w", ErrRemoteLookupTransient, server.ErrServerShuttingDown)
 			}
 			// Network error or timeout - this is transient
-			return nil, fmt.Errorf("%w: HTTP request failed: %v", ErrRemoteLookupTransient, err)
+			return nil, fmt.Errorf("%w: HTTP request failed: %v", ErrRemoteLookupTransient, config.MaskURLError(err))
 		}
 		defer drainAndClose(resp)
 
@@ -422,12 +409,12 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 	// Handle circuit breaker errors
 	if err != nil {
 		if err == circuitbreaker.ErrCircuitBreakerOpen {
-			logger.Warn("remotelookup: Circuit breaker is open", "url", c.baseURL)
+			logger.Warn("remotelookup: Circuit breaker is open", "url", config.MaskEndpointURL(c.baseURL))
 			// Circuit breaker open is a transient error - return temporarily unavailable
 			return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: circuit breaker open: too many failures", ErrRemoteLookupTransient)
 		}
 		if err == circuitbreaker.ErrTooManyRequests {
-			logger.Warn("remotelookup: Circuit breaker is half-open - rate limiting requests", "url", c.baseURL)
+			logger.Warn("remotelookup: Circuit breaker is half-open - rate limiting requests", "url", config.MaskEndpointURL(c.baseURL))
 			// Too many requests in half-open state is also a transient error - return temporarily unavailable
 			return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: circuit breaker half-open: too many concurrent requests", ErrRemoteLookupTransient)
 		}
@@ -585,13 +572,41 @@ func DeriveAccountIDFromEmail(email string) int64 {
 	return id
 }
 
+// remoteLookupRequestURL builds a lookup request URL from the configured template by
+// interpolating its placeholders:
+//   - $email: user email (MasterAddress - includes master token but not +detail)
+//   - $ip: client IP address; empty when the caller has none, never the literal placeholder
+//
+// validateRemoteLookupURL checks the template through this same function.
+func remoteLookupRequestURL(template, email, clientIP string, routeOnly bool) string {
+	requestURL := strings.ReplaceAll(template, "$email", url.QueryEscape(email))
+	requestURL = strings.ReplaceAll(requestURL, "$ip", url.QueryEscape(clientIP))
+
+	// Add route_only parameter if requested (for master username authentication)
+	if routeOnly {
+		// A fragment is not sent to the server, so append to the query before it.
+		request, fragment, hasFragment := strings.Cut(requestURL, "#")
+		// Check if URL already has query parameters
+		if strings.Contains(request, "?") {
+			request += "&route_only=true"
+		} else {
+			request += "?route_only=true"
+		}
+		requestURL = request
+		if hasFragment {
+			requestURL += "#" + fragment
+		}
+	}
+	return requestURL
+}
+
 // HealthCheck performs a health check on the HTTP remotelookup endpoint
 func (c *HTTPRemoteLookupClient) HealthCheck(ctx context.Context) error {
 	// Try a simple GET request to the base URL to check if the service is reachable
 	// Note: We're not using a real email here since this is just a health check
 	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL, nil)
 	if err != nil {
-		return fmt.Errorf("failed to create health check request: %w", err)
+		return fmt.Errorf("failed to create health check request: %w", config.MaskURLError(err))
 	}
 	// Authenticate like a lookup, so an endpoint that requires the token sees no
 	// unauthenticated requests from the proxies.
@@ -601,7 +616,7 @@ func (c *HTTPRemoteLookupClient) HealthCheck(ctx context.Context) error {
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("HTTP remotelookup endpoint unreachable: %w", err)
+		return fmt.Errorf("HTTP remotelookup endpoint unreachable: %w", config.MaskURLError(err))
 	}
 	defer drainAndClose(resp)
 

@@ -23,7 +23,7 @@ func (db *Database) CountRedirectsSince(ctx context.Context, accountID int64, wi
 	cutoffTime := time.Now().Add(-window)
 
 	var count int
-	err := db.GetReadPool().QueryRow(ctx, `
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT COUNT(*) FROM redirect_log 
 		WHERE account_id = $1 
 		AND redirect_date > $2

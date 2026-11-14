@@ -393,6 +393,18 @@ func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
 	crl.limiter.ipMu.Lock()
 	defer crl.limiter.ipMu.Unlock()
 
+	firstFailure := event.FirstFailure
+	if firstFailure.IsZero() {
+		firstFailure = event.Timestamp
+	}
+	if firstFailure.IsZero() {
+		firstFailure = time.Now()
+	}
+	lastFailure := event.Timestamp
+	if lastFailure.IsZero() {
+		lastFailure = firstFailure
+	}
+
 	info, exists := crl.limiter.ipFailureCounts[event.IP]
 	if !exists {
 		// The cap bounds the map however its entries arrive, as in
@@ -401,7 +413,7 @@ func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
 		if maxIPs := crl.limiter.config.MaxIPEntries; maxIPs > 0 && len(crl.limiter.ipFailureCounts) >= maxIPs {
 			crl.limiter.evictOldestIP()
 		}
-		info = &IPFailureInfo{FirstFailure: event.FirstFailure}
+		info = &IPFailureInfo{FirstFailure: firstFailure}
 		crl.limiter.addIPCounter(event.IP, info)
 	}
 
@@ -413,12 +425,12 @@ func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
 	if delay := min(event.LastDelay, crl.limiter.config.MaxDelay); delay > info.LastDelay {
 		info.LastDelay = delay
 	}
-	if !event.FirstFailure.IsZero() && event.FirstFailure.Before(info.FirstFailure) {
-		info.FirstFailure = event.FirstFailure
+	if info.FirstFailure.IsZero() || firstFailure.Before(info.FirstFailure) {
+		info.FirstFailure = firstFailure
 		crl.limiter.ipQueue.fix(info) // a parked counter is ordered by its block instead
 	}
-	if event.Timestamp.After(info.LastFailure) {
-		info.LastFailure = event.Timestamp
+	if lastFailure.After(info.LastFailure) {
+		info.LastFailure = lastFailure
 	}
 
 	logger.Debug("Cluster limiter: Merged failure count", "protocol", crl.limiter.protocol, "ip", event.IP, "from_node", event.NodeID,
@@ -442,13 +454,18 @@ func (crl *ClusterRateLimiter) handleUsernameFailure(event RateLimitEvent) {
 	crl.limiter.usernameMu.Lock()
 	defer crl.limiter.usernameMu.Unlock()
 
+	ts := event.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+
 	info, exists := crl.limiter.usernameFailureCounts[event.Username]
 	if !exists {
 		// Bounded however entries arrive, as in updateUsernameFailure.
 		if maxUsernames := crl.limiter.config.MaxUsernameEntries; maxUsernames > 0 && len(crl.limiter.usernameFailureCounts) >= maxUsernames {
 			crl.limiter.evictOldestUsername()
 		}
-		info = &UsernameFailureInfo{FirstFailure: event.Timestamp}
+		info = &UsernameFailureInfo{FirstFailure: ts}
 		crl.limiter.addUsernameCounter(event.Username, info)
 	}
 
@@ -460,8 +477,12 @@ func (crl *ClusterRateLimiter) handleUsernameFailure(event RateLimitEvent) {
 	// though the success supersedes it - which errs towards blocking, the safe
 	// direction for a rate limiter.
 	info.FailureCount++
-	if event.Timestamp.After(info.LastFailure) {
-		info.LastFailure = event.Timestamp
+	if info.FirstFailure.IsZero() || ts.Before(info.FirstFailure) {
+		info.FirstFailure = ts
+		crl.limiter.usernameQueue.fix(info)
+	}
+	if ts.After(info.LastFailure) {
+		info.LastFailure = ts
 	}
 
 	logger.Debug("CLUSTER-LIMITER: Applied username failure from cluster", "protocol", crl.limiter.protocol,

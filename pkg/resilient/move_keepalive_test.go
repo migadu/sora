@@ -32,7 +32,7 @@ func TestMoveSingleLongObjectKeepsTransactionAlive(t *testing.T) {
 		}
 	}
 	uids := []imap.UID{1}
-	_, err := rdb.MoveMessagesWithRetry(ctx, &uids, f.srcID, f.destID, f.ownerID, "example.net", "owner", "test-instance", f.hashes, ensure)
+	_, err := rdb.MoveMessagesWithRetry(ctx, &uids, f.srcID, f.destID, f.ownerID, "example.net", "owner", "test-instance", f.sourceHashes(), f.hashes, ensure)
 	if err != nil {
 		t.Fatalf("MOVE with a single slow S3 request: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestMoveCallerDeadlineDoesNotTripDatabaseBreaker(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	uids := []imap.UID{1}
-	_, err := rdb.MoveMessagesWithRetry(ctx, &uids, f.srcID, f.destID, f.ownerID, "example.net", "owner", "test-instance", f.hashes, func(work context.Context, _ string) error {
+	_, err := rdb.MoveMessagesWithRetry(ctx, &uids, f.srcID, f.destID, f.ownerID, "example.net", "owner", "test-instance", f.sourceHashes(), f.hashes, func(work context.Context, _ string) error {
 		<-work.Done()
 		return work.Err()
 	})

@@ -103,8 +103,9 @@ func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get updated message to return
-	message, err := s.rdb.GetMessageByIDWithRetry(ctx, accountID, messageID)
+	// Get updated message from the writer so a lagging read replica cannot
+	// return stale pre-PATCH flags or miss a newly created mailbox.
+	message, err := s.rdb.GetMessageByIDWithRetry(readFromWriter(ctx), accountID, messageID)
 	if err != nil {
 		// Even if we can't retrieve the updated message, the update succeeded
 		s.writeJSON(w, http.StatusOK, map[string]any{

@@ -57,7 +57,7 @@ type RefreshTokenRequest struct {
 	Token string `json:"token"`
 }
 
-// handleLogin handles user authentication and JWT token generation
+// handleLogin handles user authentication and JWT token generation.
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
@@ -67,7 +67,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Email == "" || req.Password == "" {
+	// An email of blanks is no email: the credential lookup trims it and refuses what is
+	// left with an error that is not "user not found" (and the User API proxy, which trims
+	// it to route the login, finds no user in it either).
+	if strings.TrimSpace(req.Email) == "" || req.Password == "" {
 		s.writeError(w, http.StatusBadRequest, "Email and password are required")
 		return
 	}
@@ -91,7 +94,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Apply progressive authentication delay BEFORE any other checks
-	if err := server.ApplyAuthenticationDelay(ctx, s.authLimiter, remoteAddr, "USER-API-LOGIN"); err != nil {
+	if err := server.ApplyAuthenticationDelay(ctx, s.authLimiter, remoteAddr, "userapi"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
 			logger.Info("User API: Delay queue full, rejecting connection", "email", req.Email, "remote", remoteAddr)
@@ -224,6 +227,15 @@ generateToken:
 	_, epoch, err := s.rdb.GetCredentialEpochWithRetry(ctx, req.Email)
 	if err != nil {
 		logger.Warn("HTTP Mail API: Error fetching credential epoch", "name", s.name, "error", err)
+		s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
+		return
+	}
+
+	// Account creation makes no mailboxes: like an IMAP or POP3 login, this one
+	// creates the default ones (consts.DefaultMailboxes) for an account that has
+	// none yet, on the cache path as on the database path.
+	if err := s.rdb.CreateDefaultMailboxesWithRetry(ctx, accountID); err != nil {
+		logger.Warn("HTTP Mail API: Error creating default mailboxes", "name", s.name, "account_id", accountID, "error", err)
 		s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
 		return
 	}
@@ -376,6 +388,7 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 		// Validate JWT token from Authorization header
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
+			server.SetBearerChallenge(w.Header(), server.UserAPIRealm, false)
 			s.writeError(w, http.StatusUnauthorized, "Authorization header required")
 			return
 		}
@@ -383,6 +396,7 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 		// Extract token from "Bearer <token>"
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+			server.SetBearerChallenge(w.Header(), server.UserAPIRealm, false)
 			s.writeError(w, http.StatusUnauthorized, "Authorization header must be 'Bearer <token>'")
 			return
 		}
@@ -393,7 +407,7 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 		claims, err := s.validateToken(tokenString)
 		if err != nil {
 			logger.Warn("HTTP Mail API: Token validation error", "name", s.name, "error", err)
-			s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+			s.writeTokenRefused(w)
 			return
 		}
 

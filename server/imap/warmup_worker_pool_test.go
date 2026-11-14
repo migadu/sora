@@ -209,7 +209,7 @@ func TestWorkerPoolProcessesJobs(t *testing.T) {
 		warmupMaxConcurrent: 3,
 		warmupQueue:         make(chan warmupJob, 50),
 		warmupSemaphore:     make(chan struct{}, 3),
-		warmupInterval:      time.Millisecond, // Very short interval so dedup re-check passes
+		warmupInterval:      time.Hour, // Unique account IDs pass the dedup re-check; the stamps outlive the count below
 		warmupTimeout:       5 * time.Second,
 		// cache is nil — executeWarmup will stamp lastWarmupTimes then fail on cache access
 		// That's fine; we're testing that workers pick up jobs.

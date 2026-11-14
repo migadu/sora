@@ -82,7 +82,7 @@ func startUnappliedKeysProxy(t *testing.T, deps *serverDependencies, start func(
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errChan := make(chan error, 1)
-	go start(ctx, deps, serverCfg, errChan)
+	deps.serverManager.Go(func() { start(ctx, deps, serverCfg, errChan) })
 	t.Cleanup(func() {
 		cancel()
 		deps.serverManager.Wait()

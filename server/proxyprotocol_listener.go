@@ -21,7 +21,7 @@ const maxConcurrentHeaderReads = 1024
 // header is consumed from the raw TCP stream before any TLS wrapper is
 // layered on top.
 //
-// COMPOSITION RULE (see docs/proxy-protocol-tls-composition.md): the PROXY
+// COMPOSITION RULE (see docs/HACKING.md, section 6.5): the PROXY
 // header travels in plaintext AHEAD of the TLS ClientHello, so this listener
 // must sit BETWEEN the TCP listener and the TLS layer:
 //

@@ -350,11 +350,11 @@ func (s *Server) SetupRoutes() http.Handler {
 	mux := http.NewServeMux()
 
 	// Public routes (no authentication required)
-	mux.HandleFunc("/user/auth/login", routeHandler("POST", s.handleLogin))
-	mux.HandleFunc("/user/auth/refresh", routeHandler("POST", s.handleRefreshToken))
+	mux.HandleFunc("/user/auth/login", s.routeHandler("POST", s.handleLogin))
+	mux.HandleFunc("/user/auth/refresh", s.routeHandler("POST", s.handleRefreshToken))
 
 	// Mailbox operations
-	mux.Handle("/user/mailboxes", s.jwtAuthMiddleware(multiMethodHandler(map[string]http.HandlerFunc{
+	mux.Handle("/user/mailboxes", s.jwtAuthMiddleware(s.multiMethodHandler(map[string]http.HandlerFunc{
 		"GET":  s.handleListMailboxes,
 		"POST": s.handleCreateMailbox,
 	})))
@@ -364,8 +364,11 @@ func (s *Server) SetupRoutes() http.Handler {
 	mux.Handle("/user/messages/", s.jwtAuthMiddleware(http.HandlerFunc(s.handleMessageOperations)))
 
 	// Sieve filter operations
-	mux.Handle("/user/filters", s.jwtAuthMiddleware(routeHandler("GET", s.handleListFilters)))
+	mux.Handle("/user/filters", s.jwtAuthMiddleware(s.routeHandler("GET", s.handleListFilters)))
 	mux.Handle("/user/filters/", s.jwtAuthMiddleware(http.HandlerFunc(s.handleFilterOperations)))
+
+	// Every other path (ServeMux's own 404 is text/plain)
+	mux.HandleFunc("/", s.notFound)
 
 	// Wrap with middleware (in reverse order - last applied is outermost)
 	handler := s.loggingMiddleware(mux)
@@ -385,7 +388,7 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	// Check for subscribe/unsubscribe operations
 	if strings.HasSuffix(path, "/subscribe") {
 		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "POST")
 			return
 		}
 		s.handleSubscribeMailbox(w, r)
@@ -393,7 +396,7 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasSuffix(path, "/unsubscribe") {
 		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "POST")
 			return
 		}
 		s.handleUnsubscribeMailbox(w, r)
@@ -403,7 +406,7 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	// Check for message listing/search
 	if strings.HasSuffix(path, "/messages") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleListMessages(w, r)
@@ -411,20 +414,20 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasSuffix(path, "/search") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleSearchMessages(w, r)
 		return
 	}
 
-	// Otherwise it's a delete operation on the mailbox itself
+	// Otherwise it's the mailbox itself, which can only be deleted
 	if r.Method == "DELETE" {
 		s.handleDeleteMailbox(w, r)
 		return
 	}
 
-	http.Error(w, "Not found", http.StatusNotFound)
+	s.methodNotAllowed(w, "DELETE")
 }
 
 // handleMessageOperations routes message operations
@@ -434,7 +437,7 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 	// Check for body/raw endpoints
 	if strings.HasSuffix(path, "/body") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleGetMessageBody(w, r)
@@ -442,7 +445,7 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 	}
 	if strings.HasSuffix(path, "/raw") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleGetMessageRaw(w, r)
@@ -458,7 +461,7 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 	case "DELETE":
 		s.handleDeleteMessage(w, r)
 	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		s.methodNotAllowed(w, "GET", "PATCH", "DELETE")
 	}
 }
 
@@ -471,7 +474,7 @@ func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) 
 	// Check for capabilities endpoint
 	if path == "capabilities" {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleGetCapabilities(w, r)
@@ -481,7 +484,7 @@ func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) 
 	// Check for activate endpoint
 	if strings.HasSuffix(path, "/activate") {
 		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "POST")
 			return
 		}
 		s.handleActivateFilter(w, r)
@@ -497,7 +500,7 @@ func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) 
 	case "DELETE":
 		s.handleDeleteFilter(w, r)
 	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		s.methodNotAllowed(w, "GET", "PUT", "DELETE")
 	}
 }
 
@@ -586,7 +589,19 @@ func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 	s.writeJSON(w, status, map[string]string{"error": message})
 }
 
-// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+// writeTokenRefused answers 401 for a bearer token the request presented and that was
+// refused: expired, malformed, badly signed, or no longer valid for its account. The
+// challenge says error="invalid_token" (RFC 6750 section 3.1), so a client can tell it
+// apart from a request that carried no token.
+func (s *Server) writeTokenRefused(w http.ResponseWriter) {
+	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, true)
+	s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+}
+
+// getProxyProtocolTrustedProxies returns the hosts trusted to send PROXY headers: the
+// ProxyProtocolTrustedProxies option if set, otherwise trusted_networks. No config key
+// sets that option (there is no proxy_protocol_trusted_proxies, #542), so in a running
+// server PROXY trust is always [servers] trusted_networks.
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {
 		return proxyProtocolTrusted

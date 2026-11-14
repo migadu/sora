@@ -113,6 +113,10 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 		datePrefix = tablePrefix + "."
 	}
 
+	// go-imap passes a search <date> as midnight UTC of that day, and ON / SENTON d as
+	// Since = d, Before = d + 24h. RFC 9051 §6.4.4: SINCE is "within or later than the
+	// specified date" (>= its midnight), BEFORE "earlier than the specified date" (< its
+	// midnight: a message at exactly that midnight is within the day, not before it).
 	if !criteria.Since.IsZero() {
 		param := nextParam()
 		args[param] = criteria.Since
@@ -121,7 +125,7 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 	if !criteria.Before.IsZero() {
 		param := nextParam()
 		args[param] = criteria.Before
-		conditions = append(conditions, fmt.Sprintf("%sinternal_date <= @%s", datePrefix, param))
+		conditions = append(conditions, fmt.Sprintf("%sinternal_date < @%s", datePrefix, param))
 	}
 	if !criteria.SentSince.IsZero() {
 		param := nextParam()
@@ -131,7 +135,7 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 	if !criteria.SentBefore.IsZero() {
 		param := nextParam()
 		args[param] = criteria.SentBefore
-		conditions = append(conditions, fmt.Sprintf("%ssent_date <= @%s", datePrefix, param))
+		conditions = append(conditions, fmt.Sprintf("%ssent_date < @%s", datePrefix, param))
 	}
 
 	// Message size
@@ -239,13 +243,20 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 			args[param] = lowerValue
 			conditions = append(conditions, substringCond(fmt.Sprintf("LOWER(%ssubject)", datePrefix), "@"+param))
 		case "message-id":
+			// Match substrings of the normalized Message-ID. Raw field text and
+			// exact header presence are not retained in message_id (see #529).
+			// Preserve the indexed equality lookup for ordinary whole-ID terms;
+			// other terms read this mailbox's rows, since the covering header
+			// index does not contain message_id.
 			param := nextParam()
-			// if the message ID is wrapped in <messageId>, we need to remove the brackets
-			if strings.HasPrefix(lowerValue, "<") && strings.HasSuffix(lowerValue, ">") {
-				lowerValue = lowerValue[1 : len(lowerValue)-1]
+			if id, ok := wholeMessageIDTerm(lowerValue); ok {
+				args[param] = id
+				conditions = append(conditions, fmt.Sprintf("LOWER(%smessage_id) = @%s", datePrefix, param))
+				break
 			}
 			args[param] = lowerValue
-			conditions = append(conditions, fmt.Sprintf("LOWER(%smessage_id) = @%s", datePrefix, param))
+			// Synthetic IDs yield NULL; turn it into FALSE before NOT/OR.
+			conditions = append(conditions, "COALESCE("+substringCond(messageIDFieldExpr(datePrefix+"message_id"), "@"+param)+", FALSE)")
 		case "in-reply-to", "references":
 			// Both headers hold message IDs, which threading clients search with
 			// the angle brackets they are written with. The columns store the IDs
@@ -370,16 +381,19 @@ func (db *Database) buildSortOrderClauseWithPrefix(sortCriteria []imap.SortCrite
 		case imap.SortKeySize:
 			orderField = fmt.Sprintf("%ssize", colPrefix)
 		case imap.SortKeyDisplayFrom:
-			// DISPLAYFROM: Use display name if available, fallback to email (RFC 5256)
-			orderField = fmt.Sprintf("COALESCE(%sfrom_name_sort, %sfrom_email_sort)", colPrefix, colPrefix)
+			// DISPLAYFROM: the display name, or the address when the name is empty (RFC 5957
+			// §3). sortColumnsFor stores a missing name as '', not NULL, hence the NULLIF;
+			// the COALESCE also covers a NULL name.
+			orderField = fmt.Sprintf("COALESCE(NULLIF(%sfrom_name_sort, ''), %sfrom_email_sort)", colPrefix, colPrefix)
 		case imap.SortKeyFrom:
 			// FROM: sort by addr-mailbox (the local part) per RFC 5256 §3, not the
 			// full local@domain address. The stored column keeps the full email
 			// (DISPLAYFROM needs it); take the local part at sort time.
 			orderField = fmt.Sprintf("split_part(%sfrom_email_sort, '@', 1)", colPrefix)
 		case imap.SortKeyDisplayTo:
-			// DISPLAYTO: Use display name if available, fallback to email (RFC 5957)
-			orderField = fmt.Sprintf("COALESCE(%sto_name_sort, %sto_email_sort)", colPrefix, colPrefix)
+			// DISPLAYTO: as DISPLAYFROM. to_name_sort is also NULL on rows written before
+			// migration 000006.
+			orderField = fmt.Sprintf("COALESCE(NULLIF(%sto_name_sort, ''), %sto_email_sort)", colPrefix, colPrefix)
 		case imap.SortKeyTo:
 			// TO: sort by addr-mailbox (local part) per RFC 5256 §3.
 			orderField = fmt.Sprintf("split_part(%sto_email_sort, '@', 1)", colPrefix)
@@ -659,6 +673,33 @@ func substringCond(expr, placeholder string) string {
 // then tests for the header's presence, as RFC 9051 §6.4.4 describes.
 func msgIDListExpr(column string) string {
 	return fmt.Sprintf(`'<' || replace(LOWER(NULLIF(%s, '')), ' ', '> <') || '>'`, column)
+}
+
+// messageIDFieldExpr brackets the normalized ID stored by go-message's Header.MessageID.
+// The current ingress parser cannot return an ID beginning with '<'; synthetic IDs
+// retain their brackets (InsertMessage, syntheticMessageID) and yield NULL here.
+// This represents parseable IDs, not raw header presence: CFWS is discarded, and absent,
+// empty or unparseable fields all become synthetic IDs. Those remaining RFC 9051 §6.4.4
+// search limitations are tracked in #529.
+func messageIDFieldExpr(column string) string {
+	return fmt.Sprintf(`CASE WHEN left(%[1]s, 1) <> '<' THEN '<' || LOWER(%[1]s) || '>' END`, column)
+}
+
+// wholeMessageIDTerm reports whether the lowercased term is one whole msg-id in angle
+// brackets, and returns the ID inside them. This preserves the existing indexed lookup
+// for ordinary whole-ID terms. A term containing brackets inside a domain literal
+// ("<a@[...]>", RFC 5322 §3.6.4) uses substring matching instead. A bracketed term inside
+// another ID's domain literal still misses on the equality path, as it did before this
+// change; #529 tracks that remaining limitation.
+func wholeMessageIDTerm(term string) (string, bool) {
+	if len(term) < 3 || term[0] != '<' || term[len(term)-1] != '>' {
+		return "", false
+	}
+	id := term[1 : len(term)-1]
+	if strings.ContainsAny(id, "<>[]") {
+		return "", false
+	}
+	return id, true
 }
 
 // headerSubstringCond is the TEXT header predicate: the bound term as a substring of any

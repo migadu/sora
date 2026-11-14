@@ -49,6 +49,15 @@ func newCrossAccountMoveFixture(t *testing.T, pool *pgxpool.Pool, messages int) 
 	return f
 }
 
+// sourceHashes maps each of SRC's UIDs to its content hash, as MOVE's caller passes them.
+func (f crossAccountMoveFixture) sourceHashes() map[imap.UID]string {
+	hashes := make(map[imap.UID]string, len(f.hashes))
+	for i, hash := range f.hashes {
+		hashes[imap.UID(i+1)] = hash
+	}
+	return hashes
+}
+
 // newShortIdlePool is a pool on the test database whose sessions the server kills after
 // idling in a transaction for idle.
 func newShortIdlePool(t *testing.T, cfg *config.DatabaseConfig, idle time.Duration) *pgxpool.Pool {
@@ -129,7 +138,7 @@ func TestMoveMessagesHoldsDestObjectsAcrossTheirCheck(t *testing.T) {
 	}
 
 	uids := []imap.UID{1, 2, 3}
-	uidMap, err := rdb.MoveMessagesWithRetry(ctx, &uids, f.srcID, f.destID, f.ownerID, "example.net", "owner", "test-instance", held, ensure)
+	uidMap, err := rdb.MoveMessagesWithRetry(ctx, &uids, f.srcID, f.destID, f.ownerID, "example.net", "owner", "test-instance", f.sourceHashes(), held, ensure)
 	if err != nil {
 		t.Fatalf("move: %v", err)
 	}
@@ -193,7 +202,7 @@ func TestMoveMessagesDestObjectFailureIsNotADatabaseFailure(t *testing.T) {
 		return s3TimeoutError{}
 	}
 	uids := []imap.UID{1}
-	_, err := rdb.MoveMessagesWithRetry(ctx, &uids, f.srcID, f.destID, f.ownerID, "example.net", "owner", "test-instance", f.hashes, ensure)
+	_, err := rdb.MoveMessagesWithRetry(ctx, &uids, f.srcID, f.destID, f.ownerID, "example.net", "owner", "test-instance", f.sourceHashes(), f.hashes, ensure)
 	var destErr *DestObjectError
 	if !errors.As(err, &destErr) || destErr.ContentHash != f.hashes[0] || !errors.Is(destErr.Err, s3TimeoutError{}) {
 		t.Fatalf("move error = %v, want a DestObjectError carrying the S3 failure", err)

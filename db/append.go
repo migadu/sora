@@ -119,8 +119,8 @@ func truncateHash(hash string) string {
 // destAccountID's S3 path, where the caller must first have made the body available (its
 // object, or the staging file of the upload restagePendingUploads queues). sourceHashes
 // holds, by source UID, the content hash each such row had when the caller did so, and
-// the row is copied only if it still has it: sora-admin import rekey renames a body's hash
-// (RekeyContentHash) under no lock the copy takes, and a copy under the new hash would
+// the row is copied only if it still has it: sora-admin import rekey can rename a body's
+// hash before this copy takes its source-account lock, and a copy under the new hash would
 // point at a key nothing wrote. A renamed source fails the copy with ErrCopySourceChanged
 // before anything commits. The check is made by the INSERT, the statement that copies the
 // rows' hashes; once inserted, a copy keeps its hash whatever happens to the source.
@@ -199,6 +199,11 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		return nil, nil, err
 	}
 
+	// From here to the commit a rekey must not rename a source: the INSERT reads its hash.
+	if err := lockRekeySources(ctx, tx, srcMailboxID, uids); err != nil {
+		return nil, nil, err
+	}
+
 	// Batch insert the copied messages and their state in one round trip. The
 	// message_state INSERT is a data-modifying CTE, which PostgreSQL executes to
 	// completion exactly once regardless of whether the primary query reads its
@@ -212,7 +217,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 			SELECT
 				m.content_hash,
 				CASE WHEN m.account_id = $6 THEN m.uploaded ELSE m.content_hash = ANY($10::text[]) END AS uploaded,
-				m.message_id, m.in_reply_to,
+				m.message_id, m.in_reply_to, m."references",
 				m.subject, m.sent_date, m.internal_date, m.size,
 				m.body_structure, m.recipients_json,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses,
@@ -229,14 +234,14 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		),
 		inserted AS (
 			INSERT INTO messages (
-				account_id, content_hash, uploaded, message_id, in_reply_to,
+				account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 				subject, sent_date, internal_date, size,
 				body_structure, recipients_json, s3_domain, s3_localpart,
 				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
 				mailbox_id, mailbox_path, created_modseq, uid
 			)
 			SELECT
-				$6 AS account_id, content_hash, uploaded, message_id, in_reply_to,
+				$6 AS account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 				subject, sent_date, internal_date, size,
 				body_structure, recipients_json,
 				-- The S3 key is per row: the body lives under whatever the account's primary
@@ -337,9 +342,10 @@ func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailbo
 // Callers skip it when every source row already belongs to the destination account. That
 // account's row for the body is then anchored by the source row itself, which stays in
 // messages (MOVE only expunges it, and the orphan sweep counts expunged rows), so the sweep
-// cannot delete the row and there is nothing to insert. The skip matters: the shared lock
-// below is one entry per distinct body in PostgreSQL's server-wide lock table, held until
-// commit, and a bulk same-account MOVE is the common case.
+// cannot delete the row and there is nothing to insert. A rekey, which renames the source
+// row's hash, waits for the copy (lockRekeySources) and so sees the copied rows too. The
+// skip matters: the shared lock below is one entry per distinct body in PostgreSQL's
+// server-wide lock table, held until commit, and a bulk same-account MOVE is the common case.
 //
 // Do not replace the lock with a "row already exists" pre-check. A row that exists can be an
 // orphan the sweep is about to delete, and the sweep cannot see the uncommitted message that
@@ -704,8 +710,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	saneSubject := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(options.Subject), helpers.MaxSubjectBytes)
 	saneInReplyToStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(inReplyToStr), 2000)
 
-	referencesStr := strings.Join(options.References, " ")
-	saneReferencesStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(referencesStr), 2000)
+	saneReferencesStr := helpers.TrimReferences(options.References, helpers.MaxReferencesBytes)
 
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
 
@@ -1081,8 +1086,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	saneSubject := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(options.Subject), helpers.MaxSubjectBytes)
 	saneInReplyToStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(inReplyToStr), 2000)
 
-	referencesStr := strings.Join(options.References, " ")
-	saneReferencesStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(referencesStr), 2000)
+	saneReferencesStr := helpers.TrimReferences(options.References, helpers.MaxReferencesBytes)
 
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
 
@@ -1333,7 +1337,7 @@ func (d *Database) InsertMessagesBatch(
 			SaneSubject:        helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(opt.Subject), helpers.MaxSubjectBytes),
 			SanePlaintextBody:  helpers.SanitizeUTF8(opt.PlaintextBody),
 			SaneInReplyToStr:   helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(inReplyToStr), 2000),
-			SaneReferencesStr:  helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(strings.Join(opt.References, " ")), 2000),
+			SaneReferencesStr:  helpers.TrimReferences(opt.References, helpers.MaxReferencesBytes),
 			BodyStructureData:  bodyStructureData,
 			RecipientsJSON:     recipientsJSON,
 			CustomKeywordsJSON: customKeywordsJSON,

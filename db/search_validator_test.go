@@ -759,3 +759,55 @@ func TestValidateSearchCriteria_TotalNodeCap(t *testing.T) {
 	}
 	assert.True(t, validator.ValidateSearchCriteria(small).Valid)
 }
+
+// A search string reaches PostgreSQL as a text parameter, which takes neither a
+// NUL nor bytes that are not UTF-8 (SQLSTATE 22021), and so does a KEYWORD.
+// NUL is in no IMAP string (RFC 9051 §9 rule 3) and the strings are UTF-8
+// (RFC 9051 §6.4.4), so such a term is the client's error: it is refused here, as an error that is not a
+// limit (BAD, not NO [LIMIT]), wherever it sits in the tree (#594).
+func TestValidateSearchCriteria_MalformedStrings(t *testing.T) {
+	validator := NewSearchCriteriaValidator()
+	header := func(key, value string) *imap.SearchCriteria {
+		return &imap.SearchCriteria{Header: []imap.SearchCriteriaHeaderField{{Key: key, Value: value}}}
+	}
+
+	refused := map[string]*imap.SearchCriteria{
+		"NUL in HEADER value":        header("Subject", "\x00"),
+		"NUL in SUBJECT value":       header("Subject", "a\x00b"),
+		"NUL in FROM value":          header("From", "user\x00@example.com"),
+		"NUL in HEADER field name":   header("X-\x00", "a"),
+		"invalid UTF-8 in BODY":      {Body: []string{"\xff"}},
+		"invalid UTF-8 in TEXT":      {Text: []string{"\xff"}},
+		"truncated UTF-8 in BODY":    {Body: []string{"caf\xc3"}},
+		"invalid UTF-8 in HEADER":    header("Subject", "\xff"),
+		"invalid UTF-8 in FROM":      header("From", "\xe9@example.com"),
+		"invalid UTF-8 in KEYWORD":   {Flag: []imap.Flag{"\xa9\xff"}},
+		"invalid UTF-8 in UNKEYWORD": {NotFlag: []imap.Flag{"\xa9\xff"}},
+		"NUL under NOT":              {Not: []imap.SearchCriteria{*header("Subject", "\x00")}},
+		"invalid UTF-8 under OR": {Or: [][2]imap.SearchCriteria{
+			{{Flag: []imap.Flag{imap.FlagSeen}}, {Body: []string{"\xff"}}},
+		}},
+	}
+	for name, criteria := range refused {
+		t.Run(name, func(t *testing.T) {
+			result := validator.ValidateSearchCriteria(criteria)
+			require.False(t, result.Valid, "a malformed search string must not reach the database")
+			for _, err := range result.Errors {
+				assert.False(t, err.IsLimit, "%s is a client error, not a limit", err.Field)
+			}
+		})
+	}
+
+	accepted := map[string]*imap.SearchCriteria{
+		"UTF-8 BODY":    {Body: []string{"café 日本"}},
+		"UTF-8 TEXT":    {Text: []string{"Grüße"}},
+		"UTF-8 SUBJECT": header("Subject", "naïve résumé"),
+		"UTF-8 FROM":    header("From", "josé@example.com"),
+		"UTF-8 KEYWORD": {Flag: []imap.Flag{"étiquette"}},
+	}
+	for name, criteria := range accepted {
+		t.Run(name, func(t *testing.T) {
+			assert.True(t, validator.ValidateSearchCriteria(criteria).Valid)
+		})
+	}
+}

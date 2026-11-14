@@ -126,6 +126,23 @@ func safeExtractBinarySectionSize(bodyData []byte, section *imap.FetchItemBinary
 	return imapserver.ExtractBinarySectionSize(bytes.NewReader(bodyData), section)
 }
 
+// requireFetchBinary refuses the BINARY, BINARY.PEEK and BINARY.SIZE items of
+// a FETCH, or of NOTIFY's MessageNew fetch-atts, unless the session offers
+// them; go-imap parses them whatever the session offers. They are BINARY's
+// (RFC 3516 §4.2) and also IMAP4rev2's, which "includes additional FETCH items
+// (BINARY, BINARY.PEEK, and BINARY.SIZE) but not extensions to the APPEND
+// command" (RFC 9051 Appendix B): disabling BINARY alone keeps them, disabling
+// both refuses them.
+func (s *IMAPSession) requireFetchBinary(options *imap.FetchOptions) error {
+	if len(options.BinarySection) == 0 && len(options.BinarySectionSize) == 0 {
+		return nil
+	}
+	if s.GetCapabilities().Has(imap.CapIMAP4rev2) {
+		return nil
+	}
+	return s.requireCapability(imap.CapBinary, "FETCH BINARY")
+}
+
 func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
 	ctx = s.pinnedContext(ctx)
 
@@ -141,6 +158,11 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 	recordMetrics := func(err error) {
 		metrics.CommandsTotal.WithLabelValues("imap", "FETCH", commandStatus(err)).Inc()
 		metrics.CommandDuration.WithLabelValues("imap", "FETCH").Observe(time.Since(start).Seconds())
+	}
+
+	if err := s.requireFetchBinary(options); err != nil {
+		recordMetrics(err)
+		return err
 	}
 
 	// First, safely read necessary session state and decode the sequence numbers all within a single read lock
@@ -510,23 +532,17 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 			}
 		}
 
+		// Fetch has refused the BINARY items up front unless the session
+		// offers them, through BINARY or IMAP4rev2.
 		if len(options.BinarySection) > 0 {
-			if s.GetCapabilities().Has(imap.CapBinary) {
-				if err := s.handleBinarySections(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
-					return err
-				}
-			} else {
-				s.DebugLog("BINARY section requests ignored due to capability filtering")
+			if err := s.handleBinarySections(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
+				return err
 			}
 		}
 
 		if len(options.BinarySectionSize) > 0 {
-			if s.GetCapabilities().Has(imap.CapBinary) {
-				if err := s.handleBinarySectionSize(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
-					return err
-				}
-			} else {
-				s.DebugLog("BINARY section size requests ignored due to capability filtering")
+			if err := s.handleBinarySectionSize(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
+				return err
 			}
 		}
 	}

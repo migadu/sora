@@ -34,6 +34,15 @@ func checkTraining(t *testing.T, req spamtraining.TrainingRequest, typ spamtrain
 	}
 }
 
+// trainedMoves describes each submission as "type source->dest".
+func trainedMoves(reqs []spamtraining.TrainingRequest) []string {
+	moves := make([]string, len(reqs))
+	for i, req := range reqs {
+		moves[i] = fmt.Sprintf("%s %s->%s", req.Type, req.SourceMailbox, req.DestMailbox)
+	}
+	return moves
+}
+
 // Moving a message into Junk submits it as spam.
 func TestIMAP_SpamTraining_MoveToJunk(t *testing.T) {
 	c, fakeS3, endpoint, account := setupSpamTrainingServer(t, config.SpamTrainingConfig{AuthToken: "test-token-123"})
@@ -77,6 +86,82 @@ func TestIMAP_SpamTraining_MoveFromJunk(t *testing.T) {
 	checkTraining(t, got[0], spamtraining.TrainingTypeHam, account.Email, "Junk", "INBOX", "Ham Test Message", "This is a legitimate message.")
 	if gets := fakeS3.GetCount() - getsBefore; gets != 1 {
 		t.Errorf("%d S3 downloads, want 1: the moved body is only in S3", gets)
+	}
+}
+
+// Moving a message from Junk to Trash deletes it; it is not submitted as ham.
+func TestIMAP_SpamTraining_MoveFromJunkToTrash(t *testing.T) {
+	// One worker runs the jobs in the order the MOVEs queued them, so when the
+	// second MOVE's submission arrives, one queued by the first would have too.
+	c, fakeS3, endpoint, account := setupSpamTrainingServer(t, config.SpamTrainingConfig{Workers: 1})
+	appendToMailbox(t, c, "Junk", trainingMessage(account.Email, "Deleted Spam", "Buy now."))
+	appendToMailbox(t, c, "Junk", trainingMessage(account.Email, "Rescued Ham", "Lunch tomorrow?"))
+	if _, err := c.Select("Junk", nil).Wait(); err != nil {
+		t.Fatalf("SELECT Junk: %v", err)
+	}
+	getsBefore := fakeS3.GetCount()
+
+	if _, err := c.Move(imap.SeqSetNum(1), "Trash").Wait(); err != nil {
+		t.Fatalf("MOVE from Junk to Trash: %v", err)
+	}
+	if _, err := c.Move(imap.SeqSetNum(1), "INBOX").Wait(); err != nil {
+		t.Fatalf("MOVE from Junk to INBOX: %v", err)
+	}
+
+	got := endpoint.waitForTraining(t, 1, 10*time.Second)
+	if len(got) != 1 {
+		t.Fatalf("training endpoint received %d submissions %q, want 1 (the message moved to INBOX)", len(got), trainedMoves(got))
+	}
+	checkTraining(t, got[0], spamtraining.TrainingTypeHam, account.Email, "Junk", "INBOX", "Rescued Ham", "Lunch tomorrow?")
+	if gets := fakeS3.GetCount() - getsBefore; gets != 1 {
+		t.Errorf("%d S3 downloads, want 1: the message moved to Trash must not be fetched", gets)
+	}
+}
+
+// Junk and Trash are the mailboxes with the RFC 6154 \Junk and \Trash attributes,
+// whatever their names: renamed, they still decide training, and plain mailboxes
+// created under the freed names "Junk" and "Trash" do not.
+func TestIMAP_SpamTraining_FollowsSpecialUse(t *testing.T) {
+	c, fakeS3, endpoint, account := setupSpamTrainingServer(t, config.SpamTrainingConfig{Workers: 1})
+	for _, rename := range [][2]string{{"Junk", "Spam"}, {"Trash", "Bin"}} {
+		if err := c.Rename(rename[0], rename[1], nil).Wait(); err != nil {
+			t.Fatalf("RENAME %s %s: %v", rename[0], rename[1], err)
+		}
+		if err := c.Create(rename[0], nil).Wait(); err != nil {
+			t.Fatalf("CREATE %s: %v", rename[0], err)
+		}
+	}
+	appendToMailbox(t, c, "INBOX", trainingMessage(account.Email, "Plain Junk", "Not trained."))
+	appendToMailbox(t, c, "INBOX", trainingMessage(account.Email, "Real Spam", "Buy now."))
+	appendToMailbox(t, c, "Spam", trainingMessage(account.Email, "Deleted Spam", "Act fast."))
+	appendToMailbox(t, c, "Spam", trainingMessage(account.Email, "Rescued Ham", "Lunch tomorrow?"))
+	getsBefore := fakeS3.GetCount()
+
+	for _, mv := range []struct{ selected, dest string }{
+		{"", "Junk"},      // INBOX -> plain "Junk": not trained
+		{"", "Spam"},      // INBOX -> \Junk: spam
+		{"Spam", "Bin"},   // \Junk -> \Trash: not trained
+		{"Spam", "Trash"}, // \Junk -> plain "Trash": ham
+	} {
+		if mv.selected != "" {
+			if _, err := c.Select(mv.selected, nil).Wait(); err != nil {
+				t.Fatalf("SELECT %s: %v", mv.selected, err)
+			}
+		}
+		if _, err := c.Move(imap.SeqSetNum(1), mv.dest).Wait(); err != nil {
+			t.Fatalf("MOVE to %s: %v", mv.dest, err)
+		}
+	}
+
+	// One worker: the jobs arrive in the order the MOVEs queued them.
+	got := endpoint.waitForTraining(t, 2, 10*time.Second)
+	if len(got) != 2 {
+		t.Fatalf("training endpoint received %d submissions %q, want 2 (INBOX to Spam, Spam to Trash)", len(got), trainedMoves(got))
+	}
+	checkTraining(t, got[0], spamtraining.TrainingTypeSpam, account.Email, "INBOX", "Spam", "Real Spam", "Buy now.")
+	checkTraining(t, got[1], spamtraining.TrainingTypeHam, account.Email, "Spam", "Trash", "Rescued Ham", "Lunch tomorrow?")
+	if gets := fakeS3.GetCount() - getsBefore; gets != 2 {
+		t.Errorf("%d S3 downloads, want 2: the messages moved to Junk and Bin must not be fetched", gets)
 	}
 }
 

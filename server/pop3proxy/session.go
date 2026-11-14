@@ -73,7 +73,7 @@ type POP3ProxySession struct {
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
 	submittedUsername     string // Username exactly as submitted by the client (lookup-cache key)
 	utf8Requested         bool   // Client enabled UTF8 pre-auth; mirrored to the backend before AUTH (RFC 6856)
-	connRejected          bool   // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
+	connRegistered        bool   // connTracker.RegisterConnection accepted this session: close() unregisters only then
 	closed                bool   // Guards close() against double teardown (guarded by mutex)
 	pop3Conn              *pop3server.Conn
 }
@@ -164,7 +164,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// meant the delay never fired in exactly the deployment proxies exist for.
 	realClientIP, _ := server.GetConnectionIPs(s.clientConn, s.proxyInfo)
 	remoteAddr := &server.StringAddr{Addr: realClientIP}
-	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-PROXY"); err != nil {
+	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "pop3_proxy"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
 			s.InfoLog("delay queue full, rejecting connection", "username", username)
@@ -319,21 +319,31 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// Otherwise: treat as token, send full username (including @SUFFIX) to remotelookup
 	var usernameForRemoteLookup string
 	var masterAuthValidated bool
+	// The master username form with a wrong master password: refused whatever the
+	// credential check below says, even for the account's own password (#801).
+	var wrongMasterPassword bool
 
 	if parseErr == nil && parsedAddr.HasSuffix() {
 		// Has suffix - check if it matches configured master username
 		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), []byte(s.server.masterUsername)) {
 			// Suffix matches master username - validate master password locally
 			if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, []byte(s.server.masterPassword)) {
-				// Wrong master password - fail immediately
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return consts.ErrAuthenticationFailed
+				// Wrong master password. Refused like a wrong password under any other
+				// suffix, and only after the same work: the regular credential path below
+				// (lookup, password verification, lookup-cache entry). An
+				// immediate refusal is answered one verification sooner, which confirms
+				// a guessed master username (#801).
+				s.DebugLog("wrong master password, refusing after the regular credential check", "username", username)
+				// A refused master guess must query the same submitted name as
+				// another suffix. The service may route or refuse tokens differently.
+				usernameForRemoteLookup = username
+				wrongMasterPassword = true
+			} else {
+				// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
+				s.DebugLog("master username authentication successful, using base address for routing", "base_address", parsedAddr.BaseAddress())
+				usernameForRemoteLookup = parsedAddr.BaseAddress()
+				masterAuthValidated = true
 			}
-			// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
-			s.DebugLog("master username authentication successful, using base address for routing", "base_address", parsedAddr.BaseAddress())
-			usernameForRemoteLookup = parsedAddr.BaseAddress()
-			masterAuthValidated = true
 		} else {
 			// Suffix doesn't match master username - treat as token
 			// Send FULL username (including @TOKEN) to remotelookup for validation
@@ -368,6 +378,10 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			s.DebugLog("remotelookup authentication", "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
 		} else {
 			s.DebugLog("remotelookup authentication", "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
+		}
+		if err == nil && authResult == proxy.AuthSuccess && wrongMasterPassword {
+			// The account's own password, not the master password: refused as a wrong one.
+			authResult = proxy.AuthFailed
 		}
 
 		if err != nil {
@@ -565,6 +579,10 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		s.DebugLog("Authenticating user via main database")
 		// Use base address (without +detail) for authentication
 		accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
+		if err == nil && wrongMasterPassword {
+			// The account's own password, not the master password: refused as a wrong one.
+			err = db.ErrInvalidCredentials
+		}
 		if err != nil {
 			// Check if error is due to session context cancellation (server shutdown)
 			// Note: Must check s.ctx.Err(), not just the query error, because the query context
@@ -1096,9 +1114,13 @@ func (s *POP3ProxySession) close() {
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits
 	// Background goroutine was causing leaks when server shutdown or high load prevented execution
 	// NOTE: accountID can be 0 for remotelookup accounts, so we don't check accountID > 0
-	// Skip unregister when registration was rejected; otherwise we would
-	// decrement a slot this session never held (limit erosion for the account).
-	if s.server.connTracker != nil && !s.connRejected {
+	// Only a session the tracker registered unregisters. The account ID is set
+	// as soon as the client's credentials are accepted, before the backend leg
+	// and the registration: a session whose backend leg failed, or whose
+	// registration was refused, holds no slot, and unregistering it would free
+	// the slot of another session of the account from the same IP.
+	if s.server.connTracker != nil && s.connRegistered {
+		s.connRegistered = false // the slot is released once, however often close() runs
 		// Use a new background context for this final operation, as s.ctx is likely already cancelled.
 		// UnregisterConnection is fast (in-memory only), so this won't block for long
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -1131,7 +1153,10 @@ func (s *POP3ProxySession) registerConnection() error {
 	defer cancel()
 
 	if s.server.connTracker != nil {
-		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "POP3", s.RemoteIP)
+		if err := s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "POP3", s.RemoteIP); err != nil {
+			return err
+		}
+		s.connRegistered = true
 	}
 	return nil
 }
@@ -1428,7 +1453,6 @@ func (s *POP3ProxySession) doLogin(ctx context.Context, username, password strin
 
 	if err := s.registerConnection(); err != nil {
 		s.InfoLog("connection rejected by connection tracker", "error", err)
-		s.connRejected = true
 		return &pop3server.Error{Code: "SYS/TEMP", Message: "Too many connections", Close: true}
 	}
 
