@@ -474,9 +474,15 @@ enabled = true
 
 The dotted form inside the block works too: `auth_rate_limit.enabled = true`.
 
-It applies to `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` and
-`http_user_api` blocks. Turn it on wherever clients log in: on the proxies when you run proxies, on
-the backends otherwise.
+It applies to `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`,
+`http_user_api` and `user_api_proxy` blocks. Turn it on wherever clients log in: on the proxies when
+you run proxies, on the backends otherwise.
+
+A `user_api_proxy` limits every login that passes it, with one count per client: those its backends
+answer, and those it answers itself (with named pools, a login for an address the remote lookup does
+not know or refuses; [USER_API.md](USER_API.md#121-how-a-request-is-routed)). Leave the limiter off
+on the `http_user_api` backends behind it: they see only the logins for addresses the lookup knows,
+so their delays and blocks would show which addresses those are.
 
 With `enabled = true`, every key you leave out, or set to `0`, gets its default. A `0` therefore never
 switches a tier off or removes a size cap.
@@ -579,7 +585,7 @@ goroutines with delayed logins. The limit is fixed. The replies are:
 | IMAP proxy | `<tag> NO Authentication failed` |
 | POP3 proxy | `-ERR [AUTH] Authentication failed` |
 | ManageSieve proxy | `NO "Authentication failed"` |
-| User API | HTTP 429 `Too many concurrent authentication attempts. Please try again later.` |
+| User API, User API proxy | HTTP 429 `Too many concurrent authentication attempts. Please try again later.` |
 
 ### 10.5 Exempt networks
 
@@ -625,7 +631,7 @@ normal load (`Auth rate limiter stats` lines, below).
 | `imap_proxy` | `<tag> NO Authentication failed`, then `* BYE [ALERT] Too many failed authentication attempts. Please try again later.` | Closed. |
 | `pop3_proxy` | `-ERR [AUTH] Authentication failed`, the same as a wrong password | Closed. |
 | `managesieve_proxy` | `NO "Authentication failed"`, the same as a wrong password | Closed. |
-| `http_user_api` | HTTP 401 `Invalid credentials` | n/a |
+| `http_user_api`, `user_api_proxy` | HTTP 401 `Invalid credentials`, the same as a wrong password | n/a |
 
 Backends hide the block on purpose: a reply that differs from a wrong password would tell an attacker
 that an account or address is being limited. The IMAP proxy is the exception and says so with an
@@ -649,8 +655,8 @@ sora-admin --config config.toml stats blocked --protocol imap_proxy
 
 This asks the Admin API at `[admin_cli] addr` (`GET /admin/auth/blocked`, optionally
 `?protocol=...`), so it shows the blocks of that one node. Protocol names are `imap`, `pop3`,
-`managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` and `userapi`. Each entry has the IP,
-the name for a Tier 1 block, `blocked_until`, the failure count, the first and last failure and the
+`managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `userapi` and `userapi_proxy`. Each
+entry has the IP, the name for a Tier 1 block, `blocked_until`, the failure count, the first and last failure and the
 type (`ip_username` or `ip`). There is no command to lift a block early; a restart of the node clears
 them all. See [ADMIN_API.md](ADMIN_API.md#16-authentication-statistics).
 

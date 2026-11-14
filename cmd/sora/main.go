@@ -2576,6 +2576,11 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		userAPIProxyAffinity = deps.affinityManager
 	}
 
+	authRateLimit := server.DefaultAuthRateLimiterConfig()
+	if serverConfig.AuthRateLimit != nil {
+		authRateLimit = *serverConfig.AuthRateLimit
+	}
+
 	server, err := userapiproxy.New(ctx, deps.resilientDB, userapiproxy.ServerOptions{
 		Name:                     serverConfig.Name,
 		Addr:                     serverConfig.Addr,
@@ -2602,6 +2607,7 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		RemoteLookup:             serverConfig.RemoteLookup,
 		LookupCache:              serverConfig.LookupCache,
 		AffinityManager:          userAPIProxyAffinity,
+		AuthRateLimit:            authRateLimit,
 		ProxyProtocol:            serverConfig.ProxyProtocol,
 		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,

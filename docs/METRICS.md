@@ -135,7 +135,7 @@ Types: a **counter** only goes up (use `rate()` or `increase()`), a **gauge** go
 |---|---|---|---|
 | `sora_authentication_attempts_total` | counter | `protocol`, `server_name`, `hostname`, `result` | Login attempts. `result`: `success`, `failure`; `rate_limited` on `pop3`; `unavailable` on the IMAP, POP3 and ManageSieve proxies (the remote lookup service was temporarily unavailable). |
 | `sora_password_verification_attempts_total` | counter | `hash_type`, `result` | Password hash checks. `hash_type`: `bcrypt`, `blf_crypt`, `ssha512`, `sha512`, `unknown`. `result`: `success`, `failure`. |
-| `sora_auth_rate_limiter_ip_username_entries` | gauge | `protocol`, `server_name`, `hostname` | Tracked IP-and-user pairs in the login rate limiter. `protocol`: `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `userapi`. |
+| `sora_auth_rate_limiter_ip_username_entries` | gauge | `protocol`, `server_name`, `hostname` | Tracked IP-and-user pairs in the login rate limiter. `protocol`: `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `userapi`, `userapi_proxy`. |
 | `sora_auth_rate_limiter_ip_entries` | gauge | same | Tracked IPs with failures. |
 | `sora_auth_rate_limiter_username_entries` | gauge | same | Tracked user names with failures. |
 | `sora_auth_rate_limiter_blocked_ips` | gauge | same | IPs blocked now. |

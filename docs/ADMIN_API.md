@@ -1269,7 +1269,7 @@ Lists the blocks that the authentication rate limiters of **this node** currentl
 [AUTHENTICATION.md](AUTHENTICATION.md) for how blocks are made.
 
 `protocol` is optional and exact: `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`,
-`managesieve_proxy` or `userapi`.
+`managesieve_proxy`, `userapi` or `userapi_proxy`.
 
 ```json
 {

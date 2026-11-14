@@ -76,6 +76,7 @@ type Server struct {
 	tlsConfig                  *tls.Config // Global TLS config from TLS manager (optional)
 	trustedProxies             []string    // CIDR blocks for trusted proxies
 	limiter                    *server.ConnectionLimiter
+	authLimiter                *server.AuthRateLimiter // login rate limit (auth_rate_limit); nil when off
 	// connReleases holds the connection-limiter release callback for each live
 	// connection, keyed by net.Conn, so the slot is freed on StateClosed/
 	// StateHijacked. Without this the limiter counter only ever increments and
@@ -132,6 +133,9 @@ type ServerOptions struct {
 	LookupCache              *config.LookupCacheConfig  // Route lookup cache configuration
 	AffinityManager          *server.AffinityManager    // Affinity manager for sticky routing (optional)
 	ClusterManager           *cluster.Manager           // Optional: enables cluster-wide per-IP limiting
+
+	// Rate limit of every login through the proxy (auth_rate_limit); see admitLogin.
+	AuthRateLimit server.AuthRateLimiterConfig
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol          bool   // Enable PROXY protocol support for incoming connections
@@ -375,9 +379,22 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		logger.Info("User API Proxy: Route lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
+	// Every login passes the proxy and some reach no backend (routeAuthRequest), so the
+	// proxy is where logins are rate limited, as on the other proxies.
+	hostname := config.ResolveMailHostname()
+	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("USER-API-PROXY", opts.Name, hostname, opts.AuthRateLimit, opts.TrustedNetworks)
+	if authLimiter != nil {
+		server.RegisterRateLimiter("userapi_proxy", opts.Name, authLimiter)
+		go func() {
+			<-ctx.Done()
+			server.UnregisterRateLimiter("userapi_proxy", opts.Name)
+			authLimiter.Stop()
+		}()
+	}
+
 	s := &Server{
 		name:                       opts.Name,
-		hostname:                   config.ResolveMailHostname(),
+		hostname:                   hostname,
 		addr:                       opts.Addr,
 		connManager:                connManager,
 		remoteUseProxyProtocol:     opts.RemoteUseProxyProtocol,
@@ -396,6 +413,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		tlsConfig:                  opts.TLSConfig,
 		trustedProxies:             opts.TrustedProxies,
 		limiter:                    limiter,
+		authLimiter:                authLimiter,
 		transport:                  transport,
 		transports:                 transports,
 		newTransport:               newTransport,
@@ -531,7 +549,7 @@ func (s *Server) setupHandler() http.Handler {
 			}
 
 			// Proxy authenticated request to the user's backend
-			s.proxyRequest(w, r, route)
+			s.proxyRequest(w, r, route, nil)
 			return
 		}
 
@@ -540,13 +558,14 @@ func (s *Server) setupHandler() http.Handler {
 		// request for that user: the account lives on a backend of the user's pool. A
 		// refresh whose token the proxy refuses is answered here, as on every other
 		// endpoint. A preflight, and an auth request that names nobody otherwise, reaches
-		// no account: see routeNameless. The backend handles rate limiting.
+		// no account: see routeNameless. Logins are rate limited here (admitLogin).
 		var route backendRoute
+		var login *loginAttempt
 		var err error
 		if isCORSPreflight(r) {
 			route, err = s.routeNameless(r)
 		} else {
-			route, err = s.routeAuthRequest(r)
+			route, login, err = s.routeAuthRequest(r)
 		}
 		if err != nil {
 			if errors.Is(err, errAuthBodyTooLarge) {
@@ -562,13 +581,18 @@ func (s *Server) setupHandler() http.Handler {
 				s.writeLoginRefused(w, r)
 				return
 			}
+			if errors.Is(err, server.ErrDelayQueueFull) {
+				// The answer of a backend's limiter (userapi handleLogin).
+				s.writeUserAPIError(w, r, "Too many concurrent authentication attempts. Please try again later.", http.StatusTooManyRequests)
+				return
+			}
 			logger.Warn("User API Proxy: Failed to get backend", "name", s.name, "path", r.URL.Path, "error", err)
 			s.writeError(w, r, "Service unavailable", http.StatusServiceUnavailable)
 			return
 		}
 
 		// Proxy unauthenticated request
-		s.proxyRequest(w, r, route)
+		s.proxyRequest(w, r, route, login)
 	})
 }
 
@@ -667,32 +691,79 @@ var errRefreshTokenRefused = errors.New("refresh token refused")
 // request nowhere.
 var errUserRefused = errors.New("user refused by the remote lookup")
 
-// errLoginRefused is a login for an errUserRefused user, refused by the proxy at the cost
-// of a password verification. It is answered as a backend answers a wrong password
-// (writeLoginRefused).
+// errLoginRefused is a login the proxy refuses itself: one for an errUserRefused user, at
+// the cost of a password verification, or one the rate limit blocks (admitLogin). It is
+// answered as a backend answers a wrong password (writeLoginRefused).
 var errLoginRefused = errors.New("login refused")
 
-// routeAuthRequest picks the backend for an unauthenticated auth request. A login for a
-// user the lookup does not know or refuses reaches no backend, which would verify the
-// password before answering 401: the proxy verifies it against a dummy hash instead and
-// returns errLoginRefused, so that neither the answer nor its timing shows what the
-// lookup said of the address. A refresh for such a user carries a token the proxy
-// accepted, so its caller learns nothing from the refusal and it stays a temporary one.
-func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, error) {
+// routeAuthRequest picks the backend for an unauthenticated auth request, and returns
+// the login attempt the rate limit counts by the backend's answer (nil for a refresh, or
+// without a rate limit). A login is admitted by the rate limit first (admitLogin). A
+// login for a user the lookup does not know or refuses reaches no backend, which would
+// verify the password before answering 401: the proxy verifies it against a dummy hash
+// instead, counts it as a failure and returns errLoginRefused, so that neither the
+// answer, nor its timing, nor the rate limit shows what the lookup said of the address.
+// A refresh for such a user carries a token the proxy accepted, so its caller learns
+// nothing from the refusal and it stays a temporary one.
+func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, *loginAttempt, error) {
 	id, err := s.peekAuthIdentity(r)
 	if err != nil {
-		return backendRoute{}, err
+		return backendRoute{}, nil, err
 	}
 	if id.email == "" {
-		return s.routeNameless(r)
+		route, err := s.routeNameless(r)
+		return route, nil, err
+	}
+	var login *loginAttempt
+	if id.password != "" && s.authLimiter != nil {
+		login = &loginAttempt{addr: &server.StringAddr{Addr: s.getRealClientIP(r)}, key: server.AuthRateLimitKey(id.email)}
+		if err := s.admitLogin(r.Context(), login); err != nil {
+			return backendRoute{}, nil, err
+		}
 	}
 	route, err := s.routeUser(r.Context(), id.email, id.accountID, true)
 	if errors.Is(err, errUserRefused) && id.password != "" {
 		logger.Info("User API Proxy: Login refused", "name", s.name, "user", id.email, "error", err)
 		db.DummyVerifyPassword(id.password)
-		return backendRoute{}, fmt.Errorf("%w: %w", errLoginRefused, err)
+		s.recordLogin(r.Context(), login, false)
+		return backendRoute{}, nil, fmt.Errorf("%w: %w", errLoginRefused, err)
 	}
-	return route, err
+	if err != nil {
+		return backendRoute{}, nil, err
+	}
+	return route, login, nil
+}
+
+// loginAttempt is a login the rate limit counts: the client's address, and the address
+// it logs in as keyed as a backend keys it (server.AuthRateLimitKey).
+type loginAttempt struct {
+	addr net.Addr
+	key  string
+}
+
+// admitLogin applies the rate limit to a login before it is routed, as a backend applies
+// its own before it verifies the password (userapi handleLogin): the client's progressive
+// delay, then the blocks of its IP and of its IP and address. A blocked login is
+// errLoginRefused, answered at once like a wrong password, without a verification that
+// would let a blocked client spend the proxy's CPU. One limiter counts every login
+// through the proxy, those a backend answers (proxyRequest) and those the proxy refuses
+// itself, so neither a delay nor a block depends on whether the lookup knows the address.
+// A login delay that cannot be served is server.ErrDelayQueueFull.
+func (s *Server) admitLogin(ctx context.Context, login *loginAttempt) error {
+	if err := server.ApplyAuthenticationDelay(ctx, s.authLimiter, login.addr, "userapi_proxy"); err != nil {
+		return fmt.Errorf("login delay: %w", err)
+	}
+	if err := s.authLimiter.CanAttemptAuth(ctx, login.addr, login.key); err != nil {
+		return fmt.Errorf("%w: %w", errLoginRefused, err)
+	}
+	return nil
+}
+
+// recordLogin counts the outcome of login; a nil login (no rate limit) counts nothing.
+func (s *Server) recordLogin(ctx context.Context, login *loginAttempt, success bool) {
+	if login != nil {
+		s.authLimiter.RecordAuthAttempt(ctx, login.addr, login.key, success)
+	}
 }
 
 // authIdentity is the user an auth request is for (see peekAuthIdentity).
@@ -1021,8 +1092,9 @@ func (s *Server) cacheRoute(email string, entry *lookupcache.CacheEntry) {
 	s.lookupCache.Set(s.name, email, entry)
 }
 
-// proxyRequest proxies the request to the backend
-func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route backendRoute) {
+// proxyRequest proxies the request to the backend. login is the login attempt r is, if
+// the rate limit counts it (routeAuthRequest), else nil.
+func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route backendRoute, login *loginAttempt) {
 	binding, err := s.connManager.BindBackendRoute(route.pool, route.addr)
 	if err != nil {
 		s.writeError(w, r, "Backend route unavailable", http.StatusServiceUnavailable)
@@ -1060,6 +1132,20 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route back
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		logger.Warn("User API Proxy: Backend request failed", "name", s.name, "backend", route.addr, "error", err)
 		s.writeError(w, r, "Bad gateway", http.StatusBadGateway)
+	}
+	// A login's verdict is the backend's answer: 200 a success, 401 a wrong password or an
+	// address without an account. Any other answer (a malformed request, a temporary
+	// failure) says nothing of the password and is not counted, as on a backend.
+	if login != nil {
+		proxy.ModifyResponse = func(resp *http.Response) error {
+			switch resp.StatusCode {
+			case http.StatusOK:
+				s.recordLogin(resp.Request.Context(), login, true)
+			case http.StatusUnauthorized:
+				s.recordLogin(resp.Request.Context(), login, false)
+			}
+			return nil
+		}
 	}
 
 	// Modify request. Capture the original Host BEFORE overwriting r.Host:
