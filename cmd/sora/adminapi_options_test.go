@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/authcache"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/adminapi"
 )
 
@@ -133,5 +135,25 @@ func TestBuildAdminAPIServerOptions_DisabledAffinityAndAuthCache(t *testing.T) {
 	var stats map[string]any
 	if resp.StatusCode != http.StatusOK || json.Unmarshal([]byte(body), &stats) != nil || stats["enabled"] != false {
 		t.Errorf("GET /admin/auth-cache/stats: got %d %s, want 200 with enabled=false", resp.StatusCode, strings.TrimSpace(body))
+	}
+}
+
+// The other half of the nil guard: on a node with [cluster] and [auth_cache] the node's
+// affinity manager and auth cache must still reach the Admin API, or its affinity
+// endpoints answer 503 and the auth cache reports "not enabled" on exactly the nodes
+// that have them.
+func TestBuildAdminAPIServerOptions_EnabledAffinityAndAuthCache(t *testing.T) {
+	deps := &serverDependencies{
+		affinityManager:   &server.AffinityManager{},
+		authCacheInstance: &authcache.Cache{},
+	}
+
+	options := buildAdminAPIServerOptions(deps, config.ServerConfig{Name: "admin-api", Addr: ":8080"})
+
+	if options.AffinityManager != deps.affinityManager {
+		t.Errorf("AffinityManager is %T(%p), want the node's affinity manager %p", options.AffinityManager, options.AffinityManager, deps.affinityManager)
+	}
+	if options.AuthCache != deps.authCacheInstance {
+		t.Errorf("AuthCache is %T(%p), want the node's auth cache %p", options.AuthCache, options.AuthCache, deps.authCacheInstance)
 	}
 }
