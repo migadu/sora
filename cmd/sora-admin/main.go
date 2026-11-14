@@ -397,9 +397,3 @@ func truncateString(s string, maxLen int) string {
 	}
 	return s[:maxLen-3] + "..."
 }
-
-// Affinity Management Functions
-
-// Affinity Management Functions (via HTTP Admin API)
-
-// callAdminAPI makes an HTTP request to the admin API server

@@ -1974,6 +1974,10 @@ paths:
                   backend:
                     type: string
                     example: "192.168.1.10:993"
+                  found:
+                    type: boolean
+                    description: "Always true in a 200 answer; a missing affinity is a 404."
+                    example: true
         '400':
           description: Missing or invalid parameters.
           content:
@@ -2147,17 +2151,62 @@ paths:
     get:
       tags:
         - Affinity Management
-      summary: List all backend affinities (not implemented)
+      summary: List backend affinities
       description: |
-        Not implemented: affinities are distributed via gossip and held in memory on each node.
-        Use GET /affinity with a user and protocol to read one affinity.
+        Lists the unexpired affinities this node holds, sorted by user and protocol. Every node
+        applies the affinities the others gossip, so any node of a converged cluster lists the
+        same set.
+      parameters:
+        - name: protocol
+          in: query
+          required: false
+          schema:
+            type: string
+          description: "Only affinities of this protocol (case-insensitive)"
+          example: "imap"
+        - name: backend
+          in: query
+          required: false
+          schema:
+            type: string
+          description: "Only affinities to this backend address"
+          example: "192.168.1.10:993"
       responses:
-        '501':
-          description: Listing is not implemented.
+        '200':
+          description: The affinities.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                type: object
+                properties:
+                  affinities:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        user:
+                          type: string
+                          format: email
+                          example: "user@example.com"
+                        protocol:
+                          type: string
+                          example: "imap"
+                        backend:
+                          type: string
+                          example: "192.168.1.10:993"
+                        assigned_at:
+                          type: string
+                          format: date-time
+                        expires_at:
+                          type: string
+                          format: date-time
+                        node_id:
+                          type: string
+                          description: "Node that assigned the affinity"
+                          example: "node-1"
+                  count:
+                    type: integer
+                    example: 1
         '503':
           description: Affinity manager not enabled on this server.
           content:
