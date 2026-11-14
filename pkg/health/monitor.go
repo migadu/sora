@@ -28,6 +28,8 @@ const (
 	// failures are intermittent rather than consecutive.
 	unhealthyFailureRate = 0.5
 	recentOutcomeWindow  = 10
+	// Refresh stable health_status rows so retention only removes stopped nodes.
+	statusReportEvery = 20
 )
 
 // failureWindow is a ring of the most recent check outcomes.
@@ -84,9 +86,10 @@ type HealthCheck struct {
 
 	// CheckCount and FailCount are lifetime totals reported to operators; the
 	// status is derived from these recent-outcome fields instead.
-	consecutiveFails int
-	recent           failureWindow
-	everSucceeded    bool
+	consecutiveFails  int
+	recent            failureWindow
+	everSucceeded     bool
+	checksSinceReport int
 
 	// stop ends the goroutine running this check. Set and called under HealthMonitor.mu.
 	stop context.CancelFunc
@@ -133,6 +136,7 @@ func (hm *HealthMonitor) RegisterCheck(check *HealthCheck) {
 	}
 }
 
+// AddStatusCallback reports the first result, changes, and every 20 stable checks.
 func (hm *HealthMonitor) AddStatusCallback(callback func(name string, status ComponentStatus)) {
 	hm.mu.Lock()
 	hm.statusCallbacks = append(hm.statusCallbacks, callback)
@@ -263,6 +267,12 @@ func (hm *HealthMonitor) performCheck(runCtx context.Context, check *HealthCheck
 	}
 
 	currentStatus := check.Status
+	changed := previousStatus != currentStatus || isFirstCheck
+	check.checksSinceReport++
+	report := changed || check.checksSinceReport >= statusReportEvery
+	if report {
+		check.checksSinceReport = 0
+	}
 	check.mu.Unlock()
 
 	// Record health check metrics
@@ -282,12 +292,14 @@ func (hm *HealthMonitor) performCheck(runCtx context.Context, check *HealthCheck
 	}
 	metrics.ComponentHealthStatus.WithLabelValues(check.Name, "").Set(statusValue)
 
-	if previousStatus != currentStatus || isFirstCheck {
+	if changed {
 		if isFirstCheck {
 			logger.Info("Health: Check initialized", "check", check.Name, "status", currentStatus)
 		} else {
 			logger.Info("Health: Check status changed", "check", check.Name, "from", previousStatus, "to", currentStatus)
 		}
+	}
+	if report {
 		hm.notifyStatusChangeLocked(check.Name, currentStatus)
 	}
 	hm.mu.Unlock()
