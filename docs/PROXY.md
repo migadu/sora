@@ -948,7 +948,9 @@ cache_path = "/var/lib/sora/affinity_cache.db"
 
 - Used only with `[cluster]` and `[cluster.affinity]` enabled and `cache_path` set.
 - At startup, entries that have not expired are loaded, except for users gossip has already
-  provided.
+  provided. Gossip is applied and written to the file from the moment the node joins the cluster,
+  also while the file is loaded: an entry that a delete received meanwhile removes is not loaded
+  and is deleted from the file.
 - Every change (set, update, delete, also those received by gossip) is written to the file in the
   background, in the order the changes were made, each write with a 2-second limit. A key changed
   again before its write starts is written once, with its latest state. Gossip changes apply only

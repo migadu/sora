@@ -1112,26 +1112,28 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			affinityCleanup = 1 * time.Hour
 		}
 
+		// Open the persistent affinity store, if configured, before creating the affinity
+		// manager: the node has already joined the cluster, and every gossip event the
+		// manager applies, also while it loads the store, must be written to the store.
+		var affinityStore server.AffinityPersistStore
+		if cfg.Cluster.Affinity.Enabled && cfg.Cluster.Affinity.CachePath != "" {
+			store, err := affinitycache.New(cfg.Cluster.Affinity.CachePath)
+			if err != nil {
+				logger.Error("Failed to initialize affinity cache - continuing without persistence", "path", cfg.Cluster.Affinity.CachePath, "error", err)
+			} else {
+				affinityStore = store
+				logger.Info("Affinity cache initialized", "path", cfg.Cluster.Affinity.CachePath)
+			}
+		}
+
 		// Initialize affinity manager for cluster-wide user-to-backend affinity. With
 		// [cluster.affinity] enabled = false there is none: proxies with enable_affinity
 		// route by consistent hash, and no affinity is gossiped or persisted.
-		deps.affinityManager = server.NewAffinityManager(deps.clusterManager, cfg.Cluster.Affinity.Enabled, affinityTTL, affinityCleanup)
+		deps.affinityManager = server.NewAffinityManagerWithStore(ctx, deps.clusterManager, cfg.Cluster.Affinity.Enabled, affinityTTL, affinityCleanup, affinityStore)
 		if deps.affinityManager != nil {
 			logger.Info("Affinity manager initialized for cluster-wide user routing", "ttl", affinityTTL, "cleanup_interval", affinityCleanup)
 		} else {
 			logger.Info("Cluster-wide affinity disabled by [cluster.affinity] enabled = false")
-		}
-
-		// Attach persistent affinity store if configured
-		if cfg.Cluster.Affinity.CachePath != "" && deps.affinityManager != nil {
-			affinityStore, err := affinitycache.New(cfg.Cluster.Affinity.CachePath)
-			if err != nil {
-				logger.Error("Failed to initialize affinity cache - continuing without persistence", "path", cfg.Cluster.Affinity.CachePath, "error", err)
-			} else {
-				deps.affinityManager.SetPersistStore(affinityStore)
-				deps.affinityManager.LoadPersistedAffinities(ctx)
-				logger.Info("Affinity cache initialized", "path", cfg.Cluster.Affinity.CachePath)
-			}
 		}
 	}
 
