@@ -352,6 +352,7 @@ type MessageS3Info struct {
 	S3Domain    string
 	S3Localpart string
 	S3Key       string
+	Uploaded    bool // false while the body waits for the uploader: no object is expected yet
 }
 
 // MessageHashInfo represents message info for content hash verification
@@ -368,7 +369,7 @@ type MessageHashInfo struct {
 // GetAllMessagesForUserVerification retrieves S3 info for all non-expunged messages for a user
 func (db *Database) GetAllMessagesForUserVerification(ctx context.Context, accountID int64) ([]MessageS3Info, error) {
 	query := `
-		SELECT id, content_hash, s3_domain, s3_localpart
+		SELECT id, content_hash, s3_domain, s3_localpart, uploaded
 		FROM messages
 		WHERE account_id = $1 AND expunged_at IS NULL
 		ORDER BY id
@@ -383,7 +384,7 @@ func (db *Database) GetAllMessagesForUserVerification(ctx context.Context, accou
 	var messages []MessageS3Info
 	for rows.Next() {
 		var msg MessageS3Info
-		err := rows.Scan(&msg.ID, &msg.ContentHash, &msg.S3Domain, &msg.S3Localpart)
+		err := rows.Scan(&msg.ID, &msg.ContentHash, &msg.S3Domain, &msg.S3Localpart, &msg.Uploaded)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan message: %w", err)
 		}

@@ -146,14 +146,49 @@ func (d *Database) RekeyContentHash(ctx context.Context, tx pgx.Tx, accountID in
 // reports false may be deleted. It reads the primary: a lagging replica could miss a row that
 // was just written.
 func (d *Database) IsContentObjectReferenced(ctx context.Context, obj ContentObject) (bool, error) {
-	var referenced bool
-	err := d.GetWritePool().QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM messages
-		               WHERE content_hash = $3 AND s3_domain = $1 AND s3_localpart = $2)
-		    OR EXISTS (SELECT 1 FROM pending_uploads WHERE content_hash = $3)`,
-		obj.S3Domain, obj.S3Localpart, obj.ContentHash).Scan(&referenced)
+	unreferenced, err := d.UnreferencedContentObjects(ctx, []ContentObject{obj})
 	if err != nil {
 		return false, fmt.Errorf("failed to check references to %s: %w", obj.Key(), err)
 	}
-	return referenced, nil
+	return len(unreferenced) == 0, nil
+}
+
+// UnreferencedContentObjects returns, in their order, the objects of objs for which
+// IsContentObjectReferenced reports false, in one query. Like it, it reads the primary.
+func (d *Database) UnreferencedContentObjects(ctx context.Context, objs []ContentObject) ([]ContentObject, error) {
+	if len(objs) == 0 {
+		return nil, nil
+	}
+	domains := make([]string, len(objs))
+	localparts := make([]string, len(objs))
+	hashes := make([]string, len(objs))
+	for i, o := range objs {
+		domains[i], localparts[i], hashes[i] = o.S3Domain, o.S3Localpart, o.ContentHash
+	}
+
+	rows, err := d.GetWritePool().Query(ctx, `
+		SELECT o.i
+		FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY AS o(s3_domain, s3_localpart, content_hash, i)
+		WHERE NOT EXISTS (SELECT 1 FROM messages m
+		                  WHERE m.content_hash = o.content_hash
+		                    AND m.s3_domain = o.s3_domain AND m.s3_localpart = o.s3_localpart)
+		  AND NOT EXISTS (SELECT 1 FROM pending_uploads pu WHERE pu.content_hash = o.content_hash)
+		ORDER BY o.i`, domains, localparts, hashes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check references to %d stored bodies: %w", len(objs), err)
+	}
+	defer rows.Close()
+
+	var unreferenced []ContentObject
+	for rows.Next() {
+		var i int64
+		if err := rows.Scan(&i); err != nil {
+			return nil, fmt.Errorf("failed to scan unreferenced stored body: %w", err)
+		}
+		unreferenced = append(unreferenced, objs[i-1])
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to check references to %d stored bodies: %w", len(objs), err)
+	}
+	return unreferenced, nil
 }

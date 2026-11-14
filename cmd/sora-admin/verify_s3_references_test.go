@@ -225,3 +225,31 @@ func TestVerifyS3NotUploadedRowsAreNotMissing(t *testing.T) {
 
 	assert.Empty(t, result.MissingFromS3, "a row whose upload is pending was reported missing from S3")
 }
+
+// TestVerifyS3FixOrphanedRechecksBeforeDelete: an object reported orphaned can be
+// claimed before --fix-orphaned reaches it (a delivery of the same body re-uploads it).
+// The delete re-checks under the body's object lock and keeps it.
+func TestVerifyS3FixOrphanedRechecksBeforeDelete(t *testing.T) {
+	f := newRekeyFixture(t)
+	mem, endpoint := newMemS3(t)
+
+	accountID, domain, localpart := f.account("verify-recheck")
+	claimedHash := helpers.HashContent(f.body("claimed"))
+	claimedKey := helpers.NewS3Key(domain, localpart, claimedHash)
+	mem.put(claimedKey)
+	orphanKey := helpers.NewS3Key(domain, localpart, helpers.HashContent(f.body("orphan")))
+	mem.put(orphanKey)
+
+	result := &verificationResult{OrphanedInS3: []string{claimedKey, orphanKey}}
+	// Claimed after the check, before the delete.
+	f.insert(accountID, "INBOX", domain, localpart, claimedHash, f.body("claimed"), "<claimed-"+f.nonce+"@example.org>")
+
+	cfg := verifyTestConfig(t, endpoint)
+	s3Storage, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, false, false, 5*time.Second)
+	require.NoError(t, err)
+	require.NoError(t, applyFixes(f.ctx, f.rdb, s3Storage, accountID, result, true, false))
+
+	assert.True(t, mem.has(claimedKey), "an object claimed after the check was deleted")
+	assert.False(t, mem.has(orphanKey), "an object nothing references was kept")
+	assert.Equal(t, 1, result.FixedOrphaned)
+}
