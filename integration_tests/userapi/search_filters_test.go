@@ -110,4 +110,22 @@ func TestUserAPI_SearchAppliesFilters(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("MissingStateIsUnseen", func(t *testing.T) {
+		const suffix = " missing-state message"
+		seed(6, word+suffix, false, from("", "other@example.com"))
+		if _, err := h.rdb.ExecWithRetry(ctx, `DELETE FROM message_state
+			WHERE message_id IN (SELECT id FROM messages WHERE mailbox_id=$1 AND subject=$2)`, h.inbox.ID, word+suffix); err != nil {
+			t.Fatal(err)
+		}
+		// Search already returns absent state with flags=0, so the unseen filter
+		// must include that same message as well as messages with an explicit row.
+		want := []string{word + suffix}
+		if got := search(url.Values{"subject": {suffix}}); !slices.Equal(got, want) {
+			t.Fatalf("unfiltered missing-state message = %q, want %q", got, want)
+		}
+		if got := search(url.Values{"subject": {suffix}, "unseen": {"true"}}); !slices.Equal(got, want) {
+			t.Errorf("unseen missing-state message = %q, want %q", got, want)
+		}
+	})
 }

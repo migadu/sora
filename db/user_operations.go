@@ -311,8 +311,8 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 
 	args := []any{mailbox.ID, strings.ToLower(query), query, mailbox.AccountID, UserAPISearchLimit + 1}
 	// The filters are the IMAP SEARCH FROM, SUBJECT and UNSEEN predicates (search.go):
-	// strpos() on columns idx_messages_mailbox_headers_v2 carries, and the \Seen test
-	// inlined so it matches idx_message_state_first_unseen's predicate.
+	// strpos() on columns idx_messages_mailbox_headers_v2 carries, and an inline
+	// \Seen bit test. Absent state is zero flags, as in the returned metadata.
 	filterCond := ""
 	if filter.From != "" {
 		args = append(args, strings.ToLower(filter.From))
@@ -323,7 +323,7 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 		filterCond += " AND " + substringCond("LOWER(m.subject)", fmt.Sprintf("$%d", len(args)))
 	}
 	if filter.UnseenOnly {
-		filterCond += fmt.Sprintf(" AND (ms.flags & %d) = 0", FlagSeen)
+		filterCond += fmt.Sprintf(" AND (ms.flags IS NULL OR (ms.flags & %d) = 0)", FlagSeen)
 	}
 
 	searchQuery = strings.Replace(searchQuery, "__HEADER_COND__", headerSubstringCond("m.", "$2"), 1)
