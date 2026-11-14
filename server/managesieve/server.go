@@ -111,7 +111,7 @@ type ManageSieveServer struct {
 	// Active session tracking for graceful shutdown
 	activeSessionsMutex sync.RWMutex
 	activeSessions      map[*ManageSieveSession]struct{}
-	sessionsWg          sync.WaitGroup // Tracks active sessions for graceful drain
+	sessions            serverPkg.SessionGroup // Tracks active sessions for graceful drain
 
 	// msLibServer is the go-managesieve protocol server. It is swapped
 	// atomically on SIGHUP so reloaded settings apply to new connections
@@ -400,6 +400,8 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 		StrictSessionErrors: true, // Session errors are *managesieveserver.Error; mask anything else (DB error text must not reach clients)
 		NewSession: func(c *managesieveserver.Conn) (managesieveserver.Session, error) {
 			netConn := c.NetConn()
+			endInitialization := s.sessions.GuardInitialization(s.appCtx, netConn)
+			defer endInitialization()
 			proxyInfo := serverPkg.GetProxyProtocolInfo(netConn)
 			clientIP, proxyIP := serverPkg.GetConnectionIPs(netConn, proxyInfo)
 
@@ -611,9 +613,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		// callback (see buildLibServer), so rejected connections never
 		// inflate the gauges.
 
-		s.sessionsWg.Add(1)
-		go func() {
-			defer s.sessionsWg.Done()
+		started := s.sessions.Go(func() {
 			// Recover from any panic in the session goroutine. Without this, a single
 			// malformed command would propagate an unrecovered panic and crash the entire
 			// (multi-protocol) server process, dropping every connection. Mirrors POP3.
@@ -623,7 +623,13 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 				}
 			}()
 			s.msLibServer.Load().ServeConn(conn)
-		}()
+		})
+		if !started {
+			// Close is draining the sessions and no longer waits for new ones.
+			conn.Close()
+			logger.Info("ManageSieve server stopped gracefully", "name", s.name)
+			return
+		}
 	}
 }
 
@@ -638,6 +644,7 @@ func (s *ManageSieveServer) SetConnTracker(tracker *serverPkg.ConnectionTracker)
 }
 
 func (s *ManageSieveServer) Close() {
+	s.sessions.BeginDrain()
 	// Unregister rate limiter from global registry
 	serverPkg.UnregisterRateLimiter("managesieve", s.name)
 
@@ -669,16 +676,9 @@ func (s *ManageSieveServer) Close() {
 
 // waitForSessionsDrain waits for all active sessions to finish with a timeout
 func (s *ManageSieveServer) waitForSessionsDrain(timeout time.Duration) {
-	done := make(chan struct{})
-	go func() {
-		s.sessionsWg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(timeout) {
 		logger.Debug("ManageSieve: All sessions drained gracefully", "name", s.name)
-	case <-time.After(timeout):
+	} else {
 		logger.Debug("ManageSieve: Session drain timeout, forcing shutdown", "name", s.name, "timeout", timeout)
 	}
 }
