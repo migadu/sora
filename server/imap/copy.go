@@ -124,6 +124,9 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	type crossAccountObject struct{ contentHash, sourceKey, destKey string }
 	var crossAccountObjects []crossAccountObject
 	seenHashes := make(map[string]bool)
+	// The hash each cross-account body is made available for below. CopyMessages copies a
+	// source only if it still has it, since a rekey can rename it before the INSERT.
+	sourceHashes := make(map[imap.UID]string)
 
 	for _, msg := range messages {
 		if msg.AccountID == destMailbox.AccountID {
@@ -131,6 +134,7 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 		}
 		// Cross-account copy: the new row will be owned by the destination mailbox
 		// owner, so the body must be reachable under the owner's S3 path.
+		sourceHashes[msg.UID] = msg.ContentHash
 		if msg.IsUploaded {
 			// Body is in S3 under the source's path; copy it to the owner's path.
 			if seenHashes[msg.ContentHash] {
@@ -162,7 +166,7 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	}
 
 	// Perform the batch copy operation
-	uidMap, newMessageIDs, err := s.server.rdb.CopyMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname)
+	uidMap, newMessageIDs, err := s.server.rdb.CopyMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname, sourceHashes)
 	if err != nil {
 		switch {
 		case errors.Is(err, resilient.ErrCommitOutcomeUnknown):
@@ -194,6 +198,17 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 			// authoritative, so fall through to the normal success path.
 			s.WarnLog("COPY commit acknowledgement was lost but read-back confirms the copy committed; answering OK",
 				"messages", len(newMessageIDs))
+		case errors.Is(err, db.ErrCopySourceChanged):
+			// A source body was renamed (sora-admin import rekey) after it was made
+			// available above, under the old hash. Nothing was written; a new COPY reads the
+			// new hash. RFC 5530 §3: INUSE, "The operation may succeed if the client tries
+			// again later."
+			s.InfoLog("COPY source changed during the copy; answering retryable NO", "error", err)
+			return nil, &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeInUse,
+				Text: "Messages changed during the copy, please retry",
+			}
 		case strings.Contains(err.Error(), "source and destination mailboxes cannot be the same"):
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,

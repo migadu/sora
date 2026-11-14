@@ -262,7 +262,7 @@ func TestCopyMessagesNotDuplicatedWhenCommitAckLost(t *testing.T) {
 	uids := []imap.UID{1, 2, 3}
 	armed.Store(true)
 	_, _, err := rdb.CopyMessagesWithRetry(context.Background(), &uids,
-		fixture.srcID, fixture.destID, fixture.accountID, "example.com", "user", "test-instance")
+		fixture.srcID, fixture.destID, fixture.accountID, "example.com", "user", "test-instance", nil)
 	t.Logf("CopyMessagesWithRetry returned: %v", err)
 
 	if !fired.Load() {
@@ -292,7 +292,7 @@ func TestAmbiguousCopyCommitResolvesToCommitted(t *testing.T) {
 	uids := []imap.UID{1, 2, 3}
 	armed.Store(true)
 	uidMap, newIDs, err := faulty.CopyMessagesWithRetry(context.Background(), &uids,
-		fixture.srcID, fixture.destID, fixture.accountID, "example.com", "user", "test-instance")
+		fixture.srcID, fixture.destID, fixture.accountID, "example.com", "user", "test-instance", nil)
 
 	if !fired.Load() {
 		t.Fatal("fault was never injected: the COMMIT acknowledgement was not dropped, so this test proves nothing")
@@ -337,7 +337,7 @@ func TestCopiedMessagesCommittedReadBackIsExact(t *testing.T) {
 	// Commit a real copy on a healthy connection and collect its ids.
 	uids := []imap.UID{1, 2, 3}
 	_, newIDs, err := rdb.CopyMessagesWithRetry(ctx, &uids,
-		fixture.srcID, fixture.destID, fixture.accountID, "example.com", "user", "test-instance")
+		fixture.srcID, fixture.destID, fixture.accountID, "example.com", "user", "test-instance", nil)
 	if err != nil {
 		t.Fatalf("copy failed: %v", err)
 	}
