@@ -303,10 +303,11 @@ func (c *ClusterConfig) GetMaxEventQueueSize() int {
 // Validate checks an enabled [cluster] for the settings gossip cannot run without.
 //
 // addr must be an IP address the other nodes can reach: it is bound and advertised as
-// is, so 0.0.0.0, ::, localhost or a host name cannot be used. secret_key is required
-// and must be the base64 of 32 bytes (AES-256): gossip carries auth-failure state, IP
-// blocks and connection-kick commands, which any host able to reach the gossip port
-// could forge without encryption.
+// is, so 0.0.0.0, ::, localhost or a host name cannot be used. Its port (from addr, or
+// the port key) must be one memberlist can bind; 0 binds a free port, which memberlist
+// advertises. secret_key is required and must be the base64 of 32 bytes (AES-256):
+// gossip carries auth-failure state, IP blocks and connection-kick commands, which any
+// host able to reach the gossip port could forge without encryption.
 func (c *ClusterConfig) Validate() error {
 	if !c.Enabled {
 		return nil
@@ -314,6 +315,9 @@ func (c *ClusterConfig) Validate() error {
 	bindAddr := c.GetBindAddr()
 	if ip := net.ParseIP(bindAddr); ip == nil || ip.IsUnspecified() {
 		return fmt.Errorf("cluster addr '%s' must be a specific IP address reachable from other nodes, such as \"10.10.10.40:7946\" (not 0.0.0.0, ::, localhost or a host name)", bindAddr)
+	}
+	if port := c.GetBindPort(); port < 0 || port > 65535 {
+		return fmt.Errorf("cluster port %d is not a valid port (0 to 65535)", port)
 	}
 	if c.SecretKey == "" {
 		return errors.New("cluster secret_key is required when cluster mode is enabled (generate one with: openssl rand -base64 32)")
@@ -3155,10 +3159,11 @@ func (c *Config) DatabaseUser() *ServerConfig {
 	return nil
 }
 
-// HasDatabaseEndpoint reports whether [database.write] or [database.read] names a host.
-func (c *Config) HasDatabaseEndpoint() bool {
-	return (c.Database.Write != nil && len(c.Database.Write.Hosts) > 0) ||
-		(c.Database.Read != nil && len(c.Database.Read.Hosts) > 0)
+// HasDatabaseWriteEndpoint reports whether [database.write] names a host. A server that
+// queries the database needs one, whatever [database.read] names: every one of them
+// writes, and the database connection does not start without a write host.
+func (c *Config) HasDatabaseWriteEndpoint() bool {
+	return c.Database.Write != nil && len(c.Database.Write.Hosts) > 0
 }
 
 // NeedsS3 reports whether the node connects to [s3]. A mail backend stores message bodies
@@ -3256,8 +3261,8 @@ func (c *Config) Validate() []Problem {
 		add("[cleanup]", c.Cleanup.Validate())
 	}
 
-	if user := c.DatabaseUser(); user != nil && !c.HasDatabaseEndpoint() {
-		add("[database]", fmt.Errorf("server %q (%s) needs the database, but it is not configured in [database.write] or [database.read]", user.Name, user.Type))
+	if user := c.DatabaseUser(); user != nil && !c.HasDatabaseWriteEndpoint() {
+		add("[database]", fmt.Errorf("server %q (%s) needs the database, but it is not configured in [database.write]", user.Name, user.Type))
 	}
 	if c.NeedsS3() {
 		add("[s3]", c.S3.Validate())

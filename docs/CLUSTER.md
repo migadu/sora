@@ -99,7 +99,9 @@ Rules for `addr`:
   machine.
 - The port can be written in `addr` (`"10.0.0.11:7946"`, or `"[2001:db8::11]:7946"` for IPv6) or in
   `port`. If `addr` has a port, it wins and a warning says `port` is ignored. With neither, the port
-  is `7946`.
+  is `7946`. A port above 65535 or below 0 is refused at startup, and by `sora-admin config
+  validate`, with `cluster port <n> is not a valid port (0 to 65535)`. Port `0` binds a free port,
+  which the node advertises; the other nodes cannot list it in `peers`.
 
 ### Ports to open
 

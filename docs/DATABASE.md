@@ -184,9 +184,11 @@ CPUs, whichever is larger).
   `[database.write]`. Repeat them, or the read endpoint uses the defaults above.
 - **An endpoint you do not write is not configured.** Without a `[database.write]` (or
   `[database.read]`) section in the file, Sora has no such endpoint. This is how a proxy-only node
-  runs without a database. A node that needs a database and has none refuses to start, and
-  `sora-admin config validate` refuses the file, with `[database]: server "<name>" (<type>) needs
-  the database, but it is not configured in [database.write] or [database.read]`.
+  runs without a database. A node that needs a database needs `[database.write]`: every server
+  that queries the database writes to it, and `[database.read]` only takes reads off it. Without it
+  the node refuses to start, and `sora-admin config validate` refuses the file, with
+  `[database]: server "<name>" (<type>) needs the database, but it is not configured in
+  [database.write]`.
 - **User name and password** may contain any characters. Sora escapes them in the connection URL.
 - **IPv6 addresses** go in brackets with a port: `hosts = ["[2001:db8::10]:5432"]`.
 

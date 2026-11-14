@@ -170,9 +170,10 @@ Things to know:
   `enabled = false`. See [9.10](#910-lookup-cache-serverlookup_cache).
 - **A database endpoint you do not write means "no database".** Without a `[database.write]` (or
   `[database.read]`) section in the file, Sora has no such endpoint. This is how a proxy-only node
-  runs without one. A node that needs a database and has none stops with `[database]: server
-  "<name>" (<type>) needs the database, but it is not configured in [database.write] or
-  [database.read]`.
+  runs without one. A node that needs a database needs `[database.write]`, since every server that
+  queries the database writes to it; `[database.read]` only takes reads off it. Without one the node
+  stops with `[database]: server "<name>" (<type>) needs the database, but it is not configured in
+  [database.write]`.
 
 ---
 
@@ -196,8 +197,8 @@ so its failure is an ERROR record of the `[logging]` output, in its format.
 | A `[[server]]` block lacks `type`, `name` or `addr` | for example `server address is required` |
 | No server is configured | `no servers configured. Please configure at least one server in the [[server]] section` |
 | An IMAP, POP3 or LMTP server is configured, or an `http_user_api` server with any `[s3]` connection setting, and `[s3] bucket` or `endpoint` is empty, or `timeout` is not a duration | `[s3]: bucket is required ...`, `[s3]: endpoint is required ...` or `[s3]: invalid timeout "<value>": ...` |
-| A server that needs the database is configured and there is no database endpoint (see [section 3](#3-defaults)) | `[database]: server "<name>" (<type>) needs the database, but it is not configured in [database.write] or [database.read]` |
-| `[cluster] enabled = true` and `addr` is not an IP address other than `0.0.0.0` or `::`, or `secret_key` is missing or not the base64 of 32 bytes (see [CLUSTER.md](CLUSTER.md)) | `[cluster]: cluster addr '<host>' must be a specific IP address reachable from other nodes, ...`, `[cluster]: cluster secret_key is required when cluster mode is enabled ...`, `[cluster]: failed to decode cluster secret_key: ...` or `[cluster]: cluster secret_key must be 32 bytes (got <n> bytes)` |
+| A server that needs the database is configured and `[database.write]` names no host (see [section 3](#3-defaults)) | `[database]: server "<name>" (<type>) needs the database, but it is not configured in [database.write]` |
+| `[cluster] enabled = true` and `addr` is not an IP address other than `0.0.0.0` or `::`, the port (in `addr` or `port`) is above 65535 or negative, or `secret_key` is missing or not the base64 of 32 bytes (see [CLUSTER.md](CLUSTER.md)) | `[cluster]: cluster addr '<host>' must be a specific IP address reachable from other nodes, ...`, `[cluster]: cluster port <n> is not a valid port (0 to 65535)`, `[cluster]: cluster secret_key is required when cluster mode is enabled ...`, `[cluster]: failed to decode cluster secret_key: ...` or `[cluster]: cluster secret_key must be 32 bytes (got <n> bytes)` |
 | `[servers] trusted_networks` has an entry that is neither an IP address nor a CIDR block | names the invalid entry |
 | A server's `auth_rate_limit.exempt_networks` has an entry that is neither an IP address nor a CIDR block | `server "<name>": auth_rate_limit.exempt_networks has entries that are neither an IP address nor a CIDR: [...]` |
 | `[relay] type` is set to something other than `"smtp"` or `"http"` | `unsupported [relay] type ...` |
