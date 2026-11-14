@@ -2940,6 +2940,19 @@ func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaDa
 
 	if cfg.TLS.LetsEncrypt != nil {
 		cfg.TLS.LetsEncrypt.normalizeDomains()
+		for i := range cfg.DynamicServers {
+			srv := &cfg.DynamicServers[i]
+			if srv.TLSDefaultDomain == "" {
+				continue
+			}
+			name, err := autocertName(srv.TLSDefaultDomain)
+			if err != nil {
+				warnf("server %q: ignoring tls_default_domain %q, clients without SNI use the global default: %v", srv.Name, srv.TLSDefaultDomain, err)
+			}
+			// The per-listener SNI-less override reaches the same whitelist as
+			// default_domain, before autocert can normalize it itself.
+			srv.TLSDefaultDomain = name
+		}
 	}
 
 	// Apply default values for fields where the Go zero value differs from the desired default
