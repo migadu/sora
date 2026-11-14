@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net"
 	"os"
 	"regexp"
@@ -254,7 +253,7 @@ type IMAPServer struct {
 	useStartTLS    bool // tlsConfig upgrades a plaintext listener on STARTTLS instead of wrapping it
 	masterUsername []byte
 	masterPassword []byte
-	appendLimit    uint32 // append_limit with the default applied, clamped to maxStoredMessageSize; a session lowers it to its memory budget (IMAPSession.AppendLimit)
+	appendLimit    uint32 // append_limit with the default applied, clamped to consts.MaxStoredMessageSize; a session lowers it to its memory budget (IMAPSession.AppendLimit)
 	ftsRetention   time.Duration
 	version        string
 	config         *config.Config       // Full config reference for shared mailboxes
@@ -422,26 +421,22 @@ type IMAPServerOptions struct {
 	SpamTraining *spamtraining.Client
 }
 
-// maxStoredMessageSize is the largest message sora can store: messages.size and
-// pending_uploads.size are INTEGER columns, which refuse a larger value.
-const maxStoredMessageSize = math.MaxInt32
-
 // effectiveAppendLimit resolves the configured append_limit to the largest
 // message this server accepts, before a session's memory budget lowers it
 // (IMAPSession.AppendLimit). A value of 0 or less means the default. RFC 7889
 // §5: "The number indicates the fixed maximum message size in octets that the
-// server will accept", so a value above maxStoredMessageSize is clamped to it.
-// That also keeps it inside the RFC 3501 "number", an "Unsigned 32-bit integer
-// (0 <= n < 4,294,967,296)", which APPENDLIMIT is written as: converting a
-// larger value with uint32() wrapped "4gb" to 0, which advertised APPENDLIMIT=0
-// and refused every APPEND.
+// server will accept", so a value above consts.MaxStoredMessageSize (the largest
+// message sora can store) is clamped to it. That also keeps it inside the RFC
+// 3501 "number", an "Unsigned 32-bit integer (0 <= n < 4,294,967,296)", which
+// APPENDLIMIT is written as: converting a larger value with uint32() wrapped
+// "4gb" to 0, which advertised APPENDLIMIT=0 and refused every APPEND.
 func effectiveAppendLimit(name string, configured int64) uint32 {
 	if configured <= 0 {
 		return DefaultAppendLimit
 	}
-	if configured > maxStoredMessageSize {
-		logger.Warn("IMAP: append_limit exceeds the largest message sora can store; clamping", "name", name, "append_limit", configured, "clamped_to", maxStoredMessageSize)
-		return maxStoredMessageSize
+	if configured > consts.MaxStoredMessageSize {
+		logger.Warn("IMAP: append_limit exceeds the largest message sora can store; clamping", "name", name, "append_limit", configured, "clamped_to", consts.MaxStoredMessageSize)
+		return consts.MaxStoredMessageSize
 	}
 	return uint32(configured)
 }

@@ -915,6 +915,19 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		return nil
 	}
 
+	// The trace headers and header edits above can take a message read at
+	// max_message_size past what the database stores: refuse it as too large here
+	// rather than answer the failed insert with a 4xx the sender retries.
+	if err := delivery.CheckStorableSize(len(fullMessageBytes)); err != nil {
+		s.WarnLog("message too large to store", "size", len(fullMessageBytes), "limit", consts.MaxStoredMessageSize)
+		recordMetrics("failure")
+		return &smtp.SMTPError{
+			Code:         552,
+			EnhancedCode: smtp.EnhancedCode{5, 3, 4},
+			Message:      fmt.Sprintf("message size exceeds maximum allowed size of %d bytes", consts.MaxStoredMessageSize),
+		}
+	}
+
 	// Store message locally for background upload to S3
 	// This happens AFTER Sieve processing and header edits, so we store the modified message
 	// Check if file already exists to prevent race condition:
