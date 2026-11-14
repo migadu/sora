@@ -258,7 +258,10 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 			}
 			param := nextParam()
 			args[param] = lowerValue
-			conditions = append(conditions, substringCond(msgIDListExpr(column), "@"+param))
+			// An absent header yields NULL, which must be FALSE before NOT/OR
+			// combine it with other criteria. In particular NOT HEADER ... ""
+			// tests absence, while HEADER ... "" still tests presence.
+			conditions = append(conditions, "COALESCE("+substringCond(msgIDListExpr(column), "@"+param)+", FALSE)")
 		case "from":
 			param := nextParam()
 			// Support partial matching on both email address and display name

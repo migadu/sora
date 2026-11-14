@@ -64,9 +64,8 @@ func TestIMAP_SearchBccReplyToAndMessageIDHeaders(t *testing.T) {
 		"Message-ID: <m2@example.com>\r\n" +
 		"In-Reply-To: <b1@example.com> <b2@example.com>\r\n" +
 		"\r\nbody\r\n")
-	// No Bcc, Reply-To, Sender, In-Reply-To or References: matches none of the
-	// searches below.
-	appendMsg("From: frank@example.com\r\nTo: carol@example.com\r\nSubject: plain\r\nMessage-ID: <m3@example.com>\r\n\r\nbody\r\n")
+	// Absent headers must not match a positive search, and must match its NOT.
+	plain := appendMsg("From: frank@example.com\r\nTo: carol@example.com\r\nSubject: plain\r\nMessage-ID: <m3@example.com>\r\n\r\nbody\r\n")
 
 	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
 		t.Fatalf("SELECT: %v", err)
@@ -74,6 +73,9 @@ func TestIMAP_SearchBccReplyToAndMessageIDHeaders(t *testing.T) {
 
 	header := func(key, value string) *imap.SearchCriteria {
 		return &imap.SearchCriteria{Header: []imap.SearchCriteriaHeaderField{{Key: key, Value: value}}}
+	}
+	notHeader := func(key, value string) *imap.SearchCriteria {
+		return &imap.SearchCriteria{Not: []imap.SearchCriteria{*header(key, value)}}
 	}
 	for _, tc := range []struct {
 		name     string
@@ -95,6 +97,10 @@ func TestIMAP_SearchBccReplyToAndMessageIDHeaders(t *testing.T) {
 		{"References first ID with brackets", header("References", "<a0@example.com>"), []imap.UID{reply}},
 		{"References two IDs", header("References", "<a0@example.com> <a1@example.com>"), []imap.UID{reply}},
 		{"References substring", header("References", "a1@EXAMPLE"), []imap.UID{reply}},
+		{"NOT In-Reply-To includes absent header", notHeader("In-Reply-To", "<a1@example.com>"), []imap.UID{twoParents, plain}},
+		{"NOT References includes absent headers", notHeader("References", "<a0@example.com>"), []imap.UID{twoParents, plain}},
+		{"NOT In-Reply-To presence", notHeader("In-Reply-To", ""), []imap.UID{plain}},
+		{"NOT References presence", notHeader("References", ""), []imap.UID{twoParents, plain}},
 	} {
 		data, err := c.UIDSearch(tc.criteria, nil).Wait()
 		if err != nil {
@@ -104,7 +110,7 @@ func TestIMAP_SearchBccReplyToAndMessageIDHeaders(t *testing.T) {
 		got := data.AllUIDs()
 		slices.Sort(got)
 		if !slices.Equal(got, tc.want) {
-			t.Errorf("%s: UID SEARCH HEADER %s %q = %v, want %v", tc.name, tc.criteria.Header[0].Key, tc.criteria.Header[0].Value, got, tc.want)
+			t.Errorf("%s: UID SEARCH = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
