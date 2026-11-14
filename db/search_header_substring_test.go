@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -21,7 +22,8 @@ import (
 
 // Header search (SEARCH FROM/TO/CC/SUBJECT/HEADER References, TEXT, and the User API
 // mailbox search) is written as strpos(), never LIKE, and is served by
-// idx_messages_mailbox_headers (migration 000052) as an Index Only Scan.
+// idx_messages_mailbox_headers_v2 (migration 000059, which replaced 000052's index) as an
+// Index Only Scan.
 //
 // The two halves depend on each other. LIKE on these columns is served by the corpus-wide
 // trigram GINs from migration 000034, whose planner cost estimate is wrong by three orders of
@@ -68,12 +70,12 @@ func TestHeaderSearchCriteriaBindLiteralTerms(t *testing.T) {
 		criteria *imap.SearchCriteria
 		exprs    []string
 	}{
-		{"FROM", header("From"), []string{"m.from_email_sort", "m.from_name_sort"}},
-		{"TO", header("To"), []string{"m.to_email_sort", "m.to_name_sort"}},
-		{"CC", header("Cc"), []string{"m.cc_email_sort"}},
+		{"FROM", header("From"), []string{"m.from_email_sort", "m.from_name_sort", `split_part(COALESCE(m.extra_addresses, ''), E'\n', 1)`}},
+		{"TO", header("To"), []string{"m.to_email_sort", "m.to_name_sort", `split_part(COALESCE(m.extra_addresses, ''), E'\n', 2)`}},
+		{"CC", header("Cc"), []string{"m.cc_email_sort", `split_part(COALESCE(m.extra_addresses, ''), E'\n', 3)`}},
 		{"SUBJECT", header("Subject"), []string{"LOWER(m.subject)"}},
 		{"HEADER References", header("References"), []string{`LOWER(m."references")`}},
-		{"TEXT", &imap.SearchCriteria{Text: []string{"Support@Equishark.com"}}, []string{"LOWER(m.subject)", "m.from_email_sort", "m.to_name_sort", "m.cc_email_sort"}},
+		{"TEXT", &imap.SearchCriteria{Text: []string{"Support@Equishark.com"}}, []string{"LOWER(m.subject)", "m.from_email_sort", "m.to_name_sort", "m.cc_email_sort", "COALESCE(m.extra_addresses, '')"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -107,12 +109,16 @@ func TestSortColumnsAreBounded(t *testing.T) {
 	longAddr := strings.Repeat("a", 300) + "@example.com"
 	longSubject := "Re: " + strings.Repeat("ü", 700)
 
-	subjectSort, fromName, fromEmail, toName, toEmail, ccEmail := sortColumnsFor(longSubject, []helpers.Recipient{
+	recipients := []helpers.Recipient{
 		{AddressType: "from", Name: longName, EmailAddress: strings.ToUpper(longAddr)},
 		{AddressType: "to", Name: "Bob", EmailAddress: "Bob@Example.org"},
 		{AddressType: "cc", EmailAddress: strings.Repeat("c", 250) + "@x.org"},
-	})
-	for name, v := range map[string]string{"subject_sort": subjectSort, "from_name_sort": fromName, "from_email_sort": fromEmail, "cc_email_sort": ccEmail} {
+	}
+	for i := range 100 {
+		recipients = append(recipients, helpers.Recipient{AddressType: "to", Name: strings.Repeat("é", 10), EmailAddress: fmt.Sprintf("r%d@example.org", i)})
+	}
+	subjectSort, fromName, fromEmail, toName, toEmail, ccEmail, extra := sortColumnsFor(longSubject, recipients)
+	for name, v := range map[string]string{"subject_sort": subjectSort, "from_name_sort": fromName, "from_email_sort": fromEmail, "cc_email_sort": ccEmail, "extra_addresses": extra} {
 		assert.True(t, utf8.ValidString(v), "%s must stay valid UTF-8", name)
 	}
 	assert.LessOrEqual(t, len(subjectSort), helpers.MaxSubjectBytes)
@@ -122,6 +128,11 @@ func TestSortColumnsAreBounded(t *testing.T) {
 	assert.Equal(t, "bob", toName, "short values are lowercased and otherwise untouched")
 	assert.Equal(t, "bob@example.org", toEmail)
 	assert.Equal(t, strings.ToLower(longAddr)[:helpers.MaxSortColumnBytes], fromEmail, "truncation keeps the prefix")
+	// extra_addresses gets what the five sort columns leave of their shared budget.
+	used := len(fromName) + len(fromEmail) + len(toName) + len(toEmail) + len(ccEmail)
+	assert.LessOrEqual(t, used+len(extra), helpers.MaxAddressColumnsBytes)
+	assert.Greater(t, used+len(extra), helpers.MaxAddressColumnsBytes-4, "a long list fills the budget (up to a split rune)")
+	assert.True(t, strings.HasPrefix(extra, "\n"+strings.Repeat("é", 10)+"\tr0@example.org\t"), "the To section follows an empty From section: %q", extra[:40])
 
 	// scripts/fix_oversized_header_columns.sql bounds EXISTING rows before the index is built;
 	// it must apply the same numbers, or the build fails on a row the application would
@@ -137,35 +148,49 @@ func TestSortColumnsAreBounded(t *testing.T) {
 	}
 
 	// The sum the index relies on: worst-case text in one tuple stays under the btree limit
-	// with room for the fixed columns and headers.
-	const btreeTupleLimit, fixedColumnsAndHeaders = 2704, 130
-	assert.LessOrEqual(t, 2*helpers.MaxSubjectBytes+5*helpers.MaxSortColumnBytes+fixedColumnsAndHeaders, btreeTupleLimit,
-		"the byte bounds must keep an idx_messages_mailbox_headers tuple under the btree limit")
+	// with room for the fixed columns and headers (~172 bytes measured on PostgreSQL 17:
+	// with every other column at its bound, incompressible, the address columns fit 1332
+	// bytes). TestInsertBoundsHeaderColumns proves it against the real index.
+	const btreeTupleLimit, fixedColumnsAndHeaders = 2704, 172
+	assert.LessOrEqual(t, 2*helpers.MaxSubjectBytes+helpers.MaxAddressColumnsBytes+fixedColumnsAndHeaders, btreeTupleLimit,
+		"the byte bounds must keep an idx_messages_mailbox_headers_v2 tuple under the btree limit")
+	assert.GreaterOrEqual(t, helpers.MaxAddressColumnsBytes-5*helpers.MaxSortColumnBytes, 300,
+		"extra_addresses must keep a useful minimum when every sort column is at its bound")
 }
 
-// headerIndexColumns parses the INCLUDE list, key column and predicate column of
-// idx_messages_mailbox_headers from migration 000052, so the guards below follow the
-// migration rather than a copy of it.
-func headerIndexColumns(t *testing.T) map[string]bool {
+// headerIndex parses the name, INCLUDE list, key column and predicate column of the header
+// covering index from the newest migration that creates it (000059's
+// idx_messages_mailbox_headers_v2 replaced 000052's idx_messages_mailbox_headers), so the
+// guards below follow the migrations rather than a copy of them.
+func headerIndex(t *testing.T) (name string, cols map[string]bool) {
 	t.Helper()
-	src, err := os.ReadFile("migrations/000052_messages_mailbox_headers_index.up.sql")
+	files, err := filepath.Glob("migrations/*.up.sql")
 	require.NoError(t, err)
-	// The statement is the last CREATE INDEX in the file (the runbook quotes the DDL in a
-	// comment above it); strip comment lines first.
-	var code []string
-	for _, line := range strings.Split(string(src), "\n") {
-		if !strings.HasPrefix(strings.TrimSpace(line), "--") {
-			code = append(code, line)
+	sort.Strings(files)
+	def := regexp.MustCompile(`(?s)CREATE INDEX (\w+) ON messages \((\w+)\)\s*INCLUDE \(([^)]*)\)\s*WHERE (\w+) IS NULL`)
+	var m []string
+	var from string
+	for _, f := range files {
+		src, err := os.ReadFile(f)
+		require.NoError(t, err)
+		// Runbooks quote the DDL in comments; only statements count.
+		var code []string
+		for _, line := range strings.Split(string(src), "\n") {
+			if !strings.HasPrefix(strings.TrimSpace(line), "--") {
+				code = append(code, line)
+			}
+		}
+		if found := def.FindStringSubmatch(strings.ReplaceAll(strings.Join(code, "\n"), "IF NOT EXISTS ", "")); found != nil {
+			m, from = found, f
 		}
 	}
-	stmt := strings.Join(code, "\n")
-	m := regexp.MustCompile(`(?s)ON messages \((\w+)\)\s*INCLUDE \(([^)]*)\)\s*WHERE (\w+) IS NULL`).FindStringSubmatch(stmt)
-	require.NotNil(t, m, "could not parse the index definition from migration 000052:\n%s", stmt)
-	cols := map[string]bool{m[1]: true, m[3]: true}
-	for _, c := range strings.Split(m[2], ",") {
+	require.NotNil(t, m, "no migration creates the header covering index")
+	require.Equal(t, "migrations/000059_messages_extra_addresses.up.sql", from, "harness check: the newest definition is 000059's")
+	cols = map[string]bool{m[2]: true, m[4]: true}
+	for _, c := range strings.Split(m[3], ",") {
 		cols[strings.TrimSpace(c)] = true
 	}
-	return cols
+	return m[1], cols
 }
 
 // headerIndexHeapOnlyColumns are messages.* columns the search builders may reference that
@@ -181,7 +206,7 @@ var headerIndexHeapOnlyColumns = map[string]bool{
 // idx_messages_mailbox_headers. One missing column silently turns every header search back
 // into the heap filter measured at 38 s, and nothing else would notice.
 func TestHeaderIndexCoversLightweightSearch(t *testing.T) {
-	indexed := headerIndexColumns(t)
+	_, indexed := headerIndex(t)
 	var db *Database
 	colRef := regexp.MustCompile(`\bm\.("references"|[a-z_]+)`)
 	referenced := map[string]string{} // column -> where it was seen
@@ -241,9 +266,9 @@ func TestHeaderIndexCoversLightweightSearch(t *testing.T) {
 		}
 	}
 	sort.Strings(missing)
-	assert.Empty(t, missing, "messages.* columns referenced by the lightweight search but not carried by idx_messages_mailbox_headers; add them to the INCLUDE list (and bound them if text) or to headerIndexHeapOnlyColumns with a reason")
+	assert.Empty(t, missing, "messages.* columns referenced by the lightweight search but not carried by the header covering index; add them to the INCLUDE list (and bound them if text) or to headerIndexHeapOnlyColumns with a reason")
 	// The guard must have seen the columns it exists for.
-	for _, col := range []string{"from_email_sort", "subject", "subject_sort", "content_hash", "internal_date", "size"} {
+	for _, col := range []string{"from_email_sort", "subject", "subject_sort", "content_hash", "internal_date", "size", "extra_addresses"} {
 		assert.Contains(t, referenced, col, "harness check: the probe must reference %s", col)
 	}
 }
@@ -266,7 +291,7 @@ func (n hdrPlanNode) walk(visit func(hdrPlanNode)) {
 
 // TestHeaderSearchIsIndexOnly captures the statement IMAP SEARCH FROM actually issues and
 // replays it under EXPLAIN (ANALYZE): the messages table must be read through an Index Only
-// Scan on idx_messages_mailbox_headers and through nothing else. This is the property the
+// Scan on the header covering index (idx_messages_mailbox_headers_v2) and through nothing else. This is the property the
 // migration exists for; a projection or predicate column outside the index breaks it, and
 // only the plan shows that.
 //
@@ -334,18 +359,19 @@ func TestHeaderSearchIsIndexOnly(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &explained))
 	require.Len(t, explained, 1)
 
+	indexName, _ := headerIndex(t)
 	var indexOnly, otherMessagesScans []string
 	explained[0].Plan.walk(func(n hdrPlanNode) {
 		if n.RelationName != "messages" {
 			return
 		}
-		if n.NodeType == "Index Only Scan" && n.IndexName == "idx_messages_mailbox_headers" {
+		if n.NodeType == "Index Only Scan" && n.IndexName == indexName {
 			indexOnly = append(indexOnly, fmt.Sprintf("%s heap_fetches=%.0f", n.IndexName, n.HeapFetches))
 			return
 		}
 		otherMessagesScans = append(otherMessagesScans, n.NodeType+" "+n.IndexName)
 	})
-	assert.NotEmpty(t, indexOnly, "header SEARCH must read messages through an Index Only Scan on idx_messages_mailbox_headers; plan:\n%s", string(raw))
+	assert.NotEmpty(t, indexOnly, "header SEARCH must read messages through an Index Only Scan on %s; plan:\n%s", indexName, string(raw))
 	assert.Empty(t, otherMessagesScans, "header SEARCH must not read messages any other way (heap filter or trigram GIN); plan:\n%s", string(raw))
 	t.Logf("messages access: %v", indexOnly)
 }
@@ -440,7 +466,7 @@ func incompressibleText(n int) string {
 // real insert path and checks the stored columns are bounded, so the row fits the covering
 // index's tuple limit. Without the bounds this INSERT fails with "index row size exceeds
 // btree version 4 maximum" once migration 000052 is applied (proved red 2026-10-01 with the
-// same incompressible fixture).
+// same incompressible fixture), and with extra_addresses unbounded once 000059 is.
 func TestInsertBoundsHeaderColumns(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -457,30 +483,37 @@ func TestInsertBoundsHeaderColumns(t *testing.T) {
 	now := time.Now()
 	longSubject := "Re: " + incompressibleText(3000) + "ü" // 3 KB of subject, multibyte at the tail
 	longAddr := incompressibleText(900) + "@example.com"
+	recipients := []helpers.Recipient{
+		{AddressType: "from", Name: incompressibleText(500), EmailAddress: longAddr},
+		{AddressType: "to", Name: incompressibleText(500), EmailAddress: longAddr},
+		{AddressType: "cc", EmailAddress: longAddr},
+	}
+	// Every further address goes to extra_addresses, which must take only what the five
+	// sort columns leave of their shared budget.
+	for i := range 40 {
+		recipients = append(recipients, helpers.Recipient{AddressType: "cc", Name: incompressibleText(40), EmailAddress: fmt.Sprintf("%s%d@example.com", incompressibleText(30), i)})
+	}
 	_, _, err = db.InsertMessage(ctx, tx, &InsertMessageOptions{
 		AccountID: accountID, MailboxID: mailboxID, MailboxName: "INBOX",
 		S3Domain: "example.com", S3Localpart: "bounds", ContentHash: "boundshash",
 		MessageID: "<bounds@example.com>", InternalDate: now, SentDate: now, Size: 1024,
-		Subject: longSubject, BodyStructure: &bs,
-		Recipients: []helpers.Recipient{
-			{AddressType: "from", Name: incompressibleText(500), EmailAddress: longAddr},
-			{AddressType: "to", Name: incompressibleText(500), EmailAddress: longAddr},
-			{AddressType: "cc", EmailAddress: longAddr},
-		},
+		Subject: longSubject, BodyStructure: &bs, Recipients: recipients,
 	}, PendingUpload{InstanceID: "test", ContentHash: "boundshash", Size: 1024, AccountID: accountID})
 	require.NoError(t, err, "a message with oversized headers must still be deliverable")
 	require.NoError(t, tx.Commit(ctx))
 
-	var subj, subjSort, fromName, fromEmail, toName, toEmail, ccEmail int
+	var subj, subjSort, fromName, fromEmail, toName, toEmail, ccEmail, extra int
 	err = db.GetReadPool().QueryRow(ctx, `
 		SELECT octet_length(subject), octet_length(subject_sort), octet_length(from_name_sort), octet_length(from_email_sort),
-		       octet_length(to_name_sort), octet_length(to_email_sort), octet_length(cc_email_sort)
-		FROM messages WHERE mailbox_id = $1 AND content_hash = 'boundshash'`, mailboxID).Scan(&subj, &subjSort, &fromName, &fromEmail, &toName, &toEmail, &ccEmail)
+		       octet_length(to_name_sort), octet_length(to_email_sort), octet_length(cc_email_sort), octet_length(extra_addresses)
+		FROM messages WHERE mailbox_id = $1 AND content_hash = 'boundshash'`, mailboxID).Scan(&subj, &subjSort, &fromName, &fromEmail, &toName, &toEmail, &ccEmail, &extra)
 	require.NoError(t, err)
 	assert.LessOrEqual(t, subj, helpers.MaxSubjectBytes)
 	assert.LessOrEqual(t, subjSort, helpers.MaxSubjectBytes)
 	for name, n := range map[string]int{"from_name_sort": fromName, "from_email_sort": fromEmail, "to_name_sort": toName, "to_email_sort": toEmail, "cc_email_sort": ccEmail} {
 		assert.LessOrEqual(t, n, helpers.MaxSortColumnBytes, name)
 	}
+	assert.Equal(t, helpers.MaxAddressColumnsBytes, fromName+fromEmail+toName+toEmail+ccEmail+extra,
+		"extra_addresses fills exactly what the sort columns leave (ASCII, so no rune boundary)")
 	assert.Positive(t, subj, "the subject is truncated, not dropped")
 }
