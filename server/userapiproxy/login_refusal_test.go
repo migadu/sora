@@ -7,11 +7,14 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/lookupcache"
+	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/testutils"
@@ -148,5 +151,74 @@ func TestUserAPIProxy_LoginRefusedFromItsBodyIsNotLookedUp(t *testing.T) {
 		if asked := lookup.asked(); len(asked) != 0 {
 			t.Errorf("%s: the routing lookup was asked for %v", answer.name, asked)
 		}
+	}
+}
+
+// A login whose email is not an address ("john", "john@", "@example.com") is refused by
+// the routing lookup client before it asks the service, with the answer it gives a
+// 401/403 (#850). With named pools it is answered as a wrong password too, whether or
+// not a pool is the default: a backend answers a login for an address no account has
+// 401 after a dummy verification, and a 503 sends the client into retries instead of
+// telling the user the address or password is wrong. It reaches no backend: a
+// credential stored under an address the proxy cannot parse would be looked up in
+// whichever pool answered.
+func TestUserAPIProxy_LoginWithAnInvalidAddressLooksLikeAWrongPassword(t *testing.T) {
+	origCost := db.BcryptCost
+	db.BcryptCost = bcrypt.MinCost
+	t.Cleanup(func() { db.BcryptCost = origCost })
+
+	var asked atomic.Int32
+	lookup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(lookup.Close)
+	_, addr, hits := countingBackend(t)
+
+	for _, isDefault := range []bool{false, true} {
+		s, err := New(t.Context(), &resilient.ResilientDatabase{}, ServerOptions{
+			Name:      "invalid-address-proxy",
+			Addr:      "127.0.0.1:0",
+			JWTSecret: corsTestSecret,
+			Pools:     []proxy.PoolSpec{{Name: "sora0", Backends: []string{addr}, Default: isDefault}},
+			RemoteLookup: &config.RemoteLookupConfig{
+				Enabled: true,
+				URL:     lookup.URL + "/lookup?email=$email",
+				Timeout: "2s",
+			},
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		t.Cleanup(s.cancel)
+		m := proxy.NewMaintenance()
+		m.Set(nil)
+		s.connManager.SetMaintenance(m)
+		handler := s.setupHandler()
+
+		for _, email := range []string{"john", "john@", "@example.com"} {
+			r := httptest.NewRequest(http.MethodPost, "/user/auth/login", strings.NewReader(`{"email":"`+email+`","password":"wrong-password"}`))
+			r.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			before := testutils.PasswordVerifications()
+			handler.ServeHTTP(w, r)
+			verifications := testutils.PasswordVerifications() - before
+
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("default=%v, email %q: status %d (%q), want 401", isDefault, email, w.Code, w.Body.String())
+			}
+			if msg := errorBody(t, w); msg != "Invalid credentials" {
+				t.Errorf("default=%v, email %q: error %q, want \"Invalid credentials\"", isDefault, email, msg)
+			}
+			if verifications != 1 {
+				t.Errorf("default=%v, email %q: %d password verifications, want 1", isDefault, email, verifications)
+			}
+		}
+	}
+	if n := asked.Load(); n != 0 {
+		t.Errorf("the lookup service was asked %d times, want never", n)
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("logins with an invalid address reached a backend %d times, want never", n)
 	}
 }

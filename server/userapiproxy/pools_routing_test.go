@@ -66,16 +66,18 @@ func poolAnswer(pool string) *scriptedLookup {
 	return &scriptedLookup{info: &proxy.UserRoutingInfo{PoolName: pool, AccountID: 42}, result: proxy.AuthSuccess}
 }
 
-// With named pools, a lookup that fails or answers nothing usable is refused: a request
-// carrying a token for account 42 must never reach the default pool's backends, where
-// account 42 is someone else. Nothing is cached, so the next request asks again.
+// With named pools, a lookup that fails, answers nothing usable or refuses the account
+// (401/403) is refused: a request carrying a token for account 42 must never reach the
+// default pool's backends, where account 42 is someone else. Nothing is cached, so the
+// next request asks again.
 func TestRouteUser_NamedPoolsRefuseWhatTheLookupDidNotAnswer(t *testing.T) {
 	for _, c := range []struct {
 		name   string
 		lookup *scriptedLookup
 	}{
 		{"lookup service down", &scriptedLookup{result: proxy.AuthTemporarilyUnavailable, err: errors.New("connection refused")}},
-		{"answer without a route (e.g. 429)", &scriptedLookup{result: proxy.AuthFailed}},
+		{"answer without a route", &scriptedLookup{result: proxy.AuthSuccess}},
+		{"lookup refuses the account (401/403)", &scriptedLookup{result: proxy.AuthFailed}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			s, _ := newPoolsMaintenanceServer(t) // sora0 is the default pool
