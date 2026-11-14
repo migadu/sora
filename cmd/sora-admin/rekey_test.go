@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -365,4 +366,56 @@ func TestRekeyOldObjectWaitsAndRechecks(t *testing.T) {
 	assert.Equal(t, []string{oldKey}, r.report.OldKept)
 	assert.Zero(t, r.report.OldDeleted)
 	assert.False(t, strings.Contains(strings.Join(r.report.OldLeft, ","), oldKey))
+}
+
+// barrierStore holds every Put until n of them are in flight (or a second has passed), so
+// that n jobs are all inside their S3 object locks at the same time.
+type barrierStore struct {
+	*testutils.FileBasedS3Mock
+	arrived chan struct{}
+	n       int
+}
+
+func (s *barrierStore) Put(key string, r io.Reader, size int64) error {
+	select {
+	case s.arrived <- struct{}{}:
+	default:
+	}
+	deadline := time.After(time.Second)
+	for len(s.arrived) < s.n {
+		select {
+		case <-deadline:
+			return s.FileBasedS3Mock.Put(key, r, size)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	return s.FileBasedS3Mock.Put(key, r, size)
+}
+
+// TestRekeyJobsFitTheWritePool: a job holds a connection for its S3 object lock and needs a
+// second one for the re-key transaction it runs under that lock. With as many jobs as the
+// write pool has connections, the locks can take every connection, and each transaction
+// then waits for one until its write timeout fails it.
+func TestRekeyJobsFitTheWritePool(t *testing.T) {
+	f := newRekeyFixture(t)
+	cfg := adminTestDBConfig(t)
+	cfg.Write.MaxConnections = 2
+	cfg.WriteTimeout = "1s"
+	rdb, err := resilient.NewResilientDatabase(f.ctx, cfg, false, false)
+	require.NoError(t, err)
+	t.Cleanup(rdb.Close)
+
+	accountID, domain, local := f.account("pool")
+	for _, name := range []string{"first", "second"} {
+		body := f.body(name)
+		hash := sha256Hex(body)
+		f.insert(accountID, "INBOX", domain, local, hash, body, name+"-"+f.nonce)
+		f.put(helpers.NewS3Key(domain, local, hash), body)
+	}
+
+	store := &barrierStore{FileBasedS3Mock: f.store, arrived: make(chan struct{}, 2), n: 2}
+	report, err := rekeyAccount(f.ctx, rdb, store, accountID, rekeyOptions{BatchSize: 10, Jobs: 2})
+	require.NoError(t, err)
+	assert.Empty(t, report.Failed)
+	assert.Equal(t, 2, report.Rekeyed)
 }

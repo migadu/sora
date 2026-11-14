@@ -147,6 +147,15 @@ func rekeyAccount(ctx context.Context, rdb *resilient.ResilientDatabase, store o
 	if opts.Jobs <= 0 {
 		opts.Jobs = 1
 	}
+	// A job holds one write-pool connection for its S3 object lock and needs a second one
+	// for the re-key transaction it runs under that lock. Jobs whose locks held every
+	// connection would each wait for a second one until the write timeout failed them.
+	if poolSize := int(rdb.GetOperationalDatabase().GetWritePool().Stat().MaxConns()); opts.Jobs > max(1, poolSize/2) {
+		opts.Jobs = max(1, poolSize/2)
+		if opts.Progress != nil {
+			fmt.Fprintf(opts.Progress, "  Running %d jobs: each needs 2 of the %d connections of the database write pool\n", opts.Jobs, poolSize)
+		}
+	}
 	r := &rekeyRun{
 		rdb:       rdb,
 		store:     store,
