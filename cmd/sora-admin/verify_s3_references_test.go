@@ -226,6 +226,33 @@ func TestVerifyS3NotUploadedRowsAreNotMissing(t *testing.T) {
 	assert.Empty(t, result.MissingFromS3, "a row whose upload is pending was reported missing from S3")
 }
 
+// TestVerifyS3NotUploadedRowWithoutPendingUploadIsMissing: a row marked not uploaded
+// with no pending upload (the upload was given up, or --fix-missing marked the row) is
+// waiting for nothing: no uploader will write its body, and the cleaner reaps the row
+// once it is older than the grace period. Its object is missing from S3, as on main; it
+// is not an upload in progress, and a second run after --fix-missing must not call the
+// account consistent.
+func TestVerifyS3NotUploadedRowWithoutPendingUploadIsMissing(t *testing.T) {
+	f := newRekeyFixture(t)
+	_, endpoint := newMemS3(t)
+
+	accountID, domain, localpart := f.account("verify-stranded")
+	strandedHash := helpers.HashContent(f.body("stranded"))
+	strandedID := f.insert(accountID, "INBOX", domain, localpart, strandedHash, f.body("stranded"), "<stranded-"+f.nonce+"@example.org>")
+	f.exec("UPDATE messages SET uploaded = FALSE WHERE id = $1", strandedID)
+
+	cfg := verifyTestConfig(t, endpoint)
+	s3Storage, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, false, false, 5*time.Second)
+	require.NoError(t, err)
+
+	result := &verificationResult{}
+	require.NoError(t, checkDBToS3(context.Background(), f.rdb, s3Storage, accountID, result, 1000, false))
+
+	assert.Equal(t, []string{helpers.NewS3Key(domain, localpart, strandedHash)}, result.MissingFromS3,
+		"a row with no body in S3 and no pending upload was not reported missing")
+	assert.Zero(t, result.NotUploaded, "a row with no pending upload was counted as an upload in progress")
+}
+
 // TestVerifyS3FixOrphanedRechecksBeforeDelete: an object reported orphaned can be
 // claimed before --fix-orphaned reaches it (a delivery of the same body re-uploads it).
 // The delete re-checks under the body's object lock and keeps it.

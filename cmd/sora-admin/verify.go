@@ -96,10 +96,10 @@ Options:
                        timeout means dead objects fail fast instead of hanging.
 
 This command performs bidirectional verification:
-  1. DB → S3: Checks that all uploaded database messages exist in S3
+  1. DB → S3: Checks that all database messages exist in S3
                (with --deep: also that each body downloads, decrypts, and
-                re-hashes correctly). Messages still waiting for the
-                uploader are counted, not checked.
+                re-hashes correctly). Messages whose upload is still
+                pending are counted, not checked.
   2. S3 → DB: Checks that every S3 object under the address is referenced
                by a message row (of any account, expunged or not) or a
                pending upload
@@ -143,7 +143,7 @@ Examples:
 type verificationResult struct {
 	MessagesInDB  int
 	ObjectsInS3   int
-	NotUploaded   int // rows whose body still waits for the uploader: no object expected yet
+	NotUploaded   int // rows whose body still waits for a pending upload: no object expected yet
 	MissingFromS3 []string
 	OrphanedInS3  []string
 	CorruptInS3   []string
@@ -278,7 +278,6 @@ func checkDBToS3(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storag
 	}
 
 	result.MessagesInDB = len(messages)
-	result.CheckedDBToS3 = len(messages)
 
 	// Deduplicate by S3 key: many messages can reference the same content hash,
 	// and a deep check transfers the whole body — no need to download it twice.
@@ -293,11 +292,12 @@ func checkDBToS3(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storag
 
 		batch := messages[i:end]
 		for _, msg := range batch {
-			if !msg.Uploaded {
+			if msg.UploadPending {
 				// The body still waits for the uploader on the node that stored it.
 				result.NotUploaded++
 				continue
 			}
+			result.CheckedDBToS3++
 			if seen[msg.S3Key] {
 				continue
 			}
