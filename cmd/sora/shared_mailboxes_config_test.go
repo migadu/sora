@@ -38,6 +38,12 @@ func TestStartupRefusesInvalidSharedNamespacePrefix(t *testing.T) {
 			wantErr: `[shared_mailboxes]: namespace_prefix "INBOX/"`},
 		{name: "personal inbox case variant", section: "enabled = true\nnamespace_prefix = \"Inbox/\"\n",
 			wantErr: `[shared_mailboxes]: namespace_prefix "Inbox/"`},
+		// The namespace root cannot be selected, so a root that is any mailbox every
+		// account is created with would take that mailbox away from every user.
+		{name: "default Trash", section: "enabled = true\nnamespace_prefix = \"Trash/\"\n",
+			wantErr: `[shared_mailboxes]: namespace_prefix "Trash/"`},
+		{name: "default Sent case variant", section: "enabled = true\nnamespace_prefix = \"sent/\"\n",
+			wantErr: `[shared_mailboxes]: namespace_prefix "sent/"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

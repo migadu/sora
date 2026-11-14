@@ -303,11 +303,17 @@ Enables RFC 4314 shared mailboxes with Access Control Lists (ACL).
 ```toml
 [shared_mailboxes]
 enabled = true
-namespace_prefix = "Shared/"      # Prefix for shared mailboxes; must end with "/" and cannot be "INBOX/"
+namespace_prefix = "Shared/"      # Prefix for shared mailboxes; must end with "/"
 allow_user_create = true          # Allow users to create shared mailboxes
 allow_anyone_identifier = true    # Allow granting rights to "anyone" in the domain
 default_rights = "lrswipkxtea"    # Full rights for creators
 ```
+
+`namespace_prefix` is a mailbox name followed by `/` (`Shared/`, `#shared/`,
+`Public/Rooms/`). The prefix without its trailing `/` is the namespace root, which cannot
+be selected, so it must not be a mailbox every account has (`INBOX`, `Sent`, `Drafts`,
+`Archive`, `Junk`, `Trash`). With `enabled = true`, the server refuses to start with any
+other value, and `sora-admin` refuses to load it.
 
 Both `allow_*` settings default to `false`:
 

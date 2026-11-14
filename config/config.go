@@ -1240,6 +1240,11 @@ func (c SharedMailboxesConfig) InNamespace(name string) bool {
 // the empty prefix, so InNamespace tells shared names apart by the prefix alone, and the
 // prefix must be a mailbox name followed by the hierarchy delimiter: an empty prefix puts
 // every mailbox in the shared namespace, and "Shared" also takes in "SharedDocs".
+//
+// The prefix without its delimiter is the namespace root, a container that SELECT and
+// CREATE refuse and LIST marks \Noselect, so it must not be a mailbox every account is
+// created with: "INBOX/" would take every user's INBOX away (an INBOX "MUST appear
+// within the user's Personal Namespace", RFC 9051 §5.1.2), "Trash/" every Trash.
 func (c SharedMailboxesConfig) Validate() error {
 	if !c.Enabled {
 		return nil
@@ -1250,8 +1255,10 @@ func (c SharedMailboxesConfig) Validate() error {
 		return fmt.Errorf("namespace_prefix %q must be a mailbox name followed by the hierarchy delimiter %q, such as \"Shared/\"",
 			c.NamespacePrefix, delim)
 	}
-	if strings.EqualFold(root, consts.MailboxInbox) {
-		return fmt.Errorf("namespace_prefix %q conflicts with the reserved personal INBOX", c.NamespacePrefix)
+	for _, mailbox := range consts.DefaultMailboxes {
+		if strings.EqualFold(root, mailbox) {
+			return fmt.Errorf("namespace_prefix %q conflicts with the personal %s every account has", c.NamespacePrefix, mailbox)
+		}
 	}
 	return nil
 }
