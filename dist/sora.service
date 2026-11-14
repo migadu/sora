@@ -23,9 +23,11 @@ Group=sora
 ExecStart=/usr/local/bin/sora --config /etc/sora/config.toml
 ExecReload=/bin/kill -HUP $MAINPID
 
-# Graceful shutdown: on SIGTERM sora waits up to 10s for its listeners to close, 3s for
-# sessions to release database resources, then stops its workers (in-flight S3 uploads
-# finish) and leaves the cluster (up to 5s). After TimeoutStopSec the rest is killed.
+# Graceful shutdown: SIGTERM cancels sora's main context at once, which closes the
+# listeners and abandons any S3 upload still in transfer (it is retried after the
+# restart; one already written is still marked done). sora waits up to 10s for the
+# listeners, 3s more for sessions to release database resources, then stops its workers
+# and leaves the cluster (up to 5s). After TimeoutStopSec the rest is killed.
 TimeoutStopSec=30
 KillMode=mixed
 KillSignal=SIGTERM
