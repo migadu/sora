@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 const (
 	configDumpHelperEnv       = "SORA_ADMIN_CONFIG_DUMP_HELPER_PATH"
 	configDumpHelperFormatEnv = "SORA_ADMIN_CONFIG_DUMP_HELPER_FORMAT"
+	configDumpHelperMaskEnv   = "SORA_ADMIN_CONFIG_DUMP_HELPER_MASK"
 )
 
 // TestConfigDumpCommandHelper is not a test: it is `sora-admin config dump`, run by the
@@ -30,6 +32,9 @@ func TestConfigDumpCommandHelper(t *testing.T) {
 		t.Skip("helper process for the config dump tests")
 	}
 	os.Args = []string{"sora-admin", "--config", path, "config", "dump", "--format", os.Getenv(configDumpHelperFormatEnv)}
+	if mask := os.Getenv(configDumpHelperMaskEnv); mask != "" {
+		os.Args = append(os.Args, "--mask-secrets="+mask)
+	}
 	handleConfigDump(context.Background())
 }
 
@@ -37,12 +42,17 @@ func TestConfigDumpCommandHelper(t *testing.T) {
 // and returns everything the command wrote.
 func runConfigDump(t *testing.T, content []byte, format string) string {
 	t.Helper()
+	return runConfigDumpWithMask(t, content, format, "true")
+}
+
+func runConfigDumpWithMask(t *testing.T, content []byte, format, mask string) string {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestConfigDumpCommandHelper$")
-	cmd.Env = append(os.Environ(), configDumpHelperEnv+"="+path, configDumpHelperFormatEnv+"="+format)
+	cmd.Env = append(os.Environ(), configDumpHelperEnv+"="+path, configDumpHelperFormatEnv+"="+format, configDumpHelperMaskEnv+"="+mask)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("config dump --format %s failed: %v\n%s", format, err, out)
@@ -88,6 +98,74 @@ auth_token = "example-lookup-token"
 			for _, kept := range []string{"https://admin.example.com:8080", "https://relay.example.com/send", "https://spam.example.com/train", "https://lookup.example.com/lookup"} {
 				if !strings.Contains(out, kept) {
 					t.Errorf("dump lacks %q, which is not a secret", kept)
+				}
+			}
+		})
+	}
+}
+
+// Endpoint userinfo is functional HTTP Basic authentication even without an
+// auth_token. Mask it in public URL settings too, but retain the routing details.
+func TestConfigDumpMasksURLUserInfo(t *testing.T) {
+	urls := []string{
+		"https://admin-user:admin-password@admin.example.invalid:8443/admin",
+		"https://relay-user:relay-password@relay.example.invalid/send%2Fmail?mode=fixture#fragment",
+		"https://training-user@training.example.invalid/train",
+		"https://lookup%40user:lookup%40password@[::1]:8443/lookup",
+		"https://storage-user:storage-password@s3.example.invalid/bucket",
+		"https://cert-user:cert-password@certs.example.invalid/bucket",
+	}
+	content := []byte(fmt.Sprintf(`
+[admin_cli]
+addr = %q
+api_key = "fixture-api-key"
+[relay]
+http_url = %q
+[spam_training]
+endpoint = %q
+[s3]
+endpoint = %q
+[tls.letsencrypt.s3]
+endpoint = %q
+[[server]]
+type = "imap_proxy"
+name = "fixture"
+addr = "127.0.0.1:0"
+[server.remote_lookup]
+url = %q
+`, urls[0], urls[1], urls[2], urls[4], urls[5], urls[3]))
+
+	for _, format := range []string{"toml", "json"} {
+		t.Run(format, func(t *testing.T) {
+			out := runConfigDump(t, content, format)
+			for _, original := range urls {
+				u, err := url.Parse(original)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if strings.Contains(out, u.User.Username()) || strings.Contains(out, u.User.String()) {
+					t.Error("dump exposes fixture URL userinfo")
+				}
+				if password, set := u.User.Password(); set && strings.Contains(out, password) {
+					t.Error("dump exposes fixture URL password")
+				}
+				if _, hasPassword := u.User.Password(); hasPassword {
+					u.User = url.UserPassword(config.SecretMask, config.SecretMask)
+				} else {
+					u.User = url.User(config.SecretMask)
+				}
+				if !strings.Contains(out, u.String()) {
+					t.Error("masked URL lost its scheme, host, port, path, query or fragment")
+				}
+			}
+			if strings.Contains(out, "fixture-api-key") {
+				t.Error("dump exposes fixture API key")
+			}
+
+			unmasked := runConfigDumpWithMask(t, content, format, "false")
+			for _, original := range append(urls, "fixture-api-key") {
+				if !strings.Contains(unmasked, original) {
+					t.Error("--mask-secrets=false changed a fixture credential")
 				}
 			}
 		})
