@@ -477,7 +477,8 @@ func (s *Server) Start() error {
 	// inline listener returned them, and net/http treats non-temporary
 	// Accept errors as fatal — one malformed header killed the listener).
 	// The HTTP variant makes RemoteAddr() report the forwarded client IP,
-	// which is what allowed_hosts and rate limiting read via r.RemoteAddr.
+	// which is what the per-IP connection limit counts and what the
+	// backends are told the client is.
 	listener = server.WrapProxyProtocolHTTP(listener, s.proxyReader, "USER-API-PROXY")
 
 	// Start serving. The certificate is in TLSConfig already: certificate
