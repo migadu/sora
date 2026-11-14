@@ -8,14 +8,21 @@ import (
 	"testing"
 )
 
+// storageTOML gives a file the [database] and [s3] settings a mail backend, or a proxy
+// that authenticates against the database, starts with.
+const storageTOML = "[database.write]\nhosts = [\"db.example.com\"]\n\n[s3]\nendpoint = \"s3.example.com\"\nbucket = \"mail\"\n\n"
+
 // TestStartupChecksTheWholeFile: start-up refuses an invalid file before it starts
 // anything, with every problem the file has, and the checks are those `sora-admin config
 // validate` runs (#516). [uploader] and [cleanup] were checked only once the database,
 // S3 and the cache were up, and start-up stopped at the first problem. A node without a
 // mail backend runs no upload worker or cleaner, so their sections are not checked there.
+// The [relay.queue] durations, [cluster] addr and secret_key, and the [database] and
+// [s3] the servers need were also checked only in service setup (#921).
 func TestStartupChecksTheWholeFile(t *testing.T) {
 	const imapBackend = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"
 	const imapProxy = "\n[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:1143\"\nremote_addrs = [\"192.0.2.10:143\"]\n"
+	const metrics = "\n[[server]]\ntype = \"metrics\"\nname = \"metrics\"\naddr = \"127.0.0.1:9090\"\npath = \"/metrics\"\n"
 	tests := []struct {
 		name    string
 		content string
@@ -44,11 +51,34 @@ func TestStartupChecksTheWholeFile(t *testing.T) {
 		},
 		{
 			name:    "uploader concurrency 0 on a proxy",
-			content: "[uploader]\nconcurrency = 0\n" + imapProxy,
+			content: storageTOML + "[uploader]\nconcurrency = 0\n" + imapProxy,
 		},
 		{
 			name:    "cleanup grace_period negative on a proxy",
-			content: "[cleanup]\ngrace_period = \"-14d\"\n" + imapProxy,
+			content: storageTOML + "[cleanup]\ngrace_period = \"-14d\"\n" + imapProxy,
+		},
+		{
+			name: "relay.queue circuit_breaker_timeout unparsable",
+			content: "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com:587\"\n\n[relay.queue]\npath = \"/tmp/relay\"\ncircuit_breaker_timeout = \"soon\"\n" +
+				metrics,
+			wantErr: []string{`invalid configuration - [relay.queue]: invalid circuit_breaker_timeout "soon"`},
+		},
+		{
+			name:    "cluster addr 0.0.0.0",
+			content: "[cluster]\nenabled = true\naddr = \"0.0.0.0:7946\"\nsecret_key = \"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\"\n" + metrics,
+			wantErr: []string{"invalid configuration - [cluster]: cluster addr '0.0.0.0' must be a specific IP address reachable from other nodes"},
+		},
+		{
+			name:    "mail backend without database and S3",
+			content: imapBackend,
+			wantErr: []string{
+				`invalid configuration - [database]: server "imap" (imap) needs the database`,
+				"invalid configuration - [s3]: bucket is required",
+			},
+		},
+		{
+			name:    "mail backend with database and S3",
+			content: storageTOML + imapBackend,
 		},
 		{
 			name: "every problem reported",
