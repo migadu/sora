@@ -5,6 +5,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"regexp"
 	"slices"
@@ -14,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/migadu/sora/cache"
+	"github.com/migadu/sora/db"
 )
 
 // registeredRoutes returns the exact routes setupRoutes registers (as the spec writes
@@ -126,6 +129,52 @@ func TestOpenAPIDescribesEveryRegisteredRoute(t *testing.T) {
 	}
 }
 
+// The prefix routes (/admin/accounts/, /admin/credentials/, ...) pick the handler from
+// the rest of the path and the method in code, so the test above cannot see them. This
+// asks the router instead: on every path the spec describes, a method the spec does not
+// list must be refused with 405. The server has no database, so a request that reaches a
+// handler usually panics; that, like any status but 405, means the method is served.
+func TestOpenAPIDescribesEveryServedMethod(t *testing.T) {
+	const key = "openapi-test-api-key-aaaaaaaaaaaaaaaa"
+	s := &Server{}
+	s.settings.Store(&reloadableSettings{apiKey: key})
+	handler := s.setupRoutes()
+
+	served := func(method, target string) (result string) {
+		defer func() {
+			if r := recover(); r != nil {
+				result = "reached a handler"
+			}
+		}()
+		req := httptest.NewRequest(method, target, nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code == http.StatusMethodNotAllowed {
+			return ""
+		}
+		return "status " + strconv.Itoa(rec.Code)
+	}
+
+	param := regexp.MustCompile(`\{[^}]+\}`)
+	var undocumented []string
+	for path, methods := range openAPIOperations(t) {
+		target := "/admin" + param.ReplaceAllString(path, "user@example.com")
+		for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+			if slices.Contains(methods, method) {
+				continue
+			}
+			if result := served(method, target); result != "" {
+				undocumented = append(undocumented, method+" /admin"+path+" ("+result+")")
+			}
+		}
+	}
+	sort.Strings(undocumented)
+	if len(undocumented) > 0 {
+		t.Fatalf("methods the server serves on a described path but admin_api_openapi.yaml does not list:\n  %s", strings.Join(undocumented, "\n  "))
+	}
+}
+
 // schemaProperties returns the top-level property names of a components/schemas entry.
 func schemaProperties(t *testing.T, name string) []string {
 	t.Helper()
@@ -177,5 +226,15 @@ func TestOpenAPICacheStatsMatchesWireFormat(t *testing.T) {
 	wire := wireKeys(t, cache.CacheStats{})
 	if strings.Join(documented, ",") != strings.Join(wire, ",") {
 		t.Fatalf("OpenAPI CacheStats properties do not match the wire format\n  spec: %v\n  wire: %v", documented, wire)
+	}
+}
+
+// GET /accounts/{email}/credentials lists db.Credential values; the struct has no JSON
+// tags either, so the spec must name its Go field names.
+func TestOpenAPIAccountCredentialMatchesWireFormat(t *testing.T) {
+	documented := schemaProperties(t, "AccountCredential")
+	wire := wireKeys(t, db.Credential{})
+	if strings.Join(documented, ",") != strings.Join(wire, ",") {
+		t.Fatalf("OpenAPI AccountCredential properties do not match the wire format\n  spec: %v\n  wire: %v", documented, wire)
 	}
 }
