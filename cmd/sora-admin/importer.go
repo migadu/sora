@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/klauspost/compress/zstd"
 	"github.com/migadu/sora/logger"
 
 	"github.com/emersion/go-message/mail" // Import for mail.ReadMessage
@@ -1612,32 +1613,50 @@ func (i *Importer) getOrCreateMailbox(ctx context.Context, AccountID int64, name
 }
 
 // maildirContentReader returns a reader over the message stored in a maildir file: the file
-// itself, or its decompression when Dovecot's zlib plugin stored it gzip- or bzip2-
-// compressed (mail_compression_save = gz / bz2). compressed reports which. The scan's hash
-// and the upload both read through it, so they always see the same bytes.
+// itself, or its decompression when Dovecot's zlib plugin (mail_compress in 2.4) stored it
+// compressed with gz, bz2, lz4 or zstd. Like Dovecot's compression_detect_handler(), it
+// goes by the magic bytes, never by the file name. compressed reports whether it
+// decompresses. The scan's hash and the upload both read through it, so they always see
+// the same bytes.
 func maildirContentReader(r io.Reader) (content io.Reader, compressed bool, err error) {
 	br := bufio.NewReader(r)
-	magic, err := br.Peek(4)
+	magic, err := br.Peek(len(dovecotLZ4Magic)) // the longest magic
 	if err != nil && err != io.EOF {
 		return nil, false, err
 	}
 
 	switch {
-	case len(magic) >= 2 && magic[0] == 0x1f && magic[1] == 0x8b:
+	case bytes.HasPrefix(magic, []byte{0x1f, 0x8b}):
 		zr, err := gzip.NewReader(br)
 		if err != nil {
 			return nil, false, fmt.Errorf("failed to create gzip reader: %w", err)
 		}
 		return zr, true, nil
-	case len(magic) == 4 && magic[0] == 'B' && magic[1] == 'Z' && magic[2] == 'h' && magic[3] >= '1' && magic[3] <= '9':
+	case len(magic) >= 4 && bytes.HasPrefix(magic, []byte("BZh")) && magic[3] >= '1' && magic[3] <= '9':
 		// bzip2: "BZh" + block size digit.
 		return bzip2.NewReader(br), true, nil
+	case bytes.HasPrefix(magic, []byte(dovecotLZ4Magic)):
+		zr, err := newDovecotLZ4Reader(br)
+		if err != nil {
+			return nil, false, err
+		}
+		return zr, true, nil
+	case bytes.HasPrefix(magic, []byte{0x28, 0xb5, 0x2f, 0xfd}):
+		// zstd. The window, which the decoder holds in memory, is capped at the 128 MiB
+		// libzstd (and so Dovecot) decodes by default, ZSTD_WINDOWLOG_LIMIT_DEFAULT. A
+		// single-goroutine decoder needs no Close.
+		zr, err := zstd.NewReader(br, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(1<<27))
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to create zstd reader: %w", err)
+		}
+		return zr, true, nil
 	// Compressions this tool cannot read must fail loudly: hashing and uploading the
 	// compressed bytes as if they were the message would store garbage under a valid-
-	// looking hash (Dovecot's zlib plugin also writes zstd and lz4).
-	case len(magic) == 4 && magic[0] == 0x28 && magic[1] == 0xb5 && magic[2] == 0x2f && magic[3] == 0xfd:
-		return nil, false, fmt.Errorf("zstd-compressed maildir file is not supported; decompress it first")
-	case len(magic) == 4 && magic[0] == 0x04 && magic[1] == 0x22 && magic[2] == 0x4d && magic[3] == 0x18:
+	// looking hash. xz is what Dovecot 2.2 wrote (2.3 still reads it, 2.4 does not); the
+	// LZ4 frame format is not Dovecot's lz4.
+	case bytes.HasPrefix(magic, []byte{0xfd, '7', 'z', 'X', 'Z', 0x00}):
+		return nil, false, fmt.Errorf("xz-compressed maildir file is not supported; decompress it first")
+	case bytes.HasPrefix(magic, []byte{0x04, 0x22, 0x4d, 0x18}):
 		return nil, false, fmt.Errorf("lz4-compressed maildir file is not supported; decompress it first")
 	}
 	return br, false, nil
@@ -1654,7 +1673,7 @@ func decompressIfNeeded(content []byte) ([]byte, error) {
 		return content, nil
 	}
 
-	// Bound decompression to avoid a gzip or bzip2 bomb exhausting memory.
+	// Bound decompression to avoid a compression bomb exhausting memory.
 	const maxDecompressedSize = 256 << 20 // 256 MiB
 	decompressed, err := io.ReadAll(io.LimitReader(reader, maxDecompressedSize+1))
 	if err != nil {
