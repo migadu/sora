@@ -190,7 +190,7 @@ type UploadWorker struct {
 	syncUpload syncBool
 
 	maxStagingSize     int64
-	currentStagingSize int64 // Atomic tracker for the global staging queue size
+	currentStagingSize int64 // Atomic tracker for this instance's own staging backlog (max_staging_size)
 	// lastStallReport is when the current stall episode was last reported, in Unix
 	// nanoseconds; 0 means no episode is in progress. Atomic, like currentStagingSize.
 	lastStallReport int64

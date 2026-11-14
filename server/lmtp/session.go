@@ -702,7 +702,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
 
-	// Safety guard: Reject if global staging limit is exceeded. Checked before Sieve runs,
+	// Safety guard: Reject if this node's staging limit is exceeded. Checked before Sieve runs,
 	// as on the Admin API path: the MTA retries a 452, and a refused attempt must not have
 	// sent a vacation reply or charged redirects to the rate limit first.
 	if s.backend.uploader.IsStagingLimitExceeded(int64(len(fullMessageBytes))) {

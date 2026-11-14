@@ -1,5 +1,3 @@
-package cleaner
-
 // Package cleaner provides a worker that periodically cleans up S3 objects
 // that are no longer needed, based on the [cleanup] grace_period. Only one
 // node runs a cycle at a time: it holds a transaction-scoped PostgreSQL
@@ -12,6 +10,7 @@ package cleaner
 // started in a separate goroutine and will continue running until the context
 // is done. It logs its progress and any errors encountered during the
 // cleanup process.
+package cleaner
 
 import (
 	"context"

@@ -1388,6 +1388,24 @@ func TestLMTPProxyRemoteLookupFallbackToDefault(t *testing.T) {
 			expectAccept:           false,
 			expectLog:              "user not found in remote lookup, fallback disabled",
 		},
+		{
+			// 401/403 refuse the account; lookup_local_users applies to 404/3xx only. The
+			// recipient is an active local account: the database must not be asked.
+			name:                   "account_refused_403_fallback_enabled",
+			fallbackToDefault:      true,
+			remotelookupStatusCode: 403,
+			remotelookupBody:       `{"error": "account refused"}`,
+			expectAccept:           false,
+			expectLog:              "account refused by remote lookup (401/403), no fallback",
+		},
+		{
+			name:                   "account_refused_401_fallback_enabled",
+			fallbackToDefault:      true,
+			remotelookupStatusCode: 401,
+			remotelookupBody:       `{"error": "account refused"}`,
+			expectAccept:           false,
+			expectLog:              "account refused by remote lookup (401/403), no fallback",
+		},
 	}
 
 	for _, tc := range testCases {
