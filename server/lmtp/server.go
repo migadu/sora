@@ -149,6 +149,10 @@ type LMTPServerBackend struct {
 	redirectRateWindow time.Duration
 	maxRedirectHops    int
 
+	// sharedMailboxes is [shared_mailboxes]: Sieve fileinto :create never makes a
+	// personal mailbox in its namespace.
+	sharedMailboxes config.SharedMailboxesConfig
+
 	// Per-command hard execution timeouts (nil = use defaults)
 	commandTimeouts *CommandTimeouts
 
@@ -219,8 +223,9 @@ type LMTPServerOptions struct {
 	RedirectRateLimit           int
 	RedirectRateWindow          time.Duration
 	MaxRedirectHops             int
-	CommandTimeoutOverrides     map[string]time.Duration // Per-command hard execution timeouts (overrides defaults)
-	IdleTimeout                 time.Duration            // Maximum idle time between commands (0 = default 5m); enforced by go-smtp with a 421 notice
+	SharedMailboxes             config.SharedMailboxesConfig // [shared_mailboxes]; Sieve fileinto :create makes no personal mailbox in its namespace
+	CommandTimeoutOverrides     map[string]time.Duration     // Per-command hard execution timeouts (overrides defaults)
+	IdleTimeout                 time.Duration                // Maximum idle time between commands (0 = default 5m); enforced by go-smtp with a 421 notice
 }
 
 func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
@@ -268,6 +273,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		redirectRateLimit:  options.RedirectRateLimit,
 		redirectRateWindow: options.RedirectRateWindow,
 		maxRedirectHops:    options.MaxRedirectHops,
+		sharedMailboxes:    options.SharedMailboxes,
 		commandTimeouts:    defaultCommandTimeouts(),
 	}
 	backend.settings.Store(&reloadableSettings{

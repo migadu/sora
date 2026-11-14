@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/migadu/go-imap/imapclient"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/pkg/resilient"
+	lmtpserver "github.com/migadu/sora/server/lmtp"
 )
 
 // createSharedMailbox makes a same-domain owner account for recipientEmail, has it
@@ -173,5 +175,40 @@ func TestLMTP_SieveFileintoCreateFindsSharedMailbox(t *testing.T) {
 	}
 	if got := ownMailboxNames(t, rdb, memberID, "Shared", team); len(got) != 0 {
 		t.Errorf("fileinto :create made personal mailboxes %v for the member", got)
+	}
+}
+
+// TestLMTP_SieveFileintoCreateRefusedInSharedNamespace: fileinto :create of a
+// missing name in the [shared_mailboxes] namespace delivers to INBOX instead of
+// making the recipient a personal mailbox there, a namesake that would shadow a
+// shared mailbox of that name in every later lookup by this user. RFC 5490 §3.2:
+// "Failure to create the specified mailbox is considered to be an error", and an
+// error keeps the message (RFC 5228 §2.10.6).
+func TestLMTP_SieveFileintoCreateRefusedInSharedNamespace(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	imapSrv, account := common.SetupIMAPServer(t)
+	defer imapSrv.Close()
+	rdb := imapSrv.ResilientDB
+
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(context.Background(), account.Email)
+	if err != nil {
+		t.Fatalf("account id: %v", err)
+	}
+	missing := fmt.Sprintf("Shared/Missing-%d", common.GetTimestamp())
+	setActiveSieveScript(t, rdb, accountID,
+		"require [\"fileinto\", \"mailbox\"];\r\nfileinto :create \""+missing+"\";\r\n")
+	lmtpAddr, _ := startTestLMTPServerWithOptions(t, rdb, lmtpserver.LMTPServerOptions{
+		SharedMailboxes: config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/"},
+	})
+
+	subject := fmt.Sprintf("create-in-namespace %d", time.Now().UnixNano())
+	deliverLMTP(t, lmtpAddr, account.Email, subject)
+
+	if got := mailboxesHolding(t, rdb, accountID, subject); len(got) != 1 || got[0] != "INBOX" {
+		t.Errorf("the message must fall back to INBOX, found it in %v", got)
+	}
+	if got := ownMailboxNames(t, rdb, accountID, "Shared", missing); len(got) != 0 {
+		t.Errorf("fileinto :create made personal mailboxes %v in the shared namespace", got)
 	}
 }

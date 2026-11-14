@@ -1521,6 +1521,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		RedirectRateLimit:       serverConfig.GetRedirectRateLimit(),
 		RedirectRateWindow:      redirectRateWindow,
 		MaxRedirectHops:         serverConfig.GetMaxRedirectHops(),
+		SharedMailboxes:         deps.config.SharedMailboxes,
 		CommandTimeoutOverrides: lmtpCommandTimeoutOverrides,
 	})
 
