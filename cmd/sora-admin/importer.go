@@ -574,15 +574,14 @@ func (i *Importer) processSubscriptions() error {
 	}
 
 	// Process each subscribed folder
-	for _, folderName := range folders {
-		// Decode Modified UTF-7 encoding used by Dovecot for non-ASCII folder names
-		if decoded, decErr := helpers.DecodeModifiedUTF7(folderName); decErr != nil {
-			logger.Warn("Failed to decode Modified UTF-7 subscription folder name, using raw name", "name", folderName, "error", decErr)
-		} else {
-			folderName = decoded
+	for _, subscribed := range folders {
+		// Named as the folder import names a folder, so the subscription is to the
+		// mailbox that folder's messages went to.
+		folderName, err := importedFolderName(subscribed)
+		if err != nil {
+			logger.Warn("Skipping subscription", "name", subscribed, "error", err)
+			continue
 		}
-		// The folder import maps these names, so the subscription must too.
-		folderName = specialFolderName(folderName)
 
 		// Subscriptions are name-based (migration 000046), so record the subscription
 		// directly without materializing a mailbox. Dovecot permits subscriptions to
@@ -1033,31 +1032,34 @@ func (i *Importer) resolveMailboxName(path string) (string, error) {
 		return "", fmt.Errorf("could not get relative path for %s: %w", path, err)
 	}
 
-	var mailboxName string
 	if relPath == "." {
-		mailboxName = "INBOX"
-	} else {
-		// Remove leading dot if present
-		cleanName := strings.TrimPrefix(relPath, ".")
-
-		// Replace maildir separator (.) with IMAP separator (/)
-		mailboxName = strings.ReplaceAll(cleanName, ".", "/")
-
-		// Decode Modified UTF-7 encoding used by Dovecot/IMAP for non-ASCII folder names
-		if decoded, err := helpers.DecodeModifiedUTF7(mailboxName); err != nil {
-			logger.Warn("Failed to decode Modified UTF-7 mailbox name, using raw name", "name", mailboxName, "error", err)
-		} else {
-			mailboxName = decoded
-		}
-
-		// Validate characters
-		if strings.ContainsAny(mailboxName, "\t\r\n") {
-			return "", fmt.Errorf("invalid characters in mailbox name")
-		}
-
-		mailboxName = specialFolderName(strings.TrimSpace(mailboxName))
+		return "INBOX", nil
 	}
-	return mailboxName, nil
+	// Folders are named Maildir++ style (".Sent", ".Work.Projects") or without the
+	// leading dot ("Sent"): drop the dot, then turn the maildir separator (.) into
+	// the IMAP one (/).
+	return importedFolderName(strings.ReplaceAll(strings.TrimPrefix(relPath, "."), ".", "/"))
+}
+
+// importedFolderName is the Sora mailbox name for a folder name read from a maildir,
+// its levels already separated by '/': modified UTF-7 decoded (Dovecot's encoding of
+// non-ASCII names), trimmed, and special folders mapped. A name with TAB, CR or LF is
+// refused. Folders and the subscriptions file are both named through it, so a
+// subscription names the mailbox the folder's messages went to.
+func importedFolderName(name string) (string, error) {
+	if decoded, err := helpers.DecodeModifiedUTF7(name); err != nil {
+		logger.Warn("Failed to decode Modified UTF-7 mailbox name, using raw name", "name", name, "error", err)
+	} else {
+		name = decoded
+	}
+	if strings.ContainsAny(name, "\t\r\n") {
+		return "", fmt.Errorf("invalid characters in mailbox name %q", name)
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", errors.New("empty mailbox name")
+	}
+	return specialFolderName(name), nil
 }
 
 // specialFolderName maps the names other mail systems give their special folders

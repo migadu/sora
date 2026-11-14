@@ -10,7 +10,9 @@ import (
 // writes it. A version 2 file starts with exactly dovecotSubscriptionsV2Header; each
 // line after it is one mailbox name whose hierarchy levels are joined with TAB, each
 // level tab-escaped (str_append_tabescaped). A file without that header is the old
-// unversioned format, one name per line.
+// unversioned format, one storage name per line (index_storage_set_subscribed writes
+// box->name), its levels joined with the mailbox list's separator: '.' for Maildir++
+// (src/lib-storage/list/mailbox-list-maildir.c).
 const dovecotSubscriptionsV2Header = "V\t2\n\n"
 
 // soraSubscriptionsHeader is what sora-admin export wrote before it followed Dovecot's
@@ -22,24 +24,39 @@ const soraSubscriptionsHeader = "V\t2\n"
 // their hierarchy levels joined by Sora's delimiter. The names are still in the
 // encoding of the maildir's folder names (modified UTF-7 for Dovecot).
 func parseDovecotSubscriptions(content string) []string {
+	delim := string(consts.MailboxDelimiter)
 	version2 := strings.HasPrefix(content, dovecotSubscriptionsV2Header)
-	if version2 {
+	// An unversioned Dovecot file separates levels with '.' (Maildir++), which the
+	// folder import, resolveMailboxName, turns into '/' in the directory names too.
+	unversioned := false
+	switch {
+	case version2:
 		content = content[len(dovecotSubscriptionsV2Header):]
-	} else {
-		content = strings.TrimPrefix(content, soraSubscriptionsHeader)
+	case strings.HasPrefix(content, soraSubscriptionsHeader):
+		content = content[len(soraSubscriptionsHeader):]
+	default:
+		unversioned = true
 	}
 
 	var names []string
 	for _, line := range strings.Split(content, "\n") {
-		if line == "" {
-			continue
-		}
-		if version2 {
+		// Dovecot reads lines with i_stream_next_line, which drops the CR of a CRLF.
+		line = strings.TrimSuffix(line, "\r")
+		switch {
+		case version2:
 			levels := strings.Split(line, "\t")
 			for i, level := range levels {
 				levels[i] = dovecotTabUnescape(level)
 			}
-			line = strings.Join(levels, string(consts.MailboxDelimiter))
+			line = strings.Join(levels, delim)
+		case unversioned:
+			line = strings.ReplaceAll(line, ".", delim)
+		}
+		// Dovecot drops a trailing separator, which old versions and other software
+		// wrote (mailbox_list_subscription_fill_one).
+		line = strings.TrimSuffix(line, delim)
+		if line == "" {
+			continue
 		}
 		names = append(names, line)
 	}
