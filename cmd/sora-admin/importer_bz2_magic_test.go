@@ -12,14 +12,14 @@ import (
 	"github.com/migadu/sora/helpers"
 )
 
-// emptyBzip2Stream is `printf '' | bzip2 -9`: "BZh9" followed by the 6-byte
+// emptyBzip2Stream is `printf ” | bzip2 -9`: "BZh9" followed by the 6-byte
 // end-of-stream magic 0x17, 0x72, 0x45, 0x38, 0x50, 0x90 (sqrt(pi)) and a zero
 // 32-bit combined CRC.
 var emptyBzip2Stream = []byte("BZh9\x17\x72\x45\x38\x50\x90\x00\x00\x00\x00")
 
-// TestMaildirBzip2MagicDetection verifies that maildirContentReader matches
-// Dovecot's is_compressed_bz2() (src/lib-compression/compression.c): bzip2
-// detection requires at least 10 bytes — "BZh", block-size digit '1'..'9', and
+// TestMaildirBzip2MagicDetection verifies the stricter bzip2 detection used by
+// maildirContentReader. Dovecot checks only the four-byte prefix; Sora requires
+// at least 10 bytes — "BZh", block-size digit '1'..'9', and
 // either the 6-byte compressed-block header magic "1AY&SY" (0x31, 0x41, 0x59,
 // 0x26, 0x53, 0x59) or the 6-byte end-of-stream magic (0x17, 0x72, 0x45, 0x38,
 // 0x50, 0x90). Plain messages that merely start with "BZh[1-9]" must not be
