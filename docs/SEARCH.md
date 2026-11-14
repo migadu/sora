@@ -431,6 +431,9 @@ Criteria that cannot match, such as `SINCE` later than `BEFORE` or `LARGER` grea
 to `SMALLER`, are valid: the search succeeds with no matches. An empty `BODY` or `TEXT` term
 matches every message.
 
+The User API search holds `q`, `from` and `subject` to the same 1000 bytes each, answering
+`400 Bad Request` above it ([USER_API.md](USER_API.md#8-search)).
+
 The client sees only the generic text. Sora logs the exact reason at debug level as
 `rejecting search criteria` and counts the refusal in
 `sora_protocol_errors_total{error_type="criteria_rejected"}`, with `severity="server_limit"` for
