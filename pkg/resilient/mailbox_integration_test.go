@@ -73,7 +73,7 @@ func TestGetOrCreateMailboxByNameWithRetry_HierarchyLevels(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, trailing.ID, plain.ID, `"Foo/" and "Foo" must name one mailbox`)
 
-	for _, name := range []string{"x//y", "/lead", "/", "", "a/../b", "a/./b", ".."} {
+	for _, name := range []string{"x//y", "/lead", "/", "", "a/../b", "a/./b", "..", "a\x00b", "caf\xe9", "a\tb"} {
 		_, err := rdb.GetOrCreateMailboxByNameWithRetry(ctx, accountID, name)
 		assert.ErrorIs(t, err, consts.ErrMailboxInvalidName, "name %q", name)
 	}
@@ -84,5 +84,23 @@ func TestGetOrCreateMailboxByNameWithRetry_HierarchyLevels(t *testing.T) {
 		assert.False(t, mb.Name == "" || strings.HasPrefix(mb.Name, "/") || strings.HasSuffix(mb.Name, "/") ||
 			strings.Contains(mb.Name, "//"), "mailbox %q has an empty hierarchy level", mb.Name)
 		assert.NotContains(t, []string{"x", "a"}, mb.Name, "a refused name created its parent %q", mb.Name)
+	}
+}
+
+// TestGetMailboxByNameWithRetry_UnstorableName: a name PostgreSQL cannot hold in a
+// text value (a NUL, invalid UTF-8) names no mailbox. The lookup answers
+// ErrMailboxNotFound, as for any other missing name, instead of the SQLSTATE 22021
+// internal error that a Sieve fileinto turned into a 451 on every attempt.
+func TestGetMailboxByNameWithRetry_UnstorableName(t *testing.T) {
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	ctx := context.Background()
+
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, account.Email)
+	require.NoError(t, err)
+
+	for _, name := range []string{"a\x00b", "caf\xe9", "INBOX/\xff"} {
+		_, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, name)
+		assert.ErrorIs(t, err, consts.ErrMailboxNotFound, "name %q", name)
 	}
 }
