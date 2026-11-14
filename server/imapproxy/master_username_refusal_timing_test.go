@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/testutils"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -29,7 +31,7 @@ const testMasterUsername, testMasterPassword = "masteruser", "master-secret"
 // "Authentication failed", whatever it wraps.
 func refuseTwiceAs(t *testing.T, srv *Server, username, password string) lookupRefusal {
 	t.Helper()
-	limiter := &verdictlessLimiter{}
+	limiter := &successKeyLimiter{}
 	srv.authLimiter = limiter
 
 	var out lookupRefusal
@@ -46,8 +48,26 @@ func refuseTwiceAs(t *testing.T, srv *Server, username, password string) lookupR
 		remote.Close()
 	}
 	out.failures = limiter.failures.Load()
+	out.successKeys = strings.Join(limiter.successKeys, ",")
 	_, out.cached = srv.lookupCache.Get(srv.name, username)
 	return out
+}
+
+// successKeyLimiter is verdictlessLimiter that also keeps the key of every success
+// recorded.
+type successKeyLimiter struct {
+	verdictlessLimiter
+	mu          sync.Mutex
+	successKeys []string
+}
+
+func (l *successKeyLimiter) RecordAuthAttemptWithProxy(ctx context.Context, conn net.Conn, proxyInfo *server.ProxyProtocolInfo, key string, success bool) {
+	l.verdictlessLimiter.RecordAuthAttemptWithProxy(ctx, conn, proxyInfo, key, success)
+	if success {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.successKeys = append(l.successKeys, key)
+	}
 }
 
 // TestIMAPProxyWrongMasterPasswordLooksLikeAnotherSuffix (#801): a wrong password in the
@@ -55,8 +75,9 @@ func refuseTwiceAs(t *testing.T, srv *Server, username, password string) lookupR
 // under any other suffix: after one lookup and one password verification, cached, and
 // answered from the cache when repeated. The proxy used to compare the master password
 // and refuse at once, so the response time confirmed a guessed master username. The
-// account's own password does not log in through the master form, but it is refused at
-// the same cost. Verifications are counted, not timed (#782).
+// account's own password logs in through the master form as through any other suffix,
+// its success recorded under the account's key, not the master credential's (#949).
+// Verifications are counted, not timed (#782).
 func TestIMAPProxyWrongMasterPasswordLooksLikeAnotherSuffix(t *testing.T) {
 	origCost := db.BcryptCost
 	db.BcryptCost = bcrypt.MinCost
@@ -126,10 +147,18 @@ func TestIMAPProxyWrongMasterPasswordLooksLikeAnotherSuffix(t *testing.T) {
 			if other.verifications != lookup.work || other.lookups != wantLookups || other.cached != wantCached || other.failures != wantFailures {
 				t.Fatalf("wrong password under another suffix: %+v; want work=%v lookups=%d cached=%v failures=%d", other, lookup.work, wantLookups, wantCached, wantFailures)
 			}
-			for _, password := range []string{"wrong-password", "own-password"} {
-				if got := refuse("anna@example.com@"+testMasterUsername, password); got != other {
-					t.Errorf("%q under the master suffix: %+v\nwrong password under another suffix: %+v", password, got, other)
-				}
+			if got := refuse("anna@example.com@"+testMasterUsername, "wrong-password"); got != other {
+				t.Errorf("wrong password under the master suffix: %+v\nunder another suffix: %+v", got, other)
+			}
+
+			// The account's own password, accepted by the lookup service for a known
+			// address, logs in under the master suffix as under any other (#949).
+			own := refuse("anna@example.com@other", "own-password")
+			if lookup.name == "known_address" && own.successKeys != "anna@example.com,anna@example.com" {
+				t.Fatalf("own password under another suffix: %+v; want two successes recorded under the account's key", own)
+			}
+			if got := refuse("anna@example.com@"+testMasterUsername, "own-password"); got != own {
+				t.Errorf("own password under the master suffix: %+v\nunder another suffix: %+v", got, own)
 			}
 		})
 	}
