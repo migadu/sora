@@ -324,6 +324,8 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					// by rate limiting, not by extending cache TTL.
 					s.DebugLog("cache hit - negative entry with same password", "username", username, "age", time.Since(cached.CreatedAt))
 					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
+					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
+					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 					return consts.ErrAuthenticationFailed
 				} else {
 					// Different password - ALWAYS revalidate (user might have fixed their password)
@@ -393,6 +395,8 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 						// Different password but too fresh
 						s.DebugLog("cache hit - positive entry with different password (too fresh)", "username", username, "age", time.Since(cached.CreatedAt))
 						metrics.CacheOperationsTotal.WithLabelValues("get", "hit_positive_fresh").Inc()
+						s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
+						metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 						return consts.ErrAuthenticationFailed
 					}
 				}
