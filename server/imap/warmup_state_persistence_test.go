@@ -482,21 +482,37 @@ func TestWarmupStateIsPerServer(t *testing.T) {
 	}
 }
 
-// TestWarmupStateIgnoresSharedFile checks that the file every IMAP server used to
-// share is removed at load without being read: whichever server started first would
-// take the entries the others warmed.
-func TestWarmupStateIgnoresSharedFile(t *testing.T) {
-	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+// TestWarmupStateMigratesSharedFile covers the restart that upgrades from the single
+// .sora_warmup_state every IMAP server used to share: the server that starts first
+// reads it along with its own file and removes it, so the others do not read it again.
+// The servers share the cache, so an account listed there is warm whichever server
+// warmed it. Dropping the file unread would warm every account again at the upgrade,
+// the herd the file is there to prevent.
+func TestWarmupStateMigratesSharedFile(t *testing.T) {
+	first, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+	second := &IMAPServer{name: "imaps", warmupInterval: 24 * time.Hour, cache: first.cache, enableWarmup: true}
 
+	warmedAt := time.Now().Add(-time.Hour).Truncate(time.Second)
 	shared := filepath.Join(tmpDir, warmupStateFile)
-	if err := os.WriteFile(shared, []byte(fmt.Sprintf("7 %d\n", time.Now().Add(-time.Hour).Unix())), 0644); err != nil {
+	if err := os.WriteFile(shared, []byte(fmt.Sprintf("7 %d\n", warmedAt.Unix())), 0600); err != nil {
 		t.Fatalf("Failed to write shared state file: %v", err)
 	}
+	if err := os.WriteFile(first.warmupStatePath(), []byte(fmt.Sprintf("9 %d\n", warmedAt.Unix())), 0600); err != nil {
+		t.Fatalf("Failed to write per-server state file: %v", err)
+	}
 
-	s.loadWarmupState()
+	first.loadWarmupState()
+	second.loadWarmupState()
 
-	if _, ok := s.lastWarmupTimes.Load(int64(7)); ok {
-		t.Error("Expected the shared state file not to be loaded")
+	for _, id := range []int64{7, 9} {
+		if raw, ok := first.lastWarmupTimes.Load(id); !ok {
+			t.Errorf("the first server to start did not load account %d", id)
+		} else if got := raw.(time.Time); !got.Equal(warmedAt) {
+			t.Errorf("account %d warmed at %v, want %v", id, got, warmedAt)
+		}
+	}
+	if n := countWarmupTimes(second); n != 0 {
+		t.Errorf("the second server loaded %d entries, want 0: the shared file is read once", n)
 	}
 	if _, err := os.Stat(shared); !os.IsNotExist(err) {
 		t.Error("Expected the shared state file to be removed")

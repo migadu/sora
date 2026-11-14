@@ -1430,8 +1430,8 @@ func (s *IMAPServer) persistWarmupState() {
 // This prevents thundering herd warmups when thousands of users reconnect
 // after a server restart — their caches are likely still warm on disk.
 //
-// Fully defensive: never crashes, always removes the file (even on corruption),
-// and uses recover() to catch unexpected panics.
+// Fully defensive: never crashes, always removes the files it reads (even on
+// corruption), and uses recover() to catch unexpected panics.
 func (s *IMAPServer) loadWarmupState() {
 	// Recover from any unexpected panic (e.g., nil pointer, type assertion)
 	// so a corrupt state file can never crash the server.
@@ -1445,16 +1445,23 @@ func (s *IMAPServer) loadWarmupState() {
 		return
 	}
 
-	// The file every IMAP server used to share is not read: the server that starts
-	// first would take the others' entries. Remove it so it does not linger.
-	os.Remove(filepath.Join(s.cache.GetBasePath(), warmupStateFile))
+	s.loadWarmupStateFile(s.warmupStatePath())
+	// The file every IMAP server of a process used to share, left by an earlier
+	// version. The servers share the cache too, so an account it lists is warm
+	// whichever server warmed it: the server that reads it first takes its entries
+	// and removes it, rather than warm every account again at the upgrade. It is
+	// read after the server's own file because, when both exist (a downgrade, then
+	// another upgrade), it is the newer one.
+	s.loadWarmupStateFile(filepath.Join(s.cache.GetBasePath(), warmupStateFile))
+}
 
-	path := s.warmupStatePath()
-
+// loadWarmupStateFile adds the unexpired entries of one warmup state file to
+// lastWarmupTimes and removes the file.
+func (s *IMAPServer) loadWarmupStateFile(path string) {
 	f, err := os.Open(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			logger.Warn("IMAP: Failed to open warmup state file - removing", "name", s.name, "error", err)
+			logger.Warn("IMAP: Failed to open warmup state file - removing", "name", s.name, "path", path, "error", err)
 			os.Remove(path)
 		}
 		return // No state file — fresh start
@@ -1498,7 +1505,7 @@ func (s *IMAPServer) loadWarmupState() {
 		logger.Warn("IMAP: Error reading warmup state file (corrupt?) - removed", "name", s.name, "error", err)
 	}
 
-	logger.Info("IMAP: Loaded warmup state from disk", "name", s.name, "loaded", count, "expired", expired)
+	logger.Info("IMAP: Loaded warmup state from disk", "name", s.name, "loaded", count, "expired", expired, "path", path)
 }
 
 // startWarmupWorkers launches the fixed pool of warmup worker goroutines.
