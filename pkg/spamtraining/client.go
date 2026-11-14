@@ -227,6 +227,12 @@ func (c *Client) run(job Job) {
 
 // train fetches the job's message, strips its attachments and submits it.
 func (c *Client) train(ctx context.Context, job Job) error {
+	// An open breaker refuses the submission, so do not download a body that
+	// cannot be sent while the endpoint is down.
+	if c.circuitBreaker.State() == circuitbreaker.StateOpen {
+		return circuitbreaker.ErrCircuitBreakerOpen
+	}
+
 	body, err := job.Open(ctx)
 	if err != nil {
 		return fmt.Errorf("fetching message: %w", err)
