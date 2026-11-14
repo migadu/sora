@@ -401,15 +401,19 @@ made once.
 
 ### What triggers it
 
-Training runs on IMAP backends, for the IMAP `MOVE` and `UID MOVE` commands only:
+Training runs on IMAP backends, for the IMAP `MOVE` and `UID MOVE` commands only. Junk and Trash
+are the folders that carry the RFC 6154 special-use attributes `\Junk` and `\Trash`: the default
+`Junk` and `Trash` folders, or whichever folders hold the attributes after a `RENAME` or a
+`CREATE ... USE`.
 
-- Destination named `Junk` and source not: the message is reported as `spam`.
-- Source named `Junk` and destination not: reported as `ham`.
+- Destination `\Junk` and source not: the message is reported as `spam`.
+- Source `\Junk` and destination neither `\Junk` nor `\Trash`: reported as `ham`.
+- Source `\Junk` and destination `\Trash`: not reported. Clients delete a message by moving it
+  to Trash, and deleting spam does not say it was not spam.
 
-The name is compared without regard to case, and only a mailbox named exactly `Junk` counts:
-`Archive/Junk`, or a folder of another name marked `\Junk`, does not. `COPY`, `APPEND`, a client
-that copies and then deletes instead of using `MOVE`, the User API and Sieve `fileinto` do not
-trigger training.
+Folder names do not count: a folder named `Junk` without the attribute, such as `Archive/Junk`,
+does not train. `COPY`, `APPEND`, a client that copies and then deletes instead of using `MOVE`,
+the User API and Sieve `fileinto` do not trigger training.
 
 ### What is sent
 

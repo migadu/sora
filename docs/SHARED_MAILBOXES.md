@@ -330,8 +330,9 @@ full-text index, because the messages are the owner's. See [SEARCH.md](SEARCH.md
 
 ### Spam training
 
-Spam training reacts only to a folder named exactly `Junk`, so moves into a shared folder such as
-`Shared/Junk` are not reported ([RELAY.md](RELAY.md#7-spam-training)).
+Spam training follows the `\Junk` and `\Trash` special-use attributes, not folder names, so moves
+into a shared folder such as `Shared/Junk` are not reported unless it carries `\Junk`
+([RELAY.md](RELAY.md#7-spam-training)).
 
 ---
 
