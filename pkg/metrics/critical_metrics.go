@@ -205,7 +205,7 @@ var (
 			Help:    "Duration of remote lookup API calls in seconds",
 			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0},
 		},
-		[]string{"protocol", "result"}, // protocol: imap/lmtp/pop3/managesieve, result: success/user_not_found/transient_error/shutdown
+		[]string{"protocol", "result"}, // protocol: imap/lmtp/pop3/managesieve, result: success/user_not_found/refused/transient_error/shutdown
 	)
 )
 
