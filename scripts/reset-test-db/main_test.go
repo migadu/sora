@@ -23,7 +23,9 @@ func resetTestDBName() string {
 
 // TestFallbackToTruncateEmptiesEveryTable: when DROP SCHEMA fails, the reset falls back
 // to truncating tables. Whatever the migrations have created since, every table must
-// come out empty, or later test runs start from rows an earlier run left behind.
+// come out empty, or later test runs start from rows an earlier run left behind. And
+// the tables stay, so the migration state must stay with them: the next test run has
+// to be able to migrate the database.
 func TestFallbackToTruncateEmptiesEveryTable(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -53,15 +55,16 @@ func TestFallbackToTruncateEmptiesEveryTable(t *testing.T) {
 	}
 	defer conn.Close(ctx)
 
-	// Start from the current schema: an earlier run's fallback dropped schema_migrations.
+	// Start from this branch's schema, whatever an earlier run or another branch left here.
 	for _, q := range []string{"DROP SCHEMA public CASCADE", "CREATE SCHEMA public"} {
 		if _, err := conn.Exec(ctx, q); err != nil {
 			t.Fatalf("%s: %v", q, err)
 		}
 	}
-	database, err := db.NewDatabaseFromConfig(ctx, &config.DatabaseConfig{
+	dbConfig := &config.DatabaseConfig{
 		Write: &config.DatabaseEndpointConfig{Hosts: []string{"localhost"}, Port: "5432", User: "postgres", Name: name},
-	}, true)
+	}
+	database, err := db.NewDatabaseFromConfig(ctx, dbConfig, true)
 	if err != nil {
 		t.Fatalf("migrate %s: %v", name, err)
 	}
@@ -82,7 +85,7 @@ func TestFallbackToTruncateEmptiesEveryTable(t *testing.T) {
 
 	fallbackToTruncate(ctx, conn)
 
-	rows, err := conn.Query(ctx, "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename")
+	rows, err := conn.Query(ctx, "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> 'schema_migrations' ORDER BY tablename")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,4 +102,12 @@ func TestFallbackToTruncateEmptiesEveryTable(t *testing.T) {
 			t.Errorf("table %s still has %d rows after the fallback truncate", table, n)
 		}
 	}
+
+	// Without its schema_migrations row, the next run starts again at 000001 and fails on
+	// CREATE TABLE accounts: the fallback would leave a database no test can set up.
+	database, err = db.NewDatabaseFromConfig(ctx, dbConfig, true)
+	if err != nil {
+		t.Fatalf("migrate %s after the fallback truncate: %v", name, err)
+	}
+	database.Close()
 }
