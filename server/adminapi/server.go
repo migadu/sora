@@ -733,6 +733,31 @@ type KickConnectionsRequest struct {
 	ClientAddr string `json:"client_addr,omitempty"`
 }
 
+// ConnectionInfo is one entry of GET /admin/connections: an account with sessions on
+// one of this node's connection trackers. There is one entry per account and tracker,
+// not per session.
+type ConnectionInfo struct {
+	Protocol   string    `json:"protocol"` // tracker key up to its first dash, e.g. "IMAP"
+	Instance   string    `json:"instance"` // tracker key, e.g. "IMAP-node1-imap-proxy"
+	AccountID  int64     `json:"account_id"`
+	LocalCount int       `json:"local_count"` // the account's sessions on this tracker
+	TotalCount int       `json:"total_count"` // LocalCount plus the sessions other nodes report for the protocol through gossip
+	LastUpdate time.Time `json:"last_update"`
+	Email      string    `json:"email"` // address the sessions logged in with
+}
+
+// UserConnectionInfo is one entry of GET /admin/connections/user/{email}. Unlike
+// ConnectionInfo, Protocol is the whole tracker key, and an account this tracker knows
+// only through gossip is listed too, with LocalCount 0.
+type UserConnectionInfo struct {
+	Protocol   string    `json:"protocol"` // tracker key, e.g. "IMAP-node1-imap-proxy"
+	AccountID  int64     `json:"account_id"`
+	Email      string    `json:"email"`
+	LocalCount int       `json:"local_count"`
+	TotalCount int       `json:"total_count"`
+	LastUpdate time.Time `json:"last_update"`
+}
+
 // Import/Export request types removed - these operations are not suitable
 // for HTTP API as they are long-running processes
 
@@ -1348,7 +1373,7 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 	// Collect connections from all trackers
 	// Only report connections where this tracker instance has actual local connections
 	// This prevents duplicate entries where trackers report gossip data from other instances
-	allConnections := make([]map[string]any, 0)
+	allConnections := make([]ConnectionInfo, 0)
 	for trackerKey, tracker := range trackers {
 		if tracker == nil {
 			continue
@@ -1368,14 +1393,14 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 			// Display: Just "PROTOCOL" for simplicity
 			protocol := extractProtocolFromKey(trackerKey)
 
-			allConnections = append(allConnections, map[string]any{
-				"protocol":    protocol,
-				"instance":    trackerKey, // Full key for debugging/filtering
-				"account_id":  connInfo.AccountID,
-				"local_count": localCount,
-				"total_count": connInfo.GetTotalCount(),
-				"last_update": connInfo.LastUpdate,
-				"email":       connInfo.Username,
+			allConnections = append(allConnections, ConnectionInfo{
+				Protocol:   protocol,
+				Instance:   trackerKey, // Full key for debugging/filtering
+				AccountID:  connInfo.AccountID,
+				LocalCount: localCount,
+				TotalCount: connInfo.GetTotalCount(),
+				LastUpdate: connInfo.LastUpdate,
+				Email:      connInfo.Username,
 			})
 		}
 	}
@@ -1543,7 +1568,7 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 	// Collect connections for this user from all trackers
 	// Filter by email string matching (case-insensitive) - no database lookup needed
 	// The connection tracker already stores the username (email) via gossip
-	userConnections := make([]map[string]any, 0)
+	userConnections := make([]UserConnectionInfo, 0)
 	emailLower := strings.ToLower(email)
 
 	for protocol, tracker := range trackers {
@@ -1555,13 +1580,13 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 		for _, connInfo := range conns {
 			// Match email case-insensitively
 			if strings.ToLower(connInfo.Username) == emailLower {
-				userConnections = append(userConnections, map[string]any{
-					"protocol":    protocol,
-					"account_id":  connInfo.AccountID,
-					"email":       connInfo.Username,
-					"local_count": connInfo.GetLocalCount(instanceID),
-					"total_count": connInfo.GetTotalCount(),
-					"last_update": connInfo.LastUpdate,
+				userConnections = append(userConnections, UserConnectionInfo{
+					Protocol:   protocol,
+					AccountID:  connInfo.AccountID,
+					Email:      connInfo.Username,
+					LocalCount: connInfo.GetLocalCount(instanceID),
+					TotalCount: connInfo.GetTotalCount(),
+					LastUpdate: connInfo.LastUpdate,
 				})
 			}
 		}
