@@ -361,10 +361,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 			cleanupInterval = 5 * time.Minute
 		}
 
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize == 0 {
-			maxSize = 10000
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()
 		if err != nil {
