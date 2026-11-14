@@ -1022,12 +1022,14 @@ func (s *Session) authenticateUser(username, password string) error {
 			// Suffix matches master username - validate master password locally
 			if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, s.server.masterPassword) {
 				// Wrong master password. Refused like a wrong password under any other
-				// suffix, and only after the same work: the credential check of the base
-				// address below (lookup, password verification, lookup-cache entry). An
+				// suffix, and only after the same work: the regular credential path below
+				// (lookup, password verification, lookup-cache entry). An
 				// immediate refusal is answered one verification sooner, which confirms
 				// a guessed master username (#801).
-				s.DebugLog("wrong master password, refusing after the credential check of the base address", "base_address", parsedAddr.BaseAddress())
-				usernameForRemoteLookup = parsedAddr.BaseAddress()
+				s.DebugLog("wrong master password, refusing after the regular credential check", "username", username)
+				// A refused master guess must query the same submitted name as
+				// another suffix. The service may route or refuse tokens differently.
+				usernameForRemoteLookup = username
 				wrongMasterPassword = true
 			} else {
 				// Master credentials validated - use base address (without @MASTER suffix) for remotelookup

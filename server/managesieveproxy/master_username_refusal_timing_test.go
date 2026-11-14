@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -72,11 +73,26 @@ func TestManageSieveProxyWrongMasterPasswordLooksLikeAnotherSuffix(t *testing.T)
 	for _, lookup := range []struct {
 		name   string
 		answer http.HandlerFunc
+		work   [2]int
 	}{
 		{"known_address", func(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]string{"address": "anna@example.com", "password_hash": hash})
-		}},
-		{"unknown_address", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }},
+		}, [2]int{1, 0}},
+		{"unknown_address", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }, [2]int{1, 0}},
+		{"suffix_specific_refusal", func(w http.ResponseWriter, r *http.Request) {
+			if strings.Count(r.URL.Query().Get("email"), "@") > 1 {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]string{"address": "anna@example.com", "password_hash": hash})
+		}, [2]int{1, 0}},
+		{"suffix_specific_unavailable", func(w http.ResponseWriter, r *http.Request) {
+			if strings.Count(r.URL.Query().Get("email"), "@") > 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]string{"address": "anna@example.com", "password_hash": hash})
+		}, [2]int{0, 0}},
 	} {
 		t.Run(lookup.name, func(t *testing.T) {
 			refuse := func(username, password string) lookupRefusal {
@@ -106,8 +122,12 @@ func TestManageSieveProxyWrongMasterPasswordLooksLikeAnotherSuffix(t *testing.T)
 			}
 
 			other := refuse("anna@example.com@other", "wrong-password")
-			if other.verifications != [2]int{1, 0} || other.lookups != 1 || !other.cached {
-				t.Fatalf("wrong password under another suffix: %+v; want one verification, one lookup and a cached refusal", other)
+			wantLookups, wantCached, wantFailures := int32(1), true, int32(2)
+			if lookup.name == "suffix_specific_unavailable" {
+				wantLookups, wantCached, wantFailures = 2, false, 0
+			}
+			if other.verifications != lookup.work || other.lookups != wantLookups || other.cached != wantCached || other.failures != wantFailures {
+				t.Fatalf("wrong password under another suffix: %+v; want work=%v lookups=%d cached=%v failures=%d", other, lookup.work, wantLookups, wantCached, wantFailures)
 			}
 			for _, password := range []string{"wrong-password", "own-password"} {
 				if got := refuse("anna@example.com@"+testMasterUsername, password); got != other {
