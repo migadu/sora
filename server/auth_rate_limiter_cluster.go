@@ -381,6 +381,12 @@ func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
 
 	info, exists := crl.limiter.ipFailureCounts[event.IP]
 	if !exists {
+		// The cap bounds the map however its entries arrive, as in
+		// updateFailureTracking: every node would otherwise hold the union of
+		// the whole cluster's attack traffic for the length of the window.
+		if maxIPs := crl.limiter.config.MaxIPEntries; maxIPs > 0 && len(crl.limiter.ipFailureCounts) >= maxIPs {
+			crl.limiter.evictOldestIP()
+		}
 		info = &IPFailureInfo{FirstFailure: event.FirstFailure}
 		crl.limiter.ipFailureCounts[event.IP] = info
 	}
@@ -419,6 +425,10 @@ func (crl *ClusterRateLimiter) handleUsernameFailure(event RateLimitEvent) {
 
 	info, exists := crl.limiter.usernameFailureCounts[event.Username]
 	if !exists {
+		// Bounded however entries arrive, as in updateUsernameFailure.
+		if maxUsernames := crl.limiter.config.MaxUsernameEntries; maxUsernames > 0 && len(crl.limiter.usernameFailureCounts) >= maxUsernames {
+			crl.limiter.evictOldestUsername()
+		}
 		info = &UsernameFailureInfo{FirstFailure: event.Timestamp}
 		crl.limiter.usernameFailureCounts[event.Username] = info
 	}

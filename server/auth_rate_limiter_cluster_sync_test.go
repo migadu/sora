@@ -167,3 +167,50 @@ func TestLoginWithoutFailuresSendsNoGossip(t *testing.T) {
 		t.Errorf("a login after a peer's failure queued %v, want one %s", types, RateLimitEventUsernameSuccess)
 	}
 }
+
+// TestPeerEventsRespectTheLimiterSizeCaps: max_ip_entries and
+// max_username_entries bound what a limiter holds however the entries arrive.
+// Entries a peer reported bypassed the cap, so every node held the union of the
+// whole cluster's attack traffic for the length of the window.
+func TestPeerEventsRespectTheLimiterSizeCaps(t *testing.T) {
+	crl := newTestClusterRateLimiter(t)
+	crl.syncFailureCounts = true
+	crl.limiter.config.MaxIPEntries = 10
+	crl.limiter.config.MaxUsernameEntries = 10
+
+	now := time.Now()
+	for i := range 50 {
+		deliverRateLimitEvent(t, crl, RateLimitEvent{
+			Type:         RateLimitEventFailureCount,
+			EventID:      fmt.Sprintf("peer-failure-count-%d", i),
+			IP:           fmt.Sprintf("192.0.2.%d", i+1),
+			Timestamp:    now,
+			NodeID:       "node-b",
+			Protocol:     crl.limiter.protocol,
+			FailureCount: 3,
+			FirstFailure: now.Add(time.Duration(i) * time.Millisecond),
+		})
+		deliverRateLimitEvent(t, crl, RateLimitEvent{
+			Type:      RateLimitEventUsernameFailure,
+			EventID:   fmt.Sprintf("peer-username-failure-%d", i),
+			Username:  fmt.Sprintf("user%d@example.com", i),
+			Timestamp: now.Add(time.Duration(i) * time.Millisecond),
+			NodeID:    "node-b",
+			Protocol:  crl.limiter.protocol,
+		})
+	}
+
+	crl.limiter.ipMu.RLock()
+	ips := len(crl.limiter.ipFailureCounts)
+	crl.limiter.ipMu.RUnlock()
+	crl.limiter.usernameMu.RLock()
+	usernames := len(crl.limiter.usernameFailureCounts)
+	crl.limiter.usernameMu.RUnlock()
+
+	if ips > 10 {
+		t.Errorf("peers' failure counts grew the IP map to %d entries, over max_ip_entries = 10", ips)
+	}
+	if usernames > 10 {
+		t.Errorf("peers' username failures grew the username map to %d entries, over max_username_entries = 10", usernames)
+	}
+}
