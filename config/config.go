@@ -343,15 +343,62 @@ func (c *TLSLetsEncryptConfig) normalizeDomains() {
 // autocert.Manager.GetCertificate derives it from a ClientHello. It fails for a name
 // GetCertificate refuses. sora-admin's tls commands name cache entries with it too.
 func AutocertName(domain string) (string, error) {
+	if domain == "" {
+		return "", errors.New("missing server name")
+	}
+	if strings.ContainsAny(domain, `/\`) {
+		return "", errors.New("server name contains path separator")
+	}
 	name, err := idna.Lookup.ToASCII(domain)
 	if err != nil {
 		return "", err
 	}
 	name = strings.TrimSuffix(name, ".")
-	if !strings.Contains(strings.Trim(name, "."), ".") {
+	if len(name) == 0 || len(name) > 253 {
+		return "", errors.New("server name length invalid")
+	}
+	if net.ParseIP(name) != nil {
+		return "", errors.New("server name must not be an IP address")
+	}
+	labels := strings.Split(name, ".")
+	if len(labels) < 2 {
 		return "", errors.New("server name component count invalid")
 	}
+	for _, label := range labels {
+		if !isValidAutocertLabel(label) {
+			return "", fmt.Errorf("invalid server name label %q", label)
+		}
+	}
+	if isAllASCIIDigits(labels[len(labels)-1]) {
+		return "", errors.New("server name top-level domain must not be all-numeric")
+	}
 	return name, nil
+}
+
+func isValidAutocertLabel(label string) bool {
+	if len(label) == 0 || len(label) > 63 {
+		return false
+	}
+	if label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(label); i++ {
+		c := label[i]
+		if ('a' <= c && c <= 'z') || ('0' <= c && c <= '9') || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isAllASCIIDigits(label string) bool {
+	for i := 0; i < len(label); i++ {
+		if label[i] < '0' || label[i] > '9' {
+			return false
+		}
+	}
+	return len(label) > 0
 }
 
 // TLSConfig holds TLS/SSL configuration
@@ -419,13 +466,34 @@ func (c *CleanupConfig) GetFTSRetention() (time.Duration, error) {
 	return helpers.ParseDuration(c.FTSRetention)
 }
 
-// Validate rejects a negative fts_retention. It parses, but delivery and import index only
-// mail sent after now minus the retention, which would then lie in the future, so no new
-// message would get a search row; and the cleaner prunes only for a positive retention. A
-// value that does not parse falls back to keeping every vector, like any other duration key.
+// Validate rejects durations that parse but have a sign the cleaner cannot use.
+//
+//   - grace_period: every cleaner threshold is now minus the grace period, so a negative
+//     one lies in the future and expunged mail and soft-deleted accounts are hard-deleted
+//     at the next cycle, with no restore window.
+//   - max_age_restriction, health_status_retention: the cleaner acts only on a positive
+//     value, so a negative one turns the restriction or the pruning off without a word.
+//   - fts_retention: delivery and import index only mail sent after now minus the
+//     retention, which would then lie in the future, so no new message would get a search
+//     row; and the cleaner prunes only for a positive retention.
+//   - instance_liveness_threshold must be positive. The runtime getter retains its
+//     default fallback for non-positive values as a safety net.
+//
+// An unset key does not parse here and takes its default; a value that does not parse
+// falls back to the default too, like any other duration key.
 func (c *CleanupConfig) Validate() error {
-	if d, err := helpers.ParseDuration(c.FTSRetention); err == nil && d < 0 {
-		return fmt.Errorf("fts_retention must not be negative, got %q", c.FTSRetention)
+	for _, f := range []struct{ key, value string }{
+		{"grace_period", c.GracePeriod},
+		{"max_age_restriction", c.MaxAgeRestriction},
+		{"fts_retention", c.FTSRetention},
+		{"health_status_retention", c.HealthStatusRetention},
+	} {
+		if d, err := helpers.ParseDuration(f.value); err == nil && d < 0 {
+			return fmt.Errorf("%s must not be negative, got %q", f.key, f.value)
+		}
+	}
+	if d, err := helpers.ParseDuration(c.InstanceLivenessThreshold); err == nil && d <= 0 {
+		return fmt.Errorf("instance_liveness_threshold must be positive, got %q", c.InstanceLivenessThreshold)
 	}
 	return nil
 }
@@ -646,7 +714,15 @@ type AuthRateLimiterConfig struct {
 // disabled the IP block on another). TOML accepts nan and inf, which pass a sign check
 // but are no growth factor. Any finite multiplier is safe: the limiter caps the
 // product at max_delay before converting it to a time.Duration.
+//
+// It also rejects an exempt_networks entry that is neither an IP address nor a CIDR.
+// The limiter's match skips such an entry, so it would exempt nobody, and the host the
+// operator meant to exempt would be counted and blocked with nothing in the log to say
+// why. A malformed [servers] trusted_networks entry is refused the same way.
 func (c *AuthRateLimiterConfig) Validate() error {
+	if invalid := helpers.InvalidNetworkEntries(c.ExemptNetworks); len(invalid) > 0 {
+		return fmt.Errorf("auth_rate_limit.exempt_networks has entries that are neither an IP address nor a CIDR: %q", invalid)
+	}
 	v := reflect.ValueOf(c).Elem()
 	for i := 0; i < v.NumField(); i++ {
 		f := v.Field(i)
@@ -1767,11 +1843,27 @@ func (s *ServerConfig) GetMaxScriptSize() (int64, error) {
 	return size, nil
 }
 
+// GetMaxMessageSize returns max_message_size (LMTP, LMTP proxy, Admin API delivery),
+// 50 MB when omitted, capped at consts.MaxStoredMessageSize: a larger message would be
+// read in full and then refused by the database insert, and the LMTP proxy would
+// advertise a SIZE no backend accepts. RFC 1870 section 5: "The fixed maximum message
+// size is defined as the message size of the largest message that a server is ever
+// willing to accept. [...] The fixed maximum message size may be an implementation
+// artifact of the SMTP server". A value that does not parse is an error: start-up falls
+// back to the default (GetMaxMessageSizeWithDefault), a reload keeps the running limit.
 func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
 	if s.MaxMessageSize == "" {
 		return 50 * 1024 * 1024, nil // 50MB default
 	}
-	return helpers.ParseSize(s.MaxMessageSize)
+	size, err := helpers.ParseSize(s.MaxMessageSize)
+	if err != nil {
+		return 0, err
+	}
+	if size > consts.MaxStoredMessageSize {
+		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
+		return consts.MaxStoredMessageSize, nil
+	}
+	return size, nil
 }
 
 func (s *ServerConfig) GetConnectTimeout() (time.Duration, error) {
@@ -1844,10 +1936,18 @@ func (s *ServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(s.ProxyProtocolTimeout)
 }
 
-// GetSearchRateLimitWindow parses the search rate limit window duration
+// GetSearchRateLimitWindow parses the search rate limit window duration. A zero or
+// negative window is an error: the rate limiter would replace it with the default.
 func (s *ServerConfig) GetSearchRateLimitWindow() (time.Duration, error) {
 	if s.Limits != nil && s.Limits.SearchRateLimitWindow != "" {
-		return helpers.ParseDuration(s.Limits.SearchRateLimitWindow)
+		window, err := helpers.ParseDuration(s.Limits.SearchRateLimitWindow)
+		if err != nil {
+			return 0, err
+		}
+		if window <= 0 {
+			return 0, fmt.Errorf("limits.search_rate_limit_window must be positive, got %q", s.Limits.SearchRateLimitWindow)
+		}
+		return window, nil
 	}
 	return time.Minute, nil // Default: 1 minute
 }
@@ -2339,22 +2439,13 @@ func (s *ServerConfig) GetAuthIdleTimeoutWithDefault() time.Duration {
 	return timeout
 }
 
-// GetMaxMessageSizeWithDefault returns max_message_size (LMTP, LMTP proxy, Admin API
-// delivery), at start-up and on a reload, capped at consts.MaxStoredMessageSize: a
-// larger message would be read in full and then refused by the database insert, and
-// the LMTP proxy would advertise a SIZE no backend accepts. RFC 1870 section 5: "The
-// fixed maximum message size is defined as the message size of the largest message
-// that a server is ever willing to accept. [...] The fixed maximum message size may
-// be an implementation artifact of the SMTP server".
+// GetMaxMessageSizeWithDefault returns GetMaxMessageSize for start-up, which has no
+// running limit to keep: a value that does not parse is the 50 MB default.
 func (s *ServerConfig) GetMaxMessageSizeWithDefault() int64 {
 	size, err := s.GetMaxMessageSize()
 	if err != nil {
 		warnf("Failed to parse max message size for server '%s': %v, using default (50MB)", s.Name, err)
 		return 52428800 // 50MB default
-	}
-	if size > consts.MaxStoredMessageSize {
-		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
-		return consts.MaxStoredMessageSize
 	}
 	return size
 }
@@ -2973,6 +3064,9 @@ func (c *Config) Validate() []Problem {
 	// and the proxy servers that route into them.
 	add("[[pool]]", c.ValidatePools())
 	add("[relay]", c.Relay.Validate())
+	if c.Relay.IsQueueEnabled() {
+		add("[relay.queue]", c.Relay.Queue.Validate())
+	}
 	// One malformed trusted_networks entry would leave LMTP admission with no peers.
 	add("trusted_networks", c.ValidateTrustedNetworks())
 	add("[shared_mailboxes]", c.SharedMailboxes.Validate())
@@ -3010,7 +3104,7 @@ func (c *Config) Validate() []Problem {
 	if c.HasMailBackend() {
 		// The cleaner and the upload worker both take [uploader] max_attempts.
 		add("[uploader]", c.Uploader.Validate())
-		// The cleaner and delivery both take [cleanup] fts_retention.
+		// The cleaner takes [cleanup]; delivery takes its fts_retention too.
 		add("[cleanup]", c.Cleanup.Validate())
 	}
 
@@ -3088,13 +3182,25 @@ func LoadServerConfig(configPath string, cfg *Config) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if !md.IsDefined("database", "write") {
+	if !hasTOMLPathFold(md, "database", "write") {
 		cfg.Database.Write = nil
 	}
-	if !md.IsDefined("database", "read") {
+	if !hasTOMLPathFold(md, "database", "read") {
 		cfg.Database.Read = nil
 	}
 	return err
+}
+
+func hasTOMLPathFold(md toml.MetaData, p1, p2 string) bool {
+	if md.IsDefined(p1, p2) {
+		return true
+	}
+	for _, k := range md.Keys() {
+		if len(k) >= 2 && strings.EqualFold(k[0], p1) && strings.EqualFold(k[1], p2) {
+			return true
+		}
+	}
+	return false
 }
 
 // LoadConfigFromFileWithMetadata is LoadConfigFromFile that also returns the file's TOML

@@ -198,3 +198,56 @@ func TestRelayValidateMalformedEndpointsHideCredentials(t *testing.T) {
 		}
 	}
 }
+
+// TestRelayQueueValidate: a [relay.queue] worker_interval of zero or less parsed and
+// reached time.NewTicker in the relay worker's goroutine, which panics on a non-positive
+// interval and took the server down at start-up (#643). A negative failed_retention would
+// have the cleanup delete every failed message, the only copy of a Sieve redirect without
+// :copy, on its first pass. Both are refused by the checks that run at start-up and in
+// `sora-admin config validate`; failed_retention = "0" keeps failed messages until they
+// are deleted or requeued. A value that does not parse is left to start-up, as before.
+func TestRelayQueueValidate(t *testing.T) {
+	const relay = "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com:587\"\n"
+	const imap = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"
+	tests := []struct {
+		name    string
+		content string
+		wantErr string // substring of the [relay.queue] problem, "" for none
+	}{
+		{name: "defaults", content: relay},
+		{name: "worker_interval 30s", content: relay + "[relay.queue]\nworker_interval = \"30s\"\n"},
+		{name: "worker_interval unparsable", content: relay + "[relay.queue]\nworker_interval = \"soon\"\n"},
+		{name: "worker_interval 0", content: relay + "[relay.queue]\nworker_interval = \"0\"\n", wantErr: `worker_interval must be positive, got "0"`},
+		{name: "worker_interval 0s", content: relay + "[relay.queue]\nworker_interval = \"0s\"\n", wantErr: `worker_interval must be positive, got "0s"`},
+		{name: "worker_interval -1m", content: relay + "[relay.queue]\nworker_interval = \"-1m\"\n", wantErr: `worker_interval must be positive, got "-1m"`},
+		{name: "failed_retention 0", content: relay + "[relay.queue]\nfailed_retention = \"0\"\n"},
+		{name: "failed_retention 7d", content: relay + "[relay.queue]\nfailed_retention = \"7d\"\n"},
+		{name: "failed_retention -1h", content: relay + "[relay.queue]\nfailed_retention = \"-1h\"\n", wantErr: `failed_retention must not be negative, got "-1h"`},
+		{name: "no relay, queue not checked", content: "[relay.queue]\nworker_interval = \"0\"\nfailed_retention = \"-1h\"\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tt.content+imap), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var cfg Config
+			if err := LoadServerConfig(path, &cfg); err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for _, p := range cfg.Validate() {
+				got = append(got, p.Section+": "+p.Err.Error())
+			}
+			if tt.wantErr == "" {
+				if len(got) != 0 {
+					t.Errorf("Validate() = %q, want no problems", got)
+				}
+				return
+			}
+			if len(got) != 1 || !strings.HasPrefix(got[0], "[relay.queue]: ") || !strings.Contains(got[0], tt.wantErr) {
+				t.Errorf("Validate() = %q, want one [relay.queue] problem containing %q", got, tt.wantErr)
+			}
+		})
+	}
+}
