@@ -598,8 +598,9 @@ exempt_networks = ["10.20.0.30/32"]   # the webmail host
 | `[]` | nobody |
 | a list | only those addresses |
 
-Entries may be CIDRs or bare IPs. Keep the list short: your own webmail or relay hosts that log in
-for many users from one address.
+Entries may be CIDRs or bare IPs. An entry that is neither, such as a host name, stops startup, and a
+reload with it is skipped for that server. Keep the list short: your own webmail or relay hosts that
+log in for many users from one address.
 
 The check uses the client address after forwarding (section 11). On a backend behind proxies that
 forward client addresses, listing the proxies in `trusted_networks` therefore does not exempt their
