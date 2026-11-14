@@ -8,10 +8,9 @@
 --
 -- PREREQUISITE: existing case-variant duplicates must be resolved first, otherwise the
 -- unique index cannot be built. The guard below aborts the migration with a clear message
--- if any collision remains, rather than failing obscurely on index creation. The cleanup
--- script its message names was a one-off and is not in this repository; resolve the
--- duplicates by hand instead, with the Sora nodes stopped (before starting the version
--- that runs this migration):
+-- if any collision remains, rather than failing obscurely on index creation. The one-off
+-- script that resolved them on production is not in this repository; resolve them by
+-- hand, with the Sora nodes stopped:
 --
 --   1. List the collision groups:
 --        SELECT account_id, array_agg(id ORDER BY id) AS ids, array_agg(name ORDER BY id) AS names
@@ -26,7 +25,11 @@
 --      Only names change; messages, flags and subscriptions stay with their mailbox ids.
 --   3. Repeat 1 and 2 until 1 returns no rows: renaming a parent also resolves its
 --      children's collisions.
---   4. After the upgrade the renamed folders appear next to the kept ones; move their
+--   4. If the guard already aborted this migration, golang-migrate left the database
+--      marked dirty at version 41 and Sora refuses to start until that is cleared:
+--        sora-admin migrate force --config <config.toml> 40
+--      then start Sora (or run sora-admin migrate up --config <config.toml>) again.
+--   5. After the upgrade the renamed folders appear next to the kept ones; move their
 --      messages over with any IMAP client and delete them.
 
 DO $$
@@ -42,7 +45,7 @@ BEGIN
 
     IF collision_groups > 0 THEN
         RAISE EXCEPTION
-            'Cannot enforce case-insensitive mailbox names: % case-collision group(s) still exist. Run scripts/fix_mailbox_case_duplicates.sql first, then re-run this migration.',
+            'Cannot enforce case-insensitive mailbox names: % case-collision group(s) still exist. Resolve them as the comment at the top of db/migrations/000041_mailbox_name_case_insensitive_unique.up.sql describes, run sora-admin migrate force 40, then re-run this migration.',
             collision_groups;
     END IF;
 END $$;
