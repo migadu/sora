@@ -34,6 +34,10 @@ func handleConfigCommand(ctx context.Context) {
 			// Skip the "config" command itself
 			continue
 		}
+		if os.Args[i] == "--help" || os.Args[i] == "-h" {
+			subcommand = "help"
+			break
+		}
 		if !strings.HasPrefix(os.Args[i], "-") {
 			subcommand = os.Args[i]
 			break
@@ -50,7 +54,7 @@ func handleConfigCommand(ctx context.Context) {
 		handleConfigDump(ctx)
 	case "validate":
 		handleConfigValidate(ctx)
-	case "--help", "-h", "help":
+	case "help":
 		printConfigUsage()
 	default:
 		fmt.Printf("Unknown config subcommand: %s\n\n", subcommand)
