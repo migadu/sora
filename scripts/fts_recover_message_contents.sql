@@ -19,7 +19,7 @@
 -- zero in a sample is not proof that every row has been recovered. Include queued text as
 -- well as vectors. For an exhaustive check, remove LIMIT 10000. With
 -- fts_retention set, rows older than it are missing from messages_fts_v2 on purpose, so add
--- AND sent_date > now() - interval '<retention>' to the sample:
+-- AND (sent_date IS NULL OR sent_date > now() - interval '<retention>') to the sample:
 --   SELECT count(*) FROM (SELECT content_hash FROM message_contents
 --                         WHERE text_body_tsv IS NOT NULL OR text_body IS NOT NULL LIMIT 10000) mc
 --   WHERE EXISTS (SELECT 1 FROM messages m LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
