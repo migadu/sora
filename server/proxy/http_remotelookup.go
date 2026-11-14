@@ -583,11 +583,17 @@ func remoteLookupRequestURL(template, email, clientIP string, routeOnly bool) st
 
 	// Add route_only parameter if requested (for master username authentication)
 	if routeOnly {
+		// A fragment is not sent to the server, so append to the query before it.
+		request, fragment, hasFragment := strings.Cut(requestURL, "#")
 		// Check if URL already has query parameters
-		if strings.Contains(requestURL, "?") {
-			requestURL += "&route_only=true"
+		if strings.Contains(request, "?") {
+			request += "&route_only=true"
 		} else {
-			requestURL += "?route_only=true"
+			request += "?route_only=true"
+		}
+		requestURL = request
+		if hasFragment {
+			requestURL += "#" + fragment
 		}
 	}
 	return requestURL

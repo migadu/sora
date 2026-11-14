@@ -35,6 +35,9 @@ func validateRemoteLookupURL(rawURL string) error {
 	if u.Hostname() == "" {
 		return fmt.Errorf("invalid remotelookup.url: no host")
 	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("invalid remotelookup.url: scheme must be http or https (got %q)", u.Scheme)
+	}
 	for _, placeholder := range []string{"$email", "$ip"} {
 		if strings.Contains(u.Host, placeholder) {
 			return fmt.Errorf("invalid remotelookup.url: %s is allowed only in the path and query, not in the host %q", placeholder, u.Host)
