@@ -1256,7 +1256,7 @@ type ServerConfig struct {
 
 	// ManageSieve specific
 	MaxScriptSize       string   `toml:"max_script_size,omitempty"`
-	SupportedExtensions []string `toml:"supported_extensions,omitempty"` // managesieve_proxy only: the SIEVE extensions it advertises. A list replaces the default set rather than adding to it (empty = the default set); a managesieve server uses [sieve] enabled_extensions
+	SupportedExtensions []string `toml:"supported_extensions,omitempty"` // managesieve_proxy only: supported names replace the default advertised SIEVE set; if none remain after filtering, the default set is used. A managesieve server uses [sieve] enabled_extensions.
 
 	// Proxy specific
 	RemoteAddrs            []string `toml:"remote_addrs,omitempty"`

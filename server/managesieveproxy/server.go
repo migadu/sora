@@ -165,7 +165,7 @@ type ServerOptions struct {
 	Debug bool // Enable debug logging
 
 	// SIEVE extensions
-	SupportedExtensions []string // SIEVE extensions to advertise; replaces the default set (nil = the default set)
+	SupportedExtensions []string // Supported SIEVE names replace the default advertised set; nil, empty or entirely unsupported lists use the default set.
 }
 
 // New creates a new ManageSieve proxy server.
