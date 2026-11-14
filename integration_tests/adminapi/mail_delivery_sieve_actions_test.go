@@ -80,6 +80,11 @@ func TestAdminAPI_DeliverMail_SieveEveryFilingAndRedirectHappens(t *testing.T) {
 			wantStored: []string{"Archive", "Projects"},
 		},
 		{
+			name:       "create two missing targets",
+			script:     []string{`require ["fileinto", "mailbox"];`, `fileinto :create "CreatedA";`, `fileinto :create "CreatedB";`},
+			wantStored: []string{"CreatedA", "CreatedB"},
+		},
+		{
 			// The redirect cancels the implicit keep that fileinto :copy left (RFC 3894 §3).
 			name:       "fileinto :copy and redirect",
 			script:     []string{`require ["fileinto", "copy"];`, `fileinto :copy "Archive";`, `redirect "` + target + `";`},
