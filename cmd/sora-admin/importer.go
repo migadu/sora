@@ -1728,8 +1728,12 @@ func maildirContentReader(r io.Reader) (content io.ReadCloser, compressed bool, 
 			return nil, false, fmt.Errorf("failed to create gzip reader: %w", err)
 		}
 		return zr, true, nil
-	case len(magic) >= 4 && bytes.HasPrefix(magic, []byte("BZh")) && magic[3] >= '1' && magic[3] <= '9':
-		// bzip2: "BZh" + block size digit.
+	case len(magic) >= 10 && bytes.HasPrefix(magic, []byte("BZh")) && magic[3] >= '1' && magic[3] <= '9' &&
+		(bytes.Equal(magic[4:10], []byte{0x31, 0x41, 0x59, 0x26, 0x53, 0x59}) ||
+			bytes.Equal(magic[4:10], []byte{0x17, 0x72, 0x45, 0x38, 0x50, 0x90})):
+		// Require a complete bzip2 block or end-of-stream signature, beyond the
+		// four-byte prefix Dovecot checks: a plain message can legitimately start
+		// with a header such as "BZh1:".
 		return io.NopCloser(bzip2.NewReader(br)), true, nil
 	case bytes.HasPrefix(magic, []byte(dovecotLZ4Magic)):
 		zr, err := newDovecotLZ4Reader(br)

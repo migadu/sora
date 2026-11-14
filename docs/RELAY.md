@@ -174,6 +174,18 @@ For each message Sora sends one `POST` to `http_url` with `Content-Type: applica
 | `from` | The envelope sender. |
 | `recipients` | The envelope recipient. Always exactly one address. |
 | `message` | The complete message (RFC 5322 headers and body) as a string. |
+| `message_base64` | The complete message byte for byte, standard base64 (RFC 4648 section 4). Only present when the message is not valid UTF-8. |
+
+A JSON string holds Unicode text only, so `message` cannot carry a message that is not valid UTF-8
+(8-bit text in another charset, raw 8-bit header values): each such byte in it is replaced with
+U+FFFD. Those messages are also sent in `message_base64`. A relay API takes the message from
+`message_base64` when it is present and from `message` otherwise; either way it gets the message
+byte for byte.
+
+Update the receiver to accept and prefer `message_base64` before deploying this field.
+A receiver that ignores it still sees the legacy, lossy `message` for non-UTF-8 mail.
+A receiver that rejects unknown fields can return a 4xx response, which Sora treats as a
+permanent relay failure and moves to the failed queue.
 
 Sora reads only the status code of the response.
 
@@ -450,9 +462,14 @@ Then Sora posts JSON to `endpoint`, with `Authorization: Bearer <auth_token>` wh
 |---|---|
 | `type` | `spam` or `ham`. |
 | `message` | The message after stripping. |
+| `message_base64` | The message after stripping, byte for byte, standard base64 (RFC 4648 section 4). Only present when it is not valid UTF-8. |
 | `user` | The address of the user who moved it. |
 | `source_mailbox`, `dest_mailbox` | The folder names. |
 | `timestamp` | When the report was built (RFC 3339). |
+
+As in the [HTTP relay request](#3-the-http-relay-request), each byte of `message` that is not valid
+UTF-8 is replaced with U+FFFD; the endpoint takes the message from `message_base64` when it is
+present and from `message` otherwise.
 
 A `2xx` answer is success. Anything else is a failure.
 
