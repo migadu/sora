@@ -94,3 +94,32 @@ func TestClientFilter_RemovesCapabilityImpliedByQResync(t *testing.T) {
 		}
 	}
 }
+
+// go-imap lists SASL-IR, LITERAL-, UNSELECT and ENABLE with IMAP4rev1 whatever
+// the configured set holds, so naming one in disabled_caps or client_filters
+// cannot withdraw it. Removing what implies it (IMAP4rev2, and LITERAL+ for
+// LITERAL-) would only downgrade the server while it stays advertised.
+func TestDisabledCaps_KeepsImpliersOfAlwaysAdvertisedCapability(t *testing.T) {
+	for _, c := range []imap.Cap{imap.CapSASLIR, imap.CapLiteralMinus, imap.CapUnselect, imap.CapEnable} {
+		srv := newDisabledCapsTestServer(t, IMAPServerOptions{
+			DisabledCaps: []string{string(c)},
+			CapabilityFilters: []config.ClientCapabilityFilter{{
+				ClientName:  "^buggy$",
+				DisableCaps: []string{string(c)},
+			}},
+		})
+		for _, keep := range []imap.Cap{imap.CapIMAP4rev2, imap.CapLiteralPlus} {
+			if !srv.caps.Has(keep) {
+				t.Errorf("disabled_caps = [%s] removed %s", c, keep)
+			}
+		}
+
+		caps := srv.caps.Copy()
+		srv.filterCapabilitiesForClient(caps, &imap.IDData{Name: "buggy"}, "")
+		for _, keep := range []imap.Cap{imap.CapIMAP4rev2, imap.CapLiteralPlus} {
+			if !caps.Has(keep) {
+				t.Errorf("client filter disable_caps = [%s] removed %s", c, keep)
+			}
+		}
+	}
+}

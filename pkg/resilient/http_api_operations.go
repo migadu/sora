@@ -76,20 +76,6 @@ func (rd *ResilientDatabase) GetAllHealthStatusesWithRetry(ctx context.Context, 
 	return result.([]*db.HealthStatus), nil
 }
 
-func (rd *ResilientDatabase) GetHealthHistoryWithRetry(ctx context.Context, hostname, component string, since time.Time, limit int) ([]*db.HealthStatus, error) {
-	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetHealthHistory(ctx, hostname, component, since, limit)
-	}
-	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		return []*db.HealthStatus{}, nil
-	}
-	return result.([]*db.HealthStatus), nil
-}
-
 func (rd *ResilientDatabase) GetHealthStatusWithRetry(ctx context.Context, hostname, component string) (*db.HealthStatus, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).GetHealthStatus(ctx, hostname, component)

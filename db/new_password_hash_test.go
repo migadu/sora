@@ -48,7 +48,7 @@ func TestNewPasswordsRefuseUnsaltedSHA512(t *testing.T) {
 	refused := func(t *testing.T, err error, address string) {
 		t.Helper()
 		if assert.Error(t, err, "sha512 was accepted for a new password") {
-			assert.Contains(t, err.Error(), "unsupported hash type")
+			assert.ErrorIs(t, err, ErrUnsupportedHashType)
 		}
 		assert.False(t, strings.HasPrefix(storedHash(t, address), "{SHA512}"), "an unsalted SHA-512 hash was stored for %s", address)
 	}
