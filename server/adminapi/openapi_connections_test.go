@@ -14,18 +14,17 @@ import (
 	"github.com/migadu/sora/server"
 )
 
-// GET /admin/connections lists ConnectionInfo entries and GET /admin/connections/user/{email}
-// UserConnectionInfo entries: one per account and connection tracker, with snake_case keys.
-// The spec described a per-session record with Go field names (ID, ClientAddr,
-// ConnectedAt, ...) that no handler ever sent, so a client generated from it read nothing.
-// This pins both schemas to what json.Marshal emits for the entry types.
+// GET /admin/connections and GET /admin/connections/user/{email} list ConnectionInfo
+// entries: one per account and connection tracker, with snake_case keys. The spec
+// described a per-session record with Go field names (ID, ClientAddr, ConnectedAt, ...)
+// that no handler ever sent, so a client generated from it read nothing. This pins the
+// schema to what json.Marshal emits for the entry type.
 func TestOpenAPIConnectionEntriesMatchWireFormat(t *testing.T) {
 	for _, tc := range []struct {
 		schema string
 		entry  any
 	}{
 		{"ConnectionInfo", ConnectionInfo{}},
-		{"UserConnectionInfo", UserConnectionInfo{}},
 	} {
 		t.Run(tc.schema, func(t *testing.T) {
 			documented := schemaProperties(t, tc.schema)

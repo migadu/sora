@@ -221,42 +221,13 @@ components:
 
     ConnectionInfo:
       type: object
-      description: "An account with sessions on one of this node's connection trackers: one entry per account and tracker, not per session. Accounts this node knows only through gossip are not listed."
+      description: "An account on one of this node's connection trackers: one entry per account and tracker, not per session."
       properties:
         protocol:
           type: string
           description: "The tracker key up to its first dash."
           example: "IMAP"
         instance:
-          type: string
-          description: "The tracker key: <PROTOCOL>-<server name> on a backend, <PROTOCOL>-<cluster node_id>-<server name> on a proxy (the host name in place of the node_id outside cluster mode, where the LMTP proxy is the only proxy that tracks sessions)."
-          example: "IMAP-node1-imap-proxy"
-        account_id:
-          type: integer
-          format: int64
-          example: 123
-        email:
-          type: string
-          description: "The address of the session that created the entry: the login address, or the recipient on an LMTP proxy."
-          example: "user@example.com"
-        local_count:
-          type: integer
-          description: "The account's sessions on this tracker."
-          example: 2
-        total_count:
-          type: integer
-          description: "local_count plus the account's sessions on the same protocol that other nodes' trackers report through gossip. Backends and LMTP proxies do not gossip, so there it equals local_count."
-          example: 3
-        last_update:
-          type: string
-          format: date-time
-          description: "When the tracker last updated the entry: a session opened or closed, or gossip about the account arrived (including the periodic full-state exchange, which changes no count)."
-
-    UserConnectionInfo:
-      type: object
-      description: "The account on one of this node's connection trackers. Unlike ConnectionInfo, protocol is the whole tracker key, and a tracker that knows the account only through gossip is listed too, with local_count 0."
-      properties:
-        protocol:
           type: string
           description: "The tracker key: <PROTOCOL>-<server name> on a backend, <PROTOCOL>-<cluster node_id>-<server name> on a proxy (the host name in place of the node_id outside cluster mode, where the LMTP proxy is the only proxy that tracks sessions)."
           example: "IMAP-node1-imap-proxy"
@@ -1808,7 +1779,7 @@ paths:
       tags:
         - Connection Management
       summary: List the accounts with sessions on this node
-      description: One entry per account and connection tracker on this node; local_count is the number of sessions.
+      description: One entry per account and connection tracker on this node; local_count is the number of sessions. Accounts this node knows only through gossip are not listed.
       responses:
         '200':
           description: The accounts with sessions on this node's connection trackers.
@@ -1898,7 +1869,7 @@ paths:
       tags:
         - Connection Management
       summary: Get connections for a specific user
-      description: One entry per connection tracker on this node that knows the account, matched case-insensitively against the entry's email, so an account whose entry was created by an alias login is found only under that alias.
+      description: One entry per connection tracker on this node that knows the account, matched case-insensitively against the entry's email, so an account whose entry was created by an alias login is found only under that alias. Unlike /connections, a tracker that knows the account only through gossip is listed too, with local_count 0.
       parameters:
         - name: email
           in: path
@@ -1920,7 +1891,7 @@ paths:
                   connections:
                     type: array
                     items:
-                      $ref: '#/components/schemas/UserConnectionInfo'
+                      $ref: '#/components/schemas/ConnectionInfo'
                   count:
                     type: integer
                     description: Number of entries in connections.
@@ -1996,6 +1967,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Affinity manager not enabled on this server.
           content:
             application/json:
               schema:
@@ -2095,6 +2072,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '503':
+          description: Affinity manager not enabled on this server.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     delete:
       tags:
         - Affinity Management
@@ -2146,6 +2129,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Affinity manager not enabled on this server.
           content:
             application/json:
               schema:

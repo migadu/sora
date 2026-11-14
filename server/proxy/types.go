@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -19,7 +21,7 @@ const (
 	AuthUserNotFound           AuthResult = iota // User doesn't exist in remotelookup - fallback controlled by lookup_local_users
 	AuthSuccess                                  // User found and authenticated - proceed with routing
 	AuthFailed                                   // User found but auth failed - reject, no fallback
-	AuthTemporarilyUnavailable                   // Auth service temporarily unavailable - temporary failure, no fallback
+	AuthTemporarilyUnavailable                   // Auth service gave no verdict - temporary failure, never a fallback to the local database
 )
 
 // String returns a human-readable representation of AuthResult
@@ -110,10 +112,15 @@ func NormalizeBackendAddr(addr string, defaultPort int) string {
 // named pools when the config declares [[pool]] blocks, else the flat remote_addrs list
 // with the server's own backend-leg settings.
 type ManagerOptions struct {
-	Pools              []PoolSpec
-	RemoteAddrs        []string
-	RemotePort         int
-	Settings           BackendSettings // flat-list settings; unused with Pools
+	Pools       []PoolSpec
+	RemoteAddrs []string
+	RemotePort  int
+	Settings    BackendSettings // flat-list settings; unused with Pools
+	// RemoteTLSCAFile is the [[server]] block's remote_tls_ca_file: a PEM file of CA
+	// certificates that the backends of a flat list, and with Pools any backend in no
+	// pool (a lookup pin), are verified against; "" = the system roots. A pool member is
+	// verified against its own pool's CA file only.
+	RemoteTLSCAFile    string
 	ConnectTimeout     time.Duration
 	RoutingLookup      UserRoutingLookup
 	ServerName         string
@@ -143,10 +150,25 @@ func poolRouteOutcome(err error) string {
 // NewConnectionManagerFromOptions builds a pool-routing manager when Pools is set and a
 // flat-list one otherwise.
 func NewConnectionManagerFromOptions(o ManagerOptions) (*ConnectionManager, error) {
-	if len(o.Pools) > 0 {
-		return NewConnectionManagerWithPools(o.Pools, o.RemotePort, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
+	var roots *x509.CertPool // nil = the system roots
+	if o.RemoteTLSCAFile != "" {
+		var err error
+		if roots, err = loadCAFile(o.RemoteTLSCAFile); err != nil {
+			return nil, fmt.Errorf("remote_tls_ca_file: %w", err)
+		}
 	}
-	return NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(o.RemoteAddrs, o.RemotePort, o.Settings.TLS, o.Settings.TLSUseStartTLS, o.Settings.TLSVerify, o.Settings.UseProxyProtocol, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
+	var cm *ConnectionManager
+	var err error
+	if len(o.Pools) > 0 {
+		cm, err = NewConnectionManagerWithPools(o.Pools, o.RemotePort, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
+	} else {
+		cm, err = NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(o.RemoteAddrs, o.RemotePort, o.Settings.TLS, o.Settings.TLSUseStartTLS, o.Settings.TLSVerify, o.Settings.UseProxyProtocol, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
+	}
+	if err != nil {
+		return nil, err
+	}
+	cm.SetRemoteTLSRootCAs(roots)
+	return cm, nil
 }
 
 // PoolSpecsFromConfig converts the [[pool]] blocks of a config file into pool specs.

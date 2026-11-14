@@ -61,7 +61,8 @@ Usage:
   sora-admin tls list [options]
 
 Options:
-  --cache-dir string    Local autocert cache directory (default: /var/cache/sora/autocert)
+  --cache-dir string    Local autocert cache directory (default: [tls.letsencrypt] fallback_dir,
+                        else /var/lib/sora/certs)
   --details             Show detailed certificate information (expiry, type, etc.)
   --json                Output in JSON format
   --config string       Path to TOML configuration file (required)

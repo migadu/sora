@@ -36,6 +36,19 @@ func vacAddr(t *testing.T, s string) *server.Address {
 	return &a
 }
 
+// ownsAny adapts a single-address ownership fake to the handler's batched
+// IsAnyOwnedAddress, as production wires both from the same credentials table.
+func ownsAny(owns func(context.Context, int64, string) (bool, error)) func(context.Context, int64, []string) (bool, error) {
+	return func(ctx context.Context, accountID int64, addresses []string) (bool, error) {
+		for _, a := range addresses {
+			if owned, err := owns(ctx, accountID, a); err != nil || owned {
+				return owned, err
+			}
+		}
+		return false, nil
+	}
+}
+
 // TestHandleVacationResponse exercises the consolidated vacation handler end-to-end
 // (the path now shared by LMTP and the Admin API): ownership-constrained ":from",
 // single-part body, RFC 2047 subject, RFC 5230 §4.5 suppression, and the notify hook.
@@ -175,7 +188,7 @@ func TestHandleVacationResponse(t *testing.T) {
 
 	t.Run("RFC 5230 §4.5: account in Cc only -> reply", func(t *testing.T) {
 		rq := &captureRelayQueue{}
-		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane}
+		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane, IsAnyOwnedAddress: ownsAny(ownsJane)}
 		reply := sieveengine.VacationReply{Body: "away"}
 		// Owner not in To, but present in Cc — still a personal message.
 		orig := makeMessage(map[string]string{"From": "bob@external.com", "To": "team@example.com", "Cc": owner})
@@ -190,7 +203,7 @@ func TestHandleVacationResponse(t *testing.T) {
 
 	t.Run("RFC 5230 §4.5: plus-addressed recipient counts -> reply", func(t *testing.T) {
 		rq := &captureRelayQueue{}
-		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane}
+		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane, IsAnyOwnedAddress: ownsAny(ownsJane)}
 		reply := sieveengine.VacationReply{Body: "away"}
 		// ownsJane only owns the base address; the To carries a +detail recipient, which
 		// must still be recognized as personal mail after base-address normalization.
@@ -206,7 +219,7 @@ func TestHandleVacationResponse(t *testing.T) {
 
 	t.Run("RFC 5230 §4.5: account not in To/Cc -> no reply (backscatter)", func(t *testing.T) {
 		rq := &captureRelayQueue{}
-		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane}
+		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane, IsAnyOwnedAddress: ownsAny(ownsJane)}
 		reply := sieveengine.VacationReply{Body: "away"}
 		// Delivered to the account (Bcc / alias expansion), but the account's address
 		// appears in neither To nor Cc — auto-replying here is backscatter.

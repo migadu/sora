@@ -908,17 +908,8 @@ enabled = false
 # before its body is fetched from S3.
 # max_message_size = "10mb"
 
-# Maximum attachment size threshold (default: "0")
-# If set to "0" (default): Always strip attachments and submit for training
-# If set to a size: Skip training if total attachments exceed this size
-# This is a pre-filter - attachments are always stripped before submission
-# max_attachment_size = "0"
-
-# Async mode (default: true)
-# When true, training submissions happen in background (non-blocking)
-# When false, MOVE command waits for training submission to complete
-# RECOMMENDED: Keep true to avoid slowing down IMAP operations
-# async = true
+# Attachments are always stripped before submission, and training always runs in
+# the background (MOVE never waits for it).
 
 # Workers that fetch and submit training messages, process-wide (default: 4)
 # At most this many message bodies are fetched and sent at once, however many
@@ -1399,8 +1390,8 @@ type = "lmtp"
 name = "main-lmtp"
 addr = ":24"
 debug = true                  # Enable debug logging for LMTP server
-max_connections = 500
-max_connections_per_ip = 5
+max_connections = 500         # The only connection limit: MTAs deliver many messages at once from few
+                              # addresses, so there is no per-IP or per-user limit.
 tls = false
 tls_use_starttls = false      # Use STARTTLS for opportunistic encryption.
 # tls_cert_file = "/path/to/your/lmtp.crt"  # [OPTIONAL] Only needed if global [tls] is disabled
@@ -1415,12 +1406,21 @@ proxy_protocol_timeout = "5s"
 # Maximum size for incoming LMTP messages to prevent memory exhaustion attacks
 max_message_size = "50mb"     # Maximum message size (default: 50MB, 0 = unlimited)
 
+# --- TIMEOUT CONFIGURATION ---
+# The LMTP server's only connection timeout. absolute_session_timeout, min_bytes_per_minute,
+# auth_idle_timeout and limits.session_memory_limit do not apply to it.
+timeouts.command_timeout = "5m"  # Idle time between commands before 421 and disconnect
+                                 # (default: 5m, the RFC 5321 §4.5.3.2.7 floor; "0" = the default).
+                                 # It also bounds receiving a message: the read deadline set for the
+                                 # DATA command is not extended while the data arrives, so a message
+                                 # that takes longer is refused with 421 and the MTA retries it.
+
 # --- PER-COMMAND EXECUTION TIMEOUTS (optional) ---
 # Hard caps on server-side work, mirroring imap_command_timeouts. On expiry
 # the command answers 4xx and the upstream MTA queues and retries — mail is
 # never lost. The DATA cap covers only the delivery pipeline (SIEVE, spool,
-# DB insert); wire reception from a slow MTA is governed by the read timeout,
-# not this cap. "0" disables a specific cap.
+# DB insert); wire reception from a slow MTA is governed by command_timeout
+# above, not this cap. "0" disables a specific cap.
 # timeouts.lmtp_command_timeouts.rcpt = "10s"  # RCPT (default: 10s, recipient validation)
 # timeouts.lmtp_command_timeouts.data = "60s"  # DATA processing (default: 60s — generous: a cap firing
                                                # after the DB commit but before the 250 reply means the
@@ -1640,6 +1640,7 @@ tls_verify = false                    # true requires client certificates (mutua
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
 remote_tls_verify = true              # Verify backend server TLS certificates
+# remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots; only for backends in no [[pool]].
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_id_command = false         # Send IMAP ID command to backends
 remote_health_checks = true           # Enable backend health tracking (default: true)
@@ -1914,14 +1915,17 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # - HALF-OPEN: Testing recovery, limited requests allowed to check if endpoint recovered
   #
   # RECOVERY PROCESS:
-  # 1. Circuit opens after failure_ratio threshold reached (default: 60% of last 3 requests fail)
+  # 1. Circuit opens once min_requests answers have completed (default: 3) and failure_ratio of them
+  #    (default: 60%) were failures, counted since the breaker last changed state (or per interval, if set)
   # 2. Waits for timeout period (default: 30s)
   # 3. Transitions to half-open and allows max_requests concurrent test requests (default: 3)
   # 4. If tests succeed → circuit closes and normal operation resumes
   # 5. If tests fail → circuit re-opens and waits another timeout period
   #
-  # IMPORTANT: Only server errors (5xx), timeouts, and network failures trigger the circuit breaker.
-  # Valid responses like 404 (user not found) do NOT count as failures.
+  # IMPORTANT: These count as failures: network errors, timeouts, 5xx, 408, 429, a 2xx other than
+  # 200, and a 200 with invalid JSON or no address. Authentication lookups also require password_hash;
+  # route-only lookups do not. 404, 3xx, 401, 403 and the other 4xx do NOT count, nor does a 200
+  # whose password_hash sora cannot verify.
   #
   # PRODUCTION RECOMMENDATIONS:
   # - timeout: 60s-300s (longer allows more time for service recovery)
@@ -2096,7 +2100,7 @@ tls_verify = false                    # true requires client certificates (mutua
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
 remote_tls_verify = true              # Verify backend server TLS certificates
-# remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots. POP3 proxy only, and only for backends in no [[pool]] (a pool member uses its pool's remote_tls_ca_file).
+# remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots; only for backends in no [[pool]].
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_xclient = false            # Send XCLIENT command to backends for forwarding client info
 remote_use_utf8 = false               # Advertise UTF8/LANG (RFC 6856) in the proxy's pre-auth CAPA and mirror
@@ -2161,6 +2165,7 @@ tls_verify = false                    # true requires client certificates (mutua
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
 remote_tls_verify = true              # Verify backend server TLS certificates
+# remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots; only for backends in no [[pool]].
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_health_checks = true           # Enable backend health tracking (default: true)
 remote_dns_refresh = "5m"             # Backend hostname re-resolution interval; "0" pins the pool to the
@@ -2200,11 +2205,10 @@ type = "lmtp_proxy"
 name = "lmtp-proxy-1"
 addr = ":124"                 # Proxy listen address. Must be different from backend LMTP port.
 remote_addrs = ["backend1.example.com:24", "backend2.example.com:24"]
-max_connections = 1000
-max_connections_per_ip = 0            # Typically no per-IP limits for LMTP (trusted sources)
-# Note: max_connections_per_user not applicable for LMTP (no user authentication)
+max_connections = 1000                # The only connection limit: max_connections_per_ip,
+                                      # max_connections_per_user and max_connections_per_user_per_ip
+                                      # do not apply to LMTP (trusted sources, no user login).
 #       LMTP uses local-only connection tracking (no gossip) for monitoring visibility.
-#       Connection limits are automatically disabled for LMTP to prevent delivery rejection.
 
 # --- PROXY TLS CONFIGURATION ---
 tls = false
@@ -2218,6 +2222,7 @@ tls_verify = false                    # true requires client certificates (mutua
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
 remote_tls_verify = true              # Verify backend server TLS certificates
+# remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots; only for backends in no [[pool]].
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_xclient = false            # Send XCLIENT command to backends for forwarding client info
 remote_health_checks = true           # Enable backend health tracking (default: true)
@@ -2239,11 +2244,11 @@ max_message_size = "50mb"
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = disabled for proxies)
+# The LMTP proxy's timeouts are auth_idle_timeout (above) and absolute_session_timeout;
+# command_timeout and min_bytes_per_minute do not apply to it.
 timeouts.absolute_session_timeout = "5m"    # Maximum total session duration (default: 5m for LMTP)
                                             # LMTP is a delivery protocol - connections should complete in seconds/minutes
                                             # 5 minutes is generous for large messages while detecting hung backends quickly
-timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
 
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)
@@ -2350,7 +2355,7 @@ tls_verify = false
 #max_connections = 10000             # Maximum total concurrent connections (0 = unlimited)
 #max_connections_per_ip = 100        # Maximum connections per client IP (0 = unlimited)
 #connect_timeout = "10s"             # Timeout for establishing backend connections
-#enable_affinity = true              # Enable user-to-backend affinity (sticky routing via consistent hashing)
+#enable_affinity = true              # Enable user-to-backend affinity (default: false; requires [cluster.affinity] to be enabled)
 #tls = false                         # Enable TLS on frontend proxy listener
 #tls_cert_file = ""
 #tls_key_file = ""
@@ -2358,6 +2363,7 @@ tls_verify = false
 #tls_default_domain = "api.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this proxy.
 #remote_tls = false                  # Use HTTPS for backend connections
 #remote_tls_verify = true            # Verify backend TLS certificates
+#remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots; only for backends in no [[pool]].
 
 # IMPORTANT: Backend User API servers should configure allowed_hosts to trust this proxy
 # Backend configuration example:

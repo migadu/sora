@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/signal"
 	"sync"
@@ -14,7 +15,8 @@ import (
 // the cluster) can take minutes, during which a log rotation or a `systemctl reload`
 // must not kill sora. Every SIGHUP reopens the log file at once. The configuration
 // reload needs the running servers, so one asked for before start is held and runs
-// once start hands over the reload, however many SIGHUPs came.
+// once start hands over the reload, however many SIGHUPs came; main does that once the
+// servers have registered for reload (startWhenServersRegistered).
 type sighupHandler struct {
 	signals chan os.Signal
 
@@ -48,7 +50,7 @@ func (h *sighupHandler) received() {
 	}
 	h.mu.Unlock()
 	if reload == nil {
-		logger.Info("SIGHUP received during start-up - log file reopened; the configuration is reloaded once the servers are started")
+		logger.Info("SIGHUP received during start-up - log file reopened; the configuration is reloaded once the servers have started")
 		return
 	}
 	reload()
@@ -69,4 +71,30 @@ func (h *sighupHandler) start(reload func()) {
 		default: // a SIGHUP is already queued, and it reloads
 		}
 	}
+}
+
+// startWhenServersRegistered hands h the reload once every server that takes one has
+// registered for it (deps.serversRegistered). A reload run while one is still starting
+// would pass it over: the settings its ReloadConfig applies would be reported as
+// needing a restart, and it would keep the ones it started with, a rotated api_key or
+// jwt_secret among them. Until then a SIGHUP only reopens the log file, as during the
+// rest of start-up. Nothing is handed over once ctx is done.
+func (h *sighupHandler) startWhenServersRegistered(ctx context.Context, deps *serverDependencies, reload func()) {
+	go func() {
+		select {
+		case <-deps.serversRegistered():
+			// Both channels can be ready during shutdown; select does not give
+			// cancellation priority over a completed registration barrier.
+			if ctx.Err() != nil {
+				return
+			}
+			h.start(func() {
+				// A held signal may be delivered after shutdown has begun.
+				if ctx.Err() == nil {
+					reload()
+				}
+			})
+		case <-ctx.Done():
+		}
+	}()
 }

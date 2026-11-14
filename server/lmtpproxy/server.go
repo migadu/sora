@@ -107,6 +107,7 @@ type ServerOptions struct {
 	RemoteTLS                bool
 	RemoteTLSUseStartTLS     bool // Use STARTTLS for backend connections
 	RemoteTLSVerify          bool
+	RemoteTLSCAFile          string // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
 	RemoteUseProxyProtocol   bool
 	ConnectTimeout           time.Duration
 	AuthIdleTimeout          time.Duration
@@ -198,6 +199,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		RemoteAddrs:        opts.RemoteAddrs,
 		RemotePort:         opts.RemotePort,
 		Settings:           proxy.BackendSettings{TLS: opts.RemoteTLS, TLSUseStartTLS: opts.RemoteTLSUseStartTLS, TLSVerify: opts.RemoteTLSVerify, UseProxyProtocol: opts.RemoteUseProxyProtocol},
+		RemoteTLSCAFile:    opts.RemoteTLSCAFile,
 		ConnectTimeout:     connectTimeout,
 		RoutingLookup:      routingLookup,
 		ServerName:         opts.Name,
@@ -627,7 +629,11 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	next := *s.loadSettings()
 
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	// A value that does not parse keeps the running one (start-up, which has none,
+	// uses the default).
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("LMTP proxy config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}

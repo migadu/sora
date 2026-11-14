@@ -872,13 +872,11 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 	var spamTrainingClient *spamtraining.Client
 	if opts != nil && opts.SpamTrainingEnabled {
 		cfg := &config.SpamTrainingConfig{
-			Enabled:           true,
-			Endpoint:          opts.SpamTrainingEndpoint,
-			AuthToken:         opts.SpamTrainingToken,
-			Timeout:           "10s",
-			MaxMessageSize:    "10mb",
-			MaxAttachmentSize: "5mb",
-			Async:             true,
+			Enabled:        true,
+			Endpoint:       opts.SpamTrainingEndpoint,
+			AuthToken:      opts.SpamTrainingToken,
+			Timeout:        "10s",
+			MaxMessageSize: "10mb",
 			CircuitBreaker: config.SpamTrainingCircuitBreakerConfig{
 				Threshold:   opts.SpamTrainingCircuitThreshold,
 				Timeout:     opts.SpamTrainingCircuitTimeout,
