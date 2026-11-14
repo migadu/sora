@@ -130,7 +130,7 @@ func (d *Database) RekeyContentHash(ctx context.Context, tx pgx.Tx, accountID in
 		return 0, fmt.Errorf("failed to re-key messages: %w", err)
 	}
 
-	if err := fillWaitingFTSRows(ctx, tx, obj.ContentHash); err != nil {
+	if err := fillWaitingFTSRows(ctx, tx, []string{obj.ContentHash}); err != nil {
 		return 0, err
 	}
 
@@ -155,26 +155,6 @@ func (d *Database) RekeyContentHash(ctx context.Context, tx pgx.Tx, accountID in
 	}
 
 	return tag.RowsAffected(), nil
-}
-
-// fillWaitingFTSRows gives the rows of hash that wait for a sibling's vector -- no text, no
-// vector, as restageFTS writes them for a copy into another account and stageFTS for a body
-// another account has indexed -- what the FTS worker would give them: the hash's vector, or,
-// while the hash's text is not tokenised yet, that text. It does not skip a row the worker has
-// polled: the worker fills it from a sibling that stays until this transaction commits, and
-// the update then finds it filled.
-func fillWaitingFTSRows(ctx context.Context, tx pgx.Tx, hash string) error {
-	if _, err := tx.Exec(ctx, `
-		UPDATE messages_fts_v2 t
-		SET text_body_tsv = s.tsv, text_body = CASE WHEN s.tsv IS NULL THEN s.text END
-		FROM (SELECT `+ftsSourceVectorSQL("$1::varchar(64)")+` AS tsv,
-		             (SELECT v.text_body FROM messages_fts_v2 v
-		               WHERE v.content_hash = $1::varchar(64) AND v.text_body IS NOT NULL LIMIT 1) AS text) s
-		WHERE t.content_hash = $1::varchar(64) AND t.text_body_tsv IS NULL AND t.text_body IS NULL
-		  AND (s.tsv IS NOT NULL OR s.text IS NOT NULL)`, hash); err != nil {
-		return fmt.Errorf("failed to fill waiting fts rows of the old hash: %w", err)
-	}
-	return nil
 }
 
 // lockRekeySources takes, in shared mode, the rekey lock of every account that owns one of
