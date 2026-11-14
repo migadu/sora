@@ -414,7 +414,27 @@ func TestSoftDeleteMailbox_UpdateMessageFlagsReturnsNotFound(t *testing.T) {
 	require.NoError(t, err)
 	defer txDel.Rollback(baseCtx)
 	require.NoError(t, db.SoftDeleteMailbox(sharedCtx, txDel, mbox.ID, ownerID))
+
+	// The first lookup can still see this uncommitted mailbox as live. Stop the
+	// flag update at its mailbox lock, then commit the delete: the second read
+	// must recheck visibility rather than mutate the tombstoned message.
+	var deletingPID int
+	require.NoError(t, txDel.QueryRow(baseCtx, `SELECT pg_backend_pid()`).Scan(&deletingPID))
+	updateCtx, cancelUpdate := context.WithTimeout(baseCtx, 10*time.Second)
+	defer cancelUpdate()
+	updateDone := make(chan error, 1)
+	go func() {
+		updateDone <- db.UpdateMessageFlags(updateCtx, ownerID, msgID, []string{"\\Flagged", "Work"}, nil)
+	}()
+	require.Eventually(t, func() bool {
+		var blocked int
+		err := db.GetWritePool().QueryRow(baseCtx, `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE $1 = ANY(pg_blocking_pids(pid))`, deletingPID).Scan(&blocked)
+		return err == nil && blocked > 0
+	}, 5*time.Second, 10*time.Millisecond, "flag update never reached the mailbox lock")
 	require.NoError(t, txDel.Commit(sharedCtx))
+	require.ErrorIs(t, <-updateDone, consts.ErrDBNotFound)
 
 	// GetMessageByID hides the message immediately for everyone.
 	for name, caller := range map[string]int64{"owner": ownerID, "writer": writerID, "reader": readerID} {
