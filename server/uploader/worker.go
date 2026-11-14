@@ -1114,7 +1114,8 @@ func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []
 	// Nothing removes an account's staging directory once it exists, so it is still
 	// there when the OpenFile below runs. The uploader used to remove it as soon as the
 	// account's last staged file left, which could land between these two calls and
-	// fail the delivery with ENOENT. An empty directory left behind costs one inode.
+	// fail the delivery with ENOENT. An empty directory left behind costs an inode, and
+	// on ext4 (without inline_data) also its one directory block.
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
