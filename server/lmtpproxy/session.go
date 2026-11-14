@@ -629,8 +629,21 @@ func (s *Session) handleConnection() {
 			s.sendResponse("221 2.0.0 Bye")
 			return
 
+		case "VRFY":
+			// Every SMTP server MUST support VRFY (RFC 5321 section 4.5.1), and
+			// one that does not verify MUST answer 252 (section 7.3), as the
+			// backend does.
+			s.sendResponse("252 2.5.0 Cannot VRFY user, but will accept message")
+
+		case "EXPN", "HELP", "SEND", "SOML", "SAML", "TURN", "BDAT", "AUTH", "XCLIENT":
+			// Known commands the proxy does not implement: 502 (RFC 5321 section
+			// 4.2.4). BDAT, AUTH and XCLIENT are the backend's, never advertised
+			// here.
+			s.sendResponse(fmt.Sprintf("502 5.5.1 %s command not implemented", command))
+
 		default:
-			s.sendResponse("502 5.5.2 Command not implemented")
+			// Not echoed: the verb is whatever the client sent.
+			s.sendResponse("500 5.5.2 Syntax error, command unrecognized")
 		}
 	}
 }
