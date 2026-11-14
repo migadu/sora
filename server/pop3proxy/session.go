@@ -118,6 +118,17 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// not the resolved s.username, which can differ for token/master/+detail logins.
 	s.submittedUsername = username
 
+	// Parse once (regular addresses and the user@domain.com@SUFFIX form alike). The base
+	// address, without +detail or @SUFFIX, names the user from here on: in every line this
+	// attempt logs and, unless a resolved address replaces it, as the routing key of the
+	// login, cached or not. The raw name stands in when it does not parse.
+	parsedAddr, parseErr := server.NewAddress(username)
+	if parseErr == nil {
+		s.username = parsedAddr.BaseAddress()
+	} else {
+		s.username = username
+	}
+
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
 	// Empty passwords are never valid under any condition
 	if password == "" {
@@ -233,10 +244,10 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					// Rebuilt exactly as the uncached login routed (proxy.RouteFromCache): the pin,
 					// its enforcement and every backend-leg setting the lookup answer carried.
 					s.routingInfo = proxy.RouteFromCache(cached)
+					// The resolved address when the entry has one; otherwise s.username keeps
+					// the base address set above, the name the uncached login routed by.
 					if cached.ActualEmail != "" {
 						s.username = cached.ActualEmail
-					} else {
-						s.username = username
 					}
 
 					// Use resolved username for rate limiting and metrics
@@ -308,9 +319,6 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// Otherwise: treat as token, send full username (including @SUFFIX) to remotelookup
 	var usernameForRemoteLookup string
 	var masterAuthValidated bool
-
-	// Parse username (handles both regular addresses and addresses with @SUFFIX)
-	parsedAddr, parseErr := server.NewAddress(username)
 
 	if parseErr == nil && parsedAddr.HasSuffix() {
 		// Has suffix - check if it matches configured master username

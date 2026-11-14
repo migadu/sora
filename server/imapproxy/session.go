@@ -932,12 +932,12 @@ func (s *Session) authenticateUser(username, password string) error {
 				// its enforcement and every backend-leg setting the lookup answer carried.
 				s.routingInfo = proxy.RouteFromCache(cached)
 				s.routingInfo.ClientConn = s.listenerConn // Always set current client connection for JA4
-				// If cache has ActualEmail (e.g., "user@example.com" for "user@TOKEN"), use it
-				// Otherwise fall back to submitted username
+				// The resolved address when the entry has one (e.g. "user@example.com" for
+				// "user@TOKEN"); otherwise s.username keeps the base address set above, the
+				// name the uncached login routed by. The submitted name would route a
+				// +detail or @SUFFIX login under another key than the uncached one.
 				if cached.ActualEmail != "" {
 					s.username = cached.ActualEmail
-				} else {
-					s.username = username
 				}
 
 				// Use actual username (resolved email) for rate limiting and metrics
