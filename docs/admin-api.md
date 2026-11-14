@@ -713,33 +713,57 @@ Get list of failed S3 uploads.
 
 ### Authentication Statistics
 
-Monitor authentication attempts and track potential security issues.
+Failed logins are tracked in memory by each server's authentication rate limiter, per address, and expire on their own. The API exposes the addresses those limiters currently block; attempt counts are exported as the Prometheus counter `sora_authentication_attempts_total`.
 
 #### Get Authentication Statistics
 
 **Endpoint:** `GET /admin/auth/stats`
 
-Get statistics about authentication attempts.
-
-**Query Parameters:**
-- `window=24h` - Time window (e.g., "1h", "30m", "24h")
+Returns no counters: the response is the same fixed description of the tracking on every call. Use [`GET /admin/auth/blocked`](#list-blocked-addresses) for live data. Query parameters are ignored; the `window` parameter of older versions is still accepted.
 
 **Response:** `200 OK`
 ```json
 {
-  "stats": {
-    "total_attempts": 1523,
-    "successful_attempts": 1489,
-    "failed_attempts": 34,
-    "unique_ips": 245,
-    "unique_usernames": 180,
-    "unique_protocols": 3,
-    "window_duration": "24h0m0s"
+  "implementation": "in-memory",
+  "tracking_mode": "per-address rate limiting with automatic expiry",
+  "available_stats": {
+    "blocked_entries": "GET /admin/auth/blocked"
   },
-  "window": "24h",
-  "window_seconds": 86400
+  "access_methods": {
+    "blocked_list": "GET /admin/auth/blocked - list currently blocked addresses"
+  }
 }
 ```
+
+#### List Blocked Addresses
+
+**Endpoint:** `GET /admin/auth/blocked`
+
+List the IP and IP+username blocks currently held by this node's authentication rate limiters.
+
+**Query Parameters:**
+- `protocol=imap` - Only the rate limiters of this server type: `imap`, `imap_proxy`, `pop3`, `pop3_proxy`, `managesieve`, `managesieve_proxy` or `userapi`
+
+**Response:** `200 OK`
+```json
+{
+  "blocked_entries": [
+    {
+      "ip": "192.0.2.10",
+      "username": "user@example.com",
+      "blocked_until": "2026-11-14T10:45:00Z",
+      "failure_count": 5,
+      "first_failure": "2026-11-14T10:29:12Z",
+      "last_failure": "2026-11-14T10:30:00Z",
+      "protocol": "IMAP",
+      "type": "ip_username"
+    }
+  ],
+  "count": 1
+}
+```
+
+`type` is `ip_username` for a block of one username from one IP and `ip` for a block of every login from the IP; `username` is absent for an `ip` block. `protocol` is the rate limiter's label (`IMAP`, `POP3`, `ManageSieve`, `IMAP-PROXY`, `POP3-PROXY`, `SIEVE-PROXY` or `user-api`), not the server type the query parameter takes.
 
 ### Health Monitoring
 
