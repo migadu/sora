@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/migadu/sora/config"
 )
 
 // waitForLog waits until logs holds want n times.
@@ -61,6 +64,64 @@ func TestSIGHUPDuringStartUpWaitsForTheServers(t *testing.T) {
 	case <-reloads:
 	case <-time.After(5 * time.Second):
 		t.Fatal("a SIGHUP after start did not reload")
+	}
+}
+
+// A SIGHUP during start-up reloads once every server that takes a reload has registered
+// for it, or stopped starting without (a User API skipped for want of a jwt_secret).
+// Run as soon as the server goroutines were launched, the reload passed over the servers
+// still starting: it reported a rotated api_key as needing a restart, and the Admin API
+// kept the old key.
+func TestSIGHUPDuringStartUpReloadsOnceTheServersRegistered(t *testing.T) {
+	logs := captureReloadLogs(t)
+	deps := &serverDependencies{config: config.NewDefaultConfig()}
+	deps.config.DynamicServers = []config.ServerConfig{
+		{Type: "http_admin_api", Name: "admin-api", Addr: ":8080"},
+		{Type: "http_user_api", Name: "user-api", Addr: ":8081"},
+		{Type: "metrics", Name: "metrics", Addr: ":9090"}, // never registers: no ReloadConfig
+	}
+	deps.expectRegistrations(deps.config.GetAllServers())
+
+	h := listenForSIGHUP()
+	t.Cleanup(func() { signal.Stop(h.signals) })
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	waitForLog(t, logs, "during start-up", 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	reloads := make(chan struct{}, 4)
+	h.startWhenServersRegistered(ctx, deps, func() { reloads <- struct{}{} })
+
+	noReload := func(why string) {
+		t.Helper()
+		select {
+		case <-reloads:
+			t.Fatal(why)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	noReload("reloaded while the Admin and User APIs were still starting")
+	deps.registerServer("admin-api", &recordingReloader{})
+	noReload("reloaded while the User API was still starting")
+	deps.startReturned("user-api")
+	select {
+	case <-reloads:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the reload asked for during start-up did not run once the servers had registered")
+	}
+	noReload("one SIGHUP during start-up made more than one reload")
+}
+
+// A node with no server that takes a reload (metrics only) has nothing to wait for.
+func TestServersRegisteredWithoutAServerThatReloads(t *testing.T) {
+	deps := &serverDependencies{}
+	deps.expectRegistrations([]config.ServerConfig{{Type: "metrics", Name: "metrics", Addr: ":9090"}})
+	select {
+	case <-deps.serversRegistered():
+	default:
+		t.Fatal("waiting for a server that never registers for reload")
 	}
 }
 
