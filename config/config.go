@@ -3,7 +3,6 @@ package config
 import (
 	"errors"
 	"fmt"
-	"log"
 	"log/slog"
 	"maps"
 	"math"
@@ -769,32 +768,34 @@ func decodeTable(name string, data any, v any) error {
 	if !ok {
 		return fmt.Errorf("%s must be a table, got %T", name, data)
 	}
-	table = maps.Clone(table)
+	decoded := maps.Clone(table)
 	typ := reflect.TypeOf(v).Elem()
 	for i := range typ.NumField() {
 		field := typ.Field(i)
 		if field.Type != reflect.TypeOf(time.Duration(0)) {
 			continue
 		}
-		key := tomlKey(field)
-		value, ok := table[key]
-		if !ok {
-			continue
+		// The toml package decodes a key into a field it matches only
+		// case-insensitively too ("IP_Block_Duration"), so every such key is parsed.
+		for key, value := range table {
+			if !strings.EqualFold(key, tomlKey(field)) {
+				continue
+			}
+			s, ok := value.(string)
+			if !ok {
+				return fmt.Errorf("%s: a duration is a string with a unit, such as \"15m\" or \"1d\", got %v", key, value)
+			}
+			// Parsed here, before LoadConfigFromFile trims every string, so trim it the same way.
+			d, err := helpers.ParseDuration(strings.TrimSpace(s))
+			if err != nil {
+				return fmt.Errorf("%s: %w", key, err)
+			}
+			decoded[key] = int64(d) // the toml package decodes an integer into a time.Duration as nanoseconds
 		}
-		s, ok := value.(string)
-		if !ok {
-			return fmt.Errorf("%s: a duration is a string with a unit, such as \"15m\" or \"1d\", got %v", key, value)
-		}
-		// Parsed here, before LoadConfigFromFile trims every string, so trim it the same way.
-		d, err := helpers.ParseDuration(strings.TrimSpace(s))
-		if err != nil {
-			return fmt.Errorf("%s: %w", key, err)
-		}
-		table[key] = int64(d) // the toml package decodes an integer into a time.Duration as nanoseconds
 	}
 
 	var buf strings.Builder
-	if err := toml.NewEncoder(&buf).Encode(table); err != nil {
+	if err := toml.NewEncoder(&buf).Encode(decoded); err != nil {
 		return fmt.Errorf("%s: %w", name, err)
 	}
 	md, err := toml.Decode(buf.String(), v)
@@ -806,7 +807,7 @@ func decodeTable(name string, data any, v any) error {
 	// The outer decoder counts every key of a table handled here as decoded, so
 	// report unknown ones here.
 	for _, key := range md.Undecoded() {
-		log.Printf("WARNING: Unknown key '%s.%s' will be ignored", name, key)
+		warnf("Unknown key '%s.%s' will be ignored", name, key)
 	}
 	return nil
 }
@@ -2251,11 +2252,13 @@ func (s *ServerConfig) GetRemoteHealthChecks() bool {
 	return *s.RemoteHealthChecks
 }
 
-// warnf reports a value a ...WithDefault method replaced with its default. It
-// logs at WARN through slog's default logger, which the logger package (it
-// imports config, so config cannot import it) points at the server log. The
-// log package's output reaches that log only at INFO, so a typo logged with
-// log.Printf was filtered out at level = "warn".
+// warnf reports a problem with the configuration: a value a ...WithDefault
+// method replaced with its default, or a key the file gets wrong. It logs at WARN
+// through slog's default logger, which the logger package (it imports config, so
+// config cannot import it) points at the server log. Start-up reads the file
+// before that, and logger.Hold keeps what is logged until then. The log package's
+// output reaches the server log only at INFO, so a typo logged with log.Printf was
+// filtered out at level = "warn".
 func warnf(format string, args ...any) {
 	slog.Warn(fmt.Sprintf(format, args...))
 }
@@ -2299,7 +2302,7 @@ func (s *ServerConfig) GetHashUsernames() bool {
 func (s *ServerConfig) GetAppendLimitWithDefault() int64 {
 	limit, err := s.GetAppendLimit()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse append limit for server '%s': %v, using default (25MB)", s.Name, err)
+		warnf("Failed to parse append limit for server '%s': %v, using default (25MB)", s.Name, err)
 		return 25 * 1024 * 1024 // 25MB default
 	}
 	return limit
@@ -2308,7 +2311,7 @@ func (s *ServerConfig) GetAppendLimitWithDefault() int64 {
 func (s *ServerConfig) GetMaxScriptSizeWithDefault() int64 {
 	size, err := s.GetMaxScriptSize()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse max script size for server '%s': %v, using default (16KB)", s.Name, err)
+		warnf("Failed to parse max script size for server '%s': %v, using default (16KB)", s.Name, err)
 		return 16 * 1024 // 16KB default
 	}
 	return size
@@ -2317,7 +2320,7 @@ func (s *ServerConfig) GetMaxScriptSizeWithDefault() int64 {
 func (s *ServerConfig) GetConnectTimeoutWithDefault() time.Duration {
 	timeout, err := s.GetConnectTimeout()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse connect timeout for server '%s': %v, using default (30s)", s.Name, err)
+		warnf("Failed to parse connect timeout for server '%s': %v, using default (30s)", s.Name, err)
 		return 30 * time.Second
 	}
 	return timeout
@@ -2335,7 +2338,7 @@ func (s *ServerConfig) GetAuthIdleTimeoutWithDefault() time.Duration {
 func (s *ServerConfig) GetMaxMessageSizeWithDefault() int64 {
 	size, err := s.GetMaxMessageSize()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse max message size for server '%s': %v, using default (50MB)", s.Name, err)
+		warnf("Failed to parse max message size for server '%s': %v, using default (50MB)", s.Name, err)
 		return 52428800 // 50MB default
 	}
 	return size
@@ -2360,7 +2363,7 @@ func (s *ServerConfig) GetProxyProtocolTimeoutWithDefault() string {
 func (c *CleanupConfig) GetGracePeriodWithDefault() time.Duration {
 	period, err := c.GetGracePeriod()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup grace_period: %v, using default (14 days)", err)
+		warnf("Failed to parse cleanup grace_period: %v, using default (14 days)", err)
 		return 14 * 24 * time.Hour
 	}
 	return period
@@ -2369,7 +2372,7 @@ func (c *CleanupConfig) GetGracePeriodWithDefault() time.Duration {
 func (c *CleanupConfig) GetPurgePollIntervalWithDefault() time.Duration {
 	interval, err := c.GetPurgePollInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup purge_poll_interval: %v, using default (30s)", err)
+		warnf("Failed to parse cleanup purge_poll_interval: %v, using default (30s)", err)
 		return 30 * time.Second
 	}
 	return interval
@@ -2378,7 +2381,7 @@ func (c *CleanupConfig) GetPurgePollIntervalWithDefault() time.Duration {
 func (c *CleanupConfig) GetWakeIntervalWithDefault() time.Duration {
 	interval, err := c.GetWakeInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup wake_interval: %v, using default (1 hour)", err)
+		warnf("Failed to parse cleanup wake_interval: %v, using default (1 hour)", err)
 		return time.Hour
 	}
 	return interval
@@ -2387,7 +2390,7 @@ func (c *CleanupConfig) GetWakeIntervalWithDefault() time.Duration {
 func (c *CleanupConfig) GetMaxAgeRestrictionWithDefault() time.Duration {
 	restriction, err := c.GetMaxAgeRestriction()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup max_age_restriction: %v, using default (no restriction)", err)
+		warnf("Failed to parse cleanup max_age_restriction: %v, using default (no restriction)", err)
 		return 0
 	}
 	return restriction
@@ -2396,7 +2399,7 @@ func (c *CleanupConfig) GetMaxAgeRestrictionWithDefault() time.Duration {
 func (c *CleanupConfig) GetFTSRetentionWithDefault() time.Duration {
 	retention, err := c.GetFTSRetention()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup fts_retention: %v, using default (keep forever)", err)
+		warnf("Failed to parse cleanup fts_retention: %v, using default (keep forever)", err)
 		return 0
 	}
 	return retention
@@ -2405,7 +2408,7 @@ func (c *CleanupConfig) GetFTSRetentionWithDefault() time.Duration {
 func (c *CleanupConfig) GetHealthStatusRetentionWithDefault() time.Duration {
 	retention, err := c.GetHealthStatusRetention()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup health_status_retention: %v, using default (30 days)", err)
+		warnf("Failed to parse cleanup health_status_retention: %v, using default (30 days)", err)
 		return 30 * 24 * time.Hour
 	}
 	return retention
@@ -2414,12 +2417,12 @@ func (c *CleanupConfig) GetHealthStatusRetentionWithDefault() time.Duration {
 func (c *CleanupConfig) GetInstanceLivenessThresholdWithDefault() time.Duration {
 	threshold, err := c.GetInstanceLivenessThreshold()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup instance_liveness_threshold: %v, using default (7 days)", err)
+		warnf("Failed to parse cleanup instance_liveness_threshold: %v, using default (7 days)", err)
 		return 7 * 24 * time.Hour
 	}
 	if threshold <= 0 {
 		// Non-positive would mean "every instance is dead", i.e. reaping on age alone.
-		log.Printf("WARNING: cleanup instance_liveness_threshold must be positive, got %s, using default (7 days)", threshold)
+		warnf("cleanup instance_liveness_threshold must be positive, got %s, using default (7 days)", threshold)
 		return 7 * 24 * time.Hour
 	}
 	return threshold
@@ -2428,7 +2431,7 @@ func (c *CleanupConfig) GetInstanceLivenessThresholdWithDefault() time.Duration 
 func (c *LocalCacheConfig) GetCapacityWithDefault() int64 {
 	capacity, err := c.GetCapacity()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache size: %v, using default (1GB)", err)
+		warnf("Failed to parse cache size: %v, using default (1GB)", err)
 		return 1024 * 1024 * 1024 // 1GB
 	}
 	return capacity
@@ -2437,7 +2440,7 @@ func (c *LocalCacheConfig) GetCapacityWithDefault() int64 {
 func (c *LocalCacheConfig) GetMaxObjectSizeWithDefault() int64 {
 	size, err := c.GetMaxObjectSize()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache max object size: %v, using default (5MB)", err)
+		warnf("Failed to parse cache max object size: %v, using default (5MB)", err)
 		return 5 * 1024 * 1024 // 5MB
 	}
 	return size
@@ -2446,7 +2449,7 @@ func (c *LocalCacheConfig) GetMaxObjectSizeWithDefault() int64 {
 func (c *LocalCacheConfig) GetPurgeIntervalWithDefault() time.Duration {
 	interval, err := c.GetPurgeInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache purge interval: %v, using default (12 hours)", err)
+		warnf("Failed to parse cache purge interval: %v, using default (12 hours)", err)
 		return 12 * time.Hour
 	}
 	return interval
@@ -2455,7 +2458,7 @@ func (c *LocalCacheConfig) GetPurgeIntervalWithDefault() time.Duration {
 func (c *LocalCacheConfig) GetOrphanCleanupAgeWithDefault() time.Duration {
 	age, err := c.GetOrphanCleanupAge()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache orphan cleanup age: %v, using default (30 days)", err)
+		warnf("Failed to parse cache orphan cleanup age: %v, using default (30 days)", err)
 		return 30 * 24 * time.Hour
 	}
 	return age
@@ -2464,7 +2467,7 @@ func (c *LocalCacheConfig) GetOrphanCleanupAgeWithDefault() time.Duration {
 func (c *LocalCacheConfig) GetMetricsIntervalWithDefault() time.Duration {
 	interval, err := c.GetMetricsInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache metrics_interval: %v, using default (5 minutes)", err)
+		warnf("Failed to parse cache metrics_interval: %v, using default (5 minutes)", err)
 		return 5 * time.Minute
 	}
 	return interval
@@ -2473,7 +2476,7 @@ func (c *LocalCacheConfig) GetMetricsIntervalWithDefault() time.Duration {
 func (c *LocalCacheConfig) GetMetricsRetentionWithDefault() time.Duration {
 	retention, err := c.GetMetricsRetention()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache metrics_retention: %v, using default (30 days)", err)
+		warnf("Failed to parse cache metrics_retention: %v, using default (30 days)", err)
 		return 30 * 24 * time.Hour
 	}
 	return retention
@@ -2482,7 +2485,7 @@ func (c *LocalCacheConfig) GetMetricsRetentionWithDefault() time.Duration {
 func (c *UploaderConfig) GetRetryIntervalWithDefault() time.Duration {
 	interval, err := c.GetRetryInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse uploader retry_interval: %v, using default (30 seconds)", err)
+		warnf("Failed to parse uploader retry_interval: %v, using default (30 seconds)", err)
 		return 30 * time.Second
 	}
 	return interval
@@ -2943,9 +2946,7 @@ func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaDa
 		// Note: toml.Decode returns ParseError by value, not by pointer
 		var parseErr toml.ParseError
 		if errors.As(err, &parseErr) && strings.Contains(parseErr.Message, "has already been defined") {
-			log.Printf("WARNING: Configuration file '%s' contains duplicate keys: %s", configPath, parseErr.Error())
-			log.Printf("WARNING: Ignoring duplicate entries. Only the first occurrence of each key will be used.")
-			log.Printf("WARNING: Please fix your configuration file to remove duplicates.")
+			warnf("Configuration file '%s' contains duplicate keys, only the first occurrence of each is used; please remove the duplicates: %s", configPath, parseErr.Error())
 
 			// Parse again with a lenient approach by removing duplicate keys
 			cleanedContent, cleanErr := removeDuplicateKeysFromTOML(string(content))
@@ -2966,12 +2967,8 @@ func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaDa
 	}
 
 	// Warn about unknown keys (might be typos or deprecated settings)
-	if len(metadata.Undecoded()) > 0 {
-		log.Printf("WARNING: Configuration file '%s' contains unknown keys that will be ignored:", configPath)
-		for _, key := range metadata.Undecoded() {
-			log.Printf("WARNING:   - %s", key)
-		}
-		log.Printf("WARNING: These keys may be typos or deprecated settings. Please review your configuration.")
+	for _, key := range metadata.Undecoded() {
+		warnf("Configuration file '%s': unknown key '%s' will be ignored (a typo or a deprecated setting?)", configPath, key)
 	}
 
 	// Trim whitespace from all string fields in the configuration
@@ -3159,7 +3156,7 @@ func removeDuplicateKeysFromTOML(content string) (string, error) {
 				// Check if we've seen this key before
 				if prevLine, exists := seenKeys[fullKey]; exists {
 					// Duplicate found - comment it out
-					log.Printf("WARNING: Duplicate key '%s' found at line %d (first occurrence at line %d). Ignoring duplicate.",
+					warnf("Duplicate key '%s' found at line %d (first occurrence at line %d). Ignoring duplicate.",
 						fullKey, lineNum+1, prevLine+1)
 					result = append(result, "# DUPLICATE IGNORED: "+line)
 					continue
