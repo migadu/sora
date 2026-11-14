@@ -25,7 +25,8 @@ func TestConfigValidateCommandHelper(t *testing.T) {
 }
 
 // TestConfigValidateRejectsUnsupportedRelayType: `sora-admin config validate` fails a
-// [relay] type the server refuses to start with (#277).
+// [relay] type the server refuses to start with (#277), and a relay type without a
+// usable smtp_host or http_url (#532).
 func TestConfigValidateRejectsUnsupportedRelayType(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -34,6 +35,9 @@ func TestConfigValidateRejectsUnsupportedRelayType(t *testing.T) {
 	}{
 		{name: "smtp", relay: "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com:587\"\n", wantErr: ""},
 		{name: "upper-case SMTP", relay: "[relay]\ntype = \"SMTP\"\nsmtp_host = \"smtp.example.com:587\"\n", wantErr: `unsupported [relay] type "SMTP"`},
+		{name: "smtp without smtp_host", relay: "[relay]\ntype = \"smtp\"\n", wantErr: `[relay] type "smtp" requires smtp_host as host:port`},
+		{name: "smtp_host without port", relay: "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com\"\n", wantErr: `[relay] smtp_host "smtp.example.com" must be host:port`},
+		{name: "http without http_url", relay: "[relay]\ntype = \"http\"\n", wantErr: `[relay] type "http" requires http_url`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
