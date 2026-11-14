@@ -436,13 +436,12 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 			// Transient errors (network, timeout, 5xx, 408, 429) - temporarily unavailable
 			return nil, AuthTemporarilyUnavailable, err
 		}
-		if errors.Is(err, ErrRemoteLookupInvalidResponse) {
-			// A malformed 200 (not JSON - a maintenance page from a reverse proxy - or
-			// required fields missing) is a broken lookup service, like an outage: it says
-			// nothing about the password. Accounts are refused with 401/403.
-			return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: %w", ErrRemoteLookupTransient, err)
-		}
-		return nil, AuthFailed, err
+		// A malformed 200 (not JSON - a maintenance page from a reverse proxy - or
+		// required fields missing) is a broken lookup service, like an outage: it says
+		// nothing about the password. Accounts are refused with 401/403. So is any other
+		// error, such as a request that cannot be built from the URL ($email in the
+		// host): no answer, never a wrong password.
+		return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: %w", ErrRemoteLookupTransient, err)
 	}
 
 	// Handle special auth result cases (user not found, auth failed)
@@ -478,7 +477,7 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 	// Extract lookup response
 	lookupResp, ok := result.(HTTPRemoteLookupResponse)
 	if !ok {
-		return nil, AuthFailed, fmt.Errorf("unexpected result type from circuit breaker")
+		return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: unexpected result type from circuit breaker", ErrRemoteLookupTransient)
 	}
 
 	// Use the address from response (required field, already validated)
