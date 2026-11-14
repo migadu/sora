@@ -84,6 +84,28 @@ write = { hosts = ["localhost"], user = "postgres", name = "sora_mail_db" }
 			wantWrite: []string{"localhost"},
 		},
 		{
+			// toml.Decode matches keys to struct fields case-insensitively, so this
+			// table fills cfg.Database.Write without an unknown-key warning.
+			name: "write table spelled [Database.Write]",
+			toml: `
+[Database.Write]
+hosts = ["db1.example.com"]
+` + imapServerTOML,
+			wantWrite: []string{"db1.example.com"},
+		},
+		{
+			name: "read as an inline table spelled Read",
+			toml: `
+[database.write]
+hosts = ["db1.example.com"]
+
+[database]
+Read = { hosts = ["db2.example.com"] }
+` + imapServerTOML,
+			wantWrite: []string{"db1.example.com"},
+			wantRead:  []string{"db2.example.com"},
+		},
+		{
 			name: "write elsewhere, no read table",
 			toml: `
 [database.write]
