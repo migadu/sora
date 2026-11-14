@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -155,6 +156,57 @@ func TestAffinityList(t *testing.T) {
 			}
 			if !slices.Equal(got, tt.want) || resp.Count != len(tt.want) {
 				t.Errorf("GET %s: got %v (count %d), want %v in this order", target, got, resp.Count, tt.want)
+			}
+		})
+	}
+}
+
+// The affinity endpoints answer errors as JSON, as the OpenAPI spec says, also when the
+// user, protocol or backend they echo holds a '"': a local part may be a quoted-string
+// (RFC 5322 §3.4.1), and a client parses the 404 of GET /admin/affinity as the answer
+// for a missing affinity.
+func TestAffinityErrorsAreJSON(t *testing.T) {
+	am := &fakeAffinityManager{entries: map[[2]string]string{}}
+	s, err := New(nil, ServerOptions{
+		Name: "affinity", APIKey: rwKey, AffinityManager: am,
+		ValidBackends: map[string][]string{"imap": {"192.0.2.21:143"}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	h := s.setupRoutes()
+
+	missing := url.Values{"user": {`"john doe"@example.com`}, "protocol": {"imap"}}
+	tests := []struct {
+		name, method, target, body string
+		status                     int
+		wantInError                string
+	}{
+		{"get missing", http.MethodGet, "/admin/affinity?" + missing.Encode(), "", http.StatusNotFound, `"john doe"@example.com`},
+		{"set unknown backend", http.MethodPost, "/admin/affinity", `{"user":"anna@example.com","protocol":"imap","backend":"192.0.2.99:143\""}`, http.StatusBadRequest, `192.0.2.99:143"`},
+		{"set no backends", http.MethodPost, "/admin/affinity", `{"user":"anna@example.com","protocol":"pop3","backend":"192.0.2.21:110"}`, http.StatusBadRequest, "pop3"},
+		{"get without user", http.MethodGet, "/admin/affinity?protocol=imap", "", http.StatusBadRequest, "required"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(tt.method, tt.target, strings.NewReader(tt.body))
+			r.Header.Set("Authorization", "Bearer "+rwKey)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != tt.status {
+				t.Fatalf("status %d %s, want %d", w.Code, w.Body, tt.status)
+			}
+			if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+				t.Errorf("Content-Type %q, want application/json", ct)
+			}
+			var resp struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("error answer is not JSON: %v: %s", err, w.Body)
+			}
+			if !strings.Contains(resp.Error, tt.wantInError) {
+				t.Errorf("error %q does not name %q", resp.Error, tt.wantInError)
 			}
 		})
 	}
