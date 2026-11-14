@@ -211,7 +211,7 @@ key_file = "/path/to/key.pem"                   # Full path to PEM-encoded priva
 # - Domains must have DNS A records pointing to this server's public IP
 # - Port 80 must be accessible from the internet (for HTTP-01 challenge validation)
 # - S3 bucket for certificate storage (allows sharing across multiple instances)
-# - AWS credentials or IAM role with S3 access
+# - An S3 access key and secret key with access to that bucket (IAM roles are not used)
 [tls.letsencrypt]
 email = "admin@example.com"                     # REQUIRED: Email for Let's Encrypt account (used for expiration notices and account recovery)
 domains = ["mail.example.com"]                  # REQUIRED: List of domains for certificate (supports multiple: ["mail.example.com", "imap.example.com", "smtp.example.com"])
@@ -245,8 +245,8 @@ endpoint = "s3.amazonaws.com"                   # S3-compatible storage endpoint
 disable_tls = false                             # Disable TLS for S3 endpoint (when true, uses http:// instead of https://). Useful for local MinIO setups.
                                                 # Note: Ignored if endpoint already includes a protocol scheme
 debug = false                                   # Enable detailed S3 request/response tracing (impacts performance)
-# access_key = ""                               # AWS/S3 access key (optional - uses IAM credentials chain if omitted)
-# secret_key = ""                               # AWS/S3 secret key (optional - uses IAM credentials chain if omitted)
+# access_key = ""                               # S3 access key. Set both keys: without them requests are unsigned
+# secret_key = ""                               # S3 secret key (environment variables and IAM roles are not read)
 # server_side_encryption = "AES256"             # Encryption asked of the store on every certificate write. Default: "AES256".
                                                 # Every object here is private key material (each certificate PEM bundle ends with
                                                 # its private key, and "acme_account+key" is the ACME account key), so protection

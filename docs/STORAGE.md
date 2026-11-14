@@ -1003,7 +1003,7 @@ and on the account. Entries are stored in PostgreSQL. Only the IMAP server uses 
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `max_entry_size` | int (bytes) | `65536` | Largest single value. |
+| `max_entry_size` | int (bytes) | `65536` | Largest single value. Over IMAP a SETMETADATA value sent as a literal is also limited to 4096 bytes (see [PROTOCOLS.md](PROTOCOLS.md)), so larger values cannot be set that way. |
 | `max_entries_per_mailbox` | int | `100` | Most entries on one mailbox. If `0`, mailbox entries are limited by `max_entries_per_server` instead. |
 | `max_entries_per_server` | int | `50` | Most account-level entries (set on the empty mailbox name `""`). |
 | `max_total_size` | int (bytes) | `1048576` | Most bytes of values per account, mailbox and account entries together. |

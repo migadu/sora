@@ -340,9 +340,9 @@ every certificate write otherwise. Other values stop startup.
 
 The S3 client uses path-style addressing and signs every request for region `us-east-1`; there is
 no region setting. A store that checks the signature's region refuses other regions, so on AWS put
-the bucket in `us-east-1`. With both `access_key` and `secret_key` set, the client uses them;
-otherwise it uses the AWS default credential chain (environment variables, shared config, instance
-role). At startup Sora checks that the bucket exists and is reachable, and stops with
+the bucket in `us-east-1`. Set both `access_key` and `secret_key`: the client signs its requests
+with them. Without both, it sends unsigned (anonymous) requests. It does not read environment
+variables, the shared AWS config or an instance role, so a private bucket refuses it. At startup Sora checks that the bucket exists and is reachable, and stops with
 `failed to verify S3 bucket access: ...` if it is not.
 
 Each S3 request has a 5-second time limit, because a TLS handshake may be waiting on it.

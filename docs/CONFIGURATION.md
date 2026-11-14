@@ -644,7 +644,7 @@ certificate files of its own. See [TLS.md](TLS.md).
 | `endpoint` | string | `"s3.amazonaws.com"` | |
 | `disable_tls` | bool | `false` | |
 | `debug` | bool | `false` | |
-| `access_key`, `secret_key` | string | none | Without both, the AWS SDK's default credential chain is used. |
+| `access_key`, `secret_key` | string | none | Set both. Without both, requests are sent unsigned; environment variables, the shared AWS config and instance roles are not read. |
 | `server_side_encryption` | string | `"AES256"` | `"AES256"`, `"aws:kms"`, or `""` to send no encryption header. |
 | `server_side_encryption_kms_key_id` | string | none | Key id, required with `"aws:kms"`. |
 
