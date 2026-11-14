@@ -2,8 +2,10 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/server/relayqueue"
 )
 
 // TestBuildAdminAPIServerOptions_ThreadsSieveExtensions covers the one line that connects
@@ -35,4 +37,28 @@ func TestBuildAdminAPIServerOptions_ThreadsSieveExtensions(t *testing.T) {
 				options.SieveExtensions, configured)
 		}
 	}
+}
+
+// TestBuildAdminAPIServerOptions_ThreadsRelayWorker covers the line that lets
+// /admin/mail/deliver wake the relay worker (#327). If it is dropped, a redirect or
+// vacation reply the Admin API queues waits for the worker's next pass, and nothing
+// fails. A node without [relay] has no worker, and the option must then be a nil
+// interface: one holding a nil *relayqueue.Worker would be called and dereference it.
+func TestBuildAdminAPIServerOptions_ThreadsRelayWorker(t *testing.T) {
+	serverConfig := config.ServerConfig{Name: "admin-api", Addr: ":8080"}
+
+	t.Run("relay worker", func(t *testing.T) {
+		worker := relayqueue.NewWorker(nil, nil, time.Minute, 0, 0, 0, 0, nil)
+		options := buildAdminAPIServerOptions(&serverDependencies{relayWorker: worker}, serverConfig)
+		if options.RelayWorker != worker {
+			t.Fatalf("the relay worker did not reach the Admin API options: got %#v", options.RelayWorker)
+		}
+	})
+
+	t.Run("no relay", func(t *testing.T) {
+		options := buildAdminAPIServerOptions(&serverDependencies{}, serverConfig)
+		if options.RelayWorker != nil {
+			t.Fatalf("a node without a relay worker must leave the option nil, got %#v", options.RelayWorker)
+		}
+	})
 }
