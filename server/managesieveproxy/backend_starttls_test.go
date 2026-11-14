@@ -432,7 +432,7 @@ func TestBackendCapabilityLiteralBounds(t *testing.T) {
 		{"record bound includes literal payload", "{8190}\r\n", server.ErrLineTooLong},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := readBackendCapabilityRecord(bufio.NewReader(strings.NewReader(tc.input)))
+			_, err := readBackendRecord(bufio.NewReader(strings.NewReader(tc.input)))
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("reading capability record: %v, want %v", err, tc.want)
 			}
