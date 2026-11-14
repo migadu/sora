@@ -728,7 +728,8 @@ func decodeTable(name string, data any, v any) error {
 		if !ok {
 			return fmt.Errorf("%s: a duration is a string with a unit, such as \"15m\" or \"1d\", got %v", key, value)
 		}
-		d, err := helpers.ParseDuration(s)
+		// Parsed here, before LoadConfigFromFile trims every string, so trim it the same way.
+		d, err := helpers.ParseDuration(strings.TrimSpace(s))
 		if err != nil {
 			return fmt.Errorf("%s: %w", key, err)
 		}
@@ -774,9 +775,10 @@ func (c *LookupCacheConfig) GetPositiveTTL() (time.Duration, error) {
 	return parseLookupCacheDuration(c.PositiveTTL, defaultLookupCachePositiveTTL)
 }
 
-// GetPositiveTTLWithDefault returns positive_ttl, or its default if the value cannot be parsed.
-func (c *LookupCacheConfig) GetPositiveTTLWithDefault() time.Duration {
-	return lookupCacheDurationWithDefault("positive_ttl", c.PositiveTTL, defaultLookupCachePositiveTTL)
+// GetPositiveTTLWithDefault returns positive_ttl, or its default if the value cannot be
+// parsed. server names the server whose table this is, for the warning.
+func (c *LookupCacheConfig) GetPositiveTTLWithDefault(server string) time.Duration {
+	return lookupCacheDurationWithDefault(server, "positive_ttl", c.PositiveTTL, defaultLookupCachePositiveTTL)
 }
 
 // GetNegativeTTL parses and returns the negative TTL duration
@@ -784,9 +786,10 @@ func (c *LookupCacheConfig) GetNegativeTTL() (time.Duration, error) {
 	return parseLookupCacheDuration(c.NegativeTTL, defaultLookupCacheNegativeTTL)
 }
 
-// GetNegativeTTLWithDefault returns negative_ttl, or its default if the value cannot be parsed.
-func (c *LookupCacheConfig) GetNegativeTTLWithDefault() time.Duration {
-	return lookupCacheDurationWithDefault("negative_ttl", c.NegativeTTL, defaultLookupCacheNegativeTTL)
+// GetNegativeTTLWithDefault returns negative_ttl, or its default if the value cannot be
+// parsed. server names the server whose table this is, for the warning.
+func (c *LookupCacheConfig) GetNegativeTTLWithDefault(server string) time.Duration {
+	return lookupCacheDurationWithDefault(server, "negative_ttl", c.NegativeTTL, defaultLookupCacheNegativeTTL)
 }
 
 // GetCleanupInterval parses and returns the cleanup interval duration
@@ -794,9 +797,10 @@ func (c *LookupCacheConfig) GetCleanupInterval() (time.Duration, error) {
 	return parseLookupCacheDuration(c.CleanupInterval, defaultLookupCacheCleanupInterval)
 }
 
-// GetCleanupIntervalWithDefault returns cleanup_interval, or its default if the value cannot be parsed.
-func (c *LookupCacheConfig) GetCleanupIntervalWithDefault() time.Duration {
-	return lookupCacheDurationWithDefault("cleanup_interval", c.CleanupInterval, defaultLookupCacheCleanupInterval)
+// GetCleanupIntervalWithDefault returns cleanup_interval, or its default if the value
+// cannot be parsed. server names the server whose table this is, for the warning.
+func (c *LookupCacheConfig) GetCleanupIntervalWithDefault(server string) time.Duration {
+	return lookupCacheDurationWithDefault(server, "cleanup_interval", c.CleanupInterval, defaultLookupCacheCleanupInterval)
 }
 
 // GetPositiveRevalidationWindow parses and returns the positive revalidation window duration
@@ -805,9 +809,10 @@ func (c *LookupCacheConfig) GetPositiveRevalidationWindow() (time.Duration, erro
 }
 
 // GetPositiveRevalidationWindowWithDefault returns positive_revalidation_window, or its
-// default if the value cannot be parsed.
-func (c *LookupCacheConfig) GetPositiveRevalidationWindowWithDefault() time.Duration {
-	return lookupCacheDurationWithDefault("positive_revalidation_window", c.PositiveRevalidationWindow, defaultLookupCachePositiveRevalidationWindow)
+// default if the value cannot be parsed. server names the server whose table this is,
+// for the warning.
+func (c *LookupCacheConfig) GetPositiveRevalidationWindowWithDefault(server string) time.Duration {
+	return lookupCacheDurationWithDefault(server, "positive_revalidation_window", c.PositiveRevalidationWindow, defaultLookupCachePositiveRevalidationWindow)
 }
 
 func parseLookupCacheDuration(value string, def time.Duration) (time.Duration, error) {
@@ -817,10 +822,10 @@ func parseLookupCacheDuration(value string, def time.Duration) (time.Duration, e
 	return helpers.ParseDuration(value)
 }
 
-func lookupCacheDurationWithDefault(key, value string, def time.Duration) time.Duration {
+func lookupCacheDurationWithDefault(server, key, value string, def time.Duration) time.Duration {
 	d, err := parseLookupCacheDuration(value, def)
 	if err != nil {
-		warnf("Failed to parse lookup_cache.%s: %v, using default (%s)", key, err, def)
+		warnf("Failed to parse lookup_cache.%s for server '%s': %v, using default (%s)", key, server, err, def)
 		return def
 	}
 	return d
