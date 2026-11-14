@@ -1250,6 +1250,9 @@ func (c SharedMailboxesConfig) Validate() error {
 		return fmt.Errorf("namespace_prefix %q must be a mailbox name followed by the hierarchy delimiter %q, such as \"Shared/\"",
 			c.NamespacePrefix, delim)
 	}
+	if strings.EqualFold(root, consts.MailboxInbox) {
+		return fmt.Errorf("namespace_prefix %q conflicts with the reserved personal INBOX", c.NamespacePrefix)
+	}
 	return nil
 }
 
