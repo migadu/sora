@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -75,6 +76,60 @@ func TestHTTPRemoteLookupDoesNotFollowRedirects(t *testing.T) {
 			}
 			if n := targetAuthHeaders.Load(); n != 0 {
 				t.Errorf("redirect target received the bearer token %d time(s)", n)
+			}
+		})
+	}
+}
+
+// TestHTTPRemoteLookupNotFoundAnswersKeepConnection: a not-found answer (404, or a 3xx
+// now that redirects are not followed) must leave the keep-alive connection reusable.
+// An HTTP/1.1 body closed unread makes the transport drop the connection, so on a split
+// deployment (lookup_local_users) every lookup of a local user would pay a new TCP and
+// TLS handshake. Go's redirect follower used to drain the 3xx body for us.
+func TestHTTPRemoteLookupNotFoundAnswersKeepConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{"302", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/elsewhere", http.StatusFound)
+		}},
+		{"404", func(w http.ResponseWriter, r *http.Request) {
+			http.NotFound(w, r)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var conns atomic.Int32
+			lookup := httptest.NewUnstartedServer(tc.handler)
+			lookup.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+				if state == http.StateNew {
+					conns.Add(1)
+				}
+			}
+			lookup.Start()
+			defer lookup.Close()
+
+			client := NewHTTPRemoteLookupClient(
+				lookup.URL+"/lookup?email=$email",
+				5*time.Second,
+				"test-token",
+				143,
+				false, false, false, false, false, false, false,
+				nil, nil,
+			)
+
+			const lookups = 5
+			for i := 0; i < lookups; i++ {
+				_, result, err := client.LookupUserRoute(context.Background(), "user@example.com", "secret")
+				if err != nil {
+					t.Fatalf("LookupUserRoute: unexpected error: %v", err)
+				}
+				if result != AuthUserNotFound {
+					t.Fatalf("result = %v, want AuthUserNotFound", result)
+				}
+			}
+			if n := conns.Load(); n != 1 {
+				t.Errorf("%d lookups opened %d connections, want 1 (the answer body must be drained so the connection is reused)", lookups, n)
 			}
 		})
 	}
