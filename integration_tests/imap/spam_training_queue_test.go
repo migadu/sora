@@ -221,3 +221,32 @@ func TestIMAP_SpamTraining_SkipsOversizedMessageWithoutDownloading(t *testing.T)
 		t.Errorf("submitted the wrong message: %q", got[0].Message)
 	}
 }
+
+// A message moved into Junk before its upload completes must still be trained. Its
+// body is only in this node's staging directory, where FETCH finds it; S3 does not
+// have it yet, so a training read from S3 alone gets a 404 and the message is lost.
+func TestIMAP_SpamTraining_TrainsMessageMovedBeforeUpload(t *testing.T) {
+	c, fakeS3, endpoint, account := setupSpamTrainingServer(t, config.SpamTrainingConfig{})
+	fakeS3.FailPuts(true) // the upload stalls and the body stays staged on this node
+
+	appendToInbox(t, c, trainingMessage(account.Email, "Spam before upload", "Buy now."))
+	if n := fakeS3.ObjectCount(); n != 0 {
+		t.Fatalf("%d objects in S3 after APPEND, want 0: the upload must still be pending", n)
+	}
+	getsBefore := fakeS3.GetCount()
+
+	moveAllToJunk(t, c)
+
+	got := endpoint.waitForTraining(t, 1, 10*time.Second)
+	if len(got) != 1 {
+		t.Fatalf("training endpoint received %d submissions, want 1: the staged body was not trained", len(got))
+	}
+	if req := got[0]; req.Type != spamtraining.TrainingTypeSpam || req.User != account.Email ||
+		req.SourceMailbox != "INBOX" || req.DestMailbox != "Junk" || !strings.Contains(req.Message, "Subject: Spam before upload") {
+		t.Errorf("unexpected training submission: type=%q user=%q source=%q dest=%q message=%q",
+			req.Type, req.User, req.SourceMailbox, req.DestMailbox, req.Message)
+	}
+	if gets := fakeS3.GetCount() - getsBefore; gets != 0 {
+		t.Errorf("%d S3 downloads, want 0: a body staged on this node is read from disk", gets)
+	}
+}

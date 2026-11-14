@@ -2157,9 +2157,10 @@ paths:
         - Affinity Management
       summary: List backend affinities
       description: |
-        Lists the unexpired affinities this node holds, sorted by user and protocol. Every node
-        applies the affinities the others gossip, so any node of a converged cluster lists the
-        same set.
+        Lists the unexpired affinities this node holds, sorted by user and protocol: those it
+        assigned and those it received by gossip. Affinities have no full-state exchange, so a
+        node that was down or joined after an affinity was gossiped does not list it, and two
+        nodes can list different sets.
       parameters:
         - name: protocol
           in: query

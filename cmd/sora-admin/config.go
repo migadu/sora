@@ -67,49 +67,35 @@ func handleConfigValidate(_ context.Context) {
 	// Extract config path from os.Args (it was preserved for config subcommand)
 	var configFile string
 
-	// Look for --config flag in the original args
+	// Look for --config flag in the original args (the first one counts). --help or -h
+	// anywhere but as the --config value prints the usage instead of validating.
 	for i := 1; i < len(os.Args); i++ {
 		if os.Args[i] == "--config" && i+1 < len(os.Args) {
-			configFile = os.Args[i+1]
-			break
+			if configFile == "" {
+				configFile = os.Args[i+1]
+			}
+			i++ // the value, even when it starts with "-"
 		} else if strings.HasPrefix(os.Args[i], "--config=") {
-			configFile = strings.TrimPrefix(os.Args[i], "--config=")
-			break
+			if configFile == "" {
+				configFile = strings.TrimPrefix(os.Args[i], "--config=")
+			}
+		} else if os.Args[i] == "--help" || os.Args[i] == "-h" {
+			printConfigValidateUsage()
+			return
 		}
 	}
 
 	if configFile == "" {
-		fmt.Printf(`Error: --config is required
-
-Validate configuration file syntax and settings
-
-Usage:
-  sora-admin --config PATH config validate
-
-Description:
-  Validates the configuration file by:
-  - Checking TOML syntax
-  - Detecting duplicate keys (warns and uses first occurrence)
-  - Detecting unknown/deprecated keys (warns)
-  - Detecting common typos (e.g., 'f' instead of 'false')
-  - Validating server configurations
-  - Checking for conflicts (duplicate names, addresses)
-
-  Exit codes:
-    0 - Configuration is valid (warnings OK)
-    1 - Configuration has errors
-
-Examples:
-  sora-admin --config sora.config.toml config validate
-`)
+		fmt.Printf("Error: --config is required\n\n")
+		printConfigValidateUsage()
 		os.Exit(1)
 	}
 
 	fmt.Printf("Validating configuration file: %s\n\n", configFile)
 
-	// Load full configuration - this will show all warnings
-	cfg := config.NewDefaultConfig()
-	if err := config.LoadConfigFromFile(configFile, &cfg); err != nil {
+	// Load full configuration as the server does - this will show all warnings
+	var cfg config.Config
+	if err := config.LoadServerConfig(configFile, &cfg); err != nil {
 		fmt.Printf("[FAIL] Configuration validation FAILED:\n")
 		fmt.Printf("   %v\n", err)
 		os.Exit(1)
@@ -240,9 +226,11 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Load full configuration
-	cfg := config.NewDefaultConfig()
-	if err := config.LoadConfigFromFile(configFile, &cfg); err != nil {
+	// Load the configuration as the server runs with it: without the [database.write]
+	// and [database.read] endpoints the file does not define, which NewDefaultConfig
+	// seeds only for the keys a table in the file leaves out.
+	var cfg config.Config
+	if err := config.LoadServerConfig(configFile, &cfg); err != nil {
 		logger.Fatalf("Failed to load config file: %v", err)
 	}
 
@@ -267,6 +255,30 @@ Examples:
 	default:
 		logger.Fatalf("Unknown format: %s (supported: toml, json)", format)
 	}
+}
+
+func printConfigValidateUsage() {
+	fmt.Printf(`Validate configuration file syntax and settings
+
+Usage:
+  sora-admin --config PATH config validate
+
+Description:
+  Validates the configuration file by:
+  - Checking TOML syntax
+  - Detecting duplicate keys (warns and uses first occurrence)
+  - Detecting unknown/deprecated keys (warns)
+  - Detecting common typos (e.g., 'f' instead of 'false')
+  - Validating server configurations
+  - Checking for conflicts (duplicate names, addresses)
+
+  Exit codes:
+    0 - Configuration is valid (warnings OK)
+    1 - Configuration has errors
+
+Examples:
+  sora-admin --config sora.config.toml config validate
+`)
 }
 
 func printConfigUsage() {

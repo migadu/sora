@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"strconv"
 	"strings"
 
 	"github.com/migadu/sora/config"
@@ -83,27 +82,10 @@ func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig, ser
 		remoteTLSVerify = *cfg.RemoteTLSVerify
 	}
 
-	// Parse remote port (can be int or string)
-	remotePort := 0
-	if cfg.RemotePort != nil {
-		switch v := cfg.RemotePort.(type) {
-		case int:
-			remotePort = v
-		case int64:
-			remotePort = int(v)
-		case string:
-			// Try to parse string as int
-			if v != "" {
-				var err error
-				remotePort, err = strconv.Atoi(v)
-				if err != nil {
-					logger.Debug("RemoteLookup: Warning - failed to parse remote_port, using default", "value", v)
-					remotePort = 0
-				}
-			}
-		default:
-			logger.Debug("RemoteLookup: Warning - remote_port has unexpected type, using default", "type", fmt.Sprintf("%T", v))
-		}
+	// remote_port may be an int or a string; 0 means unset.
+	remotePort, err := cfg.GetRemotePort()
+	if err != nil {
+		return nil, fmt.Errorf("invalid remote_lookup.remote_port: %w", err)
 	}
 	// A lookup answer naming a server without a port is dialed at the lookup's own
 	// remote_port, else at the proxy's remote_port (what its port-less pool and

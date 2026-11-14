@@ -5,10 +5,9 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -19,6 +18,8 @@ import (
 
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/storage"
+	"github.com/migadu/sora/tlsmanager"
+	"golang.org/x/net/idna"
 )
 
 func handleTLSCommand(ctx context.Context) {
@@ -449,10 +450,10 @@ func tryDecodeDomain(s3Key string) string {
 
 	for _, domain := range commonDomains {
 		// Try both ECDSA (domain) and RSA (domain+rsa)
-		if hashDomain(domain) == hash {
+		switch s3Key {
+		case tlsmanager.S3ObjectKey(domain):
 			return domain
-		}
-		if hashDomain(domain+"+rsa") == hash {
+		case tlsmanager.S3ObjectKey(domain + "+rsa"):
 			return domain + " (RSA)"
 		}
 	}
@@ -460,9 +461,25 @@ func tryDecodeDomain(s3Key string) string {
 	return hash[:16] + "..." // Show first 16 chars of hash
 }
 
-func hashDomain(domain string) string {
-	h := sha256.Sum256([]byte(domain))
-	return hex.EncodeToString(h[:])
+// autocertName returns the name autocert caches a domain's certificates under: the
+// server name folded by idna.Lookup.ToASCII (lowercase, Punycode) without a trailing
+// dot, as autocert.Manager.GetCertificate derives it from the TLS ClientHello.
+func autocertName(domain string) (string, error) {
+	domain = strings.TrimSpace(domain)
+	// Match autocert.Manager.GetCertificate's component check as well as its
+	// normalization. In particular, "." or ".." must never name the cache directory.
+	if !strings.Contains(strings.Trim(domain, "."), ".") {
+		return "", fmt.Errorf("invalid domain %q: server name component count invalid", domain)
+	}
+	name, err := idna.Lookup.ToASCII(domain)
+	if err != nil {
+		return "", fmt.Errorf("invalid domain %q: %w", domain, err)
+	}
+	name = strings.TrimSuffix(name, ".")
+	if name == "" {
+		return "", fmt.Errorf("invalid domain %q", domain)
+	}
+	return name, nil
 }
 
 func parseCertificateData(data []byte, info *CertificateInfo) {
@@ -728,17 +745,48 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 		return fmt.Errorf("failed to initialize S3 storage: %w", err)
 	}
 
-	var keysToDelete []string
+	var keysToDelete []string // S3 objects that exist
+	var localFiles []string   // local cache files that exist
 
 	if domain != "" {
-		// Delete by domain - compute S3 keys for both ECDSA and RSA
-		ecdsaKey := "autocert/" + hashDomain(domain)
-		rsaKey := "autocert/" + hashDomain(domain+"+rsa")
-		keysToDelete = []string{ecdsaKey, rsaKey}
+		name, err := autocertName(domain)
+		if err != nil {
+			return err
+		}
 
-		fmt.Printf("Deleting certificates for domain: %s\n", domain)
-		fmt.Printf("  ECDSA key: %s\n", ecdsaKey)
-		fmt.Printf("  RSA key:   %s\n", rsaKey)
+		// autocert caches a domain's ECDSA certificate as "<domain>" and its RSA one as
+		// "<domain>+rsa". The S3 cache stores each under tlsmanager.S3ObjectKey, the local
+		// fallback cache (an autocert.DirCache) as a file with the entry's name. Only what
+		// exists is deleted and counted: storage.DeleteContext succeeds for a missing key.
+		for _, entry := range []string{name, name + "+rsa"} {
+			key := tlsmanager.S3ObjectKey(entry)
+			exists, _, err := s3store.ExistsContext(ctx, key)
+			if err != nil {
+				return fmt.Errorf("failed to look up %s in S3: %w", key, err)
+			}
+			if exists {
+				keysToDelete = append(keysToDelete, key)
+			}
+
+			localPath := filepath.Join(cacheDir, entry)
+			if _, err := os.Lstat(localPath); err == nil {
+				localFiles = append(localFiles, localPath)
+			} else if !os.IsNotExist(err) {
+				return fmt.Errorf("failed to check local cache file %s: %w", localPath, err)
+			}
+		}
+
+		if len(keysToDelete) == 0 && len(localFiles) == 0 {
+			return fmt.Errorf("no certificate found for %s in S3 or in %s", name, cacheDir)
+		}
+
+		fmt.Printf("Deleting certificates for domain: %s\n", name)
+		for _, key := range keysToDelete {
+			fmt.Printf("  S3 object:  %s\n", key)
+		}
+		for _, localPath := range localFiles {
+			fmt.Printf("  Local file: %s\n", localPath)
+		}
 	} else {
 		// Delete by specific S3 key or prefix
 		// Support full key, hash, or partial hash
@@ -800,6 +848,15 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 			keysToDelete = matches
 			fmt.Printf("Found matching certificate: %s\n", matches[0])
 		} else {
+			// storage.DeleteContext succeeds for a missing key, so look first: a key
+			// that is not there must fail rather than be reported as deleted.
+			exists, _, err := s3store.ExistsContext(ctx, searchKey)
+			if err != nil {
+				return fmt.Errorf("failed to look up %s in S3: %w", searchKey, err)
+			}
+			if !exists {
+				return fmt.Errorf("certificate not found in S3: %s", searchKey)
+			}
 			keysToDelete = []string{searchKey}
 			fmt.Printf("Deleting certificate: %s\n", searchKey)
 		}
@@ -810,43 +867,35 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 		return nil
 	}
 
+	var failures []error
 	deleted := 0
-	notFound := 0
-
 	for _, key := range keysToDelete {
-		// Delete from S3
-		if err := s3store.Delete(key); err != nil {
-			// Check if it's a "not found" error
-			if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), "not found") {
-				logger.Info("Certificate not found in S3 (already deleted?)", "key", key)
-				notFound++
-			} else {
-				logger.Warn("Failed to delete certificate from S3", "key", key, "error", err)
-			}
-		} else {
-			logger.Info("Deleted certificate from S3", "key", key)
-			deleted++
+		if err := s3store.DeleteContext(ctx, key); err != nil {
+			logger.Warn("Failed to delete certificate from S3", "key", key, "error", err)
+			failures = append(failures, fmt.Errorf("S3 object %s: %w", key, err))
+			continue
 		}
-
-		// Delete from local cache if it exists
-		if domain != "" {
-			// Extract cache filename from domain
-			cacheFile := domain
-			if strings.Contains(key, "+rsa") {
-				cacheFile = domain + "+rsa"
-			}
-			localPath := filepath.Join(cacheDir, cacheFile)
-			if err := os.Remove(localPath); err != nil {
-				if !os.IsNotExist(err) {
-					logger.Warn("Failed to delete certificate from local cache", "path", localPath, "error", err)
-				}
-			} else {
-				logger.Info("Deleted certificate from local cache", "path", localPath)
-			}
-		}
+		logger.Info("Deleted certificate from S3", "key", key)
+		deleted++
 	}
 
-	fmt.Printf("\nDeleted %d certificate(s), %d not found\n", deleted, notFound)
+	removed := 0
+	for _, localPath := range localFiles {
+		if err := os.Remove(localPath); err != nil {
+			if !os.IsNotExist(err) {
+				logger.Warn("Failed to delete certificate from local cache", "path", localPath, "error", err)
+				failures = append(failures, fmt.Errorf("local file %s: %w", localPath, err))
+			}
+			continue
+		}
+		logger.Info("Deleted certificate from local cache", "path", localPath)
+		removed++
+	}
+
+	fmt.Printf("\nDeleted %d certificate(s) from S3 and %d file(s) from the local cache\n", deleted, removed)
+	if len(failures) > 0 {
+		return fmt.Errorf("%d deletion(s) failed: %w", len(failures), errors.Join(failures...))
+	}
 	return nil
 }
 
@@ -1053,10 +1102,21 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	notFound := 0
 	now := time.Now()
 
-	for _, domain := range domainsToCache {
+	for _, configured := range domainsToCache {
 		// Honor cancellation between domains (each iteration may issue slow S3 downloads)
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+
+		domain, err := autocertName(configured)
+		if err != nil {
+			if specificDomain != "" {
+				return err
+			}
+			// autocert.HostWhitelist drops such a configured domain silently and the
+			// server serves the others, so skip it rather than stop syncing them.
+			logger.Warn("Skipping configured domain autocert cannot serve", "domain", configured, "error", err)
+			continue
 		}
 
 		// Cache both ECDSA and RSA variants
@@ -1069,7 +1129,7 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		}
 
 		for _, variant := range variants {
-			s3Key := "autocert/cert-" + hashDomain(variant.key)
+			s3Key := tlsmanager.S3ObjectKey(variant.key)
 
 			// Download from S3
 			reader, err := s3store.Get(s3Key)

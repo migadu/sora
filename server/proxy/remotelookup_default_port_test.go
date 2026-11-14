@@ -3,6 +3,7 @@ package proxy_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -107,6 +108,7 @@ func TestRemoteLookupServerWithoutPortGetsTheProxysPort(t *testing.T) {
 
 		// [server.remote_lookup] remote_port is the most specific setting.
 		{"pop3 lookup remote_port wins", "pop3", 1110, 2110, "backend1.example.com", "backend1.example.com:2110"},
+		{"pop3 lookup remote_port string", "pop3", 1110, "2110", "backend1.example.com", "backend1.example.com:2110"},
 
 		// An explicit port is kept.
 		{"pop3 explicit port", "pop3", 1110, nil, "backend1.example.com:995", "backend1.example.com:995"},
@@ -179,6 +181,30 @@ func TestRemoteLookupServerWithoutPortImplicitTLSPort(t *testing.T) {
 			}
 			if info.ServerAddress != tt.want {
 				t.Errorf("ServerAddress = %q, want %q", info.ServerAddress, tt.want)
+			}
+		})
+	}
+}
+
+// TestInitializeRemoteLookupRejectsInvalidRemotePort: an unparsable or wrongly typed
+// [server.remote_lookup] remote_port used to be dropped with a Debug log (the backend was
+// dialed at a fallback port), and a negative or out-of-range number was used as given
+// (-1 left the address port-less, 70000 was dialed). ServerConfig.Validate refuses such a
+// config before any proxy is built; this is the constructor's own check behind it (with
+// lookup_local_users = true a proxy carries on without the lookup when it fails).
+func TestInitializeRemoteLookupRejectsInvalidRemotePort(t *testing.T) {
+	for _, port := range []any{"1993x", "-1", "70000", -1, int64(-1), 70000, int64(70000), int64(4294969299), 1993.5, true} {
+		t.Run(fmt.Sprintf("%T %v", port, port), func(t *testing.T) {
+			client, err := proxy.InitializeRemoteLookup("imap", &config.RemoteLookupConfig{
+				Enabled:    true,
+				URL:        "http://127.0.0.1:8080/lookup?email=$email",
+				RemotePort: port,
+			}, 0)
+			if err == nil {
+				t.Fatalf("InitializeRemoteLookup accepted remote_port %#v (client %T), want an error", port, client)
+			}
+			if !strings.Contains(err.Error(), "remote_port") {
+				t.Errorf("error = %q, want it to name remote_port", err)
 			}
 		})
 	}
