@@ -2536,6 +2536,19 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 	return err
 }
 
+// writePoolLockedJobs returns how many of jobs database's write pool can run at once when
+// each holds one of its connections for S3 object locks (ExecuteWithSharedS3ObjectLocks)
+// and needs a second one for the rows it commits under them, as the imports do: jobs
+// whose locks held every connection would each wait for a second one until its write
+// timeout failed it. It fails when the pool cannot run a single job.
+func writePoolLockedJobs(database *db.Database, jobs int) (int, error) {
+	poolSize := int(database.GetWritePool().Stat().MaxConns())
+	if poolSize < 2 {
+		return 0, fmt.Errorf("import requires at least 2 write-pool connections; configure database.write.max_connections >= 2 (got %d)", poolSize)
+	}
+	return max(1, min(jobs, poolSize/2)), nil
+}
+
 // withBodiesLocked runs fn while the S3 object locks of read's bodies are held in shared
 // mode (see processBatch), and reports whether fn ran. When it did not, nothing was
 // stored.
@@ -2705,6 +2718,14 @@ func (i *Importer) importMessages() error {
 		logger.Info("No messages to import")
 		i.printSieveOutcome()
 		return nil
+	}
+
+	// A batch holds one write-pool connection for its bodies' S3 object locks and inserts
+	// its rows on another (processBatch). A stub database (nil) has no pool to size.
+	if database := i.rdb.GetOperationalDatabase(); database != nil {
+		if _, err := writePoolLockedJobs(database, 1); err != nil {
+			return err
+		}
 	}
 
 	// Initialize batch size

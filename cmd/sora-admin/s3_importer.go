@@ -384,7 +384,19 @@ func (si *S3Importer) importFromS3() error {
 		return nil
 	}
 
-	logger.Info("Processing S3 objects", "count", si.totalObjects, "workers", si.options.Workers)
+	// A worker holds one write-pool connection for the S3 object lock of the body it
+	// imports and needs a second one for the insert it runs under that lock
+	// (importS3Object).
+	workers, err := writePoolLockedJobs(si.rdb.GetOperationalDatabase(), si.options.Workers)
+	if err != nil {
+		return err
+	}
+	if workers < si.options.Workers {
+		logger.Info("Running fewer workers than requested: each needs 2 connections of the database write pool",
+			"workers", workers, "requested", si.options.Workers)
+	}
+
+	logger.Info("Processing S3 objects", "count", si.totalObjects, "workers", workers)
 
 	rows, err := si.db.Query("SELECT key, size, domain, local_part, content_hash FROM s3_objects WHERE processed = FALSE")
 	if err != nil {
@@ -396,7 +408,7 @@ func (si *S3Importer) importFromS3() error {
 	jobs := make(chan S3ObjectInfo, 100) // Buffer for better performance
 
 	// Start workers
-	for w := 0; w < si.options.Workers; w++ {
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
