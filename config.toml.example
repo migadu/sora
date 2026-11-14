@@ -457,7 +457,7 @@ sync_failure_counts = true                      # Synchronize progressive delay 
 enabled = false                                 # Enable cluster-wide server affinity (default: false)
 ttl = "24h"                                     # How long affinity persists (default: "24h")
 cleanup_interval = "1h"                         # How often to clean up expired affinities (default: "1h")
-# cache_path = "/sora/affinity_cache.db"        # SQLite path for persistent affinity (survives restarts)
+# cache_path = "/var/cache/sora/affinity_cache.db" # SQLite path for persistent affinity (survives restarts)
 
 # EXAMPLE USAGE (Multi-instance deployment):
 # [cluster]
@@ -534,7 +534,7 @@ cleanup_interval = "1h"                         # How often to clean up expired 
 
 [auth_cache]
 enabled = true                     # Enable persistent auth cache (default: false)
-path = "/sora/auth_cache.db"       # SQLite database path. Fast storage (SSD) recommended.
+path = "/var/cache/sora/auth_cache.db" # SQLite database path (default: "/var/cache/sora/auth_cache.db"). Fast storage (SSD) recommended.
 max_age = "24"                     # Max age for cached entries before re-fetching (default: 1 day)
 cleanup_interval = "1h"            # How often to purge expired/unused entries (default: 1 hour)
 purge_unused = "168h"              # Purge entries unused for this duration (default: 7 days)
@@ -562,7 +562,7 @@ refuse_after = "30s"               # How long a backend in maintenance still acc
 # S3 API calls and improving performance for recently accessed messages.
 
 [local_cache]
-path = "/sora/cache"      # Filesystem path for cache storage. Must be writable. Fast storage (SSD) recommended.
+path = "/var/cache/sora/cache" # Filesystem path for cache storage (default: "/var/cache/sora/cache"). Must be writable. Fast storage (SSD) recommended.
 capacity = "1gb"              # Maximum total cache size (e.g., "100mb", "1gb"). LRU eviction when exceeded.
 max_object_size = "5mb"       # Maximum size for individual cached objects. Prevents large messages from dominating cache.
 metrics_interval = "5m"       # How often cache hit/miss ratios are stored in the database.
@@ -586,7 +586,9 @@ warmup_interval = "24h"       # Minimum time between warmups for the same user. 
 # to S3 storage after messages are initially stored locally.
 
 [uploader]
-path = "/sora/uploads"    # Filesystem path for staging uploads (temporary storage before S3).
+path = "/var/spool/sora/uploads" # Staging directory for bodies not yet in S3 (default: "/var/spool/sora/uploads").
+                              # A staged body is the only copy of its message: keep it on persistent
+                              # storage, never under /tmp.
 # instance_id = ""            # Upload lease identity written to pending_uploads.instance_id and
                               # instance_heartbeats.instance_id. Default: this host's hostname —
                               # the same value earlier releases stamped, so upgrades are
