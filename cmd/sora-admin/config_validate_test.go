@@ -101,9 +101,8 @@ func TestConfigValidateRejectsIncompleteServerBlock(t *testing.T) {
 	}
 }
 
-// TestConfigValidateRefusesWhatStartupRefuses: `sora-admin config validate` fails every
-// file the server refuses to start with, and passes a file it starts with (#516). It
-// printed "[OK] Configuration is valid!" for the checks it did not run: [[pool]] blocks,
+// TestConfigValidateRefusesWhatStartupRefuses covers the shared startup checks
+// added for #516. The CLI printed "[OK] Configuration is valid!" for checks it did not run: [[pool]] blocks,
 // PROXY protocol without trusted_networks, [uploader] and [shared_mailboxes], and it
 // only warned about a file without servers. A file with several problems reports each.
 func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {

@@ -7,9 +7,8 @@ import (
 	"testing"
 )
 
-// TestConfigValidate: Validate returns every problem of a file that stops sora at
-// start-up, each with the section it is about, and nothing for a file it starts with
-// (#516). sora and `sora-admin config validate` both run it.
+// TestConfigValidate covers the checks shared by sora before service setup and
+// `sora-admin config validate` (#516), including each problem's section.
 func TestConfigValidate(t *testing.T) {
 	const imapBackend = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"
 	const imapProxy = "\n[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:1143\"\nremote_addrs = [\"192.0.2.10:143\"]\n"
