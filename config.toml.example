@@ -1366,7 +1366,8 @@ auth_rate_limit.max_username_entries = 50000      # Max username tracking entrie
 # negative_ttl = "1m"                     # How long to cache failed auth attempts (default: 1m)
 #                                         # Helps mitigate brute force attacks by preventing repeated database queries
 #                                         # Note: Brute force protection itself is handled by protocol-level rate limiting
-# max_size = 50000                        # Maximum cached entries (default: 50000, LRU eviction)
+# max_size = 50000                        # Maximum cached entries (default: 50000). When full, the entry that expires
+#                                         # first makes room (an expired one, else the one with least time left)
 # cleanup_interval = "5m"                 # How often to remove expired entries (default: 5m)
 # positive_revalidation_window = "30s"    # Revalidation window for successful auth with different password (default: 30s)
 #                                         # Protects against unauthorized access when password changes
