@@ -26,7 +26,8 @@ var (
 	// ErrUserNotFoundTempFail indicates user not found but with temp failure response (450)
 	ErrUserNotFoundTempFail = errors.New("user not found (temporary failure)")
 
-	// ErrInvalidAddress indicates that the recipient address is syntactically invalid (permanent failure - 550)
+	// ErrInvalidAddress indicates that an address is syntactically invalid (for an LMTP
+	// recipient a permanent failure - 550). Every NewAddress error matches it.
 	ErrInvalidAddress = errors.New("invalid address")
 )
 
