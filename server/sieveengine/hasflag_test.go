@@ -47,9 +47,10 @@ if hasflag :count "eq" "flagvar" "0" { fileinto "Cleared"; }
 			want: []string{"Requested", "Cleared"},
 		},
 		{
-			// RFC 5232 §4's :contains and :count examples.
+			// RFC 5232 §4's :contains and :count examples. i;ascii-numeric
+			// must be required (RFC 5228 §2.7.3).
 			name: "hasflag :contains and :count over a variable",
-			script: `require ["imap4flags", "variables", "relational", "fileinto"];
+			script: `require ["imap4flags", "variables", "relational", "comparator-i;ascii-numeric", "fileinto"];
 set "MyVar" "NonJunk Junk gnus-forward $Forwarded NotJunk JunkRecorded $Junk $NotJunk";
 if hasflag :contains "MyVar" ["label", "forward"] { fileinto "Forwarded"; }
 if hasflag :contains "MyVar" ["label1", "label2"] { fileinto "Wrong"; }
