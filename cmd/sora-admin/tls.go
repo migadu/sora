@@ -804,21 +804,33 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 			fmt.Printf("  Local file: %s\n", localPath)
 		}
 	} else {
-		// Delete by specific S3 key or prefix
-		// Support full key, hash, or partial hash
+		// Delete by S3 key: a full key, a hash, or a prefix of either. A trailing "..."
+		// (as tls list truncates keys) marks a prefix. Any other value is looked up as
+		// a key first, so an existing key is deleted even when it is also the prefix
+		// of another key, and it is taken as a prefix only when it is not a key.
 		searchKey := s3Key
 		if !strings.HasPrefix(searchKey, "autocert/") {
 			searchKey = "autocert/cert-" + searchKey
 		}
+		prefix, isPrefix := strings.CutSuffix(searchKey, "...")
 
-		// If the key looks partial (ends with ...), do a prefix search
-		needsPrefixSearch := strings.HasSuffix(s3Key, "...") || len(s3Key) < 64
+		if !isPrefix {
+			// storage.DeleteContext succeeds for a missing key, so look first: a key
+			// that is not there must not be reported as deleted.
+			exists, _, err := s3store.ExistsContext(ctx, searchKey)
+			if err != nil {
+				return fmt.Errorf("failed to look up %s in S3: %w", searchKey, err)
+			}
+			if exists {
+				keysToDelete = []string{searchKey}
+				fmt.Printf("Deleting certificate: %s\n", searchKey)
+			}
+		}
 
-		if needsPrefixSearch {
+		if len(keysToDelete) == 0 {
 			// Search for matching certificates by prefix
 			fmt.Printf("Searching for certificates matching prefix: %s\n", searchKey)
 
-			prefix := strings.TrimSuffix(searchKey, "...")
 			objChan, errChan := s3store.ListObjects(ctx, "autocert/", false)
 
 			var matches []string
@@ -863,18 +875,6 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 
 			keysToDelete = matches
 			fmt.Printf("Found matching certificate: %s\n", matches[0])
-		} else {
-			// storage.DeleteContext succeeds for a missing key, so look first: a key
-			// that is not there must fail rather than be reported as deleted.
-			exists, _, err := s3store.ExistsContext(ctx, searchKey)
-			if err != nil {
-				return fmt.Errorf("failed to look up %s in S3: %w", searchKey, err)
-			}
-			if !exists {
-				return fmt.Errorf("certificate not found in S3: %s", searchKey)
-			}
-			keysToDelete = []string{searchKey}
-			fmt.Printf("Deleting certificate: %s\n", searchKey)
 		}
 	}
 
