@@ -12,7 +12,8 @@ import (
 // --- Cleanup Worker Wrappers ---
 
 // ExecuteWithLockedS3Orphans holds the per-object advisory locks for objects and runs
-// fn with the subset that is still orphaned. Deliberately not wrapped in a retry: fn
+// fn with the subset that is still orphaned, or whose rows alone may go (see
+// db.Database.ExecuteWithLockedS3Orphans). Deliberately not wrapped in a retry: fn
 // performs the S3 deletion, which a database-level retry would replay.
 func (rd *ResilientDatabase) ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error) error {
 	return rd.getOperationalDatabaseForOperation(ctx, true).ExecuteWithLockedS3Orphans(ctx, objects, gracePeriod, fn)

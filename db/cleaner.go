@@ -25,6 +25,10 @@ type UserScopedObjectForCleanup struct {
 	ContentHash string
 	S3Domain    string
 	S3Localpart string
+	// KeepObject is set by the re-check in ExecuteWithLockedS3Orphans when rows of
+	// another account still point at the object: the account's expunged rows under the
+	// key may go, the object may not.
+	KeepObject bool
 }
 
 // AcquireCleanupLock attempts to acquire a transaction-scoped advisory lock for the cleanup worker.
@@ -66,52 +70,16 @@ func (d *Database) AcquireS3ObjectLock(ctx context.Context, tx pgx.Tx, accountID
 	return err
 }
 
-// IsS3ObjectOrphan performs a fast query inside a transaction to double-check
-// if any active messages or pending uploads exist for the given S3 object.
-// Note: It does NOT explicitly check for (uploaded = FALSE AND expunged_at IS NULL),
-// because such records inherently imply a `pending_uploads` row exists that will be
-// caught by the pending check, keeping this check computationally lightweight.
-func (d *Database) IsS3ObjectOrphan(ctx context.Context, tx pgx.Tx, accountID int64, contentHash string, gracePeriod time.Duration) (bool, error) {
-	threshold := time.Now().Add(-gracePeriod).UTC()
-
-	var isOrphan bool
-	err := tx.QueryRow(ctx, `
-		SELECT 
-			(active.found IS NULL AND recent.found IS NULL AND pending.found IS NULL) as is_orphan
-		FROM 
-			(SELECT 1 as dummy) d
-		LEFT JOIN LATERAL (
-			SELECT 1 as found FROM messages m_active
-			WHERE m_active.account_id = $1
-			  AND m_active.content_hash = $2
-			  AND m_active.expunged_at IS NULL
-			LIMIT 1
-		) active ON true
-		LEFT JOIN LATERAL (
-			SELECT 1 as found FROM messages m_recent
-			WHERE m_recent.account_id = $1
-			  AND m_recent.content_hash = $2
-			  AND m_recent.expunged_at >= $3
-			LIMIT 1
-		) recent ON true
-		LEFT JOIN LATERAL (
-			SELECT 1 as found FROM pending_uploads pu
-			WHERE pu.account_id = $1
-			  AND pu.content_hash = $2
-			LIMIT 1
-		) pending ON true
-	`, accountID, contentHash, threshold).Scan(&isOrphan)
-
-	return isOrphan, err
-}
-
 // s3ObjectLockTimeout bounds opening the lock transaction and taking the per-object
 // advisory locks in it, and separately the orphan re-check that follows. The locks
 // themselves are never waited for.
 const s3ObjectLockTimeout = 30 * time.Second
 
-// ExecuteWithLockedS3Orphans runs fn with the subset of objects that are still orphans,
-// while holding their per-object advisory locks in one dedicated lock transaction.
+// ExecuteWithLockedS3Orphans runs fn with the subset of objects whose account no longer
+// needs them (see filterS3Orphans), while holding their per-object advisory locks in one
+// dedicated lock transaction. Such an object is an orphan, to be deleted with the
+// account's expunged rows under its key, unless it carries KeepObject: rows of another
+// account still point at it, and only the account's rows go.
 //
 // It is the lock the uploader's write gate takes and releases before an upload writes
 // (GetS3ObjectLockID, see PassS3WriteGate), so holding it across the orphan re-check and
@@ -190,11 +158,22 @@ func (d *Database) ExecuteWithLockedS3Orphans(ctx context.Context, objects []Use
 	return nil
 }
 
-// filterS3Orphans returns the objects that are still orphans: no active message, none
-// expunged within the grace period, and no pending upload. It is the batched form of
-// IsS3ObjectOrphan and runs on the transaction that holds the locks, so it reads the
-// primary — a lagging replica could report a body as unreferenced after a new message
-// already claimed it.
+// filterS3Orphans returns the objects whose account no longer needs them: the account
+// has no active message of the hash and none expunged within the grace period, and no
+// account has an upload of the hash pending (an upload writes the keys of its account's
+// rows, which can be this one).
+//
+// Each comes back with KeepObject set when rows of another account, live or expunged,
+// still point at its key. An object is keyed by the address a row's account had when the
+// row was written, and addresses move between accounts, so the new owner's rows can carry
+// the key of mail stored under the address before it moved (a cross-account COPY reuses
+// that object). Those rows keep the object whatever their state: it goes with the last of
+// them, when their own account's candidate is reaped, under that account's grace period.
+// Rows of an account that is reaping the same key in this batch do not count, or two
+// accounts done with one object would each keep it for the other and it would never go.
+//
+// It runs on the transaction that holds the locks, so it reads the primary — a lagging
+// replica could report a body as unreferenced after a new message already claimed it.
 func (d *Database) filterS3Orphans(ctx context.Context, tx pgx.Tx, objects []UserScopedObjectForCleanup, gracePeriod time.Duration) ([]UserScopedObjectForCleanup, error) {
 	if len(objects) == 0 {
 		return nil, nil
@@ -203,45 +182,66 @@ func (d *Database) filterS3Orphans(ctx context.Context, tx pgx.Tx, objects []Use
 	threshold := time.Now().Add(-gracePeriod).UTC()
 
 	accountIDs := make([]int64, len(objects))
+	s3Domains := make([]string, len(objects))
+	s3Localparts := make([]string, len(objects))
 	contentHashes := make([]string, len(objects))
 	for i, o := range objects {
 		accountIDs[i] = o.AccountID
+		s3Domains[i] = o.S3Domain
+		s3Localparts[i] = o.S3Localpart
 		contentHashes[i] = o.ContentHash
 	}
 
 	// Simple protocol: on the lock transaction no portal, and so no snapshot, may
 	// outlive this statement (see AdvisoryLockTx).
 	rows, err := tx.Query(ctx, `
-		SELECT DISTINCT c.account_id, c.content_hash
-		FROM unnest($1::bigint[], $2::text[]) AS c(account_id, content_hash)
-		WHERE NOT EXISTS (
-			SELECT 1 FROM messages m
-			WHERE m.account_id = c.account_id
-			  AND m.content_hash = c.content_hash
-			  AND (m.expunged_at IS NULL OR m.expunged_at >= $3)
+		WITH reapable AS (
+			SELECT DISTINCT c.account_id, c.s3_domain, c.s3_localpart, c.content_hash
+			FROM unnest($1::bigint[], $2::text[], $3::text[], $4::text[]) AS c(account_id, s3_domain, s3_localpart, content_hash)
+			WHERE NOT EXISTS (
+				SELECT 1 FROM messages m
+				WHERE m.account_id = c.account_id
+				  AND m.content_hash = c.content_hash
+				  AND (m.expunged_at IS NULL OR m.expunged_at >= $5)
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM pending_uploads pu
+				WHERE pu.content_hash = c.content_hash
+			)
+		),
+		reapers AS (
+			SELECT s3_domain, s3_localpart, content_hash, array_agg(account_id) AS account_ids
+			FROM reapable
+			GROUP BY s3_domain, s3_localpart, content_hash
 		)
-		AND NOT EXISTS (
-			SELECT 1 FROM pending_uploads pu
-			WHERE pu.account_id = c.account_id
-			  AND pu.content_hash = c.content_hash
-		)
-	`, accountIDs, contentHashes, threshold)
+		SELECT r.account_id, r.s3_domain, r.s3_localpart, r.content_hash,
+		       EXISTS (
+				SELECT 1 FROM messages m
+				WHERE m.content_hash = r.content_hash
+				  AND m.s3_domain = r.s3_domain
+				  AND m.s3_localpart = r.s3_localpart
+				  AND m.account_id <> ALL (k.account_ids)
+		       ) AS keep_object
+		FROM reapable r
+		JOIN reapers k USING (s3_domain, s3_localpart, content_hash)
+	`, accountIDs, s3Domains, s3Localparts, contentHashes, threshold)
 	if err != nil {
 		return nil, fmt.Errorf("failed to confirm S3 object orphans: %w", err)
 	}
 
-	type accountHash struct {
-		accountID int64
-		hash      string
+	type accountKey struct {
+		accountID               int64
+		domain, localpart, hash string
 	}
-	confirmed := make(map[accountHash]struct{}, len(objects))
+	confirmed := make(map[accountKey]bool, len(objects))
 	for rows.Next() {
-		var key accountHash
-		if err := rows.Scan(&key.accountID, &key.hash); err != nil {
+		var key accountKey
+		var keep bool
+		if err := rows.Scan(&key.accountID, &key.domain, &key.localpart, &key.hash, &keep); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("failed to scan confirmed S3 object orphan: %w", err)
 		}
-		confirmed[key] = struct{}{}
+		confirmed[key] = keep
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -250,9 +250,12 @@ func (d *Database) filterS3Orphans(ctx context.Context, tx pgx.Tx, objects []Use
 
 	orphans := make([]UserScopedObjectForCleanup, 0, len(confirmed))
 	for _, o := range objects {
-		if _, ok := confirmed[accountHash{accountID: o.AccountID, hash: o.ContentHash}]; ok {
-			orphans = append(orphans, o)
+		keep, ok := confirmed[accountKey{o.AccountID, o.S3Domain, o.S3Localpart, o.ContentHash}]
+		if !ok {
+			continue
 		}
+		o.KeepObject = keep
+		orphans = append(orphans, o)
 	}
 	return orphans, nil
 }
@@ -346,7 +349,9 @@ func (d *Database) ExpungeOldMessages(ctx context.Context, tx pgx.Tx, olderThan 
 }
 
 // GetUserScopedObjectsForCleanup identifies (AccountID, ContentHash) pairs where all messages
-// for that user with that hash have been expunged for longer than the grace period.
+// for that user with that hash have been expunged for longer than the grace period. Rows of
+// other accounts can still point at the object; the re-check under the object's lock
+// (ExecuteWithLockedS3Orphans) decides whether it goes with the account's rows.
 //
 // Uses a bounded scan-window approach: each batch scans a fixed number of rows from
 // idx_messages_cleanup_grouping. This ensures predictable execution time and avoids
@@ -818,7 +823,7 @@ func (d *Database) GetUnusedFTSKeys(ctx context.Context, after FTSKey, limit int
 // DeleteMessagesFTSByKeyBatch deletes multiple rows from the messages_fts_v2 table.
 //
 // Each key is re-validated inside the deleting transaction, the way the S3 orphan path
-// re-checks with IsS3ObjectOrphan. The caller's list comes from GetUnusedFTSKeys, a
+// re-checks under its locks. The caller's list comes from GetUnusedFTSKeys, a
 // read-pool scan allowed to run for tens of seconds, and delivery reuses an existing row
 // for a pair it re-delivers (INSERT ... ON CONFLICT DO NOTHING), so a pair that was
 // unreferenced when it was scanned can carry a live message by now. Deleting it would
@@ -1362,9 +1367,10 @@ func (d *Database) GetMessagesForAccount(ctx context.Context, accountID int64) (
 // skipped (something holds the body's lock, or S3 refused the delete) and their rows stay in
 // messages until the next pass.
 //
-// SAFETY: the keys are the account's own. An S3 key is <s3_domain>/<s3_localpart>/<hash>,
-// taken from the address the message was stored under, and addresses are unique across
-// accounts, so another account's body under the same hash has a different key.
+// The keys are the account's rows', not necessarily objects only the account uses: a key is
+// <s3_domain>/<s3_localpart>/<hash> from the address a row was stored under, and addresses
+// move between accounts, so rows of another account can carry the same key. The S3 phase
+// re-checks that under the object's lock and keeps such an object (KeepObject).
 //
 // It reads the pool the context selects; the purge pins it to the primary, since a lagging
 // replica would hand back keys whose rows it already deleted.
