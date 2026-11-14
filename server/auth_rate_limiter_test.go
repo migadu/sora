@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"testing"
 	"time"
@@ -103,6 +104,57 @@ func TestAuthRateLimiterProgressiveDelays(t *testing.T) {
 	delay5 := limiter.GetAuthenticationDelay(addr)
 	if delay5 != 800*time.Millisecond {
 		t.Errorf("After 5 failures should have 800ms delay, got %v", delay5)
+	}
+}
+
+// TestAuthRateLimiterProgressiveDelayStaysWithinMaxDelay checks that a growing
+// delay saturates at max_delay however large the multiplier or the failure count.
+// A product beyond the time.Duration range used to be converted before the cap
+// was applied; that conversion is implementation-defined (math.MinInt64 on
+// amd64), so the delay went negative and callers skipped it altogether.
+func TestAuthRateLimiterProgressiveDelayStaysWithinMaxDelay(t *testing.T) {
+	tests := []struct {
+		name       string
+		initial    time.Duration
+		max        time.Duration
+		multiplier float64
+		failures   int
+	}{
+		{"default doubling", time.Second, 30 * time.Second, 2, 1000},
+		{"large finite multiplier", time.Second, 30 * time.Second, 1e20, 1000},
+		{"largest finite multiplier", time.Second, 30 * time.Second, math.MaxFloat64, 1000},
+		{"doubling past the duration range", time.Second, time.Duration(math.MaxInt64), 2, 1000},
+		{"large multiplier at the duration boundary", time.Nanosecond, time.Duration(math.MaxInt64), 1e20, 100},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.DefaultAuthRateLimiterConfig()
+			cfg.Enabled = true
+			cfg.InitialDelay = tt.initial
+			cfg.MaxDelay = tt.max
+			cfg.DelayMultiplier = tt.multiplier
+			cfg.MaxAttemptsPerIP = tt.failures + 1 // track every failure without blocking
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() rejected the configuration: %v", err)
+			}
+
+			limiter := NewAuthRateLimiter("imap", "", "", cfg)
+			defer limiter.Stop()
+
+			ctx := context.Background()
+			addr := &StringAddr{Addr: "192.0.2.17:12345"}
+			for n := 1; n <= tt.failures; n++ {
+				limiter.RecordAuthAttempt(ctx, addr, "user@example.com", false)
+				delay := limiter.GetAuthenticationDelay(addr)
+				if n >= cfg.DelayStartThreshold && (delay <= 0 || delay > tt.max) {
+					t.Fatalf("after %d failures: delay = %v, want within (0, %v]", n, delay, tt.max)
+				}
+			}
+			if delay := limiter.GetAuthenticationDelay(addr); delay != tt.max {
+				t.Errorf("after %d failures: delay = %v, want max_delay %v", tt.failures, delay, tt.max)
+			}
+		})
 	}
 }
 
