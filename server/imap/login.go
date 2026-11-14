@@ -36,6 +36,22 @@ func (s *IMAPSession) refusedInMaintenance() *imap.Error {
 	}
 }
 
+// createDefaultMailboxes makes sure the account has its default mailboxes
+// (consts.DefaultMailboxes), as every login does before the session starts. When the
+// read pool did not show them, this is the account's first login: they have just
+// been created on the writer, and a replica that has not replayed that yet has no
+// INBOX. The session then reads from the writer, as after any write of its own.
+func (s *IMAPSession) createDefaultMailboxes(ctx context.Context, accountID int64) error {
+	onWriter, err := s.server.rdb.EnsureDefaultMailboxesWithRetry(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if onWriter {
+		s.useMasterDB.Store(true)
+	}
+	return nil
+}
+
 // Login handles the IMAP LOGIN command. It always applies the authentication
 // gate (progressive delay + rate-limit check) before authenticating.
 func (s *IMAPSession) Login(ctx context.Context, address, password string) error {
@@ -276,8 +292,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 	}
 
 	// Ensure the default mailboxes (INBOX/Sent/Drafts/Archive/Junk/Trash, consts.DefaultMailboxes) exist
-	err = s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, AccountID)
-	if err != nil {
+	if err := s.createDefaultMailboxes(ctx, AccountID); err != nil {
 		return s.internalError("failed to create default mailboxes: %v", err)
 	}
 
