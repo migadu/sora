@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -52,6 +55,10 @@ func (s *tlsStubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusNotFound)
 	case http.MethodGet:
+		if isBucket && r.URL.Query().Get("list-type") == "2" {
+			s.writeList(w, strings.Trim(path, "/"), r.URL.Query())
+			return
+		}
 		if !found {
 			w.WriteHeader(http.StatusNotFound)
 			io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>`)
@@ -77,6 +84,36 @@ func (s *tlsStubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+// writeList answers ListObjectsV2 in one page. With a delimiter, keys below a further
+// delimiter are common prefixes, not objects, so they are left out.
+func (s *tlsStubS3) writeList(w http.ResponseWriter, bucket string, q url.Values) {
+	prefix, delimiter := q.Get("prefix"), q.Get("delimiter")
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated>`)
+	for _, path := range slices.Sorted(maps.Keys(s.objects)) {
+		key, ok := strings.CutPrefix(path, "/"+bucket+"/")
+		if !ok || !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if delimiter != "" && strings.Contains(key[len(prefix):], delimiter) {
+			continue
+		}
+		b.WriteString("<Contents><Key>")
+		xml.EscapeText(&b, []byte(key))
+		fmt.Fprintf(&b, "</Key><Size>%d</Size></Contents>", len(s.objects[path]))
+	}
+	b.WriteString("</ListBucketResult>")
+	w.Header().Set("Content-Type", "application/xml")
+	io.WriteString(w, b.String())
+}
+
+// put stores an object under key in bucket, whatever its name.
+func (s *tlsStubS3) put(bucket, key string, data []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.objects["/"+bucket+"/"+key] = data
 }
 
 // keys returns the stored object paths, sorted.
