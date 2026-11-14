@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/emersion/go-sasl"
@@ -261,10 +262,11 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					(!selfLogin || s.AdmitMasterLogin(s.ctx, settings.masterSASLGate, nil, netConn, proxyInfo, authKey, "master SASL self-login")) {
 
 					// Network gate, anchored to the real socket peer (NetConn().RemoteAddr()),
-					// which PROXY/XCLIENT/ID forwarding cannot rewrite.
-					if !s.AdmitMasterLogin(s.ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master SASL") {
-						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-						return authFailedError()
+					// which PROXY/XCLIENT/ID forwarding cannot rewrite. Pass nil limiter so
+					// failure accounting happens once in refuseMasterSASLImpersonation after
+					// equalizing password-verification work with regular authentication.
+					if !s.AdmitMasterLogin(s.ctx, settings.masterSASLGate, nil, netConn, proxyInfo, authKey, "master SASL") {
+						return s.refuseMasterSASLImpersonation(s.ctx, username, password, netConn, proxyInfo, authKey)
 					}
 
 					// Master SASL credentials match. The user to log in as is the
@@ -277,14 +279,9 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// For master impersonation, we directly establish the session for them.
 					address, err := server.NewAddress(targetUserToImpersonate)
 					if err != nil {
-						// Same reply and same accounting as a bad credential: see the
-						// master-username path above.
+						// Same reply, accounting, and password-verification work as a bad credential.
 						s.WarnLog("impersonation target rejected (address not in the correct format)", "target_user", targetUserToImpersonate, "error", err)
-						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-						if s.server.authLimiter != nil {
-							s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authKey, false)
-						}
-						return authFailedError()
+						return s.refuseMasterSASLImpersonation(s.ctx, username, password, netConn, proxyInfo, authKey)
 					}
 
 					AccountID, err := s.server.rdb.GetMasterLoginTargetWithRetry(s.ctx, address.BaseAddress())
@@ -317,12 +314,8 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 							// Answered by regular authentication (see the self-login note above).
 							return s.login(s.ctx, username, password, identity, false)
 						}
-						// Same reply and same accounting as a bad credential (see above).
-						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-						if s.server.authLimiter != nil {
-							s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authKey, false)
-						}
-						return authFailedError()
+						// Same reply, accounting, and password-verification work as a bad credential.
+						return s.refuseMasterSASLImpersonation(s.ctx, username, password, netConn, proxyInfo, authKey)
 					}
 
 					// Get primary email address for this account
@@ -438,4 +431,38 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			Text: "Unsupported authentication mechanism",
 		}
 	}
+}
+
+// refuseMasterSASLImpersonation answers a refused non-self master SASL login
+// with the same password-verification work, lookup-cache update, rate-limit
+// accounting, and error reply that a wrong password receives via regular
+// authentication (#846), without exposing AUTHORIZATIONFAILED if username
+// happens to name an account whose own password equals master_sasl_password.
+func (s *IMAPSession) refuseMasterSASLImpersonation(ctx context.Context, username, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) error {
+	if authnAddr, err := server.NewAddress(username); err == nil &&
+		!(len(s.server.masterUsername) > 0 && authnAddr.HasSuffix() && checkMasterCredential(authnAddr.Suffix(), s.server.masterUsername)) {
+		if _, authErr := s.server.Authenticate(ctx, authnAddr.BaseAddress(), password); authErr != nil {
+			if errors.Is(authErr, context.Canceled) || errors.Is(authErr, context.DeadlineExceeded) {
+				s.InfoLog("authentication cancelled due to server shutdown")
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeUnavailable,
+					Text: server.ErrServerShuttingDown.Error(),
+				}
+			}
+			if server.IsTemporaryAuthFailure(authErr) {
+				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeUnavailable,
+					Text: server.ErrAuthServiceUnavailable.Error(),
+				}
+			}
+		}
+	}
+	metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
+	if s.server.authLimiter != nil {
+		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+	}
+	return authFailedError()
 }
