@@ -8,8 +8,9 @@ import (
 	"time"
 )
 
-// RCPT without MAIL, and DATA or BDAT without an accepted recipient, are a bad sequence
-// of commands (503), not an unimplemented command (502), which the backend answered
+// RCPT without MAIL, and DATA or non-final BDAT without an accepted recipient,
+// are a bad sequence of commands (503), not an unimplemented command (502), which
+// the backend answered
 // (#748). RFC 5321 section 3.3: "If a RCPT command appears without a previous MAIL
 // command, the server MUST return a 503 "Bad sequence of commands" response." RFC 2033
 // section 4.2: "when there have been no successful RCPT commands in the mail
@@ -26,8 +27,8 @@ func TestOutOfSequenceCommandsGet503(t *testing.T) {
 		{"RCPT without MAIL", nil, "RCPT TO:<user@example.com>"},
 		{"DATA without MAIL", nil, "DATA"},
 		{"DATA without RCPT", []string{mail}, "DATA"},
-		{"BDAT without MAIL", nil, "BDAT 0 LAST"},
-		{"BDAT without RCPT", []string{mail}, "BDAT 0 LAST"},
+		{"BDAT without MAIL", nil, "BDAT 0"},
+		{"BDAT without RCPT", []string{mail}, "BDAT 0"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, addr := startAdmissionTestBackend(t, []string{"127.0.0.0/8"}, false)

@@ -10,8 +10,8 @@ import (
 	"github.com/migadu/sora/integration_tests/common"
 )
 
-// DATA or BDAT after every RCPT was refused, and BDAT after a completed BDAT LAST, are a
-// bad sequence of commands: 503, not 502 (#748). RFC 2033 section 4.2: "when there have
+// DATA or non-final BDAT after every RCPT was refused, and BDAT after a
+// completed BDAT LAST, are a bad sequence of commands: 503, not 502 (#748). RFC 2033 section 4.2: "when there have
 // been no successful RCPT commands in the mail transaction, the DATA command MUST fail
 // with a 503 reply code." RFC 3030 section 2: "Any BDAT command sent after the BDAT LAST
 // is illegal and MUST be replied to with a 503 "Bad sequence of commands" reply code."
@@ -59,7 +59,8 @@ func TestLMTP_OutOfSequenceAfterRecipientOrDelivery(t *testing.T) {
 	}
 
 	// Every recipient refused: no successful RCPT in the transaction.
-	for _, cmd := range []string{"DATA", "BDAT 0 LAST"} {
+	// Use non-LAST BDAT: LMTP LAST has a distinct zero-reply rule (RFC 2033 section 4.3).
+	for _, cmd := range []string{"DATA", "BDAT 0"} {
 		send("MAIL FROM:<sender@example.org>", "250 ")
 		send("RCPT TO:<nobody-748@example.com>", "550 ")
 		outOfSequence(cmd)
