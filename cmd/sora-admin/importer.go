@@ -1329,52 +1329,10 @@ func (i *Importer) scanMaildir() error {
 				return fmt.Errorf("could not get relative path for %s: %w", path, err)
 			}
 
-			var mailboxName string
-			if relPath == "." {
-				mailboxName = "INBOX"
-			} else {
-				// Handle different maildir naming conventions
-				// Common formats:
-				// .Sent (Dovecot style)
-				// Sent (Courier style)
-				// .Sent.2024 (hierarchical)
-
-				// Remove leading dot if present
-				cleanName := strings.TrimPrefix(relPath, ".")
-
-				// Replace maildir separator (.) with IMAP separator (/)
-				mailboxName = strings.ReplaceAll(cleanName, ".", "/")
-
-				// Decode Modified UTF-7 encoding used by Dovecot/IMAP for non-ASCII folder names
-				// e.g. "R&AOk-pertoire" -> "Répertoire"
-				if decoded, decErr := helpers.DecodeModifiedUTF7(mailboxName); decErr != nil {
-					logger.Warn("Failed to decode Modified UTF-7 mailbox name, using raw name", "name", mailboxName, "error", decErr)
-				} else {
-					mailboxName = decoded
-				}
-
-				// Validate the mailbox name doesn't contain problematic characters
-				if strings.ContainsAny(mailboxName, "\t\r\n") {
-					logger.Info("Warning: Skipping mailbox with invalid characters", "mailbox", mailboxName)
-					return nil
-				}
-
-				// Trim any leading or trailing spaces from the mailbox name
-				mailboxName = strings.TrimSpace(mailboxName)
-
-				// Handle special folder name mappings
-				switch strings.ToLower(mailboxName) {
-				case "sent", "sent items", "sent mail":
-					mailboxName = "Sent"
-				case "drafts", "draft":
-					mailboxName = "Drafts"
-				case "trash", "deleted", "deleted items":
-					mailboxName = "Trash"
-				case "junk", "spam":
-					mailboxName = "Junk"
-				case "archive", "archives":
-					mailboxName = "Archive"
-				}
+			mailboxName, err := i.resolveMailboxName(path)
+			if err != nil {
+				logger.Info("Warning: Skipping maildir folder", "path", relPath, "error", err)
+				return nil
 			}
 
 			logger.Info("Processing maildir folder", "path", relPath, "mailbox", mailboxName, "has_delimiter", strings.Contains(mailboxName, "/"))
@@ -2420,34 +2378,10 @@ func (i *Importer) processPathsFile(cleanPath string, filesToProcess chan<- file
 			processedDirs[dir] = true
 		}
 
-		relPath, err := filepath.Rel(cleanPath, dir)
+		mailboxName, err := i.resolveMailboxName(dir)
 		if err != nil {
-			logger.Warn("Could not get relative path", "path", dir, "error", err)
+			logger.Warn("Skipping path", "path", line, "error", err)
 			continue
-		}
-
-		var mailboxName string
-		if relPath == "." {
-			mailboxName = "INBOX"
-		} else {
-			cleanName := strings.TrimPrefix(relPath, ".")
-			mailboxName = strings.ReplaceAll(cleanName, ".", "/")
-			if decoded, decErr := helpers.DecodeModifiedUTF7(mailboxName); decErr == nil {
-				mailboxName = decoded
-			}
-			mailboxName = strings.TrimSpace(mailboxName)
-			switch strings.ToLower(mailboxName) {
-			case "sent", "sent items", "sent mail":
-				mailboxName = "Sent"
-			case "drafts", "draft":
-				mailboxName = "Drafts"
-			case "trash", "deleted", "deleted items":
-				mailboxName = "Trash"
-			case "junk", "spam":
-				mailboxName = "Junk"
-			case "archive", "archives":
-				mailboxName = "Archive"
-			}
 		}
 
 		if !i.shouldImportMailbox(mailboxName) {
