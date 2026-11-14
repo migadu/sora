@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -164,8 +165,8 @@ func (r *SMTPRelayHandler) sendToSMTPRelay(from string, to string, messageBytes 
 			return &RelayError{Err: fmt.Errorf("failed to connect to SMTP relay: %w", err), Permanent: false}
 		}
 	} else if r.UseStartTLS {
-		// Connect with STARTTLS (automatically upgrades to TLS)
-		c, err = smtp.DialStartTLS(r.SMTPHost, tlsConfig)
+		// Connect in plaintext and upgrade with STARTTLS
+		c, err = r.dialStartTLS(tlsConfig)
 		if err != nil {
 			metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
 			// Connection errors are temporary (network issue, server down)
@@ -191,9 +192,8 @@ func (r *SMTPRelayHandler) sendToSMTPRelay(from string, to string, messageBytes 
 	}()
 
 	// Send EHLO/HELO with the configured hostname. When unset, go-smtp uses its
-	// default ("localhost"). For STARTTLS connections the pre-TLS EHLO already used
-	// the default; this sets the name on the post-upgrade EHLO, which is the one the
-	// receiving server records for the transaction.
+	// default ("localhost"). On a STARTTLS connection this is the EHLO after the
+	// handshake (RFC 3207 §4.2); dialStartTLS sent the one before it.
 	if r.HELOHost != "" {
 		if relayErr = c.Hello(r.HELOHost); relayErr != nil {
 			return &RelayError{Err: relayErr, Permanent: IsPermanentError(relayErr)}
@@ -236,6 +236,27 @@ func (r *SMTPRelayHandler) sendToSMTPRelay(from string, to string, messageBytes 
 
 	metrics.LMTPExternalRelay.WithLabelValues("success").Inc()
 	return nil
+}
+
+// smtpRelayDialTimeout matches the dial timeout of go-smtp's Dial functions.
+const smtpRelayDialTimeout = 30 * time.Second
+
+// dialStartTLS connects to the relay in plaintext and upgrades with STARTTLS.
+// smtp.DialStartTLS would send the EHLO before STARTTLS as "localhost"; RFC 5321
+// §2.3.5 requires the EHLO domain to be a primary host name or an address
+// literal, and a relay that checks it refuses the session before the upgrade.
+// NewClientStartTLSWithName sends HELOHost on that first EHLO as well.
+func (r *SMTPRelayHandler) dialStartTLS(tlsConfig *tls.Config) (*smtp.Client, error) {
+	conn, err := net.DialTimeout("tcp", r.SMTPHost, smtpRelayDialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	// smtp.Dial derives the TLS server name from the address; do the same.
+	tlsConfig.ServerName, _, _ = net.SplitHostPort(r.SMTPHost)
+	if r.HELOHost == "" {
+		return smtp.NewClientStartTLS(conn, tlsConfig)
+	}
+	return smtp.NewClientStartTLSWithName(conn, tlsConfig, r.HELOHost)
 }
 
 // HTTPRelayHandler implements HTTP API relay with Bearer token authentication and circuit breaker.
