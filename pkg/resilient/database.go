@@ -1588,7 +1588,15 @@ func (rd *ResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Conte
 	// instead of creating a case-variant duplicate. CanonicalMailboxName only
 	// normalizes the reserved INBOX spelling so a freshly-created inbox is stored
 	// as "INBOX" (RFC 3501 §5.1); all other names keep their as-typed case.
-	name = helpers.CanonicalMailboxName(name)
+	//
+	// The name is checked before anything is created: "Foo/" is "Foo" (RFC 3501
+	// §6.3.3), and a name with an empty, "." or ".." level is refused rather than
+	// creating a parent such as "x/" or "" on the way, or failing halfway.
+	created, err := helpers.MailboxNameToCreate(name)
+	if err != nil {
+		return nil, fmt.Errorf("mailbox %q: %w", name, err)
+	}
+	name = helpers.CanonicalMailboxName(created)
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		// First, try to get the mailbox within the transaction (case-insensitive).
 		var mb db.DBMailbox

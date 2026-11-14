@@ -492,10 +492,14 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 		os.Exit(errorHandler.WaitForExit())
 	}
 
-	// One malformed trusted_networks entry would leave the servers with no trusted
-	// networks: the LMTP backend and lmtp_proxy would refuse every connection.
+	// One malformed trusted_networks entry would leave LMTP admission with no peers.
 	if err := cfg.ValidateTrustedNetworks(); err != nil {
 		errorHandler.ValidationError("trusted_networks", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+
+	if err := cfg.SharedMailboxes.Validate(); err != nil {
+		errorHandler.ValidationError("[shared_mailboxes]", err)
 		os.Exit(errorHandler.WaitForExit())
 	}
 

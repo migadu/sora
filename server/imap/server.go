@@ -254,7 +254,7 @@ type IMAPServer struct {
 	useStartTLS    bool // tlsConfig upgrades a plaintext listener on STARTTLS instead of wrapping it
 	masterUsername []byte
 	masterPassword []byte
-	appendLimit    uint32 // effective APPENDLIMIT: default applied, clamped to 32 bits (see effectiveAppendLimit)
+	appendLimit    uint32 // append_limit with the default applied, clamped to maxStoredMessageSize; a session lowers it to its memory budget (IMAPSession.AppendLimit)
 	ftsRetention   time.Duration
 	version        string
 	config         *config.Config       // Full config reference for shared mailboxes
@@ -422,21 +422,38 @@ type IMAPServerOptions struct {
 	SpamTraining *spamtraining.Client
 }
 
-// effectiveAppendLimit resolves the configured append_limit to the value the
-// server advertises (APPENDLIMIT=, STATUS APPENDLIMIT) and enforces. A value
-// of 0 or less means the default. RFC 7889 §5 writes the limit as an RFC 3501
-// "number", an "Unsigned 32-bit integer (0 <= n < 4,294,967,296)", so a larger
-// value is clamped to math.MaxUint32: converting it with uint32() wrapped
-// "4gb" to 0, which advertised APPENDLIMIT=0 and refused every APPEND.
+// maxStoredMessageSize is the largest message sora can store: messages.size and
+// pending_uploads.size are INTEGER columns, which refuse a larger value.
+const maxStoredMessageSize = math.MaxInt32
+
+// effectiveAppendLimit resolves the configured append_limit to the largest
+// message this server accepts, before a session's memory budget lowers it
+// (IMAPSession.AppendLimit). A value of 0 or less means the default. RFC 7889
+// §5: "The number indicates the fixed maximum message size in octets that the
+// server will accept", so a value above maxStoredMessageSize is clamped to it.
+// That also keeps it inside the RFC 3501 "number", an "Unsigned 32-bit integer
+// (0 <= n < 4,294,967,296)", which APPENDLIMIT is written as: converting a
+// larger value with uint32() wrapped "4gb" to 0, which advertised APPENDLIMIT=0
+// and refused every APPEND.
 func effectiveAppendLimit(name string, configured int64) uint32 {
 	if configured <= 0 {
 		return DefaultAppendLimit
 	}
-	if configured > math.MaxUint32 {
-		logger.Warn("IMAP: append_limit exceeds the largest APPENDLIMIT IMAP can express; clamping", "name", name, "append_limit", configured, "clamped_to", uint64(math.MaxUint32))
-		return math.MaxUint32
+	if configured > maxStoredMessageSize {
+		logger.Warn("IMAP: append_limit exceeds the largest message sora can store; clamping", "name", name, "append_limit", configured, "clamped_to", maxStoredMessageSize)
+		return maxStoredMessageSize
 	}
 	return uint32(configured)
+}
+
+// warnAppendLimitOverSessionMemory warns when session_memory_limit is below
+// append_limit: APPEND reads the message into the session memory budget, so
+// sessions then advertise and enforce the budget as their APPENDLIMIT.
+func warnAppendLimitOverSessionMemory(name string, appendLimit uint32, sessionMemoryLimit int64) {
+	if sessionMemoryLimit > 0 && sessionMemoryLimit < int64(appendLimit) {
+		logger.Warn("IMAP: append_limit exceeds session_memory_limit, which APPEND reads the message into; APPENDLIMIT is session_memory_limit",
+			"name", name, "append_limit", appendLimit, "session_memory_limit", sessionMemoryLimit)
+	}
 }
 
 func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
@@ -514,31 +531,13 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	if !lookupCacheConfig.Enabled {
 		logger.Info("IMAP: Lookup cache disabled", "name", name)
 	} else {
-		positiveTTL, err := time.ParseDuration(lookupCacheConfig.PositiveTTL)
-		if err != nil || lookupCacheConfig.PositiveTTL == "" {
-			logger.Info("IMAP: Using default positive TTL (5m)", "name", name)
-			positiveTTL = 5 * time.Minute
-		}
-
-		negativeTTL, err := time.ParseDuration(lookupCacheConfig.NegativeTTL)
-		if err != nil || lookupCacheConfig.NegativeTTL == "" {
-			logger.Info("IMAP: Using default negative TTL (1m)", "name", name)
-			negativeTTL = 1 * time.Minute
-		}
-
-		cleanupInterval, err := time.ParseDuration(lookupCacheConfig.CleanupInterval)
-		if err != nil || lookupCacheConfig.CleanupInterval == "" {
-			logger.Info("IMAP: Using default cleanup interval (5m)", "name", name)
-			cleanupInterval = 5 * time.Minute
-		}
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()
 
 		maxSize := lookupCacheConfig.GetMaxSize()
 
-		positiveRevalidationWindow, err := lookupCacheConfig.GetPositiveRevalidationWindow()
-		if err != nil {
-			logger.Info("IMAP: Invalid positive revalidation window in auth cache config, using default (30s)", "name", name, "error", err)
-			positiveRevalidationWindow = 30 * time.Second
-		}
+		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault()
 
 		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("IMAP: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
@@ -658,6 +657,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		masterSASLPassword:     options.MasterSASLPassword,
 		masterSASLGate:         masterSASLGate,
 	})
+	warnAppendLimitOverSessionMemory(name, s.appendLimit, options.SessionMemoryLimit)
 
 	// Apply operator-configured per-command timeout overrides on top of defaults.
 	if len(options.CommandTimeoutOverrides) > 0 {
@@ -1885,6 +1885,7 @@ func (s *IMAPServer) ReloadConfig(cfg config.ServerConfig) error {
 	if limit, err := cfg.GetSessionMemoryLimit(); err == nil && limit != next.sessionMemoryLimit {
 		next.sessionMemoryLimit = limit
 		reloaded = append(reloaded, "session_memory_limit")
+		warnAppendLimitOverSessionMemory(s.name, s.appendLimit, limit)
 	}
 	if cfg.MasterSASLUsername != string(next.masterSASLUsername) {
 		next.masterSASLUsername = []byte(cfg.MasterSASLUsername)
