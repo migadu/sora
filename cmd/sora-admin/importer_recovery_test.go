@@ -51,9 +51,10 @@ func TestRecoverOrphanedSQLiteState_AllUploadedRows(t *testing.T) {
 		t.Fatalf("Initial import failed: %v", err)
 	}
 
-	// Reopen the cache and seed rows marked uploaded that have no PostgreSQL
-	// counterpart: exactly the state left behind after the cleaner purged
-	// expunged messages and their S3 objects.
+	// Reopen the cache and seed rows marked uploaded, with no account stamp, that
+	// have no PostgreSQL counterpart: rows marked before the stamp existed, written
+	// by the exporter, or imported into another account. (Rows stamped with this
+	// account are trusted; see TestImporter_IncrementalRunKeepsMessagesDeletedInSora.)
 	importer, err = NewImporter(context.Background(), maildirPath, testEmail, 1, rdb, nil, options)
 	if err != nil {
 		t.Fatalf("Failed to reopen importer: %v", err)

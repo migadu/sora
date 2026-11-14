@@ -29,7 +29,6 @@ type ExporterOptions struct {
 	StartDate      *time.Time
 	EndDate        *time.Time
 	MailboxFilter  []string
-	ShowProgress   bool
 	Dovecot        bool
 	OverwriteFlags bool          // Whether to overwrite flags on existing messages
 	ExportDelay    time.Duration // Delay between exports to control rate

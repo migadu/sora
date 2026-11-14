@@ -512,7 +512,8 @@ func (d *Database) DeleteExpungedMessagesByS3KeyPartsBatch(ctx context.Context, 
 
 // DeleteMessageByHashAndMailbox deletes message rows from the database that match
 // the given AccountID, MailboxID, and ContentHash. This is a hard delete used
-// by the importer for the --force-reimport option.
+// by the importer to take back a batch it inserted when it could not record the
+// batch in its maildir cache (rollback compensation).
 // It returns the number of messages deleted.
 func (d *Database) DeleteMessageByHashAndMailbox(ctx context.Context, tx pgx.Tx, accountID int64, mailboxID int64, contentHash string) (int64, error) {
 	tag, err := tx.Exec(ctx, `
