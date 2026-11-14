@@ -817,12 +817,7 @@ func (exporter *Exporter) exportSubscriptions(accountID int64) error {
 		return fmt.Errorf("failed to fetch subscriptions for export: %w", err)
 	}
 
-	lines := make([]string, 0, len(names)+1)
-	lines = append(lines, "V\t2") // Dovecot v2 format
-	lines = append(lines, names...)
-
-	content := strings.Join(lines, "\n") + "\n"
-	return os.WriteFile(subscriptionsPath, []byte(content), 0644)
+	return os.WriteFile(subscriptionsPath, []byte(formatDovecotSubscriptions(names)), 0644)
 }
 
 // getProgressPrefix returns a progress prefix for log messages

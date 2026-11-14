@@ -107,7 +107,27 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var hashedPassword string
 	var err error
 
-	// Check cache first (if enabled)
+	// Check authentication rate limiting before the auth cache: a blocked address or
+	// IP+username pair is refused whether or not the answer is cached (the cache only
+	// saves the database work), and a cached success must not be recorded for an
+	// attempt the limiter would have refused.
+	if s.authLimiter != nil {
+		if err := s.authLimiter.CanAttemptAuth(ctx, remoteAddr, authKey); err != nil {
+			// Return the SAME response as a bad-credential failure (401 "Invalid credentials")
+			// rather than a distinct 429. A divergent rate-limit response lets an attacker tell
+			// "this account/IP is being limited" apart from "wrong password", and on a shared
+			// egress IP confirms a targeted account is under attack. The block is still enforced;
+			// only its observable response is made indistinguishable. (security-audit M14)
+			// (Timing is intentionally NOT equalized here: running bcrypt on an already-blocked
+			// attempt would turn the rate limiter into a CPU-amplification vector. The fast
+			// rejection is existence-independent, so it is not a user-enumeration oracle.)
+			logger.Debug("User API: Login rate limited", "name", s.name, "ip", clientIP, "email", req.Email, "error", err)
+			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+			return
+		}
+	}
+
+	// Check cache (if enabled)
 	if s.authCache != nil {
 		cachedAccountID, found, cacheErr := s.authCache.Authenticate(req.Email, req.Password)
 		if cacheErr != nil {
@@ -131,23 +151,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		// Cache miss or revalidation needed - fall through to full auth
 		logger.Debug("User API: Cache miss - performing full authentication", "name", s.name, "email", req.Email)
-	}
-
-	// Check authentication rate limiting (after cache check to avoid delays for cached hits)
-	if s.authLimiter != nil {
-		if err := s.authLimiter.CanAttemptAuth(ctx, remoteAddr, authKey); err != nil {
-			// Return the SAME response as a bad-credential failure (401 "Invalid credentials")
-			// rather than a distinct 429. A divergent rate-limit response lets an attacker tell
-			// "this account/IP is being limited" apart from "wrong password", and on a shared
-			// egress IP confirms a targeted account is under attack. The block is still enforced;
-			// only its observable response is made indistinguishable. (security-audit M14)
-			// (Timing is intentionally NOT equalized here: running bcrypt on an already-blocked
-			// attempt would turn the rate limiter into a CPU-amplification vector. The fast
-			// rejection is existence-independent, so it is not a user-enumeration oracle.)
-			logger.Debug("User API: Login rate limited", "name", s.name, "ip", clientIP, "email", req.Email, "error", err)
-			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
-			return
-		}
 	}
 
 	// Authenticate user (full database lookup)

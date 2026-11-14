@@ -72,7 +72,9 @@ func TestHeaderSearchCriteriaBindLiteralTerms(t *testing.T) {
 		{"TO", header("To"), []string{"m.to_email_sort", "m.to_name_sort"}},
 		{"CC", header("Cc"), []string{"m.cc_email_sort"}},
 		{"SUBJECT", header("Subject"), []string{"LOWER(m.subject)"}},
-		{"HEADER References", header("References"), []string{`LOWER(m."references")`}},
+		{"HEADER References", header("References"), []string{`'<' || replace(LOWER(NULLIF(m."references", '')), ' ', '> <') || '>'`}},
+		{"HEADER In-Reply-To", header("In-Reply-To"), []string{`'<' || replace(LOWER(NULLIF(m.in_reply_to, '')), ' ', '> <') || '>'`}},
+		{"BCC", header("Bcc"), []string{"LOWER(r->>'email')", "LOWER(r->>'name')"}},
 		{"TEXT", &imap.SearchCriteria{Text: []string{"Support@Equishark.com"}}, []string{"LOWER(m.subject)", "m.from_email_sort", "m.to_name_sort", "m.cc_email_sort"}},
 	}
 	for _, tc := range cases {

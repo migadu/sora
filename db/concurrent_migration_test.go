@@ -484,6 +484,7 @@ var (
 // ensureMigrationTestDB creates the dedicated database on first use.
 func ensureMigrationTestDB(t *testing.T) {
 	t.Helper()
+	skipDatabaseTestInShortMode(t)
 	migrationTestDBOnce.Do(func() {
 		admin, err := sql.Open("pgx", "postgres://postgres:password@localhost:5432/postgres?sslmode=disable")
 		if err != nil {

@@ -303,13 +303,6 @@ func (si *S3Importer) performDryRun() error {
 	if err != nil {
 		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", si.options.Email, err, si.options.Email)
 	}
-	user := server.NewUser(address, accountID)
-
-	// Ensure default mailboxes exist for this user
-	if err := si.rdb.CreateDefaultMailboxesWithRetry(ctx, user.AccountID()); err != nil {
-		logger.Info("Warning: Failed to create default mailboxes", "email", si.options.Email, "error", err)
-		// Don't fail the dry run, as mailboxes might already exist
-	}
 
 	rows, err := si.db.Query(`
 		SELECT key, size, domain, local_part, content_hash, last_modified
