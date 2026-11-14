@@ -70,7 +70,7 @@ api_key = "replace-with-a-long-random-full-access-key"
 read_only_api_key = "replace-with-a-long-random-read-only-key"  # Optional; same rules (16+ chars), must differ from api_key
 ```
 
-The read-only key is accepted only for `GET` requests. Any other method (`POST`, `PUT`, `DELETE`, …) made with it is rejected with `403 {"error": "API key is read-only"}`. Like `api_key`, it is reloaded on SIGHUP; removing it from the config revokes it. As a guard against copy-paste mistakes, a reload is refused when it sets `api_key` to the read-only key currently in use, or `read_only_api_key` to the `api_key` it replaces. Both keys are updated together: if either is refused, both previous keys stay in use, including on repeated SIGHUPs. Other settings, such as `allowed_hosts`, can still reload. This only compares against the keys live at that moment: when retiring a key, give it a fresh value rather than reusing one from the other slot.
+The read-only key is accepted only for `GET` requests. Any other method (`POST`, `PUT`, `DELETE`, …) made with it is rejected with `403 {"error": "API key is read-only"}` and `WWW-Authenticate: Bearer realm="admin-api", error="insufficient_scope"` (RFC 6750 section 3.1). Like `api_key`, it is reloaded on SIGHUP; removing it from the config revokes it. As a guard against copy-paste mistakes, a reload is refused when it sets `api_key` to the read-only key currently in use, or `read_only_api_key` to the `api_key` it replaces. Both keys are updated together: if either is refused, both previous keys stay in use, including on repeated SIGHUPs. Other settings, such as `allowed_hosts`, can still reload. This only compares against the keys live at that moment: when retiring a key, give it a fresh value rather than reusing one from the other slot.
 
 ### Making Authenticated Requests
 
@@ -1076,7 +1076,7 @@ The Admin API uses standard HTTP status codes and returns JSON error responses.
 | 207 | Multi-Status | Partial success (e.g., partial mail delivery) |
 | 400 | Bad Request | Invalid request parameters or body |
 | 401 | Unauthorized | Missing or non-Bearer `Authorization` header; carries `WWW-Authenticate: Bearer realm="admin-api"` |
-| 403 | Forbidden | Operation not allowed |
+| 403 | Forbidden | Operation not allowed; a wrong API key carries `WWW-Authenticate: Bearer realm="admin-api", error="invalid_token"`, the read-only key on a write `Bearer realm="admin-api", error="insufficient_scope"` |
 | 404 | Not Found | Resource not found |
 | 409 | Conflict | Resource already exists |
 | 500 | Internal Server Error | Server error |
