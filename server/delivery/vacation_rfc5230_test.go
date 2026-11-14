@@ -1,13 +1,16 @@
 package delivery
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/emersion/go-message"
+	"github.com/emersion/go-message/mail"
 	"github.com/emersion/go-smtp"
 	"github.com/migadu/sora/server/sieveengine"
 )
@@ -190,5 +193,48 @@ func TestVacationScriptAddressesNeedNoOwnershipLookup(t *testing.T) {
 	}
 	if lookups != 0 {
 		t.Errorf("ownership lookups = %d, want 0: the :addresses match needs none", lookups)
+	}
+}
+
+// TestVacationSubjectIsCapped: without :subject the reply's Subject carries the
+// sender's original subject, which can be as long as the original header block. RFC
+// 3834 §3.1.5 asks for its contents "(or a portion thereof)"; Pigeonhole keeps 256
+// code points (SIEVE_MAX_SUBJECT_HEADER_CODEPOINTS). The cut is on a code point
+// boundary, so a multi-byte character is never split.
+func TestVacationSubjectIsCapped(t *testing.T) {
+	const owner = "jane@example.com"
+	owns := func(_ context.Context, _ int64, addr string) (bool, error) {
+		return strings.EqualFold(addr, owner), nil
+	}
+	for _, tc := range []struct {
+		name, subject, want string
+	}{
+		{name: "short", subject: "Auto: Réunion", want: "Auto: Réunion"},
+		{name: "exactly the cap", subject: strings.Repeat("é", 256), want: strings.Repeat("é", 256)},
+		{name: "over the cap", subject: "Auto: " + strings.Repeat("é", 100000), want: "Auto: " + strings.Repeat("é", 250)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rq := &captureRelayQueue{}
+			h := &StandardVacationHandler{Hostname: "mail.example.com", RelayQueue: rq, IsOwnedAddress: owns}
+			original := makeMessage(map[string]string{"From": "bob@example.org", "To": owner, "Subject": "Hello"})
+			reply := sieveengine.VacationReply{Body: "I am away.", Subject: tc.subject}
+			if err := h.HandleVacationResponse(context.Background(), 1, reply, vacAddr(t, "bob@example.org"), vacAddr(t, owner), original); err != nil {
+				t.Fatalf("HandleVacationResponse: %v", err)
+			}
+			if len(rq.calls) != 1 {
+				t.Fatalf("expected 1 reply, got %d", len(rq.calls))
+			}
+			entity, err := mail.CreateReader(bytes.NewReader(rq.calls[0].body))
+			if err != nil {
+				t.Fatalf("parse reply: %v", err)
+			}
+			got, err := entity.Header.Subject()
+			if err != nil {
+				t.Fatalf("decode subject: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("subject = %d code points %q..., want %d code points", utf8.RuneCountInString(got), got[:min(len(got), 20)], utf8.RuneCountInString(tc.want))
+			}
+		})
 	}
 }

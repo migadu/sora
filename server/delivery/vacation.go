@@ -111,6 +111,23 @@ func (h *StandardVacationHandler) recipientIsAddressed(ctx context.Context, acco
 	return false, nil
 }
 
+// maxVacationSubjectCodePoints caps the reply's Subject. Without :subject it carries the
+// sender's original subject, which can be as long as the original's header block; RFC
+// 3834 §3.1.5 asks for "contents of the Subject field (or a portion thereof)". Pigeonhole
+// keeps the same 256 code points (SIEVE_MAX_SUBJECT_HEADER_CODEPOINTS).
+const maxVacationSubjectCodePoints = 256
+
+// truncateCodePoints returns s cut to at most n code points, never inside one.
+func truncateCodePoints(s string, n int) string {
+	for i := range s {
+		if n == 0 {
+			return s[:i]
+		}
+		n--
+	}
+	return s
+}
+
 // log emits a message via the optional Logger.
 func (h *StandardVacationHandler) log(format string, args ...any) {
 	if h.Logger != nil {
@@ -203,7 +220,7 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 	// the original subject); the fixed subject is for a reply built without one.
 	vacationSubject := "Automated reply"
 	if reply.Subject != "" {
-		vacationSubject = reply.Subject
+		vacationSubject = truncateCodePoints(reply.Subject, maxVacationSubjectCodePoints)
 	}
 
 	// Build vacation message
