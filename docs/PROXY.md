@@ -1083,7 +1083,7 @@ On `SIGHUP` the proxies apply these `[[server]]` keys:
 | `imap_proxy` | `limits.max_auth_errors`, `auth_idle_timeout`, `timeouts.command_timeout`, `timeouts.absolute_session_timeout`, `timeouts.min_bytes_per_minute`, `master_sasl_username`, `master_sasl_password` |
 | `pop3_proxy`, `managesieve_proxy` | the same, and `debug` |
 | `lmtp_proxy` | `timeouts.absolute_session_timeout`, `max_message_size` |
-| `user_api_proxy` | `jwt_secret` |
+| `user_api_proxy` | `jwt_secret`, `allowed_origins` |
 
 Everything else in this document needs a restart: `remote_addrs`, `[[pool]]`, `[server.remote_lookup]`,
 `[server.lookup_cache]`, the backend-leg keys, `[auth_cache]`, `[backend_maintenance]` and
