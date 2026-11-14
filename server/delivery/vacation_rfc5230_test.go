@@ -3,7 +3,9 @@ package delivery
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -193,6 +195,55 @@ func TestVacationScriptAddressesNeedNoOwnershipLookup(t *testing.T) {
 	}
 	if lookups != 0 {
 		t.Errorf("ownership lookups = %d, want 0: the :addresses match needs none", lookups)
+	}
+}
+
+// TestVacationPersonalMessageCheckIsOneLookup is issue #487: the personal message
+// check (RFC 5230 §4.5) asked the database about one recipient address at a time, two
+// for a +detail address, until it found one the account owns. A message to 500 people
+// cost 500 credentials queries per vacation-enabled recipient, 1000 when the user was
+// not named at all. Every recipient is now checked in one lookup.
+func TestVacationPersonalMessageCheckIsOneLookup(t *testing.T) {
+	const owner = "jane@example.com"
+	var others []string
+	for i := range 500 {
+		others = append(others, fmt.Sprintf("user%d+tag@example.net", i))
+	}
+	for _, tc := range []struct {
+		name    string
+		to      []string
+		replies int
+	}{
+		{name: "owner named last", to: append(slices.Clone(others), owner), replies: 1},
+		{name: "owner not named", to: others, replies: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lookups := 0
+			rq := &captureRelayQueue{}
+			h := &StandardVacationHandler{
+				Hostname:   "mail.example.com",
+				RelayQueue: rq,
+				IsOwnedAddress: func(_ context.Context, _ int64, addr string) (bool, error) {
+					lookups++
+					return strings.EqualFold(addr, owner), nil
+				},
+			}
+			original := makeMessage(map[string]string{
+				"From":    "bob@example.org",
+				"To":      strings.Join(tc.to, ", "),
+				"Subject": "Hello",
+			})
+			reply := sieveengine.VacationReply{Body: "I am away."}
+			if err := h.HandleVacationResponse(context.Background(), 1, reply, vacAddr(t, "bob@example.org"), vacAddr(t, owner), original); err != nil {
+				t.Fatalf("HandleVacationResponse: %v", err)
+			}
+			if len(rq.calls) != tc.replies {
+				t.Errorf("replies = %d, want %d", len(rq.calls), tc.replies)
+			}
+			if lookups != 1 {
+				t.Errorf("ownership lookups = %d, want 1 for %d recipients", lookups, len(tc.to))
+			}
+		})
 	}
 }
 
