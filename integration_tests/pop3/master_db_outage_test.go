@@ -10,8 +10,10 @@ import (
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server/pop3"
 	"github.com/migadu/sora/storage"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // TestPOP3MasterLoginDuringDatabaseOutage: a master login whose impersonation target
@@ -71,6 +73,11 @@ func TestPOP3MasterLoginDuringDatabaseOutage(t *testing.T) {
 			t.Cleanup(func() { srv.Close() })
 			time.Sleep(100 * time.Millisecond)
 
+			authenticationAttempts := func(result string) float64 {
+				return testutil.ToFloat64(metrics.AuthenticationAttempts.WithLabelValues("pop3", "test-master-db-outage", "localhost", result))
+			}
+			unavailableBefore, failuresBefore := authenticationAttempts("unavailable"), authenticationAttempts("failure")
+
 			outage.Begin()
 			for i := 1; i <= 3; i++ {
 				if reply := form.probe(t, address, account.Email); !strings.HasPrefix(reply, "-ERR [SYS/TEMP]") {
@@ -78,6 +85,13 @@ func TestPOP3MasterLoginDuringDatabaseOutage(t *testing.T) {
 				}
 			}
 			outage.End()
+
+			if grew := authenticationAttempts("unavailable") - unavailableBefore; grew != 3 {
+				t.Errorf("outage logins counted as unavailable: %v, want 3", grew)
+			}
+			if grew := authenticationAttempts("failure") - failuresBefore; grew != 0 {
+				t.Errorf("outage logins counted as credential failures: %v, want 0", grew)
+			}
 
 			if reply := form.probe(t, address, account.Email); !strings.HasPrefix(reply, "+OK") {
 				t.Errorf("master login after the outage: %q, want +OK (the outage was counted as failed logins)", reply)

@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/migadu/sora/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // TestManageSieveProxyMasterLoginDuringDatabaseOutage: once the proxy has accepted the
@@ -27,6 +29,11 @@ func TestManageSieveProxyMasterLoginDuringDatabaseOutage(t *testing.T) {
 
 	masterLogin := account.Email + "@" + proxyMasterUsername
 
+	authenticationAttempts := func(result string) float64 {
+		return testutil.ToFloat64(metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "test-managesieve-proxy-master-ratelimit", "test-managesieve-proxy-master-ratelimit", result))
+	}
+	unavailableBefore, failuresBefore := authenticationAttempts("unavailable"), authenticationAttempts("failure")
+
 	outage.Begin()
 	for i := 1; i <= 3; i++ {
 		if reply := sieveProxyAuthReply(t, proxyAddr, masterLogin, proxyMasterPassword); !strings.HasPrefix(reply, "NO (TRYLATER)") {
@@ -34,6 +41,13 @@ func TestManageSieveProxyMasterLoginDuringDatabaseOutage(t *testing.T) {
 		}
 	}
 	outage.End()
+
+	if grew := authenticationAttempts("unavailable") - unavailableBefore; grew != 3 {
+		t.Errorf("outage logins counted as unavailable: %v, want 3", grew)
+	}
+	if grew := authenticationAttempts("failure") - failuresBefore; grew != 0 {
+		t.Errorf("outage logins counted as credential failures: %v, want 0", grew)
+	}
 
 	if reply := sieveProxyAuthReply(t, proxyAddr, masterLogin, proxyMasterPassword); !strings.HasPrefix(reply, "OK") {
 		t.Errorf("master AUTHENTICATE after the outage: %q, want OK (the outage was counted as failed logins)", reply)
