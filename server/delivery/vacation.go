@@ -69,11 +69,14 @@ var personalMessageFields = []string{"To", "Cc", "Bcc", "Resent-To", "Resent-Cc"
 // owns (ownership, not a literal match, so aliases and plus-addressed recipients count)
 // and the script's :addresses. Returns an error only if the ownership lookup fails.
 func (h *StandardVacationHandler) recipientIsAddressed(ctx context.Context, accountID int64, scriptAddresses []string, originalMessage *message.Entity) (bool, error) {
-	hdr := mail.Header{Header: originalMessage.Header}
 	var recipients []*mail.Address
 	for _, field := range personalMessageFields {
-		if list, err := hdr.AddressList(field); err == nil {
-			recipients = append(recipients, list...)
+		// Every occurrence: a message resent more than once has one set of Resent-*
+		// fields per resending (RFC 5322 §3.6.6), and §4.5 asks for "a" matching line.
+		for _, value := range originalMessage.Header.Values(field) {
+			if list, err := mail.ParseAddressList(value); err == nil {
+				recipients = append(recipients, list...)
+			}
 		}
 	}
 	for _, a := range recipients {
