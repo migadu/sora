@@ -136,6 +136,7 @@ To prevent memory exhaustion from oversized messages:
 [servers.imap]
 append_limit = "25mb"  # Maximum size for IMAP APPEND operations
 ```
+APPEND reads the message into the session's memory budget, so the APPENDLIMIT a session advertises and enforces is the smaller of `append_limit` and `session_memory_limit`, and never more than 2147483647 bytes (the largest message sora can store).
 
 **LMTP Delivery**: Configurable via `max_message_size` (default: 50MB)
 ```toml

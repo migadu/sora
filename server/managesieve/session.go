@@ -62,6 +62,14 @@ var (
 	errDelayQueueFul = &managesieveserver.Error{Message: "Too many concurrent authentication attempts. Please try again later."}
 )
 
+// authUnavailable reports whether a failed Authenticate says nothing about the
+// credentials: the database could not be asked, or the command was cut short. Such a
+// login is answered TRYLATER (RFC 5804 section 1.3) and not counted as a failed one,
+// or clients retrying a saved password through a database outage stay blocked after it.
+func authUnavailable(err error) bool {
+	return server.IsTemporaryAuthFailure(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // --- Authentication ---
 
 // AuthenticatePlain implements the SASL PLAIN authentication business logic.
@@ -73,10 +81,11 @@ var (
 func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, authnID, password string) error {
 	start := time.Now()
 	success := false
+	outcome := "failure"
 	defer func() {
 		if !success {
 			// Track failed authentication if not already successful
-			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, outcome).Inc()
 			metrics.CriticalOperationDuration.WithLabelValues("managesieve_authentication").Observe(time.Since(start).Seconds())
 		}
 	}()
@@ -363,6 +372,11 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 
 		accountID, err = s.server.Authenticate(ctx, address.BaseAddress(), password)
 		if err != nil {
+			if authUnavailable(err) {
+				outcome = "unavailable"
+				s.DebugLog("authentication unavailable", "error", err)
+				return errTryLater
+			}
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
@@ -494,6 +508,11 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 	if !authSuccess {
 		accountID, err = s.server.Authenticate(ctx, address.BaseAddress(), password)
 		if err != nil {
+			if authUnavailable(err) {
+				s.DebugLog("authentication unavailable", "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "unavailable").Inc()
+				return errTryLater
+			}
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}

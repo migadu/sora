@@ -69,14 +69,17 @@ func NewProxyProtocolReader(protocol string, config ProxyProtocolConfig) (*Proxy
 
 	logger.Debug("PROXY protocol: Initializing reader", "protocol", protocol, "enabled", config.Enabled, "mode", reader.config.Mode, "trusted_proxies", config.TrustedProxies, "timeout", reader.timeout)
 
-	// Parse timeout
+	// Parse timeout. Zero or a negative timeout would set the read deadline in
+	// the past and fail every header, so it gets the default too.
 	if config.Timeout != "" {
-		var err error
-		reader.timeout, err = time.ParseDuration(config.Timeout)
+		timeout, err := helpers.ParseDuration(config.Timeout)
+		if err == nil && timeout <= 0 {
+			err = errors.New("must be positive")
+		}
 		if err != nil {
-			// Log the error and use default timeout to prevent server crash
-			logger.Debug("PROXY protocol: WARNING - invalid timeout, using default 5s", "protocol", protocol, "timeout", config.Timeout, "error", err)
-			reader.timeout = 5 * time.Second
+			logger.Warn("PROXY protocol: invalid timeout, using default", "protocol", protocol, "timeout", config.Timeout, "error", err, "default", reader.timeout)
+		} else {
+			reader.timeout = timeout
 		}
 	}
 
@@ -614,6 +617,15 @@ func GetRealClientIP(conn net.Conn, proxyInfo *ProxyProtocolInfo) string {
 		}
 		return host
 	}
+}
+
+// GetRealClientAddr returns the real client's IP and port: the source of the PROXY
+// header when there is one, else the connection's peer.
+func GetRealClientAddr(conn net.Conn, proxyInfo *ProxyProtocolInfo) (string, int) {
+	if proxyInfo != nil && proxyInfo.SrcIP != "" {
+		return proxyInfo.SrcIP, proxyInfo.SrcPort
+	}
+	return GetHostPortFromAddr(conn.RemoteAddr())
 }
 
 // GetConnectionIPs returns both real client IP and proxy IP (if applicable)

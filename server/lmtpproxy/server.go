@@ -279,22 +279,10 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		lookupCacheConfig = &defaultConfig
 	}
 
-	if lookupCacheConfig.Enabled {
-		positiveTTL, err := lookupCacheConfig.GetPositiveTTL()
-		if err != nil {
-			logger.Info("LMTP Proxy: Invalid positive TTL in auth cache config, using default (5m)", "name", opts.Name, "error", err)
-			positiveTTL = 5 * time.Minute
-		}
-		negativeTTL, err := lookupCacheConfig.GetNegativeTTL()
-		if err != nil {
-			logger.Info("LMTP Proxy: Invalid negative TTL in auth cache config, using default (1m)", "name", opts.Name, "error", err)
-			negativeTTL = 1 * time.Minute
-		}
-		cleanupInterval, err := lookupCacheConfig.GetCleanupInterval()
-		if err != nil {
-			logger.Info("LMTP Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", opts.Name, "error", err)
-			cleanupInterval = 5 * time.Minute
-		}
+	if lookupCacheConfig.Enabled && !proxy.RemoteLookupUsesClientIP(opts.RemoteLookup) {
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()
 		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// LMTP proxy doesn't do password validation, so positive revalidation window is not needed (use 0)

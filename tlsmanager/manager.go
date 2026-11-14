@@ -12,6 +12,7 @@ import (
 
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
@@ -328,7 +329,7 @@ func (m *Manager) initLetsEncryptProvider() error {
 	var renewBefore time.Duration
 	if leCfg.RenewBefore != "" {
 		var err error
-		renewBefore, err = time.ParseDuration(leCfg.RenewBefore)
+		renewBefore, err = helpers.ParseDuration(leCfg.RenewBefore)
 		if err != nil {
 			return fmt.Errorf("invalid renew_before duration: %w", err)
 		}
@@ -436,7 +437,7 @@ func (m *Manager) initLetsEncryptProvider() error {
 
 	// Start certificate sync worker if configured
 	if leCfg.SyncInterval != "" && leCfg.SyncInterval != "0" {
-		syncInterval, err := time.ParseDuration(leCfg.SyncInterval)
+		syncInterval, err := helpers.ParseDuration(leCfg.SyncInterval)
 		if err != nil {
 			return fmt.Errorf("invalid sync_interval duration: %w", err)
 		}
