@@ -400,7 +400,7 @@ func TestTextUnionSearchResults(t *testing.T) {
 }
 
 // Database test helpers for search tests
-func setupSearchTestDatabase(t *testing.T) (*Database, int64, int64) {
+func setupSearchTestDatabase(t testing.TB) (*Database, int64, int64) {
 	db := setupTestDatabase(t)
 
 	ctx := context.Background()
