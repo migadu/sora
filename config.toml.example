@@ -579,7 +579,7 @@ purge_unused = "168h"              # Purge entries unused for this duration (def
 # How proxies honor backends put in maintenance with
 # `sora-admin backends maintenance on --host HOST`. A backend in maintenance
 # gets no new traffic from any proxy, while it keeps running to finish the
-# uploads only it can do; see docs/deployment.md. After refuse_after it also
+# uploads only it can do; see docs/PROXY.md, "Backend maintenance mode". After refuse_after it also
 # refuses new sessions itself (logins, LMTP transactions, Admin API
 # deliveries), whichever way they reach it. Both read the list from the
 # database, so a node without database access cannot honor it.
@@ -637,7 +637,7 @@ batch_size = 20               # Number of messages batched together per upload o
 concurrency = 10              # Number of concurrent upload workers. An upload holds no database connection
                               # across its S3 transfer (it passes a one-statement lock gate before writing),
                               # so this is bounded by what S3 accepts, not by the pooler's pool. See
-                              # docs/deployment.md, "Connection Poolers".
+                              # docs/DATABASE.md, "PgBouncer and other connection poolers".
 max_attempts = 5              # Attempts after which an upload is parked ("failed", needs sora-admin uploader resolve).
                               # Only evidence about the content counts: an empty or size-mismatched staging file,
                               # or a file missing while S3 reports the object absent. Provider errors (any HTTP
@@ -1104,9 +1104,13 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # Disable specific IMAP capabilities for ALL clients connecting to this server.
 # Disabled capabilities are not announced in CAPABILITY responses and cannot be
 # used: what they add is refused, e.g. with MOVE disabled the MOVE command gets
-# BAD, and with STATUS=SIZE disabled so does STATUS (SIZE). Not yet for
-# THREAD=*, MULTISEARCH, UIDPLUS, CREATE-SPECIAL-USE, LIST-EXTENDED, SPECIAL-USE
-# and ID: disabling one of those only stops announcing it.
+# BAD, with STATUS=SIZE disabled so does STATUS (SIZE), with UIDPLUS disabled
+# UID EXPUNGE. Disabling LIST-EXTENDED refuses its generic selection/return
+# options and parenthesized pattern lists; plain LIST, LSUB and options with
+# their own advertised capabilities (SPECIAL-USE, LIST-STATUS) keep working.
+# ID cannot be refused, so disabling ID only stops announcing it. Disabling
+# CREATE-SPECIAL-USE refuses attribute assignment, but an empty CREATE USE ()
+# parameter is still accepted and behaves as ordinary CREATE.
 #
 # This is different from client_filters which apply based on client identity.
 # Use this when you want to disable capabilities for ALL clients on this server.
@@ -1127,6 +1131,10 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # the server offers IMAP4rev1 with its remaining extensions; disabling CONDSTORE
 # also removes QRESYNC; disabling SORT also removes SORT=DISPLAY and ESORT.
 # client_filters follow the same rule.
+# IMAP4rev2 includes BINARY's FETCH items but not its APPEND extension, so
+# disabling BINARY keeps IMAP4rev2 and refuses only APPEND with a literal8;
+# FETCH BINARY, BINARY.PEEK and BINARY.SIZE are refused once IMAP4rev2 is
+# not offered either.
 # SASL-IR, LITERAL-, UNSELECT, ENABLE and UTF8=ACCEPT are always advertised with
 # IMAP4rev1 and cannot be disabled; naming them only logs a warning.
 # STARTTLS, LOGINDISABLED and AUTH=PLAIN follow tls, tls_use_starttls and

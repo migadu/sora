@@ -17,7 +17,7 @@ import (
 )
 
 // TestUserAPI_SearchAppliesFilters: GET /user/mailboxes/{name}/search documents from,
-// subject and unseen (docs/user-api.md, user_api_openapi.yaml), each ANDed with q. The
+// subject and unseen (docs/USER_API.md, user_api_openapi.yaml), each ANDed with q. The
 // server once read only q, so a filtered search answered the unfiltered result (#543).
 func TestUserAPI_SearchAppliesFilters(t *testing.T) {
 	h := newBodyStateHarness(t)

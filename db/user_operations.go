@@ -720,19 +720,20 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 
 // CreateMailboxForUser creates a new mailbox
 func (db *Database) CreateMailboxForUser(ctx context.Context, accountID int64, mailboxPath string) error {
+	// RFC 3501 §6.3.3: "Folder/Sub/" creates "Folder/Sub" ("the name created is
+	// without the trailing hierarchy delimiter"). A name with an empty, "." or ".."
+	// level is refused before any parent is created, so "x//y" never makes "x/".
+	mailboxPath, err := helpers.MailboxNameToCreate(mailboxPath)
+	if err != nil {
+		return err
+	}
+	delim := string(consts.MailboxDelimiter)
+
 	tx, err := db.GetWritePool().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback(context.Background())
-
-	// RFC 3501 §6.3.3: trim trailing hierarchy delimiters so "Folder/Sub/" creates
-	// "Folder/Sub" rather than storing a trailing separator.
-	delim := string(consts.MailboxDelimiter)
-	mailboxPath = strings.TrimRight(mailboxPath, delim)
-	if mailboxPath == "" {
-		return consts.ErrMailboxInvalidName
-	}
 
 	// Link the mailbox under its parent, creating any missing ancestor first, as IMAP
 	// CREATE and GetOrCreateMailboxByName do. Creating it with no parent (as this did)
