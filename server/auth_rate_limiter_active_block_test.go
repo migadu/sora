@@ -585,3 +585,27 @@ func TestIPUsernameTablesConcurrentUse(t *testing.T) {
 		t.Errorf("%d IP+username counters and %d blocks, want at most %d of each", c, b, limit)
 	}
 }
+
+// Out-of-order failures must preserve an IP-wide block just as they do for a pair.
+func TestIPBlockRenewalNeverShortensBlock(t *testing.T) {
+	limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+		Enabled: true, MaxAttemptsPerIP: 1, IPBlockDuration: time.Minute,
+		IPWindowDuration: time.Hour, CleanupInterval: time.Hour, DelayStartThreshold: 100,
+	})
+	defer limiter.Stop()
+	t0 := time.Now()
+	limiter.updateFailureTracking("198.51.100.1", t0.Add(20*time.Second))
+	limiter.updateFailureTracking("198.51.100.1", t0.Add(10*time.Second))
+	limiter.ipMu.RLock()
+	defer limiter.ipMu.RUnlock()
+	blocked := limiter.blockedIPs["198.51.100.1"]
+	if want := t0.Add(80 * time.Second); blocked.BlockedUntil.Before(want) {
+		t.Fatalf("block ends %v after t0, want %v", blocked.BlockedUntil.Sub(t0), want.Sub(t0))
+	}
+	if !blocked.LastFailure.Equal(t0.Add(20 * time.Second)) {
+		t.Errorf("last failure = %v, want latest captured failure", blocked.LastFailure)
+	}
+	if blocked.FailureCount != 2 {
+		t.Errorf("failure count = %d, want 2", blocked.FailureCount)
+	}
+}

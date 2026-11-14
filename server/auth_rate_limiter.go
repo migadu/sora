@@ -546,7 +546,9 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 	}
 
 	info.FailureCount++
-	info.LastFailure = failureTime
+	if failureTime.After(info.LastFailure) {
+		info.LastFailure = failureTime
+	}
 
 	if info.FailureCount >= a.config.DelayStartThreshold {
 		if info.LastDelay == 0 {
@@ -567,12 +569,17 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 
 	if info.FailureCount >= a.config.MaxAttemptsPerIP {
 		blockedUntil := failureTime.Add(a.config.IPBlockDuration)
+		// failureTime was captured before ipMu: an earlier in-flight failure
+		// must not shorten a block recorded by a later failure (or another node).
+		if previous, exists := a.blockedIPs[ip]; exists && previous.BlockedUntil.After(blockedUntil) {
+			blockedUntil = previous.BlockedUntil
+		}
 		// Already have ipMu lock from line 338, no need to lock again
 		a.blockedIPs[ip] = &BlockedIPInfo{
 			BlockedUntil: blockedUntil,
 			FailureCount: info.FailureCount,
 			FirstFailure: info.FirstFailure,
-			LastFailure:  failureTime,
+			LastFailure:  info.LastFailure,
 			Protocol:     a.protocol,
 		}
 		logger.Info("Auth rate limiter: IP blocked (Tier 2)",
