@@ -492,8 +492,9 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 				s.InfoLog("authentication cancelled due to server shutdown")
 				return 0, errTempUnavailable
 			}
-			// The database could not be asked, so nothing is known about the credentials:
-			// [SYS/TEMP] (RFC 3206 section 4), not [AUTH], and not counted as a failed login.
+			// The database could not be asked, or the stored hash cannot be checked, so
+			// nothing is known about the credentials: [SYS/TEMP] (RFC 3206 section 4), not
+			// [AUTH], and not counted as a failed login.
 			if server.IsTemporaryAuthFailure(err) {
 				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
 				return 0, errTempUnavailable

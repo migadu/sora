@@ -48,10 +48,6 @@ type AdminConfig struct {
 	// Sieve is read so scripts stored by the admin tools (sieve put, import-maildir
 	// --sieve-path) are validated against the same extension set delivery compiles with.
 	Sieve config.SieveConfig `toml:"sieve"`
-	// Cluster is decoded for display commands (config show masks its secret_key). It
-	// plays no part in instance identity: the upload lease key comes from
-	// uploader.instance_id, deliberately decoupled from the gossip node name.
-	Cluster config.ClusterConfig `toml:"cluster"`
 }
 
 // InstanceID returns the identity this host writes into pending_uploads.instance_id,
@@ -155,9 +151,6 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	cfg.HTTPAPIKey = fullCfg.AdminCLI.APIKey
 	cfg.Relay = fullCfg.Relay
 	cfg.Sieve = fullCfg.Sieve
-	// Needed for node_id: it resolves the instance identity this host writes into
-	// pending_uploads.instance_id, and an import must use the same one the server does.
-	cfg.Cluster = fullCfg.Cluster
 
 	// Default: verify the Admin API server's TLS certificate. Skip verification
 	// automatically only for loopback addresses (local admin use with self-signed

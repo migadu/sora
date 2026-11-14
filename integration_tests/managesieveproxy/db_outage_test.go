@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/migadu/sora/server/managesieveproxy"
 )
 
 // sieveProxyAuthReply sends one AUTHENTICATE PLAIN on a fresh connection and returns the reply.
@@ -55,5 +57,45 @@ func TestManageSieveProxyLoginDuringDatabaseOutage(t *testing.T) {
 
 	if reply := sieveProxyAuthReply(t, proxyAddr, account.Email, account.Password); !strings.HasPrefix(reply, "OK") {
 		t.Errorf("AUTHENTICATE after the outage: %q, want OK (the outage was counted as failed logins)", reply)
+	}
+}
+
+// TestManageSieveProxyDatabaseOutageDropsCachedLogin: a password that misses a cached
+// login older than positive_revalidation_window goes to the database. During an outage
+// that gives no verdict, so the attempt is answered NO (TRYLATER) and is not counted in
+// the auth rate limiter. The cached login must go with it, or the cached password still
+// signs in and every guess during the outage is checked against it, unseen by the rate
+// limiter, until the entry expires. Once the database is back the user logs in: the
+// guesses were not counted.
+func TestManageSieveProxyDatabaseOutageDropsCachedLogin(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	backend, account := common.SetupManageSieveServerWithMaster(t)
+	defer backend.Close()
+
+	rdb, outage := common.SetupTestDatabaseWithOutage(t)
+	proxyAddr := common.GetRandomAddress(t)
+	proxy := setupManageSieveProxyWithRateLimiting(t, rdb, proxyAddr, []string{backend.Address}, common.DBOutageAuthRateLimit(),
+		func(o *managesieveproxy.ServerOptions) { o.LookupCache = common.RevalidatingLookupCache() })
+	defer proxy.Close()
+
+	if reply := sieveProxyAuthReply(t, proxyAddr, account.Email, account.Password); !strings.HasPrefix(reply, "OK") {
+		t.Fatalf("AUTHENTICATE before the outage: %q, want OK", reply)
+	}
+	outage.Begin()
+	time.Sleep(2 * common.LookupCacheRevalidationWindow)
+
+	for i := 1; i <= 3; i++ {
+		if reply := sieveProxyAuthReply(t, proxyAddr, account.Email, fmt.Sprintf("guess-%d", i)); !strings.HasPrefix(reply, "NO (TRYLATER)") {
+			t.Errorf("AUTHENTICATE with guess %d during a database outage: %q, want NO (TRYLATER) ...", i, reply)
+		}
+	}
+	if reply := sieveProxyAuthReply(t, proxyAddr, account.Email, account.Password); !strings.HasPrefix(reply, "NO (TRYLATER)") {
+		t.Errorf("AUTHENTICATE with the cached password after the guesses: %q, want NO (TRYLATER) (the uncounted guesses were checked against the cached login)", reply)
+	}
+	outage.End()
+
+	if reply := sieveProxyAuthReply(t, proxyAddr, account.Email, account.Password); !strings.HasPrefix(reply, "OK") {
+		t.Errorf("AUTHENTICATE after the outage: %q, want OK (the guesses were counted as failed logins)", reply)
 	}
 }

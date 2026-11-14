@@ -3,10 +3,13 @@
 package pop3proxy_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/migadu/sora/server/pop3proxy"
 )
 
 // pop3ProxyPassReply sends USER and PASS on a fresh connection and returns the reply to PASS.
@@ -58,5 +61,45 @@ func TestPOP3ProxyLoginDuringDatabaseOutage(t *testing.T) {
 
 	if reply := pop3ProxyPassReply(t, proxyAddr, account.Email, account.Password); !strings.HasPrefix(reply, "+OK") {
 		t.Errorf("PASS after the outage: %q, want +OK (the outage was counted as failed logins)", reply)
+	}
+}
+
+// TestPOP3ProxyDatabaseOutageDropsCachedLogin: a password that misses a cached login
+// older than positive_revalidation_window goes to the database. During an outage that
+// gives no verdict, so the attempt is answered -ERR [SYS/TEMP] and is not counted in the
+// auth rate limiter. The cached login must go with it, or the cached password still signs
+// in and every guess during the outage is checked against it, unseen by the rate limiter,
+// until the entry expires. Once the database is back the user logs in: the guesses were
+// not counted.
+func TestPOP3ProxyDatabaseOutageDropsCachedLogin(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	backend, account := common.SetupPOP3ServerWithMaster(t)
+	defer backend.Close()
+
+	rdb, outage := common.SetupTestDatabaseWithOutage(t)
+	proxyAddr := common.GetRandomAddress(t)
+	proxy := setupPOP3ProxyWithRateLimiting(t, rdb, proxyAddr, []string{backend.Address}, common.DBOutageAuthRateLimit(),
+		func(o *pop3proxy.POP3ProxyServerOptions) { o.LookupCache = common.RevalidatingLookupCache() })
+	defer proxy.Close()
+
+	if reply := pop3ProxyPassReply(t, proxyAddr, account.Email, account.Password); !strings.HasPrefix(reply, "+OK") {
+		t.Fatalf("PASS before the outage: %q, want +OK", reply)
+	}
+	outage.Begin()
+	time.Sleep(2 * common.LookupCacheRevalidationWindow)
+
+	for i := 1; i <= 3; i++ {
+		if reply := pop3ProxyPassReply(t, proxyAddr, account.Email, fmt.Sprintf("guess-%d", i)); !strings.HasPrefix(reply, "-ERR [SYS/TEMP]") {
+			t.Errorf("PASS with guess %d during a database outage: %q, want -ERR [SYS/TEMP] ...", i, reply)
+		}
+	}
+	if reply := pop3ProxyPassReply(t, proxyAddr, account.Email, account.Password); !strings.HasPrefix(reply, "-ERR [SYS/TEMP]") {
+		t.Errorf("PASS with the cached password after the guesses: %q, want -ERR [SYS/TEMP] (the uncounted guesses were checked against the cached login)", reply)
+	}
+	outage.End()
+
+	if reply := pop3ProxyPassReply(t, proxyAddr, account.Email, account.Password); !strings.HasPrefix(reply, "+OK") {
+		t.Errorf("PASS after the outage: %q, want +OK (the guesses were counted as failed logins)", reply)
 	}
 }
