@@ -145,19 +145,18 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 		s.DebugLog("failed to parse address", "error", err)
 		// Track invalid address format as client error
 		metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "invalid_address", "client_error").Inc()
-		// Record and count it: an unparseable address was an unmetered
-		// authentication attempt, and it is the path a non-address master SASL
-		// username takes when it falls through to here (sasl.go section 2), which
-		// must be accounted for exactly like any other failed attempt.
+		// A failed login like any other: recorded, counted and answered exactly
+		// like a wrong password. A master SASL self-login (authorization identity
+		// = authentication identity = a non-address master SASL username) falls
+		// through to here with any password but the master SASL one, which
+		// sasl.go section 2 answers with authFailedError(), so a different reply
+		// or count here confirms a guessed master SASL password. It holds for
+		// every username, or the reply would single out the master SASL one.
 		metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 		if s.server.authLimiter != nil {
 			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 		}
-		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeAuthenticationFailed,
-			Text: "Address not in the correct format",
-		}
+		return authFailedError()
 	}
 
 	// The account the session is for, and how it was authenticated. Both branches
