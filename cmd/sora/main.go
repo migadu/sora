@@ -16,7 +16,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/affinitycache"
 	"github.com/migadu/sora/authcache"
 	"github.com/migadu/sora/cache"
@@ -333,30 +332,10 @@ func main() {
 	}
 }
 
-// dropUndefinedDatabaseEndpoints unsets the [database.write] and [database.read]
-// endpoints the config file does not define, so a node without them (a proxy) runs
-// without a database. NewDefaultConfig seeds both endpoints only so that a table in the
-// file takes the defaults for the keys it leaves out. Whether a table is in the file is
-// read from the TOML metadata, never from its values: a table that names localhost,
-// postgres and sora_mail_db is a database the node must use.
-func dropUndefinedDatabaseEndpoints(cfg *config.Config, md toml.MetaData) {
-	if !md.IsDefined("database", "write") {
-		cfg.Database.Write = nil
-	}
-	if !md.IsDefined("database", "read") {
-		cfg.Database.Read = nil
-	}
-}
-
-// readConfigFile reads the config file for start-up and for a reload alike: the
-// defaults, the file over them, and no database endpoint the file leaves out. Reading
-// both the same way is what lets a reload compare the two configs key by key. On an
-// error it returns what it has, which start-up uses when the default config.toml is
-// missing.
+// readConfigFile reads the config file identically for startup and reload.
 func readConfigFile(configPath string) (config.Config, error) {
-	cfg := config.NewDefaultConfig()
-	md, err := config.LoadConfigFromFileWithMetadata(configPath, &cfg)
-	dropUndefinedDatabaseEndpoints(&cfg, md)
+	var cfg config.Config
+	err := config.LoadServerConfig(configPath, &cfg)
 	return cfg, err
 }
 
