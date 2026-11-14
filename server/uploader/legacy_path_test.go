@@ -137,3 +137,88 @@ func TestCheckLegacyStagingSymlinkCycleWithoutBodies(t *testing.T) {
 		t.Errorf("empty legacy spool with a symlink cycle: %v", err)
 	}
 }
+
+func TestCheckLegacyStagingSharedSymlinkTarget(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+
+	t.Run("legacy symlinked to active default", func(t *testing.T) {
+		root := t.TempDir()
+		newDefault := filepath.Join(root, "spool", "uploads")
+		legacy := filepath.Join(root, "tmp", "uploads")
+		if err := os.MkdirAll(filepath.Join(newDefault, "42"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(newDefault, "42", hash), []byte("live"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(newDefault, legacy); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckLegacyStaging(newDefault, newDefault, legacy); err != nil {
+			t.Fatalf("legacy compatibility symlink to active spool refused startup: %v", err)
+		}
+	})
+
+	t.Run("active default symlinked to legacy or shared persistent target", func(t *testing.T) {
+		root := t.TempDir()
+		persistent := filepath.Join(root, "data", "uploads")
+		newDefault := filepath.Join(root, "spool", "uploads")
+		legacy := filepath.Join(root, "tmp", "uploads")
+		if err := os.MkdirAll(filepath.Join(persistent, "42"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(persistent, "42", hash), []byte("live"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, link := range []string{newDefault, legacy} {
+			if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(persistent, link); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := CheckLegacyStaging(newDefault, newDefault, legacy); err != nil {
+			t.Fatalf("active and legacy spool sharing symlink target refused startup: %v", err)
+		}
+	})
+
+	t.Run("nested account symlinks", func(t *testing.T) {
+		root := t.TempDir()
+		persistent := filepath.Join(root, "data", "42")
+		newDefault := filepath.Join(root, "spool", "uploads")
+		legacy := filepath.Join(root, "tmp", "uploads")
+		if err := os.MkdirAll(persistent, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(persistent, hash), []byte("live"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(newDefault, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(legacy, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(persistent, filepath.Join(newDefault, "42")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(persistent, filepath.Join(legacy, "42")); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckLegacyStaging(newDefault, newDefault, legacy); err != nil {
+			t.Fatalf("same account directory reachable under both spools refused startup: %v", err)
+		}
+
+		// A second account under legacy pointing at persistent while missing under newDefault IS stranded.
+		if err := os.Symlink(persistent, filepath.Join(legacy, "99")); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckLegacyStaging(newDefault, newDefault, legacy); err == nil {
+			t.Fatal("legacy account 99 missing under active spool was not refused")
+		}
+	})
+}
