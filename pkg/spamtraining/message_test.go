@@ -142,6 +142,34 @@ Content-Type: multipart/mixed; boundary="outer"
 
 ` + pdfPart
 
+// brokenNested holds a well-formed text part next to two nested multiparts
+// that do not parse, one without a boundary parameter and one without its
+// close delimiter. The old code never descended into either, so they cannot
+// be allowed to fail the whole message: the caller would then send the
+// original, attachment included.
+const brokenNested = `From: a@example.org
+To: user@example.com
+Subject: test
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="outer"
+
+--outer
+Content-Type: multipart/alternative
+
+junk
+--outer
+Content-Type: multipart/alternative; boundary="inner"
+
+--inner
+Content-Type: text/html
+
+<p>cut off</p>
+--outer
+Content-Type: text/plain
+
+hello
+` + pdfPart
+
 func TestStripAttachments(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -186,6 +214,12 @@ func TestStripAttachments(t *testing.T) {
 			msg:       crlf(digestOfMessages),
 			wantTypes: []string{"text/plain"},
 			wantTexts: []string{"[No text content - attachments stripped for spam training]\n"},
+		},
+		{
+			name:      "nested multipart that does not parse is dropped",
+			msg:       crlf(brokenNested),
+			wantTypes: []string{"multipart/mixed", "text/plain"},
+			wantTexts: []string{"hello"},
 		},
 	}
 	for _, tt := range tests {

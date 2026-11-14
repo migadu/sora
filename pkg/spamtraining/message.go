@@ -71,7 +71,8 @@ func partType(header textproto.Header, inDigest bool) (string, map[string]string
 // writeTextParts writes the entity to w if it is a text/plain or text/html
 // part, or a multipart holding one at any depth, with every other part left
 // out. It reports whether anything was written; when nothing was, w is left
-// as it was.
+// as it was. On an error w may hold part of the entity, which the caller
+// truncates.
 func writeTextParts(w *bytes.Buffer, header textproto.Header, body io.Reader, inDigest bool, depth int) (bool, error) {
 	mediaType, params := partType(header, inDigest)
 	switch {
@@ -113,11 +114,12 @@ func writeTextParts(w *bytes.Buffer, header textproto.Header, body io.Reader, in
 			w.WriteString("\r\n")
 		}
 		w.WriteString("--" + boundary + "\r\n")
+		// A part that does not parse, such as a nested multipart without a
+		// boundary or without its close delimiter, is left out like any
+		// part without text, as it was before the walk descended. If it is
+		// this multipart's own stream that broke, the next NextPart says so.
 		ok, err := writeTextParts(w, part.Header, part, mediaType == "multipart/digest", depth+1)
-		if err != nil {
-			return false, err
-		}
-		if ok {
+		if ok && err == nil {
 			kept = true
 		} else {
 			w.Truncate(mark)
