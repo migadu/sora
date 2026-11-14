@@ -16,6 +16,7 @@ import (
 	imap "github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/circuitbreaker"
 )
 
 // TestDatabaseBreakerIsSuccessful pins down which errors the database circuit breakers
@@ -122,4 +123,35 @@ func dialClosedPort(t *testing.T) error {
 		t.Fatalf("dial %s: %T %v, want *pgconn.ConnectError", addr, err, err)
 	}
 	return err
+}
+
+// TestWriteBreakerErrorLogLevel pins which write errors are logged at WARN: retryable
+// ones (a deadlock or serialization failure that is retried, a connection timeout) and
+// the database failing while the breaker is not CLOSED. Deadlocks do not count against
+// the breaker, but they still have to be visible to operators.
+func TestWriteBreakerErrorLogLevel(t *testing.T) {
+	rd := &ResilientDatabase{}
+	tests := []struct {
+		name  string
+		err   error
+		state circuitbreaker.State
+		warn  bool
+	}{
+		{"deadlock", &pgconn.PgError{Code: "40P01"}, circuitbreaker.StateClosed, true},
+		{"serialization failure", fmt.Errorf("insert failed: %w", &pgconn.PgError{Code: "40001"}), circuitbreaker.StateClosed, true},
+		{"pgbouncer connection error", &pgconn.PgError{Code: "08P01"}, circuitbreaker.StateClosed, true},
+		{"admin shutdown, breaker half-open", &pgconn.PgError{Code: "57P01"}, circuitbreaker.StateHalfOpen, true},
+		{"breaker open", circuitbreaker.ErrCircuitBreakerOpen, circuitbreaker.StateOpen, true},
+		{"rejected request", db.ErrCannotDeletePrimaryCredential, circuitbreaker.StateClosed, false},
+		{"rejected request, breaker half-open", db.ErrAccountAlreadyDeleted, circuitbreaker.StateHalfOpen, false},
+		{"not found", consts.ErrUserNotFound, circuitbreaker.StateClosed, false},
+		{"constraint violation", &pgconn.PgError{Code: "23505"}, circuitbreaker.StateClosed, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := rd.logsWriteErrorAtWarn(tt.err, tt.state); got != tt.warn {
+				t.Errorf("WARN for %v with breaker %s: %v, want %v", tt.err, tt.state, got, tt.warn)
+			}
+		})
+	}
 }

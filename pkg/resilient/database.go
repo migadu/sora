@@ -518,6 +518,15 @@ func (rd *ResilientDatabase) isRetryableError(err error) bool {
 	return false
 }
 
+// logsWriteErrorAtWarn reports whether an error from a write through the breaker is
+// logged at WARN: a retryable error (a deadlock or serialization failure, which is retried
+// and does not count against the breaker, or a connection timeout), or the database
+// failing while the breaker is not CLOSED. Anything else, such as a rejected request or a
+// not-found, is logged at DEBUG.
+func (rd *ResilientDatabase) logsWriteErrorAtWarn(err error, state circuitbreaker.State) bool {
+	return rd.isRetryableError(err) || (isDatabaseFailure(err) && state != circuitbreaker.StateClosed)
+}
+
 func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	// Determine if this should go to write or read pools
 	var pool *pgxpool.Pool
@@ -660,9 +669,7 @@ func (rd *ResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions pgx
 			state := rd.writeBreaker.State()
 			counts := rd.writeBreaker.Counts()
 
-			// Log at WARN only for system failures or when breaker is not CLOSED
-			// Errors that are not database failures log at DEBUG to reduce noise
-			if isDatabaseFailure(cbErr) && (rd.isRetryableError(cbErr) || state != circuitbreaker.StateClosed) {
+			if rd.logsWriteErrorAtWarn(cbErr, state) {
 				logger.Warn("Write operation failed through circuit breaker", "component", "RESILIENT-FAILOVER",
 					"error", cbErr, "breaker_state", state, "total_failures", counts.TotalFailures,
 					"total_requests", counts.Requests, "consecutive_failures", counts.ConsecutiveFailures)

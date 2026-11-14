@@ -10,7 +10,6 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
-	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/retry"
 )
 
@@ -677,15 +676,10 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 		})
 		if cbErr != nil {
 			// Log circuit breaker state to understand failure patterns.
-			// Only log at Warn for actual system failures (retryable errors like deadlocks,
-			// connection issues). Business logic errors (ErrNoRows, ErrMailboxNotFound, etc.)
-			// are expected and should not produce noisy Warn logs.
 			state := rd.writeBreaker.State()
 			counts := rd.writeBreaker.Counts()
 
-			// Log at WARN only for system failures or when breaker is not CLOSED
-			// Errors that are not database failures log at DEBUG to reduce noise
-			if isDatabaseFailure(cbErr) && (rd.isRetryableError(cbErr) || state != circuitbreaker.StateClosed) {
+			if rd.logsWriteErrorAtWarn(cbErr, state) {
 				logger.Warn("Write transaction operation failed through circuit breaker", "component", "RESILIENT-FAILOVER",
 					"error", cbErr, "breaker_state", state, "total_failures", counts.TotalFailures,
 					"total_requests", counts.Requests, "consecutive_failures", counts.ConsecutiveFailures)
