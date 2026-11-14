@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -170,9 +171,36 @@ func TestPurgeAllRacingWritesLeavesNoUnindexedFile(t *testing.T) {
 	err := c.PurgeAll(ctx)
 	close(stop)
 	wg.Wait()
-	require.NoError(t, err)
+	if err != nil {
+		// A writer can make a directory nonempty again while RemoveAll walks it.
+		// PurgeAll reports the incomplete removal and indexes what remains.
+		require.ErrorIs(t, err, syscall.ENOTEMPTY)
+	}
 
 	assert.Empty(t, unindexedFiles(t, c), "a write racing PurgeAll left a file without its index row")
+}
+
+// A failed filesystem removal must be reported, and the bodies it leaves behind
+// must remain covered by the index so capacity eviction can retry them later.
+func TestPurgeAllKeepsFailedRemovalsIndexed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root removes files from read-only directories")
+	}
+	c, _ := newTestCache(t, 262144, 512)
+	data, hash := randomDataAndHash(t, 10)
+	require.NoError(t, c.Put(hash, data))
+	path := c.GetPathForContentHash(hash)
+	dir := filepath.Dir(path)
+	require.NoError(t, os.Chmod(dir, 0555))
+	t.Cleanup(func() { os.Chmod(dir, 0755) })
+
+	require.Error(t, c.PurgeAll(context.Background()))
+	assert.FileExists(t, path)
+	assert.Empty(t, unindexedFiles(t, c), "the failed removal left a body outside the capacity accounting")
+
+	require.NoError(t, os.Chmod(dir, 0755))
+	require.NoError(t, c.PurgeAll(context.Background()))
+	assert.NoFileExists(t, path)
 }
 
 // A crash between a write's rename and its index insert leaves a file without a row; one

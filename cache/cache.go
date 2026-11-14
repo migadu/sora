@@ -795,19 +795,31 @@ func (c *Cache) PurgeAll(ctx context.Context) error {
 
 	dataDir := filepath.Join(c.basePath, DataDir)
 	entries, err := os.ReadDir(dataDir)
-	if err == nil {
+	if err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("failed to read cache data directory: %w", err))
+	} else if err == nil {
 		for _, entry := range entries {
 			if entry.IsDir() && len(entry.Name()) == 2 {
 				fullPath := filepath.Join(dataDir, entry.Name())
 				if err := os.RemoveAll(fullPath); err != nil {
 					logger.Error("Cache: Failed to remove directory during PurgeAll", "path", fullPath, "error", err)
+					errs = append(errs, fmt.Errorf("failed to remove cache directory %s: %w", fullPath, err))
+					// The index was cleared first to cover racing writers. If removing a
+					// shard only partly succeeded, put its remaining bodies back into the
+					// index now rather than waiting for its next periodic sweep.
+					hi, lo := hexCharToByte(entry.Name()[0]), hexCharToByte(entry.Name()[1])
+					if hi < 16 && lo < 16 {
+						if err := c.sweepShardFiles(ctx, int(hi<<4|lo)); err != nil {
+							errs = append(errs, fmt.Errorf("failed to re-index cache directory %s: %w", fullPath, err))
+						}
+					}
 				}
 			}
 		}
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("failed to clear cache index, encountered %d errors", len(errs))
+		return fmt.Errorf("failed to purge cache, encountered %d errors: %w", len(errs), errors.Join(errs...))
 	}
 
 	logger.Info("Cache: PurgeAll completed")
