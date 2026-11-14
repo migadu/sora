@@ -752,7 +752,7 @@ smtp_use_starttls = true                          # Use STARTTLS (ports 587, 25)
 
 [relay.queue]
 path = "/var/spool/sora/relay"                                    # Base path for queue storage (default: /var/spool/sora/relay)
-worker_interval = "1m"                                            # How often worker processes queue (default: 1m)
+worker_interval = "1m"                                            # How often worker processes queue (default: 1m; must be positive)
 batch_size = 100                                                  # Number of messages to process per worker cycle (default: 100)
 concurrency = 5                                                   # Number of concurrent messages to process (default: 5)
 max_attempts = 10                                                 # Maximum delivery attempts before moving to failed (default: 10)
@@ -774,7 +774,8 @@ circuit_breaker_max_requests = 3                                  # Max requests
 failed_retention = "168h"                                         # How long to retain failed messages before deletion (default: 168h = 7 days)
                                                                   # Messages older than this are automatically deleted
                                                                   # Accepted formats: "24h", "7d", "168h"
-                                                                  # Special value: "0" = disable cleanup (keep failed messages forever)
+                                                                  # Special value: "0" = disable cleanup (keep failed messages until
+                                                                  # deleted or requeued with sora-admin relay); negative stops startup
 cleanup_interval = "1h"                                           # How often to run cleanup of old failed messages (default: 1h)
                                                                   # More frequent cleanup = less disk space used
                                                                   # Less frequent cleanup = lower I/O overhead

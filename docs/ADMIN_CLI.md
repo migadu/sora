@@ -930,7 +930,7 @@ metadata file and a `<id>.msg` body in one of `pending/`, `processing/` or `fail
 
 | Subcommand | Flags | What it does |
 |---|---|---|
-| `stats` | | Counts messages in each queue. |
+| `stats` | | Counts messages in each queue. Reports a queue the server has not created yet, and does not create it. |
 | `list` | `--queue` (default `pending`), `--limit` (default `100`) | Lists messages: ID, type, sender, recipient, attempts, queued time, next retry. |
 | `show` | `--id` (required), `--queue` (default `pending`) | Prints a message's metadata, error history and body. |
 | `delete` | `--id` (required; `all` for every message), `--queue` (default `failed`), `--confirm` (required) | Deletes the message files. No undo. |
