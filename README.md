@@ -394,8 +394,9 @@ Manage multiple credentials per account:
 ./sora-admin health --config config.toml
 ./sora-admin health --config config.toml --detailed
 
-# View authentication statistics
-./sora-admin stats auth --config config.toml --window 24h
+# List addresses blocked by the authentication rate limiters
+./sora-admin stats blocked --config config.toml
+./sora-admin stats blocked --config config.toml --protocol imap_proxy
 
 # Kick connections
 ./sora-admin connections kick --config config.toml --user user@example.com

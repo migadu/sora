@@ -728,7 +728,7 @@ Get list of failed S3 uploads.
 
 ### Authentication Statistics
 
-Failed logins are tracked in memory by each server's authentication rate limiter, per address, and expire on their own. The API exposes the addresses those limiters currently block; attempt counts are exported as the Prometheus counter `sora_authentication_attempts_total`.
+Failed logins are tracked in memory by each server's authentication rate limiter, per address, and expire on their own. The API exposes the addresses those limiters currently block. IMAP, POP3 and ManageSieve attempt counts (servers and proxies) are exported as the Prometheus counter `sora_authentication_attempts_total`; User API logins are not counted there.
 
 #### Get Authentication Statistics
 
@@ -1262,7 +1262,7 @@ The Admin API implements rate limiting based on authentication attempts and API 
 
 4. **Rotate API keys periodically**
 
-5. **Monitor authentication statistics** for suspicious activity
+5. **Monitor blocked addresses** ([`GET /admin/auth/blocked`](#list-blocked-addresses)) and the `sora_authentication_attempts_total` counter for suspicious activity
 
 ### Performance
 

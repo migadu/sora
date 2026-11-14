@@ -2424,8 +2424,9 @@ paths:
         Returns no counters. Failed logins are tracked in memory by each server's
         authentication rate limiter, per address, and expire on their own; this endpoint
         answers the same fixed description of that tracking on every call. For the
-        addresses blocked right now use GET /auth/blocked. Attempt counts are exported
-        as the Prometheus counter sora_authentication_attempts_total.
+        addresses blocked right now use GET /auth/blocked. IMAP, POP3 and ManageSieve
+        attempt counts (servers and proxies) are exported as the Prometheus counter
+        sora_authentication_attempts_total; User API logins are not counted there.
 
         Query parameters are ignored; the window parameter of older versions is still
         accepted.
