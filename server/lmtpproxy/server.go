@@ -52,10 +52,7 @@ type Server struct {
 	connTracker        *server.ConnectionTracker
 	tls                bool
 	tlsUseStartTLS     bool
-	tlsCertFile        string
-	tlsKeyFile         string
-	tlsVerify          bool
-	tlsConfig          *tls.Config // Global TLS config from TLS manager or per-server config
+	tlsConfig          *tls.Config // What the listener serves with (server.ListenerTLS); nil without tls
 	enableAffinity     bool
 	wg                 sync.WaitGroup
 	ctx                context.Context
@@ -302,9 +299,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		connManager:        connManager,
 		tls:                opts.TLS,
 		tlsUseStartTLS:     opts.TLSUseStartTLS,
-		tlsCertFile:        opts.TLSCertFile,
-		tlsKeyFile:         opts.TLSKeyFile,
-		tlsVerify:          opts.TLSVerify,
 		enableAffinity:     opts.EnableAffinity,
 		ctx:                ctx,
 		cancel:             cancel,
@@ -326,38 +320,19 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		debug:                  opts.Debug,
 	})
 
-	// Setup TLS config: Support both implicit TLS and STARTTLS
-	// 1. Per-server TLS: cert files provided (for both implicit TLS and STARTTLS)
-	// 2. Global TLS: opts.TLS=true, no cert files, global TLS config provided (for both implicit TLS and STARTTLS)
-	// 3. No TLS: opts.TLS=false
-	if opts.TLS && opts.TLSCertFile != "" && opts.TLSKeyFile != "" {
-		// Scenario 1: Per-server TLS with explicit cert files
-		cert, err := tls.LoadX509KeyPair(opts.TLSCertFile, opts.TLSKeyFile)
+	// One TLS config for implicit TLS and STARTTLS; the certificate source and
+	// tls_verify follow the rule every listener shares (server.ListenerTLS).
+	if opts.TLS {
+		tlsConfig, err := server.ListenerTLS{
+			Protocol: "LMTP proxy", Name: opts.Name,
+			CertFile: opts.TLSCertFile, KeyFile: opts.TLSKeyFile, Verify: opts.TLSVerify,
+			Global: opts.TLSConfig, ALPN: []string{"lmtp"},
+		}.Config()
 		if err != nil {
 			cancel()
-			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, err
 		}
-		clientAuth := tls.NoClientCert
-		if opts.TLSVerify {
-			clientAuth = tls.RequireAndVerifyClientCert
-		}
-
-		s.tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			ClientAuth:               clientAuth,
-			ServerName:               hostname,
-			PreferServerCipherSuites: true,
-			NextProtos:               []string{"lmtp"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-	} else if opts.TLS && opts.TLSConfig != nil {
-		// Scenario 2: Global TLS manager (works for both implicit TLS and STARTTLS)
-		s.tlsConfig = opts.TLSConfig
-	} else if opts.TLS {
-		// TLS enabled but no cert files and no global TLS config provided
-		cancel()
-		return nil, fmt.Errorf("TLS enabled for LMTP proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", opts.Name)
+		s.tlsConfig = tlsConfig
 	}
 
 	return s, nil
@@ -373,14 +348,13 @@ func (s *Server) Start() error {
 		EnableTimeoutChecker: false,
 	}
 
-	// Four TLS scenarios:
-	// 1. Per-server TLS with cert files (implicit TLS): Use static certificate with TLS listener
-	// 2. Global TLS manager (implicit TLS): Use dynamic certificate with TLS listener
-	// 3. STARTTLS mode: Use plain listener, upgrade to TLS in session after STARTTLS command
-	// 4. No TLS: Plain text listener
+	// Three TLS scenarios (New resolved the certificate source into s.tlsConfig):
+	// 1. Implicit TLS: TLS listener
+	// 2. STARTTLS mode: Use plain listener, upgrade to TLS in session after STARTTLS command
+	// 3. No TLS: Plain text listener
 
-	if s.tls && !s.tlsUseStartTLS && s.tlsCertFile != "" && s.tlsKeyFile != "" {
-		// Scenario 1: Per-server TLS with cert files (implicit TLS)
+	if s.tls && !s.tlsUseStartTLS && s.tlsConfig != nil {
+		// Scenario 1: Implicit TLS
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
 		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
@@ -388,25 +362,12 @@ func (s *Server) Start() error {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
 		}
-		logger.Debug("LMTP Proxy: Using listen backlog with per-server TLS (implicit)", "proxy", s.name, "backlog", s.listenBacklog)
+		logger.Debug("LMTP Proxy: Using listen backlog with implicit TLS", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use SoraTLSListener for implicit TLS with JA4 capture
 		s.listener = server.NewSoraTLSListener(s.wrapProxyProtocol(tcpListener), s.tlsConfig, connConfig)
 		s.listenerMu.Unlock()
-	} else if s.tls && !s.tlsUseStartTLS && s.tlsConfig != nil {
-		// Scenario 2: Global TLS manager (implicit TLS)
-		s.listenerMu.Lock()
-		// Create base TCP listener with custom backlog
-		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-		if err != nil {
-			s.listenerMu.Unlock()
-			return fmt.Errorf("failed to start TCP listener: %w", err)
-		}
-		logger.Debug("LMTP Proxy: Using listen backlog with global TLS manager (implicit)", "proxy", s.name, "backlog", s.listenBacklog)
-		// Use SoraTLSListener with global TLS config for implicit TLS
-		s.listener = server.NewSoraTLSListener(s.wrapProxyProtocol(tcpListener), s.tlsConfig, connConfig)
-		s.listenerMu.Unlock()
 	} else if s.tls && s.tlsUseStartTLS {
-		// Scenario 3: STARTTLS mode - plain listener, TLS upgrade happens in session
+		// Scenario 2: STARTTLS mode - plain listener, TLS upgrade happens in session
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
 		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
@@ -423,7 +384,7 @@ func (s *Server) Start() error {
 		s.cancel()
 		return fmt.Errorf("TLS enabled for LMTP proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", s.name)
 	} else {
-		// Scenario 4: No TLS - plain text listener
+		// Scenario 3: No TLS - plain text listener
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
 		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)

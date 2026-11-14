@@ -395,38 +395,19 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		debug:                  options.Debug,
 	})
 
-	// Setup TLS: Three scenarios
-	// 1. Per-server TLS: cert files provided
-	// 2. Global TLS: options.TLS=true, no cert files, global TLS config provided
-	// 3. No TLS: options.TLS=false
-	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
-		// Scenario 1: Per-server TLS with explicit cert files
-		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
+	// The certificate source and tls_verify follow the rule every listener
+	// shares (server.ListenerTLS).
+	if options.TLS {
+		tlsConfig, err := server.ListenerTLS{
+			Protocol: "POP3 proxy", Name: options.Name,
+			CertFile: options.TLSCertFile, KeyFile: options.TLSKeyFile, Verify: options.TLSVerify,
+			Global: options.TLSConfig, ALPN: []string{"pop3"},
+		}.Config()
 		if err != nil {
 			serverCancel()
-			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, err
 		}
-		clientAuth := tls.NoClientCert
-		if options.TLSVerify {
-			clientAuth = tls.RequireAndVerifyClientCert
-		}
-
-		srv.tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			ClientAuth:               clientAuth,
-			ServerName:               hostname,
-			PreferServerCipherSuites: true,
-			NextProtos:               []string{"pop3"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-	} else if options.TLS && options.TLSConfig != nil {
-		// Scenario 2: Global TLS manager
-		srv.tlsConfig = options.TLSConfig
-	} else if options.TLS {
-		// TLS enabled but no cert files and no global TLS config provided
-		serverCancel()
-		return nil, fmt.Errorf("TLS enabled for POP3 proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", options.Name)
+		srv.tlsConfig = tlsConfig
 	}
 
 	srv.pop3libServer.Store(srv.buildLibServer())
