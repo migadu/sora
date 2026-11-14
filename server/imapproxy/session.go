@@ -1168,6 +1168,20 @@ func (s *Session) authenticateUser(username, password string) error {
 					metrics.RemoteLookupResult.WithLabelValues("imap", "user_not_found_fallback").Inc()
 					// Fallthrough to main DB auth
 				} else {
+					// The lookup service never sees the password. A wrong password for an
+					// address it knows is refused after a verification against the returned
+					// hash, and the refusal is cached (AuthFailed above). Refuse this one
+					// the same way, or the response time to the login and to its repeat
+					// shows which addresses the service knows. A master login checks no
+					// hash for a known address, so it spends none here either.
+					if !masterAuthValidated {
+						db.DummyVerifyPassword(password)
+					}
+					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+						PasswordDigest: lookupcache.NewPasswordDigest(password),
+						Result:         lookupcache.AuthUserNotFound,
+						IsNegative:     true,
+					})
 					s.InfoLog("user not found in remotelookup, local lookup disabled - rejecting")
 					metrics.RemoteLookupResult.WithLabelValues("imap", "user_not_found_rejected").Inc()
 					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
