@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,7 +13,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/storage"
@@ -139,6 +139,7 @@ type verificationResult struct {
 	MissingFromS3 []string
 	OrphanedInS3  []string
 	CorruptInS3   []string
+	LegacySHA256  []string // intact bodies stored under their SHA-256 digest by an older import
 	CheckedDBToS3 int
 	CheckedS3ToDB int
 	FixedOrphaned int
@@ -207,6 +208,9 @@ func verifyS3Storage(ctx context.Context, cfg AdminConfig, email string, showMis
 	if len(result.CorruptInS3) > 0 {
 		fmt.Printf("  [FAIL] %d corrupt/unreadable in S3\n", len(result.CorruptInS3))
 	}
+	if len(result.LegacySHA256) > 0 {
+		fmt.Printf("  [WARN] %d intact but stored under their SHA-256 digest\n", len(result.LegacySHA256))
+	}
 	fmt.Println()
 
 	// Phase 2: Check S3 → DB (objects exist in DB)
@@ -233,7 +237,12 @@ func verifyS3Storage(ctx context.Context, cfg AdminConfig, email string, showMis
 	printVerificationSummary(result, showMissing, dryRun, fixOrphaned, fixMissing, startTime)
 
 	// Exit with error code if issues found
-	if len(result.MissingFromS3) > 0 || len(result.OrphanedInS3) > 0 || len(result.CorruptInS3) > 0 {
+	if len(result.MissingFromS3) > 0 || len(result.OrphanedInS3) > 0 || len(result.CorruptInS3) > 0 || len(result.LegacySHA256) > 0 {
+		if len(result.LegacySHA256) > 0 {
+			fmt.Printf("\n[WARN] %d object(s) are intact but stored under their SHA-256 digest by an older\n", len(result.LegacySHA256))
+			fmt.Printf("   'import maildir'. Move them to their BLAKE3 key with:\n")
+			fmt.Printf("   sora-admin import rekey --email %s\n", email)
+		}
 		if len(result.CorruptInS3) > 0 {
 			fmt.Printf("\n[WARN] %d object(s) exist on HEAD but their bodies are unreadable — this is provider-side\n", len(result.CorruptInS3))
 			fmt.Printf("   data loss, not a Sora inconsistency. Restore from backup or expunge; --fix-missing\n")
@@ -292,7 +301,9 @@ func checkDBToS3(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storag
 			// timeout bounds each attempt so dead objects fail fast.
 			if deep {
 				expectedHash := hashFromS3Key(msg.S3Key)
-				if _, err := verifyS3Content(s3Storage, msg.S3Key, expectedHash); err != nil {
+				if _, err := verifyS3Content(s3Storage, msg.S3Key, expectedHash); errors.Is(err, errLegacySHA256Key) {
+					result.LegacySHA256 = append(result.LegacySHA256, msg.S3Key)
+				} else if err != nil {
 					result.CorruptInS3 = append(result.CorruptInS3, msg.S3Key)
 				}
 			}
@@ -424,6 +435,9 @@ func printVerificationSummary(result *verificationResult, showMissing, dryRun, f
 	if len(result.CorruptInS3) > 0 {
 		fmt.Printf("  Corrupt/unreadable:    %d\n", len(result.CorruptInS3))
 	}
+	if len(result.LegacySHA256) > 0 {
+		fmt.Printf("  Under SHA-256 key:     %d\n", len(result.LegacySHA256))
+	}
 
 	if fixOrphaned || fixMissing {
 		if dryRun {
@@ -469,6 +483,13 @@ func printVerificationSummary(result *verificationResult, showMissing, dryRun, f
 		if len(result.CorruptInS3) > 0 {
 			fmt.Printf("\nCorrupt/unreadable in S3 (exist on HEAD, body unreadable — likely provider-side data loss):\n")
 			for _, key := range result.CorruptInS3 {
+				fmt.Printf("  - %s\n", key)
+			}
+		}
+
+		if len(result.LegacySHA256) > 0 {
+			fmt.Printf("\nIntact, stored under their SHA-256 digest (re-key with 'sora-admin import rekey'):\n")
+			for _, key := range result.LegacySHA256 {
 				fmt.Printf("  - %s\n", key)
 			}
 		}
@@ -537,30 +558,32 @@ func downloadS3ObjectDecrypted(s3Storage *storage.S3Storage, s3Key, destPath str
 	return nil
 }
 
+// errLegacySHA256Key reports an intact body stored under its SHA-256 digest by an older
+// `import maildir`, which `import rekey` moves to its BLAKE3 key.
+var errLegacySHA256Key = errors.New("content is intact but stored under its SHA-256 digest by an older import; re-key it with 'sora-admin import rekey'")
+
 // verifyS3Content downloads the full object body, decrypts it (storage.Get
 // handles decryption transparently when client-side encryption is enabled),
 // and verifies that the BLAKE3 hash of the content matches the expected hash
 // embedded in the S3 key. It returns the decrypted size and an error if the
 // body cannot be fully read (truncation → "unexpected EOF"), decryption fails
 // (GCM auth failure on a corrupt tail), or the recomputed hash does not match.
-// It does not print — callers decide what to report.
-func verifyS3Content(s3Storage *storage.S3Storage, s3Key, expectedHash string) (int, error) {
-	reader, err := s3Storage.Get(s3Key)
+// A body whose SHA-256 digest matches instead is intact: the error is then
+// errLegacySHA256Key. It does not print — callers decide what to report.
+func verifyS3Content(s3Storage objectStorage, s3Key, expectedHash string) (int, error) {
+	content, err := readStoredBody(s3Storage, s3Key)
 	if err != nil {
-		return 0, fmt.Errorf("download/decrypt failed: %w", err)
-	}
-	defer reader.Close()
-
-	content, err := io.ReadAll(reader)
-	if err != nil {
-		return 0, fmt.Errorf("read failed: %w", err)
+		return 0, err
 	}
 
-	actualHash := helpers.HashContent(content)
-	if actualHash != expectedHash {
+	switch kind, actualHash := classifyStoredBody(content, expectedHash); kind {
+	case storedBodyBLAKE3:
+		return len(content), nil
+	case storedBodyLegacySHA256:
+		return len(content), errLegacySHA256Key
+	default:
 		return len(content), fmt.Errorf("BLAKE3 mismatch: content hashes to %s (object is corrupt)", actualHash)
 	}
-	return len(content), nil
 }
 
 func handleVerifyHash(ctx context.Context) {
@@ -701,6 +724,8 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 	// re-hash) succeeded. It stays true when the object is absent so the
 	// existing "missing" branches in the summary remain authoritative.
 	contentIntact := true
+	// legacyKey is set when the body is intact but stored under its SHA-256 digest.
+	legacyKey := false
 
 	if !exists {
 		fmt.Printf("[FAIL] Content MISSING from S3\n")
@@ -715,7 +740,10 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 		// upload) pass HEAD but fail on GET with a short read, decryption
 		// failure, or hash mismatch — this is the check that actually catches
 		// the "unexpected EOF" failures seen when fetching messages.
-		if size, err := verifyS3Content(s3Storage, s3Key, hash); err != nil {
+		if size, err := verifyS3Content(s3Storage, s3Key, hash); errors.Is(err, errLegacySHA256Key) {
+			legacyKey = true
+			fmt.Printf("  [WARN] Content verified: %d bytes downloaded and decrypted, but they match the key's SHA-256, not BLAKE3\n", size)
+		} else if err != nil {
 			contentIntact = false
 			fmt.Printf("  [FAIL] Content verification FAILED: %v\n", err)
 		} else {
@@ -746,14 +774,14 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 	// unreachable, so a storage-only node can still verify object integrity.
 	if skipDB {
 		fmt.Printf("\nDatabase cross-reference skipped (--skip-db).\n")
-		printS3OnlySummary(exists, contentIntact)
+		printS3OnlySummary(exists, contentIntact, legacyKey, email)
 		return nil
 	}
 
 	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		fmt.Printf("\n[WARN] Database unavailable, skipping message cross-reference: %v\n", err)
-		printS3OnlySummary(exists, contentIntact)
+		printS3OnlySummary(exists, contentIntact, legacyKey, email)
 		return nil
 	}
 	defer rdb.Close()
@@ -830,6 +858,8 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 		fmt.Printf("  HEAD succeeds but the full body cannot be downloaded/decrypted or fails the hash check.\n")
 		fmt.Printf("  Users will get errors (e.g. \"unexpected EOF\") trying to read these messages.\n")
 		fmt.Printf("  The S3 object must be re-uploaded from the original source, or the messages deleted.\n")
+	case exists && legacyKey:
+		printLegacyKeySummary(email)
 	case liveCount == 0 && expungedCount > 0:
 		if exists {
 			fmt.Printf("[OK] Object exists in S3, referenced only by %d expunged message(s) pending cleanup\n", expungedCount)
@@ -855,11 +885,20 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 	return nil
 }
 
+// printLegacyKeySummary is the verdict for an intact body stored under its SHA-256 digest.
+func printLegacyKeySummary(email string) {
+	fmt.Printf("[WARN] The body is intact, but stored under its SHA-256 digest by an older 'import maildir'\n")
+	fmt.Printf("  Messages read fine; it does not deduplicate with other copies of the same message.\n")
+	fmt.Printf("  Move it to its BLAKE3 key with: sora-admin import rekey --email %s\n", email)
+}
+
 // printS3OnlySummary prints a verdict for the S3-only case, where no database
 // cross-reference was performed (--skip-db or DB unavailable).
-func printS3OnlySummary(exists, contentIntact bool) {
+func printS3OnlySummary(exists, contentIntact, legacyKey bool, email string) {
 	fmt.Printf("\nSummary:\n")
 	switch {
+	case exists && legacyKey:
+		printLegacyKeySummary(email)
 	case exists && contentIntact:
 		fmt.Printf("[OK] S3 object exists and its content is intact (downloaded, decrypted, BLAKE3 verified)\n")
 	case exists && !contentIntact:

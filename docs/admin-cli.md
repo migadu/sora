@@ -61,6 +61,18 @@ Tools for migrating mail data to and from the standard Maildir format. This is e
 ./sora-admin -config ... export-maildir --email user@example.com --path /path/to/export
 ```
 
+### `import rekey`
+
+Older versions of the maildir importer stored message bodies under their SHA-256 digest, where every other path uses the BLAKE3 digest. That mail reads fine, but `verify s3 --deep` and `verify hash` flag it (as stored under its SHA-256 digest), it never deduplicates with other copies, and a non-incremental re-import adds every message again. `import rekey` downloads each of an account's bodies and moves every SHA-256-keyed one to its BLAKE3 key: it writes the object under the new key, moves the message and full-text search rows, and deletes the old object once nothing references it. It is idempotent and can be resumed with `--start-after`.
+
+```bash
+# Report what would change
+./sora-admin -config ... import rekey --email user@example.com --dry-run
+
+# Re-key the account's bodies
+./sora-admin -config ... import rekey --email user@example.com
+```
+
 ### `restore`
 
 Restores soft-deleted messages for a user or the entire system. Messages are soft-deleted when expunged and are kept for the duration of the `cleanup.grace_period`.
