@@ -3,6 +3,7 @@
 package common
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -19,11 +20,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
-	"github.com/migadu/sora/pkg/spamtraining"
 	soraserver "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/imap"
 	"github.com/migadu/sora/server/lmtp"
@@ -188,15 +189,9 @@ type TestAccount struct {
 
 // IMAPServerOpts contains optional configuration for IMAP server setup
 type IMAPServerOpts struct {
-	SpamTrainingEnabled           bool
-	SpamTrainingEndpoint          string
-	SpamTrainingToken             string
-	SpamTrainingCircuitThreshold  int
-	SpamTrainingCircuitTimeout    string
-	SpamTrainingCircuitMaxRequest int
-	SearchRateLimitPerMin         int
-	SearchRateLimitWindow         time.Duration
-	SearchRateLimitBurst          int
+	SearchRateLimitPerMin int
+	SearchRateLimitWindow time.Duration
+	SearchRateLimitBurst  int
 	// SharedMailboxes replaces the default shared mailbox settings (enabled, users
 	// may create shared mailboxes and grant "anyone").
 	SharedMailboxes   *config.SharedMailboxesConfig
@@ -813,7 +808,7 @@ func SetupIMAPServerForUploadRaceWithS3(t *testing.T, s3Storage *storage.S3Stora
 	}, account
 }
 
-// SetupIMAPServerWithOptions creates an IMAP server with custom options (e.g., spam training)
+// SetupIMAPServerWithOptions creates an IMAP server with custom options (e.g., search rate limits)
 func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer, TestAccount) {
 	t.Helper()
 	if opts == nil {
@@ -866,41 +861,6 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 		testConfig.SharedMailboxes = *opts.SharedMailboxes
 	}
 
-	// Configure spam training if enabled
-	var spamTrainingClient *spamtraining.Client
-	if opts != nil && opts.SpamTrainingEnabled {
-		cfg := &config.SpamTrainingConfig{
-			Enabled:           true,
-			Endpoint:          opts.SpamTrainingEndpoint,
-			AuthToken:         opts.SpamTrainingToken,
-			Timeout:           "10s",
-			MaxMessageSize:    "10MB",
-			MaxAttachmentSize: "5MB",
-			Async:             true,
-			CircuitBreaker: config.SpamTrainingCircuitBreakerConfig{
-				Threshold:   opts.SpamTrainingCircuitThreshold,
-				Timeout:     opts.SpamTrainingCircuitTimeout,
-				MaxRequests: opts.SpamTrainingCircuitMaxRequest,
-			},
-		}
-
-		// Set defaults if not specified
-		if cfg.CircuitBreaker.Threshold == 0 {
-			cfg.CircuitBreaker.Threshold = 5
-		}
-		if cfg.CircuitBreaker.Timeout == "" {
-			cfg.CircuitBreaker.Timeout = "30s"
-		}
-		if cfg.CircuitBreaker.MaxRequests == 0 {
-			cfg.CircuitBreaker.MaxRequests = 3
-		}
-
-		spamTrainingClient, err = spamtraining.NewClient(cfg)
-		if err != nil {
-			t.Fatalf("Failed to create spam training client: %v", err)
-		}
-	}
-
 	server, err := imap.New(
 		context.Background(),
 		"test",
@@ -913,7 +873,6 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 		imap.IMAPServerOptions{
 			InsecureAuth:          true, // Allow PLAIN auth (no TLS in tests)
 			Config:                testConfig,
-			SpamTraining:          spamTrainingClient,
 			SearchRateLimitPerMin: opts.SearchRateLimitPerMin,
 			SearchRateLimitWindow: opts.SearchRateLimitWindow,
 			SearchRateLimitBurst:  opts.SearchRateLimitBurst,
@@ -2466,6 +2425,39 @@ func GetTestConfigPath(t testing.TB) string {
 		panic(err)
 	}
 	return configPath
+}
+
+// GetTestConfigPathForTestDB returns the path of a config for a sora-admin subprocess:
+// config-test.toml, rewritten into a temporary file naming SORA_TEST_DB_NAME's database
+// when that is set. The server fixtures use SORA_TEST_DB_NAME, but sora-admin reads only
+// its --config, which names sora_test_db: given that unchanged, it works in another
+// database than the test.
+func GetTestConfigPathForTestDB(t *testing.T) string {
+	t.Helper()
+	configPath := GetTestConfigPath(t)
+	name := os.Getenv("SORA_TEST_DB_NAME")
+	if name == "" {
+		return configPath
+	}
+	var settings map[string]any
+	if _, err := toml.DecodeFile(configPath, &settings); err != nil {
+		t.Fatalf("decode %s: %v", configPath, err)
+	}
+	database, _ := settings["database"].(map[string]any)
+	for _, key := range []string{"write", "read"} {
+		if endpoint, ok := database[key].(map[string]any); ok {
+			endpoint["name"] = name
+		}
+	}
+	var encoded bytes.Buffer
+	if err := toml.NewEncoder(&encoded).Encode(settings); err != nil {
+		t.Fatalf("encode test config: %v", err)
+	}
+	rewritten := filepath.Join(t.TempDir(), "config-test.toml")
+	if err := os.WriteFile(rewritten, encoded.Bytes(), 0o600); err != nil {
+		t.Fatalf("write %s: %v", rewritten, err)
+	}
+	return rewritten
 }
 
 // GetSoraAdminBinary returns the absolute path to the sora-admin binary used by

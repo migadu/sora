@@ -49,10 +49,12 @@ func (s *IMAPSession) validateSearchCriteria(command string, criteria *imap.Sear
 	}
 	metrics.ProtocolErrors.WithLabelValues("imap", command, "criteria_rejected", errorLabel).Inc()
 
+	// RFC 5530 §3: "LIMIT: The operation ran up against an implementation
+	// limit of some kind".
 	if firstErr != nil && firstErr.IsLimit {
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCode("SERVERLIMIT"),
+			Code: imap.ResponseCodeLimit,
 			Text: "Search criteria too complex",
 		}
 	}

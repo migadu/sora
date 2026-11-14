@@ -39,6 +39,7 @@ func setupTestDatabase(t testing.TB) *Database {
 // It is for tests that empty whole tables: the configured database is shared with
 // every other test package, and go test runs packages at the same time.
 func setupTestDatabaseWithSuffix(t testing.TB, suffix string) *Database {
+	skipDatabaseTestInShortMode(t)
 	ctx := context.Background()
 
 	// Find the config-test.toml file by walking up from current directory
@@ -89,6 +90,16 @@ func setupTestDatabaseWithSuffix(t testing.TB, suffix string) *Database {
 	}
 
 	return database
+}
+
+// skipDatabaseTestInShortMode skips a test that needs PostgreSQL when run with -short,
+// which is how this package's unit tests run without a database (go test -short ./db).
+// The database helpers call it, so a test using them cannot forget it.
+func skipDatabaseTestInShortMode(t testing.TB) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
 }
 
 // createTestDatabaseIfMissing creates endpoint's database, connecting to the

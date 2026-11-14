@@ -45,6 +45,11 @@ func TestDelivery_SieveScriptCompiledOncePerScriptVersion(t *testing.T) {
 	dctx := newSieveDeliveryContext(t, rdb, fake, accountID, script)
 	recipient := newSelfRecipient(t, accountID, account.Email)
 
+	// Every delivery runs the built-in default script before the user's, through the
+	// same cache: compile it first, so only the user script's compiles are counted
+	// whichever test ran before this one.
+	_, err = sieveengine.SharedScriptCache().GetOrCompile(delivery.DefaultSieveScript, sieveengine.DefaultSieveExtensions)
+	require.NoError(t, err)
 	_, missesBefore := sieveengine.SharedScriptCache().Stats()
 
 	const deliveries = 5

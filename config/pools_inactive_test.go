@@ -19,9 +19,10 @@ name = "active-imap"
 addr = ":1143"
 remote_port = 143
 [[server]]
+enabled = false
 type = "pop3_proxy"
 name = "retired-pop3"
-addr = ""
+addr = ":1110"
 `+tc.inactive)
 			if err != nil {
 				t.Fatal(err)
@@ -48,9 +49,10 @@ enabled = true
 url = "https://lookup.example.com/?email=$email"
 lookup_local_users = false
 [[server]]
+enabled = false
 type = "pop3_proxy"
 name = "retired-pop3"
-addr = ""
+addr = ":1110"
 remote_port = 110
 `)
 	if err != nil {

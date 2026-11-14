@@ -28,7 +28,7 @@ type PoolConfig struct {
 	Default bool `toml:"default"`
 
 	RemoteTLS              bool  `toml:"remote_tls"`
-	RemoteTLSUseStartTLS   bool  `toml:"remote_tls_use_starttls"` // LMTP/ManageSieve; IMAP/POP3/User API use implicit TLS
+	RemoteTLSUseStartTLS   bool  `toml:"remote_tls_use_starttls"` // IMAP/POP3/LMTP/ManageSieve; the User API proxy has no STARTTLS
 	RemoteTLSVerify        *bool `toml:"remote_tls_verify"`       // default true
 	RemoteUseProxyProtocol bool  `toml:"remote_use_proxy_protocol"`
 	RemoteUseIDCommand     bool  `toml:"remote_use_id_command"` // IMAP only
@@ -141,8 +141,8 @@ func (c *Config) ValidatePools() error {
 		}
 	}
 
-	// Match the startup path: inactive stanzas are retained in the file, but
-	// do not constrain the backend pools used by the servers that will run.
+	// Match the startup path: stanzas with enabled = false are retained in the file,
+	// but do not constrain the backend pools used by the servers that will run.
 	for _, s := range c.GetAllServers() {
 		if !strings.HasSuffix(s.Type, "_proxy") {
 			continue

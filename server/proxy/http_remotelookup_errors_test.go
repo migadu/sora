@@ -34,9 +34,36 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, `{"error": "bad request"}`, http.StatusBadRequest)
 			},
-			expectAuthResult: AuthFailed,
-			expectErrorType:  nil,
-			description:      "4xx errors (except 401/403/404) should be treated as auth failed (client error, not service failure)",
+			expectAuthResult: AuthTemporarilyUnavailable,
+			expectErrorType:  ErrRemoteLookupTransient,
+			description:      "4xx errors (except 401/403/404) say nothing about the credentials: service unavailable, as the lookup contract documents",
+		},
+		{
+			name: "408_RequestTimeout",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, `{"error": "request timeout"}`, http.StatusRequestTimeout)
+			},
+			expectAuthResult: AuthTemporarilyUnavailable,
+			expectErrorType:  ErrRemoteLookupTransient,
+			description:      "408 (RFC 9110 section 15.5.9) is the lookup service timing out, not a wrong password",
+		},
+		{
+			name: "429_TooManyRequests",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, `{"error": "slow down"}`, http.StatusTooManyRequests)
+			},
+			expectAuthResult: AuthTemporarilyUnavailable,
+			expectErrorType:  ErrRemoteLookupTransient,
+			description:      "429 (RFC 6585 section 4) is the lookup service rate-limiting this proxy, not a wrong password",
+		},
+		{
+			name: "422_UnprocessableContent",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, `{"error": "unprocessable"}`, http.StatusUnprocessableEntity)
+			},
+			expectAuthResult: AuthTemporarilyUnavailable,
+			expectErrorType:  ErrRemoteLookupTransient,
+			description:      "4xx errors (except 401/403/404) say nothing about the credentials: service unavailable, as the lookup contract documents",
 		},
 		{
 			name: "500_ServerError",
@@ -62,9 +89,9 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 				w.Write([]byte("this is not json"))
 			},
-			expectAuthResult: AuthFailed,
+			expectAuthResult: AuthTemporarilyUnavailable,
 			expectErrorType:  ErrRemoteLookupInvalidResponse,
-			description:      "200 with invalid JSON should return ErrRemoteLookupInvalidResponse",
+			description:      "200 with invalid JSON (e.g. a maintenance page) is a broken lookup service: temporary, ErrRemoteLookupInvalidResponse",
 		},
 		{
 			name: "200_MissingAddress",
@@ -76,7 +103,7 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 					// address is missing (required)
 				})
 			},
-			expectAuthResult: AuthFailed,
+			expectAuthResult: AuthTemporarilyUnavailable,
 			expectErrorType:  ErrRemoteLookupInvalidResponse,
 			description:      "200 with missing address should return ErrRemoteLookupInvalidResponse",
 		},
@@ -90,7 +117,7 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 					"server":        "backend:143",
 				})
 			},
-			expectAuthResult: AuthFailed,
+			expectAuthResult: AuthTemporarilyUnavailable,
 			expectErrorType:  ErrRemoteLookupInvalidResponse,
 			description:      "200 with empty address should return ErrRemoteLookupInvalidResponse",
 		},
@@ -104,7 +131,7 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 					// password_hash is missing
 				})
 			},
-			expectAuthResult: AuthFailed,
+			expectAuthResult: AuthTemporarilyUnavailable,
 			expectErrorType:  ErrRemoteLookupInvalidResponse,
 			description:      "200 with missing password_hash should return ErrRemoteLookupInvalidResponse",
 		},
@@ -118,9 +145,23 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 					"server":        "backend:143",
 				})
 			},
-			expectAuthResult: AuthFailed,
+			expectAuthResult: AuthTemporarilyUnavailable,
 			expectErrorType:  ErrRemoteLookupInvalidResponse,
 			description:      "200 with empty password_hash should return ErrRemoteLookupInvalidResponse",
+		},
+		{
+			name: "200_UnverifiableHashedPassword",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]any{
+					"address":       "user@example.com",
+					"password_hash": "{SHA512-CRYPT}$6$saltsaltsaltsalt$Uz0B733KLAcpeAFT5hlALRwUMzwqxSoBO9VG7Ph8v7auZDaXL8PutBQPqOVLMvwy0rORlpwlXHm83Z4uAhgLB0",
+					"server":        "backend:143",
+				})
+			},
+			expectAuthResult: AuthTemporarilyUnavailable,
+			expectErrorType:  ErrRemoteLookupInvalidResponse,
+			description:      "200 with a password_hash sora cannot verify says nothing about the password: an invalid answer, not a wrong password",
 		},
 		{
 			name: "200_MissingServerIP_AuthOnlyMode",
@@ -192,7 +233,13 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 				} else if !errors.Is(err, tt.expectErrorType) {
 					t.Errorf("%s: expected error type %v, got %v", tt.description, tt.expectErrorType, err)
 				}
-			} else if tt.expectAuthResult == AuthUserNotFound {
+			}
+			// The proxies branch on the error, not on the result: a temporary answer
+			// without ErrRemoteLookupTransient is handled by the session as something else.
+			if tt.expectAuthResult == AuthTemporarilyUnavailable && !errors.Is(err, ErrRemoteLookupTransient) {
+				t.Errorf("%s: temporary answer without ErrRemoteLookupTransient: %v", tt.description, err)
+			}
+			if tt.expectErrorType == nil && tt.expectAuthResult == AuthUserNotFound {
 				// For user not found cases, routingInfo should be nil and no error
 				if routingInfo != nil {
 					t.Errorf("%s: expected nil routing info for user not found, got %+v", tt.description, routingInfo)
@@ -244,6 +291,35 @@ func TestHTTPRemoteLookupNetworkError(t *testing.T) {
 	}
 
 	t.Logf("✓ Network error correctly returns AuthTemporarilyUnavailable with ErrRemoteLookupTransient: %v", err)
+}
+
+// TestHTTPRemoteLookupUnbuildableRequestIsUnavailable (#518): a lookup whose request
+// cannot be built gives no verdict on the user either. With $email in the host the
+// escaped address ("user%40example.com") is not a valid host, so every request fails
+// before it is sent. That was AuthFailed with an error the proxies did not classify,
+// and they fell back to the database. The startup check now rejects such a URL (#655);
+// this client is built without it.
+func TestHTTPRemoteLookupUnbuildableRequestIsUnavailable(t *testing.T) {
+	client := NewHTTPRemoteLookupClient(
+		"https://$email.lookup.example.com/lookup",
+		time.Second,
+		"",
+		143,
+		false, // remoteTLS
+		false, // remoteTLSUseStartTLS
+		false, // remoteTLSVerify
+		false, // remoteUseProxyProtocol
+		false, // remoteUseIDCommand
+		false, // remoteUseXCLIENT
+		false, // remoteUseUTF8
+		nil,   // circuit breaker settings (use defaults)
+		nil,   // transport settings (use defaults)
+	)
+
+	_, authResult, err := client.LookupUserRoute(context.Background(), "user@example.com", "secret")
+	if authResult != AuthTemporarilyUnavailable || !errors.Is(err, ErrRemoteLookupTransient) {
+		t.Fatalf("lookup with a request that cannot be built: %v, %v; want %v with ErrRemoteLookupTransient", authResult, err, AuthTemporarilyUnavailable)
+	}
 }
 
 // TestHTTPRemoteLookupCircuitBreaker verifies that circuit breaker open returns ErrRemoteLookupTransient

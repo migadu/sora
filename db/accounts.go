@@ -27,7 +27,7 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 	// Validate email address format using server.NewAddress
 	address, err := server.NewAddress(req.Email)
 	if err != nil {
-		return 0, fmt.Errorf("invalid email address: %w", err)
+		return 0, fmt.Errorf("%w: invalid email address: %w", ErrInvalidAccountRequest, err)
 	}
 
 	normalizedEmail := address.FullAddress()
@@ -44,7 +44,7 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 
 	if err == nil {
 		if deletedAt != nil {
-			return 0, fmt.Errorf("cannot create account with email %s: an account with this email is in deletion grace period", normalizedEmail)
+			return 0, fmt.Errorf("%w: cannot create account with email %s: an account with this email is in deletion grace period", consts.ErrAccountAlreadyExists, normalizedEmail)
 		}
 		return 0, fmt.Errorf("%w: account with email %s already exists", consts.ErrAccountAlreadyExists, normalizedEmail)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
@@ -54,12 +54,15 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 	// Generate password hash or use provided hash
 	var hashedPassword string
 	if req.PasswordHash != "" {
-		// Use provided hash directly
+		// Use provided hash directly, if it is one VerifyPassword can check
+		if err = ValidatePasswordHash(req.PasswordHash); err != nil {
+			return 0, fmt.Errorf("%w: %w", ErrInvalidAccountRequest, err)
+		}
 		hashedPassword = req.PasswordHash
 	} else {
 		// Generate hash from password
 		if req.Password == "" {
-			return 0, fmt.Errorf("either password or password_hash must be provided")
+			return 0, fmt.Errorf("%w: either password or password_hash must be provided", ErrInvalidAccountRequest)
 		}
 
 		switch req.HashType {
@@ -68,15 +71,13 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 			if err != nil {
 				return 0, fmt.Errorf("failed to generate SSHA512 hash: %w", err)
 			}
-		case "sha512":
-			hashedPassword = GenerateSHA512Hash(req.Password)
 		case "bcrypt":
 			hashedPassword, err = GenerateBcryptHash(req.Password)
 			if err != nil {
 				return 0, fmt.Errorf("failed to generate bcrypt hash: %w", err)
 			}
 		default:
-			return 0, fmt.Errorf("unsupported hash type: %s", req.HashType)
+			return 0, fmt.Errorf("%w: %w: %s", ErrInvalidAccountRequest, ErrUnsupportedHashType, req.HashType)
 		}
 	}
 
@@ -128,7 +129,10 @@ func (db *Database) AddCredential(ctx context.Context, tx pgx.Tx, req AddCredent
 	// Generate password hash or use provided hash
 	var hashedPassword string
 	if req.NewPasswordHash != "" {
-		// Use provided hash directly
+		// Use provided hash directly, if it is one VerifyPassword can check
+		if err = ValidatePasswordHash(req.NewPasswordHash); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidAccountRequest, err)
+		}
 		hashedPassword = req.NewPasswordHash
 	} else {
 		// Generate hash from password
@@ -142,15 +146,13 @@ func (db *Database) AddCredential(ctx context.Context, tx pgx.Tx, req AddCredent
 			if err != nil {
 				return fmt.Errorf("failed to generate SSHA512 hash: %w", err)
 			}
-		case "sha512":
-			hashedPassword = GenerateSHA512Hash(req.NewPassword)
 		case "bcrypt":
 			hashedPassword, err = GenerateBcryptHash(req.NewPassword)
 			if err != nil {
 				return fmt.Errorf("failed to generate bcrypt hash: %w", err)
 			}
 		default:
-			return fmt.Errorf("unsupported hash type: %s", req.NewHashType)
+			return fmt.Errorf("%w: %w: %s", ErrInvalidAccountRequest, ErrUnsupportedHashType, req.NewHashType)
 		}
 	}
 
@@ -199,14 +201,14 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 	// Validate email address format using server.NewAddress
 	address, err := server.NewAddress(req.Email)
 	if err != nil {
-		return fmt.Errorf("invalid email address: %w", err)
+		return fmt.Errorf("%w: invalid email address: %w", ErrInvalidAccountRequest, err)
 	}
 
 	normalizedEmail := address.FullAddress()
 
 	// Validate that we have at least one operation to perform
 	if req.Password == "" && req.PasswordHash == "" && !req.MakePrimary {
-		return fmt.Errorf("either password, password_hash, or make-primary must be specified")
+		return fmt.Errorf("%w: either password, password_hash, or make-primary must be specified", ErrInvalidAccountRequest)
 	}
 
 	// Check if account exists
@@ -222,7 +224,10 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 	var hashedPassword string
 	var updatePassword bool
 	if req.PasswordHash != "" {
-		// Use provided hash directly
+		// Use provided hash directly, if it is one VerifyPassword can check
+		if err = ValidatePasswordHash(req.PasswordHash); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidAccountRequest, err)
+		}
 		hashedPassword = req.PasswordHash
 		updatePassword = true
 	} else if req.Password != "" {
@@ -234,15 +239,13 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 			if err != nil {
 				return fmt.Errorf("failed to generate SSHA512 hash: %w", err)
 			}
-		case "sha512":
-			hashedPassword = GenerateSHA512Hash(req.Password)
 		case "bcrypt":
 			hashedPassword, err = GenerateBcryptHash(req.Password)
 			if err != nil {
 				return fmt.Errorf("failed to generate bcrypt hash: %w", err)
 			}
 		default:
-			return fmt.Errorf("unsupported hash type: %s", req.HashType)
+			return fmt.Errorf("%w: %w: %s", ErrInvalidAccountRequest, ErrUnsupportedHashType, req.HashType)
 		}
 	}
 
@@ -361,14 +364,40 @@ func (db *Database) IsAddressOwnedByAccount(ctx context.Context, accountID int64
 	return exists, nil
 }
 
+// IsAnyAddressOwnedByAccount reports whether any of addresses is a credential of
+// accountID, matched as IsAddressOwnedByAccount matches one, in a single query. Used
+// by the SIEVE vacation personal message check (RFC 5230 §4.5), which asks about
+// every recipient of the original message.
+func (db *Database) IsAnyAddressOwnedByAccount(ctx context.Context, accountID int64, addresses []string) (bool, error) {
+	if len(addresses) == 0 {
+		return false, nil
+	}
+	var exists bool
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM credentials WHERE account_id = $1 AND LOWER(address) = ANY(SELECT LOWER(a) FROM unnest($2::text[]) AS a))`,
+		accountID, addresses).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check address ownership: %w", err)
+	}
+	return exists, nil
+}
+
 var (
-	ErrCannotDeletePrimaryCredential = errors.New("cannot delete the primary credential. Use update-account to make another credential primary first")
-	ErrCannotDeleteLastCredential    = errors.New("cannot delete the last credential for an account. Use delete-account to remove the entire account")
+	// The Admin API returns these to its clients as well, so they name no sora-admin command.
+	ErrCannotDeletePrimaryCredential = errors.New("cannot delete the primary credential: make another credential of the account primary first")
+	ErrCannotDeleteLastCredential    = errors.New("cannot delete the last credential of an account: delete the account instead")
 	// ErrCrossDomainPrimaryChange is returned when an operation would switch an account's
 	// primary identity to a different domain while the account already has messages. Message
 	// storage keys (s3_domain) are captured per-message from the then-current primary, so such
 	// a switch would split one account's objects across two S3 domain prefixes.
 	ErrCrossDomainPrimaryChange = errors.New("cannot change the primary identity to a different domain on an account that already has messages: this would split message storage across domains")
+	// ErrInvalidAccountRequest wraps the errors CreateAccount, CreateAccountWithCredentials
+	// and UpdateAccount return for a request that cannot succeed as written (malformed
+	// address, no or several primaries, an address twice, unknown hash type, a password
+	// over bcrypt's 72 bytes, a password_hash VerifyPassword cannot check, ...), so a
+	// caller can tell a bad request from a database failure. AddCredential wraps it for
+	// a password_hash too.
+	ErrInvalidAccountRequest = errors.New("invalid account request")
 )
 
 // accountHasMessages reports whether the account has any rows in the messages table.
@@ -814,7 +843,9 @@ type AccountSummary struct {
 // GetAccountsByDomain returns a simplified list of the accounts whose primary address is
 // in domain, soft-deleted ones included. It is what the purge-domain command iterates
 // through, and a purge that failed leaves its account soft-deleted: leaving those out would
-// make a re-run skip exactly the accounts it has to finish.
+// make a re-run skip exactly the accounts it has to finish. The domain is matched exactly,
+// as ListAccountsByDomain matches it: never as a LIKE pattern, where % and _ would name
+// other domains in an irreversible purge.
 func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]AccountSummary, error) {
 	query := `
 		SELECT a.id,
@@ -825,7 +856,7 @@ func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]A
 			   0 as message_count
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id AND c.primary_identity = TRUE
-		WHERE LOWER(c.address) LIKE '%' || '@' || LOWER($1)
+		WHERE c.domain = LOWER($1)
 		ORDER BY c.address
 	`
 
@@ -860,13 +891,14 @@ func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]A
 // address is in the given domain, across active (non-deleted) accounts. Domain purge uses
 // this to find cross-domain aliases: addresses in the purged domain that hang off accounts
 // whose primary identity lives in a different domain (so the account is not itself purged).
-// Such aliases keep receiving mail for the purged domain unless explicitly removed.
+// Such aliases keep receiving mail for the purged domain unless explicitly removed. The
+// domain is matched exactly, as in GetAccountsByDomain.
 func (db *Database) GetAliasCredentialsByDomain(ctx context.Context, domain string) ([]string, error) {
 	rows, err := db.GetReadPool().Query(ctx, `
 		SELECT c.address
 		FROM credentials c
 		JOIN accounts a ON a.id = c.account_id
-		WHERE LOWER(c.address) LIKE '%' || '@' || LOWER($1)
+		WHERE c.domain = LOWER($1)
 		  AND c.primary_identity = FALSE
 		  AND a.deleted_at IS NULL
 		ORDER BY c.address
@@ -893,9 +925,9 @@ func (db *Database) ListAccounts(ctx context.Context) ([]AccountSummary, error) 
 		WITH account_stats AS (
 			SELECT mb.account_id,
 				   COUNT(mb.id) as mailbox_count,
-				   -- Bulk all-accounts listing intentionally uses the mailbox_stats cache (kept accurate
-				   -- by the stats triggers + the admin recalculate-stats command) to avoid a full
-				   -- messages-table aggregate on every listing. Per-account quota lookups use live counts.
+				   -- Bulk all-accounts listing intentionally uses the mailbox_stats cache (maintained
+				   -- by the stats triggers) to avoid a full messages-table aggregate on every
+				   -- listing. Per-account quota lookups use live counts.
 				   COALESCE(SUM(ms.message_count), 0) as message_count,
 				   COALESCE(SUM(ms.total_size), 0) as storage_used
 			FROM mailboxes mb
@@ -1055,7 +1087,7 @@ type CreateAccountWithCredentialsRequest struct {
 // CreateAccountWithCredentials creates a new account with multiple credentials atomically
 func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx, req CreateAccountWithCredentialsRequest) (int64, error) {
 	if len(req.Credentials) == 0 {
-		return 0, fmt.Errorf("at least one credential must be provided")
+		return 0, fmt.Errorf("%w: at least one credential must be provided", ErrInvalidAccountRequest)
 	}
 
 	// Validate credentials and ensure exactly one primary
@@ -1065,25 +1097,35 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 			primaryCount++
 		}
 		if cred.Email == "" {
-			return 0, fmt.Errorf("credential %d: email is required", i+1)
+			return 0, fmt.Errorf("%w: credential %d: email is required", ErrInvalidAccountRequest, i+1)
 		}
 		if cred.Password == "" && cred.PasswordHash == "" {
-			return 0, fmt.Errorf("credential %d: either password or password_hash must be provided", i+1)
+			return 0, fmt.Errorf("%w: credential %d: either password or password_hash must be provided", ErrInvalidAccountRequest, i+1)
 		}
 		if cred.Password != "" && cred.PasswordHash != "" {
-			return 0, fmt.Errorf("credential %d: cannot specify both password and password_hash", i+1)
+			return 0, fmt.Errorf("%w: credential %d: cannot specify both password and password_hash", ErrInvalidAccountRequest, i+1)
 		}
 		if cred.HashType == "" {
 			req.Credentials[i].HashType = "bcrypt" // Default hash type
+		}
+		if cred.Password != "" {
+			if err := ValidateNewHashType(req.Credentials[i].HashType); err != nil {
+				return 0, fmt.Errorf("credential %d: %w", i+1, err)
+			}
+		}
+		if cred.PasswordHash != "" {
+			if err := ValidatePasswordHash(cred.PasswordHash); err != nil {
+				return 0, fmt.Errorf("%w: credential %d: %w", ErrInvalidAccountRequest, i+1, err)
+			}
 		}
 	}
 
 	// Ensure exactly one primary credential
 	if primaryCount == 0 {
-		return 0, fmt.Errorf("exactly one credential must be marked as primary")
+		return 0, fmt.Errorf("%w: exactly one credential must be marked as primary", ErrInvalidAccountRequest)
 	}
 	if primaryCount > 1 {
-		return 0, fmt.Errorf("only one credential can be marked as primary")
+		return 0, fmt.Errorf("%w: only one credential can be marked as primary", ErrInvalidAccountRequest)
 	}
 
 	// Validate and normalize all email addresses
@@ -1091,7 +1133,7 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 	for i, cred := range req.Credentials {
 		address, err := server.NewAddress(cred.Email)
 		if err != nil {
-			return 0, fmt.Errorf("credential %d: invalid email address: %w", i+1, err)
+			return 0, fmt.Errorf("%w: credential %d: invalid email address: %w", ErrInvalidAccountRequest, i+1, err)
 		}
 		normalizedEmails[i] = address.FullAddress()
 	}
@@ -1100,7 +1142,7 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 	emailSet := make(map[string]bool)
 	for i, email := range normalizedEmails {
 		if emailSet[email] {
-			return 0, fmt.Errorf("credential %d: duplicate email address: %s", i+1, email)
+			return 0, fmt.Errorf("%w: credential %d: duplicate email address: %s", ErrInvalidAccountRequest, i+1, email)
 		}
 		emailSet[email] = true
 	}
@@ -1118,7 +1160,7 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 
 		if err == nil {
 			if deletedAt != nil {
-				return 0, fmt.Errorf("credential %d: cannot create account with email %s: an account with this email is in deletion grace period", i+1, email)
+				return 0, fmt.Errorf("%w: credential %d: cannot create account with email %s: an account with this email is in deletion grace period", consts.ErrAccountAlreadyExists, i+1, email)
 			}
 			return 0, fmt.Errorf("%w: credential %d: account with email %s already exists", consts.ErrAccountAlreadyExists, i+1, email)
 		} else if !errors.Is(err, pgx.ErrNoRows) {
@@ -1138,7 +1180,7 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 		// Generate password hash or use provided hash
 		var hashedPassword string
 		if cred.PasswordHash != "" {
-			// Use provided hash directly
+			// Use provided hash directly (validated above)
 			hashedPassword = cred.PasswordHash
 		} else {
 			// Generate hash from password
@@ -1148,15 +1190,13 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 				if err != nil {
 					return 0, fmt.Errorf("credential %d: failed to generate SSHA512 hash: %w", i+1, err)
 				}
-			case "sha512":
-				hashedPassword = GenerateSHA512Hash(cred.Password)
 			case "bcrypt":
 				hashedPassword, err = GenerateBcryptHash(cred.Password)
 				if err != nil {
 					return 0, fmt.Errorf("credential %d: failed to generate bcrypt hash: %w", i+1, err)
 				}
 			default:
-				return 0, fmt.Errorf("credential %d: unsupported hash type: %s", i+1, cred.HashType)
+				return 0, fmt.Errorf("%w: credential %d: %w: %s", ErrInvalidAccountRequest, i+1, ErrUnsupportedHashType, cred.HashType)
 			}
 		}
 

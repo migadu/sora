@@ -1065,19 +1065,9 @@ func (cm *ConnectionManager) RecordRemoteLookupFailure(backend string) bool {
 	return false
 }
 
-// AuthenticateAndRoute delegates to the routing lookup if available
-func (cm *ConnectionManager) AuthenticateAndRoute(ctx context.Context, email, password string) (*UserRoutingInfo, AuthResult, error) {
-	return cm.AuthenticateAndRouteWithOptions(ctx, email, password, false)
-}
-
-// AuthenticateAndRouteWithOptions performs authentication and routing with additional options
-// routeOnly: if true, skip password validation and only return routing info (for master username auth)
-func (cm *ConnectionManager) AuthenticateAndRouteWithOptions(ctx context.Context, email, password string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
-	return cm.AuthenticateAndRouteWithClientIP(ctx, email, password, "", routeOnly)
-}
-
 // AuthenticateAndRouteWithClientIP performs authentication and routing with client IP and additional options
-// clientIP: client IP address to include in remotelookup URL (supports $ip placeholder)
+// clientIP: the real client's IP (the PROXY header source when there is one), the
+// remotelookup URL's $ip placeholder
 // routeOnly: if true, skip password validation and only return routing info (for master username auth)
 func (cm *ConnectionManager) AuthenticateAndRouteWithClientIP(ctx context.Context, email, password, clientIP string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
 	if cm.routingLookup == nil {
@@ -1159,7 +1149,7 @@ func loadCAFile(path string) (*x509.CertPool, error) {
 //   - the hardening of backendTLSConfig, verifying certificates when verify is set;
 //   - the roots: a member of a named pool is verified against its pool's remote_tls_ca_file
 //     (the system roots without one): a certificate belongs to the host, however routing
-//     reached it. Any other backend uses the server's remote_tls_ca_file (POP3) or the
+//     reached it. Any other backend uses the server's remote_tls_ca_file or the
 //     system roots;
 //   - the name: a pool or remote_addrs entry configured by hostname is dialed at an address
 //     the name resolved to, but the certificate is issued for the name. ServerName (SNI) is
@@ -1293,6 +1283,10 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 	}
 	cm.refreshResolvedAddrsIfStale()
 
+	// failedPreferred is the preferred backend whose dial just failed. The round-robin
+	// fallback does not dial it again: that would count one failed attempt twice
+	// against its health, and spend a second connect timeout on a dead backend.
+	var failedPreferred string
 	if preferredAddr != "" {
 		if err := cm.backendPoolError(preferredAddr); err != nil {
 			return nil, "", err
@@ -1301,6 +1295,9 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 		if !fallback {
 			// If no fallback is needed, we either succeeded or had a hard failure.
 			return conn, addr, err
+		}
+		if err != nil {
+			failedPreferred = preferredAddr
 		}
 		// If fallback is true, the connection failed but we should proceed to round-robin.
 		// The error from tryPreferredAddress is logged but not returned to the client yet.
@@ -1335,6 +1332,10 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 
 		if cm.InMaintenance(addr) {
 			inMaintenance++
+			continue
+		}
+
+		if addr == failedPreferred {
 			continue
 		}
 
@@ -1913,8 +1914,7 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 		err = tlsConn.Handshake()
 		if err != nil {
 			conn.Close()
-			logger.Debug("ConnectionManager: TLS handshake failed", "addr", addr, "error", err)
-			logger.Debug("ConnectionManager: TLS handshake was using InsecureSkipVerify=%t, no client certificates", !remoteTLSVerify)
+			logger.Debug("ConnectionManager: TLS handshake failed", "addr", addr, "error", err, "verify", remoteTLSVerify)
 			return nil, fmt.Errorf("TLS handshake failed: %w", err)
 		}
 
@@ -2102,18 +2102,25 @@ func (cm *ConnectionManager) HasRouting() bool {
 }
 
 // LookupUserRoute performs a user routing lookup if configured.
-// Note: This is routing-only lookup, so password is empty.
-func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email string) (*UserRoutingInfo, error) {
+// Note: This is routing-only lookup, so password is empty. clientIP is the real
+// client's IP, the remotelookup URL's $ip placeholder.
+//
+// A user the lookup does not know (404/3xx), the only answer lookup_local_users applies
+// to, is (nil, nil). An account it refused (401/403) is ErrRemoteLookupRefused.
+func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email, clientIP string) (*UserRoutingInfo, error) {
 	if !cm.HasRouting() || email == "" {
 		return nil, nil
 	}
 	// Use routeOnly=true for LMTP routing lookups (no authentication, only routing info needed)
-	info, authResult, err := cm.routingLookup.LookupUserRouteWithOptions(ctx, email, "", true)
+	info, authResult, err := cm.routingLookup.LookupUserRouteWithClientIP(ctx, email, "", clientIP, true)
 	if err != nil {
 		return nil, err
 	}
-	if authResult == AuthUserNotFound {
+	switch authResult {
+	case AuthUserNotFound:
 		return nil, nil
+	case AuthFailed:
+		return nil, ErrRemoteLookupRefused
 	}
 	return info, nil
 }
@@ -2122,6 +2129,7 @@ func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email string) 
 type RouteParams struct {
 	Ctx                   context.Context
 	Username              string
+	ClientIP              string // Real client IP (PROXY header source when present), the lookup's $ip
 	Protocol              string // "imap", "pop3", "managesieve", "lmtp"
 	IsRemoteLookupAccount bool
 	RoutingInfo           *UserRoutingInfo
@@ -2160,11 +2168,12 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 		lookupTimeout := cm.GetRemoteLookupTimeout()
 		routingCtx, routingCancel := context.WithTimeout(params.Ctx, lookupTimeout)
 		var lookupErr error
-		result.RoutingInfo, lookupErr = cm.LookupUserRoute(routingCtx, params.Username)
+		result.RoutingInfo, lookupErr = cm.LookupUserRoute(routingCtx, params.Username, params.ClientIP)
 		routingCancel()
 		if lookupErr != nil && cm.HasNamedPools() {
-			// No answer is no pool: routing on would put the user in the default pool,
-			// where the account need not live, and drop their affinity in the real one.
+			// No answer, or a refusal of the account (ErrRemoteLookupRefused), is no pool:
+			// routing on would put the user in the default pool, where the account need
+			// not live, and drop their affinity in the real one.
 			logger.Warn("Routing lookup failed - refusing to route without a pool", "proxy", params.ProxyName, "user", params.Username, "error", lookupErr)
 			return result, fmt.Errorf("%w: %w", ErrRouteLookupFailed, lookupErr)
 		}

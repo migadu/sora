@@ -2,6 +2,7 @@ package helpers
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	"github.com/migadu/sora/consts"
 )
@@ -43,6 +44,46 @@ func MailboxNameHasTraversal(name string) bool {
 		}
 	}
 	return false
+}
+
+// MailboxNameStorable reports whether name can be stored as a PostgreSQL text value:
+// valid UTF-8 without a NUL. No mailbox has any other name; querying with one fails
+// with SQLSTATE 22021 instead of finding nothing.
+func MailboxNameStorable(name string) bool {
+	return utf8.ValidString(name) && strings.IndexByte(name, 0) < 0
+}
+
+// MailboxNameToCreate returns the name of the mailbox that creating name makes, or
+// consts.ErrMailboxInvalidName when it makes none. Trailing hierarchy delimiters are
+// dropped, as IMAP CREATE drops them: "the name created is without the trailing
+// hierarchy delimiter" (RFC 3501 §6.3.3). Every level left must be non-empty and
+// neither "." nor ".." (MailboxNameHasTraversal), so "x//y" or "/y" is refused
+// instead of creating a parent "x/" or "" on the way. A name that is not storable
+// (MailboxNameStorable) or holds a TAB, CR or LF, which db.CreateMailbox refuses, is
+// refused as well.
+func MailboxNameToCreate(name string) (string, error) {
+	if !MailboxNameStorable(name) || strings.ContainsAny(name, "\t\r\n") {
+		return "", consts.ErrMailboxInvalidName
+	}
+	delim := string(consts.MailboxDelimiter)
+	name = strings.TrimRight(name, delim)
+	if name == "" {
+		return "", consts.ErrMailboxInvalidName
+	}
+	for _, level := range strings.Split(name, delim) {
+		if level == "" || level == "." || level == ".." {
+			return "", consts.ErrMailboxInvalidName
+		}
+	}
+	return name, nil
+}
+
+// MailboxNameValid reports whether name can be stored as a mailbox's name: it is
+// one MailboxNameToCreate accepts as it is, with no trailing hierarchy delimiter to
+// drop. The database layer checks every name it creates or renames to with it.
+func MailboxNameValid(name string) bool {
+	created, err := MailboxNameToCreate(name)
+	return err == nil && created == name
 }
 
 // MailboxNameIsBelow reports whether name is a descendant of ancestor in the

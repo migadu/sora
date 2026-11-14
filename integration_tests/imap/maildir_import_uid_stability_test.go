@@ -57,7 +57,7 @@ func TestIMAP_MaildirImport_UIDStability(t *testing.T) {
 	// Run sora-admin import against this account.
 	// We run it with --cleanup-db so it doesn't leave sora-maildir.db behind.
 	// NOTE: The integration test DB config must be compatible with cmd/sora-admin --config usage.
-	if err := runSoraAdminImportMaildir(ctx, testEmail, maildirPath); err != nil {
+	if err := runSoraAdminImportMaildir(ctx, t, testEmail, maildirPath); err != nil {
 		t.Fatalf("sora-admin import failed: %v", err)
 	}
 
@@ -131,9 +131,10 @@ func TestIMAP_MaildirImport_UIDStability(t *testing.T) {
 	}
 }
 
-func runSoraAdminImportMaildir(ctx context.Context, email, maildirPath string) error {
-	soraAdminBin := common.GetSoraAdminBinary(nil)
-	configPath := common.GetTestConfigPath(nil)
+func runSoraAdminImportMaildir(ctx context.Context, t *testing.T, email, maildirPath string) error {
+	soraAdminBin := common.GetSoraAdminBinary(t)
+	// The account exists in the server fixture's database (SORA_TEST_DB_NAME).
+	configPath := common.GetTestConfigPathForTestDB(t)
 	cmd := exec.CommandContext(ctx, soraAdminBin,
 		"--config", configPath,
 		"import", "maildir",
@@ -144,10 +145,7 @@ func runSoraAdminImportMaildir(ctx context.Context, email, maildirPath string) e
 		"--batch-size", "25",
 		"--jobs", "4",
 	)
-	cmd.Env = append(os.Environ(),
-		"SORA_ADMIN_SKIP_S3=1",
-		"SORA_TEST_DB_NAME=sora_test_db",
-	)
+	cmd.Env = append(os.Environ(), "SORA_ADMIN_SKIP_S3=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("sora-admin import maildir failed: %w\noutput:\n%s", err, string(out))

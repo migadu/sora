@@ -34,6 +34,11 @@ type IMAPSession struct {
 	startTime   time.Time
 	closed      bool // Close has run; guarded by mutex
 
+	// trackedClientAddr is the client address this session was registered
+	// with in the connection tracker, so it is unregistered under the same
+	// key even if an ID after login changed RemoteIP.
+	trackedClientAddr string
+
 	checkedIdleTimeout time.Duration // the idle timeout this connection's checker enforces (the IDLE keepalive beats it)
 
 	inboxWarmupDone atomic.Bool // Ensures warmup runs only once
@@ -145,6 +150,23 @@ func (s *IMAPSession) GetCapabilities() imap.CapSet {
 	return s.server.caps
 }
 
+// requireCapability refuses a command, or a command argument, that capability
+// c adds when this session does not offer c. disabled_caps and client_filters
+// take c out of CAPABILITY, but go-imap still hands the command to any session
+// that implements it. The refusal is the one go-imap gives a session without
+// the command: BAD, which RFC 9051 §6 lists for every command as "command
+// unknown or arguments invalid".
+func (s *IMAPSession) requireCapability(c imap.Cap, what string) error {
+	if s.GetCapabilities().Has(c) {
+		return nil
+	}
+	return &imap.Error{
+		Type: imap.StatusResponseTypeBad,
+		Code: imap.ResponseCodeClientBug,
+		Text: what + " is not supported",
+	}
+}
+
 // condStoreEnabled reports whether it is correct to emit a MODSEQ data item in a
 // FETCH-style response for this session. Per RFC 7162 §3.2 that requires two things:
 // the client must have become CONDSTORE-aware on this connection (issued a
@@ -172,12 +194,22 @@ func (s *IMAPSession) AdditionalCapabilities() []imap.Cap {
 // 1. Check literal size BEFORE reading data (prevents memory exhaustion)
 // 2. For LITERAL+ (non-synchronizing), drain oversized data to prevent stream corruption
 // 3. Advertise APPENDLIMIT=<size> capability to clients
+//
+// STATUS and LIST-STATUS report it as well. APPEND reads the whole literal into
+// the session memory budget (readAppendLiteral), so the limit is never above
+// that budget: go-imap then refuses a larger literal with NO [TOOBIG] before
+// asking for it, instead of the session reading it and answering with an
+// [UNAVAILABLE] that no retry cures.
+// The budget is this session's own snapshot of session_memory_limit, which a
+// reload changes for the sessions started after it.
 func (s *IMAPSession) AppendLimit() uint32 {
 	limit := s.server.appendLimit
-	if limit <= 0 {
-		limit = DefaultAppendLimit // 25MB fallback
+	if s.memTracker != nil {
+		if budget := s.memTracker.MaxAllowed(); budget > 0 && budget < int64(limit) {
+			limit = uint32(budget)
+		}
 	}
-	return uint32(limit)
+	return limit
 }
 
 // SetClientID stores the client ID information and applies capability filtering
@@ -452,8 +484,8 @@ func (s *IMAPSession) Close() error {
 		s.cancel()
 	}
 
-	// Mark session as done in WaitGroup for graceful drain
-	s.server.sessionsWg.Done()
+	// Count the session out of Close's drain
+	s.server.sessions.Done()
 
 	return nil
 }
@@ -628,12 +660,16 @@ func (s *IMAPSession) registerConnection(email string) error {
 		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
 		defer cancel()
 
-		clientAddr := server.GetAddrString(s.conn.NetConn().RemoteAddr())
+		// The client's address, not the TCP peer: behind a proxy the peer is
+		// the proxy for every client. RemoteIP already holds the address from
+		// the PROXY header or a trusted proxy's ID forwarding.
+		clientAddr := s.RemoteIP
 
 		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "IMAP", clientAddr); err != nil {
 			s.InfoLog("connection registration rejected", "error", err)
 			return err
 		}
+		s.trackedClientAddr = clientAddr
 	}
 	return nil
 }
@@ -646,9 +682,7 @@ func (s *IMAPSession) unregisterConnection() {
 		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 		defer cancel()
 
-		clientAddr := server.GetAddrString(s.conn.NetConn().RemoteAddr())
-
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "IMAP", clientAddr); err != nil {
+		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "IMAP", s.trackedClientAddr); err != nil {
 			s.InfoLog("failed to unregister connection", "error", err)
 		}
 	}

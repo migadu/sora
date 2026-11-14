@@ -1,9 +1,8 @@
-package cleaner
-
 // Package cleaner provides a worker that periodically cleans up S3 objects
-// that are no longer needed, based on a grace period defined in the database.
-// It uses a database table-based lock to ensure that only one instance of the
-// cleanup worker is running at a time. The cleanup process involves listing
+// that are no longer needed, based on the [cleanup] grace_period. Only one
+// node runs a cycle at a time: it holds a transaction-scoped PostgreSQL
+// advisory lock (db.CLEANUP_ADVISORY_LOCK_ID) for the whole cycle, and a node
+// that cannot take it skips the cycle. The cleanup process involves listing
 // S3 objects that are candidates for deletion and removing them from both
 // S3 and the database. The worker runs at a specified interval, with a
 // minimum allowed interval of 1 minute. The grace period is the time after
@@ -11,15 +10,18 @@ package cleaner
 // started in a separate goroutine and will continue running until the context
 // is done. It logs its progress and any errors encountered during the
 // cleanup process.
+package cleaner
 
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/migadu/sora/cache"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
@@ -46,6 +48,11 @@ const (
 	s3DeleteBatchSize = 500
 )
 
+// vacationHistoryRetention is how long a vacation_responses row is kept: the longest
+// Sieve vacation :days, the period in which a sender "is not responded to" again (RFC
+// 5230 §4.1). A shorter retention would let a second reply out within the period.
+const vacationHistoryRetention = consts.MaxVacationDays * 24 * time.Hour
+
 // DatabaseManager defines the interface for database operations required by the cleaner.
 // This allows for mocking in tests.
 type DatabaseManager interface {
@@ -56,8 +63,8 @@ type DatabaseManager interface {
 	GetStrandedUploadInstancesWithRetry(ctx context.Context, maxAttempts int, livenessThreshold time.Duration) ([]db.StrandedUploadInstance, error)
 	CleanupSoftDeletedAccountsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
 	PurgeSoftDeletedMailboxesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
-	CleanupOldVacationResponsesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
-	CleanupOldRedirectsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
+	CleanupOldVacationResponsesWithRetry(ctx context.Context, olderThan time.Duration) (int64, error)
+	CleanupOldRedirectsWithRetry(ctx context.Context, olderThan time.Duration) (int64, error)
 	CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error)
 	// ExecuteWithLockedS3Orphans runs fn with the objects that are still orphans while
@@ -65,7 +72,7 @@ type DatabaseManager interface {
 	ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error) error
 	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
 	PruneOldMessageVectorsWithRetry(ctx context.Context, retention time.Duration) (int64, error)
-	GetUnusedFTSKeysWithRetry(ctx context.Context, limit int) ([]db.FTSKey, error)
+	GetUnusedFTSKeysWithRetry(ctx context.Context, after db.FTSKey, limit int) ([]db.FTSKey, db.FTSKey, error)
 	DeleteMessagesFTSByKeyBatchWithRetry(ctx context.Context, keys []db.FTSKey) (int64, error)
 	DeleteFTSRowsForAccountWithRetry(ctx context.Context, accountID int64, limit int) (int64, error)
 	// GetDanglingAccountsForFinalDeletionWithRetry lists soft-deleted accounts with no
@@ -95,7 +102,9 @@ type CleanupWorker struct {
 	gracePeriod           time.Duration
 	maxAgeRestriction     time.Duration
 	ftsRetention          time.Duration // How long to keep FTS vectors
+	ftsSweepCursor        db.FTSKey     // Where the next messages_fts_v2 orphan sweep resumes
 	healthStatusRetention time.Duration
+	redirectLogRetention  time.Duration // The redirect rate window or grace_period, whichever is longer
 	uploadMaxAttempts     int           // Uploader max_attempts: an upload is only given up on beyond it
 	instanceLiveness      time.Duration // Silence after which an uploader instance counts as gone
 	stopCh                chan struct{}
@@ -105,10 +114,22 @@ type CleanupWorker struct {
 	running               bool
 }
 
-// New creates a new CleanupWorker.
-func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention time.Duration, uploadMaxAttempts int, instanceLiveness time.Duration, errCh chan<- error) *CleanupWorker {
+// New creates a new CleanupWorker. redirectRateWindow is the longest redirect rate
+// window of this node's servers (config.LongestRedirectRateWindow).
+func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, redirectRateWindow time.Duration, uploadMaxAttempts int, instanceLiveness time.Duration, errCh chan<- error) *CleanupWorker {
 	// Wrap S3 storage with resilient patterns including circuit breakers
 	resilientS3 := resilient.NewResilientS3Storage(s3)
+
+	// The redirect rate limit counts redirect_log rows within the window, so they are kept
+	// that long, and never for less than grace_period, which kept them before. The cleaner
+	// runs on whichever node wins the lock, and a node without an LMTP or Admin API server
+	// (an IMAP- or POP3-only backend) knows no window but the 1h default.
+	redirectLogRetention := max(gracePeriod, redirectRateWindow)
+
+	// The orphan sweep starts at a random point rather than at the lowest hash: a node
+	// restarted more often than it takes to cover messages_fts_v2 would otherwise never get
+	// past the same low end of the table. Content hashes are hex.
+	ftsSweepStart := db.FTSKey{ContentHash: fmt.Sprintf("%016x", rand.Uint64())}
 
 	return &CleanupWorker{
 		rdb:                   rdb,         // *resilient.ResilientDatabase implements DatabaseManager
@@ -118,7 +139,9 @@ func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.C
 		gracePeriod:           gracePeriod,
 		maxAgeRestriction:     maxAgeRestriction,
 		ftsRetention:          ftsRetention,
+		ftsSweepCursor:        ftsSweepStart,
 		healthStatusRetention: healthStatusRetention,
+		redirectLogRetention:  redirectLogRetention,
 		uploadMaxAttempts:     uploadMaxAttempts,
 		instanceLiveness:      instanceLiveness,
 		stopCh:                make(chan struct{}),
@@ -160,6 +183,7 @@ func (w *CleanupWorker) run(ctx context.Context) {
 		logParts = append(logParts, fmt.Sprintf("FTS vector retention: %v", w.ftsRetention))
 	}
 	logParts = append(logParts, fmt.Sprintf("health status retention: %v", w.healthStatusRetention))
+	logParts = append(logParts, fmt.Sprintf("redirect log retention: %v", w.redirectLogRetention))
 
 	logger.Info("Cleanup: Worker processing", "config", strings.Join(logParts, ", "))
 
@@ -444,8 +468,10 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		logger.Info("Cleanup: Purged soft-deleted mailboxes", "count", purgedMailboxCount)
 	}
 
-	// Clean up old vacation responses.
-	vacationCount, err = w.rdb.CleanupOldVacationResponsesWithRetry(ctx, w.gracePeriod)
+	// Clean up old vacation responses. A row is what stops a second reply to its sender
+	// within the script's :days, so it is kept for the longest :days Sora honours, not
+	// for grace_period, the deletion window of expunged messages.
+	vacationCount, err = w.rdb.CleanupOldVacationResponsesWithRetry(ctx, vacationHistoryRetention)
 	if err != nil {
 		logger.Error("Cleanup: Failed to clean up old vacation responses", "error", err)
 		// Continue with S3 cleanup even if vacation cleanup fails
@@ -453,11 +479,11 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		logger.Info("Cleanup: Deleted old vacation responses", "count", vacationCount)
 	}
 
-	// Clean up old redirect-rate-limit log entries. Mirrors vacation cleanup: the
-	// redirect_log table accumulates one row per relayed SIEVE redirect, so it must
-	// be pruned or it grows unbounded. The grace period safely exceeds any redirect
-	// rate window (default 1h), so live rate-limit counts are never affected.
-	redirectCount, err = w.rdb.CleanupOldRedirectsWithRetry(ctx, w.gracePeriod)
+	// Clean up old redirect-rate-limit log entries: the redirect_log table accumulates
+	// one row per relayed SIEVE redirect, so it must be pruned or it grows unbounded.
+	// The rate limit counts the rows within redirect_rate_window, so they are kept for
+	// the longest window or grace_period, whichever is longer (see New).
+	redirectCount, err = w.rdb.CleanupOldRedirectsWithRetry(ctx, w.redirectLogRetention)
 	if err != nil {
 		logger.Error("Cleanup: Failed to clean up old redirect log entries", "error", err)
 	} else if redirectCount > 0 {
@@ -551,7 +577,9 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	// If a user permanently deletes an email (S3 object deleted), their FTS vector
 	// is orphaned in messages_fts_v2. The vector TTL (Phase 2a) eventually kills it,
 	// but sweeping guarantees we don't leak vectors infinitely if fts_retention = 0.
-	orphanKeys, err := w.rdb.GetUnusedFTSKeysWithRetry(ctx, db.BATCH_PURGE_SIZE)
+	// One run scans a bounded part of the table, so each run resumes where the previous
+	// one stopped and wraps around at the end.
+	orphanKeys, nextCursor, err := w.rdb.GetUnusedFTSKeysWithRetry(ctx, w.ftsSweepCursor, db.BATCH_PURGE_SIZE)
 	if err != nil {
 		logger.Error("Cleanup: Failed to list unused FTS keys for global cleanup", "error", err)
 		return fmt.Errorf("failed to list unused FTS keys for global cleanup: %w", err)
@@ -563,11 +591,13 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 
 		deletedCount, err := w.rdb.DeleteMessagesFTSByKeyBatchWithRetry(ctx, orphanKeys)
 		if err != nil {
+			nextCursor = w.ftsSweepCursor // the next run scans these rows again
 			logger.Error("Cleanup: Failed to batch delete from messages_fts_v2 - will be retried on next run", "error", err)
 		} else if deletedCount > 0 {
 			logger.Info("Cleanup: Deleted orphaned FTS vectors", "count", deletedCount)
 		}
 	}
+	w.ftsSweepCursor = nextCursor
 
 	// --- Phase 3: Final account deletion ---
 	// After all associated data (S3 objects, messages, etc.) has been cleaned up,

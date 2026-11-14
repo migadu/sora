@@ -3,7 +3,6 @@ package userapi
 import (
 	"errors"
 	"net/http"
-	"net/url"
 	"strconv"
 
 	"github.com/migadu/sora/logger"
@@ -31,8 +30,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract mailbox name from path: /user/mailboxes/{name}/messages
-	mailboxName := extractPathParam(r.URL.Path, "/user/mailboxes/", "/messages")
-	mailboxName, err = url.QueryUnescape(mailboxName)
+	mailboxName, err := pathName(r, "/user/mailboxes/", "/messages")
 	if err != nil || mailboxName == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
 		return
@@ -71,6 +69,10 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 
 	// Get messages from database
 	messages, err := s.rdb.GetMessagesForMailboxWithRetry(ctx, accountID, mailboxName, limit, offset, unseenOnly)
+	if errors.Is(err, consts.ErrMailboxNotFound) {
+		ctx = readFromWriter(ctx)
+		messages, err = s.rdb.GetMessagesForMailboxWithRetry(ctx, accountID, mailboxName, limit, offset, unseenOnly)
+	}
 	if err != nil {
 		if errors.Is(err, consts.ErrMailboxNotFound) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
@@ -114,8 +116,7 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract mailbox name from path: /user/mailboxes/{name}/search
-	mailboxName := extractPathParam(r.URL.Path, "/user/mailboxes/", "/search")
-	mailboxName, err = url.QueryUnescape(mailboxName)
+	mailboxName, err := pathName(r, "/user/mailboxes/", "/search")
 	if err != nil || mailboxName == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
 		return
@@ -131,6 +132,9 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 
 	// Perform search
 	messages, truncated, err := s.rdb.SearchMessagesInMailboxWithRetry(ctx, accountID, mailboxName, searchQuery)
+	if errors.Is(err, consts.ErrMailboxNotFound) {
+		messages, truncated, err = s.rdb.SearchMessagesInMailboxWithRetry(readFromWriter(ctx), accountID, mailboxName, searchQuery)
+	}
 	if err != nil {
 		if errors.Is(err, consts.ErrMailboxNotFound) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")

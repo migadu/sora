@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"slices"
 	"strings"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -37,11 +37,11 @@ func SplitFlags(flags []imap.Flag) (systemFlags []imap.Flag, customKeywords []st
 			// single chokepoint every write path funnels through, rather than
 			// trusting callers.
 			if !helpers.IsValidFlagName(f) {
-				log.Printf("Database: custom keyword %q is not a valid IMAP flag-keyword, skipping.", flagStr)
+				logger.Warn("Database: custom keyword is not a valid IMAP flag-keyword, skipping", "keyword", flagStr)
 				continue
 			}
 			if len(flagStr) > FlagsMaxKeywordLength {
-				log.Printf("Database: custom keyword '%s' exceeds maximum length of %d, skipping.", flagStr, FlagsMaxKeywordLength)
+				logger.Warn("Database: custom keyword exceeds the maximum length, skipping", "keyword", flagStr, "max_length", FlagsMaxKeywordLength)
 				continue // Skip this keyword
 			}
 			customKeywords = append(customKeywords, flagStr)
@@ -128,7 +128,7 @@ func (db *Database) mailboxKeywordCanonicalMap(ctx context.Context, tx pgx.Tx, m
 	var existing []string
 	if err := json.Unmarshal(cacheJSON, &existing); err != nil {
 		// A malformed cache must not break flag writes; treat as an empty registry.
-		log.Printf("Database: failed to unmarshal custom_flags_cache for mailbox %d: %v", mailboxID, err)
+		logger.Warn("Database: failed to unmarshal custom_flags_cache, treating it as empty", "mailbox_id", mailboxID, "err", err)
 		return canonical, nil
 	}
 	for _, e := range existing {
@@ -241,7 +241,7 @@ func (db *Database) getAllFlagsForMessage(ctx context.Context, tx pgx.Tx, messag
 	allFlags := BitwiseToFlags(bitwiseFlags)
 	var customKeywords []string
 	if err := json.Unmarshal(customFlagsJSON, &customKeywords); err != nil {
-		log.Printf("Database: error unmarshalling custom_flags for message %d: %v. JSON: %s", messageID, err, string(customFlagsJSON))
+		logger.Error("Database: failed to unmarshal custom_flags", "message_id", messageID, "err", err, "json", string(customFlagsJSON))
 		return nil, fmt.Errorf("failed to unmarshal custom_flags for message %d: %w", messageID, err)
 	}
 
@@ -562,7 +562,8 @@ func (db *Database) GetUniqueCustomFlagsForMailbox(ctx context.Context, mailboxI
 
 	if err == nil && cachedFlagsJSON != nil {
 		var cachedFlags []string
-		if err := json.Unmarshal(cachedFlagsJSON, &cachedFlags); err == nil {
+		unmarshalErr := json.Unmarshal(cachedFlagsJSON, &cachedFlags)
+		if unmarshalErr == nil {
 			// Sanitize and return cached flags
 			var flags []imap.Flag
 			for _, f := range cachedFlags {
@@ -576,7 +577,7 @@ func (db *Database) GetUniqueCustomFlagsForMailbox(ctx context.Context, mailboxI
 			return dedupKeywordsByFold(result), nil
 		}
 		// If unmarshal fails, fall through to the full scan
-		log.Printf("Database: failed to unmarshal custom_flags_cache for mailbox %d, falling back to full scan", mailboxID)
+		logger.Warn("Database: failed to unmarshal custom_flags_cache, falling back to a full scan", "mailbox_id", mailboxID, "err", unmarshalErr)
 	}
 
 	// Fallback: full scan query (used if cache column doesn't exist yet or cache is NULL)

@@ -26,16 +26,6 @@ func extractPathParam(path, prefix, suffix string) string {
 	return remaining
 }
 
-// extractLastPathSegment extracts the last segment from a path
-// For example, from "/admin/connections/user/test@example.com", it extracts "test@example.com"
-func extractLastPathSegment(path string) string {
-	parts := strings.Split(strings.TrimSuffix(path, "/"), "/")
-	if len(parts) == 0 {
-		return ""
-	}
-	return parts[len(parts)-1]
-}
-
 // routeHandler wraps an http.HandlerFunc with method checking
 func routeHandler(method string, handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

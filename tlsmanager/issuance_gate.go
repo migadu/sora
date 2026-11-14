@@ -1,10 +1,14 @@
 package tlsmanager
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -167,5 +171,63 @@ func (f *issuanceFence) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("%w: request to %s (leader: %s, this node: %s)", errIssuanceDeferred,
 			req.URL.Host, f.manager.clusterManager.GetLeaderID(), f.manager.clusterManager.GetNodeID())
 	}
+
+	// Every order takes the issuance claim, whichever path started it. A first issuance
+	// already holds it from the cache miss (the claim is re-entrant); a renewal reads a
+	// certificate that is still in the cache and reaches no miss, so this is where it
+	// takes the claim. It is given back when the certificate is stored.
+	domains, err := orderedDomains(req)
+	if err != nil {
+		return nil, err
+	}
+	for _, domain := range domains {
+		if refusal := f.manager.refuseIssuance(domain); refusal != nil {
+			return nil, refusal
+		}
+	}
 	return f.base.RoundTrip(req)
+}
+
+// orderedDomains returns the DNS identifiers that a newOrder request asks a certificate
+// for, and nothing for any other ACME request. ACME requests are JWS objects in the
+// flattened JSON serialization (RFC 8555 section 6.2); only a newOrder payload carries an
+// "identifiers" array (section 7.4). The request body is restored for the transport.
+func orderedDomains(req *http.Request) ([]string, error) {
+	if req.Method != http.MethodPost || req.Body == nil {
+		return nil, nil
+	}
+	body, err := io.ReadAll(req.Body)
+	req.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("reading ACME request body: %w", err)
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+
+	var jws struct {
+		Payload string `json:"payload"`
+	}
+	if json.Unmarshal(body, &jws) != nil || jws.Payload == "" {
+		return nil, nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(jws.Payload)
+	if err != nil {
+		return nil, nil
+	}
+	var order struct {
+		Identifiers []struct {
+			Type  string `json:"type"`
+			Value string `json:"value"`
+		} `json:"identifiers"`
+	}
+	if json.Unmarshal(payload, &order) != nil {
+		return nil, nil
+	}
+
+	var domains []string
+	for _, id := range order.Identifiers {
+		if id.Type == "dns" {
+			domains = append(domains, id.Value)
+		}
+	}
+	return domains, nil
 }

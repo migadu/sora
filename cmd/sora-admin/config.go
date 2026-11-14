@@ -34,6 +34,10 @@ func handleConfigCommand(ctx context.Context) {
 			// Skip the "config" command itself
 			continue
 		}
+		if os.Args[i] == "--help" || os.Args[i] == "-h" {
+			subcommand = "help"
+			break
+		}
 		if !strings.HasPrefix(os.Args[i], "-") {
 			subcommand = os.Args[i]
 			break
@@ -50,7 +54,7 @@ func handleConfigCommand(ctx context.Context) {
 		handleConfigDump(ctx)
 	case "validate":
 		handleConfigValidate(ctx)
-	case "--help", "-h", "help":
+	case "help":
 		printConfigUsage()
 	default:
 		fmt.Printf("Unknown config subcommand: %s\n\n", subcommand)
@@ -63,49 +67,35 @@ func handleConfigValidate(_ context.Context) {
 	// Extract config path from os.Args (it was preserved for config subcommand)
 	var configFile string
 
-	// Look for --config flag in the original args
+	// Look for --config flag in the original args (the first one counts). --help or -h
+	// anywhere but as the --config value prints the usage instead of validating.
 	for i := 1; i < len(os.Args); i++ {
 		if os.Args[i] == "--config" && i+1 < len(os.Args) {
-			configFile = os.Args[i+1]
-			break
+			if configFile == "" {
+				configFile = os.Args[i+1]
+			}
+			i++ // the value, even when it starts with "-"
 		} else if strings.HasPrefix(os.Args[i], "--config=") {
-			configFile = strings.TrimPrefix(os.Args[i], "--config=")
-			break
+			if configFile == "" {
+				configFile = strings.TrimPrefix(os.Args[i], "--config=")
+			}
+		} else if os.Args[i] == "--help" || os.Args[i] == "-h" {
+			printConfigValidateUsage()
+			return
 		}
 	}
 
 	if configFile == "" {
-		fmt.Printf(`Error: --config is required
-
-Validate configuration file syntax and settings
-
-Usage:
-  sora-admin --config PATH config validate
-
-Description:
-  Validates the configuration file by:
-  - Checking TOML syntax
-  - Detecting duplicate keys (warns and uses first occurrence)
-  - Detecting unknown/deprecated keys (warns)
-  - Detecting common typos (e.g., 'f' instead of 'false')
-  - Validating server configurations
-  - Checking for conflicts (duplicate names, addresses)
-
-  Exit codes:
-    0 - Configuration is valid (warnings OK)
-    1 - Configuration has errors
-
-Examples:
-  sora-admin --config sora.config.toml config validate
-`)
+		fmt.Printf("Error: --config is required\n\n")
+		printConfigValidateUsage()
 		os.Exit(1)
 	}
 
 	fmt.Printf("Validating configuration file: %s\n\n", configFile)
 
-	// Load full configuration - this will show all warnings
-	cfg := config.NewDefaultConfig()
-	if err := config.LoadConfigFromFile(configFile, &cfg); err != nil {
+	// Load full configuration as the server does - this will show all warnings
+	var cfg config.Config
+	if err := config.LoadServerConfig(configFile, &cfg); err != nil {
 		fmt.Printf("[FAIL] Configuration validation FAILED:\n")
 		fmt.Printf("   %v\n", err)
 		os.Exit(1)
@@ -128,10 +118,30 @@ Examples:
 		}
 	}
 
-	// Check for server name conflicts
+	if err := cfg.ValidateTrustedNetworks(); err != nil {
+		fmt.Printf("[FAIL] trusted_networks validation failed:\n   %v\n", err)
+		hasErrors = true
+	}
+
+	if err := cfg.Relay.Validate(); err != nil {
+		fmt.Printf("[FAIL] [relay] validation failed:\n")
+		fmt.Printf("   %v\n", err)
+		hasErrors = true
+	}
+
+	if err := cfg.Cleanup.Validate(); err != nil {
+		fmt.Printf("[FAIL] [cleanup] validation failed:\n")
+		fmt.Printf("   %v\n", err)
+		hasErrors = true
+	}
+
+	// Check for server name conflicts. A missing name or addr was reported above.
 	serverNames := make(map[string]bool)
 	serverAddresses := make(map[string]string) // addr -> server name
 	for _, server := range allServers {
+		if server.Name == "" || server.Addr == "" {
+			continue
+		}
 		if serverNames[server.Name] {
 			fmt.Printf("[FAIL] Duplicate server name '%s' found\n", server.Name)
 			fmt.Printf("   Each server must have a unique name\n")
@@ -195,7 +205,7 @@ func handleConfigDump(_ context.Context) {
 	// Parse additional flags after the subcommand
 	flagSet := flag.NewFlagSet("config-dump", flag.ExitOnError)
 	flagSet.StringVar(&format, "format", "toml", "Output format: toml or json")
-	flagSet.BoolVar(&maskSecrets, "mask-secrets", true, "Mask sensitive values (passwords, keys)")
+	flagSet.BoolVar(&maskSecrets, "mask-secrets", true, "Mask sensitive values (passwords, keys, URL userinfo and query values)")
 	flagSet.Usage = func() {
 		fmt.Printf(`Dump the parsed configuration for debugging
 
@@ -204,7 +214,8 @@ Usage:
 
 Options:
   --format FORMAT      Output format: toml or json (default: toml)
-  --mask-secrets       Mask sensitive values like passwords (default: true)
+  --mask-secrets       Mask sensitive values: passwords, keys, and the userinfo
+                       and query values of URLs (default: true)
 
 Examples:
   sora-admin --config sora.config.toml config dump
@@ -222,48 +233,17 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Load full configuration
-	cfg := config.NewDefaultConfig()
-	if err := config.LoadConfigFromFile(configFile, &cfg); err != nil {
+	// Load the configuration as the server runs with it: without the [database.write]
+	// and [database.read] endpoints the file does not define, which NewDefaultConfig
+	// seeds only for the keys a table in the file leaves out.
+	var cfg config.Config
+	if err := config.LoadServerConfig(configFile, &cfg); err != nil {
 		logger.Fatalf("Failed to load config file: %v", err)
 	}
 
 	// Mask secrets if requested
 	if maskSecrets {
-		if cfg.Database.Write != nil {
-			cfg.Database.Write.Password = "***MASKED***"
-		}
-		if cfg.Database.Read != nil {
-			cfg.Database.Read.Password = "***MASKED***"
-		}
-		cfg.S3.AccessKey = "***MASKED***"
-		cfg.S3.SecretKey = "***MASKED***"
-		cfg.S3.EncryptionKey = "***MASKED***"
-		cfg.TLS.CertFile = "***MASKED***"
-		cfg.TLS.KeyFile = "***MASKED***"
-		if cfg.TLS.LetsEncrypt != nil {
-			cfg.TLS.LetsEncrypt.S3.AccessKey = "***MASKED***"
-			cfg.TLS.LetsEncrypt.S3.SecretKey = "***MASKED***"
-		}
-		cfg.Cluster.SecretKey = "***MASKED***"
-		for i := range cfg.DynamicServers {
-			sc := &cfg.DynamicServers[i]
-			if sc.APIKey != "" {
-				sc.APIKey = "***MASKED***"
-			}
-			if sc.ReadOnlyAPIKey != "" {
-				sc.ReadOnlyAPIKey = "***MASKED***"
-			}
-			if sc.JWTSecret != "" {
-				sc.JWTSecret = "***MASKED***"
-			}
-			if sc.MasterPassword != "" {
-				sc.MasterPassword = "***MASKED***"
-			}
-			if sc.MasterSASLPassword != "" {
-				sc.MasterSASLPassword = "***MASKED***"
-			}
-		}
+		config.MaskSecrets(&cfg)
 	}
 
 	// Output in requested format
@@ -282,6 +262,30 @@ Examples:
 	default:
 		logger.Fatalf("Unknown format: %s (supported: toml, json)", format)
 	}
+}
+
+func printConfigValidateUsage() {
+	fmt.Printf(`Validate configuration file syntax and settings
+
+Usage:
+  sora-admin --config PATH config validate
+
+Description:
+  Validates the configuration file by:
+  - Checking TOML syntax
+  - Detecting duplicate keys (warns and uses first occurrence)
+  - Detecting unknown/deprecated keys (warns)
+  - Detecting common typos (e.g., 'f' instead of 'false')
+  - Validating server configurations
+  - Checking for conflicts (duplicate names, addresses)
+
+  Exit codes:
+    0 - Configuration is valid (warnings OK)
+    1 - Configuration has errors
+
+Examples:
+  sora-admin --config sora.config.toml config validate
+`)
 }
 
 func printConfigUsage() {

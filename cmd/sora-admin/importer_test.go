@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -42,14 +43,14 @@ func newMockResilientDatabase() *mockResilientDatabase {
 	}
 }
 
-func (m *mockResilientDatabase) GetMailboxByNameWithRetry(ctx context.Context, accountID int64, name string) (*db.DBMailbox, error) {
+func (m *mockResilientDatabase) GetOwnedMailboxIDByNameWithRetry(ctx context.Context, accountID int64, name string) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.getMailboxByNameCalls++
 	if mailbox, ok := m.mailboxes[name]; ok {
-		return mailbox, nil
+		return mailbox.ID, nil
 	}
-	return nil, consts.ErrMailboxNotFound
+	return 0, consts.ErrMailboxNotFound
 }
 
 func (m *mockResilientDatabase) CreateMailboxWithRetry(ctx context.Context, accountID int64, name string, parentID *int64) error {
@@ -330,7 +331,7 @@ func TestProcessBatch_DBInsertFailure(t *testing.T) {
 		}
 
 		// 5. Create a batch with one message
-		msgHash := HashContent(msgContent)
+		msgHash := helpers.HashContent(msgContent)
 		batch := []msgInfo{
 			{
 				path:     msgPath,

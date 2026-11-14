@@ -65,6 +65,12 @@ type POP3Session struct {
 	startTime        time.Time
 	memTracker       *server.SessionMemoryTracker // Memory usage tracker for this session
 
+	// tracked is set while the session holds a slot in the connection
+	// tracker, registered under trackedClientAddr, so the slot is released
+	// under that key, once. A session the tracker refused never holds one.
+	tracked           bool
+	trackedClientAddr string
+
 	// Session statistics for summary logging
 	messagesRetrieved int // Messages retrieved with RETR
 	messagesDeleted   int // Messages marked for deletion with DELE
@@ -99,6 +105,10 @@ var (
 	errInMaintenance   = &pop3server.Error{Code: "SYS/TEMP", Message: "Server in maintenance, please try again later"}
 	errMailboxTooBig   = &pop3server.Error{Code: "SYS/TEMP", Message: "Mailbox too large to open in this session"}
 	errBodyTooBig      = &pop3server.Error{Code: "SYS/TEMP", Message: "Message too large to retrieve in this session"}
+
+	// errTooManyConnections refuses a login over max_connections_per_user or
+	// max_connections_per_user_per_ip, with the reply pop3_proxy sends.
+	errTooManyConnections = &pop3server.Error{Code: "SYS/TEMP", Message: "Too many connections"}
 )
 
 // pop3AuthError builds an [AUTH]-coded response error (RFC 3206).
@@ -224,8 +234,11 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	}
 	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, delayType); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
+			// Refused before the credentials are checked: a temporary failure
+			// (RFC 3206 section 4), never [IN-USE], which says the authentication
+			// succeeded (RFC 2449 section 8.1.2).
 			s.InfoLog("delay queue full, rejecting connection", "username", username)
-			return 0, &pop3server.Error{Code: "IN-USE", Message: "Too many concurrent authentication attempts. Please try again later."}
+			return 0, &pop3server.Error{Code: "SYS/TEMP", Message: "Too many concurrent authentication attempts. Please try again later."}
 		}
 		return 0, err
 	}
@@ -284,79 +297,73 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	// authorization identity IS the impersonation target. USER/PASS carries none
 	// at all, and a SASL submission without one cannot be a master login either —
 	// see the no-authorization-identity note below.
-	// The trailing clause excludes one case from this block: a WRONG master password on a
-	// submission whose authorization identity equals its authentication identity. RFC 4616
-	// defines authzid == authcid as "no impersonation", and several SASL libraries fill the
-	// field in unconditionally, so for an account whose address happens to be the master
-	// SASL username that shape is an ordinary login. Refusing it here would reject the
-	// account's own password forever; it falls through to regular authentication instead,
-	// which records its own failure under the same authKey, so a master-password guess
-	// dressed up as a self-login is still metered. A CORRECT master password keeps entering
-	// the block whatever the target, which is what the proxy flow relies on.
+	// Any other password falls through to regular authentication, which verifies
+	// the credentials like any other username's (RFC 4616 section 2: the
+	// authentication identity and password first, the authorization identity
+	// second) and answers and records their failure under the same authKey. A reply
+	// or accounting of its own for a wrong master SASL password, beside the
+	// authorization refusal any other username got, confirmed the master SASL
+	// username to anyone who could reach the port.
+	// A self-login falls through too if its peer is not allowed to use the master
+	// credential, or if the account does not exist (below). This keeps its cost
+	// and cache behavior identical to a self-login using any other password.
+	// The preliminary network check is logged but leaves failure accounting to
+	// regular authentication, so the attempt is gated and recorded only once.
+	selfLogin := identity == username
 	if identity != "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
 		checkMasterCredential(username, settings.masterSASLUsername) &&
-		(checkMasterCredential(password, settings.masterSASLPassword) || identity != username) {
-		if !checkMasterCredential(password, settings.masterSASLPassword) {
-			// The submitted username IS the master SASL username, an impersonation
-			// was requested, but the password is wrong. This must be recorded as an
-			// authentication failure and must not fall through to regular
-			// authentication: master SASL is a tenant-wide impersonation capability,
-			// and the regular path rejects the (non-address) master username before
-			// any RecordAuthAttempt* call, which left the credential brute-forceable
-			// at connection rate. Recorded under authKey — the master username's own
-			// bucket — so the impersonation target is not locked out.
-			s.WarnLog("master SASL authentication failed (invalid password)", "peer", server.GetAddrString(netConn.RemoteAddr()))
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
-			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
-			// Reply exactly like any other bad credential: a distinct reply would
-			// confirm the master SASL username to an attacker.
-			return 0, errAuthFailed
-		}
-		if !settings.masterSASLGate.Allowed(netConn.RemoteAddr()) {
-			s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(netConn.RemoteAddr()))
-			// Recorded exactly like a wrong master password: this site is reachable ONLY
-			// with the correct one, so a failure the credential is not charged for
-			// diverges from a wrong password at the block threshold and confirms the
-			// guess. The master-username gate below already did this.
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
-			return 0, errAuthFailed
+		checkMasterCredential(password, settings.masterSASLPassword) &&
+		(!selfLogin || s.AdmitMasterLogin(ctx, settings.masterSASLGate, nil, netConn, proxyInfo, authKey, "master SASL self-login")) {
+		if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, nil, netConn, proxyInfo, authKey, "master SASL") {
+			return 0, s.refuseMasterSASLImpersonation(ctx, username, password, netConn, proxyInfo, authKey)
 		}
 		s.DebugLog("master sasl password authentication successful", "base_address", identity)
 
 		targetAddr, err := server.NewAddress(identity)
 		if err != nil {
-			// A rejected impersonation target is answered exactly like a bad
-			// credential, and recorded exactly like one under authKey. This site is
-			// reachable ONLY with the correct master password, so a distinguishable
-			// reply — or a failure the master credential is not charged for, which
-			// diverges from a wrong password at the block threshold — confirms a
-			// guessed tenant-wide password without completing an authentication.
+			// A rejected impersonation target is answered with the same reply,
+			// accounting, and password-verification work as a bad credential (#846).
 			// Never recorded under the target's key: that charges an account for
 			// merely having been named. The real reason stays in the log.
 			s.WarnLog("impersonation target rejected (address not in the correct format)", "target_user", identity, "error", err)
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
-			return 0, errAuthFailed
+			return 0, s.refuseMasterSASLImpersonation(ctx, username, password, netConn, proxyInfo, authKey)
 		}
 
-		accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, targetAddr.BaseAddress())
+		accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, targetAddr.BaseAddress())
 		if err != nil {
-			// Same reply and same accounting as a bad credential (see above).
-			s.WarnLog("impersonation target rejected (account not found)", "target_user", targetAddr.BaseAddress(), "error", err)
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+			// The lookup was cut short (server shutdown, client gone), so nothing is
+			// known about the target: a temporary failure, not counted as a failed
+			// login, as on the regular login path below.
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.InfoLog("master SASL authentication cancelled during the impersonation target lookup", "target_user", targetAddr.BaseAddress(), "error", err)
+				return 0, errTempUnavailable
 			}
-			return 0, errAuthFailed
+			// The database could not be asked, so nothing is known about the target:
+			// [SYS/TEMP] (RFC 3206 section 4), not a failed login charged to the master
+			// credential.
+			if server.IsTemporaryAuthFailure(err) {
+				s.WarnLog("impersonation target lookup unavailable", "target_user", targetAddr.BaseAddress(), "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
+				return 0, errTempUnavailable
+			}
+			s.WarnLog("impersonation target rejected (account not found)", "target_user", targetAddr.BaseAddress(), "error", err)
+			if !selfLogin {
+				// Same reply, accounting, and password-verification work as a bad credential (#846).
+				return 0, s.refuseMasterSASLImpersonation(ctx, username, password, netConn, proxyInfo, authKey)
+			}
+			// A self-login: answered by regular authentication below (see above).
+		} else {
+			authSuccess = true
+			masterAuthUsed = true
+			// The session belongs to the impersonated account, not the master credential.
+			userAddress = &targetAddr
 		}
-		authSuccess = true
-		masterAuthUsed = true
-		// The session belongs to the impersonated account, not the master credential.
-		userAddress = &targetAddr
+	} else if identity != "" && identity != username && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
+		checkMasterCredential(username, settings.masterSASLUsername) {
+		// The master SASL username asking to act as somebody else, with a wrong
+		// password: answered by regular authentication (see above). Logged for the
+		// operator debugging a proxy with the wrong master SASL password.
+		s.WarnLog("master SASL authentication failed (invalid password)", "peer", server.GetAddrString(netConn.RemoteAddr()))
 	} else if identity == "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
 		checkMasterCredential(username, settings.masterSASLUsername) &&
 		checkMasterCredential(password, settings.masterSASLPassword) {
@@ -379,25 +386,27 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		newUserAddress, err := server.NewAddress(username)
 		if err != nil {
 			s.DebugLog("invalid username format", "error", err)
-			// Record it: an unparseable username was an unmetered authentication
-			// attempt, and it is the path a non-address master SASL username takes
-			// when it falls through to here, which must be accounted for exactly
-			// like any other failed attempt.
+			// A failed login like any other: recorded, counted and answered exactly
+			// like a wrong password. A master SASL self-login (authorization
+			// identity = authentication identity = a non-address master SASL
+			// username) falls through to here with any password but the master
+			// SASL one, which the master SASL block above answers with
+			// errAuthFailed, so a different reply or count here confirms a guessed
+			// master SASL password. It holds for every username, or the reply
+			// would single out the master SASL one.
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
-			return 0, pop3AuthError("Invalid username format")
+			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
+			return 0, errAuthFailed
 		}
 		userAddress = &newUserAddress
 
 		// Master username authentication: user@domain.com@MASTER_USERNAME
 		if len(s.server.masterUsername) > 0 && userAddress.HasSuffix() && checkMasterCredential(userAddress.Suffix(), s.server.masterUsername) {
 			if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
-				if !settings.masterSASLGate.Allowed(netConn.RemoteAddr()) {
-					s.WarnLog("master username credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(netConn.RemoteAddr()))
-					if s.server.authLimiter != nil {
-						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-					}
+				if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
+					metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
 					return 0, errAuthFailed
 				}
 				s.DebugLog("master username authentication successful", "base_address", userAddress.BaseAddress(), "master_username", userAddress.Suffix())
@@ -414,16 +423,29 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 					if s.server.authLimiter != nil {
 						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 					}
+					metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
 					return 0, errAuthFailed
 				}
 
-				accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, targetAddr.BaseAddress())
+				accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, targetAddr.BaseAddress())
 				if err != nil {
+					// Cut short: a temporary failure, see the master SASL path above.
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						s.InfoLog("master username authentication cancelled during the impersonation target lookup", "target_user", targetAddr.BaseAddress(), "error", err)
+						return 0, errTempUnavailable
+					}
+					// Database unavailable: see the master SASL path above.
+					if server.IsTemporaryAuthFailure(err) {
+						s.WarnLog("impersonation target lookup unavailable", "target_user", targetAddr.BaseAddress(), "error", err)
+						metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
+						return 0, errTempUnavailable
+					}
 					// Same reply and same accounting as a bad credential (see above).
 					s.WarnLog("impersonation target rejected (account not found)", "target_user", targetAddr.BaseAddress(), "error", err)
 					if s.server.authLimiter != nil {
 						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 					}
+					metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
 					return 0, errAuthFailed
 				}
 				authSuccess = true
@@ -445,15 +467,18 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 
 	// Regular authentication
 	if !authSuccess {
-		if identity != "" && identity != username {
-			return 0, pop3AuthError("Proxy authentication requires master credentials")
-		}
-
 		var err error
 		accountID, err = s.server.Authenticate(ctx, userAddress.BaseAddress(), password)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				s.InfoLog("authentication cancelled due to server shutdown")
+				return 0, errTempUnavailable
+			}
+			// The database could not be asked, or the stored hash cannot be checked, so
+			// nothing is known about the credentials: [SYS/TEMP] (RFC 3206 section 4), not
+			// [AUTH], and not counted as a failed login.
+			if server.IsTemporaryAuthFailure(err) {
+				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
 				return 0, errTempUnavailable
 			}
 
@@ -462,6 +487,18 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 			}
 			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
 			return 0, errAuthFailed
+		}
+
+		// The credentials checked out; now the authorization (RFC 4616 section 2).
+		// Acting as somebody else is the master SASL credentials' privilege, so this
+		// account may act only as itself. Refused here, not before the password, so
+		// only a client that proved its credentials learns it is not permitted:
+		// refusing it earlier answered every username but the master SASL one without
+		// a password check, which confirmed the master SASL username. Not recorded as
+		// a failure: the credentials were right.
+		if identity != "" && identity != username {
+			s.DebugLog("proxy authentication requires master credentials", "username", username, "identity", identity)
+			return 0, pop3AuthError("Proxy authentication requires master credentials")
 		}
 		authSuccess = true
 	}
@@ -492,6 +529,14 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		return 0, errInMaintenance
 	}
 
+	// The connection limits, also before the session takes the user: a login the tracker
+	// refuses is not logged in, so its close releases neither a count nor a tracker slot.
+	if err := s.registerConnection(accountID, userAddress.FullAddress()); err != nil {
+		s.server.authenticatedConnections.Add(-1)
+		s.InfoLog("login refused: connection limit reached", "address", userAddress.BaseAddress(), "reason", err)
+		return 0, errTooManyConnections
+	}
+
 	// Setup session state
 	s.mutex.Lock()
 	s.inboxMailboxID = inboxMailboxID.ID
@@ -504,6 +549,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		s.InfoLog("authentication successful", "address", userAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", time.Since(start).Seconds()))
 	}
 
+	metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "success").Inc()
 	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
 	s.authenticated.Store(true)
 
@@ -511,11 +557,35 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	metrics.TrackDomainConnection("pop3", s.Domain())
 	metrics.TrackUserActivity("pop3", s.FullAddress(), "connection", 1)
 
-	// Register connection
-	s.registerConnection(userAddress.FullAddress())
 	s.startTerminationPoller()
 
 	return accountID, nil
+}
+
+// refuseMasterSASLImpersonation answers a refused non-self master SASL login
+// with the same password-verification work, lookup-cache update, rate-limit
+// accounting, and error reply that a wrong password receives via regular
+// authentication (#846), without exposing proxy-auth errors if username
+// happens to name an account whose own password equals master_sasl_password.
+func (s *POP3Session) refuseMasterSASLImpersonation(ctx context.Context, username, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) error {
+	if authnAddr, err := server.NewAddress(username); err == nil &&
+		!(len(s.server.masterUsername) > 0 && authnAddr.HasSuffix() && checkMasterCredential(authnAddr.Suffix(), s.server.masterUsername)) {
+		if _, authErr := s.server.Authenticate(ctx, authnAddr.BaseAddress(), password); authErr != nil {
+			if errors.Is(authErr, context.Canceled) || errors.Is(authErr, context.DeadlineExceeded) {
+				s.InfoLog("authentication cancelled due to server shutdown")
+				return errTempUnavailable
+			}
+			if server.IsTemporaryAuthFailure(authErr) {
+				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
+				return errTempUnavailable
+			}
+		}
+	}
+	if s.server.authLimiter != nil {
+		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+	}
+	metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
+	return errAuthFailed
 }
 
 func (s *POP3Session) Login(ctx context.Context, username, password string) error {
@@ -1234,35 +1304,46 @@ func (s *POP3Session) fetchBodyFromS3(ctx context.Context, msg *db.POP3Message) 
 	return data, nil
 }
 
-// registerConnection registers the connection in the connection tracker
-func (s *POP3Session) registerConnection(email string) {
-	if s.server.connTracker != nil && s.authenticated.Load() {
-		// Use configured database query timeout for connection tracking (database INSERT)
-		queryTimeout := s.server.rdb.GetQueryTimeout()
-		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
-		defer cancel()
-
-		clientAddr := server.GetAddrString(s.conn.RemoteAddr())
-
-		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "POP3", clientAddr); err != nil {
-			s.InfoLog("rejected connection registration", "error", err)
-		}
+// registerConnection takes a slot for the logging-in account in the connection
+// tracker. The error is the tracker's refusal: the account is at
+// max_connections_per_user or max_connections_per_user_per_ip.
+func (s *POP3Session) registerConnection(accountID int64, email string) error {
+	if s.server.connTracker == nil {
+		return nil
 	}
+	// Use configured database query timeout for connection tracking (database INSERT)
+	queryTimeout := s.server.rdb.GetQueryTimeout()
+	ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
+	defer cancel()
+
+	// The client's address, not the TCP peer: behind a proxy the peer is
+	// the proxy for every client. RemoteIP already holds the address from
+	// the PROXY header or a trusted proxy's XCLIENT (refused after login).
+	clientAddr := s.RemoteIP
+
+	if err := s.server.connTracker.RegisterConnection(ctx, accountID, email, "POP3", clientAddr); err != nil {
+		return err
+	}
+	s.tracked = true
+	s.trackedClientAddr = clientAddr
+	return nil
 }
 
-// unregisterConnection removes the connection from the connection tracker
+// unregisterConnection releases the session's slot in the connection tracker,
+// if it holds one.
 func (s *POP3Session) unregisterConnection() {
-	if s.server.connTracker != nil && s.authenticated.Load() {
-		// Use configured database query timeout for connection tracking (database DELETE)
-		queryTimeout := s.server.rdb.GetQueryTimeout()
-		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
-		defer cancel()
+	if !s.tracked {
+		return
+	}
+	s.tracked = false
 
-		clientAddr := server.GetAddrString(s.conn.RemoteAddr())
+	// Use configured database query timeout for connection tracking (database DELETE)
+	queryTimeout := s.server.rdb.GetQueryTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
 
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "POP3", clientAddr); err != nil {
-			s.DebugLog("failed to unregister connection", "error", err)
-		}
+	if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "POP3", s.trackedClientAddr); err != nil {
+		s.DebugLog("failed to unregister connection", "error", err)
 	}
 }
 

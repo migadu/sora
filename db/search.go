@@ -2,7 +2,6 @@ package db
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -114,6 +113,10 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 		datePrefix = tablePrefix + "."
 	}
 
+	// go-imap passes a search <date> as midnight UTC of that day, and ON / SENTON d as
+	// Since = d, Before = d + 24h. RFC 9051 §6.4.4: SINCE is "within or later than the
+	// specified date" (>= its midnight), BEFORE "earlier than the specified date" (< its
+	// midnight: a message at exactly that midnight is within the day, not before it).
 	if !criteria.Since.IsZero() {
 		param := nextParam()
 		args[param] = criteria.Since
@@ -122,7 +125,7 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 	if !criteria.Before.IsZero() {
 		param := nextParam()
 		args[param] = criteria.Before
-		conditions = append(conditions, fmt.Sprintf("%sinternal_date <= @%s", datePrefix, param))
+		conditions = append(conditions, fmt.Sprintf("%sinternal_date < @%s", datePrefix, param))
 	}
 	if !criteria.SentSince.IsZero() {
 		param := nextParam()
@@ -132,7 +135,7 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 	if !criteria.SentBefore.IsZero() {
 		param := nextParam()
 		args[param] = criteria.SentBefore
-		conditions = append(conditions, fmt.Sprintf("%ssent_date <= @%s", datePrefix, param))
+		conditions = append(conditions, fmt.Sprintf("%ssent_date < @%s", datePrefix, param))
 	}
 
 	// Message size
@@ -240,55 +243,56 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 			args[param] = lowerValue
 			conditions = append(conditions, substringCond(fmt.Sprintf("LOWER(%ssubject)", datePrefix), "@"+param))
 		case "message-id":
+			// Match substrings of the normalized Message-ID. Raw field text and
+			// exact header presence are not retained in message_id (see #529).
+			// Preserve the indexed equality lookup for ordinary whole-ID terms;
+			// other terms read this mailbox's rows, since the covering header
+			// index does not contain message_id.
 			param := nextParam()
-			// if the message ID is wrapped in <messageId>, we need to remove the brackets
-			if strings.HasPrefix(lowerValue, "<") && strings.HasSuffix(lowerValue, ">") {
-				lowerValue = lowerValue[1 : len(lowerValue)-1]
+			if id, ok := wholeMessageIDTerm(lowerValue); ok {
+				args[param] = id
+				conditions = append(conditions, fmt.Sprintf("LOWER(%smessage_id) = @%s", datePrefix, param))
+				break
 			}
 			args[param] = lowerValue
-			conditions = append(conditions, fmt.Sprintf("LOWER(%smessage_id) = @%s", datePrefix, param))
-		case "in-reply-to":
+			// Synthetic IDs yield NULL; turn it into FALSE before NOT/OR.
+			conditions = append(conditions, "COALESCE("+substringCond(messageIDFieldExpr(datePrefix+"message_id"), "@"+param)+", FALSE)")
+		case "in-reply-to", "references":
+			// Both headers hold message IDs, which threading clients search with
+			// the angle brackets they are written with. The columns store the IDs
+			// without brackets, separated by single spaces (in_reply_to from
+			// migration 000001, "references" from 000036), so the term is matched
+			// against the bracketed list rebuilt from them (msgIDListExpr).
+			column := datePrefix + "in_reply_to"
+			if lowerKey == "references" {
+				column = datePrefix + `"references"`
+			}
 			param := nextParam()
 			args[param] = lowerValue
-			conditions = append(conditions, fmt.Sprintf("LOWER(%sin_reply_to) = @%s", datePrefix, param))
-		case "references":
-			// The References header holds a space-separated chain of Message-IDs.
-			// Threading clients search it for a containing Message-ID, so match
-			// as a substring against the dedicated column added in migration 000036.
+			// An absent header yields NULL; turn it into FALSE before NOT/OR.
+			conditions = append(conditions, "COALESCE("+substringCond(msgIDListExpr(column), "@"+param)+", FALSE)")
+		case "from", "to", "cc":
+			// Match the first address's sort columns and this header's extra section.
 			param := nextParam()
 			args[param] = lowerValue
-			conditions = append(conditions, substringCond(fmt.Sprintf(`LOWER(%s"references")`, datePrefix), "@"+param))
-		case "from":
+			conditions = append(conditions, addressHeaderCond(datePrefix, lowerKey, "@"+param))
+		case "bcc", "reply-to", "sender":
+			// No dedicated columns: recipients_json holds every address of these
+			// headers, typed by header name and in its original case. The term is a
+			// substring of one address or display name of that header, compared
+			// case-insensitively. JSONB containment compared the whole address,
+			// case-sensitively. These are rare searches; like References they are
+			// filtered from the mailbox's rows (recipients_json is deliberately
+			// not in idx_messages_mailbox_headers_v2).
+			typeParam := nextParam()
+			args[typeParam] = lowerKey
 			param := nextParam()
-			// Support partial matching on both email address and display name
-			// This allows searching for "peter" to find "peter@whatever.com" or "Peter Smith"
-			// Note: *_sort columns are already lowercase
 			args[param] = lowerValue
-			conditions = append(conditions, fmt.Sprintf("(%s OR %s)",
-				substringCond(datePrefix+"from_email_sort", "@"+param),
-				substringCond(datePrefix+"from_name_sort", "@"+param)))
-		case "to":
-			param := nextParam()
-			// Support partial matching on both email address and display name
-			// Note: *_sort columns are already lowercase
-			args[param] = lowerValue
-			conditions = append(conditions, fmt.Sprintf("(%s OR %s)",
-				substringCond(datePrefix+"to_email_sort", "@"+param),
-				substringCond(datePrefix+"to_name_sort", "@"+param)))
-		case "cc":
-			param := nextParam()
-			// Support partial email matching using indexed cc_email_sort column
-			// Note: CC doesn't have a name_sort column, only email
-			args[param] = lowerValue
-			conditions = append(conditions, substringCond(datePrefix+"cc_email_sort", "@"+param))
-		case "bcc", "reply-to":
-			// BCC and Reply-To don't have dedicated sort columns, fall back to JSONB search
-			recipientJSONParam := nextParam()
-			// Use json.Marshal to safely build JSONB value (handles special characters in search values)
-			recipientEntry := []map[string]string{{"type": lowerKey, "email": lowerValue}}
-			recipientJSON, _ := json.Marshal(recipientEntry)
-			args[recipientJSONParam] = string(recipientJSON)
-			conditions = append(conditions, fmt.Sprintf(`%srecipients_json @> @%s::jsonb`, datePrefix, recipientJSONParam))
+			conditions = append(conditions, fmt.Sprintf(
+				"EXISTS (SELECT 1 FROM jsonb_array_elements(%srecipients_json) r WHERE r->>'type' = @%s AND (%s OR %s))",
+				datePrefix, typeParam,
+				substringCond("LOWER(r->>'email')", "@"+param),
+				substringCond("LOWER(r->>'name')", "@"+param)))
 		default:
 			// HEADER search on a header without a dedicated, indexed column
 			// (e.g. List-ID, X-*). Sora stores no raw-header representation to
@@ -377,16 +381,19 @@ func (db *Database) buildSortOrderClauseWithPrefix(sortCriteria []imap.SortCrite
 		case imap.SortKeySize:
 			orderField = fmt.Sprintf("%ssize", colPrefix)
 		case imap.SortKeyDisplayFrom:
-			// DISPLAYFROM: Use display name if available, fallback to email (RFC 5256)
-			orderField = fmt.Sprintf("COALESCE(%sfrom_name_sort, %sfrom_email_sort)", colPrefix, colPrefix)
+			// DISPLAYFROM: the display name, or the address when the name is empty (RFC 5957
+			// §3). sortColumnsFor stores a missing name as '', not NULL, hence the NULLIF;
+			// the COALESCE also covers a NULL name.
+			orderField = fmt.Sprintf("COALESCE(NULLIF(%sfrom_name_sort, ''), %sfrom_email_sort)", colPrefix, colPrefix)
 		case imap.SortKeyFrom:
 			// FROM: sort by addr-mailbox (the local part) per RFC 5256 §3, not the
 			// full local@domain address. The stored column keeps the full email
 			// (DISPLAYFROM needs it); take the local part at sort time.
 			orderField = fmt.Sprintf("split_part(%sfrom_email_sort, '@', 1)", colPrefix)
 		case imap.SortKeyDisplayTo:
-			// DISPLAYTO: Use display name if available, fallback to email (RFC 5957)
-			orderField = fmt.Sprintf("COALESCE(%sto_name_sort, %sto_email_sort)", colPrefix, colPrefix)
+			// DISPLAYTO: as DISPLAYFROM. to_name_sort is also NULL on rows written before
+			// migration 000006.
+			orderField = fmt.Sprintf("COALESCE(NULLIF(%sto_name_sort, ''), %sto_email_sort)", colPrefix, colPrefix)
 		case imap.SortKeyTo:
 			// TO: sort by addr-mailbox (local part) per RFC 5256 §3.
 			orderField = fmt.Sprintf("split_part(%sto_email_sort, '@', 1)", colPrefix)
@@ -581,7 +588,7 @@ func criteriaContainsFTS(c *imap.SearchCriteria) bool {
 // mailbox the planner degrades to a full mailbox scan with a per-row probe into
 // the FTS table (measured at 24s vs 13.6s for the UNION form). The rewrite splits the
 // term into a header branch (an index-only scan of the mailbox's rows on
-// idx_messages_mailbox_headers; see substringCond) UNION an indexable body branch (FTS GIN
+// idx_messages_mailbox_headers_v2; see substringCond) UNION an indexable body branch (FTS GIN
 // on messages_fts_v2) that can be prefiltered per account.
 //
 // Eligibility is intentionally conservative — exactly one top-level TEXT term, no
@@ -640,7 +647,8 @@ func buildTextSearchBranches(text string, args pgx.NamedArgs, paramPrefix string
 // address) and does not depend on the mailbox at all, so it can never be bounded by the
 // owner's data. strpos is not indexable, which forces the planner onto a mailbox index.
 // Filtering the heap that way reads ~3.5 KB of row per message, which is the 38 s above;
-// idx_messages_mailbox_headers (migration 000052) carries every column the lightweight
+// idx_messages_mailbox_headers_v2 (migration 000059, replacing 000052's
+// idx_messages_mailbox_headers) carries every column the lightweight
 // search projection and these predicates reference, so the same statement runs as an Index
 // Only Scan over ~200 bytes per message instead (TestHeaderSearchIsIndexOnly). Keep it that
 // way: a messages.* column referenced by the lightweight search that is not in the index
@@ -657,18 +665,92 @@ func substringCond(expr, placeholder string) string {
 	return fmt.Sprintf("strpos(%s, %s) > 0", expr, placeholder)
 }
 
+// msgIDListExpr rebuilds a message-ID header field from a column that stores its IDs
+// without angle brackets, separated by single spaces ("a0@x b1@y" becomes
+// "<a0@x> <b1@y>"), lowercased, so a search term written the way the field is, with
+// brackets and possibly several IDs, is a substring of it (RFC 3501 §6.4.4). An empty
+// column (the header was absent) yields NULL, which matches nothing; an empty term
+// then tests for the header's presence, as RFC 9051 §6.4.4 describes.
+func msgIDListExpr(column string) string {
+	return fmt.Sprintf(`'<' || replace(LOWER(NULLIF(%s, '')), ' ', '> <') || '>'`, column)
+}
+
+// messageIDFieldExpr brackets the normalized ID stored by go-message's Header.MessageID.
+// The current ingress parser cannot return an ID beginning with '<'; synthetic IDs
+// retain their brackets (InsertMessage, syntheticMessageID) and yield NULL here.
+// This represents parseable IDs, not raw header presence: CFWS is discarded, and absent,
+// empty or unparseable fields all become synthetic IDs. Those remaining RFC 9051 §6.4.4
+// search limitations are tracked in #529.
+func messageIDFieldExpr(column string) string {
+	return fmt.Sprintf(`CASE WHEN left(%[1]s, 1) <> '<' THEN '<' || LOWER(%[1]s) || '>' END`, column)
+}
+
+// wholeMessageIDTerm reports whether the lowercased term is one whole msg-id in angle
+// brackets, and returns the ID inside them. This preserves the existing indexed lookup
+// for ordinary whole-ID terms. A term containing brackets inside a domain literal
+// ("<a@[...]>", RFC 5322 §3.6.4) uses substring matching instead. A bracketed term inside
+// another ID's domain literal still misses on the equality path, as it did before this
+// change; #529 tracks that remaining limitation.
+func wholeMessageIDTerm(term string) (string, bool) {
+	if len(term) < 3 || term[0] != '<' || term[len(term)-1] != '>' {
+		return "", false
+	}
+	id := term[1 : len(term)-1]
+	if strings.ContainsAny(id, "<>[]") {
+		return "", false
+	}
+	return id, true
+}
+
 // headerSubstringCond is the TEXT header predicate: the bound term as a substring of any
-// searchable header column (subject plus the from/to/cc sort columns). prefix is the
-// messages table alias with its trailing dot, or "" when the columns are unqualified.
+// searchable header column (subject, the from/to/cc sort columns and every other From/To/Cc
+// address in extra_addresses). prefix is the messages table alias with its trailing dot, or
+// "" when the columns are unqualified. The result is never NULL (see anyOf).
 func headerSubstringCond(prefix, placeholder string) string {
-	return "(" + strings.Join([]string{
+	return anyOf([]string{
 		substringCond(fmt.Sprintf("LOWER(%ssubject)", prefix), placeholder),
 		substringCond(prefix+"from_email_sort", placeholder),
 		substringCond(prefix+"from_name_sort", placeholder),
 		substringCond(prefix+"to_email_sort", placeholder),
 		substringCond(prefix+"to_name_sort", placeholder),
 		substringCond(prefix+"cc_email_sort", placeholder),
-	}, " OR ") + ")"
+		substringCond(prefix+"extra_addresses", placeholder),
+	})
+}
+
+// anyOf ORs the header predicates and turns a NULL result into FALSE. The columns they read
+// are nullable, and a NULL column makes its strpos() NULL: extra_addresses on every row
+// written before migration 000059, to_name_sort on every row written before migration
+// 000006 (added without a backfill). WHERE drops a NULL just like FALSE, but NOT NULL is
+// NULL too, so without this NOT TO and NOT TEXT dropped those rows instead of returning
+// them; a NULL column must simply not match.
+func anyOf(conds []string) string {
+	return "COALESCE(" + strings.Join(conds, " OR ") + ", FALSE)"
+}
+
+// addressHeaderSortColumns are the first-address columns of each address header, and
+// addressHeaderSection its section of extra_addresses (see extraAddressesSectionSep).
+var (
+	addressHeaderSortColumns = map[string][]string{
+		"from": {"from_email_sort", "from_name_sort"},
+		"to":   {"to_email_sort", "to_name_sort"},
+		"cc":   {"cc_email_sort"},
+	}
+	addressHeaderSection = map[string]int{"from": 1, "to": 2, "cc": 3}
+)
+
+// addressHeaderCond is the FROM/TO/CC predicate: the bound term as a substring of the
+// header's first name or address, or of any other one in its extra_addresses section.
+// header is "from", "to" or "cc"; prefix as for headerSubstringCond. A NULL column (see
+// anyOf) does not match, so NOT FROM/TO/CC keeps rows written before those columns existed.
+func addressHeaderCond(prefix, header, placeholder string) string {
+	var conds []string
+	for _, col := range addressHeaderSortColumns[header] {
+		conds = append(conds, substringCond(prefix+col, placeholder))
+	}
+	section := fmt.Sprintf(`split_part(%sextra_addresses, E'\n', %d)`, prefix, addressHeaderSection[header])
+	conds = append(conds, substringCond(section, placeholder))
+	return anyOf(conds)
 }
 
 // Sort columns carried through the UNION CTE (in addition to the branch's data
@@ -938,10 +1020,10 @@ func (db *Database) buildFTSPrefilterQuery(criteria *imap.SearchCriteria, mailbo
 // message that has no FTS row at all, which silently degrades the LEFT JOIN to an inner
 // join and drops that message from the result.
 //
-// Messages with no FTS row are ordinary, not exceptional: bodies over 64 KB are never
-// staged, empty bodies are skipped, and PruneOldMessageVectors deletes rows once
-// fts_retention expires. A negated FTS criterion (NOT BODY "x") is TRUE for exactly those
-// messages, so the WHERE placement would also discard every true negative.
+// Messages with no FTS row are ordinary, not exceptional: empty bodies are never staged,
+// nor are messages already older than fts_retention, and PruneOldMessageVectors deletes
+// rows once fts_retention expires. A negated FTS criterion (NOT BODY "x") is TRUE for
+// exactly those messages, so the WHERE placement would also discard every true negative.
 //
 // The scope is written as a constant rather than as "mc.account_id = m.account_id" because
 // the composite GIN on (account_id, text_body_tsv) needs a constant to build a scan key
@@ -1174,6 +1256,7 @@ func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID)
 
 func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, orderByClause string, limit, mailboxMessageCount int) ([]SearchMessageResult, error) {
 	criteria = cloneSearchCriteria(criteria)
+	dropEmptyTextTerms(criteria)
 	if criteriaContainsUIDWildcard(criteria) {
 		if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, criteria); err != nil {
 			return nil, err
@@ -1485,6 +1568,39 @@ func cloneSearchCriteria(c *imap.SearchCriteria) *imap.SearchCriteria {
 		}
 	}
 	return &out
+}
+
+// dropEmptyTextTerms removes empty BODY and TEXT terms from criteria and from its
+// nested NOT and OR criteria. "Note that the empty string is a substring" (RFC 9051
+// §6.4.4), so such a term matches every message, which is what leaving it out of
+// the conjunction does: an empty criteria node builds as 1=1. Searched as written
+// it would match none, since plainto_tsquery of an empty string has no lexemes.
+// The slices are replaced, not edited, so a shallow clone's caller is untouched.
+func dropEmptyTextTerms(c *imap.SearchCriteria) {
+	if c == nil {
+		return
+	}
+	nonEmpty := func(terms []string) []string {
+		if !slices.Contains(terms, "") {
+			return terms
+		}
+		out := make([]string, 0, len(terms))
+		for _, term := range terms {
+			if term != "" {
+				out = append(out, term)
+			}
+		}
+		return out
+	}
+	c.Body = nonEmpty(c.Body)
+	c.Text = nonEmpty(c.Text)
+	for i := range c.Not {
+		dropEmptyTextTerms(&c.Not[i])
+	}
+	for i := range c.Or {
+		dropEmptyTextTerms(&c.Or[i][0])
+		dropEmptyTextTerms(&c.Or[i][1])
+	}
 }
 
 // SearchMessagesWithCriteria retrieves only lightweight message metadata needed for IMAP SEARCH requests.

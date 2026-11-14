@@ -127,8 +127,8 @@ func (m *Manager) syncCertificateFromS3(ctx context.Context, domain string) erro
 	s3Data, err := fallbackCache.primary.Get(ctx, domain)
 	if err != nil {
 		if err == autocert.ErrCacheMiss {
-			// Not in S3, local is fine
-			return nil
+			// Only this node has it: it was stored while S3 refused writes.
+			return publishLocalCertificate(ctx, fallbackCache, domain, localData)
 		}
 		// S3 error, but local works, so not critical
 		logger.Debug("CertSync: Error reading S3 (local certificate still valid)", "domain", domain, "error", err)
@@ -176,8 +176,26 @@ func (m *Manager) syncCertificateFromS3(ctx context.Context, domain string) erro
 		return nil
 	}
 
-	// S3 certificate is older or same, keep local
-	logger.Debug("CertSync: Local certificate is newer (keeping local)", "domain", domain)
+	if shouldUpdateCertificate(s3Info, localInfo) {
+		// This node renewed it while S3 refused writes; S3 still holds the old one.
+		return publishLocalCertificate(ctx, fallbackCache, domain, localData)
+	}
+
+	logger.Debug("CertSync: Local and S3 certificates differ but neither is newer (keeping both)", "domain", domain)
+	return nil
+}
+
+// publishLocalCertificate writes a certificate that only this node's local cache holds to
+// S3, where the other nodes read it. FallbackCache.Put keeps a certificate locally when S3
+// refuses the write and retries S3 once; the sync worker retries every interval after
+// that, until the write succeeds.
+func publishLocalCertificate(ctx context.Context, fallbackCache *FallbackCache, domain string, data []byte) error {
+	if err := fallbackCache.primary.Put(ctx, domain, data); err != nil {
+		logger.Warn("CertSync: Certificate held only on this node could not be written to S3 - will retry", "domain", domain, "error", err)
+		return err
+	}
+	fallbackCache.markS3Available()
+	logger.Info("CertSync: Wrote certificate held only on this node to S3", "domain", domain)
 	return nil
 }
 

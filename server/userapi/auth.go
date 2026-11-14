@@ -57,7 +57,7 @@ type RefreshTokenRequest struct {
 	Token string `json:"token"`
 }
 
-// handleLogin handles user authentication and JWT token generation
+// handleLogin handles user authentication and JWT token generation.
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
@@ -67,7 +67,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Email == "" || req.Password == "" {
+	// An email of blanks is no email: the credential lookup trims it and refuses what is
+	// left with an error that is not "user not found" (and the User API proxy, which trims
+	// it to route the login, finds no user in it either).
+	if strings.TrimSpace(req.Email) == "" || req.Password == "" {
 		s.writeError(w, http.StatusBadRequest, "Email and password are required")
 		return
 	}
@@ -107,7 +110,27 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var hashedPassword string
 	var err error
 
-	// Check cache first (if enabled)
+	// Check authentication rate limiting before the auth cache: a blocked address or
+	// IP+username pair is refused whether or not the answer is cached (the cache only
+	// saves the database work), and a cached success must not be recorded for an
+	// attempt the limiter would have refused.
+	if s.authLimiter != nil {
+		if err := s.authLimiter.CanAttemptAuth(ctx, remoteAddr, authKey); err != nil {
+			// Return the SAME response as a bad-credential failure (401 "Invalid credentials")
+			// rather than a distinct 429. A divergent rate-limit response lets an attacker tell
+			// "this account/IP is being limited" apart from "wrong password", and on a shared
+			// egress IP confirms a targeted account is under attack. The block is still enforced;
+			// only its observable response is made indistinguishable. (security-audit M14)
+			// (Timing is intentionally NOT equalized here: running bcrypt on an already-blocked
+			// attempt would turn the rate limiter into a CPU-amplification vector. The fast
+			// rejection is existence-independent, so it is not a user-enumeration oracle.)
+			logger.Debug("User API: Login rate limited", "name", s.name, "ip", clientIP, "email", req.Email, "error", err)
+			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+			return
+		}
+	}
+
+	// Check cache (if enabled)
 	if s.authCache != nil {
 		cachedAccountID, found, cacheErr := s.authCache.Authenticate(req.Email, req.Password)
 		if cacheErr != nil {
@@ -133,23 +156,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		logger.Debug("User API: Cache miss - performing full authentication", "name", s.name, "email", req.Email)
 	}
 
-	// Check authentication rate limiting (after cache check to avoid delays for cached hits)
-	if s.authLimiter != nil {
-		if err := s.authLimiter.CanAttemptAuth(ctx, remoteAddr, authKey); err != nil {
-			// Return the SAME response as a bad-credential failure (401 "Invalid credentials")
-			// rather than a distinct 429. A divergent rate-limit response lets an attacker tell
-			// "this account/IP is being limited" apart from "wrong password", and on a shared
-			// egress IP confirms a targeted account is under attack. The block is still enforced;
-			// only its observable response is made indistinguishable. (security-audit M14)
-			// (Timing is intentionally NOT equalized here: running bcrypt on an already-blocked
-			// attempt would turn the rate limiter into a CPU-amplification vector. The fast
-			// rejection is existence-independent, so it is not a user-enumeration oracle.)
-			logger.Debug("User API: Login rate limited", "name", s.name, "ip", clientIP, "email", req.Email, "error", err)
-			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
-			return
-		}
-	}
-
 	// Authenticate user (full database lookup)
 	accountID, hashedPassword, err = s.rdb.GetCredentialForAuthWithRetry(ctx, req.Email)
 	if err != nil {
@@ -169,13 +175,28 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
 			return
 		}
+		// The database could not be asked: a temporary failure, not counted as a
+		// failed login.
 		logger.Warn("HTTP Mail API: Error retrieving credentials", "name", s.name, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "Authentication failed")
+		s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
 		return
 	}
 
 	// Verify password
 	if err := db.VerifyPassword(hashedPassword, req.Password); err != nil {
+		if errors.Is(err, db.ErrUnverifiableHash) {
+			// No password matches the stored hash, so this is no verdict on the submitted
+			// one: the stored data is at fault, and only an administrator can repair it.
+			// Answered like a database outage, as the proxies and the backends do: a
+			// temporary failure, not counted as a failed login (a block earned on it
+			// would outlast the repair), nothing cached. A cached login this password
+			// missed was dropped before the database was asked (LookupCache.Authenticate),
+			// so it cannot answer the next guess. VerifyPassword logged why, without the
+			// address.
+			logger.Warn("User API: authentication unavailable", "name", s.name, "email", req.Email, "reason", "unverifiable_hash", "error", err)
+			s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
+			return
+		}
 		// Cache negative result if cache enabled (result=2 for invalid password)
 		if s.authCache != nil {
 			s.authCache.SetFailure(req.Email, 2)
@@ -206,7 +227,16 @@ generateToken:
 	_, epoch, err := s.rdb.GetCredentialEpochWithRetry(ctx, req.Email)
 	if err != nil {
 		logger.Warn("HTTP Mail API: Error fetching credential epoch", "name", s.name, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "Token generation failed")
+		s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
+		return
+	}
+
+	// Account creation makes no mailboxes: like an IMAP or POP3 login, this one
+	// creates the default ones (consts.DefaultMailboxes) for an account that has
+	// none yet, on the cache path as on the database path.
+	if err := s.rdb.CreateDefaultMailboxesWithRetry(ctx, accountID); err != nil {
+		logger.Warn("HTTP Mail API: Error creating default mailboxes", "name", s.name, "account_id", accountID, "error", err)
+		s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
 		return
 	}
 
@@ -358,6 +388,7 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 		// Validate JWT token from Authorization header
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
+			server.SetBearerChallenge(w.Header(), server.UserAPIRealm, false)
 			s.writeError(w, http.StatusUnauthorized, "Authorization header required")
 			return
 		}
@@ -365,6 +396,7 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 		// Extract token from "Bearer <token>"
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+			server.SetBearerChallenge(w.Header(), server.UserAPIRealm, false)
 			s.writeError(w, http.StatusUnauthorized, "Authorization header must be 'Bearer <token>'")
 			return
 		}
@@ -375,7 +407,7 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 		claims, err := s.validateToken(tokenString)
 		if err != nil {
 			logger.Warn("HTTP Mail API: Token validation error", "name", s.name, "error", err)
-			s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+			s.writeTokenRefused(w)
 			return
 		}
 

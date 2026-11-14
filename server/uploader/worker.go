@@ -190,7 +190,7 @@ type UploadWorker struct {
 	syncUpload syncBool
 
 	maxStagingSize     int64
-	currentStagingSize int64 // Atomic tracker for the global staging queue size
+	currentStagingSize int64 // Atomic tracker for this instance's own staging backlog (max_staging_size)
 	// lastStallReport is when the current stall episode was last reported, in Unix
 	// nanoseconds; 0 means no episode is in progress. Atomic, like currentStagingSize.
 	lastStallReport int64
@@ -825,7 +825,11 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	// If the move fails, or no cache is present, delete the local file.
 	if w.cache != nil {
 		if err := w.cache.MoveIn(filePath, upload.ContentHash); err != nil {
-			logger.Error("Uploader: Failed to move uploaded hash to cache - deleting local file", "hash", upload.ContentHash, "error", err)
+			if errors.Is(err, cache.ErrObjectTooLarge) {
+				logger.Debug("Uploader: Uploaded hash is too large for the cache - deleting local file", "hash", upload.ContentHash, "size", upload.Size)
+			} else {
+				logger.Error("Uploader: Failed to move uploaded hash to cache - deleting local file", "hash", upload.ContentHash, "error", err)
+			}
 			if removeErr := w.RemoveLocalFile(filePath); removeErr != nil {
 				// Log is inside RemoveLocalFile
 			}
@@ -1107,6 +1111,11 @@ func isValidContentHash(hash string) bool {
 func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []byte) (*string, error) {
 	path := w.FilePath(contentHash, accountID)
 	dir := filepath.Dir(path)
+	// Nothing removes an account's staging directory once it exists, so it is still
+	// there when the OpenFile below runs. The uploader used to remove it as soon as the
+	// account's last staged file left, which could land between these two calls and
+	// fail the delivery with ENOENT. An empty directory left behind costs an inode, and
+	// on ext4 (without inline_data) also its one directory block.
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
@@ -1121,8 +1130,15 @@ func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []
 	// delivery of the same bytes would adopt ("file exists, skip write") and a reader
 	// would serve. The rename also keeps a concurrent reader or uploader on the old
 	// inode, so a rewrite never changes bytes under an open descriptor.
-	tmpPath := path + ".tmp"
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	//
+	// The temporary name is this call's own, created exclusively: two stagings of the
+	// same body (duplicate APPENDs or deliveries that both passed their caller's Stat)
+	// run here at once. With a shared name the first rename took the name from under
+	// the second, which then failed with ENOENT, and a second open with O_TRUNC could
+	// empty an inode the first was about to rename into place as staged. Each writer
+	// now fills its own inode and renames a complete file over <hash>.
+	tmpPath := fmt.Sprintf("%s.%016x.tmp", path, rand.Uint64())
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create file %s: %w", tmpPath, err)
 	}
@@ -1210,14 +1226,15 @@ func (w *UploadWorker) isTransientS3Error(err error) bool {
 	return false
 }
 
+// RemoveLocalFile removes a staged body. The account's staging directory stays, even
+// when empty: a delivery may have just created it and be about to stage into it (see
+// StoreLocally).
 func (w *UploadWorker) RemoveLocalFile(path string) error {
 	size := fileSize(path)
 	if err := os.Remove(path); err != nil {
 		logger.Warn("Uploader: Uploaded but could not delete file", "path", path, "error", err)
 	} else {
 		w.addStagingSize(-size)
-		stopAt, _ := filepath.Abs(w.path)
-		removeEmptyParents(path, stopAt)
 	}
 	return nil
 }
@@ -1346,30 +1363,15 @@ func (w *UploadWorker) addStagingSize(delta int64) {
 	}
 }
 
-// IsStagingLimitExceeded checks if the total staging size across the system
-// plus the provided additional size exceeds the configured max staging size.
+// IsStagingLimitExceeded checks if this instance's own staging backlog plus the
+// provided additional size exceeds the configured max staging size. Other nodes'
+// backlogs are not counted (see monitorStuckUploads).
 func (w *UploadWorker) IsStagingLimitExceeded(additionalSize int64) bool {
 	if w.maxStagingSize <= 0 {
 		return false // No limit configured
 	}
 	currentSize := atomic.LoadInt64(&w.currentStagingSize)
 	return currentSize+additionalSize > w.maxStagingSize
-}
-
-func removeEmptyParents(path, stopAt string) {
-	for {
-		parent := filepath.Dir(path)
-		if parent == stopAt || parent == "." || parent == "/" {
-			break
-		}
-		// Try removing the parent directory
-		err := os.Remove(parent)
-		if err != nil {
-			// Stop if not empty or permission denied
-			break
-		}
-		path = parent
-	}
 }
 
 // stagedFile is a file in the staging tree that the cleanup scan has yet to resolve
@@ -1416,8 +1418,6 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 	var filesChecked, filesRemoved int64
 	var totalSize int64
 
-	stopAt, _ := filepath.Abs(w.path)
-
 	// Candidate files grouped by account, resolved one batch at a time. A lookup
 	// failure leaves its whole group on disk: an unanswered query is not evidence
 	// that the message was already uploaded.
@@ -1448,7 +1448,6 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 				totalSize += file.size
 				w.addStagingSize(-file.size)
 				logger.Info("UploaderCleanup: Removed orphaned file", "hash", file.contentHash, "account_id", accountID, "size", file.size)
-				removeEmptyParents(file.path, stopAt)
 			}
 		}
 	}

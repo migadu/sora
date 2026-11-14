@@ -287,7 +287,7 @@ func TestSameAccountMoveCopyTakeNoFTSLocks(t *testing.T) {
 		require.NoError(t, err)
 		defer tx.Rollback(ctx)
 		moveUIDs := append([]imap.UID(nil), uids...)
-		moved, err := db.MoveMessages(ctx, tx, &moveUIDs, inboxID, archiveID, accountID, "domain", "part", "test-instance")
+		moved, err := db.MoveMessages(ctx, tx, &moveUIDs, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil, nil)
 		require.NoError(t, err)
 		require.Len(t, moved, n)
 		assert.Equal(t, 0, ftsLocksHeld(t, ctx, tx), "a same-account MOVE took one FTS lock per body")
@@ -298,7 +298,7 @@ func TestSameAccountMoveCopyTakeNoFTSLocks(t *testing.T) {
 		require.NoError(t, err)
 		defer tx.Rollback(ctx)
 		copyUIDs := append([]imap.UID(nil), uids...)
-		copied, _, err := db.CopyMessages(ctx, tx, &copyUIDs, inboxID, archiveID, accountID, "domain", "part", "test-instance")
+		copied, _, err := db.CopyMessages(ctx, tx, &copyUIDs, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil, nil)
 		require.NoError(t, err)
 		require.Len(t, copied, n)
 		assert.Equal(t, 0, ftsLocksHeld(t, ctx, tx), "a same-account COPY took one FTS lock per body")
@@ -337,14 +337,14 @@ func TestCrossAccountMoveCopyStageDestinationFTSRow(t *testing.T) {
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	copyUIDs := []imap.UID{9701}
-	_, _, err = db.CopyMessages(ctx, tx, &copyUIDs, inboxA, sharedB, ownerB, "example.net", "b", "test-instance")
+	_, _, err = db.CopyMessages(ctx, tx, &copyUIDs, inboxA, sharedB, ownerB, "example.net", "b", "test-instance", map[imap.UID]string{9701: copyHash}, nil)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit(ctx))
 
 	tx, err = db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	moveUIDs := []imap.UID{9702}
-	_, err = db.MoveMessages(ctx, tx, &moveUIDs, inboxA, sharedB, ownerB, "example.net", "b", "test-instance")
+	_, err = db.MoveMessages(ctx, tx, &moveUIDs, inboxA, sharedB, ownerB, "example.net", "b", "test-instance", map[imap.UID]string{9702: moveHash}, nil)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit(ctx))
 

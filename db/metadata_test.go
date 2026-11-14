@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/migadu/go-imap"
 	"github.com/stretchr/testify/assert"
@@ -19,7 +21,7 @@ func TestMetadataSetAndGet(t *testing.T) {
 	ctx := context.Background()
 
 	// Create test account
-	accountID := createTestAccount(t, db, "test-setget@example.com", "password")
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-setget-%d@example.com", time.Now().UnixNano()), "password")
 
 	// Test server metadata (mailbox_id = nil)
 	t.Run("ServerMetadata", func(t *testing.T) {
@@ -123,7 +125,7 @@ func TestMetadataUpdate(t *testing.T) {
 
 	db := setupTestDatabase(t)
 	ctx := context.Background()
-	accountID := createTestAccount(t, db, "test-update@example.com", "password")
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-update-%d@example.com", time.Now().UnixNano()), "password")
 
 	entryName := "/private/comment"
 	initialValue := bytePtr([]byte("Initial value"))
@@ -173,7 +175,7 @@ func TestMetadataDelete(t *testing.T) {
 
 	db := setupTestDatabase(t)
 	ctx := context.Background()
-	accountID := createTestAccount(t, db, "test-delete@example.com", "password")
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-delete-%d@example.com", time.Now().UnixNano()), "password")
 
 	entryName := "/private/comment"
 	value := bytePtr([]byte("To be deleted"))
@@ -222,7 +224,7 @@ func TestMetadataDepth(t *testing.T) {
 
 	db := setupTestDatabase(t)
 	ctx := context.Background()
-	accountID := createTestAccount(t, db, "test-depth@example.com", "password")
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-depth-%d@example.com", time.Now().UnixNano()), "password")
 
 	// Set up hierarchical entries
 	entries := map[string]*[]byte{
@@ -299,6 +301,88 @@ func TestMetadataDepth(t *testing.T) {
 	}
 }
 
+// TestMetadataDepthMatchesEntryNameLiterally checks that DEPTH 1 and DEPTH
+// infinity select the entries below the requested name only. "_" and "\" are
+// valid entry-name characters (RFC 5464 §3.2 forbids only "*", "%", non-ASCII
+// and control characters), so they must not act as LIKE wildcards or escapes:
+// "/private/a_b" must not match "/private/axb/y", and "/private/c\" must match
+// "/private/c\/x" but not "/private/c/z".
+func TestMetadataDepthMatchesEntryNameLiterally(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping database integration test")
+	}
+
+	db := setupTestDatabase(t)
+	ctx := context.Background()
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-depth-literal-%d@example.com", time.Now().UnixNano()), "password")
+
+	entries := map[string]*[]byte{
+		`/private/a_b`:      bytePtr([]byte("1")),
+		`/private/a_b/x`:    bytePtr([]byte("2")),
+		`/private/a_b/x/y`:  bytePtr([]byte("3")),
+		`/private/axb/y`:    bytePtr([]byte("4")),
+		`/private/axb/y/z`:  bytePtr([]byte("5")),
+		`/private/c\`:       bytePtr([]byte("6")),
+		`/private/c\/x`:     bytePtr([]byte("7")),
+		`/private/c\/x/y`:   bytePtr([]byte("8")),
+		`/private/c/z`:      bytePtr([]byte("9")),
+		`/private/c/z/deep`: bytePtr([]byte("10")),
+	}
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	require.NoError(t, db.SetMetadata(ctx, tx, accountID, nil, entries, nil))
+	require.NoError(t, tx.Commit(ctx))
+
+	tests := []struct {
+		name  string
+		entry string
+		depth imap.GetMetadataDepth
+		want  []string
+	}{
+		{"Underscore_Depth1", `/private/a_b`, imap.GetMetadataDepthOne,
+			[]string{`/private/a_b`, `/private/a_b/x`}},
+		{"Underscore_DepthInfinity", `/private/a_b`, imap.GetMetadataDepthInfinity,
+			[]string{`/private/a_b`, `/private/a_b/x`, `/private/a_b/x/y`}},
+		{"Backslash_Depth1", `/private/c\`, imap.GetMetadataDepthOne,
+			[]string{`/private/c\`, `/private/c\/x`}},
+		{"Backslash_DepthInfinity", `/private/c\`, imap.GetMetadataDepthInfinity,
+			[]string{`/private/c\`, `/private/c\/x`, `/private/c\/x/y`}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tx, err := db.GetReadPool().Begin(ctx)
+			require.NoError(t, err)
+			defer tx.Rollback(ctx)
+
+			result, err := db.GetMetadata(ctx, tx, accountID, nil, []string{tt.entry}, &imap.GetMetadataOptions{Depth: tt.depth})
+			require.NoError(t, err)
+
+			got := make([]string, 0, len(result.Entries))
+			for name := range result.Entries {
+				got = append(got, name)
+			}
+			assert.ElementsMatch(t, tt.want, got)
+		})
+	}
+}
+
+// TestEscapeLikeReusesReplacer checks that escapeLike escapes exactly the LIKE
+// metacharacters and does not build a strings.Replacer per call: GETMETADATA
+// DEPTH 1/infinity calls it once per requested entry name, and a fresh
+// Replacer allocates its 256-entry byte table (about 6.7 KB) on first use.
+func TestEscapeLikeReusesReplacer(t *testing.T) {
+	assert.Equal(t, `/private/a\_b/c\\/d\%/`, escapeLike(`/private/a_b/c\/d%/`))
+	assert.Equal(t, `/private/plain/`, escapeLike(`/private/plain/`))
+
+	var out string
+	allocs := testing.AllocsPerRun(100, func() { out = escapeLike(`/private/a_b/`) })
+	assert.LessOrEqual(t, allocs, 1.0, "escapeLike allocates beyond its result")
+	_ = out
+}
+
 // TestMetadataMaxSize tests MAXSIZE limiting
 func TestMetadataMaxSize(t *testing.T) {
 	if testing.Short() {
@@ -307,7 +391,7 @@ func TestMetadataMaxSize(t *testing.T) {
 
 	db := setupTestDatabase(t)
 	ctx := context.Background()
-	accountID := createTestAccount(t, db, "test-maxsize@example.com", "password")
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-maxsize-%d@example.com", time.Now().UnixNano()), "password")
 
 	// Set entries with different sizes
 	entries := map[string]*[]byte{
@@ -362,7 +446,7 @@ func TestMetadataEmptyValue(t *testing.T) {
 
 	db := setupTestDatabase(t)
 	ctx := context.Background()
-	accountID := createTestAccount(t, db, "test-empty@example.com", "password")
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-empty-%d@example.com", time.Now().UnixNano()), "password")
 
 	// Set entry with empty byte slice
 	emptyValue := bytePtr([]byte{})

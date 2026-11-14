@@ -106,7 +106,7 @@ func TestBuildSearchHeaderConditions(t *testing.T) {
 		{
 			name:        "References maps to the references column",
 			header:      imap.SearchCriteriaHeaderField{Key: "References", Value: "<parent@example.com>"},
-			wantContain: `strpos(LOWER(m."references"), @`,
+			wantContain: `strpos('<' || replace(LOWER(NULLIF(m."references", '')), ' ', '> <') || '>', @`,
 		},
 		{
 			name:        "non-indexed header matches nothing",
@@ -124,6 +124,37 @@ func TestBuildSearchHeaderConditions(t *testing.T) {
 			condition, _, err := db.buildSearchCriteria(criteria, "p", &paramCounter)
 			require.NoError(t, err)
 			assert.Contains(t, condition, tt.wantContain)
+		})
+	}
+}
+
+// TestBuildSearchDateConditions pins the date comparison operators (#593). go-imap
+// passes a search <date> as midnight UTC of that day, and ON d as Since = d,
+// Before = d + 24h. RFC 9051 §6.4.4: BEFORE / SENTBEFORE match a date "earlier than
+// the specified date", so the upper bound excludes midnight of that day; SINCE /
+// SENTSINCE match one "within or later than", so the lower bound includes it.
+func TestBuildSearchDateConditions(t *testing.T) {
+	var db *Database // builder does not dereference the receiver
+	day := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name     string
+		criteria *imap.SearchCriteria
+		want     string
+	}{
+		{"SINCE", &imap.SearchCriteria{Since: day}, "m.internal_date >= @p1"},
+		{"BEFORE", &imap.SearchCriteria{Before: day}, "m.internal_date < @p1"},
+		{"SENTSINCE", &imap.SearchCriteria{SentSince: day}, "m.sent_date >= @p1"},
+		{"SENTBEFORE", &imap.SearchCriteria{SentBefore: day}, "m.sent_date < @p1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			paramCounter := 0
+			condition, args, err := db.buildSearchCriteriaWithPrefix(tt.criteria, "p", &paramCounter, "m")
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, condition)
+			assert.Equal(t, day, args["p1"])
 		})
 	}
 }
@@ -400,7 +431,7 @@ func TestTextUnionSearchResults(t *testing.T) {
 }
 
 // Database test helpers for search tests
-func setupSearchTestDatabase(t *testing.T) (*Database, int64, int64) {
+func setupSearchTestDatabase(t testing.TB) (*Database, int64, int64) {
 	db := setupTestDatabase(t)
 
 	ctx := context.Background()
@@ -1071,20 +1102,21 @@ func TestSearchCriteriaValidation(t *testing.T) {
 			valid: true,
 		},
 		{
-			name: "invalid date range",
+			// Valid searches that match nothing (#283).
+			name: "empty date range",
 			criteria: &imap.SearchCriteria{
 				Since:  time.Now(),
 				Before: time.Now().Add(-24 * time.Hour), // Before is after Since
 			},
-			valid: false,
+			valid: true,
 		},
 		{
-			name: "invalid size range",
+			name: "empty size range",
 			criteria: &imap.SearchCriteria{
 				Larger:  1000,
 				Smaller: 500, // Smaller is less than Larger
 			},
-			valid: false,
+			valid: true,
 		},
 		{
 			name: "too many text search terms",

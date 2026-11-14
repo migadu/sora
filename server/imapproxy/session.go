@@ -17,6 +17,7 @@ import (
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
@@ -845,7 +846,6 @@ func (s *Session) authenticateUser(username, password string) error {
 	// the upstream load balancer whenever this proxy sits behind haproxy/nginx/NLB,
 	// and the load balancer never accumulates failures — so keying the delay on it
 	// meant the delay never fired in exactly the deployment proxies exist for.
-	remoteAddr := s.clientConn.RemoteAddr()
 	realClientIP, _ := server.GetConnectionIPs(s.clientConn, s.proxyInfo)
 	delayAddr := &server.StringAddr{Addr: realClientIP}
 	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, delayAddr, "IMAP-PROXY"); err != nil {
@@ -858,7 +858,37 @@ func (s *Session) authenticateUser(username, password string) error {
 		return err
 	}
 
-	// Check cache first (before rate limiter to avoid delays for cached successful auth)
+	// Check if the authentication attempt is allowed by the rate limiter using proxy-aware methods.
+	// Before the lookup cache: a blocked address or IP+username pair is refused whether or
+	// not the answer is cached (the cache only saves the database work), and a cached
+	// success must not be recorded for an attempt the limiter would have refused.
+	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey); err != nil {
+		// Check if this is a rate limit error
+		var rateLimitErr *server.RateLimitError
+		if errors.As(err, &rateLimitErr) {
+			s.InfoLog("rate limit exceeded",
+				"username", username,
+				"reason", rateLimitErr.Reason,
+				"failure_count", rateLimitErr.FailureCount,
+				"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
+
+			// Track rate limiting as a specific error type
+			metrics.ProtocolErrors.WithLabelValues("imap_proxy", "AUTH", "rate_limited", "client_error").Inc()
+
+			// Send BYE with ALERT to immediately close connection
+			return &imap.Error{
+				Type: imap.StatusResponseTypeBye,
+				Code: imap.ResponseCodeAlert,
+				Text: "Too many failed authentication attempts. Please try again later.",
+			}
+		}
+
+		// Unknown rate limiting error (shouldn't happen, but handle gracefully)
+		metrics.ProtocolErrors.WithLabelValues("imap_proxy", "AUTH", "rate_limited", "client_error").Inc()
+		return err
+	}
+
+	// Check cache
 	// Use server name as cache key to avoid collisions between different proxies/servers
 	if cached, found := s.server.lookupCache.Get(s.server.name, username); found {
 		// Does this login use the same password the entry was cached with?
@@ -874,7 +904,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// after negative_ttl to allow retry. Brute force protection is handled
 				// by rate limiting, not by extending cache TTL.
 				s.DebugLog("cache hit - negative entry with same password", "username", username, "age", time.Since(cached.CreatedAt))
-				metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
+				metrics.LookupCacheResults.WithLabelValues("imap_proxy", "hit_negative").Inc()
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 				return consts.ErrAuthenticationFailed
@@ -882,7 +912,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Different password - ALWAYS revalidate (user might have fixed their password)
 				// Brute force protection is handled by protocol-level rate limiting
 				s.DebugLog("cache negative entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt))
-				metrics.CacheOperationsTotal.WithLabelValues("get", "revalidate_negative_different_pw").Inc()
+				metrics.LookupCacheResults.WithLabelValues("imap_proxy", "revalidate_negative_different_pw").Inc()
 				// Fall through to full auth
 			}
 		} else {
@@ -894,7 +924,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// This ensures that when a domain moves backends or password changes,
 				// active users eventually pick up the changes.
 				s.DebugLog("cache hit - using cached auth", "username", username, "account_id", cached.AccountID, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
-				metrics.CacheOperationsTotal.WithLabelValues("get", "hit").Inc()
+				metrics.LookupCacheResults.WithLabelValues("imap_proxy", "hit").Inc()
 
 				s.accountID = cached.AccountID
 				s.isRemoteLookupAccount = cached.FromRemoteLookup
@@ -902,12 +932,12 @@ func (s *Session) authenticateUser(username, password string) error {
 				// its enforcement and every backend-leg setting the lookup answer carried.
 				s.routingInfo = proxy.RouteFromCache(cached)
 				s.routingInfo.ClientConn = s.listenerConn // Always set current client connection for JA4
-				// If cache has ActualEmail (e.g., "user@example.com" for "user@TOKEN"), use it
-				// Otherwise fall back to submitted username
+				// The resolved address when the entry has one (e.g. "user@example.com" for
+				// "user@TOKEN"); otherwise s.username keeps the base address set above, the
+				// name the uncached login routed by. The submitted name would route a
+				// +detail or @SUFFIX login under another key than the uncached one.
 				if cached.ActualEmail != "" {
 					s.username = cached.ActualEmail
-				} else {
-					s.username = username
 				}
 
 				// Use actual username (resolved email) for rate limiting and metrics
@@ -944,48 +974,32 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Use configured window: revalidate if entry is older than positiveRevalidationWindow
 				if cached.IsOld(s.server.positiveRevalidationWindow) {
 					s.DebugLog("cache positive entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt))
-					metrics.CacheOperationsTotal.WithLabelValues("get", "revalidate_positive_different_pw").Inc()
+					metrics.LookupCacheResults.WithLabelValues("imap_proxy", "revalidate_positive_different_pw").Inc()
+					// The database or the remote lookup decides this password, so drop
+					// the entry before asking (the SQLite auth cache drops a missed entry
+					// the same way). Kept, it would outlive an outage, which gives no
+					// verdict and is not counted, and still sign in its password: every
+					// guess during the outage would be checked against it, unseen by the
+					// auth rate limiter, until it expired.
+					s.invalidateLookupCache("password differs from cached login")
 					// Fall through to full auth
 				} else {
 					// Entry is fresh - likely wrong password attempt
 					s.DebugLog("cache hit - wrong password on fresh positive entry", "username", username)
-					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_positive_wrong_pw").Inc()
+					metrics.LookupCacheResults.WithLabelValues("imap_proxy", "hit_positive_wrong_pw").Inc()
+					// Cost what a failed login for an unknown address costs, or the instant
+					// answer shows that this address has an account. (#346)
+					db.DummyVerifyPassword(password)
 					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 					metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 					return consts.ErrAuthenticationFailed
 				}
 			}
 		}
-	} else {
+	} else if s.server.lookupCache != nil {
+		// A disabled cache (nil) reads nothing and counts nothing.
 		s.DebugLog("cache miss", "username", username)
-		metrics.CacheOperationsTotal.WithLabelValues("get", "miss").Inc()
-	}
-
-	// Check if the authentication attempt is allowed by the rate limiter using proxy-aware methods
-	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey); err != nil {
-		// Check if this is a rate limit error
-		var rateLimitErr *server.RateLimitError
-		if errors.As(err, &rateLimitErr) {
-			s.InfoLog("rate limit exceeded",
-				"username", username,
-				"reason", rateLimitErr.Reason,
-				"failure_count", rateLimitErr.FailureCount,
-				"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
-
-			// Track rate limiting as a specific error type
-			metrics.ProtocolErrors.WithLabelValues("imap_proxy", "AUTH", "rate_limited", "client_error").Inc()
-
-			// Send BYE with ALERT to immediately close connection
-			return &imap.Error{
-				Type: imap.StatusResponseTypeBye,
-				Code: imap.ResponseCodeAlert,
-				Text: "Too many failed authentication attempts. Please try again later.",
-			}
-		}
-
-		// Unknown rate limiting error (shouldn't happen, but handle gracefully)
-		metrics.ProtocolErrors.WithLabelValues("imap_proxy", "AUTH", "rate_limited", "client_error").Inc()
-		return err
+		metrics.LookupCacheResults.WithLabelValues("imap_proxy", "miss").Inc()
 	}
 
 	// Parse username to check for master username or token suffix
@@ -1030,9 +1044,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for remotelookup authentication
 	if s.server.connManager.HasRouting() {
-		// Extract client IP from remote address (remove port)
-		clientIP, _ := server.GetHostPortFromAddr(remoteAddr)
-		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithClientIP(ctx, usernameForRemoteLookup, password, clientIP, masterAuthValidated)
+		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithClientIP(ctx, usernameForRemoteLookup, password, realClientIP, masterAuthValidated)
 
 		// Log remotelookup response with all details
 		backend := "none"
@@ -1048,33 +1060,24 @@ func (s *Session) authenticateUser(username, password string) error {
 		s.DebugLog("remotelookup authentication", "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
 
 		if err != nil {
-			// Categorize the error type to determine fallback behavior
-			if errors.Is(err, proxy.ErrRemoteLookupInvalidResponse) {
-				// Invalid response from remotelookup (malformed 2xx) - this is a server bug, fail hard
-				s.ErrorLog("remotelookup returned invalid response - server bug", "error", err)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return fmt.Errorf("remotelookup server error: invalid response")
+			// Check if this is due to context cancellation (server shutdown)
+			if errors.Is(err, server.ErrServerShuttingDown) {
+				s.InfoLog("remotelookup cancelled due to server shutdown")
+				metrics.RemoteLookupResult.WithLabelValues("imap", "shutdown").Inc()
+				return server.ErrServerShuttingDown
 			}
 
-			if errors.Is(err, proxy.ErrRemoteLookupTransient) {
-				// Check if this is due to context cancellation (server shutdown)
-				if errors.Is(err, server.ErrServerShuttingDown) {
-					s.InfoLog("remotelookup cancelled due to server shutdown")
-					metrics.RemoteLookupResult.WithLabelValues("imap", "shutdown").Inc()
-					return server.ErrServerShuttingDown
-				}
-
-				// Transient error (network, 5xx, circuit breaker) - NEVER fallback to DB
-				// These are service availability issues, not "user not found" cases
-				s.WarnLog("remotelookup transient error - service unavailable", "error", err)
-				metrics.RemoteLookupResult.WithLabelValues("imap", "transient_error_rejected").Inc()
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return fmt.Errorf("remotelookup service unavailable")
-			} else {
-				// Unknown error type - fallthrough to main DB auth
-			}
+			// An error is no verdict on the user, whatever its kind (network, 5xx,
+			// circuit breaker, a malformed answer, or one this proxy cannot classify):
+			// NEVER fall back to the database. Only a definite "not found" does, and
+			// only with lookup_local_users (below); without it this node may have no
+			// database at all. Nothing is wrong with the client's credentials: answer a
+			// temporary failure (NO [UNAVAILABLE]) and do not charge the auth rate
+			// limiter, or clients retrying during an outage get delayed and blocked.
+			s.WarnLog("remotelookup transient error - service unavailable", "error", err)
+			metrics.RemoteLookupResult.WithLabelValues("imap", "transient_error_rejected").Inc()
+			metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+			return server.ErrAuthServiceUnavailable
 		} else {
 			switch authResult {
 			case proxy.AuthSuccess:
@@ -1166,6 +1169,20 @@ func (s *Session) authenticateUser(username, password string) error {
 					metrics.RemoteLookupResult.WithLabelValues("imap", "user_not_found_fallback").Inc()
 					// Fallthrough to main DB auth
 				} else {
+					// The lookup service never sees the password. A wrong password for an
+					// address it knows is refused after a verification against the returned
+					// hash, and the refusal is cached (AuthFailed above). Refuse this one
+					// the same way, or the response time to the login and to its repeat
+					// shows which addresses the service knows. A master login checks no
+					// hash for a known address, so it spends none here either.
+					if !masterAuthValidated {
+						db.DummyVerifyPassword(password)
+					}
+					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+						PasswordDigest: lookupcache.NewPasswordDigest(password),
+						Result:         lookupcache.AuthUserNotFound,
+						IsNegative:     true,
+					})
 					s.InfoLog("user not found in remotelookup, local lookup disabled - rejecting")
 					metrics.RemoteLookupResult.WithLabelValues("imap", "user_not_found_rejected").Inc()
 					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
@@ -1179,24 +1196,22 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Fallback to main DB
 	// If master auth was already validated, just get account ID and continue
 	// Otherwise, authenticate via main DB
-	var address server.Address
-	var err error
-	// Use already parsed address if available
-	if parseErr == nil {
-		address = parsedAddr
-	} else {
-		// Parse failed earlier - try again with NewAddress (shouldn't happen but handle it)
-		address, err = server.NewAddress(username)
-		if err != nil {
-			return fmt.Errorf("invalid address format: %w", err)
-		}
+	//
+	// A username that does not parse names no account: a failed login like any
+	// other, recorded and counted. Every login without a remote lookup gets here.
+	if parseErr != nil {
+		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
+		metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
+		return fmt.Errorf("invalid address format: %w", parseErr)
 	}
+	address := parsedAddr
 
+	var err error
 	var accountID int64
 	if masterAuthValidated {
 		// Master authentication already validated - just get account ID
 		s.DebugLog("master auth already validated, getting account ID from main database")
-		accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+		accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
 		if err != nil {
 			// Check if error is due to session context cancellation (server shutdown)
 			// Note: Must check s.ctx.Err(), not just the query error, because the query context
@@ -1204,6 +1219,15 @@ func (s *Session) authenticateUser(username, password string) error {
 			if s.ctx.Err() != nil {
 				s.InfoLog("master auth cancelled due to server shutdown")
 				return server.ErrServerShuttingDown
+			}
+
+			// The database could not be asked, so nothing is known about the target: a
+			// temporary failure (NO [UNAVAILABLE]), not a failed login charged to the master
+			// credential. The bare sentinel, because the reply carries the error's text.
+			if server.IsTemporaryAuthFailure(err) {
+				s.WarnLog("authentication unavailable", "method", "master", "user", address.BaseAddress(), "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+				return server.ErrAuthServiceUnavailable
 			}
 
 			s.InfoLog("master auth failed - account not found", "user", address.BaseAddress(), "error", err)
@@ -1225,23 +1249,24 @@ func (s *Session) authenticateUser(username, password string) error {
 				return server.ErrServerShuttingDown
 			}
 
+			// The database could not be asked, or the stored hash cannot be checked, so
+			// nothing is known about the credentials: a temporary failure (NO
+			// [UNAVAILABLE]), neither counted as a failed login nor cached. The bare
+			// sentinel, because the reply carries the error's text.
+			if proxy.IsTemporaryDBAuthFailure(err) {
+				reason, _ := proxy.ClassifyDBAuthFailure(err)
+				s.WarnLog("authentication unavailable", "reason", reason, "method", "main_db", "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+				return server.ErrAuthServiceUnavailable
+			}
+
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 			metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 
-			// Only cache definitive authentication failures, NOT transient errors
-			// Definitive failures: user not found, wrong password (from bcrypt.CompareHashAndPassword)
-			// Do NOT cache: DB connection errors, timeouts, etc (let circuit breakers handle those)
-			isDefinitiveFailure := errors.Is(err, consts.ErrUserNotFound) ||
-				strings.Contains(err.Error(), "hashedPassword is not the hash") || // bcrypt wrong password
-				strings.Contains(err.Error(), "user not found")
-
-			// Determine failure reason for logging
-			reason := "transient_error"
-			if errors.Is(err, consts.ErrUserNotFound) || strings.Contains(err.Error(), "user not found") {
-				reason = "user_not_found"
-			} else if strings.Contains(err.Error(), "hashedPassword is not the hash") {
-				reason = "invalid_password"
-			}
+			// Only cache definitive authentication failures (user not found, wrong
+			// password), NOT transient errors (DB connection errors, timeouts, etc):
+			// circuit breakers handle those.
+			reason, isDefinitiveFailure := proxy.ClassifyDBAuthFailure(err)
 
 			if isDefinitiveFailure {
 				s.DebugLog("caching definitive auth failure", "username", username)
@@ -1283,9 +1308,10 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Track successful authentication.
 	metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
 
-	// Track domain and user connection activity for the login event.
+	// Track domain and user connection activity for the login event. The user is the base
+	// address, the name a lookup-cache hit replaying this login counts it under.
 	metrics.TrackDomainConnection("imap_proxy", address.Domain())
-	metrics.TrackUserActivity("imap_proxy", address.FullAddress(), "connection", 1)
+	metrics.TrackUserActivity("imap_proxy", address.BaseAddress(), "connection", 1)
 
 	// Single consolidated log for authentication success
 	method := "main_db"
@@ -1319,6 +1345,7 @@ func (s *Session) connectToBackend() error {
 	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 		Ctx:                   s.ctx,
 		Username:              s.username,
+		ClientIP:              server.GetRealClientIP(s.clientConn, s.proxyInfo),
 		Protocol:              "imap",
 		IsRemoteLookupAccount: s.isRemoteLookupAccount,
 		RoutingInfo:           s.routingInfo,
@@ -1363,15 +1390,8 @@ func (s *Session) connectToBackend() error {
 		s.routingInfo.ProxySessionID = s.sessionID
 	}
 
-	// Use real client IP from PROXY protocol if available
-	var clientHost string
-	var clientPort int
-	if s.proxyInfo != nil && s.proxyInfo.SrcIP != "" {
-		clientHost = s.proxyInfo.SrcIP
-		clientPort = s.proxyInfo.SrcPort
-	} else {
-		clientHost, clientPort = server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
-	}
+	// The backend's PROXY header names the real client (the incoming PROXY header's source).
+	clientHost, clientPort := server.GetRealClientAddr(s.clientConn, s.proxyInfo)
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		connectCtx,

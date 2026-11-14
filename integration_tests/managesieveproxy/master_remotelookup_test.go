@@ -99,8 +99,8 @@ func TestManageSieveProxy_MasterTokenViaRemoteLookup(t *testing.T) {
 		}
 		if !expectOK {
 			// Documents the user-reported failure: a remote-lookup response that omits
-			// the resolved address is rejected as an invalid response and surfaces as
-			// `NO "Authentication failed"` — identically for IMAP/POP3/ManageSieve.
+			// the resolved address is rejected as an invalid response, handled like a
+			// lookup outage — identically for IMAP/POP3/ManageSieve.
 			t.Logf("✓ Correctly rejected (no resolved address): %s", response)
 			return
 		}
@@ -135,7 +135,7 @@ func TestManageSieveProxy_MasterTokenViaRemoteLookup(t *testing.T) {
 		run(t, account.Email+"@"+masterToken, true)
 	})
 	// Remote lookup authenticates but omits the resolved address entirely: rejected by the
-	// shared remote-lookup contract (address is required), surfaces as `NO "Authentication failed"`.
+	// shared remote-lookup contract (address is required), a broken answer like a lookup outage.
 	t.Run("RemoteLookup omits resolved address", func(t *testing.T) { run(t, "", false) })
 }
 

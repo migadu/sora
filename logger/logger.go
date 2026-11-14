@@ -1,26 +1,29 @@
 // Package logger provides structured logging for the Sora email server.
 //
 // This package wraps Go's standard library slog for high-performance
-// structured logging with support for multiple outputs:
-//   - Console (stdout/stderr)
-//   - File (reopened on SIGHUP, so newsyslog or logrotate can rotate it)
-//   - Syslog (local or remote)
+// structured logging with support for multiple outputs, chosen by
+// config.LoggingConfig.Output:
+//   - Console: "stderr" (the default) or "stdout"
+//   - Syslog: "syslog", the local syslog daemon only
+//   - File: any other value is the path of the log file (reopened on SIGHUP,
+//     so newsyslog or logrotate can rotate it)
 //
 // # Initialization
 //
 // Initialize the logger once at application startup:
 //
 //	cfg := config.LoggingConfig{
-//		Output: "file",
-//		File:   "/var/log/sora/sora.log",
+//		Output: "/var/log/sora/sora.log",
 //		Level:  "info",
 //		Format: "json",
 //	}
 //	logFile, err := logger.Initialize(cfg)
 //	if err != nil {
-//		log.Fatal(err)
+//		fmt.Fprintf(os.Stderr, "initializing logger: %v\n", err)
 //	}
-//	defer logFile.Close()
+//	if logFile != nil { // nil unless the output is a file
+//		defer logFile.Close()
+//	}
 //
 // # Usage
 //
@@ -58,13 +61,14 @@
 //
 // # Syslog Integration
 //
-// For syslog output:
+// Output = "syslog" writes to the local syslog daemon with the fixed tag "sora"
+// (facility daemon); Format does not apply. Remote syslog is not supported: have
+// the local daemon forward to a remote collector. If the local daemon cannot be
+// reached, or on Windows, the logger falls back to stderr.
 //
 //	cfg := config.LoggingConfig{
-//		Output:     "syslog",
-//		SyslogAddr: "localhost:514",  // or "/dev/log" for local
-//		SyslogTag:  "sora",
-//		Level:      "info",
+//		Output: "syslog",
+//		Level:  "info",
 //	}
 //
 // # Performance
@@ -417,6 +421,7 @@ func Initialize(cfg config.LoggingConfig) (*LogFile, error) {
 	l := slog.New(handler)
 	globalLogger.Store(l)
 	slog.SetDefault(l)
+	release(handler) // what was logged since Hold
 
 	return logFile, nil
 }
@@ -495,6 +500,7 @@ func ErrorContext(ctx context.Context, msg string, args ...any) {
 // Fatal logs a fatal message and exits
 func Fatal(msg string, args ...any) {
 	Get().Error(msg, args...)
+	Sync()
 	os.Exit(1)
 }
 
@@ -536,10 +542,16 @@ func Errorf(format string, args ...any) {
 // Fatalf logs a fatal message with formatting and exits (compatibility)
 func Fatalf(format string, args ...any) {
 	Get().Error(fmt.Sprintf(format, args...))
+	Sync()
 	os.Exit(1)
 }
 
-// Sync flushes any buffered log entries (no-op for slog, kept for compatibility)
+// Sync writes to stderr what Hold keeps when Initialize has not run, for a process that
+// stops before its logging is configured. Otherwise there is nothing to flush: slog does
+// not buffer.
 func Sync() error {
+	if held.Load() != nil {
+		release(slog.NewTextHandler(os.Stderr, nil))
+	}
 	return nil
 }

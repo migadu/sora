@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,6 +31,7 @@ func TestDecideResolve(t *testing.T) {
 		{"intact body here is re-armed, not deleted", false, true, stagedIntact, resolveRearm},
 		{"size mismatch is left to a human", false, true, stagedSizeMismatch, resolveSkipSizeMismatch},
 		{"nowhere at all is deleted", false, true, stagedAbsent, resolveDelete},
+		{"a spool that cannot be read is no proof", false, true, stagedUnknown, resolveSkipUnknown},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -46,4 +51,39 @@ func TestStagedBodyState(t *testing.T) {
 	assert.Equal(t, stagedSizeMismatch, stagedBodyState(path, 5), "wrong size")
 
 	assert.Equal(t, stagedAbsent, stagedBodyState(dir, 4), "a directory is not a body")
+
+	// sora-admin run as a user who cannot enter the spool must not read that as absent.
+	if os.Geteuid() == 0 {
+		t.Skip("root reads the file whatever its permissions")
+	}
+	locked := filepath.Join(dir, "42")
+	require.NoError(t, os.Mkdir(locked, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(locked, "body"), []byte("abcd"), 0o644))
+	require.NoError(t, os.Chmod(locked, 0))
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	assert.Equal(t, stagedUnknown, stagedBodyState(filepath.Join(locked, "body"), 4), "permission denied")
+}
+
+// With the default [uploader] path, the bodies a previous release staged under its /tmp
+// default are intact but not where resolve looks: it would [DELETE] their messages. It
+// must refuse before touching the database, as the server refuses to start.
+func TestResolveRefusesWhileLegacySpoolHoldsBodies(t *testing.T) {
+	legacy := filepath.Join(t.TempDir(), "uploads")
+	body := filepath.Join(legacy, "42", strings.Repeat("a", 64))
+	require.NoError(t, os.MkdirAll(filepath.Dir(body), 0o755))
+	require.NoError(t, os.WriteFile(body, []byte("staged"), 0o644))
+
+	saved := legacyUploaderPath
+	legacyUploaderPath = legacy
+	t.Cleanup(func() { legacyUploaderPath = saved })
+
+	var cfg AdminConfig
+	cfg.Uploader.Path = config.DefaultUploaderPath
+	cfg.Uploader.MaxAttempts = 1
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := resolveFailedUploads(ctx, cfg, false, 1)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), body, "the error names the stranded body")
 }

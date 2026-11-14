@@ -4,19 +4,49 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"strconv"
+	"strings"
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 )
 
-// validateRemoteLookupURL requires https:// for non-loopback hosts. A plaintext
-// remote-lookup endpoint exposes the user's password and the returned password hash
-// to an on-path attacker, who can also forge the backend-routing response.
+// RemoteLookupUsesClientIP reports whether lookup results can depend on the client's
+// network. The proxy lookup caches are keyed by user, so these lookups must bypass
+// both authentication and route caches rather than reuse another network's verdict.
+func RemoteLookupUsesClientIP(cfg *config.RemoteLookupConfig) bool {
+	return cfg != nil && cfg.Enabled && strings.Contains(cfg.URL, "$ip")
+}
+
+// validateRemoteLookupURL checks that the template yields a request URL for every
+// lookup, and requires https:// for non-loopback hosts. A plaintext remote-lookup
+// endpoint exposes the user's password and the returned password hash to an on-path
+// attacker, who can also forge the backend-routing response.
+//
+// The template itself parsing is not enough: the client substitutes $email and $ip
+// with url.QueryEscape, so in the host they become %40 or %3A, which net/url refuses,
+// and every lookup would fail before a request is sent. Placeholders therefore belong
+// in the path and query, and sample request URLs are built the way the client builds
+// them (an IPv4, an IPv6 and no client IP) and parsed.
 func validateRemoteLookupURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid remotelookup.url: %w", err)
+	}
+	if u.Hostname() == "" {
+		return fmt.Errorf("invalid remotelookup.url: no host")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("invalid remotelookup.url: scheme must be http or https (got %q)", u.Scheme)
+	}
+	for _, placeholder := range []string{"$email", "$ip"} {
+		if strings.Contains(u.Host, placeholder) {
+			return fmt.Errorf("invalid remotelookup.url: %s is allowed only in the path and query, not in the host %q", placeholder, u.Host)
+		}
+	}
+	for _, clientIP := range []string{"192.0.2.1", "2001:db8::1", ""} {
+		if _, err := url.Parse(remoteLookupRequestURL(rawURL, "user@example.com", clientIP, false)); err != nil {
+			return fmt.Errorf("invalid remotelookup.url: lookup requests cannot be built: %w", err)
+		}
 	}
 	if u.Scheme == "https" {
 		return nil
@@ -28,10 +58,32 @@ func validateRemoteLookupURL(rawURL string) error {
 	return fmt.Errorf("remotelookup.url must use https:// for non-loopback hosts (got scheme %q); plaintext exposes credentials and password hashes", u.Scheme)
 }
 
-// InitializeRemoteLookup creates an HTTP remotelookup client from configuration
-func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig) (UserRoutingLookup, error) {
+// standardBackendPorts are the ports the backends listen on by default (as in
+// config.toml.example). The User API has none: a port-less address there takes the
+// port of the URL scheme, as a port-less remote_addrs entry does.
+var standardBackendPorts = map[string]int{
+	"imap":        143,
+	"pop3":        110,
+	"managesieve": 4190,
+	"lmtp":        24,
+}
+
+// implicitTLSBackendPorts are the registered implicit TLS ports (RFC 8314 §3.1 "pop3s"
+// 995, §3.2 "imaps" 993), used when the lookup's backend leg is remote_tls without
+// STARTTLS. ManageSieve and LMTP have no such port and keep their standard one.
+var implicitTLSBackendPorts = map[string]int{
+	"imap": 993,
+	"pop3": 995,
+}
+
+// InitializeRemoteLookup creates an HTTP remotelookup client from configuration.
+// serverRemotePort is the proxy's own remote_port (0 when unset).
+func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig, serverRemotePort int) (UserRoutingLookup, error) {
 	if cfg == nil || !cfg.Enabled {
 		return nil, nil
+	}
+	if RemoteLookupUsesClientIP(cfg) {
+		logger.Info("RemoteLookup: Bypassing user-keyed lookup cache because URL uses $ip", "protocol", protocol)
 	}
 
 	if cfg.URL == "" {
@@ -53,27 +105,23 @@ func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig) (Us
 		remoteTLSVerify = *cfg.RemoteTLSVerify
 	}
 
-	// Parse remote port (can be int or string)
-	remotePort := 0
-	if cfg.RemotePort != nil {
-		switch v := cfg.RemotePort.(type) {
-		case int:
-			remotePort = v
-		case int64:
-			remotePort = int(v)
-		case string:
-			// Try to parse string as int
-			if v != "" {
-				var err error
-				remotePort, err = strconv.Atoi(v)
-				if err != nil {
-					logger.Debug("RemoteLookup: Warning - failed to parse remote_port, using default", "value", v)
-					remotePort = 0
-				}
-			}
-		default:
-			logger.Debug("RemoteLookup: Warning - remote_port has unexpected type, using default", "type", fmt.Sprintf("%T", v))
-		}
+	// remote_port may be an int or a string; 0 means unset.
+	remotePort, err := cfg.GetRemotePort()
+	if err != nil {
+		return nil, fmt.Errorf("invalid remote_lookup.remote_port: %w", err)
+	}
+	// A lookup answer naming a server without a port is dialed at the lookup's own
+	// remote_port, else at the proxy's remote_port (what its port-less pool and
+	// remote_addrs backends get), else at the protocol's standard port for the backend
+	// leg this lookup configures (implicit TLS or not).
+	if remotePort == 0 {
+		remotePort = serverRemotePort
+	}
+	if remotePort == 0 && cfg.RemoteTLS && !cfg.RemoteTLSUseStartTLS {
+		remotePort = implicitTLSBackendPorts[protocol]
+	}
+	if remotePort == 0 {
+		remotePort = standardBackendPorts[protocol]
 	}
 
 	hasAuth := cfg.AuthToken != ""

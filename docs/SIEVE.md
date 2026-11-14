@@ -113,7 +113,7 @@ script text and the extension set. A changed script is never served from a stale
 ## 3. The built-in default script
 
 Every delivery runs a built-in script first, before the user's script. It is compiled into
-Sora ([server/lmtp/default.sieve](../server/lmtp/default.sieve)). There is no setting to change it
+Sora ([server/delivery/default.sieve](../server/delivery/default.sieve)). There is no setting to change it
 or turn it off, and there is no other global or per-domain script.
 
 ```sieve
@@ -660,7 +660,7 @@ Relay metrics for redirects and replies are in [RELAY.md](RELAY.md#6-operating-t
 |---|---|
 | Compiling, running and interpreting results, the redirect checks, header edits | [server/sieveengine/sieve.go](../server/sieveengine/sieve.go) |
 | The compiled-script cache | [server/sieveengine/script_cache.go](../server/sieveengine/script_cache.go) |
-| The built-in default script | [server/lmtp/default.sieve](../server/lmtp/default.sieve) |
+| The built-in default script | [server/delivery/default.sieve](../server/delivery/default.sieve) |
 | LMTP delivery: default plus user script, merge, storing, redirect | [server/lmtp/session.go](../server/lmtp/session.go) |
 | Admin API delivery path | [server/delivery/sieve.go](../server/delivery/sieve.go), [server/delivery/delivery.go](../server/delivery/delivery.go) |
 | Vacation reply building and suppression | [server/delivery/vacation.go](../server/delivery/vacation.go), [server/delivery/vacation_mime.go](../server/delivery/vacation_mime.go) |

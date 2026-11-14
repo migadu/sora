@@ -5,7 +5,6 @@
 //   - SQLite-based metadata tracking
 //   - LRU eviction based on size limits
 //   - Metrics for hit/miss ratios
-//   - Automatic warming for recently accessed mailboxes
 //   - Content deduplication at read level
 //
 // # Cache Architecture
@@ -41,9 +40,6 @@
 //	// Put into cache
 //	err = cache.Put(ctx, contentHash, messageBody)
 //
-//	// Warm cache for a mailbox
-//	err = cache.WarmCache(ctx, AccountID, []string{"INBOX"}, 100)
-//
 // # Metrics
 //
 // The cache tracks:
@@ -59,11 +55,9 @@
 //
 // # Cache Warming
 //
-// For better performance, warm the cache when a user logs in:
-//
-//	cache.WarmCache(ctx, AccountID, []string{"INBOX", "Sent"}, 50)
-//
-// This pre-loads the 50 most recent messages from specified mailboxes.
+// The IMAP server warms the cache when a user logs in ([local_cache] enable_warmup):
+// it fetches the most recent messages of the configured mailboxes from S3 and puts
+// them here.
 package cache
 
 import (
@@ -74,6 +68,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,7 +86,6 @@ import (
 // This allows for mocking in tests.
 type SourceDatabase interface {
 	FindExistingContentHashesWithRetry(ctx context.Context, hashes []string) ([]string, error)
-	GetRecentMessagesForWarmupWithRetry(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error)
 }
 
 const DataDir = "data"
@@ -99,12 +93,26 @@ const IndexDB = "cache_index.db"
 const PurgeBatchSize = 1000
 const NumShards = 256
 
-// ErrObjectTooLarge is returned when attempting to cache an object that exceeds the size limit
+// tmpInfix marks the temporary file a write puts next to its final path:
+// <path>.tmp.<suffix>. Final names are hex and never hold it.
+const tmpInfix = ".tmp."
+
+// staleTmpAge is how old a temporary file must be before the shard sweep removes it: a
+// write finishes with its file within seconds, so one this old was cut off by a crash.
+const staleTmpAge = time.Hour
+
+// ErrObjectTooLarge is returned when attempting to cache an object that exceeds the size
+// limit: max_object_size, or one shard's share of the capacity (see tooLarge).
 var ErrObjectTooLarge = errors.New("object size exceeds limit")
 
 type cacheShard struct {
 	db *sql.DB
 	mu sync.Mutex
+	// size is an upper bound on the bytes the shard's index tracks, guarded by mu. It is
+	// measured when the shard is opened and by every purge of it, and grows with every
+	// object tracked. Removals other than a purge's leave it high, which costs at most
+	// one needless purge check.
+	size int64
 }
 
 type Cache struct {
@@ -192,7 +200,7 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval
 
 	for i := 0; i < NumShards; i++ {
 		shardHex := fmt.Sprintf("%02x", i)
-		dbPath := filepath.Join(basePath, fmt.Sprintf("cache_index_%s.db", shardHex))
+		dbPath := shardIndexPath(basePath, i)
 		db, err := sql.Open("sqlite", dbPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open cache index DB for shard %s: %w", shardHex, err)
@@ -217,12 +225,70 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval
 			return nil, fmt.Errorf("failed to initialize cache index schema for shard %s: %w", shardHex, err)
 		}
 
-		c.shards[i] = &cacheShard{db: db}
+		shard := &cacheShard{db: db}
+		if err := db.QueryRow(`SELECT COALESCE(SUM(size), 0) FROM cache_index`).Scan(&shard.size); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to measure cache index for shard %s: %w", shardHex, err)
+		}
+		c.shards[i] = shard
 	}
 
+	if shardCapacity := maxSizeBytes / NumShards; maxObjectSize > shardCapacity {
+		logger.Info("Cache: max_object_size is above one shard's share of the capacity (capacity/256); larger objects are not cached",
+			"max_object_size", maxObjectSize, "effective_max_object_size", shardCapacity)
+	}
+
+	// No purge loop here: the server starts the one it runs with StartPurgeLoop, and
+	// sora-admin opens the cache of a running server.
 	go c.processAccessLog()
-	c.StartPurgeLoop(context.Background())
 	return c, nil
+}
+
+// tooLarge reports whether an object of size bytes is refused: above max_object_size, or
+// above its shard's share of the capacity. Capacity is enforced per shard, so an object
+// larger than that share cannot stay cached: writing it would evict every other object
+// of its shard and then the object itself.
+func (c *Cache) tooLarge(size int64) bool {
+	return size > c.maxObjectSize || size > c.capacity/NumShards
+}
+
+func shardIndexPath(basePath string, shard int) string {
+	return filepath.Join(basePath, fmt.Sprintf("cache_index_%02x.db", shard))
+}
+
+// Usage returns the number of objects the index of the cache at basePath tracks and
+// their total size. It opens the index read-only and changes nothing: no purge runs,
+// and a path that holds no cache is an error rather than a new cache. (SQLite still
+// creates an index's -wal and -shm files when no other connection, such as a running
+// server's, has.) sora-admin reports on the cache of a running server with it.
+func Usage(basePath string) (objects, totalSize int64, err error) {
+	basePath = strings.TrimSpace(basePath)
+	if basePath == "" {
+		return 0, 0, fmt.Errorf("cache base path cannot be empty")
+	}
+	if basePath, err = filepath.Abs(basePath); err != nil {
+		return 0, 0, err
+	}
+	for i := 0; i < NumShards; i++ {
+		dbPath := shardIndexPath(basePath, i)
+		if _, err := os.Stat(dbPath); err != nil {
+			return 0, 0, fmt.Errorf("no cache index at %s: %w", dbPath, err)
+		}
+		dsn := (&url.URL{Scheme: "file", Path: dbPath, RawQuery: "mode=ro&_pragma=busy_timeout(5000)"}).String()
+		db, err := sql.Open("sqlite", dsn)
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to open cache index %s: %w", dbPath, err)
+		}
+		var n, size int64
+		err = db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(size), 0) FROM cache_index`).Scan(&n, &size)
+		db.Close()
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to read cache index %s: %w", dbPath, err)
+		}
+		objects += n
+		totalSize += size
+	}
+	return objects, totalSize, nil
 }
 
 func (c *Cache) processAccessLog() {
@@ -276,7 +342,13 @@ func (c *Cache) processAccessLog() {
 	}
 }
 
-// GetPathForContentHash returns the absolute filesystem path for a content hash
+// GetPathForContentHash returns the absolute filesystem path for a content hash:
+// data/XX/YY/<rest of the hash>.
+//
+// The fan-out directories data/XX and data/XX/YY are created by the first write into them
+// and never removed again (only PurgeAll removes them): a writer creates its directory and
+// then puts its file into it, so removing a directory that looks empty would pull it out
+// from under a writer in between, which then fails (#645). There are at most 256 × 256.
 func (c *Cache) GetPathForContentHash(contentHash string) string {
 	if len(contentHash) < 4 {
 		return filepath.Join(c.basePath, DataDir, contentHash)
@@ -319,15 +391,14 @@ func (c *Cache) Delete(contentHash string) error {
 	path := c.GetPathForContentHash(contentHash)
 	shard := c.getShard(contentHash)
 
+	// The file and its row go under the shard lock, as in every removal: a Put of the
+	// object in between would otherwise lose its row and leave a file without one.
+	shard.mu.Lock()
 	err := os.Remove(path)
 	if err != nil && !os.IsNotExist(err) {
+		shard.mu.Unlock()
 		return fmt.Errorf("failed to delete file: %w", err)
 	}
-
-	dataDir := filepath.Join(c.basePath, DataDir)
-	removeEmptyParents(path, dataDir)
-
-	shard.mu.Lock()
 	_, dbErr := shard.db.Exec(`DELETE FROM cache_index WHERE path = ?`, path)
 	shard.mu.Unlock()
 
@@ -342,14 +413,20 @@ func (c *Cache) Delete(contentHash string) error {
 // MoveIn moves a file into the cache directory structure and tracks it.
 // The file at sourcePath will be removed (either by rename or explicit removal if it already exists).
 // This is typically used to move a downloaded temp file into the cache.
+// A file the cache does not take (see tooLarge) is refused with ErrObjectTooLarge and,
+// as when the move itself fails, left for the caller to remove.
 func (c *Cache) MoveIn(sourcePath string, contentHash string) error {
+	if info, err := os.Stat(sourcePath); err == nil && c.tooLarge(info.Size()) {
+		return ErrObjectTooLarge
+	}
+
 	targetPath := c.GetPathForContentHash(contentHash)
 	shard := c.getShard(contentHash)
 
 	if _, err := os.Stat(targetPath); err == nil {
 		logger.Info("Cache: File already exists in cache - removing source", "target", targetPath, "source", sourcePath)
 		_ = os.Remove(sourcePath)
-		return c.trackFile(shard, targetPath)
+		return c.trackPlaced(shard, targetPath)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
@@ -361,12 +438,12 @@ func (c *Cache) MoveIn(sourcePath string, contentHash string) error {
 			if copyErr := c.copyAndRemove(sourcePath, targetPath); copyErr != nil {
 				return copyErr
 			}
-			return c.trackFile(shard, targetPath)
+			return c.trackPlaced(shard, targetPath)
 		}
 		return fmt.Errorf("failed to move file into cache: %w", err)
 	}
 
-	return c.trackFile(shard, targetPath)
+	return c.trackPlaced(shard, targetPath)
 }
 
 // copyAndRemove is a fallback for os.Rename when crossing device boundaries (EXDEV)
@@ -380,7 +457,7 @@ func (c *Cache) copyAndRemove(src, dst string) error {
 	// Copy to a temporary name and rename: by the time MoveIn runs, the message row
 	// is already marked uploaded, so a reader may open dst at any moment and must
 	// never see it half-written.
-	tmp := dst + ".tmp." + fmt.Sprintf("%d", time.Now().UnixNano())
+	tmp := dst + tmpInfix + fmt.Sprintf("%d", time.Now().UnixNano())
 	destFile, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to create destination file for copy: %w", err)
@@ -438,6 +515,10 @@ func (c *Cache) Get(contentHash string) ([]byte, error) {
 
 // Put writes an object to the cache.
 func (c *Cache) Put(contentHash string, data []byte) error {
+	if c.tooLarge(int64(len(data))) {
+		return ErrObjectTooLarge
+	}
+
 	path := c.GetPathForContentHash(contentHash)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -447,7 +528,7 @@ func (c *Cache) Put(contentHash string, data []byte) error {
 	// Write to temp file first to avoid partial reads by concurrent requests
 	b := make([]byte, 4)
 	rand.Read(b)
-	tempPath := path + ".tmp." + fmt.Sprintf("%d_%x", time.Now().UnixNano(), b)
+	tempPath := path + tmpInfix + fmt.Sprintf("%d_%x", time.Now().UnixNano(), b)
 	file, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to create cache file: %w", err)
@@ -457,9 +538,6 @@ func (c *Cache) Put(contentHash string, data []byte) error {
 		os.Remove(tempPath) // Clean up temp file if rename fails
 	}()
 
-	if int64(len(data)) > c.maxObjectSize {
-		return ErrObjectTooLarge
-	}
 	_, err = file.Write(data)
 	if err != nil {
 		return fmt.Errorf("failed to write cache file: %w", err)
@@ -476,7 +554,22 @@ func (c *Cache) Put(contentHash string, data []byte) error {
 	}
 
 	shard := c.getShard(contentHash)
-	return c.trackFile(shard, path)
+	return c.trackPlaced(shard, path)
+}
+
+// trackPlaced indexes a file Put or MoveIn has just put in place at path, and removes it
+// again when the index does not take it. Every eviction starts from the index and Get
+// serves the file without looking at it, so a file left without its row would stay on
+// disk for good, outside the capacity (#768). The body is content-addressed: the next
+// miss fetches it again.
+func (c *Cache) trackPlaced(shard *cacheShard, path string) error {
+	err := c.trackFile(shard, path)
+	if err != nil {
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			logger.Warn("Cache: Failed to remove a file the index did not take", "path", path, "error", rmErr)
+		}
+	}
+	return err
 }
 
 func (c *Cache) trackFile(shard *cacheShard, path string) error {
@@ -485,24 +578,46 @@ func (c *Cache) trackFile(shard *cacheShard, path string) error {
 		return fmt.Errorf("failed to stat file for tracking: %w", err)
 	}
 
+	shardCapacity := c.capacity / NumShards
 	shard.mu.Lock()
 	_, err = shard.db.Exec(
 		`INSERT OR REPLACE INTO cache_index (path, size, mod_time) VALUES (?, ?, ?)`,
 		path, info.Size(), info.ModTime(),
 	)
+	if err == nil {
+		shard.size += info.Size()
+	}
+	full := shard.size > shardCapacity
 	shard.mu.Unlock()
 
 	if err != nil {
 		return fmt.Errorf("failed to update cache index: %w", err)
 	}
 
+	// Hold the capacity as objects come in, not only at the next purge cycle: that runs
+	// every purge_interval, and the uploader moves every body it uploads in.
+	if full {
+		if err := c.purgeShardIfNeeded(context.Background(), shard, shardCapacity); err != nil {
+			logger.Warn("Cache: Purge after write failed", "error", err)
+		}
+	}
+
 	return nil
 }
 
+// StartPurgeLoop runs a purge cycle at once and then every purge interval, until ctx
+// is done or the cache is closed. The server starts it once; New does not.
 func (c *Cache) StartPurgeLoop(ctx context.Context) {
 	go func() {
-		dirCleanupShardIdx := 0
-		c.runPurgeCycle(ctx, &dirCleanupShardIdx)
+		// Each cycle sweeps one shard, so all 256 take 256 purge intervals (128 days at
+		// the default 12h). The rotation follows the clock rather than starting over at
+		// shard 00: a node restarted more often than that would otherwise sweep its first
+		// few shards again and again and never the rest.
+		staleShardIdx := 0
+		if c.purgeInterval > 0 {
+			staleShardIdx = int(time.Now().UnixNano() / int64(c.purgeInterval) % NumShards)
+		}
+		c.runPurgeCycle(ctx, &staleShardIdx)
 
 		ticker := time.NewTicker(c.purgeInterval)
 		defer ticker.Stop()
@@ -514,14 +629,24 @@ func (c *Cache) StartPurgeLoop(ctx context.Context) {
 			case <-c.stopChan:
 				return
 			case <-ticker.C:
-				c.runPurgeCycle(ctx, &dirCleanupShardIdx)
+				c.runPurgeCycle(ctx, &staleShardIdx)
 			}
 		}
 	}()
 }
 
-func (c *Cache) runPurgeCycle(ctx context.Context, dirCleanupShardIdx *int) {
+func (c *Cache) runPurgeCycle(ctx context.Context, staleShardIdx *int) {
 	logger.Info("Cache: running cache purge cycle")
+
+	// The shard's sweep comes first, so this cycle's capacity purge covers what it indexed.
+	shard := c.shards[*staleShardIdx]
+	if err := c.removeStaleEntriesForShard(ctx, shard); err != nil {
+		logger.Error("Cache: Stale DB entry cleanup error for shard", "error", err, "shard", *staleShardIdx)
+	}
+	if err := c.sweepShardFiles(ctx, *staleShardIdx); err != nil {
+		logger.Error("Cache: File sweep error for shard", "error", err, "shard", *staleShardIdx)
+	}
+
 	if err := c.PurgeIfNeeded(ctx); err != nil {
 		logger.Warn("Cache: Purge failed", "error", err)
 	}
@@ -529,75 +654,7 @@ func (c *Cache) runPurgeCycle(ctx context.Context, dirCleanupShardIdx *int) {
 		logger.Error("Cache: Orphan cleanup error", "error", err)
 	}
 
-	shard := c.shards[*dirCleanupShardIdx]
-	if err := c.removeStaleEntriesForShard(ctx, shard); err != nil {
-		logger.Error("Cache: Stale DB entry cleanup error for shard", "error", err, "shard", *dirCleanupShardIdx)
-	}
-	if err := c.cleanupStaleDirectoriesForShard(*dirCleanupShardIdx); err != nil {
-		logger.Error("Cache: Stale dir cleanup error for shard", "error", err, "shard", *dirCleanupShardIdx)
-	}
-
-	*dirCleanupShardIdx = (*dirCleanupShardIdx + 1) % NumShards
-}
-
-func (c *Cache) cleanupStaleDirectoriesForShard(shardIdx int) error {
-	shardPrefix := fmt.Sprintf("%02x", shardIdx)
-	shardDir := filepath.Join(c.basePath, DataDir, shardPrefix)
-
-	if _, err := os.Stat(shardDir); os.IsNotExist(err) {
-		return nil
-	}
-
-	return filepath.WalkDir(shardDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			var pathError *fs.PathError
-			if errors.As(err, &pathError) && errors.Is(pathError.Err, os.ErrNotExist) && pathError.Path == path {
-				return nil
-			}
-			logger.Error("Cache: Error walking path", "path", path, "error", err)
-			return err
-		}
-		if !d.IsDir() {
-			return nil
-		}
-
-		if path == filepath.Join(c.basePath, DataDir) {
-			return nil
-		}
-
-		removeErr := os.Remove(path)
-		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) && !isDirNotEmptyError(removeErr) {
-			logger.Warn("Cache: Unexpected error removing directory", "path", path, "error", removeErr)
-		}
-		return nil
-	})
-}
-
-// removeEmptyParents climbs the directory tree from path upwards and removes empty directories,
-// stopping at stopDir (or when a directory is not empty).
-func removeEmptyParents(path, stopDir string) {
-	dir := filepath.Dir(path)
-	for {
-		if len(dir) <= len(stopDir) || !strings.HasPrefix(dir, stopDir) {
-			break
-		}
-		err := os.Remove(dir)
-		if err != nil {
-			break
-		}
-		dir = filepath.Dir(dir)
-	}
-}
-
-// isDirNotEmptyError checks if the error from os.Remove is due to the directory not being empty.
-func isDirNotEmptyError(err error) bool {
-	var pathErr *os.PathError
-	if errors.As(err, &pathErr) {
-		return errors.Is(pathErr.Err, syscall.ENOTEMPTY) ||
-			errors.Is(pathErr.Err, syscall.EEXIST) || // Some systems return EEXIST for non-empty dir
-			strings.Contains(pathErr.Err.Error(), "directory not empty")
-	}
-	return false
+	*staleShardIdx = (*staleShardIdx + 1) % NumShards
 }
 
 func (c *Cache) PurgeIfNeeded(ctx context.Context) error {
@@ -637,7 +694,6 @@ func (c *Cache) purgeShardIfNeeded(ctx context.Context, shard *cacheShard, capac
 		return nil
 	}
 
-	dataDir := filepath.Join(c.basePath, DataDir)
 	for _, item := range pathsToPurge {
 		shard.mu.Lock()
 		removeErr := os.Remove(item.path)
@@ -646,8 +702,14 @@ func (c *Cache) purgeShardIfNeeded(ctx context.Context, shard *cacheShard, capac
 			shard.mu.Unlock()
 			continue
 		}
-		removeEmptyParents(item.path, dataDir)
-		_, dbErr := shard.db.ExecContext(ctx, `DELETE FROM cache_index WHERE path = ?`, item.path)
+		res, dbErr := shard.db.ExecContext(ctx, `DELETE FROM cache_index WHERE path = ?`, item.path)
+		if dbErr == nil {
+			// Only the purge that removed the row counts it: two purges of a shard can
+			// pick the same candidates.
+			if n, _ := res.RowsAffected(); n > 0 {
+				shard.size -= item.size
+			}
+		}
 		shard.mu.Unlock()
 		if dbErr != nil {
 			logger.Warn("Cache: Failed to delete DB entry during purge", "path", item.path, "error", dbErr)
@@ -668,6 +730,7 @@ func (c *Cache) getPurgeCandidatesForShard(ctx context.Context, shard *cacheShar
 	if err != nil {
 		return nil, fmt.Errorf("failed to query total shard size: %w", err)
 	}
+	shard.size = currentSize
 
 	if currentSize <= capacity {
 		return nil, nil
@@ -704,21 +767,11 @@ func (c *Cache) getPurgeCandidatesForShard(ctx context.Context, shard *cacheShar
 	return pathsToPurge, nil
 }
 
+// PurgeAll empties the cache. The index is cleared before the files are removed: a write
+// landing in between then leaves at most a row without its file, which the stale-entry
+// sweep drops and Get treats as a miss, never a file whose row the clearing drops, which
+// no eviction would ever reach (#768).
 func (c *Cache) PurgeAll(ctx context.Context) error {
-	dataDir := filepath.Join(c.basePath, DataDir)
-
-	entries, err := os.ReadDir(dataDir)
-	if err == nil {
-		for _, entry := range entries {
-			if entry.IsDir() && len(entry.Name()) == 2 {
-				fullPath := filepath.Join(dataDir, entry.Name())
-				if err := os.RemoveAll(fullPath); err != nil {
-					logger.Error("Cache: Failed to remove directory during PurgeAll", "path", fullPath, "error", err)
-				}
-			}
-		}
-	}
-
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var errs []error
@@ -732,14 +785,41 @@ func (c *Cache) PurgeAll(ctx context.Context) error {
 				errMu.Lock()
 				errs = append(errs, err)
 				errMu.Unlock()
+			} else {
+				shard.size = 0
 			}
 			shard.mu.Unlock()
 		}(c.shards[i])
 	}
 	wg.Wait()
 
+	dataDir := filepath.Join(c.basePath, DataDir)
+	entries, err := os.ReadDir(dataDir)
+	if err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("failed to read cache data directory: %w", err))
+	} else if err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() && len(entry.Name()) == 2 {
+				fullPath := filepath.Join(dataDir, entry.Name())
+				if err := os.RemoveAll(fullPath); err != nil {
+					logger.Error("Cache: Failed to remove directory during PurgeAll", "path", fullPath, "error", err)
+					errs = append(errs, fmt.Errorf("failed to remove cache directory %s: %w", fullPath, err))
+					// The index was cleared first to cover racing writers. If removing a
+					// shard only partly succeeded, put its remaining bodies back into the
+					// index now rather than waiting for its next periodic sweep.
+					hi, lo := hexCharToByte(entry.Name()[0]), hexCharToByte(entry.Name()[1])
+					if hi < 16 && lo < 16 {
+						if err := c.sweepShardFiles(ctx, int(hi<<4|lo)); err != nil {
+							errs = append(errs, fmt.Errorf("failed to re-index cache directory %s: %w", fullPath, err))
+						}
+					}
+				}
+			}
+		}
+	}
+
 	if len(errs) > 0 {
-		return fmt.Errorf("failed to clear cache index, encountered %d errors", len(errs))
+		return fmt.Errorf("failed to purge cache, encountered %d errors: %w", len(errs), errors.Join(errs...))
 	}
 
 	logger.Info("Cache: PurgeAll completed")
@@ -795,9 +875,16 @@ func (c *Cache) PurgeOrphanedContentHashes(ctx context.Context) error {
 		for _, hash := range contentHashes {
 			if !existingMap[hash] {
 				p := hashToPath[hash]
-				os.Remove(p)
-				removeEmptyParents(p, filepath.Join(c.basePath, DataDir))
+				// The row goes only with its file, and both under the shard lock, as in
+				// the capacity purge: a row dropped next to a file that stays (a failed
+				// remove, or a Put of the object in between) leaves that file outside
+				// every eviction (#768).
 				shard.mu.Lock()
+				if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+					shard.mu.Unlock()
+					logger.Warn("Cache: Failed to delete orphaned file", "path", p, "error", err)
+					continue
+				}
 				shard.db.Exec(`DELETE FROM cache_index WHERE path = ?`, p)
 				shard.mu.Unlock()
 				purged++
@@ -832,53 +919,100 @@ func (c *Cache) removeStaleEntriesForShard(ctx context.Context, shard *cacheShar
 
 	for _, p := range stalePaths {
 		shard.mu.Lock()
-		shard.db.ExecContext(ctx, `DELETE FROM cache_index WHERE path = ?`, p)
+		// Checked again under the lock: a Put of the object may have put its file back
+		// since, and its row must stay with it (#768).
+		if _, err := os.Lstat(p); os.IsNotExist(err) {
+			shard.db.ExecContext(ctx, `DELETE FROM cache_index WHERE path = ?`, p)
+		}
 		shard.mu.Unlock()
 	}
 	return nil
 }
 
-// WarmCache pre-loads message bodies for the specified mailboxes into the cache.
-// It is intended to be called in the background when a user logs in.
-func (c *Cache) WarmCache(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) error {
-	logger.Debug("Cache: Starting background warmup",
-		"account_id", AccountID,
-		"mailboxes", len(mailboxNames),
-		"message_count", messageCount)
+// sweepShardFiles walks shard idx's directory data/XX for what the index lost: a file
+// under its final name without a row is indexed, so the capacity and the orphan purge
+// cover it again, and a temporary file older than staleTmpAge is removed. A write cut off
+// by a crash leaves them (one between its rename and its index insert, one before its
+// rename); nothing else reaches them, as every eviction starts from the index and Get
+// serves a file without indexing it (#768). Directories stay (#645).
+func (c *Cache) sweepShardFiles(ctx context.Context, idx int) error {
+	shard := c.shards[idx]
 
-	hashMap, err := c.sourceDB.GetRecentMessagesForWarmupWithRetry(ctx, AccountID, mailboxNames, messageCount)
+	shard.mu.Lock()
+	rows, err := shard.db.QueryContext(ctx, `SELECT path FROM cache_index`)
+	shard.mu.Unlock()
 	if err != nil {
-		return fmt.Errorf("failed to fetch hashes for warmup: %w", err)
+		return fmt.Errorf("failed to query cache index: %w", err)
 	}
-
-	var warmCount int
-	for _, hashes := range hashMap {
-		for _, hash := range hashes {
-			// Quick check if it's already in cache
-			exists, err := c.Exists(hash)
-			if err == nil && exists {
-				continue
-			}
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-				// Read it from S3 - this will implicitly cache it if our Get implementation
-				// fetches on miss. But since Cache.Get doesn't fetch, we assume the caller
-				// or a higher level component does the fetch.
-				// Wait, the cache package itself doesn't fetch from S3.
-				// We just want to ensure it's in the cache. This implies the cache SHOULD
-				// fetch it, or someone else should.
-				// For this method to make sense, it just signals intent.
-				// Let's just log it for now.
-			}
-			warmCount++
+	indexed := make(map[string]struct{})
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err == nil {
+			indexed[p] = struct{}{}
 		}
 	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read cache index: %w", err)
+	}
 
-	logger.Debug("Cache: Warmup completed", "account_id", AccountID, "warmed_count", warmCount)
-	return nil
+	var added, addedSize int64
+	var removedTmp int
+	staleBefore := time.Now().Add(-staleTmpAge)
+	dir := filepath.Join(c.basePath, DataDir, fmt.Sprintf("%02x", idx))
+	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if !os.IsNotExist(err) {
+				logger.Warn("Cache: Failed to read path during file sweep", "path", path, "error", err)
+			}
+			return nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		if strings.Contains(d.Name(), tmpInfix) {
+			if info, err := d.Info(); err == nil && info.ModTime().Before(staleBefore) {
+				if err := os.Remove(path); err == nil {
+					removedTmp++
+				} else if !os.IsNotExist(err) {
+					logger.Warn("Cache: Failed to remove stale temporary file", "path", path, "error", err)
+				}
+			}
+			return nil
+		}
+		if _, ok := indexed[path]; ok {
+			return nil
+		}
+		// Under the lock, as every removal takes its file and row under it: a file
+		// removed since is not indexed again.
+		shard.mu.Lock()
+		defer shard.mu.Unlock()
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		res, err := shard.db.ExecContext(ctx,
+			`INSERT OR IGNORE INTO cache_index (path, size, mod_time) VALUES (?, ?, ?)`,
+			path, info.Size(), info.ModTime())
+		if err != nil {
+			logger.Warn("Cache: Failed to index file during file sweep", "path", path, "error", err)
+			return nil
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			shard.size += info.Size()
+			added++
+			addedSize += info.Size()
+		}
+		return nil
+	})
+	if added > 0 || removedTmp > 0 {
+		logger.Info("Cache: File sweep took back files the index lost", "shard", fmt.Sprintf("%02x", idx),
+			"indexed", added, "indexed_bytes", addedSize, "removed_tmp", removedTmp)
+	}
+	return err
 }
 
 // GetStats returns current cache statistics
@@ -924,10 +1058,6 @@ func (c *Cache) GetStats() (CacheStats, error) {
 	metrics.CacheSizeBytes.Set(float64(totalSize))
 
 	return stats, nil
-}
-
-func (c *Cache) GetRecentMessagesForWarmup(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
-	return c.sourceDB.GetRecentMessagesForWarmupWithRetry(ctx, AccountID, mailboxNames, messageCount)
 }
 
 type CacheMetrics struct {

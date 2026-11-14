@@ -5,11 +5,11 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -60,24 +60,20 @@ var (
 	date    = "unknown"
 )
 
-// serverManager tracks running servers for coordinated shutdown
+// serverManager tracks running servers for coordinated shutdown. It has no bare
+// Add: a server that counted itself from its own goroutine could be missed by a
+// Wait that had already begun (#769).
 type serverManager struct {
 	wg sync.WaitGroup
-	mu sync.Mutex
 }
 
-func (sm *serverManager) Add() {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	sm.wg.Add(1)
+// Go runs start in a new goroutine that Wait waits for. The goroutine is counted
+// before it starts, so a Wait that begins after Go returns includes it.
+func (sm *serverManager) Go(start func()) {
+	sm.wg.Go(start)
 }
 
-func (sm *serverManager) Done() {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	sm.wg.Done()
-}
-
+// Wait returns once every goroutine started by Go has returned.
 func (sm *serverManager) Wait() {
 	sm.wg.Wait()
 }
@@ -116,7 +112,27 @@ type serverDependencies struct {
 	maintenance           *proxy.Maintenance                   // backends in maintenance, honored by every proxy (nil without proxies or DB)
 	maintenanceGate       *server.MaintenanceGate              // refuses new sessions while this backend is in maintenance (nil on a node that does not report its sessions)
 	runningServers        map[string]ConfigReloader            // server name -> reloadable server
-	runningServersMux     sync.Mutex                           // protects runningServers map
+	runningServersMux     sync.Mutex                           // protects runningServers, registering and registered
+	// registering are the servers startServers started that take a reload and have
+	// neither registered for one nor stopped starting; registered is closed when none
+	// is left (see expectRegistrations).
+	registering map[string]bool
+	registered  chan struct{}
+}
+
+// connectionTrackersSnapshot and proxyServersSnapshot copy the maps under their mutexes,
+// for readers that run while servers still register (the Admin API serves as soon as
+// its own goroutine starts, independently of the other servers' start goroutines).
+func (deps *serverDependencies) connectionTrackersSnapshot() map[string]*server.ConnectionTracker {
+	deps.connectionTrackersMux.Lock()
+	defer deps.connectionTrackersMux.Unlock()
+	return maps.Clone(deps.connectionTrackers)
+}
+
+func (deps *serverDependencies) proxyServersSnapshot() map[string]adminapi.ProxyServer {
+	deps.proxyServersMux.Lock()
+	defer deps.proxyServersMux.Unlock()
+	return maps.Clone(deps.proxyServers)
 }
 
 // ConfigReloader is implemented by servers that support runtime config reload via SIGHUP.
@@ -133,9 +149,83 @@ func (deps *serverDependencies) registerServer(name string, server ConfigReloade
 		deps.runningServers = make(map[string]ConfigReloader)
 	}
 	deps.runningServers[name] = server
+	deps.settleLocked(name)
+}
+
+// expectRegistrations notes, before startServers starts any of them, the servers that
+// take a reload (the types in reloadableServerSettings). Each registers for it from its
+// own start goroutine, after its listener is set up, so a reload run before then passes
+// it over as not running: the settings its ReloadConfig would apply are reported as
+// needing a restart, and it keeps the ones it started with. serversRegistered tells
+// when every one has registered, or stopped starting without (skipped for want of an
+// api_key or jwt_secret, or failed, which ends the process).
+func (deps *serverDependencies) expectRegistrations(servers []config.ServerConfig) {
+	deps.runningServersMux.Lock()
+	defer deps.runningServersMux.Unlock()
+	deps.registering = make(map[string]bool)
+	deps.registered = make(chan struct{})
+	for _, s := range servers {
+		if _, reloads := reloadableServerSettings[s.Type]; reloads {
+			deps.registering[s.Name] = true
+		}
+	}
+	if len(deps.registering) == 0 {
+		deps.registering = nil
+		close(deps.registered)
+	}
+}
+
+// startReturned is called when a server's start goroutine returns: a server that
+// stopped starting without registering for reload is not waited for.
+func (deps *serverDependencies) startReturned(name string) {
+	deps.runningServersMux.Lock()
+	defer deps.runningServersMux.Unlock()
+	deps.settleLocked(name)
+}
+
+// settleLocked stops waiting for name to register. The caller holds runningServersMux.
+func (deps *serverDependencies) settleLocked(name string) {
+	if deps.registering == nil {
+		return
+	}
+	delete(deps.registering, name)
+	if len(deps.registering) == 0 {
+		deps.registering = nil
+		close(deps.registered)
+	}
+}
+
+// serversRegistered is closed once every server expectRegistrations noted has
+// registered for reload or stopped starting.
+func (deps *serverDependencies) serversRegistered() <-chan struct{} {
+	deps.runningServersMux.Lock()
+	defer deps.runningServersMux.Unlock()
+	return deps.registered
+}
+
+// relayQueueOption is the relay queue as the servers' delivery.RelayQueue option: a nil
+// interface on a node without [relay]. Assigning the nil *relayqueue.DiskQueue directly
+// would store a nil pointer in a non-nil interface, so every "relay not configured" check
+// (RelayQueue == nil) would take the configured branch and call Enqueue on the nil queue.
+func (deps *serverDependencies) relayQueueOption() delivery.RelayQueue {
+	if deps.relayQueue == nil {
+		return nil
+	}
+	return deps.relayQueue
+}
+
+// relayWorkerOption is relayQueueOption for the worker LMTP wakes after an enqueue.
+func (deps *serverDependencies) relayWorkerOption() lmtp.RelayWorkerNotifier {
+	if deps.relayWorker == nil {
+		return nil
+	}
+	return deps.relayWorker
 }
 
 func main() {
+	// Before anything else: until SIGHUP is taken, it terminates the process.
+	sighup := listenForSIGHUP()
+
 	errorHandler := errors.NewErrorHandler()
 	cfg := config.NewDefaultConfig()
 
@@ -150,12 +240,15 @@ func main() {
 		os.Exit(0)
 	}
 
+	// Logging is configured by the file loadAndValidateConfig reads. What is logged until
+	// logger.Initialize, the warnings about that file among it, is held and then written
+	// where [logging] says, at its level.
+	logger.Hold()
+	logger.Info("---------------------")
+	logger.Info("SORA application starting", "version", version, "commit", commit, "built", date)
+
 	// Load and validate configuration
 	loadAndValidateConfig(*configPath, &cfg, errorHandler)
-
-	// Clean up default database config if user explicitly set empty sections
-	// This allows proxy-only mode without database
-	cleanupDatabaseDefaults(&cfg)
 
 	// Apply the configured bcrypt cost (clamped) for password hashing/rehash.
 	db.SetBcryptCost(cfg.GetBcryptCost())
@@ -164,7 +257,7 @@ func main() {
 	// soft-wait cap). Clamped to a sane range inside the setter.
 	sieveengine.SetScriptExecutionTimeout(cfg.Sieve.GetMaxExecutionTime())
 
-	// Initialize logging with zap logger
+	// Initialize logging (log/slog), flushing records held since logger.Hold.
 	logFile, err := logger.Initialize(cfg.Logging)
 	if err != nil {
 		fmt.Fprintf(logger.Stderr(), "SORA: Warning initializing logger: %v\n", err)
@@ -181,8 +274,6 @@ func main() {
 		defer logger.Sync() // Still sync even without a log file
 	}
 
-	logger.Info("---------------------")
-	logger.Info("SORA application starting", "version", version, "commit", commit, "built", date)
 	logger.Info("Logging configuration", "format", cfg.Logging.Format, "level", cfg.Logging.Level)
 
 	// Initialize global timeout scheduler with configured shard count
@@ -256,38 +347,16 @@ func main() {
 	if deps.relayWorker != nil {
 		defer deps.relayWorker.Stop()
 	}
-
-	// SIGHUP handler for config reload - set up AFTER deps is created so the running
-	// servers are registered. Global settings are only reported (handleConfigReload
-	// leaves deps.config as it is); each server reloads its own.
-	reloadChan := make(chan os.Signal, 1)
-	signal.Notify(reloadChan, syscall.SIGHUP)
-	go func() {
-		for range reloadChan {
-			// newsyslog sends SIGHUP after rotating the log file: reopen it first,
-			// so the reload below is logged into the new file.
-			if err := logger.Reopen(); err != nil {
-				logger.Error("SIGHUP: log file not reopened", "error", err)
-			}
-			logger.Info("SIGHUP received - reloading configuration", "config", *configPath)
-
-			// Re-read the full config for per-server dispatch
-			newCfg := config.NewDefaultConfig()
-			if err := config.LoadConfigFromFile(*configPath, &newCfg); err != nil {
-				logger.Error("Config reload failed - keeping current config", "error", err)
-				continue
-			}
-
-			// Report the global settings that need a restart
-			handleConfigReload(*configPath, &deps.config, errorHandler)
-
-			// Dispatch per-server reload to running servers
-			deps.reloadServers(&newCfg)
-		}
-	}()
+	if deps.spamTrainingClient != nil {
+		defer deps.spamTrainingClient.Close()
+	}
 
 	// Start all configured servers
 	errChan := startServers(ctx, deps)
+
+	// A SIGHUP reloads the configuration once the servers that take a reload have
+	// registered for it; one that came during start-up reloads then.
+	sighup.startWhenServersRegistered(ctx, deps, func() { deps.reloadConfig(*configPath) })
 
 	// Wait for shutdown signal or error
 	select {
@@ -321,96 +390,63 @@ func main() {
 	}
 }
 
-// cleanupDatabaseDefaults clears default database config if the TOML explicitly has empty sections
-// This allows proxy-only deployments without database
-func cleanupDatabaseDefaults(cfg *config.Config) {
-	// If database.write section exists but has default "localhost", clear it
-	// This happens when user has [database.write] but no hosts specified
-	if cfg.Database.Write != nil {
-		if len(cfg.Database.Write.Hosts) == 1 && cfg.Database.Write.Hosts[0] == "localhost" &&
-			cfg.Database.Write.User == "postgres" && cfg.Database.Write.Name == "sora_mail_db" {
-			// This looks like unmodified defaults - user probably wants no database
-			logger.Debug("Detected default database.write config - clearing for proxy-only mode")
-			cfg.Database.Write = nil
-		}
-	}
-
-	// Same for read config
-	if cfg.Database.Read != nil {
-		if len(cfg.Database.Read.Hosts) == 1 && cfg.Database.Read.Hosts[0] == "localhost" &&
-			cfg.Database.Read.User == "postgres" && cfg.Database.Read.Name == "sora_mail_db" {
-			logger.Debug("Detected default database.read config - clearing for proxy-only mode")
-			cfg.Database.Read = nil
-		}
-	}
+// readConfigFile reads the config file identically for startup and reload.
+func readConfigFile(configPath string) (config.Config, error) {
+	var cfg config.Config
+	err := config.LoadServerConfig(configPath, &cfg)
+	return cfg, err
 }
 
-// handleConfigReload reports the global settings a reload changed but cannot apply.
-// Their consumers took them at start-up, or (for [shared_mailboxes]) read the
-// process-wide config with no lock, so the running config is left as it is and a
-// change takes effect on restart. Per-server settings are reloaded by each server's
-// ReloadConfig, which the SIGHUP handler calls after this.
-func handleConfigReload(configPath string, currentCfg *config.Config, errorHandler *errors.ErrorHandler) {
-	newCfg := config.NewDefaultConfig()
-
-	// Re-read config file
-	if err := config.LoadConfigFromFile(configPath, &newCfg); err != nil {
+// reloadConfig is what a SIGHUP does once the servers run. It reads the file once and
+// hands that one config to both halves of the reload, the global report and the
+// per-server reload, so they cannot act on two versions of the file.
+func (deps *serverDependencies) reloadConfig(configPath string) {
+	logger.Info("SIGHUP received - reloading configuration", "config", configPath)
+	newCfg, err := readConfigFile(configPath)
+	if err != nil {
 		logger.Error("Config reload failed - keeping current config", "error", err)
 		return
 	}
+	handleConfigReload(&deps.config, &newCfg)
+	deps.reloadServers(&newCfg)
+}
 
-	// Logging level changes require restart (logger doesn't support runtime level change)
-	if newCfg.Logging.Level != currentCfg.Logging.Level {
-		logger.Info("Config reload: logging.level changed but requires restart to take effect",
-			"current", currentCfg.Logging.Level, "new", newCfg.Logging.Level)
-	}
+// reloadableGlobalSettings are the global settings a change to which takes effect
+// without restarting sora, so a reload does not report them. None of sora's own is
+// among them: their consumers took them at start-up, or (for [shared_mailboxes]) read
+// the process-wide config with no lock, so a reload leaves the running config as it is.
+// [admin_cli] is sora-admin's, which reads the file on every run; sora never reads it.
+var reloadableGlobalSettings = []string{
+	"admin_cli.addr", "admin_cli.api_key", "admin_cli.insecure_skip_verify", "admin_cli.import_message_limit",
+}
 
-	// The cleaner is configured once, at start-up.
-	if newCfg.Cleanup != currentCfg.Cleanup {
-		logger.Info("Config reload: [cleanup] changed but requires restart to take effect",
-			"current", currentCfg.Cleanup, "new", newCfg.Cleanup)
-	}
-
-	// IMAP sessions read [shared_mailboxes] from the process-wide config with no lock,
-	// so a reload must not write it (and a session that has seen the shared namespace
-	// would lose it midway).
-	if newCfg.SharedMailboxes != currentCfg.SharedMailboxes {
-		logger.Info("Config reload: [shared_mailboxes] changed but requires restart to take effect",
-			"current", currentCfg.SharedMailboxes, "new", newCfg.SharedMailboxes)
-	}
-
-	// The [sieve] section is read once at startup by every consumer (LMTP, the
-	// Admin and User APIs, ManageSieve; max_execution_time at process start), so a
-	// change takes effect on restart. It used to be reported as reloaded, and
-	// whenever the list was non-empty, not only when it changed.
-	if !reflect.DeepEqual(newCfg.Sieve, currentCfg.Sieve) {
-		logger.Info("Config reload: [sieve] changed but requires restart to take effect",
-			"current", currentCfg.Sieve, "new", newCfg.Sieve)
-	}
-	// [backend_maintenance] tunes the poller and the drains, which start with the proxies.
-	if newCfg.Maintenance != currentCfg.Maintenance {
-		logger.Info("Config reload: [backend_maintenance] changed but requires restart to take effect",
-			"current", currentCfg.Maintenance, "new", newCfg.Maintenance)
-	}
-
-	// IMAP takes the [metadata] limits at start-up.
-	if newCfg.Metadata != currentCfg.Metadata {
-		logger.Info("Config reload: [metadata] changed but requires restart to take effect",
-			"current", currentCfg.Metadata, "new", newCfg.Metadata)
+// handleConfigReload reports the global settings next, the config a SIGHUP read,
+// changes from current, the running one, and leaves current as it is. Every one of
+// them takes effect on restart. Each server's [[server]] block is reloadServers' to
+// report, and its ReloadConfig's to apply.
+func handleConfigReload(current, next *config.Config) {
+	// Names only: values include passwords and keys.
+	if changed := current.RestartRequiredChanges(next, reloadableGlobalSettings); len(changed) > 0 {
+		logger.Info("Config reload: global settings changed but require restart to take effect", "fields", changed)
 	}
 
 	// Every server and proxy takes trusted_networks at start-up: until a restart, the
-	// networks they started with stay trusted and added ones are not.
-	if !slices.Equal(newCfg.Servers.TrustedNetworks, currentCfg.Servers.TrustedNetworks) {
+	// networks they started with stay trusted and added ones are not. A malformed entry
+	// is an error: the server would not start with this file.
+	if err := next.ValidateTrustedNetworks(); err != nil {
+		logger.Error("Config reload: servers.trusted_networks is invalid and the server will not start with this config; the networks the servers started with stay trusted", "error", err)
+	} else if !slices.Equal(next.Servers.TrustedNetworks, current.Servers.TrustedNetworks) {
 		logger.Warn("Config reload: servers.trusted_networks changed but requires restart to take effect; the networks the servers started with stay trusted until then",
-			"current", currentCfg.Servers.TrustedNetworks, "new", newCfg.Servers.TrustedNetworks)
+			"current", current.Servers.TrustedNetworks, "new", next.Servers.TrustedNetworks)
 	}
 }
 
 // loadAndValidateConfig loads configuration from file and validates all server configurations
 func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *errors.ErrorHandler) {
 	// Load configuration from TOML file
-	if err := config.LoadConfigFromFile(configPath, cfg); err != nil {
+	loaded, err := readConfigFile(configPath)
+	*cfg = loaded
+	if err != nil {
 		if os.IsNotExist(err) {
 			// If default config doesn't exist, that's okay - use defaults
 			if configPath == "config.toml" {
@@ -434,8 +470,13 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 
 	// Get all configured servers
 	allServers := cfg.GetAllServers()
+	for _, server := range cfg.DynamicServers {
+		if !server.IsEnabled() {
+			logger.Info("Server block has enabled = false - not starting it", "server", server.Name, "type", server.Type)
+		}
+	}
 
-	// Validate all server configurations
+	// Validate all server configurations, including a block that lacks type, name or addr
 	for _, server := range allServers {
 		if err := server.Validate(); err != nil {
 			errorHandler.ValidationError(fmt.Sprintf("server '%s'", server.Name), err)
@@ -447,6 +488,22 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 	// and the proxy servers that route into them.
 	if err := cfg.ValidatePools(); err != nil {
 		errorHandler.ValidationError("[[pool]]", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+
+	if err := cfg.Relay.Validate(); err != nil {
+		errorHandler.ValidationError("[relay]", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+
+	// One malformed trusted_networks entry would leave LMTP admission with no peers.
+	if err := cfg.ValidateTrustedNetworks(); err != nil {
+		errorHandler.ValidationError("trusted_networks", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+
+	if err := cfg.SharedMailboxes.Validate(); err != nil {
+		errorHandler.ValidationError("[shared_mailboxes]", err)
 		os.Exit(errorHandler.WaitForExit())
 	}
 
@@ -464,7 +521,8 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 	// the insecure-wide pattern. (security-audit M2)
 	if len(cfg.Servers.TrustedNetworks) == 0 {
 		logger.Info("trusted_networks is empty (fail-closed default): PROXY/XCLIENT client-IP forwarding and " +
-			"auth rate-limit exemption are disabled; LMTP still accepts delivery from default private ranges. " +
+			"auth rate-limit exemption are disabled; LMTP and lmtp_proxy still accept delivery from the default " +
+			"private ranges (loopback and RFC 1918). " +
 			"Set [servers] trusted_networks to your proxy IPs to enable forwarding/exemption.")
 	} else if config.TrustedNetworksHaveBroadPrivateRanges(cfg.Servers.TrustedNetworks) {
 		logger.Warn("trusted_networks includes whole private ranges (e.g. 10.0.0.0/8): every host on those " +
@@ -493,7 +551,7 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 
 	// Check if any server is configured
 	if len(allServers) == 0 {
-		errorHandler.ValidationError("servers", fmt.Errorf("no servers configured. Please configure at least one server in the [[servers]] section"))
+		errorHandler.ValidationError("servers", fmt.Errorf("no servers configured. Please configure at least one server in a [[server]] section"))
 		os.Exit(errorHandler.WaitForExit())
 	}
 
@@ -507,19 +565,19 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 func logInstanceIdentity(identity config.NodeIdentity) {
 	osHostname, err := os.Hostname()
 
-	// Warn only about the identity that is actually unsafe. A node_id that differs from
-	// the hostname is the normal, intended configuration, so it must not warn on every
+	// Warn only about the identity that is actually unsafe. An instance_id that differs
+	// from the hostname is the normal, intended configuration, so it must not warn on every
 	// boot; an id that no live instance owns is instead reported - by name, and only when
 	// one really exists - by the cleanup worker (cleaner.reportStrandedInstances).
 	if identity.InstanceID == config.FallbackInstanceID {
 		logger.Warn("Instance ID could not be derived from the host - using the fallback identity. "+
-			"Set cluster.node_id to a unique name per node: a shared instance id makes two nodes claim "+
+			"Set [uploader] instance_id to a unique name per node: a shared instance id makes two nodes claim "+
 			"each other's pending uploads, whose message bodies only exist on the node that queued them",
 			"instance_id", identity.InstanceID, "error", err)
 	} else {
 		source := "hostname"
 		if identity.InstanceID != osHostname {
-			source = "cluster.node_id"
+			source = "uploader.instance_id"
 		}
 		logger.Info("Resolved instance ID", "instance_id", identity.InstanceID, "source", source,
 			"note", "owner of this node's pending_uploads and instance_heartbeats rows; drain the upload queue before changing it")
@@ -538,6 +596,38 @@ func logInstanceIdentity(identity config.NodeIdentity) {
 	}
 	logger.Info("Resolved mail hostname", "mail_hostname", identity.MailHostname,
 		"note", "SMTP-visible name of this node: protocol greetings, Received 'by' host, vacation Message-ID domain")
+}
+
+// serverNeedsDatabase reports whether a server queries the database. The mail backends,
+// the ManageSieve backend and the HTTP APIs keep their accounts there. A mail proxy
+// authenticates its users there (the LMTP proxy looks up its recipients) unless a remote
+// lookup answers for all of them, which takes remote_lookup enabled with
+// lookup_local_users = false. The User API proxy leaves logins to its backends; it only
+// checks a local user's token there, with lookup_local_users = true.
+func serverNeedsDatabase(s config.ServerConfig) bool {
+	switch s.Type {
+	case "imap", "lmtp", "pop3", "managesieve", "http_admin_api", "http_user_api":
+		return true
+	case "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy":
+		return s.RemoteLookup == nil || !s.RemoteLookup.Enabled || s.RemoteLookup.ShouldLookupLocalUsers()
+	case "user_api_proxy":
+		return s.RemoteLookup != nil && s.RemoteLookup.ShouldLookupLocalUsers()
+	}
+	return false
+}
+
+// proxiesWithAffinity names the enabled proxy servers that set enable_affinity.
+func proxiesWithAffinity(cfg config.Config) []string {
+	var names []string
+	for _, s := range cfg.GetAllServers() {
+		switch s.Type {
+		case "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy":
+			if s.EnableAffinity {
+				names = append(names, s.Name)
+			}
+		}
+	}
+	return names
 }
 
 // initializeServices initializes all core services (S3, database, cache, workers) if storage services are needed
@@ -560,42 +650,30 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	// Determine if any mail storage services are enabled
 	allServers := cfg.GetAllServers()
 	storageServicesNeeded := false
-	databaseNeeded := false
+	userAPIServed := false
+	var databaseUser *config.ServerConfig // the first server that queries the database
 
 	// Check if database is actually configured
 	// Database is configured if either write or read has valid hosts
 	databaseConfigured := (cfg.Database.Write != nil && len(cfg.Database.Write.Hosts) > 0) ||
 		(cfg.Database.Read != nil && len(cfg.Database.Read.Hosts) > 0)
 
-	for _, server := range allServers {
+	for i, server := range allServers {
+		if databaseUser == nil && serverNeedsDatabase(server) {
+			databaseUser = &allServers[i]
+		}
 		if server.Type == "imap" || server.Type == "lmtp" || server.Type == "pop3" {
 			storageServicesNeeded = true
-			databaseNeeded = true
-			break
 		}
-		// Check if proxy servers need database (when lookup_local_users=true)
-		if server.Type == "imap_proxy" || server.Type == "pop3_proxy" || server.Type == "managesieve_proxy" || server.Type == "lmtp_proxy" || server.Type == "user_api_proxy" {
-			if server.RemoteLookup != nil && server.RemoteLookup.ShouldLookupLocalUsers() {
-				databaseNeeded = true
-			}
-		}
-		// Admin API and User API need database for account management
-		if server.Type == "http_admin_api" || server.Type == "http_user_api" {
-			databaseNeeded = true
+		if server.Type == "http_user_api" {
+			userAPIServed = true
 		}
 	}
 
 	// If database is needed but not configured, that's an error
-	if databaseNeeded && !databaseConfigured {
-		errorHandler.ValidationError("database configuration", fmt.Errorf("database is required for configured servers but not configured in [database.write] or [database.read]"))
+	if databaseUser != nil && !databaseConfigured {
+		errorHandler.ValidationError("database configuration", fmt.Errorf("server %q (%s) needs the database, but it is not configured in [database.write] or [database.read]", databaseUser.Name, databaseUser.Type))
 		os.Exit(errorHandler.WaitForExit())
-	}
-
-	// Override: if database is not configured at all, force databaseNeeded to false
-	// This allows proxy-only mode without database config
-	if !databaseConfigured {
-		databaseNeeded = false
-		logger.Info("Database not configured - forcing proxy-only mode (lookup_local_users will be treated as false)")
 	}
 
 	deps := &serverDependencies{
@@ -607,11 +685,36 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		proxyServers:       make(map[string]adminapi.ProxyServer),
 	}
 
-	// Initialize S3 storage if needed
+	// The User API serves message bodies (/user/messages/{id}/body and /raw) from S3, so
+	// it needs the [s3] connection on a node without mail services too. It reads through
+	// to S3 without the cache and workers those start below. Without any [s3] settings it
+	// serves everything but bodies.
+	s3Needed := storageServicesNeeded
+	if userAPIServed && !storageServicesNeeded {
+		if cfg.S3.Endpoint == "" && cfg.S3.Bucket == "" && cfg.S3.AccessKey == "" && cfg.S3.SecretKey == "" {
+			logger.Warn("User API: no [s3] configured on this node; message bodies (/user/messages/{id}/body and /raw) cannot be served")
+		} else {
+			s3Needed = true
+		}
+	}
+
+	// Check the staging path before any uploader or cleanup worker starts.
 	if storageServicesNeeded {
-		// Ensure required S3 arguments are provided only if needed
-		if cfg.S3.AccessKey == "" || cfg.S3.SecretKey == "" || cfg.S3.Bucket == "" {
-			errorHandler.ValidationError("S3 credentials", fmt.Errorf("missing required S3 credentials for mail services (IMAP, LMTP, POP3)"))
+		// The default [uploader] path moved off /tmp. Before any worker starts, refuse to
+		// strand bodies a previous release staged at the old default.
+		if err := uploader.CheckLegacyStaging(cfg.Uploader.Path, config.DefaultUploaderPath, config.LegacyDefaultUploaderPath); err != nil {
+			errorHandler.ValidationError("uploader path", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+	}
+
+	// Initialize S3 storage for mail services or a User API body reader.
+	if s3Needed {
+		// Ensure required S3 arguments are provided only if needed. Without access_key and
+		// secret_key the AWS default credential chain supplies them, and storage.New
+		// refuses to start when it finds none.
+		if cfg.S3.Bucket == "" {
+			errorHandler.ValidationError("S3 bucket", fmt.Errorf("missing required S3 bucket for mail services (IMAP, LMTP, POP3) or the User API"))
 			os.Exit(errorHandler.WaitForExit())
 		}
 
@@ -627,7 +730,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			os.Exit(errorHandler.WaitForExit())
 		}
 		logger.Info("Connecting to S3", "endpoint", s3EndpointToUse, "bucket", cfg.S3.Bucket, "timeout", s3Timeout)
-		deps.storage, err = storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.GetDebug(), s3Timeout)
+		deps.storage, err = storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.GetDebug(), s3Timeout, storage.WithRegion(cfg.S3.Region))
 		if err != nil {
 			errorHandler.FatalError(fmt.Sprintf("initialize S3 storage at endpoint '%s'", s3EndpointToUse), err)
 			os.Exit(errorHandler.WaitForExit())
@@ -644,15 +747,15 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 	// Initialize the resilient database with runtime failover (if needed)
 	var err error
-	if databaseNeeded {
+	if databaseUser != nil {
 		logger.Info("Connecting to database with resilient failover configuration")
 		deps.resilientDB, err = resilient.NewResilientDatabase(ctx, &cfg.Database, true, true)
 		if err != nil {
-			logger.Info("Failed to initialize resilient database", "error", err)
-			os.Exit(1)
+			errorHandler.FatalError("initialize resilient database", err)
+			os.Exit(errorHandler.WaitForExit())
 		}
 	} else {
-		logger.Info("Skipping database initialization - running in proxy-only mode with remote_lookup")
+		logger.Info("Skipping database initialization - no server on this node queries it")
 	}
 
 	// Start database metrics and health monitoring if database is available
@@ -666,23 +769,11 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	if cfg.AuthCache.Enabled {
 		acPath := cfg.AuthCache.Path
 		if acPath == "" {
-			acPath = "/tmp/sora/auth_cache.db"
+			acPath = config.DefaultAuthCachePath
 		}
-		acMaxAge, err := cfg.AuthCache.GetMaxAge()
-		if err != nil {
-			logger.Warn("AuthCache: Invalid max_age - using default (168h)", "error", err)
-			acMaxAge = 168 * time.Hour
-		}
-		acPurgeUnused, err := cfg.AuthCache.GetPurgeUnused()
-		if err != nil {
-			logger.Warn("AuthCache: Invalid purge_unused - using default (720h)", "error", err)
-			acPurgeUnused = 720 * time.Hour
-		}
-		acCleanupInterval, err := cfg.AuthCache.GetCleanupInterval()
-		if err != nil {
-			logger.Warn("AuthCache: Invalid cleanup_interval - using default (1h)", "error", err)
-			acCleanupInterval = time.Hour
-		}
+		acMaxAge := cfg.AuthCache.GetMaxAgeWithDefault()
+		acPurgeUnused := cfg.AuthCache.GetPurgeUnusedWithDefault()
+		acCleanupInterval := cfg.AuthCache.GetCleanupIntervalWithDefault()
 
 		// Ensure parent directory exists
 		if dir := filepath.Dir(acPath); dir != "" && dir != "." {
@@ -797,6 +888,17 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			}
 		}()
 
+		// The cleaner and the upload worker both take [uploader] max_attempts.
+		if err := cfg.Uploader.Validate(); err != nil {
+			errorHandler.ValidationError("[uploader]", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		// The cleaner and delivery both take [cleanup] fts_retention.
+		if err := cfg.Cleanup.Validate(); err != nil {
+			errorHandler.ValidationError("[cleanup]", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+
 		// Initialize and start the cleanup worker using configuration defaulting methods
 		gracePeriod := cfg.Cleanup.GetGracePeriodWithDefault()
 		wakeInterval := cfg.Cleanup.GetWakeIntervalWithDefault()
@@ -805,9 +907,10 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		deps.ftsRetention = ftsRetention
 		healthStatusRetention := cfg.Cleanup.GetHealthStatusRetentionWithDefault()
 		instanceLiveness := cfg.Cleanup.GetInstanceLivenessThresholdWithDefault()
+		redirectRateWindow := cfg.LongestRedirectRateWindow()
 
 		cleanupErrChan := make(chan error, 1)
-		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, cfg.Uploader.MaxAttempts, instanceLiveness, cleanupErrChan)
+		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, redirectRateWindow, cfg.Uploader.MaxAttempts, instanceLiveness, cleanupErrChan)
 		deps.ftsWorker = fts.NewWorker(deps.resilientDB)
 
 		// Start error listener for cleanup worker
@@ -899,7 +1002,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			os.Exit(errorHandler.WaitForExit())
 		}
 
-		logger.Info("Relay queue initialized", "path", queuePath, "max_attempts", cfg.Relay.Queue.MaxAttempts)
+		logger.Info("Relay queue initialized", "path", queuePath, "max_attempts", deps.relayQueue.MaxAttempts())
 
 		// Create relay handler from global relay config if configured
 		if cfg.Relay.IsConfigured() {
@@ -929,8 +1032,8 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					"",
 					"",
 					"relay_queue",
-					cfg.Relay.SMTPTLS,
-					cfg.Relay.SMTPTLSVerify,
+					cfg.Relay.GetSMTPTLS(),
+					cfg.Relay.GetSMTPTLSVerify(),
 					cfg.Relay.SMTPUseStartTLS,
 					cfg.Relay.SMTPTLSCertFile,
 					cfg.Relay.SMTPTLSKeyFile,
@@ -938,7 +1041,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					&serverLogger{},
 					cbConfig,
 				)
-				logger.Info("Relay handler configured: type=smtp", "host", cfg.Relay.SMTPHost, "helo", cfg.Relay.GetSMTPHELOHost(), "tls", cfg.Relay.SMTPTLS, "starttls", cfg.Relay.SMTPUseStartTLS, "cb_threshold", cbThreshold, "cb_timeout", cbTimeout, "cb_max_requests", cbMaxRequests)
+				logger.Info("Relay handler configured: type=smtp", "host", cfg.Relay.SMTPHost, "helo", cfg.Relay.GetSMTPHELOHost(), "tls", cfg.Relay.GetSMTPTLS(), "tls_verify", cfg.Relay.GetSMTPTLSVerify(), "starttls", cfg.Relay.SMTPUseStartTLS, "cb_threshold", cbThreshold, "cb_timeout", cbTimeout, "cb_max_requests", cbMaxRequests)
 			} else if cfg.Relay.IsHTTP() {
 				relayType = "http"
 				relayHandler = delivery.NewRelayHandlerFromConfig(
@@ -958,12 +1061,16 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 				)
 				logger.Info("Relay handler configured: type=http", "url", cfg.Relay.HTTPURL, "cb_threshold", cbThreshold, "cb_timeout", cbTimeout, "cb_max_requests", cbMaxRequests)
 			}
+			if warning := cfg.Relay.TransportWarning(); warning != "" {
+				logger.Warn(warning)
+			}
 
 			if relayHandler == nil {
 				// The queue exists but nothing would ever drain it: every Sieve redirect
 				// would be 250-accepted into pending/ and sit there forever. Refuse to
 				// start rather than accept mail into a dead end.
 				errorHandler.FatalError("configure relay", fmt.Errorf("unsupported [relay] type %q: expected \"smtp\" or \"http\"", cfg.Relay.Type))
+				os.Exit(errorHandler.WaitForExit())
 			}
 
 			if relayHandler != nil {
@@ -1062,9 +1169,15 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			affinityCleanup = 1 * time.Hour
 		}
 
-		// Initialize affinity manager for cluster-wide user-to-backend affinity
-		deps.affinityManager = server.NewAffinityManager(deps.clusterManager, true, affinityTTL, affinityCleanup)
-		logger.Info("Affinity manager initialized for cluster-wide user routing", "ttl", affinityTTL, "cleanup_interval", affinityCleanup)
+		// Initialize affinity manager for cluster-wide user-to-backend affinity. With
+		// [cluster.affinity] enabled = false there is none: proxies with enable_affinity
+		// route by consistent hash, and no affinity is gossiped or persisted.
+		deps.affinityManager = server.NewAffinityManager(deps.clusterManager, cfg.Cluster.Affinity.Enabled, affinityTTL, affinityCleanup)
+		if deps.affinityManager != nil {
+			logger.Info("Affinity manager initialized for cluster-wide user routing", "ttl", affinityTTL, "cleanup_interval", affinityCleanup)
+		} else {
+			logger.Info("Cluster-wide affinity disabled by [cluster.affinity] enabled = false")
+		}
 
 		// Attach persistent affinity store if configured
 		if cfg.Cluster.Affinity.CachePath != "" && deps.affinityManager != nil {
@@ -1076,6 +1189,14 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 				deps.affinityManager.LoadPersistedAffinities(ctx)
 				logger.Info("Affinity cache initialized", "path", cfg.Cluster.Affinity.CachePath)
 			}
+		}
+	}
+
+	// enable_affinity is served by the cluster affinity manager. Without one it does
+	// nothing, so say which proxies asked for it rather than drop it silently.
+	if deps.affinityManager == nil {
+		if names := proxiesWithAffinity(cfg); len(names) > 0 {
+			logger.Warn("enable_affinity has no effect without [cluster] and [cluster.affinity] enabled - these proxies route by consistent hash", "servers", names)
 		}
 	}
 
@@ -1123,7 +1244,6 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		} else {
 			logger.Info("Spam training client initialized",
 				"endpoint", cfg.SpamTraining.Endpoint,
-				"async", cfg.SpamTraining.Async,
 				"cb_threshold", cfg.SpamTraining.CircuitBreaker.GetThreshold())
 		}
 	}
@@ -1168,17 +1288,23 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 				}()
 
 				if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-					logger.Error("HTTP-01 challenge server error", err)
+					logger.Error("HTTP-01 challenge server error", "error", err)
 					errChan <- fmt.Errorf("HTTP-01 challenge server failed: %w", err)
 				}
 			}()
 		}
+		// Arm renewal for the certificates already cached. Not before this point: one
+		// that is due is renewed at once, and that order needs the issuance fence
+		// (installed with the manager) and HTTP-01 (enabled by HTTPHandler above).
+		deps.tlsManager.StartRenewals()
 	}
 
-	// Start all configured servers dynamically
+	// Start all configured servers dynamically. A reload waits for those that take one
+	// to register for it.
+	deps.expectRegistrations(allServers)
 	for _, server := range allServers {
 		// Warn about unused config options
-		server.WarnUnusedConfigOptions(func(format string, args ...any) { logger.Info(fmt.Sprintf(format, args...)) })
+		server.WarnUnusedConfigOptions(func(format string, args ...any) { logger.Warn(fmt.Sprintf(format, args...)) })
 
 		// Surface a dangerous misconfiguration: plaintext authentication allowed without
 		// TLS on a publicly reachable listener (clients would send credentials in the
@@ -1189,7 +1315,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 		switch server.Type {
 		case "imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy":
 			if (server.InsecureAuth || !server.TLS) && helpers.BindIsPubliclyReachable(server.Addr) {
-				logger.Warn("plaintext authentication is allowed without TLS on a publicly reachable address; configure TLS or set insecure_auth=false",
+				logger.Warn("plaintext authentication is allowed without TLS on a publicly reachable address; set tls = true and leave insecure_auth off (insecure_auth = false alone has no effect without TLS)",
 					"type", server.Type, "name", server.Name, "addr", server.Addr)
 			}
 		case "metrics":
@@ -1203,45 +1329,59 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 			}
 		}
 
+		var start func(context.Context, *serverDependencies, config.ServerConfig, chan error)
 		switch server.Type {
 		case "imap":
-			go startDynamicIMAPServer(ctx, deps, server, errChan)
+			start = startDynamicIMAPServer
 		case "lmtp":
-			go startDynamicLMTPServer(ctx, deps, server, errChan)
+			start = startDynamicLMTPServer
 		case "pop3":
-			go startDynamicPOP3Server(ctx, deps, server, errChan)
+			start = startDynamicPOP3Server
 		case "managesieve":
-			go startDynamicManageSieveServer(ctx, deps, server, errChan)
+			start = startDynamicManageSieveServer
 		case "metrics":
-			// Configure metrics collection settings
-			metrics.Configure(
-				server.EnableUserMetrics,
-				server.EnableDomainMetrics,
-				server.UserMetricsThreshold,
-				server.MaxTrackedUsers,
-				server.HashUsernames,
-			)
-			go startDynamicMetricsServer(ctx, deps, server, errChan)
+			configureMetrics(server)
+			start = startDynamicMetricsServer
 		case "imap_proxy":
-			go startDynamicIMAPProxyServer(ctx, deps, server, errChan)
+			start = startDynamicIMAPProxyServer
 		case "pop3_proxy":
-			go startDynamicPOP3ProxyServer(ctx, deps, server, errChan)
+			start = startDynamicPOP3ProxyServer
 		case "managesieve_proxy":
-			go startDynamicManageSieveProxyServer(ctx, deps, server, errChan)
+			start = startDynamicManageSieveProxyServer
 		case "lmtp_proxy":
-			go startDynamicLMTPProxyServer(ctx, deps, server, errChan)
+			start = startDynamicLMTPProxyServer
 		case "http_admin_api":
-			go startDynamicHTTPAdminAPIServer(ctx, deps, server, errChan)
+			start = startDynamicHTTPAdminAPIServer
 		case "http_user_api":
-			go startDynamicHTTPUserAPIServer(ctx, deps, server, errChan)
+			start = startDynamicHTTPUserAPIServer
 		case "user_api_proxy":
-			go startDynamicUserAPIProxyServer(ctx, deps, server, errChan)
+			start = startDynamicUserAPIProxyServer
 		default:
 			logger.Info("Unknown server type - skipping", "type", server.Type, "name", server.Name)
+			continue
 		}
+		// Counted here, before main can wait for the servers on a shutdown signal.
+		deps.serverManager.Go(func() {
+			// One that returns without registering for reload is not waited for.
+			defer deps.startReturned(server.Name)
+			start(ctx, deps, server, errChan)
+		})
 	}
 
 	return errChan
+}
+
+// proxyTrackerInstanceID names a proxy listener's connection tracker to its peers.
+// A tracker discards every event and snapshot that carries its own ID as coming
+// from itself, so in cluster mode the ID must differ between nodes. The OS
+// hostname does not: containers and cloned VMs commonly share one. cluster.node_id
+// does, because memberlist admits only one member per name. Outside cluster mode
+// the ID never leaves the node and the hostname is kept.
+func proxyTrackerInstanceID(clusterMgr *cluster.Manager, hostname, serverName string) string {
+	if clusterMgr != nil {
+		return clusterMgr.GetNodeID() + "-" + serverName
+	}
+	return hostname + "-" + serverName
 }
 
 // startConnectionTrackerForProxy initializes and starts a connection tracker for a proxy server (with gossip).
@@ -1249,7 +1389,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, clusterMgr *cluster.Manager, clusterCfg *config.ClusterConfig, srv interface {
 	SetConnectionTracker(*server.ConnectionTracker)
 }) (*server.ConnectionTracker, string) {
-	instanceID := fmt.Sprintf("%s-%s", hostname, serverName)
+	instanceID := proxyTrackerInstanceID(clusterMgr, hostname, serverName)
 
 	// LMTP proxy connections are short-lived (often seconds) and typically originate from
 	// trusted internal infrastructure.
@@ -1295,16 +1435,13 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 		srv.SetConnectionTracker(tracker)
 	}
 
-	// Return tracker and the map key (protocol-instanceID for uniqueness across cluster)
+	// Return tracker and the map key (protocol-instanceID)
 	mapKey := protocol + "-" + instanceID
 	return tracker, mapKey
 }
 
 // Dynamic server functions
 func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	appendLimit := serverConfig.GetAppendLimitWithDefault()
 
 	authRateLimit := server.DefaultAuthRateLimiterConfig()
@@ -1344,25 +1481,13 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 	}
 
 	// Parse auth idle timeout
-	authIdleTimeout, err := serverConfig.GetAuthIdleTimeout()
-	if err != nil {
-		logger.Info("IMAP: Invalid auth idle timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
-		authIdleTimeout = 0
-	}
+	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 
 	// Parse command timeout
-	commandTimeout, err := serverConfig.GetCommandTimeout()
-	if err != nil {
-		logger.Info("IMAP: Invalid command timeout - using default (5 minutes)", "name", serverConfig.Name, "error", err)
-		commandTimeout = 5 * time.Minute
-	}
+	commandTimeout := serverConfig.GetCommandTimeoutWithDefault()
 
 	// Parse absolute session timeout
-	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
-	if err != nil {
-		logger.Info("IMAP: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
-		absoluteSessionTimeout = 30 * time.Minute
-	}
+	absoluteSessionTimeout := serverConfig.GetAbsoluteSessionTimeoutWithDefault()
 
 	// Parse per-command timeout overrides (nil if not configured)
 	commandTimeoutOverrides, err := serverConfig.GetCommandTimeoutsOverrides()
@@ -1421,6 +1546,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			WarmupMailboxes:              deps.config.LocalCache.WarmupMailboxes,
 			WarmupAsync:                  deps.config.LocalCache.WarmupAsync,
 			WarmupTimeout:                deps.config.LocalCache.WarmupTimeout,
+			WarmupInterval:               deps.config.LocalCache.WarmupInterval,
 			CapabilityFilters:            serverConfig.ClientFilters,
 			DisabledCaps:                 serverConfig.DisabledCaps,
 			AdditionalCaps:               serverConfig.AdditionalCaps,
@@ -1469,9 +1595,30 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 }
 
 func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
+	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, buildLMTPServerOptions(deps, serverConfig))
 
+	if err != nil {
+		errChan <- fmt.Errorf("failed to create LMTP server: %w", err)
+		return
+	}
+
+	go func() {
+		<-ctx.Done()
+		logger.Info("Shutting down LMTP server", "name", serverConfig.Name)
+		if err := lmtpServer.Close(); err != nil {
+			logger.Info("Error closing LMTP server", "error", err)
+		}
+	}()
+
+	deps.registerServer(serverConfig.Name, lmtpServer)
+
+	lmtpServer.Start(errChan)
+}
+
+// buildLMTPServerOptions maps the running config onto the LMTP server options, split out
+// of the start path (as buildAdminAPIServerOptions is) so the config -> options threading
+// is exercised on its own.
+func buildLMTPServerOptions(deps *serverDependencies, serverConfig config.ServerConfig) lmtp.LMTPServerOptions {
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
 	maxMessageSize := serverConfig.GetMaxMessageSizeWithDefault()
@@ -1496,11 +1643,11 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		lmtpCommandTimeoutOverrides = nil
 	}
 
-	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, lmtp.LMTPServerOptions{
+	return lmtp.LMTPServerOptions{
 		InstanceID:              deps.instanceID,
 		MaintenanceGate:         deps.maintenanceGate,
-		RelayQueue:              deps.relayQueue,  // Global relay queue
-		RelayWorker:             deps.relayWorker, // Global relay worker for immediate processing
+		RelayQueue:              deps.relayQueueOption(),  // Global relay queue; nil without [relay]
+		RelayWorker:             deps.relayWorkerOption(), // Global relay worker for immediate processing
 		TLSVerify:               serverConfig.TLSVerify,
 		TLS:                     serverConfig.TLS,
 		TLSCertFile:             serverConfig.TLSCertFile,
@@ -1521,31 +1668,13 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		RedirectRateLimit:       serverConfig.GetRedirectRateLimit(),
 		RedirectRateWindow:      redirectRateWindow,
 		MaxRedirectHops:         serverConfig.GetMaxRedirectHops(),
+		SharedMailboxes:         deps.config.SharedMailboxes,
 		CommandTimeoutOverrides: lmtpCommandTimeoutOverrides,
-	})
-
-	if err != nil {
-		errChan <- fmt.Errorf("failed to create LMTP server: %w", err)
-		return
+		IdleTimeout:             serverConfig.GetCommandTimeoutWithDefault(),
 	}
-
-	go func() {
-		<-ctx.Done()
-		logger.Info("Shutting down LMTP server", "name", serverConfig.Name)
-		if err := lmtpServer.Close(); err != nil {
-			logger.Info("Error closing LMTP server", "error", err)
-		}
-	}()
-
-	deps.registerServer(serverConfig.Name, lmtpServer)
-
-	lmtpServer.Start(errChan)
 }
 
 func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	authRateLimit := server.DefaultAuthRateLimiterConfig()
 	if serverConfig.AuthRateLimit != nil {
 		authRateLimit = *serverConfig.AuthRateLimit
@@ -1555,24 +1684,14 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 
 	sessionMemoryLimit, err := serverConfig.GetSessionMemoryLimit()
 	if err != nil {
-		logger.Info("POP3: Invalid session memory limit - using default (100MB)", "name",
-			serverConfig.Name, err)
+		logger.Info("POP3: Invalid session memory limit - using default (100MB)", "name", serverConfig.Name, "error", err)
 		sessionMemoryLimit = 100 * 1024 * 1024
 	}
 
 	// Parse auth idle timeout
-	authIdleTimeout, err := serverConfig.GetAuthIdleTimeout()
-	if err != nil {
-		logger.Info("POP3: Invalid auth idle timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
-		authIdleTimeout = 0
-	}
+	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 
-	commandTimeout, err := serverConfig.GetCommandTimeout()
-	if err != nil {
-		logger.Info("POP3: Invalid command timeout - using default (2 minutes)", "name",
-			serverConfig.Name, err)
-		commandTimeout = 2 * time.Minute
-	}
+	commandTimeout := serverConfig.GetCommandTimeoutWithDefault()
 
 	pop3CommandTimeoutOverrides, err := serverConfig.GetPOP3CommandTimeoutsOverrides()
 	if err != nil {
@@ -1581,11 +1700,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 	}
 
 	// Parse absolute session timeout
-	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
-	if err != nil {
-		logger.Info("POP3: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
-		absoluteSessionTimeout = 30 * time.Minute
-	}
+	absoluteSessionTimeout := serverConfig.GetAbsoluteSessionTimeoutWithDefault()
 
 	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
@@ -1658,9 +1773,6 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 }
 
 func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	maxSize := serverConfig.GetMaxScriptSizeWithDefault()
 
 	authRateLimit := server.DefaultAuthRateLimiterConfig()
@@ -1670,18 +1782,9 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
-	authIdleTimeout, err := serverConfig.GetAuthIdleTimeout()
-	if err != nil {
-		logger.Info("ManageSieve: Invalid auth idle timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
-		authIdleTimeout = 0
-	}
+	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 
-	commandTimeout, err := serverConfig.GetCommandTimeout()
-	if err != nil {
-		logger.Info("ManageSieve: Invalid command timeout - using default (3 minutes)", "name",
-			serverConfig.Name, err)
-		commandTimeout = 3 * time.Minute
-	}
+	commandTimeout := serverConfig.GetCommandTimeoutWithDefault()
 
 	msCommandTimeoutOverrides, err := serverConfig.GetManageSieveCommandTimeoutsOverrides()
 	if err != nil {
@@ -1690,11 +1793,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 	}
 
 	// Parse absolute session timeout
-	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
-	if err != nil {
-		logger.Info("ManageSieve: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
-		absoluteSessionTimeout = 30 * time.Minute
-	}
+	absoluteSessionTimeout := serverConfig.GetAbsoluteSessionTimeoutWithDefault()
 
 	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
@@ -1766,12 +1865,21 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 	s.Start(errChan)
 }
 
-func startDynamicMetricsServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
+// configureMetrics applies a metrics block's collection settings. A tuning key the
+// block leaves out keeps the default a node without a metrics block has.
+func configureMetrics(server config.ServerConfig) {
+	metrics.Configure(
+		server.EnableUserMetrics,
+		server.GetEnableDomainMetrics(),
+		server.GetUserMetricsThreshold(),
+		server.GetMaxTrackedUsers(),
+		server.GetHashUsernames(),
+	)
+}
 
+func startDynamicMetricsServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
 	mux := http.NewServeMux()
-	mux.Handle(serverConfig.Path, metricsAccessGuard(serverConfig.AllowedHosts, serverConfig.APIKey, promhttp.Handler()))
+	mux.Handle(serverConfig.MetricsPath(), metricsAccessGuard(serverConfig.AllowedHosts, serverConfig.APIKey, promhttp.Handler()))
 
 	server := &http.Server{
 		Addr:    serverConfig.Addr,
@@ -1799,9 +1907,6 @@ func startDynamicMetricsServer(ctx context.Context, deps *serverDependencies, se
 }
 
 func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	remoteDNSRefresh, err := serverConfig.GetRemoteDNSRefresh()
 	if err != nil {
@@ -1821,17 +1926,9 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Parse timeout configurations
-	commandTimeout, err := serverConfig.GetCommandTimeout()
-	if err != nil {
-		logger.Info("IMAP proxy: Invalid command timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
-		commandTimeout = 0 // IMAP proxy cannot detect IDLE commands, so command_timeout must be disabled
-	}
+	commandTimeout := serverConfig.GetCommandTimeoutWithDefault()
 
-	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
-	if err != nil {
-		logger.Info("IMAP proxy: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
-		absoluteSessionTimeout = 30 * time.Minute
-	}
+	absoluteSessionTimeout := serverConfig.GetAbsoluteSessionTimeoutWithDefault()
 
 	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
@@ -1860,8 +1957,11 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteTLS:                serverConfig.RemoteTLS,
 		RemoteTLSUseStartTLS:     serverConfig.RemoteTLSUseStartTLS,
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
+		RemoteTLSCAFile:          serverConfig.RemoteTLSCAFile,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseIDCommand:       serverConfig.RemoteUseIDCommand,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -1876,6 +1976,8 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		TrustedProxies:           deps.config.Servers.TrustedNetworks,
 		MaxConnections:           serverConfig.MaxConnections,
 		MaxConnectionsPerIP:      serverConfig.MaxConnectionsPerIP,
+		ClusterManager:           deps.clusterManager,
+		ClusterRateLimitSync:     deps.config.Cluster.RateLimitSync,
 		TrustedNetworks:          deps.config.Servers.TrustedNetworks,
 		ListenBacklog:            serverConfig.ListenBacklog,
 		MaxAuthErrors:            serverConfig.GetMaxAuthErrors(),
@@ -1937,9 +2039,6 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 }
 
 func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	remoteDNSRefresh, err := serverConfig.GetRemoteDNSRefresh()
 	if err != nil {
@@ -1959,17 +2058,9 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Parse timeout configurations
-	commandTimeout, err := serverConfig.GetCommandTimeout()
-	if err != nil {
-		logger.Info("POP3 proxy: Invalid command timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
-		commandTimeout = 0 // Proxies should use auth_idle_timeout and absolute_session_timeout
-	}
+	commandTimeout := serverConfig.GetCommandTimeoutWithDefault()
 
-	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
-	if err != nil {
-		logger.Info("POP3 proxy: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
-		absoluteSessionTimeout = 30 * time.Minute
-	}
+	absoluteSessionTimeout := serverConfig.GetAbsoluteSessionTimeoutWithDefault()
 
 	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
@@ -2001,6 +2092,8 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseXCLIENT:         serverConfig.RemoteUseXCLIENT,
 		RemoteUseUTF8:            serverConfig.RemoteUseUTF8,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -2015,6 +2108,8 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		TrustedProxies:           deps.config.Servers.TrustedNetworks,
 		MaxConnections:           serverConfig.MaxConnections,
 		MaxConnectionsPerIP:      serverConfig.MaxConnectionsPerIP,
+		ClusterManager:           deps.clusterManager,
+		ClusterRateLimitSync:     deps.config.Cluster.RateLimitSync,
 		TrustedNetworks:          deps.config.Servers.TrustedNetworks,
 		ListenBacklog:            serverConfig.ListenBacklog,
 		LookupCache:              serverConfig.LookupCache,
@@ -2071,9 +2166,6 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 }
 
 func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	remoteDNSRefresh, err := serverConfig.GetRemoteDNSRefresh()
 	if err != nil {
@@ -2093,17 +2185,9 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	}
 
 	// Parse timeout configurations
-	commandTimeout, err := serverConfig.GetCommandTimeout()
-	if err != nil {
-		logger.Info("ManageSieve proxy: Invalid command timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
-		commandTimeout = 0 // Proxies should use auth_idle_timeout and absolute_session_timeout
-	}
+	commandTimeout := serverConfig.GetCommandTimeoutWithDefault()
 
-	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
-	if err != nil {
-		logger.Info("ManageSieve proxy: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
-		absoluteSessionTimeout = 30 * time.Minute
-	}
+	absoluteSessionTimeout := serverConfig.GetAbsoluteSessionTimeoutWithDefault()
 
 	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
@@ -2133,7 +2217,10 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		RemoteTLS:                serverConfig.RemoteTLS,
 		RemoteTLSUseStartTLS:     serverConfig.RemoteTLSUseStartTLS,
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
+		RemoteTLSCAFile:          serverConfig.RemoteTLSCAFile,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -2147,6 +2234,8 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		TrustedProxies:           deps.config.Servers.TrustedNetworks,
 		MaxConnections:           serverConfig.MaxConnections,
 		MaxConnectionsPerIP:      serverConfig.MaxConnectionsPerIP,
+		ClusterManager:           deps.clusterManager,
+		ClusterRateLimitSync:     deps.config.Cluster.RateLimitSync,
 		TrustedNetworks:          deps.config.Servers.TrustedNetworks,
 		ListenBacklog:            serverConfig.ListenBacklog,
 		Debug:                    serverConfig.Debug,
@@ -2203,21 +2292,8 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 }
 
 func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
-	// Warn if user configured connection limits (they will be ignored for LMTP)
-	if serverConfig.MaxConnectionsPerUser > 0 {
-		logger.Warn("LMTP proxy: max_connections_per_user configured but will be ignored (LMTP uses local-only tracking with limits disabled)",
-			"name", serverConfig.Name,
-			"configured_value", serverConfig.MaxConnectionsPerUser)
-	}
-	if serverConfig.MaxConnectionsPerUserPerIP > 0 {
-		logger.Warn("LMTP proxy: max_connections_per_user_per_ip configured but will be ignored (LMTP uses local-only tracking with limits disabled)",
-			"name", serverConfig.Name,
-			"configured_value", serverConfig.MaxConnectionsPerUserPerIP)
-	}
-
+	// max_connections_per_user(_per_ip) are not applied (local-only tracking with limits
+	// disabled); WarnUnusedConfigOptions says so at startup.
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	remoteDNSRefresh, err := serverConfig.GetRemoteDNSRefresh()
 	if err != nil {
@@ -2226,11 +2302,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 	maxMessageSize := serverConfig.GetMaxMessageSizeWithDefault()
 
-	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
-	if err != nil {
-		logger.Info("LMTP proxy: Invalid absolute session timeout - using default (5 minutes)", "name", serverConfig.Name, "error", err)
-		absoluteSessionTimeout = 5 * time.Minute
-	}
+	absoluteSessionTimeout := serverConfig.GetAbsoluteSessionTimeoutWithDefault()
 
 	remotePort, err := serverConfig.GetRemotePort()
 	if err != nil {
@@ -2261,8 +2333,11 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteTLS:                serverConfig.RemoteTLS,
 		RemoteTLSUseStartTLS:     serverConfig.RemoteTLSUseStartTLS,
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
+		RemoteTLSCAFile:          serverConfig.RemoteTLSCAFile,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseXCLIENT:         serverConfig.RemoteUseXCLIENT,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -2328,15 +2403,15 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 }
 
 func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	if serverConfig.APIKey == "" {
 		logger.Info("HTTP Admin API server enabled but no API key configured - skipping", "name", serverConfig.Name)
 		return
 	}
 
 	options := buildAdminAPIServerOptions(deps, serverConfig)
+	if options.Uploader == nil {
+		logger.Warn("HTTP Admin API: no upload worker on this node (no imap, pop3 or lmtp server), POST /admin/mail/deliver will answer 503", "name", serverConfig.Name)
+	}
 
 	srv, err := adminapi.New(deps.resilientDB, options)
 	if err != nil {
@@ -2401,7 +2476,13 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		redirectRateWindow = time.Hour
 	}
 
-	return adminapi.ServerOptions{
+	// A nil *relayqueue.Worker must stay a nil interface, not one holding a nil pointer.
+	var relayWorker adminapi.RelayWorkerNotifier
+	if deps.relayWorker != nil {
+		relayWorker = deps.relayWorker
+	}
+
+	options := adminapi.ServerOptions{
 		Name:               serverConfig.Name,
 		Addr:               serverConfig.Addr,
 		APIKey:             serverConfig.APIKey,
@@ -2409,9 +2490,11 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		AllowedHosts:       serverConfig.AllowedHosts,
 		Cache:              deps.cacheInstance,
 		Uploader:           deps.uploadWorker,
+		UploadMaxAttempts:  deps.config.Uploader.MaxAttempts,
 		Storage:            deps.storage,
 		PurgeWorker:        deps.purgeWorker,
-		RelayQueue:         deps.relayQueue, // Global relay queue
+		RelayQueue:         deps.relayQueueOption(), // Global relay queue; nil without [relay]
+		RelayWorker:        relayWorker,             // woken for redirects and vacation replies, as on LMTP
 		MaxMessageSize:     serverConfig.GetMaxMessageSizeWithDefault(),
 		MaxConnections:     serverConfig.MaxConnections,
 		TLS:                serverConfig.TLS,
@@ -2423,37 +2506,38 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		InstanceID:         deps.instanceID,
 		MaintenanceGate:    deps.maintenanceGate,
 		FTSRetention:       deps.ftsRetention,
-		AffinityManager:    deps.affinityManager,
 		ValidBackends:      validBackends,
-		ConnectionTrackers: deps.connectionTrackers,
-		ProxyServers:       deps.proxyServers,
-		AuthCache:          deps.authCacheInstance,
+		ConnectionTrackers: deps.connectionTrackersSnapshot,
+		ProxyServers:       deps.proxyServersSnapshot,
 		RedirectRateLimit:  serverConfig.GetRedirectRateLimit(),
 		RedirectRateWindow: redirectRateWindow,
 		MaxRedirectHops:    serverConfig.GetMaxRedirectHops(),
 		SieveExtensions:    deps.config.Sieve.EnabledExtensions,
 		SharedMailboxes:    deps.config.SharedMailboxes,
+		// Incoming PROXY headers, accepted only from trusted_networks.
+		ProxyProtocol:        serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout: serverConfig.GetProxyProtocolTimeoutWithDefault(),
+		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
 	}
+	// Set only when the feature is on: a nil pointer stored in an interface field is a
+	// non-nil interface, and the handlers tell "not enabled on this node" by comparing
+	// the interface with nil.
+	if deps.affinityManager != nil {
+		options.AffinityManager = deps.affinityManager
+	}
+	if deps.authCacheInstance != nil {
+		options.AuthCache = deps.authCacheInstance
+	}
+	return options
 }
 
 func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	if serverConfig.JWTSecret == "" {
 		logger.Info("HTTP User API server enabled but no JWT secret configured - skipping", "name", serverConfig.Name)
 		return
 	}
 
-	// Parse token duration
-	tokenDuration := 24 * time.Hour // Default
-	if serverConfig.TokenDuration != "" {
-		if dur, err := time.ParseDuration(serverConfig.TokenDuration); err == nil {
-			tokenDuration = dur
-		} else {
-			logger.Info("Invalid token_duration for HTTP User API server - using default 24h", "duration", serverConfig.TokenDuration, "name", serverConfig.Name)
-		}
-	}
+	tokenDuration := serverConfig.GetTokenDurationWithDefault()
 
 	// Get auth rate limit config
 	authRateLimit := server.DefaultAuthRateLimiterConfig()
@@ -2481,7 +2565,8 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		AllowedHosts:                serverConfig.AllowedHosts,
 		Storage:                     deps.storage,
 		Cache:                       deps.cacheInstance,
-		Uploader:                    deps.uploadWorker, // spool reads + pending-upload state for bodies not yet in S3
+		Uploader:                    deps.uploadWorker,                // spool reads + pending-upload state for bodies not yet in S3
+		UploadMaxAttempts:           deps.config.Uploader.MaxAttempts, // pending-upload state on a node without an uploader
 		AuthRateLimit:               authRateLimit,
 		LookupCache:                 serverConfig.LookupCache,
 		TLS:                         serverConfig.TLS,
@@ -2503,9 +2588,6 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 }
 
 func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	if serverConfig.JWTSecret == "" {
 		logger.Info("User API proxy server enabled but no JWT secret configured - skipping", "name", serverConfig.Name)
 		return
@@ -2531,6 +2613,12 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
 	}
 
+	// enable_affinity decides, as on every other proxy; nil reads and writes no affinity.
+	var userAPIProxyAffinity *server.AffinityManager
+	if serverConfig.EnableAffinity {
+		userAPIProxyAffinity = deps.affinityManager
+	}
+
 	server, err := userapiproxy.New(ctx, deps.resilientDB, userapiproxy.ServerOptions{
 		Name:                     serverConfig.Name,
 		Addr:                     serverConfig.Addr,
@@ -2538,6 +2626,7 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		Pools:                    proxy.PoolSpecsFromConfig(deps.config.Pools),
 		RemotePort:               remotePort,
 		JWTSecret:                serverConfig.JWTSecret,
+		AllowedOrigins:           serverConfig.AllowedOrigins,
 		TLS:                      serverConfig.TLS,
 		TLSCertFile:              serverConfig.TLSCertFile,
 		TLSKeyFile:               serverConfig.TLSKeyFile,
@@ -2545,6 +2634,7 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		TLSConfig:                tlsConfig,
 		RemoteTLS:                serverConfig.RemoteTLS,
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
+		RemoteTLSCAFile:          serverConfig.RemoteTLSCAFile,
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		EnableBackendHealthCheck: serverConfig.GetRemoteHealthChecks(),
@@ -2554,7 +2644,7 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		TrustedProxies:           deps.config.Servers.TrustedNetworks,
 		RemoteLookup:             serverConfig.RemoteLookup,
 		LookupCache:              serverConfig.LookupCache,
-		AffinityManager:          deps.affinityManager,
+		AffinityManager:          userAPIProxyAffinity,
 		ProxyProtocol:            serverConfig.ProxyProtocol,
 		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
@@ -2562,6 +2652,14 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create User API proxy server: %w", err)
 		return
+	}
+
+	// Register remotelookup health check if remotelookup is enabled
+	if routingLookup := server.GetConnectionManager().GetRoutingLookup(); routingLookup != nil {
+		if healthChecker, ok := routingLookup.(health.RemoteLookupHealthChecker); ok {
+			deps.healthIntegration.RegisterRemoteLookupCheck(healthChecker, serverConfig.Name)
+			logger.Info("Registered remotelookup health check for User API proxy", "name", serverConfig.Name)
+		}
 	}
 
 	// User API requests are routed one by one: nothing to drain.

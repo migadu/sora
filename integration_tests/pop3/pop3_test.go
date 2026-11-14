@@ -674,9 +674,10 @@ func TestCommandTimeoutTrigger(t *testing.T) {
 	server, account := common.SetupPOP3ServerWithTimeout(t, 1*time.Second)
 	defer server.Close()
 
-	// Record initial NOOP timeout count before test
-	initialNoopTimeouts := testutil.ToFloat64(metrics.CommandTimeoutsTotal.WithLabelValues("pop3", "NOOP"))
-	t.Logf("Initial NOOP timeout count: %.0f", initialNoopTimeouts)
+	// Record the initial idle timeout count before test
+	idleTimeouts := metrics.ConnectionTimeoutsTotal.WithLabelValues("pop3", "test-timeout", "localhost", "idle")
+	initialNoopTimeouts := testutil.ToFloat64(idleTimeouts)
+	t.Logf("Initial idle timeout count: %.0f", initialNoopTimeouts)
 
 	// Connect to server
 	conn, err := net.DialTimeout("tcp", server.Address, 5*time.Second)
@@ -767,8 +768,8 @@ func TestCommandTimeoutTrigger(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Verify that timeout metric was incremented if timeout occurred
-	finalNoopTimeouts := testutil.ToFloat64(metrics.CommandTimeoutsTotal.WithLabelValues("pop3", "NOOP"))
-	t.Logf("Final NOOP timeout count: %.0f", finalNoopTimeouts)
+	finalNoopTimeouts := testutil.ToFloat64(idleTimeouts)
+	t.Logf("Final idle timeout count: %.0f", finalNoopTimeouts)
 
 	if timedOut {
 		// Timeout detected - metric should have increased

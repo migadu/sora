@@ -38,7 +38,7 @@ func TestGetBackendForUser_PinInMaintenanceStaysInItsPool(t *testing.T) {
 			withAffinity(t, s)
 			s.routingLookup = &fakeRoutingLookup{backend: "10.0.1.1:8081"}
 			if cached {
-				s.lookupCache = lookupcache.New(5*time.Minute, time.Minute, 100, time.Hour, 0)
+				s.lookupCache = lookupcache.New("test", "test", 5*time.Minute, time.Minute, 100, time.Hour, 0)
 				t.Cleanup(func() { _ = s.lookupCache.Stop(context.Background()) })
 			}
 			route := func() backendRoute {

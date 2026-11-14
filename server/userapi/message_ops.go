@@ -83,6 +83,10 @@ func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Message not found")
 			return
 		}
+		if errors.Is(err, consts.ErrNotPermitted) {
+			s.writeError(w, http.StatusForbidden, "Not permitted to change these flags in this mailbox")
+			return
+		}
 		// Backstop: the loop above already rejected these, so reaching this means
 		// a caller path that skipped validation. Still answer 400, not 500.
 		if errors.Is(err, consts.ErrInvalidFlag) {
@@ -139,6 +143,10 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, consts.ErrDBNotFound) {
 			s.writeError(w, http.StatusNotFound, "Message not found")
+			return
+		}
+		if errors.Is(err, consts.ErrNotPermitted) {
+			s.writeError(w, http.StatusForbidden, "Not permitted to delete messages in this mailbox")
 			return
 		}
 		logger.Warn("HTTP Mail API: Error marking message as deleted", "name", s.name, "error", err)

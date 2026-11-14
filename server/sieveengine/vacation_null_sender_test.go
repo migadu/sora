@@ -2,6 +2,7 @@ package sieveengine
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -39,8 +40,8 @@ if header :contains "subject" "invoice" { fileinto "Invoices"; }
 			if err != nil {
 				t.Fatalf("evaluate: %v", err)
 			}
-			if result.Action != tc.want || result.Mailbox != tc.mailbox {
-				t.Errorf("action = %s (mailbox %q), want %s (mailbox %q)", result.Action, result.Mailbox, tc.want, tc.mailbox)
+			if result.Action != tc.want || strings.Join(result.Mailboxes, ",") != tc.mailbox {
+				t.Errorf("action = %s (mailbox %q), want %s (mailbox %q)", result.Action, strings.Join(result.Mailboxes, ","), tc.want, tc.mailbox)
 			}
 		})
 	}

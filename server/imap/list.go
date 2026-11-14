@@ -13,6 +13,14 @@ import (
 )
 
 func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
+	// RFC 8438 §1: with LIST-STATUS, SIZE "can be queried for many mailboxes at
+	// once using just one LIST command", so it needs STATUS=SIZE here as well.
+	if options.ReturnStatus != nil && options.ReturnStatus.Size {
+		if err := s.requireCapability(imap.CapStatusSize, "STATUS SIZE"); err != nil {
+			return err
+		}
+	}
+
 	// If no patterns, just return a simple response without any database operations
 	if len(patterns) == 0 {
 		return w.WriteList(&imap.ListData{
@@ -173,8 +181,8 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 					if s.GetCapabilities().Has(imap.CapCondStore) && options.ReturnStatus.HighestModSeq {
 						statusData.HighestModSeq = summary.HighestModSeq
 					}
-					if options.ReturnStatus.AppendLimit && s.server.appendLimit > 0 {
-						limit := uint32(s.server.appendLimit)
+					if options.ReturnStatus.AppendLimit {
+						limit := s.AppendLimit()
 						statusData.AppendLimit = &limit
 					}
 					if options.ReturnStatus.Size {

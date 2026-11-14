@@ -224,8 +224,8 @@ func TestManageSieveProxyGracefulShutdownDuringAuth(t *testing.T) {
 			if !strings.Contains(response, "TRYLATER") {
 				t.Errorf("BYE message doesn't contain TRYLATER: %s", response)
 			}
-		} else if strings.HasPrefix(response, "NO") && strings.Contains(response, "UNAVAILABLE") {
-			t.Logf("✓ Received UNAVAILABLE response: %s", response)
+		} else if strings.HasPrefix(response, "NO") && strings.Contains(response, "TRYLATER") {
+			t.Logf("✓ Received TRYLATER response: %s", response)
 		} else {
 			t.Errorf("Unexpected response: %s", response)
 		}

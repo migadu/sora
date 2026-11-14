@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"slices"
 	"strings"
 	"time"
@@ -14,6 +13,7 @@ import (
 	imap "github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/logger"
 )
 
 // DBMessage represents a simplified message structure for API responses
@@ -49,10 +49,33 @@ type DBMessage struct {
 	HasAttachments *bool `json:"has_attachments,omitempty"`
 }
 
-// RecipientInfo represents email recipient information
-type RecipientInfo struct {
-	Name    string `json:"name,omitempty"`
-	Address string `json:"address"`
+// setRecipients fills From, To, Cc and Bcc from recipients_json. It is stored as a
+// list of helpers.Recipient ({type, email, name}; db/append.go), the list IMAP FETCH
+// ENVELOPE reads too (db/fetch.go); list, search and get-by-ID all decode it here so
+// their recipient fields cannot drift apart.
+func (msg *DBMessage) setRecipients(recipientsJSON []byte) {
+	if len(recipientsJSON) == 0 {
+		return
+	}
+	var recipients []helpers.Recipient
+	if err := json.Unmarshal(recipientsJSON, &recipients); err != nil {
+		logger.Warn("Database: failed to decode recipients JSON", "message_id", msg.ID, "err", err)
+		return
+	}
+	for _, r := range recipients {
+		switch r.AddressType {
+		case "from":
+			if msg.From == "" {
+				msg.From = r.EmailAddress
+			}
+		case "to":
+			msg.To = append(msg.To, r.EmailAddress)
+		case "cc":
+			msg.Cc = append(msg.Cc, r.EmailAddress)
+		case "bcc":
+			msg.Bcc = append(msg.Bcc, r.EmailAddress)
+		}
+	}
 }
 
 // GetAccountIDByEmail retrieves account ID from email address
@@ -205,37 +228,12 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 		// Parse custom flags
 		if len(customFlagsJSON) > 0 {
 			if err := json.Unmarshal(customFlagsJSON, &msg.CustomFlags); err != nil {
-				log.Printf("Database: failed to unmarshal custom flags: %v", err)
+				logger.Error("Database: failed to unmarshal custom_flags", "message_id", msg.ID, "err", err)
 				msg.CustomFlags = []string{}
 			}
 		}
 
-		// Parse recipients
-		if len(recipientsJSON) > 0 {
-			var recipients map[string][]RecipientInfo
-			if err := json.Unmarshal(recipientsJSON, &recipients); err != nil {
-				log.Printf("Database: failed to unmarshal recipients: %v", err)
-			} else {
-				if from, ok := recipients["from"]; ok && len(from) > 0 {
-					msg.From = from[0].Address
-				}
-				if to, ok := recipients["to"]; ok {
-					for _, r := range to {
-						msg.To = append(msg.To, r.Address)
-					}
-				}
-				if cc, ok := recipients["cc"]; ok {
-					for _, r := range cc {
-						msg.Cc = append(msg.Cc, r.Address)
-					}
-				}
-				if bcc, ok := recipients["bcc"]; ok {
-					for _, r := range bcc {
-						msg.Bcc = append(msg.Bcc, r.Address)
-					}
-				}
-			}
-		}
+		msg.setRecipients(recipientsJSON)
 
 		// Convert bitwise flags to string array
 		msg.Flags = bitwiseFlagsToStrings(flagsBitmask)
@@ -279,9 +277,9 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
 		-- Account-scoped in the JOIN ON clause, never in WHERE: this is a LEFT JOIN whose
 		-- FTS predicate sits inside an OR with header substring predicates, so a WHERE-side
-		-- account qual would drop every message that has no FTS row (bodies over 64KB are
-		-- never staged, empty bodies are skipped, retention prunes old rows) even when its
-		-- subject or sender matched.
+		-- account qual would drop every message that has no FTS row (empty bodies are
+		-- never staged, retention prunes old rows) even when its subject or sender
+		-- matched.
 		LEFT JOIN messages_fts_v2 mf
 		       ON mf.content_hash = m.content_hash AND mf.account_id = $4
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
@@ -328,20 +326,7 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 			json.Unmarshal(customFlagsJSON, &msg.CustomFlags)
 		}
 
-		// Parse recipients
-		if len(recipientsJSON) > 0 {
-			var recipients map[string][]RecipientInfo
-			if err := json.Unmarshal(recipientsJSON, &recipients); err == nil {
-				if from, ok := recipients["from"]; ok && len(from) > 0 {
-					msg.From = from[0].Address
-				}
-				if to, ok := recipients["to"]; ok {
-					for _, r := range to {
-						msg.To = append(msg.To, r.Address)
-					}
-				}
-			}
-		}
+		msg.setRecipients(recipientsJSON)
 
 		msg.Flags = bitwiseFlagsToStrings(flagsBitmask)
 		msg.HasAttachments = hasAttachmentsFromKeywords(msg.CustomFlags)
@@ -480,7 +465,11 @@ func (db *Database) GetMessageByID(ctx context.Context, accountID int64, message
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL AND mb.deleted_at IS NULL
+		WHERE m.id = $1 AND m.expunged_at IS NULL AND mb.deleted_at IS NULL
+		-- A shared mailbox's messages belong to its owner. Anyone else reads them with the
+		-- "r" right on the mailbox, as SELECT requires (RFC 4314 section 4), the same gate
+		-- as the message list; without it the message is not found.
+		AND (m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 'r'))
 	`
 
 	msg := &DBMessage{}
@@ -509,25 +498,7 @@ func (db *Database) GetMessageByID(ctx context.Context, accountID int64, message
 		json.Unmarshal(customFlagsJSON, &msg.CustomFlags)
 	}
 
-	// Parse recipients
-	if len(recipientsJSON) > 0 {
-		var recipients map[string][]RecipientInfo
-		if err := json.Unmarshal(recipientsJSON, &recipients); err == nil {
-			if from, ok := recipients["from"]; ok && len(from) > 0 {
-				msg.From = from[0].Address
-			}
-			if to, ok := recipients["to"]; ok {
-				for _, r := range to {
-					msg.To = append(msg.To, r.Address)
-				}
-			}
-			if cc, ok := recipients["cc"]; ok {
-				for _, r := range cc {
-					msg.Cc = append(msg.Cc, r.Address)
-				}
-			}
-		}
-	}
+	msg.setRecipients(recipientsJSON)
 
 	msg.Flags = bitwiseFlagsToStrings(flagsBitmask)
 	msg.HasAttachments = hasAttachmentsFromKeywords(msg.CustomFlags)
@@ -544,18 +515,46 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 
 	// Resolve the mailbox before locking it. Read flags only after that lock,
 	// so a concurrent STORE cannot make this update overwrite a stale snapshot.
-	var mailboxID int64
+	//
+	// The message's account is its mailbox's owner, for a shared mailbox not the
+	// caller. Anyone else reaches it only with the "r" right, as SELECT requires, and
+	// changes a flag only with its right (RFC 4314 section 4): "s" for \Seen, "t" for
+	// \Deleted, "w" for every other flag and keyword. The owner holds them all.
+	var mailboxID, ownerID int64
+	var maySeen, mayDelete, mayWrite bool
 	err = tx.QueryRow(ctx, `
-		SELECT m.mailbox_id
+		SELECT m.mailbox_id, m.account_id,
+		       m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 's'),
+		       m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 't'),
+		       m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 'w')
 		FROM messages m
-		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL
-	`, messageID, accountID).Scan(&mailboxID)
+		WHERE m.id = $1 AND m.expunged_at IS NULL
+		  AND (m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 'r'))
+	`, messageID, accountID).Scan(&mailboxID, &ownerID, &maySeen, &mayDelete, &mayWrite)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return consts.ErrDBNotFound
 		}
 		return fmt.Errorf("failed to get current flags: %w", err)
+	}
+
+	// Like STORE, apply the flags the caller may change and leave the others alone;
+	// refuse only when that is none of them.
+	mayChange := func(flag string) bool {
+		switch {
+		case strings.EqualFold(flag, `\Seen`):
+			return maySeen
+		case strings.EqualFold(flag, `\Deleted`):
+			return mayDelete
+		}
+		return mayWrite
+	}
+	requested := len(addFlags) + len(removeFlags)
+	addFlags = slices.DeleteFunc(slices.Clone(addFlags), func(f string) bool { return !mayChange(f) })
+	removeFlags = slices.DeleteFunc(slices.Clone(removeFlags), func(f string) bool { return !mayChange(f) })
+	if requested > 0 && len(addFlags)+len(removeFlags) == 0 {
+		return consts.ErrNotPermitted
 	}
 
 	// Serialize unseen_count maintenance for this mailbox (see lockMailboxStats)
@@ -573,7 +572,7 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 		FROM messages m
 		JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL
-	`, messageID, accountID).Scan(&currentFlags, &currentCustomFlags)
+	`, messageID, ownerID).Scan(&currentFlags, &currentCustomFlags)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return consts.ErrDBNotFound
 	}
@@ -585,6 +584,7 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 	if len(currentCustomFlags) > 0 {
 		json.Unmarshal(currentCustomFlags, &customFlags)
 	}
+	storedCustomFlags := slices.Clone(customFlags)
 
 	// Keyword identity is case-insensitive (RFC 9051 §2.3.2): fold incoming
 	// keywords onto the case already established for this mailbox so adds/removes
@@ -657,6 +657,11 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 	for i, flag := range normalizedCustom {
 		customFlags[i] = string(flag)
 	}
+	if !mayWrite {
+		// No keyword changes without "w", not even the ones the attachment and
+		// color rules above derive from \Seen or \Deleted changes.
+		customFlags = storedCustomFlags
+	}
 
 	// Reject rather than silently drop if the result would exceed what a single
 	// message may hold (see MaxCustomKeywordsPerMessage). customFlags is already
@@ -674,7 +679,7 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 		SET flags = $1, custom_flags = $2, flags_changed_at = now(), updated_modseq = nextval('messages_modseq')
 		FROM messages m
 		WHERE ms.message_id = m.id AND m.id = $3 AND m.account_id = $4
-	`, newFlags, customFlagsJSON, messageID, accountID)
+	`, newFlags, customFlagsJSON, messageID, ownerID)
 
 	if err != nil {
 		return fmt.Errorf("failed to update flags: %w", err)
@@ -685,19 +690,20 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 
 // CreateMailboxForUser creates a new mailbox
 func (db *Database) CreateMailboxForUser(ctx context.Context, accountID int64, mailboxPath string) error {
+	// RFC 3501 §6.3.3: "Folder/Sub/" creates "Folder/Sub" ("the name created is
+	// without the trailing hierarchy delimiter"). A name with an empty, "." or ".."
+	// level is refused before any parent is created, so "x//y" never makes "x/".
+	mailboxPath, err := helpers.MailboxNameToCreate(mailboxPath)
+	if err != nil {
+		return err
+	}
+	delim := string(consts.MailboxDelimiter)
+
 	tx, err := db.GetWritePool().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback(context.Background())
-
-	// RFC 3501 §6.3.3: trim trailing hierarchy delimiters so "Folder/Sub/" creates
-	// "Folder/Sub" rather than storing a trailing separator.
-	delim := string(consts.MailboxDelimiter)
-	mailboxPath = strings.TrimRight(mailboxPath, delim)
-	if mailboxPath == "" {
-		return consts.ErrMailboxInvalidName
-	}
 
 	// Link the mailbox under its parent, creating any missing ancestor first, as IMAP
 	// CREATE and GetOrCreateMailboxByName do. Creating it with no parent (as this did)

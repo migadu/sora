@@ -57,6 +57,24 @@ func TestIsIPAllowed(t *testing.T) {
 			expected:     false,
 		},
 		{
+			name:         "invalid entry does not disable CIDR entries",
+			allowedHosts: []string{"10.0.0.0/8", "app.example.com"},
+			clientIP:     "10.1.2.3",
+			expected:     true,
+		},
+		{
+			name:         "invalid entry does not disable IPv6 CIDR entries",
+			allowedHosts: []string{"app.example.com", "2001:db8::/32"},
+			clientIP:     "2001:db8::5",
+			expected:     true,
+		},
+		{
+			name:         "only invalid entries allow nobody",
+			allowedHosts: []string{"app.example.com"},
+			clientIP:     "10.1.2.3",
+			expected:     false,
+		},
+		{
 			name:         "IPv6 CIDR - IP in range",
 			allowedHosts: []string{"2001:db8::/32"},
 			clientIP:     "2001:db8::1",

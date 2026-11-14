@@ -1,9 +1,10 @@
 package db
 
 import (
+	"errors"
 	"fmt"
 	"strings"
-	"time"
+	"unicode/utf8"
 
 	"github.com/migadu/go-imap"
 )
@@ -12,7 +13,6 @@ import (
 type SearchCriteriaValidator struct {
 	MaxSearchTermLength int
 	MaxSearchTerms      int
-	MaxDateRange        time.Duration
 	MaxTextSearchTerms  int
 	SupportedHeaders    map[string]bool
 	MaxSequenceRanges   int
@@ -32,14 +32,13 @@ type SearchCriteriaValidator struct {
 // NewSearchCriteriaValidator creates a new validator with sensible defaults
 func NewSearchCriteriaValidator() *SearchCriteriaValidator {
 	return &SearchCriteriaValidator{
-		MaxSearchTermLength: 1000,                 // Max characters in a single search term
-		MaxSearchTerms:      50,                   // Max total search terms across all criteria
-		MaxDateRange:        365 * 24 * time.Hour, // Max 1 year date range
-		MaxTextSearchTerms:  10,                   // Max body/text search terms
-		MaxSequenceRanges:   20,                   // Max UID/sequence ranges
-		MaxFlagFilters:      20,                   // Max flag conditions
-		MaxNestingDepth:     30,                   // Max nesting depth of Not/Or criteria
-		MaxTotalNodes:       256,                  // Max total criteria nodes across the tree
+		MaxSearchTermLength: 1000, // Max characters in a single search term
+		MaxSearchTerms:      50,   // Max total search terms across all criteria
+		MaxTextSearchTerms:  10,   // Max body/text search terms
+		MaxSequenceRanges:   20,   // Max UID/sequence ranges
+		MaxFlagFilters:      20,   // Max flag conditions
+		MaxNestingDepth:     30,   // Max nesting depth of Not/Or criteria
+		MaxTotalNodes:       256,  // Max total criteria nodes across the tree
 		SupportedHeaders: map[string]bool{
 			"subject":     true,
 			"message-id":  true,
@@ -178,17 +177,10 @@ func (v *SearchCriteriaValidator) validateNode(criteria *imap.SearchCriteria, re
 	}
 	complexityScore += len(criteria.UID)
 
-	// Validate date ranges
-	if err := v.validateDateRanges(criteria); err != nil {
-		isLimit := strings.Contains(err.Error(), "too large")
-		result.addErrorWithLimit(fieldPrefix+"dates", err.Error(), nil, isLimit)
-	}
-
-	// Validate size filters
-	if criteria.Larger > 0 && criteria.Smaller > 0 && criteria.Larger >= criteria.Smaller {
-		result.addError(fieldPrefix+"size", "larger value must be less than smaller value",
-			map[string]int64{"larger": criteria.Larger, "smaller": criteria.Smaller})
-	}
+	// Date and size keys are not checked against each other: SINCE after BEFORE,
+	// or LARGER at or over SMALLER, is a valid search that matches no message, and
+	// RFC 3501 §7.1.3 reserves BAD for "a protocol-level error in the client's
+	// command". Nor is a date span limited; an open-ended one is larger still.
 
 	// Validate text search terms
 	if err := v.validateTextTerms(criteria.Body, "Body"); err != nil {
@@ -209,6 +201,15 @@ func (v *SearchCriteriaValidator) validateNode(criteria *imap.SearchCriteria, re
 	if len(criteria.Flag)+len(criteria.NotFlag) > v.MaxFlagFilters {
 		result.addErrorWithLimit(fieldPrefix+"flags", fmt.Sprintf("too many flag filters: %d (max: %d)",
 			len(criteria.Flag)+len(criteria.NotFlag), v.MaxFlagFilters), nil, true)
+	}
+	// A KEYWORD is bound as text like a string term, and go-imap's atom admits
+	// the bytes 0xA0-0xFF, so it can hold bytes that are not UTF-8.
+	for _, flags := range [2][]imap.Flag{criteria.Flag, criteria.NotFlag} {
+		for _, flag := range flags {
+			if err := validateSearchString(string(flag)); err != nil {
+				result.addError(fieldPrefix+"flags", "keyword "+err.Error(), flag)
+			}
+		}
 	}
 
 	// Validate headers
@@ -277,45 +278,20 @@ func (v *SearchCriteriaValidator) validateUIDSets(uidSets []imap.UIDSet, fieldNa
 	return nil
 }
 
-func (v *SearchCriteriaValidator) validateDateRanges(criteria *imap.SearchCriteria) error {
-	// Check individual date validity
-	if !criteria.Since.IsZero() && !criteria.Before.IsZero() {
-		if criteria.Since.After(criteria.Before) {
-			return fmt.Errorf("since date (%v) must be before Before date (%v)", criteria.Since, criteria.Before)
-		}
-		if criteria.Before.Sub(criteria.Since) > v.MaxDateRange {
-			return fmt.Errorf("date range too large: %v (max: %v)", criteria.Before.Sub(criteria.Since), v.MaxDateRange)
-		}
-	}
-
-	if !criteria.SentSince.IsZero() && !criteria.SentBefore.IsZero() {
-		if criteria.SentSince.After(criteria.SentBefore) {
-			return fmt.Errorf("SentSince date (%v) must be before SentBefore date (%v)", criteria.SentSince, criteria.SentBefore)
-		}
-		if criteria.SentBefore.Sub(criteria.SentSince) > v.MaxDateRange {
-			return fmt.Errorf("sent date range too large: %v (max: %v)", criteria.SentBefore.Sub(criteria.SentSince), v.MaxDateRange)
-		}
-	}
-
-	return nil
-}
-
 func (v *SearchCriteriaValidator) validateTextTerms(terms []string, fieldName string) error {
 	if len(terms) > v.MaxTextSearchTerms {
 		return fmt.Errorf("too many %s search terms: %d (max: %d)", fieldName, len(terms), v.MaxTextSearchTerms)
 	}
 
+	// An empty term is valid: "Note that the empty string is a substring"
+	// (RFC 9051 §6.4.4), so it matches every message.
 	for i, term := range terms {
-		if len(term) == 0 {
-			return fmt.Errorf("%s[%d]: search term cannot be empty", fieldName, i)
-		}
 		if len(term) > v.MaxSearchTermLength {
 			return fmt.Errorf("%s[%d]: search term too long: %d characters (max: %d)",
 				fieldName, i, len(term), v.MaxSearchTermLength)
 		}
-		// Check for potentially problematic characters
-		if strings.Contains(term, "\x00") {
-			return fmt.Errorf("%s[%d]: search term contains null characters", fieldName, i)
+		if err := validateSearchString(term); err != nil {
+			return fmt.Errorf("%s[%d]: search term %w", fieldName, i, err)
 		}
 	}
 	return nil
@@ -328,23 +304,37 @@ func (v *SearchCriteriaValidator) validateHeader(header imap.SearchCriteriaHeade
 	if len(header.Key) == 0 {
 		return fmt.Errorf("header key cannot be empty")
 	}
+	if err := validateSearchString(header.Key); err != nil {
+		return fmt.Errorf("header key %w", err)
+	}
 
 	// Validate header value
 	if len(header.Value) > v.MaxSearchTermLength {
 		return fmt.Errorf("header value too long: %d characters (max: %d)",
 			len(header.Value), v.MaxSearchTermLength)
 	}
-
-	// Specific validation for certain headers
-	switch strings.ToLower(header.Key) {
-	case "message-id", "in-reply-to":
-		// Message IDs should be reasonable length and format
-		value := strings.TrimSpace(header.Value)
-		if len(value) > 255 {
-			return fmt.Errorf("%s value too long: %d characters (max: 255)", header.Key, len(value))
-		}
+	if err := validateSearchString(header.Value); err != nil {
+		return fmt.Errorf("header value %w", err)
 	}
 
+	return nil
+}
+
+// validateSearchString refuses a string PostgreSQL cannot take as a text
+// parameter (SQLSTATE 22021), so the client gets BAD for it rather than the
+// database's error as NO [SERVERBUG]. NUL is in no search string: "The ASCII
+// NUL character, %x00, MUST NOT be used anywhere, with the exception of the
+// OCTET production" (RFC 9051 §9, rule 3), and OCTET is only in literal8,
+// which no search key takes. And the strings are UTF-8: go-imap answers every
+// CHARSET but US-ASCII and UTF-8 with NO [BADCHARSET], and without one
+// "IMAP4rev2 servers MUST assume UTF-8" (RFC 9051 §6.4.4).
+func validateSearchString(s string) error {
+	if strings.IndexByte(s, 0) >= 0 {
+		return errors.New("contains a NUL character")
+	}
+	if !utf8.ValidString(s) {
+		return errors.New("is not valid UTF-8")
+	}
 	return nil
 }
 

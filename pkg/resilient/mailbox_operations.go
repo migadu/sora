@@ -277,18 +277,32 @@ func (rd *ResilientDatabase) GetActiveAccountIDByAddressWithRetry(ctx context.Co
 	return result.(int64), nil
 }
 
+// CreateDefaultMailboxesWithRetry is EnsureDefaultMailboxesWithRetry for a caller that
+// reads the mailboxes from the writer anyway, or not at all.
 func (rd *ResilientDatabase) CreateDefaultMailboxesWithRetry(ctx context.Context, AccountID int64) error {
+	_, err := rd.EnsureDefaultMailboxesWithRetry(ctx, AccountID)
+	return err
+}
+
+// EnsureDefaultMailboxesWithRetry creates the account's default mailboxes unless the
+// read pool already shows its INBOX. onWriter reports that the read pool did not: the
+// mailboxes were then created (or found) on the writer, and a replica that has not
+// replayed that yet does not have them, so a caller that goes on to read them must
+// read from the writer.
+func (rd *ResilientDatabase) EnsureDefaultMailboxesWithRetry(ctx context.Context, AccountID int64) (onWriter bool, err error) {
 	// Every RCPT, login and API delivery calls this; for every account but a brand-new
 	// one the mailboxes exist. Answer that from a single read before paying for a
 	// write transaction (BEGIN + SET LOCAL + EXISTS + COMMIT on the write pool).
 	if has, err := rd.getOperationalDatabaseForOperation(ctx, false).HasInbox(ctx, AccountID); err == nil && has {
-		return nil
+		return false, nil
 	}
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(ctx, true).CreateDefaultMailboxes(ctx, tx, AccountID)
 	}
-	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
-	return err
+	if _, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (rd *ResilientDatabase) PollMailboxStatsWithRetry(ctx context.Context, mailboxIDs []int64, sinceModSeq uint64) ([]db.MailboxStatsRow, error) {
@@ -441,11 +455,25 @@ func (rd *ResilientDatabase) ResolveAccountS3Owner(ctx context.Context, accountI
 // the caller (server/imap/copy.go) can read the ids back and learn, exactly and immune to
 // concurrency, whether the copy landed. On any other error the transaction definitely did
 // not commit, so nil is returned.
-func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string) (map[imap.UID]imap.UID, []int64, error) {
+// Destination object preparation follows MOVE's one-transaction contract: acquire
+// shared locks before S3 work, keep that transaction alive during the checks, and
+// give the row writes their own timeout afterwards. No lock handover is needed.
+func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string, destObjects []string, ensureDestObject func(context.Context, string) error) (map[imap.UID]imap.UID, []int64, error) {
 	var capturedUIDMap map[imap.UID]imap.UID
 	var capturedIDs []int64
-	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		uidMap, ids, err := rd.getOperationalDatabaseForOperation(ctx, true).CopyMessages(ctx, tx, uids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID)
+	op := func(opCtx context.Context, tx pgx.Tx) (any, error) {
+		if len(destObjects) > 0 {
+			if err := db.LockS3ObjectsSharedInTx(opCtx, tx, destAccountID, destObjects); err != nil {
+				return nil, err
+			}
+			if err := rd.ensureDestObjects(ctx, tx, destObjects, ensureDestObject); err != nil {
+				return nil, err
+			}
+			writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
+			defer cancel()
+			opCtx = writeCtx
+		}
+		uidMap, ids, err := rd.getOperationalDatabaseForOperation(opCtx, true).CopyMessages(opCtx, tx, uids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID, sourceHashes, destObjects)
 		if err != nil {
 			return nil, err
 		}

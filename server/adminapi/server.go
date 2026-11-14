@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -21,6 +20,7 @@ import (
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 
+	"github.com/migadu/sora/affinitycache"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
@@ -63,30 +63,29 @@ type Server struct {
 	storage        *storage.S3Storage
 	purgeWorker    *cleaner.PurgeWorker // this node's purge worker, nil on a node without object storage
 	relayQueue     delivery.RelayQueue  // Global relay queue for mail delivery
+	relayWorker    RelayWorkerNotifier  // woken after mail delivery queues a message; nil waits for its next pass
 	maxMessageSize int64                // Max accepted mail-injection body size (bytes); 0 -> default
 	maxConnections int                  // Max concurrent connections; 0 -> unlimited
 	server         *http.Server
 	tls            bool
-	tlsConfig      *tls.Config // TLS config from manager (takes precedence) or nil
-	tlsCertFile    string
-	tlsKeyFile     string
-	tlsVerify      bool
+	tlsConfig      *tls.Config // What the listener serves with (server.ListenerTLS); nil without tls
 	hostname       string
 	// instanceID is the upload-lease key (pending_uploads.instance_id), distinct from
 	// hostname, which is the SMTP-visible name stamped into Received headers.
 	instanceID         string
+	uploadMaxAttempts  int // [uploader] max_attempts: the uploader endpoints' default failure threshold
 	ftsRetention       time.Duration
 	affinityManager    AffinityManager
 	validBackends      map[string][]string
-	connectionTrackers map[string]*server.ConnectionTracker // protocol -> tracker
-	proxyServers       map[string]ProxyServer               // proxy name -> proxy server
-	proxyReader        *server.ProxyProtocolReader          // PROXY protocol support
-	authCache          AuthCacheStats                       // persistent auth cache (optional)
-	redirectRateLimit  int                                  // Max redirects per account
-	redirectRateWindow time.Duration                        // Window for redirect limit
-	maxRedirectHops    int                                  // Max redirect hops per message (mail-loop backstop)
-	sieveExtensions    []string                             // [sieve] enabled_extensions, shared with the LMTP path
-	sharedMailboxes    config.SharedMailboxesConfig         // [shared_mailboxes], which ACL grants honour
+	connectionTrackers func() map[string]*server.ConnectionTracker // snapshot: protocol -> tracker
+	proxyServers       func() map[string]ProxyServer               // snapshot: proxy name -> proxy server
+	proxyReader        *server.ProxyProtocolReader                 // PROXY protocol support
+	authCache          AuthCacheStats                              // persistent auth cache (optional)
+	redirectRateLimit  int                                         // Max redirects per account
+	redirectRateWindow time.Duration                               // Window for redirect limit
+	maxRedirectHops    int                                         // Max redirect hops per message (mail-loop backstop)
+	sieveExtensions    []string                                    // [sieve] enabled_extensions, shared with the LMTP path
+	sharedMailboxes    config.SharedMailboxesConfig                // [shared_mailboxes], which ACL grants honour
 
 	// Mail deliveries in flight, reported as this server's drain sessions, admitted by the
 	// maintenance gate, which refuses new ones while this backend is in maintenance.
@@ -100,6 +99,11 @@ func (s *Server) DrainSessions() int64 {
 	return s.deliveriesOpen.Load()
 }
 
+// RelayWorkerNotifier wakes the relay worker to send newly queued mail at once.
+type RelayWorkerNotifier interface {
+	NotifyQueued()
+}
+
 // ServerOptions holds configuration options for the HTTP API server
 type ServerOptions struct {
 	Name               string
@@ -109,9 +113,11 @@ type ServerOptions struct {
 	AllowedHosts       []string
 	Cache              *cache.Cache
 	Uploader           *uploader.UploadWorker
+	UploadMaxAttempts  int // [uploader] max_attempts, when the uploader endpoints count an upload as failed; 0 -> config default
 	Storage            *storage.S3Storage
 	PurgeWorker        *cleaner.PurgeWorker // woken when a purge is requested on this node; nil without object storage
 	RelayQueue         delivery.RelayQueue  // Global relay queue for mail delivery
+	RelayWorker        RelayWorkerNotifier  // Global relay worker, woken for what mail delivery queues (nil: next pass)
 	MaxMessageSize     int64                // Max accepted mail-injection body size (bytes); 0 -> 50MB default
 	MaxConnections     int                  // Max concurrent connections; 0 -> unlimited
 	TLS                bool
@@ -124,10 +130,10 @@ type ServerOptions struct {
 	MaintenanceGate    *server.MaintenanceGate // admits mail deliveries; refuses them while this backend is in maintenance (nil admits all)
 	FTSRetention       time.Duration
 	AffinityManager    AffinityManager
-	ValidBackends      map[string][]string                  // Map of protocol -> valid backend addresses
-	ConnectionTrackers map[string]*server.ConnectionTracker // protocol -> tracker (for gossip-based kick)
-	ProxyServers       map[string]ProxyServer               // proxy name -> proxy server (for backend health)
-	AuthCache          AuthCacheStats                       // persistent auth cache (optional)
+	ValidBackends      map[string][]string                         // Map of protocol -> valid backend addresses
+	ConnectionTrackers func() map[string]*server.ConnectionTracker // snapshot of protocol -> tracker (for gossip-based kick), see Server.trackers
+	ProxyServers       func() map[string]ProxyServer               // snapshot of proxy name -> proxy server (for backend health), see Server.trackers
+	AuthCache          AuthCacheStats                              // persistent auth cache (optional)
 	RedirectRateLimit  int
 	RedirectRateWindow time.Duration
 	MaxRedirectHops    int
@@ -147,6 +153,7 @@ type AffinityManager interface {
 	GetBackend(username, protocol string) (string, bool)
 	DeleteBackend(username, protocol string)
 	GetStats(ctx context.Context) map[string]any
+	List() []affinitycache.AffinityEntry // this node's unexpired affinities, in no particular order
 }
 
 // ProxyServer interface for accessing proxy backend health information
@@ -231,13 +238,18 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		return nil, err
 	}
 
-	// Validate TLS configuration
+	// The certificate source and tls_verify follow the rule every listener
+	// shares (server.ListenerTLS).
+	var tlsConfig *tls.Config
 	if options.TLS {
-		// If TLSConfig is provided (from manager), use it. Otherwise require cert files.
-		if options.TLSConfig == nil {
-			if options.TLSCertFile == "" || options.TLSKeyFile == "" {
-				return nil, fmt.Errorf("TLS certificate and key files are required when TLS is enabled (or use TLS manager)")
-			}
+		var err error
+		tlsConfig, err = server.ListenerTLS{
+			Protocol: "Admin API", Name: options.Name,
+			CertFile: options.TLSCertFile, KeyFile: options.TLSKeyFile, Verify: options.TLSVerify,
+			Global: options.TLSConfig,
+		}.Config()
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -266,15 +278,14 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		storage:            options.Storage,
 		purgeWorker:        options.PurgeWorker,
 		relayQueue:         options.RelayQueue,
+		relayWorker:        options.RelayWorker,
 		maxMessageSize:     options.MaxMessageSize,
 		maxConnections:     options.MaxConnections,
 		tls:                options.TLS,
-		tlsConfig:          options.TLSConfig,
-		tlsCertFile:        options.TLSCertFile,
-		tlsKeyFile:         options.TLSKeyFile,
-		tlsVerify:          options.TLSVerify,
+		tlsConfig:          tlsConfig,
 		hostname:           options.Hostname,
 		instanceID:         options.InstanceID,
+		uploadMaxAttempts:  options.UploadMaxAttempts,
 		maintenanceGate:    options.MaintenanceGate,
 		ftsRetention:       options.FTSRetention,
 		affinityManager:    options.AffinityManager,
@@ -289,11 +300,15 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		sieveExtensions:    sieveengine.EffectiveExtensions(options.SieveExtensions),
 		sharedMailboxes:    options.SharedMailboxes,
 	}
+	if s.uploadMaxAttempts <= 0 {
+		s.uploadMaxAttempts = config.DefaultUploaderMaxAttempts
+	}
 	s.settings.Store(&reloadableSettings{
 		apiKey:         options.APIKey,
 		readOnlyAPIKey: options.ReadOnlyAPIKey,
 		allowedHosts:   options.AllowedHosts,
 	})
+	warnUnusableAllowedHosts(options.Name, options.AllowedHosts)
 
 	return s, nil
 }
@@ -351,6 +366,7 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	// it does at startup: every host is allowed.
 	if !slices.Equal(cfg.AllowedHosts, next.allowedHosts) {
 		next.allowedHosts = slices.Clone(cfg.AllowedHosts)
+		warnUnusableAllowedHosts(s.name, next.allowedHosts)
 		reloaded = append(reloaded, "allowed_hosts")
 	}
 
@@ -438,31 +454,12 @@ func (s *Server) start(ctx context.Context) error {
 		listener = netutil.LimitListener(listener, s.maxConnections)
 	}
 
-	// Start server with or without TLS
+	// Start server with or without TLS. The certificate is in TLSConfig
+	// already: certificate files passed to ServeTLS would be loaded again and
+	// served, next to the global certificate, to clients that send no SNI.
 	if s.tls {
-		// Use TLS config from manager if provided, otherwise create one for static certs
-		var tlsConfig *tls.Config
-		if s.tlsConfig != nil {
-			// Clone the manager's TLS config
-			tlsConfig = s.tlsConfig.Clone()
-		} else {
-			// Create new TLS config for static certificates
-			tlsConfig = &tls.Config{
-				MinVersion:    tls.VersionTLS12,
-				Renegotiation: tls.RenegotiateNever,
-			}
-		}
-
-		// Apply client verification settings
-		if s.tlsVerify {
-			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-		} else {
-			tlsConfig.ClientAuth = tls.NoClientCert
-		}
-		s.server.TLSConfig = tlsConfig
-
-		// Serve with TLS using the listener
-		return s.server.ServeTLS(listener, s.tlsCertFile, s.tlsKeyFile)
+		s.server.TLSConfig = s.tlsConfig
+		return s.server.ServeTLS(listener, "", "")
 	}
 	return s.server.Serve(listener)
 }
@@ -471,9 +468,23 @@ func (s *Server) start(ctx context.Context) error {
 func (s *Server) setupRoutes() http.Handler {
 	mux := http.NewServeMux()
 
-	// Account management routes
+	// Account management routes. {email} is one segment of the escaped path, which
+	// r.PathValue decodes once: a "/" in a local part (atext, RFC 5322 §3.2.3)
+	// arrives as %2F and is part of the address, never a separator (RFC 3986 §2.4).
 	mux.HandleFunc("/admin/accounts", routeHandler("POST", s.handleCreateAccount))
-	mux.HandleFunc("/admin/accounts/", s.handleAccountOperations)
+	mux.HandleFunc("/admin/accounts/{email}", multiMethodHandler(map[string]http.HandlerFunc{
+		"GET":    s.handleGetAccount,
+		"PUT":    s.handleUpdateAccount,
+		"DELETE": s.handleDeleteAccount,
+	}))
+	mux.HandleFunc("/admin/accounts/{email}/exists", routeHandler("GET", s.handleAccountExists))
+	mux.HandleFunc("/admin/accounts/{email}/restore", routeHandler("POST", s.handleRestoreAccount))
+	mux.HandleFunc("/admin/accounts/{email}/credentials", multiMethodHandler(map[string]http.HandlerFunc{
+		"GET":  s.handleListCredentials,
+		"POST": s.handleAddCredential,
+	}))
+	mux.HandleFunc("/admin/accounts/{email}/messages/deleted", routeHandler("GET", s.handleListDeletedMessages))
+	mux.HandleFunc("/admin/accounts/{email}/messages/restore", routeHandler("POST", s.handleRestoreMessages))
 
 	// Domain-scoped account management routes
 	mux.HandleFunc("/admin/domains/", s.handleDomainOperations)
@@ -482,13 +493,16 @@ func (s *Server) setupRoutes() http.Handler {
 	mux.HandleFunc("/admin/usage/accounts", routeHandler("GET", s.handleAccountUsage))
 
 	// Credential management routes
-	mux.HandleFunc("/admin/credentials/", s.handleCredentialOperations)
+	mux.HandleFunc("/admin/credentials/{email}", multiMethodHandler(map[string]http.HandlerFunc{
+		"GET":    s.handleGetCredential,
+		"DELETE": s.handleDeleteCredential,
+	}))
 
 	// Connection management routes
 	mux.HandleFunc("/admin/connections", routeHandler("GET", s.handleListConnections))
 	mux.HandleFunc("/admin/connections/stats", routeHandler("GET", s.handleConnectionStats))
 	mux.HandleFunc("/admin/connections/kick", routeHandler("POST", s.handleKickConnections))
-	mux.HandleFunc("/admin/connections/user/", routeHandler("GET", s.handleGetUserConnections))
+	mux.HandleFunc("/admin/connections/user/{email}", routeHandler("GET", s.handleGetUserConnections))
 
 	// Cache management routes
 	mux.HandleFunc("/admin/cache/stats", routeHandler("GET", s.handleCacheStats))
@@ -539,82 +553,6 @@ func (s *Server) setupRoutes() http.Handler {
 	handler = s.allowedHostsMiddleware(handler)
 
 	return handler
-}
-
-// handleAccountOperations routes account-related operations
-func (s *Server) handleAccountOperations(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
-
-	// Check for message-related operations first (before checking for account /restore)
-	if strings.Contains(path, "/messages/deleted") {
-		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.handleListDeletedMessages(w, r)
-		return
-	}
-	if strings.Contains(path, "/messages/restore") {
-		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.handleRestoreMessages(w, r)
-		return
-	}
-
-	// Check for account-level sub-operations
-	if strings.HasSuffix(path, "/restore") {
-		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.handleRestoreAccount(w, r)
-		return
-	}
-	if strings.HasSuffix(path, "/exists") {
-		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.handleAccountExists(w, r)
-		return
-	}
-	if strings.Contains(path, "/credentials") {
-		switch r.Method {
-		case "GET":
-			s.handleListCredentials(w, r)
-		case "POST":
-			s.handleAddCredential(w, r)
-		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		}
-		return
-	}
-
-	// Otherwise it's a basic account operation
-	switch r.Method {
-	case "GET":
-		s.handleGetAccount(w, r)
-	case "PUT":
-		s.handleUpdateAccount(w, r)
-	case "DELETE":
-		s.handleDeleteAccount(w, r)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-// handleCredentialOperations routes credential operations
-func (s *Server) handleCredentialOperations(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case "GET":
-		s.handleGetCredential(w, r)
-	case "DELETE":
-		s.handleDeleteCredential(w, r)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
 }
 
 // handleDomainOperations routes domain-scoped operations
@@ -680,7 +618,9 @@ func (s *Server) allowedHostsMiddleware(next http.Handler) http.Handler {
 		clientIP := getClientIP(r)
 
 		// Single shared check: allowedHosts entries may be CIDRs or bare IPs (incl. IPv6,
-		// matched by value rather than string form). See helpers.IPInNetworks.
+		// matched by value rather than string form). See helpers.IPInNetworks. Any other
+		// entry (a host name, a typo) matches no client; warnUnusableAllowedHosts reports
+		// it once per list.
 		allowed := helpers.IPInNetworks(net.ParseIP(clientIP), allowedHosts)
 
 		if !allowed {
@@ -692,16 +632,26 @@ func (s *Server) allowedHostsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// warnUnusableAllowedHosts logs the allowed_hosts entries that are not an IP address
+// or CIDR, when a list is configured (startup) or replaced (reload).
+func warnUnusableAllowedHosts(name string, allowedHosts []string) {
+	for _, entry := range helpers.InvalidNetworkEntries(allowedHosts) {
+		logger.Warn("HTTP API: allowed_hosts entry is not an IP address or CIDR and matches no client", "name", name, "entry", entry)
+	}
+}
+
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
+			server.SetBearerChallenge(w.Header(), bearerRealm, false)
 			s.writeError(w, http.StatusUnauthorized, "Authorization header required")
 			return
 		}
 
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+			server.SetBearerChallenge(w.Header(), bearerRealm, false)
 			s.writeError(w, http.StatusUnauthorized, "Authorization header must be 'Bearer <token>'")
 			return
 		}
@@ -748,6 +698,9 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
 	}
 }
 
+// bearerRealm is the realm of the Admin API's Bearer challenge.
+const bearerRealm = "admin-api"
+
 func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 	s.writeJSON(w, status, map[string]string{"error": message})
 }
@@ -785,6 +738,19 @@ type KickConnectionsRequest struct {
 	Protocol   string `json:"protocol,omitempty"`
 	ServerAddr string `json:"server_addr,omitempty"`
 	ClientAddr string `json:"client_addr,omitempty"`
+}
+
+// ConnectionInfo is one entry of GET /admin/connections and GET
+// /admin/connections/user/{email}: an account on one of this node's connection
+// trackers. There is one entry per account and tracker, not per session.
+type ConnectionInfo struct {
+	Protocol   string    `json:"protocol"` // tracker key up to its first dash, e.g. "IMAP"
+	Instance   string    `json:"instance"` // tracker key, e.g. "IMAP-node1-imap-proxy"
+	AccountID  int64     `json:"account_id"`
+	LocalCount int       `json:"local_count"` // the account's sessions on this tracker
+	TotalCount int       `json:"total_count"` // LocalCount plus the sessions other nodes report for the protocol through gossip
+	LastUpdate time.Time `json:"last_update"`
+	Email      string    `json:"email"` // address of the session that created the entry (the recipient on an LMTP proxy)
 }
 
 // Import/Export request types removed - these operations are not suitable
@@ -830,6 +796,12 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 			if hashType == "" {
 				hashType = "bcrypt"
 			}
+			if cred.Password != "" {
+				if err := db.ValidateNewHashType(hashType); err != nil {
+					s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Credential %d: %v", i+1, err))
+					return
+				}
+			}
 
 			dbCredentials[i] = db.CredentialSpec{
 				Email:        cred.Email,
@@ -847,12 +819,17 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 
 		accountID, err := s.rdb.CreateAccountWithCredentialsWithRetry(ctx, createReq)
 		if err != nil {
-			if errors.Is(err, consts.ErrDBUniqueViolation) {
+			switch {
+			case errors.Is(err, consts.ErrAccountAlreadyExists):
+				s.writeError(w, http.StatusConflict, err.Error())
+			case errors.Is(err, db.ErrInvalidAccountRequest):
+				s.writeError(w, http.StatusBadRequest, err.Error())
+			case errors.Is(err, consts.ErrDBUniqueViolation):
 				s.writeError(w, http.StatusConflict, "One or more email addresses already exist")
-				return
+			default:
+				logger.Warn("HTTP API: Error creating account with credentials", "name", s.name, "error", err)
+				s.writeError(w, http.StatusInternalServerError, "Failed to create account with credentials")
 			}
-			logger.Warn("HTTP API: Error creating account with credentials", "name", s.name, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "Failed to create account with credentials")
 			return
 		}
 
@@ -894,12 +871,17 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 
 		accountID, err := s.rdb.CreateAccountWithRetry(ctx, createReq)
 		if err != nil {
-			if errors.Is(err, consts.ErrDBUniqueViolation) {
+			switch {
+			case errors.Is(err, consts.ErrAccountAlreadyExists):
+				s.writeError(w, http.StatusConflict, err.Error())
+			case errors.Is(err, db.ErrInvalidAccountRequest):
+				s.writeError(w, http.StatusBadRequest, err.Error())
+			case errors.Is(err, consts.ErrDBUniqueViolation):
 				s.writeError(w, http.StatusConflict, "Account already exists")
-				return
+			default:
+				logger.Warn("HTTP API: Error creating account", "name", s.name, "error", err)
+				s.writeError(w, http.StatusInternalServerError, "Failed to create account")
 			}
-			logger.Warn("HTTP API: Error creating account", "name", s.name, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "Failed to create account")
 			return
 		}
 
@@ -982,13 +964,16 @@ func (s *Server) handleAccountUsage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAccountExists(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/accounts/{email}/exists
-	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/exists")
+	email := r.PathValue("email")
 
 	ctx := r.Context()
 
 	result, err := s.rdb.AccountExistsWithRetry(ctx, email)
 	if err != nil {
+		if errors.Is(err, server.ErrInvalidAddress) {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		logger.Warn("HTTP API: Error checking account existence", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Error checking account existence")
 		return
@@ -1003,12 +988,15 @@ func (s *Server) handleAccountExists(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/accounts/{email}
-	email := extractLastPathSegment(r.URL.Path)
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	accountDetails, err := s.rdb.GetAccountDetailsWithRetry(ctx, email)
 	if err != nil {
+		if errors.Is(err, server.ErrInvalidAddress) {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, "Account not found")
 			return
@@ -1023,8 +1011,7 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	// Extract email from path: /admin/accounts/{email}
-	email := extractLastPathSegment(r.URL.Path)
+	email := r.PathValue("email")
 
 	var req UpdateAccountRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1054,13 +1041,20 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 
 	err := s.rdb.UpdateAccountWithRetry(ctx, updateReq)
 	if err != nil {
-		logger.Warn("HTTP API: Error updating account", "name", s.name, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "Failed to update account")
+		switch {
+		case errors.Is(err, consts.ErrUserNotFound):
+			s.writeError(w, http.StatusNotFound, "Account not found")
+		case errors.Is(err, db.ErrInvalidAccountRequest):
+			s.writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			logger.Warn("HTTP API: Error updating account", "name", s.name, "error", err)
+			s.writeError(w, http.StatusInternalServerError, "Failed to update account")
+		}
 		return
 	}
 
 	// The old password stops working now, not when a cached login expires.
-	s.forgetAccountLogins(s.trackedAccountID(ctx, email), email)
+	s.forgetAccountLogins(s.trackedAccountIDs(ctx, email), email)
 
 	s.writeJSON(w, http.StatusOK, map[string]string{
 		"message": "Account updated successfully",
@@ -1068,8 +1062,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/accounts/{email}
-	email := extractLastPathSegment(r.URL.Path)
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	if r.URL.Query().Get("purge") == "true" {
@@ -1077,9 +1070,13 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accountID := s.trackedAccountID(ctx, email)
+	accountIDs := s.trackedAccountIDs(ctx, email)
 	err := s.rdb.DeleteAccountWithRetry(ctx, email)
 	if err != nil {
+		if errors.Is(err, server.ErrInvalidAddress) {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, err.Error())
 			return
@@ -1096,7 +1093,7 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 
 	// A deleted account is signed out everywhere, and cannot sign back in from a
 	// cached login.
-	s.endAccountSessions(accountID, email)
+	s.endAccountSessions(accountIDs, email)
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"email":   email,
@@ -1105,12 +1102,15 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRestoreAccount(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/accounts/{email}/restore
-	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/restore")
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	err := s.rdb.RestoreAccountWithRetry(ctx, email)
 	if err != nil {
+		if errors.Is(err, server.ErrInvalidAddress) {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, err.Error())
 			return
@@ -1133,8 +1133,7 @@ func (s *Server) handleRestoreAccount(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	// Extract email from path: /admin/accounts/{email}/credentials
-	primaryEmail := extractPathParam(r.URL.Path, "/admin/accounts/", "/credentials")
+	primaryEmail := r.PathValue("email")
 
 	var req AddCredentialRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1183,6 +1182,10 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 
 	err = s.rdb.AddCredentialWithRetry(ctx, addReq)
 	if err != nil {
+		if errors.Is(err, server.ErrInvalidAddress) || errors.Is(err, db.ErrInvalidAccountRequest) {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if errors.Is(err, consts.ErrDBUniqueViolation) {
 			s.writeError(w, http.StatusConflict, "Credential with this email already exists")
 			return
@@ -1199,13 +1202,16 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/accounts/{email}/credentials
-	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/credentials")
+	email := r.PathValue("email")
 
 	ctx := r.Context()
 
 	credentials, err := s.rdb.ListCredentialsWithRetry(ctx, email)
 	if err != nil {
+		if errors.Is(err, server.ErrInvalidAddress) {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, "Account not found")
 			return
@@ -1223,8 +1229,7 @@ func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetCredential(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/credentials/{email}
-	email := extractLastPathSegment(r.URL.Path)
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	// Get detailed credential information using the same logic as CLI
@@ -1243,14 +1248,17 @@ func (s *Server) handleGetCredential(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/credentials/{email}
-	email := extractLastPathSegment(r.URL.Path)
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	// Resolved first: once the credential is gone, the address names no account.
-	accountID := s.trackedAccountID(ctx, email)
+	accountIDs := s.trackedAccountIDs(ctx, email)
 	err := s.rdb.DeleteCredentialWithRetry(ctx, email)
 	if err != nil {
+		if errors.Is(err, server.ErrInvalidAddress) {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		// Check for specific user-facing errors from the DB layer
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, err.Error())
@@ -1268,7 +1276,7 @@ func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// The address stops signing in now, not when a cached login expires.
-	s.forgetAccountLogins(accountID, email)
+	s.forgetAccountLogins(accountIDs, email)
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"email":   email,
@@ -1276,54 +1284,89 @@ func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// trackedAccountID resolves the account an account change applies to, for
-// endAccountSessions and forgetAccountLogins. It is zero when this node has no
-// servers to tell, or when the address names no account.
-func (s *Server) trackedAccountID(ctx context.Context, address string) int64 {
-	if len(s.connectionTrackers) == 0 {
-		return 0
+// trackers returns a copy of this node's connection trackers (nil without any). The
+// node's servers register their trackers and proxies from their own start goroutines
+// while the Admin API already serves, so the maps are only read through the
+// ConnectionTrackers / ProxyServers accessors, which copy them under the lock their
+// owner writes them under.
+func (s *Server) trackers() map[string]*server.ConnectionTracker {
+	if s.connectionTrackers == nil {
+		return nil
 	}
-	accountID, err := s.rdb.GetAccountIDByEmailWithRetry(ctx, address)
+	return s.connectionTrackers()
+}
+
+// sessionAccountIDs returns every account ID the connection trackers can hold the
+// sessions and cached logins of the account address names under. A server that
+// authenticates against the database keys them by the database's account ID. A proxy
+// keys a login remote lookup answered by the ID derived from the address the lookup
+// answered (proxy.DeriveAccountIDFromEmail), even when the database holds the account,
+// and the lookup may answer any address of the account, so the IDs derived from all of
+// them are included. An address the database does not know (a lookup service's own
+// account) has its derived ID only. A failed lookup is an error: the derived ID alone
+// would leave the sessions of a database account open.
+func (s *Server) sessionAccountIDs(ctx context.Context, address string) ([]int64, error) {
+	// Revocation must see newly added credentials even while read replicas lag.
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	accountID, addresses, err := s.rdb.GetAccountAddressesWithRetry(ctx, address)
+	if errors.Is(err, consts.ErrUserNotFound) {
+		return []int64{proxy.DeriveAccountIDFromEmail(address)}, nil
+	}
 	if err != nil {
-		if !errors.Is(err, consts.ErrUserNotFound) {
-			logger.Warn("HTTP API: Cannot resolve account; its sessions and cached logins are left as they are",
-				"name", s.name, "email", address, "error", err)
-		}
-		return 0
+		return nil, err
 	}
-	return accountID
+	ids := []int64{accountID}
+	for _, a := range addresses {
+		if id := proxy.DeriveAccountIDFromEmail(a); !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
 }
 
-// endAccountSessions closes the account's sessions on this node's servers and,
-// through the trackers that gossip, on their cluster peers. A kick also drops the
-// account's cached logins.
-func (s *Server) endAccountSessions(accountID int64, address string) {
-	if accountID == 0 {
-		return
+// trackedAccountIDs resolves the account an account change applies to, for
+// endAccountSessions and forgetAccountLogins (see sessionAccountIDs). It is empty
+// when this node has no servers to tell, or when the account cannot be resolved.
+func (s *Server) trackedAccountIDs(ctx context.Context, address string) []int64 {
+	if len(s.trackers()) == 0 {
+		return nil
 	}
-	for key, tracker := range s.connectionTrackers {
+	ids, err := s.sessionAccountIDs(ctx, address)
+	if err != nil {
+		logger.Warn("HTTP API: Cannot resolve account; its sessions and cached logins are left as they are",
+			"name", s.name, "email", address, "error", err)
+	}
+	return ids
+}
+
+// endAccountSessions closes the sessions held under the account IDs on this node's
+// servers and, through the trackers that gossip, on their cluster peers. A kick also
+// drops the account's cached logins.
+func (s *Server) endAccountSessions(accountIDs []int64, address string) {
+	for key, tracker := range s.trackers() {
 		if tracker == nil {
 			continue
 		}
-		if err := tracker.KickUser(accountID, key); err != nil {
-			logger.Warn("HTTP API: Error ending sessions", "name", s.name, "email", address, "tracker", key, "error", err)
+		for _, accountID := range accountIDs {
+			if err := tracker.KickUser(accountID, key); err != nil {
+				logger.Warn("HTTP API: Error ending sessions", "name", s.name, "email", address, "tracker", key, "error", err)
+			}
 		}
 	}
 }
 
-// forgetAccountLogins drops the account's cached logins on this node's servers
-// and, through the trackers that gossip, on their cluster peers, so that its next
-// login is checked against the database. Its sessions are left alone.
-func (s *Server) forgetAccountLogins(accountID int64, address string) {
-	if accountID == 0 {
-		return
-	}
-	for key, tracker := range s.connectionTrackers {
+// forgetAccountLogins drops the cached logins held under the account IDs on this
+// node's servers and, through the trackers that gossip, on their cluster peers, so
+// that the account's next login is checked afresh. Its sessions are left alone.
+func (s *Server) forgetAccountLogins(accountIDs []int64, address string) {
+	for key, tracker := range s.trackers() {
 		if tracker == nil {
 			continue
 		}
-		if err := tracker.ForgetLogins(accountID, address); err != nil {
-			logger.Warn("HTTP API: Error dropping cached logins", "name", s.name, "email", address, "tracker", key, "error", err)
+		for _, accountID := range accountIDs {
+			if err := tracker.ForgetLogins(accountID, address); err != nil {
+				logger.Warn("HTTP API: Error dropping cached logins", "name", s.name, "email", address, "tracker", key, "error", err)
+			}
 		}
 	}
 }
@@ -1350,8 +1393,23 @@ func extractProtocolFromKey(key string) string {
 	return key
 }
 
+// newConnectionInfo is the entry for an account on the tracker keyed trackerKey, with
+// localCount of its sessions on that tracker.
+func newConnectionInfo(trackerKey string, localCount int, conn server.UserConnectionInfo) ConnectionInfo {
+	return ConnectionInfo{
+		Protocol:   extractProtocolFromKey(trackerKey),
+		Instance:   trackerKey,
+		AccountID:  conn.AccountID,
+		LocalCount: localCount,
+		TotalCount: conn.GetTotalCount(),
+		LastUpdate: conn.LastUpdate,
+		Email:      conn.Username,
+	}
+}
+
 func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
-	if len(s.connectionTrackers) == 0 {
+	trackers := s.trackers()
+	if len(trackers) == 0 {
 		// No connection trackers available
 		s.writeJSON(w, http.StatusOK, map[string]any{
 			"connections": []any{},
@@ -1364,8 +1422,8 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 	// Collect connections from all trackers
 	// Only report connections where this tracker instance has actual local connections
 	// This prevents duplicate entries where trackers report gossip data from other instances
-	allConnections := make([]map[string]any, 0)
-	for trackerKey, tracker := range s.connectionTrackers {
+	allConnections := make([]ConnectionInfo, 0)
+	for trackerKey, tracker := range trackers {
 		if tracker == nil {
 			continue
 		}
@@ -1379,20 +1437,7 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 				continue // Skip - this is only gossip data, not an actual connection on this instance
 			}
 
-			// Extract protocol from tracker key
-			// Key format: "PROTOCOL-hostname-servername" or "PROTOCOL-servername"
-			// Display: Just "PROTOCOL" for simplicity
-			protocol := extractProtocolFromKey(trackerKey)
-
-			allConnections = append(allConnections, map[string]any{
-				"protocol":    protocol,
-				"instance":    trackerKey, // Full key for debugging/filtering
-				"account_id":  connInfo.AccountID,
-				"local_count": localCount,
-				"total_count": connInfo.GetTotalCount(),
-				"last_update": connInfo.LastUpdate,
-				"email":       connInfo.Username,
-			})
+			allConnections = append(allConnections, newConnectionInfo(trackerKey, localCount, connInfo))
 		}
 	}
 
@@ -1414,22 +1459,13 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// Require user email for gossip-based kick
-	if req.UserEmail == "" {
+	if strings.TrimSpace(req.UserEmail) == "" {
 		s.writeError(w, http.StatusBadRequest, "user_email is required for kick operation")
 		return
 	}
 
-	// Get account ID from email
-	// Try database first (for local accounts)
-	accountID, err := s.rdb.GetAccountIDByEmailWithRetry(ctx, req.UserEmail)
-	if err != nil {
-		// User not found in database - could be a remotelookup account
-		// Derive accountID from email (same logic as remotelookup)
-		accountID = proxy.DeriveAccountIDFromEmail(req.UserEmail)
-		logger.Info("HTTP API: User not in database, using derived accountID for kick", "name", s.name, "email", req.UserEmail, "derived_account_id", accountID)
-	}
-
-	if len(s.connectionTrackers) == 0 {
+	trackers := s.trackers()
+	if len(trackers) == 0 {
 		// No connection trackers available (not running in cluster/proxy mode)
 		logger.Debug("HTTP API: No connection trackers available - gossip-based kick requires cluster mode", "name", s.name)
 		s.writeError(w, http.StatusServiceUnavailable, "Connection tracking not available (requires cluster mode)")
@@ -1447,8 +1483,8 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 	if req.Protocol != "" {
 		// Find all trackers that match the protocol prefix
 		normalizedProtocol := strings.ToUpper(req.Protocol)
-		for trackerKey, tracker := range s.connectionTrackers {
-			// Extract protocol from tracker key (format: "PROTOCOL-hostname-servername")
+		for trackerKey, tracker := range trackers {
+			// Extract protocol from tracker key (format: "PROTOCOL-node-servername")
 			trackerProtocol := extractProtocolFromKey(trackerKey)
 			if strings.ToUpper(trackerProtocol) == normalizedProtocol {
 				trackersToKick = append(trackersToKick, struct {
@@ -1459,7 +1495,7 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// Kick all trackers if no protocol specified
-		for trackerKey, tracker := range s.connectionTrackers {
+		for trackerKey, tracker := range trackers {
 			trackersToKick = append(trackersToKick, struct {
 				key     string
 				tracker *server.ConnectionTracker
@@ -1476,6 +1512,15 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Every ID the account's sessions can be held under: the database account ID and the
+	// IDs a proxy derives for remote lookup logins.
+	accountIDs, err := s.sessionAccountIDs(ctx, req.UserEmail)
+	if err != nil {
+		logger.Warn("HTTP API: Cannot resolve account to kick", "name", s.name, "email", req.UserEmail, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "Failed to resolve account")
+		return
+	}
+
 	// Kick user on all matching trackers
 	kickedProtocols := []string{}
 	for _, item := range trackersToKick {
@@ -1484,13 +1529,19 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if err := item.tracker.KickUser(accountID, item.key); err != nil {
-			logger.Warn("HTTP API: Error kicking user on tracker", "name", s.name, "email", req.UserEmail, "tracker", item.key, "error", err)
+		kicked := true
+		for _, accountID := range accountIDs {
+			if err := item.tracker.KickUser(accountID, item.key); err != nil {
+				logger.Warn("HTTP API: Error kicking user on tracker", "name", s.name, "email", req.UserEmail, "account_id", accountID, "tracker", item.key, "error", err)
+				kicked = false
+			}
+		}
+		if !kicked {
 			continue
 		}
 
 		kickedProtocols = append(kickedProtocols, item.key)
-		logger.Info("HTTP API: Kicked user on tracker", "name", s.name, "email", req.UserEmail, "account_id", accountID, "tracker", item.key)
+		logger.Info("HTTP API: Kicked user on tracker", "name", s.name, "email", req.UserEmail, "account_ids", accountIDs, "tracker", item.key)
 	}
 
 	if len(kickedProtocols) == 0 {
@@ -1507,7 +1558,8 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConnectionStats(w http.ResponseWriter, r *http.Request) {
-	if len(s.connectionTrackers) == 0 {
+	trackers := s.trackers()
+	if len(trackers) == 0 {
 		// No connection trackers available
 		s.writeJSON(w, http.StatusOK, map[string]any{
 			"total_connections":       0,
@@ -1521,12 +1573,13 @@ func (s *Server) handleConnectionStats(w http.ResponseWriter, r *http.Request) {
 	totalConnections := 0
 	byProtocol := make(map[string]int)
 
-	for protocol, tracker := range s.connectionTrackers {
+	for protocol, tracker := range trackers {
 		if tracker == nil {
 			continue
 		}
-		conns := tracker.GetAllConnections()
-		count := len(conns)
+		// Connections on this node, as GET /admin/connections lists them: not the
+		// number of accounts, and not what other nodes report through gossip.
+		count := tracker.GetLocalConnectionTotal()
 		totalConnections += count
 		byProtocol[protocol] = count
 	}
@@ -1539,10 +1592,10 @@ func (s *Server) handleConnectionStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/connections/user/{email}
-	email := extractLastPathSegment(r.URL.Path)
+	email := r.PathValue("email")
 
-	if len(s.connectionTrackers) == 0 {
+	trackers := s.trackers()
+	if len(trackers) == 0 {
 		// No connection trackers available
 		s.writeJSON(w, http.StatusOK, map[string]any{
 			"email":       email,
@@ -1553,29 +1606,44 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Collect connections for this user from all trackers
-	// Filter by email string matching (case-insensitive) - no database lookup needed
-	// The connection tracker already stores the username (email) via gossip
-	userConnections := make([]map[string]any, 0)
-	emailLower := strings.ToLower(email)
+	// A tracker keeps one entry per account ID, with the address of the session that
+	// created it. The address is resolved to its account, as POST /admin/connections/kick
+	// resolves it, so the account's entries are listed whichever of its addresses names
+	// it. An entry created under any address of the account is listed too: a proxy keys
+	// a session that remote lookup authenticated by an ID derived from the address the
+	// lookup answered (proxy.DeriveAccountIDFromEmail), not by the database's account ID,
+	// even when the database holds the account, and that address is the one its entry
+	// keeps. Without an account in the database (a lookup service's own account, or the
+	// database cannot be asked) the entries created under the address itself are listed.
+	//
+	// Unlike GET /admin/connections, a tracker that knows the account only through
+	// gossip is listed too (local count 0): it reports the sessions on other nodes.
+	var accountID int64 // 0: the database names no account for the address
+	addresses := []string{email}
+	if s.rdb != nil {
+		id, accountAddresses, err := s.rdb.GetAccountAddressesWithRetry(r.Context(), email)
+		switch {
+		case err == nil:
+			accountID, addresses = id, append(accountAddresses, email)
+		case !errors.Is(err, consts.ErrUserNotFound):
+			logger.Warn("HTTP API: Cannot resolve account; listing only the entries created under the address",
+				"name", s.name, "email", email, "error", err)
+		}
+	}
+	createdUnder := func(username string) bool {
+		return slices.ContainsFunc(addresses, func(a string) bool { return strings.EqualFold(a, username) })
+	}
+	userConnections := make([]ConnectionInfo, 0)
 
-	for protocol, tracker := range s.connectionTrackers {
+	for trackerKey, tracker := range trackers {
 		if tracker == nil {
 			continue
 		}
 		instanceID := tracker.GetInstanceID()
 		conns := tracker.GetAllConnections()
 		for _, connInfo := range conns {
-			// Match email case-insensitively
-			if strings.ToLower(connInfo.Username) == emailLower {
-				userConnections = append(userConnections, map[string]any{
-					"protocol":    protocol,
-					"account_id":  connInfo.AccountID,
-					"email":       connInfo.Username,
-					"local_count": connInfo.GetLocalCount(instanceID),
-					"total_count": connInfo.GetTotalCount(),
-					"last_update": connInfo.LastUpdate,
-				})
+			if (accountID != 0 && connInfo.AccountID == accountID) || createdUnder(connInfo.Username) {
+				userConnections = append(userConnections, newConnectionInfo(trackerKey, connInfo.GetLocalCount(instanceID), connInfo))
 			}
 		}
 	}
@@ -1753,56 +1821,22 @@ func (s *Server) handleHealthStatusByComponent(w http.ResponseWriter, r *http.Re
 
 	ctx := r.Context()
 
-	// Parse query parameters for history
-	showHistory := r.URL.Query().Get("history") == "true"
-	sinceParam := r.URL.Query().Get("since")
-	limitParam := r.URL.Query().Get("limit")
-
-	if showHistory {
-		// Get historical health status
-		var since time.Time
-		if sinceParam != "" {
-			var err error
-			since, err = time.Parse(time.RFC3339, sinceParam)
-			if err != nil {
-				s.writeError(w, http.StatusBadRequest, "Invalid since parameter format (use RFC3339)")
-				return
-			}
-		} else {
-			since = time.Now().Add(-24 * time.Hour) // Default to last 24 hours
-		}
-
-		limit := 100
-		if limitParam != "" {
-			if l, err := strconv.Atoi(limitParam); err == nil && l > 0 {
-				limit = l
-			}
-		}
-
-		history, err := s.rdb.GetHealthHistoryWithRetry(ctx, hostname, component, since, limit)
-		if err != nil {
-			logger.Warn("HTTP API: Error getting health history", "name", s.name, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "Failed to get health history")
-			return
-		}
-
-		s.writeJSON(w, http.StatusOK, map[string]any{
-			"hostname":  hostname,
-			"component": component,
-			"history":   history,
-			"count":     len(history),
-			"since":     since,
-		})
-	} else {
-		// Get current health status
-		status, err := s.rdb.GetHealthStatusWithRetry(ctx, hostname, component)
-		if err != nil {
-			// This could be a normal "not found" case, so don't log as a server error
-			s.writeError(w, http.StatusNotFound, "Health status not found")
-			return
-		}
-		s.writeJSON(w, http.StatusOK, status)
+	// The table keeps only the current row, not historical transitions.
+	if r.URL.Query().Get("history") == "true" {
+		s.writeError(w, http.StatusBadRequest, "Health history is not recorded; request the current status without history=true")
+		return
 	}
+	status, err := s.rdb.GetHealthStatusWithRetry(ctx, hostname, component)
+	if err != nil {
+		logger.Warn("HTTP API: Error getting health status", "name", s.name, "hostname", hostname, "component", component, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "Failed to get health status")
+		return
+	}
+	if status == nil {
+		s.writeError(w, http.StatusNotFound, "Health status not found")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, status)
 }
 
 // handleProxyBackends returns backend health status for all proxy servers
@@ -1814,7 +1848,7 @@ func (s *Server) handleProxyBackends(w http.ResponseWriter, r *http.Request) {
 
 	// Iterate through all registered proxy servers
 	if s.proxyServers != nil {
-		for proxyName, proxyServer := range s.proxyServers {
+		for proxyName, proxyServer := range s.proxyServers() {
 			if proxyServer == nil {
 				continue
 			}
@@ -1861,7 +1895,7 @@ func (s *Server) handleUploaderStatus(w http.ResponseWriter, r *http.Request) {
 	showFailedStr := r.URL.Query().Get("show_failed")
 	maxAttemptsStr := r.URL.Query().Get("max_attempts")
 
-	maxAttempts := 5 // Default value
+	maxAttempts := s.uploadMaxAttempts // the uploader gives up after this many
 	if maxAttemptsStr != "" {
 		if ma, err := strconv.Atoi(maxAttemptsStr); err == nil && ma > 0 {
 			maxAttempts = ma
@@ -1911,7 +1945,7 @@ func (s *Server) handleFailedUploads(w http.ResponseWriter, r *http.Request) {
 	maxAttemptsStr := r.URL.Query().Get("max_attempts")
 	limitStr := r.URL.Query().Get("limit")
 
-	maxAttempts := 5 // Default value
+	maxAttempts := s.uploadMaxAttempts // the uploader gives up after this many
 	if maxAttemptsStr != "" {
 		if ma, err := strconv.Atoi(maxAttemptsStr); err == nil && ma > 0 {
 			maxAttempts = ma
@@ -2002,9 +2036,7 @@ func (s *Server) handleAuthBlocked(w http.ResponseWriter, r *http.Request) {
 // Message restoration handlers
 
 func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/accounts/{email}/messages/deleted
-	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/messages/deleted")
-	email, _ = url.QueryUnescape(email) // Decode URL-encoded characters
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	// Parse query parameters
@@ -2077,9 +2109,7 @@ func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	// Extract email from path: /admin/accounts/{email}/messages/restore
-	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/messages/restore")
-	email, _ = url.QueryUnescape(email) // Decode URL-encoded characters
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	var req struct {
@@ -2211,6 +2241,7 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 			},
 			"credential_management": {
 				"GET /admin/credentials/{email}",
+				"DELETE /admin/credentials/{email}",
 			},
 			"message_restoration": {
 				"GET /admin/accounts/{email}/messages/deleted",
@@ -2239,9 +2270,28 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 			"auth_statistics": {
 				"GET /admin/auth/stats",
 				"GET /admin/auth/blocked",
+				"GET /admin/auth-cache/stats",
+			},
+			"proxy_monitoring": {
+				"GET /admin/proxy/backends",
 			},
 			"system_information": {
 				"GET /admin/config",
+			},
+			"mail_delivery": {
+				"POST /admin/mail/deliver",
+			},
+			"acl_management": {
+				"POST /admin/mailboxes/acl/grant",
+				"POST /admin/mailboxes/acl/revoke",
+				"GET /admin/mailboxes/acl",
+			},
+			"affinity_management": {
+				"GET /admin/affinity",
+				"POST /admin/affinity",
+				"DELETE /admin/affinity",
+				"GET /admin/affinity/list",
+				"GET /admin/affinity/stats",
 			},
 		},
 	})

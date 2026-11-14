@@ -103,7 +103,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 				Addr:             ":2525",
 				RemoteUseXCLIENT: true,
 			},
-			wantWarnings: []string{"remote_use_xclient", "LMTP proxy"},
+			wantWarnings: []string{"remote_use_xclient", "LMTP and POP3 proxy"},
 		},
 		{
 			name: "IMAP with remote_tls_use_starttls",
@@ -116,6 +116,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 			wantWarnings: []string{"remote_tls_use_starttls", "proxy"},
 		},
 		{
+			// The POP3 proxy forwards the client to its backends with XCLIENT.
 			name: "POP3 proxy with remote_use_xclient",
 			serverConfig: ServerConfig{
 				Type:             "pop3_proxy",
@@ -124,7 +125,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 				RemoteAddrs:      []string{"backend1:110"},
 				RemoteUseXCLIENT: true,
 			},
-			wantWarnings: []string{"remote_use_xclient", "LMTP proxy"},
+			wantWarnings: nil,
 		},
 		{
 			name: "IMAP proxy with remote_use_xclient",
@@ -135,7 +136,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 				RemoteAddrs:      []string{"backend1:143"},
 				RemoteUseXCLIENT: true,
 			},
-			wantWarnings: []string{"remote_use_xclient", "LMTP proxy"},
+			wantWarnings: []string{"remote_use_xclient", "LMTP and POP3 proxy"},
 		},
 		{
 			name: "LMTP proxy with remote_use_id_command",
@@ -147,6 +148,28 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 				RemoteUseIDCommand: true,
 			},
 			wantWarnings: []string{"remote_use_id_command", "IMAP proxy"},
+		},
+		{
+			// The metrics endpoint does not read PROXY headers (#272).
+			name: "metrics with proxy_protocol",
+			serverConfig: ServerConfig{
+				Type:          "metrics",
+				Name:          "metrics-test",
+				Addr:          ":9090",
+				ProxyProtocol: true,
+			},
+			wantWarnings: []string{"proxy_protocol", "metrics"},
+		},
+		{
+			name: "IMAP proxy with proxy_protocol",
+			serverConfig: ServerConfig{
+				Type:          "imap_proxy",
+				Name:          "imap-proxy-test",
+				Addr:          ":143",
+				RemoteAddrs:   []string{"backend1:143"},
+				ProxyProtocol: true,
+			},
+			wantWarnings: nil,
 		},
 	}
 
@@ -319,5 +342,41 @@ func TestWarnStartTLSWithoutTLS(t *testing.T) {
 				t.Fatalf("expected a warning that tls_use_starttls needs tls, got %v", warnings)
 			}
 		})
+	}
+}
+
+// tls_verify asks the TLS handshake for a client certificate, so without tls =
+// true it does nothing on any listener; that must be said at startup (#416).
+func TestWarnTLSVerifyWithoutTLS(t *testing.T) {
+	for _, serverType := range []string{"imap", "lmtp", "managesieve", "pop3", "imap_proxy", "lmtp_proxy", "managesieve_proxy", "pop3_proxy", "user_api_proxy", "http_admin_api", "http_user_api"} {
+		t.Run(serverType, func(t *testing.T) {
+			for _, withTLS := range []bool{false, true} {
+				cfg := ServerConfig{Type: serverType, Name: "listener", TLS: withTLS, TLSVerify: true}
+				var warnings []string
+				cfg.WarnUnusedConfigOptions(func(format string, args ...any) {
+					warnings = append(warnings, fmt.Sprintf(format, args...))
+				})
+				if withTLS && len(warnings) != 0 {
+					t.Fatalf("tls_verify with tls = true warned: %v", warnings)
+				}
+				if !withTLS && (len(warnings) != 1 || !strings.Contains(warnings[0], "'tls_verify'") || !strings.Contains(warnings[0], "without 'tls = true'")) {
+					t.Fatalf("expected a warning that tls_verify needs tls, got %v", warnings)
+				}
+			}
+		})
+	}
+}
+
+// allowed_hosts matches IP addresses and CIDRs only; a host name matches no client.
+// A metrics listener's list is fixed at startup, so that is where such an entry must be
+// reported (#460). The Admin and User APIs report theirs when they install a list.
+func TestWarnUnusedConfigOptions_MetricsAllowedHostsNotIP(t *testing.T) {
+	cfg := ServerConfig{Type: "metrics", Name: "prometheus", AllowedHosts: []string{"10.0.0.0/8", "scraper.example.com", "192.0.2.7"}}
+	var warnings []string
+	cfg.WarnUnusedConfigOptions(func(format string, args ...any) {
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+	})
+	if len(warnings) != 1 || !strings.Contains(warnings[0], `"scraper.example.com"`) || !strings.Contains(warnings[0], "prometheus") || !strings.Contains(warnings[0], "matches no client") {
+		t.Fatalf("expected one warning naming the host-name entry, got %v", warnings)
 	}
 }

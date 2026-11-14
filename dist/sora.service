@@ -1,5 +1,6 @@
 # Sora Mail Server — systemd service file
 # Install: cp dist/sora.service /etc/systemd/system/sora.service
+#          install -d -o sora -g sora -m 0750 /var/spool/sora
 # Enable:  systemctl daemon-reload && systemctl enable sora
 # Start:   systemctl start sora
 # Reload:  systemctl reload sora  (sends SIGHUP for config reload)
@@ -8,9 +9,11 @@
 [Unit]
 Description=Sora Mail Server
 Documentation=https://github.com/migadu/sora
+# PostgreSQL is wanted, not required: a proxy node or a backend with a remote database
+# has no local postgresql.service (a missing Wants= unit is ignored), and stopping or
+# restarting the database does not stop sora. After= orders the start when both run here.
 After=network-online.target postgresql.service
-Wants=network-online.target
-Requires=postgresql.service
+Wants=network-online.target postgresql.service
 
 [Service]
 Type=simple
@@ -20,7 +23,11 @@ Group=sora
 ExecStart=/usr/local/bin/sora --config /etc/sora/config.toml
 ExecReload=/bin/kill -HUP $MAINPID
 
-# Graceful shutdown (30s timeout matches server's internal shutdown timeout)
+# Graceful shutdown: SIGTERM cancels sora's main context at once, which closes the
+# listeners and abandons any S3 upload still in transfer (it is retried after the
+# restart; one already written is still marked done). sora waits up to 10s for the
+# listeners, 3s more for sessions to release database resources, then stops its workers
+# and leaves the cluster (up to 5s). After TimeoutStopSec the rest is killed.
 TimeoutStopSec=30
 KillMode=mixed
 KillSignal=SIGTERM
@@ -33,8 +40,24 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+# The private /tmp is deleted whenever the service stops: nothing sora must keep may live
+# there. Writable and kept across restarts (the defaults point here):
+#   /var/spool/sora   [uploader] path (staged bodies, the only copy until uploaded),
+#                     [relay.queue] path; create it at install (see above)
+#   /var/lib/sora     TLS fallback_dir (StateDirectory)
+#   /var/cache/sora   [local_cache] path, [auth_cache] path (CacheDirectory)
+#   /var/log/sora     [logging] output, when a file (LogsDirectory)
+# systemd resets the State/Cache/Logs directories to their *DirectoryMode= at every start
+# (0755 when unset). The cache holds message bodies and the logs hold addresses: 0750,
+# like /var/spool/sora.
 PrivateTmp=true
-ReadWritePaths=/var/spool/sora /var/cache/sora /var/log/sora
+StateDirectory=sora
+StateDirectoryMode=0750
+CacheDirectory=sora
+CacheDirectoryMode=0750
+LogsDirectory=sora
+LogsDirectoryMode=0750
+ReadWritePaths=/var/spool/sora
 
 # File descriptor limits (for many concurrent connections)
 LimitNOFILE=65536

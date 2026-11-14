@@ -9,8 +9,9 @@ package consts
 const SoraAdvisoryLockID = 42734581 // A randomly chosen integer
 
 // SoraMigrationLeaderLockID is a unique integer used for a PostgreSQL advisory lock
-// exclusively meant for deterministic migration leader election on startup. It is
-// taken transaction-scoped inside a db.AdvisoryLockTx.
+// held by whoever runs migrations: the leader elected among starting instances, and
+// sora-admin migrate up/down/force. It is taken transaction-scoped inside a
+// db.AdvisoryLockTx.
 const SoraMigrationLeaderLockID = SoraAdvisoryLockID + 1
 
 // SoraFTSOrphanSweepLockClassID is the class ID used for transaction-scoped advisory locks

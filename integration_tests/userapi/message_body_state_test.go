@@ -38,6 +38,13 @@ type bodyStateHarness struct {
 
 func newBodyStateHarness(t *testing.T) *bodyStateHarness {
 	t.Helper()
+	return newBodyStateHarnessWith(t, nil)
+}
+
+// newBodyStateHarnessWith lets a test change the server options before the server is
+// built (e.g. drop the uploader, as on a node that runs only the User API).
+func newBodyStateHarnessWith(t *testing.T, adjust func(*userapi.ServerOptions)) *bodyStateHarness {
+	t.Helper()
 	common.SkipIfDatabaseUnavailable(t)
 	rdb := common.SetupTestDatabase(t)
 	account := common.CreateTestAccount(t, rdb)
@@ -51,11 +58,15 @@ func newBodyStateHarness(t *testing.T) *bodyStateHarness {
 		t.Fatal(err)
 	}
 
-	srv, err := userapi.New(rdb, userapi.ServerOptions{
+	options := userapi.ServerOptions{
 		Name: "body-state", Addr: "127.0.0.1:0", JWTSecret: "test-secret-key-for-testing-only",
 		TokenDuration: time.Hour, TokenIssuer: "test-issuer", AllowedOrigins: []string{"*"},
 		Storage: s3, Cache: nil, Uploader: up, TLS: false,
-	})
+	}
+	if adjust != nil {
+		adjust(&options)
+	}
+	srv, err := userapi.New(rdb, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,6 +179,50 @@ func TestUserAPI_BodyStates(t *testing.T) {
 		code, _, _ := h.getRaw(t, id)
 		if code != http.StatusGone {
 			t.Fatalf("got %d, want 410 for a NoSuchKey on an uploaded row", code)
+		}
+	})
+}
+
+// A node that runs the User API without imap, lmtp or pop3 has S3 but no upload worker
+// or cache of its own (cmd/sora initializeServices). It must still serve an uploaded
+// body, and must still call a body the uploaders have given up on gone, as IMAP, POP3
+// and a User API next to them do: "retry later" for a row no worker will lease again is
+// a promise nobody keeps, so a client honouring Retry-After would retry until the
+// cleaner reaps the row (the cleanup grace period, 14 days by default).
+func TestUserAPI_BodyStates_NoLocalUploader(t *testing.T) {
+	h := newBodyStateHarnessWith(t, func(o *userapi.ServerOptions) {
+		o.Uploader = nil
+		o.UploadMaxAttempts = 3 // [uploader] max_attempts from the node's config
+	})
+	body := []byte("Subject: state\r\n\r\nhello\r\n")
+
+	t.Run("uploaded and in S3 → 200", func(t *testing.T) {
+		id, hash := h.insert(t, body, "other-node")
+		if err := h.s3.Put(helpers.NewS3Key("example.com", "user", hash), bytes.NewReader(body), int64(len(body))); err != nil {
+			t.Fatal(err)
+		}
+		h.exec(t, `UPDATE messages SET uploaded = TRUE WHERE id = $1`, id)
+		h.exec(t, `DELETE FROM pending_uploads WHERE account_id = $1 AND content_hash = $2`, h.accountID, hash)
+		code, _, got := h.getRaw(t, id)
+		if code != http.StatusOK || !bytes.Equal(got, body) {
+			t.Fatalf("got %d %q, want 200 with the body", code, got)
+		}
+	})
+
+	t.Run("pending on another node → 503 with Retry-After", func(t *testing.T) {
+		id, _ := h.insert(t, body, "other-node")
+		code, retry, _ := h.getRaw(t, id)
+		if code != http.StatusServiceUnavailable || retry == "" {
+			t.Fatalf("got %d Retry-After=%q, want 503 with Retry-After", code, retry)
+		}
+	})
+
+	t.Run("upload given up on, nothing anywhere → 410", func(t *testing.T) {
+		id, hash := h.insert(t, body, "other-node")
+		h.exec(t, `UPDATE pending_uploads SET attempts = 3 WHERE account_id = $1 AND content_hash = $2`, h.accountID, hash)
+		code, retry, _ := h.getRaw(t, id)
+		if code != http.StatusGone {
+			t.Fatalf("got %d Retry-After=%q, want 410 for a body the uploaders have given up on", code, retry)
 		}
 	})
 }

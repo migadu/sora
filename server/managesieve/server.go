@@ -111,7 +111,7 @@ type ManageSieveServer struct {
 	// Active session tracking for graceful shutdown
 	activeSessionsMutex sync.RWMutex
 	activeSessions      map[*ManageSieveSession]struct{}
-	sessionsWg          sync.WaitGroup // Tracks active sessions for graceful drain
+	sessions            serverPkg.SessionGroup // Tracks active sessions for graceful drain
 
 	// msLibServer is the go-managesieve protocol server. It is swapped
 	// atomically on SIGHUP so reloaded settings apply to new connections
@@ -140,7 +140,7 @@ type ManageSieveServerOptions struct {
 	MasterPassword              string
 	MasterSASLUsername          string
 	MasterSASLPassword          string
-	MasterSASLAllowedNetworks   []string // Source networks allowed to use master SASL (empty = any, anchored to real socket peer)
+	MasterSASLAllowedNetworks   []string // Source networks allowed to use master SASL and the master-username form (empty = any, anchored to real socket peer)
 	MaxConnections              int
 	MaxConnectionsPerIP         int
 	MaxConnectionsPerUser       int      // Maximum connections per user (0=unlimited) - used for local tracking on backends
@@ -156,7 +156,7 @@ type ManageSieveServerOptions struct {
 	CommandTimeout              time.Duration             // Maximum idle time before disconnection
 	CommandTimeoutOverrides     map[string]time.Duration  // Per-command hard execution timeouts (overrides defaults)
 	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = no limit; go-managesieve enforces it)
-	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
+	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = disabled)
 	Config                      *config.Config            // Full config for shared settings like connection tracking timeouts
 }
 
@@ -225,50 +225,23 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 	// If no config provided, use defaults and enable cache
 	if lookupCacheConfig == nil {
-		lookupCacheConfig = &config.LookupCacheConfig{
-			Enabled:                    true,
-			PositiveTTL:                "5m",
-			NegativeTTL:                "1m",
-			MaxSize:                    10000,
-			CleanupInterval:            "5m",
-			PositiveRevalidationWindow: "30s",
-		}
+		defaultConfig := config.DefaultLookupCacheConfig()
+		lookupCacheConfig = &defaultConfig
 	}
 
 	// Only disable if explicitly set to false
 	if !lookupCacheConfig.Enabled {
 		logger.Info("ManageSieve: Lookup cache disabled", "name", name)
 	} else {
-		positiveTTL, err := time.ParseDuration(lookupCacheConfig.PositiveTTL)
-		if err != nil || lookupCacheConfig.PositiveTTL == "" {
-			logger.Info("ManageSieve: Using default positive TTL (5m)", "name", name)
-			positiveTTL = 5 * time.Minute
-		}
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault(name)
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault(name)
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(name)
 
-		negativeTTL, err := time.ParseDuration(lookupCacheConfig.NegativeTTL)
-		if err != nil || lookupCacheConfig.NegativeTTL == "" {
-			logger.Info("ManageSieve: Using default negative TTL (1m)", "name", name)
-			negativeTTL = 1 * time.Minute
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
-		cleanupInterval, err := time.ParseDuration(lookupCacheConfig.CleanupInterval)
-		if err != nil || lookupCacheConfig.CleanupInterval == "" {
-			logger.Info("ManageSieve: Using default cleanup interval (5m)", "name", name)
-			cleanupInterval = 5 * time.Minute
-		}
+		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(name)
 
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize == 0 {
-			maxSize = 10000
-		}
-
-		positiveRevalidationWindow, err := lookupCacheConfig.GetPositiveRevalidationWindow()
-		if err != nil {
-			logger.Info("ManageSieve: Invalid positive revalidation window in auth cache config, using default (30s)", "name", name, "error", err)
-			positiveRevalidationWindow = 30 * time.Second
-		}
-
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("managesieve", name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("ManageSieve: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
@@ -312,24 +285,11 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		serverInstance.commandTimeouts.ApplyOverrides(options.CommandTimeoutOverrides)
 	}
 
-	// Create connection limiter with trusted networks from server configuration
-	// For ManageSieve backend:
-	// - If PROXY protocol is enabled: only connections from trusted networks allowed, no per-IP limiting
-	// - If PROXY protocol is disabled: trusted networks bypass per-IP limits, others are limited per-IP
-	var limiterTrustedNets []string
-	var limiterMaxPerIP int
-
-	if options.ProxyProtocol {
-		// PROXY protocol enabled: use trusted networks, disable per-IP limiting
-		limiterTrustedNets = options.TrustedNetworks
-		limiterMaxPerIP = 0 // No per-IP limiting when PROXY protocol is enabled
-	} else {
-		// PROXY protocol disabled: use trusted networks for per-IP bypass
-		limiterTrustedNets = options.TrustedNetworks
-		limiterMaxPerIP = options.MaxConnectionsPerIP
-	}
-
-	serverInstance.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("ManageSieve", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
+	// Create the connection limiter. max_connections_per_ip counts the client a PROXY
+	// header names when there is one, else the socket peer, and trusted_networks
+	// exempt the counted address: a trusted proxy or load balancer passes the limit
+	// on to its clients and is only exempt itself when it names none.
+	serverInstance.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("ManageSieve", options.MaxConnections, options.MaxConnectionsPerIP, options.TrustedNetworks)
 
 	// Set listen backlog with reasonable default
 	serverInstance.listenBacklog = options.ListenBacklog
@@ -337,38 +297,19 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		serverInstance.listenBacklog = 1024 // Default backlog
 	}
 
-	// Set up TLS config: Support both file-based certificates and global TLS manager
-	// 1. Per-server TLS: cert files provided (for both implicit TLS and STARTTLS)
-	// 2. Global TLS: options.TLS=true, no cert files, global TLS config provided (for both implicit TLS and STARTTLS)
-	// 3. No TLS: options.TLS=false
-	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
-		// Scenario 1: Per-server TLS with explicit cert files
-		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
+	// One TLS config for implicit TLS and STARTTLS; the certificate source and
+	// tls_verify follow the rule every listener shares (serverPkg.ListenerTLS).
+	if options.TLS {
+		tlsConfig, err := serverPkg.ListenerTLS{
+			Protocol: "ManageSieve", Name: name,
+			CertFile: options.TLSCertFile, KeyFile: options.TLSKeyFile, Verify: options.TLSVerify,
+			Global: options.TLSConfig, ALPN: []string{"sieve"},
+		}.Config()
 		if err != nil {
 			serverCancel()
-			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, err
 		}
-		serverInstance.tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			ClientAuth:               tls.NoClientCert,
-			ServerName:               hostname,
-			PreferServerCipherSuites: true,
-			NextProtos:               []string{"sieve"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-
-		if !options.TLSVerify {
-			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
-			logger.Debug("ManageSieve: WARNING - Client TLS certificate verification not enforced", "name", name)
-		}
-	} else if options.TLS && options.TLSConfig != nil {
-		// Scenario 2: Global TLS manager (works for both implicit TLS and STARTTLS)
-		serverInstance.tlsConfig = options.TLSConfig
-	} else if options.TLS {
-		// TLS enabled but no cert files and no global TLS config provided
-		serverCancel()
-		return nil, fmt.Errorf("TLS enabled for ManageSieve [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", name)
+		serverInstance.tlsConfig = tlsConfig
 	}
 
 	// Start connection limiter cleanup
@@ -459,16 +400,27 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 		StrictSessionErrors: true, // Session errors are *managesieveserver.Error; mask anything else (DB error text must not reach clients)
 		NewSession: func(c *managesieveserver.Conn) (managesieveserver.Session, error) {
 			netConn := c.NetConn()
+			endInitialization := s.sessions.GuardInitialization(s.appCtx, netConn)
+			defer endInitialization()
 			proxyInfo := serverPkg.GetProxyProtocolInfo(netConn)
 			clientIP, proxyIP := serverPkg.GetConnectionIPs(netConn, proxyInfo)
 
 			// Limiter checks. DELIBERATE silent close, no banner: matches the
 			// previous accept-loop rejection (drop before any greeting), and
 			// a "NO too many connections" banner would tell a flooder exactly
-			// when the limiter engages so they can pace under it.
+			// when the limiter engages so they can pace under it. The
+			// exception is a client a PROXY peer named over its per-IP limit:
+			// that peer is a proxy, which fails the client's login on the
+			// reply but would count a silent close against the backend.
 			releaseConn, err := s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), clientIP)
 			if err != nil {
-				return nil, fmt.Errorf("%w: %w", managesieveserver.ErrSilentReject, err)
+				if !serverPkg.IsProxiedClientRefusal(err, proxyInfo) {
+					return nil, fmt.Errorf("%w: %w", managesieveserver.ErrSilentReject, err)
+				}
+				if _, hsErr := serverPkg.PerformDeferredTLSHandshake(netConn); hsErr != nil {
+					return nil, fmt.Errorf("%w: TLS handshake: %w", managesieveserver.ErrSilentReject, hsErr)
+				}
+				return nil, fmt.Errorf("%w: %w", errTooManyConnections, err)
 			}
 
 			// Implicit-TLS listeners (SoraTLSListener) defer the TLS
@@ -513,7 +465,7 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 			logFunc := func(format string, args ...any) {
 				session.InfoLog(format, args...)
 			}
-			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "MANAGESIEVE", logFunc)
+			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "managesieve", logFunc)
 
 			// Log connection with session context (protocol, remote, session id)
 			session.DebugLog("new connection")
@@ -661,9 +613,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		// callback (see buildLibServer), so rejected connections never
 		// inflate the gauges.
 
-		s.sessionsWg.Add(1)
-		go func() {
-			defer s.sessionsWg.Done()
+		started := s.sessions.Go(func() {
 			// Recover from any panic in the session goroutine. Without this, a single
 			// malformed command would propagate an unrecovered panic and crash the entire
 			// (multi-protocol) server process, dropping every connection. Mirrors POP3.
@@ -673,7 +623,13 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 				}
 			}()
 			s.msLibServer.Load().ServeConn(conn)
-		}()
+		})
+		if !started {
+			// Close is draining the sessions and no longer waits for new ones.
+			conn.Close()
+			logger.Info("ManageSieve server stopped gracefully", "name", s.name)
+			return
+		}
 	}
 }
 
@@ -688,6 +644,7 @@ func (s *ManageSieveServer) SetConnTracker(tracker *serverPkg.ConnectionTracker)
 }
 
 func (s *ManageSieveServer) Close() {
+	s.sessions.BeginDrain()
 	// Unregister rate limiter from global registry
 	serverPkg.UnregisterRateLimiter("managesieve", s.name)
 
@@ -719,16 +676,9 @@ func (s *ManageSieveServer) Close() {
 
 // waitForSessionsDrain waits for all active sessions to finish with a timeout
 func (s *ManageSieveServer) waitForSessionsDrain(timeout time.Duration) {
-	done := make(chan struct{})
-	go func() {
-		s.sessionsWg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(timeout) {
 		logger.Debug("ManageSieve: All sessions drained gracefully", "name", s.name)
-	case <-time.After(timeout):
+	} else {
 		logger.Debug("ManageSieve: Session drain timeout, forcing shutdown", "name", s.name, "timeout", timeout)
 	}
 }
@@ -836,12 +786,18 @@ func (s *ManageSieveServer) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	next := *s.settings.Load()
 
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+	// A value that does not parse keeps the running one (start-up, which has none,
+	// uses the default).
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("ManageSieve config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.commandTimeout)
+	} else if timeout != next.commandTimeout {
 		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 		reportCommandTimeout(timeout)
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("ManageSieve config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
@@ -849,7 +805,11 @@ func (s *ManageSieveServer) ReloadConfig(cfg config.ServerConfig) error {
 		next.minBytesPerMinute = bpm
 		reloaded = append(reloaded, "min_bytes_per_minute")
 	}
-	if maxSize := cfg.GetMaxScriptSizeWithDefault(); maxSize != next.maxScriptSize {
+	// A value that does not parse keeps the running limit (start-up, which has none,
+	// uses the default).
+	if maxSize, err := cfg.GetMaxScriptSize(); err != nil {
+		logger.Warn("ManageSieve config reload: invalid max_script_size, keeping the running value", "name", s.name, "error", err, "running", next.maxScriptSize)
+	} else if maxSize != next.maxScriptSize {
 		next.maxScriptSize = maxSize
 		reloaded = append(reloaded, "max_script_size")
 	}
@@ -886,6 +846,10 @@ func (s *ManageSieveServer) GetLookupCache() *lookupcache.LookupCache {
 // Authenticate authenticates a user with caching support.
 // This method wraps the database authentication with an optional lookup cache layer.
 // The cache decorates the database call - this is the proper architectural pattern.
+// An error wrapping server.ErrAuthServiceUnavailable (server.IsTemporaryAuthFailure)
+// is no verdict on the password: the database could not be asked, or the stored hash
+// cannot be checked. It is answered as a temporary failure and not counted as a failed
+// login.
 func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password string) (accountID int64, err error) {
 	// Check context before any work
 	if err := ctx.Err(); err != nil {
@@ -915,6 +879,12 @@ func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password 
 	// Fetch credentials from database (no caching - we handle that here)
 	accountID, hashedPassword, err := s.rdb.GetCredentialForAuthWithRetry(ctx, address)
 	if err != nil {
+		if serverPkg.IsTemporaryAuthFailure(err) {
+			// The database could not be asked: no verdict on the credentials, so nothing
+			// is cached and the login is answered as a temporary failure.
+			logger.Warn("authentication unavailable", "address", address, "method", "main_db", "error", err)
+			return 0, err
+		}
 		// Equalize response timing with the wrong-password path (which runs bcrypt) so an
 		// attacker can't use response time to tell whether the account exists. (security-audit M14)
 		if errors.Is(err, consts.ErrUserNotFound) {
@@ -931,9 +901,20 @@ func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password 
 
 	// Verify password
 	if err := db.VerifyPassword(hashedPassword, password); err != nil {
+		if errors.Is(err, db.ErrUnverifiableHash) {
+			// No password matches the stored hash, so this is no verdict on the submitted
+			// one: the stored data is at fault, and only an administrator can repair it.
+			// Answered like a database outage, as the proxies do: a temporary failure,
+			// not counted as a failed login (a block earned on it would outlast the
+			// repair), nothing cached. A cached login this password missed was dropped
+			// before the database was asked (LookupCache.Authenticate), so it cannot
+			// answer the next guess. VerifyPassword logged why, without the address.
+			logger.Warn("authentication unavailable", "address", address, "reason", "unverifiable_hash", "method", "main_db", "error", err)
+			return 0, fmt.Errorf("%w: %w", serverPkg.ErrAuthServiceUnavailable, err)
+		}
 		// Cache negative result for invalid password if enabled
+		// AuthInvalidPassword = 2 (from lookupcache package)
 		if s.lookupCache != nil {
-			// AuthInvalidPassword = 2 (from lookupcache package)
 			s.lookupCache.SetFailure(address, 2)
 		}
 		logger.Info("authentication failed", "address", address, "reason", "invalid_password", "cached", false, "method", "main_db")

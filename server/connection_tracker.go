@@ -5,7 +5,8 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
-	"strings"
+	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -106,6 +107,10 @@ type ConnectionTracker struct {
 	connections map[int64]*UserConnectionInfo // accountID -> info
 	mu          sync.RWMutex
 
+	// The sessions of this node's trackers of the protocol, this one's included
+	// (cluster mode only): no gossip about them reaches this node
+	node *nodeSessions
+
 	// Kick notifications
 	kickSessions   map[int64][]chan struct{} // accountID -> channels to notify
 	kickSessionsMu sync.RWMutex
@@ -191,6 +196,8 @@ func NewConnectionTracker(name, serverName, hostname string, instanceID string, 
 	}
 
 	if clusterMgr != nil {
+		ct.node = nodeSessionsOf(clusterMgr, name)
+
 		// Cluster mode: register with cluster manager for gossip
 		logger.Debug("Gossip tracker: Registering handlers with cluster manager", "name", name)
 		clusterMgr.RegisterConnectionHandler(ct.HandleClusterEvent)
@@ -277,6 +284,19 @@ func (ct *ConnectionTracker) registerLocked(accountID int64, username, protocol,
 		ct.connections[accountID] = info
 	}
 
+	// We always track per-IP, even if limiting is disabled.
+	clientIP := clientIPOf(clientAddr)
+
+	// The sessions of the protocol's other listeners on this node, which no
+	// gossip reports. The node's counts stay locked until this session is in
+	// them, so two listeners cannot both hand out the last place.
+	nodeOthers, nodeOthersFromIP := 0, 0
+	if ct.node != nil {
+		ct.node.mu.Lock()
+		defer ct.node.mu.Unlock()
+		nodeOthers, nodeOthersFromIP = ct.node.others(accountID, clientIP, info.PerIPCountByInstance[ct.instanceID])
+	}
+
 	// Check limit (if configured)
 	// In cluster mode, check cluster-wide count. In local mode, check local count.
 	var checkCount int
@@ -287,7 +307,7 @@ func (ct *ConnectionTracker) registerLocked(accountID int64, username, protocol,
 		scope = "on this server"
 	} else {
 		// Cluster mode: check cluster-wide
-		checkCount = info.GetTotalCount()
+		checkCount = info.GetTotalCount() + nodeOthers
 		scope = "across cluster"
 	}
 
@@ -299,10 +319,8 @@ func (ct *ConnectionTracker) registerLocked(accountID int64, username, protocol,
 
 	// Check per-user-per-IP limit (cluster-wide via gossip)
 	if ct.maxConnectionsPerUserPerIP > 0 && clientAddr != "" {
-		clientIP := clientIPOf(clientAddr)
-
 		// Get cluster-wide count for this IP by summing across all instances
-		ipCount := info.GetClusterWideIPCount(clientIP)
+		ipCount := info.GetClusterWideIPCount(clientIP) + nodeOthersFromIP
 		if ipCount >= ct.maxConnectionsPerUserPerIP {
 			logger.Info("Connection tracker: Maximum connections per user per IP reached", "tracker", ct.trackerType(), "protocol", protocol, "username", username, "account_id", accountID, "ip", clientIP, "current", ipCount, "max", ct.maxConnectionsPerUserPerIP, "client_addr", clientAddr)
 			return nil, fmt.Errorf("user %s has reached maximum connections from IP %s (%d/%d)",
@@ -313,14 +331,14 @@ func (ct *ConnectionTracker) registerLocked(accountID int64, username, protocol,
 	// Increment connection count for this instance
 	info.LastUpdate = time.Now()
 
-	// We always track per-IP, even if limiting is disabled.
-	clientIP := clientIPOf(clientAddr)
-
 	// Initialize nested map if needed
 	if info.PerIPCountByInstance[ct.instanceID] == nil {
 		info.PerIPCountByInstance[ct.instanceID] = make(map[string]int)
 	}
 	info.PerIPCountByInstance[ct.instanceID][clientIP]++
+	if ct.node != nil {
+		ct.node.add(accountID, clientIP, 1)
+	}
 
 	logger.Debug("Connection tracker: Registered", "name", ct.name, "type", ct.trackerType(), "user", username, "local", info.GetLocalCount(ct.instanceID), "total", info.GetTotalCount())
 
@@ -372,6 +390,11 @@ func (ct *ConnectionTracker) unregisterLocked(accountID int64, protocol, clientA
 
 	if perIPMap := info.PerIPCountByInstance[ct.instanceID]; perIPMap != nil {
 		if count := perIPMap[clientIP]; count > 0 {
+			if ct.node != nil {
+				ct.node.mu.Lock()
+				ct.node.add(accountID, clientIP, -1)
+				ct.node.mu.Unlock()
+			}
 			perIPMap[clientIP] = count - 1
 			// Clean up zero counts
 			if perIPMap[clientIP] == 0 {
@@ -421,13 +444,35 @@ func (ct *ConnectionTracker) unregisterLocked(accountID int64, protocol, clientA
 	}
 }
 
-// clientIPOf strips the port from a "host:port" client address. An address
-// without a port is already an IP.
+// clientIPOf returns the key a client address is counted under (per-user-per-IP
+// connections, auth rate limiting): the IP without its port, in canonical form.
+// An address without a port is already an IP, IPv6 included: cutting
+// "2001:db8::1" at its last colon would give every address in 2001:db8::/112
+// one key. The address arrives as text (PROXY v1 header, ID forwarding,
+// XCLIENT, a peer's gossip), so one client can be spelled several ways
+// (2001:0DB8::1, ::ffff:192.0.2.1); each must map to the one key. A host that
+// is not an IP is kept as given.
 func clientIPOf(clientAddr string) string {
-	if idx := strings.LastIndexByte(clientAddr, ':'); idx >= 0 {
-		return clientAddr[:idx]
+	host := clientAddr
+	if h, _, err := net.SplitHostPort(clientAddr); err == nil {
+		host = h
 	}
-	return clientAddr
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return ip.Unmap().String()
+	}
+	return host
+}
+
+// canonicalPerIPCounts re-keys a peer's per-IP counts by clientIPOf. A peer
+// keys by its own spelling of each client (a build before canonical keys by
+// the address as given), and the counts must add up under the keys this
+// tracker uses.
+func canonicalPerIPCounts(counts map[string]int) map[string]int {
+	out := make(map[string]int, len(counts))
+	for ip, count := range counts {
+		out[clientIPOf(ip)] += count
+	}
+	return out
 }
 
 // getClusterWideIPCount calculates the cluster-wide connection count for a specific IP
@@ -463,6 +508,53 @@ func (info *UserConnectionInfo) GetLocalCount(instanceID string) int {
 	return total
 }
 
+// nodeSessions counts, by account and client IP, the sessions the trackers of
+// one protocol hold on one node: the sum of what each reports to its peers as
+// its own. A tracker hears of every other node's sessions over gossip and
+// push/pull, but memberlist delivers neither back to the node that sent it, so
+// the sessions of the protocol's other listeners on its own node (an IMAP proxy
+// on 143 and one on 993) are counted from here. mu is taken while holding a
+// tracker's mu, never the other way round.
+type nodeSessions struct {
+	mu     sync.Mutex
+	counts map[int64]map[string]int // accountID -> client IP -> sessions
+}
+
+// nodeSessionsOf returns the counts the trackers of protocol share on the node
+// of clusterMgr.
+func nodeSessionsOf(clusterMgr *cluster.Manager, protocol string) *nodeSessions {
+	return clusterMgr.Shared("connection-tracker-sessions:"+protocol, func() any {
+		return &nodeSessions{counts: make(map[int64]map[string]int)}
+	}).(*nodeSessions)
+}
+
+// add moves the count of the account's sessions from clientIP by delta. The
+// caller holds ns.mu.
+func (ns *nodeSessions) add(accountID int64, clientIP string, delta int) {
+	perIP := ns.counts[accountID]
+	if perIP == nil {
+		perIP = make(map[string]int)
+		ns.counts[accountID] = perIP
+	}
+	perIP[clientIP] += delta
+	if perIP[clientIP] <= 0 {
+		delete(perIP, clientIP)
+	}
+	if len(perIP) == 0 {
+		delete(ns.counts, accountID)
+	}
+}
+
+// others returns how many of the account's sessions on this node, and of
+// those from clientIP, are held by trackers other than the one whose own
+// per-IP counts are own. The caller holds ns.mu.
+func (ns *nodeSessions) others(accountID int64, clientIP string, own map[string]int) (total, fromIP int) {
+	for ip, n := range ns.counts[accountID] {
+		total += n - own[ip]
+	}
+	return total, ns.counts[accountID][clientIP] - own[clientIP]
+}
+
 // GetInstanceID returns the instance ID of this tracker
 func (ct *ConnectionTracker) GetInstanceID() string {
 	if ct == nil {
@@ -471,7 +563,9 @@ func (ct *ConnectionTracker) GetInstanceID() string {
 	return ct.instanceID
 }
 
-// GetConnectionCount returns the cluster-wide connection count for a user
+// GetConnectionCount returns a user's connections on this tracker and on other
+// nodes. Those on this node's other trackers of the protocol are not included,
+// although the per-user limit counts them.
 func (ct *ConnectionTracker) GetConnectionCount(accountID int64) int {
 	if ct == nil {
 		return 0
@@ -499,6 +593,23 @@ func (ct *ConnectionTracker) GetLocalConnectionCount(accountID int64) int {
 		return info.GetLocalCount(ct.instanceID)
 	}
 	return 0
+}
+
+// GetLocalConnectionTotal returns the number of connections on this instance, over all
+// accounts; connections other instances report through gossip are not included.
+func (ct *ConnectionTracker) GetLocalConnectionTotal() int {
+	if ct == nil {
+		return 0
+	}
+
+	ct.mu.RLock()
+	defer ct.mu.RUnlock()
+
+	total := 0
+	for _, info := range ct.connections {
+		total += info.GetLocalCount(ct.instanceID)
+	}
+	return total
 }
 
 // GetAllConnections returns all tracked connections (for admin tool)
@@ -1259,7 +1370,7 @@ func (ct *ConnectionTracker) reconcileState(snapshot *ConnectionStateSnapshot) {
 		// The snapshot contains only the sending instance's per-IP counts
 		if len(remoteData.PerIPCount) > 0 {
 			// Replace entire map for this instance (authoritative)
-			info.PerIPCountByInstance[snapshot.InstanceID] = remoteData.PerIPCount
+			info.PerIPCountByInstance[snapshot.InstanceID] = canonicalPerIPCounts(remoteData.PerIPCount)
 			reconciledCount++
 		} else {
 			// Empty PerIPCount means no IP tracking for this instance - remove it

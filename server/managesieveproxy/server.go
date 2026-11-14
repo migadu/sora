@@ -63,13 +63,10 @@ type Server struct {
 	masterPassword     []byte
 	tls                bool
 	tlsUseStartTLS     bool
-	tlsCertFile        string
-	tlsKeyFile         string
-	tlsVerify          bool
-	tlsConfig          *tls.Config // Global TLS config from TLS manager or per-server config
+	tlsConfig          *tls.Config // What the listener serves with (server.ListenerTLS); nil without tls
 	connManager        *proxy.ConnectionManager
 	connTracker        *server.ConnectionTracker
-	wg                 sync.WaitGroup
+	sessions           server.SessionGroup // Session goroutines, which Stop drains
 	ctx                context.Context
 	cancel             context.CancelFunc
 	enableAffinity     bool
@@ -130,6 +127,7 @@ type ServerOptions struct {
 	RemoteTLS                bool
 	RemoteTLSUseStartTLS     bool // Use STARTTLS for backend connections
 	RemoteTLSVerify          bool
+	RemoteTLSCAFile          string // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
 	RemoteUseProxyProtocol   bool
 	ConnectTimeout           time.Duration
 	AuthIdleTimeout          time.Duration
@@ -147,7 +145,7 @@ type ServerOptions struct {
 	MaxConnections      int      // Maximum total connections per instance (0 = unlimited, local only)
 	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
 	TrustedNetworks     []string // CIDR blocks for trusted networks that bypass per-IP limits
-	ListenBacklog       int      // TCP listen backlog size (0 = system default; recommended: 4096-8192)
+	ListenBacklog       int      // TCP listen backlog size (0 = 1024; recommended: 4096-8192)
 
 	// Auth cache configuration
 	LookupCache *config.LookupCacheConfig
@@ -156,7 +154,8 @@ type ServerOptions struct {
 	MaxAuthErrors int // Maximum authentication errors before disconnection (0 = use default)
 
 	// Cluster support
-	ClusterManager *cluster.Manager // Optional: enables cluster-wide per-IP limiting
+	ClusterManager       *cluster.Manager                  // Optional: shares per-IP connection counts and auth rate limits with the cluster
+	ClusterRateLimitSync config.ClusterRateLimitSyncConfig // [cluster.rate_limit_sync]; read only with ClusterManager
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
@@ -166,7 +165,7 @@ type ServerOptions struct {
 	Debug bool // Enable debug logging
 
 	// SIEVE extensions
-	SupportedExtensions []string // Additional SIEVE extensions beyond builtins (e.g., ["vacation", "regex"])
+	SupportedExtensions []string // Supported SIEVE names replace the default advertised set; nil, empty or entirely unsupported lists use the default set.
 }
 
 // New creates a new ManageSieve proxy server.
@@ -197,14 +196,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Initialize remotelookup client if configured
-	routingLookup, err := proxy.InitializeRemoteLookup("managesieve", opts.RemoteLookup)
+	routingLookup, err := proxy.InitializeRemoteLookup("managesieve", opts.RemoteLookup, opts.RemotePort)
 	if err != nil {
-		logger.Debug("ManageSieve Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
-		if opts.RemoteLookup != nil && !opts.RemoteLookup.ShouldLookupLocalUsers() {
-			cancel()
-			return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
-		}
-		logger.Debug("ManageSieve Proxy: Continuing without remotelookup - local lookup enabled", "name", opts.Name)
+		// Also with lookup_local_users, which adds the database for the users the
+		// lookup does not know and does not make the lookup optional.
+		cancel()
+		return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
 	}
 	// Create connection manager with routing
 	connManager, err := proxy.NewConnectionManagerFromOptions(proxy.ManagerOptions{
@@ -212,6 +209,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		RemoteAddrs:        opts.RemoteAddrs,
 		RemotePort:         opts.RemotePort,
 		Settings:           proxy.BackendSettings{TLS: opts.RemoteTLS, TLSUseStartTLS: opts.RemoteTLSUseStartTLS, TLSVerify: opts.RemoteTLSVerify, UseProxyProtocol: opts.RemoteUseProxyProtocol},
+		RemoteTLSCAFile:    opts.RemoteTLSCAFile,
 		ConnectTimeout:     connectTimeout,
 		RoutingLookup:      routingLookup,
 		ServerName:         opts.Name,
@@ -250,6 +248,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("SIEVE-PROXY", opts.Name, hostname, opts.AuthRateLimit, opts.TrustedProxies)
 	server.RegisterRateLimiter("managesieve_proxy", opts.Name, authLimiter)
+	authLimiter.JoinCluster(opts.ClusterManager, opts.ClusterRateLimitSync)
 
 	// Initialize connection limiter with trusted networks
 	var limiter *server.ConnectionLimiter
@@ -302,35 +301,16 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		lookupCacheConfig = &defaultConfig
 	}
 
-	if lookupCacheConfig.Enabled {
-		positiveTTL, err := lookupCacheConfig.GetPositiveTTL()
-		if err != nil {
-			logger.Info("ManageSieve Proxy: Invalid positive TTL in auth cache config, using default (5m)", "name", opts.Name, "error", err)
-			positiveTTL = 5 * time.Minute
-		}
-		negativeTTL, err := lookupCacheConfig.GetNegativeTTL()
-		if err != nil {
-			logger.Info("ManageSieve Proxy: Invalid negative TTL in auth cache config, using default (1m)", "name", opts.Name, "error", err)
-			negativeTTL = 1 * time.Minute
-		}
-		cleanupInterval, err := lookupCacheConfig.GetCleanupInterval()
-		if err != nil {
-			logger.Info("ManageSieve Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", opts.Name, "error", err)
-			cleanupInterval = 5 * time.Minute
-		}
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize <= 0 {
-			maxSize = 10000
-		}
+	if lookupCacheConfig.Enabled && !proxy.RemoteLookupUsesClientIP(opts.RemoteLookup) {
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault(opts.Name)
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault(opts.Name)
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(opts.Name)
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// Parse positive revalidation window from config (used for password change detection)
-		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()
-		if err != nil {
-			logger.Info("ManageSieve Proxy: Invalid positive revalidation window in auth cache config, using default (30s)", "name", opts.Name, "error", err)
-			positiveRevalidationWindow = 30 * time.Second
-		}
+		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(opts.Name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("managesieve_proxy", opts.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("ManageSieve Proxy: Lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	} else {
 		logger.Info("ManageSieve Proxy: Lookup cache disabled", "name", opts.Name)
@@ -346,9 +326,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		masterPassword:             []byte(opts.MasterPassword),
 		tls:                        opts.TLS,
 		tlsUseStartTLS:             opts.TLSUseStartTLS,
-		tlsCertFile:                opts.TLSCertFile,
-		tlsKeyFile:                 opts.TLSKeyFile,
-		tlsVerify:                  opts.TLSVerify,
 		connManager:                connManager,
 		ctx:                        ctx,
 		cancel:                     cancel,
@@ -375,38 +352,19 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		debug:                  opts.Debug,
 	})
 
-	// Setup TLS config: Support both implicit TLS and STARTTLS
-	// 1. Per-server TLS: cert files provided (for both implicit TLS and STARTTLS)
-	// 2. Global TLS: opts.TLS=true, no cert files, global TLS config provided (for both implicit TLS and STARTTLS)
-	// 3. No TLS: opts.TLS=false
-	if opts.TLS && opts.TLSCertFile != "" && opts.TLSKeyFile != "" {
-		// Scenario 1: Per-server TLS with explicit cert files
-		cert, err := tls.LoadX509KeyPair(opts.TLSCertFile, opts.TLSKeyFile)
+	// One TLS config for implicit TLS and STARTTLS; the certificate source and
+	// tls_verify follow the rule every listener shares (server.ListenerTLS).
+	if opts.TLS {
+		tlsConfig, err := server.ListenerTLS{
+			Protocol: "ManageSieve proxy", Name: opts.Name,
+			CertFile: opts.TLSCertFile, KeyFile: opts.TLSKeyFile, Verify: opts.TLSVerify,
+			Global: opts.TLSConfig, ALPN: []string{"sieve"},
+		}.Config()
 		if err != nil {
 			cancel()
-			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, err
 		}
-		clientAuth := tls.NoClientCert
-		if opts.TLSVerify {
-			clientAuth = tls.RequireAndVerifyClientCert
-		}
-
-		s.tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			ClientAuth:               clientAuth,
-			ServerName:               hostname,
-			PreferServerCipherSuites: true,
-			NextProtos:               []string{"sieve"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-	} else if opts.TLS && opts.TLSConfig != nil {
-		// Scenario 2: Global TLS manager (works for both implicit TLS and STARTTLS)
-		s.tlsConfig = opts.TLSConfig
-	} else if opts.TLS {
-		// TLS enabled but no cert files and no global TLS config provided
-		cancel()
-		return nil, fmt.Errorf("TLS enabled for ManageSieve proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", opts.Name)
+		s.tlsConfig = tlsConfig
 	}
 
 	s.msLibServer.Store(s.buildLibServer())
@@ -455,12 +413,14 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 		StrictSessionErrors:             true, // Session errors are *managesieveserver.Error; mask anything else
 		NewSession: func(c *managesieveserver.Conn) (managesieveserver.Session, error) {
 			netConn := c.NetConn()
+			endInitialization := s.sessions.GuardInitialization(s.ctx, netConn)
+			defer endInitialization()
 			proxyInfo := server.GetProxyProtocolInfo(netConn)
 
 			var releaseConn func()
 			var err error
 			if s.limiter != nil {
-				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), "")
+				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), server.GetRealClientIP(netConn, proxyInfo))
 				if err != nil {
 					// DELIBERATE silent close, no banner: matches the previous
 					// accept-loop rejection (drop before any greeting), and a
@@ -559,14 +519,13 @@ func (s *Server) connConfig() server.SoraConnConfig {
 // Start starts the ManageSieve proxy server.
 func (s *Server) Start() error {
 
-	// Four TLS scenarios:
-	// 1. Per-server TLS with cert files (implicit TLS): Use static certificate with TLS listener
-	// 2. Global TLS manager (implicit TLS): Use dynamic certificate with TLS listener
-	// 3. STARTTLS mode: Use plain listener, upgrade to TLS in session after STARTTLS command
-	// 4. No TLS: Plain text listener
+	// Three TLS scenarios (New resolved the certificate source into s.tlsConfig):
+	// 1. Implicit TLS: TLS listener
+	// 2. STARTTLS mode: Use plain listener, upgrade to TLS in session after STARTTLS command
+	// 3. No TLS: Plain text listener
 
-	if s.tls && !s.tlsUseStartTLS && s.tlsCertFile != "" && s.tlsKeyFile != "" {
-		// Scenario 1: Per-server TLS with cert files (implicit TLS)
+	if s.tls && !s.tlsUseStartTLS && s.tlsConfig != nil {
+		// Scenario 1: Implicit TLS
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
 		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
@@ -574,25 +533,12 @@ func (s *Server) Start() error {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
 		}
-		logger.Debug("ManageSieve Proxy: Using listen backlog with per-server TLS (implicit)", "proxy", s.name, "backlog", s.listenBacklog)
+		logger.Debug("ManageSieve Proxy: Using listen backlog with implicit TLS", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use SoraTLSListener for implicit TLS with JA4 capture and timeout protection
 		s.listener = server.NewSoraTLSListenerFunc(s.wrapProxyProtocol(tcpListener), s.tlsConfig, s.connConfig)
 		s.listenerMu.Unlock()
-	} else if s.tls && !s.tlsUseStartTLS && s.tlsConfig != nil {
-		// Scenario 2: Global TLS manager (implicit TLS)
-		s.listenerMu.Lock()
-		// Create base TCP listener with custom backlog
-		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-		if err != nil {
-			s.listenerMu.Unlock()
-			return fmt.Errorf("failed to start TCP listener: %w", err)
-		}
-		logger.Debug("ManageSieve Proxy: Using listen backlog with global TLS manager (implicit)", "proxy", s.name, "backlog", s.listenBacklog)
-		// Use SoraTLSListener with global TLS config for implicit TLS
-		s.listener = server.NewSoraTLSListenerFunc(s.wrapProxyProtocol(tcpListener), s.tlsConfig, s.connConfig)
-		s.listenerMu.Unlock()
 	} else if s.tls && s.tlsUseStartTLS {
-		// Scenario 3: STARTTLS mode - plain listener, TLS upgrade happens in session
+		// Scenario 2: STARTTLS mode - plain listener, TLS upgrade happens in session
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
 		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
@@ -609,7 +555,7 @@ func (s *Server) Start() error {
 		s.cancel()
 		return fmt.Errorf("TLS enabled for ManageSieve proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", s.name)
 	} else {
-		// Scenario 4: No TLS - plain text listener
+		// Scenario 3: No TLS - plain text listener
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
 		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
@@ -667,16 +613,19 @@ func (s *Server) acceptConnections() error {
 		// inflate the gauges. PROXY protocol info is discovered there via
 		// the wrapper-chain walk.
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		started := s.sessions.Go(func() {
 			defer func() {
 				if r := recover(); r != nil {
 					logger.Error("ManageSieve Proxy: panic in connection handler", "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
 			s.msLibServer.Load().ServeConn(conn)
-		}()
+		})
+		if !started {
+			// Stop is draining the sessions and no longer waits for new ones.
+			conn.Close()
+			return nil
+		}
 	}
 }
 
@@ -701,6 +650,7 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 
 // Stop stops the ManageSieve proxy server.
 func (s *Server) Stop() error {
+	s.sessions.BeginDrain()
 	logger.Debug("ManageSieve Proxy: Stopping", "name", s.name)
 
 	// Unregister rate limiter from global registry
@@ -724,16 +674,9 @@ func (s *Server) Stop() error {
 		listener.Close()
 	}
 
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(30 * time.Second) {
 		logger.Debug("ManageSieve Proxy: Server stopped gracefully", "name", s.name)
-	case <-time.After(30 * time.Second):
+	} else {
 		logger.Debug("ManageSieve Proxy: Server stop timeout", "name", s.name)
 	}
 
@@ -869,15 +812,23 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 		next.maxAuthErrors = newVal
 		reloaded = append(reloaded, "max_auth_errors")
 	}
-	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != next.authIdleTimeout {
+	// A value that does not parse keeps the running one (start-up, which has none,
+	// uses the default).
+	if timeout, err := cfg.GetAuthIdleTimeout(); err != nil {
+		logger.Warn("ManageSieve proxy config reload: invalid auth_idle_timeout, keeping the running value", "name", s.name, "error", err, "running", next.authIdleTimeout)
+	} else if timeout != next.authIdleTimeout {
 		next.authIdleTimeout = timeout
 		reloaded = append(reloaded, "auth_idle_timeout")
 	}
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("ManageSieve proxy config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.commandTimeout)
+	} else if timeout != next.commandTimeout {
 		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("ManageSieve proxy config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}

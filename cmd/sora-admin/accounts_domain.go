@@ -234,6 +234,7 @@ func newPurgeStorage(cfg AdminConfig) (objectStorage, error) {
 		!cfg.S3.DisableTLS,
 		false, // debug mode
 		s3Timeout,
+		storage.WithRegion(cfg.S3.Region),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize S3 storage: %w", err)

@@ -176,7 +176,7 @@ func TestImporter_DovecotUIDPreservation(t *testing.T) {
 		}
 
 		// Calculate the hash of this message file to find it in the imported messages
-		hash, _, err := hashFile(messagePath)
+		hash, _, err := hashFile(messagePath, 0)
 		if err != nil {
 			t.Logf("Warning: Failed to hash file %s: %v", messagePath, err)
 			continue
@@ -362,7 +362,7 @@ func TestImporter_PendingUploads(t *testing.T) {
 	msgFilePath := filepath.Join(testMsgPath, entries[0].Name())
 
 	// Calculate hash for the message
-	hash, size, err := hashFile(msgFilePath)
+	hash, size, err := hashFile(msgFilePath, 0)
 	if err != nil {
 		t.Fatalf("Failed to hash message file: %v", err)
 	}

@@ -9,6 +9,11 @@ import (
 )
 
 func (s *IMAPSession) Status(ctx context.Context, mboxName string, options *imap.StatusOptions) (*imap.StatusData, error) {
+	if options.Size {
+		if err := s.requireCapability(imap.CapStatusSize, "STATUS SIZE"); err != nil {
+			return nil, err
+		}
+	}
 	ctx = s.pinnedContext(ctx)
 
 	// First phase: Read validation with read lock
@@ -97,8 +102,8 @@ func (s *IMAPSession) Status(ctx context.Context, mboxName string, options *imap
 	if s.GetCapabilities().Has(imap.CapCondStore) && options.HighestModSeq {
 		statusData.HighestModSeq = summary.HighestModSeq
 	}
-	if options.AppendLimit && s.server.appendLimit > 0 {
-		limit := uint32(s.server.appendLimit)
+	if options.AppendLimit {
+		limit := s.AppendLimit()
 		statusData.AppendLimit = &limit
 	}
 	if options.Size {

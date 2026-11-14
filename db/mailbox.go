@@ -200,7 +200,7 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, AccountID i
 	`, mailbox.AccountID, mailbox.Path).Scan(&mailbox.HasChildren)
 	if err != nil {
 		logger.Error("Database: failed to check for children of mailbox", "mailbox_id", mailboxID, "err", err)
-		return nil, consts.ErrInternalError
+		return nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 
 	return &mailbox, nil
@@ -256,6 +256,13 @@ var mailboxByNameSharedSQL = fmt.Sprintf(mailboxByNameSQL, `
 	LIMIT 1`
 
 func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name string) (*DBMailbox, error) {
+	// A name PostgreSQL cannot hold (a NUL, invalid UTF-8) names no mailbox. Querying
+	// with it fails with SQLSTATE 22021, which callers took for a database failure:
+	// a Sieve fileinto to such a name, which a script can take from a header value,
+	// was answered 451 on every attempt.
+	if !helpers.MailboxNameStorable(name) {
+		return nil, consts.ErrMailboxNotFound
+	}
 	start := time.Now()
 	var err error
 	defer func() {
@@ -299,7 +306,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 			return nil, consts.ErrMailboxNotFound
 		}
 		logger.Error("Database: failed to find mailbox", "name", name, "err", err)
-		return nil, consts.ErrInternalError
+		return nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 
 	mailbox.UIDValidity = uint32(uidValidityInt64)
@@ -314,7 +321,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 	`, accountID, mailbox.Path).Scan(&mailbox.HasChildren)
 	if err != nil {
 		logger.Error("Database: failed to check for children of mailbox", "name", name, "err", err)
-		return nil, consts.ErrInternalError
+		return nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 
 	return &mailbox, nil
@@ -342,17 +349,12 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 	// "INBOX" (RFC 3501 §5.1); other names keep their as-typed case.
 	name = helpers.CanonicalMailboxName(name)
 
-	// Validate mailbox name doesn't contain problematic characters
-	if strings.ContainsAny(name, "\t\r\n\x00") {
-		logger.Error("Database: attempted to create mailbox with invalid characters", "name", name, "account_id", AccountID)
-		return consts.ErrMailboxInvalidName
-	}
-
-	// Reject "." / ".." path segments: such names would let the maildir
-	// exporter escape its target directory (path traversal) when the hierarchy
-	// is materialised on disk.
-	if helpers.MailboxNameHasTraversal(name) {
-		logger.Error("Database: attempted to create mailbox with path traversal segment", "name", name, "account_id", AccountID)
+	// Refuse a name with a TAB, CR, LF or NUL, an empty level ("x//y", "/lead",
+	// "x/", "") or a "." / ".." level. The last would let the maildir exporter
+	// escape its target directory (path traversal) when the hierarchy is
+	// materialised on disk. Callers check first; this covers any later one.
+	if !helpers.MailboxNameValid(name) {
+		logger.Error("Database: attempted to create mailbox with an invalid name", "name", name, "account_id", AccountID)
 		return consts.ErrMailboxInvalidName
 	}
 
@@ -732,7 +734,7 @@ func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID i
 	`, mailboxID, limitArg)
 	if err != nil {
 		logger.Error("Database: failed to set path and mark messages as expunged", "mailbox_id", mailboxID, "err", err)
-		return false, consts.ErrInternalError
+		return false, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 	if expunged.RowsAffected() > 0 {
 		// More may remain; the caller commits this step and comes back.
@@ -764,7 +766,7 @@ func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID i
 	`, mailboxID, limitArg)
 	if err != nil {
 		logger.Error("Database: failed to refresh mailbox path on expunged messages", "mailbox_id", mailboxID, "err", err)
-		return false, consts.ErrInternalError
+		return false, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 	if stamped.RowsAffected() > 0 {
 		return false, nil
@@ -786,7 +788,7 @@ func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID i
 	`, mailboxID, limitArg)
 	if err != nil {
 		logger.Error("Database: failed to detach message state from mailbox", "mailbox_id", mailboxID, "err", err)
-		return false, consts.ErrInternalError
+		return false, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 	if detachedState.RowsAffected() > 0 {
 		return false, nil
@@ -802,7 +804,7 @@ func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID i
 	`, mailboxID, limitArg)
 	if err != nil {
 		logger.Error("Database: failed to detach messages from mailbox", "mailbox_id", mailboxID, "err", err)
-		return false, consts.ErrInternalError
+		return false, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 	if detached.RowsAffected() > 0 {
 		return false, nil
@@ -814,7 +816,7 @@ func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID i
 	result, err := tx.Exec(ctx, `DELETE FROM mailboxes WHERE id = $1`, mailboxID)
 	if err != nil {
 		logger.Error("Database: failed to delete mailbox", "mailbox_id", mailboxID, "err", err)
-		return false, consts.ErrInternalError
+		return false, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 
 	rowsAffected := result.RowsAffected()
@@ -1111,19 +1113,10 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailbox
 }
 
 func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64) error {
-	if newName == "" {
-		return consts.ErrMailboxInvalidName
-	}
-
-	// Validate mailbox name doesn't contain problematic characters
-	if strings.ContainsAny(newName, "\t\r\n\x00") {
-		logger.Error("Database: attempted to rename mailbox to name with invalid characters", "name", newName, "account_id", AccountID)
-		return consts.ErrMailboxInvalidName
-	}
-
-	// Reject "." / ".." path segments to prevent maildir-export path traversal.
-	if helpers.MailboxNameHasTraversal(newName) {
-		logger.Error("Database: attempted to rename mailbox to name with path traversal segment", "name", newName, "account_id", AccountID)
+	// The same names createMailbox refuses: control characters, empty levels and
+	// "." / ".." levels (maildir-export path traversal).
+	if !helpers.MailboxNameValid(newName) {
+		logger.Error("Database: attempted to rename mailbox to an invalid name", "name", newName, "account_id", AccountID)
 		return consts.ErrMailboxInvalidName
 	}
 
@@ -1173,7 +1166,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	} else if err != pgx.ErrNoRows {
 		// An actual error occurred during the check.
 		logger.Error("Database: failed to check for existing mailbox", "name", newName, "err", err)
-		return consts.ErrInternalError
+		return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 	// If err is pgx.ErrNoRows, we can proceed.
 
@@ -1188,7 +1181,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 			return consts.ErrMailboxNotFound
 		}
 		logger.Error("Database: failed to fetch and lock mailbox to rename", "mailbox_id", mailboxID, "err", err)
-		return consts.ErrInternalError
+		return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 
 	// Validate mailbox path is not empty (data corruption check)
@@ -1208,7 +1201,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	`, mailboxID).Scan(&ownerAccountID)
 	if err != nil {
 		logger.Error("Database: failed to get mailbox owner", "mailbox_id", mailboxID, "err", err)
-		return consts.ErrInternalError
+		return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 
 	err = tx.QueryRow(ctx, `
@@ -1216,7 +1209,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	`, ownerAccountID, oldPath).Scan(&hasChildren)
 	if err != nil {
 		logger.Error("Database: failed to check for children of mailbox", "mailbox_id", mailboxID, "err", err)
-		return consts.ErrInternalError
+		return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 
 	// Determine the path of the new parent.
@@ -1235,7 +1228,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 				return consts.ErrMailboxNotFound
 			}
 			logger.Error("Database: failed to fetch new parent path", "parent_id", *newParentID, "err", err)
-			return consts.ErrInternalError
+			return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 		}
 
 		// Also, a mailbox cannot be moved into one of its own children.
@@ -1273,7 +1266,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		`, ownerAccountID, oldPath, newPrefix, oldPrefix).Scan(&conflictCount)
 		if err != nil {
 			logger.Error("Database: failed to check for conflicting child names", "mailbox_id", mailboxID, "err", err)
-			return consts.ErrInternalError
+			return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 		}
 		if conflictCount > 0 {
 			logger.Error("Database: rename would create conflicting child names", "mailbox_id", mailboxID, "old_name", oldName, "new_name", newName, "conflicts", conflictCount)

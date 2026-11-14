@@ -41,7 +41,7 @@ components:
           example: "s3cr3t_p4ssw0rd"
         password_hash:
           type: string
-          description: "Pre-computed password hash (bcrypt, SSHA512, etc.). Cannot be used together with password."
+          description: "Pre-computed password hash: a bare bcrypt hash ($2a$, $2b$, $2y$), or Dovecot's {BLF-CRYPT}, {CRYPT} with a bcrypt hash, {SSHA512} or {SHA512}, with the scheme and a .b64, .base64 or .hex suffix in any case. A value sora cannot verify is refused with 400. Cannot be used together with password."
           example: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
       required:
         - email
@@ -60,11 +60,12 @@ components:
           format: password
         password_hash:
           type: string
+          description: "Pre-computed password hash: a bare bcrypt hash ($2a$, $2b$, $2y$), or Dovecot's {BLF-CRYPT}, {CRYPT} with a bcrypt hash, {SSHA512} or {SHA512}, with the scheme and a .b64, .base64 or .hex suffix in any case. A value sora cannot verify is refused with 400. Cannot be used together with password."
         is_primary:
           type: boolean
         hash_type:
           type: string
-          description: "Password hash type (bcrypt, ssha512, sha512). Defaults to bcrypt if not provided."
+          description: "Hash type for `password` (bcrypt or ssha512; unsalted sha512 is refused). Defaults to bcrypt if not provided."
       required:
         - email
         - is_primary
@@ -82,7 +83,7 @@ components:
           example: "new_s3cr3t_p4ssw0rd"
         password_hash:
           type: string
-          description: "Pre-computed password hash (bcrypt, SSHA512, etc.). Cannot be used together with password."
+          description: "Pre-computed password hash: a bare bcrypt hash ($2a$, $2b$, $2y$), or Dovecot's {BLF-CRYPT}, {CRYPT} with a bcrypt hash, {SSHA512} or {SHA512}, with the scheme and a .b64, .base64 or .hex suffix in any case. A value sora cannot verify is refused with 400. Cannot be used together with password."
           example: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
       anyOf:
         - required: ["password"]
@@ -103,7 +104,7 @@ components:
           example: "s3cr3t_p4ssw0rd_for_alias"
         password_hash:
           type: string
-          description: "Pre-computed password hash (bcrypt, SSHA512, etc.) for the new credential. Cannot be used together with password."
+          description: "Pre-computed password hash: a bare bcrypt hash ($2a$, $2b$, $2y$), or Dovecot's {BLF-CRYPT}, {CRYPT} with a bcrypt hash, {SSHA512} or {SHA512}, with the scheme and a .b64, .base64 or .hex suffix in any case. A value sora cannot verify is refused with 400. Cannot be used together with password."
           example: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
       required:
         - email
@@ -117,24 +118,14 @@ components:
         user_email:
           type: string
           format: email
-          description: "Terminate all connections for this user."
+          description: "End this account's sessions. Any address of the account."
           example: "user@example.com"
         protocol:
           type: string
-          description: "Terminate connections for this protocol (e.g., IMAP, POP3)."
+          description: "Kick only on the connection trackers of this protocol (IMAP, POP3, ManageSieve or LMTP), matched case-insensitively against the tracker key up to its first dash. Every tracker when omitted."
           example: "IMAP"
-        server_addr:
-          type: string
-          description: "Terminate connections to this backend server address."
-          example: "10.0.1.10:143"
-        client_addr:
-          type: string
-          description: "Terminate connections from this client IP address."
-          example: "192.168.1.100"
-        all:
-          type: boolean
-          description: "If true, terminates all connections. Use with caution."
-          example: false
+      required:
+        - user_email
 
     Account:
       type: object
@@ -150,8 +141,13 @@ components:
         deleted_at:
           type: string
           format: date-time
-          nullable: true
-          example: null
+          description: "When the account was soft-deleted. Present only while it is."
+          example: "2023-02-01T12:00:00Z"
+        purge_requested_at:
+          type: string
+          format: date-time
+          description: "When a purge was requested (`DELETE /accounts/{email}?purge=true`). Present only while the purge is pending; once it is done the account answers 404."
+          example: "2023-02-01T12:00:00Z"
         primary_email:
           type: string
           format: email
@@ -220,92 +216,94 @@ components:
 
     ConnectionInfo:
       type: object
+      description: "An account on one of this node's connection trackers: one entry per account and tracker, not per session."
       properties:
-        ID:
-          type: integer
-          format: int64
-        AccountID:
-          type: integer
-          format: int64
-        Protocol:
+        protocol:
           type: string
+          description: "The tracker key up to its first dash."
           example: "IMAP"
-        ClientAddr:
+        instance:
           type: string
-          example: "192.168.1.100:54321"
-        ServerAddr:
+          description: "The tracker key: <PROTOCOL>-<server name> on a backend, <PROTOCOL>-<cluster node_id>-<server name> on a proxy (the host name in place of the node_id outside cluster mode, where the LMTP proxy is the only proxy that tracks sessions)."
+          example: "IMAP-node1-imap-proxy"
+        account_id:
+          type: integer
+          format: int64
+          example: 123
+        email:
           type: string
-          example: "10.0.1.10:143"
-        InstanceID:
-          type: string
-          example: "sora-instance-1"
-        ConnectedAt:
-          type: string
-          format: date-time
-        LastActivity:
-          type: string
-          format: date-time
-        ShouldTerminate:
-          type: boolean
-        Email:
-          type: string
-          format: email
+          description: "The address of the session that created the entry: the login address, or the recipient on an LMTP proxy."
           example: "user@example.com"
+        local_count:
+          type: integer
+          description: "The account's sessions on this tracker."
+          example: 2
+        total_count:
+          type: integer
+          description: "local_count plus the account's sessions on the same protocol that other nodes' trackers report through gossip. Backends and LMTP proxies do not gossip, so there it equals local_count."
+          example: 3
+        last_update:
+          type: string
+          format: date-time
+          description: "When the tracker last updated the entry: a session opened or closed, or gossip about the account arrived (including the periodic full-state exchange, which changes no count)."
 
     ConnectionStats:
       type: object
       properties:
-        TotalConnections:
+        total_connections:
           type: integer
-          format: int64
-        ConnectionsByProtocol:
+          description: "Connections on this node, every session counted; connections other nodes report through gossip are not included. A session through a proxy is counted by the proxy and again by its backend, so a cluster total sums the proxy nodes or the backend nodes, not both."
+          example: 150
+        connections_by_protocol:
           type: object
+          description: "total_connections per connection tracker, keyed <PROTOCOL>-<server name> on a backend and <PROTOCOL>-<cluster node_id>-<server name> on a proxy (the host name in place of the node_id outside cluster mode)."
           additionalProperties:
             type: integer
-            format: int64
           example:
-            IMAP: 50
-            POP3: 10
-        ConnectionsByServer:
-          type: object
-          additionalProperties:
-            type: integer
-            format: int64
-          example:
-            "10.0.1.10:143": 30
-            "10.0.1.11:143": 30
-        Users:
-          type: array
-          items:
-            $ref: '#/components/schemas/ConnectionInfo'
+            IMAP-imap: 120
+            POP3-pop3: 20
+            ManageSieve-managesieve: 10
+        source:
+          type: string
+          example: "in-memory connection tracker"
+        note:
+          type: string
+          description: "Present, with zero counts, when this node has no connection trackers."
 
     CacheStats:
       type: object
+      description: "Statistics of this node's local body cache. The keys are Go field names."
       properties:
-        total_size:
+        TotalSizeBytes:
           type: integer
           format: int64
-          description: "Total size of items in cache (bytes)."
-        items:
+          description: "Total size of the cached objects (bytes)."
+          example: 524288000
+        ObjectCount:
           type: integer
           format: int64
-          description: "Number of items in cache."
-        hits:
+          description: "Number of cached objects."
+          example: 1523
+        Hits:
           type: integer
           format: int64
-        misses:
+          description: "Cache hits since the cache was opened."
+          example: 45678
+        Misses:
           type: integer
           format: int64
-        hit_rate:
+          description: "Cache misses since the cache was opened."
+          example: 3421
+        HitRatio:
           type: number
-          format: float
-        capacity:
+          format: double
+          description: "Hits / (Hits + Misses), from 0 to 1; 0 before the first lookup."
+          example: 0.93
+        Uptime:
           type: integer
           format: int64
-          description: "Total cache capacity (bytes)."
-        path:
-          type: string
-          description: "Path to the cache directory."
+          description: "Time since the cache was opened, in nanoseconds."
+          example: 86400000000000
 
     CacheMetricsRecord:
       type: object
@@ -425,26 +423,6 @@ components:
         last_error:
           type: string
 
-    AuthStats:
-      type: object
-      description: "Statistics about authentication attempts."
-      properties:
-        total_attempts:
-          type: integer
-        successful_attempts:
-          type: integer
-        failed_attempts:
-          type: integer
-        unique_ips:
-          type: integer
-        unique_usernames:
-          type: integer
-        unique_protocols:
-          type: integer
-        window_duration:
-          type: string
-          example: "24h0m0s"
-
     CredentialDetails:
       type: object
       description: "Detailed information about a specific credential including associated account details."
@@ -495,6 +473,26 @@ components:
             total_credentials:
               type: integer
               example: 3
+
+    AccountCredential:
+      type: object
+      description: >-
+        One credential in GET /accounts/{email}/credentials. The keys are Go field names,
+        and the timestamps are Go's default time format in the server's time zone, not RFC 3339.
+      properties:
+        Address:
+          type: string
+          format: email
+          example: "user@example.com"
+        PrimaryIdentity:
+          type: boolean
+          example: true
+        CreatedAt:
+          type: string
+          example: "2026-11-14 10:31:58.184087 +0000 UTC"
+        UpdatedAt:
+          type: string
+          example: "2026-11-14 10:31:58.184087 +0000 UTC"
 
     DeletedMessage:
       type: object
@@ -647,6 +645,9 @@ components:
         error:
           type: string
           example: "Recipient not found"
+        transient:
+          type: boolean
+          description: "Present and true when the failure is the server's (database, storage), not the request's: retry the delivery."
 
     DeliverMailResponse:
       type: object
@@ -752,6 +753,73 @@ components:
         - mailbox
         - owner
         - acls
+
+    BlockedEntry:
+      type: object
+      properties:
+        ip:
+          type: string
+          example: "192.0.2.10"
+        username:
+          type: string
+          description: "Blocked username; absent for an IP-only block."
+          example: "user@example.com"
+        blocked_until:
+          type: string
+          format: date-time
+        failure_count:
+          type: integer
+          example: 5
+        first_failure:
+          type: string
+          format: date-time
+        last_failure:
+          type: string
+          format: date-time
+        protocol:
+          type: string
+          description: >-
+            Label of the rate limiter that holds the block: IMAP, POP3, ManageSieve, IMAP-PROXY,
+            POP3-PROXY, SIEVE-PROXY or user-api. These are not the server types the protocol
+            query parameter takes.
+          example: "IMAP"
+        type:
+          type: string
+          enum: [ip_username, ip]
+          description: "ip_username blocks one username from one IP; ip blocks every login from the IP."
+
+    BackendHealthInfo:
+      type: object
+      properties:
+        address:
+          type: string
+          example: "192.0.2.10:143"
+        pool:
+          type: string
+          description: "Named pool the backend belongs to; absent for a flat remote_addrs list."
+          example: "sora1"
+        is_healthy:
+          type: boolean
+        failure_count:
+          type: integer
+        consecutive_fails:
+          type: integer
+        last_failure:
+          type: string
+          format: date-time
+          description: "0001-01-01T00:00:00Z if the backend never failed."
+        last_success:
+          type: string
+          format: date-time
+          description: "0001-01-01T00:00:00Z if no connection to the backend has succeeded yet."
+        health_check_enabled:
+          type: boolean
+        is_remote_lookup:
+          type: boolean
+          description: "True for a backend named by remote lookup rather than configured."
+        in_maintenance:
+          type: boolean
+          description: "True if this proxy honors maintenance for the backend."
 
 # Global security requirement
 security:
@@ -1022,6 +1090,11 @@ paths:
             - Missing required field `email`
             - Neither `password` nor `password_hash` provided
             - Both `password` and `password_hash` provided (only one allowed)
+            - A `credentials` entry with a `password` whose `hash_type` is not `bcrypt` or `ssha512`
+            - An invalid email address
+            - A `password` longer than 72 bytes hashed with bcrypt (the default), bcrypt's limit
+            - A `password_hash` sora cannot verify (no or an unsupported scheme, data that does not decode or has the wrong length)
+            - In a `credentials` array: no or several `is_primary` entries, or the same address twice
           content:
             application/json:
               schema:
@@ -1040,7 +1113,7 @@ paths:
                   value:
                     error: "Cannot specify both password and password_hash"
         '409':
-          description: Account with this email already exists.
+          description: An address already belongs to an account, or to a deleted account still in its grace period (restore or purge it first).
           content:
             application/json:
               schema:
@@ -1072,6 +1145,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Account'
+        '400':
+          description: The address does not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Account not found.
           content:
@@ -1136,6 +1215,9 @@ paths:
             Invalid request body. Common causes:
             - Neither `password` nor `password_hash` provided
             - Both `password` and `password_hash` provided (only one allowed)
+            - An invalid email address in the path
+            - A `password` longer than 72 bytes (bcrypt's limit)
+            - A `password_hash` sora cannot verify (no or an unsupported scheme, data that does not decode or has the wrong length)
           content:
             application/json:
               schema:
@@ -1164,8 +1246,11 @@ paths:
     delete:
       tags:
         - Account Management
-      summary: Delete an account (soft delete)
-      description: Soft deletes an account, marking it as deleted but preserving data for the grace period. The account can be restored during this time. Its open sessions are ended and its cached logins dropped, on this node's servers and their cluster peers, as `/admin/connections/kick` does.
+      summary: Delete an account (soft delete), or request its purge
+      description: |
+        Soft deletes an account, marking it as deleted but preserving data for the grace period. The account can be restored during this time. Its open sessions are ended and its cached logins dropped, on this node's servers and their cluster peers, as `/admin/connections/kick` does.
+
+        With `purge=true` it instead requests the permanent deletion of the account and everything it holds, with no grace period, and answers 202. Any node serves the request, a proxy without object storage included: the account is taken out of service (soft-deleted, which an already soft-deleted account may be), its sessions are ended and its cached logins dropped as above, and it is marked for purging. A purge worker on a node with object storage then deletes it. Until it is gone, `GET /accounts/{email}` shows `purge_requested_at`; `POST /accounts/{email}/restore` before then cancels the purge.
       parameters:
         - name: email
           in: path
@@ -1173,6 +1258,13 @@ paths:
           schema:
             type: string
             format: email
+        - name: purge
+          in: query
+          required: false
+          description: "`true` requests the purge instead of a soft delete. Any other value, or none, is a soft delete."
+          schema:
+            type: boolean
+            default: false
       responses:
         '200':
           description: Account soft-deleted successfully.
@@ -1188,8 +1280,27 @@ paths:
                   message:
                     type: string
                     example: "Account soft-deleted successfully. It will be permanently removed after the grace period."
+        '202':
+          description: With `purge=true`, the account is out of service and marked for purging.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email:
+                    type: string
+                    format: email
+                    example: "user@example.com"
+                  purge_requested_at:
+                    type: string
+                    format: date-time
+                    description: "When the purge was requested. A repeated request keeps the first time."
+                    example: "2026-10-17T09:12:44.120Z"
+                  message:
+                    type: string
+                    example: "Account is out of service and marked for purging; a purge worker on a node with object storage deletes it. GET /admin/accounts/{email} shows purge_requested_at until the account is gone."
         '400':
-          description: Account is already deleted.
+          description: The address does not parse, or (without `purge=true`) the account is already deleted.
           content:
             application/json:
               schema:
@@ -1236,7 +1347,7 @@ paths:
                     type: string
                     example: "Account restored successfully."
         '400':
-          description: Account is not deleted or cannot be restored.
+          description: Account is not deleted or cannot be restored, or the address does not parse.
           content:
             application/json:
               schema:
@@ -1274,6 +1385,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AccountExists'
+        '400':
+          description: The address does not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error.
           content:
@@ -1473,6 +1590,57 @@ paths:
                 $ref: '#/components/schemas/Error'
 
   /accounts/{email}/credentials:
+    get:
+      tags:
+        - Account Management
+      summary: List an account's credentials
+      description: Lists every credential (address) of the account the address in the path belongs to, the primary one first.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          description: "Any address (primary or alias) of the account."
+          schema:
+            type: string
+            format: email
+      responses:
+        '200':
+          description: The account's credentials.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email:
+                    type: string
+                    format: email
+                    description: "The address from the path."
+                    example: "user@example.com"
+                  credentials:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AccountCredential'
+                  count:
+                    type: integer
+                    example: 2
+        '400':
+          description: The address does not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     post:
       tags:
         - Account Management
@@ -1518,17 +1686,22 @@ paths:
               schema:
                 type: object
                 properties:
-                  email:
+                  new_email:
                     type: string
                     format: email
+                    description: "The added address, as the request's email gave it."
+                    example: "alias@example.com"
                   message:
                     type: string
+                    example: "Credential added successfully"
         '400':
           description: |
             Invalid request body. Common causes:
             - Missing required field `email`
             - Neither `password` nor `password_hash` provided  
             - Both `password` and `password_hash` provided (only one allowed)
+            - `email` does not parse as an address
+            - A `password_hash` sora cannot verify (no or an unsupported scheme, data that does not decode or has the wrong length)
           content:
             application/json:
               schema:
@@ -1546,6 +1719,18 @@ paths:
                   summary: Both password fields provided
                   value:
                     error: "Cannot specify both password and password_hash"
+        '404':
+          description: No account in service has the address in the path; a soft-deleted account does not count.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The address is already a credential of an account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error.
           content:
@@ -1616,7 +1801,7 @@ paths:
                   message:
                     type: string
         '400':
-          description: Bad request. The credential is the primary or last credential for the account.
+          description: Bad request. The credential is the primary or last credential for the account, or the address does not parse.
           content:
             application/json:
               schema:
@@ -1632,10 +1817,11 @@ paths:
     get:
       tags:
         - Connection Management
-      summary: List all active connections
+      summary: List the accounts with sessions on this node
+      description: One entry per account and connection tracker on this node; local_count is the number of sessions. Accounts this node knows only through gossip are not listed.
       responses:
         '200':
-          description: A list of active connections.
+          description: The accounts with sessions on this node's connection trackers.
           content:
             application/json:
               schema:
@@ -1647,6 +1833,13 @@ paths:
                       $ref: '#/components/schemas/ConnectionInfo'
                   count:
                     type: integer
+                    description: Number of entries in connections.
+                  source:
+                    type: string
+                    example: "in-memory connection tracker"
+                  note:
+                    type: string
+                    description: Present, with no entries, when this node has no connection trackers.
         '500':
           description: Internal server error.
           content:
@@ -1677,8 +1870,21 @@ paths:
     post:
       tags:
         - Connection Management
-      summary: Mark connections for termination
-      description: Marks connections matching the criteria to be terminated by the server.
+      summary: End a user's sessions
+      description: |
+        Kicks the account on this node's connection trackers (or on those of one protocol)
+        and broadcasts the kick to the cluster, where each node ends the account's sessions
+        and drops its cached logins.
+        The account is kicked by its database account ID and by the ID derived from each
+        of its database addresses: a proxy keys a session that remote lookup authenticated
+        by the ID derived from the address the lookup answered, also when the database holds the
+        account. An address the database does not know (a lookup service's own account) is
+        kicked by the ID derived from it. If the lookup service answered with an address
+        the database does not hold for the account, kicking another address of the account
+        does not reach that session. Kick the lookup service's answered address explicitly
+        to reach it. When the database cannot be asked, nothing is kicked and the
+        answer is 500. The response does not count sessions: they end within seconds, as
+        each node applies the kick.
       requestBody:
         required: true
         content:
@@ -1687,7 +1893,7 @@ paths:
               $ref: '#/components/schemas/KickConnectionsRequest'
       responses:
         '200':
-          description: Connections marked successfully.
+          description: The kick was issued on the listed trackers and broadcast to the cluster.
           content:
             application/json:
               schema:
@@ -1695,16 +1901,41 @@ paths:
                 properties:
                   message:
                     type: string
-                  connections_marked:
-                    type: integer
+                    example: "User kicked successfully via gossip protocol"
+                  user:
+                    type: string
+                    format: email
+                    description: "The user_email of the request."
+                    example: "user@example.com"
+                  protocols:
+                    type: array
+                    description: "Keys of the connection trackers the kick was issued on (protocol, a dash, the server's name or instance)."
+                    items:
+                      type: string
+                    example: ["IMAP-node1-imap-proxy"]
+                  note:
+                    type: string
+                    example: "Kick event broadcast to cluster. Connections will be terminated within seconds."
         '400':
-          description: Invalid request body.
+          description: The body is not JSON, or user_email is missing or blank.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No connection tracker on this node serves the requested protocol.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '500':
-          description: Internal server error.
+          description: The database cannot resolve the address (nothing was kicked), or the kick could not be issued on any tracker.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: This node has no connection trackers.
           content:
             application/json:
               schema:
@@ -1715,6 +1946,7 @@ paths:
       tags:
         - Connection Management
       summary: Get connections for a specific user
+      description: Entries from this node's connection trackers, one per tracked account ID and tracker. A remote lookup service that answers different addresses of the account can produce multiple tracked IDs and entries for it. The address is resolved to its account in the database, as /connections/kick resolves it, so the account is found under any of its addresses. An entry whose email is any address of the account (case-insensitively) is listed too, which is how a session a proxy authenticated through remote lookup (keyed by an ID derived from the address the lookup answered) is found; an address unknown to the database lists the entries whose email is that address. Unlike /connections, a tracker that knows the account only through gossip is listed too, with local_count 0.
       parameters:
         - name: email
           in: path
@@ -1724,7 +1956,7 @@ paths:
             format: email
       responses:
         '200':
-          description: A list of connections for the user.
+          description: The user's entries on this node's connection trackers.
           content:
             application/json:
               schema:
@@ -1739,6 +1971,13 @@ paths:
                       $ref: '#/components/schemas/ConnectionInfo'
                   count:
                     type: integer
+                    description: Number of entries in connections.
+                  source:
+                    type: string
+                    example: "in-memory connection tracker"
+                  note:
+                    type: string
+                    description: Present, with no entries, when this node has no connection trackers.
         '500':
           description: Internal server error.
           content:
@@ -1787,6 +2026,10 @@ paths:
                   backend:
                     type: string
                     example: "192.168.1.10:993"
+                  found:
+                    type: boolean
+                    description: "Always true in a 200 answer; a missing affinity is a 404."
+                    example: true
         '400':
           description: Missing or invalid parameters.
           content:
@@ -1801,6 +2044,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Affinity manager not enabled on this server.
           content:
             application/json:
               schema:
@@ -1900,6 +2149,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '503':
+          description: Affinity manager not enabled on this server.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     delete:
       tags:
         - Affinity Management
@@ -1951,6 +2206,146 @@ paths:
                 $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Affinity manager not enabled on this server.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /affinity/list:
+    get:
+      tags:
+        - Affinity Management
+      summary: List backend affinities
+      description: |
+        Lists the unexpired affinities this node holds, sorted by user and protocol: those it
+        assigned and those it received by gossip. Affinities have no full-state exchange, so a
+        node that was down or joined after an affinity was gossiped does not list it, and two
+        nodes can list different sets.
+      parameters:
+        - name: protocol
+          in: query
+          required: false
+          schema:
+            type: string
+          description: "Only affinities of this protocol (case-insensitive)"
+          example: "imap"
+        - name: backend
+          in: query
+          required: false
+          schema:
+            type: string
+          description: "Only affinities to this backend address"
+          example: "192.168.1.10:993"
+      responses:
+        '200':
+          description: The affinities.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  affinities:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        user:
+                          type: string
+                          format: email
+                          example: "user@example.com"
+                        protocol:
+                          type: string
+                          example: "imap"
+                        backend:
+                          type: string
+                          example: "192.168.1.10:993"
+                        assigned_at:
+                          type: string
+                          format: date-time
+                        expires_at:
+                          type: string
+                          format: date-time
+                        node_id:
+                          type: string
+                          description: "Node that assigned the affinity"
+                          example: "node-1"
+                  count:
+                    type: integer
+                    example: 1
+        '503':
+          description: Affinity manager not enabled on this server.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /affinity/stats:
+    get:
+      tags:
+        - Affinity Management
+      summary: Get affinity manager statistics
+      description: Statistics of this node's affinity manager.
+      responses:
+        '200':
+          description: Affinity statistics.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stats:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                      total_entries:
+                        type: integer
+                        example: 847
+                      ttl:
+                        type: string
+                        description: "Affinity TTL as a Go duration string."
+                        example: "1h0m0s"
+                      cleanup_interval:
+                        type: string
+                        description: "Cleanup interval as a Go duration string."
+                        example: "10m0s"
+                      by_protocol:
+                        type: object
+                        description: "Number of affinity entries per protocol."
+                        additionalProperties:
+                          type: integer
+                        example:
+                          imap: 512
+                          pop3: 234
+                          managesieve: 101
+                      memory_usage:
+                        type: object
+                        properties:
+                          affinity_entries:
+                            type: integer
+                          broadcast_queue:
+                            type: integer
+                            description: "Gossip broadcasts waiting to be sent."
+                          broadcast_queue_max:
+                            type: integer
+                          queue_utilization:
+                            type: number
+                            format: double
+                            description: "broadcast_queue as a percentage of broadcast_queue_max."
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Affinity manager not enabled on this server.
           content:
             application/json:
               schema:
@@ -2151,28 +2546,119 @@ paths:
     get:
       tags:
         - System Monitoring
-      summary: Get authentication statistics
-      parameters:
-        - name: window
-          in: query
-          schema:
-            type: string
-            default: "24h"
-          description: "Time window for statistics (e.g., '1h', '30m')."
+      summary: Describe authentication failure tracking
+      description: |
+        Returns no counters. Failed logins are tracked in memory by each server's
+        authentication rate limiter, per address, and expire on their own; this endpoint
+        answers the same fixed description of that tracking on every call. For the
+        addresses blocked right now use GET /auth/blocked. IMAP, POP3 and ManageSieve
+        attempt counts (servers and proxies) are exported as the Prometheus counter
+        sora_authentication_attempts_total; User API logins are not counted there.
+
+        Query parameters are ignored; the window parameter of older versions is still
+        accepted.
       responses:
         '200':
-          description: Authentication statistics.
+          description: A fixed description of the authentication failure tracking.
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  stats:
-                    $ref: '#/components/schemas/AuthStats'
-                  window:
+                  implementation:
                     type: string
-                  window_seconds:
+                    example: "in-memory"
+                  tracking_mode:
+                    type: string
+                    example: "per-address rate limiting with automatic expiry"
+                  available_stats:
+                    type: object
+                    properties:
+                      blocked_entries:
+                        type: string
+                        example: "GET /admin/auth/blocked"
+                  access_methods:
+                    type: object
+                    properties:
+                      blocked_list:
+                        type: string
+                        example: "GET /admin/auth/blocked - list currently blocked addresses"
+
+  /auth/blocked:
+    get:
+      tags:
+        - System Monitoring
+      summary: List currently blocked addresses
+      description: Lists the IP and IP+username blocks currently held by this node's authentication rate limiters.
+      parameters:
+        - name: protocol
+          in: query
+          schema:
+            type: string
+          description: "Only the rate limiters of this server type (imap, imap_proxy, pop3, pop3_proxy, managesieve, managesieve_proxy, userapi)."
+          example: "imap"
+      responses:
+        '200':
+          description: Blocked entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  blocked_entries:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/BlockedEntry'
+                  count:
                     type: integer
+
+  /auth-cache/stats:
+    get:
+      tags:
+        - System Monitoring
+      summary: Get authentication cache statistics
+      description: Statistics of this node's proxy authentication cache ([auth_cache]).
+      responses:
+        '200':
+          description: |
+            Auth cache statistics, or only enabled=false and a note when the auth cache is not enabled on this node.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                  note:
+                    type: string
+                    description: "Present only when enabled is false."
+                    example: "Auth cache is not enabled. Enable it in [auth_cache] config section."
+                  total_entries:
+                    type: integer
+                    format: int64
+                    example: 1523
+                  session_hits:
+                    type: integer
+                    format: int64
+                    description: "Hits since this node started."
+                    example: 45230
+                  session_misses:
+                    type: integer
+                    format: int64
+                    description: "Misses since this node started."
+                    example: 1523
+                  hit_rate_percent:
+                    type: number
+                    format: double
+                    description: "session_hits as a percentage of session hits and misses."
+                    example: 96.74
+                  lifetime_hit_count:
+                    type: integer
+                    format: int64
+                    description: "Sum of the hit counts stored with the cached entries."
+                    example: 892451
+                required:
+                  - enabled
         '500':
           description: Internal server error.
           content:
@@ -2244,6 +2730,7 @@ paths:
       tags:
         - Health Monitoring
       summary: Get health status for a component
+      description: "The current status only. One row is kept per component and server, rewritten when the status changes and every 20 checks while it holds, so there is no history: history=true is answered with 400. The sora_component_health_status metric gives the status over time."
       parameters:
         - name: hostname
           in: path
@@ -2255,46 +2742,19 @@ paths:
           required: true
           schema:
             type: string
-        - name: history
-          in: query
-          schema:
-            type: boolean
-          description: "If true, returns historical health data instead of the current status."
-        - name: since
-          in: query
-          schema:
-            type: string
-            format: date-time
-          description: "If history=true, return records after this timestamp (RFC3339). Defaults to 24 hours ago."
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            default: 100
-          description: "If history=true, limit the number of historical records returned."
       responses:
         '200':
-          description: Current or historical health status for the component.
+          description: Current health status for the component.
           content:
             application/json:
               schema:
-                oneOf:
-                  - $ref: '#/components/schemas/HealthStatus'
-                  - type: object
-                    properties:
-                      hostname:
-                        type: string
-                      component:
-                        type: string
-                      history:
-                        type: array
-                        items:
-                          $ref: '#/components/schemas/HealthStatus'
-                      count:
-                        type: integer
-                      since:
-                        type: string
-                        format: date-time
+                $ref: '#/components/schemas/HealthStatus'
+        '400':
+          description: history=true was requested; no health history is recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Component health status not found.
           content:
@@ -2307,6 +2767,37 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+
+  /proxy/backends:
+    get:
+      tags:
+        - Health Monitoring
+      summary: Get proxy backend health
+      description: Backend health as seen by each proxy server on this node. proxies is empty on a node without proxy servers.
+      responses:
+        '200':
+          description: Backend health per proxy server.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  proxies:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        proxy_name:
+                          type: string
+                          description: "Protocol and server name, e.g. IMAP-imap-proxy, POP3-..., ManageSieve-..., LMTP-..., UserAPI-..."
+                          example: "IMAP-imap-proxy"
+                        backends:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/BackendHealthInfo'
+                  timestamp:
+                    type: string
+                    format: date-time
 
   /config:
     get:
@@ -2322,20 +2813,22 @@ paths:
               schema:
                 type: object
                 properties:
-                  api_version:
-                    type: string
                   server_type:
                     type: string
+                    example: "sora-http-api"
                   features_enabled:
                     type: object
                     additionalProperties:
                       type: boolean
                   endpoints:
                     type: object
+                    description: "Every operation of this API, grouped by area: the method, the path and sometimes a note."
                     additionalProperties:
                       type: array
                       items:
                         type: string
+                    example:
+                      credential_management: ["GET /admin/credentials/{email}", "DELETE /admin/credentials/{email}"]
 
   /mailboxes/acl/grant:
     post:
@@ -2720,3 +3213,25 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '503':
+          description: |
+            Not deliverable now; retry after the Retry-After header. Sent when this backend is in
+            maintenance or this node has no upload worker (no imap, pop3 or lmtp server
+            configured), both with an Error body, and when the only recipient failed for a
+            server-side reason (DeliverMailResponse with transient set on the recipient).
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+              description: "Seconds to wait before retrying."
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/Error'
+                  - $ref: '#/components/schemas/DeliverMailResponse'
+              examples:
+                no_upload_worker:
+                  summary: Node without an upload worker
+                  value:
+                    error: "Mail delivery not available on this node: no upload worker"
