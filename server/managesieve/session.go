@@ -150,8 +150,14 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 
 		// Suffix matches MasterUsername, authenticate with MasterPassword
 		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
-			if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
-				return errAuthFailed
+			// Every refusal of the correct master password below costs what a wrong one
+			// costs (refuseLikeWrongPassword), or its response time confirms the guessed
+			// password, here to a peer the gate keeps out. No limiter: the helper records
+			// the failure, once.
+			if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, nil, netConn, proxyInfo, authKey, "master username") {
+				refusalErr, out := s.refuseLikeWrongPassword(ctx, authnParsed, nil, password, netConn, proxyInfo, authKey)
+				outcome = out
+				return refusalErr
 			}
 			// The success is NOT recorded here. A success clears this key's Tier-1 count
 			// and, via clearFailureTracking, the source IP's Tier-2 count and any active
@@ -173,17 +179,17 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 			address, err := server.NewAddress(targetUserToImpersonate)
 			if err != nil {
 				// A rejected impersonation target is answered exactly like a bad
-				// credential, and recorded exactly like one under authKey. This site
-				// is reachable ONLY with the correct master password, so a
-				// distinguishable reply — or a failure the master credential is not
-				// charged for, which diverges from a wrong password at the block
-				// threshold — confirms a guessed tenant-wide password without
-				// completing an authentication. The real reason stays in the log.
+				// credential, recorded exactly like one under authKey, and after the
+				// same password-verification work. This site is reachable ONLY with the
+				// correct master password, so a distinguishable reply, a failure the
+				// master credential is not charged for (which diverges from a wrong
+				// password at the block threshold), or a quicker one confirms a guessed
+				// tenant-wide password without completing an authentication. The real
+				// reason stays in the log.
 				s.WarnLog("impersonation target rejected (address not in the correct format)", "target_user", targetUserToImpersonate, "error", err)
-				if s.server.authLimiter != nil {
-					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-				}
-				return errAuthFailed
+				refusalErr, out := s.refuseLikeWrongPassword(ctx, authnParsed, nil, password, netConn, proxyInfo, authKey)
+				outcome = out
+				return refusalErr
 			}
 
 			accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
@@ -196,12 +202,12 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 					s.WarnLog("impersonation target lookup unavailable", "target_user", targetUserToImpersonate, "error", err)
 					return errTryLater
 				}
-				// Same reply and same accounting as a bad credential (see above).
+				// Same reply, accounting and password-verification work as a bad
+				// credential (see above).
 				s.WarnLog("impersonation target rejected (account not found)", "target_user", targetUserToImpersonate, "error", err)
-				if s.server.authLimiter != nil {
-					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-				}
-				return errAuthFailed
+				refusalErr, out := s.refuseLikeWrongPassword(ctx, authnParsed, nil, password, netConn, proxyInfo, authKey)
+				outcome = out
+				return refusalErr
 			}
 
 			// The impersonation is complete, so this attempt really did succeed.
@@ -454,7 +460,8 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 // impersonation (#846), which must not answer with the proxy-auth error when
 // authnParsed names an account whose own password is the master SASL password, and for
 // a wrong password in the master username form (#801), which must not log in even when
-// it is the account's own password.
+// it is the account's own password, and for every refusal of the correct one (gate,
+// target), which must cost what a wrong one costs.
 func (s *ManageSieveSession) refuseLikeWrongPassword(ctx context.Context, authnParsed server.Address, parseErr error, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) (error, string) {
 	if parseErr == nil {
 		if _, authErr := s.server.Authenticate(ctx, authnParsed.BaseAddress(), password); authErr != nil {
@@ -541,9 +548,13 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 	if len(s.server.masterUsername) > 0 && address.HasSuffix() && checkMasterCredential(address.Suffix(), s.server.masterUsername) {
 		// Suffix matches MasterUsername, authenticate with MasterPassword
 		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
-			if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
-				return errAuthFailed
+			// Every refusal of the correct master password below costs what a wrong one
+			// costs (refuseLikeWrongPassword, see AuthenticatePlain). No limiter: the
+			// helper records the failure, once.
+			if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, nil, netConn, proxyInfo, authKey, "master username") {
+				refusalErr, out := s.refuseLikeWrongPassword(ctx, address, nil, password, netConn, proxyInfo, authKey)
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, out).Inc()
+				return refusalErr
 			}
 			s.DebugLog("master username authentication successful", "address", address.BaseAddress(), "master_username", address.Suffix())
 			authSuccess = true
@@ -557,12 +568,12 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 					metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "unavailable").Inc()
 					return errTryLater
 				}
+				// Same reply, accounting and password-verification work as a bad
+				// credential, see AuthenticatePlain.
 				s.WarnLog("failed to get account id", "address", address.BaseAddress(), "error", err)
-				if s.server.authLimiter != nil {
-					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-				}
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
-				return errAuthFailed
+				refusalErr, out := s.refuseLikeWrongPassword(ctx, address, nil, password, netConn, proxyInfo, authKey)
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, out).Inc()
+				return refusalErr
 			}
 		} else {
 			// Answer exactly like any other bad credential (errAuthFailed): a distinct

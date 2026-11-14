@@ -405,9 +405,12 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		// Master username authentication: user@domain.com@MASTER_USERNAME
 		if len(s.server.masterUsername) > 0 && userAddress.HasSuffix() && checkMasterCredential(userAddress.Suffix(), s.server.masterUsername) {
 			if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
-				if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
-					metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
-					return 0, errAuthFailed
+				// Every refusal of the correct master password below costs what a wrong
+				// one costs (refuseLikeWrongPassword), or its response time confirms the
+				// guessed password, here to a peer the gate keeps out. No limiter: the
+				// helper records the failure, once.
+				if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, nil, netConn, proxyInfo, authKey, "master username") {
+					return 0, s.refuseLikeWrongPassword(ctx, username, password, netConn, proxyInfo, authKey)
 				}
 				s.DebugLog("master username authentication successful", "base_address", userAddress.BaseAddress(), "master_username", userAddress.Suffix())
 
@@ -417,14 +420,10 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 				}
 				targetAddr, err := server.NewAddress(targetUser)
 				if err != nil {
-					// Same reply and same accounting as a bad credential: see the
-					// master SASL path above.
+					// Same reply, accounting and password-verification work as a bad
+					// credential: see the master SASL path above.
 					s.WarnLog("impersonation target rejected (address not in the correct format)", "target_user", targetUser, "error", err)
-					if s.server.authLimiter != nil {
-						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-					}
-					metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
-					return 0, errAuthFailed
+					return 0, s.refuseLikeWrongPassword(ctx, username, password, netConn, proxyInfo, authKey)
 				}
 
 				accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, targetAddr.BaseAddress())
@@ -440,13 +439,10 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 						metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
 						return 0, errTempUnavailable
 					}
-					// Same reply and same accounting as a bad credential (see above).
+					// Same reply, accounting and password-verification work as a bad
+					// credential (see above).
 					s.WarnLog("impersonation target rejected (account not found)", "target_user", targetAddr.BaseAddress(), "error", err)
-					if s.server.authLimiter != nil {
-						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-					}
-					metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
-					return 0, errAuthFailed
+					return 0, s.refuseLikeWrongPassword(ctx, username, password, netConn, proxyInfo, authKey)
 				}
 				authSuccess = true
 				masterAuthUsed = true
@@ -569,7 +565,8 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 // for a refused master SASL impersonation (#846), which must not answer with the
 // proxy-auth error when username names an account whose own password is the master
 // SASL password, and for a wrong password in the master username form (#801), which
-// must not log in even when it is the account's own password.
+// must not log in even when it is the account's own password, and for every refusal of
+// the correct one (gate, target), which must cost what a wrong one costs.
 func (s *POP3Session) refuseLikeWrongPassword(ctx context.Context, username, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) error {
 	if authnAddr, err := server.NewAddress(username); err == nil {
 		if _, authErr := s.server.Authenticate(ctx, authnAddr.BaseAddress(), password); authErr != nil {
