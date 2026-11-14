@@ -18,56 +18,96 @@ import (
 // the MTA retries the delivery; had the redirect been relayed before the store, every
 // retry would relay it again.
 func TestLMTP_SieveRedirectRelayedOnlyAfterStore(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
+	for _, tc := range []struct {
+		name     string
+		script   string
+		multiple bool
+	}{
+		{"redirect copy", `require ["copy"]; redirect :copy "other@example.org";`, false},
+		{"multiple fileinto and redirect", `require ["fileinto"]; fileinto "Archive"; fileinto "Projects"; fileinto "Missing"; redirect "other@example.org";`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			common.SkipIfDatabaseUnavailable(t)
 
-	imapSrv, account := common.SetupIMAPServer(t)
-	defer imapSrv.Close()
-	rdb := imapSrv.ResilientDB
-	ctx := context.Background()
+			imapSrv, account := common.SetupIMAPServer(t)
+			defer imapSrv.Close()
+			rdb := imapSrv.ResilientDB
+			ctx := context.Background()
 
-	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, account.Email)
-	if err != nil {
-		t.Fatalf("account id: %v", err)
-	}
-	setActiveSieveScript(t, rdb, accountID, "require [\"copy\"];\r\nredirect :copy \"other@example.org\";\r\n")
-	rq := &captureRelayQueue{}
-	lmtpAddr := startTestLMTPServerWithRedirect(t, rdb, rq, 100, time.Hour)
+			accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, account.Email)
+			if err != nil {
+				t.Fatalf("account id: %v", err)
+			}
+			for _, mailbox := range []string{"Archive", "Projects"} {
+				if _, err := rdb.GetOrCreateMailboxByNameWithRetry(ctx, accountID, mailbox); err != nil {
+					t.Fatalf("create %s: %v", mailbox, err)
+				}
+			}
+			setActiveSieveScript(t, rdb, accountID, tc.script)
+			rq := &captureRelayQueue{}
+			lmtpAddr := startTestLMTPServerWithRedirect(t, rdb, rq, 100, time.Hour)
+			redirects := func() int {
+				var n int
+				if err := rdb.QueryRowWithRetry(ctx, "SELECT COUNT(*) FROM redirect_log WHERE account_id = $1", accountID).Scan(&n); err != nil {
+					t.Fatalf("count redirects: %v", err)
+				}
+				return n
+			}
 
-	const sender = "sender@example.com"
-	msg := strings.Join([]string{
-		"From: " + sender,
-		"To: " + account.Email,
-		"Subject: redirect after store",
-		fmt.Sprintf("Message-ID: <%d@example.com>", time.Now().UnixNano()),
-		"",
-		"body",
-	}, "\r\n")
+			const sender = "sender@example.com"
+			msg := strings.Join([]string{
+				"From: " + sender,
+				"To: " + account.Email,
+				"Subject: redirect after store",
+				fmt.Sprintf("Message-ID: <%d@example.com>", time.Now().UnixNano()),
+				"",
+				"body",
+			}, "\r\n")
 
-	// First attempt: INBOX goes away between RCPT, which creates the default
-	// mailboxes, and DATA, so storing the :copy fails.
-	resp := deliverLMTPRawBeforeData(t, lmtpAddr, sender, account.Email, msg, func() {
-		if _, err := rdb.ExecWithRetry(ctx,
-			"UPDATE mailboxes SET deleted_at = NOW() WHERE account_id = $1 AND LOWER(name) = 'inbox' AND deleted_at IS NULL",
-			accountID); err != nil {
-			t.Fatalf("remove INBOX: %v", err)
-		}
-	})
-	if !strings.HasPrefix(resp, "4") {
-		t.Fatalf("want a temporary failure when the message cannot be stored, got %s", resp)
-	}
-	if got := rq.relayedTo(); len(got) != 0 {
-		t.Errorf("a delivery whose store failed relayed the message to %v", got)
-	}
+			// First attempt: INBOX goes away between RCPT, which creates the default
+			// mailboxes, and DATA, so storing the :copy fails.
+			resp := deliverLMTPRawBeforeData(t, lmtpAddr, sender, account.Email, msg, func() {
+				if _, err := rdb.ExecWithRetry(ctx,
+					"UPDATE mailboxes SET deleted_at = NOW() WHERE account_id = $1 AND LOWER(name) = 'inbox' AND deleted_at IS NULL",
+					accountID); err != nil {
+					t.Fatalf("remove INBOX: %v", err)
+				}
+			})
+			if !strings.HasPrefix(resp, "4") {
+				t.Fatalf("want a temporary failure when the message cannot be stored, got %s", resp)
+			}
+			if got := rq.relayedTo(); len(got) != 0 {
+				t.Errorf("a delivery whose store failed relayed the message to %v", got)
+			}
+			if n := redirects(); n != 0 {
+				t.Errorf("a failed store consumed %d redirects, want 0", n)
+			}
 
-	// The MTA's retry: RCPT recreates INBOX, the message is stored and relayed once.
-	if resp := deliverLMTPRaw(t, lmtpAddr, sender, account.Email, msg); !strings.HasPrefix(resp, "250") {
-		t.Fatalf("retry: want 250, got %s", resp)
-	}
-	if got, want := rq.relayedTo(), []string{"other@example.org"}; !slices.Equal(got, want) {
-		t.Errorf("after the retry the message was relayed to %v, want %v (once)", got, want)
-	}
-	if n := countInMailbox(t, rdb, accountID, "INBOX"); n != 1 {
-		t.Errorf("INBOX holds %d copies after the retry, want 1", n)
+			if tc.multiple && countInMailbox(t, rdb, accountID, "Projects") != 1 {
+				t.Fatal("the failure must occur after a preceding copy was stored")
+			}
+
+			// The MTA's retry: RCPT recreates INBOX, the message is stored and relayed once.
+			if resp := deliverLMTPRaw(t, lmtpAddr, sender, account.Email, msg); !strings.HasPrefix(resp, "250") {
+				t.Fatalf("retry: want 250, got %s", resp)
+			}
+			if got, want := rq.relayedTo(), []string{"other@example.org"}; !slices.Equal(got, want) {
+				t.Errorf("after the retry the message was relayed to %v, want %v (once)", got, want)
+			}
+			if n := redirects(); n != 1 {
+				t.Errorf("retry consumed %d redirects, want 1", n)
+			}
+			if n := countInMailbox(t, rdb, accountID, "INBOX"); n != 1 {
+				t.Errorf("INBOX holds %d copies after the retry, want 1", n)
+			}
+			if tc.multiple {
+				for _, mailbox := range []string{"Archive", "Projects"} {
+					if n := countInMailbox(t, rdb, accountID, mailbox); n != 1 {
+						t.Errorf("%s holds %d copies after the retry, want 1", mailbox, n)
+					}
+				}
+			}
+		})
 	}
 }
 

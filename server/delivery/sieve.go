@@ -146,10 +146,9 @@ func (s *StandardSieveExecutor) evaluate(ctx context.Context, recipient Recipien
 	return result
 }
 
-// ExecuteSieve executes Sieve scripts and returns the outcome for this delivery. It
-// sends the vacation reply itself; storing
-// the message — in every mailbox of SieveOutcome — is left to the caller, which
-// must do it from SieveOutcome.MessageBytes.
+// ExecuteSieve executes Sieve scripts and sends the vacation reply. The caller
+// stores every requested copy from SieveOutcome.MessageBytes before invoking
+// SieveOutcome.Redirect. A redirect-only delivery uses INBOX only if handoff fails.
 func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient RecipientInfo, messageEntity *message.Entity, fullMessageBytes []byte) (*SieveOutcome, error) {
 	// Default to INBOX with the message unmodified
 	outcome := &SieveOutcome{
@@ -233,9 +232,8 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		s.DeliveryCtx.Logger.Log("Sieve %s treated as discard, no bounce sent: %q", action, reason)
 	}
 
-	// One copy in every fileinto target, and in INBOX when the message is kept (or a
-	// failed redirect left it stored nowhere). The copies are deferred to the caller,
-	// which saves them once the body has been staged locally (see CopyMailboxes).
+	// Compute the requested copies before relaying. With no requested copy the
+	// caller tries the redirect first, using INBOX only when handoff fails.
 	destinations := result.Destinations(false)
 	if len(destinations) == 0 {
 		if outcome.Redirect != nil {
