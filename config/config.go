@@ -531,7 +531,7 @@ type UploaderConfig struct {
 	MaxAttempts        int    `toml:"max_attempts"`
 	RetryInterval      string `toml:"retry_interval"`
 	CleanupGracePeriod string `toml:"cleanup_grace_period"` // Minimum age of a local upload file before cleanup considers it (default: "1h"). Must exceed the longest possible DB transaction to avoid the race where a file is deleted before its pending_upload record commits.
-	MaxStagingSize     string `toml:"max_staging_size"`     // Maximum size of this node's own upload staging backlog (e.g. "100gb"); other nodes' backlogs do not count. If set and exceeded, new appends are rejected.
+	MaxStagingSize     string `toml:"max_staging_size"`     // Maximum size of this node's own upload staging backlog (e.g. "100gb"); other nodes' backlogs do not count. If set and exceeded, new messages (IMAP APPEND, LMTP and Admin API deliveries) are refused.
 }
 
 // DefaultUploaderMaxAttempts is [uploader] max_attempts when the key is absent.
