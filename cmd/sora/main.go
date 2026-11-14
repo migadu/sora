@@ -451,7 +451,8 @@ func handleConfigReload(current, next *config.Config) {
 	}
 
 	// Every server and proxy takes trusted_networks at start-up: until a restart, the
-	// Networks stay fixed until restart; report malformed replacements as errors.
+	// networks they started with stay trusted and added ones are not. A malformed entry
+	// is an error: the server would not start with this file.
 	if err := next.ValidateTrustedNetworks(); err != nil {
 		logger.Error("Config reload: servers.trusted_networks is invalid and the server will not start with this config; the networks the servers started with stay trusted", "error", err)
 	} else if !slices.Equal(next.Servers.TrustedNetworks, current.Servers.TrustedNetworks) {
