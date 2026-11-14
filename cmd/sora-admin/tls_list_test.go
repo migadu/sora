@@ -10,8 +10,11 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"maps"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -226,5 +229,70 @@ func TestTLSCleanRemovesOnlyTheObjectsOwnLocalCopy(t *testing.T) {
 	}
 	if got, want := localNames(t, cacheDir), []string{"mail.example.com"}; !slices.Equal(got, want) {
 		t.Errorf("local cache after clean = %v, want %v", got, want)
+	}
+}
+
+// TestTLSListNamesConfiguredDomainsItCannotRead: tls list names an object by the
+// configured domain whose cache entry the server keeps at its key, also when it cannot
+// read a certificate from it (the download fails, or the object holds none), and finds
+// that entry's local fallback copy. The certificate's own name is not there to fall back
+// on in that case. An object no configured domain keeps there is still shown by a hash
+// prefix, since its key cannot be turned back into a name.
+func TestTLSListNamesConfiguredDomainsItCannotRead(t *testing.T) {
+	ecdsaKey := tlsmanager.S3ObjectKey("mail.example.com")
+	rsaKey := tlsmanager.S3ObjectKey("mail.example.com+rsa")
+	otherKey := tlsmanager.S3ObjectKey("old.example.com")
+
+	stub := &tlsStubS3{objects: make(map[string][]byte)}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/certs/"+ecdsaKey {
+			w.WriteHeader(http.StatusForbidden)
+			io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code><Message>stub: access denied</Message></Error>`)
+			return
+		}
+		stub.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := tlsTestConfig(srv.URL) // [tls.letsencrypt] domains = ["mail.example.com"]
+	cacheDir := t.TempDir()
+	stub.put("certs", ecdsaKey, expiredAutocertEntry(t, "mail.example.com"))
+	stub.put("certs", rsaKey, []byte("not a certificate"))
+	stub.put("certs", otherKey, []byte("not a certificate"))
+	writeLocalCertificates(t, cacheDir, "mail.example.com", "mail.example.com+rsa", "old.example.com")
+
+	out := captureStdout(t, func() error {
+		return listTLSCertificates(context.Background(), cfg, cacheDir, false, true)
+	})
+
+	type listedCert struct {
+		Domain       string `json:"domain"`
+		CertType     string `json:"certType"`
+		S3Key        string `json:"s3Key"`
+		InLocalCache bool   `json:"inLocalCache"`
+		LocalPath    string `json:"localPath"`
+	}
+	var listed []listedCert
+	if err := json.Unmarshal([]byte(out), &listed); err != nil {
+		t.Fatalf("tls list --json printed invalid JSON: %v\n%s", err, out)
+	}
+	got := make(map[string]listedCert)
+	for _, c := range listed {
+		got[c.S3Key] = c
+	}
+	want := map[string]listedCert{
+		ecdsaKey: {"mail.example.com", "Error", ecdsaKey, true, filepath.Join(cacheDir, "mail.example.com")},
+		rsaKey:   {"mail.example.com (RSA)", "Invalid", rsaKey, true, filepath.Join(cacheDir, "mail.example.com+rsa")},
+		otherKey: {strings.TrimPrefix(otherKey, "autocert/cert-")[:16] + "...", "Invalid", otherKey, false, ""},
+	}
+	if !maps.Equal(got, want) {
+		for key, w := range want {
+			if got[key] != w {
+				t.Errorf("%s listed as %+v, want %+v", key, got[key], w)
+			}
+		}
+		if len(got) != len(want) {
+			t.Errorf("listed %d objects, want %d:\n%s", len(got), len(want), out)
+		}
 	}
 }
