@@ -2498,7 +2498,8 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		AllowedHosts:                serverConfig.AllowedHosts,
 		Storage:                     deps.storage,
 		Cache:                       deps.cacheInstance,
-		Uploader:                    deps.uploadWorker, // spool reads + pending-upload state for bodies not yet in S3
+		Uploader:                    deps.uploadWorker,                // spool reads + pending-upload state for bodies not yet in S3
+		UploadMaxAttempts:           deps.config.Uploader.MaxAttempts, // pending-upload state on a node without an uploader
 		AuthRateLimit:               authRateLimit,
 		LookupCache:                 serverConfig.LookupCache,
 		TLS:                         serverConfig.TLS,
