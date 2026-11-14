@@ -420,19 +420,17 @@ addr = "10.10.10.40:7946"                       # Gossip bind address - MUST be 
 # If addr="10.10.10.40", this port will be appended to create "10.10.10.40:7946".
 port = 7946                                     # Gossip port (default: 7946)
 
-node_id = ""                                    # Unique node ID (default: hostname). Also this node's instance ID,
-                                                # applied even when cluster mode is disabled.
+node_id = ""                                    # Unique node ID (default: hostname): this node's name on the gossip bus
+                                                # (cluster membership, leader election, proxy connection tracking). Read
+                                                # only in cluster mode.
                                                 # INTERNAL ONLY — never appears on the wire. The SMTP-visible name (the
                                                 # "by" host of Received:, the Message-ID domain of vacation replies, and
                                                 # the protocol greetings) comes from the machine's hostname and is NOT
                                                 # affected by node_id. Give the host an FQDN; setting node_id to one
                                                 # does not help. A non-FQDN mail hostname is warned about at startup.
-                                                # WARNING: the instance ID is the lease key for pending_uploads — a queued
-                                                # message body lives on the local disk of the node that accepted it, so only
-                                                # that instance can upload it. Renaming a node abandons its queued rows: no
-                                                # instance claims them and the cleaner deletes them once they pass
-                                                # uploader.cleanup_grace_period. Before changing this, stop delivery to the
-                                                # node and wait until it owns no pending_uploads rows.
+                                                # node_id is NOT the upload instance ID, which owns this node's queued
+                                                # pending_uploads: that is [uploader] instance_id (see there), so renaming
+                                                # node_id strands no queued uploads.
 peers = []                                      # Seed nodes for cluster discovery (e.g., ["node-1.example.com:7946", "[2001:db8::41]:7946"])
                                                 # A port-less entry uses this node's gossip port. An entry that names only
                                                 # this node's own address is ignored with a warning, so one list can be
