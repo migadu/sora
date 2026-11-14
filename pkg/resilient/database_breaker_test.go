@@ -11,6 +11,7 @@ import (
 	imap "github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/server"
 )
 
 // TestDatabaseBreakerIsSuccessful pins down which errors the database circuit breakers
@@ -22,6 +23,7 @@ import (
 func TestDatabaseBreakerIsSuccessful(t *testing.T) {
 	imapUnavailable := &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeUnavailable, Text: "Message body temporarily unavailable, please retry"}
 	imapServerBug := &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeServerBug, Text: "boom"}
+	_, badAddress := server.NewAddress("not-an-address")
 
 	tests := []struct {
 		name      string
@@ -45,6 +47,7 @@ func TestDatabaseBreakerIsSuccessful(t *testing.T) {
 		{"invalid account request", fmt.Errorf("%w: invalid email address", db.ErrInvalidAccountRequest), true, true},
 		{"search result limit", db.ErrSearchTooManyResults, true, false},
 		{"wrapped search result limit", fmt.Errorf("search: %w", db.ErrSearchTooManyResults), true, false},
+		{"address that does not parse", fmt.Errorf("invalid email address: %w", badAddress), true, true},
 
 		// Differences between the two predicates.
 		{"ErrDBUniqueViolation", consts.ErrDBUniqueViolation, false, true},

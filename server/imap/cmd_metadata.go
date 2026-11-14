@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/migadu/go-imap"
@@ -95,6 +96,19 @@ func (s *IMAPSession) GetMetadata(ctx context.Context, mailbox string, entries [
 
 	result.Mailbox = mailboxName
 	return result, nil
+}
+
+// MetadataMaxSize implements imapserver.SessionMetadataMaxSize. go-imap reads
+// a SETMETADATA value literal up to this size and refuses a larger one, before
+// the client sends it, with "[METADATA MAXSIZE NNN]" (RFC 5464 §4.3). Without
+// a per-entry limit the account's total bounds a value; with neither, go-imap
+// keeps its default of 4096 octets.
+func (s *IMAPSession) MetadataMaxSize() uint32 {
+	limit := s.server.metadataMaxEntrySize
+	if limit <= 0 {
+		limit = s.server.metadataMaxTotalSize
+	}
+	return uint32(min(int64(max(limit, 0)), math.MaxUint32))
 }
 
 // SetMetadata implements the SETMETADATA command (RFC 5464).
@@ -197,24 +211,9 @@ func (s *IMAPSession) SetMetadata(ctx context.Context, mailbox string, entries m
 		var metaErr *db.MetadataError
 		if errors.As(err, &metaErr) {
 			s.DebugLog("metadata limit exceeded", "error", metaErr)
-
-			// Map MetadataError types to proper IMAP response codes
-			var responseCode imap.ResponseCode
-			switch metaErr.Type {
-			case db.MetadataErrMaxSize:
-				responseCode = imap.ResponseCodeTooBig
-			case db.MetadataErrTooMany, db.MetadataErrQuotaExceeded:
-				responseCode = imap.ResponseCodeTooMany
-			case db.MetadataErrNoPrivate:
-				responseCode = imap.ResponseCodeNoPrivate
-			default:
-				responseCode = imap.ResponseCodeLimit
-			}
-
-			// Return proper IMAP error with response code
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
-				Code: responseCode,
+				Code: metaErr.ResponseCode(),
 				Text: metaErr.Message,
 			}
 		}

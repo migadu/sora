@@ -53,9 +53,15 @@
 --   3. Deploy the application version that searches with strpos() for every mailbox size.
 --   4. Run this migration; the statement below is IF NOT EXISTS and no-ops.
 --
--- Index-only scans depend on the visibility map. messages already has per-table autovacuum
--- settings (scale factor 0.01); keep them, since the uploader's `uploaded = TRUE` UPDATE is
--- non-HOT and clears the bit on every new row's page until the next vacuum.
+-- Index-only scans depend on the visibility map, which only VACUUM sets. No migration sets
+-- autovacuum options on messages, and the defaults (autovacuum_vacuum_scale_factor and
+-- autovacuum_vacuum_insert_scale_factor 0.2) wait for a fifth of the table to change, while
+-- every new row's page stays not all-visible until the next vacuum (the uploader's
+-- `uploaded = TRUE` UPDATE is non-HOT and clears the bit again). On a large deployment set
+-- them per table, for example:
+--   ALTER TABLE messages SET (autovacuum_vacuum_scale_factor = 0.01,
+--                             autovacuum_vacuum_insert_scale_factor = 0.01);
+-- and check them with SELECT reloptions FROM pg_class WHERE relname = 'messages'.
 
 CREATE INDEX IF NOT EXISTS idx_messages_mailbox_headers ON messages (mailbox_id)
   INCLUDE (id, uid, content_hash, created_modseq, expunged_modseq, internal_date, sent_date, size,
