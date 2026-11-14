@@ -47,3 +47,44 @@ func TestSharedPeerEntryRejoinsLatePeer(t *testing.T) {
 	t.Fatalf("shared peer entry never joined late peer: node=%+v, latePeer=%+v",
 		node.GetMembers(), latePeer.GetMembers())
 }
+
+func TestPeerSatisfiedAndMissingAddrs(t *testing.T) {
+	ap := netip.MustParseAddrPort
+
+	// 4-node headless Service partitioned into {node1, node2} vs {node3, node4}.
+	headless := []netip.AddrPort{
+		ap("10.0.0.1:7946"),
+		ap("10.0.0.2:7946"),
+		ap("10.0.0.3:7946"),
+		ap("10.0.0.4:7946"),
+	}
+	self := ap("10.0.0.1:7946")
+	partitioned := map[netip.AddrPort]bool{
+		ap("10.0.0.1:7946"): true,
+		ap("10.0.0.2:7946"): true,
+	}
+	if peerSatisfied(headless, self, partitioned) {
+		t.Fatal("2v2 partitioned headless DNS entry was treated as satisfied")
+	}
+	wantMissing := []netip.AddrPort{ap("10.0.0.3:7946"), ap("10.0.0.4:7946")}
+	if got := missingPeerAddrs(headless, self, partitioned); !slices.Equal(got, wantMissing) {
+		t.Fatalf("missingPeerAddrs = %v, want %v", got, wantMissing)
+	}
+
+	healed := map[netip.AddrPort]bool{
+		ap("10.0.0.1:7946"): true,
+		ap("10.0.0.2:7946"): true,
+		ap("10.0.0.3:7946"): true,
+		ap("10.0.0.4:7946"): true,
+	}
+	if !peerSatisfied(headless, self, healed) {
+		t.Fatal("complete headless DNS entry was not treated as satisfied")
+	}
+
+	// Single dual-stack peer hostname advertising only its IPv4 address.
+	dualStackPeer := []netip.AddrPort{ap("10.0.0.2:7946"), ap("[2001:db8::2]:7946")}
+	if !peerSatisfied(dualStackPeer, self, partitioned) {
+		t.Fatal("dual-stack single peer joined on IPv4 should be treated as satisfied")
+	}
+}
+
