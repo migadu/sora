@@ -368,13 +368,13 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	}
 
 	if lookupCacheConfig.Enabled && !proxy.RemoteLookupUsesClientIP(options.RemoteLookup) {
-		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
-		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
-		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault(options.Name)
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault(options.Name)
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(options.Name)
 		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// Parse positive revalidation window from config (used for password change detection)
-		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault()
+		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(options.Name)
 
 		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("POP3 Proxy: Lookup cache enabled", "name", options.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)

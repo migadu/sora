@@ -305,6 +305,7 @@ Examples:
 			useSSL,
 			false,     // debug mode
 			s3Timeout, // timeout
+			storage.WithRegion(globalConfig.S3.Region),
 		)
 		if err != nil {
 			fmt.Printf("Failed to initialize S3 storage: %v\n", err)

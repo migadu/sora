@@ -426,8 +426,12 @@ func handleConfigReload(configPath string, currentCfg *config.Config, errorHandl
 	}
 
 	// Every server and proxy takes trusted_networks at start-up: until a restart, the
-	// networks they started with stay trusted and added ones are not.
-	if !slices.Equal(newCfg.Servers.TrustedNetworks, currentCfg.Servers.TrustedNetworks) {
+	// networks they started with stay trusted and added ones are not. A malformed entry
+	// is an error: the server would not start with this file.
+	if err := newCfg.ValidateTrustedNetworks(); err != nil {
+		logger.Error("Config reload: servers.trusted_networks is invalid and the server will not start with this config; the networks the servers started with stay trusted",
+			"error", err)
+	} else if !slices.Equal(newCfg.Servers.TrustedNetworks, currentCfg.Servers.TrustedNetworks) {
 		logger.Warn("Config reload: servers.trusted_networks changed but requires restart to take effect; the networks the servers started with stay trusted until then",
 			"current", currentCfg.Servers.TrustedNetworks, "new", newCfg.Servers.TrustedNetworks)
 	}
@@ -488,6 +492,12 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 		os.Exit(errorHandler.WaitForExit())
 	}
 
+	// One malformed trusted_networks entry would leave LMTP admission with no peers.
+	if err := cfg.ValidateTrustedNetworks(); err != nil {
+		errorHandler.ValidationError("trusted_networks", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+
 	if err := cfg.SharedMailboxes.Validate(); err != nil {
 		errorHandler.ValidationError("[shared_mailboxes]", err)
 		os.Exit(errorHandler.WaitForExit())
@@ -507,7 +517,8 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 	// the insecure-wide pattern. (security-audit M2)
 	if len(cfg.Servers.TrustedNetworks) == 0 {
 		logger.Info("trusted_networks is empty (fail-closed default): PROXY/XCLIENT client-IP forwarding and " +
-			"auth rate-limit exemption are disabled; LMTP still accepts delivery from default private ranges. " +
+			"auth rate-limit exemption are disabled; LMTP and lmtp_proxy still accept delivery from the default " +
+			"private ranges (loopback and RFC 1918). " +
 			"Set [servers] trusted_networks to your proxy IPs to enable forwarding/exemption.")
 	} else if config.TrustedNetworksHaveBroadPrivateRanges(cfg.Servers.TrustedNetworks) {
 		logger.Warn("trusted_networks includes whole private ranges (e.g. 10.0.0.0/8): every host on those " +
@@ -681,9 +692,11 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 	// Initialize S3 storage for mail services or a User API body reader.
 	if s3Needed {
-		// Ensure required S3 arguments are provided only if needed
-		if cfg.S3.AccessKey == "" || cfg.S3.SecretKey == "" || cfg.S3.Bucket == "" {
-			errorHandler.ValidationError("S3 credentials", fmt.Errorf("missing required S3 credentials for mail services (IMAP, LMTP, POP3) or the User API"))
+		// Ensure required S3 arguments are provided only if needed. Without access_key and
+		// secret_key the AWS default credential chain supplies them, and storage.New
+		// refuses to start when it finds none.
+		if cfg.S3.Bucket == "" {
+			errorHandler.ValidationError("S3 bucket", fmt.Errorf("missing required S3 bucket for mail services (IMAP, LMTP, POP3) or the User API"))
 			os.Exit(errorHandler.WaitForExit())
 		}
 
@@ -699,7 +712,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			os.Exit(errorHandler.WaitForExit())
 		}
 		logger.Info("Connecting to S3", "endpoint", s3EndpointToUse, "bucket", cfg.S3.Bucket, "timeout", s3Timeout)
-		deps.storage, err = storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.GetDebug(), s3Timeout)
+		deps.storage, err = storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.GetDebug(), s3Timeout, storage.WithRegion(cfg.S3.Region))
 		if err != nil {
 			errorHandler.FatalError(fmt.Sprintf("initialize S3 storage at endpoint '%s'", s3EndpointToUse), err)
 			os.Exit(errorHandler.WaitForExit())
@@ -1133,9 +1146,15 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			affinityCleanup = 1 * time.Hour
 		}
 
-		// Initialize affinity manager for cluster-wide user-to-backend affinity
-		deps.affinityManager = server.NewAffinityManager(deps.clusterManager, true, affinityTTL, affinityCleanup)
-		logger.Info("Affinity manager initialized for cluster-wide user routing", "ttl", affinityTTL, "cleanup_interval", affinityCleanup)
+		// Initialize affinity manager for cluster-wide user-to-backend affinity. With
+		// [cluster.affinity] enabled = false there is none: proxies with enable_affinity
+		// route by consistent hash, and no affinity is gossiped or persisted.
+		deps.affinityManager = server.NewAffinityManager(deps.clusterManager, cfg.Cluster.Affinity.Enabled, affinityTTL, affinityCleanup)
+		if deps.affinityManager != nil {
+			logger.Info("Affinity manager initialized for cluster-wide user routing", "ttl", affinityTTL, "cleanup_interval", affinityCleanup)
+		} else {
+			logger.Info("Cluster-wide affinity disabled by [cluster.affinity] enabled = false")
+		}
 
 		// Attach persistent affinity store if configured
 		if cfg.Cluster.Affinity.CachePath != "" && deps.affinityManager != nil {

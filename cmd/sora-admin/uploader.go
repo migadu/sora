@@ -159,6 +159,7 @@ func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, lim
 		!cfg.S3.DisableTLS,
 		false,
 		s3Timeout,
+		storage.WithRegion(cfg.S3.Region),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize S3: %w", err)
@@ -385,6 +386,7 @@ func showUploaderStatus(ctx context.Context, cfg AdminConfig, showFailed bool, f
 				!cfg.S3.DisableTLS,
 				false,
 				s3Timeout,
+				storage.WithRegion(cfg.S3.Region),
 			)
 			if err != nil {
 				logger.Warn("Failed to initialize S3 (S3 Status column will show 'N/A')", "error", err)

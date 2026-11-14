@@ -128,6 +128,11 @@ Examples:
 		}
 	}
 
+	if err := cfg.ValidateTrustedNetworks(); err != nil {
+		fmt.Printf("[FAIL] trusted_networks validation failed:\n   %v\n", err)
+		hasErrors = true
+	}
+
 	if err := cfg.Relay.Validate(); err != nil {
 		fmt.Printf("[FAIL] [relay] validation failed:\n")
 		fmt.Printf("   %v\n", err)
