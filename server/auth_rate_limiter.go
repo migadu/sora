@@ -624,9 +624,13 @@ func (a *AuthRateLimiter) updateIPUsernameFailure(ip, username string, failureTi
 		if failureTime.Before(blocked.BlockedUntil) {
 			// A failure while blocked (recorded by an attempt checked before the block
 			// was set) renews the block, as reaching the threshold again would.
+			// failureTime was taken before the lock, so it can be earlier than the
+			// failure that set the block: never shorten it.
 			blocked.FailureCount++
-			blocked.LastFailure = failureTime
-			blocked.BlockedUntil = failureTime.Add(a.config.IPUsernameBlockDuration)
+			if renewed := failureTime.Add(a.config.IPUsernameBlockDuration); renewed.After(blocked.BlockedUntil) {
+				blocked.LastFailure = failureTime
+				blocked.BlockedUntil = renewed
+			}
 			return
 		}
 		delete(a.blockedIPUsernames, ipUsernameKey) // expired: the pair starts over

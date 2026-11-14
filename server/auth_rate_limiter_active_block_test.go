@@ -365,6 +365,39 @@ func TestIPUsernameBlockTableReusesExpiredBlocks(t *testing.T) {
 	}
 }
 
+// A failure's time is taken before the Tier 1 lock, so a failure can be stored after a
+// later one. Recorded while its pair is blocked, it must not end the block earlier than
+// the later failure did.
+func TestIPUsernameBlockRenewalNeverShortensBlock(t *testing.T) {
+	limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+		Enabled:                  true,
+		MaxAttemptsPerIPUsername: 1,
+		IPUsernameBlockDuration:  time.Minute,
+		IPUsernameWindowDuration: time.Hour,
+		CleanupInterval:          time.Hour,
+	})
+	defer limiter.Stop()
+	const key = "198.51.100.1|user@example.com"
+	t0 := time.Now()
+
+	limiter.updateIPUsernameFailure("198.51.100.1", "user@example.com", t0.Add(20*time.Second))
+	limiter.updateIPUsernameFailure("198.51.100.1", "user@example.com", t0.Add(10*time.Second))
+
+	limiter.ipUsernameMu.RLock()
+	defer limiter.ipUsernameMu.RUnlock()
+	blocked, ok := limiter.blockedIPUsernames[key]
+	if !ok {
+		t.Fatal("pair not blocked")
+	}
+	if want := t0.Add(80 * time.Second); blocked.BlockedUntil.Before(want) {
+		t.Errorf("block ends %v after t0, want %v: an earlier failure shortened it",
+			blocked.BlockedUntil.Sub(t0), want.Sub(t0))
+	}
+	if blocked.FailureCount != 2 {
+		t.Errorf("failure count %d, want 2", blocked.FailureCount)
+	}
+}
+
 // Concurrent failures, successes, checks and cleanups on a few pairs at the size limit,
 // for the race detector; afterwards the Tier 1 tables are still within their bounds.
 func TestIPUsernameTablesConcurrentUse(t *testing.T) {
