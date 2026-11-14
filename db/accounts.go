@@ -906,9 +906,9 @@ func (db *Database) ListAccounts(ctx context.Context) ([]AccountSummary, error) 
 		WITH account_stats AS (
 			SELECT mb.account_id,
 				   COUNT(mb.id) as mailbox_count,
-				   -- Bulk all-accounts listing intentionally uses the mailbox_stats cache (kept accurate
-				   -- by the stats triggers + the admin recalculate-stats command) to avoid a full
-				   -- messages-table aggregate on every listing. Per-account quota lookups use live counts.
+				   -- Bulk all-accounts listing intentionally uses the mailbox_stats cache (maintained
+				   -- by the stats triggers) to avoid a full messages-table aggregate on every
+				   -- listing. Per-account quota lookups use live counts.
 				   COALESCE(SUM(ms.message_count), 0) as message_count,
 				   COALESCE(SUM(ms.total_size), 0) as storage_used
 			FROM mailboxes mb

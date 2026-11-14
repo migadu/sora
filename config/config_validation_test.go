@@ -343,3 +343,25 @@ func TestWarnStartTLSWithoutTLS(t *testing.T) {
 		})
 	}
 }
+
+// tls_verify asks the TLS handshake for a client certificate, so without tls =
+// true it does nothing on any listener; that must be said at startup (#416).
+func TestWarnTLSVerifyWithoutTLS(t *testing.T) {
+	for _, serverType := range []string{"imap", "lmtp", "managesieve", "pop3", "imap_proxy", "lmtp_proxy", "managesieve_proxy", "pop3_proxy", "user_api_proxy", "http_admin_api", "http_user_api"} {
+		t.Run(serverType, func(t *testing.T) {
+			for _, withTLS := range []bool{false, true} {
+				cfg := ServerConfig{Type: serverType, Name: "listener", TLS: withTLS, TLSVerify: true}
+				var warnings []string
+				cfg.WarnUnusedConfigOptions(func(format string, args ...any) {
+					warnings = append(warnings, fmt.Sprintf(format, args...))
+				})
+				if withTLS && len(warnings) != 0 {
+					t.Fatalf("tls_verify with tls = true warned: %v", warnings)
+				}
+				if !withTLS && (len(warnings) != 1 || !strings.Contains(warnings[0], "'tls_verify'") || !strings.Contains(warnings[0], "without 'tls = true'")) {
+					t.Fatalf("expected a warning that tls_verify needs tls, got %v", warnings)
+				}
+			}
+		})
+	}
+}
