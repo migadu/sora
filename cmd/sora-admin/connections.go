@@ -119,8 +119,8 @@ This command uses the HTTP API to broadcast a kick event via the gossip protocol
 All cluster nodes will receive the kick and terminate matching connections within ~100ms.
 
 Configuration Requirements:
-  - http_api_addr must be set in config (e.g., "http://localhost:8080")
-  - http_api_key must be set in config
+  - [admin_cli] addr must be set in config (e.g., "http://localhost:8080")
+  - [admin_cli] api_key must be set in config
 
 Examples:
   sora-admin --config config.toml connections kick --user user@example.com
@@ -334,8 +334,8 @@ Options:
   --backend string   Only affinities to this backend server address, e.g. 192.168.1.10:993
 
 Note: This command lists the affinities held by the node whose Admin API [admin_cli]
-      names. Every node applies the affinities the others gossip, so each node of a
-      converged cluster holds the same set.
+      names: those it assigned and those it received by gossip. A node that was down
+      or joined after an affinity was gossiped does not hold it, so nodes can differ.
 
 Examples:
   sora-admin affinity list --config config.toml
@@ -450,7 +450,6 @@ Examples:
   sora-admin connections list
   sora-admin connections list --user user@example.com
   sora-admin connections kick --user user@example.com
-  sora-admin connections kick --all
 
 Use 'sora-admin connections <subcommand> --help' for detailed help.
 `)
@@ -681,7 +680,7 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 func kickConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, serverAddr, clientAddr string, all, autoConfirm bool) error {
 	// Gossip-based kick requires user email (we need accountID)
 	if userEmail == "" && !all {
-		return fmt.Errorf("--user is required for gossip-based kick (or use --all)")
+		return fmt.Errorf("--user is required for gossip-based kick")
 	}
 
 	// serverAddr and clientAddr filtering not supported with gossip
