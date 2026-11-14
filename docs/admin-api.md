@@ -564,7 +564,7 @@ curl -X POST http://localhost:8080/admin/connections/kick \
 
 **Endpoint:** `GET /admin/connections/user/{email}`
 
-Get the user's entries on this node's connection trackers, matched case-insensitively against each entry's `email`: an account whose entry was created by an alias login is found only under that alias. Unlike `GET /admin/connections`, `protocol` is the whole tracker key, there is no `instance`, and a tracker that knows the account only through gossip is listed with `local_count` 0.
+Get the user's entries on this node's connection trackers, matched case-insensitively against each entry's `email`: an account whose entry was created by an alias login is found only under that alias. The entries are those of `GET /admin/connections`, but a tracker that knows the account only through gossip is listed too, with `local_count` 0.
 
 **Response:** `200 OK`
 ```json
@@ -572,7 +572,8 @@ Get the user's entries on this node's connection trackers, matched case-insensit
   "email": "user@example.com",
   "connections": [
     {
-      "protocol": "IMAP-node1-imap-proxy",
+      "protocol": "IMAP",
+      "instance": "IMAP-node1-imap-proxy",
       "account_id": 123,
       "email": "user@example.com",
       "local_count": 2,

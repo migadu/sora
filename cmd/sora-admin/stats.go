@@ -315,6 +315,7 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail string,
 			Email       string `json:"email"`
 			Connections []struct {
 				Protocol   string    `json:"protocol"`
+				Instance   string    `json:"instance"` // tracker key
 				AccountID  int64     `json:"account_id"`
 				Email      string    `json:"email"`
 				LocalCount int       `json:"local_count"`
@@ -342,28 +343,41 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail string,
 		fmt.Printf("Active Connections for User: %s\n", userEmail)
 		fmt.Printf("==========================================\n\n")
 		// Group by protocol. result.Count is the number of entries (one per tracker that
-		// knows the account), not of connections: the total is the sum of the counts.
-		protocolCounts := make(map[string]int)
-		total := 0
+		// knows the account), not of connections. An entry's total is its tracker's own
+		// sessions plus those other nodes report for the protocol, so the sessions on
+		// other nodes are in every entry of the protocol: they are counted once.
+		type protocolCount struct{ local, remote int }
+		protocolCounts := make(map[string]protocolCount)
 		for _, conn := range result.Connections {
-			protocolCounts[conn.Protocol] += conn.TotalCount
-			total += conn.TotalCount
+			c := protocolCounts[conn.Protocol]
+			c.local += conn.LocalCount
+			c.remote = max(c.remote, conn.TotalCount-conn.LocalCount)
+			protocolCounts[conn.Protocol] = c
 		}
+		protocols := make([]string, 0, len(protocolCounts))
+		total := 0
+		for protocol, c := range protocolCounts {
+			protocols = append(protocols, protocol)
+			total += c.local + c.remote
+		}
+		sort.Strings(protocols)
 		fmt.Printf("Total connections: %d\n\n", total)
 
 		fmt.Println("By Protocol:")
-		for protocol, count := range protocolCounts {
-			fmt.Printf("  %-12s %d\n", protocol+":", count)
+		for _, protocol := range protocols {
+			c := protocolCounts[protocol]
+			fmt.Printf("  %-12s %d\n", protocol+":", c.local+c.remote)
 		}
 		fmt.Println()
 
 		if showDetail {
 			fmt.Println("Details:")
-			fmt.Printf("%-12s %-12s %-12s %-20s\n", "Protocol", "Local", "Total", "Last Update")
-			fmt.Printf("%-12s %-12s %-12s %-20s\n", "--------", "-----", "-----", "-----------")
+			fmt.Printf("%-12s %-30s %-12s %-12s %-20s\n", "Protocol", "Instance", "Local", "Total", "Last Update")
+			fmt.Printf("%-12s %-30s %-12s %-12s %-20s\n", "--------", "--------", "-----", "-----", "-----------")
 			for _, conn := range result.Connections {
-				fmt.Printf("%-12s %-12d %-12d %-20s\n",
+				fmt.Printf("%-12s %-30s %-12d %-12d %-20s\n",
 					conn.Protocol,
+					trackerInstance(conn.Instance),
 					conn.LocalCount,
 					conn.TotalCount,
 					conn.LastUpdate.Format("2006-01-02 15:04:05"))
