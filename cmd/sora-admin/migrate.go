@@ -149,27 +149,11 @@ func handleMigrateVersion(ctx context.Context) {
 	// Query schema_migrations directly instead of going through golang-migrate, whose
 	// driver takes its own advisory lock. Checking the version must stay a plain read
 	// that is safe while sora instances are running.
-	dbCfg := globalConfig.Database.Write
-	if dbCfg == nil || len(dbCfg.Hosts) == 0 {
-		logger.Fatalf("Write database configuration is missing or has no hosts")
-	}
-
-	sslMode := "disable"
-	if dbCfg.TLSMode {
-		sslMode = "require"
-	}
-	connString := fmt.Sprintf("postgres://%s:%s@%s:%v/%s?sslmode=%s",
-		dbCfg.User, dbCfg.Password, dbCfg.Hosts[0], dbCfg.Port, dbCfg.Name, sslMode)
-
-	sqlDB, err := sql.Open("pgx", connString)
+	sqlDB, err := openMigrationDB(ctx)
 	if err != nil {
-		logger.Fatalf("Failed to open database connection: %v", err)
-	}
-	defer sqlDB.Close()
-
-	if err := sqlDB.PingContext(ctx); err != nil {
 		logger.Fatalf("Failed to connect to database: %v", err)
 	}
+	defer sqlDB.Close()
 
 	var version int
 	var dirty bool
@@ -222,27 +206,33 @@ func handleMigrateForce(ctx context.Context) {
 	showVersion(m)
 }
 
-func getMigrateInstance(ctx context.Context) (*migrate.Migrate, *sql.DB, error) {
+// openMigrationDB connects to the first host of [database.write] with the connection
+// URL the server builds for it (db.EndpointURL).
+func openMigrationDB(ctx context.Context) (*sql.DB, error) {
 	dbCfg := globalConfig.Database.Write
 	if dbCfg == nil || len(dbCfg.Hosts) == 0 {
-		return nil, nil, errors.New("write database configuration is missing or has no hosts")
+		return nil, errors.New("write database configuration is missing or has no hosts")
 	}
-
-	sslMode := "disable"
-	if dbCfg.TLSMode {
-		sslMode = "require"
-	}
-	connString := fmt.Sprintf("postgres://%s:%s@%s:%v/%s?sslmode=%s",
-		dbCfg.User, dbCfg.Password, dbCfg.Hosts[0], dbCfg.Port, dbCfg.Name, sslMode)
-
-	sqlDB, err := sql.Open("pgx", connString)
+	connURL, err := db.EndpointURL(dbCfg, dbCfg.Hosts[0])
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to open sql.DB for migrations: %w", err)
+		return nil, fmt.Errorf("invalid write database configuration: %w", err)
 	}
 
+	sqlDB, err := sql.Open("pgx", connURL.String())
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database connection: %w", err)
+	}
 	if err := sqlDB.PingContext(ctx); err != nil {
 		sqlDB.Close()
-		return nil, nil, fmt.Errorf("failed to ping database: %w", err)
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+	return sqlDB, nil
+}
+
+func getMigrateInstance(ctx context.Context) (*migrate.Migrate, *sql.DB, error) {
+	sqlDB, err := openMigrationDB(ctx)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// Use the exported MigrationsFS from the db package. The go:embed directive

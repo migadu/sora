@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -75,6 +74,7 @@ type Server struct {
 	// instanceID is the upload-lease key (pending_uploads.instance_id), distinct from
 	// hostname, which is the SMTP-visible name stamped into Received headers.
 	instanceID         string
+	uploadMaxAttempts  int // [uploader] max_attempts: the uploader endpoints' default failure threshold
 	ftsRetention       time.Duration
 	affinityManager    AffinityManager
 	validBackends      map[string][]string
@@ -109,6 +109,7 @@ type ServerOptions struct {
 	AllowedHosts       []string
 	Cache              *cache.Cache
 	Uploader           *uploader.UploadWorker
+	UploadMaxAttempts  int // [uploader] max_attempts, when the uploader endpoints count an upload as failed; 0 -> config default
 	Storage            *storage.S3Storage
 	PurgeWorker        *cleaner.PurgeWorker // woken when a purge is requested on this node; nil without object storage
 	RelayQueue         delivery.RelayQueue  // Global relay queue for mail delivery
@@ -275,6 +276,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		tlsVerify:          options.TLSVerify,
 		hostname:           options.Hostname,
 		instanceID:         options.InstanceID,
+		uploadMaxAttempts:  options.UploadMaxAttempts,
 		maintenanceGate:    options.MaintenanceGate,
 		ftsRetention:       options.FTSRetention,
 		affinityManager:    options.AffinityManager,
@@ -288,6 +290,9 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		maxRedirectHops:    options.MaxRedirectHops,
 		sieveExtensions:    sieveengine.EffectiveExtensions(options.SieveExtensions),
 		sharedMailboxes:    options.SharedMailboxes,
+	}
+	if s.uploadMaxAttempts <= 0 {
+		s.uploadMaxAttempts = config.DefaultUploaderMaxAttempts
 	}
 	s.settings.Store(&reloadableSettings{
 		apiKey:         options.APIKey,
@@ -1393,7 +1398,7 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Extract protocol from tracker key
-			// Key format: "PROTOCOL-hostname-servername" or "PROTOCOL-servername"
+			// Key format: "PROTOCOL-node-servername" (proxies) or "PROTOCOL-servername"
 			// Display: Just "PROTOCOL" for simplicity
 			protocol := extractProtocolFromKey(trackerKey)
 
@@ -1462,7 +1467,7 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 		// Find all trackers that match the protocol prefix
 		normalizedProtocol := strings.ToUpper(req.Protocol)
 		for trackerKey, tracker := range trackers {
-			// Extract protocol from tracker key (format: "PROTOCOL-hostname-servername")
+			// Extract protocol from tracker key (format: "PROTOCOL-node-servername")
 			trackerProtocol := extractProtocolFromKey(trackerKey)
 			if strings.ToUpper(trackerProtocol) == normalizedProtocol {
 				trackersToKick = append(trackersToKick, struct {
@@ -1878,7 +1883,7 @@ func (s *Server) handleUploaderStatus(w http.ResponseWriter, r *http.Request) {
 	showFailedStr := r.URL.Query().Get("show_failed")
 	maxAttemptsStr := r.URL.Query().Get("max_attempts")
 
-	maxAttempts := 5 // Default value
+	maxAttempts := s.uploadMaxAttempts // the uploader gives up after this many
 	if maxAttemptsStr != "" {
 		if ma, err := strconv.Atoi(maxAttemptsStr); err == nil && ma > 0 {
 			maxAttempts = ma
@@ -1928,7 +1933,7 @@ func (s *Server) handleFailedUploads(w http.ResponseWriter, r *http.Request) {
 	maxAttemptsStr := r.URL.Query().Get("max_attempts")
 	limitStr := r.URL.Query().Get("limit")
 
-	maxAttempts := 5 // Default value
+	maxAttempts := s.uploadMaxAttempts // the uploader gives up after this many
 	if maxAttemptsStr != "" {
 		if ma, err := strconv.Atoi(maxAttemptsStr); err == nil && ma > 0 {
 			maxAttempts = ma
@@ -2021,7 +2026,6 @@ func (s *Server) handleAuthBlocked(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Request) {
 	// Extract email from path: /admin/accounts/{email}/messages/deleted
 	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/messages/deleted")
-	email, _ = url.QueryUnescape(email) // Decode URL-encoded characters
 	ctx := r.Context()
 
 	// Parse query parameters
@@ -2096,7 +2100,6 @@ func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	// Extract email from path: /admin/accounts/{email}/messages/restore
 	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/messages/restore")
-	email, _ = url.QueryUnescape(email) // Decode URL-encoded characters
 	ctx := r.Context()
 
 	var req struct {

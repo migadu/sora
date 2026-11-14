@@ -2,66 +2,54 @@ package helpers
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// parseSize parses a human-readable size string (e.g., "1gb", "512mb", "1024kb", "2048b")
+// sizeRe matches a size: a decimal number, optional whitespace, and an
+// optional unit (b, kb, mb, gb or tb, in any case).
+var sizeRe = regexp.MustCompile(`(?i)^(\d+)\s*([kmgt]?b)?$`)
+
+// ParseSize parses a human-readable size string (e.g., "1gb", "512MB", "1024kb", "2048")
 // and returns the size in bytes as an int64.
-// It supports units: b (bytes), kb (kilobytes), mb (megabytes), gb (gigabytes).
-// The units are case-insensitive.
+// It supports units: b (bytes), kb, mb, gb and tb (powers of 1024). A bare
+// number is bytes. The units are case-insensitive.
 func ParseSize(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, fmt.Errorf("cannot parse empty size string")
 	}
 
-	// Regex to capture the numeric part and the unit part.
-	// It allows for optional whitespace between number and unit.
-	re := regexp.MustCompile(`^(\d+)\s*([kmgtKMGT]?b|[bB])$`)
-	matches := re.FindStringSubmatch(s)
-
-	if len(matches) != 3 {
-		// Check if it's just a number (implies bytes)
-		numOnlyRe := regexp.MustCompile(`^(\d+)$`)
-		numMatches := numOnlyRe.FindStringSubmatch(s)
-		if len(numMatches) == 2 {
-			size, err := strconv.ParseInt(numMatches[1], 10, 64)
-			if err != nil {
-				return 0, fmt.Errorf("invalid size format: failed to parse number '%s': %w", numMatches[1], err)
-			}
-			return size, nil // Treat as bytes
-		}
+	matches := sizeRe.FindStringSubmatch(s)
+	if matches == nil {
 		return 0, fmt.Errorf("invalid size format: '%s'. Expected format like '1024b', '5mb', '1gb'", s)
 	}
 
-	sizeStr := matches[1]
-	unitStr := strings.ToLower(matches[2])
-
-	size, err := strconv.ParseInt(sizeStr, 10, 64)
+	size, err := strconv.ParseInt(matches[1], 10, 64)
 	if err != nil {
-		// This should ideally not happen if the regex matched a \d+
-		return 0, fmt.Errorf("failed to parse size number '%s': %w", sizeStr, err)
+		return 0, fmt.Errorf("invalid size format: failed to parse number '%s': %w", matches[1], err)
 	}
 
-	switch unitStr {
-	case "b":
-		return size, nil
+	var shift uint
+	switch strings.ToLower(matches[2]) {
+	case "", "b":
+		shift = 0
 	case "kb":
-		return size * 1024, nil
+		shift = 10
 	case "mb":
-		return size * 1024 * 1024, nil
+		shift = 20
 	case "gb":
-		return size * 1024 * 1024 * 1024, nil
-	// Add tb (terabytes) if needed
-	// case "tb":
-	// 	return size * 1024 * 1024 * 1024 * 1024, nil
-	default:
-		// This case should also be rare due to the regex, but good for safety.
-		return 0, fmt.Errorf("invalid or unsupported size unit: '%s'", unitStr)
+		shift = 30
+	case "tb":
+		shift = 40
 	}
+	if size > math.MaxInt64>>shift {
+		return 0, fmt.Errorf("invalid size: '%s' exceeds the maximum of %d bytes", s, int64(math.MaxInt64))
+	}
+	return size << shift, nil
 }
 
 // ParseDuration extends time.ParseDuration to support "d" for days.
