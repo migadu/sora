@@ -18,6 +18,11 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 	// anything. Sora persists at most one attribute per mailbox.
 	var specialUse string
 	if options != nil && len(options.SpecialUse) > 0 {
+		// RFC 6154 §3: "Clients MUST NOT use the "USE" parameter unless the
+		// server advertises the capability", CREATE-SPECIAL-USE.
+		if err := s.requireCapability(imap.CapCreateSpecialUse, "CREATE USE"); err != nil {
+			return err
+		}
 		var useErr *imap.Error
 		specialUse, useErr = validateSpecialUse(options.SpecialUse)
 		if useErr != nil {
