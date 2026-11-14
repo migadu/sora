@@ -945,6 +945,16 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	var expiredCerts []CertificateInfo
 	now := time.Now()
 
+	// clean fails if it could not read a certificate (it cannot tell whether that one
+	// expired) or delete an expired one; it still cleans everything else.
+	var failures []error
+	failed := func() error {
+		if len(failures) == 0 {
+			return nil
+		}
+		return fmt.Errorf("%d operation(s) failed: %w", len(failures), errors.Join(failures...))
+	}
+
 	// Read from channels
 	for {
 		if objChan == nil && errChan == nil {
@@ -969,9 +979,10 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			certInfo.Domain = tryDecodeDomain(obj.Key)
 
 			// Download and parse certificate to check expiry
-			reader, err := s3store.Get(obj.Key)
+			reader, err := s3store.GetContext(ctx, obj.Key)
 			if err != nil {
 				logger.Warn("Failed to download certificate", "key", obj.Key, "error", err)
+				failures = append(failures, fmt.Errorf("read S3 object %s: %w", obj.Key, err))
 				continue
 			}
 
@@ -979,6 +990,7 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			reader.Close()
 			if err != nil {
 				logger.Warn("Failed to read certificate", "key", obj.Key, "error", err)
+				failures = append(failures, fmt.Errorf("read S3 object %s: %w", obj.Key, err))
 				continue
 			}
 
@@ -1005,7 +1017,7 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 
 	if len(expiredCerts) == 0 {
 		fmt.Println("No expired certificates found.")
-		return nil
+		return failed()
 	}
 
 	// The local fallback cache keeps a certificate under its autocert cache name.
@@ -1033,7 +1045,7 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 
 	if dryRun {
 		fmt.Println("\nDRY RUN - No changes will be made")
-		return nil
+		return failed()
 	}
 
 	// Confirm deletion
@@ -1043,17 +1055,16 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		fmt.Scanln(&response)
 		if response != "y" && response != "Y" && response != "yes" {
 			fmt.Println("Cancelled.")
-			return nil
+			return failed()
 		}
 	}
 
 	// Delete expired certificates
-	var failures []error
 	deleted, removed := 0, 0
 	for _, cert := range expiredCerts {
 		if err := s3store.DeleteContext(ctx, cert.S3Key); err != nil {
 			logger.Warn("Failed to delete certificate from S3", "key", cert.S3Key, "error", err)
-			failures = append(failures, fmt.Errorf("S3 object %s: %w", cert.S3Key, err))
+			failures = append(failures, fmt.Errorf("delete S3 object %s: %w", cert.S3Key, err))
 		} else {
 			logger.Info("Deleted expired certificate from S3", "key", cert.S3Key, "domain", cert.Domain)
 			deleted++
@@ -1065,7 +1076,7 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		if err := os.Remove(cert.LocalPath); err != nil {
 			if !os.IsNotExist(err) {
 				logger.Warn("Failed to delete certificate from local cache", "path", cert.LocalPath, "error", err)
-				failures = append(failures, fmt.Errorf("local file %s: %w", cert.LocalPath, err))
+				failures = append(failures, fmt.Errorf("delete local file %s: %w", cert.LocalPath, err))
 			}
 			continue
 		}
@@ -1074,10 +1085,7 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	}
 
 	fmt.Printf("\nDeleted %d expired certificate(s) from S3 and %d file(s) from the local cache\n", deleted, removed)
-	if len(failures) > 0 {
-		return fmt.Errorf("%d deletion(s) failed: %w", len(failures), errors.Join(failures...))
-	}
-	return nil
+	return failed()
 }
 
 func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, specificDomain string, force bool) error {
