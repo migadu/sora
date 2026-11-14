@@ -236,6 +236,17 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// not the resolved s.username, which can differ for token/master/+detail logins.
 	s.submittedUsername = username
 
+	// Parse once (regular addresses and the user@domain.com@SUFFIX form alike). The base
+	// address, without +detail or @SUFFIX, names the user in every line this attempt logs,
+	// refusals included, until a successful login replaces it with the resolved address;
+	// the raw name stands in when it does not parse.
+	parsedAddr, parseErr := server.NewAddress(username)
+	if parseErr == nil {
+		s.username = parsedAddr.BaseAddress()
+	} else {
+		s.username = username
+	}
+
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
 	// Empty passwords are never valid under any condition
 	if password == "" {
@@ -350,13 +361,10 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					s.accountID = cached.AccountID
 					s.isRemoteLookupAccount = cached.FromRemoteLookup
 
-					// Otherwise parse username to extract base address
+					// The resolved address when the entry has one; otherwise s.username
+					// keeps the base address set above.
 					if cached.ActualEmail != "" {
 						s.username = cached.ActualEmail
-					} else if parsedAddr, parseErr := server.NewAddress(username); parseErr == nil {
-						s.username = parsedAddr.BaseAddress() // Use base address (without @SUFFIX)
-					} else {
-						s.username = username // Fallback
 					}
 
 					// Rebuild the routing info from the entry whether it carries an explicit
@@ -418,9 +426,6 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// Otherwise: treat as token, send full username (including @SUFFIX) to remotelookup
 	var usernameForRemoteLookup string
 	var masterAuthValidated bool
-
-	// Parse username (handles both regular addresses and addresses with @SUFFIX)
-	parsedAddr, parseErr := server.NewAddress(username)
 
 	if parseErr == nil && parsedAddr.HasSuffix() {
 		// Has suffix - check if it matches configured master username
