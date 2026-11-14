@@ -34,6 +34,16 @@ type SieveOutcome struct {
 	// body locally: SaveMessageToMailbox writes a pending_uploads row, and the uploader
 	// treats a pending upload whose local file is missing as permanent content loss.
 	CopyMailbox string
+	// Redirect relays the message to every address the script redirected it to and
+	// reports whether all of them took it; nil when there is nothing to relay. The
+	// caller calls it once the message is stored in MailboxName, never before: a
+	// delivery whose store fails is retried, and a redirect relayed ahead of the
+	// store would go out again on every retry.
+	Redirect func() bool
+	// RedirectOnly marks a redirect that keeps no copy (Redirect is set). There is no
+	// store to wait for then: the caller calls Redirect first and stores the message
+	// in MailboxName (INBOX) only when a redirect failed.
+	RedirectOnly bool
 }
 
 // SieveExecutor interface defines the contract for Sieve script execution.
@@ -102,9 +112,9 @@ func (s *StandardSieveExecutor) sieveExtensions() []string {
 }
 
 // ExecuteSieve executes Sieve scripts and returns the outcome for this delivery. It
-// performs the script's non-storage side effects (redirect, vacation) itself; storing
-// the message — including any `fileinto :copy` target — is left to the caller, which
-// must do it from SieveOutcome.MessageBytes.
+// sends the vacation reply itself; storing the message — including any `fileinto
+// :copy` target — and relaying its redirects (SieveOutcome.Redirect) are left to the
+// caller, which must do both from SieveOutcome.MessageBytes.
 func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient RecipientInfo, messageEntity *message.Entity, fullMessageBytes []byte) (*SieveOutcome, error) {
 	// Default to INBOX with the message unmodified
 	outcome := &SieveOutcome{
@@ -217,47 +227,51 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		}
 
 	case sieveengine.ActionRedirect:
-		// Handle redirect via external relay
-		if recipient.FromAddress != nil {
-			// Stamp the outgoing copy with an incremented hop count (loop backstop).
-			relayBytes := helpers.PrependHeaderLine(outcome.MessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(helpers.RedirectHopCount(helpers.HeaderGetter(outcome.MessageEntity.Header.Map()))+1))
-			// Attribute this redirect to the script owner, replacing any earlier or
-			// sender-supplied attribution. Aliases still use the account's primary address.
-			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, recipient.Address.FullAddress())
-			from := recipient.FromAddress.FullAddress()
-			relayed := s.RelayQueue != nil || s.RelayHandler != nil
-			for _, redirectTo := range result.RedirectTo {
-				// Try immediate delivery first if queue is not configured
-				if s.RelayQueue == nil && s.RelayHandler != nil {
-					if err := s.RelayHandler.SendToExternalRelay(from, redirectTo, relayBytes); err != nil {
-						relayed = false
-					}
-				} else if s.RelayQueue != nil {
-					// Queue for background delivery with retry
-					if err := s.RelayQueue.Enqueue(from, redirectTo, "redirect", relayBytes); err != nil {
-						// Failed to enqueue: keep the message in INBOX rather than fail the
-						// delivery, but say so where an operator will see it — the user's
-						// redirect silently did not happen.
-						s.DeliveryCtx.Logger.Log("Failed to enqueue redirect message: %v", err)
-						logger.Warn("Sieve redirect could not be queued; message kept in INBOX instead",
-							"account_id", recipient.AccountID, "redirect_to", redirectTo, "error", err)
-						relayed = false
-					}
-				}
-			}
-			if relayed && !result.Copy {
-				// Every address relayed or queued, and no copy was asked for
-				outcome.MailboxName = ""
-				outcome.Discarded = true
-				return outcome, nil
-			}
-		}
-		// Fallback or copy: deliver to INBOX
+		// INBOX holds the :copy, or the message when it cannot be relayed or a redirect fails.
 		outcome.MailboxName = consts.MailboxInbox
+		if recipient.FromAddress != nil && (s.RelayQueue != nil || s.RelayHandler != nil) {
+			redirectTo, messageBytes, messageEntity := result.RedirectTo, outcome.MessageBytes, outcome.MessageEntity
+			outcome.Redirect = func() bool {
+				return s.relayRedirects(recipient, redirectTo, messageBytes, messageEntity)
+			}
+			outcome.RedirectOnly = !result.Copy
+		}
 
 	default:
 		outcome.MailboxName = consts.MailboxInbox
 	}
 
 	return outcome, nil
+}
+
+// relayRedirects hands the message to the relay for every address in redirectTo
+// and reports whether all of them took it: to the relay queue when there is one,
+// else straight to the relay handler.
+func (s *StandardSieveExecutor) relayRedirects(recipient RecipientInfo, redirectTo []string, messageBytes []byte, messageEntity *message.Entity) bool {
+	// Stamp the outgoing copy with an incremented hop count (loop backstop).
+	relayBytes := helpers.PrependHeaderLine(messageBytes, helpers.RedirectLoopHeader, strconv.Itoa(helpers.RedirectHopCount(helpers.HeaderGetter(messageEntity.Header.Map()))+1))
+	// Attribute this redirect to the script owner, replacing any earlier or
+	// sender-supplied attribution. Aliases still use the account's primary address.
+	relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, recipient.Address.FullAddress())
+	from := recipient.FromAddress.FullAddress()
+	relayed := true
+	for _, to := range redirectTo {
+		if s.RelayQueue == nil {
+			if err := s.RelayHandler.SendToExternalRelay(from, to, relayBytes); err != nil {
+				relayed = false
+			}
+			continue
+		}
+		// Queue for background delivery with retry
+		if err := s.RelayQueue.Enqueue(from, to, "redirect", relayBytes); err != nil {
+			// Failed to enqueue: keep the message in INBOX rather than fail the
+			// delivery, but say so where an operator will see it — the user's
+			// redirect silently did not happen.
+			s.DeliveryCtx.Logger.Log("Failed to enqueue redirect message: %v", err)
+			logger.Warn("Sieve redirect could not be queued; message kept in INBOX instead",
+				"account_id", recipient.AccountID, "redirect_to", to, "error", err)
+			relayed = false
+		}
+	}
+	return relayed
 }

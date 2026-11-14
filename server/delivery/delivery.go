@@ -156,8 +156,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// (the S3 object key, cache key and upload-dedup key) must describe the bytes that are
 	// actually stored.
 	var mailboxName string
-	var copyMailbox string     // Sieve `fileinto :copy` target, saved once the body is staged
-	var sieveFlags []imap.Flag // flags set by the Sieve script (imap4flags, RFC 5232)
+	var copyMailbox string          // Sieve `fileinto :copy` target, saved once the body is staged
+	var sieveFlags []imap.Flag      // flags set by the Sieve script (imap4flags, RFC 5232)
+	var relayAfterStore func() bool // Sieve `redirect :copy`, relayed once the copy is stored
 
 	if recipient.TargetMailbox != "" {
 		// Use explicit target mailbox (bypasses Sieve - for migrations)
@@ -179,6 +180,17 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			result.Discarded = true
 			result.Success = true
 			return result, nil
+		}
+		if outcome.RedirectOnly {
+			// No copy is kept, so there is no store to wait for. When a redirect
+			// fails the message is kept in INBOX (outcome.MailboxName) below.
+			if outcome.Redirect() {
+				result.Discarded = true
+				result.Success = true
+				return result, nil
+			}
+		} else {
+			relayAfterStore = outcome.Redirect
 		}
 
 		mailboxName = outcome.MailboxName
@@ -332,6 +344,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			result.Success = true
 			result.MailboxName = mailbox.Name
 			result.MessageUID = uint32(messageUID)
+			if relayAfterStore != nil {
+				relayAfterStore() // a failed redirect leaves the message where it is
+			}
 			// Don't notify uploader for duplicates
 			return result, nil
 		}
@@ -362,6 +377,10 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 
 	// Notify uploader
 	d.Uploader.NotifyUploadQueued()
+
+	if relayAfterStore != nil {
+		relayAfterStore() // a failed redirect leaves the message where it is
+	}
 
 	// Track metrics
 	metrics.MessageThroughput.WithLabelValues(d.MetricsLabel, "delivered", "success").Inc()

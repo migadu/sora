@@ -55,6 +55,29 @@ func (s *LMTPSession) sendToExternalRelay(from string, to string, message []byte
 	return nil
 }
 
+// relayRedirects queues the message for every address a Sieve redirect named and
+// reports whether all of them were queued. The caller keeps the message in INBOX
+// when one was not.
+func (s *LMTPSession) relayRedirects(redirectTo []string, messageContent *message.Entity, fullMessageBytes []byte) bool {
+	s.DebugLog("queueing message for relay delivery")
+	// Stamp the outgoing copy with an incremented hop count (loop backstop).
+	hops := helpers.RedirectHopCount(helpers.HeaderGetter(messageContent.Header.Map()))
+	relayBytes := helpers.PrependHeaderLine(fullMessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(hops+1))
+	// User.Address is the script owner's primary address, even for aliases.
+	// Replace earlier or sender-supplied attribution on the outgoing copy only.
+	relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, s.User.Address.FullAddress())
+	relayed := true
+	for _, to := range redirectTo {
+		if err := s.sendToExternalRelay(s.sender.FullAddress(), to, relayBytes); err != nil {
+			s.DebugLog("error enqueuing redirected message, keeping it in inbox", "redirect_to", to, "error", err)
+			relayed = false
+			continue
+		}
+		s.DebugLog("successfully queued message for relay delivery", "redirect_to", to)
+	}
+	return relayed
+}
+
 // LMTPSession represents a single LMTP session.
 type LMTPSession struct {
 	server.Session
@@ -919,6 +942,11 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	bodyStructure := &bodyStructureVal
 	sieveFlags = db.WithAttachmentKeyword(sieveFlags, fullMessageBytes, true)
 
+	// A redirect that keeps a copy is relayed once that copy is stored, never before:
+	// a store that fails is answered 451 and the MTA retries the delivery, and a
+	// redirect relayed ahead of the store would go out again on every retry.
+	relayAfterStore := false
+
 	switch result.Action {
 	case sieveengine.ActionFileInto:
 		mailboxName = result.Mailbox
@@ -967,40 +995,19 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			s.DebugLog("sieve redirect action", "redirect_to", result.RedirectTo)
 		}
 
-		// Queue the message for external relay delivery if configured
-		if s.backend.relayQueue != nil {
-			s.DebugLog("queueing message for relay delivery")
-			// Stamp the outgoing copy with an incremented hop count (loop backstop).
-			hops := helpers.RedirectHopCount(helpers.HeaderGetter(messageContent.Header.Map()))
-			relayBytes := helpers.PrependHeaderLine(fullMessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(hops+1))
-			// User.Address is the script owner's primary address, even for aliases.
-			// Replace earlier or sender-supplied attribution on the outgoing copy only.
-			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, s.User.Address.FullAddress())
-			relayed := true
-			for _, redirectTo := range result.RedirectTo {
-				if err := s.sendToExternalRelay(s.sender.FullAddress(), redirectTo, relayBytes); err != nil {
-					s.DebugLog("error enqueuing redirected message, falling back to inbox", "redirect_to", redirectTo, "error", err)
-					// Continue processing even if queue fails, store in INBOX as fallback
-					relayed = false
-					continue
-				}
-				s.DebugLog("successfully queued message for relay delivery", "redirect_to", redirectTo)
-			}
-			if relayed {
-				// If :copy is not specified and every relay succeeded, we don't store the message locally
-				if !result.Copy {
-					s.DebugLog("redirect without :copy - skipping local delivery")
-					recordMetrics("success")
-					return nil
-				}
-				s.DebugLog("redirect :copy - continuing with local delivery")
-			}
-		} else {
+		if s.backend.relayQueue == nil {
 			s.DebugLog("redirect requested but external relay not configured")
+		} else if result.Copy {
+			relayAfterStore = true
+		} else if s.relayRedirects(result.RedirectTo, messageContent, fullMessageBytes) {
+			// No copy is kept, so there is no store to wait for.
+			s.DebugLog("redirect without :copy - skipping local delivery")
+			recordMetrics("success")
+			return nil
 		}
 
-		// Fallback: store in INBOX if relay is not configured or fails
-		// Or if :copy is specified
+		// INBOX holds the :copy, or the message when no relay is configured or a
+		// redirect could not be queued.
 		mailboxName = consts.MailboxInbox
 
 	default:
@@ -1080,6 +1087,11 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	} else {
 		// Track successful non-duplicate delivery
 		metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "success").Inc()
+	}
+
+	if relayAfterStore {
+		// A redirect that cannot be queued leaves the message where it already is.
+		s.relayRedirects(result.RedirectTo, messageContent, fullMessageBytes)
 	}
 
 	s.InfoLog("message delivered", "mailbox", mailboxName)
