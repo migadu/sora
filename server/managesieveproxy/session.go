@@ -651,19 +651,9 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				return server.ErrServerShuttingDown
 			}
 
-			// Determine failure reason for logging
-			reason := "transient_error"
-			if errors.Is(err, consts.ErrUserNotFound) || strings.Contains(err.Error(), "user not found") {
-				reason = "user_not_found"
-			} else if strings.Contains(err.Error(), "hashedPassword is not the hash") {
-				reason = "invalid_password"
-			}
-
 			// Cache negative result (authentication failed)
 			// Only cache auth failures, not transient DB errors
-			isDefinitiveFailure := errors.Is(err, consts.ErrUserNotFound) ||
-				strings.Contains(err.Error(), "hashedPassword is not the hash") ||
-				strings.Contains(err.Error(), "user not found")
+			reason, isDefinitiveFailure := proxy.ClassifyDBAuthFailure(err)
 
 			if isDefinitiveFailure {
 				if s.server.lookupCache != nil {
