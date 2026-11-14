@@ -699,11 +699,20 @@ When filters apply:
   greeting's capability list is filtered.
 - A name and version match applies when the client sends `ID`. Clients usually send `ID` early,
   but anything they learned from an earlier `CAPABILITY` stays in their memory.
+- A filter never takes away what the connection has already enabled: an extension the client
+  named in `ENABLE` (`IMAP4rev2`, `CONDSTORE`, `QRESYNC`), `CONDSTORE` once the client has sent any
+  CONDSTORE enabling command such as `SELECT ... (CONDSTORE)` (RFC 7162 §3.1), and `IMAP4rev2` on
+  a server without `IMAP4rev1`. RFC 9051 §6.3.1: "Once enabled using ENABLE, each extension
+  remains active until the IMAP connection is closed." A filter matched by an `ID` sent after
+  `ENABLE IMAP4rev2` therefore leaves `IMAP4rev2` and every extension it includes in place, and
+  only removes the rest. The session logs `capability filters partly applied` with the names it
+  kept.
 
 As with `disabled_caps`, a filter that removes a capability included in `IMAP4rev2` also removes
-`IMAP4rev2` for that session, so the client falls back to IMAP4rev1 and really loses the
-extension. The same list of removable names applies as for `disabled_caps`. When a filter changes
-the list, the session logs `capability filters applied` with the client and the removed names.
+`IMAP4rev2` for that session, unless the connection has it enabled (above), so the client falls
+back to IMAP4rev1 and really loses the extension. The same list of removable names applies as for
+`disabled_caps`. When a filter changes the list, the session logs `capability filters applied`
+with the client and the removed names.
 
 ---
 
