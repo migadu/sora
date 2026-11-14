@@ -1,7 +1,11 @@
 package proxy
 
 import (
+	"bufio"
+	"context"
+	"fmt"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -13,6 +17,7 @@ func TestNormalizeHostPortIPv6Spellings(t *testing.T) {
 		defaultPort int
 		want        string
 	}{
+		{name: "explicit scoped IPv6 keeps its zone", addr: "[FE80:0::21%en0]:0143", defaultPort: 143, want: "[FE80:0::21%en0]:143"},
 		{
 			name:        "bracketed port-less IPv6 with default port",
 			addr:        "[2001:db8::21]",
@@ -55,6 +60,65 @@ func TestNormalizeHostPortIPv6Spellings(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := normalizeHostPort(tt.addr, tt.defaultPort); got != tt.want {
 				t.Errorf("normalizeHostPort(%q, %d) = %q, want %q", tt.addr, tt.defaultPort, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeIPv6BackendsOnWire(t *testing.T) {
+	for protocol, greeting := range map[string]string{"imap": "* OK IPv6 backend\r\n", "pop3": "+OK IPv6 backend\r\n"} {
+		t.Run(protocol, func(t *testing.T) {
+			ln, err := net.Listen("tcp6", "[::1]:0")
+			if err != nil {
+				t.Skipf("IPv6 loopback unavailable: %v", err)
+			}
+			defer ln.Close()
+			go func() {
+				for {
+					c, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+					_, _ = c.Write([]byte(greeting))
+					c.Close()
+				}
+			}()
+			_, portText, err := net.SplitHostPort(ln.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			port, err := strconv.Atoi(portText)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, spelling := range []string{"::1", "[0:0:0:0:0:0:0:1]", "[0:0:0:0:0:0:0:1]:" + portText} {
+				cm, err := NewConnectionManagerFromOptions(ManagerOptions{RemoteAddrs: []string{spelling}, RemotePort: port,
+					ConnectTimeout: 2 * time.Second, ServerName: protocol + "-IPv6-wire", DisableHealthCheck: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := cm.ResolveAddresses(); err != nil {
+					t.Fatal(err)
+				}
+				backend := cm.GetBackendByConsistentHash("user@example.com")
+				if backend != net.JoinHostPort("::1", portText) {
+					t.Fatalf("backend for %q=%q", spelling, backend)
+				}
+				conn, actual, err := cm.ConnectWithProxy(context.Background(), backend, "", 0, "", 0, nil)
+				if err != nil {
+					t.Fatalf("%s backend %q: %v", protocol, spelling, err)
+				}
+				conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+				line, err := bufio.NewReader(conn).ReadString('\n')
+				peer := conn.RemoteAddr().String()
+				conn.Close()
+				if err != nil || line != greeting || actual != backend || peer != backend {
+					t.Fatalf("%s %q: greeting=%q err=%v target=%q peer=%q, want %q", protocol, spelling, line, err, actual, peer, backend)
+				}
+				if cfg, err := cm.BindBackendRoute("", fmt.Sprintf("[0:0:0:0:0:0:0:1]:%s", portText)); err != nil || cfg.TLSConfig(true).ServerName != "::1" {
+					t.Fatalf("TLS route name for %q: %v", spelling, err)
+				}
 			}
 		})
 	}
