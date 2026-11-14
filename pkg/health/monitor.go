@@ -182,12 +182,16 @@ func (hm *HealthMonitor) runHealthCheck(ctx context.Context, check *HealthCheck)
 			logger.Info("Health: Monitoring stopped due to context cancellation", "check", check.Name)
 			return
 		case <-ticker.C:
-			hm.performCheck(check)
+			hm.performCheck(ctx, check)
 		}
 	}
 }
 
-func (hm *HealthMonitor) performCheck(check *HealthCheck) {
+// performCheck runs check once under runCtx, the context the check runs under. A run
+// whose runCtx ends meanwhile (the check was replaced, or the monitor stopped) is
+// discarded: the name may belong to a replacement by then, and "context canceled"
+// says nothing about the component.
+func (hm *HealthMonitor) performCheck(runCtx context.Context, check *HealthCheck) {
 	// Recover from panics within a health check to prevent the monitor goroutine from crashing.
 	defer func() {
 		if r := recover(); r != nil {
@@ -205,7 +209,7 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(hm.ctx, check.Timeout)
+	ctx, cancel := context.WithTimeout(runCtx, check.Timeout)
 	defer cancel()
 
 	// Time the health check
@@ -213,6 +217,9 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 
 	// Perform the actual check first (no lock needed)
 	err := check.Check(ctx)
+	if runCtx.Err() != nil {
+		return
+	}
 
 	// Record duration metric
 	duration := time.Since(startTime).Seconds()
