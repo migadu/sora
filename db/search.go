@@ -483,8 +483,8 @@ func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix str
 	return finalCondition, args, nil
 }
 
-// needsComplexQuery determines if the search criteria requires the complex CTE query
-// with ROW_NUMBER() and messages_fts_v2 JOIN, or if we can use the optimized simple query
+// needsComplexQuery determines if the search criteria requires one of the full-text
+// query shapes (messages_fts_v2), or if we can use the optimized simple query
 func (db *Database) needsComplexQuery(criteria *imap.SearchCriteria, orderByClause string) bool {
 	// Need complex query for full-text search
 	if len(criteria.Body) > 0 || len(criteria.Text) > 0 {
