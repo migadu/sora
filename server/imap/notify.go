@@ -304,6 +304,14 @@ func (s *IMAPSession) SetNotify(ctx context.Context, options *imap.NotifyOptions
 				return &imapserver.UnsupportedNotifyEventError{Supported: notifySupportedEvents}
 			}
 		}
+		// The MessageNew fetch-atts are answered through Fetch: refuse here
+		// what Fetch would refuse for every new message (RFC 5465 §3.1: "BAD -
+		// Command unknown, invalid, unsupported, or has unknown arguments").
+		if fetch := options.Items[i].MessageNewFetch; fetch != nil {
+			if err := s.requireFetchBinary(fetch); err != nil {
+				return err
+			}
+		}
 	}
 
 	watch := &notifyWatch{options: options}
