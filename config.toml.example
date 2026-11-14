@@ -1095,10 +1095,9 @@ tls_verify = false                        # Verify client certificates (mutual T
 # Enable if this server is behind a load balancer or reverse proxy
 proxy_protocol = false            # Enable PROXY protocol support (HAProxy, nginx, etc.)
 proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
-# proxy_protocol_trusted_proxies = []  # CIDR blocks allowed to send PROXY headers (defaults to trusted_networks if empty)
-                                  # Use this to specify which IPs can send PROXY protocol headers
-                                  # If not set, falls back to [servers] trusted_networks setting
-                                  # Example: ["10.0.0.0/8", "192.168.1.0/24"]
+                                  # With proxy_protocol = true, only hosts in [servers] trusted_networks
+                                  # may connect, and each connection must start with a PROXY header.
+                                  # There is no per-server list: trusted_networks is the PROXY trust list.
 
 # --- GLOBAL CAPABILITY CONFIGURATION ---
 # Disable specific IMAP capabilities for ALL clients connecting to this server.
@@ -1414,7 +1413,6 @@ tls_verify = false
 # tls_default_domain = "lmtp.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
 proxy_protocol = false        # Enable PROXY protocol support for LMTP
 proxy_protocol_timeout = "5s"
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- MESSAGE SIZE LIMITING ---
 # Maximum size for incoming LMTP messages to prevent memory exhaustion attacks
@@ -1463,7 +1461,6 @@ tls_verify = false
 # tls_default_domain = "pop3.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
 proxy_protocol = false        # Enable PROXY protocol support for POP3
 proxy_protocol_timeout = "5s"
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same configuration available as shown in IMAP example above
@@ -1516,7 +1513,6 @@ tls_key_file = "/path/to/your/managesieve.key"
 tls_verify = false            # true requires client certificates (mutual TLS); clients without one are refused
 proxy_protocol = false        # Enable PROXY protocol support for ManageSieve
 proxy_protocol_timeout = "5s"
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same configuration available as shown in IMAP example above
@@ -1709,7 +1705,6 @@ remote_dns_refresh = "5m"             # How often to re-resolve the hostnames in
 #
 proxy_protocol = false                # Enable PROXY protocol support for incoming connections (HAProxy, nginx, etc.)
 proxy_protocol_timeout = "5s"         # Timeout for reading PROXY protocol headers
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
@@ -2144,7 +2139,6 @@ remote_dns_refresh = "5m"             # Backend hostname re-resolution interval;
 # Enable PROXY protocol v2 for incoming connections. See IMAP proxy example above for full documentation.
 proxy_protocol = false                # Enable PROXY protocol support for incoming connections
 proxy_protocol_timeout = "5s"         # Timeout for reading PROXY protocol headers
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
@@ -2201,7 +2195,6 @@ remote_dns_refresh = "5m"             # Backend hostname re-resolution interval;
 # Enable PROXY protocol v2 for incoming connections. See IMAP proxy example above for full documentation.
 proxy_protocol = false                # Enable PROXY protocol support for incoming connections
 proxy_protocol_timeout = "5s"         # Timeout for reading PROXY protocol headers
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
@@ -2259,7 +2252,6 @@ remote_dns_refresh = "5m"             # Backend hostname re-resolution interval;
 # Enable PROXY protocol v2 for incoming connections. See IMAP proxy example above for full documentation.
 proxy_protocol = false                # Enable PROXY protocol support for incoming connections
 proxy_protocol_timeout = "5s"         # Timeout for reading PROXY protocol headers
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
@@ -2329,7 +2321,6 @@ tls_default_domain = ""       # [OPTIONAL] Default domain for SNI-less connectio
 tls_verify = false
 proxy_protocol = false        # Enable PROXY protocol support for HTTP API
 proxy_protocol_timeout = "5s"
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # NOTE: Uses global [relay] configuration for /admin/mail/deliver endpoint
 # NOTE: /admin/mail/deliver stages bodies through this node's upload worker, which runs only when the

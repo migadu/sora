@@ -53,11 +53,17 @@ The Prometheus endpoint (`type = "metrics"`) is served **without access control 
 When running Sora behind a load balancer or proxy, the server will only see the proxy's IP address. The PROXY protocol solves this by prepending a header to the connection that contains the real client IP.
 
 *   **WARNING**: Only enable this if you are certain your proxy is sending this header. An attacker who can connect directly to the port could spoof their IP address if this is misconfigured.
-*   **Configuration**:
+*   **Configuration**: set `proxy_protocol = true` on the `[[server]]` block, and list the hosts allowed to send PROXY headers in `[servers] trusted_networks`; there is no per-server list. With `proxy_protocol` enabled, the listener accepts connections only from `trusted_networks`, each of which must start with a PROXY header, and the server refuses to start while `trusted_networks` is empty. The same list also lets those hosts assert a client IP through XCLIENT and IMAP ID and, unless `auth_rate_limit.exempt_networks` is set, exempts them from authentication rate limiting, so keep it to your proxy hosts.
     ```toml
-    [servers.imap.proxy_protocol]
-    enabled = true
-    trusted_proxies = ["127.0.0.1/32", "10.0.0.0/8"] # List of trusted proxy IPs/CIDRs
+    [servers]
+    trusted_networks = ["10.20.0.5/32", "10.20.0.6/32"] # your load balancers or proxies
+
+    [[server]]
+    type = "imap"
+    name = "imap"
+    addr = ":993"
+    tls = true
+    proxy_protocol = true
     ```
 
 ## Client-Side S3 Encryption

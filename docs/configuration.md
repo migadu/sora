@@ -110,7 +110,7 @@ Declare each server or proxy in a separate `[[server]]` block with a `type`, a u
 *   `tls_verify`: With `tls = true`, require a client certificate (mutual TLS), verified against the system's trusted CAs. Leave it `false` for mail clients.
 *   `max_connections`: Limits the total concurrent connections to this server.
 *   `auth_rate_limit`: Contains settings to enable and configure brute-force authentication protection.
-*   `proxy_protocol`: Contains settings to enable PROXY protocol, which is essential for seeing real client IPs when Sora is behind a load balancer. **Only enable this if you are behind a trusted proxy.**
+*   `proxy_protocol`: Set to `true` to read a PROXY protocol header, which is essential for seeing real client IPs when Sora is behind a load balancer. Only hosts in `[servers] trusted_networks` may then connect, so that list must name your proxies. **Only enable this if you are behind a trusted proxy.**
 
 #### THREAD Message Limit
 
