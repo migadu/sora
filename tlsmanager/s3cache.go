@@ -16,9 +16,11 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go/logging"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 	"golang.org/x/crypto/acme/autocert"
@@ -124,17 +126,6 @@ func NewS3Cache(cfg config.TLSLetsEncryptS3Config, opts ...S3CacheOption) (*S3Ca
 		}
 	}
 
-	// Configure credentials
-	var creds aws.CredentialsProvider
-	if cfg.AccessKey != "" && cfg.SecretKey != "" {
-		// Use static credentials
-		creds = credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")
-	} else {
-		// Use default credentials chain (environment vars, EC2 IAM role, etc.)
-		// This will be handled by the SDK automatically
-		creds = nil
-	}
-
 	// Create custom endpoint resolver
 	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
 		return aws.Endpoint{
@@ -144,20 +135,35 @@ func NewS3Cache(cfg config.TLSLetsEncryptS3Config, opts ...S3CacheOption) (*S3Ca
 		}, nil
 	})
 
-	// Build AWS config
-	awsCfg := aws.Config{
-		Region:                      "us-east-1", // Default region
-		EndpointResolverWithOptions: customResolver,
+	// The SDK's own loader supplies what the configuration leaves out: the region from
+	// AWS_REGION or the shared config file, and credentials from the default chain
+	// (environment, shared credentials file, web identity, container or instance role).
+	// A bare aws.Config has no credentials at all, and the SDK then sends every request
+	// unsigned.
+	var loadOpts []func(*awsconfig.LoadOptions) error
+	if cfg.Region != "" {
+		loadOpts = append(loadOpts, awsconfig.WithRegion(cfg.Region))
 	}
-
-	if creds != nil {
-		awsCfg.Credentials = creds
+	if cfg.AccessKey != "" && cfg.SecretKey != "" {
+		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")))
 	}
-
-	// Add debug logging if requested
 	if cfg.Debug {
-		awsCfg.ClientLogMode = aws.LogRequest | aws.LogResponse | aws.LogRetries
+		// ClientLogMode alone selects what to trace; without a logger the SDK discards it.
+		loadOpts = append(loadOpts,
+			awsconfig.WithClientLogMode(aws.LogRequest|aws.LogResponse|aws.LogRetries),
+			awsconfig.WithLogger(s3DebugLogger{}))
 	}
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWS configuration: %w", err)
+	}
+	if awsCfg.Region == "" {
+		// S3-compatible stores generally accept any region; us-east-1 is what this cache
+		// always signed for before the region was configurable.
+		awsCfg.Region = "us-east-1"
+	}
+	awsCfg.EndpointResolverWithOptions = customResolver
 
 	// Create S3 client with path-style addressing for compatibility
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
@@ -183,9 +189,22 @@ func NewS3Cache(cfg config.TLSLetsEncryptS3Config, opts ...S3CacheOption) (*S3Ca
 	}
 
 	logger.Info("S3 autocert cache initialized", "bucket", cfg.Bucket,
-		"endpoint", endpoint, "tls", useSSL, "debug", cfg.Debug,
+		"endpoint", endpoint, "region", awsCfg.Region, "tls", useSSL, "debug", cfg.Debug,
 		"server_side_encryption", cache.sseAlgorithm)
 	return cache, nil
+}
+
+// s3DebugLogger writes the SDK's request and response tracing, which debug = true asks
+// for, to the server log. It logs at INFO so that the trace appears without lowering the
+// log level of the whole server.
+type s3DebugLogger struct{}
+
+func (s3DebugLogger) Logf(classification logging.Classification, format string, v ...any) {
+	if classification == logging.Warn {
+		logger.Warn("S3-Cache: AWS SDK", "detail", fmt.Sprintf(format, v...))
+		return
+	}
+	logger.Info("S3-Cache: AWS SDK trace", "detail", fmt.Sprintf(format, v...))
 }
 
 // verifyBucketAccess checks if the S3 bucket exists and is accessible.

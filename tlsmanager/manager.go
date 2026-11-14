@@ -228,6 +228,10 @@ func (m *Manager) initFileProvider() error {
 	return nil
 }
 
+// acmeDirectoryURL is where certificates are ordered: Let's Encrypt production. A variable
+// only so that tests can point a manager at a local ACME server before it is built.
+var acmeDirectoryURL = autocert.DefaultACMEDirectory
+
 // DefaultFallbackDir is where certificates are mirrored locally when fallback_dir is unset.
 const DefaultFallbackDir = "/var/lib/sora/certs"
 
@@ -329,7 +333,7 @@ func (m *Manager) initLetsEncryptProvider() error {
 		RenewBefore: renewBefore, // 0 = default 30 days
 		// Use Let's Encrypt production directory by default
 		Client: &acme.Client{
-			DirectoryURL: "https://acme-v02.api.letsencrypt.org/directory",
+			DirectoryURL: acmeDirectoryURL,
 			HTTPClient:   &http.Client{Transport: &issuanceFence{manager: m, base: http.DefaultTransport}},
 		},
 	}
@@ -570,54 +574,69 @@ func (m *Manager) clearRateLimit(domain string) {
 	delete(m.rateLimitMap, domain)
 }
 
-// prewarmCertificates loads existing certificates from cache into autocert's state
-// This prevents the "certificate exists in S3 but autocert doesn't know about it" problem
+// prewarmCertificates loads every certificate the cache holds for a configured domain
+// into autocert. Loading a certificate is what starts autocert's renewal timer for it,
+// and on its own autocert loads one only inside a handshake for that domain: a node that
+// serves no handshake for a domain - the leader, when clients are sent to other nodes -
+// would never renew it.
 //
-// IMPORTANT: We DO NOT call GetCertificate() during pre-warming because:
-// 1. It triggers ACME validation if certificate needs renewal
-// 2. ACME validation requires storing HTTP-01 tokens
-// 3. On non-leader cluster nodes, token storage is blocked
-// 4. This causes pre-warming to fail on non-leader nodes
-//
-// Instead, we just verify certificates exist in cache. The first actual TLS handshake
-// will load the certificate into autocert's state (and if it needs renewal, the leader
-// will handle it).
+// A certificate past its renewal point is renewed as soon as it is loaded, by the node
+// that may issue. On the others the order is refused at the issuance fence and autocert
+// retries, picking up the renewed certificate once it has reached their cache. Domains
+// without a certificate in the cache are left to their first handshake, as before.
 func (m *Manager) prewarmCertificates() {
-	if m.autocertMgr == nil || m.config.LetsEncrypt == nil {
+	if m.autocertMgr == nil || m.autocertMgr.Cache == nil || m.config.LetsEncrypt == nil {
 		return
 	}
 
-	logger.Info("Pre-warming: Checking certificates in cache")
+	logger.Info("Pre-warm: Checking certificates in cache")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	found := 0
-	missing := 0
+	// Read beneath the issuance gate: a miss here is not about to order anything, so it
+	// must not take the issuance claim.
+	cache := m.autocertMgr.Cache
+	if gate, ok := cache.(*issuanceGate); ok {
+		cache = gate.unwrap()
+	}
 
+	var load []*tls.ClientHelloInfo
 	for _, domain := range m.config.LetsEncrypt.Domains {
-		// Check if certificate exists in cache
-		if m.autocertMgr.Cache != nil {
-			data, err := m.autocertMgr.Cache.Get(ctx, domain)
-			if err != nil {
-				// Not in cache
-				logger.Debug("Pre-warm: Certificate not in cache", "domain", domain, "error", err)
-				missing++
+		// autocert keeps an ECDSA certificate under the domain and, for clients without
+		// ECDSA, an RSA one under domain+"+rsa"; a hello selects which one it loads.
+		variants := []struct {
+			key   string
+			hello *tls.ClientHelloInfo
+		}{
+			{domain, &tls.ClientHelloInfo{ServerName: domain, CipherSuites: []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256}}},
+			{domain + "+rsa", &tls.ClientHelloInfo{ServerName: domain, CipherSuites: []uint16{tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256}}},
+		}
+		for _, v := range variants {
+			data, err := cache.Get(ctx, v.key)
+			if err != nil || len(data) == 0 {
+				logger.Debug("Pre-warm: Certificate not in cache", "key", v.key, "error", err)
 				continue
 			}
-
-			// Verify it's parseable
-			if len(data) > 0 {
-				logger.Info("Pre-warm: Certificate found in cache", "domain", domain, "size", len(data))
-				found++
-			} else {
-				logger.Warn("Pre-warm: Empty certificate data in cache", "domain", domain)
-				missing++
-			}
+			logger.Info("Pre-warm: Certificate found in cache", "key", v.key, "size", len(data))
+			load = append(load, v.hello)
 		}
 	}
 
-	logger.Info("Pre-warm: Completed", "found", found, "missing", missing, "total", len(m.config.LetsEncrypt.Domains))
+	logger.Info("Pre-warm: Completed", "found", len(load), "domains", len(m.config.LetsEncrypt.Domains))
+	if len(load) == 0 {
+		return
+	}
+
+	// Off the startup path: an expired certificate is ordered anew on the node that may
+	// issue, and an ACME exchange takes minutes at worst.
+	go func() {
+		for _, hello := range load {
+			if _, err := m.autocertMgr.GetCertificate(hello); err != nil {
+				logger.Warn("Pre-warm: Could not load certificate for renewal", "domain", hello.ServerName, "error", err)
+			}
+		}
+	}()
 }
 
 // Shutdown gracefully stops the TLS manager and its background workers

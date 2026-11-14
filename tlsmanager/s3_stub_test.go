@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/migadu/sora/config"
-	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )
 
@@ -171,22 +170,22 @@ func newTestClusterManager(t *testing.T, s3Endpoint string, clusterMgr clusterCo
 		opt(leCfg)
 	}
 
+	// Redirect the directory only: the rest of the ACME client is what production builds.
+	// It has to happen before the manager is built, which loads the cached certificates
+	// and can start a renewal.
+	acmeHits, directoryURL := newStubACME(t)
+	productionDirectory := acmeDirectoryURL
+	acmeDirectoryURL = directoryURL
 	m, err := newManager(config.TLSConfig{
 		Enabled:     true,
 		Provider:    "letsencrypt",
 		LetsEncrypt: leCfg,
 	}, clusterMgr)
+	acmeDirectoryURL = productionDirectory
 	if err != nil {
 		t.Fatalf("newManager: %v", err)
 	}
 	t.Cleanup(m.Shutdown)
-
-	// Redirect the directory only: the rest of the ACME client is what production builds.
-	acmeHits, directoryURL := newStubACME(t)
-	if m.autocertMgr.Client == nil {
-		m.autocertMgr.Client = &acme.Client{}
-	}
-	m.autocertMgr.Client.DirectoryURL = directoryURL
 
 	return m, acmeHits
 }
