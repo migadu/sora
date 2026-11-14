@@ -2742,6 +2742,12 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
+	if s.Type == "imap" {
+		if err := ValidateIMAPDisabledCaps(s.DisabledCaps); err != nil {
+			return fmt.Errorf("server %q: %w", s.Name, err)
+		}
+	}
+
 	return nil
 }
 
