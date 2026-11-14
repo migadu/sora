@@ -162,7 +162,7 @@ type Result struct {
 // for this sender and response identity already checked.
 type VacationReply struct {
 	From    string // the :from address; delivery uses it only if the account owns it
-	Subject string // the :subject, or "Auto: " and the original subject (RFC 5230 §5.3)
+	Subject string // the :subject, even empty; without one the RFC 5230 §5.3 default
 	Body    string // the reason
 	IsMime  bool
 	// Addresses is the :addresses list: addresses of the recipient besides the
