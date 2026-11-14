@@ -70,9 +70,10 @@ func TestHeaderSearchCriteriaBindLiteralTerms(t *testing.T) {
 		criteria *imap.SearchCriteria
 		exprs    []string
 	}{
-		{"FROM", header("From"), []string{"m.from_email_sort", "m.from_name_sort", `split_part(m.extra_addresses, E'\n', 1)`}},
-		{"TO", header("To"), []string{"m.to_email_sort", "m.to_name_sort", `split_part(m.extra_addresses, E'\n', 2)`}},
-		{"CC", header("Cc"), []string{"m.cc_email_sort", `split_part(m.extra_addresses, E'\n', 3)`}},
+		// An empty address column means no such address, never a match (addressHeaderCond).
+		{"FROM", header("From"), []string{"NULLIF(m.from_email_sort, '')", "NULLIF(m.from_name_sort, '')", `NULLIF(split_part(m.extra_addresses, E'\n', 1), '')`}},
+		{"TO", header("To"), []string{"NULLIF(m.to_email_sort, '')", "NULLIF(m.to_name_sort, '')", `NULLIF(split_part(m.extra_addresses, E'\n', 2), '')`}},
+		{"CC", header("Cc"), []string{"NULLIF(m.cc_email_sort, '')", `NULLIF(split_part(m.extra_addresses, E'\n', 3), '')`}},
 		{"SUBJECT", header("Subject"), []string{"LOWER(m.subject)"}},
 		{"HEADER References", header("References"), []string{`'<' || replace(LOWER(NULLIF(m."references", '')), ' ', '> <') || '>'`}},
 		{"HEADER In-Reply-To", header("In-Reply-To"), []string{`'<' || replace(LOWER(NULLIF(m.in_reply_to, '')), ' ', '> <') || '>'`}},

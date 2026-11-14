@@ -134,6 +134,54 @@ func TestHeaderSearchMatchesEveryAddress(t *testing.T) {
 		assert.ElementsMatch(t, want, search(t, archiveID, header("To", "bob@example.com")))
 		assert.ElementsMatch(t, want, search(t, archiveID, header("Cc", "erin")))
 	})
+
+	// RFC 9051 §6.4.4: "If the string to search is zero-length, this matches all messages
+	// that have a header field with the specified field-name regardless of the contents."
+	// A message without a header stores '' in its columns, which contains the empty term
+	// too, so the empty term must only match a message with an address in that header.
+	t.Run("empty term tests header presence", func(t *testing.T) {
+		presenceID := createTestMailbox(t, db, accountID, "Presence")
+		insert := func(n int, recipients []helpers.Recipient) imap.UID {
+			t.Helper()
+			o := opts(n, recipients)
+			o.MailboxID, o.MailboxName = presenceID, "Presence"
+			tx, err := db.GetWritePool().Begin(ctx)
+			require.NoError(t, err)
+			defer tx.Rollback(ctx)
+			_, uid, err := db.InsertMessage(ctx, tx, o, PendingUpload{InstanceID: "test", ContentHash: o.ContentHash, Size: 100, AccountID: accountID})
+			require.NoError(t, err)
+			require.NoError(t, tx.Commit(ctx))
+			return imap.UID(uid)
+		}
+		full := insert(5, everyAddressRecipients)
+		noCc := insert(6, []helpers.Recipient{ // no display names either
+			{AddressType: "to", EmailAddress: "carol@example.com"},
+			{AddressType: "from", EmailAddress: "alice@example.com"},
+		})
+		none := insert(7, []helpers.Recipient{})
+		not := func(c *imap.SearchCriteria) *imap.SearchCriteria {
+			return &imap.SearchCriteria{Not: []imap.SearchCriteria{*c}}
+		}
+
+		for _, tc := range []struct {
+			name     string
+			criteria *imap.SearchCriteria
+			want     []imap.UID
+		}{
+			{`HEADER From ""`, header("From", ""), []imap.UID{full, noCc}},
+			{`HEADER To ""`, header("To", ""), []imap.UID{full, noCc}},
+			{`HEADER Cc ""`, header("Cc", ""), []imap.UID{full}},
+			{`NOT HEADER From ""`, not(header("From", "")), []imap.UID{none}},
+			{`NOT HEADER To ""`, not(header("To", "")), []imap.UID{none}},
+			{`NOT HEADER Cc ""`, not(header("Cc", "")), []imap.UID{noCc, none}},
+			{`HEADER Bcc ""`, header("Bcc", ""), []imap.UID{full}},
+			{`NOT HEADER Bcc ""`, not(header("Bcc", "")), []imap.UID{noCc, none}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				assert.ElementsMatch(t, tc.want, search(t, presenceID, tc.criteria))
+			})
+		}
+	})
 }
 
 // TestHeaderSearchOnRowsWithoutExtraAddresses covers rows written before extra_addresses
@@ -193,4 +241,11 @@ func TestHeaderSearchOnRowsWithoutExtraAddresses(t *testing.T) {
 		assert.ElementsMatch(t, both, search(&imap.SearchCriteria{Not: []imap.SearchCriteria{header(key, "nobody")}}), "NOT %s on rows without extra_addresses", key)
 	}
 	assert.ElementsMatch(t, both, search(&imap.SearchCriteria{Not: []imap.SearchCriteria{{Text: []string{"nobody"}}}}), "NOT TEXT on rows without extra_addresses")
+	// The empty term tests header presence on these rows too: both have a From and a To,
+	// neither has a Cc (cc_email_sort '' and no extra_addresses at all).
+	for _, key := range []string{"From", "To"} {
+		assert.ElementsMatch(t, both, search(&imap.SearchCriteria{Header: header(key, "").Header}), `HEADER %s "" on rows without extra_addresses`, key)
+	}
+	assert.Empty(t, search(&imap.SearchCriteria{Header: header("Cc", "").Header}), `HEADER Cc "" on rows without extra_addresses`)
+	assert.ElementsMatch(t, both, search(&imap.SearchCriteria{Not: []imap.SearchCriteria{header("Cc", "")}}), `NOT HEADER Cc "" on rows without extra_addresses`)
 }
