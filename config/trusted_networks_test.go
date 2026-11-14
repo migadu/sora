@@ -76,6 +76,16 @@ func TestTrustedNetworksHaveBroadPrivateRanges(t *testing.T) {
 		{"narrow subnet /24", []string{"10.1.2.0/24"}, false},
 		{"loopback only", []string{"127.0.0.0/8", "::1/128"}, false},
 		{"bare ip ignored", []string{"10.20.0.5"}, false},
+		{"all ipv4", []string{"0.0.0.0/0"}, true},
+		// An IPv4-mapped CIDR matches IPv4 clients as the IPv4 network it maps
+		// (net.IPNet.Contains, and so every trust check, sees ::ffff:10.0.0.0/104 as
+		// 10.0.0.0/8), so it is as broad as that spelling. (#765)
+		{"ipv4-mapped rfc1918 /8", []string{"::ffff:10.0.0.0/104"}, true},
+		{"ipv4-mapped rfc1918 /12", []string{"::ffff:172.16.0.0/108"}, true},
+		{"ipv4-mapped rfc1918 /16", []string{"::ffff:192.168.0.0/112"}, true},
+		{"ipv4-mapped all ipv4", []string{"::ffff:0:0/96"}, true},
+		{"ipv4-mapped narrow subnet /24", []string{"::ffff:10.1.2.0/120"}, false},
+		{"ipv4-mapped narrow proxy /32", []string{"::ffff:10.20.0.5/128"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
