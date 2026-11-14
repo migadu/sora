@@ -1,6 +1,7 @@
 package userapi
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -156,6 +157,94 @@ func TestCORSMiddlewareVaryOrigin(t *testing.T) {
 		}
 		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
 			t.Errorf("Access-Control-Allow-Origin = %q, want empty", got)
+		}
+	})
+}
+
+// TestCORSMiddlewareExposesClientHeaders checks that a cross-origin client can read the
+// headers the API sends for it to act on. Fetch Standard, "CORS filtered response": a
+// cross-origin reader sees only the CORS-safelisted response-header names
+// (Cache-Control, Content-Language, Content-Length, Content-Type, Expires,
+// Last-Modified, Pragma) and the names listed in Access-Control-Expose-Headers.
+// Retry-After (on the 503 for a body that is not available yet) and Content-Disposition
+// (on /raw) are not safelisted, so without the list a web client sees the 503 but not
+// when to retry.
+func TestCORSMiddlewareExposesClientHeaders(t *testing.T) {
+	safelisted := []string{"Cache-Control", "Content-Language", "Content-Length", "Content-Type", "Expires", "Last-Modified", "Pragma"}
+	// readable reports whether a browser hands header name of the response to a
+	// cross-origin reader.
+	readable := func(h http.Header, name string) bool {
+		if h.Get("Access-Control-Allow-Origin") == "" {
+			return false // the response is not shared at all
+		}
+		if slices.ContainsFunc(safelisted, func(s string) bool { return strings.EqualFold(s, name) }) {
+			return true
+		}
+		for _, v := range h.Values("Access-Control-Expose-Headers") {
+			for _, f := range strings.Split(v, ",") {
+				if strings.EqualFold(strings.TrimSpace(f), name) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	handlers := []struct {
+		name, header string
+		handler      func(s *Server) http.Handler
+	}{
+		{"body pending", "Retry-After", func(s *Server) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				s.writeBodyUnavailable(w, bodyPending, nil, 1)
+			})
+		}},
+		{"storage down", "Retry-After", func(s *Server) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				s.writeBodyUnavailable(w, bodyTransient, errors.New("storage timeout"), 1)
+			})
+		}},
+		// The header handleGetMessageRaw sends with the message.
+		{"raw download", "Content-Disposition", func(s *Server) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "message/rfc822")
+				w.Header().Set("Content-Disposition", `attachment; filename="message-1.eml"`)
+				w.WriteHeader(http.StatusOK)
+			})
+		}},
+	}
+	for _, origins := range []struct {
+		name    string
+		allowed []string
+	}{{"specific", []string{"https://app.example.com"}}, {"wildcard", []string{"*"}}} {
+		for _, tc := range handlers {
+			t.Run(origins.name+"/"+tc.name, func(t *testing.T) {
+				s := &Server{}
+				s.settings.Store(&reloadableSettings{allowedOrigins: origins.allowed})
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodGet, "/user/messages/1/raw", nil)
+				req.Header.Set("Origin", "https://app.example.com")
+				s.corsMiddleware(tc.handler(s)).ServeHTTP(rec, req)
+				if rec.Header().Get(tc.header) == "" {
+					t.Fatalf("%s not set by the handler", tc.header)
+				}
+				if !readable(rec.Header(), tc.header) {
+					t.Errorf("%s is hidden from a cross-origin reader: Access-Control-Expose-Headers = %q",
+						tc.header, rec.Header().Values("Access-Control-Expose-Headers"))
+				}
+			})
+		}
+	}
+
+	t.Run("disallowed origin exposes nothing", func(t *testing.T) {
+		s := &Server{}
+		s.settings.Store(&reloadableSettings{allowedOrigins: []string{"https://app.example.com"}})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/user/mailboxes", nil)
+		req.Header.Set("Origin", "https://evil.example")
+		s.corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})).ServeHTTP(rec, req)
+		if got := rec.Header().Values("Access-Control-Expose-Headers"); len(got) != 0 {
+			t.Errorf("Access-Control-Expose-Headers = %q, want none for a disallowed origin", got)
 		}
 	})
 }

@@ -548,6 +548,11 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 				w.Header().Set("Access-Control-Max-Age", "3600")
+				// A cross-origin reader sees only the CORS-safelisted response
+				// headers and the ones named here (Fetch Standard, "CORS filtered
+				// response"): Retry-After on a 503 for a body not available yet,
+				// Content-Disposition on /raw. Static, so it needs no Vary.
+				w.Header().Set("Access-Control-Expose-Headers", "Retry-After, Content-Disposition")
 				if wildcard {
 					// A wildcard origin must NOT be combined with credentials (CORS spec):
 					// reflecting a concrete origin + Allow-Credentials lets any site make
