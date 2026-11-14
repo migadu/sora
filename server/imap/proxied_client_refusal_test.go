@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -151,11 +153,76 @@ func TestTier2BlockedDirectClientIsClosedSilently(t *testing.T) {
 
 	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, &tls.Config{InsecureSkipVerify: true})
 	if err != nil {
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			t.Fatalf("blocked direct client was left waiting for TLS: %v", err)
+		}
 		return // closed before the handshake
 	}
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if line, err := bufio.NewReader(conn).ReadString('\n'); err == nil || line != "" {
 		t.Errorf("blocked direct client read %q, %v; want the connection closed without a reply", line, err)
+	}
+}
+
+// Refusals complete initialization without handing admission ownership to a
+// session. They must close after BYE and leave neither limiter slots nor drain
+// registrations behind, with or without an implicit TLS handshake.
+func TestTier2PROXYRefusalsReleaseAdmission(t *testing.T) {
+	for _, implicitTLS := range []bool{false, true} {
+		t.Run(fmt.Sprintf("implicit_TLS_%t", implicitTLS), func(t *testing.T) {
+			limiter := serverPkg.NewAuthRateLimiter("imap", t.Name(), "localhost", serverPkg.AuthRateLimiterConfig{
+				Enabled: true, MaxAttemptsPerIP: 1,
+				IPBlockDuration: time.Minute, IPWindowDuration: time.Minute, CleanupInterval: time.Minute,
+			})
+			t.Cleanup(limiter.Stop)
+			for _, ip := range []string{"2001:db8::10", "192.0.2.10"} {
+				limiter.RecordAuthAttempt(context.Background(), &serverPkg.StringAddr{Addr: net.JoinHostPort(ip, "51000")}, "user@example.com", false)
+			}
+			srv, addr, err := newGlobalTLSTestServer(t, IMAPServerOptions{
+				TLS: implicitTLS, TLSConfig: globalTLSTestConfig(t),
+				ProxyProtocol: true, ProxyProtocolTimeout: "5s", TrustedNetworks: []string{"127.0.0.0/8"},
+				AuthLimiterOverride: limiter,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			serveReloadTestServer(t, srv, addr)
+			for _, ip := range []string{"2001:db8::10", "2001:DB8:0000::0010", "::ffff:192.0.2.10"} {
+				conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { conn.Close() })
+				conn.SetDeadline(time.Now().Add(3 * time.Second))
+				if _, err := fmt.Fprintf(conn, "PROXY TCP6 %s 2001:db8::1 51000 143\r\n", ip); err != nil {
+					t.Fatal(err)
+				}
+				if implicitTLS {
+					secure := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+					if err := secure.Handshake(); err != nil {
+						t.Fatalf("handshake before refusal for %s: %v", ip, err)
+					}
+					conn = secure
+				}
+				r := bufio.NewReader(conn)
+				if line, err := r.ReadString('\n'); err != nil || !strings.HasPrefix(line, "* BYE [ALERT] ") {
+					t.Fatalf("refusal for %s: %q, %v", ip, line, err)
+				}
+				if _, err := r.ReadByte(); err != io.EOF {
+					t.Fatalf("connection after BYE for %s: %v; want EOF", ip, err)
+				}
+				conn.Close()
+			}
+			if stats := srv.limiter.GetStats(); stats.TotalConnections != 0 {
+				t.Errorf("refusals retained limiter slots: %+v", stats)
+			}
+			if got := srv.totalConnections.Load(); got != 0 {
+				t.Errorf("refusals initialized %d active sessions", got)
+			}
+			if !srv.sessions.Drain(time.Second) {
+				t.Error("refusals retained session admission registrations")
+			}
+		})
 	}
 }
