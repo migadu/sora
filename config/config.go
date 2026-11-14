@@ -1107,7 +1107,8 @@ func (c *RemoteLookupConfig) GetRemotePort() (int, error) {
 	return int(p), nil
 }
 
-// ServerLimitsConfig holds resource limits for a server
+// ServerLimitsConfig holds resource limits for a server. serverLimitKeys lists the
+// server types that apply each one.
 type ServerLimitsConfig struct {
 	SearchRateLimitPerMin *int   `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled, default: 60)
 	SearchRateLimitWindow string `toml:"search_rate_limit_window,omitempty"`  // Search rate limit time window (default: 1m)
@@ -2640,6 +2641,13 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	if s.Timeouts != nil && s.Timeouts.SchedulerShardCount != 0 {
 		logger("WARNING: Server %s (type: %s) has 'timeouts.scheduler_shard_count' configured, but it has no effect: all servers share one timeout scheduler, sized by [timeout_scheduler] shard_count", s.Name, s.Type)
 	}
+	if s.Limits != nil {
+		for _, k := range serverLimitKeys {
+			if k.set(s.Limits) && !slices.Contains(k.appliedBy, s.Type) {
+				logger("WARNING: Server %s (type: %s) has 'limits.%s' configured, but only %s servers apply it", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "))
+			}
+		}
+	}
 
 	// Check proxy-only options on non-proxy servers
 	if !strings.HasSuffix(s.Type, "_proxy") {
@@ -2700,8 +2708,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		s.warnKeysNotApplied(logger, "the LMTP server does not apply it",
 			configKey{"timeouts.absolute_session_timeout", s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != ""},
 			configKey{"timeouts.min_bytes_per_minute", s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0},
-			configKey{"auth_idle_timeout", s.AuthIdleTimeout != ""},
-			configKey{"limits.session_memory_limit", s.Limits != nil && s.Limits.SessionMemoryLimit != ""})
+			configKey{"auth_idle_timeout", s.AuthIdleTimeout != ""})
 		// MTAs deliver many messages at once from few addresses.
 		s.warnKeysNotApplied(logger, "the LMTP server limits only its total connections (max_connections)",
 			configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
@@ -2804,6 +2811,33 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			}
 		}
 	}
+}
+
+// serverLimitKeys is every [server.limits] key with the server types whose start
+// functions read it. Every type accepts every key; WarnUnusedConfigOptions reports
+// one set on a type not listed. A new limits key belongs here.
+var serverLimitKeys = []struct {
+	name      string
+	set       func(*ServerLimitsConfig) bool
+	appliedBy []string
+}{
+	// The IMAP backend's search rate limiter, THREAD cap and FETCH PREVIEW budgets.
+	{"search_rate_limit_per_min", func(l *ServerLimitsConfig) bool { return l.SearchRateLimitPerMin != nil }, []string{"imap"}},
+	{"search_rate_limit_window", func(l *ServerLimitsConfig) bool { return l.SearchRateLimitWindow != "" }, []string{"imap"}},
+	{"search_rate_limit_burst", func(l *ServerLimitsConfig) bool { return l.SearchRateLimitBurst != nil }, []string{"imap"}},
+	{"thread_max_messages", func(l *ServerLimitsConfig) bool { return l.ThreadMaxMessages != 0 }, []string{"imap"}},
+	{"preview_s3_per_min", func(l *ServerLimitsConfig) bool { return l.PreviewS3PerMin != nil }, []string{"imap"}},
+	{"preview_s3_burst", func(l *ServerLimitsConfig) bool { return l.PreviewS3Burst != nil }, []string{"imap"}},
+	{"preview_s3_node_per_min", func(l *ServerLimitsConfig) bool { return l.PreviewS3NodePerMin != nil }, []string{"imap"}},
+	{"preview_s3_max_size", func(l *ServerLimitsConfig) bool { return l.PreviewS3MaxSize != "" }, []string{"imap"}},
+	// The session memory tracker.
+	{"session_memory_limit", func(l *ServerLimitsConfig) bool { return l.SessionMemoryLimit != "" }, []string{"imap", "pop3"}},
+	// The login proxies' cap on errors (bad commands, refused logins) before authentication.
+	{"max_auth_errors", func(l *ServerLimitsConfig) bool { return l.MaxAuthErrors != 0 }, []string{"imap_proxy", "pop3_proxy", "managesieve_proxy"}},
+	// Sieve on delivery: LMTP and the Admin API's /admin/mail/deliver.
+	{"redirect_rate_limit", func(l *ServerLimitsConfig) bool { return l.RedirectRateLimit != nil }, []string{"lmtp", "http_admin_api"}},
+	{"redirect_rate_window", func(l *ServerLimitsConfig) bool { return l.RedirectRateWindow != "" }, []string{"lmtp", "http_admin_api"}},
+	{"max_redirect_hops", func(l *ServerLimitsConfig) bool { return l.MaxRedirectHops != nil }, []string{"lmtp", "http_admin_api"}},
 }
 
 // configKey is a server setting by its TOML key, and whether the block sets it.

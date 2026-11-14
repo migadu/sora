@@ -1418,7 +1418,21 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 
 	// Other proxy protocols use cluster-wide gossip tracking.
 	if clusterMgr == nil {
-		logger.Debug("Proxy: Connection tracking disabled (requires cluster mode)", "protocol", protocol, "name", serverName)
+		// Nothing else counts a user's connections through the proxy, so the per-user
+		// limits the block sets are not applied.
+		var limits []any
+		if maxConnectionsPerUser != 0 {
+			limits = append(limits, "max_connections_per_user", maxConnectionsPerUser)
+		}
+		if maxConnectionsPerUserPerIP != 0 {
+			limits = append(limits, "max_connections_per_user_per_ip", maxConnectionsPerUserPerIP)
+		}
+		if len(limits) == 0 {
+			logger.Debug("Proxy: Connection tracking disabled (requires cluster mode)", "protocol", protocol, "name", serverName)
+			return nil, ""
+		}
+		logger.Warn("Proxy: per-user connection limits are not applied without [cluster]: the proxy counts a user's connections only through the cluster connection tracker",
+			append([]any{"protocol", protocol, "name", serverName}, limits...)...)
 		return nil, ""
 	}
 
