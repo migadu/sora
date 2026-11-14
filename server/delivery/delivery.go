@@ -161,9 +161,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// actually stored.
 	var mailboxName string
 	var relayAfterStore func() bool
-	var copyMailboxes []string   // further Sieve destinations, saved once the body is staged
+	var copies []SieveCopy       // further Sieve destinations, saved once the body is staged
 	var createMailboxes []string // Sieve fileinto :create targets, created if missing
-	var sieveFlags []imap.Flag   // flags set by the Sieve script (imap4flags, RFC 5232)
+	var sieveFlags []imap.Flag   // flags the Sieve script set on the mailboxName copy (imap4flags, RFC 5232)
 
 	// The delivery reads from the writer, as LMTP does once RCPT has looked the
 	// recipient up: LookupRecipient creates an account's default mailboxes on first
@@ -204,7 +204,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		}
 
 		mailboxName = outcome.MailboxName
-		copyMailboxes = outcome.CopyMailboxes
+		copies = outcome.Copies
 		createMailboxes = outcome.CreateMailboxes
 		sieveFlags = outcome.Flags
 		// Adopt any header edits the script made (RFC 5293) before anything is derived
@@ -235,7 +235,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		d.Logger.Log("Invalid body structure detected, using fallback: %v", bsErr)
 	}
 	bodyStructure := &bodyStructureVal
-	deliveryFlags := db.WithAttachmentKeyword(sieveFlags, messageBytes, true)
+	// Classified once: every copy gets the keyword next to its own Sieve flags.
+	attachmentKeyword, attachmentKnown := helpers.AttachmentKeyword(messageBytes)
+	deliveryFlags := db.WithClassifiedAttachmentKeyword(sieveFlags, attachmentKeyword, attachmentKnown, true)
 
 	// Extract recipients
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
@@ -282,12 +284,13 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// The further copies Sieve asked for: save them now that the body is on disk, so
 	// their pending_uploads rows can never name a file that is not staged yet - the
 	// uploader treats a missing local file as permanently lost content.
-	for _, copyMailbox := range copyMailboxes {
-		err := d.SaveMessageToMailbox(ctx, recipient, copyMailbox, messageBytes, messageEntity, plaintextBody, deliveryFlags, contentHash, bodyStructure)
+	for _, c := range copies {
+		flags := db.WithClassifiedAttachmentKeyword(c.Flags, attachmentKeyword, attachmentKnown, true)
+		err := d.SaveMessageToMailbox(ctx, recipient, c.Mailbox, messageBytes, messageEntity, plaintextBody, flags, contentHash, bodyStructure)
 		// A duplicate copy is an accepted delivery, as it is in LMTP: the copy is
 		// already in the mailbox, so a resubmission must not fail the delivery.
 		if err != nil && !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
-			result.ErrorMessage = fmt.Sprintf("Failed to save Sieve copy to %s: %v", copyMailbox, err)
+			result.ErrorMessage = fmt.Sprintf("Failed to save Sieve copy to %s: %v", c.Mailbox, err)
 			return result, err
 		}
 	}

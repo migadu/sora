@@ -107,7 +107,7 @@
 //		dests = result.Destinations(true)
 //	}
 //	for _, dest := range dests {
-//		if err := deliverToMailbox(dest.Mailbox); err != nil {
+//		if err := deliverToMailbox(dest.Mailbox, dest.Flags); err != nil {
 //			return err // stop before any relay handoff
 //		}
 //	}
