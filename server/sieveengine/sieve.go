@@ -94,6 +94,15 @@ func MaxRedirects() int {
 	return sieve.DefaultOptions().Interp.MaxRedirects
 }
 
+// MaxFileintoTargets is how many mailboxes one script may file one message into.
+// Every target is a stored copy (a message row and an upload entry, and with
+// :create maybe a new mailbox), so without a bound a script could make each
+// incoming message cost hundreds of them. RFC 5228 §2.10.4: "Site policy MAY
+// limit the number of actions taken ... In the event that a script hits a policy
+// limit on the number of actions taken for a particular message, an error
+// occurs." Pigeonhole's sieve_max_actions defaults to 32 as well.
+const MaxFileintoTargets = 32
+
 // ValidateScript compiles content against the configured [sieve]
 // enabled_extensions, as delivery will. Every path that stores a script must
 // call it first: a stored script that does not compile is skipped whole at
@@ -341,6 +350,11 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 	}
 	if err := timeoutCtx.Err(); err != nil {
 		return Result{Action: ActionKeep}, err
+	}
+	// Over the limit the script is in error: none of its actions are carried out
+	// and the message is kept (RFC 5228 §2.10.6), as for any other run-time error.
+	if len(data.Mailboxes) > MaxFileintoTargets {
+		return Result{Action: ActionKeep}, fmt.Errorf("sieve: too many fileinto actions: %d mailboxes, at most %d", len(data.Mailboxes), MaxFileintoTargets)
 	}
 
 	// Process the results

@@ -2,6 +2,7 @@ package sieveengine
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"testing"
 )
@@ -127,5 +128,43 @@ func TestResultDestinations(t *testing.T) {
 				t.Errorf("Destinations(%v) = %v, want %v", tt.redirectFailed, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestTooManyFileintoTargetsIsAnError: every fileinto target is a stored copy, so
+// the number of them is bounded (RFC 5228 §2.10.4). A script over the bound is in
+// error and none of its actions are carried out: the message is kept, and its
+// redirect is neither relayed nor charged.
+func TestTooManyFileintoTargetsIsAnError(t *testing.T) {
+	script := func(targets int) string {
+		s := "require \"fileinto\";\nredirect \"other@example.org\";\n"
+		for i := range targets {
+			s += fmt.Sprintf("fileinto \"Folder%d\";\n", i)
+		}
+		return s
+	}
+	evaluate := func(targets int) (Result, *configurableRedirectOracle, error) {
+		ro := &configurableRedirectOracle{}
+		result, err := evalRedirectScript(t, script(targets), ro, 100)
+		return result, ro, err
+	}
+
+	result, ro, err := evaluate(MaxFileintoTargets)
+	if err != nil {
+		t.Fatalf("%d targets: %v", MaxFileintoTargets, err)
+	}
+	if len(result.Mailboxes) != MaxFileintoTargets || ro.recordedN != 1 {
+		t.Errorf("%d targets: filed into %d, charged %d redirects, want %d and 1", MaxFileintoTargets, len(result.Mailboxes), ro.recordedN, MaxFileintoTargets)
+	}
+
+	result, ro, err = evaluate(MaxFileintoTargets + 1)
+	if err == nil {
+		t.Fatalf("%d targets: no error, result %s into %d mailboxes", MaxFileintoTargets+1, result.Action, len(result.Mailboxes))
+	}
+	if result.Action != ActionKeep || len(result.Mailboxes) != 0 || len(result.RedirectTo) != 0 {
+		t.Errorf("%d targets: result %+v, want a plain keep", MaxFileintoTargets+1, result)
+	}
+	if ro.recordedN != 0 {
+		t.Errorf("%d targets: %d redirects charged, want none", MaxFileintoTargets+1, ro.recordedN)
 	}
 }
