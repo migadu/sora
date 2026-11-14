@@ -119,8 +119,8 @@ func truncateHash(hash string) string {
 // destAccountID's S3 path, where the caller must first have made the body available (its
 // object, or the staging file of the upload restagePendingUploads queues). sourceHashes
 // holds, by source UID, the content hash each such row had when the caller did so, and
-// the row is copied only if it still has it: sora-admin import rekey renames a body's hash
-// (RekeyContentHash) under no lock the copy takes, and a copy under the new hash would
+// the row is copied only if it still has it: sora-admin import rekey can rename a body's
+// hash before this copy takes its source-account lock, and a copy under the new hash would
 // point at a key nothing wrote. A renamed source fails the copy with ErrCopySourceChanged
 // before anything commits. The check is made by the INSERT, the statement that copies the
 // rows' hashes; once inserted, a copy keeps its hash whatever happens to the source.
