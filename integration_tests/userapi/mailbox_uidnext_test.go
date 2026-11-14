@@ -122,3 +122,58 @@ func TestUserAPI_MailboxListReportsUIDNext(t *testing.T) {
 		t.Errorf("after a delivery, INBOX uid_next = %d, want %d", got, latest+1)
 	}
 }
+
+// TestUserAPI_MailboxListRepairsNegativeUnseen: the listing reads its counts from the
+// mailbox_stats cache, as IMAP STATUS does. unseen_count in that cache has drifted below
+// zero before (concurrent flag and expunge races), and STATUS and LIST-STATUS recompute it
+// from message_state when they see a negative value. The listing must do the same rather
+// than answer "unseen": -3.
+func TestUserAPI_MailboxListRepairsNegativeUnseen(t *testing.T) {
+	h := newBodyStateHarness(t)
+	ctx := context.Background()
+
+	for n := 1; n <= 2; n++ {
+		now := time.Now()
+		hash := fmt.Sprintf("%016x%047x%d", now.UnixNano(), 0, n)
+		if _, _, err := h.rdb.InsertMessageWithRetry(ctx, &db.InsertMessageOptions{
+			AccountID: h.accountID, MailboxID: h.inbox.ID, MailboxName: "INBOX",
+			S3Domain: "example.com", S3Localpart: "user", ContentHash: hash,
+			MessageID: fmt.Sprintf("<unseen-%d-%d@example.com>", now.UnixNano(), n), Flags: []imap.Flag{},
+			InternalDate: now, Size: 64, Subject: "unseen", SentDate: now,
+		}, db.PendingUpload{AccountID: h.accountID, ContentHash: hash, InstanceID: "this-node", Size: 64, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("insert message %d: %v", n, err)
+		}
+	}
+	h.exec(t, `UPDATE mailbox_stats SET unseen_count = -3 WHERE mailbox_id = $1`, h.inbox.ID)
+
+	resp := h.tc.makeRequest(t, "GET", "/user/mailboxes", nil)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("list mailboxes: status %d", resp.StatusCode)
+	}
+	var out struct {
+		Mailboxes []listedMailbox `json:"mailboxes"`
+	}
+	parseJSON(t, resp, &out)
+	found := false
+	for _, mb := range out.Mailboxes {
+		if mb.Name == "INBOX" {
+			found = true
+			if mb.Unseen != 2 {
+				t.Errorf("INBOX unseen = %d with the cache at -3, want 2 (recomputed from message_state)", mb.Unseen)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("INBOX missing from listing: %+v", out.Mailboxes)
+	}
+
+	var cached int
+	if err := h.rdb.GetOperationalDatabase().GetWritePool().QueryRow(ctx,
+		`SELECT unseen_count FROM mailbox_stats WHERE mailbox_id = $1`, h.inbox.ID).Scan(&cached); err != nil {
+		t.Fatal(err)
+	}
+	if cached != 2 {
+		t.Errorf("mailbox_stats.unseen_count = %d after the listing, want it repaired to 2", cached)
+	}
+}
