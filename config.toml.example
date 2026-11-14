@@ -1568,8 +1568,8 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # (no email, no token, a malformed body), which reach no account, to the default pool,
 # else to the first pool in this file's order with a backend available. Give the
 # http_user_api backends of every pool the same allowed_origins. A refresh whose token
-# the proxy refuses (expired, or not signed with its jwt_secret) is answered 401 by the
-# proxy and sent to no pool.
+# the proxy refuses (expired, invalidly signed, or lacking usable account identity) is
+# answered 401 by the proxy and sent to no pool.
 #
 # A backend in maintenance (see BACKEND MAINTENANCE) is skipped inside its pool. A user
 # the API pins with "server" to a backend in maintenance is routed among the other

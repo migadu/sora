@@ -134,6 +134,9 @@ func TestUserAPIProxy_AuthRequestNamingNobodyIsAnsweredAsTheBackendAnswersIt(t *
 				if got, want := viaProxy.Header().Get("Content-Type"), direct.Header().Get("Content-Type"); got != want {
 					t.Errorf("proxy's Content-Type = %q, want the backend's %q", got, want)
 				}
+				if got := viaProxy.Header().Get("WWW-Authenticate"); got != "" {
+					t.Errorf("JSON authentication endpoint must not advertise a Bearer-header gate: %q", got)
+				}
 				var got, want map[string]any
 				if err := json.Unmarshal(direct.Body.Bytes(), &want); err != nil {
 					t.Fatalf("backend's body %q: %v", direct.Body.String(), err)
@@ -152,6 +155,81 @@ func TestUserAPIProxy_AuthRequestNamingNobodyIsAnsweredAsTheBackendAnswersIt(t *
 		}
 		if asked := lookup.asked(); len(asked) != 0 {
 			t.Errorf("%s: the routing lookup was asked for %v", config.name, asked)
+		}
+	}
+}
+
+func TestUserAPIProxy_RefreshWithoutAccountIdentityIsRefusedOnWire(t *testing.T) {
+	_, addr, hits := countingBackend(t)
+	const origin = "https://mail.example.com"
+	for _, config := range []struct {
+		name string
+		opts ServerOptions
+	}{
+		{"named pool without default", ServerOptions{Pools: []proxy.PoolSpec{{Name: "sora0", Backends: []string{addr}}}}},
+		{"named default pool", ServerOptions{Pools: []proxy.PoolSpec{{Name: "sora0", Backends: []string{addr}, Default: true}}}},
+		{"remote_addrs", ServerOptions{RemoteAddrs: []string{addr}}},
+	} {
+		config.opts.AllowedOrigins = []string{origin}
+		handler, lookup := newNamelessAuthProxy(t, config.opts)
+		front := httptest.NewServer(handler)
+		t.Cleanup(front.Close)
+		for _, identity := range []struct {
+			name, email string
+			id          int64
+		}{
+			{"zero account", "user@example.com", 0},
+			{"negative account", "user@example.com", -1},
+			{"missing email", "", 42},
+			{"blank email", " \t ", 42},
+		} {
+			t.Run(config.name+"/"+identity.name, func(t *testing.T) {
+				token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, JWTClaims{
+					Email: identity.email, AccountID: identity.id,
+					RegisteredClaims: jwt.RegisteredClaims{ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour))},
+				}).SignedString([]byte(corsTestSecret))
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, err := json.Marshal(map[string]string{"token": token})
+				if err != nil {
+					t.Fatal(err)
+				}
+				r, err := http.NewRequest(http.MethodPost, front.URL+"/user/auth/refresh", strings.NewReader(string(body)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				r.Header.Set("Content-Type", "application/json")
+				r.Header.Set("Origin", origin)
+				before := hits.Load()
+				resp, err := front.Client().Do(r)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer resp.Body.Close()
+				var result map[string]string
+				if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+					t.Fatal(err)
+				}
+				if resp.StatusCode != http.StatusUnauthorized || result["error"] != "Invalid or expired token" {
+					t.Errorf("refused identity: status=%d body=%v", resp.StatusCode, result)
+				}
+				if got := resp.Header.Get("WWW-Authenticate"); got != "" {
+					t.Errorf("JSON refresh got Bearer challenge %q", got)
+				}
+				if got := resp.Header.Get("Access-Control-Allow-Origin"); got != origin {
+					t.Errorf("CORS origin=%q", got)
+				}
+				if got := resp.Header.Get("Content-Type"); got != "application/json" {
+					t.Errorf("Content-Type=%q", got)
+				}
+				if delta := hits.Load() - before; delta != 0 {
+					t.Errorf("refused refresh reached backend %d times", delta)
+				}
+			})
+		}
+		if asked := lookup.asked(); len(asked) != 0 {
+			t.Errorf("refused identity reached routing lookup: %v", asked)
 		}
 	}
 }

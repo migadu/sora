@@ -632,11 +632,11 @@ const maxAuthBodyBytes = 64 << 10
 
 var errAuthBodyTooLarge = errors.New("auth request body too large")
 
-// errRefreshTokenRefused is a refresh whose token the proxy refuses (expired, or not
-// signed with its jwt_secret). It is answered 401, as a backend answers it, and never
+// errRefreshTokenRefused is a refresh whose token the proxy refuses (invalid, expired,
+// or lacking usable account identity). It is answered 401 and never
 // forwarded: a backend whose clock is behind the proxy's could accept the token, and its
-// refresh then reads the token's user from its own pool's database, which need not be the
-// user's (the backends trust the token's account ID).
+// refresh would then look up the token's email in its own pool's database, which need
+// not be the user's pool.
 var errRefreshTokenRefused = errors.New("refresh token refused")
 
 // routeAuthRequest picks the backend for an unauthenticated auth request.
@@ -697,7 +697,10 @@ func (s *Server) peekAuthIdentity(r *http.Request) (string, int64, error) {
 			return "", 0, fmt.Errorf("%w: %w", errRefreshTokenRefused, err)
 		}
 		if claims.AccountID <= 0 {
-			return "", 0, fmt.Errorf("refresh token has no valid account ID")
+			return "", 0, fmt.Errorf("%w: refresh token has no valid account ID", errRefreshTokenRefused)
+		}
+		if strings.TrimSpace(claims.Email) == "" {
+			return "", 0, fmt.Errorf("%w: refresh token has no usable email", errRefreshTokenRefused)
 		}
 		return claims.Email, claims.AccountID, nil
 	}
