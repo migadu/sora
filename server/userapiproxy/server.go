@@ -568,7 +568,7 @@ func (s *Server) setupHandler() http.Handler {
 
 // writeError answers r with an error the proxy writes itself, no backend having answered.
 // The body is the User API's error, {"error": msg} as application/json (the backend's
-// writeError, docs/user-api.md "Error Response Format"), so a client reads it as it reads
+// writeError, docs/USER_API.md section 4, "Requests, responses and errors"), so a client reads it as it reads
 // the backend's. It carries the CORS headers of the proxy's allowed_origins, as the
 // backend's own errors carry the backend's: without them a browser hands the page a
 // network error instead of the status, and a web client cannot tell an expired token from
