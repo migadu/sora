@@ -80,6 +80,7 @@ type resilientDB interface {
 	DeleteMessageByHashAndMailboxWithRetry(ctx context.Context, accountID, mailboxID int64, hash string) (int64, error)
 	BeginTxWithRetry(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error)
 	GetOperationalDatabase() *db.Database
+	ExecuteWithSharedS3ObjectLocks(ctx context.Context, accountID int64, contentHashes []string, executionFunc func(ctx context.Context) error) error
 }
 
 // msgInfo represents a message to import (used for batching)
@@ -95,7 +96,8 @@ type msgInfo struct {
 	imported bool
 }
 
-// uploadedMsg represents a successfully uploaded message
+// uploadedMsg is a message read and parsed from the maildir, on its way to S3 and the
+// database.
 type uploadedMsg struct {
 	msg      msgInfo
 	content  []byte
@@ -1906,15 +1908,17 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 	}, nil
 }
 
-// uploadBatchToS3 uploads messages to S3 in parallel using a worker pool
-func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
+// readBatch reads and parses the batch's files in parallel using a worker pool. It
+// writes nothing: the hash a body is stored under is final only once its bytes are
+// read, and processBatch locks the bodies by those hashes before it writes any.
+func (i *Importer) readBatch(batch []msgInfo) []uploadedMsg {
 	var (
-		uploaded []uploadedMsg
-		mu       sync.Mutex
-		wg       sync.WaitGroup
+		read []uploadedMsg
+		mu   sync.Mutex
+		wg   sync.WaitGroup
 	)
 
-	// Use semaphore to limit concurrent uploads
+	// Use semaphore to limit concurrent reads
 	sem := make(chan struct{}, i.jobs) // Reuse jobs config
 
 	for _, msg := range batch {
@@ -2018,43 +2022,8 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 				return
 			}
 
-			// Check for cancellation before S3 upload
-			select {
-			case <-i.ctx.Done():
-				return
-			default:
-			}
-
-			// Upload to S3 (FileBasedS3Mock now has proper locking for directory creation)
-			if !i.options.TestMode && i.s3 != nil {
-				s3Key := helpers.NewS3Key(metadata.domain, metadata.localpart, msg.hash)
-
-				var s3Err error
-				maxRetries := 3
-				backoff := 500 * time.Millisecond
-				for attempt := 1; attempt <= maxRetries; attempt++ {
-					if attempt > 1 {
-						time.Sleep(backoff)
-						backoff *= 2
-						logger.Info("Retrying S3 upload", "path", msg.path, "attempt", attempt)
-					}
-					s3Err = i.s3.Put(s3Key, bytes.NewReader(content), int64(len(content)))
-					if s3Err == nil {
-						break
-					}
-				}
-
-				if s3Err != nil {
-					logger.Warn("S3 upload failed after retries", "path", msg.path, "error", s3Err)
-					i.recordFailedPath(msg.path, fmt.Sprintf("s3 upload error: %v", s3Err))
-					atomic.AddInt64(&i.failedMessages, 1)
-					return
-				}
-			}
-
-			// Success - add to uploaded list
 			mu.Lock()
-			uploaded = append(uploaded, uploadedMsg{
+			read = append(read, uploadedMsg{
 				msg:      msg,
 				content:  content,
 				metadata: metadata,
@@ -2064,19 +2033,85 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 	}
 
 	wg.Wait()
+	return read
+}
+
+// uploadBatchToS3 uploads the read messages to S3 in parallel using a worker pool and
+// returns the ones stored (in test mode, which stores nothing, all of them). It runs
+// under the bodies' S3 object locks, and ctx is cancelled if they are lost.
+func (i *Importer) uploadBatchToS3(ctx context.Context, read []uploadedMsg) []uploadedMsg {
+	var (
+		uploaded []uploadedMsg
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+	)
+
+	// Use semaphore to limit concurrent uploads
+	sem := make(chan struct{}, i.jobs) // Reuse jobs config
+
+	for _, up := range read {
+		wg.Add(1)
+		sem <- struct{}{} // Acquire
+
+		go func(up uploadedMsg) {
+			defer wg.Done()
+			defer func() { <-sem }() // Release
+
+			// Check for cancellation before S3 upload
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			// Upload to S3 (FileBasedS3Mock now has proper locking for directory creation)
+			if !i.options.TestMode && i.s3 != nil {
+				s3Key := helpers.NewS3Key(up.metadata.domain, up.metadata.localpart, up.msg.hash)
+
+				var s3Err error
+				maxRetries := 3
+				backoff := 500 * time.Millisecond
+				for attempt := 1; attempt <= maxRetries; attempt++ {
+					if attempt > 1 {
+						time.Sleep(backoff)
+						backoff *= 2
+						logger.Info("Retrying S3 upload", "path", up.msg.path, "attempt", attempt)
+					}
+					s3Err = i.s3.Put(s3Key, bytes.NewReader(up.content), int64(len(up.content)))
+					if s3Err == nil {
+						break
+					}
+				}
+
+				if s3Err != nil {
+					logger.Warn("S3 upload failed after retries", "path", up.msg.path, "error", s3Err)
+					i.recordFailedPath(up.msg.path, fmt.Sprintf("s3 upload error: %v", s3Err))
+					atomic.AddInt64(&i.failedMessages, 1)
+					return
+				}
+			}
+
+			// Success - add to uploaded list
+			mu.Lock()
+			uploaded = append(uploaded, up)
+			mu.Unlock()
+		}(up)
+	}
+
+	wg.Wait()
 	return uploaded
 }
 
 // insertBatchToDB inserts all uploaded messages in a batch
 // It groups messages by mailbox and uses the highly-optimized InsertMessagesFromImporterBatchWithRetry
-func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, error) {
+func (i *Importer) insertBatchToDB(ctx context.Context, uploaded []uploadedMsg) ([]markedMessage, error) {
 	// Get user info once
 	address, err := server.NewAddress(i.email)
 	if err != nil {
 		return nil, fmt.Errorf("invalid email address format: %w", err)
 	}
 
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
+	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 	if err != nil {
 		return nil, fmt.Errorf("account not found: %w", err)
 	}
@@ -2095,7 +2130,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 
 	for _, up := range uploaded {
 		// Get/create mailbox (cached)
-		mailbox, err := i.getOrCreateMailbox(i.ctx, user.AccountID(), up.msg.mailbox)
+		mailbox, err := i.getOrCreateMailbox(ctx, user.AccountID(), up.msg.mailbox)
 		if err != nil {
 			logger.Error("Failed to get or create mailbox", "mailbox", up.msg.mailbox, "error", err)
 			i.recordFailedPath(up.msg.path, fmt.Sprintf("mailbox error: %v", err))
@@ -2147,7 +2182,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 				opts = append(opts, gm.opt)
 			}
 
-			_, _, insertedHashesBatch, err := i.rdb.InsertMessagesFromImporterBatchWithRetry(i.ctx, opts)
+			_, _, insertedHashesBatch, err := i.rdb.InsertMessagesFromImporterBatchWithRetry(ctx, opts)
 			if err != nil {
 				{
 					// The batch failed as a whole — a unique violation the dedup did not
@@ -2158,7 +2193,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 					// by path instead of writing off the chunk.
 					logger.Info("Batch insert failed, falling back to individual inserts", "mailbox_id", opts[0].MailboxID, "chunk_size", len(chunk), "error", err)
 					for _, gm := range chunk {
-						_, _, indErr := i.rdb.InsertMessageFromImporterWithRetry(i.ctx, gm.opt)
+						_, _, indErr := i.rdb.InsertMessageFromImporterWithRetry(ctx, gm.opt)
 						if indErr != nil {
 							if errors.Is(indErr, consts.ErrUIDConflict) {
 								// The preserved UID is already taken in the target mailbox: the
@@ -2202,14 +2237,14 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 
 // insertBatchToDBWithTransaction inserts all uploaded messages in a SINGLE transaction
 // This is faster (20x) but less resilient - if one message fails, entire batch rolls back
-func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]markedMessage, error) {
+func (i *Importer) insertBatchToDBWithTransaction(ctx context.Context, uploaded []uploadedMsg) ([]markedMessage, error) {
 	// Get user info once
 	address, err := server.NewAddress(i.email)
 	if err != nil {
 		return nil, fmt.Errorf("invalid email address format: %w", err)
 	}
 
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
+	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 	if err != nil {
 		return nil, fmt.Errorf("account not found: %w", err)
 	}
@@ -2218,7 +2253,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 	var successHashes []markedMessage
 
 	// Begin a single transaction for the entire batch
-	tx, err := i.rdb.BeginTxWithRetry(i.ctx, pgx.TxOptions{})
+	tx, err := i.rdb.BeginTxWithRetry(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -2236,13 +2271,13 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 	// Process all messages in this single transaction
 	for _, up := range uploaded {
 		// Get/create mailbox (cached)
-		mailbox, err := i.getOrCreateMailbox(i.ctx, user.AccountID(), up.msg.mailbox)
+		mailbox, err := i.getOrCreateMailbox(ctx, user.AccountID(), up.msg.mailbox)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get or create mailbox '%s': %w", up.msg.mailbox, err)
 		}
 
 		// Insert using the transaction handle (no retry wrapper - transaction handles atomicity)
-		_, _, err = database.InsertMessageFromImporter(i.ctx, tx, &db.InsertMessageOptions{
+		_, _, err = database.InsertMessageFromImporter(ctx, tx, &db.InsertMessageOptions{
 			AccountID:            user.AccountID(),
 			MailboxID:            mailbox.ID,
 			S3Domain:             address.Domain(),
@@ -2295,7 +2330,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 	}
 
 	// Commit the PostgreSQL transaction first
-	if err := tx.Commit(i.ctx); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("failed to commit batch transaction: %w", err)
 	}
 
@@ -2465,14 +2500,73 @@ func (i *Importer) markBatchInSQLite(marked []markedMessage) error {
 	}
 }
 
-// processBatch processes a batch of messages with sequential S3 uploads
-// and transactional DB inserts
+// processBatch reads a batch of messages, uploads their bodies to S3 and inserts their
+// rows.
+//
+// The upload and the inserts run under the bodies' S3 object locks, held in shared mode
+// (ExecuteWithSharedS3ObjectLocks). The cleaner, the account purge and `import rekey`
+// delete a body only under the same lock, after a re-check that nothing references it.
+// Holding it from before the upload until the rows commit means that such a delete either
+// sees the rows and leaves the body be, or is over before the upload writes the body
+// again; a delete whose re-check ran before the rows committed would otherwise remove the
+// body under rows marked uploaded.
 func (i *Importer) processBatch(batch []msgInfo) error {
 	logger.Info("Processing batch", "size", len(batch),
 		"progress", i.getProgressPrefix())
 
-	// Phase 1: Sequential S3 uploads (no DB state modified yet)
-	uploaded := i.uploadBatchToS3(batch)
+	// Phase 1: Read and parse the files (nothing is written yet)
+	read := i.readBatch(batch)
+	if len(read) == 0 {
+		logger.Warn("No message in batch could be read")
+		atomic.AddInt64(&i.failedMessages, int64(len(batch)))
+		return nil
+	}
+
+	stored, err := i.withBodiesLocked(read, func(ctx context.Context) error {
+		return i.storeBatch(ctx, batch, read)
+	})
+	if err != nil && !stored {
+		// Nothing of the batch was stored.
+		logger.Error("Batch not stored", "error", err)
+		for _, up := range read {
+			i.recordFailedPath(up.msg.path, err.Error())
+		}
+		atomic.AddInt64(&i.failedMessages, int64(len(read)))
+	}
+	return err
+}
+
+// withBodiesLocked runs fn while the S3 object locks of read's bodies are held in shared
+// mode (see processBatch), and reports whether fn ran. When it did not, nothing was
+// stored.
+func (i *Importer) withBodiesLocked(read []uploadedMsg, fn func(ctx context.Context) error) (ran bool, err error) {
+	address, err := server.NewAddress(i.email)
+	if err != nil {
+		return false, fmt.Errorf("invalid email address format: %w", err)
+	}
+	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
+	if err != nil {
+		return false, fmt.Errorf("account not found: %w", err)
+	}
+	hashes := make([]string, len(read))
+	for k, up := range read {
+		hashes[k] = up.msg.hash
+	}
+	err = i.rdb.ExecuteWithSharedS3ObjectLocks(i.ctx, accountID, hashes, func(ctx context.Context) error {
+		ran = true
+		return fn(ctx)
+	})
+	if err != nil && !ran {
+		return false, fmt.Errorf("failed to lock the message bodies: %w", err)
+	}
+	return ran, err
+}
+
+// storeBatch uploads the read messages' bodies to S3 and inserts their rows, under the
+// bodies' S3 object locks; ctx is cancelled if they are lost.
+func (i *Importer) storeBatch(ctx context.Context, batch []msgInfo, read []uploadedMsg) error {
+	// Phase 2: Parallel S3 uploads (no DB state modified yet)
+	uploaded := i.uploadBatchToS3(ctx, read)
 
 	logger.Info("Upload phase complete", "uploaded", len(uploaded), "batch_size", len(batch))
 
@@ -2484,7 +2578,7 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 
 	logger.Info("Starting DB insert phase", "count", len(uploaded))
 
-	// Phase 2: DB inserts (strategy depends on BatchTransactionMode flag)
+	// Phase 3: DB inserts (strategy depends on BatchTransactionMode flag)
 	var successHashes []markedMessage
 	var err error
 
@@ -2492,12 +2586,12 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 		// Fast path: Single transaction for entire batch (20x faster)
 		// SQLite is updated BEFORE PostgreSQL commit (atomicity guaranteed)
 		logger.Info("Using batch transaction mode")
-		successHashes, err = i.insertBatchToDBWithTransaction(uploaded)
+		successHashes, err = i.insertBatchToDBWithTransaction(ctx, uploaded)
 	} else {
 		// Safe path: Individual transactions per message (more resilient)
 		// Need to update SQLite after since each message commits individually
 		logger.Info("Using individual transaction mode")
-		successHashes, err = i.insertBatchToDB(uploaded)
+		successHashes, err = i.insertBatchToDB(ctx, uploaded)
 		if err != nil {
 			// insertBatchToDB fails only before it stores anything (address or
 			// account lookup), so none of the batch was imported.
@@ -2511,7 +2605,7 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 
 		logger.Info("DB inserts complete, marking in SQLite", "count", len(successHashes))
 
-		// Phase 3: Mark successful messages in SQLite cache
+		// Phase 4: Mark successful messages in SQLite cache
 		// For safe mode, this happens AFTER individual commits
 		if err := i.markBatchInSQLite(successHashes); err != nil {
 			// FATAL: If SQLite update fails, messages will be re-imported

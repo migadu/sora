@@ -475,23 +475,55 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 		}
 	}
 
+	// The body is read, and the row that points at it inserted and marked uploaded, under
+	// the body's S3 object lock, held in shared mode. The cleaner, the account purge and
+	// `import rekey` delete a body only under the same lock, after a re-check that nothing
+	// references it: a delete either sees the row and leaves the body be, or is over
+	// before the read, which then finds the body gone. A delete whose re-check ran before
+	// the row committed would otherwise remove the body under a row marked uploaded.
+	var msgID, uid int64
+	err = si.rdb.ExecuteWithSharedS3ObjectLocks(ctx, user.AccountID(), []string{contentHash}, func(ctx context.Context) (err error) {
+		msgID, uid, err = si.importStoredBody(ctx, obj, address, user, contentHash)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+
+	atomic.AddInt64(&si.importedMessages, 1)
+	logger.Info("Successfully imported message", "progress", si.getProgressPrefix(),
+		"msg_id", msgID, "uid", uid, "user", address.FullAddress())
+
+	si.markObjectProcessed(obj.Key, true, "imported successfully")
+
+	// Add delay if configured
+	if si.options.ImportDelay > 0 {
+		time.Sleep(si.options.ImportDelay)
+	}
+
+	return nil
+}
+
+// importStoredBody reads obj, the stored body of contentHash, and inserts it as a message
+// of user, marked uploaded. The caller holds the body's S3 object lock.
+func (si *S3Importer) importStoredBody(ctx context.Context, obj S3ObjectInfo, address server.Address, user *server.User, contentHash string) (int64, int64, error) {
 	// Download message content from S3
 	reader, err := si.s3.GetWithRetry(ctx, obj.Key)
 	if err != nil {
-		return fmt.Errorf("failed to download from S3: %w", err)
+		return 0, 0, fmt.Errorf("failed to download from S3: %w", err)
 	}
 	defer reader.Close()
 
 	// Read content
 	content, err := io.ReadAll(reader)
 	if err != nil {
-		return fmt.Errorf("failed to read S3 content: %w", err)
+		return 0, 0, fmt.Errorf("failed to read S3 content: %w", err)
 	}
 
 	// Parse message
 	messageContent, err := server.ParseMessage(bytes.NewReader(content))
 	if err != nil {
-		return fmt.Errorf("failed to parse message: %w", err)
+		return 0, 0, fmt.Errorf("failed to parse message: %w", err)
 	}
 
 	mailHeader := mail.Header{Header: messageContent.Header}
@@ -538,7 +570,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	// Default mailboxes should already be created at this point
 	mailbox, err := si.rdb.GetMailboxByNameWithRetry(ctx, user.AccountID(), "INBOX")
 	if err != nil {
-		return fmt.Errorf("failed to get INBOX mailbox: %w", err)
+		return 0, 0, fmt.Errorf("failed to get INBOX mailbox: %w", err)
 	}
 
 	// Insert message into database
@@ -571,27 +603,15 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 		})
 
 	if err != nil {
-		return fmt.Errorf("failed to insert message into database: %w", err)
+		return 0, 0, fmt.Errorf("failed to insert message into database: %w", err)
 	}
 
 	// Since the content already exists in S3, mark the upload as complete
 	err = si.rdb.CompleteS3UploadWithRetry(ctx, contentHash, user.AccountID(), []string{helpers.NewS3Key(address.Domain(), address.LocalPart(), contentHash)})
 	if err != nil {
-		return fmt.Errorf("failed to mark S3 upload as complete: %w", err)
+		return 0, 0, fmt.Errorf("failed to mark S3 upload as complete: %w", err)
 	}
-
-	atomic.AddInt64(&si.importedMessages, 1)
-	logger.Info("Successfully imported message", "progress", si.getProgressPrefix(),
-		"msg_id", msgID, "uid", uid, "user", address.FullAddress())
-
-	si.markObjectProcessed(obj.Key, true, "imported successfully")
-
-	// Add delay if configured
-	if si.options.ImportDelay > 0 {
-		time.Sleep(si.options.ImportDelay)
-	}
-
-	return nil
+	return msgID, uid, nil
 }
 
 // markObjectProcessed updates the processing status of an S3 object in the database

@@ -145,6 +145,10 @@ func (m *mockResilientDatabase) GetOperationalDatabase() *db.Database {
 	// For tests, we don't need the actual database
 	return nil
 }
+func (m *mockResilientDatabase) ExecuteWithSharedS3ObjectLocks(ctx context.Context, accountID int64, contentHashes []string, executionFunc func(ctx context.Context) error) error {
+	// No deleter runs against the mock, so there is nothing to wait for.
+	return executionFunc(ctx)
+}
 
 func (m *mockResilientDatabase) resetCounters() {
 	m.mu.Lock()

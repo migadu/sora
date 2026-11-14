@@ -28,6 +28,29 @@ import (
 // than finishing unprotected; a loss noticed only after it returned is reported as an
 // error.
 func (rd *ResilientDatabase) ExecuteWithS3ObjectLock(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error {
+	return rd.executeWithS3ObjectLocks(ctx, func(ctx context.Context, lock *db.AdvisoryLockTx) error {
+		return lock.Lock(ctx, db.GetS3ObjectLockID(accountID, contentHash))
+	}, executionFunc)
+}
+
+// ExecuteWithSharedS3ObjectLocks runs executionFunc while holding accountID's S3 object
+// locks of contentHashes in shared mode (db.LockS3ObjectsSharedInTx). It is for work that
+// writes the objects, or relies on them being stored, and then commits rows that point at
+// them in transactions of its own, as sora-admin's imports do. Every deleter holds the
+// same lock exclusively across its re-check that nothing references the object and its
+// DELETE, so holding it from before the write until the rows commit orders the two: the
+// deleter's re-check sees the rows, or its DELETE is over before the write. Shared holders
+// do not exclude one another. It waits for a deleter for at most 30 seconds; the locks
+// are held, and lost, as in ExecuteWithS3ObjectLock.
+func (rd *ResilientDatabase) ExecuteWithSharedS3ObjectLocks(ctx context.Context, accountID int64, contentHashes []string, executionFunc func(ctx context.Context) error) error {
+	return rd.executeWithS3ObjectLocks(ctx, func(ctx context.Context, lock *db.AdvisoryLockTx) error {
+		return lock.LockS3ObjectsShared(ctx, accountID, contentHashes)
+	}, executionFunc)
+}
+
+// executeWithS3ObjectLocks opens a db.AdvisoryLockTx, takes its locks with acquire, and
+// runs executionFunc while they are held (see ExecuteWithS3ObjectLock).
+func (rd *ResilientDatabase) executeWithS3ObjectLocks(ctx context.Context, acquire func(ctx context.Context, lock *db.AdvisoryLockTx) error, executionFunc func(ctx context.Context) error) error {
 	// Bounds acquiring the connection and waiting for the lock, not executionFunc.
 	lockCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -38,7 +61,7 @@ func (rd *ResilientDatabase) ExecuteWithS3ObjectLock(ctx context.Context, conten
 	}
 	defer lock.Release()
 
-	if err := lock.Lock(lockCtx, db.GetS3ObjectLockID(accountID, contentHash)); err != nil {
+	if err := acquire(lockCtx, lock); err != nil {
 		return err // Could not acquire lock or context was canceled
 	}
 

@@ -47,6 +47,15 @@ func LockS3ObjectsSharedInTx(ctx context.Context, tx pgx.Tx, accountID int64, co
 	return nil
 }
 
+// LockS3ObjectsShared is LockS3ObjectsSharedInTx on the lock transaction, for work that
+// claims the objects across S3 round trips and transactions of its own. Cancel ctx to
+// stop waiting; the transaction is then aborted and must be released.
+func (l *AdvisoryLockTx) LockS3ObjectsShared(ctx context.Context, accountID int64, contentHashes []string) error {
+	return l.run(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		return LockS3ObjectsSharedInTx(ctx, tx, accountID, contentHashes)
+	})
+}
+
 // MoveMessages moves the messages with the given UIDs from srcMailboxID into
 // destMailboxID, owned by destAccountID, within the caller's transaction, and returns a
 // map of old UIDs to new UIDs.
