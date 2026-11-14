@@ -101,3 +101,43 @@ func TestCleanupLockLeavesNoLockTableEntryBehind(t *testing.T) {
 	require.NoError(t, node.ReleaseCleanupLockWithRetry(ctx))
 	require.Equal(t, 0, advisoryLockEntries(t, node, db.CLEANUP_ADVISORY_LOCK_ID))
 }
+
+// One S3 object can be the body of rows of several accounts (a row's key is the address its
+// account had when the row was written), so a holder acting for one account, such as the
+// delete of an old object by import rekey, must keep out a claim made for another, such as a
+// cross-account COPY making the destination object exist (#557).
+func TestS3ObjectLockIsSharedByEveryAccount(t *testing.T) {
+	ctx := context.Background()
+	nodeA := common.SetupTestDatabase(t)
+	nodeB := common.SetupTestDatabase(t)
+	hash := fmt.Sprintf("s3lock-accounts-%d", time.Now().UnixNano())
+
+	release := make(chan struct{})
+	holding := make(chan struct{})
+	held := make(chan error, 1)
+	go func() {
+		held <- nodeA.ExecuteWithS3ObjectLock(ctx, hash, 1001, func(context.Context) error {
+			close(holding)
+			<-release
+			return nil
+		})
+	}()
+	<-holding
+
+	ran := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- nodeB.ExecuteWithS3ObjectLock(ctx, hash, 1002, func(context.Context) error {
+			close(ran)
+			return nil
+		})
+	}()
+	select {
+	case <-ran:
+		t.Error("a holder for another account ran alongside the one holding the body")
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	require.NoError(t, <-held)
+	require.NoError(t, <-done)
+}
