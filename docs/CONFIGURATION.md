@@ -763,7 +763,7 @@ See [SECURITY.md](SECURITY.md).
 |---|---|---|---|---|
 | `max_connections` | integer | `0` (no limit); `1000` on `lmtp` | all but `metrics` | Concurrent connections of this server. On `lmtp`, `0` or less means 1000. |
 | `max_connections_per_ip` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `user_api_proxy` | Concurrent connections from one IP. Hosts in `trusted_networks` are not limited. |
-| `max_connections_per_user` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Logged-in sessions of one user. Enforced on this server by `imap`, `pop3` and `managesieve`. Enforced across the cluster for proxies, which track connections only with `[cluster] enabled = true`. Ignored by `lmtp_proxy` with a warning. |
+| `max_connections_per_user` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Logged-in sessions of one user. Enforced on this server by `imap`, `pop3` and `managesieve`. Enforced across the cluster for proxies, which track connections only with `[cluster] enabled = true`; without it a proxy ignores the key, with a startup warning. Ignored by `lmtp_proxy` with a warning. |
 | `max_connections_per_user_per_ip` | integer | `0` (no limit) | as `max_connections_per_user` | Logged-in sessions of one user from one IP. |
 | `listen_backlog` | integer | `1024` | backends, line proxies | TCP listen backlog. `0` means 1024. |
 
@@ -771,6 +771,8 @@ See [SECURITY.md](SECURITY.md).
 
 Written as a sub-table under the block, `[server.limits]`, or inline as `limits = { ... }`. See
 [SECURITY.md](SECURITY.md), [SEARCH.md](SEARCH.md) and [PROTOCOLS.md](PROTOCOLS.md).
+A key set on a server type not listed under "Applies to" is ignored, with a startup warning that
+names it.
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
