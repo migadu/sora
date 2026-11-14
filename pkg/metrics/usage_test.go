@@ -54,7 +54,8 @@ func metricUses(t *testing.T) (declared []string, uses map[string]map[string]boo
 		}
 		if d.IsDir() {
 			switch d.Name() {
-			case ".git", "vendor", "testdata", "node_modules":
+			case ".git", "vendor", "testdata", "node_modules",
+				"integration_tests", "testutils": // test-only code
 				return filepath.SkipDir
 			}
 			return nil

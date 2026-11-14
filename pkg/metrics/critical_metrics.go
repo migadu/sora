@@ -12,49 +12,24 @@ import (
 
 // Critical operational metrics that are actually needed for production monitoring
 
-// Resource contention metrics - CRITICAL for identifying bottlenecks
+// Session lock contention. Each IMAP, POP3, LMTP and ManageSieve session guards its
+// own state with a lock (server.MutexTimeoutHelper); these time its acquisition.
 var (
-	// Database connection pool saturation
-	DBConnectionPoolWaitTime = promauto.NewHistogram(
+	SessionLockDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "sora_db_connection_pool_wait_seconds",
-			Help:    "Time spent waiting for a database connection from pool",
-			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0},
-		},
-	)
-
-	DBConnectionPoolExhausted = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "sora_db_connection_pool_exhausted_total",
-			Help: "Total number of times connection pool was exhausted",
-		},
-	)
-
-	// Mailbox lock contention
-	MailboxLockWaitTime = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "sora_mailbox_lock_wait_seconds",
-			Help:    "Time spent waiting to acquire mailbox lock",
-			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0},
-		},
-		[]string{"mailbox_type"}, // INBOX, Sent, etc.
-	)
-
-	MailboxLockDuration = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "sora_mailbox_lock_duration_seconds",
-			Help:    "Time spent acquiring mailbox locks",
+			Name:    "sora_session_lock_duration_seconds",
+			Help:    "Time spent acquiring a session's state lock",
 			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0},
 		},
-		[]string{"protocol", "lock_type", "result"}, // protocol: imap/pop3, lock_type: read/write, result: success/timeout
+		[]string{"protocol", "lock_type", "result"}, // protocol: imap/pop3/lmtp/managesieve, lock_type: read/write, result: success/timeout
 	)
 
-	MailboxLockTimeouts = promauto.NewCounterVec(
+	SessionLockTimeouts = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "sora_mailbox_lock_timeouts_total",
-			Help: "Total number of mailbox lock acquisition timeouts",
+			Name: "sora_session_lock_timeouts_total",
+			Help: "Total number of session state lock acquisitions given up",
 		},
-		[]string{"protocol", "lock_type"}, // protocol: imap/pop3, lock_type: read/write
+		[]string{"protocol", "lock_type"}, // protocol: imap/pop3/lmtp/managesieve, lock_type: read/write
 	)
 )
 
@@ -85,9 +60,9 @@ var (
 	StorageRetries = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "sora_storage_retries_total",
-			Help: "Storage operation retry attempts",
+			Help: "S3 operation attempts repeated after a retryable failure",
 		},
-		[]string{"operation"},
+		[]string{"operation"}, // the operation label of sora_s3_operations_total
 	)
 )
 
@@ -108,17 +83,6 @@ var (
 			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0},
 		},
 		[]string{"protocol", "command"},
-	)
-
-	// Command timeout metrics
-	// Note: label names are protocol and reason (reason describes why the timeout occurred,
-	// e.g. "idle", "slow_throughput", "session_max", "tls_on_plain_port").
-	CommandTimeoutsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "sora_command_timeouts_total",
-			Help: "Total number of commands that exceeded timeout threshold",
-		},
-		[]string{"protocol", "reason"},
 	)
 
 	CommandTimeoutThresholdSeconds = promauto.NewGaugeVec(
@@ -188,17 +152,8 @@ var (
 	)
 )
 
-// Slow operations tracker - Only for operations that matter
+// Only track duration for known-slow operations
 var (
-	SlowOperations = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "sora_slow_operations_total",
-			Help: "Operations exceeding latency threshold",
-		},
-		[]string{"operation", "threshold"}, // threshold: "100ms", "1s", "5s"
-	)
-
-	// Only track duration for known-slow operations
 	CriticalOperationDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "sora_critical_operation_duration_seconds",
@@ -218,23 +173,6 @@ var (
 			Help: "Total backend connections attempted by proxy servers",
 		},
 		[]string{"protocol", "result"}, // protocol: imap/lmtp/pop3/managesieve, result: success/failure
-	)
-
-	ProxyRequestsForwarded = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "sora_proxy_requests_forwarded_total",
-			Help: "Total requests forwarded to backend servers",
-		},
-		[]string{"protocol", "result"}, // result: success/failure
-	)
-
-	ProxyBackendLatency = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "sora_proxy_backend_latency_seconds",
-			Help:    "Latency of backend responses through proxy",
-			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0},
-		},
-		[]string{"protocol"},
 	)
 
 	ProxyRoutingMethod = promauto.NewCounterVec(
@@ -268,24 +206,6 @@ var (
 			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0},
 		},
 		[]string{"protocol", "result"}, // protocol: imap/lmtp/pop3/managesieve, result: success/user_not_found/transient_error/shutdown
-	)
-)
-
-// Business metrics - Actually useful for operations
-var (
-	ActiveMailboxes = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "sora_active_mailboxes",
-			Help: "Number of mailboxes with recent activity",
-		},
-	)
-
-	MessageAge = promauto.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "sora_message_age_at_fetch_seconds",
-			Help:    "Age of messages when fetched (indicates how fresh data needs to be)",
-			Buckets: []float64{60, 300, 3600, 86400, 604800}, // 1m, 5m, 1h, 1d, 1w
-		},
 	)
 )
 

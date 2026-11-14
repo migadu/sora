@@ -353,7 +353,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 
 		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(opts.Name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("userapi_proxy", opts.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("User API Proxy: Route lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
@@ -720,16 +720,16 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			// positive_ttl to allow periodic revalidation via remotelookup, so that when
 			// a domain moves backends, active users eventually pick up the new backend.
 			logger.Debug("User API Proxy: Using cached route", "name", s.name, "user", email, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
-			metrics.LookupCacheHitsTotal.Inc()
+			metrics.LookupCacheResults.WithLabelValues("userapi_proxy", "hit").Inc()
 			return s.serverRoute(cached.ServerAddress), nil
 		}
 		if havePool {
-			metrics.LookupCacheHitsTotal.Inc()
+			metrics.LookupCacheResults.WithLabelValues("userapi_proxy", "hit").Inc()
 		} else {
 			if found {
 				logger.Debug("User API Proxy: Cache miss (refused entry)", "name", s.name, "user", email)
 			}
-			metrics.LookupCacheMissesTotal.Inc()
+			metrics.LookupCacheResults.WithLabelValues("userapi_proxy", "miss").Inc()
 		}
 	}
 

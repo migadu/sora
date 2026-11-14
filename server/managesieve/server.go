@@ -241,7 +241,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("managesieve", name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("ManageSieve: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
@@ -467,7 +467,7 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 			logFunc := func(format string, args ...any) {
 				session.InfoLog(format, args...)
 			}
-			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "MANAGESIEVE", logFunc)
+			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "managesieve", logFunc)
 
 			// Log connection with session context (protocol, remote, session id)
 			session.DebugLog("new connection")

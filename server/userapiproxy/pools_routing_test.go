@@ -80,7 +80,7 @@ func TestRouteUser_NamedPoolsRefuseWhatTheLookupDidNotAnswer(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			s, _ := newPoolsMaintenanceServer(t) // sora0 is the default pool
 			withAffinity(t, s)
-			s.lookupCache = lookupcache.New(5*time.Minute, time.Minute, 100, time.Hour, 0)
+			s.lookupCache = lookupcache.New("test", "test", 5*time.Minute, time.Minute, 100, time.Hour, 0)
 			t.Cleanup(func() { _ = s.lookupCache.Stop(context.Background()) })
 			s.routingLookup = c.lookup
 
@@ -117,7 +117,7 @@ func TestRouteUser_UnknownUserNeedsLookupLocalUsers(t *testing.T) {
 	s.lookupLocalUsers = true
 	lookup := notFound()
 	s.routingLookup = lookup
-	s.lookupCache = lookupcache.New(5*time.Minute, time.Minute, 100, time.Hour, 0)
+	s.lookupCache = lookupcache.New("test", "test", 5*time.Minute, time.Minute, 100, time.Hour, 0)
 	t.Cleanup(func() { _ = s.lookupCache.Stop(context.Background()) })
 	for i := 0; i < 3; i++ {
 		got, err := s.routeUser(context.Background(), "local@example.com", 0, true)

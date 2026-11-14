@@ -904,7 +904,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// after negative_ttl to allow retry. Brute force protection is handled
 				// by rate limiting, not by extending cache TTL.
 				s.DebugLog("cache hit - negative entry with same password", "username", username, "age", time.Since(cached.CreatedAt))
-				metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
+				metrics.LookupCacheResults.WithLabelValues("imap_proxy", "hit_negative").Inc()
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 				return consts.ErrAuthenticationFailed
@@ -912,7 +912,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Different password - ALWAYS revalidate (user might have fixed their password)
 				// Brute force protection is handled by protocol-level rate limiting
 				s.DebugLog("cache negative entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt))
-				metrics.CacheOperationsTotal.WithLabelValues("get", "revalidate_negative_different_pw").Inc()
+				metrics.LookupCacheResults.WithLabelValues("imap_proxy", "revalidate_negative_different_pw").Inc()
 				// Fall through to full auth
 			}
 		} else {
@@ -924,7 +924,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// This ensures that when a domain moves backends or password changes,
 				// active users eventually pick up the changes.
 				s.DebugLog("cache hit - using cached auth", "username", username, "account_id", cached.AccountID, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
-				metrics.CacheOperationsTotal.WithLabelValues("get", "hit").Inc()
+				metrics.LookupCacheResults.WithLabelValues("imap_proxy", "hit").Inc()
 
 				s.accountID = cached.AccountID
 				s.isRemoteLookupAccount = cached.FromRemoteLookup
@@ -974,12 +974,12 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Use configured window: revalidate if entry is older than positiveRevalidationWindow
 				if cached.IsOld(s.server.positiveRevalidationWindow) {
 					s.DebugLog("cache positive entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt))
-					metrics.CacheOperationsTotal.WithLabelValues("get", "revalidate_positive_different_pw").Inc()
+					metrics.LookupCacheResults.WithLabelValues("imap_proxy", "revalidate_positive_different_pw").Inc()
 					// Fall through to full auth
 				} else {
 					// Entry is fresh - likely wrong password attempt
 					s.DebugLog("cache hit - wrong password on fresh positive entry", "username", username)
-					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_positive_wrong_pw").Inc()
+					metrics.LookupCacheResults.WithLabelValues("imap_proxy", "hit_positive_wrong_pw").Inc()
 					// Cost what a failed login for an unknown address costs, or the instant
 					// answer shows that this address has an account. (#346)
 					db.DummyVerifyPassword(password)
@@ -991,7 +991,7 @@ func (s *Session) authenticateUser(username, password string) error {
 		}
 	} else {
 		s.DebugLog("cache miss", "username", username)
-		metrics.CacheOperationsTotal.WithLabelValues("get", "miss").Inc()
+		metrics.LookupCacheResults.WithLabelValues("imap_proxy", "miss").Inc()
 	}
 
 	// Parse username to check for master username or token suffix

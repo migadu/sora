@@ -5,44 +5,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
+	"github.com/migadu/sora/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
-
-// gaugeValues returns the value of every series of a gauge family.
-func gaugeValues(t *testing.T, family string) []float64 {
-	t.Helper()
-	mfs, err := prometheus.DefaultGatherer.Gather()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var values []float64
-	for _, mf := range mfs {
-		if mf.GetName() != family {
-			continue
-		}
-		for _, m := range mf.GetMetric() {
-			values = append(values, m.GetGauge().GetValue())
-		}
-	}
-	return values
-}
-
-func hasValue(values []float64, want float64) bool {
-	for _, v := range values {
-		if v == want {
-			return true
-		}
-	}
-	return false
-}
 
 // TestGaugesArePerCache: a node runs one lookup cache per server (IMAP, POP3 and
 // ManageSieve backends, every proxy, the User API). The entries and hit-rate gauges
 // must show each cache's own value, not whichever cache wrote last.
 func TestGaugesArePerCache(t *testing.T) {
-	a := New(time.Hour, time.Hour, 100, time.Hour, time.Minute)
+	a := New("imap_proxy", "gauge-test-a", time.Hour, time.Hour, 100, time.Hour, time.Minute)
 	defer a.Stop(context.Background())
-	b := New(time.Hour, time.Hour, 100, time.Hour, time.Minute)
+	b := New("pop3_proxy", "gauge-test-b", time.Hour, time.Hour, 100, time.Hour, time.Minute)
 	defer b.Stop(context.Background())
 
 	// a: 3 entries, 1 hit in 2 lookups (50%).
@@ -61,12 +34,18 @@ func TestGaugesArePerCache(t *testing.T) {
 	b.Get("srv-b", "nobody@example.com")
 	b.cleanup()
 
-	entries := gaugeValues(t, "sora_lookup_cache_entries_total")
-	if !hasValue(entries, 3) || !hasValue(entries, 1) {
-		t.Errorf("sora_lookup_cache_entries_total series = %v, want one cache at 3 and one at 1", entries)
-	}
-	hitRate := gaugeValues(t, "sora_lookup_cache_hit_rate")
-	if !hasValue(hitRate, 50) || !hasValue(hitRate, 75) {
-		t.Errorf("sora_lookup_cache_hit_rate series = %v, want one cache at 50 and one at 75", hitRate)
+	for _, c := range []struct {
+		protocol, server     string
+		wantEntries, wantHit float64
+	}{
+		{"imap_proxy", "gauge-test-a", 3, 50},
+		{"pop3_proxy", "gauge-test-b", 1, 75},
+	} {
+		if got := testutil.ToFloat64(metrics.LookupCacheEntriesTotal.WithLabelValues(c.protocol, c.server)); got != c.wantEntries {
+			t.Errorf("sora_lookup_cache_entries_total{protocol=%q,server_name=%q} = %v, want %v", c.protocol, c.server, got, c.wantEntries)
+		}
+		if got := testutil.ToFloat64(metrics.LookupCacheHitRate.WithLabelValues(c.protocol, c.server)); got != c.wantHit {
+			t.Errorf("sora_lookup_cache_hit_rate{protocol=%q,server_name=%q} = %v, want %v", c.protocol, c.server, got, c.wantHit)
+		}
 	}
 }

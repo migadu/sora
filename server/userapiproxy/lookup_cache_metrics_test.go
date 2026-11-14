@@ -46,7 +46,7 @@ func counterValue(t *testing.T, family string, labels map[string]string) float64
 // to sora_lookup_cache_results_total{protocol="userapi_proxy"} instead.
 func TestRouteUser_LookupCacheReadCountedOnce(t *testing.T) {
 	s, _ := newPoolsMaintenanceServer(t)
-	s.lookupCache = lookupcache.New(5*time.Minute, time.Minute, 100, time.Hour, 0)
+	s.lookupCache = lookupcache.New("test", "test", 5*time.Minute, time.Minute, 100, time.Hour, 0)
 	t.Cleanup(func() { _ = s.lookupCache.Stop(context.Background()) })
 	s.routingLookup = poolAnswer("sora1")
 
