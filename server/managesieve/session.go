@@ -107,6 +107,10 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 	var accountID int64
 	var impersonating bool
 	var targetAddress *server.Address
+	// gated: the progressive delay and the rate-limit check have already run for this
+	// login under the key regular authentication uses (a master SASL self-login handed
+	// on to it), so they do not run a second time there.
+	var gated bool
 
 	// One copy of the master SASL settings for the whole login, however a config
 	// reload replaces them meanwhile.
@@ -233,19 +237,28 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 	// authorization identity IS the impersonation target. A submission without one
 	// cannot be a master login, so it is not answered from here at all — see the
 	// no-authorization-identity note below.
-	// The trailing clause excludes one case: a WRONG master password on a submission whose
-	// authorization identity equals its authentication identity. RFC 4616 defines
-	// authzid == authcid as "no impersonation", and several SASL libraries fill the field
-	// in unconditionally, so for an account whose address happens to be the master SASL
-	// username that shape is an ordinary login — refusing it here would reject the
-	// account's own password forever. It falls through to regular authentication, which
-	// records its own failure under the same key and answers errAuthFailed, so a
-	// master-password guess dressed up as a self-login is still metered and is answered
-	// exactly like the CORRECT master password, which keeps entering the block whatever the
-	// target (what the proxy flow relies on) and fails there when the target does not parse.
+	// A self-login (authorization identity = authentication identity) is handed on to
+	// regular authentication unless it logs in here. RFC 4616 defines authzid == authcid
+	// as "no impersonation", and several SASL libraries fill the field in unconditionally,
+	// so for an account whose address happens to be the master SASL username that shape
+	// is an ordinary login. Refusing a WRONG master password here would reject the
+	// account's own password forever; it skips this block (the trailing clause), and
+	// regular authentication records its own failure under the same key and answers
+	// errAuthFailed, so a master-password guess dressed up as a self-login is still
+	// metered. The CORRECT master password logs in here only from a peer
+	// master_sasl_allowed_networks admits and only as an account that exists (the proxy
+	// flow for that account): a gate refusal skips this block, and a target that does not
+	// exist is handed on after the lookup. Regular authentication verifies a password even
+	// for an unknown address, so refusing the master SASL password here without one let
+	// the response time confirm a guessed master SASL password. The gate refusal is logged
+	// but not recorded (no limiter is passed): regular authentication records the attempt.
+	// A target that does not parse is refused below exactly as regular authentication
+	// refuses that username.
+	selfLogin := authzID == authnID
 	if !impersonating && authzID != "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
 		checkMasterCredential(authnID, settings.masterSASLUsername) &&
-		(checkMasterCredential(password, settings.masterSASLPassword) || authzID != authnID) {
+		(!selfLogin || (checkMasterCredential(password, settings.masterSASLPassword) &&
+			s.AdmitMasterLogin(ctx, settings.masterSASLGate, nil, s.conn, s.proxyInfo(), server.AuthRateLimitKey(authnID), "master SASL self-login"))) {
 		netConn := s.conn
 		proxyInfo := s.proxyInfo()
 		// The master SASL username is not an address, so it keeps a stable
@@ -308,16 +321,21 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 				s.WarnLog("impersonation target lookup unavailable", "target_user", authzID, "error", err)
 				return errTryLater
 			}
-			// Same reply and same accounting as a bad credential (see above).
 			s.WarnLog("impersonation target rejected (account not found)", "target_user", authzID, "error", err)
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+			if !selfLogin {
+				// Same reply and same accounting as a bad credential (see above).
+				if s.server.authLimiter != nil {
+					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+				}
+				return errAuthFailed
 			}
-			return errAuthFailed
+			// A self-login: answered by regular authentication below (see above),
+			// already gated here.
+			gated = true
+		} else {
+			targetAddress = &address
+			impersonating = true
 		}
-
-		targetAddress = &address
-		impersonating = true
 	}
 
 	// Master SASL credentials submitted WITHOUT an authorization identity. There is
@@ -359,18 +377,20 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		// (IP-wide) counter up at full connection rate and hold it there, with the block
 		// it earns never applied to it. IMAP and POP3 order these the same way.
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-SASL"); err != nil {
-			if errors.Is(err, server.ErrDelayQueueFull) {
-				// Delay queue full - reject immediately to prevent goroutine exhaustion
-				s.InfoLog("delay queue full, rejecting connection")
-				return errDelayQueueFul
+		if !gated {
+			if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-SASL"); err != nil {
+				if errors.Is(err, server.ErrDelayQueueFull) {
+					// Delay queue full - reject immediately to prevent goroutine exhaustion
+					s.InfoLog("delay queue full, rejecting connection")
+					return errDelayQueueFul
+				}
+				// Context cancelled or other error - close connection
+				return errAuthFailedClose
 			}
-			// Context cancelled or other error - close connection
-			return errAuthFailedClose
 		}
 
 		// Check authentication rate limiting after delay
-		if s.server.authLimiter != nil {
+		if s.server.authLimiter != nil && !gated {
 			if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, authKey); err != nil {
 				s.DebugLog("rate limited", "error", err)
 				// Same response as a bad-credential failure so the rate-limit
