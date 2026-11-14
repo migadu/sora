@@ -400,6 +400,8 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 		StrictSessionErrors: true, // Session errors are *managesieveserver.Error; mask anything else (DB error text must not reach clients)
 		NewSession: func(c *managesieveserver.Conn) (managesieveserver.Session, error) {
 			netConn := c.NetConn()
+			endInitialization := s.sessions.GuardInitialization(s.appCtx, netConn)
+			defer endInitialization()
 			proxyInfo := serverPkg.GetProxyProtocolInfo(netConn)
 			clientIP, proxyIP := serverPkg.GetConnectionIPs(netConn, proxyInfo)
 
@@ -633,6 +635,7 @@ func (s *ManageSieveServer) SetConnTracker(tracker *serverPkg.ConnectionTracker)
 }
 
 func (s *ManageSieveServer) Close() {
+	s.sessions.BeginDrain()
 	// Unregister rate limiter from global registry
 	serverPkg.UnregisterRateLimiter("managesieve", s.name)
 

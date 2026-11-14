@@ -415,6 +415,8 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 		StrictSessionErrors:             true, // Session errors are *managesieveserver.Error; mask anything else
 		NewSession: func(c *managesieveserver.Conn) (managesieveserver.Session, error) {
 			netConn := c.NetConn()
+			endInitialization := s.sessions.GuardInitialization(s.ctx, netConn)
+			defer endInitialization()
 			proxyInfo := server.GetProxyProtocolInfo(netConn)
 
 			var releaseConn func()
@@ -650,6 +652,7 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 
 // Stop stops the ManageSieve proxy server.
 func (s *Server) Stop() error {
+	s.sessions.BeginDrain()
 	logger.Debug("ManageSieve Proxy: Stopping", "name", s.name)
 
 	// Unregister rate limiter from global registry

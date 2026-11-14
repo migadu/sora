@@ -470,6 +470,8 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 		SuppressedCaps:                  suppressedCaps,
 		NewSession: func(c *pop3server.Conn) (pop3server.Session, error) {
 			netConn := c.NetConn()
+			endInitialization := s.sessions.GuardInitialization(s.appCtx, netConn)
+			defer endInitialization()
 			proxyInfo := server.GetProxyProtocolInfo(netConn)
 
 			var releaseConn func()
@@ -689,6 +691,7 @@ func (s *POP3ProxyServer) GetConnectionManager() *proxy.ConnectionManager {
 }
 
 func (s *POP3ProxyServer) Stop() error {
+	s.sessions.BeginDrain()
 	logger.Debug("POP3 Proxy: Stopping", "proxy", s.name)
 
 	// Unregister rate limiter from global registry

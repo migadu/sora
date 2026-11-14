@@ -890,6 +890,21 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 }
 
 func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+	// Count accepted work before TLS: shutdown must also drain handshakes.
+	// Transfer the registration to IMAPSession.Close only after initialization.
+	if !s.sessions.Add() {
+		return nil, nil, &imap.Error{
+			Type: imap.StatusResponseTypeBye,
+			Text: "Server shutting down, please reconnect",
+		}
+	}
+	initialized := false
+	defer func() {
+		if !initialized {
+			s.sessions.Done()
+		}
+	}()
+
 	// Complete the deferred TLS handshake here, in go-imap's per-connection
 	// goroutine — NOT in the accept loop, where one slow TLS client would
 	// serialize behind the handshake deadline and stall every other client.
@@ -909,16 +924,6 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		return nil, nil, &imap.Error{
 			Type: imap.StatusResponseTypeBye,
 			Text: "TLS handshake failed",
-		}
-	}
-
-	// Count the session for Close's drain; the session's Close counts it out.
-	// go-imap's Close does not wait for connection goroutines, so this can
-	// run after the drain began, which no longer waits for new sessions.
-	if !s.sessions.Add() {
-		return nil, nil, &imap.Error{
-			Type: imap.StatusResponseTypeBye,
-			Text: "Server shutting down, please reconnect",
 		}
 	}
 
@@ -1044,6 +1049,9 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 
 	// Track active connection for graceful shutdown
 	s.trackConnection(conn)
+	if s.sessions.IsDraining() {
+		serverPkg.RawConn(conn.NetConn()).Close()
+	}
 
 	// Log proxy session ID if present for end-to-end tracing
 	if proxyInfo != nil && proxyInfo.ProxySessionID != "" {
@@ -1055,6 +1063,7 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	// Wrap the session so every IMAP command records throughput/latency metrics
 	// in one place (see metered.go). The wrapper embeds *IMAPSession, so all
 	// optional extension interfaces remain satisfied.
+	initialized = true
 	return newMeteredSession(session), greeting, nil
 }
 
@@ -1198,6 +1207,7 @@ func (s *IMAPServer) SetConnTracker(tracker *serverPkg.ConnectionTracker) {
 }
 
 func (s *IMAPServer) Close() {
+	s.sessions.BeginDrain()
 	s.preview.close()
 
 	// Unregister rate limiter from global registry

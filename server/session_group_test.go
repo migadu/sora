@@ -1,11 +1,61 @@
 package server
 
 import (
+	"context"
+	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// A session can finish initialization after shutdown already took its active
+// snapshot, but before cancellation runs its socket-close callback. The handoff
+// must still close that connection rather than canceling its only closer.
+func TestSessionGroupInitializationAfterDrainClosesConnection(t *testing.T) {
+	var g SessionGroup
+	accepted, peer := net.Pipe()
+	defer accepted.Close()
+	defer peer.Close()
+	endInitialization := g.GuardInitialization(context.Background(), accepted)
+	g.BeginDrain()
+	endInitialization()
+	peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("late initialized connection remained open: %v", err)
+	}
+}
+
+// Once a session is published before draining, the protocol's normal shutdown
+// response must remain possible instead of racing a raw socket-close callback.
+func TestSessionGroupInitializationHandsOffConnection(t *testing.T) {
+	var g SessionGroup
+	accepted, peer := net.Pipe()
+	defer accepted.Close()
+	defer peer.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	endInitialization := g.GuardInitialization(ctx, accepted)
+	endInitialization()
+	cancel()
+	written := make(chan error, 1)
+	go func() {
+		_, err := accepted.Write([]byte("bye"))
+		written <- err
+	}()
+	peer.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 3)
+	if _, err := io.ReadFull(peer, buf); err != nil {
+		t.Fatalf("initialized connection could not send shutdown response: %v", err)
+	}
+	if string(buf) != "bye" {
+		t.Fatalf("shutdown response = %q", buf)
+	}
+	if err := <-written; err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestSessionGroupDrainWaitsForSessions(t *testing.T) {
 	var g SessionGroup
@@ -26,9 +76,7 @@ func TestSessionGroupDrainWaitsForSessions(t *testing.T) {
 // session is refused, not started behind the drain's back.
 func TestSessionGroupRefusesSessionsOnceDraining(t *testing.T) {
 	var g SessionGroup
-	if !g.Drain(time.Second) {
-		t.Fatal("Drain of an empty group timed out")
-	}
+	g.BeginDrain()
 	ran := make(chan struct{}, 1)
 	if g.Go(func() { ran <- struct{}{} }) {
 		t.Error("Go started a session after the drain began")
@@ -40,6 +88,9 @@ func TestSessionGroupRefusesSessionsOnceDraining(t *testing.T) {
 	case <-ran:
 		t.Error("a refused session ran")
 	case <-time.After(50 * time.Millisecond):
+	}
+	if !g.Drain(time.Second) {
+		t.Fatal("Drain of an empty group timed out")
 	}
 }
 

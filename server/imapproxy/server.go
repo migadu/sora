@@ -575,6 +575,9 @@ func (s *Server) acceptConnections() error {
 			}
 			session.releaseConn = releaseConn // Set cleanup function on session
 			s.addSession(session)
+			if s.sessions.IsDraining() {
+				server.RawConn(conn).Close()
+			}
 
 			// CRITICAL: Panic recovery MUST call removeSession to prevent leak
 			defer func() {
@@ -629,6 +632,7 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 
 // Stop stops the IMAP proxy server.
 func (s *Server) Stop() error {
+	s.sessions.BeginDrain()
 	logger.Info("Stopping proxy server", "proxy", s.name)
 
 	// Unregister rate limiter from global registry

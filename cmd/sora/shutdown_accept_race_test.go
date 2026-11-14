@@ -6,7 +6,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
+	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -50,6 +54,104 @@ func TestShutdownWhileAcceptingDoesNotRaceSessionDrain(t *testing.T) {
 					s.configure(&sc)
 				}
 				shutdownWhileAccepting(t, s.start, sc)
+			}
+		})
+	}
+}
+
+type shutdownHandshakeConn struct {
+	net.Conn
+	received chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
+func (c *shutdownHandshakeConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.once.Do(func() { close(c.received) })
+	<-c.release // Hold the client before it can finish the handshake.
+	return n, err
+}
+
+// An accepted connection is counted before its TLS handshake, but may not yet
+// appear in the server's active-session map. Shutdown must close that socket
+// rather than wait for the handshake's ten-second deadline.
+func TestShutdownClosesAcceptedTLSHandshake(t *testing.T) {
+	for _, srv := range []struct {
+		name  string
+		start func(context.Context, *serverDependencies, config.ServerConfig, chan error)
+	}{
+		{"imap", startDynamicIMAPServer},
+		{"pop3", startDynamicPOP3Server},
+		{"managesieve", startDynamicManageSieveServer},
+		{"imap_proxy", startDynamicIMAPProxyServer},
+		{"pop3_proxy", startDynamicPOP3ProxyServer},
+		{"managesieve_proxy", startDynamicManageSieveProxyServer},
+		{"lmtp_proxy", startDynamicLMTPProxyServer},
+	} {
+		t.Run(srv.name, func(t *testing.T) {
+			sc := config.ServerConfig{
+				Type: srv.name, Name: srv.name + "-tls-drain", Addr: freeLoopbackAddr(t),
+				TLS: true, TLSCertFile: "../../testdata/sora.crt", TLSKeyFile: "../../testdata/sora.key",
+			}
+			withRemoteAddrs(&sc)
+			cfg := config.NewDefaultConfig()
+			cfg.Servers.TrustedNetworks = []string{"127.0.0.0/8"}
+			cfg.DynamicServers = []config.ServerConfig{sc}
+			deps := &serverDependencies{
+				storage: &storage.S3Storage{}, resilientDB: &resilient.ResilientDatabase{},
+				uploadWorker: &uploader.UploadWorker{}, cacheInstance: &cache.Cache{},
+				hostname: "localhost", config: cfg, serverManager: &serverManager{},
+				connectionTrackers: make(map[string]*server.ConnectionTracker),
+				proxyServers:       make(map[string]adminapi.ProxyServer),
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			errc := make(chan error, 1)
+			go srv.start(ctx, deps, sc, errc)
+			var raw net.Conn
+			for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+				select {
+				case err := <-errc:
+					t.Fatalf("start: %v", err)
+				default:
+				}
+				var err error
+				raw, err = net.Dial("tcp", sc.Addr)
+				if err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("server did not listen: %v", err)
+				}
+			}
+			gate := &shutdownHandshakeConn{Conn: raw, received: make(chan struct{}), release: make(chan struct{})}
+			handshakeDone := make(chan struct{})
+			t.Cleanup(func() {
+				raw.Close()
+				close(gate.release)
+				select {
+				case <-handshakeDone:
+				case <-time.After(2 * time.Second):
+					t.Error("client handshake goroutine did not stop")
+				}
+			})
+			client := tls.Client(gate, &tls.Config{InsecureSkipVerify: true})
+			go func() { defer close(handshakeDone); _ = client.Handshake() }()
+			select {
+			case <-gate.received:
+			case <-time.After(3 * time.Second):
+				t.Fatal("server did not begin the TLS handshake")
+			}
+			cancel()
+			// The gated TLS reader has stopped using the socket; drain any
+			// remaining server handshake records and require a prompt EOF.
+			raw.SetReadDeadline(time.Now().Add(4 * time.Second))
+			if _, err := io.Copy(io.Discard, raw); err != nil {
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() {
+					t.Fatalf("shutdown left the accepted handshake socket open: %v", err)
+				}
 			}
 		})
 	}

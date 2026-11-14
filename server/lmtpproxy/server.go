@@ -501,6 +501,9 @@ func (s *Server) acceptConnections() error {
 			session := newSession(s, conn, proxyInfo)
 			session.releaseConn = releaseConn // Set cleanup function on session
 			s.registerSession(session)
+			if s.sessions.IsDraining() {
+				server.RawConn(conn).Close()
+			}
 
 			// CRITICAL: Panic recovery MUST clean up metrics and limiter
 			defer func() {
@@ -656,6 +659,7 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 }
 
 func (s *Server) Stop() error {
+	s.sessions.BeginDrain()
 	logger.Info("Stopping LMTP proxy server", "name", s.name)
 
 	// Stop connection tracker first to prevent it from trying to access closed database

@@ -418,8 +418,9 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 		Caps:                caps,
 		Greeting:            "Sora-POP3-Server ready",
 		NewSession: func(c *pop3server.Conn) (pop3server.Session, error) {
-			// Connection limiting check
 			netConn := c.NetConn()
+			endInitialization := s.sessions.GuardInitialization(s.appCtx, netConn)
+			defer endInitialization()
 			proxyInfo := serverPkg.GetProxyProtocolInfo(netConn)
 
 			clientIP, proxyIP := serverPkg.GetConnectionIPs(netConn, proxyInfo)
@@ -687,6 +688,7 @@ func (s *POP3Server) SetConnTracker(tracker *serverPkg.ConnectionTracker) {
 }
 
 func (s *POP3Server) Close() {
+	s.sessions.BeginDrain()
 	// Unregister rate limiter from global registry
 	serverPkg.UnregisterRateLimiter("pop3", s.name)
 

@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"net"
 	"sync"
 	"time"
 )
@@ -53,9 +55,7 @@ func (g *SessionGroup) Go(session func()) bool {
 // Drain refuses further sessions and waits up to timeout for the registered
 // ones to end. It reports whether they all did.
 func (g *SessionGroup) Drain(timeout time.Duration) bool {
-	g.mu.Lock()
-	g.draining = true
-	g.mu.Unlock()
+	g.BeginDrain()
 
 	done := make(chan struct{})
 	go func() {
@@ -67,5 +67,40 @@ func (g *SessionGroup) Drain(timeout time.Duration) bool {
 		return true
 	case <-time.After(timeout):
 		return false
+	}
+}
+
+// BeginDrain stops admission before shutdown notifies existing sessions. It
+// uses Add's mutex, so every accepted registration precedes the later Wait.
+func (g *SessionGroup) BeginDrain() {
+	g.mu.Lock()
+	g.draining = true
+	g.mu.Unlock()
+}
+
+// IsDraining reports whether shutdown has closed session admission.
+func (g *SessionGroup) IsDraining() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.draining
+}
+
+// GuardInitialization interrupts an accepted connection's handshake on shutdown.
+// Call the returned function after publishing the initialized session, or when
+// initialization fails. A session published after shutdown's notification
+// snapshot must close itself; one published earlier is covered by that snapshot.
+// Once initialization ends, normal protocol shutdown replies own the connection.
+func (g *SessionGroup) GuardInitialization(ctx context.Context, conn net.Conn) func() {
+	closeRaw := func() {
+		if raw := RawConn(conn); raw != nil {
+			raw.Close()
+		}
+	}
+	stopClose := context.AfterFunc(ctx, closeRaw)
+	return func() {
+		stopClose()
+		if g.IsDraining() || ctx.Err() != nil {
+			closeRaw()
+		}
 	}
 }
