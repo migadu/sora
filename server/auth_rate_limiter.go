@@ -86,9 +86,11 @@ type AuthLimiter interface {
 // AuthRateLimiter provides two-tier rate limiting: IP+username and IP-only blocking
 type AuthRateLimiter struct {
 	config     AuthRateLimiterConfig
-	protocol   string
+	protocol   string // keys the cluster gossip; the metrics use metricsProtocol
 	serverName string
 	hostname   string
+
+	metricsProtocol string // the protocol label of the limiter's metrics
 
 	// Networks exempt from IP-based rate limiting. Resolved from config.ExemptNetworks,
 	// falling back to the trusted_networks passed at construction when unset. Deliberately
@@ -214,6 +216,7 @@ func NewAuthRateLimiterWithTrustedNetworks(protocol, serverName, hostname string
 	limiter := &AuthRateLimiter{
 		config:                  config,
 		protocol:                protocol,
+		metricsProtocol:         metricsProtocol(protocol),
 		serverName:              serverName,
 		hostname:                hostname,
 		exemptNetworks:          exemptNetworks,
@@ -226,10 +229,10 @@ func NewAuthRateLimiterWithTrustedNetworks(protocol, serverName, hostname string
 	}
 
 	// Initialize metrics to zero so they appear immediately in Prometheus
-	metrics.AuthRateLimiterIPUsernameEntries.WithLabelValues(protocol, serverName, hostname).Set(0)
-	metrics.AuthRateLimiterIPEntries.WithLabelValues(protocol, serverName, hostname).Set(0)
-	metrics.AuthRateLimiterUsernameEntries.WithLabelValues(protocol, serverName, hostname).Set(0)
-	metrics.AuthRateLimiterBlockedIPs.WithLabelValues(protocol, serverName, hostname).Set(0)
+	metrics.AuthRateLimiterIPUsernameEntries.WithLabelValues(limiter.metricsProtocol, serverName, hostname).Set(0)
+	metrics.AuthRateLimiterIPEntries.WithLabelValues(limiter.metricsProtocol, serverName, hostname).Set(0)
+	metrics.AuthRateLimiterUsernameEntries.WithLabelValues(limiter.metricsProtocol, serverName, hostname).Set(0)
+	metrics.AuthRateLimiterBlockedIPs.WithLabelValues(limiter.metricsProtocol, serverName, hostname).Set(0)
 
 	// Start background cleanup routine
 	go limiter.cleanupRoutine(config.CleanupInterval)
@@ -904,10 +907,10 @@ func (a *AuthRateLimiter) cleanupExpiredEntries() {
 	totalUsernames := len(a.usernameFailureCounts)
 	a.usernameMu.RUnlock()
 
-	metrics.AuthRateLimiterIPUsernameEntries.WithLabelValues(a.protocol, a.serverName, a.hostname).Set(float64(totalIPUsername))
-	metrics.AuthRateLimiterIPEntries.WithLabelValues(a.protocol, a.serverName, a.hostname).Set(float64(totalIPFailures))
-	metrics.AuthRateLimiterUsernameEntries.WithLabelValues(a.protocol, a.serverName, a.hostname).Set(float64(totalUsernames))
-	metrics.AuthRateLimiterBlockedIPs.WithLabelValues(a.protocol, a.serverName, a.hostname).Set(float64(totalBlockedIPs))
+	metrics.AuthRateLimiterIPUsernameEntries.WithLabelValues(a.metricsProtocol, a.serverName, a.hostname).Set(float64(totalIPUsername))
+	metrics.AuthRateLimiterIPEntries.WithLabelValues(a.metricsProtocol, a.serverName, a.hostname).Set(float64(totalIPFailures))
+	metrics.AuthRateLimiterUsernameEntries.WithLabelValues(a.metricsProtocol, a.serverName, a.hostname).Set(float64(totalUsernames))
+	metrics.AuthRateLimiterBlockedIPs.WithLabelValues(a.metricsProtocol, a.serverName, a.hostname).Set(float64(totalBlockedIPs))
 
 	// Log memory usage stats every 10 cleanup cycles (~50 minutes with 5min default cleanup interval)
 	// This helps monitor for memory leaks and effectiveness of size caps

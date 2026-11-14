@@ -49,7 +49,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 			// Apply progressive authentication delay BEFORE any other checks
 			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-			if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "IMAP-SASL"); err != nil {
+			if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "imap"); err != nil {
 				if errors.Is(err, server.ErrDelayQueueFull) {
 					// Delay queue full - reject immediately to prevent goroutine exhaustion
 					s.InfoLog("delay queue full, rejecting connection", "username", username)

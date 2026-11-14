@@ -97,11 +97,13 @@ type UserConnectionInfo struct {
 
 // ConnectionTracker manages connection tracking using gossip protocol
 type ConnectionTracker struct {
-	name           string
+	name           string // the protocol: keys the gossip; the metrics use metricsProtocol
 	serverName     string
 	hostname       string
 	instanceID     string
 	clusterManager *cluster.Manager
+
+	metricsProtocol string // the protocol label of the tracker's metrics
 
 	// Connection tracking
 	connections map[int64]*UserConnectionInfo // accountID -> info
@@ -169,6 +171,17 @@ type LookupCacheInvalidator interface {
 // If clusterMgr is nil, operates in local-only mode (for backend servers).
 // If snapshotOnly is true, only broadcasts periodic state snapshots (no individual register/unregister events).
 func NewConnectionTracker(name, serverName, hostname string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, maxEventQueueSize int, snapshotOnly bool) *ConnectionTracker {
+	return newConnectionTracker(name, metricsProtocol(name), serverName, hostname, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize, snapshotOnly)
+}
+
+// NewProxyConnectionTracker is NewConnectionTracker for a proxy listener. The tracker
+// has the protocol's name like a backend's, which its gossip and the Admin API rely
+// on; its metrics are labelled with the proxy's server type ("imap_proxy", ...).
+func NewProxyConnectionTracker(name, serverName, hostname string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, maxEventQueueSize int, snapshotOnly bool) *ConnectionTracker {
+	return newConnectionTracker(name, metricsProtocol(name)+"_proxy", serverName, hostname, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize, snapshotOnly)
+}
+
+func newConnectionTracker(name, metricsLabel, serverName, hostname string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, maxEventQueueSize int, snapshotOnly bool) *ConnectionTracker {
 	// Use default if not specified
 	if maxEventQueueSize <= 0 {
 		maxEventQueueSize = defaultMaxEventQueueSize
@@ -176,6 +189,7 @@ func NewConnectionTracker(name, serverName, hostname string, instanceID string, 
 
 	ct := &ConnectionTracker{
 		name:                       name,
+		metricsProtocol:            metricsLabel,
 		serverName:                 serverName,
 		hostname:                   hostname,
 		instanceID:                 instanceID,
@@ -1181,12 +1195,12 @@ func (ct *ConnectionTracker) cleanup() {
 			"users", cleanedUsers, "instance_ids", cleanedInstances, "ips", cleanedIPs)
 	}
 
-	metrics.ConnectionTrackerUsers.WithLabelValues(ct.name, ct.serverName, ct.hostname).Set(float64(totalUsers))
-	metrics.ConnectionTrackerInstanceIDs.WithLabelValues(ct.name, ct.serverName, ct.hostname).Set(float64(totalInstanceIDs))
-	metrics.ConnectionTrackerIPs.WithLabelValues(ct.name, ct.serverName, ct.hostname).Set(float64(totalIPs))
+	metrics.ConnectionTrackerUsers.WithLabelValues(ct.metricsProtocol, ct.serverName, ct.hostname).Set(float64(totalUsers))
+	metrics.ConnectionTrackerInstanceIDs.WithLabelValues(ct.metricsProtocol, ct.serverName, ct.hostname).Set(float64(totalInstanceIDs))
+	metrics.ConnectionTrackerIPs.WithLabelValues(ct.metricsProtocol, ct.serverName, ct.hostname).Set(float64(totalIPs))
 
 	queueSize := ct.queue.numQueued() + ct.criticalQueue.numQueued() + ct.heartbeatQueue.numQueued()
-	metrics.ConnectionTrackerBroadcastQueue.WithLabelValues(ct.name, ct.serverName, ct.hostname).Set(float64(queueSize))
+	metrics.ConnectionTrackerBroadcastQueue.WithLabelValues(ct.metricsProtocol, ct.serverName, ct.hostname).Set(float64(queueSize))
 
 	// Log memory usage stats every 10 cleanup cycles (~10 minutes with 1m cleanup interval)
 	ct.cleanupCounter++
