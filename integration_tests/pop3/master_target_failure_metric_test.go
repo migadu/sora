@@ -40,8 +40,8 @@ func startPOP3WithMasterCredentials(t *testing.T, rdb *resilient.ResilientDataba
 	}
 	errChan := make(chan error, 1)
 	go func() { srv.Start(errChan) }()
-	time.Sleep(100 * time.Millisecond)
 	t.Cleanup(srv.Close)
+	waitForPOP3Listener(t, address, errChan)
 	return address
 }
 
