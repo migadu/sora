@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -485,7 +484,7 @@ func scanMessages(rows pgx.Rows, includeBodyStructure bool) ([]Message, error) {
 		// Callers that need it (e.g. FETCH BODYSTRUCTURE) will lazy-fetch via GetMessageBodyStructure.
 
 		if err := json.Unmarshal(customFlagsJSON, &msg.CustomFlags); err != nil {
-			log.Printf("Database: ERROR - failed unmarshalling custom_flags for UID %d: %v. JSON: %s", msg.UID, err, string(customFlagsJSON))
+			logger.Error("Database: failed to unmarshal custom_flags", "uid", msg.UID, "mailbox_id", msg.MailboxID, "err", err, "json", string(customFlagsJSON))
 		}
 		msg.RecipientsJSON = recipientsJSON
 		messages = append(messages, msg)
@@ -528,11 +527,11 @@ func deserializeBodyStructure(data []byte, msgSize int, accountID, mailboxID int
 	if len(data) > 0 {
 		bs, err := helpers.DeserializeBodyStructureGob(data)
 		if err != nil {
-			log.Printf("Database: WARNING - account_id=%d mailbox_id=%d UID=%d content_hash=%s: failed to deserialize body_structure: %v",
-				accountID, mailboxID, uid, contentHash, err)
+			logger.Warn("Database: failed to deserialize body_structure", "account_id", accountID, "mailbox_id", mailboxID,
+				"uid", uid, "content_hash", contentHash, "err", err)
 		} else if validateErr := helpers.ValidateBodyStructure(bs); validateErr != nil {
-			log.Printf("Database: WARNING - account_id=%d mailbox_id=%d UID=%d content_hash=%s: invalid body_structure: %v",
-				accountID, mailboxID, uid, contentHash, validateErr)
+			logger.Warn("Database: invalid body_structure", "account_id", accountID, "mailbox_id", mailboxID,
+				"uid", uid, "content_hash", contentHash, "err", validateErr)
 		} else {
 			return bs
 		}
@@ -670,7 +669,7 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID in
 	for _, mailboxName := range mailboxNames {
 		mailbox, err := db.GetMailboxByName(ctx, AccountID, mailboxName)
 		if err != nil {
-			log.Printf("WarmUp: failed to get mailbox '%s' for user %d: %v", mailboxName, AccountID, err)
+			logger.Debug("WarmUp: failed to get mailbox", "mailbox", mailboxName, "account_id", AccountID, "err", err)
 			continue // Skip this mailbox if not found
 		}
 
@@ -683,7 +682,7 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID in
 		messages, err := db.SearchMessagesWithCriteria(ctx, mailbox.ID, mailbox.AccountID, criteria, messageCount, 0)
 		if err != nil {
 
-			log.Printf("WarmUp: failed to get recent messages for mailbox '%s': %v", mailboxName, err)
+			logger.Debug("WarmUp: failed to get recent messages", "mailbox", mailboxName, "account_id", AccountID, "err", err)
 			continue
 		}
 
@@ -700,7 +699,7 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID in
 
 		if len(contentHashes) > 0 {
 			result[mailboxName] = contentHashes
-			log.Printf("WarmUp: prepared %d content hashes for mailbox '%s'", len(contentHashes), mailboxName)
+			logger.Debug("WarmUp: prepared content hashes", "mailbox", mailboxName, "account_id", AccountID, "count", len(contentHashes))
 		}
 	}
 

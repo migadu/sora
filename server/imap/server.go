@@ -1036,9 +1036,6 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	session.Stats = s
 	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "IMAP", session.InfoLog)
 
-	// Log connection at INFO level
-	session.InfoLog("connected")
-
 	greeting := &imapserver.GreetingData{
 		PreAuth: false,
 	}
