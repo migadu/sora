@@ -866,11 +866,19 @@ enabled_extensions = []
 # {
 #   "type": "spam",                    // or "ham"
 #   "message": "From: sender@...",     // RFC822 message without attachments
+#   "message_base64": "RnJvbTog...",   // Only for a message that is not valid UTF-8 (see below)
 #   "user": "user@example.com",        // User who performed the action
 #   "source_mailbox": "INBOX",         // Source mailbox name
 #   "dest_mailbox": "Junk",            // Destination mailbox name
 #   "timestamp": "2026-03-13T10:30:00Z"
 # }
+#
+# A JSON string holds Unicode text only, so "message" cannot carry a message
+# that is not valid UTF-8 (8-bit text in another charset, raw 8-bit header
+# values): each such byte in it is replaced with U+FFFD. Those messages are also
+# sent byte for byte in "message_base64" (standard base64, RFC 4648 section 4).
+# A receiver takes the message from "message_base64" when it is present and
+# from "message" otherwise; either way it gets the message byte for byte.
 
 [spam_training]
 # Enable spam filter training (default: false)
