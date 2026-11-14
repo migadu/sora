@@ -377,7 +377,7 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 		OnStartTLS:             serverPkg.BeginStartTLS,
 		OnTLSHandshakeComplete: serverPkg.CompleteStartTLS,
 		Implementation:         "ManageSieve",
-		Greeting:               `"Sora" ManageSieve server ready.`,
+		Greeting:               `"Sora ManageSieve server ready."`, // written verbatim after "OK ": one quoted string (RFC 5804 section 4, response-ok)
 		GreetingStartTLSHint:   true,
 		SieveExtensions:        msieve.GetSieveCapabilities(s.supportedExtensions),
 		MaxScriptSize:          settings.maxScriptSize,
