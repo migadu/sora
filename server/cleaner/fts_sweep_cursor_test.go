@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/migadu/sora/db"
 	"github.com/stretchr/testify/assert"
@@ -74,4 +75,45 @@ func TestCleanupWorker_FTSOrphanSweepRetriesFailedDelete(t *testing.T) {
 		assert.NoError(t, worker.runOnce(ctx))
 	}
 	mockDB.AssertExpectations(t)
+}
+
+// Retention controls age pruning, not orphan scanning. Keeping vectors forever
+// between two finite-retention cycles must not reset the orphan sweep's progress.
+func TestCleanupWorker_FTSOrphanSweepSurvivesRetentionChanges(t *testing.T) {
+	m := new(mockDatabase)
+	ctx := context.Background()
+	w := &CleanupWorker{rdb: m, s3: &mockS3{healthy: true}, cache: new(mockCache)}
+	expectIdleCyclePhases(m, ctx)
+	m.On("PruneOldMessageVectorsWithRetry", ctx, time.Hour).Return(int64(0), nil).Twice()
+	mid := db.FTSKey{ContentHash: "5555", AccountID: 1}
+	end := db.FTSKey{ContentHash: "ffff", AccountID: 2}
+	m.On("GetUnusedFTSKeysWithRetry", ctx, db.FTSKey{}, db.BATCH_PURGE_SIZE).Return([]db.FTSKey{}, mid, nil).Once()
+	m.On("GetUnusedFTSKeysWithRetry", ctx, mid, db.BATCH_PURGE_SIZE).Return([]db.FTSKey{}, end, nil).Once()
+	m.On("GetUnusedFTSKeysWithRetry", ctx, end, db.BATCH_PURGE_SIZE).Return([]db.FTSKey{}, db.FTSKey{}, nil).Once()
+	for _, retention := range []time.Duration{time.Hour, 0, time.Hour} {
+		w.ftsRetention = retention
+		assert.NoError(t, w.runOnce(ctx))
+	}
+	m.AssertExpectations(t)
+}
+
+func TestCleanupWorker_FTSOrphanSweepKeepsCursorOnCancellation(t *testing.T) {
+	m := new(mockDatabase)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	start := db.FTSKey{ContentHash: "4444", AccountID: 1}
+	w := &CleanupWorker{rdb: m, s3: &mockS3{healthy: true}, cache: new(mockCache), ftsSweepCursor: start}
+	expectIdleCyclePhases(m, ctx)
+	m.On("GetUnusedFTSKeysWithRetry", ctx, start, db.BATCH_PURGE_SIZE).
+		Run(func(mock.Arguments) { cancel() }).Return([]db.FTSKey{}, db.FTSKey{}, context.Canceled).Once()
+	assert.ErrorIs(t, w.runOnce(ctx), context.Canceled)
+	assert.Equal(t, start, w.ftsSweepCursor)
+
+	resume := context.Background()
+	expectIdleCyclePhases(m, resume)
+	next := db.FTSKey{ContentHash: "8888", AccountID: 2}
+	m.On("GetUnusedFTSKeysWithRetry", resume, start, db.BATCH_PURGE_SIZE).Return([]db.FTSKey{}, next, nil).Once()
+	assert.NoError(t, w.runOnce(resume))
+	assert.Equal(t, next, w.ftsSweepCursor)
+	m.AssertExpectations(t)
 }

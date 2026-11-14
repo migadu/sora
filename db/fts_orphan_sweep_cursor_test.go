@@ -72,4 +72,18 @@ func TestGetUnusedFTSKeysResumesFromCursor(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, keys)
 	require.Equal(t, FTSKey{}, next)
+
+	// A canceled scan must not advance over candidates it could not return. Hold
+	// the real table lock so cancellation happens in PostgreSQL's query wait.
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(context.Background())
+	_, err = tx.Exec(ctx, "LOCK TABLE messages_fts_v2 IN ACCESS EXCLUSIVE MODE")
+	require.NoError(t, err)
+	canceled, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	keys, next, err = db.GetUnusedFTSKeys(canceled, first, 1)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Empty(t, keys)
+	require.Equal(t, first, next)
 }

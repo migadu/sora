@@ -12,6 +12,7 @@ import (
 // way it stops delivery on the server (#284). sora-admin refuses it like the server does,
 // both when loading its configuration and in `config validate`.
 func TestNegativeFTSRetentionRejected(t *testing.T) {
+	keepBcryptCost(t)
 	for _, tc := range []struct {
 		name, value string
 		wantErr     string // substring of the failure, "" when the config is accepted
