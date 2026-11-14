@@ -247,11 +247,9 @@ message (section 7). Times are RFC 3339.
 {"error": "Mailbox not found"}
 ```
 
-with these plain-text exceptions from Go's HTTP library:
-
-- `405 Method not allowed` for a known path with the wrong method;
-- `404 Not found` for `/user/mailboxes/{name}` with a method other than `DELETE`;
-- `404 page not found` for a path that matches no route.
+A method the path does not serve is `405 {"error":"Method not allowed"}` with an `Allow`
+header listing the methods it does serve; a path no endpoint has is
+`404 {"error":"Not found"}`.
 
 **Status codes:**
 
@@ -262,7 +260,8 @@ with these plain-text exceptions from Go's HTTP library:
 | 400 | Bad request: bad JSON, a missing or invalid field or parameter, a script that does not compile. |
 | 401 | No, bad or expired token; failed login. |
 | 403 | Client address not in `allowed_hosts`; deleting `INBOX`; or changing flags or deleting a message in a shared mailbox without the right. |
-| 404 | Mailbox, message or script not found. |
+| 404 | Mailbox, message or script not found, or no endpoint has the path. |
+| 405 | Wrong method for the path; `Allow` lists the methods it serves. |
 | 409 | Mailbox already exists, or has child mailboxes. |
 | 410 | The message body is gone for good. |
 | 413 | Sieve script over 65536 bytes. |
