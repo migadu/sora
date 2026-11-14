@@ -14,9 +14,10 @@ import (
 
 // TestInsertPathsKeepLastReferences: every insert path bounds messages."references" by
 // dropping whole message IDs from the middle, so the first ID (the thread's root) and the
-// last ones (the parent's among them, RFC 5256 §2.2 "the last reference") survive and no
-// ID is stored cut short. The bound kept the first 2000 bytes, which in a long thread
-// lost the parent and cut the last kept ID in the middle (#610).
+// last ones (the parent's among them, "the last reference" THREAD=REFERENCES links by,
+// RFC 5256 §3, BASE.6.4.THREAD, step 1(B)) survive and no ID is stored cut short. The
+// bound kept the first 2000 bytes, which in a long thread lost the parent and cut the
+// last kept ID in the middle (#610).
 func TestInsertPathsKeepLastReferences(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")

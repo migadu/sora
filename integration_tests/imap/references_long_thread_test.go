@@ -15,10 +15,11 @@ import (
 )
 
 // TestIMAP_LongReferencesKeepParent: a References field grows by one message ID per
-// reply (RFC 5322 §3.6.4), and RFC 5256 §2.2 links a message to "the last reference".
-// The stored list was cut to its first 2000 bytes, so in a 40-message thread the last
-// IDs, the parent's among them, were lost: SEARCH HEADER References on them found
-// nothing and THREAD put the reply beside its parent instead of under it (#610).
+// reply (RFC 5322 §3.6.4), and THREAD=REFERENCES links a message to "the last
+// reference" (RFC 5256 §3, BASE.6.4.THREAD, step 1(B)). The stored list was cut to its
+// first 2000 bytes, so in a 40-message thread the last IDs, the parent's among them,
+// were lost: SEARCH HEADER References on them found nothing and THREAD put the reply
+// beside its parent instead of under it (#610).
 func TestIMAP_LongReferencesKeepParent(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	server, account := common.SetupIMAPServer(t)

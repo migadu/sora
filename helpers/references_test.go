@@ -21,10 +21,11 @@ func refIDs(from, to int) []string {
 
 // TestTrimReferences: a References field grows by one message ID per reply (RFC 5322
 // §3.6.4), so in a long thread the IDs over the bound are the most recent ones, the
-// parent's among them, and RFC 5256 §2.2 threads a message under "the last reference".
-// The stored list was cut to its first bytes, losing those IDs and storing the last kept
-// one cut short (#610). It must drop whole IDs from the middle instead, keeping the
-// first and the last ones, the way RFC 5537 §3.4.4 trims References.
+// parent's among them, and THREAD=REFERENCES threads a message under "the last
+// reference" (RFC 5256 §3, BASE.6.4.THREAD, step 1(B)). The stored list was cut to its
+// first bytes, losing those IDs and storing the last kept one cut short (#610). It must
+// drop whole IDs from the middle instead, keeping the first and the last ones, the way
+// RFC 5537 §3.4.4 trims References.
 func TestTrimReferences(t *testing.T) {
 	for _, tc := range []struct {
 		name string
