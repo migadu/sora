@@ -1796,8 +1796,9 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 #   {SSHA512} and {SHA512}; scheme and .b64/.base64/.hex suffix in any case, as in Dovecot
 # - If HTTP endpoint returns 404/3xx → respects lookup_local_users setting (user partitioning)
 # - If HTTP endpoint returns 401/403 → authentication rejected (no fallback); the way to refuse an account.
-#   On a route-only lookup too: an LMTP recipient gets the user_not_found_response reply (never the
-#   local database), and with [[pool]] blocks the route is refused (temporary failure), never the default pool
+#   On a route-only lookup too: an LMTP recipient gets the user_not_found_response reply, with or
+#   without [[pool]] blocks, and is never looked up in the local database; with [[pool]] blocks any
+#   other route-only refusal (the User API proxy's: 503) is a temporary failure, never the default pool
 # - If HTTP endpoint returns other 4xx/5xx, or a 200 that is not JSON with address and password_hash
 #   → service unavailable (no verdict on the password), ALWAYS reject (no fallback); 5xx, 408, 429
 #   and malformed 200s also count toward the circuit breaker
@@ -1903,7 +1904,7 @@ lookup_local_users = true             # Check local DB when remote returns 404/3
                                       #
                                       # NOTE: This setting ONLY affects LMTP proxy behavior for unknown recipients.
                                       #       IMAP/POP3/ManageSieve proxies always reject unknown users (no retry semantics).
-                                      #       For a 404 it is IGNORED when lookup_local_users=true (database fallback enabled).
+                                      #       For a 404/3xx it is IGNORED when lookup_local_users=true (database fallback enabled).
                                       #
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
