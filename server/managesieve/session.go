@@ -408,12 +408,6 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 func (s *ManageSieveSession) Login(ctx context.Context, username, password string) error {
 	start := time.Now()
 
-	address, err := server.NewAddress(username)
-	if err != nil {
-		s.DebugLog("invalid address", "error", err)
-		return &managesieveserver.Error{Message: msieve.Quote("Invalid address")}
-	}
-
 	netConn := s.conn
 	proxyInfo := s.proxyInfo()
 	// Rate-limit key for this attempt. Canonicalised so the check and every
@@ -426,7 +420,10 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 	// must never charge the account it named.
 	authKey := server.AuthRateLimitKeyWithMaster(username, s.server.masterUsername)
 
-	// Apply progressive authentication delay BEFORE any other checks
+	// Apply progressive authentication delay BEFORE any other checks - including
+	// before the username is parsed, as in AuthenticatePlain: an unparseable username
+	// is recorded as a failed attempt below, and a site that records without first
+	// passing the delay and the block check is metered but never gated.
 	remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-LOGIN"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
@@ -444,7 +441,7 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 			var rateLimitErr *server.RateLimitError
 			if errors.As(err, &rateLimitErr) {
 				s.InfoLog("rate limit exceeded",
-					"address", address.FullAddress(),
+					"username", username,
 					"reason", rateLimitErr.Reason,
 					"failure_count", rateLimitErr.FailureCount,
 					"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
@@ -455,6 +452,17 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 			// state isn't an observable oracle. (security-audit M14)
 			return errAuthFailed
 		}
+	}
+
+	address, err := server.NewAddress(username)
+	if err != nil {
+		s.DebugLog("invalid address", "error", err)
+		// A failed login like any other: recorded and counted, as in AuthenticatePlain.
+		if s.server.authLimiter != nil {
+			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+		}
+		metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
+		return &managesieveserver.Error{Message: msieve.Quote("Invalid address")}
 	}
 
 	// Master username authentication: user@domain.com@MASTER_USERNAME

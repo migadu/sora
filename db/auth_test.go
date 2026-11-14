@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/consts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
@@ -636,6 +637,37 @@ func TestGetAccountIDByAddress(t *testing.T) {
 	// 3. Empty address (should return error)
 	// 4. Case insensitive lookup
 	// 5. Normalized address handling
+}
+
+// GetAccountAddresses answers, for any address of an account, that account's ID and all
+// of its addresses, and ErrUserNotFound for an address no account has.
+func TestGetAccountAddresses(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	database := setupTestDatabase(t)
+	defer database.Close()
+	ctx := context.Background()
+
+	suffix := time.Now().UnixNano()
+	primary := fmt.Sprintf("get-addresses-%d@example.com", suffix)
+	alias := fmt.Sprintf("get-addresses-alias-%d@example.org", suffix)
+	accountID := createAccountWithCredential(t, database, ctx, primary)
+	addCredential(t, database, ctx, accountID, alias)
+	createAccountWithCredential(t, database, ctx, fmt.Sprintf("get-addresses-other-%d@example.com", suffix))
+
+	for _, address := range []string{primary, alias, " " + strings.ToUpper(alias) + " "} {
+		id, addresses, err := database.GetAccountAddresses(ctx, address)
+		require.NoError(t, err, address)
+		assert.Equal(t, accountID, id, address)
+		assert.ElementsMatch(t, []string{primary, alias}, addresses, address)
+	}
+
+	_, _, err := database.GetAccountAddresses(ctx, fmt.Sprintf("get-addresses-unknown-%d@example.com", suffix))
+	assert.ErrorIs(t, err, consts.ErrUserNotFound)
+	_, _, err = database.GetAccountAddresses(ctx, " ")
+	assert.Error(t, err)
 }
 
 // TestGetPrimaryEmailForAccount tests primary email retrieval

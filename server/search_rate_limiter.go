@@ -34,8 +34,8 @@ type SearchRateLimiter struct {
 	now             func() time.Time
 	cleanupInterval time.Duration
 	stopCleanup     chan struct{}
-	// protocol labels refusals in the protocol error metric, lowercased like the
-	// protocol label of every other metric ("imap").
+	// protocol labels refusals in the protocol error metric, lowercased ("imap") like
+	// the protocol label of the protocol's other errors.
 	protocol string
 	// command labels refusals in the protocol error metric; empty leaves them
 	// to the caller to count.

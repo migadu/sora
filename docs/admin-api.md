@@ -576,7 +576,7 @@ curl -X POST http://localhost:8080/admin/connections/kick \
 
 **Endpoint:** `GET /admin/connections/user/{email}`
 
-Get the user's entries on this node's connection trackers. The address is resolved to its account in the database, as `POST /admin/connections/kick` resolves it, so the account's entries are listed whichever of its addresses names it. An entry whose `email` is the address (case-insensitively) is listed too: that is how a remote lookup account, which the database does not know, is found. The entries are those of `GET /admin/connections`, but a tracker that knows the account only through gossip is listed too, with `local_count` 0.
+Get the user's entries on this node's connection trackers. The address is resolved to its account in the database, as `POST /admin/connections/kick` resolves it, so the account's entries are listed whichever of its addresses names it. An entry whose `email` is any address of the account (case-insensitively) is listed too: a proxy keys a session that remote lookup authenticated by an ID derived from the address the lookup answered, not by the database's account ID, and that address is the one the entry keeps. An address the database does not know (a lookup service's own account) lists the entries whose `email` is that address. Each entry identifies one tracker and one tracked account ID. A remote lookup service that answers different addresses of the account can produce multiple tracked IDs and entries for it. The entries are those of `GET /admin/connections`, but a tracker that knows the account only through gossip is listed too, with `local_count` 0.
 
 **Response:** `200 OK`
 ```json
