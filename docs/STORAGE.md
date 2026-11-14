@@ -990,7 +990,7 @@ An invalid duration or size in this section is logged as a warning and the defau
 An invalid duration in this section is logged as a warning and the default is used. A
 negative `grace_period`, `max_age_restriction`, `fts_retention` or `health_status_retention`,
 and an `instance_liveness_threshold` of zero or less, are refused at start-up and by
-`sora-admin config validate`.
+`sora-admin config validate` when the node has a mail backend (`imap`, `lmtp`, or `pop3`).
 
 ### `[metadata]`
 

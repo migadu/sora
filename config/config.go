@@ -429,8 +429,8 @@ func (c *CleanupConfig) GetFTSRetention() (time.Duration, error) {
 //   - fts_retention: delivery and import index only mail sent after now minus the
 //     retention, which would then lie in the future, so no new message would get a search
 //     row; and the cleaner prunes only for a positive retention.
-//   - instance_liveness_threshold must be positive: at 0 or below every uploader instance
-//     would count as gone.
+//   - instance_liveness_threshold must be positive. The runtime getter retains its
+//     default fallback for non-positive values as a safety net.
 //
 // An unset key does not parse here and takes its default; a value that does not parse
 // falls back to the default too, like any other duration key.

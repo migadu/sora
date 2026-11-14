@@ -11,8 +11,8 @@ import (
 // lies in the future, so expunged mail and soft-deleted accounts are hard-deleted at the
 // next cycle. max_age_restriction and health_status_retention: the cleaner acts only on a
 // positive value, so the restriction is off and health rows are never pruned (#667).
-// instance_liveness_threshold must be positive: at 0 or below every uploader instance
-// would count as gone. Each is refused at start-up. A value that does not parse keeps
+// instance_liveness_threshold must be positive; its getter's fallback remains a safety
+// net. Each is refused on mail-backend startup. A value that does not parse keeps
 // falling back to the absent-key default, like every other duration key.
 func TestCleanupConfigValidate(t *testing.T) {
 	type tcase struct {
