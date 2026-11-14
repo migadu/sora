@@ -17,8 +17,8 @@ import (
 // syntheticMessageID's "<hash@mailbox.synthetic.invalid>" on the importer and batch paths.
 // Unlike every ID the ingress parser returns, it keeps its angle brackets. It is not the
 // message's header and must never be reported as one: RFC 9051 section 7.5.2 makes the
-// ENVELOPE member of an absent Message-ID NIL, and RFC 5256 section 2.2 gives such a
-// message a unique ID no reference can name.
+// ENVELOPE member of an absent Message-ID NIL, and RFC 5256 section 3 (BASE.6.4.THREAD,
+// REFERENCES step 1(A)) gives such a message a unique ID no reference can name.
 
 // TestBuildEnvelopeSyntheticMessageIDIsNIL: the envelope leaves MessageID empty (go-imap
 // writes NIL) for a synthetic ID, instead of handing it to go-imap, which wraps it in a
