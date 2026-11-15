@@ -974,10 +974,11 @@ Notes on `clean`:
   If deleting that version brings back an older one that has expired too, `clean` deletes that
   one as well. This needs the right to delete object versions: `s3:DeleteObjectVersion` on
   AWS, the `deleteFiles` capability on Backblaze B2.
-- A bucket without versioning offers no way to delete only what was read. There `clean`
-  deletes by name, and a renewal stored between its read and its delete is deleted with the
-  expired certificate. On such a bucket, run `clean` only while no node renews certificates,
-  or turn on versioning.
+- Without a usable version id, including a `null` version exposed after a version delete,
+  `clean` sends the inspected object's ETag in `If-Match`. A changed object is kept.
+  This requires conditional DELETE support from the S3 provider; a missing ETag or an
+  unsupported condition fails that cleanup operation and keeps the object. `clean` never
+  retries it as an unconditional delete. Versioned B2 objects continue to use version ids.
 - A local copy is removed only if it still holds an expired certificate when `clean` removes
   it. A renewal written over it during the run stays.
 

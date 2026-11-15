@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -62,6 +63,110 @@ func TestTLSCleanKeepsRenewalStoredWhileItRuns(t *testing.T) {
 	}
 	if got, want := localNames(t, cacheDir), []string{"mail.example.com"}; !slices.Equal(got, want) {
 		t.Errorf("local cache after clean = %v, want %v", got, want)
+	}
+}
+
+// An unversioned object, or a null version exposed by a version delete, can be
+// replaced after clean's last read. The DELETE must match that read's ETag.
+func TestTLSCleanConditionalDeleteKeepsConcurrentRenewal(t *testing.T) {
+	for _, nullVersion := range []bool{false, true} {
+		t.Run(map[bool]string{false: "unversioned", true: "pre-versioning null"}[nullVersion], func(t *testing.T) {
+			stub, endpoint := newTLSStubS3(t)
+			path := "/certs/" + tlsmanager.S3ObjectKey("mail.example.com")
+			expired := tlsCleanAutocertEntry(t, "mail.example.com", false, time.Now().Add(-time.Hour))
+			renewal := tlsCleanAutocertEntry(t, "mail.example.com", false, time.Now().Add(60*24*time.Hour))
+			if nullVersion {
+				stub.mu.Lock()
+				stub.versions = map[string][]tlsStubVersion{path: {{id: "null", data: expired}}}
+				stub.objects[path] = expired
+				stub.mu.Unlock()
+			}
+			putServerEntry(t, tlsTestConfig(endpoint), "mail.example.com", expired)
+			var renew sync.Once
+			var conditional atomic.Int32
+			node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete && r.URL.Query().Get("versionId") == "" {
+					if r.Header.Get("If-Match") == tlsStubETag(expired) {
+						conditional.Add(1)
+					}
+					renew.Do(func() { stub.put("certs", tlsmanager.S3ObjectKey("mail.example.com"), renewal) })
+				}
+				stub.ServeHTTP(w, r)
+			}))
+			t.Cleanup(node.Close)
+			if err := cleanTLSCertificates(context.Background(), tlsTestConfig(node.URL), t.TempDir(), false, true); err != nil {
+				t.Fatalf("cleanTLSCertificates: %v", err)
+			}
+			stub.mu.Lock()
+			stored := stub.objects[path]
+			stub.mu.Unlock()
+			if !bytes.Equal(stored, renewal) {
+				t.Error("clean removed the renewal stored after its last read")
+			}
+			if conditional.Load() != 1 {
+				t.Errorf("DELETEs matching the inspected opaque ETag = %d, want 1", conditional.Load())
+			}
+		})
+	}
+}
+
+func TestTLSCleanWithoutVersionFailsSafelyWithoutConditionalDelete(t *testing.T) {
+	for _, nullVersion := range []bool{false, true} {
+		for _, missingETag := range []bool{false, true} {
+			name := map[bool]string{false: "unversioned", true: "pre-versioning null"}[nullVersion] + "/" + map[bool]string{false: "unsupported condition", true: "missing ETag"}[missingETag]
+			t.Run(name, func(t *testing.T) {
+				stub, endpoint := newTLSStubS3(t)
+				path := "/certs/" + tlsmanager.S3ObjectKey("mail.example.com")
+				expired := tlsCleanAutocertEntry(t, "mail.example.com", false, time.Now().Add(-time.Hour))
+				if nullVersion {
+					stub.mu.Lock()
+					stub.versions = map[string][]tlsStubVersion{path: {{id: "null", data: expired}}}
+					stub.objects[path] = expired
+					stub.mu.Unlock()
+				}
+				putServerEntry(t, tlsTestConfig(endpoint), "mail.example.com", expired)
+				var unconditional, conditional atomic.Int32
+				node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodDelete && r.URL.Query().Get("versionId") == "" {
+						if r.Header.Get("If-Match") == "" {
+							unconditional.Add(1)
+						} else {
+							conditional.Add(1)
+							w.WriteHeader(http.StatusNotImplemented)
+							return
+						}
+					}
+					if missingETag && r.Method == http.MethodGet {
+						rec := httptest.NewRecorder()
+						stub.ServeHTTP(rec, r)
+						rec.Header().Del("ETag")
+						for key, values := range rec.Header() {
+							w.Header()[key] = values
+						}
+						w.WriteHeader(rec.Code)
+						w.Write(rec.Body.Bytes())
+						return
+					}
+					stub.ServeHTTP(w, r)
+				}))
+				t.Cleanup(node.Close)
+				if err := cleanTLSCertificates(context.Background(), tlsTestConfig(node.URL), t.TempDir(), false, true); err == nil {
+					t.Error("clean reported success without a safe conditional delete")
+				}
+				if unconditional.Load() != 0 {
+					t.Errorf("sent %d unconditional DELETEs", unconditional.Load())
+				}
+				if missingETag && conditional.Load() != 0 {
+					t.Errorf("sent %d conditional DELETEs without an inspected ETag", conditional.Load())
+				}
+				stub.mu.Lock()
+				stored := stub.objects[path]
+				stub.mu.Unlock()
+				if !bytes.Equal(stored, expired) {
+					t.Error("clean removed the object without safe delete support")
+				}
+			})
+		}
 	}
 }
 

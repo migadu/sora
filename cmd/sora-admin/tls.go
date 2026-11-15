@@ -191,9 +191,10 @@ Options:
 This command deletes only expired certificates from both S3 and local cache.
 A certificate a node renews while clean runs is kept: on a bucket that keeps
 versions (Backblaze B2 buckets always do) clean deletes only the versions it
-found expired, which needs the right to delete object versions. A bucket
-without versioning offers no such check, so there clean deletes by name and
-takes a renewal stored during the run with it: run it while no node renews.
+found expired, which needs the right to delete object versions. Without a usable
+version id, clean requires the object's ETag and conditional DELETE support.
+If the object changed it is kept; missing ETags or unsupported conditions fail
+safely, without falling back to an unconditional delete.
 
 Examples:
   # Clean expired certificates (with confirmation)
@@ -1002,7 +1003,7 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			}
 
 			// Download and parse certificate to check expiry
-			certData, version, err := readTLSObject(ctx, s3store, obj.Key)
+			certData, version, etag, err := readTLSObject(ctx, s3store, obj.Key)
 			if err != nil {
 				logger.Warn("Failed to download certificate", "key", obj.Key, "error", err)
 				failures = append(failures, fmt.Errorf("read S3 object %s: %w", obj.Key, err))
@@ -1017,7 +1018,7 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 
 			// Check if expired
 			if certInfo.Expiry.Before(now) {
-				expiredCerts = append(expiredCerts, expiredCertificate{CertificateInfo: certInfo, version: version})
+				expiredCerts = append(expiredCerts, expiredCertificate{CertificateInfo: certInfo, version: version, etag: etag})
 			}
 
 		case err, ok := <-errChan:
@@ -1086,10 +1087,11 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	// name since they were read, so each delete is tied to what clean found expired.
 	deleted, removed := 0, 0
 	for _, cert := range expiredCerts {
-		if err := deleteExpiredS3Object(ctx, s3store, cert.S3Key, cert.version, now); err != nil {
+		gone, err := deleteExpiredS3Object(ctx, s3store, cert.S3Key, cert.version, cert.etag, now)
+		if err != nil {
 			logger.Warn("Failed to delete certificate from S3", "key", cert.S3Key, "error", err)
 			failures = append(failures, fmt.Errorf("delete S3 object %s: %w", cert.S3Key, err))
-		} else {
+		} else if gone {
 			logger.Info("Deleted expired certificate from S3", "key", cert.S3Key, "domain", cert.Domain)
 			deleted++
 		}
@@ -1097,7 +1099,7 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		if !cert.InLocalCache {
 			continue
 		}
-		gone, err := removeExpiredLocalCopy(cert.LocalPath, now)
+		gone, err = removeExpiredLocalCopy(cert.LocalPath, now)
 		if err != nil {
 			logger.Warn("Failed to delete certificate from local cache", "path", cert.LocalPath, "error", err)
 			failures = append(failures, fmt.Errorf("delete local file %s: %w", cert.LocalPath, err))
@@ -1113,18 +1115,18 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	return failed()
 }
 
-// expiredCertificate is a certificate clean found expired, with the version of the S3
-// object it read it from ("" when the bucket keeps no versions).
+// expiredCertificate identifies the S3 object clean read and found expired.
 type expiredCertificate struct {
 	CertificateInfo
 	version string
+	etag    string
 }
 
-// readTLSObject downloads the object at key and returns it with the version the bucket
-// served, or "" when the bucket keeps no versions. A bucket whose versioning is
+// readTLSObject downloads the object at key with its opaque ETag and the version the
+// bucket served, or "" when the bucket keeps no versions. A bucket whose versioning is
 // suspended names the version "null", which every write replaces in place: that does
 // not identify what was read, so it counts as none.
-func readTLSObject(ctx context.Context, s3store *storage.S3Storage, key string) ([]byte, string, error) {
+func readTLSObject(ctx context.Context, s3store *storage.S3Storage, key string) ([]byte, string, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, s3store.Timeout)
 	defer cancel()
 	out, err := s3store.Client.GetObject(ctx, &s3.GetObjectInput{
@@ -1132,18 +1134,18 @@ func readTLSObject(ctx context.Context, s3store *storage.S3Storage, key string) 
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	defer out.Body.Close()
 	data, err := io.ReadAll(out.Body)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	version := aws.ToString(out.VersionId)
 	if version == "null" {
 		version = ""
 	}
-	return data, version, nil
+	return data, version, aws.ToString(out.ETag), nil
 }
 
 // deleteExpiredS3Object deletes the expired certificate clean read from key, given the
@@ -1151,43 +1153,64 @@ func readTLSObject(ctx context.Context, s3store *storage.S3Storage, key string) 
 // other, so a renewal a node stored since (a newer version) stays. Deleting a version
 // brings back the one before it, an older certificate; while that one has expired too
 // it is deleted the same way, so the name is left absent, as a plain delete leaves it,
-// or holding a valid certificate. A bucket without versions offers nothing to tie the
-// delete to what was read: there the object is deleted by name.
-func deleteExpiredS3Object(ctx context.Context, s3store *storage.S3Storage, key, version string, now time.Time) error {
+// or holding a valid certificate. An object without a usable version id is deleted
+// only if its ETag still matches the GET that found it expired.
+func deleteExpiredS3Object(ctx context.Context, s3store *storage.S3Storage, key, version, etag string, now time.Time) (bool, error) {
 	if version == "" {
-		return s3store.DeleteContext(ctx, key)
+		return deleteTLSObjectIfUnchanged(ctx, s3store, key, etag)
 	}
 	for {
 		if err := deleteTLSObjectVersion(ctx, s3store, key, version); err != nil {
-			return err
+			return false, err
 		}
-		data, next, err := readTLSObject(ctx, s3store, key)
+		data, next, nextETag, err := readTLSObject(ctx, s3store, key)
 		var responseError *awshttp.ResponseError
 		if errors.As(err, &responseError) && responseError.HTTPStatusCode() == http.StatusNotFound {
-			return nil
+			return true, nil
 		}
 		if err != nil {
-			return fmt.Errorf("read back after deleting version %s: %w", version, err)
+			return false, fmt.Errorf("read back after deleting version %s: %w", version, err)
 		}
 		if next == version {
-			return fmt.Errorf("version %s is still served after it was deleted", version)
+			return false, fmt.Errorf("version %s is still served after it was deleted", version)
 		}
 		var info CertificateInfo
 		if err := parseCertificate(data, &info); err != nil {
-			return fmt.Errorf("parse the object served after deleting version %s: %w", version, err)
+			return false, fmt.Errorf("parse the object served after deleting version %s: %w", version, err)
 		}
 		if !info.Expiry.Before(now) {
 			logger.Info("Kept a valid certificate stored under the name of an expired one", "key", key, "version", next, "expiry", info.Expiry)
-			return nil
+			return true, nil
 		}
 		if next == "" {
-			// An expired version without an id of its own, such as the "null" one
-			// stored before versioning was turned on: delete by name, as on a bucket
-			// without versions.
-			return s3store.DeleteContext(ctx, key)
+			// The pre-versioning or suspended "null" object can be replaced in place.
+			// Do not hide a renewal stored after the read-back inspection.
+			_, err := deleteTLSObjectIfUnchanged(ctx, s3store, key, nextETag)
+			return true, err // the expired version above was already removed
 		}
 		version = next
 	}
+}
+
+// deleteTLSObjectIfUnchanged preserves the GET's opaque ETag, including quotes.
+// A provider that cannot enforce the condition must fail rather than delete by name.
+func deleteTLSObjectIfUnchanged(ctx context.Context, s3store *storage.S3Storage, key, etag string) (bool, error) {
+	if value := strings.TrimSpace(etag); value == "" || value == "*" {
+		return false, fmt.Errorf("cannot safely delete %s without an object-specific ETag", key)
+	}
+	ctx, cancel := context.WithTimeout(ctx, s3store.Timeout)
+	defer cancel()
+	_, err := s3store.Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket:  aws.String(s3store.BucketName),
+		Key:     aws.String(key),
+		IfMatch: aws.String(etag),
+	})
+	var responseError *awshttp.ResponseError
+	if errors.As(err, &responseError) && responseError.HTTPStatusCode() == http.StatusPreconditionFailed {
+		logger.Info("Kept a certificate changed since clean inspected it", "key", key)
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // deleteTLSObjectVersion deletes one version of the object at key for good.

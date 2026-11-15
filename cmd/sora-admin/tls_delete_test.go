@@ -72,7 +72,7 @@ func (s *tlsStubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodHead:
 		if isBucket || found {
-			s.setVersionHeader(w, path)
+			s.setObjectHeaders(w, path)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -87,7 +87,7 @@ func (s *tlsStubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>`)
 			return
 		}
-		s.setVersionHeader(w, path)
+		s.setObjectHeaders(w, path)
 		w.Write(data)
 	case http.MethodPut:
 		body, err := io.ReadAll(r.Body)
@@ -96,9 +96,14 @@ func (s *tlsStubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.store(path, body)
-		s.setVersionHeader(w, path)
+		s.setObjectHeaders(w, path)
 		w.WriteHeader(http.StatusOK)
 	case http.MethodDelete:
+		if match := r.Header.Get("If-Match"); match != "" && (!found || match != tlsStubETag(data)) {
+			w.WriteHeader(http.StatusPreconditionFailed)
+			io.WriteString(w, `<Error><Code>PreconditionFailed</Code><Message>The object changed.</Message></Error>`)
+			return
+		}
 		if s.deleteStatus != 0 {
 			w.WriteHeader(s.deleteStatus)
 			io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>InternalError</Code><Message>stub failure</Message></Error>`)
@@ -173,8 +178,16 @@ func (s *tlsStubS3) remove(path, versionID string) {
 	}
 }
 
-// setVersionHeader sends the version id of the object at path, in a versioned stub.
-func (s *tlsStubS3) setVersionHeader(w http.ResponseWriter, path string) {
+// tlsStubETag is opaque to callers: its quoted value must be passed unchanged.
+func tlsStubETag(data []byte) string {
+	return fmt.Sprintf(`"opaque-%x"`, sha256.Sum256(data))
+}
+
+// setObjectHeaders sends an opaque ETag and, in a versioned stub, the version id.
+func (s *tlsStubS3) setObjectHeaders(w http.ResponseWriter, path string) {
+	if data, found := s.objects[path]; found {
+		w.Header().Set("ETag", tlsStubETag(data))
+	}
 	if versions := s.versions[path]; len(versions) > 0 {
 		w.Header().Set("x-amz-version-id", versions[len(versions)-1].id)
 	}
