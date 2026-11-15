@@ -65,8 +65,12 @@ a byte pipe. Everything after login (capabilities, IDLE, FETCH) is the backend's
 The LMTP proxy does not log in. For each `RCPT TO` it finds the recipient's backend, connects (or
 reuses the connection it holds) and forwards the command. Like the backend, it does not announce
 `DSN`, so the sending MTA issues the notifications a sender asked for (RFC 3461 §5.2.2); `NOTIFY`,
-`ORCPT`, `RET` and `ENVID` sent anyway are accepted and not forwarded. The User API proxy forwards
-each HTTP request; the backend checks the JWT token.
+`ORCPT`, `RET` and `ENVID` sent anyway are accepted and not forwarded. As on the backend, `MAIL`
+before `LHLO` gets `503 5.5.1`. A later `LHLO`, or a completed `STARTTLS`, starts the session over:
+the transaction in progress ends, and a held backend connection is closed, so the next recipient
+reaches the backend on a new connection (with `remote_use_xclient`, its `XCLIENT HELO=` is the new
+`LHLO` name). After `STARTTLS` the MTA must send `LHLO` again before `MAIL`. The User API proxy
+forwards each HTTP request; the backend checks the JWT token.
 
 A node can run proxies and backend servers in the same process. A node that runs only proxies is a
 **proxy node**. [Section 13](#13-proxy-nodes-and-the-database) explains when such a node connects
@@ -462,6 +466,8 @@ with `remote_port = 24` dials `10.0.1.21:24`.
 Sora checks the pools at startup and refuses to start when:
 
 - a pool has no `name`, a name with whitespace, the same name as another pool, or no `backends`;
+- a backend is empty or has whitespace inside it (`"192.0.2.10 :143"`; spaces at the ends are
+  trimmed);
 - a backend appears twice, in one pool or in two. Names are compared without letter case and IPs in
   canonical form. A backend without a port stands for its host on every port, so it clashes with
   any other entry for that host. Entries with different explicit ports may share a host;
@@ -665,7 +671,13 @@ addresses: every host in the list may claim any client address. See [SECURITY.md
 
 You need only one way to pass the client address. PROXY protocol works for all protocols and keeps
 the backend from seeing the proxy's address at all. `ID` and `XCLIENT` work without changing the
-backend's listener.
+backend's listener. On IMAP and POP3, a backend that receives a PROXY header judges `ID` and
+`XCLIENT` by the client the header names, not by the proxy, so next to a header it ignores the `ID`
+forwarding fields and refuses the POP3 `XCLIENT` (unless that client is itself in
+`trusted_networks`); the login continues. The header already carries the client's address and
+port, its JA4 fingerprint and the proxy session ID (8.4). LMTP `XCLIENT` is judged by the proxy
+and still carries the client's `HELO` next to a PROXY header
+([SECURITY.md](SECURITY.md#31-trusted_networks)).
 
 ### 8.2 Which settings apply
 

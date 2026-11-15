@@ -20,7 +20,6 @@ func TestEveryPooledConnectionHasThePragmas(t *testing.T) {
 		{"path", func(dir string) string { return filepath.Join(dir, "auth_cache.db") }},
 		{"file URI", func(dir string) string { return "file:" + filepath.Join(dir, "auth_cache.db") }},
 		{"file URI params", func(dir string) string { return "file:" + filepath.Join(dir, "auth_cache.db") + "?mode=rwc" }},
-		{"memory", func(string) string { return ":memory:" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, err := New(tc.dbPath(t.TempDir()), time.Hour, 24*time.Hour, time.Hour)

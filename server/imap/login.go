@@ -205,19 +205,12 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 		// Use base address (without suffix) to get account
 		AccountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, addressParsed.BaseAddress())
 		if err != nil {
-			// Check if error is due to context cancellation (server shutdown)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				s.InfoLog("master username auth cancelled due to server shutdown")
-				return &imap.Error{
-					Type: imap.StatusResponseTypeNo,
-					Code: imap.ResponseCodeUnavailable,
-					Text: server.ErrServerShuttingDown.Error(),
-				}
-			}
-
 			// The database could not be asked, so nothing is known about the target:
 			// a temporary failure (RFC 5530 section 3), not a failed login charged to
-			// the master credential.
+			// the master credential. Checked before the context errors, as on the
+			// regular path: a lookup that timed out because the database hangs is no
+			// shutdown, and a wrong master password, which the regular path answers,
+			// must get the same reply.
 			if server.IsTemporaryAuthFailure(err) {
 				s.WarnLog("impersonation target lookup unavailable", "target_user", addressParsed.BaseAddress(), "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
@@ -225,6 +218,16 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 					Type: imap.StatusResponseTypeNo,
 					Code: imap.ResponseCodeUnavailable,
 					Text: server.ErrAuthServiceUnavailable.Error(),
+				}
+			}
+
+			// Check if error is due to context cancellation (server shutdown)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.InfoLog("master username auth cancelled due to server shutdown")
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeUnavailable,
+					Text: server.ErrServerShuttingDown.Error(),
 				}
 			}
 
@@ -253,6 +256,22 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 		var reason string
 		AccountID, method, reason, err = s.server.Authenticate(ctx, addressParsed.BaseAddress(), password)
 		if err != nil {
+			// The database could not be asked, or the stored hash cannot be checked, so
+			// nothing is known about the credentials: a temporary failure (RFC 5530
+			// section 3, "a subsystem is down"), not counted as a failed login, or clients
+			// retrying a saved password through an outage stay blocked after it. Checked
+			// before the context errors below: a lookup that ran into its timeout because
+			// the database hangs carries DeadlineExceeded too, and is not a shutdown.
+			if server.IsTemporaryAuthFailure(err) {
+				s.WarnLog("authentication unavailable", "address", addressParsed.BaseAddress(), "reason", reason, "method", method, "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeUnavailable,
+					Text: server.ErrAuthServiceUnavailable.Error(),
+				}
+			}
+
 			// Check if error is due to context cancellation (server shutdown)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				// Server is shutting down - return temporary failure without recording as auth failure
@@ -261,20 +280,6 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 					Type: imap.StatusResponseTypeNo,
 					Code: imap.ResponseCodeUnavailable,
 					Text: server.ErrServerShuttingDown.Error(),
-				}
-			}
-
-			// The database could not be asked, or the stored hash cannot be checked, so
-			// nothing is known about the credentials: a temporary failure (RFC 5530
-			// section 3, "a subsystem is down"), not counted as a failed login, or clients
-			// retrying a saved password through an outage stay blocked after it.
-			if server.IsTemporaryAuthFailure(err) {
-				s.WarnLog("authentication unavailable", "address", addressParsed.BaseAddress(), "reason", reason, "method", method, "error", err)
-				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
-				return &imap.Error{
-					Type: imap.StatusResponseTypeNo,
-					Code: imap.ResponseCodeUnavailable,
-					Text: server.ErrAuthServiceUnavailable.Error(),
 				}
 			}
 
@@ -325,34 +330,6 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 		return s.internalError("failed to get primary email: %v", err)
 	}
 
-	if !s.server.maintenanceGate.Admit(&s.server.authenticatedConnections, "imap") {
-		return s.refusedInMaintenance(addressParsed.BaseAddress())
-	}
-	duration := time.Since(authStart)
-
-	// Prometheus metrics - successful authentication
-	metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
-	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
-
-	// IMPORTANT: Set user state AFTER incrementing both counters to prevent race condition
-	// If session closes between counter increments and user state setting, cleanup won't decrement
-	s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
-	s.Session.User = &s.IMAPUser.User
-
-	// Log authentication with alias detection, once the session's user and account_id
-	// fields name the account
-	loginAddr := addressParsed.BaseAddress()
-	cached := method == "cache"
-	if loginAddr != primaryAddr.FullAddress() {
-		s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "cached", cached, "method", method, "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-	} else {
-		s.InfoLog("authentication successful", "address", loginAddr, "cached", cached, "method", method, "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-	}
-
-	// Domain and user tracking
-	metrics.TrackDomainConnection("imap", addressParsed.Domain())
-	metrics.TrackUserActivity("imap", addressParsed.BaseAddress(), "connection", 1)
-
 	// Record successful authentication: a master login under the master credential's
 	// key, any other under the account's, the master form with its own password too
 	// (#949): under the master key it would clear the failed guesses at the master
@@ -361,13 +338,21 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, server.AuthSuccessRateLimitKey(address, password, s.server.masterUsername, s.server.masterPassword), true)
 	}
 
-	// Register connection for tracking
-	if err := s.registerConnection(addressParsed.BaseAddress()); err != nil {
-		// Connection limit reached - undo authentication and reject
+	return s.completeAuthentication(AccountID, addressParsed, primaryAddr, method, authStart, true)
+}
+
+// completeAuthentication admits the session through the maintenance gate and
+// connection tracker before setting user state, incrementing authentication and
+// connection metrics, or logging "authentication successful". Shared by login
+// and both master-impersonation paths in sasl.go.
+func (s *IMAPSession) completeAuthentication(accountID int64, address, primaryAddr server.Address, method string, authStart time.Time, trackActivity bool) error {
+	loginAddr := address.BaseAddress()
+	if !s.server.maintenanceGate.Admit(&s.server.authenticatedConnections, "imap") {
+		return s.refusedInMaintenance(loginAddr)
+	}
+
+	if err := s.registerConnection(accountID, loginAddr); err != nil {
 		s.server.authenticatedConnections.Add(-1)
-		metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Dec()
-		s.IMAPUser = nil
-		s.Session.User = nil
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeLimit,
@@ -375,10 +360,38 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 		}
 	}
 
-	// Start termination poller to check for kick commands
+	duration := time.Since(authStart)
+
+	// Prometheus metrics - successful authentication
+	metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
+	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
+
+	// IMPORTANT: Set user state AFTER incrementing both counters to prevent race condition
+	// If session closes between counter increments and user state setting, cleanup won't decrement
+	s.IMAPUser = NewIMAPUser(primaryAddr, accountID)
+	s.Session.User = &s.IMAPUser.User
+
+	// Log authentication with alias detection, once the session's user and account_id
+	// fields name the account
+	cached := method == "cache"
+	if loginAddr != primaryAddr.FullAddress() {
+		s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "cached", cached, "method", method, "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+	} else {
+		s.InfoLog("authentication successful", "address", loginAddr, "cached", cached, "method", method, "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+	}
+
+	if trackActivity {
+		metrics.TrackDomainConnection("imap", address.Domain())
+		metrics.TrackUserActivity("imap", loginAddr, "connection", 1)
+	}
+
+	// Start termination poller to check for kick commands. Required on every
+	// authenticated path: it is the only delivery path for kicks, and imapproxy
+	// authenticates to its backends with master AUTHENTICATE, so without it
+	// proxied backend sessions are tracked but unkickable.
 	s.startTerminationPoller()
 
-	// Trigger cache warmup for the authenticated user
+	// Trigger cache warmup for the authenticated user (if configured)
 	s.triggerCacheWarmup()
 
 	return nil

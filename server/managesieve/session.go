@@ -901,31 +901,27 @@ func (s *ManageSieveSession) SetActive(ctx context.Context, name string) error {
 func (s *ManageSieveSession) DeleteScript(ctx context.Context, name string) error {
 	ctx, cancel := applyCommandTimeout(ctx, "DELETESCRIPT", s.server.commandTimeouts)
 	defer cancel()
-	accountID, readCtx, err := s.sessionState(ctx, "DELETESCRIPT")
+	accountID, _, err := s.sessionState(ctx, "DELETESCRIPT")
 	if err != nil {
 		return err
 	}
 
-	script, dbErr := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, accountID)
-	if dbErr != nil {
-		if dbErr == consts.ErrDBNotFound {
-			return errNonExistent
-		}
-		return errTryLater
-	}
-
 	// RFC 5804 §2.10: the active script MUST NOT be deleted; the client must
-	// first deactivate it via SETACTIVE "".
-	if script.Active {
+	// first deactivate it via SETACTIVE "". The script is looked up and checked
+	// in the delete's transaction: a lookup before it (on a lagging replica, or
+	// racing another session's SETACTIVE) can see an inactive script that is
+	// active by the time it is deleted.
+	switch err := s.server.rdb.DeleteInactiveScriptWithRetry(ctx, name, accountID); {
+	case err == nil:
+		s.pinToMasterDB("DELETESCRIPT")
+		return nil
+	case errors.Is(err, consts.ErrDBNotFound):
+		return errNonExistent
+	case errors.Is(err, db.ErrSieveScriptActive):
 		return &managesieveserver.Error{Code: "ACTIVE", Message: "Cannot delete the active script; deactivate it first"}
-	}
-
-	if err := s.server.rdb.DeleteScriptByIDWithRetry(ctx, script.ID, accountID); err != nil {
+	default:
 		return errTryLater
 	}
-
-	s.pinToMasterDB("DELETESCRIPT")
-	return nil
 }
 
 // RenameScript implements managesieveserver.Session. The rename is a single

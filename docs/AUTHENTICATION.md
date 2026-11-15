@@ -664,9 +664,10 @@ The wait of section 10.3 comes before the reply in every case.
 - In cluster mode, with `[cluster.rate_limit_sync] enabled` (the default), the `imap_proxy`,
   `pop3_proxy` and `managesieve_proxy` limiters share their state with the proxies of the same type
   on every node, their own node included: Tier 2 blocks (`sync_blocks`), Tier 2 counts from
-  `delay_start_threshold` on (`sync_failure_counts`), and the name statistics. A shared count only
-  raises a listener's own, its `exempt_networks` are not counted, and a shared wait is capped at its
-  `max_delay`. Tier 1 blocks stay on the listener that set them. See
+  `delay_start_threshold` on and the successes that clear them (`sync_failure_counts`), and the
+  name statistics. A shared count only raises a listener's own, its `exempt_networks` are not
+  counted, and a shared wait is capped at its `max_delay`. Tier 1 blocks stay on the listener that
+  set them. See
   [CLUSTER.md](CLUSTER.md#66-authentication-rate-limits-imap-pop3-and-managesieve-proxies) for the
   details and [CONFIGURATION.md](CONFIGURATION.md#814-cluster-cluster) for the keys.
 - A restart forgets all counts and blocks.
@@ -697,8 +698,15 @@ ways:
 
 - **The client IP.** A host in the list may pass on the client's address with a PROXY header (on a
   listener with `proxy_protocol = true`), with IMAP ID forwarding parameters, or with POP3 XCLIENT.
-  The rate limiter and the logs then use that forwarded address. From a host not in the list, these
-  are ignored and the TCP peer is the client.
+  Logs use that forwarded address. Authentication rate-limit checks and counters do too, but POP3
+  `XCLIENT` needs `FORWARD` metadata containing `proxy-source-ip` when no client address came from
+  a PROXY header. Sora's POP3 proxy sends it; bare `ADDR` changes the logged address while those
+  checks and counters still use the TCP peer. From a host not in the list, ID and XCLIENT
+  forwarding are ignored or refused and the TCP peer is the client, and a
+  `proxy_protocol = true` listener closes the connection. Behind a PROXY header, ID and POP3
+  XCLIENT forwarding are judged by the client the header names, so a client behind a trusted load
+  balancer cannot forward another address unless its own address is in the list
+  ([SECURITY.md](SECURITY.md#31-trusted_networks)).
 - **Rate-limit exemption.** Unless `exempt_networks` is set, addresses in the list are exempt from
   rate limiting (section 10.5).
 

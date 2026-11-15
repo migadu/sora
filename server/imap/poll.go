@@ -469,10 +469,13 @@ var _ imapserver.SessionHighestModSeq = (*IMAPSession)(nil)
 
 // HighestModSeq implements imapserver.SessionHighestModSeq: the HIGHESTMODSEQ the
 // first CONDSTORE enabling command with a mailbox selected returns (RFC 7162
-// §3.1). The poll cursor is not it: it also covers what a FETCH, STORE or SEARCH
-// left queued, an EXPUNGE they may not send and whatever follows it, and the
-// client adopts the value "even if it has seen higher mod-sequences" (RFC 7162
-// §6), so it would skip those changes if it resynchronized from it. A flag
+// §3.1), and the one written after a command whose MODSEQ FETCH data items went
+// past it, such as a STORE answered while another session's VANISHED is held
+// back (RFC 7162 §3.2). The poll cursor is not it: it also covers what a FETCH,
+// STORE or SEARCH left queued, an EXPUNGE they may not send and whatever
+// follows it, and the client adopts the value "even if it has seen higher
+// mod-sequences" (RFC 7162 §6), so it would skip those changes if it
+// resynchronized from it. A flag
 // change consumed under a NOTIFY filter also holds this value back until a
 // new SELECT: changing the filter does not replay the consumed flag update.
 func (s *IMAPSession) HighestModSeq() uint64 {
