@@ -12,12 +12,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// setMetadataWhileAnotherIsOpen runs first in a transaction it keeps open, then
-// second in another transaction, waits until second has either returned or is
-// waiting for a lock, commits first, and commits second if it succeeded. It
-// returns second's error: what a SETMETADATA gets while another SETMETADATA of
-// the account is still in flight.
-func setMetadataWhileAnotherIsOpen(t *testing.T, db *Database, first, second func(context.Context, pgx.Tx) error) error {
+// writeWhileAnotherIsOpen runs first in a transaction it keeps open, then second
+// in another transaction, waits until second has either returned or is waiting
+// for a lock, commits first, and commits second if it succeeded. It returns
+// second's error: what a write (a SETMETADATA, a PUTSCRIPT) gets while another
+// write of the account is still in flight.
+func writeWhileAnotherIsOpen(t *testing.T, db *Database, first, second func(context.Context, pgx.Tx) error) error {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -114,7 +114,7 @@ func TestMetadataCountLimitHoldsWhileAnotherSetIsOpen(t *testing.T) {
 	require.NoError(t, db.SetMetadata(ctx, tx, accountID, nil, map[string]*[]byte{"/private/k0": bytePtr([]byte("v"))}, limits))
 	require.NoError(t, tx.Commit(ctx))
 
-	secondErr := setMetadataWhileAnotherIsOpen(t, db,
+	secondErr := writeWhileAnotherIsOpen(t, db,
 		func(ctx context.Context, tx pgx.Tx) error {
 			return db.SetMetadata(ctx, tx, accountID, nil, map[string]*[]byte{"/private/k1": bytePtr([]byte("v"))}, limits)
 		},
@@ -150,7 +150,7 @@ func TestMetadataTotalSizeHoldsWhileAnotherSetIsOpen(t *testing.T) {
 	require.NoError(t, err)
 	mailboxID := mailbox.ID
 
-	secondErr := setMetadataWhileAnotherIsOpen(t, db,
+	secondErr := writeWhileAnotherIsOpen(t, db,
 		func(ctx context.Context, tx pgx.Tx) error {
 			return db.SetMetadata(ctx, tx, accountID, nil, map[string]*[]byte{"/private/a": bytePtr([]byte("123456"))}, limits)
 		},

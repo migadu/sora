@@ -197,7 +197,10 @@ type MetadataLimits struct {
 // SetMetadata sets or removes server or mailbox metadata entries.
 // If mailboxID is nil, sets server metadata.
 // To remove an entry, set its value to nil.
-// Returns ErrMetadataTooBig, ErrMetadataTooMany, or ErrMetadataQuotaExceeded if limits are exceeded.
+// Returns a *MetadataError (MetadataErrMaxSize, MetadataErrTooMany or
+// MetadataErrQuotaExceeded) when the command would break a limit. The count
+// and size limits refuse only a command that raises the count or the size, so
+// an account already past one can still delete, overwrite and shrink entries.
 func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64, mailboxID *int64, entries map[string]*[]byte, limits *MetadataLimits) error {
 	if len(entries) == 0 {
 		return nil
@@ -275,7 +278,23 @@ func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 				maxEntries = limits.MaxEntriesPerMailbox
 			}
 
-			if maxEntries > 0 {
+			additions, deletions := 0, 0
+			for entryName, entryValue := range entries {
+				_, present := existingSizes[entryName]
+				switch {
+				case entryValue != nil && !present:
+					additions++
+				case entryValue == nil && present:
+					deletions++
+				}
+			}
+
+			// Only a command that adds entries overall is refused: TOOMANY is
+			// for "a new annotation" once the maximum "has already been
+			// reached" (RFC 5464 §4.3). An account already past the limit (it
+			// was lowered) must still be able to delete or overwrite entries to
+			// get back under it one command at a time.
+			if maxEntries > 0 && additions > deletions {
 				var currentCount int
 				if err := tx.QueryRow(ctx, `
 					SELECT COUNT(*)
@@ -284,17 +303,6 @@ func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 					  AND mailbox_id IS NOT DISTINCT FROM $2
 				`, accountID, mailboxID).Scan(&currentCount); err != nil {
 					return fmt.Errorf("failed to count existing metadata: %w", err)
-				}
-
-				additions, deletions := 0, 0
-				for entryName, entryValue := range entries {
-					_, present := existingSizes[entryName]
-					switch {
-					case entryValue != nil && !present:
-						additions++
-					case entryValue == nil && present:
-						deletions++
-					}
 				}
 
 				if currentCount+additions-deletions > maxEntries {
@@ -310,15 +318,6 @@ func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 		// value's size and subtract the old size of any entry being overwritten or
 		// deleted in this request, so an overwrite only counts its net delta.
 		if limits.MaxTotalSize > 0 {
-			var accountTotalSize int64
-			if err := tx.QueryRow(ctx, `
-				SELECT COALESCE(SUM(LENGTH(entry_value)), 0)
-				FROM metadata
-				WHERE account_id = $1
-			`, accountID).Scan(&accountTotalSize); err != nil {
-				return fmt.Errorf("failed to calculate total metadata size: %w", err)
-			}
-
 			sizeDelta := int64(0)
 			for entryName, entryValue := range entries {
 				newSize := int64(0)
@@ -328,10 +327,23 @@ func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 				sizeDelta += newSize - existingSizes[entryName] // existingSizes[name] is 0 if absent
 			}
 
-			if accountTotalSize+sizeDelta > int64(limits.MaxTotalSize) {
-				return &MetadataError{
-					Type:    MetadataErrQuotaExceeded,
-					Message: fmt.Sprintf("metadata quota exceeded (limit: %d bytes)", limits.MaxTotalSize),
+			// Likewise only a command that grows the total is refused, so an
+			// account over the quota can shrink or delete values.
+			if sizeDelta > 0 {
+				var accountTotalSize int64
+				if err := tx.QueryRow(ctx, `
+					SELECT COALESCE(SUM(LENGTH(entry_value)), 0)
+					FROM metadata
+					WHERE account_id = $1
+				`, accountID).Scan(&accountTotalSize); err != nil {
+					return fmt.Errorf("failed to calculate total metadata size: %w", err)
+				}
+
+				if accountTotalSize+sizeDelta > int64(limits.MaxTotalSize) {
+					return &MetadataError{
+						Type:    MetadataErrQuotaExceeded,
+						Message: fmt.Sprintf("metadata quota exceeded (limit: %d bytes)", limits.MaxTotalSize),
+					}
 				}
 			}
 		}

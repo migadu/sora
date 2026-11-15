@@ -76,10 +76,15 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 
 	seqCTE, seqJoin, seqSelect := "", "", "0"
 	if withSeqNums {
+		// Numbered in ctx's view (WithSeqView), if it has one.
+		viewParam := ""
+		if view := seqViewOf(ctx); view > 0 {
+			whereArgs["seq_view"] = int64(view)
+			viewParam = "@seq_view"
+		}
 		seqCTE = `WITH seq AS (
 			SELECT uid, ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
-			FROM messages
-			WHERE mailbox_id = @mailboxID AND expunged_at IS NULL
+			FROM ` + seqCountedRows("@mailboxID", viewParam, "", "ASC", "") + ` counted
 		)`
 		seqJoin = "JOIN seq ON seq.uid = m.uid"
 		seqSelect = "seq.seqnum"
