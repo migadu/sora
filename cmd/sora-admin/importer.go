@@ -1191,7 +1191,11 @@ func importedFolderName(name string) (string, error) {
 	if name == "" {
 		return "", errors.New("empty mailbox name")
 	}
-	return specialFolderName(name), nil
+	name = specialFolderName(name)
+	if !helpers.MailboxNameValid(name) {
+		return "", fmt.Errorf("invalid mailbox name %q", name)
+	}
+	return name, nil
 }
 
 // specialFolderName maps the names other mail systems give their special folders
