@@ -366,6 +366,7 @@ These come from go-sieve and are not configurable.
 | Variable name length | 32 bytes | The script fails. |
 | Variable value length | 4000 bytes | The value is cut. |
 | Regex pattern length | 1000 bytes | The script fails. |
+| Compiled size of a `:regex` key | about 10000 instructions; a counted repeat such as `a{100}` counts what it repeats that many times | The script fails. |
 | Text fed to one regex or `:matches` match | 256 KB | The text is cut, the match goes on. |
 
 ---
