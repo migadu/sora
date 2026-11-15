@@ -1,9 +1,13 @@
 package sieveengine
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"slices"
 	"testing"
+
+	"github.com/emersion/go-message/textproto"
 )
 
 // TestApplyHeaderEditsFieldOrder is issue #1585: the edits were applied through
@@ -210,4 +214,39 @@ if header :is "X-Foo" "new-first" { fileinto "seen"; }
 	if string(got) != want {
 		t.Errorf("edited message:\n%q\nwant:\n%q", got, want)
 	}
+}
+
+// FuzzParseHeaderFields checks that ApplyHeaderEdits sees the fields the script
+// saw: the script's header map comes from go-message, and a value-pattern
+// deleteheader selects a field by the value go-message gave it. An edit that
+// changes nothing leaves the message as it is.
+func FuzzParseHeaderFields(f *testing.F) {
+	for _, seed := range []string{
+		"A: b\r\n c\r\nD :  e \r\n\t\r\nF:\r\n\r\nbody",
+		"A: b\nC: d\n\nx",
+		"A: b\r\r\nC: \r d\r\n",
+		":\r",
+	} {
+		f.Add([]byte(seed))
+	}
+	f.Fuzz(func(t *testing.T, msg []byte) {
+		h, err := textproto.ReadHeader(bufio.NewReader(bytes.NewReader(msg)))
+		if err != nil {
+			return // delivery refuses a message whose header go-message cannot read
+		}
+		fields := parseHeaderFields(msg[:headerEnd(msg)])
+		if len(fields) != h.Len() {
+			t.Fatalf("%q: %d fields, go-message reads %d", msg, len(fields), h.Len())
+		}
+		i := 0
+		for fs := h.Fields(); fs.Next(); i++ {
+			if key, value := lowerASCII(fs.Key()), fs.Value(); fields[i].key != key || fields[i].value != value {
+				t.Fatalf("%q: field %d is %q: %q, go-message reads %q: %q", msg, i, fields[i].key, fields[i].value, key, value)
+			}
+		}
+		got, err := ApplyHeaderEdits(msg, []HeaderEdit{{Action: "delete", FieldName: "X-Absent"}})
+		if err != nil || !bytes.Equal(got, msg) {
+			t.Fatalf("%q: an edit that matches nothing gave %q, %v", msg, got, err)
+		}
+	})
 }
