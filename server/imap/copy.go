@@ -165,7 +165,7 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	}
 
 	// Perform the batch copy operation
-	uidMap, newMessageIDs, err := s.server.rdb.CopyMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname, sourceHashes, destHashes, ensureDestObject)
+	uidMap, newMessageIDs, err := s.server.rdb.CopyMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.instanceID, sourceHashes, destHashes, ensureDestObject)
 	if err != nil {
 		var destErr *resilient.DestObjectError
 		switch {
