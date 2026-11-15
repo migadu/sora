@@ -807,9 +807,14 @@ func (s *POP3ProxySession) connectToBackend() error {
 		useXCLIENT = s.routingInfo.RemoteUseXCLIENT
 	}
 	if useXCLIENT {
-		if err := s.sendForwardingParametersToBackend(backendWriter, backendReader); err != nil {
+		if err := s.sendForwardingParametersToBackend(backendWriter, backendReader); errors.Is(err, errXCLIENTRefused) {
+			// Go on without them: the -ERR ended the exchange.
 			s.WarnLog("Failed to send forwarding parameters to backend", "error", err)
-			// Continue anyway - forwarding parameters are not critical for functionality
+		} else if err != nil {
+			// The XCLIENT reply was not read (a write or read error, or the deadline). It
+			// may still come, and AUTH would take a late +OK for its own reply.
+			s.backendConn.Close()
+			return fmt.Errorf("%w: XCLIENT exchange with backend: %w", server.ErrBackendConnectionFailed, err)
 		}
 	}
 

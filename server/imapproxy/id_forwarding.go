@@ -10,6 +10,12 @@ import (
 	"github.com/migadu/sora/server"
 )
 
+// errIDRefused is the backend refusing the forwarded ID with a tagged NO or BAD. Its
+// tagged reply was read, so the stream is at a command boundary and the login can go on
+// without the forwarding parameters. Any other error of the exchange leaves the reply
+// unread, or partly read, and the connection unusable.
+var errIDRefused = errors.New("backend rejected ID command")
+
 // sendForwardingParametersToBackend sends an ID command to the backend server
 // with forwarding parameters containing the real client information
 func (s *Session) sendForwardingParametersToBackend() error {
@@ -55,8 +61,9 @@ func (s *Session) sendForwardingParametersToBackend() error {
 		fields = append(fields, fmt.Sprintf(`"%s" "%s"`, escapeIMAPString(key), escapeIMAPString(value)))
 	}
 
-	// Generate a random tag to avoid conflicts with client tags
-	tag := fmt.Sprintf("p%d", rand.Intn(10000))
+	// Generate a random tag to avoid conflicts with client tags. Its prefix differs from
+	// the AUTHENTICATE tag's, so the two replies can never be taken for each other.
+	tag := fmt.Sprintf("i%d", rand.Intn(10000))
 	idCommand := fmt.Sprintf("%s ID (%s)\r\n", tag, strings.Join(fields, " "))
 
 	// Send ID command to backend
@@ -111,7 +118,7 @@ func (s *Session) sendForwardingParametersToBackend() error {
 			continue
 		}
 		if !ok {
-			return fmt.Errorf("backend rejected ID command: %s", response)
+			return fmt.Errorf("%w: %s", errIDRefused, response)
 		}
 		s.DebugLog("ID forwarding completed successfully")
 		return nil

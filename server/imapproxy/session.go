@@ -1490,6 +1490,27 @@ func (s *Session) connectToBackend() error {
 		s.WarnLog("failed to clear read deadline", "error", err)
 	}
 
+	// Send ID command to backend with forwarding parameters if enabled.
+	// This MUST be done before authenticating to the backend, as the ID command
+	// is only valid in the "Not Authenticated" state.
+	useIDCommand := s.server.remoteUseIDCommand
+	// The route's setting applies to the backend the lookup named or its pool picked (as for the dial)
+	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
+		useIDCommand = s.routingInfo.RemoteUseIDCommand
+	}
+	if useIDCommand {
+		if err := s.sendForwardingParametersToBackend(); errors.Is(err, errIDRefused) {
+			// Go on without them: the tagged reply ended the exchange.
+			s.WarnLog("failed to send forwarding parameters to backend", "error", err)
+		} else if err != nil {
+			// The ID reply was not read to its tagged end (a write or read error, or the
+			// deadline). It may still come, and AUTHENTICATE would read it as its own.
+			s.backendConn.Close()
+			s.ErrorLog("ID exchange with backend failed", "backend", s.serverAddr, "error", err)
+			return fmt.Errorf("ID exchange with backend: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -1637,21 +1658,6 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 		s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server temporarily unavailable", clientTag))
 		s.sendResponse("* BYE Backend server unavailable, please try again")
 		return false
-	}
-
-	// Send ID command to backend with forwarding parameters if enabled.
-	// This MUST be done before authenticating to the backend, as the ID command
-	// is only valid in the "Not Authenticated" state.
-	useIDCommand := s.server.remoteUseIDCommand
-	// The route's setting applies to the backend the lookup named or its pool picked (as for the dial)
-	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
-		useIDCommand = s.routingInfo.RemoteUseIDCommand
-	}
-	if useIDCommand {
-		if err := s.sendForwardingParametersToBackend(); err != nil {
-			s.WarnLog("failed to send forwarding parameters to backend", "error", err)
-			// Continue anyway - forwarding parameters are not critical
-		}
 	}
 
 	// Authenticate to backend with master credentials

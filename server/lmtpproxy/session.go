@@ -1407,11 +1407,17 @@ func (s *Session) connectToBackend() error {
 	// The `isFromTrustedProxy()` check is for proxy-chaining, where a backend
 	// needs to validate if the client connecting to it is another trusted proxy.
 	if useXCLIENT {
-		if err := s.sendForwardingParametersToBackend(s.backendWriter, s.backendReader); err != nil {
+		if err := s.sendForwardingParametersToBackend(s.backendWriter, s.backendReader); errors.Is(err, errXCLIENTRefused) {
 			s.WarnLog("Failed to send XCLIENT to backend - continuing without forwarding parameters", "backend", s.serverAddr, "error", err)
-			// Continue without forwarding parameters rather than failing
+			// Continue without forwarding parameters rather than failing: the refusal
+			// ended the exchange.
 			// Note: If XCLIENT is rejected, this may indicate backend is not configured
 			// to accept XCLIENT from this proxy IP (check backend's trusted_networks)
+		} else if err != nil {
+			// A reply of the exchange was not read (a write or read error, or the
+			// deadline). It may still come, and MAIL FROM would read it as its own.
+			s.backendConn.Close()
+			return fmt.Errorf("XCLIENT exchange with backend: %w", err)
 		}
 	}
 
