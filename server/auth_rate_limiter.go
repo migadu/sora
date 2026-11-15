@@ -175,6 +175,11 @@ type IPFailureInfo struct {
 	LastDelay    time.Duration
 	counterSlot
 	parkedUntil time.Time // while in ipParked: the end of the address's block
+
+	// The count reached the protocol's other listeners: it got to
+	// delay_start_threshold here, from where each failure is sent, or a peer's
+	// count was merged into it. Only then does a success clear it there too.
+	shared bool
 }
 
 func (i *IPFailureInfo) evictionTime() time.Time {
@@ -588,6 +593,7 @@ func (a *AuthRateLimiter) countIPFailure(ip string, failureTime time.Time) (fail
 	}
 
 	if info.FailureCount >= a.config.DelayStartThreshold {
+		info.shared = true
 		if info.LastDelay == 0 {
 			info.LastDelay = min(a.config.InitialDelay, a.config.MaxDelay)
 		} else {
@@ -634,15 +640,30 @@ func (a *AuthRateLimiter) countIPFailure(ip string, failureTime time.Time) (fail
 // Callers check CanAttemptAuth first, so a success during a block comes from a path
 // that skipped the check or from a login verified while concurrent failures blocked
 // the address; neither may end the block before ip_block_duration.
+//
+// A shared count is cleared on the protocol's other listeners too. A count that
+// never left this listener (below delay_start_threshold) costs no gossip.
 func (a *AuthRateLimiter) clearFailureTracking(ip string) {
 	a.ipMu.Lock()
-	defer a.ipMu.Unlock()
-	if blocked, exists := a.blockedIPs[ip]; exists && time.Now().Before(blocked.BlockedUntil) {
+	clearedAt := time.Now()
+	if blocked, exists := a.blockedIPs[ip]; exists && clearedAt.Before(blocked.BlockedUntil) {
+		a.ipMu.Unlock()
 		return
 	}
+	info, tracked := a.ipFailureCounts[ip]
+	shared := tracked && info.shared
 	a.dropIPCounter(ip)
 	delete(a.blockedIPs, ip)
+	a.ipMu.Unlock()
 	logger.Debug("Auth limiter: Cleared failure tracking after successful login", "protocol", a.protocol, "ip", ip)
+
+	// The cluster is told with ipMu released (see updateFailureTracking), and
+	// the clear is stamped with the time taken under it: a failure this listener
+	// counts after the clear is sent with a later time, so it survives the clear
+	// on the other listeners.
+	if shared && a.clusterLimiter != nil {
+		a.clusterLimiter.BroadcastIPSuccess(ip, clearedAt)
+	}
 }
 
 // updateIPUsernameFailure tracks IP+username authentication failures (Tier 1: fast blocking).

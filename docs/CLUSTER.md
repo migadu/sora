@@ -331,7 +331,7 @@ port 143 and another on port 993. IMAP failures never count on a POP3 proxy.
 | State | What is shared | Key |
 |---|---|---|
 | Tier 2 IP blocks | When an address reaches `max_attempts_per_ip`, its block and the time it ends go to every listener of the protocol. Each refuses logins from the address until that time. | `sync_blocks` |
-| Tier 2 failure counts and progressive delays | Each failure from an address whose count has reached `delay_start_threshold` sends the count and the current wait. A received count only raises the listener's own and never lowers it. Counts below `delay_start_threshold` stay on the listener. | `sync_failure_counts` |
+| Tier 2 failure counts and progressive delays | Each failure from an address whose count has reached `delay_start_threshold` sends the count and the current wait. A received count only raises the listener's own and never lowers it. Counts below `delay_start_threshold` stay on the listener. A successful login from the address clears its count on every listener, except one that blocks the address or has seen a failure from it since the success. | `sync_failure_counts` |
 | Name statistics | Every failure of a name, and the success that clears its failures. | always, while `enabled` |
 | Tier 1 (IP and name) blocks | Not shared: they stay on the listener that set them. | none |
 
@@ -456,8 +456,9 @@ These details matter when you size a busy cluster or read a warning in the log.
   for members that were unreachable at that moment. An overflow is logged at Error level.
 - **Affinity queue.** Up to 5000 outgoing affinity events.
 - **Rate-limit queues.** Each proxy rate limiter queues up to 10000 outgoing IP blocks and 10000
-  other events (failure counts, name failures and successes). An overflow drops messages as in the
-  connection event queue. Nothing repairs a dropped rate-limit event.
+  other events (failure counts and the successes that clear them, name failures and successes). An
+  overflow drops messages as in the connection event queue. Nothing repairs a dropped rate-limit
+  event.
 - **Per-IP queue.** Each per-IP tracker queues up to 10000 outgoing events. The next full-state
   exchange repairs a dropped one.
 - **Receiving.** Each subsystem handles received events on its own worker, with a queue of 256. If
