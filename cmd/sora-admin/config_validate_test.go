@@ -448,3 +448,33 @@ func TestConfigValidateHelpNamesWhatItChecks(t *testing.T) {
 		}
 	}
 }
+
+// TestConfigValidateHelpStartChecksNoS3 (#1425): what the help says service start checks
+// must not include S3 or a remote lookup. Start-up builds the S3 client
+// (storage.New) and the remote lookup client (NewHTTPRemoteLookupClient) without a
+// request to either; only the health monitor reaches them, after start. An operator told
+// otherwise takes a clean start as proof that a mistyped S3 endpoint works.
+func TestConfigValidateHelpStartChecksNoS3(t *testing.T) {
+	help := captureStdout(t, func() error {
+		printConfigValidateUsage()
+		return nil
+	})
+	var found bool
+	for _, paragraph := range strings.Split(help, "\n\n") {
+		flat := strings.Join(strings.Fields(paragraph), " ")
+		for _, sentence := range strings.Split(flat, ". ") {
+			if !strings.Contains(strings.ToLower(sentence), "services start") {
+				continue
+			}
+			found = true
+			for _, unchecked := range []string{"S3", "remote lookup"} {
+				if strings.Contains(sentence, unchecked) {
+					t.Errorf("the help says service start checks %s, which start-up does not reach: %q", unchecked, sentence)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Errorf("the help does not say what service start checks:\n%s", help)
+	}
+}
