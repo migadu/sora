@@ -46,17 +46,34 @@ func TestIMAP_SelectCountsRecentInItsSnapshot(t *testing.T) {
 		write    func(w *rawIMAP) // commits while the SELECT is paused after its summary
 		// The mailbox at the summary: EXISTS and the messages above UID 4.
 		wantExists, wantRecent int
+		// UID SEARCH RECENT once the next poll has announced the write.
+		wantSearch string
 	}{
 		{
 			name:       "delivery after the summary",
 			write:      func(w *rawIMAP) { w.appendMsg("INBOX", msg(5)) },
-			wantExists: 4, wantRecent: 0,
+			wantExists: 4, wantRecent: 0, wantSearch: "5",
 		},
 		{
 			name:       "delivery after the summary on reselect",
 			reselect:   true,
 			write:      func(w *rawIMAP) { w.appendMsg("INBOX", msg(5)) },
-			wantExists: 4, wantRecent: 0,
+			wantExists: 4, wantRecent: 0, wantSearch: "5",
+		},
+		// UID 5 is already above the baseline, so RECENT is counted rather than known
+		// to be 0 from UIDNEXT.
+		{
+			name:       "delivery after the summary next to a recent message",
+			before:     func(w *rawIMAP) { w.appendMsg("INBOX", msg(5)) },
+			write:      func(w *rawIMAP) { w.appendMsg("INBOX", msg(6)) },
+			wantExists: 5, wantRecent: 1, wantSearch: "5 6",
+		},
+		{
+			name:       "delivery after the summary next to a recent message on reselect",
+			reselect:   true,
+			before:     func(w *rawIMAP) { w.appendMsg("INBOX", msg(5)) },
+			write:      func(w *rawIMAP) { w.appendMsg("INBOX", msg(6)) },
+			wantExists: 5, wantRecent: 1, wantSearch: "5 6",
 		},
 		{
 			name: "expunge of a recent message after the summary",
@@ -68,7 +85,7 @@ func TestIMAP_SelectCountsRecentInItsSnapshot(t *testing.T) {
 				w.do(`UID STORE 6 +FLAGS.SILENT (\Deleted)`)
 				w.do("UID EXPUNGE 6")
 			},
-			wantExists: 6, wantRecent: 2,
+			wantExists: 6, wantRecent: 2, wantSearch: "5",
 		},
 		{
 			name:     "expunge of a recent message after the summary on reselect",
@@ -81,7 +98,7 @@ func TestIMAP_SelectCountsRecentInItsSnapshot(t *testing.T) {
 				w.do(`UID STORE 6 +FLAGS.SILENT (\Deleted)`)
 				w.do("UID EXPUNGE 6")
 			},
-			wantExists: 6, wantRecent: 2,
+			wantExists: 6, wantRecent: 2, wantSearch: "5",
 		},
 	}
 
@@ -155,12 +172,12 @@ func TestIMAP_SelectCountsRecentInItsSnapshot(t *testing.T) {
 				"* %d EXISTS, * %d RECENT: RECENT must count the messages above UID 4 among the %d that EXISTS counts",
 				exists, recent, exists)
 
-			// The next poll announces what happened after the summary. UID 5 is
-			// \Recent in this session, as SEARCH RECENT answers from the baseline the
-			// SELECT counted from.
+			// The next poll announces what happened after the summary. A message
+			// delivered then is \Recent in this session, as SEARCH RECENT answers from
+			// the baseline the SELECT counted from.
 			c.do("NOOP")
 			searchRecent, _ := c.do("UID SEARCH RECENT")
-			assert.Equal(t, "5", responseNums(searchRecent, "* SEARCH"), "UID SEARCH RECENT after the poll")
+			assert.Equal(t, tc.wantSearch, responseNums(searchRecent, "* SEARCH"), "UID SEARCH RECENT after the poll")
 		})
 	}
 }
