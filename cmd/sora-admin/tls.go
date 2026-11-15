@@ -1390,6 +1390,12 @@ func makeCacheDir(dir string) error {
 		return err
 	}
 	defer parent.Close()
+	if name == "." || name == ".." {
+		// Creating a missing prefix can make a terminal dot component resolve.
+		// It names an existing directory, so validate it without any hand-over.
+		_, err := os.Stat(dir)
+		return err
+	}
 	err = parent.Mkdir(name, 0700)
 	if errors.Is(err, fs.ErrExist) {
 		info, statErr := parent.Stat(name)

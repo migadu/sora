@@ -406,3 +406,23 @@ func TestTLSCacheGiveDirDoesNotFollowAnAncestorReplacement(t *testing.T) {
 		t.Errorf("ancestor replaced=%v, ownership given to the created directory=%v", flipped, gaveCreated)
 	}
 }
+
+func TestTLSCacheCreatesMissingParentBeforeDotDot(t *testing.T) {
+	for _, suffix := range []string{"new/..", "new/../certs"} {
+		t.Run(suffix, func(t *testing.T) {
+			top := t.TempDir()
+			if err := makeCacheDir(top + "/" + suffix); err != nil {
+				t.Fatal(err)
+			}
+			for _, path := range []string{filepath.Join(top, "new"), top + "/" + suffix} {
+				info, err := os.Stat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !info.IsDir() {
+					t.Errorf("%s is not a directory", path)
+				}
+			}
+		})
+	}
+}
