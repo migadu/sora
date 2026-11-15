@@ -3,10 +3,12 @@ package db
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/consts"
 )
 
 // MetadataErrorType represents the type of metadata error.
@@ -23,25 +25,31 @@ const (
 type MetadataError struct {
 	Type    MetadataErrorType
 	Message string
+	MaxSize int // MetadataErrMaxSize: the largest value accepted, in octets
 }
 
 func (e *MetadataError) Error() string {
 	return e.Message
 }
 
-// ResponseCode returns the RFC 5464 METADATA response code for this error.
-func (e *MetadataError) ResponseCode() string {
+// ResponseCode returns the response code of the tagged NO for this error.
+// RFC 5464 §4.3 defines "[METADATA MAXSIZE NNN]", NNN being "the maximum
+// octet count that it is willing to accept", "[METADATA TOOMANY]" and
+// "[METADATA NOPRIVATE]". It has none for the account's total metadata size;
+// that is RFC 5530's OVERQUOTA: "The user would be over quota after the
+// operation."
+func (e *MetadataError) ResponseCode() imap.ResponseCode {
 	switch e.Type {
 	case MetadataErrMaxSize:
-		return "METADATA MAXSIZE"
+		return imap.MetadataMaxSizeResponseCode(uint32(min(int64(e.MaxSize), math.MaxUint32)))
 	case MetadataErrTooMany:
-		return "METADATA TOOMANY"
+		return imap.ResponseCodeMetadataTooMany
 	case MetadataErrQuotaExceeded:
-		return "METADATA TOOMANY" // Use TOOMANY for quota as well
+		return imap.ResponseCodeOverQuota
 	case MetadataErrNoPrivate:
-		return "METADATA NOPRIVATE"
+		return imap.ResponseCodeMetadataNoPrivate
 	default:
-		return "NO"
+		return imap.ResponseCodeLimit
 	}
 }
 
@@ -91,9 +99,12 @@ func (db *Database) GetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 			args = append(args, name)
 			argIdx++
 
-			// Immediate children (one level deeper, separated by /)
-			conditions = append(conditions, fmt.Sprintf("entry_name LIKE $%d AND entry_name NOT LIKE $%d", argIdx, argIdx+1))
-			args = append(args, name+"/%", name+"/%/%")
+			// Immediate children (one level deeper, separated by /). The name
+			// is escaped: "_" and "\" are valid in entry names (RFC 5464
+			// §3.2) and must match literally, not as LIKE metacharacters.
+			prefix := escapeLike(name + "/")
+			conditions = append(conditions, fmt.Sprintf(`entry_name LIKE $%d ESCAPE '\' AND entry_name NOT LIKE $%d ESCAPE '\'`, argIdx, argIdx+1))
+			args = append(args, prefix+"%", prefix+"%/%")
 			argIdx += 2
 		}
 
@@ -113,9 +124,9 @@ func (db *Database) GetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 		args = []any{accountID, mailboxID}
 
 		for _, name := range entryNames {
-			// Exact match or any descendant
-			conditions = append(conditions, fmt.Sprintf("(entry_name = $%d OR entry_name LIKE $%d)", argIdx, argIdx+1))
-			args = append(args, name, name+"/%")
+			// Exact match or any descendant, the name escaped as for DEPTH 1
+			conditions = append(conditions, fmt.Sprintf(`(entry_name = $%d OR entry_name LIKE $%d ESCAPE '\')`, argIdx, argIdx+1))
+			args = append(args, name, escapeLike(name+"/")+"%")
 			argIdx += 2
 		}
 
@@ -186,7 +197,10 @@ type MetadataLimits struct {
 // SetMetadata sets or removes server or mailbox metadata entries.
 // If mailboxID is nil, sets server metadata.
 // To remove an entry, set its value to nil.
-// Returns ErrMetadataTooBig, ErrMetadataTooMany, or ErrMetadataQuotaExceeded if limits are exceeded.
+// Returns a *MetadataError (MetadataErrMaxSize, MetadataErrTooMany or
+// MetadataErrQuotaExceeded) when the command would break a limit. The count
+// and size limits refuse only a command that raises the count or the size, so
+// an account already past one can still delete, overwrite and shrink entries.
 func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64, mailboxID *int64, entries map[string]*[]byte, limits *MetadataLimits) error {
 	if len(entries) == 0 {
 		return nil
@@ -201,8 +215,23 @@ func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 					return &MetadataError{
 						Type:    MetadataErrMaxSize,
 						Message: fmt.Sprintf("metadata entry %q exceeds max size of %d bytes", entryName, limits.MaxEntrySize),
+						MaxSize: limits.MaxEntrySize,
 					}
 				}
+			}
+		}
+
+		// The count and size limits are checked against what is stored and then
+		// written, so two writes of the account must not both read the old state:
+		// each would pass, and together they would store past the limit. The lock
+		// is per account, not per mailbox, as max_total_size sums every scope. It
+		// is transaction-scoped (pgbouncer transaction mode), and the queries below
+		// run after it is granted, so under READ COMMITTED they see what the
+		// previous holder committed.
+		if limits.MaxEntriesPerMailbox > 0 || limits.MaxEntriesPerServer > 0 || limits.MaxTotalSize > 0 {
+			if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int4, hashint8($2::int8))",
+				consts.SoraMetadataLimitLockClassID, accountID); err != nil {
+				return fmt.Errorf("failed to lock account metadata: %w", err)
 			}
 		}
 
@@ -249,7 +278,23 @@ func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 				maxEntries = limits.MaxEntriesPerMailbox
 			}
 
-			if maxEntries > 0 {
+			additions, deletions := 0, 0
+			for entryName, entryValue := range entries {
+				_, present := existingSizes[entryName]
+				switch {
+				case entryValue != nil && !present:
+					additions++
+				case entryValue == nil && present:
+					deletions++
+				}
+			}
+
+			// Only a command that adds entries overall is refused: TOOMANY is
+			// for "a new annotation" once the maximum "has already been
+			// reached" (RFC 5464 §4.3). An account already past the limit (it
+			// was lowered) must still be able to delete or overwrite entries to
+			// get back under it one command at a time.
+			if maxEntries > 0 && additions > deletions {
 				var currentCount int
 				if err := tx.QueryRow(ctx, `
 					SELECT COUNT(*)
@@ -258,17 +303,6 @@ func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 					  AND mailbox_id IS NOT DISTINCT FROM $2
 				`, accountID, mailboxID).Scan(&currentCount); err != nil {
 					return fmt.Errorf("failed to count existing metadata: %w", err)
-				}
-
-				additions, deletions := 0, 0
-				for entryName, entryValue := range entries {
-					_, present := existingSizes[entryName]
-					switch {
-					case entryValue != nil && !present:
-						additions++
-					case entryValue == nil && present:
-						deletions++
-					}
 				}
 
 				if currentCount+additions-deletions > maxEntries {
@@ -284,15 +318,6 @@ func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 		// value's size and subtract the old size of any entry being overwritten or
 		// deleted in this request, so an overwrite only counts its net delta.
 		if limits.MaxTotalSize > 0 {
-			var accountTotalSize int64
-			if err := tx.QueryRow(ctx, `
-				SELECT COALESCE(SUM(LENGTH(entry_value)), 0)
-				FROM metadata
-				WHERE account_id = $1
-			`, accountID).Scan(&accountTotalSize); err != nil {
-				return fmt.Errorf("failed to calculate total metadata size: %w", err)
-			}
-
 			sizeDelta := int64(0)
 			for entryName, entryValue := range entries {
 				newSize := int64(0)
@@ -302,10 +327,23 @@ func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 				sizeDelta += newSize - existingSizes[entryName] // existingSizes[name] is 0 if absent
 			}
 
-			if accountTotalSize+sizeDelta > int64(limits.MaxTotalSize) {
-				return &MetadataError{
-					Type:    MetadataErrQuotaExceeded,
-					Message: fmt.Sprintf("metadata quota exceeded (limit: %d bytes)", limits.MaxTotalSize),
+			// Likewise only a command that grows the total is refused, so an
+			// account over the quota can shrink or delete values.
+			if sizeDelta > 0 {
+				var accountTotalSize int64
+				if err := tx.QueryRow(ctx, `
+					SELECT COALESCE(SUM(LENGTH(entry_value)), 0)
+					FROM metadata
+					WHERE account_id = $1
+				`, accountID).Scan(&accountTotalSize); err != nil {
+					return fmt.Errorf("failed to calculate total metadata size: %w", err)
+				}
+
+				if accountTotalSize+sizeDelta > int64(limits.MaxTotalSize) {
+					return &MetadataError{
+						Type:    MetadataErrQuotaExceeded,
+						Message: fmt.Sprintf("metadata quota exceeded (limit: %d bytes)", limits.MaxTotalSize),
+					}
 				}
 			}
 		}

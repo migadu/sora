@@ -25,13 +25,20 @@ type captureRelayQueue struct {
 
 type relayItem struct {
 	from, to, msgType string
+	body              []byte
 }
 
 func (q *captureRelayQueue) Enqueue(from, to, messageType string, messageBytes []byte) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.enqueued = append(q.enqueued, relayItem{from: from, to: to, msgType: messageType})
+	q.enqueued = append(q.enqueued, relayItem{from: from, to: to, msgType: messageType, body: messageBytes})
 	return nil
+}
+
+// Hold records the message when it is committed, which is when the relay worker
+// would first see it.
+func (q *captureRelayQueue) Hold(from, to, messageType string, messageBytes []byte) (func() error, func(), error) {
+	return func() error { return q.Enqueue(from, to, messageType, messageBytes) }, func() {}, nil
 }
 
 func (q *captureRelayQueue) count() int {

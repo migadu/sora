@@ -70,11 +70,13 @@ func loginTwiceAgainstLookup(t *testing.T, answer http.HandlerFunc) verdictlessO
 }
 
 // TestIMAPProxyVerdictlessLookupAnswersAreAnOutage: a lookup answer that says nothing
-// about the password (429, 408, another 4xx, a 200 that is not the documented JSON) is
-// handled exactly like a lookup outage (503): the same reply and rate-limiter charge,
-// nothing cached, so the next login asks the lookup service again. Before the fix a
-// 4xx was a wrong password whose negative cache entry refused the same (correct)
-// password for negative_ttl, and a malformed 200 had its own wrong-password branch.
+// about the password (429, 408, another 4xx, a 200 that is not the documented JSON or
+// whose password_hash sora cannot verify) is handled exactly like a lookup outage (503):
+// the same reply and rate-limiter charge, nothing cached, so the next login asks the
+// lookup service again. Before the fix a 4xx was a wrong password whose negative cache
+// entry refused the same (correct) password for negative_ttl, and a malformed 200 had
+// its own wrong-password branch. An unverifiable password_hash was a wrong password
+// until #499.
 func TestIMAPProxyVerdictlessLookupAnswersAreAnOutage(t *testing.T) {
 	outage := loginTwiceAgainstLookup(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "down", http.StatusServiceUnavailable)
@@ -89,6 +91,9 @@ func TestIMAPProxyVerdictlessLookupAnswersAreAnOutage(t *testing.T) {
 		{"200 not JSON", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("<html>maintenance</html>")) }},
 		{"200 without password_hash", func(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(`{"address": "anna@example.com"}`))
+		}},
+		{"200 with a password_hash sora cannot verify", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"address": "anna@example.com", "password_hash": "{SHA512-CRYPT}$6$saltsaltsaltsalt$Uz0B733KLAcpeAFT5hlALRwUMzwqxSoBO9VG7Ph8v7auZDaXL8PutBQPqOVLMvwy0rORlpwlXHm83Z4uAhgLB0"}`))
 		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {

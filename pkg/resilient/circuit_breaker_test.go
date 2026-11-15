@@ -8,13 +8,14 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 )
 
-// TestCircuitBreakerBusinessLogicErrors verifies that business logic errors
-// (like user not found, invalid password) do NOT trip the circuit breaker.
-// Only actual system failures should trip the circuit breaker.
+// TestCircuitBreakerBusinessLogicErrors verifies, through the production predicate
+// (isBreakerSuccess), that business logic errors (like user not found, invalid password)
+// do NOT trip the circuit breaker. Only the database failing should trip it.
 func TestCircuitBreakerBusinessLogicErrors(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -62,9 +63,9 @@ func TestCircuitBreakerBusinessLogicErrors(t *testing.T) {
 			shouldSucceed: true,
 		},
 		{
-			name:          "unique violation is success for writes (business logic)",
+			name:          "unique violation is success (business logic)",
 			err:           consts.ErrDBUniqueViolation,
-			shouldSucceed: true, // Only for write breaker
+			shouldSucceed: true,
 		},
 		{
 			name:          "wrapped user not found is success",
@@ -72,9 +73,9 @@ func TestCircuitBreakerBusinessLogicErrors(t *testing.T) {
 			shouldSucceed: true,
 		},
 		{
-			name:          "wrapped account already exists is success (formatted error)",
+			name:          "account already exists formatted without %w is success",
 			err:           errors.New("account with email user@example.com already exists: " + consts.ErrAccountAlreadyExists.Error()),
-			shouldSucceed: false, // This won't match because it's not wrapped with %w
+			shouldSucceed: true, // Not a database failure, wrapped or not
 		},
 		{
 			name:          "properly wrapped account already exists is success",
@@ -82,8 +83,13 @@ func TestCircuitBreakerBusinessLogicErrors(t *testing.T) {
 			shouldSucceed: true, // This will match because it uses %w
 		},
 		{
-			name:          "generic error is failure (system error)",
+			name:          "error of no known kind is success",
 			err:           errors.New("database connection failed"),
+			shouldSucceed: true, // Only the kind of error counts, not its text
+		},
+		{
+			name:          "connection failure is failure (system error)",
+			err:           &pgconn.PgError{Code: "08006"},
 			shouldSucceed: false,
 		},
 		{
@@ -92,8 +98,8 @@ func TestCircuitBreakerBusinessLogicErrors(t *testing.T) {
 			shouldSucceed: false,
 		},
 		{
-			name:          "internal error is failure (system error)",
-			err:           consts.ErrInternalError,
+			name:          "internal error wrapping a database failure is failure (system error)",
+			err:           fmt.Errorf("%w: %w", consts.ErrInternalError, &pgconn.PgError{Code: "57P01"}),
 			shouldSucceed: false,
 		},
 	}
@@ -101,11 +107,6 @@ func TestCircuitBreakerBusinessLogicErrors(t *testing.T) {
 	// Test query circuit breaker
 	t.Run("QueryCircuitBreaker", func(t *testing.T) {
 		for _, tt := range tests {
-			// Skip unique violation test for query breaker (write-only)
-			if tt.name == "unique violation is success for writes (business logic)" {
-				continue
-			}
-
 			t.Run(tt.name, func(t *testing.T) {
 				// Create fresh circuit breaker for each test case
 				querySettings := circuitbreaker.DefaultSettings("test_query")
@@ -117,22 +118,7 @@ func TestCircuitBreakerBusinessLogicErrors(t *testing.T) {
 					return counts.TotalFailures >= 3
 				}
 
-				// Configure IsSuccessful to match production settings
-				querySettings.IsSuccessful = func(err error) bool {
-					if err == nil {
-						return true
-					}
-					if errors.Is(err, consts.ErrUserNotFound) ||
-						errors.Is(err, consts.ErrMailboxNotFound) ||
-						errors.Is(err, consts.ErrMessageNotAvailable) ||
-						errors.Is(err, consts.ErrMailboxAlreadyExists) ||
-						errors.Is(err, consts.ErrAccountAlreadyExists) ||
-						errors.Is(err, consts.ErrNotPermitted) ||
-						errors.Is(err, pgx.ErrNoRows) {
-						return true
-					}
-					return false
-				}
+				querySettings.IsSuccessful = isBreakerSuccess
 
 				breaker := circuitbreaker.NewCircuitBreaker(querySettings)
 
@@ -187,23 +173,7 @@ func TestCircuitBreakerBusinessLogicErrors(t *testing.T) {
 					return counts.TotalFailures >= 3
 				}
 
-				// Configure IsSuccessful to match production settings (includes unique violation)
-				writeSettings.IsSuccessful = func(err error) bool {
-					if err == nil {
-						return true
-					}
-					if errors.Is(err, consts.ErrUserNotFound) ||
-						errors.Is(err, consts.ErrMailboxNotFound) ||
-						errors.Is(err, consts.ErrMessageNotAvailable) ||
-						errors.Is(err, consts.ErrMailboxAlreadyExists) ||
-						errors.Is(err, consts.ErrAccountAlreadyExists) ||
-						errors.Is(err, consts.ErrNotPermitted) ||
-						errors.Is(err, consts.ErrDBUniqueViolation) ||
-						errors.Is(err, pgx.ErrNoRows) {
-						return true
-					}
-					return false
-				}
+				writeSettings.IsSuccessful = isBreakerSuccess
 
 				breaker := circuitbreaker.NewCircuitBreaker(writeSettings)
 
@@ -250,18 +220,7 @@ func TestCircuitBreakerAuthenticationFailures(t *testing.T) {
 		return counts.Requests >= 8 && failureRatio >= 0.6
 	}
 
-	// Configure IsSuccessful to match production settings
-	querySettings.IsSuccessful = func(err error) bool {
-		if err == nil {
-			return true
-		}
-		// User not found is a business logic error, not a system failure
-		if errors.Is(err, consts.ErrUserNotFound) ||
-			errors.Is(err, pgx.ErrNoRows) {
-			return true
-		}
-		return false
-	}
+	querySettings.IsSuccessful = isBreakerSuccess
 
 	breaker := circuitbreaker.NewCircuitBreaker(querySettings)
 
@@ -308,21 +267,12 @@ func TestCircuitBreakerSystemFailures(t *testing.T) {
 		return counts.TotalFailures >= 3
 	}
 
-	querySettings.IsSuccessful = func(err error) bool {
-		if err == nil {
-			return true
-		}
-		// Only business logic errors are successes
-		if errors.Is(err, consts.ErrUserNotFound) {
-			return true
-		}
-		return false
-	}
+	querySettings.IsSuccessful = isBreakerSuccess
 
 	breaker := circuitbreaker.NewCircuitBreaker(querySettings)
 
 	// Simulate 3 system failures (database connection errors)
-	systemError := errors.New("database connection failed")
+	systemError := &pgconn.PgError{Code: "08006"}
 	for i := 0; i < 2; i++ {
 		_, execErr := breaker.Execute(func() (any, error) {
 			return nil, systemError
@@ -380,32 +330,24 @@ func TestCircuitBreakerMixedErrors(t *testing.T) {
 		return counts.Requests >= 10 && failureRatio >= 0.6
 	}
 
-	querySettings.IsSuccessful = func(err error) bool {
-		if err == nil {
-			return true
-		}
-		if errors.Is(err, consts.ErrUserNotFound) {
-			return true
-		}
-		return false
-	}
+	querySettings.IsSuccessful = isBreakerSuccess
 
 	breaker := circuitbreaker.NewCircuitBreaker(querySettings)
 
 	// Mix of business logic errors and system failures
 	testErrors := []error{
-		consts.ErrUserNotFound, // business logic
-		consts.ErrUserNotFound, // business logic
-		errors.New("timeout"),  // system failure
-		consts.ErrUserNotFound, // business logic
-		errors.New("timeout"),  // system failure
-		consts.ErrUserNotFound, // business logic
-		errors.New("timeout"),  // system failure
-		consts.ErrUserNotFound, // business logic
-		errors.New("timeout"),  // system failure
-		errors.New("timeout"),  // system failure
-		errors.New("timeout"),  // system failure
-		errors.New("timeout"),  // system failure
+		consts.ErrUserNotFound,   // business logic
+		consts.ErrUserNotFound,   // business logic
+		context.DeadlineExceeded, // system failure
+		consts.ErrUserNotFound,   // business logic
+		context.DeadlineExceeded, // system failure
+		consts.ErrUserNotFound,   // business logic
+		context.DeadlineExceeded, // system failure
+		consts.ErrUserNotFound,   // business logic
+		context.DeadlineExceeded, // system failure
+		context.DeadlineExceeded, // system failure
+		context.DeadlineExceeded, // system failure
+		context.DeadlineExceeded, // system failure
 	}
 
 	var successCount, failureCount int64
@@ -439,7 +381,7 @@ func TestCircuitBreakerMixedErrors(t *testing.T) {
 
 	// Add one more system failure to cross the 60% threshold
 	breaker.Execute(func() (any, error) {
-		return nil, errors.New("timeout")
+		return nil, context.DeadlineExceeded
 	})
 
 	// Now: 13 requests, 8 failures = 61.5% failure ratio

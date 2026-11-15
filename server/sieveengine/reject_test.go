@@ -63,8 +63,8 @@ reject "no";`)
 	if err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
-	if result.Action != ActionFileInto || result.Mailbox != "Ads" || result.Rejected {
-		t.Fatalf("got action=%s mailbox=%q rejected=%v, want fileinto Ads", result.Action, result.Mailbox, result.Rejected)
+	if result.Action != ActionFileInto || strings.Join(result.Mailboxes, ",") != "Ads" || result.Rejected {
+		t.Fatalf("got action=%s mailbox=%q rejected=%v, want fileinto Ads", result.Action, strings.Join(result.Mailboxes, ","), result.Rejected)
 	}
 }
 

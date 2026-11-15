@@ -28,6 +28,13 @@ import (
 // [sieve] enabled_extensions, so the delivery path compiles user scripts with it.
 func setupHTTPAPIServerWithUploader(t *testing.T, sieveExtensions ...string) (*HTTPAPITestServer, string) {
 	t.Helper()
+	return setupHTTPAPIServerWithOptions(t, func(o *adminapi.ServerOptions) { o.SieveExtensions = sieveExtensions })
+}
+
+// setupHTTPAPIServerWithOptions is setupHTTPAPIServerWithUploader with a hook that
+// adjusts the server options (a relay queue, say) before the server starts.
+func setupHTTPAPIServerWithOptions(t *testing.T, adjust func(*adminapi.ServerOptions)) (*HTTPAPITestServer, string) {
+	t.Helper()
 
 	rdb := common.SetupTestDatabase(t)
 
@@ -49,15 +56,17 @@ func setupHTTPAPIServerWithUploader(t *testing.T, sieveExtensions ...string) (*H
 
 	addr := common.GetRandomAddress(t)
 	options := adminapi.ServerOptions{
-		Addr:            addr,
-		APIKey:          testAPIKey,
-		AllowedHosts:    []string{},
-		Cache:           testCache,
-		Uploader:        uploaderInstance,
-		Storage:         &storage.S3Storage{},
-		Hostname:        "admin.test",
-		TLS:             false,
-		SieveExtensions: sieveExtensions,
+		Addr:         addr,
+		APIKey:       testAPIKey,
+		AllowedHosts: []string{},
+		Cache:        testCache,
+		Uploader:     uploaderInstance,
+		Storage:      &storage.S3Storage{},
+		Hostname:     "admin.test",
+		TLS:          false,
+	}
+	if adjust != nil {
+		adjust(&options)
 	}
 
 	server, err := adminapi.New(rdb, options)

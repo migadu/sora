@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -33,7 +35,7 @@ func TestMetadataServerScope_NoDuplicateRows(t *testing.T) {
 	db := setupTestDatabase(t)
 	ctx := context.Background()
 
-	accountID := createTestAccount(t, db, "test-serverdup@example.com", "password")
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-serverdup-%d@example.com", time.Now().UnixNano()), "password")
 	const entryName = "/private/vendor/duptest"
 
 	set := func(val string) {

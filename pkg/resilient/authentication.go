@@ -3,6 +3,7 @@ package resilient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/retry"
+	"github.com/migadu/sora/server"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -17,8 +19,22 @@ var (
 	ErrInvalidCredentials = errors.New("invalid credentials")
 )
 
+// credentialLookupError classifies a failed credential lookup. consts.ErrUserNotFound
+// is a verdict on the login and is returned as is. Any other error (the database is
+// down or too slow, the circuit breaker is open, the login's context ended) says
+// nothing about the credentials, so it is wrapped in server.ErrAuthServiceUnavailable:
+// the login is answered as a temporary failure and not counted as a failed one.
+func credentialLookupError(err error) error {
+	if errors.Is(err, consts.ErrUserNotFound) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", server.ErrAuthServiceUnavailable, err)
+}
+
 // GetCredentialForAuthWithRetry retrieves credentials for authentication with retry logic.
 // Used by backend servers (IMAP, POP3, ManageSieve) which have direct database access.
+// A failed lookup returns consts.ErrUserNotFound or an error wrapping
+// server.ErrAuthServiceUnavailable (see credentialLookupError).
 func (rd *ResilientDatabase) GetCredentialForAuthWithRetry(ctx context.Context, address string) (accountID int64, hashedPassword string, err error) {
 	config := retry.BackoffConfig{
 		InitialInterval: 250 * time.Millisecond,
@@ -44,11 +60,25 @@ func (rd *ResilientDatabase) GetCredentialForAuthWithRetry(ctx context.Context, 
 
 	result, err := rd.executeReadWithRetry(ctx, config, timeoutAuth, op, consts.ErrUserNotFound)
 	if err != nil {
-		return 0, "", err
+		return 0, "", credentialLookupError(err)
 	}
 
 	cred := result.(credResult)
 	return cred.ID, cred.Hash, nil
+}
+
+// GetMasterLoginTargetWithRetry returns the ID of the active account a master login
+// impersonates (master username or master SASL, after the master credential checked
+// out). A failed lookup returns consts.ErrUserNotFound or an error wrapping
+// server.ErrAuthServiceUnavailable, as a credential lookup does (see
+// credentialLookupError): a master login the database cannot answer is a temporary
+// failure, not a failed login charged to the master credential.
+func (rd *ResilientDatabase) GetMasterLoginTargetWithRetry(ctx context.Context, address string) (int64, error) {
+	accountID, err := rd.GetActiveAccountIDByAddressWithRetry(ctx, address)
+	if err != nil {
+		return 0, credentialLookupError(err)
+	}
+	return accountID, nil
 }
 
 // GetCredentialEpochWithRetry retrieves the account ID and the credential's
@@ -101,7 +131,9 @@ func (rd *ResilientDatabase) GetCredentialEpochWithRetry(ctx context.Context, ad
 // AUTH RATE LIMITING: This method does not perform any rate limiting. Rate
 // limiting is handled by the proxy server layer (authLimiter) which records
 // success/failure AFTER this method returns. The auth cache is transparent
-// to the rate limiter.
+// to the rate limiter. An error wrapping server.ErrAuthServiceUnavailable means
+// the database could not be asked (see credentialLookupError): it is not a
+// failed login and must not be recorded as one.
 //
 // AUTH CACHE BEHAVIOR (when enabled via SetAuthCache):
 //  1. Check the local SQLite cache first (~0.1ms)
@@ -112,20 +144,33 @@ func (rd *ResilientDatabase) GetCredentialEpochWithRetry(ctx context.Context, ad
 //
 // This eliminates the "thundering herd" problem on proxy restart where thousands
 // of clients reconnect simultaneously.
+//
+// TIMING: a failed login costs one password verification whether the address
+// is unknown, the password is wrong, or the account's hash was cached, so
+// response time does not reveal which addresses have an account (security-audit
+// M14; the backends equalise the same way). The exception is a cached hash that
+// a password change has made stale: the first failed login after the change
+// checks both the stale hash and the current one, and drops the stale entry.
 func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address, password string) (accountID int64, err error) {
+	// The cached hash Step 1 already verified the password against, and the result.
+	var mismatchedHash string
+	var mismatchErr error
+
 	// --- Step 1: Try persistent auth cache (if enabled) ---
 	// The cache is ONLY populated from successful DB lookups, never from remote lookups.
 	if rd.authCache != nil {
 		cachedAccountID, cachedHash, cacheErr := rd.authCache.Get(ctx, address)
 		if cacheErr == nil {
 			// Cache hit — verify password locally using the cached hash
-			if verifyErr := db.VerifyPassword(cachedHash, password); verifyErr == nil {
+			verifyErr := db.VerifyPassword(cachedHash, password)
+			if verifyErr == nil {
 				// Password matches cached hash — no database round-trip needed
 				return cachedAccountID, nil
 			}
 			// Password mismatch — the password may have changed since caching.
 			// Invalidate the stale entry and fall through to the authoritative DB.
 			rd.authCache.Invalidate(ctx, address)
+			mismatchedHash, mismatchErr = cachedHash, verifyErr
 		}
 		// Cache miss or cache error — proceed to PostgreSQL
 	}
@@ -155,8 +200,13 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 
 	result, err := rd.executeReadWithRetry(ctx, config, timeoutAuth, op, consts.ErrUserNotFound)
 	if err != nil {
+		// No account: spend the verification a wrong password spends, unless Step 1
+		// already did (an account deleted since it was cached).
+		if errors.Is(err, consts.ErrUserNotFound) && mismatchErr == nil {
+			db.DummyVerifyPassword(password)
+		}
 		// NOTE: No logging here - let the calling server log with proper context
-		return 0, err // Return error from fetching credentials
+		return 0, credentialLookupError(err)
 	}
 
 	cred := result.(credResult)
@@ -164,6 +214,12 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 	hashedPassword := cred.Hash
 
 	// --- Step 3: Verify password ---
+	// Step 1 already compared the password with this very hash, and the comparison
+	// is deterministic: a second one would make a wrong password cost twice as much
+	// for a cached account as for any other address.
+	if mismatchErr != nil && hashedPassword == mismatchedHash {
+		return 0, mismatchErr
+	}
 	if err := db.VerifyPassword(hashedPassword, password); err != nil {
 		// NOTE: No logging here - let the calling server log with proper context
 		// (protocol, server name, cached status, etc)

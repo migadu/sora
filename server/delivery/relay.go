@@ -6,10 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/emersion/go-smtp"
+	"github.com/migadu/sora/config"
 	soralogger "github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
@@ -67,8 +72,8 @@ type RelayHandler interface {
 // SMTPRelayHandler implements SMTP relay with configurable TLS and circuit breaker.
 type SMTPRelayHandler struct {
 	SMTPHost       string
-	UseTLS         bool   // Use TLS (default: true)
-	TLSVerify      bool   // Verify TLS certificates (default: true)
+	UseTLS         bool   // Use TLS; false relays in plaintext ([relay] smtp_tls, default true)
+	TLSVerify      bool   // Verify the relay's certificate ([relay] smtp_tls_verify, default true)
 	UseStartTLS    bool   // Use STARTTLS instead of direct TLS
 	TLSCertFile    string // Client certificate for mTLS (optional)
 	TLSKeyFile     string // Client key for mTLS (optional)
@@ -164,8 +169,8 @@ func (r *SMTPRelayHandler) sendToSMTPRelay(from string, to string, messageBytes 
 			return &RelayError{Err: fmt.Errorf("failed to connect to SMTP relay: %w", err), Permanent: false}
 		}
 	} else if r.UseStartTLS {
-		// Connect with STARTTLS (automatically upgrades to TLS)
-		c, err = smtp.DialStartTLS(r.SMTPHost, tlsConfig)
+		// Connect in plaintext and upgrade with STARTTLS
+		c, err = r.dialStartTLS(tlsConfig)
 		if err != nil {
 			metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
 			// Connection errors are temporary (network issue, server down)
@@ -191,9 +196,8 @@ func (r *SMTPRelayHandler) sendToSMTPRelay(from string, to string, messageBytes 
 	}()
 
 	// Send EHLO/HELO with the configured hostname. When unset, go-smtp uses its
-	// default ("localhost"). For STARTTLS connections the pre-TLS EHLO already used
-	// the default; this sets the name on the post-upgrade EHLO, which is the one the
-	// receiving server records for the transaction.
+	// default ("localhost"). On a STARTTLS connection this is the EHLO after the
+	// handshake (RFC 3207 §4.2); dialStartTLS sent the one before it.
 	if r.HELOHost != "" {
 		if relayErr = c.Hello(r.HELOHost); relayErr != nil {
 			return &RelayError{Err: relayErr, Permanent: IsPermanentError(relayErr)}
@@ -238,6 +242,27 @@ func (r *SMTPRelayHandler) sendToSMTPRelay(from string, to string, messageBytes 
 	return nil
 }
 
+// smtpRelayDialTimeout matches the dial timeout of go-smtp's Dial functions.
+const smtpRelayDialTimeout = 30 * time.Second
+
+// dialStartTLS connects to the relay in plaintext and upgrades with STARTTLS.
+// smtp.DialStartTLS would send the EHLO before STARTTLS as "localhost"; RFC 5321
+// §2.3.5 requires the EHLO domain to be a primary host name or an address
+// literal, and a relay that checks it refuses the session before the upgrade.
+// NewClientStartTLSWithName sends HELOHost on that first EHLO as well.
+func (r *SMTPRelayHandler) dialStartTLS(tlsConfig *tls.Config) (*smtp.Client, error) {
+	conn, err := net.DialTimeout("tcp", r.SMTPHost, smtpRelayDialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	// smtp.Dial derives the TLS server name from the address; do the same.
+	tlsConfig.ServerName, _, _ = net.SplitHostPort(r.SMTPHost)
+	if r.HELOHost == "" {
+		return smtp.NewClientStartTLS(conn, tlsConfig)
+	}
+	return smtp.NewClientStartTLSWithName(conn, tlsConfig, r.HELOHost)
+}
+
 // HTTPRelayHandler implements HTTP API relay with Bearer token authentication and circuit breaker.
 type HTTPRelayHandler struct {
 	HTTPURL        string
@@ -245,6 +270,52 @@ type HTTPRelayHandler struct {
 	MetricsLabel   string
 	Logger         Logger
 	CircuitBreaker *circuitbreaker.CircuitBreaker // Circuit breaker for resilience
+
+	clientOnce sync.Once
+	client     *http.Client // shared by every send; see httpClient
+}
+
+const (
+	// httpRelayMaxIdleConnsPerHost bounds the idle connections kept to the relay.
+	// It is above any sensible [relay.queue] concurrency (default 5), so the
+	// worker's concurrent deliveries keep their connections instead of closing
+	// and redialing all but net/http's default of 2. The pool only holds
+	// connections those deliveries opened, and httpRelayIdleConnTimeout closes them.
+	httpRelayMaxIdleConnsPerHost = 32
+	httpRelayIdleConnTimeout     = 90 * time.Second
+	// httpRelayMaxDrain is how much of a response body is read so its connection
+	// can be reused; a longer body costs the connection, not the send.
+	httpRelayMaxDrain = 64 << 10
+)
+
+// httpClient returns the handler's client, built on first use, so every message
+// reuses the same transport and its kept-alive connections. A client per message
+// never reused a connection, and left each connection that answered with an empty
+// body idle in a transport nothing referenced, without an idle timeout (#461).
+func (r *HTTPRelayHandler) httpClient() *http.Client {
+	r.clientOnce.Do(func() {
+		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+		r.client = &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				DialContext:         dialer.DialContext,
+				TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+				TLSHandshakeTimeout: 10 * time.Second,
+				MaxIdleConns:        httpRelayMaxIdleConnsPerHost,
+				MaxIdleConnsPerHost: httpRelayMaxIdleConnsPerHost,
+				IdleConnTimeout:     httpRelayIdleConnTimeout,
+			},
+			// Never follow a redirect: a followed 301/302/303 turns the POST into a
+			// body-less GET whose 2xx would count as delivered, and a 307/308 replays
+			// the message to the Location (with the bearer token when the Location is
+			// the same host or a subdomain). The 3xx reaches the status check in
+			// sendToHTTPRelay as a failure.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+	})
+	return r.client
 }
 
 // GetCircuitBreaker returns the circuit breaker for health monitoring
@@ -256,7 +327,14 @@ func (r *HTTPRelayHandler) GetCircuitBreaker() *circuitbreaker.CircuitBreaker {
 type HTTPRelayRequest struct {
 	From       string   `json:"from"`
 	Recipients []string `json:"recipients"`
-	Message    string   `json:"message"` // RFC822 message as string
+	// Message is the RFC 5322 message as a string. A JSON string holds Unicode
+	// text only, so a message that is not valid UTF-8 arrives here with each
+	// invalid byte replaced by U+FFFD and is also sent as MessageBase64.
+	Message string `json:"message"`
+	// MessageBase64 is the message byte for byte, base64 on the wire (RFC 4648
+	// section 4). sendToHTTPRelay sets it when the message is not valid UTF-8,
+	// the one case Message cannot carry exactly; it is absent otherwise.
+	MessageBase64 []byte `json:"message_base64,omitempty"`
 }
 
 // SendToExternalRelay sends a message to the external HTTP API with circuit breaker protection.
@@ -272,7 +350,7 @@ func (r *HTTPRelayHandler) SendToExternalRelay(from string, to string, messageBy
 		})
 		// Check if circuit breaker is open
 		if errors.Is(err, circuitbreaker.ErrCircuitBreakerOpen) {
-			soralogger.Warn("HTTP Relay: Circuit breaker is OPEN - skipping delivery", "url", r.HTTPURL)
+			soralogger.Warn("HTTP Relay: Circuit breaker is OPEN - skipping delivery", "url", config.MaskEndpointURL(r.HTTPURL))
 			metrics.LMTPExternalRelay.WithLabelValues("circuit_breaker_open").Inc()
 			return fmt.Errorf("HTTP relay circuit breaker is open: %w", err)
 		}
@@ -291,6 +369,13 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 		Recipients: []string{to},
 		Message:    string(messageBytes),
 	}
+	// json.Marshal replaces every byte of a string that is not valid UTF-8 with
+	// U+FFFD, which destroys 8-bit text in any other charset: a body, a part of a
+	// multipart, a raw header value. Such a message also goes byte for byte in
+	// message_base64; message stays as it was for relay APIs that do not read it.
+	if !utf8.Valid(messageBytes) {
+		payload.MessageBase64 = messageBytes
+	}
 
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
@@ -303,8 +388,9 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 	req, err := http.NewRequest("POST", r.HTTPURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-		// Invalid URL is a configuration error (permanent)
-		return &RelayError{Err: fmt.Errorf("failed to create HTTP request: %w", err), Permanent: true}
+		// Invalid URL is a configuration error (permanent). The error quotes http_url,
+		// which may carry credentials, as does any error from Do.
+		return &RelayError{Err: fmt.Errorf("failed to create HTTP request: %w", config.MaskURLError(err)), Permanent: true}
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -312,31 +398,18 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 		req.Header.Set("Authorization", "Bearer "+r.AuthToken)
 	}
 
-	// Send request with timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-			},
-		},
-		// Never follow a redirect: a followed 301/302/303 turns the POST into a
-		// body-less GET whose 2xx would count as delivered, and a 307/308 replays
-		// the message to the Location (with the bearer token when the Location is
-		// the same host or a subdomain). The 3xx reaches the status check below
-		// as a failure.
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
-	resp, err := client.Do(req)
+	resp, err := r.httpClient().Do(req)
 	if err != nil {
 		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
 		// Network/connection errors are temporary
-		return &RelayError{Err: fmt.Errorf("failed to send HTTP relay request: %w", err), Permanent: false}
+		return &RelayError{Err: fmt.Errorf("failed to send HTTP relay request: %w", config.MaskURLError(err)), Permanent: false}
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// Read the body to EOF so the transport keeps the connection for the
+		// next message; closing it unread closes the connection.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, httpRelayMaxDrain))
+		resp.Body.Close()
+	}()
 
 	// Check response status
 	// HTTP 5xx = server error (temporary, server may recover)
@@ -348,7 +421,7 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 		err := fmt.Errorf("HTTP relay returned error status: %d", resp.StatusCode)
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			err = fmt.Errorf("HTTP relay returned redirect status %d to %q; redirects are not followed, so [relay] http_url must be the final URL",
-				resp.StatusCode, resp.Header.Get("Location"))
+				resp.StatusCode, config.MaskEndpointURL(resp.Header.Get("Location")))
 		}
 		return &RelayError{Err: err, Permanent: permanent}
 	}
@@ -364,7 +437,12 @@ type CircuitBreakerConfig struct {
 	MaxRequests int           // Max requests in half-open state (default: 3)
 }
 
-// NewRelayHandlerFromConfig creates the appropriate relay handler based on configuration with circuit breaker
+// NewRelayHandlerFromConfig creates the appropriate relay handler based on configuration with circuit breaker.
+//
+// The breaker trips on consecutive failures, which a success resets, so its counts are
+// never cleared on a timer (Interval 0). With a counting window, an attempt that takes
+// longer than the window to fail (a blackholed relay's 30 s dial, a hung one's 5 min
+// command timeout) has its result dropped, and a dead relay never opens the breaker.
 func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsLabel string, useTLS, tlsVerify, useStartTLS bool, tlsCertFile, tlsKeyFile, heloHost string, logger Logger, cbConfig CircuitBreakerConfig) RelayHandler {
 	// Apply defaults if not set
 	if cbConfig.Threshold <= 0 {
@@ -383,7 +461,7 @@ func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsL
 		cb := circuitbreaker.NewCircuitBreaker(circuitbreaker.Settings{
 			Name:        "smtp_relay",
 			MaxRequests: uint32(cbConfig.MaxRequests),
-			Interval:    10 * time.Second,
+			Interval:    0, // counts cleared only by state changes; see above
 			Timeout:     cbConfig.Timeout,
 			ReadyToTrip: func(counts circuitbreaker.Counts) bool {
 				return counts.ConsecutiveFailures >= uint32(cbConfig.Threshold)
@@ -421,7 +499,7 @@ func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsL
 		cb := circuitbreaker.NewCircuitBreaker(circuitbreaker.Settings{
 			Name:        "http_relay",
 			MaxRequests: uint32(cbConfig.MaxRequests),
-			Interval:    10 * time.Second,
+			Interval:    0, // counts cleared only by state changes; see above
 			Timeout:     cbConfig.Timeout,
 			ReadyToTrip: func(counts circuitbreaker.Counts) bool {
 				return counts.ConsecutiveFailures >= uint32(cbConfig.Threshold)

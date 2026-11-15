@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/consts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
@@ -168,13 +169,13 @@ func TestVerifySSHA512(t *testing.T) {
 			}
 
 			// Test correct password
-			err = verifySSHA512(hash, password)
+			err = VerifyPassword(hash, password)
 			if err != nil {
 				t.Errorf("Verification failed for correct password: %v", err)
 			}
 
 			// Test wrong password
-			err = verifySSHA512(hash, "wrongPassword")
+			err = VerifyPassword(hash, "wrongPassword")
 			if err == nil {
 				t.Error("Verification should fail for incorrect password")
 			}
@@ -190,7 +191,7 @@ func TestVerifySSHA512(t *testing.T) {
 			}
 
 			// But both should verify correctly
-			err = verifySSHA512(hash2, password)
+			err = VerifyPassword(hash2, password)
 			if err != nil {
 				t.Errorf("Second hash verification failed for correct password: %v", err)
 			}
@@ -198,20 +199,20 @@ func TestVerifySSHA512(t *testing.T) {
 	}
 
 	// Test malformed SSHA512 hash
-	err := verifySSHA512("{SSHA512}invalidBase64", password)
+	err := VerifyPassword("{SSHA512}invalidBase64", password)
 	if err == nil {
 		t.Error("Verification should fail for malformed hash")
 	}
 
 	// Test with invalid format prefix
-	err = verifySSHA512("{INVALID}hash", password)
+	err = VerifyPassword("{INVALID}hash", password)
 	if err == nil {
 		t.Error("Verification should fail for invalid format prefix")
 	}
 
 	// Test with too short hash
 	shortHash := "{SSHA512}" + base64.StdEncoding.EncodeToString([]byte("tooshort"))
-	err = verifySSHA512(shortHash, password)
+	err = VerifyPassword(shortHash, password)
 	if err == nil {
 		t.Error("Verification should fail for too short hash")
 	}
@@ -249,13 +250,13 @@ func TestVerifySHA512(t *testing.T) {
 			}
 
 			// Test correct password
-			err := verifySHA512(hash, password)
+			err := VerifyPassword(hash, password)
 			if err != nil {
 				t.Errorf("Verification failed for correct password: %v", err)
 			}
 
 			// Test wrong password
-			err = verifySHA512(hash, "wrongPassword")
+			err = VerifyPassword(hash, "wrongPassword")
 			if err == nil {
 				t.Error("Verification should fail for incorrect password")
 			}
@@ -269,13 +270,13 @@ func TestVerifySHA512(t *testing.T) {
 	}
 
 	// Test malformed SHA512 hash
-	err := verifySHA512("{SHA512}invalidBase64", password)
+	err := VerifyPassword("{SHA512}invalidBase64", password)
 	if err == nil {
 		t.Error("Verification should fail for malformed hash")
 	}
 
 	// Test with invalid format prefix
-	err = verifySHA512("{INVALID}hash", password)
+	err = VerifyPassword("{INVALID}hash", password)
 	if err == nil {
 		t.Error("Verification should fail for invalid format prefix")
 	}
@@ -390,9 +391,11 @@ func TestPasswordEdgeCases(t *testing.T) {
 	t.Run("very long password", func(t *testing.T) {
 		longPassword := strings.Repeat("a", 1000)
 		_, err := GenerateBcryptHash(longPassword)
-		// bcrypt has a 72-byte limit, so this should fail
+		// bcrypt has a 72-byte limit, so this should fail, as a request error
+		// (the caller's 400), not as a failure of the server
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "password length exceeds 72 bytes")
+		assert.ErrorIs(t, err, ErrInvalidAccountRequest)
 	})
 
 	t.Run("unicode password", func(t *testing.T) {
@@ -634,6 +637,37 @@ func TestGetAccountIDByAddress(t *testing.T) {
 	// 3. Empty address (should return error)
 	// 4. Case insensitive lookup
 	// 5. Normalized address handling
+}
+
+// GetAccountAddresses answers, for any address of an account, that account's ID and all
+// of its addresses, and ErrUserNotFound for an address no account has.
+func TestGetAccountAddresses(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	database := setupTestDatabase(t)
+	defer database.Close()
+	ctx := context.Background()
+
+	suffix := time.Now().UnixNano()
+	primary := fmt.Sprintf("get-addresses-%d@example.com", suffix)
+	alias := fmt.Sprintf("get-addresses-alias-%d@example.org", suffix)
+	accountID := createAccountWithCredential(t, database, ctx, primary)
+	addCredential(t, database, ctx, accountID, alias)
+	createAccountWithCredential(t, database, ctx, fmt.Sprintf("get-addresses-other-%d@example.com", suffix))
+
+	for _, address := range []string{primary, alias, " " + strings.ToUpper(alias) + " "} {
+		id, addresses, err := database.GetAccountAddresses(ctx, address)
+		require.NoError(t, err, address)
+		assert.Equal(t, accountID, id, address)
+		assert.ElementsMatch(t, []string{primary, alias}, addresses, address)
+	}
+
+	_, _, err := database.GetAccountAddresses(ctx, fmt.Sprintf("get-addresses-unknown-%d@example.com", suffix))
+	assert.ErrorIs(t, err, consts.ErrUserNotFound)
+	_, _, err = database.GetAccountAddresses(ctx, " ")
+	assert.Error(t, err)
 }
 
 // TestGetPrimaryEmailForAccount tests primary email retrieval

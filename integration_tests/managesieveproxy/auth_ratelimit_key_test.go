@@ -17,8 +17,9 @@ import (
 )
 
 // setupManageSieveProxyWithRateLimiting creates a ManageSieve proxy with
-// authentication rate limiting enabled, fronting the given backends.
-func setupManageSieveProxyWithRateLimiting(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, rateLimitConfig server.AuthRateLimiterConfig) *common.TestServer {
+// authentication rate limiting enabled, fronting the given backends. Each tune func
+// adjusts the options.
+func setupManageSieveProxyWithRateLimiting(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, rateLimitConfig server.AuthRateLimiterConfig, tune ...func(*managesieveproxy.ServerOptions)) *common.TestServer {
 	t.Helper()
 
 	opts := managesieveproxy.ServerOptions{
@@ -36,6 +37,10 @@ func setupManageSieveProxyWithRateLimiting(t *testing.T, rdb *resilient.Resilien
 		// No TrustedProxies: the proxy passes that list to the auth rate limiter as
 		// its exemption list, and the loopback test client would then be exempt from
 		// all IP-based blocking.
+	}
+
+	for _, f := range tune {
+		f(&opts)
 	}
 
 	proxy, err := managesieveproxy.New(context.Background(), rdb, "test-managesieve-proxy-rate-limit", opts)

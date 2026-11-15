@@ -20,7 +20,7 @@ type ThreadMessageResult struct {
 	MessageID    string
 	InReplyTo    string
 	References   string
-	SubjectSort  string
+	SubjectSort  string // base subject in i;unicode-casemap form (subjectCasemapKey): compare with == and <
 	SentDate     time.Time
 	InternalDate time.Time // arrival; THREAD=REFS orders threads by it
 	Seq          uint32
@@ -39,6 +39,7 @@ var ErrThreadTooManyMessages = errors.New("THREAD search matches too many messag
 // rows retained in memory; nonpositive values use the default cap.
 func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, includeSubject, withSeqNums bool, maxMessages int) ([]ThreadMessageResult, error) {
 	criteria = cloneSearchCriteria(criteria)
+	dropEmptyTextTerms(criteria)
 	if maxMessages <= 0 {
 		maxMessages = config.DefaultThreadMaxMessages
 	}
@@ -58,12 +59,12 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 	if err != nil {
 		return nil, fmt.Errorf("failed to build search criteria for threading: %w", err)
 	}
-	whereArgs["mailbox_id"] = mailboxID
+	whereArgs["mailboxID"] = mailboxID
 	whereArgs["accountID"] = accountID
 
 	subjectSelect := `'' AS subject_sort`
 	if includeSubject {
-		subjectSelect = `m.subject_sort`
+		subjectSelect = subjectCasemapKey("m.subject_sort") + " AS subject_sort"
 	}
 
 	// The FTS table is joined only for a BODY or TEXT key: one probe per message
@@ -75,10 +76,15 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 
 	seqCTE, seqJoin, seqSelect := "", "", "0"
 	if withSeqNums {
+		// Numbered in ctx's view (WithSeqView), if it has one.
+		viewParam := ""
+		if view := seqViewOf(ctx); view > 0 {
+			whereArgs["seq_view"] = int64(view)
+			viewParam = "@seq_view"
+		}
 		seqCTE = `WITH seq AS (
 			SELECT uid, ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
-			FROM messages
-			WHERE mailbox_id = @mailbox_id AND expunged_at IS NULL
+			FROM ` + seqCountedRows("@mailboxID", viewParam, "") + ` counted
 		)`
 		seqJoin = "JOIN seq ON seq.uid = m.uid"
 		seqSelect = "seq.seqnum"
@@ -96,7 +102,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		%s
 		%s
-		WHERE m.mailbox_id = @mailbox_id
+		WHERE m.mailbox_id = @mailboxID
 		  AND m.expunged_at IS NULL
 		  AND %s
 		ORDER BY m.uid
@@ -128,7 +134,10 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 		}
 
 		if msgID != nil {
-			msg.MessageID = *msgID
+			// A synthetic ID is no Message-ID: RFC 5256 §3 (BASE.6.4.THREAD,
+			// REFERENCES step 1(A)) gives such a message a unique one, which no
+			// reference can name.
+			msg.MessageID = headerMessageID(*msgID)
 		}
 		if inReplyTo != nil {
 			msg.InReplyTo = *inReplyTo

@@ -16,9 +16,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/affinitycache"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/adminapi"
@@ -118,10 +120,6 @@ type testSourceDB struct {
 }
 
 func (t *testSourceDB) FindExistingContentHashesWithRetry(ctx context.Context, hashes []string) ([]string, error) {
-	return nil, nil // Not needed for HTTP API tests
-}
-
-func (t *testSourceDB) GetRecentMessagesForWarmupWithRetry(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
 	return nil, nil // Not needed for HTTP API tests
 }
 
@@ -817,36 +815,28 @@ func TestHealthMonitoring(t *testing.T) {
 		}
 	})
 
+	// health_status keeps one row per (component, server), rewritten in place, so it
+	// holds no history: ?history=true must be refused rather than answered with the
+	// current row dressed up as a history.
 	t.Run("get health history", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/admin/health/servers/test-host/components/database?history=true&limit=5", nil)
-
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
-		}
-
-		var result map[string]any
-		server.expectJSON(t, body, &result)
-
-		if result["hostname"] != "test-host" {
-			t.Errorf("Expected hostname test-host, got %v", result["hostname"])
-		}
-
-		if result["component"] != "database" {
-			t.Errorf("Expected component database, got %v", result["component"])
-		}
-
-		history := []any{}
-		if result["history"] != nil {
-			var ok bool
-			history, ok = result["history"].([]any)
-			if !ok {
-				t.Errorf("Expected history to be an array, got %T", result["history"])
+		ctx := context.Background()
+		hostname := fmt.Sprintf("history-host-%d", time.Now().UnixNano())
+		t.Cleanup(func() {
+			_, _ = server.rdb.GetDatabase().GetWritePool().Exec(context.Background(),
+				"DELETE FROM health_status WHERE server_hostname = $1", hostname)
+		})
+		for _, status := range []db.ComponentStatus{db.StatusHealthy, db.StatusUnhealthy} {
+			if err := server.rdb.StoreHealthStatusWithRetry(ctx, hostname, "database", status, nil, 1, 0, nil); err != nil {
+				t.Fatalf("store %s status: %v", status, err)
 			}
 		}
 
-		count, ok := result["count"].(float64)
-		if !ok || int(count) != len(history) {
-			t.Errorf("Expected count to match history length, got count=%v, len=%d", result["count"], len(history))
+		resp, body := server.makeRequest(t, "GET", "/admin/health/servers/"+hostname+"/components/database?history=true&limit=5", nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			var result map[string]any
+			_ = json.Unmarshal(body, &result)
+			t.Fatalf("history=true answered %d with %v record(s) after 2 status changes, want %d (no history is kept). Body: %s",
+				resp.StatusCode, result["count"], http.StatusBadRequest, string(body))
 		}
 	})
 }
@@ -1124,16 +1114,10 @@ func TestErrorScenarios(t *testing.T) {
 		// Try to create same account again
 		resp2, body2 := server.makeRequest(t, "POST", "/admin/accounts", reqBody)
 
-		// The API might return 409 Conflict or 500 Internal Server Error depending on how it handles duplicates
-		if resp2.StatusCode != http.StatusConflict && resp2.StatusCode != http.StatusInternalServerError {
-			t.Errorf("Expected status %d or %d, got %d. Body: %s", http.StatusConflict, http.StatusInternalServerError, resp2.StatusCode, string(body2))
+		if resp2.StatusCode != http.StatusConflict {
+			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusConflict, resp2.StatusCode, string(body2))
 		}
-
-		// Check that it's some kind of error about the account existing or creation failing
-		bodyStr := string(body2)
-		if !strings.Contains(bodyStr, "already exists") && !strings.Contains(bodyStr, "Failed to create") && !strings.Contains(bodyStr, "unique") && !strings.Contains(bodyStr, "duplicate") {
-			t.Errorf("Expected error message about duplicate/existing account, got: %s", bodyStr)
-		}
+		server.expectError(t, body2, "already exists")
 	})
 
 	t.Run("invalid email format", func(t *testing.T) {
@@ -1144,14 +1128,10 @@ func TestErrorScenarios(t *testing.T) {
 
 		resp, body := server.makeRequest(t, "POST", "/admin/accounts", reqBody)
 
-		if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusInternalServerError {
-			t.Errorf("Expected status %d or %d, got %d. Body: %s", http.StatusBadRequest, http.StatusInternalServerError, resp.StatusCode, string(body))
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusBadRequest, resp.StatusCode, string(body))
 		}
-
-		// Should contain some error about invalid email
-		if !strings.Contains(string(body), "error") {
-			t.Errorf("Expected error message, got: %s", string(body))
-		}
+		server.expectError(t, body, "invalid email address")
 	})
 
 	t.Run("delete non-existent account", func(t *testing.T) {
@@ -2433,39 +2413,44 @@ func TestACLManagementOneEntryPerAccount(t *testing.T) {
 // TestACLGrantAnyoneFollowsAllowAnyoneIdentifier covers the Admin API half of issue
 // #159: with [shared_mailboxes] allow_anyone_identifier false (its default), granting
 // to "anyone" is refused (400), as it is over IMAP; a user can still be granted.
+// The mailbox is shared by a server with sharing on, and the refusal holds also when
+// the Admin API's own config has sharing off (#350).
 func TestACLGrantAnyoneFollowsAllowAnyoneIdentifier(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	for _, allowed := range []bool{false, true} {
-		t.Run(fmt.Sprintf("allow_anyone_identifier=%t", allowed), func(t *testing.T) {
-			shared := config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/", AllowAnyoneIdentifier: allowed}
-			server := setupHTTPAPIServer(t, func(o *adminapi.ServerOptions) { o.SharedMailboxes = shared })
-			defer server.Close()
+	for _, enabled := range []bool{true, false} {
+		for _, allowed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("enabled=%t/allow_anyone_identifier=%t", enabled, allowed), func(t *testing.T) {
+				shared := config.SharedMailboxesConfig{Enabled: enabled, NamespacePrefix: "Shared/", AllowAnyoneIdentifier: allowed}
+				server := setupHTTPAPIServer(t, func(o *adminapi.ServerOptions) { o.SharedMailboxes = shared })
+				defer server.Close()
 
-			owner := common.CreateTestAccount(t, server.rdb)
-			member := common.CreateTestAccount(t, server.rdb)
-			ctx := context.WithValue(context.Background(), consts.ConfigContextKey, &config.Config{SharedMailboxes: shared})
-			ownerID, err := server.rdb.GetAccountIDByAddressWithRetry(ctx, owner.Email)
-			if err != nil {
-				t.Fatalf("Failed to resolve owner: %v", err)
-			}
-			mailbox := fmt.Sprintf("Shared/Anyone-%d", time.Now().UnixNano())
-			if err := server.rdb.CreateMailboxWithRetry(ctx, ownerID, mailbox, nil); err != nil {
-				t.Fatalf("Failed to create mailbox: %v", err)
-			}
-
-			want := http.StatusBadRequest
-			if allowed {
-				want = http.StatusOK
-			}
-			for identifier, status := range map[string]int{"anyone": want, member.Email: http.StatusOK} {
-				resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/grant",
-					map[string]any{"owner": owner.Email, "mailbox": mailbox, "identifier": identifier, "rights": "lr"})
-				if resp.StatusCode != status {
-					t.Errorf("grant to %s: got %d %s, want %d", identifier, resp.StatusCode, strings.TrimSpace(string(body)), status)
+				owner := common.CreateTestAccount(t, server.rdb)
+				member := common.CreateTestAccount(t, server.rdb)
+				creator := config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/"}
+				ctx := context.WithValue(context.Background(), consts.ConfigContextKey, &config.Config{SharedMailboxes: creator})
+				ownerID, err := server.rdb.GetAccountIDByAddressWithRetry(ctx, owner.Email)
+				if err != nil {
+					t.Fatalf("Failed to resolve owner: %v", err)
 				}
-			}
-		})
+				mailbox := fmt.Sprintf("Shared/Anyone-%d", time.Now().UnixNano())
+				if err := server.rdb.CreateMailboxWithRetry(ctx, ownerID, mailbox, nil); err != nil {
+					t.Fatalf("Failed to create mailbox: %v", err)
+				}
+
+				want := http.StatusBadRequest
+				if allowed {
+					want = http.StatusOK
+				}
+				for identifier, status := range map[string]int{"anyone": want, member.Email: http.StatusOK} {
+					resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/grant",
+						map[string]any{"owner": owner.Email, "mailbox": mailbox, "identifier": identifier, "rights": "lr"})
+					if resp.StatusCode != status {
+						t.Errorf("grant to %s: got %d %s, want %d", identifier, resp.StatusCode, strings.TrimSpace(string(body)), status)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -2510,6 +2495,17 @@ func (m *mockAffinityManager) GetStats(ctx context.Context) map[string]any {
 		"enabled":       true,
 		"total_entries": len(m.affinity),
 	}
+}
+
+func (m *mockAffinityManager) List() []affinitycache.AffinityEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var list []affinitycache.AffinityEntry
+	for key, backend := range m.affinity {
+		i := strings.LastIndex(key, ":")
+		list = append(list, affinitycache.AffinityEntry{Username: key[:i], Protocol: key[i+1:], Backend: backend})
+	}
+	return list
 }
 
 // TestAffinityManagement tests the affinity management endpoints

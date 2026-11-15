@@ -10,10 +10,10 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
@@ -79,7 +79,7 @@ type CircuitBreakerSettings struct {
 	Interval     time.Duration // Time before resetting failure counts in closed state
 	Timeout      time.Duration // Time before transitioning from open to half-open
 	FailureRatio float64       // Failure ratio threshold to open circuit (0.0-1.0)
-	MinRequests  uint32        // Minimum requests before evaluating failure ratio
+	MinRequests  uint32        // Minimum completed requests before evaluating failure ratio
 }
 
 // TransportSettings holds HTTP transport configuration for connection pooling and timeouts
@@ -135,9 +135,11 @@ func NewHTTPRemoteLookupClient(
 	minRequests := cbSettings.MinRequests
 
 	settings.ReadyToTrip = func(counts circuitbreaker.Counts) bool {
-		// Open circuit if failure ratio exceeds threshold
-		ratio := float64(counts.TotalFailures) / float64(counts.Requests)
-		return counts.Requests >= minRequests && ratio >= failureRatio
+		// Pending requests have no verdict yet, including with a configured
+		// counting interval. Take both the minimum and ratio over results.
+		results := counts.Results()
+		ratio := float64(counts.TotalFailures) / float64(results)
+		return results >= minRequests && ratio >= failureRatio
 	}
 	settings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Warn("remotelookup: Circuit breaker state changed", "name", name, "from", from, "to", to)
@@ -267,30 +269,14 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 
 	// Execute HTTP request through circuit breaker (NO caching - handled at ConnectionManager level)
 	result, err := c.breaker.Execute(func() (any, error) {
-		// Build request URL by interpolating placeholders:
-		// - $email: user email (MasterAddress - includes master token but not +detail)
-		// - $ip: client IP address
-		requestURL := strings.ReplaceAll(c.baseURL, "$email", url.QueryEscape(lookupEmail))
-		if clientIP != "" {
-			requestURL = strings.ReplaceAll(requestURL, "$ip", url.QueryEscape(clientIP))
-		}
+		requestURL := config.RemoteLookupRequestURL(c.baseURL, lookupEmail, clientIP, routeOnly)
 
-		// Add route_only parameter if requested (for master username authentication)
-		if routeOnly {
-			// Check if URL already has query parameters
-			if strings.Contains(requestURL, "?") {
-				requestURL += "&route_only=true"
-			} else {
-				requestURL += "?route_only=true"
-			}
-		}
-
-		logger.Debug("remotelookup: Requesting lookup", "user", lookupEmail, "client_ip", clientIP, "url", requestURL, "route_only", routeOnly)
+		logger.Debug("remotelookup: Requesting lookup", "user", lookupEmail, "client_ip", clientIP, "url", config.MaskEndpointURL(requestURL), "route_only", routeOnly)
 
 		// Make HTTP request
 		req, err := http.NewRequestWithContext(ctx, "GET", requestURL, nil)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
+			return nil, fmt.Errorf("failed to create request: %w", config.MaskURLError(err))
 		}
 
 		// Add Bearer token authentication if configured
@@ -310,7 +296,7 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 				return nil, fmt.Errorf("%w: %w", ErrRemoteLookupTransient, server.ErrServerShuttingDown)
 			}
 			// Network error or timeout - this is transient
-			return nil, fmt.Errorf("%w: HTTP request failed: %v", ErrRemoteLookupTransient, err)
+			return nil, fmt.Errorf("%w: HTTP request failed: %v", ErrRemoteLookupTransient, config.MaskURLError(err))
 		}
 		defer drainAndClose(resp)
 
@@ -422,12 +408,12 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 	// Handle circuit breaker errors
 	if err != nil {
 		if err == circuitbreaker.ErrCircuitBreakerOpen {
-			logger.Warn("remotelookup: Circuit breaker is open", "url", c.baseURL)
+			logger.Warn("remotelookup: Circuit breaker is open", "url", config.MaskEndpointURL(c.baseURL))
 			// Circuit breaker open is a transient error - return temporarily unavailable
 			return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: circuit breaker open: too many failures", ErrRemoteLookupTransient)
 		}
 		if err == circuitbreaker.ErrTooManyRequests {
-			logger.Warn("remotelookup: Circuit breaker is half-open - rate limiting requests", "url", c.baseURL)
+			logger.Warn("remotelookup: Circuit breaker is half-open - rate limiting requests", "url", config.MaskEndpointURL(c.baseURL))
 			// Too many requests in half-open state is also a transient error - return temporarily unavailable
 			return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: circuit breaker half-open: too many concurrent requests", ErrRemoteLookupTransient)
 		}
@@ -436,24 +422,33 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 			// Transient errors (network, timeout, 5xx, 408, 429) - temporarily unavailable
 			return nil, AuthTemporarilyUnavailable, err
 		}
-		if errors.Is(err, ErrRemoteLookupInvalidResponse) {
-			// A malformed 200 (not JSON - a maintenance page from a reverse proxy - or
-			// required fields missing) is a broken lookup service, like an outage: it says
-			// nothing about the password. Accounts are refused with 401/403.
-			return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: %w", ErrRemoteLookupTransient, err)
-		}
-		return nil, AuthFailed, err
+		// A malformed 200 (not JSON - a maintenance page from a reverse proxy - or
+		// required fields missing) is a broken lookup service, like an outage: it says
+		// nothing about the password. Accounts are refused with 401/403. So is any other
+		// error, such as a request that cannot be built from the URL ($email in the
+		// host): no answer, never a wrong password.
+		return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: %w", ErrRemoteLookupTransient, err)
 	}
 
 	// Handle special auth result cases (user not found, auth failed)
 	if resultMap, ok := result.(map[string]any); ok {
 		if authResult, ok := resultMap["result"].(AuthResult); ok {
 			if authResult == AuthUserNotFound {
-				// Don't cache user not found - these should always go to remotelookup
-				// This prevents issues with user creation between cache checks
+				// Not cached here, and no dummy verification here: with lookup_local_users
+				// the caller goes on to the database login, which verifies; otherwise the
+				// caller refuses, spends the verification itself and caches the refusal
+				// for that password, as it does a wrong one.
 				return nil, AuthUserNotFound, nil
 			}
 			if authResult == AuthFailed {
+				// 401/403: the service refused the account by its address, as it never
+				// sees the password. A wrong password for an address it knows is refused
+				// only after verifyPassword below, so spend the same verification here,
+				// or the quicker answer shows that the address has a refused account. A
+				// route-only lookup has no password to verify.
+				if !routeOnly {
+					db.DummyVerifyPassword(password)
+				}
 				// Don't cache auth failures - these could be typos or password changes
 				// Better to always check remotelookup for security
 				return nil, AuthFailed, nil
@@ -468,7 +463,7 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 	// Extract lookup response
 	lookupResp, ok := result.(HTTPRemoteLookupResponse)
 	if !ok {
-		return nil, AuthFailed, fmt.Errorf("unexpected result type from circuit breaker")
+		return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: unexpected result type from circuit breaker", ErrRemoteLookupTransient)
 	}
 
 	// Use the address from response (required field, already validated)
@@ -477,19 +472,22 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 		logger.Debug("remotelookup: Using address from response", "response_email", actualEmail, "query_email", lookupEmail)
 	}
 
-	// Verify password against hash (skip if route_only mode)
-	hashPrefix := lookupResp.PasswordHash
-	if len(hashPrefix) > 30 {
-		hashPrefix = hashPrefix[:30] + "..."
-	}
-
+	// Verify password against hash (skip if route_only mode). No part of the hash is
+	// logged: a lookup service could answer a password in that field.
 	if !routeOnly {
 		// Verify password against hash returned by HTTP endpoint
 		// Note: The HTTP endpoint handles all master token logic and returns the appropriate hash
-		if !c.verifyPassword(password, lookupResp.PasswordHash) {
+		if err := db.VerifyPassword(lookupResp.PasswordHash, password); err != nil {
+			if !errors.Is(err, db.ErrInvalidCredentials) {
+				// A hash sora cannot check says nothing about the password: like a 200
+				// without one, it is a broken answer, handled as an outage. It does not
+				// count toward the circuit breaker, which has already recorded a good
+				// answer: other users' hashes may be fine.
+				return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: %w: %w", ErrRemoteLookupTransient, ErrRemoteLookupInvalidResponse, err)
+			}
 			// Don't cache auth failures - password verification failed
 			// Could be wrong password or password change in progress
-			logger.Debug("remotelookup: Password verification failed", "user", authEmail, "source", "api", "hash_prefix", hashPrefix)
+			logger.Debug("remotelookup: Password verification failed", "user", authEmail, "source", "api")
 			return nil, AuthFailed, nil
 		}
 	}
@@ -523,7 +521,7 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 	if routeOnly {
 		source = "api-route-only"
 	}
-	logger.Debug("remotelookup: SUCCESS", "user", authEmail, "source", source, "hash_prefix", hashPrefix, "auth_only_mode", lookupResp.AuthOnlyMode, "server", normalizedServer, "pool", lookupResp.Pool)
+	logger.Debug("remotelookup: SUCCESS", "user", authEmail, "source", source, "auth_only_mode", lookupResp.AuthOnlyMode, "server", normalizedServer, "pool", lookupResp.Pool)
 
 	return info, AuthSuccess, nil
 }
@@ -539,12 +537,6 @@ func drainAndClose(resp *http.Response) {
 		_, _ = io.CopyN(io.Discard, resp.Body, maxDrainBytes)
 	}
 	_ = resp.Body.Close()
-}
-
-// verifyPassword verifies a password against a hash
-func (c *HTTPRemoteLookupClient) verifyPassword(password, hash string) bool {
-	err := db.VerifyPassword(hash, password)
-	return err == nil
 }
 
 // normalizeServerAddress gives a server address without a port the client's default
@@ -585,12 +577,17 @@ func (c *HTTPRemoteLookupClient) HealthCheck(ctx context.Context) error {
 	// Note: We're not using a real email here since this is just a health check
 	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL, nil)
 	if err != nil {
-		return fmt.Errorf("failed to create health check request: %w", err)
+		return fmt.Errorf("failed to create health check request: %w", config.MaskURLError(err))
+	}
+	// Authenticate like a lookup, so an endpoint that requires the token sees no
+	// unauthenticated requests from the proxies.
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
 	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("HTTP remotelookup endpoint unreachable: %w", err)
+		return fmt.Errorf("HTTP remotelookup endpoint unreachable: %w", config.MaskURLError(err))
 	}
 	defer drainAndClose(resp)
 

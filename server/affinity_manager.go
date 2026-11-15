@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +32,11 @@ const (
 
 // maxAffinityEventQueueSize bounds the outgoing gossip queue
 const maxAffinityEventQueueSize = 5000
+
+// affinityPersistDrainTimeout bounds how long Stop waits for persistence writes
+// already started. Each set or delete has a 2 s timeout and the expired-entry
+// cleanup 5 s, and the store runs them one at a time.
+const affinityPersistDrainTimeout = 10 * time.Second
 
 // AffinityEvent represents a cluster-wide affinity event
 type AffinityEvent struct {
@@ -70,7 +76,14 @@ type AffinityManager struct {
 	mu          sync.RWMutex
 
 	clusterManager *cluster.Manager
-	persistStore   AffinityPersistStore // Optional SQLite persistence (nil = in-memory only)
+	// Optional SQLite persistence (nil = in-memory only). Set by the
+	// constructor before the manager receives gossip and never changed, so the
+	// gossip handler and the writers read it without a lock.
+	persistStore AffinityPersistStore
+
+	// Incoming events wait until the initial disk snapshot is loaded, so an
+	// older SET cannot overwrite a newer row before its timestamp is known.
+	startupLoaded chan struct{}
 
 	// Configuration
 	enabled         bool
@@ -90,15 +103,47 @@ type AffinityManager struct {
 
 	// Shutdown
 	stopCleanup chan struct{}
-	wg          sync.WaitGroup // Tracks pending async goroutines
+
+	// persistWrites runs the goroutines that write to persistStore. Stop
+	// refuses new ones and waits for the started ones before closing the
+	// store, so that no write reaches it closed.
+	persistWrites SessionGroup
+
+	// Changes waiting to be written to persistStore, at most one per key: its
+	// latest. They are queued under mu, in the order the changes were made,
+	// and a single writer goroutine applies them, so that a key's changes
+	// reach the store in that order. persistMu guards both fields.
+	persistMu      sync.Mutex
+	persistPending map[string]persistOp
+	persistWriting bool // the writer goroutine is running
 
 	// Cleanup counter for periodic memory reporting
 	cleanupCounter uint64
 }
 
-// NewAffinityManager creates a new affinity manager with cluster synchronization
+// NewAffinityManager creates an in-memory affinity manager with cluster synchronization
 func NewAffinityManager(clusterMgr *cluster.Manager, enabled bool, ttl, cleanupInterval time.Duration) *AffinityManager {
+	return NewAffinityManagerWithStore(context.Background(), clusterMgr, enabled, ttl, cleanupInterval, nil)
+}
+
+// NewAffinityManagerWithStore creates an affinity manager with cluster
+// synchronization that writes every affinity change through to store and
+// starts with the affinities store holds. A nil store keeps affinities in
+// memory only. The manager owns store and closes it in Stop.
+//
+// clusterMgr has already joined the cluster, so gossip arrives from the moment
+// the handler is registered. The store is attached before that, so that every
+// event applied is also written. The handler is registered before the file is
+// read, but waits for that initial snapshot: queued events then pass through
+// the normal timestamp checks against the loaded state, so an older SET cannot
+// replace a newer persisted assignment while the file is being read.
+func NewAffinityManagerWithStore(ctx context.Context, clusterMgr *cluster.Manager, enabled bool, ttl, cleanupInterval time.Duration, store AffinityPersistStore) *AffinityManager {
 	if !enabled || clusterMgr == nil {
+		if store != nil {
+			if err := store.Close(); err != nil {
+				logger.Warn("Affinity: Failed to close persist store", "error", err)
+			}
+		}
 		return nil
 	}
 
@@ -113,6 +158,8 @@ func NewAffinityManager(clusterMgr *cluster.Manager, enabled bool, ttl, cleanupI
 	am := &AffinityManager{
 		affinityMap:     make(map[string]*AffinityInfo),
 		clusterManager:  clusterMgr,
+		persistStore:    store,
+		startupLoaded:   make(chan struct{}),
 		enabled:         enabled,
 		defaultTTL:      ttl,
 		cleanupInterval: cleanupInterval,
@@ -124,6 +171,9 @@ func NewAffinityManager(clusterMgr *cluster.Manager, enabled bool, ttl, cleanupI
 	clusterMgr.RegisterAffinityHandler(am.HandleClusterEvent)
 	clusterMgr.RegisterAffinityBroadcaster(am.GetBroadcasts)
 
+	am.loadPersisted(ctx)
+	close(am.startupLoaded)
+
 	// Start background routines
 	go am.cleanupRoutine()
 
@@ -132,21 +182,14 @@ func NewAffinityManager(clusterMgr *cluster.Manager, enabled bool, ttl, cleanupI
 	return am
 }
 
-// SetPersistStore attaches a persistent storage backend to the affinity manager.
-// If set, affinity mappings are written through to SQLite on every set/update/delete
-// and loaded from disk on startup via LoadPersistedAffinities.
-func (am *AffinityManager) SetPersistStore(store AffinityPersistStore) {
-	if am == nil {
-		return
-	}
-	am.persistStore = store
-}
-
-// LoadPersistedAffinities loads affinity entries from the persistent store into
-// the in-memory map. Called once on startup, before gossip sync begins, to
-// pre-populate the map so users are immediately routed to their previous backends.
-func (am *AffinityManager) LoadPersistedAffinities(ctx context.Context) {
-	if am == nil || am.persistStore == nil {
+// loadPersisted loads the unexpired entries of the persistent store into the
+// in-memory map, so that users are routed to their previous backends from the
+// start. The constructor queues incoming gossip until this snapshot has loaded;
+// those events are then applied against its timestamps. Existing in-memory
+// entries and tombstones are retained when loading a manager that already has
+// state.
+func (am *AffinityManager) loadPersisted(ctx context.Context) {
+	if am.persistStore == nil {
 		return
 	}
 
@@ -157,63 +200,110 @@ func (am *AffinityManager) LoadPersistedAffinities(ctx context.Context) {
 	}
 
 	am.mu.Lock()
-	loaded := 0
+	loaded, deleted := 0, 0
 	for _, e := range entries {
 		key := fmt.Sprintf("%s:%s", e.Username, e.Protocol)
-		// Only load if no existing entry (gossip may have already provided fresher data)
-		if _, exists := am.affinityMap[key]; !exists {
-			am.affinityMap[key] = &AffinityInfo{
-				Backend:    e.Backend,
-				Protocol:   e.Protocol,
-				AssignedAt: e.AssignedAt,
-				ExpiresAt:  e.ExpiresAt,
-				NodeID:     e.NodeID,
-			}
-			loaded++
+		if _, exists := am.affinityMap[key]; exists {
+			continue
 		}
+		if am.tombstones.removedSince(key, e.AssignedAt) {
+			am.persistDeleteAsync(e.Username, e.Protocol)
+			deleted++
+			continue
+		}
+		am.affinityMap[key] = &AffinityInfo{
+			Backend:    e.Backend,
+			Protocol:   e.Protocol,
+			AssignedAt: e.AssignedAt,
+			ExpiresAt:  e.ExpiresAt,
+			NodeID:     e.NodeID,
+		}
+		loaded++
 	}
 	am.mu.Unlock()
 
-	logger.Info("Affinity: Loaded persisted affinities", "loaded", loaded, "total_on_disk", len(entries))
+	logger.Info("Affinity: Loaded persisted affinities", "loaded", loaded, "deleted_by_gossip", deleted, "total_on_disk", len(entries))
 }
 
-// persistSetAsync writes an affinity entry to the persistent store in a fire-and-forget goroutine.
+// persistOp is a change waiting to be written to the persistent store.
+type persistOp struct {
+	entry  affinitycache.AffinityEntry // only Username and Protocol for a delete
+	delete bool
+}
+
+// persistSetAsync queues an affinity entry to be written to the persistent store.
+// Once Stop has begun the write is skipped; the in-memory map and gossip are unaffected.
 func (am *AffinityManager) persistSetAsync(username, protocol, backend, nodeID string, assignedAt, expiresAt time.Time) {
-	if am.persistStore == nil {
-		return
-	}
-	am.wg.Add(1)
-	go func() {
-		defer am.wg.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := am.persistStore.Set(ctx, affinitycache.AffinityEntry{
-			Username:   username,
-			Protocol:   protocol,
-			Backend:    backend,
-			AssignedAt: assignedAt,
-			ExpiresAt:  expiresAt,
-			NodeID:     nodeID,
-		}); err != nil {
-			logger.Warn("Affinity: Failed to persist set", "user", username, "error", err)
-		}
-	}()
+	am.queuePersist(persistOp{entry: affinitycache.AffinityEntry{
+		Username:   username,
+		Protocol:   protocol,
+		Backend:    backend,
+		AssignedAt: assignedAt,
+		ExpiresAt:  expiresAt,
+		NodeID:     nodeID,
+	}})
 }
 
-// persistDeleteAsync removes an affinity entry from the persistent store in a fire-and-forget goroutine.
+// persistDeleteAsync queues the removal of an affinity entry from the persistent store.
+// Once Stop has begun the write is skipped; the in-memory map and gossip are unaffected.
 func (am *AffinityManager) persistDeleteAsync(username, protocol string) {
+	am.queuePersist(persistOp{entry: affinitycache.AffinityEntry{Username: username, Protocol: protocol}, delete: true})
+}
+
+// queuePersist makes op the pending change of its key, replacing one not yet
+// written, and starts the writer unless it is running. Callers hold am.mu, so
+// changes are queued in the order they were made.
+func (am *AffinityManager) queuePersist(op persistOp) {
 	if am.persistStore == nil {
 		return
 	}
-	am.wg.Add(1)
-	go func() {
-		defer am.wg.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := am.persistStore.Delete(ctx, username, protocol); err != nil {
-			logger.Warn("Affinity: Failed to persist delete", "user", username, "error", err)
+	am.persistMu.Lock()
+	defer am.persistMu.Unlock()
+	// A running writer would still pick the change up, so refuse it here as
+	// well: nothing changed after Stop begins is written.
+	if am.persistWrites.IsDraining() {
+		return
+	}
+	if am.persistPending == nil {
+		am.persistPending = make(map[string]persistOp)
+	}
+	am.persistPending[op.entry.Username+":"+op.entry.Protocol] = op
+	if am.persistWriting {
+		return
+	}
+	am.persistWriting = am.persistWrites.Go(am.writePersisted)
+	if !am.persistWriting {
+		am.persistPending = nil
+	}
+}
+
+// writePersisted applies the pending changes until none is left. It is the
+// only writer, and a change queued while it writes waits for the next round,
+// so each key's changes reach the store in order.
+func (am *AffinityManager) writePersisted() {
+	for {
+		am.persistMu.Lock()
+		pending := am.persistPending
+		am.persistPending = nil
+		if len(pending) == 0 {
+			am.persistWriting = false
+			am.persistMu.Unlock()
+			return
 		}
-	}()
+		am.persistMu.Unlock()
+
+		for _, op := range pending {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if op.delete {
+				if err := am.persistStore.Delete(ctx, op.entry.Username, op.entry.Protocol); err != nil {
+					logger.Warn("Affinity: Failed to persist delete", "user", op.entry.Username, "error", err)
+				}
+			} else if err := am.persistStore.Set(ctx, op.entry); err != nil {
+				logger.Warn("Affinity: Failed to persist set", "user", op.entry.Username, "error", err)
+			}
+			cancel()
+		}
+	}
 }
 
 // GetBackend returns the backend affinity for a user, if any
@@ -430,6 +520,9 @@ func (am *AffinityManager) GetBroadcasts(overhead, limit int) [][]byte {
 
 // HandleClusterEvent processes an affinity event from another node
 func (am *AffinityManager) HandleClusterEvent(data []byte) {
+	if am.startupLoaded != nil {
+		<-am.startupLoaded
+	}
 	event, err := decodeAffinityEvent(data)
 	if err != nil {
 		logger.Warn("Affinity: Failed to decode affinity event", "error", err)
@@ -628,7 +721,7 @@ func (am *AffinityManager) cleanup() {
 
 	// Cleanup expired entries from persistent store
 	if am.persistStore != nil {
-		go func() {
+		am.persistWrites.Go(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if cleaned, err := am.persistStore.Cleanup(ctx); err != nil {
@@ -636,7 +729,7 @@ func (am *AffinityManager) cleanup() {
 			} else if cleaned > 0 {
 				logger.Debug("Affinity: Cleaned up persisted expired entries", "count", cleaned)
 			}
-		}()
+		})
 	}
 
 	// Get broadcast queue size for memory reporting and metrics
@@ -657,6 +750,37 @@ func (am *AffinityManager) cleanup() {
 	}
 }
 
+// List returns the unexpired affinities this node holds, in no particular order: those
+// it assigned and those it received by gossip. Affinities have no push/pull full-state
+// exchange, so a node that was down or joined after an affinity was gossiped does not
+// hold it, and two nodes can list different sets.
+func (am *AffinityManager) List() []affinitycache.AffinityEntry {
+	if am == nil || !am.enabled {
+		return nil
+	}
+
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+
+	now := time.Now()
+	list := make([]affinitycache.AffinityEntry, 0, len(am.affinityMap))
+	for key, info := range am.affinityMap {
+		if now.After(info.ExpiresAt) {
+			continue // Expired, will be cleaned up later
+		}
+		list = append(list, affinitycache.AffinityEntry{
+			// The key is "username:protocol" with the entry's own protocol.
+			Username:   strings.TrimSuffix(key, ":"+info.Protocol),
+			Protocol:   info.Protocol,
+			Backend:    info.Backend,
+			AssignedAt: info.AssignedAt,
+			ExpiresAt:  info.ExpiresAt,
+			NodeID:     info.NodeID,
+		})
+	}
+	return list
+}
+
 // GetAffinityCount returns the number of active affinities (for testing/monitoring)
 func (am *AffinityManager) GetAffinityCount() int {
 	am.mu.RLock()
@@ -670,15 +794,30 @@ func (am *AffinityManager) Stop() {
 		return
 	}
 	close(am.stopCleanup)
+	am.stopPersistence(affinityPersistDrainTimeout)
+}
 
-	// Wait for any pending async writes to finish
-	am.wg.Wait()
-
-	if am.persistStore != nil {
-		if err := am.persistStore.Close(); err != nil {
-			logger.Warn("Affinity: Failed to close persist store", "error", err)
+func (am *AffinityManager) stopPersistence(timeout time.Duration) {
+	closeStore := func() {
+		if am.persistStore != nil {
+			if err := am.persistStore.Close(); err != nil {
+				logger.Warn("Affinity: Failed to close persist store", "error", err)
+			}
 		}
 	}
+	// Refuse new persistence writes and wait for the started ones: affinity
+	// changes continue while proxies drain their sessions and the Admin API
+	// finishes requests. At the timeout return without closing under a write,
+	// but finish closing the store when the admitted writes eventually end.
+	if !am.persistWrites.Drain(timeout) {
+		logger.Warn("Affinity: Persistence writes still running at shutdown, closing the store after they finish", "timeout", timeout)
+		go func() {
+			am.persistWrites.wait()
+			closeStore()
+		}()
+		return
+	}
+	closeStore()
 }
 
 // GetStats returns affinity statistics

@@ -1,21 +1,27 @@
 package config
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
+	"maps"
 	"math"
 	"net"
 	"net/http"
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
+	"golang.org/x/net/idna"
 )
 
 // ClientCapabilityFilter defines capability filtering rules for specific clients
@@ -25,6 +31,32 @@ type ClientCapabilityFilter struct {
 	JA4Fingerprints []string `toml:"ja4_fingerprints"` // JA4 TLS fingerprint patterns (regex). Can be a single string or array. Useful when a client has multiple fingerprints across versions/platforms. Format: "t13d1516h2_8daaf6152771_e5627efa2ab1"
 	DisableCaps     []string `toml:"disable_caps"`     // List of capabilities to disable
 	Reason          string   `toml:"reason"`           // Human-readable reason for the filter
+}
+
+// Validate reports why the filter cannot work as written: it has no pattern, so it
+// matches no client, or a pattern does not compile (the first one is named), so
+// the IMAP server skips the filter. Either way the capabilities it names stay
+// advertised. An empty client_name or client_version counts as unset, but an
+// empty ja4_fingerprints pattern would match every fingerprint, so it is refused.
+func (f ClientCapabilityFilter) Validate() error {
+	if f.ClientName == "" && f.ClientVersion == "" && len(f.JA4Fingerprints) == 0 {
+		return errors.New("none of client_name, client_version and ja4_fingerprints is set, so it matches no client")
+	}
+	if _, err := regexp.Compile(f.ClientName); err != nil {
+		return fmt.Errorf("client_name %q: %w", f.ClientName, err)
+	}
+	if _, err := regexp.Compile(f.ClientVersion); err != nil {
+		return fmt.Errorf("client_version %q: %w", f.ClientVersion, err)
+	}
+	for _, pattern := range f.JA4Fingerprints {
+		if pattern == "" {
+			return fmt.Errorf("ja4_fingerprints %q: an empty pattern matches every TLS fingerprint", pattern)
+		}
+		if _, err := regexp.Compile(pattern); err != nil {
+			return fmt.Errorf("ja4_fingerprints %q: %w", pattern, err)
+		}
+	}
+	return nil
 }
 
 // DatabaseEndpointConfig holds configuration for a single database endpoint
@@ -44,10 +76,10 @@ type DatabaseEndpointConfig struct {
 	Hosts              []string `toml:"hosts"`
 	Port               any      `toml:"port"` // Database port (default: "5432"), can be string or integer
 	User               string   `toml:"user"`
-	Password           string   `toml:"password"`
+	Password           string   `toml:"password" secret:"true"`
 	Name               string   `toml:"name"`
 	TLSMode            bool     `toml:"tls"`
-	MaxConnections     int      `toml:"max_connections"`      // Maximum number of connections in the pool
+	MaxConnections     int      `toml:"max_connections"`      // Maximum number of connections in the pool (per host; without [database.read] a write host has a second, read pool of the same size)
 	MinConnections     int      `toml:"min_connections"`      // Minimum number of connections in the pool (eagerly created on startup)
 	MinIdleConnections int      `toml:"min_idle_connections"` // Minimum number of idle connections (lazily maintained, superior to min_connections)
 	MaxConnLifetime    string   `toml:"max_conn_lifetime"`    // Maximum lifetime of a connection
@@ -60,13 +92,19 @@ type DatabaseConfig struct {
 	Debug            bool                    `toml:"debug"`             // Enable SQL query logging
 	QueryTimeout     string                  `toml:"query_timeout"`     // Default timeout for all database queries (default: "30s")
 	SearchTimeout    string                  `toml:"search_timeout"`    // Specific timeout for complex search queries (default: "60s")
-	WriteTimeout     string                  `toml:"write_timeout"`     // Timeout for write operations (default: "10s")
+	WriteTimeout     string                  `toml:"write_timeout"`     // Timeout for write operations (default: "15s")
 	LockTimeout      string                  `toml:"lock_timeout"`      // Max time a statement waits for a row lock before failing (default: "10s"; "0" disables)
 	MigrationTimeout string                  `toml:"migration_timeout"` // Timeout for auto-migrations at startup (default: "2m")
 	FetchChunkSize   int                     `toml:"fetch_chunk_size"`  // Number of messages to fetch per chunk for large result sets (default: 5000)
 	Write            *DatabaseEndpointConfig `toml:"write"`             // Write database configuration
 	Read             *DatabaseEndpointConfig `toml:"read"`              // Read database configuration (can have multiple hosts for load balancing)
 	PoolTypeOverride string                  `toml:"-"`                 // Internal: Override pool type in logs (not in config file)
+	// Internal (not in config file): with Read unset, serve reads from the write pool
+	// instead of opening a dedicated read pool to the same host. The resilient layer sets
+	// it for read replicas, and for write hosts when [database.read] is configured: those
+	// serve reads only while no replica is healthy, or in sora-admin, which skips the
+	// replicas, and then the reads share the one pool with the writes.
+	ReadsShareWritePool bool `toml:"-"`
 }
 
 // GetMaxConnLifetime parses the max connection lifetime duration for an endpoint
@@ -83,6 +121,21 @@ func (e *DatabaseEndpointConfig) GetMaxConnIdleTime() (time.Duration, error) {
 		return 30 * time.Minute, nil
 	}
 	return helpers.ParseDuration(e.MaxConnIdleTime)
+}
+
+// Validate checks that the endpoint's pool durations, max_conn_lifetime and
+// max_conn_idle_time, parse. A pool is not created without them: a write host is
+// marked failed, so start-up stops with "no healthy database pools available", and a
+// read replica is retried for good. query_timeout is not checked: an unparsable one
+// falls back to the [database] query_timeout with a warning.
+func (e *DatabaseEndpointConfig) Validate() error {
+	if _, err := e.GetMaxConnLifetime(); err != nil {
+		return fmt.Errorf("invalid max_conn_lifetime %q: %w", e.MaxConnLifetime, err)
+	}
+	if _, err := e.GetMaxConnIdleTime(); err != nil {
+		return fmt.Errorf("invalid max_conn_idle_time %q: %w", e.MaxConnIdleTime, err)
+	}
+	return nil
 }
 
 // GetQueryTimeout parses the query timeout duration for an endpoint.
@@ -147,6 +200,18 @@ func (d *DatabaseConfig) GetMigrationTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(d.MigrationTimeout)
 }
 
+// Validate checks that migration_timeout parses: a write host's pool runs the migrations
+// as it is created and is not created without it, so start-up stops with "no healthy
+// database pools available". The query, search, write and lock timeouts are not checked:
+// an unparsable one falls back to its default with a warning.
+// DatabaseEndpointConfig.Validate checks [database.write] and [database.read].
+func (d *DatabaseConfig) Validate() error {
+	if _, err := d.GetMigrationTimeout(); err != nil {
+		return fmt.Errorf("invalid migration_timeout %q: %w", d.MigrationTimeout, err)
+	}
+	return nil
+}
+
 // GetFetchChunkSize returns the chunk size for large message fetches
 func (d *DatabaseConfig) GetFetchChunkSize() int {
 	if d.FetchChunkSize <= 0 {
@@ -159,13 +224,14 @@ func (d *DatabaseConfig) GetFetchChunkSize() int {
 type S3Config struct {
 	Endpoint      string `toml:"endpoint"`
 	DisableTLS    bool   `toml:"disable_tls"`
-	AccessKey     string `toml:"access_key"`
-	SecretKey     string `toml:"secret_key"`
+	Region        string `toml:"region"`                   // Signing region (default: AWS_REGION or the shared AWS config, else "us-east-1")
+	AccessKey     string `toml:"access_key" secret:"true"` // Without both keys the AWS default credential chain is used
+	SecretKey     string `toml:"secret_key" secret:"true"`
 	Bucket        string `toml:"bucket"`
 	Debug         bool   `toml:"debug"`   // Enable detailed S3 request/response tracing
 	Timeout       string `toml:"timeout"` // Timeout for individual S3 operations (default: 30s)
 	Encrypt       bool   `toml:"encrypt"`
-	EncryptionKey string `toml:"encryption_key"`
+	EncryptionKey string `toml:"encryption_key" secret:"true"`
 }
 
 // GetDebug returns the debug flag
@@ -181,6 +247,62 @@ func (s *S3Config) GetTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(s.Timeout)
 }
 
+// Validate checks the [s3] settings a node that uses S3 needs to connect: the bucket and
+// the endpoint, a timeout that parses, access_key and secret_key both set or both empty,
+// and with encrypt = true an encryption_key that is the hex encoding of a 32-byte key.
+// Without access_key and secret_key the AWS default credential chain supplies them, which
+// only connecting can check.
+func (s *S3Config) Validate() error {
+	if s.Bucket == "" {
+		return errors.New("bucket is required for mail services (IMAP, LMTP, POP3) and for the User API to serve message bodies")
+	}
+	if s.Endpoint == "" {
+		return errors.New("endpoint is required for mail services (IMAP, LMTP, POP3) and for the User API to serve message bodies")
+	}
+	if _, err := s.GetTimeout(); err != nil {
+		return fmt.Errorf("invalid timeout %q: %w", s.Timeout, err)
+	}
+	if (s.AccessKey == "") != (s.SecretKey == "") {
+		return ErrS3KeysNotPaired
+	}
+	if s.Encrypt {
+		if _, err := ParseS3EncryptionKey(s.EncryptionKey); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ErrS3KeysNotPaired refuses an access_key without a secret_key, or a secret_key without
+// an access_key. storage.NewClient refuses such a pair with it too.
+var ErrS3KeysNotPaired = errors.New("access_key and secret_key must be set together; leave both empty to use the AWS default credential chain")
+
+// s3EncryptionKeySize is the size of the [s3] encryption_key, an AES-256 master key.
+const s3EncryptionKeySize = 32
+
+// ParseS3EncryptionKey decodes the [s3] encryption_key, the hex encoding of the AES-256
+// master key that encrypts message bodies. S3Config.Validate and storage.EnableEncryption
+// both decode it with this function, so the file is refused for the reasons the storage
+// refuses the key. The error does not quote the key, which is a secret.
+func ParseS3EncryptionKey(key string) ([]byte, error) {
+	if key == "" {
+		return nil, errors.New("encryption_key is required when encrypt = true")
+	}
+	masterKey, err := hex.DecodeString(key)
+	if err != nil {
+		return nil, fmt.Errorf("encryption_key must be %d hex characters (a %d-byte key)", 2*s3EncryptionKeySize, s3EncryptionKeySize)
+	}
+	if len(masterKey) != s3EncryptionKeySize {
+		return nil, fmt.Errorf("encryption_key must be %d bytes (%d hex characters), got %d bytes", s3EncryptionKeySize, 2*s3EncryptionKeySize, len(masterKey))
+	}
+	return masterKey, nil
+}
+
+// hasSettings reports whether the file sets any of the [s3] connection settings.
+func (s *S3Config) hasSettings() bool {
+	return s.Endpoint != "" || s.Bucket != "" || s.AccessKey != "" || s.SecretKey != ""
+}
+
 // ClusterRateLimitSyncConfig holds configuration for cluster-wide auth rate limiting
 type ClusterRateLimitSyncConfig struct {
 	Enabled           bool `toml:"enabled"`             // Enable cluster-wide rate limiting (default: true if cluster enabled)
@@ -190,7 +312,7 @@ type ClusterRateLimitSyncConfig struct {
 
 // ClusterAffinityConfig holds configuration for cluster-wide server affinity
 type ClusterAffinityConfig struct {
-	Enabled         bool   `toml:"enabled"`          // Enable cluster-wide affinity (default: false)
+	Enabled         bool   `toml:"enabled"`          // Enable cluster-wide affinity (default: true; only read with [cluster] enabled)
 	TTL             string `toml:"ttl"`              // How long affinity persists (default: "24h")
 	CleanupInterval string `toml:"cleanup_interval"` // How often to clean up expired affinities (default: "1h")
 	CachePath       string `toml:"cache_path"`       // SQLite path for persistent affinity (default: "" = disabled)
@@ -214,39 +336,39 @@ func (c *ClusterAffinityConfig) GetCleanupInterval() (time.Duration, error) {
 
 // ClusterConfig holds cluster coordination configuration using gossip protocol
 type ClusterConfig struct {
-	Enabled           bool                       `toml:"enabled"`              // Enable cluster mode
-	Addr              string                     `toml:"addr"`                 // Gossip listen address (must be specific IP:port, NOT 0.0.0.0 or localhost)
-	Port              int                        `toml:"port"`                 // Gossip port (used if not specified in addr)
-	NodeID            string                     `toml:"node_id"`              // Unique node ID (defaults to hostname)
-	Peers             []string                   `toml:"peers"`                // Initial seed nodes
-	SecretKey         string                     `toml:"secret_key"`           // Cluster encryption key (base64-encoded 32-byte key)
-	MaxEventQueueSize int                        `toml:"max_event_queue_size"` // Maximum events per protocol queue (default: 50000)
-	RateLimitSync     ClusterRateLimitSyncConfig `toml:"rate_limit_sync"`      // Auth rate limiting sync configuration
-	Affinity          ClusterAffinityConfig      `toml:"affinity"`             // Server affinity configuration
+	Enabled           bool                       `toml:"enabled"`                  // Enable cluster mode
+	Addr              string                     `toml:"addr"`                     // Gossip listen address (must be specific IP:port, NOT 0.0.0.0 or localhost)
+	Port              int                        `toml:"port"`                     // Gossip port (used if not specified in addr)
+	NodeID            string                     `toml:"node_id"`                  // Unique node ID (defaults to hostname)
+	Peers             []string                   `toml:"peers"`                    // Initial seed nodes
+	SecretKey         string                     `toml:"secret_key" secret:"true"` // Cluster encryption key (base64-encoded 32-byte key)
+	MaxEventQueueSize int                        `toml:"max_event_queue_size"`     // Maximum events per protocol queue (default: 50000)
+	RateLimitSync     ClusterRateLimitSyncConfig `toml:"rate_limit_sync"`          // Auth rate limiting sync configuration
+	Affinity          ClusterAffinityConfig      `toml:"affinity"`                 // Server affinity configuration
+}
+
+// splitClusterAddr splits addr into host and port. addr is a host or IP address,
+// IPv6 bare or bracketed ("2001:db8::40", "[2001:db8::40]"), with an optional
+// port ("10.0.0.40:7946", "[2001:db8::40]:7946"). port is "" when addr has none.
+func splitClusterAddr(addr string) (host, port string) {
+	if h, p, err := net.SplitHostPort(addr); err == nil {
+		return h, p
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]"), ""
 }
 
 // GetBindAddr returns the bind address by parsing the addr field
 func (c *ClusterConfig) GetBindAddr() string {
-	if c.Addr == "" {
-		return ""
-	}
-	// Parse addr to extract just the IP (not port)
-	if strings.Contains(c.Addr, ":") {
-		parts := strings.Split(c.Addr, ":")
-		return parts[0]
-	}
-	return c.Addr
+	host, _ := splitClusterAddr(c.Addr)
+	return host
 }
 
 // GetBindPort returns the bind port from addr or the port field
 func (c *ClusterConfig) GetBindPort() int {
 	// If addr contains a port, use that
-	if c.Addr != "" && strings.Contains(c.Addr, ":") {
-		parts := strings.Split(c.Addr, ":")
-		if len(parts) == 2 {
-			if port, err := strconv.Atoi(parts[1]); err == nil {
-				return port
-			}
+	if _, p := splitClusterAddr(c.Addr); p != "" {
+		if port, err := strconv.Atoi(p); err == nil {
+			return port
 		}
 	}
 
@@ -267,14 +389,43 @@ func (c *ClusterConfig) GetMaxEventQueueSize() int {
 	return 50000 // Default: sufficient for busy servers
 }
 
+// Validate checks an enabled [cluster] for the settings gossip cannot run without.
+//
+// addr must be an IP address the other nodes can reach: it is bound and advertised as
+// is, so 0.0.0.0, ::, localhost or a host name cannot be used. secret_key is required
+// and must be the base64 of 32 bytes (AES-256): gossip carries auth-failure state, IP
+// blocks and connection-kick commands, which any host able to reach the gossip port
+// could forge without encryption.
+func (c *ClusterConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	bindAddr := c.GetBindAddr()
+	if ip := net.ParseIP(bindAddr); ip == nil || ip.IsUnspecified() {
+		return fmt.Errorf("cluster addr '%s' must be a specific IP address reachable from other nodes, such as \"10.10.10.40:7946\" (not 0.0.0.0, ::, localhost or a host name)", bindAddr)
+	}
+	if c.SecretKey == "" {
+		return errors.New("cluster secret_key is required when cluster mode is enabled (generate one with: openssl rand -base64 32)")
+	}
+	key, err := base64.StdEncoding.DecodeString(c.SecretKey)
+	if err != nil {
+		return fmt.Errorf("failed to decode cluster secret_key: %w", err)
+	}
+	if len(key) != 32 {
+		return fmt.Errorf("cluster secret_key must be 32 bytes (got %d bytes)", len(key))
+	}
+	return nil
+}
+
 // TLSLetsEncryptS3Config holds S3-specific configuration for Let's Encrypt certificate storage
 type TLSLetsEncryptS3Config struct {
-	Bucket     string `toml:"bucket"`      // S3 bucket for certificate storage
-	Endpoint   string `toml:"endpoint"`    // S3-compatible storage endpoint (default: "s3.amazonaws.com")
-	DisableTLS bool   `toml:"disable_tls"` // Disable TLS for S3 endpoint (useful for local MinIO setups)
-	Debug      bool   `toml:"debug"`       // Enable detailed S3 request/response tracing
-	AccessKey  string `toml:"access_key"`  // AWS credentials (optional, uses default chain)
-	SecretKey  string `toml:"secret_key"`  // AWS credentials (optional)
+	Bucket     string `toml:"bucket"`                   // S3 bucket for certificate storage
+	Endpoint   string `toml:"endpoint"`                 // S3-compatible storage endpoint (default: "s3.amazonaws.com")
+	DisableTLS bool   `toml:"disable_tls"`              // Disable TLS for S3 endpoint (useful for local MinIO setups)
+	Region     string `toml:"region"`                   // Signing region (default: AWS_REGION or the shared AWS config, else "us-east-1")
+	Debug      bool   `toml:"debug"`                    // Enable detailed S3 request/response tracing
+	AccessKey  string `toml:"access_key" secret:"true"` // AWS credentials (optional, uses default chain)
+	SecretKey  string `toml:"secret_key" secret:"true"` // AWS credentials (optional)
 	// ServerSideEncryption is the encryption asked of the store on every certificate
 	// write: "AES256" for the store's own key management, "aws:kms" with a key id, or
 	// "" for no encryption header at all. Pointer so an absent key (keep the default,
@@ -288,7 +439,7 @@ type TLSLetsEncryptS3Config struct {
 // TLSLetsEncryptConfig holds Let's Encrypt automatic certificate management configuration
 type TLSLetsEncryptConfig struct {
 	Email           string                 `toml:"email"`            // Email for Let's Encrypt notifications
-	Domains         []string               `toml:"domains"`          // Domains for certificate (supports multiple)
+	Domains         []string               `toml:"domains"`          // Domains for certificate (supports multiple). Loaded as autocert names: lowercase A-labels without a trailing dot (normalizeDomains)
 	DefaultDomain   string                 `toml:"default_domain"`   // Default domain to use when client doesn't provide SNI (optional, defaults to first domain in list)
 	StorageProvider string                 `toml:"storage_provider"` // Certificate storage backend (currently only "s3")
 	S3              TLSLetsEncryptS3Config `toml:"s3"`               // S3 storage configuration
@@ -298,6 +449,97 @@ type TLSLetsEncryptConfig struct {
 	SyncInterval    string                 `toml:"sync_interval"`    // Interval to check S3 for certificate updates (e.g., "5m"). Default: 5m. Set to "0" to disable periodic sync.
 }
 
+// normalizeDomains rewrites domains and default_domain to the names autocert keeps their
+// certificates under. The certificate sync and the startup pre-warm read the cache under
+// the configured names, so a name kept as written ("Mail.Example.com") had the leader's
+// renewals synced into a local file autocert never reads. A name autocert cannot serve is
+// dropped with a warning; autocert.HostWhitelist drops it silently.
+func (c *TLSLetsEncryptConfig) normalizeDomains() {
+	var domains []string
+	for _, configured := range c.Domains {
+		name, err := AutocertName(configured)
+		if err != nil {
+			warnf("[tls.letsencrypt] domains: ignoring %q, no certificate can be served for it: %v", configured, err)
+			continue
+		}
+		if !slices.Contains(domains, name) {
+			domains = append(domains, name)
+		}
+	}
+	c.Domains = domains
+
+	if c.DefaultDomain != "" {
+		name, err := AutocertName(c.DefaultDomain)
+		if err != nil {
+			warnf("[tls.letsencrypt] default_domain: ignoring %q, clients without SNI get the first domain's certificate: %v", c.DefaultDomain, err)
+		}
+		c.DefaultDomain = name
+	}
+}
+
+// AutocertName returns the name autocert keeps a domain's certificates under: the server
+// name folded by idna.Lookup.ToASCII (lowercase, A-label) without a trailing dot, as
+// autocert.Manager.GetCertificate derives it from a ClientHello. It fails for a name
+// GetCertificate refuses. sora-admin's tls commands name cache entries with it too.
+func AutocertName(domain string) (string, error) {
+	if domain == "" {
+		return "", errors.New("missing server name")
+	}
+	if strings.ContainsAny(domain, `/\`) {
+		return "", errors.New("server name contains path separator")
+	}
+	name, err := idna.Lookup.ToASCII(domain)
+	if err != nil {
+		return "", err
+	}
+	name = strings.TrimSuffix(name, ".")
+	if len(name) == 0 || len(name) > 253 {
+		return "", errors.New("server name length invalid")
+	}
+	if net.ParseIP(name) != nil {
+		return "", errors.New("server name must not be an IP address")
+	}
+	labels := strings.Split(name, ".")
+	if len(labels) < 2 {
+		return "", errors.New("server name component count invalid")
+	}
+	for _, label := range labels {
+		if !isValidAutocertLabel(label) {
+			return "", fmt.Errorf("invalid server name label %q", label)
+		}
+	}
+	if isAllASCIIDigits(labels[len(labels)-1]) {
+		return "", errors.New("server name top-level domain must not be all-numeric")
+	}
+	return name, nil
+}
+
+func isValidAutocertLabel(label string) bool {
+	if len(label) == 0 || len(label) > 63 {
+		return false
+	}
+	if label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(label); i++ {
+		c := label[i]
+		if ('a' <= c && c <= 'z') || ('0' <= c && c <= '9') || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isAllASCIIDigits(label string) bool {
+	for i := 0; i < len(label); i++ {
+		if label[i] < '0' || label[i] > '9' {
+			return false
+		}
+	}
+	return len(label) > 0
+}
+
 // TLSConfig holds TLS/SSL configuration
 type TLSConfig struct {
 	Enabled     bool                  `toml:"enabled"`     // Enable HTTPS/TLS
@@ -305,6 +547,56 @@ type TLSConfig struct {
 	CertFile    string                `toml:"cert_file"`   // Certificate file (for provider="file")
 	KeyFile     string                `toml:"key_file"`    // Private key file (for provider="file")
 	LetsEncrypt *TLSLetsEncryptConfig `toml:"letsencrypt"` // Let's Encrypt configuration
+}
+
+// Validate checks, with enabled = true, what the TLS manager needs of [tls] before it
+// opens anything: a known provider, cert_file and key_file for provider = "file", and
+// for provider = "letsencrypt" a [tls.letsencrypt] table with email, domains,
+// storage_provider = "s3" and a renew_before and sync_interval that parse. Whether the
+// certificate files can be read and the certificate store reached is found only by
+// opening them. tlsmanager.New runs it too.
+func (c *TLSConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	switch c.Provider {
+	case "file":
+		if c.CertFile == "" || c.KeyFile == "" {
+			return errors.New("cert_file and key_file are required for provider='file'")
+		}
+		return nil
+	case "letsencrypt":
+		return c.LetsEncrypt.validate()
+	default:
+		return fmt.Errorf("unknown TLS provider: %s (must be 'file' or 'letsencrypt')", c.Provider)
+	}
+}
+
+func (c *TLSLetsEncryptConfig) validate() error {
+	if c == nil {
+		return errors.New("letsencrypt configuration is required for provider='letsencrypt'")
+	}
+	if c.Email == "" {
+		return errors.New("letsencrypt.email is required")
+	}
+	if len(c.Domains) == 0 {
+		return errors.New("letsencrypt.domains is required and must not be empty")
+	}
+	if c.StorageProvider != "s3" {
+		return errors.New("only storage_provider='s3' is currently supported for Let's Encrypt")
+	}
+	if c.RenewBefore != "" {
+		if _, err := helpers.ParseDuration(c.RenewBefore); err != nil {
+			return fmt.Errorf("invalid renew_before duration %q: %w", c.RenewBefore, err)
+		}
+	}
+	// "0" turns the certificate sync off.
+	if c.SyncInterval != "" && c.SyncInterval != "0" {
+		if _, err := helpers.ParseDuration(c.SyncInterval); err != nil {
+			return fmt.Errorf("invalid sync_interval duration %q: %w", c.SyncInterval, err)
+		}
+	}
+	return nil
 }
 
 // CleanupConfig holds cleaner worker configuration.
@@ -361,6 +653,38 @@ func (c *CleanupConfig) GetFTSRetention() (time.Duration, error) {
 		return 0, nil // 0 means keep vectors forever (default)
 	}
 	return helpers.ParseDuration(c.FTSRetention)
+}
+
+// Validate rejects durations that parse but have a sign the cleaner cannot use.
+//
+//   - grace_period: every cleaner threshold is now minus the grace period, so a negative
+//     one lies in the future and expunged mail and soft-deleted accounts are hard-deleted
+//     at the next cycle, with no restore window.
+//   - max_age_restriction, health_status_retention: the cleaner acts only on a positive
+//     value, so a negative one turns the restriction or the pruning off without a word.
+//   - fts_retention: delivery and import index only mail sent after now minus the
+//     retention, which would then lie in the future, so no new message would get a search
+//     row; and the cleaner prunes only for a positive retention.
+//   - instance_liveness_threshold must be positive. The runtime getter retains its
+//     default fallback for non-positive values as a safety net.
+//
+// An unset key does not parse here and takes its default; a value that does not parse
+// falls back to the default too, like any other duration key.
+func (c *CleanupConfig) Validate() error {
+	for _, f := range []struct{ key, value string }{
+		{"grace_period", c.GracePeriod},
+		{"max_age_restriction", c.MaxAgeRestriction},
+		{"fts_retention", c.FTSRetention},
+		{"health_status_retention", c.HealthStatusRetention},
+	} {
+		if d, err := helpers.ParseDuration(f.value); err == nil && d < 0 {
+			return fmt.Errorf("%s must not be negative, got %q", f.key, f.value)
+		}
+	}
+	if d, err := helpers.ParseDuration(c.InstanceLivenessThreshold); err == nil && d <= 0 {
+		return fmt.Errorf("instance_liveness_threshold must be positive, got %q", c.InstanceLivenessThreshold)
+	}
+	return nil
 }
 
 // GetHealthStatusRetention parses the health status retention duration
@@ -464,7 +788,53 @@ type UploaderConfig struct {
 	MaxAttempts        int    `toml:"max_attempts"`
 	RetryInterval      string `toml:"retry_interval"`
 	CleanupGracePeriod string `toml:"cleanup_grace_period"` // Minimum age of a local upload file before cleanup considers it (default: "1h"). Must exceed the longest possible DB transaction to avoid the race where a file is deleted before its pending_upload record commits.
-	MaxStagingSize     string `toml:"max_staging_size"`     // Maximum size of the global upload staging queue (e.g. "100gb"). If set and exceeded, new appends are rejected.
+	MaxStagingSize     string `toml:"max_staging_size"`     // Maximum size of this node's own upload staging backlog (e.g. "100gb"); other nodes' backlogs do not count. If set and exceeded, new messages (IMAP APPEND, LMTP and Admin API deliveries) are refused.
+}
+
+// DefaultUploaderMaxAttempts is [uploader] max_attempts when the key is absent.
+const DefaultUploaderMaxAttempts = 20
+
+// Validate rejects [uploader] settings that stop or crash the upload worker or lose
+// mail: batch_size, concurrency, max_attempts and cleanup_grace_period must be
+// positive. A zero concurrency blocks the worker (and its instance heartbeat) for
+// good, a negative one panics, a zero batch_size leases nothing and a negative one is
+// refused by PostgreSQL, and max_attempts <= 0 leases nothing and fails the cleaner's
+// failed-upload pass. A negative cleanup_grace_period puts the orphan cleanup's cutoff
+// in the future, so it removes staged bodies whose pending_uploads row is still in an
+// uncommitted delivery transaction. An unparseable cleanup_grace_period or
+// max_staging_size is refused too: start-up exits on it, as there is no fallback.
+// retry_interval must be positive as well: the lease takes rows whose last_attempt is
+// before now - retry_interval, so with 0 or less it takes back rows leased a moment ago
+// in the same pass and an upload the provider refuses is retried in a tight loop that
+// never reaches the cycle backoff. An unparseable retry_interval falls back to 30s with
+// a warning.
+func (c *UploaderConfig) Validate() error {
+	for _, f := range []struct {
+		key   string
+		value int
+	}{
+		{"batch_size", c.BatchSize},
+		{"concurrency", c.Concurrency},
+		{"max_attempts", c.MaxAttempts},
+	} {
+		if f.value <= 0 {
+			return fmt.Errorf("[uploader] %s must be positive, got %d", f.key, f.value)
+		}
+	}
+	d, err := c.GetCleanupGracePeriod()
+	if err != nil {
+		return fmt.Errorf("[uploader] cleanup_grace_period: %w", err)
+	}
+	if d <= 0 {
+		return fmt.Errorf("[uploader] cleanup_grace_period must be positive, got %q", c.CleanupGracePeriod)
+	}
+	if d, err := helpers.ParseDuration(c.RetryInterval); err == nil && d <= 0 {
+		return fmt.Errorf("[uploader] retry_interval must be positive, got %q", c.RetryInterval)
+	}
+	if _, err := c.GetMaxStagingSize(); err != nil {
+		return fmt.Errorf("[uploader] max_staging_size: %w", err)
+	}
+	return nil
 }
 
 // GetRetryInterval parses the retry interval duration
@@ -529,7 +899,7 @@ type AuthRateLimiterConfig struct {
 	DelayMultiplier     float64       `toml:"delay_multiplier"`      // Delay increase factor
 
 	// Memory safety limits (prevents unbounded growth during burst attacks)
-	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Maximum IP+username tracking entries (default: 100000)
+	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Maximum IP+username failure counters, and separately blocks (default: 100000)
 	MaxIPEntries         int `toml:"max_ip_entries"`          // Maximum IP failure tracking entries (default: 50000)
 	MaxUsernameEntries   int `toml:"max_username_entries"`    // Maximum username tracking entries (default: 50000)
 
@@ -552,11 +922,18 @@ type AuthRateLimiterConfig struct {
 // multiplier. Zero means "use the default" (see applyAuthRateLimitDefaults); a negative
 // value has no meaning, and the limiter does not read it consistently
 // (max_attempts_per_ip = -1 blocked an address at its first failure on one path and
-// disabled the IP block on another). TOML accepts nan and inf, which pass a sign check;
-// the limiter converts the multiplied delay to a time.Duration before capping it at
-// max_delay, and that conversion is platform-dependent for them (on amd64 +Inf becomes
-// a negative delay, which switches progressive delays off).
+// disabled the IP block on another). TOML accepts nan and inf, which pass a sign check
+// but are no growth factor. Any finite multiplier is safe: the limiter caps the
+// product at max_delay before converting it to a time.Duration.
+//
+// It also rejects an exempt_networks entry that is neither an IP address nor a CIDR.
+// The limiter's match skips such an entry, so it would exempt nobody, and the host the
+// operator meant to exempt would be counted and blocked with nothing in the log to say
+// why. A malformed [servers] trusted_networks entry is refused the same way.
 func (c *AuthRateLimiterConfig) Validate() error {
+	if invalid := helpers.InvalidNetworkEntries(c.ExemptNetworks); len(invalid) > 0 {
+		return fmt.Errorf("auth_rate_limit.exempt_networks has entries that are neither an IP address nor a CIDR: %q", invalid)
+	}
 	v := reflect.ValueOf(c).Elem()
 	for i := 0; i < v.NumField(); i++ {
 		f := v.Field(i)
@@ -578,6 +955,13 @@ func (c *AuthRateLimiterConfig) Validate() error {
 		}
 	}
 	return nil
+}
+
+// UnmarshalTOML decodes an auth_rate_limit table field by field, with its
+// durations parsed like every other duration key (see decodeTable).
+func (c *AuthRateLimiterConfig) UnmarshalTOML(data any) error {
+	type plain AuthRateLimiterConfig
+	return decodeTable("auth_rate_limit", data, (*plain)(c))
 }
 
 // DefaultAuthRateLimiterConfig returns sensible defaults for authentication rate limiting
@@ -610,7 +994,7 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 		DelayMultiplier:     2.0,              // Double delay each time
 
 		// Memory safety limits (prevents OOM during burst attacks)
-		MaxIPUsernameEntries: 100000, // ~25MB per protocol at capacity
+		MaxIPUsernameEntries: 100000, // counters and blocks each: ~50MB per protocol at capacity
 		MaxIPEntries:         50000,  // ~7.5MB per protocol at capacity
 		MaxUsernameEntries:   50000,  // ~7.5MB per protocol at capacity
 	}
@@ -649,19 +1033,59 @@ var tomlErrorPosition = regexp.MustCompile(`^toml: (?:line \d+ )?\(last key "([^
 // the cache enabled with the default max_size. Decoded field by field, an omitted
 // enabled would be false and turn the cache off.
 func (c *LookupCacheConfig) UnmarshalTOML(data any) error {
-	table, ok := data.(map[string]any)
-	if !ok {
-		return fmt.Errorf("lookup_cache must be a table, got %T", data)
-	}
-	// Decode the table's own keys again, into a copy of the defaults. The plain
-	// type has no UnmarshalTOML, so this decodes field by field.
-	var buf strings.Builder
-	if err := toml.NewEncoder(&buf).Encode(table); err != nil {
-		return fmt.Errorf("lookup_cache: %w", err)
-	}
 	type plain LookupCacheConfig
 	decoded := plain(DefaultLookupCacheConfig())
-	md, err := toml.Decode(buf.String(), &decoded)
+	if err := decodeTable("lookup_cache", data, &decoded); err != nil {
+		return err
+	}
+	*c = LookupCacheConfig(decoded)
+	return nil
+}
+
+// decodeTable decodes data, the table the toml package hands an UnmarshalTOML
+// method, into v, a pointer to a struct type without one: the table is encoded
+// again and decoded field by field. name is the table's key, for messages.
+//
+// A time.Duration field is parsed with helpers.ParseDuration, like every other
+// duration key, so it takes whole days ("1d"). Left to the toml package it would
+// take time.ParseDuration syntax only, and a bare integer as nanoseconds; here an
+// integer has no unit, so it is an error as "900" is for the other keys.
+func decodeTable(name string, data any, v any) error {
+	table, ok := data.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%s must be a table, got %T", name, data)
+	}
+	decoded := maps.Clone(table)
+	typ := reflect.TypeOf(v).Elem()
+	for i := range typ.NumField() {
+		field := typ.Field(i)
+		if field.Type != reflect.TypeOf(time.Duration(0)) {
+			continue
+		}
+		// The toml package decodes a key into a field it matches only
+		// case-insensitively too ("IP_Block_Duration"), so every such key is parsed.
+		for key, value := range table {
+			if !strings.EqualFold(key, tomlKey(field)) {
+				continue
+			}
+			s, ok := value.(string)
+			if !ok {
+				return fmt.Errorf("%s: a duration is a string with a unit, such as \"15m\" or \"1d\", got %v", key, value)
+			}
+			// Parsed here, before LoadConfigFromFile trims every string, so trim it the same way.
+			d, err := helpers.ParseDuration(strings.TrimSpace(s))
+			if err != nil {
+				return fmt.Errorf("%s: %w", key, err)
+			}
+			decoded[key] = int64(d) // the toml package decodes an integer into a time.Duration as nanoseconds
+		}
+	}
+
+	var buf strings.Builder
+	if err := toml.NewEncoder(&buf).Encode(decoded); err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	md, err := toml.Decode(buf.String(), v)
 	if err != nil {
 		// The line in err is one of the re-encoded table, not of the file; the
 		// outer decoder adds the table's own line. Keep the key and the reason.
@@ -670,9 +1094,8 @@ func (c *LookupCacheConfig) UnmarshalTOML(data any) error {
 	// The outer decoder counts every key of a table handled here as decoded, so
 	// report unknown ones here.
 	for _, key := range md.Undecoded() {
-		log.Printf("WARNING: Unknown key 'lookup_cache.%s' will be ignored", key)
+		warnf("Unknown key '%s.%s' will be ignored", name, key)
 	}
-	*c = LookupCacheConfig(decoded)
 	return nil
 }
 
@@ -684,44 +1107,81 @@ func (c *LookupCacheConfig) GetMaxSize() int {
 	return c.MaxSize
 }
 
+// The lookup_cache durations a key gets when it is absent.
+const (
+	defaultLookupCachePositiveTTL                = 5 * time.Minute
+	defaultLookupCacheNegativeTTL                = 1 * time.Minute
+	defaultLookupCacheCleanupInterval            = 5 * time.Minute
+	defaultLookupCachePositiveRevalidationWindow = 30 * time.Second
+)
+
 // GetPositiveTTL parses and returns the positive TTL duration
 func (c *LookupCacheConfig) GetPositiveTTL() (time.Duration, error) {
-	if c.PositiveTTL == "" {
-		return 5 * time.Minute, nil
-	}
-	return time.ParseDuration(c.PositiveTTL)
+	return parseLookupCacheDuration(c.PositiveTTL, defaultLookupCachePositiveTTL)
+}
+
+// GetPositiveTTLWithDefault returns positive_ttl, or its default if the value cannot be
+// parsed. server names the server whose table this is, for the warning.
+func (c *LookupCacheConfig) GetPositiveTTLWithDefault(server string) time.Duration {
+	return lookupCacheDurationWithDefault(server, "positive_ttl", c.PositiveTTL, defaultLookupCachePositiveTTL)
 }
 
 // GetNegativeTTL parses and returns the negative TTL duration
 func (c *LookupCacheConfig) GetNegativeTTL() (time.Duration, error) {
-	if c.NegativeTTL == "" {
-		return 1 * time.Minute, nil
-	}
-	return time.ParseDuration(c.NegativeTTL)
+	return parseLookupCacheDuration(c.NegativeTTL, defaultLookupCacheNegativeTTL)
+}
+
+// GetNegativeTTLWithDefault returns negative_ttl, or its default if the value cannot be
+// parsed. server names the server whose table this is, for the warning.
+func (c *LookupCacheConfig) GetNegativeTTLWithDefault(server string) time.Duration {
+	return lookupCacheDurationWithDefault(server, "negative_ttl", c.NegativeTTL, defaultLookupCacheNegativeTTL)
 }
 
 // GetCleanupInterval parses and returns the cleanup interval duration
 func (c *LookupCacheConfig) GetCleanupInterval() (time.Duration, error) {
-	if c.CleanupInterval == "" {
-		return 5 * time.Minute, nil
-	}
-	return time.ParseDuration(c.CleanupInterval)
+	return parseLookupCacheDuration(c.CleanupInterval, defaultLookupCacheCleanupInterval)
+}
+
+// GetCleanupIntervalWithDefault returns cleanup_interval, or its default if the value
+// cannot be parsed. server names the server whose table this is, for the warning.
+func (c *LookupCacheConfig) GetCleanupIntervalWithDefault(server string) time.Duration {
+	return lookupCacheDurationWithDefault(server, "cleanup_interval", c.CleanupInterval, defaultLookupCacheCleanupInterval)
 }
 
 // GetPositiveRevalidationWindow parses and returns the positive revalidation window duration
 func (c *LookupCacheConfig) GetPositiveRevalidationWindow() (time.Duration, error) {
-	if c.PositiveRevalidationWindow == "" {
-		return 30 * time.Second, nil
+	return parseLookupCacheDuration(c.PositiveRevalidationWindow, defaultLookupCachePositiveRevalidationWindow)
+}
+
+// GetPositiveRevalidationWindowWithDefault returns positive_revalidation_window, or its
+// default if the value cannot be parsed. server names the server whose table this is,
+// for the warning.
+func (c *LookupCacheConfig) GetPositiveRevalidationWindowWithDefault(server string) time.Duration {
+	return lookupCacheDurationWithDefault(server, "positive_revalidation_window", c.PositiveRevalidationWindow, defaultLookupCachePositiveRevalidationWindow)
+}
+
+func parseLookupCacheDuration(value string, def time.Duration) (time.Duration, error) {
+	if value == "" {
+		return def, nil
 	}
-	return time.ParseDuration(c.PositiveRevalidationWindow)
+	return helpers.ParseDuration(value)
+}
+
+func lookupCacheDurationWithDefault(server, key, value string, def time.Duration) time.Duration {
+	d, err := parseLookupCacheDuration(value, def)
+	if err != nil {
+		warnf("Failed to parse lookup_cache.%s for server '%s': %v, using default (%s)", key, server, err, def)
+		return def
+	}
+	return d
 }
 
 // RemoteLookupConfig holds configuration for HTTP-based user routing
 type RemoteLookupConfig struct {
 	Enabled   bool   `toml:"enabled"`
-	URL       string `toml:"url"`        // HTTP endpoint URL for lookups (e.g., "http://localhost:8080/lookup")
-	Timeout   string `toml:"timeout"`    // HTTP request timeout (default: "5s")
-	AuthToken string `toml:"auth_token"` // Bearer token for HTTP authentication (optional)
+	URL       string `toml:"url"`                      // HTTP endpoint URL for lookups (e.g., "http://localhost:8080/lookup")
+	Timeout   string `toml:"timeout"`                  // HTTP request timeout (default: "5s")
+	AuthToken string `toml:"auth_token" secret:"true"` // Bearer token for HTTP authentication (optional)
 
 	// Backend connection settings
 	LookupLocalUsers       bool   `toml:"lookup_local_users"`        // Check local DB when remote returns 404/3xx (for split user scenarios)
@@ -755,7 +1215,7 @@ type RemoteLookupCircuitBreakerConfig struct {
 	Interval     string  `toml:"interval"`      // Time before resetting failure counts in closed state (default: "0s" - never reset)
 	Timeout      string  `toml:"timeout"`       // Time before transitioning from open to half-open (default: "30s")
 	FailureRatio float64 `toml:"failure_ratio"` // Failure ratio threshold to open circuit (0.0-1.0, default: 0.6)
-	MinRequests  int     `toml:"min_requests"`  // Minimum requests before evaluating failure ratio (default: 3)
+	MinRequests  int     `toml:"min_requests"`  // Minimum completed requests before evaluating failure ratio (default: 3)
 }
 
 // RemoteLookupTransportConfig holds HTTP transport configuration for remote_lookup connection pooling and timeouts
@@ -764,8 +1224,8 @@ type RemoteLookupTransportConfig struct {
 	MaxIdleConnsPerHost   int    `toml:"max_idle_conns_per_host"` // Maximum idle connections per host (default: 100)
 	MaxConnsPerHost       int    `toml:"max_conns_per_host"`      // Maximum total connections per host, 0 = unlimited (default: 0)
 	IdleConnTimeout       string `toml:"idle_conn_timeout"`       // How long idle connections stay open (default: "90s")
-	DialTimeout           string `toml:"dial_timeout"`            // TCP connection timeout including DNS (default: "30s")
-	TLSHandshakeTimeout   string `toml:"tls_handshake_timeout"`   // TLS handshake timeout (default: "30s")
+	DialTimeout           string `toml:"dial_timeout"`            // TCP connection timeout including DNS (default: "10s")
+	TLSHandshakeTimeout   string `toml:"tls_handshake_timeout"`   // TLS handshake timeout (default: "10s")
 	ExpectContinueTimeout string `toml:"expect_continue_timeout"` // 100-continue timeout (default: "1s")
 	KeepAlive             string `toml:"keep_alive"`              // TCP keep-alive interval (default: "30s")
 }
@@ -833,7 +1293,7 @@ func (c *RemoteLookupCircuitBreakerConfig) GetFailureRatio() float64 {
 	return c.FailureRatio
 }
 
-// GetMinRequests returns the minimum requests before evaluating failure ratio
+// GetMinRequests returns the minimum completed requests before evaluating failure ratio
 func (c *RemoteLookupCircuitBreakerConfig) GetMinRequests() uint32 {
 	if c.MinRequests <= 0 {
 		return 3 // Default: 3 requests
@@ -927,21 +1387,22 @@ func (c *RemoteLookupConfig) GetRemotePort() (int, error) {
 	default:
 		return 0, fmt.Errorf("invalid type for remote_port: %T", v)
 	}
-	port := int(p)
-	if port < 0 || port > 65535 {
-		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", port)
+	// Range-check before converting to int: TOML integers are int64 even on 32-bit targets.
+	if p < 0 || p > 65535 {
+		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", p)
 	}
-	return port, nil
+	return int(p), nil
 }
 
-// ServerLimitsConfig holds resource limits for a server
+// ServerLimitsConfig holds resource limits for a server. serverLimitKeys lists the
+// server types that apply each one.
 type ServerLimitsConfig struct {
 	SearchRateLimitPerMin *int   `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled, default: 60)
 	SearchRateLimitWindow string `toml:"search_rate_limit_window,omitempty"`  // Search rate limit time window (default: 1m)
 	SearchRateLimitBurst  *int   `toml:"search_rate_limit_burst,omitempty"`   // Searches allowed back to back (default: search_rate_limit_per_min)
 	ThreadMaxMessages     int    `toml:"thread_max_messages,omitempty"`       // Maximum matches per THREAD command (IMAP backend only, <=0 uses default: 50000)
 	RedirectRateLimit     *int   `toml:"redirect_rate_limit,omitempty"`       // Redirect rate limit (per account across the window, 0=unlimited, default: 100)
-	RedirectRateWindow    string `toml:"redirect_rate_window,omitempty"`      // Redirect rate limit time window (default: 1h)
+	RedirectRateWindow    string `toml:"redirect_rate_window,omitempty"`      // Redirect rate limit time window (must be positive, default: 1h)
 	MaxRedirectHops       *int   `toml:"max_redirect_hops,omitempty"`         // Max times one message may be redirected before suppression (mail-loop backstop, 0=unlimited, default: 2)
 	SessionMemoryLimit    string `toml:"session_memory_limit,omitempty"`      // Per-session memory limit (default: 100mb, 0=unlimited)
 	MaxAuthErrors         int    `toml:"max_auth_errors,omitempty"`           // Maximum authentication errors before disconnection (default: 2)
@@ -956,7 +1417,7 @@ type ServerTimeoutsConfig struct {
 	CommandTimeout             string                            `toml:"command_timeout,omitempty"`              // Maximum idle time before disconnection (default: protocol-specific)
 	AbsoluteSessionTimeout     string                            `toml:"absolute_session_timeout,omitempty"`     // Maximum total session duration (default: 24h)
 	MinBytesPerMinute          int64                             `toml:"min_bytes_per_minute,omitempty"`         // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
-	SchedulerShardCount        int                               `toml:"scheduler_shard_count,omitempty"`        // Number of timeout scheduler shards (default: 0 = runtime.NumCPU(), -1 = runtime.NumCPU()/2 for physical cores)
+	SchedulerShardCount        int                               `toml:"scheduler_shard_count,omitempty"`        // Not applied (warned about): the one timeout scheduler of the process is sized by [timeout_scheduler] shard_count
 	IMAPCommandTimeouts        *CommandTimeoutsConfig            `toml:"imap_command_timeouts,omitempty"`        // Per-command hard execution timeouts (IMAP only)
 	ManageSieveCommandTimeouts *ManageSieveCommandTimeoutsConfig `toml:"managesieve_command_timeouts,omitempty"` // Per-command hard execution timeouts (ManageSieve only)
 	POP3CommandTimeouts        *POP3CommandTimeoutsConfig        `toml:"pop3_command_timeouts,omitempty"`        // Per-command hard execution timeouts (POP3 only)
@@ -1031,6 +1492,9 @@ type ServerConfig struct {
 	Type string `toml:"type"`
 	Name string `toml:"name"`
 	Addr string `toml:"addr"`
+	// Enabled = false keeps the block in the file without starting or validating it.
+	// nil (absent) or true starts it. See IsEnabled.
+	Enabled *bool `toml:"enabled,omitempty"`
 
 	// Common server options
 	TLS              bool   `toml:"tls,omitempty"`
@@ -1047,21 +1511,23 @@ type ServerConfig struct {
 	// Connection limits
 	MaxConnections             int `toml:"max_connections,omitempty"`
 	MaxConnectionsPerIP        int `toml:"max_connections_per_ip,omitempty"`
-	MaxConnectionsPerUser      int `toml:"max_connections_per_user,omitempty"`        // Cluster-wide per-user limit (proxy only, requires cluster mode)
+	MaxConnectionsPerUser      int `toml:"max_connections_per_user,omitempty"`        // Per-user limit: IMAP/POP3/ManageSieve servers count per server block on this node; their proxies count cluster-wide, in cluster mode only
 	MaxConnectionsPerUserPerIP int `toml:"max_connections_per_user_per_ip,omitempty"` // Local per-user-per-IP limit
-	ListenBacklog              int `toml:"listen_backlog,omitempty"`                  // TCP listen backlog size (0=system default, typically 128-512; recommended: 4096-8192)
+	ListenBacklog              int `toml:"listen_backlog,omitempty"`                  // TCP listen backlog size (0 = 1024; recommended: 4096-8192)
 
 	// IMAP specific
 	AppendLimit        string `toml:"append_limit,omitempty"`
 	MasterUsername     string `toml:"master_username,omitempty"`
-	MasterPassword     string `toml:"master_password,omitempty"`
+	MasterPassword     string `toml:"master_password,omitempty" secret:"true"`
 	MasterSASLUsername string `toml:"master_sasl_username,omitempty"`
-	MasterSASLPassword string `toml:"master_sasl_password,omitempty"`
+	MasterSASLPassword string `toml:"master_sasl_password,omitempty" secret:"true"`
 	// MasterSASLAllowedNetworks optionally restricts which source networks may use
-	// master SASL credentials to impersonate users on this backend. It is anchored to
-	// the real socket peer (not forwardable via PROXY/XCLIENT/IMAP ID), so it should
-	// list the proxy hosts. Empty = disabled (master SASL allowed from any source —
-	// legacy behavior; relies solely on network isolation + secret secrecy).
+	// master credentials to impersonate users on this backend: master SASL and the
+	// master-username form (user@domain@master_username) alike, on IMAP, POP3 and
+	// ManageSieve. It is anchored to the real socket peer (not forwardable via
+	// PROXY/XCLIENT/IMAP ID), so it should list the proxy hosts. Empty = disabled
+	// (master logins allowed from any source — legacy behavior; relies solely on
+	// network isolation + secret secrecy).
 	MasterSASLAllowedNetworks []string `toml:"master_sasl_allowed_networks,omitempty"`
 
 	// STARTTLS on the listening port (requires tls = true): IMAP, LMTP, ManageSieve, POP3 and their proxies
@@ -1071,11 +1537,14 @@ type ServerConfig struct {
 	MaxMessageSize string `toml:"max_message_size,omitempty"` // Maximum size for incoming LMTP messages
 
 	// Auth security
-	InsecureAuth bool `toml:"insecure_auth,omitempty"` // Allow PLAIN auth over non-TLS connections (default: false for ManageSieve, true for IMAP/LMTP behind proxy)
+	// InsecureAuth allows plaintext authentication over non-TLS connections (default:
+	// false). Without tls = true it is allowed regardless: the IMAP, POP3 and ManageSieve
+	// servers and proxies apply insecure_auth || !tls. LMTP offers no AUTH.
+	InsecureAuth bool `toml:"insecure_auth,omitempty"`
 
 	// ManageSieve specific
 	MaxScriptSize       string   `toml:"max_script_size,omitempty"`
-	SupportedExtensions []string `toml:"supported_extensions,omitempty"` // List of supported Sieve extensions (additional to builtins)
+	SupportedExtensions []string `toml:"supported_extensions,omitempty"` // managesieve_proxy only: supported names replace the default advertised SIEVE set; if none remain after filtering, the default set is used. A managesieve server uses [sieve] enabled_extensions.
 
 	// Proxy specific
 	RemoteAddrs            []string `toml:"remote_addrs,omitempty"`
@@ -1100,15 +1569,15 @@ type ServerConfig struct {
 	RemoteDNSRefresh string `toml:"remote_dns_refresh,omitempty"`
 
 	// HTTP API specific
-	APIKey         string   `toml:"api_key,omitempty"`
-	ReadOnlyAPIKey string   `toml:"read_only_api_key,omitempty"` // http_admin_api: optional second key, GET requests only
+	APIKey         string   `toml:"api_key,omitempty" secret:"true"`
+	ReadOnlyAPIKey string   `toml:"read_only_api_key,omitempty" secret:"true"` // http_admin_api: optional second key, GET requests only
 	AllowedHosts   []string `toml:"allowed_hosts,omitempty"`
 
 	// Mail HTTP API specific (stateless JWT-based authentication)
-	JWTSecret      string   `toml:"jwt_secret,omitempty"`      // Secret key for signing JWT tokens
-	TokenDuration  string   `toml:"token_duration,omitempty"`  // Token validity duration (e.g., "24h", "7d")
-	TokenIssuer    string   `toml:"token_issuer,omitempty"`    // JWT issuer field
-	AllowedOrigins []string `toml:"allowed_origins,omitempty"` // CORS allowed origins for web clients
+	JWTSecret      string   `toml:"jwt_secret,omitempty" secret:"true"` // Secret key for signing JWT tokens
+	TokenDuration  string   `toml:"token_duration,omitempty"`           // Token validity duration (e.g., "24h", "7d")
+	TokenIssuer    string   `toml:"token_issuer,omitempty"`             // JWT issuer field
+	AllowedOrigins []string `toml:"allowed_origins,omitempty"`          // CORS allowed origins for web clients
 
 	// Metrics specific
 	Path                 string `toml:"path,omitempty"`
@@ -1147,6 +1616,15 @@ type ServerConfig struct {
 // TimeoutSchedulerConfig holds global timeout scheduler configuration
 type TimeoutSchedulerConfig struct {
 	ShardCount int `toml:"shard_count"` // Number of timeout scheduler shards (0=runtime.NumCPU(), -1=runtime.NumCPU()/2, >0=specific value)
+}
+
+// Validate checks shard_count as server.InitializeGlobalTimeoutScheduler does: 0 and -1
+// select a count from the CPUs, and nothing below -1 has a meaning.
+func (c TimeoutSchedulerConfig) Validate() error {
+	if c.ShardCount < -1 {
+		return fmt.Errorf("shard_count must be >= -1, got %d", c.ShardCount)
+	}
+	return nil
 }
 
 // ServersConfig holds all server configurations.
@@ -1201,12 +1679,40 @@ func (c SharedMailboxesConfig) InNamespace(name string) bool {
 	return strings.HasPrefix(name, prefix) || name == strings.TrimSuffix(prefix, "/")
 }
 
+// IsNamespaceRoot reports whether name is the shared namespace root ("Shared" for
+// "Shared/"), in any case, while sharing is enabled. The root is a container that holds
+// no messages: IMAP refuses to CREATE or SELECT it and LIST marks it \Noselect, so
+// nothing may store a message in it either. It matches case as InNamespace does.
+func (c SharedMailboxesConfig) IsNamespaceRoot(name string) bool {
+	return c.Enabled && strings.ToLower(name) == strings.TrimSuffix(strings.ToLower(c.NamespacePrefix), "/")
+}
+
+// Validate checks namespace_prefix when sharing is enabled. The personal namespace has
+// the empty prefix, so InNamespace tells shared names apart by the prefix alone, and the
+// prefix must be a mailbox name followed by the hierarchy delimiter: an empty prefix puts
+// every mailbox in the shared namespace, and "Shared" also takes in "SharedDocs".
+func (c SharedMailboxesConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	delim := string(consts.MailboxDelimiter)
+	root, ok := strings.CutSuffix(c.NamespacePrefix, delim)
+	if !ok || slices.Contains(strings.Split(root, delim), "") {
+		return fmt.Errorf("namespace_prefix %q must be a mailbox name followed by the hierarchy delimiter %q, such as \"Shared/\"",
+			c.NamespacePrefix, delim)
+	}
+	if strings.EqualFold(root, consts.MailboxInbox) {
+		return fmt.Errorf("namespace_prefix %q conflicts with the reserved personal INBOX", c.NamespacePrefix)
+	}
+	return nil
+}
+
 // AdminCLIConfig holds configuration for sora-admin CLI tool
 type AdminCLIConfig struct {
-	Addr               string `toml:"addr"`                 // HTTP Admin API endpoint address
-	APIKey             string `toml:"api_key"`              // API key for authentication
-	InsecureSkipVerify *bool  `toml:"insecure_skip_verify"` // Skip TLS verification (default: auto; true for loopback, false for remote)
-	ImportMessageLimit string `toml:"import_message_limit"` // Maximum message size for import operations (e.g., "50mb")
+	Addr               string `toml:"addr"`                  // HTTP Admin API endpoint address
+	APIKey             string `toml:"api_key" secret:"true"` // API key for authentication
+	InsecureSkipVerify *bool  `toml:"insecure_skip_verify"`  // Skip TLS verification (default: auto; true for loopback, false for remote)
+	ImportMessageLimit string `toml:"import_message_limit"`  // Maximum message size for import operations (e.g., "50mb")
 }
 
 // SieveConfig holds Sieve script engine configuration
@@ -1235,34 +1741,71 @@ func (s *SieveConfig) GetMaxExecutionTime() time.Duration {
 // restarts and prevent thundering herd on the PostgreSQL database.
 type AuthCacheConfig struct {
 	Enabled         bool   `toml:"enabled"`          // Enable persistent auth cache (default: false)
-	Path            string `toml:"path"`             // SQLite database path (default: "/tmp/sora/auth_cache.db")
-	MaxAge          string `toml:"max_age"`          // Max age for cached entries (default: "168h" = 7 days)
+	Path            string `toml:"path"`             // SQLite database path (default: DefaultAuthCachePath)
+	MaxAge          string `toml:"max_age"`          // Max age for cached entries (default: "24h")
 	CleanupInterval string `toml:"cleanup_interval"` // How often to purge old entries (default: "1h")
-	PurgeUnused     string `toml:"purge_unused"`     // Purge entries unused for this duration (default: "720h" = 30 days)
+	PurgeUnused     string `toml:"purge_unused"`     // Purge entries unused for this duration (default: "168h" = 7 days)
 }
+
+// [auth_cache] defaults, used for absent and for unparsable values alike.
+const (
+	defaultAuthCacheMaxAge          = 24 * time.Hour
+	defaultAuthCacheCleanupInterval = time.Hour
+	defaultAuthCachePurgeUnused     = 7 * 24 * time.Hour
+)
 
 // GetMaxAge parses the max age duration
 func (a *AuthCacheConfig) GetMaxAge() (time.Duration, error) {
 	if a.MaxAge == "" {
-		return 24 * time.Hour, nil // Default: 7 days
+		return defaultAuthCacheMaxAge, nil
 	}
 	return helpers.ParseDuration(a.MaxAge)
+}
+
+// GetMaxAgeWithDefault returns max_age, or its default if the value cannot be parsed.
+func (a *AuthCacheConfig) GetMaxAgeWithDefault() time.Duration {
+	d, err := a.GetMaxAge()
+	if err != nil {
+		warnf("Failed to parse auth_cache max_age: %v, using default (%s)", err, defaultAuthCacheMaxAge)
+		return defaultAuthCacheMaxAge
+	}
+	return d
 }
 
 // GetCleanupInterval parses the cleanup interval duration
 func (a *AuthCacheConfig) GetCleanupInterval() (time.Duration, error) {
 	if a.CleanupInterval == "" {
-		return time.Hour, nil // Default: 1 hour
+		return defaultAuthCacheCleanupInterval, nil
 	}
 	return helpers.ParseDuration(a.CleanupInterval)
+}
+
+// GetCleanupIntervalWithDefault returns cleanup_interval, or its default if the value cannot be parsed.
+func (a *AuthCacheConfig) GetCleanupIntervalWithDefault() time.Duration {
+	d, err := a.GetCleanupInterval()
+	if err != nil {
+		warnf("Failed to parse auth_cache cleanup_interval: %v, using default (%s)", err, defaultAuthCacheCleanupInterval)
+		return defaultAuthCacheCleanupInterval
+	}
+	return d
 }
 
 // GetPurgeUnused parses the purge unused duration
 func (a *AuthCacheConfig) GetPurgeUnused() (time.Duration, error) {
 	if a.PurgeUnused == "" {
-		return 168 * time.Hour, nil // Default: 30 days
+		return defaultAuthCachePurgeUnused, nil
 	}
 	return helpers.ParseDuration(a.PurgeUnused)
+}
+
+// GetPurgeUnusedWithDefault returns purge_unused, or its default if the value cannot be parsed.
+func (a *AuthCacheConfig) GetPurgeUnusedWithDefault() time.Duration {
+	d, err := a.GetPurgeUnused()
+	if err != nil {
+		warnf("Failed to parse auth_cache purge_unused: %v, using default (%s)", err, defaultAuthCachePurgeUnused)
+		return defaultAuthCachePurgeUnused
+	}
+	return d
 }
 
 // MaintenanceConfig ([backend_maintenance]) tunes how proxies honor backends an operator
@@ -1364,6 +1907,20 @@ func (c *Config) GetBcryptCost() int {
 	return cost
 }
 
+// Default local paths. Nothing sora must keep across a restart defaults to /tmp: a
+// staged upload is the only copy of its message body until it reaches S3, and /tmp is
+// emptied at boot on most systems and on every stop under systemd's PrivateTmp=. The
+// directories match dist/sora.service (/var/spool/sora, CacheDirectory=sora).
+const (
+	DefaultUploaderPath   = "/var/spool/sora/uploads"
+	DefaultLocalCachePath = "/var/cache/sora/cache"
+	DefaultAuthCachePath  = "/var/cache/sora/auth_cache.db"
+
+	// LegacyDefaultUploaderPath is the [uploader] path default of earlier releases.
+	// Bodies a node staged there are stranded if it starts with the new default.
+	LegacyDefaultUploaderPath = "/tmp/sora/uploads"
+)
+
 // NewDefaultConfig creates a Config struct with default values.
 func NewDefaultConfig() Config {
 	return Config{
@@ -1421,7 +1978,7 @@ func NewDefaultConfig() Config {
 		LocalCache: LocalCacheConfig{
 			Capacity:           "1gb",
 			MaxObjectSize:      "5mb",
-			Path:               "/tmp/sora/cache",
+			Path:               DefaultLocalCachePath,
 			MetricsInterval:    "5m",
 			MetricsRetention:   "30d",
 			PurgeInterval:      "12h",
@@ -1430,6 +1987,9 @@ func NewDefaultConfig() Config {
 			WarmupMessageCount: 50,
 			WarmupMailboxes:    []string{"INBOX"},
 			WarmupAsync:        true,
+		},
+		AuthCache: AuthCacheConfig{
+			Path: DefaultAuthCachePath,
 		},
 		Metadata: MetadataConfig{
 			MaxEntrySize:         65536,   // 64KB per entry
@@ -1452,11 +2012,23 @@ func NewDefaultConfig() Config {
 			TrustedNetworks: nil,
 		},
 		Uploader: UploaderConfig{
-			Path:          "/tmp/sora/uploads",
+			Path:          DefaultUploaderPath,
 			BatchSize:     10,
 			Concurrency:   20,
-			MaxAttempts:   20,
+			MaxAttempts:   DefaultUploaderMaxAttempts,
 			RetryInterval: "30s",
+		},
+		Cluster: ClusterConfig{
+			// Only read with [cluster] enabled; on by default as documented.
+			RateLimitSync: ClusterRateLimitSyncConfig{
+				Enabled:           true,
+				SyncBlocks:        true,
+				SyncFailureCounts: true,
+			},
+			// On by default: cluster nodes ran affinity before this key was read.
+			Affinity: ClusterAffinityConfig{
+				Enabled: true,
+			},
 		},
 	}
 }
@@ -1482,18 +2054,51 @@ func IMAPAppendLimit(servers []ServerConfig) (int64, error) {
 	return 0, fmt.Errorf("no IMAP server configured")
 }
 
+// GetMaxScriptSize returns the ManageSieve script size limit. Omitted or zero is the
+// 16KB default; there is no unlimited setting (go-managesieve reads a limit of 0 as
+// none, and would then accept a script literal of any length).
 func (s *ServerConfig) GetMaxScriptSize() (int64, error) {
 	if s.MaxScriptSize == "" {
 		return 16 * 1024, nil // 16KB default
 	}
-	return helpers.ParseSize(s.MaxScriptSize)
+	size, err := helpers.ParseSize(s.MaxScriptSize)
+	if err != nil {
+		return 0, err
+	}
+	if size == 0 {
+		return 16 * 1024, nil
+	}
+	return size, nil
 }
 
+// GetMaxMessageSize returns max_message_size (LMTP, LMTP proxy, Admin API delivery),
+// 50 MB when omitted or zero, capped at consts.MaxStoredMessageSize: a larger message
+// would be read in full and then refused by the database insert, and the LMTP proxy
+// would advertise a SIZE no backend accepts. RFC 1870 section 5: "The fixed maximum
+// message size is defined as the message size of the largest message that a server is
+// ever willing to accept. [...] The fixed maximum message size may be an implementation
+// artifact of the SMTP server". Every delivery has such a limit, so zero is the default
+// and not "unlimited", at start-up and on reload alike, and the LMTP proxy advertises
+// it: RFC 1870 section 3 reads a SIZE of 0 as "no fixed maximum message size is in
+// force", and an omitted one as conveying no information. A value that does not parse
+// is an error: start-up falls back to the default (GetMaxMessageSizeWithDefault), a
+// reload keeps the running limit.
 func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
 	if s.MaxMessageSize == "" {
 		return 50 * 1024 * 1024, nil // 50MB default
 	}
-	return helpers.ParseSize(s.MaxMessageSize)
+	size, err := helpers.ParseSize(s.MaxMessageSize)
+	if err != nil {
+		return 0, err
+	}
+	if size == 0 {
+		return 50 * 1024 * 1024, nil
+	}
+	if size > consts.MaxStoredMessageSize {
+		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
+		return consts.MaxStoredMessageSize, nil
+	}
+	return size, nil
 }
 
 func (s *ServerConfig) GetConnectTimeout() (time.Duration, error) {
@@ -1522,10 +2127,41 @@ func (s *ServerConfig) GetRemoteDNSRefresh() (*time.Duration, error) {
 
 func (s *ServerConfig) GetAuthIdleTimeout() (time.Duration, error) {
 	if s.AuthIdleTimeout == "" {
-		// Default: 2 minutes idle during authentication for all proxy types
+		// Default: 2 minutes idle during authentication, for every server type
 		return 2 * time.Minute, nil
 	}
 	return helpers.ParseDuration(s.AuthIdleTimeout)
+}
+
+// defaultTokenDuration is the http_user_api JWT lifetime when token_duration is absent.
+const defaultTokenDuration = 24 * time.Hour
+
+// GetTokenDuration parses token_duration (http_user_api). It takes the same
+// syntax as the other duration keys, including days ("7d"); a negative value
+// would mint tokens that are already expired and is an error.
+func (s *ServerConfig) GetTokenDuration() (time.Duration, error) {
+	if s.TokenDuration == "" {
+		return defaultTokenDuration, nil
+	}
+	d, err := helpers.ParseDuration(s.TokenDuration)
+	if err != nil {
+		return 0, err
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("token_duration must not be negative, got %q", s.TokenDuration)
+	}
+	return d, nil
+}
+
+// GetTokenDurationWithDefault returns token_duration, or the default (24h) if
+// the value is invalid.
+func (s *ServerConfig) GetTokenDurationWithDefault() time.Duration {
+	d, err := s.GetTokenDuration()
+	if err != nil {
+		warnf("Invalid token_duration for server '%s': %v, using default (%s)", s.Name, err, defaultTokenDuration)
+		return defaultTokenDuration
+	}
+	return d
 }
 
 func (s *ServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
@@ -1535,10 +2171,18 @@ func (s *ServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(s.ProxyProtocolTimeout)
 }
 
-// GetSearchRateLimitWindow parses the search rate limit window duration
+// GetSearchRateLimitWindow parses the search rate limit window duration. A zero or
+// negative window is an error: the rate limiter would replace it with the default.
 func (s *ServerConfig) GetSearchRateLimitWindow() (time.Duration, error) {
 	if s.Limits != nil && s.Limits.SearchRateLimitWindow != "" {
-		return helpers.ParseDuration(s.Limits.SearchRateLimitWindow)
+		window, err := helpers.ParseDuration(s.Limits.SearchRateLimitWindow)
+		if err != nil {
+			return 0, err
+		}
+		if window <= 0 {
+			return 0, fmt.Errorf("limits.search_rate_limit_window must be positive, got %q", s.Limits.SearchRateLimitWindow)
+		}
+		return window, nil
 	}
 	return time.Minute, nil // Default: 1 minute
 }
@@ -1557,6 +2201,24 @@ func (s *ServerConfig) GetRedirectRateWindow() (time.Duration, error) {
 		return helpers.ParseDuration(s.Limits.RedirectRateWindow)
 	}
 	return time.Hour, nil // Default: 1 hour
+}
+
+// LongestRedirectRateWindow returns the longest redirect_rate_window of the enabled
+// servers that apply the Sieve redirect rate limit, LMTP and the Admin API, and at
+// least the default (1h), which a server also uses for a window that does not parse.
+// The limit counts redirect_log rows within the window, so the cleaner keeps them at
+// least this long.
+func (c *Config) LongestRedirectRateWindow() time.Duration {
+	longest := time.Hour
+	for _, server := range c.GetAllServers() {
+		if server.Type != "lmtp" && server.Type != "http_admin_api" {
+			continue
+		}
+		if window, err := server.GetRedirectRateWindow(); err == nil && window > longest {
+			longest = window
+		}
+	}
+	return longest
 }
 
 // GetMaxRedirectHops returns how many times one message may be redirected before
@@ -1581,13 +2243,29 @@ func (s *ServerConfig) GetCommandTimeout() (time.Duration, error) {
 	if s.Timeouts != nil && s.Timeouts.CommandTimeout != "" {
 		return helpers.ParseDuration(s.Timeouts.CommandTimeout)
 	}
-	// Protocol-specific defaults
+	return s.defaultCommandTimeout(), nil
+}
+
+// GetCommandTimeoutWithDefault returns command_timeout, or the protocol default
+// (the value an absent key gets) if the value cannot be parsed.
+func (s *ServerConfig) GetCommandTimeoutWithDefault() time.Duration {
+	timeout, err := s.GetCommandTimeout()
+	if err != nil {
+		def := s.defaultCommandTimeout()
+		warnf("Failed to parse command_timeout for server '%s': %v, using default (%s)", s.Name, err, def)
+		return def
+	}
+	return timeout
+}
+
+// defaultCommandTimeout is the protocol-specific command (idle) timeout.
+func (s *ServerConfig) defaultCommandTimeout() time.Duration {
 	switch s.Type {
 	case "pop3", "pop3_proxy":
 		// RFC 1939 §3: the POP3 autologout (inactivity) timer MUST be at least
 		// 10 minutes. This value is wired as the session idle timeout, so the
 		// default must not fall below that floor.
-		return 10 * time.Minute, nil
+		return 10 * time.Minute
 	case "imap", "imap_proxy":
 		// RFC 3501 §5.4: an IMAP inactivity autologout timer MUST be at least
 		// 30 minutes. Clients that poll without IDLE (Outlook, Thunderbird,
@@ -1596,11 +2274,16 @@ func (s *ServerConfig) GetCommandTimeout() (time.Duration, error) {
 		// Must stay below the IMAP library's hardcoded 35-minute read deadline,
 		// which would otherwise close idle sessions silently before this timer
 		// gets to send its BYE.
-		return 30 * time.Minute, nil
+		return 30 * time.Minute
 	case "managesieve", "managesieve_proxy":
-		return 3 * time.Minute, nil // 3 minutes for ManageSieve
+		return 3 * time.Minute // 3 minutes for ManageSieve
+	case "lmtp":
+		// RFC 5321 §4.5.3.2.7: "An SMTP server SHOULD have a timeout of at least
+		// 5 minutes while it is awaiting the next command from the sender", and
+		// RFC 2033 §4 makes LMTP identical to SMTP except as it says.
+		return 5 * time.Minute
 	default:
-		return 2 * time.Minute, nil // Default: 2 minutes
+		return 2 * time.Minute // Default: 2 minutes
 	}
 }
 
@@ -1610,10 +2293,26 @@ func (s *ServerConfig) GetAbsoluteSessionTimeout() (time.Duration, error) {
 	if s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != "" {
 		return helpers.ParseDuration(s.Timeouts.AbsoluteSessionTimeout)
 	}
-	if s.Type == "lmtp_proxy" {
-		return 5 * time.Minute, nil
+	return s.defaultAbsoluteSessionTimeout(), nil
+}
+
+// GetAbsoluteSessionTimeoutWithDefault returns absolute_session_timeout, or the
+// protocol default (the value an absent key gets) if the value cannot be parsed.
+func (s *ServerConfig) GetAbsoluteSessionTimeoutWithDefault() time.Duration {
+	timeout, err := s.GetAbsoluteSessionTimeout()
+	if err != nil {
+		def := s.defaultAbsoluteSessionTimeout()
+		warnf("Failed to parse absolute_session_timeout for server '%s': %v, using default (%s)", s.Name, err, def)
+		return def
 	}
-	return 24 * time.Hour, nil
+	return timeout
+}
+
+func (s *ServerConfig) defaultAbsoluteSessionTimeout() time.Duration {
+	if s.Type == "lmtp_proxy" {
+		return 5 * time.Minute
+	}
+	return 24 * time.Hour
 }
 
 // GetCommandTimeoutsOverrides returns a map of command name to timeout duration
@@ -1876,11 +2575,11 @@ func (s *ServerConfig) GetRemotePort() (int, error) {
 	default:
 		return 0, fmt.Errorf("invalid type for remote_port: %T", v)
 	}
-	port := int(p)
-	if port < 0 || port > 65535 {
-		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", port)
+	// Range-check before converting to int: TOML integers are int64 even on 32-bit targets.
+	if p < 0 || p > 65535 {
+		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", p)
 	}
-	return port, nil
+	return int(p), nil
 }
 
 // GetRemoteHealthChecks returns whether backend health checking is enabled.
@@ -1890,6 +2589,17 @@ func (s *ServerConfig) GetRemoteHealthChecks() bool {
 		return true // Default: enabled
 	}
 	return *s.RemoteHealthChecks
+}
+
+// warnf reports a problem with the configuration: a value a ...WithDefault
+// method replaced with its default, or a key the file gets wrong. It logs at WARN
+// through slog's default logger, which the logger package (it imports config, so
+// config cannot import it) points at the server log. Start-up reads the file
+// before that, and logger.Hold keeps what is logged until then. The log package's
+// output reaches the server log only at INFO, so a typo logged with log.Printf was
+// filtered out at level = "warn".
+func warnf(format string, args ...any) {
+	slog.Warn(fmt.Sprintf(format, args...))
 }
 
 // Metrics tuning keys: a key left out of the metrics block keeps the same default
@@ -1931,7 +2641,7 @@ func (s *ServerConfig) GetHashUsernames() bool {
 func (s *ServerConfig) GetAppendLimitWithDefault() int64 {
 	limit, err := s.GetAppendLimit()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse append limit for server '%s': %v, using default (25MB)", s.Name, err)
+		warnf("Failed to parse append limit for server '%s': %v, using default (25MB)", s.Name, err)
 		return 25 * 1024 * 1024 // 25MB default
 	}
 	return limit
@@ -1940,7 +2650,7 @@ func (s *ServerConfig) GetAppendLimitWithDefault() int64 {
 func (s *ServerConfig) GetMaxScriptSizeWithDefault() int64 {
 	size, err := s.GetMaxScriptSize()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse max script size for server '%s': %v, using default (16KB)", s.Name, err)
+		warnf("Failed to parse max script size for server '%s': %v, using default (16KB)", s.Name, err)
 		return 16 * 1024 // 16KB default
 	}
 	return size
@@ -1949,7 +2659,7 @@ func (s *ServerConfig) GetMaxScriptSizeWithDefault() int64 {
 func (s *ServerConfig) GetConnectTimeoutWithDefault() time.Duration {
 	timeout, err := s.GetConnectTimeout()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse connect timeout for server '%s': %v, using default (30s)", s.Name, err)
+		warnf("Failed to parse connect timeout for server '%s': %v, using default (30s)", s.Name, err)
 		return 30 * time.Second
 	}
 	return timeout
@@ -1958,16 +2668,18 @@ func (s *ServerConfig) GetConnectTimeoutWithDefault() time.Duration {
 func (s *ServerConfig) GetAuthIdleTimeoutWithDefault() time.Duration {
 	timeout, err := s.GetAuthIdleTimeout()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse auth idle timeout for server '%s': %v, using default 2m", s.Name, err)
+		warnf("Failed to parse auth idle timeout for server '%s': %v, using default 2m", s.Name, err)
 		return 2 * time.Minute
 	}
 	return timeout
 }
 
+// GetMaxMessageSizeWithDefault returns GetMaxMessageSize for start-up, which has no
+// running limit to keep: a value that does not parse is the 50 MB default.
 func (s *ServerConfig) GetMaxMessageSizeWithDefault() int64 {
 	size, err := s.GetMaxMessageSize()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse max message size for server '%s': %v, using default (50MB)", s.Name, err)
+		warnf("Failed to parse max message size for server '%s': %v, using default (50MB)", s.Name, err)
 		return 52428800 // 50MB default
 	}
 	return size
@@ -1992,7 +2704,7 @@ func (s *ServerConfig) GetProxyProtocolTimeoutWithDefault() string {
 func (c *CleanupConfig) GetGracePeriodWithDefault() time.Duration {
 	period, err := c.GetGracePeriod()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup grace_period: %v, using default (14 days)", err)
+		warnf("Failed to parse cleanup grace_period: %v, using default (14 days)", err)
 		return 14 * 24 * time.Hour
 	}
 	return period
@@ -2001,7 +2713,7 @@ func (c *CleanupConfig) GetGracePeriodWithDefault() time.Duration {
 func (c *CleanupConfig) GetPurgePollIntervalWithDefault() time.Duration {
 	interval, err := c.GetPurgePollInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup purge_poll_interval: %v, using default (30s)", err)
+		warnf("Failed to parse cleanup purge_poll_interval: %v, using default (30s)", err)
 		return 30 * time.Second
 	}
 	return interval
@@ -2010,7 +2722,7 @@ func (c *CleanupConfig) GetPurgePollIntervalWithDefault() time.Duration {
 func (c *CleanupConfig) GetWakeIntervalWithDefault() time.Duration {
 	interval, err := c.GetWakeInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup wake_interval: %v, using default (1 hour)", err)
+		warnf("Failed to parse cleanup wake_interval: %v, using default (1 hour)", err)
 		return time.Hour
 	}
 	return interval
@@ -2019,7 +2731,7 @@ func (c *CleanupConfig) GetWakeIntervalWithDefault() time.Duration {
 func (c *CleanupConfig) GetMaxAgeRestrictionWithDefault() time.Duration {
 	restriction, err := c.GetMaxAgeRestriction()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup max_age_restriction: %v, using default (no restriction)", err)
+		warnf("Failed to parse cleanup max_age_restriction: %v, using default (no restriction)", err)
 		return 0
 	}
 	return restriction
@@ -2028,7 +2740,7 @@ func (c *CleanupConfig) GetMaxAgeRestrictionWithDefault() time.Duration {
 func (c *CleanupConfig) GetFTSRetentionWithDefault() time.Duration {
 	retention, err := c.GetFTSRetention()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup fts_retention: %v, using default (keep forever)", err)
+		warnf("Failed to parse cleanup fts_retention: %v, using default (keep forever)", err)
 		return 0
 	}
 	return retention
@@ -2037,7 +2749,7 @@ func (c *CleanupConfig) GetFTSRetentionWithDefault() time.Duration {
 func (c *CleanupConfig) GetHealthStatusRetentionWithDefault() time.Duration {
 	retention, err := c.GetHealthStatusRetention()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup health_status_retention: %v, using default (30 days)", err)
+		warnf("Failed to parse cleanup health_status_retention: %v, using default (30 days)", err)
 		return 30 * 24 * time.Hour
 	}
 	return retention
@@ -2046,12 +2758,12 @@ func (c *CleanupConfig) GetHealthStatusRetentionWithDefault() time.Duration {
 func (c *CleanupConfig) GetInstanceLivenessThresholdWithDefault() time.Duration {
 	threshold, err := c.GetInstanceLivenessThreshold()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup instance_liveness_threshold: %v, using default (7 days)", err)
+		warnf("Failed to parse cleanup instance_liveness_threshold: %v, using default (7 days)", err)
 		return 7 * 24 * time.Hour
 	}
 	if threshold <= 0 {
 		// Non-positive would mean "every instance is dead", i.e. reaping on age alone.
-		log.Printf("WARNING: cleanup instance_liveness_threshold must be positive, got %s, using default (7 days)", threshold)
+		warnf("cleanup instance_liveness_threshold must be positive, got %s, using default (7 days)", threshold)
 		return 7 * 24 * time.Hour
 	}
 	return threshold
@@ -2060,7 +2772,7 @@ func (c *CleanupConfig) GetInstanceLivenessThresholdWithDefault() time.Duration 
 func (c *LocalCacheConfig) GetCapacityWithDefault() int64 {
 	capacity, err := c.GetCapacity()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache size: %v, using default (1GB)", err)
+		warnf("Failed to parse cache size: %v, using default (1GB)", err)
 		return 1024 * 1024 * 1024 // 1GB
 	}
 	return capacity
@@ -2069,7 +2781,7 @@ func (c *LocalCacheConfig) GetCapacityWithDefault() int64 {
 func (c *LocalCacheConfig) GetMaxObjectSizeWithDefault() int64 {
 	size, err := c.GetMaxObjectSize()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache max object size: %v, using default (5MB)", err)
+		warnf("Failed to parse cache max object size: %v, using default (5MB)", err)
 		return 5 * 1024 * 1024 // 5MB
 	}
 	return size
@@ -2078,7 +2790,7 @@ func (c *LocalCacheConfig) GetMaxObjectSizeWithDefault() int64 {
 func (c *LocalCacheConfig) GetPurgeIntervalWithDefault() time.Duration {
 	interval, err := c.GetPurgeInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache purge interval: %v, using default (12 hours)", err)
+		warnf("Failed to parse cache purge interval: %v, using default (12 hours)", err)
 		return 12 * time.Hour
 	}
 	return interval
@@ -2087,7 +2799,7 @@ func (c *LocalCacheConfig) GetPurgeIntervalWithDefault() time.Duration {
 func (c *LocalCacheConfig) GetOrphanCleanupAgeWithDefault() time.Duration {
 	age, err := c.GetOrphanCleanupAge()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache orphan cleanup age: %v, using default (30 days)", err)
+		warnf("Failed to parse cache orphan cleanup age: %v, using default (30 days)", err)
 		return 30 * 24 * time.Hour
 	}
 	return age
@@ -2096,7 +2808,7 @@ func (c *LocalCacheConfig) GetOrphanCleanupAgeWithDefault() time.Duration {
 func (c *LocalCacheConfig) GetMetricsIntervalWithDefault() time.Duration {
 	interval, err := c.GetMetricsInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache metrics_interval: %v, using default (5 minutes)", err)
+		warnf("Failed to parse cache metrics_interval: %v, using default (5 minutes)", err)
 		return 5 * time.Minute
 	}
 	return interval
@@ -2105,7 +2817,7 @@ func (c *LocalCacheConfig) GetMetricsIntervalWithDefault() time.Duration {
 func (c *LocalCacheConfig) GetMetricsRetentionWithDefault() time.Duration {
 	retention, err := c.GetMetricsRetention()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache metrics_retention: %v, using default (30 days)", err)
+		warnf("Failed to parse cache metrics_retention: %v, using default (30 days)", err)
 		return 30 * 24 * time.Hour
 	}
 	return retention
@@ -2114,16 +2826,21 @@ func (c *LocalCacheConfig) GetMetricsRetentionWithDefault() time.Duration {
 func (c *UploaderConfig) GetRetryIntervalWithDefault() time.Duration {
 	interval, err := c.GetRetryInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse uploader retry_interval: %v, using default (30 seconds)", err)
+		warnf("Failed to parse uploader retry_interval: %v, using default (30 seconds)", err)
 		return 30 * time.Second
 	}
 	return interval
 }
 
-// IsEnabled checks if a server should be started based on its configuration
+// IsEnabled reports whether the block is to be started: every [[server]] block is,
+// unless it says enabled = false. An enabled block must pass Validate, which requires
+// type, name and addr; a block missing one is an error, never skipped.
 func (s *ServerConfig) IsEnabled() bool {
-	return s.Type != "" && s.Name != "" && s.Addr != ""
+	return s.Enabled == nil || *s.Enabled
 }
+
+// ServerTypes are the [[server]] types the configuration accepts.
+var ServerTypes = []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "metrics", "http_admin_api", "http_user_api", "user_api_proxy"}
 
 // ValidateServerConfig validates a server configuration
 func (s *ServerConfig) Validate() error {
@@ -2131,22 +2848,21 @@ func (s *ServerConfig) Validate() error {
 		return fmt.Errorf("server type is required")
 	}
 	if s.Name == "" {
-		return fmt.Errorf("server name is required")
+		return fmt.Errorf("server name is required (type %q, addr %q)", s.Type, s.Addr)
 	}
 	if s.Addr == "" {
-		return fmt.Errorf("server address is required")
+		return fmt.Errorf("server address is required; set enabled = false to keep a [[server]] block without starting it")
 	}
 
-	validTypes := []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "metrics", "http_admin_api", "http_user_api", "user_api_proxy"}
 	isValidType := false
-	for _, validType := range validTypes {
+	for _, validType := range ServerTypes {
 		if s.Type == validType {
 			isValidType = true
 			break
 		}
 	}
 	if !isValidType {
-		return fmt.Errorf("invalid server type '%s', must be one of: %s", s.Type, strings.Join(validTypes, ", "))
+		return fmt.Errorf("invalid server type '%s', must be one of: %s", s.Type, strings.Join(ServerTypes, ", "))
 	}
 
 	// Master credentials: a configured master username with an EMPTY master
@@ -2167,12 +2883,60 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
+	// The Sieve redirect rate limit (LMTP and Admin API delivery) counts the redirects
+	// newer than now - redirect_rate_window. A zero or negative window counts none, so
+	// every redirect would be allowed; redirect_rate_limit = 0 is how the limit is
+	// switched off. An unparsable window falls back to the 1h default at startup.
+	if (s.Type == "lmtp" || s.Type == "http_admin_api") && s.Limits != nil && s.Limits.RedirectRateWindow != "" {
+		if window, err := helpers.ParseDuration(s.Limits.RedirectRateWindow); err == nil && window <= 0 {
+			return fmt.Errorf("server %q: limits.redirect_rate_window must be positive, got %q (set limits.redirect_rate_limit = 0 to disable the limit)", s.Name, s.Limits.RedirectRateWindow)
+		}
+	}
+
+	// Only the IMAP backend reads client_filters. It would skip a filter whose pattern
+	// does not compile, or never match one without a pattern, and keep advertising
+	// what the filter hides.
+	if s.Type == "imap" {
+		for i, filter := range s.ClientFilters {
+			if err := filter.Validate(); err != nil {
+				return fmt.Errorf("server %q: client_filters #%d: %w", s.Name, i+1, err)
+			}
+		}
+	}
+
+	// A proxy dials a backend address without a port at its remote_port, and builds a
+	// lookup client from its enabled remote_lookup. No other server reads either, and a
+	// disabled lookup is never initialized.
+	if strings.HasSuffix(s.Type, "_proxy") {
+		// The proxy adds every entry as a backend, an empty one included, and routes
+		// users to it; ValidatePools refuses an empty [[pool]] backend the same way.
+		for i, addr := range s.RemoteAddrs {
+			if strings.TrimSpace(addr) == "" {
+				return fmt.Errorf("server %q: remote_addrs #%d: empty backend address", s.Name, i+1)
+			}
+		}
+		if _, err := s.GetRemotePort(); err != nil {
+			return fmt.Errorf("server %q: invalid remote_port: %w", s.Name, err)
+		}
+		if s.RemoteLookup != nil && s.RemoteLookup.Enabled {
+			if err := s.RemoteLookup.Validate(); err != nil {
+				return fmt.Errorf("server %q: %w", s.Name, err)
+			}
+		}
+	}
+
 	if s.Type == "metrics" {
 		if s.Path != "" && !strings.HasPrefix(s.Path, "/") {
 			return fmt.Errorf("server %q: metrics path %q must begin with '/'", s.Name, s.Path)
 		}
 		if err := validateMetricsPattern(s.MetricsPath()); err != nil {
 			return fmt.Errorf("server %q: invalid metrics path %q: %w", s.Name, s.Path, err)
+		}
+	}
+
+	if s.Type == "imap" {
+		if err := ValidateIMAPDisabledCaps(s.DisabledCaps); err != nil {
+			return fmt.Errorf("server %q: %w", s.Name, err)
 		}
 	}
 
@@ -2204,8 +2968,19 @@ func (s *ServerConfig) MetricsPath() string {
 
 // WarnUnusedConfigOptions logs warnings for config options that don't apply to this server type
 func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...any)) {
-	if s.ReadOnlyAPIKey != "" && s.Type != "http_admin_api" {
-		logger("WARNING: Server %s (type: %s) has 'read_only_api_key' configured, but this only applies to http_admin_api servers", s.Name, s.Type)
+	for _, k := range serverTypeKeys {
+		if k.set(s) && !slices.Contains(k.appliedBy, s.Type) {
+			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "))
+		}
+	}
+	// Only these filter clients by address. Every other type, the User API proxy
+	// included, serves every client whatever the list says.
+	if len(s.AllowedHosts) > 0 {
+		switch s.Type {
+		case "metrics", "http_admin_api", "http_user_api":
+		default:
+			logger("WARNING: Server %s (type: %s) has 'allowed_hosts' configured, but this only applies to metrics, http_admin_api and http_user_api servers; it does not restrict which clients this server accepts", s.Name, s.Type)
+		}
 	}
 	if s.TLSUseStartTLS {
 		switch s.Type {
@@ -2219,11 +2994,29 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured, but this only applies to IMAP, LMTP, ManageSieve and POP3 servers and proxies", s.Name, s.Type)
 		}
 	}
+	// tls_verify asks the TLS handshake for a client certificate; without TLS
+	// there is no handshake to ask in.
+	if s.TLSVerify && !s.TLS {
+		logger("WARNING: Server %s (type: %s) has 'tls_verify' configured without 'tls = true'; it is ignored and no client certificate is required", s.Name, s.Type)
+	}
+	if s.Timeouts != nil && s.Timeouts.SchedulerShardCount != 0 {
+		logger("WARNING: Server %s (type: %s) has 'timeouts.scheduler_shard_count' configured, but it has no effect: all servers share one timeout scheduler, sized by [timeout_scheduler] shard_count", s.Name, s.Type)
+	}
+	if s.Limits != nil {
+		for _, k := range serverLimitKeys {
+			if k.set(s.Limits) && !slices.Contains(k.appliedBy, s.Type) {
+				logger("WARNING: Server %s (type: %s) has 'limits.%s' configured, but only %s servers apply it", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "))
+			}
+		}
+	}
 
 	// Check proxy-only options on non-proxy servers
 	if !strings.HasSuffix(s.Type, "_proxy") {
 		if len(s.RemoteAddrs) > 0 {
 			logger("WARNING: Server %s (type: %s) has 'remote_addrs' configured, but this only applies to proxy servers", s.Name, s.Type)
+		}
+		if s.RemoteTLSCAFile != "" {
+			logger("WARNING: Server %s (type: %s) has 'remote_tls_ca_file' configured, but this only applies to proxy servers", s.Name, s.Type)
 		}
 		if s.RemoteTLS {
 			logger("WARNING: Server %s (type: %s) has 'remote_tls' configured, but this only applies to proxy servers", s.Name, s.Type)
@@ -2255,102 +3048,185 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	}
 
 	switch s.Type {
-	case "imap":
-		// IMAP server
-		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
-		}
-		if s.RemoteUseIDCommand {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
-		}
-
 	case "lmtp":
-		// LMTP server
-		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
-		}
-		if s.RemoteUseXCLIENT {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
-		}
-
-	case "pop3":
-		// POP3 server
-		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
-		}
-
-	case "managesieve":
-		// ManageSieve server - no proxy-specific warnings needed (handled above)
-
-	case "imap_proxy":
-		// IMAP proxy
-		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers/proxies", s.Name, s.Type)
-		}
-		if s.MaxScriptSize != "" {
-			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
-		}
-		if s.RemoteUseXCLIENT {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
-		}
-
-	case "pop3_proxy":
-		// POP3 proxy
-		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers/proxies", s.Name, s.Type)
-		}
-		if s.MaxScriptSize != "" {
-			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
-		}
-		if s.RemoteUseIDCommand {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
-		}
-		if s.RemoteUseXCLIENT {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
-		}
+		// Its only timeout setting is timeouts.command_timeout (the idle timeout).
+		s.warnKeysNotApplied(logger, "the LMTP server does not apply it",
+			configKey{"timeouts.absolute_session_timeout", s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != ""},
+			configKey{"timeouts.min_bytes_per_minute", s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0})
+		// MTAs deliver many messages at once from few addresses.
+		s.warnKeysNotApplied(logger, "the LMTP server limits only its total connections (max_connections)",
+			configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
+			configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+			configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 
 	case "lmtp_proxy":
-		// LMTP proxy
-		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers/proxies", s.Name, s.Type)
-		}
-		if s.MaxScriptSize != "" {
-			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
-		}
-		if s.RemoteUseIDCommand {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
-		}
+		// Its timeouts are auth_idle_timeout and timeouts.absolute_session_timeout.
+		s.warnKeysNotApplied(logger, "the LMTP proxy does not apply it",
+			configKey{"timeouts.command_timeout", s.Timeouts != nil && s.Timeouts.CommandTimeout != ""},
+			configKey{"timeouts.min_bytes_per_minute", s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0})
+		// MTAs deliver many messages at once from few addresses, and an LMTP client
+		// does not log in as a user.
+		s.warnKeysNotApplied(logger, "the LMTP proxy limits only its total connections (max_connections)",
+			configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
+			configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+			configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 
-	case "managesieve_proxy":
-		// ManageSieve proxy
-		if s.AppendLimit != "" {
-			logger("WARNING: Server %s (type: %s) has 'append_limit' configured, but this only applies to IMAP servers", s.Name, s.Type)
-		}
-		if s.RemoteUseIDCommand {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
-		}
-		if s.RemoteUseXCLIENT {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
-		}
+	case "user_api_proxy":
+		// An HTTP request is not a logged-in session: nothing counts connections per user.
+		s.warnKeysNotApplied(logger, "the User API proxy limits only its total connections and those per IP (max_connections, max_connections_per_ip)",
+			configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+			configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 
 	case "metrics", "http_admin_api", "http_user_api":
-		// HTTP servers - warn about protocol-specific options
-		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
-		}
-		if s.MaxScriptSize != "" {
-			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
-		}
-		if s.AppendLimit != "" {
-			logger("WARNING: Server %s (type: %s) has 'append_limit' configured, but this only applies to IMAP servers", s.Name, s.Type)
+		// An HTTP request is not a logged-in session, so nothing counts connections
+		// per user. The Admin and User APIs cap their total connections, the metrics
+		// listener none.
+		if s.Type == "metrics" {
+			s.warnKeysNotApplied(logger, "the metrics server does not limit its connections",
+				configKey{"max_connections", s.MaxConnections != 0},
+				configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
+				configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+				configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
+		} else {
+			s.warnKeysNotApplied(logger, "this server type limits only its total connections (max_connections)",
+				configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
+				configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+				configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 		}
 		if s.Type == "metrics" && s.TLS {
 			logger("WARNING: Server %s (type: metrics) has 'tls' configured, but the metrics endpoint is always served over plain HTTP; terminate TLS in front of it and restrict access with 'allowed_hosts'/'api_key'", s.Name)
 		}
+		if s.Type == "metrics" && s.ProxyProtocol {
+			logger("WARNING: Server %s (type: metrics) has 'proxy_protocol' configured, but the metrics endpoint does not read PROXY protocol headers; it is ignored, and 'allowed_hosts' matches the connecting host", s.Name)
+		}
+		// A metrics listener's allowed_hosts is fixed at startup, so this is where an
+		// unusable entry is reported. The Admin and User APIs report theirs when they
+		// install a list, which a reload can replace.
+		if s.Type == "metrics" {
+			for _, entry := range helpers.InvalidNetworkEntries(s.AllowedHosts) {
+				logger("WARNING: Server %s (type: metrics) has 'allowed_hosts' entry %q, which is not an IP address or CIDR and matches no client", s.Name, entry)
+			}
+		}
 	}
 }
 
-// GetAllServers returns all configured servers from the dynamic configuration
+// serverTypeKeys is each [[server]] key that only some server types read, with
+// those types. Every type accepts every key; WarnUnusedConfigOptions reports one
+// set on a type not listed.
+var serverTypeKeys = []struct {
+	name      string
+	set       func(*ServerConfig) bool
+	appliedBy []string
+}{
+	// The mail servers and proxies open their listener with this backlog; the
+	// HTTP servers listen with the kernel's default.
+	{"listen_backlog", func(s *ServerConfig) bool { return s.ListenBacklog != 0 }, []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
+	{"api_key", func(s *ServerConfig) bool { return s.APIKey != "" }, []string{"metrics", "http_admin_api"}},
+	{"read_only_api_key", func(s *ServerConfig) bool { return s.ReadOnlyAPIKey != "" }, []string{"http_admin_api"}},
+	// The User API backend issues the tokens; the proxy checks them and sets the
+	// CORS headers of the errors it answers itself.
+	{"jwt_secret", func(s *ServerConfig) bool { return s.JWTSecret != "" }, []string{"http_user_api", "user_api_proxy"}},
+	{"allowed_origins", func(s *ServerConfig) bool { return len(s.AllowedOrigins) > 0 }, []string{"http_user_api", "user_api_proxy"}},
+	{"token_duration", func(s *ServerConfig) bool { return s.TokenDuration != "" }, []string{"http_user_api"}},
+	{"token_issuer", func(s *ServerConfig) bool { return s.TokenIssuer != "" }, []string{"http_user_api"}},
+	// The metrics listener's path, and the collection settings only a metrics
+	// block applies (configureMetrics).
+	{"path", func(s *ServerConfig) bool { return s.Path != "" }, []string{"metrics"}},
+	{"enable_user_metrics", func(s *ServerConfig) bool { return s.EnableUserMetrics }, []string{"metrics"}},
+	{"enable_domain_metrics", func(s *ServerConfig) bool { return s.EnableDomainMetrics != nil }, []string{"metrics"}},
+	{"user_metrics_threshold", func(s *ServerConfig) bool { return s.UserMetricsThreshold != nil }, []string{"metrics"}},
+	{"max_tracked_users", func(s *ServerConfig) bool { return s.MaxTrackedUsers != nil }, []string{"metrics"}},
+	{"hash_usernames", func(s *ServerConfig) bool { return s.HashUsernames != nil }, []string{"metrics"}},
+	// The IMAP backend's capabilities, and the ID answer of the backend and its proxy.
+	{"client_filters", func(s *ServerConfig) bool { return len(s.ClientFilters) > 0 }, []string{"imap"}},
+	{"disabled_caps", func(s *ServerConfig) bool { return len(s.DisabledCaps) > 0 }, []string{"imap"}},
+	{"enable_preview", func(s *ServerConfig) bool { return s.EnablePreview }, []string{"imap"}},
+	{"additional_caps", func(s *ServerConfig) bool { return len(s.AdditionalCaps) > 0 }, []string{"imap", "imap_proxy"}},
+	{"id_name", func(s *ServerConfig) bool { return s.IDName != "" }, []string{"imap", "imap_proxy"}},
+	{"id_version", func(s *ServerConfig) bool { return s.IDVersion != "" }, []string{"imap", "imap_proxy"}},
+	{"id_vendor", func(s *ServerConfig) bool { return s.IDVendor != "" }, []string{"imap", "imap_proxy"}},
+	{"id_support_url", func(s *ServerConfig) bool { return s.IDSupportURL != "" }, []string{"imap", "imap_proxy"}},
+	// Password logins. The LMTP backend offers no AUTH, so insecure_auth has nothing
+	// to allow there; only the backends limit the SASL master login by network.
+	{"master_username", func(s *ServerConfig) bool { return s.MasterUsername != "" }, loginServerTypes},
+	{"master_password", func(s *ServerConfig) bool { return s.MasterPassword != "" }, loginServerTypes},
+	{"master_sasl_username", func(s *ServerConfig) bool { return s.MasterSASLUsername != "" }, loginServerTypes},
+	{"master_sasl_password", func(s *ServerConfig) bool { return s.MasterSASLPassword != "" }, loginServerTypes},
+	{"master_sasl_allowed_networks", func(s *ServerConfig) bool { return len(s.MasterSASLAllowedNetworks) > 0 }, []string{"imap", "pop3", "managesieve"}},
+	{"insecure_auth", func(s *ServerConfig) bool { return s.InsecureAuth }, loginServerTypes},
+	// The LMTP backend's only timeout is timeouts.command_timeout.
+	{"auth_idle_timeout", func(s *ServerConfig) bool { return s.AuthIdleTimeout != "" }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
+	{"debug", func(s *ServerConfig) bool { return s.Debug }, []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
+	// The proxies' backend legs.
+	{"remote_port", func(s *ServerConfig) bool { return s.RemotePort != nil }, proxyServerTypes},
+	{"connect_timeout", func(s *ServerConfig) bool { return s.ConnectTimeout != "" }, proxyServerTypes},
+	{"remote_dns_refresh", func(s *ServerConfig) bool { return s.RemoteDNSRefresh != "" }, proxyServerTypes},
+	{"remote_health_checks", func(s *ServerConfig) bool { return s.RemoteHealthChecks != nil }, proxyServerTypes},
+	{"enable_affinity", func(s *ServerConfig) bool { return s.EnableAffinity }, proxyServerTypes},
+	{"remote_use_id_command", func(s *ServerConfig) bool { return s.RemoteUseIDCommand }, []string{"imap_proxy"}},
+	{"remote_use_xclient", func(s *ServerConfig) bool { return s.RemoteUseXCLIENT }, []string{"pop3_proxy", "lmtp_proxy"}},
+	{"remote_use_utf8", func(s *ServerConfig) bool { return s.RemoteUseUTF8 }, []string{"pop3_proxy"}},
+	// Size limits, and the Sieve extensions the ManageSieve proxy advertises (a
+	// ManageSieve backend advertises the [sieve] enabled_extensions).
+	{"max_message_size", func(s *ServerConfig) bool { return s.MaxMessageSize != "" }, []string{"lmtp", "lmtp_proxy", "http_admin_api"}},
+	{"append_limit", func(s *ServerConfig) bool { return s.AppendLimit != "" }, []string{"imap"}},
+	{"max_script_size", func(s *ServerConfig) bool { return s.MaxScriptSize != "" }, []string{"managesieve"}},
+	{"supported_extensions", func(s *ServerConfig) bool { return len(s.SupportedExtensions) > 0 }, []string{"managesieve_proxy"}},
+}
+
+// loginServerTypes are the server types with a password login, proxyServerTypes
+// those that dial backends.
+var (
+	loginServerTypes = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
+	proxyServerTypes = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
+)
+
+// serverLimitKeys is every [server.limits] key with the server types whose start
+// functions read it. Every type accepts every key; WarnUnusedConfigOptions reports
+// one set on a type not listed. A new limits key belongs here.
+var serverLimitKeys = []struct {
+	name      string
+	set       func(*ServerLimitsConfig) bool
+	appliedBy []string
+}{
+	// The IMAP backend's search rate limiter, THREAD cap and FETCH PREVIEW budgets.
+	{"search_rate_limit_per_min", func(l *ServerLimitsConfig) bool { return l.SearchRateLimitPerMin != nil }, []string{"imap"}},
+	{"search_rate_limit_window", func(l *ServerLimitsConfig) bool { return l.SearchRateLimitWindow != "" }, []string{"imap"}},
+	{"search_rate_limit_burst", func(l *ServerLimitsConfig) bool { return l.SearchRateLimitBurst != nil }, []string{"imap"}},
+	{"thread_max_messages", func(l *ServerLimitsConfig) bool { return l.ThreadMaxMessages != 0 }, []string{"imap"}},
+	{"preview_s3_per_min", func(l *ServerLimitsConfig) bool { return l.PreviewS3PerMin != nil }, []string{"imap"}},
+	{"preview_s3_burst", func(l *ServerLimitsConfig) bool { return l.PreviewS3Burst != nil }, []string{"imap"}},
+	{"preview_s3_node_per_min", func(l *ServerLimitsConfig) bool { return l.PreviewS3NodePerMin != nil }, []string{"imap"}},
+	{"preview_s3_max_size", func(l *ServerLimitsConfig) bool { return l.PreviewS3MaxSize != "" }, []string{"imap"}},
+	// The session memory tracker.
+	{"session_memory_limit", func(l *ServerLimitsConfig) bool { return l.SessionMemoryLimit != "" }, []string{"imap", "pop3"}},
+	// The login proxies' cap on protocol errors before authentication (wrong passwords do not count).
+	{"max_auth_errors", func(l *ServerLimitsConfig) bool { return l.MaxAuthErrors != 0 }, []string{"imap_proxy", "pop3_proxy", "managesieve_proxy"}},
+	// Sieve on delivery: LMTP and the Admin API's /admin/mail/deliver.
+	{"redirect_rate_limit", func(l *ServerLimitsConfig) bool { return l.RedirectRateLimit != nil }, []string{"lmtp", "http_admin_api"}},
+	{"redirect_rate_window", func(l *ServerLimitsConfig) bool { return l.RedirectRateWindow != "" }, []string{"lmtp", "http_admin_api"}},
+	{"max_redirect_hops", func(l *ServerLimitsConfig) bool { return l.MaxRedirectHops != nil }, []string{"lmtp", "http_admin_api"}},
+}
+
+// configKey is a server setting by its TOML key, and whether the block sets it.
+type configKey struct {
+	name string
+	set  bool
+}
+
+// warnKeysNotApplied warns about each of keys the block sets, which its server type
+// accepts but does not apply, for reason.
+func (s *ServerConfig) warnKeysNotApplied(logger func(format string, args ...any), reason string, keys ...configKey) {
+	for _, k := range keys {
+		if k.set {
+			logger("WARNING: Server %s (type: %s) has '%s' configured, but %s", s.Name, s.Type, k.name, reason)
+		}
+	}
+}
+
+// GetAllServers returns every [[server]] block that does not say enabled = false,
+// complete or not: the callers validate each one, so a block missing type, name or
+// addr is reported instead of being dropped.
 func (c *Config) GetAllServers() []ServerConfig {
 	var allServers []ServerConfig
 
@@ -2374,11 +3250,198 @@ func (c *Config) ProxyProtocolListenersMissingTrust() []string {
 	}
 	var names []string
 	for _, s := range c.GetAllServers() {
-		if s.ProxyProtocol {
+		// The metrics endpoint does not read PROXY headers (its proxy_protocol is warned
+		// about and ignored), so no peer can spoof a client IP through it.
+		if s.ProxyProtocol && s.Type != "metrics" {
 			names = append(names, s.Name)
 		}
 	}
 	return names
+}
+
+// ValidateTrustedNetworks checks that every [servers] trusted_networks entry is an IP
+// address or a CIDR. The servers parse the list as a whole when they start, so one
+// malformed entry would leave them with none: the LMTP backend and lmtp_proxy would
+// refuse every connection.
+func (c *Config) ValidateTrustedNetworks() error {
+	_, err := helpers.ParseTrustedNetworks(c.Servers.TrustedNetworks)
+	return err
+}
+
+// HasMailBackend reports whether an enabled server stores mail (imap, lmtp, pop3). Such a
+// node runs the upload worker, the cleaner and the local cache, so it reads [uploader]
+// and [cleanup].
+func (c *Config) HasMailBackend() bool {
+	for _, s := range c.GetAllServers() {
+		if s.Type == "imap" || s.Type == "lmtp" || s.Type == "pop3" {
+			return true
+		}
+	}
+	return false
+}
+
+// NeedsDatabase reports whether the server queries the database. The mail backends, the
+// ManageSieve backend and the HTTP APIs keep their accounts there. A mail proxy
+// authenticates its users there (the LMTP proxy looks up its recipients) unless a remote
+// lookup answers for all of them, which takes remote_lookup enabled with
+// lookup_local_users = false. The User API proxy leaves logins to its backends; it only
+// checks a local user's token there, with lookup_local_users = true.
+func (s *ServerConfig) NeedsDatabase() bool {
+	switch s.Type {
+	case "imap", "lmtp", "pop3", "managesieve", "http_admin_api", "http_user_api":
+		return true
+	case "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy":
+		return s.RemoteLookup == nil || !s.RemoteLookup.Enabled || s.RemoteLookup.ShouldLookupLocalUsers()
+	case "user_api_proxy":
+		return s.RemoteLookup != nil && s.RemoteLookup.ShouldLookupLocalUsers()
+	}
+	return false
+}
+
+// DatabaseUser returns the first enabled server that queries the database, or nil when
+// the node runs none and so connects to no database.
+func (c *Config) DatabaseUser() *ServerConfig {
+	servers := c.GetAllServers()
+	for i := range servers {
+		if servers[i].NeedsDatabase() {
+			return &servers[i]
+		}
+	}
+	return nil
+}
+
+// NeedsS3 reports whether the node connects to [s3]. A mail backend stores message bodies
+// there. The User API serves them from there (/user/messages/{id}/body and /raw) on a
+// node without a mail backend too, when [s3] has any connection setting; without one it
+// serves everything but bodies.
+func (c *Config) NeedsS3() bool {
+	if c.HasMailBackend() {
+		return true
+	}
+	if !c.S3.hasSettings() {
+		return false
+	}
+	for _, s := range c.GetAllServers() {
+		if s.Type == "http_user_api" {
+			return true
+		}
+	}
+	return false
+}
+
+// Problem is one reason Validate refuses a file: the part of the file it is about, as
+// an operator finds it ("server 'imap'", "[relay]", "trusted_networks"), and what is
+// wrong there.
+type Problem struct {
+	Section string
+	Err     error
+}
+
+// Validate runs the shared configuration checks used by sora before service setup and
+// by `sora-admin config validate`, returning every problem these checks find.
+//
+// What a node does not run is not checked: [uploader] and [cleanup] only with a mail
+// backend, [database] only with a server that queries it, [s3] only on a node that
+// connects to it, [cluster] and [tls] only when enabled. Service setup still checks
+// external connectivity and the node's disk; passing Validate does not check those.
+func (c *Config) Validate() []Problem {
+	var problems []Problem
+	add := func(section string, err error) {
+		if err != nil {
+			problems = append(problems, Problem{Section: section, Err: err})
+		}
+	}
+
+	servers := c.GetAllServers()
+	for i := range servers {
+		section := fmt.Sprintf("server '%s'", servers[i].Name)
+		add(section, servers[i].Validate())
+		// A proxy routes into its remote_addrs or into the file's [[pool]] blocks, and is
+		// not built without either. Pools are file-level, so ServerConfig.Validate cannot
+		// tell; with pools, ValidatePools checks how the proxy uses them.
+		if strings.HasSuffix(servers[i].Type, "_proxy") && len(servers[i].RemoteAddrs) == 0 && !c.HasPools() {
+			add(section, fmt.Errorf("remote_addrs is required unless the file declares [[pool]] blocks"))
+		}
+	}
+
+	// Named backend pools are validated as a whole: the checks cross the [[pool]] blocks
+	// and the proxy servers that route into them.
+	add("[[pool]]", c.ValidatePools())
+	add("[relay]", c.Relay.Validate())
+	if c.Relay.IsQueueEnabled() {
+		add("[relay.queue]", c.Relay.Queue.Validate())
+	}
+	// One malformed trusted_networks entry would leave LMTP admission with no peers.
+	add("trusted_networks", c.ValidateTrustedNetworks())
+	add("[shared_mailboxes]", c.SharedMailboxes.Validate())
+	add("[timeout_scheduler]", c.TimeoutScheduler.Validate())
+
+	// Fail closed: a listener that accepts PROXY protocol with an empty trusted_networks
+	// would let any reachable host spoof the client IP via a PROXY header. (security-audit M2)
+	if missing := c.ProxyProtocolListenersMissingTrust(); len(missing) > 0 {
+		add("trusted_networks", fmt.Errorf("proxy_protocol is enabled on server(s) %s but [servers] trusted_networks is empty; "+
+			"set trusted_networks to your trusted proxy IPs/CIDRs (otherwise any client could spoof its "+
+			"source IP via a PROXY header)", strings.Join(missing, ", ")))
+	}
+
+	// A block without a name or addr is reported by its own Validate above.
+	names := make(map[string]bool)
+	addrs := make(map[string]string) // addr -> server name
+	for _, s := range servers {
+		if s.Name != "" {
+			if names[s.Name] {
+				add("server configuration", fmt.Errorf("duplicate server name '%s' found. Each server must have a unique name", s.Name))
+			}
+			names[s.Name] = true
+		}
+		if s.Addr != "" {
+			if other, exists := addrs[s.Addr]; exists {
+				add("server configuration", fmt.Errorf("duplicate server address '%s' found. Server '%s' and '%s' cannot bind to the same address", s.Addr, other, s.Name))
+			} else {
+				addrs[s.Addr] = s.Name
+			}
+		}
+	}
+	if len(servers) == 0 {
+		add("servers", fmt.Errorf("no servers configured. Please configure at least one server in a [[server]] section"))
+	}
+
+	if c.HasMailBackend() {
+		// The cleaner and the upload worker both take [uploader] max_attempts.
+		add("[uploader]", c.Uploader.Validate())
+		// The cleaner takes [cleanup]; delivery takes its fts_retention too.
+		add("[cleanup]", c.Cleanup.Validate())
+	}
+
+	if user := c.DatabaseUser(); user != nil {
+		// An endpoint without hosts opens no pool.
+		writeHosts := c.Database.Write != nil && len(c.Database.Write.Hosts) > 0
+		readHosts := c.Database.Read != nil && len(c.Database.Read.Hosts) > 0
+		switch {
+		case !writeHosts && !readHosts:
+			add("[database]", fmt.Errorf("server %q (%s) needs the database, but it is not configured in [database.write] or [database.read]", user.Name, user.Type))
+		case !writeHosts:
+			// Start-up opens write pools only from [database.write] and stops without one,
+			// whatever the replicas do: the migrations and every write run there, and
+			// [database.read] only takes reads off it.
+			add("[database.write]", fmt.Errorf("server %q (%s) needs the database, but [database.write] has no hosts; "+
+				"[database.read] alone is not enough: the migrations and every write go to [database.write]", user.Name, user.Type))
+		}
+		add("[database]", c.Database.Validate())
+		if writeHosts {
+			add("[database.write]", c.Database.Write.Validate())
+		}
+		if readHosts {
+			add("[database.read]", c.Database.Read.Validate())
+		}
+	}
+	if c.NeedsS3() {
+		add("[s3]", c.S3.Validate())
+	}
+	add("[cluster]", c.Cluster.Validate())
+	add("[tls]", c.TLS.Validate())
+
+	return problems
 }
 
 // broadPrivateRanges are the full RFC1918 / IPv6-ULA / link-local supernets. Trusting any
@@ -2403,6 +3466,13 @@ func TrustedNetworksHaveBroadPrivateRanges(networks []string) bool {
 			if err != nil {
 				continue
 			}
+			// Measure an IPv4-mapped network (::ffff:a.b.c.d/96+k) as the IPv4 network
+			// a.b.c.d/k: that is how net.IPNet.Contains, and so every trust check, matches
+			// it against clients. ParseCIDR masks the address, so a mapped one here has a
+			// prefix of at least 96 bits.
+			if ip4 := n.IP.To4(); ip4 != nil && len(n.Mask) == net.IPv6len {
+				n = &net.IPNet{IP: ip4, Mask: n.Mask[net.IPv6len-net.IPv4len:]}
+			}
 			// Match if the configured network covers the whole supernet: it contains the
 			// supernet's base address and its mask is no narrower than the supernet's.
 			ones, _ := n.Mask.Size()
@@ -2421,10 +3491,60 @@ func TrustedNetworksHaveBroadPrivateRanges(networks []string) bool {
 //
 // All other syntax errors will cause the server to fail with helpful error messages
 func LoadConfigFromFile(configPath string, cfg *Config) error {
+	_, err := LoadConfigFromFileWithMetadata(configPath, cfg)
+	return err
+}
+
+// LoadServerConfig loads the file at configPath into cfg as the server runs with it. cfg
+// starts from NewDefaultConfig, so a setting the file leaves out takes the server's
+// default, not the zero value. sora-admin loads its file with it too: it works on the
+// same spool, cache and database, and an unset [uploader] path read as "" made `uploader
+// resolve` look for staged bodies in its working directory.
+//
+// A [database.write] or [database.read] endpoint the file does not define is unset, so a
+// node without one (a proxy) runs without that database. NewDefaultConfig seeds both only
+// so that a table in the file takes the defaults for the keys it leaves out. Whether a
+// table is in the file is read from the TOML metadata, never from its values: a table
+// that names localhost, postgres and sora_mail_db is a database the node must use.
+//
+// A file that does not exist leaves cfg at those defaults, without database endpoints,
+// and returns the error from os.ReadFile.
+func LoadServerConfig(configPath string, cfg *Config) error {
+	*cfg = NewDefaultConfig()
+	md, err := LoadConfigFromFileWithMetadata(configPath, cfg)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if !hasTOMLPathFold(md, "database", "write") {
+		cfg.Database.Write = nil
+	}
+	if !hasTOMLPathFold(md, "database", "read") {
+		cfg.Database.Read = nil
+	}
+	return err
+}
+
+func hasTOMLPathFold(md toml.MetaData, p1, p2 string) bool {
+	if md.IsDefined(p1, p2) {
+		return true
+	}
+	for _, k := range md.Keys() {
+		if len(k) >= 2 && strings.EqualFold(k[0], p1) && strings.EqualFold(k[1], p2) {
+			return true
+		}
+	}
+	return false
+}
+
+// LoadConfigFromFileWithMetadata is LoadConfigFromFile that also returns the file's TOML
+// metadata. cfg is usually seeded by NewDefaultConfig, so after the load a value equal to
+// its default may be the default or may be set by the file; MetaData.IsDefined tells them
+// apart.
+func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaData, error) {
 	// Read the file content first
 	content, err := os.ReadFile(configPath)
 	if err != nil {
-		return err
+		return toml.MetaData{}, err
 	}
 
 	// Try to decode - capture metadata to check for unknown keys
@@ -2434,65 +3554,62 @@ func LoadConfigFromFile(configPath string, cfg *Config) error {
 		// Note: toml.Decode returns ParseError by value, not by pointer
 		var parseErr toml.ParseError
 		if errors.As(err, &parseErr) && strings.Contains(parseErr.Message, "has already been defined") {
-			log.Printf("WARNING: Configuration file '%s' contains duplicate keys: %s", configPath, parseErr.Error())
-			log.Printf("WARNING: Ignoring duplicate entries. Only the first occurrence of each key will be used.")
-			log.Printf("WARNING: Please fix your configuration file to remove duplicates.")
+			warnf("Configuration file '%s' contains duplicate keys, only the first occurrence of each is used; please remove the duplicates: %s", configPath, parseErr.Error())
 
 			// Parse again with a lenient approach by removing duplicate keys
 			cleanedContent, cleanErr := removeDuplicateKeysFromTOML(string(content))
 			if cleanErr != nil {
 				// If we can't clean it, return a helpful error
-				return enhanceConfigError(err)
+				return toml.MetaData{}, enhanceConfigError(err)
 			}
 
 			// Try decoding the cleaned content
 			metadata, err = toml.Decode(cleanedContent, cfg)
 			if err != nil {
-				return enhanceConfigError(err)
+				return toml.MetaData{}, enhanceConfigError(err)
 			}
 		} else {
 			// For other errors, provide enhanced error messages
-			return enhanceConfigError(err)
+			return toml.MetaData{}, enhanceConfigError(err)
 		}
 	}
 
 	// Warn about unknown keys (might be typos or deprecated settings)
-	if len(metadata.Undecoded()) > 0 {
-		log.Printf("WARNING: Configuration file '%s' contains unknown keys that will be ignored:", configPath)
-		for _, key := range metadata.Undecoded() {
-			log.Printf("WARNING:   - %s", key)
-		}
-		log.Printf("WARNING: These keys may be typos or deprecated settings. Please review your configuration.")
+	for _, key := range metadata.Undecoded() {
+		warnf("Configuration file '%s': unknown key '%s' will be ignored (a typo or a deprecated setting?)", configPath, key)
 	}
 
 	// Trim whitespace from all string fields in the configuration
 	trimStringFields(reflect.ValueOf(cfg).Elem())
 
+	if cfg.TLS.LetsEncrypt != nil {
+		cfg.TLS.LetsEncrypt.normalizeDomains()
+		for i := range cfg.DynamicServers {
+			srv := &cfg.DynamicServers[i]
+			if srv.TLSDefaultDomain == "" {
+				continue
+			}
+			name, err := AutocertName(srv.TLSDefaultDomain)
+			if err != nil {
+				warnf("server %q: ignoring tls_default_domain %q, clients without SNI use the global default: %v", srv.Name, srv.TLSDefaultDomain, err)
+			}
+			// The per-listener SNI-less override reaches the same whitelist as
+			// default_domain, before autocert can normalize it itself.
+			srv.TLSDefaultDomain = name
+		}
+	}
+
 	// Apply default values for fields where the Go zero value differs from the desired default
 	applyConfigDefaults(cfg)
 
-	return nil
+	return metadata, nil
 }
 
 // applyConfigDefaults sets default values for config fields where the desired default
 // differs from Go's zero value. Called after loading config from file.
 func applyConfigDefaults(cfg *Config) {
-	// Set default remote_health_checks = true for all proxy servers.
-	// NOTE: Since TOML/Go doesn't distinguish between "not set" and "set to false",
-	// we cannot reliably detect if the user explicitly disabled health checks.
-	// Users MUST explicitly set remote_health_checks = true in their config if they
-	// want health checks enabled (which is the recommended default).
-	// This is acceptable because:
-	// 1. The field name is self-documenting (remote_health_checks = true is obvious)
-	// 2. The example config shows remote_health_checks = true
-	// 3. The safe/recommended default is "enabled" (true)
-	// 4. Users who want to disable must be explicit (remote_health_checks = false)
-	//
-	// Alternative considered: Use *bool (pointer) to distinguish nil/true/false,
-	// but that would require refactoring all config access. Deferred for now.
-
-	// For now, we do nothing here - users must explicitly set remote_health_checks = true
-	// in their config file. The config.toml.example shows this as the default.
+	// remote_health_checks needs nothing here: it is a *bool, and GetRemoteHealthChecks
+	// treats a key left out of the config as true.
 
 	// Apply auth rate limiter defaults for enabled rate limiters
 	// When auth_rate_limit.enabled = true is set without other fields,
@@ -2633,7 +3750,7 @@ func removeDuplicateKeysFromTOML(content string) (string, error) {
 				// Check if we've seen this key before
 				if prevLine, exists := seenKeys[fullKey]; exists {
 					// Duplicate found - comment it out
-					log.Printf("WARNING: Duplicate key '%s' found at line %d (first occurrence at line %d). Ignoring duplicate.",
+					warnf("Duplicate key '%s' found at line %d (first occurrence at line %d). Ignoring duplicate.",
 						fullKey, lineNum+1, prevLine+1)
 					result = append(result, "# DUPLICATE IGNORED: "+line)
 					continue

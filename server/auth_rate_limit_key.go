@@ -72,3 +72,19 @@ func AuthRateLimitKeyWithMaster(username string, masterUsername []byte) string {
 	}
 	return AuthRateLimitKey(username)
 }
+
+// AuthSuccessRateLimitKey is the key a SUCCESSFUL login is recorded under, for the
+// protocols that accept the "user@domain.com@MASTERUSER" master form. Only the master
+// password makes that form a master login, a success of the master credential,
+// recorded under AuthRateLimitKeyWithMaster's key like its failures. With any other
+// password the form is the base address's own login, as under any other suffix
+// (#949), and its success belongs to that address (AuthRateLimitKey): recorded under
+// the master credential's key, it would let any account holder clear that key's
+// failed guesses at the master password. Any other username gets AuthRateLimitKey
+// either way.
+func AuthSuccessRateLimitKey(username, password string, masterUsername, masterPassword []byte) string {
+	if len(masterPassword) > 0 && subtle.ConstantTimeCompare([]byte(password), masterPassword) == 1 {
+		return AuthRateLimitKeyWithMaster(username, masterUsername)
+	}
+	return AuthRateLimitKey(username)
+}

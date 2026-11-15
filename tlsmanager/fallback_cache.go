@@ -216,7 +216,7 @@ func (fc *FallbackCache) syncToS3(name string, data []byte) {
 	defer cancel()
 
 	if err := fc.primary.Put(ctx, name, data); err != nil {
-		logger.Debug("Background S3 sync failed (will retry on next operation)", "name", name, "error", err)
+		logger.Warn("Background S3 sync failed - the certificate sync worker will retry", "name", name, "error", err)
 	} else {
 		logger.Info("Certificate synced from fallback cache to S3", "name", name)
 		fc.markS3Available()

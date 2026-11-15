@@ -16,8 +16,8 @@ import (
 // pathologically deep or wide SEARCH criteria (instead of recursing unbounded through the
 // SQL builder / criteria decoder), while still accepting ordinary shallow criteria.
 //
-// Exceeding a limit is reported as NO [SERVERLIMIT], which is distinct from the
-// BAD [CLIENTBUG] used for criteria that are actually malformed.
+// Exceeding a limit is reported as NO [LIMIT] (RFC 5530), which is distinct from
+// the BAD [CLIENTBUG] used for criteria that are actually malformed.
 func TestIMAP_SearchCriteriaComplexityLimits(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -67,8 +67,8 @@ func TestIMAP_SearchCriteriaComplexityLimits(t *testing.T) {
 	assertOverLimit := func(t *testing.T, tag, command string) {
 		t.Helper()
 		got := readTaggedResult(tag, command)
-		if !strings.HasPrefix(got, tag+" NO ") || !strings.Contains(got, "[SERVERLIMIT]") {
-			t.Errorf("expected %s NO [SERVERLIMIT], got %q", tag, got)
+		if !strings.HasPrefix(got, tag+" NO ") || !strings.Contains(got, "[LIMIT]") {
+			t.Errorf("expected %s NO [LIMIT], got %q", tag, got)
 		}
 	}
 
@@ -109,7 +109,7 @@ func TestIMAP_SearchCriteriaComplexityLimits(t *testing.T) {
 
 	t.Run("MalformedCriteriaIsClientBug", func(t *testing.T) {
 		// A limit rejection must stay distinguishable from a genuinely invalid criteria,
-		// which is the distinction SERVERLIMIT exists to draw.
+		// which is the distinction LIMIT exists to draw.
 		got := readTaggedResult("A015", "SEARCH NOT")
 		if !strings.HasPrefix(got, "A015 BAD") {
 			t.Errorf("expected A015 BAD for malformed criteria, got %q", got)

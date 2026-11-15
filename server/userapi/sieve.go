@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
-	"net/url"
 
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/server/sieveengine"
 )
@@ -70,8 +71,7 @@ func (s *Server) handleGetFilter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract script name from path: /user/filters/{name}
-	name := extractPathParam(r.URL.Path, "/user/filters/", "")
-	name, err = url.QueryUnescape(name)
+	name, err := pathName(r, "/user/filters/", "")
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid script name")
 		return
@@ -107,7 +107,11 @@ func (s *Server) handleGetFilter(w http.ResponseWriter, r *http.Request) {
 // maxSieveScriptSize bounds a user-supplied Sieve script (matches the value advertised
 // by the capabilities endpoint). Enforced on PUT to prevent an oversized body from
 // exhausting memory or bloating the shared sieve_scripts table.
-const maxSieveScriptSize = 65536
+const (
+	maxSieveScriptSize = 65536
+	// JSON permits every ASCII byte to be written as a six-byte Unicode escape.
+	maxSieveScriptRequestSize = 6*maxSieveScriptSize + 1024
+)
 
 // handlePutFilter creates or updates a Sieve script
 func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
@@ -115,9 +119,9 @@ func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// Bound the request body before decoding so a huge PUT cannot exhaust memory.
-	// 2x the script cap covers JSON escaping (newlines/quotes/control chars expand) plus the
-	// envelope; the real limit is the len(req.Script) check below after decoding.
-	r.Body = http.MaxBytesReader(w, r.Body, 2*maxSieveScriptSize+1024)
+	// Allow worst-case JSON string escaping plus the envelope. The actual script
+	// limit is checked against its decoded byte length below.
+	r.Body = http.MaxBytesReader(w, r.Body, maxSieveScriptRequestSize)
 
 	accountID, err := getAccountIDFromContext(ctx)
 	if err != nil {
@@ -126,8 +130,7 @@ func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract script name from path: /user/filters/{name}
-	name := extractPathParam(r.URL.Path, "/user/filters/", "")
-	name, err = url.QueryUnescape(name)
+	name, err := pathName(r, "/user/filters/", "")
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid script name")
 		return
@@ -140,6 +143,12 @@ func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
 
 	var req SieveScriptRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// A body over the read cap is too large, not malformed (RFC 9110 section 15.5.14).
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.writeError(w, http.StatusRequestEntityTooLarge, "Request body exceeds maximum size")
+			return
+		}
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
@@ -167,8 +176,17 @@ func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create or update script
-	script, err := s.rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, name, req.Script)
+	script, _, err := s.rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, name, req.Script)
 	if err != nil {
+		if errors.Is(err, db.ErrSieveScriptLimitReached) {
+			// Permanent until a script is deleted (ManageSieve: NO (QUOTA/MAXSCRIPTS)).
+			s.writeError(w, http.StatusConflict, fmt.Sprintf("Too many Sieve scripts (maximum %d); delete one first", db.MaxScriptsPerAccount()))
+			return
+		}
+		if errors.Is(err, db.ErrSieveScriptNotStorable) {
+			s.writeError(w, http.StatusBadRequest, "Script validation failed: "+err.Error())
+			return
+		}
 		logger.Warn("HTTP Mail API: Error creating/updating Sieve script", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to save script")
 		return
@@ -195,8 +213,7 @@ func (s *Server) handleDeleteFilter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract script name from path: /user/filters/{name}
-	name := extractPathParam(r.URL.Path, "/user/filters/", "")
-	name, err = url.QueryUnescape(name)
+	name, err := pathName(r, "/user/filters/", "")
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid script name")
 		return
@@ -235,8 +252,7 @@ func (s *Server) handleActivateFilter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract script name from path: /user/filters/{name}/activate
-	name := extractPathParam(r.URL.Path, "/user/filters/", "/activate")
-	name, err = url.QueryUnescape(name)
+	name, err := pathName(r, "/user/filters/", "/activate")
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid script name")
 		return

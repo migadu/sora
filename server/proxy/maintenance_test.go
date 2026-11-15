@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"sort"
 	"strings"
@@ -206,6 +207,104 @@ func TestSessionDrainer_PacesClosesAndStopsWhenMaintenanceEnds(t *testing.T) {
 		if gap := closedAt[i].Sub(closedAt[i-1]); gap < 30*time.Millisecond {
 			t.Fatalf("closes %d and %d were %v apart; rate 20/s must space them ~50ms", i-1, i, gap)
 		}
+	}
+}
+
+// A positive kick rate below about 1.08e-10/s puts the pause between two closes beyond
+// the time.Duration range. Go leaves that float-to-integer conversion implementation-
+// dependent: on amd64 it yields math.MinInt64, so the pause would fire at once and close
+// every session back to back. However tiny the rate, the second close must wait.
+func TestSessionDrainer_TinyKickRateStaysPaced(t *testing.T) {
+	for _, rate := range []float64{1e-10, 1e-12, 1e-300, math.SmallestNonzeroFloat64} {
+		t.Run(fmt.Sprint(rate), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var closed atomic.Int32
+			targets := func() []DrainTarget {
+				out := make([]DrainTarget, 3)
+				for i := range out {
+					out[i] = DrainTarget{Backend: "10.0.0.5:143", Close: func() { closed.Add(1) }}
+				}
+				return out
+			}
+
+			m := NewMaintenance()
+			StartSessionDrainer(ctx, m, rate, targets, nil, "test")
+			m.Set([]string{"10.0.0.5"})
+
+			waitFor(t, func() bool { return closed.Load() > 0 })
+			time.Sleep(100 * time.Millisecond)
+			if n := closed.Load(); n != 1 {
+				t.Fatalf("kick_rate %g closed %d sessions back to back; the second close must wait", rate, n)
+			}
+		})
+	}
+}
+
+// The other extreme: a rate so high that the pause rounds to zero closes every session
+// without waiting, as asked, instead of stalling or panicking.
+func TestSessionDrainer_HugeKickRateDrainsAtOnce(t *testing.T) {
+	for _, rate := range []float64{2e9, 1e300, math.MaxFloat64} {
+		t.Run(fmt.Sprint(rate), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var closed atomic.Int32
+			targets := func() []DrainTarget {
+				out := make([]DrainTarget, 50)
+				for i := range out {
+					out[i] = DrainTarget{Backend: "10.0.0.5:143", Close: func() { closed.Add(1) }}
+				}
+				return out
+			}
+
+			m := NewMaintenance()
+			StartSessionDrainer(ctx, m, rate, targets, nil, "test")
+			m.Set([]string{"10.0.0.5"})
+
+			waitFor(t, func() bool { return closed.Load() == 50 })
+		})
+	}
+}
+
+// drainInterval is the same on every architecture: never negative, saturated at the
+// longest Duration for a rate too small to represent, and non-increasing as the rate grows.
+func TestDrainInterval_Extremes(t *testing.T) {
+	cases := []struct {
+		rate float64
+		want time.Duration
+	}{
+		{0, 100 * time.Millisecond}, // not positive finite: default 10/s
+		{-1, 100 * time.Millisecond},
+		{math.NaN(), 100 * time.Millisecond},
+		{math.Inf(1), 100 * time.Millisecond},
+		{math.Inf(-1), 100 * time.Millisecond},
+		{math.SmallestNonzeroFloat64, math.MaxInt64}, // quotient is +Inf
+		{1e-300, math.MaxInt64},
+		{1e-12, math.MaxInt64},
+		{1e-10, math.MaxInt64},                            // 1e19ns, just past the range
+		{float64(time.Second) / (1 << 63), math.MaxInt64}, // exactly 2^63ns
+		{1e-9, time.Duration(1e18)},
+		{1, time.Second},
+		{20, 50 * time.Millisecond},
+		{1e9, time.Nanosecond},
+		{2e9, 0}, // half a nanosecond truncates to no pause, as asked
+		{math.MaxFloat64, 0},
+	}
+	for _, c := range cases {
+		if got := drainInterval(c.rate); got != c.want {
+			t.Errorf("drainInterval(%g) = %d, want %d", c.rate, got, c.want)
+		}
+	}
+
+	prev := time.Duration(math.MaxInt64)
+	for rate := 1e-11; rate < 1e-9; rate *= 1.01 {
+		got := drainInterval(rate)
+		if got <= 0 || got > prev {
+			t.Fatalf("drainInterval(%g) = %d after %d: must stay positive and non-increasing", rate, got, prev)
+		}
+		prev = got
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"mime/quotedprintable"
 	"regexp"
@@ -115,7 +116,7 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 // decodeToBinary decodes the MIME-encoded content (e.g., Base64, Quoted-Printable) into raw binary.
 func DecodeToBinary(part *message.Entity) (io.Reader, error) {
 	// Get the Content-Transfer-Encoding from the headers
-	encodingType := strings.ToLower(part.Header.Get("Content-Transfer-Encoding"))
+	encodingType := transferEncodingMechanism(part.Header.Get("Content-Transfer-Encoding"))
 
 	// Based on the encoding type, decode the content
 	switch encodingType {
@@ -125,7 +126,7 @@ func DecodeToBinary(part *message.Entity) (io.Reader, error) {
 	case "quoted-printable":
 		// Decode quoted-printable content
 		return quotedprintable.NewReader(part.Body), nil
-	case "7bit", "8bit", "binary":
+	case "", "7bit", "8bit", "binary":
 		// For these encodings, no decoding is necessary; return the body directly
 		return part.Body, nil
 	default:
@@ -134,9 +135,17 @@ func DecodeToBinary(part *message.Entity) (io.Reader, error) {
 	}
 }
 
+// HashContent returns the content hash of a message: the hex BLAKE3-256 digest that names
+// its S3 object and is stored as messages.content_hash.
 func HashContent(content []byte) string {
-	hash := blake3.Sum256(content)
-	return fmt.Sprintf("%x", hash)
+	sum := blake3.Sum256(content)
+	return fmt.Sprintf("%x", sum)
+}
+
+// NewContentHasher returns a streaming HashContent: the hex encoding of its Sum is
+// HashContent of the bytes written to it.
+func NewContentHasher() hash.Hash {
+	return blake3.New(32, nil)
 }
 
 // ValidateBodyStructure checks if a body structure is valid and returns an error for malformed structures.
@@ -174,9 +183,17 @@ func ValidateBodyStructure(bs *imap.BodyStructure) error {
 	return nil
 }
 
-// ExtractBodyStructure is imapserver.ExtractBodyStructure, indirected so tests
-// can exercise SafeBodyStructure's recovery path.
-var ExtractBodyStructure = imapserver.ExtractBodyStructure
+// extractOptions reads the Date: of an attached message/rfc822 or message/global part,
+// whose envelope the body structure stores, with ParseDateHeader like the message's own.
+// go-imap's default is net/mail, which reads an obsolete zone such as PDT in time.Local.
+var extractOptions = &imapserver.ExtractOptions{ParseDate: ParseDateHeader}
+
+// ExtractBodyStructure is imapserver.ExtractBodyStructure with the envelope dates of
+// attached messages read by ParseDateHeader, indirected so tests can exercise
+// SafeBodyStructure's recovery path.
+var ExtractBodyStructure = func(r io.Reader) imap.BodyStructure {
+	return imapserver.ExtractBodyStructureWithOptions(r, extractOptions)
+}
 
 // SafeBodyStructure returns the BODYSTRUCTURE to store for a raw message. Every
 // ingestion path (LMTP, APPEND, Admin API delivery) stores one and FETCH later

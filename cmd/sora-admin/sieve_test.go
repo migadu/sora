@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
 )
@@ -34,7 +33,7 @@ func TestSieveCommands(t *testing.T) {
 		// Put/Create a script
 		scriptName := "myscript"
 		content := "keep;"
-		_, err := rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, scriptName, content)
+		_, _, err := rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, scriptName, content)
 		if err != nil {
 			t.Fatalf("Failed to create script: %v", err)
 		}
@@ -56,7 +55,7 @@ func TestSieveCommands(t *testing.T) {
 
 		// Update script
 		contentUpdated := "discard;"
-		_, err = rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, scriptName, contentUpdated)
+		_, _, err = rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, scriptName, contentUpdated)
 		if err != nil {
 			t.Fatalf("Failed to update script: %v", err)
 		}
@@ -157,13 +156,8 @@ func TestSieveCommands(t *testing.T) {
 func setupSieveTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 	t.Helper()
 
-	var cfg AdminConfig
-	if _, err := toml.DecodeFile("../../config-test.toml", &cfg); err != nil {
-		t.Fatalf("Failed to load test configuration: %v", err)
-	}
-
 	ctx := context.Background()
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, true)
+	rdb, err := resilient.NewResilientDatabase(ctx, configTestDatabase(t), false, true)
 	if err != nil {
 		t.Fatalf("Failed to create resilient database: %v", err)
 	}

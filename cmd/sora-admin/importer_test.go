@@ -12,8 +12,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	imap "github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -42,14 +44,14 @@ func newMockResilientDatabase() *mockResilientDatabase {
 	}
 }
 
-func (m *mockResilientDatabase) GetMailboxByNameWithRetry(ctx context.Context, accountID int64, name string) (*db.DBMailbox, error) {
+func (m *mockResilientDatabase) GetOwnedMailboxIDByNameWithRetry(ctx context.Context, accountID int64, name string) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.getMailboxByNameCalls++
 	if mailbox, ok := m.mailboxes[name]; ok {
-		return mailbox, nil
+		return mailbox.ID, nil
 	}
-	return nil, consts.ErrMailboxNotFound
+	return 0, consts.ErrMailboxNotFound
 }
 
 func (m *mockResilientDatabase) CreateMailboxWithRetry(ctx context.Context, accountID int64, name string, parentID *int64) error {
@@ -330,7 +332,7 @@ func TestProcessBatch_DBInsertFailure(t *testing.T) {
 		}
 
 		// 5. Create a batch with one message
-		msgHash := HashContent(msgContent)
+		msgHash := helpers.HashContent(msgContent)
 		batch := []msgInfo{
 			{
 				path:     msgPath,
@@ -438,7 +440,10 @@ func TestParseMessageMetadata(t *testing.T) {
 		assert.True(t, expectedDate.Equal(metadata.sentDate), "Date should be parsed from the header")
 	})
 
-	t.Run("with missing date header, fallback to file mod time", func(t *testing.T) {
+	// A message without a Date: header that parses has no sent date: it is stored with its
+	// INTERNALDATE as the sent date (RFC 5256 section 2.2) and reported with a NIL ENVELOPE
+	// date (RFC 9051 section 7.5.2), never with a date taken from the file.
+	t.Run("with missing date header, internal date from file mod time", func(t *testing.T) {
 		content := []byte("Subject: Test\r\n\r\nBody")
 
 		// Create a temp file and set its modification time
@@ -457,10 +462,11 @@ func TestParseMessageMetadata(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, metadata)
 
-		assert.True(t, expectedDate.Equal(metadata.sentDate), "Date should fall back to file modification time")
+		assert.True(t, metadata.sentDate.IsZero(), "no Date: header, no sent date: %v", metadata.sentDate)
+		assert.True(t, expectedDate.Equal(metadata.internalDate), "internal date should be the file modification time")
 	})
 
-	t.Run("with invalid date header, fallback to file mod time", func(t *testing.T) {
+	t.Run("with invalid date header, internal date from file mod time", func(t *testing.T) {
 		content := []byte("Date: not-a-valid-date\r\nSubject: Test\r\n\r\nBody")
 
 		tempFile, err := os.CreateTemp(t.TempDir(), "test-*.eml")
@@ -477,10 +483,11 @@ func TestParseMessageMetadata(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, metadata)
 
-		assert.True(t, expectedDate.Equal(metadata.sentDate), "Date should fall back to file modification time on invalid header")
+		assert.True(t, metadata.sentDate.IsZero(), "a Date: header that does not parse gives no sent date: %v", metadata.sentDate)
+		assert.True(t, expectedDate.Equal(metadata.internalDate), "internal date should be the file modification time")
 	})
 
-	t.Run("with missing date and file stat error, fallback to time.Now", func(t *testing.T) {
+	t.Run("with missing date and file stat error, internal date is time.Now", func(t *testing.T) {
 		content := []byte("Subject: Test\r\n\r\nBody")
 		before := time.Now()
 		metadata, err := importer.parseMessageMetadata(content, "test.eml", "/non/existent/path/file.eml")
@@ -488,7 +495,67 @@ func TestParseMessageMetadata(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, metadata)
 
-		// Check that the date is within the time window of the function call
-		assert.True(t, !metadata.sentDate.Before(before) && !metadata.sentDate.After(after), "Date should fall back to time.Now()")
+		assert.True(t, metadata.sentDate.IsZero(), "no Date: header, no sent date: %v", metadata.sentDate)
+		// Check that the internal date is within the time window of the function call
+		assert.True(t, !metadata.internalDate.Before(before) && !metadata.internalDate.After(after), "internal date should fall back to time.Now()")
 	})
+}
+
+// TestParseMessageMetadataObsoleteZone: an alphabetic Date: zone has the offset RFC 5322
+// section 4.3 gives it ("PDT is semantically equivalent to -0700"), not the one it has in
+// the importing host's zone. At most one of PDT and EST can be the host's in July, so a
+// zone looked up in time.Local fails at least one of them.
+func TestParseMessageMetadataObsoleteZone(t *testing.T) {
+	importer := &Importer{}
+	for _, tc := range []struct {
+		header string
+		offset int // seconds east of UTC
+	}{
+		{"Wed, 17 Jul 1996 02:23:25 PDT", -7 * 3600},
+		{"Wed, 17 Jul 1996 02:23:25 EST", -5 * 3600},
+	} {
+		content := []byte("Date: " + tc.header + "\r\nSubject: Test\r\n\r\nBody")
+		metadata, err := importer.parseMessageMetadata(content, "test.eml", "/dummy/path")
+		require.NoError(t, err)
+
+		want := time.Date(1996, 7, 17, 2, 23, 25, 0, time.FixedZone("", tc.offset))
+		_, offset := metadata.sentDate.Zone()
+		assert.True(t, want.Equal(metadata.sentDate), "%s: sent date %v, want %v", tc.header, metadata.sentDate, want)
+		assert.Equal(t, tc.offset, offset, "%s: zone offset of %v", tc.header, metadata.sentDate)
+	}
+}
+
+// TestParseMessageMetadataAttachedMessageObsoleteZone: the envelope of an attached
+// message/rfc822 part in the imported BODYSTRUCTURE reads an alphabetic Date: zone by
+// RFC 5322 section 4.3 too, not in the importing host's zone.
+func TestParseMessageMetadataAttachedMessageObsoleteZone(t *testing.T) {
+	importer := &Importer{}
+	for _, tc := range []struct {
+		header string
+		offset int // seconds east of UTC
+	}{
+		{"Wed, 17 Jul 1996 02:23:25 PDT", -7 * 3600},
+		{"Wed, 17 Jul 1996 02:23:25 EST", -5 * 3600},
+	} {
+		content := []byte("Date: Thu, 18 Jul 1996 00:00:00 +0000\r\nSubject: Fwd\r\n" +
+			"Content-Type: multipart/mixed; boundary=b\r\n\r\n" +
+			"--b\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n" +
+			"--b\r\nContent-Type: message/rfc822\r\n\r\n" +
+			"Date: " + tc.header + "\r\nSubject: attached\r\n\r\nBody\r\n" +
+			"--b--\r\n")
+		metadata, err := importer.parseMessageMetadata(content, "test.eml", "/dummy/path")
+		require.NoError(t, err)
+		require.NotNil(t, metadata.bodyStructure)
+
+		mp, ok := (*metadata.bodyStructure).(*imap.BodyStructureMultiPart)
+		require.True(t, ok && len(mp.Children) == 2, "body structure %#v", *metadata.bodyStructure)
+		part, ok := mp.Children[1].(*imap.BodyStructureSinglePart)
+		require.True(t, ok && part.MessageRFC822 != nil, "part 2 %#v", mp.Children[1])
+
+		got := part.MessageRFC822.Envelope.Date
+		want := time.Date(1996, 7, 17, 2, 23, 25, 0, time.FixedZone("", tc.offset))
+		_, offset := got.Zone()
+		assert.True(t, want.Equal(got), "%s: attached envelope date %v, want %v", tc.header, got, want)
+		assert.Equal(t, tc.offset, offset, "%s: zone offset of %v", tc.header, got)
+	}
 }

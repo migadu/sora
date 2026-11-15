@@ -37,16 +37,17 @@ func purgeDomainWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilient
 		return fmt.Errorf("failed to get accounts for domain: %w", err)
 	}
 
+	// With no account left the domain's cross-domain aliases are still removed below: a
+	// domain may hold only aliases, and a re-run after an alias failed finds no account.
 	if len(accounts) == 0 {
 		fmt.Printf("No accounts found for domain: %s\n", domain)
-		return nil
+	} else {
+		fmt.Printf("Found %d account(s) to purge:\n", len(accounts))
+		for i, acct := range accounts {
+			fmt.Printf("  %d. %s (ID: %d)\n", i+1, acct.PrimaryEmail, acct.AccountID)
+		}
+		fmt.Printf("\n")
 	}
-
-	fmt.Printf("Found %d account(s) to purge:\n", len(accounts))
-	for i, acct := range accounts {
-		fmt.Printf("  %d. %s (ID: %d)\n", i+1, acct.PrimaryEmail, acct.AccountID)
-	}
-	fmt.Printf("\n")
 
 	// Purge each account using the same logic as single account purge
 	successCount := 0
@@ -85,20 +86,24 @@ func purgeDomainWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilient
 	}
 
 	// Remove cross-domain aliases for this domain. Accounts whose PRIMARY identity is in the
-	// domain were purged above. Any credential still in this domain is a non-primary alias on
-	// an account whose primary lives elsewhere — without removal it keeps receiving mail for
-	// the (now decommissioned) domain. A credential address is a deliverable address, so this
-	// is required to fully offboard the domain.
+	// domain were purged above (or, if that failed, are left for the re-run). Any other
+	// credential in this domain is a non-primary alias on an account whose primary lives
+	// elsewhere, soft-deleted or not — without removal it keeps receiving mail for the (now
+	// decommissioned) domain, or does again once the account is restored. A credential
+	// address is a deliverable address, so this is required to fully offboard the domain.
 	aliasAddrs, err := rdb.GetAliasCredentialsByDomain(ctx, domain)
 	if err != nil {
 		return fmt.Errorf("failed to scan for cross-domain aliases: %w", err)
+	}
+	if len(accounts) == 0 && len(aliasAddrs) == 0 {
+		return nil
 	}
 
 	aliasDeleted := 0
 	aliasFailed := 0
 	if len(aliasAddrs) > 0 {
 		fmt.Printf("===================================================\n")
-		fmt.Printf("Cross-domain aliases in %s (on accounts kept alive)\n", domain)
+		fmt.Printf("Cross-domain aliases in %s (on accounts kept elsewhere)\n", domain)
 		fmt.Printf("===================================================\n\n")
 		for _, addr := range aliasAddrs {
 			if err := rdb.DeleteCredentialWithRetry(ctx, addr); err != nil {
@@ -234,6 +239,7 @@ func newPurgeStorage(cfg AdminConfig) (objectStorage, error) {
 		!cfg.S3.DisableTLS,
 		false, // debug mode
 		s3Timeout,
+		storage.WithRegion(cfg.S3.Region),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize S3 storage: %w", err)

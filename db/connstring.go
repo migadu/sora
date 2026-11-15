@@ -38,8 +38,11 @@ func EndpointURL(endpoint *config.DatabaseEndpointConfig, host string) (*url.URL
 }
 
 func endpointHostPort(endpoint *config.DatabaseEndpointConfig, host string) (string, error) {
-	if _, port, err := net.SplitHostPort(host); err == nil && port != "" {
-		return host, nil
+	if h, port, err := net.SplitHostPort(host); err == nil {
+		if port != "" {
+			return host, nil
+		}
+		host = h // "db.example.com:" names no port
 	}
 	port := defaultPostgresPort
 	if endpoint.Port != nil {

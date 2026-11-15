@@ -159,24 +159,3 @@ func (td *TestDatabase) CreateTestMailbox(t *testing.T, accountID int64, name st
 	err = tx.Commit(ctx)
 	require.NoError(t, err)
 }
-
-// TruncateAllTables cleans all data from test database tables
-func (td *TestDatabase) TruncateAllTables(t *testing.T) {
-	ctx := context.Background()
-
-	// List of tables to truncate in dependency order
-	tables := []string{
-		"messages",
-		"s3_upload_queue",
-		"mailboxes",
-		"credentials",
-		"accounts",
-		"sieve_scripts",
-		"vacation_responses",
-	}
-
-	for _, table := range tables {
-		_, err := td.Database.GetWritePool().Exec(ctx, fmt.Sprintf("TRUNCATE TABLE %s CASCADE", table))
-		require.NoError(t, err)
-	}
-}

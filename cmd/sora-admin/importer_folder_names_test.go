@@ -1,0 +1,141 @@
+package main
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestPathsFileNamesFoldersLikeResolveMailboxName: an import restricted with
+// --paths-file must name each folder as the full maildir walk and resolveMailboxName
+// do (the subscriptions import relies on that name too). "&AAk-" is modified UTF-7
+// for TAB, which the folder import refuses.
+func TestPathsFileNamesFoldersLikeResolveMailboxName(t *testing.T) {
+	root := t.TempDir()
+	const msg = "1700000000.M1P1.host:2,S"
+	var paths []string
+	for _, folder := range []string{".", ".Sent Items", ".Work.Projects", ".Bad&AAk-Name"} {
+		dir := filepath.Join(root, folder)
+		for _, sub := range []string{"cur", "new", "tmp"} {
+			require.NoError(t, os.MkdirAll(filepath.Join(dir, sub), 0o755))
+		}
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "cur", msg), []byte("Subject: x\r\n\r\nx\r\n"), 0o644))
+		paths = append(paths, filepath.Join(folder, "cur", msg))
+	}
+	pathsFile := filepath.Join(t.TempDir(), "paths.txt")
+	require.NoError(t, os.WriteFile(pathsFile, []byte(strings.Join(paths, "\n")+"\n"), 0o644))
+
+	imp, err := NewImporter(context.Background(), root, "user@example.com", 1, nil, nil, ImporterOptions{PathsFile: pathsFile})
+	require.NoError(t, err)
+	defer imp.Close()
+
+	files := make(chan fileToProcess, len(paths))
+	require.NoError(t, imp.processPathsFile(filepath.Clean(root), files))
+	close(files)
+
+	var got []string
+	for f := range files {
+		got = append(got, f.mailboxName)
+		want, err := imp.resolveMailboxName(filepath.Dir(filepath.Dir(f.path)))
+		if assert.NoError(t, err, f.path) {
+			assert.Equal(t, want, f.mailboxName, f.path)
+		}
+	}
+	assert.ElementsMatch(t, []string{"INBOX", "Sent", "Work/Projects"}, got)
+}
+
+// TestEncodedPrintableASCIIIsNotDecoded: modified BASE64 must not encode printable
+// US-ASCII (RFC 3501 §5.1.3), so "&AC8-" is not a '/' that adds a level. The import
+// keeps such a folder's raw name and fix-utf7 refuses to decode the level.
+func TestEncodedPrintableASCIIIsNotDecoded(t *testing.T) {
+	name, err := importedFolderName("a&AC8-b")
+	require.NoError(t, err)
+	assert.Equal(t, "a&AC8-b", name)
+
+	name, err = importedFolderName("Work/&AGE-")
+	require.NoError(t, err)
+	assert.Equal(t, "Work/&AGE-", name)
+
+	_, err = decodeMailboxLevelUTF7("Parent/a&AC8-b")
+	assert.Error(t, err)
+}
+
+// TestNonCanonicalModifiedUTF7IsNotDecoded: null shifts, '=' or CR/LF in a BASE64
+// segment and non-zero discarded bits are not modified UTF-7 (RFC 3501 §5.1.3,
+// RFC 2152), so ".&AOl-" is not a second encoding of ".&AOk-" that would merge both
+// folders into one mailbox "é". A CR/LF inside a segment stays in the raw name and is
+// refused like any other CR/LF.
+func TestNonCanonicalModifiedUTF7IsNotDecoded(t *testing.T) {
+	name, err := importedFolderName("&AOk-")
+	require.NoError(t, err)
+	require.Equal(t, "é", name)
+
+	for _, raw := range []string{"&AOl-", "&AOk=-", "&AOk-&AOk-", "Work/&AOl-"} {
+		name, err := importedFolderName(raw)
+		require.NoError(t, err, raw)
+		assert.Equal(t, raw, name, raw)
+
+		_, err = decodeMailboxLevelUTF7(raw)
+		assert.Error(t, err, raw)
+	}
+
+	_, err = importedFolderName("&AO\r\n\r\nk-")
+	assert.Error(t, err)
+}
+
+// TestModifiedUTF7RejectsNonPrintableOutsideShift: when '&' is present in a mailbox
+// level, raw non-printable or 8-bit octets (< 0x20 or > 0x7e) outside a shift sequence
+// prove the level is not valid Modified UTF-7 (RFC 3501 §5.1.3). mailbox fix-utf7 must
+// refuse to rename a UTF-8 mailbox like "Café &AOk-" into "Café é", and maildir import
+// must not merge non-canonical ".Café &- Thé" into canonical ".Caf&AOk- &- Th&AOk-".
+func TestModifiedUTF7RejectsNonPrintableOutsideShift(t *testing.T) {
+	for _, mbox := range []string{"Café &AOk-", "Work/Café &AOk-", "Café &- Thé", "\x7f&-"} {
+		_, err := decodeMailboxLevelUTF7(mbox)
+		assert.Error(t, err, mbox)
+	}
+
+	got, err := importedFolderName("Café &AOk-")
+	require.NoError(t, err)
+	assert.Equal(t, "Café &AOk-", got)
+
+	nonCanonical, err := importedFolderName("Café &- Thé")
+	require.NoError(t, err)
+	assert.Equal(t, "Café &- Thé", nonCanonical)
+
+	canonical, err := importedFolderName("Caf&AOk- &- Th&AOk-")
+	require.NoError(t, err)
+	assert.Equal(t, "Café & Thé", canonical)
+	assert.NotEqual(t, canonical, nonCanonical)
+
+	// No-'&' fast path: a UTF-8 level with a Maildir hex escape and no '&' still
+	// unescapes cleanly without Modified UTF-7 errors.
+	unescapedUTF8, err := importedFolderName(`Données\2e2026`)
+	require.NoError(t, err)
+	assert.Equal(t, "Données.2026", unescapedUTF8)
+}
+
+// TestUndecodableLevelStaysBelowDecodedParent: a folder level that is not valid
+// modified UTF-7 keeps its raw name, but the levels above it are still decoded. The
+// parent folder ".Donn&AOk-es" is imported as "Données", so its child must be named
+// below it; keeping the whole raw name put the child below a second, auto-created
+// "Donn&AOk-es" that no folder of the maildir names.
+func TestUndecodableLevelStaysBelowDecodedParent(t *testing.T) {
+	parent, err := importedFolderName("Donn&AOk-es")
+	require.NoError(t, err)
+	require.Equal(t, "Données", parent)
+
+	for _, tc := range []struct{ raw, want string }{
+		{"Donn&AOk-es/a&AC8-b", "Données/a&AC8-b"}, // encoded '/'
+		{"Donn&AOk-es/&2AA-", "Données/&2AA-"},     // lone surrogate
+		{"Donn&AOk-es/R&D/&APw-bersicht", "Données/R&D/übersicht"},
+	} {
+		name, err := importedFolderName(tc.raw)
+		require.NoError(t, err, tc.raw)
+		assert.Equal(t, tc.want, name, tc.raw)
+	}
+}

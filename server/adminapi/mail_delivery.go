@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -57,7 +58,7 @@ type adminAPILogger struct {
 
 func (l *adminAPILogger) Log(format string, args ...any) {
 	// Log with prefix to identify HTTP delivery path
-	logger.Debug("Mail delivery", "msg", fmt.Sprintf(format, args...))
+	logger.Debug("Mail delivery", "detail", fmt.Sprintf(format, args...))
 }
 
 // defaultMaxMessageSize is used to cap the mail-injection body when the server's
@@ -215,6 +216,16 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 		messageID = fmt.Sprintf("<%d.http-delivery@%s>", time.Now().UnixNano(), s.hostname)
 	}
 
+	// Every delivered body is staged by the upload worker, which runs only on a node with
+	// an imap, pop3 or lmtp server. Without one this node cannot deliver to anyone: that
+	// is the node's state, not the request's fault, so answer 503 and let the injector
+	// retry (on another node) rather than bounce the message on a 400.
+	if s.uploader == nil {
+		w.Header().Set("Retry-After", "60")
+		s.writeError(w, http.StatusServiceUnavailable, "Mail delivery not available on this node: no upload worker")
+		return
+	}
+
 	// Process delivery for each recipient (LMTP-style per-recipient status)
 	response := DeliverMailResponse{
 		Success:    true,
@@ -258,17 +269,19 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// notifyRelayWorker wakes the relay worker so a redirect or vacation reply a delivery
+// queued goes out at once, as on LMTP, instead of on the worker's next pass.
+func (s *Server) notifyRelayWorker() {
+	if s.relayWorker != nil {
+		s.relayWorker.NotifyQueued()
+	}
+}
+
 // deliverToRecipient delivers a message to a single recipient using the delivery package
 func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest, recipient string, messageBytes []byte, _ *message.Entity) RecipientStatus {
 	status := RecipientStatus{
 		Email:    recipient,
 		Accepted: false,
-	}
-
-	// Check if uploader is configured (required for mail delivery)
-	if s.uploader == nil {
-		status.Error = "Mail delivery not configured: uploader not available"
-		return status
 	}
 
 	// Create logger with recipient prefix
@@ -279,21 +292,24 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 	// Create delivery context with relay queue
 	vacationOracle := &delivery.VacationOracle{RDB: s.rdb}
 	vacationHandler := &delivery.StandardVacationHandler{
-		Hostname:       s.hostname,
-		RelayQueue:     s.relayQueue,
-		Logger:         logger,
-		IsOwnedAddress: s.rdb.IsAddressOwnedByAccountWithRetry,
+		Hostname:          s.hostname,
+		RelayQueue:        s.relayQueue,
+		Logger:            logger,
+		IsOwnedAddress:    s.rdb.IsAddressOwnedByAccountWithRetry,
+		IsAnyOwnedAddress: s.rdb.IsAnyAddressOwnedByAccountWithRetry,
+		RelayNotify:       s.notifyRelayWorker,
 	}
 
 	deliveryCtx := &delivery.DeliveryContext{
-		Ctx:          ctx,
-		RDB:          s.rdb,
-		Uploader:     s.uploader,
-		Hostname:     s.hostname,
-		InstanceID:   s.instanceID,
-		FTSRetention: s.ftsRetention,
-		MetricsLabel: "http_delivery",
-		Logger:       logger,
+		Ctx:             ctx,
+		RDB:             s.rdb,
+		Uploader:        s.uploader,
+		Hostname:        s.hostname,
+		InstanceID:      s.instanceID,
+		FTSRetention:    s.ftsRetention,
+		MetricsLabel:    "http_delivery",
+		Logger:          logger,
+		SharedMailboxes: s.sharedMailboxes,
 	}
 
 	sieveExecutor := &delivery.StandardSieveExecutor{
@@ -301,6 +317,7 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 		VacationOracle:     vacationOracle,
 		VacationHandler:    vacationHandler,
 		RelayQueue:         s.relayQueue,
+		RelayNotify:        s.notifyRelayWorker,
 		RedirectRateLimit:  s.redirectRateLimit,
 		RedirectRateWindow: s.redirectRateWindow,
 		MaxRedirectHops:    s.maxRedirectHops,
@@ -344,8 +361,9 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 		// Storage, the database, the staging limit, or a commit whose outcome is
 		// unknown: the message may land on a retry (or already has, and the retry is
 		// absorbed by the delivery-hash check). Never a 4xx the injector would honour
-		// by dropping the message.
-		status.Transient = true
+		// by dropping the message. A message too large to store never lands, so that
+		// one is the request's fault, as a body above max_message_size is.
+		status.Transient = !errors.Is(err, delivery.ErrMessageTooLarge)
 		return status
 	}
 

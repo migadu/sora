@@ -17,7 +17,8 @@ var (
 	// ErrServerShuttingDown indicates that authentication failed because the server is shutting down
 	ErrServerShuttingDown = errors.New("server is shutting down, please try again")
 
-	// ErrAuthServiceUnavailable indicates that an authentication service (e.g., remotelookup) is temporarily unavailable
+	// ErrAuthServiceUnavailable indicates that a service authentication depends on (the
+	// remote lookup, or the database holding the credentials) is temporarily unavailable
 	ErrAuthServiceUnavailable = errors.New("authentication service temporarily unavailable, please try again later")
 
 	// ErrUserNotFound indicates that the user was not found (permanent failure - 550)
@@ -26,7 +27,8 @@ var (
 	// ErrUserNotFoundTempFail indicates user not found but with temp failure response (450)
 	ErrUserNotFoundTempFail = errors.New("user not found (temporary failure)")
 
-	// ErrInvalidAddress indicates that the recipient address is syntactically invalid (permanent failure - 550)
+	// ErrInvalidAddress indicates that an address is syntactically invalid (for an LMTP
+	// recipient a permanent failure - 550). Every NewAddress error matches it.
 	ErrInvalidAddress = errors.New("invalid address")
 )
 

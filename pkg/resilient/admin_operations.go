@@ -10,7 +10,6 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
-	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/retry"
 )
 
@@ -38,6 +37,17 @@ func (rd *ResilientDatabase) ListCredentialsWithRetry(ctx context.Context, email
 func (rd *ResilientDatabase) IsAddressOwnedByAccountWithRetry(ctx context.Context, accountID int64, address string) (bool, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).IsAddressOwnedByAccount(ctx, accountID, address)
+	}
+	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
+
+func (rd *ResilientDatabase) IsAnyAddressOwnedByAccountWithRetry(ctx context.Context, accountID int64, addresses []string) (bool, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).IsAnyAddressOwnedByAccount(ctx, accountID, addresses)
 	}
 	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
 	if err != nil {
@@ -563,15 +573,24 @@ func (rd *ResilientDatabase) PruneOldMessageVectorsWithRetry(ctx context.Context
 	}
 	return result.(int64), nil
 }
-func (rd *ResilientDatabase) GetUnusedFTSKeysWithRetry(ctx context.Context, batchSize int) ([]db.FTSKey, error) {
+func (rd *ResilientDatabase) GetUnusedFTSKeysWithRetry(ctx context.Context, after db.FTSKey, batchSize int) ([]db.FTSKey, db.FTSKey, error) {
+	type scanResult struct {
+		keys []db.FTSKey
+		next db.FTSKey
+	}
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetUnusedFTSKeys(ctx, batchSize)
+		keys, next, err := rd.getOperationalDatabaseForOperation(ctx, false).GetUnusedFTSKeys(ctx, after, batchSize)
+		if err != nil {
+			return nil, err
+		}
+		return scanResult{keys: keys, next: next}, nil
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutSearch, op)
 	if err != nil {
-		return nil, err
+		return nil, after, err
 	}
-	return result.([]db.FTSKey), nil
+	res := result.(scanResult)
+	return res.keys, res.next, nil
 }
 
 func (rd *ResilientDatabase) DeleteMessagesFTSByKeyBatchWithRetry(ctx context.Context, keys []db.FTSKey) (int64, error) {
@@ -643,7 +662,7 @@ var ErrCommitOutcomeUnknown = errors.New("database commit outcome unknown")
 func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, config retry.BackoffConfig, opType timeoutType, op func(ctx context.Context, tx pgx.Tx) (any, error), nonRetryableErrors ...error) (any, error) {
 	var result any
 	err := retry.WithRetryAdvanced(ctx, func() error {
-		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
+		tx, origin, err := rd.beginWriteTxWithRetry(ctx, pgx.TxOptions{})
 		if err != nil {
 			if rd.isRetryableError(err) {
 				return err
@@ -677,15 +696,10 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 		})
 		if cbErr != nil {
 			// Log circuit breaker state to understand failure patterns.
-			// Only log at Warn for actual system failures (retryable errors like deadlocks,
-			// connection issues). Business logic errors (ErrNoRows, ErrMailboxNotFound, etc.)
-			// are expected and should not produce noisy Warn logs.
 			state := rd.writeBreaker.State()
 			counts := rd.writeBreaker.Counts()
 
-			// Log at WARN only for system failures or when breaker is not CLOSED
-			// Business logic errors log at DEBUG to reduce noise
-			if !rd.isBusinessLogicError(cbErr) && (rd.isRetryableError(cbErr) || state != circuitbreaker.StateClosed) {
+			if rd.logsWriteErrorAtWarn(cbErr, state) {
 				logger.Warn("Write transaction operation failed through circuit breaker", "component", "RESILIENT-FAILOVER",
 					"error", cbErr, "breaker_state", state, "total_failures", counts.TotalFailures,
 					"total_requests", counts.Requests, "consecutive_failures", counts.ConsecutiveFailures)
@@ -706,7 +720,7 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 			// will open a fresh connection that DNS / the load balancer can route to
 			// the new primary.
 			if isReadOnlyTransactionError(cbErr) {
-				rd.resetCurrentWritePool()
+				rd.onReadOnlyWriteTx(origin)
 			}
 
 			for _, nonRetryableErr := range nonRetryableErrors {
@@ -752,6 +766,9 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 
 // executeReadWithRetry provides a generic wrapper for executing a read operation with retries and circuit breaker protection.
 func (rd *ResilientDatabase) executeReadWithRetry(ctx context.Context, config retry.BackoffConfig, opType timeoutType, op func(ctx context.Context) (any, error), nonRetryableErrors ...error) (any, error) {
+	if db.HasReadSnapshot(ctx) {
+		return op(ctx)
+	}
 	var result any
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		opCtx, cancel := rd.withTimeout(ctx, opType)

@@ -2,30 +2,17 @@ package proxy
 
 import (
 	"fmt"
-	"net"
-	"net/url"
-	"strconv"
+	"strings"
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 )
 
-// validateRemoteLookupURL requires https:// for non-loopback hosts. A plaintext
-// remote-lookup endpoint exposes the user's password and the returned password hash
-// to an on-path attacker, who can also forge the backend-routing response.
-func validateRemoteLookupURL(rawURL string) error {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return fmt.Errorf("invalid remotelookup.url: %w", err)
-	}
-	if u.Scheme == "https" {
-		return nil
-	}
-	host := u.Hostname()
-	if ip := net.ParseIP(host); host == "localhost" || (ip != nil && ip.IsLoopback()) {
-		return nil // http:// allowed only to loopback (dev/test)
-	}
-	return fmt.Errorf("remotelookup.url must use https:// for non-loopback hosts (got scheme %q); plaintext exposes credentials and password hashes", u.Scheme)
+// RemoteLookupUsesClientIP reports whether lookup results can depend on the client's
+// network. The proxy lookup caches are keyed by user, so these lookups must bypass
+// both authentication and route caches rather than reuse another network's verdict.
+func RemoteLookupUsesClientIP(cfg *config.RemoteLookupConfig) bool {
+	return cfg != nil && cfg.Enabled && strings.Contains(cfg.URL, "$ip")
 }
 
 // standardBackendPorts are the ports the backends listen on by default (as in
@@ -52,11 +39,13 @@ func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig, ser
 	if cfg == nil || !cfg.Enabled {
 		return nil, nil
 	}
-
-	if cfg.URL == "" {
-		return nil, fmt.Errorf("remotelookup.url is required when remotelookup is enabled")
+	if RemoteLookupUsesClientIP(cfg) {
+		logger.Info("RemoteLookup: Bypassing user-keyed lookup cache because URL uses $ip", "protocol", protocol)
 	}
-	if err := validateRemoteLookupURL(cfg.URL); err != nil {
+
+	// The checks ServerConfig.Validate runs, so a block that passes sora-admin config
+	// validate is not refused here.
+	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
@@ -72,27 +61,10 @@ func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig, ser
 		remoteTLSVerify = *cfg.RemoteTLSVerify
 	}
 
-	// Parse remote port (can be int or string)
-	remotePort := 0
-	if cfg.RemotePort != nil {
-		switch v := cfg.RemotePort.(type) {
-		case int:
-			remotePort = v
-		case int64:
-			remotePort = int(v)
-		case string:
-			// Try to parse string as int
-			if v != "" {
-				var err error
-				remotePort, err = strconv.Atoi(v)
-				if err != nil {
-					logger.Debug("RemoteLookup: Warning - failed to parse remote_port, using default", "value", v)
-					remotePort = 0
-				}
-			}
-		default:
-			logger.Debug("RemoteLookup: Warning - remote_port has unexpected type, using default", "type", fmt.Sprintf("%T", v))
-		}
+	// remote_port may be an int or a string; 0 means unset.
+	remotePort, err := cfg.GetRemotePort()
+	if err != nil {
+		return nil, fmt.Errorf("invalid remote_lookup.remote_port: %w", err)
 	}
 	// A lookup answer naming a server without a port is dialed at the lookup's own
 	// remote_port, else at the proxy's remote_port (what its port-less pool and
@@ -109,7 +81,7 @@ func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig, ser
 	}
 
 	hasAuth := cfg.AuthToken != ""
-	logger.Debug("RemoteLookup: Initializing HTTP remotelookup (NO caching)", "url", cfg.URL, "timeout", timeout, "remote_port", remotePort, "auth_enabled", hasAuth)
+	logger.Debug("RemoteLookup: Initializing HTTP remotelookup (NO caching)", "url", config.MaskEndpointURL(cfg.URL), "timeout", timeout, "remote_port", remotePort, "auth_enabled", hasAuth)
 
 	// Parse circuit breaker settings
 	var cbSettings *CircuitBreakerSettings

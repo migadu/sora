@@ -27,7 +27,7 @@ func TestPools_UnownedPinMustFailClosed(t *testing.T) {
 				s.connManager.SetRestrictRemoteLookupToPool(true)
 			}
 			if strings.HasPrefix(mode, "cached_") {
-				s.lookupCache = lookupcache.New(time.Minute, time.Minute, 10, time.Hour, 0)
+				s.lookupCache = lookupcache.New("test", "test", time.Minute, time.Minute, 10, time.Hour, 0)
 				t.Cleanup(func() { _ = s.lookupCache.Stop(context.Background()) })
 				s.lookupCache.Set(s.name, "user@external-pool.example", &lookupcache.CacheEntry{ServerAddress: "10.9.9.9:8081"})
 				s.routingLookup = nil
@@ -44,7 +44,7 @@ func TestPools_RemovedRemoteUserMustNotBecomeLocal(t *testing.T) {
 	s, _ := newPoolsMaintenanceServer(t)
 	s.lookupLocalUsers = true
 	s.routingLookup = &scriptedLookup{result: proxy.AuthUserNotFound}
-	s.lookupCache = lookupcache.New(time.Minute, time.Minute, 10, time.Hour, 0)
+	s.lookupCache = lookupcache.New("test", "test", time.Minute, time.Minute, 10, time.Hour, 0)
 	t.Cleanup(func() { _ = s.lookupCache.Stop(context.Background()) })
 	// The user presents a still-valid JWT issued in another pool before its lookup
 	// entry was removed. Local fallback needs to establish ownership of account 42.
@@ -82,7 +82,7 @@ func TestPools_AuthUsesEndpointJSONSchema(t *testing.T) {
 			lookup := poolAnswer("sora1")
 			s.routingLookup = lookup
 			req := httptest.NewRequest("POST", "/user/auth/"+tc.path, strings.NewReader(tc.body))
-			route, err := s.routeAuthRequest(req)
+			route, _, err := s.routeAuthRequest(httptest.NewRecorder(), req)
 			if err != nil || !strings.HasPrefix(route.addr, "10.0.1.") {
 				t.Fatalf("valid backend auth request routed to %+v, err=%v; lookup asked %v", route, err, lookup.asked())
 			}
