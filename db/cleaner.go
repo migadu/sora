@@ -1071,7 +1071,10 @@ func (d *Database) ListSoftDeletedMailboxes(ctx context.Context, gracePeriod tim
 // The cleaner does not use this: a batch is O(messages) against a fixed write deadline,
 // and it rolls back whole, so one large account would be retried every cycle and never
 // progress. It runs HardDeleteAccountStep instead. This stays for callers that know the
-// accounts are small, and for tests.
+// accounts are small, and for tests. Callers must quiesce the soft-deleted accounts:
+// this legacy bulk API does not lock or re-check account rows, or serialize an
+// account restoration or already-admitted restore/new-mailbox work. The production
+// cleaner uses HardDeleteAccountStep, which locks and re-checks the account.
 func (d *Database) HardDeleteAccounts(ctx context.Context, tx pgx.Tx, accountIDs []int64) error {
 	if len(accountIDs) == 0 {
 		return nil
@@ -1157,19 +1160,27 @@ func (d *Database) HardDeleteAccountStep(ctx context.Context, tx pgx.Tx, account
 	if limit > 0 {
 		limitArg = limit
 	}
-	expunged, err := tx.Exec(ctx, `
-		UPDATE messages
-		SET expunged_at = now(), expunged_modseq = nextval('messages_modseq')
-		WHERE id IN (
-			SELECT id FROM messages
-			WHERE account_id = $1 AND expunged_at IS NULL
-			LIMIT $2
-		)
+	rows, err := tx.Query(ctx, `
+		SELECT id FROM messages
+		WHERE account_id = $1 AND expunged_at IS NULL
+		LIMIT $2
 	`, accountID, limitArg)
 	if err != nil {
-		return false, fmt.Errorf("failed to expunge messages of account %d: %w", accountID, err)
+		return false, fmt.Errorf("failed to list messages of account %d: %w", accountID, err)
 	}
-	if expunged.RowsAffected() > 0 {
+	messageIDs, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return false, fmt.Errorf("failed to list messages of account %d: %w", accountID, err)
+	}
+	if len(messageIDs) > 0 {
+		// These rows sit in other accounts' mailboxes, where their owners may be
+		// changing flags right now: ExpungeMessagesByIDs locks those mailboxes first,
+		// so the expunge's stats trigger and a concurrent STORE's cannot both charge
+		// one message. It may leave a row that moved under it; the next step lists
+		// what is left, so done is reported only once nothing is.
+		if _, err := d.ExpungeMessagesByIDs(ctx, tx, messageIDs); err != nil {
+			return false, fmt.Errorf("failed to expunge messages of account %d: %w", accountID, err)
+		}
 		return false, nil
 	}
 
@@ -1179,13 +1190,27 @@ func (d *Database) HardDeleteAccountStep(ctx context.Context, tx pgx.Tx, account
 	return true, nil
 }
 
-// lockAccountMailboxes locks the mailbox rows of the accounts (ascending id, deterministic)
-// before their messages are expunged. This serializes against concurrent EXPUNGE/STORE/MOVE
-// on the same mailboxes (which lock the mailbox row first too — see lockMailboxStats),
+// lockAccountMailboxes locks the mailbox rows of the accounts, and those of other
+// accounts' mailboxes their live messages sit in (legacy rows in a shared mailbox), before
+// those messages are expunged. This serializes against concurrent EXPUNGE/STORE/MOVE on
+// the same mailboxes (which lock the mailbox row first too — see lockMailboxStats),
 // keeping unseen_count maintenance race-free, and replaces the previous pg_advisory lock
-// to avoid the global advisory-keyspace collision.
+// to avoid the global advisory-keyspace collision. Both sets are locked in one ascending
+// pass, the order every other path locks in: locking the other accounts' mailboxes after
+// the owned ones could deadlock against those paths.
+//
+// For the intended quiesced, soft-deleted callers, the expunge that follows takes
+// every live message of the accounts: COPY and cross-mailbox MOVE give the new row
+// the destination's owner, same-mailbox MOVE stays in a locked mailbox, and restore
+// refuses a soft-deleted account. The bulk caller must prevent account restoration
+// or already-admitted restore/new-mailbox work; this helper does not lock account rows.
 func lockAccountMailboxes(ctx context.Context, tx pgx.Tx, accountIDs []int64) error {
-	rows, err := tx.Query(ctx, "SELECT id FROM mailboxes WHERE account_id = ANY($1)", accountIDs)
+	rows, err := tx.Query(ctx, `
+		SELECT id FROM mailboxes WHERE account_id = ANY($1)
+		UNION
+		SELECT mailbox_id FROM messages
+		WHERE account_id = ANY($1) AND expunged_at IS NULL AND mailbox_id IS NOT NULL
+	`, accountIDs)
 	if err != nil {
 		return fmt.Errorf("failed to query mailbox IDs for locking: %w", err)
 	}

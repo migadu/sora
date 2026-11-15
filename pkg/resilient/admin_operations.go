@@ -456,7 +456,8 @@ func (rd *ResilientDatabase) hardDeleteAccountChunked(ctx context.Context, accou
 		if done {
 			return nil
 		}
-		// A step that is not done always expunged rows, so this loop cannot spin.
+		// A step that is not done always expunged rows, or found live ones that a
+		// concurrent EXPUNGE or MOVE expunged first, so this loop cannot spin.
 	}
 }
 
