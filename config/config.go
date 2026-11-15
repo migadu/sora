@@ -2995,8 +2995,9 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		}
 	}
 	// tls_verify asks the TLS handshake for a client certificate; without TLS
-	// there is no handshake to ask in.
-	if s.TLSVerify && !s.TLS {
+	// there is no handshake to ask in. The metrics endpoint has none even with
+	// tls = true; its serverTypeKeys row reports the key.
+	if s.TLSVerify && !s.TLS && slices.Contains(listenerServerTypes, s.Type) {
 		logger("WARNING: Server %s (type: %s) has 'tls_verify' configured without 'tls = true'; it is ignored and no client certificate is required", s.Name, s.Type)
 	}
 	if s.Timeouts != nil && s.Timeouts.SchedulerShardCount != 0 {
@@ -3185,6 +3186,7 @@ var serverTypeKeys = []struct {
 	// proxy_protocol are warned about below.
 	{"tls_cert_file", func(s *ServerConfig) bool { return s.TLSCertFile != "" }, listenerServerTypes},
 	{"tls_key_file", func(s *ServerConfig) bool { return s.TLSKeyFile != "" }, listenerServerTypes},
+	{"tls_verify", func(s *ServerConfig) bool { return s.TLSVerify }, listenerServerTypes},
 	{"tls_default_domain", func(s *ServerConfig) bool { return s.TLSDefaultDomain != "" }, listenerServerTypes},
 	{"proxy_protocol_timeout", func(s *ServerConfig) bool { return s.ProxyProtocolTimeout != "" }, listenerServerTypes},
 }

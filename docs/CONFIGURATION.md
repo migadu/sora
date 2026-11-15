@@ -772,8 +772,8 @@ See [TLS.md](TLS.md).
 | `tls_default_domain` | string | `[tls.letsencrypt] default_domain` | all but `metrics` | Certificate for clients that send no SNI. |
 | `insecure_auth` | bool | `false` | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Allow password logins on a plain connection. Without `tls = true` it is always allowed. The other server types have no password login; on them the key is ignored, with a startup warning. See [SECURITY.md](SECURITY.md). |
 
-The `metrics` server always speaks plain HTTP. `tls`, `tls_cert_file`, `tls_key_file` and
-`tls_default_domain` on it only cause a startup warning that names them.
+The `metrics` server always speaks plain HTTP. `tls`, `tls_cert_file`, `tls_key_file`,
+`tls_verify` and `tls_default_domain` on it only cause a startup warning that names them.
 
 ### 9.3 PROXY protocol on the listener
 
