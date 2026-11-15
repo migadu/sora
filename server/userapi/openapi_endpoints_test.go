@@ -2,6 +2,7 @@ package userapi
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -39,10 +40,7 @@ func TestOpenAPITokenEndpointsMatchHandlers(t *testing.T) {
 
 	// The route itself: a refresh without an Authorization header reaches the handler,
 	// which reads the token from the body.
-	s, err := New(nil, ServerOptions{Name: "openapi", JWTSecret: "openapi-endpoints-test-secret-32-bytes"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	s, _ := openAPITestServer(t)
 	w := httptest.NewRecorder()
 	s.SetupRoutes().ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/user/auth/refresh", strings.NewReader(`{"token":""}`)))
 	var answer map[string]string
@@ -86,12 +84,40 @@ func TestOpenAPIDeleteMessageResponse(t *testing.T) {
 	}
 }
 
+// The statuses the token handlers answer, but 500 (which no operation in the spec
+// lists): login a bad body (400), bad credentials (401), a full delay queue (429) and
+// an account it cannot check (503); refresh the same but 429. The spec listed neither
+// 429 nor 503 for login.
+func TestOpenAPITokenEndpointStatuses(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		want []string
+	}{
+		{"/auth/login", []string{"'200'", "'400'", "'401'", "'429'", "'503'"}},
+		{"/auth/refresh", []string{"'200'", "'400'", "'401'", "'503'"}},
+	} {
+		if got := openAPIStatuses(t, tc.path, "post"); !slices.Equal(got, tc.want) {
+			t.Errorf("POST %s lists %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
 // handleDeleteMailbox refuses INBOX, and a shared mailbox without the 'x' right, with
-// 403 (#992), and a mailbox with child mailboxes with 409.
+// 403 (#992), and a mailbox with child mailboxes with 409. The INBOX refusal comes
+// before the database, so it is driven through the routes here.
 func TestOpenAPIDeleteMailboxResponse(t *testing.T) {
+	s, token := openAPITestServer(t)
+	r := httptest.NewRequest(http.MethodDelete, "/user/mailboxes/INBOX", nil)
+	r.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	s.SetupRoutes().ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("DELETE /user/mailboxes/INBOX: %d %s, want 403", w.Code, w.Body.String())
+	}
+
 	op := openAPIOperation(t, "/mailboxes/{name}", "delete")
-	if _, ok := yamlSection(op, 8, "'403':"); !ok {
-		t.Error("DELETE /mailboxes/{name} does not list 403")
+	if resp, ok := yamlSection(op, 8, "'403':"); !ok || !strings.Contains(resp, "INBOX") {
+		t.Error("DELETE /mailboxes/{name} does not document the 403 for INBOX")
 	}
 	if _, ok := yamlSection(op, 8, "'409':"); !ok {
 		t.Error("DELETE /mailboxes/{name} does not list 409 (child mailboxes)")
@@ -99,6 +125,90 @@ func TestOpenAPIDeleteMailboxResponse(t *testing.T) {
 	if resp, ok := yamlSection(op, 8, "'400':"); ok && strings.Contains(resp, "INBOX") {
 		t.Errorf("DELETE /mailboxes/{name} documents the INBOX refusal as 400; it is 403:\n%s", resp)
 	}
+}
+
+// /body and /raw refuse an ID that is not a number with 400 before they ask the
+// database, and answer a body they cannot serve as writeBodyUnavailable does: 410, or
+// 503 with Retry-After (USER_API.md section 7.5). The spec listed none of these.
+func TestOpenAPIBodyUnavailableResponses(t *testing.T) {
+	s, token := openAPITestServer(t)
+	handler := s.SetupRoutes()
+	for _, path := range []string{"/messages/{id}/body", "/messages/{id}/raw"} {
+		op := openAPIOperation(t, path, "get")
+
+		r := httptest.NewRequest(http.MethodGet, "/user"+strings.Replace(path, "{id}", "x", 1), nil)
+		r.Header.Set("Authorization", "Bearer "+token)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("GET %s with id x: %d, want 400", path, w.Code)
+		}
+		if _, ok := yamlSection(op, 8, "'400':"); !ok {
+			t.Errorf("GET %s does not list 400", path)
+		}
+
+		for _, status := range []bodyStatus{bodyPending, bodyTransient, bodyGone} {
+			w := httptest.NewRecorder()
+			s.writeBodyUnavailable(w, status, errors.New("test"), 1)
+			resp, ok := yamlSection(op, 8, fmt.Sprintf("'%d':", w.Code))
+			if !ok {
+				t.Errorf("GET %s does not list %d (%s)", path, w.Code, w.Body.String())
+				continue
+			}
+			if w.Header().Get("Retry-After") != "" && !slices.Contains(openAPIResponseHeaders(t, resp), "Retry-After") {
+				t.Errorf("GET %s %d does not document its Retry-After header", path, w.Code)
+			}
+		}
+	}
+}
+
+// openAPITestServer is a server without a database, and a token it accepts.
+func openAPITestServer(t *testing.T) (*Server, string) {
+	t.Helper()
+	s, err := New(nil, ServerOptions{Name: "openapi", JWTSecret: "openapi-endpoints-test-secret-32-bytes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, _, err := s.generateToken("user@example.com", 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, token
+}
+
+// openAPIStatuses returns the status codes the operation lists, quoted as in the
+// file, sorted.
+func openAPIStatuses(t *testing.T, path, method string) []string {
+	t.Helper()
+	responses, ok := yamlSection(openAPIOperation(t, path, method), 6, "responses:")
+	if !ok {
+		t.Fatalf("%s %s has no responses in user_api_openapi.yaml", method, path)
+	}
+	codes := yamlKeys(responses, 8)
+	slices.Sort(codes)
+	return codes
+}
+
+// openAPIResponseHeaders returns the header names of resp, an operation's response
+// (its keys indented by 10), following a $ref to a shared response.
+func openAPIResponseHeaders(t *testing.T, resp string) []string {
+	t.Helper()
+	if m := regexp.MustCompile(`(?m)^ {10}\$ref: '#/components/responses/([A-Za-z]+)'$`).FindStringSubmatch(resp); m != nil {
+		spec, err := os.ReadFile("user_api_openapi.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		components, _ := yamlSection(string(spec), 0, "components:")
+		responses, _ := yamlSection(components, 2, "responses:")
+		shared, ok := yamlSection(responses, 4, m[1]+":")
+		if !ok {
+			t.Fatalf("components/responses/%s not found in user_api_openapi.yaml", m[1])
+		}
+		headers, _ := yamlSection(shared, 6, "headers:")
+		return yamlKeys(headers, 8)
+	}
+	headers, _ := yamlSection(resp, 10, "headers:")
+	return yamlKeys(headers, 12)
 }
 
 func assertShapes(t *testing.T, what string, documented, wire []string) {

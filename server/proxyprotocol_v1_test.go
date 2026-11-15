@@ -51,7 +51,6 @@ func TestParseProxyV1Rejects(t *testing.T) {
 		{"no CRLF", "PROXY TCP4 192.0.2.1 192.0.2.10 51000 143"},
 		{"no protocol", "PROXY\r\n"},
 		{"longer than 107 characters", "PROXY UNKNOWN " + strings.Repeat("a", 60) + " " + strings.Repeat("b", 60) + " 1 2\r\n"},
-		{"no LF within the read buffer", "PROXY TCP4 " + strings.Repeat("1", 8192) + "\r\n"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			info, err := r.parseProxyV1(bufio.NewReader(strings.NewReader(tt.line)))
@@ -59,6 +58,36 @@ func TestParseProxyV1Rejects(t *testing.T) {
 				t.Fatalf("%q accepted: %+v", tt.line, info)
 			}
 		})
+	}
+}
+
+// countingReader counts the bytes read through it.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
+// A line is invalid once it runs past 107 characters without a CRLF, so a peer
+// that keeps sending must not make the parser buffer whatever arrives before the
+// PROXY timeout: the read stops at the bufio.Reader's buffer.
+func TestParseProxyV1ReadIsBounded(t *testing.T) {
+	src := &countingReader{r: io.MultiReader(
+		strings.NewReader("PROXY TCP4 "),
+		strings.NewReader(strings.Repeat("1", 1<<20)),
+		strings.NewReader("\r\n"),
+	)}
+	reader := bufio.NewReader(src)
+	if info, err := (&ProxyProtocolReader{}).parseProxyV1(reader); err == nil {
+		t.Fatalf("a 1 MiB line was accepted: %+v", info)
+	}
+	if src.n > reader.Size() {
+		t.Errorf("the parser read %d bytes of the line, want at most its %d-byte buffer", src.n, reader.Size())
 	}
 }
 
