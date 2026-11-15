@@ -223,8 +223,10 @@ func TestStatus_SharedNamespaceRootRefused(t *testing.T) {
 func TestList_ReturnStatusRefusesRecentUnderIMAP4rev2(t *testing.T) {
 	c := dialWireListServer(t, IMAPServerOptions{})
 
-	// The empty pattern answers no LIST line (RFC 9051 §6.3.9.1) once the
-	// arguments have been checked, so the session needs no mailbox behind it.
+	// The empty pattern answers no LIST line once the arguments have been
+	// checked ("In the extended syntax, any mailbox name arguments that are
+	// empty strings are ignored", RFC 9051 §6.3.9; RFC 5258 §3), so the session
+	// needs no mailbox behind it.
 	const listRecent = `LIST "" "" RETURN (STATUS (MESSAGES RECENT))`
 	c.mustOK(listRecent)
 
@@ -232,5 +234,16 @@ func TestList_ReturnStatusRefusesRecentUnderIMAP4rev2(t *testing.T) {
 	c.mustBad("STATUS INBOX (MESSAGES RECENT)")
 	c.mustBad(listRecent)
 	c.mustBad(`LIST "" "" RETURN (STATUS (RECENT))`)
+	c.mustOK(`LIST "" "" RETURN (STATUS (MESSAGES DELETED))`)
+}
+
+// A server that offers no IMAP4rev1 (disabled_caps = ["IMAP4rev1"]) serves
+// every session IMAP4rev2 without an ENABLE, and go-imap refuses STATUS
+// (RECENT) there too; LIST RETURN (STATUS (RECENT)) must follow it (#1179).
+func TestList_ReturnStatusRefusesRecentOnRev2OnlyServer(t *testing.T) {
+	c := dialWireListServer(t, IMAPServerOptions{DisabledCaps: []string{"IMAP4rev1"}})
+
+	c.mustBad("STATUS INBOX (MESSAGES RECENT)")
+	c.mustBad(`LIST "" "" RETURN (STATUS (MESSAGES RECENT))`)
 	c.mustOK(`LIST "" "" RETURN (STATUS (MESSAGES DELETED))`)
 }

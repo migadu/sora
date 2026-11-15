@@ -26,8 +26,9 @@ var IMAPAlwaysAdvertisedCaps = imap.CapSet{
 // IMAPCap returns the capability a disabled_caps or disable_caps name stands for,
 // spelled as go-imap advertises it and keys its CapSet: capability names are
 // case-insensitive (RFC 9051 section 9, note 1: "Implementations MUST accept these
-// strings in a case-insensitive fashion"), and go-imap spells every capability in
-// upper case but the two base versions.
+// strings in a case-insensitive fashion"), and go-imap spells every capability
+// these settings can withdraw in upper case but the two base versions. (RIGHTS=,
+// whose rights are lower case, is not one of them: go-imap advertises it with ACL.)
 func IMAPCap(name string) imap.Cap {
 	for _, base := range []imap.Cap{imap.CapIMAP4rev1, imap.CapIMAP4rev2} {
 		if strings.EqualFold(name, string(base)) {

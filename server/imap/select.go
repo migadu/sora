@@ -3,6 +3,7 @@ package imap
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/migadu/go-imap"
@@ -45,6 +46,9 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		}
 	}
 	AccountID := s.AccountID()
+	// The session's Recent baseline. Only SELECT and the poll of the selected mailbox
+	// move it, and the previous mailbox is no longer selected here.
+	lastSelectedMailboxID, lastHighestUID := s.lastSelectedMailboxID, s.lastHighestUID
 	release()
 
 	// Create a context that signals to use the master DB if the session is pinned.
@@ -83,36 +87,53 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		}
 	}
 
-	// Compute the user's effective rights once, for READ-ONLY signalling (RFC 4314
-	// §5.2) and PERMANENTFLAGS filtering (§5.1.1).
-	userRights, err := s.userRightsForMailbox(readCtx, mailbox.ID, mailbox.AccountID)
-	if err != nil {
-		return nil, s.internalError("failed to get user rights for mailbox '%s': %v", mboxName, err)
+	// EXAMINE and ACL-forced read-only SELECT must use the same state rules.
+	//
+	// After EXAMINE "No changes to the permanent state of the mailbox, including
+	// per-user state, are permitted" (RFC 9051 §6.3.3), so no flag is permanent
+	// there, whatever the user's rights. The response is still sent, with an
+	// empty list as in the §6.3.3 example: without it "the client should assume
+	// that all flags can be changed permanently" (§6.3.2). Only SELECT needs the
+	// user's rights, for READ-ONLY signalling (RFC 4314 §5.2) and PERMANENTFLAGS
+	// filtering (§5.1.1), so EXAMINE does not look them up.
+	examined := options != nil && options.ReadOnly
+	isReadOnly := examined
+	var permanentFlags []imap.Flag
+	if !examined {
+		userRights, err := s.userRightsForMailbox(readCtx, mailbox.ID, mailbox.AccountID)
+		if err != nil {
+			return nil, s.internalError("failed to get user rights for mailbox '%s': %v", mboxName, err)
+		}
+		isReadOnly = !strings.ContainsAny(userRights, "iestw")
+		permanentFlags = getPermanentFlags(userRights)
 	}
 
-	// EXAMINE and ACL-forced read-only SELECT must use the same state rules.
-	examined := options != nil && options.ReadOnly
-	isReadOnly := examined || !strings.ContainsAny(userRights, "iestw")
+	// This mailbox was the one most recently selected read-write in this session (and
+	// then unselected by the imapserver library).
+	isReselectOfPrevious := lastSelectedMailboxID == mailbox.ID
 
-	// Read the mailbox summary, first-unseen sequence number, defined flags, and QRESYNC
-	// VANISHED/FETCH state inside one REPEATABLE READ READ ONLY transaction so every part
-	// of the SELECT response describes the exact MVCC snapshot whose EXISTS, UIDNEXT, and
-	// HIGHESTMODSEQ come from GetMailboxSummary. Changes committed by other sessions after
-	// that snapshot (including in-place message_state overwrites and expunges of newly
-	// delivered messages) remain invisible here and are reported by the session's next poll
-	// from HighestModSeq.
+	// Read the mailbox summary, RECENT count, first-unseen sequence number, defined flags,
+	// and QRESYNC VANISHED/FETCH state inside one REPEATABLE READ READ ONLY transaction so
+	// every part of the SELECT response describes the exact MVCC snapshot whose EXISTS,
+	// UIDNEXT, and HIGHESTMODSEQ come from GetMailboxSummary. Changes committed by other
+	// sessions after that snapshot (including in-place message_state overwrites and
+	// expunges of newly delivered messages) remain invisible here and are reported by the
+	// session's next poll from HighestModSeq.
 	var (
 		currentSummary    *db.MailboxSummary
+		numRecent         uint32
+		recentAbove       imap.UID // numRecent counts the messages above this UID
 		firstUnseenSeqNum uint32
 		displayFlags      []imap.Flag
-		vanishedUIDs      []imap.UID
+		vanished          imap.UIDSet
 		changedMsgs       []db.QResyncModifiedMessage
 	)
 	if err := s.server.rdb.InReadSnapshotWithRetry(readCtx, func(snapCtx context.Context) error {
 		currentSummary = nil
+		numRecent, recentAbove = 0, 0
 		firstUnseenSeqNum = 0
 		displayFlags = nil
-		vanishedUIDs = nil
+		vanished = nil
 		changedMsgs = nil
 
 		summary, err := s.server.rdb.GetMailboxSummaryWithRetry(snapCtx, mailbox.ID)
@@ -120,6 +141,49 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 			return err
 		}
 		currentSummary = summary
+
+		// RFC 3501 §2.3.2: \Recent messages are those that arrived since the last
+		// time any read-write session selected this mailbox.
+		//
+		// We use a server-wide map (mailboxRecentUIDs) that records the highest UID
+		// at the time of the last read-write SELECT by ANY session on this server.
+		// This is correct for single-node deployments. The state is in-memory and
+		// resets on restart; true cross-node \Recent tracking would require a
+		// persistent store. Without a baseline (no read-write SELECT of this mailbox
+		// since server start) all messages are recent.
+		//
+		// On a reselect, a read-only open did not advance our last read-write
+		// baseline, and another session may since have consumed newer Recent while
+		// this mailbox was closed here, so the older of the two must not revive
+		// those messages.
+		//
+		// The count runs in the snapshot of EXISTS, so that RECENT counts among the
+		// messages EXISTS counts. No UID in the snapshot is above UIDNEXT-1, so a
+		// baseline there (a reselect or another session's SELECT without new mail)
+		// needs no statement.
+		numRecent = uint32(summary.NumMessages)
+		baseline, hasBaseline := s.server.mailboxRecentUIDs.Load(mailbox.ID)
+		if isReselectOfPrevious {
+			baseline, hasBaseline = max(baseline, lastHighestUID), true
+		}
+		if hasBaseline && int64(baseline) >= summary.UIDNext-1 {
+			numRecent, recentAbove = 0, baseline
+		} else if hasBaseline {
+			nonFatalErr, fatalErr := s.server.rdb.OptionalReadInSnapshot(snapCtx, func(spCtx context.Context) error {
+				count, countErr := s.server.rdb.CountMessagesGreaterThanUIDWithRetry(spCtx, mailbox.ID, baseline)
+				if countErr != nil {
+					return countErr
+				}
+				numRecent, recentAbove = count, baseline
+				return nil
+			})
+			if fatalErr != nil {
+				return fatalErr
+			}
+			if nonFatalErr != nil {
+				s.DebugLog("error counting messages greater than UID, defaulting RECENT to total", "uid", baseline, "mailbox_id", mailbox.ID, "error", nonFatalErr)
+			}
+		}
 
 		// Extract the first unseen message sequence number lazily for SELECT only.
 		// We do not compute this in GetMailboxSummary to avoid O(N) counts in background STATUS checks.
@@ -161,8 +225,8 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 				if nonFatalErr != nil {
 					s.WarnLog("failed to get active UIDs for QRESYNC", "err", nonFatalErr)
 					fbErr, fbFatalErr := s.server.rdb.OptionalReadInSnapshot(snapCtx, func(spCtx context.Context) error {
-						var vErr error
-						vanishedUIDs, vErr = s.server.rdb.GetVanishedUIDsWithRetry(spCtx, mailbox.ID, qr.ModSeq, summary.HighestModSeq)
+						uids, vErr := s.server.rdb.GetVanishedUIDsWithRetry(spCtx, mailbox.ID, qr.ModSeq, summary.HighestModSeq)
+						vanished = convertUIDsToRanges(uids)
 						return vErr
 					})
 					if fbFatalErr != nil {
@@ -172,29 +236,12 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 						s.WarnLog("failed to get vanished UIDs fallback for QRESYNC", "err", fbErr)
 					}
 				} else {
-					activeMap := make(map[imap.UID]struct{}, len(activeUIDs))
-					for _, uid := range activeUIDs {
-						activeMap[uid] = struct{}{}
-					}
-
-					uidNext := imap.UID(summary.UIDNext)
-					for _, r := range qr.KnownUIDs {
-						start := r.Start
-						stop := r.Stop
-						if uidNext > 0 && stop >= uidNext {
-							stop = uidNext - 1
-						}
-						for uid := start; uid <= stop; uid++ {
-							if _, ok := activeMap[uid]; !ok {
-								vanishedUIDs = append(vanishedUIDs, uid)
-							}
-						}
-					}
+					vanished = knownUIDsGaps(qr.KnownUIDs, activeUIDs, imap.UID(summary.UIDNext))
 				}
 			} else {
 				nonFatalErr, fatalErr := s.server.rdb.OptionalReadInSnapshot(snapCtx, func(spCtx context.Context) error {
-					var vErr error
-					vanishedUIDs, vErr = s.server.rdb.GetVanishedUIDsWithRetry(spCtx, mailbox.ID, qr.ModSeq, summary.HighestModSeq)
+					uids, vErr := s.server.rdb.GetVanishedUIDsWithRetry(spCtx, mailbox.ID, qr.ModSeq, summary.HighestModSeq)
+					vanished = convertUIDsToRanges(uids)
 					return vErr
 				})
 				if fatalErr != nil {
@@ -221,78 +268,6 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		return nil
 	}); err != nil {
 		return nil, s.internalError("failed to get current summary for selected mailbox '%s': %v", mboxName, err)
-	}
-
-	// First, acquire the read lock once to read necessary session state
-	acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(ctx)
-	if !acquired {
-		s.WarnLog("failed to acquire second read lock within timeout")
-		return nil, &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeServerBug,
-			Text: "Server busy, please try again",
-		}
-	}
-
-	// Check if this is a reselection of the previously selected mailbox
-	isReselectOfPrevious := (s.lastSelectedMailboxID == mailbox.ID)
-	// Store the highest UID from previous selection to calculate recent messages
-	uidToCompareAgainst := s.lastHighestUID
-	// Check if the context is already cancelled before proceeding with DB operations
-	if ctx.Err() != nil {
-		release()
-		s.DebugLog("context already cancelled before selecting mailbox", "mailbox", mboxName)
-		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed during select operation"}
-	}
-	release()
-
-	// Now perform all database operations outside the lock
-	var numRecent uint32
-	var recentAbove imap.UID // numRecent counts the messages above this UID
-
-	if isReselectOfPrevious {
-		s.DebugLog("mailbox reselected", "mailbox", mboxName)
-		// A read-only open did not advance our last read-write baseline. Another
-		// session may since have consumed newer Recent while this mailbox was
-		// closed here, so an older local baseline must not revive those messages.
-		if lastSeenUID, ok := s.server.mailboxRecentUIDs.Load(mailbox.ID); ok {
-			uidToCompareAgainst = max(uidToCompareAgainst, lastSeenUID)
-		}
-		// This mailbox was the one most recently selected (and then unselected by the imapserver library).
-		// Count messages with UID > uidToCompareAgainst. Use the potentially master-pinned context.
-		count, dbErr := s.server.rdb.CountMessagesGreaterThanUIDWithRetry(readCtx, mailbox.ID, uidToCompareAgainst)
-		if dbErr != nil {
-			s.DebugLog("error counting messages greater than UID, defaulting RECENT to total", "uid", uidToCompareAgainst, "mailbox_id", mailbox.ID, "error", dbErr)
-			numRecent = uint32(currentSummary.NumMessages) // Fallback
-		} else {
-			numRecent = count
-			recentAbove = uidToCompareAgainst
-		}
-	} else {
-		// Different mailbox or first select in this session.
-		// RFC 3501 §2.3.2: \Recent messages are those that arrived since the last
-		// time any read-write session selected this mailbox.
-		//
-		// We use a server-wide map (mailboxRecentUIDs) that records the highest UID
-		// at the time of the last read-write SELECT by ANY session on this server.
-		// This is an improvement over the previous per-session-only approach (which
-		// reported ALL messages as recent for any new session) and is correct for
-		// single-node deployments.  The state is in-memory and resets on restart;
-		// true cross-node \Recent tracking would require a persistent store.
-		if lastSeenUID, ok := s.server.mailboxRecentUIDs.Load(mailbox.ID); ok {
-			count, dbErr := s.server.rdb.CountMessagesGreaterThanUIDWithRetry(readCtx, mailbox.ID, lastSeenUID)
-			if dbErr != nil {
-				s.DebugLog("error counting recent messages from server-wide UID, defaulting to total", "uid", lastSeenUID, "mailbox_id", mailbox.ID, "error", dbErr)
-				numRecent = uint32(currentSummary.NumMessages)
-			} else {
-				numRecent = count
-				recentAbove = lastSeenUID
-			}
-		} else {
-			// No previous read-write SELECT on any session for this mailbox (since
-			// server start).  All messages are considered recent.
-			numRecent = uint32(currentSummary.NumMessages)
-		}
 	}
 
 	// Acquire the lock once after all DB operations to update session state
@@ -358,20 +333,11 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		metrics.TrackUserActivity("imap", s.IMAPUser.Address.FullAddress(), "command", 1)
 	}
 
-	// After EXAMINE "No changes to the permanent state of the mailbox, including
-	// per-user state, are permitted" (RFC 9051 §6.3.3), so no flag is permanent
-	// there. The response is still sent, with an empty list as in the §6.3.3
-	// example: without it "the client should assume that all flags can be
-	// changed permanently" (§6.3.2).
-	var permanentFlags []imap.Flag
-	if !examined {
-		permanentFlags = getPermanentFlags(userRights)
-	}
-
 	selectData := &imap.SelectData{
 		// Flags defined for this mailbox (system flags, common keywords, and in-use custom flags)
 		Flags: displayFlags,
-		// Flags that can be changed, restricted to the user's flag rights (RFC 4314 §5.1.1)
+		// Flags that can be changed: none after EXAMINE, else restricted to the
+		// user's flag rights (RFC 4314 §5.1.1)
 		PermanentFlags: permanentFlags,
 		// RFC 4314 §5.2: SELECT is READ-ONLY when the user holds none of the rights
 		// that permit modifying the mailbox — insert ('i'), expunge ('e'), or the
@@ -405,10 +371,9 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 			return selectData, nil
 		}
 
-		if len(vanishedUIDs) > 0 {
-			// Convert UIDs to optimized ranges
-			selectData.Vanished = convertUIDsToRanges(vanishedUIDs)
-			s.DebugLog("QRESYNC VANISHED", "count", len(vanishedUIDs), "ranges", len(selectData.Vanished))
+		if len(vanished) > 0 {
+			selectData.Vanished = vanished
+			s.DebugLog("QRESYNC VANISHED", "ranges", len(vanished))
 		}
 
 		if len(changedMsgs) > 0 {
@@ -433,6 +398,39 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 	}
 
 	return selectData, nil
+}
+
+// knownUIDsGaps returns the UIDs of known below uidNext that are not in active: the
+// VANISHED (EARLIER) answer for a QRESYNC known-uids. active must be sorted (as
+// GetActiveUIDsInSet returns it); known is a static set of sorted ranges with holes
+// between them, as the parser gives it (RFC 7162 §7: in known-uids "*" is not allowed).
+// The gaps are taken range by range, so the cost follows the ranges and the active
+// UIDs, never the UIDs a range spans.
+func knownUIDsGaps(known imap.UIDSet, active []imap.UID, uidNext imap.UID) imap.UIDSet {
+	var gaps imap.UIDSet
+	for _, r := range known {
+		stop := r.Stop
+		if uidNext > 0 && stop >= uidNext {
+			stop = uidNext - 1
+		}
+		if r.Start == 0 || r.Start > stop {
+			continue
+		}
+		// next is the first UID of the range not yet accounted for; uint64, as it
+		// steps past an active UID 4294967295.
+		next := uint64(r.Start)
+		i, _ := slices.BinarySearch(active, r.Start)
+		for ; i < len(active) && active[i] <= stop; i++ {
+			if uint64(active[i]) > next {
+				gaps = append(gaps, imap.UIDRange{Start: imap.UID(next), Stop: active[i] - 1})
+			}
+			next = uint64(active[i]) + 1
+		}
+		if next <= uint64(stop) {
+			gaps = append(gaps, imap.UIDRange{Start: imap.UID(next), Stop: stop})
+		}
+	}
+	return gaps
 }
 
 func (s *IMAPSession) Unselect(ctx context.Context) error {

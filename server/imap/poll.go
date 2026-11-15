@@ -424,15 +424,8 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 	}
 
 	// The session has now seen every change up to its cursor.
-	if s.ownStoreEchoMailboxID != mailboxID {
-		s.ownStoreEcho = nil
-	}
 	cursor := s.currentHighestModSeq.Load()
-	for uid, modSeq := range s.ownStoreEcho {
-		if modSeq <= cursor {
-			delete(s.ownStoreEcho, uid)
-		}
-	}
+	s.pruneOwnStoreEchoLocked(mailboxID, cursor)
 
 	// Store sessionTracker reference before releasing lock to avoid race condition
 	sessionTracker := s.sessionTracker
@@ -480,4 +473,26 @@ var _ imapserver.SessionHighestModSeq = (*IMAPSession)(nil)
 // new SELECT: changing the filter does not replay the consumed flag update.
 func (s *IMAPSession) HighestModSeq() uint64 {
 	return s.reportedHighestModSeq.Load()
+}
+
+// pruneOwnStoreEchoLocked forgets the rows this session's own STORE and FETCH
+// answers recorded that Poll has now passed: all of them when they were
+// recorded in another mailbox, otherwise each one at or below cursor. A map
+// left empty is dropped rather than kept: Go never shrinks a map, so a STORE
+// over a large mailbox would otherwise hold its buckets (up to
+// maxFetchSeenEchoEntries rows) for as long as the mailbox stays selected. The
+// caller holds ownStoreMu.
+func (s *IMAPSession) pruneOwnStoreEchoLocked(mailboxID int64, cursor uint64) {
+	if s.ownStoreEchoMailboxID != mailboxID {
+		s.ownStoreEcho = nil
+		return
+	}
+	for uid, modSeq := range s.ownStoreEcho {
+		if modSeq <= cursor {
+			delete(s.ownStoreEcho, uid)
+		}
+	}
+	if len(s.ownStoreEcho) == 0 {
+		s.ownStoreEcho = nil
+	}
 }

@@ -51,8 +51,9 @@ func TestIMAP_EmptyRequiredListIsBAD(t *testing.T) {
 	}
 
 	// The same lists with an element are served, and the lists the grammar lets
-	// be empty stay accepted: the flag-list (RFC 9051 §9), LIST select and
-	// return options (RFC 5258 §4) and SEARCH RETURN () (RFC 4731 §3.1).
+	// be empty stay accepted: the flag-list of STORE and APPEND (RFC 9051 §9),
+	// LIST select and return options (RFC 5258 §6) and SEARCH RETURN () (RFC
+	// 4731 §3.1).
 	for _, tc := range []struct{ command, want string }{
 		{`FETCH 1 (FLAGS)`, "* 1 FETCH (FLAGS ("},
 		{`FETCH 1 BODY.PEEK[HEADER.FIELDS (Subject)]`, `* 1 FETCH (BODY[HEADER.FIELDS ("Subject")] {24}`},
@@ -71,4 +72,6 @@ func TestIMAP_EmptyRequiredListIsBAD(t *testing.T) {
 		require.True(t, strings.HasPrefix(tagged, "G OK"), "%s: %s", tc.command, tagged)
 		require.Contains(t, strings.Join(untagged, "\n"), tc.want, "%s", tc.command)
 	}
+	untagged, tagged := rc.cmd("G", "APPEND INBOX () {5+}\r\nhello")
+	require.True(t, strings.HasPrefix(tagged, "G OK"), "APPEND INBOX (): %s (untagged %q)", tagged, untagged)
 }

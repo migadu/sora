@@ -125,10 +125,11 @@ func (e *DatabaseEndpointConfig) GetMaxConnIdleTime() (time.Duration, error) {
 }
 
 // Validate checks that the endpoint's pool durations, max_conn_lifetime and
-// max_conn_idle_time, parse. A pool is not created without them: a write host is
-// marked failed, so start-up stops with "no healthy database pools available", and a
-// read replica is retried for good. query_timeout is not checked: an unparsable one
-// falls back to the [database] query_timeout with a warning.
+// max_conn_idle_time, parse, and that each host entry resolves to a host and port
+// (HostPort). A pool is not created without them: a write host is marked failed, so
+// start-up stops with "no healthy database pools available", and a read replica is
+// retried for good. query_timeout is not checked: an unparsable one falls back to the
+// [database] query_timeout with a warning.
 func (e *DatabaseEndpointConfig) Validate() error {
 	if _, err := e.GetMaxConnLifetime(); err != nil {
 		return fmt.Errorf("invalid max_conn_lifetime %q: %w", e.MaxConnLifetime, err)
@@ -136,7 +137,55 @@ func (e *DatabaseEndpointConfig) Validate() error {
 	if _, err := e.GetMaxConnIdleTime(); err != nil {
 		return fmt.Errorf("invalid max_conn_idle_time %q: %w", e.MaxConnIdleTime, err)
 	}
+	for _, host := range e.Hosts {
+		if _, err := e.HostPort(host); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// defaultPostgresPort is used for a host entry without a port when the endpoint sets none.
+const defaultPostgresPort = 5432
+
+// HostPort returns the host:port the pool for one host entry of the endpoint connects
+// to. A host entry that carries a port ("db.example.com:5433", "[2001:db8::1]:5433")
+// keeps it; otherwise the endpoint's port applies, 5432 when unset. Either port must be
+// a number in 1-65535. A bare IPv6 address is bracketed.
+func (e *DatabaseEndpointConfig) HostPort(host string) (string, error) {
+	if h, port, err := net.SplitHostPort(host); err == nil {
+		if port != "" {
+			if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {
+				return "", fmt.Errorf("invalid port %q in host %q (must be 1-65535)", port, host)
+			}
+			return host, nil
+		}
+		host = h // "db.example.com:" names no port
+	}
+	port := defaultPostgresPort
+	if e.Port != nil {
+		var p int64
+		switch v := e.Port.(type) {
+		case string:
+			var err error
+			if p, err = strconv.ParseInt(v, 10, 32); err != nil {
+				return "", fmt.Errorf("invalid string for port: %q", v)
+			}
+		case int:
+			p = int64(v)
+		case int64:
+			p = v
+		default:
+			return "", fmt.Errorf("invalid type for port: %T", v)
+		}
+		if p <= 0 || p > 65535 {
+			return "", fmt.Errorf("port number %d is out of the valid range (1-65535)", p)
+		}
+		port = int(p)
+	}
+	// A bare IPv6 address may come with or without brackets; JoinHostPort adds them.
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
 // GetQueryTimeout parses the query timeout duration for an endpoint.
@@ -450,6 +499,43 @@ type TLSLetsEncryptS3Config struct {
 	ServerSideEncryptionKMSKeyID string `toml:"server_side_encryption_kms_key_id"`
 }
 
+// The server-side encryption a certificate write can ask of the [tls.letsencrypt.s3]
+// store, besides "" for no encryption header at all.
+const (
+	CertificateSSEAES256 = "AES256"  // the store's own key management, the default
+	CertificateSSEKMS    = "aws:kms" // a KMS key, server_side_encryption_kms_key_id
+)
+
+// CertificateSSE returns the server-side encryption certificate writes ask of the store,
+// and its KMS key id: server_side_encryption, "AES256" when the key is absent.
+func (c TLSLetsEncryptS3Config) CertificateSSE() (algorithm, kmsKeyID string) {
+	algorithm = CertificateSSEAES256
+	if c.ServerSideEncryption != nil {
+		algorithm = *c.ServerSideEncryption
+	}
+	return algorithm, c.ServerSideEncryptionKMSKeyID
+}
+
+// ValidateCertificateSSE refuses server-side encryption settings that would not mean what
+// they say, rather than writing private keys under them: an algorithm other than
+// "AES256", "aws:kms" or "", "aws:kms" without a KMS key id, or a KMS key id with another
+// algorithm. TLSConfig.Validate and the TLS manager's S3 cache both check with it.
+func ValidateCertificateSSE(algorithm, kmsKeyID string) error {
+	switch algorithm {
+	case "", CertificateSSEAES256, CertificateSSEKMS:
+	default:
+		return fmt.Errorf("unsupported server-side encryption %q: use %q, %q or an empty value",
+			algorithm, CertificateSSEAES256, CertificateSSEKMS)
+	}
+	if algorithm == CertificateSSEKMS && kmsKeyID == "" {
+		return fmt.Errorf("server-side encryption %q requires a KMS key id", algorithm)
+	}
+	if algorithm != CertificateSSEKMS && kmsKeyID != "" {
+		return fmt.Errorf("a KMS key id is only used by server-side encryption %q, not %q", CertificateSSEKMS, algorithm)
+	}
+	return nil
+}
+
 // TLSLetsEncryptConfig holds Let's Encrypt automatic certificate management configuration
 type TLSLetsEncryptConfig struct {
 	Email           string                 `toml:"email"`            // Email for Let's Encrypt notifications
@@ -566,9 +652,11 @@ type TLSConfig struct {
 // Validate checks, with enabled = true, what the TLS manager needs of [tls] before it
 // opens anything: a known provider, cert_file and key_file for provider = "file", and
 // for provider = "letsencrypt" a [tls.letsencrypt] table with email, domains,
-// storage_provider = "s3" and a renew_before and sync_interval that parse. Whether the
-// certificate files can be read and the certificate store reached is found only by
-// opening them. tlsmanager.New runs it too.
+// storage_provider = "s3", a renew_before and sync_interval that parse, and in
+// [tls.letsencrypt.s3] access_key and secret_key both set or both empty and a
+// server-side encryption the store can be asked for. Whether the certificate files can
+// be read and the certificate store reached is found only by opening them.
+// tlsmanager.New runs it too.
 func (c *TLSConfig) Validate() error {
 	if !c.Enabled {
 		return nil
@@ -609,6 +697,13 @@ func (c *TLSLetsEncryptConfig) validate() error {
 		if _, err := helpers.ParseDuration(c.SyncInterval); err != nil {
 			return fmt.Errorf("invalid sync_interval duration %q: %w", c.SyncInterval, err)
 		}
+	}
+	// The certificate store's client refuses these before it connects.
+	if (c.S3.AccessKey == "") != (c.S3.SecretKey == "") {
+		return fmt.Errorf("letsencrypt.s3: %w", ErrS3KeysNotPaired)
+	}
+	if err := ValidateCertificateSSE(c.S3.CertificateSSE()); err != nil {
+		return fmt.Errorf("letsencrypt.s3: %w", err)
 	}
 	return nil
 }
@@ -2925,9 +3020,10 @@ func (s *ServerConfig) Validate() error {
 		// The proxy adds every entry as a backend, as loaded, and routes users to it. The
 		// loader trims each entry's ends; an empty entry, or whitespace left inside one
 		// ("192.0.2.10 :143": no host or IP has any), is a backend that never resolves.
-		// ValidatePools refuses such a [[pool]] backend the same way.
+		// A port alone (":143") is as empty, and worse: a dial to an empty host reaches
+		// this node itself. ValidatePools refuses such a [[pool]] backend the same way.
 		for i, addr := range s.RemoteAddrs {
-			if strings.TrimSpace(addr) == "" {
+			if host, _ := poolBackendHost(addr); host == "" {
 				return fmt.Errorf("server %q: remote_addrs #%d: empty backend address", s.Name, i+1)
 			}
 			if strings.ContainsFunc(addr, unicode.IsSpace) {

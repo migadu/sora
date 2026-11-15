@@ -1282,14 +1282,14 @@ var (
 // bearer token gets the challenge without an error code, a refused token
 // error="invalid_token" (RFC 6750 section 3.1).
 func (s *Server) writeUnauthorized(w http.ResponseWriter, r *http.Request, err error) {
-	msg, tokenRefused := "Invalid or expired token", true
+	msg, errorCode := "Invalid or expired token", server.BearerInvalidToken
 	switch {
 	case errors.Is(err, errNoAuthHeader):
-		msg, tokenRefused = "Authorization header required", false
+		msg, errorCode = "Authorization header required", ""
 	case errors.Is(err, errNotBearerAuth):
-		msg, tokenRefused = "Authorization header must be 'Bearer <token>'", false
+		msg, errorCode = "Authorization header must be 'Bearer <token>'", ""
 	}
-	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, tokenRefused)
+	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, errorCode)
 	s.writeError(w, r, msg, http.StatusUnauthorized)
 }
 
