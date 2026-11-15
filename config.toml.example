@@ -1414,7 +1414,8 @@ proxy_protocol = false        # Enable PROXY protocol support for LMTP
 proxy_protocol_timeout = "5s"
 
 # --- MESSAGE SIZE LIMITING ---
-# Maximum size for incoming LMTP messages to prevent memory exhaustion attacks
+# Maximum size for incoming LMTP messages to prevent memory exhaustion attacks.
+# Advertised in LHLO as "SIZE <n>"; MAIL ... SIZE= above it is refused with 552.
 max_message_size = "50mb"     # Maximum message size (default: 50MB; 0 also means 50MB, there is no unlimited)
 
 # --- SIEVE REDIRECT LIMITS ---
@@ -2294,7 +2295,8 @@ connect_timeout = "30s"
 auth_idle_timeout = "2m"        # Idle timeout between commands during authentication phase (pre-auth only).
                               # Resets after each command received. Cleared after successful authentication.
                               # Note: absolute_session_timeout (below) separately limits total session duration.
-max_message_size = "50mb"
+max_message_size = "50mb"       # Advertised in LHLO as "SIZE <n>"; MAIL ... SIZE= above it gets 552.
+                                # "0" advertises no limit (the backend still applies its own).
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- TIMEOUT CONFIGURATION ---
