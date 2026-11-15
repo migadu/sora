@@ -1008,39 +1008,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	if result.Action == sieveengine.ActionKeep {
 		s.DebugLog("sieve keep action")
 	}
-	resolvedDestinations, resolveErr := delivery.ResolveSieveDestinations(ctx, s.backend.rdb, s.backend.sharedMailboxes, s.AccountID(), result, redirectFailed, func(format string, args ...any) {
-		s.WarnLog(fmt.Sprintf(format, args...))
-	})
-	if resolveErr != nil {
-		recordMetrics("failure")
-		return s.InternalError("failed to resolve Sieve destinations: %v", resolveErr)
-	}
-	mailboxNames := make([]string, 0, len(resolvedDestinations))
-	for _, dest := range resolvedDestinations {
-		mailboxNames = append(mailboxNames, dest.Mailbox)
-		err = s.saveMessageToMailbox(ctx, dest.Target, fullMessageBytes, contentHash, deliveryHash,
-			subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, storedFlags(dest.Destination))
-		if err == nil {
-			continue
-		}
-		// Handle duplicate messages (acceptable in LMTP - return success)
-		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
-			// For duplicates, NEVER delete the file. This prevents a race condition where:
-			// 1. Message A arrives, writes file, INSERT succeeds, creates pending_upload
-			// 2. Message B (duplicate) arrives, due to TOCTOU race also writes file
-			// 3. Message B's INSERT fails as duplicate
-			// 4. If Message B deletes the file, Message A's pending upload loses its source file
-			//
-			// The file will be cleaned up by the uploader's cleanupOrphanedFiles job
-			// (runs every 5 minutes with 10-minute grace period) if it's truly orphaned.
-			if filePath != nil {
-				s.DebugLog("duplicate message detected, keeping file for potential pending upload", "content_hash", contentHash)
-			}
-			// The copy is already there: this one is delivered, carry on with the next.
-			s.DebugLog("duplicate message accepted (already exists), skipping storage", "message_id", messageID, "mailbox", dest.Mailbox)
-			continue
-		}
-
+	handleStoreError := func(err error, mailbox string) error {
 		// Context error: DATA cap timeout vs disconnect/shutdown. In both
 		// cases DO NOT delete the file. Even though we wrote it, there's a
 		// race window where another concurrent delivery might have seen the
@@ -1085,8 +1053,42 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		recordMetrics("failure")
 		// The reply text reaches the sender in a delay or bounce notice: the folder the
 		// recipient's script files into and the database error stay in the log.
-		s.WarnLog("failed to save message", "mailbox", dest.Mailbox, "error", err)
+		s.WarnLog("failed to save message", "mailbox", mailbox, "error", err)
 		return s.InternalError("failed to save message")
+	}
+	resolvedDestinations, resolveErr := delivery.ResolveSieveDestinations(ctx, s.backend.rdb, s.backend.sharedMailboxes, s.AccountID(), result, redirectFailed, func(format string, args ...any) {
+		s.WarnLog(fmt.Sprintf(format, args...))
+	})
+	if resolveErr != nil {
+		return handleStoreError(resolveErr, "")
+	}
+	mailboxNames := make([]string, 0, len(resolvedDestinations))
+	for _, dest := range resolvedDestinations {
+		mailboxNames = append(mailboxNames, dest.Mailbox)
+		err = s.saveMessageToMailbox(ctx, dest.Target, fullMessageBytes, contentHash, deliveryHash,
+			subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, storedFlags(dest.Destination))
+		if err == nil {
+			continue
+		}
+		// Handle duplicate messages (acceptable in LMTP - return success)
+		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
+			// For duplicates, NEVER delete the file. This prevents a race condition where:
+			// 1. Message A arrives, writes file, INSERT succeeds, creates pending_upload
+			// 2. Message B (duplicate) arrives, due to TOCTOU race also writes file
+			// 3. Message B's INSERT fails as duplicate
+			// 4. If Message B deletes the file, Message A's pending upload loses its source file
+			//
+			// The file will be cleaned up by the uploader's cleanupOrphanedFiles job
+			// (runs every 5 minutes with 10-minute grace period) if it's truly orphaned.
+			if filePath != nil {
+				s.DebugLog("duplicate message detected, keeping file for potential pending upload", "content_hash", contentHash)
+			}
+			// The copy is already there: this one is delivered, carry on with the next.
+			s.DebugLog("duplicate message accepted (already exists), skipping storage", "message_id", messageID, "mailbox", dest.Mailbox)
+			continue
+		}
+
+		return handleStoreError(err, dest.Mailbox)
 	}
 
 	commitRedirects()
