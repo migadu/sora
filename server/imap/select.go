@@ -288,8 +288,11 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed during select operation"}
 	}
 
-	// SEARCH RECENT, NEW and OLD answer from this (see recent.go).
+	// SEARCH RECENT, NEW and OLD answer from this (see recent.go), and Poll
+	// keeps the RECENT count with it.
 	s.recentAboveUID = recentAbove
+	s.numRecent = numRecent
+	s.recentUnsent.Store(false)
 
 	// Only a read-write selection advances the session and server baselines.
 	// EXAMINE must preserve Recent for both later opens in this session and other
