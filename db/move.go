@@ -123,7 +123,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	// Collect message IDs and source UIDs
 	var messageIDs []int64
 	var sourceUIDsForMap []imap.UID
-	var rekeyed []bool // per message: owned by another account than destAccountID
+	var rekeyed []bool // per message: re-keyed from another account to destAccountID
 	for rows.Next() {
 		var messageID, sourceAccountID int64
 		var sourceUID imap.UID
@@ -139,7 +139,9 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		}
 		messageIDs = append(messageIDs, messageID)
 		sourceUIDsForMap = append(sourceUIDsForMap, sourceUID)
-		rekeyed = append(rekeyed, sourceAccountID != destAccountID)
+		// A move within one mailbox keeps every row's account and S3 key (see below), so it
+		// re-keys nothing, even a row of another account than the mailbox owner.
+		rekeyed = append(rekeyed, sourceAccountID != destAccountID && srcMailboxID != destMailboxID)
 	}
 	if err = rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating through source messages: %w", err)

@@ -193,3 +193,50 @@ func TestSameAccountCopyMoveLeavesPendingUploadAlone(t *testing.T) {
 		})
 	}
 }
+
+// TestSameMailboxMoveLeavesAnotherAccountsUploadAlone: a MOVE within one mailbox keeps
+// every row's account and S3 key, so it re-keys nothing even for a row of another account
+// than the mailbox owner (a cross-account copy written before copies were re-keyed to the
+// owner). Such a row is not re-staged on this node, and its upload, which may be pending
+// on another node, must not be taken over.
+func TestSameMailboxMoveLeavesAnotherAccountsUploadAlone(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db := setupTestDatabase(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	ts := time.Now().UnixNano()
+	here := fmt.Sprintf("rearm_samebox_here_%d", ts)
+	elsewhere := fmt.Sprintf("rearm_samebox_elsewhere_%d", ts)
+	contentHash := fmt.Sprintf("rearm_samebox_hash_%d", ts)
+
+	accountA := createTestAccount(t, db, fmt.Sprintf("rearm_samebox_src_%d@example.com", ts), "password")
+	accountB := createTestAccount(t, db, fmt.Sprintf("rearm_samebox_owner_%d@example.com", ts), "password")
+	boxName := fmt.Sprintf("Shared_%d", ts)
+	box := createTestMailbox(t, db, accountB, boxName)
+
+	// A row of account A in B's mailbox, its upload pending on another node.
+	insertDeliveredMessage(t, db, accountA, box, boxName, contentHash, elsewhere, 1)
+	_, err := db.GetWritePool().Exec(ctx,
+		`UPDATE pending_uploads SET attempts = 2, last_attempt = now() WHERE content_hash = $1 AND account_id = $2`,
+		contentHash, accountA)
+	require.NoError(t, err)
+	before := readPendingUpload(t, db, contentHash, accountA)
+
+	uids := mailboxUIDs(t, db, box)
+	require.Len(t, uids, 1)
+	copyOrMove(t, db, "move", uids, box, box, accountB, here, map[imap.UID]string{uids[0]: contentHash})
+
+	var movedAccount int64
+	require.NoError(t, db.GetReadPool().QueryRow(ctx,
+		`SELECT account_id FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL`, box).Scan(&movedAccount))
+	require.Equal(t, accountA, movedAccount, "a same-mailbox move must keep the row's account")
+
+	got := readPendingUpload(t, db, contentHash, accountA)
+	assert.Equal(t, elsewhere, got.instanceID, "a same-mailbox move took over the source's upload")
+	assert.Equal(t, before.attempts, got.attempts, "a same-mailbox move reset the source's upload")
+	assert.NotNil(t, got.lastAttempt, "a same-mailbox move reset the source's upload")
+}
