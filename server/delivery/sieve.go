@@ -15,6 +15,7 @@ import (
 	"github.com/emersion/go-message"
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
@@ -103,6 +104,9 @@ type SieveOutcome struct {
 	// body locally: SaveMessageToMailbox writes a pending_uploads row, and the uploader
 	// treats a pending upload whose local file is missing as permanent content loss.
 	Copies []SieveCopy
+	// Resolving can create mailboxes, so the caller invokes this only after the
+	// storable-size check and body staging, with redirect abort already deferred.
+	resolveDestinations func(context.Context) ([]SieveCopy, error)
 	// CreateMailboxes are the fileinto :create targets (RFC 5490 §3.2): the caller
 	// creates each missing mailbox before saving the copies.
 	CreateMailboxes []string
@@ -123,6 +127,7 @@ type SieveOutcome struct {
 type SieveCopy struct {
 	Mailbox string
 	Flags   []imap.Flag
+	target  *db.DBMailbox
 }
 
 // SieveExecutor interface defines the contract for Sieve script execution.
@@ -320,14 +325,25 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		return outcome, nil
 	}
 	outcome.MailboxName = destinations[0].Mailbox
-	outcome.Flags = s.sieveFlags(destinations[0].Flags)
+	outcome.Flags = helpers.SanitizeFlags(helpers.StringsToFlags(destinations[0].Flags))
 	for _, dest := range destinations {
 		if dest.Create {
 			outcome.CreateMailboxes = append(outcome.CreateMailboxes, dest.Mailbox)
 		}
 	}
 	for _, dest := range destinations[1:] {
-		outcome.Copies = append(outcome.Copies, SieveCopy{Mailbox: dest.Mailbox, Flags: s.sieveFlags(dest.Flags)})
+		outcome.Copies = append(outcome.Copies, SieveCopy{Mailbox: dest.Mailbox, Flags: helpers.SanitizeFlags(helpers.StringsToFlags(dest.Flags))})
+	}
+	outcome.resolveDestinations = func(ctx context.Context) ([]SieveCopy, error) {
+		destinations, err := ResolveSieveDestinations(ctx, s.DeliveryCtx.RDB, s.DeliveryCtx.SharedMailboxes, recipient.AccountID, result, !allHeld, s.DeliveryCtx.Logger.Log)
+		if err != nil {
+			return nil, err
+		}
+		copies := make([]SieveCopy, len(destinations))
+		for i, dest := range destinations {
+			copies[i] = SieveCopy{Mailbox: dest.Target.Name, Flags: s.sieveFlags(dest.Flags), target: dest.Target}
+		}
+		return copies, nil
 	}
 
 	return outcome, nil

@@ -858,7 +858,8 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// returns is dropped; the retry holds it again.
 	commitRedirects, abortRedirects, allHeld := s.holdRedirects(ctx, result, messageContent, fullMessageBytes)
 	defer abortRedirects()
-	destinations := result.Destinations(!allHeld)
+	redirectFailed := !allHeld
+	destinations := result.Destinations(redirectFailed)
 	if len(destinations) == 0 {
 		// A redirect without :copy, every target held: there is nothing to store.
 		if commitRedirects() {
@@ -867,6 +868,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			return nil
 		}
 		// A target the queue did not take after all: keep the message.
+		redirectFailed = true
 		destinations = result.Destinations(true)
 	}
 
@@ -1006,11 +1008,17 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	if result.Action == sieveengine.ActionKeep {
 		s.DebugLog("sieve keep action")
 	}
-	mailboxNames := make([]string, 0, len(destinations))
-	for _, dest := range destinations {
+	resolvedDestinations, resolveErr := delivery.ResolveSieveDestinations(ctx, s.backend.rdb, s.backend.sharedMailboxes, s.AccountID(), result, redirectFailed, func(format string, args ...any) {
+		s.WarnLog(fmt.Sprintf(format, args...))
+	})
+	if resolveErr != nil {
+		return s.InternalError("failed to resolve Sieve destinations: %v", resolveErr)
+	}
+	mailboxNames := make([]string, 0, len(resolvedDestinations))
+	for _, dest := range resolvedDestinations {
 		mailboxNames = append(mailboxNames, dest.Mailbox)
-		err = s.saveMessageToMailbox(ctx, dest.Mailbox, fullMessageBytes, contentHash, deliveryHash,
-			subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, dest.Create, storedFlags(dest))
+		err = s.saveMessageToMailbox(ctx, dest.Target, fullMessageBytes, contentHash, deliveryHash,
+			subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, storedFlags(dest.Destination))
 		if err == nil {
 			continue
 		}
@@ -1264,67 +1272,16 @@ func (s *LMTPSession) handleVacationResponse(ctx context.Context, reply sieveeng
 // saveMessageToMailbox saves a message to the specified mailbox.
 // flags carries any keywords/flags set by the Sieve script (imap4flags, RFC 5232);
 // they are stored on the message (InsertMessage folds keyword case per RFC 9051 §2.3.2).
-func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName string,
+func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailbox *db.DBMailbox,
 	fullMessageBytes []byte, contentHash string, deliveryHash string, subject string, messageID string,
 	sentDate time.Time, inReplyTo []string, references []string, bodyStructure *imap.BodyStructure,
-	plaintextBody *string, recipients []helpers.Recipient, createMailbox bool,
+	plaintextBody *string, recipients []helpers.Recipient,
 	flags []imap.Flag) error {
 
 	// Create a context for read operations that respects session pinning
 	readCtx := ctx
 	if s.useMasterDB {
 		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-	}
-
-	// Resolve the name as for any fileinto: the user's own mailbox, else one shared
-	// with the user, never the shared namespace root (delivery.FileintoTarget). :create
-	// (RFC 5490 §3.2) creates the mailbox only "if needed": "If the mailbox already
-	// exists, this argument is ignored", and a shared one exists for this user. It
-	// never makes a personal mailbox in the shared namespace, where a namesake would
-	// shadow a shared mailbox in later lookups.
-	mailbox, err := delivery.FileintoTarget(readCtx, s.backend.rdb, s.backend.sharedMailboxes, s.AccountID(), mailboxName)
-	if errors.Is(err, consts.ErrMailboxNotFound) && createMailbox {
-		if s.backend.sharedMailboxes.InNamespace(mailboxName) {
-			s.WarnLog("fileinto :create refused in the shared namespace", "mailbox", mailboxName)
-		} else {
-			s.DebugLog("creating mailbox", "mailbox", mailboxName)
-			mailbox, err = s.backend.rdb.GetOrCreateMailboxByNameWithRetry(ctx, s.AccountID(), mailboxName)
-			if errors.Is(err, consts.ErrMailboxInvalidName) {
-				// No mailbox can have that name. "Failure to create the specified
-				// mailbox is considered to be an error" (RFC 5490 §3.2), and on an
-				// error implementations "do an implicit keep" (RFC 5228 §2.10.6):
-				// INBOX, below. Failing the delivery would only have it retried until
-				// it bounces, and through the default script's +detail filing any
-				// sender picks the name.
-				s.WarnLog("fileinto :create of an invalid mailbox name", "mailbox", mailboxName, "error", err)
-				err = consts.ErrMailboxNotFound
-			} else if err != nil {
-				return fmt.Errorf("failed to get or create mailbox '%s': %v", mailboxName, err)
-			}
-		}
-	}
-	if errors.Is(err, consts.ErrMailboxNotFound) {
-		s.WarnLog("mailbox not found, falling back to inbox", "mailbox", mailboxName, "error", err)
-		mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), consts.MailboxInbox)
-		if err != nil {
-			return fmt.Errorf("failed to get INBOX mailbox: %v", err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("failed to get mailbox '%s': %v", mailboxName, err)
-	}
-
-	// Enforce the insert ('i') right for shared mailboxes owned by another account: a
-	// SIEVE fileinto must not write into a mailbox the recipient can only look up
-	// (RFC 4314). On denial (or check error) deliver to the recipient's own INBOX.
-	if mailbox.AccountID != s.AccountID() {
-		canInsert, permErr := s.backend.rdb.CheckMailboxPermissionWithRetry(readCtx, mailbox.ID, s.AccountID(), db.ACLRightInsert)
-		if permErr != nil || !canInsert {
-			s.WarnLog("fileinto denied: no insert right on shared mailbox, delivering to INBOX", "mailbox", mailbox.Name, "error", permErr)
-			mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), consts.MailboxInbox)
-			if err != nil {
-				return fmt.Errorf("failed to get INBOX mailbox: %v", err)
-			}
-		}
 	}
 
 	// Determine destination owner

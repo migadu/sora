@@ -997,11 +997,29 @@ type Destination struct {
 // than lost (§4.2: "Any ignored redirect MUST NOT cancel the implicit keep"). An
 // empty list means nothing is stored.
 func (r Result) Destinations(redirectFailed bool) []Destination {
+	dests, _ := r.DestinationsByKey(redirectFailed, nil)
+	return dests
+}
+
+// DestinationsByKey groups copies by their resolved storage identity. resolve is
+// called before duplicate elimination, so database aliases and fallback targets
+// retain the last explicit action's flags. A nil resolver keeps the legacy name
+// comparison used by Destinations; storage callers supply a physical identity.
+func (r Result) DestinationsByKey(redirectFailed bool, resolve func(string, bool) (string, error)) ([]Destination, error) {
 	dests := make([]Destination, 0, len(r.Mailboxes)+1)
 	orders := make([]uint64, 0, len(r.Mailboxes)+1)
-	add := func(mailbox string, create bool, flags []string, order uint64) {
+	keys := make([]string, 0, len(r.Mailboxes)+1)
+	add := func(mailbox string, create bool, flags []string, order uint64) error {
+		key := ""
+		if resolve != nil {
+			var err error
+			key, err = resolve(mailbox, create)
+			if err != nil {
+				return err
+			}
+		}
 		for i := range dests {
-			if strings.EqualFold(dests[i].Mailbox, mailbox) {
+			if resolve != nil && keys[i] == key || resolve == nil && strings.EqualFold(dests[i].Mailbox, mailbox) {
 				// Keep one copy in the first destination's position. A :create on
 				// any spelling creates it, and the last action supplies its flags.
 				dests[i].Create = dests[i].Create || create
@@ -1009,11 +1027,13 @@ func (r Result) Destinations(redirectFailed bool) []Destination {
 					dests[i].Flags = flags
 					orders[i] = order
 				}
-				return
+				return nil
 			}
 		}
 		dests = append(dests, Destination{Mailbox: mailbox, Create: create, Flags: flags})
 		orders = append(orders, order)
+		keys = append(keys, key)
+		return nil
 	}
 	for _, mailbox := range r.Mailboxes {
 		flags := r.FlagsForMailbox(mailbox)
@@ -1027,12 +1047,16 @@ func (r Result) Destinations(redirectFailed bool) []Destination {
 				mailbox = name
 			}
 		}
-		add(mailbox, create, flags, order)
+		if err := add(mailbox, create, flags, order); err != nil {
+			return nil, err
+		}
 	}
 	if r.Action == ActionKeep || r.Copy || (redirectFailed && len(dests) == 0) {
-		add(consts.MailboxInbox, false, r.FlagsForKeep(), r.KeepStoreOrder)
+		if err := add(consts.MailboxInbox, false, r.FlagsForKeep(), r.KeepStoreOrder); err != nil {
+			return nil, err
+		}
 	}
-	return dests
+	return dests, nil
 }
 
 // scriptRunner is what runScript needs of a compiled script; *sieve.Script
