@@ -97,12 +97,11 @@ func TestIMAP_ClientFilterBeforeEnableWithdrawsExtensions(t *testing.T) {
 		}
 	}
 
-	// go-imap ignores the CONDSTORE parameter of a session that does not offer
+	// go-imap refuses the CONDSTORE parameter of a session that does not offer
 	// CONDSTORE, so the client does not become CONDSTORE-aware and a later ID
 	// matching the same filter does not hand CONDSTORE back either.
-	if resp := c.mustOK("SELECT INBOX (CONDSTORE)"); strings.Contains(resp, "HIGHESTMODSEQ") {
-		t.Errorf("SELECT INBOX (CONDSTORE) after a filter withdrew CONDSTORE: want no HIGHESTMODSEQ, got:\n%s", resp)
-	}
+	c.wantBad("SELECT INBOX (CONDSTORE)")
+	c.mustOK("SELECT INBOX")
 	c.wantBad("UID EXPUNGE 1:*")
 	c.wantBad("MOVE 1 INBOX")
 	c.mustOK(`ID ("name" "buggy")`)
