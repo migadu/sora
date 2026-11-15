@@ -43,15 +43,22 @@ func (db *Database) Subscribe(ctx context.Context, tx pgx.Tx, accountID int64, m
 // Unsubscribe removes a name-based subscription. Idempotent and case-insensitive.
 // A default mailbox's subscription is kept: default mailboxes stay permanently
 // subscribed. Whether the name is a default mailbox's is asked of the row it
-// matches, as helpers.IsDefaultMailboxName asks it of a stored name (lower() under
-// the "C" collation folds ASCII letters only), so the answer is the database's
-// LOWER() under any collation: "ſent" matches only a "ſent" row, while "Jun\u212A"
-// matches Junk's under a UTF-8 collation and leaves it.
+// matches (lower() under the "C" collation folds ASCII letters only). Also
+// keep a legacy Unicode-spelled subscription when the database resolves it to
+// a live, canonically named default mailbox of this account. An ordinary
+// Unicode-named physical mailbox is not a default just because its lower()
+// happens to match one: the stored physical name must be an ASCII default.
 func (db *Database) Unsubscribe(ctx context.Context, tx pgx.Tx, accountID int64, mailboxName string) error {
 	_, err := tx.Exec(ctx, `
-		DELETE FROM subscriptions
-		WHERE account_id = $1 AND LOWER(mailbox_name) = LOWER($2)
-		  AND LOWER(mailbox_name COLLATE "C") <> ALL ($3)
+		DELETE FROM subscriptions s
+		WHERE s.account_id = $1 AND LOWER(s.mailbox_name) = LOWER($2)
+		  AND LOWER(s.mailbox_name COLLATE "C") <> ALL ($3)
+		  AND NOT EXISTS (
+		      SELECT 1 FROM mailboxes m
+		      WHERE m.account_id = s.account_id AND m.deleted_at IS NULL
+		        AND LOWER(m.name) = LOWER(s.mailbox_name)
+		        AND LOWER(m.name COLLATE "C") = ANY ($3)
+		  )
 	`, accountID, mailboxName, defaultMailboxNamesLower)
 	if err != nil {
 		return fmt.Errorf("failed to unsubscribe %q: %w", mailboxName, err)
