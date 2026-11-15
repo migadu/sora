@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -181,9 +183,9 @@ func TestWriteDovecotUIDList(t *testing.T) {
 	}
 
 	// Write UID list
-	err := WriteDovecotUIDList(tempDir, uidList)
+	err := os.WriteFile(filepath.Join(tempDir, "dovecot-uidlist"), formatDovecotUIDList(uidList), 0644)
 	if err != nil {
-		t.Fatalf("WriteDovecotUIDList failed: %v", err)
+		t.Fatalf("writing the formatted uidlist failed: %v", err)
 	}
 
 	// Read back and verify

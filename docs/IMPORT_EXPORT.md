@@ -131,8 +131,9 @@ is not read: such a message file is reported as failed by its path, and such a `
 skipped with a warning naming it.
 
 This policy covers source message and Dovecot metadata contents and `cur/`/`new/` listings. It
-does not change how the SQLite cache or explicitly supplied `--sieve` and `--paths-file` files
-are opened. Folder discovery and file existence/timestamp checks still use ordinary paths.
+does not change how the SQLite cache or an explicitly supplied `--paths-file` file are opened;
+`--sieve` has its own rule ([section 7](#7-importing-a-sieve-script)). Folder discovery and file
+existence/timestamp checks still use ordinary paths.
 
 ---
 
@@ -290,6 +291,14 @@ Very large UIDVALIDITY values in the uidlist are truncated to 32 bits.
 
 `--sieve PATH` stores the file as a Sieve script of the account before the messages are
 imported. If the file does not exist, it is ignored with a log line.
+
+The file is read through its directory. The usual file from Dovecot, the user's
+`~/.dovecot.sieve`, is a symbolic link the user owns, so a link is followed only when it is
+relative and its target is within that directory, as Pigeonhole's own
+`.dovecot.sieve -> sieve/<name>.sieve`. Any other link (one out of the directory, or any absolute
+link) is refused: the log names the file and nothing is stored. Where Pigeonhole's script
+directory is not below the link's directory, its link is absolute; name the script it points to
+instead.
 
 | Situation | Result |
 |---|---|
@@ -540,6 +549,18 @@ writes it, so `v1.2` is subscribed as `v1\2e2`.
 **UID lists.** With `--dovecot` or `--export-dovecot-uidlist`, each exported folder gets a
 `dovecot-uidlist` with the mailbox's UIDVALIDITY and each message's Sora UID. An existing
 uidlist in the target is merged: its entries for files still present are kept.
+
+**Links in the target.** The target may be a maildir its owner could write to, while the export
+runs with more privileges, so message and Dovecot contents and Maildir child directories below
+it are accessed through the opened target directory. `--maildir-path` itself may be a link.
+Each exported content file (a message,
+`dovecot-keywords`, `subscriptions`, `dovecot-uidlist`) is written as a new file and renamed over
+its name, so a symbolic or hard link at that name is replaced, and the file it points to is left
+alone. A mailbox directory, `cur/`, `new/` or `tmp/` that is a link is followed only when the link
+is relative and its target is below the target directory; any other link makes the export fail
+before it writes a message, naming the path. An existing `dovecot-keywords` or `dovecot-uidlist`
+that is such a link is not read, and is replaced as if it were not there. The SQLite cache and
+its sidecars still use ordinary paths; their policy is unchanged ([section 8](#8-the-sqlite-cache-sora-maildirdb)).
 
 **Re-runs.** The exporter keeps `sora-maildir.db` in the target directory, with the same schema
 as the importer's ([section 8](#8-the-sqlite-cache-sora-maildirdb)), and records each exported

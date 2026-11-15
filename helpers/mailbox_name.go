@@ -25,6 +25,44 @@ func CanonicalMailboxName(name string) string {
 	return name
 }
 
+// IsDefaultMailboxName reports whether stored, the name of a mailbox or subscription
+// as the database holds it, is one of consts.DefaultMailboxes in any case of its
+// ASCII letters. Give it the name the database resolved a client's name to, never
+// the client's name: which names are one mailbox is the database's LOWER(name), and
+// lower() depends on the collation. It maps U+212A KELVIN SIGN to "k" under libc and
+// ICU, U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE to "i" under libc only, and leaves
+// U+017F LATIN SMALL LETTER LONG S as it is under every one, so "ſent" is a mailbox of
+// its own while strings.EqualFold matches it with "Sent".
+func IsDefaultMailboxName(stored string) bool {
+	for _, def := range consts.DefaultMailboxes {
+		if equalFoldASCII(stored, def) {
+			return true
+		}
+	}
+	return false
+}
+
+// equalFoldASCII reports whether a and b are equal with their ASCII letters compared
+// case-insensitively and every other byte exactly.
+func equalFoldASCII(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		x, y := a[i], b[i]
+		if 'A' <= x && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if 'A' <= y && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
+}
+
 // MailboxNameHasTraversal reports whether an IMAP mailbox name contains a path
 // segment that would escape its on-disk representation during maildir
 // import/export.

@@ -96,7 +96,7 @@ func TestImportedFolderNameRejectsInvalidMailboxNames(t *testing.T) {
 
 func TestScanMaildirSkipsInvalidMailboxFolders(t *testing.T) {
 	root := t.TempDir()
-	exporter := &Exporter{maildirPath: root}
+	exporter := newDirExporter(t, root)
 	require.NoError(t, exporter.createMailboxDirectory("INBOX"))
 
 	folders := []string{

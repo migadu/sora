@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/helpers"
 )
 
 func (s *IMAPSession) Delete(ctx context.Context, mboxName string) error {
@@ -22,18 +22,6 @@ func (s *IMAPSession) Delete(ctx context.Context, mboxName string) error {
 	AccountID := s.AccountID()
 	release()
 
-	// Check if special mailbox - no lock needed
-	for _, specialMailbox := range consts.DefaultMailboxes {
-		if strings.EqualFold(mboxName, specialMailbox) {
-			s.DebugLog("attempt to delete special mailbox", "mailbox", mboxName)
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeNoPerm,
-				Text: fmt.Sprintf("Mailbox '%s' is a special mailbox and cannot be deleted", mboxName),
-			}
-		}
-	}
-
 	// Middle phase: Database operations outside lock
 	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, mboxName)
 	if err != nil {
@@ -46,6 +34,19 @@ func (s *IMAPSession) Delete(ctx context.Context, mboxName string) error {
 			}
 		}
 		return s.internalError("failed to fetch mailbox '%s': %v", mboxName, err)
+	}
+
+	// A default mailbox cannot be deleted. Ask of the mailbox the database found, not
+	// of the client's spelling: the database decides which names are one mailbox
+	// (LOWER(name), which depends on its collation), so "ſent" is a mailbox of its own
+	// while "Jun\u212A" is Junk under a UTF-8 collation.
+	if helpers.IsDefaultMailboxName(mailbox.Name) {
+		s.DebugLog("attempt to delete special mailbox", "mailbox", mboxName)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNoPerm,
+			Text: fmt.Sprintf("Mailbox '%s' is a special mailbox and cannot be deleted", mboxName),
+		}
 	}
 
 	// Check ACL permissions - requires 'x' (delete) right
