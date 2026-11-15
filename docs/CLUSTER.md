@@ -43,6 +43,11 @@ disk. It carries:
 - **Backend affinity**, the record of which backend a user was last sent to, so every proxy node
   sends the user to the same backend.
 - **Leadership**, which only Let's Encrypt uses: only the leader orders and renews certificates.
+- **Per-IP connection counts** from the IMAP, POP3 and ManageSieve proxies, so
+  `max_connections_per_ip` counts a client address's connections on every proxy node.
+- **Authentication rate-limit state** from the same proxies: IP blocks, progressive-delay failure
+  counts and per-name failure statistics, so a client that guesses passwords is slowed down and
+  blocked on every proxy node, not only on the one it tried.
 
 Section 6 describes each of these in detail. Section 7 lists what stays on one node or lives in
 PostgreSQL instead.
@@ -65,6 +70,8 @@ You need the cluster when you want any of the following:
 | To kick a user's proxy sessions with `sora-admin connections kick` or the admin API | The kick reaches proxy sessions only through the cluster's connection tracker. |
 | `enable_affinity = true` on a proxy | The affinity store only exists in cluster mode, with `[cluster.affinity] enabled = true`. |
 | Several nodes that use Let's Encrypt with one S3 bucket | Without the cluster every node orders and renews certificates on its own. See [TLS.md](TLS.md#8-lets-encrypt-in-a-cluster). |
+| `max_connections_per_ip` on IMAP, POP3 or ManageSieve proxies to cap a client address over all proxy nodes | Without the cluster each proxy listener counts only its own connections. |
+| IMAP, POP3 or ManageSieve proxies that share authentication rate limits | Without the cluster each proxy listener counts failures and blocks addresses on its own, so a client that guesses passwords starts afresh on every node and on every listener. |
 
 A single proxy node can run a cluster of one: set `enabled = true`, leave `peers` empty, and the
 node logs `No peers to join - running as standalone single-node cluster` and becomes its own leader.
@@ -296,6 +303,61 @@ themselves never travel over the cluster: nodes share them through an S3 bucket.
 a database, a PostgreSQL lock additionally makes sure only one node orders or renews a certificate
 for a name at a time. See [TLS.md](TLS.md#8-lets-encrypt-in-a-cluster).
 
+### 6.5 Per-IP connection counts (IMAP, POP3 and ManageSieve proxies)
+
+In cluster mode, every `imap_proxy`, `pop3_proxy` and `managesieve_proxy` listener that sets
+`max_connections_per_ip` counts each client address's open connections and gossips every change.
+The limit then caps one address over all the proxy listeners of that protocol that set the key, on
+every node, the listener's own node included. Without the cluster it caps the address on each
+listener.
+
+- The key works as described in [SECURITY.md](SECURITY.md#4-connection-limits) otherwise: addresses
+  in `[servers] trusted_networks` are not counted, and behind a PROXY header the client the header
+  names is counted. A connection over the limit is closed before any greeting.
+- The counts behave like the per-user counts of section 6.1: they are eventually consistent, so two
+  connections on two nodes at the same moment can both pass the limit; the full-state exchange every
+  30 seconds repairs them; each tracker sends a heartbeat every 30 seconds, and a node drops another
+  node's counts once that tracker has been silent for 5 minutes (checked every 5 minutes).
+- `max_connections` is not shared. On backends and on the `user_api_proxy`, `max_connections_per_ip`
+  counts per listener, in cluster mode too.
+
+### 6.6 Authentication rate limits (IMAP, POP3 and ManageSieve proxies)
+
+In cluster mode, every `imap_proxy`, `pop3_proxy` and `managesieve_proxy` listener with
+`auth_rate_limit` enabled shares the state of its rate limiter
+([AUTHENTICATION.md](AUTHENTICATION.md#10-authentication-rate-limiting)) with the listeners of the
+same protocol: those on the other nodes, and the other ones on its own node, such as an IMAP proxy on
+port 143 and another on port 993. IMAP failures never count on a POP3 proxy.
+`[cluster.rate_limit_sync]` (section 11) controls the sharing; it is on by default.
+
+| State | What is shared | Key |
+|---|---|---|
+| Tier 2 IP blocks | When an address reaches `max_attempts_per_ip`, its block and the time it ends go to every listener of the protocol. Each refuses logins from the address until that time. | `sync_blocks` |
+| Tier 2 failure counts and progressive delays | Each failure from an address whose count has reached `delay_start_threshold` sends the count and the current wait. A received count only raises the listener's own and never lowers it. Counts below `delay_start_threshold` stay on the listener. A successful login from the address clears its count on every listener, except one that blocks the address or has seen a failure from it since the success. | `sync_failure_counts` |
+| Name statistics | Every failure of a name, and the success that clears its failures. | always, while `enabled` |
+| Tier 1 (IP and name) blocks | Not shared: they stay on the listener that set them. | none |
+
+Details:
+
+- Shared failure counts merge by maximum. If two listeners each increment a count from 5 to 6,
+  both keep 6 after sharing their events. Simultaneous failures can therefore outnumber the count
+  used for progressive delays and blocking.
+- Each listener applies what it receives under its own `auth_rate_limit`: an address in its
+  `exempt_networks` is neither blocked nor counted, and a received wait is capped at its `max_delay`.
+  A received block keeps the end time the blocking listener set.
+- Each node applies `sync_blocks` and `sync_failure_counts` both to what it sends and to what it
+  accepts, so set them the same on every node.
+- The other listeners on the same node get each event at once. Other nodes get it by gossip only,
+  normally within a second (section 9), and ignore it when it arrives more than 5 minutes after it
+  was sent. There is no full-state exchange for this state: a node that joins or restarts learns
+  from the gossip events it receives, including any recent events still queued by peers. A restart
+  clears the node's blocks, the received ones included; the other nodes keep theirs.
+- `sora-admin stats blocked` lists the blocks of one node, the ones it received included
+  ([AUTHENTICATION.md](AUTHENTICATION.md#109-seeing-who-is-blocked)).
+- The limiters of the backends (`imap`, `pop3`, `managesieve`), of the `http_user_api` and of the
+  `user_api_proxy` never share anything, and the `lmtp_proxy` has none. Without the cluster, or with
+  `[cluster.rate_limit_sync] enabled = false`, every listener counts and blocks on its own.
+
 ---
 
 ## 7. What the cluster does not share
@@ -305,7 +367,9 @@ These stay on one node, or live in PostgreSQL:
 | Thing | Where it lives |
 |---|---|
 | `max_connections` | Counted per listener on each node. |
-| Per-user limits on backends | Counted per backend server. |
+| Per-user limits and `max_connections_per_ip` on backends, `max_connections_per_ip` on the User API proxy | Counted per listener. |
+| Authentication rate limits of the backends, the User API and the User API proxy | Per listener, in memory. |
+| Tier 1 (IP and name) blocks of the proxies | Per listener, in memory. |
 | The proxies' lookup cache | Per proxy server, in memory. The cluster only tells it to drop a user's entries (section 6.2). |
 | The proxies' auth cache (`[auth_cache]`) | A local SQLite file per node. |
 | Backend health checks | Each proxy checks its backends itself. |
@@ -332,8 +396,10 @@ suspect, then dead once a suspicion timeout passes: a few seconds in a small clu
 half a minute in a larger one. The leader is then recomputed within 5 seconds.
 
 The connection counts the lost node held stay counted on the other nodes until they have heard
-nothing from it for 5 minutes. During that time its users may hit `max_connections_per_user`
-early. Affinity entries the node set stay valid: they name backends, not the node.
+nothing from it for 5 minutes (per-IP counts: up to 10 minutes, section 6.5). During that time its
+users may hit `max_connections_per_user`, and its clients `max_connections_per_ip`, early.
+Affinity entries the node set stay valid: they name backends, not the node. Rate-limit blocks it
+sent stay in force on the other nodes until they end.
 
 ### The leader dies
 
@@ -344,9 +410,10 @@ working on every node.
 
 ### A node comes back
 
-A restarted node joins through its `peers` list. It gets the current connection counts from the
-next full-state exchange (within about 30 seconds) and only new affinity assignments, unless
-`cache_path` is set.
+A restarted node joins through its `peers` list. It gets the current connection counts, per user
+and per IP, from the next full-state exchange (within about 30 seconds), only new affinity
+assignments, unless `cache_path` is set, and rate-limit state from the gossip events it receives
+after joining (section 6.6).
 
 ### A network split
 
@@ -361,8 +428,8 @@ the two sides merge into one cluster again and agree on one leader.
 
 Every gossip event carries the sender's time. A receiver ignores events that are more than
 **5 minutes old** by its own clock, so that a healed split does not replay old news. A node whose
-clock runs more than 5 minutes behind therefore has its connection events, kicks and affinity
-changes ignored. Keep all nodes in sync with NTP.
+clock runs more than 5 minutes behind therefore has its connection events, kicks, affinity
+changes and rate-limit events ignored. Keep all nodes in sync with NTP.
 
 ---
 
@@ -376,9 +443,11 @@ These details matter when you size a busy cluster or read a warning in the log.
 - **Retransmission.** An event is retransmitted a number of times that grows with the logarithm of
   the cluster size, then retired. Delivery is at least once; receivers drop duplicates by event ID.
   Order is not preserved; the receivers handle events that arrive in the wrong order.
-- **Fairness.** Connection events and affinity events take turns at the datagram budget, so a busy
-  kind cannot starve the other. Within the connection events, heartbeats go first, then kicks
-  (with at most half of the remaining space), then ordinary connect and disconnect events.
+- **Fairness.** Rate-limit events, affinity events, connection events and per-IP connection
+  events take turns at the datagram budget, so a busy kind cannot starve the others. Within the
+  connection events, heartbeats go first, then kicks (with at most half of the remaining space),
+  then ordinary connect and disconnect events. Within the rate-limit events, IP blocks go first,
+  with at most half of the datagram.
 - **Connection event queue.** Each proxy tracker queues outgoing connection events, up to
   `[cluster] max_event_queue_size` (default `50000`). When it overflows, memberlist drops the
   messages that were already sent most often, and Sora logs
@@ -388,11 +457,17 @@ These details matter when you size a busy cluster or read a warning in the log.
   ordinary events. They are also sent directly over TCP when issued, so this queue matters only
   for members that were unreachable at that moment. An overflow is logged at Error level.
 - **Affinity queue.** Up to 5000 outgoing affinity events.
+- **Rate-limit queues.** Each proxy rate limiter queues up to 10000 outgoing IP blocks and 10000
+  other events (failure counts and the successes that clear them, name failures and successes). An
+  overflow drops messages as in the connection event queue. Nothing repairs a dropped rate-limit
+  event.
+- **Per-IP queue.** Each per-IP tracker queues up to 10000 outgoing events. The next full-state
+  exchange repairs a dropped one.
 - **Receiving.** Each subsystem handles received events on its own worker, with a queue of 256. If
   it falls behind, new events are dropped and
   `Cluster: Gossip handler queue full, dropping events` is logged (at most every 10 seconds).
-- **Full-state exchange.** Every 30 seconds each node exchanges its connection tracker state with
-  one random member over TCP. memberlist refuses a state larger than 20 MB.
+- **Full-state exchange.** Every 30 seconds each node exchanges the state of its connection
+  trackers and per-IP trackers with one random member over TCP. memberlist refuses a state larger than 20 MB.
 - **memberlist's own log.** Sora logs memberlist's errors and warnings at Error and Warn level, for
   example `memberlist: Decrypt packet failed` from a node with a different `secret_key`.
 
@@ -426,6 +501,13 @@ curl -s -H "Authorization: Bearer $API_KEY" http://127.0.0.1:8080/admin/connecti
 ```
 
 The user's entry shows `local_count` 1 and `total_count` 2 once the gossip has arrived.
+
+**Rate limits and per-IP counts.** At startup each proxy listener that shares its rate limiter
+logs `CLUSTER-LIMITER: initialized cluster rate limiting` with its `protocol`, `sync_blocks` and
+`sync_failure_counts`, and each one that counts `max_connections_per_ip` across the cluster logs
+`Connection limiter: Cluster-wide per-IP limiting enabled`. A block received from another listener
+is logged as `CLUSTER-LIMITER: Applied cluster block for IP`, with the `ip`, the sending `node` and
+`until`, and is listed by `sora-admin stats blocked` on the receiving node.
 
 **Metrics** (see [METRICS.md](METRICS.md)):
 
@@ -467,13 +549,25 @@ them.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `enabled` | bool | `false` | Run the cluster-wide affinity store on this node. The proxies opt in with `enable_affinity`. |
+| `enabled` | bool | `true` | Run the cluster-wide affinity store on this node. The proxies opt in with `enable_affinity`. |
 | `ttl` | duration | `"24h"` | How long an affinity entry lives after it is set. An invalid value logs a warning and uses `24h`. |
 | `cleanup_interval` | duration | `"1h"` | How often expired entries are removed (and the affinity metrics refreshed). An invalid value logs a warning and uses `1h`. |
 | `cache_path` | string | `""` | Path of a SQLite file that keeps affinity entries across restarts. Empty keeps them in memory only. The directory must exist and be writable; if the file cannot be opened Sora logs `Failed to initialize affinity cache - continuing without persistence` and runs without it. A corrupt file is deleted and recreated. |
 
 Durations accept Go units (`"30m"`, `"24h"`) and days (`"7d"`); see
 [CONFIGURATION.md](CONFIGURATION.md).
+
+### `[cluster.rate_limit_sync]`
+
+Sharing of the authentication rate limits of the IMAP, POP3 and ManageSieve proxies (section 6.6).
+It applies only to proxy listeners with `auth_rate_limit` enabled. Each node applies the keys to what
+it sends and to what it accepts; set them the same on every node.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `true` | Share the proxies' rate limiters with the listeners of the same protocol on every node, this one included. The name statistics are always shared while it is on. `false` shares nothing: each listener counts and blocks on its own. |
+| `sync_blocks` | bool | `true` | Send and apply Tier 2 IP blocks. |
+| `sync_failure_counts` | bool | `true` | Send and apply Tier 2 failure counts and progressive delays, from `delay_start_threshold` on, and the successful logins that clear them. |
 
 ### Related `[[server]]` keys
 
@@ -483,6 +577,9 @@ These live in the proxy `[[server]]` blocks and are documented in [PROXY.md](PRO
 - `max_connections_per_user`, `max_connections_per_user_per_ip`: cluster-wide on IMAP, POP3 and
   ManageSieve proxies (section 6.1).
 - `enable_affinity`: use the shared affinity store (section 6.3).
+- `max_connections_per_ip`: cluster-wide on IMAP, POP3 and ManageSieve proxies (section 6.5).
+- `auth_rate_limit`: shared by IMAP, POP3 and ManageSieve proxies as `[cluster.rate_limit_sync]`
+  says (section 6.6); see [AUTHENTICATION.md](AUTHENTICATION.md#10-authentication-rate-limiting).
 
 ### A complete example
 
@@ -515,5 +612,7 @@ On the other nodes only `node_id`, `addr` and `peers` change.
 | [server/gossip.go](../server/gossip.go) | Shared gossip plumbing: bounded transmit queues, priority tiers, duplicate suppression, tombstones for out-of-order removals, the 5-minute staleness rule. |
 | [server/connection_tracker.go](../server/connection_tracker.go) | Per-user connection counts, limits, kicks, "forget logins", heartbeats, state reconciliation. |
 | [server/affinity_manager.go](../server/affinity_manager.go) | Affinity store, its gossip and its optional SQLite persistence ([affinitycache/](../affinitycache/)). |
+| [server/ip_limit_tracker.go](../server/ip_limit_tracker.go) | Per-IP connection counts of the proxies across the cluster, used by [server/connection_limiter.go](../server/connection_limiter.go). |
+| [server/auth_rate_limiter_cluster.go](../server/auth_rate_limiter_cluster.go) | Sharing of the proxies' authentication rate limits (`[cluster.rate_limit_sync]`). |
 | [tlsmanager/](../tlsmanager/) | Uses leadership for Let's Encrypt; see [TLS.md](TLS.md). |
-| [cmd/sora/main.go](../cmd/sora/main.go) | Starts the cluster, the affinity store and the proxy trackers. |
+| [cmd/sora/main.go](../cmd/sora/main.go) | Starts the cluster, the affinity store and the proxy trackers, and passes `[cluster.rate_limit_sync]` to the proxies. |

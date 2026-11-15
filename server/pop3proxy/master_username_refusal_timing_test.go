@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,7 +17,10 @@ import (
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/testutils"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -29,7 +33,7 @@ const testMasterUsername, testMasterPassword = "masteruser", "master-secret"
 // "Authentication failed", whatever it wraps.
 func refuseTwiceAs(t *testing.T, srv *POP3ProxyServer, username, password string) lookupRefusal {
 	t.Helper()
-	limiter := &verdictlessLimiter{}
+	limiter := &successKeyLimiter{}
 	srv.authLimiter = limiter
 
 	var out lookupRefusal
@@ -49,8 +53,26 @@ func refuseTwiceAs(t *testing.T, srv *POP3ProxyServer, username, password string
 		remote.Close()
 	}
 	out.failures = limiter.failures.Load()
+	out.successKeys = strings.Join(limiter.successKeys, ",")
 	_, out.cached = srv.lookupCache.Get(srv.name, username)
 	return out
+}
+
+// successKeyLimiter is verdictlessLimiter that also keeps the key of every success
+// recorded.
+type successKeyLimiter struct {
+	verdictlessLimiter
+	mu          sync.Mutex
+	successKeys []string
+}
+
+func (l *successKeyLimiter) RecordAuthAttemptWithProxy(ctx context.Context, conn net.Conn, proxyInfo *server.ProxyProtocolInfo, key string, success bool) {
+	l.verdictlessLimiter.RecordAuthAttemptWithProxy(ctx, conn, proxyInfo, key, success)
+	if success {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.successKeys = append(l.successKeys, key)
+	}
 }
 
 // TestPOP3ProxyWrongMasterPasswordLooksLikeAnotherSuffix (#801): a wrong password in the
@@ -58,8 +80,9 @@ func refuseTwiceAs(t *testing.T, srv *POP3ProxyServer, username, password string
 // under any other suffix: after one lookup and one password verification, cached, and
 // answered from the cache when repeated. The proxy used to compare the master password
 // and refuse at once, so the response time confirmed a guessed master username. The
-// account's own password does not log in through the master form, but it is refused at
-// the same cost. Verifications are counted, not timed (#782).
+// account's own password logs in through the master form as through any other suffix,
+// its success recorded under the account's key, not the master credential's (#949).
+// Verifications are counted, not timed (#782).
 func TestPOP3ProxyWrongMasterPasswordLooksLikeAnotherSuffix(t *testing.T) {
 	origCost := db.BcryptCost
 	db.BcryptCost = bcrypt.MinCost
@@ -129,11 +152,108 @@ func TestPOP3ProxyWrongMasterPasswordLooksLikeAnotherSuffix(t *testing.T) {
 			if other.verifications != lookup.work || other.lookups != wantLookups || other.cached != wantCached || other.failures != wantFailures {
 				t.Fatalf("wrong password under another suffix: %+v; want work=%v lookups=%d cached=%v failures=%d", other, lookup.work, wantLookups, wantCached, wantFailures)
 			}
-			for _, password := range []string{"wrong-password", "own-password"} {
-				if got := refuse("anna@example.com@"+testMasterUsername, password); got != other {
-					t.Errorf("%q under the master suffix: %+v\nwrong password under another suffix: %+v", password, got, other)
-				}
+			if got := refuse("anna@example.com@"+testMasterUsername, "wrong-password"); got != other {
+				t.Errorf("wrong password under the master suffix: %+v\nunder another suffix: %+v", got, other)
+			}
+
+			// The account's own password, accepted by the lookup service for a known
+			// address, logs in under the master suffix as under any other (#949).
+			own := refuse("anna@example.com@other", "own-password")
+			if lookup.name == "known_address" && own.successKeys != "anna@example.com,anna@example.com" {
+				t.Fatalf("own password under another suffix: %+v; want two successes recorded under the account's key", own)
+			}
+			if got := refuse("anna@example.com@"+testMasterUsername, "own-password"); got != own {
+				t.Errorf("own password under the master suffix: %+v\nunder another suffix: %+v", got, own)
 			}
 		})
+	}
+}
+
+// TestPOP3ProxyMasterFormPasswordsShareTheLookupCache (#949): two passwords log in under
+// the master username form, the master password (a master login) and the account's own,
+// and the lookup cache keeps one entry for the submitted name. The entry either leaves
+// must not refuse the other as a wrong password, in either order: a fresh positive entry
+// answers any other password as a wrong one, which refused support's master login after
+// the account's own login, and the account's own login after a master one. A wrong
+// password is still answered from the account's entry exactly as under another suffix.
+// This proxy dials the backend inside authenticate and drops the entry when that fails,
+// so the entry a login leaves is written here, as the login writes it.
+func TestPOP3ProxyMasterFormPasswordsShareTheLookupCache(t *testing.T) {
+	origCost := db.BcryptCost
+	db.BcryptCost = bcrypt.MinCost
+	t.Cleanup(func() { db.BcryptCost = origCost })
+
+	hash, err := db.GenerateBcryptHash("own-password")
+	if err != nil {
+		t.Fatalf("GenerateBcryptHash: %v", err)
+	}
+	var lookups atomic.Int32
+	lookupSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lookups.Add(1)
+		json.NewEncoder(w).Encode(map[string]string{"address": "anna@example.com", "password_hash": hash})
+	}))
+	defer lookupSrv.Close()
+
+	srv, err := New(context.Background(), "localhost", "127.0.0.1:0", &resilient.ResilientDatabase{}, POP3ProxyServerOptions{
+		Name: "master-form-cache", RemoteAddrs: []string{"127.0.0.1:1"}, ConnectTimeout: time.Second,
+		InsecureAuth:   true,
+		MasterUsername: testMasterUsername,
+		MasterPassword: testMasterPassword,
+		RemoteLookup:   &config.RemoteLookupConfig{Enabled: true, URL: lookupSrv.URL + "/lookup?email=$email", Timeout: "2s"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.Stop()
+	limiter := &successKeyLimiter{}
+	srv.authLimiter = limiter
+	successes := func() int {
+		limiter.mu.Lock()
+		defer limiter.mu.Unlock()
+		return len(limiter.successKeys)
+	}
+
+	// cached writes the entry a successful login of username with password leaves.
+	cached := func(username, password string) {
+		entry := &lookupcache.CacheEntry{
+			PasswordDigest: lookupcache.NewPasswordDigest(password),
+			ActualEmail:    "anna@example.com",
+			Result:         lookupcache.AuthSuccess,
+		}
+		proxy.CacheRoute(entry, &proxy.UserRoutingInfo{AccountID: 1, IsRemoteLookupAccount: true})
+		srv.lookupCache.Set(srv.name, username, entry)
+	}
+	// login reports whether the login authenticated: a success recorded, whatever happens
+	// after it (the backend is not reachable here).
+	login := func(username, password string) (bool, error) {
+		before := successes()
+		client, remote := net.Pipe()
+		defer client.Close()
+		defer remote.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		err := (&POP3ProxySession{server: srv, clientConn: remote, listenerConn: remote, ctx: ctx, cancel: cancel}).authenticate(username, password)
+		return successes() > before, err
+	}
+
+	masterForm := "anna@example.com@" + testMasterUsername
+	for _, order := range [][2]string{{"own-password", testMasterPassword}, {testMasterPassword, "own-password"}} {
+		cached(masterForm, order[0])
+		if ok, err := login(masterForm, order[1]); !ok {
+			t.Errorf("%q, then %q under the master suffix: %q refused: %v", order[0], order[1], order[1], err)
+		}
+	}
+
+	// After the account's own login, a wrong password is answered from its entry without a
+	// lookup under the master suffix exactly as under another one.
+	for _, username := range []string{"anna@example.com@other", masterForm} {
+		cached(username, "own-password")
+		before := lookups.Load()
+		if ok, err := login(username, "wrong-password"); ok || !errors.Is(err, consts.ErrAuthenticationFailed) {
+			t.Errorf("%s with a wrong password: %v, want %v", username, err, consts.ErrAuthenticationFailed)
+		}
+		if n := lookups.Load() - before; n != 0 {
+			t.Errorf("%s: a wrong password after the account's own login reached the lookup service %d times, want 0 (answered from the cache)", username, n)
+		}
 	}
 }

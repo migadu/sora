@@ -34,7 +34,7 @@ func (s *LMTPSession) XCLIENT(session smtp.Session, attrs map[string]string) err
 		return &smtp.SMTPError{Code: 501, EnhancedCode: smtp.EnhancedCode{5, 5, 4}, Message: "Invalid XCLIENT attributes"}
 	}
 
-	s.DebugLog("processed xclient attributes", "client_ip", s.ForwardingParams.OriginatingIP, "client_port", s.ForwardingParams.OriginatingPort, "protocol", s.ForwardingParams.Protocol, "helo", s.ForwardingParams.HELO, "login", s.ForwardingParams.Login)
+	s.DebugLog("processed xclient attributes", "client_ip", s.ForwardingParams.OriginatingIP, "client_port", s.ForwardingParams.OriginatingPort, "xclient_proto", s.ForwardingParams.Protocol, "helo", s.ForwardingParams.HELO, "login", s.ForwardingParams.Login)
 
 	return nil
 }
@@ -215,7 +215,7 @@ func (s *LMTPSession) ParseRCPTForward(rcptOptions *smtp.RcptOptions) {
 		// Don't update s.RemoteIP for XRCPTFORWARD, unlike XCLIENT
 		// XRCPTFORWARD is per-recipient forwarding, not session-level IP forwarding
 
-		s.InfoLog("xrcptforward set proxy information", "proxy", proxyIP)
+		s.InfoLog("xrcptforward set proxy information", "forwarded_proxy", proxyIP)
 	}
 
 	s.InfoLog("processed xrcptforward parameters", "variables_count", len(forwardParams.Variables))

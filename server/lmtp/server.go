@@ -29,6 +29,12 @@ import (
 // DefaultMaxMessageSize is the default maximum message size for LMTP (50MB)
 const DefaultMaxMessageSize = 50 * 1024 * 1024
 
+// DefaultDataTimeout bounds one message's content transfer (DATA body or BDAT
+// chunk). The idle timeout applies to each read within it, so a sender that keeps
+// sending is not cut off by the idle timeout; this only stops one that trickles a
+// message in. An hour lets the default 50 MiB message arrive at about 15 KB/s.
+const DefaultDataTimeout = time.Hour
+
 // defaultLMTPMaxConnections bounds total concurrent LMTP connections when the operator
 // leaves max_connections unset. Generous enough not to throttle legitimate burst delivery
 // from internal MTAs, but finite so a single trusted source cannot exhaust resources.
@@ -179,6 +185,15 @@ type reloadableSettings struct {
 	debug          bool
 }
 
+// messageSizeLimit is the largest message accepted: max_message_size, or
+// DefaultMaxMessageSize when it is unset or zero.
+func (s *reloadableSettings) messageSizeLimit() int64 {
+	if s.maxMessageSize > 0 {
+		return s.maxMessageSize
+	}
+	return DefaultMaxMessageSize
+}
+
 type LMTPServerBackend struct {
 	addr     string
 	name     string
@@ -191,6 +206,7 @@ type LMTPServerBackend struct {
 	uploader     *uploader.UploadWorker
 	server       *smtp.Server
 	appCtx       context.Context
+	cancel       context.CancelFunc
 	tlsConfig    *tls.Config
 	ftsRetention time.Duration
 	relayQueue   delivery.RelayQueue // Disk-based queue for relay retry
@@ -204,7 +220,8 @@ type LMTPServerBackend struct {
 	maxRedirectHops    int
 
 	// sharedMailboxes is [shared_mailboxes]: Sieve fileinto :create never makes a
-	// personal mailbox in its namespace.
+	// personal mailbox in its namespace, and neither a fileinto nor Sieve
+	// mailboxexists resolves its root (delivery.FileintoTarget).
 	sharedMailboxes config.SharedMailboxesConfig
 
 	// Per-command hard execution timeouts (nil = use defaults)
@@ -279,7 +296,8 @@ type LMTPServerOptions struct {
 	MaxRedirectHops             int
 	SharedMailboxes             config.SharedMailboxesConfig // [shared_mailboxes]; Sieve fileinto :create makes no personal mailbox in its namespace
 	CommandTimeoutOverrides     map[string]time.Duration     // Per-command hard execution timeouts (overrides defaults)
-	IdleTimeout                 time.Duration                // Maximum idle time between commands (0 = default 5m); enforced by go-smtp with a 421 notice
+	IdleTimeout                 time.Duration                // Maximum wait for the next command or for more message content (0 = default 5m); enforced by go-smtp
+	DataTimeout                 time.Duration                // Maximum time to receive one DATA body or BDAT chunk (0 = DefaultDataTimeout)
 }
 
 func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
@@ -310,10 +328,19 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		options.TLSUseStartTLS = false
 	}
 
+	serverCtx, serverCancel := context.WithCancel(appCtx)
+	created := false
+	defer func() {
+		if !created {
+			serverCancel()
+		}
+	}()
+
 	backend := &LMTPServerBackend{
 		addr:               addr,
 		name:               name,
-		appCtx:             appCtx,
+		appCtx:             serverCtx,
+		cancel:             serverCancel,
 		hostname:           hostname,
 		instanceID:         instanceIDOrHostname(options.InstanceID, hostname),
 		maintenanceGate:    options.MaintenanceGate,
@@ -395,7 +422,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// context: go-smtp cancels the derived context when the client disconnects,
 	// the connection ends, or the server shuts down, and BaseContext adds app
 	// shutdown on top. Sessions derive their context from it in NewSession.
-	s.BaseContext = func(net.Listener) context.Context { return appCtx }
+	s.BaseContext = func(net.Listener) context.Context { return serverCtx }
 	s.AllowInsecureAuth = options.InsecureAuth
 	s.LMTP = true
 	s.MaxRecipients = 1 // Enforce single recipient per LMTP transaction.
@@ -403,15 +430,32 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// This makes the behavior explicit and advertises LIMITS RCPTMAX=1 in LHLO,
 	// so the MTA sends each recipient in a separate transaction.
 
+	// The message size limit, asked for at every use so a reload of max_message_size
+	// applies: LHLO advertises it as "SIZE <n>", MAIL refuses a larger SIZE= declaration
+	// with 552 5.3.4 before any body is sent (RFC 1870 sections 4 and 6.1), and the DATA
+	// reader stops at it (Data still checks its own copy of the settings).
+	s.MaxMessageBytesFunc = func() int64 { return backend.settings.Load().messageSizeLimit() }
+
 	// Bound idle/slow connections so a held connection cannot pin a goroutine
 	// indefinitely (slowloris). Generous values: legit transactions finish in
 	// seconds. go-smtp is the single idle owner (it writes the 421 4.4.2
-	// notice); its hook below is the only place LMTP timeout disconnects are
+	// notice, and closes the connection after a timeout during message
+	// content); its hook below is the only place LMTP timeout disconnects are
 	// counted — do NOT add a SoraConn idle checker on top (two owners of the
 	// same timer race each other and can duplicate the notice).
+	//
+	// ReadTimeout bounds each wait for input, also during DATA and BDAT
+	// content (the model RFC 5321 section 4.5.3.2 gives the sending side: "a
+	// timer is set ... for each buffer of the data transfer"), so a large
+	// message on a slow link is not cut off after 5 minutes. DataTimeout
+	// bounds one DATA body or one BDAT chunk as a whole.
 	s.ReadTimeout = 5 * time.Minute
 	if options.IdleTimeout > 0 {
 		s.ReadTimeout = options.IdleTimeout
+	}
+	s.DataTimeout = DefaultDataTimeout
+	if options.DataTimeout > 0 {
+		s.DataTimeout = options.DataTimeout
 	}
 	s.WriteTimeout = 2 * time.Minute
 	s.OnTimeout = func() {
@@ -479,7 +523,8 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	}
 
 	// Start connection limiter cleanup
-	backend.limiter.StartCleanup(appCtx)
+	backend.limiter.StartCleanup(serverCtx)
+	created = true
 
 	return backend, nil
 }
@@ -587,6 +632,10 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 }
 
 func (b *LMTPServerBackend) Start(errChan chan error) {
+	if b.appCtx.Err() != nil {
+		return
+	}
+
 	var listener net.Listener
 	var err error
 
@@ -596,6 +645,9 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	// Create base TCP listener with custom backlog
 	tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", b.server.Addr, b.listenBacklog)
 	if err != nil {
+		if b.cancel != nil {
+			b.cancel()
+		}
 		errChan <- fmt.Errorf("failed to create listener: %w", err)
 		return
 	}
@@ -684,6 +736,9 @@ func (b *LMTPServerBackend) ReloadConfig(cfg config.ServerConfig) error {
 }
 
 func (b *LMTPServerBackend) Close() error {
+	if b.cancel != nil {
+		b.cancel()
+	}
 	if b.server != nil {
 		return b.server.Close()
 	}

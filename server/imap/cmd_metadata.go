@@ -18,9 +18,24 @@ func (s *IMAPSession) GetMetadata(ctx context.Context, mailbox string, entries [
 	if err := s.requireCapability(imap.CapMetadata, "GETMETADATA"); err != nil {
 		return nil, err
 	}
+	if len(entries) == 0 {
+		return nil, emptyMetadataEntryList("GETMETADATA")
+	}
 	ctx = s.pinnedContext(ctx)
 
 	s.DebugLog("GETMETADATA command", "mailbox", mailbox, "entries", entries)
+
+	// Canonicalise (case-fold) and validate entry names first: RFC 5464 §3.2
+	// makes entry names case-insensitive and requires BAD for invalid entry
+	// names in any IMAP command, before rejecting wildcard mailbox names with NO.
+	canonEntries := make([]string, len(entries))
+	for i, entry := range entries {
+		canonEntries[i] = canonicalMetadataEntry(entry)
+		if err := validateMetadataEntry(canonEntries[i]); err != nil {
+			return nil, err
+		}
+	}
+	entries = canonEntries
 
 	// RFC 5464 does not support wildcard mailbox names in GETMETADATA
 	// SnappyMail webmail incorrectly sends "*" as the mailbox parameter
@@ -33,17 +48,6 @@ func (s *IMAPSession) GetMetadata(ctx context.Context, mailbox string, entries [
 			Text: "GETMETADATA does not support wildcard mailbox names. Use empty string \"\" for server metadata or a specific mailbox name.",
 		}
 	}
-
-	// Canonicalise (case-fold) and validate entry names. RFC 5464 §3.2 makes
-	// entry names case-insensitive, so we query using the canonical form.
-	canonEntries := make([]string, len(entries))
-	for i, entry := range entries {
-		canonEntries[i] = canonicalMetadataEntry(entry)
-		if err := validateMetadataEntry(canonEntries[i]); err != nil {
-			return nil, err
-		}
-	}
-	entries = canonEntries
 
 	var mailboxID *int64
 	var mailboxName string
@@ -121,17 +125,29 @@ func (s *IMAPSession) SetMetadata(ctx context.Context, mailbox string, entries m
 	if err := s.requireCapability(imap.CapMetadata, "SETMETADATA"); err != nil {
 		return err
 	}
+	if len(entries) == 0 {
+		return emptyMetadataEntryList("SETMETADATA")
+	}
 	ctx = s.pinnedContext(ctx)
 
 	// Canonicalise (case-fold) entry names first so the case-insensitivity rule
 	// (RFC 5464 §3.2) is honoured for storage AND for the /private-vs-/shared
 	// scope classification below — otherwise a /SHARED/... spelling would be
 	// misclassified as private and skip the shared-scope 'w' ACL check.
+	//
+	// go-imap passes the entries as a map keyed by the names as sent, so two
+	// spellings of one entry (/private/A and /private/a) arrive as two keys in
+	// no particular order. Keeping either would make the stored value depend
+	// on map iteration order, so the command is refused instead. (The same
+	// spelling twice never gets here: go-imap keeps the later value.)
 	canonEntries := make(map[string]*[]byte, len(entries))
 	for entryName, entryValue := range entries {
 		canonName := canonicalMetadataEntry(entryName)
 		if err := validateMetadataEntry(canonName); err != nil {
 			return err
+		}
+		if _, dup := canonEntries[canonName]; dup {
+			return invalidMetadataEntry(fmt.Sprintf("metadata entry %q is named more than once (entry names are case-insensitive)", canonName))
 		}
 		canonEntries[canonName] = entryValue
 	}
@@ -300,4 +316,14 @@ func invalidMetadataEntry(text string) error {
 		Code: imap.ResponseCodeClientBug,
 		Text: text,
 	}
+}
+
+// emptyMetadataEntryList refuses a GETMETADATA or SETMETADATA whose entry
+// list is "()". RFC 5464 §5 gives both lists at least one entry ("entries =
+// entry / "(" entry *(SP entry) ")"", "entry-values = "(" entry-value *(SP
+// entry-value) ")""), and §4.2/§4.3 answer "BAD - command unknown or arguments
+// invalid". go-imap's list parser accepts "()" and passes no entries, so the
+// handlers refuse it first, before any mailbox lookup or ACL check.
+func emptyMetadataEntryList(command string) error {
+	return invalidMetadataEntry(command + " requires at least one metadata entry")
 }

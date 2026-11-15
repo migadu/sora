@@ -104,7 +104,9 @@ password change drops the account's cached logins.
 
 The HTTP server's limits are fixed: 10 seconds for the request headers, 30 seconds to read
 the request, 30 seconds to write the response (this bounds a `/raw` download), 120 seconds for
-an idle keep-alive connection, and 15 seconds to finish open requests at shutdown.
+an idle keep-alive connection, and 15 seconds to finish open requests at shutdown. A login the
+rate limit delays has its 30 seconds to write from the end of the delay
+([AUTHENTICATION.md](AUTHENTICATION.md#103-progressive-delays) section 10.3).
 
 **Reload.** On SIGHUP, `jwt_secret`, `allowed_origins` and `allowed_hosts` are re-read. A
 changed `jwt_secret` makes every token signed with the old one invalid at once. An empty
@@ -260,7 +262,7 @@ header listing the methods it does serve; a path no endpoint has is
 | 201 | Mailbox created. |
 | 400 | Bad request: bad JSON, a missing or invalid field or parameter, a script that does not compile. |
 | 401 | No, bad or expired token; failed login. |
-| 403 | Client address not in `allowed_hosts`; deleting `INBOX`; or changing flags or deleting a message in a shared mailbox without the right. |
+| 403 | Client address not in `allowed_hosts`; creating a mailbox in the shared namespace; deleting `INBOX`; or deleting a shared mailbox, changing flags or deleting a message in one without the right. |
 | 404 | Mailbox, message or script not found, or no endpoint has the path. |
 | 405 | Wrong method for the path; `Allow` lists the methods it serves. |
 | 409 | Mailbox already exists, or has child mailboxes. |
@@ -351,13 +353,17 @@ mailboxes.
 {"name": "Projects/Acme"}
 ```
 
-Missing parent mailboxes are created too. A trailing `/` is removed.
+Missing parent mailboxes are created too. A trailing `/` is removed. The User API does not
+create shared mailboxes: with `[shared_mailboxes]` enabled, a name in the shared namespace
+(with the default prefix, `Shared` or any name under `Shared/`, in any letter case) is refused
+with 403. Create those over IMAP or with `sora-admin mailbox create`.
 
 Response `201 {"message":"Mailbox created successfully","name":"Projects/Acme"}`.
 
 | Status | Body `error` |
 |---|---|
 | 400 | `Invalid request body`, `Mailbox name is required`, `mailbox name contains invalid characters` (NUL, CR or LF), `mailbox name too long (max 255 characters)`, `Invalid mailbox name` |
+| 403 | `Mailboxes in the shared namespace cannot be created through the User API` |
 | 409 | `Mailbox already exists` |
 | 500 | `Failed to create mailbox` |
 
@@ -375,10 +381,10 @@ Response `200 {"message":"Mailbox deleted successfully","name":"Projects/Acme"}`
 | Status | Body `error` |
 |---|---|
 | 400 | `Invalid mailbox name` |
-| 403 | `Cannot delete INBOX` |
+| 403 | `Cannot delete INBOX`; `Not permitted to delete this mailbox` (a shared mailbox without the `x` right) |
 | 404 | `Mailbox not found` |
 | 409 | `Mailbox has child mailboxes; delete them first` |
-| 500 | `Failed to delete mailbox` (also for a shared mailbox without the delete right) |
+| 500 | `Failed to delete mailbox` |
 
 ### 6.4 Subscribe and unsubscribe
 
@@ -411,7 +417,7 @@ right to read a message, the write and delete rights to change its flags.
 |---|---|---|
 | `limit` | `50` | Messages per page. At least 1. Values above 1000 are lowered to 1000. |
 | `offset` | `0` | How many to skip. |
-| `unseen` | `false` | `true`: only messages without `\Seen`. |
+| `unseen` | `false` | `true`: only messages without `\Seen`, including messages with no stored flags. |
 
 Newest arrival first (by `internal_date`).
 
@@ -556,10 +562,11 @@ its results, and all supplied filters must match:
 |---|---|
 | `from` | Literal substring of any sender's address or display name, ignoring case. |
 | `subject` | Literal substring of the subject, ignoring case. |
-| `unseen=true` | Only messages without `\\Seen`, including messages with no stored flags. |
+| `unseen=true` | Only messages without `\Seen`, including messages with no stored flags. |
 
 The text filters have no wildcard syntax. A `q`, `from` or `subject` containing a NUL or
-invalid UTF-8 is refused with `400 Bad Request`.
+invalid UTF-8 is refused with `400 Bad Request`, and so is one longer than 1000 bytes, the
+length IMAP `SEARCH` allows one search term ([SEARCH.md](SEARCH.md#9-limits)).
 
 Response `200`:
 
@@ -583,7 +590,7 @@ Response `200`:
 
 | Status | Body `error` |
 |---|---|
-| 400 | `Invalid mailbox name`, `Search query parameter 'q' is required`, `Search query parameter 'q' must be UTF-8 text without NUL`, `Search filters 'from' and 'subject' must be UTF-8 text without NUL` |
+| 400 | `Invalid mailbox name`, `Search query parameter 'q' is required`, `Search query parameter 'q' must be UTF-8 text without NUL`, `Search query parameter 'q' must be at most 1000 bytes`, `Search filters 'from' and 'subject' must be UTF-8 text without NUL`, `Search filters 'from' and 'subject' must be at most 1000 bytes each` |
 | 404 | `Mailbox not found` (also a shared mailbox without `r`) |
 | 500 | `Failed to search messages` |
 
@@ -722,7 +729,7 @@ return messages in this shape:
 | `subject` | The decoded `Subject`. |
 | `from` | The first `From` address, address only (no display name). |
 | `to`, `cc`, `bcc` | Addresses only. `cc` is filled in lists, search results and `GET /user/messages/{id}`; `bcc` only in lists. `to` is always present (`[]` when the message has none); empty `cc` and `bcc` are left out. |
-| `date` | The message's `Date` header, as stored. |
+| `date` | The message's `Date` header; its `internal_date` when it has none that parses. |
 | `internal_date` | When the message arrived in Sora. |
 | `size` | Bytes. |
 | `flags` | System flags. `[]` when there are none. |
@@ -892,8 +899,8 @@ call the API through the proxy.
 each is reported with a startup warning. Affinity is
 used when the block sets `enable_affinity = true` and the cluster runs its affinity store
 (`[cluster.affinity] enabled = true`). The proxy's HTTP
-limits are fixed: 30 seconds to read a request and 30 seconds to write a response, 120 seconds
-for an idle connection.
+limits are fixed: 30 seconds to read a request and 30 seconds to write a response (from the end
+of the delay for a login the proxy's rate limit delays), 120 seconds for an idle connection.
 
 The Admin API shows the proxy's backends under the name `UserAPI-{name}` at
 `GET /admin/proxy/backends` (see [ADMIN_API.md](ADMIN_API.md#13-proxy-backends-and-affinity)).

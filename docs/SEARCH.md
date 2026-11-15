@@ -436,6 +436,11 @@ The client sees only the generic text. Sora logs the exact reason at debug level
 `sora_protocol_errors_total{error_type="criteria_rejected"}`, with `severity="server_limit"` for
 the first table and `severity="client_error"` for the second.
 
+The User API search holds `q`, `from` and `subject` to the same 1000 bytes each. Above it the
+request is answered `400 Bad Request` with an error that names the parameter and the bound
+([USER_API.md](USER_API.md#8-search)); that refusal is not an IMAP criteria refusal and is
+neither logged as one nor counted in `criteria_rejected`.
+
 ### Result caps
 
 | Command | Cap | Answer above the cap |

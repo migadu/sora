@@ -17,6 +17,10 @@ import (
 func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName string) (*imap.CopyData, error) {
 	ctx = s.pinnedContext(ctx)
 
+	// The client's numbering holds still while its numbers are resolved (seqViewMu).
+	s.seqViewMu.RLock()
+	defer s.seqViewMu.RUnlock()
+
 	// First phase: Read session state with read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
@@ -40,10 +44,13 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	selectedMailboxID := s.selectedMailbox.ID
 	selectedMailboxName := s.selectedMailbox.Name
 	AccountID := s.AccountID()
+	view := s.seqViewLocked()
+	decodedNumSet := s.decodeNumSetLocked(view, numSet)
 	release()
 
-	// Use decoded numSet - this safely acquires its own read lock
-	decodedNumSet := s.decodeNumSet(numSet)
+	if imapErr := s.sharedRootDestinationRefusal("COPY", mboxName); imapErr != nil {
+		return nil, imapErr
+	}
 
 	// Middle phase: Database operations outside lock
 	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, mboxName)
@@ -76,7 +83,7 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	}
 
 	// Get the messages to determine their UIDs
-	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet)
+	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(view.context(ctx), selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return nil, s.internalError("failed to retrieve messages for copy: %v", err)
 	}
@@ -165,7 +172,7 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	}
 
 	// Perform the batch copy operation
-	uidMap, newMessageIDs, err := s.server.rdb.CopyMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname, sourceHashes, destHashes, ensureDestObject)
+	uidMap, newMessageIDs, err := s.server.rdb.CopyMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.instanceID, sourceHashes, destHashes, ensureDestObject)
 	if err != nil {
 		var destErr *resilient.DestObjectError
 		switch {
@@ -279,7 +286,7 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 // command read the message (a read racing the upload, or a lagging replica). The caller
 // then handles the body as an uploaded one, in S3.
 func (s *IMAPSession) stageCrossAccountBody(command, contentHash string, srcAccountID, destAccountID int64) (bool, *imap.Error) {
-	err := helpers.LinkOrCopyFile(s.server.uploader.FilePath(contentHash, srcAccountID), s.server.uploader.FilePath(contentHash, destAccountID))
+	err := s.server.uploader.LinkStaged(contentHash, srcAccountID, destAccountID)
 	if err == nil {
 		return true, nil
 	}

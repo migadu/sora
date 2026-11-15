@@ -95,7 +95,8 @@ Sora starts in this order. A failure in any step ends the process with status 1,
    - Two `[[server]]` blocks may not share a `name` or an `addr`.
    - At least one `[[server]]` block must exist.
    - A server that queries the database needs a `[database.write]` host (step 9.2 says which do).
-   - A node that uses S3 needs `[s3] bucket` and `endpoint`, and a `timeout` that parses.
+   - A node that uses S3 needs `[s3] bucket` and `endpoint`, a `timeout` that parses, `access_key`
+     and `secret_key` both set or both empty, and with `encrypt = true` a valid `encryption_key`.
    - With `[cluster] enabled = true`, `addr` must be a specific IP address with a port memberlist can
      bind, and `secret_key` the base64 of 32 bytes ([CLUSTER.md](CLUSTER.md)).
    - The other checks of [CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup), such as
@@ -309,6 +310,11 @@ changed, each with a line `Config reload: <section> changed but requires restart
 - `[database]`, `[s3]`, `[local_cache]`, `[uploader]`, `[relay]`, `[cluster]`, `[tls]`,
   `[auth_cache]`, `[[pool]]`, `[spam_training]`, `[timeout_scheduler]` and `bcrypt_cost`
 
+Sora also checks the new file as startup does (the checks `sora-admin config validate` runs) and logs
+an error for each problem it finds, `Config reload: <section> is invalid and the server will not
+start with this config`, with the reason in `error`. Fix these before the next restart, which
+would refuse the file.
+
 TLS certificates are never reloaded by SIGHUP. Certificate files (`[tls] cert_file`/`key_file` and
 per-server `tls_cert_file`/`tls_key_file`) are read once, at startup, so a renewed certificate needs
 a restart. Certificates from Let's Encrypt renew inside the running process
@@ -374,8 +380,9 @@ A restart, planned or not, **loses**:
   LMTP transactions without a final answer are retried by the MTA. ManageSieve sessions are short and
   lose nothing that was saved.
 - **In-memory state:** login lookup caches, auth rate-limit counters and blocks, search rate limits,
-  connection counts. In a cluster, the other nodes keep the per-user proxy connection counts
-  ([CLUSTER.md](CLUSTER.md)).
+  connection counts. In a cluster, the other nodes keep the per-user and per-IP proxy connection
+  counts, which the restarted node gets back from them, and the proxies' rate-limit blocks and
+  counts, which that state exchange does not restore ([CLUSTER.md](CLUSTER.md#a-node-comes-back)).
 - **Proxy affinity** held in this node's memory, unless `[cluster.affinity] cache_path` is set.
 - **Uploads and relay deliveries in flight.** They are retried after the start.
 

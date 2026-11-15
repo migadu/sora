@@ -11,8 +11,8 @@ import (
 )
 
 // startPlainSession runs a session of a plaintext proxy over a pipe and returns
-// the client end with the greeting read.
-func startPlainSession(t *testing.T) (net.Conn, *bufio.Reader) {
+// it with the client end, the greeting read.
+func startPlainSession(t *testing.T) (*Session, net.Conn, *bufio.Reader) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -41,7 +41,7 @@ func startPlainSession(t *testing.T) (net.Conn, *bufio.Reader) {
 	if line := readReply(t, reader); !strings.HasPrefix(line, "220 ") {
 		t.Fatalf("greeting = %q", line)
 	}
-	return client, reader
+	return sess, client, reader
 }
 
 // The proxy answers the commands it does not relay the way the LMTP backend
@@ -77,7 +77,7 @@ func TestLMTPProxyRepliesToUnhandledCommands(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.command, func(t *testing.T) {
-			conn, r := startPlainSession(t)
+			_, conn, r := startPlainSession(t)
 			io.WriteString(conn, tt.command+"\r\n")
 			if line := readReply(t, r); !strings.HasPrefix(line, tt.want) {
 				t.Errorf("%s: %q, want %q...", tt.command, line, tt.want)
