@@ -487,8 +487,11 @@ Sora checks the pools at startup and refuses to start when:
 - An affinity that points outside the user's current pool is deleted and the user is routed
   afresh. This is how a user the API moves to another pool lands there. An affinity of another
   protocol outside the pool is skipped, not deleted.
-- The LMTP proxy holds one backend connection per session. A recipient whose pool or backend differs
-  from the held connection's gets `451 4.3.0`, so the sending MTA retries it in a new transaction.
+- The LMTP proxy holds one backend connection per session, across transactions. Until a recipient
+  of a transaction is accepted, each recipient is routed as on a fresh connection: if its pool or
+  backend differs from the held connection's, that connection is dropped and the proxy connects to
+  the recipient's backend. After that, a recipient of the same transaction that needs another pool
+  or backend gets `451 4.3.0`, so the sending MTA retries it in a new transaction.
 
 Each routing decision on a proxy with pools increments
 `sora_proxy_pool_route_total{protocol, pool, result}`, where `result` is `routed`,
@@ -1038,8 +1041,10 @@ Notes:
   of maintenance, because it cannot be sure. A recipient the remote lookup does not know gets the
   same reply whether the answer is fresh or comes from the lookup cache: `550 5.1.1`, or `450 4.1.1`
   with `user_not_found_response = "tempfail"`.
-- An LMTP recipient that needs another backend or pool than the session's held connection gets
+- An LMTP recipient that needs another backend or pool than the one holding an already accepted
+  recipient of the same transaction gets
   `451 4.3.0 Recipient requires different backend server, start new transaction` (or `... pool ...`).
+  While the transaction has no accepted recipient, the held connection is replaced instead.
 
 ---
 
