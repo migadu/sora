@@ -387,6 +387,14 @@ func TestNotifyOwnTreeChanges(t *testing.T) {
 			}),
 		},
 		{
+			// Another user's shared namespace root, which the user cannot see.
+			name: "CREATE below a level the snapshot does not show",
+			own:  func(w *notifyWatch) { w.ownCreated("Shared/Team/Sub") },
+			cur: with(func(s snap) {
+				s[10] = notifySnapshotEntry{name: "Shared/Team/Sub"}
+			}),
+		},
+		{
 			name: "CREATE under an existing mailbox",
 			own:  func(w *notifyWatch) { w.ownCreated("Old/New") },
 			cur:  with(func(s snap) { s[10] = notifySnapshotEntry{name: "Old/New"} }),

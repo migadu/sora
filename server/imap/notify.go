@@ -72,6 +72,10 @@ type notifySnapshotEntry struct {
 	name        string
 	uidValidity uint32
 	subscribed  bool
+	// superior marks the placeholder of a superior name of a mailbox the
+	// client created (ownCreated), which the account snapshot may never
+	// show (resolveOwnCreated).
+	superior bool
 }
 
 // notifyWatch is the per-session NOTIFY state installed by SetNotify. After
@@ -429,7 +433,7 @@ func (watch *notifyWatch) ownCreated(name string) {
 		level := strings.Join(levels[:i+1], delim)
 		if !watch.snapshotHas(level) {
 			watch.ownTree.placeholder--
-			watch.snapshot[watch.ownTree.placeholder] = notifySnapshotEntry{name: level}
+			watch.snapshot[watch.ownTree.placeholder] = notifySnapshotEntry{name: level, superior: i < len(levels)-1}
 		}
 	}
 }
@@ -486,18 +490,25 @@ func (watch *notifyWatch) snapshotHas(name string) bool {
 // prev was read (ownCreated) the ID that a mailbox of its name, new to prev, has
 // in cur, along with cur's entry, so the diff does not report it. One that cur
 // lacks, which someone else has deleted or renamed since, keeps its placeholder
-// ID, so the diff reports it gone.
+// ID, so the diff reports it gone. A superior name that cur lacks is dropped
+// instead: the snapshot shows only mailboxes the user has the 'l' right on, so
+// it may never have shown that level, such as another user's shared namespace
+// root above the shared mailbox the client created in, which did not change.
 func resolveOwnCreated(prev, cur map[int64]notifySnapshotEntry) {
 	for id, own := range prev {
 		if id >= 0 {
 			continue
 		}
+		resolved := false
 		for curID, entry := range cur {
 			if _, known := prev[curID]; !known && strings.EqualFold(entry.name, own.name) {
-				delete(prev, id)
 				prev[curID] = entry
+				resolved = true
 				break
 			}
+		}
+		if resolved || own.superior {
+			delete(prev, id)
 		}
 	}
 }
