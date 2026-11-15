@@ -179,14 +179,6 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					}
 					duration := time.Since(authStart)
 
-					// Log authentication with alias detection
-					loginAddr := address.BaseAddress()
-					if loginAddr != primaryAddr.FullAddress() {
-						s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-					} else {
-						s.InfoLog("authentication successful", "address", loginAddr, "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-					}
-
 					metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
 
@@ -194,6 +186,15 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// If session closes between counter increments and user state setting, cleanup won't decrement
 					s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
 					s.Session.User = &s.IMAPUser.User
+
+					// Log authentication with alias detection, once the session's user and
+					// account_id fields name the account
+					loginAddr := address.BaseAddress()
+					if loginAddr != primaryAddr.FullAddress() {
+						s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+					} else {
+						s.InfoLog("authentication successful", "address", loginAddr, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+					}
 
 					// Register connection for tracking
 					if err := s.registerConnection(address.BaseAddress()); err != nil {
@@ -328,14 +329,6 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					}
 					duration := time.Since(authStart)
 
-					// Log authentication with alias detection
-					loginAddr := address.BaseAddress()
-					if loginAddr != primaryAddr.FullAddress() {
-						s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-					} else {
-						s.InfoLog("authentication successful", "address", loginAddr, "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-					}
-
 					metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
 
@@ -343,6 +336,15 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// If session closes between counter increments and user state setting, cleanup won't decrement
 					s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
 					s.Session.User = &s.IMAPUser.User
+
+					// Log authentication with alias detection, once the session's user and
+					// account_id fields name the account
+					loginAddr := address.BaseAddress()
+					if loginAddr != primaryAddr.FullAddress() {
+						s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+					} else {
+						s.InfoLog("authentication successful", "address", loginAddr, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+					}
 
 					// Register connection for tracking
 					if err := s.registerConnection(address.BaseAddress()); err != nil {
