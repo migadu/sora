@@ -27,8 +27,9 @@ func authFailedError() *imap.Error {
 // refusedInMaintenance answers a login the maintenance gate refused, after the credentials
 // checked out: a temporary failure, so the client (or the proxy, which answers its own
 // client the same way) tries again, by when the proxies route it to another backend.
-func (s *IMAPSession) refusedInMaintenance() *imap.Error {
-	s.InfoLog("login refused: this backend is in maintenance")
+// address names the account, which the session's user field does not yet.
+func (s *IMAPSession) refusedInMaintenance(address string) *imap.Error {
+	s.InfoLog("login refused: this backend is in maintenance", "address", address)
 	return &imap.Error{
 		Type: imap.StatusResponseTypeNo,
 		Code: imap.ResponseCodeUnavailable,
@@ -304,7 +305,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 	// password check, which confirmed the master SASL username. Not recorded as a
 	// failure: the credentials were right.
 	if authzid != "" && authzid != address {
-		s.DebugLog("proxy login not allowed for non-master users", "username", address, "identity", authzid)
+		s.InfoLog("authorization failed", "address", addressParsed.BaseAddress(), "authzid", authzid, "method", method)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeAuthorizationFailed,
@@ -325,7 +326,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 	}
 
 	if !s.server.maintenanceGate.Admit(&s.server.authenticatedConnections, "imap") {
-		return s.refusedInMaintenance()
+		return s.refusedInMaintenance(addressParsed.BaseAddress())
 	}
 	duration := time.Since(authStart)
 

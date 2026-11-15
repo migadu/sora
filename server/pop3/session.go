@@ -495,7 +495,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		// a password check, which confirmed the master SASL username. Not recorded as
 		// a failure: the credentials were right.
 		if identity != "" && identity != username {
-			s.DebugLog("proxy authentication requires master credentials", "username", username, "identity", identity)
+			s.InfoLog("authorization failed", "address", userAddress.BaseAddress(), "authzid", identity, "method", method)
 			return 0, pop3AuthError("Proxy authentication requires master credentials")
 		}
 		authSuccess = true
@@ -509,8 +509,10 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	}
 
 	// Ensure default mailboxes exist
+	// The credentials checked out, so a failure from here on is the login's result: logged
+	// with the address, which the session's user field does not name yet.
 	if err := s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, accountID); err != nil {
-		s.DebugLog("error creating default mailboxes", "error", err)
+		s.WarnLog("error creating default mailboxes", "address", userAddress.BaseAddress(), "method", method, "error", err)
 		return 0, errTempUnavailable
 	}
 
@@ -518,7 +520,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	readCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
 	inboxMailboxID, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, accountID, consts.MailboxInbox)
 	if err != nil {
-		s.DebugLog("error getting inbox", "error", err)
+		s.WarnLog("error getting inbox", "address", userAddress.BaseAddress(), "method", method, "error", err)
 		return 0, errTempUnavailable
 	}
 

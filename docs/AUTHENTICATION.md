@@ -398,8 +398,8 @@ AUTHENTICATE PLAIN base64("user@example.com" NUL "proxyuser" NUL "proxy-secret")
 - A client that does not use the master SASL username, and sends an authorization identity that
   differs from its authentication identity, is refused: `NO [AUTHORIZATIONFAILED] Proxy login not permitted for this user.`
   (IMAP), `-ERR [AUTH] Proxy authentication requires master credentials` (POP3), `NO "Proxy
-  authentication requires master_sasl_username and master_sasl_password to be configured"`
-  (ManageSieve).
+  authentication requires master credentials"` (ManageSieve). The refusal comes only after the
+  password checked out, and logs `authorization failed`.
 
 ### 8.3 `master_sasl_allowed_networks`
 
@@ -734,6 +734,8 @@ Log lines (INFO unless noted), with the session's fields:
 |---|---|
 | `authentication successful` | A login succeeded. `method` is `main_db`, `cache`, `master` or `remotelookup`; `cached` says whether a cache answered. |
 | `authentication failed` | A login failed. `reason` is `user_not_found`, `invalid_password` or `transient_error`. |
+| WARN `authentication unavailable` | The password could not be checked, so the client got a temporary failure and the attempt was not counted. `reason` is `transient_error` (the database could not be asked) or `unverifiable_hash` (the stored hash cannot be checked, for example an unknown scheme). |
+| `authorization failed` | On a backend: the password was right, but the client asked to act as another user (`authzid`) without master credentials (section 8.2). |
 | `rate limit exceeded` | A login was refused by the rate limiter; with `reason` (`ip_blocked` or `ip_username_blocked`), `failure_count`, `blocked_until`. |
 | `Auth rate limiter: IP+username blocked (Tier 1)` | A Tier 1 block started. |
 | `Auth rate limiter: IP blocked (Tier 2)` | A Tier 2 block started. |

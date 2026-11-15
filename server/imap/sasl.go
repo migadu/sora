@@ -175,7 +175,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					}
 
 					if !s.server.maintenanceGate.Admit(&s.server.authenticatedConnections, "imap") {
-						return s.refusedInMaintenance()
+						return s.refusedInMaintenance(address.BaseAddress())
 					}
 					duration := time.Since(authStart)
 
@@ -325,7 +325,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					}
 
 					if !s.server.maintenanceGate.Admit(&s.server.authenticatedConnections, "imap") {
-						return s.refusedInMaintenance()
+						return s.refusedInMaintenance(address.BaseAddress())
 					}
 					duration := time.Since(authStart)
 
