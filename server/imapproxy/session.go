@@ -184,6 +184,15 @@ func (s *Session) handleConnection() {
 
 		// Use the shared command parser. IMAP commands have tags.
 		tag, command, args, err := server.ParseLine(line, true)
+
+		// LOGIN and ID read the literals in their arguments. Every other
+		// command, and a line that does not parse, is answered without its
+		// arguments being read, but the literals ending its lines still belong
+		// to it: read them first, or they are parsed as the next command.
+		if (err != nil || (command != "LOGIN" && command != "ID")) && s.skipLiterals(line, false) != nil {
+			return
+		}
+
 		if err != nil {
 			// This would be a malformed line, e.g., unclosed quote.
 			// Send a tagged BAD response if we have a tag.
@@ -217,7 +226,8 @@ func (s *Session) handleConnection() {
 		case "LOGIN":
 			// Check insecure_auth: reject LOGIN over non-TLS when insecure_auth is false
 			if !s.server.insecureAuth && !server.ConnIsTLS(s.clientConn) {
-				if s.handleAuthError(fmt.Sprintf("%s NO [PRIVACYREQUIRED] Authentication requires TLS connection", tag)) {
+				if s.skipLiterals(line, false) != nil ||
+					s.handleAuthError(fmt.Sprintf("%s NO [PRIVACYREQUIRED] Authentication requires TLS connection", tag)) {
 					return
 				}
 				continue
@@ -232,8 +242,9 @@ func (s *Session) handleConnection() {
 				// Check if username is a literal
 				if strings.HasPrefix(args[0], "{") && strings.HasSuffix(args[0], "}") {
 					literalSize, nonSync, err := server.ParseLiteral(args[0])
-					if err != nil || literalSize > 8192 {
-						if s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in username", tag)) {
+					if err != nil || literalSize > maxPreAuthLiteral {
+						if s.skipLiterals(line, false) != nil ||
+							s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in username", tag)) {
 							return
 						}
 						continue
@@ -276,8 +287,9 @@ func (s *Session) handleConnection() {
 					// Check if password is a literal
 					if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
 						literalSize, nonSync, err := server.ParseLiteral(line)
-						if err != nil || literalSize > 8192 {
-							if s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
+						if err != nil || literalSize > maxPreAuthLiteral {
+							if s.skipLiterals(line, false) != nil ||
+								s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
 								return
 							}
 							continue
@@ -313,8 +325,9 @@ func (s *Session) handleConnection() {
 					// Check if password is a literal (username was not)
 					if strings.HasPrefix(args[1], "{") && strings.HasSuffix(args[1], "}") {
 						literalSize, nonSync, err := server.ParseLiteral(args[1])
-						if err != nil || literalSize > 8192 {
-							if s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
+						if err != nil || literalSize > maxPreAuthLiteral {
+							if s.skipLiterals(line, false) != nil ||
+								s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
 								return
 							}
 							continue
@@ -550,8 +563,9 @@ func (s *Session) handleConnection() {
 			// physical line, so drain any literal continuation lines here —
 			// otherwise the literal payload is read back as commands and burns
 			// the pre-auth error budget before LOGIN is ever reached.
-			if err := s.drainLiterals(args); err != nil {
-				if s.handleAuthError(fmt.Sprintf("%s BAD %s", tag, err.Error())) {
+			if err := s.skipLiterals(line, true); err != nil {
+				if !errors.Is(err, errSyncLiteralTooBig) ||
+					s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal", tag)) {
 					return
 				}
 				continue
@@ -599,45 +613,81 @@ func (s *Session) handleConnection() {
 	s.startProxy()
 }
 
-// drainLiterals consumes the literal payloads announced by a pre-auth command
-// whose arguments the proxy does not need to inspect (ID). Only the LAST token
-// of a physical line can be a literal announcement; after the literal bytes,
-// the client sends the rest of the command on a fresh line, which may itself
-// end in another literal. For synchronizing literals ({N}) the proxy must send
-// a continuation before the client transmits; for {N+} the data is already in
-// flight. Each literal is bounded to keep the pre-auth path memory-safe.
-func (s *Session) drainLiterals(args []string) error {
-	const maxPreAuthLiteral = 8192
-	for len(args) > 0 {
-		last := args[len(args)-1]
-		if !strings.HasPrefix(last, "{") || !strings.HasSuffix(last, "}") {
+// maxPreAuthLiteral bounds each literal the pre-auth loop reads.
+const maxPreAuthLiteral = 8192
+
+var (
+	// errSyncLiteralTooBig: skipLiterals sent no continuation request for a
+	// synchronizing literal over maxPreAuthLiteral, so the client sends nothing
+	// more of the command, and the caller rejects it.
+	errSyncLiteralTooBig = errors.New("synchronizing literal too big")
+	// errNonSyncLiteralTooBig: skipLiterals ended the session with BYE over a
+	// non-synchronizing literal over maxPreAuthLiteral.
+	errNonSyncLiteralTooBig = errors.New("non-synchronizing literal too big")
+)
+
+// skipLiterals reads the rest of a command whose arguments the pre-auth loop
+// does not use, given the command's last line read (without CRLF). A line
+// ending in a literal announcement is followed by the literal's octets and then
+// by another line of the same command, which may end in a literal again.
+//
+// The client sends the octets of a non-synchronizing literal "{N+}" without
+// waiting, and the server "MUST treat the specified number of following octets
+// and the following line ... as part of the same command" (RFC 7888 §3), so
+// they are always read: left unread, they would be parsed as further commands.
+// A synchronizing literal "{N}" is read only when sync is set, after a
+// continuation request. Otherwise the client is still waiting for that request,
+// and the response that rejects the command tells it to send no more of it
+// (RFC 9051 §2.2.1).
+//
+// A literal over maxPreAuthLiteral is not read. For a non-synchronizing one the
+// octets are already in flight and nothing after them can be found, so the
+// session ends with BYE [TOOBIG] (RFC 7888 §4 and §5) and
+// errNonSyncLiteralTooBig. With sync set, a synchronizing one gets no
+// continuation request and errSyncLiteralTooBig. A read error is returned as is.
+func (s *Session) skipLiterals(line string, sync bool) error {
+	for {
+		size, nonSync, ok := trailingLiteral(line)
+		if !ok || (!nonSync && !sync) {
 			return nil
 		}
-		size, nonSync, err := server.ParseLiteral(last)
-		if err != nil || size > maxPreAuthLiteral {
-			return fmt.Errorf("Invalid literal")
+		if size > maxPreAuthLiteral {
+			if !nonSync {
+				return errSyncLiteralTooBig
+			}
+			s.DebugLog("non-synchronizing literal over the pre-auth bound", "size", size)
+			s.sendResponse("* BYE [TOOBIG] Non-synchronizing literal too big")
+			return errNonSyncLiteralTooBig
 		}
 		if !nonSync {
 			s.sendResponse("+ ")
 		}
-		if _, err := io.ReadFull(s.clientReader, make([]byte, size)); err != nil {
-			return fmt.Errorf("Failed to read literal")
+		if _, err := s.clientReader.Discard(size); err != nil {
+			return err
 		}
-		// Rest of the command line after the literal (may end in another literal).
-		rest, err := server.ReadBoundedLine(s.clientReader, 65536)
+		next, err := server.ReadBoundedLine(s.clientReader, 65536)
 		if err != nil {
-			return fmt.Errorf("Failed to read command continuation")
+			return err
 		}
-		rest = strings.TrimSpace(strings.TrimRight(rest, "\r\n"))
-		if rest == "" {
-			return nil
-		}
-		_, _, args, err = server.ParseLine("x CMD "+rest, true)
-		if err != nil {
-			return fmt.Errorf("Malformed command continuation")
-		}
+		line = strings.TrimRight(next, "\r\n")
 	}
-	return nil
+}
+
+// trailingLiteral reports the literal announced at the end of a command line
+// without its CRLF: "{N}", or "{N+}" for a non-synchronizing one. Trailing
+// white space is ignored, as ParseLine ignores it, so that a literal LOGIN
+// rejects is found here too.
+func trailingLiteral(line string) (size int, nonSync, ok bool) {
+	line = strings.TrimSpace(line)
+	if !strings.HasSuffix(line, "}") {
+		return 0, false, false
+	}
+	start := strings.LastIndexByte(line, '{')
+	if start < 0 {
+		return 0, false, false
+	}
+	size, nonSync, err := server.ParseLiteral(line[start:])
+	return size, nonSync, err == nil
 }
 
 // preAuthRequiredState maps the commands a backend implements that are not
