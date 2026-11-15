@@ -20,6 +20,7 @@ import (
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/sieveengine"
 )
 
@@ -279,7 +280,7 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		edited, editErr := sieveengine.ApplyHeaderEdits(outcome.MessageBytes, result.HeaderEdits)
 		if editErr != nil {
 			s.DeliveryCtx.Logger.Log("Failed to apply Sieve header edits, delivering unmodified: %v", editErr)
-		} else if reparsed, parseErr := message.Read(bytes.NewReader(edited)); parseErr != nil {
+		} else if reparsed, parseErr := server.ParseMessage(bytes.NewReader(edited)); parseErr != nil {
 			// Bytes and entity must stay consistent: the entity is what the stored
 			// metadata (subject, message id, body structure) is derived from.
 			s.DeliveryCtx.Logger.Log("Failed to re-parse message after Sieve header edits, delivering unmodified: %v", parseErr)

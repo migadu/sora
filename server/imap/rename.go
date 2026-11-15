@@ -101,7 +101,7 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 	// of the new name are created, which would be below this mailbox. (RENAME INBOX
 	// moves messages into a new mailbox instead, which may be below INBOX.)
 	if !isInbox {
-		below, belowErr := s.nameIsBelowMailbox(ctx, newName, oldMailbox)
+		below, belowErr := s.server.rdb.MailboxNameIsBelowWithRetry(ctx, newName, oldMailbox)
 		if belowErr != nil {
 			return s.internalError("failed to check whether '%s' is below '%s': %v", newName, existingName, belowErr)
 		}
@@ -264,7 +264,7 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 		// auto-created, on the nearest existing ancestor that CREATE would extend.
 		// A pure rename that keeps the same parent needs no "k". (Owners hold "k".)
 		// Whether newParentPath names the current parent is the database's call.
-		sameParent, parentErr := s.namesParentOf(ctx, newParentPath, oldMailbox)
+		parentID, sameParent, parentErr := s.lookUpNewParent(ctx, newParentPath, oldMailbox)
 		if parentErr != nil {
 			return s.internalError("failed to resolve new parent mailbox %q: %v", newParentPath, parentErr)
 		}
@@ -274,9 +274,11 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 			}
 		}
 
-		parentID, perr := s.resolveOrCreateParentPath(ctx, newParentPath, ownerAccountID)
-		if perr != nil {
-			return perr
+		if parentID == nil {
+			var perr error
+			if parentID, perr = s.resolveOrCreateParentPath(ctx, newParentPath, ownerAccountID); perr != nil {
+				return perr
+			}
 		}
 		newParentMailboxID = parentID
 	}
@@ -321,46 +323,26 @@ func (s *IMAPSession) writeRenameOldName(w *imapserver.RenameWriter, oldName, ne
 	}
 }
 
-// nameIsBelowMailbox reports whether name is below mbox in its owner's hierarchy,
-// as the database resolves names. lower() leaves the hierarchy delimiters alone,
-// so of the leading parts of name only the one with as many levels as mbox's name
-// can name mbox: that one is looked up and the mailbox found compared with mbox.
-func (s *IMAPSession) nameIsBelowMailbox(ctx context.Context, name string, mbox *db.DBMailbox) (bool, error) {
-	delim := string(consts.MailboxDelimiter)
-	levels := strings.Count(mbox.Name, delim) + 1
-	parts := strings.Split(name, delim)
-	if len(parts) <= levels {
-		return false, nil
-	}
-	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-	id, err := s.server.rdb.GetOwnedMailboxIDByNameWithRetry(ctx, mbox.AccountID, strings.Join(parts[:levels], delim))
-	switch {
-	case err == nil:
-		return id == mbox.ID, nil
-	case errors.Is(err, consts.ErrMailboxNotFound):
-		return false, nil
-	default:
-		return false, err
-	}
-}
-
-// namesParentOf reports whether parentPath names the current parent of mbox in its
-// owner's hierarchy, as the database resolves names. The parent is the one whose
-// ID ends mbox's path; a top-level mailbox has none.
-func (s *IMAPSession) namesParentOf(ctx context.Context, parentPath string, mbox *db.DBMailbox) (bool, error) {
+// lookUpNewParent looks parentPath up in mbox's owner's hierarchy, as the database
+// resolves names, and returns the ID of the mailbox found and whether it is mbox's
+// current parent, the one whose ID ends mbox's path. The caller reuses the ID
+// instead of looking the parent up again. For a top-level mailbox, which has no
+// parent, nothing is looked up; (nil, false) leaves the parent to
+// resolveOrCreateParentPath, as when parentPath names no mailbox.
+func (s *IMAPSession) lookUpNewParent(ctx context.Context, parentPath string, mbox *db.DBMailbox) (*int64, bool, error) {
 	currentParentPath := helpers.GetParentPathFromPath(mbox.Path)
 	if currentParentPath == "" {
-		return false, nil
+		return nil, false, nil
 	}
 	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	id, err := s.server.rdb.GetOwnedMailboxIDByNameWithRetry(ctx, mbox.AccountID, parentPath)
 	switch {
 	case err == nil:
-		return strings.HasSuffix(currentParentPath, helpers.FormatMailboxID(id)), nil
+		return &id, strings.HasSuffix(currentParentPath, helpers.FormatMailboxID(id)), nil
 	case errors.Is(err, consts.ErrMailboxNotFound):
-		return false, nil
+		return nil, false, nil
 	default:
-		return false, err
+		return nil, false, err
 	}
 }
 
