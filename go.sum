@@ -235,6 +235,8 @@ github.com/migadu/go-sieve v1.4.5-0.20261115203103-58ff98b024ff h1:hjvh5m0KyoNP8
 github.com/migadu/go-sieve v1.4.5-0.20261115203103-58ff98b024ff/go.mod h1:xHAx5kMQ5hw/YJziHobNfLDpMK4jjxMJ5sZAHi3uFr8=
 github.com/migadu/go-sieve v1.4.5-0.20261115203417-469014cee3b7 h1:nN8x5SQgSYl4xh4HdcCMNEf+/llQkvIvudqRIrjvKZI=
 github.com/migadu/go-sieve v1.4.5-0.20261115203417-469014cee3b7/go.mod h1:xHAx5kMQ5hw/YJziHobNfLDpMK4jjxMJ5sZAHi3uFr8=
+github.com/migadu/go-sieve v1.4.5-0.20261115203421-3e74949d0af2 h1:fBLCsAYESoL9V7mFZTy/JfduW106YzoUQD01mWN0tWU=
+github.com/migadu/go-sieve v1.4.5-0.20261115203421-3e74949d0af2/go.mod h1:xHAx5kMQ5hw/YJziHobNfLDpMK4jjxMJ5sZAHi3uFr8=
 github.com/migadu/go-smtp v0.0.0-20261115152018-628a3c6f1030 h1:zoui0RdyNYKHu6kZWuS7zvC4E4nW2MM7lu80feLzDBI=
 github.com/migadu/go-smtp v0.0.0-20261115152018-628a3c6f1030/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/moby/docker-image-spec v1.3.1 h1:jMKff3w6PgbfSa69GfNg+zN/XLhfXJGnEx3Nl2EsFP0=
