@@ -20,7 +20,8 @@ type pendingRow struct {
 // measurement. A test commits a row the way a delivery's transaction does after
 // staging the body, and drops one the way an upload's finalize does before the body
 // leaves the spool; snapshot answers what a measurement whose snapshot is taken at
-// that moment reports.
+// that moment reports, with Included for every row (the monitor looks up only the
+// bodies it names).
 type pendingRows struct {
 	mu   sync.Mutex
 	rows map[pendingRow]int64
@@ -45,10 +46,11 @@ func (p *pendingRows) drop(accountID int64, contentHash string) {
 func (p *pendingRows) snapshot() UploadBacklog {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	var backlog UploadBacklog
-	for _, size := range p.rows {
+	backlog := UploadBacklog{Included: make(map[StagedBody]int64, len(p.rows))}
+	for row, size := range p.rows {
 		backlog.Count++
 		backlog.Bytes += size
+		backlog.Included[StagedBody{AccountID: row.accountID, ContentHash: row.contentHash}] = size
 	}
 	return backlog
 }
