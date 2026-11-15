@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
@@ -230,8 +231,8 @@ func (d *Database) ValidateQResyncUIDValidityWithRetry(ctx context.Context, mail
 	return d.ValidateQResyncUIDValidity(ctx, mailboxID, clientUIDValidity)
 }
 
-// GetActiveUIDsInSet returns the active (non-expunged) UIDs in the mailbox that fall within the given UIDSet.
-// This is used for QRESYNC SELECT to efficiently check which of the client's known UIDs are still active.
+// GetActiveUIDsInSet returns the active (non-expunged) UIDs in the mailbox that fall within the given UIDSet,
+// in ascending order. This is used for QRESYNC SELECT to efficiently check which of the client's known UIDs are still active.
 // In a view (WithSeqView) the messages the view still holds although they have since been
 // expunged are active too: the SELECT counts them in EXISTS, and the session's next poll
 // reports their expunge.
@@ -256,13 +257,15 @@ func (d *Database) GetActiveUIDsInSet(ctx context.Context, mailboxID int64, uidS
 		args = append(args, int64(view))
 		viewParam = fmt.Sprintf("$%d", len(args))
 	}
-	// OFFSET 0 keeps the lateral subquery from being flattened into a plain join, which
-	// the planner may order the other way round when it underestimates the mailbox (a
-	// new one, before ANALYZE): every message then tested against every range.
-	query := `SELECT DISTINCT counted.uid FROM unnest($2::bigint[], $3::bigint[]) AS known(lo, hi)
+	// The ORDER BY inside the lateral subquery makes the (mailbox_id, uid) index, which
+	// returns a range in order, the plan for every range, and keeps the subquery from
+	// being flattened into a join. Without it a mailbox the planner underestimates (one
+	// that has grown since the last ANALYZE) was read whole once per range. There is no
+	// ORDER BY over the result: the database would sort every UID found, on each SELECT.
+	query := `SELECT counted.uid FROM unnest($2::bigint[], $3::bigint[]) AS known(lo, hi)
 		CROSS JOIN LATERAL (SELECT uid FROM ` +
-		seqCountedRows("$1", viewParam, "uid BETWEEN known.lo AND known.hi", "", "") +
-		` c OFFSET 0) counted ORDER BY counted.uid`
+		seqCountedRows("$1", viewParam, "uid BETWEEN known.lo AND known.hi", "ASC", "") +
+		` c ORDER BY uid) counted`
 
 	rows, err := d.readQuerier(ctx).Query(ctx, query, args...)
 	if err != nil {
@@ -283,7 +286,11 @@ func (d *Database) GetActiveUIDsInSet(ctx context.Context, mailboxID int64, uidS
 		return nil, fmt.Errorf("error iterating active UIDs in set: %w", err)
 	}
 
-	return uids, nil
+	// The ranges come in the set's order, ascending and disjoint as the parser builds
+	// them, so the UIDs already are sorted and this is one linear pass. A hand-built
+	// set may overlap or be out of order.
+	slices.Sort(uids)
+	return slices.Compact(uids), nil
 }
 
 func (d *Database) GetActiveUIDsInSetWithRetry(ctx context.Context, mailboxID int64, uidSet imap.UIDSet) ([]imap.UID, error) {

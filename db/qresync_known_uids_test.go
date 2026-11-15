@@ -54,6 +54,11 @@ func TestGetActiveUIDsInSetManyRanges(t *testing.T) {
 	active, err = database.GetActiveUIDsInSet(view, mailboxID, known)
 	require.NoError(t, err)
 	assert.Equal(t, want, active, "in a view at the current modseq")
+
+	// A hand-built set, out of order and overlapping, still gives each UID once, in order.
+	active, err = database.GetActiveUIDsInSet(ctx, mailboxID, imap.UIDSet{{Start: 200_000, Stop: 200_002}, {Start: 1, Stop: 3}, {Start: 2, Stop: 200_000}})
+	require.NoError(t, err)
+	assert.Equal(t, []imap.UID{1, 2, 3, 139_999, 200_000, 200_002}, active, "out of order, overlapping ranges")
 }
 
 // knownUIDsPlanNode is the part of an EXPLAIN (ANALYZE, FORMAT JSON) node that says how
