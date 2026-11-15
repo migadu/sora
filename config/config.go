@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -113,6 +114,21 @@ func (e *DatabaseEndpointConfig) GetMaxConnIdleTime() (time.Duration, error) {
 	return helpers.ParseDuration(e.MaxConnIdleTime)
 }
 
+// Validate checks that the endpoint's pool durations, max_conn_lifetime and
+// max_conn_idle_time, parse. A pool is not created without them: a write host is
+// marked failed, so start-up stops with "no healthy database pools available", and a
+// read replica is retried for good. query_timeout is not checked: an unparsable one
+// falls back to the [database] query_timeout with a warning.
+func (e *DatabaseEndpointConfig) Validate() error {
+	if _, err := e.GetMaxConnLifetime(); err != nil {
+		return fmt.Errorf("invalid max_conn_lifetime %q: %w", e.MaxConnLifetime, err)
+	}
+	if _, err := e.GetMaxConnIdleTime(); err != nil {
+		return fmt.Errorf("invalid max_conn_idle_time %q: %w", e.MaxConnIdleTime, err)
+	}
+	return nil
+}
+
 // GetQueryTimeout parses the query timeout duration for an endpoint.
 func (e *DatabaseEndpointConfig) GetQueryTimeout() (time.Duration, error) {
 	if e.QueryTimeout == "" {
@@ -175,6 +191,18 @@ func (d *DatabaseConfig) GetMigrationTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(d.MigrationTimeout)
 }
 
+// Validate checks that migration_timeout parses: a write host's pool runs the migrations
+// as it is created and is not created without it, so start-up stops with "no healthy
+// database pools available". The query, search, write and lock timeouts are not checked:
+// an unparsable one falls back to its default with a warning.
+// DatabaseEndpointConfig.Validate checks [database.write] and [database.read].
+func (d *DatabaseConfig) Validate() error {
+	if _, err := d.GetMigrationTimeout(); err != nil {
+		return fmt.Errorf("invalid migration_timeout %q: %w", d.MigrationTimeout, err)
+	}
+	return nil
+}
+
 // GetFetchChunkSize returns the chunk size for large message fetches
 func (d *DatabaseConfig) GetFetchChunkSize() int {
 	if d.FetchChunkSize <= 0 {
@@ -211,8 +239,10 @@ func (s *S3Config) GetTimeout() (time.Duration, error) {
 }
 
 // Validate checks the [s3] settings a node that uses S3 needs to connect: the bucket and
-// the endpoint, and a timeout that parses. Without access_key and secret_key the AWS
-// default credential chain supplies them, which only connecting can check.
+// the endpoint, a timeout that parses, access_key and secret_key both set or both empty,
+// and with encrypt = true an encryption_key that is the hex encoding of a 32-byte key.
+// Without access_key and secret_key the AWS default credential chain supplies them, which
+// only connecting can check.
 func (s *S3Config) Validate() error {
 	if s.Bucket == "" {
 		return errors.New("bucket is required for mail services (IMAP, LMTP, POP3) and for the User API to serve message bodies")
@@ -223,7 +253,40 @@ func (s *S3Config) Validate() error {
 	if _, err := s.GetTimeout(); err != nil {
 		return fmt.Errorf("invalid timeout %q: %w", s.Timeout, err)
 	}
+	if (s.AccessKey == "") != (s.SecretKey == "") {
+		return ErrS3KeysNotPaired
+	}
+	if s.Encrypt {
+		if _, err := ParseS3EncryptionKey(s.EncryptionKey); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// ErrS3KeysNotPaired refuses an access_key without a secret_key, or a secret_key without
+// an access_key. storage.NewClient refuses such a pair with it too.
+var ErrS3KeysNotPaired = errors.New("access_key and secret_key must be set together; leave both empty to use the AWS default credential chain")
+
+// s3EncryptionKeySize is the size of the [s3] encryption_key, an AES-256 master key.
+const s3EncryptionKeySize = 32
+
+// ParseS3EncryptionKey decodes the [s3] encryption_key, the hex encoding of the AES-256
+// master key that encrypts message bodies. S3Config.Validate and storage.EnableEncryption
+// both decode it with this function, so the file is refused for the reasons the storage
+// refuses the key. The error does not quote the key, which is a secret.
+func ParseS3EncryptionKey(key string) ([]byte, error) {
+	if key == "" {
+		return nil, errors.New("encryption_key is required when encrypt = true")
+	}
+	masterKey, err := hex.DecodeString(key)
+	if err != nil {
+		return nil, fmt.Errorf("encryption_key must be %d hex characters (a %d-byte key)", 2*s3EncryptionKeySize, s3EncryptionKeySize)
+	}
+	if len(masterKey) != s3EncryptionKeySize {
+		return nil, fmt.Errorf("encryption_key must be %d bytes (%d hex characters), got %d bytes", s3EncryptionKeySize, 2*s3EncryptionKeySize, len(masterKey))
+	}
+	return masterKey, nil
 }
 
 // hasSettings reports whether the file sets any of the [s3] connection settings.
@@ -477,6 +540,56 @@ type TLSConfig struct {
 	LetsEncrypt *TLSLetsEncryptConfig `toml:"letsencrypt"` // Let's Encrypt configuration
 }
 
+// Validate checks, with enabled = true, what the TLS manager needs of [tls] before it
+// opens anything: a known provider, cert_file and key_file for provider = "file", and
+// for provider = "letsencrypt" a [tls.letsencrypt] table with email, domains,
+// storage_provider = "s3" and a renew_before and sync_interval that parse. Whether the
+// certificate files can be read and the certificate store reached is found only by
+// opening them. tlsmanager.New runs it too.
+func (c *TLSConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	switch c.Provider {
+	case "file":
+		if c.CertFile == "" || c.KeyFile == "" {
+			return errors.New("cert_file and key_file are required for provider='file'")
+		}
+		return nil
+	case "letsencrypt":
+		return c.LetsEncrypt.validate()
+	default:
+		return fmt.Errorf("unknown TLS provider: %s (must be 'file' or 'letsencrypt')", c.Provider)
+	}
+}
+
+func (c *TLSLetsEncryptConfig) validate() error {
+	if c == nil {
+		return errors.New("letsencrypt configuration is required for provider='letsencrypt'")
+	}
+	if c.Email == "" {
+		return errors.New("letsencrypt.email is required")
+	}
+	if len(c.Domains) == 0 {
+		return errors.New("letsencrypt.domains is required and must not be empty")
+	}
+	if c.StorageProvider != "s3" {
+		return errors.New("only storage_provider='s3' is currently supported for Let's Encrypt")
+	}
+	if c.RenewBefore != "" {
+		if _, err := helpers.ParseDuration(c.RenewBefore); err != nil {
+			return fmt.Errorf("invalid renew_before duration %q: %w", c.RenewBefore, err)
+		}
+	}
+	// "0" turns the certificate sync off.
+	if c.SyncInterval != "" && c.SyncInterval != "0" {
+		if _, err := helpers.ParseDuration(c.SyncInterval); err != nil {
+			return fmt.Errorf("invalid sync_interval duration %q: %w", c.SyncInterval, err)
+		}
+	}
+	return nil
+}
+
 // CleanupConfig holds cleaner worker configuration.
 type CleanupConfig struct {
 	GracePeriod           string `toml:"grace_period"`
@@ -679,12 +792,13 @@ const DefaultUploaderMaxAttempts = 20
 // refused by PostgreSQL, and max_attempts <= 0 leases nothing and fails the cleaner's
 // failed-upload pass. A negative cleanup_grace_period puts the orphan cleanup's cutoff
 // in the future, so it removes staged bodies whose pending_uploads row is still in an
-// uncommitted delivery transaction. An unparseable cleanup_grace_period is refused
-// too: start-up exits on it, as there is no fallback. retry_interval must be positive
-// as well: the lease takes rows whose last_attempt is before now - retry_interval, so
-// with 0 or less it takes back rows leased a moment ago in the same pass and an upload
-// the provider refuses is retried in a tight loop that never reaches the cycle backoff.
-// An unparseable retry_interval falls back to 30s with a warning.
+// uncommitted delivery transaction. An unparseable cleanup_grace_period or
+// max_staging_size is refused too: start-up exits on it, as there is no fallback.
+// retry_interval must be positive as well: the lease takes rows whose last_attempt is
+// before now - retry_interval, so with 0 or less it takes back rows leased a moment ago
+// in the same pass and an upload the provider refuses is retried in a tight loop that
+// never reaches the cycle backoff. An unparseable retry_interval falls back to 30s with
+// a warning.
 func (c *UploaderConfig) Validate() error {
 	for _, f := range []struct {
 		key   string
@@ -707,6 +821,9 @@ func (c *UploaderConfig) Validate() error {
 	}
 	if d, err := helpers.ParseDuration(c.RetryInterval); err == nil && d <= 0 {
 		return fmt.Errorf("[uploader] retry_interval must be positive, got %q", c.RetryInterval)
+	}
+	if _, err := c.GetMaxStagingSize(); err != nil {
+		return fmt.Errorf("[uploader] max_staging_size: %w", err)
 	}
 	return nil
 }
@@ -3240,8 +3357,8 @@ type Problem struct {
 //
 // What a node does not run is not checked: [uploader] and [cleanup] only with a mail
 // backend, [database] only with a server that queries it, [s3] only on a node that
-// connects to it, [cluster] only when enabled. Service setup still checks external
-// connectivity and the node's disk; passing Validate does not check those.
+// connects to it, [cluster] and [tls] only when enabled. Service setup still checks
+// external connectivity and the node's disk; passing Validate does not check those.
 func (c *Config) Validate() []Problem {
 	var problems []Problem
 	add := func(section string, err error) {
@@ -3310,13 +3427,24 @@ func (c *Config) Validate() []Problem {
 		add("[cleanup]", c.Cleanup.Validate())
 	}
 
-	if user := c.DatabaseUser(); user != nil && !c.HasDatabaseEndpoint() {
-		add("[database]", fmt.Errorf("server %q (%s) needs the database, but it is not configured in [database.write] or [database.read]", user.Name, user.Type))
+	if user := c.DatabaseUser(); user != nil {
+		if !c.HasDatabaseEndpoint() {
+			add("[database]", fmt.Errorf("server %q (%s) needs the database, but it is not configured in [database.write] or [database.read]", user.Name, user.Type))
+		}
+		add("[database]", c.Database.Validate())
+		// An endpoint without hosts opens no pool.
+		if c.Database.Write != nil && len(c.Database.Write.Hosts) > 0 {
+			add("[database.write]", c.Database.Write.Validate())
+		}
+		if c.Database.Read != nil && len(c.Database.Read.Hosts) > 0 {
+			add("[database.read]", c.Database.Read.Validate())
+		}
 	}
 	if c.NeedsS3() {
 		add("[s3]", c.S3.Validate())
 	}
 	add("[cluster]", c.Cluster.Validate())
+	add("[tls]", c.TLS.Validate())
 
 	return problems
 }

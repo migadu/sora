@@ -311,6 +311,11 @@ func newManager(cfg config.TLSConfig, clusterMgr clusterCoordinator) (*Manager, 
 	if !cfg.Enabled {
 		return nil, fmt.Errorf("TLS is not enabled in configuration")
 	}
+	// The provider, required keys and durations are the [tls] checks the server runs on
+	// the whole file before it starts anything (config.Config.Validate).
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 
 	m := &Manager{
 		config:         cfg,
@@ -336,8 +341,6 @@ func newManager(cfg config.TLSConfig, clusterMgr clusterCoordinator) (*Manager, 
 		if err := m.initLetsEncryptProvider(); err != nil {
 			return nil, fmt.Errorf("failed to initialize Let's Encrypt provider: %w", err)
 		}
-	default:
-		return nil, fmt.Errorf("unknown TLS provider: %s (must be 'file' or 'letsencrypt')", cfg.Provider)
 	}
 
 	logger.Info("TLS manager initialized", "provider", cfg.Provider)
@@ -361,10 +364,6 @@ func acmeCapableProtocols() []string {
 
 // initFileProvider initializes TLS with certificate files
 func (m *Manager) initFileProvider() error {
-	if m.config.CertFile == "" || m.config.KeyFile == "" {
-		return fmt.Errorf("cert_file and key_file are required for provider='file'")
-	}
-
 	cert, err := tls.LoadX509KeyPair(m.config.CertFile, m.config.KeyFile)
 	if err != nil {
 		return fmt.Errorf("failed to load certificate: %w", err)
@@ -406,23 +405,7 @@ func resolveFallbackDir(leCfg *config.TLSLetsEncryptConfig) string {
 
 // initLetsEncryptProvider initializes autocert for automatic certificate management
 func (m *Manager) initLetsEncryptProvider() error {
-	if m.config.LetsEncrypt == nil {
-		return fmt.Errorf("letsencrypt configuration is required for provider='letsencrypt'")
-	}
-
 	leCfg := m.config.LetsEncrypt
-
-	if leCfg.Email == "" {
-		return fmt.Errorf("letsencrypt.email is required")
-	}
-
-	if len(leCfg.Domains) == 0 {
-		return fmt.Errorf("letsencrypt.domains is required and must not be empty")
-	}
-
-	if leCfg.StorageProvider != "s3" {
-		return fmt.Errorf("only storage_provider='s3' is currently supported for Let's Encrypt")
-	}
 
 	// Initialize S3 cache
 	s3cache, err := NewS3Cache(leCfg.S3, encryptionOptions(leCfg.S3)...)
