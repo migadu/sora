@@ -53,8 +53,7 @@ func TestIMAPAuthenticationSuccessfulLogsAccountOnce(t *testing.T) {
 			if reply := l.login(); !strings.Contains(reply, " OK") {
 				t.Fatalf("%s: %q, want OK", l.name, reply)
 			}
-			// The session's line: IMAPServer.Authenticate also logs a regular login, with
-			// no session fields.
+			// The session's line, the only one that carries the session's fields (#1198).
 			line := logs.WaitForLine(t, "authentication successful", " session=", "method="+l.method)
 			if n := strings.Count(line, " account_id="); n != 1 {
 				t.Errorf("%s logged account_id %d times:\n  %s", l.name, n, line)
