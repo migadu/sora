@@ -666,7 +666,9 @@ The wait of section 10.3 comes before the reply in every case.
   on every node, their own node included: Tier 2 blocks (`sync_blocks`), Tier 2 counts from
   `delay_start_threshold` on (`sync_failure_counts`), and the name statistics. A shared count only
   raises a listener's own, its `exempt_networks` are not counted, and a shared wait is capped at its
-  `max_delay`. Tier 1 blocks stay on the listener that set them.
+  `max_delay`. Tier 1 blocks stay on the listener that set them. See
+  [CLUSTER.md](CLUSTER.md#66-authentication-rate-limits-imap-pop3-and-managesieve-proxies) for the
+  details and [CONFIGURATION.md](CONFIGURATION.md#814-cluster-cluster) for the keys.
 - A restart forgets all counts and blocks.
 - `auth_rate_limit` is read at startup. A SIGHUP reload does not change it.
 
