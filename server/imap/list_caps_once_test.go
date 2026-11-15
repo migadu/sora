@@ -7,11 +7,11 @@ import (
 	"testing"
 )
 
-// LIST reads the session's capability set once (#1079). GetCapabilities returns
-// a fresh copy of the set on every call, and the set cannot change in the middle
-// of a command, so a call per listed mailbox (and another per mailbox for
-// RETURN (STATUS ...)) only allocated garbage in proportion to the account's
-// mailbox count on every LIST a client syncs with.
+// LIST reads the session's capability set once (#1079). The set cannot change
+// in the middle of a command, so a call per listed mailbox (and another per
+// mailbox for RETURN (STATUS ...)) only repeated work in proportion to the
+// account's mailbox count on every LIST a client syncs with. That work was a
+// copy of the whole set until GetCapabilities stopped copying it (#1206).
 func TestList_ReadsCapabilitiesOnce(t *testing.T) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "list.go", nil, 0)
