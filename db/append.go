@@ -148,7 +148,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	var messageIDs []int64
 	var sourceUIDsForMap []imap.UID
 	var expectedHashes []string // per message: sourceHashes, checked for re-keyed rows only
-	crossAccount := false       // any source row owned by another account: see restageFTS
+	var rekeyed []bool          // per message: owned by another account than destAccountID
 	for rows.Next() {
 		var messageID, sourceAccountID int64
 		var sourceUID imap.UID
@@ -158,7 +158,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		messageIDs = append(messageIDs, messageID)
 		sourceUIDsForMap = append(sourceUIDsForMap, sourceUID)
 		expectedHashes = append(expectedHashes, sourceHashes[sourceUID])
-		crossAccount = crossAccount || sourceAccountID != destAccountID
+		rekeyed = append(rekeyed, sourceAccountID != destAccountID)
 	}
 	if err = rows.Err(); err != nil {
 		return nil, nil, fmt.Errorf("error iterating through source messages: %w", err)
@@ -176,12 +176,18 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		return nil, nil, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 	}
 
-	// Calculate the new UIDs for the copied messages.
-	var newUIDs []int64
+	// Calculate the new UIDs for the copied messages, and split them by whether the
+	// copy is re-keyed to the destination owner (see restagePendingUploads).
+	var newUIDs, keptUIDs, rekeyedUIDs []int64
 	startUID := newHighestUID - numToCopy + 1
 	for i, sourceUID := range sourceUIDsForMap {
 		newUID := startUID + int64(i)
 		newUIDs = append(newUIDs, newUID)
+		if rekeyed[i] {
+			rekeyedUIDs = append(rekeyedUIDs, newUID)
+		} else {
+			keptUIDs = append(keptUIDs, newUID)
+		}
 		messageUIDMap[sourceUID] = imap.UID(newUID)
 	}
 
@@ -294,12 +300,10 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	// (s3_domain/s3_localpart) and marks the new row uploaded. Without this, a
 	// cross-account copy of a not-yet-uploaded message would never reach the
 	// owner's path and would become unreadable once local staging is cleaned up.
-	// ON CONFLICT makes this a no-op for same-account copies, where the source's
-	// pending_upload already covers (content_hash, account_id).
-	if err := db.restagePendingUploads(ctx, tx, destMailboxID, newUIDs, instanceID); err != nil {
+	if err := db.restagePendingUploads(ctx, tx, destMailboxID, keptUIDs, rekeyedUIDs, instanceID); err != nil {
 		return nil, nil, err
 	}
-	if crossAccount {
+	if len(rekeyedUIDs) > 0 {
 		if err := db.restageFTS(ctx, tx, destMailboxID, newUIDs); err != nil {
 			return nil, nil, err
 		}
@@ -309,25 +313,45 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 }
 
 // restagePendingUploads ensures every just-inserted, not-yet-uploaded message in
-// (mailboxID, newUIDs) has a pending_upload under its own account so the uploader
-// writes the body under that account's S3 path. The local staging file must already
-// exist under FilePath(content_hash, account_id) (the caller hardlinks it for
-// cross-account inserts). instanceID must be the upload instance id of the node holding
-// the local file (config.InstanceID, the key its uploader leases under), not its mail
-// hostname, so its own worker, not a peer or nobody, picks the task up.
-func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailboxID int64, newUIDs []int64, instanceID string) error {
-	if len(newUIDs) == 0 {
-		return nil
+// mailboxID has a pending_upload under its own account so the uploader writes the body
+// under that account's S3 path. instanceID must be the upload instance id of the node
+// holding the local file (config.InstanceID, the key its uploader leases under), not its
+// mail hostname, so its own worker, not a peer or nobody, picks the task up.
+//
+// rekeyedUIDs are the copies of another account's rows, re-keyed to the mailbox owner. One
+// that is not uploaded is one whose body the caller has just staged on this node under
+// FilePath(content_hash, owner) (see CopyMessages), so the owner's row is re-armed for
+// this node as a fresh delivery re-arms it (InsertMessage): an existing row may be one no
+// uploader leases any more, its attempts used up or its instance gone, and left as it is
+// the copy is never uploaded and CleanupFailedUploads deletes it. DISTINCT ON because two
+// copies of one body propose the same row, which ON CONFLICT DO UPDATE refuses.
+//
+// keptUIDs are the copies of the owner's own rows. They stage nothing here: the body is
+// wherever the source was delivered, possibly another node, so an existing row is left
+// alone (DO NOTHING) rather than taken over by this one.
+func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailboxID int64, keptUIDs, rekeyedUIDs []int64, instanceID string) error {
+	if len(rekeyedUIDs) > 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO pending_uploads (instance_id, content_hash, size, created_at, account_id)
+			SELECT DISTINCT ON (m.content_hash, m.account_id) $1, m.content_hash, m.size, NOW(), m.account_id
+			FROM messages m
+			WHERE m.mailbox_id = $2 AND m.uid = ANY($3) AND m.uploaded = FALSE AND m.expunged_at IS NULL
+			ON CONFLICT (content_hash, account_id) DO UPDATE
+			SET attempts = 0, instance_id = EXCLUDED.instance_id, last_attempt = NULL`,
+			instanceID, mailboxID, rekeyedUIDs); err != nil {
+			return fmt.Errorf("failed to re-stage pending uploads: %w", err)
+		}
 	}
-	_, err := tx.Exec(ctx, `
-		INSERT INTO pending_uploads (instance_id, content_hash, size, created_at, account_id)
-		SELECT $1, m.content_hash, m.size, NOW(), m.account_id
-		FROM messages m
-		WHERE m.mailbox_id = $2 AND m.uid = ANY($3) AND m.uploaded = FALSE AND m.expunged_at IS NULL
-		ON CONFLICT (content_hash, account_id) DO NOTHING`,
-		instanceID, mailboxID, newUIDs)
-	if err != nil {
-		return fmt.Errorf("failed to re-stage pending uploads: %w", err)
+	if len(keptUIDs) > 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO pending_uploads (instance_id, content_hash, size, created_at, account_id)
+			SELECT $1, m.content_hash, m.size, NOW(), m.account_id
+			FROM messages m
+			WHERE m.mailbox_id = $2 AND m.uid = ANY($3) AND m.uploaded = FALSE AND m.expunged_at IS NULL
+			ON CONFLICT (content_hash, account_id) DO NOTHING`,
+			instanceID, mailboxID, keptUIDs); err != nil {
+			return fmt.Errorf("failed to re-stage pending uploads: %w", err)
+		}
 	}
 	return nil
 }
