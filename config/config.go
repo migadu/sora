@@ -3155,8 +3155,9 @@ var serverTypeKeyNotes = map[string]string{
 	"supported_extensions": "; a ManageSieve server advertises the [sieve] enabled_extensions",
 }
 
-// loginServerTypes are the server types with a password login, proxyServerTypes
-// those that dial backends.
+// loginServerTypes are the IMAP, POP3 and ManageSieve servers and proxies, the line
+// protocols with a password login (the HTTP User API's login reads none of the keys
+// they share); proxyServerTypes are those that dial backends.
 var (
 	loginServerTypes = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
 	proxyServerTypes = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
