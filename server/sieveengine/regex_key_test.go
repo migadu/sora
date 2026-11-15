@@ -54,14 +54,15 @@ func TestValidateScriptRefusesMalformedRegexKey(t *testing.T) {
 }
 
 // ValidateScript checks a :regex key without compiling it. Counted repetition
-// makes a 1000-byte key such as "(?:a...a){1000}" compile to a program of some
-// 45 MB, so compiling and keeping every key of a script made one 15 KB
-// PUTSCRIPT (under ManageSieve's 16 KB limit; the User API takes 64 KB)
-// allocate over 3 GB, and the delivery script cache hold some 700 MB for each
-// such script.
+// makes a key of a few bytes such as "(?:abcdefghi){1000}" compile to a program
+// of 9000 instructions, within the bound (#1428), which allocates some 1.7 MB
+// and keeps some 0.4 MB, so compiling and keeping every key of a script would
+// make one PUTSCRIPT under ManageSieve's 16 KB limit (the User API takes 64 KB)
+// allocate over a gigabyte, and the delivery script cache hold some 300 MB for
+// each such script.
 func TestValidateScriptDoesNotCompileRegexKeys(t *testing.T) {
-	key := `"(?:` + strings.Repeat("a", 990) + `){1000}"`
-	keys := make([]string, 15)
+	key := `"(?:abcdefghi){1000}"`
+	keys := make([]string, 40)
 	for i := range keys {
 		keys[i] = key
 	}
