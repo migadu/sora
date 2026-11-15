@@ -10,6 +10,7 @@ import (
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
 )
@@ -602,13 +603,13 @@ Examples:
 			fmt.Printf("Failed to find account: %v\n", err)
 			os.Exit(1)
 		}
-		query = `SELECT id, account_id, name, path FROM mailboxes WHERE account_id = $1 AND name ~ '` + encoded + `' AND deleted_at IS NULL ORDER BY account_id, name`
+		query = `SELECT id, account_id, name, path, COALESCE(is_shared, FALSE) FROM mailboxes WHERE account_id = $1 AND name ~ '` + encoded + `' AND deleted_at IS NULL ORDER BY account_id, name`
 		args = []any{accountID}
 	} else {
-		query = `SELECT id, account_id, name, path FROM mailboxes WHERE name ~ '` + encoded + `' AND deleted_at IS NULL ORDER BY account_id, name`
+		query = `SELECT id, account_id, name, path, COALESCE(is_shared, FALSE) FROM mailboxes WHERE name ~ '` + encoded + `' AND deleted_at IS NULL ORDER BY account_id, name`
 	}
 
-	db := rdb.GetOperationalDatabase()
+	opDB := rdb.GetOperationalDatabase()
 
 	// With the shared mailbox config, db.RenameMailbox refuses a rename across the
 	// shared namespace boundary, as on "mailbox rename" and IMAP RENAME: a personal
@@ -627,6 +628,158 @@ Examples:
 		AccountID   int64
 		MailboxName string
 		Path        string
+		IsShared    bool
+	}
+
+	type dryRunMailbox struct {
+		ID   int64
+		Name string
+		Path string
+	}
+	accountMailboxes := make(map[int64][]dryRunMailbox)
+	loadAccountMailboxes := func(accountID int64) ([]dryRunMailbox, error) {
+		if mboxes, ok := accountMailboxes[accountID]; ok {
+			return mboxes, nil
+		}
+		mRows, err := opDB.WritePool.Query(ctx,
+			`SELECT id, name, path FROM mailboxes WHERE account_id = $1 AND deleted_at IS NULL`,
+			accountID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
+		}
+		defer mRows.Close()
+		var mboxes []dryRunMailbox
+		for mRows.Next() {
+			var m dryRunMailbox
+			if err := mRows.Scan(&m.ID, &m.Name, &m.Path); err != nil {
+				return nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
+			}
+			mboxes = append(mboxes, m)
+		}
+		if err := mRows.Err(); err != nil {
+			return nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
+		}
+		accountMailboxes[accountID] = mboxes
+		return mboxes, nil
+	}
+
+	checkDryRunRename := func(r candidate, decoded string) error {
+		ids, err := helpers.GetIdsFromPath(r.Path)
+		if err != nil {
+			return err
+		}
+		var parentID *int64
+		if len(ids) > 1 {
+			parentID = &ids[len(ids)-2]
+		}
+
+		if !helpers.MailboxNameValid(decoded) {
+			return consts.ErrMailboxInvalidName
+		}
+
+		if globalConfig.SharedMailboxes.Enabled && globalConfig.SharedMailboxes.InNamespace(decoded) != r.IsShared {
+			return consts.ErrMailboxSharedBoundary
+		}
+
+		if r.IsShared {
+			hasAdminRight, err := rdb.CheckMailboxPermissionWithRetry(renameCtx, r.MailboxID, r.AccountID, db.ACLRightAdmin)
+			if err != nil {
+				return fmt.Errorf("failed to check admin permission: %w", err)
+			}
+			if !hasAdminRight {
+				return fmt.Errorf("permission denied: user does not have admin right on shared mailbox")
+			}
+		}
+
+		mboxes, err := loadAccountMailboxes(r.AccountID)
+		if err != nil {
+			return err
+		}
+
+		foundSelf := false
+		for _, m := range mboxes {
+			if m.ID == r.MailboxID {
+				foundSelf = true
+				continue
+			}
+			if strings.EqualFold(m.Name, decoded) {
+				return consts.ErrMailboxAlreadyExists
+			}
+		}
+		if !foundSelf {
+			return consts.ErrMailboxNotFound
+		}
+
+		if r.Path == "" {
+			return fmt.Errorf("mailbox has invalid empty path (data corruption)")
+		}
+
+		if parentID != nil {
+			if *parentID == r.MailboxID {
+				return fmt.Errorf("mailbox %d cannot be its own parent", r.MailboxID)
+			}
+			var parentPath string
+			foundParent := false
+			for _, m := range mboxes {
+				if m.ID == *parentID {
+					parentPath = m.Path
+					foundParent = true
+					break
+				}
+			}
+			if !foundParent {
+				return consts.ErrMailboxNotFound
+			}
+			if strings.HasPrefix(parentPath, r.Path) {
+				return fmt.Errorf("cannot move mailbox %d into one of its own sub-mailboxes", r.MailboxID)
+			}
+		}
+
+		delim := string(consts.MailboxDelimiter)
+		oldPrefix := r.MailboxName + delim
+		newPrefix := decoded + delim
+		oldPrefixRunes := len([]rune(oldPrefix))
+
+		var cascadedNames []string
+		for _, child := range mboxes {
+			if !helpers.IsDescendantOf(child.Path, r.Path) {
+				continue
+			}
+			childRunes := []rune(child.Name)
+			var suffix string
+			if oldPrefixRunes <= len(childRunes) {
+				suffix = string(childRunes[oldPrefixRunes:])
+			}
+			cascadedNames = append(cascadedNames, newPrefix+suffix)
+		}
+
+		if len(cascadedNames) > 0 {
+			exactConflicts := 0
+			for _, existing := range mboxes {
+				for _, cascaded := range cascadedNames {
+					if existing.Name == cascaded {
+						exactConflicts++
+						break
+					}
+				}
+			}
+			if exactConflicts > 0 {
+				return fmt.Errorf("rename would create conflicting mailbox names (%d conflicts)", exactConflicts)
+			}
+			for _, existing := range mboxes {
+				if existing.ID == r.MailboxID || helpers.IsDescendantOf(existing.Path, r.Path) {
+					continue
+				}
+				for _, cascaded := range cascadedNames {
+					if strings.EqualFold(existing.Name, cascaded) {
+						return consts.ErrMailboxAlreadyExists
+					}
+				}
+			}
+		}
+
+		return nil
 	}
 
 	fixed := 0
@@ -647,7 +800,7 @@ Examples:
 		if !fromDB {
 			rows = simulated
 		} else {
-			dbRows, err := db.WritePool.Query(ctx, query, args...)
+			dbRows, err := opDB.WritePool.Query(ctx, query, args...)
 			if err != nil {
 				fmt.Printf("Failed to query mailboxes: %v\n", err)
 				os.Exit(1)
@@ -655,7 +808,7 @@ Examples:
 
 			for dbRows.Next() {
 				var r candidate
-				if err := dbRows.Scan(&r.MailboxID, &r.AccountID, &r.MailboxName, &r.Path); err != nil {
+				if err := dbRows.Scan(&r.MailboxID, &r.AccountID, &r.MailboxName, &r.Path, &r.IsShared); err != nil {
 					fmt.Printf("Failed to scan row: %v\n", err)
 					os.Exit(1)
 				}
@@ -721,15 +874,40 @@ Examples:
 			}
 
 			if *dryRun {
+				if dryErr := checkDryRunRename(r, decoded); dryErr != nil {
+					fmt.Printf("  WOULD FAIL  account_id=%-6d  %q  ->  %q  (error: %v)\n", r.AccountID, r.MailboxName, decoded, dryErr)
+					failed++
+					processedIDs[r.MailboxID] = true
+					continue
+				}
+
 				fmt.Printf("  WOULD RENAME  account_id=%-6d  %q  ->  %q\n", r.AccountID, r.MailboxName, decoded)
 				fixed++
 				processedIDs[r.MailboxID] = true
 				renamedInRound++
+
+				delim := string(consts.MailboxDelimiter)
+				oldPrefix := r.MailboxName + delim
+				newPrefix := decoded + delim
+				oldPrefixRunes := len([]rune(oldPrefix))
+				mboxes := accountMailboxes[r.AccountID]
+				for j := range mboxes {
+					if mboxes[j].ID == r.MailboxID {
+						mboxes[j].Name = decoded
+					} else if helpers.IsDescendantOf(mboxes[j].Path, r.Path) {
+						childRunes := []rune(mboxes[j].Name)
+						var suffix string
+						if oldPrefixRunes <= len(childRunes) {
+							suffix = string(childRunes[oldPrefixRunes:])
+						}
+						mboxes[j].Name = newPrefix + suffix
+					}
+				}
+
 				// As the rename would, carry the new name down to the children.
-				prefix := r.MailboxName + string(consts.MailboxDelimiter)
 				for j := range rows {
 					c := &rows[j]
-					if c.AccountID == r.AccountID && helpers.IsDescendantOf(c.Path, r.Path) && strings.HasPrefix(c.MailboxName, prefix) {
+					if c.AccountID == r.AccountID && helpers.IsDescendantOf(c.Path, r.Path) && strings.HasPrefix(c.MailboxName, oldPrefix) {
 						c.MailboxName = decoded + c.MailboxName[len(r.MailboxName):]
 					}
 				}
@@ -781,7 +959,11 @@ Examples:
 
 	fmt.Println()
 	if *dryRun {
-		fmt.Printf("Dry run complete: %d would be renamed, %d skipped\n", fixed, skipped)
+		if failed > 0 {
+			fmt.Printf("Dry run complete: %d would be renamed, %d skipped, %d would fail\n", fixed, skipped, failed)
+		} else {
+			fmt.Printf("Dry run complete: %d would be renamed, %d skipped\n", fixed, skipped)
+		}
 	} else {
 		fmt.Printf("Done: %d renamed, %d skipped, %d failed\n", fixed, skipped, failed)
 	}
