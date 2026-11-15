@@ -427,6 +427,43 @@ type TLSLetsEncryptS3Config struct {
 	ServerSideEncryptionKMSKeyID string `toml:"server_side_encryption_kms_key_id"`
 }
 
+// The server-side encryption a certificate write can ask of the [tls.letsencrypt.s3]
+// store, besides "" for no encryption header at all.
+const (
+	CertificateSSEAES256 = "AES256"  // the store's own key management, the default
+	CertificateSSEKMS    = "aws:kms" // a KMS key, server_side_encryption_kms_key_id
+)
+
+// CertificateSSE returns the server-side encryption certificate writes ask of the store,
+// and its KMS key id: server_side_encryption, "AES256" when the key is absent.
+func (c TLSLetsEncryptS3Config) CertificateSSE() (algorithm, kmsKeyID string) {
+	algorithm = CertificateSSEAES256
+	if c.ServerSideEncryption != nil {
+		algorithm = *c.ServerSideEncryption
+	}
+	return algorithm, c.ServerSideEncryptionKMSKeyID
+}
+
+// ValidateCertificateSSE refuses server-side encryption settings that would not mean what
+// they say, rather than writing private keys under them: an algorithm other than
+// "AES256", "aws:kms" or "", "aws:kms" without a KMS key id, or a KMS key id with another
+// algorithm. TLSConfig.Validate and the TLS manager's S3 cache both check with it.
+func ValidateCertificateSSE(algorithm, kmsKeyID string) error {
+	switch algorithm {
+	case "", CertificateSSEAES256, CertificateSSEKMS:
+	default:
+		return fmt.Errorf("unsupported server-side encryption %q: use %q, %q or an empty value",
+			algorithm, CertificateSSEAES256, CertificateSSEKMS)
+	}
+	if algorithm == CertificateSSEKMS && kmsKeyID == "" {
+		return fmt.Errorf("server-side encryption %q requires a KMS key id", algorithm)
+	}
+	if algorithm != CertificateSSEKMS && kmsKeyID != "" {
+		return fmt.Errorf("a KMS key id is only used by server-side encryption %q, not %q", CertificateSSEKMS, algorithm)
+	}
+	return nil
+}
+
 // TLSLetsEncryptConfig holds Let's Encrypt automatic certificate management configuration
 type TLSLetsEncryptConfig struct {
 	Email           string                 `toml:"email"`            // Email for Let's Encrypt notifications
@@ -543,9 +580,11 @@ type TLSConfig struct {
 // Validate checks, with enabled = true, what the TLS manager needs of [tls] before it
 // opens anything: a known provider, cert_file and key_file for provider = "file", and
 // for provider = "letsencrypt" a [tls.letsencrypt] table with email, domains,
-// storage_provider = "s3" and a renew_before and sync_interval that parse. Whether the
-// certificate files can be read and the certificate store reached is found only by
-// opening them. tlsmanager.New runs it too.
+// storage_provider = "s3", a renew_before and sync_interval that parse, and in
+// [tls.letsencrypt.s3] access_key and secret_key both set or both empty and a
+// server-side encryption the store can be asked for. Whether the certificate files can
+// be read and the certificate store reached is found only by opening them.
+// tlsmanager.New runs it too.
 func (c *TLSConfig) Validate() error {
 	if !c.Enabled {
 		return nil
@@ -586,6 +625,13 @@ func (c *TLSLetsEncryptConfig) validate() error {
 		if _, err := helpers.ParseDuration(c.SyncInterval); err != nil {
 			return fmt.Errorf("invalid sync_interval duration %q: %w", c.SyncInterval, err)
 		}
+	}
+	// The certificate store's client refuses these before it connects.
+	if (c.S3.AccessKey == "") != (c.S3.SecretKey == "") {
+		return fmt.Errorf("letsencrypt.s3: %w", ErrS3KeysNotPaired)
+	}
+	if err := ValidateCertificateSSE(c.S3.CertificateSSE()); err != nil {
+		return fmt.Errorf("letsencrypt.s3: %w", err)
 	}
 	return nil
 }
