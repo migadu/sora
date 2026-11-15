@@ -87,11 +87,14 @@ func TestOpenAPIDeleteMessageResponse(t *testing.T) {
 }
 
 // handleDeleteMailbox refuses INBOX, and a shared mailbox without the 'x' right, with
-// 403 (#992).
+// 403 (#992), and a mailbox with child mailboxes with 409.
 func TestOpenAPIDeleteMailboxResponse(t *testing.T) {
 	op := openAPIOperation(t, "/mailboxes/{name}", "delete")
 	if _, ok := yamlSection(op, 8, "'403':"); !ok {
 		t.Error("DELETE /mailboxes/{name} does not list 403")
+	}
+	if _, ok := yamlSection(op, 8, "'409':"); !ok {
+		t.Error("DELETE /mailboxes/{name} does not list 409 (child mailboxes)")
 	}
 	if resp, ok := yamlSection(op, 8, "'400':"); ok && strings.Contains(resp, "INBOX") {
 		t.Errorf("DELETE /mailboxes/{name} documents the INBOX refusal as 400; it is 403:\n%s", resp)

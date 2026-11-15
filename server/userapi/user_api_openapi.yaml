@@ -194,6 +194,8 @@ paths:
           description: INBOX, or a shared mailbox without the `x` (delete mailbox) right.
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: The mailbox has child mailboxes; delete them first.
 
   /mailboxes/{name}/subscribe:
     post:
