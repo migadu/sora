@@ -52,6 +52,7 @@ type Session struct {
 	sessionID             string // Proxy session ID for end-to-end tracing (also forwarded to the backend)
 	clientAddr            string // Cached client address to avoid race with connection close
 	clientHelo            string // Client's announced LHLO name, forwarded to the backend via XCLIENT
+	lhloAccepted          bool   // An LHLO was accepted since the greeting or the last STARTTLS; MAIL needs one
 	releaseConn           func() // Connection limiter cleanup function
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
 	mu                    sync.Mutex
@@ -254,10 +255,14 @@ func (s *Session) handleConnection() {
 				s.sendResponse("501 5.5.4 Syntax error in parameters")
 				continue
 			}
+			// An accepted LHLO resets the session as RSET would (RFC 5321 section 4.1.4;
+			// LHLO is LMTP's EHLO, RFC 2033 section 4.1).
+			s.restartSession()
 			// Remember the client's announced name so we can forward it to the backend via
 			// XCLIENT (HELO=...); without it the backend's Received: trace falls back to the
 			// proxy's own LHLO name. args[0] is a single tokenized field (no spaces/CRLF).
 			s.clientHelo = args[0]
+			s.lhloAccepted = true
 			var lhlo strings.Builder
 			fmt.Fprintf(&lhlo, "250-%s\r\n", s.server.hostname)
 
@@ -283,6 +288,13 @@ func (s *Session) handleConnection() {
 			}
 
 		case "MAIL":
+			// RFC 5321 section 4.1.1.1: "a client MUST issue HELO or EHLO before starting
+			// a mail transaction" (LHLO in LMTP). 503, a MAIL reply of section 4.3.2, with
+			// the backend's text.
+			if !s.lhloAccepted {
+				s.sendResponse("503 5.5.1 Please introduce yourself first.")
+				continue
+			}
 			fromParam, found := findParameter(args, "FROM:")
 			if !found {
 				s.sendResponse("501 5.5.4 Syntax error in MAIL command (missing FROM)")
@@ -667,8 +679,12 @@ func (s *Session) handleConnection() {
 
 			s.DebugLog("STARTTLS negotiation successful")
 
-			// Client must send LHLO again after STARTTLS (RFC 3207)
-			// Continue to next iteration to wait for a new LHLO
+			// RFC 3207 section 4.2: the session is back in its initial state, and the
+			// server "MUST discard any knowledge obtained from the client, such as the
+			// argument to the EHLO command". MAIL needs a new LHLO.
+			s.restartSession()
+			s.clientHelo = ""
+			s.lhloAccepted = false
 
 		case "RSET":
 			s.resetTransaction()
@@ -2025,6 +2041,19 @@ func (s *Session) resetTransaction() {
 	s.declaredSize = ""
 }
 
+// restartSession ends the current transaction and drops a held backend, for an
+// accepted LHLO and a completed STARTTLS, which each start the session over. The
+// held backend's XCLIENT carried the client's earlier LHLO name: the next RCPT
+// connects afresh, and XCLIENT gives the backend the name in effect then. The
+// transaction is reset first, so the drop poisons nothing (see loseBackend).
+func (s *Session) restartSession() {
+	s.resetTransaction()
+	if s.backendConn != nil {
+		s.InfoLog("dropping backend connection: client started the session over", "backend", s.serverAddr)
+		s.loseBackend()
+	}
+}
+
 // loseBackend drops the backend connection. If the backend had already accepted a
 // recipient of the current transaction, the transaction is poisoned: the MTA believes
 // those recipients are accepted, so every further RCPT and DATA must answer 451 (retry
@@ -2033,13 +2062,14 @@ func (s *Session) resetTransaction() {
 // recipients and its single end-of-data reply would be attributed to the wrong one.
 func (s *Session) loseBackend() {
 	s.mu.Lock()
-	if s.backendConn != nil {
-		s.backendConn.Close()
-		s.backendConn = nil
-	}
+	backend := s.backendConn
+	s.backendConn = nil
 	s.backendRoute = nil
 	s.mu.Unlock()
 	s.backendHasMail = false
+	// This connection is being abandoned. Interrupt transport I/O before TLS
+	// cleanup, outside the mutex that cancellation and shutdown need too.
+	closeSessionTransport(backend)
 	if s.acceptedRcpts > 0 {
 		s.txPoisoned = true
 	}
