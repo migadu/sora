@@ -140,7 +140,7 @@ func TestLateNewOrderFailureDoesNotDropNewClaimReference(t *testing.T) {
 	old.expires = time.Now().Add(-time.Second)
 	nodeA.issuanceClaims[domain] = old
 	nodeA.claimMu.Unlock()
-	old.release(ctx)
+	old.hold.Release(ctx)
 	rt := &issuanceFence{manager: nodeA, base: okRoundTripper{}}
 	ecdsa, rsa := exchange(t, 10*time.Minute), exchange(t, 10*time.Minute)
 	for _, renewal := range []context.Context{ecdsa, rsa} {
@@ -276,14 +276,14 @@ func lapseClaim(t *testing.T, node *Manager, domain string) {
 	claim.expires = time.Now().Add(-time.Second)
 	node.issuanceClaims[domain] = claim
 	node.claimMu.Unlock()
-	if !held || claim.release == nil {
+	if !held || claim.hold == nil {
 		t.Fatalf("node holds no claim on %s", domain)
 	}
-	claim.release(context.Background())
+	claim.hold.Release(context.Background())
 }
 
-// A claim lapses issuanceClaimTTL after it was taken, also while an order started late
-// under it - a re-entrant order does not extend it - is still running. When the sibling
+// A claim can lapse while an order started late under it is still running: when the
+// fence could not be reached to extend the claim over the order. When the sibling
 // variant's order then takes a fresh claim, the older order's Put must not give that
 // claim away: the sibling is still ordering under it, and another node could start a
 // duplicate order.

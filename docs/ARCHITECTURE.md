@@ -213,9 +213,9 @@ in `db`. The resilient wrapper adds retries, timeouts, circuit breakers and the 
 the write pool and the read pool. Schema migrations are in [db/migrations](../db/migrations).
 See [DATABASE.md](DATABASE.md).
 
-**Cluster** ([cluster](../cluster)). Gossip membership between nodes. It shares per-user
-connection counts on proxies, kicks and proxy affinity, and elects the Let's Encrypt leader.
-See [CLUSTER.md](CLUSTER.md).
+**Cluster** ([cluster](../cluster)). Gossip membership between nodes. It shares the proxies'
+per-user and per-IP connection counts, kicks, proxy affinity and the proxies' authentication rate
+limits, and elects the Let's Encrypt leader. See [CLUSTER.md](CLUSTER.md).
 
 **TLS manager** ([tlsmanager](../tlsmanager)). Certificates from files or from Let's Encrypt.
 See [TLS.md](TLS.md).
@@ -251,8 +251,8 @@ safely.
 | Outgoing relay messages | Local disk, `[relay.queue] path` (default `/var/spool/sora/relay`) | See [RELAY.md](RELAY.md). |
 | Auth cache, affinity cache | Local SQLite files on proxy nodes | Disposable. See [PROXY.md](PROXY.md). |
 | Let's Encrypt certificates | The S3 bucket in `[tls.letsencrypt.s3]`, mirrored to a local fallback directory | See [TLS.md](TLS.md). |
-| Login rate-limit counts | Memory | Lost on restart. See [AUTHENTICATION.md](AUTHENTICATION.md). |
-| Per-user connection counts on proxies, affinity | Memory, shared between nodes by gossip | Lost on restart. See [CLUSTER.md](CLUSTER.md). |
+| Login rate-limit counts | Memory; the IMAP, POP3 and ManageSieve proxies share Tier 2 blocks and counts between nodes by gossip | Lost on restart. See [AUTHENTICATION.md](AUTHENTICATION.md) and [CLUSTER.md](CLUSTER.md#66-authentication-rate-limits-imap-pop3-and-managesieve-proxies). |
+| Per-user and per-IP connection counts on IMAP, POP3 and ManageSieve proxies, affinity | Memory, shared between nodes by gossip | Lost on restart. See [CLUSTER.md](CLUSTER.md). |
 | Client sessions | Memory of the node that holds the connection | |
 
 The default paths under `/tmp` are fine for a laptop and wrong for production: the staging

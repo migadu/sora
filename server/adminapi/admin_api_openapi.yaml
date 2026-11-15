@@ -1643,7 +1643,9 @@ paths:
         - Time range (messages deleted within the range)
 
         At least one criterion must be provided. Restored messages will be assigned new UIDs but preserve all other metadata and flags.
-        If the original mailbox was deleted, it will be automatically recreated.
+        If the original mailbox was deleted, it will be automatically recreated. With [shared_mailboxes] enabled, a mailbox
+        recreated in the shared namespace is a shared mailbox of the account with the initial ACL of a new one; the ACL
+        entries it had before it was deleted are not restored.
 
         Large restores are processed in chunks, each committed in its own transaction. If the operation fails part-way,
         the messages restored so far are kept and the error message states how many; repeating the same request restores

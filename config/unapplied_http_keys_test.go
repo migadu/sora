@@ -83,16 +83,26 @@ func TestWarnUnusedConfigOptions_AllowedHostsOnlyOnHTTPServers(t *testing.T) {
 	}
 }
 
-// Keys only some server types read (#908): listen_backlog by the mail servers and
-// proxies (the HTTP servers listen with the kernel's default backlog), the API keys,
-// the User API's JWT and CORS keys, and the metrics listener's path and collection
-// settings. Each one set on any other type is reported at startup, naming the key
-// and the server; on a type that reads it, nothing is reported.
+// Keys only some server types read (#908, #1081): listen_backlog by the mail servers
+// and proxies (the HTTP servers listen with the kernel's default backlog), the API
+// keys, the User API's JWT and CORS keys, the metrics listener's path and collection
+// settings, and the protocol, login and backend keys the start functions in
+// cmd/sora/main.go pass to some servers only. Each one set on any other type is
+// reported at startup, naming the key and the server; on a type that reads it,
+// nothing is reported.
 func TestWarnUnusedConfigOptions_KeysOnlySomeServerTypesRead(t *testing.T) {
 	mailServers := []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}
 	userAPI := []string{"http_user_api", "user_api_proxy"}
 	metricsOnly := []string{"metrics"}
-	no, n := false, 50
+	imapOnly := []string{"imap"}
+	imapAndProxy := []string{"imap", "imap_proxy"}
+	// The servers with a password login. The LMTP backend offers no AUTH, so
+	// insecure_auth has nothing to allow there.
+	loginServers := []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
+	proxies := []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
+	// The LMTP backend's only timeout is timeouts.command_timeout.
+	authIdle := []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}
+	no, yes, n := false, true, 50
 	keys := []struct {
 		key    string
 		set    func(*ServerConfig)
@@ -111,6 +121,44 @@ func TestWarnUnusedConfigOptions_KeysOnlySomeServerTypesRead(t *testing.T) {
 		{"user_metrics_threshold", func(s *ServerConfig) { s.UserMetricsThreshold = &n }, metricsOnly},
 		{"max_tracked_users", func(s *ServerConfig) { s.MaxTrackedUsers = &n }, metricsOnly},
 		{"hash_usernames", func(s *ServerConfig) { s.HashUsernames = &no }, metricsOnly},
+
+		// IMAP capabilities and the ID answer.
+		{"client_filters", func(s *ServerConfig) {
+			s.ClientFilters = []ClientCapabilityFilter{{ClientName: "^Mail$", DisableCaps: []string{"IDLE"}}}
+		}, imapOnly},
+		{"disabled_caps", func(s *ServerConfig) { s.DisabledCaps = []string{"IDLE"} }, imapOnly},
+		{"enable_preview", func(s *ServerConfig) { s.EnablePreview = true }, imapOnly},
+		{"additional_caps", func(s *ServerConfig) { s.AdditionalCaps = []string{"X-EXAMPLE"} }, imapAndProxy},
+		{"id_name", func(s *ServerConfig) { s.IDName = "Example" }, imapAndProxy},
+		{"id_version", func(s *ServerConfig) { s.IDVersion = "1.0" }, imapAndProxy},
+		{"id_vendor", func(s *ServerConfig) { s.IDVendor = "Example Org" }, imapAndProxy},
+		{"id_support_url", func(s *ServerConfig) { s.IDSupportURL = "https://example.com" }, imapAndProxy},
+
+		// Logins. Only the backends limit the SASL master login by network.
+		{"master_username", func(s *ServerConfig) { s.MasterUsername = "master" }, loginServers},
+		{"master_password", func(s *ServerConfig) { s.MasterPassword = "secret" }, loginServers},
+		{"master_sasl_username", func(s *ServerConfig) { s.MasterSASLUsername = "proxyuser" }, loginServers},
+		{"master_sasl_password", func(s *ServerConfig) { s.MasterSASLPassword = "proxypass" }, loginServers},
+		{"master_sasl_allowed_networks", func(s *ServerConfig) { s.MasterSASLAllowedNetworks = []string{"10.0.0.0/8"} }, []string{"imap", "pop3", "managesieve"}},
+		{"insecure_auth", func(s *ServerConfig) { s.InsecureAuth = true }, loginServers},
+		{"auth_idle_timeout", func(s *ServerConfig) { s.AuthIdleTimeout = "2m" }, authIdle},
+		{"debug", func(s *ServerConfig) { s.Debug = true }, mailServers},
+
+		// The proxies' backend legs.
+		{"remote_port", func(s *ServerConfig) { s.RemotePort = int64(143) }, proxies},
+		{"connect_timeout", func(s *ServerConfig) { s.ConnectTimeout = "10s" }, proxies},
+		{"remote_dns_refresh", func(s *ServerConfig) { s.RemoteDNSRefresh = "1m" }, proxies},
+		{"remote_health_checks", func(s *ServerConfig) { s.RemoteHealthChecks = &yes }, proxies},
+		{"enable_affinity", func(s *ServerConfig) { s.EnableAffinity = true }, proxies},
+		{"remote_use_id_command", func(s *ServerConfig) { s.RemoteUseIDCommand = true }, []string{"imap_proxy"}},
+		{"remote_use_xclient", func(s *ServerConfig) { s.RemoteUseXCLIENT = true }, []string{"pop3_proxy", "lmtp_proxy"}},
+		{"remote_use_utf8", func(s *ServerConfig) { s.RemoteUseUTF8 = true }, []string{"pop3_proxy"}},
+
+		// Size limits and the ManageSieve proxy's extensions.
+		{"max_message_size", func(s *ServerConfig) { s.MaxMessageSize = "10mb" }, []string{"lmtp", "lmtp_proxy", "http_admin_api"}},
+		{"append_limit", func(s *ServerConfig) { s.AppendLimit = "10mb" }, imapOnly},
+		{"max_script_size", func(s *ServerConfig) { s.MaxScriptSize = "32kb" }, []string{"managesieve"}},
+		{"supported_extensions", func(s *ServerConfig) { s.SupportedExtensions = []string{"vacation"} }, []string{"managesieve_proxy"}},
 	}
 	for _, k := range keys {
 		for _, serverType := range ServerTypes {
