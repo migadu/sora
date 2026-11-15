@@ -49,10 +49,13 @@ func (b *LogBuffer) WaitForLine(t *testing.T, parts ...string) string {
 }
 
 // loginResultMessages are the messages a backend logs a login's result under.
+// "authorization failed" is a login whose credentials checked out but that asked to act
+// as another user.
 var loginResultMessages = []string{
 	`msg="authentication successful"`,
 	`msg="authentication failed"`,
 	`msg="authentication unavailable"`,
+	`msg="authorization failed"`,
 }
 
 // RequireLoginResults checks the login-result lines captured for address. Each login's
