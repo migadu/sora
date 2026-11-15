@@ -155,8 +155,9 @@ func (b *greetingBackend) serve(conn net.Conn, id int) {
 //     the initial state", and "the server MUST discard any knowledge obtained from
 //     the client, such as the argument to the EHLO command".
 //
-// So the transaction in progress is gone (RCPT gets 503 until a new MAIL), after
-// STARTTLS a MAIL before a new LHLO is refused, and a backend held from before,
+// So the transaction in progress is gone (RCPT gets 503 until a new MAIL, after
+// STARTTLS as soon as the handshake is done), after STARTTLS a MAIL before a new
+// LHLO is refused, and a backend held from before,
 // whose XCLIENT carried the earlier LHLO name, is no longer used: the next recipient
 // reaches the backend on a new connection that XCLIENT gives the new name.
 func TestRegreetingResetsSession(t *testing.T) {
@@ -211,6 +212,11 @@ func TestRegreetingResetsSession(t *testing.T) {
 
 			if regreet == "STARTTLS" {
 				conn, reader = upgrade(t, front, reader)
+				// The plaintext transaction ends with the handshake, not at the next
+				// LHLO: a RCPT that continues it has no MAIL in effect, and the backend
+				// held for it is already dropped.
+				step("RCPT TO:<a@example.com>", "503 5.5.1 ")
+				backend.waitClosed(t, 1)
 				step("MAIL FROM:<early@example.com>", "503 5.5.1 ")
 				// The session wrote clientHelo, if at all, before the reply just read.
 				if sess.clientHelo != "" {
