@@ -63,6 +63,7 @@ func TestS3Importer_ForceReimportDryRunMatchesImport(t *testing.T) {
 		opts.Email, opts.Workers, opts.CleanupDB, opts.InstanceID = email, 1, true, "test-instance"
 		si, err := NewS3Importer(ctx, rdb, s3storage, opts)
 		require.NoError(t, err)
+		require.NoError(t, si.lookupAccount())
 		t.Cleanup(func() { si.Close() })
 		for _, o := range objects {
 			_, err := si.db.Exec(`INSERT INTO s3_objects (key, size, last_modified, etag, domain, local_part, content_hash)

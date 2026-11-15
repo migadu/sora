@@ -348,6 +348,9 @@ func TestS3Importer_DryRunChangesNothing(t *testing.T) {
 		"example.com", "dryrun-s3", hash); err != nil {
 		t.Fatal(err)
 	}
+	if err := si.lookupAccount(); err != nil {
+		t.Fatalf("lookupAccount: %v", err)
+	}
 	if err := si.performDryRun(); err != nil {
 		t.Fatalf("dry run: %v", err)
 	}
