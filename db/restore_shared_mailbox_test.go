@@ -14,10 +14,11 @@ import (
 
 // TestRestoreMessages_RecreatesSharedMailboxAsShared: a restore that recreates a deleted
 // mailbox in the shared namespace makes it a shared mailbox, as createMailbox makes one:
-// is_shared, the owner's domain, and the initial ACL of a new shared mailbox (#1289). It
-// came back as a personal mailbox (is_shared = false, no owner_domain, no ACL), which LIST
-// shows in the shared namespace and SETACL refuses to share. The ACL the mailbox had
-// before it was deleted is gone with it and does not come back.
+// is_shared and the owner's domain (#1289). It came back as a personal mailbox
+// (is_shared = false, no owner_domain, no ACL), which LIST shows in the shared namespace
+// and SETACL refuses to share. The ACL the mailbox had before it was deleted is gone with
+// it and does not come back, and it does not take a live shared parent's ACL either: each
+// level the restore recreates gets one entry, the owner with default_rights.
 func TestRestoreMessages_RecreatesSharedMailboxAsShared(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -110,8 +111,7 @@ func TestRestoreMessages_RecreatesSharedMailboxAsShared(t *testing.T) {
 		for name, m := range map[string]mailboxRow{"Shared": root, "Shared/Team": team} {
 			assert.True(t, m.shared, "%s is_shared", name)
 			assert.Equal(t, "example.com", m.domain, "%s owner_domain", name)
-			// The root gets the creator entry with default_rights, and Shared/Team a copy
-			// of its shared parent's entries, as IMAP CREATE Shared/Team makes them. The
+			// Each recreated level gets the owner entry with default_rights only. The
 			// grantee's entry on the deleted Shared/Team is not restored.
 			assert.Equal(t, map[string]string{ownerEmail: "lrswipkxte"}, acl(m.id), "%s ACL", name)
 		}
@@ -120,21 +120,52 @@ func TestRestoreMessages_RecreatesSharedMailboxAsShared(t *testing.T) {
 	})
 
 	t.Run("under a live shared parent", func(t *testing.T) {
+		// Shared/Sales grants the grantee "lr". Shared/Sales/Confidential, created below
+		// it, inherits that entry (RFC 4314 section 4, CREATE), and the owner then takes
+		// the grantee off it. Once Confidential is deleted and restored, a copy of the
+		// parent's entries would let the grantee read the messages it was kept away from.
 		require.NoError(t, db.CreateMailboxForUser(ctx, ownerID, "Shared/Sales"))
 		require.NoError(t, db.GrantMailboxAccessByIdentifier(ctx, ownerID, granteeEmail, "Shared/Sales", "lr"))
-		require.NoError(t, db.CreateMailboxForUser(ctx, ownerID, "Shared/Sales/Q1"))
-		require.NoError(t, db.GrantMailboxAccessByIdentifier(ctx, ownerID, granteeEmail, "Shared/Sales/Q1", "lrsw"))
-		msgID := insertTestMessage(t, db, ownerID, mailbox("Shared/Sales/Q1").id, "Shared/Sales/Q1", "q1", "<q1@example.com>")
-		deleteMailbox(ctx, "Shared/Sales/Q1")
+		require.NoError(t, db.CreateMailboxForUser(ctx, ownerID, "Shared/Sales/Confidential"))
+		created := mailbox("Shared/Sales/Confidential")
+		require.Equal(t, map[string]string{ownerEmail: "lrswipkxte", granteeEmail: "lr"}, acl(created.id),
+			"a mailbox created under a shared parent still copies the parent's entries")
+		require.NoError(t, db.RevokeMailboxAccessByIdentifier(ctx, created.id, granteeEmail))
+		msgID := insertTestMessage(t, db, ownerID, created.id, "Shared/Sales/Confidential", "confidential", "<confidential@example.com>")
+		deleteMailbox(ctx, "Shared/Sales/Confidential")
 
-		restore(ctx, "Shared/Sales/Q1")
+		restore(ctx, "Shared/Sales/Confidential")
 
-		q1 := mailbox("Shared/Sales/Q1")
-		assert.True(t, q1.shared, "is_shared")
-		assert.Equal(t, "example.com", q1.domain, "owner_domain")
-		// A copy of the parent's entries now, not the "lrsw" the deleted Q1 granted.
-		assert.Equal(t, map[string]string{ownerEmail: "lrswipkxte", granteeEmail: "lr"}, acl(q1.id), "ACL")
-		assert.Equal(t, q1.id, liveIn(msgID), "the message is back in Shared/Sales/Q1")
+		restored := mailbox("Shared/Sales/Confidential")
+		assert.True(t, restored.shared, "is_shared")
+		assert.Equal(t, "example.com", restored.domain, "owner_domain")
+		assert.Equal(t, map[string]string{ownerEmail: "lrswipkxte"}, acl(restored.id),
+			"the owner only: no copy of the parent's entries")
+		assert.Equal(t, map[string]string{ownerEmail: "lrswipkxte", granteeEmail: "lr"}, acl(mailbox("Shared/Sales").id),
+			"the parent's ACL is unchanged")
+		assert.Equal(t, restored.id, liveIn(msgID), "the message is back in Shared/Sales/Confidential")
+	})
+
+	t.Run("levels recreated under a live shared parent", func(t *testing.T) {
+		// Shared/Ops is live and grants the grantee "lr"; Archive and Archive/2025 below it
+		// are both gone. Each level the restore recreates gets the owner entry only.
+		require.NoError(t, db.CreateMailboxForUser(ctx, ownerID, "Shared/Ops"))
+		require.NoError(t, db.GrantMailboxAccessByIdentifier(ctx, ownerID, granteeEmail, "Shared/Ops", "lr"))
+		require.NoError(t, db.CreateMailboxForUser(ctx, ownerID, "Shared/Ops/Archive/2025"))
+		msgID := insertTestMessage(t, db, ownerID, mailbox("Shared/Ops/Archive/2025").id, "Shared/Ops/Archive/2025", "2025", "<ops-2025@example.com>")
+		deleteMailbox(ctx, "Shared/Ops/Archive/2025")
+		deleteMailbox(ctx, "Shared/Ops/Archive")
+
+		restore(ctx, "Shared/Ops/Archive/2025")
+
+		archive, year := mailbox("Shared/Ops/Archive"), mailbox("Shared/Ops/Archive/2025")
+		for name, m := range map[string]mailboxRow{"Shared/Ops/Archive": archive, "Shared/Ops/Archive/2025": year} {
+			assert.True(t, m.shared, "%s is_shared", name)
+			assert.Equal(t, "example.com", m.domain, "%s owner_domain", name)
+			assert.Equal(t, map[string]string{ownerEmail: "lrswipkxte"}, acl(m.id), "%s ACL", name)
+		}
+		assert.Equal(t, archive.path, year.path[:len(archive.path)], "Archive/2025 is linked under Archive")
+		assert.Equal(t, year.id, liveIn(msgID), "the message is back in Shared/Ops/Archive/2025")
 	})
 
 	t.Run("sharing disabled", func(t *testing.T) {

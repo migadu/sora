@@ -1401,8 +1401,21 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 			return fmt.Errorf("mailbox %d cannot be its own parent", mailboxID)
 		}
 
-		// Lock the parent row as well to prevent it from being deleted/moved during this transaction.
-		err = tx.QueryRow(ctx, "SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL FOR UPDATE", *newParentID, AccountID).Scan(&newParentPath)
+		// Lock the parent row as well to prevent it from being deleted/moved during this
+		// transaction. As in createMailbox, it must still have the name that the new name
+		// gives it: callers resolve its ID by that name in an earlier transaction, and a
+		// rename of the parent or of an ancestor (which locks its descendants FOR UPDATE)
+		// committed since would otherwise leave this mailbox below the renamed parent
+		// under the old name (issue #1298). A parent renamed away is not found.
+		newParentName := ""
+		if i := strings.LastIndex(newName, string(consts.MailboxDelimiter)); i >= 0 {
+			newParentName = newName[:i]
+		}
+		err = tx.QueryRow(ctx, `
+			SELECT path FROM mailboxes
+			WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL AND LOWER(name) = LOWER($3)
+			FOR UPDATE
+		`, *newParentID, AccountID, newParentName).Scan(&newParentPath)
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				logger.Error("Database: new parent mailbox not found for rename", "parent_id", *newParentID)
