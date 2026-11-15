@@ -2,11 +2,13 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/migadu/sora/consts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -165,5 +167,43 @@ func TestScriptNameNotStorable(t *testing.T) {
 			return database.RenameScript(ctx, tx, accountID, name, "renamed")
 		})
 		assert.ErrorIs(t, err, consts.ErrDBNotFound, "RenameScript(%q)", name)
+	}
+}
+
+// TestScriptContentNotStorable: CreateScript and UpdateScript reject unstorable script
+// content or names (NUL byte or invalid UTF-8) before sending the statement to PostgreSQL
+// so callers never receive a raw SQLSTATE 22021 *pgconn.PgError.
+func TestScriptContentNotStorable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	database := setupTestDatabase(t)
+	defer database.Close()
+	ctx := context.Background()
+	accountID := createTestAccountForSieve(t, database, ctx)
+
+	var existing *SieveScript
+	require.NoError(t, inSieveTx(t, database, ctx, func(tx pgx.Tx) error {
+		var err error
+		existing, err = database.CreateScript(ctx, tx, accountID, "existing", "keep;")
+		return err
+	}))
+
+	for _, content := range []string{"# \x00\nkeep;\n", "# \xff\nkeep;\n", "# caf\xc3\nkeep;\n"} {
+		err := inSieveTx(t, database, ctx, func(tx pgx.Tx) error {
+			_, err := database.CreateScript(ctx, tx, accountID, "fresh", content)
+			return err
+		})
+		require.Error(t, err, "CreateScript(%q)", content)
+		var pgErr *pgconn.PgError
+		assert.False(t, errors.As(err, &pgErr), "CreateScript(%q) leaked PostgreSQL error %v", content, err)
+
+		err = inSieveTx(t, database, ctx, func(tx pgx.Tx) error {
+			_, err := database.UpdateScript(ctx, tx, existing.ID, accountID, "existing", content)
+			return err
+		})
+		require.Error(t, err, "UpdateScript(%q)", content)
+		assert.False(t, errors.As(err, &pgErr), "UpdateScript(%q) leaked PostgreSQL error %v", content, err)
 	}
 }

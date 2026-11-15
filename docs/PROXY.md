@@ -63,8 +63,10 @@ After the backend accepts the login, the proxy sends the backend's reply to the 
 a byte pipe. Everything after login (capabilities, IDLE, FETCH) is the backend's.
 
 The LMTP proxy does not log in. For each `RCPT TO` it finds the recipient's backend, connects (or
-reuses the connection it holds) and forwards the command. The User API proxy forwards each HTTP
-request; the backend checks the JWT token.
+reuses the connection it holds) and forwards the command. Like the backend, it does not announce
+`DSN`, so the sending MTA issues the notifications a sender asked for (RFC 3461 §5.2.2); `NOTIFY`,
+`ORCPT`, `RET` and `ENVID` sent anyway are accepted and not forwarded. The User API proxy forwards
+each HTTP request; the backend checks the JWT token.
 
 A node can run proxies and backend servers in the same process. A node that runs only proxies is a
 **proxy node**. [Section 13](#13-proxy-nodes-and-the-database) explains when such a node connects
@@ -241,11 +243,12 @@ The proxy sends `GET` to `url` after replacing placeholders:
 
 With `auth_token` set, the request carries `Authorization: Bearer <auth_token>`.
 
-The URL must use `https://`, unless its host is `localhost` or a loopback address. Sora refuses to
-start a proxy with a plain `http://` URL to any other host, because the request and answer carry
-password hashes. It also refuses a URL with `$email` or `$ip` in the host, and a `timeout`,
-`circuit_breaker` or `transport` duration it cannot parse, with `lookup_local_users` or without.
-`sora-admin config validate` fails the file for the same reasons.
+The URL must be an absolute URL with a host, and use `https://` unless its host is `localhost` or
+a loopback address. Sora refuses to start a proxy with a plain `http://` URL to any other host,
+because the request and answer carry password hashes. It also refuses a URL that does not parse,
+has no host or has a scheme other than `http` or `https`, a URL with `$email` or `$ip` in the host,
+and a `timeout`, `circuit_breaker` or `transport` duration or a `remote_port` it cannot parse, with
+`lookup_local_users` or without. `sora-admin config validate` fails the file for the same reasons.
 
 ### 4.2 The answer
 
@@ -621,10 +624,17 @@ A remote lookup `server` given as a hostname is resolved when it is dialed.
 
 ### 7.3 Connect timeouts
 
-`connect_timeout` (default `30s`) limits one TCP connect and the TLS handshake. Because a login may
-try the preferred backend and then fall back, the whole attempt gets
-`connect_timeout × min(number of backends + 1, 3)` (90 seconds with the default). A backend that
-drops packets cannot use up the time of every fallback.
+`connect_timeout` (default `30s`) limits each TCP connect and each implicit-TLS handshake.
+The IMAP and ManageSieve proxies put an overall deadline around a connection attempt, so a dead
+pool cannot take one timeout per backend. One attempt's budget is `connect_timeout`, doubled
+when the manager or any named pool uses implicit TLS. With `n = number of backends + 1` (the
+preferred backend plus fallbacks), the overall budget is `min(n + 0.5, 4)` times that per-attempt
+budget. The extra half attempt allows scheduling and teardown between dials. At the default,
+the cap is 120 seconds for plaintext and 240 seconds for implicit TLS.
+
+A caller cancellation or a shorter caller deadline is not charged to backend health. A phase
+that was allowed its full `connect_timeout` and failed counts even when the process resumes
+after the overall deadline has also elapsed.
 
 After connecting, the proxy reads the backend's greeting and does its own login within
 `connect_timeout` each. A greeting other than `* OK` (IMAP) is a failure.
@@ -819,6 +829,11 @@ written to disk, and the cache is empty after a restart.
 |---|---|---|
 | success | accepted from the cache, routed as before | entry younger than `positive_revalidation_window`: rejected without asking; older: checked again |
 | failure | rejected from the cache | checked again |
+
+The master username form `user@example.com@MASTERUSER` logs in with two passwords, `master_password`
+and the user's own ([AUTHENTICATION.md](AUTHENTICATION.md#81-master-username-master_username-and-master_password)),
+and both use the one entry for that name. A success entry made with one of them never rejects the
+other: the login is checked again, as for an older entry.
 
 Entries are not extended by use: a success entry expires `positive_ttl` after it was made, and the
 next login checks again. The IMAP and POP3 proxies delete the entry when the backend cannot be

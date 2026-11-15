@@ -500,7 +500,8 @@ numbers for `STORE`, UIDs for `UID STORE`), per RFC 7162 §3.1.3.
 
 `GETMETADATA` and `SETMETADATA` store annotations per mailbox, and per account for the server
 entry (mailbox `""`). Entry names must start with `/private/` or `/shared/` and are
-case-insensitive. A wildcard mailbox name (`*` or `%`) gets `NO [CLIENTBUG]`. The size and count
+case-insensitive; a `SETMETADATA` naming one entry twice in different letter case gets
+`BAD [CLIENTBUG]`. A wildcard mailbox name (`*` or `%`) gets `NO [CLIENTBUG]`. The size and count
 limits come from the `[metadata]` section (64 KiB per entry, 100 entries per mailbox, 50 server
 entries per account, 1 MiB per account by default); see [STORAGE.md](STORAGE.md).
 
@@ -687,7 +688,9 @@ Matching:
   its name and version patterns both match the `ID` data. A name or version pattern that is left
   out counts as matching; a client that sent no `ID` never matches a name or version pattern.
 - Every matching filter applies; their `disable_caps` add up.
-- A filter whose pattern does not compile is skipped (logged at debug level). Check new patterns.
+- Patterns are Go regular expressions (RE2 syntax). A pattern that does not compile stops startup,
+  naming the entry, the key and the pattern; `sora-admin config validate` reports it too, and a
+  reload with it is skipped for that server.
 - The key is `ja4_fingerprints`, a list. A single `ja4_fingerprint` key is unknown and ignored.
 
 Where the JA4 fingerprint comes from, in order of preference:
@@ -908,9 +911,10 @@ Received: from <helo> ([<client-ip>])
 `<helo>` is the `HELO` value from XCLIENT if the MTA sent one, otherwise the `LHLO` name. The
 protocol word is `UTF8LMTP` for an internationalised transaction (RFC 6531 §3.7.3).
 
-The built-in default script files messages whose `X-Spam` header contains `Yes` into `Junk`. For an
-address with a detail, it files the message into a mailbox named after the detail, creating it if
-needed. Any sender can therefore create a folder in an account by writing to `user+name@`.
+The built-in default script files messages whose `X-Spam` header contains `Yes` into the
+account's personal mailbox with the `\Junk` special-use attribute, or into `Junk` if none has it.
+For an address with a detail, it files the message into a mailbox named after the detail, creating
+it if needed. Any sender can therefore create a folder in an account by writing to `user+name@`.
 
 A message that is already in the target mailbox (same Message-ID and content, or the same bytes
 delivered again after an MTA retry) is answered `250` and not stored a second time.

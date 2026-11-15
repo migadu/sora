@@ -191,6 +191,7 @@ type LMTPServerBackend struct {
 	uploader     *uploader.UploadWorker
 	server       *smtp.Server
 	appCtx       context.Context
+	cancel       context.CancelFunc
 	tlsConfig    *tls.Config
 	ftsRetention time.Duration
 	relayQueue   delivery.RelayQueue // Disk-based queue for relay retry
@@ -310,10 +311,19 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		options.TLSUseStartTLS = false
 	}
 
+	serverCtx, serverCancel := context.WithCancel(appCtx)
+	created := false
+	defer func() {
+		if !created {
+			serverCancel()
+		}
+	}()
+
 	backend := &LMTPServerBackend{
 		addr:               addr,
 		name:               name,
-		appCtx:             appCtx,
+		appCtx:             serverCtx,
+		cancel:             serverCancel,
 		hostname:           hostname,
 		instanceID:         instanceIDOrHostname(options.InstanceID, hostname),
 		maintenanceGate:    options.MaintenanceGate,
@@ -395,7 +405,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// context: go-smtp cancels the derived context when the client disconnects,
 	// the connection ends, or the server shuts down, and BaseContext adds app
 	// shutdown on top. Sessions derive their context from it in NewSession.
-	s.BaseContext = func(net.Listener) context.Context { return appCtx }
+	s.BaseContext = func(net.Listener) context.Context { return serverCtx }
 	s.AllowInsecureAuth = options.InsecureAuth
 	s.LMTP = true
 	s.MaxRecipients = 1 // Enforce single recipient per LMTP transaction.
@@ -479,7 +489,8 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	}
 
 	// Start connection limiter cleanup
-	backend.limiter.StartCleanup(appCtx)
+	backend.limiter.StartCleanup(serverCtx)
+	created = true
 
 	return backend, nil
 }
@@ -587,6 +598,10 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 }
 
 func (b *LMTPServerBackend) Start(errChan chan error) {
+	if b.appCtx.Err() != nil {
+		return
+	}
+
 	var listener net.Listener
 	var err error
 
@@ -596,6 +611,9 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	// Create base TCP listener with custom backlog
 	tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", b.server.Addr, b.listenBacklog)
 	if err != nil {
+		if b.cancel != nil {
+			b.cancel()
+		}
 		errChan <- fmt.Errorf("failed to create listener: %w", err)
 		return
 	}
@@ -684,6 +702,9 @@ func (b *LMTPServerBackend) ReloadConfig(cfg config.ServerConfig) error {
 }
 
 func (b *LMTPServerBackend) Close() error {
+	if b.cancel != nil {
+		b.cancel()
+	}
 	if b.server != nil {
 		return b.server.Close()
 	}

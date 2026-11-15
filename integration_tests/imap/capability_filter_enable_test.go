@@ -13,11 +13,11 @@ import (
 )
 
 // enableFilter withdraws two extensions IMAP4rev2 includes (RFC 9051 Appendix
-// E) and one it does not, from the client named "buggy".
+// E) and two it does not, from the client named "buggy".
 func enableFilter(o *imapserver.IMAPServerOptions) {
 	o.CapabilityFilters = []config.ClientCapabilityFilter{{
 		ClientName:  "^buggy$",
-		DisableCaps: []string{"UIDPLUS", "MOVE", "CONDSTORE"},
+		DisableCaps: []string{"UIDPLUS", "MOVE", "CONDSTORE", "SORT"},
 	}}
 }
 
@@ -38,8 +38,9 @@ func advertisedCaps(t *testing.T, resp string) []string {
 // extensions away: with IMAP4rev2 gone the session refused UID EXPUNGE and MOVE
 // with BAD while go-imap went on answering SEARCH with ESEARCH (#905). RFC 9051
 // §6.3.1: "Once enabled using ENABLE, each extension remains active until the
-// IMAP connection is closed." The filter still withdraws what the client has
-// not enabled (QRESYNC here).
+// IMAP connection is closed." Extensions that depend on a kept capability and
+// were not disabled themselves (QRESYNC on CONDSTORE) stay offered, while what
+// the client has not enabled (SORT and its extensions here) is still withdrawn.
 func TestIMAP_ClientFilterAfterEnableKeepsEnabledExtensions(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	c := dialDisabledCaps(t, enableFilter, false)
@@ -54,13 +55,15 @@ func TestIMAP_ClientFilterAfterEnableKeepsEnabledExtensions(t *testing.T) {
 	c.mustOK(`ID ("name" "buggy")`)
 
 	caps := advertisedCaps(t, c.mustOK("CAPABILITY"))
-	for _, want := range []string{"IMAP4rev2", "CONDSTORE"} {
+	for _, want := range []string{"IMAP4rev2", "CONDSTORE", "QRESYNC"} {
 		if !slices.Contains(caps, want) {
-			t.Errorf("CAPABILITY after ENABLE and ID lost enabled %s: %v", want, caps)
+			t.Errorf("CAPABILITY after ENABLE and ID lost %s: %v", want, caps)
 		}
 	}
-	if slices.Contains(caps, "QRESYNC") {
-		t.Errorf("CAPABILITY still offers QRESYNC, which the filter withdraws and the client did not enable: %v", caps)
+	for _, gone := range []string{"SORT", "SORT=DISPLAY", "ESORT"} {
+		if slices.Contains(caps, gone) {
+			t.Errorf("CAPABILITY still offers %s, which the filter withdraws and the client did not enable: %v", gone, caps)
+		}
 	}
 
 	c.mustOK("SELECT INBOX")
@@ -149,10 +152,12 @@ func TestIMAP_ClientFilterAfterCondStoreEnablingCommandKeepsCondStore(t *testing
 	c.mustOK(`ID ("name" "buggy")`)
 
 	caps := advertisedCaps(t, c.mustOK("CAPABILITY"))
-	if !slices.Contains(caps, "CONDSTORE") {
-		t.Errorf("CAPABILITY after SELECT (CONDSTORE) and ID lost CONDSTORE: %v", caps)
+	for _, want := range []string{"CONDSTORE", "QRESYNC"} {
+		if !slices.Contains(caps, want) {
+			t.Errorf("CAPABILITY after SELECT (CONDSTORE) and ID lost %s: %v", want, caps)
+		}
 	}
-	for _, gone := range []string{"IMAP4rev2", "UIDPLUS", "MOVE", "QRESYNC"} {
+	for _, gone := range []string{"IMAP4rev2", "UIDPLUS", "MOVE", "SORT", "SORT=DISPLAY", "ESORT"} {
 		if slices.Contains(caps, gone) {
 			t.Errorf("CAPABILITY still offers %s, which the filter withdraws and the client did not enable: %v", gone, caps)
 		}

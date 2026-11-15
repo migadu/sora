@@ -161,6 +161,12 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 			wantErr: []string{"invalid remote_lookup.timeout"},
 		},
 		{
+			// The issue's file: every proxy refuses to be built without backends (#1038).
+			name:    "proxy without remote_addrs or [[pool]] blocks",
+			content: imapProxy + "\n[server.remote_lookup]\nenabled = true\nurl = \"https://lookup.example.com/lookup?email=$email\"\n",
+			wantErr: []string{"[FAIL] server 'imap-proxy':\n   remote_addrs is required unless the file declares [[pool]] blocks"},
+		},
+		{
 			name:    "remote_lookup the proxies start with",
 			content: imapProxy + remoteLookup + "url = \"https://lookup.example.com/lookup?email=$email\"\ntimeout = \"5s\"\n",
 		},

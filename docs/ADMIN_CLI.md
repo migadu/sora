@@ -966,6 +966,22 @@ Notes on `delete`:
   local mirror.
 - `--key` leaves the local mirror alone.
 
+Notes on `clean`:
+
+- A node can renew an expired certificate while `clean` runs, after `clean` has read the
+  expired one. On a bucket that keeps versions (Backblaze B2 buckets always do), `clean`
+  deletes only the version it read and found expired, so the renewal, a newer version, stays.
+  If deleting that version brings back an older one that has expired too, `clean` deletes that
+  one as well. This needs the right to delete object versions: `s3:DeleteObjectVersion` on
+  AWS, the `deleteFiles` capability on Backblaze B2.
+- Without a usable version id, including a `null` version exposed after a version delete,
+  `clean` sends the inspected object's ETag in `If-Match`. A changed object is kept.
+  This requires conditional DELETE support from the S3 provider; a missing ETag or an
+  unsupported condition fails that cleanup operation and keeps the object. `clean` never
+  retries it as an unconditional delete. Versioned B2 objects continue to use version ids.
+- A local copy is removed only if it still holds an expired certificate when `clean` removes
+  it. A renewal written over it during the run stays.
+
 `cache` writes files with mode `0600` as the user running the command. Run it as the user the
 server runs as, or fix the ownership afterwards.
 

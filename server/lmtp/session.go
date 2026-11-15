@@ -685,12 +685,9 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		references = nil
 	}
 
-	if sentDate.IsZero() {
-		sentDate = time.Now()
-		s.DebugLog("no sent date found, using current time", "sent_date", sentDate)
-	} else {
-		s.DebugLog("message sent date", "sent_date", sentDate)
-	}
+	// A zero sentDate (no Date: header that parses) is stored as the internal date and
+	// reported as absent (db.InsertMessageOptions.SentDate).
+	s.DebugLog("message sent date", "sent_date", sentDate)
 
 	var plaintextBody *string
 	plaintextBodyResult, extractErr := helpers.ExtractPlaintextBody(messageContent)
@@ -794,8 +791,14 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			result = sieveengine.Result{Action: sieveengine.ActionKeep}
 		} else {
 			metrics.SieveExecutions.WithLabelValues("lmtp", "success").Inc()
-			// Set the result from the default script
-			result = defaultResult
+			// Set the result from the default script, its spam filing pointed at the
+			// account's \Junk mailbox, whatever that is named.
+			var junkErr error
+			if result, junkErr = delivery.ResolveDefaultJunk(readCtx, s.backend.rdb, s.AccountID(), defaultResult); junkErr != nil {
+				recordMetrics("failure")
+				s.WarnLog("failed to resolve the default script's Junk mailbox", "error", junkErr)
+				return s.InternalError("failed to resolve the target mailbox")
+			}
 
 			s.logSieveAction("default", result)
 		}
@@ -877,9 +880,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				}
 				if len(references) == 0 {
 					references = nil
-				}
-				if sentDate.IsZero() {
-					sentDate = time.Now()
 				}
 				s.DebugLog("message headers updated after edits", "content_hash", contentHash)
 			}

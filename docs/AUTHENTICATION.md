@@ -130,7 +130,8 @@ the correct format` (IMAP), `-ERR [AUTH] Invalid username format` (POP3),
 `NO "Invalid username format"` (ManageSieve `AUTHENTICATE`) and `NO "Invalid address"` (ManageSieve
 `LOGIN`). Except on ManageSieve's `LOGIN`, it counts as a failed attempt for the rate limiter.
 
-A suffix that is not the configured `master_username`:
+A suffix that is not the configured `master_username`, and the `master_username` suffix with any
+password other than `master_password` (section 8.1):
 
 - on a proxy with remote lookup, is part of the name sent to the lookup service, which can treat it
   as a token ([PROXY.md](PROXY.md#4-remote-lookup));
@@ -368,9 +369,12 @@ a1 LOGIN user@example.com@support a-long-random-secret
 - The suffix must equal `master_username` exactly, including case.
 - On a backend with SASL PLAIN, if the client also sends an authorization identity, that identity is
   the user to log in as. Otherwise it is the address before the suffix.
-- The target must be an active account. A wrong master password, a target that is not a valid
-  address, or a target account that does not exist gets the protocol's bad-credentials reply and is
-  counted as a failed login.
+- The target must be an active account. A target that is not a valid address, or a target account
+  that does not exist, gets the protocol's bad-credentials reply and is counted as a failed login.
+- Any other password is not a master login. The name is then handled like a name with any other
+  suffix (section 3): the user's own password logs in as the user, and anything else gets the
+  bad-credentials reply. The failure is counted under the master credential's key, the success
+  under the user's (section 10.2).
 
 ### 8.2 Master SASL: `master_sasl_username` and `master_sasl_password`
 
@@ -525,7 +529,9 @@ durations.
 - the base address of the login name, lower case, without `+tag` (section 3). `User@Example.com`,
   `user+a@example.com` and `user@example.com` are one key, so varying them does not get more tries;
 - for the master username form `user@example.com@support`, the key `master:support`, so the attempt
-  is charged to the master credential and not to `user@example.com`;
+  is charged to the master credential and not to `user@example.com`. A success with the user's own
+  password instead of the master password (section 8.1) is the user's login: it is recorded under
+  `user@example.com`, so it cannot clear the failed guesses at the master password;
 - for a master SASL login, the master SASL username;
 - for a name that does not parse, the name itself, trimmed and lower-cased.
 

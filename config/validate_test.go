@@ -175,6 +175,38 @@ func TestConfigValidateDatabaseAndS3(t *testing.T) {
 	}
 }
 
+// TestConfigValidateProxyNeedsBackends: every proxy refuses to be built without backends,
+// in its remote_addrs or in the file's [[pool]] blocks, so Validate refuses such a file
+// too, naming the server. It passed both start-up's configuration check and `sora-admin
+// config validate` (#1038).
+func TestConfigValidateProxyNeedsBackends(t *testing.T) {
+	const pool = "[[pool]]\nname = \"sora1\"\nbackends = [\"192.0.2.10\"]\ndefault = true\n"
+	const want = "remote_addrs is required unless the file declares [[pool]] blocks"
+	var proxies int
+	for _, typ := range ServerTypes {
+		if !strings.HasSuffix(typ, "_proxy") {
+			continue
+		}
+		proxies++
+		server := "\n[[server]]\ntype = \"" + typ + "\"\nname = \"proxy\"\naddr = \"127.0.0.1:1143\"\nremote_port = 143\n"
+		t.Run(typ, func(t *testing.T) {
+			got := validateFile(t, storageTOML+server)
+			if len(got) != 1 || got[0].Section != "server 'proxy'" || !strings.Contains(got[0].Err.Error(), want) {
+				t.Errorf("without backends: Validate() = %v, want server 'proxy': ...%s...", got, want)
+			}
+			if got := validateFile(t, storageTOML+server+"remote_addrs = [\"192.0.2.10\"]\n"); len(got) != 0 {
+				t.Errorf("with remote_addrs: Validate() = %v, want no problems", got)
+			}
+			if got := validateFile(t, storageTOML+pool+server); len(got) != 0 {
+				t.Errorf("with [[pool]] blocks: Validate() = %v, want no problems", got)
+			}
+		})
+	}
+	if proxies != 5 {
+		t.Errorf("checked %d proxy types, want the 5 proxies", proxies)
+	}
+}
+
 // validateFile loads content as the server loads its file and returns what Validate finds.
 func validateFile(t *testing.T, content string) []Problem {
 	t.Helper()

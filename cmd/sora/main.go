@@ -274,7 +274,7 @@ func main() {
 		defer logger.Sync() // Still sync even without a log file
 	}
 
-	logger.Info("Logging configuration", "format", cfg.Logging.Format, "level", cfg.Logging.Level)
+	logger.Info("Logging configuration", "format", cfg.Logging.Format, "log_level", cfg.Logging.Level)
 
 	// Initialize global timeout scheduler with configured shard count
 	shardCount := cfg.TimeoutScheduler.ShardCount
@@ -2330,7 +2330,9 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 	// Registered before it serves, as the other servers are: its deliveries count in the
 	// node's sessions report (drainSessions) from the first.
 	deps.registerServer(serverConfig.Name, srv)
-	srv.Serve(ctx, errChan)
+	if err := srv.Run(ctx); err != nil && ctx.Err() == nil {
+		errChan <- fmt.Errorf("HTTP API server failed: %w", err)
+	}
 }
 
 // buildAdminAPIServerOptions maps the running config onto the Admin API server options.
@@ -2490,9 +2492,14 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		SieveExtensions:             deps.config.Sieve.EnabledExtensions,
 	}
 
-	srv := mailapi.Start(ctx, deps.resilientDB, options, errChan)
-	if srv != nil {
-		deps.registerServer(serverConfig.Name, srv)
+	srv, err := mailapi.New(deps.resilientDB, options)
+	if err != nil {
+		errChan <- fmt.Errorf("failed to create HTTP Mail API server: %w", err)
+		return
+	}
+	deps.registerServer(serverConfig.Name, srv)
+	if err := srv.Run(ctx); err != nil && ctx.Err() == nil {
+		errChan <- fmt.Errorf("HTTP Mail API server failed: %w", err)
 	}
 }
 

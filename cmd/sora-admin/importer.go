@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -32,6 +31,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/pkg/sqlitefile"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/sieveengine"
 	_ "modernc.org/sqlite"
@@ -177,19 +177,6 @@ type Importer struct {
 // database is waited for up to 5 seconds.
 const maildirCacheParams = "_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL"
 
-// sqliteFileDSN returns the DSN that opens the SQLite database at path with params: a
-// file: URI of the absolute path. modernc.org/sqlite cuts any other DSN at its first
-// '?' and reads the rest as parameters, so a plain path with a '?' in it would open a
-// different file. In the URI the path is percent-encoded and SQLite decodes it, so a
-// '?', '#' or '%' in it stays part of the file name.
-func sqliteFileDSN(path, params string) (string, error) {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve database path %s: %w", path, err)
-	}
-	return (&url.URL{Scheme: "file", Path: absPath, RawQuery: params}).String(), nil
-}
-
 // NewImporter creates a new Importer instance.
 func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ImporterOptions) (*Importer, error) {
 	// Always create SQLite database in the maildir path to persist maildir state
@@ -201,7 +188,7 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		logger.Info("Incremental mode disabled - will read all files (database still created for tracking)", "path", dbPath)
 	}
 
-	dsn, err := sqliteFileDSN(dbPath, maildirCacheParams)
+	dsn, err := sqlitefile.DSN(dbPath, maildirCacheParams)
 	if err != nil {
 		return nil, err
 	}
@@ -1142,11 +1129,22 @@ func (i *Importer) resolveMailboxName(path string) (string, error) {
 // non-ASCII names), trimmed, and special folders mapped. A name with TAB, CR or LF is
 // refused. Folders and the subscriptions file are both named through it, so a
 // subscription names the mailbox the folder's messages went to.
+//
+// Each level is decoded on its own, and one that is not valid modified UTF-7 keeps
+// its raw name. The levels above it still decode as the parent folders' own names
+// did, so the mailbox stays below them instead of below a raw-named copy of them.
 func importedFolderName(name string) (string, error) {
-	if decoded, err := helpers.DecodeModifiedUTF7(name); err != nil {
-		logger.Warn("Failed to decode Modified UTF-7 mailbox name, using raw name", "name", name, "error", err)
-	} else {
-		name = decoded
+	if strings.Contains(name, "&") {
+		delim := string(consts.MailboxDelimiter)
+		levels := strings.Split(name, delim)
+		for i, level := range levels {
+			if decoded, err := helpers.DecodeModifiedUTF7(level); err != nil {
+				logger.Warn("Failed to decode Modified UTF-7 mailbox name level, using raw level", "name", name, "level", level, "error", err)
+			} else {
+				levels[i] = decoded
+			}
+		}
+		name = strings.Join(levels, delim)
 	}
 	if strings.ContainsAny(name, "\t\r\n") {
 		return "", fmt.Errorf("invalid characters in mailbox name %q", name)
@@ -1879,17 +1877,6 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 	}
 	if len(references) == 0 {
 		references = nil
-	}
-
-	// If the Date header is missing or invalid, fall back to the file's modification time.
-	// This is a more accurate timestamp than time.Now().
-	if sentDate.IsZero() {
-		if info, statErr := os.Stat(path); statErr == nil {
-			sentDate = info.ModTime()
-		} else {
-			// As a last resort, use the current time.
-			sentDate = time.Now()
-		}
 	}
 
 	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(content))
@@ -2875,7 +2862,8 @@ func (i *Importer) keywordsForMessagePath(path string) map[int]string {
 // filename (what Dovecot and the exporter here write) and, failing that, as the file's
 // modification time. The Date: header (sentDate) is the sender's clock, not arrival;
 // using it as INTERNALDATE altered the arrival time of every imported message and
-// re-stamped mtimes on export.
+// re-stamped mtimes on export. sentDate is zero for a message without a Date: header
+// that parses; it is stored with its INTERNALDATE as the sent date.
 func maildirInternalDate(filename, path string, sentDate time.Time) time.Time {
 	base := filepath.Base(filename)
 	if dot := strings.IndexByte(base, '.'); dot > 0 {
@@ -2885,6 +2873,9 @@ func maildirInternalDate(filename, path string, sentDate time.Time) time.Time {
 	}
 	if info, err := os.Stat(path); err == nil && !info.ModTime().IsZero() {
 		return info.ModTime()
+	}
+	if sentDate.IsZero() {
+		return time.Now()
 	}
 	return sentDate
 }

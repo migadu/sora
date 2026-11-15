@@ -260,7 +260,7 @@ header listing the methods it does serve; a path no endpoint has is
 | 201 | Mailbox created. |
 | 400 | Bad request: bad JSON, a missing or invalid field or parameter, a script that does not compile. |
 | 401 | No, bad or expired token; failed login. |
-| 403 | Client address not in `allowed_hosts`; deleting `INBOX`; or changing flags or deleting a message in a shared mailbox without the right. |
+| 403 | Client address not in `allowed_hosts`; deleting `INBOX`; or deleting a shared mailbox, changing flags or deleting a message in one without the right. |
 | 404 | Mailbox, message or script not found, or no endpoint has the path. |
 | 405 | Wrong method for the path; `Allow` lists the methods it serves. |
 | 409 | Mailbox already exists, or has child mailboxes. |
@@ -375,10 +375,10 @@ Response `200 {"message":"Mailbox deleted successfully","name":"Projects/Acme"}`
 | Status | Body `error` |
 |---|---|
 | 400 | `Invalid mailbox name` |
-| 403 | `Cannot delete INBOX` |
+| 403 | `Cannot delete INBOX`; `Not permitted to delete this mailbox` (a shared mailbox without the `x` right) |
 | 404 | `Mailbox not found` |
 | 409 | `Mailbox has child mailboxes; delete them first` |
-| 500 | `Failed to delete mailbox` (also for a shared mailbox without the delete right) |
+| 500 | `Failed to delete mailbox` |
 
 ### 6.4 Subscribe and unsubscribe
 
@@ -411,7 +411,7 @@ right to read a message, the write and delete rights to change its flags.
 |---|---|---|
 | `limit` | `50` | Messages per page. At least 1. Values above 1000 are lowered to 1000. |
 | `offset` | `0` | How many to skip. |
-| `unseen` | `false` | `true`: only messages without `\Seen`. |
+| `unseen` | `false` | `true`: only messages without `\Seen`, including messages with no stored flags. |
 
 Newest arrival first (by `internal_date`).
 
@@ -556,10 +556,11 @@ its results, and all supplied filters must match:
 |---|---|
 | `from` | Literal substring of any sender's address or display name, ignoring case. |
 | `subject` | Literal substring of the subject, ignoring case. |
-| `unseen=true` | Only messages without `\\Seen`, including messages with no stored flags. |
+| `unseen=true` | Only messages without `\Seen`, including messages with no stored flags. |
 
 The text filters have no wildcard syntax. A `q`, `from` or `subject` containing a NUL or
-invalid UTF-8 is refused with `400 Bad Request`.
+invalid UTF-8 is refused with `400 Bad Request`, and so is one longer than 1000 bytes, the
+length IMAP `SEARCH` allows one search term ([SEARCH.md](SEARCH.md#9-limits)).
 
 Response `200`:
 
@@ -583,7 +584,7 @@ Response `200`:
 
 | Status | Body `error` |
 |---|---|
-| 400 | `Invalid mailbox name`, `Search query parameter 'q' is required`, `Search query parameter 'q' must be UTF-8 text without NUL`, `Search filters 'from' and 'subject' must be UTF-8 text without NUL` |
+| 400 | `Invalid mailbox name`, `Search query parameter 'q' is required`, `Search query parameter 'q' must be UTF-8 text without NUL`, `Search query parameter 'q' must be at most 1000 bytes`, `Search filters 'from' and 'subject' must be UTF-8 text without NUL`, `Search filters 'from' and 'subject' must be at most 1000 bytes each` |
 | 404 | `Mailbox not found` (also a shared mailbox without `r`) |
 | 500 | `Failed to search messages` |
 
@@ -722,7 +723,7 @@ return messages in this shape:
 | `subject` | The decoded `Subject`. |
 | `from` | The first `From` address, address only (no display name). |
 | `to`, `cc`, `bcc` | Addresses only. `cc` is filled in lists, search results and `GET /user/messages/{id}`; `bcc` only in lists. `to` is always present (`[]` when the message has none); empty `cc` and `bcc` are left out. |
-| `date` | The message's `Date` header, as stored. |
+| `date` | The message's `Date` header; its `internal_date` when it has none that parses. |
 | `internal_date` | When the message arrived in Sora. |
 | `size` | Bytes. |
 | `flags` | System flags. `[]` when there are none. |

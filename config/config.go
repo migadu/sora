@@ -32,6 +32,23 @@ type ClientCapabilityFilter struct {
 	Reason          string   `toml:"reason"`           // Human-readable reason for the filter
 }
 
+// Validate reports the first pattern of the filter that does not compile. The IMAP
+// server skips such a filter, so the capabilities it names stay advertised.
+func (f ClientCapabilityFilter) Validate() error {
+	if _, err := regexp.Compile(f.ClientName); err != nil {
+		return fmt.Errorf("client_name %q: %w", f.ClientName, err)
+	}
+	if _, err := regexp.Compile(f.ClientVersion); err != nil {
+		return fmt.Errorf("client_version %q: %w", f.ClientVersion, err)
+	}
+	for _, pattern := range f.JA4Fingerprints {
+		if _, err := regexp.Compile(pattern); err != nil {
+			return fmt.Errorf("ja4_fingerprints %q: %w", pattern, err)
+		}
+	}
+	return nil
+}
+
 // DatabaseEndpointConfig holds configuration for a single database endpoint
 type DatabaseEndpointConfig struct {
 	// List of database hosts for runtime failover/load balancing
@@ -1905,13 +1922,17 @@ func (s *ServerConfig) GetMaxScriptSize() (int64, error) {
 }
 
 // GetMaxMessageSize returns max_message_size (LMTP, LMTP proxy, Admin API delivery),
-// 50 MB when omitted, capped at consts.MaxStoredMessageSize: a larger message would be
-// read in full and then refused by the database insert, and the LMTP proxy would
-// advertise a SIZE no backend accepts. RFC 1870 section 5: "The fixed maximum message
-// size is defined as the message size of the largest message that a server is ever
-// willing to accept. [...] The fixed maximum message size may be an implementation
-// artifact of the SMTP server". A value that does not parse is an error: start-up falls
-// back to the default (GetMaxMessageSizeWithDefault), a reload keeps the running limit.
+// 50 MB when omitted or zero, capped at consts.MaxStoredMessageSize: a larger message
+// would be read in full and then refused by the database insert, and the LMTP proxy
+// would advertise a SIZE no backend accepts. RFC 1870 section 5: "The fixed maximum
+// message size is defined as the message size of the largest message that a server is
+// ever willing to accept. [...] The fixed maximum message size may be an implementation
+// artifact of the SMTP server". Every delivery has such a limit, so zero is the default
+// and not "unlimited", at start-up and on reload alike, and the LMTP proxy advertises
+// it: RFC 1870 section 3 reads a SIZE of 0 as "no fixed maximum message size is in
+// force", and an omitted one as conveying no information. A value that does not parse
+// is an error: start-up falls back to the default (GetMaxMessageSizeWithDefault), a
+// reload keeps the running limit.
 func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
 	if s.MaxMessageSize == "" {
 		return 50 * 1024 * 1024, nil // 50MB default
@@ -1919,6 +1940,9 @@ func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
 	size, err := helpers.ParseSize(s.MaxMessageSize)
 	if err != nil {
 		return 0, err
+	}
+	if size == 0 {
+		return 50 * 1024 * 1024, nil
 	}
 	if size > consts.MaxStoredMessageSize {
 		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
@@ -2719,6 +2743,16 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
+	// Only the IMAP backend reads client_filters. It would skip a filter whose pattern
+	// does not compile and keep advertising what the filter hides.
+	if s.Type == "imap" {
+		for i, filter := range s.ClientFilters {
+			if err := filter.Validate(); err != nil {
+				return fmt.Errorf("server %q: client_filters #%d: %w", s.Name, i+1, err)
+			}
+		}
+	}
+
 	// A proxy dials a backend address without a port at its remote_port, and builds a
 	// lookup client from its enabled remote_lookup. No other server reads either, and a
 	// disabled lookup is never initialized.
@@ -2739,6 +2773,12 @@ func (s *ServerConfig) Validate() error {
 		}
 		if err := validateMetricsPattern(s.MetricsPath()); err != nil {
 			return fmt.Errorf("server %q: invalid metrics path %q: %w", s.Name, s.Path, err)
+		}
+	}
+
+	if s.Type == "imap" {
+		if err := ValidateIMAPDisabledCaps(s.DisabledCaps); err != nil {
+			return fmt.Errorf("server %q: %w", s.Name, err)
 		}
 	}
 
@@ -3205,7 +3245,14 @@ func (c *Config) Validate() []Problem {
 
 	servers := c.GetAllServers()
 	for i := range servers {
-		add(fmt.Sprintf("server '%s'", servers[i].Name), servers[i].Validate())
+		section := fmt.Sprintf("server '%s'", servers[i].Name)
+		add(section, servers[i].Validate())
+		// A proxy routes into its remote_addrs or into the file's [[pool]] blocks, and is
+		// not built without either. Pools are file-level, so ServerConfig.Validate cannot
+		// tell; with pools, ValidatePools checks how the proxy uses them.
+		if strings.HasSuffix(servers[i].Type, "_proxy") && len(servers[i].RemoteAddrs) == 0 && !c.HasPools() {
+			add(section, fmt.Errorf("remote_addrs is required unless the file declares [[pool]] blocks"))
+		}
 	}
 
 	// Named backend pools are validated as a whole: the checks cross the [[pool]] blocks

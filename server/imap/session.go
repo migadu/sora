@@ -231,32 +231,29 @@ func (s *IMAPSession) applyCapabilityFilters() {
 		caps[cap] = struct{}{}
 	}
 
-	// Apply capability filtering based on client identification and/or TLS fingerprint
-	disabledCaps := s.server.filterCapabilitiesForClient(caps, s.clientID, s.ja4Fingerprint)
-
-	// A filter matched after the client enabled an extension (an ID sent after
-	// ENABLE IMAP4rev2, say) gives the extension back: "Once enabled using
-	// ENABLE, each extension remains active until the IMAP connection is
-	// closed" (RFC 9051 §6.3.1), and a CONDSTORE-aware client gets
-	// mod-sequences "until the connection is closed" (RFC 7162 §3.1). For
-	// IMAP4rev2 that keeps every extension it includes (MOVE, UIDPLUS, IDLE,
-	// ESEARCH, ...), whose commands the session would otherwise refuse while
-	// go-imap goes on serving IMAP4rev2.
-	var kept []string
+	// Capabilities already enabled on this connection cannot be withdrawn:
+	// "Once enabled using ENABLE, each extension remains active until the IMAP
+	// connection is closed" (RFC 9051 §6.3.1), and a CONDSTORE-aware client gets
+	// mod-sequences "until the connection is closed" (RFC 7162 §3.1). Pass keep
+	// into the filter pass so capabilities satisfied by keep are neither deleted
+	// nor cascaded from (preserving e.g. ESORT/MULTISEARCH when ESEARCH stays
+	// active via IMAP4rev2, or QRESYNC when CONDSTORE stays active).
+	var keep imap.CapSet
 	for c := range s.enabledCaps() {
 		if _, offered := s.server.caps[c]; !offered {
 			continue
 		}
-		if _, ok := caps[c]; !ok {
-			caps[c] = struct{}{}
-			kept = append(kept, string(c))
+		if keep == nil {
+			keep = make(imap.CapSet)
 		}
+		keep[c] = struct{}{}
 	}
+
+	// Apply capability filtering based on client identification and/or TLS fingerprint
+	disabledCaps, kept := s.server.filterCapabilitiesForClientExcept(caps, s.clientID, s.ja4Fingerprint, keep)
 	if len(kept) > 0 {
 		slices.Sort(kept)
-		disabledCaps = slices.DeleteFunc(disabledCaps, func(name string) bool {
-			return caps.Has(imap.Cap(name))
-		})
+		kept = slices.Compact(kept)
 	}
 
 	// Atomic store - safe for concurrent access

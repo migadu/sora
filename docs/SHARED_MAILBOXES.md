@@ -88,8 +88,9 @@ mailboxes stay visible and usable for the users who have rights on them.
 
 ## 3. The shared namespace
 
-- The prefix is `namespace_prefix`, default `Shared/`. Sora refuses to start with an empty prefix
-  while sharing is on.
+- The prefix is `namespace_prefix`, default `Shared/`. While sharing is on, Sora refuses to start
+  with a prefix that is not a mailbox name followed by `/` (an empty one, `Shared` or `Shared//`),
+  or with `INBOX/` in any letter case.
 - A name is in the namespace when it starts with the prefix, or equals the prefix without its
   trailing `/` (the root, `Shared`). Case does not matter. A folder such as `SharedNotes` is an
   ordinary personal folder.
@@ -343,7 +344,7 @@ into a shared folder such as `Shared/Junk` are not reported unless it carries `\
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | bool | `false` | Turns sharing on. |
-| `namespace_prefix` | string | `"Shared/"` | The prefix of the shared namespace: `Shared/` covers the root `Shared` and the names under `Shared/`. Must not be empty while sharing is on. |
+| `namespace_prefix` | string | `"Shared/"` | The prefix of the shared namespace: `Shared/` covers the root `Shared` and the names under `Shared/`. While sharing is on, it must be a mailbox name followed by `/`, and not `INBOX/` ([section 3](#3-the-shared-namespace)). |
 | `allow_user_create` | bool | `false` | Lets users create top-level shared folders over IMAP. Off: only `sora-admin mailbox create` can. |
 | `allow_anyone_identifier` | bool | `false` | Lets rights be granted to `anyone` (every user of the owner's domain). |
 | `default_rights` | string | `"lrswipkxtea"` | Rights stored as the creator's entry on a new top-level shared folder. Has no practical effect, since the creator is the owner ([section 4](#4-creating-shared-mailboxes)). |
