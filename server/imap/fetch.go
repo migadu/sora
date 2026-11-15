@@ -211,10 +211,14 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 	decodedNumSet = s.decodeNumSetLocked(numSet)
 	release()
 
-	// QRESYNC: Handle VANISHED modifier (RFC 7162 §3.2.4)
-	// VANISHED returns UIDs of expunged messages since ChangedSince modseq
-	// Only valid with QRESYNC enabled and ChangedSince parameter
-	if s.GetCapabilities().Has(imap.CapQResync) && options.Vanished && options.ChangedSince > 0 {
+	// QRESYNC: Handle VANISHED modifier (RFC 7162 §3.2.6)
+	// VANISHED returns UIDs of expunged messages since ChangedSince modseq.
+	// It needs CHANGEDSINCE and a client that issued ENABLE QRESYNC on this
+	// connection; QRESYNC being advertised is not enough: "A server MUST
+	// respond with a tagged BAD response if the VANISHED UID FETCH modifier is
+	// specified and the client hasn't issued "ENABLE QRESYNC" in the current
+	// connection" (RFC 7162 §3.2.6).
+	if options.Vanished && options.ChangedSince > 0 && s.conn != nil && s.conn.EnabledCaps().Has(imap.CapQResync) {
 		s.DebugLog("FETCH with VANISHED modifier", "changed_since", options.ChangedSince)
 
 		vanishedUIDs, err := s.server.rdb.GetVanishedUIDsForFetchWithRetry(ctx, selectedMailboxID, options.ChangedSince)
@@ -246,10 +250,11 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			}
 		}
 	} else if options.Vanished {
-		// VANISHED modifier used without QRESYNC or ChangedSince - protocol violation
+		// VANISHED modifier used without ENABLE QRESYNC or ChangedSince - protocol violation
 		imapErr := &imap.Error{
 			Type: imap.StatusResponseTypeBad,
-			Text: "VANISHED requires QRESYNC and CHANGEDSINCE",
+			Code: imap.ResponseCodeClientBug,
+			Text: "VANISHED requires ENABLE QRESYNC and CHANGEDSINCE",
 		}
 		recordMetrics(imapErr)
 		return imapErr

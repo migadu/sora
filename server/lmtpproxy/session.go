@@ -505,7 +505,7 @@ func (s *Session) handleConnection() {
 
 			// Forward RCPT TO to backend
 			if s.backendConn != nil {
-				s.DebugLog("Forwarding RCPT TO to backend", "to", s.to, "account_id", s.accountID)
+				s.DebugLog("Forwarding RCPT TO to backend", "to", s.to)
 				s.forwardRCPT(line)
 			} else {
 				s.WarnLog("Cannot forward RCPT - no backend connection", "to", s.to)
@@ -1643,7 +1643,7 @@ func (s *Session) close() {
 			// Use cached client address to avoid race with connection close
 			if err := s.server.connTracker.UnregisterConnection(ctx, id, "LMTP", s.clientAddr); err != nil {
 				// Connection tracking is non-critical monitoring data, so log but continue
-				s.WarnLog("Failed to unregister connection", "error", err, "account_id", id)
+				s.WarnLog("Failed to unregister connection", "error", err, "registered_account_id", id)
 			}
 		}
 	}

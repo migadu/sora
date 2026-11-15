@@ -519,10 +519,10 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			switch authResult {
 			case proxy.AuthSuccess:
 				// RemoteLookup returned success - use routing info
-				s.DebugLog("remotelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
+				s.accountID = routingInfo.AccountID
+				s.DebugLog("remotelookup successful", "master_auth_validated", masterAuthValidated)
 				s.DebugLog("remotelookup routing", "server", routingInfo.ServerAddress, "tls", routingInfo.RemoteTLS, "starttls", routingInfo.RemoteTLSUseStartTLS, "tls_verify", routingInfo.RemoteTLSVerify, "proxy_protocol", routingInfo.RemoteUseProxyProtocol)
 				metrics.RemoteLookupResult.WithLabelValues("managesieve", "success").Inc()
-				s.accountID = routingInfo.AccountID
 				s.isRemoteLookupAccount = routingInfo.IsRemoteLookupAccount
 				s.routingInfo = routingInfo
 
@@ -583,7 +583,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				// For master username, this shouldn't happen (password already validated)
 				// For others, reject immediately
 				if masterAuthValidated {
-					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "user", username)
+					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "username", username)
 				}
 
 				// Cache negative result (wrong password)
@@ -674,7 +674,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			// temporary failure (NO (TRYLATER)), not a failed login charged to the master
 			// credential.
 			if server.IsTemporaryAuthFailure(err) {
-				s.WarnLog("authentication unavailable", "method", "master", "user", address.BaseAddress(), "error", err)
+				s.WarnLog("authentication unavailable", "method", "master", "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
 				return server.ErrAuthServiceUnavailable
 			}
