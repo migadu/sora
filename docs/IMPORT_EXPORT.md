@@ -90,10 +90,15 @@ folder. Its mailbox name comes from its path relative to the root:
 2. A leading `.` is removed and the remaining `.` characters become `/`. So the Maildir++ folder
    `.Work.2024` becomes `Work/2024`. A folder without a leading dot (`Sent`) is read the same
    way. Nested directories (`Work/2024`) keep their `/`.
-3. IMAP modified UTF-7 is decoded: `.R&AOk-pertoire` becomes `Répertoire`.
-4. Leading and trailing spaces are trimmed. A name containing a tab, CR or LF is skipped with a
+3. In each level, `\` followed by two hex digits is the character with that value, as Dovecot's
+   storage name escape character (`\` by default) writes it: `.v1\2e2.Notes` becomes
+   `v1.2/Notes`. Only printable US-ASCII characters are restored; any other `\` stays as it is.
+   An escaped `/` is refused: Sora cannot represent a literal hierarchy delimiter inside one
+   level, and treating it as hierarchy would merge distinct source folders.
+4. IMAP modified UTF-7 is decoded: `.R&AOk-pertoire` becomes `Répertoire`.
+5. Leading and trailing spaces are trimmed. A name containing a tab, CR or LF is skipped with a
    warning.
-5. Some names are mapped to Sora's standard folders, compared case-insensitively, for the whole
+6. Some names are mapped to Sora's standard folders, compared case-insensitively, for the whole
    name only (`Work/Sent` is not mapped):
 
 | Folder name | Mailbox in Sora |
@@ -219,11 +224,14 @@ Dovecot stores custom keywords as letters `a` to `z` in file names. Each folder 
 With `--dovecot`, the `subscriptions` file at the maildir root is read:
 
 1. Sora's default mailboxes are created: `INBOX`, `Sent`, `Drafts`, `Archive`, `Junk`, `Trash`.
-2. Each name in the file is decoded from modified UTF-7, passed through the folder mapping of
-   [section 3](#3-the-maildir-layout-sora-reads), and recorded as a subscription. Dovecot's
-   version-2 file separates the parts of a nested name with tab characters; they are joined with
-   `/`, so `Work` + tab + `2024` subscribes `Work/2024`. No mailbox is created for it:
-   subscriptions are names, and Dovecot allows subscriptions to folders that do not exist.
+2. Each name in the file is read as a folder name is, by rules 3 to 6 of
+   [section 3](#3-the-maildir-layout-sora-reads) (escaped characters restored, modified UTF-7
+   decoded, the folder mapping), and recorded as a subscription. Dovecot writes a folder's
+   subscription in the same form as the folder's directory name, so `v1\2e2` subscribes the
+   folder `.v1\2e2`, imported as `v1.2`. Dovecot's version-2 file separates the parts of a nested
+   name with tab characters; they are joined with `/`, so `Work` + tab + `2024` subscribes
+   `Work/2024`. No mailbox is created for it: subscriptions are names, and Dovecot allows
+   subscriptions to folders that do not exist.
 
 ### UIDs (`dovecot-uidlist`)
 
@@ -466,10 +474,16 @@ to, and every message that is not expunged. Bodies are downloaded from S3 under 
 each message and decrypted.
 
 **Layout.** INBOX is the root (`cur/`, `new/`, `tmp/`). Every other mailbox is a directory under
-the root named after the mailbox, with `/` creating subdirectories: `Work/2024` becomes
-`<root>/Work/2024/cur`. Names are written in UTF-8. This is not the Maildir++ layout with dotted
-names (`.Work.2024`) that Dovecot uses by default; a Dovecot reading the export needs a
-filesystem-style folder layout (Dovecot's `LAYOUT=fs`). Sora's own importer reads it back.
+the root, with one directory per level of its name: `Work/2024` becomes `<root>/Work/2024/cur`.
+Each level is written in IMAP modified UTF-7, as Dovecot names folders on disk (`Données` becomes
+`Donn&AOk-es`, `R&D` becomes `R&-D`), and a `.` or `\` in it is escaped as `\2e` or `\5c`
+(`v1.2` becomes `v1\2e2`), because the importer reads a `.` as the Maildir++ separator. A mailbox
+with a level `.` or `..` fails to export. This is not the Maildir++ layout with dotted names
+(`.Work.2024`) that Dovecot uses by default; a Dovecot reading the export needs a
+filesystem-style folder layout (Dovecot's `LAYOUT=fs`), and shows escaped names right only with
+`\` as its storage name escape character (the 2.3 `listescape` plugin, or
+`mailbox_list_storage_escape_char` in 2.4). Sora's own importer reads each name back as it was
+exported, under the rules of [section 3](#3-the-maildir-layout-sora-reads).
 
 **Files.** Each message is written to `tmp/`, synced to disk and renamed into `cur/`, so a reader
 never sees half a file. The name is `<INTERNALDATE as Unix time>.M<same>P<UID>.<hostname>:2,<flags>`
@@ -484,7 +498,8 @@ kept. A folder can name at most 26 keywords; further ones are logged and left ou
 **Subscriptions.** With `--dovecot`, `subscriptions` at the root lists every subscribed name,
 also of folders that no longer exist, in Dovecot's version-2 format: a `V` + tab + `2` line and an
 empty line, then one name per line, with the levels of a nested name separated by tab
-characters.
+characters. Each level is written as a folder's directory is (modified UTF-7, `.` and `\`
+escaped), as Dovecot writes it, so `v1.2` is subscribed as `v1\2e2`.
 
 **UID lists.** With `--dovecot` or `--export-dovecot-uidlist`, each exported folder gets a
 `dovecot-uidlist` with the mailbox's UIDVALIDITY and each message's Sora UID. An existing
@@ -494,8 +509,12 @@ uidlist in the target is merged: its entries for files still present are kept.
 as the importer's ([section 8](#8-the-sqlite-cache-sora-maildirdb)), and records each exported
 message by content hash and mailbox. On a re-run:
 
-- A message already recorded whose file still exists is skipped.
-- A message recorded whose file is gone is written again under its recorded name.
+- A message already recorded whose file is still in its folder's `cur/` is skipped.
+- A message recorded whose file is not there is written again under its recorded name. That
+  includes a folder an older version wrote under another directory name (one with `.`, `\`, `&`
+  or non-ASCII characters in its name): its messages are written to the folder's directory as
+  named now, and the old directory is left as it was, so remove it or export into an empty
+  directory.
 - With `--overwrite-flags`, recorded messages are written again with their current flags and the
   old file is removed.
 - Two messages with the same content in one mailbox are exported as one file.
@@ -507,8 +526,11 @@ Each message is tried three times. If any message or mailbox fails, the command 
 
 ## 15. Round trips and known limits
 
-- **Dots in names.** Export writes a mailbox `Foo.Bar` as a directory `Foo.Bar`; the importer reads
-  that back as `Foo/Bar`.
+- **Backslashes in folder names.** The importer reads `\` and two hex digits in a directory name
+  or a subscription as an escaped character ([section 3](#3-the-maildir-layout-sora-reads)), so a
+  folder from another system whose name really contains `\2e` is imported with a `.` there
+  instead. The same applies to a subscription to such a name in an export made before
+  subscriptions were escaped.
 - **Exporting into an imported maildir.** Export and import share the file name
   `sora-maildir.db`. Export into an empty directory, not into a maildir you imported from.
 - **Not imported:** Dovecot's index files (`dovecot.index*`), quota files, ACL files, and
