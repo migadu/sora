@@ -23,15 +23,19 @@ func TestMaskSecretsMalformedURLUserInfo(t *testing.T) {
 	for _, endpoint := range []string{
 		"https://fixture-user:fixture-password@example.invalid/%zz",
 		"https://fixture-user:fixture-password@example.invalid:bad/path",
-		// An unencoded "/" or "#" in the password ends the authority, so the parser
+		// An unencoded "/", "?" or "#" in the password ends the authority, so the parser
 		// sees no userinfo and takes the start of the password for a port (#806).
 		"https://fixture-user:fixture/password@example.invalid/send",
+		"https://fixture-user:fixture?password@example.invalid/send",
 		"https://fixture-user:fixture#password@example.invalid/send",
 		// When that start is a number, or empty, the URL parses: host "fixture-user"
-		// with a port, the rest of the password and the "@" in the path or fragment.
+		// with a port, the rest of the password and the "@" in the path, query or fragment.
 		"https://fixture-user:2024/password@example.invalid/send",
 		"https://fixture-user:2024/password@example.invalid/send?api_key=fixture-query-secret",
 		"https://fixture-user:/password@example.invalid/send",
+		"https://fixture-user:2024?password@example.invalid/send",
+		"https://fixture-user:2024?s3cret=1@example.invalid/send",
+		"https://fixture-user:?password@example.invalid/send",
 		"https://fixture-user:2024#password@example.invalid/send",
 	} {
 		cfg := Config{Relay: RelayConfig{HTTPURL: endpoint}}
