@@ -59,6 +59,7 @@ type Server struct {
 	tlsConfig                  *tls.Config // What the listener serves with (server.ListenerTLS); nil without tls
 	proxyReader                *server.ProxyProtocolReader
 	sieveExtensions            []string
+	sharedMailboxes            config.SharedMailboxesConfig // [shared_mailboxes]; see ServerOptions
 }
 
 // ServerOptions holds configuration options for the HTTP Mail API server
@@ -97,6 +98,10 @@ type ServerOptions struct {
 	// default set), the one delivery compiles a user's script with. The capabilities
 	// endpoint reports it, so a client offers only rules that will run.
 	SieveExtensions []string
+	// SharedMailboxes is the [shared_mailboxes] config. The User API does not create
+	// shared mailboxes, so mailbox creation refuses a name in the shared namespace
+	// rather than making a personal mailbox there.
+	SharedMailboxes config.SharedMailboxesConfig
 }
 
 // minJWTSecretLength is the minimum accepted JWT signing secret length. RFC 7518
@@ -218,6 +223,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		tls:                        options.TLS,
 		tlsConfig:                  tlsConfig,
 		proxyReader:                proxyReader,
+		sharedMailboxes:            options.SharedMailboxes,
 	}
 	s.settings.Store(&reloadableSettings{
 		jwtSecret:      options.JWTSecret,

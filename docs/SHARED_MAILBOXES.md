@@ -133,10 +133,14 @@ Either way, a user who holds the create right (`k`) on an existing shared folder
 folders below it. The new folder belongs to the owner of that hierarchy, not to the user who
 created it.
 
-### Other paths create personal folders
+### Other paths
 
-The User API never creates shared folders; a folder it creates under the prefix is a personal
-folder. Sieve `fileinto :create` never creates a folder in the shared namespace.
+- `sora-admin import maildir` imports a folder under the prefix into a shared mailbox the account
+  owns, as `mailbox create` makes one, when sharing is enabled in the config file you pass. See
+  [IMPORT_EXPORT.md](IMPORT_EXPORT.md).
+- The User API does not create shared folders: `POST /user/mailboxes` with a name in the shared
+  namespace, the root included, is refused with `403`.
+- Sieve `fileinto :create` never creates a folder in the shared namespace.
 
 ### The initial ACL
 

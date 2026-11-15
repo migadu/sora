@@ -27,6 +27,7 @@ import (
 	"github.com/emersion/go-message/mail" // Import for mail.ReadMessage
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -59,6 +60,9 @@ type ImporterOptions struct {
 	MaxMessageSize       int64         // Maximum message size to import (bytes); 0 or above consts.MaxStoredMessageSize means that maximum
 	PathsFile            string        // Path to a file containing a list of relative or absolute paths to import
 	FTSRetention         time.Duration // Skip the search row for messages sent before this window (0 = index all)
+	// SharedMailboxes is the [shared_mailboxes] config: with sharing enabled, a folder
+	// in the shared namespace is imported into a shared mailbox the account owns.
+	SharedMailboxes config.SharedMailboxesConfig
 }
 
 // resilientDB defines the interface for database operations needed by the importer.
@@ -1739,6 +1743,11 @@ func (i *Importer) getOrCreateMailbox(ctx context.Context, AccountID int64, name
 
 	// Still not there, so we are responsible for creating it
 	// This single call handles both getting and creating, avoiding a redundant lookup.
+	// With the shared mailbox config in the context, a name in the shared namespace
+	// (and each missing level above it) becomes a shared mailbox the account owns, as
+	// `sora-admin mailbox create` makes it; without it, a personal mailbox in the
+	// shared namespace, which IMAP then cannot share.
+	ctx = context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: i.options.SharedMailboxes})
 	mailbox, err := i.rdb.GetOrCreateMailboxByNameWithRetry(ctx, AccountID, name)
 
 	if err == nil {
