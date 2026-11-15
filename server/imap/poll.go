@@ -428,5 +428,26 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		return nil
 	}
 
-	return sessionTracker.Poll(w, allowExpunge)
+	if err := sessionTracker.Poll(w, allowExpunge); err != nil {
+		return err
+	}
+	// Every change up to the cursor has been queued, by this poll or an earlier
+	// one, so once nothing is left queued all of them have been sent. Polls run
+	// one at a time (seqViewMu) and the cursor never moves back.
+	if sessionTracker.QueuedUpdates() == 0 {
+		s.reportedHighestModSeq.Store(cursor)
+	}
+	return nil
+}
+
+var _ imapserver.SessionHighestModSeq = (*IMAPSession)(nil)
+
+// HighestModSeq implements imapserver.SessionHighestModSeq: the HIGHESTMODSEQ the
+// first CONDSTORE enabling command with a mailbox selected returns (RFC 7162
+// §3.1). The poll cursor is not it: it also covers what a FETCH, STORE or SEARCH
+// left queued, an EXPUNGE they may not send and whatever follows it, and the
+// client adopts the value "even if it has seen higher mod-sequences" (RFC 7162
+// §6), so it would skip those changes if it resynchronized from it.
+func (s *IMAPSession) HighestModSeq() uint64 {
+	return s.reportedHighestModSeq.Load()
 }
