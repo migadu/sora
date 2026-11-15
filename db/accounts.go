@@ -328,7 +328,9 @@ func (db *Database) ListCredentials(ctx context.Context, email string) ([]Creden
 	}
 	defer rows.Close()
 
-	var credentials []Credential
+	// Never nil: an empty result is the JSON array [], not null. The account was found by
+	// one of its credentials, but in a separate query, so a purge in between leaves no rows.
+	credentials := []Credential{}
 	for rows.Next() {
 		var cred Credential
 		var createdAt, updatedAt any
