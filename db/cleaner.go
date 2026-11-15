@@ -118,8 +118,8 @@ const s3ObjectLockTimeout = 30 * time.Second
 // the caller's S3 DELETE is what orders a delete confirmed before an upload's pending row
 // existed ahead of that upload's write. Uploads that passed the gate earlier are kept out
 // by the re-check itself: it refuses any body with a pending upload row, and an upload
-// holds no lock while it writes. Restore and cross-account COPY take the same lock, and
-// a cross-account MOVE takes it in shared mode until its moved rows commit.
+// holds no lock while it writes. Restore takes the same lock, and a cross-account COPY
+// or MOVE takes it in shared mode until its rows commit.
 // The locks live in an AdvisoryLockTx: transaction-scoped, so
 // they cannot outlive their backend whatever pooler sits between Sora and PostgreSQL,
 // and held in a transaction that is otherwise idle and read-only, so the caller's S3

@@ -13,11 +13,13 @@ import (
 // --- Uploader Worker Wrappers ---
 
 // ExecuteWithS3ObjectLock runs executionFunc while holding the per-object advisory lock
-// that the cleaner's S3 deletion takes as well (db.GetS3ObjectLockID). Cross-account IMAP
-// COPY holds it around its server-side copy; an upload only passes db.PassS3WriteGate and
-// holds nothing across its transfer. The lock is held in a db.AdvisoryLockTx for exactly
-// the duration of executionFunc: transaction-scoped,
-// so it is released with its backend whatever pooler the write pool goes through, and
+// that the cleaner's S3 deletion takes as well (db.GetS3ObjectLockID). sora-admin import
+// rekey holds it while it writes a body's new object and while it deletes the old one.
+// A cross-account IMAP COPY or MOVE takes the same lock in shared mode in its own
+// transaction instead (db.LockS3ObjectsSharedInTx), and an upload only passes
+// db.PassS3WriteGate and holds nothing across its transfer. The lock is held in a
+// db.AdvisoryLockTx for exactly the duration of executionFunc: transaction-scoped, so
+// it is released with its backend whatever pooler the write pool goes through, and
 // held in a transaction that is otherwise idle and read-only, so the S3 transfer inside
 // executionFunc pins one pooled connection but no write transaction, snapshot or xid.
 // It waits for a current holder (a cleaner batch confirming this object is an orphan)

@@ -212,9 +212,8 @@ func TestCrossAccountCopyMove_BodyUploadedAfterRead(t *testing.T) {
 				"the body must be in S3 under the owner's key")
 			assert.Equal(t, 1, liveMessageCount(t, server, ownerID, shared))
 
-			// COPY's row took the source's stale flag, and its re-staged upload finds the
-			// object in S3 and marks it uploaded; MOVE marked its row uploaded for the object
-			// it made exist under the owner's key.
+			// The command made the object exist under the owner's key and marked the owner's
+			// row uploaded for it, rather than taking the source's stale flag.
 			server.WaitForUploads(t)
 			ownerFetchesMarker(t, server, ownerEmail, shared, marker)
 		})
