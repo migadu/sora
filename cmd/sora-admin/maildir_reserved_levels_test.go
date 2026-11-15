@@ -43,7 +43,7 @@ func testMaildirReservedLevelsRoundTrip(t *testing.T, mailboxes []string) {
 	baseTime := time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC)
 	for idx, mbox := range mailboxes {
 		require.NoError(t, exporter.createMailboxDirectory(mbox), mbox)
-		dir, err := exporter.mailboxDir(mbox)
+		dir, err := exporter.mailboxDirName(mbox)
 		require.NoError(t, err, mbox)
 		if mbox != "INBOX" {
 			base := filepath.Base(dir)
@@ -63,7 +63,7 @@ func testMaildirReservedLevelsRoundTrip(t *testing.T, mailboxes []string) {
 			"From: sender@example.com\r\nTo: user@example.com\r\nSubject: %s\r\nDate: Thu, 15 Jan 2026 10:%02d:00 +0000\r\nMessage-ID: <msg-%d@example.com>\r\n\r\nBody for %s\r\n",
 			mbox, idx, idx+1, mbox,
 		)
-		require.NoError(t, writeMaildirFile(filepath.Join(dir, "cur", filename), []byte(rawMsg)), mbox)
+		require.NoError(t, writeMaildirFile(exporter.root, filepath.Join(dir, "cur", filename), []byte(rawMsg)), mbox)
 
 		baseFilename := filename
 		if colon := strings.LastIndex(baseFilename, ":"); colon > 0 {
@@ -72,7 +72,7 @@ func testMaildirReservedLevelsRoundTrip(t *testing.T, mailboxes []string) {
 		uidList := CreateDovecotUIDListFromMessages(uint32(100+idx), []UIDFileMapping{
 			{UID: 1, Filename: baseFilename},
 		})
-		require.NoError(t, WriteDovecotUIDList(dir, uidList), mbox)
+		require.NoError(t, replaceFile(exporter.root, dir, filepath.Join(dir, "dovecot-uidlist"), formatDovecotUIDList(uidList)), mbox)
 	}
 	require.NoError(t, exporter.Close())
 

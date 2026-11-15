@@ -74,7 +74,7 @@ func testExportFoldersNamedAfterDirectoryEntries(t *testing.T, mailboxes []strin
 	}
 	baseTime := time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC)
 	for idx, mbox := range mailboxes {
-		dir, err := exporter.mailboxDir(mbox)
+		dir, err := exporter.mailboxDirName(mbox)
 		require.NoError(t, err, mbox)
 		msg := db.Message{
 			UID:          1,
@@ -86,11 +86,11 @@ func testExportFoldersNamedAfterDirectoryEntries(t *testing.T, mailboxes []strin
 		}
 		filename := exporter.generateMaildirFilename(&msg, mbox)
 		rawMsg := fmt.Sprintf("From: sender@example.com\r\nTo: user@example.com\r\nSubject: %s\r\nMessage-ID: <msg-%d@example.com>\r\n\r\nBody\r\n", mbox, idx)
-		require.NoError(t, writeMaildirFile(filepath.Join(dir, "cur", filename), []byte(rawMsg)), mbox)
+		require.NoError(t, writeMaildirFile(exporter.root, filepath.Join(dir, "cur", filename), []byte(rawMsg)), mbox)
 		uidList := CreateDovecotUIDListFromMessages(uint32(100+idx), []UIDFileMapping{
 			{UID: 1, Filename: filename[:strings.LastIndex(filename, ":")]},
 		})
-		assert.NoError(t, WriteDovecotUIDList(dir, uidList), "dovecot-uidlist of %q", mbox)
+		assert.NoError(t, replaceFile(exporter.root, dir, filepath.Join(dir, "dovecot-uidlist"), formatDovecotUIDList(uidList)), "dovecot-uidlist of %q", mbox)
 	}
 	// The subscriptions file, as exportSubscriptions writes it.
 	subscribed := make([]string, 0, len(mailboxes))
