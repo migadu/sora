@@ -43,21 +43,29 @@ func TestStartupConfigWarningsReachTheConfiguredLog(t *testing.T) {
 	}
 
 	const misspelt = "[cleanup]\ngrace_periood = \"7d\"\n"
-	const pop3 = "\n[[server]]\ntype = \"pop3\"\nname = \"pop3\"\naddr = \"127.0.0.1:0\"\n"
+	const metricsServer = "\n[[server]]\ntype = \"metrics\"\nname = \"metrics\"\naddr = \"127.0.0.1:0\"\n"
 
 	t.Run("logging configured", func(t *testing.T) {
-		logPath := filepath.Join(t.TempDir(), "sora.log")
-		// shard_count = -2 stops start-up right after logging is configured: the timeout
-		// scheduler refuses it before any database or listener is touched.
-		out, err := run(t, fmt.Sprintf("[logging]\noutput = %q\nlevel = \"warn\"\n\n[timeout_scheduler]\nshard_count = -2\n\n", logPath)+storageTOML+misspelt+pop3)
+		dir := t.TempDir()
+		logPath := filepath.Join(dir, "sora.log")
+		// A [tls] certificate that cannot be read stops start-up once logging is
+		// configured: the whole-file checks do not read it, service setup does. A node
+		// that runs only a metrics server needs no database or S3, so nothing is
+		// connected to and no listener is opened before that.
+		missing := filepath.Join(dir, "missing.pem")
+		tlsTOML := fmt.Sprintf("[tls]\nenabled = true\nprovider = \"file\"\ncert_file = %q\nkey_file = %q\n\n", missing, missing)
+		out, err := run(t, fmt.Sprintf("[logging]\noutput = %q\nlevel = \"warn\"\n\n", logPath)+tlsTOML+misspelt+metricsServer)
 		if err == nil {
-			t.Fatalf("start-up went on; want it stopped by shard_count = -2:\n%s", out)
+			t.Fatalf("start-up went on; want it stopped by the unreadable certificate:\n%s", out)
 		}
 		data, err := os.ReadFile(logPath)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("%v\nstderr:\n%s", err, out)
 		}
 		logged := string(data)
+		if !strings.Contains(logged, `operation="initialize TLS manager"`) {
+			t.Fatalf("start-up did not stop at the TLS manager:\n%s\nstderr:\n%s", logged, out)
+		}
 		if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, "cleanup.grace_periood") {
 			t.Errorf("the log file has no WARN record naming cleanup.grace_periood:\n%s\nstderr:\n%s", logged, out)
 		}
