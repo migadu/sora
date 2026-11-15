@@ -79,6 +79,16 @@ type IMAPSession struct {
 	ownStoreEcho          map[imap.UID]uint64
 	ownStoreEchoMailboxID int64
 
+	// seqViewMu keeps the client's sequence numbering still while a command
+	// translates through it (seqView): the command holds it for reading from
+	// before it reads the poll cursor and the tracker until its last response,
+	// and Poll, which moves both and delivers what the tracker holds, holds it
+	// for writing. Otherwise a NOTIFY pump poll during a command would number
+	// the command's first responses in one view and the rest in another. It is
+	// taken before ownStoreMu and s.mutex, and only once per command: a second
+	// read lock queued behind a waiting Poll would deadlock.
+	seqViewMu sync.RWMutex
+
 	// savedSearchUIDs holds the SEARCH RETURN (SAVE) result set referenced by
 	// "$" (RFC 5182 / RFC 9051 §6.4.4.1). It is per-session, scoped to the
 	// currently selected mailbox, stored as UIDs (stable across EXPUNGE), and
@@ -583,98 +593,20 @@ func (s *IMAPSession) savedSearchResultLocked() imap.UIDSet {
 	return out
 }
 
-// decodeNumSetLocked translates client sequence numbers to server sequence numbers.
-// IMPORTANT: The caller MUST hold s.mutex (either read or write lock) when calling this method.
-func (s *IMAPSession) decodeNumSetLocked(numSet imap.NumSet) imap.NumSet {
+// decodeNumSetLocked translates a command's message set into the server view the
+// database numbers (seqView.decode). The caller holds s.mutex (a read lock will do)
+// and seqViewMu.
+func (s *IMAPSession) decodeNumSetLocked(view seqView, numSet imap.NumSet) imap.NumSet {
 	// RFC 5182 / RFC 9051 §6.4.4.1: resolve the "$" saved-search-result marker to
 	// this session's saved UID set (empty if nothing has been saved). The marker
 	// is always a UIDSet, so the result bypasses sequence-number translation.
 	if imap.IsSearchRes(numSet) {
 		return s.savedSearchResultLocked()
 	}
-
-	if s.sessionTracker == nil {
-		return numSet
+	if seqSet, ok := numSet.(imap.SeqSet); ok && view.tracker != nil {
+		return view.decode(seqSet)
 	}
-
-	// Only handle SeqSet, not UIDSet - UIDs don't need sequence number translation
-
-	seqSet, ok := numSet.(imap.SeqSet)
-	if !ok {
-		return numSet
-	}
-
-	// Use the session's current understanding of the total number of messages
-	// to resolve '*' (represented by 0 in imap.SeqRange Start/Stop).
-	// This count (s.currentNumMessages) is maintained by SELECT, APPEND (for this session),
-	// and POLL, reflecting this session's potentially slightly delayed view of the mailbox.
-	currentTotalMessagesInMailbox := s.currentNumMessages.Load()
-
-	var out imap.SeqSet
-	for _, seqRange := range seqSet {
-		actualStart := seqRange.Start
-		if seqRange.Start == 0 { // Represents '*' for the start of the range
-			if currentTotalMessagesInMailbox == 0 {
-				actualStart = 0 // Or 1, but 0 is fine; DecodeSeqNum(0) is 0.
-			} else {
-				actualStart = currentTotalMessagesInMailbox
-			}
-		}
-
-		actualStop := seqRange.Stop
-		if seqRange.Stop == 0 { // Represents '*' for the end of the range
-			if currentTotalMessagesInMailbox == 0 {
-				actualStop = 0
-			} else {
-				actualStop = currentTotalMessagesInMailbox
-			}
-		}
-
-		// Use the sequence numbers directly without decoding.
-		// In our database-authoritative design, the database maintains canonical sequence
-		// numbers via triggers, and client sequence numbers should match database sequences.
-		// We don't use DecodeSeqNum because:
-		// 1. Database triggers immediately renumber sequences after expunge
-		// 2. Clients receive expunge notifications to stay in sync
-		// 3. DecodeSeqNum would double-adjust for expunges already reflected in the database
-		start := actualStart
-		stop := actualStop
-
-		// Validate the range is non-zero and within bounds
-		if start == 0 && seqRange.Start != 0 {
-			continue
-		}
-		if stop == 0 && seqRange.Stop != 0 {
-			continue
-		}
-		out = append(out, imap.SeqRange{Start: start, Stop: stop})
-	}
-	if len(out) == 0 && len(seqSet) > 0 {
-		return imap.SeqSet{}
-	}
-	return out
-}
-
-// decodeNumSet translates client sequence numbers to server sequence numbers.
-// It safely acquires the read mutex to protect access to session state.
-func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
-	// Acquire read mutex with timeout to protect access to session state
-	if s.ctx.Err() != nil {
-		s.DebugLog("session context cancelled, skipping decodeNumSet")
-		// Return unmodified set if context is cancelled
-		return numSet
-	}
-
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-	if !acquired {
-		s.DebugLog("failed to acquire read lock for decodeNumSet within timeout")
-		// Return unmodified set if we can't acquire the lock
-		return numSet
-	}
-	defer release()
-
-	// Use the helper method that assumes the caller holds the lock
-	return s.decodeNumSetLocked(numSet)
+	return numSet
 }
 
 // triggerCacheWarmup starts the cache warmup process if configured.

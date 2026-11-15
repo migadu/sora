@@ -26,6 +26,10 @@ func keywordLimitExceededError() *imap.Error {
 }
 
 func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
+	// The client's numbering holds still until the last response (seqViewMu).
+	s.seqViewMu.RLock()
+	defer s.seqViewMu.RUnlock()
+
 	// First, safely read session state with a single mutex acquisition
 	var selectedMailboxID int64
 	var selectedMailboxOwnerID int64
@@ -66,12 +70,8 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 
 	selectedMailboxID = s.selectedMailbox.ID
 	selectedMailboxOwnerID = s.selectedMailbox.AccountID
-
-	// Capture modseq before unlocking
-	modSeqSnapshot := s.currentHighestModSeq.Load()
-
-	// Use our helper method that assumes the mutex is held (read lock is sufficient)
-	decodedNumSet = s.decodeNumSetLocked(numSet)
+	view := s.seqViewLocked()
+	decodedNumSet = s.decodeNumSetLocked(view, numSet)
 	release()
 
 	// Sanitize flags to remove invalid values (e.g., NIL, NULL, empty strings)
@@ -138,23 +138,9 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	}
 
 	// Perform database operations outside of lock
-	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet)
+	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(view.context(ctx), selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return s.internalError("failed to retrieve messages: %v", err)
-	}
-
-	// Check if mailbox changed during our operation
-	if modSeqSnapshot > 0 && s.currentHighestModSeq.Load() > modSeqSnapshot {
-		s.DebugLog("mailbox changed during STORE operation", "old_modseq", modSeqSnapshot, "new_modseq", s.currentHighestModSeq.Load())
-		// For sequence sets, this could mean we're updating wrong messages
-		if _, isSeqSet := numSet.(imap.SeqSet); isSeqSet {
-			// Re-decode and re-fetch to ensure consistency
-			decodedNumSet = s.decodeNumSet(numSet) // This will re-lock, but it's a rare case
-			messages, err = s.server.rdb.GetMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet)
-			if err != nil {
-				return s.internalError("failed to retrieve messages: %v", err)
-			}
-		}
 	}
 
 	type storeResponseMessage struct {
@@ -186,7 +172,11 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 			return
 		}
 		for _, modified := range responseMessages {
-			// Use database sequence number directly (no encoding needed)
+			// A message the client has not been told about has no number to be
+			// answered under; Poll reports it once the client knows it.
+			if modified.seq == 0 {
+				continue
+			}
 			m := w.CreateMessage(modified.seq)
 
 			if !sanitizedStoreFlags.Silent {
@@ -260,13 +250,16 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 			if uint64(currentModSeq) > options.UnchangedSince {
 				s.DebugLog("CONDSTORE skipping message", "uid", msg.UID, "modseq", currentModSeq, "unchanged_since", options.UnchangedSince)
 				failedUIDs.AddNum(msg.UID)
-				failedSeqs.AddNum(msg.Seq)
+				if seq := view.encode(msg.Seq); seq != 0 {
+					failedSeqs.AddNum(seq) // 0 would read as "*"
+				}
 				continue
 			}
 		}
 
 		validUIDs = append(validUIDs, msg.UID)
-		seqMap[msg.UID] = msg.Seq
+		// The client's number for the message, 0 if it has none (seqView.encode).
+		seqMap[msg.UID] = view.encode(msg.Seq)
 
 		// RFC 5530 [LIMIT]: reject a STORE that would push this message past the
 		// per-message keyword cap, rather than silently dropping keywords (which
@@ -317,7 +310,9 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		for _, res := range batchResults {
 			if res.PreconditionFailed {
 				failedUIDs.AddNum(res.UID)
-				failedSeqs.AddNum(seqMap[res.UID])
+				if seq := seqMap[res.UID]; seq != 0 {
+					failedSeqs.AddNum(seq) // 0 would read as "*"
+				}
 				continue
 			}
 			responseMessages = append(responseMessages, storeResponseMessage{
@@ -402,14 +397,6 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		s.DebugLog("request aborted after flag updates, response will be incomplete")
 		return nil
 	}
-
-	// Re-acquire read mutex to access session tracker for encoding sequence numbers in the response
-	acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(ctx)
-	if !acquired {
-		s.DebugLog("failed to acquire second read lock within timeout")
-		return nil // Continue without sending responses since we already updated the flags
-	}
-	release()
 
 	writeResponses()
 

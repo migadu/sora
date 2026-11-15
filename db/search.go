@@ -1171,16 +1171,33 @@ func (db *Database) mapSeqNumCriteriaToUID(ctx context.Context, mailboxID int64,
 	return nil
 }
 
-// uidsBySeqNum returns the UID at each of the given sequence numbers. A sequence number
-// past the last message is missing from the result. Key zero always contains the
-// last live UID, for wildcard resolution and clipping out-of-bounds range ends.
+// uidsBySeqNum returns the UID at each of the given sequence numbers, in ctx's view
+// (WithSeqView). A sequence number past the last message is missing from the result.
+// Key zero always contains the last UID (of a live message, or in a view of the view's
+// last message), for wildcard resolution and clipping out-of-bounds range ends.
 func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums []int64) (map[uint32]imap.UID, error) {
+	args := []any{mailboxID, slices.Max(seqNums), seqNums}
+	viewParam := ""
+	last := `SELECT uid FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			ORDER BY uid DESC LIMIT 1`
+	if view := seqViewOf(ctx); view > 0 {
+		args = append(args, int64(view))
+		viewParam = "$4"
+		// The view's last message is its last live one or a later one it still
+		// holds; a message created since the view is past it.
+		last = `SELECT GREATEST(
+				(SELECT uid FROM messages
+				 WHERE mailbox_id = $1 AND expunged_at IS NULL AND created_modseq <= $4
+				 ORDER BY uid DESC LIMIT 1),
+				(SELECT MAX(m.uid) FROM messages m WHERE m.mailbox_id = $1 AND ` + heldExpungedCond("m", "$4") + `)
+			) AS uid`
+	}
 	query := `
 		SELECT ranked.seqnum, ranked.uid
 		FROM (
 			SELECT uid, ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
-			FROM messages
-			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			FROM ` + seqCountedRows("$1", viewParam, "") + ` counted
 			ORDER BY uid
 			LIMIT $2
 		) ranked
@@ -1190,12 +1207,9 @@ func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums [
 	// a ranked read and a separate last-UID read can create a range that
 	// names the wrong messages in every possible mailbox state.
 	query += ` UNION ALL
-		SELECT 0 AS seqnum, last.uid FROM (
-			SELECT uid FROM messages
-			WHERE mailbox_id = $1 AND expunged_at IS NULL
-			ORDER BY uid DESC LIMIT 1
-		) last`
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, slices.Max(seqNums), seqNums)
+		SELECT 0 AS seqnum, last.uid FROM (` + last + `) last
+		WHERE last.uid IS NOT NULL`
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to map sequence numbers to UIDs: %w", err)
 	}

@@ -168,11 +168,15 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 		return err
 	}
 
+	// The client's numbering holds still until the last response (seqViewMu).
+	s.seqViewMu.RLock()
+	defer s.seqViewMu.RUnlock()
+
 	// First, safely read necessary session state and decode the sequence numbers all within a single read lock
 	var selectedMailboxID int64
 	var selectedMailboxOwnerID int64
 	var selectedExamined bool
-	var sessionTrackerSnapshot *imapserver.SessionTracker
+	var view seqView
 	var decodedNumSet imap.NumSet
 
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
@@ -202,13 +206,8 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 	selectedMailboxID = s.selectedMailbox.ID
 	selectedMailboxOwnerID = s.selectedMailbox.AccountID
 	selectedExamined = s.selectedExamined.Load()
-	sessionTrackerSnapshot = s.sessionTracker
-
-	// Capture modseq before unlocking
-	modSeqSnapshot := s.currentHighestModSeq.Load()
-
-	// Use our helper method that assumes the mutex is held (read lock is sufficient here)
-	decodedNumSet = s.decodeNumSetLocked(numSet)
+	view = s.seqViewLocked()
+	decodedNumSet = s.decodeNumSetLocked(view, numSet)
 	release()
 
 	// QRESYNC: Handle VANISHED modifier (RFC 7162 §3.2.6)
@@ -262,15 +261,6 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 
 	needsBodyStructure := options.BodyStructure != nil
 
-	// Check if mailbox changed IMMEDIATELY after acquiring the read lock.
-	if modSeqSnapshot > 0 && s.currentHighestModSeq.Load() > modSeqSnapshot {
-		s.WarnLog("mailbox changed during FETCH operation startup", "old_modseq", modSeqSnapshot, "new_modseq", s.currentHighestModSeq.Load())
-		if _, isSeqSet := numSet.(imap.SeqSet); isSeqSet {
-			// Re-decode to ensure consistency before we lock-in the streaming pipeline
-			decodedNumSet = s.decodeNumSet(numSet)
-		}
-	}
-
 	// Determine if this FETCH implicitly marks messages as \Seen: any BODY[] or
 	// BINARY[] that is not the .PEEK form (RFC 9051 §6.4.5). Not in a mailbox
 	// opened with EXAMINE, where "No changes to the permanent state of the
@@ -296,7 +286,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 		}
 	}
 
-	if sessionTrackerSnapshot == nil {
+	if view.tracker == nil {
 		s.DebugLog("session tracker is nil, cannot process messages")
 		return nil
 	}
@@ -321,6 +311,16 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			writeErr = err
 			return err
 		}
+		// Number the messages as the client does. A message it has not been told
+		// about (a UID FETCH may name one) has no number it could be sent under,
+		// and is neither returned nor marked \Seen.
+		known := make([]db.Message, 0, len(messages))
+		for _, msg := range messages {
+			if msg.Seq = view.encode(msg.Seq); msg.Seq != 0 {
+				known = append(known, msg)
+			}
+		}
+		messages = known
 		// The parser accepted CHANGEDSINCE only if the session offers
 		// CONDSTORE, so the request alone gates it here.
 		if options.ChangedSince > 0 {
@@ -396,7 +396,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 		return nil
 	}
 
-	err := s.server.rdb.StreamMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet, cb, needsBodyStructure)
+	err := s.server.rdb.StreamMessagesByNumSetWithRetry(view.context(ctx), selectedMailboxID, decodedNumSet, cb, needsBodyStructure)
 	if writeErr != nil {
 		// Bypass explicit metric tracking for socket disconnections, identically to pre-streaming behavior
 		return writeErr
@@ -420,27 +420,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, preview *previewRun) (retErr error) {
 	s.DebugLog("fetching message", "uid", msg.UID, "seq", msg.Seq)
 
-	// ARCHITECTURE DECISION: Use database sequence numbers directly, not sessionTracker.EncodeSeqNum().
-	//
-	// Sequence numbers are computed dynamically via ROW_NUMBER() OVER (ORDER BY uid) at query time,
-	// ensuring they always reflect the canonical mailbox state without relying on cached tables.
-	//
-	// Why NOT EncodeSeqNum:
-	//   1. EncodeSeqNum is designed for in-memory servers that track deltas from a snapshot.
-	//      Our server uses PostgreSQL as the authority — applying EncodeSeqNum on top of
-	//      dynamically-computed sequences causes off-by-one errors.
-	//   2. The go-imap MailboxTracker/SessionTracker pair translates from an initial snapshot
-	//      through in-flight expunges.  Our database queries already compute correct positions,
-	//      making the tracker layer redundant for sequence number translation.
-	//
-	// Trade-off: if a concurrent EXPUNGE changes sequence positions between the DB query and the
-	// response write, the seqnums in THIS response may not match the client's pre-expunge
-	// view.  The Poll mechanism detects desyncs and forces a reconnection (BYE) in extreme
-	// cases.  In practice this race is rare because expunge notifications are delivered to
-	// clients before subsequent FETCH responses via the go-imap write goroutine's poll cycle.
-	//
-	// This design is validated by TestIMAP_SequenceNumberConsistency_* in
-	// integration_tests/imap/sequence_number_consistency_test.go.
+	// msg.Seq is the client's sequence number (Fetch translated it, see seqView).
 	seqNum := msg.Seq
 
 	if seqNum == 0 {
