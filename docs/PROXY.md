@@ -243,11 +243,12 @@ The proxy sends `GET` to `url` after replacing placeholders:
 
 With `auth_token` set, the request carries `Authorization: Bearer <auth_token>`.
 
-The URL must use `https://`, unless its host is `localhost` or a loopback address. Sora refuses to
-start a proxy with a plain `http://` URL to any other host, because the request and answer carry
-password hashes. It also refuses a URL with `$email` or `$ip` in the host, and a `timeout`,
-`circuit_breaker` or `transport` duration it cannot parse, with `lookup_local_users` or without.
-`sora-admin config validate` fails the file for the same reasons.
+The URL must be an absolute URL with a host, and use `https://` unless its host is `localhost` or
+a loopback address. Sora refuses to start a proxy with a plain `http://` URL to any other host,
+because the request and answer carry password hashes. It also refuses a URL that does not parse,
+has no host or has a scheme other than `http` or `https`, a URL with `$email` or `$ip` in the host,
+and a `timeout`, `circuit_breaker` or `transport` duration or a `remote_port` it cannot parse, with
+`lookup_local_users` or without. `sora-admin config validate` fails the file for the same reasons.
 
 ### 4.2 The answer
 
