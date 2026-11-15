@@ -672,45 +672,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	contentHash := helpers.HashContent(fullMessageBytes)
 	s.DebugLog("message parsed", "content_hash", contentHash)
 
-	// Parse message headers (this does not consume the body)
-	mailHeader := mail.Header{Header: messageContent.Header}
-	subject, _ := mailHeader.Subject()
-	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date"))
-	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
-	references, _ := mailHeader.MsgIDList("References")
-
-	if len(inReplyTo) == 0 {
-		inReplyTo = nil
-	}
-	if len(references) == 0 {
-		references = nil
-	}
-
-	// A zero sentDate (no Date: header that parses) is stored as the internal date and
-	// reported as absent (db.InsertMessageOptions.SentDate).
-	s.DebugLog("message sent date", "sent_date", sentDate)
-
-	var plaintextBody *string
-	plaintextBodyResult, extractErr := helpers.ExtractPlaintextBody(messageContent)
-	if extractErr != nil {
-		// Plaintext extraction had errors but may have succeeded partially.
-		// Log the issues for debugging malformed MIME (invalid Content-Type, truncated parts, etc.)
-		s.DebugLog("plaintext extraction encountered errors", "error", extractErr)
-	}
-
-	// Use whatever text was extracted (may be nil, partial, or complete)
-	if plaintextBodyResult == nil {
-		// No plaintext or HTML body found in the message
-		// Use empty string as fallback for FTS indexing
-		emptyStr := new(string)
-		plaintextBody = emptyStr
-	} else {
-		plaintextBody = plaintextBodyResult
-	}
-
-	recipients := helpers.ExtractRecipients(messageContent.Header)
-
 	// Safety guard: Reject if this node's staging limit is exceeded. Checked before Sieve runs,
 	// as on the Admin API path: the MTA retries a 452, and a refused attempt must not have
 	// sent a vacation reply or charged redirects to the rate limit first.
@@ -859,32 +820,14 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		if err != nil {
 			s.WarnLog("failed to apply header edits", "error", err)
 			// Continue with original message on error
+		} else if reparsed, err := server.ParseMessage(bytes.NewReader(modifiedBytes)); err != nil {
+			// Keep bytes, hash, and entity consistent when the edited header cannot be parsed.
+			s.WarnLog("failed to re-parse message after header edits", "error", err)
 		} else {
-			// Update fullMessageBytes with modified version
 			fullMessageBytes = modifiedBytes
-			// Recalculate content hash with modified message
 			contentHash = helpers.HashContent(fullMessageBytes)
-			// Re-parse message content for updated headers
-			messageContent, err = server.ParseMessage(bytes.NewReader(fullMessageBytes))
-			if err != nil {
-				s.WarnLog("failed to re-parse message after header edits", "error", err)
-				// Continue with what we have
-			} else {
-				// Update extracted header data
-				mailHeader = mail.Header{Header: messageContent.Header}
-				subject, _ = mailHeader.Subject()
-				messageID, _ = mailHeader.MessageID()
-				sentDate, _ = helpers.ParseDateHeader(mailHeader.Get("Date"))
-				inReplyTo, _ = mailHeader.MsgIDList("In-Reply-To")
-				references, _ = mailHeader.MsgIDList("References")
-				if len(inReplyTo) == 0 {
-					inReplyTo = nil
-				}
-				if len(references) == 0 {
-					references = nil
-				}
-				s.DebugLog("message headers updated after edits", "content_hash", contentHash)
-			}
+			messageContent = reparsed
+			s.DebugLog("message headers updated after edits", "content_hash", contentHash)
 		}
 	}
 
@@ -987,6 +930,41 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	}
 
 	s.InfoLog("executing sieve action", "action", result.Action)
+
+	// Extract header, recipient, body, and MIME metadata once from the final message
+	// (after any Sieve editheader changes, RFC 5293 §7) and reuse across destinations.
+	mailHeader := mail.Header{Header: messageContent.Header}
+	subject, _ := mailHeader.Subject()
+	messageID, _ := mailHeader.MessageID()
+	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date"))
+	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
+	references, _ := mailHeader.MsgIDList("References")
+	if len(inReplyTo) == 0 {
+		inReplyTo = nil
+	}
+	if len(references) == 0 {
+		references = nil
+	}
+	// A zero sentDate (no Date: header that parses) is stored as the internal date and
+	// reported as absent (db.InsertMessageOptions.SentDate).
+	s.DebugLog("message sent date", "sent_date", sentDate)
+
+	var plaintextBody *string
+	plaintextBodyResult, extractErr := helpers.ExtractPlaintextBody(messageContent)
+	if extractErr != nil {
+		// Plaintext extraction had errors but may have succeeded partially.
+		// Log the issues for debugging malformed MIME (invalid Content-Type, truncated parts, etc.)
+		s.DebugLog("plaintext extraction encountered errors", "error", extractErr)
+	}
+	if plaintextBodyResult == nil {
+		// No plaintext or HTML body found in the message; use empty string fallback for FTS.
+		emptyStr := new(string)
+		plaintextBody = emptyStr
+	} else {
+		plaintextBody = plaintextBodyResult
+	}
+
+	recipients := helpers.ExtractRecipients(messageContent.Header)
 
 	// Classify and extract the final stored MIME once, after editheader, and
 	// reuse both results for every destination. The structure
