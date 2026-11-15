@@ -56,7 +56,7 @@ func TestExportedFolderNamesRoundTripThroughImport(t *testing.T) {
 // "Work/v1.2/Notes") hold no messages and are no mailboxes of their own.
 func TestExportedFolderTreeScansAsTheExportedMailboxes(t *testing.T) {
 	root := t.TempDir()
-	exporter := &Exporter{maildirPath: root}
+	exporter := newDirExporter(t, root)
 	const msg = "1700000000.M1P1.host:2,S"
 
 	want := append([]string{"INBOX"}, roundTripFolderNames...)
@@ -206,7 +206,7 @@ func TestImportRefusesEscapedHierarchyDelimiter(t *testing.T) {
 
 func TestImportEscapedSlashDoesNotMergeFolders(t *testing.T) {
 	root := t.TempDir()
-	exporter := &Exporter{maildirPath: root}
+	exporter := newDirExporter(t, root)
 	require.NoError(t, exporter.createMailboxDirectory("INBOX"))
 	for n, name := range []string{`.Work\2fSecret`, `.Work.Secret`} {
 		dir := filepath.Join(root, name)
