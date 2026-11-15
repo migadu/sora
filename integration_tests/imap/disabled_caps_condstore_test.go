@@ -105,15 +105,10 @@ func TestIMAP_DisabledCondStoreFetchItems(t *testing.T) {
 }
 
 // TestIMAP_ClientFilterAfterNotifyLeavesOutModSeq: a NOTIFY watch whose
-// MessageNew fetch-atts name MODSEQ, set while the session offered CONDSTORE,
-// keeps asking for it after an ID-matched client filter withdraws CONDSTORE.
-// Fetch writes MODSEQ whenever it is asked for, since the parser refuses it
-// without CONDSTORE, and relies on the writer to leave it out here: MODSEQ is
-// CONDSTORE's data item (RFC 7162 §3.1.4.2), and a session whose CAPABILITY
-// lacks CONDSTORE does not offer the extension (RFC 7162 §3.1.1). The new
-// message's FETCH still carries its UID, so it is never empty (RFC 9051 §9
-// msg-att).
-func TestIMAP_ClientFilterAfterNotifyLeavesOutModSeq(t *testing.T) {
+// MODSEQ in MessageNew fetch-atts makes the client CONDSTORE-aware. A later
+// ID-matched filter must preserve CONDSTORE for that connection (#1071), and
+// the notification must still carry the requested MODSEQ (RFC 7162 §3.1).
+func TestIMAP_ClientFilterAfterNotifyKeepsModSeq(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	server, account, _ := common.SetupIMAPServerWithRealS3Options(t, func(o *imapserver.IMAPServerOptions) {
@@ -128,8 +123,8 @@ func TestIMAP_ClientFilterAfterNotifyLeavesOutModSeq(t *testing.T) {
 	watcher.do("NOTIFY SET (SELECTED (MessageNew (UID MODSEQ) MessageExpunge))")
 	watcher.do(`ID ("name" "buggy")`)
 	capLines, _ := watcher.do("CAPABILITY")
-	if caps := strings.Fields(strings.Join(capLines, " ")); slices.Contains(caps, "CONDSTORE") {
-		t.Fatalf("CAPABILITY after ID: want no CONDSTORE, got:\n%s", strings.Join(capLines, "\n"))
+	if caps := strings.Fields(strings.Join(capLines, " ")); !slices.Contains(caps, "CONDSTORE") {
+		t.Fatalf("CAPABILITY after ID: want enabled CONDSTORE preserved, got:\n%s", strings.Join(capLines, "\n"))
 	}
 
 	other := dialRawIMAP(t, server.Address)
@@ -149,7 +144,7 @@ func TestIMAP_ClientFilterAfterNotifyLeavesOutModSeq(t *testing.T) {
 			fetch = strings.TrimRight(line, "\r\n")
 		}
 	}
-	if !strings.Contains(fetch, "UID ") || strings.Contains(fetch, "MODSEQ") {
-		t.Errorf("MessageNew FETCH: want UID and no MODSEQ, got: %s", fetch)
+	if !strings.Contains(fetch, "UID ") || !strings.Contains(fetch, "MODSEQ") {
+		t.Errorf("MessageNew FETCH: want UID and MODSEQ, got: %s", fetch)
 	}
 }

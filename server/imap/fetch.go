@@ -535,9 +535,8 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 	}
 
 	// Likewise MODSEQ, and CHANGEDSINCE, which implies it: the parser accepted
-	// them only if the session offers CONDSTORE. A NOTIFY watch set before a
-	// client filter withdrew CONDSTORE still asks for MODSEQ, and WriteModSeq
-	// leaves it out then.
+	// them only if the session offers CONDSTORE. Requesting MODSEQ also makes
+	// the client CONDSTORE-aware, so a later capability filter preserves it.
 	if options.ModSeq {
 		var highestModSeq int64
 		highestModSeq = msg.CreatedModSeq
