@@ -1142,11 +1142,22 @@ func (i *Importer) resolveMailboxName(path string) (string, error) {
 // non-ASCII names), trimmed, and special folders mapped. A name with TAB, CR or LF is
 // refused. Folders and the subscriptions file are both named through it, so a
 // subscription names the mailbox the folder's messages went to.
+//
+// Each level is decoded on its own, and one that is not valid modified UTF-7 keeps
+// its raw name. The levels above it still decode as the parent folders' own names
+// did, so the mailbox stays below them instead of below a raw-named copy of them.
 func importedFolderName(name string) (string, error) {
-	if decoded, err := helpers.DecodeModifiedUTF7(name); err != nil {
-		logger.Warn("Failed to decode Modified UTF-7 mailbox name, using raw name", "name", name, "error", err)
-	} else {
-		name = decoded
+	if strings.Contains(name, "&") {
+		delim := string(consts.MailboxDelimiter)
+		levels := strings.Split(name, delim)
+		for i, level := range levels {
+			if decoded, err := helpers.DecodeModifiedUTF7(level); err != nil {
+				logger.Warn("Failed to decode Modified UTF-7 mailbox name level, using raw level", "name", name, "level", level, "error", err)
+			} else {
+				levels[i] = decoded
+			}
+		}
+		name = strings.Join(levels, delim)
 	}
 	if strings.ContainsAny(name, "\t\r\n") {
 		return "", fmt.Errorf("invalid characters in mailbox name %q", name)

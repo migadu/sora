@@ -73,7 +73,7 @@ func EncodeModifiedUTF7(src string) string {
 
 // DecodeModifiedUTF7 decodes a Modified UTF-7 encoded string (RFC 3501) to UTF-8.
 // If the string contains no Modified UTF-7 sequences (i.e., no '&' characters),
-// it is returned as-is.
+// it is returned as-is. BASE64 that encodes printable US-ASCII is invalid.
 func DecodeModifiedUTF7(src string) (string, error) {
 	// Fast path: no '&' means no Modified UTF-7 encoding
 	hasAmpersand := false
@@ -149,6 +149,11 @@ func DecodeModifiedUTF7(src string) (string, error) {
 					if r == utf8.RuneError {
 						return "", ErrInvalidModifiedUTF7
 					}
+				} else if r >= 0x20 && r <= 0x7e {
+					// A printable US-ASCII character has its own form ("&" is "&-"):
+					// modified BASE64 MUST NOT represent it (RFC 3501 §5.1.3).
+					// Decoding "&AC8-" would make a '/' that adds a hierarchy level.
+					return "", ErrInvalidModifiedUTF7
 				}
 				var buf [4]byte
 				w := utf8.EncodeRune(buf[:], r)
