@@ -140,9 +140,17 @@ func (db *Database) ResetUploadAttempts(ctx context.Context, tx pgx.Tx, contentH
 // pending row, the next lease finds no key left to write (PendingUploadKeys excludes a
 // key that has a live uploaded row) and calls this with no writtenKeys — the clause
 // then marks that row from the sibling that proves the object.
+//
+// The pending row is locked before dropFinishedPendingUpload decides; see there.
+// CompleteLeasedS3Upload locks it by ending its lease.
 func (db *Database) CompleteS3Upload(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64, writtenKeys []string) error {
 	if err := markS3Uploaded(ctx, tx, contentHash, accountID, writtenKeys); err != nil {
 		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		SELECT 1 FROM pending_uploads WHERE content_hash = $1 AND account_id = $2 FOR UPDATE
+	`, contentHash, accountID); err != nil {
+		return fmt.Errorf("failed to lock pending upload (hash=%s, account=%d): %w", contentHash, accountID, err)
 	}
 	return dropFinishedPendingUpload(ctx, tx, contentHash, accountID)
 }
@@ -217,6 +225,15 @@ func markS3Uploaded(ctx context.Context, tx pgx.Tx, contentHash string, accountI
 // dropFinishedPendingUpload deletes the pair's pending row once nothing is left to write
 // for it. It runs after markS3Uploaded in the same transaction, so it sees the rows just
 // marked.
+//
+// The caller must already hold the row's lock, so that this statement's snapshot is taken
+// after any delivery or copy that re-armed the row (InsertMessage, restagePendingUploads)
+// has committed together with the message it staged. Otherwise the DELETE waits for that
+// lock and, under READ COMMITTED, re-checks the row but judges "nothing left to write"
+// from a snapshot without that message: the re-armed row would go, and the new message
+// would stay uploaded = FALSE with no pending upload until CleanupFailedUploads reaps it.
+// A re-arm that starts after the lock waits for this transaction, and inserts a new row
+// if this one is deleted.
 //
 // A row with a live lease is left: an upload is writing under it (see PassS3WriteGate),
 // and the row is all that keeps a purge away from that body until the write lands. The

@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/retry"
@@ -85,6 +86,19 @@ func (rd *ResilientDatabase) IsMailboxSharedWithRetry(ctx context.Context, mailb
 		return rd.getOperationalDatabaseForOperation(ctx, false).IsMailboxShared(ctx, mailboxID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
+
+// RenameCrossesSharedBoundaryWithRetry reports whether renaming mbox to newName would
+// take it, or a live descendant, across the shared namespace boundary.
+func (rd *ResilientDatabase) RenameCrossesSharedBoundaryWithRetry(ctx context.Context, shared config.SharedMailboxesConfig, mbox *db.DBMailbox, newName string) (bool, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).RenameCrossesSharedBoundary(ctx, shared, mbox, newName)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
 	if err != nil {
 		return false, err
 	}
@@ -202,6 +216,36 @@ func (rd *ResilientDatabase) GetMailboxSummaryWithRetry(ctx context.Context, mai
 	return result.(*db.MailboxSummary), nil
 }
 
+// InReadSnapshotWithRetry runs fn inside a single REPEATABLE READ READ ONLY transaction
+// on the read pool (or write pool when consts.UseMasterDBKey is set on ctx), retrying
+// the entire snapshot as a unit on transient database errors. Snapshot-aware read
+// helpers called with snapCtx reuse the open transaction directly. The callback
+// context is scoped to fn and must only be used with this ResilientDatabase.
+func (rd *ResilientDatabase) InReadSnapshotWithRetry(ctx context.Context, fn func(ctx context.Context) error) error {
+	op := func(opCtx context.Context) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(opCtx, false).InReadSnapshot(opCtx, fn)
+	}
+	_, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
+	return err
+}
+
+// OptionalReadInSnapshot runs fn inside a PostgreSQL SAVEPOINT when ctx carries an
+// active InReadSnapshot transaction. Statement errors that rolled back cleanly to the
+// savepoint are returned as nonFatalErr so the caller can log/fall back on the still-
+// healthy snapshot transaction; context cancellation/deadlines, savepoint failures,
+// retryable transient errors, and database/connection failures are returned as fatalErr
+// so InReadSnapshotWithRetry can retry or surface them through the query breaker.
+func (rd *ResilientDatabase) OptionalReadInSnapshot(ctx context.Context, fn func(ctx context.Context) error) (nonFatalErr error, fatalErr error) {
+	err := db.InReadSavepoint(ctx, fn)
+	if err == nil {
+		return nil, nil
+	}
+	if ctx.Err() != nil || errors.Is(err, db.ErrReadSnapshotAborted) || rd.isRetryableError(err) || isDatabaseFailure(err) {
+		return nil, err
+	}
+	return err, nil
+}
+
 func (rd *ResilientDatabase) GetFirstUnseenSeqNumWithRetry(ctx context.Context, mailboxID int64) (uint32, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).GetFirstUnseenSeqNum(ctx, mailboxID)
@@ -225,6 +269,17 @@ func (rd *ResilientDatabase) GetMailboxSummariesBatchWithRetry(ctx context.Conte
 		return map[int64]*db.MailboxSummary{}, nil
 	}
 	return result.(map[int64]*db.MailboxSummary), nil
+}
+
+func (rd *ResilientDatabase) CountDeletedMessagesWithRetry(ctx context.Context, mailboxIDs []int64) (map[int64]uint32, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).CountDeletedMessages(ctx, mailboxIDs)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.(map[int64]uint32), nil
 }
 
 func (rd *ResilientDatabase) GetMailboxesWithRetry(ctx context.Context, AccountID int64, subscribed bool) ([]*db.DBMailbox, error) {

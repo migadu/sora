@@ -40,6 +40,10 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 		}
 	}
 
+	// The client's numbering holds still until the results are numbered (seqViewMu).
+	s.seqViewMu.RLock()
+	defer s.seqViewMu.RUnlock()
+
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		return nil, s.internalError("failed to acquire lock for thread")
@@ -55,7 +59,8 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 	selectedMailboxOwnerID := s.selectedMailbox.AccountID
 	selectedMailboxName := s.selectedMailbox.Name
 	mailboxMessageCount := s.currentNumMessages.Load()
-	criteria = s.decodeSearchCriteriaLocked(criteria)
+	view := s.seqViewLocked()
+	criteria = s.decodeSearchCriteriaLocked(view, criteria)
 	release()
 
 	if s.useMasterDB.Load() {
@@ -73,7 +78,7 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 	// destMailbox.AccountID, LMTP and delivery resolve the owner likewise). Passing the
 	// session account here would make every shared-mailbox body search return nothing.
 	withSeqNums := numKind == imapserver.NumKindSeq
-	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(ctx, selectedMailboxID, selectedMailboxOwnerID, criteria, includeSubject, withSeqNums, s.server.threadMaxMessages)
+	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(view.context(ctx), selectedMailboxID, selectedMailboxOwnerID, criteria, includeSubject, withSeqNums, s.server.threadMaxMessages)
 	if errors.Is(err, db.ErrThreadTooManyMessages) {
 		// RFC 5530 section 3, LIMIT: "The operation ran up against an
 		// implementation limit of some kind".
@@ -88,6 +93,10 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 	if err != nil {
 		s.ErrorLog("failed to fetch messages for threading", "err", err)
 		return nil, fmt.Errorf("failed to fetch messages for threading: %w", err)
+	}
+	if withSeqNums {
+		// Thread only the messages the client knows, by its numbers for them.
+		messages = encodeResults(view, messages, func(m *db.ThreadMessageResult) *uint32 { return &m.Seq })
 	}
 
 	// No messages match the search criteria.

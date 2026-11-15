@@ -241,10 +241,10 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					// positive_ttl to allow periodic revalidation via remotelookup/database.
 					// This ensures that when a domain moves backends or password changes,
 					// active users eventually pick up the changes.
-					s.DebugLog("cache hit - using cached auth", "username", username, "account_id", cached.AccountID, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
+					s.accountID = cached.AccountID
+					s.DebugLog("cache hit - using cached auth", "username", username, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
 					metrics.LookupCacheResults.WithLabelValues("pop3_proxy", "hit").Inc()
 
-					s.accountID = cached.AccountID
 					s.isRemoteLookupAccount = cached.FromRemoteLookup
 					// Rebuilt exactly as the uncached login routed (proxy.RouteFromCache): the pin,
 					// its enforcement and every backend-leg setting the lookup answer carried.
@@ -407,9 +407,9 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// RemoteLookup returned success - use routing info
-				s.DebugLog("remotelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
-				metrics.RemoteLookupResult.WithLabelValues("pop3", "success").Inc()
 				s.accountID = routingInfo.AccountID
+				s.DebugLog("remotelookup successful", "master_auth_validated", masterAuthValidated)
+				metrics.RemoteLookupResult.WithLabelValues("pop3", "success").Inc()
 				s.isRemoteLookupAccount = routingInfo.IsRemoteLookupAccount
 				s.routingInfo = routingInfo
 
@@ -474,7 +474,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				// For master username, this shouldn't happen (password already validated)
 				// For others, reject immediately
 				if masterAuthValidated {
-					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "user", username)
+					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "username", username)
 				}
 
 				// Cache negative result (wrong password)
@@ -565,7 +565,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			// temporary failure (-ERR [SYS/TEMP]), not a failed login charged to the master
 			// credential.
 			if server.IsTemporaryAuthFailure(err) {
-				s.WarnLog("authentication unavailable", "method", "master", "user", address.BaseAddress(), "error", err)
+				s.WarnLog("authentication unavailable", "method", "master", "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
 				return server.ErrAuthServiceUnavailable
 			}
@@ -807,9 +807,14 @@ func (s *POP3ProxySession) connectToBackend() error {
 		useXCLIENT = s.routingInfo.RemoteUseXCLIENT
 	}
 	if useXCLIENT {
-		if err := s.sendForwardingParametersToBackend(backendWriter, backendReader); err != nil {
+		if err := s.sendForwardingParametersToBackend(backendWriter, backendReader); errors.Is(err, errXCLIENTRefused) {
+			// Go on without them: the -ERR ended the exchange.
 			s.WarnLog("Failed to send forwarding parameters to backend", "error", err)
-			// Continue anyway - forwarding parameters are not critical for functionality
+		} else if err != nil {
+			// The XCLIENT reply was not read (a write or read error, or the deadline). It
+			// may still come, and AUTH would take a late +OK for its own reply.
+			s.backendConn.Close()
+			return fmt.Errorf("%w: XCLIENT exchange with backend: %w", server.ErrBackendConnectionFailed, err)
 		}
 	}
 
@@ -843,7 +848,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: failed to read UTF8 response: %w", server.ErrBackendConnectionFailed, err)
 		}
-		if !strings.HasPrefix(resp, "+OK") {
+		if !isPositiveResponse(resp) {
 			// Best-effort: pre-migration code never forwarded UTF8, so a
 			// backend without UTF8 support degrades exactly as it did before.
 			s.WarnLog("backend rejected UTF8 mode; continuing without it", "response", strings.TrimSpace(resp))
@@ -880,7 +885,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 		return fmt.Errorf("%w: failed to read auth response: %w", server.ErrBackendAuthFailed, err)
 	}
 
-	if !strings.HasPrefix(authResp, "+OK") {
+	if !isPositiveResponse(authResp) {
 		s.backendConn.Close()
 		// CRITICAL: Invalidate cache on backend authentication failure
 		// This ensures the next request does fresh remotelookup/database lookup
@@ -901,13 +906,21 @@ func (s *POP3ProxySession) connectToBackend() error {
 }
 
 // isPositiveResponse reports whether a backend response line carries the +OK status
-// indicator: ASCII case-insensitive (RFC 1939 section 3) and complete, so that a prefix
-// such as +OKAY is not an OK status.
-func isPositiveResponse(line string) bool {
-	if len(line) < 3 || !strings.EqualFold(line[:3], "+OK") {
+// indicator, and isNegativeResponse whether it carries -ERR. See hasStatusIndicator.
+func isPositiveResponse(line string) bool { return hasStatusIndicator(line, "+OK") }
+
+func isNegativeResponse(line string) bool { return hasStatusIndicator(line, "-ERR") }
+
+// hasStatusIndicator reports whether line starts with the status indicator status as a
+// whole: RFC 2449 section 3, single-line = status [SP text] CRLF, so that +OKAY is not
+// +OK. The match ignores case, as ABNF strings do (RFC 2234 section 2.3), though RFC
+// 1939 section 3 has servers send the indicators in upper case.
+func hasStatusIndicator(line, status string) bool {
+	if len(line) < len(status) || !strings.EqualFold(line[:len(status)], status) {
 		return false
 	}
-	return len(line) == 3 || line[3] == ' ' || line[3] == '\r' || line[3] == '\n'
+	rest := line[len(status):]
+	return rest == "" || rest[0] == ' ' || rest[0] == '\r' || rest[0] == '\n'
 }
 
 // startTLSWithBackend upgrades the backend connection with STLS (RFC 2595), within
