@@ -29,11 +29,10 @@ const (
 	ActionRedirect Action = "redirect"
 )
 
-// scriptExecutionTimeout bounds the total execution time of a single Sieve script
-// (CPU/resource-exhaustion guard). It is also passed to go-sieve as the per-match
-// regex soft-wait cap (Options.Interp.RegexLimits.MaxExecTime), so a large but
-// input-bounded body :matches/:regex completes within the script budget instead of
-// failing on go-sieve's tight 100ms default under load or race instrumentation.
+// scriptExecutionTimeout supplies the cooperative execution budget of a Sieve
+// script and the per-match regex deadline (Options.Interp.RegexLimits.MaxExecTime).
+// Inputs over 1 KB check it while matching; smaller matches and compilation run
+// inline under the input/pattern/program limits. It is not a strict wall-clock cap.
 // Configurable via SetScriptExecutionTimeout (from [sieve] max_execution_time).
 var scriptExecutionTimeout = 2 * time.Second
 
@@ -43,7 +42,7 @@ const (
 )
 
 // SetScriptExecutionTimeout overrides the Sieve script execution budget (and the
-// per-match regex soft-wait cap derived from it). The value is clamped to
+// large-input regex deadline derived from it). The value is clamped to
 // [100ms, 60s]; a non-positive value leaves the current setting unchanged. Call once
 // at startup before serving.
 func SetScriptExecutionTimeout(d time.Duration) {
@@ -286,9 +285,10 @@ func CompileScript(scriptContent string, enabledExtensions []string) (*CompiledS
 	}
 	options := sieve.DefaultOptions()
 	options.EnabledExtensions = enabledExtensions
-	// Raise the per-match regex soft-wait cap to the whole-script budget. The match
-	// input is already truncated to MaxInputLength, so a large body match is bounded;
-	// go-sieve's 100ms default can otherwise spuriously fail it under load or -race.
+	// Raise the large-input regex deadline to the whole-script budget: go-sieve's
+	// 100ms default can otherwise spuriously fail a body match under load or -race.
+	// Inputs over 1 KB check the deadline as they are read, then stop on timeout;
+	// short matches and compilation remain inline under the fixed size limits.
 	options.Interp.RegexLimits.MaxExecTime = scriptExecutionTimeout
 	script, err := sieve.Load(strings.NewReader(scriptContent), options)
 	if err != nil {
@@ -327,11 +327,11 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		To:   ctx.EnvelopeTo,
 	}
 
-	// RFC 5228 §2.6.2.1: Header field names are case-insensitive
-	// Normalize all header keys to lowercase to ensure consistent matching
+	// Header names compare under i;ascii-casemap (RFC 5228 §2.7): the map is
+	// keyed by the lower-cased name and HeaderGet lowers the name it looks up.
 	normalizedHeaders := make(map[string][]string, len(ctx.Header))
 	for key, values := range ctx.Header {
-		normalizedHeaders[strings.ToLower(key)] = values
+		normalizedHeaders[lowerASCII(key)] = values
 	}
 
 	message := &SieveMessage{
@@ -650,9 +650,30 @@ type SieveMessage struct {
 }
 
 func (m *SieveMessage) HeaderGet(key string) ([]string, error) {
-	// RFC 5228 §2.6.2.1: Header field names are case-insensitive
-	// Since LMTP normalizes headers to lowercase, we must do case-insensitive lookup
-	return m.Headers[strings.ToLower(key)], nil
+	return m.Headers[lowerASCII(key)], nil
+}
+
+// lowerASCII lowers the US-ASCII letters of a header name and leaves every other
+// byte as it is. Header names compare under i;ascii-casemap (RFC 5228 §2.7), which
+// "treats US-ASCII letters case-insensitively" and under which "letters outside
+// ASCII are not treated case-insensitively" (RFC 4790 §9.2.1); strings.ToLower
+// would also lower U+212A KELVIN SIGN to "k" and U+0130 LATIN CAPITAL LETTER I
+// WITH DOT ABOVE to "i".
+func lowerASCII(s string) string {
+	i := 0
+	for i < len(s) && (s[i] < 'A' || s[i] > 'Z') {
+		i++
+	}
+	if i == len(s) {
+		return s
+	}
+	b := []byte(s)
+	for ; i < len(b); i++ {
+		if 'A' <= b[i] && b[i] <= 'Z' {
+			b[i] += 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 func (m *SieveMessage) MessageSize() int {

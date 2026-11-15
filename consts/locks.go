@@ -45,3 +45,8 @@ const SoraSieveScriptLimitLockClassID = int32(0x53494556) // "SIEV" in hex = 139
 // lock, keyed by hashint8(account_id), that serialises Sieve script activations
 // (db.SetScriptActive, db.SetScriptActiveByName) per account.
 const SoraSieveScriptActivateLockClassID = int32(0x53414354) // "SACT" in hex = 1396786004
+
+// SoraPrimaryIdentityLockClassID is the class ID of the transaction-scoped advisory lock,
+// keyed by hashint8(account_id), that serialises changes of an account's primary identity
+// (db.AddCredential with IsPrimary, db.UpdateAccount with MakePrimary).
+const SoraPrimaryIdentityLockClassID = int32(0x5052494D) // "PRIM" in hex = 1347569997
