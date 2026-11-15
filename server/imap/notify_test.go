@@ -2,6 +2,7 @@ package imap
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"testing"
 
@@ -486,6 +487,55 @@ func TestNotifyOwnTreeChanges(t *testing.T) {
 				t.Errorf("events = %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+// TestOwnTreeChangeLeavesTickSnapshotAlone: the account snapshot a tick makes
+// the watch's is the map that notifyTick goes on reading, without notifyMutex,
+// for the STATUS fan-in. A command that ends meanwhile applies its own tree
+// change to the watch's snapshot, and must not write to that map: that is a
+// data race, which the Go runtime may abort the whole process for
+// ("concurrent map read and map write").
+func TestOwnTreeChangeLeavesTickSnapshotAlone(t *testing.T) {
+	s := &IMAPSession{}
+	watch := newTestWatch(imap.NotifyItem{
+		MailboxSpec: imap.NotifyMailboxSpecPersonal,
+		Events:      []imap.NotifyEvent{imap.NotifyEventMessageNew, imap.NotifyEventMailboxName, imap.NotifyEventSubscriptionChange},
+	})
+	watch.snapshot = map[int64]notifySnapshotEntry{1: {name: "INBOX"}, 2: {name: "Old"}}
+	s.notifyWatch = watch
+	cur := map[int64]notifySnapshotEntry{1: {name: "INBOX"}, 2: {name: "Old"}, 3: {name: "Gone"}}
+	want := maps.Clone(cur)
+	if _, stale := s.advanceNotifySnapshot(watch, cur, 0, true); stale {
+		t.Fatal("snapshot taken for stale")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, record := range []func(*ownTreeChange){
+			func(c *ownTreeChange) { c.created("Projects") },
+			func(c *ownTreeChange) { c.renamed("Old", "Older") },
+			func(c *ownTreeChange) { c.subscribed("Older", true) },
+			func(c *ownTreeChange) { c.deleted("Gone") },
+		} {
+			own := s.beginOwnTreeChange()
+			record(own)
+			own.end()
+		}
+	}()
+	for range 1000 {
+		for id := range want {
+			_ = cur[id] // as the fan-in does for each changed mailbox
+		}
+	}
+	<-done
+
+	if !maps.Equal(cur, want) {
+		t.Errorf("own tree changes wrote to the snapshot the tick reads: %v, want %v", cur, want)
+	}
+	if !watch.snapshotHas("Projects") || !watch.snapshotHas("Older") || watch.snapshotHas("Gone") {
+		t.Errorf("own tree changes missing from the watch's snapshot: %v", watch.snapshot)
 	}
 }
 
