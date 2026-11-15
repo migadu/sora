@@ -1271,6 +1271,24 @@ func (db *Database) RenameCrossesSharedBoundary(ctx context.Context, shared conf
 	return crossSharedBoundary(rows, &shared)
 }
 
+// isInboxMailboxName reports whether stored, a mailbox name resolved from the database,
+// is "INBOX" in any case of its ASCII letters.
+func isInboxMailboxName(stored string) bool {
+	if len(stored) != len(consts.MailboxInbox) {
+		return false
+	}
+	for i := 0; i < len(stored); i++ {
+		c := stored[i]
+		if 'a' <= c && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if c != consts.MailboxInbox[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64) error {
 	// The same names createMailbox refuses: control characters, empty levels and
 	// "." / ".." levels (maildir-export path traversal).
@@ -1282,16 +1300,20 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// Check if user has admin permission (ACL 'a' right) for shared mailboxes
 	// For personal mailboxes, ownership is sufficient
 	var isShared bool
+	var currentName string
 	err := tx.QueryRow(ctx, `
-		SELECT COALESCE(is_shared, FALSE)
+		SELECT COALESCE(is_shared, FALSE), name
 		FROM mailboxes
 		WHERE id = $1 AND (account_id = $2 OR COALESCE(is_shared, FALSE) = TRUE) AND deleted_at IS NULL
-	`, mailboxID, AccountID).Scan(&isShared)
+	`, mailboxID, AccountID).Scan(&isShared, &currentName)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return consts.ErrMailboxNotFound
 		}
 		return fmt.Errorf("failed to fetch mailbox for rename: %w", err)
+	}
+	if !isShared && isInboxMailboxName(currentName) {
+		return fmt.Errorf("cannot rename INBOX: %w", consts.ErrNotPermitted)
 	}
 
 	// Whether a mailbox is shared (is_shared, owner_domain, its ACL) is settled when
@@ -1345,6 +1367,9 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		}
 		logger.Error("Database: failed to fetch and lock mailbox to rename", "mailbox_id", mailboxID, "err", err)
 		return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
+	}
+	if !isShared && isInboxMailboxName(oldName) {
+		return fmt.Errorf("cannot rename INBOX: %w", consts.ErrNotPermitted)
 	}
 
 	// Validate mailbox path is not empty (data corruption check)
