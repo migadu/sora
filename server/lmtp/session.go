@@ -1358,12 +1358,8 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 
 		// Ensure the local file exists under the destination owner's staging directory.
 		// The original was staged under s.AccountID() by StoreLocally before Sieve.
-		sourcePath := s.backend.uploader.FilePath(contentHash, s.AccountID())
-		destPath := s.backend.uploader.FilePath(contentHash, destAccountID)
-		if sourcePath != destPath {
-			if err := helpers.LinkOrCopyFile(sourcePath, destPath); err != nil {
-				s.WarnLog("failed to stage local file for cross-account LMTP delivery", "source", sourcePath, "dest", destPath, "error", err)
-			}
+		if err := s.backend.uploader.LinkStaged(contentHash, s.AccountID(), destAccountID); err != nil {
+			s.WarnLog("failed to stage local file for cross-account LMTP delivery", "hash", contentHash, "dest_account_id", destAccountID, "error", err)
 		}
 	}
 

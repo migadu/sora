@@ -1,11 +1,13 @@
 package uploader
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"math/rand/v2"
 	"os"
@@ -1230,45 +1232,111 @@ func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []
 	path := w.FilePath(contentHash, accountID)
 	dir := filepath.Dir(path)
 	// Nothing removes an account's staging directory once it exists, so it is still
-	// there when the OpenFile below runs. The uploader used to remove it as soon as the
-	// account's last staged file left, which could land between these two calls and
-	// fail the delivery with ENOENT. An empty directory left behind costs an inode, and
-	// on ext4 (without inline_data) also its one directory block.
+	// there when stageFrom creates its file. The uploader used to remove it as soon as
+	// the account's last staged file left, which could land between these two steps
+	// and fail the delivery with ENOENT. An empty directory left behind costs an inode,
+	// and on ext4 (without inline_data) also its one directory block.
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
+	if err := w.stageFrom(path, bytes.NewReader(data)); err != nil {
+		return nil, err
+	}
+	return &path, nil
+}
 
-	// Write to a temporary name, fsync, then rename into place. The final path is
-	// only ever a complete, durable file: a crash mid-write leaves a stray .tmp that
-	// nobody reads (and the orphan sweep removes), never a truncated body that a later
-	// delivery of the same bytes would adopt ("file exists, skip write") and a reader
-	// would serve. The rename also keeps a concurrent reader or uploader on the old
-	// inode, so a rewrite never changes bytes under an open descriptor.
-	//
-	// The temporary name is this call's own, created exclusively: two stagings of the
-	// same body (duplicate APPENDs or deliveries that both passed their caller's Stat)
-	// run here at once. With a shared name the first rename took the name from under
-	// the second, which then failed with ENOENT, and a second open with O_TRUNC could
-	// empty an inode the first was about to rename into place as staged. Each writer
-	// now fills its own inode and renames a complete file over <hash>.
+// linkFile makes a hard link; a variable so tests can refuse one.
+var linkFile = os.Link
+
+// LinkStaged stages for destAccountID a body staged on this node for srcAccountID. A
+// cross-account COPY or MOVE, and a delivery into a shared mailbox another account owns,
+// store the body under the mailbox owner, whose own pending upload reads this file. It
+// is hard-linked where the filesystem allows it and copied otherwise; a destination
+// already staged is left as it is.
+//
+// The staging counts against max_staging_size like any other. The monitor refresh
+// counts one pending row per account and body, and the destination's upload subtracts
+// the body's size when it removes its file, whether or not that file shares the
+// source's inode; were the link not added here, the guard would count one body short
+// per cross-account staging until the next refresh.
+//
+// An error wrapping fs.ErrNotExist means the body is not staged here for srcAccountID.
+func (w *UploadWorker) LinkStaged(contentHash string, srcAccountID, destAccountID int64) error {
+	if !isValidContentHash(contentHash) {
+		return fmt.Errorf("invalid content hash %q", contentHash)
+	}
+	src, dst := w.FilePath(contentHash, srcAccountID), w.FilePath(contentHash, destAccountID)
+	if src == dst {
+		return nil
+	}
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0755); err != nil { // never removed once made, see StoreLocally
+		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	}
+
+	pathMu := w.stagingPathLock(dst)
+	pathMu.Lock()
+	err := linkFile(src, dst)
+	if err == nil {
+		w.stagedSizeChanged(dst, 0, fileSize(dst))
+	}
+	pathMu.Unlock()
+	switch {
+	case err == nil:
+		if err := syncDir(dir); err != nil {
+			logger.Warn("Uploader: Failed to fsync directory (non-fatal)", "dir", dir, "error", err)
+		}
+		return nil
+	case errors.Is(err, fs.ErrExist):
+		return nil // staged for destAccountID already, and counted then
+	}
+
+	// No hard link here (another filesystem, a link limit, ...): copy the body. A
+	// missing source fails the open, before anything is written.
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open staged body %s: %w", src, err)
+	}
+	defer in.Close()
+	return w.stageFrom(dst, in)
+}
+
+// stageFrom stages at path, whose directory exists, the body read from r, and counts it
+// against max_staging_size.
+//
+// It writes to a temporary name, fsyncs, then renames into place. The final path is
+// only ever a complete, durable file: a crash mid-write leaves a stray .tmp that nobody
+// reads (and the orphan sweep removes), never a truncated body that a later delivery of
+// the same bytes would adopt ("file exists, skip write") and a reader would serve. The
+// rename also keeps a concurrent reader or uploader on the old inode, so a rewrite never
+// changes bytes under an open descriptor.
+//
+// The temporary name is this call's own, created exclusively: two stagings of the same
+// body (duplicate APPENDs or deliveries that both passed their caller's Stat) run here
+// at once. With a shared name the first rename took the name from under the second,
+// which then failed with ENOENT, and a second open with O_TRUNC could empty an inode the
+// first was about to rename into place as staged. Each writer now fills its own inode
+// and renames a complete file over <hash>.
+func (w *UploadWorker) stageFrom(path string, r io.Reader) error {
 	tmpPath := fmt.Sprintf("%s.%016x.tmp", path, rand.Uint64())
 	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create file %s: %w", tmpPath, err)
+		return fmt.Errorf("failed to create file %s: %w", tmpPath, err)
 	}
-	if _, err := f.Write(data); err != nil {
+	size, err := io.Copy(f, r)
+	if err != nil {
 		f.Close()
 		os.Remove(tmpPath)
-		return nil, fmt.Errorf("failed to write file %s: %w", tmpPath, err)
+		return fmt.Errorf("failed to write file %s: %w", tmpPath, err)
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmpPath) // an unsynced file must not be left where "exists" means "staged"
-		return nil, fmt.Errorf("failed to fsync file %s: %w", tmpPath, err)
+		return fmt.Errorf("failed to fsync file %s: %w", tmpPath, err)
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(tmpPath)
-		return nil, fmt.Errorf("failed to close file %s: %w", tmpPath, err)
+		return fmt.Errorf("failed to close file %s: %w", tmpPath, err)
 	}
 
 	// Bytes already accounted for at this path are sampled under the per-path lock
@@ -1279,21 +1347,21 @@ func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []
 	previousSize := fileSize(path)
 	renameErr := os.Rename(tmpPath, path)
 	if renameErr == nil {
-		w.stagedSizeChanged(path, previousSize, int64(len(data)))
+		w.stagedSizeChanged(path, previousSize, size)
 	}
 	pathMu.Unlock()
 	if renameErr != nil {
 		os.Remove(tmpPath)
-		return nil, fmt.Errorf("failed to move %s into place: %w", tmpPath, renameErr)
+		return fmt.Errorf("failed to move %s into place: %w", tmpPath, renameErr)
 	}
 
 	// Fsync the parent directory to ensure the directory entry is durable.
+	dir := filepath.Dir(path)
 	if err := syncDir(dir); err != nil {
 		logger.Warn("Uploader: Failed to fsync directory (non-fatal)", "dir", dir, "error", err)
 		// Non-fatal: the file data is already synced, directory entry may survive without this
 	}
-
-	return &path, nil
+	return nil
 }
 
 // fileSize returns the size of a file, or 0 if it cannot be stat'ed.
