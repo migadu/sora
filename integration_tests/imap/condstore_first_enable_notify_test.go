@@ -16,7 +16,7 @@ import (
 // values. Enabling notifications again cannot repair an already consumed delta.
 func TestIMAP_FirstCondStoreEnablingCommandBelowFilteredFlagChange(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
-	for _, mode := range []string{"filtered", "reenabled", "reselected"} {
+	for _, mode := range []string{"filtered", "reenabled", "reselected", "none", "none_reenabled", "none_uidexpunge"} {
 		t.Run(mode, func(t *testing.T) {
 			srv, account := common.SetupIMAPServer(t)
 			defer srv.Close()
@@ -29,7 +29,11 @@ func TestIMAP_FirstCondStoreEnablingCommandBelowFilteredFlagChange(t *testing.T)
 			if strings.Contains(strings.Join(cached, "\n"), `\Flagged`) {
 				t.Fatal("initial cache already has the flag")
 			}
-			c.do("NOTIFY SET (selected (MessageNew MessageExpunge))")
+			if strings.HasPrefix(mode, "none") {
+				c.do("NOTIFY NONE")
+			} else {
+				c.do("NOTIFY SET (selected (MessageNew MessageExpunge))")
+			}
 
 			other := dialRawIMAP(t, srv.Address)
 			other.do(fmt.Sprintf("LOGIN %s %s", account.Email, account.Password))
@@ -39,13 +43,22 @@ func TestIMAP_FirstCondStoreEnablingCommandBelowFilteredFlagChange(t *testing.T)
 			if flagModSeq <= baseline {
 				t.Fatalf("other STORE did not change metadata: %q", changed)
 			}
-			// NOOP runs the selected pipeline with FlagChange disabled; the
-			// update is consumed but does not reach this client's cache.
-			filtered, _ := c.do("NOOP")
+			// NOOP runs the selected pipeline with FlagChange disabled. Under
+			// NOTIFY NONE, EXPUNGE commands still force it to report command
+			// results, even though no message is currently marked Deleted.
+			// The flag update is consumed without reaching this client's cache.
+			syncCommand := "NOOP"
+			if strings.HasPrefix(mode, "none") {
+				syncCommand = "EXPUNGE"
+			}
+			if mode == "none_uidexpunge" {
+				syncCommand = "UID EXPUNGE 1:2"
+			}
+			filtered, _ := c.do(syncCommand)
 			if strings.Contains(strings.Join(filtered, "\n"), `\Flagged`) {
 				t.Fatalf("FlagChange was not filtered: %q", filtered)
 			}
-			if mode != "filtered" {
+			if mode == "reenabled" || mode == "reselected" || mode == "none_reenabled" {
 				c.do("NOTIFY SET (selected (MessageNew MessageExpunge FlagChange))")
 				c.do("NOOP")
 			}

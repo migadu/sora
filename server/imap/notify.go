@@ -279,26 +279,6 @@ func (s *IMAPSession) notifyWatchActive() bool {
 	return s.notifyWatch != nil
 }
 
-// notifySelectedFlagsFiltered matches the selected-mailbox FlagChange filter
-// applied by the library's UpdateWriter. The watch pointer is guarded, and its
-// selected event list is immutable once installed.
-func (s *IMAPSession) notifySelectedFlagsFiltered() bool {
-	s.notifyMutex.Lock()
-	defer s.notifyMutex.Unlock()
-	watch := s.notifyWatch
-	if watch == nil {
-		return false
-	}
-	if watch.selected != nil {
-		for _, event := range watch.selected.Events {
-			if event == imap.NotifyEventFlagChange {
-				return false
-			}
-		}
-	}
-	return true
-}
-
 // SetNotify implements imapserver.SessionNotify. It validates the requested
 // events, resolves the watch against the account's current mailboxes,
 // initializes the fan-in cursor, and — when the STATUS indicator is present —

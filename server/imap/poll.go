@@ -380,9 +380,10 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		}
 	}
 
-	// Process message flag updates. The NOTIFY event list is stable during
-	// this poll; take its pointer lock once rather than for every message.
-	flagsFiltered := s.notifySelectedFlagsFiltered()
+	// Read the writer's actual NOTIFY policy once, when the first flag update
+	// needs it. A nil backend watch can mean NOTIFY NONE as well as the
+	// default, and only the library knows which policy its writer applies.
+	var flagFilterRead, flagsFiltered bool
 	for _, update := range poll.Updates {
 		if update.IsExpunge {
 			continue
@@ -391,6 +392,10 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		// Already answered by this session's own STORE or FETCH.
 		if modSeq, ok := s.ownStoreEcho[update.UID]; ok && modSeq == update.EffectiveModSeq && s.ownStoreEchoMailboxID == mailboxID {
 			continue
+		}
+		if !flagFilterRead {
+			flagsFiltered = !w.FlagChangeAllowed()
+			flagFilterRead = true
 		}
 		// NOTIFY may discard this update instead of writing it. An empty
 		// tracker then does not mean every change through the cursor was
