@@ -25,6 +25,7 @@ type lookupRefusal struct {
 	failures      int32  // failed attempts charged to the auth rate limiter
 	lookups       int32  // requests that reached the lookup service
 	cached        bool   // a lookup-cache entry was written for the user
+	successKeys   string // the rate-limit keys successes were recorded under
 }
 
 func refuseTwiceAgainstLookup(t *testing.T, answer http.HandlerFunc) lookupRefusal {

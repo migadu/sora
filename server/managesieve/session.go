@@ -108,8 +108,9 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 	var impersonating bool
 	var targetAddress *server.Address
 	// gated: the progressive delay and the rate-limit check have already run for this
-	// login under the key regular authentication uses (a master SASL self-login handed
-	// on to it), so they do not run a second time there.
+	// login under the key regular authentication uses (a master SASL self-login, or the
+	// master username form without the master password, handed on to it), so they do
+	// not run a second time there.
 	var gated bool
 
 	// One copy of the master SASL settings for the whole login, however a config
@@ -117,7 +118,8 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 	settings := s.server.settings.Load()
 
 	// 1. Check for Master Username Authentication (user@domain.com@MASTER_USERNAME)
-	if parseErr == nil && len(s.server.masterUsername) > 0 && authnParsed.HasSuffix() && checkMasterCredential(authnParsed.Suffix(), s.server.masterUsername) {
+	masterForm := parseErr == nil && len(s.server.masterUsername) > 0 && authnParsed.HasSuffix() && checkMasterCredential(authnParsed.Suffix(), s.server.masterUsername)
+	if masterForm {
 		// Rate-limit the master-password check. The master password is a
 		// tenant-wide credential, so it must not be brute-forceable
 		// unthrottled.
@@ -212,19 +214,15 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 			targetAddress = &address
 			impersonating = true
 		} else {
-			// The failure is recorded (feeds progressive delay / blocking so the
-			// tenant-wide master password can't be brute-forced) under authKey — the
-			// master credential's own bucket — so the impersonation target is not locked
-			// out. Answered exactly like any other bad credential (errAuthFailed): a
-			// distinct reply is reachable with only the master USERNAME (no secret) and
-			// confirms the configured master username to an attacker. At the same cost
-			// too: any other suffix is answered after the regular check of the base
-			// address, so a refusal without it confirms the master username by its
-			// response time (#801). Reason kept at WARN.
-			s.WarnLog("master username authentication failed (invalid master password)")
-			refusalErr, out := s.refuseLikeWrongPassword(ctx, authnParsed, nil, password, netConn, proxyInfo, authKey)
-			outcome = out
-			return refusalErr
+			// Any other password is the base address's own login, checked by regular
+			// authentication below exactly as under any other suffix: a distinct reply, a
+			// quicker one (#801), or a refusal of the account's own password (#949)
+			// confirms the configured master username. Already delayed and checked here
+			// under authKey, the master credential's own bucket, where regular
+			// authentication also records its failure (AuthRateLimitKeyWithMaster), so the
+			// tenant-wide master password cannot be brute-forced and the account it names
+			// is not locked out; only a success is the account's.
+			gated = true
 		}
 	}
 
@@ -346,11 +344,14 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 	if !impersonating {
 		netConn := s.conn
 		proxyInfo := s.proxyInfo()
-		// Rate-limit key for this attempt. Canonicalised so the check and both
-		// record calls below use the SAME key: keying on FullAddress() kept the
-		// "+detail", so a different +tag per attempt gave every attempt its own
-		// bucket and Tier 1 never engaged.
-		authKey := server.AuthRateLimitKey(authnID)
+		// Rate-limit key for this attempt. Canonicalised so the check and the failure
+		// records below use the SAME key: keying on FullAddress() kept the "+detail", so
+		// a different +tag per attempt gave every attempt its own bucket and Tier 1
+		// never engaged. The master username form handed on from above keeps the master
+		// credential's key (AuthRateLimitKeyWithMaster), under which it was checked: its
+		// failures are guesses at the master password and must not charge the account
+		// it names.
+		authKey := server.AuthRateLimitKeyWithMaster(authnID, s.server.masterUsername)
 
 		// Apply progressive authentication delay BEFORE any other checks - including
 		// before the identity is parsed. An unparseable identity is recorded as a failed
@@ -409,6 +410,10 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 				s.DebugLog("authentication unavailable", "error", err)
 				return errTryLater
 			}
+			if masterForm {
+				// Kept for the operator debugging a client with the wrong master password.
+				s.WarnLog("master username authentication failed (invalid master password)")
+			}
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
@@ -429,9 +434,11 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 			return &managesieveserver.Error{Message: msieve.Quote("Proxy authentication requires master credentials")}
 		}
 
-		// Record successful attempt
+		// Record successful attempt under the account's key, the master username form
+		// with the account's own password too (#949): under the master credential's key
+		// it would clear the failed guesses at the master password.
 		if s.server.authLimiter != nil {
-			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, true)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, server.AuthRateLimitKey(authnID), true)
 		}
 
 		targetAddress = &address
@@ -452,9 +459,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 // outcome to count. A refusal that skipped the check would be answered one
 // verification sooner and confirm what made it one. Used for a refused master SASL
 // impersonation (#846), which must not answer with the proxy-auth error when
-// authnParsed names an account whose own password is the master SASL password, and for
-// a wrong password in the master username form (#801), which must not log in even when
-// it is the account's own password.
+// authnParsed names an account whose own password is the master SASL password.
 func (s *ManageSieveSession) refuseLikeWrongPassword(ctx context.Context, authnParsed server.Address, parseErr error, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) (error, string) {
 	if parseErr == nil {
 		if _, authErr := s.server.Authenticate(ctx, authnParsed.BaseAddress(), password); authErr != nil {
@@ -534,47 +539,38 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 		return errAuthFailed
 	}
 
-	// Master username authentication: user@domain.com@MASTER_USERNAME
 	authSuccess := false
 	masterAuthUsed := false
 	var accountID int64
-	if len(s.server.masterUsername) > 0 && address.HasSuffix() && checkMasterCredential(address.Suffix(), s.server.masterUsername) {
-		// Suffix matches MasterUsername, authenticate with MasterPassword
-		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
-			if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
-				return errAuthFailed
+	// Master username authentication: user@domain.com@MASTER_USERNAME, with the master
+	// password. Any other password in that form is the base address's own login, checked
+	// by regular authentication below exactly as under any other suffix (see
+	// AuthenticatePlain, #801, #949). Its failure is recorded under authKey, the master
+	// credential's key; only a success is the account's.
+	masterForm := len(s.server.masterUsername) > 0 && address.HasSuffix() && checkMasterCredential(address.Suffix(), s.server.masterUsername)
+	if masterForm && len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
+		if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
+			return errAuthFailed
+		}
+		s.DebugLog("master username authentication successful", "address", address.BaseAddress(), "master_username", address.Suffix())
+		authSuccess = true
+		masterAuthUsed = true
+		// Use base address (without suffix) to get account
+		accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
+		if err != nil {
+			// Unavailable: a temporary failure, see AuthenticatePlain.
+			if authUnavailable(err) {
+				s.WarnLog("impersonation target lookup unavailable", "target_user", address.BaseAddress(), "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "unavailable").Inc()
+				return errTryLater
 			}
-			s.DebugLog("master username authentication successful", "address", address.BaseAddress(), "master_username", address.Suffix())
-			authSuccess = true
-			masterAuthUsed = true
-			// Use base address (without suffix) to get account
-			accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
-			if err != nil {
-				// Unavailable: a temporary failure, see AuthenticatePlain.
-				if authUnavailable(err) {
-					s.WarnLog("impersonation target lookup unavailable", "target_user", address.BaseAddress(), "error", err)
-					metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "unavailable").Inc()
-					return errTryLater
-				}
-				s.WarnLog("failed to get account id", "address", address.BaseAddress(), "error", err)
-				if s.server.authLimiter != nil {
-					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-				}
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
-				return errAuthFailed
+			s.WarnLog("failed to get account id", "address", address.BaseAddress(), "error", err)
+			if s.server.authLimiter != nil {
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
-		} else {
-			// Answer exactly like any other bad credential (errAuthFailed): a distinct
-			// reply is reachable with only the master USERNAME (no secret) and confirms
-			// the configured master username to an attacker. At the same cost too: any
-			// other suffix is answered after the regular check of the base address, so a
-			// refusal without it confirms the master username by its response time
-			// (#801). Reason kept at WARN.
-			s.WarnLog("master username authentication failed (invalid master password)")
-			refusalErr, out := s.refuseLikeWrongPassword(ctx, address, nil, password, netConn, proxyInfo, authKey)
-			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, out).Inc()
-			return refusalErr
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
+			return errAuthFailed
 		}
 	}
 
@@ -599,6 +595,10 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "unavailable").Inc()
 				return errTryLater
 			}
+			if masterForm {
+				// Kept for the operator debugging a client with the wrong master password.
+				s.WarnLog("master username authentication failed (invalid master password)")
+			}
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
@@ -607,9 +607,11 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 		}
 	}
 
-	// Record successful attempt
+	// Record successful attempt: a master login under the master credential's key, any
+	// other under the account's, the master form with its own password too (#949): under
+	// the master key it would clear the failed guesses at the master password.
 	if s.server.authLimiter != nil {
-		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, true)
+		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, server.AuthSuccessRateLimitKey(username, password, s.server.masterUsername, s.server.masterPassword), true)
 	}
 
 	return s.completeAuthentication(ctx, address, accountID, masterAuthUsed, start)

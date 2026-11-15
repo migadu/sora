@@ -830,6 +830,11 @@ written to disk, and the cache is empty after a restart.
 | success | accepted from the cache, routed as before | entry younger than `positive_revalidation_window`: rejected without asking; older: checked again |
 | failure | rejected from the cache | checked again |
 
+The master username form `user@example.com@MASTERUSER` logs in with two passwords, `master_password`
+and the user's own ([AUTHENTICATION.md](AUTHENTICATION.md#81-master-username-master_username-and-master_password)),
+and both use the one entry for that name. A success entry made with one of them never rejects the
+other: the login is checked again, as for an older entry.
+
 Entries are not extended by use: a success entry expires `positive_ttl` after it was made, and the
 next login checks again. The IMAP and POP3 proxies delete the entry when the backend cannot be
 reached or refuses the proxy's login, so the next attempt routes afresh. The LMTP proxy does not
