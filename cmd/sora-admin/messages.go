@@ -133,7 +133,9 @@ func handleRestoreMessages(ctx context.Context) {
 This command restores deleted (expunged) messages back to their original mailboxes.
 If the original mailbox no longer exists, it will be recreated. Messages are
 assigned new UIDs in their target mailboxes. A mailbox recreated in the shared
-namespace is a shared mailbox of the account, without the ACL entries it had.
+namespace is a shared mailbox of the account that only the owner can open: it
+gets neither the ACL entries it had nor its parent's. Grant access again with
+'acl grant'.
 
 Large restores are processed in chunks, each committed separately. If the run
 fails part-way, the messages restored so far are kept and the error says how

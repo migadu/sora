@@ -4,9 +4,11 @@ package resilient
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 )
 
@@ -119,4 +121,25 @@ func TestSetScriptActiveByName_ReplicaHasNotReplayedCreate(t *testing.T) {
 			t.Fatal("the script is still active after its deactivation")
 		}
 	})
+}
+
+// Activating a name the account has no script of answers not found and leaves the
+// active script active: the deactivation that precedes the activation is rolled back.
+func TestActivateScript_UnknownNameKeepsActiveScript(t *testing.T) {
+	ctx := context.Background()
+	rd, _, primary, accountID := newSieveTestWithLaggingReplica(t)
+	stored, _, err := rd.CreateOrUpdateScriptWithRetry(ctx, accountID, "filters", "keep;")
+	if err != nil {
+		t.Fatalf("PUT: %v", err)
+	}
+	if err := rd.SetScriptActiveWithRetry(ctx, stored.ID, accountID, true); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	if err := rd.ActivateScriptWithRetry(ctx, "missing", accountID); !errors.Is(err, consts.ErrDBNotFound) {
+		t.Fatalf("activate a name with no script: got %v, want %v", err, consts.ErrDBNotFound)
+	}
+	if _, active := primaryScriptState(t, primary, accountID, "filters"); !active {
+		t.Fatal("the active script was deactivated by the activation of a missing name")
+	}
 }

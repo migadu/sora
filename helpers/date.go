@@ -78,6 +78,13 @@ func ParseDateHeader(value string) (time.Time, error) {
 		if end < len(unfolded) && unfolded[end] != ' ' && unfolded[end] != '\t' && unfolded[end] != '(' {
 			return mail.ParseDate(unfolded)
 		}
+		// Nor are the letters the zone when a numeric offset follows them after
+		// white space or a comment, as in "02:23:25 PM -0700": the grammar has one
+		// zone after the time of day ("time = time-of-day zone"), and net/mail
+		// would discard the offset after the replacement.
+		if rest := strings.TrimLeft(unfolded[end:], " \t"); rest != "" && (rest[0] == '+' || rest[0] == '-') {
+			return mail.ParseDate(unfolded)
+		}
 		zone, ok := obsZones[strings.ToUpper(unfolded[m[4]:end])]
 		if !ok {
 			zone = "-0000"

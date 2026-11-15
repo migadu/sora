@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,29 +44,27 @@ func TestStartupConfigWarningsReachTheConfiguredLog(t *testing.T) {
 	}
 
 	const misspelt = "[cleanup]\ngrace_periood = \"7d\"\n"
-	const metricsServer = "\n[[server]]\ntype = \"metrics\"\nname = \"metrics\"\naddr = \"127.0.0.1:0\"\n"
 
 	t.Run("logging configured", func(t *testing.T) {
-		dir := t.TempDir()
-		logPath := filepath.Join(dir, "sora.log")
-		// A [tls] certificate that cannot be read stops start-up once logging is
-		// configured: the whole-file checks do not read it, service setup does. A node
-		// that runs only a metrics server needs no database or S3, so nothing is
-		// connected to and no listener is opened before that.
-		missing := filepath.Join(dir, "missing.pem")
-		tlsTOML := fmt.Sprintf("[tls]\nenabled = true\nprovider = \"file\"\ncert_file = %q\nkey_file = %q\n\n", missing, missing)
-		out, err := run(t, fmt.Sprintf("[logging]\noutput = %q\nlevel = \"warn\"\n\n", logPath)+tlsTOML+misspelt+metricsServer)
+		logPath := filepath.Join(t.TempDir(), "sora.log")
+		// A reserved local metrics address stops start-up after logging is configured.
+		// It needs no database or S3, and still exercises held startup warnings now
+		// that invalid scheduler settings are refused before logging is initialized.
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		metrics := fmt.Sprintf("\n[[server]]\ntype = \"metrics\"\nname = \"metrics\"\naddr = %q\n", listener.Addr().String())
+		out, err := run(t, fmt.Sprintf("[logging]\noutput = %q\nlevel = \"warn\"\n\n", logPath)+misspelt+metrics)
 		if err == nil {
-			t.Fatalf("start-up went on; want it stopped by the unreadable certificate:\n%s", out)
+			t.Fatalf("start-up went on; want it stopped by the occupied metrics address:\n%s", out)
 		}
 		data, err := os.ReadFile(logPath)
 		if err != nil {
-			t.Fatalf("%v\nstderr:\n%s", err, out)
+			t.Fatal(err)
 		}
 		logged := string(data)
-		if !strings.Contains(logged, `operation="initialize TLS manager"`) {
-			t.Fatalf("start-up did not stop at the TLS manager:\n%s\nstderr:\n%s", logged, out)
-		}
 		if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, "cleanup.grace_periood") {
 			t.Errorf("the log file has no WARN record naming cleanup.grace_periood:\n%s\nstderr:\n%s", logged, out)
 		}
