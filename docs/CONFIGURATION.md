@@ -757,7 +757,7 @@ to" column, "backends" means `imap`, `pop3`, `lmtp` and `managesieve`, and "line
 | `type` | string | required | all | See [section 5](#5-server-blocks). |
 | `name` | string | required | all | Unique name. |
 | `addr` | string | required | all | Listen address. |
-| `debug` | bool | `false` | backends, line proxies | Extra diagnostics for this server. Some protocols write a raw protocol trace to the log output whatever the level. On the HTTP servers it is ignored, with a startup warning. See [PROTOCOLS.md](PROTOCOLS.md). |
+| `debug` | bool | `false` | `imap`, `lmtp`, line proxies | Extra diagnostics for this server. Some protocols write a raw protocol trace to the log output whatever the level. On the other server types (`pop3` and `managesieve` included) it is ignored, with a startup warning. See [PROTOCOLS.md](PROTOCOLS.md). |
 
 ### 9.2 TLS on the listener
 
@@ -770,9 +770,10 @@ See [TLS.md](TLS.md).
 | `tls_cert_file`, `tls_key_file` | string | none | all but `metrics` | Certificate files for this listener. |
 | `tls_verify` | bool | `false` | all but `metrics` | See [TLS.md](TLS.md). |
 | `tls_default_domain` | string | `[tls.letsencrypt] default_domain` | all but `metrics` | Certificate for clients that send no SNI. |
-| `insecure_auth` | bool | `false` | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Allow password logins on a plain connection. Without `tls = true` it is always allowed. The other server types have no password login; on them the key is ignored, with a startup warning. See [SECURITY.md](SECURITY.md). |
+| `insecure_auth` | bool | `false` | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Allow password logins on a plain connection. Without `tls = true` it is always allowed. LMTP has no login and the HTTP servers do not use the key; on the other server types it is ignored, with a startup warning. See [SECURITY.md](SECURITY.md). |
 
-The `metrics` server always speaks plain HTTP. `tls` on it only causes a startup warning.
+The `metrics` server always speaks plain HTTP. `tls`, `tls_cert_file`, `tls_key_file`,
+`tls_verify` and `tls_default_domain` on it only cause a startup warning that names them.
 
 ### 9.3 PROXY protocol on the listener
 
@@ -781,7 +782,8 @@ The `metrics` server always speaks plain HTTP. `tls` on it only causes a startup
 | `proxy_protocol` | bool | `false` | backends, line proxies, `http_admin_api`, `http_user_api`, `user_api_proxy` | Expect a PROXY protocol header from hosts in `trusted_networks`. Needs a non-empty `trusted_networks`. |
 | `proxy_protocol_timeout` | duration | `"5s"` | as `proxy_protocol` | Time to wait for the header. |
 
-`proxy_protocol_trusted_proxies` is not a key: Sora warns about it as unknown.
+The `metrics` server reads no PROXY header; on it both keys are ignored, with a startup warning
+that names them. `proxy_protocol_trusted_proxies` is not a key: Sora warns about it as unknown.
 See [SECURITY.md](SECURITY.md) and [PROXY.md](PROXY.md).
 
 ### 9.4 Connection limits
@@ -822,10 +824,12 @@ names it.
 ### 9.6 Timeouts (`[server.timeouts]`)
 
 See [SECURITY.md](SECURITY.md) and [PROTOCOLS.md](PROTOCOLS.md).
+A key or per-command table set on a server type not listed for it is ignored, with a startup
+warning that names it.
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
-| `command_timeout` | duration | `imap`, `imap_proxy`: `30m`; `pop3`, `pop3_proxy`: `10m`; `managesieve`, `managesieve_proxy`: `3m` | `imap`, `pop3`, `managesieve` and their proxies | Idle time before a connection is closed. |
+| `command_timeout` | duration | `imap`, `imap_proxy`: `30m`; `pop3`, `pop3_proxy`: `10m`; `managesieve`, `managesieve_proxy`: `3m`; `lmtp`: `5m` | `imap`, `pop3`, `managesieve` and their proxies, `lmtp` | Idle time before a connection is closed. |
 | `absolute_session_timeout` | duration | `24h`; `lmtp_proxy`: `5m` | `imap`, `pop3`, `managesieve`, line proxies | Longest a session may last. |
 | `min_bytes_per_minute` | integer | `0` (off) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Minimum throughput before a slow connection is closed. |
 
@@ -894,7 +898,8 @@ names it.
 ### 9.9 Authentication rate limit (`[server.auth_rate_limit]`)
 
 Applies to `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`,
-`http_user_api` and `user_api_proxy`. When `enabled = true`, every key you leave
+`http_user_api` and `user_api_proxy`; on another server type the table is ignored, with a startup
+warning. When `enabled = true`, every key you leave
 out, or set to 0, gets the default below. A negative value, or a `delay_multiplier` of `nan` or
 `inf`, stops startup ([section 4](#4-checks-at-startup)). See [AUTHENTICATION.md](AUTHENTICATION.md).
 
@@ -926,7 +931,8 @@ An in-memory cache of login results. See [AUTHENTICATION.md](AUTHENTICATION.md) 
 
 By default the cache is on for `imap`, `pop3`, `managesieve` and the line proxies, and off for
 `http_user_api` and `user_api_proxy`. A table you write changes only the keys it names; the others,
-`enabled` included, keep their defaults.
+`enabled` included, keep their defaults. The `lmtp`, `metrics` and `http_admin_api` servers keep no
+lookup cache; on them the table is ignored, with a startup warning.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
@@ -964,7 +970,8 @@ names it.
 ### 9.12 Remote lookup (`[server.remote_lookup]`)
 
 Asks an HTTP API which backend serves a user, or checks the password there. Applies to the line
-proxies and `user_api_proxy`. See [PROXY.md](PROXY.md).
+proxies and `user_api_proxy`; on another server type the table is ignored, with a startup warning.
+See [PROXY.md](PROXY.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
