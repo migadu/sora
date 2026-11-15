@@ -67,6 +67,20 @@ func (rd *ResilientDatabase) GetCredentialForAuthWithRetry(ctx context.Context, 
 	return cred.ID, cred.Hash, nil
 }
 
+// GetMasterLoginTargetWithRetry returns the ID of the active account a master login
+// impersonates (master username or master SASL, after the master credential checked
+// out). A failed lookup returns consts.ErrUserNotFound or an error wrapping
+// server.ErrAuthServiceUnavailable, as a credential lookup does (see
+// credentialLookupError): a master login the database cannot answer is a temporary
+// failure, not a failed login charged to the master credential.
+func (rd *ResilientDatabase) GetMasterLoginTargetWithRetry(ctx context.Context, address string) (int64, error) {
+	accountID, err := rd.GetActiveAccountIDByAddressWithRetry(ctx, address)
+	if err != nil {
+		return 0, credentialLookupError(err)
+	}
+	return accountID, nil
+}
+
 // GetCredentialEpochWithRetry retrieves the account ID and the credential's
 // password epoch (updated_at) for an address with retry logic, requiring the
 // account to be active. The User API uses this to revalidate account state when

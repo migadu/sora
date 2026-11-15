@@ -60,6 +60,40 @@ func TestAdminAPI_DeliverMail_RunsDefaultSieveAndCreate(t *testing.T) {
 			want:   "INBOX",
 		},
 		{name: "default fileinto :create of an invalid detail keeps", detail: "a/./b", want: "INBOX"},
+		// Issue #457: an empty hierarchy level is refused as a "." level is, and a
+		// trailing delimiter is no part of the name (RFC 3501 §6.3.3: "the name
+		// created is without the trailing hierarchy delimiter"), so neither makes a
+		// mailbox with an empty level ("x/", "Trail/").
+		{
+			name:   "user fileinto :create of a name with an empty level keeps",
+			script: []string{`require ["fileinto", "mailbox"];`, `fileinto :create "x//y";`},
+			want:   "INBOX",
+		},
+		{name: "default fileinto :create of a detail with an empty level keeps", detail: "x//y", want: "INBOX"},
+		{
+			name:   "user fileinto :create of a name with a trailing delimiter",
+			script: []string{`require ["fileinto", "mailbox"];`, `fileinto :create "Trail/";`},
+			want:   "Trail",
+		},
+		{name: "default fileinto :create of a detail with a trailing delimiter", detail: "foo/", want: "foo"},
+		// A NUL or a byte that is not UTF-8 cannot be stored in a PostgreSQL text
+		// value; the lookup of such a name failed the delivery, with :create or
+		// without.
+		{
+			name:   "user fileinto :create of a name with a NUL keeps",
+			script: []string{`require ["fileinto", "mailbox", "encoded-character"];`, `fileinto :create "a${hex:00}b";`},
+			want:   "INBOX",
+		},
+		{
+			name:   "user fileinto :create of a name that is not UTF-8 keeps",
+			script: []string{`require ["fileinto", "mailbox", "encoded-character"];`, `fileinto :create "a${hex:ff}b";`},
+			want:   "INBOX",
+		},
+		{
+			name:   "user fileinto of a name that is not UTF-8 keeps",
+			script: []string{`require ["fileinto", "encoded-character"];`, `fileinto "a${hex:ff}b";`},
+			want:   "INBOX",
+		},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -112,6 +146,16 @@ func TestAdminAPI_DeliverMail_RunsDefaultSieveAndCreate(t *testing.T) {
 			}
 			if mailbox != tc.want {
 				t.Errorf("stored in %s, want %s", mailbox, tc.want)
+			}
+
+			mailboxes, err := server.rdb.GetMailboxesWithRetry(ctx, accountID, false)
+			if err != nil {
+				t.Fatalf("list mailboxes: %v", err)
+			}
+			for _, mb := range mailboxes {
+				if mb.Name == "" || strings.HasPrefix(mb.Name, "/") || strings.HasSuffix(mb.Name, "/") || strings.Contains(mb.Name, "//") {
+					t.Errorf("created mailbox %q with an empty hierarchy level", mb.Name)
+				}
 			}
 		})
 	}
@@ -174,5 +218,62 @@ func TestAdminAPI_DeliverMail_SieveCreateNotInSharedNamespace(t *testing.T) {
 	}
 	if personal != 0 {
 		t.Errorf("fileinto :create made %d personal mailboxes in the shared namespace", personal)
+	}
+}
+
+// TestAdminAPI_DeliverMail_DefaultSieveFilesSpamIntoJunkSpecialUse is issue #987 on
+// the /admin/mail/deliver path (the LMTP side is in integration_tests/lmtp): the
+// default script files spam into the mailbox carrying \Junk (RFC 6154), here a Junk
+// folder renamed to Spam, and not into a plain folder that merely has the name Junk.
+func TestAdminAPI_DeliverMail_DefaultSieveFilesSpamIntoJunkSpecialUse(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, _ := setupHTTPAPIServerWithUploader(t)
+	defer server.Close()
+	ctx := context.Background()
+
+	email := fmt.Sprintf("apijunkuse-%d@example.com", time.Now().UnixNano())
+	createDeliveryAccount(t, server, email)
+	accountID, err := server.rdb.GetAccountIDByAddressWithRetry(ctx, email)
+	if err != nil {
+		t.Fatalf("lookup account: %v", err)
+	}
+	if err := server.rdb.CreateDefaultMailboxesWithRetry(ctx, accountID); err != nil {
+		t.Fatalf("create default mailboxes: %v", err)
+	}
+	junk, err := server.rdb.GetMailboxByNameWithRetry(ctx, accountID, "Junk")
+	if err != nil {
+		t.Fatalf("get Junk: %v", err)
+	}
+	if junk.SpecialUse != `\Junk` {
+		t.Fatalf("default Junk special-use %q, want \\Junk", junk.SpecialUse)
+	}
+	if err := server.rdb.RenameMailboxWithRetry(ctx, junk.ID, accountID, "Spam", nil); err != nil {
+		t.Fatalf("rename Junk to Spam: %v", err)
+	}
+	if err := server.rdb.CreateMailboxWithRetry(ctx, accountID, "Junk", nil); err != nil {
+		t.Fatalf("create plain Junk: %v", err)
+	}
+
+	subject := fmt.Sprintf("api-spam-%d", time.Now().UnixNano())
+	msg := "From: sender@example.com\r\nTo: " + email + "\r\nSubject: " + subject + "\r\nX-Spam: Yes\r\n\r\nBody via API.\r\n"
+	resp, body := server.makeRequest(t, "POST", "/admin/mail/deliver", map[string]any{
+		"recipients": []string{email},
+		"from":       "sender@example.com",
+		"message":    msg,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("deliver: %d %s", resp.StatusCode, string(body))
+	}
+
+	var mailbox string
+	if err := server.rdb.QueryRowWithRetry(ctx, `
+		SELECT mb.name FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id
+		WHERE m.account_id = $1 AND m.subject = $2 AND m.expunged_at IS NULL`,
+		accountID, subject).Scan(&mailbox); err != nil {
+		t.Fatalf("find delivered message: %v", err)
+	}
+	if mailbox != "Spam" {
+		t.Errorf("spam stored in %s, want Spam (the \\Junk mailbox)", mailbox)
 	}
 }

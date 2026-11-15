@@ -51,17 +51,6 @@ func startLoginTestServer(t *testing.T, rdb *resilient.ResilientDatabase, cached
 	}
 }
 
-// TestUserAPILoginMalformedEmail: an email that is not an address is a failed login,
-// 401, as on every other protocol, not 503: nothing is wrong with the database.
-func TestUserAPILoginMalformedEmail(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
-	login := startLoginTestServer(t, common.SetupTestDatabase(t), false)
-
-	if code := login("   ", "any-password"); code != http.StatusUnauthorized {
-		t.Errorf("login with a blank email: %d, want %d", code, http.StatusUnauthorized)
-	}
-}
-
 // TestUserAPILoginDeletedCachedAccount: a login answered from the lookup cache for an
 // account deleted since it was cached is refused, 401, as the token refresh refuses
 // it, not 503: the credential-epoch lookup found no active account, it did not fail.

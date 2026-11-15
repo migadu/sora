@@ -7,8 +7,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/migadu/sora/db"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -43,6 +45,27 @@ func newCleanupDBImporter(t *testing.T, ctx context.Context, maildirPath string,
 		importer.s3 = s3
 	}
 	return importer
+}
+
+// newTestModeImporter returns an importer over maildirPath with opts, wired to rdb,
+// in test mode (no uploads).
+func newTestModeImporter(t *testing.T, maildirPath string, rdb resilientDB, opts ImporterOptions) *Importer {
+	t.Helper()
+	opts.TestMode = true
+	importer, err := NewImporter(context.Background(), maildirPath, "user@example.com", 1, nil, nil, opts)
+	require.NoError(t, err)
+	t.Cleanup(func() { importer.Close() })
+	importer.rdb = rdb
+	return importer
+}
+
+// addOversizedMessage adds a message larger than maxSize to maildirPath: the scan
+// fails it (validateMessage) before it reaches the import database, so it is never
+// pending for an --incremental run.
+func addOversizedMessage(t *testing.T, maildirPath string, maxSize int) {
+	t.Helper()
+	content := "From: sender@example.com\r\nTo: user@example.com\r\nSubject: Big\r\n\r\n" + strings.Repeat("x", 2*maxSize) + "\r\n"
+	require.NoError(t, os.WriteFile(filepath.Join(maildirPath, "cur", "1700000999.M999P1.host:2,S"), []byte(content), 0644))
 }
 
 // uploadedCounts reads the kept import database: how many files it records as
@@ -101,6 +124,16 @@ type failingAccountLookupDB struct {
 
 func (m *failingAccountLookupDB) GetAccountIDByAddressWithRetry(ctx context.Context, address string) (int64, error) {
 	return 0, errors.New("simulated database unavailable")
+}
+
+// panickingInsertDB panics in the batch insert, which runs on Run's own goroutine, as
+// an importer bug would: a run that panics did not import everything.
+type panickingInsertDB struct {
+	*mockResilientDatabase
+}
+
+func (m *panickingInsertDB) InsertMessagesFromImporterBatchWithRetry(ctx context.Context, opts []*db.InsertMessageOptions) ([]int64, []int64, []string, error) {
+	panic("simulated importer bug")
 }
 
 // --cleanup-db removes sora-maildir.db, the record of which files are already
@@ -169,5 +202,56 @@ func TestImportCleanupDBOnlyAfterSuccessfulRun(t *testing.T) {
 		assert.Equal(t, int64(2), importer.failedMessages)
 		assert.FileExists(t, filepath.Join(maildirPath, "sora-maildir.db"),
 			"a failed run removed the import database")
+	})
+
+	t.Run("re-run whose remaining messages all fail the scan fails and keeps the database", func(t *testing.T) {
+		const maxSize = 1024
+		maildirPath := newCleanupDBMaildir(t, 2)
+		addOversizedMessage(t, maildirPath, maxSize)
+		opts := ImporterOptions{CleanupDB: true, Incremental: true, MaxMessageSize: maxSize}
+
+		first := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), opts)
+		require.Error(t, first.Run())
+		require.FileExists(t, filepath.Join(maildirPath, "sora-maildir.db"))
+
+		// The re-run finds nothing pending: the one message left failed in the scan again.
+		second := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), opts)
+		err := second.Run()
+		require.Error(t, err, "a run whose only remaining message failed reported success")
+		assert.Equal(t, int64(1), second.failedMessages)
+		require.FileExists(t, filepath.Join(maildirPath, "sora-maildir.db"),
+			"a run whose only remaining message failed removed the import database")
+
+		imported, _ := uploadedCounts(t, maildirPath)
+		assert.Equal(t, 2, imported, "the record of the first run's imports is kept for the next run")
+	})
+
+	t.Run("dry run keeps the database", func(t *testing.T) {
+		const maxSize = 1024
+		maildirPath := newCleanupDBMaildir(t, 2)
+		addOversizedMessage(t, maildirPath, maxSize)
+		opts := ImporterOptions{CleanupDB: true, Incremental: true, MaxMessageSize: maxSize}
+
+		first := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), opts)
+		require.Error(t, first.Run())
+
+		// Previewing the retry with the same command line plus --dry-run.
+		opts.DryRun = true
+		preview := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), opts)
+		require.NoError(t, preview.Run())
+		require.FileExists(t, filepath.Join(maildirPath, "sora-maildir.db"),
+			"a dry run removed the import database")
+
+		imported, _ := uploadedCounts(t, maildirPath)
+		assert.Equal(t, 2, imported, "a dry run lost the record of the earlier run's imports")
+	})
+
+	t.Run("run that panics keeps the database", func(t *testing.T) {
+		maildirPath := newCleanupDBMaildir(t, 2)
+		importer := newCleanupDBImporter(t, context.Background(), maildirPath, &panickingInsertDB{newMockResilientDatabase()}, nil)
+
+		assert.PanicsWithValue(t, "simulated importer bug", func() { _ = importer.Run() })
+		assert.FileExists(t, filepath.Join(maildirPath, "sora-maildir.db"),
+			"a run that panicked removed the import database")
 	})
 }

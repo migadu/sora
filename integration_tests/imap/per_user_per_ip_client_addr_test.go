@@ -114,6 +114,27 @@ func TestIMAP_PerUserPerIPLimitSeparatesIPv6Clients(t *testing.T) {
 	}
 }
 
+// A real PROXY v1 client must not get a second per-user slot by spelling
+// the same IP differently, including its IPv4-mapped form.
+func TestIMAP_PerUserPerIPLimitCanonicalisesProxiedClient(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	for _, tc := range []struct{ name, first, second string }{
+		{"IPv6", "2001:db8::1", "2001:0DB8:0:0:0:0:0:1"},
+		{"IPv4 mapped", "192.0.2.1", "::ffff:192.0.2.1"},
+		{"IPv4 unmapped", "::ffff:192.0.2.1", "192.0.2.1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, account := setupPerUserPerIPBehindProxy(t, 1)
+			if resp := dialProxiedIMAP(t, server.Address, tc.first).login(account); !strings.Contains(resp, " OK ") {
+				t.Fatalf("first LOGIN from %s: %s", tc.first, resp)
+			}
+			if resp := dialProxiedIMAP(t, server.Address, tc.second).login(account); !strings.Contains(resp, " NO [LIMIT]") {
+				t.Fatalf("second LOGIN from equivalent client %s: %s, want NO [LIMIT]", tc.second, resp)
+			}
+		})
+	}
+}
+
 // A trusted proxy that forwards the client address with ID (x-originating-ip)
 // before LOGIN gets the same per-client count.
 func TestIMAP_PerUserPerIPLimitCountsIDForwardedClientAddress(t *testing.T) {
@@ -127,6 +148,25 @@ func TestIMAP_PerUserPerIPLimitCountsIDForwardedClientAddress(t *testing.T) {
 		}
 		if resp := c.login(account); !strings.Contains(resp, " OK ") {
 			t.Fatalf("LOGIN forwarded for %s (first from that address): %s", ip, resp)
+		}
+	}
+}
+
+// Behind a layer-4 load balancer that sends PROXY headers, an ID is the client's own:
+// it cannot replace the address the header gave, so a client cannot claim a fresh
+// address for each connection and escape the per-IP count (#540).
+func TestIMAP_PerUserPerIPLimitIgnoresIDFromProxiedClient(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account := setupPerUserPerIPBehindProxy(t, 1)
+
+	for i, want := range []string{" OK ", " NO [LIMIT]", " NO [LIMIT]"} {
+		claimed := fmt.Sprintf("203.0.113.%d", i+1)
+		c := dialProxiedIMAP(t, server.Address, "198.51.100.66")
+		if resp := c.do(fmt.Sprintf(`ID ("x-originating-ip" "%s" "x-proxy-ttl" "5")`, claimed)); !strings.Contains(resp, " OK ") {
+			t.Fatalf("ID: %s", resp)
+		}
+		if resp := c.login(account); !strings.Contains(resp, want) {
+			t.Fatalf("LOGIN %d from 198.51.100.66 claiming %s: %s, want %s", i+1, claimed, resp, want)
 		}
 	}
 }

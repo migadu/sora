@@ -21,10 +21,18 @@ import (
 
 // setupManageSievePerUserPerIPBehindProxy starts a ManageSieve backend that
 // accepts PROXY headers from 127.0.0.1 and tracks connections in the returned
-// tracker, with a per-user-per-IP limit of perIP. A refused registration is
-// only logged on this backend (#345), so the tests read the tracker instead of
-// the AUTHENTICATE response.
+// tracker, with a per-user-per-IP limit of perIP.
 func setupManageSievePerUserPerIPBehindProxy(t *testing.T, perIP int) (string, common.TestAccount, *server.ConnectionTracker) {
+	t.Helper()
+	_, address, account, tracker := setupManageSieveConnLimitsBehindProxy(t, 100, perIP)
+	return address, account, tracker
+}
+
+// setupManageSieveConnLimitsBehindProxy starts a ManageSieve backend that
+// accepts PROXY headers from 127.0.0.1 and tracks connections in the returned
+// tracker, with max_connections_per_user perUser and
+// max_connections_per_user_per_ip perIP (0: no limit).
+func setupManageSieveConnLimitsBehindProxy(t *testing.T, perUser, perIP int) (*managesieve.ManageSieveServer, string, common.TestAccount, *server.ConnectionTracker) {
 	t.Helper()
 	rdb := common.SetupTestDatabase(t)
 	account := common.CreateTestAccount(t, rdb)
@@ -42,14 +50,14 @@ func setupManageSievePerUserPerIPBehindProxy(t *testing.T, perIP int) (string, c
 	if err != nil {
 		t.Fatalf("managesieve.New: %v", err)
 	}
-	tracker := server.NewConnectionTracker("ManageSieve", "test", "localhost", "test-instance", nil, 100, perIP, 0, false)
+	tracker := server.NewConnectionTracker("ManageSieve", "test", "localhost", "test-instance", nil, perUser, perIP, 0, false)
 	srv.SetConnTracker(tracker)
 
 	errChan := make(chan error, 1)
 	go srv.Start(errChan)
 	t.Cleanup(srv.Close)
 	time.Sleep(100 * time.Millisecond)
-	return address, account, tracker
+	return srv, address, account, tracker
 }
 
 type proxiedSieveConn struct {
@@ -172,10 +180,12 @@ func TestManageSieve_PerUserPerIPLimitCountsProxiedClientAddress(t *testing.T) {
 	waitTrackedEmpty(t, tracker)
 
 	// The limit still holds per client address: a second session from
-	// 198.51.100.1 is not counted (whether its login is refused is #345).
+	// 198.51.100.1 is refused and not counted.
 	dialProxiedManageSieve(t, addr, "198.51.100.1").login(account)
 	over := dialProxiedManageSieve(t, addr, "198.51.100.1")
-	over.tryLogin(account)
+	if resp := over.tryLogin(account); !strings.HasPrefix(resp, "NO (TRYLATER)") {
+		t.Fatalf("login over max_connections_per_user_per_ip = %q, want NO (TRYLATER)", resp)
+	}
 	expectTrackedPerIP(t, tracker, map[string]int{"198.51.100.1": 1})
 
 	// Closing the session that was not counted must not release the count

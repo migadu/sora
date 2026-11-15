@@ -90,8 +90,7 @@ func TestProxyRealClientIPLimiting(t *testing.T) {
 	// Test scenario:
 	// - Proxy connects from 127.0.0.1 (trusted for PROXY protocol)
 	// - Real client IP is 192.0.2.100 (NOT in trusted networks)
-	// - Should be limited to 1 connection per real client IP
-	// - Currently FAILS due to architectural issue
+	// - Should be limited to 1 connection per real client IP (#539)
 
 	// First connection from real client IP 192.0.2.100 should succeed
 	conn1 := connectWithProxyHeaderToAddress(t, address, "192.0.2.100", 12345)
@@ -123,20 +122,16 @@ func TestProxyRealClientIPLimiting(t *testing.T) {
 	_, err = conn2.Write([]byte(proxyHeader))
 	if err != nil {
 		t.Logf("Second connection was rejected during PROXY header send: %v", err)
-		// This might be expected if connection was rejected
 	} else {
-		// Try to read banner - should fail if connection was rejected
+		// Read the banner: the refusal is answered with a BYE greeting, so the
+		// PROXY peer can tell it from a dead backend (#703)
 		banner2 := make([]byte, 1024)
 		conn2.SetReadDeadline(time.Now().Add(2 * time.Second))
 		n2, err := conn2.Read(banner2)
-		if err != nil {
-			t.Logf("Second connection was rejected (no banner): %v", err)
-			// This is what we WANT to happen
+		if err != nil || !strings.HasPrefix(string(banner2[:n2]), "* BYE ") {
+			t.Errorf("second connection from the same real client IP behind a trusted PROXY peer: %q, %v; want max_connections_per_ip = 1 to refuse it with a BYE greeting", string(banner2[:n2]), err)
 		} else {
-			t.Logf("ARCHITECTURAL LIMITATION: Second connection from same real client IP was accepted!")
-			t.Logf("Banner: %s", string(banner2[:n2]))
-			t.Logf("Note: When proxy IP is in trusted networks, it bypasses per-IP limits for real client IPs")
-			t.Logf("This is expected behavior currently - see connection_limits tests for details")
+			t.Logf("Second connection was refused: %s", strings.TrimSpace(string(banner2[:n2])))
 		}
 	}
 

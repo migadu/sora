@@ -73,7 +73,7 @@ type POP3ProxySession struct {
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
 	submittedUsername     string // Username exactly as submitted by the client (lookup-cache key)
 	utf8Requested         bool   // Client enabled UTF8 pre-auth; mirrored to the backend before AUTH (RFC 6856)
-	connRejected          bool   // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
+	connRegistered        bool   // connTracker.RegisterConnection accepted this session: close() unregisters only then
 	closed                bool   // Guards close() against double teardown (guarded by mutex)
 	pop3Conn              *pop3server.Conn
 }
@@ -118,6 +118,17 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// not the resolved s.username, which can differ for token/master/+detail logins.
 	s.submittedUsername = username
 
+	// Parse once (regular addresses and the user@domain.com@SUFFIX form alike). The base
+	// address, without +detail or @SUFFIX, names the user from here on: in every line this
+	// attempt logs and, unless a resolved address replaces it, as the routing key of the
+	// login, cached or not. The raw name stands in when it does not parse.
+	parsedAddr, parseErr := server.NewAddress(username)
+	if parseErr == nil {
+		s.username = parsedAddr.BaseAddress()
+	} else {
+		s.username = username
+	}
+
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
 	// Empty passwords are never valid under any condition
 	if password == "" {
@@ -139,6 +150,11 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// bucket by varying the target, leaving the proxy's tenant-wide password unmetered.
 	// Decided here, from the raw identity, so check site and record sites cannot drift.
 	authKey := server.AuthRateLimitKeyWithMaster(username, []byte(s.server.masterUsername))
+	// A success is recorded under the master credential's key only for a master
+	// login. The master form with any other password is the base address's own login
+	// (#949), and its success, recorded under the master credential's key, would
+	// clear that key's failed guesses at the master password.
+	successKey := server.AuthSuccessRateLimitKey(username, password, []byte(s.server.masterUsername), []byte(s.server.masterPassword))
 
 	// Use configured remotelookup timeout instead of hardcoded value
 	authTimeout := s.server.connManager.GetRemoteLookupTimeout()
@@ -153,7 +169,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// meant the delay never fired in exactly the deployment proxies exist for.
 	realClientIP, _ := server.GetConnectionIPs(s.clientConn, s.proxyInfo)
 	remoteAddr := &server.StringAddr{Addr: realClientIP}
-	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-PROXY"); err != nil {
+	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "pop3_proxy"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
 			s.InfoLog("delay queue full, rejecting connection", "username", username)
@@ -206,7 +222,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					// after negative_ttl to allow retry. Brute force protection is handled
 					// by rate limiting, not by extending cache TTL.
 					s.DebugLog("cache hit - negative entry with same password", "username", username, "age", time.Since(cached.CreatedAt))
-					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
+					metrics.LookupCacheResults.WithLabelValues("pop3_proxy", "hit_negative").Inc()
 					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, authKey, false)
 					metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "failure").Inc()
 					return consts.ErrAuthenticationFailed
@@ -214,7 +230,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					// Different password - ALWAYS revalidate (user might have fixed their password)
 					// Brute force protection is handled by protocol-level rate limiting
 					s.DebugLog("cache negative entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt))
-					metrics.CacheOperationsTotal.WithLabelValues("get", "revalidate_negative_different_pw").Inc()
+					metrics.LookupCacheResults.WithLabelValues("pop3_proxy", "revalidate_negative_different_pw").Inc()
 					// Fall through to full auth
 				}
 			} else {
@@ -225,22 +241,22 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					// positive_ttl to allow periodic revalidation via remotelookup/database.
 					// This ensures that when a domain moves backends or password changes,
 					// active users eventually pick up the changes.
-					s.DebugLog("cache hit - using cached auth", "username", username, "account_id", cached.AccountID, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
-					metrics.CacheOperationsTotal.WithLabelValues("get", "hit").Inc()
-
 					s.accountID = cached.AccountID
+					s.DebugLog("cache hit - using cached auth", "username", username, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
+					metrics.LookupCacheResults.WithLabelValues("pop3_proxy", "hit").Inc()
+
 					s.isRemoteLookupAccount = cached.FromRemoteLookup
 					// Rebuilt exactly as the uncached login routed (proxy.RouteFromCache): the pin,
 					// its enforcement and every backend-leg setting the lookup answer carried.
 					s.routingInfo = proxy.RouteFromCache(cached)
+					// The resolved address when the entry has one; otherwise s.username keeps
+					// the base address set above, the name the uncached login routed by.
 					if cached.ActualEmail != "" {
 						s.username = cached.ActualEmail
-					} else {
-						s.username = username
 					}
 
 					// Use resolved username for rate limiting and metrics
-					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, authKey, true)
+					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, successKey, true)
 					metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "success").Inc()
 
 					// Track domain and user activity using resolved email
@@ -271,15 +287,24 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					return nil
 				} else {
 					// Different password on positive entry - always revalidate
-					// Use configured window: revalidate if entry is older than positiveRevalidationWindow
-					if cached.IsOld(s.server.positiveRevalidationWindow) {
+					// Use configured window: revalidate if entry is older than positiveRevalidationWindow,
+					// or if the two passwords are the master username form's two credentials (#949)
+					if cached.IsOld(s.server.positiveRevalidationWindow) ||
+						proxy.MasterFormOtherCredential(username, password, cached.PasswordDigest, []byte(s.server.masterUsername), []byte(s.server.masterPassword)) {
 						s.DebugLog("cache positive entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt), "window", s.server.positiveRevalidationWindow)
-						metrics.CacheOperationsTotal.WithLabelValues("get", "revalidate_positive_different_pw").Inc()
+						metrics.LookupCacheResults.WithLabelValues("pop3_proxy", "revalidate_positive_different_pw").Inc()
+						// The database or the remote lookup decides this password, so drop
+						// the entry before asking (the SQLite auth cache drops a missed entry
+						// the same way). Kept, it would outlive an outage, which gives no
+						// verdict and is not counted, and still sign in its password: every
+						// guess during the outage would be checked against it, unseen by the
+						// auth rate limiter, until it expired.
+						s.invalidateLookupCache("password differs from cached login")
 						// Fall through to full auth
 					} else {
 						// Entry is fresh - likely wrong password attempt
 						s.DebugLog("cache hit - wrong password on fresh positive entry", "username", username)
-						metrics.CacheOperationsTotal.WithLabelValues("get", "hit_positive_wrong_pw").Inc()
+						metrics.LookupCacheResults.WithLabelValues("pop3_proxy", "hit_positive_wrong_pw").Inc()
 						// Cost what a failed login for an unknown address costs, or the instant
 						// answer shows that this address has an account. (#346)
 						db.DummyVerifyPassword(password)
@@ -291,7 +316,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			}
 		} else {
 			s.DebugLog("cache miss", "username", username)
-			metrics.CacheOperationsTotal.WithLabelValues("get", "miss").Inc()
+			metrics.LookupCacheResults.WithLabelValues("pop3_proxy", "miss").Inc()
 		}
 	}
 
@@ -302,23 +327,27 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	var usernameForRemoteLookup string
 	var masterAuthValidated bool
 
-	// Parse username (handles both regular addresses and addresses with @SUFFIX)
-	parsedAddr, parseErr := server.NewAddress(username)
-
 	if parseErr == nil && parsedAddr.HasSuffix() {
 		// Has suffix - check if it matches configured master username
 		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), []byte(s.server.masterUsername)) {
 			// Suffix matches master username - validate master password locally
 			if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, []byte(s.server.masterPassword)) {
-				// Wrong master password - fail immediately
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return consts.ErrAuthenticationFailed
+				// Not the master password: the base address's own login, checked below
+				// exactly as under any other suffix, with the same lookup, password
+				// verification and lookup-cache entry, and under the same submitted name
+				// (the lookup service may route or refuse tokens differently). A distinct
+				// reply, a quicker one (#801), or a refusal of the account's own password
+				// (#949) confirms a guessed master username. Its failure is still recorded
+				// under authKey, the master credential's key; only a success is the
+				// account's (successKey).
+				s.DebugLog("master username without the master password, checked like another suffix", "address", parsedAddr.BaseAddress())
+				usernameForRemoteLookup = username
+			} else {
+				// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
+				s.DebugLog("master username authentication successful, using base address for routing", "base_address", parsedAddr.BaseAddress())
+				usernameForRemoteLookup = parsedAddr.BaseAddress()
+				masterAuthValidated = true
 			}
-			// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
-			s.DebugLog("master username authentication successful, using base address for routing", "base_address", parsedAddr.BaseAddress())
-			usernameForRemoteLookup = parsedAddr.BaseAddress()
-			masterAuthValidated = true
 		} else {
 			// Suffix doesn't match master username - treat as token
 			// Send FULL username (including @TOKEN) to remotelookup for validation
@@ -356,35 +385,31 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		}
 
 		if err != nil {
-			// Categorize the error type to determine fallback behavior. A malformed
-			// answer arrives as ErrRemoteLookupTransient: a broken lookup service.
-			if errors.Is(err, proxy.ErrRemoteLookupTransient) {
-				// Check if this is due to context cancellation (server shutdown)
-				if errors.Is(err, server.ErrServerShuttingDown) {
-					s.InfoLog("remotelookup cancelled due to server shutdown")
-					metrics.RemoteLookupResult.WithLabelValues("pop3", "shutdown").Inc()
-					return server.ErrServerShuttingDown
-				}
-
-				// Transient error (network, 5xx, circuit breaker) - NEVER fallback to DB
-				// These are service availability issues, not "user not found" cases.
-				// Nothing is wrong with the client's credentials: answer a temporary
-				// failure (-ERR [SYS/TEMP]) and do not charge the auth rate limiter, or
-				// clients retrying during an outage get delayed and blocked.
-				s.WarnLog("remotelookup transient error - service unavailable", "error", err)
-				metrics.RemoteLookupResult.WithLabelValues("pop3", "transient_error_rejected").Inc()
-				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
-				return server.ErrAuthServiceUnavailable
-			} else {
-				// Unknown error type - fallthrough to main DB auth
+			// Check if this is due to context cancellation (server shutdown)
+			if errors.Is(err, server.ErrServerShuttingDown) {
+				s.InfoLog("remotelookup cancelled due to server shutdown")
+				metrics.RemoteLookupResult.WithLabelValues("pop3", "shutdown").Inc()
+				return server.ErrServerShuttingDown
 			}
+
+			// An error is no verdict on the user, whatever its kind (network, 5xx,
+			// circuit breaker, a malformed answer, or one this proxy cannot classify):
+			// NEVER fall back to the database. Only a definite "not found" does, and
+			// only with lookup_local_users (below); without it this node may have no
+			// database at all. Nothing is wrong with the client's credentials: answer a
+			// temporary failure (-ERR [SYS/TEMP]) and do not charge the auth rate
+			// limiter, or clients retrying during an outage get delayed and blocked.
+			s.WarnLog("remotelookup transient error - service unavailable", "error", err)
+			metrics.RemoteLookupResult.WithLabelValues("pop3", "transient_error_rejected").Inc()
+			metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+			return server.ErrAuthServiceUnavailable
 		} else {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// RemoteLookup returned success - use routing info
-				s.DebugLog("remotelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
-				metrics.RemoteLookupResult.WithLabelValues("pop3", "success").Inc()
 				s.accountID = routingInfo.AccountID
+				s.DebugLog("remotelookup successful", "master_auth_validated", masterAuthValidated)
+				metrics.RemoteLookupResult.WithLabelValues("pop3", "success").Inc()
 				s.isRemoteLookupAccount = routingInfo.IsRemoteLookupAccount
 				s.routingInfo = routingInfo
 
@@ -422,7 +447,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 				s.authenticated = true
 				// Use resolvedEmail for rate limiting (not submitted username with token)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, authKey, true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, successKey, true)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "success").Inc()
 
 				// For metrics, use resolvedEmail for accurate tracking
@@ -449,7 +474,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				// For master username, this shouldn't happen (password already validated)
 				// For others, reject immediately
 				if masterAuthValidated {
-					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "user", username)
+					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "username", username)
 				}
 
 				// Cache negative result (wrong password)
@@ -482,6 +507,22 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					metrics.RemoteLookupResult.WithLabelValues("pop3", "user_not_found_fallback").Inc()
 					// Fallthrough to main DB auth
 				} else {
+					// The lookup service never sees the password. A wrong password for an
+					// address it knows is refused after a verification against the returned
+					// hash, and the refusal is cached (AuthFailed above). Refuse this one
+					// the same way, or the response time to the login and to its repeat
+					// shows which addresses the service knows. A master login checks no
+					// hash for a known address, so it spends none here either.
+					if !masterAuthValidated {
+						db.DummyVerifyPassword(password)
+					}
+					if s.server.lookupCache != nil {
+						s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+							PasswordDigest: lookupcache.NewPasswordDigest(password),
+							Result:         lookupcache.AuthUserNotFound,
+							IsNegative:     true,
+						})
+					}
 					s.InfoLog("user not found in remotelookup, local lookup disabled - rejecting")
 					metrics.RemoteLookupResult.WithLabelValues("pop3", "user_not_found_rejected").Inc()
 					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, authKey, false)
@@ -495,24 +536,22 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// Fallback to main DB
 	// If master auth was already validated, just get account ID and continue
 	// Otherwise, authenticate via main DB
-	var address server.Address
-	var err error
-	// Use already parsed address if available
-	if parseErr == nil {
-		address = parsedAddr
-	} else {
-		// Parse failed earlier - try again with NewAddress (shouldn't happen but handle it)
-		address, err = server.NewAddress(username)
-		if err != nil {
-			return fmt.Errorf("invalid address format: %w", err)
-		}
+	//
+	// A username that does not parse names no account: a failed login like any
+	// other, recorded and counted. Every login without a remote lookup gets here.
+	if parseErr != nil {
+		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, authKey, false)
+		metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "failure").Inc()
+		return fmt.Errorf("invalid address format: %w", parseErr)
 	}
+	address := parsedAddr
 
+	var err error
 	var accountID int64
 	if masterAuthValidated {
 		// Master authentication already validated - just get account ID
 		s.DebugLog("master auth already validated, getting account ID from main database")
-		accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+		accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
 		if err != nil {
 			// Check if error is due to session context cancellation (server shutdown)
 			// Note: Must check s.ctx.Err(), not just the query error, because the query context
@@ -520,6 +559,15 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			if s.ctx.Err() != nil {
 				s.InfoLog("master auth cancelled due to server shutdown")
 				return server.ErrServerShuttingDown
+			}
+
+			// The database could not be asked, so nothing is known about the target: a
+			// temporary failure (-ERR [SYS/TEMP]), not a failed login charged to the master
+			// credential.
+			if server.IsTemporaryAuthFailure(err) {
+				s.WarnLog("authentication unavailable", "method", "master", "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+				return server.ErrAuthServiceUnavailable
 			}
 
 			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, authKey, false)
@@ -540,11 +588,12 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				return server.ErrServerShuttingDown
 			}
 
-			// The database could not be asked, so nothing is known about the credentials:
-			// a temporary failure (-ERR [SYS/TEMP]), neither counted as a failed login nor
-			// cached.
-			if server.IsTemporaryAuthFailure(err) {
-				s.WarnLog("authentication unavailable", "method", "main_db", "error", err)
+			// The database could not be asked, or the stored hash cannot be checked, so
+			// nothing is known about the credentials: a temporary failure (-ERR
+			// [SYS/TEMP]), neither counted as a failed login nor cached.
+			if proxy.IsTemporaryDBAuthFailure(err) {
+				reason, _ := proxy.ClassifyDBAuthFailure(err)
+				s.WarnLog("authentication unavailable", "reason", reason, "method", "main_db", "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
 				return server.ErrAuthServiceUnavailable
 			}
@@ -575,12 +624,13 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		}
 	}
 
-	s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, authKey, true)
+	s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, successKey, true)
 
 	// Track successful authentication.
 	metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "success").Inc()
 	metrics.TrackDomainConnection("pop3_proxy", address.Domain())
-	metrics.TrackUserActivity("pop3_proxy", address.FullAddress(), "connection", 1)
+	// The base address, the name a lookup-cache hit replaying this login counts the user under.
+	metrics.TrackUserActivity("pop3_proxy", address.BaseAddress(), "connection", 1)
 
 	// Single consolidated log for authentication success
 	method := "main_db"
@@ -757,9 +807,14 @@ func (s *POP3ProxySession) connectToBackend() error {
 		useXCLIENT = s.routingInfo.RemoteUseXCLIENT
 	}
 	if useXCLIENT {
-		if err := s.sendForwardingParametersToBackend(backendWriter, backendReader); err != nil {
+		if err := s.sendForwardingParametersToBackend(backendWriter, backendReader); errors.Is(err, errXCLIENTRefused) {
+			// Go on without them: the -ERR ended the exchange.
 			s.WarnLog("Failed to send forwarding parameters to backend", "error", err)
-			// Continue anyway - forwarding parameters are not critical for functionality
+		} else if err != nil {
+			// The XCLIENT reply was not read (a write or read error, or the deadline). It
+			// may still come, and AUTH would take a late +OK for its own reply.
+			s.backendConn.Close()
+			return fmt.Errorf("%w: XCLIENT exchange with backend: %w", server.ErrBackendConnectionFailed, err)
 		}
 	}
 
@@ -793,7 +848,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: failed to read UTF8 response: %w", server.ErrBackendConnectionFailed, err)
 		}
-		if !strings.HasPrefix(resp, "+OK") {
+		if !isPositiveResponse(resp) {
 			// Best-effort: pre-migration code never forwarded UTF8, so a
 			// backend without UTF8 support degrades exactly as it did before.
 			s.WarnLog("backend rejected UTF8 mode; continuing without it", "response", strings.TrimSpace(resp))
@@ -830,7 +885,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 		return fmt.Errorf("%w: failed to read auth response: %w", server.ErrBackendAuthFailed, err)
 	}
 
-	if !strings.HasPrefix(authResp, "+OK") {
+	if !isPositiveResponse(authResp) {
 		s.backendConn.Close()
 		// CRITICAL: Invalidate cache on backend authentication failure
 		// This ensures the next request does fresh remotelookup/database lookup
@@ -851,13 +906,21 @@ func (s *POP3ProxySession) connectToBackend() error {
 }
 
 // isPositiveResponse reports whether a backend response line carries the +OK status
-// indicator: ASCII case-insensitive (RFC 1939 section 3) and complete, so that a prefix
-// such as +OKAY is not an OK status.
-func isPositiveResponse(line string) bool {
-	if len(line) < 3 || !strings.EqualFold(line[:3], "+OK") {
+// indicator, and isNegativeResponse whether it carries -ERR. See hasStatusIndicator.
+func isPositiveResponse(line string) bool { return hasStatusIndicator(line, "+OK") }
+
+func isNegativeResponse(line string) bool { return hasStatusIndicator(line, "-ERR") }
+
+// hasStatusIndicator reports whether line starts with the status indicator status as a
+// whole: RFC 2449 section 3, single-line = status [SP text] CRLF, so that +OKAY is not
+// +OK. The match ignores case, as ABNF strings do (RFC 2234 section 2.3), though RFC
+// 1939 section 3 has servers send the indicators in upper case.
+func hasStatusIndicator(line, status string) bool {
+	if len(line) < len(status) || !strings.EqualFold(line[:len(status)], status) {
 		return false
 	}
-	return len(line) == 3 || line[3] == ' ' || line[3] == '\r' || line[3] == '\n'
+	rest := line[len(status):]
+	return rest == "" || rest[0] == ' ' || rest[0] == '\r' || rest[0] == '\n'
 }
 
 // startTLSWithBackend upgrades the backend connection with STLS (RFC 2595), within
@@ -1060,9 +1123,13 @@ func (s *POP3ProxySession) close() {
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits
 	// Background goroutine was causing leaks when server shutdown or high load prevented execution
 	// NOTE: accountID can be 0 for remotelookup accounts, so we don't check accountID > 0
-	// Skip unregister when registration was rejected; otherwise we would
-	// decrement a slot this session never held (limit erosion for the account).
-	if s.server.connTracker != nil && !s.connRejected {
+	// Only a session the tracker registered unregisters. The account ID is set
+	// as soon as the client's credentials are accepted, before the backend leg
+	// and the registration: a session whose backend leg failed, or whose
+	// registration was refused, holds no slot, and unregistering it would free
+	// the slot of another session of the account from the same IP.
+	if s.server.connTracker != nil && s.connRegistered {
+		s.connRegistered = false // the slot is released once, however often close() runs
 		// Use a new background context for this final operation, as s.ctx is likely already cancelled.
 		// UnregisterConnection is fast (in-memory only), so this won't block for long
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -1095,7 +1162,10 @@ func (s *POP3ProxySession) registerConnection() error {
 	defer cancel()
 
 	if s.server.connTracker != nil {
-		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "POP3", s.RemoteIP)
+		if err := s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "POP3", s.RemoteIP); err != nil {
+			return err
+		}
+		s.connRegistered = true
 	}
 	return nil
 }
@@ -1162,7 +1232,7 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 		// set it arms the SoraConn idle checker, which owns idle enforcement:
 		// it tracks activity in both directions (an in-flight backend->client
 		// response keeps the session alive), emits the idle metric and the
-		// [IN-USE] notice, and closes the connection, which unblocks the read
+		// idle notice, and closes the connection, which unblocks the read
 		// below. Arming this deadline with the same value raced the checker
 		// and could deliver the notice twice, so it is only a stale-connection
 		// backstop well past the knob (the role CopyWithDeadline plays on the
@@ -1217,7 +1287,7 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 				// the client a reason (whole-write atomic, so it cannot
 				// byte-interleave with the backend->client copy).
 				metrics.ConnectionTimeoutsTotal.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "idle").Inc()
-				_, _ = s.clientConn.Write([]byte("-ERR [IN-USE] Idle timeout, please reconnect\r\n"))
+				_, _ = s.clientConn.Write([]byte("-ERR Idle timeout, please reconnect\r\n"))
 				return
 			}
 			if err != io.EOF && !isClosingError(err) {
@@ -1392,7 +1462,6 @@ func (s *POP3ProxySession) doLogin(ctx context.Context, username, password strin
 
 	if err := s.registerConnection(); err != nil {
 		s.InfoLog("connection rejected by connection tracker", "error", err)
-		s.connRejected = true
 		return &pop3server.Error{Code: "SYS/TEMP", Message: "Too many connections", Close: true}
 	}
 

@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,4 +178,100 @@ func TestGetAliasCredentialsByDomain(t *testing.T) {
 
 	// Only the non-primary alias must be returned; the domainB primary must be excluded.
 	assert.Equal(t, []string{"aliasinb@" + domainB}, aliases)
+}
+
+// TestGetAliasCredentialsByDomainSelectsByPrimaryDomain (#934): the domain's aliases are
+// chosen by where their account's primary address is, not by whether the account is
+// soft-deleted. An alias on a soft-deleted account in another domain is still a deliverable
+// address once the account is restored, so domain purge has to see it. Aliases on accounts
+// with their primary address in the domain are left out, soft-deleted or not: the purge
+// removes those accounts whole.
+func TestGetAliasCredentialsByDomainSelectsByPrimaryDomain(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	db := setupTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	domainA, domainB := uniqueDomains(t)
+	softDelete := func(email string) {
+		t.Helper()
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		require.NoError(t, db.DeleteAccount(ctx, tx, email))
+		require.NoError(t, tx.Commit(ctx))
+	}
+	withAlias := func(primary, alias string) {
+		t.Helper()
+		id, _ := setupAccountWithInbox(t, db, ctx, primary)
+		require.NoError(t, addCredentialTx(t, db, ctx, AddCredentialRequest{
+			AccountID: id, NewEmail: alias, NewPassword: "pw", NewHashType: "bcrypt",
+		}))
+	}
+
+	// Primary in domainA: their aliases in domainB are returned, deleted account or not.
+	withAlias("active@"+domainA, "active-alias@"+domainB)
+	withAlias("deleted@"+domainA, "deleted-alias@"+domainB)
+	softDelete("deleted@" + domainA)
+
+	// Primary in domainB: their other addresses there go with the account.
+	withAlias("own@"+domainB, "own-alias@"+domainB)
+	withAlias("own-deleted@"+domainB, "own-deleted-alias@"+domainB)
+	softDelete("own-deleted@" + domainB)
+
+	aliases, err := db.GetAliasCredentialsByDomain(ctx, domainB)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"active-alias@" + domainB, "deleted-alias@" + domainB}, aliases)
+}
+
+// TestDomainPurgeLookupsMatchTheDomainExactly (#316 item 3): the lookups behind
+// `accounts purge-domain` match the domain as `accounts list --domain` does, exactly and
+// regardless of case. They matched with LIKE '%@' || domain, so % and _ in the domain
+// were wildcards: "%" named every account, and a domain with _ also named the domain with
+// any other character in its place.
+func TestDomainPurgeLookupsMatchTheDomainExactly(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	db := setupTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	tok := fmt.Sprintf("%d", time.Now().UnixNano())
+	domain := "pd-" + tok + ".example.com"
+	other := "po-" + tok + ".example.org"
+
+	primary, _ := setupAccountWithInbox(t, db, ctx, "user@"+domain)
+	keeper, _ := setupAccountWithInbox(t, db, ctx, "keeper@"+other)
+	require.NoError(t, addCredentialTx(t, db, ctx, AddCredentialRequest{
+		AccountID: keeper, NewEmail: "alias@" + domain, NewPassword: "pw", NewHashType: "bcrypt",
+	}))
+
+	accountIDs := func(d string) []int64 {
+		t.Helper()
+		accounts, err := db.GetAccountsByDomain(ctx, d)
+		require.NoError(t, err)
+		var ids []int64
+		for _, a := range accounts {
+			ids = append(ids, a.AccountID)
+		}
+		return ids
+	}
+	aliases := func(d string) []string {
+		t.Helper()
+		addrs, err := db.GetAliasCredentialsByDomain(ctx, d)
+		require.NoError(t, err)
+		return addrs
+	}
+
+	upper := strings.ToUpper(domain)
+	assert.Equal(t, []int64{primary}, accountIDs(upper), "the domain itself, in any case")
+	assert.Equal(t, []string{"alias@" + domain}, aliases(upper), "the domain itself, in any case")
+
+	for _, pattern := range []string{"%", "%" + tok + ".example.com", "pd_" + tok + ".example.com", "pd-" + tok + "_example_com"} {
+		assert.NotContains(t, accountIDs(pattern), primary, "GetAccountsByDomain(%q)", pattern)
+		assert.NotContains(t, aliases(pattern), "alias@"+domain, "GetAliasCredentialsByDomain(%q)", pattern)
+	}
 }

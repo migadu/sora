@@ -1,6 +1,11 @@
 package proxy
 
-import "github.com/migadu/sora/pkg/lookupcache"
+import (
+	"crypto/subtle"
+
+	"github.com/migadu/sora/pkg/lookupcache"
+	"github.com/migadu/sora/server"
+)
 
 // CacheRoute records a lookup answer's route in a lookup-cache entry: the pin or the pool,
 // every backend-leg setting the answer carried, and whether the remote lookup gave it. The
@@ -42,4 +47,25 @@ func RouteFromCache(entry *lookupcache.CacheEntry) *UserRoutingInfo {
 		RemoteUseXCLIENT:       entry.RemoteUseXCLIENT,
 		RemoteUseUTF8:          entry.RemoteUseUTF8,
 	}
+}
+
+// MasterFormOtherCredential reports whether password and the password a positive
+// lookup-cache entry for username was made with are the two credentials of the master
+// username form "user@domain.com@MASTERUSER": one is the master password, the other is
+// not. Both log in under that name (#949), the master password as a master login and any
+// other password as the account's own login, and they share its one cache entry. A fresh
+// positive entry refuses any other password as a wrong one, so either login refused the
+// other until the entry aged past the revalidation window; the proxies check such a pair
+// again instead. One side is always the master password, so after the account's own
+// login a client without it is answered exactly as under another suffix. Both
+// comparisons run whatever the suffix.
+func MasterFormOtherCredential(username, password string, cached lookupcache.PasswordDigest, masterUsername, masterPassword []byte) bool {
+	if len(masterUsername) == 0 || len(masterPassword) == 0 {
+		return false
+	}
+	addr, err := server.NewAddress(username)
+	masterForm := err == nil && addr.HasSuffix() && subtle.ConstantTimeCompare([]byte(addr.Suffix()), masterUsername) == 1
+	masterPresented := subtle.ConstantTimeCompare([]byte(password), masterPassword) == 1
+	masterCached := cached.Matches(string(masterPassword))
+	return masterForm && masterPresented != masterCached
 }

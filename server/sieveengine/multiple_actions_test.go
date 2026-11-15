@@ -109,6 +109,31 @@ func TestResultDestinations(t *testing.T) {
 			result: Result{Action: ActionFileInto, Mailboxes: []string{"archive", "Archive"}, CreateMailboxes: []string{"Archive"}},
 			want:   []Destination{{Mailbox: "archive", Create: true}},
 		},
+		{
+			// Issue #457: "the name created is without the trailing hierarchy
+			// delimiter" (RFC 3501 §6.3.3), and the copy goes where it is created.
+			name:   "fileinto :create with a trailing delimiter",
+			result: Result{Action: ActionFileInto, Mailboxes: []string{"Foo/"}, CreateMailboxes: []string{"Foo/"}},
+			want:   []Destination{{Mailbox: "Foo", Create: true}},
+		},
+		{
+			name:   "fileinto :create of Foo/ and fileinto foo are one mailbox",
+			result: Result{Action: ActionFileInto, Mailboxes: []string{"Foo/", "foo"}, CreateMailboxes: []string{"Foo/"}},
+			want:   []Destination{{Mailbox: "Foo", Create: true}},
+		},
+		{
+			// A name that makes no mailbox is left as it is: creating it fails, and
+			// delivery keeps the message.
+			name:   "fileinto :create of a name with an empty level",
+			result: Result{Action: ActionFileInto, Mailboxes: []string{"x//y"}, CreateMailboxes: []string{"x//y"}},
+			want:   []Destination{{Mailbox: "x//y", Create: true}},
+		},
+		{
+			// Without :create the name is looked up as given.
+			name:   "fileinto with a trailing delimiter",
+			result: Result{Action: ActionFileInto, Mailboxes: []string{"Foo/"}},
+			want:   []Destination{{Mailbox: "Foo/"}},
+		},
 		{name: "redirect", result: Result{Action: ActionRedirect, RedirectTo: []string{"a@example.org"}}},
 		{
 			name:   "redirect :copy",

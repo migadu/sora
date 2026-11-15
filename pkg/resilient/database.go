@@ -117,6 +117,16 @@ type DatabasePool struct {
 	isHealthy   atomic.Bool
 	lastFailure atomic.Int64 // Unix timestamp
 	failCount   atomic.Int64
+	resetMu     sync.Mutex
+	resetGen    atomic.Uint64
+}
+
+// writeTxOrigin records which write pool a transaction was opened on and that pool's
+// reset generation before BeginTx, so a later SQLSTATE 25006 only resets that pool and
+// only when no reset has already superseded that connection.
+type writeTxOrigin struct {
+	pool *DatabasePool
+	gen  uint64
 }
 
 // FailedHost tracks a database host (read replica or write host) that failed to
@@ -470,12 +480,20 @@ func (rd *ResilientDatabase) GetDatabase() *db.Database {
 }
 
 // PingReadPools pings, on every read host, the pool reads are served from: each
-// replica's, or the write hosts' while reads use them. The error names every host that
-// failed.
+// replica's, or the write hosts' while reads use them. A replica that has not connected
+// since startup is not in the read pools yet; it fails the check as it would had it gone
+// down later. The error names every host that failed.
 func (rd *ResilientDatabase) PingReadPools(ctx context.Context) error {
-	rd.failoverManager.mu.RLock()
-	pools := append([]*DatabasePool(nil), rd.failoverManager.readPools...)
-	rd.failoverManager.mu.RUnlock()
+	fm := rd.failoverManager
+	fm.mu.RLock()
+	pools := append([]*DatabasePool(nil), fm.readPools...)
+	var unconnected []error
+	for _, f := range fm.failedHosts {
+		if f.poolType == "read" {
+			unconnected = append(unconnected, fmt.Errorf("read replica %s: not connected since startup, reconnecting in the background", f.host))
+		}
+	}
+	fm.mu.RUnlock()
 
 	errs := make([]error, len(pools))
 	var wg sync.WaitGroup
@@ -489,7 +507,7 @@ func (rd *ResilientDatabase) PingReadPools(ctx context.Context) error {
 		}()
 	}
 	wg.Wait()
-	return errors.Join(errs...)
+	return errors.Join(append(errs, unconnected...)...)
 }
 
 // GetQueryTimeout returns the configured query timeout for read operations
@@ -703,6 +721,11 @@ func (rd *ResilientDatabase) ExecWithRetry(ctx context.Context, sql string, args
 }
 
 func (rd *ResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error) {
+	tx, _, err := rd.beginWriteTxWithRetry(ctx, txOptions)
+	return tx, err
+}
+
+func (rd *ResilientDatabase) beginWriteTxWithRetry(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, writeTxOrigin, error) {
 	config := retry.BackoffConfig{
 		InitialInterval: 1 * time.Second,
 		MaxInterval:     5 * time.Second,
@@ -712,14 +735,29 @@ func (rd *ResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions pgx
 		OperationName:   "db_begin_tx",
 	}
 
-	var tx pgx.Tx
+	var (
+		tx     pgx.Tx
+		origin writeTxOrigin
+	)
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
 		defer cancel()
 
+		var attemptOrigin writeTxOrigin
 		result, cbErr := rd.writeBreaker.Execute(func() (any, error) {
-			t, txErr := rd.getOperationalDatabaseForOperation(writeCtx, true).BeginTx(writeCtx, txOptions)
-			return t, txErr
+			for {
+				pool := rd.getOperationalPoolForOperation(writeCtx, true)
+				gen := pool.resetGen.Load()
+				t, txErr := pool.database.BeginTx(writeCtx, txOptions)
+				if txErr != nil {
+					return nil, txErr
+				}
+				if pool.resetGen.Load() == gen {
+					attemptOrigin = writeTxOrigin{pool: pool, gen: gen}
+					return t, nil
+				}
+				_ = t.Rollback(context.Background())
+			}
 		})
 
 		if cbErr != nil {
@@ -744,10 +782,11 @@ func (rd *ResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions pgx
 		}
 
 		tx = result.(pgx.Tx)
+		origin = attemptOrigin
 		return nil
 	}, config)
 
-	return tx, err
+	return tx, origin, err
 }
 
 // UpdatePasswordWithRetry updates a user's password with resilience.
@@ -1079,6 +1118,11 @@ func (rd *ResilientDatabase) getCurrentDatabaseForOperation(isWrite bool) *db.Da
 
 // getOperationalDatabaseForOperation returns the database to use for operations, with runtime failover
 func (rd *ResilientDatabase) getOperationalDatabaseForOperation(ctx context.Context, isWrite bool) *db.Database {
+	return rd.getOperationalPoolForOperation(ctx, isWrite).database
+}
+
+// getOperationalPoolForOperation returns the DatabasePool to use for operations, with runtime failover.
+func (rd *ResilientDatabase) getOperationalPoolForOperation(ctx context.Context, isWrite bool) *DatabasePool {
 	if rd.failoverManager == nil {
 		panic("failover manager not initialized")
 	}
@@ -1089,8 +1133,8 @@ func (rd *ResilientDatabase) getOperationalDatabaseForOperation(ctx context.Cont
 		}
 	}
 
-	// Try to get a healthy database, with failover if needed
-	return rd.getHealthyDatabaseWithFailover(isWrite)
+	// Try to get a healthy pool, with failover if needed
+	return rd.getHealthyPoolWithFailover(isWrite)
 }
 
 // GetOperationalDatabase returns the underlying database instance for write operations
@@ -1099,84 +1143,98 @@ func (rd *ResilientDatabase) GetOperationalDatabase() *db.Database {
 	return rd.getOperationalDatabaseForOperation(context.Background(), true)
 }
 
+// poolsFor returns the pools for one kind of operation and the index of the current one.
+// Caller holds fm.mu: attemptReconnectFailedHosts replaces the slices at runtime, and an
+// index is only valid for the slice it was chosen in.
+func (fm *RuntimeFailoverManager) poolsFor(isWrite bool) ([]*DatabasePool, int) {
+	if isWrite {
+		return fm.writePools, int(fm.currentWriteIdx.Load())
+	}
+	return fm.readPools, int(fm.currentReadIdx.Load())
+}
+
 // getHealthyDatabaseWithFailover attempts to get a healthy database, failing over if necessary
 func (rd *ResilientDatabase) getHealthyDatabaseWithFailover(isWrite bool) *db.Database {
-	var pools []*DatabasePool
-	var currentIdx int64
+	return rd.getHealthyPoolWithFailover(isWrite).database
+}
 
-	rd.failoverManager.mu.RLock()
-	if isWrite {
-		pools = rd.failoverManager.writePools
-		currentIdx = rd.failoverManager.currentWriteIdx.Load()
-	} else {
-		pools = rd.failoverManager.readPools
-		currentIdx = rd.failoverManager.currentReadIdx.Load()
-	}
-	rd.failoverManager.mu.RUnlock()
-
-	if len(pools) == 0 {
-		panic("no database pools available")
-	}
+// getHealthyPoolWithFailover attempts to get a healthy DatabasePool, failing over if necessary.
+func (rd *ResilientDatabase) getHealthyPoolWithFailover(isWrite bool) *DatabasePool {
+	fm := rd.failoverManager
 
 	// --- Fast Path (Read Lock) ---
 	// Check if the current pool is healthy. This is the most common case.
-	rd.failoverManager.mu.RLock()
-	currentPool := pools[currentIdx]
-	isHealthy := currentPool.isHealthy.Load()
-	rd.failoverManager.mu.RUnlock()
+	fm.mu.RLock()
+	pools, currentIdx := fm.poolsFor(isWrite)
+	var currentPool *DatabasePool
+	if len(pools) > 0 {
+		currentPool = pools[currentIdx]
+	}
+	fm.mu.RUnlock()
 
-	if isHealthy {
-		if !isWrite && rd.failoverManager.readsOnWritePools.CompareAndSwap(true, false) {
+	if currentPool == nil {
+		panic("no database pools available")
+	}
+
+	if currentPool.isHealthy.Load() {
+		if !isWrite && fm.readsOnWritePools.Load() && fm.readsOnWritePools.CompareAndSwap(true, false) {
 			logger.Info("Read operations are back on a read replica", "component", "RESILIENT-FAILOVER", "pool", currentPool.host)
 		}
-		return currentPool.database
+		return currentPool
 	}
 
 	// --- Slow Path (Write Lock) ---
 	// The current pool is unhealthy. Acquire a write lock to perform a failover.
-	rd.failoverManager.mu.Lock()
-	defer rd.failoverManager.mu.Unlock()
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
 
-	// Double-check: Another goroutine might have already performed the failover while we were waiting for the lock.
-	if isWrite {
-		currentIdx = rd.failoverManager.currentWriteIdx.Load()
-	} else {
-		currentIdx = rd.failoverManager.currentReadIdx.Load()
-	}
-
-	if int(currentIdx) < len(pools) && pools[currentIdx].isHealthy.Load() {
-		return pools[currentIdx].database
+	// Read the pools again: while we waited for the lock another goroutine may have failed
+	// over, and a reconnect may have replaced the slice the fast path read.
+	pools, currentIdx = fm.poolsFor(isWrite)
+	if pools[currentIdx].isHealthy.Load() {
+		return pools[currentIdx]
 	}
 
 	// Iterate through all pools to find a healthy one, starting from the next one.
 	numPools := len(pools)
 	for i := 1; i <= numPools; i++ {
-		nextIdx := (int(currentIdx) + i) % numPools
+		nextIdx := (currentIdx + i) % numPools
 		if pools[nextIdx].isHealthy.Load() {
+			if nextIdx == currentIdx {
+				// The last candidate is the current pool, which the health check marked
+				// healthy again while we looked: no switch, and in particular no
+				// RetireWriter on the pool that stays the writer.
+				return pools[currentIdx]
+			}
 			// Found a healthy pool, switch to it.
 			if isWrite {
-				rd.failoverManager.currentWriteIdx.Store(int64(nextIdx))
+				fm.currentWriteIdx.Store(int64(nextIdx))
 				logger.Info("Switched write operations from unhealthy pool to healthy pool", "component", "RESILIENT-FAILOVER", "from", pools[currentIdx].host, "to", pools[nextIdx].host)
+				// The advisory locks held on the former write host exclude nothing on
+				// the new one: revoke them, and the work they guard, before anything
+				// is written there (see db.AdvisoryLockTx).
+				pools[nextIdx].database.ReinstateWriter()
+				pools[currentIdx].database.RetireWriter(fmt.Errorf("write operations moved from %s to %s", pools[currentIdx].host, pools[nextIdx].host))
 			} else {
-				rd.failoverManager.currentReadIdx.Store(int64(nextIdx))
+				fm.currentReadIdx.Store(int64(nextIdx))
 				logger.Info("Switched read operations from unhealthy pool to healthy pool", "component", "RESILIENT-FAILOVER", "from", pools[currentIdx].host, "to", pools[nextIdx].host)
 			}
-			return pools[nextIdx].database
+			return pools[nextIdx]
 		}
 	}
 
 	// No read replica is healthy: serve reads from a healthy write pool, as startup does
 	// when every replica is down, rather than from a replica known to be failing.
-	if !isWrite && rd.failoverManager.readPoolsAreDistinct() {
-		writePools := rd.failoverManager.writePools
-		writeIdx := int(rd.failoverManager.currentWriteIdx.Load())
+	if !isWrite && fm.readPoolsAreDistinct() {
+		writePools := fm.writePools
+		writeIdx := int(fm.currentWriteIdx.Load())
 		for i := 0; i < len(writePools); i++ {
 			p := writePools[(writeIdx+i)%len(writePools)]
 			if p.isHealthy.Load() {
-				if rd.failoverManager.readsOnWritePools.CompareAndSwap(false, true) {
+				if fm.readsOnWritePools.CompareAndSwap(false, true) {
 					logger.Warn("No healthy read replica, serving read operations from the write pool", "component", "RESILIENT-FAILOVER", "pool", p.host)
 				}
-				return p.database
+				return p
 			}
 		}
 	}
@@ -1187,7 +1245,7 @@ func (rd *ResilientDatabase) getHealthyDatabaseWithFailover(isWrite bool) *db.Da
 		opType = "write"
 	}
 	logger.Warn("No healthy database pools available, continuing with unhealthy pool as last resort", "component", "RESILIENT-FAILOVER", "type", opType, "pool", pools[currentIdx].host)
-	return pools[currentIdx].database
+	return pools[currentIdx]
 }
 
 // startRuntimeHealthChecking starts background health checking for all pools
@@ -1257,24 +1315,59 @@ func isReadOnlyTransactionError(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "25006"
 }
 
-// resetCurrentWritePool resets all connections in the current write pool.
-// This should be called when we detect the write pool is connected to a read-only
-// server (e.g. after a PostgreSQL failover). Resetting forces fresh connections
-// that may be routed to the new primary by DNS or a load balancer.
-func (rd *ResilientDatabase) resetCurrentWritePool() {
-	rd.failoverManager.mu.RLock()
-	defer rd.failoverManager.mu.RUnlock()
-
-	currentIdx := rd.failoverManager.currentWriteIdx.Load()
-	pools := rd.failoverManager.writePools
-	if int(currentIdx) < len(pools) {
-		pool := pools[currentIdx]
-		if pool.database != nil && pool.database.WritePool != nil {
-			logger.Info("Resetting write pool connections after read-only error (failover recovery)",
-				"component", "RESILIENT-FAILOVER", "host", pool.host)
-			pool.database.WritePool.Reset()
-		}
+// onReadOnlyWriteTx handles SQLSTATE 25006 from a write transaction opened on origin.
+// Only origin.pool (never a newly promoted write pool) is reset and fenced, and only
+// when origin.gen still matches origin.pool's reset generation (skipping redundant
+// resets from other connections checked out before an earlier reset). When multiple
+// write hosts are configured, origin.pool is marked unhealthy and failover is triggered
+// immediately so writes and advisory lock transactions move to a healthy write host.
+func (rd *ResilientDatabase) onReadOnlyWriteTx(origin writeTxOrigin) {
+	pool := origin.pool
+	if pool == nil || pool.database == nil || pool.database.WritePool == nil {
+		return
 	}
+
+	pool.resetMu.Lock()
+	if origin.gen != pool.resetGen.Load() {
+		pool.resetMu.Unlock()
+		return
+	}
+	logger.Info("Resetting write pool connections after read-only error (failover recovery)",
+		"component", "RESILIENT-FAILOVER", "host", pool.host)
+	resetWriteHostLocked(pool, fmt.Errorf("write host %s is read-only", pool.host))
+	pool.resetMu.Unlock()
+
+	fm := rd.failoverManager
+	if fm == nil {
+		return
+	}
+	fm.mu.RLock()
+	multiWrite := len(fm.writePools) > 1
+	fm.mu.RUnlock()
+	if multiWrite {
+		if pool.isHealthy.Swap(false) {
+			pool.lastFailure.Store(time.Now().Unix())
+			pool.failCount.Add(1)
+		}
+		rd.getHealthyDatabaseWithFailover(true)
+	}
+}
+
+// resetWriteHost drops every connection of pool's write pool, so the next ones reach
+// whatever server its host leads to now, and then fences the advisory locks held on the
+// old connections: they exclude nothing on that server (see db.AdvisoryLockTx). Reset
+// first: a fence before it could miss a lock transaction that picked up an old
+// connection in between.
+func resetWriteHost(pool *DatabasePool, cause error) {
+	pool.resetMu.Lock()
+	defer pool.resetMu.Unlock()
+	resetWriteHostLocked(pool, cause)
+}
+
+func resetWriteHostLocked(pool *DatabasePool, cause error) {
+	pool.database.WritePool.Reset()
+	pool.resetGen.Add(1)
+	pool.database.FenceAdvisoryLocks(cause)
 }
 
 // checkPoolHealth checks the health of a single pool
@@ -1305,7 +1398,7 @@ func (rd *ResilientDatabase) checkPoolHealth(ctx context.Context, pool *Database
 					"component", "RESILIENT-FAILOVER", "host", pool.host)
 				// Reset pool connections immediately so the next attempt uses a fresh TCP
 				// connection that may be routed to the new primary.
-				pool.database.WritePool.Reset()
+				resetWriteHost(pool, fmt.Errorf("write host %s is in recovery", pool.host))
 			}
 		}
 	}
@@ -1588,7 +1681,15 @@ func (rd *ResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Conte
 	// instead of creating a case-variant duplicate. CanonicalMailboxName only
 	// normalizes the reserved INBOX spelling so a freshly-created inbox is stored
 	// as "INBOX" (RFC 3501 §5.1); all other names keep their as-typed case.
-	name = helpers.CanonicalMailboxName(name)
+	//
+	// The name is checked before anything is created: "Foo/" is "Foo" (RFC 3501
+	// §6.3.3), and a name with an empty, "." or ".." level is refused rather than
+	// creating a parent such as "x/" or "" on the way, or failing halfway.
+	created, err := helpers.MailboxNameToCreate(name)
+	if err != nil {
+		return nil, fmt.Errorf("mailbox %q: %w", name, err)
+	}
+	name = helpers.CanonicalMailboxName(created)
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		// First, try to get the mailbox within the transaction (case-insensitive).
 		var mb db.DBMailbox

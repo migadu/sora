@@ -2,6 +2,7 @@ package helpers
 
 import (
 	"net"
+	"slices"
 	"testing"
 )
 
@@ -159,6 +160,34 @@ func TestParseTrustedNetworks_IPv6AutoSubnet(t *testing.T) {
 	}
 }
 
+// A bare IPv4-mapped IPv6 address is the single IPv4 host it maps. Appending "/32" to its
+// text turned it into the IPv6 network ::/32, which matches no IPv4 client (the intended
+// host included) and matches ::1 and every other address whose first 32 bits are zero.
+func TestParseTrustedNetworks_IPv4MappedBareIP(t *testing.T) {
+	networks, err := ParseTrustedNetworks([]string{"::ffff:192.0.2.5"})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(networks) != 1 {
+		t.Fatalf("Expected 1 network, got %d", len(networks))
+	}
+	network := networks[0]
+
+	if got := network.String(); got != "192.0.2.5/32" {
+		t.Errorf("network = %s, want 192.0.2.5/32", got)
+	}
+	for _, ip := range []string{"192.0.2.5", "::ffff:192.0.2.5"} {
+		if !network.Contains(net.ParseIP(ip)) {
+			t.Errorf("network %s does not contain %s", network, ip)
+		}
+	}
+	for _, ip := range []string{"192.0.2.6", "::ffff:192.0.2.6", "::1", "::", "0:0:1::1"} {
+		if network.Contains(net.ParseIP(ip)) {
+			t.Errorf("network %s contains %s", network, ip)
+		}
+	}
+}
+
 func TestParseTrustedNetworks_RealWorldExample(t *testing.T) {
 	// This is the exact case from the error message
 	input := []string{"54.38.178.38"}
@@ -197,6 +226,11 @@ func TestIPInNetworks(t *testing.T) {
 		{"mixed list, bare hit", "192.168.1.5", []string{"10.0.0.0/8", "192.168.1.5"}, true},
 		{"bare IPv6 -> /128 match", "2001:db8::1", []string{"2001:db8::1"}, true},
 		{"IPv6 canonicalization", "2001:0db8::0:1", []string{"2001:db8::1"}, true},
+		{"bare IPv4-mapped matches its IPv4 host", "192.0.2.5", []string{"::ffff:192.0.2.5"}, true},
+		{"bare IPv4-mapped matches its mapped form", "::ffff:192.0.2.5", []string{"::ffff:192.0.2.5"}, true},
+		{"bare IPv4-mapped no match other IPv4", "192.0.2.6", []string{"::ffff:192.0.2.5"}, false},
+		{"bare IPv4-mapped no match ::1", "::1", []string{"::ffff:192.0.2.5"}, false},
+		{"bare IPv4-mapped no match ::/32 address", "0:0:1::1", []string{"::ffff:192.0.2.5"}, false},
 		{"invalid entry skipped, valid wins", "10.0.0.1", []string{"not-an-ip", "10.0.0.0/8"}, true},
 		{"all entries invalid", "10.0.0.1", []string{"not-an-ip", "garbage"}, false},
 		{"empty list", "10.0.0.1", nil, false},
@@ -211,5 +245,21 @@ func TestIPInNetworks(t *testing.T) {
 	// A nil IP is never trusted (e.g. unparseable client address).
 	if IPInNetworks(nil, []string{"0.0.0.0/0"}) {
 		t.Error("nil IP must never match, even against 0.0.0.0/0")
+	}
+}
+
+// InvalidNetworkEntries reports exactly the entries IPInNetworks skips: anything that is
+// not an IP address or CIDR, host names included (they are never resolved).
+func TestInvalidNetworkEntries(t *testing.T) {
+	entries := []string{
+		"10.0.1.0/24", "192.0.2.7", "2001:db8::/32", "2001:db8::1",
+		"admin.example.com", "localhost", "", " 192.0.2.8", "10.0.0.0/33", "fe80::1%eth0",
+	}
+	want := []string{"admin.example.com", "localhost", "", " 192.0.2.8", "10.0.0.0/33", "fe80::1%eth0"}
+	if got := InvalidNetworkEntries(entries); !slices.Equal(got, want) {
+		t.Errorf("InvalidNetworkEntries(%q) = %q, want %q", entries, got, want)
+	}
+	if got := InvalidNetworkEntries([]string{"10.0.0.0/8", "::1"}); len(got) != 0 {
+		t.Errorf("valid list reported invalid entries %q", got)
 	}
 }

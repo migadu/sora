@@ -3,6 +3,7 @@ package sieveengine
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/mail"
 	"runtime/debug"
@@ -162,7 +163,7 @@ type Result struct {
 // for this sender and response identity already checked.
 type VacationReply struct {
 	From    string // the :from address; delivery uses it only if the account owns it
-	Subject string // the :subject, or "Auto: " and the original subject (RFC 5230 §5.3)
+	Subject string // the :subject, even empty; without one the RFC 5230 §5.3 default
 	Body    string // the reason
 	IsMime  bool
 	// Addresses is the :addresses list: addresses of the recipient besides the
@@ -273,6 +274,16 @@ type CompiledScript struct {
 // enabledExtensions is the set a require may name; nil enables none (go-sieve), so
 // callers pass EffectiveExtensions.
 func CompileScript(scriptContent string, enabledExtensions []string) (*CompiledScript, error) {
+	// RFC 5228 sections 1.1, 2.4.2.1 and 8.1 require Sieve scripts to be valid UTF-8 and
+	// forbid NUL octets (0x00) inside strings and comments; PostgreSQL text columns also
+	// reject both with SQLSTATE 22021. go-sieve's lexer only rejects NUL at top-level
+	// token boundaries and never validates UTF-8.
+	if !helpers.TextStorable(scriptContent) {
+		if !utf8.ValidString(scriptContent) {
+			return nil, errors.New("sieve: script is not valid UTF-8")
+		}
+		return nil, errors.New("sieve: script contains NUL byte")
+	}
 	options := sieve.DefaultOptions()
 	options.EnabledExtensions = enabledExtensions
 	// Raise the per-match regex soft-wait cap to the whole-script budget. The match
@@ -801,7 +812,16 @@ func (r Result) Destinations(redirectFailed bool) []Destination {
 		dests = append(dests, Destination{Mailbox: mailbox, Create: create})
 	}
 	for _, mailbox := range r.Mailboxes {
-		add(mailbox, slices.Contains(r.CreateMailboxes, mailbox))
+		create := slices.Contains(r.CreateMailboxes, mailbox)
+		if create {
+			// The copy goes into the mailbox :create makes: "Foo" for "Foo/" (RFC 3501
+			// §6.3.3). A name that makes none stays as it is; creating it fails, and
+			// delivery keeps the message instead.
+			if name, err := helpers.MailboxNameToCreate(mailbox); err == nil {
+				mailbox = name
+			}
+		}
+		add(mailbox, create)
 	}
 	if r.Action == ActionKeep || r.Copy || (redirectFailed && len(dests) == 0) {
 		add(consts.MailboxInbox, false)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -81,14 +82,41 @@ func getDelayManager() *DelayManager {
 }
 
 // ApplyAuthenticationDelay applies progressive delays before authentication attempts
-// Returns ErrDelayQueueFull if too many concurrent delays are already in progress for this IP
+// Returns ErrDelayQueueFull if too many concurrent delays are already in progress for this IP.
+// protocol labels the sora_auth_delay_* metrics: the caller's server type, spelled as
+// its other metrics spell it ("imap", "imap_proxy", "userapi", ...).
 func ApplyAuthenticationDelay(ctx context.Context, limiter any, remoteAddr net.Addr, protocol string) error {
 	return applyAuthenticationDelayWithManager(ctx, limiter, remoteAddr, protocol, getDelayManager())
+}
+
+// ApplyHTTPAuthenticationDelay is ApplyAuthenticationDelay for a login an HTTP handler
+// answers. net/http sets the request's write deadline (http.Server WriteTimeout) when it
+// has read the request, before the handler runs, and a delay up to max_delay can outlast
+// it: the answer written after the delay was then dropped and the connection closed, so
+// the client got no response at all, not even for the right password (#1074). Before it
+// waits, it moves the write deadline of w to the end of the delay plus budget, the time
+// left for the rest of the login and its answer: the server's WriteTimeout, which is what
+// a login without a delay has. The delay is never shortened to fit a deadline, and the
+// deadline stays bounded, by max_delay plus budget.
+func ApplyHTTPAuthenticationDelay(ctx context.Context, w http.ResponseWriter, limiter any, remoteAddr net.Addr, protocol string, budget time.Duration) error {
+	rc := http.NewResponseController(w)
+	return delayAuthentication(ctx, limiter, remoteAddr, protocol, getDelayManager(), func(delay time.Duration) {
+		if err := rc.SetWriteDeadline(time.Now().Add(delay + budget)); err != nil {
+			logger.Warn("Auth delay: could not move the HTTP write deadline past the delay", "protocol", protocol, "delay", delay, "error", err)
+		}
+	})
 }
 
 // applyAuthenticationDelayWithManager is the internal implementation that accepts a DelayManager
 // This allows for testing with custom delay managers
 func applyAuthenticationDelayWithManager(ctx context.Context, limiter any, remoteAddr net.Addr, protocol string, dm *DelayManager) error {
+	return delayAuthentication(ctx, limiter, remoteAddr, protocol, dm, nil)
+}
+
+// delayAuthentication waits out the delay of limiter for remoteAddr in a slot of dm.
+// beforeWait, if not nil, is called with the delay once the slot is taken, just before
+// the wait.
+func delayAuthentication(ctx context.Context, limiter any, remoteAddr net.Addr, protocol string, dm *DelayManager, beforeWait func(delay time.Duration)) error {
 	delayHelper, ok := limiter.(AuthDelayHelper)
 	if !ok || delayHelper == nil {
 		return nil
@@ -99,10 +127,8 @@ func applyAuthenticationDelayWithManager(ctx context.Context, limiter any, remot
 		return nil
 	}
 
-	ip, _, err := net.SplitHostPort(remoteAddr.String())
-	if err != nil {
-		ip = remoteAddr.String()
-	}
+	// One slot count per client, however its address is spelled (see clientIPOf).
+	ip := clientIPOf(remoteAddr.String())
 
 	// Try to acquire a delay slot (non-blocking)
 	if !dm.tryAcquire(ip) {
@@ -118,6 +144,9 @@ func applyAuthenticationDelayWithManager(ctx context.Context, limiter any, remot
 	defer metrics.AuthDelayQueueDepth.WithLabelValues(protocol).Dec()
 
 	logger.Debug("Auth delay: Applying delay", "protocol", protocol, "delay", delay, "ip", ip)
+	if beforeWait != nil {
+		beforeWait(delay)
+	}
 
 	// Use context-aware delay to allow cancellation
 	timer := time.NewTimer(delay)

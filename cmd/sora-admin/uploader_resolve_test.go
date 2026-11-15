@@ -31,6 +31,7 @@ func TestDecideResolve(t *testing.T) {
 		{"intact body here is re-armed, not deleted", false, true, stagedIntact, resolveRearm},
 		{"size mismatch is left to a human", false, true, stagedSizeMismatch, resolveSkipSizeMismatch},
 		{"nowhere at all is deleted", false, true, stagedAbsent, resolveDelete},
+		{"a spool that cannot be read is no proof", false, true, stagedUnknown, resolveSkipUnknown},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -50,6 +51,17 @@ func TestStagedBodyState(t *testing.T) {
 	assert.Equal(t, stagedSizeMismatch, stagedBodyState(path, 5), "wrong size")
 
 	assert.Equal(t, stagedAbsent, stagedBodyState(dir, 4), "a directory is not a body")
+
+	// sora-admin run as a user who cannot enter the spool must not read that as absent.
+	if os.Geteuid() == 0 {
+		t.Skip("root reads the file whatever its permissions")
+	}
+	locked := filepath.Join(dir, "42")
+	require.NoError(t, os.Mkdir(locked, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(locked, "body"), []byte("abcd"), 0o644))
+	require.NoError(t, os.Chmod(locked, 0))
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	assert.Equal(t, stagedUnknown, stagedBodyState(filepath.Join(locked, "body"), 4), "permission denied")
 }
 
 // With the default [uploader] path, the bodies a previous release staged under its /tmp

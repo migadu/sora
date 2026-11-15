@@ -21,19 +21,20 @@
 //
 // # Starting a POP3 Server
 //
-//	cfg := &config.POP3Config{
-//		Addr:    ":110",
-//		TLSAddr: ":995",
-//		MaxConnections: 500,
-//	}
-//	srv, err := pop3.NewServer(cfg, db, s3, cache)
-//	if err != nil {
-//		log.Fatal(err)
-//	}
+// cmd/sora builds one server per pop3 [[server]] block, each with a single
+// listener (implicit TLS, STLS or plaintext, as the options say):
 //
-//	// Start listeners
-//	go srv.ListenAndServe(ctx)
-//	go srv.ListenAndServeTLS(ctx, certFile, keyFile)
+//	srv, err := pop3.New(ctx, name, hostname, ":995", s3, rdb, uploadWorker, cache,
+//		pop3.POP3ServerOptions{
+//			TLS:            true,
+//			TLSCertFile:    certFile,
+//			TLSKeyFile:     keyFile,
+//			MaxConnections: 500,
+//		})
+//	if err != nil {
+//		return err
+//	}
+//	go srv.Start(errChan)
 //
 // # Supported Commands
 //

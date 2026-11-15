@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,7 +34,9 @@ type SearchRateLimiter struct {
 	now             func() time.Time
 	cleanupInterval time.Duration
 	stopCleanup     chan struct{}
-	protocol        string
+	// protocol labels refusals in the protocol error metric, lowercased ("imap") like
+	// the protocol label of the protocol's other errors.
+	protocol string
 	// command labels refusals in the protocol error metric; empty leaves them
 	// to the caller to count.
 	command string
@@ -80,7 +83,7 @@ func NewCommandRateLimiter(protocol, command string, perWindow int, window time.
 		now:             time.Now,
 		cleanupInterval: 5 * time.Minute,
 		stopCleanup:     make(chan struct{}),
-		protocol:        protocol,
+		protocol:        strings.ToLower(protocol),
 		command:         command,
 	}
 

@@ -3,11 +3,9 @@ package pop3proxy
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -68,7 +66,7 @@ type POP3ProxyServer struct {
 	masterPassword     string
 	connManager        *proxy.ConnectionManager
 	connTracker        *server.ConnectionTracker
-	wg                 sync.WaitGroup
+	sessions           server.SessionGroup // Session goroutines, which Stop drains
 	enableAffinity     bool
 	authLimiter        server.AuthLimiter
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
@@ -199,7 +197,7 @@ type POP3ProxyServerOptions struct {
 	MaxConnections      int      // Maximum total connections per instance (0 = unlimited, local only)
 	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
 	TrustedNetworks     []string // CIDR blocks for trusted networks that bypass per-IP limits
-	ListenBacklog       int      // TCP listen backlog size (0 = system default; recommended: 4096-8192)
+	ListenBacklog       int      // TCP listen backlog size (0 = 1024; recommended: 4096-8192)
 
 	// Auth cache configuration
 	LookupCache *config.LookupCacheConfig
@@ -226,17 +224,14 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	if options.RemoteLookup != nil && options.RemoteLookup.Enabled {
 		remotelookupClient, err := proxy.InitializeRemoteLookup("pop3", options.RemoteLookup, options.RemotePort)
 		if err != nil {
-			logger.Debug("POP3 Proxy: Failed to initialize remotelookup client", "proxy", options.Name, "error", err)
-			if !options.RemoteLookup.ShouldLookupLocalUsers() {
-				serverCancel()
-				return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
-			}
-			logger.Debug("POP3 Proxy: Continuing without remotelookup due to lookup_local_users=true", "proxy", options.Name)
-		} else {
-			routingLookup = remotelookupClient
-			if options.Debug {
-				logger.Debug("POP3 Proxy: RemoteLookup client initialized successfully", "proxy", options.Name)
-			}
+			// Also with lookup_local_users, which adds the database for the users the
+			// lookup does not know and does not make the lookup optional.
+			serverCancel()
+			return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
+		}
+		routingLookup = remotelookupClient
+		if options.Debug {
+			logger.Debug("POP3 Proxy: RemoteLookup client initialized successfully", "proxy", options.Name)
 		}
 	}
 
@@ -255,6 +250,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		RemoteAddrs:        options.RemoteAddrs,
 		RemotePort:         options.RemotePort,
 		Settings:           proxy.BackendSettings{TLS: options.RemoteTLS, TLSUseStartTLS: options.RemoteTLSUseStartTLS, TLSVerify: options.RemoteTLSVerify, UseProxyProtocol: options.RemoteUseProxyProtocol},
+		RemoteTLSCAFile:    options.RemoteTLSCAFile,
 		ConnectTimeout:     connectTimeout,
 		RoutingLookup:      routingLookup,
 		ServerName:         options.Name,
@@ -275,29 +271,6 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// up without a restart; remote_dns_refresh tunes or disables that.
 	if options.RemoteDNSRefresh != nil {
 		connManager.SetResolveRefreshInterval(*options.RemoteDNSRefresh)
-	}
-
-	// Custom CA for backend certificate verification (private-CA or
-	// self-signed backends): keeps remote_tls_verify usable instead of
-	// forcing it off.
-	if options.RemoteTLSCAFile != "" {
-		pem, err := os.ReadFile(options.RemoteTLSCAFile)
-		if err != nil {
-			if routingLookup != nil {
-				routingLookup.Close()
-			}
-			serverCancel()
-			return nil, fmt.Errorf("failed to read remote_tls_ca_file: %w", err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			if routingLookup != nil {
-				routingLookup.Close()
-			}
-			serverCancel()
-			return nil, fmt.Errorf("remote_tls_ca_file %q contains no usable certificates", options.RemoteTLSCAFile)
-		}
-		connManager.SetRemoteTLSRootCAs(pool)
 	}
 
 	// Resolve addresses to expand hostnames to IPs
@@ -368,31 +341,15 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	}
 
 	if lookupCacheConfig.Enabled && !proxy.RemoteLookupUsesClientIP(options.RemoteLookup) {
-		positiveTTL, err := lookupCacheConfig.GetPositiveTTL()
-		if err != nil {
-			logger.Info("POP3 Proxy: Invalid positive TTL in auth cache config, using default (5m)", "name", options.Name, "error", err)
-			positiveTTL = 5 * time.Minute
-		}
-		negativeTTL, err := lookupCacheConfig.GetNegativeTTL()
-		if err != nil {
-			logger.Info("POP3 Proxy: Invalid negative TTL in auth cache config, using default (1m)", "name", options.Name, "error", err)
-			negativeTTL = 1 * time.Minute
-		}
-		cleanupInterval, err := lookupCacheConfig.GetCleanupInterval()
-		if err != nil {
-			logger.Info("POP3 Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", options.Name, "error", err)
-			cleanupInterval = 5 * time.Minute
-		}
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault(options.Name)
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault(options.Name)
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(options.Name)
 		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// Parse positive revalidation window from config (used for password change detection)
-		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()
-		if err != nil {
-			logger.Info("POP3 Proxy: Invalid positive revalidation window in auth cache config, using default (30s)", "name", options.Name, "error", err)
-			positiveRevalidationWindow = 30 * time.Second
-		}
+		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(options.Name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("pop3_proxy", options.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("POP3 Proxy: Lookup cache enabled", "name", options.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	} else {
 		logger.Info("POP3 Proxy: Lookup cache disabled", "name", options.Name)
@@ -435,38 +392,19 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		debug:                  options.Debug,
 	})
 
-	// Setup TLS: Three scenarios
-	// 1. Per-server TLS: cert files provided
-	// 2. Global TLS: options.TLS=true, no cert files, global TLS config provided
-	// 3. No TLS: options.TLS=false
-	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
-		// Scenario 1: Per-server TLS with explicit cert files
-		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
+	// The certificate source and tls_verify follow the rule every listener
+	// shares (server.ListenerTLS).
+	if options.TLS {
+		tlsConfig, err := server.ListenerTLS{
+			Protocol: "POP3 proxy", Name: options.Name,
+			CertFile: options.TLSCertFile, KeyFile: options.TLSKeyFile, Verify: options.TLSVerify,
+			Global: options.TLSConfig, ALPN: []string{"pop3"},
+		}.Config()
 		if err != nil {
 			serverCancel()
-			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, err
 		}
-		clientAuth := tls.NoClientCert
-		if options.TLSVerify {
-			clientAuth = tls.RequireAndVerifyClientCert
-		}
-
-		srv.tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			ClientAuth:               clientAuth,
-			ServerName:               hostname,
-			PreferServerCipherSuites: true,
-			NextProtos:               []string{"pop3"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-	} else if options.TLS && options.TLSConfig != nil {
-		// Scenario 2: Global TLS manager
-		srv.tlsConfig = options.TLSConfig
-	} else if options.TLS {
-		// TLS enabled but no cert files and no global TLS config provided
-		serverCancel()
-		return nil, fmt.Errorf("TLS enabled for POP3 proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", options.Name)
+		srv.tlsConfig = tlsConfig
 	}
 
 	srv.pop3libServer.Store(srv.buildLibServer())
@@ -529,12 +467,14 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 		SuppressedCaps:                  suppressedCaps,
 		NewSession: func(c *pop3server.Conn) (pop3server.Session, error) {
 			netConn := c.NetConn()
+			endInitialization := s.sessions.GuardInitialization(s.appCtx, netConn)
+			defer endInitialization()
 			proxyInfo := server.GetProxyProtocolInfo(netConn)
 
 			var releaseConn func()
 			var err error
 			if s.limiter != nil {
-				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), "")
+				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), server.GetRealClientIP(netConn, proxyInfo))
 				if err != nil {
 					// DELIBERATE silent close, no banner: matches the previous
 					// accept-loop rejection (drop before any greeting), and an
@@ -611,18 +551,20 @@ func (s *POP3ProxyServer) connConfig() server.SoraConnConfig {
 		MinBytesPerMinute:    settings.minBytesPerMinute,
 		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0 || settings.minBytesPerMinute > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
-			// Send POP3 error response before closing
-			// RFC 1939 doesn't define specific timeout response codes, but [IN-USE] is commonly used
+			// Best-effort notice before closing. It answers no command and
+			// carries no response code: [IN-USE] says a login succeeded with
+			// the maildrop locked (RFC 2449 section 8.1.2), and no RFC 2449 or
+			// RFC 3206 code describes a timeout.
 			var message string
 			switch reason {
 			case "idle":
-				message = "-ERR [IN-USE] Idle timeout, please reconnect\r\n"
+				message = "-ERR Idle timeout, please reconnect\r\n"
 			case "slow_throughput":
-				message = "-ERR [IN-USE] Connection too slow, please reconnect\r\n"
+				message = "-ERR Connection too slow, please reconnect\r\n"
 			case "session_max":
-				message = "-ERR [IN-USE] Maximum session duration exceeded, please reconnect\r\n"
+				message = "-ERR Maximum session duration exceeded, please reconnect\r\n"
 			default:
-				message = "-ERR [IN-USE] Connection timeout, please reconnect\r\n"
+				message = "-ERR Connection timeout, please reconnect\r\n"
 			}
 			_, _ = fmt.Fprint(conn, message)
 		},
@@ -712,16 +654,19 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 		// connections never inflate the gauges (they have no session to
 		// decrement them).
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		started := s.sessions.Go(func() {
 			defer func() {
 				if r := recover(); r != nil {
 					logger.Error("POP3 Proxy: panic in connection handler", "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
 			s.pop3libServer.Load().ServeConn(conn)
-		}()
+		})
+		if !started {
+			// Stop is draining the sessions and no longer waits for new ones.
+			conn.Close()
+			return nil
+		}
 	}
 }
 
@@ -745,6 +690,7 @@ func (s *POP3ProxyServer) GetConnectionManager() *proxy.ConnectionManager {
 }
 
 func (s *POP3ProxyServer) Stop() error {
+	s.sessions.BeginDrain()
 	logger.Debug("POP3 Proxy: Stopping", "proxy", s.name)
 
 	// Unregister rate limiter from global registry
@@ -770,16 +716,9 @@ func (s *POP3ProxyServer) Stop() error {
 		lib.Close()
 	}
 
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(30 * time.Second) {
 		logger.Debug("POP3 Proxy: Server stopped gracefully", "name", s.name)
-	case <-time.After(30 * time.Second):
+	} else {
 		logger.Debug("POP3 Proxy: Server stop timeout", "proxy", s.name)
 	}
 
@@ -800,6 +739,10 @@ func (s *POP3ProxyServer) Stop() error {
 		if err := s.lookupCache.Stop(stopCtx); err != nil {
 			logger.Error("Error stopping auth cache", "proxy", s.name, "error", err)
 		}
+	}
+
+	if s.authLimiter != nil {
+		s.authLimiter.Stop()
 	}
 
 	return nil
@@ -918,16 +861,23 @@ func (s *POP3ProxyServer) ReloadConfig(cfg config.ServerConfig) error {
 		reloaded = append(reloaded, "max_auth_errors")
 	}
 
-	// Update timeouts (affect new connections only)
-	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != next.authIdleTimeout {
+	// Update timeouts (affect new connections only). A value that does not parse
+	// keeps the running one (start-up, which has none, uses the default).
+	if timeout, err := cfg.GetAuthIdleTimeout(); err != nil {
+		logger.Warn("POP3 proxy config reload: invalid auth_idle_timeout, keeping the running value", "name", s.name, "error", err, "running", next.authIdleTimeout)
+	} else if timeout != next.authIdleTimeout {
 		next.authIdleTimeout = timeout
 		reloaded = append(reloaded, "auth_idle_timeout")
 	}
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("POP3 proxy config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.commandTimeout)
+	} else if timeout != next.commandTimeout {
 		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("POP3 proxy config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
