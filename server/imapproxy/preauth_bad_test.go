@@ -32,6 +32,9 @@ func TestPreAuthUnknownAndWrongStateCommandsAnswerBAD(t *testing.T) {
 		{"a1 uid expunge 1", "a1 BAD [CLIENTBUG] This command is only valid in the selected state"},
 		{"a1 FOO", "a1 BAD Unknown command"},
 		{"a1 UID FOO 1", "a1 BAD Unknown command"},
+		{"a1 UID ſEARCH ALL", "a1 BAD Unknown command"},
+		{"a1 uid ſtore 1 FLAGS ()", "a1 BAD Unknown command"},
+		{"a1 UıD FETCH 1 FLAGS", "a1 BAD Unknown command"},
 		{"a1 UID", "a1 BAD Unknown command"},
 	}
 
