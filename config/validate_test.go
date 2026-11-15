@@ -251,6 +251,18 @@ func TestConfigValidateWhatServiceSetupRefuses(t *testing.T) {
 			want: []problem{{"[tls]", `invalid renew_before duration "a month"`}}},
 		{name: "tls letsencrypt sync_interval unparsable", content: tls + "sync_interval = \"often\"\n" + metrics,
 			want: []problem{{"[tls]", `invalid sync_interval duration "often"`}}},
+		// The certificate store's client and its encryption settings are refused from the
+		// file as well, before the store is reached.
+		{name: "tls letsencrypt s3", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\naccess_key = \"AKIAEXAMPLE\"\nsecret_key = \"example-secret\"\nserver_side_encryption = \"aws:kms\"\nserver_side_encryption_kms_key_id = \"example-key\"\n" + metrics},
+		{name: "tls letsencrypt s3 without server-side encryption", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption = \"\"\n" + metrics},
+		{name: "tls letsencrypt s3 access_key without secret_key", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\naccess_key = \"AKIAEXAMPLE\"\n" + metrics,
+			want: []problem{{"[tls]", "letsencrypt.s3: access_key and secret_key must be set together"}}},
+		{name: "tls letsencrypt s3 server_side_encryption unsupported", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption = \"rot13\"\n" + metrics,
+			want: []problem{{"[tls]", `letsencrypt.s3: unsupported server-side encryption "rot13"`}}},
+		{name: "tls letsencrypt s3 aws:kms without key id", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption = \"aws:kms\"\n" + metrics,
+			want: []problem{{"[tls]", `letsencrypt.s3: server-side encryption "aws:kms" requires a KMS key id`}}},
+		{name: "tls letsencrypt s3 key id without aws:kms", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption_kms_key_id = \"example-key\"\n" + metrics,
+			want: []problem{{"[tls]", `letsencrypt.s3: a KMS key id is only used by server-side encryption "aws:kms", not "AES256"`}}},
 		{name: "tls disabled is not checked", content: "[tls]\nenabled = false\nprovider = \"acme\"\n" + metrics},
 	}
 	for _, tt := range tests {
