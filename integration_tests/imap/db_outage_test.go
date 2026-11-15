@@ -106,6 +106,115 @@ func TestIMAPCachedLoginDuringDatabaseOutageIsUnavailable(t *testing.T) {
 	}
 }
 
+// TestIMAPCachedLoginDuringDatabaseOutageIsLogged: a login answered from the lookup
+// cache during a database outage passes the password check and then fails to ensure
+// the default mailboxes before s.Session.User is set. That is the login's result: the
+// session logs it at WARN with the address and how the password was checked.
+func TestIMAPCachedLoginDuringDatabaseOutageIsLogged(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	rdb, outage := common.SetupTestDatabaseWithOutage(t)
+	account := common.CreateTestAccount(t, rdb)
+	address := startIMAPWithMasterSASL(t, rdb, common.DBOutageAuthRateLimit(), "", "")
+
+	if reply := imapLoginReply(t, address, account.Email, account.Password); !strings.HasPrefix(reply, "a1 OK") {
+		t.Fatalf("LOGIN before the outage: %q, want a1 OK", reply)
+	}
+
+	outage.Begin()
+	defer outage.End()
+	for _, cmd := range imapLoginCommands {
+		t.Run(cmd.name, func(t *testing.T) {
+			logs := common.CaptureLogs(t)
+			if reply := cmd.login(t, address, account.Email, account.Password); !strings.HasPrefix(reply, "NO [UNAVAILABLE]") {
+				t.Errorf("cached %s during a database outage: %q, want NO [UNAVAILABLE] ...", cmd.name, reply)
+			}
+			logs.WaitForLine(t, "level=WARN", "failed to create default mailboxes", "address="+account.Email, "method=cache", "session=")
+		})
+	}
+}
+
+// TestIMAPLoginResultLoggedOnSetupFailure: when credentials pass (regular login, master
+// username, or master SASL) and post-authentication session setup fails before
+// s.Session.User is populated, the session logs the failure at WARN with address and
+// method rather than user="" account_id=0 at INFO.
+func TestIMAPLoginResultLoggedOnSetupFailure(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	if _, err := rdb.GetDatabase().GetWritePool().Exec(context.Background(),
+		"UPDATE credentials SET primary_identity = FALSE WHERE LOWER(address) = LOWER($1)", account.Email); err != nil {
+		t.Fatalf("unset primary_identity: %v", err)
+	}
+
+	addr := common.GetRandomAddress(t)
+	const (
+		masterUser = "masteruser"
+		masterPass = "masterpass"
+		saslUser   = "saslmaster"
+		saslPass   = "saslpass"
+	)
+	srv, err := serverImap.New(context.Background(), "test-login-setup-err", "localhost", addr,
+		&storage.S3Storage{}, rdb, nil, nil,
+		serverImap.IMAPServerOptions{
+			InsecureAuth:       true,
+			MasterUsername:     []byte(masterUser),
+			MasterPassword:     []byte(masterPass),
+			MasterSASLUsername: []byte(saslUser),
+			MasterSASLPassword: []byte(saslPass),
+		})
+	if err != nil {
+		t.Fatalf("Failed to create IMAP server: %v", err)
+	}
+	go func() { _ = srv.Serve(addr) }()
+	t.Cleanup(func() { srv.Close() })
+	time.Sleep(100 * time.Millisecond)
+
+	for _, tc := range []struct {
+		name   string
+		run    func(t *testing.T) string
+		method string
+	}{
+		{
+			name: "regular_login",
+			run: func(t *testing.T) string {
+				return strings.TrimPrefix(imapLoginReply(t, addr, account.Email, account.Password), "a1 ")
+			},
+			method: "main_db",
+		},
+		{
+			name: "master_username_login",
+			run: func(t *testing.T) string {
+				return strings.TrimPrefix(imapLoginReply(t, addr, account.Email+"@"+masterUser, masterPass), "a1 ")
+			},
+			method: "master",
+		},
+		{
+			name: "master_username_sasl",
+			run: func(t *testing.T) string {
+				return strings.TrimPrefix(imapAuthPlain(t, addr, "", account.Email+"@"+masterUser, masterPass), "A001 ")
+			},
+			method: "master",
+		},
+		{
+			name: "master_sasl",
+			run: func(t *testing.T) string {
+				return strings.TrimPrefix(imapAuthPlain(t, addr, account.Email, saslUser, saslPass), "A001 ")
+			},
+			method: "master",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := common.CaptureLogs(t)
+			if reply := tc.run(t); !strings.HasPrefix(reply, "NO [SERVERBUG]") {
+				t.Errorf("%s reply = %q, want NO [SERVERBUG] ...", tc.name, reply)
+			}
+			logs.WaitForLine(t, "level=WARN", "failed to get primary email", "address="+account.Email, "method="+tc.method, "session=")
+		})
+	}
+}
+
 // TestIMAPDatabaseOutageDropsCachedLogin: a login in the backend's lookup cache keeps
 // signing in during a database outage while it is younger than
 // positive_revalidation_window (30s by default). A password that misses it goes to the
