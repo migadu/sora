@@ -30,6 +30,10 @@ var alphabeticZone = regexp.MustCompile(`^[^:]*\d:\d{2}(?::\d{2})?([ \t]*)([A-Za
 // follows.
 var obsYear = regexp.MustCompile(`^[^:]*[ \t](\d{2,3})[ \t]+\d{1,2}:`)
 
+// leapSecond matches a date-time (RFC 5322 §3.3) up to the seconds of its time-of-day
+// (the field's first colon is the one after the hour) when they are 60: a leap second.
+var leapSecond = regexp.MustCompile(`^[^:]*\d:\d{2}:(60)(?:\D|$)`)
+
 // gmtHourOffset matches a zone of GMT and a signed hour other than zero, the form
 // time.Parse (and so net/mail.ParseDate) accepts after GMT: GMT+1, GMT-05, GMT+0001.
 var gmtHourOffset = regexp.MustCompile(`^GMT[+-]0*[1-9]`)
@@ -57,6 +61,10 @@ var gmtHourOffset = regexp.MustCompile(`^GMT[+-]0*[1-9]`)
 // are each "[CFWS] ... [CFWS]"), so they are first reduced to the separators net/mail's
 // layouts have.
 //
+// A time-of-day whose second is 60, a leap second (§3.3: "the time-of-day MUST be in the
+// range 00:00:00 through 23:59:60"), is read as second 59 of the same minute, as Dovecot
+// reads it: time.Time cannot hold second 60, and net/mail.ParseDate does not parse it.
+
 // GMT with a signed hour other than zero (GMT+1) is not parsed. It is no zone of RFC
 // 5322 (§3.3; the obs-zone names of §4.3 are alphabetic) and has no single meaning, an
 // offset of +0100 or, as a POSIX TZ, UTC-1. net/mail.ParseDate takes the time of day as
@@ -69,6 +77,9 @@ func ParseDateHeader(value string) (time.Time, error) {
 		return mail.ParseDate(value)
 	}
 	unfolded = normalizeCFWS(unfolded)
+	if m := leapSecond.FindStringSubmatchIndex(unfolded); m != nil {
+		unfolded = unfolded[:m[2]] + "59" + unfolded[m[3]:]
+	}
 	if m := obsYear.FindStringSubmatchIndex(unfolded); m != nil {
 		year, _ := strconv.Atoi(unfolded[m[2]:m[3]])
 		if m[3]-m[2] == 2 && year < 50 {
@@ -83,8 +94,8 @@ func ParseDateHeader(value string) (time.Time, error) {
 		// Replace a whole zone token only. For example, PDT+0400 is not PDT:
 		// net/mail would discard the suffix after a numeric replacement. Keep
 		// its existing behavior for extensions it accepts, such as GMT+0000
-		// (unfolded is the value net/mail would see, with the separators and
-		// the year rewritten).
+		// (unfolded is the value net/mail would see, with the separators, the
+		// year and a leap second rewritten).
 		if end < len(unfolded) && unfolded[end] != ' ' && unfolded[end] != '\t' && unfolded[end] != '(' {
 			// Except GMT with a signed hour other than zero (see above), which
 			// time.Parse builds in UTC and only labels with the offset: 12:00:00
@@ -156,11 +167,15 @@ func normalizeCFWS(s string) string {
 func isDigit(c byte) bool { return '0' <= c && c <= '9' }
 
 // commentLen returns the length of the comment s starts with, nested comments and
-// quoted-pairs included (RFC 5322 §3.2.2), or 0 if it does not close.
+// quoted-pairs included (RFC 5322 §3.2.2), or 0 if it is malformed or
+// does not close. An unquoted NUL is not ctext, including obsolete ctext;
+// a quoted NUL remains allowed by obs-qp (§4.1).
 func commentLen(s string) int {
 	depth := 0
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
+		case 0:
+			return 0
 		case '\\':
 			i++
 		case '(':

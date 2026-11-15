@@ -77,10 +77,13 @@ func TestIMAP_FetchFailingPartWaySetsSeenOnlyOnAnswered(t *testing.T) {
 	})
 
 	// A body the session memory budget cannot hold (#1256), and a BODY[TEXT]
-	// copy it refuses once the body is loaded, fail with NO [UNAVAILABLE], not
-	// an empty literal and not after the response is opened. The messages are
-	// appended before session_memory_limit is reloaded to 256 KiB, and fetched
-	// by a session that starts after the reload.
+	// copy it refuses once the body is loaded, fail with NO [LIMIT], not an
+	// empty literal and not after the response is opened: neither fits the
+	// whole budget, beside its body for the copy, so no retry can fetch it
+	// (RFC 5530: "The operation ran up against an implementation limit of some
+	// kind"). The messages are appended before session_memory_limit is
+	// reloaded to 256 KiB, and fetched by a session that starts after the
+	// reload.
 	for _, tc := range []struct {
 		name    string
 		size    int
@@ -116,7 +119,7 @@ func TestIMAP_FetchFailingPartWaySetsSeenOnlyOnAnswered(t *testing.T) {
 
 			c = login()
 			c.do("SELECT INBOX")
-			requireFetchFailsAtSecond(t, c, tc.command, " NO [UNAVAILABLE] ")
+			requireFetchFailsAtSecond(t, c, tc.command, " NO [LIMIT] ")
 		})
 	}
 }

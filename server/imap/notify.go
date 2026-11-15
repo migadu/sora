@@ -993,9 +993,11 @@ func (s *IMAPSession) notifyFetchNewMessages(ctx context.Context, watch *notifyW
 	// sending duplicate data"), and none is lost behind a message that fails.
 	// One whose fetch-atts can never be answered, a BINARY section whose
 	// Content-Transfer-Encoding cannot be decoded (NO [UNKNOWN-CTE], RFC 9051
-	// §7.5.2), is passed over at once. Any other failure, such as a body that
-	// cannot be read right now (NO [UNAVAILABLE]), is retried on the next
-	// tick, until notifyMaxFetchAttempts gives the message up.
+	// §7.5.2) or a body or section larger than the session memory budget (NO
+	// [LIMIT], sectionMemoryRefused), is passed over at once. Any other
+	// failure, such as a body that cannot be read right now (NO
+	// [UNAVAILABLE]), is retried on the next tick, until
+	// notifyMaxFetchAttempts gives the message up.
 	for watch.nextFetchUID <= upper {
 		uidSet := uidRangeExcept(watch.nextFetchUID, upper, own)
 		if len(uidSet) == 0 {
@@ -1023,7 +1025,8 @@ func (s *IMAPSession) notifyFetchNewMessages(ctx context.Context, watch *notifyW
 		}
 
 		var imapErr *imap.Error
-		if progress.failed != 0 && errors.As(err, &imapErr) && imapErr.Code == imap.ResponseCodeUnknownCTE {
+		if progress.failed != 0 && errors.As(err, &imapErr) &&
+			(imapErr.Code == imap.ResponseCodeUnknownCTE || imapErr.Code == imap.ResponseCodeLimit) {
 			s.InfoLog("NOTIFY: MessageNew fetch-atts cannot be answered for a message, passing over it",
 				"uid", progress.failed, "error", err)
 			watch.nextFetchUID, watch.fetchAttempts = progress.failed+1, 0
