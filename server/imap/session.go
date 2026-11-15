@@ -98,7 +98,7 @@ type IMAPSession struct {
 	// Memory tracking
 	memTracker *server.SessionMemoryTracker
 
-	// Body section retained for <offset.size> chunk fetches (see body_section_cache.go).
+	// BODY or BINARY section retained for <offset.size> chunk fetches (see body_section_cache.go).
 	bodySectionCacheMu   sync.Mutex
 	bodySectionCacheKey  string
 	bodySectionCacheData []byte

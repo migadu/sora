@@ -664,63 +664,145 @@ type decodedBinary struct {
 	charged  int64 // session memory charged for sections
 }
 
-// decodeBinary decodes the BINARY sections and BINARY.SIZE values a FETCH asks
-// for. A section whose Content-Transfer-Encoding cannot be decoded fails with
-// NO [UNKNOWN-CTE]: RFC 9051 §7.5.2, for both items, "If the server does not
-// know how to decode the section's Content-Transfer-Encoding, it MUST fail
-// the request and issue a "NO" response that contains the "UNKNOWN-CTE"
-// response code."
-func (s *IMAPSession) decodeBinary(ctx context.Context, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) (*decodedBinary, error) {
-	if err := s.ensureBodyDataLoaded(ctx, msg, bodyData, bodyDataFetched); err != nil {
-		// Transient: body staged for upload but not yet retrievable from this node.
-		// Ask the client to retry instead of returning an empty section.
-		if errors.Is(err, errBodyTransientlyUnavailable) {
-			return nil, s.transientBodyUnavailable(msg.UID, err)
+// binaryPart is a part a FETCH names in BINARY or BINARY.SIZE items, with the
+// indexes of those items in the FETCH options.
+type binaryPart struct {
+	part     []int
+	sections []int // into BinarySection
+	sizes    []int // into BinarySectionSize
+}
+
+// binaryParts groups the BINARY and BINARY.SIZE items of a FETCH by the part
+// they name, in the order the parts are first named.
+func binaryParts(options *imap.FetchOptions) []*binaryPart {
+	var parts []*binaryPart
+	byPart := make(map[string]*binaryPart)
+	named := func(part []int) *binaryPart {
+		key := fmt.Sprint(part)
+		p := byPart[key]
+		if p == nil {
+			p = &binaryPart{part: part}
+			byPart[key] = p
+			parts = append(parts, p)
 		}
-		// Graceful degradation: return empty binary sections and zero sizes instead
-		// of failing the entire multi-message FETCH. This prevents one broken message
-		// (missing S3 content, etc.) from making the whole mailbox listing fail for
-		// webmail clients.
-		s.WarnLog("failed to load message body, returning empty binary sections", "uid", msg.UID, "error", err)
+		return p
+	}
+	for i, section := range options.BinarySection {
+		p := named(section.Part)
+		p.sections = append(p.sections, i)
+	}
+	for i, section := range options.BinarySectionSize {
+		p := named(section.Part)
+		p.sizes = append(p.sizes, i)
+	}
+	return parts
+}
+
+// decodeBinary decodes the BINARY sections and BINARY.SIZE values a FETCH asks
+// for. Each part is decoded once, however many items name it: one command line
+// has room for thousands of items like BINARY.PEEK[2]<0.1>, and a decode is
+// work in the size of the whole part. A section whose Content-Transfer-Encoding
+// cannot be decoded fails with NO [UNKNOWN-CTE]: RFC 9051 §7.5.2, for both
+// items, "If the server does not know how to decode the section's
+// Content-Transfer-Encoding, it MUST fail the request and issue a "NO" response
+// that contains the "UNKNOWN-CTE" response code."
+func (s *IMAPSession) decodeBinary(ctx context.Context, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) (*decodedBinary, error) {
+	// The body is loaded only for a part the session has not retained.
+	loadBody := func() ([]byte, error) {
+		if err := s.ensureBodyDataLoaded(ctx, msg, bodyData, bodyDataFetched); err != nil {
+			// Transient: body staged for upload but not yet retrievable from this node.
+			// Ask the client to retry instead of returning an empty section.
+			if errors.Is(err, errBodyTransientlyUnavailable) {
+				return nil, s.transientBodyUnavailable(msg.UID, err)
+			}
+			// Graceful degradation: return empty binary sections and zero sizes instead
+			// of failing the entire multi-message FETCH. This prevents one broken message
+			// (missing S3 content, etc.) from making the whole mailbox listing fail for
+			// webmail clients.
+			s.WarnLog("failed to load message body, returning empty binary sections", "uid", msg.UID, "error", err)
+		}
+		return *bodyData, nil
 	}
 
 	b := &decodedBinary{
 		sections: make([][]byte, len(options.BinarySection)),
 		sizes:    make([]uint32, len(options.BinarySectionSize)),
 	}
-	if *bodyData == nil {
-		return b, nil
-	}
-	for i, section := range options.BinarySection {
-		buf, err := safeDecodeBinarySection(*bodyData, section)
-		if err != nil {
+	for _, p := range binaryParts(options) {
+		if err := s.decodeBinaryPart(b, p, options, msg, loadBody); err != nil {
 			s.freeSectionCopies(b.charged)
-			return nil, s.unknownCTE(msg.UID)
+			return nil, err
 		}
-		if section.Partial != nil {
-			// A <partial> is a slice of the whole decoded section. Keep only the
-			// slice, which is what is charged: the sections are held until the
-			// response is written, and one command line can name the same part
-			// thousands of times.
-			buf = bytes.Clone(buf)
-		}
-		charged, ok := s.chargeSectionCopy(len(buf))
-		if !ok {
-			s.freeSectionCopies(b.charged)
-			return nil, s.sectionMemoryUnavailable(msg.UID, len(buf))
-		}
-		b.charged += charged
-		b.sections[i] = buf
-	}
-	for i, section := range options.BinarySectionSize {
-		n, err := safeDecodeBinarySectionSize(*bodyData, section)
-		if err != nil {
-			s.freeSectionCopies(b.charged)
-			return nil, s.unknownCTE(msg.UID)
-		}
-		b.sizes[i] = n
 	}
 	return b, nil
+}
+
+// decodeBinaryPart fills in b the items that name p, from the one decoded
+// section of p. A part named only with a <partial> is being fetched in chunks:
+// its decoded section is retained for the session's next chunk of it, as a BODY
+// section is (body_section_cache.go), and answered from there while it is.
+func (s *IMAPSession) decodeBinaryPart(b *decodedBinary, p *binaryPart, options *imap.FetchOptions, msg *db.Message, loadBody func() ([]byte, error)) error {
+	key := binarySectionCacheKey(msg.ContentHash, p.part)
+	section := s.cachedBodySection(key) // charged to the retention while it is retained
+	retained := section != nil
+	var charged int64 // charged here for section
+	if !retained {
+		body, err := loadBody()
+		if err != nil || body == nil {
+			return err // no body: empty sections and zero sizes
+		}
+		if len(p.sections) == 0 {
+			// BINARY.SIZE alone: count the decoded octets without holding them.
+			n, err := safeDecodeBinarySectionSize(body, &imap.FetchItemBinarySectionSize{Part: p.part})
+			if err != nil {
+				return s.unknownCTE(msg.UID)
+			}
+			for _, i := range p.sizes {
+				b.sizes[i] = n
+			}
+			return nil
+		}
+		if section, err = safeDecodeBinarySection(body, &imap.FetchItemBinarySection{Part: p.part}); err != nil {
+			return s.unknownCTE(msg.UID)
+		}
+		var ok bool
+		if charged, ok = s.chargeSectionCopy(len(section)); !ok {
+			return s.sectionMemoryUnavailable(msg.UID, len(section))
+		}
+	}
+	for _, i := range p.sizes {
+		b.sizes[i] = uint32(len(section))
+	}
+
+	chunked := !slices.ContainsFunc(p.sections, func(i int) bool { return options.BinarySection[i].Partial == nil })
+	if !retained && !chunked {
+		// The whole section is sent, so the items are slices of it, held and
+		// charged until the response is written.
+		for _, i := range p.sections {
+			b.sections[i] = applyPartial(section, options.BinarySection[i].Partial)
+		}
+		b.charged += charged
+		return nil
+	}
+
+	// The items keep copies of their slices, which is what they charge: they are
+	// held until the response is written, while the section goes to the
+	// retention, which may give it up before then, or is given back now if the
+	// session cannot retain it.
+	for _, i := range p.sections {
+		buf := bytes.Clone(applyPartial(section, options.BinarySection[i].Partial))
+		n, ok := s.chargeSectionCopy(len(buf))
+		if !ok {
+			s.freeSectionCopies(charged)
+			return s.sectionMemoryUnavailable(msg.UID, len(buf))
+		}
+		b.charged += n
+		b.sections[i] = buf
+	}
+	if !retained && !s.retainBodySection(key, section) {
+		s.freeSectionCopies(charged)
+	}
+	return nil
 }
 
 // writeDecodedBinary writes the BINARY sections and BINARY.SIZE values
