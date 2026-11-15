@@ -462,7 +462,11 @@ func (si *S3Importer) importFromS3() error {
 		}(w)
 	}
 
-	// Feed jobs a page at a time, closing each read cursor before channel waits.
+	// Feed jobs to workers a page of keys at a time. A query's read transaction lasts
+	// until its rows are closed, and the feeder waits on the workers while it feeds
+	// them: a query left open for the whole run would hold the snapshot that keeps the
+	// checkpointer from ever resetting the WAL, which then grows with every worker's
+	// update. Each page is read in full, and its rows closed, before it is fed.
 	// Stop feeding on an interrupt; workers finish active stores and skip queued jobs.
 	var feedErr error
 feed:
