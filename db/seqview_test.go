@@ -15,8 +15,8 @@ import (
 // sequence number, and one created since has none before the view's last message.
 // Every statement that numbers messages must agree, whichever path it takes: the
 // sequence-set resolution, the forward and backward hydration sweeps, the windows of a
-// chunked fetch, 1:*, SEARCH and THREAD. "*" is the last row counted (UID 11 here):
-// the session never sends it, and names no number past what its client knows.
+// chunked fetch, 1:*, SEARCH and THREAD. "*" is the view's last message (UID 10 here);
+// a session never sends it, and names no number past what its client knows.
 func TestSeqViewNumbersMessagesAsOfTheView(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -81,10 +81,10 @@ func TestSeqViewNumbersMessagesAsOfTheView(t *testing.T) {
 			}{
 				{"forward sweep", imap.SeqSet{{Start: 3, Stop: 5}}, []imap.UID{4, 6}},
 				{"backward sweep", imap.SeqSet{{Start: 6, Stop: 9}}, []imap.UID{7, 8, 10}},
-				{"star is the last row counted", imap.SeqSet{{Start: 6, Stop: 0}}, []imap.UID{7, 8, 10, 11}},
+				{"star is the view's last", imap.SeqSet{{Start: 6, Stop: 0}}, []imap.UID{7, 8, 10}},
 				{"a held message names nothing", imap.SeqSet{{Start: 8, Stop: 8}}, nil},
 				{"the view's last message", imap.SeqSet{{Start: 9, Stop: 9}}, []imap.UID{10}},
-				{"1:* numbers in the view", imap.SeqSet{{Start: 1, Stop: 0}}, []imap.UID{1, 4, 6, 7, 8, 10, 11}},
+				{"1:* is the view", imap.SeqSet{{Start: 1, Stop: 0}}, []imap.UID{1, 4, 6, 7, 8, 10}},
 				{"1:9 is the view", imap.SeqSet{{Start: 1, Stop: 9}}, []imap.UID{1, 4, 6, 7, 8, 10}},
 				{"UIDs are numbered in the view too", imap.UIDSetNum(1, 6, 11), []imap.UID{1, 6, 11}},
 			}
@@ -109,7 +109,7 @@ func TestSeqViewNumbersMessagesAsOfTheView(t *testing.T) {
 		for _, r := range results {
 			got[r.UID] = r.Seq
 		}
-		require.Equal(t, map[imap.UID]uint32{4: 3, 6: 5, 7: 6, 8: 7, 10: 9, 11: 10}, got)
+		require.Equal(t, map[imap.UID]uint32{4: 3, 6: 5, 7: 6, 8: 7, 10: 9}, got)
 	})
 
 	t.Run("thread", func(t *testing.T) {

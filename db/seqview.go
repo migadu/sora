@@ -16,8 +16,10 @@ type seqViewKey struct{}
 // Nothing created after modSeq can come before a message of the view, since UIDs only
 // grow, so such messages only occupy the numbers past the view's last message; the
 // caller, which knows how many messages its client was told about, names no number past
-// them. "*" (0) is the last row counted, which is also what a UID "*" resolves to:
-// "the unique identifier of the last message in the mailbox" (RFC 9051 §9).
+// them. "*" (0) in a sequence set means the view's last message, which also bounds a
+// range ending past the last message counted. A UID "*" is not this: it is "the unique
+// identifier of the last message in the mailbox" (RFC 9051 §9), the highest live UID
+// (uidsBySeqNumAndLiveLast).
 //
 // For append and soft-expunge changes, the view of a modseq is the same in every
 // snapshot: an expunge only moves a message from the live rows to the held ones.

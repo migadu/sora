@@ -370,8 +370,9 @@ func streamMessagesBySeqSet(ctx context.Context, run MessageStreamDBRunner, mail
 	if len(seqSet) == 0 {
 		return nil
 	}
-	// 1:* names every live message, numbered by counting them. In a view (WithSeqView)
-	// the held messages are counted too, so the numbering goes through uidsBySeqNum.
+	// Without a view 1:* names every live message, numbered by counting them. In a view
+	// (WithSeqView) the held messages are counted too and "*" is the view's last
+	// message, so the set goes through uidsBySeqNum. (A session never sends "*".)
 	if len(seqSet) == 1 && seqSet[0].Start == 1 && (seqSet[0].Stop == 0) && seqViewOf(ctx) == 0 {
 		logger.Debug("Database: Streaming SeqSet 1:* fetch", "mailbox_id", mailboxID)
 		return streamAllActiveMessagesRawChunked(ctx, run, mailboxID, cb, includeBodyStructure)

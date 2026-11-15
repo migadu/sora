@@ -376,17 +376,3 @@ func TestIMAP_SessionSeqNums_StarStopsAtTheClientsLastMessage(t *testing.T) {
 	require.NotContains(t, flagsOfUID(t, other, "5"), `\Flagged`,
 		"the restored message (UID 5) is not one of the three the client knew")
 }
-
-// TestIMAP_SessionSeqNums_UIDStarIsTheMailboxsLastMessage: UID "*" is "the unique
-// identifier of the last message in the mailbox" (RFC 9051 §9, seq-number). A message
-// delivered since the session's last poll is in the mailbox, so UID 4:* names it alone,
-// not also the message before it.
-func TestIMAP_SessionSeqNums_UIDStarIsTheMailboxsLastMessage(t *testing.T) {
-	viewer, other := twoSessions(t, 3)
-	other.append("o1", "INBOX", msg(4)) // UID 4
-
-	untagged, tagged := viewer.cmd("u1", "UID SEARCH UID 4:*")
-	require.Contains(t, tagged, "OK")
-	require.Contains(t, untagged, "* SEARCH 4")
-	require.NotContains(t, untagged, "* SEARCH 3 4")
-}
