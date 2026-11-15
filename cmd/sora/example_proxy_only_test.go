@@ -32,7 +32,7 @@ func TestProxyOnlyExampleStarts(t *testing.T) {
 		t.Fatal("config-proxy-only.toml enables no server")
 	}
 	for _, s := range servers {
-		if serverNeedsDatabase(s) {
+		if s.NeedsDatabase() {
 			t.Errorf("server %q (%s) needs the database, which the example does not configure", s.Name, s.Type)
 		}
 	}
