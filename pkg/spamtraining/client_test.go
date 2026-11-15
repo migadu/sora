@@ -458,9 +458,9 @@ func TestOpenCircuitBreakerSkipsTheFetch(t *testing.T) {
 
 // TestSubmitTrainingDoesNotFollowRedirects: a 3xx answer to the training POST is not
 // an accepted submission. Followed, a 301/302/303 turns the POST into a body-less GET
-// whose 2xx counted as accepted, and a 307/308 replayed the message and the bearer
-// token to the Location. The 3xx itself must be reported as a failure naming the
-// Location.
+// whose 2xx counted as accepted, and a 307/308 replayed the message to the Location
+// (with the bearer token when the Location is the same host or a subdomain). The 3xx
+// itself must be reported as a failure naming the Location.
 func TestSubmitTrainingDoesNotFollowRedirects(t *testing.T) {
 	for _, status := range []int{
 		http.StatusMovedPermanently,
