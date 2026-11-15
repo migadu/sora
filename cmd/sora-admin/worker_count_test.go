@@ -91,3 +91,61 @@ func TestImportExportFlagsRejectWorkerCountBelowOne(t *testing.T) {
 		}
 	}
 }
+
+// TestImportMaildirFlagRejectsBatchSizeBelowOne: `import maildir --batch-size` below 1 is a
+// flag error like --jobs, reported before the command connects to the database.
+func TestImportMaildirFlagRejectsBatchSizeBelowOne(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte("[database.write]\nhosts = [\"127.0.0.1\"]\nport = 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []int{0, -1} {
+		t.Run(strconv.Itoa(n), func(t *testing.T) {
+			out, code := runAdminMain(t, "--config", configPath, "import", "maildir", "--email", "user@example.com",
+				"--maildir-path", t.TempDir(), "--batch-size", strconv.Itoa(n))
+			if code == 0 {
+				t.Fatalf("exit code 0, want non-zero:\n%s", out)
+			}
+			if !strings.Contains(out, "--batch-size must be at least 1") {
+				t.Errorf("output lacks %q:\n%s", "--batch-size must be at least 1", out)
+			}
+			if strings.Contains(out, "write pool") {
+				t.Errorf("the command got past its flags:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestImporterBatchSizeBelowOneUsesTheDefault: NewImporter takes a batch size below 1 for
+// the default of 20, but importMessages read the option again and handed -1 to make(), so
+// an import with a negative batch size panicked at its first batch.
+func TestImporterBatchSizeBelowOneUsesTheDefault(t *testing.T) {
+	for _, n := range []int{0, -1} {
+		t.Run(strconv.Itoa(n), func(t *testing.T) {
+			importer, err := NewImporter(context.Background(), newCleanupDBMaildir(t, 2), "user@example.com", 1, nil, nil,
+				ImporterOptions{TestMode: true, BatchSize: n})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { importer.Close() })
+			importer.rdb = newMockResilientDatabase()
+
+			func() {
+				defer func() {
+					if p := recover(); p != nil {
+						t.Fatalf("import with batch size %d panicked: %v", n, p)
+					}
+				}()
+				if err := importer.Run(); err != nil {
+					t.Fatalf("import with batch size %d: %v", n, err)
+				}
+			}()
+			if importer.importedMessages != 2 {
+				t.Errorf("imported %d messages, want 2", importer.importedMessages)
+			}
+			if importer.batchSize != 20 {
+				t.Errorf("batch size %d, want the default 20", importer.batchSize)
+			}
+		})
+	}
+}

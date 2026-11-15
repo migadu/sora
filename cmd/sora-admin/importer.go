@@ -2785,13 +2785,6 @@ func (i *Importer) importMessages() error {
 		return nil
 	}
 
-	// Initialize batch size
-	if i.options.BatchSize == 0 {
-		i.batchSize = 20 // Default
-	} else {
-		i.batchSize = i.options.BatchSize
-	}
-
 	// Initialize mailbox cache
 	i.mailboxCache = make(map[string]*db.DBMailbox)
 
