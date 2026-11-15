@@ -196,3 +196,107 @@ func TestHardDeleteAccountsSerializesWithFlagChangeInSharedMailbox(t *testing.T)
 		`SELECT COUNT(*) FROM mailboxes WHERE account_id = $1`, f.deletedID).Scan(&owned))
 	require.Equal(t, 0, owned, "the deleted account's own mailboxes should be gone")
 }
+
+// TestHardDeleteInterruptedAfterLastMailboxResumesForLegacyRows stops the cleaner's hard
+// delete of an account right after the step that removed its last mailbox, as a shutdown
+// or a failed step between steps does, while its legacy row in another account's shared
+// mailbox is still live. The next cycle must list the account again to expunge that row:
+// nothing else ever does, and a live row keeps the account from being finalized for good.
+// Once the hard delete has finished, the account must not be listed again.
+func TestHardDeleteInterruptedAfterLastMailboxResumesForLegacyRows(t *testing.T) {
+	db := setupTestDatabase(t)
+	t.Cleanup(db.Close)
+	ctx := context.Background()
+
+	marker := finalizeTestMarker(t, db)
+	f := setupSharedLegacyFixture(t, db, true)
+	_, err := db.GetWritePool().Exec(ctx, `UPDATE accounts SET deleted_at = $2 WHERE id = $1`, f.deletedID, marker)
+	require.NoError(t, err)
+	grace := time.Since(marker.Add(time.Minute))
+	// A run that fails before the finalize below must not leave the account soft-deleted
+	// at the marker, where other tests' grace windows would pick it up.
+	t.Cleanup(func() {
+		for _, q := range []string{
+			`DELETE FROM messages_fts_v2 WHERE account_id = $1`,
+			`DELETE FROM messages WHERE account_id = $1`,
+			`DELETE FROM pending_uploads WHERE account_id = $1`,
+			`DELETE FROM mailboxes WHERE account_id = $1`,
+			`DELETE FROM accounts WHERE id = $1`,
+		} {
+			if _, err := db.GetWritePool().Exec(context.Background(), q, f.deletedID); err != nil {
+				t.Errorf("cleanup of account %d: %s: %v", f.deletedID, q, err)
+			}
+		}
+	})
+
+	listed := func() []int64 {
+		ids, err := db.ListSoftDeletedAccountsForHardDelete(ctx, grace, 100000)
+		require.NoError(t, err)
+		return ids
+	}
+	step := func() bool {
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		done, err := db.HardDeleteAccountStep(ctx, tx, f.deletedID, 1)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+		return done
+	}
+	ownedMailboxes := func() int {
+		var n int
+		require.NoError(t, db.GetWritePool().QueryRow(ctx,
+			`SELECT count(*) FROM mailboxes WHERE account_id = $1`, f.deletedID).Scan(&n))
+		return n
+	}
+	legacyLive := func() bool {
+		var live bool
+		require.NoError(t, db.GetWritePool().QueryRow(ctx,
+			`SELECT expunged_at IS NULL FROM messages WHERE id = $1`, f.legacyID).Scan(&live))
+		return live
+	}
+
+	require.Contains(t, listed(), f.deletedID, "a soft-deleted account owning a mailbox is listed")
+
+	// Run steps until the account owns no mailbox, then stop between steps.
+	for steps := 0; ownedMailboxes() > 0; steps++ {
+		require.Less(t, steps, 20, "the hard delete must terminate")
+		require.False(t, step(), "a step that removed a mailbox is not done")
+	}
+	require.True(t, legacyLive(), "precondition: the run stopped before the legacy row was expunged")
+
+	require.Contains(t, listed(), f.deletedID,
+		"an account still holding a live message must be listed again so the next cycle expunges it")
+	dangling, err := db.GetDanglingAccountsForFinalDeletion(ctx, 100000, marker.Add(time.Minute))
+	require.NoError(t, err)
+	require.NotContains(t, dangling, f.deletedID, "an account holding a live message cannot be finalized")
+
+	// The next cycle runs the hard delete to the end.
+	for steps := 0; !step(); steps++ {
+		require.Less(t, steps, 20, "the hard delete must terminate")
+	}
+	require.False(t, legacyLive(), "the legacy row in the shared mailbox is expunged")
+	require.NotContains(t, listed(), f.deletedID, "a hard-deleted account is not listed again")
+
+	// Once its expunged rows are reaped, the account is finalized.
+	_, err = db.GetWritePool().Exec(ctx, `DELETE FROM messages WHERE account_id = $1 AND expunged_at IS NOT NULL`, f.deletedID)
+	require.NoError(t, err)
+	dangling, err = db.GetDanglingAccountsForFinalDeletion(ctx, 100000, marker.Add(time.Minute))
+	require.NoError(t, err)
+	require.Contains(t, dangling, f.deletedID, "a hard-deleted account whose rows are reaped is finalized")
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	for {
+		n, err := db.DeleteFTSRowsForAccount(ctx, tx, f.deletedID, 100)
+		require.NoError(t, err)
+		if n == 0 {
+			break
+		}
+	}
+	n, err := db.FinalizeAccountDeletions(ctx, tx, []int64{f.deletedID})
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit(ctx))
+	require.Equal(t, int64(1), n)
+}
