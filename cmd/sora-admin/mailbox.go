@@ -266,14 +266,30 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Refuse a mailbox with children BEFORE --purge touches anything. The delete below
-	// refuses it anyway (ErrMailboxHasChildren), but the purge matches the whole subtree,
-	// so running it first would expunge every child folder's messages and then leave
-	// those folders in place, emptied.
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+
+	// Refuse INBOX, missing shared-mailbox delete permission, and mailboxes with children
+	// BEFORE --purge touches anything. The delete below refuses them anyway, so running
+	// --purge first would expunge messages and then leave the mailbox in place, emptied.
 	target, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, *mailbox)
 	if err != nil {
 		fmt.Printf("Failed to find mailbox '%s': %v\n", *mailbox, err)
 		os.Exit(1)
+	}
+	if target.AccountID == accountID && isInboxMailboxName(target.Name) {
+		fmt.Println("Failed to delete mailbox: cannot delete INBOX")
+		os.Exit(1)
+	}
+	if target.AccountID != accountID {
+		hasDeleteRight, err := rdb.CheckMailboxPermissionWithRetry(ctx, target.ID, accountID, db.ACLRightDelete)
+		if err != nil {
+			fmt.Printf("Failed to check delete permission on '%s': %v\n", *mailbox, err)
+			os.Exit(1)
+		}
+		if !hasDeleteRight {
+			fmt.Printf("Failed to delete mailbox: %v: no delete right on shared mailbox '%s'\n", consts.ErrNotPermitted, *mailbox)
+			os.Exit(1)
+		}
 	}
 	// Any live descendant, not only a direct child (HasChildren): the purge also reaches
 	// a live grandchild under a mailbox an earlier build tombstoned.
@@ -292,7 +308,7 @@ Examples:
 	if *purge {
 		fmt.Printf("Purging all messages from mailbox '%s'...\n", *mailbox)
 
-		err = purgeMailboxMessages(ctx, rdb, accountID, *mailbox)
+		err = purgeResolvedMailboxMessages(ctx, rdb, target)
 		if err != nil {
 			fmt.Printf("Failed to purge messages: %v\n", err)
 			os.Exit(1)
@@ -375,10 +391,16 @@ Examples:
 		os.Exit(1)
 	}
 
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+
 	// Get the mailbox to rename
 	mbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, *oldName)
 	if err != nil {
 		fmt.Printf("Failed to find mailbox '%s': %v\n", *oldName, err)
+		os.Exit(1)
+	}
+	if mbox.AccountID == accountID && isInboxMailboxName(mbox.Name) {
+		fmt.Println("Failed to rename mailbox: cannot rename INBOX")
 		os.Exit(1)
 	}
 
@@ -1070,6 +1092,24 @@ For more information on a subcommand, run:
   sora-admin mailbox <subcommand> --help`)
 }
 
+// isInboxMailboxName reports whether stored, a mailbox name resolved from the database,
+// is "INBOX" in any case of its ASCII letters.
+func isInboxMailboxName(stored string) bool {
+	if len(stored) != len(consts.MailboxInbox) {
+		return false
+	}
+	for i := 0; i < len(stored); i++ {
+		c := stored[i]
+		if 'a' <= c && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if c != consts.MailboxInbox[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // purgeMailboxMessages expunges all messages of a mailbox and its children. The cleaner
 // deletes the rows and their S3 objects after the grace period, so no S3 client is needed.
 func purgeMailboxMessages(ctx context.Context, rdb *resilient.ResilientDatabase, accountID int64, mailboxName string) error {
@@ -1078,9 +1118,12 @@ func purgeMailboxMessages(ctx context.Context, rdb *resilient.ResilientDatabase,
 	if err != nil {
 		return fmt.Errorf("failed to get mailbox: %w", err)
 	}
+	return purgeResolvedMailboxMessages(ctx, rdb, mbox)
+}
 
-	// Get all messages for this mailbox and its children by querying messages with matching path
-	messages, err := rdb.GetMessagesForMailboxAndChildren(ctx, accountID, mbox.ID, mbox.Path)
+func purgeResolvedMailboxMessages(ctx context.Context, rdb *resilient.ResilientDatabase, mbox *db.DBMailbox) error {
+	// Get all messages for this mailbox and its children under the mailbox owner's account.
+	messages, err := rdb.GetMessagesForMailboxAndChildren(ctx, mbox.AccountID, mbox.ID, mbox.Path)
 	if err != nil {
 		return fmt.Errorf("failed to get messages for purge: %w", err)
 	}
