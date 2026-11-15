@@ -45,6 +45,10 @@ import (
 var (
 	// ErrCacheMiss indicates the requested entry was not found in cache.
 	ErrCacheMiss = errors.New("auth cache miss")
+
+	// errNotAFile refuses an in-memory or temporary database. It is not corruption:
+	// deleting the files named after the path and opening it again cannot help.
+	errNotAFile = errors.New("an in-memory or temporary database does not persist")
 )
 
 // Cache provides persistent authentication cache using SQLite.
@@ -111,8 +115,8 @@ func New(dbPath string, maxAge, purgeUnused, cleanupInterval time.Duration) (*Ca
 // and read-only errors must be surfaced so an operator can fix them rather than
 // being silently (and futilely) "recreated".
 func isCorruptionError(err error) bool {
-	// Filesystem/access problems are never corruption.
-	if errors.Is(err, fs.ErrPermission) || errors.Is(err, fs.ErrNotExist) {
+	// Filesystem/access problems, and a database that is not a file, are never corruption.
+	if errors.Is(err, fs.ErrPermission) || errors.Is(err, fs.ErrNotExist) || errors.Is(err, errNotAFile) {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
@@ -178,7 +182,7 @@ func openAndValidate(dbPath string) (*sql.DB, error) {
 	}
 	if file == "" {
 		sqliteDB.Close()
-		return nil, fmt.Errorf("%q is not a database file: an in-memory or temporary database does not persist", dbPath)
+		return nil, fmt.Errorf("%q is not a file: %w", dbPath, errNotAFile)
 	}
 
 	// Set pragmas for performance
