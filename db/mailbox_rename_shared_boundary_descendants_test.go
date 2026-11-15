@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,10 +37,18 @@ func TestRenameMailbox_SharedBoundaryDescendants(t *testing.T) {
 		t.Helper()
 		mbox, err := db.GetMailboxByName(ctx, accountID, oldName)
 		require.NoError(t, err)
+		// Under the parent of the new name, as IMAP RENAME links it: a nil parent
+		// would move the mailbox to the top level.
+		var parentID *int64
+		if i := strings.LastIndex(newName, "/"); i >= 0 {
+			parent, err := db.GetMailboxByName(ctx, accountID, newName[:i])
+			require.NoError(t, err)
+			parentID = &parent.ID
+		}
 		tx, err := db.GetWritePool().Begin(ctx)
 		require.NoError(t, err)
 		defer tx.Rollback(ctx)
-		if err := db.RenameMailbox(ctx, tx, mbox.ID, accountID, newName, nil); err != nil {
+		if err := db.RenameMailbox(ctx, tx, mbox.ID, accountID, newName, parentID); err != nil {
 			return err
 		}
 		return tx.Commit(ctx)
