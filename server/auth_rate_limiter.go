@@ -654,6 +654,14 @@ func (a *AuthRateLimiter) clearFailureTracking(ip string) {
 	shared := tracked && info.shared
 	a.dropIPCounter(ip)
 	delete(a.blockedIPs, ip)
+	// A count another listener sent before this success may still be on its way
+	// here. It is the older of the two, and the listener that sent it drops it
+	// when the success reaches it (handleIPSuccess), so it must not bring the
+	// count back here either. Marked under ipMu, where handleFailureCount checks
+	// it, as handleIPSuccess does.
+	if shared && a.clusterLimiter != nil && a.clusterLimiter.syncFailureCounts {
+		a.clusterLimiter.ipSucceeded.mark(ip, clearedAt)
+	}
 	a.ipMu.Unlock()
 	logger.Debug("Auth limiter: Cleared failure tracking after successful login", "protocol", a.protocol, "ip", ip)
 
