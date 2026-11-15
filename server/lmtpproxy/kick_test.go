@@ -19,19 +19,21 @@ import (
 )
 
 // TestKickClosesLMTPSession drives the command loop of #1237: one LMTP
-// connection delivers to two accounts, then one account is kicked through the
-// proxy's tracker, as POST /admin/connections/kick does. The kick must close the
-// session whichever of its recipients the account is, release every account the
-// session counted, and leave a session that delivers to other accounts alone.
+// connection delivers to two accounts, then accounts are kicked through the
+// proxy's tracker, as POST /admin/connections/kick does. The kick must send a 421
+// and close the session whichever of its recipients the account is (or both),
+// release every account the session counted, and leave a session that delivers
+// to other accounts alone.
 func TestKickClosesLMTPSession(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
-		kick   string
+		kick   []string
 		closed bool
 	}{
-		{name: "first recipient", kick: "first@example.com", closed: true},
-		{name: "last recipient", kick: "second@example.com", closed: true},
-		{name: "other account", kick: "other@example.com", closed: false},
+		{name: "first recipient", kick: []string{"first@example.com"}, closed: true},
+		{name: "last recipient", kick: []string{"second@example.com"}, closed: true},
+		{name: "both recipients", kick: []string{"first@example.com", "second@example.com"}, closed: true},
+		{name: "other account", kick: []string{"other@example.com"}, closed: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -113,8 +115,10 @@ func TestKickClosesLMTPSession(t *testing.T) {
 			require("RCPT TO:<first@example.com>", "250")
 			require("RCPT TO:<second@example.com>", "250")
 
-			if err := tracker.KickUser(proxy.DeriveAccountIDFromEmail(tc.kick), "LMTP"); err != nil {
-				t.Fatalf("KickUser: %v", err)
+			for _, address := range tc.kick {
+				if err := tracker.KickUser(proxy.DeriveAccountIDFromEmail(address), "LMTP"); err != nil {
+					t.Fatalf("KickUser: %v", err)
+				}
 			}
 
 			finished := func() bool {
@@ -133,13 +137,16 @@ func TestKickClosesLMTPSession(t *testing.T) {
 				}
 				return
 			}
-			if !finished() {
-				t.Fatalf("the LMTP session of %s is still open 3s after its kick", tc.kick)
+			// RFC 5321 section 3.8: the server closes the connection on purpose only
+			// after a 421.
+			if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "421 ") {
+				t.Fatalf("after the kick of %v the client read %q (%v), want a 421", tc.kick, line, err)
 			}
-			if _, err := fmt.Fprint(front, "NOOP\r\n"); err == nil {
-				if line, err := reader.ReadString('\n'); err == nil {
-					t.Fatalf("NOOP after the kick answered %q, want the connection closed", line)
-				}
+			if !finished() {
+				t.Fatalf("the LMTP session of %v is still open 3s after its kick", tc.kick)
+			}
+			if line, err := reader.ReadString('\n'); err == nil {
+				t.Fatalf("after the 421 the client read %q, want the connection closed", line)
 			}
 			if f, s := tracker.GetLocalConnectionCount(first), tracker.GetLocalConnectionCount(second); f != 0 || s != 0 {
 				t.Fatalf("counts after the kick: first=%d second=%d, want 0 0", f, s)

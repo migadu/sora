@@ -30,7 +30,7 @@ type Session struct {
 	listenerConn          net.Conn            // The accepted connection, never reassigned: its SoraConn carries the JA4 and username, which the TLS conn above it after STARTTLS does not
 	startTLSInProgress    bool                // Between the 220 to STARTTLS and the end of its handshake, under mu: the client reads neither plaintext nor, yet, TLS
 	greeted               bool                // The 220 greeting has been written, under mu: before it the implicit-TLS handshake may be pending, and a notice written then would wait for it
-	noticeMu              sync.Mutex          // Orders the greeting and shutdown notice with STARTTLS, without holding mu during socket writes
+	noticeMu              sync.Mutex          // Orders the greeting and the shutdown and kick notices with STARTTLS, without holding mu during socket writes
 	backendConn           net.Conn            // Reassigned under mu on backend connect/STARTTLS/error; shutdown/cancellation snapshot it under mu
 	backendRoute          *proxy.BackendRoute // Authorization of the held socket; survives per-recipient routing and transaction resets
 	backendReader         *bufio.Reader
@@ -1760,19 +1760,45 @@ func (s *Session) registerConnection() error {
 	return nil
 }
 
+// kickNoticeTimeout bounds the write of the 421 a kick sends before it closes
+// the session, as the shutdown notice is bounded, for a client that stops reading.
+const kickNoticeTimeout = time.Second
+
 // watchKick ends the session when the tracker kicks accountID (it closes kick),
 // whichever of the session's recipients the account is, and returns with the
-// session otherwise. Cancelling the session context closes the client and
-// backend transports (handleConnection); the MTA retries whatever it had not
-// been told was delivered. It does not log: the session logger reads fields
-// the command loop writes, so close() reports the kick.
+// session otherwise. The kick is an intentional close, which RFC 5321 section
+// 3.8 (LMTP is SMTP there, RFC 2033 section 4) allows only after a 421, sent
+// "asynchronously from command receipt" if need be: watchKick writes it the way
+// the shutdown notice does, then cancels the session context, which closes the
+// client and backend transports (handleConnection). The MTA retries whatever it
+// had not been told was delivered. It does not log: the session logger reads
+// fields the command loop writes, so close() reports the kick.
 func (s *Session) watchKick(accountID int64, kick <-chan struct{}) {
 	select {
 	case <-kick:
-		s.kickedAccountID.CompareAndSwap(0, accountID)
-		s.cancel()
 	case <-s.ctx.Done():
+		return
 	}
+	if !s.kickedAccountID.CompareAndSwap(0, accountID) {
+		return // another of the session's accounts was kicked: that watcher ends it
+	}
+
+	// noticeMu orders the notice with STARTTLS and the shutdown notice: no
+	// plaintext 421 after the reply that makes the client expect TLS, and none
+	// after the shutdown's own 421.
+	s.noticeMu.Lock()
+	s.mu.Lock()
+	conn := s.clientConn
+	ready := s.greeted && !s.startTLSInProgress && !s.gracefulShutdown
+	s.mu.Unlock()
+	if conn != nil && ready {
+		if err := conn.SetWriteDeadline(time.Now().Add(kickNoticeTimeout)); err == nil {
+			fmt.Fprint(conn, "421 4.3.2 Service closing connection\r\n")
+		}
+	}
+	s.noticeMu.Unlock()
+
+	s.cancel()
 }
 
 func isClosingError(err error) bool {
