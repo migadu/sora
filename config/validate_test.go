@@ -88,6 +88,20 @@ func TestConfigValidate(t *testing.T) {
 		{name: "cluster secret_key of 16 bytes", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"MDEyMzQ1Njc4OWFiY2RlZg==\"\n" + imapBackend,
 			want: []problem{{"[cluster]", "cluster secret_key must be 32 bytes (got 16 bytes)"}}},
 		{name: "cluster disabled is not checked", content: "[cluster]\nenabled = false\naddr = \"0.0.0.0:7946\"\n" + imapBackend},
+		// memberlist cannot bind these either, and start-up stopped there only once the
+		// database and S3 were up. Port 0 binds a free port, which memberlist advertises.
+		{name: "cluster dynamic port", content: cluster + "addr = \"10.10.10.40:0\"\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend},
+		{name: "cluster port in addr out of range", content: cluster + "addr = \"10.10.10.40:70000\"\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend,
+			want: []problem{{"[cluster]", "cluster port 70000 is not a valid port"}}},
+		{name: "cluster negative port in addr", content: cluster + "addr = \"10.10.10.40:-1\"\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend,
+			want: []problem{{"[cluster]", "cluster port -1 is not a valid port"}}},
+		{name: "cluster port field out of range", content: cluster + "addr = \"10.10.10.40\"\nport = 70000\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend,
+			want: []problem{{"[cluster]", "cluster port 70000 is not a valid port"}}},
+		// A negative port key bound the default 7946 instead of being refused.
+		{name: "cluster negative port field", content: cluster + "addr = \"10.10.10.40\"\nport = -1\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend,
+			want: []problem{{"[cluster]", "cluster port -1 is not a valid port"}}},
+
+		{name: "cluster port overflow", content: cluster + "addr = \"10.10.10.40:999999999999999999999999999999\"\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend, want: []problem{{"[cluster]", `cluster port "999999999999999999999999999999" is not a valid port`}}},
 		{name: "every problem, in order", content: "[servers]\ntrusted_networks = []\n\n[relay]\ntype = \"SMTP\"\n\n[uploader]\nbatch_size = 0\n" +
 			imapBackend + "proxy_protocol = true\n" + imapBackend,
 			want: []problem{

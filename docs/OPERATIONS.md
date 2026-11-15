@@ -95,6 +95,14 @@ Sora starts in this order. A failure in any step ends the process with status 1,
    - A listener with `proxy_protocol = true` requires a non-empty `[servers] trusted_networks`.
    - Two `[[server]]` blocks may not share a `name` or an `addr`.
    - At least one `[[server]]` block must exist.
+   - A server that queries the database needs a `[database.write]` host (step 9.2 says which do).
+   - A node that uses S3 needs `[s3] bucket` and `endpoint`, a `timeout` that parses, `access_key`
+     and `secret_key` both set or both empty, and with `encrypt = true` a valid `encryption_key`.
+   - With `[cluster] enabled = true`, `addr` must be a specific IP address with a port memberlist can
+     bind, and `secret_key` the base64 of 32 bytes ([CLUSTER.md](CLUSTER.md)).
+   - The other checks of [CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup), such as
+     `[relay]`, `[relay.queue]`, `[uploader]` and `[cleanup]`. Every problem found is reported
+     before Sora exits.
 4. **Database endpoints.** A `[database.write]` or `[database.read]` section that is not in the file
    counts as not configured. This is how a proxy-only node runs without a database.
 5. **Global settings.** `bcrypt_cost` and `[sieve] max_execution_time` are applied.
@@ -110,11 +118,12 @@ Sora starts in this order. A failure in any step ends the process with status 1,
       PostgreSQL. A node with `managesieve`, `http_admin_api` or `http_user_api` needs PostgreSQL,
       and `http_user_api` also uses S3 to serve message bodies. A proxy needs PostgreSQL when it
       checks passwords in the database (no remote lookup, or
-      `[server.remote_lookup] lookup_local_users = true`). A database that is needed but not
-      configured stops startup.
-   3. **S3**, when needed: `[s3] access_key`, `secret_key`, `bucket` and `endpoint` must be set. Sora
-      does not contact S3 here and does not create the bucket. With `[s3] encrypt = true` the
-      encryption key is checked (64 hex characters).
+      `[server.remote_lookup] lookup_local_users = true`). Step 3 has checked that what it needs is
+      configured.
+   3. **S3**, when needed: the client is set up with `[s3] endpoint` and `bucket`. Without
+      `access_key` and `secret_key` the AWS default credential chain must supply them. Sora does not
+      contact S3 here and does not create the bucket. With `[s3] encrypt = true` the encryption key
+      is checked (64 hex characters).
    4. **PostgreSQL**, when needed: Sora connects to every write host, applies pending migrations
       through the first one it can reach ([Database migrations](#10-database-migrations)), and
       connects to the read hosts. A failed migration stops startup. Hosts that fail, read or write,
