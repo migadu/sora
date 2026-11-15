@@ -96,7 +96,7 @@ func handleConfigValidate(_ context.Context) {
 
 	fmt.Printf("Validating configuration file: %s\n\n", configFile)
 
-	// Load full configuration as the server does - this will show all warnings
+	// Load the file as the server does, which reports unknown and duplicate keys.
 	var cfg config.Config
 	if err := config.LoadServerConfig(configFile, &cfg); err != nil {
 		fmt.Printf("[FAIL] Configuration validation FAILED:\n")
@@ -114,7 +114,9 @@ func handleConfigValidate(_ context.Context) {
 		os.Exit(1)
 	}
 
-	// The warnings start-up logs about the file. They do not fail it.
+	// The warnings start-up logs about [[server]] keys a server type does not apply, and
+	// about an imap or pop3 session_memory_limit below an lmtp max_message_size. They do
+	// not fail the file.
 	allServers := cfg.GetAllServers()
 	for _, server := range allServers {
 		server.WarnUnusedConfigOptions(func(format string, args ...any) {
