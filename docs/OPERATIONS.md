@@ -422,6 +422,16 @@ of them, and exits with status 1. Either set `[uploader] path = "/tmp/sora/uploa
 directory to `/var/spool/sora/uploads`. `sora-admin uploader resolve` refuses to run in the same
 case.
 
+The check sees only the `/tmp` Sora runs with. Under `PrivateTmp=true`, as in `dist/sora.service`,
+that is a new, empty directory at every start, not the host's `/tmp`: a node that staged bodies in
+the host's `/tmp/sora/uploads` starts under such a unit without the check finding them. Move that
+directory to `/var/spool/sora/uploads` before the node first starts under the unit, and never set
+`[uploader] path` to a path under `/tmp` there: systemd deletes the private `/tmp` at every stop.
+
+An older release that defaults `[uploader] path` to `/tmp/sora/uploads` has no such check and does
+not look in `/var/spool/sora/uploads`: before rolling back to one, set the path explicitly
+([Rolling back](#rolling-back)).
+
 ---
 
 ## 6. What Sora writes to local disk
@@ -792,6 +802,11 @@ property of each release, so the release notes are the place to look.
 - **Restore.** Restore the database backup taken before the upgrade
   ([Backups and restores](#13-backups-and-restores)). Mail delivered since then is lost from the
   database.
+
+On a node whose config does not set `[uploader] path`, check the old binary's default first.
+Releases that default it to `/tmp/sora/uploads` do not look in `/var/spool/sora/uploads`, where the
+newer binary staged the bodies not yet in S3: set `[uploader] path = "/var/spool/sora/uploads"`
+before the old binary starts ([What a restart loses and keeps](#5-what-a-restart-loses-and-keeps)).
 
 ---
 
