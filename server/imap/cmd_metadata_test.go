@@ -3,6 +3,7 @@ package imap
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/migadu/go-imap"
@@ -113,6 +114,46 @@ func TestSetMetadataSameEntryInTwoCasesIsBAD(t *testing.T) {
 			if imapErr.Type != imap.StatusResponseTypeBad || imapErr.Code != imap.ResponseCodeClientBug {
 				t.Errorf("SetMetadata(%q, %q) answered %s [%s], want BAD [CLIENTBUG]", mailbox, names, imapErr.Type, imapErr.Code)
 			}
+		}
+	}
+}
+
+// RFC 5464 §5: "entries = entry / "(" entry *(SP entry) ")"" and
+// "entry-values = "(" entry-value *(SP entry-value) ")"": both lists name at
+// least one entry, so GETMETADATA and SETMETADATA with "()" are malformed, and
+// §4.2 and §4.3 answer "BAD - command unknown or arguments invalid". go-imap's
+// parser accepts "()" and hands the session no entries. The test session has
+// no database: a handler that does not refuse the command up front panics on it.
+func TestMetadataEmptyEntryListIsBAD(t *testing.T) {
+	srv := newDisabledCapsTestServer(t, IMAPServerOptions{})
+	s := newDisabledCapsTestSession(srv)
+	if !s.GetCapabilities().Has(imap.CapMetadata) {
+		t.Fatal("test server does not offer METADATA")
+	}
+
+	wantBAD := func(call string, err error) {
+		t.Helper()
+		var imapErr *imap.Error
+		if !errors.As(err, &imapErr) {
+			t.Errorf("%s = %v, want BAD [CLIENTBUG]", call, err)
+			return
+		}
+		if imapErr.Type != imap.StatusResponseTypeBad || imapErr.Code != imap.ResponseCodeClientBug {
+			t.Errorf("%s answered %s [%s], want BAD [CLIENTBUG]", call, imapErr.Type, imapErr.Code)
+		}
+	}
+
+	for _, mailbox := range []string{"", "INBOX"} {
+		for _, entries := range []map[string]*[]byte{nil, {}} {
+			err := callHandler(func() error { return s.SetMetadata(context.Background(), mailbox, entries) })
+			wantBAD(fmt.Sprintf("SetMetadata(%q, %#v)", mailbox, entries), err)
+		}
+		for _, entries := range [][]string{nil, {}} {
+			err := callHandler(func() error {
+				_, err := s.GetMetadata(context.Background(), mailbox, entries, nil)
+				return err
+			})
+			wantBAD(fmt.Sprintf("GetMetadata(%q, %#v)", mailbox, entries), err)
 		}
 	}
 }

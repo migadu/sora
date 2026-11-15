@@ -127,10 +127,10 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 		args[param] = criteria.Before
 		conditions = append(conditions, fmt.Sprintf("%sinternal_date < @%s", datePrefix, param))
 	}
-	// SENTSINCE / SENTBEFORE compare the day of the Date: header in its own zone (#867). The
-	// test looks the row up by its id, which is ambiguous unqualified in the legacy seqnum
-	// statement (message_seqs has one too); that statement passes no prefix, but it too
-	// names its messages row m.
+	// SENTSINCE / SENTBEFORE compare the day of the Date: header in its own zone (#867), and
+	// match only a message that has one (#1118). The test looks the row up by its id, which
+	// is ambiguous unqualified in the legacy seqnum statement (message_seqs has one too);
+	// that statement passes no prefix, but it too names its messages row m.
 	sentAlias := tablePrefix
 	if sentAlias == "" {
 		sentAlias = "m"
@@ -140,6 +140,9 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 	}
 	if !criteria.SentBefore.IsZero() {
 		conditions = append(conditions, sentDayCond(sentAlias, "<", criteria.SentBefore, args, nextParam))
+	}
+	if !criteria.SentSince.IsZero() || !criteria.SentBefore.IsZero() {
+		conditions = append(conditions, sentDateKnownCond(sentAlias))
 	}
 
 	// Message size
@@ -424,6 +427,21 @@ func sentDayCond(alias, op string, day time.Time, args pgx.NamedArgs, nextParam 
 	headerTime := fmt.Sprintf("%[1]s.sent_date + make_interval(secs => COALESCE(message_sent_utc_offset(%[1]s.id), 0))", alias)
 	return fmt.Sprintf("(%[1]s.sent_date %[2]s @%[3]s OR (%[1]s.sent_date %[2]s @%[4]s AND %[5]s %[2]s @%[6]s))",
 		alias, op, sureParam, edgeParam, headerTime, dayParam)
+}
+
+// sentDateKnownCond holds for a message that has a Date: header, the only kind the SENTBEFORE,
+// SENTON and SENTSINCE keys can match (RFC 9051 §6.4.4: "Messages whose [RFC5322] Date: header
+// field ..."). A message without one that parses keeps its INTERNALDATE in sent_date, as SORT
+// and THREAD need (RFC 5256 §2.2), and is marked sent_date_unknown (migration 000061); a row
+// written before that migration cannot be told apart and still counts as dated.
+//
+// Like sent_utc_offset (see sentDayCond), sent_date_unknown is not in the header covering
+// index, so the test must not read it from the messages row. The partial index (migration
+// 000062) permits an anti-join or an indexed lookup. NOT IN can instead rescan a materialized
+// ID list per candidate when that set outgrows work_mem. It names the mailbox @mailboxID,
+// which every statement that takes search criteria binds.
+func sentDateKnownCond(alias string) string {
+	return "NOT EXISTS (SELECT 1 FROM messages nd WHERE nd.mailbox_id = @mailboxID AND nd.id = " + alias + ".id AND nd.sent_date_unknown AND nd.expunged_at IS NULL)"
 }
 
 // buildSortOrderClause builds an SQL ORDER BY clause from IMAP sort criteria
