@@ -421,7 +421,11 @@ field `uploader path`, with an error that begins
 of them, and exits with status 1. Either set `[uploader] path = "/tmp/sora/uploads"` until
 `sora-admin uploader status` shows nothing pending and then remove it, or stop Sora and move that
 directory to `/var/spool/sora/uploads`. `sora-admin uploader resolve` refuses to run in the same
-case.
+case. At startup only entries of the user Sora runs as, or of root, count: any local user can
+write to `/tmp`, so an entry there that belongs to another user, or that Sora cannot read, is
+logged as a warning (`Uploader: ignoring an entry under the previous default [uploader] path ...`)
+and passed over with everything below it. `resolve`, often run as root, cannot tell which user
+the server runs as: it counts every entry and refuses when it cannot read one.
 
 Check the host's old spool before the first start with the new systemd unit. Its
 [`PrivateTmp=true`](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#PrivateTmp=)

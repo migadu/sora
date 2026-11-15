@@ -6,6 +6,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
+
+	"github.com/migadu/sora/logger"
 )
 
 // AnyOwner, as the uid for CheckLegacyStaging, is for a caller that does not run as the
@@ -25,26 +28,70 @@ func sameStagedFile(legacyFile, activeFile string) bool {
 	return os.SameFile(legacyInfo, activeInfo)
 }
 
+// spoolError returns nil for an error that means the legacy spool entry at p holds no
+// body staged as uid: it is gone, or, unless uid is AnyOwner, this process cannot read
+// it, which it logs. Otherwise it returns err.
+func spoolError(p string, err error, uid int) error {
+	if errors.Is(err, fs.ErrPermission) && uid != AnyOwner {
+		logger.Warn("Uploader: ignoring an entry under the previous default [uploader] path that this process cannot read", "path", p, "error", err)
+		return nil
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+// foreignEntry reports, and logs, that the legacy spool entry info describes belongs to
+// a user other than root and uid, unless uid is AnyOwner. The uploader stages as the user
+// it runs as, so no such entry is a body it staged, while /tmp lets every local user
+// create one. Root is trusted: an administrator's link or directory is followed.
+func foreignEntry(p string, info fs.FileInfo, uid int) bool {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || uid == AnyOwner || st.Uid == 0 || int(st.Uid) == uid {
+		return false
+	}
+	logger.Warn("Uploader: ignoring an entry under the previous default [uploader] path that belongs to another user", "path", p, "uid", st.Uid)
+	return true
+}
+
+// walkSpool is filepath.WalkDir over a legacy spool directory that passes over what
+// spoolError and foreignEntry rule out, with the directory below it, so fn sees only
+// entries of uid or root that this process can read. A symlink's own owner counts: fn
+// follows only a link that user or root made.
+func walkSpool(root string, uid int, fn func(p string, d fs.DirEntry) error) error {
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		var info fs.FileInfo
+		if err == nil {
+			info, err = d.Info()
+		}
+		if err != nil {
+			return spoolError(p, err, uid)
+		}
+		if foreignEntry(p, info, uid) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		return fn(p, d)
+	})
+}
+
 // firstStagedBody checks physical targets once each. It is used for a cyclic alias:
 // an empty cycle strands nothing, but a nonempty one must not hide a body just because
 // its target was already visited under a different account path.
-func firstStagedBody(entryPath string) (string, error) {
+func firstStagedBody(entryPath string, uid int) (string, error) {
 	visited := make(map[string]bool)
 	var walk func(string) (string, error)
 	walk = func(entryPath string) (string, error) {
 		root, err := filepath.EvalSymlinks(entryPath)
-		if errors.Is(err, fs.ErrNotExist) {
-			return "", nil
-		}
 		if err != nil || visited[root] {
-			return "", err
+			return "", spoolError(entryPath, err, uid)
 		}
 		visited[root] = true
 		found := ""
-		err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
+		err = walkSpool(root, uid, func(p string, d fs.DirEntry) error {
 			rel, err := filepath.Rel(root, p)
 			if err != nil {
 				return err
@@ -76,8 +123,11 @@ func firstStagedBody(entryPath string) (string, error) {
 // a message until it reaches S3.
 //
 // uid is the user bodies were staged as: the server passes its own, as its uploader
-// stages as the user it runs as. A caller that cannot tell which user the server runs as
-// passes AnyOwner.
+// stages as the user it runs as. Every local user can create the legacy default under
+// /tmp, so an entry that belongs to another user (root aside), or that this process
+// cannot read, is logged and passed over with what is below it: otherwise any local user
+// could keep the server from starting. A caller that cannot tell which user the server
+// runs as passes AnyOwner, and refuses on such entries rather than miss a staged body.
 func CheckLegacyStaging(path, newDefault, legacyPath string, uid int) error {
 	if filepath.Clean(path) != filepath.Clean(newDefault) {
 		return nil
@@ -97,11 +147,9 @@ func CheckLegacyStaging(path, newDefault, legacyPath string, uid int) error {
 	var walk func(entryPath, logicalRel string) (bool, error)
 	walk = func(entryPath, logicalRel string) (bool, error) {
 		root, err := filepath.EvalSymlinks(entryPath)
-		if errors.Is(err, fs.ErrNotExist) {
-			return false, nil // A missing directory or dangling link holds no body.
-		}
 		if err != nil {
-			return false, err
+			// A missing directory or dangling link holds no body.
+			return false, spoolError(entryPath, err, uid)
 		}
 		// Identical physical subtrees make every relative body path reachable under
 		// the active spool, without inspecting the subtree's files individually.
@@ -113,7 +161,7 @@ func CheckLegacyStaging(path, newDefault, legacyPath string, uid int) error {
 		}
 		if ancestors[root] {
 			var err error
-			found, err = firstStagedBody(entryPath)
+			found, err = firstStagedBody(entryPath, uid)
 			if err == nil && found == "" {
 				empty[root] = true
 			}
@@ -123,10 +171,7 @@ func CheckLegacyStaging(path, newDefault, legacyPath string, uid int) error {
 		defer delete(ancestors, root)
 
 		sawRegularOrCycle := false
-		err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
+		err = walkSpool(root, uid, func(p string, d fs.DirEntry) error {
 			curRel := logicalRel
 			if p != root {
 				subRel, relErr := filepath.Rel(root, p)
@@ -159,11 +204,12 @@ func CheckLegacyStaging(path, newDefault, legacyPath string, uid int) error {
 		}
 		return sawRegularOrCycle, err
 	}
-	_, err := walk(legacyPath, "")
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
+	// walkSpool checks the entries it visits; the legacy path itself may be a link.
+	info, err := os.Lstat(legacyPath)
+	if err == nil && !foreignEntry(legacyPath, info, uid) {
+		_, err = walk(legacyPath, "")
 	}
-	if err != nil {
+	if err = spoolError(legacyPath, err, uid); err != nil {
 		return fmt.Errorf("cannot check %s for bodies staged under the previous default [uploader] path: %w", legacyPath, err)
 	}
 	if found == "" {

@@ -721,9 +721,10 @@ that owns the uploads, with its own config file. Always look at a `--dry-run` fi
 
 With the default `[uploader] path`, `resolve`, `--dry-run` included, refuses to run while
 `/tmp/sora/uploads`, the default of earlier releases, still holds staged bodies: they are not in
-the spool it checks, so `[DELETE]` would take them for lost. It fails with
-`Failed to resolve uploads:` and the error the server stops with at startup
-([OPERATIONS.md](OPERATIONS.md#5-what-a-restart-loses-and-keeps)).
+the spool it checks, so `[DELETE]` would take them for lost. Unlike the server, it counts a file
+there whoever owns it, and refuses when it cannot read a directory there: it cannot tell which
+user the server stages as. It fails with `Failed to resolve uploads:` and an error that names
+the old spool ([OPERATIONS.md](OPERATIONS.md#5-what-a-restart-loses-and-keeps)).
 
 ---
 
