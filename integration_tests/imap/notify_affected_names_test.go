@@ -34,10 +34,8 @@ func TestNotifyMailboxNameAffectedNames(t *testing.T) {
 	rec := newNotifyRecorder()
 	watcher := notifyLoginAndSelect(t, server.Address, account, rec.options(), "")
 	defer watcher.Logout()
-	// OLDNAME is sent to IMAP4rev2 clients only.
-	if _, err := watcher.Enable(imap.CapIMAP4rev2).Wait(); err != nil {
-		t.Fatalf("Enable(IMAP4rev2) = %v", err)
-	}
+	// No ENABLE IMAP4rev2: a NOTIFY LIST carries OLDNAME for every client,
+	// which the check on Attic/Old below holds.
 	cmd, err := watcher.Notify(&imap.NotifyOptions{
 		Items: []imap.NotifyItem{{
 			MailboxSpec: imap.NotifyMailboxSpecPersonal,
