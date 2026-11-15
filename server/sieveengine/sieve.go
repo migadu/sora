@@ -676,6 +676,27 @@ func lowerASCII(s string) string {
 	return string(b)
 }
 
+// equalFoldASCII reports whether two header names are equal under
+// i;ascii-casemap, as lowerASCII folds them, without allocating.
+func equalFoldASCII(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if 'A' <= ca && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if 'A' <= cb && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
+}
+
 func (m *SieveMessage) MessageSize() int {
 	return m.Size
 }
@@ -736,44 +757,7 @@ func ApplyHeaderEdits(messageBytes []byte, edits []HeaderEdit) ([]byte, error) {
 			}
 
 		case "delete":
-			if edit.Index > 0 {
-				// Delete specific index
-				values := entity.Header.Values(edit.FieldName)
-				if len(values) == 0 {
-					continue
-				}
-
-				idx := edit.Index - 1
-				if edit.Last {
-					idx = len(values) - edit.Index
-				}
-
-				if idx >= 0 && idx < len(values) {
-					entity.Header.Del(edit.FieldName)
-					for i, v := range values {
-						if i != idx {
-							entity.Header.Add(edit.FieldName, v)
-						}
-					}
-				}
-
-			} else if edit.Value != "" {
-				// Delete first occurrence matching value
-				values := entity.Header.Values(edit.FieldName)
-				entity.Header.Del(edit.FieldName)
-				deleted := false
-				for _, v := range values {
-					if !deleted && v == edit.Value {
-						deleted = true
-						continue
-					}
-					entity.Header.Add(edit.FieldName, v)
-				}
-
-			} else {
-				// Delete all occurrences
-				entity.Header.Del(edit.FieldName)
-			}
+			deleteHeaderFields(&entity.Header, edit)
 		}
 	}
 
@@ -784,6 +768,47 @@ func ApplyHeaderEdits(messageBytes []byte, edits []HeaderEdit) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+// deleteHeaderFields removes the fields a deleteheader edit selects: with
+// :index the Index-th named field from the top (from the bottom with :last),
+// with a Value the first named field holding it, otherwise every named field.
+// "The field-name is mandatory and always matched as a case-insensitive
+// US-ASCII string" (RFC 5293 §5), so the names are compared over the field
+// list: go-message's Header.Values and Header.Del canonicalize a name only when
+// all its bytes are token characters, and miss "X(a" for "x(A".
+func deleteHeaderFields(h *message.Header, edit HeaderEdit) {
+	target := edit.Index
+	if edit.Index > 0 && edit.Last {
+		n := 0
+		for fields := h.Fields(); fields.Next(); {
+			if equalFoldASCII(fields.Key(), edit.FieldName) {
+				n++
+			}
+		}
+		target = n - edit.Index + 1
+	}
+	i := 0
+	for fields := h.Fields(); fields.Next(); {
+		if !equalFoldASCII(fields.Key(), edit.FieldName) {
+			continue
+		}
+		i++
+		switch {
+		case edit.Index > 0:
+			if i == target {
+				fields.Del()
+				return
+			}
+		case edit.Value != "":
+			if fields.Value() == edit.Value {
+				fields.Del()
+				return
+			}
+		default:
+			fields.Del()
+		}
+	}
 }
 
 // maxLoggedRejectReason bounds the reject reason in a log line. The reason is
