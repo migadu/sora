@@ -147,6 +147,18 @@ func (s *IMAPSession) requireFetchBinary(options *imap.FetchOptions) error {
 }
 
 func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
+	return s.fetch(ctx, w, numSet, options, nil)
+}
+
+// fetchProgress is how far a fetch got through its messages, which it answers
+// in ascending UID order.
+type fetchProgress struct {
+	answered imap.UID // the last message it wrote a response for
+	failed   imap.UID // the message it failed at, 0 if it did not fail at one
+}
+
+// fetch is Fetch, recording in progress, when it is not nil, how far it got.
+func (s *IMAPSession) fetch(ctx context.Context, w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions, progress *fetchProgress) error {
 	ctx = s.pinnedContext(ctx)
 
 	// FETCH is not wrapped by meteredSession (it self-instruments below), so the
@@ -369,8 +381,14 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 				metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
 			}
 			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID, markSeen, view.tracker, preview); err != nil {
+				if progress != nil {
+					progress.failed = msg.UID
+				}
 				writeErr = err
 				return err
+			}
+			if progress != nil {
+				progress.answered = msg.UID
 			}
 		}
 		return nil
