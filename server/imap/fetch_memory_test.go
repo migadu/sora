@@ -141,7 +141,7 @@ func TestFetch_BodySectionCopyIsCharged(t *testing.T) {
 
 	options := &imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{section}}
 	if err := fetchBodySections(s, w, &bodyData, &bodyFetched, options, fetchTestMessage(body)); err != nil {
-		t.Fatalf("handleBodySections: %v", err)
+		t.Fatalf("fetchBodySections: %v", err)
 	}
 
 	if len(w.sections) != 1 {
@@ -270,7 +270,7 @@ func TestFetch_PartialOfMalformedBodyIsSliced(t *testing.T) {
 	bodyFetched := true
 	if err := fetchBodySections(s, w, &bodyData, &bodyFetched,
 		&imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{section}}, fetchTestMessage(body)); err != nil {
-		t.Fatalf("handleBodySections: %v", err)
+		t.Fatalf("fetchBodySections: %v", err)
 	}
 	if len(w.sections) != 1 {
 		t.Fatalf("expected 1 written section, got %d", len(w.sections))
@@ -293,7 +293,7 @@ func TestFetch_FullBodyOfMalformedMessageIsVerbatim(t *testing.T) {
 	bodyFetched := true
 	if err := fetchBodySections(s, w, &bodyData, &bodyFetched,
 		&imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{{}}}, fetchTestMessage(body)); err != nil {
-		t.Fatalf("handleBodySections: %v", err)
+		t.Fatalf("fetchBodySections: %v", err)
 	}
 	if len(w.sections) != 1 {
 		t.Fatalf("expected 1 written section, got %d", len(w.sections))
