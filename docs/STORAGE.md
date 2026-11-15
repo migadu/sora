@@ -854,7 +854,7 @@ Metrics and log lines:
 | The S3 bucket | **Yes** | Every uploaded body. Use your provider's replication or versioning, or copy the bucket. |
 | `[s3] encryption_key` | **Yes, apart from the bucket** | Without it, an encrypted bucket is unreadable. |
 | The config file and TLS keys | Yes | |
-| `[uploader] path` | Keep it on durable storage instead | It holds the only copy of mail not yet in S3: normally for seconds, during an S3 outage for hours. A periodic backup of it is of little use. Do not put it on `tmpfs` or under a `/tmp` that is cleared at boot (the default is `/tmp/sora/uploads`). |
+| `[uploader] path` | Keep it on durable storage instead | It holds the only copy of mail not yet in S3: normally for seconds, during an S3 outage for hours. A periodic backup of it is of little use. Do not put it on `tmpfs` or under a `/tmp` that is cleared at boot (the default is `/var/spool/sora/uploads`). |
 | `[local_cache] path` | No | Rebuilt from S3. |
 | Auth cache, affinity cache | No | Rebuilt. See [PROXY.md](PROXY.md). |
 | `[relay.queue] path` | See [RELAY.md](RELAY.md) | Outgoing redirects and vacation replies. |
@@ -957,7 +957,7 @@ Required on every storage node.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `path` | string | `"/tmp/sora/cache"` | Cache directory. Created if missing. Put it on the same filesystem as `[uploader] path`. |
+| `path` | string | `"/var/cache/sora/cache"` | Cache directory. Created if missing. Put it on the same filesystem as `[uploader] path`. |
 | `capacity` | size | `"1gb"` | Total size the cache is kept within. |
 | `max_object_size` | size | `"5mb"` | Largest body cached, after an upload, an S3 read or a warmup. Also the default of the IMAP server's `preview_s3_max_size`. |
 | `purge_interval` | duration | `"12h"` | How often the cache is trimmed and cleaned. |
@@ -977,7 +977,7 @@ An invalid duration or size in this section is logged as a warning and the defau
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `path` | string | `"/tmp/sora/uploads"` | Staging directory for bodies not yet in S3. Must be durable. |
+| `path` | string | `"/var/spool/sora/uploads"` | Staging directory for bodies not yet in S3. Must be durable. |
 | `instance_id` | string | the hostname | The node's [instance ID](ARCHITECTURE.md#8-node-identity), the owner of its pending uploads. Unique per `sora` process, stable across restarts. |
 | `batch_size` | int | `10` | Pending rows taken per database query. Each body is still its own S3 request. Must be positive. |
 | `concurrency` | int | `20` | Uploads in flight at once. Must be positive. |
