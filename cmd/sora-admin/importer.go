@@ -1372,6 +1372,16 @@ func isMaildirFolder(path string) bool {
 	return true
 }
 
+// isMaildirMessageDir reports whether name is one of a maildir folder's message
+// directories, which hold message files and never a folder.
+func isMaildirMessageDir(name string) bool {
+	switch name {
+	case "cur", "new", "tmp":
+		return true
+	}
+	return false
+}
+
 // fileToProcess is a struct to send file info to worker goroutines for processing.
 type fileToProcess struct {
 	path        string
@@ -1515,13 +1525,16 @@ func (i *Importer) scanMaildir() error {
 			// A folder below the root that is a symbolic link is not followed either: a
 			// link to a folder of the same maildir is an alias (dsync skips those too),
 			// and one pointing elsewhere would have the import read outside the path it
-			// was given. It is named, so its mail is never left out without a word.
-			// cur/ and new/ are read through a link (os.ReadDir below).
+			// was given. It is named, so its mail is never left out without a word; so is
+			// a link whose target cannot be read (a volume that is not mounted), which
+			// may be a folder too. cur/, new/ and tmp/ and the message files in them are
+			// not folders: they are read through a link (os.ReadDir, hashFile below), and
+			// a message that cannot be read is refused by path.
 			if info.Mode()&os.ModeSymlink != 0 {
-				switch info.Name() {
-				case "cur", "new", "tmp":
-				default:
-					if target, statErr := os.Stat(walked); statErr == nil && target.IsDir() {
+				if !isMaildirMessageDir(info.Name()) && !isMaildirMessageDir(filepath.Base(filepath.Dir(walked))) {
+					if target, statErr := os.Stat(walked); statErr != nil {
+						logger.Warn("Skipping maildir entry: it is a symbolic link whose target cannot be read", "path", path, "error", statErr)
+					} else if target.IsDir() {
 						logger.Warn("Skipping maildir folder: it is a symbolic link, which the import does not follow", "path", path)
 					}
 				}
