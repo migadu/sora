@@ -415,7 +415,7 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 				Message:      "service shutting down",
 			}
 		}
-		s.WarnLog("failed to get primary email", "account_id", AccountID, "error", err)
+		s.WarnLog("failed to get primary email", "recipient_account_id", AccountID, "error", err)
 		recordMetrics("failure")
 		return &smtp.SMTPError{
 			Code:         451,
@@ -470,9 +470,9 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 
 	// Log recipient acceptance with alias detection
 	if fullAddress != primaryAddr.FullAddress() {
-		s.DebugLog("recipient accepted", "to", fullAddress, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID)
+		s.DebugLog("recipient accepted", "to", fullAddress, "primary_address", primaryAddr.FullAddress())
 	} else {
-		s.DebugLog("recipient accepted", "to", fullAddress, "account_id", AccountID)
+		s.DebugLog("recipient accepted", "to", fullAddress)
 	}
 	recordMetrics("success")
 	return nil
