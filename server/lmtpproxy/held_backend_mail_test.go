@@ -130,13 +130,9 @@ func TestHeldBackendDoesNotAnswerMAIL(t *testing.T) {
 // DATA with no recipient accepted in the transaction is answered 503 by the proxy (RFC
 // 2033 section 4.2: "when there have been no successful RCPT commands in the mail
 // transaction, the DATA command MUST fail with a 503 reply code"), as on a new
-// connection, never by a held backend, which may still hold an earlier transaction. Here
-// the MTA sends a MAIL while a transaction is open ("MAIL ... MUST NOT be sent if a mail
-// transaction is already open", RFC 5321 section 4.1.4), which the proxy takes for a new
-// transaction, as it does on a new connection, while the held A still has the first
-// recipient: forwarding DATA there would start the earlier message, whose end-of-data
-// reply no recipient of this transaction would account for. The next recipient on A
-// finds A refusing the MAIL (503) and gets a new connection to A.
+// connection, never by a held backend. With backend A held from a completed delivery
+// (and again after RSET), both DATA before MAIL and MAIL -> DATA with no RCPT get the
+// proxy's 503 without asking A, and RCPT -> DATA then delivers on the held A connection.
 func TestDATAWithoutAcceptedRecipientIsAnsweredByTheProxy(t *testing.T) {
 	aAddr, aMails := sizeBackend{name: "A", lhloSize: "SIZE"}.start(t)
 	bAddr, _ := sizeBackend{name: "B", lhloSize: "SIZE"}.start(t)
@@ -144,13 +140,20 @@ func TestDATAWithoutAcceptedRecipientIsAnsweredByTheProxy(t *testing.T) {
 	run(
 		clientStep{"MAIL FROM:<first@example.com>", "250 "},
 		clientStep{"RCPT TO:<a@example.com>", "250 "},
+		clientStep{"DATA", "354 "},
+		clientStep{"Subject: first\r\n\r\nbody\r\n.", "250 2.0.0 Delivered by A"},
+		clientStep{"DATA", "503 5.5.1 Bad sequence of commands (no valid recipients)"},
+		clientStep{"MAIL FROM:<rset@example.com>", "250 "},
+		clientStep{"DATA", "503 5.5.1 Bad sequence of commands (no valid recipients)"},
+		clientStep{"RSET", "250 "},
+		clientStep{"DATA", "503 5.5.1 Bad sequence of commands (no valid recipients)"},
 		clientStep{"MAIL FROM:<second@example.com>", "250 "},
-		clientStep{"DATA", "503 5.5.1 "},
+		clientStep{"DATA", "503 5.5.1 Bad sequence of commands (no valid recipients)"},
 		clientStep{"RCPT TO:<a@example.com>", "250 "},
 		clientStep{"DATA", "354 "},
 		clientStep{"Subject: second\r\n\r\nbody\r\n.", "250 2.0.0 Delivered by A"},
 	)
-	want := []string{"MAIL FROM:<first@example.com>", "MAIL FROM:<second@example.com>", "MAIL FROM:<second@example.com>"}
+	want := []string{"MAIL FROM:<first@example.com>", "MAIL FROM:<second@example.com>"}
 	if got := aMails(); !slices.Equal(got, want) {
 		t.Errorf("A received %q, want %q", got, want)
 	}
