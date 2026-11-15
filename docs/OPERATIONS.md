@@ -429,8 +429,13 @@ gives Sora a different `/tmp`, so the startup check cannot see the host's
 `/tmp/sora/uploads`. Drain that spool using the old service and configuration before replacing
 the unit, or stop the old service and move the preserved host spool to the durable path before
 starting the new one. Merely setting the old path in the new private namespace does not expose
-the host's files. If the old service itself stored bodies in a private `/tmp`, drain its uploads
-before stopping it: systemd removes that temporary directory when the service stops.
+the host's files. Never configure the upload spool under the unit's private `/tmp`: systemd
+removes that temporary directory when the service stops. If the old service itself stored bodies
+in a private `/tmp`, drain its uploads before stopping it.
+
+An older release that defaults `[uploader] path` to `/tmp/sora/uploads` has no such check and does
+not look in `/var/spool/sora/uploads`: before rolling back to one, set the path explicitly
+([Rolling back](#rolling-back)).
 
 ---
 
@@ -802,6 +807,11 @@ property of each release, so the release notes are the place to look.
 - **Restore.** Restore the database backup taken before the upgrade
   ([Backups and restores](#13-backups-and-restores)). Mail delivered since then is lost from the
   database.
+
+On a node whose config does not set `[uploader] path`, check the old binary's default first.
+Releases that default it to `/tmp/sora/uploads` do not look in `/var/spool/sora/uploads`, where the
+newer binary staged the bodies not yet in S3: set `[uploader] path = "/var/spool/sora/uploads"`
+before the old binary starts ([What a restart loses and keeps](#5-what-a-restart-loses-and-keeps)).
 
 ---
 
