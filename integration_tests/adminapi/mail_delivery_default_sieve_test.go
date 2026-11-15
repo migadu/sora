@@ -220,3 +220,60 @@ func TestAdminAPI_DeliverMail_SieveCreateNotInSharedNamespace(t *testing.T) {
 		t.Errorf("fileinto :create made %d personal mailboxes in the shared namespace", personal)
 	}
 }
+
+// TestAdminAPI_DeliverMail_DefaultSieveFilesSpamIntoJunkSpecialUse is issue #987 on
+// the /admin/mail/deliver path (the LMTP side is in integration_tests/lmtp): the
+// default script files spam into the mailbox carrying \Junk (RFC 6154), here a Junk
+// folder renamed to Spam, and not into a plain folder that merely has the name Junk.
+func TestAdminAPI_DeliverMail_DefaultSieveFilesSpamIntoJunkSpecialUse(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, _ := setupHTTPAPIServerWithUploader(t)
+	defer server.Close()
+	ctx := context.Background()
+
+	email := fmt.Sprintf("apijunkuse-%d@example.com", time.Now().UnixNano())
+	createDeliveryAccount(t, server, email)
+	accountID, err := server.rdb.GetAccountIDByAddressWithRetry(ctx, email)
+	if err != nil {
+		t.Fatalf("lookup account: %v", err)
+	}
+	if err := server.rdb.CreateDefaultMailboxesWithRetry(ctx, accountID); err != nil {
+		t.Fatalf("create default mailboxes: %v", err)
+	}
+	junk, err := server.rdb.GetMailboxByNameWithRetry(ctx, accountID, "Junk")
+	if err != nil {
+		t.Fatalf("get Junk: %v", err)
+	}
+	if junk.SpecialUse != `\Junk` {
+		t.Fatalf("default Junk special-use %q, want \\Junk", junk.SpecialUse)
+	}
+	if err := server.rdb.RenameMailboxWithRetry(ctx, junk.ID, accountID, "Spam", nil); err != nil {
+		t.Fatalf("rename Junk to Spam: %v", err)
+	}
+	if err := server.rdb.CreateMailboxWithRetry(ctx, accountID, "Junk", nil); err != nil {
+		t.Fatalf("create plain Junk: %v", err)
+	}
+
+	subject := fmt.Sprintf("api-spam-%d", time.Now().UnixNano())
+	msg := "From: sender@example.com\r\nTo: " + email + "\r\nSubject: " + subject + "\r\nX-Spam: Yes\r\n\r\nBody via API.\r\n"
+	resp, body := server.makeRequest(t, "POST", "/admin/mail/deliver", map[string]any{
+		"recipients": []string{email},
+		"from":       "sender@example.com",
+		"message":    msg,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("deliver: %d %s", resp.StatusCode, string(body))
+	}
+
+	var mailbox string
+	if err := server.rdb.QueryRowWithRetry(ctx, `
+		SELECT mb.name FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id
+		WHERE m.account_id = $1 AND m.subject = $2 AND m.expunged_at IS NULL`,
+		accountID, subject).Scan(&mailbox); err != nil {
+		t.Fatalf("find delivered message: %v", err)
+	}
+	if mailbox != "Spam" {
+		t.Errorf("spam stored in %s, want Spam (the \\Junk mailbox)", mailbox)
+	}
+}

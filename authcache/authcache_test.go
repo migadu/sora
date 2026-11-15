@@ -421,10 +421,19 @@ func TestStartCleanupLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
-	defer c.Close()
-
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	defer func() {
+		cancel()
+		// The final Get may have queued a usage update; finish it before taking mu.
+		c.wg.Wait()
+		// Let any cleanup query finish before closing the pool. Otherwise SQLite's
+		// final sidecar cleanup can race TempDir removal after this test returns.
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if err := c.Close(); err != nil {
+			t.Errorf("Close() error: %v", err)
+		}
+	}()
 
 	c.Put(ctx, "expire@example.com", 1, "hash")
 

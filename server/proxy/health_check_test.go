@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1105,6 +1106,156 @@ func TestDialTimeoutMarksPreferredPoolBackendUnhealthy(t *testing.T) {
 	}
 }
 
+// elapsedDeadlineCtx is a caller context caught between its deadline passing and its
+// timer running: Deadline is in the past while Done is still open and Err is nil. Every
+// context.WithTimeout passes through this state as it expires, for as long as the
+// scheduler takes to run its timer, and net.Dialer refuses a dial inside it from the
+// deadline alone. Holding the state still makes that window deterministic.
+type elapsedDeadlineCtx struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c elapsedDeadlineCtx) Deadline() (time.Time, bool) { return c.deadline, true }
+
+func newElapsedDeadlineCtx(t *testing.T) context.Context {
+	t.Helper()
+	parent, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return elapsedDeadlineCtx{Context: parent, deadline: time.Now().Add(-time.Millisecond)}
+}
+
+// TestCallerDeadlineIsNotChargedToBackend covers every path that charges a failed dial
+// to a backend's health (#862). A caller whose deadline has passed has its dial refused
+// by net.Dialer before ctx.Err() says so, and three such refusals quarantined a healthy,
+// listening backend. A backend that exhausts its own connect_timeout while the caller
+// still has time left must keep counting: both fail as a timeout, so the returned error
+// cannot tell them apart.
+func TestCallerDeadlineIsNotChargedToBackend(t *testing.T) {
+	poolHealth := func(cm *ConnectionManager, backend string) (int, bool) {
+		return poolHealthSnapshot(t, cm, backend).FailureCount, cm.IsBackendHealthy(backend)
+	}
+	remoteLookupHealth := func(cm *ConnectionManager, backend string) (int, bool) {
+		cm.healthMu.RLock()
+		failures := 0
+		if h, ok := cm.remoteLookupHealth[backend]; ok {
+			failures = h.FailureCount
+		}
+		cm.healthMu.RUnlock()
+		return failures, cm.IsRemoteLookupBackendHealthy(backend)
+	}
+	closeConn := func(conn net.Conn) {
+		if conn != nil {
+			conn.Close()
+		}
+	}
+
+	paths := []struct {
+		name string
+		// outsidePool: the dialed backend is a lookup pin outside the manager's pool.
+		outsidePool bool
+		connect     func(ctx context.Context, cm *ConnectionManager, backend string) error
+		health      func(cm *ConnectionManager, backend string) (failures int, healthy bool)
+	}{
+		{
+			name: "round_robin",
+			connect: func(ctx context.Context, cm *ConnectionManager, _ string) error {
+				conn, _, err := cm.ConnectWithProxy(ctx, "", "", 0, "", 0, nil)
+				closeConn(conn)
+				return err
+			},
+			health: poolHealth,
+		},
+		{
+			name: "preferred_pool_backend",
+			connect: func(ctx context.Context, cm *ConnectionManager, backend string) error {
+				conn, _, err := cm.ConnectWithProxy(ctx, backend, "", 0, "", 0, nil)
+				closeConn(conn)
+				return err
+			},
+			health: poolHealth,
+		},
+		{
+			name:        "remote_lookup_outside_pool",
+			outsidePool: true,
+			connect: func(ctx context.Context, cm *ConnectionManager, backend string) error {
+				info := &UserRoutingInfo{ServerAddress: backend, IsRemoteLookupAccount: true}
+				conn, _, err := cm.ConnectWithProxy(ctx, backend, "", 0, "", 0, info)
+				closeConn(conn)
+				return err
+			},
+			health: remoteLookupHealth,
+		},
+		{
+			// The User API proxy dials through a bound route and reports the outcome.
+			name: "route_dial_outcome",
+			connect: func(ctx context.Context, cm *ConnectionManager, backend string) error {
+				route, err := cm.BindBackendRoute("", backend)
+				if err != nil {
+					t.Fatalf("BindBackendRoute(%s): %v", backend, err)
+				}
+				conn, err := route.DialContext(ctx, "tcp", backend)
+				route.RecordDialOutcome(ctx, err)
+				closeConn(conn)
+				return err
+			},
+			health: poolHealth,
+		},
+	}
+
+	newManager := func(t *testing.T, outsidePool bool, connectTimeout time.Duration) (*ConnectionManager, string) {
+		t.Helper()
+		backend, _ := listen(t)
+		pool := []string{backend}
+		if outsidePool {
+			other, _ := listen(t)
+			pool = []string{other}
+		}
+		cm, err := NewConnectionManager(pool, 0, false, false, false, connectTimeout)
+		if err != nil {
+			t.Fatalf("Failed to create connection manager: %v", err)
+		}
+		return cm, backend
+	}
+
+	for _, p := range paths {
+		t.Run(p.name+"/elapsed_caller_deadline", func(t *testing.T) {
+			// A connect_timeout the healthy backend never comes near: only the
+			// caller's deadline can refuse these dials.
+			cm, backend := newManager(t, p.outsidePool, 5*time.Second)
+			for i := 0; i < 3; i++ {
+				ctx := newElapsedDeadlineCtx(t)
+				if err := p.connect(ctx, cm, backend); err == nil {
+					t.Fatalf("attempt %d: dial succeeded on an elapsed caller deadline", i)
+				}
+				if ctx.Err() != nil {
+					t.Fatalf("attempt %d: ctx.Err()=%v, the test must hold the caller in the window before Err is set", i, ctx.Err())
+				}
+			}
+			if failures, healthy := p.health(cm, backend); failures != 0 || !healthy {
+				t.Errorf("healthy listening backend charged for the caller's elapsed deadline: FailureCount=%d healthy=%v, want 0/true", failures, healthy)
+			}
+		})
+
+		t.Run(p.name+"/backend_timeout_with_live_caller_deadline", func(t *testing.T) {
+			// A 1ns connect_timeout: the backend's own budget runs out while the
+			// caller's deadline is a minute away.
+			cm, backend := newManager(t, p.outsidePool, time.Nanosecond)
+			for i := 0; i < 3; i++ {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				err := p.connect(ctx, cm, backend)
+				cancel()
+				if err == nil {
+					t.Fatalf("attempt %d: expected the dial to exhaust its 1ns connect timeout", i)
+				}
+			}
+			if failures, healthy := p.health(cm, backend); failures != 3 || healthy {
+				t.Errorf("dial timeouts of the backend's own while the caller had time left: FailureCount=%d healthy=%v, want 3/false", failures, healthy)
+			}
+		})
+	}
+}
+
 // TestConnectBudgetCoversFallbackDials pins the deadline the proxies put around one
 // ConnectWithProxy call. connect_timeout is a per-dial budget, so an overall deadline
 // equal to it lets a black-holed preferred backend consume everything and every
@@ -1248,5 +1399,299 @@ func TestFailedPreferredBackendIsDialedOncePerAttempt(t *testing.T) {
 		if healthy := cm.IsBackendHealthy(backendAddr); healthy != (attempt < 3) {
 			t.Errorf("after attempt %d backend healthy = %v, want it marked unhealthy at the third failed attempt and not before", attempt, healthy)
 		}
+	}
+}
+
+// blackHoleTCPBackend returns an address whose TCP dials time out without sending RST.
+// It saturates a backlog=1 loopback socket so every subsequent SYN is dropped locally;
+// if the host kernel accepts all probes despite backlog=1, it falls back to TEST-NET-1.
+func blackHoleTCPBackend(t *testing.T, fallbackIndex int) string {
+	t.Helper()
+
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
+	if err == nil {
+		var held []net.Conn
+		t.Cleanup(func() {
+			for _, c := range held {
+				c.Close()
+			}
+			syscall.Close(fd)
+		})
+
+		sa := &syscall.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}
+		if err := syscall.Bind(fd, sa); err == nil {
+			if err := syscall.Listen(fd, 1); err == nil {
+				if bound, err := syscall.Getsockname(fd); err == nil {
+					if inet4, ok := bound.(*syscall.SockaddrInet4); ok {
+						addr := fmt.Sprintf("127.0.0.1:%d", inet4.Port)
+						for range 16 {
+							c, dialErr := net.DialTimeout("tcp", addr, 15*time.Millisecond)
+							if dialErr != nil {
+								var netErr net.Error
+								if errors.As(dialErr, &netErr) && netErr.Timeout() {
+									return addr
+								}
+								break
+							}
+							held = append(held, c)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return fmt.Sprintf("192.0.2.%d:143", fallbackIndex)
+}
+
+// stalledTLSBackend accepts TCP connections immediately and holds them open without
+// speaking TLS, so every implicit-TLS handshake hangs until its deadline.
+func stalledTLSBackend(t *testing.T) string {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+
+	var (
+		mu   sync.Mutex
+		held []net.Conn
+	)
+	t.Cleanup(func() {
+		ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range held {
+			c.Close()
+		}
+	})
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, c)
+			mu.Unlock()
+		}
+	}()
+
+	return ln.Addr().String()
+}
+
+// TestConnectBudgetMarksAllThreeHungPoolBackendsUnhealthy covers imapproxy and
+// managesieveproxy wrapping ConnectWithProxy in context.WithTimeout(s.ctx, cm.ConnectBudget()).
+// With an exact 3 * connect_timeout budget and zero inter-attempt slack, the first two
+// hung dials spend 2 * connect_timeout + scheduling overhead, so the third hung backend
+// hits connectCtx's deadline slightly early and callerGaveUp suppresses RecordConnectionFailure.
+func TestConnectBudgetMarksAllThreeHungPoolBackendsUnhealthy(t *testing.T) {
+	const connectTimeout = 35 * time.Millisecond
+	backends := []string{
+		blackHoleTCPBackend(t, 1),
+		blackHoleTCPBackend(t, 2),
+		blackHoleTCPBackend(t, 3),
+	}
+
+	cm, err := NewConnectionManager(backends, 143, false, false, false, connectTimeout)
+	if err != nil {
+		t.Fatalf("Failed to create connection manager: %v", err)
+	}
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		connectCtx, cancel := context.WithTimeout(context.Background(), cm.ConnectBudget())
+		conn, _, err := cm.ConnectWithProxy(connectCtx, "", "", 0, "", 0, nil)
+		cancel()
+		if conn != nil {
+			conn.Close()
+		}
+		if err == nil {
+			t.Fatalf("attempt %d: expected ConnectWithProxy to fail against black-holed pool", attempt)
+		}
+	}
+
+	for _, addr := range backends {
+		health := poolHealthSnapshot(t, cm, addr)
+		if health.FailureCount != 3 || health.ConsecutiveFails != 3 {
+			t.Errorf("backend %s: FailureCount=%d ConsecutiveFails=%d, want 3/3", addr, health.FailureCount, health.ConsecutiveFails)
+		}
+		if cm.IsBackendHealthy(addr) {
+			t.Errorf("backend %s still reported healthy after 3 hung connect attempts under ConnectBudget()", addr)
+		}
+	}
+}
+
+// TestConnectBudgetMarksHungImplicitTLSBackendsUnhealthy verifies that implicit-TLS
+// handshakes that stall for connect_timeout are accounted for in ConnectBudget() (both
+// flat remote_addrs and named [[pool]] configs) and recorded as backend failures, even
+// when remote_lookup enables implicit TLS dynamically on a plaintext manager.
+func TestConnectBudgetMarksHungImplicitTLSBackendsUnhealthy(t *testing.T) {
+	const connectTimeout = 35 * time.Millisecond
+
+	t.Run("flat_pool", func(t *testing.T) {
+		backends := []string{
+			stalledTLSBackend(t),
+			stalledTLSBackend(t),
+			stalledTLSBackend(t),
+		}
+		cm, err := NewConnectionManager(backends, 993, true /* remoteTLS */, false, false, connectTimeout)
+		if err != nil {
+			t.Fatalf("Failed to create connection manager: %v", err)
+		}
+
+		for attempt := 1; attempt <= 3; attempt++ {
+			connectCtx, cancel := context.WithTimeout(context.Background(), cm.ConnectBudget())
+			conn, _, err := cm.ConnectWithProxy(connectCtx, "", "", 0, "", 0, nil)
+			cancel()
+			if conn != nil {
+				conn.Close()
+			}
+			if err == nil {
+				t.Fatalf("attempt %d: expected stalled TLS handshake to fail", attempt)
+			}
+		}
+
+		for _, addr := range backends {
+			health := poolHealthSnapshot(t, cm, addr)
+			if health.FailureCount != 3 || health.ConsecutiveFails != 3 || cm.IsBackendHealthy(addr) {
+				t.Errorf("flat implicit-TLS backend %s: FailureCount=%d ConsecutiveFails=%d healthy=%v, want 3/3/false",
+					addr, health.FailureCount, health.ConsecutiveFails, cm.IsBackendHealthy(addr))
+			}
+		}
+	})
+
+	t.Run("named_pool", func(t *testing.T) {
+		backends := []string{
+			stalledTLSBackend(t),
+			stalledTLSBackend(t),
+			stalledTLSBackend(t),
+		}
+		cm, err := NewConnectionManagerWithPools([]PoolSpec{{
+			Name:     "imaps",
+			Default:  true,
+			Backends: backends,
+			Settings: BackendSettings{TLS: true},
+		}}, 993, connectTimeout, nil, "imaps-test", false)
+		if err != nil {
+			t.Fatalf("NewConnectionManagerWithPools: %v", err)
+		}
+
+		info := &UserRoutingInfo{PoolName: "imaps", RemoteTLS: true}
+		for attempt := 1; attempt <= 3; attempt++ {
+			connectCtx, cancel := context.WithTimeout(context.Background(), cm.ConnectBudget())
+			conn, _, err := cm.ConnectWithProxy(connectCtx, "", "", 0, "", 0, info)
+			cancel()
+			if conn != nil {
+				conn.Close()
+			}
+			if err == nil {
+				t.Fatalf("attempt %d: expected stalled TLS handshake to fail", attempt)
+			}
+		}
+
+		for _, addr := range backends {
+			health := poolHealthSnapshot(t, cm, addr)
+			if health.FailureCount != 3 || health.ConsecutiveFails != 3 || cm.IsBackendHealthy(addr) {
+				t.Errorf("named-pool implicit-TLS backend %s: FailureCount=%d ConsecutiveFails=%d healthy=%v, want 3/3/false",
+					addr, health.FailureCount, health.ConsecutiveFails, cm.IsBackendHealthy(addr))
+			}
+		}
+	})
+
+	t.Run("preferred_tcp_timeout_then_single_pool_stalled_tls", func(t *testing.T) {
+		tcpBlackHole := blackHoleTCPBackend(t, 4)
+		tlsStalled := stalledTLSBackend(t)
+
+		cm, err := NewConnectionManager([]string{tlsStalled}, 993, true /* remoteTLS */, false, false, connectTimeout)
+		if err != nil {
+			t.Fatalf("Failed to create connection manager: %v", err)
+		}
+
+		for attempt := 1; attempt <= 3; attempt++ {
+			connectCtx, cancel := context.WithTimeout(context.Background(), cm.ConnectBudget())
+			conn, _, err := cm.ConnectWithProxy(connectCtx, tcpBlackHole, "", 0, "", 0, nil)
+			cancel()
+			if conn != nil {
+				conn.Close()
+			}
+			if err == nil {
+				t.Fatalf("attempt %d: expected preferred + fallback to fail", attempt)
+			}
+		}
+
+		health := poolHealthSnapshot(t, cm, tlsStalled)
+		if health.FailureCount != 3 || health.ConsecutiveFails != 3 || cm.IsBackendHealthy(tlsStalled) {
+			t.Errorf("single-pool implicit-TLS backend %s: FailureCount=%d ConsecutiveFails=%d healthy=%v, want 3/3/false",
+				tlsStalled, health.FailureCount, health.ConsecutiveFails, cm.IsBackendHealthy(tlsStalled))
+		}
+	})
+
+	t.Run("remote_lookup_implicit_tls_on_plaintext_manager", func(t *testing.T) {
+		poolBackend, _ := listen(t)
+		tlsStalled := stalledTLSBackend(t)
+
+		cm, err := NewConnectionManager([]string{poolBackend}, 143, false /* remoteTLS */, false, false, connectTimeout)
+		if err != nil {
+			t.Fatalf("Failed to create connection manager: %v", err)
+		}
+
+		info := &UserRoutingInfo{
+			ServerAddress:         tlsStalled,
+			IsRemoteLookupAccount: true,
+			RemoteTLS:             true,
+		}
+		for attempt := 1; attempt <= 3; attempt++ {
+			// Budget matches connectTimeout closely so ctx deadline can pass during wakeup
+			// right as the TLS handshake exhausts its full connectTimeout.
+			connectCtx, cancel := context.WithTimeout(context.Background(), connectTimeout+2*time.Millisecond)
+			conn, _, err := cm.ConnectWithProxy(connectCtx, tlsStalled, "", 0, "", 0, info)
+			cancel()
+			if conn != nil {
+				conn.Close()
+			}
+			if err == nil {
+				t.Fatalf("attempt %d: expected stalled remote_lookup TLS handshake to fail", attempt)
+			}
+		}
+
+		if cm.IsRemoteLookupBackendHealthy(tlsStalled) {
+			t.Errorf("remote_lookup implicit-TLS backend %s still reported healthy after 3 stalled handshakes", tlsStalled)
+		}
+	})
+}
+
+// TestImplicitTLSHandshakeRespectsContextCancellation verifies that dialWithProxy uses
+// tlsConn.HandshakeContext so a canceled or short caller context aborts a stalled
+// implicit-TLS handshake promptly instead of blocking for connect_timeout, and does not
+// blame the backend when the caller gave up early.
+func TestImplicitTLSHandshakeRespectsContextCancellation(t *testing.T) {
+	backendAddr := stalledTLSBackend(t)
+	cm, err := NewConnectionManager([]string{backendAddr}, 993, true /* remoteTLS */, false, false, 600*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Failed to create connection manager: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	conn, _, err := cm.ConnectWithProxy(ctx, "", "", 0, "", 0, nil)
+	elapsed := time.Since(start)
+	if conn != nil {
+		conn.Close()
+	}
+	if err == nil {
+		t.Fatal("expected stalled TLS handshake to fail on context timeout")
+	}
+	if elapsed > 250*time.Millisecond {
+		t.Errorf("stalled TLS handshake ignored caller context for %v, want prompt abort well below the 600ms connect_timeout", elapsed)
+	}
+
+	health := poolHealthSnapshot(t, cm, backendAddr)
+	if health.FailureCount != 0 || !cm.IsBackendHealthy(backendAddr) {
+		t.Errorf("backend penalized when caller context expired early during TLS handshake: FailureCount=%d healthy=%v, want 0/true",
+			health.FailureCount, cm.IsBackendHealthy(backendAddr))
 	}
 }

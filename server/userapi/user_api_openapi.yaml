@@ -169,6 +169,11 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            A name in the shared namespace, the namespace root included, while
+            `[shared_mailboxes]` is enabled. The User API does not create shared
+            mailboxes.
         '409':
           description: Mailbox already exists
 
@@ -187,11 +192,15 @@ paths:
         '200':
           description: Mailbox deleted successfully
         '400':
-          description: Cannot delete INBOX
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: INBOX, or a shared mailbox without the `x` (delete mailbox) right.
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: The mailbox has child mailboxes; delete them first.
 
   /mailboxes/{name}/subscribe:
     post:
@@ -298,7 +307,7 @@ paths:
         - $ref: '#/components/parameters/MailboxName'
         - name: q
           in: query
-          description: Search query
+          description: Search query, at most 1000 bytes of UTF-8.
           required: true
           schema:
             type: string
@@ -306,14 +315,14 @@ paths:
           in: query
           description: |
             Only messages whose sender's address or name contains this text
-            (case-insensitive, literal). ANDed with `q`.
+            (case-insensitive, literal, at most 1000 bytes). ANDed with `q`.
           schema:
             type: string
         - name: subject
           in: query
           description: |
             Only messages whose subject contains this text (case-insensitive,
-            literal). ANDed with `q`.
+            literal, at most 1000 bytes). ANDed with `q`.
           schema:
             type: string
         - name: unseen
@@ -885,8 +894,9 @@ components:
         message_id:
           type: string
           description: |
-            The Message-ID header, without angle brackets. A message stored without a
-            Message-ID that parses has an ID Sora generated, in angle brackets.
+            The Message-ID header, without angle brackets. The empty string when the
+            message has no Message-ID that parses (the ID Sora stores for such a message
+            to detect duplicates is not its header and is never returned).
           example: abc123@example.com
         in_reply_to:
           type: string
