@@ -246,6 +246,13 @@ generateToken:
 	// can skip the DB, so fetch it here for both paths).
 	_, epoch, err := s.rdb.GetCredentialEpochWithRetry(ctx, email)
 	if err != nil {
+		if errors.Is(err, consts.ErrUserNotFound) {
+			// No active account any more: deleted since its credentials were cached
+			// (or since the lookup above). Refused, as the refresh refuses it.
+			logger.Info("HTTP Mail API: Refusing login for deleted/unknown account", "name", s.name, "email", email)
+			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+			return
+		}
 		logger.Warn("HTTP Mail API: Error fetching credential epoch", "name", s.name, "error", err)
 		s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
 		return

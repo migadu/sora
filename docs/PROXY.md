@@ -1058,6 +1058,11 @@ Notes:
   recipient of the same transaction gets
   `451 4.3.0 Recipient requires different backend server, start new transaction` (or `... pool ...`).
   While the transaction has no accepted recipient, the held connection is replaced instead.
+- The LMTP proxy answers `MAIL` itself and sends it to the backend with the first recipient. When
+  the backend refuses the sender (`501` or `553`, as a Sora backend answers a sender it cannot
+  parse or does not accept), each recipient gets `553 5.1.7 Invalid sender`, a bounce, as on a
+  direct connection; when it refuses the declared `SIZE=` (`552`), each recipient gets
+  `552 5.3.4`. Any other refusal of `MAIL` counts as a failed backend connection (`451 4.4.1`).
 
 ---
 
