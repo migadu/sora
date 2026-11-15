@@ -56,6 +56,20 @@ func foreignEntry(p string, info fs.FileInfo, uid int) bool {
 	return true
 }
 
+// linkedAbove reports, and logs, that a directory above p is a link of a user other
+// than root and uid, such as /tmp/sora above /tmp/sora/uploads: through it, p names a
+// directory of that user's choice.
+func linkedAbove(p string, uid int) bool {
+	for dir := filepath.Dir(p); ; dir = filepath.Dir(dir) {
+		if info, err := os.Lstat(dir); err == nil && info.Mode()&fs.ModeSymlink != 0 && foreignEntry(dir, info, uid) {
+			return true
+		}
+		if filepath.Dir(dir) == dir {
+			return false
+		}
+	}
+}
+
 // walkSpool is filepath.WalkDir over a legacy spool directory that passes over what
 // spoolError and foreignEntry rule out, with the directory below it, so fn sees only
 // entries of uid or root that this process can read. A symlink's own owner counts: fn
@@ -205,10 +219,15 @@ func CheckLegacyStaging(path, newDefault, legacyPath string, uid int) error {
 		}
 		return sawRegularOrCycle, err
 	}
-	// walkSpool checks the entries it visits; the legacy path itself may be a link.
+	// walkSpool checks the entries it visits. The legacy path itself may be a link, as
+	// may a directory above it. Only a directory is a spool: bodies are staged at
+	// <account id>/<content hash> below it, so a file at the path, which a hard link can
+	// make root's, holds none.
 	info, err := os.Lstat(legacyPath)
-	if err == nil && !foreignEntry(legacyPath, info, uid) {
-		_, err = walk(legacyPath, "")
+	if err == nil && !linkedAbove(legacyPath, uid) && !foreignEntry(legacyPath, info, uid) {
+		if info, err = os.Stat(legacyPath); err == nil && info.IsDir() {
+			_, err = walk(legacyPath, "")
+		}
 	}
 	if err = spoolError(legacyPath, err, uid); err != nil {
 		return fmt.Errorf("cannot check %s for bodies staged under the previous default [uploader] path: %w", legacyPath, err)

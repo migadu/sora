@@ -424,8 +424,10 @@ directory to `/var/spool/sora/uploads`. `sora-admin uploader resolve` refuses to
 case. At startup only entries of the user Sora runs as, or of root, count: any local user can
 write to `/tmp`, so an entry there that belongs to another user, or that Sora cannot read, is
 logged as a warning (`Uploader: ignoring an entry under the previous default [uploader] path ...`)
-and passed over with everything below it. `resolve`, often run as root, cannot tell which user
-the server runs as: it counts every entry and refuses when it cannot read one.
+and passed over with everything below it, as is the whole old spool when `/tmp/sora` is a link
+of another user. `resolve`, often run as root, cannot tell which user the server runs as: it
+counts every entry and refuses when it cannot read one. Neither counts a file at
+`/tmp/sora/uploads` itself: bodies were staged in directories below it.
 
 The startup check assumes the service user is unchanged from the version that staged those
 bodies. Changing that user in the same upgrade, or leaving genuine old bodies unreadable, can
