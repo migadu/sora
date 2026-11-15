@@ -358,3 +358,67 @@ func TestIMAP_Examine_ReadOnly_RejectsMove(t *testing.T) {
 		t.Errorf("STATUS Other after MOVE in a read-write selection: %v, want MESSAGES 1", untagged)
 	}
 }
+
+// TestIMAP_Examine_PermanentFlagsEmpty: no flag can be changed in a mailbox
+// opened with EXAMINE (RFC 9051 §6.3.3: "No changes to the permanent state of
+// the mailbox, including per-user state, are permitted"), so its PERMANENTFLAGS,
+// "A list of message flags that the client can change permanently" (§6.3.2),
+// is the empty list of the §6.3.3 example. It is sent empty rather than left
+// out: "If this is missing, the client should assume that all flags can be
+// changed permanently" (§6.3.2). A SELECT of the same mailbox still lists the
+// flags the user's rights allow, for the owner and for a grantee (#1059).
+func TestIMAP_Examine_PermanentFlagsEmpty(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	// permanentFlags runs cmd and returns the list of its one PERMANENTFLAGS
+	// response code.
+	permanentFlags := func(c *rawIMAP, cmd string) string {
+		t.Helper()
+		untagged, _ := c.do(cmd)
+		var lists []string
+		for _, line := range untagged {
+			if _, rest, ok := strings.Cut(line, "[PERMANENTFLAGS ("); ok {
+				list, _, _ := strings.Cut(rest, ")]")
+				lists = append(lists, list)
+			}
+		}
+		if len(lists) != 1 {
+			t.Fatalf("%s: got %d PERMANENTFLAGS responses, want 1: %q", cmd, len(lists), untagged)
+		}
+		return lists[0]
+	}
+
+	owner := dialRawIMAP(t, server.Address)
+	owner.do(fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password))
+	for _, tc := range []struct{ cmd, want string }{
+		{"EXAMINE INBOX", ""},
+		{"SELECT INBOX", `\Seen \Answered \Flagged \Deleted \Draft \*`},
+		{"EXAMINE INBOX", ""},
+	} {
+		if got := permanentFlags(owner, tc.cmd); got != tc.want {
+			t.Errorf("owner %s: PERMANENTFLAGS (%s), want (%s)", tc.cmd, got, tc.want)
+		}
+	}
+
+	// A grantee whose rights allow \Seen only ('s').
+	email2, password2 := createSecondUser(t, server, "example.com", "examinepf")
+	shared := fmt.Sprintf("Shared/ExaminePermFlags-%d", common.GetTimestamp())
+	owner.do(fmt.Sprintf(`CREATE "%s"`, shared))
+	defer owner.status(fmt.Sprintf(`DELETE "%s"`, shared))
+	owner.do(fmt.Sprintf(`SETACL "%s" "%s" lrs`, shared, email2))
+
+	grantee := dialRawIMAP(t, server.Address)
+	grantee.do(fmt.Sprintf(`LOGIN "%s" "%s"`, email2, password2))
+	for _, tc := range []struct{ cmd, want string }{
+		{fmt.Sprintf(`EXAMINE "%s"`, shared), ""},
+		{fmt.Sprintf(`SELECT "%s"`, shared), `\Seen`},
+		{fmt.Sprintf(`EXAMINE "%s"`, shared), ""},
+	} {
+		if got := permanentFlags(grantee, tc.cmd); got != tc.want {
+			t.Errorf("grantee with lrs %s: PERMANENTFLAGS (%s), want (%s)", tc.cmd, got, tc.want)
+		}
+	}
+}
