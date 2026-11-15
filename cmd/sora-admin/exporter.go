@@ -45,7 +45,7 @@ type ExporterOptions struct {
 type Exporter struct {
 	ctx         context.Context // Context for cancellation support
 	maildirPath string
-	root        *os.Root // the destination, which every file below it is written and read through (replaceFile)
+	root        *os.Root // confines message/Dovecot contents and Maildir child directories; excludes the SQLite cache
 	email       string
 	jobs        int
 	db          *sql.DB
