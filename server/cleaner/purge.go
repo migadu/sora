@@ -42,8 +42,8 @@ var ErrAccountInService = errors.New("account is in service: it was restored, or
 const (
 	// purgeMaxPasses bounds how often a purge runs the whole pipeline again when the
 	// account still holds rows at the end of a pass: an upload of a body is in flight,
-	// something held a body's lock (a restore or cross-account COPY of it, or a delivery
-	// staging its search row), S3 refused a delete, or a delivery that passed its
+	// something held a body's lock (a restore or cross-account COPY or MOVE of it, or a
+	// delivery staging its search row), S3 refused a delete, or a delivery that passed its
 	// recipient check just before the account went out of service landed afterwards.
 	purgeMaxPasses = 5
 	// purgeRetryDelay is the pause before the second pass, doubled before each further one.
