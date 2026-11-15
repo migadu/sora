@@ -83,6 +83,12 @@ func TestInReadSnapshotIsolatesConcurrentOverwritesAndExpunges(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, uint32(3), unseenSeq, "UID 3 must still be the first unseen message in the snapshot")
 
+		// SELECT's RECENT count (#1361): UIDs 2-4 are above 1 in the snapshot, whatever
+		// was delivered or expunged since.
+		recent, err := database.CountMessagesGreaterThanUID(snapCtx, mailboxID, 1)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(3), recent, "RECENT must count the messages above UID 1 in the snapshot")
+
 		customFlags, err := database.GetUniqueCustomFlagsForMailbox(snapCtx, mailboxID)
 		require.NoError(t, err)
 		assert.NotContains(t, customFlags, "$AfterSummary", "keyword added after snapshot must not leak")

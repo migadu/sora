@@ -155,8 +155,9 @@ If a server type needs PostgreSQL and the config has no database endpoint, `sora
 `[database]: server "<name>" (<type>) needs the database, but it is not configured in
 [database.write] or [database.read]`. With `[database.read]` hosts but no `[database.write]` hosts
 it stops with `[database.write]: server "<name>" (<type>) needs the database, but [database.write]
-has no hosts; ...`: the migrations and every write go to `[database.write]`. On a node that needs S3, `[s3] endpoint` and `bucket` must
-be set, or `sora` stops with `[s3]: endpoint is required ...` or `[s3]: bucket is required ...`;
+has no hosts; ...`: the migrations and every write go to `[database.write]`. On a node that needs
+S3, `[s3] endpoint` and `bucket` must be set, or `sora` stops with `[s3]: endpoint is required ...`
+or `[s3]: bucket is required ...`;
 without `access_key` and `secret_key` the AWS default credential chain must supply them.
 `sora-admin config validate` refuses such a file too.
 

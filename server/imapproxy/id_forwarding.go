@@ -97,8 +97,9 @@ func (s *Session) sendForwardingParametersToBackend() error {
 	for {
 		response, err := server.ReadBoundedLine(s.backendReader, 65536)
 		if errors.Is(err, server.ErrLineTooLong) {
-			// ReadBoundedLine drained the line. Read on to the tagged reply: the login
-			// goes on after a failed ID, and AUTHENTICATE would take that reply for its own.
+			// ReadBoundedLine drained the line. Read on to the tagged reply: only it
+			// tells a refusal, after which the login goes on, from an exchange left
+			// unfinished, which fails the backend leg.
 			if !warnedTooLong {
 				s.WarnLog("skipping oversized line in backend ID response", "backend", s.serverAddr)
 				warnedTooLong = true

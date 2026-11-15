@@ -158,6 +158,55 @@ func TestMetricsAccessGuard(t *testing.T) {
 	}
 }
 
+// TestMetricsAccessGuard_BearerChallenge pins the WWW-Authenticate challenge of the
+// api_key check. RFC 9110 section 15.5.2 requires one on every 401, and RFC 6750
+// section 3 on every refusal of a request that "does not include authentication
+// credentials or does not contain an access token that enables access to the protected
+// resource", the 403 for a wrong token included: that one names the reason,
+// error="invalid_token" (section 3.1). A host outside allowed_hosts is refused before
+// any token is looked at, and no token would change that, so it gets no challenge.
+func TestMetricsAccessGuard_BearerChallenge(t *testing.T) {
+	const apiKey = "s3cr3t-scrape-key"
+	tests := []struct {
+		name          string
+		allowedHosts  []string
+		remoteAddr    string
+		authHeader    string
+		wantStatus    int
+		wantChallenge string
+	}{
+		{name: "missing token", remoteAddr: "10.4.2.1:51000", wantStatus: http.StatusUnauthorized, wantChallenge: `Bearer realm="metrics"`},
+		{name: "non-bearer scheme", remoteAddr: "10.4.2.1:51000", authHeader: "Basic " + apiKey, wantStatus: http.StatusUnauthorized, wantChallenge: `Bearer realm="metrics"`},
+		{name: "wrong token", remoteAddr: "10.4.2.1:51000", authHeader: "Bearer wrong-key", wantStatus: http.StatusForbidden, wantChallenge: `Bearer realm="metrics", error="invalid_token"`},
+		{name: "host outside allow-list", allowedHosts: []string{"10.0.0.0/8"}, remoteAddr: "203.0.113.9:51000", authHeader: "Bearer " + apiKey, wantStatus: http.StatusForbidden},
+		{name: "correct token", remoteAddr: "10.4.2.1:51000", authHeader: "Bearer " + apiKey, wantStatus: http.StatusOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var reached bool
+			guard := metricsAccessGuard(tt.allowedHosts, apiKey, okHandler(&reached))
+			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			req.RemoteAddr = tt.remoteAddr
+			if tt.authHeader != "" {
+				req.Header.Set("Authorization", tt.authHeader)
+			}
+			rec := httptest.NewRecorder()
+			guard.ServeHTTP(rec, req)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body %q)", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			got := rec.Header().Values("WWW-Authenticate")
+			if tt.wantChallenge == "" {
+				if len(got) != 0 {
+					t.Errorf("WWW-Authenticate = %q, want none", got)
+				}
+			} else if len(got) != 1 || got[0] != tt.wantChallenge {
+				t.Errorf("WWW-Authenticate = %q, want %q", got, tt.wantChallenge)
+			}
+		})
+	}
+}
+
 // TestMetricsAccessGuard_IgnoresForwardedHeaders pins that the allow-list reads
 // the socket peer only. The metrics listener does not parse PROXY protocol, so
 // an X-Forwarded-For an attacker sets must not talk its way past allowed_hosts.

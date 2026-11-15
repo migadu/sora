@@ -215,3 +215,50 @@ func TestReloadConfig_RotatesAPIKeysTogether(t *testing.T) {
 		t.Errorf("full-access key after revocation: status %d, want 200", got)
 	}
 }
+
+// A bearer token the Admin API refuses gets the challenge with the reason, though the
+// status stays 403. RFC 6750 section 3: "If the protected resource request does not
+// include authentication credentials or does not contain an access token that enables
+// access to the protected resource, the resource server MUST include the HTTP
+// "WWW-Authenticate" response header field". Section 3.1 names the reasons: a wrong key
+// is "invalid_token", the read-only key on a write "insufficient_scope" ("The request
+// requires higher privileges than provided by the access token").
+func TestAuthMiddleware_RefusedKeyCarriesBearerChallenge(t *testing.T) {
+	s, err := New(&resilient.ResilientDatabase{}, ServerOptions{Name: "ro", APIKey: rwKey, ReadOnlyAPIKey: roKey})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	h := s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	cases := []struct {
+		name, method, key string
+		wantStatus        int
+		wantChallenge     string
+	}{
+		{"wrong key", http.MethodGet, "wrong-key", http.StatusForbidden, `Bearer realm="admin-api", error="invalid_token"`},
+		{"wrong key on a write", http.MethodPost, "wrong-key", http.StatusForbidden, `Bearer realm="admin-api", error="invalid_token"`},
+		{"read-only key on a write", http.MethodPost, roKey, http.StatusForbidden, `Bearer realm="admin-api", error="insufficient_scope"`},
+		{"read-only key on a read", http.MethodGet, roKey, http.StatusOK, ""},
+		{"full key", http.MethodDelete, rwKey, http.StatusOK, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := httptest.NewRequest(c.method, "/admin/accounts/user@example.com", nil)
+			r.Header.Set("Authorization", "Bearer "+c.key)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != c.wantStatus {
+				t.Fatalf("status %d, want %d (body %q)", w.Code, c.wantStatus, w.Body.String())
+			}
+			got := w.Header().Values("WWW-Authenticate")
+			if c.wantChallenge == "" {
+				if len(got) != 0 {
+					t.Errorf("accepted key answered with a challenge: %q", got)
+				}
+			} else if len(got) != 1 || got[0] != c.wantChallenge {
+				t.Errorf("WWW-Authenticate = %q, want %q", got, c.wantChallenge)
+			}
+		})
+	}
+}

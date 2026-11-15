@@ -16,7 +16,10 @@ type PendingUpload struct {
 	ID          int64
 	AccountID   int64
 	ContentHash string // serves also as unique identifier in S3
-	InstanceID  string // hostname of the instance that created the upload
+	// InstanceID is the upload instance id of the node holding the staged body
+	// (config.InstanceID, the key its uploader leases under), not its mail hostname:
+	// AcquireAndLeasePendingUploads hands the row only to that instance.
+	InstanceID  string
 	Size        int64
 	Attempts    int
 	CreatedAt   time.Time
@@ -37,20 +40,22 @@ type PendingUploadWithEmail struct {
 //
 // A row whose upload is in flight (lease_until in the future, see PassS3WriteGate) is not
 // taken again, however long the transfer runs past retry_interval.
+//
+// retry_interval is measured on the database clock, which wrote last_attempt (the lease
+// below, MarkUploadAttempt). On this node's clock, one running ahead of the database's by
+// retry_interval or more would take back rows its running pass leased a moment ago.
 func (db *Database) AcquireAndLeasePendingUploads(ctx context.Context, tx pgx.Tx, instanceId string, limit int, retryInterval time.Duration, maxAttempts int) ([]PendingUpload, error) {
-	retryTasksLastAttemptBefore := time.Now().Add(-retryInterval)
-
 	rows, err := tx.Query(ctx, `
 		SELECT id, account_id, content_hash, size, instance_id, attempts, created_at, updated_at, last_attempt
 		FROM pending_uploads
 		WHERE instance_id = $1
 		  AND (attempts < $2)
-		  AND ((last_attempt IS NULL) OR (last_attempt < $3))
+		  AND ((last_attempt IS NULL) OR (last_attempt < now() - $3::interval))
 		  AND (lease_until IS NULL OR lease_until < now())
 		ORDER BY created_at ASC, id ASC
 		LIMIT $4
 		FOR UPDATE SKIP LOCKED
-	`, instanceId, maxAttempts, retryTasksLastAttemptBefore, limit)
+	`, instanceId, maxAttempts, retryInterval, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query pending uploads for acquisition: %w", err)
 	}
@@ -260,8 +265,8 @@ const (
 	// now leased to this upload alone until the lease expires.
 	S3WriteOpen S3WriteGate = iota
 	// S3WriteBusy: someone else is at the body right now — the cleaner or a purge
-	// confirming it is an orphan and deleting it, a restore, a cross-account COPY, or
-	// another upload of it that holds the row's lease. The upload is deferred.
+	// confirming it is an orphan and deleting it, a restore, a cross-account COPY or
+	// MOVE, or another upload of it that holds the row's lease. The upload is deferred.
 	S3WriteBusy
 	// S3WriteAbandoned: the pending row is gone (the account was deleted, the upload
 	// reaped, or another upload finished it), so there is nothing left to upload.

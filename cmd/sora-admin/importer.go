@@ -1424,9 +1424,12 @@ func (i *Importer) scanMaildir() error {
 
 	var refusedMu sync.Mutex
 	refusedFiles := make(map[maildirFileKey]struct{})
-	// Refusals apply only to this run. Deleting a prior cache row would also lose
-	// a successful legacy import's SHA-256 identity and duplicate it under BLAKE3
-	// if a later run raises the limit again.
+	// refuse reports a file the scan drops, once, and leaves it out of this run's
+	// import: a cache row an earlier run left for it would otherwise be read again
+	// and the file reported a second time. Refusals apply only to this run.
+	// Deleting a prior cache row would also lose a successful legacy import's
+	// SHA-256 identity and duplicate it under BLAKE3 if a later run raises the limit
+	// again.
 	refuse := func(file fileToProcess, reason string) {
 		logger.Warn("Refusing message", "path", file.path, "reason", reason)
 		i.recordFailedPath(file.path, reason)
@@ -1456,9 +1459,7 @@ func (i *Importer) scanMaildir() error {
 					continue
 				}
 				if err != nil {
-					logger.Warn("Failed to hash file", "path", file.path, "error", err)
-					i.recordFailedPath(file.path, fmt.Sprintf("read/hash error: %v", err))
-					atomic.AddInt64(&i.failedMessages, 1)
+					refuse(file, fmt.Sprintf("read/hash error: %v", err))
 					continue
 				}
 
@@ -1474,9 +1475,7 @@ func (i *Importer) scanMaildir() error {
 				_, err = i.sqliteDB.Exec("INSERT OR IGNORE INTO messages (path, filename, hash, size, mailbox) VALUES (?, ?, ?, ?, ?)",
 					file.path, file.filename, hash, size, file.mailboxName)
 				if err != nil {
-					logger.Warn("Failed to insert message into sqlite db", "path", file.path, "error", err)
-					i.recordFailedPath(file.path, fmt.Sprintf("cache insert error: %v", err))
-					atomic.AddInt64(&i.failedMessages, 1)
+					refuse(file, fmt.Sprintf("cache insert error: %v", err))
 					continue
 				}
 			}
@@ -2305,7 +2304,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 								// The preserved UID is already taken in the target mailbox: the
 								// message was NOT stored. A "skip" would hide a lost message.
 								logger.Error("Preserved UID already in use, message not imported", "path", gm.path, "hash", gm.hash)
-								i.recordFailedPath(gm.path, "preserved UID already in use in the target mailbox (re-run without --preserve-uids to import it)")
+								i.recordFailedPath(gm.path, uidConflictReason)
 								atomic.AddInt64(&i.failedMessages, 1)
 								continue
 							}
@@ -2341,6 +2340,23 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 	return successHashes, nil
 }
 
+// uidConflictReason is the failure reason of a message whose preserved UID the
+// target mailbox already uses.
+const uidConflictReason = "preserved UID already in use in the target mailbox (re-run without --preserve-uids to import it)"
+
+// batchUIDConflictError ends a batch transaction at the message whose preserved UID
+// the target mailbox already uses.
+type batchUIDConflictError struct {
+	path string
+	err  error
+}
+
+func (e *batchUIDConflictError) Error() string {
+	return fmt.Sprintf("preserved UID of %s already in use in the target mailbox: %v", e.path, e.err)
+}
+
+func (e *batchUIDConflictError) Unwrap() error { return e.err }
+
 // insertBatchToDBWithTransaction inserts all uploaded messages in a SINGLE transaction
 // This is faster (20x) but less resilient - if one message fails, entire batch rolls back
 func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]markedMessage, error) {
@@ -2368,10 +2384,8 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 	// Get the underlying database for direct access to InsertMessageFromImporter
 	database := i.rdb.GetOperationalDatabase()
 
-	// Stage per-message UID conflicts and dedup skips until tx.Commit and
-	// markBatchInSQLite succeed: if the batch aborts, processBatch records and
-	// counts the entire uploaded slice as failed.
-	var uidConflicts []failedImport
+	// Stage dedup skips until tx.Commit and markBatchInSQLite succeed: if the batch
+	// aborts, processBatch records and counts the entire uploaded slice as failed.
 	var skipped int64
 
 	// Track mailbox IDs for rollback compensation
@@ -2415,14 +2429,12 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 		if err != nil {
 			if errors.Is(err, consts.ErrUIDConflict) {
 				// The preserved UID is already taken in the target mailbox: this message
-				// was NOT stored. Report it as failed (never as a dedup skip) and go on
-				// with the batch.
+				// was NOT stored (never a dedup skip). The unique violation behind it has
+				// aborted the transaction, so nothing else of the batch can be stored
+				// either: stop here instead of sending statements PostgreSQL ignores
+				// until the rollback, whose error would then hide this cause.
 				logger.Error("Preserved UID already in use, message not imported", "path", up.msg.path, "hash", up.msg.hash)
-				uidConflicts = append(uidConflicts, failedImport{
-					path:   up.msg.path,
-					reason: "preserved UID already in use in the target mailbox (re-run without --preserve-uids to import it)",
-				})
-				continue
+				return nil, &batchUIDConflictError{path: up.msg.path, err: err}
 			}
 			if errors.Is(err, consts.ErrDBUniqueViolation) {
 				// Message already exists - skip but continue processing batch
@@ -2479,12 +2491,6 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 		return nil, fmt.Errorf("failed to update SQLite cache (batch reverted): %w", err)
 	}
 
-	for _, f := range uidConflicts {
-		i.recordFailedPath(f.path, f.reason)
-	}
-	if len(uidConflicts) > 0 {
-		atomic.AddInt64(&i.failedMessages, int64(len(uidConflicts)))
-	}
 	if skipped > 0 {
 		atomic.AddInt64(&i.skippedMessages, skipped)
 	}
@@ -2648,8 +2654,8 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 	var err error
 
 	if i.options.BatchTransactionMode {
-		// Fast path: Single transaction for entire batch (20x faster)
-		// SQLite is updated BEFORE PostgreSQL commit (atomicity guaranteed)
+		// One PostgreSQL transaction covers the batch. SQLite marks follow its commit;
+		// a mark failure invokes best-effort PostgreSQL compensation.
 		logger.Info("Using batch transaction mode")
 		successHashes, err = i.insertBatchToDBWithTransaction(uploaded)
 	} else {
@@ -2689,16 +2695,25 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 			// Interrupted: the database calls failed on the cancelled context. What
 			// the batch did not store is not a failure: its cache rows stay unmarked,
 			// pending for the next run, and importMessages reports the interruption.
+			// The batch returns the interruption, not the error of the call it cut
+			// short ("failed to look up account: ... context canceled").
 			atomic.AddInt64(&i.importedMessages, int64(len(successHashes)))
 			logger.Info("Import interrupted, rest of the batch left for the next run",
 				"imported", len(successHashes), "batch_size", len(batch))
-			return err
+			return i.ctx.Err()
 		}
 		logger.Error("Batch processing failed", "error", err)
 		// Everything in uploaded that wasn't successfully inserted is already tracked if individual mode
-		// Let's ensure BatchTransactionMode logs all if it aborted
+		// Let's ensure BatchTransactionMode logs all if it aborted: the message
+		// whose preserved UID ended the transaction with its own reason.
 		if i.options.BatchTransactionMode {
+			var conflict *batchUIDConflictError
+			errors.As(err, &conflict)
 			for _, up := range uploaded {
+				if conflict != nil && up.msg.path == conflict.path {
+					i.recordFailedPath(up.msg.path, uidConflictReason)
+					continue
+				}
 				i.recordFailedPath(up.msg.path, fmt.Sprintf("batch transaction aborted: %v", err))
 			}
 			atomic.AddInt64(&i.failedMessages, int64(len(uploaded)))
@@ -2847,9 +2862,10 @@ func (i *Importer) importMessages() error {
 
 		batch = append(batch, msg)
 
-		// Process when batch is full
+		// Process when batch is full. A batch the interrupt ended has logged it
+		// already, and an interrupt is not a batch error.
 		if len(batch) >= i.batchSize {
-			if err := i.processBatch(batch); err != nil {
+			if err := i.processBatch(batch); err != nil && i.ctx.Err() == nil {
 				logger.Warn("Batch processing had errors", "error", err)
 			}
 			batch = batch[:0] // Reset batch
@@ -2858,7 +2874,7 @@ func (i *Importer) importMessages() error {
 
 	// Process remaining messages
 	if len(batch) > 0 {
-		if err := i.processBatch(batch); err != nil {
+		if err := i.processBatch(batch); err != nil && i.ctx.Err() == nil {
 			logger.Warn("Final batch had errors", "error", err)
 		}
 	}

@@ -161,7 +161,8 @@ func (rd *ResilientDatabase) CreateScriptWithRetry(ctx context.Context, AccountI
 	return result.(*db.SieveScript), nil
 }
 
-// SetScriptActiveWithRetry sets a script's active status with retry logic
+// SetScriptActiveWithRetry sets a script's active status with retry logic. It returns
+// consts.ErrDBNotFound, changing nothing, when the account has no script with that ID.
 func (rd *ResilientDatabase) SetScriptActiveWithRetry(ctx context.Context, scriptID, AccountID int64, active bool) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(ctx, true).SetScriptActive(ctx, tx, scriptID, AccountID, active)

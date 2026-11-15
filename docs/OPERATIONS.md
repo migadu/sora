@@ -83,8 +83,9 @@ Sora starts in this order. A failure in any step ends the process with status 1,
 
 1. **Flags.** `-version` prints and exits here.
 2. **Config file.** Sora reads and parses the file. Unknown keys and duplicate keys are warnings, not
-   errors ([CONFIGURATION.md](CONFIGURATION.md)). These warnings go to standard error, because
-   logging is not set up yet.
+   errors ([CONFIGURATION.md](CONFIGURATION.md)). Logging is not set up yet, so Sora holds these
+   warnings and writes them to the `[logging]` output at step 6, at its level. If startup stops
+   before step 6, it writes them to standard error.
 3. **Validation.** In this order:
    - Unknown names in `[sieve] enabled_extensions` are a warning.
    - Each `[[server]]` block is validated: a `type`, `name` and `addr`, a known `type`, and no
@@ -94,6 +95,14 @@ Sora starts in this order. A failure in any step ends the process with status 1,
    - A listener with `proxy_protocol = true` requires a non-empty `[servers] trusted_networks`.
    - Two `[[server]]` blocks may not share a `name` or an `addr`.
    - At least one `[[server]]` block must exist.
+   - A server that queries the database needs a `[database.write]` host (step 9.2 says which do).
+   - A node that uses S3 needs `[s3] bucket` and `endpoint`, a `timeout` that parses, `access_key`
+     and `secret_key` both set or both empty, and with `encrypt = true` a valid `encryption_key`.
+   - With `[cluster] enabled = true`, `addr` must be a specific IP address with a port memberlist can
+     bind, and `secret_key` the base64 of 32 bytes ([CLUSTER.md](CLUSTER.md)).
+   - The other checks of [CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup), such as
+     `[relay]`, `[relay.queue]`, `[uploader]` and `[cleanup]`. Every problem found is reported
+     before Sora exits.
 4. **Database endpoints.** A `[database.write]` or `[database.read]` section that is not in the file
    counts as not configured. This is how a proxy-only node runs without a database.
 5. **Global settings.** `bcrypt_cost` and `[sieve] max_execution_time` are applied.
@@ -109,11 +118,12 @@ Sora starts in this order. A failure in any step ends the process with status 1,
       PostgreSQL. A node with `managesieve`, `http_admin_api` or `http_user_api` needs PostgreSQL,
       and `http_user_api` also uses S3 to serve message bodies. A proxy needs PostgreSQL when it
       checks passwords in the database (no remote lookup, or
-      `[server.remote_lookup] lookup_local_users = true`). A database that is needed but not
-      configured stops startup.
-   3. **S3**, when needed: `[s3] access_key`, `secret_key`, `bucket` and `endpoint` must be set. Sora
-      does not contact S3 here and does not create the bucket. With `[s3] encrypt = true` the
-      encryption key is checked (64 hex characters).
+      `[server.remote_lookup] lookup_local_users = true`). Step 3 has checked that what it needs is
+      configured.
+   3. **S3**, when needed: the client is set up with `[s3] endpoint` and `bucket`. Without
+      `access_key` and `secret_key` the AWS default credential chain must supply them. Sora does not
+      contact S3 here and does not create the bucket. With `[s3] encrypt = true` the encryption key
+      is checked (64 hex characters).
    4. **PostgreSQL**, when needed: Sora connects to every write host, applies pending migrations
       through the first one it can reach ([Database migrations](#10-database-migrations)), and
       connects to the read hosts. A failed migration stops startup. Hosts that fail, read or write,
@@ -143,11 +153,12 @@ with status 1. It does not leave the other listeners running.
 ### Messages that stop startup
 
 Errors from steps 2 to 9 are written by Sora's error handler. Before step 6 the `[logging]` output
-is not open yet, so they go to standard error, in this form:
+is not open yet, so they go to standard error, after what Sora logged until then, in this form:
 
 ```
+[ERROR] 2026/01/15 10:00:00 ERROR: configuration file '<path>' not found: <why>
+[ERROR] 2026/01/15 10:00:00 ERROR: failed to parse configuration file '<path>': <why>
 [ERROR] 2026/01/15 10:00:00 ERROR: invalid configuration - <what>: <why>
-[ERROR] 2026/01/15 10:00:00 FATAL: operation '<what>' failed: <why>
 ```
 
 From step 6 on they are ERROR records of the `[logging]` output, in its format, like every other
@@ -463,8 +474,9 @@ keys. Use it when a log collector parses the lines.
 
 A few things are always written to the process's standard error, whatever `output` says:
 
-- Warnings from reading the config at startup (unknown keys, duplicate keys) and the startup errors
-  that happen before logging is set up ([Startup](#messages-that-stop-startup)).
+- The startup errors that happen before logging is set up ([Startup](#messages-that-stop-startup)),
+  with what Sora logged until then, such as the warnings about unknown or duplicate keys in the
+  config file. When startup gets past that point, those go to the `[logging]` output instead.
 - A Go panic and its stack trace.
 
 Under systemd these are in the journal even when Sora logs to a file. Check both when Sora does not

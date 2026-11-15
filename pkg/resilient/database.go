@@ -903,6 +903,13 @@ func (rd *ResilientDatabase) StoreHealthStatusWithRetry(ctx context.Context, hos
 
 // newRuntimeFailoverManager creates a new runtime failover manager with separate read/write pools
 func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfig, runMigrations bool, skipReadReplicas bool) (*RuntimeFailoverManager, error) {
+	// Without a write host nothing can run, whatever the replicas do: the migrations and
+	// every write go to [database.write]. sora refuses such a file in Config.Validate;
+	// sora-admin opens its database without that check.
+	if config.Write == nil || len(config.Write.Hosts) == 0 {
+		return nil, fmt.Errorf("[database.write] has no hosts: the migrations and every write go there, and [database.read] only takes reads off it")
+	}
+
 	manager := &RuntimeFailoverManager{
 		writePools:      make([]*DatabasePool, 0),
 		readPools:       make([]*DatabasePool, 0),
@@ -916,42 +923,40 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 	// 1. Migrations run once, through the first write host that connects (requires
 	//    exclusive migration lock); a host that is down does not skip them
 	// 2. Parallel creation could cause connection pool exhaustion during startup
-	if config.Write != nil && len(config.Write.Hosts) > 0 {
-		migrationsPending := runMigrations
-		for i, host := range config.Write.Hosts {
-			logger.Info("Creating write pool", "component", "RESILIENT-FAILOVER", "host", host, "index", i, "total", len(config.Write.Hosts))
+	migrationsPending := runMigrations
+	for i, host := range config.Write.Hosts {
+		logger.Info("Creating write pool", "component", "RESILIENT-FAILOVER", "host", host, "index", i, "total", len(config.Write.Hosts))
 
-			pool, err := createDatabasePool(ctx, host, config, config.Write, "write", migrationsPending)
-			if err != nil {
-				// The schema is shared by every write host: a node must not start on a
-				// schema whose migration failed, however many hosts it could reach.
-				if errors.Is(err, db.ErrMigrationFailed) {
-					return nil, err
-				}
-				logger.Error("Failed to create write pool for host, will retry periodically", "component", "RESILIENT-FAILOVER", "host", host, "error", err)
-				manager.failedHosts = append(manager.failedHosts, &FailedHost{
-					host:           host,
-					poolType:       "write",
-					endpointConfig: config.Write,
-					lastAttempt:    time.Now(),
-					attemptCount:   1,
-				})
-				continue
+		pool, err := createDatabasePool(ctx, host, config, config.Write, "write", migrationsPending)
+		if err != nil {
+			// The schema is shared by every write host: a node must not start on a
+			// schema whose migration failed, however many hosts it could reach.
+			if errors.Is(err, db.ErrMigrationFailed) {
+				return nil, err
 			}
-			migrationsPending = false
+			logger.Error("Failed to create write pool for host, will retry periodically", "component", "RESILIENT-FAILOVER", "host", host, "error", err)
+			manager.failedHosts = append(manager.failedHosts, &FailedHost{
+				host:           host,
+				poolType:       "write",
+				endpointConfig: config.Write,
+				lastAttempt:    time.Now(),
+				attemptCount:   1,
+			})
+			continue
+		}
+		migrationsPending = false
 
-			dbPool := &DatabasePool{
-				database: pool,
-				host:     host,
-			}
-			dbPool.isHealthy.Store(true) // Start as healthy
+		dbPool := &DatabasePool{
+			database: pool,
+			host:     host,
+		}
+		dbPool.isHealthy.Store(true) // Start as healthy
 
-			manager.writePools = append(manager.writePools, dbPool)
+		manager.writePools = append(manager.writePools, dbPool)
 
-			// First pool becomes the current one
-			if i == 0 {
-				manager.currentWriteIdx.Store(0)
-			}
+		// First pool becomes the current one
+		if i == 0 {
+			manager.currentWriteIdx.Store(0)
 		}
 	}
 

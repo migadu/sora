@@ -261,6 +261,14 @@ func maskSingleURL(value string) (string, bool) {
 		// just because another part of their URL has an invalid escape or port.
 		return SecretMask, true
 	}
+	// Unless that start of the password is a number, or empty: then it is a valid
+	// port and the URL parses, with the rest of the password and its "@" in the path
+	// or fragment. Mask such a URL whole too, as the parser cannot tell it from a
+	// host with a port and an "@" in its path.
+	if u.User == nil && hasPortSeparator(u.Host) &&
+		(strings.Contains(u.EscapedPath(), "@") || strings.Contains(u.EscapedFragment(), "@")) {
+		return SecretMask, true
+	}
 	if u.User == nil && u.RawQuery == "" {
 		if strings.Contains(authority, "@") {
 			return SecretMask, true
@@ -279,6 +287,13 @@ func maskSingleURL(value string) (string, bool) {
 	}
 	u.RawQuery = maskQueryValues(u.RawQuery)
 	return u.String(), false
+}
+
+// hasPortSeparator reports whether a URL host ("host:port", "[v6]:port", or with an
+// empty port) has a ":" before its port.
+func hasPortSeparator(host string) bool {
+	i := strings.LastIndexByte(host, ':')
+	return i >= 0 && i > strings.LastIndexByte(host, ']')
 }
 
 // findURLEnd returns the end offset in s of the URL whose scheme starts at schemeStart
