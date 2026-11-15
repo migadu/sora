@@ -423,7 +423,19 @@ field `uploader path`, with an error that begins
 of them, and exits with status 1. Either set `[uploader] path = "/tmp/sora/uploads"` until
 `sora-admin uploader status` shows nothing pending and then remove it, or stop Sora and move that
 directory to `/var/spool/sora/uploads`. `sora-admin uploader resolve` refuses to run in the same
-case.
+case. At startup only entries of the user Sora runs as, or of root, count: any local user can
+write to `/tmp`, so an entry there that belongs to another user, or that Sora cannot read, is
+logged as a warning (`Uploader: ignoring an entry under the previous default [uploader] path ...`)
+and passed over with everything below it, as is the whole old spool when `/tmp/sora` is a link
+of another user. `resolve`, often run as root, cannot tell which user the server runs as: it
+counts every entry and refuses when it cannot read one. Neither counts a file at
+`/tmp/sora/uploads` itself: bodies were staged in directories below it.
+
+The startup check assumes the service user is unchanged from the version that staged those
+bodies. Changing that user in the same upgrade, or leaving genuine old bodies unreadable, can
+make startup pass over bodies the database still needs. Inspect and drain or migrate those
+bodies before starting on the new path. File ownership does not establish that a spool belongs
+to the connected database; use the matching instance and configuration.
 
 Check the host's old spool before the first start with the new systemd unit. Its
 [`PrivateTmp=true`](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#PrivateTmp=)
