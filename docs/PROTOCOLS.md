@@ -622,8 +622,9 @@ Rules:
   `UIDPLUS`, `ESEARCH`, `SEARCHRES`, `ESORT`, `SORT`, `SORT=DISPLAY`, `SPECIAL-USE`,
   `CREATE-SPECIAL-USE`, `LIST-EXTENDED`, `LIST-STATUS`, `STATUS=SIZE`, `BINARY`, `CONDSTORE`,
   `QRESYNC`, `NOTIFY`, `CHILDREN`, `ID`, `NAMESPACE`, `METADATA`, `THREAD=REFERENCES`,
-  `THREAD=REFS`, `THREAD=ORDEREDSUBJECT`, `MULTISEARCH`, and `PREVIEW` when enabled. Any other
-  name is ignored (logged at debug level).
+  `THREAD=REFS`, `THREAD=ORDEREDSUBJECT`, `MULTISEARCH`, and `PREVIEW` when enabled. Names are
+  case-insensitive (`idle` is `IDLE`). Any other name is ignored and logged at WARN when the
+  server starts.
 - `IMAP4rev2` includes `NAMESPACE`, `UNSELECT`, `UIDPLUS`, `ESEARCH`, `SEARCHRES`, `ENABLE`,
   `IDLE`, `SASL-IR`, `LIST-EXTENDED`, `LIST-STATUS`, `MOVE`, `LITERAL-`, `STATUS=SIZE` and
   `CHILDREN`. Removing one of these with `disabled_caps` also removes `IMAP4rev2`, so clients fall
@@ -691,6 +692,10 @@ Matching:
 - Patterns are Go regular expressions (RE2 syntax). A pattern that does not compile stops startup,
   naming the entry, the key and the pattern; `sora-admin config validate` reports it too, and a
   reload with it is skipped for that server.
+- An entry needs at least one of `client_name`, `client_version` and `ja4_fingerprints`; one
+  without, which would match no client, stops startup the same way. An empty `client_name` or
+  `client_version` counts as left out, but an empty `ja4_fingerprints` pattern would match every
+  fingerprint, so it stops startup too.
 - The key is `ja4_fingerprints`, a list. A single `ja4_fingerprint` key is unknown and ignored.
 
 Where the JA4 fingerprint comes from, in order of preference:
@@ -717,7 +722,8 @@ When filters apply:
 As with `disabled_caps`, a filter that removes a capability included in `IMAP4rev2` also removes
 `IMAP4rev2` for that session, unless the connection has it enabled (above), so the client falls
 back to IMAP4rev1 and really loses the extension. The same list of removable names applies as for
-`disabled_caps`. When a filter changes the list, the session logs `capability filters applied`
+`disabled_caps`, case-insensitively, and any other name is logged at WARN when the server starts,
+with the entry number. When a filter changes the list, the session logs `capability filters applied`
 with the client and the removed names.
 
 ---

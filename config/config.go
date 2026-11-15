@@ -33,9 +33,15 @@ type ClientCapabilityFilter struct {
 	Reason          string   `toml:"reason"`           // Human-readable reason for the filter
 }
 
-// Validate reports the first pattern of the filter that does not compile. The IMAP
-// server skips such a filter, so the capabilities it names stay advertised.
+// Validate reports why the filter cannot work as written: it has no pattern, so it
+// matches no client, or a pattern does not compile (the first one is named), so
+// the IMAP server skips the filter. Either way the capabilities it names stay
+// advertised. An empty client_name or client_version counts as unset, but an
+// empty ja4_fingerprints pattern would match every fingerprint, so it is refused.
 func (f ClientCapabilityFilter) Validate() error {
+	if f.ClientName == "" && f.ClientVersion == "" && len(f.JA4Fingerprints) == 0 {
+		return errors.New("none of client_name, client_version and ja4_fingerprints is set, so it matches no client")
+	}
 	if _, err := regexp.Compile(f.ClientName); err != nil {
 		return fmt.Errorf("client_name %q: %w", f.ClientName, err)
 	}
@@ -43,6 +49,9 @@ func (f ClientCapabilityFilter) Validate() error {
 		return fmt.Errorf("client_version %q: %w", f.ClientVersion, err)
 	}
 	for _, pattern := range f.JA4Fingerprints {
+		if pattern == "" {
+			return fmt.Errorf("ja4_fingerprints %q: an empty pattern matches every TLS fingerprint", pattern)
+		}
 		if _, err := regexp.Compile(pattern); err != nil {
 			return fmt.Errorf("ja4_fingerprints %q: %w", pattern, err)
 		}
@@ -2868,7 +2877,8 @@ func (s *ServerConfig) Validate() error {
 	}
 
 	// Only the IMAP backend reads client_filters. It would skip a filter whose pattern
-	// does not compile and keep advertising what the filter hides.
+	// does not compile, or never match one without a pattern, and keep advertising
+	// what the filter hides.
 	if s.Type == "imap" {
 		for i, filter := range s.ClientFilters {
 			if err := filter.Validate(); err != nil {
