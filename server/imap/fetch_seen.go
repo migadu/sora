@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"sync"
 
 	"github.com/migadu/go-imap"
@@ -9,49 +10,60 @@ import (
 )
 
 // A streamed FETCH can name an entire mailbox while Poll waits for its sequence
-// view. Keep its optional echo memo bounded; batches beyond this limit are
+// view. Keep its optional echo memo bounded; updates beyond this limit are
 // reported again by Poll instead of retaining one entry per mailbox message.
 const maxFetchSeenEchoEntries = 65536
 
-// unseenMessageUIDs returns the UIDs of messages in the batch that do not yet
-// carry \Seen.
-func unseenMessageUIDs(messages []db.Message) []imap.UID {
-	var uids []imap.UID
-	for i := range messages {
-		if !db.ContainsFlag(messages[i].BitwiseFlags, db.FlagSeen) {
-			uids = append(uids, messages[i].UID)
-		}
+// setImplicitSeen sets \Seen on msg, whose BODY[] or BINARY[] section the FETCH
+// is about to return (RFC 9051 §6.4.5: "The \Seen flag is implicitly set; if
+// this causes the flags to change, they SHOULD be included as part of the
+// FETCH responses"), and returns the options to write its response with. A
+// non-nil answer must be released after the response; answered is called only
+// once the response successfully closes.
+//
+// It is called for one message at a time, after its body is loaded and its
+// BINARY sections are decoded, so a FETCH that fails part way sets \Seen only
+// on the messages it answered (#1222). Setting it for a whole stream chunk
+// ahead would have to be undone on failure, which would also clear a \Seen
+// another session set, or found already set, in the meantime. The update is
+// one write next to the body load the message needs anyway, and none for a
+// message that is \Seen already.
+func (s *IMAPSession) setImplicitSeen(ctx context.Context, msg *db.Message, options *imap.FetchOptions, mailboxID int64, tracker *imapserver.SessionTracker) (*imap.FetchOptions, *implicitSeenAnswer) {
+	if db.ContainsFlag(msg.BitwiseFlags, db.FlagSeen) {
+		return options, nil
 	}
-	return uids
+	answer := s.lockImplicitSeenAnswer(mailboxID)
+	results, err := s.server.rdb.AddMessageFlagsBatchWithRetry(ctx, []imap.UID{msg.UID}, mailboxID, []imap.Flag{imap.FlagSeen})
+	if err != nil {
+		s.DebugLog("failed to mark message as seen", "uid", msg.UID, "error", err)
+		answer.release()
+		return options, nil
+	}
+	s.useMasterDB.Store(true)
+	if !applyImplicitSeenUpdate(msg, results) {
+		answer.release()
+		return options, nil
+	}
+	answer.expect(map[imap.UID]bool{msg.UID: true}, tracker)
+	return s.fetchOptionsForImplicitSeen(options, true), answer
 }
 
-// applyImplicitSeenUpdates updates the in-memory message models with the
-// authoritative post-update flags and mod-sequences returned by
-// AddMessageFlagsBatch, returning the set of UIDs whose flags actually changed.
-func applyImplicitSeenUpdates(messages []db.Message, batchResults []db.BatchFlagUpdateResult) map[imap.UID]bool {
-	if len(batchResults) == 0 {
-		return nil
-	}
-	byUID := make(map[imap.UID]db.BatchFlagUpdateResult, len(batchResults))
-	for _, res := range batchResults {
-		if !res.PreconditionFailed {
-			byUID[res.UID] = res
-		}
-	}
-	changed := make(map[imap.UID]bool, len(byUID))
-	for i := range messages {
-		res, ok := byUID[messages[i].UID]
-		if !ok {
+// applyImplicitSeenUpdate updates the in-memory message model with the
+// authoritative post-update flags and mod-sequence AddMessageFlagsBatch
+// returned for it, reporting whether its flags actually changed.
+func applyImplicitSeenUpdate(msg *db.Message, results []db.BatchFlagUpdateResult) bool {
+	for _, res := range results {
+		if res.UID != msg.UID || res.PreconditionFailed {
 			continue
 		}
 		sysFlags, customFlags := db.SplitFlags(res.Flags)
-		messages[i].BitwiseFlags = db.FlagsToBitwise(sysFlags)
-		messages[i].CustomFlags = customFlags
+		msg.BitwiseFlags = db.FlagsToBitwise(sysFlags)
+		msg.CustomFlags = customFlags
 		modSeq := res.ModSeq
-		messages[i].UpdatedModSeq = &modSeq
-		changed[messages[i].UID] = true
+		msg.UpdatedModSeq = &modSeq
+		return true
 	}
-	return changed
+	return false
 }
 
 // fetchOptionsForImplicitSeen returns the per-message FetchOptions to use when
@@ -79,15 +91,15 @@ func (s *IMAPSession) fetchOptionsForImplicitSeen(options *imap.FetchOptions, se
 }
 
 // implicitSeenAnswer keeps Poll from reporting again the \Seen that one FETCH
-// batch set and its FETCH responses already carried (as STORE does with its
+// update set and its FETCH response already carried (as STORE does with its
 // own answers): each message answered with FLAGS is recorded in ownStoreEcho
 // at the mod-sequence the update gave it, and Poll skips exactly that update.
 //
 // ownStoreMu is taken before the update, so Poll (the NOTIFY pump polls
 // concurrently with the command) either reads its delta before the update or
-// finds the answered rows recorded. It is released as soon as the last changed
-// message is recorded, so it is not held while the rest of the batch streams
-// bodies, nor across batches, and at the latest when the batch ends. Poll and
+// finds the answered row recorded. It is released when that response completes,
+// or when an error leaves its update to Poll. It is not held during preflight
+// body loading or between messages. Poll and
 // another FETCH registering its metadata read contend for it. A message whose
 // response was not written, because the FETCH failed or stopped before it, is never recorded:
 // Poll reports its \Seen instead, or the client would never learn of it.
@@ -114,8 +126,8 @@ func (s *IMAPSession) beginFetch() func() {
 	}
 }
 
-// lockImplicitSeenAnswer takes ownStoreMu ahead of a FETCH batch's \Seen
-// update. The caller must call release once the batch ends.
+// lockImplicitSeenAnswer takes ownStoreMu ahead of a FETCH's \Seen
+// update. The caller must call release once its response ends.
 func (s *IMAPSession) lockImplicitSeenAnswer(mailboxID int64) *implicitSeenAnswer {
 	s.ownStoreMu.Lock()
 	return &implicitSeenAnswer{s: s, mailboxID: mailboxID, unlock: sync.OnceFunc(s.ownStoreMu.Unlock)}
@@ -166,7 +178,7 @@ func (a *implicitSeenAnswer) answered(uid imap.UID, modSeq uint64) {
 	}
 }
 
-// release ends the batch: the messages not answered by now are left to Poll.
+// release ends the update: messages not answered by now are left to Poll.
 func (a *implicitSeenAnswer) release() {
 	a.pending = 0
 	a.unlock()
