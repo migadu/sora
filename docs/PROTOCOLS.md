@@ -500,7 +500,8 @@ numbers for `STORE`, UIDs for `UID STORE`), per RFC 7162 §3.1.3.
 
 `GETMETADATA` and `SETMETADATA` store annotations per mailbox, and per account for the server
 entry (mailbox `""`). Entry names must start with `/private/` or `/shared/` and are
-case-insensitive. A wildcard mailbox name (`*` or `%`) gets `NO [CLIENTBUG]`. The size and count
+case-insensitive; a `SETMETADATA` naming one entry twice in different letter case gets
+`BAD [CLIENTBUG]`. A wildcard mailbox name (`*` or `%`) gets `NO [CLIENTBUG]`. The size and count
 limits come from the `[metadata]` section (64 KiB per entry, 100 entries per mailbox, 50 server
 entries per account, 1 MiB per account by default); see [STORAGE.md](STORAGE.md).
 
