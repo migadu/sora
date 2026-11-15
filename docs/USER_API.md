@@ -894,7 +894,7 @@ call the API through the proxy.
 | `tls_verify` | `false` | Require client certificates. |
 | `tls_default_domain` | none | Certificate name for clients without SNI, with the `[tls]` manager. |
 | `[server.remote_lookup]` | off | Route lookups; see [PROXY.md](PROXY.md). |
-| `[server.lookup_cache]` | off | Caches lookup answers; same keys and defaults as in section 2. |
+| `[server.lookup_cache]` | off | Caches lookup answers; same keys and defaults as in section 2, except `positive_revalidation_window`: the proxy checks no passwords (the backend does), and warns at startup when it is set. |
 | `[server.auth_rate_limit]` | off | Login rate limiting of every login through the proxy (12.1). The keys are in [AUTHENTICATION.md](AUTHENTICATION.md). Blocked clients show at `GET /admin/auth/blocked?protocol=userapi_proxy`. |
 
 `allowed_hosts`, `token_duration` and `token_issuer` have no effect on this proxy; set in its block,
