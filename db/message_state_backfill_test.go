@@ -223,6 +223,43 @@ func TestMessageStateBackfillMigration(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 2, summary.UnseenCount)
 	})
+
+	// The migration reads the script's progress table and drops it as Sora's database
+	// user, the owner of messages (docs/DATABASE.md, Privileges), while an operator may
+	// well run the script as a superuser. A table belongs to the role that creates it, so
+	// a superuser's table would stop the migration with "permission denied" and leave the
+	// version dirty.
+	t.Run("the script's progress table belongs to the owner of messages", func(t *testing.T) {
+		pool, _, _ := open(t)
+		owner := fmt.Sprintf("sora_backfill_owner_%d", time.Now().UnixNano())
+		if _, err := pool.Exec(ctx, "CREATE ROLE "+owner+" NOLOGIN"); err != nil {
+			t.Skipf("cannot create a role to own messages: %v", err)
+		}
+		t.Cleanup(func() {
+			for _, stmt := range []string{"REASSIGN OWNED BY " + owner + " TO CURRENT_USER", "DROP OWNED BY " + owner, "DROP ROLE " + owner} {
+				if _, err := pool.Exec(ctx, stmt); err != nil {
+					t.Logf("%s: %v", stmt, err)
+				}
+			}
+		})
+		_, err := pool.Exec(ctx, "GRANT USAGE ON SCHEMA public TO "+owner+"; ALTER TABLE messages OWNER TO "+owner)
+		require.NoError(t, err)
+
+		loadScript(t, pool) // as the test's superuser
+		_, err = pool.Exec(ctx, `CALL sora_backfill_message_state(500000, 0)`)
+		require.NoError(t, err)
+
+		tx, err := pool.Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		_, err = tx.Exec(ctx, "SET LOCAL ROLE "+owner)
+		require.NoError(t, err)
+		var checked *int64
+		require.NoError(t, tx.QueryRow(ctx, `SELECT max(checked_through) FROM message_state_backfill`).Scan(&checked),
+			"the owner of messages must be able to read the progress")
+		_, err = tx.Exec(ctx, `DROP TABLE message_state_backfill`)
+		require.NoError(t, err, "the owner of messages must be able to drop the progress table")
+	})
 }
 
 // COPY and MOVE give the new message its source's flags. A source without a

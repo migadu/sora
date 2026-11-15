@@ -32,6 +32,17 @@ CREATE TABLE IF NOT EXISTS message_state_backfill (
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
 
+-- Migration 000063 reads this table and drops it as Sora's database user, the owner of
+-- messages, but a table belongs to the role that created it. Created by a superuser, it
+-- would stop the migration with "permission denied" and leave the version dirty, so hand
+-- it to the owner of messages, whoever runs this script.
+DO $$
+BEGIN
+	EXECUTE format('ALTER TABLE message_state_backfill OWNER TO %s',
+		(SELECT relowner::regrole FROM pg_class WHERE oid = 'messages'::regclass));
+END
+$$;
+
 -- One batch: give the live messages with ids in (p_lo, p_hi] that have no row one. Returns
 -- the number of rows added. The same statement as in migration 000063. ARRAY(subquery) is
 -- evaluated ahead of the outer scan, which keeps that on the primary key, and the range is
