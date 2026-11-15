@@ -26,6 +26,8 @@ func TestValidateScriptRefusesMalformedRegexKey(t *testing.T) {
 		{"body", `require ["body", "regex"]; if body :regex "(" { stop; }`},
 		{"hasflag", `require ["imap4flags", "regex"]; if hasflag :regex "(" { stop; }`},
 		{"pattern too long", `require "regex"; if header :regex "Subject" "` + strings.Repeat("a", 1001) + `" { stop; }`},
+		// Issue #1428: 1000 bytes that compile to about a million instructions.
+		{"program too large", `require "regex"; if header :regex "Received" "(?:` + strings.Repeat("a", 990) + `){1000}" { stop; }`},
 	}
 	for _, tc := range refused {
 		t.Run(tc.name, func(t *testing.T) {
@@ -101,5 +103,76 @@ if header :regex "Subject" "^invoice ([0-9]+)$" { fileinto "Invoices/${1}"; }
 	}
 	if want := []string{"Invoices/42"}; !slices.Equal(result.Mailboxes, want) {
 		t.Fatalf("Mailboxes = %q, want %q", result.Mailboxes, want)
+	}
+}
+
+// evaluateReceived runs script against a message with the given number of
+// Received fields and returns what Evaluate allocated.
+func evaluateReceived(t *testing.T, script string, fields int) (uint64, error) {
+	t.Helper()
+	executor, err := NewSieveExecutorWithExtensions(script, EffectiveExtensions(nil))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	received := make([]string, fields)
+	for i := range received {
+		received[i] = "from host.example.com by mx.example.org"
+	}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err = executor.Evaluate(context.Background(), Context{
+		EnvelopeFrom: "sender@example.com",
+		EnvelopeTo:   "user@example.com",
+		Header:       map[string][]string{"Received": received, "Subject": {"x"}, "From": {"sender@example.com"}},
+		Message:      bodyOnly("body"),
+	})
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc, err
+}
+
+// TestRegexKeyTooLargeRefusedAtDelivery is issue #1428: a :regex key known only
+// at delivery, through a variable, whose program would be too large is refused
+// then, as the same key written as a string is refused by ValidateScript. It was
+// compiled, to about a million instructions (some 45 MB), for each of the ten
+// Received fields: some 300 ms and 2 GB for every message to the account.
+func TestRegexKeyTooLargeRefusedAtDelivery(t *testing.T) {
+	script := `require ["variables", "regex", "fileinto"];
+set "p" "(?:` + strings.Repeat("a", 990) + `){1000}";
+if header :regex "Received" "${p}" { fileinto "hit"; }
+`
+	if _, err := evaluateReceived(t, script, 10); err == nil || !strings.Contains(err.Error(), "too complex") {
+		t.Fatalf("Evaluate: %v, want a too complex error", err)
+	}
+}
+
+// TestRegexKeyCompiledOncePerDelivery is issue #1428: a :regex key is compiled
+// once per delivery, not once for every value its test matches it against, as
+// Pigeonhole compiles each key once per match operation. The key compiles to
+// 8000 instructions, within the bound.
+func TestRegexKeyCompiledOncePerDelivery(t *testing.T) {
+	const key = "(?:abcdefgh){1000}"
+	scripts := map[string]string{
+		"constant": `require ["regex", "fileinto"];
+if header :regex "Received" "` + key + `" { fileinto "hit"; }
+`,
+		"variable": `require ["variables", "regex", "fileinto"];
+set "p" "` + key + `";
+if header :regex "Received" "${p}" { fileinto "hit"; }
+`,
+	}
+	for name, script := range scripts {
+		t.Run(name, func(t *testing.T) {
+			one, err := evaluateReceived(t, script, 1)
+			if err != nil {
+				t.Fatalf("Evaluate: %v", err)
+			}
+			ten, err := evaluateReceived(t, script, 10)
+			if err != nil {
+				t.Fatalf("Evaluate: %v", err)
+			}
+			if ten > 2*one {
+				t.Fatalf("matching the key against ten Received fields allocated %d KB, against one %d KB", ten>>10, one>>10)
+			}
+		})
 	}
 }
