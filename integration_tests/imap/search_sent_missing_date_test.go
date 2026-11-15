@@ -54,6 +54,9 @@ func TestIMAP_SentSearchSkipsMissingAndInvalidDates(t *testing.T) {
 			{"UID SEARCH OR SENTON 1-Jan-2020 SENTON 2-Jan-2020", "* SEARCH 3 4"},
 			{"UID SORT (DATE) UTF-8 SENTON 1-Jan-2020", "* SORT 4"},
 			{"UID THREAD REFERENCES UTF-8 SENTON 1-Jan-2020", "* THREAD (4)"},
+			{"THREAD REFERENCES UTF-8 SENTON 1-Jan-2020", "* THREAD (4)"},
+			{"THREAD REFERENCES UTF-8 NOT SENTON 1-Jan-2020", "* THREAD (1)(2)(3)"},
+			{"THREAD REFERENCES UTF-8 OR SENTON 1-Jan-2020 SENTON 2-Jan-2020", "* THREAD (4)(3)"},
 		} {
 			t.Run(mailbox+" "+tc.cmd, func(t *testing.T) {
 				lines, tagged := rc.cmd(fmt.Sprintf("q%d", i), tc.cmd)

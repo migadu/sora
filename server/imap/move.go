@@ -18,6 +18,10 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 	}
 	ctx = s.pinnedContext(ctx)
 
+	// The client's numbering holds still while its numbers are resolved (seqViewMu).
+	s.seqViewMu.RLock()
+	defer s.seqViewMu.RUnlock()
+
 	// First, safely read necessary session state
 	var selectedMailbox *db.DBMailbox
 	var selectedMailboxID int64
@@ -59,8 +63,8 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 	selectedMailbox = s.selectedMailbox
 	selectedMailboxID = selectedMailbox.ID
 
-	// Use our helper method that assumes the mutex is held (read lock is sufficient)
-	decodedNumSet = s.decodeNumSetLocked(numSet)
+	view := s.seqViewLocked()
+	decodedNumSet = s.decodeNumSetLocked(view, numSet)
 	release() // Release read lock
 
 	// Perform database operations outside of lock
@@ -107,7 +111,7 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		}
 	}
 
-	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet)
+	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(view.context(ctx), selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return s.internalError("failed to retrieve messages: %v", err)
 	}
