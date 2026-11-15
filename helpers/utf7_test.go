@@ -54,6 +54,28 @@ func TestDecodeModifiedUTF7(t *testing.T) {
 		{"encoded unit separator 0x1f", "&AB8-", "\x1f", false},
 		{"encoded del 0x7f", "&AH8-", "\x7f", false},
 
+		// RFC 3501 §5.1.3: null shifts ("-&" while in BASE64) are not permitted.
+		// "&U,BTFw-&ZeVnLIqe-" is the RFC's own example of a superfluous shift.
+		{"null shift", "&AOk-&AOk-", "", true},
+		{"null shift rfc example", "&U,BTFw-&ZeVnLIqe-", "", true},
+		{"superfluous shift corrected", "&U,BTF2XlZyyKng-", "台北日本語", false},
+		{"escaped ampersand between shifts", "&AOk-&-&AOk-", "é&é", false},
+		{"ascii between shifts", "&AOk-a&AOk-", "éaé", false},
+
+		// RFC 9051 §A.1: only the modified base64 alphabet is permitted in modified
+		// base64 text; RFC 2152 omits the "=" pad character.
+		{"pad in segment", "&AOk=-", "", true},
+		{"pads after surrogate pair", "&2D3eCg==-", "", true},
+		{"crlf in segment", "&AO\r\n\r\nk-", "", true},
+		{"lf in segment", "&A\n\n\n\nOk-", "", true},
+		{"standard base64 slash", "&U/BTFw-", "", true},
+
+		// RFC 2152: discarded bits at the end of the segment must be zero.
+		{"non-zero 2 discarded bits", "&AOl-", "", true},
+		{"non-zero 2 discarded bits 2", "&AOn-", "", true},
+		{"non-zero 4 discarded bits", "&AOkA6R-", "", true},
+		{"zero 4 discarded bits", "&AOkA6Q-", "éé", false},
+
 		// Edge cases
 		{"just ampersand-dash", "&-", "&", false},
 		{"multiple ampersand escapes", "&-&-&-", "&&&", false},
