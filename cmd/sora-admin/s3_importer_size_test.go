@@ -64,7 +64,7 @@ func TestS3Importer_EncryptedObjectStoresMessageSize(t *testing.T) {
 		t.Fatalf("stored object is %d octets, the size of the message: not encrypted", stored)
 	}
 
-	si, err := NewS3Importer(rdb, s3storage, S3ImporterOptions{Email: email, Workers: 1, CleanupDB: true, InstanceID: "test-instance"})
+	si, err := NewS3Importer(ctx, rdb, s3storage, S3ImporterOptions{Email: email, Workers: 1, CleanupDB: true, InstanceID: "test-instance"})
 	if err != nil {
 		t.Fatal(err)
 	}
