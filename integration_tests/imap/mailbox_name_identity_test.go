@@ -332,7 +332,7 @@ func TestIMAP_ListSubscribedKeysNamesAsTheDatabaseDoes(t *testing.T) {
 		if err := c.Create(name, nil).Wait(); err != nil {
 			t.Fatalf("CREATE %q: %v", name, err)
 		}
-		defer c.Delete(name).Wait()
+		defer func() { c.Delete(name).Wait() }()
 		if err := c.Subscribe(name).Wait(); err != nil {
 			t.Fatalf("SUBSCRIBE %q: %v", name, err)
 		}
@@ -340,8 +340,8 @@ func TestIMAP_ListSubscribedKeysNamesAsTheDatabaseDoes(t *testing.T) {
 
 		listed := listByName(t, c, "*", &imap.ListOptions{SelectSubscribed: true})
 		for _, want := range []string{"INBOX", name} {
-			if got := listed[want]; got == nil || !slices.Contains(got.Attrs, imap.MailboxAttrSubscribed) {
-				t.Errorf("LIST (SUBSCRIBED) \"\" *: want %q listed \\Subscribed; listed %v", want, mapKeys(listed))
+			if got := listed[want]; got == nil || !slices.Contains(got.Attrs, imap.MailboxAttrSubscribed) || slices.Contains(got.Attrs, imap.MailboxAttrNonExistent) {
+				t.Errorf("LIST (SUBSCRIBED) \"\" *: want live %q listed \\Subscribed; got %+v; listed %v", want, got, mapKeys(listed))
 			}
 		}
 	})
