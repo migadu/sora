@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -23,7 +24,7 @@ type RelayConfig struct {
 	SMTPUseStartTLS bool   `toml:"smtp_use_starttls"`  // Use STARTTLS instead of direct TLS (default: false); ignored when smtp_tls = false
 	SMTPTLSCertFile string `toml:"smtp_tls_cert_file"` // Client certificate for mTLS (optional)
 	SMTPTLSKeyFile  string `toml:"smtp_tls_key_file"`  // Client key for mTLS (optional)
-	SMTPHELOHost    string `toml:"smtp_helo_host"`     // Hostname to send in EHLO/HELO (default: "localhost"). Set to your FQDN for correct deliverability.
+	SMTPHELOHost    string `toml:"smtp_helo_host"`     // Hostname to send in EHLO/HELO (default: the system hostname, or "localhost" if it cannot be read). Set to your FQDN for correct deliverability.
 
 	// HTTP API relay configuration
 	HTTPURL   string `toml:"http_url"`                 // HTTP API endpoint (e.g., "https://api.example.com/v1/mail/deliver")
@@ -68,15 +69,87 @@ func (r *RelayConfig) IsQueueEnabled() bool {
 	return r.IsConfigured()
 }
 
-// Validate checks that a configured relay has a type the server can send with. Any
-// [relay] type turns the relay queue on, but only "smtp" and "http" (exactly) have a
-// handler, so any other type would queue every Sieve redirect and vacation reply with
-// no worker to send it.
+// Validate checks that a configured relay has a type the server can send with and a
+// destination to send to. Any [relay] type turns the relay queue on, but only "smtp"
+// and "http" (exactly) have a handler, so any other type would queue every Sieve
+// redirect and vacation reply with no worker to send it. Likewise a handler without a
+// usable smtp_host or http_url fails every attempt, as a temporary error, until the
+// message is moved to failed/.
 func (r *RelayConfig) Validate() error {
-	if !r.IsConfigured() || r.IsSMTP() || r.IsHTTP() {
+	switch {
+	case !r.IsConfigured():
 		return nil
+	case r.IsSMTP():
+		return r.validateSMTPHost()
+	case r.IsHTTP():
+		return r.validateHTTPURL()
 	}
 	return fmt.Errorf("unsupported [relay] type %q: expected \"smtp\" or \"http\"", r.Type)
+}
+
+// validateSMTPHost checks that smtp_host is a host:port the SMTP handler can dial: it
+// dials smtp_host as given, with no default port.
+func (r *RelayConfig) validateSMTPHost() error {
+	if r.SMTPHost == "" {
+		return errors.New(`[relay] type "smtp" requires smtp_host as host:port`)
+	}
+	host, port, err := net.SplitHostPort(r.SMTPHost)
+	shown := MaskEndpointURL(r.SMTPHost)
+	if err != nil {
+		// AddrError.Error repeats the raw endpoint, which may contain misplaced
+		// URL credentials. Keep the parser's reason, not its address.
+		reason := "invalid address"
+		var addrErr *net.AddrError
+		if errors.As(err, &addrErr) {
+			reason = addrErr.Err
+		}
+		return fmt.Errorf("[relay] smtp_host %q must be host:port: %s", shown, reason)
+	}
+	if host == "" {
+		// net.Dial would take the local system for it.
+		return fmt.Errorf("[relay] smtp_host %q has no host", shown)
+	}
+	if strings.ContainsAny(host, " \t\r\n/@?#") {
+		return fmt.Errorf("[relay] smtp_host %q has no valid host", shown)
+	}
+	if !validDialPort(port) {
+		return fmt.Errorf("[relay] smtp_host %q has no valid port", shown)
+	}
+	return nil
+}
+
+// validateHTTPURL checks that http_url is a URL the HTTP handler can post to: absolute,
+// http or https, with a host. The error quotes http_url masked as the config dump
+// shows it, since a query value may be the relay's API key.
+func (r *RelayConfig) validateHTTPURL() error {
+	if r.HTTPURL == "" {
+		return errors.New(`[relay] type "http" requires http_url`)
+	}
+	shown := MaskEndpointURL(r.HTTPURL)
+	u, err := url.Parse(r.HTTPURL)
+	if err != nil {
+		// The *url.Error repeats the URL, shown above; keep only its reason, which
+		// MaskURLError masks when it may quote a credential.
+		var urlErr *url.Error
+		if errors.As(MaskURLError(err), &urlErr) {
+			err = urlErr.Err
+		}
+		return fmt.Errorf("[relay] http_url %q is not a valid URL: %w", shown, err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return fmt.Errorf("[relay] http_url %q must be an absolute http:// or https:// URL with a host", shown)
+	}
+	if port := u.Port(); port != "" && !validDialPort(port) {
+		return fmt.Errorf("[relay] http_url %q has no valid port", shown)
+	}
+	return nil
+}
+
+// validDialPort reports whether port is a TCP port a dial can reach, resolved as
+// net.Dial resolves it: a number from 1 to 65535, or a known service name.
+func validDialPort(port string) bool {
+	p, err := net.LookupPort("tcp", port)
+	return err == nil && p > 0
 }
 
 // GetSMTPTLS reports whether the SMTP relay connection uses TLS (default true).
@@ -150,6 +223,33 @@ func (r *RelayConfig) GetQueuePath() string {
 		return r.Queue.Path
 	}
 	return "/var/spool/sora/relay" // Default path
+}
+
+// Validate rejects the [relay.queue] settings the relay worker cannot start with: a
+// circuit_breaker_timeout, cleanup_interval or failed_retention that does not parse, a
+// worker_interval of zero or less, which the worker's ticker cannot run with, and a
+// negative failed_retention, against which every failed message is overdue for
+// deletion. A worker_interval or retry_backoff that does not parse takes its default.
+func (q *RelayQueueConfig) Validate() error {
+	for _, f := range []struct {
+		key, value string
+		parse      func() (time.Duration, error)
+	}{
+		{"circuit_breaker_timeout", q.CircuitBreakerTimeout, q.GetCircuitBreakerTimeout},
+		{"cleanup_interval", q.CleanupInterval, q.GetCleanupInterval},
+		{"failed_retention", q.FailedRetention, q.GetFailedRetention},
+	} {
+		if _, err := f.parse(); err != nil {
+			return fmt.Errorf("invalid %s %q: %w", f.key, f.value, err)
+		}
+	}
+	if d, err := q.GetWorkerInterval(); err == nil && d <= 0 {
+		return fmt.Errorf("worker_interval must be positive, got %q", q.WorkerInterval)
+	}
+	if d, _ := q.GetFailedRetention(); d < 0 {
+		return fmt.Errorf("failed_retention must not be negative, got %q", q.FailedRetention)
+	}
+	return nil
 }
 
 // GetWorkerInterval parses the worker interval duration

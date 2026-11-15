@@ -55,18 +55,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  token:
-                    type: string
-                    description: JWT access token
-                  expires_at:
-                    type: string
-                    format: date-time
-                    description: Token expiration timestamp
-                  account_id:
-                    type: integer
-                    format: int64
+                $ref: '#/components/schemas/TokenResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '400':
@@ -77,26 +66,33 @@ paths:
       tags:
         - Authentication
       summary: Refresh JWT token
-      description: Exchange an existing valid token for a new one
+      description: |
+        Exchange a token that has not expired yet for a new one with a full token
+        lifetime. The token is sent in the request body; no Authorization header is
+        needed. The account is checked first: if its credential was removed, the
+        account deleted, or the password changed since the token was issued, the
+        answer is 401 and the client must log in again. An expired token cannot be
+        refreshed.
       operationId: refreshToken
-      security:
-        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
       responses:
         '200':
           description: Token refreshed successfully
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  token:
-                    type: string
-                    description: New JWT access token
-                  expires_at:
-                    type: string
-                    format: date-time
+                $ref: '#/components/schemas/TokenResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: The account could not be checked (database error).
 
   /mailboxes:
     get:
@@ -162,12 +158,22 @@ paths:
                 properties:
                   message:
                     type: string
-                  mailbox:
+                    example: Mailbox created successfully
+                  name:
                     type: string
+                    description: |
+                      The name as created: a trailing `/` is removed. Missing parent
+                      mailboxes are created too.
+                    example: Archive/2024
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            A name in the shared namespace, the namespace root included, while
+            `[shared_mailboxes]` is enabled. The User API does not create shared
+            mailboxes.
         '409':
           description: Mailbox already exists
 
@@ -186,11 +192,15 @@ paths:
         '200':
           description: Mailbox deleted successfully
         '400':
-          description: Cannot delete INBOX
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: INBOX, or a shared mailbox without the `x` (delete mailbox) right.
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: The mailbox has child mailboxes; delete them first.
 
   /mailboxes/{name}/subscribe:
     post:
@@ -270,8 +280,7 @@ paths:
                 properties:
                   messages:
                     type: array
-                    nullable: true
-                    description: The matching messages, or null when there are none.
+                    description: The matching messages; empty when there are none.
                     items:
                       $ref: '#/components/schemas/Message'
                   total:
@@ -298,23 +307,27 @@ paths:
         - $ref: '#/components/parameters/MailboxName'
         - name: q
           in: query
-          description: Search query
+          description: Search query, at most 1000 bytes of UTF-8.
           required: true
           schema:
             type: string
         - name: from
           in: query
-          description: Filter by sender email
+          description: |
+            Only messages whose sender's address or name contains this text
+            (case-insensitive, literal, at most 1000 bytes). ANDed with `q`.
           schema:
             type: string
         - name: subject
           in: query
-          description: Filter by subject
+          description: |
+            Only messages whose subject contains this text (case-insensitive,
+            literal, at most 1000 bytes). ANDed with `q`.
           schema:
             type: string
         - name: unseen
           in: query
-          description: Only unseen messages
+          description: Only messages without the \Seen flag when `true`. ANDed with `q`.
           schema:
             type: boolean
       responses:
@@ -327,8 +340,7 @@ paths:
                 properties:
                   messages:
                     type: array
-                    nullable: true
-                    description: The matching messages, or null when there are none.
+                    description: The matching messages; empty when there are none.
                     items:
                       $ref: '#/components/schemas/Message'
                   total:
@@ -428,14 +440,21 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            A shared mailbox where the account may change none of the flags asked for.
+            Flags it may not change are otherwise left alone.
         '404':
           $ref: '#/components/responses/NotFound'
 
     delete:
       tags:
         - Messages
-      summary: Delete message
-      description: Mark message as deleted and expunge
+      summary: Mark message as deleted
+      description: |
+        Adds the \Deleted flag. The message is not expunged: it stays in the mailbox,
+        listed with \Deleted, until an IMAP client expunges the mailbox. The User API
+        has no expunge.
       operationId: deleteMessage
       security:
         - bearerAuth: []
@@ -443,9 +462,24 @@ paths:
         - $ref: '#/components/parameters/MessageId'
       responses:
         '200':
-          description: Message deleted successfully
+          description: The \Deleted flag is set.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Message marked as deleted successfully
+                  id:
+                    type: integer
+                    format: int64
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: A shared mailbox without the `t` (delete-message) right.
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -454,29 +488,26 @@ paths:
       tags:
         - Messages
       summary: Get message body
-      description: Retrieve message body in text or HTML format
+      description: |
+        Everything after the message's header block, as stored. The response's
+        Content-Type is the message's own top-level Content-Type
+        (`text/plain; charset=utf-8` when the message has none). For a multipart
+        message this is the whole MIME body, boundaries and all: no text or HTML part
+        is picked out. The Content-Transfer-Encoding is not undone. To work with
+        parts, fetch /messages/{id}/raw and parse it.
       operationId: getMessageBody
       security:
         - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/MessageId'
-        - name: format
-          in: query
-          description: Preferred format
-          schema:
-            type: string
-            enum: [text, html]
-            default: html
       responses:
         '200':
-          description: Message body
+          description: The message body, with the message's own Content-Type.
           content:
-            text/plain:
+            '*/*':
               schema:
                 type: string
-            text/html:
-              schema:
-                type: string
+                format: binary
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -586,7 +617,9 @@ paths:
         '409':
           description: A new script would exceed the limit of 100 scripts per account
         '413':
-          description: The script is larger than `max_script_size`
+          description: |
+            The script is larger than `max_script_size`, or the request body is larger
+            than the server reads for one script
 
     delete:
       tags:
@@ -690,6 +723,34 @@ components:
       example: spam-filter
 
   schemas:
+    TokenResponse:
+      type: object
+      properties:
+        token:
+          type: string
+          description: JWT access token
+        expires_at:
+          type: integer
+          format: int64
+          description: When the token expires, in Unix seconds.
+          example: 1773216000
+        email:
+          type: string
+          description: The address the token was issued for, as sent at login.
+          example: user@example.com
+        account_id:
+          type: integer
+          format: int64
+
+    RefreshTokenRequest:
+      type: object
+      required:
+        - token
+      properties:
+        token:
+          type: string
+          description: The token to refresh. It must not have expired.
+
     Mailbox:
       type: object
       description: |
@@ -742,8 +803,7 @@ components:
 
     SystemFlags:
       type: array
-      nullable: true
-      description: System flags set on the message, with their backslash; null when none are set.
+      description: System flags set on the message, with their backslash; empty when none are set.
       items:
         type: string
         enum: ['\Seen', '\Answered', '\Flagged', '\Deleted', '\Draft']
@@ -794,8 +854,7 @@ components:
           example: boss@example.com
         to:
           type: array
-          nullable: true
-          description: The addresses of the To header; null when there are none.
+          description: The addresses of the To header; empty when there are none.
           items:
             type: string
           example: ['user@example.com']
@@ -835,8 +894,9 @@ components:
         message_id:
           type: string
           description: |
-            The Message-ID header, without angle brackets. A message delivered without
-            one has an ID Sora generated, in angle brackets.
+            The Message-ID header, without angle brackets. The empty string when the
+            message has no Message-ID that parses (the ID Sora stores for such a message
+            to detect duplicates is not its header and is never returned).
           example: abc123@example.com
         in_reply_to:
           type: string
@@ -919,6 +979,16 @@ components:
 
     Unauthorized:
       description: Unauthorized - invalid or missing JWT token
+      headers:
+        WWW-Authenticate:
+          description: >-
+            On Bearer-protected endpoints (RFC 9110 section 15.5.2, RFC 6750 section 3):
+            Bearer realm="user-api" for a request without a bearer token,
+            with error="invalid_token" added when a token was sent and refused.
+            The public JSON login and refresh endpoints do not send this header.
+          schema:
+            type: string
+            example: Bearer realm="user-api", error="invalid_token"
       content:
         application/json:
           schema:

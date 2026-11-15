@@ -61,6 +61,13 @@ var (
 		},
 		[]string{"hash_type", "result"},
 	)
+
+	PasswordDummyVerifications = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sora_password_dummy_verifications_total",
+			Help: "Total number of bcrypt comparisons against the dummy hash, spent by failed logins with no password hash to check so that they cost what a wrong password costs",
+		},
+	)
 )
 
 // Database performance metrics
@@ -172,7 +179,7 @@ var (
 	LargeBodyStorageSkipped = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "sora_large_body_storage_skipped_total",
-			Help: "Total number of message bodies/headers not stored in database due to large size (>64KB)",
+			Help: "Total number of message bodies truncated to their first 64KB for full-text indexing",
 		},
 	)
 )
@@ -511,7 +518,7 @@ var (
 			Name: "sora_connection_timeouts_total",
 			Help: "Total number of connection timeouts by protocol and reason",
 		},
-		[]string{"protocol", "server_name", "hostname", "reason"}, // reason: idle, slow_throughput, session_max, tls_on_plain_port
+		[]string{"protocol", "server_name", "hostname", "reason"}, // reason: idle, slow_throughput, session_max, tls_on_plain_port, plain_text_on_tls_port
 	)
 )
 

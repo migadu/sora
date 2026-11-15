@@ -5,10 +5,13 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/migadu/sora/helpers"
 )
 
@@ -72,7 +75,7 @@ func mustDecodeHex(t *testing.T, s string) []byte {
 // by magic bytes, as Dovecot's compression_detect_handler() does, never by file name.
 // Dovecot's lz4 is not the LZ4 frame format but its own header and chunk layout, and zstd
 // is what current Dovecot setups write: both are read, and the scan (hashFile) and the
-// upload (decompressIfNeeded) must see the same message. xz, which only Dovecot 2.2 wrote,
+// upload (readMessage) must see the same message. xz, which only Dovecot 2.2 wrote,
 // is refused by name instead of being imported as a garbled message.
 func TestMaildirDovecotCompression(t *testing.T) {
 	// Three Dovecot-sized chunks: 64 KiB, 64 KiB and the rest.
@@ -128,15 +131,15 @@ func TestMaildirDovecotCompression(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			hash, size, hashErr := hashFile(path)
-			content, decErr := decompressIfNeeded(tt.onDisk)
+			hash, size, hashErr := hashFile(path, 0)
+			content, decErr := readMessage(path, 0)
 
 			if tt.wantErr != "" {
 				if hashErr == nil || !strings.Contains(hashErr.Error(), tt.wantErr) {
 					t.Errorf("hashFile error = %v, want one containing %q", hashErr, tt.wantErr)
 				}
 				if decErr == nil || !strings.Contains(decErr.Error(), tt.wantErr) {
-					t.Errorf("decompressIfNeeded error = %v, want one containing %q", decErr, tt.wantErr)
+					t.Errorf("readMessage error = %v, want one containing %q", decErr, tt.wantErr)
 				}
 				return
 			}
@@ -151,11 +154,108 @@ func TestMaildirDovecotCompression(t *testing.T) {
 				t.Errorf("hashFile size = %d, want the message size %d", size, len(tt.message))
 			}
 			if decErr != nil {
-				t.Fatalf("decompressIfNeeded: %v", decErr)
+				t.Fatalf("readMessage: %v", decErr)
 			}
 			if string(content) != tt.message {
-				t.Errorf("decompressIfNeeded = %.60q (%d bytes), want %.60q (%d bytes)", content, len(content), tt.message, len(tt.message))
+				t.Errorf("readMessage = %.60q (%d bytes), want %.60q (%d bytes)", content, len(content), tt.message, len(tt.message))
 			}
 		})
 	}
+}
+
+// TestMaildirZstdDecoderReuse: on the first block of a frame a zstd decoder allocates its
+// history, the frame's window plus up to 1 MiB: 3 MiB for the 2 MiB window Dovecot's
+// default level (ZSTD_CLEVEL_DEFAULT, streamed without a size) writes, however small the
+// message. The scan and the upload both read every file, so a decoder per file allocated
+// that twice per message: about 6.5 MB of garbage for this 111-byte one. Decoders are
+// reused instead.
+func TestMaildirZstdDecoderReuse(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race detector makes sync.Pool drop a share of what is put back")
+	}
+	onDisk := mustDecodeHex(t, zstdMessageHex)
+	path := filepath.Join(t.TempDir(), "m")
+	if err := os.WriteFile(path, onDisk, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanAndUpload := func() {
+		if _, _, err := hashFile(path, 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readMessage(path, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scanAndUpload() // the first decoder is allocated once
+
+	const files = 20
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for range files {
+		scanAndUpload()
+	}
+	runtime.ReadMemStats(&after)
+	if perFile := (after.TotalAlloc - before.TotalAlloc) / files; perFile > 1<<20 {
+		t.Errorf("scanning and uploading a %d-byte zstd message allocates %d bytes, want under 1 MiB",
+			len(dovecotMessage), perFile)
+	}
+}
+
+// TestMaildirZstdConcurrentFiles reads zstd files of different sizes, and corrupt ones,
+// from several goroutines at once, as the scan's and the upload's workers do: a reused
+// decoder must never be shared by two files, nor carry a failed file's state into the next.
+func TestMaildirZstdConcurrentFiles(t *testing.T) {
+	large := []byte("From: a@example.com\r\nSubject: large\r\n\r\n" + strings.Repeat("0123456789abcdef\r\n", 9000))
+	enc, err := zstd.NewWriter(nil, zstd.WithWindowSize(1<<21))
+	if err != nil {
+		t.Fatal(err)
+	}
+	small := mustDecodeHex(t, zstdMessageHex)
+	files := []struct {
+		onDisk  []byte
+		message []byte // nil when reading must fail
+	}{
+		{onDisk: small, message: []byte(dovecotMessage)},
+		{onDisk: enc.EncodeAll(large, nil), message: large},
+		{onDisk: small[:len(small)-6]}, // truncated
+		{onDisk: append(append([]byte{}, small[:20]...), 0xff, 0xff, 0xff, 0xff)},
+	}
+	dir := t.TempDir()
+	for i, f := range files {
+		if err := os.WriteFile(filepath.Join(dir, strconv.Itoa(i)), f.onDisk, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	for g := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for n := range 40 {
+				i := (g + n) % len(files)
+				f := files[i]
+				path := filepath.Join(dir, strconv.Itoa(i))
+				hash, _, hashErr := hashFile(path, 0)
+				content, decErr := readMessage(path, 0)
+				if f.message == nil {
+					if hashErr == nil || decErr == nil {
+						t.Errorf("file %d: hashFile error %v, readMessage error %v, want both to fail", i, hashErr, decErr)
+					}
+					continue
+				}
+				if hashErr != nil || decErr != nil {
+					t.Errorf("file %d: hashFile error %v, readMessage error %v", i, hashErr, decErr)
+					continue
+				}
+				if want := helpers.HashContent(f.message); hash != want {
+					t.Errorf("file %d: hashFile = %s, want %s", i, hash, want)
+				}
+				if string(content) != string(f.message) {
+					t.Errorf("file %d: readMessage returned %d bytes that differ from the %d-byte message", i, len(content), len(f.message))
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }

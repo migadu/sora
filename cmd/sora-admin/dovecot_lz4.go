@@ -22,8 +22,10 @@ const (
 )
 
 // dovecotLZ4Reader decompresses a file Dovecot stored with lz4, checking it the way
-// Dovecot's istream-lz4.c reads it. It is stricter in one place: a file that ends inside
-// a chunk length is an error, where Dovecot ends the message there.
+// Dovecot's istream-lz4.c reads it, with three differences. A file that ends inside a
+// chunk length is an error, where Dovecot ends the message there. A largest chunk size of
+// 0 is refused in the header; Dovecot fails only on the first chunk. A chunk that
+// decompresses to nothing is skipped, where Dovecot asserts (i_assert(ret > 0)).
 type dovecotLZ4Reader struct {
 	r   io.Reader
 	src []byte // the compressed chunk

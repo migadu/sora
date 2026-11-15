@@ -33,7 +33,10 @@ import (
 	"github.com/migadu/go-pop3/pop3server"
 )
 
-// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+// getProxyProtocolTrustedProxies returns the hosts trusted to send PROXY headers: the
+// ProxyProtocolTrustedProxies option if set, otherwise trusted_networks. No config key
+// sets that option (there is no proxy_protocol_trusted_proxies, #542), so in a running
+// server PROXY trust is always [servers] trusted_networks.
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {
 		return proxyProtocolTrusted
@@ -113,7 +116,7 @@ type POP3Server struct {
 	// Active session tracking for graceful shutdown
 	activeSessionsMutex sync.RWMutex
 	activeSessions      map[*POP3Session]struct{}
-	sessionsWg          sync.WaitGroup // Tracks active sessions for graceful drain
+	sessions            serverPkg.SessionGroup // Tracks active sessions for graceful drain
 
 	// The library server is rebuilt (for new connections only) when runtime
 	// settings change on SIGHUP; existing connections keep their snapshot.
@@ -158,8 +161,8 @@ type POP3ServerOptions struct {
 	CommandTimeout              time.Duration             // Maximum idle time before disconnection
 	CommandTimeoutOverrides     map[string]time.Duration  // Per-command hard execution timeouts (overrides defaults)
 	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = no limit; go-pop3 enforces it)
-	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
-	InsecureAuth                bool                      // Allow PLAIN auth over non-TLS connections (default: true for backends behind proxy)
+	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = disabled)
+	InsecureAuth                bool                      // Allow plaintext authentication over non-TLS connections
 	Config                      *config.Config            // Full config for shared settings like connection tracking timeouts
 }
 
@@ -418,8 +421,9 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 		Caps:                caps,
 		Greeting:            "Sora-POP3-Server ready",
 		NewSession: func(c *pop3server.Conn) (pop3server.Session, error) {
-			// Connection limiting check
 			netConn := c.NetConn()
+			endInitialization := s.sessions.GuardInitialization(s.appCtx, netConn)
+			defer endInitialization()
 			proxyInfo := serverPkg.GetProxyProtocolInfo(netConn)
 
 			clientIP, proxyIP := serverPkg.GetConnectionIPs(netConn, proxyInfo)
@@ -429,10 +433,19 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 			// an "-ERR too many connections" banner would tell a flooder
 			// exactly when the limiter engages so they can pace under it.
 			// Test-enforced (connection-limit tests assert the rejected
-			// socket never sees "+OK") — do not add a banner.
+			// socket never sees "+OK") — do not add a banner. The exception
+			// is a client a PROXY peer named over its per-IP limit: that
+			// peer is a proxy, which fails the client's login on the reply
+			// but would count a silent close against the backend.
 			releaseConn, err := s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), clientIP)
 			if err != nil {
-				return nil, fmt.Errorf("%w: %w", pop3server.ErrSilentReject, err)
+				if !serverPkg.IsProxiedClientRefusal(err, proxyInfo) {
+					return nil, fmt.Errorf("%w: %w", pop3server.ErrSilentReject, err)
+				}
+				if _, hsErr := serverPkg.PerformDeferredTLSHandshake(netConn); hsErr != nil {
+					return nil, fmt.Errorf("%w: TLS handshake: %w", pop3server.ErrSilentReject, hsErr)
+				}
+				return nil, fmt.Errorf("%w: %w", errTooManyConnections, err)
 			}
 
 			// Implicit-TLS listeners (SoraTLSListener) defer the TLS handshake
@@ -560,12 +573,13 @@ func (s *POP3Server) connConfig() serverPkg.SoraConnConfig {
 		NoAbsoluteTimeout:    true, // the library enforces absolute_session_timeout
 		OnTimeout: func(conn net.Conn, reason string) {
 			// Best-effort notice before closing, on the connection the library
-			// is using (the TLS one after STLS; see NewSession); RFC 1939
-			// doesn't define timeout response codes, but [IN-USE] is commonly
-			// used.
-			message := "-ERR [IN-USE] Connection timeout, please reconnect\r\n"
+			// is using (the TLS one after STLS; see NewSession). It answers no
+			// command and carries no response code: [IN-USE] says a login
+			// succeeded with the maildrop locked (RFC 2449 section 8.1.2), and
+			// no RFC 2449 or RFC 3206 code describes a timeout.
+			message := "-ERR Connection timeout, please reconnect\r\n"
 			if reason == "slow_throughput" {
-				message = "-ERR [IN-USE] Connection too slow, please reconnect\r\n"
+				message = "-ERR Connection too slow, please reconnect\r\n"
 			}
 			_, _ = fmt.Fprint(conn, message)
 		},
@@ -659,16 +673,20 @@ func (s *POP3Server) Start(errChan chan error) {
 		// connections never inflate the gauges (they have no session to
 		// decrement them).
 
-		s.sessionsWg.Add(1)
-		go func() {
-			defer s.sessionsWg.Done()
+		started := s.sessions.Go(func() {
 			defer func() {
 				if r := recover(); r != nil {
 					logger.Error("POP3: panic in connection handler", "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
 			s.pop3libServer.Load().ServeConn(conn)
-		}()
+		})
+		if !started {
+			// Close is draining the sessions and no longer waits for new ones.
+			conn.Close()
+			logger.Info("POP3 server stopped gracefully", "name", s.name)
+			return
+		}
 	}
 }
 
@@ -683,6 +701,7 @@ func (s *POP3Server) SetConnTracker(tracker *serverPkg.ConnectionTracker) {
 }
 
 func (s *POP3Server) Close() {
+	s.sessions.BeginDrain()
 	// Unregister rate limiter from global registry
 	serverPkg.UnregisterRateLimiter("pop3", s.name)
 
@@ -715,16 +734,9 @@ func (s *POP3Server) Close() {
 
 // waitForSessionsDrain waits for all active sessions to finish with a timeout
 func (s *POP3Server) waitForSessionsDrain(timeout time.Duration) {
-	done := make(chan struct{})
-	go func() {
-		s.sessionsWg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(timeout) {
 		logger.Debug("POP3: All sessions drained gracefully", "name", s.name)
-	case <-time.After(timeout):
+	} else {
 		logger.Debug("POP3: Session drain timeout, forcing shutdown", "name", s.name, "timeout", timeout)
 	}
 }
@@ -906,10 +918,19 @@ func (s *POP3Server) GetLookupCache() *lookupcache.LookupCache {
 // Authenticate authenticates a user with caching support.
 // This method wraps the database authentication with an optional lookup cache layer.
 // The cache decorates the database call - this is the proper architectural pattern.
-func (s *POP3Server) Authenticate(ctx context.Context, address, password string) (accountID int64, err error) {
+// An error wrapping server.ErrAuthServiceUnavailable (server.IsTemporaryAuthFailure)
+// is no verdict on the password: the database could not be asked, or the stored hash
+// cannot be checked. It is answered as a temporary failure and not counted as a failed
+// login.
+//
+// It logs no result: the session does, once, with its own fields. method says how the
+// password was checked, "cache" (the lookup cache) or "main_db", and reason why the
+// check failed, in the words of the proxies' lines: "user_not_found",
+// "invalid_password", "unverifiable_hash" or "transient_error".
+func (s *POP3Server) Authenticate(ctx context.Context, address, password string) (accountID int64, method, reason string, err error) {
 	// Check context before any work
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return 0, "main_db", "transient_error", err
 	}
 
 	// Check cache first if enabled
@@ -917,16 +938,14 @@ func (s *POP3Server) Authenticate(ctx context.Context, address, password string)
 		cachedAccountID, found, cacheErr := s.lookupCache.Authenticate(address, password)
 		if cacheErr != nil {
 			// Cached authentication failure - return immediately without querying database
-			logger.Debug("Authentication failed (cached)", "address", address, "cache", "hit")
-			return 0, cacheErr
+			return 0, "cache", "invalid_password", cacheErr
 		}
 		if found {
 			// Cache hit with successful authentication - but check context is still valid
 			if err := ctx.Err(); err != nil {
-				return 0, err
+				return 0, "cache", "transient_error", err
 			}
-			logger.Info("authentication successful", "address", address, "account_id", cachedAccountID, "cached", true, "method", "cache")
-			return cachedAccountID, nil
+			return cachedAccountID, "cache", "", nil
 		}
 		// Cache miss - continue to database
 		logger.Debug("Authentication: cache miss, checking database", "address", address)
@@ -938,8 +957,7 @@ func (s *POP3Server) Authenticate(ctx context.Context, address, password string)
 		if serverPkg.IsTemporaryAuthFailure(err) {
 			// The database could not be asked: no verdict on the credentials, so nothing
 			// is cached and the login is answered as a temporary failure.
-			logger.Warn("authentication unavailable", "address", address, "method", "main_db", "error", err)
-			return 0, err
+			return 0, "main_db", "transient_error", err
 		}
 		// Equalize response timing with the wrong-password path (which runs bcrypt) so an
 		// attacker can't use response time to tell whether the account exists. (security-audit M14)
@@ -951,32 +969,33 @@ func (s *POP3Server) Authenticate(ctx context.Context, address, password string)
 			// AuthUserNotFound = 1 (from lookupcache package)
 			s.lookupCache.SetFailure(address, 1)
 		}
-		logger.Info("authentication failed", "address", address, "reason", "user_not_found", "cached", false, "method", "main_db")
-		return 0, err
+		return 0, "main_db", "user_not_found", err
 	}
 
 	// Verify password
 	if err := db.VerifyPassword(hashedPassword, password); err != nil {
-		reason := "invalid_password"
 		if errors.Is(err, db.ErrUnverifiableHash) {
-			// No password matches the stored hash: not a wrong password, so nothing is
-			// cached. VerifyPassword logged why, without the address.
-			reason = "unverifiable_hash"
-		} else if s.lookupCache != nil {
-			// Cache negative result for invalid password if enabled
-			// AuthInvalidPassword = 2 (from lookupcache package)
+			// No password matches the stored hash, so this is no verdict on the submitted
+			// one: the stored data is at fault, and only an administrator can repair it.
+			// Answered like a database outage, as the proxies do: a temporary failure,
+			// not counted as a failed login (a block earned on it would outlast the
+			// repair), nothing cached. A cached login this password missed was dropped
+			// before the database was asked (LookupCache.Authenticate), so it cannot
+			// answer the next guess. VerifyPassword logged why, without the address.
+			return 0, "main_db", "unverifiable_hash", fmt.Errorf("%w: %w", serverPkg.ErrAuthServiceUnavailable, err)
+		}
+		// Cache negative result for invalid password if enabled
+		// AuthInvalidPassword = 2 (from lookupcache package)
+		if s.lookupCache != nil {
 			s.lookupCache.SetFailure(address, 2)
 		}
-		logger.Info("authentication failed", "address", address, "reason", reason, "cached", false, "method", "main_db")
-		return 0, err
+		return 0, "main_db", "invalid_password", err
 	}
 
 	// Cache successful authentication if enabled
 	if s.lookupCache != nil {
 		s.lookupCache.SetSuccess(address, accountID, hashedPassword, password)
 	}
-
-	logger.Info("authentication successful", "address", address, "account_id", accountID, "cached", false, "method", "main_db")
 
 	// Asynchronously rehash if needed
 	if db.NeedsRehash(hashedPassword) {
@@ -1008,5 +1027,5 @@ func (s *POP3Server) Authenticate(ctx context.Context, address, password string)
 		})
 	}
 
-	return accountID, nil
+	return accountID, "main_db", "", nil
 }

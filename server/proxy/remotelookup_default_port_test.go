@@ -190,8 +190,8 @@ func TestRemoteLookupServerWithoutPortImplicitTLSPort(t *testing.T) {
 // [server.remote_lookup] remote_port used to be dropped with a Debug log (the backend was
 // dialed at a fallback port), and a negative or out-of-range number was used as given
 // (-1 left the address port-less, 70000 was dialed). ServerConfig.Validate refuses such a
-// config before any proxy is built; this is the constructor's own check behind it (with
-// lookup_local_users = true a proxy carries on without the lookup when it fails).
+// config before any proxy is built; this is the constructor's own check behind it, and
+// every proxy fails startup on it, also with lookup_local_users = true.
 func TestInitializeRemoteLookupRejectsInvalidRemotePort(t *testing.T) {
 	for _, port := range []any{"1993x", "-1", "70000", -1, int64(-1), 70000, int64(70000), int64(4294969299), 1993.5, true} {
 		t.Run(fmt.Sprintf("%T %v", port, port), func(t *testing.T) {

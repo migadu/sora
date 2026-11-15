@@ -171,6 +171,9 @@ func probeIPCacheProxy(t *testing.T, protocol, addr, ip string) string {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if response.StatusCode == http.StatusUnauthorized {
+			return "denied"
+		}
 		if response.StatusCode != http.StatusOK {
 			t.Fatalf("HTTP proxy: %d %s", response.StatusCode, b)
 		}
@@ -192,9 +195,10 @@ func TestIPDependentLookupDoesNotReuseAnotherNetworksCache(t *testing.T) {
 				independent := order == "independent_cache_still_used"
 				var backend, pinned string
 				if protocol == "userapi" {
-					// A routing miss uses the normal flat-pool fallback. Distinct
-					// bodies expose a cached negative route or a cached positive pin.
-					fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "denied") }))
+					// An unknown user is refused before reaching the flat pool.
+					// A distinct fallback body exposes any unintended fallback;
+					// the allowed body exposes reuse of another network's pin.
+					fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "fallback") }))
 					t.Cleanup(fallback.Close)
 					allowed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "allowed") }))
 					t.Cleanup(allowed.Close)

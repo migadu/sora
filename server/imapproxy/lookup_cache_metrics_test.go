@@ -85,3 +85,50 @@ func TestCachedLoginIsNotABodyCacheHit(t *testing.T) {
 		t.Errorf(`sora_lookup_cache_results_total{protocol="imap_proxy",result="hit"} grew by %v, want 1`, d)
 	}
 }
+
+// TestLoginWithoutLookupCacheCountsNoMiss: a proxy whose lookup cache is disabled reads
+// no cache, so a login is no miss in sora_lookup_cache_results_total (the POP3 and
+// ManageSieve proxies count none either); with the cache enabled the same login is one.
+func TestLoginWithoutLookupCacheCountsNoMiss(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		cache      *lookupcache.LookupCache
+		wantMisses float64
+	}{
+		{"cache disabled", nil, 0},
+		{"cache enabled", newTestLookupCache(t), 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			srv := &Server{
+				name:                       "test",
+				hostname:                   "test-host",
+				ctx:                        ctx,
+				cancel:                     cancel,
+				activeSessions:             make(map[*Session]struct{}),
+				connManager:                newTestConnManager(t, "127.0.0.1:1"),
+				lookupCache:                tc.cache,
+				authLimiter:                &fakeAuthLimiter{},
+				positiveRevalidationWindow: 30 * time.Second,
+			}
+
+			miss := map[string]string{"protocol": "imap_proxy", "result": "miss"}
+			misses0 := counterValue(t, "sora_lookup_cache_results_total", miss)
+
+			client, remote := net.Pipe()
+			defer client.Close()
+			defer remote.Close()
+			// A username that does not parse is refused right after the cache, without a
+			// lookup. (A wrong master password no longer is: it gets the credential check
+			// of the base address that any other suffix gets, #801.)
+			if err := newSession(srv, client).authenticateUser("not-an-address", "wrong"); err == nil {
+				t.Fatal("login with a username that does not parse succeeded")
+			}
+
+			if d := counterValue(t, "sora_lookup_cache_results_total", miss) - misses0; d != tc.wantMisses {
+				t.Errorf(`sora_lookup_cache_results_total{protocol="imap_proxy",result="miss"} grew by %v, want %v`, d, tc.wantMisses)
+			}
+		})
+	}
+}

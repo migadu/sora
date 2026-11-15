@@ -37,12 +37,9 @@ func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sort
 		}
 	}
 
-	searchCriteria = s.decodeSearchCriteria(searchCriteria)
-
-	if s.currentNumMessages.Load() == 0 && len(searchCriteria.SeqNum) > 0 {
-		s.InfoLog("skipping SORT because mailbox is empty")
-		return &imap.SortData{All: []uint32{}}, nil
-	}
+	// The client's numbering holds still until the results are numbered (seqViewMu).
+	s.seqViewMu.RLock()
+	defer s.seqViewMu.RUnlock()
 
 	// Acquire a read lock to safely get a snapshot of the session tracker.
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
@@ -50,11 +47,12 @@ func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sort
 		s.InfoLog("failed to acquire read lock for session tracker")
 		return nil, s.internalError("failed to acquire lock for sort")
 	}
-	sessionTrackerSnapshot := s.sessionTracker
 	if s.selectedMailbox == nil {
 		release()
 		return nil, s.internalError("no mailbox selected for sort")
 	}
+	view := s.seqViewLocked()
+	searchCriteria = s.decodeSearchCriteriaLocked(view, searchCriteria)
 	// The FTS scope is the mailbox OWNER, which for a shared mailbox is not the session
 	// account: messages.account_id always carries the owner (server/imap/copy.go passes
 	// destMailbox.AccountID, LMTP and delivery resolve the owner likewise). Passing the
@@ -67,8 +65,13 @@ func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sort
 	mailboxMessageCount := int(s.currentNumMessages.Load())
 	release()
 
-	if sessionTrackerSnapshot == nil {
+	if view.tracker == nil {
 		return nil, s.internalError("no session tracker available for sort")
+	}
+
+	if mailboxMessageCount == 0 && len(searchCriteria.SeqNum) > 0 {
+		s.InfoLog("skipping SORT because mailbox is empty")
+		return &imap.SortData{All: []uint32{}}, nil
 	}
 
 	searchCriteria, err := s.withSessionRecent(searchCriteria, selectedMailboxID)
@@ -83,12 +86,15 @@ func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sort
 
 	// Pass both search criteria and sort criteria to the database layer
 	// SORT only returns UIDs, so we can use a high limit (0 = use default MaxSearchResults)
-	messages, err := s.server.rdb.SearchMessagesSortedWithRetry(ctx, selectedMailboxID, selectedMailboxOwnerID, searchCriteria, sortCriteria, 0, mailboxMessageCount)
+	messages, err := s.server.rdb.SearchMessagesSortedWithRetry(view.context(ctx), selectedMailboxID, selectedMailboxOwnerID, searchCriteria, sortCriteria, 0, mailboxMessageCount)
 	if errors.Is(err, db.ErrSearchTooManyResults) {
 		return nil, s.searchResultLimitError("SORT", "mailbox", selectedMailboxName, "mailbox_messages", mailboxMessageCount)
 	}
 	if err != nil {
 		return nil, s.internalError("failed to sort messages: %v", err)
+	}
+	if numKind == imapserver.NumKindSeq {
+		messages = view.encodeSearchResults(messages)
 	}
 
 	// Prepare the sorted list of message numbers (UIDs or sequence numbers)
@@ -97,7 +103,6 @@ func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sort
 		if numKind == imapserver.NumKindUID {
 			nums = append(nums, uint32(msg.UID))
 		} else {
-			// Use database sequence number directly (no encoding needed)
 			nums = append(nums, msg.Seq)
 		}
 	}

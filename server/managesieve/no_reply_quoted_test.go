@@ -58,10 +58,11 @@ func TestNoRepliesAreQuotedStrings(t *testing.T) {
 		name, command, want string
 	}{
 		{"wrong master SASL password", plain("user@example.com", "master", "wrong"), `NO "Authentication failed"`},
-		{"unparsable identity", plain("", "not-an-address", "password"), `NO "Invalid username format"`},
-		{"authorization identity without master SASL", plain("other@example.com", "user@example.com", "password"),
-			`NO "Proxy authentication requires master_sasl_username and master_sasl_password to be configured"`},
-		{"LOGIN with an unparsable address", `LOGIN "not-an-address" "password"`, `NO "Invalid address"`},
+		{"unparsable identity", plain("", "not-an-address", "password"), `NO "Authentication failed"`},
+		// The authorization refusal itself needs valid credentials, so a database
+		// (integration_tests/managesieve TestManageSieve_AuthzIDRefusalNeedsCredentials).
+		{"authorization identity with bad credentials", plain("other@example.com", "not-an-address", "password"), `NO "Authentication failed"`},
+		{"LOGIN with an unparsable address", `LOGIN "not-an-address" "password"`, `NO "Authentication failed"`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			conn, reader, _ := dialManageSieve(t, srv)

@@ -65,7 +65,7 @@ type Session struct {
 	byePending        string           // a BYE to write as soon as the stream is between responses
 	byeSent           bool             // a BYE was written: none is written again
 	submittedUsername string           // Username exactly as submitted by the client (lookup-cache key)
-	connRejected      bool             // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
+	connRegistered    bool             // connTracker.RegisterConnection accepted this session: close() unregisters only then
 }
 
 // newSession creates a new IMAP proxy session.
@@ -833,6 +833,11 @@ func (s *Session) authenticateUser(username, password string) error {
 	// bucket by varying the target, leaving the proxy's tenant-wide password unmetered.
 	// Decided here, from the raw identity, so check site and record sites cannot drift.
 	authKey := server.AuthRateLimitKeyWithMaster(username, s.server.masterUsername)
+	// A success is recorded under the master credential's key only for a master
+	// login. The master form with any other password is the base address's own login
+	// (#949), and its success, recorded under the master credential's key, would
+	// clear that key's failed guesses at the master password.
+	successKey := server.AuthSuccessRateLimitKey(username, password, s.server.masterUsername, s.server.masterPassword)
 
 	// Use configured remotelookup timeout instead of hardcoded value
 	// This allows slow networks enough time for initial TLS handshake while reusing connections
@@ -848,7 +853,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	// meant the delay never fired in exactly the deployment proxies exist for.
 	realClientIP, _ := server.GetConnectionIPs(s.clientConn, s.proxyInfo)
 	delayAddr := &server.StringAddr{Addr: realClientIP}
-	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, delayAddr, "IMAP-PROXY"); err != nil {
+	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, delayAddr, "imap_proxy"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
 			s.InfoLog("delay queue full, rejecting connection", "username", username)
@@ -923,25 +928,25 @@ func (s *Session) authenticateUser(username, password string) error {
 				// positive_ttl to allow periodic revalidation via remotelookup/database.
 				// This ensures that when a domain moves backends or password changes,
 				// active users eventually pick up the changes.
-				s.DebugLog("cache hit - using cached auth", "username", username, "account_id", cached.AccountID, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
+				s.accountID = cached.AccountID
+				s.DebugLog("cache hit - using cached auth", "username", username, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
 				metrics.LookupCacheResults.WithLabelValues("imap_proxy", "hit").Inc()
 
-				s.accountID = cached.AccountID
 				s.isRemoteLookupAccount = cached.FromRemoteLookup
 				// Rebuilt exactly as the uncached login routed (proxy.RouteFromCache): the pin,
 				// its enforcement and every backend-leg setting the lookup answer carried.
 				s.routingInfo = proxy.RouteFromCache(cached)
 				s.routingInfo.ClientConn = s.listenerConn // Always set current client connection for JA4
-				// If cache has ActualEmail (e.g., "user@example.com" for "user@TOKEN"), use it
-				// Otherwise fall back to submitted username
+				// The resolved address when the entry has one (e.g. "user@example.com" for
+				// "user@TOKEN"); otherwise s.username keeps the base address set above, the
+				// name the uncached login routed by. The submitted name would route a
+				// +detail or @SUFFIX login under another key than the uncached one.
 				if cached.ActualEmail != "" {
 					s.username = cached.ActualEmail
-				} else {
-					s.username = username
 				}
 
 				// Use actual username (resolved email) for rate limiting and metrics
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
 
 				// Track domain and user activity using resolved email
@@ -971,10 +976,19 @@ func (s *Session) authenticateUser(username, password string) error {
 				return nil
 			} else {
 				// Different password on positive entry - always revalidate
-				// Use configured window: revalidate if entry is older than positiveRevalidationWindow
-				if cached.IsOld(s.server.positiveRevalidationWindow) {
+				// Use configured window: revalidate if entry is older than positiveRevalidationWindow,
+				// or if the two passwords are the master username form's two credentials (#949)
+				if cached.IsOld(s.server.positiveRevalidationWindow) ||
+					proxy.MasterFormOtherCredential(username, password, cached.PasswordDigest, s.server.masterUsername, s.server.masterPassword) {
 					s.DebugLog("cache positive entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt))
 					metrics.LookupCacheResults.WithLabelValues("imap_proxy", "revalidate_positive_different_pw").Inc()
+					// The database or the remote lookup decides this password, so drop
+					// the entry before asking (the SQLite auth cache drops a missed entry
+					// the same way). Kept, it would outlive an outage, which gives no
+					// verdict and is not counted, and still sign in its password: every
+					// guess during the outage would be checked against it, unseen by the
+					// auth rate limiter, until it expired.
+					s.invalidateLookupCache("password differs from cached login")
 					// Fall through to full auth
 				} else {
 					// Entry is fresh - likely wrong password attempt
@@ -989,7 +1003,8 @@ func (s *Session) authenticateUser(username, password string) error {
 				}
 			}
 		}
-	} else {
+	} else if s.server.lookupCache != nil {
+		// A disabled cache (nil) reads nothing and counts nothing.
 		s.DebugLog("cache miss", "username", username)
 		metrics.LookupCacheResults.WithLabelValues("imap_proxy", "miss").Inc()
 	}
@@ -1010,15 +1025,22 @@ func (s *Session) authenticateUser(username, password string) error {
 		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), s.server.masterUsername) {
 			// Suffix matches master username - validate master password locally
 			if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, s.server.masterPassword) {
-				// Wrong master password - fail immediately
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return consts.ErrAuthenticationFailed
+				// Not the master password: the base address's own login, checked below
+				// exactly as under any other suffix, with the same lookup, password
+				// verification and lookup-cache entry, and under the same submitted name
+				// (the lookup service may route or refuse tokens differently). A distinct
+				// reply, a quicker one (#801), or a refusal of the account's own password
+				// (#949) confirms a guessed master username. Its failure is still recorded
+				// under authKey, the master credential's key; only a success is the
+				// account's (successKey).
+				s.DebugLog("master username without the master password, checked like another suffix", "address", parsedAddr.BaseAddress())
+				usernameForRemoteLookup = username
+			} else {
+				// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
+				s.DebugLog("master username authentication successful, using base address for routing", "base_address", parsedAddr.BaseAddress())
+				usernameForRemoteLookup = parsedAddr.BaseAddress()
+				masterAuthValidated = true
 			}
-			// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
-			s.DebugLog("master username authentication successful, using base address for routing", "base_address", parsedAddr.BaseAddress())
-			usernameForRemoteLookup = parsedAddr.BaseAddress()
-			masterAuthValidated = true
 		} else {
 			// Suffix doesn't match master username - treat as token
 			// Send FULL username (including @TOKEN) to remotelookup for validation
@@ -1074,9 +1096,9 @@ func (s *Session) authenticateUser(username, password string) error {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// RemoteLookup returned success - use routing info
-				s.DebugLog("remotelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
-				metrics.RemoteLookupResult.WithLabelValues("imap", "success").Inc()
 				s.accountID = routingInfo.AccountID
+				s.DebugLog("remotelookup successful", "master_auth_validated", masterAuthValidated)
+				metrics.RemoteLookupResult.WithLabelValues("imap", "success").Inc()
 				s.isRemoteLookupAccount = routingInfo.IsRemoteLookupAccount
 				s.routingInfo = routingInfo
 
@@ -1093,7 +1115,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				s.username = resolvedEmail // Use for backend impersonation
 
 				// Use resolvedEmail for rate limiting and metrics (the actual user)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
 
 				// For metrics, use resolvedEmail for accurate tracking
@@ -1129,7 +1151,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// For master username, this shouldn't happen (password already validated)
 				// For others, reject immediately
 				if masterAuthValidated {
-					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "user", username)
+					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "username", username)
 				}
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
@@ -1188,24 +1210,22 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Fallback to main DB
 	// If master auth was already validated, just get account ID and continue
 	// Otherwise, authenticate via main DB
-	var address server.Address
-	var err error
-	// Use already parsed address if available
-	if parseErr == nil {
-		address = parsedAddr
-	} else {
-		// Parse failed earlier - try again with NewAddress (shouldn't happen but handle it)
-		address, err = server.NewAddress(username)
-		if err != nil {
-			return fmt.Errorf("invalid address format: %w", err)
-		}
+	//
+	// A username that does not parse names no account: a failed login like any
+	// other, recorded and counted. Every login without a remote lookup gets here.
+	if parseErr != nil {
+		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
+		metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
+		return fmt.Errorf("invalid address format: %w", parseErr)
 	}
+	address := parsedAddr
 
+	var err error
 	var accountID int64
 	if masterAuthValidated {
 		// Master authentication already validated - just get account ID
 		s.DebugLog("master auth already validated, getting account ID from main database")
-		accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+		accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
 		if err != nil {
 			// Check if error is due to session context cancellation (server shutdown)
 			// Note: Must check s.ctx.Err(), not just the query error, because the query context
@@ -1215,7 +1235,16 @@ func (s *Session) authenticateUser(username, password string) error {
 				return server.ErrServerShuttingDown
 			}
 
-			s.InfoLog("master auth failed - account not found", "user", address.BaseAddress(), "error", err)
+			// The database could not be asked, so nothing is known about the target: a
+			// temporary failure (NO [UNAVAILABLE]), not a failed login charged to the master
+			// credential. The bare sentinel, because the reply carries the error's text.
+			if server.IsTemporaryAuthFailure(err) {
+				s.WarnLog("authentication unavailable", "method", "master", "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+				return server.ErrAuthServiceUnavailable
+			}
+
+			s.InfoLog("master auth failed - account not found", "error", err)
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 			metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 			return fmt.Errorf("account not found: %w", err)
@@ -1240,13 +1269,6 @@ func (s *Session) authenticateUser(username, password string) error {
 			// sentinel, because the reply carries the error's text.
 			if proxy.IsTemporaryDBAuthFailure(err) {
 				reason, _ := proxy.ClassifyDBAuthFailure(err)
-				// A login this username has in the lookup cache was verified against
-				// another hash than the one now stored. Drop it: while it stays, every
-				// password that misses it is answered here, uncounted, and the cached
-				// one still signs in, an unmetered guessing oracle until it expires.
-				if errors.Is(err, db.ErrUnverifiableHash) {
-					s.invalidateLookupCache("unverifiable stored hash")
-				}
 				s.WarnLog("authentication unavailable", "reason", reason, "method", "main_db", "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
 				return server.ErrAuthServiceUnavailable
@@ -1295,14 +1317,15 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Set username to base address (without master username suffix or +detail)
 	// This is what gets sent to the backend for impersonation
 	s.username = address.BaseAddress()
-	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
+	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
 
 	// Track successful authentication.
 	metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
 
-	// Track domain and user connection activity for the login event.
+	// Track domain and user connection activity for the login event. The user is the base
+	// address, the name a lookup-cache hit replaying this login counts it under.
 	metrics.TrackDomainConnection("imap_proxy", address.Domain())
-	metrics.TrackUserActivity("imap_proxy", address.FullAddress(), "connection", 1)
+	metrics.TrackUserActivity("imap_proxy", address.BaseAddress(), "connection", 1)
 
 	// Single consolidated log for authentication success
 	method := "main_db"
@@ -1445,7 +1468,7 @@ func (s *Session) connectToBackend() error {
 	// Only an untagged OK greeting is usable: BYE means the backend refuses
 	// service, and PREAUTH would be an already-authenticated connection that
 	// cannot go through our AUTHENTICATE impersonation flow.
-	if !strings.HasPrefix(greeting, "* OK") {
+	if tag, ok := statusOK(greeting); tag != "*" || !ok {
 		s.backendConn.Close()
 		s.ErrorLog("Unexpected backend greeting", "backend", s.serverAddr, "greeting", strings.TrimRight(greeting, "\r\n"))
 		return fmt.Errorf("unexpected backend greeting: %s", strings.TrimRight(greeting, "\r\n"))
@@ -1465,6 +1488,27 @@ func (s *Session) connectToBackend() error {
 	// Clear the read deadline after successful greeting
 	if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
 		s.WarnLog("failed to clear read deadline", "error", err)
+	}
+
+	// Send ID command to backend with forwarding parameters if enabled.
+	// This MUST be done before authenticating to the backend, as the ID command
+	// is only valid in the "Not Authenticated" state.
+	useIDCommand := s.server.remoteUseIDCommand
+	// The route's setting applies to the backend the lookup named or its pool picked (as for the dial)
+	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
+		useIDCommand = s.routingInfo.RemoteUseIDCommand
+	}
+	if useIDCommand {
+		if err := s.sendForwardingParametersToBackend(); errors.Is(err, errIDRefused) {
+			// Go on without them: the tagged reply ended the exchange.
+			s.WarnLog("failed to send forwarding parameters to backend", "error", err)
+		} else if err != nil {
+			// The ID reply was not read to its tagged end (a write or read error, or the
+			// deadline). It may still come, and AUTHENTICATE would read it as its own.
+			s.backendConn.Close()
+			s.ErrorLog("ID exchange with backend failed", "backend", s.serverAddr, "error", err)
+			return fmt.Errorf("ID exchange with backend: %w", err)
+		}
 	}
 
 	return nil
@@ -1525,6 +1569,19 @@ func (s *Session) startTLSWithBackend(tlsConfig *tls.Config, timeout time.Durati
 	return errors.New("no tagged STARTTLS response from backend")
 }
 
+// statusOK returns the tag of a backend response line ("*" when it is untagged) and
+// whether its status is OK. RFC 9051 section 9: the status is a whole atom (greeting =
+// "*" SP (resp-cond-auth / resp-cond-bye) CRLF, response-tagged = tag SP resp-cond-state
+// CRLF, resp-cond-state = ("OK" / "NO" / "BAD") SP resp-text), and "Implementations MUST
+// accept these strings in a case-insensitive fashion". The atom ends at SP or the line
+// end, so OKAY, or OK run into its text, is not OK. The length check keeps the folding
+// ASCII: a multi-byte rune that folds to K (the Kelvin sign) cannot fit.
+func statusOK(line string) (tag string, ok bool) {
+	tag, rest, _ := strings.Cut(strings.TrimRight(line, "\r\n"), " ")
+	status, _, _ := strings.Cut(rest, " ")
+	return tag, len(status) == 2 && strings.EqualFold(status, "OK")
+}
+
 // authenticateToBackend authenticates to the backend using master credentials.
 func (s *Session) authenticateToBackend() (string, error) {
 	// Authenticate to the backend using master credentials in a single step.
@@ -1580,7 +1637,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 		s.WarnLog("failed to clear auth deadline", "error", err)
 	}
 
-	if !strings.HasPrefix(strings.TrimSpace(response), tag+" OK") {
+	if responseTag, ok := statusOK(response); responseTag != tag || !ok {
 		return "", fmt.Errorf("%w: %s", server.ErrBackendAuthFailed, strings.TrimSpace(response))
 	}
 
@@ -1601,21 +1658,6 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 		s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server temporarily unavailable", clientTag))
 		s.sendResponse("* BYE Backend server unavailable, please try again")
 		return false
-	}
-
-	// Send ID command to backend with forwarding parameters if enabled.
-	// This MUST be done before authenticating to the backend, as the ID command
-	// is only valid in the "Not Authenticated" state.
-	useIDCommand := s.server.remoteUseIDCommand
-	// The route's setting applies to the backend the lookup named or its pool picked (as for the dial)
-	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
-		useIDCommand = s.routingInfo.RemoteUseIDCommand
-	}
-	if useIDCommand {
-		if err := s.sendForwardingParametersToBackend(); err != nil {
-			s.WarnLog("failed to send forwarding parameters to backend", "error", err)
-			// Continue anyway - forwarding parameters are not critical
-		}
 	}
 
 	// Authenticate to backend with master credentials
@@ -1653,9 +1695,6 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 	// the backend server does the same and replies NO [LIMIT].
 	if err := s.registerConnection(); err != nil {
 		s.InfoLog("connection rejected by connection tracker", "error", err)
-		// Mark as rejected so close() does not decrement a slot this session
-		// never held (which would erode the limit for the account).
-		s.connRejected = true
 		s.sendResponse(fmt.Sprintf("%s NO [LIMIT] Too many connections", clientTag))
 		s.sendResponse("* BYE Too many connections")
 		s.mu.Lock()
@@ -1905,9 +1944,13 @@ func (s *Session) close() {
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits
 	// Background goroutine was causing leaks when server shutdown or high load prevented execution
 	// NOTE: accountID can be 0 for remotelookup accounts, so we don't check accountID > 0
-	// Skip unregister when registration was rejected; otherwise we would
-	// decrement a slot this session never held (limit erosion for the account).
-	if s.server.connTracker != nil && !s.connRejected {
+	// Only a session the tracker registered unregisters. The account ID is set
+	// as soon as the client's credentials are accepted, before the backend leg
+	// and the registration: a session whose backend leg failed, or whose
+	// registration was refused, holds no slot, and unregistering it would free
+	// the slot of another session of the account from the same IP.
+	if s.server.connTracker != nil && s.connRegistered {
+		s.connRegistered = false // the slot is released once, however often close() runs
 		// Use a new background context for this final operation, as s.ctx is likely already cancelled.
 		// UnregisterConnection is fast (in-memory only), so this won't block for long
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -1923,7 +1966,7 @@ func (s *Session) close() {
 			s.DebugLog("Successfully unregistered connection")
 		}
 	} else {
-		s.DebugLog("Skipping unregister - no connTracker")
+		s.DebugLog("Skipping unregister - not registered with connTracker")
 	}
 
 	if s.clientConn != nil {
@@ -1948,7 +1991,10 @@ func (s *Session) registerConnection() error {
 
 	// Use cached client address (real IP) to match UnregisterConnection in close()
 	if s.server.connTracker != nil {
-		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "IMAP", s.clientAddr)
+		if err := s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "IMAP", s.clientAddr); err != nil {
+			return err
+		}
+		s.connRegistered = true
 	}
 	return nil
 }

@@ -40,6 +40,13 @@ func SetNotifyMaxChangedMailboxesForTests(n int) {
 // delivered on subsequent ticks.
 const notifyMaxFetchPerTick = 64
 
+// notifyMaxFetchAttempts bounds the ticks in a row that MessageNew fetch-atts
+// delivery retries a message it could not answer for now, such as one whose
+// body cannot be read yet (NO [UNAVAILABLE]). The new messages after it wait
+// for it, so one that stays unanswerable is given up after this many attempts
+// instead of holding them back.
+const notifyMaxFetchAttempts = 4
+
 // SetNotifyPollIntervalForTests overrides the NOTIFY watch cadence. It exists
 // so integration tests can observe asynchronous notifications without waiting
 // out the production interval; it must not be called outside tests.
@@ -98,6 +105,10 @@ type notifyWatch struct {
 	// mailbox switches so the high-water mark is rebound.
 	selectedMailboxID int64
 	nextFetchUID      imap.UID
+
+	// fetchAttempts counts the ticks in a row whose fetch failed at
+	// nextFetchUID (see notifyMaxFetchAttempts).
+	fetchAttempts int
 }
 
 // hasSelectedMessageEvents reports whether the watch requests message events
@@ -257,7 +268,13 @@ func notifyStatusData(name string, uidValidity uint32, row db.MailboxStatsRow, o
 		data.NumUnseen = &numUnseen
 	}
 	if options.HighestModSeq {
-		data.HighestModSeq = row.HighestModSeq
+		// A mailbox that has never held a message has no mailbox_stats row
+		// and a raw highest_modseq of 0, which the callers need as-is for
+		// their activity checks and statusMarks. The client must see 1, as
+		// STATUS, LIST-STATUS and SELECT report (GetMailboxSummary): RFC 7162
+		// section 7 reserves HIGHESTMODSEQ 0 for a mailbox without persistent
+		// mod-sequences.
+		data.HighestModSeq = max(row.HighestModSeq, 1)
 	}
 	return data
 }
@@ -302,6 +319,14 @@ func (s *IMAPSession) SetNotify(ctx context.Context, options *imap.NotifyOptions
 				// supported
 			default:
 				return &imapserver.UnsupportedNotifyEventError{Supported: notifySupportedEvents}
+			}
+		}
+		// The MessageNew fetch-atts are answered through Fetch: refuse here
+		// what Fetch would refuse for every new message (RFC 5465 §3.1: "BAD -
+		// Command unknown, invalid, unsupported, or has unknown arguments").
+		if fetch := options.Items[i].MessageNewFetch; fetch != nil {
+			if err := s.requireFetchBinary(fetch); err != nil {
+				return err
 			}
 		}
 	}
@@ -451,7 +476,7 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 		// fetch-atts high-water mark so only messages arriving from now on
 		// are announced with a FETCH.
 		watch.selectedMailboxID = selectedID
-		watch.nextFetchUID = 0
+		watch.nextFetchUID, watch.fetchAttempts = 0, 0
 		if selectedID != 0 && watch.selected != nil && watch.selected.MessageNewFetch != nil {
 			rows, err := s.server.rdb.GetMailboxesStatsWithRetry(readCtx, []int64{selectedID})
 			if err != nil {
@@ -847,20 +872,71 @@ func (s *IMAPSession) notifyFetchNewMessages(ctx context.Context, watch *notifyW
 		upper = watch.nextFetchUID + imap.UID(notifyMaxFetchPerTick) - 1
 	}
 
-	var uidSet imap.UIDSet
-	uidSet.AddRange(watch.nextFetchUID, upper)
-
-	// Advance before writing: a delivery failure tears the connection down,
-	// and this avoids duplicate FETCHes on partial failure.
-	watch.nextFetchUID = upper + 1
-
+	// This is an unsolicited FETCH, not the answer to a FETCH command, so
+	// RFC 7162 §3.1 applies in full: a CONDSTORE-aware client gets
+	// "mod-sequence data in all subsequent untagged FETCH responses", and
+	// §3.2.4 "both UID and mod-sequence data", whatever the fetch-atts name.
+	// Request MODSEQ even before CONDSTORE is enabled: a first enabling
+	// command can run while this fetch loads a body. The response writer
+	// checks current awareness when it writes the unsolicited response.
 	options := *watch.selected.MessageNewFetch
 	options.UID = true
-	if err := s.Fetch(ctx, w.FetchWriter(), uidSet, &options); err != nil {
-		s.WarnLog("NOTIFY: MessageNew fetch failed", "error", err)
-		return nil
+	options.ModSeq = true
+
+	// The fetch answers the messages in UID order and stops at the first one
+	// it cannot answer, so nextFetchUID only passes what it got through: each
+	// message is sent its FETCH once (RFC 5465 §5.2: "The server SHOULD avoid
+	// sending duplicate data"), and none is lost behind a message that fails.
+	// One whose fetch-atts can never be answered, a BINARY section whose
+	// Content-Transfer-Encoding cannot be decoded (NO [UNKNOWN-CTE], RFC 9051
+	// §7.5.2), is passed over at once. Any other failure, such as a body that
+	// cannot be read right now (NO [UNAVAILABLE]), is retried on the next
+	// tick, until notifyMaxFetchAttempts gives the message up.
+	for watch.nextFetchUID <= upper {
+		var uidSet imap.UIDSet
+		uidSet.AddRange(watch.nextFetchUID, upper)
+		var progress fetchProgress
+		err := s.fetch(ctx, w.FetchWriter(), uidSet, &options, &progress)
+		if err == nil {
+			watch.nextFetchUID, watch.fetchAttempts = upper+1, 0
+			metrics.IMAPNotifyEventsSent.WithLabelValues("fetch").Inc()
+			return nil
+		}
+		// Resume at the message it failed at; after one that did not fail at
+		// a message (busy session, database error), after the last answered.
+		resume := progress.answered + 1
+		if progress.failed != 0 {
+			resume = progress.failed
+		}
+		if resume > watch.nextFetchUID {
+			watch.nextFetchUID, watch.fetchAttempts = resume, 0
+		}
+		if ctx.Err() != nil {
+			return nil // the session is going away
+		}
+
+		var imapErr *imap.Error
+		if progress.failed != 0 && errors.As(err, &imapErr) && imapErr.Code == imap.ResponseCodeUnknownCTE {
+			s.InfoLog("NOTIFY: MessageNew fetch-atts cannot be answered for a message, passing over it",
+				"uid", progress.failed, "error", err)
+			watch.nextFetchUID, watch.fetchAttempts = progress.failed+1, 0
+			continue
+		}
+		watch.fetchAttempts++
+		if watch.fetchAttempts < notifyMaxFetchAttempts {
+			s.InfoLog("NOTIFY: MessageNew fetch failed, retrying next tick",
+				"uid", progress.failed, "attempt", watch.fetchAttempts, "error", err)
+			return nil
+		}
+		s.WarnLog("NOTIFY: MessageNew fetch failed, giving up",
+			"uid", progress.failed, "attempts", watch.fetchAttempts, "error", err)
+		watch.fetchAttempts = 0
+		if progress.failed == 0 {
+			watch.nextFetchUID = upper + 1 // not at a message: give up the range
+			return nil
+		}
+		watch.nextFetchUID = progress.failed + 1
 	}
-	metrics.IMAPNotifyEventsSent.WithLabelValues("fetch").Inc()
 	return nil
 }
 

@@ -320,7 +320,7 @@ func (c *Client) submitHTTP(ctx context.Context, req *TrainingRequest) error {
 	// Create HTTP request
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.config.Endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
+		return fmt.Errorf("failed to create HTTP request: %w", config.MaskURLError(err))
 	}
 
 	// Set headers
@@ -332,7 +332,7 @@ func (c *Client) submitHTTP(ctx context.Context, req *TrainingRequest) error {
 	// Send request
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("HTTP request failed: %w", err)
+		return fmt.Errorf("HTTP request failed: %w", config.MaskURLError(err))
 	}
 	defer resp.Body.Close()
 
@@ -344,7 +344,7 @@ func (c *Client) submitHTTP(ctx context.Context, req *TrainingRequest) error {
 	// Check response status
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		return fmt.Errorf("training endpoint returned redirect status %d to %q; redirects are not followed, so [spam_training] endpoint must be the final URL",
-			resp.StatusCode, resp.Header.Get("Location"))
+			resp.StatusCode, config.MaskEndpointURL(resp.Header.Get("Location")))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("training endpoint returned status %d: %s", resp.StatusCode, string(body))

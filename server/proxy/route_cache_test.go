@@ -59,3 +59,40 @@ func TestRoutingInfoSurvivesTheLookupCache(t *testing.T) {
 		t.Errorf("database user came back as %+v", local)
 	}
 }
+
+// TestMasterFormOtherCredential (#949): under the master username form a cached positive
+// entry and the password now presented are revalidated, not refused, exactly when one of
+// them is the master password and the other is not. Any other pair, and any other name,
+// keeps the fresh-entry refusal of a different password.
+func TestMasterFormOtherCredential(t *testing.T) {
+	master, masterPassword := []byte("admin"), []byte("master-secret")
+
+	tests := []struct {
+		name, username, presented, cached string
+		want                              bool
+	}{
+		{"master password after the account's own login", "user@example.com@admin", "master-secret", "own-password", true},
+		{"account's own password after a master login", "user@example.com@admin", "own-password", "master-secret", true},
+		{"wrong password after the account's own login", "user@example.com@admin", "wrong-password", "own-password", false},
+		{"wrong password after a master login", "user@example.com@admin", "wrong-password", "master-secret", true},
+		{"master password under another suffix", "user@example.com@TOKEN", "master-secret", "own-password", false},
+		{"master password without a suffix", "user@example.com", "master-secret", "own-password", false},
+		{"suffix differs in case", "user@example.com@Admin", "master-secret", "own-password", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := MasterFormOtherCredential(tt.username, tt.presented, lookupcache.NewPasswordDigest(tt.cached), master, masterPassword)
+			if got != tt.want {
+				t.Errorf("MasterFormOtherCredential(%q, %q, digest of %q) = %v, want %v", tt.username, tt.presented, tt.cached, got, tt.want)
+			}
+		})
+	}
+
+	// Without master credentials nothing is the master form.
+	if MasterFormOtherCredential("user@example.com@admin", "master-secret", lookupcache.NewPasswordDigest("own-password"), master, nil) {
+		t.Error("MasterFormOtherCredential with no master password = true, want false")
+	}
+	if MasterFormOtherCredential("user@example.com@admin", "master-secret", lookupcache.NewPasswordDigest("own-password"), nil, masterPassword) {
+		t.Error("MasterFormOtherCredential with no master username = true, want false")
+	}
+}

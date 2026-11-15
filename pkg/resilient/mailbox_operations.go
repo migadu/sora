@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/retry"
@@ -85,6 +86,19 @@ func (rd *ResilientDatabase) IsMailboxSharedWithRetry(ctx context.Context, mailb
 		return rd.getOperationalDatabaseForOperation(ctx, false).IsMailboxShared(ctx, mailboxID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
+
+// RenameCrossesSharedBoundaryWithRetry reports whether renaming mbox to newName would
+// take it, or a live descendant, across the shared namespace boundary.
+func (rd *ResilientDatabase) RenameCrossesSharedBoundaryWithRetry(ctx context.Context, shared config.SharedMailboxesConfig, mbox *db.DBMailbox, newName string) (bool, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).RenameCrossesSharedBoundary(ctx, shared, mbox, newName)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
 	if err != nil {
 		return false, err
 	}
@@ -202,6 +216,36 @@ func (rd *ResilientDatabase) GetMailboxSummaryWithRetry(ctx context.Context, mai
 	return result.(*db.MailboxSummary), nil
 }
 
+// InReadSnapshotWithRetry runs fn inside a single REPEATABLE READ READ ONLY transaction
+// on the read pool (or write pool when consts.UseMasterDBKey is set on ctx), retrying
+// the entire snapshot as a unit on transient database errors. Snapshot-aware read
+// helpers called with snapCtx reuse the open transaction directly. The callback
+// context is scoped to fn and must only be used with this ResilientDatabase.
+func (rd *ResilientDatabase) InReadSnapshotWithRetry(ctx context.Context, fn func(ctx context.Context) error) error {
+	op := func(opCtx context.Context) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(opCtx, false).InReadSnapshot(opCtx, fn)
+	}
+	_, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
+	return err
+}
+
+// OptionalReadInSnapshot runs fn inside a PostgreSQL SAVEPOINT when ctx carries an
+// active InReadSnapshot transaction. Statement errors that rolled back cleanly to the
+// savepoint are returned as nonFatalErr so the caller can log/fall back on the still-
+// healthy snapshot transaction; context cancellation/deadlines, savepoint failures,
+// retryable transient errors, and database/connection failures are returned as fatalErr
+// so InReadSnapshotWithRetry can retry or surface them through the query breaker.
+func (rd *ResilientDatabase) OptionalReadInSnapshot(ctx context.Context, fn func(ctx context.Context) error) (nonFatalErr error, fatalErr error) {
+	err := db.InReadSavepoint(ctx, fn)
+	if err == nil {
+		return nil, nil
+	}
+	if ctx.Err() != nil || errors.Is(err, db.ErrReadSnapshotAborted) || rd.isRetryableError(err) || isDatabaseFailure(err) {
+		return nil, err
+	}
+	return err, nil
+}
+
 func (rd *ResilientDatabase) GetFirstUnseenSeqNumWithRetry(ctx context.Context, mailboxID int64) (uint32, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).GetFirstUnseenSeqNum(ctx, mailboxID)
@@ -225,6 +269,17 @@ func (rd *ResilientDatabase) GetMailboxSummariesBatchWithRetry(ctx context.Conte
 		return map[int64]*db.MailboxSummary{}, nil
 	}
 	return result.(map[int64]*db.MailboxSummary), nil
+}
+
+func (rd *ResilientDatabase) CountDeletedMessagesWithRetry(ctx context.Context, mailboxIDs []int64) (map[int64]uint32, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).CountDeletedMessages(ctx, mailboxIDs)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.(map[int64]uint32), nil
 }
 
 func (rd *ResilientDatabase) GetMailboxesWithRetry(ctx context.Context, AccountID int64, subscribed bool) ([]*db.DBMailbox, error) {
@@ -277,18 +332,32 @@ func (rd *ResilientDatabase) GetActiveAccountIDByAddressWithRetry(ctx context.Co
 	return result.(int64), nil
 }
 
+// CreateDefaultMailboxesWithRetry is EnsureDefaultMailboxesWithRetry for a caller that
+// reads the mailboxes from the writer anyway, or not at all.
 func (rd *ResilientDatabase) CreateDefaultMailboxesWithRetry(ctx context.Context, AccountID int64) error {
+	_, err := rd.EnsureDefaultMailboxesWithRetry(ctx, AccountID)
+	return err
+}
+
+// EnsureDefaultMailboxesWithRetry creates the account's default mailboxes unless the
+// read pool already shows its INBOX. onWriter reports that the read pool did not: the
+// mailboxes were then created (or found) on the writer, and a replica that has not
+// replayed that yet does not have them, so a caller that goes on to read them must
+// read from the writer.
+func (rd *ResilientDatabase) EnsureDefaultMailboxesWithRetry(ctx context.Context, AccountID int64) (onWriter bool, err error) {
 	// Every RCPT, login and API delivery calls this; for every account but a brand-new
 	// one the mailboxes exist. Answer that from a single read before paying for a
 	// write transaction (BEGIN + SET LOCAL + EXISTS + COMMIT on the write pool).
 	if has, err := rd.getOperationalDatabaseForOperation(ctx, false).HasInbox(ctx, AccountID); err == nil && has {
-		return nil
+		return false, nil
 	}
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(ctx, true).CreateDefaultMailboxes(ctx, tx, AccountID)
 	}
-	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
-	return err
+	if _, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (rd *ResilientDatabase) PollMailboxStatsWithRetry(ctx context.Context, mailboxIDs []int64, sinceModSeq uint64) ([]db.MailboxStatsRow, error) {
@@ -441,11 +510,25 @@ func (rd *ResilientDatabase) ResolveAccountS3Owner(ctx context.Context, accountI
 // the caller (server/imap/copy.go) can read the ids back and learn, exactly and immune to
 // concurrency, whether the copy landed. On any other error the transaction definitely did
 // not commit, so nil is returned.
-func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string) (map[imap.UID]imap.UID, []int64, error) {
+// Destination object preparation follows MOVE's one-transaction contract: acquire
+// shared locks before S3 work, keep that transaction alive during the checks, and
+// give the row writes their own timeout afterwards. No lock handover is needed.
+func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string, destObjects []string, ensureDestObject func(context.Context, string) error) (map[imap.UID]imap.UID, []int64, error) {
 	var capturedUIDMap map[imap.UID]imap.UID
 	var capturedIDs []int64
-	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		uidMap, ids, err := rd.getOperationalDatabaseForOperation(ctx, true).CopyMessages(ctx, tx, uids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID)
+	op := func(opCtx context.Context, tx pgx.Tx) (any, error) {
+		if len(destObjects) > 0 {
+			if err := db.LockS3ObjectsSharedInTx(opCtx, tx, destAccountID, destObjects); err != nil {
+				return nil, err
+			}
+			if err := rd.ensureDestObjects(ctx, tx, destObjects, ensureDestObject); err != nil {
+				return nil, err
+			}
+			writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
+			defer cancel()
+			opCtx = writeCtx
+		}
+		uidMap, ids, err := rd.getOperationalDatabaseForOperation(opCtx, true).CopyMessages(opCtx, tx, uids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID, sourceHashes, destObjects)
 		if err != nil {
 			return nil, err
 		}
@@ -621,6 +704,20 @@ func (rd *ResilientDatabase) HasMailboxWithSpecialUseWithRetry(ctx context.Conte
 		return false, err
 	}
 	return result.(bool), nil
+}
+
+// GetPersonalMailboxNameBySpecialUseWithRetry returns the name of the account's
+// personal mailbox carrying the RFC 6154 special-use attribute attr, or
+// consts.ErrMailboxNotFound if there is none.
+func (rd *ResilientDatabase) GetPersonalMailboxNameBySpecialUseWithRetry(ctx context.Context, accountID int64, attr string) (string, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetPersonalMailboxNameBySpecialUse(ctx, accountID, attr)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
+	if err != nil {
+		return "", err
+	}
+	return result.(string), nil
 }
 
 func (rd *ResilientDatabase) CountMessagesGreaterThanUIDWithRetry(ctx context.Context, mailboxID int64, minUID imap.UID) (uint32, error) {

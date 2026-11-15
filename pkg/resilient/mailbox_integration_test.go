@@ -87,6 +87,46 @@ func TestGetOrCreateMailboxByNameWithRetry_HierarchyLevels(t *testing.T) {
 	}
 }
 
+// TestCreateAndRenameMailbox_EmptyHierarchyLevel is issue #566: below every entry
+// point, the database layer itself refuses to create a mailbox, or rename one to a
+// name, with an empty level ("x/", "/lead", "x//y"), as it refuses "." and ".."
+// levels. CreateMailboxForUser (User API, sora-admin mailbox create) refuses such a
+// name before it creates any parent.
+func TestCreateAndRenameMailbox_EmptyHierarchyLevel(t *testing.T) {
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	ctx := context.Background()
+
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, account.Email)
+	require.NoError(t, err)
+
+	empty := []string{"", "/", "x/", "/lead", "x//y", "x//y/"}
+	for _, name := range empty {
+		err := rdb.CreateMailboxWithRetry(ctx, accountID, name, nil)
+		assert.ErrorIs(t, err, consts.ErrMailboxInvalidName, "CreateMailbox %q", name)
+	}
+	for _, name := range []string{"x//y", "/lead", "a/b//c/"} {
+		err := rdb.CreateMailboxForUserWithRetry(ctx, accountID, name)
+		assert.ErrorIs(t, err, consts.ErrMailboxInvalidName, "CreateMailboxForUser %q", name)
+	}
+
+	require.NoError(t, rdb.CreateMailboxWithRetry(ctx, accountID, "Plain", nil))
+	plain, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, "Plain")
+	require.NoError(t, err)
+	for _, name := range append(empty, "Foo/") {
+		err := rdb.RenameMailboxWithRetry(ctx, plain.ID, accountID, name, nil)
+		assert.ErrorIs(t, err, consts.ErrMailboxInvalidName, "RenameMailbox to %q", name)
+	}
+
+	mailboxes, err := rdb.GetMailboxesWithRetry(ctx, accountID, false)
+	require.NoError(t, err)
+	for _, mb := range mailboxes {
+		assert.False(t, mb.Name == "" || strings.HasPrefix(mb.Name, "/") || strings.HasSuffix(mb.Name, "/") ||
+			strings.Contains(mb.Name, "//"), "mailbox %q has an empty hierarchy level", mb.Name)
+		assert.NotContains(t, []string{"x", "a", "a/b"}, mb.Name, "a refused name created its parent %q", mb.Name)
+	}
+}
+
 // TestGetMailboxByNameWithRetry_UnstorableName: a name PostgreSQL cannot hold in a
 // text value (a NUL, invalid UTF-8) names no mailbox. The lookup answers
 // ErrMailboxNotFound, as for any other missing name, instead of the SQLSTATE 22021

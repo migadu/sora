@@ -2,7 +2,6 @@ package helpers
 
 import (
 	"strings"
-	"unicode/utf8"
 
 	"github.com/migadu/sora/consts"
 )
@@ -50,7 +49,7 @@ func MailboxNameHasTraversal(name string) bool {
 // valid UTF-8 without a NUL. No mailbox has any other name; querying with one fails
 // with SQLSTATE 22021 instead of finding nothing.
 func MailboxNameStorable(name string) bool {
-	return utf8.ValidString(name) && strings.IndexByte(name, 0) < 0
+	return TextStorable(name)
 }
 
 // MailboxNameToCreate returns the name of the mailbox that creating name makes, or
@@ -76,6 +75,14 @@ func MailboxNameToCreate(name string) (string, error) {
 		}
 	}
 	return name, nil
+}
+
+// MailboxNameValid reports whether name can be stored as a mailbox's name: it is
+// one MailboxNameToCreate accepts as it is, with no trailing hierarchy delimiter to
+// drop. The database layer checks every name it creates or renames to with it.
+func MailboxNameValid(name string) bool {
+	created, err := MailboxNameToCreate(name)
+	return err == nil && created == name
 }
 
 // MailboxNameIsBelow reports whether name is a descendant of ancestor in the
