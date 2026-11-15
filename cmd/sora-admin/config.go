@@ -114,22 +114,13 @@ func handleConfigValidate(_ context.Context) {
 		os.Exit(1)
 	}
 
-	// The warnings start-up logs about [[server]] keys a server type does not apply, and
-	// about an imap or pop3 session_memory_limit below an lmtp max_message_size. They do
-	// not fail the file.
-	allServers := cfg.GetAllServers()
-	for _, server := range allServers {
-		server.WarnUnusedConfigOptions(func(format string, args ...any) {
-			fmt.Printf("[WARN] %s\n", strings.TrimPrefix(fmt.Sprintf(format, args...), "WARNING: "))
-		})
-	}
-	for _, s := range cfg.SessionMemoryShortfalls() {
-		fmt.Printf("[WARN] Server %s (type: %s) has session_memory_limit %d bytes, below max_message_size %d bytes of lmtp server %s: "+
-			"a delivered message larger than session_memory_limit is stored, but this server can never fetch it (IMAP NO [LIMIT], POP3 -ERR [SYS/PERM]); "+
-			"sora-admin imports are bounded by [admin_cli] import_message_limit instead\n",
-			s.Server, s.Type, s.SessionMemoryLimit, s.MaxMessageSize, s.LMTPServer)
+	// The warnings start-up logs about the file alone (Config.Warnings). They do not
+	// fail it.
+	for _, w := range cfg.Warnings() {
+		fmt.Printf("[WARN] %s\n", w)
 	}
 
+	allServers := cfg.GetAllServers()
 	fmt.Printf("[OK] Configuration is valid!\n")
 	if len(allServers) > 0 {
 		fmt.Printf("\nConfigured servers:\n")
@@ -276,9 +267,21 @@ Description:
         to S3 (a mail backend, or the User API when [s3] has an endpoint,
         bucket or keys)
       [cluster] and [tls] when enabled
-  - Warning, as start-up does, about [[server]] keys the server type does
-    not use, and about an imap or pop3 session_memory_limit below the
-    largest lmtp max_message_size
+  - Warning, as start-up does, about settings that do not do on this node
+    what they say:
+      [[server]] keys the server type does not use
+      an imap or pop3 session_memory_limit below the largest lmtp
+        max_message_size
+      enable_affinity without [cluster] and [cluster.affinity], and per-user
+        proxy connection limits without [cluster]
+      a User API without [s3], an Admin API without an imap, pop3 or lmtp
+        server (no upload worker), and proxies without a database (backend
+        maintenance)
+      a [relay] in plaintext or without certificate verification
+      values start-up cannot parse and replaces with the default: the
+        [server.limits] windows and sizes, the timeouts.*_command_timeouts
+        tables, remote_dns_refresh, and the [cluster.affinity],
+        [backend_maintenance] and [relay.queue] durations
 
   It connects to nothing and does not look at the node's disk, so it does
   not check connectivity. When services start, Sora connects to the database
