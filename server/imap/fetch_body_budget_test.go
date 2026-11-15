@@ -11,7 +11,9 @@ import (
 	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/metrics"
 	serverPkg "github.com/migadu/sora/server"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // requireMemoryRefusal fails t unless err is NO with code, the answer to a body
@@ -59,15 +61,17 @@ func fetchItemsBeforeResponse(s *IMAPSession, msg *db.Message, options *imap.Fet
 			s.memTracker.Free(int64(len(bodyData)))
 		}
 	}()
+	var binaryCopies int64
 	if len(options.BinarySection) > 0 || len(options.BinarySectionSize) > 0 {
 		b, err := s.decodeBinary(ctx, &bodyData, &bodyFetched, options, msg)
 		if err != nil {
 			return err
 		}
 		defer s.freeSectionCopies(b.charged)
+		binaryCopies = b.charged
 	}
 	if len(options.BodySection) > 0 {
-		b, err := s.extractBodySections(ctx, &bodyData, &bodyFetched, options, msg)
+		b, err := s.extractBodySections(ctx, &bodyData, &bodyFetched, options, msg, binaryCopies)
 		if err != nil {
 			return err
 		}
@@ -332,5 +336,87 @@ func TestFetch_RetainedSectionYieldsToUnsizedBody(t *testing.T) {
 				t.Error("the other section is still retained")
 			}
 		})
+	}
+}
+
+// Every prepared response copy stays owned until that response ends. The same
+// FETCH is permanently over budget when their total cannot fit, but allocations
+// belonging to other work must leave the refusal temporary.
+func TestFetch_MultipleCopiesClassifyRequestOwnership(t *testing.T) {
+	body := multipartTestMessage(64 * 1024)
+	section := imapserver.ExtractBodySection(bytes.NewReader(body), &imap.FetchItemBodySection{Part: []int{2}})
+	cases := []struct {
+		name    string
+		options *imap.FetchOptions
+	}{
+		{"BODY copies", &imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{{Part: []int{2}}, {Part: []int{2}}}}},
+		{"BINARY partial copies", &imap.FetchOptions{BinarySection: []*imap.FetchItemBinarySection{{Part: []int{2}, Partial: &imap.SectionPartial{Size: int64(len(section))}}, {Part: []int{2}, Partial: &imap.SectionPartial{Size: int64(len(section))}}}}},
+		{"mixed BINARY and BODY", &imap.FetchOptions{BinarySection: []*imap.FetchItemBinarySection{{Part: []int{2}}}, BodySection: []*imap.FetchItemBodySection{{Part: []int{2}}}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, temporary := range []bool{false, true} {
+				label := "request cannot fit"
+				if temporary {
+					label = "other work holds budget"
+				}
+				t.Run(label, func(t *testing.T) {
+					limit := int64(len(body) + 3*len(section)/2)
+					held := int64(0)
+					want := imap.ResponseCodeLimit
+					if temporary {
+						limit = int64(len(body) + 3*len(section))
+						held = int64(2 * len(section))
+						want = imap.ResponseCodeUnavailable
+					}
+					sess, tracker, msg := newBudgetTestSession(t, limit, body, len(body))
+					sess.server.name = t.Name()
+					if err := tracker.Allocate(held); err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { tracker.Free(held) })
+					counter := metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", sess.server.name, sess.server.hostname)
+					before := testutil.ToFloat64(counter)
+					requireMemoryRefusal(t, fetchItemsBeforeResponse(sess, msg, tc.options), want)
+					if got := tracker.Current(); got != held {
+						t.Errorf("memory after refusal=%d, want unrelated allocation %d", got, held)
+					}
+					if got := testutil.ToFloat64(counter) - before; got != 1 {
+						t.Errorf("memory refusal metric increased by%v, want1", got)
+					}
+				})
+			}
+		})
+	}
+}
+
+// A retained BINARY chunk can be prepared without loading the message body.
+// A subsequent BODY[] must include that owned chunk when its body load fails.
+func TestFetch_BodyLoadCountsPreviouslyPreparedCachedChunk(t *testing.T) {
+	body := multipartTestMessage(64 * 1024)
+	const chunk = 16 * 1024
+	sess, tracker, msg := newBudgetTestSession(t, int64(len(body)+chunk/2), body, len(body))
+	sess.server.name = t.Name()
+	decoded, err := safeDecodeBinarySection(body, &imap.FetchItemBinarySection{Part: []int{2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	charge, ok := sess.chargeSectionCopy(len(decoded))
+	if !ok {
+		t.Fatal("cannot prepare optional retention")
+	}
+	if !sess.retainBodySection(binarySectionCacheKey(msg.ContentHash, []int{2}), decoded) {
+		sess.freeSectionCopies(charge)
+		t.Fatal("section was not retained")
+	}
+	counter := metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", sess.server.name, sess.server.hostname)
+	before := testutil.ToFloat64(counter)
+	options := &imap.FetchOptions{BinarySection: []*imap.FetchItemBinarySection{{Part: []int{2}, Partial: &imap.SectionPartial{Size: chunk}}}, BodySection: []*imap.FetchItemBodySection{{}}}
+	requireMemoryRefusal(t, fetchItemsBeforeResponse(sess, msg, options), imap.ResponseCodeLimit)
+	if got := tracker.Current(); got != 0 {
+		t.Errorf("memory after refusal=%d, want0", got)
+	}
+	if got := testutil.ToFloat64(counter) - before; got != 1 {
+		t.Errorf("memory refusal metric increased by%v, want1", got)
 	}
 }
