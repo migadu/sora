@@ -79,6 +79,13 @@ func TestStartupChecksTheWholeFile(t *testing.T) {
 			},
 		},
 		{
+			// Start-up set up S3 and tried every replica before it stopped with "no
+			// healthy database pools available" (#1266).
+			name:    "mail backend with only [database.read] hosts",
+			content: "[database.read]\nhosts = [\"replica.example.com\"]\n\n[s3]\nendpoint = \"s3.example.com\"\nbucket = \"mail\"\n" + imapBackend,
+			wantErr: []string{`invalid configuration - [database.write]: server "imap" (imap) needs the database, but [database.write] has no hosts`},
+		},
+		{
 			// Every proxy refused this file only as it was built (#1038).
 			name: "proxy without remote_addrs or [[pool]] blocks",
 			content: "\n[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:1143\"\n" +
