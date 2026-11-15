@@ -684,18 +684,31 @@ func (i *Importer) processSubscriptions() error {
 	return nil
 }
 
+// readSieveFile reads path through a root at its directory. The root follows a
+// symbolic link only to a file within that directory, as Pigeonhole's own
+// ~/.dovecot.sieve -> sieve/<name>.sieve; a link out of it, or an absolute one, does
+// not open. The usual --sieve file of a Dovecot migration is that link, which is the
+// user's, and the import runs with privileges the user lacks: the link must not
+// choose which file those privileges read into the user's account.
+func readSieveFile(path string) ([]byte, error) {
+	path = filepath.Clean(path)
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return root.ReadFile(filepath.Base(path))
+}
+
 // importSieveScript imports a Sieve script file for the user
 func (i *Importer) importSieveScript() error {
-	// Check if file exists (follow symlinks if present)
-	if _, err := os.Stat(i.options.SievePath); os.IsNotExist(err) {
+	scriptContent, err := readSieveFile(i.options.SievePath)
+	if errors.Is(err, fs.ErrNotExist) {
 		logger.Info("Sieve script file does not exist - ignoring", "path", i.options.SievePath)
 		return nil
 	}
-
-	// Read the script content
-	scriptContent, err := os.ReadFile(i.options.SievePath)
 	if err != nil {
-		return fmt.Errorf("failed to read Sieve script file: %w", err)
+		return fmt.Errorf("failed to read Sieve script file %s: %w", i.options.SievePath, err)
 	}
 
 	// A script delivery cannot compile is skipped whole, so it must not become
