@@ -120,14 +120,27 @@ func TestCleanupFailedUploadsSparesAPendingUploadReArmedMidStatement(t *testing.
 
 			res := <-done
 			require.NoError(t, res.err)
-			require.Equal(t, int64(1), res.cleaned,
-				"precondition: the cleaner reaps the first delivery, judged dead from its snapshot")
+			// The count covers the whole database, which other tests share: judge the
+			// outcome by this test's own rows.
+			t.Logf("CleanupFailedUploads reported %d message(s) deleted", res.cleaned)
 
-			var uploaded bool
-			require.NoError(t, db.GetReadPool().QueryRow(ctx,
-				`SELECT uploaded FROM messages WHERE content_hash = $1 AND account_id = $2`,
-				contentHash, accountID).Scan(&uploaded))
-			require.False(t, uploaded, "the second delivery is staged on the live node, not uploaded yet")
+			var uids []int64
+			var uploaded []bool
+			rows, err := db.GetReadPool().Query(ctx,
+				`SELECT uid, uploaded FROM messages WHERE content_hash = $1 AND account_id = $2 ORDER BY uid`,
+				contentHash, accountID)
+			require.NoError(t, err)
+			for rows.Next() {
+				var uid int64
+				var up bool
+				require.NoError(t, rows.Scan(&uid, &up))
+				uids = append(uids, uid)
+				uploaded = append(uploaded, up)
+			}
+			require.NoError(t, rows.Err())
+			require.Equal(t, []int64{2}, uids,
+				"precondition: the cleaner reaps the first delivery, judged dead from its snapshot, and not the second")
+			require.Equal(t, []bool{false}, uploaded, "the second delivery is staged on the live node, not uploaded yet")
 
 			var attempts int
 			var owner string
