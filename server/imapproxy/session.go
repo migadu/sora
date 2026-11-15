@@ -562,7 +562,7 @@ func (s *Session) handleConnection() {
 			s.sendResponse(fmt.Sprintf("%s OK NOOP completed", tag))
 
 		default:
-			if s.handleAuthError(fmt.Sprintf("%s NO Command not supported before authentication", tag)) {
+			if s.handleAuthError(tag + " " + preAuthCommandError(command, args)) {
 				return
 			}
 			continue
@@ -620,6 +620,72 @@ func (s *Session) drainLiterals(args []string) error {
 		}
 	}
 	return nil
+}
+
+// preAuthRequiredState maps the commands a backend implements that are not
+// valid in the not-authenticated state to the state they require, as the
+// backend (go-imap) checks it. UID commands are keyed "UID <command>".
+var preAuthRequiredState = map[string]string{
+	"UNAUTHENTICATE": "authenticated",
+	"ENABLE":         "authenticated",
+	"CREATE":         "authenticated",
+	"DELETE":         "authenticated",
+	"RENAME":         "authenticated",
+	"SUBSCRIBE":      "authenticated",
+	"UNSUBSCRIBE":    "authenticated",
+	"STATUS":         "authenticated",
+	"LIST":           "authenticated",
+	"LSUB":           "authenticated",
+	"NAMESPACE":      "authenticated",
+	"GETACL":         "authenticated",
+	"SETACL":         "authenticated",
+	"DELETEACL":      "authenticated",
+	"LISTRIGHTS":     "authenticated",
+	"MYRIGHTS":       "authenticated",
+	"IDLE":           "authenticated",
+	"NOTIFY":         "authenticated",
+	"SELECT":         "authenticated",
+	"EXAMINE":        "authenticated",
+	"APPEND":         "authenticated",
+	"GETMETADATA":    "authenticated",
+	"SETMETADATA":    "authenticated",
+	"ESEARCH":        "authenticated",
+	"CHECK":          "selected",
+	"CLOSE":          "selected",
+	"UNSELECT":       "selected",
+	"EXPUNGE":        "selected",
+	"FETCH":          "selected",
+	"STORE":          "selected",
+	"COPY":           "selected",
+	"MOVE":           "selected",
+	"SEARCH":         "selected",
+	"SORT":           "selected",
+	"THREAD":         "selected",
+	"UID EXPUNGE":    "selected",
+	"UID FETCH":      "selected",
+	"UID STORE":      "selected",
+	"UID COPY":       "selected",
+	"UID MOVE":       "selected",
+	"UID SEARCH":     "selected",
+	"UID SORT":       "selected",
+	"UID THREAD":     "selected",
+}
+
+// preAuthCommandError is the tagged reply text (without the tag) for a command
+// the pre-auth loop does not handle: an unknown command, or one valid only
+// after authentication. Both are protocol-level errors in the client's
+// command, reported with BAD (RFC 9051 §7.1.3), not NO, which reports the
+// unsuccessful completion of a valid command (§7.1.2). The wording is the
+// backend's, so a client gets the same reply from a proxy as from a backend.
+func preAuthCommandError(command string, args []string) string {
+	name := command
+	if command == "UID" && len(args) > 0 {
+		name += " " + strings.ToUpper(args[0])
+	}
+	if state, ok := preAuthRequiredState[name]; ok {
+		return "BAD [CLIENTBUG] This command is only valid in the " + state + " state"
+	}
+	return "BAD Unknown command"
 }
 
 // handleAuthError increments the error count, sends an error response, and
