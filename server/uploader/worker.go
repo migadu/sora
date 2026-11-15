@@ -1301,6 +1301,20 @@ func (w *UploadWorker) LinkStaged(contentHash string, srcAccountID, destAccountI
 	return w.stageFrom(dst, in)
 }
 
+// LinkStagedOrStore stages for destAccountID a body whose bytes the caller holds as
+// data: as LinkStaged does from the file staged for srcAccountID, and from data when
+// that file is not staged here any more (srcAccountID's upload removed it after the
+// caller staged or found it). A delivery into a shared mailbox another account owns
+// uses it, the owner's pending upload reading only the owner's file: on an error the
+// owner's message must not be stored.
+func (w *UploadWorker) LinkStagedOrStore(contentHash string, srcAccountID, destAccountID int64, data []byte) error {
+	err := w.LinkStaged(contentHash, srcAccountID, destAccountID)
+	if errors.Is(err, fs.ErrNotExist) {
+		_, err = w.StoreLocally(contentHash, destAccountID, data)
+	}
+	return err
+}
+
 // stageFrom stages at path, whose directory exists, the body read from r, and counts it
 // against max_staging_size.
 //
