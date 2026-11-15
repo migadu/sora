@@ -424,7 +424,14 @@ Examples:
 		os.Exit(1)
 	}
 	*newName = created
-	if helpers.MailboxNameIsBelow(*newName, mbox.Name) {
+	// Which level of the new name is the mailbox is the database's call (LOWER(name)
+	// under its collation), not a Go case mapping's.
+	below, err := rdb.MailboxNameIsBelowWithRetry(ctx, *newName, mbox)
+	if err != nil {
+		fmt.Printf("Failed to check whether '%s' is below '%s': %v\n", *newName, *oldName, err)
+		os.Exit(1)
+	}
+	if below {
 		fmt.Println("Failed to rename mailbox: a mailbox cannot be renamed to a name below itself")
 		os.Exit(1)
 	}

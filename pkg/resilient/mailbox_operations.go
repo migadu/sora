@@ -68,6 +68,32 @@ func (rd *ResilientDatabase) GetOwnedMailboxIDByNameWithRetry(ctx context.Contex
 	return result.(int64), nil
 }
 
+// MailboxNameIsBelowWithRetry reports whether name is below mbox in its owner's
+// hierarchy, as the database resolves names. Which names are one mailbox is the
+// database's call, LOWER(name) under its collation, which no Go case mapping
+// matches (under ICU "İx" is not "ix", and "ας" is "ΑΣ"). lower() leaves the
+// hierarchy delimiters alone, so of the leading parts of name only the one with as
+// many levels as mbox's name can name mbox: that one is looked up, on the primary,
+// and the mailbox found compared with mbox.
+func (rd *ResilientDatabase) MailboxNameIsBelowWithRetry(ctx context.Context, name string, mbox *db.DBMailbox) (bool, error) {
+	delim := string(consts.MailboxDelimiter)
+	levels := strings.Count(mbox.Name, delim) + 1
+	parts := strings.Split(name, delim)
+	if len(parts) <= levels {
+		return false, nil
+	}
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	id, err := rd.GetOwnedMailboxIDByNameWithRetry(ctx, mbox.AccountID, strings.Join(parts[:levels], delim))
+	switch {
+	case err == nil:
+		return id == mbox.ID, nil
+	case errors.Is(err, consts.ErrMailboxNotFound):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
 // HasLiveDescendantsWithRetry reports whether any live mailbox sits below the given path.
 func (rd *ResilientDatabase) HasLiveDescendantsWithRetry(ctx context.Context, accountID int64, path string) (bool, error) {
 	op := func(ctx context.Context) (any, error) {

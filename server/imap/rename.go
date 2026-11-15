@@ -101,7 +101,7 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 	// of the new name are created, which would be below this mailbox. (RENAME INBOX
 	// moves messages into a new mailbox instead, which may be below INBOX.)
 	if !isInbox {
-		below, belowErr := s.nameIsBelowMailbox(ctx, newName, oldMailbox)
+		below, belowErr := s.server.rdb.MailboxNameIsBelowWithRetry(ctx, newName, oldMailbox)
 		if belowErr != nil {
 			return s.internalError("failed to check whether '%s' is below '%s': %v", newName, existingName, belowErr)
 		}
@@ -318,29 +318,6 @@ func (s *IMAPSession) writeRenameOldName(w *imapserver.RenameWriter, oldName, ne
 	}); err != nil {
 		s.WarnLog("failed to write OLDNAME LIST response after RENAME",
 			"old_name", oldName, "new_name", newName, "error", err)
-	}
-}
-
-// nameIsBelowMailbox reports whether name is below mbox in its owner's hierarchy,
-// as the database resolves names. lower() leaves the hierarchy delimiters alone,
-// so of the leading parts of name only the one with as many levels as mbox's name
-// can name mbox: that one is looked up and the mailbox found compared with mbox.
-func (s *IMAPSession) nameIsBelowMailbox(ctx context.Context, name string, mbox *db.DBMailbox) (bool, error) {
-	delim := string(consts.MailboxDelimiter)
-	levels := strings.Count(mbox.Name, delim) + 1
-	parts := strings.Split(name, delim)
-	if len(parts) <= levels {
-		return false, nil
-	}
-	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-	id, err := s.server.rdb.GetOwnedMailboxIDByNameWithRetry(ctx, mbox.AccountID, strings.Join(parts[:levels], delim))
-	switch {
-	case err == nil:
-		return id == mbox.ID, nil
-	case errors.Is(err, consts.ErrMailboxNotFound):
-		return false, nil
-	default:
-		return false, err
 	}
 }
 
