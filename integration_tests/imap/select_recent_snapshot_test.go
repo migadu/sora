@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -161,4 +163,75 @@ func TestIMAP_SelectCountsRecentInItsSnapshot(t *testing.T) {
 			assert.Equal(t, "5", responseNums(searchRecent, "* SEARCH"), "UID SEARCH RECENT after the poll")
 		})
 	}
+}
+
+// recentCountTracer counts the RECENT count statements (CountMessagesGreaterThanUID)
+// that SELECT runs for one mailbox.
+type recentCountTracer struct {
+	mailboxID int64
+	counts    atomic.Int32
+}
+
+func (r *recentCountTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, q pgx.TraceQueryStartData) context.Context {
+	if strings.Contains(q.SQL, "FROM messages WHERE mailbox_id = $1 AND uid > $2 AND expunged_at IS NULL") &&
+		len(q.Args) == 2 && q.Args[0] == r.mailboxID {
+		r.counts.Add(1)
+	}
+	return ctx
+}
+
+func (r *recentCountTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// TestIMAP_SelectCountsRecentOnlyAboveItsBaseline: every UID in SELECT's snapshot is at
+// most UIDNEXT-1, so when the Recent baseline is already there nothing can be recent,
+// and SELECT must not spend a statement (and its savepoint) counting it. Clients
+// reselect their folders constantly without new mail, so that is the common case.
+func TestIMAP_SelectCountsRecentOnlyAboveItsBaseline(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	ctx := context.Background()
+	server, owner := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	msg := func(n int) string {
+		return fmt.Sprintf("From: sender@example.com\r\nTo: user@example.com\r\nSubject: baseline %d\r\n\r\nbody %d\r\n", n, n)
+	}
+	w := dialRawIMAP(t, server.Address)
+	w.do(fmt.Sprintf("LOGIN %s %s", owner.Email, owner.Password))
+	for i := 1; i <= 4; i++ {
+		w.appendMsg("INBOX", msg(i))
+	}
+
+	ownerID, err := server.ResilientDB.GetAccountIDByEmailWithRetry(ctx, owner.Email)
+	require.NoError(t, err)
+	mailbox, err := server.ResilientDB.GetMailboxByNameWithRetry(ctx, ownerID, "INBOX")
+	require.NoError(t, err)
+	tracer := &recentCountTracer{mailboxID: mailbox.ID}
+	addr := startTracedIMAPServer(t, server.ResilientDB, tracer)
+
+	login := func() *rawIMAP {
+		c := dialRawIMAP(t, addr)
+		c.do(fmt.Sprintf("LOGIN %s %s", owner.Email, owner.Password))
+		return c
+	}
+	selectRecent := func(c *rawIMAP) int {
+		t.Helper()
+		lines, _ := c.do("SELECT INBOX")
+		recent, ok := qrsNumber(t, selectRecentRe, lines)
+		require.True(t, ok, "no RECENT in the SELECT response")
+		return int(recent)
+	}
+
+	first := login()
+	assert.Equal(t, 4, selectRecent(first), "no baseline yet: every message is recent")
+	assert.Equal(t, int32(0), tracer.counts.Load(), "no baseline: nothing to count")
+
+	assert.Equal(t, 0, selectRecent(first), "reselect with nothing new")
+	assert.Equal(t, int32(0), tracer.counts.Load(), "reselect: the session's baseline is UIDNEXT-1, nothing can be above it")
+
+	assert.Equal(t, 0, selectRecent(login()), "another session with nothing new")
+	assert.Equal(t, int32(0), tracer.counts.Load(), "server-wide baseline is UIDNEXT-1, nothing can be above it")
+
+	w.appendMsg("INBOX", msg(5))
+	assert.Equal(t, 1, selectRecent(login()), "UID 5 arrived after the baseline")
+	assert.Equal(t, int32(1), tracer.counts.Load(), "a message above the baseline is counted")
 }
