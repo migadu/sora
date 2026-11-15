@@ -225,3 +225,113 @@ func TestRenameMailbox_ConcurrentCreatesInSubtree(t *testing.T) {
 	_, err = db.GetMailboxByName(ctx, accountID, "Gam/Beta/Delta")
 	require.NoError(t, err, "the child created before the rename committed is renamed with its parent")
 }
+
+// TestRenameMailbox_NewParentRenamedSinceLookup: RENAME resolves the new parent's ID
+// by the parent part of the new name, in an earlier transaction (IMAP RENAME,
+// sora-admin mailbox rename). A rename of that parent committed since must not leave
+// the renamed mailbox below it under the parent's old name (issue #1298).
+func TestRenameMailbox_NewParentRenamedSinceLookup(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	db := setupTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+	accountID := createTestAccount(t, db, fmt.Sprintf("rename-renamed-parent-%d@example.com", time.Now().UnixNano()), "password123")
+
+	require.NoError(t, db.CreateMailboxForUser(ctx, accountID, "Alpha"))
+	require.NoError(t, db.CreateMailboxForUser(ctx, accountID, "Box"))
+	alpha, err := db.GetMailboxByName(ctx, accountID, "Alpha")
+	require.NoError(t, err)
+	box, err := db.GetMailboxByName(ctx, accountID, "Box")
+	require.NoError(t, err)
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, db.RenameMailbox(ctx, tx, alpha.ID, accountID, "Gam", nil))
+	require.NoError(t, tx.Commit(ctx))
+
+	tx, err = db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(context.Background())
+	err = db.RenameMailbox(ctx, tx, box.ID, accountID, "Alpha/Box", &alpha.ID)
+	require.ErrorIs(t, err, consts.ErrMailboxNotFound)
+	require.NoError(t, tx.Rollback(ctx))
+
+	_, err = db.GetMailboxByName(ctx, accountID, "Box")
+	require.NoError(t, err, "a refused rename leaves the mailbox as it was")
+	assertMailboxTreeConsistent(t, db, accountID)
+
+	// The parent's name is compared case-insensitively, as mailbox names are.
+	tx, err = db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, db.RenameMailbox(ctx, tx, box.ID, accountID, "gam/Box", &alpha.ID))
+	require.NoError(t, tx.Commit(ctx))
+	assertMailboxTreeConsistent(t, db, accountID)
+}
+
+// TestRenameMailbox_NewParentRenamedConcurrently: a RENAME into a parent, or into a
+// mailbox below an ancestor, that another RENAME is renaming must not link the
+// mailbox below the renamed parent under its old name (issue #1298).
+func TestRenameMailbox_NewParentRenamedConcurrently(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	db := setupTestDatabase(t)
+	defer db.Close()
+
+	for _, tc := range []struct {
+		name     string
+		existing string // the new parent, created first with "Box"
+		newName  string // what "Box" is renamed to while "Alpha" is renamed
+	}{
+		{name: "parent", existing: "Alpha", newName: "Alpha/Box"},
+		{name: "ancestor", existing: "Alpha/Beta", newName: "Alpha/Beta/Box"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			accountID := createTestAccount(t, db, fmt.Sprintf("rename-parent-race-%s-%d@example.com", tc.name, time.Now().UnixNano()), "password123")
+			require.NoError(t, db.CreateMailboxForUser(ctx, accountID, tc.existing))
+			require.NoError(t, db.CreateMailboxForUser(ctx, accountID, "Box"))
+			alpha, err := db.GetMailboxByName(ctx, accountID, "Alpha")
+			require.NoError(t, err)
+			box, err := db.GetMailboxByName(ctx, accountID, "Box")
+			require.NoError(t, err)
+			// Resolved by name before the rename of "Alpha" commits.
+			parent, err := db.GetMailboxByName(ctx, accountID, tc.existing)
+			require.NoError(t, err)
+
+			// The rename of "Alpha", done but not committed.
+			txRename, err := db.GetWritePool().Begin(ctx)
+			require.NoError(t, err)
+			defer txRename.Rollback(context.Background())
+			renamePID := backendPID(t, txRename)
+			require.NoError(t, db.RenameMailbox(ctx, txRename, alpha.ID, accountID, "Gam", nil))
+
+			done := make(chan error, 1)
+			go func() {
+				tx, err := db.GetWritePool().Begin(ctx)
+				if err != nil {
+					done <- err
+					return
+				}
+				defer tx.Rollback(context.Background())
+				if err := db.RenameMailbox(ctx, tx, box.ID, accountID, tc.newName, &parent.ID); err != nil {
+					done <- err
+					return
+				}
+				done <- tx.Commit(ctx)
+			}()
+			finished, moveErr := blockedOrDone(t, db, renamePID, done)
+
+			require.NoError(t, txRename.Commit(ctx))
+			if !finished {
+				moveErr = <-done
+			}
+			if moveErr != nil {
+				require.ErrorIs(t, moveErr, consts.ErrMailboxNotFound)
+			}
+			assertMailboxTreeConsistent(t, db, accountID)
+		})
+	}
+}
