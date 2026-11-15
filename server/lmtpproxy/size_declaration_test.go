@@ -115,6 +115,8 @@ func TestMAILRefusesDeclaredSizeOverTheAdvertisedLimit(t *testing.T) {
 // transaction starts.
 func TestMAILRefusesMalformedSizeParameter(t *testing.T) {
 	conn, r := startSizeDeclarationSession(t, 1024)
+	io.WriteString(conn, "LHLO client.example.org\r\n")
+	readReply(t, r)
 	for _, mail := range []string{
 		"MAIL FROM:<a@example.org> SIZE=12x",
 		"MAIL FROM:<a@example.org> SIZE=",
@@ -145,6 +147,8 @@ func TestMAILRefusesMalformedSizeParameter(t *testing.T) {
 // declaration.
 func TestMAILWithoutLimitAcceptsAnyDeclaredSize(t *testing.T) {
 	conn, r := startSizeDeclarationSession(t, 0)
+	io.WriteString(conn, "LHLO client.example.org\r\n")
+	readReply(t, r)
 	io.WriteString(conn, "MAIL FROM:<a@example.org> SIZE=104857600\r\n")
 	if got := readReply(t, r); !strings.HasPrefix(got, "250 ") {
 		t.Errorf("MAIL with SIZE and no limit: %q, want 250", got)
@@ -153,11 +157,16 @@ func TestMAILWithoutLimitAcceptsAnyDeclaredSize(t *testing.T) {
 
 // sizeBackend is a scripted LMTP backend for the SIZE forwarding tests. It advertises
 // lhloSize in its LHLO reply ("" advertises no SIZE) and, as a go-smtp backend does,
-// refuses a MAIL whose SIZE is above refuseAbove with 552 (0: refuses none). It serves
-// any number of connections and records every MAIL command it receives.
+// refuses a MAIL whose SIZE is above refuseAbove (0: refuses none), with refuseReply
+// (default 552 5.3.4). It keeps a transaction's state as go-smtp does: a nested MAIL, and
+// a RCPT or DATA out of sequence, get 503; DATA takes the body and answers once per
+// recipient ("250 2.0.0 Delivered by <name>"). It serves any number of connections and
+// records every MAIL command it receives.
 type sizeBackend struct {
+	name        string
 	lhloSize    string
 	refuseAbove int64
+	refuseReply string
 }
 
 func (b sizeBackend) start(t *testing.T) (addr string, mails func() []string) {
@@ -167,6 +176,9 @@ func (b sizeBackend) start(t *testing.T) (addr string, mails func() []string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
+	if b.refuseReply == "" {
+		b.refuseReply = "552 5.3.4 Max message size exceeded"
+	}
 	var mu sync.Mutex
 	var got []string
 	serve := func(conn net.Conn) {
@@ -174,6 +186,7 @@ func (b sizeBackend) start(t *testing.T) (addr string, mails func() []string) {
 		conn.SetDeadline(time.Now().Add(10 * time.Second))
 		io.WriteString(conn, "220 backend ready\r\n")
 		r := bufio.NewReader(conn)
+		from, rcpts := false, 0
 		for {
 			line, err := r.ReadString('\n')
 			if err != nil {
@@ -192,6 +205,10 @@ func (b sizeBackend) start(t *testing.T) (addr string, mails func() []string) {
 				mu.Lock()
 				got = append(got, line)
 				mu.Unlock()
+				if from {
+					io.WriteString(conn, "503 5.5.1 Sender already specified\r\n")
+					continue
+				}
 				refused := false
 				for _, arg := range strings.Fields(line) {
 					if v, ok := strings.CutPrefix(strings.ToUpper(arg), "SIZE="); ok {
@@ -200,10 +217,40 @@ func (b sizeBackend) start(t *testing.T) (addr string, mails func() []string) {
 					}
 				}
 				if refused {
-					io.WriteString(conn, "552 5.3.4 Max message size exceeded\r\n")
+					io.WriteString(conn, b.refuseReply+"\r\n")
 				} else {
+					from = true
 					io.WriteString(conn, "250 2.0.0 Roger\r\n")
 				}
+			case "RCPT":
+				if !from {
+					io.WriteString(conn, "503 5.5.1 Missing MAIL FROM command.\r\n")
+					continue
+				}
+				rcpts++
+				io.WriteString(conn, "250 2.0.0 I'll make sure it gets there\r\n")
+			case "DATA":
+				if !from || rcpts == 0 {
+					io.WriteString(conn, "503 5.5.1 Missing RCPT TO command.\r\n")
+					continue
+				}
+				io.WriteString(conn, "354 Go ahead\r\n")
+				for {
+					body, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if body == ".\r\n" {
+						break
+					}
+				}
+				for ; rcpts > 0; rcpts-- {
+					io.WriteString(conn, "250 2.0.0 Delivered by "+b.name+"\r\n")
+				}
+				from = false
+			case "RSET":
+				from, rcpts = false, 0
+				io.WriteString(conn, "250 2.0.0 OK\r\n")
 			case "QUIT":
 				io.WriteString(conn, "221 bye\r\n")
 				return
@@ -280,8 +327,8 @@ func startSizeForwardingSession(t *testing.T, backendAddr string) (send func(str
 // command may also carry parameters associated with a particular service extension"
 // (RFC 5321 section 4.1.1.2). It goes with
 // the MAIL sent when the backend is connected for the first recipient and with the MAIL
-// relayed to a backend held from an earlier transaction, and a MAIL without SIZE leaves
-// none behind.
+// sent, with a transaction's first recipient, to a backend held from an earlier
+// transaction, and a MAIL without SIZE leaves none behind.
 func TestMAILForwardsDeclaredSizeToBackendThatAdvertisesSIZE(t *testing.T) {
 	for _, tt := range []struct {
 		name, lhloSize string
@@ -299,8 +346,10 @@ func TestMAILForwardsDeclaredSizeToBackendThatAdvertisesSIZE(t *testing.T) {
 				{"RCPT TO:<user@example.com>", "250 "},
 				{"RSET", "250 "},
 				{"MAIL FROM:<b@example.org> size=2000", "250 "},
+				{"RCPT TO:<user@example.com>", "250 "},
 				{"RSET", "250 "},
 				{"MAIL FROM:<c@example.org>", "250 "},
+				{"RCPT TO:<user@example.com>", "250 "},
 			} {
 				if got := send(step.cmd); !strings.HasPrefix(got, step.want) {
 					t.Fatalf("%s: %q, want %q", step.cmd, got, step.want)
@@ -325,7 +374,9 @@ func TestMAILForwardsDeclaredSizeToBackendThatAdvertisesSIZE(t *testing.T) {
 // returned, the client may not requeue the message". When the backend is connected for a
 // recipient, each recipient is answered 552, never "451 Backend connection failed", which
 // would have the MTA retry the message until it expires. A backend held from an earlier
-// transaction answers the MAIL itself.
+// transaction is no different: the proxy answers the MAIL against its own limit, as on a
+// new connection, and the held backend, asked with the first recipient, refuses that
+// recipient.
 func TestBackendRefusalOfDeclaredSizeIsPermanent(t *testing.T) {
 	addr, _ := sizeBackend{lhloSize: "SIZE 1024", refuseAbove: 1024}.start(t)
 	send := startSizeForwardingSession(t, addr)
@@ -339,8 +390,12 @@ func TestBackendRefusalOfDeclaredSizeIsPermanent(t *testing.T) {
 		{"MAIL FROM:<a@example.org> SIZE=1000", "250 "},
 		{"RCPT TO:<user@example.com>", "250 "},
 		{"RSET", "250 "},
-		{"MAIL FROM:<a@example.org> SIZE=2000", "552 5.3.4 "},
-		{"RCPT TO:<user@example.com>", "503 "},
+		{"MAIL FROM:<a@example.org> SIZE=2000", "250 "},
+		{"RCPT TO:<user@example.com>", "552 5.3.4 "},
+		{"RCPT TO:<other@example.com>", "552 5.3.4 "},
+		{"RSET", "250 "},
+		{"MAIL FROM:<a@example.org> SIZE=1000", "250 "},
+		{"RCPT TO:<user@example.com>", "250 "},
 	} {
 		if got := send(step.cmd); !strings.HasPrefix(got, step.want) {
 			t.Errorf("%s: %q, want %q", step.cmd, got, step.want)

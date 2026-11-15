@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/migadu/go-imap"
 )
@@ -20,6 +21,25 @@ var IMAPAlwaysAdvertisedCaps = imap.CapSet{
 	imap.CapUnselect:     {},
 	imap.CapEnable:       {},
 	imap.CapUTF8Accept:   {},
+}
+
+// IMAPCap returns the capability a disabled_caps or disable_caps name stands for,
+// spelled as go-imap advertises it and keys its CapSet: capability names are
+// case-insensitive (RFC 9051 section 9, note 1: "Implementations MUST accept these
+// strings in a case-insensitive fashion"), and go-imap spells every capability in
+// upper case but the two base versions.
+func IMAPCap(name string) imap.Cap {
+	for _, base := range []imap.Cap{imap.CapIMAP4rev1, imap.CapIMAP4rev2} {
+		if strings.EqualFold(name, string(base)) {
+			return base
+		}
+	}
+	return imap.Cap(strings.Map(func(r rune) rune {
+		if 'a' <= r && r <= 'z' {
+			return r - 'a' + 'A'
+		}
+		return r
+	}, name))
 }
 
 // IMAPCapImplies reports whether capability by implies capability c: go-imap's
@@ -57,8 +77,9 @@ func imapCapKeptBy(keep imap.CapSet, target imap.Cap) []imap.Cap {
 	return keepers
 }
 
-// DisableIMAPCapabilities removes the named capabilities (and any capabilities
-// in caps that imply them) from caps, except capabilities protected by keep.
+// DisableIMAPCapabilities removes the named capabilities (IMAPCap: in any case)
+// and any capabilities in caps that imply them from caps, except capabilities
+// protected by keep.
 // When a capability is protected by keep, it is neither deleted nor cascaded
 // from, so extensions that depend on it and were not themselves disabled stay
 // available. It returns the removed capability names and the sorted, unique
@@ -76,7 +97,7 @@ func DisableIMAPCapabilities(caps imap.CapSet, names []string, keep imap.CapSet)
 	}
 
 	for _, name := range names {
-		c := imap.Cap(name)
+		c := IMAPCap(name)
 		if _, ok := IMAPAlwaysAdvertisedCaps[c]; ok {
 			continue
 		}
@@ -85,7 +106,7 @@ func DisableIMAPCapabilities(caps imap.CapSet, names []string, keep imap.CapSet)
 		}
 		if _, ok := caps[c]; ok {
 			delete(caps, c)
-			removed = append(removed, name)
+			removed = append(removed, string(c))
 		}
 		queue := []imap.Cap{c}
 		for len(queue) > 0 {

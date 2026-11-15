@@ -65,8 +65,12 @@ a byte pipe. Everything after login (capabilities, IDLE, FETCH) is the backend's
 The LMTP proxy does not log in. For each `RCPT TO` it finds the recipient's backend, connects (or
 reuses the connection it holds) and forwards the command. Like the backend, it does not announce
 `DSN`, so the sending MTA issues the notifications a sender asked for (RFC 3461 §5.2.2); `NOTIFY`,
-`ORCPT`, `RET` and `ENVID` sent anyway are accepted and not forwarded. The User API proxy forwards
-each HTTP request; the backend checks the JWT token.
+`ORCPT`, `RET` and `ENVID` sent anyway are accepted and not forwarded. As on the backend, `MAIL`
+before `LHLO` gets `503 5.5.1`. A later `LHLO`, or a completed `STARTTLS`, starts the session over:
+the transaction in progress ends, and a held backend connection is closed, so the next recipient
+reaches the backend on a new connection (with `remote_use_xclient`, its `XCLIENT HELO=` is the new
+`LHLO` name). After `STARTTLS` the MTA must send `LHLO` again before `MAIL`. The User API proxy
+forwards each HTTP request; the backend checks the JWT token.
 
 A node can run proxies and backend servers in the same process. A node that runs only proxies is a
 **proxy node**. [Section 13](#13-proxy-nodes-and-the-database) explains when such a node connects
@@ -125,10 +129,11 @@ carries its own copy and these server keys are not used for pool members (except
 | `timeouts.command_timeout` | IMAP `30m`, POP3 `10m`, ManageSieve `3m` | Idle timeout. |
 | `timeouts.absolute_session_timeout` | `24h`, LMTP `5m` | Longest a session may last. |
 | `timeouts.min_bytes_per_minute` | `0` (off) | Slow-client guard. |
-| `max_connections`, `max_connections_per_ip` | `0` (unlimited) | Per proxy instance. |
+| `max_connections` | `0` (unlimited) | Per proxy listener. |
+| `max_connections_per_ip` | `0` (unlimited) | Per proxy listener. The LMTP proxy ignores it with a warning. With `[cluster]` enabled, the IMAP, POP3 and ManageSieve proxies count an address's connections on every node; see [CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies). |
 | `max_connections_per_user`, `max_connections_per_user_per_ip` | `0` | IMAP, POP3 and ManageSieve proxies only, and only with `[cluster]` enabled; see [CLUSTER.md](CLUSTER.md). The LMTP proxy ignores them with a warning. |
 | `limits.max_auth_errors` | `2` | Protocol errors before login (unknown or malformed commands, logins refused without TLS) before the connection is closed. Wrong passwords do not count. |
-| `auth_rate_limit` | off | See [AUTHENTICATION.md](AUTHENTICATION.md). |
+| `auth_rate_limit` | off | See [AUTHENTICATION.md](AUTHENTICATION.md). With `[cluster]` enabled, the IMAP, POP3 and ManageSieve proxies share it; see [CLUSTER.md](CLUSTER.md#66-authentication-rate-limits-imap-pop3-and-managesieve-proxies). |
 | `listen_backlog` | `1024` (mail proxies) | TCP accept backlog. |
 | `debug` | `false` | Log the protocol exchange, with passwords masked. |
 | `proxy_protocol`, `proxy_protocol_timeout` | off, `5s` | Accept a PROXY header from a load balancer in front of the proxy. The load balancer's address must be in `[servers] trusted_networks`. |
@@ -664,7 +669,13 @@ addresses: every host in the list may claim any client address. See [SECURITY.md
 
 You need only one way to pass the client address. PROXY protocol works for all protocols and keeps
 the backend from seeing the proxy's address at all. `ID` and `XCLIENT` work without changing the
-backend's listener.
+backend's listener. On IMAP and POP3, a backend that receives a PROXY header judges `ID` and
+`XCLIENT` by the client the header names, not by the proxy, so next to a header it ignores the `ID`
+forwarding fields and refuses the POP3 `XCLIENT` (unless that client is itself in
+`trusted_networks`); the login continues. The header already carries the client's address and
+port, its JA4 fingerprint and the proxy session ID (8.4). LMTP `XCLIENT` is judged by the proxy
+and still carries the client's `HELO` next to a PROXY header
+([SECURITY.md](SECURITY.md#31-trusted_networks)).
 
 ### 8.2 Which settings apply
 

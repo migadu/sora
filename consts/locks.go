@@ -37,6 +37,6 @@ const SoraContentRekeyLockClassID = int32(0x524B4559) // "RKEY" in hex = 1380664
 const SoraMetadataLimitLockClassID = int32(0x4D455441) // "META" in hex = 1296389185
 
 // SoraSieveScriptLimitLockClassID is the class ID of the transaction-scoped advisory lock,
-// keyed by hashint8(account_id), that serialises the script count check and insert of
-// db.CreateScript per account, so two creates cannot both pass the per-account limit.
+// keyed by hashint8(account_id), that serialises Sieve script creates and name changes
+// (db.CreateScript, db.CreateOrUpdateScript, db.UpdateScript, db.RenameScript) per account.
 const SoraSieveScriptLimitLockClassID = int32(0x53494556) // "SIEV" in hex = 1397310806
