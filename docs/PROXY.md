@@ -665,7 +665,13 @@ addresses: every host in the list may claim any client address. See [SECURITY.md
 
 You need only one way to pass the client address. PROXY protocol works for all protocols and keeps
 the backend from seeing the proxy's address at all. `ID` and `XCLIENT` work without changing the
-backend's listener.
+backend's listener. On IMAP and POP3, a backend that receives a PROXY header judges `ID` and
+`XCLIENT` by the client the header names, not by the proxy, so next to a header it ignores the `ID`
+forwarding fields and refuses the POP3 `XCLIENT` (unless that client is itself in
+`trusted_networks`); the login continues. The header already carries the client's address and
+port, its JA4 fingerprint and the proxy session ID (8.4). LMTP `XCLIENT` is judged by the proxy
+and still carries the client's `HELO` next to a PROXY header
+([SECURITY.md](SECURITY.md#31-trusted_networks)).
 
 ### 8.2 Which settings apply
 
