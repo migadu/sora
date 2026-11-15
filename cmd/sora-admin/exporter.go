@@ -812,12 +812,17 @@ func (exporter *Exporter) buildMaildirFlags(msg *db.Message, mailboxName string)
 // Returns: (fileExists, filename, error)
 // - fileExists: true if file exists on disk, false if needs to be created
 // - filename: original filename from database (empty if not in database)
+//
+// The file is looked for in the directory this export writes the mailbox to
+// (mailboxDir), not at the path recorded with it: an older version named some
+// folders' directories differently (#1166), and a message left only in such a
+// directory is not in the folder the importer reads the mailbox from.
 func (exporter *Exporter) isMessageExported(contentHash, mailbox string) (bool, string, error) {
-	var filename, path string
+	var filename string
 	err := exporter.db.QueryRow(
-		"SELECT filename, path FROM messages WHERE hash = ? AND mailbox = ?",
+		"SELECT filename FROM messages WHERE hash = ? AND mailbox = ?",
 		contentHash, mailbox,
-	).Scan(&filename, &path)
+	).Scan(&filename)
 
 	if err == sql.ErrNoRows {
 		return false, "", nil
@@ -826,8 +831,12 @@ func (exporter *Exporter) isMessageExported(contentHash, mailbox string) (bool, 
 		return false, "", err
 	}
 
+	dir, err := exporter.mailboxDir(mailbox)
+	if err != nil {
+		return false, "", err
+	}
 	// Check if the file still exists on disk
-	if _, err := os.Stat(path); os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, "cur", filename)); os.IsNotExist(err) {
 		logger.Info("File in database but not on disk - will recreate with original filename", "filename", filename)
 		return false, filename, nil // Return the original filename for reuse
 	}

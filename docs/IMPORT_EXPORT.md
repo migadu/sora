@@ -507,8 +507,12 @@ uidlist in the target is merged: its entries for files still present are kept.
 as the importer's ([section 8](#8-the-sqlite-cache-sora-maildirdb)), and records each exported
 message by content hash and mailbox. On a re-run:
 
-- A message already recorded whose file still exists is skipped.
-- A message recorded whose file is gone is written again under its recorded name.
+- A message already recorded whose file is still in its folder's `cur/` is skipped.
+- A message recorded whose file is not there is written again under its recorded name. That
+  includes a folder an older version wrote under another directory name (one with `.`, `\`, `&`
+  or non-ASCII characters in its name): its messages are written to the folder's directory as
+  named now, and the old directory is left as it was, so remove it or export into an empty
+  directory.
 - With `--overwrite-flags`, recorded messages are written again with their current flags and the
   old file is removed.
 - Two messages with the same content in one mailbox are exported as one file.

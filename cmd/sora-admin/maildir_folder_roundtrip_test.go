@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -147,4 +148,37 @@ func TestSubscriptionsNameTheMailboxesTheirFoldersImportAs(t *testing.T) {
 		assert.Equal(t, filepath.ToSlash(rel), entry, "subscription of %q names its directory", name)
 		assert.Equal(t, name, subscribedAs(formatDovecotSubscriptions([]string{entry})), "subscription of %q", name)
 	}
+}
+
+// TestReexportWritesMessagesWhereTheFolderIsNamedNow: a message an older version
+// exported is exported again when its file is not in the directory this version
+// names the mailbox by. An older export wrote "v1.2" to the directory "v1.2", which
+// the importer reads as "v1/2" (#1166); re-running the export into that directory
+// must fill "v1\2e2" with every message of "v1.2", not only with those the older
+// run did not write.
+func TestReexportWritesMessagesWhereTheFolderIsNamedNow(t *testing.T) {
+	root := t.TempDir()
+	exporter, err := NewExporter(context.Background(), root, "user@example.com", 1, nil, nil, ExporterOptions{})
+	require.NoError(t, err)
+	defer exporter.Close()
+
+	const hash, filename = "0123456789abcdef", "1700000000.M1700000000P1.host:2,S"
+	oldPath := filepath.Join(root, "v1.2", "cur", filename)
+	require.NoError(t, os.MkdirAll(filepath.Dir(oldPath), 0o755))
+	require.NoError(t, os.WriteFile(oldPath, []byte("Subject: x\r\n\r\nx\r\n"), 0o644))
+	require.NoError(t, exporter.recordExport(hash, "v1.2", filename, oldPath, 17))
+
+	exported, existing, err := exporter.isMessageExported(hash, "v1.2")
+	require.NoError(t, err)
+	assert.False(t, exported, "the file is in %q, not in the directory this export writes \"v1.2\" to", oldPath)
+	assert.Equal(t, filename, existing, "the message is written again under its recorded name")
+
+	dir, err := exporter.mailboxDir("v1.2")
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "cur"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "cur", filename), []byte("Subject: x\r\n\r\nx\r\n"), 0o644))
+	exported, existing, err = exporter.isMessageExported(hash, "v1.2")
+	require.NoError(t, err)
+	assert.True(t, exported, "the file is where this export writes \"v1.2\"")
+	assert.Equal(t, filename, existing)
 }
