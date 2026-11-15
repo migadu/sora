@@ -1,0 +1,60 @@
+package imap
+
+import (
+	"bufio"
+	"net"
+	"strings"
+	"testing"
+	"time"
+)
+
+// A PLAIN message that is not three NUL-separated fields (RFC 4616 §2) is the
+// client's error. It is refused like the IMAP proxy refuses it (NO Invalid SASL
+// PLAIN response), not answered NO [SERVERBUG] and logged as a server failure,
+// whether it came as the initial response or as the reply to the continuation
+// request, and the connection stays usable. It is refused before the
+// credentials are looked at, so no database is needed.
+func TestAuthenticateMalformedPlainIsNotServerBug(t *testing.T) {
+	srv, addr := newReloadTestServer(t, IMAPServerOptions{})
+	serveReloadTestServer(t, srv, addr)
+
+	cases := []struct {
+		name string
+		// initial is the initial response, sent on the command line; reply,
+		// when initial is empty, answers the continuation request.
+		initial, reply string
+	}{
+		{name: "initial response without NULs", initial: "dXNlcg=="}, // "user"
+		{name: "zero-length initial response", initial: "="},
+		{name: "empty reply", reply: ""},
+		{name: "reply with four fields", reply: "AAAA"}, // "\x00\x00\x00"
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			c.SetDeadline(time.Now().Add(5 * time.Second))
+			r := bufio.NewReader(c)
+			readTagged(t, r, "* OK")
+
+			if tc.initial != "" {
+				c.Write([]byte("a AUTHENTICATE PLAIN " + tc.initial + "\r\n"))
+			} else {
+				c.Write([]byte("a AUTHENTICATE PLAIN\r\n"))
+				readTagged(t, r, "+")
+				c.Write([]byte(tc.reply + "\r\n"))
+			}
+			if line := strings.TrimRight(readTagged(t, r, "a "), "\r\n"); !strings.HasPrefix(line, "a NO ") || strings.Contains(line, "SERVERBUG") {
+				t.Fatalf("malformed PLAIN message = %q, want a NO without SERVERBUG", line)
+			}
+
+			c.Write([]byte("b NOOP\r\n"))
+			if line := readTagged(t, r, "b "); !strings.HasPrefix(line, "b OK") {
+				t.Fatalf("NOOP after the refused AUTHENTICATE = %q, want b OK", line)
+			}
+		})
+	}
+}
