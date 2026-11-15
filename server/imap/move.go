@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
@@ -204,8 +206,10 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		return s.server.s3.CopyWithRetry(ctx, obj.sourceKey, obj.destKey)
 	}
 
+	ownMessagesDone := s.beginOwnMessages(destMailbox.ID) // a MOVE within the selected mailbox
 	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.instanceID, sourceHashes, destHashes, ensureDestObject)
 	if err != nil {
+		ownMessagesDone()
 		var destErr *resilient.DestObjectError
 		if errors.As(err, &destErr) {
 			return s.crossAccountObjectError(destObjects[destErr.ContentHash].sourcePending, destErr.Err)
@@ -224,6 +228,7 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		}
 		return s.internalError("failed to move messages: %v", err)
 	}
+	ownMessagesDone(slices.Collect(maps.Values(messageUIDMap))...)
 
 	// Pin this session to the master DB (same rationale as APPEND, append.go).
 	// MOVE's RFC 6851 §3.3 inline EXPUNGE notifications are emitted by the

@@ -130,7 +130,7 @@ carries its own copy and these server keys are not used for pool members (except
 | `timeouts.absolute_session_timeout` | `24h`, LMTP `5m` | Longest a session may last. |
 | `timeouts.min_bytes_per_minute` | `0` (off) | Slow-client guard. |
 | `max_connections` | `0` (unlimited) | Per proxy listener. |
-| `max_connections_per_ip` | `0` (unlimited) | Per proxy listener. The LMTP proxy ignores it with a warning. With `[cluster]` enabled, the IMAP, POP3 and ManageSieve proxies count an address's connections on every node; see [CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies). |
+| `max_connections_per_ip` | `0` (unlimited) | Per proxy listener. The LMTP proxy ignores it with a warning. With `[cluster]` enabled, the IMAP, POP3 and ManageSieve proxies count an address's connections on every node; see [CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies). With `proxy_protocol`, the address counted is the client the header names ([SECURITY.md](SECURITY.md#4-connection-limits)). |
 | `max_connections_per_user`, `max_connections_per_user_per_ip` | `0` | IMAP, POP3 and ManageSieve proxies only, and only with `[cluster]` enabled; see [CLUSTER.md](CLUSTER.md). The LMTP proxy ignores them with a warning. |
 | `limits.max_auth_errors` | `2` | Protocol errors before login (unknown or malformed commands, logins refused without TLS) before the connection is closed. Wrong passwords do not count. |
 | `auth_rate_limit` | off | See [AUTHENTICATION.md](AUTHENTICATION.md). With `[cluster]` enabled, the IMAP, POP3 and ManageSieve proxies share it; see [CLUSTER.md](CLUSTER.md#66-authentication-rate-limits-imap-pop3-and-managesieve-proxies). |
@@ -978,11 +978,11 @@ cache_path = "/var/lib/sora/affinity_cache.db"
 ```
 
 - Used only with `[cluster]` and `[cluster.affinity]` enabled and `cache_path` set.
-- At startup, entries that have not expired are loaded. The gossip handler is registered
-  before the file is loaded, and queues incoming
-  events until the initial snapshot is ready. Those events are then applied and written using
-  their timestamps: an older SET cannot replace a newer stored assignment, and a newer delete
-  removes the stored entry.
+- At startup, entries that have not expired are loaded. The file is opened before the node joins
+  the cluster, and the gossip handler is registered right after the join, before the file is
+  loaded; it queues incoming events until the initial snapshot is ready. Those events are then
+  applied and written using their timestamps: an older SET cannot replace a newer stored
+  assignment, and a newer delete removes the stored entry.
 - Every change (set, update, delete, also those received by gossip) is written to the file in the
   background, in the order the changes were made, each write with a 2-second limit. A key changed
   again before its write starts is written once, with its latest state. Gossip changes apply only
@@ -1058,6 +1058,11 @@ Notes:
   recipient of the same transaction gets
   `451 4.3.0 Recipient requires different backend server, start new transaction` (or `... pool ...`).
   While the transaction has no accepted recipient, the held connection is replaced instead.
+- The LMTP proxy answers `MAIL` itself and sends it to the backend with the first recipient. When
+  the backend refuses the sender (`501` or `553`, as a Sora backend answers a sender it cannot
+  parse or does not accept), each recipient gets `553 5.1.7 Invalid sender`, a bounce, as on a
+  direct connection; when it refuses the declared `SIZE=` (`552`), each recipient gets
+  `552 5.3.4`. Any other refusal of `MAIL` counts as a failed backend connection (`451 4.4.1`).
 
 ---
 

@@ -56,10 +56,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TokenResponse'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          description: Too many logins are waiting out a progressive delay at once.
+        '503':
+          description: |
+            The account could not be checked (database error, or a stored password
+            hash that cannot be verified), or the request was cancelled while it
+            waited out a delay. Not counted as a failed login.
 
   /auth/refresh:
     post:
@@ -508,10 +515,16 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/BodyGone'
+        '503':
+          $ref: '#/components/responses/BodyUnavailable'
 
   /messages/{id}/raw:
     get:
@@ -532,10 +545,16 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/BodyGone'
+        '503':
+          $ref: '#/components/responses/BodyUnavailable'
 
   /filters:
     get:
@@ -1008,3 +1027,35 @@ components:
               error:
                 type: string
                 example: Resource not found
+
+    BodyGone:
+      description: The message body is gone and is not coming back.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Message body is no longer available
+
+    BodyUnavailable:
+      description: |
+        The body cannot be served yet: its upload is still pending (Retry-After: 5,
+        "Message body not yet available, retry shortly"), or storage did not answer
+        (Retry-After: 30, "Storage temporarily unavailable, retry later"). Retry
+        after the given number of seconds.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+            example: 5
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Message body not yet available, retry shortly

@@ -47,18 +47,25 @@ func tlsCacheStub(t *testing.T, path string, handle http.HandlerFunc) (*tlsStubS
 }
 
 // TestTLSCacheFailsWhenACertificateCannotBeDownloaded: a GET that fails with anything
-// but "not found" must fail tls cache and name the certificate, instead of a summary
-// of "Cached: 0" and exit status 0 (#944). The other variant is still cached.
+// but NoSuchKey must fail tls cache and name the certificate, instead of a summary of
+// "Cached: 0" and exit status 0 (#944). The other variant is still cached.
 func TestTLSCacheFailsWhenACertificateCannotBeDownloaded(t *testing.T) {
-	for status, code := range map[int]string{
-		http.StatusForbidden:           "AccessDenied",
-		http.StatusInternalServerError: "InternalError",
+	for _, tt := range []struct {
+		status        int
+		code, message string
+	}{
+		{http.StatusForbidden, "AccessDenied", "stub failure"},
+		{http.StatusInternalServerError, "InternalError", "stub failure"},
+		// The message is the provider's free text: an error that says "not found" but
+		// is not NoSuchKey is a failure, not an absent certificate.
+		{http.StatusNotFound, "NoSuchBucket", "Bucket not found"},
+		{http.StatusForbidden, "AccessDenied", "Key not found in the allowed prefix"},
 	} {
-		t.Run(code, func(t *testing.T) {
+		t.Run(tt.code+"/"+tt.message, func(t *testing.T) {
 			key := tlsmanager.S3ObjectKey("mail.example.com")
 			_, endpoint := tlsCacheStub(t, "/certs/"+key, func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(status)
-				fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>%s</Code><Message>stub failure</Message></Error>`, code)
+				w.WriteHeader(tt.status)
+				fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>%s</Code><Message>%s</Message></Error>`, tt.code, tt.message)
 			})
 			cfg := tlsTestConfig(endpoint)
 			putServerCertificates(t, cfg, "mail.example.com", "mail.example.com+rsa")
