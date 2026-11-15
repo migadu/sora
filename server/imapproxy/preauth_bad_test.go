@@ -32,10 +32,14 @@ func TestPreAuthUnknownAndWrongStateCommandsAnswerBAD(t *testing.T) {
 		{"a1 uid expunge 1", "a1 BAD [CLIENTBUG] This command is only valid in the selected state"},
 		{"a1 FOO", "a1 BAD Unknown command"},
 		{"a1 UID FOO 1", "a1 BAD Unknown command"},
-		{"a1 UID ſEARCH ALL", "a1 BAD Unknown command"},
-		{"a1 uid ſtore 1 FLAGS ()", "a1 BAD Unknown command"},
-		{"a1 UıD FETCH 1 FLAGS", "a1 BAD Unknown command"},
 		{"a1 UID", "a1 BAD Unknown command"},
+		// Look-alikes are not command names: ASCII case folding only (RFC 5234
+		// §2.3), as the backend matches them (#1511). U+017F (long s) is not
+		// an S, and U+0131 (dotless i) is not an I.
+		{"a1 ſELECT INBOX", "a1 BAD Unknown command"},
+		{"a1 UıD FETCH 1:* FLAGS", "a1 BAD Unknown command"},
+		{"a1 UID ſEARCH ALL", "a1 BAD Unknown command"},
+		{"a1 uid ſtore 1 +FLAGS (\\Seen)", "a1 BAD Unknown command"},
 	}
 
 	for _, tc := range tests {
