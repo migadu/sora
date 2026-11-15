@@ -830,7 +830,7 @@ See [PROTOCOLS.md](PROTOCOLS.md).
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
 | `append_limit` | size | `"25mb"` | `imap` | Largest message accepted by APPEND. |
-| `max_message_size` | size | `"50mb"` | `lmtp`, `lmtp_proxy`, `http_admin_api` | Largest message accepted for delivery. |
+| `max_message_size` | size | `"50mb"` | `lmtp`, `lmtp_proxy`, `http_admin_api` | Largest message accepted for delivery. `0` also means 50 MiB. |
 | `max_script_size` | size | `"16kb"` | `managesieve` | Largest Sieve script. |
 | `supported_extensions` | list of strings | the default set | `managesieve_proxy` | Sieve extensions the proxy advertises. A `managesieve` backend uses `[sieve] enabled_extensions`. |
 | `enable_preview` | bool | `false` | `imap` | Advertise FETCH PREVIEW (RFC 8970). |

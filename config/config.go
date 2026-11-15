@@ -1905,13 +1905,17 @@ func (s *ServerConfig) GetMaxScriptSize() (int64, error) {
 }
 
 // GetMaxMessageSize returns max_message_size (LMTP, LMTP proxy, Admin API delivery),
-// 50 MB when omitted, capped at consts.MaxStoredMessageSize: a larger message would be
-// read in full and then refused by the database insert, and the LMTP proxy would
-// advertise a SIZE no backend accepts. RFC 1870 section 5: "The fixed maximum message
-// size is defined as the message size of the largest message that a server is ever
-// willing to accept. [...] The fixed maximum message size may be an implementation
-// artifact of the SMTP server". A value that does not parse is an error: start-up falls
-// back to the default (GetMaxMessageSizeWithDefault), a reload keeps the running limit.
+// 50 MB when omitted or zero, capped at consts.MaxStoredMessageSize: a larger message
+// would be read in full and then refused by the database insert, and the LMTP proxy
+// would advertise a SIZE no backend accepts. RFC 1870 section 5: "The fixed maximum
+// message size is defined as the message size of the largest message that a server is
+// ever willing to accept. [...] The fixed maximum message size may be an implementation
+// artifact of the SMTP server". Every delivery has such a limit, so zero is the default
+// and not "unlimited", at start-up and on reload alike, and the LMTP proxy advertises
+// it: RFC 1870 section 3 reads a SIZE of 0 as "no fixed maximum message size is in
+// force", and an omitted one as conveying no information. A value that does not parse
+// is an error: start-up falls back to the default (GetMaxMessageSizeWithDefault), a
+// reload keeps the running limit.
 func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
 	if s.MaxMessageSize == "" {
 		return 50 * 1024 * 1024, nil // 50MB default
@@ -1919,6 +1923,9 @@ func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
 	size, err := helpers.ParseSize(s.MaxMessageSize)
 	if err != nil {
 		return 0, err
+	}
+	if size == 0 {
+		return 50 * 1024 * 1024, nil
 	}
 	if size > consts.MaxStoredMessageSize {
 		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
