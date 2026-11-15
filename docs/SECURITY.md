@@ -235,7 +235,7 @@ Where each applies:
 | Key | `imap`, `pop3`, `managesieve` | `imap_proxy`, `pop3_proxy`, `managesieve_proxy` |
 |---|---|---|
 | `max_connections` | yes | yes |
-| `max_connections_per_ip` | yes, except for trusted networks; with `proxy_protocol = true` it counts the client the header names | as on the backends |
+| `max_connections_per_ip` | yes, except for trusted networks; with `proxy_protocol = true` it counts the client the header names | as on the backends; with `[cluster]`, counted across the cluster ([CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies)) |
 | `max_connections_per_user` | enforced, per listener | enforced across the cluster; needs `[cluster]`, otherwise not enforced |
 | `max_connections_per_user_per_ip` | as above; on `imap` the IP is the client's real address, as forwarded by a proxy | as above |
 
@@ -555,9 +555,12 @@ same key on every node. Details are in [STORAGE.md](STORAGE.md).
 | Protection | Counted |
 |---|---|
 | Limit of 10 waiting logins per IP | Per node, over all its listeners. |
-| `max_connections`; `max_connections_per_ip` on backends | Per listener on each node. |
+| `max_connections`; `max_connections_per_ip` on backends and the User API proxy | Per listener on each node. |
+| `max_connections_per_ip` on IMAP, POP3 and ManageSieve proxies | Across the cluster, through gossip. Per listener without `[cluster]`. |
 | `max_connections_per_user`, `..._per_user_per_ip` on proxies | Across the cluster, through gossip. Not enforced without `[cluster]`. |
 | `max_connections_per_user`, `..._per_user_per_ip` on backends | Per listener. |
+| Authentication rate limits on IMAP, POP3 and ManageSieve proxies | Tier 2 blocks, Tier 2 counts and the name statistics across the cluster, through gossip, as `[cluster.rate_limit_sync]` says; Tier 1 blocks per listener. Per listener without `[cluster]`. |
+| Authentication rate limits on backends, the User API and the User API proxy | Per listener. |
 | Search rate limit | Per account in each IMAP listener of each node. |
 | Session memory, error counts, timeouts | Per connection. |
 | Lookup caches | Per listener; an account's entries are dropped on every node after a kick or an Admin API change. |
