@@ -32,7 +32,6 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
-	"github.com/migadu/sora/pkg/sqlitefile"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/sieveengine"
 	_ "modernc.org/sqlite"
@@ -181,11 +180,6 @@ type Importer struct {
 	batchSize int // default: 20
 }
 
-// maildirCacheParams are the connection settings of sora-maildir.db, for import and
-// export alike: WAL lets readers and the writer work concurrently, and a locked
-// database is waited for up to 5 seconds.
-const maildirCacheParams = "_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL"
-
 // NewImporter creates a new Importer instance.
 func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ImporterOptions) (*Importer, error) {
 	// The import runs on exactly this many workers: with none it would never drain its queue.
@@ -193,7 +187,7 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		return nil, fmt.Errorf("jobs must be at least 1, got %d", jobs)
 	}
 	// Always create SQLite database in the maildir path to persist maildir state
-	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
+	dbPath := filepath.Join(maildirPath, maildirCacheName)
 
 	if options.Incremental {
 		logger.Info("Using maildir database for incremental import", "path", dbPath)
@@ -201,19 +195,10 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		logger.Info("Incremental mode disabled - will read all files (database still created for tracking)", "path", dbPath)
 	}
 
-	dsn, err := sqlitefile.DSN(dbPath, maildirCacheParams)
+	sqliteDB, err := openMaildirCache(maildirPath)
 	if err != nil {
 		return nil, err
 	}
-	sqliteDB, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
-	}
-
-	// Configure connection pool for better concurrency
-	// SQLite works best with a single writer connection
-	sqliteDB.SetMaxOpenConns(1)
-	sqliteDB.SetMaxIdleConns(1)
 
 	// Create the table for storing message information.
 	// s3_uploaded tracks whether the message has been successfully uploaded to S3

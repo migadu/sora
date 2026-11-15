@@ -310,6 +310,13 @@ The importer keeps a SQLite database in the maildir, `<maildir-path>/sora-maildi
 `-wal` and `-shm` files while it is open). It records every message file it has seen and whether
 that file has been imported. It makes re-runs cheap and safe.
 
+The maildir's owner may be able to write in it while the import runs with more privileges, so
+`sora-maildir.db` and its `-wal`, `-shm` and `-journal` files must be regular files. If one of
+them is a symbolic link, even to a file inside the maildir, or another kind of file, the import
+refuses to start and names it. The cache is opened without following a link, so a link put in its
+place while the run starts is refused as well. The export applies the same rule to the
+`sora-maildir.db` in its target directory.
+
 Table `messages`:
 
 | Column | Meaning |
