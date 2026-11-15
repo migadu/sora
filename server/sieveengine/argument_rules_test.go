@@ -50,4 +50,15 @@ func TestValidateScriptRefusesUnrequiredComparatorAndLateTag(t *testing.T) {
 			t.Errorf("ValidateScript(%s): %v", script, err)
 		}
 	}
+
+	// RFC 5293 §5: "If no value-patterns are specified, then the comparator and
+	// match-type options are silently ignored." The unrequired comparator is
+	// still an error there, but not how a required one fits the match type.
+	editheader := []string{"editheader", "comparator-i;ascii-numeric"}
+	if err := ValidateScript(`require "editheader"; deleteheader :comparator "i;ascii-numeric" "X-Count";`, editheader); err == nil || !strings.Contains(err.Error(), "comparator-i;ascii-numeric") {
+		t.Errorf("deleteheader without value patterns, unrequired comparator: %v, want an error naming comparator-i;ascii-numeric", err)
+	}
+	if err := ValidateScript(`require ["editheader", "comparator-i;ascii-numeric"]; deleteheader :comparator "i;ascii-numeric" :contains "X-Count";`, editheader); err != nil {
+		t.Errorf("deleteheader without value patterns, required comparator with :contains: %v", err)
+	}
 }
