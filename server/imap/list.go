@@ -93,19 +93,23 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 		sharedNamespaceRoot = strings.TrimSuffix(s.server.config.SharedMailboxes.NamespacePrefix, string(consts.MailboxDelimiter))
 	}
 
+	// The capability set cannot change during a command, and GetCapabilities
+	// returns a fresh copy of it, so read it once rather than per mailbox.
+	caps := s.GetCapabilities()
+
 	var l []imap.ListData
 	if options.SelectSubscribed {
 		// SUBSCRIBED selection (RFC 5258 §3.5), including RECURSIVEMATCH/CHILDINFO
 		// and non-existent subscribed names. LSUB arrives here too — the go-imap
 		// layer dispatches it as LIST (SUBSCRIBED RECURSIVEMATCH) and renders the
 		// CHILDINFO parents as \Noselect.
-		l = buildSubscribedList(ref, patterns, options, mboxes, subscribedSet, s.GetCapabilities(), sharedNamespaceRoot)
+		l = buildSubscribedList(ref, patterns, options, mboxes, subscribedSet, caps, sharedNamespaceRoot)
 	} else {
 		for _, mbox := range mboxes {
 			if !matchesAnyPattern(mbox.Name, ref, patterns) {
 				continue
 			}
-			data := listMailbox(mbox, options, s.GetCapabilities(), sharedNamespaceRoot)
+			data := listMailbox(mbox, options, caps, sharedNamespaceRoot)
 			if data != nil {
 				l = append(l, *data)
 			}
@@ -206,7 +210,7 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 						num := uint32(unseenCount)
 						statusData.NumUnseen = &num
 					}
-					if s.GetCapabilities().Has(imap.CapCondStore) && options.ReturnStatus.HighestModSeq {
+					if caps.Has(imap.CapCondStore) && options.ReturnStatus.HighestModSeq {
 						statusData.HighestModSeq = summary.HighestModSeq
 					}
 					if options.ReturnStatus.AppendLimit {
