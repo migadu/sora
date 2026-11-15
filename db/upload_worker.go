@@ -16,7 +16,10 @@ type PendingUpload struct {
 	ID          int64
 	AccountID   int64
 	ContentHash string // serves also as unique identifier in S3
-	InstanceID  string // hostname of the instance that created the upload
+	// InstanceID is the upload instance id of the node holding the staged body
+	// (config.InstanceID, the key its uploader leases under), not its mail hostname:
+	// AcquireAndLeasePendingUploads hands the row only to that instance.
+	InstanceID  string
 	Size        int64
 	Attempts    int
 	CreatedAt   time.Time
