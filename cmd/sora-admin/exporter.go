@@ -490,18 +490,16 @@ func maildirFolderName(mailboxName string) string {
 // them, so the importer does not decode an '&' or a literal "&...-" of the name.
 // Levels named "cur", "new", or "tmp" escape their first character (\63ur, \6eew,
 // \74mp, as Dovecot LAYOUT=fs does) so they do not collide with a Maildir's own
-// cur/, new/, and tmp/ subdirectories. A '.' is escaped, because the importer reads
-// a '.' as the Maildir++ hierarchy separator, and so is the escape character, so
+// cur/, new/, and tmp/ subdirectories. Case variants are escaped too for filesystems
+// that ignore case, retaining the original byte's case in the hex escape. A '.'
+// is escaped because the importer reads it as the Maildir++ hierarchy separator,
+// and so is the escape character, so
 // that unescapeMaildirLevel restores exactly the characters escaped here.
 func maildirFolderLevel(level string) string {
 	encoded := helpers.EncodeModifiedUTF7(level)
-	switch encoded {
-	case "cur":
-		return `\63ur`
-	case "new":
-		return `\6eew`
-	case "tmp":
-		return `\74mp`
+	switch strings.ToLower(encoded) {
+	case "cur", "new", "tmp":
+		return fmt.Sprintf(`\%02x%s`, encoded[0], encoded[1:])
 	}
 	if !strings.ContainsAny(encoded, ".\\") {
 		return encoded

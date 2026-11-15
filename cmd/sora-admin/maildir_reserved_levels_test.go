@@ -21,24 +21,24 @@ import (
 // to escaped directory names (\63ur, \6eew, \74mp) rather than colliding with a
 // parent mailbox's Maildir cur/, new/, or tmp/ subdirectories.
 func TestMaildirReservedLevelsRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		mailboxes []string
+	}{
+		{"lowercase", []string{"INBOX", "cur", "new", "tmp", "Work", "Work/cur", "Work/new", "Work/tmp", "Projects/new"}},
+		{"case variants", []string{"INBOX", "Cur", "NEW", "Tmp", "Work", "Work/Cur", "Work/NEW", "Work/Tmp", "Projects/New"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) { testMaildirReservedLevelsRoundTrip(t, tc.mailboxes) })
+	}
+}
+
+func testMaildirReservedLevelsRoundTrip(t *testing.T, mailboxes []string) {
 	root := t.TempDir()
 	exporter, err := NewExporter(context.Background(), root, "user@example.com", 1, nil, nil, ExporterOptions{
 		Dovecot:       true,
 		ExportUIDList: true,
 	})
 	require.NoError(t, err)
-
-	mailboxes := []string{
-		"INBOX",
-		"cur",
-		"new",
-		"tmp",
-		"Work",
-		"Work/cur",
-		"Work/new",
-		"Work/tmp",
-		"Projects/new", // "Projects" itself is NOT a mailbox
-	}
 
 	baseTime := time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC)
 	for idx, mbox := range mailboxes {
@@ -47,7 +47,7 @@ func TestMaildirReservedLevelsRoundTrip(t *testing.T) {
 		require.NoError(t, err, mbox)
 		if mbox != "INBOX" {
 			base := filepath.Base(dir)
-			assert.NotContains(t, []string{"cur", "new", "tmp"}, base,
+			assert.NotContains(t, []string{"cur", "new", "tmp"}, strings.ToLower(base),
 				"mailbox %q directory %q must not be named cur, new, or tmp", mbox, dir)
 		}
 
@@ -116,7 +116,7 @@ func TestMaildirReservedLevelsRoundTrip(t *testing.T) {
 
 	// Subscriptions and literal backslash-escaped names round-trip without collision.
 	roundTripNames := append([]string{}, mailboxes[1:]...) // non-INBOX folders
-	roundTripNames = append(roundTripNames, `\63ur`, `\6eew`, `\74mp`, `Work/\63ur`)
+	roundTripNames = append(roundTripNames, `\63ur`, `\6eew`, `\74mp`, `Work/\63ur`, `\43ur`, `\4eEW`, `\54mp`)
 	seenStorage := make(map[string]string, len(roundTripNames))
 	for _, name := range roundTripNames {
 		storage := maildirFolderName(name)
