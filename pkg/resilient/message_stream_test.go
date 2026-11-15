@@ -26,7 +26,7 @@ func newMessageStreamTestDatabase(searchTimeout string) *ResilientDatabase {
 			ReadyToTrip: func(counts circuitbreaker.Counts) bool {
 				return counts.Requests >= 8 && float64(counts.TotalFailures)/float64(counts.Requests) >= 0.6
 			},
-			IsSuccessful: isQuerySuccessful,
+			IsSuccessful: isBreakerSuccess,
 		}),
 	}
 }
@@ -125,7 +125,7 @@ func TestMessageStreamDatabaseFailuresStillTripBreaker(t *testing.T) {
 		name string
 		err  error
 	}{
-		{"database failure", errors.New("database query failed")},
+		{"database shutting down", &pgconn.PgError{Code: "57P01"}},
 		{"database connection reset", &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -176,7 +176,7 @@ func TestMessageStreamDatabaseErrorsRemainRetryable(t *testing.T) {
 		if !rd.isRetryableError(err) {
 			t.Errorf("database error %v should remain retryable", err)
 		}
-		if isQuerySuccessful(err) {
+		if isBreakerSuccess(err) {
 			t.Errorf("database error %v should count as a database failure", err)
 		}
 	}

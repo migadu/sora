@@ -2,11 +2,15 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // MockAuthDelayHelper for testing
@@ -273,5 +277,98 @@ func TestDelayManager_ConcurrentCleanup(t *testing.T) {
 
 	if mapSize > 0 {
 		t.Fatalf("Expected empty map after cleanup, got %d entries", mapSize)
+	}
+}
+
+// TestApplyAuthenticationDelay_MetricsBoundedByProtocol checks that the
+// sora_auth_delay_* series do not grow with the number of client addresses that
+// were ever delayed: every outcome (completed, cancelled, rejected) for many
+// different addresses on one call site must land in a single series per metric,
+// labelled by the call site only (#353). Per-address detail belongs in logs and in
+// the auth rate limiter's blocked list, not in Prometheus.
+func TestApplyAuthenticationDelay_MetricsBoundedByProtocol(t *testing.T) {
+	// Unique per run so that -count=N does not add to the previous run's counters.
+	protocol := fmt.Sprintf("TEST-CARDINALITY-%d", time.Now().UnixNano())
+	const clients = 20
+
+	addrOf := func(prefix string, i int) net.Addr {
+		return &StringAddr{Addr: net.JoinHostPort(fmt.Sprintf("%s.%d", prefix, i+1), "1234")}
+	}
+
+	// Completed delays, one per client address.
+	short := &MockAuthDelayHelper{delay: time.Millisecond}
+	for i := 0; i < clients; i++ {
+		if err := applyAuthenticationDelayWithManager(context.Background(), short, addrOf("198.51.100", i), protocol, NewDelayManager(1)); err != nil {
+			t.Fatalf("completed delay %d: %v", i, err)
+		}
+	}
+
+	// Cancelled delays: the connection is already gone.
+	long := &MockAuthDelayHelper{delay: time.Hour}
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := 0; i < clients; i++ {
+		if err := applyAuthenticationDelayWithManager(gone, long, addrOf("203.0.113", i), protocol, NewDelayManager(1)); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled delay %d: got %v, want context.Canceled", i, err)
+		}
+	}
+
+	// Rejected delays: each address already holds its only slot.
+	full := NewDelayManager(1)
+	for i := 0; i < clients; i++ {
+		addr := addrOf("192.0.2", i)
+		ip, _, _ := net.SplitHostPort(addr.String())
+		if !full.tryAcquire(ip) {
+			t.Fatalf("could not take the slot for %s", ip)
+		}
+		if err := applyAuthenticationDelayWithManager(context.Background(), long, addr, protocol, full); !errors.Is(err, ErrDelayQueueFull) {
+			t.Fatalf("rejected delay %d: got %v, want ErrDelayQueueFull", i, err)
+		}
+	}
+
+	want := map[string]float64{
+		"sora_auth_delay_completed_total":  clients,
+		"sora_auth_delay_cancelled_total":  clients,
+		"sora_auth_delay_rejections_total": clients,
+		"sora_auth_delay_queue_depth":      0,
+	}
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	series := make(map[string]int)
+	for _, f := range families {
+		if _, ok := want[f.GetName()]; !ok {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := make(map[string]string)
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			if labels["protocol"] != protocol {
+				continue
+			}
+			series[f.GetName()]++
+			if len(labels) != 1 {
+				if series[f.GetName()] == 1 { // once per metric, not once per address
+					t.Errorf("%s series carries labels %v, want protocol only", f.GetName(), labels)
+				}
+				continue
+			}
+			got := m.GetCounter().GetValue()
+			if m.GetGauge() != nil {
+				got = m.GetGauge().GetValue()
+			}
+			if got != want[f.GetName()] {
+				t.Errorf("%s{protocol=%q} = %v, want %v", f.GetName(), protocol, got, want[f.GetName()])
+			}
+		}
+	}
+	for name := range want {
+		if series[name] != 1 {
+			t.Errorf("%s has %d series for protocol %q after delays for %d client addresses each, want 1", name, series[name], protocol, clients)
+		}
 	}
 }

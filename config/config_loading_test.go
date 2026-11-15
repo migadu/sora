@@ -383,3 +383,31 @@ type mockError struct {
 func (e *mockError) Error() string {
 	return e.msg
 }
+
+// LoadServerConfig resets cfg to the server's defaults before decoding, and without a
+// file leaves those defaults minus the database endpoints the server only takes from a
+// table in the file.
+func TestLoadServerConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[local_cache]\ncapacity = \"2gb\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{Uploader: UploaderConfig{Path: "stale"}}
+	if err := LoadServerConfig(path, &cfg); err != nil {
+		t.Fatalf("LoadServerConfig: %v", err)
+	}
+	if cfg.Uploader.Path != DefaultUploaderPath || cfg.LocalCache.Path != DefaultLocalCachePath || cfg.LocalCache.Capacity != "2gb" {
+		t.Errorf("uploader path %q, local_cache path %q capacity %q; want the defaults with the file's capacity",
+			cfg.Uploader.Path, cfg.LocalCache.Path, cfg.LocalCache.Capacity)
+	}
+
+	cfg = Config{}
+	err := LoadServerConfig(filepath.Join(t.TempDir(), "missing.toml"), &cfg)
+	if !os.IsNotExist(err) {
+		t.Fatalf("LoadServerConfig of a missing file = %v, want a not-exist error", err)
+	}
+	if cfg.Uploader.Path != DefaultUploaderPath || cfg.Database.Write != nil || cfg.Database.Read != nil {
+		t.Errorf("missing file: uploader path %q, database write %v read %v; want the defaults without endpoints",
+			cfg.Uploader.Path, cfg.Database.Write, cfg.Database.Read)
+	}
+}

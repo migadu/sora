@@ -63,25 +63,14 @@ func (s *POP3Session) handleXCLIENT(args string) (bool, string) {
 	return true, "XCLIENT parameters accepted"
 }
 
-// isFromTrustedProxy checks if the connection is from a trusted network that can send forwarding parameters
+// isFromTrustedProxy checks if the connection is from a trusted network that can send
+// forwarding parameters. With a PROXY header that is the header's source, not the load
+// balancer that sent it (see server.ForwardingSourceIP).
 func (s *POP3Session) isFromTrustedProxy() bool {
 	// Use the server's limiter trusted networks for XCLIENT command forwarding
 	// This ensures consistency with connection limiting behavior
 	if s.server.limiter == nil {
 		return false
 	}
-
-	// When PROXY protocol is used, check the proxy's IP (not the real client IP)
-	// The ProxyIP contains the actual IP of the proxy server that sent the PROXY header
-	if s.ProxyIP != "" {
-		// Create a fake net.Addr with the proxy IP for trusted network checking
-		proxyAddr := &net.TCPAddr{
-			IP: net.ParseIP(s.ProxyIP),
-		}
-		return s.server.limiter.IsTrustedConnection(proxyAddr)
-	}
-
-	// Fall back to checking the direct connection's remote address (no PROXY protocol)
-	remoteAddr := s.conn.RemoteAddr()
-	return s.server.limiter.IsTrustedConnection(remoteAddr)
+	return s.server.limiter.IsTrustedConnection(&net.TCPAddr{IP: server.ForwardingSourceIP(s.conn)})
 }

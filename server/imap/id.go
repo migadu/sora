@@ -24,9 +24,10 @@ func (s *IMAPSession) ID(clientID *imap.IDData) *imap.IDData {
 			s.logAdditionalIDFields(clientID.Raw)
 		}
 
-		// Check for Dovecot-style forwarding parameters in client ID
-		// Only process forwarding parameters if the connection is from a trusted proxy
-		if s.isFromTrustedProxy() && len(clientID.Raw) > 0 {
+		// Check for Dovecot-style forwarding parameters in client ID. Only a trusted proxy
+		// forwards them, and only before login: after it the peer relays the client's own
+		// commands (an imap_proxy does), so a later ID is the client's.
+		if s.IMAPUser == nil && s.isFromTrustedProxy() && len(clientID.Raw) > 0 {
 			// Extract only forwarding parameters (x-* prefixed fields)
 			forwardingFields := s.extractForwardingFields(clientID.Raw)
 			if len(forwardingFields) > 0 {
@@ -72,28 +73,16 @@ func (s *IMAPSession) ID(clientID *imap.IDData) *imap.IDData {
 	return serverID
 }
 
-// isFromTrustedProxy checks if the connection is from a trusted network that can send forwarding parameters
+// isFromTrustedProxy checks if the connection is from a trusted network that can send
+// forwarding parameters. With a PROXY header that is the header's source, not the load
+// balancer that sent it (see server.ForwardingSourceIP).
 func (s *IMAPSession) isFromTrustedProxy() bool {
 	// Use the server's limiter trusted networks for ID command forwarding
 	// This ensures consistency with connection limiting behavior
 	if s.server.limiter == nil {
 		return false
 	}
-
-	// When PROXY protocol is used, check the proxy's IP (not the real client IP)
-	// The ProxyIP contains the actual IP of the proxy server that sent the PROXY header
-	if s.ProxyIP != "" {
-		// Create a fake net.Addr with the proxy IP for trusted network checking
-		proxyAddr := &net.TCPAddr{
-			IP: net.ParseIP(s.ProxyIP),
-		}
-		return s.server.limiter.IsTrustedConnection(proxyAddr)
-	}
-
-	// Fall back to checking the direct connection's remote address (no PROXY protocol)
-	conn := s.conn.NetConn()
-	remoteAddr := conn.RemoteAddr()
-	return s.server.limiter.IsTrustedConnection(remoteAddr)
+	return s.server.limiter.IsTrustedConnection(&net.TCPAddr{IP: server.ForwardingSourceIP(s.conn.NetConn())})
 }
 
 // logAdditionalIDFields logs any additional ID fields that aren't forwarding parameters

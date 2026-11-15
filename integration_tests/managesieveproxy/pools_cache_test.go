@@ -51,8 +51,8 @@ func TestManageSieveProxyCachedPoolOutlivesLookupAnswer(t *testing.T) {
 		t.Fatalf("auths within the TTL asked the lookup again (%d calls)", n)
 	}
 	time.Sleep(ttl + 500*time.Millisecond)
-	if resp := sieveAuth(t, proxyAddr, user); !strings.HasPrefix(resp, "NO") || !strings.Contains(resp, "UNAVAILABLE") {
-		t.Fatalf("auth after the TTL with the dead-pool answer: %s, want NO (UNAVAILABLE)", resp)
+	if resp := sieveAuth(t, proxyAddr, user); !strings.HasPrefix(resp, "NO") || !strings.Contains(resp, "TRYLATER") {
+		t.Fatalf("auth after the TTL with the dead-pool answer: %s, want NO (TRYLATER)", resp)
 	}
 	if n := lookup.calls.Load(); n != 2 {
 		t.Fatalf("auth after the TTL asked the lookup %d times in total, want 2", n)

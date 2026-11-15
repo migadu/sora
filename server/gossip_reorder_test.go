@@ -259,7 +259,7 @@ func TestAffinityLocalDeleteIsNotResurrectedByAnOlderSet(t *testing.T) {
 func TestAffinityRetransmissionIsAppliedOnce(t *testing.T) {
 	store := &countingAffinityStore{}
 	am := newTestAffinityManager()
-	am.SetPersistStore(store)
+	am.persistStore = store
 
 	encoded, err := encodeAffinityEvent(AffinityEvent{
 		Type:      AffinityEventSet,
@@ -278,7 +278,9 @@ func TestAffinityRetransmissionIsAppliedOnce(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		am.HandleClusterEvent(encoded)
 	}
-	am.wg.Wait()
+	if !am.persistWrites.Drain(5 * time.Second) {
+		t.Fatal("the persistence writes did not finish")
+	}
 
 	if sets := store.setCount(); sets != 1 {
 		t.Errorf("a retransmitted affinity event was persisted %d times, want 1", sets)
@@ -329,6 +331,7 @@ func TestUsernameFailureAndSuccessConvergeInEitherOrder(t *testing.T) {
 		Username:  username,
 		Timestamp: failedAt,
 		NodeID:    "node-b",
+		Protocol:  "test",
 	}
 	success := RateLimitEvent{
 		Type:      RateLimitEventUsernameSuccess,
@@ -336,6 +339,7 @@ func TestUsernameFailureAndSuccessConvergeInEitherOrder(t *testing.T) {
 		Username:  username,
 		Timestamp: succeededAt,
 		NodeID:    "node-b",
+		Protocol:  "test",
 	}
 
 	for _, tc := range []struct {
@@ -387,6 +391,7 @@ func TestBlockAndUnblockConvergeInEitherOrder(t *testing.T) {
 		IP:        ip,
 		Timestamp: unblockedAt,
 		NodeID:    "node-b",
+		Protocol:  "test",
 	}
 
 	for _, tc := range []struct {
@@ -435,6 +440,7 @@ func TestUsernameSuccessDoesNotClearANewerFailure(t *testing.T) {
 			Username:  username,
 			Timestamp: succeededAt.Add(time.Second),
 			NodeID:    "node-b",
+			Protocol:  "test",
 		},
 		{
 			Type:      RateLimitEventUsernameSuccess,
@@ -442,6 +448,7 @@ func TestUsernameSuccessDoesNotClearANewerFailure(t *testing.T) {
 			Username:  username,
 			Timestamp: succeededAt,
 			NodeID:    "node-b",
+			Protocol:  "test",
 		},
 	} {
 		encoded, err := encodeRateLimitEvent(event)
@@ -480,6 +487,7 @@ func TestUsernameFailureDoesNotRewindTheLastFailureTimestamp(t *testing.T) {
 			Username:  username,
 			Timestamp: newest,
 			NodeID:    "node-b",
+			Protocol:  "test",
 		},
 		{
 			Type:      RateLimitEventUsernameFailure,
@@ -487,6 +495,7 @@ func TestUsernameFailureDoesNotRewindTheLastFailureTimestamp(t *testing.T) {
 			Username:  username,
 			Timestamp: first,
 			NodeID:    "node-b",
+			Protocol:  "test",
 		},
 		{
 			Type:      RateLimitEventUsernameSuccess,
@@ -494,6 +503,7 @@ func TestUsernameFailureDoesNotRewindTheLastFailureTimestamp(t *testing.T) {
 			Username:  username,
 			Timestamp: succeeded,
 			NodeID:    "node-b",
+			Protocol:  "test",
 		},
 	} {
 		encoded, err := encodeRateLimitEvent(event)

@@ -15,6 +15,7 @@ import (
 	"github.com/emersion/go-message/mail"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -44,6 +45,9 @@ type DeliveryContext struct {
 	SieveExecutor SieveExecutor
 	Logger        Logger
 	OwnerResolver *resilient.OwnerResolver
+	// SharedMailboxes is [shared_mailboxes]: Sieve fileinto :create never makes a
+	// personal mailbox in its namespace.
+	SharedMailboxes config.SharedMailboxesConfig
 }
 
 // uploadInstanceID is the identity this delivery stamps on the pending_uploads row it
@@ -84,6 +88,23 @@ type RecipientInfo struct {
 	// DeliveryHash identifies the upstream submission (see db.InsertMessageOptions).
 	// Set by DeliverMessage from the bytes as received; callers leave it empty.
 	DeliveryHash string
+}
+
+// ErrMessageTooLarge is returned for a message larger than consts.MaxStoredMessageSize,
+// the largest message sora can store.
+var ErrMessageTooLarge = errors.New("message too large to store")
+
+// CheckStorableSize refuses a message of size octets that sora cannot store. A
+// delivery's max_message_size is capped at consts.MaxStoredMessageSize, but what it
+// stores is larger than what it read: the Received and Delivered-To trace headers and
+// any Sieve header edits are added afterwards. Checked on the final bytes, before
+// they are staged, so such a message is refused as too large instead of failing at
+// the database insert (messages.size is an INTEGER column).
+func CheckStorableSize(size int) error {
+	if int64(size) > consts.MaxStoredMessageSize {
+		return fmt.Errorf("%w: %d bytes (max: %d)", ErrMessageTooLarge, size, consts.MaxStoredMessageSize)
+	}
+	return nil
 }
 
 // DeliverMessage is the main entry point for message delivery.
@@ -143,7 +164,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		plaintextBody = &emptyBody
 	}
 
-	// Safety guard: Reject if global staging limit is exceeded. Checked before Sieve runs,
+	// Safety guard: Reject if this node's staging limit is exceeded. Checked before Sieve runs,
 	// so a rejected delivery cannot have redirected or auto-replied first.
 	if d.Uploader.IsStagingLimitExceeded(int64(len(messageBytes))) {
 		d.Logger.Log("Rejecting delivery due to upload staging size limit exceeded")
@@ -156,8 +177,16 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// (the S3 object key, cache key and upload-dedup key) must describe the bytes that are
 	// actually stored.
 	var mailboxName string
-	var copyMailbox string     // Sieve `fileinto :copy` target, saved once the body is staged
-	var sieveFlags []imap.Flag // flags set by the Sieve script (imap4flags, RFC 5232)
+	var relayAfterStore func() bool
+	var copyMailboxes []string   // further Sieve destinations, saved once the body is staged
+	var createMailboxes []string // Sieve fileinto :create targets, created if missing
+	var sieveFlags []imap.Flag   // flags set by the Sieve script (imap4flags, RFC 5232)
+
+	// The delivery reads from the writer, as LMTP does once RCPT has looked the
+	// recipient up: LookupRecipient creates an account's default mailboxes on first
+	// delivery, a fileinto :create target is created below, and a read replica may not
+	// have replayed either yet, so INBOX itself could be "not found".
+	ctx := context.WithValue(d.Ctx, consts.UseMasterDBKey, true)
 
 	if recipient.TargetMailbox != "" {
 		// Use explicit target mailbox (bypasses Sieve - for migrations)
@@ -165,7 +194,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	} else {
 		// Execute Sieve scripts
 		outcome, err := d.SieveExecutor.ExecuteSieve(
-			d.Ctx,
+			ctx,
 			recipient,
 			messageEntity,
 			messageBytes,
@@ -181,8 +210,24 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			return result, nil
 		}
 
+		if outcome.AbortRedirect != nil {
+			// A delivery that fails is retried by its caller, which holds the
+			// redirects again: drop the ones this attempt has not handed over.
+			defer outcome.AbortRedirect()
+		}
+		if outcome.RedirectOnly {
+			if outcome.Redirect() {
+				result.Discarded = true
+				result.Success = true
+				return result, nil
+			}
+		} else {
+			relayAfterStore = outcome.Redirect
+		}
+
 		mailboxName = outcome.MailboxName
-		copyMailbox = outcome.CopyMailbox
+		copyMailboxes = outcome.CopyMailboxes
+		createMailboxes = outcome.CreateMailboxes
 		sieveFlags = outcome.Flags
 		// Adopt any header edits the script made (RFC 5293) before anything is derived
 		// from the message.
@@ -190,17 +235,18 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		messageEntity = outcome.MessageEntity
 	}
 
+	if err := CheckStorableSize(len(messageBytes)); err != nil {
+		result.ErrorMessage = err.Error()
+		return result, err
+	}
+
 	// Parse message metadata
 	mailHeader := mail.Header{Header: messageEntity.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
+	sentDate, _ := mailHeader.Date() // zero without a Date: header that parses (db.InsertMessageOptions.SentDate)
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
-
-	if sentDate.IsZero() {
-		sentDate = time.Now()
-	}
 
 	// Calculate content hash
 	contentHash := helpers.HashContent(messageBytes)
@@ -249,15 +295,22 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		return result, fmt.Errorf("failed to check file existence: %w", err)
 	}
 
-	// Sieve `fileinto :copy`: save the second copy now that the body is on disk, so its
-	// pending_uploads row can never name a file that is not staged yet - the uploader
-	// treats a missing local file as permanently lost content.
-	if copyMailbox != "" {
-		err := d.SaveMessageToMailbox(d.Ctx, recipient, copyMailbox, messageBytes, messageEntity, plaintextBody, deliveryFlags, contentHash, bodyStructure)
+	for _, createMailbox := range createMailboxes {
+		if err := d.createMissingMailbox(ctx, recipient, createMailbox); err != nil {
+			result.ErrorMessage = fmt.Sprintf("Failed to create Sieve fileinto :create target %s: %v", createMailbox, err)
+			return result, err
+		}
+	}
+
+	// The further copies Sieve asked for: save them now that the body is on disk, so
+	// their pending_uploads rows can never name a file that is not staged yet - the
+	// uploader treats a missing local file as permanently lost content.
+	for _, copyMailbox := range copyMailboxes {
+		err := d.SaveMessageToMailbox(ctx, recipient, copyMailbox, messageBytes, messageEntity, plaintextBody, deliveryFlags, contentHash, bodyStructure)
 		// A duplicate copy is an accepted delivery, as it is in LMTP: the copy is
 		// already in the mailbox, so a resubmission must not fail the delivery.
 		if err != nil && !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
-			result.ErrorMessage = fmt.Sprintf("Failed to save Sieve :copy to %s: %v", copyMailbox, err)
+			result.ErrorMessage = fmt.Sprintf("Failed to save Sieve copy to %s: %v", copyMailbox, err)
 			return result, err
 		}
 	}
@@ -266,7 +319,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// account), enforce the 'i' right, attribute the message to the mailbox owner, and
 	// stage the already-saved body under the owner's path. The body was stored locally
 	// under recipient.AccountID above.
-	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(d.Ctx, recipient, mailboxName, contentHash)
+	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(ctx, recipient, mailboxName, contentHash)
 	if err != nil {
 		result.ErrorMessage = fmt.Sprintf("Failed to resolve destination mailbox: %v", err)
 		return result, err
@@ -274,7 +327,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 
 	// Save message to mailbox
 	size := int64(len(messageBytes))
-	_, messageUID, err := d.RDB.InsertMessageWithRetry(d.Ctx,
+	_, messageUID, err := d.RDB.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
 			AccountID:            destAccountID,
 			MailboxID:            mailbox.ID,
@@ -315,7 +368,8 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			// 4. If Message B deletes the file, Message A's pending upload loses its source file
 			//
 			// The file will be cleaned up by the uploader's cleanupOrphanedFiles job
-			// (runs every 5 minutes with 10-minute grace period) if it's truly orphaned.
+			// (runs every 5 minutes; [uploader] cleanup_grace_period, default 1h) if it's
+			// truly orphaned.
 			// This is safer than trying to determine if a pending upload exists, because:
 			// - The pending upload might be for a different account with the same content hash
 			// - The pending upload check itself could race with upload completion
@@ -332,6 +386,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			result.Success = true
 			result.MailboxName = mailbox.Name
 			result.MessageUID = uint32(messageUID)
+			if relayAfterStore != nil {
+				relayAfterStore()
+			}
 			// Don't notify uploader for duplicates
 			return result, nil
 		}
@@ -363,6 +420,10 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// Notify uploader
 	d.Uploader.NotifyUploadQueued()
 
+	if relayAfterStore != nil {
+		relayAfterStore()
+	}
+
 	// Track metrics
 	metrics.MessageThroughput.WithLabelValues(d.MetricsLabel, "delivered", "success").Inc()
 	metrics.TrackDomainMessage(d.MetricsLabel, recipient.Address.Domain(), "delivered")
@@ -384,6 +445,11 @@ func (d *DeliveryContext) LookupRecipient(ctx context.Context, recipient string)
 	}
 
 	lookupAddress := toAddress.BaseAddress()
+
+	// Recipient existence is a delivery verdict: a replica may not have replayed
+	// a new account or its deletion yet. Read the writer before accepting or
+	// permanently refusing the recipient, as the rest of the delivery does.
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 
 	// Lookup user account and get primary address in one query
 	// This finds the account by alias/recipient address, but returns the primary address
@@ -421,6 +487,55 @@ func (d *DeliveryContext) LookupRecipient(ctx context.Context, recipient string)
 		Address:   &primaryAddr, // Primary address (for S3 keys, metrics, etc.)
 		ToAddress: &toAddress,   // Recipient address as sent (may include +alias)
 	}, nil
+}
+
+// CanFileInto reports whether a message for accountID can be filed into the mailbox
+// named name: one of the account's own, or one shared with it with the insert right
+// (RFC 4314 'i'), resolved the way delivery resolves a fileinto target. It is the
+// Sieve mailboxexists test (RFC 5490 §3.1): the mailbox exists "and each allows the
+// user in whose context the Sieve script runs to "deliver" messages into it".
+func CanFileInto(ctx context.Context, rdb *resilient.ResilientDatabase, accountID int64, name string) (bool, error) {
+	mailbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, name)
+	if errors.Is(err, consts.ErrMailboxNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if mailbox.AccountID == accountID {
+		return true, nil
+	}
+	return rdb.CheckMailboxPermissionWithRetry(ctx, mailbox.ID, accountID, db.ACLRightInsert)
+}
+
+// createMissingMailbox carries out a Sieve fileinto :create (RFC 5490 §3.2): it
+// creates the recipient's mailbox named name "if needed". A mailbox the recipient
+// already has by that name, its own or one shared with it, is used as it is ("If the
+// mailbox already exists, this argument is ignored"). None is created in the shared
+// namespace, where a personal namesake would shadow a shared mailbox in later
+// lookups; the message then falls back to INBOX, as for any missing target.
+//
+// A name the mailstore refuses is no delivery failure either: "Failure to create the
+// specified mailbox is considered to be an error" (RFC 5490 §3.2), and on an error
+// implementations "do an implicit keep" (RFC 5228 §2.10.6), so the message goes to
+// INBOX. The name never becomes valid; failing the delivery would only have it
+// retried until it bounces, and through the default script's +detail filing any
+// sender can choose the name.
+func (d *DeliveryContext) createMissingMailbox(ctx context.Context, recipient RecipientInfo, name string) error {
+	_, err := d.RDB.GetMailboxByNameWithRetry(ctx, recipient.AccountID, name)
+	if !errors.Is(err, consts.ErrMailboxNotFound) {
+		return err // nil: the mailbox exists
+	}
+	if d.SharedMailboxes.InNamespace(name) {
+		d.Logger.Log("Sieve fileinto :create refused in the shared namespace: %s", name)
+		return nil
+	}
+	_, err = d.RDB.GetOrCreateMailboxByNameWithRetry(ctx, recipient.AccountID, name)
+	if errors.Is(err, consts.ErrMailboxInvalidName) {
+		d.Logger.Log("Sieve fileinto :create of an invalid mailbox name %q, keeping the message: %v", name, err)
+		return nil
+	}
+	return err
 }
 
 // resolveOwnedTarget resolves mailboxName for the recipient, supporting shared
@@ -475,12 +590,8 @@ func (d *DeliveryContext) resolveOwnedTarget(ctx context.Context, recipient Reci
 	// hardlink it to the owner's staging path so the uploader writes the body under the
 	// owner's S3 path (B2).
 	if destAccountID != recipient.AccountID {
-		sourcePath := d.Uploader.FilePath(contentHash, recipient.AccountID)
-		destPath := d.Uploader.FilePath(contentHash, destAccountID)
-		if sourcePath != destPath {
-			if linkErr := helpers.LinkOrCopyFile(sourcePath, destPath); linkErr != nil {
-				d.Logger.Log("failed to stage local file for cross-account delivery: %v", linkErr)
-			}
+		if linkErr := d.Uploader.LinkStaged(contentHash, recipient.AccountID, destAccountID); linkErr != nil {
+			d.Logger.Log("failed to stage local file for cross-account delivery: %v", linkErr)
 		}
 	}
 
@@ -502,13 +613,9 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 	mailHeader := mail.Header{Header: messageEntity.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
+	sentDate, _ := mailHeader.Date() // zero without a Date: header that parses (db.InsertMessageOptions.SentDate)
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
-
-	if sentDate.IsZero() {
-		sentDate = time.Now()
-	}
 
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
 

@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/migadu/sora/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // TestIMAP_SearchRateLimit_ChargesByCost checks over the wire which commands the
@@ -77,6 +79,9 @@ func TestIMAP_SearchRateLimit_ChargesByCost(t *testing.T) {
 		"ESEARCH IN (personal) RETURN (ALL) UNSEEN",
 	}
 	before := searchRefusedCount(t, "rate_limit")
+	// Counted under protocol="imap" like every other IMAP protocol error, not "IMAP".
+	rateLimited := metrics.ProtocolErrors.WithLabelValues("imap", "SEARCH", "rate_limited", "client_error")
+	rateLimitedBefore := testutil.ToFloat64(rateLimited)
 	for i, cmd := range refused {
 		rtag := fmt.Sprintf("r%d", i)
 		_, tagged := esearchExec(t, conn, r, rtag, cmd)
@@ -88,6 +93,9 @@ func TestIMAP_SearchRateLimit_ChargesByCost(t *testing.T) {
 	// the result cap's so that one metric answers how often NO [LIMIT] is sent and why.
 	if got, want := searchRefusedCount(t, "rate_limit"), before+float64(len(refused)); got != want {
 		t.Errorf(`sora_imap_search_refused_total{reason="rate_limit"} after %d refusals: got %.0f, want %.0f`, len(refused), got, want)
+	}
+	if got, want := testutil.ToFloat64(rateLimited), rateLimitedBefore+float64(len(refused)); got != want {
+		t.Errorf(`sora_protocol_errors_total{protocol="imap",command="SEARCH",error_type="rate_limited"} after %d refusals: got %.0f, want %.0f`, len(refused), got, want)
 	}
 
 	runFree("after")

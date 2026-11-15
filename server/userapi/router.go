@@ -1,7 +1,10 @@
 package userapi
 
 import (
+	"maps"
 	"net/http"
+	"net/url"
+	"slices"
 	"strings"
 )
 
@@ -26,6 +29,43 @@ func extractPathParam(path, prefix, suffix string) string {
 	return remaining
 }
 
+// pathName returns the mailbox or script name between prefix and suffix in r's
+// path, percent-decoded exactly once. It cuts the escaped path, so an encoded
+// "/" (%2F) stays part of the name, and decodes it with PathUnescape: in a path
+// "+" is a plus (RFC 3986), not the form encoding of a space. The routers that
+// pick the endpoint by suffix must look at the escaped path too.
+func pathName(r *http.Request, prefix, suffix string) (string, error) {
+	return url.PathUnescape(extractPathParam(escapedRoutingPath(r), prefix, suffix))
+}
+
+// escapedRoutingPath normalizes percent-encoded unreserved characters (RFC 3986
+// section 6.2.2.2), so encoded route words match the same routes ServeMux accepts.
+// Reserved characters stay escaped: in particular, %2F inside a name must not
+// become an endpoint separator, and %25 must not cause a second decoding.
+func escapedRoutingPath(r *http.Request) string {
+	path := r.URL.EscapedPath()
+	if !strings.Contains(path, "%") {
+		return path
+	}
+	var out strings.Builder
+	out.Grow(len(path))
+	for i := 0; i < len(path); i++ {
+		if path[i] == '%' && i+2 < len(path) {
+			decoded, err := url.PathUnescape(path[i : i+3])
+			if err == nil {
+				c := decoded[0]
+				if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("-._~", rune(c)) {
+					out.WriteByte(c)
+					i += 2
+					continue
+				}
+			}
+		}
+		out.WriteByte(path[i])
+	}
+	return out.String()
+}
+
 // extractLastPathSegment extracts the last segment from a path
 // For example, from "/user/messages/123", it extracts "123"
 func extractLastPathSegment(path string) string {
@@ -37,7 +77,7 @@ func extractLastPathSegment(path string) string {
 }
 
 // routeHandler wraps an http.HandlerFunc with method checking
-func routeHandler(method string, handler http.HandlerFunc) http.HandlerFunc {
+func (s *Server) routeHandler(method string, handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "OPTIONS" {
 			// Allow OPTIONS for CORS preflight
@@ -45,7 +85,7 @@ func routeHandler(method string, handler http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if r.Method != method {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, method)
 			return
 		}
 		handler(w, r)
@@ -53,7 +93,8 @@ func routeHandler(method string, handler http.HandlerFunc) http.HandlerFunc {
 }
 
 // multiMethodHandler allows multiple HTTP methods for a single route
-func multiMethodHandler(handlers map[string]http.HandlerFunc) http.HandlerFunc {
+func (s *Server) multiMethodHandler(handlers map[string]http.HandlerFunc) http.HandlerFunc {
+	allowed := slices.Sorted(maps.Keys(handlers))
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "OPTIONS" {
 			// Allow OPTIONS for CORS preflight
@@ -64,6 +105,26 @@ func multiMethodHandler(handlers map[string]http.HandlerFunc) http.HandlerFunc {
 			handler(w, r)
 			return
 		}
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		s.methodNotAllowed(w, allowed...)
 	}
+}
+
+// methodNotAllowed answers a method the endpoint does not serve: 405 with the
+// documented JSON error and, as RFC 9110 section 15.5.6 requires, an Allow
+// header listing the methods the endpoint does serve.
+func (s *Server) methodNotAllowed(w http.ResponseWriter, allowed ...string) {
+	// The CORS middleware accepts OPTIONS for every endpoint. Include it in
+	// Allow as well as the methods handled by the endpoint itself. Clone first:
+	// multiMethodHandler shares its allowed slice between concurrent requests.
+	if !slices.Contains(allowed, http.MethodOptions) {
+		allowed = append(slices.Clone(allowed), http.MethodOptions)
+	}
+	w.Header().Set("Allow", strings.Join(allowed, ", "))
+	s.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+}
+
+// notFound answers a path no endpoint serves with the documented JSON error,
+// in place of ServeMux's text/plain "404 page not found".
+func (s *Server) notFound(w http.ResponseWriter, _ *http.Request) {
+	s.writeError(w, http.StatusNotFound, "Not found")
 }

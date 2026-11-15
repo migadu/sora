@@ -35,7 +35,10 @@ const DefaultMaxMessageSize = 50 * 1024 * 1024
 // (security-audit M13)
 const defaultLMTPMaxConnections = 1000
 
-// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+// getProxyProtocolTrustedProxies returns the hosts trusted to send PROXY headers: the
+// ProxyProtocolTrustedProxies option if set, otherwise trusted_networks. No config key
+// sets that option (there is no proxy_protocol_trusted_proxies, #542), so in a running
+// server PROXY trust is always [servers] trusted_networks.
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {
 		return proxyProtocolTrusted
@@ -43,14 +46,18 @@ func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []stri
 	return trustedNetworks
 }
 
-// connectionLimitingListener wraps a net.Listener to enforce connection limits at the TCP level
+// connectionLimitingListener wraps a net.Listener to enforce connection admission and
+// limits at the TCP level
 type connectionLimitingListener struct {
 	net.Listener
 	limiter *server.ConnectionLimiter
 	name    string
+	// trusted reports whether a socket peer is in the admission networks.
+	trusted func(net.Addr) bool
 }
 
-// Accept accepts connections and checks connection limits before returning them
+// Accept accepts connections and checks admission and connection limits before
+// returning them
 func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 	for {
 		conn, err := l.Listener.Accept()
@@ -58,11 +65,22 @@ func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 
+		// A peer outside trusted_networks is closed here, as lmtp_proxy closes it:
+		// before it takes a max_connections slot, before the TLS handshake and with
+		// nothing sent. No SMTP session is opened, so there is no QUIT to wait for
+		// (RFC 5321 §3.1), and the client treats the closed connection as a
+		// temporary failure (§3.8). NewSession checks the same socket peer again.
+		if !l.trusted(conn.RemoteAddr()) {
+			logger.Warn("connection rejected - not from trusted network", "name", l.name, "remote_addr", server.GetAddrString(conn.RemoteAddr()))
+			conn.Close()
+			continue
+		}
+
 		// Extract real client IP and proxy info if this is a PROXY protocol
 		// connection. The PROXY conn sits INSIDE the TLS layer (the header is
 		// read from the raw stream before any TLS processing), so on
-		// implicit-TLS listeners the accepted conn is a *tls.Conn; the walk
-		// traverses it via NetConn(), which never triggers the handshake.
+		// implicit-TLS listeners the accepted conn is a SoraTLSConn; the walk
+		// traverses it via Unwrap(), which never triggers the handshake.
 		var realClientIP string
 		proxyInfo := server.GetProxyProtocolInfo(conn)
 		if proxyInfo != nil && proxyInfo.SrcIP != "" {
@@ -93,6 +111,42 @@ type connectionLimitingConn struct {
 	proxyInfo   *server.ProxyProtocolInfo
 	closeMu     sync.Mutex
 	closed      bool
+
+	handshakeOnce sync.Once
+	handshakeErr  error
+}
+
+// handshake completes the deferred TLS handshake of a connection accepted from the
+// implicit-TLS listener (SoraTLSListener), and does nothing on a plain-text one. The
+// other servers run it from their protocol library's per-connection hook, before the
+// greeting; go-smtp has no such hook, so the connection's first Read or Write runs it:
+// the greeting, written from go-smtp's per-connection goroutine, not the accept loop.
+// SoraTLSConn bounds the handshake with its own deadline, so a client that never
+// sends a ClientHello gives back its slot, and rejects plain text on the TLS port.
+//
+// The handshake clears the deadlines when it ends, including the write deadline
+// go-smtp set for the greeting. That greeting is one short record sent right after
+// a completed handshake, which the socket buffer takes without waiting for the
+// client, and go-smtp sets its deadlines again for every later read and reply.
+func (c *connectionLimitingConn) handshake() error {
+	c.handshakeOnce.Do(func() {
+		_, c.handshakeErr = server.PerformDeferredTLSHandshake(c.Conn)
+	})
+	return c.handshakeErr
+}
+
+func (c *connectionLimitingConn) Read(b []byte) (int, error) {
+	if err := c.handshake(); err != nil {
+		return 0, err
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *connectionLimitingConn) Write(b []byte) (int, error) {
+	if err := c.handshake(); err != nil {
+		return 0, err
+	}
+	return c.Conn.Write(b)
 }
 
 // GetProxyInfo implements the same interface as server.ProxyProtocolConn
@@ -146,6 +200,7 @@ type LMTPServerBackend struct {
 	uploader     *uploader.UploadWorker
 	server       *smtp.Server
 	appCtx       context.Context
+	cancel       context.CancelFunc
 	tlsConfig    *tls.Config
 	ftsRetention time.Duration
 	relayQueue   delivery.RelayQueue // Disk-based queue for relay retry
@@ -157,6 +212,10 @@ type LMTPServerBackend struct {
 	redirectRateLimit  int
 	redirectRateWindow time.Duration
 	maxRedirectHops    int
+
+	// sharedMailboxes is [shared_mailboxes]: Sieve fileinto :create never makes a
+	// personal mailbox in its namespace.
+	sharedMailboxes config.SharedMailboxesConfig
 
 	// Per-command hard execution timeouts (nil = use defaults)
 	commandTimeouts *CommandTimeouts
@@ -176,7 +235,7 @@ type LMTPServerBackend struct {
 	// Listen backlog
 	listenBacklog int
 
-	// Trusted networks for connection admission (NewSession). Defaults to private
+	// Trusted networks for connection admission (at accept). Defaults to private
 	// networks when trusted_networks is unset, since LMTP is internal-only.
 	trustedNetworks []*net.IPNet
 
@@ -224,12 +283,13 @@ type LMTPServerOptions struct {
 	FTSRetention                time.Duration
 	MaxMessageSize              int64    // Maximum size for incoming messages in bytes
 	SieveExtensions             []string // Sieve extensions to enable (nil/empty = all default extensions)
-	InsecureAuth                bool     // Allow PLAIN auth over non-TLS connections (default: true for LMTP behind trusted network)
+	InsecureAuth                bool     // Allow plaintext authentication over non-TLS connections
 	RedirectRateLimit           int
 	RedirectRateWindow          time.Duration
 	MaxRedirectHops             int
-	CommandTimeoutOverrides     map[string]time.Duration // Per-command hard execution timeouts (overrides defaults)
-	IdleTimeout                 time.Duration            // Maximum idle time between commands (0 = default 5m); enforced by go-smtp with a 421 notice
+	SharedMailboxes             config.SharedMailboxesConfig // [shared_mailboxes]; Sieve fileinto :create makes no personal mailbox in its namespace
+	CommandTimeoutOverrides     map[string]time.Duration     // Per-command hard execution timeouts (overrides defaults)
+	IdleTimeout                 time.Duration                // Maximum idle time between commands (0 = default 5m); enforced by go-smtp with a 421 notice
 }
 
 func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
@@ -260,10 +320,19 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		options.TLSUseStartTLS = false
 	}
 
+	serverCtx, serverCancel := context.WithCancel(appCtx)
+	created := false
+	defer func() {
+		if !created {
+			serverCancel()
+		}
+	}()
+
 	backend := &LMTPServerBackend{
 		addr:               addr,
 		name:               name,
-		appCtx:             appCtx,
+		appCtx:             serverCtx,
+		cancel:             serverCancel,
 		hostname:           hostname,
 		instanceID:         instanceIDOrHostname(options.InstanceID, hostname),
 		maintenanceGate:    options.MaintenanceGate,
@@ -277,6 +346,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		redirectRateLimit:  options.RedirectRateLimit,
 		redirectRateWindow: options.RedirectRateWindow,
 		maxRedirectHops:    options.MaxRedirectHops,
+		sharedMailboxes:    options.SharedMailboxes,
 		commandTimeouts:    defaultCommandTimeouts(),
 	}
 	backend.settings.Store(&reloadableSettings{
@@ -322,36 +392,18 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	backend.defaultSieveScript = compiledDefault
 	logger.Debug("default sieve script parsed and cached", "name", backend.name)
 
-	// Set up TLS config: Support both file-based certificates and global TLS manager
-	// 1. Per-server TLS: cert files provided (for both implicit TLS and STARTTLS)
-	// 2. Global TLS: options.TLS=true, no cert files, global TLS config provided (for both implicit TLS and STARTTLS)
-	// 3. No TLS: options.TLS=false
-	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
-		// Scenario 1: Per-server TLS with explicit cert files
-		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
+	// One TLS config for implicit TLS and STARTTLS; the certificate source and
+	// tls_verify follow the rule every listener shares (server.ListenerTLS).
+	if options.TLS {
+		tlsConfig, err := server.ListenerTLS{
+			Protocol: "LMTP", Name: name,
+			CertFile: options.TLSCertFile, KeyFile: options.TLSKeyFile, Verify: options.TLSVerify,
+			Global: options.TLSConfig, ALPN: []string{"lmtp"},
+		}.Config()
 		if err != nil {
-			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, err
 		}
-		backend.tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			ClientAuth:               tls.NoClientCert,
-			ServerName:               hostname,
-			PreferServerCipherSuites: true,
-			NextProtos:               []string{"lmtp"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-
-		if !options.TLSVerify {
-			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
-			logger.Debug("LMTP: WARNING - Client TLS certificate verification not enforced", "name", name)
-		}
-	} else if options.TLS && options.TLSConfig != nil {
-		// Scenario 2: Global TLS manager (works for both implicit TLS and STARTTLS)
-		backend.tlsConfig = options.TLSConfig
-	} else if options.TLS {
-		// TLS enabled but no cert files and no global TLS config provided
-		return nil, fmt.Errorf("TLS enabled for LMTP [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", name)
+		backend.tlsConfig = tlsConfig
 	}
 
 	s := smtp.NewServer(backend)
@@ -362,7 +414,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// context: go-smtp cancels the derived context when the client disconnects,
 	// the connection ends, or the server shuts down, and BaseContext adds app
 	// shutdown on top. Sessions derive their context from it in NewSession.
-	s.BaseContext = func(net.Listener) context.Context { return appCtx }
+	s.BaseContext = func(net.Listener) context.Context { return serverCtx }
 	s.AllowInsecureAuth = options.InsecureAuth
 	s.LMTP = true
 	s.MaxRecipients = 1 // Enforce single recipient per LMTP transaction.
@@ -404,25 +456,18 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// every address; go-smtp only parses the delimiters around it.
 	s.EnableSMTPUTF8 = true
 
-	// Connection admission (NewSession): LMTP is internal-only, so when trusted_networks
+	// Connection admission (at accept): LMTP is internal-only, so when trusted_networks
 	// is unset we default to private networks. This gate intentionally keeps the RFC1918
 	// default — emptying the list must NOT silently reject all delivery.
-	admissionProxies := options.TrustedNetworks
-	if len(admissionProxies) == 0 {
-		admissionProxies = []string{
-			"127.0.0.0/8",    // localhost
-			"::1/128",        // IPv6 localhost
-			"10.0.0.0/8",     // RFC1918 private networks
-			"172.16.0.0/12",  // RFC1918 private networks
-			"192.168.0.0/16", // RFC1918 private networks
-		}
+	admissionProxies := server.LMTPAdmissionNetworks(options.TrustedNetworks)
+	if len(options.TrustedNetworks) == 0 {
 		logger.Info("LMTP: trusted_networks empty; accepting delivery from default private ranges (RFC1918+localhost). Set trusted_networks to restrict.", "name", name)
 	}
+	// A malformed entry is a configuration error: dropping the list would admit no peer
+	// and refuse every delivery.
 	admissionNets, err := helpers.ParseTrustedNetworks(admissionProxies)
 	if err != nil {
-		// Log the error and use empty trusted networks to prevent server crash
-		logger.Debug("failed to parse trusted networks, connection admission disabled", "name", name, "error", err)
-		admissionNets = []*net.IPNet{}
+		return nil, fmt.Errorf("invalid trusted_networks for LMTP [%s]: %w", name, err)
 	}
 	backend.trustedNetworks = admissionNets
 
@@ -433,8 +478,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// explicitly. (security-audit M2)
 	xclientNets, err := helpers.ParseTrustedNetworks(options.TrustedNetworks)
 	if err != nil {
-		logger.Debug("failed to parse XCLIENT trusted networks, XCLIENT disabled", "name", name, "error", err)
-		xclientNets = []*net.IPNet{}
+		return nil, fmt.Errorf("invalid trusted_networks for LMTP [%s]: %w", name, err)
 	}
 	backend.xclientTrustedNets = xclientNets
 	s.XCLIENTTrustedNets = xclientNets
@@ -460,7 +504,8 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	}
 
 	// Start connection limiter cleanup
-	backend.limiter.StartCleanup(appCtx)
+	backend.limiter.StartCleanup(serverCtx)
+	created = true
 
 	return backend, nil
 }
@@ -475,31 +520,28 @@ func (b *LMTPServerBackend) isFromTrustedNetwork(ip net.IP) bool {
 	return false
 }
 
-func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
-	// Check if connection is from a trusted network
-	remoteAddr := c.Conn().RemoteAddr()
+// isTrustedPeer reports whether the socket peer addr is in a trusted network. An
+// address without an IP is not.
+func (b *LMTPServerBackend) isTrustedPeer(addr net.Addr) bool {
 	var ip net.IP
-	switch addr := remoteAddr.(type) {
+	switch a := addr.(type) {
 	case *net.TCPAddr:
-		ip = addr.IP
+		ip = a.IP
 	case *net.UDPAddr:
-		ip = addr.IP
+		ip = a.IP
 	default:
-		// Try to parse as string
-		host, _, err := net.SplitHostPort(remoteAddr.String())
-		if err != nil {
-			logger.Debug("connection rejected - invalid address format", "name", b.name, "remote_addr", remoteAddr)
-			return nil, fmt.Errorf("invalid remote address format")
-		}
-		ip = net.ParseIP(host)
-		if ip == nil {
-			logger.Debug("connection rejected - could not parse ip", "name", b.name, "remote_addr", remoteAddr)
-			return nil, fmt.Errorf("could not parse remote IP address")
+		if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+			ip = net.ParseIP(host)
 		}
 	}
+	return ip != nil && b.isFromTrustedNetwork(ip)
+}
 
-	if !b.isFromTrustedNetwork(ip) {
-		logger.Warn("connection rejected - not from trusted network", "name", b.name, "ip", ip, "remote_addr", remoteAddr)
+func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
+	// The listener closes a peer outside trusted_networks at accept; this checks the
+	// same socket peer for a connection that reached go-smtp another way.
+	if remoteAddr := c.Conn().RemoteAddr(); !b.isTrustedPeer(remoteAddr) {
+		logger.Warn("connection rejected - not from trusted network", "name", b.name, "remote_addr", server.GetAddrString(remoteAddr))
 		return nil, fmt.Errorf("LMTP connections only allowed from trusted networks")
 	}
 
@@ -561,7 +603,7 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	}
 
 	// Initialize the mutex helper
-	s.mutexHelper = server.NewMutexTimeoutHelper(&s.mutex, sessionCtx, "LMTP", logFunc)
+	s.mutexHelper = server.NewMutexTimeoutHelper(&s.mutex, sessionCtx, "lmtp", logFunc)
 
 	// Log connection with connection counters
 	activeCount := b.activeConnections.Load()
@@ -571,6 +613,10 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 }
 
 func (b *LMTPServerBackend) Start(errChan chan error) {
+	if b.appCtx.Err() != nil {
+		return
+	}
+
 	var listener net.Listener
 	var err error
 
@@ -580,6 +626,9 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	// Create base TCP listener with custom backlog
 	tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", b.server.Addr, b.listenBacklog)
 	if err != nil {
+		if b.cancel != nil {
+			b.cancel()
+		}
 		errChan <- fmt.Errorf("failed to create listener: %w", err)
 		return
 	}
@@ -587,19 +636,25 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 
 	// The PROXY protocol header travels in plaintext AHEAD of the TLS
 	// ClientHello, so the header reader must sit between the TCP socket and
-	// the TLS layer: the header is read from the raw stream, and crypto/tls
-	// then handshakes lazily THROUGH the PROXY conn on first I/O, consuming
-	// any ClientHello bytes its bufio buffered alongside the header. Wrapping
-	// in the other order makes the eager TLS conn handshake against the
-	// plaintext "PROXY ..." line and fail on every connection. STARTTLS mode
+	// the TLS layer: the header is read from the raw stream, and the deferred
+	// TLS handshake then reads THROUGH the PROXY conn, consuming any
+	// ClientHello bytes its bufio buffered alongside the header. Wrapping in
+	// the other order makes the handshake read the raw socket and miss those
+	// bytes, or run against the plaintext "PROXY ..." line. STARTTLS mode
 	// (b.server.TLSConfig set) is unaffected: TLS is negotiated in-protocol,
 	// long after the header.
 	base := server.WrapProxyProtocol(tcpListener, b.proxyReader, "LMTP")
 
 	// Only use a TLS listener if we're not using StartTLS and TLS is enabled
 	if b.tlsConfig != nil && b.server.TLSConfig == nil {
-		// Implicit TLS - wrap PROXY-aware listener with TLS
-		listener = tls.NewListener(base, b.tlsConfig)
+		// Implicit TLS - wrap PROXY-aware listener with TLS. The handshake is
+		// deferred to the connection's first I/O (connectionLimitingConn.handshake).
+		// No timeout checker: go-smtp owns the idle timeout (see New).
+		listener = server.NewSoraTLSListener(base, b.tlsConfig, server.SoraConnConfig{
+			Protocol:   "lmtp",
+			ServerName: b.name,
+			Hostname:   b.hostname,
+		})
 		logger.Info("lmtp server listening with tls", "name", b.name, "addr", b.server.Addr)
 	} else {
 		listener = base
@@ -607,11 +662,22 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	}
 	defer listener.Close()
 
+	// cmd/sora calls Close from a watcher on the application context that
+	// races Start, and go-smtp's Close closes only the listeners Serve has
+	// already registered: a listener created after it would be served until
+	// the process exits. Close it on shutdown, as the POP3 and ManageSieve
+	// servers do.
+	go func() {
+		<-b.appCtx.Done()
+		listener.Close()
+	}()
+
 	// Wrap listener with connection limiting
 	limitedListener := &connectionLimitingListener{
 		Listener: listener,
 		limiter:  b.limiter,
 		name:     b.name,
+		trusted:  b.isTrustedPeer,
 	}
 
 	if err := b.server.Serve(limitedListener); err != nil {
@@ -633,7 +699,11 @@ func (b *LMTPServerBackend) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	next := *b.settings.Load()
 
-	if maxSize := cfg.GetMaxMessageSizeWithDefault(); maxSize != next.maxMessageSize {
+	// A value that does not parse keeps the running limit (start-up, which has none,
+	// uses the default).
+	if maxSize, err := cfg.GetMaxMessageSize(); err != nil {
+		logger.Warn("LMTP config reload: invalid max_message_size, keeping the running value", "name", b.name, "error", err, "running", next.maxMessageSize)
+	} else if maxSize != next.maxMessageSize {
 		next.maxMessageSize = maxSize
 		reloaded = append(reloaded, "max_message_size")
 	}
@@ -647,6 +717,9 @@ func (b *LMTPServerBackend) ReloadConfig(cfg config.ServerConfig) error {
 }
 
 func (b *LMTPServerBackend) Close() error {
+	if b.cancel != nil {
+		b.cancel()
+	}
 	if b.server != nil {
 		return b.server.Close()
 	}

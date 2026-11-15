@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -32,7 +31,8 @@ type Message struct {
 	FlagsChangedAt *time.Time // Time when the flags were last changed
 	Subject        string     // Subject of the message
 	InternalDate   time.Time  // The internal date the message was received
-	SentDate       time.Time  // The date the message was sent
+	SentDate       time.Time  // The date the message was sent; its INTERNALDATE when NoDateHeader
+	NoDateHeader   bool       // No Date: header that parses (sent_date_unknown): the ENVELOPE date is NIL
 	Size           int        // Size of the message in bytes
 	MessageID      string     // Unique Message-ID from the message headers
 	InReplyTo      string
@@ -246,7 +246,7 @@ func streamMessagesWhereChunked(ctx context.Context, run MessageStreamDBRunner, 
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
 			m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq,
 			0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
@@ -419,7 +419,7 @@ func streamAllActiveMessagesRawChunked(ctx context.Context, run MessageStreamDBR
 		SELECT
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
 			m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
@@ -470,7 +470,7 @@ func scanMessages(rows pgx.Rows, includeBodyStructure bool) ([]Message, error) {
 		}
 		scanArgs = append(scanArgs,
 			&msg.CreatedModSeq, &msg.UpdatedModSeq,
-			&msg.ExpungedModSeq, &msg.Seq, &msg.FlagsChangedAt, &msg.Subject, &msg.SentDate, &msg.MessageID,
+			&msg.ExpungedModSeq, &msg.Seq, &msg.FlagsChangedAt, &msg.Subject, &msg.SentDate, &msg.NoDateHeader, &msg.MessageID,
 			&msg.InReplyTo, &recipientsJSON,
 		)
 
@@ -485,7 +485,7 @@ func scanMessages(rows pgx.Rows, includeBodyStructure bool) ([]Message, error) {
 		// Callers that need it (e.g. FETCH BODYSTRUCTURE) will lazy-fetch via GetMessageBodyStructure.
 
 		if err := json.Unmarshal(customFlagsJSON, &msg.CustomFlags); err != nil {
-			log.Printf("Database: ERROR - failed unmarshalling custom_flags for UID %d: %v. JSON: %s", msg.UID, err, string(customFlagsJSON))
+			logger.Error("Database: failed to unmarshal custom_flags", "uid", msg.UID, "mailbox_id", msg.MailboxID, "err", err, "json", string(customFlagsJSON))
 		}
 		msg.RecipientsJSON = recipientsJSON
 		messages = append(messages, msg)
@@ -528,11 +528,11 @@ func deserializeBodyStructure(data []byte, msgSize int, accountID, mailboxID int
 	if len(data) > 0 {
 		bs, err := helpers.DeserializeBodyStructureGob(data)
 		if err != nil {
-			log.Printf("Database: WARNING - account_id=%d mailbox_id=%d UID=%d content_hash=%s: failed to deserialize body_structure: %v",
-				accountID, mailboxID, uid, contentHash, err)
+			logger.Warn("Database: failed to deserialize body_structure", "account_id", accountID, "mailbox_id", mailboxID,
+				"uid", uid, "content_hash", contentHash, "err", err)
 		} else if validateErr := helpers.ValidateBodyStructure(bs); validateErr != nil {
-			log.Printf("Database: WARNING - account_id=%d mailbox_id=%d UID=%d content_hash=%s: invalid body_structure: %v",
-				accountID, mailboxID, uid, contentHash, validateErr)
+			logger.Warn("Database: invalid body_structure", "account_id", accountID, "mailbox_id", mailboxID,
+				"uid", uid, "content_hash", contentHash, "err", validateErr)
 		} else {
 			return bs
 		}
@@ -582,7 +582,7 @@ func (db *Database) GetMessagesByFlag(ctx context.Context, mailboxID int64, flag
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
 			m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq,
 			0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND (ms.flags & $2) != 0 AND m.expunged_at IS NULL
@@ -648,11 +648,22 @@ func (db *Database) GetDeletedMessageUIDsAndSeqs(ctx context.Context, mailboxID 
 	return results, rows.Err()
 }
 
-// GetRecentMessagesForWarmup fetches the most recent messages from specified mailboxes for cache warming
-// Returns a map of mailboxName -> []contentHash for the most recent messages
-func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
+// WarmupObject is a body the cache warmup may fetch: the S3 object its message row points
+// at, and the message's size, so the warmup can pass over a body the cache would refuse
+// without downloading it.
+type WarmupObject struct {
+	ContentObject
+	Size int64
+}
+
+// GetRecentMessagesForWarmup fetches the most recent messages from specified mailboxes for cache warming.
+// Returns a map of mailboxName -> the bodies of up to messageCount of its most recent uploaded messages.
+// Each body is the S3 object its message row points at, under the address it was stored with, which is
+// not the account's primary address once that has changed. A message whose upload is still pending is
+// left out: its body is not in S3 yet, and the uploader moves it into its node's cache once uploaded.
+func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]WarmupObject, error) {
 	if messageCount <= 0 {
-		return make(map[string][]string), nil
+		return make(map[string][]WarmupObject), nil
 	}
 
 	// Check if account has any mailboxes - skip warmup for new accounts to avoid noise
@@ -662,45 +673,39 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID in
 	}
 	if mailboxCount == 0 {
 		// New account with no mailboxes yet - skip warmup silently
-		return make(map[string][]string), nil
+		return make(map[string][]WarmupObject), nil
 	}
 
-	result := make(map[string][]string)
+	result := make(map[string][]WarmupObject)
 
 	for _, mailboxName := range mailboxNames {
 		mailbox, err := db.GetMailboxByName(ctx, AccountID, mailboxName)
 		if err != nil {
-			log.Printf("WarmUp: failed to get mailbox '%s' for user %d: %v", mailboxName, AccountID, err)
+			logger.Debug("WarmUp: failed to get mailbox", "mailbox", mailboxName, "account_id", AccountID, "err", err)
 			continue // Skip this mailbox if not found
 		}
 
-		// Create search criteria to get all messages (no filters)
-		criteria := &imap.SearchCriteria{}
-
-		// Get the most recent messages. Use SearchMessagesWithCriteria to trigger the
-		// fast-path ORDER BY uid DESC which operates in O(1) via indices, instead of
-		// forcing a massive in-memory ordering on internal_date.
-		messages, err := db.SearchMessagesWithCriteria(ctx, mailbox.ID, mailbox.AccountID, criteria, messageCount, 0)
+		// The most recent uploaded messages by UID, which the (mailbox_id, uid) index
+		// returns in order, instead of sorting the mailbox by internal_date.
+		rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+			SELECT s3_domain, s3_localpart, content_hash, size
+			FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL AND uploaded = TRUE
+			ORDER BY uid DESC
+			LIMIT $2`, mailbox.ID, messageCount)
 		if err != nil {
-
-			log.Printf("WarmUp: failed to get recent messages for mailbox '%s': %v", mailboxName, err)
+			logger.Debug("WarmUp: failed to get recent messages", "mailbox", mailboxName, "account_id", AccountID, "err", err)
+			continue
+		}
+		objects, err := pgx.CollectRows(rows, pgx.RowToStructByPos[WarmupObject])
+		if err != nil {
+			logger.Debug("WarmUp: failed to read recent messages", "mailbox", mailboxName, "account_id", AccountID, "err", err)
 			continue
 		}
 
-		// Extract content hashes for the most recent messages (up to messageCount)
-		var contentHashes []string
-		for i, message := range messages {
-			if i >= messageCount {
-				break
-			}
-			if message.ContentHash != "" {
-				contentHashes = append(contentHashes, message.ContentHash)
-			}
-		}
-
-		if len(contentHashes) > 0 {
-			result[mailboxName] = contentHashes
-			log.Printf("WarmUp: prepared %d content hashes for mailbox '%s'", len(contentHashes), mailboxName)
+		if len(objects) > 0 {
+			result[mailboxName] = objects
+			logger.Debug("WarmUp: prepared cache objects", "mailbox", mailboxName, "account_id", AccountID, "count", len(objects))
 		}
 	}
 

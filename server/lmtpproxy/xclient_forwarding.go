@@ -2,12 +2,20 @@ package lmtpproxy
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/migadu/sora/server"
 )
+
+// errXCLIENTRefused is the backend refusing XCLIENT with a 5xx reply. The reply was read,
+// so the stream is at a command boundary and the transaction can go on without the
+// forwarding parameters. Any other error of the exchange (the XCLIENT reply or, after a
+// 220, the LHLO reply) leaves a reply unread and the connection unusable: MAIL FROM would
+// read it as its own.
+var errXCLIENTRefused = errors.New("backend rejected XCLIENT command")
 
 // sendForwardingParametersToBackend sends an XCLIENT command to the backend server
 // with forwarding parameters containing the real client information
@@ -117,7 +125,7 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 
 		s.DebugLog("XCLIENT and session reset completed")
 	} else if strings.HasPrefix(response, "550") || strings.HasPrefix(response, "5") {
-		return fmt.Errorf("backend rejected XCLIENT command: %s", response)
+		return fmt.Errorf("%w: %s", errXCLIENTRefused, response)
 	} else {
 		// Unexpected response - log but don't fail
 		s.DebugLog("unexpected XCLIENT response", "response", response)

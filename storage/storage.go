@@ -29,6 +29,8 @@
 //		"my-bucket",
 //		true,  // use TLS
 //		false, // debug mode
+//		30*time.Second, // per-operation timeout
+//		storage.WithRegion("eu-central-1"), // optional signing region
 //	)
 //	if err != nil {
 //		log.Fatal(err)
@@ -78,7 +80,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -94,57 +95,38 @@ type S3Storage struct {
 	Timeout       time.Duration // Timeout for individual S3 operations
 }
 
-func New(endpoint, accessKeyID, secretAccessKey, bucketName string, useSSL bool, debug bool, timeout time.Duration) (*S3Storage, error) {
-	// Build endpoint URL - accept either with or without protocol
-	var endpointURL string
-	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
-		// Endpoint already includes protocol
-		endpointURL = endpoint
-	} else {
-		// Add protocol based on useSSL flag
-		if useSSL {
-			endpointURL = "https://" + endpoint
-		} else {
-			endpointURL = "http://" + endpoint
-		}
-	}
-
-	// Create AWS credentials
-	creds := credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, "")
-
-	// Create custom endpoint resolver
-	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-		return aws.Endpoint{
-			URL:               endpointURL,
-			HostnameImmutable: true,
-			Source:            aws.EndpointSourceCustom,
-		}, nil
-	})
-
-	// Build AWS config
-	cfg := aws.Config{
-		Credentials:                 creds,
-		Region:                      "us-east-1", // Default region, can be overridden
-		EndpointResolverWithOptions: customResolver,
-		RetryMaxAttempts:            1, // Disable SDK-level retries; the resilient layer (pkg/resilient) handles retries with circuit breaker and proper error classification
-	}
-
-	// Add debug logging if requested
-	if debug {
-		cfg.ClientLogMode = aws.LogRequest | aws.LogResponse | aws.LogRetries
-	}
-
-	// Create S3 client with path-style addressing for compatibility
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.UsePathStyle = true
-	})
-
+// New connects to the bucket at endpoint. Empty keys take credentials from the AWS
+// default credential chain; opts set what the arguments leave out, such as the region.
+func New(endpoint, accessKeyID, secretAccessKey, bucketName string, useSSL bool, debug bool, timeout time.Duration, opts ...Option) (*S3Storage, error) {
 	// Default timeout if not provided
 	if timeout == 0 {
 		timeout = 30 * time.Second
 	}
 
-	logger.Info("STORAGE: Initialized AWS S3 client", "endpoint", endpoint, "bucket", bucketName, "ssl", useSSL, "timeout", timeout)
+	cfg := ClientConfig{
+		Endpoint:  endpoint,
+		UseTLS:    useSSL,
+		AccessKey: accessKeyID,
+		SecretKey: secretAccessKey,
+		Debug:     debug,
+		LogPrefix: "STORAGE",
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	client, err := NewClient(ctx, cfg, func(o *s3.Options) {
+		// Disable SDK-level retries; the resilient layer (pkg/resilient) handles retries
+		// with circuit breaker and proper error classification
+		o.RetryMaxAttempts = 1
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	logger.Info("STORAGE: Initialized AWS S3 client", "endpoint", endpoint, "bucket", bucketName,
+		"region", client.Options().Region, "ssl", useSSL, "debug", debug, "timeout", timeout)
 
 	// Return the initialized storage client
 	return &S3Storage{

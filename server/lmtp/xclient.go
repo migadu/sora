@@ -70,12 +70,19 @@ func (s *LMTPSession) applyXCLIENTAttrs(attrs map[string]string) error {
 		}
 	}
 
+	replaceAddr := s.mayReplaceClientAddr()
+
 	// Process standard XCLIENT attributes and map them to ForwardingParams
 	for name, value := range attrs {
 		upperName := strings.ToUpper(name)
 
 		// Skip [UNAVAILABLE] and [TEMPUNAVAIL] values
 		if value == "[UNAVAILABLE]" || value == "[TEMPUNAVAIL]" {
+			continue
+		}
+
+		if (upperName == "ADDR" || upperName == "PORT") && !replaceAddr {
+			s.DebugLog("xclient client address ignored: the PROXY header's source is not trusted", "attribute", upperName, "value", value)
 			continue
 		}
 
@@ -126,11 +133,29 @@ func (s *LMTPSession) isFromTrustedProxy() bool {
 	return server.IsTrustedForwardingWithProxy(s.conn.Conn(), s.ProxyIP, s.xclientTrustedProxies())
 }
 
+// mayReplaceClientAddr reports whether XCLIENT ADDR and PORT may replace the client address
+// the connection established. XCLIENT itself is judged by the socket peer, as Dovecot's LMTP
+// does: an lmtp_proxy sends a PROXY header and XCLIENT on one connection, the XCLIENT for the
+// client's HELO. But behind a layer-4 load balancer the XCLIENT is the client's own, so it
+// replaces the address a PROXY header gave only when the header's source is itself in
+// trusted_networks (see server.ForwardingSourceIP). Without a PROXY header that source is
+// the socket peer, which the XCLIENT was already accepted from.
+func (s *LMTPSession) mayReplaceClientAddr() bool {
+	ip := server.ForwardingSourceIP(s.conn.Conn())
+	for _, network := range s.backend.xclientTrustedNets {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // xclientTrustedProxies returns the CIDR blocks trusted to send XCLIENT/XRCPTFORWARD
 // source-IP overrides, using exactly the configured lists with no RFC1918 fallback.
 func (s *LMTPSession) xclientTrustedProxies() []string {
-	// With PROXY protocol enabled, honor the (possibly separate) proxy_protocol_trusted_proxies
-	// list, which itself falls back only to the configured trusted_networks — never to RFC1918.
+	// With PROXY protocol enabled, honor the PROXY reader's trust list: the
+	// ProxyProtocolTrustedProxies option, which no config key sets and which falls back
+	// only to the configured trusted_networks — never to RFC1918.
 	if s.backend.proxyReader != nil {
 		return s.backend.proxyReader.GetTrustedProxies()
 	}

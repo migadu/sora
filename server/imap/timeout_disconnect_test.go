@@ -3,7 +3,9 @@ package imap
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -226,10 +228,11 @@ func TestSlowThroughputTimeoutInfo(t *testing.T) {
 	t.Log("  (Full integration test would require >2 minutes to execute)")
 }
 
-// TestAuthIdleTimeoutDuringPreAuth verifies that auth_idle_timeout disconnects during pre-auth phase
-// Note: auth_idle_timeout uses SetReadDeadline() which closes the connection without sending BYE.
-// This is acceptable because: (1) default is 0 (disabled), (2) meant for aggressive cleanup,
-// (3) post-auth timeouts via SoraConn properly send BYE messages.
+// TestAuthIdleTimeoutDuringPreAuth verifies that an auth_idle_timeout shorter
+// than command_timeout is what closes an idle unauthenticated connection.
+// go-imap applies it as its read timeout before authentication and closes the
+// connection without a BYE; SoraConn's command_timeout checker, which sends
+// BYE first, would only fire after 10 seconds.
 func TestAuthIdleTimeoutDuringPreAuth(t *testing.T) {
 	// Skip in short mode
 	if testing.Short() {
@@ -297,14 +300,11 @@ func TestAuthIdleTimeoutDuringPreAuth(t *testing.T) {
 	// Auth idle timeout should trigger (2 seconds + buffer)
 	time.Sleep(3 * time.Second)
 
-	// Try to read - should get connection closed or timeout error
+	// The server must have closed the connection: a client-side read timeout
+	// means it is still open, and a BYE means command_timeout closed it.
 	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-	_, err = reader.ReadString('\n')
-
-	// We expect either EOF (connection closed) or timeout
-	if err == nil {
-		t.Error("Expected connection to be closed after auth idle timeout, but read succeeded")
-	} else {
-		t.Logf("✓ Connection closed during pre-auth idle as expected: %v", err)
+	line, err := reader.ReadString('\n')
+	if line != "" || !errors.Is(err, io.EOF) {
+		t.Fatalf("idle unauthenticated connection with auth_idle_timeout = 2s: read %q, %v; want the server to have closed it without a BYE", line, err)
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/sqlitefile"
 	_ "modernc.org/sqlite"
 )
 
@@ -96,6 +97,7 @@ func isCorruptionError(err error) bool {
 
 // openAndValidate opens a SQLite database, sets pragmas, and creates the schema.
 func openAndValidate(dbPath string) (*sql.DB, error) {
+	dsn := dbPath
 	if dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") {
 		// Ensure the database file has 0600 permissions.
 		// If the file does not exist, pre-create it with 0600 permissions.
@@ -108,9 +110,13 @@ func openAndValidate(dbPath string) (*sql.DB, error) {
 		if err := os.Chmod(dbPath, 0600); err != nil {
 			return nil, fmt.Errorf("failed to enforce 0600 permissions on database file: %w", err)
 		}
+		// Open that same file: a plain path would be cut at its first '?'.
+		if dsn, err = sqlitefile.DSN(dbPath, ""); err != nil {
+			return nil, err
+		}
 	}
 
-	sqliteDB, err := sql.Open("sqlite", dbPath)
+	sqliteDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open: %w", err)
 	}

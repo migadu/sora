@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -42,7 +43,7 @@ func handleStatsCommand(ctx context.Context) {
 func handleBlockedCommand(ctx context.Context) {
 	// Parse blocked specific flags
 	fs := flag.NewFlagSet("stats blocked", flag.ExitOnError)
-	protocol := fs.String("protocol", "", "Filter by protocol (imap, pop3, managesieve, imap_proxy, pop3_proxy, managesieve_proxy, userapi)")
+	protocol := fs.String("protocol", "", "Filter by protocol (imap, pop3, managesieve, imap_proxy, pop3_proxy, managesieve_proxy, userapi, userapi_proxy)")
 
 	fs.Usage = func() {
 		fmt.Printf(`Show blocked IPs and rate-limited addresses
@@ -55,9 +56,8 @@ Options:
   --protocol string   Filter by protocol (optional)
 
 Protocols:
-  imap, pop3, managesieve          Backend servers
-  imap_proxy, pop3_proxy           Proxy servers
-  managesieve_proxy, userapi       Other services
+  Backend servers: imap, pop3, managesieve, userapi
+  Proxy servers:   imap_proxy, pop3_proxy, managesieve_proxy, userapi_proxy
 
 Examples:
   sora-admin stats blocked --config config.toml
@@ -273,15 +273,16 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail string,
 	}
 
 	// Build URL based on whether user email is specified
-	var url string
+	var endpoint string
 	if userEmail != "" {
-		url = fmt.Sprintf("%s/admin/connections/user/%s", cfg.HTTPAPIAddr, userEmail)
+		// One path segment: a "/" in the local part goes as %2F (RFC 3986 §2.2).
+		endpoint = fmt.Sprintf("%s/admin/connections/user/%s", cfg.HTTPAPIAddr, url.PathEscape(userEmail))
 	} else {
-		url = fmt.Sprintf("%s/admin/connections/stats", cfg.HTTPAPIAddr)
+		endpoint = fmt.Sprintf("%s/admin/connections/stats", cfg.HTTPAPIAddr)
 	}
 
 	// Create request
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -313,6 +314,7 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail string,
 			Email       string `json:"email"`
 			Connections []struct {
 				Protocol   string    `json:"protocol"`
+				Instance   string    `json:"instance"` // tracker key
 				AccountID  int64     `json:"account_id"`
 				Email      string    `json:"email"`
 				LocalCount int       `json:"local_count"`
@@ -339,27 +341,52 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail string,
 
 		fmt.Printf("Active Connections for User: %s\n", userEmail)
 		fmt.Printf("==========================================\n\n")
-		fmt.Printf("Total connections: %d\n\n", result.Count)
-
-		// Group by protocol
-		protocolCounts := make(map[string]int)
-		for _, conn := range result.Connections {
-			protocolCounts[conn.Protocol] += conn.TotalCount
+		// Group by protocol. result.Count is the number of entries (one per tracker that
+		// knows the account), not of connections. An entry's total is its tracker's own
+		// sessions plus those other nodes report for the protocol, so the sessions on
+		// other nodes are in every entry for that account and protocol: count them
+		// once. An address reused by another account can still match the old account's
+		// open sessions, so remote counts of different account IDs stay separate.
+		type protocolCount struct{ local, remote int }
+		type accountProtocol struct {
+			accountID int64
+			protocol  string
 		}
+		counts := make(map[accountProtocol]protocolCount)
+		for _, conn := range result.Connections {
+			key := accountProtocol{conn.AccountID, conn.Protocol}
+			c := counts[key]
+			c.local += conn.LocalCount
+			c.remote = max(c.remote, conn.TotalCount-conn.LocalCount)
+			counts[key] = c
+		}
+		protocolCounts := make(map[string]int)
+		for key, c := range counts {
+			protocolCounts[key.protocol] += c.local + c.remote
+		}
+		protocols := make([]string, 0, len(protocolCounts))
+		total := 0
+		for protocol, c := range protocolCounts {
+			protocols = append(protocols, protocol)
+			total += c
+		}
+		sort.Strings(protocols)
+		fmt.Printf("Total connections: %d\n\n", total)
 
 		fmt.Println("By Protocol:")
-		for protocol, count := range protocolCounts {
-			fmt.Printf("  %-12s %d\n", protocol+":", count)
+		for _, protocol := range protocols {
+			fmt.Printf("  %-12s %d\n", protocol+":", protocolCounts[protocol])
 		}
 		fmt.Println()
 
 		if showDetail {
 			fmt.Println("Details:")
-			fmt.Printf("%-12s %-12s %-12s %-20s\n", "Protocol", "Local", "Total", "Last Update")
-			fmt.Printf("%-12s %-12s %-12s %-20s\n", "--------", "-----", "-----", "-----------")
+			fmt.Printf("%-12s %-30s %-12s %-12s %-20s\n", "Protocol", "Instance", "Local", "Total", "Last Update")
+			fmt.Printf("%-12s %-30s %-12s %-12s %-20s\n", "--------", "--------", "-----", "-----", "-----------")
 			for _, conn := range result.Connections {
-				fmt.Printf("%-12s %-12d %-12d %-20s\n",
+				fmt.Printf("%-12s %-30s %-12d %-12d %-20s\n",
 					conn.Protocol,
+					trackerInstance(conn.Instance),
 					conn.LocalCount,
 					conn.TotalCount,
 					conn.LastUpdate.Format("2006-01-02 15:04:05"))

@@ -20,6 +20,12 @@ import (
 var _ imapserver.SessionThread = (*IMAPSession)(nil)
 
 func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, algorithm imap.ThreadAlgorithm, charset string, criteria *imap.SearchCriteria) ([]imap.ThreadData, error) {
+	// RFC 5256 §1: a server offers each threading algorithm as a capability
+	// "consisting of "THREAD=" followed by a supported threading algorithm name".
+	if err := s.requireCapability(imap.Cap("THREAD="+string(algorithm)), "THREAD "+string(algorithm)); err != nil {
+		return nil, err
+	}
+
 	// Reject pathologically complex/deep criteria before building a query.
 	if err := s.validateSearchCriteria("THREAD", criteria); err != nil {
 		return nil, err
@@ -108,6 +114,8 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 func (s *IMAPSession) threadOrderedSubject(numKind imapserver.NumKind, messages []db.ThreadMessageResult) []imap.ThreadData {
 	// 1. Sort messages by subject, then by sent date, then by mailbox order. UID
 	// order is sequence order, and UID is always set; Seq is 0 for UID THREAD.
+	// SubjectSort arrives in i;unicode-casemap form, so comparing its octets is
+	// that collation (RFC 5256 §7, RFC 5051 §2).
 	sort.Slice(messages, func(i, j int) bool {
 		if messages[i].SubjectSort != messages[j].SubjectSort {
 			return messages[i].SubjectSort < messages[j].SubjectSort

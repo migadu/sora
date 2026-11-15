@@ -1,30 +1,45 @@
 package userapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
-	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 )
 
-// MailboxInfo represents mailbox information for API responses
+// MailboxInfo represents mailbox information for API responses. Total, Unseen,
+// UIDNext and UIDValidity are what IMAP STATUS reports as MESSAGES, UNSEEN, UIDNEXT
+// and UIDVALIDITY; all four are 0 for a mailbox the user may list but not read.
 type MailboxInfo struct {
-	Name       string `json:"name"`
-	Path       string `json:"path"`
-	Subscribed bool   `json:"subscribed"`
-	Total      int    `json:"total"`
-	Unseen     int    `json:"unseen"`
-	UIDNext    int64  `json:"uid_next"`
+	Name        string `json:"name"`
+	Path        string `json:"path"`
+	Subscribed  bool   `json:"subscribed"`
+	Total       int    `json:"total"`
+	Unseen      int    `json:"unseen"`
+	UIDNext     int64  `json:"uid_next"`
+	UIDValidity uint32 `json:"uid_validity"`
 }
 
 // CreateMailboxRequest represents the request to create a new mailbox
 type CreateMailboxRequest struct {
 	Name string `json:"name"`
+}
+
+// readFromWriter sends ctx's reads to the writer. The API is stateless, so a request
+// cannot tell whether the read pool has replayed what an earlier request wrote on
+// the writer, such as the default mailboxes its login created (handleLogin). A read
+// that finds no mailbox on the read pool asks the writer again before answering
+// none or 404, as POP3 and LMTP read from the writer once they have created them.
+func readFromWriter(ctx context.Context) context.Context {
+	return context.WithValue(ctx, consts.UseMasterDBKey, true)
 }
 
 // handleListMailboxes returns all mailboxes for the authenticated user
@@ -44,6 +59,14 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 	// subscriptions table (migration 000046), not the vestigial mailboxes.subscribed
 	// column, so we filter locally rather than pushing subscribedOnly into the query.
 	mailboxes, err := s.rdb.GetMailboxesForUserWithRetry(ctx, accountID, false)
+	if err == nil && !slices.ContainsFunc(mailboxes, func(mb *db.DBMailbox) bool {
+		return mb.AccountID == accountID && strings.EqualFold(mb.Name, "INBOX")
+	}) {
+		// The login made INBOX, which cannot be deleted; the read pool has not
+		// replayed it yet.
+		ctx = readFromWriter(ctx)
+		mailboxes, err = s.rdb.GetMailboxesForUserWithRetry(ctx, accountID, false)
+	}
 	if err != nil {
 		logger.Warn("HTTP Mail API: Error retrieving mailboxes", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve mailboxes")
@@ -61,34 +84,56 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 		subscribedSet[strings.ToLower(n)] = true
 	}
 
-	// Convert to API response format with counts
-	mailboxInfos := make([]MailboxInfo, 0, len(mailboxes))
+	listed := make([]*db.DBMailbox, 0, len(mailboxes))
 	for _, mb := range mailboxes {
-		isSubscribed := subscribedSet[strings.ToLower(mb.Name)]
-		if subscribedOnly && !isSubscribed {
-			continue
+		if !subscribedOnly || subscribedSet[strings.ToLower(mb.Name)] {
+			listed = append(listed, mb)
 		}
-		// Get message counts
-		total, err := s.rdb.GetMessageCountForMailboxWithRetry(ctx, accountID, mb.Name)
-		if err != nil {
-			logger.Warn("HTTP Mail API: Error getting message count", "name", s.name, "mailbox", mb.Name, "error", err)
-			total = 0 // Continue with zero count on error
-		}
+	}
 
-		unseen, err := s.rdb.GetUnseenCountForMailboxWithRetry(ctx, accountID, mb.Name)
-		if err != nil {
-			logger.Warn("HTTP Mail API: Error getting unseen count", "name", s.name, "mailbox", mb.Name, "error", err)
-			unseen = 0 // Continue with zero count on error
-		}
+	// UIDNEXT and counts for every listed mailbox in one query, as IMAP STATUS
+	// reports them. Reuse these counts rather than scanning each mailbox twice.
+	ids := make([]int64, len(listed))
+	for i, mb := range listed {
+		ids[i] = mb.ID
+	}
+	summaries, err := s.rdb.GetMailboxSummariesBatchWithRetry(ctx, ids)
+	if err != nil {
+		// Continue with zero counts and uid_next on error.
+		logger.Warn("HTTP Mail API: Error getting mailbox summaries", "name", s.name, "error", err)
+	}
 
-		mailboxInfos = append(mailboxInfos, MailboxInfo{
+	// Convert to API response format with counts
+	mailboxInfos := make([]MailboxInfo, 0, len(listed))
+	for _, mb := range listed {
+		info := MailboxInfo{
 			Name:       mb.Name,
 			Path:       mb.Name, // Same as name for now
-			Subscribed: isSubscribed,
-			Total:      total,
-			Unseen:     unseen,
-			UIDNext:    0, // Will be populated when needed
-		})
+			Subscribed: subscribedSet[strings.ToLower(mb.Name)],
+		}
+
+		// RFC 4314 §4: STATUS needs the "r" right. A shared mailbox listed with only "l"
+		// (lookup) shows its name and nothing about its contents, as in IMAP LIST-STATUS.
+		readable := mb.AccountID == accountID
+		if !readable {
+			readable, err = s.rdb.CheckMailboxPermissionWithRetry(ctx, mb.ID, accountID, db.ACLRightRead)
+			if err != nil {
+				logger.Warn("HTTP Mail API: Error checking read right", "name", s.name, "mailbox", mb.Name, "error", err)
+				readable = false
+			}
+		}
+		if !readable {
+			mailboxInfos = append(mailboxInfos, info)
+			continue
+		}
+
+		info.UIDValidity = mb.UIDValidity
+		if summary, ok := summaries[mb.ID]; ok {
+			info.Total = summary.NumMessages
+			info.Unseen = summary.UnseenCount
+			info.UIDNext = summary.UIDNext
+		}
+		mailboxInfos = append(mailboxInfos, info)
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
@@ -124,7 +169,14 @@ func (s *Server) handleCreateMailbox(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	canonicalName := strings.TrimRight(req.Name, string(consts.MailboxDelimiter))
+	// As IMAP CREATE: a trailing delimiter is no part of the name, and a name with
+	// an empty, "." or ".." level ("x//y", "/lead") is refused, not created with a
+	// parent such as "x/" or "" on the way.
+	canonicalName, err := helpers.MailboxNameToCreate(req.Name)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
+		return
+	}
 
 	// Create mailbox
 	if err := s.rdb.CreateMailboxForUserWithRetry(ctx, accountID, canonicalName); err != nil {
@@ -158,8 +210,7 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract mailbox name from path: /user/mailboxes/{name}
-	name := extractPathParam(r.URL.Path, "/user/mailboxes/", "")
-	name, err = url.QueryUnescape(name)
+	name, err := pathName(r, "/user/mailboxes/", "")
 	if err != nil || name == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
 		return
@@ -179,6 +230,12 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, consts.ErrMailboxHasChildren) {
 			s.writeError(w, http.StatusConflict, "Mailbox has child mailboxes; delete them first")
+			return
+		}
+		// A shared mailbox without the 'x' right (RFC 4314 §2.1), which IMAP DELETE
+		// answers NO [NOPERM].
+		if errors.Is(err, consts.ErrNotPermitted) {
+			s.writeError(w, http.StatusForbidden, "Not permitted to delete this mailbox")
 			return
 		}
 		logger.Warn("HTTP Mail API: Error deleting mailbox", "name", s.name, "error", err)
@@ -203,8 +260,7 @@ func (s *Server) handleSubscribeMailbox(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Extract mailbox name from path: /user/mailboxes/{name}/subscribe
-	name := extractPathParam(r.URL.Path, "/user/mailboxes/", "/subscribe")
-	name, err = url.QueryUnescape(name)
+	name, err := pathName(r, "/user/mailboxes/", "/subscribe")
 	if err != nil || name == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
 		return
@@ -212,7 +268,7 @@ func (s *Server) handleSubscribeMailbox(w http.ResponseWriter, r *http.Request) 
 
 	// Subscribe to mailbox
 	if err := s.rdb.SubscribeToMailboxWithRetry(ctx, accountID, name); err != nil {
-		if errors.Is(err, consts.ErrDBNotFound) {
+		if errors.Is(err, consts.ErrMailboxNotFound) || errors.Is(err, consts.ErrDBNotFound) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
@@ -239,8 +295,7 @@ func (s *Server) handleUnsubscribeMailbox(w http.ResponseWriter, r *http.Request
 	}
 
 	// Extract mailbox name from path: /user/mailboxes/{name}/unsubscribe
-	name := extractPathParam(r.URL.Path, "/user/mailboxes/", "/unsubscribe")
-	name, err = url.QueryUnescape(name)
+	name, err := pathName(r, "/user/mailboxes/", "/unsubscribe")
 	if err != nil || name == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
 		return
@@ -248,7 +303,7 @@ func (s *Server) handleUnsubscribeMailbox(w http.ResponseWriter, r *http.Request
 
 	// Unsubscribe from mailbox
 	if err := s.rdb.UnsubscribeFromMailboxWithRetry(ctx, accountID, name); err != nil {
-		if errors.Is(err, consts.ErrDBNotFound) {
+		if errors.Is(err, consts.ErrMailboxNotFound) || errors.Is(err, consts.ErrDBNotFound) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}

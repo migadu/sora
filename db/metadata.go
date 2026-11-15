@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -23,25 +24,31 @@ const (
 type MetadataError struct {
 	Type    MetadataErrorType
 	Message string
+	MaxSize int // MetadataErrMaxSize: the largest value accepted, in octets
 }
 
 func (e *MetadataError) Error() string {
 	return e.Message
 }
 
-// ResponseCode returns the RFC 5464 METADATA response code for this error.
-func (e *MetadataError) ResponseCode() string {
+// ResponseCode returns the response code of the tagged NO for this error.
+// RFC 5464 §4.3 defines "[METADATA MAXSIZE NNN]", NNN being "the maximum
+// octet count that it is willing to accept", "[METADATA TOOMANY]" and
+// "[METADATA NOPRIVATE]". It has none for the account's total metadata size;
+// that is RFC 5530's OVERQUOTA: "The user would be over quota after the
+// operation."
+func (e *MetadataError) ResponseCode() imap.ResponseCode {
 	switch e.Type {
 	case MetadataErrMaxSize:
-		return "METADATA MAXSIZE"
+		return imap.MetadataMaxSizeResponseCode(uint32(min(int64(e.MaxSize), math.MaxUint32)))
 	case MetadataErrTooMany:
-		return "METADATA TOOMANY"
+		return imap.ResponseCodeMetadataTooMany
 	case MetadataErrQuotaExceeded:
-		return "METADATA TOOMANY" // Use TOOMANY for quota as well
+		return imap.ResponseCodeOverQuota
 	case MetadataErrNoPrivate:
-		return "METADATA NOPRIVATE"
+		return imap.ResponseCodeMetadataNoPrivate
 	default:
-		return "NO"
+		return imap.ResponseCodeLimit
 	}
 }
 
@@ -91,9 +98,12 @@ func (db *Database) GetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 			args = append(args, name)
 			argIdx++
 
-			// Immediate children (one level deeper, separated by /)
-			conditions = append(conditions, fmt.Sprintf("entry_name LIKE $%d AND entry_name NOT LIKE $%d", argIdx, argIdx+1))
-			args = append(args, name+"/%", name+"/%/%")
+			// Immediate children (one level deeper, separated by /). The name
+			// is escaped: "_" and "\" are valid in entry names (RFC 5464
+			// §3.2) and must match literally, not as LIKE metacharacters.
+			prefix := escapeLike(name + "/")
+			conditions = append(conditions, fmt.Sprintf(`entry_name LIKE $%d ESCAPE '\' AND entry_name NOT LIKE $%d ESCAPE '\'`, argIdx, argIdx+1))
+			args = append(args, prefix+"%", prefix+"%/%")
 			argIdx += 2
 		}
 
@@ -113,9 +123,9 @@ func (db *Database) GetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 		args = []any{accountID, mailboxID}
 
 		for _, name := range entryNames {
-			// Exact match or any descendant
-			conditions = append(conditions, fmt.Sprintf("(entry_name = $%d OR entry_name LIKE $%d)", argIdx, argIdx+1))
-			args = append(args, name, name+"/%")
+			// Exact match or any descendant, the name escaped as for DEPTH 1
+			conditions = append(conditions, fmt.Sprintf(`(entry_name = $%d OR entry_name LIKE $%d ESCAPE '\')`, argIdx, argIdx+1))
+			args = append(args, name, escapeLike(name+"/")+"%")
 			argIdx += 2
 		}
 
@@ -201,6 +211,7 @@ func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 					return &MetadataError{
 						Type:    MetadataErrMaxSize,
 						Message: fmt.Sprintf("metadata entry %q exceeds max size of %d bytes", entryName, limits.MaxEntrySize),
+						MaxSize: limits.MaxEntrySize,
 					}
 				}
 			}

@@ -200,7 +200,7 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, AccountID i
 	`, mailbox.AccountID, mailbox.Path).Scan(&mailbox.HasChildren)
 	if err != nil {
 		logger.Error("Database: failed to check for children of mailbox", "mailbox_id", mailboxID, "err", err)
-		return nil, consts.ErrInternalError
+		return nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 
 	return &mailbox, nil
@@ -256,6 +256,13 @@ var mailboxByNameSharedSQL = fmt.Sprintf(mailboxByNameSQL, `
 	LIMIT 1`
 
 func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name string) (*DBMailbox, error) {
+	// A name PostgreSQL cannot hold (a NUL, invalid UTF-8) names no mailbox. Querying
+	// with it fails with SQLSTATE 22021, which callers took for a database failure:
+	// a Sieve fileinto to such a name, which a script can take from a header value,
+	// was answered 451 on every attempt.
+	if !helpers.MailboxNameStorable(name) {
+		return nil, consts.ErrMailboxNotFound
+	}
 	start := time.Now()
 	var err error
 	defer func() {
@@ -299,7 +306,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 			return nil, consts.ErrMailboxNotFound
 		}
 		logger.Error("Database: failed to find mailbox", "name", name, "err", err)
-		return nil, consts.ErrInternalError
+		return nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 
 	mailbox.UIDValidity = uint32(uidValidityInt64)
@@ -314,7 +321,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 	`, accountID, mailbox.Path).Scan(&mailbox.HasChildren)
 	if err != nil {
 		logger.Error("Database: failed to check for children of mailbox", "name", name, "err", err)
-		return nil, consts.ErrInternalError
+		return nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 
 	return &mailbox, nil
@@ -342,17 +349,12 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 	// "INBOX" (RFC 3501 §5.1); other names keep their as-typed case.
 	name = helpers.CanonicalMailboxName(name)
 
-	// Validate mailbox name doesn't contain problematic characters
-	if strings.ContainsAny(name, "\t\r\n\x00") {
-		logger.Error("Database: attempted to create mailbox with invalid characters", "name", name, "account_id", AccountID)
-		return consts.ErrMailboxInvalidName
-	}
-
-	// Reject "." / ".." path segments: such names would let the maildir
-	// exporter escape its target directory (path traversal) when the hierarchy
-	// is materialised on disk.
-	if helpers.MailboxNameHasTraversal(name) {
-		logger.Error("Database: attempted to create mailbox with path traversal segment", "name", name, "account_id", AccountID)
+	// Refuse a name with a TAB, CR, LF or NUL, an empty level ("x//y", "/lead",
+	// "x/", "") or a "." / ".." level. The last would let the maildir exporter
+	// escape its target directory (path traversal) when the hierarchy is
+	// materialised on disk. Callers check first; this covers any later one.
+	if !helpers.MailboxNameValid(name) {
+		logger.Error("Database: attempted to create mailbox with an invalid name", "name", name, "account_id", AccountID)
 		return consts.ErrMailboxInvalidName
 	}
 
@@ -546,7 +548,7 @@ func (db *Database) SoftDeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID 
 			return fmt.Errorf("failed to check delete permission: %w", err)
 		}
 		if !hasDeleteRight {
-			return fmt.Errorf("permission denied: user does not have delete right on shared mailbox")
+			return fmt.Errorf("%w: no delete right on shared mailbox %d", consts.ErrNotPermitted, mailboxID)
 		}
 	}
 
@@ -732,7 +734,7 @@ func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID i
 	`, mailboxID, limitArg)
 	if err != nil {
 		logger.Error("Database: failed to set path and mark messages as expunged", "mailbox_id", mailboxID, "err", err)
-		return false, consts.ErrInternalError
+		return false, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 	if expunged.RowsAffected() > 0 {
 		// More may remain; the caller commits this step and comes back.
@@ -764,7 +766,7 @@ func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID i
 	`, mailboxID, limitArg)
 	if err != nil {
 		logger.Error("Database: failed to refresh mailbox path on expunged messages", "mailbox_id", mailboxID, "err", err)
-		return false, consts.ErrInternalError
+		return false, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 	if stamped.RowsAffected() > 0 {
 		return false, nil
@@ -786,7 +788,7 @@ func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID i
 	`, mailboxID, limitArg)
 	if err != nil {
 		logger.Error("Database: failed to detach message state from mailbox", "mailbox_id", mailboxID, "err", err)
-		return false, consts.ErrInternalError
+		return false, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 	if detachedState.RowsAffected() > 0 {
 		return false, nil
@@ -802,7 +804,7 @@ func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID i
 	`, mailboxID, limitArg)
 	if err != nil {
 		logger.Error("Database: failed to detach messages from mailbox", "mailbox_id", mailboxID, "err", err)
-		return false, consts.ErrInternalError
+		return false, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 	if detached.RowsAffected() > 0 {
 		return false, nil
@@ -814,7 +816,7 @@ func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID i
 	result, err := tx.Exec(ctx, `DELETE FROM mailboxes WHERE id = $1`, mailboxID)
 	if err != nil {
 		logger.Error("Database: failed to delete mailbox", "mailbox_id", mailboxID, "err", err)
-		return false, consts.ErrInternalError
+		return false, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 
 	rowsAffected := result.RowsAffected()
@@ -838,6 +840,28 @@ func (db *Database) HasMailboxWithSpecialUse(ctx context.Context, accountID int6
 		return false, fmt.Errorf("failed to check special-use uniqueness: %w", err)
 	}
 	return exists, nil
+}
+
+// GetPersonalMailboxNameBySpecialUse returns the name of the account's mailbox in
+// its personal namespace that carries the RFC 6154 special-use attribute attr, or
+// consts.ErrMailboxNotFound if there is none. A mailbox the account owns in the
+// shared namespace does not count: RFC 8579 §4 looks the attribute up "in the
+// user's personal namespace". An attribute marks at most one live mailbox of an
+// account (mailboxes_account_special_use_unique).
+func (db *Database) GetPersonalMailboxNameBySpecialUse(ctx context.Context, accountID int64, attr string) (string, error) {
+	var name string
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT name FROM mailboxes
+		WHERE account_id = $1 AND special_use = $2 AND deleted_at IS NULL
+		  AND NOT COALESCE(is_shared, FALSE)
+	`, accountID, attr).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", consts.ErrMailboxNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to look up the %s mailbox: %w", attr, err)
+	}
+	return name, nil
 }
 
 func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, AccountID int64) error {
@@ -1057,6 +1081,54 @@ func (d *Database) GetMailboxSummariesBatch(ctx context.Context, mailboxIDs []in
 	return result, nil
 }
 
+// CountDeletedMessages returns, per mailbox, how many of its messages that are
+// not expunged have the \Deleted flag set: the DELETED status data item (RFC
+// 9051 §6.3.11). A mailbox without any is left out of the map. mailbox_stats
+// keeps no such count, so this reads the mailboxes' message_state rows; STATUS
+// runs it only when a client asks for DELETED.
+func (d *Database) CountDeletedMessages(ctx context.Context, mailboxIDs []int64) (map[int64]uint32, error) {
+	if len(mailboxIDs) == 0 {
+		return map[int64]uint32{}, nil
+	}
+
+	start := time.Now()
+	var err error
+	defer func() {
+		status := "success"
+		if err != nil {
+			status = "error"
+		}
+		metrics.DBQueryDuration.WithLabelValues("mailbox_deleted_count", "read").Observe(time.Since(start).Seconds())
+		metrics.DBQueriesTotal.WithLabelValues("mailbox_deleted_count", status, "read").Inc()
+	}()
+
+	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, `
+		SELECT mst.mailbox_id, COUNT(*)
+		FROM message_state mst
+		JOIN messages m ON m.id = mst.message_id AND m.mailbox_id = mst.mailbox_id
+		WHERE mst.mailbox_id = ANY($1) AND (mst.flags & $2) <> 0 AND m.expunged_at IS NULL
+		GROUP BY mst.mailbox_id
+	`, mailboxIDs, FlagDeleted)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count deleted messages: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[int64]uint32, len(mailboxIDs))
+	for rows.Next() {
+		var mailboxID, count int64
+		if err = rows.Scan(&mailboxID, &count); err != nil {
+			return nil, fmt.Errorf("failed to scan deleted message count: %w", err)
+		}
+		result[mailboxID] = uint32(count)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating deleted message counts: %w", err)
+	}
+
+	return result, nil
+}
+
 // GetMailboxMessageCountAndSizeSum returns the count and total size of active messages in a mailbox.
 // Used by POP3 STAT. Reads from the mailbox_stats cache (O(1)) — consistent with IMAP STATUS, which
 // also serves counts from the cache (see GetMailboxSummary). The cache is kept accurate by the stats
@@ -1111,19 +1183,10 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailbox
 }
 
 func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64) error {
-	if newName == "" {
-		return consts.ErrMailboxInvalidName
-	}
-
-	// Validate mailbox name doesn't contain problematic characters
-	if strings.ContainsAny(newName, "\t\r\n\x00") {
-		logger.Error("Database: attempted to rename mailbox to name with invalid characters", "name", newName, "account_id", AccountID)
-		return consts.ErrMailboxInvalidName
-	}
-
-	// Reject "." / ".." path segments to prevent maildir-export path traversal.
-	if helpers.MailboxNameHasTraversal(newName) {
-		logger.Error("Database: attempted to rename mailbox to name with path traversal segment", "name", newName, "account_id", AccountID)
+	// The same names createMailbox refuses: control characters, empty levels and
+	// "." / ".." levels (maildir-export path traversal).
+	if !helpers.MailboxNameValid(newName) {
+		logger.Error("Database: attempted to rename mailbox to an invalid name", "name", newName, "account_id", AccountID)
 		return consts.ErrMailboxInvalidName
 	}
 
@@ -1173,7 +1236,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	} else if err != pgx.ErrNoRows {
 		// An actual error occurred during the check.
 		logger.Error("Database: failed to check for existing mailbox", "name", newName, "err", err)
-		return consts.ErrInternalError
+		return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 	// If err is pgx.ErrNoRows, we can proceed.
 
@@ -1188,7 +1251,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 			return consts.ErrMailboxNotFound
 		}
 		logger.Error("Database: failed to fetch and lock mailbox to rename", "mailbox_id", mailboxID, "err", err)
-		return consts.ErrInternalError
+		return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 
 	// Validate mailbox path is not empty (data corruption check)
@@ -1208,7 +1271,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	`, mailboxID).Scan(&ownerAccountID)
 	if err != nil {
 		logger.Error("Database: failed to get mailbox owner", "mailbox_id", mailboxID, "err", err)
-		return consts.ErrInternalError
+		return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 
 	err = tx.QueryRow(ctx, `
@@ -1216,7 +1279,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	`, ownerAccountID, oldPath).Scan(&hasChildren)
 	if err != nil {
 		logger.Error("Database: failed to check for children of mailbox", "mailbox_id", mailboxID, "err", err)
-		return consts.ErrInternalError
+		return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 
 	// Determine the path of the new parent.
@@ -1235,7 +1298,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 				return consts.ErrMailboxNotFound
 			}
 			logger.Error("Database: failed to fetch new parent path", "parent_id", *newParentID, "err", err)
-			return consts.ErrInternalError
+			return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 		}
 
 		// Also, a mailbox cannot be moved into one of its own children.
@@ -1273,7 +1336,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		`, ownerAccountID, oldPath, newPrefix, oldPrefix).Scan(&conflictCount)
 		if err != nil {
 			logger.Error("Database: failed to check for conflicting child names", "mailbox_id", mailboxID, "err", err)
-			return consts.ErrInternalError
+			return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 		}
 		if conflictCount > 0 {
 			logger.Error("Database: rename would create conflicting child names", "mailbox_id", mailboxID, "old_name", oldName, "new_name", newName, "conflicts", conflictCount)

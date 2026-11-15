@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"mime/quotedprintable"
 	"regexp"
@@ -134,9 +135,17 @@ func DecodeToBinary(part *message.Entity) (io.Reader, error) {
 	}
 }
 
+// HashContent returns the content hash of a message: the hex BLAKE3-256 digest that names
+// its S3 object and is stored as messages.content_hash.
 func HashContent(content []byte) string {
-	hash := blake3.Sum256(content)
-	return fmt.Sprintf("%x", hash)
+	sum := blake3.Sum256(content)
+	return fmt.Sprintf("%x", sum)
+}
+
+// NewContentHasher returns a streaming HashContent: the hex encoding of its Sum is
+// HashContent of the bytes written to it.
+func NewContentHasher() hash.Hash {
+	return blake3.New(32, nil)
 }
 
 // ValidateBodyStructure checks if a body structure is valid and returns an error for malformed structures.

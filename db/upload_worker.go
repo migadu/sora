@@ -491,7 +491,8 @@ func (db *Database) GetFailedUploads(ctx context.Context, maxAttempts int, limit
 	}
 	defer rows.Close()
 
-	var uploads []PendingUpload
+	// Never nil: an empty result is the JSON array [], not null.
+	uploads := []PendingUpload{}
 	for rows.Next() {
 		var u PendingUpload
 		if err := rows.Scan(&u.ID, &u.AccountID, &u.ContentHash, &u.Size, &u.InstanceID, &u.Attempts, &u.CreatedAt, &u.UpdatedAt, &u.LastAttempt); err != nil {

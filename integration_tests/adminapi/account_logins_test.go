@@ -26,6 +26,7 @@ import (
 type accountLoginsStack struct {
 	api      *HTTPAPITestServer
 	imapAddr string
+	tracker  *serverPkg.ConnectionTracker
 }
 
 func setupAccountLoginsStack(t *testing.T, opts ...func(*adminapi.ServerOptions)) *accountLoginsStack {
@@ -55,7 +56,7 @@ func setupAccountLoginsStack(t *testing.T, opts ...func(*adminapi.ServerOptions)
 	t.Cleanup(api.Close)
 	time.Sleep(100 * time.Millisecond)
 
-	return &accountLoginsStack{api: api, imapAddr: imapAddr}
+	return &accountLoginsStack{api: api, imapAddr: imapAddr, tracker: tracker}
 }
 
 // startAdminAPI starts the Admin API on rdb; opts adjust its options before it starts.
@@ -66,7 +67,7 @@ func startAdminAPI(t *testing.T, rdb *resilient.ResilientDatabase, trackers map[
 		Addr:               common.GetRandomAddress(t),
 		APIKey:             testAPIKey,
 		AllowedHosts:       []string{},
-		ConnectionTrackers: trackers,
+		ConnectionTrackers: func() map[string]*serverPkg.ConnectionTracker { return trackers },
 	}
 	for _, opt := range opts {
 		opt(&options)

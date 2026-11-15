@@ -111,8 +111,8 @@ func TestVacationUnicodeOwnerWithASCIIFromAlias(t *testing.T) {
 			if !received.utf8 {
 				t.Error("MAIL FROM did not negotiate SMTPUTF8 for the Unicode attribution header")
 			}
-			if received.from != alias || received.to != sender {
-				t.Errorf("reply envelope = %q -> %q, want %q -> %q", received.from, received.to, alias, sender)
+			if received.from != "" || received.to != sender {
+				t.Errorf("reply envelope = %q -> %q, want <> -> %q", received.from, received.to, sender)
 			}
 			entity, err := message.Read(bytes.NewReader(received.body))
 			if err != nil {
