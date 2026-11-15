@@ -2413,39 +2413,44 @@ func TestACLManagementOneEntryPerAccount(t *testing.T) {
 // TestACLGrantAnyoneFollowsAllowAnyoneIdentifier covers the Admin API half of issue
 // #159: with [shared_mailboxes] allow_anyone_identifier false (its default), granting
 // to "anyone" is refused (400), as it is over IMAP; a user can still be granted.
+// The mailbox is shared by a server with sharing on, and the refusal holds also when
+// the Admin API's own config has sharing off (#350).
 func TestACLGrantAnyoneFollowsAllowAnyoneIdentifier(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	for _, allowed := range []bool{false, true} {
-		t.Run(fmt.Sprintf("allow_anyone_identifier=%t", allowed), func(t *testing.T) {
-			shared := config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/", AllowAnyoneIdentifier: allowed}
-			server := setupHTTPAPIServer(t, func(o *adminapi.ServerOptions) { o.SharedMailboxes = shared })
-			defer server.Close()
+	for _, enabled := range []bool{true, false} {
+		for _, allowed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("enabled=%t/allow_anyone_identifier=%t", enabled, allowed), func(t *testing.T) {
+				shared := config.SharedMailboxesConfig{Enabled: enabled, NamespacePrefix: "Shared/", AllowAnyoneIdentifier: allowed}
+				server := setupHTTPAPIServer(t, func(o *adminapi.ServerOptions) { o.SharedMailboxes = shared })
+				defer server.Close()
 
-			owner := common.CreateTestAccount(t, server.rdb)
-			member := common.CreateTestAccount(t, server.rdb)
-			ctx := context.WithValue(context.Background(), consts.ConfigContextKey, &config.Config{SharedMailboxes: shared})
-			ownerID, err := server.rdb.GetAccountIDByAddressWithRetry(ctx, owner.Email)
-			if err != nil {
-				t.Fatalf("Failed to resolve owner: %v", err)
-			}
-			mailbox := fmt.Sprintf("Shared/Anyone-%d", time.Now().UnixNano())
-			if err := server.rdb.CreateMailboxWithRetry(ctx, ownerID, mailbox, nil); err != nil {
-				t.Fatalf("Failed to create mailbox: %v", err)
-			}
-
-			want := http.StatusBadRequest
-			if allowed {
-				want = http.StatusOK
-			}
-			for identifier, status := range map[string]int{"anyone": want, member.Email: http.StatusOK} {
-				resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/grant",
-					map[string]any{"owner": owner.Email, "mailbox": mailbox, "identifier": identifier, "rights": "lr"})
-				if resp.StatusCode != status {
-					t.Errorf("grant to %s: got %d %s, want %d", identifier, resp.StatusCode, strings.TrimSpace(string(body)), status)
+				owner := common.CreateTestAccount(t, server.rdb)
+				member := common.CreateTestAccount(t, server.rdb)
+				creator := config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/"}
+				ctx := context.WithValue(context.Background(), consts.ConfigContextKey, &config.Config{SharedMailboxes: creator})
+				ownerID, err := server.rdb.GetAccountIDByAddressWithRetry(ctx, owner.Email)
+				if err != nil {
+					t.Fatalf("Failed to resolve owner: %v", err)
 				}
-			}
-		})
+				mailbox := fmt.Sprintf("Shared/Anyone-%d", time.Now().UnixNano())
+				if err := server.rdb.CreateMailboxWithRetry(ctx, ownerID, mailbox, nil); err != nil {
+					t.Fatalf("Failed to create mailbox: %v", err)
+				}
+
+				want := http.StatusBadRequest
+				if allowed {
+					want = http.StatusOK
+				}
+				for identifier, status := range map[string]int{"anyone": want, member.Email: http.StatusOK} {
+					resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/grant",
+						map[string]any{"owner": owner.Email, "mailbox": mailbox, "identifier": identifier, "rights": "lr"})
+					if resp.StatusCode != status {
+						t.Errorf("grant to %s: got %d %s, want %d", identifier, resp.StatusCode, strings.TrimSpace(string(body)), status)
+					}
+				}
+			})
+		}
 	}
 }
 

@@ -5,13 +5,14 @@ import (
 	"strings"
 )
 
-// FallbackInstanceID is the identity used when this node has no configured node_id and
-// the operating system will not tell us our hostname. It is a fixed string on purpose:
-// a random id would be unique but would change on every restart, and a restart under a
-// new id abandons every pending upload the previous run queued (they are leased only by
-// their creating instance). A stable wrong-ish name keeps a single node self-consistent
-// across restarts; it only collides if several hostname-less nodes share a database,
-// which is why resolving to it is logged as a warning at startup.
+// FallbackInstanceID is the identity used when this node has no configured
+// uploader.instance_id and the operating system will not tell us our hostname. It is a
+// fixed string on purpose: a random id would be unique but would change on every
+// restart, and a restart under a new id abandons every pending upload the previous run
+// queued (they are leased only by their creating instance). A stable wrong-ish name
+// keeps a single node self-consistent across restarts; it only collides if several
+// hostname-less nodes share a database, which is why resolving to it is logged as a
+// warning at startup.
 const FallbackInstanceID = "sora-unknown-host"
 
 // FallbackMailHostname is the "by" host used when the operating system will not tell us
@@ -43,8 +44,8 @@ func (c Config) NodeIdentity() NodeIdentity {
 // of the Received header LMTP and the delivery API stamp on every message, the domain of
 // the Message-ID on vacation auto-replies, and the SMTP/IMAP/POP3 greeting.
 //
-// It is deliberately independent of cluster.node_id. node_id is a lease key whose only
-// requirement is uniqueness within the cluster, so operators reasonably set it to an
+// It is deliberately independent of cluster.node_id. node_id names this node on the gossip
+// bus and only needs to be unique within the cluster, so operators reasonably set it to an
 // internal label ("node-1"); publishing that label as a mail host stamps a name that does
 // not resolve into the trace headers of real mail, and mints vacation Message-IDs in a
 // non-existent domain - a spam signal on a reply the user did not choose to send.
@@ -95,12 +96,12 @@ func mailHostnameFrom(hostnameFn func() (string, error)) string {
 //
 // WARNING - changing the resolved value strands queued uploads. Rows already in
 // pending_uploads keep the old instance_id; no running instance will claim them, the old
-// id stops heartbeating, and once the messages pass uploader.cleanup_grace_period the
-// cleaner treats the owner as gone and deletes them. Before changing
-// uploader.instance_id (or a node's hostname while it is unset), drain the queue: stop
-// accepting mail, wait for pending_uploads to empty for the old id, and only then
-// restart under the new one. The cleanup worker warns about any leftover owner by name
-// (see cleaner.reportStrandedInstances).
+// id stops heartbeating, and once the messages pass cleanup.grace_period and the old id
+// has been silent for cleanup.instance_liveness_threshold, the cleaner treats the owner
+// as gone and deletes them. Before changing uploader.instance_id (or a node's hostname
+// while it is unset), drain the queue: stop accepting mail, wait for pending_uploads to
+// empty for the old id, and only then restart under the new one. The cleanup worker
+// warns about any leftover owner by name (see cleaner.reportStrandedInstances).
 func (c Config) InstanceID() string {
 	return ResolveInstanceID(c.Uploader.InstanceID)
 }

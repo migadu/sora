@@ -35,7 +35,7 @@ func TestIPUsernameSizeLimit(t *testing.T) {
 
 	// Verify we have exactly 5 entries
 	limiter.ipUsernameMu.RLock()
-	entriesCount := len(limiter.blockedIPUsernames)
+	entriesCount := len(limiter.ipUsernameFailureCounts)
 	limiter.ipUsernameMu.RUnlock()
 
 	if entriesCount != 5 {
@@ -49,11 +49,11 @@ func TestIPUsernameSizeLimit(t *testing.T) {
 
 	// Still should have 5 entries
 	limiter.ipUsernameMu.RLock()
-	entriesCount = len(limiter.blockedIPUsernames)
+	entriesCount = len(limiter.ipUsernameFailureCounts)
 	user1Key := "192.168.1.100|user1@example.com"
 	user6Key := "192.168.1.100|user6@example.com"
-	_, user1Exists := limiter.blockedIPUsernames[user1Key]
-	_, user6Exists := limiter.blockedIPUsernames[user6Key]
+	_, user1Exists := limiter.ipUsernameFailureCounts[user1Key]
+	_, user6Exists := limiter.ipUsernameFailureCounts[user6Key]
 	limiter.ipUsernameMu.RUnlock()
 
 	if entriesCount != 5 {
@@ -72,7 +72,7 @@ func TestIPUsernameSizeLimit(t *testing.T) {
 	limiter.ipUsernameMu.RLock()
 	for i := 2; i <= 5; i++ {
 		key := fmt.Sprintf("192.168.1.100|user%d@example.com", i)
-		if _, exists := limiter.blockedIPUsernames[key]; !exists {
+		if _, exists := limiter.ipUsernameFailureCounts[key]; !exists {
 			t.Errorf("user%d should still exist", i)
 		}
 	}
@@ -240,7 +240,7 @@ func TestSizeLimitDisabled(t *testing.T) {
 
 	// Verify we have all 100 entries
 	limiter.ipUsernameMu.RLock()
-	entriesCount := len(limiter.blockedIPUsernames)
+	entriesCount := len(limiter.ipUsernameFailureCounts)
 	limiter.ipUsernameMu.RUnlock()
 
 	if entriesCount != 100 {
@@ -272,21 +272,10 @@ func TestEvictionOrderByFirstFailure(t *testing.T) {
 		time.Now().Add(-1 * time.Minute),  // newest
 	}
 
-	// Manually create entries with specific FirstFailure times
-	limiter.ipUsernameMu.Lock()
-	for i, t := range times {
-		username := fmt.Sprintf("user%d@example.com", i+1)
-		key := fmt.Sprintf("192.168.1.100|%s", username)
-		limiter.blockedIPUsernames[key] = &BlockedIPUsernameInfo{
-			FailureCount: 1,
-			FirstFailure: t,
-			LastFailure:  t,
-			Protocol:     "test",
-			IP:           "192.168.1.100",
-			Username:     username,
-		}
+	// Record failures with these FirstFailure times, not in time order
+	for _, i := range []int{1, 0, 2} {
+		limiter.updateIPUsernameFailure("192.168.1.100", fmt.Sprintf("user%d@example.com", i+1), times[i])
 	}
-	limiter.ipUsernameMu.Unlock()
 
 	// Add 4th entry - should evict user1 (oldest FirstFailure)
 	time.Sleep(10 * time.Millisecond)
@@ -294,11 +283,11 @@ func TestEvictionOrderByFirstFailure(t *testing.T) {
 
 	// Verify user1 was evicted, others remain
 	limiter.ipUsernameMu.RLock()
-	_, user1Exists := limiter.blockedIPUsernames["192.168.1.100|user1@example.com"]
-	_, user2Exists := limiter.blockedIPUsernames["192.168.1.100|user2@example.com"]
-	_, user3Exists := limiter.blockedIPUsernames["192.168.1.100|user3@example.com"]
-	_, user4Exists := limiter.blockedIPUsernames["192.168.1.100|user4@example.com"]
-	entriesCount := len(limiter.blockedIPUsernames)
+	_, user1Exists := limiter.ipUsernameFailureCounts["192.168.1.100|user1@example.com"]
+	_, user2Exists := limiter.ipUsernameFailureCounts["192.168.1.100|user2@example.com"]
+	_, user3Exists := limiter.ipUsernameFailureCounts["192.168.1.100|user3@example.com"]
+	_, user4Exists := limiter.ipUsernameFailureCounts["192.168.1.100|user4@example.com"]
+	entriesCount := len(limiter.ipUsernameFailureCounts)
 	limiter.ipUsernameMu.RUnlock()
 
 	if entriesCount != 3 {

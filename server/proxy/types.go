@@ -54,6 +54,13 @@ var (
 	// ErrRemoteLookupTransient.
 	ErrRemoteLookupInvalidResponse = errors.New("remotelookup invalid response")
 
+	// ErrRemoteLookupRefused is returned by a routing lookup (ConnectionManager.LookupUserRoute)
+	// that the lookup service answered 401/403: it refused the account. Unlike a 404 the
+	// account is not "unknown here", so there is no fallback to the local database
+	// (lookup_local_users), and named-pool routing refuses to use the default pool.
+	// Unlike an outage it is a verdict. Not wrapped in ErrRemoteLookupTransient.
+	ErrRemoteLookupRefused = errors.New("remotelookup refused the account")
+
 	// ErrUnknownPool is returned when a route names a pool this proxy does not have:
 	// a lookup answer for a pool the proxy's config lacks (rollout skew, a typo in
 	// the API). The connection fails; it is never spilled into another pool.
@@ -256,13 +263,19 @@ func normalizeHostPort(addr string, defaultPort int) string {
 	if addr == "" {
 		return ""
 	}
-	// A complete IPv6 literal has no port, even when its last group is decimal.
-	// Trying the unbracketed host:port heuristic first silently changes the host.
-	if net.ParseIP(addr) != nil {
+	// A complete IPv6 literal (bare or bracketed without a port) has no port,
+	// even when its last group is decimal. Trying the unbracketed host:port
+	// heuristic first silently changes the host.
+	bare := addr
+	if strings.HasPrefix(addr, "[") && strings.HasSuffix(addr, "]") {
+		bare = addr[1 : len(addr)-1]
+	}
+	if ip := net.ParseIP(bare); ip != nil {
+		canonical := ip.String()
 		if defaultPort > 0 {
-			return net.JoinHostPort(addr, strconv.Itoa(defaultPort))
+			return net.JoinHostPort(canonical, strconv.Itoa(defaultPort))
 		}
-		return addr
+		return canonical
 	}
 
 	// net.SplitHostPort is the robust way to do this, as it correctly
@@ -296,10 +309,10 @@ func normalizeHostPort(addr string, defaultPort int) string {
 			portPart := addr[lastColon+1:]
 
 			// Check if the parts look like a valid IP and port.
-			if net.ParseIP(hostPart) != nil {
-				if _, pErr := strconv.Atoi(portPart); pErr == nil {
-					// This looks like a valid but malformed IPv6:port. Fix it.
-					fixedAddr := net.JoinHostPort(hostPart, portPart)
+			if ip := net.ParseIP(hostPart); ip != nil {
+				if portNum, pErr := strconv.Atoi(portPart); pErr == nil {
+					// This looks like a valid but malformed IPv6:port. Fix and canonicalize it.
+					fixedAddr := net.JoinHostPort(ip.String(), strconv.Itoa(portNum))
 					logger.Debug("Proxy: Corrected malformed IPv6 address", "original", addr, "corrected", fixedAddr)
 					return fixedAddr
 				}

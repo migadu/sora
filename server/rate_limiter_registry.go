@@ -44,7 +44,7 @@ func GetAllBlockedEntries() []BlockedEntry {
 		entries := limiter.GetBlockedEntries()
 		allEntries = append(allEntries, entries...)
 	}
-	return allEntries
+	return deduplicateBlockedEntries(allEntries)
 }
 
 // GetBlockedEntriesByProtocol returns blocked entries for a specific protocol
@@ -60,5 +60,51 @@ func GetBlockedEntriesByProtocol(protocol string) []BlockedEntry {
 			allEntries = append(allEntries, entries...)
 		}
 	}
-	return allEntries
+	return deduplicateBlockedEntries(allEntries)
+}
+
+type blockedIPKey struct {
+	protocol string
+	ip       string
+}
+
+func mergeBlockedIPEntry(existing, candidate BlockedEntry) BlockedEntry {
+	if candidate.BlockedUntil.After(existing.BlockedUntil) {
+		existing.BlockedUntil = candidate.BlockedUntil
+	}
+	if candidate.FailureCount > existing.FailureCount {
+		existing.FailureCount = candidate.FailureCount
+	}
+	if !candidate.FirstFailure.IsZero() && (existing.FirstFailure.IsZero() || candidate.FirstFailure.Before(existing.FirstFailure)) {
+		existing.FirstFailure = candidate.FirstFailure
+	}
+	if candidate.LastFailure.After(existing.LastFailure) {
+		existing.LastFailure = candidate.LastFailure
+	}
+	return existing
+}
+
+// deduplicateBlockedEntries collapses shared Tier-2 IP blocks (Type == "ip")
+// replicated across multiple listeners of the same protocol on one node while
+// preserving distinct protocols and listener-local Tier-1 ("ip_username") entries.
+func deduplicateBlockedEntries(entries []BlockedEntry) []BlockedEntry {
+	if len(entries) == 0 {
+		return make([]BlockedEntry, 0)
+	}
+	result := make([]BlockedEntry, 0, len(entries))
+	ipIndex := make(map[blockedIPKey]int)
+	for _, entry := range entries {
+		if entry.Type != "ip" {
+			result = append(result, entry)
+			continue
+		}
+		key := blockedIPKey{protocol: entry.Protocol, ip: entry.IP}
+		if idx, exists := ipIndex[key]; exists {
+			result[idx] = mergeBlockedIPEntry(result[idx], entry)
+			continue
+		}
+		ipIndex[key] = len(result)
+		result = append(result, entry)
+	}
+	return result
 }

@@ -35,7 +35,6 @@ type DBMessage struct {
 	MessageID    string    `json:"message_id"`
 	InReplyTo    string    `json:"in_reply_to,omitempty"`
 	References   string    `json:"references,omitempty"`
-	Recipients   []string  `json:"recipients,omitempty"`
 	ContentHash  string    `json:"content_hash"`
 	S3Domain     string    `json:"-"`
 	AccountID    int64     `json:"-"` // owner of the row (the pending-upload key, with ContentHash)
@@ -52,8 +51,11 @@ type DBMessage struct {
 // setRecipients fills From, To, Cc and Bcc from recipients_json. It is stored as a
 // list of helpers.Recipient ({type, email, name}; db/append.go), the list IMAP FETCH
 // ENVELOPE reads too (db/fetch.go); list, search and get-by-ID all decode it here so
-// their recipient fields cannot drift apart.
+// their recipient fields cannot drift apart. To is never nil: unlike cc and bcc it
+// is not omitempty, and the API documents it as an array, so a message without a To
+// address sends [] rather than null.
 func (msg *DBMessage) setRecipients(recipientsJSON []byte) {
+	msg.To = []string{}
 	if len(recipientsJSON) == 0 {
 		return
 	}
@@ -127,6 +129,13 @@ func (db *Database) GetMessageCountForMailbox(ctx context.Context, accountID int
 	return count, nil
 }
 
+// userAPIUnseenCond keeps the messages without \Seen, for the statements that LEFT JOIN
+// message_state as ms. A message with no state row has no flags (every User API read
+// returns it with COALESCE(ms.flags, 0)), so it is unseen; a bare (ms.flags & \Seen) = 0
+// is NULL for it and would drop the message. The list, its unseen total and search's
+// unseen filter all use this one predicate, so they cannot disagree.
+var userAPIUnseenCond = fmt.Sprintf("(ms.flags IS NULL OR (ms.flags & %d) = 0)", FlagSeen)
+
 // GetUnseenCountForMailbox retrieves unseen message count
 func (db *Database) GetUnseenCountForMailbox(ctx context.Context, accountID int64, mailboxPath string) (int, error) {
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
@@ -141,12 +150,11 @@ func (db *Database) GetUnseenCountForMailbox(ctx context.Context, accountID int6
 	}
 
 	var count int
-	query := fmt.Sprintf(`
-		SELECT COUNT(*) 
+	query := `
+		SELECT COUNT(*)
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL AND (ms.flags & %d) = 0
-	`, FlagSeen)
+		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL AND ` + userAPIUnseenCond
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, query, mailbox.ID).Scan(&count)
 
 	if err != nil {
@@ -186,7 +194,7 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 	argPos := 2
 
 	if unseenOnly {
-		query += fmt.Sprintf(" AND (ms.flags & %d) = 0", FlagSeen)
+		query += " AND " + userAPIUnseenCond
 	}
 
 	query += " ORDER BY m.internal_date DESC"
@@ -208,7 +216,8 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 	}
 	defer rows.Close()
 
-	var messages []*DBMessage
+	// Never nil: an empty result is the JSON array [], not null.
+	messages := []*DBMessage{}
 	for rows.Next() {
 		msg := &DBMessage{}
 		var customFlagsJSON []byte
@@ -234,6 +243,7 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 		}
 
 		msg.setRecipients(recipientsJSON)
+		msg.MessageID = headerMessageID(msg.MessageID)
 
 		// Convert bitwise flags to string array
 		msg.Flags = bitwiseFlagsToStrings(flagsBitmask)
@@ -252,9 +262,20 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 // row past it so the caller can tell a result clipped at the cap from a complete one.
 const UserAPISearchLimit = 100
 
+// UserAPISearchFilter narrows a User API search. Each set field is ANDed with the query;
+// the zero value applies no filter.
+type UserAPISearchFilter struct {
+	// From is a case-insensitive substring of a From name or address, as IMAP SEARCH FROM.
+	From string
+	// Subject is a case-insensitive substring of the subject, as IMAP SEARCH SUBJECT.
+	Subject string
+	// UnseenOnly keeps only messages without \Seen.
+	UnseenOnly bool
+}
+
 // SearchMessagesInMailbox performs full-text search. It returns at most
 // UserAPISearchLimit messages, newest first, and whether more matches were left out.
-func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64, mailboxPath string, query string) ([]*DBMessage, bool, error) {
+func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64, mailboxPath string, query string, filter UserAPISearchFilter) ([]*DBMessage, bool, error) {
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
 		return nil, false, err
@@ -277,9 +298,9 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
 		-- Account-scoped in the JOIN ON clause, never in WHERE: this is a LEFT JOIN whose
 		-- FTS predicate sits inside an OR with header substring predicates, so a WHERE-side
-		-- account qual would drop every message that has no FTS row (bodies over 64KB are
-		-- never staged, empty bodies are skipped, retention prunes old rows) even when its
-		-- subject or sender matched.
+		-- account qual would drop every message that has no FTS row (empty bodies are
+		-- never staged, retention prunes old rows) even when its subject or sender
+		-- matched.
 		LEFT JOIN messages_fts_v2 mf
 		       ON mf.content_hash = m.content_hash AND mf.account_id = $4
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
@@ -293,18 +314,38 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 			-- The IS NOT NULL is required for the PARTIAL composite GIN to be usable.
 			OR (mf.text_body_tsv IS NOT NULL AND mf.text_body_tsv @@ plainto_tsquery('simple', $3))
 		)
+		__FILTER_COND__
 		ORDER BY m.internal_date DESC
 		LIMIT $5
 	`
 
+	args := []any{mailbox.ID, strings.ToLower(query), query, mailbox.AccountID, UserAPISearchLimit + 1}
+	// The filters are the IMAP SEARCH FROM, SUBJECT and UNSEEN predicates (search.go):
+	// strpos() on columns idx_messages_mailbox_headers_v2 carries, and an inline
+	// \Seen bit test. Absent state is zero flags, as in the returned metadata.
+	filterCond := ""
+	if filter.From != "" {
+		args = append(args, strings.ToLower(filter.From))
+		filterCond += " AND " + addressHeaderCond("m.", "from", fmt.Sprintf("$%d", len(args)))
+	}
+	if filter.Subject != "" {
+		args = append(args, strings.ToLower(filter.Subject))
+		filterCond += " AND " + substringCond("LOWER(m.subject)", fmt.Sprintf("$%d", len(args)))
+	}
+	if filter.UnseenOnly {
+		filterCond += " AND " + userAPIUnseenCond
+	}
+
 	searchQuery = strings.Replace(searchQuery, "__HEADER_COND__", headerSubstringCond("m.", "$2"), 1)
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, searchQuery, mailbox.ID, strings.ToLower(query), query, mailbox.AccountID, UserAPISearchLimit+1)
+	searchQuery = strings.Replace(searchQuery, "__FILTER_COND__", filterCond, 1)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, searchQuery, args...)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to search messages: %w", err)
 	}
 	defer rows.Close()
 
-	var messages []*DBMessage
+	// Never nil: an empty result is the JSON array [], not null.
+	messages := []*DBMessage{}
 	for rows.Next() {
 		msg := &DBMessage{}
 		var customFlagsJSON []byte
@@ -327,6 +368,7 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 		}
 
 		msg.setRecipients(recipientsJSON)
+		msg.MessageID = headerMessageID(msg.MessageID)
 
 		msg.Flags = bitwiseFlagsToStrings(flagsBitmask)
 		msg.HasAttachments = hasAttachmentsFromKeywords(msg.CustomFlags)
@@ -499,6 +541,7 @@ func (db *Database) GetMessageByID(ctx context.Context, accountID int64, message
 	}
 
 	msg.setRecipients(recipientsJSON)
+	msg.MessageID = headerMessageID(msg.MessageID)
 
 	msg.Flags = bitwiseFlagsToStrings(flagsBitmask)
 	msg.HasAttachments = hasAttachmentsFromKeywords(msg.CustomFlags)
@@ -528,7 +571,8 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 		       m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 't'),
 		       m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 'w')
 		FROM messages m
-		WHERE m.id = $1 AND m.expunged_at IS NULL
+		JOIN mailboxes mb ON mb.id = m.mailbox_id
+		WHERE m.id = $1 AND m.expunged_at IS NULL AND mb.deleted_at IS NULL
 		  AND (m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 'r'))
 	`, messageID, accountID).Scan(&mailboxID, &ownerID, &maySeen, &mayDelete, &mayWrite)
 
@@ -570,8 +614,9 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 	err = tx.QueryRow(ctx, `
 		SELECT ms.flags, ms.custom_flags
 		FROM messages m
+		JOIN mailboxes mb ON mb.id = m.mailbox_id
 		JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL
+		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL AND mb.deleted_at IS NULL
 	`, messageID, ownerID).Scan(&currentFlags, &currentCustomFlags)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return consts.ErrDBNotFound
@@ -690,19 +735,20 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 
 // CreateMailboxForUser creates a new mailbox
 func (db *Database) CreateMailboxForUser(ctx context.Context, accountID int64, mailboxPath string) error {
+	// RFC 3501 §6.3.3: "Folder/Sub/" creates "Folder/Sub" ("the name created is
+	// without the trailing hierarchy delimiter"). A name with an empty, "." or ".."
+	// level is refused before any parent is created, so "x//y" never makes "x/".
+	mailboxPath, err := helpers.MailboxNameToCreate(mailboxPath)
+	if err != nil {
+		return err
+	}
+	delim := string(consts.MailboxDelimiter)
+
 	tx, err := db.GetWritePool().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback(context.Background())
-
-	// RFC 3501 §6.3.3: trim trailing hierarchy delimiters so "Folder/Sub/" creates
-	// "Folder/Sub" rather than storing a trailing separator.
-	delim := string(consts.MailboxDelimiter)
-	mailboxPath = strings.TrimRight(mailboxPath, delim)
-	if mailboxPath == "" {
-		return consts.ErrMailboxInvalidName
-	}
 
 	// Link the mailbox under its parent, creating any missing ancestor first, as IMAP
 	// CREATE and GetOrCreateMailboxByName do. Creating it with no parent (as this did)
@@ -746,6 +792,11 @@ func (db *Database) DeleteMailboxForUser(ctx context.Context, accountID int64, m
 		return errors.New("cannot delete INBOX")
 	}
 
+	// Pin pre-transaction mailbox resolution and shared-mailbox ACL checks to the
+	// writer so a lagging read replica cannot answer 404 or stale rights for a
+	// mailbox or grant written moments earlier (e.g. login default mailboxes or
+	// POST /user/mailboxes).
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
 		return err
@@ -771,6 +822,7 @@ func (db *Database) DeleteMailboxForUser(ctx context.Context, accountID int64, m
 
 // SubscribeToMailbox marks mailbox as subscribed
 func (db *Database) SubscribeToMailbox(ctx context.Context, accountID int64, mailboxPath string) error {
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
 		return err
@@ -792,6 +844,7 @@ func (db *Database) SubscribeToMailbox(ctx context.Context, accountID int64, mai
 
 // UnsubscribeFromMailbox marks mailbox as unsubscribed
 func (db *Database) UnsubscribeFromMailbox(ctx context.Context, accountID int64, mailboxPath string) error {
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
 		return err
@@ -825,7 +878,8 @@ func bitwiseFlagsToStrings(flags any) []string {
 		return []string{}
 	}
 
-	var result []string
+	// Never nil: a message without system flags sends "flags": [], not null.
+	result := []string{}
 	if bitwiseFlags&FlagSeen != 0 {
 		result = append(result, "\\Seen")
 	}

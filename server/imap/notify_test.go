@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/db"
 )
 
 func newTestWatch(items ...imap.NotifyItem) *notifyWatch {
@@ -212,6 +213,34 @@ func TestNotifyStatusOptions(t *testing.T) {
 	opts = notifyStatusOptions(flagChange, true)
 	if opts == nil || !opts.UIDValidity || !opts.HighestModSeq {
 		t.Errorf("FlagChange STATUS items with CONDSTORE wrong: %+v", opts)
+	}
+}
+
+// TestNotifyStatusDataHighestModSeq: a mailbox that has never held a message
+// has no mailbox_stats row, so its stats row carries highest_modseq 0. NOTIFY
+// must still report HIGHESTMODSEQ 1 for it, as STATUS, LIST-STATUS and SELECT
+// do: 0 is reserved for a mailbox without persistent mod-sequences (RFC 7162
+// section 7, status-att-val), and a client that sends it back as CHANGEDSINCE
+// or a QRESYNC parameter gets BAD (those take a mod-sequence-value, >= 1).
+func TestNotifyStatusDataHighestModSeq(t *testing.T) {
+	options := &imap.StatusOptions{NumMessages: true, UIDNext: true, UIDValidity: true, HighestModSeq: true}
+
+	empty := notifyStatusData("Empty", 42, db.MailboxStatsRow{MailboxID: 1}, options)
+	if empty.HighestModSeq != 1 {
+		t.Errorf("empty mailbox: HIGHESTMODSEQ = %d, want 1", empty.HighestModSeq)
+	}
+	if empty.NumMessages == nil || *empty.NumMessages != 0 || empty.UIDNext != 1 || empty.UIDValidity != 42 {
+		t.Errorf("empty mailbox: unexpected STATUS data %+v", empty)
+	}
+
+	busy := notifyStatusData("INBOX", 42, db.MailboxStatsRow{MailboxID: 2, HighestModSeq: 917, MessageCount: 3, HighestUID: 5}, options)
+	if busy.HighestModSeq != 917 {
+		t.Errorf("non-empty mailbox: HIGHESTMODSEQ = %d, want 917", busy.HighestModSeq)
+	}
+
+	noModSeq := notifyStatusData("Empty", 42, db.MailboxStatsRow{MailboxID: 1}, &imap.StatusOptions{NumMessages: true})
+	if noModSeq.HighestModSeq != 0 {
+		t.Errorf("HIGHESTMODSEQ not requested: got %d, want it omitted (0)", noModSeq.HighestModSeq)
 	}
 }
 

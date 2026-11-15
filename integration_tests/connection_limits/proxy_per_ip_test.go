@@ -123,14 +123,15 @@ func TestProxyRealClientIPLimiting(t *testing.T) {
 	if err != nil {
 		t.Logf("Second connection was rejected during PROXY header send: %v", err)
 	} else {
-		// Try to read banner - should fail because the connection was rejected
+		// Read the banner: the refusal is answered with a BYE greeting, so the
+		// PROXY peer can tell it from a dead backend (#703)
 		banner2 := make([]byte, 1024)
 		conn2.SetReadDeadline(time.Now().Add(2 * time.Second))
 		n2, err := conn2.Read(banner2)
-		if err != nil {
-			t.Logf("Second connection was rejected (no banner): %v", err)
+		if err != nil || !strings.HasPrefix(string(banner2[:n2]), "* BYE ") {
+			t.Errorf("second connection from the same real client IP behind a trusted PROXY peer: %q, %v; want max_connections_per_ip = 1 to refuse it with a BYE greeting", string(banner2[:n2]), err)
 		} else {
-			t.Errorf("second connection from the same real client IP behind a trusted PROXY peer was accepted, want max_connections_per_ip = 1 to refuse it; banner: %s", string(banner2[:n2]))
+			t.Logf("Second connection was refused: %s", strings.TrimSpace(string(banner2[:n2])))
 		}
 	}
 

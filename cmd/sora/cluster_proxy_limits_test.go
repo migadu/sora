@@ -104,7 +104,7 @@ func startLimitsTestProxy(t *testing.T, mgr *cluster.Manager, serverCfg config.S
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errChan := make(chan error, 1)
-	go startDynamicIMAPProxyServer(ctx, deps, serverCfg, errChan)
+	deps.serverManager.Go(func() { startDynamicIMAPProxyServer(ctx, deps, serverCfg, errChan) })
 	t.Cleanup(func() {
 		cancel()
 		deps.serverManager.Wait()

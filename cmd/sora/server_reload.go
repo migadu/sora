@@ -45,21 +45,31 @@ var reloadableServerSettings = map[string][]string{
 	"lmtp_proxy":     {"timeouts.absolute_session_timeout", "max_message_size"},
 	"http_admin_api": {"api_key", "read_only_api_key", "allowed_hosts"},
 	"http_user_api":  {"jwt_secret", "allowed_origins", "allowed_hosts"},
-	"user_api_proxy": {"jwt_secret"},
+	"user_api_proxy": {"jwt_secret", "allowed_origins"},
 }
 
 // reloadServers hands each running server its [[server]] block from newCfg, the config
 // a SIGHUP re-read, by name, and reports what the reload leaves for a restart: the
 // settings a block changed that its server does not apply (all of them for a server
-// that does not reload: metrics, or one start-up skipped, such as an Admin API without
-// an api_key; a reload waits for the servers still starting), a block removed from the
-// file or set to enabled = false, whose server keeps running, and a block added to it
-// or enabled, which is not started. The config the servers started with, deps.config,
-// is read and never written.
+// that does not reload: metrics, one start-up skipped such as an Admin API without an
+// api_key, or a block whose type changed; a reload waits for the servers still
+// starting), a block removed from the file or set to enabled = false, whose server keeps
+// running, and a valid block added to it or enabled, which is not started. Blocks
+// sharing a duplicate server name are refused and skipped; that a restart refuses them,
+// and an invalid block, is handleConfigReload's to report. The config the servers
+// started with, deps.config, is read and never written.
 func (deps *serverDependencies) reloadServers(newCfg *config.Config) {
 	newServers := newCfg.GetAllServers()
 	newByName := make(map[string]config.ServerConfig, len(newServers))
+	duplicateNames := make(map[string]bool)
 	for _, s := range newServers {
+		if s.Name == "" {
+			continue
+		}
+		if _, exists := newByName[s.Name]; exists {
+			duplicateNames[s.Name] = true
+			continue
+		}
 		newByName[s.Name] = s
 	}
 	startedServers := deps.config.GetAllServers()
@@ -70,21 +80,27 @@ func (deps *serverDependencies) reloadServers(newCfg *config.Config) {
 	for _, started := range startedServers {
 		name := started.Name
 		startedByName[name] = true
+		if duplicateNames[name] {
+			logger.Error("Skipping reload: duplicate server name in config; a restart will refuse to start with it", "server", name)
+			continue
+		}
 		newServerCfg, ok := newByName[name]
 		if !ok {
 			logger.Info("Config reload: server removed or set to enabled = false, but it keeps running until a restart", "server", name, "type", started.Type)
 			continue
 		}
+		// Re-validate before applying or comparing: keeps the fail-closed startup guards
+		// (e.g. master_username with an empty master_password, missing addr, or invalid
+		// type) effective on SIGHUP reload. Invalid new config is skipped; the server
+		// keeps running on its previous, already-validated config.
+		if err := newServerCfg.Validate(); err != nil {
+			logger.Error("Skipping reload: invalid new server config", "server", name, "error", err)
+			continue
+		}
 		var reloadable []string
-		if srv, running := deps.runningServers[name]; running {
-			// Re-validate before applying: keeps the fail-closed startup guards
-			// (e.g. master_username with an empty master_password) effective on
-			// SIGHUP reload. Invalid new config is skipped; the server keeps
-			// running on its previous, already-validated config.
-			if err := newServerCfg.Validate(); err != nil {
-				logger.Error("Skipping reload: invalid new server config", "server", name, "error", err)
-				continue
-			}
+		if newServerCfg.Type != started.Type {
+			logger.Warn("Config reload: server type changed; keeping running server until restart", "server", name, "current_type", started.Type, "new_type", newServerCfg.Type)
+		} else if srv, running := deps.runningServers[name]; running {
 			if err := srv.ReloadConfig(newServerCfg); err != nil {
 				logger.Error("Failed to reload server config", "server", name, "error", err)
 			}
@@ -96,12 +112,10 @@ func (deps *serverDependencies) reloadServers(newCfg *config.Config) {
 			logger.Info("Config reload: server settings changed but require restart to take effect", "server", name, "fields", changed)
 		}
 	}
+	// An added block that is invalid or shares its name with another does not start on
+	// a restart either: the restart refuses the file, which handleConfigReload reports.
 	for _, s := range newServers {
-		if !startedByName[s.Name] {
-			if err := s.Validate(); err != nil {
-				logger.Error("Config reload: invalid server config; a restart will refuse to start with it", "server", s.Name, "type", s.Type, "error", err)
-				continue
-			}
+		if !startedByName[s.Name] && !duplicateNames[s.Name] && s.Validate() == nil {
 			logger.Info("Config reload: server added or enabled but not running; it is not started until restart", "server", s.Name, "type", s.Type)
 		}
 	}

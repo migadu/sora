@@ -1,9 +1,8 @@
-package cleaner
-
 // Package cleaner provides a worker that periodically cleans up S3 objects
-// that are no longer needed, based on a grace period defined in the database.
-// It uses a database table-based lock to ensure that only one instance of the
-// cleanup worker is running at a time. The cleanup process involves listing
+// that are no longer needed, based on the [cleanup] grace_period. Only one
+// node runs a cycle at a time: it holds a transaction-scoped PostgreSQL
+// advisory lock (db.CLEANUP_ADVISORY_LOCK_ID) for the whole cycle, and a node
+// that cannot take it skips the cycle. The cleanup process involves listing
 // S3 objects that are candidates for deletion and removing them from both
 // S3 and the database. The worker runs at a specified interval, with a
 // minimum allowed interval of 1 minute. The grace period is the time after
@@ -11,6 +10,7 @@ package cleaner
 // started in a separate goroutine and will continue running until the context
 // is done. It logs its progress and any errors encountered during the
 // cleanup process.
+package cleaner
 
 import (
 	"context"
@@ -614,8 +614,8 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		// Drain each account's FTS rows in bounded batches BEFORE finalization. An account
 		// has one FTS row per distinct body it held, so a single unbounded DELETE inside
 		// the finalize transaction could be millions of rows and a correspondingly long
-		// lock. FinalizeAccountDeletions still issues the same DELETE as a safety net; by
-		// then it is a no-op.
+		// lock. FinalizeAccountDeletions skips an account whose rows the drain left (it
+		// failed, or a body was being staged); the next cycle drains it again.
 		for _, accountID := range danglingAccounts {
 			deleted, err := drainAccountFTS(ctx, w.rdb, accountID)
 			ftsPrunedCount += deleted

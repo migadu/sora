@@ -5,10 +5,12 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
 )
@@ -380,19 +382,26 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Validate before creating parents, so a refused rename leaves no hierarchy. The
-	// namespace boundary is checked against the stored flag, as db.RenameMailbox does:
-	// a personal mailbox under the shared prefix may only be renamed out of it.
-	isShared, err := rdb.IsMailboxSharedWithRetry(ctx, mbox.ID)
-	if err != nil {
-		fmt.Printf("Failed to check whether mailbox '%s' is shared: %v\n", *oldName, err)
-		os.Exit(1)
+	// Validate before creating parents, so a refused rename leaves no hierarchy. As on
+	// IMAP RENAME, a trailing delimiter is no part of the new name, and a name with an
+	// empty, "." or ".." level is refused.
+	created, nameErr := helpers.MailboxNameToCreate(*newName)
+	// The namespace boundary is checked against the stored flags, as db.RenameMailbox
+	// does: a personal mailbox under the shared prefix may only be renamed out of it,
+	// and the descendants the rename carries along must stay on their side too.
+	crosses := false
+	if nameErr == nil {
+		crosses, err = rdb.RenameCrossesSharedBoundaryWithRetry(ctx, globalConfig.SharedMailboxes, mbox, created)
+		if err != nil {
+			fmt.Printf("Failed to check mailbox '%s' against the shared namespace: %v\n", *oldName, err)
+			os.Exit(1)
+		}
 	}
-	if helpers.MailboxNameHasTraversal(*newName) ||
-		(globalConfig.SharedMailboxes.Enabled && globalConfig.SharedMailboxes.InNamespace(*newName) != isShared) {
+	if nameErr != nil || crosses {
 		fmt.Println("Failed to rename mailbox: invalid destination or shared namespace boundary")
 		os.Exit(1)
 	}
+	*newName = created
 	if helpers.MailboxNameIsBelow(*newName, mbox.Name) {
 		fmt.Println("Failed to rename mailbox: a mailbox cannot be renamed to a name below itself")
 		os.Exit(1)
@@ -587,6 +596,7 @@ Examples:
 	// Find affected mailboxes using a regex that matches Modified UTF-7 sequences.
 	// Modified UTF-7 uses '&' followed by base64 chars and terminated by '-'.
 	// We exclude '&-' (which is a literal ampersand escape).
+	const encoded = `&[A-Za-z0-9+,]+-`
 	var query string
 	var args []any
 
@@ -596,18 +606,215 @@ Examples:
 			fmt.Printf("Failed to find account: %v\n", err)
 			os.Exit(1)
 		}
-		query = `SELECT id, account_id, name FROM mailboxes WHERE account_id = $1 AND name ~ '&[A-Za-z0-9+,]+-' AND deleted_at IS NULL ORDER BY account_id, name`
+		query = `SELECT id, account_id, name, path, COALESCE(is_shared, FALSE) FROM mailboxes WHERE account_id = $1 AND name ~ '` + encoded + `' AND deleted_at IS NULL ORDER BY account_id, name`
 		args = []any{accountID}
 	} else {
-		query = `SELECT id, account_id, name FROM mailboxes WHERE name ~ '&[A-Za-z0-9+,]+-' AND deleted_at IS NULL ORDER BY account_id, name`
+		query = `SELECT id, account_id, name, path, COALESCE(is_shared, FALSE) FROM mailboxes WHERE name ~ '` + encoded + `' AND deleted_at IS NULL ORDER BY account_id, name`
 	}
 
-	db := rdb.GetOperationalDatabase()
+	opDB := rdb.GetOperationalDatabase()
+
+	// With the shared mailbox config, db.RenameMailbox refuses a rename across the
+	// shared namespace boundary, as on "mailbox rename" and IMAP RENAME: a personal
+	// mailbox whose name decodes onto namespace_prefix stays where it is.
+	renameCtx := context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: globalConfig.SharedMailboxes})
 
 	// Fetch all affected mailboxes, decode their names, and process them
 	// shallowest-first. RenameMailbox cascades name changes to children,
 	// so after renaming a parent its children's prefixes are updated.
 	// We re-query after each depth level to pick up the cascaded changes.
+	// A dry run writes nothing for a query to see: it carries each rename down
+	// to the children in memory and keeps the rows the query would still match.
+
+	type candidate struct {
+		MailboxID   int64
+		AccountID   int64
+		MailboxName string
+		Path        string
+		IsShared    bool
+	}
+
+	type dryRunMailbox struct {
+		ID       int64
+		Name     string
+		Path     string
+		IsShared bool
+	}
+	accountMailboxes := make(map[int64][]dryRunMailbox)
+	loadAccountMailboxes := func(accountID int64) ([]dryRunMailbox, error) {
+		if mboxes, ok := accountMailboxes[accountID]; ok {
+			return mboxes, nil
+		}
+		mRows, err := opDB.WritePool.Query(ctx,
+			`SELECT id, name, path, COALESCE(is_shared, FALSE) FROM mailboxes WHERE account_id = $1 AND deleted_at IS NULL`,
+			accountID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
+		}
+		defer mRows.Close()
+		var mboxes []dryRunMailbox
+		for mRows.Next() {
+			var m dryRunMailbox
+			if err := mRows.Scan(&m.ID, &m.Name, &m.Path, &m.IsShared); err != nil {
+				return nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
+			}
+			mboxes = append(mboxes, m)
+		}
+		if err := mRows.Err(); err != nil {
+			return nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
+		}
+		accountMailboxes[accountID] = mboxes
+		return mboxes, nil
+	}
+
+	// Keep collision comparisons in PostgreSQL, just like RenameMailbox and
+	// mailboxes_account_id_lower_name_unique. Unicode EqualFold is different
+	// from database LOWER (for example final sigma and dotted I). The arrays
+	// carry simulated successful renames, which a query of stored rows cannot see.
+	countConflicts := func(existing, proposed []string, fold bool) (int, error) {
+		comparison := "existing.name = proposed.name"
+		if fold {
+			comparison = "LOWER(existing.name) = LOWER(proposed.name)"
+		}
+		var conflicts int
+		err := opDB.WritePool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM unnest($1::text[]) AS existing(name)
+			WHERE EXISTS (SELECT 1 FROM unnest($2::text[]) AS proposed(name)
+				WHERE `+comparison+`)`, existing, proposed).Scan(&conflicts)
+		if err != nil {
+			return 0, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
+		}
+		return conflicts, nil
+	}
+
+	checkDryRunRename := func(r candidate, decoded string) error {
+		ids, err := helpers.GetIdsFromPath(r.Path)
+		if err != nil {
+			return err
+		}
+		var parentID *int64
+		if len(ids) > 1 {
+			parentID = &ids[len(ids)-2]
+		}
+
+		if !helpers.MailboxNameValid(decoded) {
+			return consts.ErrMailboxInvalidName
+		}
+
+		if globalConfig.SharedMailboxes.Enabled && globalConfig.SharedMailboxes.InNamespace(decoded) != r.IsShared {
+			return consts.ErrMailboxSharedBoundary
+		}
+
+		if r.IsShared {
+			hasAdminRight, err := rdb.CheckMailboxPermissionWithRetry(renameCtx, r.MailboxID, r.AccountID, db.ACLRightAdmin)
+			if err != nil {
+				return fmt.Errorf("failed to check admin permission: %w", err)
+			}
+			if !hasAdminRight {
+				return fmt.Errorf("permission denied: user does not have admin right on shared mailbox")
+			}
+		}
+
+		mboxes, err := loadAccountMailboxes(r.AccountID)
+		if err != nil {
+			return err
+		}
+
+		foundSelf := false
+		var otherNames []string
+		for _, m := range mboxes {
+			if m.ID == r.MailboxID {
+				foundSelf = true
+				continue
+			}
+			otherNames = append(otherNames, m.Name)
+		}
+		if !foundSelf {
+			return consts.ErrMailboxNotFound
+		}
+		conflicts, err := countConflicts(otherNames, []string{decoded}, true)
+		if err != nil {
+			return err
+		}
+		if conflicts > 0 {
+			return consts.ErrMailboxAlreadyExists
+		}
+
+		if r.Path == "" {
+			return fmt.Errorf("mailbox has invalid empty path (data corruption)")
+		}
+
+		if parentID != nil {
+			if *parentID == r.MailboxID {
+				return fmt.Errorf("mailbox %d cannot be its own parent", r.MailboxID)
+			}
+			var parentPath string
+			foundParent := false
+			for _, m := range mboxes {
+				if m.ID == *parentID {
+					parentPath = m.Path
+					foundParent = true
+					break
+				}
+			}
+			if !foundParent {
+				return consts.ErrMailboxNotFound
+			}
+			if strings.HasPrefix(parentPath, r.Path) {
+				return fmt.Errorf("cannot move mailbox %d into one of its own sub-mailboxes", r.MailboxID)
+			}
+		}
+
+		delim := string(consts.MailboxDelimiter)
+		oldPrefix := r.MailboxName + delim
+		newPrefix := decoded + delim
+		oldPrefixRunes := len([]rune(oldPrefix))
+
+		var cascadedNames []string
+		for _, child := range mboxes {
+			if !helpers.IsDescendantOf(child.Path, r.Path) {
+				continue
+			}
+			childRunes := []rune(child.Name)
+			var suffix string
+			if oldPrefixRunes <= len(childRunes) {
+				suffix = string(childRunes[oldPrefixRunes:])
+			}
+			newName := newPrefix + suffix
+			if globalConfig.SharedMailboxes.Enabled && globalConfig.SharedMailboxes.InNamespace(newName) != child.IsShared {
+				return consts.ErrMailboxSharedBoundary
+			}
+			cascadedNames = append(cascadedNames, newName)
+		}
+
+		if len(cascadedNames) > 0 {
+			allNames := make([]string, 0, len(mboxes))
+			var unaffectedNames []string
+			for _, existing := range mboxes {
+				allNames = append(allNames, existing.Name)
+				if existing.ID != r.MailboxID && !helpers.IsDescendantOf(existing.Path, r.Path) {
+					unaffectedNames = append(unaffectedNames, existing.Name)
+				}
+			}
+			exactConflicts, err := countConflicts(allNames, cascadedNames, false)
+			if err != nil {
+				return err
+			}
+			if exactConflicts > 0 {
+				return fmt.Errorf("rename would create conflicting mailbox names (%d conflicts)", exactConflicts)
+			}
+			conflicts, err := countConflicts(unaffectedNames, cascadedNames, true)
+			if err != nil {
+				return err
+			}
+			if conflicts > 0 {
+				return consts.ErrMailboxAlreadyExists
+			}
+		}
+
+		return nil
+	}
 
 	fixed := 0
 	skipped := 0
@@ -617,43 +824,39 @@ Examples:
 	// Track mailbox IDs we've already skipped/failed so we don't retry them
 	processedIDs := make(map[int64]bool)
 
+	stillEncoded := regexp.MustCompile(encoded)
+	var simulated []candidate // dry run: the rows as its renames so far leave them
+	fromDB := true
+
 	for {
-		var rows []struct {
-			MailboxID   int64
-			AccountID   int64
-			MailboxName string
-		}
+		var rows []candidate
 
-		dbRows, err := db.WritePool.Query(ctx, query, args...)
-		if err != nil {
-			fmt.Printf("Failed to query mailboxes: %v\n", err)
-			os.Exit(1)
-		}
-
-		for dbRows.Next() {
-			var r struct {
-				MailboxID   int64
-				AccountID   int64
-				MailboxName string
-			}
-			if err := dbRows.Scan(&r.MailboxID, &r.AccountID, &r.MailboxName); err != nil {
-				fmt.Printf("Failed to scan row: %v\n", err)
+		if !fromDB {
+			rows = simulated
+		} else {
+			dbRows, err := opDB.WritePool.Query(ctx, query, args...)
+			if err != nil {
+				fmt.Printf("Failed to query mailboxes: %v\n", err)
 				os.Exit(1)
 			}
-			rows = append(rows, r)
+
+			for dbRows.Next() {
+				var r candidate
+				if err := dbRows.Scan(&r.MailboxID, &r.AccountID, &r.MailboxName, &r.Path, &r.IsShared); err != nil {
+					fmt.Printf("Failed to scan row: %v\n", err)
+					os.Exit(1)
+				}
+				rows = append(rows, r)
+			}
+			if err := dbRows.Err(); err != nil {
+				fmt.Printf("Failed to iterate mailbox rows: %v\n", err)
+				os.Exit(1)
+			}
+			dbRows.Close()
 		}
-		if err := dbRows.Err(); err != nil {
-			fmt.Printf("Failed to iterate mailbox rows: %v\n", err)
-			os.Exit(1)
-		}
-		dbRows.Close()
 
 		// Filter out already-processed IDs
-		var unprocessed []struct {
-			MailboxID   int64
-			AccountID   int64
-			MailboxName string
-		}
+		var unprocessed []candidate
 		for _, r := range rows {
 			if !processedIDs[r.MailboxID] {
 				unprocessed = append(unprocessed, r)
@@ -688,7 +891,7 @@ Examples:
 				continue
 			}
 
-			decoded, err := helpers.DecodeModifiedUTF7(r.MailboxName)
+			decoded, err := decodeMailboxLevelUTF7(r.MailboxName)
 			if err != nil {
 				fmt.Printf("  SKIP  %-40s  (decode error: %v)\n", r.MailboxName, err)
 				skipped++
@@ -705,15 +908,56 @@ Examples:
 			}
 
 			if *dryRun {
+				if dryErr := checkDryRunRename(r, decoded); dryErr != nil {
+					fmt.Printf("  WOULD FAIL  account_id=%-6d  %q  ->  %q  (error: %v)\n", r.AccountID, r.MailboxName, decoded, dryErr)
+					failed++
+					processedIDs[r.MailboxID] = true
+					continue
+				}
+
 				fmt.Printf("  WOULD RENAME  account_id=%-6d  %q  ->  %q\n", r.AccountID, r.MailboxName, decoded)
 				fixed++
 				processedIDs[r.MailboxID] = true
 				renamedInRound++
+
+				delim := string(consts.MailboxDelimiter)
+				oldPrefix := r.MailboxName + delim
+				newPrefix := decoded + delim
+				oldPrefixRunes := len([]rune(oldPrefix))
+				mboxes := accountMailboxes[r.AccountID]
+				for j := range mboxes {
+					if mboxes[j].ID == r.MailboxID {
+						mboxes[j].Name = decoded
+					} else if helpers.IsDescendantOf(mboxes[j].Path, r.Path) {
+						childRunes := []rune(mboxes[j].Name)
+						var suffix string
+						if oldPrefixRunes <= len(childRunes) {
+							suffix = string(childRunes[oldPrefixRunes:])
+						}
+						mboxes[j].Name = newPrefix + suffix
+					}
+				}
+
+				// As the rename would, carry the new name down to the children.
+				for j := range rows {
+					c := &rows[j]
+					if c.AccountID == r.AccountID && helpers.IsDescendantOf(c.Path, r.Path) && strings.HasPrefix(c.MailboxName, oldPrefix) {
+						c.MailboxName = decoded + c.MailboxName[len(r.MailboxName):]
+					}
+				}
 				continue
 			}
 
-			// Perform the rename (this cascades to children)
-			err = rdb.RenameMailboxWithRetry(ctx, r.MailboxID, r.AccountID, decoded, nil)
+			// Rename in place, under the parent the path links it to: a nil parent
+			// would move it to the top level. The rename cascades to its children.
+			ids, err := helpers.GetIdsFromPath(r.Path)
+			if err == nil {
+				var parentID *int64
+				if len(ids) > 1 {
+					parentID = &ids[len(ids)-2]
+				}
+				err = rdb.RenameMailboxWithRetry(renameCtx, r.MailboxID, r.AccountID, decoded, parentID)
+			}
 			if err != nil {
 				fmt.Printf("  FAIL  account_id=%-6d  %q  ->  %q  (error: %v)\n", r.AccountID, r.MailboxName, decoded, err)
 				failed++
@@ -727,26 +971,15 @@ Examples:
 			renamedInRound++
 		}
 
-		// In dry-run mode nothing changes in the DB, so process all depths in one pass
 		if *dryRun {
-			for _, r := range unprocessed {
-				if processedIDs[r.MailboxID] {
-					continue
-				}
-				processedIDs[r.MailboxID] = true
-				decoded, err := helpers.DecodeModifiedUTF7(r.MailboxName)
-				if err != nil {
-					fmt.Printf("  SKIP  %-40s  (decode error: %v)\n", r.MailboxName, err)
-					skipped++
-				} else if decoded == r.MailboxName {
-					fmt.Printf("  SKIP  %-40s  (no change after decode)\n", r.MailboxName)
-					skipped++
-				} else {
-					fmt.Printf("  WOULD RENAME  account_id=%-6d  %q  ->  %q\n", r.AccountID, r.MailboxName, decoded)
-					fixed++
+			// What the query would return now: a child that its parent's rename left
+			// with no encoded level drops out, as it does from the query.
+			simulated, fromDB = nil, false
+			for _, r := range rows {
+				if stillEncoded.MatchString(r.MailboxName) {
+					simulated = append(simulated, r)
 				}
 			}
-			break
 		}
 
 		if renamedInRound == 0 {
@@ -760,10 +993,28 @@ Examples:
 
 	fmt.Println()
 	if *dryRun {
-		fmt.Printf("Dry run complete: %d would be renamed, %d skipped\n", fixed, skipped)
+		if failed > 0 {
+			fmt.Printf("Dry run complete: %d would be renamed, %d skipped, %d would fail\n", fixed, skipped, failed)
+		} else {
+			fmt.Printf("Dry run complete: %d would be renamed, %d skipped\n", fixed, skipped)
+		}
 	} else {
 		fmt.Printf("Done: %d renamed, %d skipped, %d failed\n", fixed, skipped, failed)
 	}
+}
+
+// decodeMailboxLevelUTF7 decodes the last level of a mailbox name from Modified UTF-7
+// and keeps the levels above it, which are its ancestors' names. fix-utf7 renames
+// shallowest first and a rename carries the new name down to the children, so an
+// ancestor that is still encoded was not renamed: the child stays linked under it,
+// and its name must keep naming it.
+func decodeMailboxLevelUTF7(name string) (string, error) {
+	i := strings.LastIndexByte(name, consts.MailboxDelimiter) + 1
+	level, err := helpers.DecodeModifiedUTF7(name[i:])
+	if err != nil {
+		return "", err
+	}
+	return name[:i] + level, nil
 }
 
 // printMailboxUsage prints usage information for the 'mailbox' command

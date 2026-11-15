@@ -970,38 +970,8 @@ func TestSearchFunctionality(t *testing.T) {
 		}
 	})
 
-	t.Run("Search_WithFromFilter", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/mailboxes/INBOX/search?q=test&from=sender@example.com", nil)
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
-		}
-
-		var result map[string]any
-		parseJSON(t, resp, &result)
-		t.Logf("Search with from filter returned %v results", result["total"])
-	})
-
-	t.Run("Search_WithSubjectFilter", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/mailboxes/INBOX/search?q=test&subject=important", nil)
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
-		}
-
-		var result map[string]any
-		parseJSON(t, resp, &result)
-		t.Logf("Search with subject filter returned %v results", result["total"])
-	})
-
-	t.Run("Search_UnseenOnly", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/mailboxes/INBOX/search?q=test&unseen=true", nil)
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
-		}
-
-		var result map[string]any
-		parseJSON(t, resp, &result)
-		t.Logf("Search for unseen messages returned %v results", result["total"])
-	})
+	// The from, subject and unseen filters are asserted on seeded messages in
+	// TestUserAPI_SearchAppliesFilters (search_filters_test.go).
 
 	t.Run("Search_NonexistentMailbox", func(t *testing.T) {
 		resp := tc.makeRequest(t, "GET", "/user/mailboxes/NonexistentFolder/search?q=test", nil)

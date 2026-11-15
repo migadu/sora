@@ -3,6 +3,7 @@
 package lmtp_test
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -210,4 +211,62 @@ func TestLMTPBackendDefaultErrorFallback(t *testing.T) {
 		t.Log("Implementation check: session.go Rcpt() should return 550 only for pgx.ErrNoRows")
 		t.Log("Implementation check: Unknown errors should default to 451 (temporary)")
 	})
+}
+
+// TestLMTPBackendMailboxSetupFailureReplyCarriesNoDetails: RCPT recreates an account's
+// default mailboxes when its INBOX is missing, and answers 451 when that fails. The reply
+// text reaches the sender in a delay or bounce notice, so it must not carry the database
+// error, which names the mailbox, the table's constraint, or a database host.
+func TestLMTPBackendMailboxSetupFailureReplyCarriesNoDetails(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupLMTPServer(t)
+	defer server.Close()
+	rdb := server.ResilientDB
+	ctx := context.Background()
+
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, account.Email)
+	if err != nil {
+		t.Fatalf("account id: %v", err)
+	}
+	// Without INBOX, RCPT recreates the default mailboxes, and "Sent" cannot be
+	// recreated while another mailbox holds its \Sent special use.
+	for _, stmt := range []string{
+		"UPDATE mailboxes SET deleted_at = NOW() WHERE account_id = $1 AND LOWER(name) = 'inbox' AND deleted_at IS NULL",
+		"UPDATE mailboxes SET name = 'Sent Items' WHERE account_id = $1 AND LOWER(name) = 'sent' AND deleted_at IS NULL",
+	} {
+		if _, err := rdb.ExecWithRetry(ctx, stmt, accountID); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	client, err := NewLMTPClient(server.Address)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer client.Close()
+	if err := client.SendCommand("LHLO test"); err != nil {
+		t.Fatalf("Failed to send LHLO: %v", err)
+	}
+	if _, err := client.ReadMultilineResponse(); err != nil {
+		t.Fatalf("Failed to read LHLO response: %v", err)
+	}
+	if err := client.SendCommand("MAIL FROM:<sender@example.com>"); err != nil {
+		t.Fatalf("Failed to send MAIL FROM: %v", err)
+	}
+	if resp, _ := client.ReadResponse(); !strings.HasPrefix(resp, "250") {
+		t.Fatalf("MAIL FROM failed: %s", resp)
+	}
+	if err := client.SendCommand(fmt.Sprintf("RCPT TO:<%s>", account.Email)); err != nil {
+		t.Fatalf("Failed to send RCPT TO: %v", err)
+	}
+	resp, _ := client.ReadResponse()
+	if !strings.HasPrefix(resp, "451 4.3.0") {
+		t.Fatalf("want 451 4.3.0 when the default mailboxes cannot be created, got %s", resp)
+	}
+	for _, detail := range []string{"Sent", "SQLSTATE", "constraint", "duplicate"} {
+		if strings.Contains(resp, detail) {
+			t.Errorf("reply %q names %q", resp, detail)
+		}
+	}
 }

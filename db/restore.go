@@ -117,7 +117,8 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 	}
 	defer rows.Close()
 
-	var messages []DeletedMessage
+	// Never nil: an empty result is the JSON array [], not null.
+	messages := []DeletedMessage{}
 	for rows.Next() {
 		var msg DeletedMessage
 		err := rows.Scan(
@@ -135,6 +136,7 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan deleted message: %w", err)
 		}
+		msg.MessageID = headerMessageID(msg.MessageID)
 		messages = append(messages, msg)
 	}
 
@@ -392,7 +394,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 
 	mailboxIDMap := make(map[string]int64)
 	for _, mailboxName := range names {
-		mailboxID, _, err := restoreMailbox(ctx, tx, accountID, mailboxName, false)
+		mailboxID, _, _, err := restoreMailbox(ctx, tx, accountID, mailboxName, false)
 		if err != nil {
 			return 0, err
 		}
@@ -508,38 +510,52 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	return restoredCount, nil
 }
 
-// restoreMailbox returns the id and path of the live mailbox called name, recreating it
-// if it was deleted — linked under its parent, which is itself recreated first if it is
-// gone too. A recreated "Parent/Child" used to land at the root: the name still showed
-// the hierarchy in LIST, but the tree is path-based, so the parent lost \HasChildren,
-// RENAME of the parent stopped carrying the child, and a later DELETE of the parent
-// succeeded and stranded it.
+// restoreMailbox returns the id, path and is_shared of the live mailbox called name,
+// recreating it if it was deleted — linked under its parent, which is itself recreated
+// first if it is gone too. A recreated "Parent/Child" used to land at the root: the name
+// still showed the hierarchy in LIST, but the tree is path-based, so the parent lost
+// \HasChildren, RENAME of the parent stopped carrying the child, and a later DELETE of
+// the parent succeeded and stranded it.
+//
+// A name in the shared namespace of the [shared_mailboxes] config in ctx is recreated as
+// a shared mailbox of the account, with the initial ACL createMailbox gives a new one.
+// Recreated personal, it sat in the shared namespace where SETACL refuses to share it.
+// The entries the deleted mailbox had went with it and are not restored.
 //
 // asParent takes FOR KEY SHARE on an existing mailbox that is about to receive a
 // recreated child — the same lock createMailbox takes — so the parent cannot be
 // soft-deleted underneath the child (see SoftDeleteMailbox).
-func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string, asParent bool) (int64, string, error) {
-	lookup := `SELECT id, path FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL`
+func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string, asParent bool) (int64, string, bool, error) {
+	lookup := `SELECT id, path, COALESCE(is_shared, FALSE) FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL`
 	if asParent {
 		lookup += ` FOR KEY SHARE`
 	}
 	var mailboxID int64
 	var path string
-	err := tx.QueryRow(ctx, lookup, accountID, name).Scan(&mailboxID, &path)
+	var isShared bool
+	err := tx.QueryRow(ctx, lookup, accountID, name).Scan(&mailboxID, &path, &isShared)
 	if err == nil {
-		return mailboxID, path, nil
+		return mailboxID, path, isShared, nil
 	}
 	if err != pgx.ErrNoRows {
-		return 0, "", fmt.Errorf("failed to check mailbox %s: %w", name, err)
+		return 0, "", false, fmt.Errorf("failed to check mailbox %s: %w", name, err)
 	}
 
 	// Gone: recreate its parent first, so this one can be linked under it.
+	var parentID int64
 	var parentPath string
+	var parentIsShared bool
 	if i := strings.LastIndex(name, string(consts.MailboxDelimiter)); i > 0 {
-		if _, parentPath, err = restoreMailbox(ctx, tx, accountID, name[:i], true); err != nil {
-			return 0, "", err
+		if parentID, parentPath, parentIsShared, err = restoreMailbox(ctx, tx, accountID, name[:i], true); err != nil {
+			return 0, "", false, err
 		}
 	}
+
+	ownerDomain, err := newMailboxOwnerDomain(ctx, tx, accountID, name)
+	if err != nil {
+		return 0, "", false, err
+	}
+	isShared = ownerDomain != nil
 
 	// Re-seed the RFC 6154 special-use attribute for a canonical top-level default name
 	// (consistent with CreateDefaultMailboxes / migration 000045), but ONLY if the
@@ -548,12 +564,13 @@ func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string
 	// ON CONFLICT tolerates a concurrent recreate of the same name; its row is then
 	// re-read below.
 	err = tx.QueryRow(ctx, `
-		INSERT INTO mailboxes (account_id, name, uid_validity, created_at, updated_at, path, special_use)
+		INSERT INTO mailboxes (account_id, name, uid_validity, created_at, updated_at, path, special_use, is_shared, owner_domain)
 		SELECT $1, $2, extract(epoch from now())::bigint, now(), now(), '',
 			CASE WHEN canon.su IS NOT NULL
 			          AND NOT EXISTS (SELECT 1 FROM mailboxes m2
 			                          WHERE m2.account_id = $1 AND m2.special_use = canon.su AND m2.deleted_at IS NULL)
-			     THEN canon.su END
+			     THEN canon.su END,
+			$3::boolean, $4::text
 		FROM (SELECT CASE LOWER($2)
 			WHEN 'sent'    THEN '\Sent'
 			WHEN 'drafts'  THEN '\Drafts'
@@ -563,23 +580,35 @@ func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string
 		END AS su) canon
 		ON CONFLICT (account_id, LOWER(name)) WHERE deleted_at IS NULL DO NOTHING
 		RETURNING id
-	`, accountID, name).Scan(&mailboxID)
+	`, accountID, name, isShared, ownerDomain).Scan(&mailboxID)
 	if err == pgx.ErrNoRows {
 		// Concurrent recreate won the race; use its row as it is.
-		err = tx.QueryRow(ctx, lookup, accountID, name).Scan(&mailboxID, &path)
+		err = tx.QueryRow(ctx, lookup, accountID, name).Scan(&mailboxID, &path, &isShared)
 		if err != nil {
-			return 0, "", fmt.Errorf("failed to create mailbox %s: %w", name, err)
+			return 0, "", false, fmt.Errorf("failed to create mailbox %s: %w", name, err)
 		}
-		return mailboxID, path, nil
+		return mailboxID, path, isShared, nil
 	}
 	if err != nil {
-		return 0, "", fmt.Errorf("failed to create mailbox %s: %w", name, err)
+		return 0, "", false, fmt.Errorf("failed to create mailbox %s: %w", name, err)
 	}
 
 	// The path needs the id, so it is set once the row exists.
 	path = helpers.GetMailboxPath(parentPath, mailboxID)
 	if _, err := tx.Exec(ctx, `UPDATE mailboxes SET path = $1 WHERE id = $2`, path, mailboxID); err != nil {
-		return 0, "", fmt.Errorf("failed to update path for mailbox %s: %w", name, err)
+		return 0, "", false, fmt.Errorf("failed to update path for mailbox %s: %w", name, err)
 	}
-	return mailboxID, path, nil
+
+	if isShared {
+		var sharedParentID *int64
+		if parentIsShared {
+			sharedParentID = &parentID
+		}
+		if err := grantNewSharedMailboxACL(ctx, tx, accountID, name, mailboxID, sharedParentID, *ownerDomain); err != nil {
+			return 0, "", false, err
+		}
+		logger.Warn("Database: restore recreated a deleted shared mailbox with the initial ACL of a new one; the entries it had before it was deleted are not restored",
+			"account_id", accountID, "mailbox", name, "mailbox_id", mailboxID)
+	}
+	return mailboxID, path, isShared, nil
 }
