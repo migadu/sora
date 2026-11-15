@@ -216,6 +216,36 @@ func (rd *ResilientDatabase) GetMailboxSummaryWithRetry(ctx context.Context, mai
 	return result.(*db.MailboxSummary), nil
 }
 
+// InReadSnapshotWithRetry runs fn inside a single REPEATABLE READ READ ONLY transaction
+// on the read pool (or write pool when consts.UseMasterDBKey is set on ctx), retrying
+// the entire snapshot as a unit on transient database errors. Snapshot-aware read
+// helpers called with snapCtx reuse the open transaction directly. The callback
+// context is scoped to fn and must only be used with this ResilientDatabase.
+func (rd *ResilientDatabase) InReadSnapshotWithRetry(ctx context.Context, fn func(ctx context.Context) error) error {
+	op := func(opCtx context.Context) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(opCtx, false).InReadSnapshot(opCtx, fn)
+	}
+	_, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
+	return err
+}
+
+// OptionalReadInSnapshot runs fn inside a PostgreSQL SAVEPOINT when ctx carries an
+// active InReadSnapshot transaction. Statement errors that rolled back cleanly to the
+// savepoint are returned as nonFatalErr so the caller can log/fall back on the still-
+// healthy snapshot transaction; context cancellation/deadlines, savepoint failures,
+// retryable transient errors, and database/connection failures are returned as fatalErr
+// so InReadSnapshotWithRetry can retry or surface them through the query breaker.
+func (rd *ResilientDatabase) OptionalReadInSnapshot(ctx context.Context, fn func(ctx context.Context) error) (nonFatalErr error, fatalErr error) {
+	err := db.InReadSavepoint(ctx, fn)
+	if err == nil {
+		return nil, nil
+	}
+	if ctx.Err() != nil || errors.Is(err, db.ErrReadSnapshotAborted) || rd.isRetryableError(err) || isDatabaseFailure(err) {
+		return nil, err
+	}
+	return err, nil
+}
+
 func (rd *ResilientDatabase) GetFirstUnseenSeqNumWithRetry(ctx context.Context, mailboxID int64) (uint32, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).GetFirstUnseenSeqNum(ctx, mailboxID)
