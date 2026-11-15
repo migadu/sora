@@ -1271,18 +1271,25 @@ func removeExpiredLocalCopy(path string, now time.Time) (bool, error) {
 // does: it writes a temporary file in the same directory and renames it over path, so a
 // write that fails part-way (the disk fills) leaves no partial file under the cache name,
 // which a later run would skip as already cached and the server would read. The new file
-// gets the owner and group of the file it replaces, as writing into that file would keep
-// them, so that, run as root, tls cache --force leaves the server a file it can read.
+// keeps the owner, group and permissions of the file it replaces, as writing in place
+// would, so tls cache --force preserves the server's access to an existing cache.
 func writeLocalCacheFile(path string, data []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".cache-")
+	f, err := os.CreateTemp(filepath.Dir(path), ".sora-tls-cache-")
 	if err != nil {
 		return err
 	}
+	mode := fs.FileMode(0600)
 	if old, statErr := os.Stat(path); statErr == nil {
+		mode = old.Mode().Perm()
 		err = takeOwner(f, old)
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		err = statErr
 	}
 	if err == nil {
 		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = f.Chmod(mode)
 	}
 	if err == nil {
 		err = f.Sync()
