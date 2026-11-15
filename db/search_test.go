@@ -123,6 +123,33 @@ func TestBuildSearchHeaderConditions(t *testing.T) {
 	}
 }
 
+// TestBuildSearchHeaderLookalikeFieldNames: a header field name is printable US-ASCII
+// (RFC 5322 §2.2), so only its ASCII letters fold. strings.ToLower maps U+0130 (LATIN
+// CAPITAL LETTER I WITH DOT ABOVE) to "i", which turned SEARCH HEADER "MESSAGE-İD" into
+// a Message-ID search; no message has that header, so it matches nothing (#1511).
+func TestBuildSearchHeaderLookalikeFieldNames(t *testing.T) {
+	var db *Database // builder does not dereference the receiver
+
+	for _, tc := range []struct{ key, want string }{
+		{"MESSAGE-İD", "FALSE"},
+		{"İN-REPLY-TO", "FALSE"},
+		{"MESSAGE-ID", "message_id"},
+		{"In-Reply-To", "in_reply_to"},
+	} {
+		paramCounter := 0
+		criteria := &imap.SearchCriteria{
+			Header: []imap.SearchCriteriaHeaderField{{Key: tc.key, Value: "<a@example.com>"}},
+		}
+		condition, _, err := db.buildSearchCriteria(criteria, "p", &paramCounter)
+		require.NoError(t, err)
+		if tc.want == "FALSE" {
+			assert.Equal(t, "FALSE", condition, "HEADER %q", tc.key)
+		} else {
+			assert.Contains(t, condition, tc.want, "HEADER %q", tc.key)
+		}
+	}
+}
+
 // TestBuildSearchDateConditions pins the date comparison operators (#593). go-imap
 // passes a search <date> as midnight UTC of that day, and ON d as Since = d,
 // Before = d + 24h. RFC 9051 §6.4.4: BEFORE / SENTBEFORE match a date "earlier than
