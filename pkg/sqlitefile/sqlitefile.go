@@ -59,21 +59,98 @@ func Parse(name string) (path, query string, err error) {
 	}
 	path = unescape(uri)
 
-	// SQLite reads the parameters in order, so the last mode and the last vfs win.
-	var mode, vfs string
-	for _, param := range strings.Split(query, "&") {
-		key, value, _ := strings.Cut(param, "=")
-		switch unescape(key) {
-		case "mode":
-			mode = unescape(value)
-		case "vfs":
-			vfs = unescape(value)
-		}
+	// SQLite validates access modes in order and uses the last accepted mode
+	// and the last VFS. Validate before callers prepare the file or its directory.
+	mode, _, err := parseMode(query)
+	if err != nil {
+		return "", "", err
 	}
+	vfs, _ := lastParameter(query, "vfs")
 	if path == "" || path == ":memory:" || mode == "memory" || vfs == "memdb" {
 		return "", "", nil
 	}
 	return path, query, nil
+}
+
+// CanCreate reports whether the final accepted URI mode permits creating a file,
+// including percent-escaped keys and values. Validate before touching files.
+func CanCreate(params string) (bool, error) {
+	mode, present, err := parseMode(params)
+	return !present || mode == "rwc", err
+}
+
+// Prepare secures the database and any existing journal files before SQLite
+// opens them. New sidecars inherit the database's mode. A no-create URI mode
+// must not be turned into creation by this permission preparation.
+func Prepare(path, params string) error {
+	create, err := CanCreate(params)
+	if err != nil {
+		return err
+	}
+	flags := os.O_RDWR
+	if create {
+		flags |= os.O_CREATE
+	}
+	f, err := os.OpenFile(path, flags, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to prepare database file: %w", err)
+	}
+	err = f.Chmod(0600)
+	closeErr := f.Close()
+	if err != nil {
+		return fmt.Errorf("failed to enforce 0600 permissions on database file: %w", err)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("failed to close prepared database file: %w", closeErr)
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if err := os.Chmod(path+suffix, 0600); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to enforce 0600 permissions on database sidecar %s: %w", suffix, err)
+		}
+	}
+	return nil
+}
+
+func lastParameter(query, name string) (value string, present bool) {
+	for _, param := range strings.Split(query, "&") {
+		key, v, _ := strings.Cut(param, "=")
+		if unescape(key) == name {
+			value, present = unescape(v), true
+		}
+	}
+	return value, present
+}
+
+func parseMode(query string) (mode string, present bool, err error) {
+	// Match sqlite3ParseUri's access-mode check against the current open
+	// flags (READONLY=1, READWRITE=2, CREATE=4, MEMORY=128). For example,
+	// rwc followed by rw is valid; ro followed by rwc is not.
+	limit := 2 | 4
+	for _, param := range strings.Split(query, "&") {
+		key, value, _ := strings.Cut(param, "=")
+		if unescape(key) != "mode" {
+			continue
+		}
+		mode, present = unescape(value), true
+		var flags int
+		switch mode {
+		case "ro":
+			flags = 1
+		case "rw":
+			flags = 2
+		case "rwc":
+			flags = 2 | 4
+		case "memory":
+			flags = 128
+		default:
+			return mode, present, fmt.Errorf("invalid file database mode %q", mode)
+		}
+		if flags&^128 > limit {
+			return mode, present, fmt.Errorf("file database mode not allowed: %s", mode)
+		}
+		limit = flags
+	}
+	return mode, present, nil
 }
 
 // unescape decodes the %HH escapes in one part of a URI (its path, or a parameter's name

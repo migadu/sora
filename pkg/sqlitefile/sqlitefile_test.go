@@ -117,7 +117,6 @@ func TestParse(t *testing.T) {
 		{"file:/a.db%00ignored?mode=rwc", "/a.db", "mode=rwc"},
 		{"file:/x.db?mode=memory&mode=rwc", "/x.db", "mode=memory&mode=rwc"}, // the last mode wins
 		{"file:/x.db?vfs=memdb&vfs=unix", "/x.db", "vfs=memdb&vfs=unix"},
-		{"file:/x.db?mode=memor", "/x.db", "mode=memor"},
 
 		// Names that open no file.
 		{":memory:", "", ""},
@@ -140,9 +139,9 @@ func TestParse(t *testing.T) {
 		}
 	}
 
-	for _, name := range []string{"file://example.com/x.db", "file://localhost:80/x.db", "file://user@localhost/x.db"} {
+	for _, name := range []string{"file://example.com/x.db", "file://localhost:80/x.db", "file://user@localhost/x.db", "file:/x.db?mode=memor", "file:/x.db?mode="} {
 		if path, _, err := Parse(name); err == nil {
-			t.Errorf("Parse(%q) = %q, nil; want an invalid authority error", name, path)
+			t.Errorf("Parse(%q) = %q, nil; want an invalid authority or mode error", name, path)
 		}
 	}
 }

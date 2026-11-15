@@ -69,6 +69,9 @@ func New(dbPath string) (*Store, error) {
 			// real error so the operator can fix the path/permissions.
 			return nil, fmt.Errorf("failed to open affinity cache db: %w", err)
 		}
+		if create, _ := sqlitefile.CanCreate(query); !create {
+			return nil, fmt.Errorf("cannot recreate corrupt affinity cache with a no-create URI mode: %w", err)
+		}
 		logger.Warn("AffinityCache: Database appears corrupted, recreating", "path", dbPath, "error", err)
 		if removeErr := removeDBFiles(file); removeErr != nil {
 			return nil, fmt.Errorf("failed to remove corrupted affinity cache db: %w", removeErr)
@@ -116,16 +119,8 @@ const connParams = "_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
 // openAndValidate opens the SQLite database file at path, 0600, with the URI query
 // params (empty for none), sets pragmas, and creates the schema.
 func openAndValidate(path, params string) (*sql.DB, error) {
-	// Ensure the database file has 0600 permissions.
-	// If the file does not exist, pre-create it with 0600 permissions.
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create or set permissions on database file: %w", err)
-	}
-	f.Close()
-	// If the file already exists, enforce 0600 permissions on it.
-	if err := os.Chmod(path, 0600); err != nil {
-		return nil, fmt.Errorf("failed to enforce 0600 permissions on database file: %w", err)
+	if err := sqlitefile.Prepare(path, params); err != nil {
+		return nil, err
 	}
 	// Open that same file: a plain path would be cut at its first '?'.
 	if params != "" {
