@@ -184,3 +184,48 @@ func TestMailboxFixUTF7DryRunDatabaseCaseParity(t *testing.T) {
 		})
 	}
 }
+
+func TestMailboxFixUTF7DryRunDescendantSharedBoundary(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	rdb := common.SetupTestDatabase(t)
+	ctx := context.Background()
+	previous := globalConfig
+	t.Cleanup(func() { globalConfig = previous })
+	globalConfig.SharedMailboxes = config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Téam/Shared/", DefaultRights: "lrswipkxtea"}
+	account := common.CreateTestAccount(t, rdb)
+	id, err := rdb.GetAccountIDByEmailWithRetry(ctx, account.Email)
+	require.NoError(t, err)
+	_, err = rdb.ResolveOrCreateMailboxPathWithRetry(ctx, id, "T&AOk-am/Shared")
+	require.NoError(t, err)
+	dry := runMailboxFixUTF7(t, ctx, account.Email, "--dry-run")
+	live := runMailboxFixUTF7(t, ctx, account.Email)
+	require.Empty(t, parseFixUTF7Renames(live))
+	require.Contains(t, live, consts.ErrMailboxSharedBoundary.Error())
+	require.Equal(t, parseFixUTF7Renames(live), parseFixUTF7Renames(dry), "dry=%s live=%s", dry, live)
+	require.Equal(t, parseFixUTF7Failures(live), parseFixUTF7Failures(dry), "dry=%s live=%s", dry, live)
+}
+
+func TestMailboxFixUTF7DryRunDatabaseDescendantCaseParity(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	rdb := common.SetupTestDatabase(t)
+	ctx := context.Background()
+	for _, tc := range []struct{ name, existing, encoded string }{
+		{"final sigma subtree is distinct", "ς/Sub", "&A6M-/Sub"},
+		{"dotted I subtree conflicts", "i\u0307/Sub", "&ATA-/Sub"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			account := common.CreateTestAccount(t, rdb)
+			id, err := rdb.GetAccountIDByEmailWithRetry(ctx, account.Email)
+			require.NoError(t, err)
+			require.NoError(t, rdb.CreateMailboxWithRetry(ctx, id, tc.existing, nil))
+			_, err = rdb.ResolveOrCreateMailboxPathWithRetry(ctx, id, tc.encoded)
+			require.NoError(t, err)
+			dry := runMailboxFixUTF7(t, ctx, account.Email, "--dry-run")
+			live := runMailboxFixUTF7(t, ctx, account.Email)
+			require.Equal(t, parseFixUTF7Renames(live), parseFixUTF7Renames(dry), "dry=%s live=%s", dry, live)
+			// The live index violation includes its constraint detail; both modes
+			// must refuse the same number of renames without cascading the parent.
+			require.Len(t, parseFixUTF7Failures(dry), len(parseFixUTF7Failures(live)), "dry=%s live=%s", dry, live)
+		})
+	}
+}

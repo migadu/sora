@@ -635,9 +635,10 @@ Examples:
 	}
 
 	type dryRunMailbox struct {
-		ID   int64
-		Name string
-		Path string
+		ID       int64
+		Name     string
+		Path     string
+		IsShared bool
 	}
 	accountMailboxes := make(map[int64][]dryRunMailbox)
 	loadAccountMailboxes := func(accountID int64) ([]dryRunMailbox, error) {
@@ -645,7 +646,7 @@ Examples:
 			return mboxes, nil
 		}
 		mRows, err := opDB.WritePool.Query(ctx,
-			`SELECT id, name, path FROM mailboxes WHERE account_id = $1 AND deleted_at IS NULL`,
+			`SELECT id, name, path, COALESCE(is_shared, FALSE) FROM mailboxes WHERE account_id = $1 AND deleted_at IS NULL`,
 			accountID,
 		)
 		if err != nil {
@@ -655,7 +656,7 @@ Examples:
 		var mboxes []dryRunMailbox
 		for mRows.Next() {
 			var m dryRunMailbox
-			if err := mRows.Scan(&m.ID, &m.Name, &m.Path); err != nil {
+			if err := mRows.Scan(&m.ID, &m.Name, &m.Path, &m.IsShared); err != nil {
 				return nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 			}
 			mboxes = append(mboxes, m)
@@ -665,6 +666,26 @@ Examples:
 		}
 		accountMailboxes[accountID] = mboxes
 		return mboxes, nil
+	}
+
+	// Keep collision comparisons in PostgreSQL, just like RenameMailbox and
+	// mailboxes_account_id_lower_name_unique. Unicode EqualFold is different
+	// from database LOWER (for example final sigma and dotted I). The arrays
+	// carry simulated successful renames, which a query of stored rows cannot see.
+	countConflicts := func(existing, proposed []string, fold bool) (int, error) {
+		comparison := "existing.name = proposed.name"
+		if fold {
+			comparison = "LOWER(existing.name) = LOWER(proposed.name)"
+		}
+		var conflicts int
+		err := opDB.WritePool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM unnest($1::text[]) AS existing(name)
+			WHERE EXISTS (SELECT 1 FROM unnest($2::text[]) AS proposed(name)
+				WHERE `+comparison+`)`, existing, proposed).Scan(&conflicts)
+		if err != nil {
+			return 0, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
+		}
+		return conflicts, nil
 	}
 
 	checkDryRunRename := func(r candidate, decoded string) error {
@@ -701,17 +722,23 @@ Examples:
 		}
 
 		foundSelf := false
+		var otherNames []string
 		for _, m := range mboxes {
 			if m.ID == r.MailboxID {
 				foundSelf = true
 				continue
 			}
-			if strings.EqualFold(m.Name, decoded) {
-				return consts.ErrMailboxAlreadyExists
-			}
+			otherNames = append(otherNames, m.Name)
 		}
 		if !foundSelf {
 			return consts.ErrMailboxNotFound
+		}
+		conflicts, err := countConflicts(otherNames, []string{decoded}, true)
+		if err != nil {
+			return err
+		}
+		if conflicts > 0 {
+			return consts.ErrMailboxAlreadyExists
 		}
 
 		if r.Path == "" {
@@ -754,31 +781,35 @@ Examples:
 			if oldPrefixRunes <= len(childRunes) {
 				suffix = string(childRunes[oldPrefixRunes:])
 			}
-			cascadedNames = append(cascadedNames, newPrefix+suffix)
+			newName := newPrefix + suffix
+			if globalConfig.SharedMailboxes.Enabled && globalConfig.SharedMailboxes.InNamespace(newName) != child.IsShared {
+				return consts.ErrMailboxSharedBoundary
+			}
+			cascadedNames = append(cascadedNames, newName)
 		}
 
 		if len(cascadedNames) > 0 {
-			exactConflicts := 0
+			allNames := make([]string, 0, len(mboxes))
+			var unaffectedNames []string
 			for _, existing := range mboxes {
-				for _, cascaded := range cascadedNames {
-					if existing.Name == cascaded {
-						exactConflicts++
-						break
-					}
+				allNames = append(allNames, existing.Name)
+				if existing.ID != r.MailboxID && !helpers.IsDescendantOf(existing.Path, r.Path) {
+					unaffectedNames = append(unaffectedNames, existing.Name)
 				}
+			}
+			exactConflicts, err := countConflicts(allNames, cascadedNames, false)
+			if err != nil {
+				return err
 			}
 			if exactConflicts > 0 {
 				return fmt.Errorf("rename would create conflicting mailbox names (%d conflicts)", exactConflicts)
 			}
-			for _, existing := range mboxes {
-				if existing.ID == r.MailboxID || helpers.IsDescendantOf(existing.Path, r.Path) {
-					continue
-				}
-				for _, cascaded := range cascadedNames {
-					if strings.EqualFold(existing.Name, cascaded) {
-						return consts.ErrMailboxAlreadyExists
-					}
-				}
+			conflicts, err := countConflicts(unaffectedNames, cascadedNames, true)
+			if err != nil {
+				return err
+			}
+			if conflicts > 0 {
+				return consts.ErrMailboxAlreadyExists
 			}
 		}
 
