@@ -480,6 +480,9 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	if rdb == nil {
 		return nil, fmt.Errorf("database is required for IMAP server")
 	}
+	if err := config.ValidateIMAPDisabledCaps(options.DisabledCaps); err != nil {
+		return nil, fmt.Errorf("server %q: %w", name, err)
+	}
 
 	// Wrap S3 storage with resilient patterns including circuit breakers
 	resilientS3 := resilient.NewResilientS3Storage(s3)
@@ -725,7 +728,9 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		// Only add the filter if all regex patterns are valid
 		if isValid {
 			for _, capStr := range filter.DisableCaps {
-				if _, ok := alwaysAdvertisedCaps[imap.Cap(capStr)]; ok {
+				if imap.Cap(capStr) == imap.CapIMAP4rev1 {
+					logger.Warn("IMAP: Capability filter cannot disable IMAP4rev1, go-imap selects connection protocol version from server-global capabilities", "name", name, "capability", capStr, "reason", filter.Reason)
+				} else if _, ok := alwaysAdvertisedCaps[imap.Cap(capStr)]; ok {
 					logger.Warn("IMAP: Capability filter cannot disable capability, go-imap always advertises it with IMAP4rev1", "name", name, "capability", capStr, "reason", filter.Reason)
 				}
 			}
@@ -1774,10 +1779,17 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 
 // filterCapabilitiesForClient applies client-specific capability filtering and returns disabled capabilities
 func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, clientID *imap.IDData, tlsFingerprint string) []string {
-	var disabledCaps []string
+	disabledCaps, _ := s.filterCapabilitiesForClientExcept(sessionCaps, clientID, tlsFingerprint, nil)
+	return disabledCaps
+}
 
+// filterCapabilitiesForClientExcept applies client-specific capability filtering
+// while preserving capabilities in keep (and avoiding reverse-implication
+// cascades from kept capabilities), and skips IMAP4rev1 because go-imap selects
+// the connection's base IMAP version from server-global capabilities.
+func (s *IMAPServer) filterCapabilitiesForClientExcept(sessionCaps imap.CapSet, clientID *imap.IDData, tlsFingerprint string, keep imap.CapSet) (disabledCaps, keptCaps []string) {
 	if len(s.capFilters) == 0 {
-		return disabledCaps // No filters configured
+		return nil, nil // No filters configured
 	}
 
 	// Extract client info
@@ -1796,7 +1808,18 @@ func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, client
 		if s.clientMatches(clientName, clientVersion, tlsFingerprint, filter) {
 			logger.Debug("IMAP: Applying capability filter", "name", s.name, "reason", filter.Reason, "client_name", clientName, "client_version", clientVersion, "ja4", tlsFingerprint)
 
-			removed := disableCapabilities(sessionCaps, filter.DisableCaps)
+			names := make([]string, 0, len(filter.DisableCaps))
+			for _, capStr := range filter.DisableCaps {
+				if imap.Cap(capStr) == imap.CapIMAP4rev1 {
+					continue
+				}
+				names = append(names, capStr)
+			}
+
+			removed, kept := config.DisableIMAPCapabilities(sessionCaps, names, keep)
+			if len(kept) > 0 {
+				keptCaps = append(keptCaps, kept...)
+			}
 			if len(removed) > 0 {
 				disabledCaps = append(disabledCaps, removed...)
 				logger.Debug("IMAP: Disabled capabilities", "name", s.name, "capabilities", removed, "reason", filter.Reason)
@@ -1804,81 +1827,22 @@ func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, client
 		}
 	}
 
-	return disabledCaps
+	return disabledCaps, keptCaps
 }
 
-// alwaysAdvertisedCaps are the capabilities go-imap lists on every IMAP4rev1
-// server whatever the configured set holds (imapserver availableCaps: SASL-IR
-// and LITERAL- before login, UNSELECT, ENABLE and UTF8=ACCEPT after it), so
-// neither disabled_caps nor client_filters can withdraw them. All but
-// UTF8=ACCEPT are implied by IMAP4rev2, and LITERAL- also by LITERAL+:
-// removing those for them would downgrade the server and leave them advertised
-// all the same.
-var alwaysAdvertisedCaps = imap.CapSet{
-	imap.CapSASLIR:       {},
-	imap.CapLiteralMinus: {},
-	imap.CapUnselect:     {},
-	imap.CapEnable:       {},
-	imap.CapUTF8Accept:   {},
-}
+// alwaysAdvertisedCaps aliases config.IMAPAlwaysAdvertisedCaps so server startup
+// and config validation share one definition.
+var alwaysAdvertisedCaps = config.IMAPAlwaysAdvertisedCaps
 
-// capImplies reports whether capability by implies capability c: go-imap's own
-// Has, so it follows the library, plus the extension dependencies Has does not
-// model:
-//   - SORT=DISPLAY (RFC 5957 §1) and ESORT (RFC 5267 §3.1) extend SORT;
-//   - SEARCHRES (RFC 5182 §2.1), ESORT (RFC 5267 §3.1) and MULTISEARCH
-//     (RFC 7377 §1, §2) require ESEARCH;
-//   - CREATE-SPECIAL-USE requires SPECIAL-USE (RFC 6154 §3).
+// capImplies delegates to config.IMAPCapImplies.
 func capImplies(by, c imap.Cap) bool {
-	if (imap.CapSet{by: {}}).Has(c) {
-		return true
-	}
-	switch c {
-	case imap.CapSort:
-		return by == imap.CapSortDisplay || by == imap.CapESort
-	case imap.CapESearch:
-		return by == imap.CapSearchRes || by == imap.CapESort || by == imap.CapMultiSearch
-	case imap.CapSpecialUse:
-		return by == imap.CapCreateSpecialUse
-	}
-	return false
+	return config.IMAPCapImplies(by, c)
 }
 
-// disableCapabilities removes the named capabilities from caps and returns
-// the ones it removed. go-imap's CapSet.Has also reports a capability that
-// another one in the set implies, and builds both the CAPABILITY response and
-// its command gates on Has: IMAP4rev2 implies the extensions RFC 9051 folds
-// into the base protocol (IDLE, ESEARCH, SEARCHRES, MOVE, NAMESPACE, UIDPLUS,
-// ...), QRESYNC implies CONDSTORE (RFC 7162 §3.2.3). Deleting only the named key
-// left such a capability advertised and usable, so whatever implies it is
-// removed transitively too (see capImplies). For IMAP4rev2 that downgrades the
-// server or session to IMAP4rev1, where go-imap lists each remaining extension
-// on its own. A name in alwaysAdvertisedCaps is skipped: nothing removed here
-// can withdraw it.
+// disableCapabilities removes the named capabilities (and any capabilities that
+// imply them) from caps.
 func disableCapabilities(caps imap.CapSet, names []string) []string {
-	var removed []string
-	for _, name := range names {
-		c := imap.Cap(name)
-		if _, ok := alwaysAdvertisedCaps[c]; ok {
-			continue
-		}
-		if _, ok := caps[c]; ok {
-			delete(caps, c)
-			removed = append(removed, name)
-		}
-		queue := []imap.Cap{c}
-		for len(queue) > 0 {
-			cur := queue[0]
-			queue = queue[1:]
-			for other := range caps {
-				if capImplies(other, cur) {
-					delete(caps, other)
-					removed = append(removed, string(other))
-					queue = append(queue, other)
-				}
-			}
-		}
-	}
+	removed, _ := config.DisableIMAPCapabilities(caps, names, nil)
 	return removed
 }
 
