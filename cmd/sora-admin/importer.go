@@ -2654,8 +2654,8 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 	var err error
 
 	if i.options.BatchTransactionMode {
-		// Fast path: Single transaction for entire batch (20x faster)
-		// SQLite is updated BEFORE PostgreSQL commit (atomicity guaranteed)
+		// One PostgreSQL transaction covers the batch. SQLite marks follow its commit;
+		// a mark failure invokes best-effort PostgreSQL compensation.
 		logger.Info("Using batch transaction mode")
 		successHashes, err = i.insertBatchToDBWithTransaction(uploaded)
 	} else {
