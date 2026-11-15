@@ -683,7 +683,7 @@ var preAuthRequiredState = map[string]string{
 func preAuthCommandError(command string, args []string) string {
 	name := command
 	if command == "UID" && len(args) > 0 {
-		name += " " + strings.ToUpper(args[0])
+		name += " " + server.ToUpperASCII(args[0])
 	}
 	if state, ok := preAuthRequiredState[name]; ok {
 		return "BAD [CLIENTBUG] This command is only valid in the " + state + " state"
