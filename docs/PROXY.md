@@ -726,13 +726,25 @@ With `remote_use_id_command`, the IMAP proxy sends one `ID` command before it lo
 are `name` (`Sora-Proxy`), `x-originating-ip`, `x-originating-port`, `x-connected-ip`,
 `x-connected-port`, `x-session-id`, `x-proxy-ttl` (10), and `x-forward-proxy-server`,
 `x-forward-proxy-user`, `x-forward-proxy-source-ip` and, when known, `x-forward-ja4-fingerprint`. A
-failure is logged and the login continues.
+backend that refuses it (a tagged `NO` or `BAD`) is logged and the login continues without the
+fields. When the tagged reply is not read within `connect_timeout`, or the connection fails before
+it, the login fails as a backend failure (`NO [UNAVAILABLE]`): a late reply would be read as the
+reply to the login.
 
 ### 8.6 XCLIENT
 
 With `remote_use_xclient`, the POP3 proxy sends `XCLIENT ADDR=... PORT=... SESSION=... TTL=10
 FORWARD=...` before it logs in; the LMTP proxy sends `XCLIENT ADDR=... PORT=... HELO=...
-PROTO=ESMTP` (IPv6 addresses as `ADDR=IPV6:...`).
+PROTO=ESMTP` (IPv6 addresses as `ADDR=IPV6:...`) before `MAIL FROM`.
+
+A refusal (POP3 `-ERR`; LMTP `5xx`, or `4xx` other than `421`) is logged and the session
+continues. The client's address can still have been supplied by a PROXY header. When the reply
+is not read within `connect_timeout` (for an LMTP
+backend that answers with a new `220` greeting, also the reply to the `LHLO` the proxy then sends),
+the backend connection fails: POP3 answers `-ERR [SYS/TEMP]`, LMTP `451 4.4.1`. A late reply would
+otherwise be read as the reply to the next command (POP3 replies carry no tag, so a late `+OK` would
+pass for the login's). The LMTP connection also fails on a `421`, on a malformed reply or one with
+any other code, and when the backend does not answer that `LHLO` with `250`.
 
 ### 8.7 POP3 UTF8
 
@@ -978,11 +990,11 @@ cache_path = "/var/lib/sora/affinity_cache.db"
 ```
 
 - Used only with `[cluster]` and `[cluster.affinity]` enabled and `cache_path` set.
-- At startup, entries that have not expired are loaded. The gossip handler is registered
-  before the file is loaded, and queues incoming
-  events until the initial snapshot is ready. Those events are then applied and written using
-  their timestamps: an older SET cannot replace a newer stored assignment, and a newer delete
-  removes the stored entry.
+- At startup, entries that have not expired are loaded. The file is opened before the node joins
+  the cluster, and the gossip handler is registered right after the join, before the file is
+  loaded; it queues incoming events until the initial snapshot is ready. Those events are then
+  applied and written using their timestamps: an older SET cannot replace a newer stored
+  assignment, and a newer delete removes the stored entry.
 - Every change (set, update, delete, also those received by gossip) is written to the file in the
   background, in the order the changes were made, each write with a 2-second limit. A key changed
   again before its write starts is written once, with its latest state. Gossip changes apply only
@@ -1015,7 +1027,7 @@ What a proxy needs PostgreSQL for:
 A node that runs only proxies, all of them with a remote lookup and none with
 `lookup_local_users = true`, does not need PostgreSQL to check users and can leave `[database]`
 out. It logs
-`Skipping database initialization - running in proxy-only mode with remote_lookup`.
+`Skipping database initialization - no server on this node queries it`.
 
 On a node without database access:
 
@@ -1028,7 +1040,11 @@ An `http_admin_api` server on a proxy node lets you see the proxies' backend hea
 Sora treats the database as not configured when `[database.write]` and `[database.read]` are absent
 or have empty `hosts`. A node that needs the database while it is not configured refuses to start,
 and `sora-admin config validate` refuses its file, with `[database]: server "<name>" (<type>) needs
-the database, but it is not configured in [database.write] or [database.read]`.
+the database, but it is not configured in [database.write] or [database.read]`. A proxy that checks
+passwords in the database needs `[database.write]` hosts even though it mostly reads: start-up runs
+the migrations there, and a login rehashes a password whose hash is outdated. With `[database.read]`
+hosts alone the proxy refuses to start with `[database.write]: server "<name>" (<type>) needs the
+database, but [database.write] has no hosts; ...`.
 
 ---
 

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/logger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -94,6 +97,25 @@ func (m *interruptingDB) BeginTxWithRetry(ctx context.Context, txOptions pgx.TxO
 	return m.mockResilientDatabase.BeginTxWithRetry(ctx, txOptions)
 }
 
+// importLogBuffer collects what the importer logs; the upload goroutines log
+// concurrently.
+type importLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *importLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *importLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // newTwoMailboxMaildir builds a maildir with one message in INBOX and one in Sent.
 func newTwoMailboxMaildir(t *testing.T) string {
 	t.Helper()
@@ -110,7 +132,8 @@ func newTwoMailboxMaildir(t *testing.T) string {
 // An interrupt keeps the rest of the batch from being stored; it does not make those
 // messages fail. They stay pending (their cache rows unmarked) for the next run, and
 // are neither counted as failed nor listed with an upload, mailbox, "account not
-// found" or insert error. What committed before the interrupt is imported and marked.
+// found" or insert error, and the interrupt is not logged as a warning or an error.
+// What committed before the interrupt is imported and marked.
 func TestImportInterruptLeavesUnstoredMessagesPending(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -153,7 +176,10 @@ func TestImportInterruptLeavesUnstoredMessagesPending(t *testing.T) {
 				importer.s3 = s3
 			}
 
+			logs := &importLogBuffer{}
+			prev := logger.Swap(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
 			err = importer.Run()
+			logger.Swap(prev)
 			require.ErrorIs(t, err, context.Canceled, "an interrupted run must report the interruption")
 			if s3 != nil {
 				require.Equal(t, 1, s3.puts, "the second upload must see the interrupt")
@@ -161,6 +187,7 @@ func TestImportInterruptLeavesUnstoredMessagesPending(t *testing.T) {
 
 			assert.Zero(t, importer.failedMessages, "messages the interrupt kept from being stored were counted as failed")
 			assert.Empty(t, recordedFailedPaths(importer), "messages the interrupt kept from being stored were listed as failed")
+			assert.Empty(t, logs.String(), "the interrupt was logged as a warning or an error")
 			assert.Equal(t, tc.singleTries, rdb.singleInserts, "a batch insert that failed on the interrupt was retried message by message")
 			assert.Equal(t, int64(tc.committed), importer.importedMessages)
 

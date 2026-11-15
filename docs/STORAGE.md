@@ -247,7 +247,11 @@ directory.
 If the file already exists with the right size (the same body is being delivered again, or
 is still being uploaded), Sora leaves it alone and only updates its modification time. A
 message filed into another account's shared mailbox is staged a second time, under the
-owner's account ID, as a hard link (or a copy, if a link is not possible).
+owner's account ID, as a hard link (or a copy, if a link is not possible). If the
+recipient's file is gone by then (its upload finished in the meantime), the owner's file is
+written from the delivered message instead. The owner's upload reads only the owner's file,
+so a delivery that cannot stage it fails with a temporary error (LMTP `451`, a transient
+Admin API delivery error) and stores nothing in that mailbox.
 
 Keep the staging directory and the cache directory on the same filesystem. After an upload,
 the staged file moves into the cache with a rename. Across filesystems that rename becomes a

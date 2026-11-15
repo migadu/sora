@@ -262,3 +262,64 @@ func TestMailboxNameHasPrefix(t *testing.T) {
 		}
 	}
 }
+
+func TestUIDRangeExcept(t *testing.T) {
+	set := func(ranges ...imap.UIDRange) imap.UIDSet {
+		var s imap.UIDSet
+		for _, r := range ranges {
+			s.AddRange(r.Start, r.Stop)
+		}
+		return s
+	}
+	tests := []struct {
+		name        string
+		first, last imap.UID
+		except      imap.UIDSet
+		want        string
+	}{
+		{"nothing excepted", 5, 9, nil, "5:9"},
+		{"all excepted", 5, 9, set(imap.UIDRange{Start: 1, Stop: 20}), ""},
+		{"exactly the range", 5, 9, set(imap.UIDRange{Start: 5, Stop: 9}), ""},
+		{"head", 5, 9, set(imap.UIDRange{Start: 3, Stop: 6}), "7:9"},
+		{"tail", 5, 9, set(imap.UIDRange{Start: 8, Stop: 12}), "5:7"},
+		{"middle", 5, 9, set(imap.UIDRange{Start: 7, Stop: 7}), "5:6,8:9"},
+		{"several", 1, 10, set(imap.UIDRange{Start: 2, Stop: 3}, imap.UIDRange{Start: 6, Stop: 6}, imap.UIDRange{Start: 10, Stop: 11}), "1,4:5,7:9"},
+		{"outside", 5, 9, set(imap.UIDRange{Start: 1, Stop: 4}, imap.UIDRange{Start: 10, Stop: 12}), "5:9"},
+		{"single UID excepted", 5, 5, set(imap.UIDRange{Start: 5, Stop: 5}), ""},
+		{"top UID", 4294967294, 4294967295, set(imap.UIDRange{Start: 4294967295, Stop: 4294967295}), "4294967294"},
+	}
+	for _, tc := range tests {
+		if got := uidRangeExcept(tc.first, tc.last, tc.except).String(); got != tc.want {
+			t.Errorf("%s: uidRangeExcept(%d, %d, %v) = %q, want %q", tc.name, tc.first, tc.last, tc.except, got, tc.want)
+		}
+	}
+}
+
+// TestOwnMessages: the pump sees the own UIDs of the mailbox it treats as
+// selected from nextFetchUID on, forgets the rest, and holds back while an own
+// write is in flight.
+func TestOwnMessages(t *testing.T) {
+	s := &IMAPSession{}
+	watch := &notifyWatch{selectedMailboxID: 7, nextFetchUID: 5}
+	watch.own.mailboxID = 7
+	watch.own.uids.AddNum(2, 3, 5, 9)
+
+	uids, busy := s.ownMessages(watch)
+	if got := uids.String(); got != "5,9" || busy {
+		t.Fatalf("ownMessages = %q, busy %v; want \"5,9\", not busy", got, busy)
+	}
+	if got := watch.own.uids.String(); got != "5,9" {
+		t.Errorf("after ownMessages the watch keeps %q, want the passed UIDs forgotten: \"5,9\"", got)
+	}
+
+	watch.own.writes = 1
+	if _, busy := s.ownMessages(watch); !busy {
+		t.Error("ownMessages with an own write in flight: busy = false, want true")
+	}
+	watch.own.writes = 0
+
+	watch.selectedMailboxID = 8 // the client selected another mailbox
+	if uids, _ := s.ownMessages(watch); len(uids) != 0 || watch.own.mailboxID != 8 {
+		t.Errorf("after a mailbox switch ownMessages = %q for mailbox %d, want none for mailbox 8", uids.String(), watch.own.mailboxID)
+	}
+}

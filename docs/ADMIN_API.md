@@ -132,14 +132,15 @@ Authorization: Bearer a-long-random-value-of-at-least-16-characters
 
 The word `Bearer` may be in any case. The key is compared in constant time.
 
-| Situation | Status | Body |
-|---|---|---|
-| No `Authorization` header | 401 | `{"error":"Authorization header required"}` |
-| Header is not `Bearer <key>` | 401 | `{"error":"Authorization header must be 'Bearer <token>'"}` |
-| Wrong key | 403 | `{"error":"Invalid API key"}` |
-| `read_only_api_key` with a method other than `GET` | 403 | `{"error":"API key is read-only"}` |
+| Situation | Status | Body | `WWW-Authenticate` |
+|---|---|---|---|
+| No `Authorization` header | 401 | `{"error":"Authorization header required"}` | `Bearer realm="admin-api"` |
+| Header is not `Bearer <key>` | 401 | `{"error":"Authorization header must be 'Bearer <token>'"}` | `Bearer realm="admin-api"` |
+| Wrong key | 403 | `{"error":"Invalid API key"}` | `Bearer realm="admin-api", error="invalid_token"` |
+| `read_only_api_key` with a method other than `GET` | 403 | `{"error":"API key is read-only"}` | `Bearer realm="admin-api", error="insufficient_scope"` |
 
-The two 401 answers carry the challenge `WWW-Authenticate: Bearer realm="admin-api"`.
+Every refusal of the key carries a Bearer challenge (RFC 6750 section 3); a key that was
+presented and refused also says why, with the error codes of RFC 6750 section 3.1.
 
 `api_key` grants every endpoint. `read_only_api_key`, when set, grants every `GET` endpoint and
 nothing else: every endpoint that changes something uses `POST`, `PUT` or `DELETE`. Give the

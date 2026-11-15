@@ -384,6 +384,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	// attachment from an undecidable or synthetic BODYSTRUCTURE.
 	appendFlags = db.WithAttachmentKeyword(appendFlags, fullMessageBytes, false)
 
+	ownMessagesDone := s.beginOwnMessages(mailbox.ID)
 	_, messageUID, err := s.server.rdb.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
 			AccountID:     destAccountID,
@@ -412,6 +413,10 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 			AccountID:   destAccountID,
 		})
 	if err != nil {
+		// A duplicate is answered with the UID of a message this APPEND did
+		// not create, which still gets its NOTIFY MessageNew FETCH.
+		ownMessagesDone()
+
 		// Handle duplicate messages (either pre-detected or from unique constraint violation)
 		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
 			// For duplicates, NEVER delete the file. This prevents a race condition where:
@@ -446,6 +451,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		recordMetrics(ierr)
 		return nil, ierr
 	}
+	ownMessagesDone(imap.UID(messageUID))
 
 	// Before updating the session state, check if the context is still valid
 	// and then update the session state under mutex protection

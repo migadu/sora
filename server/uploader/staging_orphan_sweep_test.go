@@ -2,6 +2,7 @@ package uploader
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -169,6 +170,44 @@ func TestOrphanSweepDoesNotSubtractAFileThisRunNeverCounted(t *testing.T) {
 
 	if got := stagingSize(w); got != 600 {
 		t.Errorf("staging size = %d after sweeping a leftover this run never counted, want the 600 bytes it staged", got)
+	}
+}
+
+// A refresh that cannot measure the backlog leaves the count alone, so an orphan
+// staged before it is still counted as it is on disk, and sweeping it must take its
+// bytes out. Were a failed refresh to drop the orphan's path from onDisk, every orphan
+// swept during a run of failing refreshes (a cancelled or duplicate delivery leaves
+// one) would stay counted until a refresh succeeds, and the guard would refuse
+// deliveries into an emptying spool.
+func TestOrphanSweepSubtractsAnOrphanAFailedRefreshLeftCounted(t *testing.T) {
+	w, rdb, _, _, _ := setupTestWorker(t)
+	w.maxStagingSize = 1000
+	rows := newPendingRows()
+	rdb.ExistingPendingUploadsFunc = rows.existing
+	rdb.PendingUploadBacklogFunc = func(ctx context.Context, instanceID string, maxAttempts int) (UploadBacklog, error) {
+		return UploadBacklog{}, errors.New("database unavailable")
+	}
+
+	deliver(t, w, rows, "a", 600)
+	orphan := stageOrphan(t, w, "b", 300)
+	if err := w.monitorStuckUploads(context.Background()); err != nil {
+		t.Fatalf("monitorStuckUploads: %v", err)
+	}
+	if got := stagingSize(w); got != 900 {
+		t.Fatalf("staging size = %d after a refresh that could not measure the backlog, want the local 900", got)
+	}
+
+	ageStaged(t, orphan)
+	if err := w.cleanupOrphanedFiles(context.Background()); err != nil {
+		t.Fatalf("cleanupOrphanedFiles: %v", err)
+	}
+	requireSwept(t, orphan)
+
+	if got := stagingSize(w); got != 600 {
+		t.Errorf("staging size = %d after sweeping an orphan the failed refresh left counted, want the 600 bytes still staged", got)
+	}
+	if w.IsStagingLimitExceeded(400) {
+		t.Errorf("a 400-byte delivery is refused with 600 bytes staged under a 1000-byte limit (counted %d)", stagingSize(w))
 	}
 }
 

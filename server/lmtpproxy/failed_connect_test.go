@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/server/proxy"
 )
 
 // startFailFirstBackend starts an LMTP backend whose first connection fails at
@@ -132,5 +133,40 @@ func TestFailedBackendConnectIsNotHeld(t *testing.T) {
 				step("RCPT TO:<a2@example.com>", "250 ", 2)
 			})
 		}
+	}
+}
+
+// TestFailedSTARTTLSConnectIsNotHeld covers the STARTTLS steps of #1186, before and
+// after the TLS connection replaced the plaintext one: connectToBackend fails, the
+// session holds no backend connection or route, and the backend sees the connection
+// closed.
+func TestFailedSTARTTLSConnectIsNotHeld(t *testing.T) {
+	const ready = "220 2.0.0 ready to start TLS\r\n"
+	for _, tc := range []struct {
+		name    string
+		backend fakeLMTPBackend
+	}{
+		{"STARTTLS refused", fakeLMTPBackend{}},
+		{"data after the STARTTLS reply", fakeLMTPBackend{startTLSReply: ready + "250 injected\r\n"}},
+		{"TLS handshake", fakeLMTPBackend{startTLSReply: ready, noHandshake: true}},
+		{"LHLO after STARTTLS", fakeLMTPBackend{startTLSReply: ready, lhloAfterTLS: "421 4.3.2 Busy\r\n"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, commands := tc.backend.start(t)
+			sess, err := connectLMTPBackend(t, addr, proxy.BackendSettings{TLS: true, TLSUseStartTLS: true}, nil, 500*time.Millisecond)
+			if err == nil {
+				t.Fatal("connectToBackend succeeded")
+			}
+			if sess.backendConn != nil || sess.backendRoute != nil {
+				t.Errorf("after %q the session holds backendConn %T, backendRoute %v; want neither", err, sess.backendConn, sess.backendRoute)
+			}
+			// The fake backend also ends the connection on its own 10 s deadline, so
+			// only a prompt end shows that connectToBackend closed it.
+			waitStart := time.Now()
+			commands()
+			if waited := time.Since(waitStart); waited > 2*time.Second {
+				t.Errorf("the backend saw its connection end %v after connectToBackend failed (its own deadline): the connection was left open", waited.Round(time.Second))
+			}
+		})
 	}
 }

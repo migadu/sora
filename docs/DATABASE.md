@@ -187,6 +187,12 @@ CPUs, whichever is larger).
   runs without a database. A node that needs a database and has none refuses to start, and
   `sora-admin config validate` refuses the file, with `[database]: server "<name>" (<type>) needs
   the database, but it is not configured in [database.write] or [database.read]`.
+- **`[database.read]` alone is not enough.** The migrations and every write go to
+  `[database.write]`, so a node that needs a database needs `[database.write]` hosts, a proxy
+  that only checks passwords included. With `[database.read]` hosts and none in
+  `[database.write]`, Sora refuses to start, and `sora-admin config validate` refuses the file,
+  with `[database.write]: server "<name>" (<type>) needs the database, but [database.write] has
+  no hosts; ...`. Other `sora-admin` commands stop with `[database.write] has no hosts`.
 - **User name and password** may contain any characters. Sora escapes them in the connection URL.
 - **IPv6 addresses** go in brackets with a port: `hosts = ["[2001:db8::10]:5432"]`.
 
@@ -623,6 +629,7 @@ pooler), off-peak. The migrations on `main` that need it on a large database:
 | 000050 | `messages_fts_v2`, the per-account search table, and `btree_gin`. | See [Migration 000050](#migration-000050) below. |
 | 000051 | Replaces seven indexes on `messages` with `idx_messages_mailbox_active`. | Create the new index with `CREATE INDEX CONCURRENTLY`, then drop the seven old ones with `DROP INDEX CONCURRENTLY`, one at a time. |
 | 000052 | `idx_messages_mailbox_headers`, the covering index for header search. | Fix over-long rows with [scripts/fix_oversized_header_columns.sql](../scripts/fix_oversized_header_columns.sql), then build the index with `CREATE INDEX CONCURRENTLY`, using exactly the definition in the file. |
+| 000062 | `idx_messages_mailbox_sent_date_unknown`, the messages without a usable `Date:` header, which SENTBEFORE, SENTON and SENTSINCE leave out. | Build the index with `CREATE INDEX CONCURRENTLY`, using exactly the definition in the file, and check that it is valid. On more than 25,000 messages the migration refuses to build it itself. |
 
 Older migrations (for example 000008, 000010, 000012, 000014, 000038 and 000039) carry the same
 kind of note. Copy index definitions exactly from the migration file: the migration only checks
