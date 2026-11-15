@@ -154,7 +154,18 @@ func TestNotifyLaggingReplicaShrinkUsesPrimary(t *testing.T) {
 
 	rec := newNotifyRecorder()
 	watcher := notifyLoginAndSelect(t, server.Address, account, rec.options(), "")
-	defer watcher.Logout()
+	defer func() {
+		// Stop and join the NOTIFY pump before installLaggingReplica restores
+		// the test-only read-pool pointer. Logout alone only queues a command.
+		cmd, err := watcher.Notify(nil)
+		if err == nil {
+			err = cmd.Wait()
+		}
+		if err != nil {
+			t.Errorf("stopping NOTIFY before restoring the replica: %v", err)
+		}
+		_ = watcher.Logout().Wait()
+	}()
 
 	cmd, err := watcher.Notify(&imap.NotifyOptions{
 		Items: []imap.NotifyItem{{
