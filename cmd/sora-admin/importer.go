@@ -1120,29 +1120,67 @@ func (i *Importer) resolveMailboxName(path string) (string, error) {
 	}
 	// Folders are named Maildir++ style (".Sent", ".Work.Projects") or without the
 	// leading dot ("Sent"): drop the dot, then turn the maildir separator (.) into
-	// the IMAP one (/).
+	// the IMAP one (/). importedFolderName restores escaped characters after that
+	// split, so an escaped '.' ("v1\2e2", as the exporter writes "v1.2") stays in its
+	// level.
 	return importedFolderName(strings.ReplaceAll(strings.TrimPrefix(relPath, "."), ".", "/"))
 }
 
+// unescapeMaildirLevel restores the characters of one level of a folder name (a
+// directory's or a subscription's) escaped with maildirEscapeChar, before the level
+// is decoded from modified UTF-7, as
+// Dovecot's mailbox_list_unescape_name_params does. Only a printable US-ASCII
+// character is restored: escaping only ever applies to those, and a mailbox name
+// must not gain a control character or a byte of invalid UTF-8 from a directory
+// name. Any other escape character is kept as it is.
+func unescapeMaildirLevel(level string) string {
+	if strings.IndexByte(level, maildirEscapeChar) < 0 {
+		return level
+	}
+	var b strings.Builder
+	for n := 0; n < len(level); n++ {
+		if level[n] == maildirEscapeChar && n+2 < len(level) {
+			if v, err := hex.DecodeString(level[n+1 : n+3]); err == nil && v[0] >= 0x20 && v[0] <= 0x7e {
+				b.WriteByte(v[0])
+				n += 2
+				continue
+			}
+		}
+		b.WriteByte(level[n])
+	}
+	return b.String()
+}
+
 // importedFolderName is the Sora mailbox name for a folder name read from a maildir,
-// its levels already separated by '/': modified UTF-7 decoded (Dovecot's encoding of
-// non-ASCII names), trimmed, and special folders mapped. A name with TAB, CR or LF is
-// refused. Folders and the subscriptions file are both named through it, so a
-// subscription names the mailbox the folder's messages went to.
+// its levels already separated by '/': in each level the escaped characters restored
+// (unescapeMaildirLevel) and then modified UTF-7 decoded (Dovecot's encoding of
+// non-ASCII names), as Dovecot's mailbox_list_default_get_vname_part turns a storage
+// name into a mailbox name; then trimmed, and special folders mapped. A name with TAB,
+// CR or LF is refused. Folders and the subscriptions file are both named through it,
+// as Dovecot names both by the storage name, so a subscription names the mailbox the
+// folder's messages went to.
 //
 // Each level is decoded on its own, and one that is not valid modified UTF-7 keeps
 // its raw name. The levels above it still decode as the parent folders' own names
 // did, so the mailbox stays below them instead of below a raw-named copy of them.
 func importedFolderName(name string) (string, error) {
-	if strings.Contains(name, "&") {
+	if strings.ContainsAny(name, "&"+string(maildirEscapeChar)) {
 		delim := string(consts.MailboxDelimiter)
 		levels := strings.Split(name, delim)
 		for i, level := range levels {
+			level = unescapeMaildirLevel(level)
 			if decoded, err := helpers.DecodeModifiedUTF7(level); err != nil {
 				logger.Warn("Failed to decode Modified UTF-7 mailbox name level, using raw level", "name", name, "mailbox_level", level, "error", err)
 			} else {
-				levels[i] = decoded
+				level = decoded
 			}
+			// A storage escape must not introduce hierarchy. Dovecot can escape a
+			// visible separator inside one level; Sora uses '/' as its hierarchy
+			// delimiter and cannot represent that literal character in a level.
+			if strings.Contains(level, delim) {
+				return "", fmt.Errorf("hierarchy delimiter in escaped mailbox level %q", level)
+			}
+			levels[i] = level
 		}
 		name = strings.Join(levels, delim)
 	}
