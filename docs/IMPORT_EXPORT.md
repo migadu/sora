@@ -435,8 +435,9 @@ sora-admin --config config.toml import s3 --email user@example.com --workers 10
 How it works:
 
 1. It lists `domain/localpart/` and keeps keys of the form `domain/localpart/<64 hex digits>`,
-   recording them in a temporary SQLite file `sora-s3-import-<unix time>.db` in the system's
-   temporary directory.
+   recording them in a temporary SQLite file `sora-s3-import-<random>.db` in the system's
+   temporary directory. Every run creates a file of its own, readable by its owner only, so
+   runs for several users can go in parallel.
 2. For each object, it skips it when a live message of the account already has that content hash
    (unless `--force-reimport`). Otherwise it downloads and decrypts the object, parses it, and
    inserts it into **INBOX**: S3 holds no folder information. INTERNALDATE and sent date are the
