@@ -231,6 +231,13 @@ func TestConfigValidateWhatServiceSetupRefuses(t *testing.T) {
 			want: []problem{{"[database.read]", `invalid max_conn_idle_time "idle"`}}},
 		{name: "database.read without hosts is not checked", content: db + "\n[database.read]\nhosts = []\nmax_conn_idle_time = \"idle\"\n" + managesieve},
 		{name: "database on a node that queries none is not checked", content: "[database]\nmigration_timeout = \"soon\"\n\n" + db + "max_conn_lifetime = \"an hour\"\n" + metrics},
+		// So is a host whose connection string cannot be built from the endpoint's port.
+		{name: "database ports", content: db + "port = 5433\n\n[database.read]\nhosts = [\"replica.example.com\"]\nport = \"5434\"\n" + managesieve},
+		{name: "database.write port out of range", content: db + "port = 70000\n" + managesieve,
+			want: []problem{{"[database.write]", "port number 70000 is out of the valid range (1-65535)"}}},
+		{name: "database.read port not a number", content: db + "\n[database.read]\nhosts = [\"replica.example.com\"]\nport = \"x\"\n" + managesieve,
+			want: []problem{{"[database.read]", `invalid string for port: "x"`}}},
+		{name: "database port unused when every host names one", content: "[database.write]\nhosts = [\"db.example.com:5433\"]\nport = \"x\"\n" + managesieve},
 
 		// #1105: the TLS manager refused these last, after every other service was up.
 		{name: "tls letsencrypt", content: tls + "renew_before = \"720h\"\nsync_interval = \"0\"\n" + metrics},
