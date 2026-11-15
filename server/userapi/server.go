@@ -643,7 +643,7 @@ func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 // challenge says error="invalid_token" (RFC 6750 section 3.1), so a client can tell it
 // apart from a request that carried no token.
 func (s *Server) writeTokenRefused(w http.ResponseWriter) {
-	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, true)
+	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, server.BearerInvalidToken)
 	s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
 }
 
