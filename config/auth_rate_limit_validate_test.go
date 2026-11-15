@@ -93,3 +93,37 @@ func TestAuthRateLimitNonFiniteMultiplierRejected(t *testing.T) {
 		}
 	}
 }
+
+// An exempt_networks entry that is neither an IP address nor a CIDR exempts nobody:
+// the limiter's match skips it, so the host the operator meant to exempt is counted
+// and blocked like any other client. It is refused at startup and on reload, as a
+// malformed [servers] trusted_networks entry is (#709).
+func TestAuthRateLimitInvalidExemptNetworksRejected(t *testing.T) {
+	for _, entry := range []string{"webmail.example.com", "10.0.0.5/33", "192.0.2.256", "2001:db8::/129", ""} {
+		for _, enabled := range []string{"true", "false"} {
+			s := decodeAuthRateLimitServer(t, "enabled = "+enabled+"\nexempt_networks = [\"192.0.2.10\", \""+entry+"\"]\n")
+			err := s.Validate()
+			if err == nil {
+				t.Errorf("enabled = %s, exempt_networks entry %q: accepted", enabled, entry)
+				continue
+			}
+			if !strings.Contains(err.Error(), "exempt_networks") || !strings.Contains(err.Error(), `"`+entry+`"`) {
+				t.Errorf("exempt_networks entry %q: error %q does not name the key and the entry", entry, err)
+			}
+		}
+	}
+}
+
+// IPv4 and IPv6 addresses and CIDRs, and the empty list (exempt nobody), stay valid.
+func TestAuthRateLimitValidExemptNetworksAccepted(t *testing.T) {
+	for _, list := range []string{
+		`[]`,
+		`["192.0.2.10"]`,
+		`["192.0.2.0/24", "10.0.0.5/32", "2001:db8::1", "2001:db8::/32", "::ffff:192.0.2.5"]`,
+	} {
+		s := decodeAuthRateLimitServer(t, "enabled = true\nexempt_networks = "+list+"\n")
+		if err := s.Validate(); err != nil {
+			t.Errorf("exempt_networks = %s rejected: %v", list, err)
+		}
+	}
+}

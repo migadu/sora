@@ -14,8 +14,8 @@ import (
 )
 
 // errorBody decodes an error response of the User API: Content-Type application/json and
-// a body that is one object holding a non-empty "error" string (docs/user-api.md, "Error
-// Response Format"; components/responses in user_api_openapi.yaml).
+// a body that is one object holding a non-empty "error" string (docs/USER_API.md, section 4
+// "Requests, responses and errors"; components/responses in user_api_openapi.yaml).
 func errorBody(t *testing.T, w *httptest.ResponseRecorder) string {
 	t.Helper()
 	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
@@ -81,7 +81,8 @@ func TestUserAPIProxy_OwnErrorsAreJSON(t *testing.T) {
 }
 
 // A token the proxy refuses is answered as the backend answers the same token: the same
-// status, Content-Type and body, so a client cannot tell which of the two refused it.
+// status, Content-Type, WWW-Authenticate challenge and body, so a client cannot tell which
+// of the two refused it. RFC 9110 section 15.5.2 requires the challenge on every 401.
 func TestUserAPIProxy_RefusedTokenIsAnsweredAsTheBackendAnswersIt(t *testing.T) {
 	api, err := userapi.New(nil, userapi.ServerOptions{Name: "json-backend", JWTSecret: corsTestSecret})
 	if err != nil {
@@ -128,6 +129,12 @@ func TestUserAPIProxy_RefusedTokenIsAnsweredAsTheBackendAnswersIt(t *testing.T) 
 			}
 			if got, want := viaProxy.Header().Get("Content-Type"), direct.Header().Get("Content-Type"); got != want {
 				t.Errorf("proxy's Content-Type = %q, want the backend's %q", got, want)
+			}
+			if direct.Header().Get("WWW-Authenticate") == "" {
+				t.Errorf("backend's 401 carries no WWW-Authenticate challenge")
+			}
+			if got, want := viaProxy.Header().Values("WWW-Authenticate"), direct.Header().Values("WWW-Authenticate"); !reflect.DeepEqual(got, want) {
+				t.Errorf("proxy's WWW-Authenticate = %q, want the backend's %q", got, want)
 			}
 			var got, want map[string]any
 			if err := json.Unmarshal(direct.Body.Bytes(), &want); err != nil {

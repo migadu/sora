@@ -14,14 +14,17 @@ import (
 func BuildEnvelope(msg *Message) (*imap.Envelope, error) {
 	var envelope imap.Envelope
 	// RFC 3501 §7.4.2 / RFC 9051 §7.5.2: the ENVELOPE date is the message's
-	// origination Date: header (SentDate), not the server's INTERNALDATE. Fall
-	// back to INTERNALDATE only when the message had no parseable Date: header.
-	envelope.Date = msg.SentDate
-	if envelope.Date.IsZero() {
-		envelope.Date = msg.InternalDate
+	// origination Date: header (SentDate), never the server's INTERNALDATE. Without
+	// a Date: header that parses the member is NIL (go-imap writes NIL for the zero
+	// time); SentDate is then the INTERNALDATE, which RFC 5256 §2.2 has SORT and
+	// THREAD use instead.
+	if !msg.NoDateHeader {
+		envelope.Date = msg.SentDate
 	}
 	envelope.Subject = msg.Subject
-	envelope.MessageID = msg.MessageID
+	// RFC 9051 §7.5.2: an absent Message-ID is a NIL member, which go-imap writes for
+	// "". A synthetic ID is not the header; passed on, it came out in doubled brackets.
+	envelope.MessageID = headerMessageID(msg.MessageID)
 
 	// Split the In-Reply-To header into individual message IDs
 	if msg.InReplyTo != "" {
@@ -83,16 +86,20 @@ func BuildEnvelope(msg *Message) (*imap.Envelope, error) {
 
 func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailboxID int64) (*imap.Envelope, error) {
 	var msg Message
+	var sentUTCOffset *int32
 	msg.UID = UID
 	msg.MailboxID = mailboxID
 
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
         SELECT 
-            internal_date, subject, in_reply_to, message_id, recipients_json 
+            internal_date, sent_date, sent_utc_offset, sent_date_unknown IS TRUE, subject, in_reply_to, message_id, recipients_json
         FROM messages 
         WHERE uid = $1 AND mailbox_id = $2 AND expunged_at IS NULL
     `, int64(UID), mailboxID).Scan(
 		&msg.InternalDate,
+		&msg.SentDate,
+		&sentUTCOffset,
+		&msg.NoDateHeader,
 		&msg.Subject,
 		&msg.InReplyTo,
 		&msg.MessageID,
@@ -102,6 +109,7 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 		logger.Error("Database: failed to fetch envelope fields", "uid", UID, "mailbox_id", mailboxID, "err", err)
 		return nil, err
 	}
+	msg.SentDate = sentDateInHeaderZone(msg.SentDate, sentUTCOffset)
 
 	return BuildEnvelope(&msg)
 }

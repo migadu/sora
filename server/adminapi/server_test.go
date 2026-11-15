@@ -153,6 +153,17 @@ func TestAuthMiddleware(t *testing.T) {
 			if !strings.Contains(rr.Body.String(), tt.expectedBodyContains) {
 				t.Errorf("authMiddleware() body = %v, want to contain %v", rr.Body.String(), tt.expectedBodyContains)
 			}
+
+			// RFC 9110 section 15.5.2: "The server generating a 401 response MUST send a
+			// WWW-Authenticate header field (Section 11.6.1) containing at least one
+			// challenge applicable to the target resource." These 401s carry no usable
+			// bearer token, so the challenge has no error code (RFC 6750 section 3.1).
+			if tt.expectedStatus == http.StatusUnauthorized {
+				const want = `Bearer realm="admin-api"`
+				if got := rr.Header().Values("WWW-Authenticate"); len(got) != 1 || got[0] != want {
+					t.Errorf("authMiddleware() WWW-Authenticate = %q, want %q", got, want)
+				}
+			}
 		})
 	}
 }

@@ -248,8 +248,9 @@ func TestLMTPProxyBackendMaintenanceHeldBackendThatRefusesMail(t *testing.T) {
 
 // RCPT without a MAIL in effect is a bad sequence (RFC 5321 §3.3: 503), answered here: a
 // backend asked for it answers 5xx too, which the proxy would take for a routing
-// inconsistency (451 and a dropped lookup cache entry). It happens where a pipelining MTA
-// sends its RCPTs after a MAIL the held backend refused.
+// inconsistency (451 and a dropped lookup cache entry). A MAIL is the proxy's to answer
+// whether or not a backend is held: a held backend that refuses it does so at the first
+// recipient, as a new connection to it would.
 func TestLMTPProxyRecipientWithoutMailIsABadSequence(t *testing.T) {
 	e := setupMaintenanceLMTP(t)
 
@@ -264,9 +265,9 @@ func TestLMTPProxyRecipientWithoutMailIsABadSequence(t *testing.T) {
 
 	// backend1 refuses MAIL without the proxy knowing why (no maintenance here)
 	e.backend1.refuseMail.Store(true)
-	e.expect(t, "MAIL FROM:<sender@example.com>", "451")
-	e.expect(t, "RCPT TO:<user1@example.com>", "503 5.5.1")
-	e.recipients(t, 1, 0, "RCPT after a refused MAIL")
+	e.expect(t, "MAIL FROM:<sender@example.com>", "250")
+	e.expect(t, "RCPT TO:<user1@example.com>", "451 4.4.1")
+	e.recipients(t, 1, 0, "RCPT on a backend that refuses MAIL")
 }
 
 // Maintenance starting mid-transaction must not move it: backend1 already accepted a

@@ -4,40 +4,35 @@ import (
 	"context"
 	"errors"
 	"io"
-	"strings"
 
 	"github.com/migadu/go-imap"
-	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/spamtraining"
 )
 
 // triggerSpamTraining queues the messages a MOVE put into or took out of Junk for
-// spam filter training. moved holds the source rows the MOVE read, and uidMap maps
-// the source UIDs it actually moved. The spam training client's workers fetch and
-// submit the messages; nothing here waits for S3 or the training endpoint.
-func (s *IMAPSession) triggerSpamTraining(srcMailboxName, destMailboxName string, moved []db.Message, uidMap map[imap.UID]imap.UID, destAccountID int64, destS3Domain, destS3Localpart string) {
-	// Determine if this is a spam training operation
+// spam filter training. Junk and Trash are the mailboxes carrying the RFC 6154
+// \Junk and \Trash attributes, whatever their names. A MOVE into Junk trains spam
+// and one out of Junk trains ham, except into Trash: that is how clients delete a
+// message, and deleting spam does not say it was not spam. moved holds the source
+// rows the MOVE read, and uidMap maps the source UIDs it actually moved. The spam
+// training client's workers fetch and submit the messages; nothing here waits for
+// S3 or the training endpoint.
+func (s *IMAPSession) triggerSpamTraining(src, dest *db.DBMailbox, moved []db.Message, uidMap map[imap.UID]imap.UID, destS3Domain, destS3Localpart string) {
+	srcIsJunk := src.SpecialUse == string(imap.MailboxAttrJunk)
+	destIsJunk := dest.SpecialUse == string(imap.MailboxAttrJunk)
+
 	var trainingType spamtraining.TrainingType
-	var isTraining bool
-
-	srcIsJunk := strings.EqualFold(srcMailboxName, "Junk") || srcMailboxName == consts.MailboxJunk
-	destIsJunk := strings.EqualFold(destMailboxName, "Junk") || destMailboxName == consts.MailboxJunk
-
-	if destIsJunk && !srcIsJunk {
-		// Moving TO Junk = mark as spam
+	switch {
+	case destIsJunk && !srcIsJunk:
 		trainingType = spamtraining.TrainingTypeSpam
-		isTraining = true
-	} else if srcIsJunk && !destIsJunk {
-		// Moving FROM Junk = mark as ham (not spam)
+	case srcIsJunk && !destIsJunk && dest.SpecialUse != string(imap.MailboxAttrTrash):
 		trainingType = spamtraining.TrainingTypeHam
-		isTraining = true
-	}
-
-	if !isTraining {
+	default:
 		return // Not a spam training operation
 	}
+	destAccountID := dest.AccountID
 
 	// Get user email from session (already available, no need for DB lookup)
 	userEmail := s.FullAddress()
@@ -70,8 +65,8 @@ func (s *IMAPSession) triggerSpamTraining(srcMailboxName, destMailboxName string
 		err := s.server.spamTraining.Enqueue(spamtraining.Job{
 			Type:          trainingType,
 			User:          userEmail,
-			SourceMailbox: srcMailboxName,
-			DestMailbox:   destMailboxName,
+			SourceMailbox: src.Name,
+			DestMailbox:   dest.Name,
 			Size:          int64(msg.Size),
 			Open: func(ctx context.Context) (io.ReadCloser, error) {
 				// The moved row, and the staged body with it, belongs to the
