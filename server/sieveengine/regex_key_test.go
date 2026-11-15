@@ -2,6 +2,7 @@ package sieveengine
 
 import (
 	"context"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -50,7 +51,33 @@ func TestValidateScriptRefusesMalformedRegexKey(t *testing.T) {
 	}
 }
 
-// A :regex key compiled when the script loads still files the message and sets
+// ValidateScript checks a :regex key without compiling it. Counted repetition
+// makes a 1000-byte key such as "(?:a...a){1000}" compile to a program of some
+// 45 MB, so compiling and keeping every key of a script made one 15 KB
+// PUTSCRIPT (under ManageSieve's 16 KB limit; the User API takes 64 KB)
+// allocate over 3 GB, and the delivery script cache hold some 700 MB for each
+// such script.
+func TestValidateScriptDoesNotCompileRegexKeys(t *testing.T) {
+	key := `"(?:` + strings.Repeat("a", 990) + `){1000}"`
+	keys := make([]string, 15)
+	for i := range keys {
+		keys[i] = key
+	}
+	script := `require "regex"; if header :regex "Subject" [` + strings.Join(keys, ", ") + `] { stop; }`
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	err := ValidateScript(script, nil)
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatalf("ValidateScript: %v", err)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 16<<20 {
+		t.Fatalf("ValidateScript of a %d-byte script allocated %d MB, want under 16 MB", len(script), allocated>>20)
+	}
+}
+
+// A :regex key checked when the script loads still files the message and sets
 // the match variables at delivery.
 func TestRegexKeyMatchesAtDelivery(t *testing.T) {
 	script := `require ["regex", "variables", "fileinto"];
