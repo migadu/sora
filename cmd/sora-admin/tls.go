@@ -1361,6 +1361,9 @@ func foreignOwner(info os.FileInfo) *fileOwner {
 // sticky directory such as /tmp each user's entries are their own, so what is made in
 // one stays its maker's.
 func makeCacheDir(dir string) error {
+	// filepath.Dir of a name with a trailing slash ("/var/lib/sora/certs/") is the
+	// directory itself, not the one it is created in.
+	dir = filepath.Clean(dir)
 	err := os.Mkdir(dir, 0700)
 	if parent := filepath.Dir(dir); errors.Is(err, fs.ErrNotExist) && parent != dir {
 		if err = makeCacheDir(parent); err == nil {

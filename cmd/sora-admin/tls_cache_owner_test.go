@@ -212,6 +212,35 @@ func TestTLSCacheGivesTheCacheDirItCreatesToTheParentsOwner(t *testing.T) {
 	}
 }
 
+// TestTLSCacheGivesACacheDirNamedWithATrailingSlashToTheParentsOwner: fallback_dir =
+// "/var/lib/sora/certs/" or --cache-dir with a trailing slash names the same directory,
+// whose parent is still /var/lib/sora. filepath.Dir of such a name is the directory
+// itself, so tls cache looked up the owner of the directory it had just made: run as
+// root that is root, nothing was given away, and the certificates written into it stayed
+// root's as well. Here every directory appears to be another user's, so the mistake
+// shows as a hand-over of the directory by its unclean name to its own owner.
+func TestTLSCacheGivesACacheDirNamedWithATrailingSlashToTheParentsOwner(t *testing.T) {
+	_, endpoint := newTLSStubS3(t)
+	cfg := tlsTestConfig(endpoint)
+	putServerCertificates(t, cfg, "mail.example.com")
+	stateDir := t.TempDir()
+	cacheDir := filepath.Join(stateDir, "certs")
+	handOvers := recordTLSHandOvers(t)
+
+	if err := cacheTLSCertificates(context.Background(), cfg, cacheDir+string(filepath.Separator), "", false); err != nil {
+		t.Fatalf("cacheTLSCertificates: %v", err)
+	}
+	if len(*handOvers) != 2 {
+		t.Fatalf("tls cache gave away %+v, want the directory it created, then the certificate", *handOvers)
+	}
+	if h, w := (*handOvers)[0], tlsOwner(t, stateDir); h.path != cacheDir || h.uid != w.uid || h.gid != w.gid {
+		t.Errorf("hand-over 0 = %+v, want %s given to the owner of %s, %d:%d", h, cacheDir, stateDir, w.uid, w.gid)
+	}
+	if h := (*handOvers)[1]; !isTLSCacheTempFile(cacheDir, h.path) {
+		t.Errorf("hand-over 1 is %s, want a certificate of %s", h.path, cacheDir)
+	}
+}
+
 // TestTLSCacheLeavesADirInASharedParentToItsMaker: in a sticky directory such as /tmp,
 // each user's entries are their own, so the directory tls cache creates there is not
 // given to the sticky directory's owner (root, for /tmp).
