@@ -65,6 +65,29 @@ func TestEncodedPrintableASCIIIsNotDecoded(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// TestNonCanonicalModifiedUTF7IsNotDecoded: null shifts, '=' or CR/LF in a BASE64
+// segment and non-zero discarded bits are not modified UTF-7 (RFC 3501 §5.1.3,
+// RFC 2152), so ".&AOl-" is not a second encoding of ".&AOk-" that would merge both
+// folders into one mailbox "é". A CR/LF inside a segment stays in the raw name and is
+// refused like any other CR/LF.
+func TestNonCanonicalModifiedUTF7IsNotDecoded(t *testing.T) {
+	name, err := importedFolderName("&AOk-")
+	require.NoError(t, err)
+	require.Equal(t, "é", name)
+
+	for _, raw := range []string{"&AOl-", "&AOk=-", "&AOk-&AOk-", "Work/&AOl-"} {
+		name, err := importedFolderName(raw)
+		require.NoError(t, err, raw)
+		assert.Equal(t, raw, name, raw)
+
+		_, err = decodeMailboxLevelUTF7(raw)
+		assert.Error(t, err, raw)
+	}
+
+	_, err = importedFolderName("&AO\r\n\r\nk-")
+	assert.Error(t, err)
+}
+
 // TestUndecodableLevelStaysBelowDecodedParent: a folder level that is not valid
 // modified UTF-7 keeps its raw name, but the levels above it are still decoded. The
 // parent folder ".Donn&AOk-es" is imported as "Données", so its child must be named
