@@ -89,3 +89,35 @@ if address :index 1 ["To", "Cc"] "cc@example.org" { fileinto "wrong-to"; }
 		t.Errorf("mailboxes = %q, want %q", result.Mailboxes, want)
 	}
 }
+
+// TestAddressSkipsNonAddressHeader: RFC 5228 §5.1 "Implementations MUST
+// restrict the address test to headers that contain addresses". An address test
+// on any other header is false, as it was before the header and address tests
+// took :index; with that change such a header was read as one with no fields,
+// which matches the empty string, so `address :matches "X-Envelope-From" "*"`
+// was true for every message. Such a header does not count for :index either.
+func TestAddressSkipsNonAddressHeader(t *testing.T) {
+	const script = `require ["index", "fileinto"];
+if address :matches "X-Envelope-From" "*" { fileinto "x-envelope-from"; }
+if address :is "Subject" "" { fileinto "subject"; }
+if address :matches "Return-Path" "*" { fileinto "return-path"; }
+if address :index 1 ["X-Envelope-From", "From"] "sender@example.net" { fileinto "from"; }
+`
+	executor, err := NewSieveExecutorWithExtensions(script, EffectiveExtensions(nil))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	result, err := executor.Evaluate(context.Background(), rawContext(t,
+		"From: sender@example.net\r\n"+
+			"To: user@example.com\r\n"+
+			"Subject: hello\r\n"+
+			"X-Envelope-From: bounce@example.net\r\n"+
+			"\r\n"+
+			"body\r\n"))
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if want := []string{"from"}; !slices.Equal(result.Mailboxes, want) {
+		t.Errorf("mailboxes = %q, want %q", result.Mailboxes, want)
+	}
+}
