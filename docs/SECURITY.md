@@ -251,8 +251,8 @@ above the most connections the proxies let one address open in total. In cluster
 proxies' own `max_connections_per_ip`, which `imap_proxy`, `pop3_proxy` and `managesieve_proxy`
 count across all proxy nodes of the protocol. Without `[cluster]` each proxy listener counts only
 its own connections, so it is that limit times the number of proxy listeners. Leave headroom above
-it: the cluster-wide count is eventually consistent, and a proxy frees a client's slot a moment
-before the backend sees the connection close.
+it: the cluster-wide count is eventually consistent, and when a proxy closes a session the backend
+can still count its connection for a moment after the proxy has freed the client's slot.
 
 What a client sees:
 
