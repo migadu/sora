@@ -628,8 +628,8 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	// Check the staging path before any uploader or cleanup worker starts.
 	if storageServicesNeeded {
 		// The default [uploader] path moved off /tmp. Before any worker starts, refuse to
-		// strand bodies a previous release staged at the old default.
-		if err := uploader.CheckLegacyStaging(cfg.Uploader.Path, config.DefaultUploaderPath, config.LegacyDefaultUploaderPath); err != nil {
+		// strand bodies a previous release staged at the old default, as this user.
+		if err := uploader.CheckLegacyStaging(cfg.Uploader.Path, config.DefaultUploaderPath, config.LegacyDefaultUploaderPath, os.Geteuid()); err != nil {
 			errorHandler.ValidationError("uploader path", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
