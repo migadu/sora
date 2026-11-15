@@ -215,6 +215,14 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 			content: "[cluster]\nenabled = true\naddr = \"10.10.10.40:7946\"\nsecret_key = \"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\"\n" + metrics,
 		},
 		{
+			// memberlist cannot bind it: "bind: invalid argument".
+			name:    "cluster port out of range",
+			content: "[cluster]\nenabled = true\naddr = \"10.10.10.40\"\nport = 70000\nsecret_key = \"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\"\n" + metrics,
+			wantErr: []string{"cluster port 70000 is not a valid port"},
+		},
+
+		{name: "cluster port overflow", content: "[cluster]\nenabled = true\naddr = \"[2001:db8::40]:999999999999999999999999999999\"\nsecret_key = \"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\"\n" + metrics, wantErr: []string{`cluster port "999999999999999999999999999999" is not a valid port`}},
+		{
 			name:    "mail backend without database and S3",
 			content: imapBackend,
 			wantErr: []string{`server "imap" (imap) needs the database`, "bucket is required"},

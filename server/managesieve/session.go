@@ -441,7 +441,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		// username. Not recorded as a failure: the credentials were right.
 		if authzID != "" && authzID != authnID {
 			outcome = ""
-			s.DebugLog("proxy authentication requires master credentials", "authz_id", authzID, "authn_id", authnID)
+			s.InfoLog("authorization failed", "address", address.BaseAddress(), "authzid", authzID, "method", method)
 			return &managesieveserver.Error{Message: msieve.Quote("Proxy authentication requires master credentials")}
 		}
 

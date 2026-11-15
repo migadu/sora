@@ -16,12 +16,15 @@ import (
 // session's other lines (protocol, remote, session, and on success user/account_id),
 // and its cached/method say how the password was checked. The second login with the
 // same password is answered by the lookup cache, the wrong passwords by the database.
-// AUTHENTICATE and LOGIN authenticate in separate functions, so both are probed.
+// AUTHENTICATE and LOGIN authenticate in separate functions, so both are probed. The
+// last login has the right password but asks to act as another user: it is refused
+// for authorization, and that is its result.
 func TestManageSieveLoginResultLoggedOnceThroughSession(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	rdb := common.SetupTestDatabase(t)
 	account := common.CreateTestAccount(t, rdb)
+	other := common.CreateTestAccount(t, rdb)
 	address := startManageSieveWithMasterSASL(t, rdb, server.AuthRateLimiterConfig{}, "", "")
 	logs := common.CaptureLogs(t)
 
@@ -35,6 +38,9 @@ func TestManageSieveLoginResultLoggedOnceThroughSession(t *testing.T) {
 			t.Fatalf("%s with a wrong password: %q, want NO", verb.name, reply)
 		}
 	}
+	if reply := msAuthPlain(t, address, other.Email, account.Email, account.Password); reply != `NO "Proxy authentication requires master credentials"` {
+		t.Fatalf("AUTHENTICATE PLAIN acting as another user: %q, want the authorization refusal", reply)
+	}
 
 	success := []string{"protocol=ManageSieve-", "user=" + account.Email, `msg="authentication successful"`}
 	failed := []string{"protocol=ManageSieve-", "address=" + account.Email, `msg="authentication failed"`, "reason=invalid_password", "cached=false", "method=main_db"}
@@ -43,5 +49,6 @@ func TestManageSieveLoginResultLoggedOnceThroughSession(t *testing.T) {
 		slices.Concat(success, []string{"cached=true", "method=cache"}),
 		failed,
 		failed,
+		[]string{"protocol=ManageSieve-", "address=" + account.Email, `msg="authorization failed"`, "authzid=" + other.Email, "method=main_db"},
 	)
 }

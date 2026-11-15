@@ -413,7 +413,9 @@ func (c *ClusterConfig) GetBindAddr() string {
 	return host
 }
 
-// GetBindPort returns the bind port from addr or the port field
+// GetBindPort returns the bind port from addr or the port field. A port key of 0 means
+// unset; any other value is returned as written, so Validate refuses a negative one
+// instead of it binding the default.
 func (c *ClusterConfig) GetBindPort() int {
 	// If addr contains a port, use that
 	if _, p := splitClusterAddr(c.Addr); p != "" {
@@ -423,7 +425,7 @@ func (c *ClusterConfig) GetBindPort() int {
 	}
 
 	// Otherwise use explicit port field
-	if c.Port > 0 {
+	if c.Port != 0 {
 		return c.Port
 	}
 
@@ -442,10 +444,11 @@ func (c *ClusterConfig) GetMaxEventQueueSize() int {
 // Validate checks an enabled [cluster] for the settings gossip cannot run without.
 //
 // addr must be an IP address the other nodes can reach: it is bound and advertised as
-// is, so 0.0.0.0, ::, localhost or a host name cannot be used. secret_key is required
-// and must be the base64 of 32 bytes (AES-256): gossip carries auth-failure state, IP
-// blocks and connection-kick commands, which any host able to reach the gossip port
-// could forge without encryption.
+// is, so 0.0.0.0, ::, localhost or a host name cannot be used. Its port (from addr, or
+// the port key) must be one memberlist can bind; :0 in addr binds a free port, which
+// memberlist advertises. secret_key is required and must be the base64 of 32 bytes (AES-256):
+// gossip carries auth-failure state, IP blocks and connection-kick commands, which any
+// host able to reach the gossip port could forge without encryption.
 func (c *ClusterConfig) Validate() error {
 	if !c.Enabled {
 		return nil
@@ -453,6 +456,16 @@ func (c *ClusterConfig) Validate() error {
 	bindAddr := c.GetBindAddr()
 	if ip := net.ParseIP(bindAddr); ip == nil || ip.IsUnspecified() {
 		return fmt.Errorf("cluster addr '%s' must be a specific IP address reachable from other nodes, such as \"10.10.10.40:7946\" (not 0.0.0.0, ::, localhost or a host name)", bindAddr)
+	}
+	// GetBindPort falls back to the port key or default when Atoi fails. An
+	// explicit port must not silently change because it overflows or is malformed.
+	if _, port := splitClusterAddr(c.Addr); port != "" {
+		if _, err := strconv.Atoi(port); err != nil {
+			return fmt.Errorf("cluster port %q is not a valid port (0 to 65535)", port)
+		}
+	}
+	if port := c.GetBindPort(); port < 0 || port > 65535 {
+		return fmt.Errorf("cluster port %d is not a valid port (0 to 65535)", port)
 	}
 	if c.SecretKey == "" {
 		return errors.New("cluster secret_key is required when cluster mode is enabled (generate one with: openssl rand -base64 32)")
