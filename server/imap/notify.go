@@ -875,6 +875,14 @@ func (s *IMAPSession) notifySnapshotAndMatches(ctx context.Context, watch *notif
 	return snapshot, matchedIDs, nil
 }
 
+// notifyCarriedEntry pairs a carried descendant's pre- and post-rename
+// snapshot entries so watches matching either state observe the ancestor
+// rename.
+type notifyCarriedEntry struct {
+	prev notifySnapshotEntry
+	cur  notifySnapshotEntry
+}
+
 // notifyTreeEvent is one detected mailbox-tree change.
 type notifyTreeEvent struct {
 	event   imap.NotifyEvent // MailboxName or SubscriptionChange
@@ -888,10 +896,12 @@ type notifyTreeEvent struct {
 	// name after the change.
 	hasChildren bool
 	entry       notifySnapshotEntry
+	prev        notifySnapshotEntry
+	hasPrev     bool
 	// carried holds descendants whose rename this ancestor represents. A
 	// watched descendant can make the ancestor relevant even when the
 	// ancestor itself is outside a SUBSCRIBED or explicit mailbox filter.
-	carried []notifySnapshotEntry
+	carried []notifyCarriedEntry
 }
 
 // diffNotifySnapshots compares two account snapshots and returns the
@@ -927,7 +937,7 @@ func diffNotifySnapshots(prev, cur map[int64]notifySnapshotEntry) []notifyTreeEv
 
 	var events []notifyTreeEvent
 	var createdOrDeleted []string
-	var carriedBy map[string][]notifySnapshotEntry
+	var carriedBy map[string][]notifyCarriedEntry
 	for id, old := range prev {
 		if _, exists := cur[id]; !exists {
 			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: old.name, deleted: true, entry: old})
@@ -941,9 +951,9 @@ func diffNotifySnapshots(prev, cur map[int64]notifySnapshotEntry) []notifyTreeEv
 			superior = renamedWithSuperior(old.name, entry.name, renamed)
 			if superior != "" {
 				if carriedBy == nil {
-					carriedBy = make(map[string][]notifySnapshotEntry)
+					carriedBy = make(map[string][]notifyCarriedEntry)
 				}
-				carriedBy[superior] = append(carriedBy[superior], entry)
+				carriedBy[superior] = append(carriedBy[superior], notifyCarriedEntry{prev: old, cur: entry})
 			}
 		}
 		switch {
@@ -951,9 +961,9 @@ func diffNotifySnapshots(prev, cur map[int64]notifySnapshotEntry) []notifyTreeEv
 			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: entry.name, entry: entry})
 			createdOrDeleted = append(createdOrDeleted, entry.name)
 		case old.name != entry.name && superior == "":
-			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: entry.name, oldName: old.name, entry: entry})
+			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: entry.name, oldName: old.name, entry: entry, prev: old, hasPrev: true})
 		case old.subscribed != entry.subscribed:
-			events = append(events, notifyTreeEvent{event: imap.NotifyEventSubscriptionChange, name: entry.name, entry: entry})
+			events = append(events, notifyTreeEvent{event: imap.NotifyEventSubscriptionChange, name: entry.name, entry: entry, prev: old, hasPrev: true})
 		}
 	}
 	if len(events) == 0 {
@@ -1046,16 +1056,40 @@ func (s *IMAPSession) notifyDiffSnapshots(watch *notifyWatch, cur map[int64]noti
 	// As in LIST, the child attributes go with the CHILDREN capability.
 	children := s.GetCapabilities().Has(imap.CapChildren)
 	for _, ev := range events {
-		interested := watch.eventsForMailbox(ev.name, ev.entry.subscribed, sharedRoot)[ev.event]
-		if !interested && ev.event == imap.NotifyEventMailboxName {
-			// A single visible ancestor rename represents its carried
-			// descendants. Keep that rename observable when a descendant
-			// is watched but the ancestor itself is not (e.g. SUBSCRIBED).
-			for _, child := range ev.carried {
-				if watch.eventsForMailbox(child.name, child.subscribed, sharedRoot)[imap.NotifyEventMailboxName] {
-					interested = true
-					break
+		includeOldName := ev.oldName != ""
+		var interested bool
+		switch ev.event {
+		case imap.NotifyEventMailboxName:
+			interested = watch.eventsForMailbox(ev.name, ev.entry.subscribed, sharedRoot)[imap.NotifyEventMailboxName]
+			if !interested && !ev.deleted && ev.hasPrev {
+				interested = watch.eventsForMailbox(ev.prev.name, ev.prev.subscribed, sharedRoot)[imap.NotifyEventMailboxName]
+			}
+			if !interested {
+				// A single visible ancestor rename represents its carried
+				// descendants. Keep that rename observable when a descendant
+				// is watched (before or after the rename) even when the
+				// ancestor itself is outside a SUBSCRIBED or explicit filter.
+				for _, child := range ev.carried {
+					if watch.eventsForMailbox(child.cur.name, child.cur.subscribed, sharedRoot)[imap.NotifyEventMailboxName] ||
+						watch.eventsForMailbox(child.prev.name, child.prev.subscribed, sharedRoot)[imap.NotifyEventMailboxName] {
+						interested = true
+						break
+					}
 				}
+			}
+			if !interested && !ev.deleted && ev.hasPrev && ev.prev.subscribed != ev.entry.subscribed {
+				// An independent rename whose subscription also changed emits
+				// one MailboxName event in diffNotifySnapshots; report it as a
+				// SubscriptionChange LIST (without OLDNAME) when the watch
+				// only requested SubscriptionChange.
+				interested = watch.eventsForMailbox(ev.name, ev.entry.subscribed, sharedRoot)[imap.NotifyEventSubscriptionChange] ||
+					watch.eventsForMailbox(ev.prev.name, ev.prev.subscribed, sharedRoot)[imap.NotifyEventSubscriptionChange]
+				includeOldName = false
+			}
+		case imap.NotifyEventSubscriptionChange:
+			interested = watch.eventsForMailbox(ev.name, ev.entry.subscribed, sharedRoot)[imap.NotifyEventSubscriptionChange]
+			if !interested && ev.hasPrev {
+				interested = watch.eventsForMailbox(ev.prev.name, ev.prev.subscribed, sharedRoot)[imap.NotifyEventSubscriptionChange]
 			}
 		}
 		if !interested {
@@ -1069,7 +1103,7 @@ func (s *IMAPSession) notifyDiffSnapshots(watch *notifyWatch, cur map[int64]noti
 			// §5.4: names no longer accessible carry \NonExistent.
 			data.Attrs = append(data.Attrs, imap.MailboxAttrNonExistent)
 		} else {
-			if ev.oldName != "" {
+			if includeOldName {
 				// §5.4: renames announce the new name with OLDNAME (the
 				// NOTIFY writer includes it for every client).
 				data.OldName = ev.oldName
