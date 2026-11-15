@@ -1174,8 +1174,9 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 	return nil
 }
 
-// connectToBackend establishes a connection to the backend server.
-func (s *Session) connectToBackend() error {
+// connectToBackend establishes a connection to the backend server. When it fails, the
+// session holds no backend connection.
+func (s *Session) connectToBackend() (err error) {
 	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 		Ctx:                   s.ctx,
 		Username:              s.originalAddress, // Use original address (not resolved address) for route/affinity consistency
@@ -1261,6 +1262,14 @@ func (s *Session) connectToBackend() error {
 	s.backendWriter = bufio.NewWriter(backendConn)
 	s.mu.Unlock()
 	s.serverAddr = actualAddr
+	// From here on the session holds the connection, so a failure drops it (closed and
+	// cleared), or the next command would go to the closed connection instead of
+	// connecting afresh.
+	defer func() {
+		if err != nil {
+			s.loseBackend()
+		}
+	}()
 
 	// Enable TCP keepalive on backend connection to detect dead connections
 	// This helps detect network partitions and stale connections without waiting for read timeout
@@ -1291,11 +1300,9 @@ func (s *Session) connectToBackend() error {
 	// accepts TCP but never sends its greeting must not hang the session)
 	greeting, err := s.readBackendLine()
 	if err != nil {
-		s.backendConn.Close()
 		return fmt.Errorf("failed to read backend greeting: %w", err)
 	}
 	if !strings.HasPrefix(greeting, "220") {
-		s.backendConn.Close()
 		return fmt.Errorf("unexpected backend greeting: %q", strings.TrimSpace(greeting))
 	}
 
@@ -1303,7 +1310,6 @@ func (s *Session) connectToBackend() error {
 	lhloCmd := fmt.Sprintf("LHLO %s\r\n", s.server.hostname)
 	_, err = s.backendWriter.WriteString(lhloCmd)
 	if err != nil {
-		s.backendConn.Close()
 		return fmt.Errorf("failed to send LHLO: %w", err)
 	}
 	s.backendWriter.Flush()
@@ -1313,12 +1319,10 @@ func (s *Session) connectToBackend() error {
 	s.backendSMTPUTF8, s.backendSIZE = false, false
 	for lines := 0; ; lines++ {
 		if lines >= maxLHLOResponseLines {
-			s.backendConn.Close()
 			return fmt.Errorf("backend LHLO response exceeded %d lines", maxLHLOResponseLines)
 		}
 		response, err := s.readBackendLine()
 		if err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("failed to read LHLO response: %w", err)
 		}
 
@@ -1333,7 +1337,6 @@ func (s *Session) connectToBackend() error {
 		// Check if this is the last line (no hyphen after status code)
 		if len(response) >= 4 && response[3] != '-' {
 			if !strings.HasPrefix(response, "250") {
-				s.backendConn.Close()
 				return fmt.Errorf("backend LHLO failed: %s", response)
 			}
 			break
@@ -1349,7 +1352,6 @@ func (s *Session) connectToBackend() error {
 		// Send STARTTLS command
 		_, err := s.backendWriter.WriteString("STARTTLS\r\n")
 		if err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("failed to send STARTTLS command: %w", err)
 		}
 		s.backendWriter.Flush()
@@ -1357,12 +1359,10 @@ func (s *Session) connectToBackend() error {
 		// Read STARTTLS response (bounded, with read deadline)
 		response, err := s.readBackendLine()
 		if err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("failed to read STARTTLS response: %w", err)
 		}
 
 		if !strings.HasPrefix(strings.TrimSpace(response), "220") {
-			s.backendConn.Close()
 			return fmt.Errorf("backend STARTTLS failed: %s", strings.TrimSpace(response))
 		}
 
@@ -1370,7 +1370,6 @@ func (s *Session) connectToBackend() error {
 		// could have put them. The reader replaced below would drop them; a stream that
 		// broke the protocol there fails the connection instead (cf. CVE-2011-0411).
 		if s.backendReader.Buffered() > 0 {
-			s.backendConn.Close()
 			return errors.New("backend sent data after its STARTTLS response")
 		}
 
@@ -1378,18 +1377,15 @@ func (s *Session) connectToBackend() error {
 		// handshake gets its own: a backend that never answers must not hold the session.
 		if timeout := s.server.connManager.GetConnectTimeout(); timeout > 0 {
 			if err := s.backendConn.SetDeadline(time.Now().Add(timeout)); err != nil {
-				s.backendConn.Close()
 				return fmt.Errorf("failed to set the STARTTLS handshake deadline: %w", err)
 			}
 		}
 		tlsConn := tls.Client(s.backendConn, tlsConfig)
 		err = tlsConn.Handshake()
 		if err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("TLS handshake with backend failed: %w", err)
 		}
 		if err := tlsConn.SetDeadline(time.Time{}); err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("failed to clear the STARTTLS handshake deadline: %w", err)
 		}
 
@@ -1404,7 +1400,6 @@ func (s *Session) connectToBackend() error {
 		lhloCmd := fmt.Sprintf("LHLO %s\r\n", s.server.hostname)
 		_, err = s.backendWriter.WriteString(lhloCmd)
 		if err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("failed to send LHLO after STARTTLS: %w", err)
 		}
 		s.backendWriter.Flush()
@@ -1413,12 +1408,10 @@ func (s *Session) connectToBackend() error {
 		s.backendSMTPUTF8, s.backendSIZE = false, false
 		for lines := 0; ; lines++ {
 			if lines >= maxLHLOResponseLines {
-				s.backendConn.Close()
 				return fmt.Errorf("backend LHLO response after STARTTLS exceeded %d lines", maxLHLOResponseLines)
 			}
 			response, err := s.readBackendLine()
 			if err != nil {
-				s.backendConn.Close()
 				return fmt.Errorf("failed to read LHLO response after STARTTLS: %w", err)
 			}
 
@@ -1433,7 +1426,6 @@ func (s *Session) connectToBackend() error {
 			// Check if this is the last line
 			if len(response) >= 4 && response[3] != '-' {
 				if !strings.HasPrefix(response, "250") {
-					s.backendConn.Close()
 					return fmt.Errorf("backend LHLO after STARTTLS failed: %s", response)
 				}
 				break
@@ -1462,7 +1454,6 @@ func (s *Session) connectToBackend() error {
 		} else if err != nil {
 			// A reply of the exchange was not read (a write or read error, or the
 			// deadline). It may still come, and MAIL FROM would read it as its own.
-			s.backendConn.Close()
 			return fmt.Errorf("XCLIENT exchange with backend: %w", err)
 		}
 	}
@@ -1472,7 +1463,6 @@ func (s *Session) connectToBackend() error {
 		mailCmd := s.backendMailFrom() + "\r\n"
 		_, err = s.backendWriter.WriteString(mailCmd)
 		if err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("failed to send MAIL FROM: %w", err)
 		}
 		s.backendWriter.Flush()
@@ -1480,13 +1470,10 @@ func (s *Session) connectToBackend() error {
 		// Read MAIL FROM response (bounded, with read deadline)
 		response, err := s.readBackendLine()
 		if err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("failed to read MAIL FROM response: %w", err)
 		}
 
 		if !strings.HasPrefix(response, "250") {
-			// Dropped, not only closed: the next recipient connects afresh.
-			s.loseBackend()
 			if strings.HasPrefix(response, "552") {
 				return fmt.Errorf("%w: %s", errBackendRefusedSize, strings.TrimSpace(response))
 			}
