@@ -94,36 +94,53 @@ const maxScriptsPerAccount = 100
 // attempting a create.
 func MaxScriptsPerAccount() int { return maxScriptsPerAccount }
 
-// ErrSieveScriptLimitReached is returned by CreateScript when the account already has
-// maxScriptsPerAccount scripts. It is a permanent condition (not transient), so callers
-// can map it to a permanent protocol error rather than a retryable one.
+// ErrSieveScriptLimitReached is returned by CreateScript, and by CreateOrUpdateScript
+// for a new name, when the account already has maxScriptsPerAccount scripts. It is a
+// permanent condition (not transient), so callers can map it to a permanent protocol
+// error rather than a retryable one.
 var ErrSieveScriptLimitReached = errors.New("maximum number of sieve scripts reached")
 
-// ErrSieveScriptNotStorable is returned by CreateScript and UpdateScript when the script
-// name or content contains a NUL byte or invalid UTF-8, which PostgreSQL text columns
-// reject with SQLSTATE 22021.
+// ErrSieveScriptNotStorable is returned by CreateScript, UpdateScript and
+// CreateOrUpdateScript when the script name or content contains a NUL byte or invalid
+// UTF-8, which PostgreSQL text columns reject with SQLSTATE 22021.
 var ErrSieveScriptNotStorable = errors.New("sieve script contains NUL or invalid UTF-8")
+
+// lockScriptCreates serialises the account's script creates for the rest of tx.
+// The limit is checked against the stored count and then inserted, so two creates
+// of the account must not both read the old count: each would pass, and together
+// they would store past the limit. The lock is transaction-scoped (pgbouncer
+// transaction mode), and statements run after it is granted take a new snapshot
+// under READ COMMITTED, so they see what the previous holder committed.
+func lockScriptCreates(ctx context.Context, tx pgx.Tx, AccountID int64) error {
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int4, hashint8($2::int8))",
+		consts.SoraSieveScriptLimitLockClassID, AccountID); err != nil {
+		return fmt.Errorf("failed to lock account sieve scripts: %w", err)
+	}
+	return nil
+}
+
+// checkScriptLimit refuses a create when the account already has
+// maxScriptsPerAccount scripts. The caller holds lockScriptCreates.
+func checkScriptLimit(ctx context.Context, tx pgx.Tx, AccountID int64) error {
+	var count int
+	if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM sieve_scripts WHERE account_id = $1", AccountID).Scan(&count); err != nil {
+		return err
+	}
+	if count >= maxScriptsPerAccount {
+		return fmt.Errorf("%w (limit %d)", ErrSieveScriptLimitReached, maxScriptsPerAccount)
+	}
+	return nil
+}
 
 func (db *Database) CreateScript(ctx context.Context, tx pgx.Tx, AccountID int64, name, script string) (*SieveScript, error) {
 	if !helpers.TextStorable(name) || !helpers.TextStorable(script) {
 		return nil, ErrSieveScriptNotStorable
 	}
-	// The limit is checked against the stored count and then inserted, so two
-	// creates of the account must not both read the old count: each would pass,
-	// and together they would store past the limit. The lock is
-	// transaction-scoped (pgbouncer transaction mode), and the count below runs
-	// after it is granted, so under READ COMMITTED it sees what the previous
-	// holder committed.
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int4, hashint8($2::int8))",
-		consts.SoraSieveScriptLimitLockClassID, AccountID); err != nil {
-		return nil, fmt.Errorf("failed to lock account sieve scripts: %w", err)
-	}
-	var count int
-	if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM sieve_scripts WHERE account_id = $1", AccountID).Scan(&count); err != nil {
+	if err := lockScriptCreates(ctx, tx, AccountID); err != nil {
 		return nil, err
 	}
-	if count >= maxScriptsPerAccount {
-		return nil, fmt.Errorf("%w (limit %d)", ErrSieveScriptLimitReached, maxScriptsPerAccount)
+	if err := checkScriptLimit(ctx, tx, AccountID); err != nil {
+		return nil, err
 	}
 
 	var s SieveScript
@@ -132,6 +149,64 @@ func (db *Database) CreateScript(ctx context.Context, tx pgx.Tx, AccountID int64
 		VALUES ($1, $2, $3, false) 
 		RETURNING id, account_id, name, script, active, updated_at
 	`, AccountID, name, script).Scan(&s.ID, &s.AccountID, &s.Name, &s.Script, &s.Active, &s.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+// CreateOrUpdateScript stores script as the account's script called name: it
+// replaces the content of the script of that name, keeping its active state, or
+// creates the script, inactive, when the account has none. updated reports which.
+//
+// The choice is made in tx after lockScriptCreates, so it sees every create of the
+// name committed before it. A lookup outside tx (on a read replica that has not
+// replayed a recent create, or racing a create another session is committing)
+// misses such a script, and the create that follows fails on
+// UNIQUE (account_id, name).
+func (db *Database) CreateOrUpdateScript(ctx context.Context, tx pgx.Tx, AccountID int64, name, script string) (s *SieveScript, updated bool, err error) {
+	if !helpers.TextStorable(name) || !helpers.TextStorable(script) {
+		return nil, false, ErrSieveScriptNotStorable
+	}
+	if err := lockScriptCreates(ctx, tx, AccountID); err != nil {
+		return nil, false, err
+	}
+	if s, err := updateScriptByName(ctx, tx, AccountID, name, script); !errors.Is(err, pgx.ErrNoRows) {
+		return s, err == nil, err
+	}
+	// Replacing a script adds none, so only the create is held to the limit.
+	if err := checkScriptLimit(ctx, tx, AccountID); err != nil {
+		return nil, false, err
+	}
+
+	s = &SieveScript{}
+	err = tx.QueryRow(ctx, `
+		INSERT INTO sieve_scripts (account_id, name, script, active)
+		VALUES ($1, $2, $3, false)
+		ON CONFLICT (account_id, name) DO NOTHING
+		RETURNING id, account_id, name, script, active, updated_at
+	`, AccountID, name, script).Scan(&s.ID, &s.AccountID, &s.Name, &s.Script, &s.Active, &s.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// A rename to this name (renames do not take the lock) committed after
+		// the update above looked: that script is the one to replace.
+		s, err = updateScriptByName(ctx, tx, AccountID, name, script)
+		return s, err == nil, err
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return s, false, nil
+}
+
+// updateScriptByName replaces the content of the account's script called name.
+// It returns pgx.ErrNoRows when the account has no such script.
+func updateScriptByName(ctx context.Context, tx pgx.Tx, AccountID int64, name, script string) (*SieveScript, error) {
+	var s SieveScript
+	err := tx.QueryRow(ctx, `
+		UPDATE sieve_scripts SET script = $1, updated_at = now()
+		WHERE account_id = $2 AND name = $3
+		RETURNING id, account_id, name, script, active, updated_at
+	`, script, AccountID, name).Scan(&s.ID, &s.AccountID, &s.Name, &s.Script, &s.Active, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
