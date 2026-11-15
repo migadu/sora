@@ -120,6 +120,15 @@ in the maildir to import them.
 Within each folder, every regular file in `cur/` and `new/` whose name does not start with `.`
 is a message. Files in `new/` usually carry no flags, so they arrive unread.
 
+The maildir may have been written by its owner, while the import runs with more privileges, so
+symbolic links below the root never make it read a file outside the root. `--maildir-path` itself
+may be a link. Below it, a folder that is a link is not walked and is named in a warning. A message
+file, a `cur/` or `new/` directory, or a `subscriptions`, `dovecot-keywords` or `dovecot-uidlist`
+file that is a link is read only when the link is relative and its target is below the root. Any
+other link (one pointing outside the root, or any absolute link, even to a file inside the root)
+is not read: such a message file is reported as failed by its path, and such a `cur/` or `new/` is
+skipped with a warning naming it.
+
 ---
 
 ## 4. import maildir flags
