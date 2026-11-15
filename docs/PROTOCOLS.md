@@ -688,7 +688,9 @@ Matching:
   its name and version patterns both match the `ID` data. A name or version pattern that is left
   out counts as matching; a client that sent no `ID` never matches a name or version pattern.
 - Every matching filter applies; their `disable_caps` add up.
-- A filter whose pattern does not compile is skipped (logged at debug level). Check new patterns.
+- Patterns are Go regular expressions (RE2 syntax). A pattern that does not compile stops startup,
+  naming the entry, the key and the pattern; `sora-admin config validate` reports it too, and a
+  reload with it is skipped for that server.
 - The key is `ja4_fingerprints`, a list. A single `ja4_fingerprint` key is unknown and ignored.
 
 Where the JA4 fingerprint comes from, in order of preference:
