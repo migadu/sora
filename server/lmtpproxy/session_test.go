@@ -8,9 +8,10 @@ import (
 
 func TestExtractAddress(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		expected string
+		name       string
+		input      string
+		expected   string
+		unreadable bool
 	}{
 		{
 			name:     "basic angle bracket address",
@@ -53,9 +54,19 @@ func TestExtractAddress(t *testing.T) {
 			expected: "user@example.com",
 		},
 		{
-			name:     "address with no closing bracket (invalid)",
-			input:    "<user@example.com",
-			expected: "",
+			name:       "address with no closing bracket (invalid)",
+			input:      "<user@example.com",
+			unreadable: true,
+		},
+		{
+			name:       "opening bracket only (invalid)",
+			input:      "<",
+			unreadable: true,
+		},
+		{
+			name:       "one character (invalid)",
+			input:      "x",
+			unreadable: true,
 		},
 	}
 
@@ -65,9 +76,9 @@ func TestExtractAddress(t *testing.T) {
 			s := &Session{
 				server: &Server{},
 			}
-			result := s.extractAddress(tt.input)
-			if result != tt.expected {
-				t.Errorf("extractAddress(%q) = %q, want %q", tt.input, result, tt.expected)
+			result, ok := s.extractAddress(tt.input)
+			if result != tt.expected || ok == tt.unreadable {
+				t.Errorf("extractAddress(%q) = %q, %v, want %q, %v", tt.input, result, ok, tt.expected, !tt.unreadable)
 			}
 		})
 	}
@@ -306,9 +317,9 @@ func TestRCPTWithESMTPParameters(t *testing.T) {
 
 			// Extract the address
 			s := &Session{server: &Server{}}
-			address := s.extractAddress(param)
-			if address != tt.expectedAddress {
-				t.Errorf("extractAddress(%q) = %q, want %q", param, address, tt.expectedAddress)
+			address, ok := s.extractAddress(param)
+			if !ok || address != tt.expectedAddress {
+				t.Errorf("extractAddress(%q) = %q, %v, want %q, true", param, address, ok, tt.expectedAddress)
 			}
 		})
 	}

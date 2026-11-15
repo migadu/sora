@@ -135,9 +135,10 @@ type s3ImportTestDB struct {
 	exists   func(ctx context.Context, count *int) error
 	onInsert func()
 
-	mu        sync.Mutex
-	inserted  []string // content hashes of the messages stored
-	completed []string // content hashes marked uploaded
+	mu             sync.Mutex
+	inserted       []string // content hashes of the messages stored
+	completed      []string // content hashes marked uploaded
+	mailboxLookups int      // GetMailboxByNameWithRetry calls
 }
 
 func (m *s3ImportTestDB) GetAccountIDByAddressWithRetry(ctx context.Context, address string) (int64, error) {
@@ -152,10 +153,23 @@ func (m *s3ImportTestDB) CreateDefaultMailboxesWithRetry(ctx context.Context, ac
 }
 
 func (m *s3ImportTestDB) QueryRowWithRetry(ctx context.Context, sql string, args ...any) pgx.Row {
-	return rowFunc(func(dest ...any) error { return m.exists(ctx, dest[0].(*int)) })
+	return rowFunc(func(dest ...any) error {
+		count := dest[0].(*int)
+		if err := m.exists(ctx, count); err != nil {
+			return err
+		}
+		// The account's copies are in its INBOX: the in-INBOX count, when asked, is the same.
+		for _, d := range dest[1:] {
+			*d.(*int) = *count
+		}
+		return nil
+	})
 }
 
 func (m *s3ImportTestDB) GetMailboxByNameWithRetry(ctx context.Context, accountID int64, name string) (*db.DBMailbox, error) {
+	m.mu.Lock()
+	m.mailboxLookups++
+	m.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -364,6 +378,44 @@ func TestS3ImportDoesNotImportWhenTheExistenceCheckFails(t *testing.T) {
 	require.EqualValues(t, objects, si.failedMessages)
 }
 
+// TestS3ImportSkipCostsOnlyTheExistenceCheck: a run of `import s3` over an account that
+// already holds every object's message in INBOX (a re-run) skips them all, with or
+// without --force-reimport. Deciding a skip takes the existence check alone: no object
+// is read from S3 and no mailbox is looked up, neither by the import nor by its dry run.
+func TestS3ImportSkipCostsOnlyTheExistenceCheck(t *testing.T) {
+	const objects = 3
+	held := func(_ context.Context, count *int) error { *count = 1; return nil }
+	for _, force := range []bool{false, true} {
+		for _, dryRun := range []bool{false, true} {
+			t.Run(fmt.Sprintf("force-reimport=%v/dry-run=%v", force, dryRun), func(t *testing.T) {
+				bucket, s3storage := newS3ImportTestBucket(t, objects, 1000)
+				si, err := NewS3Importer(context.Background(), nil, s3storage, S3ImporterOptions{Email: s3ImportTestEmail,
+					DryRun: dryRun, ForceReimport: force, Workers: 1, BatchSize: 1000, CleanupDB: true,
+					InstanceID: "test-instance"})
+				require.NoError(t, err)
+				mock := &s3ImportTestDB{exists: held}
+				si.rdb = mock
+
+				out, err := runS3Import(t, si)
+				require.NoError(t, err)
+				if dryRun {
+					require.Contains(t, out, fmt.Sprintf("Would skip: %d messages", objects))
+				} else {
+					require.EqualValues(t, objects, atomic.LoadInt64(&si.skippedMessages))
+				}
+				bucket.mu.Lock()
+				gets := bucket.gets
+				bucket.mu.Unlock()
+				require.Zero(t, gets, "skipped objects were read from S3")
+				mock.mu.Lock()
+				lookups := mock.mailboxLookups
+				mock.mu.Unlock()
+				require.Zero(t, lookups, "deciding to skip an object looked a mailbox up")
+			})
+		}
+	}
+}
+
 // TestS3ImportInterruptIsNotAFailure: an object the interrupt stops before it is stored
 // is left for the next run, like the objects still queued and like the messages
 // `import maildir` leaves at an interrupt (#945): it is neither counted as failed nor
@@ -377,6 +429,7 @@ func TestS3ImportInterruptIsNotAFailure(t *testing.T) {
 	defer si.Close()
 	// The interrupt lands while the first object's "already imported?" check runs.
 	si.rdb = &s3ImportTestDB{exists: func(ctx context.Context, _ *int) error { cancel(); return ctx.Err() }}
+	require.NoError(t, si.lookupAccount())
 	insertS3Objects(t, si, "example.com", "user", 3)
 
 	err = si.importFromS3()

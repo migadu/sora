@@ -871,9 +871,9 @@ delete it on a failed backend connection, so an outage does not send one lookup 
 Failures are cached only when definite: a wrong password, or a user who does not exist. Database and
 API outages are not cached.
 
-A password change, credential removal or account deletion made through the Admin API or
-`sora-admin` drops the account's entries from the lookup cache of every proxy, whichever node or
-tool makes the change, so the old credentials stop working at once. A password changed in the remote lookup API's own system reaches
+Administrative password, credential and account changes request cache invalidation. Immediate
+revocation on every node is not guaranteed: a node that misses the change can retain cached
+credentials until they are refreshed or expire. A password changed in the remote lookup API's own system reaches
 the proxy as entries expire: the old password still works for up to `positive_ttl` for a user who
 used it recently, and the new one may be refused for up to `positive_revalidation_window`.
 
@@ -888,7 +888,7 @@ used it recently, and the new one may be refused for up to `positive_revalidatio
 | `negative_ttl` | `1m` | How long a failure is kept. |
 | `max_size` | `50000` | Entries per proxy server. When full, the oldest entry is removed. |
 | `cleanup_interval` | `5m` | How often expired entries are removed. |
-| `positive_revalidation_window` | `30s` | Age below which a different password on a success entry is rejected without a check. |
+| `positive_revalidation_window` | `30s` | Age below which a different password on a success entry is rejected without a check. Not used by the LMTP and User API proxies, which check no passwords against the cache; they warn at startup when it is set. |
 
 Durations take Go units (`90s`, `5m`, `1h`) or whole days (`1d`).
 
@@ -926,9 +926,9 @@ by the remote lookup, and master logins, never use it. It needs the node to have
 Errors reading the file are logged and the login goes to the database. The cache never fails a
 login by itself.
 
-A password change, credential removal or account deletion made through the Admin API or
-`sora-admin` removes the account's entries on every node, so the old credentials stop working at
-the proxies at once.
+Administrative password, credential and account changes also request invalidation of this cache.
+Propagation can miss a node, so old cached credentials can remain usable until refresh or expiry;
+the change does not guarantee immediate revocation at every proxy.
 
 ### 11.3 On disk
 

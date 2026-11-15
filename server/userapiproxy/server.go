@@ -56,38 +56,37 @@ type reloadableSettings struct {
 
 // Server represents a User API proxy server
 type Server struct {
-	name                       string
-	hostname                   string // labels the metrics, like every other server's hostname
-	addr                       string
-	connManager                *proxy.ConnectionManager
-	remoteUseProxyProtocol     bool // the server's own PROXY-header setting; a named pool's setting overrides it per route
-	remoteTLS                  bool // the server's own backend TLS setting; a named pool's setting overrides it per route
-	remoteTLSVerify            bool // the server's own backend certificate check; likewise
-	lookupLocalUsers           bool // a user the remote lookup does not know is routed into the default pool
-	rdb                        *resilient.ResilientDatabase
-	routingLookup              proxy.UserRoutingLookup  // RemoteLookup client for user routing (optional)
-	affinityManager            *server.AffinityManager  // Affinity manager for sticky routing (optional)
-	lookupCache                *lookupcache.LookupCache // Route lookup cache (optional)
-	positiveRevalidationWindow time.Duration            // Revalidation window for cached routes
-	tls                        bool
-	tlsCertFile                string
-	tlsKeyFile                 string
-	tlsVerify                  bool
-	tlsConfig                  *tls.Config // Global TLS config from TLS manager (optional)
-	trustedProxies             []string    // CIDR blocks for trusted proxies
-	limiter                    *server.ConnectionLimiter
-	authLimiter                *server.AuthRateLimiter // login rate limit (auth_rate_limit); nil when off
+	name                   string
+	hostname               string // labels the metrics, like every other server's hostname
+	addr                   string
+	connManager            *proxy.ConnectionManager
+	remoteUseProxyProtocol bool // the server's own PROXY-header setting; a named pool's setting overrides it per route
+	remoteTLS              bool // the server's own backend TLS setting; a named pool's setting overrides it per route
+	remoteTLSVerify        bool // the server's own backend certificate check; likewise
+	lookupLocalUsers       bool // a user the remote lookup does not know is routed into the default pool
+	rdb                    *resilient.ResilientDatabase
+	routingLookup          proxy.UserRoutingLookup  // RemoteLookup client for user routing (optional)
+	affinityManager        *server.AffinityManager  // Affinity manager for sticky routing (optional)
+	lookupCache            *lookupcache.LookupCache // Route lookup cache (optional)
+	tls                    bool
+	tlsCertFile            string
+	tlsKeyFile             string
+	tlsVerify              bool
+	tlsConfig              *tls.Config // Global TLS config from TLS manager (optional)
+	trustedProxies         []string    // CIDR blocks for trusted proxies
+	limiter                *server.ConnectionLimiter
+	authLimiter            *server.AuthRateLimiter // login rate limit (auth_rate_limit); nil when off
 	// connReleases holds the connection-limiter release callback for each live
 	// connection, keyed by net.Conn, so the slot is freed on StateClosed/
 	// StateHijacked. Without this the limiter counter only ever increments and
 	// the proxy eventually refuses every connection (permanent DoS).
 	connReleases   map[net.Conn]func()
 	connReleasesMu sync.Mutex
-	httpServer   *http.Server
-	shutdownMu   sync.Mutex
-	shutdownDone chan struct{}
-	ctx          context.Context
-	cancel       context.CancelFunc
+	httpServer     *http.Server
+	shutdownMu     sync.Mutex
+	shutdownDone   chan struct{}
+	ctx            context.Context
+	cancel         context.CancelFunc
 
 	// Base transports retain the server's dial policy. Proxied requests use a
 	// bounded cache partitioned by pool, verification policy and DNS snapshot;
@@ -364,7 +363,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 
 	// Initialize route lookup cache if configured
 	var lookupCache *lookupcache.LookupCache
-	var positiveRevalidationWindow time.Duration
 	if opts.LookupCache != nil && opts.LookupCache.Enabled && !proxy.RemoteLookupUsesClientIP(opts.RemoteLookup) {
 		lookupCacheConfig := opts.LookupCache
 
@@ -374,10 +372,10 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 
 		maxSize := lookupCacheConfig.GetMaxSize()
 
-		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(opts.Name)
-
-		lookupCache = lookupcache.New("userapi_proxy", opts.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
-		logger.Info("User API Proxy: Route lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
+		// The cache holds routes and checks no passwords (the backend checks the
+		// login), so it has no positive_revalidation_window (0).
+		lookupCache = lookupcache.New("userapi_proxy", opts.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, 0)
+		logger.Info("User API Proxy: Route lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize)
 	}
 
 	// Every login passes the proxy and some reach no backend (routeAuthRequest), so the
@@ -394,35 +392,34 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 	}
 
 	s := &Server{
-		name:                       opts.Name,
-		hostname:                   hostname,
-		addr:                       opts.Addr,
-		connManager:                connManager,
-		remoteUseProxyProtocol:     opts.RemoteUseProxyProtocol,
-		remoteTLS:                  opts.RemoteTLS,
-		remoteTLSVerify:            opts.RemoteTLSVerify,
-		lookupLocalUsers:           opts.RemoteLookup != nil && opts.RemoteLookup.ShouldLookupLocalUsers(),
-		rdb:                        rdb,
-		routingLookup:              routingLookup,
-		affinityManager:            opts.AffinityManager,
-		lookupCache:                lookupCache,
-		positiveRevalidationWindow: positiveRevalidationWindow,
-		tls:                        opts.TLS,
-		tlsCertFile:                opts.TLSCertFile,
-		tlsKeyFile:                 opts.TLSKeyFile,
-		tlsVerify:                  opts.TLSVerify,
-		tlsConfig:                  opts.TLSConfig,
-		trustedProxies:             opts.TrustedProxies,
-		limiter:                    limiter,
-		authLimiter:                authLimiter,
-		transport:                  transport,
-		transports:                 transports,
-		newTransport:               newTransport,
-		poolTransports:             make(map[backendTransportKey]*http.Transport),
-		proxyReader:                proxyReader,
-		ctx:                        ctx,
-		cancel:                     cancel,
-		connReleases:               make(map[net.Conn]func()),
+		name:                   opts.Name,
+		hostname:               hostname,
+		addr:                   opts.Addr,
+		connManager:            connManager,
+		remoteUseProxyProtocol: opts.RemoteUseProxyProtocol,
+		remoteTLS:              opts.RemoteTLS,
+		remoteTLSVerify:        opts.RemoteTLSVerify,
+		lookupLocalUsers:       opts.RemoteLookup != nil && opts.RemoteLookup.ShouldLookupLocalUsers(),
+		rdb:                    rdb,
+		routingLookup:          routingLookup,
+		affinityManager:        opts.AffinityManager,
+		lookupCache:            lookupCache,
+		tls:                    opts.TLS,
+		tlsCertFile:            opts.TLSCertFile,
+		tlsKeyFile:             opts.TLSKeyFile,
+		tlsVerify:              opts.TLSVerify,
+		tlsConfig:              opts.TLSConfig,
+		trustedProxies:         opts.TrustedProxies,
+		limiter:                limiter,
+		authLimiter:            authLimiter,
+		transport:              transport,
+		transports:             transports,
+		newTransport:           newTransport,
+		poolTransports:         make(map[backendTransportKey]*http.Transport),
+		proxyReader:            proxyReader,
+		ctx:                    ctx,
+		cancel:                 cancel,
+		connReleases:           make(map[net.Conn]func()),
 	}
 	connManager.OnMaintenanceChange(s.closeBackendIdleConnections)
 	s.settings.Store(&reloadableSettings{jwtSecret: opts.JWTSecret, allowedOrigins: opts.AllowedOrigins})
