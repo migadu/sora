@@ -905,7 +905,7 @@ func (s *Session) ErrorLog(msg string, keyvals ...any) {
 //   - "RCPT TO:<user@example.com> UNKNOWN=value" -> "RCPT TO:<user@example.com>"
 func stripUnsupportedRCPTParameters(command string) string {
 	// Only process RCPT TO commands
-	if !strings.HasPrefix(strings.ToUpper(command), "RCPT TO") {
+	if !strings.HasPrefix(server.ToUpperASCII(command), "RCPT TO") {
 		return command
 	}
 
@@ -949,7 +949,7 @@ func stripUnsupportedRCPTParameters(command string) string {
 			continue // Malformed parameter
 		}
 
-		paramName := strings.ToUpper(parts[0])
+		paramName := server.ToUpperASCII(parts[0])
 
 		// Keep only if in allowlist
 		if allowedParams[paramName] {
@@ -1965,12 +1965,13 @@ func isClosingError(err error) bool {
 }
 
 // findParameter searches for a parameter with a given prefix in a list of arguments.
-// It is case-insensitive and supports prefixes like "FROM:" or "TO:".
+// It is case-insensitive over ASCII letters (see server.ToUpperASCII) and supports
+// prefixes like "FROM:" or "TO:".
 // It handles both "KEY:value" and "KEY: value" formats.
 func findParameter(args []string, prefix string) (string, bool) {
 	for i, arg := range args {
 		// Handle "KEY: value" format where KEY: is a standalone token.
-		if strings.ToUpper(arg) == prefix {
+		if server.ToUpperASCII(arg) == prefix {
 			if i+1 < len(args) {
 				return args[i+1], true
 			}
@@ -1978,7 +1979,7 @@ func findParameter(args []string, prefix string) (string, bool) {
 		}
 
 		// Handle "KEY:value" format where it's a single token.
-		if strings.HasPrefix(strings.ToUpper(arg), prefix) {
+		if strings.HasPrefix(server.ToUpperASCII(arg), prefix) {
 			return arg[len(prefix):], true
 		}
 	}
@@ -1989,7 +1990,7 @@ func findParameter(args []string, prefix string) (string, bool) {
 // (RFC 6531 §3.4; it takes no value).
 func hasSMTPUTF8Param(args []string) bool {
 	for _, arg := range args {
-		if strings.EqualFold(arg, "SMTPUTF8") {
+		if server.EqualFoldASCII(arg, "SMTPUTF8") {
 			return true
 		}
 	}
@@ -2009,7 +2010,7 @@ func mailSizeParameter(args []string, limit int64) (size, reply string) {
 	}
 	for _, arg := range args {
 		key, value, _ := strings.Cut(arg, "=")
-		if !strings.EqualFold(key, "SIZE") {
+		if !server.EqualFoldASCII(key, "SIZE") {
 			continue
 		}
 		if size != "" || len(value) == 0 || len(value) > 20 || strings.Trim(value, "0123456789") != "" {
@@ -2044,7 +2045,7 @@ var errBackendRefusedSender = errors.New("backend refused the sender")
 // isSMTPUTF8Capability reports whether an LHLO reply line ("250-SMTPUTF8" or
 // "250 SMTPUTF8") advertises the extension.
 func isSMTPUTF8Capability(line string) bool {
-	return len(line) > 4 && strings.EqualFold(strings.TrimSpace(line[4:]), "SMTPUTF8")
+	return len(line) > 4 && server.EqualFoldASCII(strings.TrimSpace(line[4:]), "SMTPUTF8")
 }
 
 // isSIZECapability reports whether an LHLO reply line advertises SIZE (RFC 1870
@@ -2054,7 +2055,7 @@ func isSIZECapability(line string) bool {
 		return false
 	}
 	keyword, _, _ := strings.Cut(strings.TrimSpace(line[4:]), " ")
-	return strings.EqualFold(keyword, "SIZE")
+	return server.EqualFoldASCII(keyword, "SIZE")
 }
 
 // backendMailFrom is the MAIL command sent to the backend for the current transaction.
