@@ -260,7 +260,7 @@ func (d *Database) GetActiveUIDsInSet(ctx context.Context, mailboxID int64, uidS
 		args = append(args, int64(view))
 		viewParam = fmt.Sprintf("$%d", len(args))
 	}
-	query := `SELECT uid FROM ` + seqCountedRows("$1", viewParam, "("+strings.Join(conditions, " OR ")+")", "ASC") + ` counted ORDER BY uid`
+	query := `SELECT uid FROM ` + seqCountedRows("$1", viewParam, "("+strings.Join(conditions, " OR ")+")", "ASC", "") + ` counted ORDER BY uid`
 
 	rows, err := d.readQuerier(ctx).Query(ctx, query, args...)
 	if err != nil {

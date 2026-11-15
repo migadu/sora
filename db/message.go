@@ -773,7 +773,7 @@ func (db *Database) hydrateChunkSequences(ctx context.Context, mailboxID int64, 
 	}
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
 		SELECT uid, $2::bigint + ROW_NUMBER() OVER(ORDER BY uid)
-		FROM `+seqCountedRows("$1", viewParam, "uid > $3 AND uid <= $4", "ASC")+` counted
+		FROM `+seqCountedRows("$1", viewParam, "uid > $3 AND uid <= $4", "ASC", "")+` counted
 	`, args...)
 	if err != nil {
 		return fmt.Errorf("failed to query sequence window after uid %d: %w", anchorUID, err)
@@ -874,7 +874,7 @@ func hydrateSequencesCore[T any](
 		query = `
 			WITH all_uids AS (
 				SELECT uid, ROW_NUMBER() OVER(ORDER BY uid) as seqnum
-				FROM ` + seqCountedRows("$1", viewParam, "uid <= $3", "ASC") + ` counted
+				FROM ` + seqCountedRows("$1", viewParam, "uid <= $3", "ASC", "") + ` counted
 			)
 			SELECT a.uid, a.seqnum
 			FROM all_uids a
@@ -885,11 +885,11 @@ func hydrateSequencesCore[T any](
 		query = `
 			WITH counted_total AS (
 				SELECT COUNT(*)::int as cnt
-				FROM ` + seqCountedRows("$1", viewParam, "", "") + ` counted
+				FROM ` + seqCountedRows("$1", viewParam, "", "", "") + ` counted
 			),
 			all_uids AS (
 				SELECT uid, (SELECT cnt FROM counted_total) - ROW_NUMBER() OVER(ORDER BY uid DESC) + 1 as seqnum
-				FROM ` + seqCountedRows("$1", viewParam, "uid >= $3", "DESC") + ` counted
+				FROM ` + seqCountedRows("$1", viewParam, "uid >= $3", "DESC", "") + ` counted
 			)
 			SELECT a.uid, a.seqnum
 			FROM all_uids a

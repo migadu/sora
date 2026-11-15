@@ -84,7 +84,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 		}
 		seqCTE = `WITH seq AS (
 			SELECT uid, ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
-			FROM ` + seqCountedRows("@mailboxID", viewParam, "", "ASC") + ` counted
+			FROM ` + seqCountedRows("@mailboxID", viewParam, "", "ASC", "") + ` counted
 		)`
 		seqJoin = "JOIN seq ON seq.uid = m.uid"
 		seqSelect = "seq.seqnum"

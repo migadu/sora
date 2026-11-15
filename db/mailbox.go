@@ -1065,7 +1065,7 @@ func (d *Database) GetFirstUnseenSeqNum(ctx context.Context, mailboxID int64) (u
 		viewParam = "$3"
 	}
 	err = d.readQuerier(ctx).QueryRow(ctx,
-		`SELECT COUNT(*) + 1 FROM `+seqCountedRows("$1", viewParam, "uid < $2", "")+` counted`, args...).Scan(&seqNum)
+		`SELECT COUNT(*) + 1 FROM `+seqCountedRows("$1", viewParam, "uid < $2", "", "")+` counted`, args...).Scan(&seqNum)
 	if err != nil {
 		return 0, fmt.Errorf("failed to compute sequence number for UID %d: %w", firstUnseenUID, err)
 	}

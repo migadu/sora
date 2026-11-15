@@ -54,9 +54,15 @@ func heldExpungedCond(m, param string) string {
 // when it only counts them. In a view each branch of the UNION ALL is ordered by it,
 // which lets the planner merge the live branch, read in order from the live-uid index,
 // with the few held rows (a Merge Append) instead of sorting every live UID of the
-// mailbox: the numbering keeps streaming, and a LIMIT still stops it early. The held
-// branch reads only the messages expunged after the view, which are few.
-func seqCountedRows(mailboxParam, viewParam, cond, order string) string {
+// mailbox: the numbering keeps streaming. The held branch reads only the messages
+// expunged after the view, which are few.
+//
+// limit (empty for none) is how many rows, in that order, the caller reads at most. A
+// LIMIT above the UNION ALL does not reach the plans of its ordered branches, which
+// PostgreSQL then plans for reading every row, so it can sort the whole mailbox rather
+// than read the index in order and stop early. In a view each branch is limited too:
+// neither can contribute more than limit rows to the first limit rows of the merge.
+func seqCountedRows(mailboxParam, viewParam, cond, order, limit string) string {
 	if cond != "" {
 		cond = " AND " + cond
 	}
@@ -69,6 +75,10 @@ func seqCountedRows(mailboxParam, viewParam, cond, order string) string {
 	if order != "" {
 		live += " ORDER BY uid " + order
 		held += " ORDER BY m.uid " + order
+		if limit != "" {
+			live += " LIMIT " + limit
+			held += " LIMIT " + limit
+		}
 	}
 	return "((" + live + ") UNION ALL (" + held + "))"
 }
