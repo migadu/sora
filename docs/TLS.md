@@ -377,8 +377,11 @@ When several nodes use Let's Encrypt with the same bucket, run them in one clust
   node that receives Let's Encrypt's request on port 80 reads the token from there. A load
   balancer can therefore send port 80 to any node.
 - **A database claim stops duplicate orders.** On nodes that have a database, the leader takes a
-  claim in PostgreSQL (the `locks` row `acme_issuance:<name>`, held for up to 10 minutes) before it
-  orders a certificate, for a first issuance and for a renewal alike. During a network split both
+  claim in PostgreSQL (the `locks` row `acme_issuance:<name>`) before it orders a certificate, for
+  a first issuance and for a renewal alike. The claim is given back when the certificate is
+  stored. If the order fails or the node dies, the claim lapses after 10 minutes, or when the
+  last order started under it must end if that is later: an order that would outlive the claim
+  extends it first. During a network split both
   sides have a leader, but only one gets the claim. If the database cannot be reached, the order
   goes ahead anyway: an expired certificate is worse than a duplicate order. Nodes without a
   database (proxy-only) rely on leadership alone.
@@ -529,7 +532,7 @@ Sora holds in memory:
 | `sora-admin tls list` | Lists certificates in S3, whether each is in the local directory, and with `--details` their expiry. |
 | `sora-admin tls cache` | Copies certificates from S3 into the local directory, for example on a new node. |
 | `sora-admin tls delete --domain <name>` | Deletes a name's certificates, ECDSA and RSA, from S3 and from the local directory. `--key` deletes one object from S3 by the full key that `tls list --details` shows. |
-| `sora-admin tls clean` | Deletes expired certificates. |
+| `sora-admin tls clean` | Deletes inspected expired versions, or uses conditional DELETE with their ETag when no version id is available. Keeps concurrent renewals; fails safely if the required condition is unsupported (see ADMIN_CLI.md). |
 
 Flags and output are in [ADMIN_CLI.md](ADMIN_CLI.md).
 

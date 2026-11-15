@@ -67,6 +67,28 @@ func (d *Database) TryAcquireNamedLock(ctx context.Context, name string, ttl tim
 	return &NamedLock{Name: name, AcquiredAt: acquiredAt}, nil
 }
 
+// ExtendNamedLock moves a held lock's expiry to no earlier than ttl from now, for work
+// that turns out to run longer than the lock was taken for. It reports false when the
+// lock is no longer the caller's: it was released, or it expired and another node took
+// it over.
+//
+// The update is qualified by the fencing token, as the release is. A takeover changes
+// the token, so a row that still carries it was never anybody else's, even if it is past
+// its expiry. GREATEST keeps an extension from shortening the lock.
+func (d *Database) ExtendNamedLock(ctx context.Context, lock *NamedLock, ttl time.Duration) (bool, error) {
+	if ttl <= 0 {
+		return false, fmt.Errorf("lock ttl must be positive, got %s", ttl)
+	}
+	tag, err := d.GetWritePool().Exec(ctx, `
+		UPDATE locks SET expires_at = GREATEST(expires_at, now() + $3::interval)
+		WHERE lock_name = $1 AND acquired_at = $2
+	`, lock.Name, lock.AcquiredAt, ttl)
+	if err != nil {
+		return false, fmt.Errorf("failed to extend lock %q: %w", lock.Name, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // ReleaseNamedLock hands a held lock back before its expiry, so the next node does not
 // have to wait out the ttl.
 //

@@ -46,8 +46,9 @@ flowchart LR
     F -->|sora-admin relay requeue| P
 ```
 
-Without a relay (`[relay] type` empty), there is no queue and no worker. A redirected message is
-then kept in INBOX instead, and vacation replies are not sent.
+Without a relay (`[relay] type` empty), there is no queue and no worker. Sieve redirects are then
+skipped: the message is stored where the rest of the script puts it, in INBOX when a redirect was
+the only place it went. Vacation replies are not sent.
 
 The relay has to accept these messages from the Sora node. A redirect keeps the original sender's
 address, so the relay must allow foreign senders from Sora; Sora does not rewrite the sender
@@ -136,6 +137,7 @@ system roots, with TLS 1.2 or later.
 | Response | Class |
 |---|---|
 | `2xx` | Delivered. |
+| `3xx` | Temporary. Redirects are not followed, so `http_url` must answer the `POST` itself; the error names the `Location`. |
 | `4xx` | Permanent. The message goes to the failed queue. |
 | anything else, and connection errors | Temporary. The message is retried. |
 
@@ -174,6 +176,18 @@ For each message Sora sends one `POST` to `http_url` with `Content-Type: applica
 | `from` | The envelope sender. |
 | `recipients` | The envelope recipient. Always exactly one address. |
 | `message` | The complete message (RFC 5322 headers and body) as a string. |
+| `message_base64` | The complete message byte for byte, standard base64 (RFC 4648 section 4). Only present when the message is not valid UTF-8. |
+
+A JSON string holds Unicode text only, so `message` cannot carry a message that is not valid UTF-8
+(8-bit text in another charset, raw 8-bit header values): each such byte in it is replaced with
+U+FFFD. Those messages are also sent in `message_base64`. A relay API takes the message from
+`message_base64` when it is present and from `message` otherwise; either way it gets the message
+byte for byte.
+
+Update the receiver to accept and prefer `message_base64` before deploying this field.
+A receiver that ignores it still sees the legacy, lossy `message` for non-UTF-8 mail.
+A receiver that rejects unknown fields can return a 4xx response, which Sora treats as a
+permanent relay failure and moves to the failed queue.
 
 Sora reads only the status code of the response.
 
@@ -198,6 +212,12 @@ Each message is a pair of files with the same id (a UUID): `<id>.msg` is the raw
 `<id>.json` is its metadata. Sora writes each file to a temporary name first (prefix `.tmp-`) and
 renames it, writing the body before the metadata, so a crash never leaves metadata pointing at a
 half-written body.
+
+A Sieve redirect is written while its delivery is still running, with its metadata named
+`<id>.held`, which the worker does not pick up. Once the delivery has stored everything it stores,
+`<id>.held` is renamed to `<id>.json`; if the delivery fails, both files are removed. The sender
+retries a failed delivery, so a redirect queued by the failed attempt would otherwise go out once
+per attempt.
 
 ```json
 {
@@ -244,7 +264,7 @@ may then receive it twice.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `path` | string | `"/var/spool/sora/relay"` | The queue directory. |
-| `worker_interval` | duration | `"1m"` | How often the worker runs a pass. An invalid value logs a warning and uses `1m`. |
+| `worker_interval` | duration | `"1m"` | How often the worker runs a pass. `0` or less stops startup. An invalid value logs a warning and uses `1m`. |
 | `batch_size` | integer | `100` | Most messages sent in one pass. `0` or less means 100. |
 | `concurrency` | integer | `5` | Most messages sent at the same time. `0` or less means 5. |
 | `max_attempts` | integer | `10` | Attempts before a message moves to the failed queue. `0` or less means 10. |
@@ -252,10 +272,11 @@ may then receive it twice.
 | `circuit_breaker_threshold` | integer | `5` | Temporary failures in a row that open the breaker. |
 | `circuit_breaker_timeout` | duration | `"30s"` | How long the breaker stays open before it lets trial messages through. An invalid value stops startup. |
 | `circuit_breaker_max_requests` | integer | `3` | Trial messages allowed while the breaker is half open. |
-| `failed_retention` | duration | `"168h"` (7 days) | How long a message stays in `failed/`, counted from its last attempt. `0` or less also means 7 days; there is no way to keep failed messages forever. An invalid value stops startup. |
+| `failed_retention` | duration | `"168h"` (7 days) | How long a message stays in `failed/`, counted from its last attempt. `0` keeps failed messages until they are deleted or requeued. A negative or invalid value stops startup. |
 | `cleanup_interval` | duration | `"1h"` | How often the cleanup pass runs. An invalid value stops startup. |
 
-Durations accept Go syntax (`"90s"`, `"1h30m"`) and whole days (`"7d"`).
+Durations accept Go syntax (`"90s"`, `"1h30m"`) and whole days (`"7d"`). A value that stops
+startup also fails `sora-admin config validate`.
 
 ```toml
 [relay.queue]
@@ -298,7 +319,8 @@ That is about 103 hours (4 days and 7 hours) from the first attempt to the last,
 ### The failed queue
 
 A message in `failed/` is never retried on its own. It stays until `failed_retention` has passed
-since its last attempt, and the cleanup pass then deletes it for good, logging a warning:
+since its last attempt (with `failed_retention = "0"`, until someone deletes or requeues it), and
+the cleanup pass then deletes it for good, logging a warning:
 
 ```text
 RelayQueue: Deleted permanently failed message after retention - no copy remains
@@ -319,8 +341,9 @@ Requeueing resets the attempt count and the error history.
 ### Crash debris
 
 The cleanup pass also removes, once they are more than an hour old: leftover temporary files
-(`.tmp-*`) in any of the three directories, and a body or metadata file in `pending/` whose
-partner is missing in both `pending/` and `processing/`. Each removal is logged
+(`.tmp-*`) in any of the three directories, a body or metadata file in `pending/` whose partner is
+missing in both `pending/` and `processing/`, and a held redirect (`<id>.held` and its body) whose
+delivery never finished. Each removal is logged
 (`RelayQueue: Removed orphaned queue file`).
 
 ---
@@ -334,7 +357,7 @@ so run them on the node that owns the queue. They refuse to run when `[relay] ty
 
 | Command | What it does |
 |---|---|
-| `sora-admin relay stats --config FILE` | Counts the messages in each directory. |
+| `sora-admin relay stats --config FILE` | Counts the messages in each directory. Reports a queue the server has not created yet, and does not create it. |
 | `sora-admin relay list --config FILE [--queue pending\|processing\|failed] [--limit 100]` | Lists messages (default queue `pending`). |
 | `sora-admin relay show --config FILE --id ID [--queue pending]` | Shows one message's metadata. |
 | `sora-admin relay delete --config FILE --id ID\|all [--queue failed] --confirm` | Deletes one message or all messages of a queue (default queue `failed`). |
@@ -401,15 +424,19 @@ made once.
 
 ### What triggers it
 
-Training runs on IMAP backends, for the IMAP `MOVE` and `UID MOVE` commands only:
+Training runs on IMAP backends, for the IMAP `MOVE` and `UID MOVE` commands only. Junk and Trash
+are the folders that carry the RFC 6154 special-use attributes `\Junk` and `\Trash`: the default
+`Junk` and `Trash` folders, or whichever folders hold the attributes after a `RENAME` or a
+`CREATE ... USE`.
 
-- Destination named `Junk` and source not: the message is reported as `spam`.
-- Source named `Junk` and destination not: reported as `ham`.
+- Destination `\Junk` and source not: the message is reported as `spam`.
+- Source `\Junk` and destination neither `\Junk` nor `\Trash`: reported as `ham`.
+- Source `\Junk` and destination `\Trash`: not reported. Clients delete a message by moving it
+  to Trash, and deleting spam does not say it was not spam.
 
-The name is compared without regard to case, and only a mailbox named exactly `Junk` counts:
-`Archive/Junk`, or a folder of another name marked `\Junk`, does not. `COPY`, `APPEND`, a client
-that copies and then deletes instead of using `MOVE`, the User API and Sieve `fileinto` do not
-trigger training.
+Folder names do not count: a folder named `Junk` without the attribute, such as `Archive/Junk`,
+does not train. `COPY`, `APPEND`, a client that copies and then deletes instead of using `MOVE`,
+the User API and Sieve `fileinto` do not trigger training.
 
 ### What is sent
 
@@ -446,11 +473,17 @@ Then Sora posts JSON to `endpoint`, with `Authorization: Bearer <auth_token>` wh
 |---|---|
 | `type` | `spam` or `ham`. |
 | `message` | The message after stripping. |
+| `message_base64` | The message after stripping, byte for byte, standard base64 (RFC 4648 section 4). Only present when it is not valid UTF-8. |
 | `user` | The address of the user who moved it. |
 | `source_mailbox`, `dest_mailbox` | The folder names. |
 | `timestamp` | When the report was built (RFC 3339). |
 
-A `2xx` answer is success. Anything else is a failure.
+As in the [HTTP relay request](#3-the-http-relay-request), each byte of `message` that is not valid
+UTF-8 is replaced with U+FFFD; the endpoint takes the message from `message_base64` when it is
+present and from `message` otherwise.
+
+A `2xx` answer is success. Anything else is a failure, a `3xx` too: redirects are not followed, so
+`endpoint` must answer the `POST` itself.
 
 ### Failures
 

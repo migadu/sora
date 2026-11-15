@@ -741,6 +741,10 @@ func (s *POP3ProxyServer) Stop() error {
 		}
 	}
 
+	if s.authLimiter != nil {
+		s.authLimiter.Stop()
+	}
+
 	return nil
 }
 

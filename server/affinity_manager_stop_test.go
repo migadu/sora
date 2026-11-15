@@ -213,7 +213,7 @@ func TestAffinityStopPreservesStartedWritesAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	am := newStopTestAffinityManager(store)
-	am.LoadPersistedAffinities(context.Background())
+	am.loadPersisted(context.Background())
 	am.handleAffinityDelete(AffinityEvent{Username: "removed@example.com", Protocol: "imap", Timestamp: now.Add(time.Second)})
 	am.handleAffinitySet(AffinityEvent{
 		Username: "kept@example.com", Protocol: "imap", Backend: "kept:143",
@@ -236,7 +236,7 @@ func TestAffinityStopPreservesStartedWritesAcrossRestart(t *testing.T) {
 	}
 	restarted := newStopTestAffinityManager(reopened)
 	t.Cleanup(restarted.Stop)
-	restarted.LoadPersistedAffinities(context.Background())
+	restarted.loadPersisted(context.Background())
 	if backend, found := restarted.GetBackend("kept@example.com", "imap"); !found || backend != "kept:143" {
 		t.Fatalf("restart lost an admitted set: %q, found=%v", backend, found)
 	}

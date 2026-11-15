@@ -18,7 +18,7 @@ func TestConfigValidateChecksTrustedNetworks(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.toml")
-			body := fmt.Sprintf("[servers]\ntrusted_networks = %s\n[[server]]\ntype = \"lmtp\"\nname = \"lmtp\"\naddr = \"127.0.0.1:0\"\n", tc.networks)
+			body := storageTOML + fmt.Sprintf("[servers]\ntrusted_networks = %s\n[[server]]\ntype = \"lmtp\"\nname = \"lmtp\"\naddr = \"127.0.0.1:0\"\n", tc.networks)
 			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 				t.Fatal(err)
 			}

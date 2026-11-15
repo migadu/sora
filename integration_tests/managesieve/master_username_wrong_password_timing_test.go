@@ -20,9 +20,9 @@ import (
 // wrong password under any other suffix: the same reply after the same password
 // verification, the regular check of the base address. The master password used to be
 // compared and refused without one, so the response time confirmed a guessed master
-// username. The account's own password does not log in through the master form (any
-// other suffix would), but it is refused after the same verification. Both verbs, both
-// cache modes; the verifications are counted, not timed (#782).
+// username. The account's own password logs in through the master form as through any
+// other suffix (#949). Both verbs, both cache modes; the verifications are counted, not
+// timed (#782).
 func TestManageSieve_MasterUsernameWrongPasswordIsNotAMasterUsernameOracle(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	rdb := common.SetupTestDatabase(t)
@@ -72,13 +72,12 @@ func TestManageSieve_MasterUsernameWrongPasswordIsNotAMasterUsernameOracle(t *te
 					}
 				}
 
-				ownReply, ownVerified := counted(account.Email+"@"+masterUser, account.Password)
-				wrongReply, _ := counted(account.Email+"@other", "wrong-password")
-				if ownReply != wrongReply {
-					t.Fatalf("the account's own password under the master suffix: %q, want the wrong-password reply %q", ownReply, wrongReply)
-				}
-				if ownVerified != 1 {
-					t.Errorf("the account's own password under the master suffix refused after %d password verifications, want 1", ownVerified)
+				// The account's own password logs in under the master suffix as under any
+				// other (#949). Not counted: whichever comes first is cached for the other.
+				ownMaster, _ := counted(account.Email+"@"+masterUser, account.Password)
+				ownOther, _ := counted(account.Email+"@other", account.Password)
+				if ownMaster != ownOther || !strings.HasPrefix(ownOther, "OK") {
+					t.Errorf("the account's own password:\n  master suffix: %q\n  other suffix:  %q\nwant the same login: a refusal under the master suffix alone confirms the master username", ownMaster, ownOther)
 				}
 			})
 		}
