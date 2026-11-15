@@ -338,9 +338,10 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
 				return 0, errTempUnavailable
 			}
-			// The lookup was cut short (server shutdown, client gone), so nothing is
-			// known about the target: a temporary failure, not counted as a failed
-			// login, as on the regular login path below.
+			// The lookup was cut short (server shutdown, command_timeout,
+			// absolute_session_timeout, or the database read timeout), so nothing
+			// is known about the target: a temporary failure, not counted as a
+			// failed login, as on the regular login path below.
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				s.InfoLog("master SASL authentication cancelled during the impersonation target lookup", "target_user", targetAddr.BaseAddress(), "error", err)
 				return 0, errTempUnavailable
