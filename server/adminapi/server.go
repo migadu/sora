@@ -2257,7 +2257,10 @@ func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Restore messages. Chunked: a failure part-way leaves already-restored chunks
-	// committed; the caller can simply repeat the request to restore the remainder.
+	// committed; the caller can simply repeat the request to restore the remainder. With
+	// the shared mailbox config in the context, a deleted mailbox in the shared namespace
+	// comes back as a shared mailbox of the account.
+	ctx = context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: s.sharedMailboxes})
 	count, err := s.rdb.RestoreMessagesWithRetry(ctx, params)
 	if err != nil {
 		if errors.Is(err, db.ErrAccountNotFound) {

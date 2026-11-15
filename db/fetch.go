@@ -86,17 +86,19 @@ func BuildEnvelope(msg *Message) (*imap.Envelope, error) {
 
 func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailboxID int64) (*imap.Envelope, error) {
 	var msg Message
+	var sentUTCOffset *int32
 	msg.UID = UID
 	msg.MailboxID = mailboxID
 
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
         SELECT 
-            internal_date, sent_date, sent_date_unknown IS TRUE, subject, in_reply_to, message_id, recipients_json 
+            internal_date, sent_date, sent_utc_offset, sent_date_unknown IS TRUE, subject, in_reply_to, message_id, recipients_json
         FROM messages 
         WHERE uid = $1 AND mailbox_id = $2 AND expunged_at IS NULL
     `, int64(UID), mailboxID).Scan(
 		&msg.InternalDate,
 		&msg.SentDate,
+		&sentUTCOffset,
 		&msg.NoDateHeader,
 		&msg.Subject,
 		&msg.InReplyTo,
@@ -107,6 +109,7 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 		logger.Error("Database: failed to fetch envelope fields", "uid", UID, "mailbox_id", mailboxID, "err", err)
 		return nil, err
 	}
+	msg.SentDate = sentDateInHeaderZone(msg.SentDate, sentUTCOffset)
 
 	return BuildEnvelope(&msg)
 }

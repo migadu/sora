@@ -113,7 +113,8 @@ controls:
 
 - which peers may send a PROXY protocol header (section 3);
 - which peers may send forwarding data: XCLIENT on POP3 and LMTP, and the `x-` fields of the IMAP
-  `ID` command;
+  `ID` command. Behind a PROXY header, IMAP and POP3 judge the client the header names, not the
+  load balancer that sent it ([SECURITY.md](SECURITY.md#31-trusted_networks));
 - which peers skip the per-IP connection limit;
 - which peers skip auth rate limiting, unless `auth_rate_limit.exempt_networks` is set (see
   [AUTHENTICATION.md](AUTHENTICATION.md));
@@ -541,11 +542,14 @@ The server answers `ID` with:
 
 Some clients change behaviour by server name, so these keys let you present a different identity.
 
-The client's `name` and `version` are matched against `client_filters` (section 6). When the
-connection comes from a peer in `trusted_networks`, Sora also reads the proxy's forwarding fields
-(`x-originating-ip`, `x-originating-port`, `x-session-id`, `x-proxy-ttl`, `x-forward-ja4-fingerprint`
-and others) and uses them as the client's address and fingerprint. A forwarded TTL that has run out
-closes the connection to stop a proxy loop. The fields are described in [PROXY.md](PROXY.md).
+The client's `name` and `version` are matched against `client_filters` (section 6). Before login,
+when the connection comes from a peer in `trusted_networks` (behind a PROXY header, the client the
+header names; see [SECURITY.md](SECURITY.md#31-trusted_networks)), Sora also reads the proxy's
+forwarding fields (`x-originating-ip`, `x-originating-port`, `x-session-id`, `x-proxy-ttl`,
+`x-forward-ja4-fingerprint` and others) and uses them as the client's address and fingerprint.
+After login they are ignored: the peer is then relaying the client's own commands. A forwarded TTL
+that has run out closes the connection to stop a proxy loop. The fields are described in
+[PROXY.md](PROXY.md).
 
 ### 5.12 Per-command timeouts
 
@@ -622,8 +626,9 @@ Rules:
   `UIDPLUS`, `ESEARCH`, `SEARCHRES`, `ESORT`, `SORT`, `SORT=DISPLAY`, `SPECIAL-USE`,
   `CREATE-SPECIAL-USE`, `LIST-EXTENDED`, `LIST-STATUS`, `STATUS=SIZE`, `BINARY`, `CONDSTORE`,
   `QRESYNC`, `NOTIFY`, `CHILDREN`, `ID`, `NAMESPACE`, `METADATA`, `THREAD=REFERENCES`,
-  `THREAD=REFS`, `THREAD=ORDEREDSUBJECT`, `MULTISEARCH`, and `PREVIEW` when enabled. Any other
-  name is ignored (logged at debug level).
+  `THREAD=REFS`, `THREAD=ORDEREDSUBJECT`, `MULTISEARCH`, and `PREVIEW` when enabled. Names are
+  case-insensitive (`idle` is `IDLE`). Any other name is ignored and logged at WARN when the
+  server starts.
 - `IMAP4rev2` includes `NAMESPACE`, `UNSELECT`, `UIDPLUS`, `ESEARCH`, `SEARCHRES`, `ENABLE`,
   `IDLE`, `SASL-IR`, `LIST-EXTENDED`, `LIST-STATUS`, `MOVE`, `LITERAL-`, `STATUS=SIZE` and
   `CHILDREN`. Removing one of these with `disabled_caps` also removes `IMAP4rev2`, so clients fall
@@ -691,6 +696,10 @@ Matching:
 - Patterns are Go regular expressions (RE2 syntax). A pattern that does not compile stops startup,
   naming the entry, the key and the pattern; `sora-admin config validate` reports it too, and a
   reload with it is skipped for that server.
+- An entry needs at least one of `client_name`, `client_version` and `ja4_fingerprints`; one
+  without, which would match no client, stops startup the same way. An empty `client_name` or
+  `client_version` counts as left out, but an empty `ja4_fingerprints` pattern would match every
+  fingerprint, so it stops startup too.
 - The key is `ja4_fingerprints`, a list. A single `ja4_fingerprint` key is unknown and ignored.
 
 Where the JA4 fingerprint comes from, in order of preference:
@@ -717,7 +726,8 @@ When filters apply:
 As with `disabled_caps`, a filter that removes a capability included in `IMAP4rev2` also removes
 `IMAP4rev2` for that session, unless the connection has it enabled (above), so the client falls
 back to IMAP4rev1 and really loses the extension. The same list of removable names applies as for
-`disabled_caps`. When a filter changes the list, the session logs `capability filters applied`
+`disabled_caps`, case-insensitively, and any other name is logged at WARN when the server starts,
+with the entry number. When a filter changes the list, the session logs `capability filters applied`
 with the client and the removed names.
 
 ---
@@ -802,12 +812,13 @@ does not apply to the POP3 backend.
 
 ### 7.5 XCLIENT
 
-A peer in `trusted_networks` (or a trusted PROXY-protocol proxy) may send `XCLIENT` before login to
-pass the real client address. Attributes: `ADDR`, `PORT`, `SESSION`, `TTL` and `FORWARD`. It is
-allowed once per session and only before login. Replies: `+OK XCLIENT parameters accepted`,
-`-ERR Connection not from trusted proxy`, `-ERR Invalid XCLIENT parameters`, and
-`-ERR Proxy TTL expired` (which closes the connection). Sora's POP3 proxy uses it; see
-[PROXY.md](PROXY.md).
+A peer in `trusted_networks` may send `XCLIENT` before login to pass the real client address. Behind
+a PROXY header the peer is the client the header names, not the load balancer that sent it
+([SECURITY.md](SECURITY.md#31-trusted_networks)). Attributes: `ADDR`, `PORT`, `SESSION`, `TTL` and
+`FORWARD`. It is allowed once per session and only before login. Replies:
+`+OK XCLIENT parameters accepted`, `-ERR Connection not from trusted proxy`,
+`-ERR Invalid XCLIENT parameters`, and `-ERR Proxy TTL expired` (which closes the connection).
+Sora's POP3 proxy uses it; see [PROXY.md](PROXY.md).
 
 ### 7.6 Per-command timeouts
 
@@ -948,7 +959,10 @@ Redirected copies leave through `[relay]`; see [RELAY.md](RELAY.md) and [SIEVE.m
 
 Peers in `[servers] trusted_networks` may send `XCLIENT` with `ADDR`, `PORT`, `PROTO`, `HELO`,
 `LOGIN` and `NAME`. After it, the server greets again and the MTA must send `LHLO` again. Sora uses
-`ADDR` as the client address and `HELO` in the `Received:` header. From any other peer `XCLIENT`
+`ADDR` as the client address and `HELO` in the `Received:` header. On a listener with
+`proxy_protocol = true`, `ADDR` and `PORT` replace the address the PROXY header gave only when that
+address is itself in `trusted_networks`; otherwise they are ignored and the other attributes still
+apply ([SECURITY.md](SECURITY.md#31-trusted_networks)). From any other peer `XCLIENT`
 is not advertised and gets `550 5.7.1 XCLIENT denied`. The LMTP proxy uses XCLIENT; see
 [PROXY.md](PROXY.md).
 
@@ -1057,7 +1071,7 @@ plain number of bytes.
 | `type` | string | required | all | `imap`, `pop3`, `lmtp` or `managesieve`. |
 | `name` | string | required | all | Unique server name. |
 | `addr` | string | required | all | Listen address. |
-| `debug` | bool | `false` | IMAP, LMTP | IMAP: writes a raw protocol trace, with LOGIN and AUTHENTICATE passwords masked but message content included, to the log file when `[logging] output` is a file, otherwise to standard output. LMTP: logs each message's headers at debug level before Sieve runs. No effect on POP3 and ManageSieve. Needs a restart. |
+| `debug` | bool | `false` | IMAP, LMTP | IMAP: writes a raw protocol trace, with LOGIN and AUTHENTICATE passwords masked but message content included, to the log file when `[logging] output` is a file, otherwise to standard output. LMTP: logs each message's headers at debug level before Sieve runs. No effect on POP3 and ManageSieve, where it is ignored with a startup warning. Needs a restart. |
 
 ### 10.2 TLS
 
