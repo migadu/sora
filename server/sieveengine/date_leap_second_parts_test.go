@@ -52,6 +52,7 @@ func TestDateCombinedLeapMetadata(t *testing.T) {
 	for _, tc := range []struct{ name, field, value, condition string }{
 		{"received-comment", "Received", "from mx by backend; Sat, 31 Dec 2016 23:59:60 +0000 (route; note)", `date :zone "+0000" "Received" "iso8601" "2016-12-31T23:59:60Z"`},
 		{"variable-zone-part", "Date", "Sat, 31 Dec 2016 23:59:60 +0000", `date :zone "${z}" "Date" "${p}" "2017-01-01T00:59:60+01:00"`},
+		{"cfws-year-leap", "Date", "Sun (day) , 31 Dec (year) 50 23 : 59 : (sec) 60 +0000", `date :originalzone "Date" "iso8601" "1950-12-31T23:59:60Z"`},
 		{"obsolete-year", "Date", "Sun, 31 Dec 50 23:59:60 +0000", `date :originalzone "Date" "iso8601" "1950-12-31T23:59:60Z"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
