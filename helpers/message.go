@@ -116,7 +116,7 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 // decodeToBinary decodes the MIME-encoded content (e.g., Base64, Quoted-Printable) into raw binary.
 func DecodeToBinary(part *message.Entity) (io.Reader, error) {
 	// Get the Content-Transfer-Encoding from the headers
-	encodingType := strings.ToLower(part.Header.Get("Content-Transfer-Encoding"))
+	encodingType := transferEncodingMechanism(part.Header.Get("Content-Transfer-Encoding"))
 
 	// Based on the encoding type, decode the content
 	switch encodingType {

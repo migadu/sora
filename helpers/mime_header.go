@@ -84,6 +84,24 @@ func parseMIMEHeader(raw string, contentType bool) mimeHeaderValue {
 	return v
 }
 
+// transferEncodingMechanism returns the lowercased mechanism a
+// Content-Transfer-Encoding field value names (RFC 2045 §6.1), without the RFC
+// 822 comments around it, which "have no semantic content and should be ignored
+// during MIME processing" (RFC 2045 §1). It is "" for an empty value, which
+// §6.1 makes 7bit. Anything but one token between comments, an unclosed comment
+// included, is returned lowercased as is and so names no known mechanism.
+// go-message strips comments the same way, so it decodes every value this
+// reduces to a known mechanism as that mechanism.
+func transferEncodingMechanism(raw string) string {
+	s := mimeHeaderScanner{rest: raw}
+	if s.skipCFWS() {
+		if mechanism := s.token(); s.skipCFWS() && s.rest == "" {
+			return strings.ToLower(mechanism)
+		}
+	}
+	return strings.ToLower(raw)
+}
+
 func (v *mimeHeaderValue) invalidate(key string) {
 	if key != "" {
 		delete(v.params, key)
