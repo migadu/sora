@@ -362,29 +362,12 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 	// Use nanoseconds to significantly reduce the chance of collision on rapid creation.
 	uidValidity := uint32(time.Now().UnixNano())
 
-	// Check if this is a shared mailbox based on name prefix
-	// Extract config from context if available
-	isShared := false
-	var ownerDomain *string
-
-	// Try to get config from context
-	if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil {
-		if cfg.SharedMailboxes.InNamespace(name) {
-			isShared = true
-
-			// Extract domain from user's primary credential
-			var domain string
-			err := tx.QueryRow(ctx, `
-				SELECT SPLIT_PART(address, '@', 2)
-				FROM credentials
-				WHERE account_id = $1 AND primary_identity = TRUE
-			`, AccountID).Scan(&domain)
-			if err != nil {
-				return fmt.Errorf("failed to get user domain for shared mailbox: %w", err)
-			}
-			ownerDomain = &domain
-		}
+	// A name in the shared namespace of the config in the context is a shared mailbox.
+	ownerDomain, err := newMailboxOwnerDomain(ctx, tx, AccountID, name)
+	if err != nil {
+		return err
 	}
+	isShared := ownerDomain != nil
 
 	// Determine the parent path if parentID is provided
 	var parentPath string
@@ -416,7 +399,7 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 
 	// Insert the mailbox with shared mailbox fields
 	var mailboxID int64
-	err := tx.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path, is_shared, owner_domain, special_use)
 		VALUES ($1, $2, $3, $4, '', $5, $6, $7)
 		RETURNING id
@@ -456,52 +439,82 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 		return fmt.Errorf("failed to update mailbox path: %w", err)
 	}
 
-	// If shared mailbox, grant creator full rights (or configured default rights)
-	// Also inherit ACLs from parent mailbox if one exists (RFC 4314)
 	if isShared {
-		// If there's a shared parent mailbox, inherit its ACLs. A parent that is not
-		// shared has none to give: a level above a namespace prefix of several levels,
-		// or a personal mailbox under the namespace's name.
-		if parentID != nil && parentIsShared {
-			// Copy all ACL entries from parent to child
-			_, err = tx.Exec(ctx, `
-				INSERT INTO mailbox_acls (mailbox_id, account_id, identifier, rights, created_at, updated_at)
-				SELECT $1, account_id, identifier, rights, now(), now()
-				FROM mailbox_acls
-				WHERE mailbox_id = $2
-			`, mailboxID, *parentID)
-			if err != nil {
-				return fmt.Errorf("failed to inherit parent ACLs: %w", err)
-			}
-			logger.Info("Database: created shared mailbox with inherited ACLs from parent", "name", name, "mailbox_id", mailboxID, "parent_id", *parentID)
-		} else {
-			// No shared parent, grant creator full rights (or configured default rights)
-			defaultRights := "lrswipkxtea" // Full rights by default
-			if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.DefaultRights != "" {
-				defaultRights = cfg.SharedMailboxes.DefaultRights
-			}
-
-			// Get creator's email for identifier
-			var creatorEmail string
-			err = tx.QueryRow(ctx, `
-				SELECT address FROM credentials
-				WHERE account_id = $1 AND primary_identity = TRUE
-			`, AccountID).Scan(&creatorEmail)
-			if err != nil {
-				return fmt.Errorf("failed to get creator email: %w", err)
-			}
-
-			_, err = tx.Exec(ctx, `
-				INSERT INTO mailbox_acls (mailbox_id, account_id, identifier, rights, created_at, updated_at)
-				VALUES ($1, $2, $3, $4, now(), now())
-			`, mailboxID, AccountID, creatorEmail, defaultRights)
-			if err != nil {
-				return fmt.Errorf("failed to set creator ACL for shared mailbox: %w", err)
-			}
-			logger.Info("Database: created shared mailbox", "name", name, "mailbox_id", mailboxID, "account_id", AccountID, "domain", *ownerDomain)
+		var sharedParentID *int64
+		if parentIsShared {
+			sharedParentID = parentID
+		}
+		if err := grantNewSharedMailboxACL(ctx, tx, AccountID, name, mailboxID, sharedParentID, *ownerDomain); err != nil {
+			return err
 		}
 	}
 
+	return nil
+}
+
+// newMailboxOwnerDomain returns the owner domain of a mailbox called name that accountID
+// is creating: for a name in the shared namespace of the [shared_mailboxes] config in
+// ctx, the domain of the account's primary address, which makes it a shared mailbox;
+// nil, a personal mailbox, otherwise (sharing off, or no config in ctx).
+func newMailboxOwnerDomain(ctx context.Context, tx pgx.Tx, accountID int64, name string) (*string, error) {
+	cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config)
+	if !ok || cfg == nil || !cfg.SharedMailboxes.InNamespace(name) {
+		return nil, nil
+	}
+	var domain string
+	err := tx.QueryRow(ctx, `
+		SELECT SPLIT_PART(address, '@', 2)
+		FROM credentials
+		WHERE account_id = $1 AND primary_identity = TRUE
+	`, accountID).Scan(&domain)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user domain for shared mailbox: %w", err)
+	}
+	return &domain, nil
+}
+
+// grantNewSharedMailboxACL gives the shared mailbox accountID just created its initial
+// ACL (RFC 4314). Under a shared parent (sharedParentID) it copies the parent's entries.
+// Otherwise it grants the creator's primary address the configured default_rights (full
+// rights by default). A parent that is not shared has none to give: a level above a
+// namespace prefix of several levels, or a personal mailbox under the namespace's name.
+func grantNewSharedMailboxACL(ctx context.Context, tx pgx.Tx, accountID int64, name string, mailboxID int64, sharedParentID *int64, ownerDomain string) error {
+	if sharedParentID != nil {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO mailbox_acls (mailbox_id, account_id, identifier, rights, created_at, updated_at)
+			SELECT $1, account_id, identifier, rights, now(), now()
+			FROM mailbox_acls
+			WHERE mailbox_id = $2
+		`, mailboxID, *sharedParentID)
+		if err != nil {
+			return fmt.Errorf("failed to inherit parent ACLs: %w", err)
+		}
+		logger.Info("Database: created shared mailbox with inherited ACLs from parent", "name", name, "mailbox_id", mailboxID, "parent_id", *sharedParentID)
+		return nil
+	}
+
+	defaultRights := "lrswipkxtea"
+	if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.DefaultRights != "" {
+		defaultRights = cfg.SharedMailboxes.DefaultRights
+	}
+
+	var creatorEmail string
+	err := tx.QueryRow(ctx, `
+		SELECT address FROM credentials
+		WHERE account_id = $1 AND primary_identity = TRUE
+	`, accountID).Scan(&creatorEmail)
+	if err != nil {
+		return fmt.Errorf("failed to get creator email: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO mailbox_acls (mailbox_id, account_id, identifier, rights, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, now(), now())
+	`, mailboxID, accountID, creatorEmail, defaultRights)
+	if err != nil {
+		return fmt.Errorf("failed to set creator ACL for shared mailbox: %w", err)
+	}
+	logger.Info("Database: created shared mailbox", "name", name, "mailbox_id", mailboxID, "account_id", accountID, "domain", ownerDomain)
 	return nil
 }
 
