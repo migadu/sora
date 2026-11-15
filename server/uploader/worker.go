@@ -1263,11 +1263,14 @@ func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []
 // linkFile makes a hard link; a variable so tests can refuse one.
 var linkFile = os.Link
 
+// chtimesFile refreshes a staged file's grace window; tests can refuse the touch.
+var chtimesFile = os.Chtimes
+
 // LinkStaged stages for destAccountID a body staged on this node for srcAccountID. A
 // cross-account COPY or MOVE, and a delivery into a shared mailbox another account owns,
 // store the body under the mailbox owner, whose own pending upload reads this file. It
-// is hard-linked where the filesystem allows it and copied otherwise; a destination
-// already staged is left as it is.
+// is hard-linked where the filesystem allows it and copied otherwise. An existing
+// destination is reused only when its size matches and its grace window is refreshed.
 //
 // The staging counts against max_staging_size like any other. The monitor refresh
 // counts one pending row per account and body, and the destination's upload subtracts
@@ -1300,7 +1303,7 @@ func (w *UploadWorker) LinkStaged(contentHash string, srcAccountID, destAccountI
 		// cleanupOrphanedFiles grants destAccountID a full grace period before its
 		// pending_uploads row commits.
 		now := time.Now()
-		chtimesErr = os.Chtimes(dst, now, now)
+		chtimesErr = chtimesFile(dst, now, now)
 		w.stagedSizeChanged(dst, 0, fileSize(dst))
 	case errors.Is(err, fs.ErrExist):
 		// Reuse dst only if its size matches src and its grace window is refreshed
@@ -1309,7 +1312,7 @@ func (w *UploadWorker) LinkStaged(contentHash string, srcAccountID, destAccountI
 		srcInfo, srcErr := os.Stat(src)
 		if dstErr == nil && srcErr == nil && dstInfo.Size() == srcInfo.Size() {
 			now := time.Now()
-			if chtimesErr = os.Chtimes(dst, now, now); chtimesErr == nil {
+			if chtimesErr = chtimesFile(dst, now, now); chtimesErr == nil {
 				reuseExisting = true
 			}
 		}
@@ -1319,7 +1322,7 @@ func (w *UploadWorker) LinkStaged(contentHash string, srcAccountID, destAccountI
 		logger.Warn("Uploader: Failed to refresh staged file mtime", "path", dst, "error", chtimesErr)
 	}
 	switch {
-	case err == nil:
+	case err == nil && chtimesErr == nil:
 		if err := syncDir(dir); err != nil {
 			logger.Warn("Uploader: Failed to fsync directory (non-fatal)", "dir", dir, "error", err)
 		}
@@ -1328,8 +1331,9 @@ func (w *UploadWorker) LinkStaged(contentHash string, srcAccountID, destAccountI
 		return nil // staged for destAccountID already with matching size, and counted then
 	}
 
-	// No hard link here (another filesystem, a link limit, or an invalid existing dst):
-	// copy the body. A missing source fails the open, before anything is written.
+	// No protected hard link here (another filesystem, a link limit, an invalid
+	// existing dst, or a failed timestamp refresh): copy to a fresh inode. A missing
+	// source fails the open, before anything is written.
 	in, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("failed to open staged body %s: %w", src, err)

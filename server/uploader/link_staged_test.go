@@ -390,3 +390,87 @@ func TestLinkStagedReplacesTruncatedExistingDestination(t *testing.T) {
 		})
 	}
 }
+
+// A successful link without a successful timestamp refresh has no grace period.
+// Copying to a fresh inode must either restore that protection or report failure.
+func TestLinkStagedFailedTouchDoesNotReportUnprotectedSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		existing, sourceGone bool
+	}{
+		{name: "new link"},
+		{name: "existing destination", existing: true},
+		{name: "source disappears before fallback", sourceGone: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const source = int64(1)
+			hash := stagingHash("9")
+			body := bytes.Repeat([]byte("failed touch fallback\r\n"), 64)
+			w := &UploadWorker{path: t.TempDir(), cleanupGracePeriod: time.Hour}
+			destination := int64(2)
+			// The source uploader removes its own path while the destination lock
+			// is held, so use distinct stripes for this deterministic interleave.
+			for w.stagingPathLock(w.FilePath(hash, source)) == w.stagingPathLock(w.FilePath(hash, destination)) {
+				destination++
+			}
+			w.rdb = &mockDB{ExistingPendingUploadsFunc: func(_ context.Context, accountID int64, _ []string) (map[string]struct{}, error) {
+				if accountID == source {
+					return map[string]struct{}{hash: {}}, nil
+				}
+				return map[string]struct{}{}, nil // destination transaction not committed
+			}}
+			src, err := w.StoreLocally(hash, source, body)
+			require.NoError(t, err)
+			old := time.Now().Add(-2 * time.Hour)
+			require.NoError(t, os.Chtimes(*src, old, old))
+			dst := w.FilePath(hash, destination)
+			if tc.existing {
+				_, err = w.StoreLocally(hash, destination, body)
+				require.NoError(t, err)
+				require.NoError(t, os.Chtimes(dst, old, old))
+			}
+			touches := 0
+			chtimesFile = func(path string, atime, mtime time.Time) error {
+				if path != dst {
+					return os.Chtimes(path, atime, mtime)
+				}
+				touches++
+				if tc.sourceGone {
+					if err := w.RemoveLocalFile(*src); err != nil {
+						return err
+					}
+				}
+				return &os.PathError{Op: "chtimes", Path: path, Err: fs.ErrPermission}
+			}
+			t.Cleanup(func() { chtimesFile = os.Chtimes })
+			err = w.LinkStaged(hash, source, destination)
+			require.Equal(t, 1, touches)
+			if tc.sourceGone {
+				require.ErrorIs(t, err, fs.ErrNotExist, "an old-mtime hard link cannot be reported as protected staging")
+				require.Equal(t, int64(len(body)), atomic.LoadInt64(&w.currentStagingSize))
+				// The delivery API can recover from the held bytes when the source
+				// upload finished before the copy fallback opened its staging file.
+				require.NoError(t, w.LinkStagedOrStore(hash, source, destination, body))
+			} else {
+				require.NoError(t, err)
+			}
+			require.NoError(t, w.cleanupOrphanedFiles(context.Background()))
+			got, err := os.ReadFile(dst)
+			require.NoError(t, err)
+			require.Equal(t, body, got)
+			if !tc.sourceGone {
+				srcInfo, err := os.Stat(*src)
+				require.NoError(t, err)
+				dstInfo, err := os.Stat(dst)
+				require.NoError(t, err)
+				require.False(t, os.SameFile(srcInfo, dstInfo), "the failed touch must fall back to a fresh copied inode")
+			}
+			wantSize := 2 * int64(len(body))
+			if tc.sourceGone {
+				wantSize = int64(len(body))
+			}
+			require.Equal(t, wantSize, atomic.LoadInt64(&w.currentStagingSize))
+			requireNoTemporaryFiles(t, filepath.Dir(dst))
+		})
+	}
+}
