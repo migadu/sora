@@ -182,6 +182,10 @@ const maildirCacheParams = "_journal_mode=WAL&_busy_timeout=5000&_synchronous=NO
 
 // NewImporter creates a new Importer instance.
 func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ImporterOptions) (*Importer, error) {
+	// The import runs on exactly this many workers: with none it would never drain its queue.
+	if jobs < 1 {
+		return nil, fmt.Errorf("jobs must be at least 1, got %d", jobs)
+	}
 	// Always create SQLite database in the maildir path to persist maildir state
 	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
 
