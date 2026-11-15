@@ -341,9 +341,17 @@ Every run, default or user, is counted in `sora_sieve_executions_total{protocol,
 `100ms` and `60s`. An empty, unparsable, zero or negative value means the default. The value is
 read at startup; a change needs a restart.
 
-The budget also bounds a single `:regex` or `:matches` match: a match still running when it runs
-out stops there. Each run is also bounded by the time left on the LMTP `DATA` command, if that is
-shorter (`timeouts.lmtp_command_timeouts`, see [PROTOCOLS.md](PROTOCOLS.md)).
+The budget also supplies the deadline for a single `:regex` or `:matches` match. Inputs
+larger than 1 KB are matched synchronously through a reader that checks the deadline as
+input advances, roughly every 64 bytes. A stopped match returns a timeout only after the matching
+work has ended; it leaves no background match goroutine. These checks are cooperative,
+so work can continue until the next check. Inputs up to 1 KB and pattern compilation run
+inline, bounded by the input, pattern and program limits below; the budget is not a strict
+wall-clock cap for those operations. Cancellation after the last sampled input read can
+race with normal match completion.
+
+Each run also receives the time left on the LMTP `DATA` command, if that is shorter
+(`timeouts.lmtp_command_timeouts`, see [PROTOCOLS.md](PROTOCOLS.md)).
 
 ### Fixed interpreter limits
 
