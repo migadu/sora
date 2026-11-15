@@ -102,6 +102,10 @@ const s3ImportDBParams = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
 
 // NewS3Importer creates a new S3Importer instance
 func NewS3Importer(ctx context.Context, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, options S3ImporterOptions) (*S3Importer, error) {
+	// importFromS3 runs on exactly this many workers: with none it would never drain its queue.
+	if options.Workers < 1 {
+		return nil, fmt.Errorf("workers must be at least 1, got %d", options.Workers)
+	}
 	// Wrap S3 storage with resilient patterns
 	resilientS3 := resilient.NewResilientS3Storage(s3)
 	// Create temporary SQLite database to track S3 objects. Every run gets a file of its
