@@ -137,7 +137,8 @@ func (m *mockUploaderDB) GetFailedUploadsWithRetry(ctx context.Context, maxAttem
 
 // The backlog measurement is reporting-only; these tests exercise the upload/cleanup
 // paths, so answer with an empty queue rather than requiring a per-test expectation.
-func (m *mockUploaderDB) PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int) (UploadBacklog, error) {
+func (m *mockUploaderDB) PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int, changed func() []StagedBody) (UploadBacklog, error) {
+	changed()
 	return UploadBacklog{}, nil
 }
 
@@ -497,4 +498,53 @@ func TestCleanupOrphanedFiles_SkipsFilesWithinGracePeriod(t *testing.T) {
 
 	require.Zero(t, mockDB.lookups(),
 		"Expected no database lookup for a file inside the grace period")
+}
+
+// TestCleanupOrphanedFiles_NonPositiveGracePeriodUsesDefault verifies that a grace
+// period <= 0 falls back to the 1h default (#922). A negative one put the cutoff in
+// the future, so every staged body, including one whose pending_uploads row was
+// still in an uncommitted delivery transaction, was looked up and removed.
+func TestCleanupOrphanedFiles_NonPositiveGracePeriodUsesDefault(t *testing.T) {
+	for _, grace := range []time.Duration{0, -time.Nanosecond, -time.Hour} {
+		t.Run(grace.String(), func(t *testing.T) {
+			mockDB := new(mockUploaderDB)
+			worker := &UploadWorker{
+				rdb:                mockDB,
+				path:               t.TempDir(),
+				cleanupGracePeriod: grace,
+			}
+
+			const contentHash = "fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321"
+			const accountID = int64(4242)
+
+			// Staged ten minutes ago by a delivery whose transaction has not
+			// committed its pending_uploads row yet.
+			filePath := worker.FilePath(contentHash, accountID)
+			require.NoError(t, os.MkdirAll(filepath.Dir(filePath), 0755))
+			require.NoError(t, os.WriteFile(filePath, []byte("staged body"), 0644))
+			staged := time.Now().Add(-10 * time.Minute)
+			require.NoError(t, os.Chtimes(filePath, staged, staged))
+
+			require.NoError(t, worker.cleanupOrphanedFiles(context.Background()))
+
+			_, statErr := os.Stat(filePath)
+			require.NoError(t, statErr, "grace period %v: staged body inside the 1h default was removed", grace)
+			require.Zero(t, mockDB.lookups(), "grace period %v: file inside the 1h default was looked up", grace)
+
+			// The fallback is the default, not a disabled sweep: an orphan older
+			// than 1h is still removed.
+			const orphanHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+			orphanPath := worker.FilePath(orphanHash, accountID)
+			require.NoError(t, os.WriteFile(orphanPath, []byte("orphan"), 0644))
+			old := time.Now().Add(-2 * time.Hour)
+			require.NoError(t, os.Chtimes(orphanPath, old, old))
+
+			require.NoError(t, worker.cleanupOrphanedFiles(context.Background()))
+
+			_, statErr = os.Stat(orphanPath)
+			require.True(t, os.IsNotExist(statErr), "grace period %v: orphan older than the 1h default was kept (stat err: %v)", grace, statErr)
+			_, statErr = os.Stat(filePath)
+			require.NoError(t, statErr, "grace period %v: staged body inside the 1h default was removed", grace)
+		})
+	}
 }

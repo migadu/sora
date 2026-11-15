@@ -171,7 +171,7 @@ func TestGlobalReloadReportsAnInvalidRelay(t *testing.T) {
 			logs := captureReloadLogs(t)
 			cfg := startupConfig()
 
-			handleConfigReload(&cfg, reloadedFrom(t, "[relay]\n"+tt.relay+"\n"))
+			handleConfigReload(&cfg, reloadedFrom(t, "[relay]\n"+tt.relay+"\n"+metricsServerTOML))
 
 			if cfg.Relay.IsConfigured() {
 				t.Errorf("relay = %+v after the reload, want the start-up one (none)", cfg.Relay)
@@ -214,7 +214,7 @@ func TestGlobalReloadReportsAnInvalidRelayQueue(t *testing.T) {
 			logs := captureReloadLogs(t)
 			cfg := startupConfig()
 
-			handleConfigReload(&cfg, reloadedFrom(t, relay+tt.queue+"\n"))
+			handleConfigReload(&cfg, reloadedFrom(t, relay+tt.queue+"\n"+metricsServerTOML))
 
 			out := logs.String()
 			if tt.wantErr == "" {
@@ -225,6 +225,122 @@ func TestGlobalReloadReportsAnInvalidRelayQueue(t *testing.T) {
 			}
 			if !hasLineWith(out, "level=ERROR", "[relay.queue]", tt.wantErr) {
 				t.Errorf("no error-level report naming %q:\n%s", tt.wantErr, out)
+			}
+		})
+	}
+}
+
+// metricsServerTOML is a server that needs neither the database nor S3, so a file with
+// it and the sections under test is one start-up takes.
+const metricsServerTOML = "\n[[server]]\ntype = \"metrics\"\nname = \"metrics\"\naddr = \"127.0.0.1:9090\"\npath = \"/metrics\"\n"
+
+// A reload applies no global section, but it reports a new file that start-up would
+// refuse as an error, one for each problem Config.Validate finds: the restart the
+// reload asks for would not start (#1106). The reload used to check trusted_networks,
+// [relay] and [relay.queue] only, so a broken [cluster] or [[pool]] came to light when
+// the next restart failed.
+func TestGlobalReloadReportsWhatStartupRefuses(t *testing.T) {
+	const imapBackend = storageTOML + "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"
+	const imapProxy = "\n[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:1143\"\n"
+	type problem struct{ section, err string }
+	tests := []struct {
+		name    string
+		content string
+		want    []problem // none for a file start-up takes
+	}{
+		{name: "valid mail backend", content: imapBackend},
+		{name: "valid proxy with pools", content: "[[pool]]\nname = \"sora1\"\nbackends = [\"10.0.0.1:143\"]\ndefault = true\n" + storageTOML + imapProxy},
+		{
+			name: "cluster secret_key of 16 bytes",
+			content: "[cluster]\nenabled = true\naddr = \"10.0.0.1:7946\"\nsecret_key = \"MDEyMzQ1Njc4OWFiY2RlZg==\"\n" +
+				metricsServerTOML,
+			want: []problem{{"[cluster]", "cluster secret_key must be 32 bytes (got 16 bytes)"}},
+		},
+		{
+			name: "pool declared twice",
+			content: "[[pool]]\nname = \"sora1\"\nbackends = [\"10.0.0.1:143\"]\ndefault = true\n" +
+				"\n[[pool]]\nname = \"sora1\"\nbackends = [\"10.0.0.2:143\"]\n" + storageTOML + imapProxy,
+			want: []problem{{"[[pool]]", "declared more than once"}},
+		},
+		{
+			name:    "proxy without remote_addrs or [[pool]] blocks",
+			content: storageTOML + imapProxy,
+			want:    []problem{{"server 'imap-proxy'", "remote_addrs is required unless the file declares [[pool]] blocks"}},
+		},
+		{
+			name:    "proxy_protocol without trusted_networks",
+			content: "[servers]\ntrusted_networks = []\n" + imapBackend + "proxy_protocol = true\n",
+			want:    []problem{{"trusted_networks", "proxy_protocol is enabled on server(s) imap but [servers] trusted_networks is empty"}},
+		},
+		{
+			name:    "shared_mailboxes namespace_prefix without delimiter",
+			content: "[shared_mailboxes]\nenabled = true\nnamespace_prefix = \"Shared\"\n" + imapBackend,
+			want:    []problem{{"[shared_mailboxes]", "must be a mailbox name followed by the hierarchy delimiter"}},
+		},
+		{
+			name:    "uploader concurrency 0 on a mail backend",
+			content: "[uploader]\nconcurrency = 0\n" + imapBackend,
+			want:    []problem{{"[uploader]", "concurrency must be positive, got 0"}},
+		},
+		{
+			name:    "cleanup grace_period negative on a mail backend",
+			content: "[cleanup]\ngrace_period = \"-14d\"\n" + imapBackend,
+			want:    []problem{{"[cleanup]", "grace_period must not be negative"}},
+		},
+		{
+			name:    "mail backend without database and S3",
+			content: "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n",
+			want:    []problem{{"[database]", "needs the database"}, {"[s3]", "bucket is required"}},
+		},
+		{
+			name:    "s3 encryption_key not hex",
+			content: storageTOML + "encrypt = true\nencryption_key = \"not-hex\"\n" + "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n",
+			want:    []problem{{"[s3]", "encryption_key must be 64 hex characters"}},
+		},
+		{
+			name:    "tls letsencrypt without email",
+			content: "[tls]\nenabled = true\nprovider = \"letsencrypt\"\n\n[tls.letsencrypt]\ndomains = [\"mail.example.com\"]\n" + metricsServerTOML,
+			want:    []problem{{"[tls]", "letsencrypt.email is required"}},
+		},
+		{
+			name:    "timeout_scheduler shard_count below -1",
+			content: "[timeout_scheduler]\nshard_count = -2\n" + metricsServerTOML,
+			want:    []problem{{"[timeout_scheduler]", "shard_count must be >= -1, got -2"}},
+		},
+		{
+			name:    "no servers",
+			content: "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com:587\"\n",
+			want:    []problem{{"servers", "no servers configured"}},
+		},
+		{
+			name: "server names and addresses used twice",
+			content: imapBackend + "\n[[server]]\ntype = \"pop3\"\nname = \"imap\"\naddr = \"127.0.0.1:110\"\n" +
+				"\n[[server]]\ntype = \"lmtp\"\nname = \"lmtp\"\naddr = \"127.0.0.1:143\"\n",
+			want: []problem{
+				{"server configuration", "duplicate server name 'imap' found"},
+				{"server configuration", "duplicate server address '127.0.0.1:143' found"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureReloadLogs(t)
+			cfg := startupConfig()
+
+			handleConfigReload(&cfg, reloadedFrom(t, tt.content))
+
+			out := logs.String()
+			if len(tt.want) == 0 {
+				if strings.Contains(out, "level=ERROR") {
+					t.Errorf("a file start-up takes was reported as an error:\n%s", out)
+				}
+				return
+			}
+			for _, p := range tt.want {
+				msg := "Config reload: " + p.section + " is invalid and the server will not start with this config"
+				if !hasLineWith(out, "level=ERROR", msg, p.err) {
+					t.Errorf("no error-level report %q naming %q:\n%s", msg, p.err, out)
+				}
 			}
 		})
 	}
@@ -285,8 +401,8 @@ func hasLineWith(logs string, parts ...string) bool {
 	return false
 }
 
-// proxyNodeConfig is a proxy node: no [database] (so start-up runs it without one),
-// named pools and a relay.
+// proxyNodeConfig is a proxy node: no [database] (so start-up runs it without one, with
+// a remote lookup for every user), named pools and a relay.
 const proxyNodeConfig = `
 bcrypt_cost = 12
 
@@ -303,6 +419,10 @@ default = true
 type = "imap_proxy"
 name = "imap-proxy"
 addr = ":1993"
+
+[server.remote_lookup]
+enabled = true
+url = "https://lookup.example.com/lookup?email=$email"
 `
 
 // reportsRestart reports whether a restart notice in logs names key as a whole field.

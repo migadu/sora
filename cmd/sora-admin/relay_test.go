@@ -297,3 +297,102 @@ func TestRelayStatsDoesNotCreateTheQueue(t *testing.T) {
 		}
 	})
 }
+
+// relay delete --queue pending --id all must delete only committed messages (paired with
+// <id>.json) and leave in-flight uncommitted holds (<id>.held + <id>.msg) intact so an
+// active delivery can still commit and relay its redirect body.
+func TestRelayDeleteAllLeavesHeldMessagesIntact(t *testing.T) {
+	queuePath := t.TempDir()
+	q, err := relayqueue.NewDiskQueue(queuePath, 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := q.Enqueue("committed@example.com", "drop@example.org", "redirect", []byte("committed body")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	wantBody := []byte("From: alice@example.com\r\nTo: keep@example.org\r\n\r\nHeld redirect body.\r\n")
+	commit, abort, err := q.Hold("alice@example.com", "keep@example.org", "redirect", wantBody)
+	if err != nil {
+		t.Fatalf("Hold: %v", err)
+	}
+	defer abort()
+
+	out := runRelay(t, queuePath, "", "delete", "--queue", "pending", "--id", "all", "--confirm")
+	if !strings.Contains(out, "Deleted 1 messages from pending queue\n") {
+		t.Errorf("unexpected delete output:\n%s", out)
+	}
+
+	entries, err := os.ReadDir(filepath.Join(queuePath, "pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if len(names) != 2 {
+		t.Fatalf("pending holds %v after delete --id all; want the held redirect's .held and .msg (2 files)", names)
+	}
+
+	if err := commit(); err != nil {
+		t.Fatalf("commit held redirect after delete --id all: %v", err)
+	}
+	msg, gotBody, err := q.AcquireNext()
+	if err != nil || msg == nil {
+		t.Fatalf("AcquireNext after committing held redirect = %v, %v; want the held message", msg, err)
+	}
+	if msg.To != "keep@example.org" || string(gotBody) != string(wantBody) {
+		t.Errorf("acquired To=%q body=%q; want To=%q body=%q", msg.To, gotBody, "keep@example.org", wantBody)
+	}
+}
+
+func TestDeleteAllMessagesInQueueDir(t *testing.T) {
+	queuePath := t.TempDir()
+	q, err := relayqueue.NewDiskQueue(queuePath, 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingDir := filepath.Join(queuePath, "pending")
+
+	if err := q.Enqueue("a@example.com", "b@example.org", "redirect", []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Enqueue("c@example.com", "d@example.org", "redirect", []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	_, abort, err := q.Hold("h@example.com", "k@example.org", "redirect", []byte("held"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer abort()
+	scratch := filepath.Join(pendingDir, ".tmp-scratch")
+	if err := os.WriteFile(scratch, []byte("scratch"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stagingMsg := filepath.Join(pendingDir, "unpaired-staging.msg")
+	if err := os.WriteFile(stagingMsg, []byte("staging"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := deleteAllMessagesInQueueDir(pendingDir)
+	if err != nil {
+		t.Fatalf("deleteAllMessagesInQueueDir: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", deleted)
+	}
+	for _, keep := range []string{scratch, stagingMsg} {
+		if _, err := os.Stat(keep); err != nil {
+			t.Errorf("expected %s to remain untouched: %v", filepath.Base(keep), err)
+		}
+	}
+	abort()
+	entries, err := os.ReadDir(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected only scratch and unpaired .msg to remain after abort, got %d entries", len(entries))
+	}
+}

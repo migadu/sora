@@ -27,6 +27,12 @@ func (q *captureRelayQueue) Enqueue(from, to, msgType string, body []byte) error
 	return nil
 }
 
+// Hold records the message when it is committed, which is when the relay worker
+// would first see it.
+func (q *captureRelayQueue) Hold(from, to, messageType string, messageBytes []byte) (func() error, func(), error) {
+	return func() error { return q.Enqueue(from, to, messageType, messageBytes) }, func() {}, nil
+}
+
 func vacAddr(t *testing.T, s string) *server.Address {
 	t.Helper()
 	a, err := server.NewAddress(s)

@@ -77,13 +77,20 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 	// shared namespace, so a RENAME never crosses it (issue #160). Checked before any
 	// parent of the new name is created, and against the stored flag as
 	// db.RenameMailbox does: a personal mailbox can sit under the shared prefix, and
-	// may only be renamed out of it.
+	// may only be renamed out of it. The rename carries the mailbox's descendants
+	// along, and each must stay on its side as well (issue #1229). RENAME INBOX moves
+	// the messages of the personal INBOX into a new mailbox and leaves the children
+	// in place, so only the new name counts there.
 	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
-		isShared, sharedErr := s.server.rdb.IsMailboxSharedWithRetry(ctx, oldMailbox.ID)
-		if sharedErr != nil {
-			return s.internalError("failed to check whether mailbox '%s' is shared: %v", existingName, sharedErr)
+		crosses := s.server.config.SharedMailboxes.InNamespace(newName)
+		if !strings.EqualFold(existingName, consts.MailboxInbox) {
+			var sharedErr error
+			crosses, sharedErr = s.server.rdb.RenameCrossesSharedBoundaryWithRetry(ctx, s.server.config.SharedMailboxes, oldMailbox, newName)
+			if sharedErr != nil {
+				return s.internalError("failed to check mailbox '%s' against the shared namespace: %v", existingName, sharedErr)
+			}
 		}
-		if s.server.config.SharedMailboxes.InNamespace(newName) != isShared {
+		if crosses {
 			s.DebugLog("rejecting rename across the shared namespace boundary", "old_name", existingName, "new_name", newName)
 			return sharedBoundaryError()
 		}
@@ -185,7 +192,7 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 			if resolveErr != nil {
 				return s.internalError("failed to resolve S3 owner for INBOX rename: %v", resolveErr)
 			}
-			_, err = s.server.rdb.MoveMessagesWithRetry(ctx, &uids, oldMailbox.ID, newMailbox.ID, AccountID, domain, localpart, s.server.hostname, nil, nil, nil)
+			_, err = s.server.rdb.MoveMessagesWithRetry(ctx, &uids, oldMailbox.ID, newMailbox.ID, AccountID, domain, localpart, s.server.instanceID, nil, nil, nil)
 		}
 		if err != nil {
 			return s.internalError("failed to move messages from INBOX to '%s': %v", newName, err)

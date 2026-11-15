@@ -614,8 +614,8 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		// Drain each account's FTS rows in bounded batches BEFORE finalization. An account
 		// has one FTS row per distinct body it held, so a single unbounded DELETE inside
 		// the finalize transaction could be millions of rows and a correspondingly long
-		// lock. FinalizeAccountDeletions still issues the same DELETE as a safety net; by
-		// then it is a no-op.
+		// lock. FinalizeAccountDeletions skips an account whose rows the drain left (it
+		// failed, or a body was being staged); the next cycle drains it again.
 		for _, accountID := range danglingAccounts {
 			deleted, err := drainAccountFTS(ctx, w.rdb, accountID)
 			ftsPrunedCount += deleted

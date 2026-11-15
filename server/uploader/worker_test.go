@@ -99,11 +99,18 @@ func (m *mockDB) GetUploaderStatsWithRetry(ctx context.Context, maxAttempts int)
 	return &db.UploaderStats{}, nil
 }
 
-func (m *mockDB) PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int) (UploadBacklog, error) {
+// PendingUploadBacklog answers from PendingUploadBacklogFunc and then, like the real
+// query once its totals are read, ends the measurement window through changed.
+func (m *mockDB) PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int, changed func() []StagedBody) (UploadBacklog, error) {
+	var backlog UploadBacklog
 	if m.PendingUploadBacklogFunc != nil {
-		return m.PendingUploadBacklogFunc(ctx, instanceID, maxAttempts)
+		var err error
+		if backlog, err = m.PendingUploadBacklogFunc(ctx, instanceID, maxAttempts); err != nil {
+			return UploadBacklog{}, err
+		}
 	}
-	return UploadBacklog{}, nil
+	changed()
+	return backlog, nil
 }
 
 func (m *mockDB) RecordInstanceHeartbeatWithRetry(ctx context.Context, instanceID string) error {
