@@ -316,11 +316,12 @@ func validateSpecialUse(attrs []imap.MailboxAttr) (string, *imap.Error) {
 // [shared_mailboxes] allow_user_create is false (the default). Administrators create
 // those (sora-admin mailbox create). Inside an existing shared mailbox the ACL's 'k'
 // right decides, as anywhere else. A personal mailbox found under a parent's name
-// does not count: the User API and Sieve fileinto :create make personal mailboxes
-// under the prefix, and personal ones in any case variant of it ("shared/Team")
-// predate case-insensitive namespace matching. accountID is the account whose view
-// resolves the parents; with ownedOnly only its own shared mailboxes count, as for
-// RENAME, which keeps a mailbox with its owner.
+// does not count: the User API, import maildir and Sieve fileinto :create made
+// personal mailboxes under the prefix before they refused or shared such names, and
+// personal ones in any case variant of it ("shared/Team") predate case-insensitive
+// namespace matching. accountID is the account whose view resolves the parents; with
+// ownedOnly only its own shared mailboxes count, as for RENAME, which keeps a mailbox
+// with its owner.
 func (s *IMAPSession) sharedCreateRefusal(ctx context.Context, accountID int64, name string, ownedOnly bool) error {
 	refused, err := s.isRefusedSharedRoot(ctx, accountID, name, ownedOnly)
 	if err != nil {

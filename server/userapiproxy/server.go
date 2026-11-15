@@ -83,10 +83,11 @@ type Server struct {
 	// the proxy eventually refuses every connection (permanent DoS).
 	connReleases   map[net.Conn]func()
 	connReleasesMu sync.Mutex
-	httpServer     *http.Server
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
+	httpServer   *http.Server
+	shutdownMu   sync.Mutex
+	shutdownDone chan struct{}
+	ctx          context.Context
+	cancel       context.CancelFunc
 
 	// Base transports retain the server's dial policy. Proxied requests use a
 	// bounded cache partitioned by pool, verification policy and DNS snapshot;
@@ -430,11 +431,15 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 
 // Start starts the User API proxy server
 func (s *Server) Start() error {
+	if s.ctx.Err() != nil {
+		return nil
+	}
+
 	// Setup HTTP handler (with PROXY protocol support if enabled)
 	handler := s.setupHandler()
 
 	// Create HTTP server
-	s.httpServer = &http.Server{
+	httpServer := &http.Server{
 		Addr:         s.addr,
 		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
@@ -458,8 +463,19 @@ func (s *Server) Start() error {
 			s.cancel()
 			return err
 		}
-		s.httpServer.TLSConfig = tlsConfig
+		httpServer.TLSConfig = tlsConfig
 	}
+
+	s.shutdownMu.Lock()
+	if s.ctx.Err() != nil {
+		s.shutdownMu.Unlock()
+		return nil
+	}
+	s.httpServer = httpServer
+	shutdownDone := make(chan struct{})
+	s.shutdownDone = shutdownDone
+	s.shutdownMu.Unlock()
+	defer close(shutdownDone)
 
 	// Start connection limiter cleanup if enabled
 	if s.limiter != nil {
@@ -467,12 +483,14 @@ func (s *Server) Start() error {
 	}
 
 	// Graceful shutdown
+	httpShutdownDone := make(chan struct{})
 	go func() {
+		defer close(httpShutdownDone)
 		<-s.ctx.Done()
 		logger.Info("User API Proxy: Shutting down server", "name", s.name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			logger.Warn("User API Proxy: Error shutting down server", "name", s.name, "error", err)
 		}
 	}()
@@ -487,6 +505,8 @@ func (s *Server) Start() error {
 	// Create listener
 	listener, err := net.Listen("tcp", s.addr)
 	if err != nil {
+		s.cancel()
+		<-httpShutdownDone
 		return fmt.Errorf("failed to create listener: %w", err)
 	}
 
@@ -500,12 +520,26 @@ func (s *Server) Start() error {
 	// backends are told the client is.
 	listener = server.WrapProxyProtocolHTTP(listener, s.proxyReader, "USER-API-PROXY")
 
+	if s.ctx.Err() != nil {
+		listener.Close()
+		<-httpShutdownDone
+		return nil
+	}
+
 	// Start serving. The certificate is in TLSConfig already: certificate
 	// files passed here would be loaded again, on top of the global one.
 	if s.tls {
-		return s.httpServer.ServeTLS(listener, "", "")
+		err = httpServer.ServeTLS(listener, "", "")
+	} else {
+		err = httpServer.Serve(listener)
 	}
-	return s.httpServer.Serve(listener)
+	if errors.Is(err, http.ErrServerClosed) && s.ctx.Err() != nil {
+		<-httpShutdownDone
+		return nil
+	}
+	s.cancel()
+	<-httpShutdownDone
+	return err
 }
 
 // setupHandler creates the HTTP handler with reverse proxy logic
@@ -565,7 +599,7 @@ func (s *Server) setupHandler() http.Handler {
 		if isCORSPreflight(r) {
 			route, err = s.routeNameless(r)
 		} else {
-			route, login, err = s.routeAuthRequest(r)
+			route, login, err = s.routeAuthRequest(w, r)
 		}
 		if err != nil {
 			if errors.Is(err, errAuthBodyTooLarge) {
@@ -673,7 +707,8 @@ func (s *Server) routeNameless(r *http.Request) (backendRoute, error) {
 }
 
 // writeTimeout is the proxy's http.Server WriteTimeout: no answer later than this after a
-// request was read reaches its client.
+// request was read reaches its client, unless the handler moves the deadline (a delayed
+// login, admitLogin).
 const writeTimeout = 30 * time.Second
 
 // maxAuthBodyBytes bounds how much of an auth request body the proxy reads to find the
@@ -702,14 +737,15 @@ var errLoginRefused = errors.New("login refused")
 
 // routeAuthRequest picks the backend for an unauthenticated auth request, and returns
 // the login attempt the rate limit counts by the backend's answer (nil for a refresh, or
-// without a rate limit). A login is admitted by the rate limit first (admitLogin). A
+// without a rate limit). A login is admitted by the rate limit first (admitLogin), which
+// moves the write deadline of w past its delay. A
 // login for a user the lookup does not know or refuses reaches no backend, which would
 // verify the password before answering 401: the proxy verifies it against a dummy hash
 // instead, counts it as a failure and returns errLoginRefused, so that neither the
 // answer, nor its timing, nor the rate limit shows what the lookup said of the address.
 // A refresh for such a user carries a token the proxy accepted, so its caller learns
 // nothing from the refusal and it stays a temporary one.
-func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, *loginAttempt, error) {
+func (s *Server) routeAuthRequest(w http.ResponseWriter, r *http.Request) (backendRoute, *loginAttempt, error) {
 	id, err := s.peekAuthIdentity(r)
 	if err != nil {
 		return backendRoute{}, nil, err
@@ -721,7 +757,7 @@ func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, *loginAttempt,
 	var login *loginAttempt
 	if id.password != "" && s.authLimiter != nil {
 		login = &loginAttempt{addr: &server.StringAddr{Addr: s.getRealClientIP(r)}, key: server.AuthRateLimitKey(id.email)}
-		if err := s.admitLogin(r.Context(), login); err != nil {
+		if err := s.admitLogin(r.Context(), w, login); err != nil {
 			return backendRoute{}, nil, err
 		}
 	}
@@ -752,9 +788,11 @@ type loginAttempt struct {
 // would let a blocked client spend the proxy's CPU. One limiter counts every login
 // through the proxy, those a backend answers (proxyRequest) and those the proxy refuses
 // itself, so neither a delay nor a block depends on whether the lookup knows the address.
-// A login delay that cannot be served is server.ErrDelayQueueFull.
-func (s *Server) admitLogin(ctx context.Context, login *loginAttempt) error {
-	if err := server.ApplyAuthenticationDelay(ctx, s.authLimiter, login.addr, "userapi_proxy"); err != nil {
+// A login delay that cannot be served is server.ErrDelayQueueFull. The delay runs after
+// net/http set the request's write deadline, so it moves the deadline of w past itself,
+// leaving the login writeTimeout after it.
+func (s *Server) admitLogin(ctx context.Context, w http.ResponseWriter, login *loginAttempt) error {
+	if err := server.ApplyHTTPAuthenticationDelay(ctx, w, s.authLimiter, login.addr, "userapi_proxy", writeTimeout); err != nil {
 		return fmt.Errorf("login delay: %w", err)
 	}
 	if err := s.authLimiter.CanAttemptAuth(ctx, login.addr, login.key); err != nil {
@@ -1363,22 +1401,24 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 func (s *Server) Stop() error {
 	logger.Info("User API Proxy: Stopping", "name", s.name)
 
+	s.shutdownMu.Lock()
 	s.cancel()
+	shutdownDone := s.shutdownDone
+	s.shutdownMu.Unlock()
+
 	s.closeBackendIdleConnections()
 
-	// HTTP server shutdown is handled by the graceful shutdown goroutine
-	// Wait for it to complete
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	// HTTP server shutdown is handled by the graceful shutdown goroutine;
+	// wait for Start (and httpServer.Shutdown) to complete.
+	if shutdownDone != nil {
+		select {
+		case <-shutdownDone:
+			logger.Info("User API Proxy: Server stopped gracefully", "name", s.name)
+		case <-time.After(30 * time.Second):
+			logger.Warn("User API Proxy: Server stop timeout", "name", s.name)
+		}
+	} else {
 		logger.Info("User API Proxy: Server stopped gracefully", "name", s.name)
-	case <-time.After(30 * time.Second):
-		logger.Warn("User API Proxy: Server stop timeout", "name", s.name)
 	}
 
 	return nil

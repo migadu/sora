@@ -68,7 +68,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,6 +78,7 @@ import (
 
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/pkg/sqlitefile"
 	_ "modernc.org/sqlite"
 )
 
@@ -199,15 +199,18 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval
 
 	for i := 0; i < NumShards; i++ {
 		shardHex := fmt.Sprintf("%02x", i)
-		dbPath := shardIndexPath(basePath, i)
-		db, err := sql.Open("sqlite", dbPath)
+		// busy_timeout is a setting of each connection, so it goes in the DSN, which the
+		// driver applies to every connection the pool opens; a PRAGMA run with Exec on
+		// the pool sets it on one pooled connection only.
+		dsn, err := sqlitefile.DSN(shardIndexPath(basePath, i), "_pragma=busy_timeout(5000)")
+		if err != nil {
+			return nil, err
+		}
+		db, err := sql.Open("sqlite", dsn)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open cache index DB for shard %s: %w", shardHex, err)
 		}
 
-		if _, err := db.Exec(`PRAGMA busy_timeout = 5000;`); err != nil {
-			logger.Warn("Cache: Failed to set busy_timeout", "error", err)
-		}
 		if _, err := db.Exec(`PRAGMA journal_mode = WAL;`); err != nil {
 			logger.Warn("Cache: Failed to enable WAL mode on cache index DB", "error", err)
 		}
@@ -274,7 +277,10 @@ func Usage(basePath string) (objects, totalSize int64, err error) {
 		if _, err := os.Stat(dbPath); err != nil {
 			return 0, 0, fmt.Errorf("no cache index at %s: %w", dbPath, err)
 		}
-		dsn := (&url.URL{Scheme: "file", Path: dbPath, RawQuery: "mode=ro&_pragma=busy_timeout(5000)"}).String()
+		dsn, err := sqlitefile.DSN(dbPath, "mode=ro&_pragma=busy_timeout(5000)")
+		if err != nil {
+			return 0, 0, err
+		}
 		db, err := sql.Open("sqlite", dsn)
 		if err != nil {
 			return 0, 0, fmt.Errorf("failed to open cache index %s: %w", dbPath, err)

@@ -115,7 +115,8 @@ func TestConfigValidateRejectsIncompleteServerBlock(t *testing.T) {
 // only warned about a file without servers. A file with several problems reports each.
 // Nor did it check what start-up checked only as it set up services (#921): the
 // [relay.queue] durations, [cluster] addr and secret_key, and the [database] and [s3]
-// a node's servers need.
+// a node's servers need; nor [uploader] max_staging_size, the [s3] keys, the [database]
+// durations and [tls] (#1092, #1095, #1104, #1105).
 func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 	const imapBackend = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"
 	const imapProxy = "\n[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:1143\"\n"
@@ -159,6 +160,19 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 			name:    "remote_lookup timeout without a unit",
 			content: imapProxy + remoteLookup + "url = \"https://lookup.example.com/lookup?email=$email\"\ntimeout = \"5\"\n",
 			wantErr: []string{"invalid remote_lookup.timeout"},
+		},
+		{
+			// The issue's file: every proxy refuses to be built without backends (#1038).
+			name:    "proxy without remote_addrs or [[pool]] blocks",
+			content: imapProxy + "\n[server.remote_lookup]\nenabled = true\nurl = \"https://lookup.example.com/lookup?email=$email\"\n",
+			wantErr: []string{"[FAIL] server 'imap-proxy':\n   remote_addrs is required unless the file declares [[pool]] blocks"},
+		},
+		{
+			// The issue's file: the proxy was built with "" as a backend (#1147).
+			name: "proxy with an empty remote_addrs entry",
+			content: imapProxy + "remote_addrs = [\"\"]\nremote_port = 143\n" +
+				"\n[server.remote_lookup]\nenabled = true\nurl = \"https://lookup.example.com/lookup?email=$email\"\n",
+			wantErr: []string{"[FAIL] server 'imap-proxy':\n   server \"imap-proxy\": remote_addrs #1: empty backend address"},
 		},
 		{
 			name:    "remote_lookup the proxies start with",
@@ -206,6 +220,13 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 			wantErr: []string{`server "imap" (imap) needs the database`, "bucket is required"},
 		},
 		{
+			// Start-up opens no write pool and stops with "no healthy database pools
+			// available" (#1266).
+			name:    "managesieve with only [database.read] hosts",
+			content: "[database.read]\nhosts = [\"replica.example.com\"]\n\n[[server]]\ntype = \"managesieve\"\nname = \"managesieve\"\naddr = \"127.0.0.1:4190\"\n",
+			wantErr: []string{"[FAIL] [database.write]:\n   server \"managesieve\" (managesieve) needs the database, but [database.write] has no hosts"},
+		},
+		{
 			name:    "mail backend with an S3 timeout without a unit",
 			content: storageTOML + "timeout = \"30\"\n" + imapBackend,
 			wantErr: []string{`invalid timeout "30"`},
@@ -248,6 +269,48 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 			name:    "no servers",
 			content: "[logging]\nlevel = \"info\"\n",
 			wantErr: []string{"no servers configured"},
+		},
+		{
+			// The file of #1092: the server exits on it as it starts the upload worker.
+			name:    "uploader max_staging_size unparsable on a mail backend",
+			content: storageTOML + "[uploader]\nmax_staging_size = \"100 gigs\"\n" + imapBackend,
+			wantErr: []string{"[uploader] max_staging_size: invalid size format: '100 gigs'"},
+		},
+		{
+			// The files of #1095: storage set-up refused them.
+			name:    "s3 encryption_key not hex",
+			content: storageTOML + "encrypt = true\nencryption_key = \"not-hex\"\n" + imapBackend,
+			wantErr: []string{"[FAIL] [s3]:\n   encryption_key must be 64 hex characters"},
+		},
+		{
+			name:    "s3 access_key without secret_key",
+			content: storageTOML + "access_key = \"AKIAEXAMPLE\"\n" + imapBackend,
+			wantErr: []string{"[FAIL] [s3]:\n   access_key and secret_key must be set together"},
+		},
+		{
+			// The files of #1104: start-up stopped with "no healthy database pools
+			// available", which does not name the key.
+			name: "database.write max_conn_lifetime unparsable",
+			content: "[database.write]\nhosts = [\"localhost\"]\nuser = \"postgres\"\nname = \"sora_mail_db\"\nmax_conn_lifetime = \"an hour\"\n" +
+				"\n[[server]]\ntype = \"managesieve\"\nname = \"managesieve\"\naddr = \"127.0.0.1:4190\"\n",
+			wantErr: []string{"[FAIL] [database.write]:\n   invalid max_conn_lifetime \"an hour\""},
+		},
+		{
+			name: "database migration_timeout unparsable",
+			content: "[database]\nmigration_timeout = \"soon\"\n\n[database.write]\nhosts = [\"localhost\"]\n" +
+				"\n[[server]]\ntype = \"managesieve\"\nname = \"managesieve\"\naddr = \"127.0.0.1:4190\"\n",
+			wantErr: []string{"[FAIL] [database]:\n   invalid migration_timeout \"soon\""},
+		},
+		{
+			// The files of #1105: the TLS manager refused them after every other service.
+			name:    "tls letsencrypt without email",
+			content: "[tls]\nenabled = true\nprovider = \"letsencrypt\"\n\n[tls.letsencrypt]\ndomains = [\"mail.example.com\"]\n" + metrics,
+			wantErr: []string{"[FAIL] [tls]:\n   letsencrypt.email is required"},
+		},
+		{
+			name:    "tls provider unknown",
+			content: "[tls]\nenabled = true\nprovider = \"acme\"\n" + metrics,
+			wantErr: []string{"[FAIL] [tls]:\n   unknown TLS provider: acme (must be 'file' or 'letsencrypt')"},
 		},
 		{
 			name: "every problem reported",

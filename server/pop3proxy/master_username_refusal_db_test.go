@@ -9,11 +9,13 @@ import (
 	"time"
 
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/migadu/sora/server"
 )
 
 // TestPOP3ProxyWrongMasterPasswordLooksLikeAnotherSuffixInTheDatabase is
 // TestPOP3ProxyWrongMasterPasswordLooksLikeAnotherSuffix (#801) for a proxy that
-// authenticates against the database, for an unknown address and for an account.
+// authenticates against the database, for an unknown address and for an account. The
+// account's own password logs in under the master suffix as under any other (#949).
 func TestPOP3ProxyWrongMasterPasswordLooksLikeAnotherSuffixInTheDatabase(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	rdb := common.SetupTestDatabase(t)
@@ -35,18 +37,25 @@ func TestPOP3ProxyWrongMasterPasswordLooksLikeAnotherSuffixInTheDatabase(t *test
 	}
 
 	unknown := fmt.Sprintf("nobody-%d@example.com", time.Now().UnixNano())
-	for _, c := range []struct{ name, base, password string }{
-		{"unknown_address", unknown, "wrong-password"},
-		{"wrong_password", account.Email, "wrong-password"},
-		{"account_password", account.Email, account.Password},
+	for _, c := range []struct {
+		name, base, password string
+		logsIn               bool
+	}{
+		{"unknown_address", unknown, "wrong-password", false},
+		{"wrong_password", account.Email, "wrong-password", false},
+		{"account_password", account.Email, account.Password, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			other := refuse(c.base+"@other", "wrong-password")
-			if other.verifications != [2]int{1, 0} || !other.cached {
-				t.Fatalf("wrong password under another suffix: %+v; want one verification and a cached refusal", other)
+			other := refuse(c.base+"@other", c.password)
+			if c.logsIn {
+				if key := server.AuthRateLimitKey(c.base); other.successKeys != key+","+key {
+					t.Fatalf("%q under another suffix: %+v; want two successes recorded under %q", c.password, other, key)
+				}
+			} else if other.verifications != [2]int{1, 0} || !other.cached {
+				t.Fatalf("%q under another suffix: %+v; want one verification and a cached refusal", c.password, other)
 			}
 			if got := refuse(c.base+"@"+testMasterUsername, c.password); got != other {
-				t.Errorf("%q under the master suffix: %+v\nwrong password under another suffix: %+v", c.password, got, other)
+				t.Errorf("%q under the master suffix: %+v\nunder another suffix: %+v", c.password, got, other)
 			}
 		})
 	}
