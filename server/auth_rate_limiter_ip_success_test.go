@@ -167,6 +167,45 @@ func TestFailureCountDeliveredAfterTheSuccessIsIgnored(t *testing.T) {
 	}
 }
 
+// TestFailureCountDeliveredAfterTheSuccessIsIgnoredWhereItHappened: the
+// listener that saw the success is no exception. A count another listener sent
+// before the success, delivered here after it, is the older of the two: that
+// listener clears it when the success reaches it, and it must not come back here
+// either, or the listener the user just logged in on is the one that delays them.
+func TestFailureCountDeliveredAfterTheSuccessIsIgnoredWhereItHappened(t *testing.T) {
+	cfg := ipSuccessTestConfig()
+	a := newNodeRateLimiter(t, newSingleNodeCluster(t, "node-1"), "IMAP-PROXY", "imap-proxy", cfg)
+	b := newNodeRateLimiter(t, newSingleNodeCluster(t, "node-2"), "IMAP-PROXY", "imap-proxy", cfg)
+
+	ctx := context.Background()
+	client := &net.TCPAddr{IP: net.ParseIP("192.0.2.9"), Port: 40000}
+	for range 3 {
+		a.RecordAuthAttempt(ctx, client, "anna@example.com", false)
+	}
+	deliverRateLimitBroadcasts(b.clusterLimiter, takeRateLimitBroadcasts(t, a.clusterLimiter))
+
+	// node-2 counts one more failure; its count is still on the way to node-1
+	// when the user logs in there.
+	time.Sleep(2 * time.Millisecond)
+	b.RecordAuthAttempt(ctx, client, "bob@example.com", false)
+	late := takeRateLimitBroadcasts(t, b.clusterLimiter)
+
+	time.Sleep(2 * time.Millisecond)
+	a.RecordAuthAttempt(ctx, client, "anna@example.com", true)
+	deliverRateLimitBroadcasts(b.clusterLimiter, takeRateLimitBroadcasts(t, a.clusterLimiter))
+	if got := ipFailureCountOf(b, "192.0.2.9"); got != 0 {
+		t.Fatalf("node-2 counts %d failures of the address after a later success on node-1, want 0", got)
+	}
+
+	deliverRateLimitBroadcasts(a.clusterLimiter, late)
+	if got := a.GetAuthenticationDelay(client); got != 0 {
+		t.Errorf("node-1 delays the address by %v: a count sent before its own success, delivered after it, was applied", got)
+	}
+	if got := ipFailureCountOf(a, "192.0.2.9"); got != 0 {
+		t.Errorf("node-1 counts %d failures of the address from a count sent before its own success", got)
+	}
+}
+
 // TestSuccessClearsACountReceivedUnderAHigherThreshold: listeners of one
 // protocol may run with different limits (a rolling change, or two [[server]]
 // entries of the protocol). A count received from a listener whose
