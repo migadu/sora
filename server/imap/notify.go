@@ -873,6 +873,10 @@ type notifyTreeEvent struct {
 	// name after the change.
 	hasChildren bool
 	entry       notifySnapshotEntry
+	// carried holds descendants whose rename this ancestor represents. A
+	// watched descendant can make the ancestor relevant even when the
+	// ancestor itself is outside a SUBSCRIBED or explicit mailbox filter.
+	carried []notifySnapshotEntry
 }
 
 // diffNotifySnapshots compares two account snapshots and returns the
@@ -908,6 +912,7 @@ func diffNotifySnapshots(prev, cur map[int64]notifySnapshotEntry) []notifyTreeEv
 
 	var events []notifyTreeEvent
 	var createdOrDeleted []string
+	var carriedBy map[string][]notifySnapshotEntry
 	for id, old := range prev {
 		if _, exists := cur[id]; !exists {
 			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: old.name, deleted: true, entry: old})
@@ -916,11 +921,21 @@ func diffNotifySnapshots(prev, cur map[int64]notifySnapshotEntry) []notifyTreeEv
 	}
 	for id, entry := range cur {
 		old, existed := prev[id]
+		var superior string
+		if existed && old.name != entry.name {
+			superior = renamedWithSuperior(old.name, entry.name, renamed)
+			if superior != "" {
+				if carriedBy == nil {
+					carriedBy = make(map[string][]notifySnapshotEntry)
+				}
+				carriedBy[superior] = append(carriedBy[superior], entry)
+			}
+		}
 		switch {
 		case !existed:
 			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: entry.name, entry: entry})
 			createdOrDeleted = append(createdOrDeleted, entry.name)
-		case old.name != entry.name && !renamedWithSuperior(old.name, entry.name, renamed):
+		case old.name != entry.name && superior == "":
 			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: entry.name, oldName: old.name, entry: entry})
 		case old.subscribed != entry.subscribed:
 			events = append(events, notifyTreeEvent{event: imap.NotifyEventSubscriptionChange, name: entry.name, entry: entry})
@@ -971,22 +986,27 @@ func diffNotifySnapshots(prev, cur map[int64]notifySnapshotEntry) []notifyTreeEv
 
 	for i := range events {
 		events[i].hasChildren = superiors[strings.ToLower(events[i].name)]
+		if events[i].oldName != "" {
+			events[i].carried = carriedBy[events[i].name]
+		}
 	}
 	return events
 }
 
-// renamedWithSuperior reports whether the rename of a mailbox from oldName to
-// newName is the one a superior renamed in the same diff gave it. A RENAME
-// renames the inferiors of the mailbox by replacing its old name at the start
-// of their names with the new one (db.RenameMailbox). renamed maps the
-// lower-cased old name of each renamed mailbox to its new name.
-func renamedWithSuperior(oldName, newName string, renamed map[string]string) bool {
+// renamedWithSuperior returns the new name of the outermost superior whose
+// rename carries oldName to newName, or empty when this is an independent
+// rename. The outermost matching superior is the one with a reported rename;
+// intermediate carried ancestors are suppressed too. This same depth walk
+// supplies filter metadata without rescanning all mailboxes per parent event.
+// renamed maps each lower-cased old name to its new name.
+func renamedWithSuperior(oldName, newName string, renamed map[string]string) string {
+	var superior string
 	for i := strings.LastIndexByte(oldName, consts.MailboxDelimiter); i > 0; i = strings.LastIndexByte(oldName[:i], consts.MailboxDelimiter) {
 		if to, ok := renamed[strings.ToLower(oldName[:i])]; ok && newName == to+oldName[i:] {
-			return true
+			superior = to
 		}
 	}
-	return false
+	return superior
 }
 
 // notifySnapshotLooksStale reports whether cur is a sharply smaller view of the
@@ -1011,7 +1031,19 @@ func (s *IMAPSession) notifyDiffSnapshots(watch *notifyWatch, cur map[int64]noti
 	// As in LIST, the child attributes go with the CHILDREN capability.
 	children := s.GetCapabilities().Has(imap.CapChildren)
 	for _, ev := range events {
-		if !watch.eventsForMailbox(ev.name, ev.entry.subscribed, sharedRoot)[ev.event] {
+		interested := watch.eventsForMailbox(ev.name, ev.entry.subscribed, sharedRoot)[ev.event]
+		if !interested && ev.event == imap.NotifyEventMailboxName {
+			// A single visible ancestor rename represents its carried
+			// descendants. Keep that rename observable when a descendant
+			// is watched but the ancestor itself is not (e.g. SUBSCRIBED).
+			for _, child := range ev.carried {
+				if watch.eventsForMailbox(child.name, child.subscribed, sharedRoot)[imap.NotifyEventMailboxName] {
+					interested = true
+					break
+				}
+			}
+		}
+		if !interested {
 			continue
 		}
 		data := &imap.ListData{
@@ -1031,6 +1063,11 @@ func (s *IMAPSession) notifyDiffSnapshots(watch *notifyWatch, cur map[int64]noti
 				// §5.5: \Subscribed if and only if subscribed after the event.
 				data.Attrs = append(data.Attrs, imap.MailboxAttrSubscribed)
 			}
+		}
+		// As in LIST, the configured shared namespace root is always a
+		// non-selectable container, including after its last child is deleted.
+		if sharedRoot != "" && strings.EqualFold(ev.name, sharedRoot) {
+			data.Attrs = append(data.Attrs, imap.MailboxAttrNoSelect)
 		}
 		if children {
 			// §5.4: "The server SHOULD also include \HasChildren or
