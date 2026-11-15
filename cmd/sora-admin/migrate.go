@@ -288,7 +288,7 @@ func showVersion(m *migrate.Migrate) {
 type migrationLogger struct{}
 
 func (l *migrationLogger) Printf(format string, v ...any) {
-	logger.Info("MIGRATE", "msg", fmt.Sprintf(format, v...))
+	logger.Info("MIGRATE", "detail", fmt.Sprintf(format, v...))
 }
 
 func (l *migrationLogger) Verbose() bool {

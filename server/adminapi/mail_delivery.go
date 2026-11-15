@@ -58,7 +58,7 @@ type adminAPILogger struct {
 
 func (l *adminAPILogger) Log(format string, args ...any) {
 	// Log with prefix to identify HTTP delivery path
-	logger.Debug("Mail delivery", "msg", fmt.Sprintf(format, args...))
+	logger.Debug("Mail delivery", "detail", fmt.Sprintf(format, args...))
 }
 
 // defaultMaxMessageSize is used to cap the mail-injection body when the server's
