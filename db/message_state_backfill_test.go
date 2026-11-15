@@ -185,6 +185,48 @@ func TestMessageStateBackfillMigration(t *testing.T) {
 		assert.Equal(t, 1, summary.UnseenCount)
 	})
 
+	// A message without a row can already be in unseen_count, so the repair must count
+	// the mailbox again rather than add the message to it. The messages trigger reads a
+	// missing row as no flags: a restore by an older build un-expunged a message whose
+	// mailbox had been purged, wrote no row, and the trigger counted the message as an
+	// unseen arrival (see the recompute at the end of RestoreMessages). Migration 000022
+	// run without its copy (#613) likewise left unseen_count counting the flags it dropped.
+	for _, viaScript := range []bool{false, true} {
+		name := "a restored message already counted as unseen is counted once"
+		if viaScript {
+			name += ", through the script"
+		}
+		t.Run(name, func(t *testing.T) {
+			pool, database, m := open(t)
+			if viaScript {
+				makeLarge(t, pool)
+			}
+			mb := newMailbox(t, pool)
+			restored := insertMessage(t, pool, mb, 1, true)
+			seen := insertMessage(t, pool, mb, 2, false)
+			addState(t, pool, mb, seen, FlagSeen)
+			_, err := pool.Exec(ctx, `UPDATE messages SET expunged_at = NULL, expunged_modseq = NULL WHERE id = $1`, restored)
+			require.NoError(t, err)
+			before, err := database.GetMailboxSummary(ctx, mb.id)
+			require.NoError(t, err)
+			require.Equal(t, 1, before.UnseenCount, "the messages trigger counted the restored message as unseen")
+
+			if viaScript {
+				loadScript(t, pool)
+				_, err = pool.Exec(ctx, `CALL sora_backfill_message_state(500000, 0)`)
+				require.NoError(t, err)
+			}
+			upgrade(t, m)
+			require.True(t, hasState(t, pool, restored))
+			// RFC 9051 §6.3.11: UNSEEN is "the number of messages that do not have the \Seen flag set".
+			summary, err := database.GetMailboxSummary(ctx, mb.id)
+			require.NoError(t, err)
+			assert.Equal(t, 2, summary.NumMessages)
+			assert.Equal(t, 1, summary.UnseenCount)
+			assert.Equal(t, before.HighestModSeq, summary.HighestModSeq)
+		})
+	}
+
 	t.Run("large database without the backfill is refused", func(t *testing.T) {
 		pool, _, m := open(t)
 		makeLarge(t, pool)

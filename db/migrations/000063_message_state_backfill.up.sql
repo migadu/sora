@@ -13,9 +13,18 @@
 -- one for a source that has none, so repairing the existing rows once is enough.
 --
 -- The new row holds no flags and no keywords, which is what every reader already showed,
--- so no client sees a change: updated_modseq stays NULL (nothing for CONDSTORE to report)
--- and the message_state INSERT trigger adds the rows to their mailbox's unseen_count.
+-- so no client sees a change: updated_modseq stays NULL (nothing for CONDSTORE to report).
 -- Expunged messages are left alone: restore writes the row of the message it brings back.
+--
+-- UNSEEN. Whether such a message is already counted in its mailbox's unseen_count depends
+-- on how it lost its row, so the message_state INSERT trigger's +1 would count some twice:
+-- the messages trigger reads a missing row as no flags, so a restore by an older build
+-- counted the message as an unseen arrival, and 000022 without its copy left unseen_count
+-- counting the flags it dropped. The unseen_count of each mailbox that gets a row is
+-- counted again instead, as RecomputeMailboxUnseen does. Like it, this first locks the
+-- mailboxes rows FOR UPDATE (lockMailboxStats, db/mailbox_stats.go), in ascending id order
+-- as lockMailboxStatsPair does: the count cannot race a flag change or an expunge, and the
+-- locks are taken in the order every other path takes them.
 --
 -- COST. Finding the messages without a row reads the id of every message, so this
 -- migration checks at most 1,000,000 ids by itself: it runs under the migration leader
@@ -24,12 +33,15 @@
 -- connection (not through a transaction pooler). It checks the ids in batches, each in a
 -- transaction of its own, and records how far it got in message_state_backfill; this
 -- migration then checks only the ids above that, and drops the table. It can run while
--- the old release serves mail. Without it, a database that large is refused.
+-- the old release serves mail. Without it, a database that large is refused. Counting a
+-- mailbox's unseen messages again reads its unseen rows, once per mailbox that gets a row.
 
 DO $$
 DECLARE
     checked bigint := 0;
     top bigint;
+    ids bigint[];
+    boxes bigint[];
 BEGIN
     IF to_regclass('message_state_backfill') IS NOT NULL THEN
         SELECT COALESCE(max(checked_through), 0) INTO checked FROM message_state_backfill;
@@ -40,20 +52,39 @@ BEGIN
             checked + 1, top;
     END IF;
 
-    -- The statement of sora_backfill_message_state_batch in the script. The ids come from
+    -- The statements of sora_backfill_message_state_batch in the script. The ids come from
     -- the primary keys (and message_state); of messages, only the rows of the ids without
     -- a state row are read.
-    INSERT INTO message_state (message_id, mailbox_id)
-    SELECT m.id, m.mailbox_id
-    FROM messages m
-    WHERE m.id = ANY (ARRAY(
-            SELECT x.id FROM messages x
-            WHERE x.id > checked
-              AND NOT EXISTS (SELECT 1 FROM message_state ms
-                              WHERE ms.message_id = x.id AND ms.message_id > checked)))
-      AND m.expunged_at IS NULL
-      AND m.mailbox_id IS NOT NULL
-    ON CONFLICT (message_id) DO NOTHING;
+    ids := ARRAY(
+        SELECT x.id FROM messages x
+        WHERE x.id > checked
+          AND NOT EXISTS (SELECT 1 FROM message_state ms
+                          WHERE ms.message_id = x.id AND ms.message_id > checked));
+    boxes := ARRAY(
+        SELECT DISTINCT m.mailbox_id FROM messages m
+        WHERE m.id = ANY (ids) AND m.expunged_at IS NULL AND m.mailbox_id IS NOT NULL
+        ORDER BY 1);
+    IF cardinality(boxes) > 0 THEN
+        PERFORM 1 FROM mailboxes WHERE id = ANY (boxes) ORDER BY id FOR UPDATE;
+        INSERT INTO message_state (message_id, mailbox_id)
+        SELECT m.id, m.mailbox_id
+        FROM messages m
+        WHERE m.id = ANY (ids)
+          AND m.expunged_at IS NULL
+          AND m.mailbox_id = ANY (boxes)
+        ON CONFLICT (message_id) DO NOTHING;
+        WITH unseen AS (
+            SELECT ms.mailbox_id, count(*) AS unseen
+            FROM message_state ms
+            JOIN messages m ON m.id = ms.message_id AND m.mailbox_id = ms.mailbox_id
+            WHERE ms.mailbox_id = ANY (boxes) AND (ms.flags & 1) = 0 AND m.expunged_at IS NULL
+            GROUP BY ms.mailbox_id
+        )
+        UPDATE mailbox_stats s
+        SET unseen_count = COALESCE(u.unseen, 0), updated_at = now()
+        FROM unnest(boxes) AS b(id) LEFT JOIN unseen u ON u.mailbox_id = b.id
+        WHERE s.mailbox_id = b.id;
+    END IF;
 
     DROP TABLE IF EXISTS message_state_backfill;
 END $$;
