@@ -50,8 +50,13 @@ func applyImplicitSeenUpdates(messages []db.Message, batchResults []db.BatchFlag
 // writing FETCH data items. When FETCH implicitly added \Seen to this message:
 //   - FLAGS is included so the client learns of the flag change even when Poll
 //     does not emit a separate FlagChange response (RFC 3501 §6.4.5 / RFC 9051 §6.4.5);
-//   - MODSEQ is included when the session is CONDSTORE-aware (RFC 7162 §3.1.3 / §3.2);
-//   - UID is included when QRESYNC is enabled on the session (RFC 7162 §3.2.4).
+//   - MODSEQ and UID are included when the session is CONDSTORE-aware. RFC 7162
+//     §3.2.4: "Once a CONDSTORE enabling command is issued by the client, the
+//     server MUST automatically include both UID and mod-sequence data in all
+//     subsequent untagged FETCH responses", naming "a FETCH/UID FETCH that
+//     implicitly set the \Seen flag". The trigger is any CONDSTORE enabling
+//     command (ENABLE QRESYNC is one), and §3.1 asks the same of a session
+//     that offers CONDSTORE without QRESYNC.
 func (s *IMAPSession) fetchOptionsForImplicitSeen(options *imap.FetchOptions, seenChanged bool) *imap.FetchOptions {
 	if !seenChanged {
 		return options
@@ -60,8 +65,6 @@ func (s *IMAPSession) fetchOptionsForImplicitSeen(options *imap.FetchOptions, se
 	opts.Flags = true
 	if s.condStoreEnabled() {
 		opts.ModSeq = true
-	}
-	if s.conn != nil && s.conn.EnabledCaps().Has(imap.CapQResync) && s.GetCapabilities().Has(imap.CapQResync) {
 		opts.UID = true
 	}
 	return &opts
