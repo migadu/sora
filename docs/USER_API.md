@@ -723,7 +723,7 @@ return messages in this shape:
 | `subject` | The decoded `Subject`. |
 | `from` | The first `From` address, address only (no display name). |
 | `to`, `cc`, `bcc` | Addresses only. `cc` is filled in lists, search results and `GET /user/messages/{id}`; `bcc` only in lists. `to` is always present (`[]` when the message has none); empty `cc` and `bcc` are left out. |
-| `date` | The message's `Date` header, as stored. |
+| `date` | The message's `Date` header; its `internal_date` when it has none that parses. |
 | `internal_date` | When the message arrived in Sora. |
 | `size` | Bytes. |
 | `flags` | System flags. `[]` when there are none. |

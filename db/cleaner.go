@@ -1326,7 +1326,7 @@ func (d *Database) GetMessagesForMailboxAndChildren(ctx context.Context, account
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart,
 			m.uploaded, ms.flags, ms.custom_flags, m.internal_date, m.size,
 			m.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
@@ -1378,7 +1378,7 @@ func (d *Database) GetMessagesForAccount(ctx context.Context, accountID int64) (
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart,
 			m.uploaded, ms.flags, ms.custom_flags, m.internal_date, m.size,
 			m.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.account_id = $1

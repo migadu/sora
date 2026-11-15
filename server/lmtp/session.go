@@ -685,12 +685,9 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		references = nil
 	}
 
-	if sentDate.IsZero() {
-		sentDate = time.Now()
-		s.DebugLog("no sent date found, using current time", "sent_date", sentDate)
-	} else {
-		s.DebugLog("message sent date", "sent_date", sentDate)
-	}
+	// A zero sentDate (no Date: header that parses) is stored as the internal date and
+	// reported as absent (db.InsertMessageOptions.SentDate).
+	s.DebugLog("message sent date", "sent_date", sentDate)
 
 	var plaintextBody *string
 	plaintextBodyResult, extractErr := helpers.ExtractPlaintextBody(messageContent)
@@ -883,9 +880,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				}
 				if len(references) == 0 {
 					references = nil
-				}
-				if sentDate.IsZero() {
-					sentDate = time.Now()
 				}
 				s.DebugLog("message headers updated after edits", "content_hash", contentHash)
 			}

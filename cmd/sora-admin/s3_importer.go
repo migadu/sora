@@ -512,8 +512,11 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 		references = nil
 	}
 
-	if sentDate.IsZero() {
-		sentDate = time.Now()
+	// The Date: header is the INTERNALDATE too; a message without one that parses
+	// arrives now and keeps a zero sentDate (db.InsertMessageOptions.SentDate).
+	internalDate := sentDate
+	if internalDate.IsZero() {
+		internalDate = time.Now()
 	}
 
 	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(content))
@@ -556,7 +559,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 			MailboxName:   mailbox.Name,
 			ContentHash:   contentHash,
 			MessageID:     messageID,
-			InternalDate:  sentDate,
+			InternalDate:  internalDate,
 			Size:          size,
 			Subject:       subject,
 			PlaintextBody: actualPlaintextBody,

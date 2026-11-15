@@ -1879,17 +1879,6 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		references = nil
 	}
 
-	// If the Date header is missing or invalid, fall back to the file's modification time.
-	// This is a more accurate timestamp than time.Now().
-	if sentDate.IsZero() {
-		if info, statErr := os.Stat(path); statErr == nil {
-			sentDate = info.ModTime()
-		} else {
-			// As a last resort, use the current time.
-			sentDate = time.Now()
-		}
-	}
-
 	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(content))
 
 	// Validate body structure and use fallback if invalid (e.g., multipart with no children)
@@ -2873,7 +2862,8 @@ func (i *Importer) keywordsForMessagePath(path string) map[int]string {
 // filename (what Dovecot and the exporter here write) and, failing that, as the file's
 // modification time. The Date: header (sentDate) is the sender's clock, not arrival;
 // using it as INTERNALDATE altered the arrival time of every imported message and
-// re-stamped mtimes on export.
+// re-stamped mtimes on export. sentDate is zero for a message without a Date: header
+// that parses; it is stored with its INTERNALDATE as the sent date.
 func maildirInternalDate(filename, path string, sentDate time.Time) time.Time {
 	base := filepath.Base(filename)
 	if dot := strings.IndexByte(base, '.'); dot > 0 {
@@ -2883,6 +2873,9 @@ func maildirInternalDate(filename, path string, sentDate time.Time) time.Time {
 	}
 	if info, err := os.Stat(path); err == nil && !info.ModTime().IsZero() {
 		return info.ModTime()
+	}
+	if sentDate.IsZero() {
+		return time.Now()
 	}
 	return sentDate
 }
