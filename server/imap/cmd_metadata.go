@@ -128,11 +128,20 @@ func (s *IMAPSession) SetMetadata(ctx context.Context, mailbox string, entries m
 	// (RFC 5464 §3.2) is honoured for storage AND for the /private-vs-/shared
 	// scope classification below — otherwise a /SHARED/... spelling would be
 	// misclassified as private and skip the shared-scope 'w' ACL check.
+	//
+	// go-imap passes the entries as a map keyed by the names as sent, so two
+	// spellings of one entry (/private/A and /private/a) arrive as two keys in
+	// no particular order. Keeping either would make the stored value depend
+	// on map iteration order, so the command is refused instead. (The same
+	// spelling twice never gets here: go-imap keeps the later value.)
 	canonEntries := make(map[string]*[]byte, len(entries))
 	for entryName, entryValue := range entries {
 		canonName := canonicalMetadataEntry(entryName)
 		if err := validateMetadataEntry(canonName); err != nil {
 			return err
+		}
+		if _, dup := canonEntries[canonName]; dup {
+			return invalidMetadataEntry(fmt.Sprintf("metadata entry %q is named more than once (entry names are case-insensitive)", canonName))
 		}
 		canonEntries[canonName] = entryValue
 	}
