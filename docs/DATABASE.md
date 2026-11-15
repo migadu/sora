@@ -623,6 +623,7 @@ pooler), off-peak. The migrations on `main` that need it on a large database:
 | 000050 | `messages_fts_v2`, the per-account search table, and `btree_gin`. | See [Migration 000050](#migration-000050) below. |
 | 000051 | Replaces seven indexes on `messages` with `idx_messages_mailbox_active`. | Create the new index with `CREATE INDEX CONCURRENTLY`, then drop the seven old ones with `DROP INDEX CONCURRENTLY`, one at a time. |
 | 000052 | `idx_messages_mailbox_headers`, the covering index for header search. | Fix over-long rows with [scripts/fix_oversized_header_columns.sql](../scripts/fix_oversized_header_columns.sql), then build the index with `CREATE INDEX CONCURRENTLY`, using exactly the definition in the file. |
+| 000062 | `idx_messages_mailbox_sent_date_unknown`, the messages without a `Date:` header, which SENTBEFORE, SENTON and SENTSINCE leave out. | Build the index with `CREATE INDEX CONCURRENTLY`, using exactly the definition in the file, and check that it is valid. On more than 25,000 messages the migration refuses to build it itself. |
 
 Older migrations (for example 000008, 000010, 000012, 000014, 000038 and 000039) carry the same
 kind of note. Copy index definitions exactly from the migration file: the migration only checks
