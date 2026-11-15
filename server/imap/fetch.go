@@ -171,6 +171,10 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 	// The client's numbering holds still until the last response (seqViewMu).
 	s.seqViewMu.RLock()
 	defer s.seqViewMu.RUnlock()
+	endFetch := s.beginFetch()
+	defer endFetch()
+	// A Seen update may have pinned reads to the primary while beginFetch waited.
+	ctx = s.pinnedContext(ctx)
 
 	// First, safely read necessary session state and decode the sequence numbers all within a single read lock
 	var selectedMailboxID int64
@@ -364,7 +368,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			if s.IMAPUser != nil {
 				metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
 			}
-			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID, markSeen, preview); err != nil {
+			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID, markSeen, view.tracker, preview); err != nil {
 				writeErr = err
 				return err
 			}
@@ -394,7 +398,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 // writeMessageFetchData handles writing all FETCH data items for a single message.
 // markSeen is whether the FETCH implicitly sets \Seen; preview is the command's
 // PREVIEW state, nil unless PREVIEW was requested.
-func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, markSeen bool, preview *previewRun) (retErr error) {
+func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, markSeen bool, tracker *imapserver.SessionTracker, preview *previewRun) (retErr error) {
 	s.DebugLog("fetching message", "uid", msg.UID, "seq", msg.Seq)
 
 	// msg.Seq is the client's sequence number (Fetch translated it, see seqView).
@@ -444,8 +448,12 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 	// rather than for the whole stream chunk up front: a FETCH that fails at a
 	// message leaves that message, and the ones after it whose bodies it never
 	// sent, as they were.
+	var seenAnswer *implicitSeenAnswer
 	if markSeen {
-		options = s.setImplicitSeen(ctx, msg, options, selectedMailboxID)
+		options, seenAnswer = s.setImplicitSeen(ctx, msg, options, selectedMailboxID, tracker)
+		if seenAnswer != nil {
+			defer seenAnswer.release()
+		}
 	}
 
 	m := w.CreateMessage(seqNum)
@@ -462,6 +470,11 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 			if retErr == nil {
 				retErr = closeErr
 			}
+		}
+		// Suppress only the update this successfully completed response carried.
+		// A failed or partial response leaves it for Poll to announce.
+		if retErr == nil && seenAnswer != nil {
+			seenAnswer.answered(msg.UID, uint64(*msg.UpdatedModSeq))
 		}
 	}()
 

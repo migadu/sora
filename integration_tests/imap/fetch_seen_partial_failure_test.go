@@ -84,18 +84,23 @@ func requireFetchFailsAtSecond(t *testing.T, c *rawIMAP, command, wantStatus str
 	if !strings.Contains(tagged, wantStatus) {
 		t.Fatalf("%s: want%s, got %s", command, wantStatus, tagged)
 	}
-	answered := map[int]bool{}
+	answered := map[int]int{}
 	for _, resp := range splitUntaggedResponses(untagged) {
 		if m := fetchSeqRe.FindStringSubmatch(resp); m != nil {
 			seq, _ := strconv.Atoi(m[1])
-			answered[seq] = true
+			answered[seq]++
 		}
 	}
-	if !answered[1] || answered[2] || answered[3] {
+	if answered[1] != 1 || answered[2] != 0 || answered[3] != 0 {
 		t.Errorf("%s: want a FETCH response for message 1 only, got:\n%s", command, strings.Join(untagged, "\r\n"))
 	}
 
-	c.do("NOOP")
+	noopLines, _ := c.do("NOOP")
+	for _, resp := range splitUntaggedResponses(noopLines) {
+		if fetchSeqRe.MatchString(resp) {
+			t.Errorf("after %s: failed FETCH left an unexpected flag echo: %s", command, resp)
+		}
+	}
 	untagged, _ = c.do("FETCH 1:3 (FLAGS)")
 	seen := map[int]bool{}
 	for _, resp := range splitUntaggedResponses(untagged) {
