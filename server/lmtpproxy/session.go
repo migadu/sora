@@ -60,7 +60,9 @@ type Session struct {
 
 	// Connection tracker bookkeeping:
 	// LMTP sessions can contain multiple RCPT TO commands (multiple recipients).
-	// We register the session as a "connection" against each recipient account we handle.
+	// We register the session as a "connection" against each recipient account the
+	// backend accepts a recipient for (forwardRCPT), on a new or an already held
+	// backend connection; a refused recipient is not registered.
 	// IMPORTANT: s.accountID is overwritten per RCPT; if we only unregister the last one,
 	// earlier recipients would leak connection counts permanently. Each account is
 	// registered at most once per session (a backend reconnect does not register it
@@ -443,10 +445,6 @@ func (s *Session) handleConnection() {
 					s.sendResponse("451 4.4.1 Backend connection failed")
 					// Do not return, continue loop to handle RSET or QUIT
 					continue
-				}
-				// Register connection
-				if err := s.registerConnection(); err != nil {
-					s.InfoLog("rejected connection registration", "error", err)
 				}
 			} else {
 				// Verify if the current backend connection is compatible with this recipient
@@ -1606,6 +1604,13 @@ func (s *Session) forwardRCPT(command string) {
 	s.clientWriter.WriteString(response)
 	s.clientWriter.Flush()
 
+	// The session now delivers to this recipient's account, on a new backend
+	// connection or on the one it already held: count it for that account
+	// (once per session, however many of its recipients follow).
+	if err := s.registerConnection(); err != nil {
+		s.InfoLog("rejected connection registration", "error", err)
+	}
+
 	// Log routing decision at INFO level with sender, recipient, and routing method
 	s.InfoLog("routing to backend", "backend", s.serverAddr, "method", s.routingMethod, "from", s.sender, "to", s.to)
 }
@@ -1694,9 +1699,10 @@ func (s *Session) registerConnection() error {
 
 	// Use cached client address (real IP) to match UnregisterConnection in close()
 	if s.server.connTracker != nil {
-		// One LMTP session counts once per account, however many backend connections
-		// it opens: after a lost backend (loseBackend) the next RCPT TO reconnects and
-		// lands here again, and close() unregisters each account once.
+		// One LMTP session counts once per account, however many of its recipients
+		// the backend accepts and however many backend connections it opens (after a
+		// lost backend the next RCPT TO reconnects and lands here again), and close()
+		// unregisters each account once.
 		if _, ok := s.registeredAccountIDs[s.accountID]; ok {
 			return nil
 		}

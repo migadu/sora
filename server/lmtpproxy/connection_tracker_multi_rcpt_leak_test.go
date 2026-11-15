@@ -227,3 +227,119 @@ func TestConnectionTracker_BackendRestartOnTheWire(t *testing.T) {
 		t.Fatalf("leak: account count after QUIT = %d, want 0", got)
 	}
 }
+
+// TestConnectionTracker_RegistersEachAcceptedRecipient drives the command loop of
+// #1068: one LMTP connection, every recipient routed to the same backend. The
+// first recipient opens the backend connection and the backend refuses it; the
+// next ones are forwarded to the backend the session already holds and accepted.
+// Every account the backend accepted a recipient for must count once for the
+// session (a second recipient of the same account does not count again), the
+// refused one not at all, and QUIT must release them all.
+func TestConnectionTracker_RegistersEachAcceptedRecipient(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	var connections atomic.Int32
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			connections.Add(1)
+			go func() {
+				defer conn.Close()
+				conn.SetDeadline(time.Now().Add(10 * time.Second))
+				io.WriteString(conn, "220 backend ready\r\n")
+				reader := bufio.NewReader(conn)
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if strings.HasPrefix(strings.ToUpper(line), "RCPT TO:<REFUSED@") {
+						io.WriteString(conn, "550 5.1.1 No such user\r\n")
+						continue
+					}
+					io.WriteString(conn, "250 OK\r\n")
+				}
+			}()
+		}
+	}()
+	lookup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"address": r.URL.Query().Get("email")})
+	}))
+	t.Cleanup(lookup.Close)
+	srv, err := New(context.Background(), nil, "test-host", ServerOptions{
+		Name: "held-backend", RemoteAddrs: []string{ln.Addr().String()}, RemotePort: 24, ConnectTimeout: time.Second,
+		RemoteLookup: &config.RemoteLookupConfig{Enabled: true, URL: lookup.URL + "?email=$email", Timeout: "1s"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Stop() })
+	tracker := server.NewConnectionTracker("LMTP", "", "", "test-instance", nil, 0, 0, 1000, false)
+	t.Cleanup(tracker.Stop)
+	srv.SetConnectionTracker(tracker)
+	refused := proxy.DeriveAccountIDFromEmail("refused@example.com")
+	first := proxy.DeriveAccountIDFromEmail("first@example.com")
+	second := proxy.DeriveAccountIDFromEmail("second@example.com")
+
+	front, accepted := net.Pipe()
+	t.Cleanup(func() { front.Close() })
+	sess := newSession(srv, accepted, nil)
+	done := make(chan struct{})
+	go func() { defer close(done); sess.handleConnection() }()
+	front.SetDeadline(time.Now().Add(5 * time.Second))
+	reader := bufio.NewReader(front)
+	read := func() string {
+		t.Helper()
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(line) < 4 || line[3] != '-' {
+				return strings.TrimSpace(line)
+			}
+		}
+	}
+	require := func(line, prefix string) {
+		t.Helper()
+		if _, err := fmt.Fprintf(front, "%s\r\n", line); err != nil {
+			t.Fatal(err)
+		}
+		if resp := read(); !strings.HasPrefix(resp, prefix) {
+			t.Fatalf("%s: %s, want %s", line, resp, prefix)
+		}
+	}
+	counts := func() (int, int, int) {
+		return tracker.GetLocalConnectionCount(refused), tracker.GetLocalConnectionCount(first), tracker.GetLocalConnectionCount(second)
+	}
+	if greeting := read(); !strings.HasPrefix(greeting, "220") {
+		t.Fatal(greeting)
+	}
+	require("LHLO client.example.com", "250")
+	require("MAIL FROM:<sender@example.com>", "250")
+	require("RCPT TO:<refused@example.com>", "451") // opens the backend, which refuses it
+	require("RCPT TO:<first@example.com>", "250")   // forwarded to the held backend
+	require("RCPT TO:<second@example.com>", "250")
+	require("RCPT TO:<first+tag@example.com>", "250") // the same account again
+	if n := connections.Load(); n != 1 {
+		t.Fatalf("backend connections = %d, want 1 (every recipient shares the held backend)", n)
+	}
+	if r, f, s := counts(); r != 0 || f != 1 || s != 1 {
+		t.Errorf("counts during the session: refused=%d first=%d second=%d, want 0 1 1", r, f, s)
+	}
+	require("QUIT", "221")
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session did not finish after QUIT")
+	}
+	if r, f, s := counts(); r != 0 || f != 0 || s != 0 {
+		t.Fatalf("leak after QUIT: refused=%d first=%d second=%d, want 0 0 0", r, f, s)
+	}
+}
