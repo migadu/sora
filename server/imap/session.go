@@ -654,9 +654,11 @@ func (s *IMAPSession) triggerCacheWarmup() {
 	}
 }
 
-// registerConnection registers the connection in the connection tracker
-func (s *IMAPSession) registerConnection(email string) error {
-	if s.server.connTracker != nil && s.IMAPUser != nil {
+// registerConnection takes a slot for the logging-in account in the connection
+// tracker. It runs before s.IMAPUser / s.Session.User are set so a rejected
+// login leaves the session unauthenticated.
+func (s *IMAPSession) registerConnection(accountID int64, email string) error {
+	if s.server.connTracker != nil {
 		// Use configured database query timeout for connection tracking (database INSERT)
 		queryTimeout := s.server.rdb.GetQueryTimeout()
 		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
@@ -667,8 +669,8 @@ func (s *IMAPSession) registerConnection(email string) error {
 		// the PROXY header or a trusted proxy's ID forwarding.
 		clientAddr := s.RemoteIP
 
-		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "IMAP", clientAddr); err != nil {
-			s.InfoLog("connection registration rejected", "error", err)
+		if err := s.server.connTracker.RegisterConnection(ctx, accountID, email, "IMAP", clientAddr); err != nil {
+			s.InfoLog("connection registration rejected", "address", email, "error", err)
 			return err
 		}
 		s.trackedClientAddr = clientAddr

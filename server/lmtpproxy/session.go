@@ -52,6 +52,7 @@ type Session struct {
 	sessionID             string // Proxy session ID for end-to-end tracing (also forwarded to the backend)
 	clientAddr            string // Cached client address to avoid race with connection close
 	clientHelo            string // Client's announced LHLO name, forwarded to the backend via XCLIENT
+	lhloAccepted          bool   // An LHLO was accepted since the greeting or the last STARTTLS; MAIL needs one
 	releaseConn           func() // Connection limiter cleanup function
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
 	mu                    sync.Mutex
@@ -84,6 +85,12 @@ type Session struct {
 	// RSET or QUIT (see loseBackend).
 	acceptedRcpts int
 	txPoisoned    bool
+	// backendHasMail records that the held backend accepted the current transaction's
+	// MAIL FROM. The proxy answers MAIL itself; a backend is sent it with the first
+	// recipient that stays on it (connectToBackend, or the RCPT handler for a backend
+	// held from an earlier transaction). Cleared with the rest of the transaction state
+	// and when the backend is lost.
+	backendHasMail bool
 
 	// smtputf8 marks the current transaction as internationalized (RFC 6531): the MTA
 	// gave the SMTPUTF8 MAIL parameter, or sent a non-ASCII address without it. Cleared
@@ -248,10 +255,14 @@ func (s *Session) handleConnection() {
 				s.sendResponse("501 5.5.4 Syntax error in parameters")
 				continue
 			}
+			// An accepted LHLO resets the session as RSET would (RFC 5321 section 4.1.4;
+			// LHLO is LMTP's EHLO, RFC 2033 section 4.1).
+			s.restartSession()
 			// Remember the client's announced name so we can forward it to the backend via
 			// XCLIENT (HELO=...); without it the backend's Received: trace falls back to the
 			// proxy's own LHLO name. args[0] is a single tokenized field (no spaces/CRLF).
 			s.clientHelo = args[0]
+			s.lhloAccepted = true
 			var lhlo strings.Builder
 			fmt.Fprintf(&lhlo, "250-%s\r\n", s.server.hostname)
 
@@ -277,14 +288,28 @@ func (s *Session) handleConnection() {
 			}
 
 		case "MAIL":
+			// RFC 5321 section 4.1.1.1: "a client MUST issue HELO or EHLO before starting
+			// a mail transaction" (LHLO in LMTP). 503, a MAIL reply of section 4.3.2, with
+			// the backend's text.
+			if !s.lhloAccepted {
+				s.sendResponse("503 5.5.1 Please introduce yourself first.")
+				continue
+			}
+			// RFC 5321 section 4.1.1.2: MAIL is only permitted when no mail transaction
+			// is in progress; a nested MAIL gets 503 5.5.1 (matching go-smtp's reply)
+			// and leaves the open transaction and any held backend untouched.
+			if s.mailFromReceived {
+				s.sendResponse("503 5.5.1 Sender already specified")
+				continue
+			}
 			fromParam, found := findParameter(args, "FROM:")
 			if !found {
 				s.sendResponse("501 5.5.4 Syntax error in MAIL command (missing FROM)")
 				continue
 			}
 			// The limit advertised in LHLO is the proxy's own, checked here before the MTA
-			// sends the body (RFC 1870 section 6.1): no backend may be connected yet, and
-			// one that is may not take SIZE. A refused MAIL starts no transaction and
+			// sends the body (RFC 1870 section 6.1): no recipient is routed yet, so no
+			// backend is the transaction's. A refused MAIL starts no transaction and
 			// leaves the current one alone.
 			declaredSize, reply := mailSizeParameter(args, s.settings.maxMessageSize)
 			if reply != "" {
@@ -300,30 +325,11 @@ func (s *Session) handleConnection() {
 			s.mailFromReceived = true
 			s.smtputf8 = hasSMTPUTF8Param(args) || !server.IsASCII(sender)
 			s.declaredSize = declaredSize
-			// A held backend that has gone into maintenance is dropped before it is asked
-			// (past refuse_after it refuses every MAIL, and the MTA keeping this connection
-			// would get that for every message): the transaction has no recipient yet, and
-			// the first RCPT routes afresh. The RCPT check below covers maintenance that
-			// begins between the two.
-			if s.backendConn != nil && s.backendInMaintenance() {
-				s.InfoLog("dropping backend connection: backend in maintenance", "backend", s.serverAddr)
-				s.loseBackend()
-			}
-			// A connected backend must learn the new sender too (RFC 5321 §4.1.1.2: MAIL
-			// after a completed or reset transaction), or it would deliver with the
-			// previous transaction's Return-Path. Its answer is the answer; a backend
-			// lost here is harmless — the next RCPT reconnects and re-sends MAIL FROM.
-			if s.backendConn != nil {
-				if reply, ok := s.forwardSimpleCommand(s.backendMailFrom()); ok {
-					if !strings.HasPrefix(reply, "2") {
-						s.mailFromReceived = false
-					}
-					if _, err := s.writeClientReply(reply, false); err != nil {
-						return
-					}
-					continue
-				}
-			}
+			// Answered here also when a backend is held from an earlier transaction: that
+			// backend need not be where any recipient of this one routes, so its answer
+			// must not decide the message (its 552 would have the MTA bounce it for every
+			// recipient, RFC 1870 section 6.2 (2)). It is sent the MAIL with the first
+			// recipient that stays on it (RCPT below), as a new backend is.
 			s.sendResponse("250 2.1.0 Ok")
 
 		case "RCPT":
@@ -345,9 +351,10 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			s.DebugLog("Extracted recipient address", "to", to)
-			// No MAIL in effect (none yet, RSET, or one the backend refused while a
-			// pipelining MTA sent on): a bad sequence, answered here, as a backend asked
-			// would answer 5xx, which reads as a routing inconsistency below.
+			// No MAIL in effect (none yet, RSET, the end of a transaction, or a MAIL the
+			// proxy refused while a pipelining MTA sent on): a bad sequence, answered here,
+			// as a backend asked would answer 5xx, which reads as a routing inconsistency
+			// below.
 			if !s.mailFromReceived {
 				s.sendResponse("503 5.5.1 Error: need MAIL command")
 				continue
@@ -442,9 +449,10 @@ func (s *Session) handleConnection() {
 
 			// A session keeps its backend across transactions (an MTA may reuse its LMTP
 			// connection), so one held to a backend that has since gone into maintenance
-			// is dropped here, at the first recipient of a transaction: the backend holds
-			// no accepted recipient yet, so nothing is poisoned, and the connect below
-			// routes afresh and re-sends MAIL FROM. Never later in a transaction.
+			// is dropped here, at the first recipient of a transaction and before it is
+			// sent the MAIL (past refuse_after it refuses every MAIL): the backend holds no
+			// accepted recipient yet, so nothing is poisoned, and the connect below routes
+			// afresh and sends MAIL FROM. Never later in a transaction.
 			if s.backendConn != nil && s.acceptedRcpts == 0 && s.backendInMaintenance() {
 				s.InfoLog("dropping backend connection: backend in maintenance", "backend", s.serverAddr)
 				s.loseBackend()
@@ -454,7 +462,7 @@ func (s *Session) handleConnection() {
 			// transaction has no accepted recipient, the recipient is routed as on a
 			// fresh connection: a held backend it does not route to is dropped (nothing
 			// is poisoned) and the connect below reaches the recipient's backend and
-			// re-sends MAIL FROM. Otherwise an MTA that keeps this connection would get
+			// sends MAIL FROM there. Otherwise an MTA that keeps this connection would get
 			// 451 for every transaction whose first recipient lives elsewhere. Once a
 			// recipient is accepted the held backend is the transaction's, and one that
 			// needs another backend gets 451, to be sent in a new transaction.
@@ -530,6 +538,23 @@ func (s *Session) handleConnection() {
 				}
 			}
 
+			// A held backend this recipient stays on is sent the transaction's MAIL now,
+			// as a new backend is on connecting: the MAIL initiates the transaction there
+			// (RFC 5321 §4.1.1.2). One that refuses it, or is lost, holds no recipient of
+			// this transaction: it is dropped and the connect below asks afresh, so the
+			// recipient is answered as on a new connection (552 5.3.4 for a refused size,
+			// RFC 1870 section 6.4).
+			if s.backendConn != nil && !s.backendHasMail {
+				if reply, ok := s.forwardSimpleCommand(s.backendMailFrom()); !ok {
+					s.DebugLog("held backend lost on MAIL FROM; reconnecting", "backend", s.serverAddr)
+				} else if !strings.HasPrefix(reply, "250") {
+					s.InfoLog("dropping backend connection: backend refused MAIL FROM", "backend", s.serverAddr, "response", strings.TrimSpace(reply))
+					s.loseBackend()
+				} else {
+					s.backendHasMail = true
+				}
+			}
+
 			// Connect to backend if not already connected
 			if s.backendConn == nil {
 				if err := s.connectToBackend(); err != nil {
@@ -569,8 +594,11 @@ func (s *Session) handleConnection() {
 				s.sendResponse("451 4.4.2 Backend connection lost, please retry the transaction")
 				continue
 			}
-			if s.backendConn == nil {
-				s.sendResponse("503 5.5.1 Bad sequence of commands (not connected to backend)")
+			// No recipient accepted: 503 (RFC 2033 section 4.2), answered here whether or
+			// not a backend is held. A held one lacks this transaction's MAIL until the
+			// first recipient is routed, or holds no transaction after RSET or DATA.
+			if s.acceptedRcpts == 0 {
+				s.sendResponse("503 5.5.1 Bad sequence of commands (no valid recipients)")
 				continue
 			}
 
@@ -660,8 +688,12 @@ func (s *Session) handleConnection() {
 
 			s.DebugLog("STARTTLS negotiation successful")
 
-			// Client must send LHLO again after STARTTLS (RFC 3207)
-			// Continue to next iteration to wait for a new LHLO
+			// RFC 3207 section 4.2: the session is back in its initial state, and the
+			// server "MUST discard any knowledge obtained from the client, such as the
+			// argument to the EHLO command". MAIL needs a new LHLO.
+			s.restartSession()
+			s.clientHelo = ""
+			s.lhloAccepted = false
 
 		case "RSET":
 			s.resetTransaction()
@@ -1554,6 +1586,7 @@ func (s *Session) connectToBackend() (err error) {
 		}
 
 		s.DebugLog("Backend MAIL FROM accepted")
+		s.backendHasMail = true
 	}
 
 	return nil
@@ -2012,8 +2045,22 @@ func (s *Session) resetTransaction() {
 	s.mailFromReceived = false
 	s.acceptedRcpts = 0
 	s.txPoisoned = false
+	s.backendHasMail = false
 	s.smtputf8 = false
 	s.declaredSize = ""
+}
+
+// restartSession ends the current transaction and drops a held backend, for an
+// accepted LHLO and a completed STARTTLS, which each start the session over. The
+// held backend's XCLIENT carried the client's earlier LHLO name: the next RCPT
+// connects afresh, and XCLIENT gives the backend the name in effect then. The
+// transaction is reset first, so the drop poisons nothing (see loseBackend).
+func (s *Session) restartSession() {
+	s.resetTransaction()
+	if s.backendConn != nil {
+		s.InfoLog("dropping backend connection: client started the session over", "backend", s.serverAddr)
+		s.loseBackend()
+	}
 }
 
 // loseBackend drops the backend connection. If the backend had already accepted a
@@ -2024,12 +2071,14 @@ func (s *Session) resetTransaction() {
 // recipients and its single end-of-data reply would be attributed to the wrong one.
 func (s *Session) loseBackend() {
 	s.mu.Lock()
-	if s.backendConn != nil {
-		s.backendConn.Close()
-		s.backendConn = nil
-	}
+	backend := s.backendConn
+	s.backendConn = nil
 	s.backendRoute = nil
 	s.mu.Unlock()
+	s.backendHasMail = false
+	// This connection is being abandoned. Interrupt transport I/O before TLS
+	// cleanup, outside the mutex that cancellation and shutdown need too.
+	closeSessionTransport(backend)
 	if s.acceptedRcpts > 0 {
 		s.txPoisoned = true
 	}

@@ -140,7 +140,7 @@ func TestIMAP_StoreSilentReturnsModSeq(t *testing.T) {
 	c.do("SELECT INBOX")
 	c.do(`UID STORE 1 FLAGS (\Seen)`)
 	c.do("SELECT INBOX (CONDSTORE)")
-	for _, command := range []string{`UID STORE 1 (UNCHANGEDSINCE 18446744073709551615) +FLAGS.SILENT (\Seen)`, `UID STORE 1 (UNCHANGEDSINCE 18446744073709551615) +FLAGS.SILENT (\Seen)`, `UID STORE 1 +FLAGS.SILENT (\Seen)`} {
+	for _, command := range []string{`UID STORE 1 (UNCHANGEDSINCE 9223372036854775807) +FLAGS.SILENT (\Seen)`, `UID STORE 1 (UNCHANGEDSINCE 9223372036854775807) +FLAGS.SILENT (\Seen)`, `UID STORE 1 +FLAGS.SILENT (\Seen)`} {
 		lines, _ := c.do(command)
 		var fetches []string
 		for _, line := range lines {
