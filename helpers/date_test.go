@@ -181,6 +181,57 @@ func TestParseDateHeaderCFWS(t *testing.T) {
 	}
 }
 
+// TestParseDateHeaderLeapSecond is issue #1384: a time-of-day whose second is 60, a leap
+// second, is a date-time. RFC 5322 section 3.3: "the time-of-day MUST be in the range
+// 00:00:00 through 23:59:60 (the number of seconds allowing for a leap second ...)".
+// net/mail.ParseDate does not parse it, so the message was stored with an unknown sent
+// date. time.Time cannot hold second 60: it is read as second 59 of the same minute, as
+// Dovecot's message_date_parse does.
+func TestParseDateHeaderLeapSecond(t *testing.T) {
+	const h = 3600
+	leap := time.Date(2016, 12, 31, 23, 59, 59, 0, time.UTC) // 2016-12-31T23:59:60Z, as second 59
+	cases := []struct {
+		value  string
+		want   time.Time
+		offset int // seconds east of UTC
+	}{
+		{"Sat, 31 Dec 2016 23:59:60 +0000", leap, 0},
+		{"Sun, 1 Jan 2017 00:59:60 +0100", leap, h},
+		{"Sat, 31 Dec 2016 15:59:60 -0800", leap, -8 * h},
+		{"Sat, 31 Dec 2016 23:59:60 GMT", leap, 0},
+		{"Sat, 31 Dec 2016 15:59:60 PST", leap, -8 * h},
+		{"Sat, 31 Dec 2016 23:59:60 GMT+0000", leap, 0},
+		{"31 Dec 2016 23:59:60 +0000", leap, 0},
+		{"Sat, 31 Dec 16 23:59:60 +0000", leap, 0},
+		{"Sat, 31 Dec 116 23:59:60 UT", leap, 0},
+		{"Sat, 31 Dec 2016 23:59:60\r\n +0000", leap, 0},
+		// Comments and white space around the seconds (obs-second = [CFWS] 2DIGIT [CFWS]).
+		{"Sat, 31 Dec 2016 23 : 59 : 60 +0000", leap, 0},
+		{"Sat, 31 Dec 2016 23:59:(s)60 (leap second) +0000", leap, 0},
+		{"Tue, 30 Jun 2015 23:59:60 +0000", time.Date(2015, 6, 30, 23, 59, 59, 0, time.UTC), 0},
+	}
+	for _, tc := range cases {
+		got, err := ParseDateHeader(tc.value)
+		if !assert.NoError(t, err, "%q", tc.value) {
+			continue
+		}
+		_, offset := got.Zone()
+		assert.True(t, got.Equal(tc.want), "%q: %v, want %v", tc.value, got, tc.want.In(time.FixedZone("", tc.offset)))
+		assert.Equal(t, tc.offset, offset, "%q: zone offset of %v", tc.value, got)
+	}
+
+	// Only a second of 60 is a leap second.
+	for _, value := range []string{
+		"Sat, 31 Dec 2016 23:59:61 +0000",
+		"Sat, 31 Dec 2016 23:59:600 +0000",
+		"Sat, 31 Dec 2016 23:60:00 +0000",
+		"Sat, 31 Dec 2016 24:00:00 +0000",
+	} {
+		got, err := ParseDateHeader(value)
+		assert.Error(t, err, "%q: parsed as %v", value, got)
+	}
+}
+
 // TestParseDateHeaderInvalid: a value net/mail does not parse is still an error.
 func TestParseDateHeaderInvalid(t *testing.T) {
 	for _, value := range []string{
@@ -220,6 +271,50 @@ func TestParseDateHeaderInvalid(t *testing.T) {
 	} {
 		got, err := ParseDateHeader(value)
 		assert.Error(t, err, "%q: parsed as %v", value, got)
+	}
+}
+
+// TestParseDateHeaderGMTHourOffset: GMT with a signed hour ("GMT+1", "GMT-05") is no zone of
+// RFC 5322 (section 3.3: zone = (FWS ( "+" / "-" ) 4DIGIT) / obs-zone, and the obs-zone
+// names of section 4.3 are alphabetic), and it has no single meaning: read as an offset,
+// GMT+1 is +0100, read as a POSIX TZ, it is UTC-1. net/mail.ParseDate accepts it, but
+// time.Parse takes the time of day as UTC and only labels it with the offset, so
+// "12:00:00 GMT+1" came out as 13:00:00 +0100 and "12:00:00 GMT-5" as 07:00:00 -0500, a
+// time of day neither reading gives. It is not parsed, like GMT+0200: the sent date is
+// unknown, and SORT and THREAD use the INTERNALDATE (db.storedSentDate). RFC 5256
+// section 2.2 would keep the written time instead: "If the time zone is invalid, the
+// date and time SHOULD be treated as UTC". A zero hour means Universal Time either way
+// and keeps net/mail's reading.
+func TestParseDateHeaderGMTHourOffset(t *testing.T) {
+	for _, value := range []string{
+		"Tue, 01 Jan 2019 12:00:00 GMT+1",
+		"Tue, 01 Jan 2019 12:00:00 GMT+01",
+		"Tue, 01 Jan 2019 12:00:00 GMT-5",
+		"Tue, 01 Jan 2019 12:00:00 GMT+23",
+		// net/mail reads the digits after GMT as hours, whatever their number.
+		"Tue, 01 Jan 2019 12:00:00 GMT+0001",
+		// A comment after the zone is read as white space.
+		"Tue, 01 Jan 2019 12:00:00 GMT+10 (CET)",
+		"Tue, 01 Jan 19 12:00 GMT-1",
+	} {
+		got, err := ParseDateHeader(value)
+		assert.Error(t, err, "%q: parsed as %v", value, got)
+	}
+
+	wall := time.Date(2019, 1, 1, 12, 0, 0, 0, time.UTC)
+	for _, value := range []string{
+		"Tue, 01 Jan 2019 12:00:00 GMT+0",
+		"Tue, 01 Jan 2019 12:00:00 GMT-0",
+		"Tue, 01 Jan 2019 12:00:00 GMT+00",
+		"Tue, 01 Jan 2019 12:00:00 GMT-0000",
+	} {
+		got, err := ParseDateHeader(value)
+		if !assert.NoError(t, err, "%q", value) {
+			continue
+		}
+		_, offset := got.Zone()
+		assert.True(t, got.Equal(wall), "%q: %v, want %v", value, got, wall)
+		assert.Equal(t, 0, offset, "%q: zone offset of %v", value, got)
 	}
 }
 

@@ -20,10 +20,10 @@ require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/k3a/html2text v1.4.0
 	github.com/klauspost/compress v1.19.1
-	github.com/migadu/go-imap v1.2.7-0.20261115170001-b99d899924dc
+	github.com/migadu/go-imap v1.2.7-0.20261115170920-0b73c8a548ef
 	github.com/migadu/go-managesieve v0.1.4
 	github.com/migadu/go-pop3 v0.1.5-0.20261114174148-24ad5702c60a
-	github.com/migadu/go-sieve v1.4.5-0.20261115173847-f32d4291048f
+	github.com/migadu/go-sieve v1.4.5-0.20261115175441-69d09b4396c6
 	github.com/pierrec/lz4/v4 v4.1.33
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.2
