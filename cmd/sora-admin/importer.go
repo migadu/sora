@@ -2304,7 +2304,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 								// The preserved UID is already taken in the target mailbox: the
 								// message was NOT stored. A "skip" would hide a lost message.
 								logger.Error("Preserved UID already in use, message not imported", "path", gm.path, "hash", gm.hash)
-								i.recordFailedPath(gm.path, "preserved UID already in use in the target mailbox (re-run without --preserve-uids to import it)")
+								i.recordFailedPath(gm.path, uidConflictReason)
 								atomic.AddInt64(&i.failedMessages, 1)
 								continue
 							}
@@ -2340,6 +2340,23 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 	return successHashes, nil
 }
 
+// uidConflictReason is the failure reason of a message whose preserved UID the
+// target mailbox already uses.
+const uidConflictReason = "preserved UID already in use in the target mailbox (re-run without --preserve-uids to import it)"
+
+// batchUIDConflictError ends a batch transaction at the message whose preserved UID
+// the target mailbox already uses.
+type batchUIDConflictError struct {
+	path string
+	err  error
+}
+
+func (e *batchUIDConflictError) Error() string {
+	return fmt.Sprintf("preserved UID of %s already in use in the target mailbox: %v", e.path, e.err)
+}
+
+func (e *batchUIDConflictError) Unwrap() error { return e.err }
+
 // insertBatchToDBWithTransaction inserts all uploaded messages in a SINGLE transaction
 // This is faster (20x) but less resilient - if one message fails, entire batch rolls back
 func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]markedMessage, error) {
@@ -2367,10 +2384,8 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 	// Get the underlying database for direct access to InsertMessageFromImporter
 	database := i.rdb.GetOperationalDatabase()
 
-	// Stage per-message UID conflicts and dedup skips until tx.Commit and
-	// markBatchInSQLite succeed: if the batch aborts, processBatch records and
-	// counts the entire uploaded slice as failed.
-	var uidConflicts []failedImport
+	// Stage dedup skips until tx.Commit and markBatchInSQLite succeed: if the batch
+	// aborts, processBatch records and counts the entire uploaded slice as failed.
 	var skipped int64
 
 	// Track mailbox IDs for rollback compensation
@@ -2414,14 +2429,12 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 		if err != nil {
 			if errors.Is(err, consts.ErrUIDConflict) {
 				// The preserved UID is already taken in the target mailbox: this message
-				// was NOT stored. Report it as failed (never as a dedup skip) and go on
-				// with the batch.
+				// was NOT stored (never a dedup skip). The unique violation behind it has
+				// aborted the transaction, so nothing else of the batch can be stored
+				// either: stop here instead of sending statements PostgreSQL ignores
+				// until the rollback, whose error would then hide this cause.
 				logger.Error("Preserved UID already in use, message not imported", "path", up.msg.path, "hash", up.msg.hash)
-				uidConflicts = append(uidConflicts, failedImport{
-					path:   up.msg.path,
-					reason: "preserved UID already in use in the target mailbox (re-run without --preserve-uids to import it)",
-				})
-				continue
+				return nil, &batchUIDConflictError{path: up.msg.path, err: err}
 			}
 			if errors.Is(err, consts.ErrDBUniqueViolation) {
 				// Message already exists - skip but continue processing batch
@@ -2478,12 +2491,6 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 		return nil, fmt.Errorf("failed to update SQLite cache (batch reverted): %w", err)
 	}
 
-	for _, f := range uidConflicts {
-		i.recordFailedPath(f.path, f.reason)
-	}
-	if len(uidConflicts) > 0 {
-		atomic.AddInt64(&i.failedMessages, int64(len(uidConflicts)))
-	}
 	if skipped > 0 {
 		atomic.AddInt64(&i.skippedMessages, skipped)
 	}
@@ -2695,9 +2702,16 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 		}
 		logger.Error("Batch processing failed", "error", err)
 		// Everything in uploaded that wasn't successfully inserted is already tracked if individual mode
-		// Let's ensure BatchTransactionMode logs all if it aborted
+		// Let's ensure BatchTransactionMode logs all if it aborted: the message
+		// whose preserved UID ended the transaction with its own reason.
 		if i.options.BatchTransactionMode {
+			var conflict *batchUIDConflictError
+			errors.As(err, &conflict)
 			for _, up := range uploaded {
+				if conflict != nil && up.msg.path == conflict.path {
+					i.recordFailedPath(up.msg.path, uidConflictReason)
+					continue
+				}
 				i.recordFailedPath(up.msg.path, fmt.Sprintf("batch transaction aborted: %v", err))
 			}
 			atomic.AddInt64(&i.failedMessages, int64(len(uploaded)))

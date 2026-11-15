@@ -59,6 +59,18 @@ func recordedFailedPaths(importer *Importer) []string {
 	return paths
 }
 
+// recordedFailedReasons returns the reasons of the records recordedFailedPaths lists,
+// in the same order.
+func recordedFailedReasons(importer *Importer) []string {
+	importer.failedPathsMutex.Lock()
+	defer importer.failedPathsMutex.Unlock()
+	var reasons []string
+	for _, f := range importer.failedPaths {
+		reasons = append(reasons, f.reason)
+	}
+	return reasons
+}
+
 // The upload phase counts every message it drops (read, decompress, size, parse or
 // upload error) as it drops it. A batch none of whose messages reached the insert
 // phase must not be counted again as a whole (#546).
