@@ -1013,13 +1013,15 @@ func (d *Database) ListSoftDeletedAccountsForHardDelete(ctx context.Context, gra
 	// Plan this infrequent listing with its current arguments. Under skew, a cached
 	// generic plan can scan live messages once for every already-finished account.
 	// Exec keeps bound parameters but avoids reusing that named prepared plan.
+	// Keep pending membership uncorrelated and deduplicated by account, so the
+	// planner need not rescan an unrelated backlog for every finished account.
 	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, `
 		SELECT a.id
 		FROM accounts a
 		WHERE a.deleted_at IS NOT NULL AND a.deleted_at < $1
 		AND (EXISTS (SELECT 1 FROM mailboxes WHERE account_id = a.id)
 		     OR EXISTS (SELECT 1 FROM messages WHERE account_id = a.id AND expunged_at IS NULL)
-		     OR EXISTS (SELECT 1 FROM pending_uploads WHERE account_id = a.id AND (lease_until IS NULL OR lease_until < now()))
+		     OR a.id IN (SELECT DISTINCT account_id FROM pending_uploads WHERE lease_until IS NULL OR lease_until < now())
 		     OR EXISTS (SELECT 1 FROM sieve_scripts WHERE account_id = a.id)
 		     OR EXISTS (SELECT 1 FROM vacation_responses WHERE account_id = a.id))
 		ORDER BY a.deleted_at ASC
