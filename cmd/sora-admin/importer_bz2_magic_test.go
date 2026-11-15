@@ -127,10 +127,10 @@ func TestMaildirBzip2MagicDetection(t *testing.T) {
 				t.Fatal(err)
 			}
 			hash, size, hashErr := hashFile(path, 0)
-			dec, decErr := decompressIfNeeded(tt.onDisk)
+			dec, decErr := readMessage(path, 0)
 			if tt.wantReadErr {
 				if hashErr == nil || decErr == nil {
-					t.Errorf("hashFile err=%v, decompressIfNeeded err=%v; want both non-nil", hashErr, decErr)
+					t.Errorf("hashFile err=%v, readMessage err=%v; want both non-nil", hashErr, decErr)
 				}
 				return
 			}
@@ -138,7 +138,7 @@ func TestMaildirBzip2MagicDetection(t *testing.T) {
 				t.Fatalf("hashFile error = %v", hashErr)
 			}
 			if decErr != nil {
-				t.Fatalf("decompressIfNeeded error = %v", decErr)
+				t.Fatalf("readMessage error = %v", decErr)
 			}
 			if wantHash := helpers.HashContent([]byte(tt.wantContent)); hash != wantHash {
 				t.Errorf("hashFile hash = %s, want %s", hash, wantHash)
@@ -147,7 +147,7 @@ func TestMaildirBzip2MagicDetection(t *testing.T) {
 				t.Errorf("hashFile size = %d, want %d", size, len(tt.wantContent))
 			}
 			if string(dec) != tt.wantContent {
-				t.Errorf("decompressIfNeeded = %q, want %q", dec, tt.wantContent)
+				t.Errorf("readMessage = %q, want %q", dec, tt.wantContent)
 			}
 		})
 	}

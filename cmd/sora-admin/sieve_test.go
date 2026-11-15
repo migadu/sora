@@ -33,7 +33,7 @@ func TestSieveCommands(t *testing.T) {
 		// Put/Create a script
 		scriptName := "myscript"
 		content := "keep;"
-		_, err := rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, scriptName, content)
+		_, _, err := rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, scriptName, content)
 		if err != nil {
 			t.Fatalf("Failed to create script: %v", err)
 		}
@@ -55,7 +55,7 @@ func TestSieveCommands(t *testing.T) {
 
 		// Update script
 		contentUpdated := "discard;"
-		_, err = rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, scriptName, contentUpdated)
+		_, _, err = rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, scriptName, contentUpdated)
 		if err != nil {
 			t.Fatalf("Failed to update script: %v", err)
 		}

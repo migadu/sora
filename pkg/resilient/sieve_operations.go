@@ -57,72 +57,76 @@ func (rd *ResilientDatabase) GetScriptByNameWithRetry(ctx context.Context, name 
 	return result.(*db.SieveScript), nil
 }
 
-// CreateOrUpdateScriptWithRetry creates or updates a Sieve script with retry logic
-func (rd *ResilientDatabase) CreateOrUpdateScriptWithRetry(ctx context.Context, AccountID int64, name, script string) (*db.SieveScript, error) {
+// CreateOrUpdateScriptWithRetry stores script as the account's script called name,
+// replacing the content of an existing one or creating it (inactive); updated reports
+// which. The choice is made inside the write transaction (db.CreateOrUpdateScript),
+// not from a read-pool lookup, which misses a create the replica has not replayed yet
+// or that another session is committing.
+func (rd *ResilientDatabase) CreateOrUpdateScriptWithRetry(ctx context.Context, AccountID int64, name, script string) (stored *db.SieveScript, updated bool, err error) {
+	type outcome struct {
+		script  *db.SieveScript
+		updated bool
+	}
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		// Check if script exists
-		existing, err := rd.getOperationalDatabaseForOperation(ctx, false).GetScriptByName(ctx, name, AccountID)
-		if err == nil {
-			// Update existing script
-			return rd.getOperationalDatabaseForOperation(ctx, true).UpdateScript(ctx, tx, existing.ID, AccountID, name, script)
+		s, updated, err := rd.getOperationalDatabaseForOperation(ctx, true).CreateOrUpdateScript(ctx, tx, AccountID, name, script)
+		if err != nil {
+			return nil, err
 		}
-		// Create new script
-		return rd.getOperationalDatabaseForOperation(ctx, true).CreateScript(ctx, tx, AccountID, name, script)
+		return outcome{s, updated}, nil
 	}
 
 	result, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	return result.(*db.SieveScript), nil
+	o := result.(outcome)
+	return o.script, o.updated, nil
 }
 
-// DeleteScriptWithRetry deletes a Sieve script with retry logic
+// DeleteScriptWithRetry deletes the account's script called name, active or not. It
+// returns consts.ErrDBNotFound when the account has no such script. The name is
+// resolved inside the write transaction (db.DeleteScriptByName), not on the read
+// pool, which misses a script the replica has not replayed yet or returns the ID of
+// one deleted and created again.
 func (rd *ResilientDatabase) DeleteScriptWithRetry(ctx context.Context, name string, AccountID int64) error {
-	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		// Get script ID
-		script, err := rd.getOperationalDatabaseForOperation(ctx, false).GetScriptByName(ctx, name, AccountID)
-		if err != nil {
-			return nil, err
-		}
+	return rd.deleteScriptByName(ctx, AccountID, name, false)
+}
 
-		// Delete script
-		return nil, rd.getOperationalDatabaseForOperation(ctx, true).DeleteScript(ctx, tx, script.ID, AccountID)
+// DeleteInactiveScriptWithRetry deletes the account's script called name unless it
+// is the active script, which it refuses with db.ErrSieveScriptActive (ManageSieve
+// DELETESCRIPT, RFC 5804 section 2.10). The script is checked under the row lock its
+// delete holds, so an activation committed in between cannot be missed.
+func (rd *ResilientDatabase) DeleteInactiveScriptWithRetry(ctx context.Context, name string, AccountID int64) error {
+	return rd.deleteScriptByName(ctx, AccountID, name, true)
+}
+
+func (rd *ResilientDatabase) deleteScriptByName(ctx context.Context, AccountID int64, name string, keepActive bool) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).DeleteScriptByName(ctx, tx, AccountID, name, keepActive)
 	}
 
 	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
 	return err
 }
 
-// ActivateScriptWithRetry activates a Sieve script (deactivates all others) with retry logic
+// ActivateScriptWithRetry activates the account's script called name (deactivating
+// all others). It returns consts.ErrDBNotFound when the account has no such script.
+// The name is resolved inside the write transaction (db.SetScriptActiveByName).
 func (rd *ResilientDatabase) ActivateScriptWithRetry(ctx context.Context, name string, AccountID int64) error {
-	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		// Get script ID
-		script, err := rd.getOperationalDatabaseForOperation(ctx, false).GetScriptByName(ctx, name, AccountID)
-		if err != nil {
-			return nil, err
-		}
-
-		// Activate script (deactivates all others automatically)
-		return nil, rd.getOperationalDatabaseForOperation(ctx, true).SetScriptActive(ctx, tx, script.ID, AccountID, true)
-	}
-
-	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
-	return err
+	return rd.setScriptActiveByName(ctx, AccountID, name, true)
 }
 
-// DeactivateScriptWithRetry deactivates a Sieve script with retry logic
+// DeactivateScriptWithRetry deactivates the account's script called name. It returns
+// consts.ErrDBNotFound when the account has no such script. The name is resolved
+// inside the write transaction (db.SetScriptActiveByName).
 func (rd *ResilientDatabase) DeactivateScriptWithRetry(ctx context.Context, name string, AccountID int64) error {
-	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		// Get script ID
-		script, err := rd.getOperationalDatabaseForOperation(ctx, false).GetScriptByName(ctx, name, AccountID)
-		if err != nil {
-			return nil, err
-		}
+	return rd.setScriptActiveByName(ctx, AccountID, name, false)
+}
 
-		// Deactivate script
-		return nil, rd.getOperationalDatabaseForOperation(ctx, true).SetScriptActive(ctx, tx, script.ID, AccountID, false)
+func (rd *ResilientDatabase) setScriptActiveByName(ctx context.Context, AccountID int64, name string, active bool) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).SetScriptActiveByName(ctx, tx, AccountID, name, active)
 	}
 
 	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
@@ -204,14 +208,15 @@ func (rd *ResilientDatabase) DeactivateAllScriptsWithRetry(ctx context.Context, 
 // RenameScriptWithRetry renames a Sieve script with retry logic. The rename is a
 // single atomic UPDATE, so there is no read-then-write window: the script's active
 // state is preserved and the UNIQUE (account_id, name) constraint resolves name
-// collisions. It returns consts.ErrDBNotFound if oldName does not exist, or
-// consts.ErrDBUniqueViolation if newName already exists.
+// collisions. It returns consts.ErrDBNotFound if oldName does not exist,
+// consts.ErrDBUniqueViolation if newName already exists, or
+// db.ErrSieveScriptNotStorable if newName contains NUL or invalid UTF-8.
 func (rd *ResilientDatabase) RenameScriptWithRetry(ctx context.Context, AccountID int64, oldName, newName string) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(ctx, true).RenameScript(ctx, tx, AccountID, oldName, newName)
 	}
 
-	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op, consts.ErrDBNotFound, consts.ErrDBUniqueViolation)
+	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op, consts.ErrDBNotFound, consts.ErrDBUniqueViolation, db.ErrSieveScriptNotStorable)
 	return err
 }
 

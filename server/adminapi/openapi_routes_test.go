@@ -1,6 +1,7 @@
 package adminapi
 
 import (
+	"database/sql"
 	"encoding/json"
 	"go/ast"
 	"go/parser"
@@ -65,10 +66,10 @@ func registeredRoutes(t *testing.T) map[string][]string {
 			if !ok {
 				t.Fatalf("%s: handler is not wrapped in routeHandler/multiMethodHandler; teach this test its methods", path)
 			}
-			switch ident, _ := wrapper.Fun.(*ast.Ident); {
-			case ident != nil && ident.Name == "routeHandler":
+			switch sel, _ := wrapper.Fun.(*ast.SelectorExpr); {
+			case sel != nil && sel.Sel.Name == "routeHandler":
 				routes[path] = append(routes[path], unquote(wrapper.Args[0]))
-			case ident != nil && ident.Name == "multiMethodHandler":
+			case sel != nil && sel.Sel.Name == "multiMethodHandler":
 				for _, elt := range wrapper.Args[0].(*ast.CompositeLit).Elts {
 					routes[path] = append(routes[path], unquote(elt.(*ast.KeyValueExpr).Key))
 				}
@@ -236,5 +237,30 @@ func TestOpenAPIAccountCredentialMatchesWireFormat(t *testing.T) {
 	wire := wireKeys(t, db.Credential{})
 	if strings.Join(documented, ",") != strings.Join(wire, ",") {
 		t.Fatalf("OpenAPI AccountCredential properties do not match the wire format\n  spec: %v\n  wire: %v", documented, wire)
+	}
+}
+
+// GET /uploader/status encodes db.UploaderStats, and both uploader endpoints list
+// db.PendingUpload values as FailedUpload. Neither struct has JSON tags, so the wire keys
+// are Go field names, and OldestPending and LastAttempt are sql.NullTime objects. The
+// spec described snake_case fields neither struct has (pending_count, in_progress_count,
+// last_error, ...). GET /cache/metrics lists db.CacheMetricsRecord values.
+func TestOpenAPIUploaderAndCacheMetricsSchemasMatchWireFormat(t *testing.T) {
+	for _, tc := range []struct {
+		schema string
+		value  any
+	}{
+		{"UploaderStats", db.UploaderStats{}},
+		{"FailedUpload", db.PendingUpload{}},
+		{"NullTime", sql.NullTime{}},
+		{"CacheMetricsRecord", db.CacheMetricsRecord{}},
+	} {
+		t.Run(tc.schema, func(t *testing.T) {
+			documented := schemaProperties(t, tc.schema)
+			wire := wireKeys(t, tc.value)
+			if !slices.Equal(documented, wire) {
+				t.Fatalf("OpenAPI %s properties do not match the wire format\n  spec: %v\n  wire: %v", tc.schema, documented, wire)
+			}
+		})
 	}
 }

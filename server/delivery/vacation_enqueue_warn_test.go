@@ -46,6 +46,10 @@ type failingRelayQueue struct{ err error }
 
 func (q *failingRelayQueue) Enqueue(_, _, _ string, _ []byte) error { return q.err }
 
+func (q *failingRelayQueue) Hold(_, _, _ string, _ []byte) (func() error, func(), error) {
+	return nil, nil, q.err
+}
+
 // failingRelayHandler refuses every message.
 type failingRelayHandler struct{ err error }
 

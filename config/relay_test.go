@@ -183,12 +183,15 @@ func TestRelayValidateMalformedEndpointsHideCredentials(t *testing.T) {
 		{Type: "http", HTTPURL: "user:private-relay-token@relay.example/send"},
 		{Type: "smtp", SMTPHost: "smtp://user:private-relay-token@smtp.example:587"},
 		{Type: "smtp", SMTPHost: "user:private-relay-token@smtp.example:587"},
+		// The parser's reason quotes the part of the password before the "/" as a
+		// port: `invalid port ":private" after host` (#806).
+		{Type: "http", HTTPURL: "https://user:private/relay-token@relay.example/send"},
 	} {
 		err := relay.Validate()
 		if err == nil {
 			t.Fatalf("invalid relay endpoint was accepted: %#v", relay)
 		}
-		if strings.Contains(err.Error(), "private-relay-token") {
+		if strings.Contains(err.Error(), "private") {
 			t.Errorf("validation exposed endpoint credentials: %v", err)
 		}
 	}
@@ -205,10 +208,14 @@ func TestRelayValidateMalformedEndpointsHideCredentials(t *testing.T) {
 // have the cleanup delete every failed message, the only copy of a Sieve redirect without
 // :copy, on its first pass. Both are refused by the checks that run at start-up and in
 // `sora-admin config validate`; failed_retention = "0" keeps failed messages until they
-// are deleted or requeued. A value that does not parse is left to start-up, as before.
+// are deleted or requeued. So is a circuit_breaker_timeout, cleanup_interval or
+// failed_retention that does not parse, which start-up refused only once it had opened
+// the database, S3 and the cache (#921). An unparsable worker_interval or retry_backoff
+// takes the default at start-up. The relay worker runs on any node with [relay], here
+// one with only a metrics listener.
 func TestRelayQueueValidate(t *testing.T) {
 	const relay = "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com:587\"\n"
-	const imap = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"
+	const metrics = "\n[[server]]\ntype = \"metrics\"\nname = \"metrics\"\naddr = \"127.0.0.1:9090\"\npath = \"/metrics\"\n"
 	tests := []struct {
 		name    string
 		content string
@@ -223,12 +230,18 @@ func TestRelayQueueValidate(t *testing.T) {
 		{name: "failed_retention 0", content: relay + "[relay.queue]\nfailed_retention = \"0\"\n"},
 		{name: "failed_retention 7d", content: relay + "[relay.queue]\nfailed_retention = \"7d\"\n"},
 		{name: "failed_retention -1h", content: relay + "[relay.queue]\nfailed_retention = \"-1h\"\n", wantErr: `failed_retention must not be negative, got "-1h"`},
-		{name: "no relay, queue not checked", content: "[relay.queue]\nworker_interval = \"0\"\nfailed_retention = \"-1h\"\n"},
+		{name: "retry_backoff unparsable", content: relay + "[relay.queue]\nretry_backoff = [\"1m\", \"soon\"]\n"},
+		{name: "circuit_breaker_timeout 1m", content: relay + "[relay.queue]\ncircuit_breaker_timeout = \"1m\"\n"},
+		{name: "circuit_breaker_timeout unparsable", content: relay + "[relay.queue]\ncircuit_breaker_timeout = \"soon\"\n", wantErr: `invalid circuit_breaker_timeout "soon"`},
+		{name: "cleanup_interval 30m", content: relay + "[relay.queue]\ncleanup_interval = \"30m\"\n"},
+		{name: "cleanup_interval unparsable", content: relay + "[relay.queue]\ncleanup_interval = \"hourly\"\n", wantErr: `invalid cleanup_interval "hourly"`},
+		{name: "failed_retention unparsable", content: relay + "[relay.queue]\nfailed_retention = \"a week\"\n", wantErr: `invalid failed_retention "a week"`},
+		{name: "no relay, queue not checked", content: "[relay.queue]\nworker_interval = \"0\"\nfailed_retention = \"-1h\"\ncircuit_breaker_timeout = \"soon\"\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.toml")
-			if err := os.WriteFile(path, []byte(tt.content+imap), 0o600); err != nil {
+			if err := os.WriteFile(path, []byte(tt.content+metrics), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			var cfg Config

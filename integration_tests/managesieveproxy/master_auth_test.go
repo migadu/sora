@@ -329,24 +329,26 @@ func TestManageSieveProxy_MasterAuthenticationPriority(t *testing.T) {
 	proxy := setupManageSieveProxyWithMasterAuth(t, backendServer, proxyAddress, []string{backendServer.Address})
 	defer proxy.Close()
 
-	t.Run("Master username overrides regular auth at proxy", func(t *testing.T) {
+	t.Run("Account password under the master username suffix is the account's own login at proxy", func(t *testing.T) {
 		client, err := NewManageSieveClient(proxyAddress)
 		if err != nil {
 			t.Fatalf("Failed to connect to ManageSieve proxy: %v", err)
 		}
 		defer client.Close()
 
-		// Try proxy master username suffix with account password (should fail)
+		// The master username form without the master password is the account's
+		// own login, as under any other suffix (#949): refused there alone, it
+		// confirmed the master username to any account holder.
 		username := account.Email + "@" + proxyMasterUsername
 		authString := "\x00" + username + "\x00" + account.Password
 		encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
 		client.SendCommand(fmt.Sprintf("AUTHENTICATE \"PLAIN\" \"%s\"", encoded))
 		response, _ := client.ReadResponse()
-		if strings.HasPrefix(response, "OK") {
-			t.Fatal("Expected authentication to fail when using account password with proxy master username suffix")
+		if !strings.HasPrefix(response, "OK") {
+			t.Fatalf("account password under the proxy master username suffix: %q, want the account's own login", response)
 		}
-		t.Log("✓ Correctly rejected account password when proxy master username suffix is present")
+		t.Log("✓ Account password under the proxy master username suffix logs in as the account")
 	})
 
 	t.Run("Regular auth still works through proxy without suffix", func(t *testing.T) {

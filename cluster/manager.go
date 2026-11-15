@@ -86,7 +86,7 @@ type Manager struct {
 	// Rate limit event handling
 	rateLimitHandlers   []*handlerQueue
 	rateLimitMu         sync.RWMutex
-	rateLimitBroadcasts []func(int, int) [][]byte
+	rateLimitBroadcasts []*rateLimitBroadcaster
 	broadcastMu         sync.RWMutex
 
 	// Affinity event handling
@@ -121,27 +121,45 @@ type handlerQueue struct {
 	events      chan []byte
 	dropped     atomic.Uint64
 	lastDropLog atomic.Int64
+	ctx         context.Context
+	cancel      context.CancelFunc
+	done        chan struct{}
+	stopOnce    sync.Once
 }
 
 func newHandlerQueue(ctx context.Context, kind string, handler func([]byte)) *handlerQueue {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(ctx)
 	q := &handlerQueue{
 		kind:    kind,
 		handler: handler,
 		events:  make(chan []byte, handlerQueueDepth),
+		ctx:     ctx,
+		cancel:  cancel,
+		done:    make(chan struct{}),
 	}
 	go q.run(ctx)
 	return q
 }
 
 func (q *handlerQueue) run(ctx context.Context) {
+	defer close(q.done)
 	var done <-chan struct{}
 	if ctx != nil {
 		done = ctx.Done()
 	}
 
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		select {
 		case data := <-q.events:
+			if ctx.Err() != nil {
+				return
+			}
 			q.invoke(data)
 		case <-done:
 			return
@@ -160,11 +178,24 @@ func (q *handlerQueue) invoke(data []byte) {
 
 // deliver queues one payload, or drops it if the handler has fallen behind
 func (q *handlerQueue) deliver(data []byte) {
+	if q.ctx.Err() != nil {
+		return
+	}
 	select {
 	case q.events <- data:
 	default:
 		q.recordDrop()
 	}
+}
+
+// stop cancels pending delivery and waits for the current handler invocation.
+// Call it from outside the handler being stopped.
+func (q *handlerQueue) stop() {
+	q.stopOnce.Do(func() {
+		q.cancel()
+		<-q.done
+		q.handler = nil
+	})
 }
 
 func (q *handlerQueue) recordDrop() {
@@ -231,6 +262,11 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	if !cfg.Enabled {
 		return nil, fmt.Errorf("cluster mode is not enabled")
 	}
+	// The addr and secret_key checks are the ones the server runs on the whole file
+	// before it starts anything (config.Config.Validate).
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 
 	// Use hostname as default node ID
 	nodeID := cfg.NodeID
@@ -281,17 +317,6 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 		logger.Warn("To avoid confusion, remove either the port from 'addr' or remove the 'port' field")
 	}
 
-	// Validate bind address - must be a specific IP, not 0.0.0.0 or localhost hostname
-	if bindAddr == "" || bindAddr == "0.0.0.0" || bindAddr == "::" || bindAddr == "localhost" {
-		logger.Error("Cluster mode ERROR: 'addr' must be a specific IP address reachable from other nodes")
-		logger.Error("Current value is not valid for cluster gossip", "addr", bindAddr)
-		logger.Error("The gossip protocol requires advertising a real IP address that other nodes can reach")
-		logger.Error("Example: addr = \"10.10.10.40:7946\" or addr = \"10.10.10.40\" with port = 7946")
-		logger.Error("Cannot use: 0.0.0.0, localhost, or ::")
-		cancel()
-		return nil, fmt.Errorf("cluster addr '%s' must be a specific IP address reachable from other nodes", bindAddr)
-	}
-
 	// Warn about loopback addresses (allowed for testing but not recommended for production)
 	if bindAddr == "127.0.0.1" || bindAddr == "::1" {
 		logger.Warn("Cluster mode: Using loopback address - this only works for single-machine testing", "addr", bindAddr)
@@ -309,31 +334,14 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	// Forward memberlist's own log lines at their level
 	mlConfig.LogOutput = &memberlistLogger{prefix: "Cluster: "}
 
-	// Set up encryption if secret key is provided
-	if cfg.SecretKey != "" {
-		keyBytes, err := base64.StdEncoding.DecodeString(cfg.SecretKey)
-		if err != nil {
-			cancel()
-			return nil, fmt.Errorf("failed to decode cluster secret_key: %w", err)
-		}
-		if len(keyBytes) != 32 {
-			cancel()
-			return nil, fmt.Errorf("cluster secret_key must be 32 bytes (got %d bytes)", len(keyBytes))
-		}
-		mlConfig.SecretKey = keyBytes
-		logger.Info("Cluster encryption enabled with secret key")
-	} else {
-		// secret_key is mandatory when cluster mode is enabled. Gossip carries
-		// security-sensitive state (auth-failure counts, IP blocks, connection-kick
-		// commands); without encryption any host able to reach the gossip port can
-		// forge these messages. Fail closed rather than running unauthenticated.
-		logger.Error("Cluster mode ERROR: 'secret_key' is required when cluster mode is enabled")
-		logger.Error("Gossip carries auth-failure state, IP blocks, and connection-kick commands")
-		logger.Error("Without encryption, any host able to reach the gossip port can forge them")
-		logger.Error("Generate a key with: openssl rand -base64 32")
+	// Encrypt gossip with the secret key, which Validate found to be 32 bytes of base64.
+	keyBytes, err := base64.StdEncoding.DecodeString(cfg.SecretKey)
+	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("cluster secret_key is required when cluster mode is enabled (generate one with: openssl rand -base64 32)")
+		return nil, fmt.Errorf("failed to decode cluster secret_key: %w", err)
 	}
+	mlConfig.SecretKey = keyBytes
+	logger.Info("Cluster encryption enabled with secret key")
 
 	// Create memberlist
 	logger.Info("Creating memberlist with config", "node", mlConfig.Name, "bind_addr", mlConfig.BindAddr, "bind_port", mlConfig.BindPort, "delegate", fmt.Sprintf("%p", mlConfig.Delegate))
@@ -696,11 +704,29 @@ func (m *Manager) OnLeaderChange(callback func(isLeader bool, newLeaderID string
 	m.leaderChangeCallbacks = append(m.leaderChangeCallbacks, callback)
 }
 
-// RegisterRateLimitHandler registers a callback to handle rate limit events from the cluster
-func (m *Manager) RegisterRateLimitHandler(handler func([]byte)) {
+// RegisterRateLimitHandler registers a callback and returns an idempotent
+// unregister function. Unregister waits for an in-flight invocation to return;
+// it must not be called from that handler.
+func (m *Manager) RegisterRateLimitHandler(handler func([]byte)) func() {
+	q := newHandlerQueue(m.ctx, "rate-limit", handler)
 	m.rateLimitMu.Lock()
-	defer m.rateLimitMu.Unlock()
-	m.rateLimitHandlers = append(m.rateLimitHandlers, newHandlerQueue(m.ctx, "rate-limit", handler))
+	m.rateLimitHandlers = append(m.rateLimitHandlers, q)
+	m.rateLimitMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.rateLimitMu.Lock()
+			remaining := make([]*handlerQueue, 0, len(m.rateLimitHandlers))
+			for _, current := range m.rateLimitHandlers {
+				if current != q {
+					remaining = append(remaining, current)
+				}
+			}
+			m.rateLimitHandlers = remaining
+			m.rateLimitMu.Unlock()
+			q.stop()
+		})
+	}
 }
 
 // notifyRateLimitHandlers queues an event for all registered rate limit handlers
@@ -712,11 +738,47 @@ func (m *Manager) notifyRateLimitHandlers(data []byte) {
 	deliverGossip(queues, data)
 }
 
-// RegisterRateLimitBroadcaster registers a callback to generate rate limit broadcasts
-func (m *Manager) RegisterRateLimitBroadcaster(broadcaster func(int, int) [][]byte) {
+// rateLimitBroadcaster lets an already-copied broadcast snapshot become inert
+// on unregister without retaining its subsystem through the callback.
+type rateLimitBroadcaster struct {
+	mu       sync.RWMutex
+	callback func(int, int) [][]byte
+}
+
+func (b *rateLimitBroadcaster) get(overhead, limit int) [][]byte {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.callback == nil {
+		return nil
+	}
+	return b.callback(overhead, limit)
+}
+
+// RegisterRateLimitBroadcaster returns an idempotent unregister function that
+// waits for an in-flight callback and makes old snapshots inert. Do not call
+// unregister from the callback being unregistered.
+func (m *Manager) RegisterRateLimitBroadcaster(broadcaster func(int, int) [][]byte) func() {
+	b := &rateLimitBroadcaster{callback: broadcaster}
 	m.broadcastMu.Lock()
-	defer m.broadcastMu.Unlock()
-	m.rateLimitBroadcasts = append(m.rateLimitBroadcasts, broadcaster)
+	m.rateLimitBroadcasts = append(m.rateLimitBroadcasts, b)
+	m.broadcastMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.broadcastMu.Lock()
+			remaining := make([]*rateLimitBroadcaster, 0, len(m.rateLimitBroadcasts))
+			for _, current := range m.rateLimitBroadcasts {
+				if current != b {
+					remaining = append(remaining, current)
+				}
+			}
+			m.rateLimitBroadcasts = remaining
+			m.broadcastMu.Unlock()
+			b.mu.Lock()
+			b.callback = nil
+			b.mu.Unlock()
+		})
+	}
 }
 
 // RegisterAffinityHandler registers a callback to handle affinity events from the cluster
@@ -828,7 +890,9 @@ func (m *Manager) getAffinityBroadcasts(overhead, limit int) [][]byte {
 func (m *Manager) getRateLimitBroadcasts(overhead, limit int) [][]byte {
 	m.broadcastMu.RLock()
 	broadcasters := make([]func(int, int) [][]byte, len(m.rateLimitBroadcasts))
-	copy(broadcasters, m.rateLimitBroadcasts)
+	for i, b := range m.rateLimitBroadcasts {
+		broadcasters[i] = b.get
+	}
 	m.broadcastMu.RUnlock()
 
 	return collectBroadcasts("rate-limit", markerRateLimit, broadcasters, overhead, limit)
