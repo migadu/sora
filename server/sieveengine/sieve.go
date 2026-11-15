@@ -12,7 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/emersion/go-message"
+	"github.com/emersion/go-message/textproto"
 	msieve "github.com/migadu/go-managesieve/managesieve"
 	"github.com/migadu/go-sieve"
 	"github.com/migadu/go-sieve/interp"
@@ -732,85 +732,185 @@ func messageBody(msg []byte) []byte {
 	return nil
 }
 
-// ApplyHeaderEdits applies header modifications to raw message bytes (RFC 5293)
-// Returns the modified message bytes with header edits applied
+// ApplyHeaderEdits applies a script's addheader/deleteheader edits (RFC 5293) to
+// the raw message, in order, each to the header the earlier ones left, as the
+// script saw it. It edits the header's list of fields and nothing else: every
+// field it does not add or delete and the whole body keep their bytes, so a DKIM
+// signature over them still verifies.
 func ApplyHeaderEdits(messageBytes []byte, edits []HeaderEdit) ([]byte, error) {
 	if len(edits) == 0 {
 		return messageBytes, nil
 	}
 
-	// Parse message using go-message
-	entity, err := message.Read(bytes.NewReader(messageBytes))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse message: %w", err)
+	end := headerEnd(messageBytes)
+	fields := parseHeaderFields(messageBytes[:end])
+
+	// Added fields end their lines as the message does, so a bare-LF message does
+	// not get mixed line breaks.
+	eol := "\r\n"
+	if n := bytes.IndexByte(messageBytes, '\n'); n == 0 || n > 0 && messageBytes[n-1] != '\r' {
+		eol = "\n"
 	}
 
-	// Apply header edits
 	for _, edit := range edits {
+		// RFC 5293 §5: "The field-name is mandatory and always matched as a
+		// case-insensitive US-ASCII string."
+		key := lowerASCII(edit.FieldName)
 		switch edit.Action {
 		case "add":
+			raw, err := formatAddedField(edit.FieldName, edit.Value, eol)
+			if err != nil {
+				return nil, err
+			}
+			f := headerField{key: key, value: edit.Value, raw: raw}
+			// RFC 5293 §4: "By default, the header field is inserted at the
+			// beginning of the existing message header.  If the optional flag
+			// ":last" is specified, it is appended at the end."
 			if edit.Last {
-				// Add at the end - go-message naturally adds to the end
-				entity.Header.Add(edit.FieldName, edit.Value)
+				fields = append(fields, f)
 			} else {
-				// Add at the beginning - need to preserve existing and prepend
-				existingValues := entity.Header.Values(edit.FieldName)
-				entity.Header.Del(edit.FieldName)
-				entity.Header.Add(edit.FieldName, edit.Value)
-				for _, v := range existingValues {
-					entity.Header.Add(edit.FieldName, v)
-				}
+				fields = slices.Insert(fields, 0, f)
 			}
 
 		case "delete":
-			if edit.Index > 0 {
-				// Delete specific index
-				values := entity.Header.Values(edit.FieldName)
-				if len(values) == 0 {
-					continue
+			switch {
+			case edit.Index > 0:
+				// RFC 5293 §5: :index counts the named fields "beginning at 1,
+				// the first named header field.  If :last is specified, the
+				// count is backwards; 1 denotes the last named header field".
+				var named []int
+				for i, f := range fields {
+					if f.key == key {
+						named = append(named, i)
+					}
 				}
-
-				idx := edit.Index - 1
+				n := edit.Index - 1
 				if edit.Last {
-					idx = len(values) - edit.Index
+					n = len(named) - edit.Index
 				}
-
-				if idx >= 0 && idx < len(values) {
-					entity.Header.Del(edit.FieldName)
-					for i, v := range values {
-						if i != idx {
-							entity.Header.Add(edit.FieldName, v)
-						}
-					}
+				if n >= 0 && n < len(named) {
+					fields = slices.Delete(fields, named[n], named[n]+1)
 				}
-
-			} else if edit.Value != "" {
-				// Delete first occurrence matching value
-				values := entity.Header.Values(edit.FieldName)
-				entity.Header.Del(edit.FieldName)
-				deleted := false
-				for _, v := range values {
-					if !deleted && v == edit.Value {
-						deleted = true
-						continue
-					}
-					entity.Header.Add(edit.FieldName, v)
+			case edit.Value != "":
+				// go-sieve records one edit for each field whose value matched
+				// the value-patterns, carrying that value.
+				if i := slices.IndexFunc(fields, func(f headerField) bool {
+					return f.key == key && f.value == edit.Value
+				}); i >= 0 {
+					fields = slices.Delete(fields, i, i+1)
 				}
-
-			} else {
-				// Delete all occurrences
-				entity.Header.Del(edit.FieldName)
+			default:
+				fields = slices.DeleteFunc(fields, func(f headerField) bool { return f.key == key })
 			}
 		}
 	}
 
-	// Write modified message back to bytes
-	var buf bytes.Buffer
-	if err := entity.WriteTo(&buf); err != nil {
-		return nil, fmt.Errorf("failed to write modified message: %w", err)
+	out := make([]byte, 0, len(messageBytes)+len(edits)*64)
+	for i, f := range fields {
+		out = append(out, f.raw...)
+		// Only the last line of a header with no body can lack a line break; a
+		// field may now follow it.
+		if i < len(fields)-1 && !bytes.HasSuffix(f.raw, []byte{'\n'}) {
+			out = append(out, eol...)
+		}
 	}
+	return append(out, messageBytes[end:]...), nil
+}
 
-	return buf.Bytes(), nil
+// headerField is one field of a message header: its bytes as the message has
+// them (the first line, any continuation lines and their line breaks), its name
+// lower-cased for i;ascii-casemap, and its value as the script's header map holds
+// it. A line with no colon is kept with an empty key and never matches an edit.
+type headerField struct {
+	key   string
+	value string
+	raw   []byte
+}
+
+// parseHeaderFields splits a header block into its fields. A line that starts
+// with SP or HT continues the field before it (RFC 5322 §2.2.3).
+func parseHeaderFields(header []byte) []headerField {
+	var fields []headerField
+	start := 0
+	for i := 0; i < len(header); {
+		next := len(header)
+		if n := bytes.IndexByte(header[i:], '\n'); n >= 0 {
+			next = i + n + 1
+		}
+		if i > start && header[i] != ' ' && header[i] != '\t' {
+			fields = append(fields, newHeaderField(header[start:i]))
+			start = i
+		}
+		i = next
+	}
+	if start < len(header) {
+		fields = append(fields, newHeaderField(header[start:]))
+	}
+	return fields
+}
+
+func newHeaderField(raw []byte) headerField {
+	f := headerField{raw: raw}
+	firstLine := raw
+	if n := bytes.IndexByte(raw, '\n'); n >= 0 {
+		firstLine = raw[:n]
+	}
+	colon := bytes.IndexByte(firstLine, ':')
+	if colon < 0 {
+		return f
+	}
+	// go-message, which built the script's header map, drops the SP/HT around
+	// the name and unfolds the value: each line without its line break and the
+	// SP/HT around it, the non-empty ones joined with a single space.
+	f.key = lowerASCII(string(bytes.Trim(raw[:colon], " \t")))
+	var value strings.Builder
+	for line := range bytes.Lines(raw[colon+1:]) {
+		if l, ok := bytes.CutSuffix(line, []byte{'\n'}); ok {
+			line = bytes.TrimSuffix(l, []byte{'\r'})
+		}
+		if line = bytes.Trim(line, " \t"); len(line) == 0 {
+			continue
+		}
+		if value.Len() > 0 {
+			value.WriteByte(' ')
+		}
+		value.Write(line)
+	}
+	f.value = value.String()
+	return f
+}
+
+// formatAddedField formats an addheader field as go-message writes a new field,
+// folded to RFC 5322 line lengths, with its lines ending in eol. A value holding
+// a CR or LF is refused.
+func formatAddedField(name, value, eol string) ([]byte, error) {
+	var h textproto.Header
+	h.Add(name, value)
+	var b bytes.Buffer
+	if err := textproto.WriteHeader(&b, h); err != nil {
+		return nil, fmt.Errorf("addheader %q: %w", name, err)
+	}
+	raw := b.Bytes()[:b.Len()-2] // WriteHeader ends the header with a blank line
+	if eol == "\n" {
+		raw = bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))
+	}
+	return raw, nil
+}
+
+// headerEnd returns the length of msg's header block: the octets before the blank
+// line that ends it, or all of msg when there is none.
+func headerEnd(msg []byte) int {
+	for i := 0; i < len(msg); {
+		if msg[i] == '\n' || msg[i] == '\r' && i+1 < len(msg) && msg[i+1] == '\n' {
+			return i
+		}
+		n := bytes.IndexByte(msg[i:], '\n')
+		if n < 0 {
+			break
+		}
+		i += n + 1
+	}
+	return len(msg)
 }
 
 // maxLoggedRejectReason bounds the reject reason in a log line. The reason is

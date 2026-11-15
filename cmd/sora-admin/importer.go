@@ -32,7 +32,6 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
-	"github.com/migadu/sora/pkg/sqlitefile"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/sieveengine"
 	_ "modernc.org/sqlite"
@@ -181,11 +180,6 @@ type Importer struct {
 	batchSize int // default: 20
 }
 
-// maildirCacheParams are the connection settings of sora-maildir.db, for import and
-// export alike: WAL lets readers and the writer work concurrently, and a locked
-// database is waited for up to 5 seconds.
-const maildirCacheParams = "_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL"
-
 // NewImporter creates a new Importer instance.
 func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ImporterOptions) (*Importer, error) {
 	// The import runs on exactly this many workers: with none it would never drain its queue.
@@ -193,7 +187,7 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		return nil, fmt.Errorf("jobs must be at least 1, got %d", jobs)
 	}
 	// Always create SQLite database in the maildir path to persist maildir state
-	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
+	dbPath := filepath.Join(maildirPath, maildirCacheName)
 
 	if options.Incremental {
 		logger.Info("Using maildir database for incremental import", "path", dbPath)
@@ -201,19 +195,10 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		logger.Info("Incremental mode disabled - will read all files (database still created for tracking)", "path", dbPath)
 	}
 
-	dsn, err := sqlitefile.DSN(dbPath, maildirCacheParams)
+	sqliteDB, err := openMaildirCache(maildirPath)
 	if err != nil {
 		return nil, err
 	}
-	sqliteDB, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
-	}
-
-	// Configure connection pool for better concurrency
-	// SQLite works best with a single writer connection
-	sqliteDB.SetMaxOpenConns(1)
-	sqliteDB.SetMaxIdleConns(1)
 
 	// Create the table for storing message information.
 	// s3_uploaded tracks whether the message has been successfully uploaded to S3
@@ -684,18 +669,31 @@ func (i *Importer) processSubscriptions() error {
 	return nil
 }
 
+// readSieveFile reads path through a root at its directory. The root follows a
+// symbolic link only to a file within that directory, as Pigeonhole's own
+// ~/.dovecot.sieve -> sieve/<name>.sieve; a link out of it, or an absolute one, does
+// not open. The usual --sieve file of a Dovecot migration is that link, which is the
+// user's, and the import runs with privileges the user lacks: the link must not
+// choose which file those privileges read into the user's account.
+func readSieveFile(path string) ([]byte, error) {
+	path = filepath.Clean(path)
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return root.ReadFile(filepath.Base(path))
+}
+
 // importSieveScript imports a Sieve script file for the user
 func (i *Importer) importSieveScript() error {
-	// Check if file exists (follow symlinks if present)
-	if _, err := os.Stat(i.options.SievePath); os.IsNotExist(err) {
+	scriptContent, err := readSieveFile(i.options.SievePath)
+	if errors.Is(err, fs.ErrNotExist) {
 		logger.Info("Sieve script file does not exist - ignoring", "path", i.options.SievePath)
 		return nil
 	}
-
-	// Read the script content
-	scriptContent, err := os.ReadFile(i.options.SievePath)
 	if err != nil {
-		return fmt.Errorf("failed to read Sieve script file: %w", err)
+		return fmt.Errorf("failed to read Sieve script file %s: %w", i.options.SievePath, err)
 	}
 
 	// A script delivery cannot compile is skipped whole, so it must not become

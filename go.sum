@@ -189,6 +189,8 @@ github.com/migadu/go-imap v1.2.8-0.20261115200620-0ddeca5f6a1c h1:OWNan9HorIafCS
 github.com/migadu/go-imap v1.2.8-0.20261115200620-0ddeca5f6a1c/go.mod h1:fvRvl7ajggZYKHgHokVT0O5uQsAj7ZVAhK6PoQYgga0=
 github.com/migadu/go-imap v1.2.8-0.20261115201318-143b364803bf h1:RuABmfR+O8Wd2VwJA4gXoPfkDunSKmirF61BySzaVB0=
 github.com/migadu/go-imap v1.2.8-0.20261115201318-143b364803bf/go.mod h1:fvRvl7ajggZYKHgHokVT0O5uQsAj7ZVAhK6PoQYgga0=
+github.com/migadu/go-imap v1.2.8-0.20261115221246-ec5bc48e0109 h1:3+n8j3qQvU1n+OOsw9bI7H18nX7aldiNH1bBjhtdf3o=
+github.com/migadu/go-imap v1.2.8-0.20261115221246-ec5bc48e0109/go.mod h1:fvRvl7ajggZYKHgHokVT0O5uQsAj7ZVAhK6PoQYgga0=
 github.com/migadu/go-managesieve v0.1.4 h1:Gd+Q8kjlAElaHJamHwLFNcHlsNaHBtsv6D1fNjIwgL0=
 github.com/migadu/go-managesieve v0.1.4/go.mod h1:E38XgVuCDYRSNz/9ku4Sc7CvVDmJ8FLqGc1udcxP9SE=
 github.com/migadu/go-message v0.0.0-20261115010257-aa2abe055119 h1:5wZ36W5frh1ZaSuIIvw2Afyr8mNT4mfGcGSeAgSXAIQ=
@@ -245,6 +247,10 @@ github.com/migadu/go-sieve v1.4.5-0.20261115204523-f4c295567d2b h1:1bGjz45yNmGMS
 github.com/migadu/go-sieve v1.4.5-0.20261115204523-f4c295567d2b/go.mod h1:xHAx5kMQ5hw/YJziHobNfLDpMK4jjxMJ5sZAHi3uFr8=
 github.com/migadu/go-sieve v1.4.5-0.20261115205127-6ac6c248303d h1:mrvmaaFJ1Pfv6wLEKGAdMFkO+/Y4dw2nG9GdTdUjKO8=
 github.com/migadu/go-sieve v1.4.5-0.20261115205127-6ac6c248303d/go.mod h1:xHAx5kMQ5hw/YJziHobNfLDpMK4jjxMJ5sZAHi3uFr8=
+github.com/migadu/go-sieve v1.4.5-0.20261115215545-bd9d8f5f84af h1:gTUBGljj0+Df2ZMIH3jhSGJHN+lrhsbwLPrctcn903k=
+github.com/migadu/go-sieve v1.4.5-0.20261115215545-bd9d8f5f84af/go.mod h1:xHAx5kMQ5hw/YJziHobNfLDpMK4jjxMJ5sZAHi3uFr8=
+github.com/migadu/go-sieve v1.4.5-0.20261115220842-1474bec4fdc5 h1:3PlopwfHFsuAyguYAHcVybZjqc3tiPTCLLQ/xSsLgt8=
+github.com/migadu/go-sieve v1.4.5-0.20261115220842-1474bec4fdc5/go.mod h1:xHAx5kMQ5hw/YJziHobNfLDpMK4jjxMJ5sZAHi3uFr8=
 github.com/migadu/go-smtp v0.0.0-20261115213624-e2128ee885bd h1:vbj0EnLbR3uKLN7WR7bFEZqTKzKnzZ347mU3dDkeTwA=
 github.com/migadu/go-smtp v0.0.0-20261115213624-e2128ee885bd/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/moby/docker-image-spec v1.3.1 h1:jMKff3w6PgbfSa69GfNg+zN/XLhfXJGnEx3Nl2EsFP0=
