@@ -1531,7 +1531,11 @@ func (i *Importer) scanMaildir() error {
 			// not folders: they are read through a link (os.ReadDir, hashFile below), and
 			// a message that cannot be read is refused by path.
 			if info.Mode()&os.ModeSymlink != 0 {
-				if !isMaildirMessageDir(info.Name()) && !isMaildirMessageDir(filepath.Base(filepath.Dir(walked))) {
+				parent := filepath.Dir(walked)
+				// The root itself may be named cur, new or tmp; only a message
+				// directory below it makes this entry a message rather than a folder.
+				inMessageDir := parent != walkRoot && isMaildirMessageDir(filepath.Base(parent))
+				if !isMaildirMessageDir(info.Name()) && !inMessageDir {
 					if target, statErr := os.Stat(walked); statErr != nil {
 						logger.Warn("Skipping maildir entry: it is a symbolic link whose target cannot be read", "path", path, "error", statErr)
 					} else if target.IsDir() {

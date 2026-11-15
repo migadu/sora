@@ -127,3 +127,32 @@ func scanMaildirWarnings(t *testing.T, importer *Importer) string {
 	require.NoError(t, err)
 	return logs.String()
 }
+
+// A Maildir root can itself be named cur, new or tmp. Its direct children are
+// folders, not message files merely because the root has one of those names.
+func TestScanMaildirWarnsAboutLinkedFoldersBelowMessageNamedRoot(t *testing.T) {
+	const inboxName = "1700000001.M1P1.host:2,S"
+	for _, rootName := range []string{"cur", "new", "tmp"} {
+		for _, dangling := range []bool{false, true} {
+			name := rootName + "/existing"
+			if dangling {
+				name = rootName + "/dangling"
+			}
+			t.Run(name, func(t *testing.T) {
+				original := newMaildirWith(t, map[string][]byte{inboxName: cachedSizeMessage("One", 100)})
+				root := filepath.Join(t.TempDir(), rootName)
+				require.NoError(t, os.Rename(original, root))
+				target := filepath.Join(t.TempDir(), "unmounted", ".Archive")
+				if !dangling {
+					target = newMaildirWith(t, map[string][]byte{inboxName: cachedSizeMessage("Archived", 100)})
+				}
+				link := filepath.Join(root, ".Archive")
+				require.NoError(t, os.Symlink(target, link))
+				importer := newTestModeImporter(t, root, newMockResilientDatabase(), ImporterOptions{})
+				logs := scanMaildirWarnings(t, importer)
+				assert.Contains(t, logs, link, "the root's name hid its skipped folder")
+				assert.Equal(t, map[string]string{filepath.Join(root, "cur", inboxName): "INBOX"}, scannedMessages(t, importer))
+			})
+		}
+	}
+}
