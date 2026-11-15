@@ -121,7 +121,8 @@ Sora starts in this order. A failure in any step ends the process with status 1,
       `[server.remote_lookup] lookup_local_users = true`). Step 3 has checked that what it needs is
       configured. A node with an `imap`, `pop3` or `lmtp` server and the default `[uploader] path`
       then checks that the old default spool, `/tmp/sora/uploads`, holds no staged body
-      ([What a restart loses and keeps](#5-what-a-restart-loses-and-keeps)).
+      in its filesystem namespace. Migrate the host's old spool before first starting the new
+      `PrivateTmp` unit ([What a restart loses and keeps](#5-what-a-restart-loses-and-keeps)).
    3. **S3**, when needed: the client is set up with `[s3] endpoint` and `bucket`. Without
       `access_key` and `secret_key` the AWS default credential chain must supply them. Sora does not
       contact S3 here and does not create the bucket. With `[s3] encrypt = true` the encryption key
@@ -189,7 +190,7 @@ show nothing on standard error: look in the log file or in syslog.
 | `Fatal error` with operation `initialize resilient database` | No write host reachable, or migrations failed. The line before it says why. | See [Database migrations](#10-database-migrations) and [DATABASE.md](DATABASE.md). |
 | `Fatal error` with operation `initialize cache` | `[local_cache] path` cannot be created. | Fix the path or its permissions. |
 | `Fatal error` with operation `create upload worker` | `[uploader] path` cannot be created. | Fix the path or its permissions. |
-| `Invalid configuration` with field `uploader path` and `the previous default [uploader] path, still holds staged bodies` | `[uploader] path` is the default, and `/tmp/sora/uploads`, the default of earlier releases, holds bodies not yet in S3 (step 9.2). | Set `[uploader] path = "/tmp/sora/uploads"` until they are uploaded, or move the directory ([What a restart loses and keeps](#5-what-a-restart-loses-and-keeps)). |
+| `Invalid configuration` with field `uploader path` and `the previous default [uploader] path, still holds staged bodies` | `[uploader] path` is the default, and the process can see staged bodies in the old `/tmp/sora/uploads` (step 9.2). A private `/tmp` can hide the host's old spool. | Drain or migrate the old spool before changing the unit ([What a restart loses and keeps](#5-what-a-restart-loses-and-keeps)). |
 | `Fatal error` with operation `initialize TLS manager` | Certificate files unreadable, or a Let's Encrypt setting is missing. | See [TLS.md](TLS.md). |
 | `Fatal error` with operation `server operation` | A listener could not start or failed later, for example `address already in use`. | Free the port, or check privileges for ports below 1024. |
 
@@ -411,8 +412,8 @@ Sora runs as, on a disk that survives reboots, or set the paths elsewhere
 ([What Sora writes to local disk](#6-what-sora-writes-to-local-disk)). Never put `[uploader] path`
 on `tmpfs` or under a `/tmp` that is cleared at boot.
 
-Earlier releases defaulted all three paths to `/tmp/sora`. Nothing defaults to it any more. Sora
-only looks at the old spool at startup: a node with an `imap`, `pop3` or `lmtp` server whose
+Earlier releases defaulted all three paths to `/tmp/sora`. Nothing defaults to it any more. At
+storage startup Sora checks the old spool in its filesystem namespace: a node with an `imap`, `pop3` or `lmtp` server whose
 `[uploader] path` is the default refuses to start while `/tmp/sora/uploads` still holds staged
 bodies, because the new default would never upload them. It logs `Invalid configuration` for the
 field `uploader path`, with an error that begins
@@ -421,6 +422,15 @@ of them, and exits with status 1. Either set `[uploader] path = "/tmp/sora/uploa
 `sora-admin uploader status` shows nothing pending and then remove it, or stop Sora and move that
 directory to `/var/spool/sora/uploads`. `sora-admin uploader resolve` refuses to run in the same
 case.
+
+Check the host's old spool before the first start with the new systemd unit. Its
+[`PrivateTmp=true`](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#PrivateTmp=)
+gives Sora a different `/tmp`, so the startup check cannot see the host's
+`/tmp/sora/uploads`. Drain that spool using the old service and configuration before replacing
+the unit, or stop the old service and move the preserved host spool to the durable path before
+starting the new one. Merely setting the old path in the new private namespace does not expose
+the host's files. If the old service itself stored bodies in a private `/tmp`, drain its uploads
+before stopping it: systemd removes that temporary directory when the service stops.
 
 ---
 
