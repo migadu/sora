@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -151,5 +153,110 @@ func TestDATAWithoutAcceptedRecipientIsAnsweredByTheProxy(t *testing.T) {
 	want := []string{"MAIL FROM:<first@example.com>", "MAIL FROM:<second@example.com>", "MAIL FROM:<second@example.com>"}
 	if got := aMails(); !slices.Equal(got, want) {
 		t.Errorf("A received %q, want %q", got, want)
+	}
+}
+
+// hangUpBackend is an LMTP backend that takes every envelope and message and, after the
+// end-of-data reply of each message, writes notice ("" for none) and closes the
+// connection, standing in for a backend whose idle timeout passed while the proxy held
+// it. It records each MAIL with the number of its connection.
+func hangUpBackend(t *testing.T, notice string) (addr string, mails func() []string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	var mu sync.Mutex
+	var got []string
+	serve := func(conn net.Conn, id int) {
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(10 * time.Second))
+		io.WriteString(conn, "220 backend ready\r\n")
+		r := bufio.NewReader(conn)
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				return
+			}
+			line = strings.TrimRight(line, "\r\n")
+			switch verb, _, _ := strings.Cut(strings.ToUpper(line), " "); verb {
+			case "LHLO":
+				io.WriteString(conn, "250-backend\r\n250 PIPELINING\r\n")
+			case "MAIL":
+				mu.Lock()
+				got = append(got, fmt.Sprintf("#%d %s", id, line))
+				mu.Unlock()
+				io.WriteString(conn, "250 2.1.0 Ok\r\n")
+			case "DATA":
+				io.WriteString(conn, "354 Go ahead\r\n")
+				for {
+					body, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if body == ".\r\n" {
+						break
+					}
+				}
+				io.WriteString(conn, fmt.Sprintf("250 2.0.0 Delivered on #%d\r\n", id))
+				if notice != "" {
+					io.WriteString(conn, notice+"\r\n")
+				}
+				return
+			default:
+				io.WriteString(conn, "250 2.0.0 Ok\r\n")
+			}
+		}
+	}
+	go func() {
+		for id := 1; ; id++ {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go serve(conn, id)
+		}
+	}()
+	return ln.Addr().String(), func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), got...)
+	}
+}
+
+// A backend held from an earlier transaction may have closed the connection since, with
+// or without a 421 notice the proxy has not read. The proxy learns it when it sends that
+// backend the next transaction's MAIL, with its first recipient, and connects again: the
+// MTA's MAIL is the proxy's 250 and the message is delivered on the new connection. A
+// notice the backend wrote before closing is read as its answer to that MAIL and is
+// never relayed to the MTA.
+func TestHeldBackendGoneBetweenTransactionsIsReconnected(t *testing.T) {
+	for name, notice := range map[string]string{
+		"closed":     "",
+		"421 notice": "421 4.4.2 Idle timeout, closing connection",
+	} {
+		t.Run(name, func(t *testing.T) {
+			addr, mails := hangUpBackend(t, notice)
+			send := startSizeForwardingSession(t, addr)
+			for _, step := range []clientStep{
+				{"MAIL FROM:<first@example.com>", "250 "},
+				{"RCPT TO:<user@example.com>", "250 "},
+				{"DATA", "354 "},
+				{"Subject: first\r\n\r\nbody\r\n.", "250 2.0.0 Delivered on #1"},
+				{"MAIL FROM:<second@example.com>", "250 2.1.0 "},
+				{"RCPT TO:<user@example.com>", "250 "},
+				{"DATA", "354 "},
+				{"Subject: second\r\n\r\nbody\r\n.", "250 2.0.0 Delivered on #2"},
+			} {
+				if got := send(step.cmd); !strings.HasPrefix(got, step.want) {
+					t.Fatalf("%q: %q, want %q", step.cmd, got, step.want)
+				}
+			}
+			want := []string{"#1 MAIL FROM:<first@example.com>", "#2 MAIL FROM:<second@example.com>"}
+			if got := mails(); !slices.Equal(got, want) {
+				t.Errorf("backend received %q, want %q", got, want)
+			}
+		})
 	}
 }
