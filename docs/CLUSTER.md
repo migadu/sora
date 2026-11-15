@@ -331,12 +331,15 @@ port 143 and another on port 993. IMAP failures never count on a POP3 proxy.
 | State | What is shared | Key |
 |---|---|---|
 | Tier 2 IP blocks | When an address reaches `max_attempts_per_ip`, its block and the time it ends go to every listener of the protocol. Each refuses logins from the address until that time. | `sync_blocks` |
-| Tier 2 failure counts and progressive delays | Each failure from an address whose count has reached `delay_start_threshold` sends the count and the current wait. A received count only raises the listener's own and never lowers it, so failures spread over several nodes count towards one `max_attempts_per_ip`. Counts below `delay_start_threshold` stay on the listener. | `sync_failure_counts` |
+| Tier 2 failure counts and progressive delays | Each failure from an address whose count has reached `delay_start_threshold` sends the count and the current wait. A received count only raises the listener's own and never lowers it. Counts below `delay_start_threshold` stay on the listener. | `sync_failure_counts` |
 | Name statistics | Every failure of a name, and the success that clears its failures. | always, while `enabled` |
 | Tier 1 (IP and name) blocks | Not shared: they stay on the listener that set them. | none |
 
 Details:
 
+- Shared failure counts merge by maximum. If two listeners each increment a count from 5 to 6,
+  both keep 6 after sharing their events. Simultaneous failures can therefore outnumber the count
+  used for progressive delays and blocking.
 - Each listener applies what it receives under its own `auth_rate_limit`: an address in its
   `exempt_networks` is neither blocked nor counted, and a received wait is capped at its `max_delay`.
   A received block keeps the end time the blocking listener set.
