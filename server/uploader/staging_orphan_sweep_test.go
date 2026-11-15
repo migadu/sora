@@ -173,12 +173,12 @@ func TestOrphanSweepDoesNotSubtractAFileThisRunNeverCounted(t *testing.T) {
 	}
 }
 
-// A refresh that cannot measure the backlog does not re-base the count, so an orphan
-// staged before it is still counted, and sweeping it must take its bytes out. Were the
-// sweep's bookkeeping dropped when a refresh begins rather than when one re-bases,
-// every orphan swept during a run of failing refreshes (a cancelled or duplicate
-// delivery leaves one) would stay counted until a refresh succeeds, and the guard
-// would refuse deliveries into an emptying spool.
+// A refresh that cannot measure the backlog leaves the count alone, so an orphan
+// staged before it is still counted as it is on disk, and sweeping it must take its
+// bytes out. Were a failed refresh to drop the orphan's path from onDisk, every orphan
+// swept during a run of failing refreshes (a cancelled or duplicate delivery leaves
+// one) would stay counted until a refresh succeeds, and the guard would refuse
+// deliveries into an emptying spool.
 func TestOrphanSweepSubtractsAnOrphanAFailedRefreshLeftCounted(t *testing.T) {
 	w, rdb, _, _, _ := setupTestWorker(t)
 	w.maxStagingSize = 1000
