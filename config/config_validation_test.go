@@ -364,6 +364,20 @@ func TestWarnTLSVerifyWithoutTLS(t *testing.T) {
 			}
 		})
 	}
+	// The metrics endpoint is plain HTTP with or without tls = true (#1326): one
+	// warning names tls_verify, and it does not send the operator to set tls.
+	for _, withTLS := range []bool{false, true} {
+		cfg := ServerConfig{Type: "metrics", Name: "listener", TLS: withTLS, TLSVerify: true}
+		var named []string
+		cfg.WarnUnusedConfigOptions(func(format string, args ...any) {
+			if w := fmt.Sprintf(format, args...); strings.Contains(w, "'tls_verify'") {
+				named = append(named, w)
+			}
+		})
+		if len(named) != 1 || strings.Contains(named[0], "without 'tls = true'") {
+			t.Fatalf("metrics with tls = %v: want one warning naming tls_verify as not applied, got %v", withTLS, named)
+		}
+	}
 }
 
 // allowed_hosts matches IP addresses and CIDRs only; a host name matches no client.
