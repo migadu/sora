@@ -3,12 +3,14 @@
 package imap_test
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	imap "github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapclient"
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -146,5 +148,52 @@ func TestIMAP_EnvelopeAbsentDateIsNIL(t *testing.T) {
 		require.Len(t, untagged, 1, "%s: %v", name, untagged)
 		require.Contains(t, untagged[0], `(ENVELOPE (NIL "no date" `,
 			"%s: the date member must stay NIL: %s", name, untagged[0])
+	}
+}
+
+// TestIMAP_EnvelopeDateKeepsHeaderZone: the ENVELOPE date names the day, time of day and
+// zone the Date: header was written in, whatever zone the server runs in. RFC 9051 section
+// 7.5.2: the envelope "is computed by the server by parsing the [RFC5322] header into the
+// component parts", and the section 8 example gives the date member as the header's own
+// "Wed, 17 Jul 1996 02:23:25 -0700 (PDT)". Before the fix the date was the stored instant
+// in the server's zone: "Tue, 31 Dec 2024 20:00:00 -0800" came out as
+// "Wed, 01 Jan 2025 04:00:00 +0000" on a server in UTC.
+func TestIMAP_EnvelopeDateKeepsHeaderZone(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	rc := dialRaw(t, server.Address)
+	defer rc.conn.Close()
+	rc.login(account)
+
+	// Date: header -> the envelope date member. At most one of these zones can be the
+	// server's, so a date rendered in the server's zone fails at least two of them.
+	dates := []struct{ header, envelope string }{
+		{"Tue, 31 Dec 2024 20:00:00 -0800", `"Tue, 31 Dec 2024 20:00:00 -0800"`},
+		{"Wed, 1 Jan 2025 05:45:00 +0545", `"Wed, 01 Jan 2025 05:45:00 +0545"`},
+		{"Wed, 01 Jan 2025 00:00:00 +0000", `"Wed, 01 Jan 2025 00:00:00 +0000"`},
+	}
+	for i, d := range dates {
+		rc.append(fmt.Sprintf("a%d", i), "INBOX", "From: alice@example.com\r\nTo: bob@example.com\r\n"+
+			fmt.Sprintf("Subject: zone %d\r\nDate: %s\r\n\r\nbody\r\n", i, d.header))
+	}
+	_, tagged := rc.cmd("c", "CREATE Copied")
+	require.Contains(t, tagged, "OK")
+	_, tagged = rc.cmd("s", "SELECT INBOX")
+	require.Contains(t, tagged, "OK")
+	_, tagged = rc.cmd("cp", "COPY 1:* Copied")
+	require.Contains(t, tagged, "OK")
+
+	for _, name := range []string{"INBOX", "Copied"} {
+		_, tagged := rc.cmd("s", "SELECT "+name)
+		require.Contains(t, tagged, "OK")
+		untagged, tagged := rc.cmd("f", "FETCH 1:* (ENVELOPE)")
+		require.Contains(t, tagged, "OK")
+		require.Len(t, untagged, len(dates), "%s: one FETCH response per message: %v", name, untagged)
+		for i, d := range dates {
+			assert.Contains(t, untagged[i], "(ENVELOPE ("+d.envelope+" ",
+				"%s: Date: %s must be reported in its own zone: %s", name, d.header, untagged[i])
+		}
 	}
 }
