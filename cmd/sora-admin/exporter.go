@@ -23,7 +23,6 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
-	"github.com/migadu/sora/pkg/sqlitefile"
 	"github.com/migadu/sora/server"
 	_ "modernc.org/sqlite"
 )
@@ -83,22 +82,13 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	}
 
 	// Use the shared SQLite database in the maildir path
-	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
+	dbPath := filepath.Join(maildirPath, maildirCacheName)
 	logger.Info("Using maildir database", "path", dbPath)
 
-	dsn, err := sqlitefile.DSN(dbPath, maildirCacheParams)
+	db, err := openMaildirCache(maildirPath)
 	if err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
-	}
-
-	// Configure connection pool for better concurrency
-	// SQLite works best with a single writer connection
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
 
 	// Create the same table structure as importer uses
 	// s3_uploaded tracks whether the message has been successfully uploaded to S3
