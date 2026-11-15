@@ -1,6 +1,8 @@
 package imap
 
 import (
+	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/migadu/go-imap"
@@ -321,5 +323,266 @@ func TestOwnMessages(t *testing.T) {
 	watch.selectedMailboxID = 8 // the client selected another mailbox
 	if uids, _ := s.ownMessages(watch); len(uids) != 0 || watch.own.mailboxID != 8 {
 		t.Errorf("after a mailbox switch ownMessages = %q for mailbox %d, want none for mailbox 8", uids.String(), watch.own.mailboxID)
+	}
+}
+
+// treeEventStrings renders tree events for comparison: "+name" created,
+// "-name" deleted, "old>new" renamed, "name sub=true" subscription changed.
+func treeEventStrings(events []notifyTreeEvent) []string {
+	var out []string
+	for _, ev := range events {
+		switch {
+		case ev.deleted:
+			out = append(out, "-"+ev.name)
+		case ev.oldName != "":
+			out = append(out, ev.oldName+">"+ev.name)
+		case ev.event == imap.NotifyEventSubscriptionChange:
+			out = append(out, fmt.Sprintf("%s sub=%v", ev.name, ev.entry.subscribed))
+		default:
+			out = append(out, "+"+ev.name)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// TestNotifyOwnTreeChanges: a tree change the client made itself, applied to
+// the previous snapshot, is not reported by the diff with the next one (RFC
+// 5465 section 5), while someone else's change before or after it still is.
+func TestNotifyOwnTreeChanges(t *testing.T) {
+	type snap = map[int64]notifySnapshotEntry
+	base := func() snap {
+		return snap{
+			1: {name: "INBOX", subscribed: true},
+			2: {name: "Old"},
+			3: {name: "Old/Kid"},
+			4: {name: "Gone"},
+			5: {name: "Subbed", subscribed: true},
+		}
+	}
+	with := func(changes func(s snap)) snap {
+		s := base()
+		changes(s)
+		return s
+	}
+
+	tests := []struct {
+		name string
+		own  func(*notifyWatch)
+		cur  snap
+		want []string
+	}{
+		{
+			name: "CREATE",
+			own:  func(w *notifyWatch) { w.ownCreated("Projects") },
+			cur:  with(func(s snap) { s[10] = notifySnapshotEntry{name: "Projects"} }),
+		},
+		{
+			name: "CREATE with a superior name it creates",
+			own:  func(w *notifyWatch) { w.ownCreated("Parent/Child") },
+			cur: with(func(s snap) {
+				s[10] = notifySnapshotEntry{name: "Parent"}
+				s[11] = notifySnapshotEntry{name: "Parent/Child"}
+			}),
+		},
+		{
+			name: "CREATE under an existing mailbox",
+			own:  func(w *notifyWatch) { w.ownCreated("Old/New") },
+			cur:  with(func(s snap) { s[10] = notifySnapshotEntry{name: "Old/New"} }),
+		},
+		{
+			name: "CREATE and SUBSCRIBE",
+			own: func(w *notifyWatch) {
+				w.ownCreated("Projects")
+				w.ownSubscribed("Projects", true)
+			},
+			cur: with(func(s snap) { s[10] = notifySnapshotEntry{name: "Projects", subscribed: true} }),
+		},
+		{
+			name: "CREATE, then someone else deletes it",
+			own:  func(w *notifyWatch) { w.ownCreated("Projects") },
+			cur:  base(),
+			want: []string{"-Projects"},
+		},
+		{
+			name: "CREATE and DELETE",
+			own: func(w *notifyWatch) {
+				w.ownCreated("Projects")
+				w.ownDeleted("Projects")
+			},
+			cur: base(),
+		},
+		{
+			name: "DELETE",
+			own:  func(w *notifyWatch) { w.ownDeleted("gone") },
+			cur:  with(func(s snap) { delete(s, 4) }),
+		},
+		{
+			name: "DELETE, then someone else creates it again",
+			own:  func(w *notifyWatch) { w.ownDeleted("Gone") },
+			cur: with(func(s snap) {
+				delete(s, 4)
+				s[10] = notifySnapshotEntry{name: "Gone"}
+			}),
+			want: []string{"+Gone"},
+		},
+		{
+			name: "DELETE and CREATE",
+			own: func(w *notifyWatch) {
+				w.ownDeleted("Gone")
+				w.ownCreated("Gone")
+			},
+			cur: with(func(s snap) {
+				delete(s, 4)
+				s[10] = notifySnapshotEntry{name: "Gone"}
+			}),
+		},
+		{
+			name: "RENAME with a child, creating a superior name",
+			own:  func(w *notifyWatch) { w.ownRenamed("Old", "Attic/Old") },
+			cur: with(func(s snap) {
+				s[2] = notifySnapshotEntry{name: "Attic/Old"}
+				s[3] = notifySnapshotEntry{name: "Attic/Old/Kid"}
+				s[10] = notifySnapshotEntry{name: "Attic"}
+			}),
+		},
+		{
+			name: "RENAME of INBOX creates the new name",
+			own:  func(w *notifyWatch) { w.ownCreated("Saved") },
+			cur:  with(func(s snap) { s[10] = notifySnapshotEntry{name: "Saved"} }),
+		},
+		{
+			name: "SUBSCRIBE and UNSUBSCRIBE",
+			own: func(w *notifyWatch) {
+				w.ownSubscribed("Old", true)
+				w.ownSubscribed("subbed", false)
+			},
+			cur: with(func(s snap) {
+				s[2] = notifySnapshotEntry{name: "Old", subscribed: true}
+				s[5] = notifySnapshotEntry{name: "Subbed"}
+			}),
+		},
+		{
+			name: "someone else's changes next to own ones",
+			own:  func(w *notifyWatch) { w.ownCreated("Projects") },
+			cur: with(func(s snap) {
+				s[10] = notifySnapshotEntry{name: "Projects"}
+				s[11] = notifySnapshotEntry{name: "Marker"}
+				s[2] = notifySnapshotEntry{name: "Older"}
+				s[4] = notifySnapshotEntry{name: "Gone", subscribed: true}
+			}),
+			want: []string{"+Marker", "Gone sub=true", "Old>Older"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			watch := &notifyWatch{snapshot: base()}
+			tc.own(watch)
+			resolveOwnCreated(watch.snapshot, tc.cur)
+			got := treeEventStrings(diffNotifySnapshots(watch.snapshot, tc.cur))
+			want := tc.want
+			slices.Sort(want)
+			if !slices.Equal(got, want) {
+				t.Errorf("events = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestAdvanceNotifySnapshotWaitsForOwnTreeChanges: the diff waits while an
+// own tree change is in flight, or one began after the tick's account
+// snapshot was read, keeping the previous snapshot; then it runs and replaces
+// it.
+func TestAdvanceNotifySnapshotWaitsForOwnTreeChanges(t *testing.T) {
+	s := &IMAPSession{}
+	watch := newTestWatch(imap.NotifyItem{
+		MailboxSpec: imap.NotifyMailboxSpecPersonal,
+		Events:      []imap.NotifyEvent{imap.NotifyEventMailboxName, imap.NotifyEventSubscriptionChange},
+	})
+	prev := map[int64]notifySnapshotEntry{1: {name: "INBOX"}}
+	watch.snapshot = prev
+	cur := map[int64]notifySnapshotEntry{1: {name: "INBOX"}, 2: {name: "New"}}
+
+	if events, _ := s.advanceNotifySnapshot(watch, cur, 0, false); events != nil || len(watch.snapshot) != 1 {
+		t.Errorf("with an own change in flight: events %v and a snapshot of %d, want none and the previous one", events, len(watch.snapshot))
+	}
+	watch.ownTree.gen = 1 // begun since the account snapshot was read
+	if events, _ := s.advanceNotifySnapshot(watch, cur, 0, true); events != nil || len(watch.snapshot) != 1 {
+		t.Errorf("with an own change begun since: events %v and a snapshot of %d, want none and the previous one", events, len(watch.snapshot))
+	}
+	events, stale := s.advanceNotifySnapshot(watch, cur, 1, true)
+	if got := treeEventStrings(events); stale || !slices.Equal(got, []string{"+New"}) || len(watch.snapshot) != 2 {
+		t.Errorf("idle: events %q (stale %v) and a snapshot of %d, want [+New] and the new one", got, stale, len(watch.snapshot))
+	}
+}
+
+// TestOwnStatusChanges: a mailbox whose change from its mark is all the
+// client's own writes gets no STATUS and its mark moves on; one changed by
+// anyone else before or after them, or whose own write is still in flight,
+// is left as it is.
+func TestOwnStatusChanges(t *testing.T) {
+	change := func(id int64, from, polled uint64) notifyStatusChange {
+		return notifyStatusChange{row: db.MailboxStatsRow{MailboxID: id, HighestModSeq: polled}, from: from}
+	}
+	tests := []struct {
+		name     string
+		windows  []db.ModSeqWindow // recorded in order
+		inFlight bool
+		change   notifyStatusChange
+		reported bool
+		mark     uint64 // after the call; 0 for none
+	}{
+		{"own write", []db.ModSeqWindow{{Before: 10, After: 12}}, false, change(1, 10, 12), false, 12},
+		{"own writes in a row", []db.ModSeqWindow{{Before: 10, After: 12}, {Before: 12, After: 15}}, false, change(1, 10, 15), false, 15},
+		{"someone else's change before", []db.ModSeqWindow{{Before: 11, After: 13}}, false, change(1, 10, 13), true, 0},
+		{"someone else's change after", []db.ModSeqWindow{{Before: 10, After: 12}}, false, change(1, 10, 14), true, 0},
+		{"someone else's change between", []db.ModSeqWindow{{Before: 10, After: 12}, {Before: 13, After: 15}}, false, change(1, 10, 15), true, 0},
+		{"no own write", nil, false, change(1, 10, 12), true, 0},
+		{"own write in flight", []db.ModSeqWindow{{Before: 10, After: 12}}, true, change(1, 10, 12), false, 0},
+		{"new mailbox, own writes only", []db.ModSeqWindow{{Before: 0, After: 7}}, false, change(1, 0, 7), false, 7},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &IMAPSession{}
+			watch := &notifyWatch{statusMarks: map[int64]uint64{}}
+			for i, w := range tc.windows {
+				w.MailboxID, w.Measured = 1, true
+				watch.ownStatus.record(&w, uint64(i+1))
+			}
+			if tc.inFlight {
+				watch.ownStatus.writes = map[int64]int{1: 1}
+			}
+			got := s.withoutOwnStatusChanges(watch, []notifyStatusChange{tc.change})
+			if reported := len(got) == 1; reported != tc.reported {
+				t.Errorf("reported = %v, want %v", reported, tc.reported)
+			}
+			if mark := watch.statusMarks[1]; mark != tc.mark {
+				t.Errorf("mark = %d, want %d", mark, tc.mark)
+			}
+		})
+	}
+}
+
+// TestOwnStatusWindowsPruned: a window goes once its mailbox's mark has passed
+// it, or, for a mailbox the watch does not track, once it predates the tick;
+// a window still ahead of its mark, or newer than the tick, stays.
+func TestOwnStatusWindowsPruned(t *testing.T) {
+	s := &IMAPSession{}
+	watch := &notifyWatch{statusMarks: map[int64]uint64{1: 12, 2: 10}}
+	watch.ownStatus = notifyOwnStatus{windows: map[int64]notifyOwnWindow{
+		1: {before: 10, after: 12, seq: 1}, // tracked, passed
+		2: {before: 10, after: 12, seq: 1}, // tracked, ahead of its mark
+		3: {before: 0, after: 5, seq: 1},   // not tracked, before the tick
+		4: {before: 0, after: 5, seq: 3},   // not tracked, begun since
+		5: {before: 0, after: 5, seq: 1},   // not tracked, another write in flight
+	}, writes: map[int64]int{5: 1}}
+	s.pruneOwnStatusWindows(watch, 2)
+	var kept []int64
+	for id := range watch.ownStatus.windows {
+		kept = append(kept, id)
+	}
+	slices.Sort(kept)
+	if !slices.Equal(kept, []int64{2, 4, 5}) {
+		t.Errorf("kept windows of mailboxes %v, want [2 4 5]", kept)
 	}
 }

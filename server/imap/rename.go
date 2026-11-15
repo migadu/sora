@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/migadu/go-imap"
@@ -136,6 +138,9 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 		}
 	}
 
+	own := s.beginOwnTreeChange()
+	defer own.end()
+
 	// RFC 3501 §6.3.5: Renaming INBOX is special — moves messages to the new
 	// mailbox while leaving INBOX intact (empty, same UID validity).
 	if strings.EqualFold(existingName, consts.MailboxInbox) {
@@ -192,7 +197,10 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 			if resolveErr != nil {
 				return s.internalError("failed to resolve S3 owner for INBOX rename: %v", resolveErr)
 			}
-			_, err = s.server.rdb.MoveMessagesWithRetry(ctx, &uids, oldMailbox.ID, newMailbox.ID, AccountID, domain, localpart, s.server.instanceID, nil, nil, nil)
+			writeCtx, ownMessagesDone := s.beginOwnMessages(ctx, newMailbox.ID)
+			var moved map[imap.UID]imap.UID
+			moved, err = s.server.rdb.MoveMessagesWithRetry(writeCtx, &uids, oldMailbox.ID, newMailbox.ID, AccountID, domain, localpart, s.server.instanceID, nil, nil, nil)
+			ownMessagesDone(slices.Collect(maps.Values(moved))...)
 		}
 		if err != nil {
 			return s.internalError("failed to move messages from INBOX to '%s': %v", newName, err)
@@ -201,6 +209,7 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 		s.DebugLog("INBOX renamed (RFC 3501): messages moved to new mailbox, INBOX preserved empty",
 			"new_name", newName)
 		s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
+		own.created(newName)
 
 		// RFC 9051 §6.3.6: RENAME INBOX is still a RENAME as far as the client is
 		// concerned — the SHOULD-send-OLDNAME applies so a rev2 client learns where
@@ -278,6 +287,7 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 
 	s.DebugLog("mailbox renamed", "old_name", existingName, "new_name", newName)
 	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
+	own.renamed(oldMailbox.Name, newName)
 
 	// NOTE: the subscription follows the rename ATOMICALLY inside db.RenameMailbox
 	// (same transaction as the name update), so there is no separate call here — a

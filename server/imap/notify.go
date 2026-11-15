@@ -76,8 +76,8 @@ type notifySnapshotEntry struct {
 // notifyWatch is the per-session NOTIFY state installed by SetNotify. After
 // installation it is only touched by the pump goroutine (the library
 // guarantees NotifyPoll is stopped before SetNotify runs again), except for
-// the pointer swap itself and own, which are guarded by
-// IMAPSession.notifyMutex.
+// the pointer swap itself, snapshot, own, ownStatus and ownTree, which are
+// guarded by IMAPSession.notifyMutex.
 type notifyWatch struct {
 	options *imap.NotifyOptions
 
@@ -98,7 +98,8 @@ type notifyWatch struct {
 	statusMarks map[int64]uint64
 
 	// snapshot is the previous tick's view of the account's mailboxes,
-	// diffed to detect MailboxName and SubscriptionChange events.
+	// diffed to detect MailboxName and SubscriptionChange events, with the
+	// changes the client has made to the tree since applied (ownTree).
 	snapshot map[int64]notifySnapshotEntry
 
 	// selectedMailboxID / nextFetchUID track MessageNew fetch-atts delivery
@@ -112,8 +113,53 @@ type notifyWatch struct {
 	// nextFetchUID (see notifyMaxFetchAttempts).
 	fetchAttempts int
 
-	// own is written by APPEND and MOVE on the command goroutine too.
-	own notifyOwnMessages
+	// own, ownStatus and ownTree are written by commands on the command
+	// goroutine too.
+	own       notifyOwnMessages
+	ownStatus notifyOwnStatus
+	ownTree   notifyOwnTree
+}
+
+// notifyOwnStatus records the messages this connection's own APPEND, COPY and
+// MOVE added to mailboxes other than the selected one. RFC 5465 section 5:
+// "The server SHOULD omit notifying the client if the event is caused by this
+// client." A watched mailbox gets no STATUS when all its change since its mark
+// is the client's own: the window of its own writes (db.ModSeqWindow) starts
+// at the mark and ends at the mod-sequence polled. A change by anyone else,
+// before or after an own write, breaks one of the two.
+type notifyOwnStatus struct {
+	// writes counts per mailbox the own writes into it in flight. One may
+	// have committed before its window is recorded, so the fan-in looks at
+	// that mailbox again on a later tick.
+	writes map[int64]int
+	// windows holds per mailbox the window of its latest own writes, those
+	// that follow each other merged into one.
+	windows map[int64]notifyOwnWindow
+	// seq counts the own writes begun.
+	seq uint64
+}
+
+// notifyOwnWindow spans the mod-sequences from before to after that own
+// writes moved a mailbox across. seq is the latest write's.
+type notifyOwnWindow struct {
+	before, after uint64
+	seq           uint64
+}
+
+// notifyOwnTree tracks this connection's own changes to the mailbox tree,
+// which get no MailboxName or SubscriptionChange LIST (RFC 5465 section 5).
+// When a CREATE, RENAME, DELETE, SUBSCRIBE or UNSUBSCRIBE is done, its change
+// is applied to the watch's snapshot, so the next diff does not see it. A diff
+// is only sound when the account snapshot it reads holds the same own changes
+// as the snapshot it is compared with, so it is put off to a later tick while
+// one is in flight, or when one begins after the tick has started.
+type notifyOwnTree struct {
+	writes int    // in flight
+	gen    uint64 // begun
+	// placeholder is the ID last given a mailbox the client created, which
+	// the next diff replaces by its real one (resolveOwnCreated). They count
+	// down from -1, below any real ID.
+	placeholder int64
 }
 
 // notifyOwnMessages records the messages this connection's own APPEND and
@@ -132,22 +178,74 @@ type notifyOwnMessages struct {
 	uids      imap.UIDSet
 }
 
-// beginOwnMessages is called by APPEND and MOVE before they add messages to
-// mailboxID. When a NOTIFY watch sends MessageNew fetch-atts and mailboxID is
-// the selected mailbox, the write is announced to the watch, and the returned
-// function, which the caller must call once the write is done, records the
-// UIDs it created (none when it failed). Otherwise the function does nothing.
-func (s *IMAPSession) beginOwnMessages(mailboxID int64) (done func(created ...imap.UID)) {
+// beginOwnMessages is called by APPEND, COPY, MOVE and RENAME INBOX before
+// they add messages to mailboxID, and the write runs in the context it
+// returns. When a NOTIFY watch would report the new messages, the write is
+// announced to the watch, and the returned function, which the caller must
+// call once the write is done, records the UIDs it created (none when it
+// failed): for the selected mailbox when the watch sends MessageNew
+// fetch-atts (notifyOwnMessages), for any other when the watch asks for
+// message events in other mailboxes (notifyOwnStatus). Otherwise the function
+// does nothing.
+func (s *IMAPSession) beginOwnMessages(ctx context.Context, mailboxID int64) (context.Context, func(created ...imap.UID)) {
 	s.notifyMutex.Lock()
 	watch := s.notifyWatch
 	s.notifyMutex.Unlock()
-	if watch == nil || watch.selected == nil || watch.selected.MessageNewFetch == nil {
-		return func(...imap.UID) {}
+	if watch == nil {
+		return ctx, func(...imap.UID) {}
 	}
-	if selectedID, ok := s.currentSelectedMailboxID(); !ok || selectedID != mailboxID {
-		return func(...imap.UID) {}
+	if selectedID, ok := s.currentSelectedMailboxID(); ok && selectedID == mailboxID {
+		if watch.selected == nil || watch.selected.MessageNewFetch == nil {
+			return ctx, func(...imap.UID) {}
+		}
+		return ctx, s.beginOwnSelectedMessages(watch, mailboxID)
+	}
+	if !watch.wantsNonSelectedMessageEvents() {
+		return ctx, func(...imap.UID) {}
 	}
 
+	window := &db.ModSeqWindow{MailboxID: mailboxID}
+	s.notifyMutex.Lock()
+	own := &watch.ownStatus
+	if own.writes == nil {
+		own.writes = make(map[int64]int)
+	}
+	own.writes[mailboxID]++
+	own.seq++
+	seq := own.seq
+	s.notifyMutex.Unlock()
+	return db.WithModSeqWindow(ctx, window), func(created ...imap.UID) {
+		s.notifyMutex.Lock()
+		defer s.notifyMutex.Unlock()
+		own.writes[mailboxID]--
+		if own.writes[mailboxID] == 0 {
+			delete(own.writes, mailboxID)
+		}
+		if len(created) > 0 && window.Measured {
+			own.record(window, seq)
+		}
+	}
+}
+
+// record adds the window of a done own write, the seq-th begun, to the
+// mailbox's. The caller holds notifyMutex.
+func (own *notifyOwnStatus) record(window *db.ModSeqWindow, seq uint64) {
+	if own.windows == nil {
+		own.windows = make(map[int64]notifyOwnWindow)
+	}
+	w, ok := own.windows[window.MailboxID]
+	if !ok || w.after != window.Before {
+		// Someone else changed the mailbox since the earlier own writes, if
+		// any, which the fan-in reports whatever their windows say.
+		w.before = window.Before
+	}
+	w.after, w.seq = window.After, seq
+	own.windows[window.MailboxID] = w
+}
+
+// beginOwnSelectedMessages announces an own write into the selected mailbox
+// (see beginOwnMessages).
+func (s *IMAPSession) beginOwnSelectedMessages(watch *notifyWatch, mailboxID int64) (done func(created ...imap.UID)) {
 	s.notifyMutex.Lock()
 	watch.own.writes++
 	s.notifyMutex.Unlock()
@@ -207,6 +305,191 @@ func uidRangeExcept(first, last imap.UID, except imap.UIDSet) imap.UIDSet {
 	return set
 }
 
+// withoutOwnStatusChanges leaves out of changes, the mailboxes the fan-in
+// found changed, each one whose change is all the client's own
+// (notifyOwnStatus), moving its mark past it, and each one an own write is
+// still in flight into, whose mark stays for a later tick.
+func (s *IMAPSession) withoutOwnStatusChanges(watch *notifyWatch, changes []notifyStatusChange) []notifyStatusChange {
+	s.notifyMutex.Lock()
+	defer s.notifyMutex.Unlock()
+	own := &watch.ownStatus
+	reported := changes[:0]
+	for _, c := range changes {
+		id := c.row.MailboxID
+		if own.writes[id] > 0 {
+			continue
+		}
+		if w, ok := own.windows[id]; ok && w.before == c.from && w.after == c.row.HighestModSeq {
+			watch.statusMarks[id] = c.row.HighestModSeq
+			continue
+		}
+		reported = append(reported, c)
+	}
+	return reported
+}
+
+// pruneOwnStatusWindows drops the own write windows the fan-in no longer
+// needs, once it has moved the marks: those the mailbox's mark has passed, and
+// those of a mailbox the watch does not track from writes begun before
+// statusSeq, ownStatus.seq as read before the tick's account snapshot.
+func (s *IMAPSession) pruneOwnStatusWindows(watch *notifyWatch, statusSeq uint64) {
+	s.notifyMutex.Lock()
+	defer s.notifyMutex.Unlock()
+	own := &watch.ownStatus
+	for id, w := range own.windows {
+		mark, tracked := watch.statusMarks[id]
+		if (tracked && w.after <= mark) || (!tracked && w.seq <= statusSeq && own.writes[id] == 0) {
+			delete(own.windows, id)
+		}
+	}
+}
+
+// ownTreeChange is a change to the mailbox tree a command makes, begun by
+// beginOwnTreeChange. Once it has made the change, the command records it,
+// and it calls end when it is done in any case.
+type ownTreeChange struct {
+	s      *IMAPSession
+	watch  *notifyWatch // nil when no NOTIFY watch reports tree events
+	change func(*notifyWatch)
+}
+
+// beginOwnTreeChange is called by CREATE, DELETE, RENAME, SUBSCRIBE and
+// UNSUBSCRIBE before they change the mailbox tree. When a NOTIFY watch
+// reports MailboxName or SubscriptionChange events, the change is announced to
+// it (notifyOwnTree).
+func (s *IMAPSession) beginOwnTreeChange() *ownTreeChange {
+	s.notifyMutex.Lock()
+	defer s.notifyMutex.Unlock()
+	watch := s.notifyWatch
+	if watch == nil || !watch.wantsNonSelectedItems() || !watch.wantsTreeEvents() {
+		return &ownTreeChange{}
+	}
+	watch.ownTree.writes++
+	watch.ownTree.gen++
+	return &ownTreeChange{s: s, watch: watch}
+}
+
+// created records that the command created name, and any of its superior
+// names that did not exist.
+func (c *ownTreeChange) created(name string) {
+	c.change = func(watch *notifyWatch) { watch.ownCreated(name) }
+}
+
+// deleted records that the command deleted name.
+func (c *ownTreeChange) deleted(name string) {
+	c.change = func(watch *notifyWatch) { watch.ownDeleted(name) }
+}
+
+// renamed records that the command renamed oldName, and the mailboxes below
+// it, to newName, creating any of its superior names that did not exist.
+func (c *ownTreeChange) renamed(oldName, newName string) {
+	c.change = func(watch *notifyWatch) { watch.ownRenamed(oldName, newName) }
+}
+
+// subscribed records that the command subscribed or unsubscribed name.
+func (c *ownTreeChange) subscribed(name string, subscribed bool) {
+	c.change = func(watch *notifyWatch) { watch.ownSubscribed(name, subscribed) }
+}
+
+// end applies the recorded change, if any, to the watch's snapshot. It must be
+// called after the session is pinned to the master database for the change,
+// so the pump reads the change back from where it was made.
+func (c *ownTreeChange) end() {
+	if c.watch == nil {
+		return
+	}
+	c.s.notifyMutex.Lock()
+	defer c.s.notifyMutex.Unlock()
+	c.watch.ownTree.writes--
+	if c.change != nil {
+		c.change(c.watch)
+	}
+}
+
+// ownCreated applies to the snapshot the creation of name and of those of its
+// superior names it lacks. A new mailbox's ID is not known here, so it gets a
+// placeholder ID until the next diff (resolveOwnCreated). The caller holds
+// notifyMutex, as for the other own* changes below.
+func (watch *notifyWatch) ownCreated(name string) {
+	delim := string(consts.MailboxDelimiter)
+	levels := strings.Split(name, delim)
+	for i := range levels {
+		level := strings.Join(levels[:i+1], delim)
+		if !watch.snapshotHas(level) {
+			watch.ownTree.placeholder--
+			watch.snapshot[watch.ownTree.placeholder] = notifySnapshotEntry{name: level}
+		}
+	}
+}
+
+// ownDeleted applies to the snapshot the deletion of name.
+func (watch *notifyWatch) ownDeleted(name string) {
+	for id, entry := range watch.snapshot {
+		if strings.EqualFold(entry.name, name) {
+			delete(watch.snapshot, id)
+		}
+	}
+}
+
+// ownRenamed applies to the snapshot the rename of oldName, and of the
+// mailboxes below it, to newName, and the creation of the superior names of
+// newName it lacks.
+func (watch *notifyWatch) ownRenamed(oldName, newName string) {
+	for id, entry := range watch.snapshot {
+		switch {
+		case strings.EqualFold(entry.name, oldName):
+			entry.name = newName
+		case mailboxNameHasPrefix(entry.name, oldName):
+			entry.name = newName + entry.name[len(oldName):]
+		default:
+			continue
+		}
+		watch.snapshot[id] = entry
+	}
+	if i := strings.LastIndex(newName, string(consts.MailboxDelimiter)); i >= 0 {
+		watch.ownCreated(newName[:i])
+	}
+}
+
+// ownSubscribed applies to the snapshot the subscription change of name.
+func (watch *notifyWatch) ownSubscribed(name string, subscribed bool) {
+	for id, entry := range watch.snapshot {
+		if strings.EqualFold(entry.name, name) {
+			entry.subscribed = subscribed
+			watch.snapshot[id] = entry
+		}
+	}
+}
+
+func (watch *notifyWatch) snapshotHas(name string) bool {
+	for _, entry := range watch.snapshot {
+		if strings.EqualFold(entry.name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveOwnCreated gives each mailbox in prev that the client created since
+// prev was read (ownCreated) the ID that a mailbox of its name, new to prev, has
+// in cur, along with cur's entry, so the diff does not report it. One that cur
+// lacks, which someone else has deleted or renamed since, keeps its placeholder
+// ID, so the diff reports it gone.
+func resolveOwnCreated(prev, cur map[int64]notifySnapshotEntry) {
+	for id, own := range prev {
+		if id >= 0 {
+			continue
+		}
+		for curID, entry := range cur {
+			if _, known := prev[curID]; !known && strings.EqualFold(entry.name, own.name) {
+				delete(prev, id)
+				prev[curID] = entry
+				break
+			}
+		}
+	}
+}
+
 // hasSelectedMessageEvents reports whether the watch requests message events
 // for the currently selected mailbox.
 func (watch *notifyWatch) hasSelectedMessageEvents() bool {
@@ -236,6 +519,26 @@ func (watch *notifyWatch) wantsNonSelectedItems() bool {
 		if item.MailboxSpec != imap.NotifyMailboxSpecSelected &&
 			item.MailboxSpec != imap.NotifyMailboxSpecSelectedDelayed {
 			return true
+		}
+	}
+	return false
+}
+
+// wantsNonSelectedMessageEvents reports whether a specifier other than
+// SELECTED/SELECTED-DELAYED requests message events, which the fan-in reports
+// as STATUS.
+func (watch *notifyWatch) wantsNonSelectedMessageEvents() bool {
+	for i := range watch.options.Items {
+		item := &watch.options.Items[i]
+		if item.MailboxSpec == imap.NotifyMailboxSpecSelected ||
+			item.MailboxSpec == imap.NotifyMailboxSpecSelectedDelayed {
+			continue
+		}
+		for _, ev := range item.Events {
+			switch ev {
+			case imap.NotifyEventMessageNew, imap.NotifyEventMessageExpunge, imap.NotifyEventFlagChange:
+				return true
+			}
 		}
 	}
 	return false
@@ -555,6 +858,14 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 		return true, nil
 	}
 
+	// The own changes begun so far. Read before the master pin below: a
+	// command pins the session before it records its change, so a change
+	// recorded by now is read back from the master.
+	s.notifyMutex.Lock()
+	treeGen, treeIdle := watch.ownTree.gen, watch.ownTree.writes == 0
+	statusSeq := watch.ownStatus.seq
+	s.notifyMutex.Unlock()
+
 	readCtx := ctx
 	if s.useMasterDB.Load() {
 		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
@@ -650,36 +961,19 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 	}
 
 	// Account snapshot: powers specifier matching, tree-event diffing, and
-	// the fan-in ID set. Skipped when only the selected mailbox is watched.
-	var (
-		snapshot   map[int64]notifySnapshotEntry
-		matchedIDs []int64
-	)
+	// the fan-in ID set.
 	sharedRoot := s.sharedNamespaceRoot()
-	if watch.wantsNonSelectedItems() {
-		var err error
-		snapshot, matchedIDs, err = s.notifySnapshotAndMatches(readCtx, watch, selectedID)
-		if err != nil {
-			s.WarnLog("NOTIFY: account snapshot failed", "error", err)
-			return false, nil
-		}
-
-		// Guard against a read-pool failover to a more-lagged replica, whose
-		// sharply smaller view would otherwise be diffed into a storm of false
-		// deletions (and, next tick, false creations). Skip the whole tick and
-		// keep the prior snapshot/marks; retry next tick.
-		if watch.snapshot != nil && notifySnapshotLooksStale(watch.snapshot, snapshot) {
-			s.WarnLog("NOTIFY: account snapshot shrank sharply, likely replica lag; skipping tick",
-				"prev", len(watch.snapshot), "cur", len(snapshot))
-			return false, nil
-		}
-
-		if watch.wantsTreeEvents() {
-			if err := s.notifyDiffSnapshots(watch, snapshot, sharedRoot, w); err != nil {
-				return false, err
-			}
-		}
-		watch.snapshot = snapshot
+	snapshot, matchedIDs, err := s.notifySnapshotAndMatches(readCtx, watch, selectedID)
+	if err != nil {
+		s.WarnLog("NOTIFY: account snapshot failed", "error", err)
+		return false, nil
+	}
+	treeEvents, stale := s.advanceNotifySnapshot(watch, snapshot, treeGen, treeIdle)
+	if stale {
+		return false, nil
+	}
+	if err := s.notifyWriteTreeEvents(watch, treeEvents, sharedRoot, w); err != nil {
+		return false, err
 	}
 
 	// Fan-in: detect message events in non-selected matched mailboxes and
@@ -695,6 +989,7 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 		if len(watch.statusMarks) > 0 {
 			watch.statusMarks = make(map[int64]uint64)
 		}
+		s.pruneOwnStatusWindows(watch, statusSeq)
 		return false, nil
 	}
 
@@ -717,16 +1012,16 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 		}
 	}
 
-	var changed []db.MailboxStatsRow
+	var changes []notifyStatusChange
 
 	// Newly-matched mailboxes: a mailbox that enters the set after the watch was
 	// installed represents activity the client has not heard about — a mailbox
 	// created after NOTIFY SET (report it), or a pre-existing one re-entering the
 	// set, e.g. after UNSELECT (a single absolute STATUS is harmless). Report
-	// those with any message activity once (highest_modseq > 0), and mark every
-	// new mailbox at its current modseq so it is not re-reported next tick. This
-	// differs from the SetNotify bootstrap, which seeds marks silently because
-	// pre-watch state is not "new".
+	// those with any message activity once (highest_modseq > 0, measured from a
+	// mark of 0), and mark every new mailbox at its current modseq so it is not
+	// re-reported next tick. This differs from the SetNotify bootstrap, which
+	// seeds marks silently because pre-watch state is not "new".
 	if len(newIDs) > 0 {
 		initRows, initErr := s.server.rdb.GetMailboxesStatsWithRetry(readCtx, newIDs)
 		if initErr != nil {
@@ -735,10 +1030,11 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 		}
 		seen := make(map[int64]struct{}, len(initRows))
 		for _, r := range initRows {
-			watch.statusMarks[r.MailboxID] = r.HighestModSeq
 			seen[r.MailboxID] = struct{}{}
 			if r.HighestModSeq > 0 {
-				changed = append(changed, r)
+				changes = append(changes, notifyStatusChange{row: r}) // marked below
+			} else {
+				watch.statusMarks[r.MailboxID] = 0
 			}
 		}
 		// A mailbox that vanished before its init read still needs a mark so it
@@ -768,17 +1064,22 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 			return false, nil
 		}
 		for _, row := range rows {
-			if row.HighestModSeq > watch.statusMarks[row.MailboxID] {
-				changed = append(changed, row)
+			if mark := watch.statusMarks[row.MailboxID]; row.HighestModSeq > mark {
+				changes = append(changes, notifyStatusChange{row: row, from: mark})
 			}
 		}
 	}
 
-	if len(changed) > notifyMaxChangedMailboxes {
+	// The client's own changes are not reported (RFC 5465 section 5). A new
+	// mailbox left out for an own write in flight stays unmarked, so it is new
+	// again next tick.
+	changes = s.withoutOwnStatusChanges(watch, changes)
+
+	if len(changes) > notifyMaxChangedMailboxes {
 		// RFC 5465 §5.8: tell the client and behave as if NOTIFY NONE was
 		// received. The library treats NotifyPoll returning as the pump
 		// ending; the watch state is cleared here.
-		s.WarnLog("NOTIFY: notification overflow, dropping watch", "changed_mailboxes", len(changed))
+		s.WarnLog("NOTIFY: notification overflow, dropping watch", "changed_mailboxes", len(changes))
 		metrics.IMAPNotifyOverflows.Inc()
 		s.notifyMutex.Lock()
 		s.notifyWatch = nil
@@ -787,7 +1088,8 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 	}
 
 	condStore := w.CondStoreEnabled()
-	for _, row := range changed {
+	for _, c := range changes {
+		row := c.row
 		watch.statusMarks[row.MailboxID] = row.HighestModSeq
 
 		entry, ok := snapshot[row.MailboxID]
@@ -804,7 +1106,15 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 		metrics.IMAPNotifyEventsSent.WithLabelValues("status").Inc()
 	}
 
+	s.pruneOwnStatusWindows(watch, statusSeq)
 	return false, nil
+}
+
+// notifyStatusChange is a mailbox the fan-in found changed: its stats row, and
+// the mark its change is measured from, 0 for a mailbox new to the watch.
+type notifyStatusChange struct {
+	row  db.MailboxStatsRow
+	from uint64
 }
 
 // notifySnapshotAndMatches loads the account's current mailboxes and returns
@@ -909,12 +1219,47 @@ func notifySnapshotLooksStale(prev, cur map[int64]notifySnapshotEntry) bool {
 	return len(prev) >= 4 && len(cur)*2 < len(prev)
 }
 
-// notifyDiffSnapshots emits LIST responses for mailbox-tree changes since the
+// advanceNotifySnapshot replaces the watch's snapshot by cur, the account
+// snapshot of this tick, and returns the mailbox-tree events between the two
+// when the watch reports them. When an own tree change was in flight as the
+// tick began (treeIdle false), or has begun since (ownTree.gen moved past
+// treeGen), it returns none and keeps the snapshot for a later tick: cur may
+// then hold an own change not yet applied to the snapshot, or the other way
+// round (notifyOwnTree). stale reports a cur that looks like a lagged
+// replica's (notifySnapshotLooksStale): the snapshot is kept and the tick
+// skipped.
+func (s *IMAPSession) advanceNotifySnapshot(watch *notifyWatch, cur map[int64]notifySnapshotEntry, treeGen uint64, treeIdle bool) (events []notifyTreeEvent, stale bool) {
+	s.notifyMutex.Lock()
+	defer s.notifyMutex.Unlock()
+	prev := watch.snapshot
+
+	// Guard against a read-pool failover to a more-lagged replica, whose
+	// sharply smaller view would otherwise be diffed into a storm of false
+	// deletions (and, next tick, false creations). Skip the whole tick and
+	// keep the prior snapshot/marks; retry next tick.
+	if prev != nil && notifySnapshotLooksStale(prev, cur) {
+		s.WarnLog("NOTIFY: account snapshot shrank sharply, likely replica lag; skipping tick",
+			"prev", len(prev), "cur", len(cur))
+		return nil, true
+	}
+
+	if watch.wantsTreeEvents() {
+		if !treeIdle || watch.ownTree.gen != treeGen {
+			return nil, false
+		}
+		resolveOwnCreated(prev, cur)
+		events = diffNotifySnapshots(prev, cur)
+	}
+	watch.snapshot = cur
+	return events, false
+}
+
+// notifyWriteTreeEvents emits LIST responses for mailbox-tree changes since the
 // previous tick (RFC 5465 §5.4, §5.5). The first tick after SetNotify diffs
 // against the bootstrap snapshot, so only changes after NOTIFY SET are
 // reported.
-func (s *IMAPSession) notifyDiffSnapshots(watch *notifyWatch, cur map[int64]notifySnapshotEntry, sharedRoot string, w *imapserver.UpdateWriter) error {
-	for _, ev := range diffNotifySnapshots(watch.snapshot, cur) {
+func (s *IMAPSession) notifyWriteTreeEvents(watch *notifyWatch, events []notifyTreeEvent, sharedRoot string, w *imapserver.UpdateWriter) error {
+	for _, ev := range events {
 		if !watch.eventsForMailbox(ev.name, ev.entry.subscribed, sharedRoot)[ev.event] {
 			continue
 		}

@@ -136,6 +136,9 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 		break
 	}
 
+	own := s.beginOwnTreeChange()
+	defer own.end()
+
 	// For nested mailboxes, we need to find the immediate parent
 	if len(parts) > 1 {
 		// Remove empty part if name ends with delimiter (e.g., "folder/" -> ["folder", ""])
@@ -264,6 +267,7 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 		}
 		s.DebugLog("mailbox created with special-use", "mailbox", name, "special_use", specialUse)
 		s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
+		own.created(name)
 		return nil
 	}
 
@@ -283,6 +287,7 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 
 	s.DebugLog("mailbox created", "mailbox", name)
 	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
+	own.created(name)
 	return nil
 }
 

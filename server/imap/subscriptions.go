@@ -43,6 +43,8 @@ func (s *IMAPSession) updateSubscriptionStatus(ctx context.Context, mailboxName 
 		}
 	}
 
+	own := s.beginOwnTreeChange()
+	defer own.end()
 	var err error
 	if subscribe {
 		err = s.server.rdb.SubscribeWithRetry(ctx, AccountID, mailboxName)
@@ -59,6 +61,7 @@ func (s *IMAPSession) updateSubscriptionStatus(ctx context.Context, mailboxName 
 	}
 	s.DebugLog("mailbox subscription changed", "mailbox", mailboxName, "action", action)
 	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
+	own.subscribed(mailboxName, subscribe)
 
 	return nil
 }

@@ -384,8 +384,8 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	// attachment from an undecidable or synthetic BODYSTRUCTURE.
 	appendFlags = db.WithAttachmentKeyword(appendFlags, fullMessageBytes, false)
 
-	ownMessagesDone := s.beginOwnMessages(mailbox.ID)
-	_, messageUID, err := s.server.rdb.InsertMessageWithRetry(ctx,
+	writeCtx, ownMessagesDone := s.beginOwnMessages(ctx, mailbox.ID)
+	_, messageUID, err := s.server.rdb.InsertMessageWithRetry(writeCtx,
 		&db.InsertMessageOptions{
 			AccountID:     destAccountID,
 			MailboxID:     mailbox.ID,

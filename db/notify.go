@@ -183,3 +183,70 @@ func scanMailboxStatsRows(rows interface {
 	}
 	return result, nil
 }
+
+// ModSeqWindow is a mailbox's highest mod-sequence right before and right after
+// one write transaction changed it. Both are read inside that transaction while
+// it holds the mailbox row lock that every write into a mailbox takes before it
+// assigns a mod-sequence there (lockMailboxStats, or the highest_uid UPDATE of
+// InsertMessage and CopyMessages), so every change from Before to After is that
+// transaction's own. The IMAP NOTIFY watch uses it to tell the changes a
+// session made to another mailbox itself from anyone else's (RFC 5465 section
+// 5).
+type ModSeqWindow struct {
+	MailboxID     int64
+	Before, After uint64
+	// Measured is set once After is read. A retried write measures again.
+	Measured bool
+}
+
+type modSeqWindowKey struct{}
+
+// WithModSeqWindow returns a context in which InsertMessage, CopyMessages and
+// MoveMessages measure w for the messages they add to w.MailboxID.
+func WithModSeqWindow(ctx context.Context, w *ModSeqWindow) context.Context {
+	return context.WithValue(ctx, modSeqWindowKey{}, w)
+}
+
+// modSeqWindowFor returns the window ctx asks for mailboxID's changes, or nil.
+func modSeqWindowFor(ctx context.Context, mailboxID int64) *ModSeqWindow {
+	w, _ := ctx.Value(modSeqWindowKey{}).(*ModSeqWindow)
+	if w == nil || w.MailboxID != mailboxID {
+		return nil
+	}
+	return w
+}
+
+// begin reads Before. The caller holds the mailbox row lock. A nil window does
+// nothing.
+func (w *ModSeqWindow) begin(ctx context.Context, tx pgx.Tx) error {
+	if w == nil {
+		return nil
+	}
+	w.Measured = false
+	return w.read(ctx, tx, &w.Before)
+}
+
+// end reads After, once the transaction's last change to the mailbox is made.
+func (w *ModSeqWindow) end(ctx context.Context, tx pgx.Tx) error {
+	if w == nil {
+		return nil
+	}
+	if err := w.read(ctx, tx, &w.After); err != nil {
+		return err
+	}
+	w.Measured = true
+	return nil
+}
+
+// read reads the mailbox's highest_modseq as the NOTIFY fan-in polls it: 0 for
+// a mailbox that has never held a message (no mailbox_stats row).
+func (w *ModSeqWindow) read(ctx context.Context, tx pgx.Tx, into *uint64) error {
+	var modSeq int64
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE((SELECT highest_modseq FROM mailbox_stats WHERE mailbox_id = $1), 0)
+	`, w.MailboxID).Scan(&modSeq); err != nil {
+		return fmt.Errorf("failed to read highest modseq of mailbox %d: %w", w.MailboxID, err)
+	}
+	*into = uint64(modSeq)
+	return nil
+}
