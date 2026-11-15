@@ -2,12 +2,19 @@ package pop3proxy
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/migadu/sora/server"
 )
+
+// errXCLIENTRefused is the backend refusing XCLIENT with -ERR. Its reply was read, so
+// the stream is at a command boundary and the login can go on without the forwarding
+// parameters. Any other error of the exchange leaves the reply unread and the
+// connection unusable: POP3 replies carry no tag, so AUTH would read it as its own.
+var errXCLIENTRefused = errors.New("backend rejected XCLIENT command")
 
 // sendForwardingParametersToBackend sends an XCLIENT command to the backend server
 // with forwarding parameters containing the real client information
@@ -68,10 +75,10 @@ func (s *POP3ProxySession) sendForwardingParametersToBackend(writer *bufio.Write
 
 	response = strings.TrimRight(response, "\r\n")
 
-	if strings.HasPrefix(response, "+OK") {
+	if isPositiveResponse(response) {
 		s.DebugLog("XCLIENT forwarding completed successfully", "params", xclientParams)
-	} else if strings.HasPrefix(response, "-ERR") {
-		return fmt.Errorf("backend rejected XCLIENT command: %s", response)
+	} else if isNegativeResponse(response) {
+		return fmt.Errorf("%w: %s", errXCLIENTRefused, response)
 	} else {
 		// Unexpected response - log but don't fail
 		s.DebugLog("unexpected XCLIENT response from backend", "response", response)

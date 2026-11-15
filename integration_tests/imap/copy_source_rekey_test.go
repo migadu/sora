@@ -146,11 +146,22 @@ func (f *sourceRekeyFixture) rekey(t *testing.T) {
 	require.NoError(t, err, "rekey")
 }
 
-// checkOwnerCopy checks what a COPY that raced with the rekey left behind. Every live row
-// of the owner must be readable: an uploaded row's object exists under its key, any other
-// row has an upload pending. A COPY may instead be refused as one to retry, writing
-// nothing; the retry then succeeds. Either way the owner ends up reading the body.
+// checkOwnerCopy checks what a COPY that raced with the rekey left behind
+// (checkOwnerResult).
 func (f *sourceRekeyFixture) checkOwnerCopy(t *testing.T, copyErr error) {
+	t.Helper()
+	f.checkOwnerResult(t, "COPY", copyErr, func() error {
+		_, err := f.cc.Copy(imap.SeqSetNum(1), f.shared).Wait()
+		return err
+	})
+}
+
+// checkOwnerResult checks what a COPY or MOVE (op) that raced with the rekey left behind.
+// Every live row of the owner must be readable: an uploaded row's object exists under its
+// key, any other row has an upload pending. The operation may instead be refused as one to
+// retry, writing nothing; retry then succeeds. Either way the owner ends up reading the
+// body.
+func (f *sourceRekeyFixture) checkOwnerResult(t *testing.T, op string, opErr error, retry func() error) {
 	t.Helper()
 	ctx := context.Background()
 	pool := f.server.ResilientDB.GetDatabase().GetWritePool()
@@ -169,20 +180,19 @@ func (f *sourceRekeyFixture) checkOwnerCopy(t *testing.T, copyErr error) {
 		key := helpers.NewS3Key(domain, local, hash)
 		if uploaded {
 			assert.NotEmpty(t, f.fake.Keys(key),
-				"COPY committed uploaded=true under %s, but no object exists there (provisioned: %v)", key, f.fake.Keys(f.ownerKey("")))
+				"%s committed uploaded=true under %s, but no object exists there (provisioned: %v)", op, key, f.fake.Keys(f.ownerKey("")))
 		} else {
-			assert.True(t, pending, "COPY committed a row not uploaded under %s with no pending upload", key)
+			assert.True(t, pending, "%s committed a row not uploaded under %s with no pending upload", op, key)
 		}
 	}
 	require.NoError(t, rows.Err())
 
-	if copyErr != nil {
+	if opErr != nil {
 		var imapErr *imap.Error
-		require.ErrorAs(t, copyErr, &imapErr, "COPY failed: %v", copyErr)
-		assert.Equal(t, imap.ResponseCodeInUse, imapErr.Code, "a COPY refused because its source changed must be retryable: %v", copyErr)
-		require.Zero(t, live, "a refused COPY must not leave rows behind")
-		_, err := f.cc.Copy(imap.SeqSetNum(1), f.shared).Wait()
-		require.NoError(t, err, "COPY retried after the rekey")
+		require.ErrorAs(t, opErr, &imapErr, "%s failed: %v", op, opErr)
+		assert.Equal(t, imap.ResponseCodeInUse, imapErr.Code, "a %s refused because its source changed must be retryable: %v", op, opErr)
+		require.Zero(t, live, "a refused %s must not leave rows behind", op)
+		require.NoError(t, retry(), "%s retried after the rekey", op)
 	}
 
 	oc, err := imapclient.DialInsecure(f.server.Address, nil)
@@ -192,7 +202,7 @@ func (f *sourceRekeyFixture) checkOwnerCopy(t *testing.T, copyErr error) {
 	mbox, err := oc.Select(f.shared, nil).Wait()
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), mbox.NumMessages)
-	assert.Contains(t, string(fetchFullBody(t, oc, 1)), f.marker, "owner FETCHes the copied body from S3")
+	assert.Contains(t, string(fetchFullBody(t, oc, 1)), f.marker, "owner FETCHes the body from S3 after the %s", op)
 }
 
 // copyBarrier is a transaction holding a lock that a COPY is made to wait for, so a

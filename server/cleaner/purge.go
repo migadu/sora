@@ -42,9 +42,9 @@ var ErrAccountInService = errors.New("account is in service: it was restored, or
 const (
 	// purgeMaxPasses bounds how often a purge runs the whole pipeline again when the
 	// account still holds rows at the end of a pass: an upload of a body is in flight,
-	// something held a body's lock (a restore, or a cross-account COPY or MOVE of it),
-	// S3 refused a delete, or a delivery that passed its recipient check just before the
-	// account went out of service landed afterwards.
+	// something held a body's lock (a restore or cross-account COPY or MOVE of it, or a
+	// delivery staging its search row), S3 refused a delete, or a delivery that passed its
+	// recipient check just before the account went out of service landed afterwards.
 	purgeMaxPasses = 5
 	// purgeRetryDelay is the pause before the second pass, doubled before each further one.
 	purgeRetryDelay = 250 * time.Millisecond
@@ -164,10 +164,11 @@ type ftsDrainer interface {
 	DeleteFTSRowsForAccountWithRetry(ctx context.Context, accountID int64, limit int) (int64, error)
 }
 
-// drainAccountFTS deletes the account's search vectors in bounded batches, so that the
-// finalize, which deletes them too as a safety net, finds none: an account has one row
-// per distinct body, and one unbounded DELETE in the finalize transaction could be
-// millions of rows.
+// drainAccountFTS deletes the account's search vectors in bounded batches before the
+// finalize, which keeps an account until they are gone: an account has one row per
+// distinct body, and one unbounded DELETE in the finalize transaction could be millions
+// of rows. A batch skips a body being staged by a delivery or COPY right now (its row
+// may wait for the account's), which the next pass takes.
 func drainAccountFTS(ctx context.Context, rdb ftsDrainer, accountID int64) (int64, error) {
 	var total int64
 	for {

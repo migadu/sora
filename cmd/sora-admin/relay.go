@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,6 +42,25 @@ func handleRelayCommand(ctx context.Context) {
 	}
 }
 
+// openExistingRelayQueue opens the relay queue at queuePath without creating any of its
+// directories. NewDiskQueue creates the missing ones, and created by `sudo sora-admin`
+// they would belong to root, where the server, running as its own user, cannot queue:
+// these commands only work on a queue the server has made. A missing directory is
+// reported as the *fs.PathError from os.Stat.
+func openExistingRelayQueue(queuePath string, maxAttempts int) (*relayqueue.DiskQueue, error) {
+	for _, dir := range []string{"failed", "pending", "processing"} {
+		path := filepath.Join(queuePath, dir)
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("%s is not a directory", path)
+		}
+	}
+	return relayqueue.NewDiskQueue(queuePath, maxAttempts, nil)
+}
+
 func handleRelayStats(_ context.Context) {
 	flags := flag.NewFlagSet("relay stats", flag.ExitOnError)
 	flags.Parse(os.Args[3:])
@@ -52,9 +73,16 @@ func handleRelayStats(_ context.Context) {
 		os.Exit(1)
 	}
 
-	// Create queue instance (just for stats, doesn't start worker)
+	// Open the queue just for stats (no worker). On a node whose server has not created it
+	// yet there is nothing to count, so say so, as list does.
 	queuePath := cfg.Relay.GetQueuePath()
-	queue, err := relayqueue.NewDiskQueue(queuePath, cfg.Relay.Queue.MaxAttempts, nil)
+	queue, err := openExistingRelayQueue(queuePath, cfg.Relay.Queue.MaxAttempts)
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) && errors.Is(err, fs.ErrNotExist) {
+		fmt.Printf("Queue directory does not exist: %s\n", pathErr.Path)
+		fmt.Println("The server creates the relay queue when it starts with [relay] configured.")
+		return
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error accessing relay queue: %v\n", err)
 		os.Exit(1)
@@ -288,25 +316,10 @@ func handleRelayDelete(_ context.Context) {
 	queueDir := filepath.Join(cfg.Relay.GetQueuePath(), *queueType)
 
 	if *messageID == "all" {
-		// Delete all messages in the queue
-		entries, err := os.ReadDir(queueDir)
+		deleted, err := deleteAllMessagesInQueueDir(queueDir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error reading queue directory: %v\n", err)
 			os.Exit(1)
-		}
-
-		deleted := 0
-		for _, entry := range entries {
-			name := entry.Name()
-			if filepath.Ext(name) == ".json" || filepath.Ext(name) == ".msg" {
-				if err := os.Remove(filepath.Join(queueDir, name)); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: Could not delete %s: %v\n", name, err)
-				} else {
-					if filepath.Ext(name) == ".json" {
-						deleted++
-					}
-				}
-			}
 		}
 
 		fmt.Printf("Deleted %d messages from %s queue\n", deleted, *queueType)
@@ -333,6 +346,42 @@ func handleRelayDelete(_ context.Context) {
 
 		fmt.Printf("Deleted message %s from %s queue\n", *messageID, *queueType)
 	}
+}
+
+// deleteAllMessagesInQueueDir deletes every committed message (identified by its .json
+// metadata file) from queueDir, removing <id>.json before <id>.msg so a concurrent
+// worker never observes metadata without its body, while leaving uncommitted .held
+// redirects, scratch files, and unpaired .msg files untouched.
+func deleteAllMessagesInQueueDir(queueDir string) (int, error) {
+	entries, err := os.ReadDir(queueDir)
+	if err != nil {
+		return 0, err
+	}
+
+	deleted := 0
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		name := entry.Name()
+		id := strings.TrimSuffix(name, ".json")
+		metadataPath := filepath.Join(queueDir, name)
+		messagePath := filepath.Join(queueDir, id+".msg")
+
+		if err := os.Remove(metadataPath); err != nil {
+			// A worker may have claimed the metadata since ReadDir. Its body can
+			// still be here until the second rename; leave that body to the worker.
+			if !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "Warning: Could not delete %s: %v\n", name, err)
+			}
+			continue
+		}
+		if err := os.Remove(messagePath); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Warning: Could not delete %s: %v\n", id+".msg", err)
+		}
+		deleted++
+	}
+	return deleted, nil
 }
 
 func handleRelayRequeue(_ context.Context) {
@@ -362,23 +411,8 @@ func handleRelayRequeue(_ context.Context) {
 
 	// The queue does the move, so requeue keeps the order its own writers rely on: a
 	// running server's worker picks the message up on its next resync of pending/.
-	// NewDiskQueue creates missing directories, and created by `sudo sora-admin` they
-	// would belong to root, where the server, running as its own user, cannot queue:
-	// requeue only works on a queue the server has made.
 	queuePath := cfg.Relay.GetQueuePath()
-	for _, dir := range []string{"failed", "pending", "processing"} {
-		path := filepath.Join(queuePath, dir)
-		info, err := os.Stat(path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error accessing relay queue: %v\n", err)
-			os.Exit(1)
-		}
-		if !info.IsDir() {
-			fmt.Fprintf(os.Stderr, "Error accessing relay queue: %s is not a directory\n", path)
-			os.Exit(1)
-		}
-	}
-	queue, err := relayqueue.NewDiskQueue(queuePath, cfg.Relay.Queue.MaxAttempts, nil)
+	queue, err := openExistingRelayQueue(queuePath, cfg.Relay.Queue.MaxAttempts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error accessing relay queue: %v\n", err)
 		os.Exit(1)

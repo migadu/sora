@@ -123,7 +123,7 @@ func TestConnectionTrackerCleanup(t *testing.T) {
 		session.clientAddr = clientAddr // must match what close() uses for UnregisterConnection
 
 		// Register connection
-		err := tracker.RegisterConnection(ctx, session.accountID, session.username, "IMAP", clientAddr)
+		err := session.registerConnection() // as postAuthenticationSetup does
 		if err != nil {
 			t.Fatalf("Failed to register connection: %v", err)
 		}
@@ -242,7 +242,7 @@ func TestConnectionTrackerAsyncUnregisterReliability(t *testing.T) {
 		session.clientAddr = clientAddr // must match what close() uses for UnregisterConnection
 
 		// Register connection
-		err := tracker.RegisterConnection(ctx, session.accountID, session.username, "IMAP", clientAddr)
+		err := session.registerConnection() // as postAuthenticationSetup does
 		if err != nil {
 			t.Fatalf("Failed to register connection: %v", err)
 		}
@@ -288,7 +288,7 @@ func TestConnectionTrackerAsyncUnregisterReliability(t *testing.T) {
 		session.clientAddr = clientAddr // must match what close() uses for UnregisterConnection
 
 		// Register connection
-		err := tracker.RegisterConnection(ctx, session.accountID, session.username, "IMAP", clientAddr)
+		err := session.registerConnection() // as postAuthenticationSetup does
 		if err != nil {
 			t.Fatalf("Failed to register connection: %v", err)
 		}
@@ -343,7 +343,7 @@ func TestConnectionTrackerWithRealSession(t *testing.T) {
 		// Register connection (simulating postAuthenticationSetup)
 		clientAddr := "127.0.0.1:54321"
 		session.clientAddr = clientAddr // must match what close() uses for UnregisterConnection
-		err := tracker.RegisterConnection(ctx, session.accountID, session.username, "IMAP", clientAddr)
+		err := session.registerConnection()
 		if err != nil {
 			t.Fatalf("Failed to register connection: %v", err)
 		}

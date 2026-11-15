@@ -166,9 +166,10 @@ func TestCORSMiddlewareVaryOrigin(t *testing.T) {
 // cross-origin reader sees only the CORS-safelisted response-header names
 // (Cache-Control, Content-Language, Content-Length, Content-Type, Expires,
 // Last-Modified, Pragma) and the names listed in Access-Control-Expose-Headers.
-// Retry-After (on the 503 for a body that is not available yet) and Content-Disposition
-// (on /raw) are not safelisted, so without the list a web client sees the 503 but not
-// when to retry.
+// Retry-After (on the 503 for a body that is not available yet), Content-Disposition
+// (on /raw) and WWW-Authenticate (on a 401) are not safelisted, so without the list a
+// web client sees the 503 but not when to retry, or the 401 but not whether its token
+// was refused.
 func TestCORSMiddlewareExposesClientHeaders(t *testing.T) {
 	safelisted := []string{"Cache-Control", "Content-Language", "Content-Length", "Content-Type", "Expires", "Last-Modified", "Pragma"}
 	// readable reports whether a browser hands header name of the response to a
@@ -203,6 +204,10 @@ func TestCORSMiddlewareExposesClientHeaders(t *testing.T) {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				s.writeBodyUnavailable(w, bodyTransient, errors.New("storage timeout"), 1)
 			})
+		}},
+		// The challenge of a 401 (the request carries no token).
+		{"token missing", "WWW-Authenticate", func(s *Server) http.Handler {
+			return s.jwtAuthMiddleware(http.NotFoundHandler())
 		}},
 		// The header handleGetMessageRaw sends with the message.
 		{"raw download", "Content-Disposition", func(s *Server) http.Handler {
