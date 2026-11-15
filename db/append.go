@@ -312,8 +312,9 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 // (mailboxID, newUIDs) has a pending_upload under its own account so the uploader
 // writes the body under that account's S3 path. The local staging file must already
 // exist under FilePath(content_hash, account_id) (the caller hardlinks it for
-// cross-account inserts). instanceID must be the hostname of the server holding the
-// local file so its own worker, not a peer, picks the task up.
+// cross-account inserts). instanceID must be the upload instance id of the node holding
+// the local file (config.InstanceID, the key its uploader leases under), not its mail
+// hostname, so its own worker, not a peer or nobody, picks the task up.
 func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailboxID int64, newUIDs []int64, instanceID string) error {
 	if len(newUIDs) == 0 {
 		return nil
