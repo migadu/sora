@@ -217,6 +217,48 @@ func TestParseDateHeaderInvalid(t *testing.T) {
 	}
 }
 
+// TestParseDateHeaderGMTHourOffset: GMT with a signed hour ("GMT+1", "GMT-05") is no zone of
+// RFC 5322 (section 3.3: zone = (FWS ( "+" / "-" ) 4DIGIT) / obs-zone, and the obs-zone
+// names of section 4.3 are alphabetic), and it has no single meaning: read as an offset,
+// GMT+1 is +0100, read as a POSIX TZ, it is UTC-1. net/mail.ParseDate accepts it, but
+// time.Parse takes the time of day as UTC and only labels it with the offset, so
+// "12:00:00 GMT+1" came out as 13:00:00 +0100 and "12:00:00 GMT-5" as 07:00:00 -0500, a
+// time of day neither reading gives. It is not parsed, like GMT+0200: the sent date is
+// unknown, and RFC 5256 section 2.2 uses the INTERNALDATE instead. A zero hour means
+// Universal Time either way and keeps net/mail's reading.
+func TestParseDateHeaderGMTHourOffset(t *testing.T) {
+	for _, value := range []string{
+		"Tue, 01 Jan 2019 12:00:00 GMT+1",
+		"Tue, 01 Jan 2019 12:00:00 GMT+01",
+		"Tue, 01 Jan 2019 12:00:00 GMT-5",
+		"Tue, 01 Jan 2019 12:00:00 GMT+23",
+		// net/mail reads the digits after GMT as hours, whatever their number.
+		"Tue, 01 Jan 2019 12:00:00 GMT+0001",
+		// A comment after the zone is read as white space.
+		"Tue, 01 Jan 2019 12:00:00 GMT+10 (CET)",
+		"Tue, 01 Jan 19 12:00 GMT-1",
+	} {
+		got, err := ParseDateHeader(value)
+		assert.Error(t, err, "%q: parsed as %v", value, got)
+	}
+
+	wall := time.Date(2019, 1, 1, 12, 0, 0, 0, time.UTC)
+	for _, value := range []string{
+		"Tue, 01 Jan 2019 12:00:00 GMT+0",
+		"Tue, 01 Jan 2019 12:00:00 GMT-0",
+		"Tue, 01 Jan 2019 12:00:00 GMT+00",
+		"Tue, 01 Jan 2019 12:00:00 GMT-0000",
+	} {
+		got, err := ParseDateHeader(value)
+		if !assert.NoError(t, err, "%q", value) {
+			continue
+		}
+		_, offset := got.Zone()
+		assert.True(t, got.Equal(wall), "%q: %v, want %v", value, got, wall)
+		assert.Equal(t, 0, offset, "%q: zone offset of %v", value, got)
+	}
+}
+
 // An alphabetic prefix that is not a whole obs-zone must retain net/mail's
 // behavior, including its accepted GMT extension and permissive suffix handling.
 func TestParseDateHeaderPreservesParserExtensions(t *testing.T) {
