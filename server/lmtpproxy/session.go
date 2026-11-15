@@ -308,6 +308,17 @@ func (s *Session) handleConnection() {
 				s.sendResponse("501 5.5.4 Syntax error in MAIL command (missing FROM)")
 				continue
 			}
+			// Only "<>" is the null reverse-path (RFC 5321 section 4.1.2). One the proxy
+			// cannot read (among them a quoted local part with a space, which the
+			// space-split arguments cut short) is refused with a sora backend's reply,
+			// before the parameters as there, and starts no transaction. Sent on as
+			// "MAIL FROM:<>", it would have the message delivered as a bounce.
+			sender, ok := s.extractAddress(fromParam)
+			if !ok {
+				s.InfoLog("MAIL refused for an unreadable reverse-path", "from", fromParam)
+				s.sendResponse("501 5.5.2 Was expecting MAIL arg syntax of FROM:<address>")
+				continue
+			}
 			// The limit advertised in LHLO is the proxy's own, checked here before the MTA
 			// sends the body (RFC 1870 section 6.1): no recipient is routed yet, so no
 			// backend is the transaction's. A refused MAIL starts no transaction and
@@ -318,8 +329,6 @@ func (s *Session) handleConnection() {
 				s.sendResponse(reply)
 				continue
 			}
-			// Note: extractAddress can return an empty string for a null sender "<>", which is valid.
-			sender := s.extractAddress(fromParam)
 			// A new transaction: whatever became of the previous one is over.
 			s.resetTransaction()
 			s.sender = sender
@@ -345,8 +354,8 @@ func (s *Session) handleConnection() {
 			// toParam may contain the address and additional ESMTP parameters
 			// Example: "<user@example.com> NOTIFY=NEVER ORCPT=rfc822;user@example.com"
 			s.DebugLog("Parsing RCPT TO", "toParam", toParam, "args", fmt.Sprintf("%v", args))
-			to := s.extractAddress(toParam)
-			if to == "" {
+			to, ok := s.extractAddress(toParam)
+			if !ok || to == "" {
 				s.DebugLog("Failed to extract address", "toParam", toParam)
 				s.sendResponse("501 5.1.3 Bad recipient address syntax")
 				continue
@@ -961,12 +970,16 @@ func stripUnsupportedRCPTParameters(command string) string {
 // This handles ESMTP parameters that may follow the address, such as:
 //   - MAIL FROM:<user@example.com> SIZE=1234
 //   - RCPT TO:<user@example.com> NOTIFY=NEVER ORCPT=rfc822;user@example.com
-func (s *Session) extractAddress(param string) string {
+//
+// ok is false when no path can be read. "<>" is read as the empty address: the
+// null reverse-path of MAIL (RFC 5321 section 4.1.2), never a path that could not
+// be read.
+func (s *Session) extractAddress(param string) (address string, ok bool) {
 	// The parameter value might be quoted, so unquote it first.
 	param = server.UnquoteString(strings.TrimSpace(param))
 
 	if len(param) < 2 {
-		return ""
+		return "", false
 	}
 
 	// Handle <address> format with or without additional ESMTP parameters
@@ -975,19 +988,19 @@ func (s *Session) extractAddress(param string) string {
 		endIdx := strings.Index(param, ">")
 		if endIdx > 0 {
 			// Found closing bracket - extract address between < and >
-			return param[1:endIdx]
+			return param[1:endIdx], true
 		}
 		// No closing bracket found - invalid format
-		return ""
+		return "", false
 	}
 
 	// Some clients might not use angle brackets (non-standard but handle it)
 	// In this case, stop at the first space (which would separate address from parameters)
 	if idx := strings.Index(param, " "); idx > 0 {
-		return param[:idx]
+		return param[:idx], true
 	}
 
-	return param
+	return param, true
 }
 
 // handleRecipient looks up the recipient, determines routing, and sets session state.
