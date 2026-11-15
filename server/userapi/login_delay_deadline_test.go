@@ -16,11 +16,12 @@ import (
 )
 
 // A login the rate limit delays waits inside the handler, after net/http has set the
-// request's read and write deadlines (ReadTimeout and WriteTimeout, from when it read the
-// request). A delay as long as them (max_delay and both timeouts are 30 s by default) ran
-// past both: the read deadline cancelled the request and the write deadline dropped the
-// answer, so the client got no response at all, not even for the right password (#1074).
-// The server's timeouts are scaled down here and the delay outlasts them.
+// request's write deadline (WriteTimeout, from when it read the request headers). A delay
+// as long as it (max_delay and WriteTimeout are both 30 s by default) ran past it, and the
+// write deadline dropped the answer, so the client got no response at all, not even for
+// the right password (#1074). The read deadline (ReadTimeout) is no part of it: net/http
+// clears it once the body is read. The server's timeouts are scaled down here, both of
+// them, and the delay outlasts them.
 func TestDelayedLoginIsAnsweredPastTheServerTimeouts(t *testing.T) {
 	origCost := db.BcryptCost
 	db.BcryptCost = bcrypt.MinCost

@@ -10,12 +10,12 @@ import (
 )
 
 // A login the proxy's rate limit delays waits inside the handler (admitLogin), after
-// net/http has set the request's read and write deadlines (ReadTimeout and writeTimeout,
-// from when it read the request). A delay as long as them (max_delay and both timeouts
-// are 30 s by default) ran past both: the read deadline cancelled the request and the
-// write deadline dropped the answer, so the client got no response at all, not even the
-// token of a login with the right password (#1074). The proxy's timeouts are scaled down
-// here and the delay outlasts them.
+// net/http has set the request's write deadline (writeTimeout, from when it read the
+// request headers). A delay as long as it (max_delay and writeTimeout are both 30 s by
+// default) ran past it, and the write deadline dropped the answer, so the client got no
+// response at all, not even the token of a login with the right password (#1074). The
+// read deadline (ReadTimeout) is no part of it: net/http clears it once the body is read.
+// The proxy's timeouts are scaled down here, both of them, and the delay outlasts them.
 func TestUserAPIProxy_DelayedLoginIsAnsweredPastTheServerTimeouts(t *testing.T) {
 	const delay = 400 * time.Millisecond
 	limit := rateLimit()
