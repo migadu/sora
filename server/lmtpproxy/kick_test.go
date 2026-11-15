@@ -26,14 +26,18 @@ import (
 // to other accounts alone.
 func TestKickClosesLMTPSession(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		kick   []string
-		closed bool
+		name       string
+		kick       []string
+		closed     bool
+		limitFirst bool
 	}{
 		{name: "first recipient", kick: []string{"first@example.com"}, closed: true},
 		{name: "last recipient", kick: []string{"second@example.com"}, closed: true},
 		{name: "both recipients", kick: []string{"first@example.com", "second@example.com"}, closed: true},
 		{name: "other account", kick: []string{"other@example.com"}, closed: false},
+		{name: "limited first recipient", kick: []string{"first@example.com"}, closed: true, limitFirst: true},
+		{name: "limited last recipient", kick: []string{"second@example.com"}, closed: true, limitFirst: true},
+		{name: "limited other account", kick: []string{"other@example.com"}, closed: false, limitFirst: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -73,11 +77,26 @@ func TestKickClosesLMTPSession(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { srv.Stop() })
-			tracker := server.NewConnectionTracker("LMTP", "", "", "test-instance", nil, 0, 0, 1000, false)
+			maxPerUser := 0
+			if tc.limitFirst {
+				maxPerUser = 1
+			}
+			tracker := server.NewConnectionTracker("LMTP", "", "", "test-instance", nil, maxPerUser, 0, 1000, false)
 			t.Cleanup(tracker.Stop)
 			srv.SetConnectionTracker(tracker)
 			first := proxy.DeriveAccountIDFromEmail("first@example.com")
 			second := proxy.DeriveAccountIDFromEmail("second@example.com")
+			wantFirst := 0
+			if tc.limitFirst {
+				// Another session owns this count. Backend acceptance still succeeds
+				// when this session cannot count, so it must subscribe to kicks without
+				// decrementing the other session during teardown.
+				if err := tracker.RegisterConnection(context.Background(), first, "first@example.com", "LMTP", "other-client"); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = tracker.UnregisterConnection(context.Background(), first, "LMTP", "other-client") })
+				wantFirst = 1
+			}
 
 			front, accepted := net.Pipe()
 			t.Cleanup(func() { front.Close() })
@@ -135,6 +154,9 @@ func TestKickClosesLMTPSession(t *testing.T) {
 				if !finished() {
 					t.Fatal("session did not finish after QUIT")
 				}
+				if f, s := tracker.GetLocalConnectionCount(first), tracker.GetLocalConnectionCount(second); f != wantFirst || s != 0 {
+					t.Fatalf("counts after QUIT: first=%d second=%d, want %d 0", f, s, wantFirst)
+				}
 				return
 			}
 			// RFC 5321 section 3.8: the server closes the connection on purpose only
@@ -148,9 +170,34 @@ func TestKickClosesLMTPSession(t *testing.T) {
 			if line, err := reader.ReadString('\n'); err == nil {
 				t.Fatalf("after the 421 the client read %q, want the connection closed", line)
 			}
-			if f, s := tracker.GetLocalConnectionCount(first), tracker.GetLocalConnectionCount(second); f != 0 || s != 0 {
-				t.Fatalf("counts after the kick: first=%d second=%d, want 0 0", f, s)
+			if f, s := tracker.GetLocalConnectionCount(first), tracker.GetLocalConnectionCount(second); f != wantFirst || s != 0 {
+				t.Fatalf("counts after the kick: first=%d second=%d, want %d 0", f, s, wantFirst)
 			}
 		})
+	}
+}
+
+func TestKickUnresponsiveClientCancelsSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client, peer := net.Pipe()
+	defer client.Close()
+	defer peer.Close()
+	sess := &Session{ctx: ctx, cancel: cancel, clientConn: client, greeted: true}
+	kick := make(chan struct{})
+	done := make(chan struct{})
+	go func() { defer close(done); sess.watchKick(42, kick) }()
+	close(kick)
+	// The peer never reads the 421. That write must still release the watcher
+	// and cancel the session so existing I/O cancellation can close both transports.
+	select {
+	case <-ctx.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("an unread kick notice prevented session cancellation")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("kick watcher did not exit after session cancellation")
 	}
 }

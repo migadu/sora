@@ -65,12 +65,11 @@ type Session struct {
 	// backend accepts a recipient for (forwardRCPT), on a new or an already held
 	// backend connection; a refused recipient is not registered.
 	// IMPORTANT: s.accountID is overwritten per RCPT; if we only unregister the last one,
-	// earlier recipients would leak connection counts permanently. Each account is
-	// registered at most once per session (a backend reconnect does not register it
-	// again), so close() unregisters each entry exactly once.
-	// Each entry holds the channel the tracker closes when that account is kicked:
-	// a kick of any account the session delivers to ends the session (watchKick).
-	registeredAccountIDs map[int64]<-chan struct{}
+	// earlier recipients would leak connection counts permanently. Every accepted
+	// account subscribes to kicks, even if counting fails after backend acceptance.
+	// Successful counts happen at most once per account; failed counts can retry
+	// without creating another kick watcher. close() releases only successful counts.
+	registeredAccountIDs map[int64]accountRegistration
 	// kickedAccountID is the account whose kick ended the session, 0 if none. It is
 	// set by watchKick and logged by close(), on the session goroutine, which owns
 	// the fields the session logger reads.
@@ -99,6 +98,11 @@ type Session struct {
 	backendSIZE  bool
 }
 
+type accountRegistration struct {
+	kick    <-chan struct{}
+	counted bool
+}
+
 // newSession creates a new LMTP proxy session.
 func newSession(s *Server, conn net.Conn, proxyInfo *server.ProxyProtocolInfo) *Session {
 	sessionCtx, sessionCancel := context.WithCancel(s.ctx)
@@ -121,7 +125,7 @@ func newSession(s *Server, conn net.Conn, proxyInfo *server.ProxyProtocolInfo) *
 		cancel:               sessionCancel,
 		startTime:            time.Now(),
 		proxyInfo:            proxyInfo,
-		registeredAccountIDs: make(map[int64]<-chan struct{}),
+		registeredAccountIDs: make(map[int64]accountRegistration),
 		// Generate the session id once, up front, so every log line carries it.
 		// It's also forwarded to the backend (XCLIENT), logged there as proxy_session.
 		sessionID: idgen.New(),
@@ -1706,8 +1710,11 @@ func (s *Session) close() {
 		// backend connect failed) or was rejected by a limit. Unregistering an
 		// account that was never registered decrements connection counts owned
 		// by the user's OTHER live sessions, eroding per-user limits.
-		for id, kick := range s.registeredAccountIDs {
-			s.server.connTracker.UnregisterSession(id, kick)
+		for id, registration := range s.registeredAccountIDs {
+			s.server.connTracker.UnregisterSession(id, registration.kick)
+			if !registration.counted {
+				continue
+			}
 			// Use cached client address to avoid race with connection close
 			if err := s.server.connTracker.UnregisterConnection(ctx, id, "LMTP", s.clientAddr); err != nil {
 				// Connection tracking is non-critical monitoring data, so log but continue
@@ -1757,22 +1764,24 @@ func (s *Session) registerConnection() error {
 		// the backend accepts and however many backend connections it opens (after a
 		// lost backend the next RCPT TO reconnects and lands here again), and close()
 		// unregisters each account once.
-		if _, ok := s.registeredAccountIDs[s.accountID]; ok {
+		registration, subscribed := s.registeredAccountIDs[s.accountID]
+		if !subscribed {
+			if s.registeredAccountIDs == nil {
+				s.registeredAccountIDs = make(map[int64]accountRegistration)
+			}
+			registration.kick = s.server.connTracker.RegisterSession(s.accountID)
+			s.registeredAccountIDs[s.accountID] = registration
+			go s.watchKick(s.accountID, registration.kick)
+		}
+		if registration.counted {
 			return nil
 		}
 		err := s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "LMTP", s.clientAddr)
 		if err != nil {
 			return err
 		}
-		// Remember which account we registered so close() can unregister the same one,
-		// even if s.accountID later changes due to additional RCPT TOs, and from now
-		// on end the session when that account is kicked.
-		if s.registeredAccountIDs == nil {
-			s.registeredAccountIDs = make(map[int64]<-chan struct{})
-		}
-		kick := s.server.connTracker.RegisterSession(s.accountID)
-		s.registeredAccountIDs[s.accountID] = kick
-		go s.watchKick(s.accountID, kick)
+		registration.counted = true
+		s.registeredAccountIDs[s.accountID] = registration
 		return nil
 	}
 	return nil
