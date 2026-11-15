@@ -21,10 +21,11 @@ const maxFetchSeenEchoEntries = 65536
 // non-nil answer must be released after the response; answered is called only
 // once the response successfully closes.
 //
-// It is called for one message at a time, after its body is loaded and its
-// BINARY sections are decoded, so a FETCH that fails part way at either sets
-// \Seen only on the messages it answered (#1222); one that fails later, in
-// the message's open response, has set it on that message too. Setting it
+// It is called for one message at a time, after its body is loaded, its
+// BINARY sections are decoded and its BODY sections extracted, so a FETCH that
+// fails part way at any of these sets \Seen only on the messages it answered
+// (#1222); one that fails later, in the message's open response (an ENVELOPE
+// it cannot build, a write error), has set it on that message too. Setting it
 // for a whole stream chunk ahead would have to be undone on failure, which
 // would also clear a \Seen another session set, or found already set, in the
 // meantime. The update is one write next to the body load the message needs
