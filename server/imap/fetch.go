@@ -442,6 +442,9 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 	if err := s.loadBodyForSections(ctx, msg, &bodyData, &bodyDataFetched, options); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// Loading and decoding are what fails the command at this message, so its
 	// implicit \Seen (RFC 9051 §6.4.5) is set only now, one message at a time
