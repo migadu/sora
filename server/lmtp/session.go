@@ -676,7 +676,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	mailHeader := mail.Header{Header: messageContent.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
+	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date"))
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
 
@@ -874,7 +874,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				mailHeader = mail.Header{Header: messageContent.Header}
 				subject, _ = mailHeader.Subject()
 				messageID, _ = mailHeader.MessageID()
-				sentDate, _ = mailHeader.Date()
+				sentDate, _ = helpers.ParseDateHeader(mailHeader.Get("Date"))
 				inReplyTo, _ = mailHeader.MsgIDList("In-Reply-To")
 				references, _ = mailHeader.MsgIDList("References")
 				if len(inReplyTo) == 0 {

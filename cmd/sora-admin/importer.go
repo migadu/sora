@@ -1906,7 +1906,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
+	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date"))
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
 
