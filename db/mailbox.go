@@ -1008,7 +1008,7 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 		LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
 		WHERE mb.id = $1
 	`
-	row := d.GetReadPoolWithContext(ctx).QueryRow(ctx, summaryQuery, mailboxID)
+	row := d.readQuerier(ctx).QueryRow(ctx, summaryQuery, mailboxID)
 
 	var s MailboxSummary
 	err = row.Scan(&s.UIDNext, &s.NumMessages, &s.TotalSize, &s.HighestModSeq, &s.UnseenCount)
@@ -1049,7 +1049,7 @@ func (d *Database) GetFirstUnseenSeqNum(ctx context.Context, mailboxID int64) (u
 		WHERE ms.mailbox_id = $1 AND (ms.flags & %d) = 0 AND %s
 		ORDER BY ms.message_id ASC LIMIT 1
 	`, FlagSeen, inMailbox)
-	err := d.GetReadPoolWithContext(ctx).QueryRow(ctx, query, args...).Scan(&firstUnseenUID)
+	err := d.readQuerier(ctx).QueryRow(ctx, query, args...).Scan(&firstUnseenUID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return 0, nil
@@ -1064,7 +1064,7 @@ func (d *Database) GetFirstUnseenSeqNum(ctx context.Context, mailboxID int64) (u
 		args = append(args, int64(view))
 		viewParam = "$3"
 	}
-	err = d.GetReadPoolWithContext(ctx).QueryRow(ctx,
+	err = d.readQuerier(ctx).QueryRow(ctx,
 		`SELECT COUNT(*) + 1 FROM `+seqCountedRows("$1", viewParam, "uid < $2")+` counted`, args...).Scan(&seqNum)
 	if err != nil {
 		return 0, fmt.Errorf("failed to compute sequence number for UID %d: %w", firstUnseenUID, err)
