@@ -1,6 +1,8 @@
 package imap
 
 import (
+	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +12,10 @@ import (
 	"time"
 
 	"github.com/migadu/sora/cache"
+	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server/uploader"
+	"github.com/migadu/sora/storage"
 )
 
 // mockCacheForState is a minimal mock that satisfies cache.GetBasePath()
@@ -49,7 +55,7 @@ func createTestCache(basePath string) (*cache.Cache, error) {
 // TestWarmupStatePersistAndLoad tests the full round-trip:
 // persist state → load state → verify entries match
 func TestWarmupStatePersistAndLoad(t *testing.T) {
-	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+	s, _ := testWarmupStateServer(t, 24*time.Hour)
 
 	// Store some warmup times
 	now := time.Now()
@@ -61,7 +67,7 @@ func TestWarmupStatePersistAndLoad(t *testing.T) {
 	s.persistWarmupState()
 
 	// Verify file was created
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 	if _, err := os.Stat(statePath); os.IsNotExist(err) {
 		t.Fatal("Expected warmup state file to exist after persist")
 	}
@@ -89,7 +95,7 @@ func TestWarmupStatePersistAndLoad(t *testing.T) {
 
 // TestWarmupStatePersistFiltersExpired verifies that expired entries are not persisted
 func TestWarmupStatePersistFiltersExpired(t *testing.T) {
-	s, tmpDir := testWarmupStateServer(t, 1*time.Hour)
+	s, _ := testWarmupStateServer(t, 1*time.Hour)
 
 	now := time.Now()
 	s.lastWarmupTimes.Store(int64(100), now.Add(-30*time.Minute)) // 30m ago — within 1h interval
@@ -115,7 +121,7 @@ func TestWarmupStatePersistFiltersExpired(t *testing.T) {
 	}
 
 	// Verify file was cleaned up
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
 		t.Error("Expected state file to be removed after load")
 	}
@@ -149,9 +155,9 @@ func TestWarmupStateLoadFiltersExpired(t *testing.T) {
 
 // TestWarmupStateCorruptFile verifies that a corrupt file is handled gracefully
 func TestWarmupStateCorruptFile(t *testing.T) {
-	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+	s, _ := testWarmupStateServer(t, 24*time.Hour)
 
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 
 	// Write garbage to the state file
 	err := os.WriteFile(statePath, []byte("this is not valid data\x00\xff\xfe binary garbage\n"), 0644)
@@ -180,9 +186,9 @@ func TestWarmupStateCorruptFile(t *testing.T) {
 
 // TestWarmupStatePartiallyCorruptFile verifies that valid entries before corruption are loaded
 func TestWarmupStatePartiallyCorruptFile(t *testing.T) {
-	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+	s, _ := testWarmupStateServer(t, 24*time.Hour)
 
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 
 	// Write a file with some valid entries followed by garbage
 	now := time.Now()
@@ -237,9 +243,9 @@ func TestWarmupStateMissingFile(t *testing.T) {
 
 // TestWarmupStateEmptyFile verifies that an empty file is handled gracefully
 func TestWarmupStateEmptyFile(t *testing.T) {
-	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+	s, _ := testWarmupStateServer(t, 24*time.Hour)
 
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 	err := os.WriteFile(statePath, []byte(""), 0644)
 	if err != nil {
 		t.Fatalf("Failed to write empty file: %v", err)
@@ -264,9 +270,9 @@ func TestWarmupStateEmptyFile(t *testing.T) {
 
 // TestWarmupStateMalformedLines verifies various malformed line formats
 func TestWarmupStateMalformedLines(t *testing.T) {
-	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+	s, _ := testWarmupStateServer(t, 24*time.Hour)
 
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 	now := time.Now()
 
 	content := fmt.Sprintf(
@@ -323,7 +329,7 @@ func TestWarmupStateAtomicWrite(t *testing.T) {
 
 	s.persistWarmupState()
 
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 
 	// Verify the file exists and has content
 	data, err := os.ReadFile(statePath)
@@ -340,7 +346,7 @@ func TestWarmupStateAtomicWrite(t *testing.T) {
 		t.Fatalf("Failed to read dir: %v", err)
 	}
 	for _, entry := range entries {
-		if entry.Name() != warmupStateFile && entry.Name() != "data" && !strings.HasPrefix(entry.Name(), "cache_index") {
+		if entry.Name() != filepath.Base(statePath) && entry.Name() != "data" && !strings.HasPrefix(entry.Name(), "cache_index") {
 			t.Errorf("Unexpected file in cache dir: %s (possible leaked temp file)", entry.Name())
 		}
 	}
@@ -373,12 +379,12 @@ func TestWarmupStateLoadNilCache(t *testing.T) {
 
 // TestWarmupStatePersistEmpty verifies persist with no entries creates a valid (empty) file
 func TestWarmupStatePersistEmpty(t *testing.T) {
-	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+	s, _ := testWarmupStateServer(t, 24*time.Hour)
 
 	// No entries stored — persist should still create the file
 	s.persistWarmupState()
 
-	statePath := filepath.Join(tmpDir, warmupStateFile)
+	statePath := s.warmupStatePath()
 	data, err := os.ReadFile(statePath)
 	if err != nil {
 		t.Fatalf("Failed to read state file: %v", err)
@@ -437,5 +443,176 @@ func TestWarmupStateTimestampAccuracy(t *testing.T) {
 	// Compare Unix timestamps (our format has second precision)
 	if loaded.Unix() != ts.Unix() {
 		t.Errorf("Timestamp mismatch: stored %d, loaded %d", ts.Unix(), loaded.Unix())
+	}
+}
+
+// TestWarmupStateIsPerServer covers IMAP servers that share one cache, as every
+// type = "imap" server of a process does: each must get its own entries back after a
+// restart, whichever order the servers stop and start in. With one shared file, the
+// server that starts first takes the entries of the server that stopped last, and the
+// others get nothing.
+func TestWarmupStateIsPerServer(t *testing.T) {
+	plain, _ := testWarmupStateServer(t, 24*time.Hour)
+	plain.name = "imap"
+	tls := &IMAPServer{name: "imaps", warmupInterval: 24 * time.Hour, cache: plain.cache, enableWarmup: true}
+
+	warmedAt := time.Now().Add(-time.Hour).Truncate(time.Second)
+	plain.lastWarmupTimes.Store(int64(1), warmedAt)
+	tls.lastWarmupTimes.Store(int64(2), warmedAt)
+
+	// Shutdown: imap stops first, imaps last.
+	plain.persistWarmupState()
+	tls.persistWarmupState()
+
+	// Restart: imap starts first.
+	plain2 := &IMAPServer{name: "imap", warmupInterval: 24 * time.Hour, cache: plain.cache, enableWarmup: true}
+	tls2 := &IMAPServer{name: "imaps", warmupInterval: 24 * time.Hour, cache: plain.cache, enableWarmup: true}
+	plain2.loadWarmupState()
+	tls2.loadWarmupState()
+
+	for _, tc := range []struct {
+		srv        *IMAPServer
+		own, other int64
+	}{
+		{plain2, 1, 2},
+		{tls2, 2, 1},
+	} {
+		if raw, ok := tc.srv.lastWarmupTimes.Load(tc.own); !ok {
+			t.Errorf("server %q lost its own entry for account %d across the restart", tc.srv.name, tc.own)
+		} else if got := raw.(time.Time); !got.Equal(warmedAt) {
+			t.Errorf("server %q: account %d warmed at %v, want %v", tc.srv.name, tc.own, got, warmedAt)
+		}
+		if _, ok := tc.srv.lastWarmupTimes.Load(tc.other); ok {
+			t.Errorf("server %q loaded account %d, which another server warmed", tc.srv.name, tc.other)
+		}
+	}
+}
+
+// TestWarmupStateIgnoresSharedFile checks that the file every IMAP server used to
+// share is removed at load without being read: whichever server started first would
+// take the entries the others warmed.
+func TestWarmupStateIgnoresSharedFile(t *testing.T) {
+	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+
+	shared := filepath.Join(tmpDir, warmupStateFile)
+	if err := os.WriteFile(shared, []byte(fmt.Sprintf("7 %d\n", time.Now().Add(-time.Hour).Unix())), 0644); err != nil {
+		t.Fatalf("Failed to write shared state file: %v", err)
+	}
+
+	s.loadWarmupState()
+
+	if _, ok := s.lastWarmupTimes.Load(int64(7)); ok {
+		t.Error("Expected the shared state file not to be loaded")
+	}
+	if _, err := os.Stat(shared); !os.IsNotExist(err) {
+		t.Error("Expected the shared state file to be removed")
+	}
+}
+
+// TestWarmupStatePathStaysInCacheDir checks that every server name, whatever it
+// contains, maps to its own file directly in the cache directory.
+func TestWarmupStatePathStaysInCacheDir(t *testing.T) {
+	s, tmpDir := testWarmupStateServer(t, 24*time.Hour)
+
+	seen := make(map[string]string)
+	for _, name := range []string{"imap", "../imap", "a/b", "a%2Fb", "imap 993"} {
+		s.name = name
+		path := s.warmupStatePath()
+		if filepath.Dir(path) != tmpDir {
+			t.Errorf("server %q: state file %q is outside the cache directory %q", name, path, tmpDir)
+		}
+		if other, dup := seen[path]; dup {
+			t.Errorf("servers %q and %q share the state file %q", other, name, path)
+		}
+		seen[path] = name
+	}
+}
+
+// Names remain distinct on case-insensitive filesystems and fit within a
+// filesystem component even when the accepted server name itself is long.
+func TestWarmupStateNamesArePortable(t *testing.T) {
+	base, _ := testWarmupStateServer(t, time.Hour)
+	for _, names := range [][2]string{
+		{"imap-case", "IMAP-case"},
+		{strings.Repeat("long/server/", 40), strings.Repeat("long/server/", 40) + "other"},
+	} {
+		a := &IMAPServer{name: names[0], cache: base.cache, warmupInterval: time.Hour}
+		b := &IMAPServer{name: names[1], cache: base.cache, warmupInterval: time.Hour}
+		a.lastWarmupTimes.Store(int64(1), time.Now())
+		b.lastWarmupTimes.Store(int64(2), time.Now())
+		a.persistWarmupState()
+		b.persistWarmupState()
+		a.lastWarmupTimes.Clear()
+		b.lastWarmupTimes.Clear()
+		a.loadWarmupState()
+		b.loadWarmupState()
+		if _, ok := a.lastWarmupTimes.Load(int64(1)); !ok {
+			t.Errorf("server %q lost its own persisted entry", a.name)
+		}
+		if _, ok := a.lastWarmupTimes.Load(int64(2)); ok {
+			t.Errorf("server %q loaded the other server's entry", a.name)
+		}
+		if _, ok := b.lastWarmupTimes.Load(int64(2)); !ok {
+			t.Errorf("server %q lost its own persisted entry", b.name)
+		}
+	}
+}
+
+// A cache without a base path, the zero-value cache.Cache that many server fixtures
+// pass, has no directory to keep warmup state in. The server must not fall back to
+// its working directory, which a path joined onto the empty base path names: started
+// with warmup enabled it read and removed state files there, and on Close it wrote
+// one, so tests left .sora_warmup_state.* files in the source tree (#995, #997).
+func TestWarmupStateWithoutCacheDirectoryLeavesWorkingDirectoryAlone(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	const name = "warmup-no-cache-dir"
+	state := fmt.Sprintf("42 %d\n", time.Now().Unix())
+	files := []string{
+		warmupStateFile, // the file all servers used to share
+		fmt.Sprintf("%s.%x", warmupStateFile, sha256.Sum256([]byte(name))),
+	}
+	for _, f := range files {
+		if err := os.WriteFile(f, []byte(state), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv, err := New(ctx, name, "localhost", "127.0.0.1:0", &storage.S3Storage{}, &resilient.ResilientDatabase{}, &uploader.UploadWorker{}, &cache.Cache{}, IMAPServerOptions{
+		AppendLimit:    DefaultAppendLimit,
+		MaxConnections: 10,
+		Config:         &config.Config{},
+		EnableWarmup:   true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, ok := srv.lastWarmupTimes.Load(int64(42)); ok {
+		t.Error("server loaded warmup state from its working directory")
+	}
+	srv.lastWarmupTimes.Store(int64(7), time.Now())
+	srv.Close()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range entries {
+		got = append(got, e.Name())
+	}
+	if len(got) != len(files) {
+		t.Errorf("working directory holds %q, want only the files the test wrote %q", got, files)
+	}
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Errorf("%s: %v", f, err)
+		} else if string(b) != state {
+			t.Errorf("%s was rewritten: %q, want %q", f, b, state)
+		}
 	}
 }

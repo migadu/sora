@@ -8,23 +8,14 @@ import (
 
 func TestResourceContentionMetricsBasic(t *testing.T) {
 	// Reset metrics
-	MailboxLockTimeouts.Reset()
+	SessionLockTimeouts.Reset()
 
-	t.Run("db_connection_pool_exhausted", func(t *testing.T) {
-		DBConnectionPoolExhausted.Add(3)
+	t.Run("session_lock_timeouts", func(t *testing.T) {
+		SessionLockTimeouts.WithLabelValues("imap", "write").Add(2)
+		SessionLockTimeouts.WithLabelValues("pop3", "read").Inc()
 
-		count := testutil.ToFloat64(DBConnectionPoolExhausted)
-		if count != 3 {
-			t.Errorf("Expected 3 pool exhaustions, got %f", count)
-		}
-	})
-
-	t.Run("mailbox_lock_timeouts", func(t *testing.T) {
-		MailboxLockTimeouts.WithLabelValues("imap", "write").Add(2)
-		MailboxLockTimeouts.WithLabelValues("pop3", "read").Inc()
-
-		imapTimeouts := testutil.ToFloat64(MailboxLockTimeouts.WithLabelValues("imap", "write"))
-		pop3Timeouts := testutil.ToFloat64(MailboxLockTimeouts.WithLabelValues("pop3", "read"))
+		imapTimeouts := testutil.ToFloat64(SessionLockTimeouts.WithLabelValues("imap", "write"))
+		pop3Timeouts := testutil.ToFloat64(SessionLockTimeouts.WithLabelValues("pop3", "read"))
 
 		if imapTimeouts != 2 {
 			t.Errorf("Expected 2 IMAP write timeouts, got %f", imapTimeouts)
@@ -36,14 +27,10 @@ func TestResourceContentionMetricsBasic(t *testing.T) {
 
 	t.Run("histograms_work", func(t *testing.T) {
 		// Test that histograms accept observations without error
-		DBConnectionPoolWaitTime.Observe(0.05)
-		MailboxLockWaitTime.WithLabelValues("INBOX").Observe(0.01)
-		MailboxLockDuration.WithLabelValues("imap", "read", "success").Observe(0.02)
+		SessionLockDuration.WithLabelValues("imap", "read", "success").Observe(0.02)
 		CommandDuration.WithLabelValues("imap", "SELECT").Observe(0.1)
 		MessageSizeBytes.WithLabelValues("imap").Observe(1024)
 		CriticalOperationDuration.WithLabelValues("search_full_text").Observe(2.0)
-		ProxyBackendLatency.WithLabelValues("imap").Observe(0.01)
-		MessageAge.Observe(3600)
 
 		// If we got here without panic, histograms are working
 	})
@@ -218,31 +205,9 @@ func TestQueueMetrics(t *testing.T) {
 	})
 }
 
-func TestSlowOperations(t *testing.T) {
-	// Reset metrics
-	SlowOperations.Reset()
-
-	t.Run("slow_operations", func(t *testing.T) {
-		operations := []string{"search_full_text", "expunge_bulk"}
-		thresholds := []string{"100ms", "1s"}
-
-		for _, operation := range operations {
-			for _, threshold := range thresholds {
-				SlowOperations.WithLabelValues(operation, threshold).Inc()
-			}
-		}
-
-		searchSlowCount := testutil.ToFloat64(SlowOperations.WithLabelValues("search_full_text", "1s"))
-		if searchSlowCount != 1 {
-			t.Errorf("Expected 1 slow search operation, got %f", searchSlowCount)
-		}
-	})
-}
-
 func TestProxyMetrics(t *testing.T) {
 	// Reset metrics
 	ProxyBackendConnections.Reset()
-	ProxyRequestsForwarded.Reset()
 	ProxyRoutingMethod.Reset()
 
 	t.Run("proxy_backend_connections", func(t *testing.T) {
@@ -271,17 +236,6 @@ func TestProxyMetrics(t *testing.T) {
 		remotelookupCount := testutil.ToFloat64(ProxyRoutingMethod.WithLabelValues("imap", "remotelookup"))
 		if remotelookupCount != 50 {
 			t.Errorf("Expected 50 remotelookup routings, got %f", remotelookupCount)
-		}
-	})
-}
-
-func TestBusinessMetrics(t *testing.T) {
-	t.Run("active_mailboxes", func(t *testing.T) {
-		ActiveMailboxes.Set(250)
-
-		count := testutil.ToFloat64(ActiveMailboxes)
-		if count != 250 {
-			t.Errorf("Expected 250 active mailboxes, got %f", count)
 		}
 	})
 }

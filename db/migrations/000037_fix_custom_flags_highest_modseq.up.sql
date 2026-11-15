@@ -19,8 +19,9 @@
 -- message_state UPDATE/DELETE branches are subtraction/flag-change paths that ALWAYS operate on a mailbox
 -- that already has a stats row (the row is created by the INSERT/UPDATE-additions path first), and their
 -- deltas can be negative -- UPSERTing them would risk inserting rows with negative counts, so they are
--- intentionally left as plain UPDATE. Existing on-disk drift is healed separately by
--- db.RecalculateMailboxStats / `sora-admin mailbox recalculate-stats`.
+-- intentionally left as plain UPDATE. This migration does not heal existing on-disk drift, and Sora has no
+-- command that recomputes message_count or total_size; the cleanup worker repairs only a negative
+-- unseen_count (db.ReconcileNegativeMailboxStats).
 
 CREATE OR REPLACE FUNCTION maintain_mailbox_stats_state() RETURNS TRIGGER AS $$
 BEGIN

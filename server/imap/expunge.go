@@ -9,6 +9,14 @@ import (
 )
 
 func (s *IMAPSession) Expunge(ctx context.Context, w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) error {
+	// UID EXPUNGE is the command UIDPLUS adds (RFC 4315 §2.1); IMAP4rev2
+	// includes it. A plain EXPUNGE arrives with no UID set.
+	if uidSet != nil {
+		if err := s.requireCapability(imap.CapUIDPlus, "UID EXPUNGE"); err != nil {
+			return err
+		}
+	}
+
 	ctx = s.pinnedContext(ctx)
 
 	// First phase: Read session state with simple read lock

@@ -40,9 +40,10 @@ type ManageSieveSession struct {
 	releaseConn func() // Function to release connection from limiter
 	startTime   time.Time
 
-	// trackedClientAddr is the client address this session was registered
-	// with in the connection tracker, so it is unregistered under that key.
-	// Empty when the tracker refused the session: it has nothing to release.
+	// tracked is set while the session holds a slot in the connection
+	// tracker, registered under trackedClientAddr, so the slot is released
+	// under that key, once. A session the tracker refused never holds one.
+	tracked           bool
 	trackedClientAddr string
 }
 
@@ -51,21 +52,29 @@ var (
 	_ managesieveserver.SessionLogin = (*ManageSieveSession)(nil)
 )
 
-// Shared wire responses. Uncoded *Error messages are emitted verbatim after
-// "NO ", so these preserve sora's historical response bytes exactly.
+// Shared wire responses. go-managesieve emits an uncoded *Error message verbatim
+// after "NO ", so it is pre-quoted: RFC 5804 section 4 allows only a string
+// (quoted or literal) as the text of a NO response. A coded message is quoted by
+// the library.
 var (
-	errAuthFailed    = &managesieveserver.Error{Message: "Authentication failed"}
-	errTryLater      = &managesieveserver.Error{Code: "TRYLATER", Message: "Service temporarily unavailable"}
-	errNonExistent   = &managesieveserver.Error{Code: "NONEXISTENT", Message: "Script does not exist"}
-	errServerBusy    = &managesieveserver.Error{Message: "Server busy, try again later"}
-	errSessionClosed = &managesieveserver.Error{Message: "Session closed", Close: true}
-	errDelayQueueFul = &managesieveserver.Error{Message: "Too many concurrent authentication attempts. Please try again later."}
+	errAuthFailed      = &managesieveserver.Error{Message: msieve.Quote("Authentication failed")}
+	errAuthFailedClose = &managesieveserver.Error{Message: msieve.Quote("Authentication failed"), Close: true}
+	errTryLater        = &managesieveserver.Error{Code: "TRYLATER", Message: "Service temporarily unavailable"}
+	errNonExistent     = &managesieveserver.Error{Code: "NONEXISTENT", Message: "Script does not exist"}
+	errServerBusy      = &managesieveserver.Error{Message: msieve.Quote("Server busy, try again later")}
+	errSessionClosed   = &managesieveserver.Error{Message: msieve.Quote("Session closed"), Close: true}
+	errDelayQueueFul   = &managesieveserver.Error{Message: msieve.Quote("Too many concurrent authentication attempts. Please try again later.")}
+
+	// errTooManyConnections refuses a login over max_connections_per_user or
+	// max_connections_per_user_per_ip, with the reply managesieve_proxy sends.
+	errTooManyConnections = &managesieveserver.Error{Code: "TRYLATER", Message: "Too many connections"}
 )
 
 // authUnavailable reports whether a failed Authenticate says nothing about the
-// credentials: the database could not be asked, or the command was cut short. Such a
-// login is answered TRYLATER (RFC 5804 section 1.3) and not counted as a failed one,
-// or clients retrying a saved password through a database outage stay blocked after it.
+// credentials: the database could not be asked, the stored hash cannot be checked, or
+// the command was cut short. Such a login is answered TRYLATER (RFC 5804 section 1.3)
+// and not counted as a failed one, or clients retrying a saved password through a
+// database outage stay blocked after it.
 func authUnavailable(err error) bool {
 	return server.IsTemporaryAuthFailure(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
@@ -83,8 +92,8 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 	success := false
 	outcome := "failure"
 	defer func() {
-		if !success {
-			// Track failed authentication if not already successful
+		if !success && outcome != "" {
+			// Track failed or unavailable credential check if not already successful
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, outcome).Inc()
 			metrics.CriticalOperationDuration.WithLabelValues("managesieve_authentication").Observe(time.Since(start).Seconds())
 		}
@@ -97,14 +106,21 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 
 	var accountID int64
 	var impersonating bool
+	var method string // how the credentials were checked: "master", or as Authenticate says
 	var targetAddress *server.Address
+	// gated: the progressive delay and the rate-limit check have already run for this
+	// login under the key regular authentication uses (a master SASL self-login, or the
+	// master username form without the master password, handed on to it), so they do
+	// not run a second time there.
+	var gated bool
 
 	// One copy of the master SASL settings for the whole login, however a config
 	// reload replaces them meanwhile.
 	settings := s.server.settings.Load()
 
 	// 1. Check for Master Username Authentication (user@domain.com@MASTER_USERNAME)
-	if parseErr == nil && len(s.server.masterUsername) > 0 && authnParsed.HasSuffix() && checkMasterCredential(authnParsed.Suffix(), s.server.masterUsername) {
+	masterForm := parseErr == nil && len(s.server.masterUsername) > 0 && authnParsed.HasSuffix() && checkMasterCredential(authnParsed.Suffix(), s.server.masterUsername)
+	if masterForm {
 		// Rate-limit the master-password check. The master password is a
 		// tenant-wide credential, so it must not be brute-forceable
 		// unthrottled.
@@ -118,15 +134,17 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		// account, and hand every guess a fresh bucket by varying the target.
 		authKey := server.MasterAuthRateLimitKey(authnParsed.Suffix())
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-MASTER"); err != nil {
+		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "managesieve"); err != nil {
+			outcome = ""
 			if errors.Is(err, server.ErrDelayQueueFull) {
 				return errDelayQueueFul
 			}
 			// Context cancelled or other error - close connection
-			return &managesieveserver.Error{Message: "Authentication failed", Close: true}
+			return errAuthFailedClose
 		}
 		if s.server.authLimiter != nil {
 			if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, authKey); err != nil {
+				outcome = ""
 				s.DebugLog("rate limited", "error", err)
 				// Same response as bad credentials so rate-limit state isn't an oracle.
 				return errAuthFailed
@@ -171,8 +189,16 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 				return errAuthFailed
 			}
 
-			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+			accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
 			if err != nil {
+				// The database could not be asked, or the command was cut short, so
+				// nothing is known about the target: TRYLATER (RFC 5804 section 1.3),
+				// not a failed login charged to the master credential.
+				if authUnavailable(err) {
+					outcome = "unavailable"
+					s.WarnLog("impersonation target lookup unavailable", "target_user", targetUserToImpersonate, "error", err)
+					return errTryLater
+				}
 				// Same reply and same accounting as a bad credential (see above).
 				s.WarnLog("impersonation target rejected (account not found)", "target_user", targetUserToImpersonate, "error", err)
 				if s.server.authLimiter != nil {
@@ -188,46 +214,42 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 
 			targetAddress = &address
 			impersonating = true
+			method = "master"
 		} else {
-			// Record failed master password authentication (feeds progressive
-			// delay / blocking so the tenant-wide master password can't be
-			// brute-forced). Under authKey — the master credential's own bucket —
-			// so the impersonation target is not locked out.
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
-			// Answer exactly like any other bad credential (errAuthFailed): a distinct
-			// reply is reachable with only the master USERNAME (no secret) and confirms
-			// the configured master username to an attacker. Reason kept at WARN.
-			s.WarnLog("master username authentication failed (invalid master password)")
-			return errAuthFailed
+			// Any other password is the base address's own login, checked by regular
+			// authentication below exactly as under any other suffix: a distinct reply, a
+			// quicker one (#801), or a refusal of the account's own password (#949)
+			// confirms the configured master username. Already delayed and checked here
+			// under authKey, the master credential's own bucket, where regular
+			// authentication also records its failure (AuthRateLimitKeyWithMaster), so the
+			// tenant-wide master password cannot be brute-forced and the account it names
+			// is not locked out; only a success is the account's.
+			gated = true
 		}
 	}
 
 	// 2. Check for Master SASL Authentication (traditional)
-	// Entered on the authentication identity alone (constant-time comparison, to
-	// avoid a timing side-channel on the tenant-wide credential). The password is
-	// checked below rather than in this condition: a wrong master password must be
-	// rate limited and recorded here instead of falling through to regular
-	// authentication, which rejects the (non-address) master SASL username before
-	// the delay, the CanAttempt check and any RecordAuthAttempt* call — leaving the
-	// tenant-wide credential brute-forceable at connection rate.
 	// Only ever a master login when the client asked to act as somebody: the
 	// authorization identity IS the impersonation target. A submission without one
 	// cannot be a master login, so it is not answered from here at all — see the
 	// no-authorization-identity note below.
-	// The trailing clause excludes one case: a WRONG master password on a submission whose
-	// authorization identity equals its authentication identity. RFC 4616 defines
-	// authzid == authcid as "no impersonation", and several SASL libraries fill the field
-	// in unconditionally, so for an account whose address happens to be the master SASL
-	// username that shape is an ordinary login — refusing it here would reject the
-	// account's own password forever. It falls through to regular authentication, which
-	// records its own failure under the same key, so a master-password guess dressed up as
-	// a self-login is still metered. A CORRECT master password keeps entering the block
-	// whatever the target, which is what the proxy flow relies on.
+	// Any other password falls through to regular authentication, which verifies the
+	// credentials like any other authentication identity's (RFC 4616 section 2: the
+	// authentication identity and password first, the authorization identity second)
+	// and delays, checks, answers and records their failure under the same key. A
+	// reply or accounting of its own for a wrong master SASL password, beside the
+	// authorization refusal any other authentication identity got, confirmed the
+	// master SASL username to anyone who could reach the port.
+	// A self-login falls through too if its peer is not allowed to use the master
+	// credential, or if the account does not exist (below). This keeps its cost
+	// and cache behavior identical to a self-login using any other password.
+	// The preliminary network check is logged but leaves failure accounting to
+	// regular authentication, so the attempt is gated and recorded only once.
+	selfLogin := authzID == authnID
 	if !impersonating && authzID != "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
 		checkMasterCredential(authnID, settings.masterSASLUsername) &&
-		(checkMasterCredential(password, settings.masterSASLPassword) || authzID != authnID) {
+		checkMasterCredential(password, settings.masterSASLPassword) &&
+		(!selfLogin || s.AdmitMasterLogin(ctx, settings.masterSASLGate, nil, s.conn, s.proxyInfo(), server.AuthRateLimitKey(authnID), "master SASL self-login")) {
 		netConn := s.conn
 		proxyInfo := s.proxyInfo()
 		// The master SASL username is not an address, so it keeps a stable
@@ -237,63 +259,72 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 
 		// Apply progressive authentication delay BEFORE any other checks
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-MASTER-SASL"); err != nil {
+		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "managesieve"); err != nil {
+			outcome = ""
 			if errors.Is(err, server.ErrDelayQueueFull) {
 				return errDelayQueueFul
 			}
 			// Context cancelled or other error - close connection
-			return &managesieveserver.Error{Message: "Authentication failed", Close: true}
+			return errAuthFailedClose
 		}
 		if s.server.authLimiter != nil {
 			if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, authKey); err != nil {
+				outcome = ""
 				s.DebugLog("rate limited", "error", err)
 				// Same response as bad credentials so rate-limit state isn't an oracle.
 				return errAuthFailed
 			}
 		}
 
-		if !checkMasterCredential(password, settings.masterSASLPassword) {
-			s.WarnLog("master SASL authentication failed (invalid password)", "peer", server.GetAddrString(s.conn.RemoteAddr()))
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
-			// Same response as any other bad credential: a distinct one would
-			// confirm the master SASL username to an attacker.
-			return errAuthFailed
-		}
-
-		if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master SASL") {
-			return errAuthFailed
+		if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, nil, netConn, proxyInfo, authKey, "master SASL") {
+			err, out := s.refuseLikeWrongPassword(ctx, authnParsed, parseErr, password, netConn, proxyInfo, authKey)
+			outcome = out
+			return err
 		}
 		s.DebugLog("master sasl user authenticated, attempting impersonation", "authn_id", authnID, "authz_id", authzID)
 
 		// Log in as the authzID without a password check
 		address, err := server.NewAddress(authzID)
 		if err != nil {
-			// Same reply and same accounting as a bad credential: see the
-			// master-username path above.
+			// Same reply, accounting, and password-verification work as a bad credential (#846).
 			s.WarnLog("impersonation target rejected (address not in the correct format)", "target_user", authzID, "error", err)
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
-			return errAuthFailed
+			refusalErr, out := s.refuseLikeWrongPassword(ctx, authnParsed, parseErr, password, netConn, proxyInfo, authKey)
+			outcome = out
+			return refusalErr
 		}
 
 		// Resolve the account by the base address (stripping any +detail
 		// or @suffix), consistent with the master-username path above and
 		// the IMAP/POP3 backends.
-		accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+		accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
 		if err != nil {
-			// Same reply and same accounting as a bad credential (see above).
-			s.WarnLog("impersonation target rejected (account not found)", "target_user", authzID, "error", err)
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+			// Unavailable: see the master-username path above.
+			if authUnavailable(err) {
+				outcome = "unavailable"
+				s.WarnLog("impersonation target lookup unavailable", "target_user", authzID, "error", err)
+				return errTryLater
 			}
-			return errAuthFailed
+			s.WarnLog("impersonation target rejected (account not found)", "target_user", authzID, "error", err)
+			if !selfLogin {
+				// Same reply, accounting, and password-verification work as a bad credential (#846).
+				refusalErr, out := s.refuseLikeWrongPassword(ctx, authnParsed, parseErr, password, netConn, proxyInfo, authKey)
+				outcome = out
+				return refusalErr
+			}
+			// A self-login: answered by regular authentication below (see above),
+			// already gated here.
+			gated = true
+		} else {
+			targetAddress = &address
+			impersonating = true
+			method = "master"
 		}
-
-		targetAddress = &address
-		impersonating = true
+	} else if !impersonating && authzID != "" && authzID != authnID && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
+		checkMasterCredential(authnID, settings.masterSASLUsername) {
+		// The master SASL username asking to act as somebody else, with a wrong
+		// password: answered by regular authentication (see above). Logged for the
+		// operator debugging a proxy with the wrong master SASL password.
+		s.WarnLog("master SASL authentication failed (invalid password)", "peer", server.GetAddrString(s.conn.RemoteAddr()))
 	}
 
 	// Master SASL credentials submitted WITHOUT an authorization identity. There is
@@ -314,19 +345,16 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 
 	// If not using master SASL, perform regular authentication
 	if !impersonating {
-		// For regular ManageSieve, we don't support proxy authentication
-		if authzID != "" && authzID != authnID {
-			s.DebugLog("proxy authentication requires master credentials", "authz_id", authzID, "authn_id", authnID)
-			return &managesieveserver.Error{Message: "Proxy authentication requires master_sasl_username and master_sasl_password to be configured"}
-		}
-
 		netConn := s.conn
 		proxyInfo := s.proxyInfo()
-		// Rate-limit key for this attempt. Canonicalised so the check and both
-		// record calls below use the SAME key: keying on FullAddress() kept the
-		// "+detail", so a different +tag per attempt gave every attempt its own
-		// bucket and Tier 1 never engaged.
-		authKey := server.AuthRateLimitKey(authnID)
+		// Rate-limit key for this attempt. Canonicalised so the check and the failure
+		// records below use the SAME key: keying on FullAddress() kept the "+detail", so
+		// a different +tag per attempt gave every attempt its own bucket and Tier 1
+		// never engaged. The master username form handed on from above keeps the master
+		// credential's key (AuthRateLimitKeyWithMaster), under which it was checked: its
+		// failures are guesses at the master password and must not charge the account
+		// it names.
+		authKey := server.AuthRateLimitKeyWithMaster(authnID, s.server.masterUsername)
 
 		// Apply progressive authentication delay BEFORE any other checks - including
 		// before the identity is parsed. An unparseable identity is recorded as a failed
@@ -335,19 +363,23 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		// (IP-wide) counter up at full connection rate and hold it there, with the block
 		// it earns never applied to it. IMAP and POP3 order these the same way.
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-SASL"); err != nil {
-			if errors.Is(err, server.ErrDelayQueueFull) {
-				// Delay queue full - reject immediately to prevent goroutine exhaustion
-				s.InfoLog("delay queue full, rejecting connection")
-				return errDelayQueueFul
+		if !gated {
+			if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "managesieve"); err != nil {
+				outcome = ""
+				if errors.Is(err, server.ErrDelayQueueFull) {
+					// Delay queue full - reject immediately to prevent goroutine exhaustion
+					s.InfoLog("delay queue full, rejecting connection")
+					return errDelayQueueFul
+				}
+				// Context cancelled or other error - close connection
+				return errAuthFailedClose
 			}
-			// Context cancelled or other error - close connection
-			return &managesieveserver.Error{Message: "Authentication failed", Close: true}
 		}
 
 		// Check authentication rate limiting after delay
-		if s.server.authLimiter != nil {
+		if s.server.authLimiter != nil && !gated {
 			if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, authKey); err != nil {
+				outcome = ""
 				s.DebugLog("rate limited", "error", err)
 				// Same response as a bad-credential failure so the rate-limit
 				// state isn't an observable oracle. (security-audit M14)
@@ -358,45 +390,96 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		address, err := server.NewAddress(authnID)
 		if err != nil {
 			s.WarnLog("invalid address format", "error", err)
-			// Record it: an unparseable identity was an unmetered authentication
-			// attempt, and it is the path a non-address master SASL username takes
-			// when it falls through to here, which must be accounted for exactly
-			// like any other failed attempt.
+			// A failed login like any other: recorded, counted and answered exactly
+			// like a wrong password. A master SASL self-login (authorization
+			// identity = authentication identity = a non-address master SASL
+			// username) falls through to here with any password but the master
+			// SASL one, which the master SASL block above answers with
+			// errAuthFailed, so a different reply or count here confirms a guessed
+			// master SASL password. It holds for every username, or the reply
+			// would single out the master SASL one.
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
-			return &managesieveserver.Error{Message: "Invalid username format"}
+			return errAuthFailed
 		}
 
 		s.DebugLog("authentication attempt", "address", address.FullAddress())
 
-		accountID, err = s.server.Authenticate(ctx, address.BaseAddress(), password)
+		// Its result is logged here, once, with the session's fields.
+		var reason string
+		accountID, method, reason, err = s.server.Authenticate(ctx, address.BaseAddress(), password)
 		if err != nil {
 			if authUnavailable(err) {
 				outcome = "unavailable"
-				s.DebugLog("authentication unavailable", "error", err)
+				s.WarnLog("authentication unavailable", "address", address.BaseAddress(), "reason", reason, "method", method, "error", err)
 				return errTryLater
+			}
+			s.InfoLog("authentication failed", "address", address.BaseAddress(), "reason", reason, "cached", false, "method", method)
+			if masterForm {
+				// Kept for the operator debugging a client with the wrong master password.
+				s.WarnLog("master username authentication failed (invalid master password)")
 			}
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
-			s.DebugLog("authentication failed")
 			return errAuthFailed
 		}
 
-		// Record successful attempt
+		// The credentials checked out; now the authorization (RFC 4616 section 2).
+		// Acting as somebody else is the master SASL credentials' privilege, so this
+		// account may act only as itself. Refused here, not before the password, so
+		// only a client that proved its credentials learns it is not permitted:
+		// refusing it earlier answered every authentication identity but the master
+		// SASL username without a password check, which confirmed the master SASL
+		// username. Not recorded as a failure: the credentials were right.
+		if authzID != "" && authzID != authnID {
+			outcome = ""
+			s.DebugLog("proxy authentication requires master credentials", "authz_id", authzID, "authn_id", authnID)
+			return &managesieveserver.Error{Message: msieve.Quote("Proxy authentication requires master credentials")}
+		}
+
+		// Record successful attempt under the account's key, the master username form
+		// with the account's own password too (#949): under the master credential's key
+		// it would clear the failed guesses at the master password.
 		if s.server.authLimiter != nil {
-			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, true)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, server.AuthRateLimitKey(authnID), true)
 		}
 
 		targetAddress = &address
 	}
 
-	if err := s.completeAuthentication(ctx, *targetAddress, accountID, impersonating, start); err != nil {
+	if err := s.completeAuthentication(ctx, *targetAddress, accountID, method, start); err != nil {
+		outcome = ""
 		return err
 	}
 	success = true
 	return nil
+}
+
+// refuseLikeWrongPassword refuses a login that must not succeed with what regular
+// authentication gives authnParsed with a wrong password: the credential check of its
+// base address (password verification and lookup-cache update), whose verdict is
+// discarded, then the same rate-limit accounting and reply; it also returns the
+// outcome to count. A refusal that skipped the check would be answered one
+// verification sooner and confirm what made it one. Used for a refused master SASL
+// impersonation (#846), which must not answer with the proxy-auth error when
+// authnParsed names an account whose own password is the master SASL password.
+// The caller logs why the login is refused; only a check that could not be made is
+// logged here, because it changes the reply.
+func (s *ManageSieveSession) refuseLikeWrongPassword(ctx context.Context, authnParsed server.Address, parseErr error, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) (error, string) {
+	if parseErr == nil {
+		if _, method, reason, authErr := s.server.Authenticate(ctx, authnParsed.BaseAddress(), password); authErr != nil {
+			if authUnavailable(authErr) {
+				s.WarnLog("authentication unavailable", "address", authnParsed.BaseAddress(), "reason", reason, "method", method, "error", authErr)
+				return errTryLater, "unavailable"
+			}
+		}
+	}
+	if s.server.authLimiter != nil {
+		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+	}
+	return errAuthFailed, "failure"
 }
 
 // Login implements the non-standard LOGIN verb the backend has historically
@@ -404,12 +487,6 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 // re-authentication gates. ctx is the library's per-command context.
 func (s *ManageSieveSession) Login(ctx context.Context, username, password string) error {
 	start := time.Now()
-
-	address, err := server.NewAddress(username)
-	if err != nil {
-		s.DebugLog("invalid address", "error", err)
-		return &managesieveserver.Error{Message: "Invalid address"}
-	}
 
 	netConn := s.conn
 	proxyInfo := s.proxyInfo()
@@ -423,16 +500,19 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 	// must never charge the account it named.
 	authKey := server.AuthRateLimitKeyWithMaster(username, s.server.masterUsername)
 
-	// Apply progressive authentication delay BEFORE any other checks
+	// Apply progressive authentication delay BEFORE any other checks - including
+	// before the username is parsed, as in AuthenticatePlain: an unparseable username
+	// is recorded as a failed attempt below, and a site that records without first
+	// passing the delay and the block check is metered but never gated.
 	remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-LOGIN"); err != nil {
+	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "managesieve"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
 			s.InfoLog("delay queue full, rejecting connection", "username", username)
 			return errDelayQueueFul
 		}
 		// Context cancelled or other error - close connection
-		return &managesieveserver.Error{Message: "Authentication failed", Close: true}
+		return errAuthFailedClose
 	}
 
 	// Check authentication rate limiting after delay
@@ -441,7 +521,7 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 			var rateLimitErr *server.RateLimitError
 			if errors.As(err, &rateLimitErr) {
 				s.InfoLog("rate limit exceeded",
-					"address", address.FullAddress(),
+					"username", username,
 					"reason", rateLimitErr.Reason,
 					"failure_count", rateLimitErr.FailureCount,
 					"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
@@ -454,40 +534,49 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 		}
 	}
 
-	// Master username authentication: user@domain.com@MASTER_USERNAME
+	address, err := server.NewAddress(username)
+	if err != nil {
+		s.DebugLog("invalid address", "error", err)
+		// A failed login like any other: recorded, counted and answered exactly
+		// like a wrong password, as in AuthenticatePlain.
+		if s.server.authLimiter != nil {
+			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+		}
+		metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
+		return errAuthFailed
+	}
+
 	authSuccess := false
-	masterAuthUsed := false
+	var method string // how the credentials were checked: "master", or as Authenticate says
 	var accountID int64
-	if len(s.server.masterUsername) > 0 && address.HasSuffix() && checkMasterCredential(address.Suffix(), s.server.masterUsername) {
-		// Suffix matches MasterUsername, authenticate with MasterPassword
-		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
-			if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
-				return errAuthFailed
-			}
-			s.DebugLog("master username authentication successful", "address", address.BaseAddress(), "master_username", address.Suffix())
-			authSuccess = true
-			masterAuthUsed = true
-			// Use base address (without suffix) to get account
-			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
-			if err != nil {
-				s.WarnLog("failed to get account id", "address", address.BaseAddress(), "error", err)
-				if s.server.authLimiter != nil {
-					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-				}
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
-				return errAuthFailed
-			}
-		} else {
-			// Record failed master password authentication
+	// Master username authentication: user@domain.com@MASTER_USERNAME, with the master
+	// password. Any other password in that form is the base address's own login, checked
+	// by regular authentication below exactly as under any other suffix (see
+	// AuthenticatePlain, #801, #949). Its failure is recorded under authKey, the master
+	// credential's key; only a success is the account's.
+	masterForm := len(s.server.masterUsername) > 0 && address.HasSuffix() && checkMasterCredential(address.Suffix(), s.server.masterUsername)
+	if masterForm && len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
+		if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
+			return errAuthFailed
+		}
+		s.DebugLog("master username authentication successful", "address", address.BaseAddress(), "master_username", address.Suffix())
+		authSuccess = true
+		method = "master"
+		// Use base address (without suffix) to get account
+		accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
+		if err != nil {
+			// Unavailable: a temporary failure, see AuthenticatePlain.
+			if authUnavailable(err) {
+				s.WarnLog("impersonation target lookup unavailable", "target_user", address.BaseAddress(), "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "unavailable").Inc()
+				return errTryLater
+			}
+			s.WarnLog("failed to get account id", "address", address.BaseAddress(), "error", err)
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
-			// Answer exactly like any other bad credential (errAuthFailed): a distinct
-			// reply is reachable with only the master USERNAME (no secret) and confirms
-			// the configured master username to an attacker. Reason kept at WARN.
-			s.WarnLog("master username authentication failed (invalid master password)")
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
 			return errAuthFailed
 		}
 	}
@@ -504,14 +593,21 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 	// master-USERNAME suffix form above (user@domain@MASTER) remains the way to impersonate
 	// via LOGIN, and it names the target explicitly.
 
-	// If master password didn't work, try regular authentication
+	// If master password didn't work, try regular authentication. Its result is logged
+	// here, once, with the session's fields.
 	if !authSuccess {
-		accountID, err = s.server.Authenticate(ctx, address.BaseAddress(), password)
+		var reason string
+		accountID, method, reason, err = s.server.Authenticate(ctx, address.BaseAddress(), password)
 		if err != nil {
 			if authUnavailable(err) {
-				s.DebugLog("authentication unavailable", "error", err)
+				s.WarnLog("authentication unavailable", "address", address.BaseAddress(), "reason", reason, "method", method, "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "unavailable").Inc()
 				return errTryLater
+			}
+			s.InfoLog("authentication failed", "address", address.BaseAddress(), "reason", reason, "cached", false, "method", method)
+			if masterForm {
+				// Kept for the operator debugging a client with the wrong master password.
+				s.WarnLog("master username authentication failed (invalid master password)")
 			}
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
@@ -521,19 +617,22 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 		}
 	}
 
-	// Record successful attempt
+	// Record successful attempt: a master login under the master credential's key, any
+	// other under the account's, the master form with its own password too (#949): under
+	// the master key it would clear the failed guesses at the master password.
 	if s.server.authLimiter != nil {
-		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, true)
+		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, server.AuthSuccessRateLimitKey(username, password, s.server.masterUsername, s.server.masterPassword), true)
 	}
 
-	return s.completeAuthentication(ctx, address, accountID, masterAuthUsed, start)
+	return s.completeAuthentication(ctx, address, accountID, method, start)
 }
 
 // completeAuthentication updates session state, counters, metrics, and
-// connection tracking after a successful credential check. Shared by
+// connection tracking after a successful credential check, and logs the login's
+// success; method says how the credentials were checked. Shared by
 // AuthenticatePlain and Login. ctx is the per-command context; state that
 // outlives the command (the termination poller) stays on the session context.
-func (s *ManageSieveSession) completeAuthentication(ctx context.Context, address server.Address, accountID int64, masterAuthUsed bool, start time.Time) error {
+func (s *ManageSieveSession) completeAuthentication(ctx context.Context, address server.Address, accountID int64, method string, start time.Time) error {
 	// Check if the command or session was cancelled during authentication logic
 	if ctx.Err() != nil || s.ctx.Err() != nil {
 		s.DebugLog("request aborted, aborting session update")
@@ -548,20 +647,26 @@ func (s *ManageSieveSession) completeAuthentication(ctx context.Context, address
 	}
 	defer release()
 
+	// The connection limits come before the session takes the user: a login the
+	// tracker refuses is not logged in, so its close releases neither a count
+	// nor a tracker slot, and it must not count as a successful login (#864).
+	if err := s.registerConnection(ctx, accountID, address.FullAddress()); err != nil {
+		s.InfoLog("login refused: connection limit reached", "address", address.BaseAddress(), "reason", err)
+		return errTooManyConnections
+	}
+
+	metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "success").Inc()
+
 	s.User = server.NewUser(address, accountID)
+
+	// Log authentication success, now that the session's user and account_id
+	// fields name the account.
+	s.InfoLog("authentication successful", "address", address.BaseAddress(), "cached", method == "cache", "method", method, "duration", fmt.Sprintf("%.3fs", time.Since(start).Seconds()))
 
 	// Increment authenticated connections counter
 	s.server.authenticatedConnections.Add(1)
 
-	// Log authentication success. Regular auth via Authenticate() already
-	// logs in server.go with cached/method; master auth is logged here.
-	if masterAuthUsed {
-		duration := time.Since(start)
-		s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-	}
-
 	// Track successful authentication
-	metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "success").Inc()
 	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("managesieve", s.server.name, s.server.hostname).Inc()
 	metrics.CriticalOperationDuration.WithLabelValues("managesieve_authentication").Observe(time.Since(start).Seconds())
 
@@ -569,9 +674,6 @@ func (s *ManageSieveSession) completeAuthentication(ctx context.Context, address
 	// prevent a race: if the session closes between counter increments and
 	// flag setting, cleanup won't decrement.
 	s.authenticated = true
-
-	// Register connection for tracking
-	s.registerConnection(ctx, address.FullAddress())
 
 	// Start termination poller to check for kick commands
 	s.startTerminationPoller()
@@ -697,7 +799,7 @@ func (s *ManageSieveSession) PutScript(ctx context.Context, name, content string
 	start := time.Now()
 	ctx, cancel := applyCommandTimeout(ctx, "PUTSCRIPT", s.server.commandTimeouts)
 	defer cancel()
-	accountID, readCtx, err := s.sessionState(ctx, "PUTSCRIPT")
+	accountID, _, err := s.sessionState(ctx, "PUTSCRIPT")
 	if err != nil {
 		return false, err
 	}
@@ -706,24 +808,18 @@ func (s *ManageSieveSession) PutScript(ctx context.Context, name, content string
 		return false, err
 	}
 
-	script, dbErr := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, accountID)
-	if dbErr != nil && dbErr != consts.ErrDBNotFound {
+	// Update or create is decided in the write transaction: a lookup before it
+	// (on a lagging replica, or racing another create of the name) can miss the
+	// script, and the create then fails on the unique name.
+	_, updated, err := s.server.rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, name, content)
+	if err != nil {
+		if errors.Is(err, db.ErrSieveScriptLimitReached) {
+			return false, &managesieveserver.Error{Code: "QUOTA/MAXSCRIPTS", Message: "Too many scripts for this account"}
+		}
+		if errors.Is(err, db.ErrSieveScriptNotStorable) {
+			return false, &managesieveserver.Error{Message: msieve.Quote("Script validation failed: " + msieve.SanitizeText(err.Error()))}
+		}
 		return false, errTryLater
-	}
-
-	updated := false
-	if script != nil {
-		if _, err := s.server.rdb.UpdateScriptWithRetry(ctx, script.ID, accountID, name, content); err != nil {
-			return false, errTryLater
-		}
-		updated = true
-	} else {
-		if _, err := s.server.rdb.CreateScriptWithRetry(ctx, accountID, name, content); err != nil {
-			if errors.Is(err, db.ErrSieveScriptLimitReached) {
-				return false, &managesieveserver.Error{Code: "QUOTA/MAXSCRIPTS", Message: "Too many scripts for this account"}
-			}
-			return false, errTryLater
-		}
 	}
 
 	s.pinToMasterDB("PUTSCRIPT")
@@ -805,31 +901,27 @@ func (s *ManageSieveSession) SetActive(ctx context.Context, name string) error {
 func (s *ManageSieveSession) DeleteScript(ctx context.Context, name string) error {
 	ctx, cancel := applyCommandTimeout(ctx, "DELETESCRIPT", s.server.commandTimeouts)
 	defer cancel()
-	accountID, readCtx, err := s.sessionState(ctx, "DELETESCRIPT")
+	accountID, _, err := s.sessionState(ctx, "DELETESCRIPT")
 	if err != nil {
 		return err
 	}
 
-	script, dbErr := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, accountID)
-	if dbErr != nil {
-		if dbErr == consts.ErrDBNotFound {
-			return errNonExistent
-		}
-		return errTryLater
-	}
-
 	// RFC 5804 §2.10: the active script MUST NOT be deleted; the client must
-	// first deactivate it via SETACTIVE "".
-	if script.Active {
+	// first deactivate it via SETACTIVE "". The script is looked up and checked
+	// in the delete's transaction: a lookup before it (on a lagging replica, or
+	// racing another session's SETACTIVE) can see an inactive script that is
+	// active by the time it is deleted.
+	switch err := s.server.rdb.DeleteInactiveScriptWithRetry(ctx, name, accountID); {
+	case err == nil:
+		s.pinToMasterDB("DELETESCRIPT")
+		return nil
+	case errors.Is(err, consts.ErrDBNotFound):
+		return errNonExistent
+	case errors.Is(err, db.ErrSieveScriptActive):
 		return &managesieveserver.Error{Code: "ACTIVE", Message: "Cannot delete the active script; deactivate it first"}
-	}
-
-	if err := s.server.rdb.DeleteScriptByIDWithRetry(ctx, script.ID, accountID); err != nil {
+	default:
 		return errTryLater
 	}
-
-	s.pinToMasterDB("DELETESCRIPT")
-	return nil
 }
 
 // RenameScript implements managesieveserver.Session. The rename is a single
@@ -853,6 +945,8 @@ func (s *ManageSieveSession) RenameScript(ctx context.Context, oldName, newName 
 		return errNonExistent
 	case errors.Is(renameErr, consts.ErrDBUniqueViolation):
 		return &managesieveserver.Error{Code: "ALREADYEXISTS", Message: "A script with the new name already exists"}
+	case errors.Is(renameErr, db.ErrSieveScriptNotStorable):
+		return &managesieveserver.Error{Message: msieve.Quote("Script validation failed: " + msieve.SanitizeText(renameErr.Error()))}
 	default:
 		return errTryLater
 	}
@@ -967,40 +1061,48 @@ func (s *ManageSieveSession) Close() error {
 	}
 }
 
-// registerConnection registers the connection in the connection tracker.
-// It runs synchronously within the authenticating command, so it is bounded
-// by the per-command context (plus the query timeout).
-func (s *ManageSieveSession) registerConnection(ctx context.Context, email string) {
-	if s.server.connTracker != nil && s.User != nil {
-		// Use configured database query timeout for connection tracking (database INSERT)
-		queryTimeout := s.server.rdb.GetQueryTimeout()
-		ctx, cancel := context.WithTimeout(ctx, queryTimeout)
-		defer cancel()
-
-		// The client's address, not the TCP peer: behind a proxy the peer is
-		// the proxy for every client. RemoteIP already holds the address from
-		// the PROXY header.
-		clientAddr := s.RemoteIP
-
-		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "ManageSieve", clientAddr); err != nil {
-			s.InfoLog("rejected connection registration", "error", err)
-			return
-		}
-		s.trackedClientAddr = clientAddr
+// registerConnection takes a slot for the logging-in account in the connection
+// tracker. The error is the tracker's refusal: the account is at
+// max_connections_per_user or max_connections_per_user_per_ip. It runs
+// synchronously within the authenticating command, so it is bounded by the
+// per-command context (plus the query timeout).
+func (s *ManageSieveSession) registerConnection(ctx context.Context, accountID int64, email string) error {
+	if s.server.connTracker == nil {
+		return nil
 	}
+	// Use configured database query timeout for connection tracking (database INSERT)
+	queryTimeout := s.server.rdb.GetQueryTimeout()
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	// The client's address, not the TCP peer: behind a proxy the peer is
+	// the proxy for every client. RemoteIP already holds the address from
+	// the PROXY header.
+	clientAddr := s.RemoteIP
+
+	if err := s.server.connTracker.RegisterConnection(ctx, accountID, email, "ManageSieve", clientAddr); err != nil {
+		return err
+	}
+	s.tracked = true
+	s.trackedClientAddr = clientAddr
+	return nil
 }
 
-// unregisterConnection removes the connection from the connection tracker
+// unregisterConnection releases the session's slot in the connection tracker,
+// if it holds one.
 func (s *ManageSieveSession) unregisterConnection() {
-	if s.server.connTracker != nil && s.User != nil && s.trackedClientAddr != "" {
-		// Use configured database query timeout for connection tracking (database DELETE)
-		queryTimeout := s.server.rdb.GetQueryTimeout()
-		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
-		defer cancel()
+	if !s.tracked {
+		return
+	}
+	s.tracked = false
 
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "ManageSieve", s.trackedClientAddr); err != nil {
-			s.WarnLog("failed to unregister connection", "error", err)
-		}
+	// Use configured database query timeout for connection tracking (database DELETE)
+	queryTimeout := s.server.rdb.GetQueryTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "ManageSieve", s.trackedClientAddr); err != nil {
+		s.WarnLog("failed to unregister connection", "error", err)
 	}
 }
 

@@ -28,15 +28,6 @@ type SpamTrainingConfig struct {
 	// Default: "10mb"
 	MaxMessageSize string `toml:"max_message_size"`
 
-	// Skip training if message has attachments larger than this size
-	// Set to "0" to always strip attachments and train regardless of size
-	// Default: "0" (always strip and train)
-	MaxAttachmentSize string `toml:"max_attachment_size"`
-
-	// Async mode: submit training requests in background (don't block MOVE)
-	// Default: true
-	Async bool `toml:"async"`
-
 	// Number of workers that fetch and submit training messages, process-wide.
 	// Default: 4
 	Workers int `toml:"workers"`
@@ -99,14 +90,6 @@ func (s *SpamTrainingConfig) GetQueueSize() int {
 		return 1000
 	}
 	return s.QueueSize
-}
-
-// GetMaxAttachmentSize parses and returns the maximum attachment size
-func (s *SpamTrainingConfig) GetMaxAttachmentSize() (int64, error) {
-	if s.MaxAttachmentSize == "" {
-		return 0, nil // Default: always strip attachments
-	}
-	return helpers.ParseSize(s.MaxAttachmentSize)
 }
 
 // GetCircuitBreakerThreshold returns the circuit breaker failure threshold

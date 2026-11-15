@@ -118,35 +118,32 @@ func TestCanUseFTSPrefilter(t *testing.T) {
 	tests := []struct {
 		name         string
 		criteria     *imap.SearchCriteria
-		seqNum       bool
 		orderBy      string
 		mailboxCount int
 		want         bool
 		why          string
 	}{
-		{"small mailbox keeps the per-message probe", body("invoice"), false, "", 100, false,
+		{"small mailbox keeps the per-message probe", body("invoice"), "", 100, false,
 			"below the threshold the probe is ~150x cheaper"},
-		{"large mailbox gets the prefilter", body("invoice"), false, "", ftsCTEThreshold, true,
+		{"large mailbox gets the prefilter", body("invoice"), "", ftsCTEThreshold, true,
 			"at and above the threshold the probe degrades to a full mailbox scan with a detoast per row"},
-		{"unknown mailbox size keeps the probe", body("invoice"), false, "", 0, false,
+		{"unknown mailbox size keeps the probe", body("invoice"), "", 0, false,
 			"callers with no count (User API, MULTISEARCH) must get the safe default"},
-		{"two body terms share one match set", body("a", "b"), false, "", 100000, true,
+		{"two body terms share one match set", body("a", "b"), "", 100000, true,
 			"required terms are intersected inside one account-scoped match set"},
-		{"TEXT gets its own match set", &imap.SearchCriteria{Text: []string{"a"}}, false, "", 100000, true,
+		{"TEXT gets its own match set", &imap.SearchCriteria{Text: []string{"a"}}, "", 100000, true,
 			"TEXT is body OR headers, so its body side is a LEFT JOINed match set, not an inner join"},
 		{"nested FTS gets its own match set", &imap.SearchCriteria{
 			Or: [][2]imap.SearchCriteria{{{Body: []string{"a"}}, {Body: []string{"b"}}}},
-		}, false, "", 100000, true, "a term inside OR/NOT is tested against its own LEFT JOINed match set"},
-		{"seqnum search is rejected", body("invoice"), true, "", 100000, false,
-			"sequence numbers need the legacy CTE"},
-		{"seqnum ORDER BY is rejected", body("invoice"), false, "ORDER BY seqnum", 100000, false,
+		}, "", 100000, true, "a term inside OR/NOT is tested against its own LEFT JOINed match set"},
+		{"seqnum ORDER BY is rejected", body("invoice"), "ORDER BY seqnum", 100000, false,
 			"the rewrite has no seqnum to order by"},
-		{"no FTS term at all", &imap.SearchCriteria{}, false, "", 100000, false,
+		{"no FTS term at all", &imap.SearchCriteria{}, "", 100000, false,
 			"nothing to prefilter"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := db.canUseFTSPrefilter(tc.criteria, tc.seqNum, tc.orderBy, tc.mailboxCount)
+			got := db.canUseFTSPrefilter(tc.criteria, tc.orderBy, tc.mailboxCount)
 			assert.Equal(t, tc.want, got, tc.why)
 		})
 	}

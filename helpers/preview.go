@@ -144,7 +144,7 @@ func MessagePreview(r io.Reader) (preview string) {
 		// Check leaf coding independently of the parser warning: an unknown
 		// charset can overwrite its earlier unknown-encoding error. Multipart
 		// transfer codings remain ignored, matching go-message's MIME quirk.
-		switch strings.ToLower(current.Header.Get("Content-Transfer-Encoding")) {
+		switch transferEncodingMechanism(current.Header.Get("Content-Transfer-Encoding")) {
 		case "", "7bit", "8bit", "binary", "quoted-printable", "base64":
 		default:
 			continue // undecoded bytes must never be shown as text

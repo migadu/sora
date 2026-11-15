@@ -288,3 +288,70 @@ func TestAccountPurgeFollowsTheAddress(t *testing.T) {
 	require.NoError(t, rdb.QueryRowWithRetry(ctx, `SELECT deleted_at IS NOT NULL FROM accounts WHERE id = $1`, idA).Scan(&deletedA))
 	require.False(t, deletedA, "the account the stale id named must be left in service")
 }
+
+// TestDomainPurgeRemovesAliasesWithNoAccountInDomain: a cross-domain alias (a non-primary
+// address in the domain, on an account whose primary address is elsewhere) keeps receiving
+// mail for the domain until the purge removes it. It has to be removed even when no account
+// has its primary address in the domain: a domain that only ever held aliases, or the re-run
+// the command asks for after an alias removal failed, once the first run purged the accounts.
+// An alias on a soft-deleted account is removed too (#934): restoring the account would put
+// it back in service.
+func TestDomainPurgeRemovesAliasesWithNoAccountInDomain(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		accountsPurged bool // the domain had an account, purged by an earlier run
+		ownerDeleted   bool // the alias's account is soft-deleted during the purge
+	}{
+		{name: "domain holds only aliases"},
+		{name: "re-run after the accounts were purged", accountsPurged: true},
+		{name: "alias of a soft-deleted account", ownerDeleted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			rdb := setupPurgeTestDatabase(t)
+			defer rdb.Close()
+			s3Storage := createPurgeTestS3Storage(t)
+			cfg := createPurgeTestConfig(t)
+
+			stamp := time.Now().UnixNano()
+			domain := fmt.Sprintf("purge-aliases-%d.example.com", stamp)
+			owner := fmt.Sprintf("owner-%d@example.org", stamp)
+			alias := "alias@" + domain
+			createPurgeTestAccount(t, rdb, owner, "password123")
+			ownerID, err := rdb.GetAccountIDByEmailWithRetry(ctx, owner)
+			require.NoError(t, err)
+			require.NoError(t, rdb.AddCredentialWithRetry(ctx, db.AddCredentialRequest{AccountID: ownerID, NewEmail: alias, NewPassword: "password123", NewHashType: "bcrypt"}))
+
+			if tc.accountsPurged {
+				user := "user@" + domain
+				createPurgeTestAccount(t, rdb, user, "password123")
+				userID, err := rdb.GetAccountIDByEmailWithRetry(ctx, user)
+				require.NoError(t, err)
+				require.NoError(t, purgeAccountWithStorage(ctx, cfg, rdb, userID, user, s3Storage))
+			}
+			if tc.ownerDeleted {
+				require.NoError(t, rdb.DeleteAccountWithRetry(ctx, owner))
+			}
+
+			out := captureStdout(t, func() error { return purgeDomainWithStorage(ctx, cfg, rdb, domain, s3Storage) })
+
+			var aliasRows int
+			require.NoError(t, rdb.QueryRowWithRetry(ctx, `SELECT count(*) FROM credentials WHERE address = $1`, alias).Scan(&aliasRows))
+			require.Zero(t, aliasRows, "alias %s left in the purged domain; output:\n%s", alias, out)
+			require.Contains(t, out, "Removed alias: "+alias)
+			require.Contains(t, out, "Aliases removed: 1")
+
+			if tc.ownerDeleted {
+				// The account comes back without the alias.
+				require.NoError(t, rdb.RestoreAccountWithRetry(ctx, owner))
+				_, err := rdb.GetAccountIDByEmailWithRetry(ctx, alias)
+				require.Error(t, err, "restored account answers for %s again", alias)
+			}
+
+			// The account the alias hung off is kept, with its own address.
+			id, err := rdb.GetAccountIDByEmailWithRetry(ctx, owner)
+			require.NoError(t, err)
+			require.Equal(t, ownerID, id)
+		})
+	}
+}

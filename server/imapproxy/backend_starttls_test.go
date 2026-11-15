@@ -70,10 +70,17 @@ func fakeSTARTTLSBackend(t *testing.T, reply func(tag string) string) (addr stri
 // remote_tls_use_starttls.
 func connectThroughSTARTTLS(t *testing.T, addr string) (*Session, error) {
 	t.Helper()
+	return connectToTestBackend(t, addr, proxy.BackendSettings{TLS: true, TLSUseStartTLS: true})
+}
+
+// connectToTestBackend runs connectToBackend for user@example.com against addr with
+// the given backend leg settings.
+func connectToTestBackend(t *testing.T, addr string, settings proxy.BackendSettings) (*Session, error) {
+	t.Helper()
 	cm, err := proxy.NewConnectionManagerFromOptions(proxy.ManagerOptions{
 		RemoteAddrs:        []string{addr},
 		RemotePort:         143,
-		Settings:           proxy.BackendSettings{TLS: true, TLSUseStartTLS: true},
+		Settings:           settings,
 		ConnectTimeout:     2 * time.Second,
 		ServerName:         "test",
 		DisableHealthCheck: true,

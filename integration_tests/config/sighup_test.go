@@ -205,6 +205,99 @@ api_key = "sighup-test-key"
 	p.failIfKilledBySIGHUP(t)
 }
 
+// TestSoraAppliesASIGHUPOnceTheServersRun sends SIGHUP, with a setting the POP3 proxy's
+// ReloadConfig applies changed, while that proxy is still starting: its certificate is
+// a FIFO the test has not written yet. The reload ran as soon as the server goroutines
+// were launched, past the proxy, which registers for reload only once it is set up: it
+// reported auth_idle_timeout as needing a restart, and the proxy kept the old value. The
+// reload must wait for the proxy and apply it.
+func TestSoraAppliesASIGHUPOnceTheServersRun(t *testing.T) {
+	dir := t.TempDir()
+	certFile, keyFile, _ := common.GenerateTestTLSCert(t, nil, nil)
+	certPEM, err := os.ReadFile(certFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fifo := filepath.Join(dir, "cert.pem")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("no FIFO here: %v", err)
+	}
+
+	logPath := filepath.Join(dir, "sora.log")
+	cfgPath := filepath.Join(dir, "sora.toml")
+	addr := common.GetRandomAddress(t)
+	// A remote_lookup proxy without lookup_local_users needs no database.
+	config := func(authIdleTimeout string) string {
+		return fmt.Sprintf(`
+[logging]
+output = %q
+format = "console"
+level = "info"
+
+[[server]]
+type = "pop3_proxy"
+name = "pop3-proxy"
+addr = %q
+remote_addrs = ["127.0.0.1:1"]
+tls = true
+tls_cert_file = %q
+tls_key_file = %q
+auth_idle_timeout = %q
+
+[server.remote_lookup]
+enabled = true
+url = "http://127.0.0.1:1/lookup/$email"
+`, logPath, addr, fifo, keyFile, authIdleTimeout)
+	}
+	writeConfigAtomically(t, cfgPath, config("1h"))
+
+	p := startSora(t, cfgPath)
+	// Opening the FIFO to write returns once sora opens it to read the certificate: the
+	// proxy is starting and has not registered for reload.
+	opened := make(chan *os.File, 1)
+	go func() {
+		f, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+		if err != nil {
+			close(opened)
+			return
+		}
+		opened <- f
+	}()
+	var cert *os.File
+	select {
+	case cert = <-opened:
+		if cert == nil {
+			t.Fatal("cannot open the certificate FIFO")
+		}
+	case <-p.exited:
+		t.Fatalf("sora exited before reading its certificate: %v\n--- output ---\n%s", p.err, p.out)
+	case <-time.After(30 * time.Second):
+		t.Fatalf("sora did not read its certificate within 30s\n--- output ---\n%s", p.out)
+	}
+	t.Cleanup(func() { cert.Close() })
+
+	writeConfigAtomically(t, cfgPath, config("2h"))
+	if err := p.cmd.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	waitForFile(t, p, logPath, "SIGHUP received")
+	if _, err := cert.Write(certPEM); err != nil {
+		t.Fatal(err)
+	}
+	cert.Close()
+
+	waitForFile(t, p, logPath, "POP3 proxy config reloaded")
+	content, _ := os.ReadFile(logPath)
+	for _, line := range strings.Split(string(content), "\n") {
+		if strings.Contains(line, "POP3 proxy config reloaded") && !strings.Contains(line, "auth_idle_timeout") {
+			t.Errorf("the reload did not apply auth_idle_timeout: %s", line)
+		}
+		if strings.Contains(line, "server=pop3-proxy") && strings.Contains(line, "restart") {
+			t.Errorf("auth_idle_timeout, which the proxy reloads, reported as needing a restart: %s", line)
+		}
+	}
+}
+
 // TestSoraReportsWhatASIGHUPDoesNotApply changes global settings and adds a [[server]]
 // block on a running node, then sends SIGHUP. A reload applies none of them, and it used
 // to say nothing about them either (#282): it must name each as needing a restart.

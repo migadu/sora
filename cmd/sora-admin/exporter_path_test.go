@@ -21,7 +21,10 @@ func TestExporterMailboxDirContainment(t *testing.T) {
 			{"INBOX", "."},
 			{"Sent", "Sent"},
 			{"Archive/2024", filepath.Join("Archive", "2024")},
-			{"Foo.Bar", "Foo.Bar"},
+			// A '.' in a level is escaped, or the importer would read it as the
+			// Maildir++ hierarchy separator (#1166).
+			{"Foo.Bar", `Foo\2eBar`},
+			{"Données/Q1", filepath.Join("Donn&AOk-es", "Q1")},
 		}
 		for _, c := range cases {
 			dir, err := exporter.mailboxDir(c.mailbox)
@@ -40,10 +43,10 @@ func TestExporterMailboxDirContainment(t *testing.T) {
 		}
 	})
 
-	// Names whose ".." segments make the path escape the export root must be
-	// rejected. (Names with contained ".." that normalise back inside the root,
-	// e.g. "foo/../bar" -> "<root>/bar", are not an escape and are blocked
-	// earlier at mailbox creation by helpers.MailboxNameHasTraversal.)
+	// Names with a "." or ".." level are rejected, as mailbox creation rejects
+	// them (helpers.MailboxNameHasTraversal): no directory names them. That
+	// includes names that normalise back inside the root, e.g. "foo/../bar",
+	// which would otherwise share the directory of the mailbox "bar".
 	t.Run("escaping names are rejected", func(t *testing.T) {
 		bad := []string{
 			"..",
@@ -52,6 +55,7 @@ func TestExporterMailboxDirContainment(t *testing.T) {
 			"../../etc/passwd",
 			"foo/..",               // normalises to the root itself
 			"Archive/../../secret", // escapes one level above root
+			"foo/../bar",           // normalises to the directory of "bar"
 		}
 		for _, mailbox := range bad {
 			dir, err := exporter.mailboxDir(mailbox)

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -104,12 +106,57 @@ auth_token = "example-lookup-token"
 	}
 }
 
+// Exercise the actual TOML loader and both dump encoders: interface-valued port
+// fields may hold unvalidated strings, maps and arrays during inspection.
+func TestConfigDumpMasksNestedAndInterfaceURLs(t *testing.T) {
+	content := []byte(`
+[database.write]
+hosts = ["db.example.invalid"]
+port = { nested = ["jdbc:postgresql://fixture-db-user:fixture-db-password@db.example.invalid/mail?token=fixture-db-token"] }
+
+[[server]]
+type = "imap_proxy"
+name = "fixture-proxy"
+addr = "127.0.0.1:0"
+remote_port = " /https://fixture-port-user:fixture-port-password@backend.example.invalid/path "
+remote_addrs = ["https://public.example.invalid/a,https://fixture-list-user:fixture-list-password@backend.example.invalid/b"]
+
+[server.remote_lookup]
+remote_port = { nested = ["https://proxy.example.invalid/fetch#redirect=https://fixture-nested-user:fixture-nested-password@lookup.example.invalid/path?token=fixture-nested-token"] }
+`)
+	secrets := []string{
+		"fixture-db-user", "fixture-db-password", "fixture-db-token",
+		"fixture-port-user", "fixture-port-password",
+		"fixture-list-user", "fixture-list-password",
+		"fixture-nested-user", "fixture-nested-password", "fixture-nested-token",
+	}
+	for _, format := range []string{"toml", "json"} {
+		t.Run(format, func(t *testing.T) {
+			masked := runConfigDump(t, content, format)
+			plain := runConfigDumpWithMask(t, content, format, "false")
+			for _, secret := range secrets {
+				if strings.Contains(masked, secret) {
+					t.Errorf("masked dump exposes fixture credential %q", secret)
+				}
+				if !strings.Contains(plain, secret) {
+					t.Errorf("unmasked dump lost fixture credential %q", secret)
+				}
+			}
+			for _, kept := range []string{"jdbc:postgresql://", "db.example.invalid/mail", "backend.example.invalid/path", "lookup.example.invalid/path", "https://public.example.invalid/a"} {
+				if !strings.Contains(masked, kept) {
+					t.Errorf("masked dump lost public endpoint detail %q", kept)
+				}
+			}
+		})
+	}
+}
+
 // Endpoint userinfo is functional HTTP Basic authentication even without an
 // auth_token. Mask it in public URL settings too, but retain the routing details.
 func TestConfigDumpMasksURLUserInfo(t *testing.T) {
 	urls := []string{
 		"https://admin-user:admin-password@admin.example.invalid:8443/admin",
-		"https://relay-user:relay-password@relay.example.invalid/send%2Fmail?mode=fixture#fragment",
+		"https://relay-user:relay-password@relay.example.invalid/send%2Fmail#fragment",
 		"https://training-user@training.example.invalid/train",
 		"https://lookup%40user:lookup%40password@[::1]:8443/lookup",
 		"https://storage-user:storage-password@s3.example.invalid/bucket",
@@ -155,7 +202,7 @@ url = %q
 					u.User = url.User(config.SecretMask)
 				}
 				if !strings.Contains(out, u.String()) {
-					t.Error("masked URL lost its scheme, host, port, path, query or fragment")
+					t.Error("masked URL lost its scheme, host, port, path or fragment")
 				}
 			}
 			if strings.Contains(out, "fixture-api-key") {
@@ -166,6 +213,63 @@ url = %q
 			for _, original := range append(urls, "fixture-api-key") {
 				if !strings.Contains(unmasked, original) {
 					t.Error("--mask-secrets=false changed a fixture credential")
+				}
+			}
+		})
+	}
+}
+
+// Endpoint APIs authenticate with query parameters of any name, so the masked dump
+// masks every query value, percent-encoded or not, and keeps the parameter names (#596).
+func TestConfigDumpMasksURLQueryValues(t *testing.T) {
+	const m = config.SecretMask
+	endpoints := []struct{ key, in, want string }{
+		{"[relay] http_url",
+			"https://relay.example.invalid/send?api_key=fixture-query-secret",
+			"https://relay.example.invalid/send?api_key=" + m},
+		{"[spam_training] endpoint",
+			"https://training.example.invalid/train?api%5Fkey=fixture%2Dencoded%2Dsecret&empty=&fixture-bare-token#fragment",
+			"https://training.example.invalid/train?api%5Fkey=" + m + "&empty=&" + m + "#fragment"},
+		{"[server.remote_lookup] url",
+			"https://lookup-user@lookup.example.invalid/lookup?email=$email&token=fixture-lookup-secret",
+			"https://%2A%2A%2AMASKED%2A%2A%2A@lookup.example.invalid/lookup?email=$email&token=" + m},
+	}
+	content := []byte(fmt.Sprintf(`
+[relay]
+http_url = %q
+[spam_training]
+endpoint = %q
+[[server]]
+type = "imap_proxy"
+name = "fixture"
+addr = "127.0.0.1:0"
+[server.remote_lookup]
+url = %q
+`, endpoints[0].in, endpoints[1].in, endpoints[2].in))
+	secrets := []string{"fixture-query-secret", "fixture%2Dencoded%2Dsecret", "fixture-encoded-secret", "fixture-bare-token", "fixture-lookup-secret", "lookup-user"}
+	quote := map[string]func(string) string{
+		"toml": strconv.Quote,
+		"json": func(s string) string { b, _ := json.Marshal(s); return string(b) },
+	}
+
+	for _, format := range []string{"toml", "json"} {
+		t.Run(format, func(t *testing.T) {
+			out := runConfigDump(t, content, format)
+			for _, secret := range secrets {
+				if strings.Contains(out, secret) {
+					t.Errorf("dump prints the fixture query credential %q", secret)
+				}
+			}
+			for _, e := range endpoints {
+				if !strings.Contains(out, quote[format](e.want)) {
+					t.Errorf("%s: dump lacks %s", e.key, quote[format](e.want))
+				}
+			}
+
+			unmasked := runConfigDumpWithMask(t, content, format, "false")
+			for _, e := range endpoints {
+				if !strings.Contains(unmasked, quote[format](e.in)) {
+					t.Errorf("%s: --mask-secrets=false changed the URL", e.key)
 				}
 			}
 		})
@@ -274,6 +378,33 @@ func TestConfigDumpMasksEverySecretField(t *testing.T) {
 				if strings.Contains(out, filled[path]) {
 					t.Errorf("dump prints %s in clear", path)
 				}
+			}
+		})
+	}
+}
+
+// `config dump` shows the configuration the server runs with. A [database.write] or
+// [database.read] endpoint the file does not define is not one the server uses (a
+// proxy runs without a database); the dump used to show the built-in localhost one.
+func TestConfigDumpShowsTheDatabaseEndpointsTheServerUses(t *testing.T) {
+	for _, tc := range []struct {
+		name, toml          string
+		wantWrite, wantRead bool
+	}{
+		{"no endpoint", "[database]\nquery_timeout = \"10s\"\n", false, false},
+		{"write endpoint only", "[database.write]\nhosts = [\"db1.example.com\"]\n", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dump := runConfigDump(t, []byte(tc.toml), "toml")
+			if got := strings.Contains(dump, "[database.write]"); got != tc.wantWrite {
+				t.Errorf("dump shows [database.write]: %v, want %v\n%s", got, tc.wantWrite, dump)
+			}
+			if got := strings.Contains(dump, "[database.read]"); got != tc.wantRead {
+				t.Errorf("dump shows [database.read]: %v, want %v\n%s", got, tc.wantRead, dump)
+			}
+			// A table in the file takes the server's defaults for the keys it leaves out.
+			if tc.wantWrite && !strings.Contains(dump, `name = "sora_mail_db"`) {
+				t.Errorf("dump does not show the default database name for [database.write]:\n%s", dump)
 			}
 		})
 	}

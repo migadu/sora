@@ -328,7 +328,9 @@ func (db *Database) ListCredentials(ctx context.Context, email string) ([]Creden
 	}
 	defer rows.Close()
 
-	var credentials []Credential
+	// Never nil: an empty result is the JSON array [], not null. The account was found by
+	// one of its credentials, but in a separate query, so a purge in between leaves no rows.
+	credentials := []Credential{}
 	for rows.Next() {
 		var cred Credential
 		var createdAt, updatedAt any
@@ -364,9 +366,28 @@ func (db *Database) IsAddressOwnedByAccount(ctx context.Context, accountID int64
 	return exists, nil
 }
 
+// IsAnyAddressOwnedByAccount reports whether any of addresses is a credential of
+// accountID, matched as IsAddressOwnedByAccount matches one, in a single query. Used
+// by the SIEVE vacation personal message check (RFC 5230 §4.5), which asks about
+// every recipient of the original message.
+func (db *Database) IsAnyAddressOwnedByAccount(ctx context.Context, accountID int64, addresses []string) (bool, error) {
+	if len(addresses) == 0 {
+		return false, nil
+	}
+	var exists bool
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM credentials WHERE account_id = $1 AND LOWER(address) = ANY(SELECT LOWER(a) FROM unnest($2::text[]) AS a))`,
+		accountID, addresses).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check address ownership: %w", err)
+	}
+	return exists, nil
+}
+
 var (
-	ErrCannotDeletePrimaryCredential = errors.New("cannot delete the primary credential. Use update-account to make another credential primary first")
-	ErrCannotDeleteLastCredential    = errors.New("cannot delete the last credential for an account. Use delete-account to remove the entire account")
+	// The Admin API returns these to its clients as well, so they name no sora-admin command.
+	ErrCannotDeletePrimaryCredential = errors.New("cannot delete the primary credential: make another credential of the account primary first")
+	ErrCannotDeleteLastCredential    = errors.New("cannot delete the last credential of an account: delete the account instead")
 	// ErrCrossDomainPrimaryChange is returned when an operation would switch an account's
 	// primary identity to a different domain while the account already has messages. Message
 	// storage keys (s3_domain) are captured per-message from the then-current primary, so such
@@ -869,11 +890,13 @@ func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]A
 }
 
 // GetAliasCredentialsByDomain returns the addresses of all NON-primary credentials whose
-// address is in the given domain, across active (non-deleted) accounts. Domain purge uses
-// this to find cross-domain aliases: addresses in the purged domain that hang off accounts
-// whose primary identity lives in a different domain (so the account is not itself purged).
-// Such aliases keep receiving mail for the purged domain unless explicitly removed. The
-// domain is matched exactly, as in GetAccountsByDomain.
+// address is in the given domain, on accounts whose primary identity lives in a different
+// domain. Domain purge uses this to find cross-domain aliases: addresses in the purged
+// domain that hang off accounts it does not purge. Such aliases keep receiving mail for the
+// purged domain unless explicitly removed. Soft-deleted accounts are included: restoring
+// one puts its aliases back in service. Accounts with their primary in the domain are left
+// out, soft-deleted or not, since the purge removes them whole. The domain is matched
+// exactly, as in GetAccountsByDomain.
 func (db *Database) GetAliasCredentialsByDomain(ctx context.Context, domain string) ([]string, error) {
 	rows, err := db.GetReadPool().Query(ctx, `
 		SELECT c.address
@@ -881,7 +904,12 @@ func (db *Database) GetAliasCredentialsByDomain(ctx context.Context, domain stri
 		JOIN accounts a ON a.id = c.account_id
 		WHERE c.domain = LOWER($1)
 		  AND c.primary_identity = FALSE
-		  AND a.deleted_at IS NULL
+		  AND NOT EXISTS (
+		      SELECT 1 FROM credentials p
+		      WHERE p.account_id = c.account_id
+		        AND p.primary_identity = TRUE
+		        AND p.domain = c.domain
+		  )
 		ORDER BY c.address
 	`, domain)
 	if err != nil {
@@ -906,9 +934,9 @@ func (db *Database) ListAccounts(ctx context.Context) ([]AccountSummary, error) 
 		WITH account_stats AS (
 			SELECT mb.account_id,
 				   COUNT(mb.id) as mailbox_count,
-				   -- Bulk all-accounts listing intentionally uses the mailbox_stats cache (kept accurate
-				   -- by the stats triggers + the admin recalculate-stats command) to avoid a full
-				   -- messages-table aggregate on every listing. Per-account quota lookups use live counts.
+				   -- Bulk all-accounts listing intentionally uses the mailbox_stats cache (maintained
+				   -- by the stats triggers) to avoid a full messages-table aggregate on every
+				   -- listing. Per-account quota lookups use live counts.
 				   COALESCE(SUM(ms.message_count), 0) as message_count,
 				   COALESCE(SUM(ms.total_size), 0) as storage_used
 			FROM mailboxes mb
@@ -1091,7 +1119,7 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 		}
 		if cred.Password != "" {
 			if err := ValidateNewHashType(req.Credentials[i].HashType); err != nil {
-				return 0, fmt.Errorf("credential %d: %w", i+1, err)
+				return 0, fmt.Errorf("%w: credential %d: %w", ErrInvalidAccountRequest, i+1, err)
 			}
 		}
 		if cred.PasswordHash != "" {

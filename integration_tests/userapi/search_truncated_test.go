@@ -14,7 +14,7 @@ import (
 )
 
 // userAPISearchCap is the documented cap on GET /user/mailboxes/{name}/search
-// (docs/user-api.md, Search). Written out rather than imported so the test also pins
+// (docs/USER_API.md, section 8 "Search"). Written out rather than imported so the test also pins
 // the number the documentation promises.
 const userAPISearchCap = 100
 

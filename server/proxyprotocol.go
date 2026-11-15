@@ -2,11 +2,13 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"github.com/migadu/sora/logger"
 	"io"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +26,13 @@ var ErrNoProxyHeader = errors.New("no PROXY protocol header found")
 // TRUSTED peers, which indicate a misconfigured proxy fleet (a peer that
 // should send PROXY headers but doesn't).
 var ErrUntrustedProxySource = errors.New("PROXY protocol connection from untrusted source")
+
+// proxyV1Sig opens every PROXY v1 line and proxyV2Sig every v2 header (haproxy
+// doc/proxy-protocol.txt sections 2.1 and 2.2).
+var (
+	proxyV1Sig = []byte("PROXY")
+	proxyV2Sig = []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
+)
 
 // ProxyProtocolConfig is an alias for config.ProxyProtocolConfig for compatibility
 type ProxyProtocolConfig = config.ProxyProtocolConfig
@@ -172,8 +181,16 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 	// Create buffered reader
 	reader := bufio.NewReader(conn)
 
-	// Peek at first few bytes to detect PROXY protocol
-	peek, err := reader.Peek(16) // Peek more bytes to detect PROXY v2 signature
+	// Wait only for the bytes that tell the headers apart. Every v1 line starts
+	// with the 5-byte v1 signature and the shortest one, "PROXY UNKNOWN\r\n", is
+	// 15 bytes; on the server-speaks-first protocols the sender then waits for the
+	// greeting, so waiting for the 16 bytes of a v2 header before looking would
+	// hold that connection until the timeout. Only a stream that starts like the
+	// v2 signature is peeked further.
+	peek, err := reader.Peek(len(proxyV1Sig))
+	if err == nil && bytes.HasPrefix(proxyV2Sig, peek) {
+		peek, err = reader.Peek(len(proxyV2Sig))
+	}
 	if err != nil {
 		// If peeking fails (e.g., connection closed immediately), it's not a "no header" case.
 		// It's a connection error.
@@ -187,7 +204,7 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 	}
 
 	// Check for PROXY v1 signature
-	if len(peek) >= 5 && string(peek[:5]) == "PROXY" {
+	if bytes.Equal(peek, proxyV1Sig) {
 		logger.Debug("PROXY protocol: Detected v1", "remote", GetAddrString(conn.RemoteAddr()))
 		info, err := r.parseProxyV1(reader)
 		if err != nil {
@@ -209,42 +226,29 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 	}
 
 	// Check for PROXY v2 signature (binary)
-	if len(peek) >= 12 {
-		// PROXY v2 signature: \x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A
-		v2Sig := []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
-		if len(peek) >= len(v2Sig) {
-			match := true
-			for i, b := range v2Sig {
-				if peek[i] != b {
-					match = false
-					break
-				}
-			}
-			if match {
-				logger.Debug("PROXY protocol: Detected v2", "remote", GetAddrString(conn.RemoteAddr()))
-				info, err := r.parseProxyV2(reader)
-				if err != nil {
-					return nil, conn, fmt.Errorf("failed to parse PROXY v2 header: %w", err)
-				}
-
-				if info.SrcIP != "" {
-					logger.Debug("PROXY protocol: Parsed v2", "client_ip", info.SrcIP, "client_port", info.SrcPort, "server_ip", info.DstIP, "server_port", info.DstPort)
-				} else {
-					logger.Debug("PROXY protocol: Parsed v2 command", "command", info.Command)
-				}
-
-				// Clear read deadline
-				conn.SetReadDeadline(time.Time{})
-
-				// Return wrapped connection
-				wrappedConn := &proxyProtocolConn{
-					Conn:   conn,
-					reader: reader,
-				}
-
-				return info, wrappedConn, nil
-			}
+	if bytes.Equal(peek, proxyV2Sig) {
+		logger.Debug("PROXY protocol: Detected v2", "remote", GetAddrString(conn.RemoteAddr()))
+		info, err := r.parseProxyV2(reader)
+		if err != nil {
+			return nil, conn, fmt.Errorf("failed to parse PROXY v2 header: %w", err)
 		}
+
+		if info.SrcIP != "" {
+			logger.Debug("PROXY protocol: Parsed v2", "client_ip", info.SrcIP, "client_port", info.SrcPort, "server_ip", info.DstIP, "server_port", info.DstPort)
+		} else {
+			logger.Debug("PROXY protocol: Parsed v2 command", "command", info.Command)
+		}
+
+		// Clear read deadline
+		conn.SetReadDeadline(time.Time{})
+
+		// Return wrapped connection
+		wrappedConn := &proxyProtocolConn{
+			Conn:   conn,
+			reader: reader,
+		}
+
+		return info, wrappedConn, nil
 	}
 
 	// No PROXY protocol detected, clear deadline and return original connection
@@ -266,49 +270,70 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 	return nil, wrappedConn, fmt.Errorf("PROXY protocol header missing")
 }
 
-// parseProxyV1 parses PROXY protocol version 1 header
+// proxyV1MaxLine is the longest PROXY v1 line including the CRLF ("PROXY UNKNOWN"
+// with two full IPv6 addresses and ports), haproxy doc/proxy-protocol.txt section 2.1.
+const proxyV1MaxLine = 107
+
+// parseProxyV1 parses a PROXY protocol version 1 header. Section 2.1 of the
+// specification defines the line exactly, and "any sequence which does not exactly
+// match the protocol must be discarded and cause the receiver to abort the
+// connection", so every field is validated: the source address becomes the
+// session's client address.
 func (r *ProxyProtocolReader) parseProxyV1(reader *bufio.Reader) (*ProxyProtocolInfo, error) {
-	// Read the PROXY line (ends with \r\n)
-	line, err := reader.ReadString('\n')
+	// ReadSlice stops at the reader's buffer size, so a sender that never ends
+	// the line cannot make it grow; a line that long is invalid anyway.
+	raw, err := reader.ReadSlice('\n')
 	if err != nil {
+		if errors.Is(err, bufio.ErrBufferFull) {
+			err = errors.New("no CRLF")
+		}
 		return nil, fmt.Errorf("failed to read PROXY line: %w", err)
 	}
+	if len(raw) > proxyV1MaxLine {
+		return nil, fmt.Errorf("invalid PROXY v1 header: longer than %d characters", proxyV1MaxLine)
+	}
+	line, ok := strings.CutSuffix(string(raw), "\r\n")
+	if !ok {
+		return nil, errors.New("invalid PROXY v1 header: not terminated by CRLF")
+	}
 
-	// Remove \r\n
-	line = strings.TrimRight(line, "\r\n")
-
-	// Parse: "PROXY TCP4 255.255.255.255 255.255.255.255 65535 65535"
+	// "PROXY TCP4 255.255.255.255 255.255.255.255 65535 65535", one space apart.
 	parts := strings.Split(line, " ")
-	if len(parts) != 6 {
-		return nil, fmt.Errorf("invalid PROXY v1 format: expected 6 parts, got %d", len(parts))
+	if len(parts) < 2 || parts[0] != "PROXY" {
+		return nil, fmt.Errorf("invalid PROXY v1 header: %q", line)
 	}
 
-	if parts[0] != "PROXY" {
-		return nil, fmt.Errorf("invalid PROXY v1 header: expected PROXY, got %s", parts[0])
-	}
-
-	protocol := parts[1] // TCP4, TCP6, UNKNOWN
-	srcIP := parts[2]
-	dstIP := parts[3]
-	srcPortStr := parts[4]
-	dstPortStr := parts[5]
-
-	// Handle UNKNOWN connections
-	if protocol == "UNKNOWN" {
+	protocol := parts[1]
+	switch protocol {
+	case "UNKNOWN":
+		// "the rest of the line before the CRLF may be omitted by the sender, and
+		// the receiver must ignore anything presented before the CRLF is found".
 		return &ProxyProtocolInfo{
 			Version:  1,
 			Command:  "UNKNOWN",
 			Protocol: protocol,
 		}, nil
+	case "TCP4", "TCP6":
+	default:
+		return nil, fmt.Errorf("invalid PROXY v1 protocol %q", protocol)
 	}
 
-	// Parse ports
-	srcPort, err := strconv.Atoi(srcPortStr)
+	if len(parts) != 6 {
+		return nil, fmt.Errorf("invalid PROXY v1 format: expected 6 parts, got %d", len(parts))
+	}
+	srcIP, err := parseProxyV1Addr(protocol, parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("invalid source address: %w", err)
+	}
+	dstIP, err := parseProxyV1Addr(protocol, parts[3])
+	if err != nil {
+		return nil, fmt.Errorf("invalid destination address: %w", err)
+	}
+	srcPort, err := parseProxyV1Port(parts[4])
 	if err != nil {
 		return nil, fmt.Errorf("invalid source port: %w", err)
 	}
-
-	dstPort, err := strconv.Atoi(dstPortStr)
+	dstPort, err := parseProxyV1Port(parts[5])
 	if err != nil {
 		return nil, fmt.Errorf("invalid destination port: %w", err)
 	}
@@ -324,6 +349,36 @@ func (r *ProxyProtocolReader) parseProxyV1(reader *bufio.Reader) (*ProxyProtocol
 	}, nil
 }
 
+// parseProxyV1Addr parses a PROXY v1 address of the family the protocol advertises
+// and returns it in canonical form, so that one client is one string for every
+// consumer (logs, per-IP limits, auth rate limiting, remote lookup). netip rejects
+// IPv4 numbers with heading zeroes, as section 2.1 does. A TCP6 address may be
+// IPv4-mapped (HAProxy maps the IPv4 side when the two sides differ in family); it
+// is unmapped, the spelling a direct IPv4 client has.
+func parseProxyV1Addr(protocol, s string) (string, error) {
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		return "", err
+	}
+	if addr.Zone() != "" || (protocol == "TCP4" && !addr.Is4()) || (protocol == "TCP6" && !addr.Is6()) {
+		return "", fmt.Errorf("%q is not a %s address", s, protocol)
+	}
+	return addr.Unmap().String(), nil
+}
+
+// parseProxyV1Port parses a PROXY v1 port, "a decimal integer in the range
+// [0..65535] inclusive. Heading zeroes are not permitted". ParseUint takes no sign.
+func parseProxyV1Port(s string) (int, error) {
+	if len(s) > 1 && s[0] == '0' {
+		return 0, fmt.Errorf("%q has a heading zero", s)
+	}
+	port, err := strconv.ParseUint(s, 10, 16)
+	if err != nil {
+		return 0, err
+	}
+	return int(port), nil
+}
+
 // parseProxyV2 parses PROXY protocol version 2 header (binary format)
 func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocolInfo, error) {
 	// Read the 16-byte header
@@ -334,11 +389,8 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 	}
 
 	// Verify signature (already checked by caller, but double-check)
-	v2Sig := []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
-	for i, b := range v2Sig {
-		if header[i] != b {
-			return nil, fmt.Errorf("invalid PROXY v2 signature")
-		}
+	if !bytes.Equal(header[:len(proxyV2Sig)], proxyV2Sig) {
+		return nil, fmt.Errorf("invalid PROXY v2 signature")
 	}
 
 	// Parse version and command (byte 12)
@@ -378,6 +430,38 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 	// Handle PROXY command (0x1)
 	if command != 0x1 {
 		return nil, fmt.Errorf("unsupported PROXY v2 command: %d", command)
+	}
+
+	// Section 2.2 defines the address families AF_UNSPEC (0x0), AF_INET (0x1),
+	// AF_INET6 (0x2) and AF_UNIX (0x3) and the transport protocols UNSPEC (0x0),
+	// STREAM (0x1) and DGRAM (0x2): "other values are unspecified and must not be
+	// emitted in version 2 of this protocol and must be rejected as invalid by
+	// receivers".
+	if addressFamily > 0x3 {
+		return nil, fmt.Errorf("invalid address family: %d", addressFamily)
+	}
+	if protocol > 0x2 {
+		return nil, fmt.Errorf("invalid transport protocol: %d", protocol)
+	}
+
+	// For an UNSPEC family or transport "the receiver should ignore address
+	// information": the connection keeps its real endpoints, as for LOCAL. AF_UNIX
+	// is valid but not implemented here, and a receiver "automatically falls back
+	// to the UNSPEC mode for the valid combinations above that it does not
+	// support".
+	if addressFamily == 0x0 || addressFamily == 0x3 || protocol == 0x0 {
+		if length > 0 {
+			skipData := make([]byte, length)
+			_, err := io.ReadFull(reader, skipData)
+			if err != nil {
+				return nil, fmt.Errorf("failed to skip UNSPEC address data: %w", err)
+			}
+		}
+		return &ProxyProtocolInfo{
+			Version:  2,
+			Command:  "UNKNOWN",
+			Protocol: "UNKNOWN",
+		}, nil
 	}
 
 	// Read address information based on family
@@ -428,7 +512,7 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 			ProxySessionID: extractProxySessionIDFromTLVs(tlvs),
 		}, nil
 
-	case 0x2: // AF_INET6 (IPv6)
+	default: // 0x2 AF_INET6 (IPv6)
 		if length < 36 {
 			return nil, fmt.Errorf("insufficient data for IPv6 addresses")
 		}
@@ -471,24 +555,6 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 			JA4Fingerprint: extractJA4FromTLVs(tlvs),
 			ProxySessionID: extractProxySessionIDFromTLVs(tlvs),
 		}, nil
-
-	case 0x0: // AF_UNSPEC (UNKNOWN)
-		// Skip the data
-		if length > 0 {
-			skipData := make([]byte, length)
-			_, err := io.ReadFull(reader, skipData)
-			if err != nil {
-				return nil, fmt.Errorf("failed to skip UNKNOWN address data: %w", err)
-			}
-		}
-		return &ProxyProtocolInfo{
-			Version:  2,
-			Command:  "UNKNOWN",
-			Protocol: "UNKNOWN",
-		}, nil
-
-	default:
-		return nil, fmt.Errorf("unsupported address family: %d", addressFamily)
 	}
 }
 

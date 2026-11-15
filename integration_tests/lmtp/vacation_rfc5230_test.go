@@ -82,3 +82,66 @@ func TestLMTP_SieveVacationRFC5230(t *testing.T) {
 		})
 	}
 }
+
+// TestLMTP_SieveVacationPersonalMessageCheck is the RFC 5230 §4.5 personal message
+// check over LMTP against the credentials table, which issue #487 answers in one
+// query for all of the original's recipients. The account's own address with a
+// +detail counts as the account's; a message that names neither the account nor an
+// :addresses entry gets no reply. The second case is the one that fails if LMTP
+// delivery stops wiring the batched ownership lookup: without it the check is skipped
+// and every message is answered.
+func TestLMTP_SieveVacationPersonalMessageCheck(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	imapSrv, account := common.SetupIMAPServer(t)
+	defer imapSrv.Close()
+	rdb := imapSrv.ResilientDB
+
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(context.Background(), account.Email)
+	if err != nil {
+		t.Fatalf("account id: %v", err)
+	}
+	if _, err := rdb.ExecWithRetry(context.Background(), "DELETE FROM vacation_responses WHERE account_id = $1", accountID); err != nil {
+		t.Fatalf("clear vacation_responses: %v", err)
+	}
+	setActiveSieveScript(t, rdb, accountID, "require [\"vacation\"];\r\nvacation :days 1 \"I am away until Monday.\";\r\n")
+
+	rq := &captureRelayQueue{}
+	lmtpAddr := startTestLMTPServerWithRedirect(t, rdb, rq, 10, time.Hour)
+
+	local, domain, _ := strings.Cut(account.Email, "@")
+	for _, tc := range []struct {
+		name    string
+		to      string
+		replies int
+	}{
+		{name: "own address with +detail", to: "list@example.net, " + local + "+tag@" + domain, replies: 1},
+		{name: "account not named", to: "list@example.net, other@example.net", replies: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A sender of its own: the :days window is per sender.
+			sender := fmt.Sprintf("sender-%d@example.org", time.Now().UnixNano())
+			before := len(rq.items())
+			msg := strings.Join([]string{
+				"From: " + sender,
+				"To: " + tc.to,
+				"Subject: Project update",
+				fmt.Sprintf("Message-ID: <%d@example.org>", time.Now().UnixNano()),
+				"",
+				"body",
+			}, "\r\n")
+			if resp := deliverLMTPRaw(t, lmtpAddr, sender, account.Email, msg); !strings.HasPrefix(resp, "250") {
+				t.Fatalf("delivery not accepted: %s", resp)
+			}
+			replies := 0
+			for _, it := range rq.items()[before:] {
+				if it.msgType == "vacation" {
+					replies++
+				}
+			}
+			if replies != tc.replies {
+				t.Errorf("To: %s: %d vacation replies, want %d", tc.to, replies, tc.replies)
+			}
+		})
+	}
+}

@@ -2,11 +2,13 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/migadu/sora/consts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -141,4 +143,100 @@ func TestRenameScript(t *testing.T) {
 		_, err = database.GetScriptByName(ctx, "renamed", accountID)
 		assert.NoError(t, err)
 	})
+}
+
+// TestScriptNameNotStorable: a name PostgreSQL cannot hold (a NUL, invalid UTF-8)
+// names no script. GetScriptByName and RenameScript answer ErrDBNotFound for it, as
+// for any unknown name, instead of the database's SQLSTATE 22021, which callers
+// took for a database failure (ManageSieve NO (TRYLATER), User API 500).
+func TestScriptNameNotStorable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	database := setupTestDatabase(t)
+	defer database.Close()
+	ctx := context.Background()
+	accountID := createTestAccountForSieve(t, database, ctx)
+
+	for _, name := range []string{"a\x00b", "\xff", "caf\xc3"} {
+		_, err := database.GetScriptByName(ctx, name, accountID)
+		assert.ErrorIs(t, err, consts.ErrDBNotFound, "GetScriptByName(%q)", name)
+
+		err = inSieveTx(t, database, ctx, func(tx pgx.Tx) error {
+			return database.RenameScript(ctx, tx, accountID, name, "renamed")
+		})
+		assert.ErrorIs(t, err, consts.ErrDBNotFound, "RenameScript(%q)", name)
+	}
+}
+
+// TestRenameScriptNewNameNotStorable: RenameScript rejects an unstorable newName
+// (NUL byte or invalid UTF-8) with ErrSieveScriptNotStorable, matching CreateScript,
+// UpdateScript and CreateOrUpdateScript, instead of sending it to PostgreSQL and
+// leaking SQLSTATE 22021.
+func TestRenameScriptNewNameNotStorable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	database := setupTestDatabase(t)
+	defer database.Close()
+	ctx := context.Background()
+	accountID := createTestAccountForSieve(t, database, ctx)
+
+	require.NoError(t, inSieveTx(t, database, ctx, func(tx pgx.Tx) error {
+		_, err := database.CreateScript(ctx, tx, accountID, "existing", "keep;")
+		return err
+	}))
+
+	for _, newName := range []string{"a\x00b", "\xff", "caf\xc3"} {
+		err := inSieveTx(t, database, ctx, func(tx pgx.Tx) error {
+			return database.RenameScript(ctx, tx, accountID, "existing", newName)
+		})
+		assert.ErrorIs(t, err, ErrSieveScriptNotStorable, "RenameScript(existing, %q)", newName)
+		var pgErr *pgconn.PgError
+		assert.False(t, errors.As(err, &pgErr), "RenameScript(existing, %q) leaked PostgreSQL error %v", newName, err)
+	}
+
+	s, err := database.GetScriptByName(ctx, "existing", accountID)
+	require.NoError(t, err)
+	assert.Equal(t, "keep;", s.Script)
+}
+
+// TestScriptContentNotStorable: CreateScript and UpdateScript reject unstorable script
+// content or names (NUL byte or invalid UTF-8) before sending the statement to PostgreSQL
+// so callers never receive a raw SQLSTATE 22021 *pgconn.PgError.
+func TestScriptContentNotStorable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	database := setupTestDatabase(t)
+	defer database.Close()
+	ctx := context.Background()
+	accountID := createTestAccountForSieve(t, database, ctx)
+
+	var existing *SieveScript
+	require.NoError(t, inSieveTx(t, database, ctx, func(tx pgx.Tx) error {
+		var err error
+		existing, err = database.CreateScript(ctx, tx, accountID, "existing", "keep;")
+		return err
+	}))
+
+	for _, content := range []string{"# \x00\nkeep;\n", "# \xff\nkeep;\n", "# caf\xc3\nkeep;\n"} {
+		err := inSieveTx(t, database, ctx, func(tx pgx.Tx) error {
+			_, err := database.CreateScript(ctx, tx, accountID, "fresh", content)
+			return err
+		})
+		require.Error(t, err, "CreateScript(%q)", content)
+		var pgErr *pgconn.PgError
+		assert.False(t, errors.As(err, &pgErr), "CreateScript(%q) leaked PostgreSQL error %v", content, err)
+
+		err = inSieveTx(t, database, ctx, func(tx pgx.Tx) error {
+			_, err := database.UpdateScript(ctx, tx, existing.ID, accountID, "existing", content)
+			return err
+		})
+		require.Error(t, err, "UpdateScript(%q)", content)
+		assert.False(t, errors.As(err, &pgErr), "UpdateScript(%q) leaked PostgreSQL error %v", content, err)
+	}
 }
