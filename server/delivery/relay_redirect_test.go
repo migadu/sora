@@ -11,9 +11,9 @@ import (
 // TestHTTPRelayHandlerDoesNotFollowRedirects: a 3xx answer to the relay POST is not a
 // delivery. Followed, a 301/302/303 turns the POST into a body-less GET whose 2xx
 // counted as delivered (the vacation reply or Sieve redirect was lost), and a 307/308
-// replayed the message and the bearer token to the Location. The 3xx itself must be
-// reported as a temporary failure that names the Location, so the message stays
-// queued while http_url is corrected.
+// replayed the message to the Location (with the bearer token when the Location is the
+// same host or a subdomain). The 3xx itself must be reported as a temporary failure
+// that names the Location, so the message stays queued while http_url is corrected.
 func TestHTTPRelayHandlerDoesNotFollowRedirects(t *testing.T) {
 	for _, status := range []int{
 		http.StatusMovedPermanently,

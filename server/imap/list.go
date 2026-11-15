@@ -88,10 +88,11 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 
 	// Shared-namespace root (e.g. "Shared" for prefix "Shared/"), used to mark that
 	// root \Noselect. Empty when shared mailboxes are disabled.
-	sharedNamespaceRoot := ""
-	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
-		sharedNamespaceRoot = strings.TrimSuffix(s.server.config.SharedMailboxes.NamespacePrefix, string(consts.MailboxDelimiter))
-	}
+	sharedNamespaceRoot := s.sharedNamespaceRoot()
+
+	// The capability set cannot change during a command, so read its immutable
+	// snapshot once rather than per mailbox.
+	caps := s.GetCapabilities()
 
 	var l []imap.ListData
 	if options.SelectSubscribed {
@@ -99,13 +100,13 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 		// and non-existent subscribed names. LSUB arrives here too — the go-imap
 		// layer dispatches it as LIST (SUBSCRIBED RECURSIVEMATCH) and renders the
 		// CHILDINFO parents as \Noselect.
-		l = buildSubscribedList(ref, patterns, options, mboxes, subscribedSet, s.GetCapabilities(), sharedNamespaceRoot)
+		l = buildSubscribedList(ref, patterns, options, mboxes, subscribedSet, caps, sharedNamespaceRoot)
 	} else {
 		for _, mbox := range mboxes {
 			if !matchesAnyPattern(mbox.Name, ref, patterns) {
 				continue
 			}
-			data := listMailbox(mbox, options, s.GetCapabilities(), sharedNamespaceRoot)
+			data := listMailbox(mbox, options, caps, sharedNamespaceRoot)
 			if data != nil {
 				l = append(l, *data)
 			}
@@ -120,15 +121,43 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 	// Use batch query to fetch all summaries in a single database round-trip
 	// instead of N individual Status() calls (which each do 3 queries).
 	if options.ReturnStatus != nil {
-		// Collect mailbox IDs for all listed mailboxes
+		// Collect the listed entries that get a STATUS response: selectable
+		// mailboxes that matched the selection options and that this user may
+		// read (RFC 5819 §2 / RFC 9051 §6.3.9.2).
+		var wanted []int // indices into l
 		var mailboxIDs []int64
-		for _, data := range l {
-			if data.Mailbox == "" {
+		for i := range l {
+			data := &l[i]
+			if !listEntryWantsStatus(data, options, subscribedSet) {
 				continue
 			}
-			if mbox, ok := nameToMailbox[data.Mailbox]; ok {
-				mailboxIDs = append(mailboxIDs, mbox.ID)
+			mbox, ok := nameToMailbox[data.Mailbox]
+			if !ok {
+				continue
 			}
+			// RFC 4314: STATUS data requires the 'r' (read) right. A shared mailbox can
+			// be listed with only 'l' (lookup); don't leak its counts via LIST-STATUS.
+			// Owned mailboxes (owner == this account) always have 'r', so only the few
+			// shared ones incur an ACL check — the batch fast path is preserved.
+			if mbox.AccountID != s.AccountID() {
+				hasRead, permErr := s.server.rdb.CheckMailboxPermissionWithRetry(readCtx, mbox.ID, s.AccountID(), 'r')
+				if permErr != nil {
+					// RFC 5819 §2: on unexpected problems the server "MAY drop the
+					// corresponding STATUS reply".
+					s.DebugLog("LIST-STATUS: skipping STATUS, ACL read-check failed", "mailbox", data.Mailbox, "error", permErr)
+					continue
+				}
+				if !hasRead {
+					// RFC 5819 §2: when STATUS fails because the mailbox can't be
+					// selected ("l" granted, "r" not), "the STATUS response MUST NOT
+					// be returned and the LIST response MUST include the \NoSelect
+					// attribute".
+					data.Attrs = append(data.Attrs, imap.MailboxAttrNoSelect)
+					continue
+				}
+			}
+			wanted = append(wanted, i)
+			mailboxIDs = append(mailboxIDs, mbox.ID)
 		}
 
 		if len(mailboxIDs) > 0 {
@@ -144,29 +173,9 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 				s.DebugLog("failed to get batch mailbox status", "error", err)
 			} else {
 				// Populate STATUS data from batch results
-				for i := range l {
+				for _, i := range wanted {
 					data := &l[i]
-					if data.Mailbox == "" {
-						continue
-					}
-					mbox, ok := nameToMailbox[data.Mailbox]
-					if !ok {
-						continue
-					}
-					// RFC 4314: STATUS data requires the 'r' (read) right. A shared mailbox can
-					// be listed with only 'l' (lookup); don't leak its counts via LIST-STATUS.
-					// Owned mailboxes (owner == this account) always have 'r', so only the few
-					// shared ones incur an ACL check — the batch fast path is preserved.
-					if mbox.AccountID != s.AccountID() {
-						hasRead, permErr := s.server.rdb.CheckMailboxPermissionWithRetry(readCtx, mbox.ID, s.AccountID(), 'r')
-						if permErr != nil {
-							s.DebugLog("LIST-STATUS: skipping STATUS, ACL read-check failed", "mailbox", data.Mailbox, "error", permErr)
-							continue
-						}
-						if !hasRead {
-							continue
-						}
-					}
+					mbox := nameToMailbox[data.Mailbox]
 					summary, ok := summaries[mbox.ID]
 					if !ok {
 						continue
@@ -206,7 +215,7 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 						num := uint32(unseenCount)
 						statusData.NumUnseen = &num
 					}
-					if s.GetCapabilities().Has(imap.CapCondStore) && options.ReturnStatus.HighestModSeq {
+					if caps.Has(imap.CapCondStore) && options.ReturnStatus.HighestModSeq {
 						statusData.HighestModSeq = summary.HighestModSeq
 					}
 					if options.ReturnStatus.AppendLimit {
@@ -260,6 +269,29 @@ func hasListOptions(options *imap.ListOptions) bool {
 		options.ReturnSubscribed || options.ReturnChildren ||
 		options.ReturnSpecialUse || options.ReturnStatus != nil ||
 		options.ReturnMetadata != nil
+}
+
+// listEntryWantsStatus reports whether LIST ... RETURN (STATUS (...)) should
+// emit a STATUS response for data. RFC 5819 §2 and RFC 9051 §6.3.9.2 require:
+//   - no STATUS response for mailboxes listed with \Noselect or \NonExistent;
+//   - STATUS responses only for mailboxes that themselves match the selection
+//     options (excluding unsubscribed parents returned solely via RECURSIVEMATCH).
+func listEntryWantsStatus(data *imap.ListData, options *imap.ListOptions, subscribedSet map[string]string) bool {
+	if data == nil || data.Mailbox == "" {
+		return false
+	}
+	for _, attr := range data.Attrs {
+		if strings.EqualFold(string(attr), string(imap.MailboxAttrNoSelect)) ||
+			strings.EqualFold(string(attr), string(imap.MailboxAttrNonExistent)) {
+			return false
+		}
+	}
+	if options != nil && options.SelectSubscribed {
+		if _, ok := subscribedSet[strings.ToLower(data.Mailbox)]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // matchesAnyPattern reports whether name matches any of the LIST patterns given
@@ -405,10 +437,12 @@ func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.
 
 	// Add \Noselect for the shared-namespace root (e.g. "Shared" for prefix
 	// "Shared/", or the configured namespace_prefix). This prevents clients from
-	// trying to SELECT the namespace prefix itself. sharedNamespaceRoot is empty
-	// when shared mailboxes are disabled, so a personal folder that happens to be
-	// named like the prefix is not falsely marked \Noselect.
-	if sharedNamespaceRoot != "" && strings.EqualFold(mbox.Name, sharedNamespaceRoot) && mbox.HasChildren {
+	// trying to SELECT the namespace prefix itself (which SELECT always refuses
+	// with NO [CANNOT], even when no child mailboxes currently remain under it).
+	// sharedNamespaceRoot is empty when shared mailboxes are disabled, so a
+	// personal folder that happens to be named like the prefix is not falsely
+	// marked \Noselect.
+	if sharedNamespaceRoot != "" && strings.EqualFold(mbox.Name, sharedNamespaceRoot) {
 		attributes = append(attributes, imap.MailboxAttrNoSelect)
 	}
 

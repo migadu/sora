@@ -356,8 +356,11 @@ Your MTA keeps the message and retries a `452`. LMTP also answers `452 4.3.1` wh
 staging disk is full or read-only, whether or not a limit is set.
 
 The worker keeps the total in memory and corrects it every 5 minutes from this node's rows
-in `pending_uploads`. Set a limit below the free space of the staging disk, so that a long S3
-outage makes the MTA queue mail instead of filling the disk.
+in `pending_uploads`. A body the node staged since it started that has no row (a delivery
+whose transaction has yet to commit, one that failed after writing its file, or a duplicate
+of a body already in S3) stays counted until its row appears or the orphan sweep removes the
+file. Set a limit below the free space of the staging disk, so that a long S3 outage makes
+the MTA queue mail instead of filling the disk.
 
 ### 6.8 The orphan sweep
 
@@ -973,7 +976,7 @@ An invalid duration or size in this section is logged as a warning and the defau
 | `batch_size` | int | `10` | Pending rows taken per database query. Each body is still its own S3 request. Must be positive. |
 | `concurrency` | int | `20` | Uploads in flight at once. Must be positive. |
 | `max_attempts` | int | `20` | Content failures after which an upload is parked. Must be positive. |
-| `retry_interval` | duration | `"30s"` | How long a taken row waits before it can be taken again; also the first backoff pause. |
+| `retry_interval` | duration | `"30s"` | How long a taken row waits before it can be taken again; also the first backoff pause. Must be positive. |
 | `cleanup_grace_period` | duration | `"1h"` | Minimum age of a staging file before the orphan sweep may remove it. Must be positive; an invalid value stops `sora`. |
 | `max_staging_size` | size | no limit | Most bytes this node may hold waiting for upload. An invalid value stops `sora`. |
 
@@ -1008,4 +1011,6 @@ and on the account. Entries are stored in PostgreSQL. Only the IMAP server uses 
 
 A `SETMETADATA` that would break a limit is refused with `NO`, and nothing in it is stored. A
 limit of `0` turns that check off. An overwrite counts only its change in size, and a delete
-frees its slot.
+frees its slot. The count and size limits refuse only a command that raises the count or the
+size, so an account already past one (the limit was lowered) can still delete, overwrite and
+shrink entries to get back under it.

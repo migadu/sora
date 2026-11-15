@@ -103,6 +103,11 @@ func TestIMAP_FetchPreviewDisconnectPreservesDatabaseBreaker(t *testing.T) {
 	}
 	clients[0].appendMessage("From: alice@example.com\nSubject: disconnect breaker\n\nThe body in storage.\n")
 	server.WaitForUploads(t)
+	// Every selected session must learn the appended message before it can
+	// fetch sequence 1; the disconnect check needs all clients to reach S3.
+	for _, c := range clients {
+		c.ok("NOOP")
+	}
 	accountID, err := server.ResilientDB.GetAccountIDByEmailWithRetry(context.Background(), account.Email)
 	if err != nil {
 		t.Fatal(err)

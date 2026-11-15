@@ -154,3 +154,127 @@ func TestAbsentDateHeaderReportedAsNIL(t *testing.T) {
 		}
 	})
 }
+
+// TestEnvelopeDateKeepsHeaderZone: the ENVELOPE date names the day, time of day and zone
+// the Date: header was written in, through every insert path and every reader that builds
+// a Message for it. RFC 9051 section 7.5.2: the envelope "is computed by the server by
+// parsing the [RFC5322] header into the component parts"; sent_date keeps only the instant
+// and sent_utc_offset (migration 000060) the header's zone. A row without an offset
+// (written before that migration) is given in UTC, never in the server's zone.
+func TestEnvelopeDateKeepsHeaderZone(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, mailboxID := setupMessageTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+	ts := time.Now().UnixNano()
+
+	const layout = "Mon, 02 Jan 2006 15:04:05 -0700" // go-imap's envelope date layout
+	// At most one of these zones can be the server's, so a date given in the server's
+	// zone fails at least two of them.
+	zones := []*time.Location{
+		time.FixedZone("", -8*3600),
+		time.FixedZone("", 5*3600+45*60),
+		time.FixedZone("", 0),
+	}
+	instant := time.Date(2025, 1, 1, 4, 0, 0, 0, time.UTC)
+
+	insert := func(path string, sent time.Time) int64 {
+		t.Helper()
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		var bs imap.BodyStructure = &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain", Size: 64}
+		_, offset := sent.Zone()
+		hash := fmt.Sprintf("envzone_%s_%d_%d", path, offset, ts)
+		opts := &InsertMessageOptions{
+			AccountID:     accountID,
+			MailboxID:     mailboxID,
+			MailboxName:   "INBOX",
+			S3Domain:      "example.com",
+			S3Localpart:   "envzone",
+			ContentHash:   hash,
+			MessageID:     hash + "@example.com",
+			InternalDate:  instant,
+			SentDate:      sent,
+			Size:          64,
+			Subject:       "issue1064 " + path,
+			BodyStructure: &bs,
+		}
+		var uid int64
+		switch path {
+		case "live":
+			_, uid, err = db.InsertMessage(ctx, tx, opts, PendingUpload{
+				InstanceID: "envzone", ContentHash: hash, Size: 64, AccountID: accountID,
+			})
+		case "importer":
+			_, uid, err = db.InsertMessageFromImporter(ctx, tx, opts)
+		case "batch":
+			var uids []int64
+			_, uids, _, err = db.InsertMessagesFromImporterBatch(ctx, tx, []*InsertMessageOptions{opts})
+			if err == nil {
+				require.Len(t, uids, 1)
+				uid = uids[0]
+			}
+		}
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+		return uid
+	}
+
+	// want maps each UID to its envelope date member.
+	want := map[int64]string{}
+	for _, path := range []string{"live", "importer", "batch"} {
+		for _, zone := range zones {
+			sent := instant.In(zone)
+			want[insert(path, sent)] = sent.Format(layout)
+		}
+	}
+	// A row written before migration 000060 has no offset: it is given in UTC.
+	legacy := insert("live", instant.In(time.FixedZone("", 2*3600)))
+	_, err := db.GetWritePool().Exec(ctx,
+		`UPDATE messages SET sent_utc_offset = NULL WHERE mailbox_id = $1 AND uid = $2`, mailboxID, legacy)
+	require.NoError(t, err)
+	want[legacy] = instant.Format(layout)
+
+	check := func(reader string, msgs []Message) {
+		t.Helper()
+		require.Len(t, msgs, len(want), reader)
+		for i := range msgs {
+			env, err := BuildEnvelope(&msgs[i])
+			require.NoError(t, err)
+			uid := int64(msgs[i].UID)
+			assert.Equal(t, want[uid], env.Date.Format(layout), "%s uid %d: envelope date", reader, uid)
+			if uid == legacy {
+				assert.True(t, env.Date.Location() == time.UTC,
+					"%s uid %d: a row without an offset must be given in UTC, not in time.Local", reader, uid)
+			}
+		}
+	}
+
+	msgs, err := db.ListMessages(ctx, mailboxID)
+	require.NoError(t, err)
+	check("ListMessages", msgs)
+
+	var uids imap.UIDSet
+	for uid := range want {
+		uids.AddNum(imap.UID(uid))
+	}
+	msgs, err = db.GetMessagesByNumSet(ctx, mailboxID, uids)
+	require.NoError(t, err)
+	check("GetMessagesByNumSet(UID)", msgs)
+
+	var all imap.SeqSet
+	all.AddRange(1, 0)
+	msgs, err = db.GetMessagesByNumSet(ctx, mailboxID, all, true)
+	require.NoError(t, err)
+	check("GetMessagesByNumSet(1:*)", msgs)
+
+	for uid, date := range want {
+		env, err := db.GetMessageEnvelope(ctx, imap.UID(uid), mailboxID)
+		require.NoError(t, err)
+		assert.Equal(t, date, env.Date.Format(layout), "GetMessageEnvelope uid %d: envelope date", uid)
+	}
+}

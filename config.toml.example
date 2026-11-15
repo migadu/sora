@@ -643,9 +643,9 @@ max_attempts = 5              # Attempts after which an upload is parked ("faile
                               # or a file missing while S3 reports the object absent. Provider errors (any HTTP
                               # status, including 4xx) and database errors never count — the body is intact on
                               # disk and the upload is simply retried.
-retry_interval = "30s"        # Delay before a failed upload is leased again. When every upload in a cycle fails
-                              # (provider or database outage) the worker backs off exponentially from this value,
-                              # doubling per failed cycle up to 10 minutes, and resumes on the first success.
+retry_interval = "30s"        # Delay before a failed upload is leased again. Must be positive. When every upload in a
+                              # cycle fails (provider or database outage) the worker backs off exponentially from this
+                              # value, doubling per failed cycle up to 10 minutes, and resumes on the first success.
 cleanup_grace_period = "1h"   # Minimum age of a local upload file before cleanup considers it. Must be positive and
                               # longer than any delivery transaction can take.
 max_staging_size = "100gb"    # Maximum size of this node's own upload staging backlog (e.g. "100gb"); other nodes' backlogs do not count. If set and exceeded, new messages (IMAP APPEND, LMTP and Admin API deliveries) are refused.
@@ -710,6 +710,8 @@ smtp_use_starttls = true                          # Use STARTTLS (ports 587, 25)
 # smtp_tls_key_file = "/path/to/client.key"      # Client key for mTLS (optional)
 
 # HTTP API Relay Configuration (when type="http")
+# http_url must answer the POST itself: redirects are not followed, and a 3xx answer
+# is a temporary failure (the message stays queued and is retried).
 # http_url = "https://api.example.com/v1/mail/deliver"  # HTTP API endpoint (startup warns about http:// unless the host is loopback)
 # auth_token = "your-bearer-token"                      # Bearer token for Authorization header
 
@@ -895,6 +897,8 @@ enabled_extensions = []
 enabled = false
 
 # HTTP endpoint to submit training data (POST requests with JSON payload)
+# Must answer the POST itself: redirects are not followed, and a 3xx answer is a
+# failed submission.
 # Example: "https://spam-filter.example.com/train"
 # endpoint = "https://your-spam-service.example.com/api/train"
 
@@ -1148,6 +1152,8 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # IMAP4rev1 and cannot be disabled; naming them only logs a warning.
 # STARTTLS, LOGINDISABLED and AUTH=PLAIN follow tls, tls_use_starttls and
 # insecure_auth; disabled_caps does not change them.
+# Names are case-insensitive ("idle" is IDLE). A name that is no capability the
+# server can withdraw (a typo, ACL, STARTTLS, ...) is logged at WARN at startup.
 
 # --- ADDITIONAL CAPABILITY TOKENS ---
 # Advertise extra, non-standard capability tokens to ALL clients, verbatim. These
@@ -1241,6 +1247,8 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # - If ja4_fingerprints specified: matches if ANY pattern matches (OR)
 # - If client_name/version specified: matches if BOTH name AND version match (AND)
 # - Between ja4_fingerprints and client_name/version: matches if EITHER criteria is met (OR)
+# - An entry with none of them, or with an empty ja4_fingerprints pattern (which
+#   would match every fingerprint), stops startup
 
 # --- RESOURCE LIMITS ---
 # Search rate limiting - prevent DoS attacks via excessive search queries (IMAP only)
@@ -1414,7 +1422,8 @@ proxy_protocol = false        # Enable PROXY protocol support for LMTP
 proxy_protocol_timeout = "5s"
 
 # --- MESSAGE SIZE LIMITING ---
-# Maximum size for incoming LMTP messages to prevent memory exhaustion attacks
+# Maximum size for incoming LMTP messages to prevent memory exhaustion attacks.
+# Advertised in LHLO as "SIZE <n>"; MAIL ... SIZE= above it is refused with 552.
 max_message_size = "50mb"     # Maximum message size (default: 50MB; 0 also means 50MB, there is no unlimited)
 
 # --- SIEVE REDIRECT LIMITS ---
@@ -1436,13 +1445,13 @@ limits.max_redirect_hops = 2             # Max times one message may be redirect
                                          # still applies regardless of this value.
 
 # --- TIMEOUT CONFIGURATION ---
-# The LMTP server's only connection timeout. absolute_session_timeout, min_bytes_per_minute,
-# auth_idle_timeout and limits.session_memory_limit do not apply to it.
+# absolute_session_timeout, min_bytes_per_minute, auth_idle_timeout and
+# limits.session_memory_limit do not apply to the LMTP backend.
 timeouts.command_timeout = "5m"  # Idle time between commands before 421 and disconnect
                                  # (default: 5m, the RFC 5321 §4.5.3.2.7 floor; "0" = the default).
-                                 # It also bounds receiving a message: the read deadline set for the
-                                 # DATA command is not extended while the data arrives, so a message
-                                 # that takes longer is refused with 421 and the MTA retries it.
+                                 # During DATA and BDAT it bounds each wait for more message content.
+                                 # A separate one-hour limit bounds one DATA body or BDAT chunk;
+                                 # a stalled or over-time transfer gets 421 and disconnects so the MTA retries.
 
 # --- PER-COMMAND EXECUTION TIMEOUTS (optional) ---
 # Hard caps on server-side work, mirroring imap_command_timeouts. On expiry
@@ -2294,7 +2303,8 @@ connect_timeout = "30s"
 auth_idle_timeout = "2m"        # Idle timeout between commands during authentication phase (pre-auth only).
                               # Resets after each command received. Cleared after successful authentication.
                               # Note: absolute_session_timeout (below) separately limits total session duration.
-max_message_size = "50mb"
+max_message_size = "50mb"       # Advertised in LHLO as "SIZE <n>"; MAIL ... SIZE= above it gets 552, a SIZE= that is
+                                # not a number 501. SIZE= is passed on to backends that advertise SIZE. "0" also means 50MB.
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- TIMEOUT CONFIGURATION ---

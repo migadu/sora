@@ -31,7 +31,7 @@ type Message struct {
 	FlagsChangedAt *time.Time // Time when the flags were last changed
 	Subject        string     // Subject of the message
 	InternalDate   time.Time  // The internal date the message was received
-	SentDate       time.Time  // The date the message was sent; its INTERNALDATE when NoDateHeader
+	SentDate       time.Time  // The Date: header in its own zone (sentDateInHeaderZone); its INTERNALDATE when NoDateHeader
 	NoDateHeader   bool       // No Date: header that parses (sent_date_unknown): the ENVELOPE date is NIL
 	Size           int        // Size of the message in bytes
 	MessageID      string     // Unique Message-ID from the message headers
@@ -246,7 +246,7 @@ func streamMessagesWhereChunked(ctx context.Context, run MessageStreamDBRunner, 
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
 			m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq,
 			0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
@@ -370,7 +370,10 @@ func streamMessagesBySeqSet(ctx context.Context, run MessageStreamDBRunner, mail
 	if len(seqSet) == 0 {
 		return nil
 	}
-	if len(seqSet) == 1 && seqSet[0].Start == 1 && (seqSet[0].Stop == 0) {
+	// Without a view 1:* names every live message, numbered by counting them. In a view
+	// (WithSeqView) the held messages are counted too and "*" is the view's last
+	// message, so the set goes through uidsBySeqNum. (A session never sends "*".)
+	if len(seqSet) == 1 && seqSet[0].Start == 1 && (seqSet[0].Stop == 0) && seqViewOf(ctx) == 0 {
 		logger.Debug("Database: Streaming SeqSet 1:* fetch", "mailbox_id", mailboxID)
 		return streamAllActiveMessagesRawChunked(ctx, run, mailboxID, cb, includeBodyStructure)
 	}
@@ -419,7 +422,7 @@ func streamAllActiveMessagesRawChunked(ctx context.Context, run MessageStreamDBR
 		SELECT
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
 			m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
@@ -458,6 +461,7 @@ func scanMessages(rows pgx.Rows, includeBodyStructure bool) ([]Message, error) {
 		var customFlagsJSON []byte
 		var recipientsJSON []byte
 		var bodyStructureBytes []byte
+		var sentUTCOffset *int32
 
 		// Build scan args dynamically — body_structure is only present when includeBodyStructure is true.
 		scanArgs := []any{
@@ -470,13 +474,14 @@ func scanMessages(rows pgx.Rows, includeBodyStructure bool) ([]Message, error) {
 		}
 		scanArgs = append(scanArgs,
 			&msg.CreatedModSeq, &msg.UpdatedModSeq,
-			&msg.ExpungedModSeq, &msg.Seq, &msg.FlagsChangedAt, &msg.Subject, &msg.SentDate, &msg.NoDateHeader, &msg.MessageID,
+			&msg.ExpungedModSeq, &msg.Seq, &msg.FlagsChangedAt, &msg.Subject, &msg.SentDate, &sentUTCOffset, &msg.NoDateHeader, &msg.MessageID,
 			&msg.InReplyTo, &recipientsJSON,
 		)
 
 		if err := rows.Scan(scanArgs...); err != nil {
 			return nil, fmt.Errorf("failed to scan message: %w", err)
 		}
+		msg.SentDate = sentDateInHeaderZone(msg.SentDate, sentUTCOffset)
 
 		if includeBodyStructure {
 			msg.BodyStructure = deserializeBodyStructure(bodyStructureBytes, msg.Size, msg.AccountID, msg.MailboxID, msg.UID, msg.ContentHash)
@@ -582,7 +587,7 @@ func (db *Database) GetMessagesByFlag(ctx context.Context, mailboxID int64, flag
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
 			m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq,
 			0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND (ms.flags & $2) != 0 AND m.expunged_at IS NULL
@@ -743,7 +748,8 @@ func (db *Database) HydrateSearchMessageSequences(ctx context.Context, mailboxID
 //
 // Carrying the anchor forward also keeps one FETCH response internally consistent. A
 // concurrent expunge no longer renumbers the chunks still to come, which is what
-// RFC 3501 §7.4.1 requires when it forbids reporting expunges during a fetch.
+// RFC 3501 §7.4.1 requires when it forbids reporting expunges during a fetch. In a
+// view (WithSeqView) the count includes the messages the view still holds.
 func (db *Database) hydrateChunkSequences(ctx context.Context, mailboxID int64, messages []Message, anchorUID, anchorSeq uint32) error {
 	if anchorSeq == 0 {
 		return db.HydrateMessageSequences(ctx, mailboxID, messages)
@@ -759,14 +765,16 @@ func (db *Database) hydrateChunkSequences(ctx context.Context, mailboxID int64, 
 		wanted[uid] = &messages[i]
 	}
 
+	args := []any{mailboxID, int64(anchorSeq), int64(anchorUID), int64(maxUID)}
+	viewParam := ""
+	if view := seqViewOf(ctx); view > 0 {
+		args = append(args, int64(view))
+		viewParam = "$5"
+	}
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
-		SELECT m.uid, $2::bigint + ROW_NUMBER() OVER(ORDER BY m.uid)
-		FROM messages m
-		WHERE m.mailbox_id = $1
-		  AND m.expunged_at IS NULL
-		  AND m.uid > $3
-		  AND m.uid <= $4
-	`, mailboxID, int64(anchorSeq), int64(anchorUID), int64(maxUID))
+		SELECT uid, $2::bigint + ROW_NUMBER() OVER(ORDER BY uid)
+		FROM `+seqCountedRows("$1", viewParam, "uid > $3 AND uid <= $4", "ASC", "")+` counted
+	`, args...)
 	if err != nil {
 		return fmt.Errorf("failed to query sequence window after uid %d: %w", anchorUID, err)
 	}
@@ -819,17 +827,22 @@ func hydrateSequencesCore[T any](
 
 	// Fetch mailbox stats for bidirectional sweep decision.
 	// On deadlock/lock timeout, gracefully fall back to forward sweep.
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT COALESCE(highest_uid, 1)
-		FROM mailboxes
-		WHERE id = $1
-	`, mailboxID).Scan(&uidNext)
+	err := InReadSavepoint(ctx, func(spCtx context.Context) error {
+		return db.readQuerier(spCtx).QueryRow(spCtx, `
+			SELECT COALESCE(highest_uid, 1)
+			FROM mailboxes
+			WHERE id = $1
+		`, mailboxID).Scan(&uidNext)
+	})
 
 	useForwardSweep := true // Default to forward sweep
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Mailbox doesn't exist - this is a real error
 			return fmt.Errorf("mailbox %d not found for sequence hydration", mailboxID)
+		}
+		if errors.Is(err, ErrReadSnapshotAborted) {
+			return err
 		}
 		// On deadlock or other transient errors, fall back to forward sweep
 		// This prevents test flakiness during concurrent execution
@@ -846,57 +859,46 @@ func hydrateSequencesCore[T any](
 		useForwardSweep = minUID <= midpoint
 	}
 
-	var query string
-	var args []interface{}
+	// $3 bounds the sweep's UIDs. In a view (WithSeqView) the messages it still holds
+	// are counted too.
+	args := []any{mailboxID, uids, int64(maxUID)}
+	viewParam := ""
+	if view := seqViewOf(ctx); view > 0 {
+		args = append(args, int64(view))
+		viewParam = "$4"
+	}
 
+	var query string
 	if useForwardSweep {
 		// Forward Sweep (Faster for older messages)
 		query = `
-			WITH range_bounds AS (
-				SELECT MAX(uid) as max_uid
-				FROM unnest($2::bigint[]) as t(uid)
-			),
-			all_uids AS (
-				SELECT m.uid, ROW_NUMBER() OVER(ORDER BY m.uid) as seqnum
-				FROM messages m
-				CROSS JOIN range_bounds
-				WHERE m.mailbox_id = $1
-				  AND m.expunged_at IS NULL
-				  AND m.uid <= range_bounds.max_uid
+			WITH all_uids AS (
+				SELECT uid, ROW_NUMBER() OVER(ORDER BY uid) as seqnum
+				FROM ` + seqCountedRows("$1", viewParam, "uid <= $3", "ASC", "") + ` counted
 			)
 			SELECT a.uid, a.seqnum
 			FROM all_uids a
 			JOIN unnest($2::bigint[]) t(uid) ON a.uid = t.uid
 		`
-		args = []interface{}{mailboxID, uids}
 	} else {
 		// Backward Sweep (Faster for recent messages, utilizing exact live count)
 		query = `
-			WITH range_bounds AS (
-				SELECT MIN(uid) as min_uid
-				FROM unnest($2::bigint[]) as t(uid)
-			),
-			active_count AS (
+			WITH counted_total AS (
 				SELECT COUNT(*)::int as cnt
-				FROM messages
-				WHERE mailbox_id = $1 AND expunged_at IS NULL
+				FROM ` + seqCountedRows("$1", viewParam, "", "", "") + ` counted
 			),
 			all_uids AS (
-				SELECT m.uid, (SELECT cnt FROM active_count) - ROW_NUMBER() OVER(ORDER BY m.uid DESC) + 1 as seqnum
-				FROM messages m
-				CROSS JOIN range_bounds
-				WHERE m.mailbox_id = $1
-				  AND m.expunged_at IS NULL
-				  AND m.uid >= range_bounds.min_uid
+				SELECT uid, (SELECT cnt FROM counted_total) - ROW_NUMBER() OVER(ORDER BY uid DESC) + 1 as seqnum
+				FROM ` + seqCountedRows("$1", viewParam, "uid >= $3", "DESC", "") + ` counted
 			)
 			SELECT a.uid, a.seqnum
 			FROM all_uids a
 			JOIN unnest($2::bigint[]) t(uid) ON a.uid = t.uid
 		`
-		args = []interface{}{mailboxID, uids}
+		args[2] = int64(minUID)
 	}
 
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
+	rows, err := db.readQuerier(ctx).Query(ctx, query, args...)
 
 	if err != nil {
 		return fmt.Errorf("failed to query sequence streams: %w", err)
