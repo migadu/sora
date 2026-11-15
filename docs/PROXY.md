@@ -65,8 +65,12 @@ a byte pipe. Everything after login (capabilities, IDLE, FETCH) is the backend's
 The LMTP proxy does not log in. For each `RCPT TO` it finds the recipient's backend, connects (or
 reuses the connection it holds) and forwards the command. Like the backend, it does not announce
 `DSN`, so the sending MTA issues the notifications a sender asked for (RFC 3461 §5.2.2); `NOTIFY`,
-`ORCPT`, `RET` and `ENVID` sent anyway are accepted and not forwarded. The User API proxy forwards
-each HTTP request; the backend checks the JWT token.
+`ORCPT`, `RET` and `ENVID` sent anyway are accepted and not forwarded. As on the backend, `MAIL`
+before `LHLO` gets `503 5.5.1`. A later `LHLO`, or a completed `STARTTLS`, starts the session over:
+the transaction in progress ends, and a held backend connection is closed, so the next recipient
+reaches the backend on a new connection (with `remote_use_xclient`, its `XCLIENT HELO=` is the new
+`LHLO` name). After `STARTTLS` the MTA must send `LHLO` again before `MAIL`. The User API proxy
+forwards each HTTP request; the backend checks the JWT token.
 
 A node can run proxies and backend servers in the same process. A node that runs only proxies is a
 **proxy node**. [Section 13](#13-proxy-nodes-and-the-database) explains when such a node connects
