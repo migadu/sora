@@ -61,6 +61,14 @@ type wireCapClient struct {
 
 func dialWireCapServer(t *testing.T, opts IMAPServerOptions) *wireCapClient {
 	t.Helper()
+	c := dialWireCapServerNotAuthenticated(t, opts)
+	c.mustOK("LOGIN user@example.com secret")
+	return c
+}
+
+// dialWireCapServerNotAuthenticated is dialWireCapServer without the LOGIN.
+func dialWireCapServerNotAuthenticated(t *testing.T, opts IMAPServerOptions) *wireCapClient {
+	t.Helper()
 	srv := newDisabledCapsTestServer(t, opts)
 	sessions := make(chan *IMAPSession, 1)
 	is := imapserver.New(&imapserver.Options{
@@ -104,9 +112,7 @@ func dialWireCapServer(t *testing.T, opts IMAPServerOptions) *wireCapClient {
 		t.Fatal("timed out waiting for session")
 	}
 
-	c := &wireCapClient{t: t, conn: conn, br: br, sess: imapSess}
-	c.mustOK("LOGIN user@example.com secret")
-	return c
+	return &wireCapClient{t: t, conn: conn, br: br, sess: imapSess}
 }
 
 func (c *wireCapClient) sendCmd(cmd string) (resp, tagged string, err error) {
