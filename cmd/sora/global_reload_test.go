@@ -303,6 +303,11 @@ func TestGlobalReloadReportsWhatStartupRefuses(t *testing.T) {
 			want:    []problem{{"[tls]", "letsencrypt.email is required"}},
 		},
 		{
+			name:    "timeout_scheduler shard_count below -1",
+			content: "[timeout_scheduler]\nshard_count = -2\n" + metricsServerTOML,
+			want:    []problem{{"[timeout_scheduler]", "shard_count must be >= -1, got -2"}},
+		},
+		{
 			name:    "no servers",
 			content: "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com:587\"\n",
 			want:    []problem{{"servers", "no servers configured"}},

@@ -1618,6 +1618,15 @@ type TimeoutSchedulerConfig struct {
 	ShardCount int `toml:"shard_count"` // Number of timeout scheduler shards (0=runtime.NumCPU(), -1=runtime.NumCPU()/2, >0=specific value)
 }
 
+// Validate checks shard_count as server.InitializeGlobalTimeoutScheduler does: 0 and -1
+// select a count from the CPUs, and nothing below -1 has a meaning.
+func (c TimeoutSchedulerConfig) Validate() error {
+	if c.ShardCount < -1 {
+		return fmt.Errorf("shard_count must be >= -1, got %d", c.ShardCount)
+	}
+	return nil
+}
+
 // ServersConfig holds all server configurations.
 type ServersConfig struct {
 	TrustedNetworks []string `toml:"trusted_networks"` // Global trusted networks for proxy parameter forwarding
@@ -3365,6 +3374,7 @@ func (c *Config) Validate() []Problem {
 	// One malformed trusted_networks entry would leave LMTP admission with no peers.
 	add("trusted_networks", c.ValidateTrustedNetworks())
 	add("[shared_mailboxes]", c.SharedMailboxes.Validate())
+	add("[timeout_scheduler]", c.TimeoutScheduler.Validate())
 
 	// Fail closed: a listener that accepts PROXY protocol with an empty trusted_networks
 	// would let any reachable host spoof the client IP via a PROXY header. (security-audit M2)
