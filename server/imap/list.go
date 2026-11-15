@@ -90,8 +90,8 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 	// root \Noselect. Empty when shared mailboxes are disabled.
 	sharedNamespaceRoot := s.sharedNamespaceRoot()
 
-	// The capability set cannot change during a command, and GetCapabilities
-	// returns a fresh copy of it, so read it once rather than per mailbox.
+	// The capability set cannot change during a command, so read its immutable
+	// snapshot once rather than per mailbox.
 	caps := s.GetCapabilities()
 
 	var l []imap.ListData

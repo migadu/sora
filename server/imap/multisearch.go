@@ -81,6 +81,7 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 	release()
 
 	var results []*imap.SearchData
+	condStore := s.GetCapabilities().Has(imap.CapCondStore)
 
 	// RETURN (SAVE) sets "$" as SEARCH does. go-imap allows it only when the
 	// selected mailbox is the sole source (RFC 7377 §2.2), so at most one mailbox
@@ -170,7 +171,7 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 				searchData.Max = max
 			}
 		}
-		if s.GetCapabilities().Has(imap.CapCondStore) {
+		if condStore {
 			searchData.ModSeq = returnedModSeq(messages, minIdx, maxIdx, options)
 		}
 		if options != nil && options.ReturnSave {
