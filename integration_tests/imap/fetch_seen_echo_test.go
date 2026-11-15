@@ -4,10 +4,12 @@ package imap_test
 
 import (
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/stretchr/testify/require"
 )
@@ -263,4 +265,65 @@ func TestIMAP_FetchImplicitSeenSkipsUnannouncedUID(t *testing.T) {
 	beforeUpdates := lines[:firstIndexOfResponse(lines, "EXPUNGE")]
 	require.Empty(t, seqUIDPairs(beforeUpdates), "unannounced UID must not get a response")
 	require.NotContains(t, flagsOfUID(t, viewer, "4"), `\Seen`, "unanswered UID was marked Seen")
+}
+
+// The NOTIFY pump takes a batch of updates off the session tracker and then
+// writes it, and a client that reads slowly keeps it writing. A FETCH that
+// sets \Seen, or a STORE, of a message whose older state is still in that
+// batch must not slip its answer in ahead of that state: the answer is
+// recorded so the poll does not repeat it, so the older state written after it
+// would be the client's last view of the message.
+func TestIMAP_OwnAnswerNotOvertakenByNotifyDelivery(t *testing.T) {
+	for name, command := range map[string]string{
+		"fetch": "UID FETCH %d BODY[TEXT]",
+		"store": `UID STORE %d +FLAGS (\Seen)`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			common.SkipIfDatabaseUnavailable(t)
+			server, owner := common.SetupIMAPServer(t)
+			defer server.Close()
+
+			c := dialRawIMAP(t, server.Address)
+			c.do(fmt.Sprintf("LOGIN %s %s", owner.Email, owner.Password))
+			const messages = 200
+			var lastUID imap.UID
+			for range messages {
+				lastUID = c.appendMsg("INBOX", binaryFetchTestMessage)
+			}
+			c.do("SELECT INBOX")
+			c.do("NOTIFY SET (SELECTED (MessageNew MessageExpunge FlagChange))")
+			require.NoError(t, c.conn.(*net.TCPConn).SetReadBuffer(4096))
+
+			// One STORE gives every message long keywords: the pump takes all
+			// of the changes in one batch, the last message's (without \Seen)
+			// at its end, and blocks writing it while this client reads nothing.
+			other := dialRawIMAP(t, server.Address)
+			other.do(fmt.Sprintf("LOGIN %s %s", owner.Email, owner.Password))
+			other.do("SELECT INBOX")
+			keywords := make([]string, 40)
+			for i := range keywords {
+				keywords[i] = fmt.Sprintf("k%02d%s", i, strings.Repeat("x", 90))
+			}
+			other.do("STORE 1:* +FLAGS.SILENT (" + strings.Join(keywords, " ") + ")")
+			time.Sleep(time.Second)
+
+			cmd := fmt.Sprintf(command, lastUID)
+			tag := c.send(cmd)
+			time.Sleep(500 * time.Millisecond) // the command reaches its answer
+			lines, tagged := c.read(tag, cmd)
+			require.True(t, strings.HasPrefix(tagged, tag+" OK"), tagged)
+			noopLines, _ := c.do("NOOP")
+
+			// In the order received: whether each FLAGS of the message carried
+			// \Seen.
+			var seen []bool
+			for _, resp := range fetchResponsesForSeq(append(lines, noopLines...), messages) {
+				if strings.Contains(resp, "FLAGS (") {
+					seen = append(seen, seenFlagsRe.MatchString(resp))
+				}
+			}
+			require.NotEmpty(t, seen, "no flags reported for message %d", messages)
+			require.True(t, seen[len(seen)-1], "%s: the last flags sent for the message are an older state (\\Seen in each FLAGS received: %v)", cmd, seen)
+		})
+	}
 }
