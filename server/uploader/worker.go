@@ -1702,9 +1702,13 @@ func (w *UploadWorker) countOnDisk(path string) {
 	}
 	w.stagingRefreshMu.Lock()
 	defer w.stagingRefreshMu.Unlock()
-	if _, counted := w.onDisk[path]; !counted {
-		w.stagedSizeChangedLocked(path, size, size)
+	if counted, ok := w.onDisk[path]; ok {
+		size = counted.size
 	}
+	// Preserve an existing entry's accounted size and claim this generation even
+	// when the body was already counted. An in-flight refresh must not prune its
+	// on-disk protection before finalize removes it.
+	w.stagedSizeChangedLocked(path, size, size)
 }
 
 // orphanRemoved applies the orphan sweep's removal of the size bytes staged at path,
