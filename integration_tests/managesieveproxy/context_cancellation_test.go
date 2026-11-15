@@ -181,7 +181,7 @@ func TestManageSieveProxyRemoteLookupContextCancellation(t *testing.T) {
 		t.Logf("Auth error: %v", authErr)
 
 		// Check that we got temporary unavailability (not "Authentication failed" or just "NO")
-		if strings.Contains(errStr, "UNAVAILABLE") || strings.Contains(errStr, "TRYLATER") || strings.Contains(errStr, "shutting down") {
+		if strings.Contains(errStr, "TRYLATER") || strings.Contains(errStr, "shutting down") {
 			t.Logf("✓ Correctly received temporary unavailability during remotelookup context cancellation")
 		} else if strings.Contains(errStr, "Authentication failed") || strings.Contains(errStr, "NO \"Authentication") {
 			t.Errorf("FAIL: Received 'Authentication failed' instead of temporary unavailability during shutdown")

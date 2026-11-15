@@ -2,9 +2,11 @@ package userapi
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
-	"net/url"
 	"strconv"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/migadu/sora/logger"
 
@@ -31,8 +33,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract mailbox name from path: /user/mailboxes/{name}/messages
-	mailboxName := extractPathParam(r.URL.Path, "/user/mailboxes/", "/messages")
-	mailboxName, err = url.QueryUnescape(mailboxName)
+	mailboxName, err := pathName(r, "/user/mailboxes/", "/messages")
 	if err != nil || mailboxName == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
 		return
@@ -71,6 +72,10 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 
 	// Get messages from database
 	messages, err := s.rdb.GetMessagesForMailboxWithRetry(ctx, accountID, mailboxName, limit, offset, unseenOnly)
+	if errors.Is(err, consts.ErrMailboxNotFound) {
+		ctx = readFromWriter(ctx)
+		messages, err = s.rdb.GetMessagesForMailboxWithRetry(ctx, accountID, mailboxName, limit, offset, unseenOnly)
+	}
 	if err != nil {
 		if errors.Is(err, consts.ErrMailboxNotFound) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
@@ -103,6 +108,13 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, response)
 }
 
+// validSearchText reports whether s can be bound as a PostgreSQL text parameter, which
+// refuses a NUL and bytes that are not UTF-8 (SQLSTATE 22021). A value that cannot is
+// the client's malformed input: it gets a 400 instead of reaching the database.
+func validSearchText(s string) bool {
+	return strings.IndexByte(s, 0) < 0 && utf8.ValidString(s)
+}
+
 // handleSearchMessages searches messages in a mailbox
 func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -114,8 +126,7 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract mailbox name from path: /user/mailboxes/{name}/search
-	mailboxName := extractPathParam(r.URL.Path, "/user/mailboxes/", "/search")
-	mailboxName, err = url.QueryUnescape(mailboxName)
+	mailboxName, err := pathName(r, "/user/mailboxes/", "/search")
 	if err != nil || mailboxName == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
 		return
@@ -128,9 +139,38 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "Search query parameter 'q' is required")
 		return
 	}
+	if !validSearchText(searchQuery) {
+		s.writeError(w, http.StatusBadRequest, "Search query parameter 'q' must be UTF-8 text without NUL")
+		return
+	}
+	// Bounded as each IMAP SEARCH string is: every word of q is a term of the body's
+	// tsquery, whose database time grows with the square of the word count.
+	if len(searchQuery) > db.MaxSearchTermLength {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Search query parameter 'q' must be at most %d bytes", db.MaxSearchTermLength))
+		return
+	}
+
+	// The documented filters, each ANDed with q. unseen is parsed as in the list endpoint.
+	filter := db.UserAPISearchFilter{
+		From:       query.Get("from"),
+		Subject:    query.Get("subject"),
+		UnseenOnly: query.Get("unseen") == "true",
+	}
+	if !validSearchText(filter.From) || !validSearchText(filter.Subject) {
+		s.writeError(w, http.StatusBadRequest, "Search filters 'from' and 'subject' must be UTF-8 text without NUL")
+		return
+	}
+	// Bounded as the values of IMAP SEARCH FROM and SUBJECT are.
+	if len(filter.From) > db.MaxSearchTermLength || len(filter.Subject) > db.MaxSearchTermLength {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Search filters 'from' and 'subject' must be at most %d bytes each", db.MaxSearchTermLength))
+		return
+	}
 
 	// Perform search
-	messages, truncated, err := s.rdb.SearchMessagesInMailboxWithRetry(ctx, accountID, mailboxName, searchQuery)
+	messages, truncated, err := s.rdb.SearchMessagesInMailboxWithRetry(ctx, accountID, mailboxName, searchQuery, filter)
+	if errors.Is(err, consts.ErrMailboxNotFound) {
+		messages, truncated, err = s.rdb.SearchMessagesInMailboxWithRetry(readFromWriter(ctx), accountID, mailboxName, searchQuery, filter)
+	}
 	if err != nil {
 		if errors.Is(err, consts.ErrMailboxNotFound) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")

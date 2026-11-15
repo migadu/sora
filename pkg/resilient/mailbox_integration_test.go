@@ -4,6 +4,7 @@ package resilient_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/migadu/sora/consts"
@@ -48,4 +49,98 @@ func TestGetOrCreateMailboxByNameWithRetry_Hierarchical(t *testing.T) {
 	// Ensure the child path properly inherits from parent A/B
 	// Since path is hex encoded, we can fetch it. It should be 48 chars long (16 * 3 levels).
 	assert.Equal(t, 48, len(childC.Path), "Path should be 48 chars (3 levels of nesting)")
+}
+
+// TestGetOrCreateMailboxByNameWithRetry_HierarchyLevels is issue #457. The
+// get-or-create behind Sieve fileinto :create, the Admin API and the importer names
+// a mailbox as IMAP CREATE does: a trailing delimiter is no part of the name (RFC
+// 3501 §6.3.3: "the name created is without the trailing hierarchy delimiter"),
+// and a name with an empty, "." or ".." level is refused with
+// ErrMailboxInvalidName before anything is created, so no mailbox with an empty
+// level ("x/", "") ever appears.
+func TestGetOrCreateMailboxByNameWithRetry_HierarchyLevels(t *testing.T) {
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	ctx := context.Background()
+
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, account.Email)
+	require.NoError(t, err)
+
+	trailing, err := rdb.GetOrCreateMailboxByNameWithRetry(ctx, accountID, "Foo/")
+	require.NoError(t, err)
+	assert.Equal(t, "Foo", trailing.Name)
+	plain, err := rdb.GetOrCreateMailboxByNameWithRetry(ctx, accountID, "Foo")
+	require.NoError(t, err)
+	assert.Equal(t, trailing.ID, plain.ID, `"Foo/" and "Foo" must name one mailbox`)
+
+	for _, name := range []string{"x//y", "/lead", "/", "", "a/../b", "a/./b", "..", "a\x00b", "caf\xe9", "a\tb"} {
+		_, err := rdb.GetOrCreateMailboxByNameWithRetry(ctx, accountID, name)
+		assert.ErrorIs(t, err, consts.ErrMailboxInvalidName, "name %q", name)
+	}
+
+	mailboxes, err := rdb.GetMailboxesWithRetry(ctx, accountID, false)
+	require.NoError(t, err)
+	for _, mb := range mailboxes {
+		assert.False(t, mb.Name == "" || strings.HasPrefix(mb.Name, "/") || strings.HasSuffix(mb.Name, "/") ||
+			strings.Contains(mb.Name, "//"), "mailbox %q has an empty hierarchy level", mb.Name)
+		assert.NotContains(t, []string{"x", "a"}, mb.Name, "a refused name created its parent %q", mb.Name)
+	}
+}
+
+// TestCreateAndRenameMailbox_EmptyHierarchyLevel is issue #566: below every entry
+// point, the database layer itself refuses to create a mailbox, or rename one to a
+// name, with an empty level ("x/", "/lead", "x//y"), as it refuses "." and ".."
+// levels. CreateMailboxForUser (User API, sora-admin mailbox create) refuses such a
+// name before it creates any parent.
+func TestCreateAndRenameMailbox_EmptyHierarchyLevel(t *testing.T) {
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	ctx := context.Background()
+
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, account.Email)
+	require.NoError(t, err)
+
+	empty := []string{"", "/", "x/", "/lead", "x//y", "x//y/"}
+	for _, name := range empty {
+		err := rdb.CreateMailboxWithRetry(ctx, accountID, name, nil)
+		assert.ErrorIs(t, err, consts.ErrMailboxInvalidName, "CreateMailbox %q", name)
+	}
+	for _, name := range []string{"x//y", "/lead", "a/b//c/"} {
+		err := rdb.CreateMailboxForUserWithRetry(ctx, accountID, name)
+		assert.ErrorIs(t, err, consts.ErrMailboxInvalidName, "CreateMailboxForUser %q", name)
+	}
+
+	require.NoError(t, rdb.CreateMailboxWithRetry(ctx, accountID, "Plain", nil))
+	plain, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, "Plain")
+	require.NoError(t, err)
+	for _, name := range append(empty, "Foo/") {
+		err := rdb.RenameMailboxWithRetry(ctx, plain.ID, accountID, name, nil)
+		assert.ErrorIs(t, err, consts.ErrMailboxInvalidName, "RenameMailbox to %q", name)
+	}
+
+	mailboxes, err := rdb.GetMailboxesWithRetry(ctx, accountID, false)
+	require.NoError(t, err)
+	for _, mb := range mailboxes {
+		assert.False(t, mb.Name == "" || strings.HasPrefix(mb.Name, "/") || strings.HasSuffix(mb.Name, "/") ||
+			strings.Contains(mb.Name, "//"), "mailbox %q has an empty hierarchy level", mb.Name)
+		assert.NotContains(t, []string{"x", "a", "a/b"}, mb.Name, "a refused name created its parent %q", mb.Name)
+	}
+}
+
+// TestGetMailboxByNameWithRetry_UnstorableName: a name PostgreSQL cannot hold in a
+// text value (a NUL, invalid UTF-8) names no mailbox. The lookup answers
+// ErrMailboxNotFound, as for any other missing name, instead of the SQLSTATE 22021
+// internal error that a Sieve fileinto turned into a 451 on every attempt.
+func TestGetMailboxByNameWithRetry_UnstorableName(t *testing.T) {
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	ctx := context.Background()
+
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, account.Email)
+	require.NoError(t, err)
+
+	for _, name := range []string{"a\x00b", "caf\xe9", "INBOX/\xff"} {
+		_, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, name)
+		assert.ErrorIs(t, err, consts.ErrMailboxNotFound, "name %q", name)
+	}
 }

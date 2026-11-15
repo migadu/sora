@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -48,16 +49,14 @@ type Server struct {
 	storage                    *storage.S3Storage
 	rs3                        *resilient.ResilientS3Storage // storage behind retries + breaker; nil when storage is
 	uploader                   *uploader.UploadWorker
+	uploadMaxAttempts          int // [uploader] max_attempts for a node without uploader; see ServerOptions
 	cache                      *cache.Cache
 	authCache                  *lookupcache.LookupCache
 	positiveRevalidationWindow time.Duration
 	authLimiter                *server.AuthRateLimiter
 	server                     *http.Server
 	tls                        bool
-	tlsConfig                  *tls.Config // TLS config from manager (takes precedence) or nil
-	tlsCertFile                string
-	tlsKeyFile                 string
-	tlsVerify                  bool
+	tlsConfig                  *tls.Config // What the listener serves with (server.ListenerTLS); nil without tls
 	proxyReader                *server.ProxyProtocolReader
 	sieveExtensions            []string
 }
@@ -77,7 +76,12 @@ type ServerOptions struct {
 	// Uploader is this node's upload worker: bodies not yet in S3 are read from its
 	// staging spool, and its max_attempts tells a body still on its way from one the
 	// worker has given up on (see loadMessageBody). Optional.
-	Uploader                    *uploader.UploadWorker
+	Uploader *uploader.UploadWorker
+	// UploadMaxAttempts is [uploader] max_attempts, used when there is no Uploader (a
+	// User API node without imap, lmtp or pop3): the uploaders give up on a body after
+	// that many attempts, so it is gone, not "retry later". 0 counts every pending
+	// upload as on its way.
+	UploadMaxAttempts           int
 	AuthRateLimit               server.AuthRateLimiterConfig
 	LookupCache                 *config.LookupCacheConfig // Authentication cache configuration
 	TLS                         bool
@@ -128,8 +132,8 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		return nil, err
 	}
 
-	if options.TokenDuration == 0 {
-		options.TokenDuration = 24 * time.Hour // Default to 24 hours
+	if options.TokenDuration <= 0 {
+		options.TokenDuration = 24 * time.Hour // Default to 24 hours; a negative lifetime would mint expired tokens
 	}
 	if options.TokenDuration > maxTokenDuration {
 		logger.Warn("User API: token_duration exceeds maximum; clamping",
@@ -141,13 +145,18 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		options.TokenIssuer = "sora-mail-api"
 	}
 
-	// Validate TLS configuration
+	// The certificate source and tls_verify follow the rule every listener
+	// shares (server.ListenerTLS).
+	var tlsConfig *tls.Config
 	if options.TLS {
-		// If TLSConfig is provided (from manager), use it. Otherwise require cert files.
-		if options.TLSConfig == nil {
-			if options.TLSCertFile == "" || options.TLSKeyFile == "" {
-				return nil, fmt.Errorf("TLS certificate and key files are required when TLS is enabled (or use TLS manager)")
-			}
+		var err error
+		tlsConfig, err = server.ListenerTLS{
+			Protocol: "User API", Name: options.Name,
+			CertFile: options.TLSCertFile, KeyFile: options.TLSKeyFile, Verify: options.TLSVerify,
+			Global: options.TLSConfig,
+		}.Config()
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -162,36 +171,15 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		// Parse TTL and other config values
 		lookupCacheConfig := options.LookupCache
 
-		positiveTTL, err := time.ParseDuration(lookupCacheConfig.PositiveTTL)
-		if err != nil || lookupCacheConfig.PositiveTTL == "" {
-			logger.Info("User API: Using default positive TTL (5m)", "name", options.Name)
-			positiveTTL = 5 * time.Minute
-		}
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault(options.Name)
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault(options.Name)
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(options.Name)
 
-		negativeTTL, err := time.ParseDuration(lookupCacheConfig.NegativeTTL)
-		if err != nil || lookupCacheConfig.NegativeTTL == "" {
-			logger.Info("User API: Using default negative TTL (1m)", "name", options.Name)
-			negativeTTL = 1 * time.Minute
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
-		cleanupInterval, err := time.ParseDuration(lookupCacheConfig.CleanupInterval)
-		if err != nil || lookupCacheConfig.CleanupInterval == "" {
-			logger.Info("User API: Using default cleanup interval (5m)", "name", options.Name)
-			cleanupInterval = 5 * time.Minute
-		}
+		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(options.Name)
 
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize == 0 {
-			maxSize = 10000
-		}
-
-		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()
-		if err != nil {
-			logger.Info("User API: Invalid positive revalidation window in auth cache config, using default (30s)", "name", options.Name, "error", err)
-			positiveRevalidationWindow = 30 * time.Second
-		}
-
-		authCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		authCache = lookupcache.New("userapi", options.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("User API: Lookup cache enabled", "name", options.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
@@ -223,14 +211,12 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		rs3:                        newResilientStorage(options.Storage),
 		cache:                      options.Cache,
 		uploader:                   options.Uploader,
+		uploadMaxAttempts:          options.UploadMaxAttempts,
 		authCache:                  authCache,
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		authLimiter:                authLimiter,
 		tls:                        options.TLS,
-		tlsConfig:                  options.TLSConfig,
-		tlsCertFile:                options.TLSCertFile,
-		tlsKeyFile:                 options.TLSKeyFile,
-		tlsVerify:                  options.TLSVerify,
+		tlsConfig:                  tlsConfig,
 		proxyReader:                proxyReader,
 	}
 	s.settings.Store(&reloadableSettings{
@@ -238,6 +224,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		allowedOrigins: options.AllowedOrigins,
 		allowedHosts:   options.AllowedHosts,
 	})
+	warnUnusableAllowedHosts(options.Name, options.AllowedHosts)
 
 	return s, nil
 }
@@ -269,6 +256,7 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	}
 	if !slices.Equal(cfg.AllowedHosts, next.allowedHosts) {
 		next.allowedHosts = slices.Clone(cfg.AllowedHosts)
+		warnUnusableAllowedHosts(s.name, next.allowedHosts)
 		reloaded = append(reloaded, "allowed_hosts")
 	}
 
@@ -285,29 +273,35 @@ func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options Server
 		errChan <- fmt.Errorf("failed to create HTTP Mail API server: %w", err)
 		return nil
 	}
-
-	protocol := "HTTP"
-	if options.TLS {
-		protocol = "HTTPS"
-	}
-	serverName := options.Name
-	if serverName == "" {
-		serverName = "default"
-	}
-	logger.Info("HTTP Mail API: Starting server", "name", serverName, "protocol", protocol, "addr", options.Addr)
 	go func() {
-		if err := server.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
+		if err := server.Run(ctx); err != nil && ctx.Err() == nil {
 			errChan <- fmt.Errorf("HTTP Mail API server failed: %w", err)
 		}
 	}()
 	return server
 }
 
-// start initializes and starts the HTTP server
-func (s *Server) start(ctx context.Context) error {
+// Run starts the HTTP Mail API server and blocks until it stops. It returns nil
+// when stopped via ctx cancellation.
+func (s *Server) Run(ctx context.Context) error {
+	defer server.UnregisterRateLimiter("userapi", s.name)
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	protocol := "HTTP"
+	if s.tls {
+		protocol = "HTTPS"
+	}
+	serverName := s.name
+	if serverName == "" {
+		serverName = "default"
+	}
+	logger.Info("HTTP Mail API: Starting server", "name", serverName, "protocol", protocol, "addr", s.addr)
+
 	router := s.SetupRoutes()
 
-	s.server = &http.Server{
+	httpServer := &http.Server{
 		Addr:              s.addr,
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second, // slowloris-on-headers defense
@@ -315,15 +309,31 @@ func (s *Server) start(ctx context.Context) error {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	if s.tls {
+		httpServer.TLSConfig = s.tlsConfig
+	}
+	s.server = httpServer
+
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	stopCtx, stopCancel := context.WithCancel(ctx)
+	defer stopCancel()
 
 	// Graceful shutdown
+	shutdownDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
+		defer close(shutdownDone)
+		<-stopCtx.Done()
+		if ctx.Err() == nil {
+			return
+		}
 		logger.Info("HTTP Mail API: Shutting down server...", "name", s.name)
 		server.UnregisterRateLimiter("userapi", s.name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if err := s.server.Shutdown(shutdownCtx); err != nil {
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			logger.Warn("HTTP Mail API: Error shutting down server", "name", s.name, "error", err)
 		}
 	}()
@@ -331,6 +341,8 @@ func (s *Server) start(ctx context.Context) error {
 	// Create listener
 	listener, err := net.Listen("tcp", s.addr)
 	if err != nil {
+		stopCancel()
+		<-shutdownDone
 		return fmt.Errorf("failed to create listener: %w", err)
 	}
 
@@ -349,38 +361,26 @@ func (s *Server) start(ctx context.Context) error {
 		listener = netutil.LimitListener(listener, s.maxConnections)
 	}
 
-	// Start server with or without TLS
-	if s.tls {
-		// Use TLS config from manager if provided, otherwise create one for static certs
-		var tlsConfig *tls.Config
-		if s.tlsConfig != nil {
-			// Clone the manager's TLS config
-			tlsConfig = s.tlsConfig.Clone()
-		} else {
-			// Create new TLS config for static certificates
-			tlsConfig = &tls.Config{
-				MinVersion:    tls.VersionTLS12,
-				Renegotiation: tls.RenegotiateNever,
-			}
-		}
-
-		// Apply client verification settings
-		if s.tlsVerify {
-			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-		} else {
-			tlsConfig.ClientAuth = tls.NoClientCert
-		}
-		s.server.TLSConfig = tlsConfig
-
-		// If using TLS manager (tlsConfig from manager), pass empty cert files
-		// The GetCertificate callback in the config will handle certificate retrieval
-		if s.tlsConfig != nil {
-			return s.server.ServeTLS(listener, "", "")
-		}
-		// Otherwise use static certificate files
-		return s.server.ServeTLS(listener, s.tlsCertFile, s.tlsKeyFile)
+	if ctx.Err() != nil {
+		listener.Close()
+		<-shutdownDone
+		return nil
 	}
-	return s.server.Serve(listener)
+
+	// Start server with or without TLS. The certificate is in TLSConfig
+	// already, from the global [tls] manager or the certificate files.
+	if s.tls {
+		err = httpServer.ServeTLS(listener, "", "")
+	} else {
+		err = httpServer.Serve(listener)
+	}
+	if errors.Is(err, http.ErrServerClosed) && ctx.Err() != nil {
+		<-shutdownDone
+		return nil
+	}
+	stopCancel()
+	<-shutdownDone
+	return err
 }
 
 // SetupRoutes configures all HTTP routes and middleware
@@ -388,11 +388,11 @@ func (s *Server) SetupRoutes() http.Handler {
 	mux := http.NewServeMux()
 
 	// Public routes (no authentication required)
-	mux.HandleFunc("/user/auth/login", routeHandler("POST", s.handleLogin))
-	mux.HandleFunc("/user/auth/refresh", routeHandler("POST", s.handleRefreshToken))
+	mux.HandleFunc("/user/auth/login", s.routeHandler("POST", s.handleLogin))
+	mux.HandleFunc("/user/auth/refresh", s.routeHandler("POST", s.handleRefreshToken))
 
 	// Mailbox operations
-	mux.Handle("/user/mailboxes", s.jwtAuthMiddleware(multiMethodHandler(map[string]http.HandlerFunc{
+	mux.Handle("/user/mailboxes", s.jwtAuthMiddleware(s.multiMethodHandler(map[string]http.HandlerFunc{
 		"GET":  s.handleListMailboxes,
 		"POST": s.handleCreateMailbox,
 	})))
@@ -402,8 +402,11 @@ func (s *Server) SetupRoutes() http.Handler {
 	mux.Handle("/user/messages/", s.jwtAuthMiddleware(http.HandlerFunc(s.handleMessageOperations)))
 
 	// Sieve filter operations
-	mux.Handle("/user/filters", s.jwtAuthMiddleware(routeHandler("GET", s.handleListFilters)))
+	mux.Handle("/user/filters", s.jwtAuthMiddleware(s.routeHandler("GET", s.handleListFilters)))
 	mux.Handle("/user/filters/", s.jwtAuthMiddleware(http.HandlerFunc(s.handleFilterOperations)))
+
+	// Every other path (ServeMux's own 404 is text/plain)
+	mux.HandleFunc("/", s.notFound)
 
 	// Wrap with middleware (in reverse order - last applied is outermost)
 	handler := s.loggingMiddleware(mux)
@@ -415,12 +418,15 @@ func (s *Server) SetupRoutes() http.Handler {
 
 // handleMailboxWithName routes mailbox operations that include a mailbox name
 func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
+	// The endpoint is picked by what follows the name, in the escaped path (an
+	// encoded "/" belongs to the name, see pathName) and only after a name: a
+	// DELETE of the top-level mailbox "search" deletes that mailbox.
+	path := strings.TrimPrefix(escapedRoutingPath(r), "/user/mailboxes/")
 
 	// Check for subscribe/unsubscribe operations
 	if strings.HasSuffix(path, "/subscribe") {
 		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "POST")
 			return
 		}
 		s.handleSubscribeMailbox(w, r)
@@ -428,7 +434,7 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasSuffix(path, "/unsubscribe") {
 		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "POST")
 			return
 		}
 		s.handleUnsubscribeMailbox(w, r)
@@ -438,7 +444,7 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	// Check for message listing/search
 	if strings.HasSuffix(path, "/messages") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleListMessages(w, r)
@@ -446,20 +452,20 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasSuffix(path, "/search") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleSearchMessages(w, r)
 		return
 	}
 
-	// Otherwise it's a delete operation on the mailbox itself
+	// Otherwise it's the mailbox itself, which can only be deleted
 	if r.Method == "DELETE" {
 		s.handleDeleteMailbox(w, r)
 		return
 	}
 
-	http.Error(w, "Not found", http.StatusNotFound)
+	s.methodNotAllowed(w, "DELETE")
 }
 
 // handleMessageOperations routes message operations
@@ -469,7 +475,7 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 	// Check for body/raw endpoints
 	if strings.HasSuffix(path, "/body") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleGetMessageBody(w, r)
@@ -477,7 +483,7 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 	}
 	if strings.HasSuffix(path, "/raw") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleGetMessageRaw(w, r)
@@ -493,18 +499,20 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 	case "DELETE":
 		s.handleDeleteMessage(w, r)
 	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		s.methodNotAllowed(w, "GET", "PATCH", "DELETE")
 	}
 }
 
 // handleFilterOperations routes Sieve filter operations
 func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
+	// As in handleMailboxWithName: /activate is matched only after a script
+	// name, so a script named "activate" is addressed by that name.
+	path := strings.TrimPrefix(escapedRoutingPath(r), "/user/filters/")
 
 	// Check for capabilities endpoint
-	if strings.HasSuffix(path, "/capabilities") {
+	if path == "capabilities" {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleGetCapabilities(w, r)
@@ -514,7 +522,7 @@ func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) 
 	// Check for activate endpoint
 	if strings.HasSuffix(path, "/activate") {
 		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "POST")
 			return
 		}
 		s.handleActivateFilter(w, r)
@@ -530,7 +538,7 @@ func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) 
 	case "DELETE":
 		s.handleDeleteFilter(w, r)
 	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		s.methodNotAllowed(w, "GET", "PUT", "DELETE")
 	}
 }
 
@@ -547,41 +555,9 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-
-		// Check if origin is allowed
-		allowedOrigins := s.settings.Load().allowedOrigins
-		if origin != "" && len(allowedOrigins) > 0 {
-			allowed := false
-			wildcard := false
-			for _, allowedOrigin := range allowedOrigins {
-				if allowedOrigin == "*" {
-					allowed = true
-					wildcard = true
-					break
-				}
-				if allowedOrigin == origin {
-					allowed = true
-					break
-				}
-			}
-
-			if allowed {
-				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-				w.Header().Set("Access-Control-Max-Age", "3600")
-				if wildcard {
-					// A wildcard origin must NOT be combined with credentials (CORS spec):
-					// reflecting a concrete origin + Allow-Credentials lets any site make
-					// credentialed cross-origin reads. Emit literal "*" without credentials.
-					w.Header().Set("Access-Control-Allow-Origin", "*")
-				} else {
-					// Specific configured origin: safe to reflect and allow credentials.
-					w.Header().Set("Access-Control-Allow-Origin", origin)
-					w.Header().Set("Access-Control-Allow-Credentials", "true")
-				}
-			}
-		}
+		// The CORS policy is shared with the User API proxy, which applies it to the
+		// responses it writes itself.
+		server.SetCORSHeaders(w.Header(), r.Header.Get("Origin"), s.settings.Load().allowedOrigins)
 
 		// Handle preflight requests
 		if r.Method == "OPTIONS" {
@@ -624,29 +600,19 @@ func getClientIP(r *http.Request) string {
 	return host
 }
 
+// isIPAllowed reports whether clientIP matches an IP or CIDR entry of allowedHosts.
+// An entry that is neither (a host name, a typo) matches no client but does not stop
+// the other entries from matching; warnUnusableAllowedHosts reports it once per list.
 func isIPAllowed(clientIP string, allowedHosts []string) bool {
-	networks, err := helpers.ParseTrustedNetworks(allowedHosts)
-	if err != nil {
-		logger.Warn("userapi: failed to parse allowed hosts as CIDR, falling back to literal matching", "error", err)
-		for _, allowedHost := range allowedHosts {
-			if allowedHost == clientIP {
-				return true
-			}
-		}
-		return false
-	}
+	return helpers.IPInNetworks(net.ParseIP(clientIP), allowedHosts)
+}
 
-	ip := net.ParseIP(clientIP)
-	if ip == nil {
-		return false
+// warnUnusableAllowedHosts logs the allowed_hosts entries that are not an IP address
+// or CIDR, when a list is configured (startup) or replaced (reload).
+func warnUnusableAllowedHosts(name string, allowedHosts []string) {
+	for _, entry := range helpers.InvalidNetworkEntries(allowedHosts) {
+		logger.Warn("HTTP Mail API: allowed_hosts entry is not an IP address or CIDR and matches no client", "name", name, "entry", entry)
 	}
-
-	for _, network := range networks {
-		if network.Contains(ip) {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
@@ -661,7 +627,19 @@ func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 	s.writeJSON(w, status, map[string]string{"error": message})
 }
 
-// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+// writeTokenRefused answers 401 for a bearer token the request presented and that was
+// refused: expired, malformed, badly signed, or no longer valid for its account. The
+// challenge says error="invalid_token" (RFC 6750 section 3.1), so a client can tell it
+// apart from a request that carried no token.
+func (s *Server) writeTokenRefused(w http.ResponseWriter) {
+	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, true)
+	s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+}
+
+// getProxyProtocolTrustedProxies returns the hosts trusted to send PROXY headers: the
+// ProxyProtocolTrustedProxies option if set, otherwise trusted_networks. No config key
+// sets that option (there is no proxy_protocol_trusted_proxies, #542), so in a running
+// server PROXY trust is always [servers] trusted_networks.
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {
 		return proxyProtocolTrusted

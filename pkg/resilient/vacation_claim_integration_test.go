@@ -44,3 +44,51 @@ func TestVacationClaim_AmbiguousCommitFailsClosed(t *testing.T) {
 		t.Fatalf("claim after ambiguous committed response authorized=%v error=%v, want false and nil", claimed, err)
 	}
 }
+
+// A claim that wins a new period supersedes the key's older history: only the most
+// recent response decides any later claim, so the older rows only made the table
+// grow. With the history kept for the longest :days (#292), a permanent :days 1
+// responder would otherwise keep a row per reply for a year.
+func TestVacationClaim_SupersedesOlderHistory(t *testing.T) {
+	ctx := context.Background()
+	cfg := testDatabaseConfig()
+	plain := newTestPool(t, cfg, nil)
+	var accountID int64
+	if err := plain.QueryRow(ctx, `INSERT INTO accounts DEFAULT VALUES RETURNING id`).Scan(&accountID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { plain.Exec(ctx, `DELETE FROM accounts WHERE id = $1`, accountID) })
+	rdb := newTestResilientDatabase(cfg, plain)
+
+	records := func(identity string) int {
+		t.Helper()
+		var n int
+		if err := plain.QueryRow(ctx, `SELECT count(*) FROM vacation_responses WHERE account_id = $1 AND response_identity = $2`,
+			accountID, identity).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	for _, identity := range []string{"response", "other"} {
+		if claimed, err := rdb.ClaimVacationResponseWithRetry(ctx, accountID, "sender@example.net", identity, 24*time.Hour); err != nil || !claimed {
+			t.Fatalf("first claim of %s authorized=%v error=%v", identity, claimed, err)
+		}
+	}
+	// The period of "response" is over: move its reply two days back.
+	if _, err := plain.Exec(ctx, `UPDATE vacation_responses SET response_date = response_date - interval '2 days'
+		WHERE account_id = $1 AND response_identity = 'response'`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := rdb.ClaimVacationResponseWithRetry(ctx, accountID, "sender@example.net", "response", 24*time.Hour); err != nil || !claimed {
+		t.Fatalf("claim after the period authorized=%v error=%v, want true", claimed, err)
+	}
+	if n := records("response"); n != 1 {
+		t.Errorf("history rows for the reclaimed response = %d, want 1 (the new period only)", n)
+	}
+	if n := records("other"); n != 1 {
+		t.Errorf("another response identity's history was touched: %d rows, want 1", n)
+	}
+	if claimed, err := rdb.ClaimVacationResponseWithRetry(ctx, accountID, "sender@example.net", "response", 24*time.Hour); err != nil || claimed {
+		t.Fatalf("claim within the new period authorized=%v error=%v, want false", claimed, err)
+	}
+}

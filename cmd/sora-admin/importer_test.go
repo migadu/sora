@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -42,14 +43,14 @@ func newMockResilientDatabase() *mockResilientDatabase {
 	}
 }
 
-func (m *mockResilientDatabase) GetMailboxByNameWithRetry(ctx context.Context, accountID int64, name string) (*db.DBMailbox, error) {
+func (m *mockResilientDatabase) GetOwnedMailboxIDByNameWithRetry(ctx context.Context, accountID int64, name string) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.getMailboxByNameCalls++
 	if mailbox, ok := m.mailboxes[name]; ok {
-		return mailbox, nil
+		return mailbox.ID, nil
 	}
-	return nil, consts.ErrMailboxNotFound
+	return 0, consts.ErrMailboxNotFound
 }
 
 func (m *mockResilientDatabase) CreateMailboxWithRetry(ctx context.Context, accountID int64, name string, parentID *int64) error {
@@ -330,7 +331,7 @@ func TestProcessBatch_DBInsertFailure(t *testing.T) {
 		}
 
 		// 5. Create a batch with one message
-		msgHash := HashContent(msgContent)
+		msgHash := helpers.HashContent(msgContent)
 		batch := []msgInfo{
 			{
 				path:     msgPath,
@@ -438,7 +439,10 @@ func TestParseMessageMetadata(t *testing.T) {
 		assert.True(t, expectedDate.Equal(metadata.sentDate), "Date should be parsed from the header")
 	})
 
-	t.Run("with missing date header, fallback to file mod time", func(t *testing.T) {
+	// A message without a Date: header that parses has no sent date: it is stored with its
+	// INTERNALDATE as the sent date (RFC 5256 section 2.2) and reported with a NIL ENVELOPE
+	// date (RFC 9051 section 7.5.2), never with a date taken from the file.
+	t.Run("with missing date header, internal date from file mod time", func(t *testing.T) {
 		content := []byte("Subject: Test\r\n\r\nBody")
 
 		// Create a temp file and set its modification time
@@ -457,10 +461,11 @@ func TestParseMessageMetadata(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, metadata)
 
-		assert.True(t, expectedDate.Equal(metadata.sentDate), "Date should fall back to file modification time")
+		assert.True(t, metadata.sentDate.IsZero(), "no Date: header, no sent date: %v", metadata.sentDate)
+		assert.True(t, expectedDate.Equal(metadata.internalDate), "internal date should be the file modification time")
 	})
 
-	t.Run("with invalid date header, fallback to file mod time", func(t *testing.T) {
+	t.Run("with invalid date header, internal date from file mod time", func(t *testing.T) {
 		content := []byte("Date: not-a-valid-date\r\nSubject: Test\r\n\r\nBody")
 
 		tempFile, err := os.CreateTemp(t.TempDir(), "test-*.eml")
@@ -477,10 +482,11 @@ func TestParseMessageMetadata(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, metadata)
 
-		assert.True(t, expectedDate.Equal(metadata.sentDate), "Date should fall back to file modification time on invalid header")
+		assert.True(t, metadata.sentDate.IsZero(), "a Date: header that does not parse gives no sent date: %v", metadata.sentDate)
+		assert.True(t, expectedDate.Equal(metadata.internalDate), "internal date should be the file modification time")
 	})
 
-	t.Run("with missing date and file stat error, fallback to time.Now", func(t *testing.T) {
+	t.Run("with missing date and file stat error, internal date is time.Now", func(t *testing.T) {
 		content := []byte("Subject: Test\r\n\r\nBody")
 		before := time.Now()
 		metadata, err := importer.parseMessageMetadata(content, "test.eml", "/non/existent/path/file.eml")
@@ -488,7 +494,8 @@ func TestParseMessageMetadata(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, metadata)
 
-		// Check that the date is within the time window of the function call
-		assert.True(t, !metadata.sentDate.Before(before) && !metadata.sentDate.After(after), "Date should fall back to time.Now()")
+		assert.True(t, metadata.sentDate.IsZero(), "no Date: header, no sent date: %v", metadata.sentDate)
+		// Check that the internal date is within the time window of the function call
+		assert.True(t, !metadata.internalDate.Before(before) && !metadata.internalDate.After(after), "internal date should fall back to time.Now()")
 	})
 }

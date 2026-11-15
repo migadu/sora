@@ -61,6 +61,13 @@ var (
 		},
 		[]string{"hash_type", "result"},
 	)
+
+	PasswordDummyVerifications = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sora_password_dummy_verifications_total",
+			Help: "Total number of bcrypt comparisons against the dummy hash, spent by failed logins with no password hash to check so that they cost what a wrong password costs",
+		},
+	)
 )
 
 // Database performance metrics
@@ -172,7 +179,7 @@ var (
 	LargeBodyStorageSkipped = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "sora_large_body_storage_skipped_total",
-			Help: "Total number of message bodies/headers not stored in database due to large size (>64KB)",
+			Help: "Total number of message bodies truncated to their first 64KB for full-text indexing",
 		},
 	)
 )
@@ -205,12 +212,13 @@ var (
 	)
 )
 
-// Cache metrics (S3 object cache)
+// Cache metrics (local message body cache). The lookup caches of logins and routing
+// have their own sora_lookup_cache_* metrics.
 var (
 	CacheOperationsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "sora_cache_operations_total",
-			Help: "Total number of cache operations",
+			Help: "Total number of message body cache operations",
 		},
 		[]string{"operation", "result"},
 	)
@@ -246,18 +254,23 @@ var (
 		},
 	)
 
-	LookupCacheEntriesTotal = promauto.NewGauge(
+	// A node has one lookup cache per server that enables it (backends, proxies, the
+	// User API), so the gauges are per cache: protocol is the server type ("imap",
+	// "imap_proxy", "userapi", ...), server_name the server's configured name.
+	LookupCacheEntriesTotal = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "sora_lookup_cache_entries_total",
 			Help: "Current number of entries in authentication cache",
 		},
+		[]string{"protocol", "server_name"},
 	)
 
-	LookupCacheHitRate = promauto.NewGauge(
+	LookupCacheHitRate = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "sora_lookup_cache_hit_rate",
 			Help: "Authentication cache hit rate percentage (0-100)",
 		},
+		[]string{"protocol", "server_name"},
 	)
 
 	LookupCacheSharedFetchesTotal = promauto.NewCounter(
@@ -265,6 +278,17 @@ var (
 			Name: "sora_lookup_cache_shared_fetches_total",
 			Help: "Total number of shared fetches (thundering herd prevented)",
 		},
+	)
+
+	// How a proxy used what its lookup cache returned for a login or a route: hit, miss,
+	// or the finer outcomes of a proxy that revalidates (hit_negative,
+	// revalidate_negative_different_pw, revalidate_positive_different_pw, ...).
+	LookupCacheResults = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_lookup_cache_results_total",
+			Help: "Proxy lookup cache reads by how the proxy used the entry",
+		},
+		[]string{"protocol", "result"}, // protocol: imap_proxy/pop3_proxy/managesieve_proxy/lmtp_proxy/userapi_proxy
 	)
 )
 
@@ -494,7 +518,7 @@ var (
 			Name: "sora_connection_timeouts_total",
 			Help: "Total number of connection timeouts by protocol and reason",
 		},
-		[]string{"protocol", "server_name", "hostname", "reason"}, // reason: idle, slow_throughput, session_max, tls_on_plain_port
+		[]string{"protocol", "server_name", "hostname", "reason"}, // reason: idle, slow_throughput, session_max, tls_on_plain_port, plain_text_on_tls_port
 	)
 )
 
@@ -533,21 +557,24 @@ var (
 		[]string{"protocol", "server_name", "hostname"},
 	)
 
-	// Auth delay queue metrics (per-IP semaphore tracking)
+	// Auth delay queue metrics. Labelled by the call site only: a client-address
+	// label would add series for every address ever delayed and never drop them.
+	// Per-address detail is in the logs and, for addresses that end up blocked, in
+	// GET /admin/auth/blocked.
 	AuthDelayQueueDepth = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "sora_auth_delay_queue_depth",
-			Help: "Current number of connections waiting in auth delay queue per IP",
+			Help: "Current number of connections waiting in an auth delay",
 		},
-		[]string{"protocol", "ip"},
+		[]string{"protocol"},
 	)
 
 	AuthDelayRejections = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "sora_auth_delay_rejections_total",
-			Help: "Total number of connections rejected due to full delay queue per IP",
+			Help: "Total number of connections rejected because their IP's auth delay queue was full",
 		},
-		[]string{"protocol", "ip"},
+		[]string{"protocol"},
 	)
 
 	AuthDelayCompleted = promauto.NewCounterVec(
@@ -555,7 +582,7 @@ var (
 			Name: "sora_auth_delay_completed_total",
 			Help: "Total number of auth delays completed successfully",
 		},
-		[]string{"protocol", "ip"},
+		[]string{"protocol"},
 	)
 
 	AuthDelayCancelled = promauto.NewCounterVec(
@@ -563,7 +590,7 @@ var (
 			Name: "sora_auth_delay_cancelled_total",
 			Help: "Total number of auth delays cancelled (connection closed, shutdown, etc.)",
 		},
-		[]string{"protocol", "ip"},
+		[]string{"protocol"},
 	)
 
 	// Connection tracker memory usage (proxy mode)
@@ -684,5 +711,16 @@ var (
 			Help: "New sessions (logins, LMTP transactions, Admin API deliveries) this backend refused because it is in maintenance",
 		},
 		[]string{"protocol"},
+	)
+)
+
+// Spam training metrics
+var (
+	SpamTrainingMessagesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_spam_training_messages_total",
+			Help: "Messages moved to or from Junk, by spam training outcome (submitted, failed, too_large, dropped)",
+		},
+		[]string{"result"},
 	)
 )

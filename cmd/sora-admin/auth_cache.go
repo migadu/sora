@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,6 +32,20 @@ func handleAuthCacheCommand(ctx context.Context) {
 }
 
 func handleAuthCacheStatus(ctx context.Context) {
+	fs := flag.NewFlagSet("auth-cache status", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Printf(`Show auth cache statistics
+
+Usage:
+  sora-admin --config PATH auth-cache status
+
+Asks the Admin API ([admin_cli] addr and api_key) for the auth cache's entries and hit rate.
+`)
+	}
+	if err := fs.Parse(os.Args[3:]); err != nil {
+		logger.Fatalf("Error parsing flags: %v", err)
+	}
+
 	client, err := createHTTPAPIClient(globalConfig)
 	if err != nil {
 		logger.Fatalf("Failed to create HTTP API client: %v", err)

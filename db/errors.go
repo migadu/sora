@@ -18,8 +18,17 @@ var (
 	// ErrMessageNotFound indicates that a message was not found in the database
 	ErrMessageNotFound = errors.New("message not found")
 
-	// ErrInvalidCredentials indicates that the provided credentials are invalid
+	// ErrInvalidCredentials is what VerifyPassword returns (possibly wrapped) when the
+	// password does not match the stored hash, whatever its scheme. A hash that cannot
+	// be checked at all is ErrUnverifiableHash.
 	ErrInvalidCredentials = errors.New("invalid credentials")
+
+	// ErrUnverifiableHash is what VerifyPassword and ValidatePasswordHash return
+	// (wrapped, with the reason) for a stored password value sora cannot check: no or
+	// an unsupported scheme, data that does not decode or has the wrong length. No
+	// password matches it, so it is not a wrong password. The error text never quotes
+	// the value, which may be a password pasted into the hash field.
+	ErrUnverifiableHash = errors.New("password hash cannot be verified")
 
 	// ErrDuplicateAccount indicates that an account with the given email already exists
 	ErrDuplicateAccount = errors.New("account already exists")
@@ -35,6 +44,12 @@ var (
 
 	// Connection errors
 	ErrFailedToConnect = errors.New("failed to connect to database")
+
+	// ErrConnectionClosed indicates the database closed the connection a statement
+	// ran on: PostgreSQL shutting down under it, or a pooled connection that the
+	// database side (or a relay in front of it) closed, which pgx then reports as
+	// closed.
+	ErrConnectionClosed = errors.New("database connection closed")
 
 	// ErrDBLockTimeout indicates a statement was canceled because it waited longer
 	// than lock_timeout for a row lock (PostgreSQL SQLSTATE 55P03). This is a
@@ -62,7 +77,16 @@ func ClassifyDBError(err error) error {
 		switch pgErr.Code {
 		case "55P03": // lock_not_available — lock_timeout elapsed
 			return errors.Join(ErrDBLockTimeout, err)
+		case "57P01", // admin_shutdown: the server is shutting down
+			"57P02": // crash_shutdown: the server is resetting after a crash
+			return errors.Join(ErrConnectionClosed, err)
 		}
+	}
+
+	// pgx closes a connection once its socket fails or the server ends the session,
+	// and a statement on it then fails with pgconn.ErrConnClosed ("conn closed").
+	if errors.Is(err, pgconn.ErrConnClosed) {
+		return errors.Join(ErrConnectionClosed, err)
 	}
 
 	msg := err.Error()

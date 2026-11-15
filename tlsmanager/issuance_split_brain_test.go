@@ -142,6 +142,52 @@ func TestConcurrentHandshakesOnOneNodeShareItsClaim(t *testing.T) {
 	}
 }
 
+// TestFailedOrderDoesNotHoldTheClaimPastItsExpiry: the claim is given back when the
+// certificate is stored, and an order that fails stores none. autocert retries a failed
+// renewal 30-60 minutes later, after the fence has let the claim go on its own
+// (issuanceClaimTTL) and another node may have taken it. The retry must ask the fence
+// again instead of reading its lapsed claim as still its own.
+func TestFailedOrderDoesNotHoldTheClaimPastItsExpiry(t *testing.T) {
+	const domain = "mail.example.com"
+
+	setup := func(t *testing.T) (*fakeFence, *Manager) {
+		fence := newFakeFence()
+		node := splitBrainNode(fence)
+		if err := node.refuseIssuance(domain); err != nil {
+			t.Fatalf("first order refused: %v", err)
+		}
+		// The order fails, so nothing releases the claim; issuanceClaimTTL passes.
+		node.claimMu.Lock()
+		claim := node.issuanceClaims[domain]
+		claim.expires = time.Now().Add(-time.Second)
+		node.issuanceClaims[domain] = claim
+		node.claimMu.Unlock()
+		return fence, node
+	}
+
+	t.Run("taken by another node", func(t *testing.T) {
+		// To the fence, the claim this node let lapse and another node then took
+		// looks the same as the one it still records: held.
+		_, node := setup(t)
+		if err := node.refuseIssuance(domain); !errors.Is(err, errIssuanceDeferred) {
+			t.Errorf("retry after the claim lapsed and another node took it = %v, want errIssuanceDeferred", err)
+		}
+	})
+
+	t.Run("free", func(t *testing.T) {
+		fence, node := setup(t)
+		fence.mu.Lock()
+		delete(fence.held, domain) // lapsed, and nobody took it
+		fence.mu.Unlock()
+		if err := node.refuseIssuance(domain); err != nil {
+			t.Fatalf("retry after the claim lapsed refused: %v", err)
+		}
+		if got := fence.grantCount(); got != 2 {
+			t.Errorf("fence granted %d claims, want 2: the retry must take the claim anew", got)
+		}
+	})
+}
+
 // TestFenceFailureFallsBackToIssuing pins the availability choice: if the fence cannot be
 // reached, ordering proceeds. An expired certificate takes the node's TLS down entirely,
 // while the worst case of ordering unfenced is a duplicate order costing rate-limit budget.

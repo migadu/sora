@@ -3,12 +3,10 @@ package lmtp
 import (
 	"bytes"
 	"context"
-	_ "embed"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,27 +30,81 @@ import (
 	"github.com/migadu/sora/server/sieveengine"
 )
 
-//go:embed default.sieve
-var defaultSieveScript string
+// defaultSieveScript is the built-in script run before the user's own; a variable
+// so a test can replace it before New compiles it.
+var defaultSieveScript = delivery.DefaultSieveScript
 
-// sendToExternalRelay queues a message for external relay delivery
-func (s *LMTPSession) sendToExternalRelay(from string, to string, message []byte) error {
-	if s.backend.relayQueue == nil {
-		return fmt.Errorf("relay queue not configured")
+// holdRedirects writes the message to the relay queue for every redirect without
+// handing it to the relay worker, and reports whether every target was held. commit
+// hands over every redirect still held, charges each one handed over against the rate
+// limit, and reports whether all of them went; abort drops the ones still held.
+func (s *LMTPSession) holdRedirects(ctx context.Context, result sieveengine.Result, messageContent *message.Entity, fullMessageBytes []byte) (commit func() bool, abort func(), allHeld bool) {
+	type heldRedirect struct {
+		to     string
+		commit func() error
+		abort  func()
+	}
+	var held []heldRedirect
+	allHeld = true
+	if len(result.RedirectTo) > 0 {
+		if result.Copy {
+			s.DebugLog("sieve redirect :copy action", "redirect_to", result.RedirectTo)
+		} else {
+			s.DebugLog("sieve redirect action", "redirect_to", result.RedirectTo)
+		}
+
+		if s.backend.relayQueue != nil {
+			// Stamp the outgoing copy with an incremented hop count (loop backstop).
+			hops := helpers.RedirectHopCount(helpers.HeaderGetter(messageContent.Header.Map()))
+			relayBytes := helpers.PrependHeaderLine(fullMessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(hops+1))
+			// User.Address is the script owner's primary address, even for aliases.
+			// Replace earlier or sender-supplied attribution on the outgoing copy only.
+			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, s.User.Address.FullAddress())
+			for _, redirectTo := range result.RedirectTo {
+				commit, abort, err := s.backend.relayQueue.Hold(s.sender.FullAddress(), redirectTo, "redirect", relayBytes)
+				if err != nil {
+					// Delivery goes on: the message is kept in INBOX unless a fileinto
+					// stores it (Result.Destinations). Say so where an operator will see
+					// it, as the Admin API path does: the user's redirect did not happen.
+					s.WarnLog("sieve redirect could not be queued", "redirect_to", redirectTo, "error", err)
+					allHeld = false
+					continue
+				}
+				held = append(held, heldRedirect{to: redirectTo, commit: commit, abort: abort})
+			}
+		} else {
+			s.DebugLog("redirect requested but external relay not configured")
+			allHeld = false
+		}
 	}
 
-	// Queue the message for background delivery
-	err := s.backend.relayQueue.Enqueue(from, to, "redirect", message)
-	if err != nil {
-		return fmt.Errorf("failed to enqueue relay message: %w", err)
+	commit = func() bool {
+		ok := true
+		for _, h := range held {
+			if err := h.commit(); err != nil {
+				s.WarnLog("sieve redirect could not be queued", "redirect_to", h.to, "error", err)
+				ok = false
+				continue
+			}
+			s.DebugLog("successfully queued message for relay delivery", "redirect_to", h.to)
+			s.notifyRelayWorker()
+			// Only a queued redirect counts against the rate limit.
+			if result.RecordRedirect != nil {
+				if err := result.RecordRedirect(ctx); err != nil {
+					s.WarnLog("failed to charge redirect against the rate limit", "redirect_to", h.to, "error", err)
+				}
+			}
+		}
+		held = nil
+		return ok
 	}
-
-	// Notify worker for immediate processing if available
-	if s.backend.relayWorker != nil {
-		s.backend.relayWorker.NotifyQueued()
+	abort = func() {
+		for _, h := range held {
+			h.abort()
+		}
+		held = nil
 	}
-
-	return nil
+	return commit, abort, allHeld
 }
 
 // LMTPSession represents a single LMTP session.
@@ -333,7 +385,10 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 			}
 		}
 		recordMetrics("failure")
-		return s.InternalError("failed to create default mailboxes: %v", err)
+		// The reply text reaches the sender in a delay or bounce notice: the database
+		// error stays in the log.
+		s.WarnLog("failed to create default mailboxes", "error", err)
+		return s.InternalError("failed to create default mailboxes")
 	}
 
 	// Get primary email address for this account
@@ -630,12 +685,9 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		references = nil
 	}
 
-	if sentDate.IsZero() {
-		sentDate = time.Now()
-		s.DebugLog("no sent date found, using current time", "sent_date", sentDate)
-	} else {
-		s.DebugLog("message sent date", "sent_date", sentDate)
-	}
+	// A zero sentDate (no Date: header that parses) is stored as the internal date and
+	// reported as absent (db.InsertMessageOptions.SentDate).
+	s.DebugLog("message sent date", "sent_date", sentDate)
 
 	var plaintextBody *string
 	plaintextBodyResult, extractErr := helpers.ExtractPlaintextBody(messageContent)
@@ -657,6 +709,19 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
 
+	// Safety guard: Reject if this node's staging limit is exceeded. Checked before Sieve runs,
+	// as on the Admin API path: the MTA retries a 452, and a refused attempt must not have
+	// sent a vacation reply or charged redirects to the rate limit first.
+	if s.backend.uploader.IsStagingLimitExceeded(int64(len(fullMessageBytes))) {
+		s.WarnLog("rejecting delivery due to upload staging size limit exceeded")
+		recordMetrics("failure")
+		return &smtp.SMTPError{
+			Code:         452,
+			EnhancedCode: smtp.EnhancedCode{4, 3, 1},
+			Message:      "Insufficient system storage",
+		}
+	}
+
 	// SIEVE script processing (BEFORE storing locally)
 	// We need to run Sieve and apply header edits BEFORE storing the message,
 	// so that the stored file has the modified headers
@@ -669,7 +734,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	activeScript, err := s.backend.rdb.GetActiveScriptWithRetry(readCtx, s.AccountID())
 	var result sieveengine.Result
-	var mailboxName string
 
 	// Create an adapter for the VacationOracle interface
 	sieveVacOracle := &dbVacationOracle{
@@ -690,6 +754,12 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		EnvelopeTo:   envelopeTo,
 		Header:       messageContent.Header.Map(),
 		Message:      fullMessageBytes,
+		MailboxExists: func(ctx context.Context, mailbox string) (bool, error) {
+			if s.useMasterDB {
+				ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+			}
+			return delivery.CanFileInto(ctx, s.backend.rdb, s.AccountID(), mailbox)
+		},
 	}
 
 	// Always run the default script first as a "before script"
@@ -713,7 +783,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			s.backend.redirectRateWindow,
 			s.backend.maxRedirectHops,
 		)
-		defaultResult, defaultEvalErr := defaultSieveExecutor.Evaluate(ctx, sieveCtx)
+		defaultResult, defaultEvalErr := defaultSieveExecutor.Evaluate(readCtx, sieveCtx)
 		if defaultEvalErr != nil {
 			metrics.SieveExecutions.WithLabelValues("lmtp", "failure").Inc()
 			s.WarnLog("default sieve script evaluation error", "error", defaultEvalErr)
@@ -721,8 +791,14 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			result = sieveengine.Result{Action: sieveengine.ActionKeep}
 		} else {
 			metrics.SieveExecutions.WithLabelValues("lmtp", "success").Inc()
-			// Set the result from the default script
-			result = defaultResult
+			// Set the result from the default script, its spam filing pointed at the
+			// account's \Junk mailbox, whatever that is named.
+			var junkErr error
+			if result, junkErr = delivery.ResolveDefaultJunk(readCtx, s.backend.rdb, s.AccountID(), defaultResult); junkErr != nil {
+				recordMetrics("failure")
+				s.WarnLog("failed to resolve the default script's Junk mailbox", "error", junkErr)
+				return s.InternalError("failed to resolve the target mailbox")
+			}
 
 			s.logSieveAction("default", result)
 		}
@@ -749,7 +825,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				s.backend.redirectRateWindow,
 				s.backend.maxRedirectHops,
 			)
-			userResult, userEvalErr := userSieveExecutor.Evaluate(ctx, sieveCtx)
+			userResult, userEvalErr := userSieveExecutor.Evaluate(readCtx, sieveCtx)
 			if userEvalErr != nil {
 				metrics.SieveExecutions.WithLabelValues("lmtp", "failure").Inc()
 				s.WarnLog("user sieve script evaluation error", "error", userEvalErr)
@@ -758,7 +834,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				metrics.SieveExecutions.WithLabelValues("lmtp", "success").Inc()
 
 				var keptDefault bool
-				result, keptDefault = mergeSieveResults(result, userResult)
+				result, keptDefault = delivery.MergeSieveResults(result, userResult)
 				if keptDefault {
 					s.InfoLog("user sieve keep - merging with default script result", "default_action", result.Action, "vacation", result.Vacation != nil)
 				} else {
@@ -805,9 +881,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				if len(references) == 0 {
 					references = nil
 				}
-				if sentDate.IsZero() {
-					sentDate = time.Now()
-				}
 				s.DebugLog("message headers updated after edits", "content_hash", contentHash)
 			}
 		}
@@ -817,7 +890,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// a discarded one included, and after the header edits, which it has to see
 	// (RFC 5293 §7).
 	if result.Vacation != nil {
-		if err := s.handleVacationResponse(ctx, *result.Vacation, messageContent); err != nil {
+		if err := s.handleVacationResponse(readCtx, *result.Vacation, messageContent); err != nil {
 			s.DebugLog("error handling vacation response", "error", err)
 			// Continue processing even if vacation response fails
 		}
@@ -832,23 +905,44 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		return nil
 	}
 
+	// Write every redirect to the relay queue now, but hand none to the relay worker
+	// before everything this delivery stores is stored: a target the queue cannot take
+	// keeps the message in INBOX when nothing else stores it, and a delivery that fails
+	// is retried by the sender, so a redirect handed over before the failure would be
+	// relayed again by every retry. Whatever is not handed over when this delivery
+	// returns is dropped; the retry holds it again.
+	commitRedirects, abortRedirects, allHeld := s.holdRedirects(ctx, result, messageContent, fullMessageBytes)
+	defer abortRedirects()
+	destinations := result.Destinations(!allHeld)
+	if len(destinations) == 0 {
+		// A redirect without :copy, every target held: there is nothing to store.
+		if commitRedirects() {
+			s.DebugLog("redirect without :copy - skipping local delivery")
+			recordMetrics("success")
+			return nil
+		}
+		// A target the queue did not take after all: keep the message.
+		destinations = result.Destinations(true)
+	}
+
+	// The trace headers and header edits above can take a message read at
+	// max_message_size past what the database stores: refuse it as too large here
+	// rather than answer the failed insert with a 4xx the sender retries.
+	if err := delivery.CheckStorableSize(len(fullMessageBytes)); err != nil {
+		s.WarnLog("message too large to store", "size", len(fullMessageBytes), "limit", consts.MaxStoredMessageSize)
+		recordMetrics("failure")
+		return &smtp.SMTPError{
+			Code:         552,
+			EnhancedCode: smtp.EnhancedCode{5, 3, 4},
+			Message:      fmt.Sprintf("message size exceeds maximum allowed size of %d bytes", consts.MaxStoredMessageSize),
+		}
+	}
+
 	// Store message locally for background upload to S3
 	// This happens AFTER Sieve processing and header edits, so we store the modified message
 	// Check if file already exists to prevent race condition:
 	// If a duplicate arrives while uploader is processing the first copy,
 	// we don't want to overwrite/delete the file the uploader is reading.
-
-	// Safety guard: Reject if global staging limit is exceeded
-	if s.backend.uploader.IsStagingLimitExceeded(int64(len(fullMessageBytes))) {
-		s.WarnLog("rejecting delivery due to upload staging size limit exceeded")
-		recordMetrics("failure")
-		return &smtp.SMTPError{
-			Code:         452,
-			EnhancedCode: smtp.EnhancedCode{4, 3, 1},
-			Message:      "Insufficient system storage",
-		}
-	}
-
 	expectedPath := s.backend.uploader.FilePath(contentHash, s.AccountID())
 	var filePath *string
 	if info, err := os.Stat(expectedPath); os.IsNotExist(err) || (err == nil && info.Size() != int64(len(fullMessageBytes))) {
@@ -867,7 +961,10 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 					Message:      "Insufficient system storage, please try again later",
 				}
 			}
-			return s.InternalError("failed to save message to disk: %v", err)
+			// The error names spool files, and the reply text reaches the sending MTA
+			// (and can end up in a bounce): log it and answer with the cause only.
+			s.WarnLog("failed to save message to disk", "error", err)
+			return s.InternalError("failed to save message to disk: %v", helpers.FileErrorCause(err))
 		}
 		s.DebugLog("message accepted locally", "path", *filePath)
 	} else if err == nil {
@@ -883,7 +980,8 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	} else {
 		// Stat error (permission issue, etc.)
 		recordMetrics("failure")
-		return s.InternalError("failed to check file existence: %v", err)
+		s.WarnLog("failed to check file existence", "error", err)
+		return s.InternalError("failed to check file existence: %v", helpers.FileErrorCause(err))
 	}
 
 	s.InfoLog("executing sieve action", "action", result.Action)
@@ -908,7 +1006,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	}
 
 	// Classify and extract the final stored MIME once, after editheader, and
-	// reuse both results for every fileinto :copy destination. The structure
+	// reuse both results for every destination. The structure
 	// gets the same validation and fallback as APPEND's and the Admin API's:
 	// a stored structure that does not serialize panics the FETCH write path.
 	bodyStructureVal, bsErr := helpers.SafeBodyStructure(fullMessageBytes)
@@ -918,101 +1016,19 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	bodyStructure := &bodyStructureVal
 	sieveFlags = db.WithAttachmentKeyword(sieveFlags, fullMessageBytes, true)
 
-	switch result.Action {
-	case sieveengine.ActionFileInto:
-		mailboxName = result.Mailbox
-		if result.Copy {
-			s.InfoLog("sieve fileinto :copy - saving to both mailbox and inbox", "mailbox", mailboxName)
-
-			// First save to the specified mailbox (with :create if specified)
-			err := s.saveMessageToMailbox(ctx, mailboxName, fullMessageBytes, contentHash, deliveryHash,
-				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, result.CreateMailbox, sieveFlags)
-			if err != nil {
-				// Allow duplicates (message already in target mailbox)
-				if !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
-					recordMetrics("failure")
-					return s.InternalError("failed to save message to specified mailbox: %v", err)
-				}
-				s.DebugLog("duplicate message in target mailbox, continuing", "mailbox", mailboxName)
-			}
-
-			// Then save to INBOX (for the :copy functionality)
-			s.DebugLog("saving copy to inbox due to :copy modifier")
-
-			// Call saveMessageToMailbox again for INBOX (no :create for INBOX - it always exists)
-			err = s.saveMessageToMailbox(ctx, consts.MailboxInbox, fullMessageBytes, contentHash, deliveryHash,
-				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, false, sieveFlags)
-			if err != nil {
-				// Allow duplicates (message already in INBOX)
-				if !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
-					recordMetrics("failure")
-					return s.InternalError("failed to save message copy to inbox: %v", err)
-				}
-				s.DebugLog("duplicate message in INBOX, continuing")
-			}
-
-			// Success - both copies saved
-			s.InfoLog("message delivered according to fileinto :copy directive")
-			recordMetrics("success")
-			return nil
-		} else {
-			s.InfoLog("sieve fileinto - saving to mailbox only", "mailbox", mailboxName)
-		}
-
-	case sieveengine.ActionRedirect:
-		if result.Copy {
-			s.DebugLog("sieve redirect :copy action", "redirect_to", result.RedirectTo)
-		} else {
-			s.DebugLog("sieve redirect action", "redirect_to", result.RedirectTo)
-		}
-
-		// Queue the message for external relay delivery if configured
-		if s.backend.relayQueue != nil {
-			s.DebugLog("queueing message for relay delivery")
-			// Stamp the outgoing copy with an incremented hop count (loop backstop).
-			hops := helpers.RedirectHopCount(helpers.HeaderGetter(messageContent.Header.Map()))
-			relayBytes := helpers.PrependHeaderLine(fullMessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(hops+1))
-			// User.Address is the script owner's primary address, even for aliases.
-			// Replace earlier or sender-supplied attribution on the outgoing copy only.
-			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, s.User.Address.FullAddress())
-			relayed := true
-			for _, redirectTo := range result.RedirectTo {
-				if err := s.sendToExternalRelay(s.sender.FullAddress(), redirectTo, relayBytes); err != nil {
-					s.DebugLog("error enqueuing redirected message, falling back to inbox", "redirect_to", redirectTo, "error", err)
-					// Continue processing even if queue fails, store in INBOX as fallback
-					relayed = false
-					continue
-				}
-				s.DebugLog("successfully queued message for relay delivery", "redirect_to", redirectTo)
-			}
-			if relayed {
-				// If :copy is not specified and every relay succeeded, we don't store the message locally
-				if !result.Copy {
-					s.DebugLog("redirect without :copy - skipping local delivery")
-					recordMetrics("success")
-					return nil
-				}
-				s.DebugLog("redirect :copy - continuing with local delivery")
-			}
-		} else {
-			s.DebugLog("redirect requested but external relay not configured")
-		}
-
-		// Fallback: store in INBOX if relay is not configured or fails
-		// Or if :copy is specified
-		mailboxName = consts.MailboxInbox
-
-	default:
+	// Store one copy in every fileinto target, and in INBOX when the message is kept
+	// (or a failed redirect left it stored nowhere).
+	if result.Action == sieveengine.ActionKeep {
 		s.DebugLog("sieve keep action")
-		mailboxName = consts.MailboxInbox
 	}
-
-	// Save the message to the determined mailbox (either the specified one or INBOX)
-	// For fileinto actions without :copy, pass the :create flag if specified
-	createMailbox := result.Action == sieveengine.ActionFileInto && result.CreateMailbox
-	err = s.saveMessageToMailbox(ctx, mailboxName, fullMessageBytes, contentHash, deliveryHash,
-		subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, createMailbox, sieveFlags)
-	if err != nil {
+	mailboxNames := make([]string, 0, len(destinations))
+	for _, dest := range destinations {
+		mailboxNames = append(mailboxNames, dest.Mailbox)
+		err = s.saveMessageToMailbox(ctx, dest.Mailbox, fullMessageBytes, contentHash, deliveryHash,
+			subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, dest.Create, sieveFlags)
+		if err == nil {
+			continue
+		}
 		// Handle duplicate messages (acceptable in LMTP - return success)
 		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
 			// For duplicates, NEVER delete the file. This prevents a race condition where:
@@ -1026,62 +1042,65 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			if filePath != nil {
 				s.DebugLog("duplicate message detected, keeping file for potential pending upload", "content_hash", contentHash)
 			}
-			s.DebugLog("duplicate message accepted (already exists), skipping storage", "message_id", messageID)
-			// Don't track as failure - duplicate is success
-			metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "success").Inc()
-			// Fall through to success path below (don't return error)
-			// This ensures the message is accepted by LMTP even if it's a duplicate
-		} else {
-			// Context error: DATA cap timeout vs disconnect/shutdown. In both
-			// cases DO NOT delete the file. Even though we wrote it, there's a
-			// race window where another concurrent delivery might have seen the
-			// file exists and decided not to write it (but might still be trying
-			// to create a DB record) — and on a timeout the transaction may have
-			// silently committed (commit ambiguity), in which case the upload
-			// worker still needs the file. Cleanup is the uploader's
-			// cleanupOrphanedFiles job either way.
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				if filePath != nil {
-					s.DebugLog("keeping file for cleanup job after cancellation", "content_hash", contentHash)
-				}
-				recordMetrics("failure")
-				if commandTimedOut(ctx) {
-					s.WarnLog("message save timed out", "cap", "data")
-					metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "timeout").Inc()
-					return &smtp.SMTPError{
-						Code:         451,
-						EnhancedCode: smtp.EnhancedCode{4, 3, 0},
-						Message:      "Message processing timed out, please try again later",
-					}
-				}
-				s.InfoLog("message save cancelled due to server shutdown")
-				metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "shutdown").Inc()
-				return &smtp.SMTPError{
-					Code:         421,
-					EnhancedCode: smtp.EnhancedCode{4, 2, 1},
-					Message:      "service shutting down",
-				}
-			}
-
-			// Never delete the local file on error. The uploader's
-			// cleanupOrphanedFiles job (runs every 5 min, 1h grace period)
-			// already checks PendingUploadExists before removing any file.
-			// Deleting here is dangerous: if the transaction silently
-			// committed (e.g. commit ambiguity on timeout), the upload
-			// worker still needs this file to complete the S3 upload.
-			if filePath != nil {
-				s.DebugLog("keeping file for cleanup job after error", "content_hash", contentHash)
-			}
-			metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "failure").Inc()
-			recordMetrics("failure")
-			return s.InternalError("failed to save message: %v", err)
+			// The copy is already there: this one is delivered, carry on with the next.
+			s.DebugLog("duplicate message accepted (already exists), skipping storage", "message_id", messageID, "mailbox", dest.Mailbox)
+			continue
 		}
-	} else {
-		// Track successful non-duplicate delivery
-		metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "success").Inc()
+
+		// Context error: DATA cap timeout vs disconnect/shutdown. In both
+		// cases DO NOT delete the file. Even though we wrote it, there's a
+		// race window where another concurrent delivery might have seen the
+		// file exists and decided not to write it (but might still be trying
+		// to create a DB record) — and on a timeout the transaction may have
+		// silently committed (commit ambiguity), in which case the upload
+		// worker still needs the file. Cleanup is the uploader's
+		// cleanupOrphanedFiles job either way.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if filePath != nil {
+				s.DebugLog("keeping file for cleanup job after cancellation", "content_hash", contentHash)
+			}
+			recordMetrics("failure")
+			if commandTimedOut(ctx) {
+				s.WarnLog("message save timed out", "cap", "data")
+				metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "timeout").Inc()
+				return &smtp.SMTPError{
+					Code:         451,
+					EnhancedCode: smtp.EnhancedCode{4, 3, 0},
+					Message:      "Message processing timed out, please try again later",
+				}
+			}
+			s.InfoLog("message save cancelled due to server shutdown")
+			metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "shutdown").Inc()
+			return &smtp.SMTPError{
+				Code:         421,
+				EnhancedCode: smtp.EnhancedCode{4, 2, 1},
+				Message:      "service shutting down",
+			}
+		}
+
+		// Never delete the local file on error. The uploader's
+		// cleanupOrphanedFiles job (runs every 5 min, 1h grace period)
+		// already checks PendingUploadExists before removing any file.
+		// Deleting here is dangerous: if the transaction silently
+		// committed (e.g. commit ambiguity on timeout), the upload
+		// worker still needs this file to complete the S3 upload.
+		if filePath != nil {
+			s.DebugLog("keeping file for cleanup job after error", "content_hash", contentHash)
+		}
+		metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "failure").Inc()
+		recordMetrics("failure")
+		// The reply text reaches the sender in a delay or bounce notice: the folder the
+		// recipient's script files into and the database error stay in the log.
+		s.WarnLog("failed to save message", "mailbox", dest.Mailbox, "error", err)
+		return s.InternalError("failed to save message")
 	}
 
-	s.InfoLog("message delivered", "mailbox", mailboxName)
+	commitRedirects()
+
+	// A duplicate is a delivered message too: the copy is already in the mailbox.
+	metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "success").Inc()
+
+	s.InfoLog("message delivered", "mailboxes", mailboxNames)
 
 	// Track domain and user activity - LMTP delivery is critical!
 	if s.User != nil {
@@ -1094,57 +1113,11 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	return nil
 }
 
-// mergeSieveResults decides what the default script and the user script together
-// ask of delivery. A user script that kept, implicitly or explicitly, leaves where
-// the message goes to the default script, whatever it decided, and the two results
-// are merged by keepDefaultAction; it reports keptDefault then. A user script that
-// took an explicit fileinto, redirect or discard took the message over, and its
-// result stands alone: the default script's flags, header edits and reply are all
-// replaced, the reply with them, since the user script overruled that run entirely.
-func mergeSieveResults(defaultResult, userResult sieveengine.Result) (merged sieveengine.Result, keptDefault bool) {
-	if userResult.Action == sieveengine.ActionKeep {
-		return keepDefaultAction(defaultResult, userResult), true
-	}
-	return userResult, false
-}
-
-// keepDefaultAction merges the result of a user script that ended in a keep into
-// the default script's, whose action then stands, be it a filing or a keep of its
-// own: the user script only left where the message goes to the default. Everything
-// else it did still happens, after the default script's work as the two ran: its
-// flags join the default's, its header edits follow the default's, and its vacation
-// reply goes out (RFC 5230 §4.7), seeing those edits as RFC 5293 §7 requires. A user
-// reply takes precedence; otherwise the default script's independent vacation reply
-// still stands.
-func keepDefaultAction(defaultResult, userResult sieveengine.Result) sieveengine.Result {
-	merged := defaultResult
-	merged.Flags = mergeFlags(defaultResult.Flags, userResult.Flags)
-	merged.HeaderEdits = slices.Concat(defaultResult.HeaderEdits, userResult.HeaderEdits)
-	if userResult.Vacation != nil {
-		merged.Vacation = userResult.Vacation
-	}
-	return merged
-}
-
-// mergeFlags returns a's flags, then b's, without repeats. Flag names are
-// case-insensitive (RFC 5232 §3), and the first spelling seen is kept.
-func mergeFlags(a, b []string) []string {
-	merged := make([]string, 0, len(a)+len(b))
-	seen := make(map[string]bool, len(a)+len(b))
-	for _, flag := range slices.Concat(a, b) {
-		if key := strings.ToLower(flag); !seen[key] {
-			seen[key] = true
-			merged = append(merged, flag)
-		}
-	}
-	return merged
-}
-
 // logSieveAction records what the default or the user script decided.
 func (s *LMTPSession) logSieveAction(source string, result sieveengine.Result) {
 	switch result.Action {
 	case sieveengine.ActionFileInto:
-		s.InfoLog(source+" sieve fileinto", "mailbox", result.Mailbox, "copy", result.Copy, "create", result.CreateMailbox)
+		s.InfoLog(source+" sieve fileinto", "mailboxes", result.Mailboxes, "redirect_to", result.RedirectTo, "copy", result.Copy, "create", result.CreateMailboxes)
 	case sieveengine.ActionRedirect:
 		s.InfoLog(source+" sieve redirect", "redirect_to", result.RedirectTo, "copy", result.Copy)
 	case sieveengine.ActionDiscard:
@@ -1289,12 +1262,16 @@ func (s *LMTPSession) notifyRelayWorker() {
 // all live there. The send decision and per-sender rate-limiting are handled upstream
 // by the Sieve engine's VacationOracle.
 func (s *LMTPSession) handleVacationResponse(ctx context.Context, reply sieveengine.VacationReply, originalMessage *message.Entity) error {
+	if s.useMasterDB {
+		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	}
 	handler := &delivery.StandardVacationHandler{
-		Hostname:       s.HostName,
-		RelayQueue:     s.backend.relayQueue,
-		Logger:         &lmtpDeliveryLogger{s: s},
-		IsOwnedAddress: s.backend.rdb.IsAddressOwnedByAccountWithRetry,
-		RelayNotify:    s.notifyRelayWorker,
+		Hostname:          s.HostName,
+		RelayQueue:        s.backend.relayQueue,
+		Logger:            &lmtpDeliveryLogger{s: s},
+		IsOwnedAddress:    s.backend.rdb.IsAddressOwnedByAccountWithRetry,
+		IsAnyOwnedAddress: s.backend.rdb.IsAnyAddressOwnedByAccountWithRetry,
+		RelayNotify:       s.notifyRelayWorker,
 	}
 	return handler.HandleVacationResponse(ctx, s.AccountID(), reply, s.sender, &s.User.Address, originalMessage)
 }
@@ -1314,30 +1291,40 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
-	// If :create flag is set, use GetOrCreateMailboxByNameWithRetry
-	var mailbox *db.DBMailbox
-	var err error
-	if createMailbox {
-		s.DebugLog("creating mailbox if it doesn't exist", "mailbox", mailboxName)
-		mailbox, err = s.backend.rdb.GetOrCreateMailboxByNameWithRetry(ctx, s.AccountID(), mailboxName)
-		if err != nil {
-			return fmt.Errorf("failed to get or create mailbox '%s': %v", mailboxName, err)
-		}
-		s.DebugLog("mailbox ready for delivery", "mailbox", mailboxName, "mailbox_id", mailbox.ID)
-	} else {
-		// Normal behavior: get mailbox, fallback to INBOX if not found
-		mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), mailboxName)
-		if err != nil {
-			if err == consts.ErrMailboxNotFound {
-				s.WarnLog("mailbox not found, falling back to inbox", "mailbox", mailboxName)
-				mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), consts.MailboxInbox)
-				if err != nil {
-					return fmt.Errorf("failed to get INBOX mailbox: %v", err)
-				}
-			} else {
-				return fmt.Errorf("failed to get mailbox '%s': %v", mailboxName, err)
+	// Resolve the name as for any fileinto: the user's own mailbox, else one shared
+	// with the user. :create (RFC 5490 §3.2) creates the mailbox only "if needed":
+	// "If the mailbox already exists, this argument is ignored", and a shared one
+	// exists for this user. It never makes a personal mailbox in the shared
+	// namespace, where a namesake would shadow a shared mailbox in later lookups.
+	mailbox, err := s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), mailboxName)
+	if errors.Is(err, consts.ErrMailboxNotFound) && createMailbox {
+		if s.backend.sharedMailboxes.InNamespace(mailboxName) {
+			s.WarnLog("fileinto :create refused in the shared namespace", "mailbox", mailboxName)
+		} else {
+			s.DebugLog("creating mailbox", "mailbox", mailboxName)
+			mailbox, err = s.backend.rdb.GetOrCreateMailboxByNameWithRetry(ctx, s.AccountID(), mailboxName)
+			if errors.Is(err, consts.ErrMailboxInvalidName) {
+				// No mailbox can have that name. "Failure to create the specified
+				// mailbox is considered to be an error" (RFC 5490 §3.2), and on an
+				// error implementations "do an implicit keep" (RFC 5228 §2.10.6):
+				// INBOX, below. Failing the delivery would only have it retried until
+				// it bounces, and through the default script's +detail filing any
+				// sender picks the name.
+				s.WarnLog("fileinto :create of an invalid mailbox name", "mailbox", mailboxName, "error", err)
+				err = consts.ErrMailboxNotFound
+			} else if err != nil {
+				return fmt.Errorf("failed to get or create mailbox '%s': %v", mailboxName, err)
 			}
 		}
+	}
+	if errors.Is(err, consts.ErrMailboxNotFound) {
+		s.WarnLog("mailbox not found, falling back to inbox", "mailbox", mailboxName)
+		mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), consts.MailboxInbox)
+		if err != nil {
+			return fmt.Errorf("failed to get INBOX mailbox: %v", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("failed to get mailbox '%s': %v", mailboxName, err)
 	}
 
 	// Enforce the insert ('i') right for shared mailboxes owned by another account: a
@@ -1371,12 +1358,8 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 
 		// Ensure the local file exists under the destination owner's staging directory.
 		// The original was staged under s.AccountID() by StoreLocally before Sieve.
-		sourcePath := s.backend.uploader.FilePath(contentHash, s.AccountID())
-		destPath := s.backend.uploader.FilePath(contentHash, destAccountID)
-		if sourcePath != destPath {
-			if err := helpers.LinkOrCopyFile(sourcePath, destPath); err != nil {
-				s.WarnLog("failed to stage local file for cross-account LMTP delivery", "source", sourcePath, "dest", destPath, "error", err)
-			}
+		if err := s.backend.uploader.LinkStaged(contentHash, s.AccountID(), destAccountID); err != nil {
+			s.WarnLog("failed to stage local file for cross-account LMTP delivery", "hash", contentHash, "dest_account_id", destAccountID, "error", err)
 		}
 	}
 

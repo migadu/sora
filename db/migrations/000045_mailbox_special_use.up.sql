@@ -31,10 +31,13 @@ WHERE deleted_at IS NULL
 -- RFC 6154 §5: a special-use attribute identifies at most one mailbox per account.
 -- Enforce it structurally with a partial unique index over live rows. The backfill
 -- above is one-per-name, so no duplicates exist at build time. NOTE: this is a plain
--- (non-CONCURRENT) index — it briefly locks writes to `mailboxes` while it builds
--- (~one entry per default folder per account). To avoid the write lock on a large
--- live table, build it out-of-band with CREATE UNIQUE INDEX CONCURRENTLY before
--- deploying (CONCURRENTLY cannot run inside this migration's transaction).
+-- (non-CONCURRENT) index. The migration file runs as one transaction, so the ACCESS
+-- EXCLUSIVE lock taken by the ADD COLUMN above is held through the backfill and this
+-- build, which reads all of `mailboxes` once (it indexes only ~one entry per default
+-- folder per account): every query on `mailboxes`, logins and deliveries included, waits
+-- until the migration commits. The index cannot be built ahead of this migration:
+-- special_use does not exist before it, and adding the column by hand makes the ADD
+-- COLUMN above fail. On a large deployment, run this migration off-peak.
 CREATE UNIQUE INDEX IF NOT EXISTS mailboxes_account_special_use_unique
     ON mailboxes (account_id, special_use)
     WHERE special_use IS NOT NULL AND deleted_at IS NULL;

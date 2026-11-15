@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BurntSushi/toml"
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -185,15 +184,9 @@ func testMailboxDelete(t *testing.T, rdb *resilient.ResilientDatabase, ctx conte
 func setupMailboxTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 	t.Helper()
 
-	// Load test configuration
-	var cfg AdminConfig
-	if _, err := toml.DecodeFile("../../config-test.toml", &cfg); err != nil {
-		t.Fatalf("Failed to load test configuration: %v", err)
-	}
-
 	// Create resilient database connection with migrations enabled
 	ctx := context.Background()
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, true)
+	rdb, err := resilient.NewResilientDatabase(ctx, configTestDatabase(t), false, true)
 	if err != nil {
 		t.Fatalf("Failed to create resilient database: %v", err)
 	}
@@ -356,7 +349,7 @@ func TestMailboxPurge(t *testing.T) {
 	t.Logf("✅ Verified all S3 objects exist before purge")
 
 	// Perform purge
-	err = purgeMailboxMessages(ctx, rdb, s3Mock, accountID, testMailboxName)
+	err = purgeMailboxMessages(ctx, rdb, accountID, testMailboxName)
 	if err != nil {
 		t.Fatalf("Failed to purge mailbox: %v", err)
 	}

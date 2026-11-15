@@ -45,7 +45,7 @@ func dialPool(t *testing.T, cm *ConnectionManager, pool string) error {
 // the implicit-TLS dial and on a STARTTLS upgrade alike; with verification on (the pool
 // default) a private-CA backend is reachable without turning verification off. A pool
 // without its own CA file uses the system roots: nothing is inherited from the [[server]]
-// block, not even POP3's remote_tls_ca_file.
+// block, not even its remote_tls_ca_file.
 func TestPools_PoolCAFileVerifiesItsBackends(t *testing.T) {
 	addr, caFile := privateCABackend(t)
 
@@ -67,7 +67,7 @@ func TestPools_PoolCAFileVerifiesItsBackends(t *testing.T) {
 
 	noCA := newPoolsCM(t, []PoolSpec{{Name: "public", Backends: []string{addr}, Default: true,
 		Settings: BackendSettings{TLS: true, TLSVerify: true}}})
-	noCA.SetRemoteTLSRootCAs(mustPool(t, caFile)) // POP3's [[server]] remote_tls_ca_file
+	noCA.SetRemoteTLSRootCAs(mustPool(t, caFile)) // the [[server]] block's remote_tls_ca_file
 	if err := dialPool(t, noCA, "public"); err == nil {
 		t.Fatal("a pool without a CA file trusted the [[server]] block's CA")
 	}
@@ -87,6 +87,36 @@ func TestPools_ServerCAFileStillVerifiesPins(t *testing.T) {
 		t.Fatalf("pin verified against the server's CA file: %v", err)
 	}
 	conn.Close()
+}
+
+// ManagerOptions.RemoteTLSCAFile is how every proxy hands over its [[server]] block's
+// remote_tls_ca_file: it verifies the backends of a flat list and, with pools, a backend
+// in no pool (a lookup pin). An unreadable file is a startup error.
+func TestManagerOptions_RemoteTLSCAFile(t *testing.T) {
+	addr, caFile := privateCABackend(t)
+	for name, o := range map[string]ManagerOptions{
+		"flat list": {RemoteAddrs: []string{addr}, Settings: BackendSettings{TLS: true, TLSVerify: true}},
+		"pools":     {Pools: []PoolSpec{{Name: "p", Backends: []string{"10.0.0.1"}, Default: true}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			o.RemotePort, o.ConnectTimeout, o.DisableHealthCheck = 143, 2*time.Second, true
+			o.RemoteTLSCAFile = caFile
+			cm, err := NewConnectionManagerFromOptions(o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", addr, cm.BackendClientTLS(true, addr))
+			if err != nil {
+				t.Fatalf("backend signed by the remote_tls_ca_file CA: %v", err)
+			}
+			conn.Close()
+
+			o.RemoteTLSCAFile = filepath.Join(t.TempDir(), "missing.pem")
+			if _, err := NewConnectionManagerFromOptions(o); err == nil {
+				t.Error("a missing remote_tls_ca_file was accepted")
+			}
+		})
+	}
 }
 
 // An unreadable or empty CA file is a startup error, never a silent fallback to the system

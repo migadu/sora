@@ -83,6 +83,10 @@ func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Message not found")
 			return
 		}
+		if errors.Is(err, consts.ErrNotPermitted) {
+			s.writeError(w, http.StatusForbidden, "Not permitted to change these flags in this mailbox")
+			return
+		}
 		// Backstop: the loop above already rejected these, so reaching this means
 		// a caller path that skipped validation. Still answer 400, not 500.
 		if errors.Is(err, consts.ErrInvalidFlag) {
@@ -99,8 +103,9 @@ func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get updated message to return
-	message, err := s.rdb.GetMessageByIDWithRetry(ctx, accountID, messageID)
+	// Get updated message from the writer so a lagging read replica cannot
+	// return stale pre-PATCH flags or miss a newly created mailbox.
+	message, err := s.rdb.GetMessageByIDWithRetry(readFromWriter(ctx), accountID, messageID)
 	if err != nil {
 		// Even if we can't retrieve the updated message, the update succeeded
 		s.writeJSON(w, http.StatusOK, map[string]any{
@@ -139,6 +144,10 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, consts.ErrDBNotFound) {
 			s.writeError(w, http.StatusNotFound, "Message not found")
+			return
+		}
+		if errors.Is(err, consts.ErrNotPermitted) {
+			s.writeError(w, http.StatusForbidden, "Not permitted to delete messages in this mailbox")
 			return
 		}
 		logger.Warn("HTTP Mail API: Error marking message as deleted", "name", s.name, "error", err)

@@ -24,10 +24,12 @@ import (
 type Session struct {
 	server                *Server
 	settings              *reloadableSettings // the server's settings when the session started (see reloadableSettings)
-	clientConn            net.Conn            // Reassigned on STARTTLS; writes must hold mu (sendGracefulShutdownMessage reads it from the Stop goroutine)
+	clientConn            net.Conn            // Reassigned under mu on STARTTLS; shutdown/cancellation snapshot it under mu
 	listenerConn          net.Conn            // The accepted connection, never reassigned: its SoraConn carries the JA4 and username, which the TLS conn above it after STARTTLS does not
 	startTLSInProgress    bool                // Between the 220 to STARTTLS and the end of its handshake, under mu: the client reads neither plaintext nor, yet, TLS
-	backendConn           net.Conn            // Reassigned on backend connect/STARTTLS/error; writes must hold mu (same reason)
+	greeted               bool                // The 220 greeting has been written, under mu: before it the implicit-TLS handshake may be pending, and a notice written then would wait for it
+	noticeMu              sync.Mutex          // Orders the greeting and shutdown notice with STARTTLS, without holding mu during socket writes
+	backendConn           net.Conn            // Reassigned under mu on backend connect/STARTTLS/error; shutdown/cancellation snapshot it under mu
 	backendRoute          *proxy.BackendRoute // Authorization of the held socket; survives per-recipient routing and transaction resets
 	backendReader         *bufio.Reader
 	backendWriter         *bufio.Writer
@@ -59,7 +61,9 @@ type Session struct {
 	// LMTP sessions can contain multiple RCPT TO commands (multiple recipients).
 	// We register the session as a "connection" against each recipient account we handle.
 	// IMPORTANT: s.accountID is overwritten per RCPT; if we only unregister the last one,
-	// earlier recipients would leak connection counts permanently.
+	// earlier recipients would leak connection counts permanently. Each account is
+	// registered at most once per session (a backend reconnect does not register it
+	// again), so close() unregisters each entry exactly once.
 	registeredAccountIDs map[int64]struct{}
 
 	// Per-transaction state. The backend's view of a transaction must stay the MTA's:
@@ -124,16 +128,13 @@ func (s *Session) handleConnection() {
 	// unblock a read on the backend connection.
 	go func() {
 		<-s.ctx.Done()
-		// Force close connections to unblock any pending Read calls
-		// Use mutex to ensure safe access consistent with close()
 		s.mu.Lock()
-		if s.clientConn != nil {
-			s.clientConn.Close()
-		}
-		if s.backendConn != nil {
-			s.backendConn.Close()
-		}
+		client, backend := s.clientConn, s.backendConn
 		s.mu.Unlock()
+		// A TLS close_notify can wait for its peer. Force the transports
+		// closed without holding the mutex needed by shutdown and teardown.
+		closeSessionTransport(client)
+		closeSessionTransport(backend)
 	}()
 
 	// Enforce absolute session timeout to prevent hung sessions from leaking
@@ -161,7 +162,15 @@ func (s *Session) handleConnection() {
 	}
 
 	// Send greeting
-	if err := s.sendGreeting(); err != nil {
+	s.noticeMu.Lock()
+	err := s.sendGreeting()
+	if err == nil {
+		s.mu.Lock()
+		s.greeted = true
+		s.mu.Unlock()
+	}
+	s.noticeMu.Unlock()
+	if err != nil {
 		s.DebugLog("Failed to send greeting", "error", err)
 		return
 	}
@@ -242,8 +251,10 @@ func (s *Session) handleConnection() {
 				}
 				s.sendResponse("250-ENHANCEDSTATUSCODES")
 				s.sendResponse("250-8BITMIME")
-				s.sendResponse("250-SMTPUTF8")
-				s.sendResponse("250 DSN")
+				// No DSN, as on the backend: neither issues a "delivered" DSN (RFC 3461
+				// §5.2.3), so the MTA keeps the duties of §5.2.2 (a "relayed" DSN for
+				// NOTIFY=SUCCESS). DSN parameters sent anyway are dropped, not forwarded.
+				s.sendResponse("250 SMTPUTF8")
 			} else {
 				s.sendResponse(fmt.Sprintf("250 %s", s.server.hostname))
 			}
@@ -434,6 +445,7 @@ func (s *Session) handleConnection() {
 				routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 					Ctx:                   s.ctx,
 					Username:              s.originalAddress,
+					ClientIP:              server.GetRealClientIP(s.clientConn, s.proxyInfo),
 					Protocol:              "lmtp",
 					IsRemoteLookupAccount: s.isRemoteLookupAccount,
 					RoutingInfo:           s.routingInfo,
@@ -556,41 +568,21 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			// Load TLS config: Use global TLS manager config if available, otherwise load from files
-			var tlsConfig *tls.Config
-			if s.server.tlsConfig != nil {
-				// Use global TLS manager (e.g., Let's Encrypt autocert)
-				tlsConfig = s.server.tlsConfig
-			} else if s.server.tlsCertFile != "" && s.server.tlsKeyFile != "" {
-				// Load from cert files
-				cert, err := tls.LoadX509KeyPair(s.server.tlsCertFile, s.server.tlsKeyFile)
-				if err != nil {
-					s.DebugLog("Failed to load TLS certificate", "error", err)
-					s.sendResponse("454 4.3.0 TLS not available due to configuration error")
-					continue
-				}
-
-				tlsConfig = &tls.Config{
-					MinVersion:    tls.VersionTLS12,
-					Certificates:  []tls.Certificate{cert},
-					ClientAuth:    tls.NoClientCert,
-					Renegotiation: tls.RenegotiateNever,
-				}
-				if s.server.tlsVerify {
-					tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-				}
-			} else {
+			// The listener's TLS config, resolved once in New (server.ListenerTLS).
+			tlsConfig := s.server.tlsConfig
+			if tlsConfig == nil {
 				s.DebugLog("STARTTLS config error")
 				s.sendResponse("454 4.3.0 TLS not available due to configuration error")
 				continue
 			}
 
-			// The shutdown notice writes clientConn under mu from another
-			// goroutine: stop it before the reply that makes the client expect
+			// Order a shutdown notice before the reply that makes the client expect
 			// TLS, so no plaintext 421 can follow that reply.
+			s.noticeMu.Lock()
 			s.mu.Lock()
 			s.startTLSInProgress = true
 			s.mu.Unlock()
+			s.noticeMu.Unlock()
 			if err := s.sendResponse("220 2.0.0 Ready to start TLS"); err != nil {
 				s.DebugLog("Failed to send STARTTLS response", "error", err)
 				return
@@ -639,8 +631,21 @@ func (s *Session) handleConnection() {
 			s.sendResponse("221 2.0.0 Bye")
 			return
 
+		case "VRFY":
+			// Every SMTP server MUST support VRFY (RFC 5321 section 4.5.1), and
+			// one that does not verify MUST answer 252 (section 7.3), as the
+			// backend does.
+			s.sendResponse("252 2.5.0 Cannot VRFY user, but will accept message")
+
+		case "EXPN", "HELP", "SEND", "SOML", "SAML", "TURN", "BDAT", "AUTH", "XCLIENT":
+			// Known commands the proxy does not implement: 502 (RFC 5321 section
+			// 4.2.4). BDAT, AUTH and XCLIENT are the backend's, never advertised
+			// here.
+			s.sendResponse(fmt.Sprintf("502 5.5.1 %s command not implemented", command))
+
 		default:
-			s.sendResponse("502 5.5.2 Command not implemented")
+			// Not echoed: the verb is whatever the client sent.
+			s.sendResponse("500 5.5.2 Syntax error, command unrecognized")
 		}
 	}
 }
@@ -726,8 +731,10 @@ func (s *Session) ErrorLog(msg string, keyvals ...any) {
 // Allowed RCPT TO parameters for LMTP:
 //   - XRCPTFORWARD: Dovecot-specific forwarding information (original recipient)
 //
-// Stripped parameters (SMTP-only, not supported by typical LMTP servers):
-//   - NOTIFY, ORCPT, RET, ENVID: DSN extensions (RFC 3461)
+// Stripped parameters:
+//   - NOTIFY, ORCPT: DSN (RFC 3461 §4.1, §4.2), which neither the proxy nor the
+//     backend announces; an MTA should not send them, but some do. RET and ENVID,
+//     the DSN parameters of MAIL (§4.3, §4.4), are dropped by backendMailFrom.
 //   - Any other unknown ESMTP parameters
 //
 // Examples:
@@ -860,7 +867,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			// User previously not found - return cached failure
 			// Note: Do NOT refresh negative entries - let them expire naturally so we can
 			// re-check the database in case the user was created since last check
-			metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
+			metrics.LookupCacheResults.WithLabelValues("lmtp_proxy", "hit_negative").Inc()
 
 			// Single consolidated log for lookup failure
 			duration := time.Since(lookupStart)
@@ -871,13 +878,13 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				"method", "cache",
 				"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
-			// The same decision a fresh miss makes (tempfail configured, or no
-			// healthy backend to verify against) — a cache hit must not bounce
-			// where the miss would have deferred.
-			return s.userNotFoundError()
+			// The reply a fresh lookup from the same source gives now: a remote
+			// lookup negative gets the reply its 404 got, a database negative is
+			// still deferred while no default-pool backend is healthy.
+			return s.userNotFoundError(cached.FromRemoteLookup)
 		} else {
 			// User found - use cached routing info
-			metrics.CacheOperationsTotal.WithLabelValues("get", "hit").Inc()
+			metrics.LookupCacheResults.WithLabelValues("lmtp_proxy", "hit").Inc()
 
 			s.accountID = cached.AccountID
 			s.isRemoteLookupAccount = cached.FromRemoteLookup
@@ -905,6 +912,9 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 			return nil
 		}
+	} else if s.server.lookupCache != nil {
+		// A disabled cache (nil) reads nothing and counts nothing.
+		metrics.LookupCacheResults.WithLabelValues("lmtp_proxy", "miss").Inc()
 	}
 
 	// 1. Try remotelookup first
@@ -917,10 +927,14 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 		defer routingCancel()
 
 		remoteLookupStart := time.Now()
-		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
+		// $ip is the delivering MTA: this proxy's client, the PROXY header source when
+		// there is one (the address XCLIENT forwards to the backend as well).
+		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username, server.GetRealClientIP(s.clientConn, s.proxyInfo))
 		remoteLookupDuration := time.Since(remoteLookupStart).Seconds()
+		// 401/403: the lookup refused the account, a verdict and no route (handled below).
+		refused := errors.Is(lookupErr, proxy.ErrRemoteLookupRefused)
 
-		if lookupErr != nil {
+		if lookupErr != nil && !refused {
 			s.InfoLog("remotelookup failed", "username", s.username, "error", lookupErr, "cache", "miss")
 
 			// Check if error is due to context cancellation (server shutdown)
@@ -980,39 +994,48 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 			return nil
 		} else {
-			// User not found in remotelookup (404/3xx or empty response).
+			// No route: the user is not found in remotelookup (404/3xx or empty response),
+			// or the account is refused (401/403). lookup_local_users applies to the first
+			// only: a refused recipient is never looked up, and delivered, in the local
+			// database.
 			duration := time.Since(lookupStart)
-			metrics.RemoteLookupDuration.WithLabelValues("lmtp", "user_not_found").Observe(remoteLookupDuration)
-			if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.ShouldLookupLocalUsers() {
+			outcome := "user_not_found"
+			if refused {
+				outcome = "refused"
+			}
+			metrics.RemoteLookupDuration.WithLabelValues("lmtp", outcome).Observe(remoteLookupDuration)
+			if !refused && s.server.remotelookupConfig != nil && s.server.remotelookupConfig.ShouldLookupLocalUsers() {
 				s.InfoLog("user not found in remote lookup, local lookup enabled - attempting main DB",
 					"username", s.username,
 					"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 				metrics.RemoteLookupResult.WithLabelValues("lmtp", "user_not_found_fallback").Inc()
 				// Fallthrough to main DB
 			} else {
-				// User not found and no database fallback - use configured response
+				// No database fallback - use configured response
 				response := "reject" // default
 				if s.server.remotelookupConfig != nil {
 					response = s.server.remotelookupConfig.GetUserNotFoundResponse()
 				}
 
-				s.InfoLog("user not found in remote lookup, fallback disabled",
+				msg := "user not found in remote lookup, fallback disabled"
+				if refused {
+					msg = "account refused by remote lookup (401/403), no fallback"
+				}
+				s.InfoLog(msg,
 					"username", s.username,
 					"duration", fmt.Sprintf("%.3fs", duration.Seconds()),
 					"response", response)
-				metrics.RemoteLookupResult.WithLabelValues("lmtp", "user_not_found_"+response).Inc()
+				metrics.RemoteLookupResult.WithLabelValues("lmtp", outcome+"_"+response).Inc()
 
-				// Cache negative result to protect remotelookup
+				// Cache negative result to protect remotelookup. FromRemoteLookup lets a
+				// cache hit give the reply given here (userNotFoundError).
 				s.server.lookupCache.Set(s.server.name, originalAddress, &lookupcache.CacheEntry{
-					Result:     lookupcache.AuthUserNotFound,
-					IsNegative: true,
+					Result:           lookupcache.AuthUserNotFound,
+					IsNegative:       true,
+					FromRemoteLookup: true,
 				})
 
-				// Return appropriate error based on configuration
-				if response == "tempfail" {
-					return server.ErrUserNotFoundTempFail
-				}
-				return server.ErrUserNotFound
+				return s.userNotFoundError(true)
 			}
 		}
 	} else {
@@ -1116,6 +1139,7 @@ func (s *Session) connectToBackend() error {
 	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 		Ctx:                   s.ctx,
 		Username:              s.originalAddress, // Use original address (not resolved address) for route/affinity consistency
+		ClientIP:              server.GetRealClientIP(s.clientConn, s.proxyInfo),
 		Protocol:              "lmtp",
 		IsRemoteLookupAccount: s.isRemoteLookupAccount,
 		RoutingInfo:           s.routingInfo,
@@ -1144,7 +1168,8 @@ func (s *Session) connectToBackend() error {
 	// Track which routing method was used for this connection.
 	metrics.ProxyRoutingMethod.WithLabelValues("lmtp", routeResult.RoutingMethod).Inc()
 
-	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
+	// The backend's PROXY header names the real client (the incoming PROXY header's source).
+	clientHost, clientPort := server.GetRealClientAddr(s.clientConn, s.proxyInfo)
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	var backendRoute *proxy.BackendRoute
 	if preferredAddr != "" {
@@ -1382,11 +1407,17 @@ func (s *Session) connectToBackend() error {
 	// The `isFromTrustedProxy()` check is for proxy-chaining, where a backend
 	// needs to validate if the client connecting to it is another trusted proxy.
 	if useXCLIENT {
-		if err := s.sendForwardingParametersToBackend(s.backendWriter, s.backendReader); err != nil {
+		if err := s.sendForwardingParametersToBackend(s.backendWriter, s.backendReader); errors.Is(err, errXCLIENTRefused) {
 			s.WarnLog("Failed to send XCLIENT to backend - continuing without forwarding parameters", "backend", s.serverAddr, "error", err)
-			// Continue without forwarding parameters rather than failing
+			// Continue without forwarding parameters rather than failing: the refusal
+			// ended the exchange.
 			// Note: If XCLIENT is rejected, this may indicate backend is not configured
 			// to accept XCLIENT from this proxy IP (check backend's trusted_networks)
+		} else if err != nil {
+			// A reply of the exchange was not read (a write or read error, or the
+			// deadline). It may still come, and MAIL FROM would read it as its own.
+			s.backendConn.Close()
+			return fmt.Errorf("XCLIENT exchange with backend: %w", err)
 		}
 	}
 
@@ -1460,8 +1491,8 @@ func (s *Session) invalidateLookupCache(reason string) {
 
 // forwardRCPT sends the RCPT TO command to backend and handles response interception
 func (s *Session) forwardRCPT(command string) {
-	// Strip unsupported ESMTP parameters from RCPT TO before forwarding to backend
-	// Most ESMTP extensions (especially DSN) are SMTP-specific and not supported by LMTP
+	// Strip the RCPT TO parameters the backend does not take before forwarding
+	// (DSN parameters among them: neither the proxy nor the backend announces DSN).
 	cleanedCommand := stripUnsupportedRCPTParameters(command)
 	if cleanedCommand != command {
 		s.DebugLog("Stripped unsupported ESMTP parameters from RCPT TO", "original", command, "cleaned", cleanedCommand)
@@ -1573,7 +1604,6 @@ func (s *Session) forwardRCPT(command string) {
 // close closes all connections.
 func (s *Session) close() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// Release connection limiter slot IMMEDIATELY (don't wait for goroutine to exit)
 	if s.releaseConn != nil {
@@ -1618,12 +1648,26 @@ func (s *Session) close() {
 		}
 	}
 
-	if s.clientConn != nil {
-		s.clientConn.Close()
+	client, backend := s.clientConn, s.backendConn
+	s.mu.Unlock()
+	// Normal completion retains TLS close_notify. Forced shutdown/cancellation
+	// closes the raw transports separately and can interrupt these closes.
+	if client != nil {
+		client.Close()
 	}
+	if backend != nil {
+		backend.Close()
+	}
+}
 
-	if s.backendConn != nil {
-		s.backendConn.Close()
+// closeSessionTransport interrupts pending I/O before wrapper cleanup. In
+// particular it never waits for TLS close_notify while holding a session lock.
+func closeSessionTransport(conn net.Conn) {
+	if conn != nil {
+		if raw := server.RawConn(conn); raw != nil {
+			raw.Close()
+		}
+		conn.Close()
 	}
 }
 
@@ -1641,6 +1685,12 @@ func (s *Session) registerConnection() error {
 
 	// Use cached client address (real IP) to match UnregisterConnection in close()
 	if s.server.connTracker != nil {
+		// One LMTP session counts once per account, however many backend connections
+		// it opens: after a lost backend (loseBackend) the next RCPT TO reconnects and
+		// lands here again, and close() unregisters each account once.
+		if _, ok := s.registeredAccountIDs[s.accountID]; ok {
+			return nil
+		}
 		err := s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "LMTP", s.clientAddr)
 		if err != nil {
 			return err
@@ -1735,6 +1785,7 @@ func isSMTPUTF8Capability(line string) bool {
 }
 
 // backendMailFrom is the MAIL command sent to the backend for the current transaction.
+// The MTA's other MAIL parameters (RET and ENVID among them) are not forwarded.
 // The SMTPUTF8 parameter goes with it only when the backend advertised the extension
 // (RFC 6531 §3.2): a backend without it gets the plain command and, if the envelope is
 // in fact non-ASCII, decides for itself — sora backends accept it — which is what keeps
@@ -1815,14 +1866,23 @@ func (s *Session) forwardSimpleCommand(command string) (reply string, ok bool) {
 }
 
 // userNotFoundError is the error for a recipient known not to exist, whether the
-// knowledge is fresh or cached. It re-runs the decision the fresh lookup makes, so a
-// negative-cache hit can neither turn a configured tempfail into a bounce nor bypass the
-// all-backends-down guard (a proxy that cannot verify anything must not bounce).
-func (s *Session) userNotFoundError() error {
-	if !s.server.connManager.HasHealthyPoolBackends() {
-		return server.ErrUserNotFoundTempFail
+// knowledge is fresh or cached, so that a negative-cache hit gets the reply the fresh
+// lookup gave. fromRemoteLookup says who reported the recipient unknown:
+//   - the remote lookup, the authority on its users (a 404/3xx without database
+//     fallback, or a 401/403 refusal of the account): 550, or 450 when
+//     user_not_found_response = "tempfail". Backend health does not enter into it.
+//   - the proxy's own database, which may lag the backends: 550 only while a backend
+//     of the default pool is healthy, else 450 (a proxy that cannot verify anything
+//     must not bounce). user_not_found_response does not apply to the database
+//     fallback.
+func (s *Session) userNotFoundError(fromRemoteLookup bool) error {
+	if fromRemoteLookup {
+		if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.GetUserNotFoundResponse() == "tempfail" {
+			return server.ErrUserNotFoundTempFail
+		}
+		return server.ErrUserNotFound
 	}
-	if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.GetUserNotFoundResponse() == "tempfail" {
+	if !s.server.connManager.HasHealthyPoolBackends() {
 		return server.ErrUserNotFoundTempFail
 	}
 	return server.ErrUserNotFound

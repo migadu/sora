@@ -1,6 +1,11 @@
 package helpers
 
-import "testing"
+import (
+	"errors"
+	"testing"
+
+	"github.com/migadu/sora/consts"
+)
 
 func TestMailboxNameHasTraversal(t *testing.T) {
 	tests := []struct {
@@ -30,6 +35,63 @@ func TestMailboxNameHasTraversal(t *testing.T) {
 	for _, tt := range tests {
 		if got := MailboxNameHasTraversal(tt.name); got != tt.want {
 			t.Errorf("MailboxNameHasTraversal(%q) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestMailboxNameToCreate(t *testing.T) {
+	tests := []struct {
+		name  string
+		want  string
+		valid bool
+	}{
+		{"INBOX", "INBOX", true},
+		{"Archive/2024", "Archive/2024", true},
+		{"Foo.Bar/..baz", "Foo.Bar/..baz", true}, // dots inside a level are fine
+		{"Foo/", "Foo", true},                    // RFC 3501 §6.3.3: no trailing delimiter
+		{"Foo/Bar//", "Foo/Bar", true},
+		{"", "", false},
+		{"/", "", false},
+		{"//", "", false},
+		{"/Foo", "", false},   // empty first level
+		{"x//y", "", false},   // empty middle level
+		{"x//y/", "", false},  // still empty after the trailing delimiter goes
+		{"a/../b", "", false}, // traversal levels
+		{"a/./b", "", false},
+		{"..", "", false},
+		{"Foo/.", "", false},
+		{"Jos\u00e9/\u00dcber", "Jos\u00e9/\u00dcber", true}, // non-ASCII UTF-8 is a name
+		// Characters PostgreSQL cannot store in text (NUL, invalid UTF-8) and the
+		// ones db.CreateMailbox refuses: a Sieve name taken from a header can hold
+		// any of them.
+		{"a\x00b", "", false},
+		{"caf\xe9", "", false},
+		{"a/\xff/b", "", false},
+		{"a\tb", "", false},
+		{"a\r\nb", "", false},
+	}
+	for _, tt := range tests {
+		got, err := MailboxNameToCreate(tt.name)
+		if tt.valid {
+			if err != nil || got != tt.want {
+				t.Errorf("MailboxNameToCreate(%q) = %q, %v; want %q, nil", tt.name, got, err, tt.want)
+			}
+		} else if !errors.Is(err, consts.ErrMailboxInvalidName) {
+			t.Errorf("MailboxNameToCreate(%q) = %q, %v; want ErrMailboxInvalidName", tt.name, got, err)
+		}
+	}
+}
+
+func TestMailboxNameValid(t *testing.T) {
+	for _, name := range []string{"INBOX", "Archive/2024", "Foo.Bar/..baz", "José"} {
+		if !MailboxNameValid(name) {
+			t.Errorf("MailboxNameValid(%q) = false, want true", name)
+		}
+	}
+	// A stored name has no trailing delimiter: "Foo/" is the name CREATE makes "Foo".
+	for _, name := range []string{"", "/", "Foo/", "/Foo", "x//y", "a/../b", "a\tb", "caf\xe9"} {
+		if MailboxNameValid(name) {
+			t.Errorf("MailboxNameValid(%q) = true, want false", name)
 		}
 	}
 }

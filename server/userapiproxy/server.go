@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
@@ -48,12 +50,14 @@ type JWTClaims struct {
 // reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
 // publishes a new one whole and none is changed after; a request loads it once.
 type reloadableSettings struct {
-	jwtSecret string // JWT secret for token validation
+	jwtSecret      string   // JWT secret for token validation
+	allowedOrigins []string // CORS policy of the responses the proxy writes itself (writeError)
 }
 
 // Server represents a User API proxy server
 type Server struct {
 	name                       string
+	hostname                   string // labels the metrics, like every other server's hostname
 	addr                       string
 	connManager                *proxy.ConnectionManager
 	remoteUseProxyProtocol     bool // the server's own PROXY-header setting; a named pool's setting overrides it per route
@@ -72,16 +76,18 @@ type Server struct {
 	tlsConfig                  *tls.Config // Global TLS config from TLS manager (optional)
 	trustedProxies             []string    // CIDR blocks for trusted proxies
 	limiter                    *server.ConnectionLimiter
+	authLimiter                *server.AuthRateLimiter // login rate limit (auth_rate_limit); nil when off
 	// connReleases holds the connection-limiter release callback for each live
 	// connection, keyed by net.Conn, so the slot is freed on StateClosed/
 	// StateHijacked. Without this the limiter counter only ever increments and
 	// the proxy eventually refuses every connection (permanent DoS).
 	connReleases   map[net.Conn]func()
 	connReleasesMu sync.Mutex
-	httpServer     *http.Server
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
+	httpServer   *http.Server
+	shutdownMu   sync.Mutex
+	shutdownDone chan struct{}
+	ctx          context.Context
+	cancel       context.CancelFunc
 
 	// Base transports retain the server's dial policy. Proxied requests use a
 	// bounded cache partitioned by pool, verification policy and DNS snapshot;
@@ -108,6 +114,7 @@ type ServerOptions struct {
 	Pools                    []proxy.PoolSpec // Named backend pools ([[pool]] blocks); when set, RemoteAddrs is unused and each pool brings its own backend-leg settings
 	RemotePort               int              // Default port for backends if not in address
 	JWTSecret                string           // JWT secret for token validation
+	AllowedOrigins           []string         // CORS allowed origins (allowed_origins) of the responses the proxy writes itself
 	TLS                      bool
 	TLSCertFile              string
 	TLSKeyFile               string
@@ -115,6 +122,7 @@ type ServerOptions struct {
 	TLSConfig                *tls.Config // Global TLS config from TLS manager (optional)
 	RemoteTLS                bool
 	RemoteTLSVerify          bool
+	RemoteTLSCAFile          string // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
 	ConnectTimeout           time.Duration
 	EnableBackendHealthCheck bool                       // Enable backend health checking (default: true)
 	RemoteDNSRefresh         *time.Duration             // Backend DNS re-resolution interval; nil = default, 0 = pin to the startup resolution
@@ -126,6 +134,9 @@ type ServerOptions struct {
 	LookupCache              *config.LookupCacheConfig  // Route lookup cache configuration
 	AffinityManager          *server.AffinityManager    // Affinity manager for sticky routing (optional)
 	ClusterManager           *cluster.Manager           // Optional: enables cluster-wide per-IP limiting
+
+	// Rate limit of every login through the proxy (auth_rate_limit); see admitLogin.
+	AuthRateLimit server.AuthRateLimiterConfig
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol          bool   // Enable PROXY protocol support for incoming connections
@@ -171,18 +182,15 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 	// Initialize remotelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
 	if opts.RemoteLookup != nil && opts.RemoteLookup.Enabled {
-		remotelookupClient, err := proxy.InitializeRemoteLookup("userapi", opts.RemoteLookup)
+		remotelookupClient, err := proxy.InitializeRemoteLookup("userapi", opts.RemoteLookup, opts.RemotePort)
 		if err != nil {
-			logger.Warn("User API Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
-			if len(opts.Pools) > 0 || !opts.RemoteLookup.ShouldLookupLocalUsers() {
-				cancel()
-				return nil, fmt.Errorf("remotelookup initialization failed: %w", err)
-			}
-			logger.Info("User API Proxy: Continuing with consistent hash fallback", "name", opts.Name)
-		} else {
-			routingLookup = remotelookupClient
-			logger.Info("User API Proxy: RemoteLookup enabled", "name", opts.Name)
+			// Also with lookup_local_users, which adds the database for the users the
+			// lookup does not know and does not make the lookup optional.
+			cancel()
+			return nil, fmt.Errorf("remotelookup initialization failed: %w", err)
 		}
+		routingLookup = remotelookupClient
+		logger.Info("User API Proxy: RemoteLookup enabled", "name", opts.Name)
 	}
 
 	// Create connection manager with routing lookup
@@ -191,6 +199,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		RemoteAddrs:        opts.RemoteAddrs,
 		RemotePort:         opts.RemotePort,
 		Settings:           proxy.BackendSettings{TLS: opts.RemoteTLS, TLSVerify: opts.RemoteTLSVerify},
+		RemoteTLSCAFile:    opts.RemoteTLSCAFile,
 		ConnectTimeout:     connectTimeout,
 		RoutingLookup:      routingLookup,
 		ServerName:         opts.Name,
@@ -278,14 +287,30 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		}
 		return conn, nil
 	}
+	// Each connection's outcome, once it is usable or has failed (after the TLS handshake
+	// if there is one), is recorded against the backend the request was routed to:
+	// routing passes over a backend that failed three connections in a row, as on the
+	// other proxies, instead of sending its users there for a 502 while it is down.
+	// http.Transport dials with a context detached from the request's cancellation: a
+	// dial outlives a client that went away, and counts when it fails on its own; only a
+	// dial CloseIdleConnections cancels once no request waits for it goes uncounted.
+	recordDial := func(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dial(ctx, network, addr)
+			if route, ok := ctx.Value(backendRouteKey).(*proxy.BackendRoute); ok {
+				route.RecordDialOutcome(ctx, err)
+			}
+			return conn, err
+		}
+	}
 	// The TLS leg is set up here rather than by the transport, with the connection
 	// manager's config for the address dialed (proxy.BackendClientTLS): a pool member is
 	// verified against its pool's CA file, and by the name it was configured with although
 	// the transport dials the address that name resolved to.
 	newTransport := func(verify bool) *http.Transport {
 		return &http.Transport{
-			DialContext: dialBackend,
-			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			DialContext: recordDial(dialBackend),
+			DialTLSContext: recordDial(func(ctx context.Context, network, addr string) (net.Conn, error) {
 				conn, err := dialBackend(ctx, network, addr)
 				if err != nil {
 					return nil, err
@@ -302,7 +327,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 					return nil, err
 				}
 				return tlsConn, nil
-			},
+			}),
 			MaxIdleConns:          100,
 			MaxIdleConnsPerHost:   10,
 			IdleConnTimeout:       90 * time.Second,
@@ -340,44 +365,37 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 	// Initialize route lookup cache if configured
 	var lookupCache *lookupcache.LookupCache
 	var positiveRevalidationWindow time.Duration
-	if opts.LookupCache != nil && opts.LookupCache.Enabled {
+	if opts.LookupCache != nil && opts.LookupCache.Enabled && !proxy.RemoteLookupUsesClientIP(opts.RemoteLookup) {
 		lookupCacheConfig := opts.LookupCache
 
-		positiveTTL, err := time.ParseDuration(lookupCacheConfig.PositiveTTL)
-		if err != nil || lookupCacheConfig.PositiveTTL == "" {
-			logger.Info("User API Proxy: Using default positive TTL (5m)", "name", opts.Name)
-			positiveTTL = 5 * time.Minute
-		}
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault(opts.Name)
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault(opts.Name)
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(opts.Name)
 
-		negativeTTL, err := time.ParseDuration(lookupCacheConfig.NegativeTTL)
-		if err != nil || lookupCacheConfig.NegativeTTL == "" {
-			logger.Info("User API Proxy: Using default negative TTL (1m)", "name", opts.Name)
-			negativeTTL = 1 * time.Minute
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
-		cleanupInterval, err := time.ParseDuration(lookupCacheConfig.CleanupInterval)
-		if err != nil || lookupCacheConfig.CleanupInterval == "" {
-			logger.Info("User API Proxy: Using default cleanup interval (5m)", "name", opts.Name)
-			cleanupInterval = 5 * time.Minute
-		}
+		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(opts.Name)
 
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize == 0 {
-			maxSize = 10000
-		}
-
-		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()
-		if err != nil {
-			logger.Info("User API Proxy: Invalid positive revalidation window in lookup cache config, using default (30s)", "name", opts.Name, "error", err)
-			positiveRevalidationWindow = 30 * time.Second
-		}
-
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("userapi_proxy", opts.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("User API Proxy: Route lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
+	}
+
+	// Every login passes the proxy and some reach no backend (routeAuthRequest), so the
+	// proxy is where logins are rate limited, as on the other proxies.
+	hostname := config.ResolveMailHostname()
+	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("USER-API-PROXY", opts.Name, hostname, opts.AuthRateLimit, opts.TrustedNetworks)
+	if authLimiter != nil {
+		server.RegisterRateLimiter("userapi_proxy", opts.Name, authLimiter)
+		go func() {
+			<-ctx.Done()
+			server.UnregisterRateLimiter("userapi_proxy", opts.Name)
+			authLimiter.Stop()
+		}()
 	}
 
 	s := &Server{
 		name:                       opts.Name,
+		hostname:                   hostname,
 		addr:                       opts.Addr,
 		connManager:                connManager,
 		remoteUseProxyProtocol:     opts.RemoteUseProxyProtocol,
@@ -396,6 +414,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		tlsConfig:                  opts.TLSConfig,
 		trustedProxies:             opts.TrustedProxies,
 		limiter:                    limiter,
+		authLimiter:                authLimiter,
 		transport:                  transport,
 		transports:                 transports,
 		newTransport:               newTransport,
@@ -406,21 +425,25 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		connReleases:               make(map[net.Conn]func()),
 	}
 	connManager.OnMaintenanceChange(s.closeBackendIdleConnections)
-	s.settings.Store(&reloadableSettings{jwtSecret: opts.JWTSecret})
+	s.settings.Store(&reloadableSettings{jwtSecret: opts.JWTSecret, allowedOrigins: opts.AllowedOrigins})
 	return s, nil
 }
 
 // Start starts the User API proxy server
 func (s *Server) Start() error {
+	if s.ctx.Err() != nil {
+		return nil
+	}
+
 	// Setup HTTP handler (with PROXY protocol support if enabled)
 	handler := s.setupHandler()
 
 	// Create HTTP server
-	s.httpServer = &http.Server{
+	httpServer := &http.Server{
 		Addr:         s.addr,
 		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: writeTimeout,
 		IdleTimeout:  120 * time.Second,
 		ConnState:    s.connStateHandler,
 	}
@@ -428,35 +451,31 @@ func (s *Server) Start() error {
 	// Note: PROXY protocol is handled by wrapping the listener in Start(),
 	// not via ConnContext, because we need to replace the connection before HTTP server sees it
 
-	// Configure TLS
-	if s.tls && s.tlsCertFile != "" && s.tlsKeyFile != "" {
-		// Scenario 1: Per-server TLS with explicit cert files
-		cert, err := tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile)
+	// Configure TLS: the certificate source and tls_verify follow the rule
+	// every listener shares (server.ListenerTLS).
+	if s.tls {
+		tlsConfig, err := server.ListenerTLS{
+			Protocol: "User API proxy", Name: s.name,
+			CertFile: s.tlsCertFile, KeyFile: s.tlsKeyFile, Verify: s.tlsVerify,
+			Global: s.tlsConfig,
+		}.Config()
 		if err != nil {
 			s.cancel()
-			return fmt.Errorf("failed to load TLS certificate: %w", err)
+			return err
 		}
-
-		clientAuth := tls.NoClientCert
-		if s.tlsVerify {
-			clientAuth = tls.RequireAndVerifyClientCert
-		}
-
-		s.httpServer.TLSConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			ClientAuth:               clientAuth,
-			PreferServerCipherSuites: true,
-			Renegotiation:            tls.RenegotiateNever,
-		}
-	} else if s.tls && s.tlsConfig != nil {
-		// Scenario 2: Global TLS manager
-		s.httpServer.TLSConfig = s.tlsConfig
-	} else if s.tls {
-		// TLS enabled but no cert files and no global TLS config provided
-		s.cancel()
-		return fmt.Errorf("TLS enabled for User API proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", s.name)
+		httpServer.TLSConfig = tlsConfig
 	}
+
+	s.shutdownMu.Lock()
+	if s.ctx.Err() != nil {
+		s.shutdownMu.Unlock()
+		return nil
+	}
+	s.httpServer = httpServer
+	shutdownDone := make(chan struct{})
+	s.shutdownDone = shutdownDone
+	s.shutdownMu.Unlock()
+	defer close(shutdownDone)
 
 	// Start connection limiter cleanup if enabled
 	if s.limiter != nil {
@@ -464,12 +483,14 @@ func (s *Server) Start() error {
 	}
 
 	// Graceful shutdown
+	httpShutdownDone := make(chan struct{})
 	go func() {
+		defer close(httpShutdownDone)
 		<-s.ctx.Done()
 		logger.Info("User API Proxy: Shutting down server", "name", s.name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			logger.Warn("User API Proxy: Error shutting down server", "name", s.name, "error", err)
 		}
 	}()
@@ -484,6 +505,8 @@ func (s *Server) Start() error {
 	// Create listener
 	listener, err := net.Listen("tcp", s.addr)
 	if err != nil {
+		s.cancel()
+		<-httpShutdownDone
 		return fmt.Errorf("failed to create listener: %w", err)
 	}
 
@@ -493,41 +516,61 @@ func (s *Server) Start() error {
 	// inline listener returned them, and net/http treats non-temporary
 	// Accept errors as fatal — one malformed header killed the listener).
 	// The HTTP variant makes RemoteAddr() report the forwarded client IP,
-	// which is what allowed_hosts and rate limiting read via r.RemoteAddr.
+	// which is what the per-IP connection limit counts and what the
+	// backends are told the client is.
 	listener = server.WrapProxyProtocolHTTP(listener, s.proxyReader, "USER-API-PROXY")
 
-	// Start serving
-	if s.tls {
-		return s.httpServer.ServeTLS(listener, s.tlsCertFile, s.tlsKeyFile)
+	if s.ctx.Err() != nil {
+		listener.Close()
+		<-httpShutdownDone
+		return nil
 	}
-	return s.httpServer.Serve(listener)
+
+	// Start serving. The certificate is in TLSConfig already: certificate
+	// files passed here would be loaded again, on top of the global one.
+	if s.tls {
+		err = httpServer.ServeTLS(listener, "", "")
+	} else {
+		err = httpServer.Serve(listener)
+	}
+	if errors.Is(err, http.ErrServerClosed) && s.ctx.Err() != nil {
+		<-httpShutdownDone
+		return nil
+	}
+	s.cancel()
+	<-httpShutdownDone
+	return err
 }
 
 // setupHandler creates the HTTP handler with reverse proxy logic
 func (s *Server) setupHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The client's IP travels with the request: routeUser fills the remote lookup's
+		// $ip with it.
+		r = r.WithContext(context.WithValue(r.Context(), clientIPKey, s.getRealClientIP(r)))
+
 		// Track metrics
-		metrics.ConnectionsTotal.WithLabelValues("userapi_proxy", s.name, "").Inc()
-		metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, "").Inc()
-		defer metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, "").Dec()
+		metrics.ConnectionsTotal.WithLabelValues("userapi_proxy", s.name, s.hostname).Inc()
+		metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, s.hostname).Inc()
+		defer metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, s.hostname).Dec()
 
 		// Fail closed until the backend maintenance list has been read: any backend
 		// might be in maintenance (proxy.Maintenance.Loaded).
 		if !s.connManager.MaintenanceLoaded() {
 			logger.Error("User API Proxy: backend maintenance list not loaded yet - refusing request", "name", s.name)
-			http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+			s.writeError(w, r, "Service unavailable", http.StatusServiceUnavailable)
 			return
 		}
 
 		// Check if this is an authentication endpoint (no JWT required)
 		isAuthEndpoint := strings.HasPrefix(r.URL.Path, "/user/auth/")
 
-		if !isAuthEndpoint {
+		if !isAuthEndpoint && !isCORSPreflight(r) {
 			// Validate JWT token and extract claims for non-auth endpoints
 			claims, err := s.extractAndValidateToken(r)
 			if err != nil {
 				logger.Warn("User API Proxy: Authentication failed", "name", s.name, "path", r.URL.Path, "error", err)
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				s.writeUnauthorized(w, r, err)
 				return
 			}
 
@@ -535,35 +578,137 @@ func (s *Server) setupHandler() http.Handler {
 			route, err := s.getBackendForUser(r.Context(), claims.Email, claims.AccountID)
 			if err != nil {
 				logger.Warn("User API Proxy: Failed to get backend", "name", s.name, "user", claims.Email, "error", err)
-				http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+				s.writeError(w, r, "Service unavailable", http.StatusServiceUnavailable)
 				return
 			}
 
 			// Proxy authenticated request to the user's backend
-			s.proxyRequest(w, r, route)
+			s.proxyRequest(w, r, route, nil)
 			return
 		}
 
-		// Auth endpoints carry no JWT. A login names its user in the body and a refresh
-		// carries the user's token, so both are routed like any other request for that
-		// user: the account lives on a backend of the user's pool. A request that names
-		// nobody goes to the default pool by path hash, as before pools; without a default
-		// pool it is refused. The backend handles rate limiting.
-		route, err := s.routeAuthRequest(r)
+		// Auth endpoints and CORS preflights carry no JWT. A login names its user in the
+		// body and a refresh carries the user's token, so both are routed like any other
+		// request for that user: the account lives on a backend of the user's pool. A
+		// refresh whose token the proxy refuses is answered here, as on every other
+		// endpoint. A preflight, and an auth request that names nobody otherwise, reaches
+		// no account: see routeNameless. Logins are rate limited here (admitLogin).
+		var route backendRoute
+		var login *loginAttempt
+		var err error
+		if isCORSPreflight(r) {
+			route, err = s.routeNameless(r)
+		} else {
+			route, login, err = s.routeAuthRequest(r)
+		}
 		if err != nil {
 			if errors.Is(err, errAuthBodyTooLarge) {
-				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+				s.writeError(w, r, "Request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			if errors.Is(err, errRefreshTokenRefused) {
+				logger.Warn("User API Proxy: Authentication failed", "name", s.name, "path", r.URL.Path, "error", err)
+				s.writeError(w, r, "Invalid or expired token", http.StatusUnauthorized)
+				return
+			}
+			if errors.Is(err, errLoginRefused) {
+				s.writeLoginRefused(w, r)
+				return
+			}
+			if errors.Is(err, server.ErrDelayQueueFull) {
+				// The answer of a backend's limiter (userapi handleLogin).
+				s.writeUserAPIError(w, r, "Too many concurrent authentication attempts. Please try again later.", http.StatusTooManyRequests)
 				return
 			}
 			logger.Warn("User API Proxy: Failed to get backend", "name", s.name, "path", r.URL.Path, "error", err)
-			http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+			s.writeError(w, r, "Service unavailable", http.StatusServiceUnavailable)
 			return
 		}
 
 		// Proxy unauthenticated request
-		s.proxyRequest(w, r, route)
+		s.proxyRequest(w, r, route, login)
 	})
 }
+
+// writeError answers r with an error the proxy writes itself, no backend having answered.
+// The body is the User API's error, {"error": msg} as application/json (the backend's
+// writeError, docs/USER_API.md section 4, "Requests, responses and errors"), so a client reads it as it reads
+// the backend's. It carries the CORS headers of the proxy's allowed_origins, as the
+// backend's own errors carry the backend's: without them a browser hands the page a
+// network error instead of the status, and a web client cannot tell an expired token from
+// an outage. A forwarded response carries the backend's CORS headers and must get none here.
+func (s *Server) writeError(w http.ResponseWriter, r *http.Request, msg string, code int) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	s.writeUserAPIError(w, r, msg, code)
+}
+
+// writeLoginRefused answers a login the proxy refuses itself (errLoginRefused) as a
+// backend answers a wrong password (userapi handleLogin): 401 {"error": "Invalid
+// credentials"} with the backend's headers. Unlike writeError it sets no
+// X-Content-Type-Options, which the backend's answer lacks: a header only the proxy sets
+// would show that no backend was asked, and so what the lookup said of the address.
+func (s *Server) writeLoginRefused(w http.ResponseWriter, r *http.Request) {
+	s.writeUserAPIError(w, r, "Invalid credentials", http.StatusUnauthorized)
+}
+
+// writeUserAPIError writes {"error": msg} as application/json with the CORS headers of
+// the proxy's allowed_origins: what a backend's writeError writes behind its CORS
+// middleware.
+func (s *Server) writeUserAPIError(w http.ResponseWriter, r *http.Request, msg string, code int) {
+	h := w.Header()
+	server.SetCORSHeaders(h, r.Header.Get("Origin"), s.settings.Load().allowedOrigins)
+	h.Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	if err := json.NewEncoder(w).Encode(map[string]string{"error": msg}); err != nil {
+		logger.Debug("User API Proxy: Failed to write error response", "name", s.name, "status", code, "error", err)
+	}
+}
+
+// isCORSPreflight reports whether r is a CORS-preflight request: an OPTIONS request with
+// Access-Control-Request-Method (Fetch Standard, "HTTP requests"). A browser sends one
+// before a cross-origin call that carries Authorization and never puts credentials on it,
+// so it cannot be held to the JWT check; the backend answers it without touching any
+// account, as it does when it is reached directly.
+func isCORSPreflight(r *http.Request) bool {
+	return r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != ""
+}
+
+// routeNameless picks the backend that answers a request naming no user: a CORS
+// preflight, or an auth request whose body names nobody (see peekAuthIdentity). A backend
+// answers a preflight in its CORS middleware (with its allowed_origins) before any
+// handler, and such an auth request from the request alone (400 for a login without an
+// email or a refresh without a token, 404, 405), so it reaches no account. Unlike a
+// request that names a user it is therefore not confined to one pool: it goes to the
+// default pool (the one pool of a flat remote_addrs list), and failing that (no default
+// pool, or no backend of it available) to the first pool in configuration order with a
+// backend available (neither in maintenance nor marked unhealthy). Which pool answers
+// decides whose allowed_origins applies, so every pool's backends should share them.
+func (s *Server) routeNameless(r *http.Request) (backendRoute, error) {
+	tried := ""
+	if pool, err := s.connManager.ResolvePool(""); err == nil {
+		if addr := s.connManager.GetBackendByConsistentHashInPool(pool.Name, r.URL.Path); addr != "" {
+			return s.poolRoute(addr, pool), nil
+		}
+		tried = pool.Name
+	}
+	for _, name := range s.connManager.PoolNames() {
+		if name == tried {
+			continue
+		}
+		pool, err := s.connManager.ResolvePool(name)
+		if err != nil {
+			continue // refused while its backends collide with another pool's
+		}
+		if addr := s.connManager.GetBackendByConsistentHashInPool(name, r.URL.Path); addr != "" {
+			return s.poolRoute(addr, pool), nil
+		}
+	}
+	return backendRoute{}, fmt.Errorf("no backend available for a request naming no user")
+}
+
+// writeTimeout is the proxy's http.Server WriteTimeout: no answer later than this after a
+// request was read reaches its client.
+const writeTimeout = 30 * time.Second
 
 // maxAuthBodyBytes bounds how much of an auth request body the proxy reads to find the
 // user it is for; a login or refresh body is a few hundred bytes.
@@ -571,73 +716,159 @@ const maxAuthBodyBytes = 64 << 10
 
 var errAuthBodyTooLarge = errors.New("auth request body too large")
 
-// routeAuthRequest picks the backend for an unauthenticated auth request.
-func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, error) {
-	email, tokenAccountID, err := s.peekAuthIdentity(r)
+// errRefreshTokenRefused is a refresh whose token the proxy refuses (invalid, expired,
+// or lacking usable account identity). It is answered 401 and never
+// forwarded: a backend whose clock is behind the proxy's could accept the token, and its
+// refresh would then look up the token's email in its own pool's database, which need
+// not be the user's pool.
+var errRefreshTokenRefused = errors.New("refresh token refused")
+
+// errUserRefused is a user the remote lookup does not know (404/3xx) while
+// lookup_local_users is off, or one whose account it refuses (401/403): a verdict on the
+// user, not an outage. No backend may answer for that user, with named pools or a flat
+// remote_addrs list, so routeUser routes the request nowhere.
+var errUserRefused = errors.New("user refused by the remote lookup")
+
+// errLoginRefused is a login the proxy refuses itself: one for an errUserRefused user, at
+// the cost of a password verification, or one the rate limit blocks (admitLogin). It is
+// answered as a backend answers a wrong password (writeLoginRefused).
+var errLoginRefused = errors.New("login refused")
+
+// routeAuthRequest picks the backend for an unauthenticated auth request, and returns
+// the login attempt the rate limit counts by the backend's answer (nil for a refresh, or
+// without a rate limit). A login is admitted by the rate limit first (admitLogin). A
+// login for a user the lookup does not know or refuses reaches no backend, which would
+// verify the password before answering 401: the proxy verifies it against a dummy hash
+// instead, counts it as a failure and returns errLoginRefused, so that neither the
+// answer, nor its timing, nor the rate limit shows what the lookup said of the address.
+// A refresh for such a user carries a token the proxy accepted, so its caller learns
+// nothing from the refusal and it stays a temporary one.
+func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, *loginAttempt, error) {
+	id, err := s.peekAuthIdentity(r)
 	if err != nil {
-		return backendRoute{}, err
+		return backendRoute{}, nil, err
 	}
-	if email != "" {
-		return s.routeUser(r.Context(), email, tokenAccountID, true)
+	if id.email == "" {
+		route, err := s.routeNameless(r)
+		return route, nil, err
 	}
-	// Names nobody: the backend answers the malformed request itself, wherever it lands.
-	pool, err := s.connManager.ResolvePool("")
+	var login *loginAttempt
+	if id.password != "" && s.authLimiter != nil {
+		login = &loginAttempt{addr: &server.StringAddr{Addr: s.getRealClientIP(r)}, key: server.AuthRateLimitKey(id.email)}
+		if err := s.admitLogin(r.Context(), login); err != nil {
+			return backendRoute{}, nil, err
+		}
+	}
+	route, err := s.routeUser(r.Context(), id.email, id.accountID, true)
+	if errors.Is(err, errUserRefused) && id.password != "" {
+		logger.Info("User API Proxy: Login refused", "name", s.name, "user", id.email, "error", err)
+		db.DummyVerifyPassword(id.password)
+		s.recordLogin(r.Context(), login, false)
+		return backendRoute{}, nil, fmt.Errorf("%w: %w", errLoginRefused, err)
+	}
 	if err != nil {
-		return backendRoute{}, err
+		return backendRoute{}, nil, err
 	}
-	addr := s.connManager.GetBackendByConsistentHashInPool(pool.Name, r.URL.Path)
-	if addr == "" {
-		return backendRoute{}, fmt.Errorf("no backend available")
+	return route, login, nil
+}
+
+// loginAttempt is a login the rate limit counts: the client's address, and the address
+// it logs in as keyed as a backend keys it (server.AuthRateLimitKey).
+type loginAttempt struct {
+	addr net.Addr
+	key  string
+}
+
+// admitLogin applies the rate limit to a login before it is routed, as a backend applies
+// its own before it verifies the password (userapi handleLogin): the client's progressive
+// delay, then the blocks of its IP and of its IP and address. A blocked login is
+// errLoginRefused, answered at once like a wrong password, without a verification that
+// would let a blocked client spend the proxy's CPU. One limiter counts every login
+// through the proxy, those a backend answers (proxyRequest) and those the proxy refuses
+// itself, so neither a delay nor a block depends on whether the lookup knows the address.
+// A login delay that cannot be served is server.ErrDelayQueueFull.
+func (s *Server) admitLogin(ctx context.Context, login *loginAttempt) error {
+	if err := server.ApplyAuthenticationDelay(ctx, s.authLimiter, login.addr, "userapi_proxy"); err != nil {
+		return fmt.Errorf("login delay: %w", err)
 	}
-	return s.poolRoute(addr, pool), nil
+	if err := s.authLimiter.CanAttemptAuth(ctx, login.addr, login.key); err != nil {
+		return fmt.Errorf("%w: %w", errLoginRefused, err)
+	}
+	return nil
+}
+
+// recordLogin counts the outcome of login; a nil login (no rate limit) counts nothing.
+func (s *Server) recordLogin(ctx context.Context, login *loginAttempt, success bool) {
+	if login != nil {
+		s.authLimiter.RecordAuthAttempt(ctx, login.addr, login.key, success)
+	}
+}
+
+// authIdentity is the user an auth request is for (see peekAuthIdentity).
+type authIdentity struct {
+	email     string
+	password  string // a login's, never empty; "" for a refresh
+	accountID int64  // a refresh token's; 0 for a login
 }
 
 // peekAuthIdentity reads the user an auth request is for without consuming the request: the
-// email of a login body, or the subject of the (valid) token a refresh body carries. The
-// body is put back for the backend, and read as the backend reads it (the first JSON value)
-// so the two cannot disagree on whose request it is. "" when the body names nobody the
-// proxy can route by; the backend then answers the malformed request itself.
-// A refresh also carries its token's account ID, for local-fallback ownership checks.
-func (s *Server) peekAuthIdentity(r *http.Request) (string, int64, error) {
-	if r.Body == nil || r.Body == http.NoBody {
-		return "", 0, nil
+// email and password of a login body, or the subject of the (valid) token a refresh body
+// carries. The body is put back for the backend, and read as the backend reads it (the
+// first JSON value, into the fields the endpoint decodes) so the two cannot disagree on
+// whose request it is. No email when the request names nobody the proxy can route by: no
+// body, a body the backend refuses before looking anyone up (not JSON, a field of the
+// wrong type, no email, a login without a password, a refresh without a token), another
+// path, or a method other than POST, which the backend answers 405 before reading the
+// body. A backend then answers it from the request alone, whatever the lookup knows of
+// the address. A refresh token the proxy refuses is errRefreshTokenRefused. A refresh also
+// carries its token's account ID, for local-fallback ownership checks.
+func (s *Server) peekAuthIdentity(r *http.Request) (authIdentity, error) {
+	if r.Method != http.MethodPost || r.Body == nil || r.Body == http.NoBody {
+		return authIdentity{}, nil
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxAuthBodyBytes+1))
 	r.Body.Close()
 	if err != nil {
-		return "", 0, fmt.Errorf("reading auth request body: %w", err)
+		return authIdentity{}, fmt.Errorf("reading auth request body: %w", err)
 	}
 	if len(body) > maxAuthBodyBytes {
-		return "", 0, errAuthBodyTooLarge
+		return authIdentity{}, errAuthBodyTooLarge
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 
 	switch r.URL.Path {
 	case "/user/auth/login":
-		// Decode only fields the login endpoint uses. A refresh-only field must
-		// stay unknown here, just as it is to the backend's login decoder.
+		// Decode only fields the login endpoint uses (userapi.LoginRequest). A
+		// refresh-only field must stay unknown here, just as it is to the backend's
+		// login decoder.
 		var req struct {
-			Email string `json:"email"`
+			Email    string `json:"email"`
+			Password string `json:"password"`
 		}
-		if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil {
-			return "", 0, nil
+		if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil || req.Password == "" {
+			return authIdentity{}, nil
 		}
-		return strings.TrimSpace(req.Email), 0, nil
+		return authIdentity{email: strings.TrimSpace(req.Email), password: req.Password}, nil
 	case "/user/auth/refresh":
 		var req struct {
 			Token string `json:"token"`
 		}
-		if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil {
-			return "", 0, nil
+		if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil || req.Token == "" {
+			return authIdentity{}, nil
 		}
-		if claims, err := s.validateToken(req.Token); err == nil {
-			if claims.AccountID <= 0 {
-				return "", 0, fmt.Errorf("refresh token has no valid account ID")
-			}
-			return claims.Email, claims.AccountID, nil
+		claims, err := s.validateToken(req.Token)
+		if err != nil {
+			return authIdentity{}, fmt.Errorf("%w: %w", errRefreshTokenRefused, err)
 		}
+		if claims.AccountID <= 0 {
+			return authIdentity{}, fmt.Errorf("%w: refresh token has no valid account ID", errRefreshTokenRefused)
+		}
+		if strings.TrimSpace(claims.Email) == "" {
+			return authIdentity{}, fmt.Errorf("%w: refresh token has no usable email", errRefreshTokenRefused)
+		}
+		return authIdentity{email: claims.Email, accountID: claims.AccountID}, nil
 	}
-	return "", 0, nil
+	return authIdentity{}, nil
 }
 
 // backendRoute is where a request goes and how its backend leg is spoken: with named
@@ -696,10 +927,17 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 // it. With lookup_local_users, a JWT request the lookup does not know also has to
 // identify an active local account before it can enter the default pool.
 //
+// A user the lookup does not know (without lookup_local_users) or refuses is
+// errUserRefused, with named pools or a flat remote_addrs list. A flat list is one pool:
+// a lookup that fails still routes into it, as before pools.
+//
 // A backend in maintenance is never picked. A pin to one routes the user among that
 // backend's own siblings (refused if its named pool cannot be identified) without
 // setting affinity, so the pin takes the user back when maintenance ends; an affinity to
 // one is dropped and the user routed afresh, so the new affinity keeps them there after it.
+// A backend marked unhealthy (three failed connections in a row) is passed over the same
+// way by affinity and consistent hash, but not by a pin: the lookup's answer is
+// definitive, as on the other proxies.
 //
 // forAuth is set for a login or refresh, which carries no token yet: anyone can name any
 // user in one, so it reads affinity but never writes it (no gossip per made-up user).
@@ -739,16 +977,16 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			// positive_ttl to allow periodic revalidation via remotelookup, so that when
 			// a domain moves backends, active users eventually pick up the new backend.
 			logger.Debug("User API Proxy: Using cached route", "name", s.name, "user", email, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
-			metrics.LookupCacheHitsTotal.Inc()
+			metrics.LookupCacheResults.WithLabelValues("userapi_proxy", "hit").Inc()
 			return s.serverRoute(cached.ServerAddress), nil
 		}
 		if havePool {
-			metrics.LookupCacheHitsTotal.Inc()
+			metrics.LookupCacheResults.WithLabelValues("userapi_proxy", "hit").Inc()
 		} else {
 			if found {
 				logger.Debug("User API Proxy: Cache miss (refused entry)", "name", s.name, "user", email)
 			}
-			metrics.LookupCacheMissesTotal.Inc()
+			metrics.LookupCacheResults.WithLabelValues("userapi_proxy", "miss").Inc()
 		}
 	}
 
@@ -759,7 +997,8 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 		lookupCtx, lookupCancel := context.WithTimeout(ctx, s.connManager.GetRemoteLookupTimeout())
 		defer lookupCancel()
 
-		routingInfo, result, err := s.routingLookup.LookupUserRouteWithOptions(lookupCtx, email, "", true)
+		clientIP, _ := ctx.Value(clientIPKey).(string) // set by the handler; "" when unknown
+		routingInfo, result, err := s.routingLookup.LookupUserRouteWithClientIP(lookupCtx, email, "", clientIP, true)
 		switch {
 		case err != nil:
 			logger.Warn("User API Proxy: RemoteLookup failed", "name", s.name, "user", email, "error", err)
@@ -770,6 +1009,11 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 		case routingInfo == nil && result == proxy.AuthUserNotFound:
 			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, IsNegative: true})
 			notFound = true
+		case routingInfo == nil && result == proxy.AuthFailed:
+			// 401/403: the lookup refuses the account, a verdict and not an outage, with
+			// no fallback, a flat list included. Not cached, as the lookup client caches
+			// no refusal.
+			return backendRoute{}, fmt.Errorf("%w: %w", errUserRefused, proxy.ErrRemoteLookupRefused)
 		case routingInfo == nil:
 			logger.Warn("User API Proxy: RemoteLookup gave no route", "name", s.name, "user", email, "result", result)
 			if named {
@@ -806,10 +1050,11 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, PoolName: routingInfo.PoolName})
 		}
 	}
+	if notFound && !s.lookupLocalUsers {
+		// With a flat list too: its backends would log the user in from their database.
+		return backendRoute{}, fmt.Errorf("%w: not known to the remote lookup, and lookup_local_users is off", errUserRefused)
+	}
 	if notFound && named {
-		if !s.lookupLocalUsers {
-			return backendRoute{}, fmt.Errorf("user is not known to the remote lookup, and lookup_local_users is off")
-		}
 		// A valid JWT from another pool may carry the ID of an unrelated local
 		// account. A lookup miss is not evidence that its owner is a local user.
 		// Logins are authenticated by the backend. Requests carrying a token,
@@ -849,14 +1094,17 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 		if backend, found := s.affinityManager.GetBackend(email, "userapi"); found {
 			// Affinity is gossip-synced and persisted: honor it only inside the user's pool
 			// (a user the lookup moved to another pool must not follow a stale entry), only
-			// when restrict_to_pool allows it (a poisoned entry from another node), and
-			// never to a backend in maintenance.
-			if s.connManager.PoolHasBackend(pool.Name, backend) && s.connManager.AllowRemoteLookupBackend(backend) && !s.connManager.InMaintenance(backend) {
+			// when restrict_to_pool allows it (a poisoned entry from another node), never
+			// to a backend in maintenance, and never to one marked unhealthy. Health is read
+			// without auto-recovery, as the other proxies' affinity does: a user who failed
+			// over stays on the new backend when the old one comes back.
+			if s.connManager.PoolHasBackend(pool.Name, backend) && s.connManager.AllowRemoteLookupBackend(backend) &&
+				!s.connManager.InMaintenance(backend) && s.connManager.IsBackendHealthyForAffinity(backend) {
 				logger.Debug("User API Proxy: Using affinity backend", "name", s.name, "user", email, "backend", backend, "pool", pool.Name)
 				return s.poolRoute(backend, pool), nil
 			}
 			if !forAuth {
-				logger.Info("User API Proxy: Affinity backend not in the user's pool or in maintenance - deleting affinity", "name", s.name, "user", email, "backend", backend, "pool", pool.Name)
+				logger.Info("User API Proxy: Affinity backend not in the user's pool, in maintenance or unhealthy - deleting affinity", "name", s.name, "user", email, "backend", backend, "pool", pool.Name)
 				s.affinityManager.DeleteBackend(email, "userapi")
 			}
 		}
@@ -887,16 +1135,17 @@ func (s *Server) cacheRoute(email string, entry *lookupcache.CacheEntry) {
 	s.lookupCache.Set(s.name, email, entry)
 }
 
-// proxyRequest proxies the request to the backend
-func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route backendRoute) {
+// proxyRequest proxies the request to the backend. login is the login attempt r is, if
+// the rate limit counts it (routeAuthRequest), else nil.
+func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route backendRoute, login *loginAttempt) {
 	binding, err := s.connManager.BindBackendRoute(route.pool, route.addr)
 	if err != nil {
-		http.Error(w, "Backend route unavailable", http.StatusServiceUnavailable)
+		s.writeError(w, r, "Backend route unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	transport, err := s.transportFor(route, binding)
 	if err != nil {
-		http.Error(w, "Backend route unavailable", http.StatusServiceUnavailable)
+		s.writeError(w, r, "Backend route unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	// Create reverse proxy to backend
@@ -905,16 +1154,42 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route back
 		scheme = "https"
 	}
 
-	target, err := url.Parse(fmt.Sprintf("%s://%s", scheme, route.addr))
+	// A backend without a port takes the scheme's port. A bare IPv6 literal must then be
+	// bracketed, or the URL reads its last group as the port.
+	host := route.addr
+	if strings.Contains(host, ":") && net.ParseIP(host) != nil {
+		host = "[" + host + "]"
+	}
+	target, err := url.Parse(fmt.Sprintf("%s://%s", scheme, host))
 	if err != nil {
 		logger.Warn("User API Proxy: Failed to parse backend URL", "name", s.name, "error", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		s.writeError(w, r, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	// Create reverse proxy with shared transport (prevents connection pool leaks)
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = transport
+	// The backend did not answer (the default handler's bare 502): ReverseProxy calls this
+	// before it has copied any backend header, so the response is the proxy's own.
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		logger.Warn("User API Proxy: Backend request failed", "name", s.name, "backend", route.addr, "error", err)
+		s.writeError(w, r, "Bad gateway", http.StatusBadGateway)
+	}
+	// A login's verdict is the backend's answer: 200 a success, 401 a wrong password or an
+	// address without an account. Any other answer (a malformed request, a temporary
+	// failure) says nothing of the password and is not counted, as on a backend.
+	if login != nil {
+		proxy.ModifyResponse = func(resp *http.Response) error {
+			switch resp.StatusCode {
+			case http.StatusOK:
+				s.recordLogin(resp.Request.Context(), login, true)
+			case http.StatusUnauthorized:
+				s.recordLogin(resp.Request.Context(), login, false)
+			}
+			return nil
+		}
+	}
 
 	// Modify request. Capture the original Host BEFORE overwriting r.Host:
 	// the Host of an incoming request lives in r.Host, not in r.Header
@@ -929,8 +1204,9 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route back
 	// Get real client IP (from PROXY protocol or RemoteAddr)
 	realClientIP := s.getRealClientIP(r)
 
-	// Forward real client IP to backend in X-Forwarded-For and X-Real-IP headers
-	// Backend should trust these headers from trusted proxy networks
+	// Forward real client IP to backend in X-Forwarded-For and X-Real-IP headers.
+	// The sora User API backend does not read them: it learns the client address
+	// only from the PROXY protocol header (remote_use_proxy_protocol).
 	r.Header.Set("X-Real-IP", realClientIP)
 	r.Header.Set("X-Forwarded-For", realClientIP)
 
@@ -945,6 +1221,17 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route back
 		}
 	}
 	ctx = context.WithValue(ctx, proxyProtocolKey, route.proxyProtocol)
+	if login != nil {
+		// The backend's answer is counted whether or not the client waits for it, as the
+		// proxy's own refusal of a login is (routeAuthRequest): cancelled with the client,
+		// a login that left before the backend answered went uncounted, and the rate limit
+		// alone showed which addresses the lookup knows. Bounded by writeTimeout, past
+		// which no answer reaches a client. (Without a deadline the context could never
+		// be done, and ReverseProxy would cancel it on the client's close itself.)
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
+		defer cancel()
+	}
 	r = r.WithContext(ctx)
 
 	// Keep Authorization header for backend JWT validation
@@ -978,17 +1265,41 @@ func (s *Server) validateToken(tokenString string) (*JWTClaims, error) {
 	return nil, fmt.Errorf("invalid token claims")
 }
 
+// The refusals of extractAndValidateToken that writeUnauthorized tells apart.
+var (
+	errNoAuthHeader  = errors.New("authorization header required")
+	errNotBearerAuth = errors.New("authorization header must be 'Bearer <token>'")
+)
+
+// writeUnauthorized answers r, whose token extractAndValidateToken refused with err, as
+// the User API answers the same refusal (userapi jwtAuthMiddleware), so a token the proxy
+// refuses is answered as a backend answers it: the same message and the same Bearer
+// challenge, which RFC 9110 section 15.5.2 requires on every 401. A request without a
+// bearer token gets the challenge without an error code, a refused token
+// error="invalid_token" (RFC 6750 section 3.1).
+func (s *Server) writeUnauthorized(w http.ResponseWriter, r *http.Request, err error) {
+	msg, tokenRefused := "Invalid or expired token", true
+	switch {
+	case errors.Is(err, errNoAuthHeader):
+		msg, tokenRefused = "Authorization header required", false
+	case errors.Is(err, errNotBearerAuth):
+		msg, tokenRefused = "Authorization header must be 'Bearer <token>'", false
+	}
+	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, tokenRefused)
+	s.writeError(w, r, msg, http.StatusUnauthorized)
+}
+
 // extractAndValidateToken extracts and validates JWT token from request
 func (s *Server) extractAndValidateToken(r *http.Request) (*JWTClaims, error) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
-		return nil, fmt.Errorf("authorization header required")
+		return nil, errNoAuthHeader
 	}
 
 	// Extract token from "Bearer <token>"
 	parts := strings.SplitN(authHeader, " ", 2)
 	if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-		return nil, fmt.Errorf("authorization header must be 'Bearer <token>'")
+		return nil, errNotBearerAuth
 	}
 
 	tokenString := parts[1]
@@ -1069,6 +1380,12 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 			reloaded = append(reloaded, "jwt_secret")
 		}
 	}
+	// Reload receives the complete config, so an empty or removed list means what it does
+	// at startup: the proxy's own responses authorize no origin.
+	if !slices.Equal(cfg.AllowedOrigins, next.allowedOrigins) {
+		next.allowedOrigins = slices.Clone(cfg.AllowedOrigins)
+		reloaded = append(reloaded, "allowed_origins")
+	}
 
 	if len(reloaded) > 0 {
 		s.settings.Store(&next)
@@ -1080,22 +1397,24 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 func (s *Server) Stop() error {
 	logger.Info("User API Proxy: Stopping", "name", s.name)
 
+	s.shutdownMu.Lock()
 	s.cancel()
+	shutdownDone := s.shutdownDone
+	s.shutdownMu.Unlock()
+
 	s.closeBackendIdleConnections()
 
-	// HTTP server shutdown is handled by the graceful shutdown goroutine
-	// Wait for it to complete
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	// HTTP server shutdown is handled by the graceful shutdown goroutine;
+	// wait for Start (and httpServer.Shutdown) to complete.
+	if shutdownDone != nil {
+		select {
+		case <-shutdownDone:
+			logger.Info("User API Proxy: Server stopped gracefully", "name", s.name)
+		case <-time.After(30 * time.Second):
+			logger.Warn("User API Proxy: Server stop timeout", "name", s.name)
+		}
+	} else {
 		logger.Info("User API Proxy: Server stopped gracefully", "name", s.name)
-	case <-time.After(30 * time.Second):
-		logger.Warn("User API Proxy: Server stop timeout", "name", s.name)
 	}
 
 	return nil

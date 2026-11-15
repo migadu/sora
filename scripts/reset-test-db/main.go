@@ -78,23 +78,31 @@ func main() {
 }
 
 func fallbackToTruncate(ctx context.Context, conn *pgx.Conn) {
-	tables := []string{
-		"vacation_responses", "sieve_scripts", "pending_uploads",
-		"messages_fts", "messages", "mailbox_stats", "mailbox_acls",
-		"mailboxes", "credentials", "accounts", "metadata", "health_status",
-		"cache_metrics",
-	}
-
 	// Disable triggers
 	_, _ = conn.Exec(ctx, "SET session_replication_role = replica;")
 
-	// Drop schema_migrations to ensure migrations run from scratch on errors
-	_, _ = conn.Exec(ctx, "DROP TABLE IF EXISTS schema_migrations;")
-
-	log.Println("Truncating tables...")
-	_, err := conn.Exec(ctx, "TRUNCATE TABLE "+strings.Join(tables, ", ")+" CASCADE;")
+	// Every table in public, whatever the migrations have added since this was written:
+	// a fixed list goes stale, and a table missing from it keeps its rows. Except
+	// schema_migrations: the tables stay, so their version must stay too, or the next
+	// run starts again at 000001 and fails on CREATE TABLE accounts.
+	rows, err := conn.Query(ctx, "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> 'schema_migrations'")
 	if err != nil {
-		log.Fatalf("Fatal error truncating tables: %v", err)
+		log.Fatalf("Fatal error listing tables: %v", err)
+	}
+	tables, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (string, error) {
+		var name string
+		err := row.Scan(&name)
+		return pgx.Identifier{"public", name}.Sanitize(), err
+	})
+	if err != nil {
+		log.Fatalf("Fatal error listing tables: %v", err)
+	}
+
+	if len(tables) > 0 {
+		log.Println("Truncating tables...")
+		if _, err := conn.Exec(ctx, "TRUNCATE TABLE "+strings.Join(tables, ", ")+" CASCADE;"); err != nil {
+			log.Fatalf("Fatal error truncating tables: %v", err)
+		}
 	}
 
 	// Re-enable triggers

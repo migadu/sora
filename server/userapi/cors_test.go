@@ -1,8 +1,11 @@
 package userapi
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -52,6 +55,201 @@ func TestCORSMiddleware(t *testing.T) {
 		s.corsMiddleware(next).ServeHTTP(rec, req)
 		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
 			t.Errorf("Access-Control-Allow-Origin = %q, want empty for a disallowed origin", got)
+		}
+	})
+}
+
+// TestCORSMiddlewareVaryOrigin covers the HTTP-cache side of CORS (Fetch Standard,
+// "CORS protocol and HTTP caches"): when the answer depends on the request's Origin
+// (a specific allowed_origins list), every response, including the ones that do not
+// reflect an origin and preflights, must say Vary: Origin; with "*" the header is
+// static and sent on every response, so no Vary is needed.
+func TestCORSMiddlewareVaryOrigin(t *testing.T) {
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	serve := func(origins []string, method, origin string) *httptest.ResponseRecorder {
+		s := &Server{}
+		s.settings.Store(&reloadableSettings{allowedOrigins: origins})
+		rec := httptest.NewRecorder()
+		rec.Header().Set("Vary", "Accept-Encoding") // set earlier in the chain; must be kept
+		req := httptest.NewRequest(method, "/user/mailboxes", nil)
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		s.corsMiddleware(next).ServeHTTP(rec, req)
+		return rec
+	}
+	hasVaryOrigin := func(h http.Header) bool {
+		for _, v := range h.Values("Vary") {
+			for _, f := range strings.Split(v, ",") {
+				if strings.EqualFold(strings.TrimSpace(f), "Origin") {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	specific := []string{"https://app.example.com"}
+	for _, tc := range []struct{ name, method, origin string }{
+		{"allowed origin", http.MethodGet, "https://app.example.com"},
+		{"disallowed origin", http.MethodGet, "https://evil.example"},
+		{"no origin", http.MethodGet, ""},
+		{"allowed preflight", http.MethodOptions, "https://app.example.com"},
+		{"disallowed preflight", http.MethodOptions, "https://evil.example"},
+	} {
+		t.Run("specific/"+tc.name, func(t *testing.T) {
+			rec := serve(specific, tc.method, tc.origin)
+			if !hasVaryOrigin(rec.Header()) {
+				t.Errorf("Vary = %q, want it to include Origin", rec.Header().Values("Vary"))
+			}
+			if !slices.Contains(rec.Header().Values("Vary"), "Accept-Encoding") {
+				t.Errorf("Vary = %q, an existing Vary value was dropped", rec.Header().Values("Vary"))
+			}
+		})
+	}
+
+	t.Run("wildcard without origin still sends *", func(t *testing.T) {
+		rec := serve([]string{"*"}, http.MethodGet, "")
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+			t.Errorf("Access-Control-Allow-Origin = %q, want \"*\" on every response", got)
+		}
+		if hasVaryOrigin(rec.Header()) {
+			t.Errorf("Vary = %q, a static \"*\" needs no Vary: Origin", rec.Header().Values("Vary"))
+		}
+	})
+
+	// The first matching entry decides, as before Vary was added: an origin listed
+	// before "*" keeps its credentialed answer, and since the answer then depends on
+	// the Origin every response says Vary: Origin. A "*" listed first answers every
+	// request with the static "*".
+	for _, tc := range []struct {
+		name            string
+		origins         []string
+		origin          string
+		wantAllowOrigin string
+		wantCredentials string
+		wantVary        bool
+	}{
+		{"origin before * is reflected", []string{"https://app.example.com", "*"}, "https://app.example.com", "https://app.example.com", "true", true},
+		{"origin before *, other origin", []string{"https://app.example.com", "*"}, "https://other.example", "*", "", true},
+		{"origin before *, no origin", []string{"https://app.example.com", "*"}, "", "*", "", true},
+		{"* first wins", []string{"*", "https://app.example.com"}, "https://app.example.com", "*", "", false},
+		{"* first, no origin", []string{"*", "https://app.example.com"}, "", "*", "", false},
+	} {
+		t.Run("mixed/"+tc.name, func(t *testing.T) {
+			rec := serve(tc.origins, http.MethodGet, tc.origin)
+			if got := rec.Header().Get("Access-Control-Allow-Origin"); got != tc.wantAllowOrigin {
+				t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, tc.wantAllowOrigin)
+			}
+			if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != tc.wantCredentials {
+				t.Errorf("Access-Control-Allow-Credentials = %q, want %q", got, tc.wantCredentials)
+			}
+			if got := hasVaryOrigin(rec.Header()); got != tc.wantVary {
+				t.Errorf("Vary = %q, want Vary: Origin %v", rec.Header().Values("Vary"), tc.wantVary)
+			}
+		})
+	}
+
+	t.Run("no allowed origins", func(t *testing.T) {
+		rec := serve(nil, http.MethodGet, "https://app.example.com")
+		if hasVaryOrigin(rec.Header()) {
+			t.Errorf("Vary = %q, want no Vary: Origin without CORS", rec.Header().Values("Vary"))
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("Access-Control-Allow-Origin = %q, want empty", got)
+		}
+	})
+}
+
+// TestCORSMiddlewareExposesClientHeaders checks that a cross-origin client can read the
+// headers the API sends for it to act on. Fetch Standard, "CORS filtered response": a
+// cross-origin reader sees only the CORS-safelisted response-header names
+// (Cache-Control, Content-Language, Content-Length, Content-Type, Expires,
+// Last-Modified, Pragma) and the names listed in Access-Control-Expose-Headers.
+// Retry-After (on the 503 for a body that is not available yet), Content-Disposition
+// (on /raw) and WWW-Authenticate (on a 401) are not safelisted, so without the list a
+// web client sees the 503 but not when to retry, or the 401 but not whether its token
+// was refused.
+func TestCORSMiddlewareExposesClientHeaders(t *testing.T) {
+	safelisted := []string{"Cache-Control", "Content-Language", "Content-Length", "Content-Type", "Expires", "Last-Modified", "Pragma"}
+	// readable reports whether a browser hands header name of the response to a
+	// cross-origin reader.
+	readable := func(h http.Header, name string) bool {
+		if h.Get("Access-Control-Allow-Origin") == "" {
+			return false // the response is not shared at all
+		}
+		if slices.ContainsFunc(safelisted, func(s string) bool { return strings.EqualFold(s, name) }) {
+			return true
+		}
+		for _, v := range h.Values("Access-Control-Expose-Headers") {
+			for _, f := range strings.Split(v, ",") {
+				if strings.EqualFold(strings.TrimSpace(f), name) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	handlers := []struct {
+		name, header string
+		handler      func(s *Server) http.Handler
+	}{
+		{"body pending", "Retry-After", func(s *Server) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				s.writeBodyUnavailable(w, bodyPending, nil, 1)
+			})
+		}},
+		{"storage down", "Retry-After", func(s *Server) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				s.writeBodyUnavailable(w, bodyTransient, errors.New("storage timeout"), 1)
+			})
+		}},
+		// The challenge of a 401 (the request carries no token).
+		{"token missing", "WWW-Authenticate", func(s *Server) http.Handler {
+			return s.jwtAuthMiddleware(http.NotFoundHandler())
+		}},
+		// The header handleGetMessageRaw sends with the message.
+		{"raw download", "Content-Disposition", func(s *Server) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "message/rfc822")
+				w.Header().Set("Content-Disposition", `attachment; filename="message-1.eml"`)
+				w.WriteHeader(http.StatusOK)
+			})
+		}},
+	}
+	for _, origins := range []struct {
+		name    string
+		allowed []string
+	}{{"specific", []string{"https://app.example.com"}}, {"wildcard", []string{"*"}}} {
+		for _, tc := range handlers {
+			t.Run(origins.name+"/"+tc.name, func(t *testing.T) {
+				s := &Server{}
+				s.settings.Store(&reloadableSettings{allowedOrigins: origins.allowed})
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodGet, "/user/messages/1/raw", nil)
+				req.Header.Set("Origin", "https://app.example.com")
+				s.corsMiddleware(tc.handler(s)).ServeHTTP(rec, req)
+				if rec.Header().Get(tc.header) == "" {
+					t.Fatalf("%s not set by the handler", tc.header)
+				}
+				if !readable(rec.Header(), tc.header) {
+					t.Errorf("%s is hidden from a cross-origin reader: Access-Control-Expose-Headers = %q",
+						tc.header, rec.Header().Values("Access-Control-Expose-Headers"))
+				}
+			})
+		}
+	}
+
+	t.Run("disallowed origin exposes nothing", func(t *testing.T) {
+		s := &Server{}
+		s.settings.Store(&reloadableSettings{allowedOrigins: []string{"https://app.example.com"}})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/user/mailboxes", nil)
+		req.Header.Set("Origin", "https://evil.example")
+		s.corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})).ServeHTTP(rec, req)
+		if got := rec.Header().Values("Access-Control-Expose-Headers"); len(got) != 0 {
+			t.Errorf("Access-Control-Expose-Headers = %q, want none for a disallowed origin", got)
 		}
 	})
 }

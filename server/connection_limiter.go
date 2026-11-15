@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -12,6 +13,23 @@ import (
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 )
+
+// ErrMaxConnectionsPerIP is a refusal over max_connections_per_ip: one client has too
+// many connections, as opposed to the server being full (max_connections).
+var ErrMaxConnectionsPerIP = errors.New("maximum connections per IP reached")
+
+// IsProxiedClientRefusal reports whether err refused the client a PROXY header named for
+// a reason of that client's own: over its max_connections_per_ip (ErrMaxConnectionsPerIP)
+// or with its IP blocked by the auth rate limiter (ErrIPBlocked). Such a refusal is
+// answered with a protocol reply after the TLS handshake instead of a silent close: the
+// PROXY peer is a proxy or load balancer (the header is only read from a trusted peer),
+// and a sora proxy that sees the socket close before its TLS handshake counts a backend
+// failure, quarantining the backend for every user over one client. Every other refusal
+// stays a silent close, so a flooder connecting directly is told nothing.
+func IsProxiedClientRefusal(err error, proxyInfo *ProxyProtocolInfo) bool {
+	return proxyInfo != nil && proxyInfo.SrcIP != "" &&
+		(errors.Is(err, ErrMaxConnectionsPerIP) || errors.Is(err, ErrIPBlocked))
+}
 
 // ConnectionLimiter manages connection limits for protocol servers
 type ConnectionLimiter struct {
@@ -89,36 +107,42 @@ func (cl *ConnectionLimiter) IsTrustedConnection(remoteAddr net.Addr) bool {
 
 // isTrustedConnection checks if connection is from trusted network (internal method)
 func (cl *ConnectionLimiter) isTrustedConnection(remoteAddr net.Addr) bool {
-	if len(cl.trustedNets) == 0 {
+	return cl.isTrustedIP(addrIP(remoteAddr))
+}
+
+// isTrustedIP reports whether ip is in trusted_networks.
+func (cl *ConnectionLimiter) isTrustedIP(ip net.IP) bool {
+	if ip == nil {
 		return false
 	}
-
-	var ip net.IP
-	switch addr := remoteAddr.(type) {
-	case *net.TCPAddr:
-		ip = addr.IP
-	case *net.UDPAddr:
-		ip = addr.IP
-	default:
-		// For unknown types, must use String() which may trigger DNS lookup
-		// This should be rare in practice (TCP/UDP are most common)
-		host, _, err := net.SplitHostPort(remoteAddr.String())
-		if err != nil {
-			return false
-		}
-		ip = net.ParseIP(host)
-		if ip == nil {
-			return false
-		}
-	}
-
 	for _, network := range cl.trustedNets {
 		if network.Contains(ip) {
 			return true
 		}
 	}
-
 	return false
+}
+
+// perIPAddr returns the address max_connections_per_ip counts for a connection
+// and whether trusted_networks exempt it. The counted address is the client a
+// PROXY header names (realClientIP) when there is one, else the socket peer, and
+// the exemption is checked against that address, not against the peer: a trusted
+// load balancer or proxy passes the limit on to the clients it names, and is only
+// exempt itself when it names none (no header, PROXY LOCAL/UNKNOWN). The PROXY
+// reader refuses headers from untrusted peers, so realClientIP is never an address
+// an untrusted client chose.
+func (cl *ConnectionLimiter) perIPAddr(remoteAddr net.Addr, realClientIP string) (string, bool) {
+	if realClientIP == "" {
+		if ip := addrIP(remoteAddr); ip != nil {
+			return ip.String(), cl.isTrustedIP(ip)
+		}
+		return GetIPString(remoteAddr), false
+	}
+	// Canonical form, so one client spelled two ways is one key.
+	if ip := net.ParseIP(realClientIP); ip != nil {
+		return ip.String(), cl.isTrustedIP(ip)
+	}
+	return realClientIP, false
 }
 
 // CanAccept checks if a new connection can be accepted from the given remote address
@@ -158,7 +182,7 @@ func (cl *ConnectionLimiter) CanAccept(remoteAddr net.Addr) error {
 			current := ipCounter.Load()
 			if current >= int64(cl.maxPerIP) {
 				logger.Info("Connection limiter: Maximum connections per IP reached", "protocol", cl.protocol, "ip", ip, "current", current, "max", cl.maxPerIP)
-				return fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", ip, current, cl.maxPerIP)
+				return fmt.Errorf("%w for %s (%d/%d)", ErrMaxConnectionsPerIP, ip, current, cl.maxPerIP)
 			}
 		}
 	}
@@ -175,27 +199,7 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 		return nil, err
 	}
 
-	// Determine which IP to use for per-IP tracking
-	var trackingIP string
-	isTrusted := cl.isTrustedConnection(remoteAddr)
-
-	if realClientIP != "" && !isTrusted {
-		// Use real client IP for per-IP limiting when not from trusted network
-		trackingIP = realClientIP
-	} else {
-		switch a := remoteAddr.(type) {
-		case *net.TCPAddr:
-			trackingIP = a.IP.String()
-		default:
-			// Fallback for non-TCP addresses
-			host, _, err := net.SplitHostPort(remoteAddr.String())
-			if err != nil {
-				trackingIP = remoteAddr.String()
-			} else {
-				trackingIP = host
-			}
-		}
-	}
+	trackingIP, exempt := cl.perIPAddr(remoteAddr, realClientIP)
 
 	// Increment total counter, then re-check the limit. CanAcceptWithRealIP above is
 	// only an advisory pre-check; without this post-increment guard two concurrent
@@ -214,30 +218,32 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 	var perIP int64 = 0
 	var ipCounter *atomic.Int64
 
-	// Only track per-IP if limits are enabled (maxPerIP > 0) and not from trusted network
-	if cl.maxPerIP > 0 && !isTrusted {
+	// Only track per-IP if limits are enabled (maxPerIP > 0) and the counted address is not trusted
+	if cl.maxPerIP > 0 && !exempt {
 		// Use cluster-wide tracking if available, otherwise use local tracking
 		if cl.ipTracker != nil {
-			// Cluster mode: increment cluster-wide counter
-			cl.ipTracker.IncrementIP(trackingIP)
-			perIP = int64(cl.ipTracker.GetIPCount(trackingIP))
+			// Cluster mode: the tracker checks the cluster-wide count and counts
+			// the connection at once, so concurrent accepts from one IP, on this
+			// listener or a sibling of it on this node, can't overshoot maxPerIP.
+			count, ok := cl.ipTracker.TryIncrementIP(trackingIP, cl.maxPerIP)
+			if !ok {
+				cl.currentTotal.Add(-1)
+				return nil, fmt.Errorf("%w for %s (%d/%d)", ErrMaxConnectionsPerIP, trackingIP, count, cl.maxPerIP)
+			}
+			perIP = int64(count)
 		} else {
 			// Local mode: increment local counter using lock-free LoadOrStore
 			value, _ := cl.perIPConnections.LoadOrStore(trackingIP, &atomic.Int64{})
 			ipCounter = value.(*atomic.Int64)
 			perIP = ipCounter.Add(1)
-		}
 
-		// Post-increment per-IP guard, mirroring the total-counter guard above: close the
-		// check/increment TOCTOU so concurrent accepts from one IP can't overshoot maxPerIP.
-		if perIP > int64(cl.maxPerIP) {
-			if cl.ipTracker != nil {
-				cl.ipTracker.DecrementIP(trackingIP)
-			} else if ipCounter != nil {
+			// Post-increment per-IP guard, mirroring the total-counter guard above: close the
+			// check/increment TOCTOU so concurrent accepts from one IP can't overshoot maxPerIP.
+			if perIP > int64(cl.maxPerIP) {
 				ipCounter.Add(-1)
+				cl.currentTotal.Add(-1)
+				return nil, fmt.Errorf("%w for %s (%d/%d)", ErrMaxConnectionsPerIP, trackingIP, cl.maxPerIP, cl.maxPerIP)
 			}
-			cl.currentTotal.Add(-1)
-			return nil, fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", trackingIP, cl.maxPerIP, cl.maxPerIP)
 		}
 
 		if realClientIP != "" {
@@ -245,12 +251,11 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 		} else {
 			logger.Debug("Connection limiter: Connection accepted", "protocol", cl.protocol, "ip", trackingIP, "total", total, "max_total", cl.maxConnections, "per_ip", perIP, "max_per_ip", cl.maxPerIP)
 		}
-	} else if isTrusted {
-		proxyIPStr := GetAddrString(remoteAddr)
+	} else if exempt {
 		if realClientIP != "" {
-			logger.Debug("Connection limiter: Connection accepted from trusted proxy", "protocol", cl.protocol, "proxy", proxyIPStr, "real_client", realClientIP, "total", total, "max_total", cl.maxConnections)
+			logger.Debug("Connection limiter: Connection accepted for client in trusted network", "protocol", cl.protocol, "remote", GetAddrString(remoteAddr), "real_client", realClientIP, "total", total, "max_total", cl.maxConnections)
 		} else {
-			logger.Debug("Connection limiter: Connection accepted from trusted network", "protocol", cl.protocol, "ip", proxyIPStr, "total", total, "max_total", cl.maxConnections)
+			logger.Debug("Connection limiter: Connection accepted from trusted network", "protocol", cl.protocol, "ip", GetAddrString(remoteAddr), "total", total, "max_total", cl.maxConnections)
 		}
 	} else {
 		logger.Debug("Connection limiter: Connection accepted - unlimited", "protocol", cl.protocol, "ip", trackingIP, "total", total, "max_total", cl.maxConnections)
@@ -268,7 +273,7 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 				logger.Info("Connection limiter: Connections released", "protocol", cl.protocol, "current_total", newTotal, "max", cl.maxConnections)
 			}
 
-			if cl.maxPerIP > 0 && !isTrusted {
+			if cl.maxPerIP > 0 && !exempt {
 				var remaining int64
 
 				// Use cluster-wide tracking if available, otherwise use local tracking
@@ -328,38 +333,11 @@ func (cl *ConnectionLimiter) CanAcceptWithRealIP(remoteAddr net.Addr, realClient
 	}
 
 	// Check per-IP connection limit (skip if maxPerIP is 0, allowing unlimited per-IP for proxy scenarios)
-	// Also skip per-IP limits for trusted networks (proxies)
-	if cl.maxPerIP > 0 && !cl.isTrustedConnection(remoteAddr) {
-		// Determine which IP to check for per-IP limits
-		var checkIP string
-		if realClientIP != "" {
-			// Use real client IP for per-IP limiting when available
-			checkIP = realClientIP
-		} else {
-			// Extract IP from remote address without triggering reverse DNS lookup
-			var extractedIP net.IP
-			switch addr := remoteAddr.(type) {
-			case *net.TCPAddr:
-				extractedIP = addr.IP
-			case *net.UDPAddr:
-				extractedIP = addr.IP
-			default:
-				// For unknown types, we must call String() but this may be slow
-				// if it triggers reverse DNS lookup
-				host, _, err := net.SplitHostPort(remoteAddr.String())
-				if err == nil {
-					extractedIP = net.ParseIP(host)
-				}
-			}
-
-			if extractedIP != nil {
-				checkIP = extractedIP.String()
-			} else {
-				// Fallback - this may be slow if it triggers DNS
-				checkIP = remoteAddr.String()
-			}
-		}
-
+	if cl.maxPerIP <= 0 {
+		return nil
+	}
+	checkIP, exempt := cl.perIPAddr(remoteAddr, realClientIP)
+	if !exempt {
 		// Use cluster-wide count if tracker is available, otherwise use local count
 		var current int64
 		if cl.ipTracker != nil {
@@ -374,7 +352,7 @@ func (cl *ConnectionLimiter) CanAcceptWithRealIP(remoteAddr net.Addr, realClient
 		}
 
 		if current >= int64(cl.maxPerIP) {
-			return fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", checkIP, current, cl.maxPerIP)
+			return fmt.Errorf("%w for %s (%d/%d)", ErrMaxConnectionsPerIP, checkIP, current, cl.maxPerIP)
 		}
 	}
 
@@ -393,14 +371,27 @@ func (cl *ConnectionLimiter) GetStats() ConnectionStats {
 
 	// Get per-IP counts from cluster tracker if available, otherwise from local map
 	if cl.ipTracker != nil {
-		// Cluster mode: get cluster-wide IP counts from tracker
-		cl.ipTracker.mu.RLock()
-		for ip, info := range cl.ipTracker.connections {
-			if info.TotalCount > 0 {
-				stats.IPConnections[ip] = int64(info.TotalCount)
+		// Snapshot the same counts admission checks, including sibling-only IPs.
+		// Keep the tracker -> node lock order used by TryIncrementIP/GetIPCount.
+		tracker := cl.ipTracker
+		tracker.mu.RLock()
+		if tracker.node != nil {
+			tracker.node.mu.Lock()
+		}
+		for ip := range tracker.connections {
+			if count := tracker.countLocked(ip); count > 0 {
+				stats.IPConnections[ip] = int64(count)
 			}
 		}
-		cl.ipTracker.mu.RUnlock()
+		if tracker.node != nil {
+			for ip := range tracker.node.counts {
+				if count := tracker.countLocked(ip); count > 0 {
+					stats.IPConnections[ip] = int64(count)
+				}
+			}
+			tracker.node.mu.Unlock()
+		}
+		tracker.mu.RUnlock()
 	} else {
 		// Local mode: get local IP counts from map
 		cl.perIPConnections.Range(func(key, value interface{}) bool {

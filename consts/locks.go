@@ -9,8 +9,9 @@ package consts
 const SoraAdvisoryLockID = 42734581 // A randomly chosen integer
 
 // SoraMigrationLeaderLockID is a unique integer used for a PostgreSQL advisory lock
-// exclusively meant for deterministic migration leader election on startup. It is
-// taken transaction-scoped inside a db.AdvisoryLockTx.
+// held by whoever runs migrations: the leader elected among starting instances, and
+// sora-admin migrate up/down/force. It is taken transaction-scoped inside a
+// db.AdvisoryLockTx.
 const SoraMigrationLeaderLockID = SoraAdvisoryLockID + 1
 
 // SoraFTSOrphanSweepLockClassID is the class ID used for transaction-scoped advisory locks
@@ -24,3 +25,8 @@ const SoraVacationClaimLockClassID = int32(0x56414341) // "VACA"
 // SoraMailboxACLLockClassID is the class ID of the transaction-scoped advisory lock,
 // keyed by hashint8(mailbox_id), that serialises every ACL write on a mailbox.
 const SoraMailboxACLLockClassID = int32(0x41434C31) // "ACL1" in hex = 1094929457
+
+// SoraContentRekeyLockClassID is the class ID of the transaction-scoped advisory lock,
+// keyed by hashint8(account_id), that sora-admin import rekey (db.RekeyContentHash) takes
+// exclusively and COPY and MOVE take shared for the accounts whose rows they copy.
+const SoraContentRekeyLockClassID = int32(0x524B4559) // "RKEY" in hex = 1380664665

@@ -2,6 +2,7 @@ package config
 
 import (
 	"reflect"
+	"slices"
 	"strings"
 )
 
@@ -13,12 +14,44 @@ import (
 // command_timeout set changes timeouts.command_timeout and nothing else. A list, or an
 // array of tables such as client_filters, is one setting.
 func (s *ServerConfig) RestartRequiredChanges(next ServerConfig, reloadable []string) []string {
+	return changedSettings(reflect.ValueOf(*s), reflect.ValueOf(next), reloadable)
+}
+
+// ServerConfigKeys lists every setting RestartRequiredChanges can name, in the order
+// it names them.
+func ServerConfigKeys() []string {
+	return settingKeys(reflect.ValueOf(ServerConfig{}))
+}
+
+// serverBlocksKey is the key of the [[server]] blocks in Config.
+const serverBlocksKey = "server"
+
+// RestartRequiredChanges names the global settings that differ between c, the config
+// the process started with, and next, the one a reload read, less reloadable, the
+// settings a reload applies. Names are TOML keys as ServerConfig.RestartRequiredChanges
+// gives them ("relay.smtp_host"); a top-level key and an array of tables are one setting
+// each ("bcrypt_cost", "pool"). The [[server]] blocks are left out: each is compared
+// on its own, against the server that runs it.
+func (c *Config) RestartRequiredChanges(next *Config, reloadable []string) []string {
+	return changedSettings(reflect.ValueOf(*c), reflect.ValueOf(*next), append(slices.Clip(reloadable), serverBlocksKey))
+}
+
+// GlobalConfigKeys lists every setting Config.RestartRequiredChanges can name, in the
+// order it names them.
+func GlobalConfigKeys() []string {
+	keys := settingKeys(reflect.ValueOf(Config{}))
+	return slices.DeleteFunc(keys, func(key string) bool { return key == serverBlocksKey })
+}
+
+// changedSettings names the leaf settings that differ between a and b, two values of
+// one struct type, less reloadable.
+func changedSettings(a, b reflect.Value, reloadable []string) []string {
 	applied := make(map[string]bool, len(reloadable))
 	for _, key := range reloadable {
 		applied[key] = true
 	}
 	var changed []string
-	walkTOMLKeys("", reflect.ValueOf(*s), reflect.ValueOf(next), func(key string, was, now reflect.Value) {
+	walkTOMLKeys("", a, b, func(key string, was, now reflect.Value) {
 		if !applied[key] && !reflect.DeepEqual(was.Interface(), now.Interface()) {
 			changed = append(changed, key)
 		}
@@ -26,12 +59,10 @@ func (s *ServerConfig) RestartRequiredChanges(next ServerConfig, reloadable []st
 	return changed
 }
 
-// ServerConfigKeys lists every setting RestartRequiredChanges can name, in the order
-// it names them.
-func ServerConfigKeys() []string {
+// settingKeys lists the leaf settings of v's struct type.
+func settingKeys(v reflect.Value) []string {
 	var keys []string
-	zero := reflect.ValueOf(ServerConfig{})
-	walkTOMLKeys("", zero, zero, func(key string, _, _ reflect.Value) {
+	walkTOMLKeys("", v, v, func(key string, _, _ reflect.Value) {
 		keys = append(keys, key)
 	})
 	return keys

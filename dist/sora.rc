@@ -5,7 +5,11 @@
 # Enable:  sysrc sora_enable=YES
 # Start:   service sora start
 # Reload:  service sora reload  (sends SIGHUP for config reload)
-# Logs:    tail -f /var/log/sora/sora.log
+# Logs:    tail -f /var/log/sora/sora.log  ([logging] output = "/var/log/sora/sora.log";
+#          with the default output, stderr, they go to /var/log/sora/sora.out)
+# Rotate:  newsyslog.conf(5); its SIGHUP makes daemon(8) reopen sora.out, sora reopen sora.log:
+#          /var/log/sora/sora.out            600  7  *  @T00  J  /var/run/sora_daemon.pid
+#          /var/log/sora/sora.log  sora:sora 640  7  *  @T00  J  /var/run/sora.pid
 
 # PROVIDE: sora
 # REQUIRE: LOGIN networking postgresql
@@ -24,21 +28,41 @@ load_rc_config $name
 : ${sora_config:="/usr/local/etc/sora/config.toml"}
 : ${sora_logdir:="/var/log/sora"}
 : ${sora_spooldir:="/var/spool/sora"}
+: ${sora_cachedir:="/var/cache/sora"}
+: ${sora_statedir:="/var/lib/sora"}
 
+# sora stays in the foreground and writes no pidfile. daemon(8) detaches it, writes its
+# PID to ${pidfile} (which status, stop and reload use; procname matches it), sends its
+# output to sora.out and runs it as ${sora_user}. daemon's own PID goes to
+# ${supervisor_pidfile}, so newsyslog can signal it to reopen sora.out (-H).
 pidfile="/var/run/${name}.pid"
-command="/usr/local/bin/sora"
-command_args="--config ${sora_config}"
+supervisor_pidfile="/var/run/${name}_daemon.pid"
+procname="${sora_program:-/usr/local/bin/sora}"
+command="/usr/sbin/daemon"
+command_args="-f -p ${pidfile} -P ${supervisor_pidfile} -u ${sora_user} -H -o ${sora_logdir}/sora.out ${procname} --config ${sora_config}"
 
-# SIGHUP triggers config reload
+# SIGHUP triggers config reload. rc.subr provides reload only when extra_commands lists it.
+extra_commands="reload"
 sig_reload="HUP"
 
 start_precmd="sora_precmd"
 
 sora_precmd()
 {
-    # Ensure required directories exist
-    install -d -o ${sora_user} -g ${sora_group} -m 750 ${sora_logdir}
-    install -d -o ${sora_user} -g ${sora_group} -m 750 ${sora_spooldir}
+    # Ensure required directories exist. sora runs as ${sora_runas} and cannot create
+    # them under /var itself. The defaults: [uploader] and [relay.queue] path under the
+    # spool, [local_cache] and [auth_cache] path under the cache, TLS fallback_dir under
+    # the state directory.
+    install -d -o ${sora_runas} -g ${sora_group} -m 750 ${sora_logdir}
+    install -d -o ${sora_runas} -g ${sora_group} -m 750 ${sora_spooldir}
+    install -d -o ${sora_runas} -g ${sora_group} -m 750 ${sora_cachedir}
+    install -d -o ${sora_runas} -g ${sora_group} -m 750 ${sora_statedir}
 }
+
+# daemon(8) changes to sora_user itself (-u), and must start as root to write ${pidfile}.
+# With sora_user set, rc.subr would start it through su(1) as that user instead.
+# sora_program names the sora binary (procname); rc.subr would run it in place of daemon.
+sora_runas=${sora_user}
+unset sora_user sora_program
 
 run_rc_command "$1"

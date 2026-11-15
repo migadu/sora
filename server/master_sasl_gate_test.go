@@ -1,7 +1,10 @@
 package server
 
 import (
+	"context"
+	"fmt"
 	"net"
+	"reflect"
 	"testing"
 )
 
@@ -101,5 +104,53 @@ func TestMasterSASLNetworkGate_Equal(t *testing.T) {
 	}
 	if a.Equal(empty1) {
 		t.Error("enforcing gate should not equal a disabled gate")
+	}
+}
+
+// recordOnlyLimiter records RecordAuthAttemptWithProxy calls; any other method panics
+// (nil embedded interface), which keeps AdmitMasterLogin from calling anything else.
+type recordOnlyLimiter struct {
+	AuthLimiter
+	records []string
+}
+
+func (r *recordOnlyLimiter) RecordAuthAttemptWithProxy(_ context.Context, _ net.Conn, _ *ProxyProtocolInfo, key string, success bool) {
+	r.records = append(r.records, fmt.Sprintf("%s:%v", key, success))
+}
+
+func TestAdmitMasterLogin(t *testing.T) {
+	gate, err := NewMasterSASLNetworkGate([]string{"10.0.0.0/24"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Session{Protocol: "test"}
+	inside := &mockAddrConn{remote: tcpAddr("10.0.0.5")}
+	outside := &mockAddrConn{remote: tcpAddr("203.0.113.7")}
+	ctx := context.Background()
+
+	limiter := &recordOnlyLimiter{}
+	if !s.AdmitMasterLogin(ctx, gate, limiter, inside, nil, "master:admin", "master username") {
+		t.Fatal("a peer inside the gate was refused")
+	}
+	if len(limiter.records) != 0 {
+		t.Fatalf("an admitted login recorded %v; its outcome is the caller's to record", limiter.records)
+	}
+
+	if s.AdmitMasterLogin(ctx, gate, limiter, outside, nil, "master:admin", "master username") {
+		t.Fatal("a peer outside the gate was admitted")
+	}
+	if want := []string{"master:admin:false"}; !reflect.DeepEqual(limiter.records, want) {
+		t.Fatalf("refusal recorded %v, want %v (one failure under the master credential's key)", limiter.records, want)
+	}
+
+	// No limiter configured: still refused, nothing to record.
+	if s.AdmitMasterLogin(ctx, gate, nil, outside, nil, "master:admin", "master SASL") {
+		t.Fatal("a peer outside the gate was admitted without a limiter")
+	}
+
+	// A disabled gate admits everyone.
+	open, _ := NewMasterSASLNetworkGate(nil)
+	if !s.AdmitMasterLogin(ctx, open, limiter, outside, nil, "master:admin", "master SASL") {
+		t.Fatal("a disabled gate refused a login")
 	}
 }

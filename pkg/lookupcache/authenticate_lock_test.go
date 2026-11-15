@@ -21,7 +21,7 @@ func withVerifyPassword(t *testing.T, fn func(hashedPassword, password string) e
 // RWMutex parks new readers behind a waiting writer - convoying the entire auth
 // path on exactly the reconnect storm this cache exists to absorb.
 func TestAuthenticateReleasesLockDuringVerify(t *testing.T) {
-	cache := New(time.Minute, time.Minute, 100, time.Minute, time.Minute)
+	cache := New("test", "test", time.Minute, time.Minute, 100, time.Minute, time.Minute)
 	t.Cleanup(func() { _ = cache.Stop(context.Background()) })
 
 	const (
@@ -94,7 +94,7 @@ func TestAuthenticateSucceedsOnFreshEntry(t *testing.T) {
 	)
 
 	t.Run("verify ok", func(t *testing.T) {
-		cache := New(time.Minute, time.Minute, 100, time.Minute, time.Minute)
+		cache := New("test", "test", time.Minute, time.Minute, 100, time.Minute, time.Minute)
 		t.Cleanup(func() { _ = cache.Stop(context.Background()) })
 		withVerifyPassword(t, func(hashedPassword, pw string) error {
 			if hashedPassword != "cached-hash" || pw != password {
@@ -118,7 +118,7 @@ func TestAuthenticateSucceedsOnFreshEntry(t *testing.T) {
 	})
 
 	t.Run("verify fails invalidates", func(t *testing.T) {
-		cache := New(time.Minute, time.Minute, 100, time.Minute, time.Minute)
+		cache := New("test", "test", time.Minute, time.Minute, 100, time.Minute, time.Minute)
 		t.Cleanup(func() { _ = cache.Stop(context.Background()) })
 		withVerifyPassword(t, func(hashedPassword, pw string) error {
 			return context.DeadlineExceeded // any verification failure
