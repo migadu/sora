@@ -221,7 +221,7 @@ func TestS3ImportScanStopsOnInterrupt(t *testing.T) {
 			cancel()
 		}
 	}
-	si, err := NewS3Importer(ctx, nil, s3storage, S3ImporterOptions{Email: s3ImportTestEmail, BatchSize: 1000, CleanupDB: true})
+	si, err := NewS3Importer(ctx, nil, s3storage, S3ImporterOptions{Email: s3ImportTestEmail, Workers: 1, BatchSize: 1000, CleanupDB: true})
 	require.NoError(t, err)
 	defer si.Close()
 
@@ -252,7 +252,7 @@ func TestS3ImportDryRunStopsOnInterruptAndLookupErrors(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		si, err := NewS3Importer(ctx, nil, s3storage, S3ImporterOptions{Email: s3ImportTestEmail, DryRun: true,
-			BatchSize: 1000, CleanupDB: true})
+			Workers: 1, BatchSize: 1000, CleanupDB: true})
 		require.NoError(t, err)
 		si.rdb = &s3ImportTestDB{exists: func(ctx context.Context, count *int) error { return exists(ctx, cancel, count) }}
 		return runS3Import(t, si)

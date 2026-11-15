@@ -70,6 +70,10 @@ type Exporter struct {
 
 // NewExporter creates a new Exporter instance.
 func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ExporterOptions) (*Exporter, error) {
+	// The export runs on exactly this many workers: with none it would write nothing.
+	if jobs < 1 {
+		return nil, fmt.Errorf("jobs must be at least 1, got %d", jobs)
+	}
 	// Ensure maildir path exists
 	if err := os.MkdirAll(maildirPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create maildir path: %w", err)

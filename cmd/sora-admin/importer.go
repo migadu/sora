@@ -142,6 +142,10 @@ type Importer struct {
 	s3          objectStorage
 	options     ImporterOptions
 
+	// user is the account the import is for. Run looks it up once (lookupAccount),
+	// before it scans or uploads anything, and every step uses it from there.
+	user *server.User
+
 	totalMessages    int64
 	importedMessages int64
 	skippedMessages  int64
@@ -182,6 +186,10 @@ const maildirCacheParams = "_journal_mode=WAL&_busy_timeout=5000&_synchronous=NO
 
 // NewImporter creates a new Importer instance.
 func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ImporterOptions) (*Importer, error) {
+	// The import runs on exactly this many workers: with none it would never drain its queue.
+	if jobs < 1 {
+		return nil, fmt.Errorf("jobs must be at least 1, got %d", jobs)
+	}
 	// Always create SQLite database in the maildir path to persist maildir state
 	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
 
@@ -376,20 +384,7 @@ const recoveryHashBatchSize = 500
 //
 // Recovery: Reset s3_uploaded=0 for messages not found in PostgreSQL
 func (i *Importer) recoverOrphanedSQLiteState() error {
-	// Get account info
-	address, err := server.NewAddress(i.email)
-	if err != nil {
-		return fmt.Errorf("invalid email: %w", err)
-	}
-
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
-	if err != nil {
-		// Account doesn't exist yet - nothing to recover
-		if errors.Is(err, consts.ErrUserNotFound) {
-			return nil
-		}
-		return fmt.Errorf("failed to get account: %w", err)
-	}
+	accountID := i.user.AccountID()
 
 	// Query SQLite for ALL messages marked as uploaded. Any row left marked
 	// uploaded is skipped forever by incremental imports, so the check must not
@@ -478,6 +473,12 @@ func (i *Importer) Run() (err error) {
 		}
 		i.finish(err)
 	}()
+
+	// The account first: an import for an address without one would otherwise scan
+	// the maildir and upload every message to S3, only to fail each at its insert.
+	if err := i.lookupAccount(); err != nil {
+		return err
+	}
 
 	// Recovery: Check for messages marked in SQLite but not in PostgreSQL
 	// This can happen if PostgreSQL commit failed after SQLite update
@@ -591,6 +592,20 @@ func accountLookupError(email string, err error) error {
 	return fmt.Errorf("failed to look up account %s: %w", email, err)
 }
 
+// lookupAccount looks up the account the import is for and keeps it on the importer.
+func (i *Importer) lookupAccount() error {
+	address, err := server.NewAddress(i.email)
+	if err != nil {
+		return fmt.Errorf("invalid email address: %w", err)
+	}
+	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
+	if err != nil {
+		return accountLookupError(i.email, err)
+	}
+	i.user = server.NewUser(address, accountID)
+	return nil
+}
+
 // processSubscriptions reads and processes the Dovecot subscriptions file
 func (i *Importer) processSubscriptions() error {
 	subscriptionsPath := filepath.Join(i.maildirPath, "subscriptions")
@@ -617,17 +632,7 @@ func (i *Importer) processSubscriptions() error {
 
 	logger.Info("Found subscribed folders", "count", len(folders), "folders", folders)
 
-	// Get user context for database operations
-	address, err := server.NewAddress(i.email)
-	if err != nil {
-		return fmt.Errorf("invalid email address: %w", err)
-	}
-
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
-	if err != nil {
-		return accountLookupError(i.email, err)
-	}
-	user := server.NewUser(address, accountID)
+	user := i.user
 
 	// Ensure default mailboxes exist first
 	if i.options.DryRun {
@@ -700,17 +705,7 @@ func (i *Importer) importSieveScript() error {
 
 	logger.Info("Importing Sieve script", "path", i.options.SievePath)
 
-	// Get user context for database operations
-	address, err := server.NewAddress(i.email)
-	if err != nil {
-		return fmt.Errorf("invalid email address: %w", err)
-	}
-
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
-	if err != nil {
-		return accountLookupError(i.email, err)
-	}
-	user := server.NewUser(address, accountID)
+	user := i.user
 
 	scriptName := "imported"
 	if compileErr != nil {
@@ -815,16 +810,7 @@ func (i *Importer) parseDovecotKeywords() error {
 func (i *Importer) performDryRun() error {
 	fmt.Printf("\n=== DRY RUN: Import Analysis ===\n\n")
 
-	address, err := server.NewAddress(i.email)
-	if err != nil {
-		return fmt.Errorf("invalid email address: %w", err)
-	}
-
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
-	if err != nil {
-		return accountLookupError(i.email, err)
-	}
-	user := server.NewUser(address, accountID)
+	user := i.user
 
 	// Query the SQLite database for messages
 	var query string
@@ -1372,6 +1358,16 @@ func isMaildirFolder(path string) bool {
 	return true
 }
 
+// isMaildirMessageDir reports whether name is one of a maildir folder's message
+// directories, which hold message files and never a folder.
+func isMaildirMessageDir(name string) bool {
+	switch name {
+	case "cur", "new", "tmp":
+		return true
+	}
+	return false
+}
+
 // fileToProcess is a struct to send file info to worker goroutines for processing.
 type fileToProcess struct {
 	path        string
@@ -1415,6 +1411,16 @@ func (i *Importer) scanMaildir() error {
 		}
 
 		return fmt.Errorf("path '%s' is not a valid maildir root (must contain cur/ or new/)", cleanPath)
+	}
+
+	// filepath.Walk lstats its root and never follows a symbolic link, so a path that
+	// is a link to a maildir (accepted above: isMaildirFolder stats through it) was
+	// walked as a file and the run imported nothing. The walk starts at the directory
+	// the path names and reports every path below the path given, which mailbox names,
+	// keywords and uidlists are resolved against.
+	walkRoot, err := filepath.EvalSymlinks(cleanPath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve maildir path %s: %w", cleanPath, err)
 	}
 
 	// --- Parallel Processing Setup ---
@@ -1487,7 +1493,7 @@ func (i *Importer) scanMaildir() error {
 	if i.options.PathsFile != "" {
 		walkErr = i.processPathsFile(cleanPath, filesToProcess)
 	} else {
-		walkErr = filepath.Walk(cleanPath, func(path string, info os.FileInfo, err error) error {
+		walkErr = filepath.Walk(walkRoot, func(walked string, info os.FileInfo, err error) error {
 			select {
 			case <-i.ctx.Done():
 				return i.ctx.Err() // Stop walking if context is cancelled.
@@ -1495,6 +1501,34 @@ func (i *Importer) scanMaildir() error {
 			}
 			if err != nil {
 				return err
+			}
+			rel, err := filepath.Rel(walkRoot, walked)
+			if err != nil {
+				return fmt.Errorf("could not get relative path for %s: %w", walked, err)
+			}
+			path := filepath.Join(cleanPath, rel)
+
+			// A folder below the root that is a symbolic link is not followed either: a
+			// link to a folder of the same maildir is an alias (dsync skips those too),
+			// and one pointing elsewhere would have the import read outside the path it
+			// was given. It is named, so its mail is never left out without a word; so is
+			// a link whose target cannot be read (a volume that is not mounted), which
+			// may be a folder too. cur/, new/ and tmp/ and the message files in them are
+			// not folders: they are read through a link (os.ReadDir, hashFile below), and
+			// a message that cannot be read is refused by path.
+			if info.Mode()&os.ModeSymlink != 0 {
+				parent := filepath.Dir(walked)
+				// The root itself may be named cur, new or tmp; only a message
+				// directory below it makes this entry a message rather than a folder.
+				inMessageDir := parent != walkRoot && isMaildirMessageDir(filepath.Base(parent))
+				if !isMaildirMessageDir(info.Name()) && !inMessageDir {
+					if target, statErr := os.Stat(walked); statErr != nil {
+						logger.Warn("Skipping maildir entry: it is a symbolic link whose target cannot be read", "path", path, "error", statErr)
+					} else if target.IsDir() {
+						logger.Warn("Skipping maildir folder: it is a symbolic link, which the import does not follow", "path", path)
+					}
+				}
+				return nil
 			}
 
 			// We are looking for directories that are maildir folders.
@@ -1588,16 +1622,7 @@ func (i *Importer) scanMaildir() error {
 
 // syncMailboxState ensures mailboxes exist and have correct UIDVALIDITY
 func (i *Importer) syncMailboxState() error {
-	address, err := server.NewAddress(i.email)
-	if err != nil {
-		return fmt.Errorf("invalid email: %w", err)
-	}
-
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
-	if err != nil {
-		return fmt.Errorf("failed to get account: %w", err)
-	}
-	user := server.NewUser(address, accountID)
+	user := i.user
 
 	for path, uidList := range i.dovecotUIDLists {
 		if uidList == nil {
@@ -2195,21 +2220,11 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 // insertBatchToDB inserts all uploaded messages in a batch
 // It groups messages by mailbox and uses the highly-optimized InsertMessagesFromImporterBatchWithRetry
 //
-// It returns an error only before it stores anything, or when the import is
-// interrupted (i.ctx cancelled): it then stops and returns the messages committed
-// before the interrupt along with the error, and leaves the rest uncounted.
+// It returns an error only when the import is interrupted (i.ctx cancelled): it then
+// stops and returns the messages committed before the interrupt along with the
+// error, and leaves the rest uncounted.
 func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, error) {
-	// Get user info once
-	address, err := server.NewAddress(i.email)
-	if err != nil {
-		return nil, fmt.Errorf("invalid email address format: %w", err)
-	}
-
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
-	if err != nil {
-		return nil, fmt.Errorf("failed to look up account: %w", err)
-	}
-	user := server.NewUser(address, accountID)
+	user := i.user
 
 	var successHashes []markedMessage
 
@@ -2238,8 +2253,8 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 		opt := &db.InsertMessageOptions{
 			AccountID:            user.AccountID(),
 			MailboxID:            mailbox.ID,
-			S3Domain:             address.Domain(),
-			S3Localpart:          address.LocalPart(),
+			S3Domain:             user.Domain(),
+			S3Localpart:          user.LocalPart(),
 			MailboxName:          mailbox.Name,
 			ContentHash:          up.msg.hash,
 			MessageID:            up.metadata.messageID,
@@ -2360,17 +2375,7 @@ func (e *batchUIDConflictError) Unwrap() error { return e.err }
 // insertBatchToDBWithTransaction inserts all uploaded messages in a SINGLE transaction
 // This is faster (20x) but less resilient - if one message fails, entire batch rolls back
 func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]markedMessage, error) {
-	// Get user info once
-	address, err := server.NewAddress(i.email)
-	if err != nil {
-		return nil, fmt.Errorf("invalid email address format: %w", err)
-	}
-
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
-	if err != nil {
-		return nil, fmt.Errorf("failed to look up account: %w", err)
-	}
-	user := server.NewUser(address, accountID)
+	user := i.user
 
 	var successHashes []markedMessage
 
@@ -2406,8 +2411,8 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 		_, _, err = database.InsertMessageFromImporter(i.ctx, tx, &db.InsertMessageOptions{
 			AccountID:            user.AccountID(),
 			MailboxID:            mailbox.ID,
-			S3Domain:             address.Domain(),
-			S3Localpart:          address.LocalPart(),
+			S3Domain:             user.Domain(),
+			S3Localpart:          user.LocalPart(),
 			MailboxName:          mailbox.Name,
 			ContentHash:          up.msg.hash,
 			MessageID:            up.metadata.messageID,
@@ -2471,14 +2476,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 			"error", err, "batch_size", len(successHashes))
 
 		// Attempt to delete the just-inserted messages from PostgreSQL
-		accountID, accErr := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, i.email)
-		if accErr != nil {
-			logger.Error("CRITICAL: Failed to get account ID for rollback - messages orphaned in PostgreSQL",
-				"error", accErr, "original_error", err, "batch_size", len(successHashes))
-			return nil, fmt.Errorf("failed to update SQLite cache and cannot rollback (messages orphaned): %w", err)
-		}
-
-		if rollbackErr := i.rollbackBatchFromPostgreSQL(accountID, successList); rollbackErr != nil {
+		if rollbackErr := i.rollbackBatchFromPostgreSQL(user.AccountID(), successList); rollbackErr != nil {
 			// Both SQLite update AND compensation failed - messages are in PG only
 			// Recovery mechanism will NOT fix this (it only resets SQLite orphans)
 			logger.Error("CRITICAL: Rollback compensation failed - messages orphaned in PostgreSQL",
@@ -2662,20 +2660,9 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 		// Safe path: Individual transactions per message (more resilient)
 		// Need to update SQLite after since each message commits individually
 		logger.Info("Using individual transaction mode")
+		// insertBatchToDB fails only on an interrupt, and successHashes then holds
+		// the messages committed before it: they are marked like any others.
 		successHashes, err = i.insertBatchToDB(uploaded)
-		if err != nil && i.ctx.Err() == nil {
-			// Unless interrupted, insertBatchToDB fails only before it stores
-			// anything (address or account lookup), so none of the batch was imported.
-			logger.Error("DB inserts failed", "error", err)
-			for _, up := range uploaded {
-				i.recordFailedPath(up.msg.path, fmt.Sprintf("db insert error: %v", err))
-			}
-			atomic.AddInt64(&i.failedMessages, int64(len(uploaded)))
-			return err
-		}
-
-		// After an interrupt err is set, and successHashes holds the messages
-		// committed before it: they are marked like any others.
 		logger.Info("DB inserts complete, marking in SQLite", "count", len(successHashes))
 
 		// Phase 3: Mark successful messages in SQLite cache
@@ -2696,7 +2683,7 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 			// the batch did not store is not a failure: its cache rows stay unmarked,
 			// pending for the next run, and importMessages reports the interruption.
 			// The batch returns the interruption, not the error of the call it cut
-			// short ("failed to look up account: ... context canceled").
+			// short ("failed to begin transaction: context canceled").
 			atomic.AddInt64(&i.importedMessages, int64(len(successHashes)))
 			logger.Info("Import interrupted, rest of the batch left for the next run",
 				"imported", len(successHashes), "batch_size", len(batch))

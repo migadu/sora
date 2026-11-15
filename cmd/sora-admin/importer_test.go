@@ -351,6 +351,7 @@ func TestProcessBatch_DBInsertFailure(t *testing.T) {
 		require.NoError(t, err)
 
 		// --- Act ---
+		require.NoError(t, importer.lookupAccount())
 		processErr := importer.processBatch(batch)
 
 		// --- Assert ---

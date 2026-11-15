@@ -116,6 +116,7 @@ func TestImportRefusesAFileGrownAboveTheLimitSinceTheScan(t *testing.T) {
 	grownPath := filepath.Join(maildirPath, "cur", "1700000002.M2P1.host:2,S")
 
 	importer := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), ImporterOptions{MaxMessageSize: limit})
+	require.NoError(t, importer.lookupAccount())
 	require.NoError(t, importer.scanMaildir())
 	require.NoError(t, os.WriteFile(grownPath, cachedSizeMessage("Grown", 2*limit), 0644))
 
