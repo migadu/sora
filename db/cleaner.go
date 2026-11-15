@@ -1051,7 +1051,10 @@ func (d *Database) ListSoftDeletedMailboxes(ctx context.Context, gracePeriod tim
 // The cleaner does not use this: a batch is O(messages) against a fixed write deadline,
 // and it rolls back whole, so one large account would be retried every cycle and never
 // progress. It runs HardDeleteAccountStep instead. This stays for callers that know the
-// accounts are small, and for tests.
+// accounts are small, and for tests. Callers must quiesce the soft-deleted accounts:
+// this legacy bulk API does not lock or re-check account rows, or serialize an
+// account restoration or already-admitted restore/new-mailbox work. The production
+// cleaner uses HardDeleteAccountStep, which locks and re-checks the account.
 func (d *Database) HardDeleteAccounts(ctx context.Context, tx pgx.Tx, accountIDs []int64) error {
 	if len(accountIDs) == 0 {
 		return nil
@@ -1176,10 +1179,11 @@ func (d *Database) HardDeleteAccountStep(ctx context.Context, tx pgx.Tx, account
 // pass, the order every other path locks in: locking the other accounts' mailboxes after
 // the owned ones could deadlock against those paths.
 //
-// The expunge that follows takes every live message of the accounts without a mailbox
-// filter. None can appear outside the locked set in between: COPY and a MOVE into another
-// mailbox give the new row the destination's owner, a MOVE within a mailbox stays in a
-// locked one, and restore refuses a soft-deleted account.
+// For the intended quiesced, soft-deleted callers, the expunge that follows takes
+// every live message of the accounts: COPY and cross-mailbox MOVE give the new row
+// the destination's owner, same-mailbox MOVE stays in a locked mailbox, and restore
+// refuses a soft-deleted account. The bulk caller must prevent account restoration
+// or already-admitted restore/new-mailbox work; this helper does not lock account rows.
 func lockAccountMailboxes(ctx context.Context, tx pgx.Tx, accountIDs []int64) error {
 	rows, err := tx.Query(ctx, `
 		SELECT id FROM mailboxes WHERE account_id = ANY($1)
