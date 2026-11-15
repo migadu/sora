@@ -164,12 +164,12 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// User.Address should always be the primary address
 					primaryAddr, primErr := s.server.rdb.GetPrimaryEmailForAccountWithRetry(s.ctx, AccountID)
 					if primErr != nil {
-						return s.internalError("failed to get primary email: %v", primErr)
+						return s.loginSetupError("failed to get primary email", address.BaseAddress(), "master", primErr)
 					}
 
 					// Ensure default mailboxes for the impersonated user
 					if dbErr := s.createDefaultMailboxes(s.ctx, AccountID); dbErr != nil {
-						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
+						return s.loginSetupError("failed to prepare impersonated user session", address.BaseAddress(), "master", dbErr)
 					}
 
 					return s.completeAuthentication(AccountID, address, primaryAddr, "master", authStart, false)
@@ -270,12 +270,12 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// User.Address should always be the primary address
 					primaryAddr, primErr := s.server.rdb.GetPrimaryEmailForAccountWithRetry(s.ctx, AccountID)
 					if primErr != nil {
-						return s.internalError("failed to get primary email: %v", primErr)
+						return s.loginSetupError("failed to get primary email", address.BaseAddress(), "master", primErr)
 					}
 
 					// Ensure default mailboxes for the impersonated user
 					if dbErr := s.createDefaultMailboxes(s.ctx, AccountID); dbErr != nil {
-						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
+						return s.loginSetupError("failed to prepare impersonated user session", address.BaseAddress(), "master", dbErr)
 					}
 
 					return s.completeAuthentication(AccountID, address, primaryAddr, "master", authStart, false)

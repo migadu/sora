@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -415,7 +414,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	}
 
 	s := smtp.NewServer(backend)
-	s.ErrorLog = log.New(logger.Stderr(), "smtp/server ", log.LstdFlags)
+	s.ErrorLog = smtpErrorLog{name: name}
 	s.Addr = addr
 	s.Domain = hostname
 	// Seed every connection's context (smtp.Conn.Context) from the application
@@ -624,9 +623,13 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	// Initialize the mutex helper
 	s.mutexHelper = server.NewMutexTimeoutHelper(&s.mutex, sessionCtx, "lmtp", logFunc)
 
-	// Log connection with connection counters
-	activeCount := b.activeConnections.Load()
-	s.InfoLog("new session", "id", s.Id, "active_count", activeCount)
+	// Log connection with connection counters, and the session an lmtp_proxy's PROXY v2
+	// header names (TLV 0xE1): it leads from the proxy's session=<id> to this session.
+	keyvals := []any{"id", s.Id, "active_count", b.activeConnections.Load()}
+	if proxyInfo != nil && proxyInfo.ProxySessionID != "" {
+		keyvals = append(keyvals, "proxy_session", proxyInfo.ProxySessionID)
+	}
+	s.InfoLog("new session", keyvals...)
 
 	return s, nil
 }

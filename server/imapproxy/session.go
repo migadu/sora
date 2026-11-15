@@ -98,7 +98,7 @@ func newSession(s *Server, conn net.Conn) *Session {
 		startTime:    time.Now(),
 		// Generate the session id once, up front, so every log line for this
 		// connection carries it. It's also forwarded to the backend (PROXY v2 TLV /
-		// XCLIENT) and logged there as proxy_session for end-to-end tracing.
+		// ID command) and logged there as proxy_session for end-to-end tracing.
 		sessionID: idgen.New(),
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -26,24 +25,8 @@ type interruptingDB struct {
 	cancel context.CancelFunc
 	at     string
 
-	mu             sync.Mutex
-	accountLookups int
-	singleInserts  int
-}
-
-func (m *interruptingDB) GetAccountIDByAddressWithRetry(ctx context.Context, address string) (int64, error) {
-	m.mu.Lock()
-	m.accountLookups++
-	n := m.accountLookups
-	m.mu.Unlock()
-	// The first lookup is Run's orphan recovery, before any batch.
-	if m.at == "account lookup" && n > 1 {
-		m.cancel()
-	}
-	if err := ctx.Err(); err != nil {
-		return 0, fmt.Errorf("database error fetching account ID: %w", err)
-	}
-	return m.mockResilientDatabase.GetAccountIDByAddressWithRetry(ctx, address)
+	mu            sync.Mutex
+	singleInserts int
 }
 
 func (m *interruptingDB) GetOrCreateMailboxByNameWithRetry(ctx context.Context, accountID int64, name string) (*db.DBMailbox, error) {
@@ -131,8 +114,8 @@ func newTwoMailboxMaildir(t *testing.T) string {
 
 // An interrupt keeps the rest of the batch from being stored; it does not make those
 // messages fail. They stay pending (their cache rows unmarked) for the next run, and
-// are neither counted as failed nor listed with an upload, mailbox, "account not
-// found" or insert error, and the interrupt is not logged as a warning or an error.
+// are neither counted as failed nor listed with an upload, mailbox or insert error,
+// and the interrupt is not logged as a warning or an error.
 // What committed before the interrupt is imported and marked.
 func TestImportInterruptLeavesUnstoredMessagesPending(t *testing.T) {
 	cases := []struct {
@@ -144,7 +127,6 @@ func TestImportInterruptLeavesUnstoredMessagesPending(t *testing.T) {
 		singleTries int    // per-message inserts attempted
 	}{
 		{name: "during the uploads", at: "upload"},
-		{name: "at the insert phase's account lookup", at: "account lookup"},
 		{name: "at the mailbox lookup", at: "mailbox"},
 		{name: "after the first mailbox's batch insert", at: "batch insert", committed: 1},
 		// The second attempt is the one that sees the interrupt.
