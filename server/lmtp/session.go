@@ -1012,6 +1012,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		s.WarnLog(fmt.Sprintf(format, args...))
 	})
 	if resolveErr != nil {
+		recordMetrics("failure")
 		return s.InternalError("failed to resolve Sieve destinations: %v", resolveErr)
 	}
 	mailboxNames := make([]string, 0, len(resolvedDestinations))
