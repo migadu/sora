@@ -621,10 +621,17 @@ A remote lookup `server` given as a hostname is resolved when it is dialed.
 
 ### 7.3 Connect timeouts
 
-`connect_timeout` (default `30s`) limits one TCP connect and the TLS handshake. Because a login may
-try the preferred backend and then fall back, the whole attempt gets
-`connect_timeout × min(number of backends + 1, 3)` (90 seconds with the default). A backend that
-drops packets cannot use up the time of every fallback.
+`connect_timeout` (default `30s`) limits each TCP connect and each implicit-TLS handshake.
+The IMAP and ManageSieve proxies put an overall deadline around a connection attempt, so a dead
+pool cannot take one timeout per backend. One attempt's budget is `connect_timeout`, doubled
+when the manager or any named pool uses implicit TLS. With `n = number of backends + 1` (the
+preferred backend plus fallbacks), the overall budget is `min(n + 0.5, 4)` times that per-attempt
+budget. The extra half attempt allows scheduling and teardown between dials. At the default,
+the cap is 120 seconds for plaintext and 240 seconds for implicit TLS.
+
+A caller cancellation or a shorter caller deadline is not charged to backend health. A phase
+that was allowed its full `connect_timeout` and failed counts even when the process resumes
+after the overall deadline has also elapsed.
 
 After connecting, the proxy reads the backend's greeting and does its own login within
 `connect_timeout` each. A greeting other than `* OK` (IMAP) is a failure.

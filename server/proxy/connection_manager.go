@@ -1393,9 +1393,17 @@ func (e *backendConnectTimeoutError) Error() string { return e.err.Error() }
 func (e *backendConnectTimeoutError) Unwrap() error { return e.err }
 
 func (cm *ConnectionManager) phaseExhaustedConnectTimeout(ctx context.Context, phaseStart time.Time) bool {
-	return cm.connectTimeout > 0 &&
-		time.Since(phaseStart) >= cm.connectTimeout &&
-		!errors.Is(ctx.Err(), context.Canceled)
+	if cm.connectTimeout <= 0 || time.Since(phaseStart) < cm.connectTimeout ||
+		errors.Is(ctx.Err(), context.Canceled) {
+		return false
+	}
+	// The process may resume after both timers expired. Time spent waiting to
+	// be scheduled does not give the backend a full phase when the caller's
+	// earlier deadline cut it short.
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(phaseStart.Add(cm.connectTimeout)) {
+		return false
+	}
+	return true
 }
 
 func shouldIgnoreDialFailure(ctx context.Context, err error) bool {
