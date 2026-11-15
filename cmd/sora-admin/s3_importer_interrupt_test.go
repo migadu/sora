@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -361,4 +362,27 @@ func TestS3ImportDoesNotImportWhenTheExistenceCheckFails(t *testing.T) {
 	require.Empty(t, mock.inserted, "objects whose existence check failed were imported")
 	require.Zero(t, bucket.gets, "objects whose existence check failed were read from S3")
 	require.EqualValues(t, objects, si.failedMessages)
+}
+
+// TestS3ImportInterruptIsNotAFailure: an object the interrupt stops before it is stored
+// is left for the next run, like the objects still queued and like the messages
+// `import maildir` leaves at an interrupt (#945): it is neither counted as failed nor
+// recorded in the work database as processed, with the interrupt as its error.
+func TestS3ImportInterruptIsNotAFailure(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	si, err := NewS3Importer(ctx, nil, nil, S3ImporterOptions{Email: s3ImportTestEmail, Workers: 1, CleanupDB: true})
+	require.NoError(t, err)
+	defer si.Close()
+	// The interrupt lands while the first object's "already imported?" check runs.
+	si.rdb = &s3ImportTestDB{exists: func(ctx context.Context, _ *int) error { cancel(); return ctx.Err() }}
+	insertS3Objects(t, si, "example.com", "user", 3)
+
+	err = si.importFromS3()
+	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, atomic.LoadInt64(&si.failedMessages), "an object the interrupt stopped was counted as failed")
+	var marked int
+	require.NoError(t, si.db.QueryRow(`SELECT COUNT(*) FROM s3_objects WHERE processed`).Scan(&marked))
+	require.Zero(t, marked, "an object the interrupt stopped was recorded as processed")
 }

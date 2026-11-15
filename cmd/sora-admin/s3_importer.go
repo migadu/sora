@@ -452,6 +452,13 @@ func (si *S3Importer) importFromS3() error {
 					continue // interrupted: what the feeder queued is left for the next run
 				}
 				if err := si.importS3Object(obj); err != nil {
+					if si.ctx.Err() != nil {
+						// Stopped by the interrupt, not failed: like the objects still
+						// queued, it is left for the next run.
+						logger.Info("Import interrupted, S3 object left for the next run", "worker", workerID,
+							"key", obj.Key, "error", err)
+						continue
+					}
 					logger.Info("Failed to import S3 object", "worker", workerID,
 						"progress", si.getProgressPrefix(), "key", obj.Key, "error", err)
 					atomic.AddInt64(&si.failedMessages, 1)
@@ -462,12 +469,12 @@ func (si *S3Importer) importFromS3() error {
 		}(w)
 	}
 
-	// Feed jobs to workers a page of keys at a time. A query's read transaction lasts
-	// until its rows are closed, and the feeder waits on the workers while it feeds
-	// them: a query left open for the whole run would hold the snapshot that keeps the
-	// checkpointer from ever resetting the WAL, which then grows with every worker's
-	// update. Each page is read in full, and its rows closed, before it is fed.
-	// Stop feeding on an interrupt; workers finish active stores and skip queued jobs.
+	// Feed jobs to workers a page of keys at a time, until the keys run out or the
+	// import is interrupted. A query's read transaction lasts until its rows are
+	// closed, and the feeder waits on the workers while it feeds them: a query left
+	// open for the whole run would hold the snapshot that keeps the checkpointer from
+	// ever resetting the WAL, which then grows with every worker's update. Each page is
+	// read in full, and its rows closed, before it is fed.
 	var feedErr error
 feed:
 	for afterID := int64(0); ; {
@@ -486,7 +493,6 @@ feed:
 				break feed
 			}
 		}
-
 	}
 
 	close(jobs)
@@ -497,7 +503,6 @@ feed:
 	}
 	if feedErr != nil {
 		return fmt.Errorf("failed to query unprocessed S3 objects: %w", feedErr)
-
 	}
 	return nil
 }
