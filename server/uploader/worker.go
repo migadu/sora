@@ -1845,88 +1845,84 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 		}
 	}
 
-	// Walk the upload directory tree
-	err := filepath.Walk(w.path, func(path string, info os.FileInfo, err error) error {
+	// Scan the spool, laid out as FilePath writes it: {w.path}/{account_id}/{content_hash}.
+	// os.ReadDir follows a spool path or account directory that is a symbolic link (to
+	// keep the spool on another volume), as staging and uploading do. filepath.Walk lstats
+	// every entry and never descended into one, so such a spool was never swept (#1312).
+	// Candidates are joined as FilePath joins them, not resolved: stagingPathLock and the
+	// staging count key by that string, so a resolved path would not serialize with a
+	// delivery staging the same body.
+	scan := func() error {
+		accounts, err := os.ReadDir(w.path)
 		if err != nil {
-			logger.Warn("UploaderCleanup: Error accessing path", "path", path, "error", err)
-			return nil // Continue walking despite errors
-		}
-
-		// Skip directories
-		if info.IsDir() {
+			logger.Warn("UploaderCleanup: Error accessing path", "path", w.path, "error", err)
 			return nil
 		}
-
-		// Check context cancellation
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		// Skip recently created/modified files (within grace period)
-		if info.ModTime().After(cutoffTime) {
-			return nil
-		}
-
-		filesChecked++
-
-		// Extract account ID and content hash from path
-		// Path structure: /path/to/uploads/{accountID}/{contentHash}
-		relPath, err := filepath.Rel(w.path, path)
-		if err != nil {
-			logger.Warn("UploaderCleanup: Failed to get relative path", "path", path, "error", err)
-			return nil
-		}
-
-		// Parse path components.
-		// filepath.SplitList splits on the OS list-separator (":" on Unix, ";"
-		// on Windows) - it is intended for $PATH-style strings and is wrong here.
-		// Use strings.Split with the path separator instead.
-		parts := strings.Split(relPath, string(filepath.Separator))
-
-		if len(parts) < 2 {
-			logger.Warn("UploaderCleanup: Unexpected path structure", "path", relPath)
-			return nil
-		}
-
-		// Get account ID and content hash
-		accountIDStr := parts[0]
-		contentHash := parts[len(parts)-1] // Last component is the hash
-
-		// Parse account ID
-		accountID, err := strconv.ParseInt(accountIDStr, 10, 64)
-		if err != nil {
-			logger.Warn("UploaderCleanup: Invalid account ID in path", "path", path, "error", err)
-			return nil
-		}
-
-		// Validate content hash
-		if !isValidContentHash(contentHash) {
-			logger.Warn("UploaderCleanup: Invalid content hash in path", "path", path)
-			// Remove invalid files (such as <hash>.<16hex>.tmp crash leftovers).
-			// Do not subtract info.Size() from currentStagingSize: non-content-hash
-			// files were never staged into place or counted in currentStagingSize.
-			if removeErr := os.Remove(path); removeErr != nil {
-				logger.Warn("UploaderCleanup: Failed to remove invalid file", "path", path, "error", removeErr)
-			} else {
-				filesRemoved++
-				totalSize += info.Size()
-				logger.Info("UploaderCleanup: Removed invalid file", "path", path)
+		for _, account := range accounts {
+			accountDir := filepath.Join(w.path, account.Name())
+			accountID, err := strconv.ParseInt(account.Name(), 10, 64)
+			if err != nil {
+				logger.Warn("UploaderCleanup: Invalid account ID in path", "path", accountDir, "error", err)
+				continue
 			}
-			return nil
-		}
+			entries, err := os.ReadDir(accountDir)
+			if err != nil {
+				logger.Warn("UploaderCleanup: Error accessing path", "path", accountDir, "error", err)
+				continue
+			}
+			for _, entry := range entries {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 
-		batch[accountID] = append(batch[accountID], stagedFile{path: path, contentHash: contentHash, size: info.Size()})
-		batched++
-		if batched >= orphanLookupBatchSize {
-			removeOrphans(batch)
-			batch = make(map[int64][]stagedFile)
-			batched = 0
-		}
+				path := filepath.Join(accountDir, entry.Name())
+				info, err := entry.Info()
+				if err != nil {
+					if !os.IsNotExist(err) { // gone since the listing: uploaded or removed
+						logger.Warn("UploaderCleanup: Error accessing path", "path", path, "error", err)
+					}
+					continue
+				}
+				if info.IsDir() {
+					logger.Warn("UploaderCleanup: Unexpected path structure", "path", path)
+					continue
+				}
 
+				// Skip recently created/modified files (within grace period)
+				if info.ModTime().After(cutoffTime) {
+					continue
+				}
+
+				filesChecked++
+
+				contentHash := entry.Name()
+				if !isValidContentHash(contentHash) {
+					logger.Warn("UploaderCleanup: Invalid content hash in path", "path", path)
+					// Remove invalid files (such as <hash>.<16hex>.tmp crash leftovers).
+					// Do not subtract info.Size() from currentStagingSize: non-content-hash
+					// files were never staged into place or counted in currentStagingSize.
+					if removeErr := os.Remove(path); removeErr != nil {
+						logger.Warn("UploaderCleanup: Failed to remove invalid file", "path", path, "error", removeErr)
+					} else {
+						filesRemoved++
+						totalSize += info.Size()
+						logger.Info("UploaderCleanup: Removed invalid file", "path", path)
+					}
+					continue
+				}
+
+				batch[accountID] = append(batch[accountID], stagedFile{path: path, contentHash: contentHash, size: info.Size()})
+				batched++
+				if batched >= orphanLookupBatchSize {
+					removeOrphans(batch)
+					batch = make(map[int64][]stagedFile)
+					batched = 0
+				}
+			}
+		}
 		return nil
-	})
+	}
+	err := scan()
 
 	if err == nil {
 		removeOrphans(batch)
