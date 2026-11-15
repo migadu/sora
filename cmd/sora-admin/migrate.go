@@ -103,6 +103,11 @@ func handleMigrateDown(ctx context.Context) {
 		fmt.Println("Reverts migrations. Defaults to reverting one migration.")
 	}
 	fs.Parse(os.Args[3:])
+	// Steps(-limit) reverts only for a positive limit: Steps(0) is ErrNoChange and a
+	// negative limit would migrate up.
+	if *limit < 1 {
+		logger.Fatal("--limit must be at least 1")
+	}
 
 	m, db, err := getMigrateInstance(ctx)
 	if err != nil {
