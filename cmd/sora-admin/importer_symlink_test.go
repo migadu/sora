@@ -78,6 +78,11 @@ func TestScanMaildirWarnsAboutASymlinkedFolder(t *testing.T) {
 			addMaildirFolder(t, maildirPath, ".Sent", otherName, cachedSizeMessage("Sent", 100))
 			return ".Sent"
 		}},
+		// The volume the folder lives on is not mounted: the link dangles, so it
+		// cannot be told from a link to a file, and is named all the same.
+		{"target missing", func(t *testing.T, _ string) string {
+			return filepath.Join(t.TempDir(), "unmounted", ".Archive")
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			maildirPath := newMaildirWith(t, map[string][]byte{inboxName: cachedSizeMessage("One", 100)})
@@ -85,16 +90,69 @@ func TestScanMaildirWarnsAboutASymlinkedFolder(t *testing.T) {
 			require.NoError(t, os.Symlink(tc.target(t, maildirPath), linkPath))
 
 			importer := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), ImporterOptions{})
-			logs := &importLogBuffer{}
-			prev := logger.Swap(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
-			err := importer.scanMaildir()
-			logger.Swap(prev)
-			require.NoError(t, err)
+			logs := scanMaildirWarnings(t, importer)
 
 			for path, mailbox := range scannedMessages(t, importer) {
 				assert.NotEqual(t, "Archive", mailbox, "the linked folder was imported: %s", path)
 			}
-			assert.Contains(t, logs.String(), linkPath, "the linked folder was skipped without a warning naming it")
+			assert.Contains(t, logs, linkPath, "the linked folder was skipped without a warning naming it")
 		})
+	}
+}
+
+// Links inside cur/, new/ and tmp/ are message files, which the folder's own scan
+// reads through the link or refuses by path; tmp/ is never read. None of them is a
+// skipped folder, dangling or not, so none gets the symbolic-link warning.
+func TestScanMaildirDoesNotWarnAboutLinkedMessageFiles(t *testing.T) {
+	const inboxName = "1700000001.M1P1.host:2,S"
+	maildirPath := newMaildirWith(t, map[string][]byte{inboxName: cachedSizeMessage("One", 100)})
+	missing := filepath.Join(t.TempDir(), "missing")
+	require.NoError(t, os.Symlink(filepath.Join(maildirPath, "cur", inboxName), filepath.Join(maildirPath, "new", "1700000002.M2P1.host")))
+	require.NoError(t, os.Symlink(missing, filepath.Join(maildirPath, "new", "1700000003.M3P1.host")))
+	require.NoError(t, os.Symlink(missing, filepath.Join(maildirPath, "tmp", "1700000004.M4P1.host")))
+
+	importer := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), ImporterOptions{})
+	logs := scanMaildirWarnings(t, importer)
+
+	assert.NotContains(t, logs, "symbolic link")
+}
+
+// scanMaildirWarnings runs the scan and returns what it logged at warning level.
+func scanMaildirWarnings(t *testing.T, importer *Importer) string {
+	t.Helper()
+	logs := &importLogBuffer{}
+	prev := logger.Swap(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	err := importer.scanMaildir()
+	logger.Swap(prev)
+	require.NoError(t, err)
+	return logs.String()
+}
+
+// A Maildir root can itself be named cur, new or tmp. Its direct children are
+// folders, not message files merely because the root has one of those names.
+func TestScanMaildirWarnsAboutLinkedFoldersBelowMessageNamedRoot(t *testing.T) {
+	const inboxName = "1700000001.M1P1.host:2,S"
+	for _, rootName := range []string{"cur", "new", "tmp"} {
+		for _, dangling := range []bool{false, true} {
+			name := rootName + "/existing"
+			if dangling {
+				name = rootName + "/dangling"
+			}
+			t.Run(name, func(t *testing.T) {
+				original := newMaildirWith(t, map[string][]byte{inboxName: cachedSizeMessage("One", 100)})
+				root := filepath.Join(t.TempDir(), rootName)
+				require.NoError(t, os.Rename(original, root))
+				target := filepath.Join(t.TempDir(), "unmounted", ".Archive")
+				if !dangling {
+					target = newMaildirWith(t, map[string][]byte{inboxName: cachedSizeMessage("Archived", 100)})
+				}
+				link := filepath.Join(root, ".Archive")
+				require.NoError(t, os.Symlink(target, link))
+				importer := newTestModeImporter(t, root, newMockResilientDatabase(), ImporterOptions{})
+				logs := scanMaildirWarnings(t, importer)
+				assert.Contains(t, logs, link, "the root's name hid its skipped folder")
+				assert.Equal(t, map[string]string{filepath.Join(root, "cur", inboxName): "INBOX"}, scannedMessages(t, importer))
+			})
+		}
 	}
 }

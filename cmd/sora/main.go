@@ -29,6 +29,7 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/pkg/spamtraining"
+	"github.com/migadu/sora/pkg/sqlitefile"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/adminapi"
 	"github.com/migadu/sora/server/cleaner"
@@ -690,9 +691,13 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		acPurgeUnused := cfg.AuthCache.GetPurgeUnusedWithDefault()
 		acCleanupInterval := cfg.AuthCache.GetCleanupIntervalWithDefault()
 
-		// Ensure parent directory exists
-		if dir := filepath.Dir(acPath); dir != "" && dir != "." {
-			os.MkdirAll(dir, 0755)
+		// Ensure the database file's parent directory exists. For a file: URI that is the
+		// directory of the file the URI names, not filepath.Dir of the URI; a name that is
+		// not a file is refused by authcache.New.
+		if file, _, err := sqlitefile.Parse(acPath); err == nil && file != "" {
+			if dir := filepath.Dir(file); dir != "." {
+				os.MkdirAll(dir, 0755)
+			}
 		}
 
 		ac, err := authcache.New(acPath, acMaxAge, acPurgeUnused, acCleanupInterval)
