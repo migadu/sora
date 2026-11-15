@@ -197,3 +197,43 @@ func TestIMAP_EnvelopeDateKeepsHeaderZone(t *testing.T) {
 		}
 	}
 }
+
+// TestIMAP_EnvelopeDateObsoleteZone: an alphabetic Date: zone (RFC 5322 section 4.3
+// obs-zone, which a receiver MUST accept per section 4) is stored at the offset that section
+// gives it ("PDT is semantically equivalent to -0700"), and a military or unknown zone as
+// "-0000", whatever zone the server runs in. Before the fix net/mail looked the name up in
+// time.Local: PDT came out as +0000 on a server in UTC, EST in July as 03:23:25 -0400 on
+// one in America/New_York, and a military or lower-case zone did not parse at all (NIL).
+// At most one of PDT and EST can be the server's in July, so a zone looked up in the
+// server's zone fails at least one of them.
+func TestIMAP_EnvelopeDateObsoleteZone(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	rc := dialRaw(t, server.Address)
+	defer rc.conn.Close()
+	rc.login(account)
+
+	dates := []struct{ header, envelope string }{
+		{"Wed, 17 Jul 1996 02:23:25 PDT", `"Wed, 17 Jul 1996 02:23:25 -0700"`},
+		{"Wed, 17 Jul 1996 02:23:25 EST", `"Wed, 17 Jul 1996 02:23:25 -0500"`},
+		{"Wed, 17 Jan 1996 02:23:25 CST (Central Standard Time)", `"Wed, 17 Jan 1996 02:23:25 -0600"`},
+		{"Wed, 17 Jul 1996 02:23:25 pdt", `"Wed, 17 Jul 1996 02:23:25 -0700"`},
+		{"Wed, 17 Jul 1996 02:23:25 Z", `"Wed, 17 Jul 1996 02:23:25 +0000"`},
+		{"Wed, 17 Jan 1996 02:23:25 CET", `"Wed, 17 Jan 1996 02:23:25 +0000"`},
+	}
+	for i, d := range dates {
+		rc.append(fmt.Sprintf("a%d", i), "INBOX", "From: alice@example.com\r\nTo: bob@example.com\r\n"+
+			fmt.Sprintf("Subject: obs %d\r\nDate: %s\r\n\r\nbody\r\n", i, d.header))
+	}
+	_, tagged := rc.cmd("s", "SELECT INBOX")
+	require.Contains(t, tagged, "OK")
+	untagged, tagged := rc.cmd("f", "FETCH 1:* (ENVELOPE)")
+	require.Contains(t, tagged, "OK")
+	require.Len(t, untagged, len(dates), "one FETCH response per message: %v", untagged)
+	for i, d := range dates {
+		assert.Contains(t, untagged[i], "(ENVELOPE ("+d.envelope+" ",
+			"Date: %s must be read at its RFC 5322 offset: %s", d.header, untagged[i])
+	}
+}
