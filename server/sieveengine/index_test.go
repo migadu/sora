@@ -57,6 +57,10 @@ func TestValidateScriptIndexOnHeaderAndAddress(t *testing.T) {
 // match a value are limited to the header field fieldno [...] If :last is
 // also specified, the count is backwards [...] all the named header fields
 // are counted in the order specified by the header-list."
+//
+// The header map comes from a parse of the raw message, as LMTP and the Admin
+// API delivery build it, since :index depends on the field order that parse
+// keeps.
 func TestIndexSelectsOneHeaderField(t *testing.T) {
 	const script = `require ["index", "fileinto"];
 if header :matches :index 2 "Received" "from second.example.net *" { fileinto "second"; }
@@ -69,21 +73,15 @@ if address :index 1 ["To", "Cc"] "cc@example.org" { fileinto "wrong-to"; }
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
-	result, err := executor.Evaluate(context.Background(), Context{
-		EnvelopeFrom: "sender@example.net",
-		EnvelopeTo:   "user@example.com",
-		Header: map[string][]string{
-			"Received": {
-				"from third.example.net by mx.example.com; Sun, 15 Nov 2026 10:00:03 +0000",
-				"from second.example.net by third.example.net; Sun, 15 Nov 2026 10:00:02 +0000",
-				"from first.example.net by second.example.net; Sun, 15 Nov 2026 10:00:01 +0000",
-			},
-			"From": {"sender@example.net"},
-			"To":   {"user@example.com"},
-			"Cc":   {"cc@example.org"},
-		},
-		Message: bodyOnly("body"),
-	})
+	result, err := executor.Evaluate(context.Background(), rawContext(t,
+		"Received: from third.example.net by mx.example.com; Sun, 15 Nov 2026 10:00:03 +0000\r\n"+
+			"Received: from second.example.net by third.example.net; Sun, 15 Nov 2026 10:00:02 +0000\r\n"+
+			"Received: from first.example.net by second.example.net; Sun, 15 Nov 2026 10:00:01 +0000\r\n"+
+			"From: sender@example.net\r\n"+
+			"To: user@example.com\r\n"+
+			"Cc: cc@example.org\r\n"+
+			"\r\n"+
+			"body\r\n"))
 	if err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
