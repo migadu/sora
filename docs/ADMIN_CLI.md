@@ -719,6 +719,12 @@ sora-admin --config config.toml uploader resolve
 spool is `[uploader] path`, with the server's default when unset. Run `resolve` on the backend
 that owns the uploads, with its own config file. Always look at a `--dry-run` first.
 
+With the default `[uploader] path`, `resolve`, `--dry-run` included, refuses to run while
+`/tmp/sora/uploads`, the default of earlier releases, still holds staged bodies: they are not in
+the spool it checks, so `[DELETE]` would take them for lost. It fails with
+`Failed to resolve uploads:` and the error the server stops with at startup
+([OPERATIONS.md](OPERATIONS.md#5-what-a-restart-loses-and-keeps)).
+
 ---
 
 ## 13. cache
