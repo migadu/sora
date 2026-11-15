@@ -256,23 +256,15 @@ func TestIMAP_CONDSTOREFiltering_iOSBeforeAfterID(t *testing.T) {
 	writer.Flush()
 	readResponse("A09")
 
-	// Search with MODSEQ criteria - should work but not return MODSEQ-specific data when filtered
+	// The MODSEQ search key is CONDSTORE's (RFC 7162 §3.1.5): with CONDSTORE
+	// filtered it is refused with BAD, not dropped (which matched every message).
 	sendCommand("A10", "SEARCH MODSEQ 1")
 	searchResponses := readResponse("A10")
 
-	var foundCondstoreInSearch bool
-	for _, resp := range searchResponses {
-		// Look for any CONDSTORE-specific extensions in search response
-		if strings.Contains(resp, "MODSEQ") && !strings.Contains(resp, "SEARCH MODSEQ") {
-			foundCondstoreInSearch = true
-			t.Logf("SEARCH response includes CONDSTORE data: %s", resp)
-		}
-	}
-
-	if foundCondstoreInSearch {
-		t.Errorf("✗ FAILURE: SEARCH response includes CONDSTORE extensions when should be filtered")
+	if tagged := searchResponses[len(searchResponses)-1]; !strings.HasPrefix(tagged, "A10 BAD ") || len(searchResponses) > 1 {
+		t.Errorf("✗ FAILURE: SEARCH MODSEQ with CONDSTORE filtered: want only a tagged BAD, got:\n%s", strings.Join(searchResponses, "\n"))
 	} else {
-		t.Logf("✓ SUCCESS: SEARCH correctly processes MODSEQ criteria but excludes CONDSTORE extensions when filtered")
+		t.Logf("✓ SUCCESS: SEARCH MODSEQ correctly refused when CONDSTORE is filtered")
 	}
 
 	// STEP 8: Test UNCHANGEDSINCE with STORE (should be ignored when CONDSTORE filtered)
@@ -446,235 +438,65 @@ func TestIMAP_CONDSTOREFiltering_UnidentifiedClient(t *testing.T) {
 	t.Log("Unidentified client CONDSTORE test completed successfully")
 }
 
-// TestIMAP_CONDSTOREFiltering_ComprehensiveBeforeAfterID tests CONDSTORE filtering
-// across all major IMAP commands (SELECT, FETCH, STORE, SEARCH) before and after ID
+// TestIMAP_CONDSTOREFiltering_ComprehensiveBeforeAfterID verifies that a late
+// client filter preserves CONDSTORE once a command has enabled it. QRESYNC was
+// never enabled on this connection, so the same filter can still withdraw it.
 func TestIMAP_CONDSTOREFiltering_ComprehensiveBeforeAfterID(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	// Same filters as main test
-	filters := []config.ClientCapabilityFilter{
-		{
-			ClientName:    "com\\.apple\\.email\\.maild",
-			ClientVersion: ".*",
-			DisableCaps:   []string{"CONDSTORE", "QRESYNC"},
-			Reason:        "iOS Apple Mail has CONDSTORE implementation issues (QRESYNC depends on CONDSTORE)",
-		},
-	}
-
+	filters := []config.ClientCapabilityFilter{{
+		ClientName:    "com\\.apple\\.email\\.maild",
+		ClientVersion: ".*",
+		DisableCaps:   []string{"CONDSTORE", "QRESYNC"},
+	}}
 	server, account := setupIMAPServerWithCapabilityFilters(t, filters)
-	defer server.Close()
+	t.Cleanup(server.Close)
 
-	// Connect using raw TCP for precise protocol control
-	conn, err := net.Dial("tcp", server.Address)
-	if err != nil {
-		t.Fatalf("Failed to connect to server: %v", err)
-	}
-	defer conn.Close()
-
-	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
-
-	sendCommand := func(tag, command string) {
-		fmt.Fprintf(writer, "%s %s\r\n", tag, command)
-		writer.Flush()
-		t.Logf("SENT: %s %s", tag, command)
-	}
-
-	readResponse := func(expectedTag string) []string {
-		var responses []string
-		for {
-			line, _, err := reader.ReadLine()
-			if err != nil {
-				t.Fatalf("Failed to read response: %v", err)
-			}
-			lineStr := string(line)
-			t.Logf("RECV: %s", lineStr)
-			responses = append(responses, lineStr)
-
-			if strings.HasPrefix(lineStr, expectedTag+" ") {
-				break
-			}
-		}
-		return responses
-	}
-
-	// Read greeting
-	greeting, _, err := reader.ReadLine()
-	if err != nil {
-		t.Fatalf("Failed to read greeting: %v", err)
-	}
-	t.Logf("RECV: %s", greeting)
-
-	// Login
-	sendCommand("A01", fmt.Sprintf("LOGIN %s %s", account.Email, account.Password))
-	readResponse("A01")
-
-	// SELECT INBOX
-	sendCommand("A02", "SELECT INBOX")
-	readResponse("A02")
-
-	// Add test messages for operations
+	c := dialRawIMAP(t, server.Address)
+	c.do(fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password))
 	for i := 1; i <= 2; i++ {
-		messageData := fmt.Sprintf("From: test%d@example.com\r\nTo: %s\r\nSubject: Test Message %d\r\nDate: %s\r\n\r\nTest message content %d.",
-			i, account.Email, i, time.Now().Format(time.RFC1123), i)
-
-		sendCommand(fmt.Sprintf("A%02d", i+2), fmt.Sprintf("APPEND INBOX {%d}", len(messageData)))
-		contLine, _, err := reader.ReadLine()
-		if err != nil {
-			t.Fatalf("Failed to read continuation: %v", err)
-		}
-		t.Logf("RECV: %s", contLine)
-		fmt.Fprintf(writer, "%s\r\n", messageData)
-		writer.Flush()
-		readResponse(fmt.Sprintf("A%02d", i+2))
+		c.appendMsg("INBOX", fmt.Sprintf("From: test@example.com\r\nTo: %s\r\nSubject: Test %d\r\n\r\nhello\r\n", account.Email, i))
 	}
+	c.do("SELECT INBOX")
 
-	// Reselect to see messages
-	sendCommand("A05", "SELECT INBOX")
-	readResponse("A05")
-
-	t.Logf("=== BEFORE ID: Test all operations with CONDSTORE (should include fragments) ===")
-
-	// Test FETCH before ID - should include MODSEQ
-	sendCommand("A06", "FETCH 1:2 (FLAGS MODSEQ)")
-	fetchBeforeResponses := readResponse("A06")
-
-	var foundModSeqBeforeID bool
-	for _, resp := range fetchBeforeResponses {
-		if strings.Contains(resp, "MODSEQ") && strings.Contains(resp, "FETCH") {
-			foundModSeqBeforeID = true
-			t.Logf("Before ID - FETCH includes MODSEQ: %s", resp)
+	assertModSeq := func(cmd string, want int) {
+		t.Helper()
+		lines, _ := c.do(cmd)
+		var got int
+		for _, line := range lines {
+			if strings.Contains(line, " FETCH ") && strings.Contains(line, "MODSEQ (") {
+				got++
+			}
+		}
+		if got != want {
+			t.Fatalf("%s: want %d FETCH responses with MODSEQ, got %d:\n%s", cmd, want, got, strings.Join(lines, "\n"))
 		}
 	}
 
-	// Test STORE before ID - should include MODSEQ in response
-	sendCommand("A07", "STORE 1 +FLAGS (\\Seen)")
-	storeBeforeResponses := readResponse("A07")
+	// FETCH MODSEQ makes the session CONDSTORE-aware without ENABLE. Subsequent
+	// STORE and SEARCH commands must keep working across a matching late ID.
+	assertModSeq("FETCH 1:2 (FLAGS MODSEQ)", 2)
+	assertModSeq(`STORE 1 +FLAGS (\Seen)`, 1)
+	c.do("SEARCH MODSEQ 1")
+	c.do(`ID ("name" "com.apple.email.maild" "version" "3826.300.87.2.22" "os" "iOS")`)
 
-	var foundModSeqInStoreBeforeID bool
-	for _, resp := range storeBeforeResponses {
-		if strings.Contains(resp, "MODSEQ") && strings.Contains(resp, "FETCH") {
-			foundModSeqInStoreBeforeID = true
-			t.Logf("Before ID - STORE includes MODSEQ: %s", resp)
-		}
+	caps, _ := c.do("CAPABILITY")
+	capList := " " + strings.Join(caps, " ") + " "
+	if !strings.Contains(capList, " CONDSTORE ") || strings.Contains(capList, " QRESYNC ") {
+		t.Fatalf("late ID must retain enabled CONDSTORE and withdraw unenabled QRESYNC:\n%s", strings.Join(caps, "\n"))
 	}
+	assertModSeq("FETCH 1:2 (FLAGS MODSEQ)", 2)
+	assertModSeq(`STORE 2 +FLAGS (\Flagged)`, 1)
+	c.do("SEARCH MODSEQ 1")
 
-	// Test SEARCH with MODSEQ before ID - should work normally
-	sendCommand("A08", "SEARCH MODSEQ 1")
-	searchBeforeResponses := readResponse("A08")
-
-	var searchWorkedBeforeID bool
-	for _, resp := range searchBeforeResponses {
-		if strings.Contains(resp, "A08 OK") {
-			searchWorkedBeforeID = true
-		}
+	// An old precondition must still be enforced after ID, rather than silently
+	// treating this as an unconditional write when the filter matches.
+	_, tagged := c.do(`STORE 1 (UNCHANGEDSINCE 1) +FLAGS (\Draft)`)
+	if !strings.Contains(tagged, "[MODIFIED 1]") {
+		t.Fatalf("failed conditional STORE must report MODIFIED 1: %s", tagged)
 	}
-
-	// Log results before ID
-	if foundModSeqBeforeID {
-		t.Logf("✓ Before ID: FETCH correctly includes MODSEQ (CONDSTORE available)")
-	} else {
-		t.Logf("⚠ Before ID: FETCH does not include MODSEQ (may be expected if no messages)")
+	flags, _ := c.do("FETCH 1 (FLAGS MODSEQ)")
+	if response := strings.Join(flags, "\n"); strings.Contains(response, `\Draft`) || !strings.Contains(response, `\Seen`) {
+		t.Fatalf("failed conditional STORE must leave flags unchanged:\n%s", response)
 	}
-
-	if foundModSeqInStoreBeforeID {
-		t.Logf("✓ Before ID: STORE correctly includes MODSEQ (CONDSTORE available)")
-	} else {
-		t.Logf("⚠ Before ID: STORE does not include MODSEQ")
-	}
-
-	if searchWorkedBeforeID {
-		t.Logf("✓ Before ID: SEARCH MODSEQ works correctly (CONDSTORE available)")
-	} else {
-		t.Logf("⚠ Before ID: SEARCH MODSEQ failed")
-	}
-
-	t.Logf("=== SEND ID: Identify as iOS ===")
-
-	// Send ID command to identify as iOS
-	sendCommand("A09", `ID ("name" "com.apple.email.maild" "version" "3826.300.87.2.22" "os" "iOS")`)
-	readResponse("A09")
-
-	t.Logf("=== AFTER ID: Test all operations with CONDSTORE (should exclude fragments) ===")
-
-	// Test FETCH after ID - should NOT include MODSEQ
-	sendCommand("A10", "FETCH 1:2 (FLAGS MODSEQ)")
-	fetchAfterResponses := readResponse("A10")
-
-	var foundModSeqAfterID bool
-	for _, resp := range fetchAfterResponses {
-		if strings.Contains(resp, "MODSEQ") && strings.Contains(resp, "FETCH") {
-			foundModSeqAfterID = true
-			t.Logf("After ID - FETCH includes MODSEQ: %s", resp)
-		}
-	}
-
-	// Test STORE after ID - should NOT include MODSEQ in response
-	sendCommand("A11", "STORE 2 +FLAGS (\\Flagged)")
-	storeAfterResponses := readResponse("A11")
-
-	var foundModSeqInStoreAfterID bool
-	for _, resp := range storeAfterResponses {
-		if strings.Contains(resp, "MODSEQ") && strings.Contains(resp, "FETCH") {
-			foundModSeqInStoreAfterID = true
-			t.Logf("After ID - STORE includes MODSEQ: %s", resp)
-		}
-	}
-
-	// Test SEARCH with MODSEQ after ID - should handle gracefully
-	sendCommand("A12", "SEARCH MODSEQ 1")
-	searchAfterResponses := readResponse("A12")
-
-	var searchWorkedAfterID bool
-	var searchFailedAfterID bool
-	for _, resp := range searchAfterResponses {
-		if strings.Contains(resp, "A12 OK") {
-			searchWorkedAfterID = true
-		}
-		if strings.Contains(resp, "A12 BAD") || strings.Contains(resp, "A12 NO") {
-			searchFailedAfterID = true
-		}
-	}
-
-	// Test STORE with UNCHANGEDSINCE after ID - should be rejected or ignore MODSEQ
-	sendCommand("A13", "STORE 1 (UNCHANGEDSINCE 1) +FLAGS (\\Draft)")
-	unchangedSinceAfterResponses := readResponse("A13")
-
-	var hasModSeqInUnchangedSinceAfter bool
-	for _, resp := range unchangedSinceAfterResponses {
-		if strings.Contains(resp, "MODSEQ") {
-			hasModSeqInUnchangedSinceAfter = true
-		}
-	}
-
-	// Verify filtering results
-	t.Logf("=== VERIFICATION RESULTS ===")
-
-	if foundModSeqAfterID {
-		t.Errorf("✗ FAILURE: FETCH includes MODSEQ after iOS ID (should be filtered)")
-	} else {
-		t.Logf("✓ SUCCESS: FETCH correctly excludes MODSEQ after iOS ID")
-	}
-
-	if foundModSeqInStoreAfterID {
-		t.Errorf("✗ FAILURE: STORE includes MODSEQ after iOS ID (should be filtered)")
-	} else {
-		t.Logf("✓ SUCCESS: STORE correctly excludes MODSEQ after iOS ID")
-	}
-
-	if searchFailedAfterID {
-		t.Logf("✓ SUCCESS: SEARCH MODSEQ correctly rejected after iOS ID")
-	} else if searchWorkedAfterID {
-		t.Logf("✓ SUCCESS: SEARCH MODSEQ handled gracefully after iOS ID (capability filtered)")
-	} else {
-		t.Logf("⚠ SEARCH MODSEQ behavior unclear after iOS ID")
-	}
-
-	if hasModSeqInUnchangedSinceAfter {
-		t.Errorf("✗ FAILURE: STORE UNCHANGEDSINCE includes MODSEQ after iOS ID (should be filtered)")
-	} else {
-		t.Logf("✓ SUCCESS: STORE UNCHANGEDSINCE correctly excludes MODSEQ after iOS ID")
-	}
-
-	t.Log("=== COMPREHENSIVE CONDSTORE filtering verification completed ===")
 }

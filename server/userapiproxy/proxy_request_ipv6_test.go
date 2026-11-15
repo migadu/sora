@@ -37,7 +37,7 @@ func TestProxyRequestBareIPv6Backend(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	s.proxyRequest(w, httptest.NewRequest(http.MethodGet, "http://original.example.com/user/mailboxes", nil), backendRoute{addr: "2001:db8::21"})
+	s.proxyRequest(w, httptest.NewRequest(http.MethodGet, "http://original.example.com/user/mailboxes", nil), backendRoute{addr: "2001:db8::21"}, nil)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("backend not reached: status %d, body %q", w.Code, w.Body.String())

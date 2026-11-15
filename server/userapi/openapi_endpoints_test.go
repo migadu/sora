@@ -102,9 +102,10 @@ func TestOpenAPITokenEndpointStatuses(t *testing.T) {
 	}
 }
 
-// handleDeleteMailbox refuses INBOX with 403 before it asks the database; the spec
-// said 400. A mailbox with children is refused with 409, which it did not list.
-func TestOpenAPIDeleteMailboxStatuses(t *testing.T) {
+// handleDeleteMailbox refuses INBOX, and a shared mailbox without the 'x' right, with
+// 403 (#992), and a mailbox with child mailboxes with 409. The INBOX refusal comes
+// before the database, so it is driven through the routes here.
+func TestOpenAPIDeleteMailboxResponse(t *testing.T) {
 	s, token := openAPITestServer(t)
 	r := httptest.NewRequest(http.MethodDelete, "/user/mailboxes/INBOX", nil)
 	r.Header.Set("Authorization", "Bearer "+token)
@@ -115,14 +116,14 @@ func TestOpenAPIDeleteMailboxStatuses(t *testing.T) {
 	}
 
 	op := openAPIOperation(t, "/mailboxes/{name}", "delete")
-	if inbox, ok := yamlSection(op, 8, "'403':"); !ok || !strings.Contains(inbox, "INBOX") {
+	if resp, ok := yamlSection(op, 8, "'403':"); !ok || !strings.Contains(resp, "INBOX") {
 		t.Error("DELETE /mailboxes/{name} does not document the 403 for INBOX")
 	}
-	if bad, _ := yamlSection(op, 8, "'400':"); strings.Contains(bad, "INBOX") {
-		t.Error("DELETE /mailboxes/{name} documents the INBOX refusal as 400")
-	}
-	if !slices.Contains(openAPIStatuses(t, "/mailboxes/{name}", "delete"), "'409'") {
+	if _, ok := yamlSection(op, 8, "'409':"); !ok {
 		t.Error("DELETE /mailboxes/{name} does not list 409 (child mailboxes)")
+	}
+	if resp, ok := yamlSection(op, 8, "'400':"); ok && strings.Contains(resp, "INBOX") {
+		t.Errorf("DELETE /mailboxes/{name} documents the INBOX refusal as 400; it is 403:\n%s", resp)
 	}
 }
 

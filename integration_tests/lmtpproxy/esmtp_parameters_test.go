@@ -195,17 +195,12 @@ func TestLMTPProxyESMTPParameters(t *testing.T) {
 				}
 			}
 
-			// Verify DSN is advertised
-			dsnAdvertised := false
+			// DSN is not announced, so the MTA keeps the DSN duties (RFC 3461
+			// §5.2.2); the parameters below are what an MTA may send anyway.
 			for _, line := range lhloResponse {
-				if strings.Contains(line, "DSN") {
-					dsnAdvertised = true
-					t.Logf("✓ DSN extension advertised")
-					break
+				if len(line) > 4 && strings.EqualFold(strings.Fields(line[4:])[0], "DSN") {
+					t.Errorf("LHLO announces DSN: %q", line)
 				}
-			}
-			if !dsnAdvertised {
-				t.Logf("⚠ WARNING: DSN extension not advertised in LHLO response")
 			}
 
 			// Send MAIL FROM

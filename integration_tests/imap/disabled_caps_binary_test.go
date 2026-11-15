@@ -140,7 +140,8 @@ func TestIMAP_DisabledBinaryFetchItems(t *testing.T) {
 				}
 				// Decoding must preserve NUL and non-ASCII octets through a
 				// literal8, with SIZE and partial offsets measured after decoding
-				// (RFC 9051 sections 6.4.5 and 7.5.2).
+				// (RFC 9051 sections 6.4.5 and 7.5.2). A slice without the NUL
+				// goes as a literal.
 				binaryMsg := "From: a@example.com\r\nTo: b@example.com\r\n" +
 					"MIME-Version: 1.0\r\nContent-Type: application/octet-stream\r\n" +
 					"Content-Transfer-Encoding: base64\r\n\r\nAAH/YQ==\r\n"
@@ -150,7 +151,7 @@ func TestIMAP_DisabledBinaryFetchItems(t *testing.T) {
 					t.Errorf("decoded binary octets or size mismatch: %q", resp)
 				}
 				resp = mustOK("UID FETCH 2 (BINARY.PEEK[1]<1.2>)")
-				if !strings.Contains(resp, "BINARY[1]<1> ~{2}\r\n\x01\xff") {
+				if !strings.Contains(resp, "BINARY[1]<1> {2}\r\n\x01\xff") {
 					t.Errorf("decoded partial offset/bytes mismatch: %q", resp)
 				}
 			} else {

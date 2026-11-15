@@ -46,8 +46,9 @@ flowchart LR
     F -->|sora-admin relay requeue| P
 ```
 
-Without a relay (`[relay] type` empty), there is no queue and no worker. A redirected message is
-then kept in INBOX instead, and vacation replies are not sent.
+Without a relay (`[relay] type` empty), there is no queue and no worker. Sieve redirects are then
+skipped: the message is stored where the rest of the script puts it, in INBOX when a redirect was
+the only place it went. Vacation replies are not sent.
 
 The relay has to accept these messages from the Sora node. A redirect keeps the original sender's
 address, so the relay must allow foreign senders from Sora; Sora does not rewrite the sender
@@ -136,6 +137,7 @@ system roots, with TLS 1.2 or later.
 | Response | Class |
 |---|---|
 | `2xx` | Delivered. |
+| `3xx` | Temporary. Redirects are not followed, so `http_url` must answer the `POST` itself; the error names the `Location`. |
 | `4xx` | Permanent. The message goes to the failed queue. |
 | anything else, and connection errors | Temporary. The message is retried. |
 
@@ -211,6 +213,12 @@ Each message is a pair of files with the same id (a UUID): `<id>.msg` is the raw
 renames it, writing the body before the metadata, so a crash never leaves metadata pointing at a
 half-written body.
 
+A Sieve redirect is written while its delivery is still running, with its metadata named
+`<id>.held`, which the worker does not pick up. Once the delivery has stored everything it stores,
+`<id>.held` is renamed to `<id>.json`; if the delivery fails, both files are removed. The sender
+retries a failed delivery, so a redirect queued by the failed attempt would otherwise go out once
+per attempt.
+
 ```json
 {
   "id": "<uuid>",
@@ -267,7 +275,8 @@ may then receive it twice.
 | `failed_retention` | duration | `"168h"` (7 days) | How long a message stays in `failed/`, counted from its last attempt. `0` keeps failed messages until they are deleted or requeued. A negative or invalid value stops startup. |
 | `cleanup_interval` | duration | `"1h"` | How often the cleanup pass runs. An invalid value stops startup. |
 
-Durations accept Go syntax (`"90s"`, `"1h30m"`) and whole days (`"7d"`).
+Durations accept Go syntax (`"90s"`, `"1h30m"`) and whole days (`"7d"`). A value that stops
+startup also fails `sora-admin config validate`.
 
 ```toml
 [relay.queue]
@@ -332,8 +341,9 @@ Requeueing resets the attempt count and the error history.
 ### Crash debris
 
 The cleanup pass also removes, once they are more than an hour old: leftover temporary files
-(`.tmp-*`) in any of the three directories, and a body or metadata file in `pending/` whose
-partner is missing in both `pending/` and `processing/`. Each removal is logged
+(`.tmp-*`) in any of the three directories, a body or metadata file in `pending/` whose partner is
+missing in both `pending/` and `processing/`, and a held redirect (`<id>.held` and its body) whose
+delivery never finished. Each removal is logged
 (`RelayQueue: Removed orphaned queue file`).
 
 ---
@@ -472,7 +482,8 @@ As in the [HTTP relay request](#3-the-http-relay-request), each byte of `message
 UTF-8 is replaced with U+FFFD; the endpoint takes the message from `message_base64` when it is
 present and from `message` otherwise.
 
-A `2xx` answer is success. Anything else is a failure.
+A `2xx` answer is success. Anything else is a failure, a `3xx` too: redirects are not followed, so
+`endpoint` must answer the `POST` itself.
 
 ### Failures
 

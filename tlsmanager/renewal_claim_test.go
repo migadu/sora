@@ -210,7 +210,7 @@ func TestRenewalTakesTheIssuanceClaim(t *testing.T) {
 
 	t.Run("claim held by another node", func(t *testing.T) {
 		fence := newFakeFence()
-		fence.held[domain] = true // the other partition's leader is ordering
+		fence.held[domain] = fakeClaim{} // the other partition's leader is ordering
 
 		_, acme := setup(t, fence)
 		time.Sleep(500 * time.Millisecond)

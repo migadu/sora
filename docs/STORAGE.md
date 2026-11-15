@@ -356,8 +356,11 @@ Your MTA keeps the message and retries a `452`. LMTP also answers `452 4.3.1` wh
 staging disk is full or read-only, whether or not a limit is set.
 
 The worker keeps the total in memory and corrects it every 5 minutes from this node's rows
-in `pending_uploads`. Set a limit below the free space of the staging disk, so that a long S3
-outage makes the MTA queue mail instead of filling the disk.
+in `pending_uploads`. A body the node staged since it started that has no row (a delivery
+whose transaction has yet to commit, one that failed after writing its file, or a duplicate
+of a body already in S3) stays counted until its row appears or the orphan sweep removes the
+file. Set a limit below the free space of the staging disk, so that a long S3 outage makes
+the MTA queue mail instead of filling the disk.
 
 ### 6.8 The orphan sweep
 
@@ -465,7 +468,7 @@ alone: one copy serves every account on the node.
 <[local_cache] path>/
   data/ab/cd/<the remaining 60 characters of the hash>   one file per body
   cache_index_00.db … cache_index_ff.db                  256 SQLite index files (WAL mode)
-  .sora_warmup_state                                     warmup times, written at shutdown
+  .sora_warmup_state.<server hash>                       one IMAP server's warmup times, written at shutdown
 ```
 
 The index records each file's size and when it was last read. It is split into 256 shards by
@@ -494,12 +497,14 @@ Warmup preloads recent mail when a user logs in over IMAP, so that the first scr
 messages opens quickly.
 
 - With `enable_warmup = true` (the default), an IMAP login queues a warmup for the account.
-  It fetches the newest `warmup_message_count` messages (default 50) of each mailbox in
-  `warmup_mailboxes` (default `["INBOX"]`) from S3 into the cache, skipping bodies already
-  cached.
+  It fetches the newest `warmup_message_count` uploaded messages (default 50) of each mailbox
+  in `warmup_mailboxes` (default `["INBOX"]`) from S3 into the cache, skipping bodies already
+  cached. A message whose upload is still pending is not in S3 yet and is not counted; the
+  uploader moves its body into the cache of the node that stored it once it is uploaded.
 - One account is warmed at most once every `warmup_interval` (default 24 hours) per server.
-  The time of each warmup is saved in `.sora_warmup_state` at shutdown and read back at
-  startup, so a restart does not warm every account again.
+  Each IMAP server saves the time of each warmup in its own `.sora_warmup_state.<server hash>`
+  (the lowercase SHA-256 of its name) at shutdown and reads it back at startup, so a restart does not
+  warm every account again. Warmups older than the interval are dropped from memory too.
 - With `warmup_async = true` (the default), the warmup runs in the background. Ten workers
   per IMAP server process a queue of 50; a warmup that finds the queue full is dropped and
   tried at the next login. With `warmup_async = false`, the login waits for the warmup.
@@ -968,11 +973,11 @@ An invalid duration or size in this section is logged as a warning and the defau
 |---|---|---|---|
 | `path` | string | `"/tmp/sora/uploads"` | Staging directory for bodies not yet in S3. Must be durable. |
 | `instance_id` | string | the hostname | The node's [instance ID](ARCHITECTURE.md#8-node-identity), the owner of its pending uploads. Unique per `sora` process, stable across restarts. |
-| `batch_size` | int | `10` | Pending rows taken per database query. Each body is still its own S3 request. |
-| `concurrency` | int | `20` | Uploads in flight at once. |
-| `max_attempts` | int | `20` | Content failures after which an upload is parked. |
-| `retry_interval` | duration | `"30s"` | How long a taken row waits before it can be taken again; also the first backoff pause. |
-| `cleanup_grace_period` | duration | `"1h"` | Minimum age of a staging file before the orphan sweep may remove it. An invalid value stops `sora`. |
+| `batch_size` | int | `10` | Pending rows taken per database query. Each body is still its own S3 request. Must be positive. |
+| `concurrency` | int | `20` | Uploads in flight at once. Must be positive. |
+| `max_attempts` | int | `20` | Content failures after which an upload is parked. Must be positive. |
+| `retry_interval` | duration | `"30s"` | How long a taken row waits before it can be taken again; also the first backoff pause. Must be positive. |
+| `cleanup_grace_period` | duration | `"1h"` | Minimum age of a staging file before the orphan sweep may remove it. Must be positive; an invalid value stops `sora`. |
 | `max_staging_size` | size | no limit | Most bytes this node may hold waiting for upload. An invalid value stops `sora`. |
 
 ### `[cleanup]`
@@ -1006,4 +1011,6 @@ and on the account. Entries are stored in PostgreSQL. Only the IMAP server uses 
 
 A `SETMETADATA` that would break a limit is refused with `NO`, and nothing in it is stored. A
 limit of `0` turns that check off. An overwrite counts only its change in size, and a delete
-frees its slot.
+frees its slot. The count and size limits refuse only a command that raises the count or the
+size, so an account already past one (the limit was lowered) can still delete, overwrite and
+shrink entries to get back under it.

@@ -60,3 +60,55 @@ func TestPutFilter_ScriptLimit(t *testing.T) {
 		t.Errorf("PUT an existing script at the limit: status %d, want 200", resp.StatusCode)
 	}
 }
+
+// A script name PostgreSQL cannot hold (a NUL, invalid UTF-8) names no script: GET,
+// DELETE and activate answer 404 as for any unknown script. The name was sent to the
+// database, which refused it with SQLSTATE 22021, and the client got 500.
+func TestFilterRoutes_UnstorableName(t *testing.T) {
+	tc := setupTestServer(t)
+	tc.JWTToken = tc.loginFor(t, tc.TestUser.Email, tc.TestUser.Password)
+	for _, name := range []string{"%00", "a%00b", "%FF", "caf%C3"} {
+		for _, req := range []struct{ method, path string }{
+			{"GET", "/user/filters/" + name},
+			{"DELETE", "/user/filters/" + name},
+			{"POST", "/user/filters/" + name + "/activate"},
+		} {
+			resp := tc.makeRequest(t, req.method, req.path, nil)
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusNotFound {
+				t.Errorf("%s %s: status %d (%s), want 404", req.method, req.path, resp.StatusCode, body)
+			}
+		}
+	}
+}
+
+// A script whose content decodes to a NUL byte (e.g. JSON \u0000 in a comment or string)
+// violates RFC 5228 and cannot be stored in PostgreSQL text: PUT /user/filters/{name}
+// must refuse it with 400 Bad Request rather than hitting SQLSTATE 22021 and answering 500.
+func TestPutFilter_UnstorableScript(t *testing.T) {
+	tc := setupTestServer(t)
+	tc.JWTToken = tc.loginFor(t, tc.TestUser.Email, tc.TestUser.Password)
+
+	resp := tc.makeRequest(t, "PUT", "/user/filters/existing", map[string]string{"script": "keep;\n"})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("seed PUT /user/filters/existing: status %d, want 200", resp.StatusCode)
+	}
+
+	for _, script := range []string{
+		"# \x00\nkeep;\n",
+		"/* \x00 */\nkeep;\n",
+		"require \"fileinto\";\nfileinto \"INBOX\x00\";\n",
+		"require \"vacation\";\nvacation text:\naway \x00\n.\n;\n",
+	} {
+		for _, target := range []string{"vacation", "existing"} {
+			resp := tc.makeRequest(t, "PUT", "/user/filters/"+target, map[string]string{"script": script})
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("PUT /user/filters/%s (%q): status %d (%s), want 400", target, script, resp.StatusCode, body)
+			}
+		}
+	}
+}

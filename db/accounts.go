@@ -328,7 +328,9 @@ func (db *Database) ListCredentials(ctx context.Context, email string) ([]Creden
 	}
 	defer rows.Close()
 
-	var credentials []Credential
+	// Never nil: an empty result is the JSON array [], not null. The account was found by
+	// one of its credentials, but in a separate query, so a purge in between leaves no rows.
+	credentials := []Credential{}
 	for rows.Next() {
 		var cred Credential
 		var createdAt, updatedAt any
@@ -888,11 +890,13 @@ func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]A
 }
 
 // GetAliasCredentialsByDomain returns the addresses of all NON-primary credentials whose
-// address is in the given domain, across active (non-deleted) accounts. Domain purge uses
-// this to find cross-domain aliases: addresses in the purged domain that hang off accounts
-// whose primary identity lives in a different domain (so the account is not itself purged).
-// Such aliases keep receiving mail for the purged domain unless explicitly removed. The
-// domain is matched exactly, as in GetAccountsByDomain.
+// address is in the given domain, on accounts whose primary identity lives in a different
+// domain. Domain purge uses this to find cross-domain aliases: addresses in the purged
+// domain that hang off accounts it does not purge. Such aliases keep receiving mail for the
+// purged domain unless explicitly removed. Soft-deleted accounts are included: restoring
+// one puts its aliases back in service. Accounts with their primary in the domain are left
+// out, soft-deleted or not, since the purge removes them whole. The domain is matched
+// exactly, as in GetAccountsByDomain.
 func (db *Database) GetAliasCredentialsByDomain(ctx context.Context, domain string) ([]string, error) {
 	rows, err := db.GetReadPool().Query(ctx, `
 		SELECT c.address
@@ -900,7 +904,12 @@ func (db *Database) GetAliasCredentialsByDomain(ctx context.Context, domain stri
 		JOIN accounts a ON a.id = c.account_id
 		WHERE c.domain = LOWER($1)
 		  AND c.primary_identity = FALSE
-		  AND a.deleted_at IS NULL
+		  AND NOT EXISTS (
+		      SELECT 1 FROM credentials p
+		      WHERE p.account_id = c.account_id
+		        AND p.primary_identity = TRUE
+		        AND p.domain = c.domain
+		  )
 		ORDER BY c.address
 	`, domain)
 	if err != nil {

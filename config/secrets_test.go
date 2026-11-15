@@ -23,6 +23,10 @@ func TestMaskSecretsMalformedURLUserInfo(t *testing.T) {
 	for _, endpoint := range []string{
 		"https://fixture-user:fixture-password@example.invalid/%zz",
 		"https://fixture-user:fixture-password@example.invalid:bad/path",
+		// An unencoded "/" or "#" in the password ends the authority, so the parser
+		// sees no userinfo and takes the start of the password for a port (#806).
+		"https://fixture-user:fixture/password@example.invalid/send",
+		"https://fixture-user:fixture#password@example.invalid/send",
 	} {
 		cfg := Config{Relay: RelayConfig{HTTPURL: endpoint}}
 		MaskSecrets(&cfg)

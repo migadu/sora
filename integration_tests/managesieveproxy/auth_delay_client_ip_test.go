@@ -135,7 +135,7 @@ func TestManageSieveProxy_AuthDelay_UsesRealClientIP(t *testing.T) {
 	}
 
 	delays := func() float64 {
-		return testutil.ToFloat64(metrics.AuthDelayCompleted.WithLabelValues("MANAGESIEVE-PROXY"))
+		return testutil.ToFloat64(metrics.AuthDelayCompleted.WithLabelValues("managesieve_proxy"))
 	}
 
 	// Two failures push the real client's failure count to the delay threshold.
