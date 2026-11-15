@@ -45,6 +45,7 @@ func TestParseDateHeaderObsoleteZone(t *testing.T) {
 		{"Wed, 17 Jul 1996 02:23:25\r\n\tPdT", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC), -7 * h},
 		{"Wed, 17 Jul 1996 02:23:25PDT", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC), -7 * h},
 		{"Wed, 17 Jul 1996 02:23:25 PDT(comment)", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC), -7 * h},
+		{"Wed, 17 Jul 1996 02:23:25 PDT (-0700)", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC), -7 * h},
 		{"17 Jul 96 02:23 PDT", time.Date(1996, 7, 17, 2, 23, 0, 0, time.UTC), -7 * h},
 		// Military zones and other names: "-0000".
 		{"Wed, 17 Jul 1996 02:23:25 Z", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC), 0},
@@ -89,9 +90,18 @@ func TestParseDateHeaderInvalid(t *testing.T) {
 		"Wed, 17 Jul 1996 02:23:25 PDT-0700",
 		"Wed, 17 Jul 1996 02:23:25\r PDT",
 		"Wed, 17 Jul 1996 02:23:25\n PDT",
+		"Wed, 17 Jul 1996 02:23:25 GMT+0200",
+		"Wed, 17 Jul 1996 02:23:25 UTC-0500",
+		// Nor are letters a zone when a numeric offset follows them after white space:
+		// the RFC 5322 section 3.3 grammar has one zone after the time of day ("time =
+		// time-of-day zone"), and the offset after the letters would be discarded.
+		"Wed, 17 Jul 1996 02:23:25 PM -0700",
+		"Wed, 17 Jul 1996 02:23:25 PDT +0500",
+		"Wed, 17 Jul 1996 02:23:25 PDT\r\n +0500",
+		"Wed, 17 Jul 1996 02:23:25 Z\t-0700",
 	} {
-		_, err := ParseDateHeader(value)
-		assert.Error(t, err, "%q", value)
+		got, err := ParseDateHeader(value)
+		assert.Error(t, err, "%q: parsed as %v", value, got)
 	}
 }
 
