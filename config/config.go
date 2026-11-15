@@ -3534,8 +3534,10 @@ type Problem struct {
 //
 // What a node does not run is not checked: [uploader] and [cleanup] only with a mail
 // backend, [database] only with a server that queries it, [s3] only on a node that
-// connects to it, [cluster] and [tls] only when enabled. Service setup still checks
-// external connectivity and the node's disk; passing Validate does not check those.
+// connects to it, [cluster] and [tls] only when enabled. Validate connects to nothing and
+// does not look at the node's disk. Service setup connects to the database and the
+// certificate store and checks the disk; S3 and a remote lookup are first reached when
+// used, so neither passing Validate nor a clean start shows that they can be reached.
 func (c *Config) Validate() []Problem {
 	var problems []Problem
 	add := func(section string, err error) {
