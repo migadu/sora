@@ -69,11 +69,38 @@ func (db *Database) ExpungeMessagesByIDs(ctx context.Context, tx pgx.Tx, message
 	if len(messageIDs) == 0 {
 		return 0, nil
 	}
+
+	// Lock the mailboxes rows of the live messages before expunging them, as every
+	// other unseen-mutating path does (see lockMailboxStats): without it the expunge
+	// trigger and a concurrent flag change's trigger can both charge the same unseen
+	// message to unseen_count. The messages may span several mailboxes (a purge passes
+	// a mailbox and its children), so the rows are locked in ascending id order, like
+	// the age-based expunge and MOVE, which keeps this deadlock-free against them.
+	rows, err := tx.Query(ctx, `
+		SELECT id FROM mailboxes
+		WHERE id IN (SELECT mailbox_id FROM messages WHERE id = ANY($1) AND expunged_at IS NULL)
+		ORDER BY id
+		FOR UPDATE
+	`, messageIDs)
+	if err != nil {
+		return 0, fmt.Errorf("failed to lock mailboxes for expunge by id: %w", err)
+	}
+	lockedMailboxIDs, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return 0, fmt.Errorf("failed to lock mailboxes for expunge by id: %w", err)
+	}
+
+	// Expunge only rows in a mailbox locked above. A message that was already expunged
+	// when the mailboxes were picked and has been restored since may sit in a mailbox
+	// this transaction does not hold, and locking that one now would break the ascending
+	// order; it is left alone, as if this ran before the restore. A row without a
+	// mailbox is expunged as before: the stats triggers skip it.
 	tag, err := tx.Exec(ctx, `
 		UPDATE messages
 		SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
 		WHERE id = ANY($1) AND expunged_at IS NULL
-	`, messageIDs)
+		  AND (mailbox_id = ANY($2) OR mailbox_id IS NULL)
+	`, messageIDs, lockedMailboxIDs)
 	if err != nil {
 		return 0, fmt.Errorf("failed to expunge messages by id: %w", err)
 	}

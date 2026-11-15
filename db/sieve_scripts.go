@@ -315,6 +315,23 @@ func (db *Database) DeleteScriptByName(ctx context.Context, tx pgx.Tx, AccountID
 	return err
 }
 
+// lockScriptActivations serialises the account's script activations for the rest of
+// tx. It is taken before the deactivation of the active script. Without it, an
+// activation that starts while another is uncommitted reads the old active script,
+// waits for the other's row lock on it and then skips it (already cleared), never
+// seeing the other's target: it clears nothing, and setting its own target active
+// violates idx_sieve_scripts_account_id_one_active (23505). Once the lock is granted,
+// the deactivation takes a new snapshot under READ COMMITTED and clears the target the
+// previous holder committed. The lock is transaction-scoped (pgbouncer transaction
+// mode) and precedes both row locks, so their order stays unchanged.
+func lockScriptActivations(ctx context.Context, tx pgx.Tx, AccountID int64) error {
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int4, hashint8($2::int8))",
+		consts.SoraSieveScriptActivateLockClassID, AccountID); err != nil {
+		return fmt.Errorf("failed to lock account sieve script activations: %w", err)
+	}
+	return nil
+}
+
 // SetScriptActiveByName sets the active state of the account's script called name,
 // as SetScriptActive. It returns consts.ErrDBNotFound when the account has no such
 // script; the caller must then roll tx back, which undoes the deactivation of the
@@ -329,6 +346,9 @@ func (db *Database) SetScriptActiveByName(ctx context.Context, tx pgx.Tx, Accoun
 		return consts.ErrDBNotFound
 	}
 	if active {
+		if err := lockScriptActivations(ctx, tx, AccountID); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, "UPDATE sieve_scripts SET active = false WHERE account_id = $1 AND active = true", AccountID); err != nil {
 			return fmt.Errorf("failed to deactivate other scripts: %w", err)
 		}
@@ -348,6 +368,9 @@ func (db *Database) SetScriptActive(ctx context.Context, tx pgx.Tx, scriptID, Ac
 	// If we are activating a script, we must first deactivate all other scripts for this user
 	// to ensure the UNIQUE index on (account_id, active=true) is not violated.
 	if active {
+		if err := lockScriptActivations(ctx, tx, AccountID); err != nil {
+			return err
+		}
 		_, err := tx.Exec(ctx, "UPDATE sieve_scripts SET active = false WHERE account_id = $1 AND active = true", AccountID)
 		if err != nil {
 			return fmt.Errorf("failed to deactivate other scripts: %w", err)
