@@ -8,6 +8,11 @@ import (
 	"path/filepath"
 )
 
+// AnyOwner, as the uid for CheckLegacyStaging, is for a caller that does not run as the
+// user the server stages bodies as, such as sora-admin, often run as root: every entry
+// counts whoever owns it, and one it cannot read is an error.
+const AnyOwner = -1
+
 func sameStagedFile(legacyFile, activeFile string) bool {
 	legacyInfo, err := os.Stat(legacyFile)
 	if err != nil {
@@ -69,7 +74,11 @@ func firstStagedBody(entryPath string) (string, error) {
 // those bodies under the new default, count every upload as missing its file and, once
 // max_attempts is used up, have their messages reaped: the staged file is the only copy of
 // a message until it reaches S3.
-func CheckLegacyStaging(path, newDefault, legacyPath string) error {
+//
+// uid is the user bodies were staged as: the server passes its own, as its uploader
+// stages as the user it runs as. A caller that cannot tell which user the server runs as
+// passes AnyOwner.
+func CheckLegacyStaging(path, newDefault, legacyPath string, uid int) error {
 	if filepath.Clean(path) != filepath.Clean(newDefault) {
 		return nil
 	}

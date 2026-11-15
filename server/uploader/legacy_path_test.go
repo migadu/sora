@@ -15,7 +15,7 @@ func TestCheckLegacyStaging(t *testing.T) {
 	newDefault := filepath.Join(root, "spool", "uploads")
 	legacy := filepath.Join(root, "tmp", "uploads")
 
-	if err := CheckLegacyStaging(newDefault, newDefault, legacy); err != nil {
+	if err := CheckLegacyStaging(newDefault, newDefault, legacy, os.Geteuid()); err != nil {
 		t.Fatalf("legacy directory absent: %v", err)
 	}
 
@@ -23,7 +23,7 @@ func TestCheckLegacyStaging(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(legacy, "42"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := CheckLegacyStaging(newDefault, newDefault, legacy); err != nil {
+	if err := CheckLegacyStaging(newDefault, newDefault, legacy, os.Geteuid()); err != nil {
 		t.Fatalf("legacy directory without bodies: %v", err)
 	}
 
@@ -31,7 +31,7 @@ func TestCheckLegacyStaging(t *testing.T) {
 	if err := os.WriteFile(body, []byte("staged"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err := CheckLegacyStaging(newDefault, newDefault, legacy)
+	err := CheckLegacyStaging(newDefault, newDefault, legacy, os.Geteuid())
 	if err == nil {
 		t.Fatal("default path with bodies staged under the legacy default: want an error, got nil")
 	}
@@ -40,15 +40,15 @@ func TestCheckLegacyStaging(t *testing.T) {
 	}
 
 	// Trailing slash or other spelling of the default is the same directory.
-	if err := CheckLegacyStaging(newDefault+"/", newDefault, legacy); err == nil {
+	if err := CheckLegacyStaging(newDefault+"/", newDefault, legacy, os.Geteuid()); err == nil {
 		t.Error("default path spelled with a trailing slash: want an error, got nil")
 	}
 
 	// An operator who configured a path chose where bodies live; nothing is inferred.
-	if err := CheckLegacyStaging(filepath.Join(root, "elsewhere"), newDefault, legacy); err != nil {
+	if err := CheckLegacyStaging(filepath.Join(root, "elsewhere"), newDefault, legacy, os.Geteuid()); err != nil {
 		t.Errorf("explicit non-default path: %v", err)
 	}
-	if err := CheckLegacyStaging(legacy, newDefault, legacy); err != nil {
+	if err := CheckLegacyStaging(legacy, newDefault, legacy, os.Geteuid()); err != nil {
 		t.Errorf("path set to the legacy directory itself: %v", err)
 	}
 }
@@ -75,7 +75,7 @@ func TestCheckLegacyStagingFollowsSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := CheckLegacyStaging(newDefault, newDefault, legacy); err == nil {
+	if err := CheckLegacyStaging(newDefault, newDefault, legacy, os.Geteuid()); err == nil {
 		t.Fatal("legacy directory is a symlink to staged bodies: want an error, got nil")
 	}
 
@@ -83,7 +83,7 @@ func TestCheckLegacyStagingFollowsSymlink(t *testing.T) {
 	if err := os.RemoveAll(target); err != nil {
 		t.Fatal(err)
 	}
-	if err := CheckLegacyStaging(newDefault, newDefault, legacy); err != nil {
+	if err := CheckLegacyStaging(newDefault, newDefault, legacy, os.Geteuid()); err != nil {
 		t.Errorf("dangling legacy symlink: %v", err)
 	}
 }
@@ -115,7 +115,7 @@ func TestCheckLegacyStagingFollowsNestedSymlink(t *testing.T) {
 				t.Fatal(err)
 			}
 			newDefault := filepath.Join(root, "new")
-			if err := CheckLegacyStaging(newDefault, newDefault, legacy); err == nil {
+			if err := CheckLegacyStaging(newDefault, newDefault, legacy, os.Geteuid()); err == nil {
 				t.Fatal("legacy spool reaches a staged body through a nested symlink; want refusal")
 			}
 		})
@@ -133,7 +133,7 @@ func TestCheckLegacyStagingSymlinkCycleWithoutBodies(t *testing.T) {
 		t.Fatal(err)
 	}
 	newDefault := filepath.Join(root, "new")
-	if err := CheckLegacyStaging(newDefault, newDefault, legacy); err != nil {
+	if err := CheckLegacyStaging(newDefault, newDefault, legacy, os.Geteuid()); err != nil {
 		t.Errorf("empty legacy spool with a symlink cycle: %v", err)
 	}
 }
@@ -157,7 +157,7 @@ func TestCheckLegacyStagingSharedSymlinkTarget(t *testing.T) {
 		if err := os.Symlink(newDefault, legacy); err != nil {
 			t.Fatal(err)
 		}
-		if err := CheckLegacyStaging(newDefault, newDefault, legacy); err != nil {
+		if err := CheckLegacyStaging(newDefault, newDefault, legacy, os.Geteuid()); err != nil {
 			t.Fatalf("legacy compatibility symlink to active spool refused startup: %v", err)
 		}
 	})
@@ -181,7 +181,7 @@ func TestCheckLegacyStagingSharedSymlinkTarget(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if err := CheckLegacyStaging(newDefault, newDefault, legacy); err != nil {
+		if err := CheckLegacyStaging(newDefault, newDefault, legacy, os.Geteuid()); err != nil {
 			t.Fatalf("active and legacy spool sharing symlink target refused startup: %v", err)
 		}
 	})
@@ -209,7 +209,7 @@ func TestCheckLegacyStagingSharedSymlinkTarget(t *testing.T) {
 		if err := os.Symlink(persistent, filepath.Join(legacy, "42")); err != nil {
 			t.Fatal(err)
 		}
-		if err := CheckLegacyStaging(newDefault, newDefault, legacy); err != nil {
+		if err := CheckLegacyStaging(newDefault, newDefault, legacy, os.Geteuid()); err != nil {
 			t.Fatalf("same account directory reachable under both spools refused startup: %v", err)
 		}
 
@@ -217,7 +217,7 @@ func TestCheckLegacyStagingSharedSymlinkTarget(t *testing.T) {
 		if err := os.Symlink(persistent, filepath.Join(legacy, "99")); err != nil {
 			t.Fatal(err)
 		}
-		if err := CheckLegacyStaging(newDefault, newDefault, legacy); err == nil {
+		if err := CheckLegacyStaging(newDefault, newDefault, legacy, os.Geteuid()); err == nil {
 			t.Fatal("legacy account 99 missing under active spool was not refused")
 		}
 	})
@@ -262,7 +262,7 @@ func TestCheckLegacyStagingBodyIdentity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = CheckLegacyStaging(active, active, legacy)
+			err = CheckLegacyStaging(active, active, legacy, os.Geteuid())
 			if (err != nil) != tc.wantRefusal {
 				t.Fatalf("refusal = %v, want %v (error: %v)", err != nil, tc.wantRefusal, err)
 			}
@@ -295,7 +295,7 @@ func TestCheckLegacyStagingCycleDoesNotHideStrandedBody(t *testing.T) {
 	if err := os.Symlink(legacy, filepath.Join(legacy, "42")); err != nil {
 		t.Fatal(err)
 	}
-	if err := CheckLegacyStaging(active, active, legacy); err == nil {
+	if err := CheckLegacyStaging(active, active, legacy, os.Geteuid()); err == nil {
 		t.Fatal("legacy account 42 reaches a body that is absent under the active account path; want refusal")
 	}
 	// The alias is safe once its identical subtree is also reachable at the same
@@ -303,7 +303,7 @@ func TestCheckLegacyStagingCycleDoesNotHideStrandedBody(t *testing.T) {
 	if err := os.Symlink(legacy, filepath.Join(active, "42")); err != nil {
 		t.Fatal(err)
 	}
-	if err := CheckLegacyStaging(active, active, legacy); err != nil {
+	if err := CheckLegacyStaging(active, active, legacy, os.Geteuid()); err != nil {
 		t.Fatalf("cyclic account alias is reachable through the active spool too: %v", err)
 	}
 	// The cycle's presence check also follows a body symlink outside the spool.
@@ -322,7 +322,140 @@ func TestCheckLegacyStagingCycleDoesNotHideStrandedBody(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := CheckLegacyStaging(active, active, legacy); err == nil {
+	if err := CheckLegacyStaging(active, active, legacy, os.Geteuid()); err == nil {
 		t.Fatal("cyclic account alias reaches an external body symlink missing under active account 42; want refusal")
+	}
+}
+
+// anotherUsersEntries makes the entries at paths belong to another local user, as if that
+// user had created them in the shared /tmp, and returns the uid to check as. Only root can
+// give a file away; any other user checks as a uid other than its own instead, so every
+// file the test made belongs to "another user".
+func anotherUsersEntries(t *testing.T, paths ...string) int {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		return os.Geteuid() + 1
+	}
+	for _, p := range paths {
+		if err := os.Lchown(p, 65534, 65534); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return 0
+}
+
+// TestCheckLegacyStagingIgnoresAnotherUsersSpool: any local user can create the legacy
+// default under /tmp. What another user put there holds no body the server staged, and
+// must not keep it from starting. sora-admin, which cannot tell who the server runs as,
+// still counts it.
+func TestCheckLegacyStagingIgnoresAnotherUsersSpool(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+
+	t.Run("planted body", func(t *testing.T) {
+		root := t.TempDir()
+		active, legacy := filepath.Join(root, "spool", "uploads"), filepath.Join(root, "tmp", "sora", "uploads")
+		account := filepath.Join(legacy, "x")
+		body := filepath.Join(account, hash)
+		if err := os.MkdirAll(account, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(body, []byte("planted"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		uid := anotherUsersEntries(t, filepath.Dir(legacy), legacy, account, body)
+		if err := CheckLegacyStaging(active, active, legacy, uid); err != nil {
+			t.Fatalf("legacy spool made by another user refused startup: %v", err)
+		}
+		if err := CheckLegacyStaging(active, active, legacy, AnyOwner); err == nil {
+			t.Fatal("AnyOwner: another user's legacy body: want refusal, got nil")
+		}
+	})
+
+	// A link to someone else's files is no spool: here root's /etc, whose files would
+	// count, root being trusted like the user the server runs as.
+	t.Run("planted symlink", func(t *testing.T) {
+		root := t.TempDir()
+		active, legacy := filepath.Join(root, "spool", "uploads"), filepath.Join(root, "tmp", "sora", "uploads")
+		if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("/etc", legacy); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckLegacyStaging(active, active, legacy, os.Geteuid()); err == nil {
+			t.Fatal("legacy spool linked by this user to root's files: want refusal, got nil")
+		}
+		uid := anotherUsersEntries(t, filepath.Dir(legacy), legacy)
+		if err := CheckLegacyStaging(active, active, legacy, uid); err != nil {
+			t.Fatalf("legacy spool linked by another user to root's files refused startup: %v", err)
+		}
+	})
+}
+
+// TestCheckLegacyStagingIgnoresUnreadableDirectory: another user's /tmp/sora with mode
+// 0700 cannot be read by the user the server runs as, nor can a directory of its own
+// that it lost access to. Neither holds a body it could upload. sora-admin still refuses:
+// what it cannot read, the server may.
+func TestCheckLegacyStagingIgnoresUnreadableDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads every directory")
+	}
+	for _, unreadable := range []string{"tmp/sora", "tmp/sora/uploads/x"} {
+		t.Run(unreadable, func(t *testing.T) {
+			root := t.TempDir()
+			active, legacy := filepath.Join(root, "spool", "uploads"), filepath.Join(root, "tmp", "sora", "uploads")
+			if err := os.MkdirAll(filepath.Join(legacy, "x"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(legacy, "x", strings.Repeat("a", 64)), []byte("planted"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			dir := filepath.Join(root, filepath.FromSlash(unreadable))
+			if err := os.Chmod(dir, 0); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { os.Chmod(dir, 0o755) })
+			if err := CheckLegacyStaging(active, active, legacy, os.Geteuid()); err != nil {
+				t.Fatalf("unreadable %s refused startup: %v", unreadable, err)
+			}
+			if err := CheckLegacyStaging(active, active, legacy, AnyOwner); err == nil {
+				t.Fatalf("AnyOwner: unreadable %s: want refusal, got nil", unreadable)
+			}
+		})
+	}
+}
+
+// TestCheckLegacyStagingIgnoresAnotherUsersEntries: inside a spool of the user the server
+// runs as, a directory or body of another user is passed over, while a body of its own
+// still refuses the start. Only root can give a file away.
+func TestCheckLegacyStagingIgnoresAnotherUsersEntries(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("only root can give a file to another user")
+	}
+	root := t.TempDir()
+	active, legacy := filepath.Join(root, "spool", "uploads"), filepath.Join(root, "tmp", "sora", "uploads")
+	hash := strings.Repeat("a", 64)
+	for _, dir := range []string{"41", "42"} {
+		if err := os.MkdirAll(filepath.Join(legacy, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(legacy, dir, hash), []byte("planted"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	uid := anotherUsersEntries(t, filepath.Join(legacy, "41"), filepath.Join(legacy, "42", hash))
+	if err := CheckLegacyStaging(active, active, legacy, uid); err != nil {
+		t.Fatalf("another user's directory and body in the legacy spool refused startup: %v", err)
+	}
+
+	own := filepath.Join(legacy, "43", hash)
+	if err := os.MkdirAll(filepath.Dir(own), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(own, []byte("staged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckLegacyStaging(active, active, legacy, uid); err == nil || !strings.Contains(err.Error(), own) {
+		t.Fatalf("own body next to another user's entries: want a refusal naming %s, got %v", own, err)
 	}
 }
