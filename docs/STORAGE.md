@@ -294,13 +294,15 @@ seconds, and at once whenever a message is queued on this node. In each pass it:
 
 ### 6.4 Leases and the write gate
 
-S3 deletes (by the cleanup worker and by account purges) and S3 writes for the same body
-must never overlap. Sora orders them with a per-body PostgreSQL advisory lock and a lease on
-the pending row:
+Within an account, Sora orders S3 deletes (by the cleanup worker and by account purges)
+and writes of a body with a PostgreSQL advisory lock keyed by `(accountID, contentHash)`
+and a lease on the pending row. Another account's reference to the same physical S3 key
+uses a different advisory lock; these locks do not exclude every writer of that key.
+For operations using the same account/hash key:
 
-- Before it writes, an upload briefly takes the body's lock. If a delete, a restore or a
-  cross-account copy of that body is running, the upload is deferred until the row's
-  `retry_interval` passes.
+- Before it writes, an upload briefly takes the body's lock. If a delete, a restore, or a
+  cross-account copy or move of that body is running, the upload is deferred until the
+  row's `retry_interval` passes.
 - Passing the gate leases the pending row to this upload for 2 minutes. The worker renews
   the lease every 30 seconds while the transfer runs. If it cannot renew in time, or the row
   is gone, it stops the transfer.
@@ -813,7 +815,7 @@ How it works:
    S3 key of the account's expunged messages (with no grace period), deletes the search
    vectors, and finally deletes the addresses and the account row.
 4. **Retries.** If something is still left at the end (an upload of one of its bodies is in
-   flight, a body is locked by a restore or copy, S3 refuses a delete, or a message arrived
+   flight, a body is locked by a restore, copy or move, S3 refuses a delete, or a message arrived
    shortly before the account went out of service), it runs the whole purge again, up to 5
    times in one go, with short pauses. If that is not enough, the attempt fails: the account
    stays out of service, and the next attempt waits 1 minute, doubling per failure up to

@@ -11,7 +11,7 @@ import (
 )
 
 // A client over the backend's max_connections_per_ip, named by a proxy's PROXY header,
-// is refused after the TLS handshake with a NO (TRYLATER) reply, so the proxy's
+// is refused after the TLS handshake with a BYE (TRYLATER) reply, so the proxy's
 // implicit-TLS dial succeeds and the refusal stays that client's. A silent close
 // before the handshake made the proxy count a backend failure, and two refused
 // connections of one client marked the backend unhealthy for every user (#703).
@@ -32,30 +32,34 @@ func TestPerIPRefusalOfPROXYClientKeepsBackendHealthy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConnectionManager: %v", err)
 	}
-	// greeting connects as the proxy does for clientIP and returns the backend's first line.
-	greeting := func(clientIP string) (string, error) {
+	// greeting connects as the proxy does for clientIP and returns the backend's first line and reader.
+	greeting := func(clientIP string) (string, *bufio.Reader, error) {
 		conn, _, err := cm.ConnectWithProxy(context.Background(), addr, clientIP, 51000, "127.0.0.1", 4190, nil)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		t.Cleanup(func() { conn.Close() })
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		return bufio.NewReader(conn).ReadString('\n')
+		r := bufio.NewReader(conn)
+		line, err := r.ReadString('\n')
+		return line, r, err
 	}
 
 	// An accepted connection's greeting starts with its capabilities.
-	if line, err := greeting("192.0.2.10"); err != nil || !strings.HasPrefix(line, `"IMPLEMENTATION"`) {
+	if line, _, err := greeting("192.0.2.10"); err != nil || !strings.HasPrefix(line, `"IMPLEMENTATION"`) {
 		t.Fatalf("first connection from 192.0.2.10: %q, %v", line, err)
 	}
 	for i := 1; i <= 3; i++ {
-		if line, err := greeting("192.0.2.10"); err != nil || !strings.HasPrefix(line, "NO (TRYLATER) ") {
-			t.Errorf("connection %d over the limit from 192.0.2.10: %q, %v; want a NO (TRYLATER) reply over TLS", i, line, err)
+		line, r, err := greeting("192.0.2.10")
+		if err != nil || line != "BYE (TRYLATER) \"Too many connections\"\r\n" {
+			t.Fatalf("connection %d over the limit from 192.0.2.10: %q, %v; want a BYE (TRYLATER) reply over TLS", i, line, err)
 		}
+		assertRefusalCloses(t, r)
 	}
 	if !cm.IsBackendHealthy(addr) {
 		t.Error("one client's per-IP refusals marked the backend unhealthy for every user")
 	}
-	if line, err := greeting("192.0.2.11"); err != nil || !strings.HasPrefix(line, `"IMPLEMENTATION"`) {
+	if line, _, err := greeting("192.0.2.11"); err != nil || !strings.HasPrefix(line, `"IMPLEMENTATION"`) {
 		t.Errorf("connection from another client, 192.0.2.11: %q, %v", line, err)
 	}
 }
