@@ -206,6 +206,134 @@ func TestSearchSentKeysUseHeaderDay(t *testing.T) {
 	}
 }
 
+// TestSearchSentKeysSkipMessagesWithoutDateHeader is the regression test for #1118: a
+// message without a Date: header has no Date: header day, so SENTBEFORE, SENTON and
+// SENTSINCE match none of it (RFC 9051 §6.4.4: "Messages whose [RFC5322] Date: header
+// field ..."), and NOT of them matches it. sent_date holds its INTERNALDATE, the sent date
+// SORT and THREAD order it by (RFC 5256 §2.2), which the SENT* keys must not mistake for
+// a header. Every statement that takes search criteria is checked, the full-text query
+// shapes included.
+func TestSearchSentKeysSkipMessagesWithoutDateHeader(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	db, accountID, mailboxID := setupSearchTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	day := func(y int, mo time.Month, d int) time.Time { return time.Date(y, mo, d, 0, 0, 0, 0, time.UTC) }
+	insert := func(name string, sent, internal time.Time) imap.UID {
+		t.Helper()
+		opts := sentDayOptions(accountID, mailboxID, name, sent)
+		opts.InternalDate = internal
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		_, uid, err := db.InsertMessage(ctx, tx, opts,
+			PendingUpload{InstanceID: "test", ContentHash: opts.ContentHash, Size: 100, AccountID: accountID})
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+		return imap.UID(uid)
+	}
+	const (
+		noDate = "msg without Date: (INTERNALDATE 1-Jan-2020 10:00 +0000)"
+		jan1   = "msg dated 1-Jan-2020 12:00 +0000"
+		jan3   = "msg dated 3-Jan-2020 12:00 +0000"
+	)
+	nameOf := map[imap.UID]string{
+		insert(noDate, time.Time{}, time.Date(2020, 1, 1, 10, 0, 0, 0, time.UTC)):    noDate,
+		insert(jan1, time.Date(2020, 1, 1, 12, 0, 0, 0, time.UTC), day(2030, 6, 15)): jan1,
+		insert(jan3, time.Date(2020, 1, 3, 12, 0, 0, 0, time.UTC), day(2030, 6, 15)): jan3,
+	}
+
+	senton := func(d time.Time) imap.SearchCriteria {
+		return imap.SearchCriteria{SentSince: d, SentBefore: d.Add(24 * time.Hour)}
+	}
+	tests := []struct {
+		key      string
+		criteria imap.SearchCriteria
+		want     []string
+	}{
+		// The fixture itself: the message is found by its INTERNALDATE.
+		{"ON 1-Jan-2020", imap.SearchCriteria{Since: day(2020, 1, 1), Before: day(2020, 1, 2)}, []string{noDate}},
+		{"SENTON 1-Jan-2020", senton(day(2020, 1, 1)), []string{jan1}},
+		{"SENTSINCE 1-Jan-2020", imap.SearchCriteria{SentSince: day(2020, 1, 1)}, []string{jan1, jan3}},
+		{"SENTBEFORE 2-Jan-2020", imap.SearchCriteria{SentBefore: day(2020, 1, 2)}, []string{jan1}},
+		// More than a day from the INTERNALDATE, where sent_date alone decides.
+		{"SENTSINCE 1-Dec-2019", imap.SearchCriteria{SentSince: day(2019, 12, 1)}, []string{jan1, jan3}},
+		{"SENTBEFORE 1-Feb-2020", imap.SearchCriteria{SentBefore: day(2020, 2, 1)}, []string{jan1, jan3}},
+		{"NOT SENTON 1-Jan-2020", imap.SearchCriteria{Not: []imap.SearchCriteria{senton(day(2020, 1, 1))}}, []string{noDate, jan3}},
+		{"NOT SENTBEFORE 1-Feb-2020", imap.SearchCriteria{Not: []imap.SearchCriteria{{SentBefore: day(2020, 2, 1)}}}, []string{noDate}},
+		{"OR SENTON 1-Jan-2020 SENTON 3-Jan-2020", imap.SearchCriteria{Or: [][2]imap.SearchCriteria{{senton(day(2020, 1, 1)), senton(day(2020, 1, 3))}}}, []string{jan1, jan3}},
+	}
+
+	uids := func(res []SearchMessageResult, err error) []imap.UID {
+		t.Helper()
+		require.NoError(t, err)
+		out := []imap.UID{}
+		for _, r := range res {
+			out = append(out, r.UID)
+		}
+		return out
+	}
+	// Each statement shape of getSearchMessagesQueryExecutor, and THREAD's. TEXT "msg" and
+	// NOT BODY "zzzz" match every fixture (the subjects; no body has an FTS row), so they
+	// only steer the search onto the full-text shapes; a mailbox count of ftsCTEThreshold
+	// selects the prefiltered ones.
+	withTerm := func(c imap.SearchCriteria, text, notBody bool) *imap.SearchCriteria {
+		if text {
+			c.Text = append(c.Text, "msg")
+		}
+		if notBody {
+			c.Not = append(c.Not, imap.SearchCriteria{Body: []string{"zzzz"}})
+		}
+		return &c
+	}
+	commands := []struct {
+		name string
+		run  func(c imap.SearchCriteria) []imap.UID
+	}{
+		{"SEARCH", func(c imap.SearchCriteria) []imap.UID {
+			return uids(db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, &c, 0, 3))
+		}},
+		{"SEARCH TEXT", func(c imap.SearchCriteria) []imap.UID {
+			return uids(db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, withTerm(c, true, false), 0, 3))
+		}},
+		{"SEARCH TEXT prefiltered", func(c imap.SearchCriteria) []imap.UID {
+			return uids(db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, withTerm(c, true, false), 0, ftsCTEThreshold))
+		}},
+		{"SEARCH NOT BODY", func(c imap.SearchCriteria) []imap.UID {
+			return uids(db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, withTerm(c, false, true), 0, 3))
+		}},
+		{"SEARCH NOT BODY prefiltered", func(c imap.SearchCriteria) []imap.UID {
+			return uids(db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, withTerm(c, false, true), 0, ftsCTEThreshold))
+		}},
+		{"SORT", func(c imap.SearchCriteria) []imap.UID {
+			return uids(db.SearchMessagesSorted(ctx, mailboxID, accountID, &c, []imap.SortCriterion{{Key: imap.SortKeyDate}}, 0, 3))
+		}},
+		{"THREAD", func(c imap.SearchCriteria) []imap.UID {
+			res, err := db.GetMessagesForThreading(ctx, mailboxID, accountID, &c, false, false, 0)
+			require.NoError(t, err)
+			out := []imap.UID{}
+			for _, r := range res {
+				out = append(out, r.UID)
+			}
+			return out
+		}},
+	}
+	for _, cmd := range commands {
+		for _, tt := range tests {
+			t.Run(cmd.name+" "+tt.key, func(t *testing.T) {
+				got := []string{}
+				for _, uid := range cmd.run(tt.criteria) {
+					got = append(got, nameOf[uid])
+				}
+				assert.ElementsMatch(t, tt.want, got)
+			})
+		}
+	}
+}
+
 // TestSentDateOffsetStored checks what the insert paths record for the Date: header's
 // zone: its offset from UTC in seconds, which COPY and MOVE carry with the rest of the row
 // (TestCopyMoveCarryEveryMessageColumn), and NULL for a zone further than a day from UTC,
@@ -291,7 +419,9 @@ func (n sentPlanNode) walk(visit func(sentPlanNode)) {
 // TestSentDateSearchIsIndexOnly guards the cost of the SENT* keys: the zone offset is not
 // in the header covering index (idx_messages_mailbox_headers_v2), so the mailbox must still
 // be read through an Index Only Scan, and the offset looked up only for the messages sent
-// within a day of the searched date, where the zone can decide the day.
+// within a day of the searched date, where the zone can decide the day. Neither is
+// sent_date_unknown (#1118): the mailbox's messages without a Date: header are read once,
+// from their own partial index.
 func TestSentDateSearchIsIndexOnly(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -324,6 +454,12 @@ func TestSentDateSearchIsIndexOnly(t *testing.T) {
 		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags)
 		SELECT id, mailbox_id, 0, '[]'::jsonb FROM inserted`, accountID, mailboxID, bsBytes, rows, start)
 	require.NoError(t, err)
+	// A few messages without a Date: header, sent_date being their INTERNALDATE, well after
+	// the searched date: SENTSINCE must leave them out (#1118).
+	const noDateRows = 5
+	_, err = db.GetWritePool().Exec(ctx, `UPDATE messages SET sent_date_unknown = TRUE
+		WHERE mailbox_id = $1 AND uid BETWEEN 15000 AND $2`, mailboxID, 15000+noDateRows-1)
+	require.NoError(t, err)
 	_, err = db.GetWritePool().Exec(ctx, "VACUUM ANALYZE messages")
 	require.NoError(t, err)
 	_, err = db.GetWritePool().Exec(ctx, "VACUUM ANALYZE message_state")
@@ -336,7 +472,7 @@ func TestSentDateSearchIsIndexOnly(t *testing.T) {
 
 	// SENTSINCE 1-Jun-2025: every message from then on (hours 12408 to 20000).
 	since := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
-	wantMatches := rows - int(since.Sub(start).Hours()) + 1
+	wantMatches := rows - int(since.Sub(start).Hours()) + 1 - noDateRows
 	results, err := traced.SearchMessagesWithCriteria(ctx, mailboxID, accountID, &imap.SearchCriteria{SentSince: since}, 0, rows)
 	require.NoError(t, err)
 	require.Len(t, results, wantMatches)
@@ -375,7 +511,8 @@ func TestSentDateSearchIsIndexOnly(t *testing.T) {
 	require.Len(t, explained, 1)
 
 	indexName, _ := headerIndex(t)
-	var indexOnly bool
+	const noDateIndex = "idx_messages_mailbox_sent_date_unknown"
+	var indexOnly, noDateIndexed bool
 	var other []string
 	explained[0].Plan.walk(func(n sentPlanNode) {
 		if n.RelationName != "messages" {
@@ -385,9 +522,14 @@ func TestSentDateSearchIsIndexOnly(t *testing.T) {
 			indexOnly = true
 			return
 		}
+		if n.NodeType == "Index Only Scan" && n.IndexName == noDateIndex {
+			noDateIndexed = true
+			return
+		}
 		other = append(other, n.NodeType+" "+n.IndexName)
 	})
 	assert.True(t, indexOnly, "SENTSINCE must read the mailbox through an Index Only Scan on %s; plan:\n%s", indexName, string(raw))
+	assert.True(t, noDateIndexed, "SENTSINCE must read the messages without a Date: header through an Index Only Scan on %s; plan:\n%s", noDateIndex, string(raw))
 	assert.Empty(t, other, "SENTSINCE must not read messages any other way; plan:\n%s", string(raw))
 
 	if !superuser {
