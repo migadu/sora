@@ -27,7 +27,7 @@ func (d *Database) GetVanishedUIDs(ctx context.Context, mailboxID int64, sinceMo
 		ORDER BY uid
 	`
 
-	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, sinceModSeq, untilModSeq)
+	rows, err := d.readQuerier(ctx).Query(ctx, query, mailboxID, sinceModSeq, untilModSeq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query vanished UIDs: %w", err)
 	}
@@ -101,7 +101,7 @@ func (d *Database) GetMessagesChangedSince(ctx context.Context, mailboxID int64,
 	}
 	query += ` ORDER BY uid`
 
-	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
+	rows, err := d.readQuerier(ctx).Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query changed messages: %w", err)
 	}
@@ -262,7 +262,7 @@ func (d *Database) GetActiveUIDsInSet(ctx context.Context, mailboxID int64, uidS
 	}
 	query := `SELECT uid FROM ` + seqCountedRows("$1", viewParam, "("+strings.Join(conditions, " OR ")+")") + ` counted ORDER BY uid`
 
-	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
+	rows, err := d.readQuerier(ctx).Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query active UIDs in set: %w", err)
 	}
