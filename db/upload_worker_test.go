@@ -176,6 +176,46 @@ func TestAcquireAndLeasePendingUploads(t *testing.T) {
 	}
 }
 
+// The lease's retry_interval cutoff is measured on the clock that wrote last_attempt,
+// the database's. Measured on the worker's clock, a node running ahead of the database
+// by retry_interval or more takes back rows its running pass leased a moment ago: the
+// tight loop of #1091 with a valid retry_interval. A transaction's now() is its start
+// time, so a transaction held open for two seconds sees a database clock two seconds
+// behind the worker's.
+func TestAcquireAndLeasePendingUploads_CutoffUsesDatabaseClock(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	db := setupUploadWorkerTest(t)
+
+	ctx := context.Background()
+	testEmail := fmt.Sprintf("test_lease_clock_%d@example.com", time.Now().UnixNano())
+	accountID := createTestAccount(t, db, testEmail, "password")
+	const instanceID = "test-instance-clock"
+	recent := createPendingUpload(t, db, accountID, instanceID, "hash-recent", 0, time.Time{}, 1024)
+	due := createPendingUpload(t, db, accountID, instanceID, "hash-due", 0, time.Time{}, 1024)
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	// By the database clock, one row was leased half a second ago, the other 1.5s ago.
+	_, err = tx.Exec(ctx, `
+		UPDATE pending_uploads
+		SET last_attempt = now() - CASE WHEN id = $1 THEN interval '500 milliseconds' ELSE interval '1500 milliseconds' END
+		WHERE id = ANY($2)`, recent, []int64{recent, due})
+	require.NoError(t, err)
+	time.Sleep(2 * time.Second)
+
+	uploads, err := db.AcquireAndLeasePendingUploads(ctx, tx, instanceID, 10, time.Second, 3)
+	require.NoError(t, err)
+	var got []string
+	for _, u := range uploads {
+		got = append(got, u.ContentHash)
+	}
+	assert.Equal(t, []string{"hash-due"}, got, "with a 1s retry_interval only the row leased 1.5s ago (database clock) is due")
+}
+
 func TestMarkUploadAttempt(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
