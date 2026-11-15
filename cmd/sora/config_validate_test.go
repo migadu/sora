@@ -20,7 +20,8 @@ const storageTOML = "[database.write]\nhosts = [\"db.example.com\"]\n\n[s3]\nend
 // The [relay.queue] durations, [cluster] addr and secret_key, and the [database] and
 // [s3] the servers need were also checked only in service setup (#921), and so were
 // [uploader] max_staging_size, the [s3] keys, the [database] durations and [tls] (#1092,
-// #1095, #1104, #1105).
+// #1095, #1104, #1105). [timeout_scheduler] shard_count was refused only once logging
+// was set up (#1325).
 func TestStartupChecksTheWholeFile(t *testing.T) {
 	const imapBackend = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"
 	const imapProxy = "\n[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:1143\"\nremote_addrs = [\"192.0.2.10:143\"]\n"
@@ -146,6 +147,11 @@ func TestStartupChecksTheWholeFile(t *testing.T) {
 		},
 
 		{name: "cluster port overflow", content: "[cluster]\nenabled = true\naddr = \"10.10.10.40:999999999999999999999999999999\"\nsecret_key = \"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\"\n" + metrics, wantErr: []string{`invalid configuration - [cluster]: cluster port "999999999999999999999999999999" is not a valid port`}},
+		{
+			name:    "timeout_scheduler shard_count below -1",
+			content: "[timeout_scheduler]\nshard_count = -2\n" + metrics,
+			wantErr: []string{"invalid configuration - [timeout_scheduler]: shard_count must be >= -1, got -2"},
+		},
 		{
 			name: "every problem reported",
 			content: "[servers]\ntrusted_networks = []\n\n[relay]\ntype = \"SMTP\"\nsmtp_host = \"smtp.example.com:587\"\n" +
