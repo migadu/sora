@@ -42,7 +42,7 @@ func TestStartupRefusesInvalidSharedNamespacePrefix(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.toml")
-			content := "[shared_mailboxes]\n" + tt.section +
+			content := storageTOML + "[shared_mailboxes]\n" + tt.section +
 				"\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:0\"\n"
 			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 				t.Fatal(err)

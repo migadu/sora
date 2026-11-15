@@ -40,7 +40,7 @@ api_key = "a-long-random-token"   # optional bearer token
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `addr` | string | required | Listen address. |
-| `path` | string | — | URL path, such as `"/metrics"`. Only this exact path serves metrics. |
+| `path` | string | `"/metrics"` | URL path. Only this exact path serves metrics. Must begin with `/`. |
 | `allowed_hosts` | list of strings | empty (any host) | IP addresses or CIDR blocks allowed to scrape. Other peers get `403 forbidden`. |
 | `api_key` | string | none | When set, every request needs `Authorization: Bearer <key>`. Without the header the answer is `401 unauthorized`; with a wrong key, `403 forbidden`. |
 | `enable_domain_metrics` | bool | `true` | Count activity per mail domain (see [3.18](#318-domain-and-user-metrics)). |
@@ -66,7 +66,8 @@ user metrics on, it can show user names, and with `hash_usernames = false` it sh
 text.
 
 The five `enable_*`, `user_metrics_threshold`, `max_tracked_users` and `hash_usernames` settings
-apply to the whole process. With several `metrics` blocks, the last one in the file wins.
+apply to the whole process, but only a `metrics` block sets them: in another block they are ignored,
+with a startup warning. With several `metrics` blocks, the last one in the file wins.
 
 The metrics server is not reloaded by `SIGHUP`: restart Sora to change it. See
 [CONFIGURATION.md](CONFIGURATION.md#6-reloading-with-sighup).
@@ -135,7 +136,7 @@ Types: a **counter** only goes up (use `rate()` or `increase()`), a **gauge** go
 |---|---|---|---|
 | `sora_authentication_attempts_total` | counter | `protocol`, `server_name`, `hostname`, `result` | Login attempts. `result`: `success`, `failure`; `rate_limited` on `pop3`; `unavailable` on the IMAP, POP3 and ManageSieve proxies (the remote lookup service was temporarily unavailable). |
 | `sora_password_verification_attempts_total` | counter | `hash_type`, `result` | Password hash checks. `hash_type`: `bcrypt`, `blf_crypt`, `ssha512`, `sha512`, `unknown`. `result`: `success`, `failure`. |
-| `sora_auth_rate_limiter_ip_username_entries` | gauge | `protocol`, `server_name`, `hostname` | Tracked IP-and-user pairs in the login rate limiter. `protocol`: `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `userapi`. |
+| `sora_auth_rate_limiter_ip_username_entries` | gauge | `protocol`, `server_name`, `hostname` | Tracked IP-and-user pairs in the login rate limiter. `protocol`: `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `userapi`, `userapi_proxy`. |
 | `sora_auth_rate_limiter_ip_entries` | gauge | same | Tracked IPs with failures. |
 | `sora_auth_rate_limiter_username_entries` | gauge | same | Tracked user names with failures. |
 | `sora_auth_rate_limiter_blocked_ips` | gauge | same | IPs blocked now. |

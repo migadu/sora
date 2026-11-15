@@ -49,7 +49,7 @@ func TestStartupConfigWarningsReachTheConfiguredLog(t *testing.T) {
 		logPath := filepath.Join(t.TempDir(), "sora.log")
 		// shard_count = -2 stops start-up right after logging is configured: the timeout
 		// scheduler refuses it before any database or listener is touched.
-		out, err := run(t, fmt.Sprintf("[logging]\noutput = %q\nlevel = \"warn\"\n\n[timeout_scheduler]\nshard_count = -2\n\n", logPath)+misspelt+pop3)
+		out, err := run(t, fmt.Sprintf("[logging]\noutput = %q\nlevel = \"warn\"\n\n[timeout_scheduler]\nshard_count = -2\n\n", logPath)+storageTOML+misspelt+pop3)
 		if err == nil {
 			t.Fatalf("start-up went on; want it stopped by shard_count = -2:\n%s", out)
 		}

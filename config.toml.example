@@ -646,7 +646,8 @@ max_attempts = 5              # Attempts after which an upload is parked ("faile
 retry_interval = "30s"        # Delay before a failed upload is leased again. When every upload in a cycle fails
                               # (provider or database outage) the worker backs off exponentially from this value,
                               # doubling per failed cycle up to 10 minutes, and resumes on the first success.
-cleanup_grace_period = "1h"   # Minimum age of a local upload file before cleanup considers it.
+cleanup_grace_period = "1h"   # Minimum age of a local upload file before cleanup considers it. Must be positive and
+                              # longer than any delivery transaction can take.
 max_staging_size = "100gb"    # Maximum size of this node's own upload staging backlog (e.g. "100gb"); other nodes' backlogs do not count. If set and exceeded, new messages (IMAP APPEND, LMTP and Admin API deliveries) are refused.
 
 # CLEANUP PROCESS CONFIGURATION
@@ -813,7 +814,7 @@ max_total_size = 1048576       # Maximum total metadata size per account (1MB). 
 
 [shared_mailboxes]
 enabled = false                  # Enable shared mailbox functionality (default: false)
-namespace_prefix = "Shared/"     # IMAP namespace prefix (e.g., "Shared/" or "#shared/"); must end with "/" and cannot be "INBOX/"
+namespace_prefix = "Shared/"     # IMAP namespace prefix (e.g., "Shared/" or "#shared/"); must be a mailbox name followed by "/", and not "INBOX/"
 allow_user_create = false        # Allow users to create shared mailboxes over IMAP (false = admin-only: sora-admin mailbox create)
 allow_anyone_identifier = false  # Allow granting rights to "anyone" (every user in the owner's domain); existing grants stay until revoked
 default_rights = "lrswipkxtea"   # Default ACL rights for shared mailbox creators (full rights by default)
@@ -1131,9 +1132,15 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # A capability another one implies is removed together with it: disabling an
 # extension IMAP4rev2 includes (IDLE, ESEARCH, SEARCHRES, MOVE, NAMESPACE,
 # UIDPLUS, LIST-STATUS, STATUS=SIZE, CHILDREN, ...) also removes IMAP4rev2, so
-# the server offers IMAP4rev1 with its remaining extensions; disabling CONDSTORE
-# also removes QRESYNC; disabling SORT also removes SORT=DISPLAY and ESORT.
-# client_filters follow the same rule.
+# the server offers IMAP4rev1 with its remaining extensions; disabling ESEARCH
+# also removes SEARCHRES, ESORT and MULTISEARCH; disabling CONDSTORE also
+# removes QRESYNC; disabling SORT also removes SORT=DISPLAY and ESORT; disabling
+# SPECIAL-USE also removes CREATE-SPECIAL-USE.
+# client_filters follow the same rule, except that a filter never takes away
+# what the connection has already enabled (ENABLE IMAP4rev2/CONDSTORE/QRESYNC,
+# any CONDSTORE enabling command, IMAP4rev2 on a server without IMAP4rev1):
+# a client that sends ID after ENABLE IMAP4rev2 keeps IMAP4rev2 and every
+# extension it includes.
 # IMAP4rev2 includes BINARY's FETCH items but not its APPEND extension, so
 # disabling BINARY keeps IMAP4rev2 and refuses only APPEND with a literal8;
 # FETCH BINARY, BINARY.PEEK and BINARY.SIZE are refused once IMAP4rev2 is
@@ -1409,7 +1416,7 @@ proxy_protocol_timeout = "5s"
 
 # --- MESSAGE SIZE LIMITING ---
 # Maximum size for incoming LMTP messages to prevent memory exhaustion attacks
-max_message_size = "50mb"     # Maximum message size (default: 50MB, 0 = unlimited)
+max_message_size = "50mb"     # Maximum message size (default: 50MB; 0 also means 50MB, there is no unlimited)
 
 # --- SIEVE REDIRECT LIMITS ---
 # Applied when a delivery runs the recipient's Sieve script: by lmtp servers and by
@@ -1823,10 +1830,9 @@ limits.max_auth_errors = 2                  # Number of protocol errors before a
 # - If HTTP endpoint returns 404/3xx → respects lookup_local_users setting (user partitioning)
 # - If HTTP endpoint returns 401/403 → authentication rejected (no fallback); the way to refuse an account.
 #   On a route-only lookup too: an LMTP recipient gets the user_not_found_response reply, with or
-#   without [[pool]] blocks, and is never looked up in the local database; with [[pool]] blocks the
-#   User API proxy answers a login 401 as a wrong password (see NAMED BACKEND POOLS), and any other
-#   route-only refusal (a User API request carrying a token: 503) is a temporary failure, never the
-#   default pool
+#   without [[pool]] blocks, and is never looked up in the local database; the User API proxy, with
+#   [[pool]] blocks or remote_addrs, answers a login 401 as a wrong password (see NAMED BACKEND
+#   POOLS), and a request carrying a token 503, never sending either to a backend
 # - If HTTP endpoint returns other 4xx/5xx, or a 200 that is not JSON with address and password_hash
 #   → service unavailable (no verdict on the password), ALWAYS reject (no fallback); 5xx, 408, 429
 #   and malformed 200s also count toward the circuit breaker
@@ -2421,6 +2427,8 @@ tls_verify = false
 #remote_tls = false                  # Use HTTPS for backend connections
 #remote_tls_verify = true            # Verify backend TLS certificates
 #remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots; only for backends in no [[pool]].
+#auth_rate_limit.enabled = true      # Rate limit every login through the proxy, including those it refuses itself (named pools);
+                                    # leave it off on the http_user_api backends behind it. Keys as in the IMAP example above.
 
 # IMPORTANT: Backend User API servers should configure allowed_hosts to trust this proxy
 # Backend configuration example:

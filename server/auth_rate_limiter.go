@@ -547,6 +547,26 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 		return // Skip if IP-only blocking is disabled
 	}
 
+	failures, delay, firstFailure, blockedUntil := a.countIPFailure(ip, failureTime)
+
+	// The cluster is told with ipMu released: queueEvent applies the event to the
+	// protocol's other limiters on this node under their locks, and any of them
+	// may be handing this limiter an event of its own at the same time.
+	if a.clusterLimiter == nil {
+		return
+	}
+	if !blockedUntil.IsZero() {
+		a.clusterLimiter.BroadcastBlockIP(ip, blockedUntil, failures, firstFailure)
+	} else if failures >= a.config.DelayStartThreshold {
+		// Failure count for progressive delays
+		a.clusterLimiter.BroadcastFailureCount(ip, failures, delay, firstFailure)
+	}
+}
+
+// countIPFailure counts a failure of ip, moves its progressive delay and blocks
+// it at max_attempts_per_ip. It returns the failure count, the delay, the first
+// failure and, if the failure blocked ip, the end of the block.
+func (a *AuthRateLimiter) countIPFailure(ip string, failureTime time.Time) (failures int, delay time.Duration, firstFailure, blockedUntil time.Time) {
 	a.ipMu.Lock()
 	defer a.ipMu.Unlock()
 
@@ -584,13 +604,12 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 	}
 
 	if info.FailureCount >= a.config.MaxAttemptsPerIP {
-		blockedUntil := failureTime.Add(a.config.IPBlockDuration)
+		blockedUntil = failureTime.Add(a.config.IPBlockDuration)
 		// failureTime was captured before ipMu: an earlier in-flight failure
 		// must not shorten a block recorded by a later failure (or another node).
 		if previous, exists := a.blockedIPs[ip]; exists && previous.BlockedUntil.After(blockedUntil) {
 			blockedUntil = previous.BlockedUntil
 		}
-		// Already have ipMu lock from line 338, no need to lock again
 		a.blockedIPs[ip] = &BlockedIPInfo{
 			BlockedUntil: blockedUntil,
 			FailureCount: info.FailureCount,
@@ -603,19 +622,10 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 			"ip", ip,
 			"failure_count", info.FailureCount,
 			"blocked_until", blockedUntil.Format(time.RFC3339))
-
-		// Broadcast to cluster
-		if a.clusterLimiter != nil {
-			a.clusterLimiter.BroadcastBlockIP(ip, blockedUntil, info.FailureCount, info.FirstFailure)
-		}
 	} else if info.FailureCount >= a.config.DelayStartThreshold {
 		logger.Debug("Auth limiter: Progressive delay for IP", "protocol", a.protocol, "ip", ip, "delay", info.LastDelay, "failures", info.FailureCount)
-
-		// Broadcast failure count to cluster for progressive delays
-		if a.clusterLimiter != nil {
-			a.clusterLimiter.BroadcastFailureCount(ip, info.FailureCount, info.LastDelay, info.FirstFailure)
-		}
 	}
+	return info.FailureCount, info.LastDelay, info.FirstFailure, blockedUntil
 }
 
 // clearFailureTracking clears the Tier 2 state of ip after a successful login, unless
@@ -736,6 +746,15 @@ func (a *AuthRateLimiter) updateUsernameFailure(username string, failureTime tim
 		return // Skip empty usernames
 	}
 
+	a.countUsernameFailure(username, failureTime)
+
+	// Broadcast to cluster, with usernameMu released (see updateFailureTracking)
+	if a.clusterLimiter != nil {
+		a.clusterLimiter.BroadcastUsernameFailure(username)
+	}
+}
+
+func (a *AuthRateLimiter) countUsernameFailure(username string, failureTime time.Time) {
 	a.usernameMu.Lock()
 	defer a.usernameMu.Unlock()
 
@@ -752,11 +771,6 @@ func (a *AuthRateLimiter) updateUsernameFailure(username string, failureTime tim
 
 	info.FailureCount++
 	info.LastFailure = failureTime
-
-	// Broadcast to cluster
-	if a.clusterLimiter != nil {
-		a.clusterLimiter.BroadcastUsernameFailure(username)
-	}
 }
 
 // clearUsernameFailure clears username failure tracking (cluster-synchronized)

@@ -249,11 +249,8 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	if internalDate.IsZero() {
 		internalDate = time.Now() // last-resort: current time
 	}
-	// sentDate is kept as-is (from the message's Date: header) for SentDate.
-	// If the message had no Date: header at all, align SentDate with internalDate.
-	if sentDate.IsZero() {
-		sentDate = internalDate
-	}
+	// sentDate stays zero without a Date: header that parses: the insert stores the
+	// INTERNALDATE as the sent date and the ENVELOPE reports the date as NIL.
 
 	// Extract body structure with panic recovery for malformed messages
 	// Attachment classification reads the raw message separately, so a

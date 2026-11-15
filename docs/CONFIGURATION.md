@@ -170,8 +170,9 @@ Things to know:
   `enabled = false`. See [9.10](#910-lookup-cache-serverlookup_cache).
 - **A database endpoint you do not write means "no database".** Without a `[database.write]` (or
   `[database.read]`) section in the file, Sora has no such endpoint. This is how a proxy-only node
-  runs without one. A node that needs a database and has none stops with `database is required for
-  configured servers but not configured in [database.write] or [database.read]`.
+  runs without one. A node that needs a database and has none stops with `[database]: server
+  "<name>" (<type>) needs the database, but it is not configured in [database.write] or
+  [database.read]`.
 
 ---
 
@@ -180,9 +181,8 @@ Things to know:
 After parsing, Sora checks the configuration before it opens any listener. Each failed check below
 stops startup with exit status 1. The checks on the file itself run before logging is set up, so
 they write a line of the form `[ERROR] <date> <time> ERROR: invalid configuration - <what>: <reason>`
-to standard error. The S3 and database checks run after it, so their failures are ERROR records of
-the `[logging]` output, in its format: `msg="Invalid configuration" field=<what> error=<reason>`
-with the console format.
+to standard error, one for each problem the file has. The `[timeout_scheduler]` check runs after it,
+so its failure is an ERROR record of the `[logging]` output, in its format.
 
 | Check | Message |
 |---|---|
@@ -190,19 +190,30 @@ with the console format.
 | `master_username` is set and `master_password` is empty | `server "<name>": master_username is set but master_password is empty; refusing to start ...` |
 | `master_sasl_username` is set and `master_sasl_password` is empty | `server "<name>": master_sasl_username is set but master_sasl_password is empty; refusing to start ...` |
 | `[[pool]]` blocks are inconsistent (see [section 10](#10-named-backend-pools-pool)) | `[[pool]]: ...` |
+| A proxy server (a type ending in `_proxy`) has no `remote_addrs` and the file has no `[[pool]]` blocks | `server '<name>': remote_addrs is required unless the file declares [[pool]] blocks` |
 | A server has `proxy_protocol = true` and `[servers] trusted_networks` is empty | `trusted_networks: proxy_protocol is enabled on server(s) <names> but [servers] trusted_networks is empty; ...` |
 | Two servers have the same `name` | `duplicate server name '<name>' found. Each server must have a unique name` |
 | Two servers have the same `addr` string | `duplicate server address '<addr>' found. Server '<a>' and '<b>' cannot bind to the same address` |
 | A `[[server]]` block lacks `type`, `name` or `addr` | for example `server address is required` |
-| No server is configured | `no servers configured. Please configure at least one server in the [[server]] section` |
-| An IMAP, POP3 or LMTP server is configured but `[s3]` lacks `access_key`, `secret_key` or `bucket` | `missing required S3 credentials for mail services (IMAP, LMTP, POP3)` |
-| An IMAP, POP3 or LMTP server is configured and `[s3] endpoint` is empty | `S3 endpoint not specified` |
-| A server that needs the database is configured and there is no database endpoint (see [section 3](#3-defaults)) | `database is required for configured servers but not configured in [database.write] or [database.read]` |
+| No server is configured | `no servers configured. Please configure at least one server in a [[server]] section` |
+| An IMAP, POP3 or LMTP server is configured, or an `http_user_api` server with any `[s3]` connection setting, and `[s3] bucket` or `endpoint` is empty, or `timeout` is not a duration | `[s3]: bucket is required ...`, `[s3]: endpoint is required ...` or `[s3]: invalid timeout "<value>": ...` |
+| A server that needs the database is configured and there is no database endpoint (see [section 3](#3-defaults)) | `[database]: server "<name>" (<type>) needs the database, but it is not configured in [database.write] or [database.read]` |
+| `[cluster] enabled = true` and `addr` is not an IP address other than `0.0.0.0` or `::`, or `secret_key` is missing or not the base64 of 32 bytes (see [CLUSTER.md](CLUSTER.md)) | `[cluster]: cluster addr '<host>' must be a specific IP address reachable from other nodes, ...`, `[cluster]: cluster secret_key is required when cluster mode is enabled ...`, `[cluster]: failed to decode cluster secret_key: ...` or `[cluster]: cluster secret_key must be 32 bytes (got <n> bytes)` |
 | `[servers] trusted_networks` has an entry that is neither an IP address nor a CIDR block | names the invalid entry |
 | A server's `auth_rate_limit.exempt_networks` has an entry that is neither an IP address nor a CIDR block | `server "<name>": auth_rate_limit.exempt_networks has entries that are neither an IP address nor a CIDR: [...]` |
+| An `imap` server's `client_filters` entry has a `client_name`, `client_version` or `ja4_fingerprints` pattern that is not a valid regular expression | `server "<name>": client_filters #<n>: <key> "<pattern>": error parsing regexp: ...` |
+| A server's `auth_rate_limit` has a negative count or duration, or a `delay_multiplier` that is negative, `nan` or `inf` | `server "<name>": auth_rate_limit.<key> must not be negative, got <value>` or `server "<name>": auth_rate_limit.delay_multiplier must be a finite number, got <value>` |
+| An `lmtp` or `http_admin_api` server has a `limits.redirect_rate_window` of zero or less | `server "<name>": limits.redirect_rate_window must be positive, got "<value>" (set limits.redirect_rate_limit = 0 to disable the limit)` |
+| A proxy server has a `remote_port` that is not a port number | `server "<name>": invalid remote_port: ...` |
+| A proxy server has `remote_lookup` enabled without a `url`; with a `url` that is not an absolute `http://` or `https://` URL with a host, has `$email` or `$ip` in the host, or uses `http://` to a host other than `localhost` or a loopback address (see [PROXY.md section 4.1](PROXY.md#41-the-request)); or with a `timeout`, `remote_port`, `circuit_breaker` or `transport` value that does not parse | `server "<name>": remote_lookup.url is required when remote_lookup is enabled`, `server "<name>": remote_lookup.url must use https:// for non-loopback hosts ...` or `server "<name>": invalid remote_lookup.<key>: ...` |
+| A `metrics` server's `path` does not begin with `/`, or is not a pattern Go's `http.ServeMux` accepts | `server "<name>": metrics path "<path>" must begin with '/'` or `server "<name>": invalid metrics path "<path>": ...` |
 | `[relay] type` is set to something other than `"smtp"` or `"http"` | `unsupported [relay] type ...` |
+| `[relay] type = "smtp"` and `smtp_host` is not a `host:port` that can be dialed, or `type = "http"` and `http_url` is not an absolute `http://` or `https://` URL with a host and, if it has one, a valid port | `[relay] type "smtp" requires smtp_host as host:port`, `[relay] smtp_host "<value>" must be host:port: ...` (or `has no host`, `has no valid host`, `has no valid port`), `[relay] type "http" requires http_url` or `[relay] http_url "<value>" ...` |
 | `[relay.queue] worker_interval` is `0` or less, or `failed_retention` is negative, with `[relay]` configured | `[relay.queue]: worker_interval must be positive, got ...` or `[relay.queue]: failed_retention must not be negative, got ...` |
+| `[relay.queue] circuit_breaker_timeout`, `cleanup_interval` or `failed_retention` is not a duration, with `[relay]` configured | `[relay.queue]: invalid <key> "<value>": ...` |
 | An IMAP, POP3 or LMTP server is configured and `[cleanup]` has a negative `grace_period`, `max_age_restriction`, `fts_retention` or `health_status_retention`, or an `instance_liveness_threshold` of zero or less | `[cleanup]: <key> must not be negative, got "<value>"` or `[cleanup]: instance_liveness_threshold must be positive, got "<value>"` |
+| An IMAP, POP3 or LMTP server is configured and `[uploader]` has a `batch_size`, `concurrency` or `max_attempts` of zero or less, or a `cleanup_grace_period` of zero or less or that is not a duration | `[uploader] <key> must be positive, got <n>`, `[uploader] cleanup_grace_period must be positive, got "<value>"` or `[uploader] cleanup_grace_period: <parse error>` |
+| `[shared_mailboxes] enabled = true` and `namespace_prefix` is not a mailbox name followed by `/` (for example `""`, `"Shared"` or `"Shared//"`), or is `INBOX/` in any letter case | `[shared_mailboxes]: namespace_prefix "<value>" must be a mailbox name followed by the hierarchy delimiter "/", such as "Shared/"` or `[shared_mailboxes]: namespace_prefix "<value>" conflicts with the reserved personal INBOX` |
 | `[timeout_scheduler] shard_count` is below -1 | `msg="Fatal error" operation="initialize timeout scheduler" error="invalid shard count: <n> (must be >= -1)"` |
 
 The address check compares the strings, so `":143"` and `"0.0.0.0:143"` pass it and fail later when
@@ -225,13 +236,11 @@ These conditions only log, and startup continues:
 - The host name is not fully qualified: `Mail hostname is not fully qualified`. Sora uses the host
   name in greetings and in the `Received` header.
 
-Later steps can still fail, for example a TLS certificate that cannot be read, an invalid
-`[cluster] secret_key`, or a database that cannot be reached. Those are covered in the topic
-documents.
+Later steps can still fail, for example a TLS certificate that cannot be read, or a database that
+cannot be reached. Those are covered in the topic documents.
 
-`sora-admin config validate` runs part of this list without starting anything: the parse, the
-server type and master password checks, and the duplicate name and address checks. It does not check
-`[[pool]]` blocks, `trusted_networks`, S3 or the database. See [ADMIN_CLI.md](ADMIN_CLI.md).
+`sora-admin config validate` runs every check in this list but the `[timeout_scheduler]` one,
+without starting anything. See [ADMIN_CLI.md](ADMIN_CLI.md).
 
 ---
 
@@ -315,7 +324,7 @@ Only the settings in this table reload:
 | `lmtp_proxy` | `timeouts.absolute_session_timeout`, `max_message_size` |
 | `http_admin_api` | `api_key`, `read_only_api_key`, `allowed_hosts` |
 | `http_user_api` | `jwt_secret`, `allowed_origins`, `allowed_hosts` |
-| `user_api_proxy` | `jwt_secret` |
+| `user_api_proxy` | `jwt_secret`, `allowed_origins` |
 | `metrics` | nothing |
 
 A server that applied a change logs it, for example `IMAP config reloaded` with the list of updated
@@ -493,11 +502,11 @@ See [STORAGE.md](STORAGE.md).
 |---|---|---|---|
 | `path` | string | `"/tmp/sora/uploads"` | Staging directory for bodies not yet in S3. |
 | `instance_id` | string | the host name | The node's upload lease identity. Changing it strands queued uploads: read [STORAGE.md](STORAGE.md) first. |
-| `batch_size` | integer | `10` | Uploads leased per batch. |
-| `concurrency` | integer | `20` | Parallel uploads. |
-| `max_attempts` | integer | `20` | Attempts before an upload is parked. |
+| `batch_size` | integer | `10` | Uploads leased per batch. Must be positive. |
+| `concurrency` | integer | `20` | Parallel uploads. Must be positive. |
+| `max_attempts` | integer | `20` | Attempts before an upload is parked. Must be positive. |
 | `retry_interval` | duration | `"30s"` | Wait before retrying a failed upload. |
-| `cleanup_grace_period` | duration | `"1h"` | Minimum age of a staged file before cleanup looks at it. |
+| `cleanup_grace_period` | duration | `"1h"` | Minimum age of a staged file before cleanup looks at it. Must be positive. |
 | `max_staging_size` | size | no limit | Size of this node's staging directory above which new messages are refused. An invalid value stops startup. |
 
 ### 8.7 Cleaner (`[cleanup]`)
@@ -530,7 +539,7 @@ See [SHARED_MAILBOXES.md](SHARED_MAILBOXES.md).
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | bool | `false` | Turn on shared mailboxes and ACLs. |
-| `namespace_prefix` | string | `"Shared/"` | Prefix of the shared namespace. `Shared/` covers the root `Shared` and the names under `Shared/`, not `SharedNotes`. Sora refuses to start with an empty prefix while sharing is on. |
+| `namespace_prefix` | string | `"Shared/"` | Prefix of the shared namespace. `Shared/` covers the root `Shared` and the names under `Shared/`, not `SharedNotes`. While sharing is on, Sora refuses to start with a prefix that is not a mailbox name followed by `/` (an empty one, `Shared` or `Shared//`), or with `INBOX/`. |
 | `allow_user_create` | bool | `false` | Let users create shared mailboxes. |
 | `default_rights` | string | `"lrswipkxtea"` | ACL rights of the creator. |
 | `allow_anyone_identifier` | bool | `false` | Allow the RFC 4314 `anyone` identifier. |
@@ -769,7 +778,7 @@ See [SECURITY.md](SECURITY.md).
 | `max_connections_per_ip` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `user_api_proxy` | Concurrent connections from one IP. Hosts in `trusted_networks` are not limited. |
 | `max_connections_per_user` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Logged-in sessions of one user. Enforced on this server by `imap`, `pop3` and `managesieve`. Enforced across the cluster for proxies, which track connections only with `[cluster] enabled = true`; without it a proxy ignores the key, with a startup warning. Ignored by `lmtp_proxy` with a warning. |
 | `max_connections_per_user_per_ip` | integer | `0` (no limit) | as `max_connections_per_user` | Logged-in sessions of one user from one IP. |
-| `listen_backlog` | integer | `1024` | backends, line proxies | TCP listen backlog. `0` means 1024. |
+| `listen_backlog` | integer | `1024` | backends, line proxies | TCP listen backlog. `0` means 1024. The HTTP servers listen with the kernel's default backlog; on them the key is ignored, with a startup warning. |
 
 ### 9.5 Limits (`[server.limits]`)
 
@@ -787,7 +796,7 @@ names it.
 | `search_rate_limit_burst` | integer | `search_rate_limit_per_min` | `imap` | Searches allowed back to back. `0` or less means the default. |
 | `thread_max_messages` | integer | `50000` | `imap` | Matches one THREAD command may process. `0` or less means the default. |
 | `redirect_rate_limit` | integer | `100` | `lmtp`, `http_admin_api` | Sieve redirects per account per window. `0` means no limit. |
-| `redirect_rate_window` | duration | `"1h"` | `lmtp`, `http_admin_api` | Window of the redirect limit. |
+| `redirect_rate_window` | duration | `"1h"` | `lmtp`, `http_admin_api` | Window of the redirect limit. Must be positive. |
 | `max_redirect_hops` | integer | `2` | `lmtp`, `http_admin_api` | Redirects of one message before further ones are suppressed. `0` means no limit. |
 | `preview_s3_per_min` | integer | `300` | `imap` | S3 downloads per account per minute to answer FETCH PREVIEW. `0` or less means no limit. |
 | `preview_s3_burst` | integer | `min(200, preview_s3_per_min)` | `imap` | Of those, how many may run back to back. |
@@ -831,7 +840,7 @@ See [PROTOCOLS.md](PROTOCOLS.md).
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
 | `append_limit` | size | `"25mb"` | `imap` | Largest message accepted by APPEND. |
-| `max_message_size` | size | `"50mb"` | `lmtp`, `lmtp_proxy`, `http_admin_api` | Largest message accepted for delivery. |
+| `max_message_size` | size | `"50mb"` | `lmtp`, `lmtp_proxy`, `http_admin_api` | Largest message accepted for delivery. `0` also means 50 MiB. |
 | `max_script_size` | size | `"16kb"` | `managesieve` | Largest Sieve script. |
 | `supported_extensions` | list of strings | the default set | `managesieve_proxy` | Sieve extensions the proxy advertises. A `managesieve` backend uses `[sieve] enabled_extensions`. |
 | `enable_preview` | bool | `false` | `imap` | Advertise FETCH PREVIEW (RFC 8970). |
@@ -864,9 +873,10 @@ See [AUTHENTICATION.md](AUTHENTICATION.md).
 
 ### 9.9 Authentication rate limit (`[server.auth_rate_limit]`)
 
-Applies to `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` and
-`http_user_api`. When `enabled = true`, every key you leave
-out, or set to 0, gets the default below. See [AUTHENTICATION.md](AUTHENTICATION.md).
+Applies to `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`,
+`http_user_api` and `user_api_proxy`. When `enabled = true`, every key you leave
+out, or set to 0, gets the default below. A negative value, or a `delay_multiplier` of `nan` or
+`inf`, stops startup ([section 4](#4-checks-at-startup)). See [AUTHENTICATION.md](AUTHENTICATION.md).
 
 | Key | Type | Default |
 |---|---|---|
@@ -913,7 +923,7 @@ Read by the line proxies and `user_api_proxy`. See [PROXY.md](PROXY.md).
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
-| `remote_addrs` | list of strings | none | proxies | Backends. Not allowed together with `[[pool]]` blocks. |
+| `remote_addrs` | list of strings | none | proxies | Backends. Required unless the file has `[[pool]]` blocks, and not allowed together with them. |
 | `remote_port` | integer or string | none | proxies | Port for backends written without one. |
 | `remote_tls` | bool | `false` | proxies | TLS to the backends (HTTPS for `user_api_proxy`). |
 | `remote_tls_use_starttls` | bool | `false` | line proxies | STARTTLS to the backends. Needs `remote_tls`. |
@@ -978,6 +988,8 @@ proxies and `user_api_proxy`. See [PROXY.md](PROXY.md).
 ### 9.13 HTTP API keys
 
 See [ADMIN_API.md](ADMIN_API.md) and [USER_API.md](USER_API.md).
+A key set on a server type not listed under "Applies to" is ignored, with a startup warning that
+names it.
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
@@ -987,7 +999,7 @@ See [ADMIN_API.md](ADMIN_API.md) and [USER_API.md](USER_API.md).
 | `jwt_secret` | string | none | `http_user_api`, `user_api_proxy` | Key that signs and checks JWTs. Without it the server is skipped. |
 | `token_duration` | duration | `"24h"` | `http_user_api` | Token lifetime. Must not be negative. |
 | `token_issuer` | string | `"sora-mail-api"` | `http_user_api` | JWT issuer. |
-| `allowed_origins` | list of strings | none | `http_user_api` | CORS origins. |
+| `allowed_origins` | list of strings | none | `http_user_api`, `user_api_proxy` | CORS origins. The proxy uses them for the errors it answers itself. |
 
 ### 9.14 Metrics server keys
 
@@ -995,7 +1007,7 @@ See [METRICS.md](METRICS.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `path` | string | — | URL path of the metrics, such as `"/metrics"`. |
+| `path` | string | `"/metrics"` | URL path of the metrics. Must begin with `/`. |
 | `allowed_hosts` | list of strings | empty (any host) | IPs or CIDR blocks allowed to scrape, matched against the TCP peer. |
 | `api_key` | string | none | Require `Authorization: Bearer <key>`. |
 | `enable_domain_metrics` | bool | `true` | Per-domain counters. |
@@ -1005,6 +1017,8 @@ See [METRICS.md](METRICS.md).
 | `hash_usernames` | bool | `true` | Replace user names by a short SHA-256 prefix in labels. |
 
 These five metric settings are global: if several `metrics` blocks exist, the last one read wins.
+`path` and these five settings are read from `metrics` blocks only; on another server type they are
+ignored, with a startup warning that names them.
 
 ---
 

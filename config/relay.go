@@ -225,15 +225,28 @@ func (r *RelayConfig) GetQueuePath() string {
 	return "/var/spool/sora/relay" // Default path
 }
 
-// Validate rejects a worker_interval of zero or less, which the worker's ticker cannot
-// run with, and a negative failed_retention, against which every failed message is
-// overdue for deletion. A value that does not parse is left to start-up, where
-// worker_interval falls back to its default and failed_retention stops the server.
+// Validate rejects the [relay.queue] settings the relay worker cannot start with: a
+// circuit_breaker_timeout, cleanup_interval or failed_retention that does not parse, a
+// worker_interval of zero or less, which the worker's ticker cannot run with, and a
+// negative failed_retention, against which every failed message is overdue for
+// deletion. A worker_interval or retry_backoff that does not parse takes its default.
 func (q *RelayQueueConfig) Validate() error {
+	for _, f := range []struct {
+		key, value string
+		parse      func() (time.Duration, error)
+	}{
+		{"circuit_breaker_timeout", q.CircuitBreakerTimeout, q.GetCircuitBreakerTimeout},
+		{"cleanup_interval", q.CleanupInterval, q.GetCleanupInterval},
+		{"failed_retention", q.FailedRetention, q.GetFailedRetention},
+	} {
+		if _, err := f.parse(); err != nil {
+			return fmt.Errorf("invalid %s %q: %w", f.key, f.value, err)
+		}
+	}
 	if d, err := q.GetWorkerInterval(); err == nil && d <= 0 {
 		return fmt.Errorf("worker_interval must be positive, got %q", q.WorkerInterval)
 	}
-	if d, err := q.GetFailedRetention(); err == nil && d < 0 {
+	if d, _ := q.GetFailedRetention(); d < 0 {
 		return fmt.Errorf("failed_retention must not be negative, got %q", q.FailedRetention)
 	}
 	return nil
