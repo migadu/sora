@@ -623,6 +623,7 @@ pooler), off-peak. The migrations on `main` that need it on a large database:
 | 000050 | `messages_fts_v2`, the per-account search table, and `btree_gin`. | See [Migration 000050](#migration-000050) below. |
 | 000051 | Replaces seven indexes on `messages` with `idx_messages_mailbox_active`. | Create the new index with `CREATE INDEX CONCURRENTLY`, then drop the seven old ones with `DROP INDEX CONCURRENTLY`, one at a time. |
 | 000052 | `idx_messages_mailbox_headers`, the covering index for header search. | Fix over-long rows with [scripts/fix_oversized_header_columns.sql](../scripts/fix_oversized_header_columns.sql), then build the index with `CREATE INDEX CONCURRENTLY`, using exactly the definition in the file. |
+| 000063 | A `message_state` row for every live message. | Where message ids span more than 1,000,000, see [Migration 000063](#migration-000063) below. |
 
 Older migrations (for example 000008, 000010, 000012, 000014, 000038 and 000039) carry the same
 kind of note. Copy index definitions exactly from the migration file: the migration only checks
@@ -696,6 +697,32 @@ and checks the result. Run it with `psql`, not through a transaction pooler. The
 with `CREATE INDEX CONCURRENTLY`, using the definition from the migration file. The migration's
 header comment lists the session settings that help a large build (`maintenance_work_mem`,
 `temp_file_limit`, `statement_timeout`).
+
+#### Migration 000063
+
+Every live message has a `message_state` row, which holds its flags. Older releases could leave
+messages without one (migration 000022 run without its copy, and messages restored after their
+folder was purged). 000063 gives each of them a row with no flags, which is how they were shown,
+and counts them as unseen in their folder.
+
+Finding them reads the id of every message, so the migration checks at most 1,000,000 ids by
+itself. Where the ids span more, it stops with `message ids ... have not been checked for a
+missing message_state row` until [scripts/message_state_backfill.sql](../scripts/message_state_backfill.sql)
+has run. On the primary, over a direct connection, while the old release keeps serving mail:
+
+```sh
+psql -h <primary> -d <db> -f scripts/message_state_backfill.sql
+psql -h <primary> -d <db> -c 'CALL sora_backfill_message_state()'
+```
+
+The arguments are the ids per batch and the milliseconds to sleep between batches, default
+`(10000, 100)`. The procedure commits after every batch and records its progress, so it can be
+stopped and called again. Call it once more right before the upgrade: the migration then checks
+only the ids that arrived after it, and drops the progress table.
+
+If the migration already stopped and left the version dirty at 63, run the script, then
+`sora-admin migrate force <N>` with the number of the previous migration file, and start Sora
+again.
 
 ---
 

@@ -212,6 +212,8 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	// comment above).
 	// RFC 3501 §2.3.2: \Recent is a session flag and must NOT be stored
 	// persistently.  Preserve only the source message's existing flags.
+	// A source without a message_state row (left by an older build, see
+	// migration 000063) has none, and its copy gets a row with none.
 	insRows, err := tx.Query(ctx, `
 		WITH src_data AS (
 			SELECT
@@ -261,10 +263,10 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		),
 		state_inserted AS (
 			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
-			SELECT i.id, $1, ms.flags, s.custom_flags_canon, NOW(), nextval('messages_modseq')
+			SELECT i.id, $1, COALESCE(ms.flags, 0), s.custom_flags_canon, NOW(), nextval('messages_modseq')
 			FROM inserted i
 			JOIN src_data s ON s.new_uid = i.uid
-			JOIN message_state ms ON ms.message_id = s.original_id
+			LEFT JOIN message_state ms ON ms.message_id = s.original_id
 			RETURNING message_id
 		)
 		SELECT id FROM inserted ORDER BY uid

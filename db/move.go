@@ -178,6 +178,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	//
 	// For same-mailbox moves, we must mark old messages as expunged BEFORE inserting
 	// new ones to avoid having two active copies of the same message.
+	//
+	// Both paths carry the source's flags. A source without a message_state row (left
+	// by an older build, see migration 000063) has none, and the moved message gets a
+	// row with none.
 	if srcMailboxID == destMailboxID {
 		// Step 1: Mark old messages as expunged to remove them from the unique index
 		_, err = tx.Exec(ctx, `
@@ -225,10 +229,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 				RETURNING id, uid
 			)
 			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
-			SELECT i.id, $1, ms.flags, ms.custom_flags, NOW(), nextval('messages_modseq')
+			SELECT i.id, $1, COALESCE(ms.flags, 0), COALESCE(ms.custom_flags, '[]'::jsonb), NOW(), nextval('messages_modseq')
 			FROM inserted i
 			JOIN src_data s ON s.new_uid = i.uid
-			JOIN message_state ms ON ms.message_id = s.original_id
+			LEFT JOIN message_state ms ON ms.message_id = s.original_id
 		`, srcMailboxID, destMailboxName, messageIDs, newUIDs)
 		if err != nil {
 			logger.Error("Database: failed to insert new messages for same-mailbox move", "err", err)
@@ -291,10 +295,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 				RETURNING id, uid
 			)
 			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
-			SELECT i.id, $1, ms.flags, s.custom_flags_canon, NOW(), nextval('messages_modseq')
+			SELECT i.id, $1, COALESCE(ms.flags, 0), s.custom_flags_canon, NOW(), nextval('messages_modseq')
 			FROM inserted i
 			JOIN src_data s ON s.new_uid = i.uid
-			JOIN message_state ms ON ms.message_id = s.original_id
+			LEFT JOIN message_state ms ON ms.message_id = s.original_id
 		`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart, destObjects)
 		if err != nil {
 			logger.Error("Database: failed to batch insert messages into destination mailbox", "err", err)
