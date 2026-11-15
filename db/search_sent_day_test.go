@@ -420,8 +420,8 @@ func (n sentPlanNode) walk(visit func(sentPlanNode)) {
 // in the header covering index (idx_messages_mailbox_headers_v2), so the mailbox must still
 // be read through an Index Only Scan, and the offset looked up only for the messages sent
 // within a day of the searched date, where the zone can decide the day. Neither is
-// sent_date_unknown (#1118): the mailbox's messages without a Date: header are read once,
-// from their own partial index.
+// sent_date_unknown (#1118): the mailbox's messages without a Date: header are checked
+// through their own partial index.
 func TestSentDateSearchIsIndexOnly(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -531,6 +531,32 @@ func TestSentDateSearchIsIndexOnly(t *testing.T) {
 	assert.True(t, indexOnly, "SENTSINCE must read the mailbox through an Index Only Scan on %s; plan:\n%s", indexName, string(raw))
 	assert.True(t, noDateIndexed, "SENTSINCE must read the messages without a Date: header through an Index Only Scan on %s; plan:\n%s", noDateIndex, string(raw))
 	assert.Empty(t, other, "SENTSINCE must not read messages any other way; plan:\n%s", string(raw))
+
+	// An imported mailbox can have many messages without usable Date headers.
+	// When their IDs outgrow work_mem, NOT IN stops hashing them and rescans a
+	// materialized list for each candidate. Inspect the real captured SEARCH
+	// statement without executing that quadratic plan.
+	_, err = db.GetWritePool().Exec(ctx, `UPDATE messages SET sent_date_unknown = TRUE
+		WHERE mailbox_id = $1 AND uid <= $2`, mailboxID, rows/2)
+	require.NoError(t, err)
+	_, err = db.GetWritePool().Exec(ctx, "ANALYZE messages")
+	require.NoError(t, err)
+	_, err = tx.Exec(ctx, "SET LOCAL work_mem = '64kB'")
+	require.NoError(t, err)
+	err = tx.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+searchStmt.SQL, searchStmt.Args...).Scan(&raw)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(raw, &explained))
+	var materializedNoDateSet bool
+	explained[0].Plan.walk(func(n sentPlanNode) {
+		if n.NodeType == "Materialize" {
+			n.walk(func(child sentPlanNode) {
+				if child.IndexName == noDateIndex {
+					materializedNoDateSet = true
+				}
+			})
+		}
+	})
+	assert.False(t, materializedNoDateSet, "SEARCH must not rescan a materialized no-Date set per message when it outgrows work_mem; plan:\n%s", string(raw))
 
 	if !superuser {
 		t.Log("not a superuser: offset lookups not counted")

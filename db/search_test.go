@@ -141,7 +141,7 @@ func TestBuildSearchDateConditions(t *testing.T) {
 	day := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	dayBefore, dayAfter := day.Add(-24*time.Hour), day.Add(24*time.Hour)
 	const headerTime = "m.sent_date + make_interval(secs => COALESCE(message_sent_utc_offset(m.id), 0))"
-	const dated = " AND m.id NOT IN (SELECT nd.id FROM messages nd WHERE nd.mailbox_id = @mailboxID AND nd.sent_date_unknown AND nd.expunged_at IS NULL)"
+	const dated = " AND NOT EXISTS (SELECT 1 FROM messages nd WHERE nd.mailbox_id = @mailboxID AND nd.id = m.id AND nd.sent_date_unknown AND nd.expunged_at IS NULL)"
 
 	tests := []struct {
 		name     string

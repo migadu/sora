@@ -436,12 +436,12 @@ func sentDayCond(alias, op string, day time.Time, args pgx.NamedArgs, nextParam 
 // written before that migration cannot be told apart and still counts as dated.
 //
 // Like sent_utc_offset (see sentDayCond), sent_date_unknown is not in the header covering
-// index, so the test must not read it from the messages row. It collects the mailbox's few
-// such ids once, from their own partial index (migration 000062), into a hashed subplan that
-// each row probes. It names the mailbox @mailboxID, which every statement that takes search
-// criteria binds.
+// index, so the test must not read it from the messages row. The partial index (migration
+// 000062) permits an anti-join or an indexed lookup. NOT IN can instead rescan a materialized
+// ID list per candidate when that set outgrows work_mem. It names the mailbox @mailboxID,
+// which every statement that takes search criteria binds.
 func sentDateKnownCond(alias string) string {
-	return alias + ".id NOT IN (SELECT nd.id FROM messages nd WHERE nd.mailbox_id = @mailboxID AND nd.sent_date_unknown AND nd.expunged_at IS NULL)"
+	return "NOT EXISTS (SELECT 1 FROM messages nd WHERE nd.mailbox_id = @mailboxID AND nd.id = " + alias + ".id AND nd.sent_date_unknown AND nd.expunged_at IS NULL)"
 }
 
 // buildSortOrderClause builds an SQL ORDER BY clause from IMAP sort criteria

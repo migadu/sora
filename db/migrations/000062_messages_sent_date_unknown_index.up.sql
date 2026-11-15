@@ -4,8 +4,8 @@
 -- (RFC 5256 §2.2), so the keys leave out the rows migration 000061 marks sent_date_unknown
 -- (#1118). sent_date_unknown is deliberately not in idx_messages_mailbox_headers_v2, and
 -- testing it on the messages row would turn every date search back into a heap filter over
--- the whole mailbox (the 38 s case of migration 000052). The search instead collects the
--- mailbox's few such ids once, from this index (sentDateKnownCond in db/search.go). It holds
+-- the whole mailbox (the 38 s case of migration 000052). The search instead tests for such
+-- a row through this index (sentDateKnownCond in db/search.go), by anti-join or indexed lookup. It holds
 -- only those rows: sent_date_unknown is NULL on every message with a Date: header and on
 -- every row written before migration 000061, which keep matching by sent_date as before.
 --
