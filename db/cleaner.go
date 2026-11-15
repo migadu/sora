@@ -516,14 +516,18 @@ func (d *Database) DeleteExpungedMessagesByS3KeyPartsBatch(ctx context.Context, 
 // by the importer for the --force-reimport option.
 // It returns the number of messages deleted.
 func (d *Database) DeleteMessageByHashAndMailbox(ctx context.Context, tx pgx.Tx, accountID int64, mailboxID int64, contentHash string) (int64, error) {
-	tag, err := tx.Exec(ctx, `
-		DELETE FROM messages
-		WHERE account_id = $1 AND mailbox_id = $2 AND content_hash = $3
-	`, accountID, mailboxID, contentHash)
+	// Live rows are expunged first, under the mailbox lock, so that they leave
+	// unseen_count (see notLiveInMailbox).
+	const match = `m.account_id = $1 AND m.mailbox_id = $2 AND m.content_hash = $3`
+	locked, err := lockLiveMessageMailboxes(ctx, tx, match, accountID, mailboxID, contentHash)
 	if err != nil {
 		return 0, fmt.Errorf("failed to delete message for re-import (account: %d, mailbox: %d, hash: %s): %w", accountID, mailboxID, contentHash, err)
 	}
-	return tag.RowsAffected(), nil
+	deleted, err := hardDeleteMessages(ctx, tx, locked, match, accountID, mailboxID, contentHash)
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete message for re-import (account: %d, mailbox: %d, hash: %s): %w", accountID, mailboxID, contentHash, err)
+	}
+	return deleted, nil
 }
 
 // livePendingUpload holds for a pending_uploads row pu that an upload can still come
@@ -580,10 +584,30 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 
 	threshold := time.Now().Add(-gracePeriod).UTC()
 
+	// reapable holds for an old, non-uploaded message that no pending upload will retry
+	// any more.
+	const reapable = `m.uploaded = FALSE AND m.created_at < $1
+		AND NOT EXISTS (
+			SELECT 1 FROM pending_uploads pu
+			WHERE pu.content_hash = m.content_hash AND pu.account_id = m.account_id
+			  AND ` + livePendingUpload + `
+		)`
+
+	// A reapable message may still be live in its mailbox. It is expunged first, under
+	// the mailbox lock, so that it leaves unseen_count (see notLiveInMailbox). One that a
+	// concurrent delivery makes recoverable in between stays expunged, not deleted.
+	locked, err := lockLiveMessageMailboxes(ctx, tx, reapable, threshold, maxAttempts, instanceLiveness)
+	if err != nil {
+		return 0, fmt.Errorf("failed to cleanup failed uploads: %w", err)
+	}
+	if _, err := expungeLiveMessages(ctx, tx, locked, reapable, threshold, maxAttempts, instanceLiveness); err != nil {
+		return 0, fmt.Errorf("failed to cleanup failed uploads: expunge before delete: %w", err)
+	}
+
 	// This single query uses a Common Table Expression (CTE) to perform the deletions
 	// in one atomic operation, which is more efficient than separate queries.
-	// 1. The `deleted_messages` CTE deletes old, non-uploaded messages that no pending
-	//    upload will retry any more, and returns their keys.
+	// 1. The `deleted_messages` CTE deletes the reapable messages, now expunged, and
+	//    returns their keys.
 	// 2. The `deleted_pending` CTE then uses these keys to remove the corresponding
 	//    entries from `pending_uploads`, but only the same still-dead row version the
 	//    statement saw. A concurrent delivery or copy can re-arm a row while DELETE
@@ -606,12 +630,8 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 	query := `
 		WITH deleted_messages AS (
 			DELETE FROM messages m
-			WHERE m.uploaded = FALSE AND m.created_at < $1
-			  AND NOT EXISTS (
-				SELECT 1 FROM pending_uploads pu
-				WHERE pu.content_hash = m.content_hash AND pu.account_id = m.account_id
-				  AND ` + livePendingUpload + `
-			  )
+			WHERE ` + reapable + `
+			  AND ` + notLiveInMailbox + `
 			RETURNING m.content_hash, m.account_id
 		),
 		deleted_pending AS (
@@ -635,7 +655,7 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 	`
 
 	var deletedCount int64
-	err := tx.QueryRow(ctx, query, threshold, maxAttempts, instanceLiveness).Scan(&deletedCount)
+	err = tx.QueryRow(ctx, query, threshold, maxAttempts, instanceLiveness).Scan(&deletedCount)
 	if err != nil {
 		return 0, fmt.Errorf("failed to cleanup failed uploads: %w", err)
 	}
@@ -1378,7 +1398,14 @@ func (d *Database) PurgeMessagesByIDs(ctx context.Context, messageIDs []int64) (
 	}
 	defer tx.Rollback(context.Background())
 
-	result, err := tx.Exec(ctx, `DELETE FROM messages WHERE id = ANY($1)`, messageIDs)
+	// Live rows are expunged first, under their mailboxes' locks, so that they leave
+	// unseen_count (see notLiveInMailbox).
+	const byID = `m.id = ANY($1)`
+	locked, err := lockLiveMessageMailboxes(ctx, tx, byID, messageIDs)
+	if err != nil {
+		return 0, fmt.Errorf("failed to purge messages: %w", err)
+	}
+	deleted, err := hardDeleteMessages(ctx, tx, locked, byID, messageIDs)
 	if err != nil {
 		return 0, fmt.Errorf("failed to purge messages: %w", err)
 	}
@@ -1387,7 +1414,7 @@ func (d *Database) PurgeMessagesByIDs(ctx context.Context, messageIDs []int64) (
 		return 0, fmt.Errorf("failed to commit purge transaction: %w", err)
 	}
 
-	return result.RowsAffected(), nil
+	return deleted, nil
 }
 
 // GetMessagesForAccount retrieves all messages for an account
