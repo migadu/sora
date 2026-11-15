@@ -336,7 +336,7 @@ func TestS3Importer_DryRunChangesNothing(t *testing.T) {
 	}
 	before := accountMailboxState(t, rdb, accountID)
 
-	si, err := NewS3Importer(rdb, nil, S3ImporterOptions{Email: email, DryRun: true, CleanupDB: true})
+	si, err := NewS3Importer(ctx, rdb, nil, S3ImporterOptions{Email: email, DryRun: true, CleanupDB: true})
 	if err != nil {
 		t.Fatal(err)
 	}
