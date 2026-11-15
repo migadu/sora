@@ -301,6 +301,11 @@ changed, each with a line `Config reload: <section> changed but requires restart
 - `[database]`, `[s3]`, `[local_cache]`, `[uploader]`, `[relay]`, `[cluster]`, `[tls]`,
   `[auth_cache]`, `[[pool]]`, `[spam_training]`, `[timeout_scheduler]` and `bcrypt_cost`
 
+Sora also checks the new file as startup does (the checks `sora-admin config validate` runs) and logs
+an error for each problem it finds, `Config reload: <section> is invalid and the server will not
+start with this config`, with the reason in `error`. Fix these before the next restart, which
+would refuse the file.
+
 TLS certificates are never reloaded by SIGHUP. Certificate files (`[tls] cert_file`/`key_file` and
 per-server `tls_cert_file`/`tls_key_file`) are read once, at startup, so a renewed certificate needs
 a restart. Certificates from Let's Encrypt renew inside the running process
