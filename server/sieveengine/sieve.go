@@ -330,11 +330,11 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		To:   ctx.EnvelopeTo,
 	}
 
-	// RFC 5228 §2.6.2.1: Header field names are case-insensitive
-	// Normalize all header keys to lowercase to ensure consistent matching
+	// Header names compare under i;ascii-casemap (RFC 5228 §2.7): the map is
+	// keyed by the lower-cased name and HeaderGet lowers the name it looks up.
 	normalizedHeaders := make(map[string][]string, len(ctx.Header))
 	for key, values := range ctx.Header {
-		normalizedHeaders[strings.ToLower(key)] = values
+		normalizedHeaders[lowerASCII(key)] = values
 	}
 
 	message := &SieveMessage{
@@ -653,9 +653,30 @@ type SieveMessage struct {
 }
 
 func (m *SieveMessage) HeaderGet(key string) ([]string, error) {
-	// RFC 5228 §2.6.2.1: Header field names are case-insensitive
-	// Since LMTP normalizes headers to lowercase, we must do case-insensitive lookup
-	return m.Headers[strings.ToLower(key)], nil
+	return m.Headers[lowerASCII(key)], nil
+}
+
+// lowerASCII lowers the US-ASCII letters of a header name and leaves every other
+// byte as it is. Header names compare under i;ascii-casemap (RFC 5228 §2.7), which
+// "treats US-ASCII letters case-insensitively" and under which "letters outside
+// ASCII are not treated case-insensitively" (RFC 4790 §9.2.1); strings.ToLower
+// would also lower U+212A KELVIN SIGN to "k" and U+0130 LATIN CAPITAL LETTER I
+// WITH DOT ABOVE to "i".
+func lowerASCII(s string) string {
+	i := 0
+	for i < len(s) && (s[i] < 'A' || s[i] > 'Z') {
+		i++
+	}
+	if i == len(s) {
+		return s
+	}
+	b := []byte(s)
+	for ; i < len(b); i++ {
+		if 'A' <= b[i] && b[i] <= 'Z' {
+			b[i] += 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 func (m *SieveMessage) MessageSize() int {
