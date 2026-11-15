@@ -543,7 +543,7 @@ func (s *Session) handleConnection() {
 			// (RFC 5321 §4.1.1.2). One that refuses it, or is lost, holds no recipient of
 			// this transaction: it is dropped and the connect below asks afresh, so the
 			// recipient is answered as on a new connection (552 5.3.4 for a refused size,
-			// RFC 1870 section 6.4).
+			// RFC 1870 section 6.4; 553 5.1.7 for a refused sender).
 			if s.backendConn != nil && !s.backendHasMail {
 				if reply, ok := s.forwardSimpleCommand(s.backendMailFrom()); !ok {
 					s.DebugLog("held backend lost on MAIL FROM; reconnecting", "backend", s.serverAddr)
@@ -563,6 +563,13 @@ func (s *Session) handleConnection() {
 					// (RFC 1870 section 6.4 (2)), not a failed connection to retry.
 					if errors.Is(err, errBackendRefusedSize) {
 						s.sendResponse("552 5.3.4 Message size exceeds fixed maximum message size")
+						continue
+					}
+					// The backend refused the sender: permanent as well, as on a direct
+					// connection. 553 is a RCPT reply (RFC 5321 section 4.3.2), and "X.1.7
+					// Bad sender's mailbox address syntax" (RFC 3463) names the sender.
+					if errors.Is(err, errBackendRefusedSender) {
+						s.sendResponse("553 5.1.7 Invalid sender")
 						continue
 					}
 					// NOTE: we deliberately do NOT invalidate the lookup cache here.
@@ -1582,6 +1589,9 @@ func (s *Session) connectToBackend() (err error) {
 			if strings.HasPrefix(response, "552") {
 				return fmt.Errorf("%w: %s", errBackendRefusedSize, strings.TrimSpace(response))
 			}
+			if strings.HasPrefix(response, "501") || strings.HasPrefix(response, "553") {
+				return fmt.Errorf("%w: %s", errBackendRefusedSender, strings.TrimSpace(response))
+			}
 			return fmt.Errorf("backend MAIL FROM failed: %s", response)
 		}
 
@@ -1997,6 +2007,16 @@ func mailSizeParameter(args []string, limit int64) (size, reply string) {
 // errBackendRefusedSize is the backend's 552 to the MAIL sent when connecting: its fixed
 // maximum is below the declared size (RFC 1870 section 6.1 (2)).
 var errBackendRefusedSize = errors.New("backend refused the declared message size")
+
+// errBackendRefusedSender is the backend's refusal of the reverse-path in the MAIL sent
+// when connecting: 553, "mailbox name not allowed (e.g., mailbox syntax incorrect)", or
+// 501, "Syntax error in parameters or arguments" (RFC 5321 section 4.2.2). The proxy
+// writes that MAIL's parameters itself (SIZE checked as 1*20DIGIT, SMTPUTF8 only to a
+// backend that advertised it), so either refuses the sender. A sora backend answers 501
+// 5.5.2 for a reverse-path go-smtp cannot parse and 553 5.1.7 for one server.NewAddress
+// does not take. Its other refusals (authentication or TLS required, policy) say nothing
+// about the message.
+var errBackendRefusedSender = errors.New("backend refused the sender")
 
 // isSMTPUTF8Capability reports whether an LHLO reply line ("250-SMTPUTF8" or
 // "250 SMTPUTF8") advertises the extension.
