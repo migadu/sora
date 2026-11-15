@@ -210,14 +210,15 @@ func (rd *ResilientDatabase) DeactivateAllScriptsWithRetry(ctx context.Context, 
 // RenameScriptWithRetry renames a Sieve script with retry logic. The rename is a
 // single atomic UPDATE, so there is no read-then-write window: the script's active
 // state is preserved and the UNIQUE (account_id, name) constraint resolves name
-// collisions. It returns consts.ErrDBNotFound if oldName does not exist, or
-// consts.ErrDBUniqueViolation if newName already exists.
+// collisions. It returns consts.ErrDBNotFound if oldName does not exist,
+// consts.ErrDBUniqueViolation if newName already exists, or
+// db.ErrSieveScriptNotStorable if newName contains NUL or invalid UTF-8.
 func (rd *ResilientDatabase) RenameScriptWithRetry(ctx context.Context, AccountID int64, oldName, newName string) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(ctx, true).RenameScript(ctx, tx, AccountID, oldName, newName)
 	}
 
-	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op, consts.ErrDBNotFound, consts.ErrDBUniqueViolation)
+	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op, consts.ErrDBNotFound, consts.ErrDBUniqueViolation, db.ErrSieveScriptNotStorable)
 	return err
 }
 

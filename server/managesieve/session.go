@@ -942,6 +942,8 @@ func (s *ManageSieveSession) RenameScript(ctx context.Context, oldName, newName 
 		return errNonExistent
 	case errors.Is(renameErr, consts.ErrDBUniqueViolation):
 		return &managesieveserver.Error{Code: "ALREADYEXISTS", Message: "A script with the new name already exists"}
+	case errors.Is(renameErr, db.ErrSieveScriptNotStorable):
+		return &managesieveserver.Error{Message: msieve.Quote("Script validation failed: " + msieve.SanitizeText(renameErr.Error()))}
 	default:
 		return errTryLater
 	}

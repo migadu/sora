@@ -170,6 +170,39 @@ func TestScriptNameNotStorable(t *testing.T) {
 	}
 }
 
+// TestRenameScriptNewNameNotStorable: RenameScript rejects an unstorable newName
+// (NUL byte or invalid UTF-8) with ErrSieveScriptNotStorable, matching CreateScript,
+// UpdateScript and CreateOrUpdateScript, instead of sending it to PostgreSQL and
+// leaking SQLSTATE 22021.
+func TestRenameScriptNewNameNotStorable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	database := setupTestDatabase(t)
+	defer database.Close()
+	ctx := context.Background()
+	accountID := createTestAccountForSieve(t, database, ctx)
+
+	require.NoError(t, inSieveTx(t, database, ctx, func(tx pgx.Tx) error {
+		_, err := database.CreateScript(ctx, tx, accountID, "existing", "keep;")
+		return err
+	}))
+
+	for _, newName := range []string{"a\x00b", "\xff", "caf\xc3"} {
+		err := inSieveTx(t, database, ctx, func(tx pgx.Tx) error {
+			return database.RenameScript(ctx, tx, accountID, "existing", newName)
+		})
+		assert.ErrorIs(t, err, ErrSieveScriptNotStorable, "RenameScript(existing, %q)", newName)
+		var pgErr *pgconn.PgError
+		assert.False(t, errors.As(err, &pgErr), "RenameScript(existing, %q) leaked PostgreSQL error %v", newName, err)
+	}
+
+	s, err := database.GetScriptByName(ctx, "existing", accountID)
+	require.NoError(t, err)
+	assert.Equal(t, "keep;", s.Script)
+}
+
 // TestScriptContentNotStorable: CreateScript and UpdateScript reject unstorable script
 // content or names (NUL byte or invalid UTF-8) before sending the statement to PostgreSQL
 // so callers never receive a raw SQLSTATE 22021 *pgconn.PgError.

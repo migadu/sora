@@ -100,17 +100,19 @@ func MaxScriptsPerAccount() int { return maxScriptsPerAccount }
 // error rather than a retryable one.
 var ErrSieveScriptLimitReached = errors.New("maximum number of sieve scripts reached")
 
-// ErrSieveScriptNotStorable is returned by CreateScript, UpdateScript and
-// CreateOrUpdateScript when the script name or content contains a NUL byte or invalid
-// UTF-8, which PostgreSQL text columns reject with SQLSTATE 22021.
+// ErrSieveScriptNotStorable is returned by CreateScript, UpdateScript,
+// CreateOrUpdateScript and RenameScript when a stored script name or content contains
+// a NUL byte or invalid UTF-8, which PostgreSQL text columns reject with SQLSTATE 22021.
 var ErrSieveScriptNotStorable = errors.New("sieve script contains NUL or invalid UTF-8")
 
-// lockScriptCreates serialises the account's script creates for the rest of tx.
-// The limit is checked against the stored count and then inserted, so two creates
-// of the account must not both read the old count: each would pass, and together
-// they would store past the limit. The lock is transaction-scoped (pgbouncer
-// transaction mode), and statements run after it is granted take a new snapshot
-// under READ COMMITTED, so they see what the previous holder committed.
+// lockScriptCreates serialises the account's script creates and name changes for the
+// rest of tx. The limit is checked against the stored count and then inserted, so two
+// creates of the account must not both read the old count: each would pass, and
+// together they would store past the limit. Renames (RenameScript, UpdateScript) take
+// the same lock so CreateOrUpdateScript sees any in-flight rename into its target name
+// before checking the limit. The lock is transaction-scoped (pgbouncer transaction
+// mode), and statements run after it is granted take a new snapshot under READ
+// COMMITTED, so they see what the previous holder committed.
 func lockScriptCreates(ctx context.Context, tx pgx.Tx, AccountID int64) error {
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int4, hashint8($2::int8))",
 		consts.SoraSieveScriptLimitLockClassID, AccountID); err != nil {
@@ -159,11 +161,11 @@ func (db *Database) CreateScript(ctx context.Context, tx pgx.Tx, AccountID int64
 // replaces the content of the script of that name, keeping its active state, or
 // creates the script, inactive, when the account has none. updated reports which.
 //
-// The choice is made in tx after lockScriptCreates, so it sees every create of the
-// name committed before it. A lookup outside tx (on a read replica that has not
-// replayed a recent create, or racing a create another session is committing)
-// misses such a script, and the create that follows fails on
-// UNIQUE (account_id, name).
+// The choice is made in tx after lockScriptCreates, which CreateScript, UpdateScript
+// and RenameScript also take, so it sees every create or rename into the name
+// committed before it. A lookup outside tx (on a read replica that has not replayed a
+// recent write, or racing another session's write) misses such a script, and the
+// create that follows fails on UNIQUE (account_id, name) or checkScriptLimit.
 func (db *Database) CreateOrUpdateScript(ctx context.Context, tx pgx.Tx, AccountID int64, name, script string) (s *SieveScript, updated bool, err error) {
 	if !helpers.TextStorable(name) || !helpers.TextStorable(script) {
 		return nil, false, ErrSieveScriptNotStorable
@@ -171,31 +173,32 @@ func (db *Database) CreateOrUpdateScript(ctx context.Context, tx pgx.Tx, Account
 	if err := lockScriptCreates(ctx, tx, AccountID); err != nil {
 		return nil, false, err
 	}
-	if s, err := updateScriptByName(ctx, tx, AccountID, name, script); !errors.Is(err, pgx.ErrNoRows) {
-		return s, err == nil, err
-	}
-	// Replacing a script adds none, so only the create is held to the limit.
-	if err := checkScriptLimit(ctx, tx, AccountID); err != nil {
-		return nil, false, err
-	}
+	for {
+		if s, err := updateScriptByName(ctx, tx, AccountID, name, script); !errors.Is(err, pgx.ErrNoRows) {
+			return s, err == nil, err
+		}
+		// Replacing a script adds none, so only the create is held to the limit.
+		if err := checkScriptLimit(ctx, tx, AccountID); err != nil {
+			return nil, false, err
+		}
 
-	s = &SieveScript{}
-	err = tx.QueryRow(ctx, `
-		INSERT INTO sieve_scripts (account_id, name, script, active)
-		VALUES ($1, $2, $3, false)
-		ON CONFLICT (account_id, name) DO NOTHING
-		RETURNING id, account_id, name, script, active, updated_at
-	`, AccountID, name, script).Scan(&s.ID, &s.AccountID, &s.Name, &s.Script, &s.Active, &s.UpdatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		// A rename to this name (renames do not take the lock) committed after
-		// the update above looked: that script is the one to replace.
-		s, err = updateScriptByName(ctx, tx, AccountID, name, script)
-		return s, err == nil, err
+		s = &SieveScript{}
+		err = tx.QueryRow(ctx, `
+			INSERT INTO sieve_scripts (account_id, name, script, active)
+			VALUES ($1, $2, $3, false)
+			ON CONFLICT (account_id, name) DO NOTHING
+			RETURNING id, account_id, name, script, active, updated_at
+		`, AccountID, name, script).Scan(&s.ID, &s.AccountID, &s.Name, &s.Script, &s.Active, &s.UpdatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// An unserialised write put this name in place after updateScriptByName
+			// looked; loop to replace it (or re-check and insert if it disappeared).
+			continue
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		return s, false, nil
 	}
-	if err != nil {
-		return nil, false, err
-	}
-	return s, false, nil
 }
 
 // updateScriptByName replaces the content of the account's script called name.
@@ -217,6 +220,9 @@ func (db *Database) UpdateScript(ctx context.Context, tx pgx.Tx, scriptID, Accou
 	if !helpers.TextStorable(name) || !helpers.TextStorable(script) {
 		return nil, ErrSieveScriptNotStorable
 	}
+	if err := lockScriptCreates(ctx, tx, AccountID); err != nil {
+		return nil, err
+	}
 	var s SieveScript
 	err := tx.QueryRow(ctx, `
 		UPDATE sieve_scripts SET name = $1, script = $2, updated_at = now() 
@@ -231,14 +237,22 @@ func (db *Database) UpdateScript(ctx context.Context, tx pgx.Tx, scriptID, Accou
 
 // RenameScript renames a Sieve script in a single atomic statement. The script's
 // active state and content are preserved (only the name changes). It returns:
+//   - ErrSieveScriptNotStorable if newName contains a NUL byte or invalid UTF-8
 //   - consts.ErrDBNotFound if no script named oldName exists for the account
 //   - consts.ErrDBUniqueViolation if a script named newName already exists
 //
-// Because the rename is a single UPDATE, there is no read-then-write window: the
-// UNIQUE (account_id, name) constraint resolves name collisions atomically.
+// Because the rename is a single UPDATE under lockScriptCreates, there is no
+// read-then-write window and a concurrent CreateOrUpdateScript at maxScriptsPerAccount
+// sees the renamed script instead of failing checkScriptLimit.
 func (db *Database) RenameScript(ctx context.Context, tx pgx.Tx, AccountID int64, oldName, newName string) error {
+	if !helpers.TextStorable(newName) {
+		return ErrSieveScriptNotStorable
+	}
 	if !helpers.TextStorable(oldName) { // names no script, see GetScriptByName
 		return consts.ErrDBNotFound
+	}
+	if err := lockScriptCreates(ctx, tx, AccountID); err != nil {
+		return err
 	}
 	tag, err := tx.Exec(ctx, `
 		UPDATE sieve_scripts SET name = $1, updated_at = now()
