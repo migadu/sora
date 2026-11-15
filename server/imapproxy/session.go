@@ -144,7 +144,9 @@ func (s *Session) handleConnection() {
 
 	// Send greeting
 	if err := s.sendGreeting(); err != nil {
-		s.ErrorLog("Failed to send greeting", "error", err)
+		if !errors.Is(err, errSessionShuttingDown) {
+			s.ErrorLog("Failed to send greeting", "error", err)
+		}
 		return
 	}
 
@@ -736,14 +738,28 @@ func (s *Session) handleStartTLS(tag string, args []string) bool {
 	s.startTLSInProgress = false
 	s.clientReader = bufio.NewReader(tlsConn)
 	s.clientWriter = bufio.NewWriter(tlsConn)
+	shuttingDown := s.gracefulShutdown
 	s.mu.Unlock()
+	if shuttingDown {
+		s.sendBye("* BYE Server shutting down, please reconnect\r\n")
+		return false
+	}
 	return true
 }
 
-// sendGreeting sends the IMAP greeting.
+var errSessionShuttingDown = errors.New("session shutting down")
+
+// sendGreeting sends the IMAP greeting unless graceful shutdown has already
+// claimed the session.
 func (s *Session) sendGreeting() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.gracefulShutdown {
+		return errSessionShuttingDown
+	}
 
 	greeting := "* OK [CAPABILITY " + s.preAuthCapabilities() + s.server.additionalCapsSuffix + "] Proxy Ready\r\n"
 	_, err := s.clientWriter.WriteString(greeting)
