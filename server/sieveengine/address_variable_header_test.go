@@ -10,7 +10,7 @@ import (
 // lower case, so `set "h" "From"; address :is "${h}" ...` never matched while
 // `address :is "From" ...` did.
 //
-// RFC 5228 §2.7.3: "when a string represents the name of a header, the
+// RFC 5228 §2.7: "when a string represents the name of a header, the
 // comparator is never user-specified. Header comparisons are always done with
 // the "i;ascii-casemap" operator". RFC 5229 §3: "When a string is evaluated,
 // substrings matching variable-ref SHALL be replaced by the value of
