@@ -317,12 +317,17 @@ func TestProcessBatch_DBInsertFailure(t *testing.T) {
 		mockRDB.insertMessageShouldFail = true
 		mockRDB.insertMessageError = errors.New("simulated db connection error")
 
-		// 4. Create the Importer instance
+		// 4. Create the Importer instance, over tempDir as its maildir
+		root, err := os.OpenRoot(tempDir)
+		require.NoError(t, err)
+		defer root.Close()
 		importer := &Importer{
-			ctx:      ctx,
-			email:    "test@example.com",
-			rdb:      mockRDB,
-			sqliteDB: sqliteDB,
+			ctx:         ctx,
+			maildirPath: tempDir,
+			root:        root,
+			email:       "test@example.com",
+			rdb:         mockRDB,
+			sqliteDB:    sqliteDB,
 			options: ImporterOptions{
 				TestMode:             true,  // Skip S3 uploads
 				BatchTransactionMode: false, // Safe mode only for unit test
