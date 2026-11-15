@@ -99,3 +99,86 @@ func TestPOP3MasterLoginDuringDatabaseOutage(t *testing.T) {
 		})
 	}
 }
+
+// TestPOP3LoginDuringDatabaseStall: a login whose credential or impersonation target
+// lookup runs into its timeout because the database hangs is a database outage,
+// -ERR [SYS/TEMP] and counted as unavailable, not a server shutdown, which is not
+// counted at all. The regular login and each master path look the account up
+// separately, so each is probed, each on its own database connection.
+func TestPOP3LoginDuringDatabaseStall(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	const (
+		masterUser = "master_admin"
+		masterPass = "master_secret_pw"
+		saslUser   = "master_sasl"
+		saslPass   = "master_sasl_secret_pw"
+	)
+
+	forms := []struct {
+		name  string
+		probe func(t *testing.T, address string, account common.TestAccount) string
+	}{
+		{"USER_PASS", func(t *testing.T, address string, account common.TestAccount) string {
+			return pop3UserPass(t, address, account.Email, account.Password)
+		}},
+		{"USER_PASS_master_username", func(t *testing.T, address string, account common.TestAccount) string {
+			return pop3UserPass(t, address, account.Email+"@"+masterUser, masterPass)
+		}},
+		{"AUTH_PLAIN_master_username", func(t *testing.T, address string, account common.TestAccount) string {
+			return pop3AuthPlain(t, address, "", account.Email+"@"+masterUser, masterPass)
+		}},
+		{"AUTH_PLAIN_master_SASL", func(t *testing.T, address string, account common.TestAccount) string {
+			return pop3AuthPlain(t, address, account.Email, saslUser, saslPass)
+		}},
+	}
+
+	for _, form := range forms {
+		t.Run(form.name, func(t *testing.T) {
+			rdb, outage := common.SetupTestDatabaseWithOutage(t)
+			account := common.CreateTestAccount(t, rdb)
+			address := common.GetRandomAddress(t)
+
+			srv, err := pop3.New(context.Background(), "test-db-stall", "localhost", address,
+				&storage.S3Storage{}, rdb, nil, nil,
+				pop3.POP3ServerOptions{
+					InsecureAuth:       true,
+					Config:             &config.Config{},
+					AuthRateLimit:      common.DBOutageAuthRateLimit(),
+					MasterUsername:     masterUser,
+					MasterPassword:     masterPass,
+					MasterSASLUsername: saslUser,
+					MasterSASLPassword: saslPass,
+				})
+			if err != nil {
+				t.Fatalf("Failed to create POP3 server: %v", err)
+			}
+			errChan := make(chan error, 1)
+			go func() { srv.Start(errChan) }()
+			t.Cleanup(func() { srv.Close() })
+			time.Sleep(100 * time.Millisecond)
+
+			unavailable := func() float64 {
+				return testutil.ToFloat64(metrics.AuthenticationAttempts.WithLabelValues("pop3", "test-db-stall", "localhost", "unavailable"))
+			}
+			before := unavailable()
+
+			outage.Stall()
+			// The first lookup may find its pooled connection dropped; the next ones stall.
+			for i := 1; i <= 3; i++ {
+				if reply := form.probe(t, address, account); !strings.HasPrefix(reply, "-ERR [SYS/TEMP]") {
+					t.Errorf("login %d while the database stalls: %q, want -ERR [SYS/TEMP] ...", i, reply)
+				}
+			}
+			outage.End()
+
+			if grew := unavailable() - before; grew != 3 {
+				t.Errorf("logins while the database stalls counted as unavailable: %v, want 3 (a lookup timeout was taken for a server shutdown)", grew)
+			}
+
+			if reply := form.probe(t, address, account); !strings.HasPrefix(reply, "+OK") {
+				t.Errorf("login after the stall: %q, want +OK", reply)
+			}
+		})
+	}
+}
