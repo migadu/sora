@@ -238,6 +238,8 @@ func TestConfigValidateWhatServiceSetupRefuses(t *testing.T) {
 		{name: "database.read port not a number", content: db + "\n[database.read]\nhosts = [\"replica.example.com\"]\nport = \"x\"\n" + managesieve,
 			want: []problem{{"[database.read]", `invalid string for port: "x"`}}},
 		{name: "database port unused when every host names one", content: "[database.write]\nhosts = [\"db.example.com:5433\"]\nport = \"x\"\n" + managesieve},
+		{name: "database.write host port not a number", content: "[database.write]\nhosts = [\"db.example.com:5433\", \"db2.example.com:abc\"]\n" + managesieve,
+			want: []problem{{"[database.write]", `invalid port "abc" in host "db2.example.com:abc"`}}},
 
 		// #1105: the TLS manager refused these last, after every other service was up.
 		{name: "tls letsencrypt", content: tls + "renew_before = \"720h\"\nsync_interval = \"0\"\n" + metrics},

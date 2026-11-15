@@ -115,10 +115,11 @@ func (e *DatabaseEndpointConfig) GetMaxConnIdleTime() (time.Duration, error) {
 }
 
 // Validate checks that the endpoint's pool durations, max_conn_lifetime and
-// max_conn_idle_time, parse. A pool is not created without them: a write host is
-// marked failed, so start-up stops with "no healthy database pools available", and a
-// read replica is retried for good. query_timeout is not checked: an unparsable one
-// falls back to the [database] query_timeout with a warning.
+// max_conn_idle_time, parse, and that each host entry resolves to a host and port
+// (HostPort). A pool is not created without them: a write host is marked failed, so
+// start-up stops with "no healthy database pools available", and a read replica is
+// retried for good. query_timeout is not checked: an unparsable one falls back to the
+// [database] query_timeout with a warning.
 func (e *DatabaseEndpointConfig) Validate() error {
 	if _, err := e.GetMaxConnLifetime(); err != nil {
 		return fmt.Errorf("invalid max_conn_lifetime %q: %w", e.MaxConnLifetime, err)
@@ -126,7 +127,55 @@ func (e *DatabaseEndpointConfig) Validate() error {
 	if _, err := e.GetMaxConnIdleTime(); err != nil {
 		return fmt.Errorf("invalid max_conn_idle_time %q: %w", e.MaxConnIdleTime, err)
 	}
+	for _, host := range e.Hosts {
+		if _, err := e.HostPort(host); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// defaultPostgresPort is used for a host entry without a port when the endpoint sets none.
+const defaultPostgresPort = 5432
+
+// HostPort returns the host:port the pool for one host entry of the endpoint connects
+// to. A host entry that carries a port ("db.example.com:5433", "[2001:db8::1]:5433")
+// keeps it; otherwise the endpoint's port applies, 5432 when unset. Either port must be
+// a number in 1-65535. A bare IPv6 address is bracketed.
+func (e *DatabaseEndpointConfig) HostPort(host string) (string, error) {
+	if h, port, err := net.SplitHostPort(host); err == nil {
+		if port != "" {
+			if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {
+				return "", fmt.Errorf("invalid port %q in host %q (must be 1-65535)", port, host)
+			}
+			return host, nil
+		}
+		host = h // "db.example.com:" names no port
+	}
+	port := defaultPostgresPort
+	if e.Port != nil {
+		var p int64
+		switch v := e.Port.(type) {
+		case string:
+			var err error
+			if p, err = strconv.ParseInt(v, 10, 32); err != nil {
+				return "", fmt.Errorf("invalid string for port: %q", v)
+			}
+		case int:
+			p = int64(v)
+		case int64:
+			p = v
+		default:
+			return "", fmt.Errorf("invalid type for port: %T", v)
+		}
+		if p <= 0 || p > 65535 {
+			return "", fmt.Errorf("port number %d is out of the valid range (1-65535)", p)
+		}
+		port = int(p)
+	}
+	// A bare IPv6 address may come with or without brackets; JoinHostPort adds them.
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
 // GetQueryTimeout parses the query timeout duration for an endpoint.
