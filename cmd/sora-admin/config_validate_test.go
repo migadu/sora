@@ -541,6 +541,20 @@ func TestConfigValidateReportsStartupWarnings(t *testing.T) {
 			},
 		},
 		{
+			// A managesieve_proxy advertises its own supported_extensions, and start-up
+			// warns about the names sieveengine.InvalidExtensions drops from them too.
+			name: "unsupported supported_extensions on a managesieve_proxy",
+			content: storageTOML + "[[server]]\ntype = \"managesieve_proxy\"\nname = \"sieve-proxy\"\naddr = \"127.0.0.1:4190\"\n" +
+				"remote_addrs = [\"192.0.2.10:4190\"]\nsupported_extensions = [\"fileinto\", \"no-such-extension\"]\n",
+			wantWarn: []string{"[WARN] Server sieve-proxy (type: managesieve_proxy) has supported_extensions the engine does not support: no-such-extension; " +
+				"they are ignored, and the default set is advertised if none remain (effective: fileinto)"},
+		},
+		{
+			name: "supported supported_extensions on a managesieve_proxy",
+			content: storageTOML + "[[server]]\ntype = \"managesieve_proxy\"\nname = \"sieve-proxy\"\naddr = \"127.0.0.1:4190\"\n" +
+				"remote_addrs = [\"192.0.2.10:4190\"]\nsupported_extensions = [\"fileinto\", \"vacation\"]\n",
+		},
+		{
 			name: "supported sieve extensions and narrow trusted_networks",
 			content: storageTOML + "[servers]\ntrusted_networks = [\"192.0.2.10/32\", \"10.1.2.0/24\"]\n\n[sieve]\nenabled_extensions = [\"fileinto\", \"vacation\"]\n\n" +
 				"[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n" + lmtp,
