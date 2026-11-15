@@ -18,9 +18,11 @@ type seqViewKey struct{}
 // the numbers past the view's last message. "*" (0) in a sequence set means the
 // view's last message.
 //
-// The view of a modseq is the same in every snapshot: an expunge only moves a message
-// from the live rows to the held ones. So each statement that numbers messages in a
-// view is exact on its own, whatever other sessions commit between statements.
+// For append and soft-expunge changes, the view of a modseq is the same in every
+// snapshot: an expunge only moves a message from the live rows to the held ones.
+// Each numbering statement is therefore exact while those rows and their recorded
+// UID/creation/expunge history remain available. Restore rewrites that history
+// (including the UID) and is outside this guarantee.
 //
 // Without a view (or with modSeq 0, before anything exists) sequence numbers count the
 // live messages, as for any caller that is not an IMAP session.
