@@ -268,7 +268,13 @@ func notifyStatusData(name string, uidValidity uint32, row db.MailboxStatsRow, o
 		data.NumUnseen = &numUnseen
 	}
 	if options.HighestModSeq {
-		data.HighestModSeq = row.HighestModSeq
+		// A mailbox that has never held a message has no mailbox_stats row
+		// and a raw highest_modseq of 0, which the callers need as-is for
+		// their activity checks and statusMarks. The client must see 1, as
+		// STATUS, LIST-STATUS and SELECT report (GetMailboxSummary): RFC 7162
+		// section 7 reserves HIGHESTMODSEQ 0 for a mailbox without persistent
+		// mod-sequences.
+		data.HighestModSeq = max(row.HighestModSeq, 1)
 	}
 	return data
 }
