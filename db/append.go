@@ -509,6 +509,20 @@ func sentUTCOffset(sentDate time.Time) *int32 {
 	return &o
 }
 
+// sentDateInHeaderZone is the inverse of sentUTCOffset: messages.sent_date in the zone of
+// the Date: header it was parsed from, given that row's sent_utc_offset. The ENVELOPE date
+// is formatted from it and must name the header's own day, time of day and zone (RFC 9051
+// §7.5.2: the envelope "is computed by the server by parsing the [RFC5322] header into the
+// component parts"). A row without an offset (written before migration 000060, or with a
+// zone beyond maxSentUTCOffset) is given in UTC rather than in the time.Local pgx decodes a
+// timestamptz into, so the ENVELOPE never depends on the server's TZ.
+func sentDateInHeaderZone(sentDate time.Time, offset *int32) time.Time {
+	if offset == nil {
+		return sentDate.UTC()
+	}
+	return sentDate.In(time.FixedZone("", int(*offset)))
+}
+
 // storedSentDate returns the messages.sent_date and sent_date_unknown values for a message,
 // whose InternalDate the caller has already defaulted. A message without a Date: header that
 // parses has no sent date, and SORT and THREAD use its INTERNALDATE instead (RFC 5256 §2.2:
