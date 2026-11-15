@@ -3,11 +3,14 @@ package affinitycache
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/migadu/sora/pkg/sqlitefile"
 )
 
 // A file: URI names the store by the URI's path. New created the database file 0600, and
@@ -97,5 +100,77 @@ func TestCorruptDatabaseAtFileURIIsRecreated(t *testing.T) {
 	f.Close()
 	if err != nil || !bytes.Equal(header, []byte("SQLite format 3\x00")) {
 		t.Errorf("%s is not the recreated database (header %q, err %v)", path, header, err)
+	}
+}
+
+// SQLite creates the -wal and -shm files with the database file's mode, but reuses the
+// ones left behind by a process that exited with the database open, with the mode they
+// have. A cache that ran before its files were 0600 (a file: URI, #1397) leaves 0644
+// ones, which then keep receiving the affinities, readable by every local user. New makes
+// them 0600 as it does the database file.
+func TestExistingWorldReadableWALIsMadePrivate(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		spell func(path string) string
+	}{
+		{"path", func(p string) string { return p }},
+		{"file URI", func(p string) string { return "file:" + p }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "affinity.db")
+			leaveWorldReadableWAL(t, path)
+			store, err := New(tc.spell(path))
+			if err != nil {
+				t.Fatalf("New() error: %v", err)
+			}
+			defer store.Close()
+			now := time.Now()
+			if err := store.Set(context.Background(), AffinityEntry{Username: "alice@example.com", Protocol: "imap", Backend: "backend1:143",
+				AssignedAt: now, ExpiresAt: now.Add(time.Hour), NodeID: "node-1"}); err != nil {
+				t.Fatalf("Set() error: %v", err)
+			}
+			for _, suffix := range []string{"", "-wal", "-shm"} {
+				info, err := os.Stat(path + suffix)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode := info.Mode().Perm(); mode != 0600 {
+					t.Errorf("%s has mode %o, want 600", path+suffix, mode)
+				}
+			}
+		})
+	}
+}
+
+// leaveWorldReadableWAL leaves at path a WAL-mode database whose 0644 -wal and -shm files
+// hold a committed transaction, as a process killed with the database open leaves them:
+// it copies the files of a database that is still open.
+func leaveWorldReadableWAL(t *testing.T, path string) {
+	t.Helper()
+	src := filepath.Join(t.TempDir(), "src.db")
+	dsn, err := sqlitefile.DSN(src, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA journal_mode = WAL; CREATE TABLE t (x); INSERT INTO t VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		data, err := os.ReadFile(src + suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path+suffix, data, 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path+suffix, 0644); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
