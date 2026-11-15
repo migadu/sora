@@ -359,8 +359,12 @@ Adding, removing or renaming a `[[server]]` block also needs a restart, and Sora
 removed blocks. A new block is not started, and a running server whose block was removed or renamed
 keeps running with its old settings.
 
-The global checks of [section 4](#4-checks-at-startup) (pools, `trusted_networks` against
-`proxy_protocol`, server names and addresses) do not run on a reload.
+A reload also runs the checks of [section 4](#4-checks-at-startup) that
+`sora-admin config validate` runs (all but `[timeout_scheduler]`) on the new file. For each problem
+it logs an error, for example
+`Config reload: [cluster] is invalid and the server will not start with this config`, with the
+reason in `error`, so a file the next restart would refuse is caught at the reload. It still
+applies each valid `[[server]]` block as above.
 
 How to send the signal, and how shutdown works, is in [OPERATIONS.md](OPERATIONS.md).
 
