@@ -308,3 +308,67 @@ func TestVacationSubjectIsCapped(t *testing.T) {
 		})
 	}
 }
+
+// TestVacationSubjectParameter is issue #526. RFC 5230 §5.3: "If the :subject parameter
+// is not supplied, then the subject is generated as follows: The subject is set to the
+// characters "Auto: " followed by the original subject." An explicit :subject is used as
+// given, an empty one included: go-sieve gave it the default subject, and delivery
+// replaced an empty subject with "Automated reply". The script runs through the
+// interpreter and the handler, so the subject's presence must survive both.
+func TestVacationSubjectParameter(t *testing.T) {
+	const owner = "jane@example.com"
+	owns := func(_ context.Context, _ int64, addr string) (bool, error) {
+		return strings.EqualFold(addr, owner), nil
+	}
+	for _, tc := range []struct {
+		name, args, want string
+	}{
+		{name: "omitted", args: ``, want: "Auto: Original subject"},
+		{name: "explicit empty", args: `:subject ""`, want: ""},
+		{name: "explicit", args: `:subject "Away"`, want: "Away"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, err := sieveengine.NewSieveExecutorWithExtensions(`require "vacation"; vacation `+tc.args+` "Away.";`, []string{"vacation"})
+			if err != nil {
+				t.Fatalf("compile script: %v", err)
+			}
+			const raw = "From: bob@example.org\r\nTo: " + owner + "\r\nSubject: Original subject\r\n\r\nHello\r\n"
+			r, err := e.Evaluate(context.Background(), sieveengine.Context{
+				EnvelopeFrom: "bob@example.org",
+				EnvelopeTo:   owner,
+				Header:       map[string][]string{"From": {"bob@example.org"}, "To": {owner}, "Subject": {"Original subject"}},
+				Message:      []byte(raw),
+			})
+			if err != nil {
+				t.Fatalf("evaluate script: %v", err)
+			}
+			if r.Vacation == nil {
+				t.Fatalf("script produced no vacation reply (action %s)", r.Action)
+			}
+
+			rq := &captureRelayQueue{}
+			h := &StandardVacationHandler{Hostname: "mail.example.com", RelayQueue: rq, IsOwnedAddress: owns}
+			original := makeMessage(map[string]string{"From": "bob@example.org", "To": owner, "Subject": "Original subject"})
+			if err := h.HandleVacationResponse(context.Background(), 1, *r.Vacation, vacAddr(t, "bob@example.org"), vacAddr(t, owner), original); err != nil {
+				t.Fatalf("HandleVacationResponse: %v", err)
+			}
+			if len(rq.calls) != 1 {
+				t.Fatalf("expected 1 reply, got %d", len(rq.calls))
+			}
+			entity, err := mail.CreateReader(bytes.NewReader(rq.calls[0].body))
+			if err != nil {
+				t.Fatalf("parse reply: %v", err)
+			}
+			if !entity.Header.Has("Subject") {
+				t.Fatalf("reply has no Subject field")
+			}
+			got, err := entity.Header.Subject()
+			if err != nil {
+				t.Fatalf("decode subject: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("reply subject = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

@@ -643,10 +643,11 @@ max_attempts = 5              # Attempts after which an upload is parked ("faile
                               # or a file missing while S3 reports the object absent. Provider errors (any HTTP
                               # status, including 4xx) and database errors never count — the body is intact on
                               # disk and the upload is simply retried.
-retry_interval = "30s"        # Delay before a failed upload is leased again. When every upload in a cycle fails
-                              # (provider or database outage) the worker backs off exponentially from this value,
-                              # doubling per failed cycle up to 10 minutes, and resumes on the first success.
-cleanup_grace_period = "1h"   # Minimum age of a local upload file before cleanup considers it.
+retry_interval = "30s"        # Delay before a failed upload is leased again. Must be positive. When every upload in a
+                              # cycle fails (provider or database outage) the worker backs off exponentially from this
+                              # value, doubling per failed cycle up to 10 minutes, and resumes on the first success.
+cleanup_grace_period = "1h"   # Minimum age of a local upload file before cleanup considers it. Must be positive and
+                              # longer than any delivery transaction can take.
 max_staging_size = "100gb"    # Maximum size of this node's own upload staging backlog (e.g. "100gb"); other nodes' backlogs do not count. If set and exceeded, new messages (IMAP APPEND, LMTP and Admin API deliveries) are refused.
 
 # CLEANUP PROCESS CONFIGURATION
@@ -709,6 +710,8 @@ smtp_use_starttls = true                          # Use STARTTLS (ports 587, 25)
 # smtp_tls_key_file = "/path/to/client.key"      # Client key for mTLS (optional)
 
 # HTTP API Relay Configuration (when type="http")
+# http_url must answer the POST itself: redirects are not followed, and a 3xx answer
+# is a temporary failure (the message stays queued and is retried).
 # http_url = "https://api.example.com/v1/mail/deliver"  # HTTP API endpoint (startup warns about http:// unless the host is loopback)
 # auth_token = "your-bearer-token"                      # Bearer token for Authorization header
 
@@ -813,7 +816,7 @@ max_total_size = 1048576       # Maximum total metadata size per account (1MB). 
 
 [shared_mailboxes]
 enabled = false                  # Enable shared mailbox functionality (default: false)
-namespace_prefix = "Shared/"     # IMAP namespace prefix (e.g., "Shared/" or "#shared/"); must end with "/" and cannot be "INBOX/"
+namespace_prefix = "Shared/"     # IMAP namespace prefix (e.g., "Shared/" or "#shared/"); must be a mailbox name followed by "/", and not "INBOX/"
 allow_user_create = false        # Allow users to create shared mailboxes over IMAP (false = admin-only: sora-admin mailbox create)
 allow_anyone_identifier = false  # Allow granting rights to "anyone" (every user in the owner's domain); existing grants stay until revoked
 default_rights = "lrswipkxtea"   # Default ACL rights for shared mailbox creators (full rights by default)
@@ -894,6 +897,8 @@ enabled_extensions = []
 enabled = false
 
 # HTTP endpoint to submit training data (POST requests with JSON payload)
+# Must answer the POST itself: redirects are not followed, and a 3xx answer is a
+# failed submission.
 # Example: "https://spam-filter.example.com/train"
 # endpoint = "https://your-spam-service.example.com/api/train"
 
@@ -1108,12 +1113,11 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # Disabled capabilities are not announced in CAPABILITY responses and cannot be
 # used: what they add is refused, e.g. with MOVE disabled the MOVE command gets
 # BAD, with STATUS=SIZE disabled so does STATUS (SIZE), with UIDPLUS disabled
-# UID EXPUNGE. Disabling LIST-EXTENDED refuses its generic selection/return
+# UID EXPUNGE, with CREATE-SPECIAL-USE disabled CREATE's USE parameter (even
+# USE ()). Disabling LIST-EXTENDED refuses its generic selection/return
 # options and parenthesized pattern lists; plain LIST, LSUB and options with
 # their own advertised capabilities (SPECIAL-USE, LIST-STATUS) keep working.
-# ID cannot be refused, so disabling ID only stops announcing it. Disabling
-# CREATE-SPECIAL-USE refuses attribute assignment, but an empty CREATE USE ()
-# parameter is still accepted and behaves as ordinary CREATE.
+# ID cannot be refused, so disabling ID only stops announcing it.
 #
 # This is different from client_filters which apply based on client identity.
 # Use this when you want to disable capabilities for ALL clients on this server.
@@ -1131,9 +1135,15 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # A capability another one implies is removed together with it: disabling an
 # extension IMAP4rev2 includes (IDLE, ESEARCH, SEARCHRES, MOVE, NAMESPACE,
 # UIDPLUS, LIST-STATUS, STATUS=SIZE, CHILDREN, ...) also removes IMAP4rev2, so
-# the server offers IMAP4rev1 with its remaining extensions; disabling CONDSTORE
-# also removes QRESYNC; disabling SORT also removes SORT=DISPLAY and ESORT.
-# client_filters follow the same rule.
+# the server offers IMAP4rev1 with its remaining extensions; disabling ESEARCH
+# also removes SEARCHRES, ESORT and MULTISEARCH; disabling CONDSTORE also
+# removes QRESYNC; disabling SORT also removes SORT=DISPLAY and ESORT; disabling
+# SPECIAL-USE also removes CREATE-SPECIAL-USE.
+# client_filters follow the same rule, except that a filter never takes away
+# what the connection has already enabled (ENABLE IMAP4rev2/CONDSTORE/QRESYNC,
+# any CONDSTORE enabling command, IMAP4rev2 on a server without IMAP4rev1):
+# a client that sends ID after ENABLE IMAP4rev2 keeps IMAP4rev2 and every
+# extension it includes.
 # IMAP4rev2 includes BINARY's FETCH items but not its APPEND extension, so
 # disabling BINARY keeps IMAP4rev2 and refuses only APPEND with a literal8;
 # FETCH BINARY, BINARY.PEEK and BINARY.SIZE are refused once IMAP4rev2 is
@@ -1142,6 +1152,8 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # IMAP4rev1 and cannot be disabled; naming them only logs a warning.
 # STARTTLS, LOGINDISABLED and AUTH=PLAIN follow tls, tls_use_starttls and
 # insecure_auth; disabled_caps does not change them.
+# Names are case-insensitive ("idle" is IDLE). A name that is no capability the
+# server can withdraw (a typo, ACL, STARTTLS, ...) is logged at WARN at startup.
 
 # --- ADDITIONAL CAPABILITY TOKENS ---
 # Advertise extra, non-standard capability tokens to ALL clients, verbatim. These
@@ -1235,6 +1247,8 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # - If ja4_fingerprints specified: matches if ANY pattern matches (OR)
 # - If client_name/version specified: matches if BOTH name AND version match (AND)
 # - Between ja4_fingerprints and client_name/version: matches if EITHER criteria is met (OR)
+# - An entry with none of them, or with an empty ja4_fingerprints pattern (which
+#   would match every fingerprint), stops startup
 
 # --- RESOURCE LIMITS ---
 # Search rate limiting - prevent DoS attacks via excessive search queries (IMAP only)
@@ -1408,8 +1422,9 @@ proxy_protocol = false        # Enable PROXY protocol support for LMTP
 proxy_protocol_timeout = "5s"
 
 # --- MESSAGE SIZE LIMITING ---
-# Maximum size for incoming LMTP messages to prevent memory exhaustion attacks
-max_message_size = "50mb"     # Maximum message size (default: 50MB, 0 = unlimited)
+# Maximum size for incoming LMTP messages to prevent memory exhaustion attacks.
+# Advertised in LHLO as "SIZE <n>"; MAIL ... SIZE= above it is refused with 552.
+max_message_size = "50mb"     # Maximum message size (default: 50MB; 0 also means 50MB, there is no unlimited)
 
 # --- SIEVE REDIRECT LIMITS ---
 # Applied when a delivery runs the recipient's Sieve script: by lmtp servers and by
@@ -1430,13 +1445,13 @@ limits.max_redirect_hops = 2             # Max times one message may be redirect
                                          # still applies regardless of this value.
 
 # --- TIMEOUT CONFIGURATION ---
-# The LMTP server's only connection timeout. absolute_session_timeout, min_bytes_per_minute,
-# auth_idle_timeout and limits.session_memory_limit do not apply to it.
+# absolute_session_timeout, min_bytes_per_minute, auth_idle_timeout and
+# limits.session_memory_limit do not apply to the LMTP backend.
 timeouts.command_timeout = "5m"  # Idle time between commands before 421 and disconnect
                                  # (default: 5m, the RFC 5321 §4.5.3.2.7 floor; "0" = the default).
-                                 # It also bounds receiving a message: the read deadline set for the
-                                 # DATA command is not extended while the data arrives, so a message
-                                 # that takes longer is refused with 421 and the MTA retries it.
+                                 # During DATA and BDAT it bounds each wait for more message content.
+                                 # A separate one-hour limit bounds one DATA body or BDAT chunk;
+                                 # a stalled or over-time transfer gets 421 and disconnects so the MTA retries.
 
 # --- PER-COMMAND EXECUTION TIMEOUTS (optional) ---
 # Hard caps on server-side work, mirroring imap_command_timeouts. On expiry
@@ -1823,10 +1838,9 @@ limits.max_auth_errors = 2                  # Number of protocol errors before a
 # - If HTTP endpoint returns 404/3xx → respects lookup_local_users setting (user partitioning)
 # - If HTTP endpoint returns 401/403 → authentication rejected (no fallback); the way to refuse an account.
 #   On a route-only lookup too: an LMTP recipient gets the user_not_found_response reply, with or
-#   without [[pool]] blocks, and is never looked up in the local database; with [[pool]] blocks the
-#   User API proxy answers a login 401 as a wrong password (see NAMED BACKEND POOLS), and any other
-#   route-only refusal (a User API request carrying a token: 503) is a temporary failure, never the
-#   default pool
+#   without [[pool]] blocks, and is never looked up in the local database; the User API proxy, with
+#   [[pool]] blocks or remote_addrs, answers a login 401 as a wrong password (see NAMED BACKEND
+#   POOLS), and a request carrying a token 503, never sending either to a backend
 # - If HTTP endpoint returns other 4xx/5xx, or a 200 that is not JSON with address and password_hash
 #   → service unavailable (no verdict on the password), ALWAYS reject (no fallback); 5xx, 408, 429
 #   and malformed 200s also count toward the circuit breaker
@@ -2289,7 +2303,8 @@ connect_timeout = "30s"
 auth_idle_timeout = "2m"        # Idle timeout between commands during authentication phase (pre-auth only).
                               # Resets after each command received. Cleared after successful authentication.
                               # Note: absolute_session_timeout (below) separately limits total session duration.
-max_message_size = "50mb"
+max_message_size = "50mb"       # Advertised in LHLO as "SIZE <n>"; MAIL ... SIZE= above it gets 552, a SIZE= that is
+                                # not a number 501. SIZE= is passed on to backends that advertise SIZE. "0" also means 50MB.
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- TIMEOUT CONFIGURATION ---
@@ -2421,6 +2436,8 @@ tls_verify = false
 #remote_tls = false                  # Use HTTPS for backend connections
 #remote_tls_verify = true            # Verify backend TLS certificates
 #remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots; only for backends in no [[pool]].
+#auth_rate_limit.enabled = true      # Rate limit every login through the proxy, including those it refuses itself (named pools);
+                                    # leave it off on the http_user_api backends behind it. Keys as in the IMAP example above.
 
 # IMPORTANT: Backend User API servers should configure allowed_hosts to trust this proxy
 # Backend configuration example:

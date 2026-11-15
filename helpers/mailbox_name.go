@@ -2,7 +2,6 @@ package helpers
 
 import (
 	"strings"
-	"unicode/utf8"
 
 	"github.com/migadu/sora/consts"
 )
@@ -50,7 +49,7 @@ func MailboxNameHasTraversal(name string) bool {
 // valid UTF-8 without a NUL. No mailbox has any other name; querying with one fails
 // with SQLSTATE 22021 instead of finding nothing.
 func MailboxNameStorable(name string) bool {
-	return utf8.ValidString(name) && strings.IndexByte(name, 0) < 0
+	return TextStorable(name)
 }
 
 // MailboxNameToCreate returns the name of the mailbox that creating name makes, or

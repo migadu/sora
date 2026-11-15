@@ -94,7 +94,7 @@ func (r *RelayConfig) validateSMTPHost() error {
 		return errors.New(`[relay] type "smtp" requires smtp_host as host:port`)
 	}
 	host, port, err := net.SplitHostPort(r.SMTPHost)
-	shown := relayEndpointForError(r.SMTPHost)
+	shown := MaskEndpointURL(r.SMTPHost)
 	if err != nil {
 		// AddrError.Error repeats the raw endpoint, which may contain misplaced
 		// URL credentials. Keep the parser's reason, not its address.
@@ -125,12 +125,13 @@ func (r *RelayConfig) validateHTTPURL() error {
 	if r.HTTPURL == "" {
 		return errors.New(`[relay] type "http" requires http_url`)
 	}
-	shown := relayEndpointForError(r.HTTPURL)
+	shown := MaskEndpointURL(r.HTTPURL)
 	u, err := url.Parse(r.HTTPURL)
 	if err != nil {
-		// The *url.Error repeats the unmasked URL; keep only its reason.
+		// The *url.Error repeats the URL, shown above; keep only its reason, which
+		// MaskURLError masks when it may quote a credential.
 		var urlErr *url.Error
-		if errors.As(err, &urlErr) {
+		if errors.As(MaskURLError(err), &urlErr) {
 			err = urlErr.Err
 		}
 		return fmt.Errorf("[relay] http_url %q is not a valid URL: %w", shown, err)
@@ -142,15 +143,6 @@ func (r *RelayConfig) validateHTTPURL() error {
 		return fmt.Errorf("[relay] http_url %q has no valid port", shown)
 	}
 	return nil
-}
-
-// Validation also handles malformed endpoints, where the usual URL masker cannot
-// identify an authority. Hide a credential-bearing schemeless value completely.
-func relayEndpointForError(value string) string {
-	if !strings.Contains(value, "://") && strings.ContainsAny(value, "?@") {
-		return SecretMask
-	}
-	return maskURLCredentials(value)
 }
 
 // validDialPort reports whether port is a TCP port a dial can reach, resolved as
@@ -233,15 +225,28 @@ func (r *RelayConfig) GetQueuePath() string {
 	return "/var/spool/sora/relay" // Default path
 }
 
-// Validate rejects a worker_interval of zero or less, which the worker's ticker cannot
-// run with, and a negative failed_retention, against which every failed message is
-// overdue for deletion. A value that does not parse is left to start-up, where
-// worker_interval falls back to its default and failed_retention stops the server.
+// Validate rejects the [relay.queue] settings the relay worker cannot start with: a
+// circuit_breaker_timeout, cleanup_interval or failed_retention that does not parse, a
+// worker_interval of zero or less, which the worker's ticker cannot run with, and a
+// negative failed_retention, against which every failed message is overdue for
+// deletion. A worker_interval or retry_backoff that does not parse takes its default.
 func (q *RelayQueueConfig) Validate() error {
+	for _, f := range []struct {
+		key, value string
+		parse      func() (time.Duration, error)
+	}{
+		{"circuit_breaker_timeout", q.CircuitBreakerTimeout, q.GetCircuitBreakerTimeout},
+		{"cleanup_interval", q.CleanupInterval, q.GetCleanupInterval},
+		{"failed_retention", q.FailedRetention, q.GetFailedRetention},
+	} {
+		if _, err := f.parse(); err != nil {
+			return fmt.Errorf("invalid %s %q: %w", f.key, f.value, err)
+		}
+	}
 	if d, err := q.GetWorkerInterval(); err == nil && d <= 0 {
 		return fmt.Errorf("worker_interval must be positive, got %q", q.WorkerInterval)
 	}
-	if d, err := q.GetFailedRetention(); err == nil && d < 0 {
+	if d, _ := q.GetFailedRetention(); d < 0 {
 		return fmt.Errorf("failed_retention must not be negative, got %q", q.FailedRetention)
 	}
 	return nil

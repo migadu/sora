@@ -20,7 +20,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 				Addr:                ":143",
 				SupportedExtensions: []string{"vacation"},
 			},
-			wantWarnings: []string{"supported_extensions", "ManageSieve"},
+			wantWarnings: []string{"supported_extensions", "managesieve_proxy"},
 		},
 		{
 			name: "IMAP with remote_addrs",
@@ -41,7 +41,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 				RemoteAddrs:         []string{"backend1:110"},
 				SupportedExtensions: []string{"vacation"},
 			},
-			wantWarnings: []string{"supported_extensions", "ManageSieve"},
+			wantWarnings: []string{"supported_extensions", "managesieve_proxy"},
 		},
 		{
 			name: "ManageSieve with remote_addrs",
@@ -73,7 +73,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 				RemoteAddrs:   []string{"backend1:2525"},
 				MaxScriptSize: "16kb",
 			},
-			wantWarnings: []string{"max_script_size", "ManageSieve"},
+			wantWarnings: []string{"max_script_size", "managesieve"},
 		},
 		{
 			name: "Metrics server with remote_addrs",
@@ -93,7 +93,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 				Addr:               ":143",
 				RemoteUseIDCommand: true,
 			},
-			wantWarnings: []string{"remote_use_id_command", "IMAP proxy"},
+			wantWarnings: []string{"remote_use_id_command", "imap_proxy"},
 		},
 		{
 			name: "LMTP with remote_use_xclient",
@@ -103,7 +103,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 				Addr:             ":2525",
 				RemoteUseXCLIENT: true,
 			},
-			wantWarnings: []string{"remote_use_xclient", "LMTP and POP3 proxy"},
+			wantWarnings: []string{"remote_use_xclient", "pop3_proxy, lmtp_proxy"},
 		},
 		{
 			name: "IMAP with remote_tls_use_starttls",
@@ -136,7 +136,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 				RemoteAddrs:      []string{"backend1:143"},
 				RemoteUseXCLIENT: true,
 			},
-			wantWarnings: []string{"remote_use_xclient", "LMTP and POP3 proxy"},
+			wantWarnings: []string{"remote_use_xclient", "pop3_proxy, lmtp_proxy"},
 		},
 		{
 			name: "LMTP proxy with remote_use_id_command",
@@ -147,7 +147,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 				RemoteAddrs:        []string{"backend1:2525"},
 				RemoteUseIDCommand: true,
 			},
-			wantWarnings: []string{"remote_use_id_command", "IMAP proxy"},
+			wantWarnings: []string{"remote_use_id_command", "imap_proxy"},
 		},
 		{
 			// The metrics endpoint does not read PROXY headers (#272).
@@ -232,10 +232,9 @@ func TestWarnUnusedConfigOptions_MultipleIssues(t *testing.T) {
 
 	serverConfig.WarnUnusedConfigOptions(mockLogger)
 
-	// Should get warnings for both supported_extensions and remote_addrs
-	// (MaxScriptSize doesn't trigger a warning for IMAP as we didn't add that check)
-	if warningCount < 2 {
-		t.Errorf("Expected at least 2 warnings for multiple invalid options, got %d", warningCount)
+	// One warning each for supported_extensions, remote_addrs and max_script_size.
+	if warningCount != 3 {
+		t.Errorf("Expected 3 warnings for multiple invalid options, got %d", warningCount)
 	}
 }
 
@@ -364,6 +363,20 @@ func TestWarnTLSVerifyWithoutTLS(t *testing.T) {
 				}
 			}
 		})
+	}
+	// The metrics endpoint is plain HTTP with or without tls = true (#1326): one
+	// warning names tls_verify, and it does not send the operator to set tls.
+	for _, withTLS := range []bool{false, true} {
+		cfg := ServerConfig{Type: "metrics", Name: "listener", TLS: withTLS, TLSVerify: true}
+		var named []string
+		cfg.WarnUnusedConfigOptions(func(format string, args ...any) {
+			if w := fmt.Sprintf(format, args...); strings.Contains(w, "'tls_verify'") {
+				named = append(named, w)
+			}
+		})
+		if len(named) != 1 || strings.Contains(named[0], "without 'tls = true'") {
+			t.Fatalf("metrics with tls = %v: want one warning naming tls_verify as not applied, got %v", withTLS, named)
+		}
 	}
 }
 

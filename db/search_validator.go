@@ -29,16 +29,23 @@ type SearchCriteriaValidator struct {
 	MaxTotalNodes int
 }
 
+// MaxSearchTermLength is the most bytes one search text may have: each string of an
+// IMAP SEARCH and the User API's search query and filters. Every word of a body search
+// becomes a node of plainto_tsquery, which PostgreSQL parses in time growing with the
+// square of the word count and plans recursively, so an unbounded text costs seconds of
+// database time and, with enough words, fails with SQLSTATE 54001.
+const MaxSearchTermLength = 1000
+
 // NewSearchCriteriaValidator creates a new validator with sensible defaults
 func NewSearchCriteriaValidator() *SearchCriteriaValidator {
 	return &SearchCriteriaValidator{
-		MaxSearchTermLength: 1000, // Max characters in a single search term
-		MaxSearchTerms:      50,   // Max total search terms across all criteria
-		MaxTextSearchTerms:  10,   // Max body/text search terms
-		MaxSequenceRanges:   20,   // Max UID/sequence ranges
-		MaxFlagFilters:      20,   // Max flag conditions
-		MaxNestingDepth:     30,   // Max nesting depth of Not/Or criteria
-		MaxTotalNodes:       256,  // Max total criteria nodes across the tree
+		MaxSearchTermLength: MaxSearchTermLength,
+		MaxSearchTerms:      50,  // Max total search terms across all criteria
+		MaxTextSearchTerms:  10,  // Max body/text search terms
+		MaxSequenceRanges:   20,  // Max UID/sequence ranges
+		MaxFlagFilters:      20,  // Max flag conditions
+		MaxNestingDepth:     30,  // Max nesting depth of Not/Or criteria
+		MaxTotalNodes:       256, // Max total criteria nodes across the tree
 		SupportedHeaders: map[string]bool{
 			"subject":     true,
 			"message-id":  true,

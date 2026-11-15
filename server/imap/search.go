@@ -34,6 +34,10 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 		}
 	}
 
+	// The client's numbering holds still until the results are numbered (seqViewMu).
+	s.seqViewMu.RLock()
+	defer s.seqViewMu.RUnlock()
+
 	// First safely read and decode session state
 	var selectedMailboxID int64
 	var currentNumMessages uint32
@@ -72,9 +76,10 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 	selectedMailboxOwnerID := s.selectedMailbox.AccountID
 	selectedMailboxName := s.selectedMailbox.Name
 	currentNumMessages = s.currentNumMessages.Load()
+	view := s.seqViewLocked()
+	criteria = s.decodeSearchCriteriaLocked(view, criteria)
 	release() // Release read lock
 
-	criteria = s.decodeSearchCriteria(criteria)
 	if criteria, err = s.withSessionRecent(criteria, selectedMailboxID); err != nil {
 		return nil, err
 	}
@@ -90,7 +95,7 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 
 	// The configured search_timeout is now automatically applied by the resilient DB layer.
 	// SEARCH only returns UIDs, so we can use a high limit (0 = use default MaxSearchResults)
-	messages, err := s.server.rdb.SearchMessagesWithCriteriaWithRetry(ctx, selectedMailboxID, selectedMailboxOwnerID, criteria, 0, int(currentNumMessages))
+	messages, err := s.server.rdb.SearchMessagesWithCriteriaWithRetry(view.context(ctx), selectedMailboxID, selectedMailboxOwnerID, criteria, 0, int(currentNumMessages))
 	if errors.Is(err, db.ErrSearchTooManyResults) {
 		return nil, s.searchResultLimitError("SEARCH", "mailbox", selectedMailboxName, "mailbox_messages", currentNumMessages)
 	}
@@ -99,6 +104,9 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 		s.DebugLog("[SEARCH] final error after retries", "error", err)
 		s.classifyAndTrackError("SEARCH", err, nil)
 		return nil, s.internalError("failed to search messages: %v", err)
+	}
+	if numKind == imapserver.NumKindSeq {
+		messages = view.encodeSearchResults(messages)
 	}
 
 	// Track memory for search results (approximate: 64 bytes per message lightweight metadata)
@@ -165,8 +173,7 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 						// MIN is the smallest UID - last element in DESC order
 						searchData.Min = uint32(messages[len(messages)-1].UID)
 					} else {
-						// For sequence number search, use the database sequence number directly
-						// (see fetch.go for explanation of why we don't use EncodeSeqNum)
+						// The client's sequence number (encodeSearchResults above)
 						searchData.Min = messages[len(messages)-1].Seq
 					}
 				}
@@ -175,8 +182,7 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 						// MAX is the largest UID - first element in DESC order
 						searchData.Max = uint32(messages[0].UID)
 					} else {
-						// For sequence number search, use the database sequence number directly
-						// (see fetch.go for explanation of why we don't use EncodeSeqNum)
+						// The client's sequence number (encodeSearchResults above)
 						searchData.Max = messages[0].Seq
 					}
 				}
@@ -184,7 +190,6 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 				// Populate ALL with actual results
 				for _, msg := range messages {
 					uids.AddNum(msg.UID)
-					// Use database sequence numbers directly (no encoding needed)
 					seqNums.AddNum(msg.Seq)
 				}
 			}
@@ -216,7 +221,6 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 				var seqNums imap.SeqSet
 				for _, msg := range messages {
 					uids.AddNum(msg.UID)
-					// Use database sequence numbers directly (no encoding needed)
 					seqNums.AddNum(msg.Seq)
 				}
 				if numKind == imapserver.NumKindUID {
@@ -240,7 +244,6 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 			var seqNums imap.SeqSet
 			for _, msg := range messages {
 				uids.AddNum(msg.UID)
-				// Use database sequence numbers directly (no encoding needed)
 				seqNums.AddNum(msg.Seq)
 			}
 
@@ -303,12 +306,15 @@ func (s *IMAPSession) emptySavedSearchOnNo(err error) {
 }
 
 // decodeSearchCriteriaLocked resolves the "$" markers in search criteria to this
-// session's saved search result. Sequence sets are left as the client sent them:
-// the database maps them to UIDs in one snapshot of the mailbox, and needs "*"
-// still unresolved to answer a range such as 99:* that starts past the last message.
-// IMPORTANT: The caller MUST hold s.mutex (either read or write lock) when calling this method.
-func (s *IMAPSession) decodeSearchCriteriaLocked(criteria *imap.SearchCriteria) *imap.SearchCriteria {
-	return searchResAsUIDs(criteria, s.savedSearchResultLocked())
+// session's saved search result and decodes the sequence sets into the server view
+// (seqView.decodeCriteria); the database maps those to UIDs in one snapshot.
+// IMPORTANT: The caller MUST hold s.mutex (either read or write lock) and seqViewMu.
+func (s *IMAPSession) decodeSearchCriteriaLocked(view seqView, criteria *imap.SearchCriteria) *imap.SearchCriteria {
+	criteria = searchResAsUIDs(criteria, s.savedSearchResultLocked())
+	if view.tracker == nil {
+		return criteria
+	}
+	return view.decodeCriteria(criteria)
 }
 
 // searchResAsUIDs returns a copy of criteria with every "$" marker (RFC 5182),
@@ -337,25 +343,6 @@ func searchResAsUIDs(criteria *imap.SearchCriteria, saved imap.UIDSet) *imap.Sea
 	}
 
 	return &decoded
-}
-
-// decodeSearchCriteria safely acquires the read mutex and resolves "$" in search criteria.
-func (s *IMAPSession) decodeSearchCriteria(criteria *imap.SearchCriteria) *imap.SearchCriteria {
-	if s.ctx.Err() != nil {
-		s.DebugLog("session context is cancelled, skipping decodeSearchCriteria")
-		// Return unmodified criteria if context is cancelled
-		return criteria
-	}
-
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-	if !acquired {
-		s.DebugLog("failed to acquire read lock for decodeSearchCriteria within timeout")
-		// Return unmodified criteria if we can't acquire the lock
-		return criteria
-	}
-	defer release()
-
-	return s.decodeSearchCriteriaLocked(criteria)
 }
 
 // searchResultLimitError answers a command that matched more than db.MaxSearchResults

@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// A real COPY restage can lose its only vector source to source-account purge.
+// A real COPY restage could lose its only vector source to source-account purge (#909).
 // Recovery may replace only empty placeholders with known-positive legacy vectors.
 func TestFTSRecoverMessageContentsRepairsEmptyDestinations(t *testing.T) {
 	for _, mode := range []string{"queued", "poisoned", "legacy text without known vector", "concurrent worker poisons", "concurrent worker supplies vector"} {
@@ -46,13 +46,11 @@ func TestFTSRecoverMessageContentsRepairsEmptyDestinations(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, database.restageFTS(ctx, tx, f.mailboxID, []int64{1}))
 			require.NoError(t, tx.Commit(ctx))
-			// The production account-purge method removes the source's sole remaining vector.
-			tx, err = pool.Begin(ctx)
+			// The source's sole remaining vector goes, as the account purge removed it before
+			// it learned to fill the waiting copy first (#909); the drain no longer does this.
+			tag, err := pool.Exec(ctx, `DELETE FROM messages_fts_v2 WHERE account_id = $1`, sourceAccount)
 			require.NoError(t, err)
-			n, err := database.DeleteFTSRowsForAccount(ctx, tx, sourceAccount, 100)
-			require.NoError(t, err)
-			require.EqualValues(t, 1, n)
-			require.NoError(t, tx.Commit(ctx))
+			require.EqualValues(t, 1, tag.RowsAffected())
 			_, err = pool.Exec(ctx, `UPDATE messages_fts_v2 SET created_at='2000-01-01',sent_date='2001-01-01'
     WHERE content_hash='hash_indexed' AND account_id=$1`, f.accountID)
 			require.NoError(t, err)

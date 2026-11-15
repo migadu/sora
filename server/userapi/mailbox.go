@@ -178,6 +178,16 @@ func (s *Server) handleCreateMailbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A mailbox created in the shared namespace is a shared mailbox: IMAP CREATE makes
+	// it one or refuses it (the namespace root, or allow_user_create = false), and
+	// RENAME never moves a mailbox into the namespace. The User API does not create
+	// shared mailboxes, so it refuses these names rather than create personal
+	// mailboxes there.
+	if s.sharedMailboxes.InNamespace(canonicalName) {
+		s.writeError(w, http.StatusForbidden, "Mailboxes in the shared namespace cannot be created through the User API")
+		return
+	}
+
 	// Create mailbox
 	if err := s.rdb.CreateMailboxForUserWithRetry(ctx, accountID, canonicalName); err != nil {
 		if errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -230,6 +240,12 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, consts.ErrMailboxHasChildren) {
 			s.writeError(w, http.StatusConflict, "Mailbox has child mailboxes; delete them first")
+			return
+		}
+		// A shared mailbox without the 'x' right (RFC 4314 §2.1), which IMAP DELETE
+		// answers NO [NOPERM].
+		if errors.Is(err, consts.ErrNotPermitted) {
+			s.writeError(w, http.StatusForbidden, "Not permitted to delete this mailbox")
 			return
 		}
 		logger.Warn("HTTP Mail API: Error deleting mailbox", "name", s.name, "error", err)

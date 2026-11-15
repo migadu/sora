@@ -86,10 +86,11 @@ func purgeDomainWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilient
 	}
 
 	// Remove cross-domain aliases for this domain. Accounts whose PRIMARY identity is in the
-	// domain were purged above. Any credential still in this domain is a non-primary alias on
-	// an account whose primary lives elsewhere — without removal it keeps receiving mail for
-	// the (now decommissioned) domain. A credential address is a deliverable address, so this
-	// is required to fully offboard the domain.
+	// domain were purged above (or, if that failed, are left for the re-run). Any other
+	// credential in this domain is a non-primary alias on an account whose primary lives
+	// elsewhere, soft-deleted or not — without removal it keeps receiving mail for the (now
+	// decommissioned) domain, or does again once the account is restored. A credential
+	// address is a deliverable address, so this is required to fully offboard the domain.
 	aliasAddrs, err := rdb.GetAliasCredentialsByDomain(ctx, domain)
 	if err != nil {
 		return fmt.Errorf("failed to scan for cross-domain aliases: %w", err)
@@ -102,7 +103,7 @@ func purgeDomainWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilient
 	aliasFailed := 0
 	if len(aliasAddrs) > 0 {
 		fmt.Printf("===================================================\n")
-		fmt.Printf("Cross-domain aliases in %s (on accounts kept alive)\n", domain)
+		fmt.Printf("Cross-domain aliases in %s (on accounts kept elsewhere)\n", domain)
 		fmt.Printf("===================================================\n\n")
 		for _, addr := range aliasAddrs {
 			if err := rdb.DeleteCredentialWithRetry(ctx, addr); err != nil {
