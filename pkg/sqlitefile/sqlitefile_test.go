@@ -96,3 +96,53 @@ func assertOpensFile(t *testing.T, dir, path, name string) {
 		t.Errorf("DSN %q created %q in %s, want only %q", dsn, names, dir, name)
 	}
 }
+
+// Parse reads a file: URI by SQLite's rules (https://www.sqlite.org/uri.html, section 3)
+// and any other name as a path, and reports the names that open no file.
+func TestParse(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, query string
+	}{
+		{"/var/cache/sora/auth.db", "/var/cache/sora/auth.db", ""},
+		{"rel/a?b.db", "rel/a?b.db", ""}, // a path is the file name, '?' and all
+		{"FILE:/x.db", "FILE:/x.db", ""}, // the scheme is "file:", lower case
+		{"file:/var/cache/sora/auth.db", "/var/cache/sora/auth.db", ""},
+		{"file:///var/cache/sora/auth.db", "/var/cache/sora/auth.db", ""},
+		{"file://localhost/var/cache/sora/auth.db", "/var/cache/sora/auth.db", ""},
+		{"file:rel/auth.db", "rel/auth.db", ""},
+		{"file:/x.db?mode=rwc&cache=private", "/x.db", "mode=rwc&cache=private"},
+		{"file:/x.db#frag?mode=memory", "/x.db", ""}, // the fragment ends the URI
+		{"file:/a%3Fb%23c%25d.db", "/a?b#c%d.db", ""},
+		{"file:/a%b%zz%4.db", "/a%b%zz%4.db", ""}, // not %HH: a literal '%'
+		{"file:/a.db%00ignored?mode=rwc", "/a.db", "mode=rwc"},
+		{"file:/x.db?mode=memory&mode=rwc", "/x.db", "mode=memory&mode=rwc"}, // the last mode wins
+		{"file:/x.db?vfs=memdb&vfs=unix", "/x.db", "vfs=memdb&vfs=unix"},
+		{"file:/x.db?mode=memor", "/x.db", "mode=memor"},
+
+		// Names that open no file.
+		{":memory:", "", ""},
+		{"", "", ""},
+		{"file:", "", ""},
+		{"file://", "", ""},
+		{"file://localhost", "", ""},
+		{"file:?mode=rwc", "", ""},
+		{"file::memory:", "", ""},
+		{"file::memory:?cache=shared", "", ""},
+		{"file:/x.db?mode=memory", "", ""},
+		{"file:/x.db?mode=rwc&mode=memory", "", ""},
+		{"file:/x.db?mode=memor%79", "", ""},
+		{"file:/x.db?vfs=memdb", "", ""},
+		{"file:/x.db?%76fs=memdb", "", ""},
+	} {
+		path, query, err := Parse(tc.name)
+		if err != nil || path != tc.path || query != tc.query {
+			t.Errorf("Parse(%q) = %q, %q, %v; want %q, %q, nil", tc.name, path, query, err, tc.path, tc.query)
+		}
+	}
+
+	for _, name := range []string{"file://example.com/x.db", "file://localhost:80/x.db", "file://user@localhost/x.db"} {
+		if path, _, err := Parse(name); err == nil {
+			t.Errorf("Parse(%q) = %q, nil; want an invalid authority error", name, path)
+		}
+	}
+}
