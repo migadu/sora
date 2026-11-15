@@ -184,9 +184,9 @@ CPUs, whichever is larger).
   `[database.write]`. Repeat them, or the read endpoint uses the defaults above.
 - **An endpoint you do not write is not configured.** Without a `[database.write]` (or
   `[database.read]`) section in the file, Sora has no such endpoint. This is how a proxy-only node
-  runs without a database. A node that needs a database and has none refuses to start with
-  `database is required for configured servers but not configured in [database.write] or
-  [database.read]`.
+  runs without a database. A node that needs a database and has none refuses to start, and
+  `sora-admin config validate` refuses the file, with `[database]: server "<name>" (<type>) needs
+  the database, but it is not configured in [database.write] or [database.read]`.
 - **User name and password** may contain any characters. Sora escapes them in the connection URL.
 - **IPv6 addresses** go in brackets with a port: `hosts = ["[2001:db8::10]:5432"]`.
 
@@ -365,6 +365,32 @@ So point `[database.write] hosts` at a name or address that always reaches the c
 a DNS name your failover tooling updates, a virtual IP, or a pooler that follows the primary. You
 can also list every server that may become primary. The check marks the standbys unhealthy, and
 writes move to the server that answers as primary within one check interval.
+
+### Advisory locks across a failover
+
+Sora orders the deletion of a message body in S3 (the cleaner, account purges, `import rekey`)
+against the writes that claim one (uploads, restores, cross-account copies) with advisory locks
+on the write host. A lock excludes only what runs on the server that holds it. So when Sora stops
+writing through a server, it revokes the locks it holds there: the work they guard is cancelled
+(a cleanup batch or purge runs again in a later cycle; a copy or `import rekey` fails and can be
+retried). It does so when it switches to another write host, before it writes anything there, and
+when it reconnects its write host because the server answered read-only or in recovery, as soon
+as it has dropped the old connections. The log shows `Database: fencing advisory locks`.
+
+Each node notices a failover by itself, at its next health check or at its first write that
+fails. Until then, a node still connected to the old primary keeps its locks there, and they
+exclude nothing on the new one. Your failover tooling must therefore fence the old primary before
+the new one accepts writes: shut it down, or terminate every client session on it
+(`pg_terminate_backend`) and refuse new ones. Making it read-only is not enough, because a session
+that is already open keeps its locks.
+
+Fencing ends the locks, but not at once the work they guard. Sora notices that the session
+holding a lock is gone only at the lock's next keepalive, which runs at most a minute after the
+lock's last statement (twice the 30-second keepalive interval) and gives up on a server that does
+not answer after 5 seconds. Until then the guarded work goes on: an S3 delete that was already
+under way, and its retries, can still remove the body of a message the new primary has just
+accepted. So the new primary must not accept writes until more than 65 seconds after the old one
+was fenced.
 
 ### Retries
 
@@ -736,7 +762,7 @@ transaction` for a long time are usually the lock holders of [section 8](#8-pgbo
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Startup fails with `database is required for configured servers but not configured` | `[database.write]` is missing. | Configure the write endpoint ([section 3](#3-connecting-the-write-and-read-endpoints)). |
+| Startup fails with `[database]: server "<name>" (<type>) needs the database, but it is not configured ...` | `[database.write]` is missing. | Configure the write endpoint ([section 3](#3-connecting-the-write-and-read-endpoints)). |
 | Startup fails with `Failed to initialize resilient database` | No write host could be reached. | Check the host, port, credentials and network. The line before it names the error. |
 | Startup fails with `dirty migration state` | A migration failed earlier. | See [A failed migration](#a-failed-migration). |
 | Nodes exit with `timed out waiting for another instance to complete migrations` | A long migration on another node. | Let it finish, then start them; for long migrations, run `sora-admin migrate up` first or raise `migration_timeout`. |

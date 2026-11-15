@@ -138,8 +138,11 @@ if envelope :matches :detail "To" "*" {
 
 What it does:
 
-- A message with an `X-Spam` header that contains `Yes` (in any case) goes to `Junk`. Your
-  spam filter must add that header for this to work.
+- A message with an `X-Spam` header that contains `Yes` (in any case) goes to the account's Junk
+  folder: the personal mailbox with the `\Junk` special-use attribute (RFC 6154), whatever it is
+  named, so a renamed Junk folder keeps receiving spam. Only if no personal mailbox has `\Junk`
+  does it go to the mailbox named `Junk` (the RFC 8579 `fileinto :specialuse` rule), and to INBOX
+  if there is none. Your spam filter must add that header for this to work.
 - A message sent to `user+tag@example.com` goes to a folder named after the detail, in lower case
   (`tag`). The folder is created if it does not exist.
 - Everything else stays in INBOX.
@@ -367,8 +370,8 @@ the message in the relay queue, and the relay worker sends it through the config
 
 ### When a redirect happens
 
-A redirect action is honoured only if all of these hold. If one fails, the redirect is skipped
-and the message is kept, as if the line were not there:
+A redirect action is honoured only if all of these hold. If one of the first four fails, the
+redirect is skipped and the message is kept, as if the line were not there:
 
 1. The target parses as an email address.
 2. The message has been redirected by Sora fewer than `max_redirect_hops` times (default 2). Sora
@@ -381,7 +384,9 @@ and the message is kept, as if the line were not there:
 4. The account is under its redirect rate limit: at most `redirect_rate_limit` redirected
    addresses (default 100) per `redirect_rate_window` (default `1h`). `0` turns the limit off. If
    the database check fails, the redirect is skipped.
-5. A relay is configured (`[relay] type` set). Without one, the message is kept in INBOX.
+5. A relay is configured (`[relay] type` set). Sora checks this at delivery, after the script has
+   run, so without a relay the message is stored as when the relay queue cannot take a redirect
+   (see below).
 
 A script may redirect to several addresses; an address named twice is sent once. More than five
 redirect actions in one run make the run fail, and the message is then handled as in
@@ -399,11 +404,24 @@ redirect actions in one run make the run fail, and the message is then handled a
   - `X-Redirected-By: <primary address of the account that owns the script>`. Any
     `X-Redirected-By` already in the message is removed first.
 
-If queueing fails, the message is kept in INBOX and Sora logs
-`Sieve redirect could not be queued; message kept in INBOX instead` at warning level. Without
-`:copy` (and without `keep`), once every address is queued the message is not stored locally:
-**the queue file is the only copy**. If the relay later rejects it permanently, the message waits
-in the failed queue until `failed_retention` deletes it ([RELAY.md](RELAY.md#5-failures-retries-and-the-failed-queue)).
+A redirect is handed to the relay only after the delivery has stored every copy it stores. A
+delivery that fails (`451` on LMTP, an error from the Admin API) relays nothing, so the sender's
+retry relays each address once.
+
+If the relay queue cannot take an address, the message is not redirected to that address; it still
+goes to the others. Sora logs a warning with the address (`redirect_to`) and the error:
+
+- LMTP: `sieve redirect could not be queued`, both when the queue refuses the message and when it
+  cannot hand a queued one to the relay worker afterwards.
+- Admin API delivery: `Sieve redirect could not be queued` when the queue refuses the message, and
+  `Sieve redirect could not be handed to the relay` when it cannot hand a queued one to the relay
+  worker afterwards.
+
+The message is still stored wherever `fileinto`, `keep` or `:copy` puts it; when the redirects are
+the only place it goes, it is kept in INBOX instead. When they are and every address is queued, the
+message is not stored locally: **the queue file is the only copy**. If the relay later rejects it
+permanently, the message waits in the failed queue until `failed_retention` deletes it
+([RELAY.md](RELAY.md#5-failures-retries-and-the-failed-queue)).
 
 ### Loop detection
 
@@ -638,7 +656,9 @@ Useful log lines (LMTP session logs carry the session and message fields):
 | `mailbox not found, falling back to inbox` | warn | `fileinto` named a missing folder without `:create`. |
 | `sieve set invalid IMAP keywords, dropped` | warn | A flag name was not a valid IMAP keyword. |
 | `mail loop detected via Delivered-To, rejecting` | warn | A redirect loop was refused with 550. |
-| `Sieve redirect could not be queued; message kept in INBOX instead` | warn | The relay queue refused the message. |
+| `sieve redirect could not be queued` | warn | LMTP: a redirect did not go out (`redirect_to`, `error`); the relay queue refused it or could not hand it to the relay worker. See [section 7](#7-redirect) for where the message is stored. |
+| `Sieve redirect could not be queued` | warn | Admin API: the relay queue refused a redirect (`account_id`, `redirect_to`, `error`). |
+| `Sieve redirect could not be handed to the relay` | warn | Admin API: the queue took a redirect but could not hand it to the relay worker. |
 | `Sieve vacation reply could not be queued; the response period is consumed` | warn | The reply was lost for this window. |
 | `[VACATION] suppressed: ...` | debug | Why a reply was not sent. |
 

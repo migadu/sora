@@ -5,9 +5,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,13 +17,14 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/server"
-	"github.com/migadu/sora/storage"
+	"github.com/migadu/sora/testutils"
 )
 
 // TestImporter_SynchronousUploadFlow tests that the importer:
 // 1. Does NOT create pending_uploads entries
 // 2. Marks messages as uploaded=TRUE immediately
-// 3. Uploads to S3 BEFORE database insert (fail-fast on S3 errors)
+// 3. Stores every body in S3, under the key its row references, as part of the
+// import (TestImporter_S3FailurePreventsDBInsert covers an upload that fails)
 func TestImporter_SynchronousUploadFlow(t *testing.T) {
 	if os.Getenv("SKIP_DB_TESTS") == "true" {
 		t.Skip("Skipping database tests")
@@ -53,45 +56,20 @@ func TestImporter_SynchronousUploadFlow(t *testing.T) {
 		tempDir := t.TempDir()
 		maildirPath := filepath.Join(tempDir, "testmaildir")
 
-		// Copy limited test data (3 messages)
-		err := copyLimitedTestData(t, "../../testdata/Maildir", maildirPath, 3)
+		// Copy limited test data
+		const messageCount = 3
+		err := copyLimitedTestData(t, "../../testdata/Maildir", maildirPath, messageCount)
 		if err != nil {
 			t.Fatalf("Failed to copy test data: %v", err)
 		}
 
-		// Configure S3 storage for testing
-		endpoint := os.Getenv("S3_ENDPOINT")
-		accessKeyID := os.Getenv("S3_ACCESS_KEY_ID")
-		secretAccessKey := os.Getenv("S3_SECRET_ACCESS_KEY")
-		bucketName := os.Getenv("S3_BUCKET_NAME")
-
-		// Use default test values if env vars not set
-		if endpoint == "" {
-			endpoint = "localhost:9000"
-		}
-		if accessKeyID == "" {
-			accessKeyID = "minioadmin"
-		}
-		if secretAccessKey == "" {
-			secretAccessKey = "minioadmin"
-		}
-		if bucketName == "" {
-			bucketName = "sora-test"
-		}
-
-		s3Storage, err := storage.New(endpoint, accessKeyID, secretAccessKey, bucketName, false, false, 30*time.Second)
+		// The importer uploads for real (no TestMode), into a file-based S3 mock.
+		s3Mock, err := testutils.NewFileBasedS3Mock(filepath.Join(tempDir, "s3"))
 		if err != nil {
-			t.Logf("S3 not available, using TestMode (no S3 upload): %v", err)
-			s3Storage = nil
+			t.Fatalf("Failed to create S3 mock: %v", err)
 		}
 
-		// Create importer with TestMode to bypass actual S3 uploads
-		// storage.New() doesn't fail immediately if local minio is down, so we force TestMode
-		options := ImporterOptions{
-			TestMode: true,
-		}
-
-		importer, err := NewImporter(ctx, maildirPath, testEmail, 4, rdb, s3Storage, options)
+		importer, err := NewImporter(ctx, maildirPath, testEmail, 4, rdb, s3Mock, ImporterOptions{})
 		if err != nil {
 			t.Fatalf("Failed to create importer: %v", err)
 		}
@@ -130,10 +108,46 @@ func TestImporter_SynchronousUploadFlow(t *testing.T) {
 			t.Fatalf("Failed to query message upload status: %v", err)
 		}
 
+		if totalCount != messageCount {
+			t.Fatalf("Expected %d imported messages, got %d", messageCount, totalCount)
+		}
 		if uploadedCount != totalCount {
 			t.Errorf("❌ Expected all %d messages to be marked uploaded=TRUE, got %d", totalCount, uploadedCount)
 		} else {
 			t.Logf("✅ All %d messages marked as uploaded=TRUE immediately", totalCount)
+		}
+
+		// Every row's body is in S3, under the key the row names, with the content
+		// its content_hash names.
+		rows, err := rdb.QueryWithRetry(ctx, `
+			SELECT s3_domain, s3_localpart, content_hash
+			FROM messages
+			WHERE account_id = $1 AND expunged_at IS NULL
+		`, accountID)
+		if err != nil {
+			t.Fatalf("Failed to query message S3 keys: %v", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var domain, localpart, hash string
+			if err := rows.Scan(&domain, &localpart, &hash); err != nil {
+				t.Fatalf("Failed to scan message S3 key: %v", err)
+			}
+			key := helpers.NewS3Key(domain, localpart, hash)
+			data, ok := s3Mock.GetStoredData(key)
+			if !ok {
+				t.Errorf("❌ Message body %s was not uploaded to S3", key)
+				continue
+			}
+			if got := helpers.HashContent(data); got != hash {
+				t.Errorf("❌ S3 object %s holds content hashing to %s", key, got)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("Failed to read message S3 keys: %v", err)
+		}
+		if got := s3Mock.ObjectCount(); got != messageCount {
+			t.Errorf("❌ Expected %d S3 objects, got %d", messageCount, got)
 		}
 
 		t.Logf("✅ Synchronous upload flow verified: no queue entries, all uploaded")
@@ -241,23 +255,155 @@ func TestImporter_SynchronousUploadFlow(t *testing.T) {
 	})
 }
 
-// TestImporter_S3FailurePreventsDBInsert tests that if S3 upload fails,
-// the message is NOT inserted into the database at all
-//
-// Note: This test verifies the LOGIC, not actual S3 failures.
-// With TestMode=false but no S3, it will fall back to TestMode behavior.
-// The key test is in the real world: if S3 upload fails during import,
-// the database insert never happens (because S3 upload is FIRST).
+// TestImporter_S3FailurePreventsDBInsert: a message whose body could not be stored
+// in S3 must not be inserted into the database at all. The importer inserts its rows
+// as uploaded, with no pending upload to retry, so such a row would name a body S3
+// does not have. The message is reported as failed instead, and left pending in the
+// maildir database for the next run, while the messages whose upload succeeded are
+// imported.
 func TestImporter_S3FailurePreventsDBInsert(t *testing.T) {
-	t.Skip("This test requires a real broken S3 setup. The sync upload logic is verified by code review and TestImporter_SynchronousUploadFlow")
+	if os.Getenv("SKIP_DB_TESTS") == "true" {
+		t.Skip("Skipping database tests")
+	}
 
-	// The important verification is:
-	// 1. S3 upload happens BEFORE DB insert (verified by code inspection)
-	// 2. No pending_uploads created (verified by TestImporter_SynchronousUploadFlow)
-	// 3. Messages marked uploaded=TRUE immediately (verified by TestImporter_SynchronousUploadFlow)
-	//
-	// Testing actual S3 failures requires either:
-	// - A mock S3 that can be configured to fail
-	// - Integration with a real broken S3 endpoint
-	// Both are complex and the logic is simple enough to verify by inspection
+	rdb := setupTestDatabase(t)
+	defer rdb.Close()
+	ctx := context.Background()
+
+	const messageCount = 3
+
+	// importWithStorage imports messageCount messages for a new account, with TestMode
+	// off so the importer does upload. newStorage returns the storage to upload to and
+	// the content hashes of the messages it refuses. The run must fail, report only the
+	// refused messages as failed (each with its S3 error) and leave them pending, and
+	// insert rows for exactly the other messages.
+	importWithStorage := func(t *testing.T, newStorage func(email, maildirPath string) (objectStorage, map[string]bool), options ImporterOptions) {
+		t.Helper()
+		testEmail := fmt.Sprintf("s3-failure-test-%d@example.com", time.Now().UnixNano())
+		createTestAccount(t, rdb, testEmail, "testpassword123")
+		accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, testEmail)
+		if err != nil {
+			t.Fatalf("Failed to get account ID: %v", err)
+		}
+
+		maildirPath := filepath.Join(t.TempDir(), "testmaildir")
+		if err := copyLimitedTestData(t, "../../testdata/Maildir", maildirPath, messageCount); err != nil {
+			t.Fatalf("Failed to copy test data: %v", err)
+		}
+		s3, rejected := newStorage(testEmail, maildirPath)
+
+		importer, err := NewImporter(ctx, maildirPath, testEmail, 4, rdb, s3, options)
+		if err != nil {
+			t.Fatalf("Failed to create importer: %v", err)
+		}
+		defer importer.Close()
+
+		if err := importer.Run(); err == nil {
+			t.Fatal("Import reported success although S3 refused an upload")
+		}
+
+		// Rows: exactly the messages whose upload succeeded.
+		rows, err := rdb.QueryWithRetry(ctx, `SELECT content_hash, uploaded FROM messages WHERE account_id = $1`, accountID)
+		if err != nil {
+			t.Fatalf("Failed to query messages: %v", err)
+		}
+		defer rows.Close()
+		inserted := 0
+		for rows.Next() {
+			var hash string
+			var uploaded bool
+			if err := rows.Scan(&hash, &uploaded); err != nil {
+				t.Fatalf("Failed to scan message: %v", err)
+			}
+			inserted++
+			if rejected[hash] {
+				t.Errorf("Message %s was inserted although its S3 upload failed (uploaded=%v)", hash, uploaded)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("Failed to read messages: %v", err)
+		}
+		if want := messageCount - len(rejected); inserted != want {
+			t.Errorf("Expected %d message rows, got %d", want, inserted)
+		}
+
+		var pendingRows int
+		if err := rdb.QueryRowWithRetry(ctx, `SELECT COUNT(*) FROM pending_uploads WHERE account_id = $1`, accountID).Scan(&pendingRows); err != nil {
+			t.Fatalf("Failed to count pending_uploads: %v", err)
+		}
+		if pendingRows != 0 {
+			t.Errorf("Expected no pending_uploads rows, got %d", pendingRows)
+		}
+
+		importer.failedPathsMutex.Lock()
+		failed := append([]failedImport(nil), importer.failedPaths...)
+		importer.failedPathsMutex.Unlock()
+		if len(failed) != len(rejected) {
+			t.Errorf("Expected %d failed paths, got %d: %v", len(rejected), len(failed), failed)
+		}
+		for _, f := range failed {
+			if !strings.HasPrefix(f.reason, "s3 upload error: ") {
+				t.Errorf("Failed path %s has reason %q, want an S3 upload error", f.path, f.reason)
+			}
+		}
+		if importer.failedMessages != int64(len(rejected)) || importer.importedMessages != int64(messageCount-len(rejected)) {
+			t.Errorf("Expected %d failed and %d imported messages, got %d failed and %d imported",
+				len(rejected), messageCount-len(rejected), importer.failedMessages, importer.importedMessages)
+		}
+
+		imported, pending := uploadedCounts(t, maildirPath)
+		if imported != messageCount-len(rejected) || pending != len(rejected) {
+			t.Errorf("Expected the maildir database to hold %d imported and %d pending messages, got %d and %d",
+				messageCount-len(rejected), len(rejected), imported, pending)
+		}
+	}
+
+	// Every upload fails: the insert phase never runs.
+	t.Run("every upload fails", func(t *testing.T) {
+		importWithStorage(t, func(email, maildirPath string) (objectStorage, map[string]bool) {
+			rejected := make(map[string]bool)
+			for _, content := range maildirContents(t, maildirPath) {
+				rejected[helpers.HashContent(content)] = true
+			}
+			return &rejectingStorage{}, rejected
+		}, ImporterOptions{})
+	})
+
+	// One upload fails: the batch's insert phase runs for the other messages only, in
+	// either transaction mode.
+	for _, batchTx := range []bool{false, true} {
+		t.Run(fmt.Sprintf("one upload fails/batch_transaction=%v", batchTx), func(t *testing.T) {
+			importWithStorage(t, func(email, maildirPath string) (objectStorage, map[string]bool) {
+				mock, err := testutils.NewFileBasedS3Mock(filepath.Join(t.TempDir(), "s3"))
+				if err != nil {
+					t.Fatalf("Failed to create S3 mock: %v", err)
+				}
+				address, err := server.NewAddress(email)
+				if err != nil {
+					t.Fatalf("Invalid email address: %v", err)
+				}
+				hash := helpers.HashContent(maildirContents(t, maildirPath)[0])
+				mock.SetError(helpers.NewS3Key(address.Domain(), address.LocalPart(), hash), errors.New("simulated S3 rejection"))
+				return mock, map[string]bool{hash: true}
+			}, ImporterOptions{BatchTransactionMode: batchTx})
+		})
+	}
+}
+
+// maildirContents returns the content of each message in maildirPath/cur.
+func maildirContents(t *testing.T, maildirPath string) [][]byte {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(maildirPath, "cur"))
+	if err != nil {
+		t.Fatalf("Failed to read maildir: %v", err)
+	}
+	var contents [][]byte
+	for _, entry := range entries {
+		content, err := os.ReadFile(filepath.Join(maildirPath, "cur", entry.Name()))
+		if err != nil {
+			t.Fatalf("Failed to read message: %v", err)
+		}
+		contents = append(contents, content)
+	}
+	return contents
 }

@@ -43,7 +43,7 @@ func handleStatsCommand(ctx context.Context) {
 func handleBlockedCommand(ctx context.Context) {
 	// Parse blocked specific flags
 	fs := flag.NewFlagSet("stats blocked", flag.ExitOnError)
-	protocol := fs.String("protocol", "", "Filter by protocol (imap, pop3, managesieve, imap_proxy, pop3_proxy, managesieve_proxy, userapi)")
+	protocol := fs.String("protocol", "", "Filter by protocol (imap, pop3, managesieve, imap_proxy, pop3_proxy, managesieve_proxy, userapi, userapi_proxy)")
 
 	fs.Usage = func() {
 		fmt.Printf(`Show blocked IPs and rate-limited addresses
@@ -56,9 +56,8 @@ Options:
   --protocol string   Filter by protocol (optional)
 
 Protocols:
-  imap, pop3, managesieve          Backend servers
-  imap_proxy, pop3_proxy           Proxy servers
-  managesieve_proxy, userapi       Other services
+  Backend servers: imap, pop3, managesieve, userapi
+  Proxy servers:   imap_proxy, pop3_proxy, managesieve_proxy, userapi_proxy
 
 Examples:
   sora-admin stats blocked --config config.toml
