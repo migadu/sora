@@ -364,7 +364,9 @@ func (c *ClusterConfig) GetBindAddr() string {
 	return host
 }
 
-// GetBindPort returns the bind port from addr or the port field
+// GetBindPort returns the bind port from addr or the port field. A port key of 0 means
+// unset; any other value is returned as written, so Validate refuses a negative one
+// instead of it binding the default.
 func (c *ClusterConfig) GetBindPort() int {
 	// If addr contains a port, use that
 	if _, p := splitClusterAddr(c.Addr); p != "" {
@@ -374,7 +376,7 @@ func (c *ClusterConfig) GetBindPort() int {
 	}
 
 	// Otherwise use explicit port field
-	if c.Port > 0 {
+	if c.Port != 0 {
 		return c.Port
 	}
 
