@@ -66,30 +66,3 @@ func TestTLSCacheForceKeepsUnstatableFile(t *testing.T) {
 		t.Errorf("cache after error=%v", names)
 	}
 }
-
-func TestTLSCacheForceKeepsExistingPermissions(t *testing.T) {
-	_, endpoint := newTLSStubS3(t)
-	cfg := tlsTestConfig(endpoint)
-	entry := validAutocertEntry(t, "mail.example.com")
-	putServerEntry(t, cfg, "mail.example.com", entry)
-	dir := t.TempDir()
-	path := filepath.Join(dir, "mail.example.com")
-	// Administrators can make a root-owned cache readable to the server's
-	// group. Replacing the file must not discard that existing read permission.
-	if err := os.WriteFile(path, []byte("old"), 0640); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(path, 0640); err != nil {
-		t.Fatal(err)
-	}
-	if err := cacheTLSCertificates(context.Background(), cfg, dir, "", true); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0640 {
-		t.Errorf("replacement permissions=%o, want existing 640", info.Mode().Perm())
-	}
-}

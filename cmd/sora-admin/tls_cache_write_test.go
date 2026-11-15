@@ -162,6 +162,43 @@ func TestTLSCacheForceKeepsTheOwnerOfTheReplacedFile(t *testing.T) {
 	}
 }
 
+// TestTLSCacheForceKeepsTheModeOfTheReplacedFile: the file tls cache --force writes in
+// place of a cached one must have that file's permissions, as writing into the file kept
+// them: a cache file an operator made group-readable (0640, read by the server through
+// its group) must not turn 0600 and unreadable to the server.
+func TestTLSCacheForceKeepsTheModeOfTheReplacedFile(t *testing.T) {
+	_, endpoint := newTLSStubS3(t)
+	cfg := tlsTestConfig(endpoint)
+	inS3 := validAutocertEntry(t, "mail.example.com")
+	putServerEntry(t, cfg, "mail.example.com", inS3)
+	cacheDir := t.TempDir()
+	localPath := filepath.Join(cacheDir, "mail.example.com")
+	if err := os.WriteFile(localPath, validAutocertEntry(t, "mail.example.com"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(localPath, 0640); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cacheTLSCertificates(context.Background(), cfg, cacheDir, "", true); err != nil {
+		t.Fatalf("cacheTLSCertificates --force: %v", err)
+	}
+	got, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, inS3) {
+		t.Error("--force did not replace the cached certificate with the one from S3")
+	}
+	info, err := os.Stat(localPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode != 0640 {
+		t.Errorf("the replaced file has mode %#o, want the cached file's mode 0640", mode)
+	}
+}
+
 func fileGID(t *testing.T, path string) int {
 	t.Helper()
 	info, err := os.Stat(path)
