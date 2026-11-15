@@ -808,7 +808,7 @@ names it.
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
-| `session_memory_limit` | size | `"100mb"` | `imap`, `pop3` | Memory one session may allocate. `"0"` means no limit. |
+| `session_memory_limit` | size | `"100mb"` | `imap`, `pop3` | Memory one session may allocate. `"0"` means no limit. A message that can never fit it is refused (IMAP `NO [LIMIT]`, POP3 `-ERR [SYS/PERM]`); start-up and a reload warn when it is below the `max_message_size` of an `lmtp` server in the same file. |
 | `max_auth_errors` | integer | `2` | `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Protocol errors before login (unknown or malformed commands, logins refused without TLS) before the proxy disconnects. Wrong passwords do not count; the login rate limiter handles those. `0` or less means 2. |
 | `search_rate_limit_per_min` | integer | `60` | `imap` | Search cost per account per window. `0` or less disables the limit. |
 | `search_rate_limit_window` | duration | `"1m"` | `imap` | Window of the search rate limit. |

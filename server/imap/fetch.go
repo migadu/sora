@@ -34,10 +34,15 @@ import (
 // carries the specific cause for logging.
 var errBodyTransientlyUnavailable = errors.New("message body temporarily unavailable")
 
-// errBodyOverMemoryBudget marks a message body the session memory budget
-// (session_memory_limit) cannot hold. The FETCH is answered as for a section
-// copy the budget refuses (sectionMemoryUnavailable), not with an empty body.
-var errBodyOverMemoryBudget = errors.New("message body exceeds the session memory budget")
+// bodyOverBudgetError marks a message body of size octets the session memory
+// budget (session_memory_limit) cannot hold. The FETCH is answered as for a
+// section copy the budget refuses (sectionMemoryRefused), not with an empty
+// body. The size is the body's as read when the message has none recorded.
+type bodyOverBudgetError struct{ size int }
+
+func (e *bodyOverBudgetError) Error() string {
+	return fmt.Sprintf("message body of %d bytes exceeds the session memory budget", e.size)
+}
 
 // bodyFetchRetry* tune the bounded retry of the S3 read on the not-yet-uploaded path.
 // They absorb the read-before-write race where the background S3 PUT lands shortly after
@@ -460,9 +465,9 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 		defer s.freeSectionCopies(binary.charged)
 	}
 	// BODY sections are extracted before the response too, for the same
-	// reason: a body that cannot be read right now, or a body or section the
-	// session memory budget cannot hold, fails the command with
-	// NO [UNAVAILABLE].
+	// reason: a body that cannot be read right now fails the command with
+	// NO [UNAVAILABLE], and a body or section the session memory budget
+	// cannot hold with NO [LIMIT] or NO [UNAVAILABLE] (sectionMemoryRefused).
 	var sections *bodySections
 	if len(options.BodySection) > 0 {
 		var err error
@@ -763,9 +768,10 @@ func (s *IMAPSession) decodeBinaryPart(b *decodedBinary, p *binaryPart, options 
 	key := binarySectionCacheKey(msg.ContentHash, p.part)
 	section := s.cachedBodySection(key) // charged to the retention while it is retained
 	retained := section != nil
+	var body []byte // the body the section is decoded from, held with its copies
 	if !retained {
-		body, err := loadBody()
-		if err != nil || body == nil {
+		var err error
+		if body, err = loadBody(); err != nil || body == nil {
 			return err // no body: empty sections and zero sizes
 		}
 		if len(p.sections) == 0 {
@@ -797,7 +803,7 @@ func (s *IMAPSession) decodeBinaryPart(b *decodedBinary, p *binaryPart, options 
 		}
 		charged, ok := s.chargeSectionCopy(len(section))
 		if !ok {
-			return s.sectionMemoryUnavailable(msg.UID, len(section))
+			return s.sectionMemoryRefused(msg.UID, len(body)+len(section))
 		}
 		for _, i := range p.sections {
 			b.sections[i] = applyPartial(section, options.BinarySection[i].Partial)
@@ -814,7 +820,7 @@ func (s *IMAPSession) decodeBinaryPart(b *decodedBinary, p *binaryPart, options 
 		buf := bytes.Clone(applyPartial(section, options.BinarySection[i].Partial))
 		n, ok := s.chargeSectionCopy(len(buf))
 		if !ok {
-			return s.sectionMemoryUnavailable(msg.UID, len(buf))
+			return s.sectionMemoryRefused(msg.UID, len(body)+len(buf))
 		}
 		b.charged += n
 		b.sections[i] = buf
@@ -911,7 +917,7 @@ func (s *IMAPSession) extractBodySection(ctx context.Context, bodyData *[]byte, 
 	}
 	charged, ok := s.chargeSectionCopy(len(full))
 	if !ok {
-		return nil, 0, s.sectionMemoryUnavailable(msg.UID, len(full))
+		return nil, 0, s.sectionMemoryRefused(msg.UID, len(*bodyData)+len(full))
 	}
 	if section.Partial == nil || !s.retainBodySection(cacheKey, full) {
 		return applyPartial(full, section.Partial), charged, nil
@@ -921,12 +927,13 @@ func (s *IMAPSession) extractBodySection(ctx context.Context, bodyData *[]byte, 
 }
 
 // retainedSectionChunk returns a copy of a chunk of the retained section,
-// charged to the session budget.
+// charged to the session budget. The copy needs no body beside it, and the
+// budget gives the retained section up for it if need be.
 func (s *IMAPSession) retainedSectionChunk(uid imap.UID, chunk []byte) ([]byte, int64, error) {
 	chunk = bytes.Clone(chunk)
 	charged, ok := s.chargeSectionCopy(len(chunk))
 	if !ok {
-		return nil, 0, s.sectionMemoryUnavailable(uid, len(chunk))
+		return nil, 0, s.sectionMemoryRefused(uid, len(chunk))
 	}
 	return chunk, charged, nil
 }
@@ -947,8 +954,9 @@ func (s *IMAPSession) loadSectionBody(ctx context.Context, msg *db.Message, body
 		// The body exists but the session budget cannot hold it: refused like a
 		// section copy the budget cannot hold, as an empty section would pass
 		// for the message.
-		if errors.Is(loadErr, errBodyOverMemoryBudget) {
-			return s.sectionMemoryUnavailable(msg.UID, msg.Size)
+		var overBudget *bodyOverBudgetError
+		if errors.As(loadErr, &overBudget) {
+			return s.sectionMemoryRefused(msg.UID, overBudget.size)
 		}
 		// Graceful degradation: return empty sections instead of failing the
 		// entire multi-message FETCH. This prevents one broken message (missing
@@ -998,19 +1006,30 @@ func (s *IMAPSession) chargeSectionCopy(n int) (int64, bool) {
 	return int64(n), true
 }
 
-// sectionMemoryUnavailable answers a body or section the session budget cannot hold
-// with NO [UNAVAILABLE] rather than an empty literal: an empty body section is
-// indistinguishable from a genuinely empty message to the client, which may act on it
-// destructively (see errBodyTransientlyUnavailable).
-func (s *IMAPSession) sectionMemoryUnavailable(uid imap.UID, n int) *imap.Error {
-	s.WarnLog("session memory limit exceeded serving a message", "uid", uid, "bytes", n,
-		"limit", s.memTracker.MaxAllowed())
-	metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
+// sectionMemoryRefused answers a body or section the session budget cannot hold with
+// NO rather than an empty literal: an empty body section is indistinguishable from a
+// genuinely empty message to the client, which may act on it destructively (see
+// errBodyTransientlyUnavailable). need is what the message's FETCH holds at once for
+// it: the body, or a section copy and the body it is taken from. A need over the whole
+// budget can never be met, however often the client retries: RFC 5530 LIMIT, "The
+// operation ran up against an implementation limit of some kind". A need within it is
+// refused only because other allocations of the session hold the budget now, and a
+// retry can succeed: UNAVAILABLE, "Temporary failure because a subsystem is down",
+// which clients such as iOS Mail retry on every sync.
+func (s *IMAPSession) sectionMemoryRefused(uid imap.UID, need int) *imap.Error {
+	limit := s.memTracker.MaxAllowed()
 	imapErr := &imap.Error{
 		Type: imap.StatusResponseTypeNo,
 		Code: imap.ResponseCodeUnavailable,
-		Text: "Message too large for the session memory limit",
+		Text: "Session memory limit reached, please try again later",
 	}
+	if limit > 0 && int64(need) > limit {
+		imapErr.Code = imap.ResponseCodeLimit
+		imapErr.Text = "Message too large for the session memory limit"
+	}
+	s.WarnLog("session memory limit exceeded serving a message", "uid", uid, "bytes", need,
+		"limit", limit, "code", imapErr.Code)
+	metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
 	metrics.CommandsTotal.WithLabelValues("imap", "FETCH", commandStatus(imapErr)).Inc()
 	return imapErr
 }
@@ -1055,9 +1074,9 @@ func (s *IMAPSession) getMessageBody(ctx context.Context, msg *db.Message) ([]by
 	// into memory. The post-read Allocate() below can only detect the overrun once the
 	// body is already resident — too late to prevent the OOM. msg.Size is the stored
 	// metadata size, so this bounds the single allocation. (security-audit M13)
-	// Both refusals are errBodyOverMemoryBudget.
+	// Both refusals are a bodyOverBudgetError.
 	if msg.Size > 0 && !s.memoryAvailable(int64(msg.Size)) {
-		return nil, fmt.Errorf("%w: message size %d bytes exceeds available budget", errBodyOverMemoryBudget, msg.Size)
+		return nil, &bodyOverBudgetError{size: msg.Size}
 	}
 
 	data, err := s.loadMessageBody(ctx, msg)
@@ -1069,11 +1088,8 @@ func (s *IMAPSession) getMessageBody(ctx context.Context, msg *db.Message) ([]by
 	// A body without a recorded size is checked only here, so memoryAvailable gives
 	// the retained section back first, as it does before the read for a sized body.
 	if s.memTracker != nil {
-		if !s.memoryAvailable(int64(len(data))) {
-			return nil, fmt.Errorf("%w: message body %d bytes exceeds available budget", errBodyOverMemoryBudget, len(data))
-		}
-		if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-			return nil, fmt.Errorf("%w: %v", errBodyOverMemoryBudget, allocErr)
+		if !s.memoryAvailable(int64(len(data))) || s.memTracker.Allocate(int64(len(data))) != nil {
+			return nil, &bodyOverBudgetError{size: len(data)}
 		}
 	}
 	return data, nil

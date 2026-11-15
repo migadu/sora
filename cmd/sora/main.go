@@ -444,6 +444,21 @@ func handleConfigReload(current, next *config.Config) {
 	for _, p := range next.Validate() {
 		logger.Error("Config reload: "+p.Section+" is invalid and the server will not start with this config", "error", p.Err)
 	}
+	// session_memory_limit and max_message_size are both reloadable.
+	warnSessionMemoryShortfalls(next)
+}
+
+// warnSessionMemoryShortfalls warns about each imap and pop3 server of cfg that never
+// fetches some of the messages an lmtp server of cfg delivers: FETCH and RETR hold the
+// whole body in the session memory budget, and refuse one larger than the budget with
+// NO [LIMIT] and -ERR [SYS/PERM].
+func warnSessionMemoryShortfalls(cfg *config.Config) {
+	for _, s := range cfg.SessionMemoryShortfalls() {
+		logger.Warn("session_memory_limit is below the max_message_size of an lmtp server: a delivered message larger than session_memory_limit is stored, "+
+			"but this server can never fetch it (IMAP NO [LIMIT], POP3 -ERR [SYS/PERM]); sora-admin imports are bounded by [admin_cli] import_message_limit instead",
+			"server", s.Server, "type", s.Type, "session_memory_limit", s.SessionMemoryLimit,
+			"lmtp_server", s.LMTPServer, "max_message_size", s.MaxMessageSize)
+	}
 }
 
 // loadAndValidateConfig loads configuration from file and validates all server configurations
@@ -489,6 +504,7 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 		}
 		os.Exit(errorHandler.WaitForExit())
 	}
+	warnSessionMemoryShortfalls(cfg)
 
 	// Surface the trusted_networks posture so operators notice the fail-closed default and
 	// the insecure-wide pattern. (security-audit M2)

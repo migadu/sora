@@ -2231,12 +2231,61 @@ func (s *ServerConfig) GetMaxRedirectHops() int {
 	return helpers.DefaultMaxRedirectHops
 }
 
+// defaultSessionMemoryLimit is session_memory_limit when the block leaves it out, and
+// what an imap or pop3 server uses when it does not parse.
+const defaultSessionMemoryLimit = 100 * 1024 * 1024
+
 // GetSessionMemoryLimit parses the session memory limit
 func (s *ServerConfig) GetSessionMemoryLimit() (int64, error) {
 	if s.Limits != nil && s.Limits.SessionMemoryLimit != "" {
 		return helpers.ParseSize(s.Limits.SessionMemoryLimit)
 	}
-	return 100 * 1024 * 1024, nil // Default: 100MB
+	return defaultSessionMemoryLimit, nil
+}
+
+// SessionMemoryShortfall is an imap or pop3 server whose session_memory_limit is below
+// the max_message_size of an lmtp server in the same file.
+type SessionMemoryShortfall struct {
+	Server, Type       string
+	SessionMemoryLimit int64
+	LMTPServer         string
+	MaxMessageSize     int64
+}
+
+// SessionMemoryShortfalls returns the enabled imap and pop3 servers whose
+// session_memory_limit is set (not "0") and below the largest max_message_size of the
+// file's enabled lmtp servers, with that lmtp server. An IMAP FETCH or POP3 RETR holds
+// the whole body in the session's memory budget, so such a server never fetches a
+// message delivered between the two sizes.
+func (c *Config) SessionMemoryShortfalls() []SessionMemoryShortfall {
+	servers := c.GetAllServers()
+	var lmtp string
+	var maxMessageSize int64
+	for i := range servers {
+		if servers[i].Type != "lmtp" {
+			continue
+		}
+		if size := servers[i].GetMaxMessageSizeWithDefault(); size > maxMessageSize {
+			lmtp, maxMessageSize = servers[i].Name, size
+		}
+	}
+	var shortfalls []SessionMemoryShortfall
+	for i := range servers {
+		if servers[i].Type != "imap" && servers[i].Type != "pop3" {
+			continue
+		}
+		limit, err := servers[i].GetSessionMemoryLimit()
+		if err != nil {
+			limit = defaultSessionMemoryLimit
+		}
+		if limit > 0 && limit < maxMessageSize {
+			shortfalls = append(shortfalls, SessionMemoryShortfall{
+				Server: servers[i].Name, Type: servers[i].Type, SessionMemoryLimit: limit,
+				LMTPServer: lmtp, MaxMessageSize: maxMessageSize,
+			})
+		}
+	}
+	return shortfalls
 }
 
 // GetCommandTimeout parses the command timeout duration with protocol-specific defaults
