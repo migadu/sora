@@ -1473,9 +1473,8 @@ func (s *IMAPServer) loadWarmupState() {
 	// The file every IMAP server of a process used to share, left by an earlier
 	// version. The servers share the cache too, so an account it lists is warm
 	// whichever server warmed it: the server that reads it first takes its entries
-	// and removes it, rather than warm every account again at the upgrade. It is
-	// read after the server's own file because, when both exist (a downgrade, then
-	// another upgrade), it is the newer one.
+	// and removes it, rather than warm every account again at the upgrade. Both
+	// files may contain an account; keep its newest timestamp from either file.
 	s.loadWarmupStateFile(filepath.Join(s.cache.GetBasePath(), warmupStateFile))
 }
 
@@ -1516,6 +1515,9 @@ func (s *IMAPServer) loadWarmupStateFile(path string) {
 		ts := time.Unix(unixTS, 0)
 		// Only load entries that haven't expired yet
 		if now.Sub(ts) < s.warmupInterval {
+			if previous, ok := s.lastWarmupTimes.Load(accountID); ok && !ts.After(previous.(time.Time)) {
+				continue
+			}
 			s.lastWarmupTimes.Store(accountID, ts)
 			count++
 		} else {

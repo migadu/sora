@@ -632,3 +632,41 @@ func TestWarmupStateWithoutCacheDirectoryLeavesWorkingDirectoryAlone(t *testing.
 		}
 	}
 }
+
+// A legacy file can coexist with newer per-server state, or be newer itself.
+// Loading the two files must never move an account's warmup timestamp back.
+func TestWarmupStateKeepsNewestTimestampAcrossFiles(t *testing.T) {
+	for _, sharedNewer := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sharedNewer=%v", sharedNewer), func(t *testing.T) {
+			s := &IMAPServer{warmupInterval: 24 * time.Hour}
+			dir := t.TempDir()
+			ownPath := filepath.Join(dir, "per-server-state")
+			newest := time.Now().Add(-time.Hour).Truncate(time.Second)
+			older := newest.Add(-22 * time.Hour)
+			own, shared := newest, older
+			if sharedNewer {
+				own, shared = older, newest
+			}
+			legacy := filepath.Join(dir, warmupStateFile)
+			for path, ts := range map[string]time.Time{ownPath: own, legacy: shared} {
+				if err := os.WriteFile(path, []byte(fmt.Sprintf("7 %d\n", ts.Unix())), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s.loadWarmupStateFile(ownPath)
+			s.loadWarmupStateFile(legacy)
+			raw, ok := s.lastWarmupTimes.Load(int64(7))
+			if !ok {
+				t.Fatal("warmup timestamp missing")
+			}
+			if got := raw.(time.Time); !got.Equal(newest) {
+				t.Fatalf("loaded timestamp %v, want newest %v", got, newest)
+			}
+			for _, path := range []string{ownPath, legacy} {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Errorf("state file %s remains: %v", path, err)
+				}
+			}
+		})
+	}
+}
