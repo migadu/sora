@@ -1026,7 +1026,11 @@ An `http_admin_api` server on a proxy node lets you see the proxies' backend hea
 Sora treats the database as not configured when `[database.write]` and `[database.read]` are absent
 or have empty `hosts`. A node that needs the database while it is not configured refuses to start,
 and `sora-admin config validate` refuses its file, with `[database]: server "<name>" (<type>) needs
-the database, but it is not configured in [database.write] or [database.read]`.
+the database, but it is not configured in [database.write] or [database.read]`. A proxy that checks
+passwords in the database needs `[database.write]` hosts even though it mostly reads: start-up runs
+the migrations there, and a login rehashes a password whose hash is outdated. With `[database.read]`
+hosts alone the proxy refuses to start with `[database.write]: server "<name>" (<type>) needs the
+database, but [database.write] has no hosts; ...`.
 
 ---
 
