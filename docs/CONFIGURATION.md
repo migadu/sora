@@ -679,7 +679,7 @@ See [CLUSTER.md](CLUSTER.md).
 |---|---|---|---|
 | `enabled` | bool | `true` | Share the rate limiters with the proxies of the same protocol on every node, this one included. The name statistics are always shared while it is on. |
 | `sync_blocks` | bool | `true` | Share Tier 2 IP blocks. |
-| `sync_failure_counts` | bool | `true` | Share Tier 2 failure counts and progressive delays, from `delay_start_threshold` on. |
+| `sync_failure_counts` | bool | `true` | Share Tier 2 failure counts and progressive delays, from `delay_start_threshold` on, and the successful logins that clear them. |
 
 ### 8.15 Persistent auth cache (`[auth_cache]`)
 
