@@ -56,7 +56,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, AccountID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
-			s.DebugLog("mailbox does not exist", "mailbox", mboxName, "account_id", s.AccountID())
+			s.DebugLog("mailbox does not exist", "mailbox", mboxName)
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeNonExistent,
@@ -74,7 +74,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		return nil, s.internalError("failed to check read permission for mailbox '%s': %v", mboxName, err)
 	}
 	if !hasReadRight {
-		s.DebugLog("user does not have read permission on mailbox", "account_id", AccountID, "mailbox", mboxName)
+		s.DebugLog("user does not have read permission on mailbox", "mailbox", mboxName)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,

@@ -543,7 +543,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	s.mutex.Unlock()
 
 	if masterAuthUsed {
-		s.InfoLog("authentication successful", "address", userAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", time.Since(start).Seconds()))
+		s.InfoLog("authentication successful", "address", userAddress.BaseAddress(), "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", time.Since(start).Seconds()))
 	}
 
 	metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "success").Inc()

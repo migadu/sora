@@ -644,15 +644,17 @@ func (s *ManageSieveSession) completeAuthentication(ctx context.Context, address
 		return errTooManyConnections
 	}
 
-	// Log authentication success. Regular auth via Authenticate() already
-	// logs in server.go with cached/method; master auth is logged here.
-	if masterAuthUsed {
-		duration := time.Since(start)
-		s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-	}
 	metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "success").Inc()
 
 	s.User = server.NewUser(address, accountID)
+
+	// Log authentication success, now that the session's user and account_id
+	// fields name the account. Regular auth via Authenticate() already logs in
+	// server.go with cached/method; master auth is logged here.
+	if masterAuthUsed {
+		duration := time.Since(start)
+		s.InfoLog("authentication successful", "address", address.BaseAddress(), "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+	}
 
 	// Increment authenticated connections counter
 	s.server.authenticatedConnections.Add(1)
