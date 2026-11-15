@@ -937,15 +937,16 @@ func (s *POP3Session) Quit(ctx context.Context) (int, error) {
 }
 
 func (s *POP3Session) SetLanguage(ctx context.Context, lang string) (string, error) {
-	langTag := strings.ToLower(lang)
-	if langTag != "en" && langTag != "*" && langTag != "i-default" {
+	// A language range is ASCII (RFC 4647 section 2.1), matched case-insensitively.
+	isDefault := server.EqualFoldASCII(lang, "i-default")
+	if !isDefault && lang != "*" && !server.EqualFoldASCII(lang, "en") {
 		return "", &pop3server.Error{Message: "Unsupported language"}
 	}
 
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if langTag == "i-default" {
+	if isDefault {
 		s.language = "i-default"
 	} else {
 		s.language = "en"
