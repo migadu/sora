@@ -377,6 +377,7 @@ func TestS3ImportInterruptIsNotAFailure(t *testing.T) {
 	defer si.Close()
 	// The interrupt lands while the first object's "already imported?" check runs.
 	si.rdb = &s3ImportTestDB{exists: func(ctx context.Context, _ *int) error { cancel(); return ctx.Err() }}
+	require.NoError(t, si.lookupAccount())
 	insertS3Objects(t, si, "example.com", "user", 3)
 
 	err = si.importFromS3()

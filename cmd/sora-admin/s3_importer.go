@@ -73,6 +73,10 @@ type S3Importer struct {
 	dbPath  string
 	options S3ImporterOptions
 
+	// user is the account the import is for. Run looks it up once (lookupAccount),
+	// before it lists the bucket, and every step uses it from there.
+	user *server.User
+
 	totalObjects     int64
 	processedObjects int64
 	importedMessages int64
@@ -190,6 +194,12 @@ func (si *S3Importer) Run() error {
 
 	logger.Info("Starting S3 import process...")
 
+	// The account first: an import for an address without one would otherwise list
+	// the whole prefix, then fail every object on a lookup of its own.
+	if err := si.lookupAccount(); err != nil {
+		return err
+	}
+
 	// Step 1: Scan S3 bucket for objects
 	if err := si.scanS3Objects(); err != nil {
 		return fmt.Errorf("failed to scan S3 objects: %w", err)
@@ -222,6 +232,20 @@ func (si *S3Importer) Run() error {
 	}
 
 	return si.printSummary()
+}
+
+// lookupAccount looks up the account the import is for and keeps it on the importer.
+func (si *S3Importer) lookupAccount() error {
+	address, err := server.NewAddress(si.options.Email)
+	if err != nil {
+		return fmt.Errorf("invalid email address: %w", err)
+	}
+	accountID, err := si.rdb.GetAccountIDByAddressWithRetry(si.ctx, address.FullAddress())
+	if err != nil {
+		return accountLookupError(si.options.Email, err)
+	}
+	si.user = server.NewUser(address, accountID)
+	return nil
 }
 
 // scanS3Objects scans the S3 bucket and stores object information in the database
@@ -335,18 +359,7 @@ func (si *S3Importer) performDryRun() error {
 	fmt.Printf("Analyzing S3 messages for user: %s\n\n", si.options.Email)
 
 	ctx := si.ctx
-
-	// Parse email address for user lookup
-	address, err := server.NewAddress(si.options.Email)
-	if err != nil {
-		return fmt.Errorf("invalid email address: %w", err)
-	}
-
-	// Get account ID once
-	accountID, err := si.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
-	if err != nil {
-		return accountLookupError(si.options.Email, err)
-	}
+	accountID := si.user.AccountID()
 
 	rows, err := si.db.Query(`
 		SELECT key, size, domain, local_part, content_hash, last_modified
@@ -543,24 +556,15 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	contentHash := parts[2]
 
 	ctx := si.ctx
-	address, err := server.NewAddress(si.options.Email)
-	if err != nil {
-		return fmt.Errorf("invalid email address: %w", err)
-	}
+	user := si.user
 
 	// The message is filed under this user's prefix (S3Domain/S3Localpart and the key
 	// CompleteS3Upload confirms), so the object must be the one under that prefix: an
 	// object under any other is another user's mail.
-	s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), contentHash)
+	s3Key := helpers.NewS3Key(user.Domain(), user.LocalPart(), contentHash)
 	if obj.Key != s3Key {
-		return fmt.Errorf("S3 object %s is not under the prefix of %s", obj.Key, address.FullAddress())
+		return fmt.Errorf("S3 object %s is not under the prefix of %s", obj.Key, user.FullAddress())
 	}
-
-	accountID, err := si.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
-	if err != nil {
-		return accountLookupError(si.options.Email, err)
-	}
-	user := server.NewUser(address, accountID)
 
 	// Proactively ensure default mailboxes exist for this user
 	// This prevents "mailbox not found" errors during import
@@ -575,7 +579,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 		var count int
 		if err := si.rdb.QueryRowWithRetry(ctx,
 			"SELECT COUNT(*) FROM messages WHERE content_hash = $1 AND account_id = $2 AND expunged_at IS NULL",
-			contentHash, accountID).Scan(&count); err != nil {
+			contentHash, user.AccountID()).Scan(&count); err != nil {
 			return fmt.Errorf("failed to check whether the message is already imported: %w", err)
 		}
 		if count > 0 {
@@ -671,8 +675,8 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 		&db.InsertMessageOptions{
 			AccountID:     user.AccountID(),
 			MailboxID:     mailbox.ID,
-			S3Domain:      address.Domain(),
-			S3Localpart:   address.LocalPart(),
+			S3Domain:      user.Domain(),
+			S3Localpart:   user.LocalPart(),
 			MailboxName:   mailbox.Name,
 			ContentHash:   contentHash,
 			MessageID:     messageID,
@@ -706,7 +710,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 
 	atomic.AddInt64(&si.importedMessages, 1)
 	logger.Info("Successfully imported message", "progress", si.getProgressPrefix(),
-		"msg_id", msgID, "uid", uid, "user", address.FullAddress())
+		"msg_id", msgID, "uid", uid, "user", user.FullAddress())
 
 	si.markObjectProcessed(obj.Key, true, "imported successfully")
 
