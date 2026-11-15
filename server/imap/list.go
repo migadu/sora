@@ -28,12 +28,8 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 		if err := s.requireCapability(imap.CapListStatus, "LIST RETURN (STATUS)"); err != nil {
 			return err
 		}
-		// RFC 8438 §1: with LIST-STATUS, SIZE "can be queried for many mailboxes at
-		// once using just one LIST command", so it needs STATUS=SIZE here as well.
-		if options.ReturnStatus.Size {
-			if err := s.requireCapability(imap.CapStatusSize, "STATUS SIZE"); err != nil {
-				return err
-			}
+		if err := s.checkStatusItems(options.ReturnStatus); err != nil {
+			return err
 		}
 	}
 	if options.ReturnMetadata != nil {
@@ -138,8 +134,14 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 		if len(mailboxIDs) > 0 {
 			// Single batch query replaces N * 3 individual queries
 			summaries, err := s.server.rdb.GetMailboxSummariesBatchWithRetry(readCtx, mailboxIDs)
+			var deleted map[int64]uint32
+			if err == nil && options.ReturnStatus.NumDeleted {
+				deleted, err = s.server.rdb.CountDeletedMessagesWithRetry(readCtx, mailboxIDs)
+			}
 			if err != nil {
-				s.DebugLog("failed to get batch mailbox summaries", "error", err)
+				// RFC 5819 §2: on unexpected problems the server "MAY drop the
+				// corresponding STATUS reply".
+				s.DebugLog("failed to get batch mailbox status", "error", err)
 			} else {
 				// Populate STATUS data from batch results
 				for i := range l {
@@ -210,6 +212,10 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 					if options.ReturnStatus.AppendLimit {
 						limit := s.AppendLimit()
 						statusData.AppendLimit = &limit
+					}
+					if options.ReturnStatus.NumDeleted {
+						num := deleted[mbox.ID]
+						statusData.NumDeleted = &num
 					}
 					if options.ReturnStatus.Size {
 						size := summary.TotalSize

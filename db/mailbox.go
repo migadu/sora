@@ -1081,6 +1081,54 @@ func (d *Database) GetMailboxSummariesBatch(ctx context.Context, mailboxIDs []in
 	return result, nil
 }
 
+// CountDeletedMessages returns, per mailbox, how many of its messages that are
+// not expunged have the \Deleted flag set: the DELETED status data item (RFC
+// 9051 §6.3.11). A mailbox without any is left out of the map. mailbox_stats
+// keeps no such count, so this reads the mailboxes' message_state rows; STATUS
+// runs it only when a client asks for DELETED.
+func (d *Database) CountDeletedMessages(ctx context.Context, mailboxIDs []int64) (map[int64]uint32, error) {
+	if len(mailboxIDs) == 0 {
+		return map[int64]uint32{}, nil
+	}
+
+	start := time.Now()
+	var err error
+	defer func() {
+		status := "success"
+		if err != nil {
+			status = "error"
+		}
+		metrics.DBQueryDuration.WithLabelValues("mailbox_deleted_count", "read").Observe(time.Since(start).Seconds())
+		metrics.DBQueriesTotal.WithLabelValues("mailbox_deleted_count", status, "read").Inc()
+	}()
+
+	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, `
+		SELECT mst.mailbox_id, COUNT(*)
+		FROM message_state mst
+		JOIN messages m ON m.id = mst.message_id AND m.mailbox_id = mst.mailbox_id
+		WHERE mst.mailbox_id = ANY($1) AND (mst.flags & $2) <> 0 AND m.expunged_at IS NULL
+		GROUP BY mst.mailbox_id
+	`, mailboxIDs, FlagDeleted)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count deleted messages: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[int64]uint32, len(mailboxIDs))
+	for rows.Next() {
+		var mailboxID, count int64
+		if err = rows.Scan(&mailboxID, &count); err != nil {
+			return nil, fmt.Errorf("failed to scan deleted message count: %w", err)
+		}
+		result[mailboxID] = uint32(count)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating deleted message counts: %w", err)
+	}
+
+	return result, nil
+}
+
 // GetMailboxMessageCountAndSizeSum returns the count and total size of active messages in a mailbox.
 // Used by POP3 STAT. Reads from the mailbox_stats cache (O(1)) — consistent with IMAP STATUS, which
 // also serves counts from the cache (see GetMailboxSummary). The cache is kept accurate by the stats
