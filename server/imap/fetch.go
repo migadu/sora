@@ -446,11 +446,13 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 		return err
 	}
 
-	// Loading and decoding are what fails the command at this message, so its
-	// implicit \Seen (RFC 9051 §6.4.5) is set only now, one message at a time
-	// rather than for the whole stream chunk up front: a FETCH that fails at a
-	// message leaves that message, and the ones after it whose bodies it never
-	// sent, as they were.
+	// Loading and decoding are what usually fails the command at this message,
+	// so its implicit \Seen (RFC 9051 §6.4.5) is set only now, one message at a
+	// time rather than for the whole stream chunk up front: a FETCH that fails
+	// there leaves that message, and the ones after it whose bodies it never
+	// sent, as they were. A failure once the response is open (a section copy
+	// the session memory budget refuses, a write error) still leaves this one
+	// message \Seen, and its update to Poll.
 	var seenAnswer *implicitSeenAnswer
 	if markSeen {
 		options, seenAnswer = s.setImplicitSeen(ctx, msg, options, selectedMailboxID, tracker)

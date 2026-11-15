@@ -22,12 +22,13 @@ const maxFetchSeenEchoEntries = 65536
 // once the response successfully closes.
 //
 // It is called for one message at a time, after its body is loaded and its
-// BINARY sections are decoded, so a FETCH that fails part way sets \Seen only
-// on the messages it answered (#1222). Setting it for a whole stream chunk
-// ahead would have to be undone on failure, which would also clear a \Seen
-// another session set, or found already set, in the meantime. The update is
-// one write next to the body load the message needs anyway, and none for a
-// message that is \Seen already.
+// BINARY sections are decoded, so a FETCH that fails part way at either sets
+// \Seen only on the messages it answered (#1222); one that fails later, in
+// the message's open response, has set it on that message too. Setting it
+// for a whole stream chunk ahead would have to be undone on failure, which
+// would also clear a \Seen another session set, or found already set, in the
+// meantime. The update is one write next to the body load the message needs
+// anyway, and none for a message that is \Seen already.
 func (s *IMAPSession) setImplicitSeen(ctx context.Context, msg *db.Message, options *imap.FetchOptions, mailboxID int64, tracker *imapserver.SessionTracker) (*imap.FetchOptions, *implicitSeenAnswer) {
 	if db.ContainsFlag(msg.BitwiseFlags, db.FlagSeen) {
 		return options, nil
