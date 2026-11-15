@@ -47,7 +47,7 @@ func TestIMAP_DisabledCapsRefusesCommands(t *testing.T) {
 					t.Errorf("CAPABILITY still offers %s:\n%s", c, capLine)
 				}
 			}
-			for _, c := range []string{"IMAP4rev1", "LIST-STATUS", "UIDPLUS"} {
+			for _, c := range []string{"IMAP4rev1", "LIST-STATUS", "UIDPLUS", "CREATE-SPECIAL-USE"} {
 				if !slices.Contains(caps, c) {
 					t.Errorf("CAPABILITY lost %s:\n%s", c, capLine)
 				}
@@ -55,6 +55,9 @@ func TestIMAP_DisabledCapsRefusesCommands(t *testing.T) {
 
 			c.appendMessage()
 			mustOK("CREATE Moved")
+			// CREATE-SPECIAL-USE is still offered, so its USE parameter is
+			// accepted, an empty attribute list included (RFC 6154 §6).
+			mustOK("CREATE EmptyUse (USE ())")
 
 			wantBad("NAMESPACE")
 			wantBad("STATUS INBOX (SIZE)")
@@ -124,6 +127,12 @@ func TestIMAP_DisabledCapsRefusesListThreadAndUIDPlus(t *testing.T) {
 			c.clearSpecialUse(`\Archive`)
 			c.wantBad(`CREATE Arch (USE (\Archive))`)
 			if resp := c.mustOK(`LIST "" "Arch"`); strings.Contains(resp, "* LIST ") {
+				t.Errorf("a refused CREATE created the mailbox:\n%s", resp)
+			}
+			// RFC 6154 §6 allows an empty attribute list, but USE is still
+			// CREATE-SPECIAL-USE's parameter (RFC 4466 §2.2).
+			c.wantBad(`CREATE EmptyUse (USE ())`)
+			if resp := c.mustOK(`LIST "" "EmptyUse"`); strings.Contains(resp, "* LIST ") {
 				t.Errorf("a refused CREATE created the mailbox:\n%s", resp)
 			}
 			if resp := c.mustOK(`LIST "" "*"`); !strings.Contains(resp, "INBOX") {
