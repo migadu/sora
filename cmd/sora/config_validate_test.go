@@ -77,6 +77,13 @@ func TestStartupChecksTheWholeFile(t *testing.T) {
 			},
 		},
 		{
+			// Every proxy refused this file only as it was built (#1038).
+			name: "proxy without remote_addrs or [[pool]] blocks",
+			content: "\n[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:1143\"\n" +
+				"\n[server.remote_lookup]\nenabled = true\nurl = \"https://lookup.example.com/lookup?email=$email\"\n",
+			wantErr: []string{"invalid configuration - server 'imap-proxy': remote_addrs is required unless the file declares [[pool]] blocks"},
+		},
+		{
 			name:    "mail backend with database and S3",
 			content: storageTOML + imapBackend,
 		},

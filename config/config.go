@@ -3218,7 +3218,14 @@ func (c *Config) Validate() []Problem {
 
 	servers := c.GetAllServers()
 	for i := range servers {
-		add(fmt.Sprintf("server '%s'", servers[i].Name), servers[i].Validate())
+		section := fmt.Sprintf("server '%s'", servers[i].Name)
+		add(section, servers[i].Validate())
+		// A proxy routes into its remote_addrs or into the file's [[pool]] blocks, and is
+		// not built without either. Pools are file-level, so ServerConfig.Validate cannot
+		// tell; with pools, ValidatePools checks how the proxy uses them.
+		if strings.HasSuffix(servers[i].Type, "_proxy") && len(servers[i].RemoteAddrs) == 0 && !c.HasPools() {
+			add(section, fmt.Errorf("remote_addrs is required unless the file declares [[pool]] blocks"))
+		}
 	}
 
 	// Named backend pools are validated as a whole: the checks cross the [[pool]] blocks
