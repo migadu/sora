@@ -1002,15 +1002,26 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 
 // GetFirstUnseenSeqNum performs the expensive O(N) count translation of the first unseen UID into a sequence number.
 // This must only be called for IMAP SELECT/EXAMINE where the IMAP protocol mandates [UNSEEN <seq>].
+//
+// In a view (WithSeqView) the first unseen message is looked for among the view's
+// messages and numbered in the view, so that it is a message of the EXISTS the SELECT
+// sends for that view.
 func (d *Database) GetFirstUnseenSeqNum(ctx context.Context, mailboxID int64) (uint32, error) {
 	var firstUnseenUID int64
+	view := seqViewOf(ctx)
+	inMailbox := "m.expunged_at IS NULL"
+	args := []any{mailboxID}
+	if view > 0 {
+		inMailbox = "m.created_modseq <= $2 AND (m.expunged_at IS NULL OR m.expunged_modseq > $2)"
+		args = append(args, int64(view))
+	}
 	query := fmt.Sprintf(`
 		SELECT m.uid FROM message_state ms
 		JOIN messages m ON ms.message_id = m.id
-		WHERE ms.mailbox_id = $1 AND (ms.flags & %d) = 0 AND m.expunged_at IS NULL
+		WHERE ms.mailbox_id = $1 AND (ms.flags & %d) = 0 AND %s
 		ORDER BY ms.message_id ASC LIMIT 1
-	`, FlagSeen)
-	err := d.GetReadPoolWithContext(ctx).QueryRow(ctx, query, mailboxID).Scan(&firstUnseenUID)
+	`, FlagSeen, inMailbox)
+	err := d.GetReadPoolWithContext(ctx).QueryRow(ctx, query, args...).Scan(&firstUnseenUID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return 0, nil
@@ -1019,11 +1030,14 @@ func (d *Database) GetFirstUnseenSeqNum(ctx context.Context, mailboxID int64) (u
 	}
 
 	var seqNum uint32
-	err = d.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT COUNT(*) + 1 FROM messages
-		WHERE mailbox_id = $1 AND expunged_at IS NULL
-		  AND uid < $2
-	`, mailboxID, firstUnseenUID).Scan(&seqNum)
+	args = []any{mailboxID, firstUnseenUID}
+	viewParam := ""
+	if view > 0 {
+		args = append(args, int64(view))
+		viewParam = "$3"
+	}
+	err = d.GetReadPoolWithContext(ctx).QueryRow(ctx,
+		`SELECT COUNT(*) + 1 FROM `+seqCountedRows("$1", viewParam, "uid < $2")+` counted`, args...).Scan(&seqNum)
 	if err != nil {
 		return 0, fmt.Errorf("failed to compute sequence number for UID %d: %w", firstUnseenUID, err)
 	}
