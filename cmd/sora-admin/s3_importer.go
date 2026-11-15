@@ -20,7 +20,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/emersion/go-message/mail"
 	"github.com/migadu/go-imap"
-	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
@@ -540,7 +539,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 		internalDate = time.Now()
 	}
 
-	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(content))
+	bodyStructure := helpers.ExtractBodyStructure(bytes.NewReader(content))
 
 	// Validate body structure and use fallback if invalid (e.g., multipart with no children)
 	if err := helpers.ValidateBodyStructure(&bodyStructure); err != nil {
