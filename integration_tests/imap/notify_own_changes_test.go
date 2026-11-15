@@ -3,12 +3,15 @@
 package imap_test
 
 import (
+	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
 )
 
@@ -112,5 +115,50 @@ func TestNotifyNoEventsForOwnChanges(t *testing.T) {
 	}
 	if t.Failed() {
 		t.Logf("all responses:\n%s", strings.Join(got, "\r\n"))
+	}
+}
+
+// TestNotifyOwnCreateBelowAnInvisibleLevel: a client creating a mailbox below
+// another user's shared mailbox gets no LIST for its CREATE, and none for the
+// namespace root above it either. The root is the owner's mailbox, which the
+// client has no 'l' right on, so its account snapshot never shows it: nothing
+// happened to it, and it must not be reported \NonExistent. What the owner
+// creates there afterwards is still reported.
+func TestNotifyOwnCreateBelowAnInvisibleLevel(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, owner := common.SetupIMAPServer(t)
+	defer server.Close()
+	member := fmt.Sprintf("member-%d@example.com", common.GetTimestamp())
+	if _, err := server.ResilientDB.CreateAccountWithRetry(context.Background(), db.CreateAccountRequest{
+		Email: member, Password: "password", HashType: "bcrypt", IsPrimary: true,
+	}); err != nil {
+		t.Fatalf("create member account: %v", err)
+	}
+
+	ownerConn := dialRawIMAP(t, server.Address)
+	ownerConn.do(fmt.Sprintf(`LOGIN "%s" "%s"`, owner.Email, owner.Password))
+	ownerConn.do("CREATE Shared/Team") // creates the owner's Shared too
+	ownerConn.do(fmt.Sprintf(`SETACL Shared/Team "%s" lrk`, member))
+
+	watcher := dialRawIMAP(t, server.Address)
+	watcher.do(fmt.Sprintf(`LOGIN "%s" "password"`, member))
+	watcher.do("NOTIFY SET (SUBTREE Shared (MailboxName SubscriptionChange))")
+	untagged, _ := watcher.do("CREATE Shared/Team/Sub")
+	got := splitUntaggedResponses(untagged)
+
+	ownerConn.do("CREATE Shared/Team/Marker")
+	got = append(got, readNotifyUntil(t, watcher, 10*time.Second, func(resps []string) bool {
+		return slices.ContainsFunc(resps, func(resp string) bool { return strings.Contains(resp, "Shared/Team/Marker") })
+	})...)
+	got = append(got, notifyNoop(t, watcher)...)
+
+	var lists []string
+	for _, resp := range got {
+		if m := notifyEventRe.FindStringSubmatch(resp); m != nil && m[1] == "LIST" && m[2] != "Shared/Team/Marker" {
+			lists = append(lists, resp)
+		}
+	}
+	if len(lists) > 0 {
+		t.Errorf("want no LIST for the client's own CREATE, got:\n%s", strings.Join(lists, "\r\n"))
 	}
 }
