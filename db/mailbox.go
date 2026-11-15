@@ -28,6 +28,12 @@ type DBMailbox struct {
 	SpecialUse  string // RFC 6154 special-use attribute (e.g. "\Sent"); empty if none
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+
+	// NameKey is LOWER(name) as the database computes it: the mailbox's identity
+	// (unique per owner, migration 000041). lower() depends on the collation, and
+	// no Go case mapping matches it, so names are compared by this key. Set by
+	// GetMailboxes.
+	NameKey string
 }
 
 func NewDBMailbox(mboxId int64, name string, uidValidity uint32, path string, subscribed, hasChildren bool, createdAt, updatedAt time.Time) DBMailbox {
@@ -95,7 +101,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			ORDER BY LOWER(name), priority, id
 		)
 		SELECT
-			m.id, m.name, m.uid_validity, m.path,
+			m.id, m.name, LOWER(m.name), m.uid_validity, m.path,
 			-- Subscription state from the name-based subscriptions table (migration
 			-- 000046) via a LEFT JOIN: the planner hashes this account's (small)
 			-- subscription set once and probes per mailbox, instead of running a
@@ -137,7 +143,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 		var mailbox DBMailbox
 		var uidValidityInt64 int64
 
-		if err := rows.Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID, &mailbox.HasChildren); err != nil {
+		if err := rows.Scan(&mailbox.ID, &mailbox.Name, &mailbox.NameKey, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID, &mailbox.HasChildren); err != nil {
 			return nil, err
 		}
 
