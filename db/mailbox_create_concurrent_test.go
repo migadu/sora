@@ -45,6 +45,48 @@ func TestCreateMailbox_DuplicateNameKeepsTransactionUsable(t *testing.T) {
 	assertMailboxTreeConsistent(t, db, accountID)
 }
 
+// TestCreateMailboxWithSpecialUse_ConflictErrors: with a taken name skipped by ON
+// CONFLICT instead of raised, a special-use attribute that another mailbox of the
+// account holds must still come back as consts.ErrMailboxSpecialUseInUse (NO
+// [USEATTR], RFC 6154 §3), and a taken name as consts.ErrDBUniqueViolation (NO
+// [ALREADYEXISTS]) even when the attribute is taken too, with the transaction
+// still usable.
+func TestCreateMailboxWithSpecialUse_ConflictErrors(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	db := setupTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+	accountID := createTestAccount(t, db, fmt.Sprintf("create-special-use-dup-%d@example.com", time.Now().UnixNano()), "password123")
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(context.Background())
+	require.NoError(t, db.CreateMailboxWithSpecialUse(ctx, tx, accountID, "Keep", nil, `\Archive`))
+	require.NoError(t, tx.Commit(ctx))
+
+	for _, tc := range []struct {
+		name, mailbox string
+		want          error
+	}{
+		{"attribute taken", "Keep2", consts.ErrMailboxSpecialUseInUse},
+		{"name and attribute taken", "KEEP", consts.ErrDBUniqueViolation},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tx, err := db.GetWritePool().Begin(ctx)
+			require.NoError(t, err)
+			defer tx.Rollback(context.Background())
+			err = db.CreateMailboxWithSpecialUse(ctx, tx, accountID, tc.mailbox, nil, `\Archive`)
+			require.ErrorIs(t, err, tc.want)
+			if tc.want == consts.ErrDBUniqueViolation {
+				var one int
+				require.NoError(t, tx.QueryRow(ctx, `SELECT 1`).Scan(&one), "the transaction must still be usable after a duplicate name")
+			}
+		})
+	}
+}
+
 // TestCreateMailboxForUser_ParentCreatedConcurrently is issue #1396: a missing
 // ancestor that another transaction creates while CreateMailboxForUser creates it
 // too must be read back and used as the parent, not fail the call with
