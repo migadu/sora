@@ -441,29 +441,15 @@ func (s *Session) handleConnection() {
 				s.loseBackend()
 			}
 
-			// Connect to backend if not already connected
-			if s.backendConn == nil {
-				if err := s.connectToBackend(); err != nil {
-					s.InfoLog("backend connection failed", "from", s.sender, "to", s.to, "error", err)
-					// The backend refused the declared size: permanent for this recipient
-					// (RFC 1870 section 6.4 (2)), not a failed connection to retry.
-					if errors.Is(err, errBackendRefusedSize) {
-						s.sendResponse("552 5.3.4 Message size exceeds fixed maximum message size")
-						continue
-					}
-					// NOTE: we deliberately do NOT invalidate the lookup cache here.
-					// The cache exists to protect remotelookup; invalidating on
-					// connect failure would hammer remotelookup with one query per
-					// delivery attempt for the whole duration of a backend outage.
-					// Routing is revalidated via positive-TTL expiry instead (see
-					// integration_tests/lmtpproxy/backend_rejection_cache_test.go).
-					s.sendResponse("451 4.4.1 Backend connection failed")
-					// Do not return, continue loop to handle RSET or QUIT
-					continue
-				}
-			} else {
-				// Verify if the current backend connection is compatible with this recipient
-				// Since we are reusing the connection, we must ensure this user routes to the same backend
+			// A held backend must also be where this recipient routes. While the
+			// transaction has no accepted recipient, the recipient is routed as on a
+			// fresh connection: a held backend it does not route to is dropped (nothing
+			// is poisoned) and the connect below reaches the recipient's backend and
+			// re-sends MAIL FROM. Otherwise an MTA that keeps this connection would get
+			// 451 for every transaction whose first recipient lives elsewhere. Once a
+			// recipient is accepted the held backend is the transaction's, and one that
+			// needs another backend gets 451, to be sent in a new transaction.
+			if s.backendConn != nil {
 				routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 					Ctx:                   s.ctx,
 					Username:              s.originalAddress,
@@ -496,6 +482,7 @@ func (s *Session) handleConnection() {
 					}
 					recipientPool = binding.PoolName()
 				}
+				mismatch := ""
 				if s.backendRoute != nil {
 					if err := s.backendRoute.ValidatePoolDestination(s.backendConn.RemoteAddr().String()); err != nil {
 						s.loseBackend()
@@ -503,24 +490,55 @@ func (s *Session) handleConnection() {
 						continue
 					}
 					if s.backendRoute.PoolName() != recipientPool {
-						s.sendResponse("451 4.3.0 Recipient requires different backend pool, start new transaction")
-						continue
+						mismatch = "451 4.3.0 Recipient requires different backend pool, start new transaction"
 					}
 				}
-				// If a specific backend is required (targetAddr not empty) and it differs from
-				// the currently connected backend, we must reject this recipient.
-				// The client should retry this recipient in a separate transaction.
-				// Without a specific backend (every member of the pool unhealthy), the held
-				// backend still has to be a member of the recipient's pool.
-				if (targetAddr != "" && targetAddr != s.serverAddr) ||
-					(targetAddr == "" && routeResult.Pool != "" && !s.server.connManager.PoolHasBackend(routeResult.Pool, s.serverAddr)) {
-					s.InfoLog("rejecting recipient - routing mismatch (requires different backend)",
+				// A specific backend (targetAddr) must be the held one. Without one (every
+				// member of the pool unhealthy), the held backend still has to be a member of
+				// the recipient's pool.
+				if mismatch == "" && ((targetAddr != "" && targetAddr != s.serverAddr) ||
+					(targetAddr == "" && routeResult.Pool != "" && !s.server.connManager.PoolHasBackend(routeResult.Pool, s.serverAddr))) {
+					mismatch = "451 4.3.0 Recipient requires different backend server, start new transaction"
+				}
+				if mismatch != "" {
+					if s.acceptedRcpts > 0 {
+						s.InfoLog("rejecting recipient - routing mismatch (requires different backend)",
+							"to", s.to,
+							"current_backend", s.serverAddr,
+							"target_backend", targetAddr,
+							"pool", routeResult.Pool,
+							"method", routeResult.RoutingMethod)
+						s.sendResponse(mismatch)
+						continue
+					}
+					s.InfoLog("dropping backend connection: recipient routes to another backend",
 						"to", s.to,
-						"current_backend", s.serverAddr,
+						"backend", s.serverAddr,
 						"target_backend", targetAddr,
 						"pool", routeResult.Pool,
 						"method", routeResult.RoutingMethod)
-					s.sendResponse("451 4.3.0 Recipient requires different backend server, start new transaction")
+					s.loseBackend()
+				}
+			}
+
+			// Connect to backend if not already connected
+			if s.backendConn == nil {
+				if err := s.connectToBackend(); err != nil {
+					s.InfoLog("backend connection failed", "from", s.sender, "to", s.to, "error", err)
+					// The backend refused the declared size: permanent for this recipient
+					// (RFC 1870 section 6.4 (2)), not a failed connection to retry.
+					if errors.Is(err, errBackendRefusedSize) {
+						s.sendResponse("552 5.3.4 Message size exceeds fixed maximum message size")
+						continue
+					}
+					// NOTE: we deliberately do NOT invalidate the lookup cache here.
+					// The cache exists to protect remotelookup; invalidating on
+					// connect failure would hammer remotelookup with one query per
+					// delivery attempt for the whole duration of a backend outage.
+					// Routing is revalidated via positive-TTL expiry instead (see
+					// integration_tests/lmtpproxy/backend_rejection_cache_test.go).
+					s.sendResponse("451 4.4.1 Backend connection failed")
+					// Do not return, continue loop to handle RSET or QUIT
 					continue
 				}
 			}
