@@ -542,12 +542,14 @@ The server answers `ID` with:
 
 Some clients change behaviour by server name, so these keys let you present a different identity.
 
-The client's `name` and `version` are matched against `client_filters` (section 6). When the
-connection comes from a peer in `trusted_networks` (behind a PROXY header, the client the header
-names; see [SECURITY.md](SECURITY.md#31-trusted_networks)), Sora also reads the proxy's forwarding
-fields (`x-originating-ip`, `x-originating-port`, `x-session-id`, `x-proxy-ttl`, `x-forward-ja4-fingerprint`
-and others) and uses them as the client's address and fingerprint. A forwarded TTL that has run out
-closes the connection to stop a proxy loop. The fields are described in [PROXY.md](PROXY.md).
+The client's `name` and `version` are matched against `client_filters` (section 6). Before login,
+when the connection comes from a peer in `trusted_networks` (behind a PROXY header, the client the
+header names; see [SECURITY.md](SECURITY.md#31-trusted_networks)), Sora also reads the proxy's
+forwarding fields (`x-originating-ip`, `x-originating-port`, `x-session-id`, `x-proxy-ttl`,
+`x-forward-ja4-fingerprint` and others) and uses them as the client's address and fingerprint.
+After login they are ignored: the peer is then relaying the client's own commands. A forwarded TTL
+that has run out closes the connection to stop a proxy loop. The fields are described in
+[PROXY.md](PROXY.md).
 
 ### 5.12 Per-command timeouts
 
@@ -812,11 +814,11 @@ does not apply to the POP3 backend.
 
 A peer in `trusted_networks` may send `XCLIENT` before login to pass the real client address. Behind
 a PROXY header the peer is the client the header names, not the load balancer that sent it
-([SECURITY.md](SECURITY.md#31-trusted_networks)). Attributes: `ADDR`, `PORT`, `SESSION`, `TTL`
-and `FORWARD`. It is allowed once per session and only before login. Replies: `+OK XCLIENT parameters accepted`,
-`-ERR Connection not from trusted proxy`, `-ERR Invalid XCLIENT parameters`, and
-`-ERR Proxy TTL expired` (which closes the connection). Sora's POP3 proxy uses it; see
-[PROXY.md](PROXY.md).
+([SECURITY.md](SECURITY.md#31-trusted_networks)). Attributes: `ADDR`, `PORT`, `SESSION`, `TTL` and
+`FORWARD`. It is allowed once per session and only before login. Replies:
+`+OK XCLIENT parameters accepted`, `-ERR Connection not from trusted proxy`,
+`-ERR Invalid XCLIENT parameters`, and `-ERR Proxy TTL expired` (which closes the connection).
+Sora's POP3 proxy uses it; see [PROXY.md](PROXY.md).
 
 ### 7.6 Per-command timeouts
 
