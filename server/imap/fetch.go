@@ -724,17 +724,14 @@ func (s *IMAPSession) decodeBinary(ctx context.Context, bodyData *[]byte, bodyDa
 }
 
 // writeDecodedBinary writes the BINARY sections and BINARY.SIZE values
-// decodeBinary returned.
+// decodeBinary returned. A section goes as a literal8 only when it contains a
+// NUL octet: RFC 9051 §7.5.2, "If the domain of the decoded data is "8bit"
+// and the data does not contain the NUL octet, the server SHOULD return the
+// data in a <string> instead of a <literal8>".
 func writeDecodedBinary(w *imapserver.FetchResponseWriter, options *imap.FetchOptions, b *decodedBinary) error {
 	for i, section := range options.BinarySection {
-		wc := w.WriteBinarySection(section, int64(len(b.sections[i])))
-		_, writeErr := wc.Write(b.sections[i])
-		closeErr := wc.Close()
-		if writeErr != nil {
-			return writeErr
-		}
-		if closeErr != nil {
-			return closeErr
+		if err := w.WriteBinarySectionBytes(section, b.sections[i]); err != nil {
+			return err
 		}
 	}
 	for i, section := range options.BinarySectionSize {
