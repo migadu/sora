@@ -2882,9 +2882,11 @@ func (s *ServerConfig) Validate() error {
 	// disabled lookup is never initialized.
 	if strings.HasSuffix(s.Type, "_proxy") {
 		// The proxy adds every entry as a backend, an empty one included, and routes
-		// users to it; ValidatePools refuses an empty [[pool]] backend the same way.
+		// users to it. A port alone (":143") is as empty, and worse: a dial to an empty
+		// host reaches this node itself. ValidatePools refuses an empty [[pool]] host
+		// the same way.
 		for i, addr := range s.RemoteAddrs {
-			if strings.TrimSpace(addr) == "" {
+			if host, _ := poolBackendHost(addr); host == "" {
 				return fmt.Errorf("server %q: remote_addrs #%d: empty backend address", s.Name, i+1)
 			}
 		}
