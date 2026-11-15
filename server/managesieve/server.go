@@ -470,8 +470,14 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 			}
 			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "managesieve", logFunc)
 
-			// Log connection with session context (protocol, remote, session id)
-			session.DebugLog("new connection")
+			// Log connection with session context (protocol, remote, session id), and the
+			// session a managesieve_proxy's PROXY v2 header names (TLV 0xE1): it leads
+			// from the proxy's session=<id> to this session.
+			if proxyInfo != nil && proxyInfo.ProxySessionID != "" {
+				session.InfoLog("connected", "proxy_session", proxyInfo.ProxySessionID)
+			} else {
+				session.InfoLog("connected")
+			}
 
 			// Track session for graceful shutdown
 			s.addSession(session)
