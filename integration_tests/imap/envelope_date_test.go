@@ -226,6 +226,12 @@ func TestIMAP_EnvelopeDateObsoleteZone(t *testing.T) {
 		// A name prefix must not turn an invalid field into a parsed Date.
 		{"Wed, 17 Jul 1996 02:23:25 PDT+0400", "NIL"},
 		{"Wed, 17 Jul 1996 02:23:25 PDT0", "NIL"},
+		// GMT with a signed hour is no RFC 5322 zone and has no single meaning (+0100,
+		// or UTC-1 as a POSIX TZ). net/mail read these as 03:23:25 +0100 and as
+		// 21:23:25 -0500 the day before.
+		{"Wed, 17 Jul 1996 02:23:25 GMT+1", "NIL"},
+		{"Wed, 17 Jul 1996 02:23:25 GMT-5", "NIL"},
+		{"Wed, 17 Jul 1996 02:23:25 GMT+0000", `"Wed, 17 Jul 1996 02:23:25 +0000"`},
 	}
 	for i, d := range dates {
 		rc.append(fmt.Sprintf("a%d", i), "INBOX", "From: alice@example.com\r\nTo: bob@example.com\r\n"+
