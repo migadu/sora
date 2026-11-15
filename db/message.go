@@ -846,17 +846,22 @@ func hydrateSequencesCore[T any](
 
 	// Fetch mailbox stats for bidirectional sweep decision.
 	// On deadlock/lock timeout, gracefully fall back to forward sweep.
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT COALESCE(highest_uid, 1)
-		FROM mailboxes
-		WHERE id = $1
-	`, mailboxID).Scan(&uidNext)
+	err := InReadSavepoint(ctx, func(spCtx context.Context) error {
+		return db.readQuerier(spCtx).QueryRow(spCtx, `
+			SELECT COALESCE(highest_uid, 1)
+			FROM mailboxes
+			WHERE id = $1
+		`, mailboxID).Scan(&uidNext)
+	})
 
 	useForwardSweep := true // Default to forward sweep
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Mailbox doesn't exist - this is a real error
 			return fmt.Errorf("mailbox %d not found for sequence hydration", mailboxID)
+		}
+		if errors.Is(err, ErrReadSnapshotAborted) {
+			return err
 		}
 		// On deadlock or other transient errors, fall back to forward sweep
 		// This prevents test flakiness during concurrent execution
@@ -912,7 +917,7 @@ func hydrateSequencesCore[T any](
 		args[2] = int64(minUID)
 	}
 
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
+	rows, err := db.readQuerier(ctx).Query(ctx, query, args...)
 
 	if err != nil {
 		return fmt.Errorf("failed to query sequence streams: %w", err)
