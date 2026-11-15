@@ -485,7 +485,12 @@ each message and decrypted.
 the root, with one directory per level of its name: `Work/2024` becomes `<root>/Work/2024/cur`.
 Each level is written in IMAP modified UTF-7, as Dovecot names folders on disk (`Données` becomes
 `Donn&AOk-es`, `R&D` becomes `R&-D`), and a `.` or `\` in it is escaped as `\2e` or `\5c`
-(`v1.2` becomes `v1\2e2`), because the importer reads a `.` as the Maildir++ separator. A mailbox
+(`v1.2` becomes `v1\2e2`), because the importer reads a `.` as the Maildir++ separator. A level
+named after an entry of the directory that holds it, whatever its case, escapes its first
+character the same way: `cur`, `new`, `tmp`, `dovecot-uidlist` and `dovecot-keywords` at every level, and
+`subscriptions` at the top level (the root holds the `subscriptions` file). So `subscriptions`
+becomes `\73ubscriptions` and `Work/dovecot-uidlist` becomes `Work/\64ovecot-uidlist`, and the
+folder does not take the place of its parent's own directories and files. A mailbox
 with a level `.` or `..` fails to export. This is not the Maildir++ layout with dotted names
 (`.Work.2024`) that Dovecot uses by default; a Dovecot reading the export needs a
 filesystem-style folder layout (Dovecot's `LAYOUT=fs`), and shows escaped names right only with
@@ -507,7 +512,8 @@ kept. A folder can name at most 26 keywords; further ones are logged and left ou
 also of folders that no longer exist, in Dovecot's version-2 format: a `V` + tab + `2` line and an
 empty line, then one name per line, with the levels of a nested name separated by tab
 characters. Each level is written as a folder's directory is (modified UTF-7, `.` and `\`
-escaped), as Dovecot writes it, so `v1.2` is subscribed as `v1\2e2`.
+escaped, and so is the first character of a level named after a directory entry), as Dovecot
+writes it, so `v1.2` is subscribed as `v1\2e2`.
 
 **UID lists.** With `--dovecot` or `--export-dovecot-uidlist`, each exported folder gets a
 `dovecot-uidlist` with the mailbox's UIDVALIDITY and each message's Sora UID. An existing
@@ -520,15 +526,18 @@ message by content hash and mailbox. On a re-run:
 - A message already recorded whose file is still in its folder's `cur/` is skipped.
 - A message recorded whose file is not there is written again under its recorded name. That
   includes a folder an older version wrote under another directory name (one with `.`, `\`, `&`
-  or non-ASCII characters in its name): its messages are written to the folder's directory as
-  named now, and the old directory is left as it was, so remove it or export into an empty
-  directory.
+  or non-ASCII characters in its name, or named after a directory entry such as `subscriptions`):
+  its messages are written to the folder's directory as named now, and the old directory is left
+  as it was, so remove it or export into an empty directory. An old directory that sits where the
+  export writes a file (`subscriptions`, a `dovecot-uidlist`) makes writing that file fail.
 - With `--overwrite-flags`, recorded messages are written again with their current flags and the
   old file is removed.
 - Two messages with the same content in one mailbox are exported as one file.
 
 Each message is tried three times. If any message or mailbox fails, the command exits `1` with
-`export incomplete: N message(s) and M mailbox(es) failed`.
+`export incomplete: N message(s) and M mailbox(es) failed`. It also exits `1`, naming the file,
+when the `subscriptions` file or a folder's `dovecot-uidlist` cannot be written; the other folders'
+uidlists are still written.
 
 ---
 
