@@ -191,6 +191,7 @@ so its failure is an ERROR record of the `[logging]` output, in its format.
 | `master_sasl_username` is set and `master_sasl_password` is empty | `server "<name>": master_sasl_username is set but master_sasl_password is empty; refusing to start ...` |
 | `[[pool]]` blocks are inconsistent (see [section 10](#10-named-backend-pools-pool)) | `[[pool]]: ...` |
 | A proxy server (a type ending in `_proxy`) has no `remote_addrs` and the file has no `[[pool]]` blocks | `server '<name>': remote_addrs is required unless the file declares [[pool]] blocks` |
+| A proxy server has a `remote_addrs` entry that is empty or only spaces | `server "<name>": remote_addrs #<n>: empty backend address` |
 | A server has `proxy_protocol = true` and `[servers] trusted_networks` is empty | `trusted_networks: proxy_protocol is enabled on server(s) <names> but [servers] trusted_networks is empty; ...` |
 | Two servers have the same `name` | `duplicate server name '<name>' found. Each server must have a unique name` |
 | Two servers have the same `addr` string | `duplicate server address '<addr>' found. Server '<a>' and '<b>' cannot bind to the same address` |
@@ -202,6 +203,7 @@ so its failure is an ERROR record of the `[logging]` output, in its format.
 | `[servers] trusted_networks` has an entry that is neither an IP address nor a CIDR block | names the invalid entry |
 | A server's `auth_rate_limit.exempt_networks` has an entry that is neither an IP address nor a CIDR block | `server "<name>": auth_rate_limit.exempt_networks has entries that are neither an IP address nor a CIDR: [...]` |
 | An `imap` server's `client_filters` entry has a `client_name`, `client_version` or `ja4_fingerprints` pattern that is not a valid regular expression | `server "<name>": client_filters #<n>: <key> "<pattern>": error parsing regexp: ...` |
+| An `imap` server's `client_filters` entry has none of `client_name`, `client_version` and `ja4_fingerprints` (empty ones count as unset), or an empty `ja4_fingerprints` pattern | `server "<name>": client_filters #<n>: none of client_name, client_version and ja4_fingerprints is set, so it matches no client` or `server "<name>": client_filters #<n>: ja4_fingerprints "": an empty pattern matches every TLS fingerprint` |
 | A server's `auth_rate_limit` has a negative count or duration, or a `delay_multiplier` that is negative, `nan` or `inf` | `server "<name>": auth_rate_limit.<key> must not be negative, got <value>` or `server "<name>": auth_rate_limit.delay_multiplier must be a finite number, got <value>` |
 | An `lmtp` or `http_admin_api` server has a `limits.redirect_rate_window` of zero or less | `server "<name>": limits.redirect_rate_window must be positive, got "<value>" (set limits.redirect_rate_limit = 0 to disable the limit)` |
 | A proxy server has a `remote_port` that is not a port number | `server "<name>": invalid remote_port: ...` |
@@ -358,8 +360,12 @@ Adding, removing or renaming a `[[server]]` block also needs a restart, and Sora
 removed blocks. A new block is not started, and a running server whose block was removed or renamed
 keeps running with its old settings.
 
-The global checks of [section 4](#4-checks-at-startup) (pools, `trusted_networks` against
-`proxy_protocol`, server names and addresses) do not run on a reload.
+A reload also runs the checks of [section 4](#4-checks-at-startup) that
+`sora-admin config validate` runs (all but `[timeout_scheduler]`) on the new file. For each problem
+it logs an error, for example
+`Config reload: [cluster] is invalid and the server will not start with this config`, with the
+reason in `error`, so a file the next restart would refuse is caught at the reload. It still
+applies each valid `[[server]]` block as above.
 
 How to send the signal, and how shutdown works, is in [OPERATIONS.md](OPERATIONS.md).
 
@@ -382,7 +388,7 @@ How to send the signal, and how shutdown works, is in [OPERATIONS.md](OPERATIONS
 | `[relay]`, `[relay.queue]` | Outbound relay for redirect and vacation | [8.11](#811-relay-relay-and-relayqueue), [RELAY.md](RELAY.md) |
 | `[spam_training]` | Spam filter training on moves to and from Junk | [8.12](#812-spam-training-spam_training), [RELAY.md](RELAY.md) |
 | `[tls]`, `[tls.letsencrypt]`, `[tls.letsencrypt.s3]` | Shared certificates, Let's Encrypt | [8.13](#813-tls-tls), [TLS.md](TLS.md) |
-| `[cluster]`, `[cluster.affinity]` | Gossip cluster | [8.14](#814-cluster-cluster), [CLUSTER.md](CLUSTER.md) |
+| `[cluster]`, `[cluster.affinity]`, `[cluster.rate_limit_sync]` | Gossip cluster | [8.14](#814-cluster-cluster), [CLUSTER.md](CLUSTER.md) |
 | `[auth_cache]` | Persistent login cache for proxies | [8.15](#815-persistent-auth-cache-auth_cache), [PROXY.md](PROXY.md) |
 | `[backend_maintenance]` | How proxies drain backends in maintenance | [8.16](#816-backend-maintenance-backend_maintenance), [PROXY.md](PROXY.md) |
 | `[servers]` | `trusted_networks` | [8.17](#817-trusted-networks-servers), [SECURITY.md](SECURITY.md) |
@@ -661,10 +667,19 @@ See [CLUSTER.md](CLUSTER.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `enabled` | bool | `false` | Share affinities across the cluster. |
+| `enabled` | bool | `true` | Share affinities across the cluster. |
 | `ttl` | duration | `"24h"` | How long an affinity lasts. |
 | `cleanup_interval` | duration | `"1h"` | How often expired affinities are removed. |
 | `cache_path` | string | none | SQLite file that keeps affinities across restarts. Unset keeps them in memory only. |
+
+`[cluster.rate_limit_sync]`, for the `imap_proxy`, `pop3_proxy` and `managesieve_proxy` listeners with
+`auth_rate_limit` enabled ([CLUSTER.md](CLUSTER.md#66-authentication-rate-limits-imap-pop3-and-managesieve-proxies)):
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `true` | Share the rate limiters with the proxies of the same protocol on every node, this one included. The name statistics are always shared while it is on. |
+| `sync_blocks` | bool | `true` | Share Tier 2 IP blocks. |
+| `sync_failure_counts` | bool | `true` | Share Tier 2 failure counts and progressive delays, from `delay_start_threshold` on, and the successful logins that clear them. |
 
 ### 8.15 Persistent auth cache (`[auth_cache]`)
 
@@ -741,7 +756,7 @@ to" column, "backends" means `imap`, `pop3`, `lmtp` and `managesieve`, and "line
 | `type` | string | required | all | See [section 5](#5-server-blocks). |
 | `name` | string | required | all | Unique name. |
 | `addr` | string | required | all | Listen address. |
-| `debug` | bool | `false` | backends, line proxies | Extra diagnostics for this server. Some protocols write a raw protocol trace to the log output whatever the level. See [PROTOCOLS.md](PROTOCOLS.md). |
+| `debug` | bool | `false` | backends, line proxies | Extra diagnostics for this server. Some protocols write a raw protocol trace to the log output whatever the level. On the HTTP servers it is ignored, with a startup warning. See [PROTOCOLS.md](PROTOCOLS.md). |
 
 ### 9.2 TLS on the listener
 
@@ -754,7 +769,7 @@ See [TLS.md](TLS.md).
 | `tls_cert_file`, `tls_key_file` | string | none | all but `metrics` | Certificate files for this listener. |
 | `tls_verify` | bool | `false` | all but `metrics` | See [TLS.md](TLS.md). |
 | `tls_default_domain` | string | `[tls.letsencrypt] default_domain` | all but `metrics` | Certificate for clients that send no SNI. |
-| `insecure_auth` | bool | `false` | `imap`, `pop3`, `managesieve`, `lmtp`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Allow password logins on a plain connection. Without `tls = true` it is always allowed. See [SECURITY.md](SECURITY.md). |
+| `insecure_auth` | bool | `false` | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Allow password logins on a plain connection. Without `tls = true` it is always allowed. The other server types have no password login; on them the key is ignored, with a startup warning. See [SECURITY.md](SECURITY.md). |
 
 The `metrics` server always speaks plain HTTP. `tls` on it only causes a startup warning.
 
@@ -775,7 +790,7 @@ See [SECURITY.md](SECURITY.md).
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
 | `max_connections` | integer | `0` (no limit); `1000` on `lmtp` | all but `metrics` | Concurrent connections of this server. On `lmtp`, `0` or less means 1000. |
-| `max_connections_per_ip` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `user_api_proxy` | Concurrent connections from one IP. Hosts in `trusted_networks` are not limited. |
+| `max_connections_per_ip` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `user_api_proxy` | Concurrent connections from one IP. Hosts in `trusted_networks` are not limited. With `[cluster] enabled = true`, `imap_proxy`, `pop3_proxy` and `managesieve_proxy` count the IP's connections on every node ([CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies)). |
 | `max_connections_per_user` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Logged-in sessions of one user. Enforced on this server by `imap`, `pop3` and `managesieve`. Enforced across the cluster for proxies, which track connections only with `[cluster] enabled = true`; without it a proxy ignores the key, with a startup warning. Ignored by `lmtp_proxy` with a warning. |
 | `max_connections_per_user_per_ip` | integer | `0` (no limit) | as `max_connections_per_user` | Logged-in sessions of one user from one IP. |
 | `listen_backlog` | integer | `1024` | backends, line proxies | TCP listen backlog. `0` means 1024. The HTTP servers listen with the kernel's default backlog; on them the key is ignored, with a startup warning. |
@@ -836,6 +851,8 @@ out keeps its default. On POP3, LMTP and ManageSieve an explicit `"0"` turns tha
 ### 9.7 Protocol-specific keys
 
 See [PROTOCOLS.md](PROTOCOLS.md).
+A key set on a server type not listed under "Applies to" is ignored, with a startup warning that
+names it. The same holds for `[[server.client_filters]]`.
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
@@ -864,6 +881,8 @@ See [PROTOCOLS.md](PROTOCOLS.md).
 ### 9.8 Master credentials
 
 See [AUTHENTICATION.md](AUTHENTICATION.md).
+A key set on a server type not listed under "Applies to" is ignored, with a startup warning that
+names it.
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
@@ -920,10 +939,12 @@ By default the cache is on for `imap`, `pop3`, `managesieve` and the line proxie
 ### 9.11 Proxy keys
 
 Read by the line proxies and `user_api_proxy`. See [PROXY.md](PROXY.md).
+A key set on a server type not listed under "Applies to" is ignored, with a startup warning that
+names it.
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
-| `remote_addrs` | list of strings | none | proxies | Backends. Required unless the file has `[[pool]]` blocks, and not allowed together with them. |
+| `remote_addrs` | list of strings | none | proxies | Backends. Required unless the file has `[[pool]]` blocks, and not allowed together with them. An empty entry is refused. |
 | `remote_port` | integer or string | none | proxies | Port for backends written without one. |
 | `remote_tls` | bool | `false` | proxies | TLS to the backends (HTTPS for `user_api_proxy`). |
 | `remote_tls_use_starttls` | bool | `false` | line proxies | STARTTLS to the backends. Needs `remote_tls`. |

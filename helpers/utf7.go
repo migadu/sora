@@ -80,9 +80,10 @@ func EncodeModifiedUTF7(src string) string {
 
 // DecodeModifiedUTF7 decodes a Modified UTF-7 encoded string (RFC 3501) to UTF-8.
 // If the string contains no Modified UTF-7 sequences (i.e., no '&' characters),
-// it is returned as-is. Only the canonical BASE64 form of a name decodes: BASE64 that
-// encodes printable US-ASCII, a null shift, a byte outside the modified BASE64
-// alphabet and non-zero discarded bits are invalid.
+// it is returned as-is. Only the canonical BASE64 form of a name decodes: non-printable
+// or 8-bit octets outside a shift, BASE64 that encodes printable US-ASCII, a null
+// shift, a byte outside the modified BASE64 alphabet and non-zero discarded bits are
+// invalid.
 func DecodeModifiedUTF7(src string) (string, error) {
 	// Fast path: no '&' means no Modified UTF-7 encoding
 	hasAmpersand := false
@@ -103,6 +104,11 @@ func DecodeModifiedUTF7(src string) (string, error) {
 		ch := src[i]
 
 		if ch != '&' {
+			// Outside a shift sequence, only printable US-ASCII (0x20..0x7e) may
+			// represent itself (RFC 3501 §5.1.3, RFC 9051 §A.1).
+			if ch < 0x20 || ch > 0x7e {
+				return "", ErrInvalidModifiedUTF7
+			}
 			result = append(result, ch)
 			afterBase64 = false
 			continue

@@ -41,7 +41,7 @@ func TestConnectionTracker_MultiRCPTDoesNotLeak(t *testing.T) {
 		clientAddr:           "192.0.2.10:12345",
 		ctx:                  context.Background(),
 		startTime:            time.Now(),
-		registeredAccountIDs: make(map[int64]struct{}),
+		registeredAccountIDs: make(map[int64]accountRegistration),
 	}
 
 	// registerConnection() falls back to a safe default timeout if s.server.rdb is nil.
@@ -93,7 +93,7 @@ func TestConnectionTracker_BackendReconnectDoesNotLeak(t *testing.T) {
 		clientAddr:           "192.0.2.10:12345",
 		ctx:                  context.Background(),
 		startTime:            time.Now(),
-		registeredAccountIDs: make(map[int64]struct{}),
+		registeredAccountIDs: make(map[int64]accountRegistration),
 		accountID:            1,
 		username:             "user@example.com",
 	}
@@ -341,5 +341,66 @@ func TestConnectionTracker_RegistersEachAcceptedRecipient(t *testing.T) {
 	}
 	if r, f, s := counts(); r != 0 || f != 0 || s != 0 {
 		t.Fatalf("leak after QUIT: refused=%d first=%d second=%d, want 0 0 0", r, f, s)
+	}
+}
+
+// A failed count must not suppress the accepted account's kick subscription, and
+// retrying after capacity becomes available must count only once and keep the
+// original subscription.
+func TestConnectionTracker_RetryAfterLimitKeepsSingleKickSubscription(t *testing.T) {
+	tracker := server.NewConnectionTracker("LMTP", "", "", "retry-limit", nil, 1, 0, 1000, false)
+	defer tracker.Stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const accountID = int64(42)
+	if err := tracker.RegisterConnection(ctx, accountID, "user@example.com", "LMTP", "other-client"); err != nil {
+		t.Fatal(err)
+	}
+	client, peer := net.Pipe()
+	defer client.Close()
+	defer peer.Close()
+	sess := &Session{
+		server: &Server{connTracker: tracker}, clientConn: client,
+		clientAddr: "192.0.2.1:1234", ctx: ctx, cancel: cancel,
+		startTime: time.Now(), accountID: accountID, username: "user@example.com",
+	}
+	if err := sess.registerConnection(); err == nil {
+		t.Fatal("registration at the per-user limit unexpectedly succeeded")
+	}
+	kick := sess.registeredAccountIDs[accountID].kick
+	if kick == nil {
+		t.Fatal("accepted account has no kick subscription after counting failed")
+	}
+	if err := sess.registerConnection(); err == nil {
+		t.Fatal("second registration at the limit unexpectedly succeeded")
+	}
+	if sess.registeredAccountIDs[accountID].kick != kick {
+		t.Fatal("retry replaced the kick subscription")
+	}
+	if err := tracker.UnregisterConnection(ctx, accountID, "LMTP", "other-client"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := sess.registerConnection(); err != nil {
+			t.Fatalf("registration after capacity became available: %v", err)
+		}
+	}
+	if got := tracker.GetLocalConnectionCount(accountID); got != 1 {
+		t.Fatalf("repeated registration counted %d connections, want 1", got)
+	}
+	if sess.registeredAccountIDs[accountID].kick != kick {
+		t.Fatal("successful retry replaced the kick subscription")
+	}
+	sess.close()
+	if got := tracker.GetLocalConnectionCount(accountID); got != 0 {
+		t.Fatalf("close left %d connections, want 0", got)
+	}
+	if err := tracker.KickUser(accountID, "LMTP"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-kick:
+		t.Fatal("close left the kick subscription registered")
+	default:
 	}
 }

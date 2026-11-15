@@ -98,6 +98,11 @@ mailboxes stay visible and usable for the users who have rights on them.
   `NO [CANNOT] Cannot create the shared namespace root directly...`, and `SELECT Shared` with
   `NO [CANNOT] The shared namespace root cannot be selected...`. When the root exists as a parent
   and has children, `LIST` marks it `\Noselect`.
+- **The root holds no messages.** `APPEND`, `COPY` and `MOVE` to it are refused with
+  `NO [CANNOT] The shared namespace root holds no messages...`, whether or not it exists. Sieve
+  `fileinto` of the root (also through the default script's `user+shared@` filing) and an Admin API
+  delivery naming it as the target mailbox keep the message in INBOX, and Sieve `mailboxexists`
+  reports it as missing.
 - **Whether a mailbox is shared is fixed when it is created.** `RENAME` cannot move a mailbox into
   or out of the namespace: `NO [CANNOT] Mailboxes cannot be moved into or out of the shared namespace`.
   The one exception is a personal folder that already sat under the prefix: it may be renamed out.
@@ -133,10 +138,18 @@ Either way, a user who holds the create right (`k`) on an existing shared folder
 folders below it. The new folder belongs to the owner of that hierarchy, not to the user who
 created it.
 
-### Other paths create personal folders
+### Other paths
 
-The User API never creates shared folders; a folder it creates under the prefix is a personal
-folder. Sieve `fileinto :create` never creates a folder in the shared namespace.
+- `sora-admin import maildir` imports a folder under the prefix into a shared mailbox the account
+  owns, as `mailbox create` makes one, when sharing is enabled in the config file you pass. The
+  messages of a folder named like the namespace root are not imported. See
+  [IMPORT_EXPORT.md](IMPORT_EXPORT.md).
+- The User API does not create shared folders: `POST /user/mailboxes` with a name in the shared
+  namespace, the root included, is refused with `403`.
+- `sora-admin messages restore` and the Admin API restore recreate a deleted folder under the
+  prefix as a shared mailbox of the account, as `mailbox create` makes one, when sharing is
+  enabled. The ACL entries it had are not restored; it gets the initial ACL below.
+- Sieve `fileinto :create` never creates a folder in the shared namespace.
 
 ### The initial ACL
 

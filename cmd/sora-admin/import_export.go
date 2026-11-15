@@ -246,6 +246,7 @@ Examples:
 		MaxMessageSize:       globalConfig.GetImportMessageLimit(),
 		PathsFile:            *pathsFile,
 		FTSRetention:         ftsRetentionParsed,
+		SharedMailboxes:      globalConfig.SharedMailboxes,
 	}
 
 	importer, err := NewImporter(ctx, *maildirPath, *email, *jobs, rdb, s3, options)
