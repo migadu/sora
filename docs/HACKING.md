@@ -489,10 +489,11 @@ So do not repeat `remote`, `user` or an `IMAP:` prefix in the message.
 Proxy sessions have methods with the same names, backed by `server.ProxySessionLogger`
 ([`server/proxy_logging.go`](../server/proxy_logging.go)). They add `proto`, `name`, `remote`,
 `user`, `account_id`, `session` and, when known, `ja4`. The proxy also passes its session ID to
-the backend: in a PROXY v2 header, an IMAP `ID` command or XCLIENT, depending on the setup. The
-IMAP backend logs an ID from a PROXY v2 header as `proxy_session` on its `connected` line. IDs
-that arrive through `ID` or XCLIENT appear as `session_id` in a debug line about the forwarded
-parameters.
+the backend: every proxy in its PROXY v2 header, the IMAP proxy in its `ID` command and the POP3
+proxy in XCLIENT, depending on the setup (LMTP XCLIENT has no attribute for it). The backend logs
+it as `proxy_session`: one from a PROXY v2 header on the line that announces the connection
+(`connected`, or `new session` for LMTP), one from `ID` or XCLIENT on a `forwarding parameters
+accepted` line.
 
 One difference matters: a proxy session's `DebugLog` writes only when the proxy's own `debug`
 setting is on. A backend session's `DebugLog` is filtered only by the global log level. Turning a

@@ -232,6 +232,21 @@ type UserRoutingInfo struct {
 	ProxySessionID         string        // Proxy session ID for end-to-end tracing
 }
 
+// ForDial returns the routing info a proxy session dials its backend with: a copy of r (an
+// empty one when r is nil) carrying the client's connection, whose JA4 fingerprint the
+// PROXY v2 header forwards (TLV 0xE0), and the proxy's session ID, which it forwards for
+// the backend to log as proxy_session (TLV 0xE1). r is not modified, so a session without
+// routing info keeps meaning "no route looked up yet".
+func (r *UserRoutingInfo) ForDial(clientConn net.Conn, sessionID string) *UserRoutingInfo {
+	var info UserRoutingInfo
+	if r != nil {
+		info = *r
+	}
+	info.ClientConn = clientConn
+	info.ProxySessionID = sessionID
+	return &info
+}
+
 // LookupRouted reports whether addr is the backend the remote lookup named, the only one
 // its backend settings (the Remote* fields) are for. A user the proxy routes itself — in
 // auth-only mode, from the database, or around a remote-lookup route in maintenance —

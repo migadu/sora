@@ -64,7 +64,12 @@ func (s *POP3Session) handleXCLIENT(args string) (bool, string) {
 		}
 	}
 
-	s.DebugLog("processed xclient forwarding parameters", "client_ip", forwardingParams.OriginatingIP, "client_port", forwardingParams.OriginatingPort, "session_id", forwardingParams.SessionID, "ttl", forwardingParams.ProxyTTL, "variables_count", len(forwardingParams.Variables))
+	// A pop3_proxy names its session in SESSION=: logged as on the "connected" line for
+	// a PROXY v2 header, it leads from the proxy's session=<id> to this session.
+	if forwardingParams.SessionID != "" {
+		s.InfoLog("forwarding parameters accepted", "proxy_session", forwardingParams.SessionID)
+	}
+	s.DebugLog("processed xclient forwarding parameters", "client_ip", forwardingParams.OriginatingIP, "client_port", forwardingParams.OriginatingPort, "ttl", forwardingParams.ProxyTTL, "variables_count", len(forwardingParams.Variables))
 
 	return true, "XCLIENT parameters accepted"
 }

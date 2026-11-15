@@ -135,7 +135,8 @@ func newSession(s *Server, conn net.Conn, proxyInfo *server.ProxyProtocolInfo) *
 		proxyInfo:            proxyInfo,
 		registeredAccountIDs: make(map[int64]accountRegistration),
 		// Generate the session id once, up front, so every log line carries it.
-		// It's also forwarded to the backend (XCLIENT), logged there as proxy_session.
+		// It's also forwarded to the backend in the PROXY v2 header (TLV 0xE1) and
+		// logged there as proxy_session.
 		sessionID: idgen.New(),
 	}
 }
@@ -1334,7 +1335,7 @@ func (s *Session) connectToBackend() (err error) {
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		s.ctx,
 		preferredAddr,
-		clientHost, clientPort, serverHost, serverPort, s.routingInfo,
+		clientHost, clientPort, serverHost, serverPort, s.routingInfo.ForDial(s.acceptedConn(), s.sessionID),
 	)
 	if err != nil {
 		// Track backend connection failure

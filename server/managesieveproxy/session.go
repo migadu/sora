@@ -828,7 +828,7 @@ func (s *Session) connectToBackendAndAuth() error {
 	conn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		connectCtx,
 		preferredAddr,
-		clientHost, clientPort, serverHost, serverPort, s.routingInfo,
+		clientHost, clientPort, serverHost, serverPort, s.routingInfo.ForDial(s.listenerConn, s.sessionID),
 	)
 	if err != nil {
 		metrics.ProxyBackendConnections.WithLabelValues("managesieve", "failure").Inc()
