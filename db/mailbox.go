@@ -362,42 +362,40 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 	// Use nanoseconds to significantly reduce the chance of collision on rapid creation.
 	uidValidity := uint32(time.Now().UnixNano())
 
-	// Check if this is a shared mailbox based on name prefix
-	// Extract config from context if available
-	isShared := false
-	var ownerDomain *string
-
-	// Try to get config from context
-	if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil {
-		if cfg.SharedMailboxes.InNamespace(name) {
-			isShared = true
-
-			// Extract domain from user's primary credential
-			var domain string
-			err := tx.QueryRow(ctx, `
-				SELECT SPLIT_PART(address, '@', 2)
-				FROM credentials
-				WHERE account_id = $1 AND primary_identity = TRUE
-			`, AccountID).Scan(&domain)
-			if err != nil {
-				return fmt.Errorf("failed to get user domain for shared mailbox: %w", err)
-			}
-			ownerDomain = &domain
-		}
+	// A name in the shared namespace of the config in the context is a shared mailbox.
+	ownerDomain, err := newMailboxOwnerDomain(ctx, tx, AccountID, name)
+	if err != nil {
+		return err
 	}
+	isShared := ownerDomain != nil
 
 	// Determine the parent path if parentID is provided
 	var parentPath string
 	var parentIsShared bool
 	if parentID != nil {
-		// Fetch the parent mailbox to get its path. FOR KEY SHARE holds the parent in
-		// place until this child is committed: it conflicts with SoftDeleteMailbox's FOR
-		// UPDATE (so the parent's delete sees this child, or this create sees the parent
-		// gone), but not with the highest_uid UPDATE every delivery into the parent takes.
+		// Fetch the parent mailbox to get its path. It must still have the name that
+		// the child's name gives it: callers resolve the parent's ID by name, perhaps
+		// in an earlier transaction, and a rename committed since would otherwise put
+		// the child below the renamed mailbox under the old name (issue #1298). The
+		// name is part of the WHERE clause, so a create that waits for a rename's lock
+		// on the parent checks it against the renamed row. A parent renamed away is
+		// not found, as a deleted one is.
+		//
+		// FOR KEY SHARE holds the parent in place until this child is committed: it
+		// conflicts with SoftDeleteMailbox's FOR UPDATE (so the parent's delete sees this
+		// child, or this create sees the parent gone) and with the FOR UPDATE that
+		// RenameMailbox takes on the mailbox it renames and on its descendants (so the
+		// rename renames this child too, or this create sees the new name), but not with
+		// the highest_uid UPDATE every delivery into the parent takes.
+		parentName := ""
+		if i := strings.LastIndex(name, string(consts.MailboxDelimiter)); i >= 0 {
+			parentName = name[:i]
+		}
 		err := tx.QueryRow(ctx, `
-			SELECT path, COALESCE(is_shared, FALSE) FROM mailboxes WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
+			SELECT path, COALESCE(is_shared, FALSE) FROM mailboxes
+			WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL AND LOWER(name) = LOWER($3)
 			FOR KEY SHARE
-		`, *parentID, AccountID).Scan(&parentPath, &parentIsShared)
+		`, *parentID, AccountID, parentName).Scan(&parentPath, &parentIsShared)
 
 		if err != nil {
 			if err == pgx.ErrNoRows {
@@ -416,7 +414,7 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 
 	// Insert the mailbox with shared mailbox fields
 	var mailboxID int64
-	err := tx.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path, is_shared, owner_domain, special_use)
 		VALUES ($1, $2, $3, $4, '', $5, $6, $7)
 		RETURNING id
@@ -456,52 +454,82 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 		return fmt.Errorf("failed to update mailbox path: %w", err)
 	}
 
-	// If shared mailbox, grant creator full rights (or configured default rights)
-	// Also inherit ACLs from parent mailbox if one exists (RFC 4314)
 	if isShared {
-		// If there's a shared parent mailbox, inherit its ACLs. A parent that is not
-		// shared has none to give: a level above a namespace prefix of several levels,
-		// or a personal mailbox under the namespace's name.
-		if parentID != nil && parentIsShared {
-			// Copy all ACL entries from parent to child
-			_, err = tx.Exec(ctx, `
-				INSERT INTO mailbox_acls (mailbox_id, account_id, identifier, rights, created_at, updated_at)
-				SELECT $1, account_id, identifier, rights, now(), now()
-				FROM mailbox_acls
-				WHERE mailbox_id = $2
-			`, mailboxID, *parentID)
-			if err != nil {
-				return fmt.Errorf("failed to inherit parent ACLs: %w", err)
-			}
-			logger.Info("Database: created shared mailbox with inherited ACLs from parent", "name", name, "mailbox_id", mailboxID, "parent_id", *parentID)
-		} else {
-			// No shared parent, grant creator full rights (or configured default rights)
-			defaultRights := "lrswipkxtea" // Full rights by default
-			if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.DefaultRights != "" {
-				defaultRights = cfg.SharedMailboxes.DefaultRights
-			}
-
-			// Get creator's email for identifier
-			var creatorEmail string
-			err = tx.QueryRow(ctx, `
-				SELECT address FROM credentials
-				WHERE account_id = $1 AND primary_identity = TRUE
-			`, AccountID).Scan(&creatorEmail)
-			if err != nil {
-				return fmt.Errorf("failed to get creator email: %w", err)
-			}
-
-			_, err = tx.Exec(ctx, `
-				INSERT INTO mailbox_acls (mailbox_id, account_id, identifier, rights, created_at, updated_at)
-				VALUES ($1, $2, $3, $4, now(), now())
-			`, mailboxID, AccountID, creatorEmail, defaultRights)
-			if err != nil {
-				return fmt.Errorf("failed to set creator ACL for shared mailbox: %w", err)
-			}
-			logger.Info("Database: created shared mailbox", "name", name, "mailbox_id", mailboxID, "account_id", AccountID, "domain", *ownerDomain)
+		var sharedParentID *int64
+		if parentIsShared {
+			sharedParentID = parentID
+		}
+		if err := grantNewSharedMailboxACL(ctx, tx, AccountID, name, mailboxID, sharedParentID, *ownerDomain); err != nil {
+			return err
 		}
 	}
 
+	return nil
+}
+
+// newMailboxOwnerDomain returns the owner domain of a mailbox called name that accountID
+// is creating: for a name in the shared namespace of the [shared_mailboxes] config in
+// ctx, the domain of the account's primary address, which makes it a shared mailbox;
+// nil, a personal mailbox, otherwise (sharing off, or no config in ctx).
+func newMailboxOwnerDomain(ctx context.Context, tx pgx.Tx, accountID int64, name string) (*string, error) {
+	cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config)
+	if !ok || cfg == nil || !cfg.SharedMailboxes.InNamespace(name) {
+		return nil, nil
+	}
+	var domain string
+	err := tx.QueryRow(ctx, `
+		SELECT SPLIT_PART(address, '@', 2)
+		FROM credentials
+		WHERE account_id = $1 AND primary_identity = TRUE
+	`, accountID).Scan(&domain)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user domain for shared mailbox: %w", err)
+	}
+	return &domain, nil
+}
+
+// grantNewSharedMailboxACL gives the shared mailbox accountID just created its initial
+// ACL (RFC 4314). Under a shared parent (sharedParentID) it copies the parent's entries.
+// Otherwise it grants the creator's primary address the configured default_rights (full
+// rights by default). A parent that is not shared has none to give: a level above a
+// namespace prefix of several levels, or a personal mailbox under the namespace's name.
+func grantNewSharedMailboxACL(ctx context.Context, tx pgx.Tx, accountID int64, name string, mailboxID int64, sharedParentID *int64, ownerDomain string) error {
+	if sharedParentID != nil {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO mailbox_acls (mailbox_id, account_id, identifier, rights, created_at, updated_at)
+			SELECT $1, account_id, identifier, rights, now(), now()
+			FROM mailbox_acls
+			WHERE mailbox_id = $2
+		`, mailboxID, *sharedParentID)
+		if err != nil {
+			return fmt.Errorf("failed to inherit parent ACLs: %w", err)
+		}
+		logger.Info("Database: created shared mailbox with inherited ACLs from parent", "name", name, "mailbox_id", mailboxID, "parent_id", *sharedParentID)
+		return nil
+	}
+
+	defaultRights := "lrswipkxtea"
+	if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.DefaultRights != "" {
+		defaultRights = cfg.SharedMailboxes.DefaultRights
+	}
+
+	var creatorEmail string
+	err := tx.QueryRow(ctx, `
+		SELECT address FROM credentials
+		WHERE account_id = $1 AND primary_identity = TRUE
+	`, accountID).Scan(&creatorEmail)
+	if err != nil {
+		return fmt.Errorf("failed to get creator email: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO mailbox_acls (mailbox_id, account_id, identifier, rights, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, now(), now())
+	`, mailboxID, accountID, creatorEmail, defaultRights)
+	if err != nil {
+		return fmt.Errorf("failed to set creator ACL for shared mailbox: %w", err)
+	}
+	logger.Info("Database: created shared mailbox", "name", name, "mailbox_id", mailboxID, "account_id", accountID, "domain", ownerDomain)
 	return nil
 }
 
@@ -1325,9 +1353,8 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		return fmt.Errorf("mailbox has invalid empty path (data corruption)")
 	}
 
-	// Separately, check if the mailbox has children. This avoids using GROUP BY with FOR UPDATE.
+	// Separately, lock the mailbox's live descendants, which tells whether it has any.
 	// Use owner's account_id for accurate child count (important for shared mailboxes)
-	var hasChildren bool
 	var ownerAccountID int64
 	err = tx.QueryRow(ctx, `
 		SELECT account_id FROM mailboxes WHERE id = $1
@@ -1337,13 +1364,34 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
 
-	err = tx.QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND path LIKE $2 || '%' AND path != $2 AND deleted_at IS NULL)
-	`, ownerAccountID, oldPath).Scan(&hasChildren)
-	if err != nil {
-		logger.Error("Database: failed to check for children of mailbox", "mailbox_id", mailboxID, "err", err)
-		return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
+	// The child UPDATE below takes only FOR NO KEY UPDATE, which does not conflict with
+	// the FOR KEY SHARE a create holds on its parent. Without these locks a create below
+	// a descendant would neither wait for the rename nor be waited for: one that resolved
+	// its parent by the old names links its child below the renamed parent, and a child
+	// committed after the UPDATE started is not renamed (issue #1298). A pass locks the
+	// descendants its snapshot sees; one that waited for a create may miss that create's
+	// child, so passes repeat until one finds no more than the last. From then on a
+	// create below any of them waits for this transaction, and then sees the new names.
+	var descendants int
+	for {
+		var n int
+		err = tx.QueryRow(ctx, `
+			SELECT COUNT(*) FROM (
+				SELECT 1 FROM mailboxes
+				WHERE account_id = $1 AND path LIKE $2 || '%' AND path != $2 AND deleted_at IS NULL
+				FOR UPDATE
+			) d
+		`, ownerAccountID, oldPath).Scan(&n)
+		if err != nil {
+			logger.Error("Database: failed to lock children of mailbox", "mailbox_id", mailboxID, "err", err)
+			return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
+		}
+		if n == descendants {
+			break
+		}
+		descendants = n
 	}
+	hasChildren := descendants > 0
 
 	// Determine the path of the new parent.
 	var newParentPath string
