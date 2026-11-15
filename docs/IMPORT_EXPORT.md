@@ -429,12 +429,12 @@ sora-admin --config config.toml import s3 --email user@example.com --workers 10
 | Flag | Default | Meaning |
 |---|---|---|
 | `--email` | | The account (required). Its domain and local part form the prefix that is listed. The account must exist. |
-| `--dry-run` | `false` | List each object as `IMPORT` or `SKIP` and change no messages. Default mailboxes are still created. |
+| `--dry-run` | `false` | Preview each object as `IMPORT`, `REIMPORT` or `SKIP`, as the import would treat it, without creating messages or mailboxes. |
 | `--workers` | `5` | Objects imported in parallel. |
 | `--max-objects` | `0` (no limit) | Stop the listing after this many objects. |
 | `--batch-size` | `1000` | Every this many listed objects, the key is remembered as a resume point (printed at the end as `Resumption token`). |
 | `--continuation-token KEY` | | Start listing after this key. Pass a `Resumption token` from an earlier run. |
-| `--force-reimport` | `false` | Import objects even when a live message of the account already has that hash. |
+| `--force-reimport` | `false` | Import objects even when a live message of the account in another mailbox already has that hash (`REIMPORT`). An object whose message INBOX already holds is still skipped. |
 | `--import-delay` | `0` | Pause after each imported message (Go duration, for example `200ms`). |
 | `--cleanup-db` | `true` | Delete the temporary SQLite file at the end. |
 | `--fts-retention` | `[cleanup] fts_retention` | As for `import maildir`. |
@@ -446,9 +446,10 @@ How it works:
    temporary directory. Every run creates a file of its own, readable by its owner only, so
    runs for several users can go in parallel.
 2. For each object, it skips it when a live message of the account already has that content hash
-   (unless `--force-reimport`). Otherwise it downloads and decrypts the object, parses it, and
-   inserts it into **INBOX**: S3 holds no folder information. INTERNALDATE and sent date are the
-   `Date:` header (or the current time), and the message has no flags.
+   (with `--force-reimport`, only when that message is in INBOX). Otherwise it downloads and
+   decrypts the object, parses it, and inserts it into **INBOX**: S3 holds no folder
+   information. INTERNALDATE and sent date are the `Date:` header (or the current time), and the
+   message has no flags.
 3. It prints a summary. If any object failed, the command exits `1`.
 
 Running it again is safe: imported objects are skipped as existing.

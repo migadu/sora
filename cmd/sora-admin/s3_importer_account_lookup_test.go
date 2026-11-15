@@ -30,7 +30,7 @@ func TestS3Importer_AccountLookupErrors(t *testing.T) {
 	}
 	run := func(t *testing.T, dryRun bool) error {
 		t.Helper()
-		si, err := NewS3Importer(context.Background(), rdb, nil, S3ImporterOptions{Email: email, DryRun: dryRun, CleanupDB: true})
+		si, err := NewS3Importer(context.Background(), rdb, nil, S3ImporterOptions{Email: email, DryRun: dryRun, Workers: 1, CleanupDB: true})
 		if err != nil {
 			t.Fatal(err)
 		}

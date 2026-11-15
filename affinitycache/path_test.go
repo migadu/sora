@@ -3,6 +3,7 @@ package affinitycache
 import (
 	"bytes"
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -55,7 +56,8 @@ func TestStoreIsTheConfiguredFile(t *testing.T) {
 }
 
 // assertStoreIsFile opens the store at dbPath, which is <root>/<dir>/affinity.db, and
-// checks that the store data lives in that file and that nothing is created outside dir.
+// checks that the store data lives in that file, that every file SQLite keeps for it is
+// 0600, and that nothing is created outside dir.
 func assertStoreIsFile(t *testing.T, root, dir, dbPath string) {
 	t.Helper()
 	ctx := context.Background()
@@ -69,6 +71,22 @@ func assertStoreIsFile(t *testing.T, root, dir, dbPath string) {
 		AssignedAt: now, ExpiresAt: now.Add(time.Hour), NodeID: "node-1"}
 	if err := store.Set(ctx, entry); err != nil {
 		t.Fatalf("Set() error: %v", err)
+	}
+	err = filepath.WalkDir(root, func(path string, e fs.DirEntry, err error) error {
+		if err != nil || !e.Type().IsRegular() {
+			return err
+		}
+		info, err := e.Info()
+		if err != nil {
+			return err
+		}
+		if mode := info.Mode().Perm(); mode != 0600 {
+			t.Errorf("%s has mode %o, want 600", path, mode)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close() error: %v", err)

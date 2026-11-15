@@ -1119,6 +1119,11 @@ type LookupCacheConfig struct {
 	MaxSize                    int    `toml:"max_size"`                     // Maximum number of cached entries (default: 50000)
 	CleanupInterval            string `toml:"cleanup_interval"`             // How often to clean expired entries (default: "5m")
 	PositiveRevalidationWindow string `toml:"positive_revalidation_window"` // How long to wait before revalidating positive cache with different password (default: "30s")
+
+	// positiveRevalidationWindowSet records that the table names
+	// positive_revalidation_window, which the defaults otherwise fill in; the LMTP
+	// and User API proxies do not apply it.
+	positiveRevalidationWindowSet bool
 }
 
 // DefaultLookupCacheConfig returns sensible defaults for authentication and routing lookup caching
@@ -1148,6 +1153,11 @@ func (c *LookupCacheConfig) UnmarshalTOML(data any) error {
 		return err
 	}
 	*c = LookupCacheConfig(decoded)
+	for key := range data.(map[string]any) { // decodeTable checked it is a table
+		if strings.EqualFold(key, "positive_revalidation_window") {
+			c.positiveRevalidationWindowSet = true
+		}
+	}
 	return nil
 }
 
@@ -3137,6 +3147,12 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it%s", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "), serverTypeKeyNotes[k.name])
 		}
 	}
+	// A type that does not read the table at all was told so about the table above.
+	for _, k := range serverTableKeys {
+		if k.set(s) && slices.Contains(k.tableReadBy, s.Type) && !slices.Contains(k.appliedBy, s.Type) {
+			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it%s", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "), serverTypeKeyNotes[k.name])
+		}
+	}
 	// Only these filter clients by address. Every other type, the User API proxy
 	// included, serves every client whatever the list says.
 	if len(s.AllowedHosts) > 0 {
@@ -3200,7 +3216,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has 'remote_tls_use_starttls' configured, but the User API proxy speaks HTTP to its backends: 'remote_tls' alone selects HTTPS, there is no STARTTLS", s.Name, s.Type)
 		}
 		if s.RemoteLookup != nil && s.RemoteLookup.RemoteTLSUseStartTLS {
-			logger("WARNING: Server %s (type: %s) has 'remote_lookup.remote_tls_use_starttls' configured, but the User API proxy speaks HTTP to its backends: 'remote_lookup.remote_tls' alone selects HTTPS, there is no STARTTLS", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'remote_lookup.remote_tls_use_starttls' configured, but the User API proxy speaks HTTP to its backends and dials a backend a lookup names with the block's own settings: 'remote_tls' alone selects HTTPS, there is no STARTTLS", s.Name, s.Type)
 		}
 	} else {
 		// STARTTLS is a way of doing remote_tls: without it the backend leg is plaintext.
@@ -3336,7 +3352,7 @@ var serverTypeKeys = []struct {
 	// the Admin API and the metrics listener look up no credentials to cache.
 	{"remote_lookup", func(s *ServerConfig) bool { return s.RemoteLookup != nil }, proxyServerTypes},
 	{"auth_rate_limit", func(s *ServerConfig) bool { return s.AuthRateLimit != nil }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "http_user_api", "user_api_proxy"}},
-	{"lookup_cache", func(s *ServerConfig) bool { return s.LookupCache != nil }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_user_api", "user_api_proxy"}},
+	{"lookup_cache", func(s *ServerConfig) bool { return s.LookupCache != nil }, lookupCacheServerTypes},
 	// Session timeouts. The LMTP backend's command_timeout is its idle timeout, and
 	// the LMTP proxy's timeouts are auth_idle_timeout and absolute_session_timeout.
 	// The HTTP servers time out no sessions, and each per-command table is its own
@@ -3357,20 +3373,56 @@ var serverTypeKeys = []struct {
 	{"proxy_protocol_timeout", func(s *ServerConfig) bool { return s.ProxyProtocolTimeout != "" }, listenerServerTypes},
 }
 
-// serverTypeKeyNotes ends the warning about a serverTypeKeys key with the setting
-// that applies in its place.
+// serverTableKeys is each [server.remote_lookup] and [server.lookup_cache] key that
+// only some of the server types reading its table read, with the types reading the
+// table and those reading the key. WarnUnusedConfigOptions reports one set on a type
+// that reads the table but not the key. A new key of either table that not every
+// reader of the table reads belongs here; remote_lookup.remote_tls_use_starttls has a
+// warning of its own, as the User API proxy has no STARTTLS at all.
+var serverTableKeys = []struct {
+	name        string
+	set         func(*ServerConfig) bool
+	tableReadBy []string
+	appliedBy   []string
+}{
+	// Only the LMTP proxy answers for a recipient the lookup does not know.
+	{"remote_lookup.user_not_found_response", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.UserNotFoundResponse != "" }, proxyServerTypes, []string{"lmtp_proxy"}},
+	// The backend leg to a backend the lookup names, read where the [[server]] key of
+	// the same name is. The User API proxy dials it with the block's own settings.
+	{"remote_lookup.remote_tls", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteTLS }, proxyServerTypes, lineProxyServerTypes},
+	{"remote_lookup.remote_tls_verify", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteTLSVerify != nil }, proxyServerTypes, lineProxyServerTypes},
+	{"remote_lookup.remote_use_proxy_protocol", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseProxyProtocol }, proxyServerTypes, lineProxyServerTypes},
+	{"remote_lookup.remote_use_id_command", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseIDCommand }, proxyServerTypes, []string{"imap_proxy"}},
+	{"remote_lookup.remote_use_xclient", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseXCLIENT }, proxyServerTypes, []string{"pop3_proxy", "lmtp_proxy"}},
+	{"remote_lookup.remote_use_utf8", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseUTF8 }, proxyServerTypes, []string{"pop3_proxy"}},
+	// These route-only proxies check no passwords, so have none to revalidate.
+	{"lookup_cache.positive_revalidation_window", func(s *ServerConfig) bool {
+		return s.LookupCache != nil && s.LookupCache.positiveRevalidationWindowSet
+	}, lookupCacheServerTypes, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "http_user_api"}},
+}
+
+// serverTypeKeyNotes ends the warning about a serverTypeKeys or serverTableKeys key
+// with the setting that applies in its place, or why none does.
 var serverTypeKeyNotes = map[string]string{
-	"supported_extensions": "; a ManageSieve server advertises the [sieve] enabled_extensions",
+	"supported_extensions":                      "; a ManageSieve server advertises the [sieve] enabled_extensions",
+	"remote_lookup.remote_tls":                  "; the User API proxy dials a backend a lookup names with the block's own 'remote_tls'",
+	"remote_lookup.remote_tls_verify":           "; the User API proxy dials a backend a lookup names with the block's own 'remote_tls_verify'",
+	"remote_lookup.remote_use_proxy_protocol":   "; the User API proxy dials a backend a lookup names with the block's own 'remote_use_proxy_protocol'",
+	"lookup_cache.positive_revalidation_window": "; LMTP and User API proxies cache routes without checking passwords",
 }
 
 // loginServerTypes are the IMAP, POP3 and ManageSieve servers and proxies, the line
 // protocols with a password login (the HTTP User API's login reads none of the keys
-// they share); proxyServerTypes dial backends; listenerServerTypes serve TLS and read
-// PROXY headers on the listener (every type but metrics).
+// they share); proxyServerTypes dial backends, lineProxyServerTypes over the mail
+// protocols; lookupCacheServerTypes cache credential or route lookups;
+// listenerServerTypes serve TLS and read PROXY headers on the listener (every type but
+// metrics).
 var (
-	loginServerTypes    = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
-	proxyServerTypes    = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
-	listenerServerTypes = []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_admin_api", "http_user_api", "user_api_proxy"}
+	loginServerTypes       = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
+	proxyServerTypes       = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
+	lineProxyServerTypes   = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}
+	lookupCacheServerTypes = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_user_api", "user_api_proxy"}
+	listenerServerTypes    = []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_admin_api", "http_user_api", "user_api_proxy"}
 )
 
 // serverLimitKeys is every [server.limits] key with the server types whose start

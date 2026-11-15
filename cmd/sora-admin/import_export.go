@@ -157,6 +157,11 @@ Examples:
 		os.Exit(1)
 	}
 
+	if *jobs < 1 {
+		fmt.Printf("Error: --jobs must be at least 1\n")
+		os.Exit(1)
+	}
+
 	// Parse date filters
 	var startDateParsed, endDateParsed *time.Time
 	if *startDate != "" {
@@ -271,7 +276,7 @@ func handleImportS3(ctx context.Context) {
 	workers := fs.Int("workers", 5, "Number of concurrent workers")
 	dryRun := fs.Bool("dry-run", false, "Show what would be imported without making changes")
 	showProgress := fs.Bool("show-progress", true, "Show import progress")
-	forceReimport := fs.Bool("force-reimport", false, "Force reimport even if message already exists")
+	forceReimport := fs.Bool("force-reimport", false, "Import into INBOX even when another mailbox of the account holds the message")
 	cleanupDB := fs.Bool("cleanup-db", true, "Cleanup temporary database when done")
 	importDelay := fs.Duration("import-delay", 0, "Delay between imports to control rate")
 	continuationToken := fs.String("continuation-token", "", "S3 continuation token to resume from")
@@ -286,6 +291,9 @@ func handleImportS3(ctx context.Context) {
 	// Validate required flags
 	if *email == "" {
 		logger.Fatal("--email is required (e.g., 'user@example.com')")
+	}
+	if *workers < 1 {
+		logger.Fatal("--workers must be at least 1")
 	}
 	ftsRetentionParsed, err := resolveImportFTSRetention(*ftsRetention)
 	if err != nil {
@@ -438,6 +446,11 @@ Examples:
 	if *maildirPath == "" {
 		fmt.Printf("Error: --maildir-path is required\n\n")
 		fs.Usage()
+		os.Exit(1)
+	}
+
+	if *jobs < 1 {
+		fmt.Printf("Error: --jobs must be at least 1\n")
 		os.Exit(1)
 	}
 

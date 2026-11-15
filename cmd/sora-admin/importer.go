@@ -186,6 +186,10 @@ const maildirCacheParams = "_journal_mode=WAL&_busy_timeout=5000&_synchronous=NO
 
 // NewImporter creates a new Importer instance.
 func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ImporterOptions) (*Importer, error) {
+	// The import runs on exactly this many workers: with none it would never drain its queue.
+	if jobs < 1 {
+		return nil, fmt.Errorf("jobs must be at least 1, got %d", jobs)
+	}
 	// Always create SQLite database in the maildir path to persist maildir state
 	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
 
@@ -1354,6 +1358,16 @@ func isMaildirFolder(path string) bool {
 	return true
 }
 
+// isMaildirMessageDir reports whether name is one of a maildir folder's message
+// directories, which hold message files and never a folder.
+func isMaildirMessageDir(name string) bool {
+	switch name {
+	case "cur", "new", "tmp":
+		return true
+	}
+	return false
+}
+
 // fileToProcess is a struct to send file info to worker goroutines for processing.
 type fileToProcess struct {
 	path        string
@@ -1497,13 +1511,20 @@ func (i *Importer) scanMaildir() error {
 			// A folder below the root that is a symbolic link is not followed either: a
 			// link to a folder of the same maildir is an alias (dsync skips those too),
 			// and one pointing elsewhere would have the import read outside the path it
-			// was given. It is named, so its mail is never left out without a word.
-			// cur/ and new/ are read through a link (os.ReadDir below).
+			// was given. It is named, so its mail is never left out without a word; so is
+			// a link whose target cannot be read (a volume that is not mounted), which
+			// may be a folder too. cur/, new/ and tmp/ and the message files in them are
+			// not folders: they are read through a link (os.ReadDir, hashFile below), and
+			// a message that cannot be read is refused by path.
 			if info.Mode()&os.ModeSymlink != 0 {
-				switch info.Name() {
-				case "cur", "new", "tmp":
-				default:
-					if target, statErr := os.Stat(walked); statErr == nil && target.IsDir() {
+				parent := filepath.Dir(walked)
+				// The root itself may be named cur, new or tmp; only a message
+				// directory below it makes this entry a message rather than a folder.
+				inMessageDir := parent != walkRoot && isMaildirMessageDir(filepath.Base(parent))
+				if !isMaildirMessageDir(info.Name()) && !inMessageDir {
+					if target, statErr := os.Stat(walked); statErr != nil {
+						logger.Warn("Skipping maildir entry: it is a symbolic link whose target cannot be read", "path", path, "error", statErr)
+					} else if target.IsDir() {
 						logger.Warn("Skipping maildir folder: it is a symbolic link, which the import does not follow", "path", path)
 					}
 				}
