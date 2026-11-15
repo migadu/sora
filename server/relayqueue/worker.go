@@ -74,7 +74,9 @@ type Worker struct {
 //   - batchSize: Maximum messages to process per interval
 //   - concurrency: Number of messages to process concurrently
 //   - cleanupInterval: How often to clean up old failed messages
-//   - failedRetention: How long to retain failed messages before deletion
+//   - failedRetention: How long to retain failed messages before deletion; 0 (or less)
+//     keeps them until they are deleted or requeued. The 7-day default for an unset
+//     failed_retention is applied by the config.
 //   - errCh: Channel for error reporting (can be nil)
 func NewWorker(queue RelayQueue, relayHandler RelayHandler, interval time.Duration, batchSize, concurrency int, cleanupInterval, failedRetention time.Duration, errCh chan<- error) *Worker {
 	if batchSize <= 0 {
@@ -85,9 +87,6 @@ func NewWorker(queue RelayQueue, relayHandler RelayHandler, interval time.Durati
 	}
 	if cleanupInterval <= 0 {
 		cleanupInterval = 1 * time.Hour // Default 1 hour
-	}
-	if failedRetention <= 0 {
-		failedRetention = 168 * time.Hour // Default 7 days
 	}
 
 	return &Worker{

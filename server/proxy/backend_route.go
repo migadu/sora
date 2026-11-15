@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"slices"
+	"strings"
 	"syscall"
 )
 
@@ -38,6 +39,12 @@ func (cm *ConnectionManager) BindBackendRoute(poolName, addr string) (*BackendRo
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
+		if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+			host = host[1 : len(host)-1]
+		}
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
 	}
 	r.names = append(cm.configuredHostnamesOfLocked(addr), host)
 	if !cm.HasNamedPools() {
@@ -215,9 +222,9 @@ func (r *BackendRoute) DialContext(ctx context.Context, network, address string)
 // for a caller that dials through its own transport instead of ConnectWithProxy (the
 // User API proxy). It counts a pool member's dials as ConnectWithProxy does: a dial the
 // proxy refused itself (maintenance, pool ownership) says nothing about the backend, and
-// a failure counts only while the supplied dial context is live. An HTTP transport can
-// keep that dial alive after its initiating request is canceled, and its independent
-// backend outcome still counts. A backend outside the pools
+// a failure counts only while the supplied dial context is live and within its deadline
+// (callerGaveUp). An HTTP transport can keep that dial alive after its initiating
+// request is canceled, and its independent backend outcome still counts. A backend outside the pools
 // (a lookup pin) is not recorded: ConnectWithProxy keeps such pins in a record of their
 // own (IsRemoteLookupBackendHealthy) to refuse them early, but the User API proxy dials a
 // pin whatever its health, so nothing would read it.
@@ -231,7 +238,7 @@ func (r *BackendRoute) RecordDialOutcome(ctx context.Context, err error) {
 		cm.RecordConnectionSuccess(r.addr)
 	case errors.Is(err, errBackendInMaintenance), errors.Is(err, errMaintenanceNotLoaded),
 		errors.Is(err, ErrBackendOutsidePool), errors.Is(err, ErrAmbiguousBackendPool):
-	case ctx.Err() == nil:
+	case !callerGaveUp(ctx):
 		cm.RecordConnectionFailure(r.addr)
 	}
 }

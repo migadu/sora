@@ -11,8 +11,8 @@ import (
 // SoraTLSConn accepted from an implicit-TLS listener must refuse Read/Write
 // until PerformHandshake has run. Without the guard, a listener-composition
 // regression (a wrapper hiding the SoraTLSConn from the handshake trigger)
-// silently degrades to a plaintext greeting on a TLS port — the Shape-A
-// failure documented in docs/proxy-protocol-tls-composition.md.
+// silently degrades to a plaintext greeting on a TLS port — the
+// failure described in docs/HACKING.md, section 6.5.
 func TestSoraTLSConnRefusesIOBeforeHandshake(t *testing.T) {
 	clientEnd, serverEnd := net.Pipe()
 	defer clientEnd.Close()

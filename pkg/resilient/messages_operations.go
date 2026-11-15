@@ -160,7 +160,10 @@ func (rd *ResilientDatabase) SearchMessagesSortedWithRetry(ctx context.Context, 
 var destObjectKeepalive = 30 * time.Second
 
 // MoveMessagesWithRetry moves ids from srcMailboxID into destMailboxID, owned by
-// destAccountID, in one write transaction (db.MoveMessages).
+// destAccountID, in one write transaction (db.MoveMessages). sourceHashes are the hashes,
+// by source UID, whose bodies the caller made available under destAccountID's key; a
+// cross-account source renamed since fails the move with db.ErrMoveSourceChanged, which
+// is not retried (a retry would carry the same stale hashes).
 //
 // destObjects are the bodies of a cross-account move that are in S3 under their source
 // key. The moved rows point at destAccountID's key, and ensureDestObject makes the
@@ -181,7 +184,7 @@ var destObjectKeepalive = 30 * time.Second
 // move with a *DestObjectError, which the write circuit breaker does not count and the
 // retry does not repeat (the S3 calls retry on their own). A statement keeps the
 // transaction alive at least every destObjectKeepalive.
-func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, destObjects []string, ensureDestObject func(ctx context.Context, contentHash string) error) (map[imap.UID]imap.UID, error) {
+func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string, destObjects []string, ensureDestObject func(ctx context.Context, contentHash string) error) (map[imap.UID]imap.UID, error) {
 	op := func(opCtx context.Context, tx pgx.Tx) (any, error) {
 		if len(destObjects) > 0 {
 			if err := db.LockS3ObjectsSharedInTx(opCtx, tx, destAccountID, destObjects); err != nil {
@@ -194,7 +197,7 @@ func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]i
 			defer cancel()
 			opCtx = writeCtx
 		}
-		return rd.getOperationalDatabaseForOperation(opCtx, true).MoveMessages(opCtx, tx, ids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID, destObjects)
+		return rd.getOperationalDatabaseForOperation(opCtx, true).MoveMessages(opCtx, tx, ids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID, sourceHashes, destObjects)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
 	if err != nil {

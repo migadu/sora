@@ -13,8 +13,11 @@ import (
 // which answers the lookup's users from the database (550 5.1.1, so their mail bounces).
 func TestNew_InvalidRemoteLookupFailsWithLookupLocalUsers(t *testing.T) {
 	for name, lookup := range map[string]*config.RemoteLookupConfig{
-		"plaintext_url":   {Enabled: true, LookupLocalUsers: true, URL: "http://lookup.example.com/lookup?email=$email"},
-		"invalid_timeout": {Enabled: true, LookupLocalUsers: true, URL: "http://127.0.0.1:1/lookup?email=$email", Timeout: "5"},
+		"plaintext_url":      {Enabled: true, LookupLocalUsers: true, URL: "http://lookup.example.com/lookup?email=$email"},
+		"invalid_timeout":    {Enabled: true, LookupLocalUsers: true, URL: "http://127.0.0.1:1/lookup?email=$email", Timeout: "5"},
+		"placeholder_host":   {Enabled: true, LookupLocalUsers: true, URL: "https://$email.lookup.example.com/lookup"},
+		"missing_host":       {Enabled: true, LookupLocalUsers: true, URL: "https:///lookup?email=$email"},
+		"unsupported_scheme": {Enabled: true, LookupLocalUsers: true, URL: "ftp://localhost/lookup?email=$email"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			srv, err := New(context.Background(), &resilient.ResilientDatabase{}, "localhost", ServerOptions{

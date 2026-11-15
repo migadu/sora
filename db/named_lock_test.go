@@ -108,3 +108,93 @@ func TestReleaseDoesNotRevokeALaterHolder(t *testing.T) {
 
 	require.NoError(t, database.ReleaseNamedLock(ctx, current))
 }
+
+// TestNamedLockExtensionOutlivesItsTTL covers work that runs longer than the lock was
+// taken for. An extended lock must not be taken over at its original expiry, and must
+// still be released by the token it was granted with.
+func TestNamedLockExtensionOutlivesItsTTL(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	ctx := context.Background()
+	database := setupTestDatabase(t)
+	defer database.Close()
+
+	name := fmt.Sprintf("test-lock-extend-%d", time.Now().UnixNano())
+
+	lock, err := database.TryAcquireNamedLock(ctx, name, time.Millisecond)
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+
+	// Past its expiry but never taken over, the lock is still the holder's.
+	time.Sleep(10 * time.Millisecond)
+	extended, err := database.ExtendNamedLock(ctx, lock, time.Minute)
+	require.NoError(t, err)
+	require.True(t, extended, "a lock nobody took over could not be extended by its holder")
+
+	intruder, err := database.TryAcquireNamedLock(ctx, name, time.Minute)
+	require.NoError(t, err)
+	require.Nil(t, intruder, "an extended lock was taken over at its original expiry: a second "+
+		"node starts the work while the holder is still doing it")
+
+	// A shorter extension does not shorten it.
+	extended, err = database.ExtendNamedLock(ctx, lock, time.Millisecond)
+	require.NoError(t, err)
+	require.True(t, extended)
+	time.Sleep(10 * time.Millisecond)
+	intruder, err = database.TryAcquireNamedLock(ctx, name, time.Minute)
+	require.NoError(t, err)
+	require.Nil(t, intruder, "a shorter extension cut the lock short")
+
+	require.NoError(t, database.ReleaseNamedLock(ctx, lock))
+	next, err := database.TryAcquireNamedLock(ctx, name, time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, next, "an extended lock was not released by its own token")
+	require.NoError(t, database.ReleaseNamedLock(ctx, next))
+}
+
+// TestExtendDoesNotReviveASupersededLock is the fencing-token case for extensions: a
+// holder whose lock expired and was taken over must learn that it lost it, and must not
+// move the new holder's expiry.
+func TestExtendDoesNotReviveASupersededLock(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	ctx := context.Background()
+	database := setupTestDatabase(t)
+	defer database.Close()
+
+	name := fmt.Sprintf("test-lock-extend-fencing-%d", time.Now().UnixNano())
+
+	stale, err := database.TryAcquireNamedLock(ctx, name, time.Millisecond)
+	require.NoError(t, err)
+	require.NotNil(t, stale)
+
+	var current *NamedLock
+	require.Eventually(t, func() bool {
+		current, err = database.TryAcquireNamedLock(ctx, name, time.Millisecond)
+		return err == nil && current != nil
+	}, 5*time.Second, 50*time.Millisecond)
+
+	extended, err := database.ExtendNamedLock(ctx, stale, time.Hour)
+	require.NoError(t, err)
+	require.False(t, extended, "a superseded holder extended the lock another node now holds")
+
+	// The current holder's lock still expires when it was going to.
+	require.Eventually(t, func() bool {
+		taken, err := database.TryAcquireNamedLock(ctx, name, time.Minute)
+		if err != nil || taken == nil {
+			return false
+		}
+		require.NoError(t, database.ReleaseNamedLock(ctx, taken))
+		return true
+	}, 5*time.Second, 50*time.Millisecond, "a superseded holder's extension kept the current "+
+		"holder's lock from expiring")
+
+	// Nor can a lock whose row has since been taken over and released.
+	extended, err = database.ExtendNamedLock(ctx, current, time.Minute)
+	require.NoError(t, err)
+	require.False(t, extended, "a lock that was taken over was extended by its former holder")
+}

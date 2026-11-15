@@ -24,7 +24,10 @@ func TestRestageFTSCreatesDestinationPair(t *testing.T) {
 		t.Skip("Skipping database integration test in short mode")
 	}
 
-	db, _, accountID, mailboxID := setupCleanerTestDatabase(t)
+	// A database of its own: ProcessFTSBatch below polls the whole FTS queue oldest first,
+	// so in the shared database 500 rows queued by other packages or earlier runs would
+	// fill the batch before it reached this test's row.
+	db, _, accountID, mailboxID := setupCleanerTestDatabaseWithSuffix(t, "_ftsqueue")
 	defer db.Close()
 
 	ctx := context.Background()
@@ -287,7 +290,7 @@ func TestSameAccountMoveCopyTakeNoFTSLocks(t *testing.T) {
 		require.NoError(t, err)
 		defer tx.Rollback(ctx)
 		moveUIDs := append([]imap.UID(nil), uids...)
-		moved, err := db.MoveMessages(ctx, tx, &moveUIDs, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil)
+		moved, err := db.MoveMessages(ctx, tx, &moveUIDs, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil, nil)
 		require.NoError(t, err)
 		require.Len(t, moved, n)
 		assert.Equal(t, 0, ftsLocksHeld(t, ctx, tx), "a same-account MOVE took one FTS lock per body")
@@ -344,7 +347,7 @@ func TestCrossAccountMoveCopyStageDestinationFTSRow(t *testing.T) {
 	tx, err = db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	moveUIDs := []imap.UID{9702}
-	_, err = db.MoveMessages(ctx, tx, &moveUIDs, inboxA, sharedB, ownerB, "example.net", "b", "test-instance", nil)
+	_, err = db.MoveMessages(ctx, tx, &moveUIDs, inboxA, sharedB, ownerB, "example.net", "b", "test-instance", map[imap.UID]string{9702: moveHash}, nil)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit(ctx))
 
