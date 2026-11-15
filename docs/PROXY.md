@@ -962,7 +962,7 @@ Sora logs `AuthCache: Failed to initialize - continuing without auth cache` and 
 | Key (`[auth_cache]`) | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Turn the cache on. |
-| `path` | `/tmp/sora/auth_cache.db` | The SQLite file. |
+| `path` | `/var/cache/sora/auth_cache.db` | The SQLite file. |
 | `max_age` | `24h` | Entries older than this are not used, and are deleted at cleanup. |
 | `purge_unused` | `168h` | Entries not used for this long are deleted at cleanup. |
 | `cleanup_interval` | `1h` | How often cleanup runs. |

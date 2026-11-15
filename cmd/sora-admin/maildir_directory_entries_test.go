@@ -135,7 +135,7 @@ func testExportFoldersNamedAfterDirectoryEntries(t *testing.T, mailboxes []strin
 		if uidList := importer.dovecotUIDLists[dir]; assert.NotNil(t, uidList, "dovecot-uidlist of %q", mbox) {
 			assert.Equal(t, uint32(100+idx), uidList.UIDValidity, "UIDVALIDITY of %q", mbox)
 		}
-		kws, err := parseKeywordsFile(filepath.Join(dir, "dovecot-keywords"))
+		kws, err := parseKeywordsFile(filepath.Join(dir, "dovecot-keywords"), os.ReadFile)
 		if assert.NoError(t, err, "dovecot-keywords of %q", mbox) {
 			assert.Equal(t, map[int]string{0: "$Important"}, kws, "dovecot-keywords of %q", mbox)
 		}

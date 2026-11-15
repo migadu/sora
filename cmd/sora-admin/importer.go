@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -134,6 +135,7 @@ type failedImport struct {
 type Importer struct {
 	ctx         context.Context // Context for cancellation support
 	maildirPath string
+	root        *os.Root // the maildir, which every file below it is read through (openMaildirFile)
 	email       string
 	jobs        int
 	sqliteDB    *sql.DB // SQLite database for caching (nil in non-incremental mode)
@@ -300,9 +302,16 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		batchSize = options.BatchSize
 	}
 
+	root, err := os.OpenRoot(filepath.Clean(maildirPath))
+	if err != nil {
+		sqliteDB.Close()
+		return nil, fmt.Errorf("failed to open maildir: %w", err)
+	}
+
 	importer := &Importer{
 		ctx:             ctx,
 		maildirPath:     maildirPath,
+		root:            root,
 		email:           email,
 		jobs:            jobs,
 		sqliteDB:        sqliteDB,
@@ -339,6 +348,9 @@ func (i *Importer) recordFailedPath(path, reason string) {
 // Close closes the importer and its resources. The maildir database file stays on
 // disk: Run removes it for --cleanup-db, and only after an import that succeeded.
 func (i *Importer) Close() error {
+	if i.root != nil {
+		i.root.Close()
+	}
 	if i.sqliteDB != nil {
 		if err := i.sqliteDB.Close(); err != nil {
 			return fmt.Errorf("failed to close maildir database: %w", err)
@@ -619,7 +631,7 @@ func (i *Importer) processSubscriptions() error {
 	logger.Info("Processing Dovecot subscriptions", "path", subscriptionsPath)
 
 	// Read the subscriptions file
-	content, err := os.ReadFile(subscriptionsPath)
+	content, err := i.readMaildirFile(subscriptionsPath)
 	if err != nil {
 		return fmt.Errorf("failed to read subscriptions file: %w", err)
 	}
@@ -789,7 +801,7 @@ func (i *Importer) parseDovecotKeywords() error {
 
 	logger.Info("Parsing Dovecot keywords", "path", keywordsPath)
 
-	keywords, err := parseKeywordsFile(keywordsPath)
+	keywords, err := parseKeywordsFile(keywordsPath, i.readMaildirFile)
 	if err != nil {
 		return err
 	}
@@ -923,7 +935,7 @@ func (i *Importer) performDryRun() error {
 
 		// Try to get subject from the first KB of the message, decompressed as the
 		// import reads it
-		if head := messageHead(path, 1024); head != "" {
+		if head := i.messageHead(path, 1024); head != "" {
 			// Simple subject extraction
 			if idx := strings.Index(strings.ToLower(head), "subject:"); idx != -1 {
 				subjectLine := head[idx+8:]
@@ -1059,21 +1071,25 @@ func importSizeLimit(maxSize int64, compressed bool) int64 {
 	return limit
 }
 
-// hashFile returns the content hash (helpers.HashContent) and size of the message in a
-// maildir file, decompressing it the way the upload does. It streams the file, so the
-// scan never holds a whole message in memory.
+// hashMaildirFile is hashMessageFile of the maildir file at path (openMaildirFile).
+func (i *Importer) hashMaildirFile(path string) (string, int64, error) {
+	file, err := i.openMaildirFile(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer file.Close()
+	return hashMessageFile(file, i.options.MaxMessageSize)
+}
+
+// hashMessageFile returns the content hash (helpers.HashContent) and size of the
+// message in a maildir file, decompressing it the way the upload does. It streams the
+// file, so the scan never holds a whole message in memory.
 //
 // It reads no more of the message than the import takes (importSizeLimit). Past that
 // it fails with errMessageTooLarge without reading the rest: a compressed file of a
 // few hundred bytes can expand to gigabytes, and hashing all of it only to refuse it
 // afterwards keeps a scan worker busy for as long as that takes.
-func hashFile(path string, maxSize int64) (string, int64, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", 0, err
-	}
-	defer file.Close()
-
+func hashMessageFile(file *os.File, maxSize int64) (string, int64, error) {
 	reader, compressed, err := maildirContentReader(file)
 	if err != nil {
 		return "", 0, err
@@ -1095,11 +1111,11 @@ func hashFile(path string, maxSize int64) (string, int64, error) {
 	return hex.EncodeToString(hasher.Sum(nil)), size, nil
 }
 
-// messageHead returns up to n bytes from the start of the message in a maildir file,
-// decompressed as the import reads it (maildirContentReader), or "" when the file cannot
-// be read.
-func messageHead(path string, n int) string {
-	file, err := os.Open(path)
+// messageHead returns up to n bytes from the start of the message in a maildir file
+// (openMaildirFile), decompressed as the import reads it (maildirContentReader), or ""
+// when the file cannot be read.
+func (i *Importer) messageHead(path string, n int) string {
+	file, err := i.openMaildirFile(path)
 	if err != nil {
 		return ""
 	}
@@ -1342,6 +1358,69 @@ func (i *Importer) isMessageAlreadyImported(hash string, mailboxID int64) (bool,
 	return count > 0, nil
 }
 
+// openMaildirFile opens path, a file below the maildir (as the scan names it, or as the
+// import cache holds it), through the maildir root. The root follows a symbolic link
+// only to a file below it: a link pointing out of the maildir, or an absolute one, does
+// not open, wherever it is in the path (a cur/ or new/ directory as well as a message
+// or metadata file) and however it changes while the import runs. The maildir may have
+// been written by its owner, and the import runs with privileges the owner lacks: a
+// link must not choose which files those privileges read into the owner's mailbox.
+// Folders that are links are not walked at all (scanMaildir).
+func (i *Importer) openMaildirFile(path string) (*os.File, error) {
+	name, err := i.maildirName(path)
+	if err != nil {
+		return nil, err
+	}
+	return i.root.Open(name)
+}
+
+// readMaildirFile is os.ReadFile through the maildir root (openMaildirFile).
+func (i *Importer) readMaildirFile(path string) ([]byte, error) {
+	name, err := i.maildirName(path)
+	if err != nil {
+		return nil, err
+	}
+	return i.root.ReadFile(name)
+}
+
+// readMaildirDir is os.ReadDir through the maildir root (openMaildirFile).
+func (i *Importer) readMaildirDir(path string) ([]os.DirEntry, error) {
+	name, err := i.maildirName(path)
+	if err != nil {
+		return nil, err
+	}
+	return fs.ReadDir(i.root.FS(), filepath.ToSlash(name))
+}
+
+// maildirName returns the name of path below the maildir root. A path the cache holds
+// from a run given another spelling of the maildir (a link to it, or the directory a
+// link names) is named by its resolved directory; the root still decides what the name
+// reaches.
+func (i *Importer) maildirName(path string) (string, error) {
+	if name, err := filepath.Rel(filepath.Clean(i.maildirPath), path); err == nil && filepath.IsLocal(name) {
+		return name, nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err != nil {
+		return "", err
+	}
+	root, err := filepath.Abs(i.maildirPath)
+	if err == nil {
+		root, err = filepath.EvalSymlinks(root)
+	}
+	if err != nil {
+		return "", err
+	}
+	if name, err := filepath.Rel(root, filepath.Join(dir, filepath.Base(abs))); err == nil && filepath.IsLocal(name) {
+		return name, nil
+	}
+	return "", fmt.Errorf("%s is not below the maildir %s", path, i.maildirPath)
+}
+
 // isMaildirFolder checks if a directory is a valid maildir folder.
 func isMaildirFolder(path string) bool {
 	// A maildir folder is one that holds messages: cur/ or new/. tmp/ is where a
@@ -1459,7 +1538,7 @@ func (i *Importer) scanMaildir() error {
 				// Use streaming hash function
 				// Every file the scan drops is reported by path at the end: a message that
 				// never reaches the cache is otherwise invisible to every later count.
-				hash, size, err := hashFile(file.path, i.options.MaxMessageSize)
+				hash, size, err := i.hashMaildirFile(file.path)
 				if errors.Is(err, errMessageTooLarge) {
 					refuse(file, fmt.Sprintf("invalid message: %v", err))
 					continue
@@ -1514,8 +1593,9 @@ func (i *Importer) scanMaildir() error {
 			// was given. It is named, so its mail is never left out without a word; so is
 			// a link whose target cannot be read (a volume that is not mounted), which
 			// may be a folder too. cur/, new/ and tmp/ and the message files in them are
-			// not folders: they are read through a link (os.ReadDir, hashFile below), and
-			// a message that cannot be read is refused by path.
+			// not folders: they are read through the maildir root (openMaildirFile),
+			// which follows a link only within the maildir. A cur/ or new/ it does not
+			// read is named below, and a message file it does not read is refused by path.
 			if info.Mode()&os.ModeSymlink != 0 {
 				parent := filepath.Dir(walked)
 				// The root itself may be named cur, new or tmp; only a message
@@ -1572,9 +1652,16 @@ func (i *Importer) scanMaildir() error {
 			// This is a maildir folder, process the messages within it.
 			// Only scan 'cur' and 'new' directories (skip 'tmp' as it contains incomplete messages)
 			for _, subDir := range []string{"cur", "new"} {
-				messages, err := os.ReadDir(filepath.Join(path, subDir))
-				if err != nil {
+				messages, err := i.readMaildirDir(filepath.Join(path, subDir))
+				if os.IsNotExist(err) {
+					// A folder may hold only one of cur/ and new/ (isMaildirFolder).
 					logger.Info("Failed to read directory", "path", filepath.Join(path, subDir), "error", err)
+					continue
+				}
+				if err != nil {
+					// One that exists and is not read (a link out of the maildir, no
+					// permission) leaves its messages out of the import: name it.
+					logger.Warn("Skipping maildir message directory: it cannot be read", "path", filepath.Join(path, subDir), "error", err)
 					continue
 				}
 
@@ -1595,7 +1682,7 @@ func (i *Importer) scanMaildir() error {
 
 			// Parse dovecot-uidlist if preserving UIDs
 			if i.options.PreserveUIDs {
-				uidList, err := ParseDovecotUIDList(path)
+				uidList, err := parseDovecotUIDListFile(i.openMaildirFile(filepath.Join(path, "dovecot-uidlist")))
 				if err != nil {
 					logger.Info("Warning: Failed to parse dovecot-uidlist", "path", path, "error", err)
 				} else if uidList != nil {
@@ -1744,7 +1831,7 @@ func (i *Importer) findMovedFile(originalPath string) (string, bool) {
 	}
 	prefix := parts[0] + ":2,"
 
-	entries, err := os.ReadDir(dir)
+	entries, err := i.readMaildirDir(dir)
 	if err != nil {
 		return "", false
 	}
@@ -1930,19 +2017,24 @@ func (z *maildirZstdReader) Close() error {
 // compression bomb cannot exhaust memory in the upload or keep the scan busy.
 const maxDecompressedSize = 256 << 20 // 256 MiB
 
-// readMessage returns the message in a maildir file, decompressed as hashFile reads it
-// (maildirContentReader). Like hashFile it reads no more of the message than the import
-// takes (importSizeLimit), and past that fails with errMessageTooLarge without reading
-// the rest: the file may have grown since the scan sized it, or this run's scan may not
-// have visited it (--paths-file), so only what is read now can decide, and refusing it
-// must not cost memory in proportion to the file.
-func readMessage(path string, maxSize int64) ([]byte, error) {
-	file, err := os.Open(path)
+// readMaildirMessage is readMessageFile of the maildir file at path (openMaildirFile).
+func (i *Importer) readMaildirMessage(path string) ([]byte, error) {
+	file, err := i.openMaildirFile(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
+	return readMessageFile(file, i.options.MaxMessageSize)
+}
 
+// readMessageFile returns the message in a maildir file, decompressed as
+// hashMessageFile reads it (maildirContentReader). Like hashMessageFile it reads no
+// more of the message than the import takes (importSizeLimit), and past that fails
+// with errMessageTooLarge without reading the rest: the file may have grown since the
+// scan sized it, or this run's scan may not have visited it (--paths-file), so only
+// what is read now can decide, and refusing it must not cost memory in proportion to
+// the file.
+func readMessageFile(file *os.File, maxSize int64) ([]byte, error) {
 	reader, compressed, err := maildirContentReader(file)
 	if err != nil {
 		return nil, err
@@ -2097,8 +2189,8 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 			// earlier run cached under a higher limit, for a file this scan did not
 			// visit (--paths-file), and the file may have changed since the scan. The
 			// cached size may be stale for the same reasons, so the check is on what
-			// would be stored, which readMessage reads no more of than the limit.
-			content, err := readMessage(msg.path, i.options.MaxMessageSize)
+			// would be stored, which readMaildirMessage reads no more of than the limit.
+			content, err := i.readMaildirMessage(msg.path)
 			if os.IsNotExist(err) {
 				// If file not found, it might have been renamed (e.g. flags changed)
 				// Try to find it by unique ID prefix
@@ -2106,7 +2198,7 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 					logger.Info("File moved, found at new path", "old", msg.path, "new", newPath)
 					msg.path = newPath
 					msg.filename = filepath.Base(newPath)
-					content, err = readMessage(newPath, i.options.MaxMessageSize)
+					content, err = i.readMaildirMessage(newPath)
 				}
 			}
 			if err != nil && !errors.Is(err, errMessageTooLarge) {
@@ -2747,7 +2839,7 @@ func (i *Importer) processPathsFile(cleanPath string, filesToProcess chan<- file
 		dir := filepath.Dir(filepath.Dir(fullPath))
 
 		if i.options.PreserveUIDs && !processedDirs[dir] {
-			uidList, err := ParseDovecotUIDList(dir)
+			uidList, err := parseDovecotUIDListFile(i.openMaildirFile(filepath.Join(dir, "dovecot-uidlist")))
 			if err == nil && uidList != nil {
 				i.dovecotUIDLists[dir] = uidList
 				logger.Info("Loaded dovecot-uidlist", "path", dir)
@@ -2883,9 +2975,10 @@ func (i *Importer) getProgressPrefix() string {
 }
 
 // parseKeywordsFile reads one dovecot-keywords file ("<index> <keyword>" per line,
-// index 0-25 ↔ letters a-z in maildir filenames). Malformed lines are skipped.
-func parseKeywordsFile(path string) (map[int]string, error) {
-	content, err := os.ReadFile(path)
+// index 0-25 ↔ letters a-z in maildir filenames) with readFile. Malformed lines are
+// skipped.
+func parseKeywordsFile(path string, readFile func(string) ([]byte, error)) (map[int]string, error) {
+	content, err := readFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read dovecot-keywords file: %w", err)
 	}
@@ -2937,7 +3030,7 @@ func (i *Importer) keywordsForMessagePath(path string) map[int]string {
 		kws = i.dovecotKeywords
 	} else if i.options.Dovecot {
 		if _, err := os.Stat(keywordsPath); err == nil {
-			parsed, perr := parseKeywordsFile(keywordsPath)
+			parsed, perr := parseKeywordsFile(keywordsPath, i.readMaildirFile)
 			if perr != nil {
 				logger.Warn("Failed to read folder dovecot-keywords, importing its messages without keywords", "path", keywordsPath, "error", perr)
 			} else {

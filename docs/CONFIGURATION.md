@@ -490,7 +490,7 @@ See [STORAGE.md](STORAGE.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `path` | string | `"/tmp/sora/cache"` | Cache directory. |
+| `path` | string | `"/var/cache/sora/cache"` | Cache directory. |
 | `capacity` | size | `"1gb"` | Total cache size. |
 | `max_object_size` | size | `"5mb"` | Largest body cached. |
 | `purge_interval` | duration | `"12h"` | How often the cache is trimmed. |
@@ -510,7 +510,7 @@ See [STORAGE.md](STORAGE.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `path` | string | `"/tmp/sora/uploads"` | Staging directory for bodies not yet in S3. |
+| `path` | string | `"/var/spool/sora/uploads"` | Staging directory for bodies not yet in S3. |
 | `instance_id` | string | the host name | The node's upload lease identity. Changing it strands queued uploads: read [STORAGE.md](STORAGE.md) first. |
 | `batch_size` | integer | `10` | Uploads leased per batch. Must be positive. |
 | `concurrency` | integer | `20` | Parallel uploads. Must be positive. |
@@ -693,7 +693,7 @@ A SQLite cache of credentials, used by proxies that check passwords in the datab
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | bool | `false` | |
-| `path` | string | `"/tmp/sora/auth_cache.db"` | Database file. Its directory is created. |
+| `path` | string | `"/var/cache/sora/auth_cache.db"` | Database file. Its directory is created. |
 | `max_age` | duration | `"24h"` | Age after which an entry is fetched again. |
 | `purge_unused` | duration | `"168h"` | Entries unused this long are removed. |
 | `cleanup_interval` | duration | `"1h"` | How often old entries are removed. |
