@@ -196,8 +196,13 @@ func TestClientFilter_AfterEnableDoesNotCascadeFromKeptCapabilities(t *testing.T
 		if resp := c.mustOK("SORT RETURN (MIN) (DATE) UTF-8 1"); !strings.Contains(resp, "* ESEARCH ") {
 			t.Errorf("SORT RETURN (MIN) after ENABLE IMAP4rev2 and ESEARCH filter: want ESEARCH, got:\n%s", resp)
 		}
+		// Probe the handler's capability gate on an independent session. The wire
+		// session is owned by its connection goroutine and may close after SORT;
+		// calling its handler here races Close clearing its authenticated user.
+		gateSession := &IMAPSession{}
+		gateSession.sessionCaps.Store(c.sess.GetCapabilities())
 		err := callHandler(func() error {
-			_, err := c.sess.MultiSearch(context.Background(), &imap.SearchSource{Personal: true}, &imap.SearchCriteria{}, &imap.SearchOptions{ReturnAll: true})
+			_, err := gateSession.MultiSearch(context.Background(), &imap.SearchSource{Personal: true}, &imap.SearchCriteria{}, &imap.SearchOptions{ReturnAll: true})
 			return err
 		})
 		if isBad(err) {
