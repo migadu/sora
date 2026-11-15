@@ -514,7 +514,7 @@ durations.
 | `username_window_duration` | `60m` | Statistics only: how long a name's failure count is kept. |
 | `delay_start_threshold` | `2` | Failures from an IP before its logins are delayed. |
 | `initial_delay` | `1s` | The first delay. |
-| `max_delay` | `30s` | The longest delay. |
+| `max_delay` | `30s` | The longest delay. An HTTP login's write timeout starts after it (section 10.3). |
 | `delay_multiplier` | `2.0` | Each further failure multiplies the delay by this. |
 | `cleanup_interval` | `5m` | How often expired entries are removed and the gauges updated. |
 | `max_ip_username_entries` | `100000` | Size cap of the Tier 1 table. |
@@ -583,6 +583,11 @@ defaults:
 The wait applies to every login from that IP, including a correct password, until a success clears
 the count or the count is forgotten. It applies once per login command. A client that closes the
 connection while waiting ends the wait.
+
+On the User API and the User API proxy the wait runs inside the HTTP request, whose 30-second write
+timeout has already started. The timeout is moved to the end of the wait, so a delayed login is
+answered and still has 30 seconds for its own work and its answer, whatever `max_delay` is. The wait
+is never shortened to fit the timeout.
 
 ### 10.4 Waits in parallel
 
