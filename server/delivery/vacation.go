@@ -217,12 +217,11 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 		vacationFrom = owned
 	}
 
-	// The interpreter supplies the :subject or the RFC 5230 §5.3 default ("Auto: " and
-	// the original subject); the fixed subject is for a reply built without one.
-	vacationSubject := "Automated reply"
-	if reply.Subject != "" {
-		vacationSubject = truncateCodePoints(reply.Subject, maxVacationSubjectCodePoints)
-	}
+	// The interpreter supplies the :subject, which may be empty, or the RFC 5230 §5.3
+	// default ("Auto: " and the original subject, else "Automated reply"). An empty
+	// subject is the script's explicit :subject "", not a missing one (§5.3 applies the
+	// default only "If the :subject parameter is not supplied"), so it is kept.
+	vacationSubject := truncateCodePoints(reply.Subject, maxVacationSubjectCodePoints)
 
 	// Build vacation message
 	var vacationMessage bytes.Buffer
