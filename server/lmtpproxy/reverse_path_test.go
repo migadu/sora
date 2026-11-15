@@ -1,0 +1,97 @@
+package lmtpproxy
+
+import (
+	"io"
+	"strings"
+	"testing"
+)
+
+// RFC 5321 section 4.1.2: "Reverse-path = Path / "<>"". Only "<>" is the null
+// reverse-path. A MAIL whose reverse-path the proxy cannot read is refused as a sora
+// backend refuses it on a direct connection, "501 5.5.2 Was expecting MAIL arg syntax
+// of FROM:<address>" (go-smtp's reply; "501 Syntax error in command or arguments" may
+// answer any command, section 4.3.2), and starts no transaction. It must never reach a
+// backend as "MAIL FROM:<>": the message would be stored as a bounce, which Sieve
+// "envelope :from" and vacation (which never answers a null sender) then see.
+func TestUnreadableReversePathRefused(t *testing.T) {
+	for _, tt := range []struct{ name, from string }{
+		{"no closing bracket", "<foo"},
+		{"one character", "x"},
+		{"quoted local part with space", `<"john doe"@example.org>`},
+		{"spaces inside brackets", "< a@example.org >"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := startNestedMailBackend(t)
+			conn, reader, _ := startNestedMailProxySession(t, backend.addr)
+			send := func(cmd string) string {
+				t.Helper()
+				if _, err := io.WriteString(conn, cmd+"\r\n"); err != nil {
+					t.Fatalf("writing %q: %v", cmd, err)
+				}
+				return readReply(t, reader)
+			}
+
+			if got := send("LHLO client.example.com"); !strings.HasPrefix(got, "250 ") {
+				t.Fatalf("LHLO: %q, want 250", got)
+			}
+			want := "501 5.5.2 Was expecting MAIL arg syntax of FROM:<address>"
+			if got := send("MAIL FROM:" + tt.from); got != want {
+				t.Errorf("MAIL FROM:%s: %q, want %q", tt.from, got, want)
+			}
+			// No transaction was started: the recipient a pipelining MTA sends on is out
+			// of sequence, and no message is delivered.
+			if got := send("RCPT TO:<a@example.com>"); !strings.HasPrefix(got, "503 5.5.1 ") {
+				t.Errorf("RCPT after the refused MAIL: %q, want 503 5.5.1", got)
+			}
+			// Nothing reached a backend (the scripted one records a command before replying).
+			for _, cmd := range backend.commands() {
+				t.Errorf("backend was sent %q for MAIL FROM:%s", cmd, tt.from)
+			}
+
+			// The session goes on: a readable MAIL starts a transaction.
+			if got := send("MAIL FROM:<sender@example.com>"); !strings.HasPrefix(got, "250 ") {
+				t.Fatalf("MAIL after the refused one: %q, want 250", got)
+			}
+			if got := send("RCPT TO:<a@example.com>"); !strings.HasPrefix(got, "250 ") {
+				t.Fatalf("RCPT: %q, want 250", got)
+			}
+			if got := send("DATA"); !strings.HasPrefix(got, "354 ") {
+				t.Fatalf("DATA: %q, want 354", got)
+			}
+			wantDelivered := "250 2.0.0 Delivered from <sender@example.com> to <a@example.com>"
+			if got := send("Subject: test\r\n\r\nhello\r\n."); got != wantDelivered {
+				t.Fatalf("end of data: %q, want %q", got, wantDelivered)
+			}
+		})
+	}
+
+	// "<>" itself stays the null sender and reaches the backend as such.
+	t.Run("null reverse-path", func(t *testing.T) {
+		backend := startNestedMailBackend(t)
+		conn, reader, _ := startNestedMailProxySession(t, backend.addr)
+		send := func(cmd string) string {
+			t.Helper()
+			if _, err := io.WriteString(conn, cmd+"\r\n"); err != nil {
+				t.Fatalf("writing %q: %v", cmd, err)
+			}
+			return readReply(t, reader)
+		}
+
+		if got := send("LHLO client.example.com"); !strings.HasPrefix(got, "250 ") {
+			t.Fatalf("LHLO: %q, want 250", got)
+		}
+		if got := send("MAIL FROM:<>"); !strings.HasPrefix(got, "250 ") {
+			t.Fatalf("MAIL FROM:<>: %q, want 250", got)
+		}
+		if got := send("RCPT TO:<a@example.com>"); !strings.HasPrefix(got, "250 ") {
+			t.Fatalf("RCPT: %q, want 250", got)
+		}
+		if got := send("DATA"); !strings.HasPrefix(got, "354 ") {
+			t.Fatalf("DATA: %q, want 354", got)
+		}
+		wantDelivered := "250 2.0.0 Delivered from <> to <a@example.com>"
+		if got := send("Subject: bounce\r\n\r\nhello\r\n."); got != wantDelivered {
+			t.Fatalf("end of data: %q, want %q", got, wantDelivered)
+		}
+	})
+}
