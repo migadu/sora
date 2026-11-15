@@ -115,10 +115,11 @@ func handleConfigValidate(_ context.Context) {
 		os.Exit(1)
 	}
 
-	// The warnings start-up logs about [sieve] enabled_extensions the engine does not
-	// support, [servers] trusted_networks that include a whole private range, [[server]]
-	// keys a server type does not apply, and an imap or pop3 session_memory_limit below an
-	// lmtp max_message_size. They do not fail the file.
+	// The warnings start-up logs about [sieve] enabled_extensions (and a managesieve_proxy's
+	// supported_extensions) the engine does not support, [servers] trusted_networks that
+	// include a whole private range, [[server]] keys a server type does not apply, and an
+	// imap or pop3 session_memory_limit below an lmtp max_message_size. They do not fail
+	// the file.
 	if invalid := sieveengine.InvalidExtensions(cfg.Sieve.EnabledExtensions); len(invalid) > 0 {
 		fmt.Printf("[WARN] [sieve] enabled_extensions names extensions the engine does not support: %s; "+
 			"they are ignored, and the default set is used if none remain (effective: %s)\n",
@@ -135,6 +136,15 @@ func handleConfigValidate(_ context.Context) {
 		server.WarnUnusedConfigOptions(func(format string, args ...any) {
 			fmt.Printf("[WARN] %s\n", strings.TrimPrefix(fmt.Sprintf(format, args...), "WARNING: "))
 		})
+		if server.Type != "managesieve_proxy" {
+			continue
+		}
+		if invalid := sieveengine.InvalidExtensions(server.SupportedExtensions); len(invalid) > 0 {
+			fmt.Printf("[WARN] Server %s (type: %s) has supported_extensions the engine does not support: %s; "+
+				"they are ignored, and the default set is advertised if none remain (effective: %s)\n",
+				server.Name, server.Type, strings.Join(invalid, ", "),
+				strings.Join(sieveengine.EffectiveExtensions(server.SupportedExtensions), ", "))
+		}
 	}
 	for _, s := range cfg.SessionMemoryShortfalls() {
 		fmt.Printf("[WARN] Server %s (type: %s) has session_memory_limit %d bytes, below max_message_size %d bytes of lmtp server %s: "+
@@ -289,11 +299,11 @@ Description:
         to S3 (a mail backend, or the User API when [s3] has an endpoint,
         bucket or keys)
       [cluster] and [tls] when enabled
-  - Warning, as start-up does, about [sieve] enabled_extensions the engine
-    does not support, [servers] trusted_networks that include a whole
-    private range (such as 10.0.0.0/8), [[server]] keys the server type does
-    not use, and an imap or pop3 session_memory_limit below the largest lmtp
-    max_message_size
+  - Warning, as start-up does, about [sieve] enabled_extensions and a
+    managesieve_proxy's supported_extensions the engine does not support,
+    [servers] trusted_networks that include a whole private range (such as
+    10.0.0.0/8), [[server]] keys the server type does not use, and an imap
+    or pop3 session_memory_limit below the largest lmtp max_message_size
 
   It connects to nothing and does not look at the node's disk, so it does
   not check connectivity. When services start, Sora connects to the database

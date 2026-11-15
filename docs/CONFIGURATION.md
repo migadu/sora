@@ -227,12 +227,15 @@ the second listener cannot bind.
 
 These conditions only log, and startup continues:
 
-- `[sieve] enabled_extensions` names an extension the engine does not support. The name is dropped.
+- `[sieve] enabled_extensions`, or a `managesieve_proxy`'s `supported_extensions`, names an
+  extension the engine does not support. The name is dropped.
 - `trusted_networks` is empty (an INFO line explains what that disables), or it contains a whole
   private range such as `10.0.0.0/8` (a WARN line).
 - A key is set on a server type it does not apply to, for example `remote_addrs` on an `imap`
   server, or `tls_use_starttls` without `tls = true`. Sora logs `WARNING: Server <name> (type: <type>)
   has '<key>' configured, but ...`.
+- An `imap` or `pop3` server's `session_memory_limit` is below the `max_message_size` of an `lmtp`
+  server: a delivered message larger than the limit is stored but can never be fetched there.
 - IMAP, POP3 or ManageSieve (or their proxies) allow plaintext authentication on a publicly
   reachable address: `plaintext authentication is allowed without TLS on a publicly reachable
   address`. Configure TLS to clear it.
@@ -245,8 +248,10 @@ These conditions only log, and startup continues:
 Later steps can still fail, for example a TLS certificate that cannot be read, or a database that
 cannot be reached. Those are covered in the topic documents.
 
-`sora-admin config validate` runs every check in this list, without starting anything. See
-[ADMIN_CLI.md](ADMIN_CLI.md).
+`sora-admin config validate` runs every check in the table, without starting anything, and prints a
+`[WARN]` line for each WARN of the first four items of this list; they do not change its exit
+status. The plaintext-authentication, metrics and host-name warnings depend on the node's addresses
+and host name, so only startup reports them. See [ADMIN_CLI.md](ADMIN_CLI.md).
 
 ---
 
