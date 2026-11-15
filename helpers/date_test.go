@@ -224,8 +224,10 @@ func TestParseDateHeaderInvalid(t *testing.T) {
 // time.Parse takes the time of day as UTC and only labels it with the offset, so
 // "12:00:00 GMT+1" came out as 13:00:00 +0100 and "12:00:00 GMT-5" as 07:00:00 -0500, a
 // time of day neither reading gives. It is not parsed, like GMT+0200: the sent date is
-// unknown, and RFC 5256 section 2.2 uses the INTERNALDATE instead. A zero hour means
-// Universal Time either way and keeps net/mail's reading.
+// unknown, and SORT and THREAD use the INTERNALDATE (db.storedSentDate). RFC 5256
+// section 2.2 would keep the written time instead: "If the time zone is invalid, the
+// date and time SHOULD be treated as UTC". A zero hour means Universal Time either way
+// and keeps net/mail's reading.
 func TestParseDateHeaderGMTHourOffset(t *testing.T) {
 	for _, value := range []string{
 		"Tue, 01 Jan 2019 12:00:00 GMT+1",
