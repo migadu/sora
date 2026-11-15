@@ -1024,7 +1024,7 @@ func (s *IMAPSession) notifyDiffSnapshots(watch *notifyWatch, cur map[int64]noti
 		} else {
 			if ev.oldName != "" {
 				// §5.4: renames announce the new name with OLDNAME (the
-				// writer includes it only for IMAP4rev2-enabled clients).
+				// NOTIFY writer includes it for every client).
 				data.OldName = ev.oldName
 			}
 			if ev.entry.subscribed {
