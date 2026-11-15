@@ -131,6 +131,21 @@ func openAndValidate(dbPath string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to open: %w", err)
 	}
 
+	// The store must be a database file. An in-memory or temporary database (":memory:",
+	// "file::memory:", mode=memory, vfs=memdb, an empty name), for which SQLite reports
+	// no file name, is private to the connection that opened it, or with a shared cache
+	// lasts only while a connection is open: the pool's other connections would have no
+	// schema and no rows, and none of it survives the restart the store exists for.
+	var file string
+	if err := sqliteDB.QueryRow(`SELECT file FROM pragma_database_list WHERE name = 'main'`).Scan(&file); err != nil {
+		sqliteDB.Close()
+		return nil, fmt.Errorf("failed to read database file name: %w", err)
+	}
+	if file == "" {
+		sqliteDB.Close()
+		return nil, fmt.Errorf("%q is not a database file: an in-memory or temporary database does not persist", dbPath)
+	}
+
 	if _, err := sqliteDB.Exec(`PRAGMA journal_mode = WAL`); err != nil {
 		sqliteDB.Close()
 		return nil, fmt.Errorf("failed to set WAL mode: %w", err)
