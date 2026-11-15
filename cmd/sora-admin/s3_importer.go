@@ -452,6 +452,13 @@ func (si *S3Importer) importFromS3() error {
 					continue // interrupted: what the feeder queued is left for the next run
 				}
 				if err := si.importS3Object(obj); err != nil {
+					if si.ctx.Err() != nil {
+						// Stopped by the interrupt, not failed: like the objects still
+						// queued, it is left for the next run.
+						logger.Info("Import interrupted, S3 object left for the next run", "worker", workerID,
+							"key", obj.Key, "error", err)
+						continue
+					}
 					logger.Info("Failed to import S3 object", "worker", workerID,
 						"progress", si.getProgressPrefix(), "key", obj.Key, "error", err)
 					atomic.AddInt64(&si.failedMessages, 1)
