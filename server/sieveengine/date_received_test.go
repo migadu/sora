@@ -37,6 +37,10 @@ if date :count "eq" :comparator "i;ascii-numeric" "received" "date" "1" { filein
 		{"from mx.example.org (mx.example.org [192.0.2.1])\r\n\tby mail.example.com (Postfix) with ESMTPS id 4ABC\r\n\tfor <user@example.com>; Wed, 17 Jul 1996 02:23:25 -0700 (PDT)", []string{"match", "count"}},
 		{"from mx.example.org by mail.example.com; Wed, 17 Jul 1996 03:23:25 -0700", []string{"count"}},
 		{"from mx.example.org by mail.example.com; id 4ABC", nil},
+		{"from mx.example.org by mail.example.com; Wed, 17 Jul 1996 02:23:25 -0700 (route; note)", []string{"match", "count"}},
+		{"from mx.example.org by mail.example.com; Wed, 17 Jul 1996 02:23:25 -0700 (outer (inner; note))", []string{"match", "count"}},
+		{"from mx.example.org by mail.example.com; Wed, 17 Jul 1996 02:23:25 -0700 (route; Wed, 17 Jul 1996 03:23:25 +0000)", []string{"match", "count"}},
+
 	} {
 		raw := "Received: " + tc.received + "\r\nFrom: sender@example.com\r\nSubject: test\r\n\r\nbody\r\n"
 		entity, err := message.Read(strings.NewReader(raw))
