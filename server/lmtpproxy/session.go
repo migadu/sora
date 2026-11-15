@@ -85,6 +85,11 @@ type Session struct {
 	// backendSMTPUTF8 records whether the connected backend advertised SMTPUTF8 in its
 	// LHLO reply; the parameter is forwarded only to a backend that did (backendMailFrom).
 	backendSMTPUTF8 bool
+	// declaredSize is the value of the current transaction's SIZE parameter (RFC 1870),
+	// "" when the MTA declared none; backendSIZE records whether the connected backend
+	// advertised SIZE, the only kind of backend it is forwarded to (backendMailFrom).
+	declaredSize string
+	backendSIZE  bool
 }
 
 // newSession creates a new LMTP proxy session.
@@ -269,10 +274,12 @@ func (s *Session) handleConnection() {
 				s.sendResponse("501 5.5.4 Syntax error in MAIL command (missing FROM)")
 				continue
 			}
-			// The backend never sees the SIZE parameter, so the limit advertised in LHLO
-			// is checked here, before the MTA sends the body (RFC 1870 section 6.1). A
-			// refused MAIL starts no transaction and leaves the current one alone.
-			if reply := declaredSizeReply(args, s.settings.maxMessageSize); reply != "" {
+			// The limit advertised in LHLO is the proxy's own, checked here before the MTA
+			// sends the body (RFC 1870 section 6.1): no backend may be connected yet, and
+			// one that is may not take SIZE. A refused MAIL starts no transaction and
+			// leaves the current one alone.
+			declaredSize, reply := mailSizeParameter(args, s.settings.maxMessageSize)
+			if reply != "" {
 				s.InfoLog("MAIL refused for its SIZE parameter", "limit", s.settings.maxMessageSize, "response", reply)
 				s.sendResponse(reply)
 				continue
@@ -284,6 +291,7 @@ func (s *Session) handleConnection() {
 			s.sender = sender
 			s.mailFromReceived = true
 			s.smtputf8 = hasSMTPUTF8Param(args) || !server.IsASCII(sender)
+			s.declaredSize = declaredSize
 			// A held backend that has gone into maintenance is dropped before it is asked
 			// (past refuse_after it refuses every MAIL, and the MTA keeping this connection
 			// would get that for every message): the transaction has no recipient yet, and
@@ -437,6 +445,12 @@ func (s *Session) handleConnection() {
 			if s.backendConn == nil {
 				if err := s.connectToBackend(); err != nil {
 					s.InfoLog("backend connection failed", "from", s.sender, "to", s.to, "error", err)
+					// The backend refused the declared size: permanent for this recipient
+					// (RFC 1870 section 6.4 (2)), not a failed connection to retry.
+					if errors.Is(err, errBackendRefusedSize) {
+						s.sendResponse("552 5.3.4 Message size exceeds fixed maximum message size")
+						continue
+					}
 					// NOTE: we deliberately do NOT invalidate the lookup cache here.
 					// The cache exists to protect remotelookup; invalidating on
 					// connect failure would hammer remotelookup with one query per
@@ -1278,7 +1292,7 @@ func (s *Session) connectToBackend() error {
 
 	// Read LHLO response (bounded lines and line count so a misbehaving backend
 	// cannot keep us in this loop or grow memory without limit)
-	s.backendSMTPUTF8 = false
+	s.backendSMTPUTF8, s.backendSIZE = false, false
 	for lines := 0; ; lines++ {
 		if lines >= maxLHLOResponseLines {
 			s.backendConn.Close()
@@ -1293,6 +1307,9 @@ func (s *Session) connectToBackend() error {
 		s.DebugLog("Backend LHLO response", "response", strings.TrimRight(response, "\r"))
 		if isSMTPUTF8Capability(response) {
 			s.backendSMTPUTF8 = true
+		}
+		if isSIZECapability(response) {
+			s.backendSIZE = true
 		}
 
 		// Check if this is the last line (no hyphen after status code)
@@ -1375,7 +1392,7 @@ func (s *Session) connectToBackend() error {
 		s.backendWriter.Flush()
 
 		// Read LHLO response again (bounded lines and line count)
-		s.backendSMTPUTF8 = false
+		s.backendSMTPUTF8, s.backendSIZE = false, false
 		for lines := 0; ; lines++ {
 			if lines >= maxLHLOResponseLines {
 				s.backendConn.Close()
@@ -1390,6 +1407,9 @@ func (s *Session) connectToBackend() error {
 			s.DebugLog("Backend LHLO response after STARTTLS", "response", strings.TrimRight(response, "\r"))
 			if isSMTPUTF8Capability(response) {
 				s.backendSMTPUTF8 = true
+			}
+			if isSIZECapability(response) {
+				s.backendSIZE = true
 			}
 
 			// Check if this is the last line
@@ -1447,7 +1467,11 @@ func (s *Session) connectToBackend() error {
 		}
 
 		if !strings.HasPrefix(response, "250") {
-			s.backendConn.Close()
+			// Dropped, not only closed: the next recipient connects afresh.
+			s.loseBackend()
+			if strings.HasPrefix(response, "552") {
+				return fmt.Errorf("%w: %s", errBackendRefusedSize, strings.TrimSpace(response))
+			}
 			return fmt.Errorf("backend MAIL FROM failed: %s", response)
 		}
 
@@ -1794,33 +1818,55 @@ func hasSMTPUTF8Param(args []string) bool {
 	return false
 }
 
-// declaredSizeReply checks the SIZE parameter of MAIL (RFC 1870 section 6) against
-// limit, the size advertised in LHLO: the 552 reply for a declared size above it
-// (section 6.1 (2)), and "" otherwise or when there is no limit. A value that is no
-// number is let through, as it always was here: the body is still checked by the
-// backend, and refusing it would stop all delivery from a client that sends one.
-func declaredSizeReply(args []string, limit int64) string {
+// mailSizeParameter reads the SIZE parameter of MAIL (RFC 1870 section 6) and checks it
+// against limit, the size advertised in LHLO. It returns the declared size as given
+// ("" for none) and the reply refusing the command ("" for none): 501 for a value that
+// is not "size-value ::= 1*20DIGIT" (section 3 (4)) and for a second SIZE ("Only one
+// SIZE parameter may be specified in a single MAIL command", section 6), 552 for a size
+// above the limit (section 6.1 (2)). Without a limit no SIZE is advertised, and the
+// parameter is ignored.
+func mailSizeParameter(args []string, limit int64) (size, reply string) {
 	if limit <= 0 {
-		return ""
+		return "", ""
 	}
 	for _, arg := range args {
 		key, value, _ := strings.Cut(arg, "=")
 		if !strings.EqualFold(key, "SIZE") {
 			continue
 		}
-		size, err := strconv.ParseUint(value, 10, 64)
-		if errors.Is(err, strconv.ErrRange) || (err == nil && size > uint64(limit)) {
-			return "552 5.3.4 Message size exceeds fixed maximum message size"
+		if size != "" || len(value) == 0 || len(value) > 20 || strings.Trim(value, "0123456789") != "" {
+			return "", "501 5.5.4 Syntax error in SIZE parameter"
 		}
-		return ""
+		size = value
 	}
-	return ""
+	if size == "" {
+		return "", ""
+	}
+	// Twenty digits can exceed an int64: the only error left is the range.
+	if n, err := strconv.ParseInt(size, 10, 64); err != nil || n > limit {
+		return "", "552 5.3.4 Message size exceeds fixed maximum message size"
+	}
+	return size, ""
 }
+
+// errBackendRefusedSize is the backend's 552 to the MAIL sent when connecting: its fixed
+// maximum is below the declared size (RFC 1870 section 6.1 (2)).
+var errBackendRefusedSize = errors.New("backend refused the declared message size")
 
 // isSMTPUTF8Capability reports whether an LHLO reply line ("250-SMTPUTF8" or
 // "250 SMTPUTF8") advertises the extension.
 func isSMTPUTF8Capability(line string) bool {
 	return len(line) > 4 && strings.EqualFold(strings.TrimSpace(line[4:]), "SMTPUTF8")
+}
+
+// isSIZECapability reports whether an LHLO reply line advertises SIZE (RFC 1870
+// section 3), with or without a fixed maximum ("250-SIZE 52428800", "250 SIZE").
+func isSIZECapability(line string) bool {
+	if len(line) <= 4 {
+		return false
+	}
+	keyword, _, _ := strings.Cut(strings.TrimSpace(line[4:]), " ")
+	return strings.EqualFold(keyword, "SIZE")
 }
 
 // backendMailFrom is the MAIL command sent to the backend for the current transaction.
@@ -1829,8 +1875,15 @@ func isSMTPUTF8Capability(line string) bool {
 // (RFC 6531 §3.2): a backend without it gets the plain command and, if the envelope is
 // in fact non-ASCII, decides for itself — sora backends accept it — which is what keeps
 // a mixed-version deployment delivering while the backends are upgraded.
+// The declared SIZE goes with it only to a backend that advertised SIZE (RFC 1870
+// section 4: "When supported by the server, a client may use the extended MAIL
+// command"), so a backend whose fixed maximum is below the proxy's refuses the message
+// before the body is sent, not after it (section 6.3).
 func (s *Session) backendMailFrom() string {
 	cmd := "MAIL FROM:<" + s.sender + ">"
+	if s.declaredSize != "" && s.backendSIZE {
+		cmd += " SIZE=" + s.declaredSize
+	}
 	if s.smtputf8 && s.backendSMTPUTF8 {
 		cmd += " SMTPUTF8"
 	}
@@ -1848,6 +1901,7 @@ func (s *Session) resetTransaction() {
 	s.acceptedRcpts = 0
 	s.txPoisoned = false
 	s.smtputf8 = false
+	s.declaredSize = ""
 }
 
 // loseBackend drops the backend connection. If the backend had already accepted a

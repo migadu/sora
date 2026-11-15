@@ -347,3 +347,22 @@ func TestBackendRefusalOfDeclaredSizeIsPermanent(t *testing.T) {
 		}
 	}
 }
+
+func TestIsSIZECapability(t *testing.T) {
+	for _, tt := range []struct {
+		line string
+		want bool
+	}{
+		{"250-SIZE 52428800\r\n", true},
+		{"250 SIZE\r\n", true},
+		{"250-size 1024", true},
+		{"250-SIZEX 1024", false},
+		{"250-SMTPUTF8", false},
+		{"250", false},
+		{"", false},
+	} {
+		if got := isSIZECapability(tt.line); got != tt.want {
+			t.Errorf("isSIZECapability(%q) = %v, want %v", tt.line, got, tt.want)
+		}
+	}
+}
