@@ -126,7 +126,7 @@ func DecodeToBinary(part *message.Entity) (io.Reader, error) {
 	case "quoted-printable":
 		// Decode quoted-printable content
 		return quotedprintable.NewReader(part.Body), nil
-	case "7bit", "8bit", "binary":
+	case "", "7bit", "8bit", "binary":
 		// For these encodings, no decoding is necessary; return the body directly
 		return part.Body, nil
 	default:

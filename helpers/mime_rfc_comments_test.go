@@ -203,6 +203,79 @@ func TestCTEComments_DecodeToBinary(t *testing.T) {
 	}
 }
 
+func TestCTEComments_DefaultEncodingAndMalformedValues(t *testing.T) {
+	for _, encoding := range []string{"", "(only a comment)", "(outer (nested) comment)"} {
+		t.Run("identity "+encoding, func(t *testing.T) {
+			const body = "plain body\r\n"
+			var h message.Header
+			h.Set("Content-Transfer-Encoding", encoding)
+			r, err := DecodeToBinary(&message.Entity{Header: h, Body: strings.NewReader(body)})
+			if err != nil {
+				t.Fatalf("missing mechanism defaults to 7bit: %v", err)
+			}
+			if got, err := io.ReadAll(r); err != nil || string(got) != body {
+				t.Fatalf("identity body = %q, %v", got, err)
+			}
+		})
+	}
+
+	// A comment separates tokens; it cannot make two tokens into one known
+	// encoding. Malformed values likewise must not expose undecoded bytes in
+	// PREVIEW, even if the MIME reader tolerates an unfinished comment.
+	for _, encoding := range []string{"base(comment)64", "base64 (unfinished", "base64 (escaped\\)", "base64 extra", "base64;", "x-unknown (comment)"} {
+		t.Run("unsupported "+encoding, func(t *testing.T) {
+			const body = "aGVsbG8gd29ybGQK\r\n"
+			var h message.Header
+			h.Set("Content-Transfer-Encoding", encoding)
+			if _, err := DecodeToBinary(&message.Entity{Header: h, Body: strings.NewReader(body)}); err == nil {
+				t.Fatal("unsupported or malformed encoding was accepted")
+			}
+			raw := "Content-Type: text/plain\r\nContent-Transfer-Encoding: " + encoding + "\r\n\r\n" + body
+			if got := MessagePreview(strings.NewReader(raw)); got != "" {
+				t.Fatalf("unsupported or malformed preview = %q", got)
+			}
+		})
+	}
+}
+
+func TestCTEComments_PreviewMatchesReaderForWhitespace(t *testing.T) {
+	for _, tc := range []struct {
+		name, field string
+		decoded     bool
+	}{
+		{"retained bare CR", "base64 \r \r\n", false},
+		{"ordinary whitespace", "base64 \t\r\n", true},
+		{"folded whitespace", "base64\r\n \t\r\n", true},
+		{"folded comment", "(encoded)\r\n BASE64 (comment)\r\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const body = "aGVsbG8gd29ybGQK\r\n"
+			raw := "Content-Type: text/plain\r\nContent-Transfer-Encoding: " + tc.field + "\r\n" + body
+			entity, err := message.Read(strings.NewReader(raw))
+			if tc.decoded && err != nil {
+				t.Fatalf("valid CTE not decoded: %v", err)
+			}
+			if !tc.decoded && !message.IsUnknownEncoding(err) {
+				t.Fatalf("malformed CTE was not reported as unknown: %v", err)
+			}
+			got, err := io.ReadAll(entity.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantBody, wantPreview := body, ""
+			if tc.decoded {
+				wantBody, wantPreview = "hello world\n", "hello world"
+			}
+			if string(got) != wantBody {
+				t.Fatalf("reader body = %q, want %q", got, wantBody)
+			}
+			if preview := MessagePreview(strings.NewReader(raw)); preview != wantPreview {
+				t.Fatalf("preview = %q, want %q", preview, wantPreview)
+			}
+		})
+	}
+}
+
 func deref(s *string) string {
 	if s == nil {
 		return "<nil>"

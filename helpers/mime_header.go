@@ -93,6 +93,12 @@ func parseMIMEHeader(raw string, contentType bool) mimeHeaderValue {
 // go-message strips comments the same way, so it decodes every value this
 // reduces to a known mechanism as that mechanism.
 func transferEncodingMechanism(raw string) string {
+	if !strings.ContainsRune(raw, '(') {
+		// Match go-message's unchanged-value path. Its header reader can
+		// retain a bare CR, which is not valid folding whitespace; accepting
+		// it here would let PREVIEW show a body the reader did not decode.
+		return strings.ToLower(raw)
+	}
 	s := mimeHeaderScanner{rest: raw}
 	if s.skipCFWS() {
 		if mechanism := s.token(); s.skipCFWS() && s.rest == "" {
