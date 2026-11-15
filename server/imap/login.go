@@ -204,19 +204,12 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 		// Use base address (without suffix) to get account
 		AccountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, addressParsed.BaseAddress())
 		if err != nil {
-			// Check if error is due to context cancellation (server shutdown)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				s.InfoLog("master username auth cancelled due to server shutdown")
-				return &imap.Error{
-					Type: imap.StatusResponseTypeNo,
-					Code: imap.ResponseCodeUnavailable,
-					Text: server.ErrServerShuttingDown.Error(),
-				}
-			}
-
 			// The database could not be asked, so nothing is known about the target:
 			// a temporary failure (RFC 5530 section 3), not a failed login charged to
-			// the master credential.
+			// the master credential. Checked before the context errors, as on the
+			// regular path: a lookup that timed out because the database hangs is no
+			// shutdown, and a wrong master password, which the regular path answers,
+			// must get the same reply.
 			if server.IsTemporaryAuthFailure(err) {
 				s.WarnLog("impersonation target lookup unavailable", "target_user", addressParsed.BaseAddress(), "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
@@ -224,6 +217,16 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 					Type: imap.StatusResponseTypeNo,
 					Code: imap.ResponseCodeUnavailable,
 					Text: server.ErrAuthServiceUnavailable.Error(),
+				}
+			}
+
+			// Check if error is due to context cancellation (server shutdown)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.InfoLog("master username auth cancelled due to server shutdown")
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeUnavailable,
+					Text: server.ErrServerShuttingDown.Error(),
 				}
 			}
 
@@ -252,6 +255,22 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 		var reason string
 		AccountID, method, reason, err = s.server.Authenticate(ctx, addressParsed.BaseAddress(), password)
 		if err != nil {
+			// The database could not be asked, or the stored hash cannot be checked, so
+			// nothing is known about the credentials: a temporary failure (RFC 5530
+			// section 3, "a subsystem is down"), not counted as a failed login, or clients
+			// retrying a saved password through an outage stay blocked after it. Checked
+			// before the context errors below: a lookup that ran into its timeout because
+			// the database hangs carries DeadlineExceeded too, and is not a shutdown.
+			if server.IsTemporaryAuthFailure(err) {
+				s.WarnLog("authentication unavailable", "address", addressParsed.BaseAddress(), "reason", reason, "method", method, "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeUnavailable,
+					Text: server.ErrAuthServiceUnavailable.Error(),
+				}
+			}
+
 			// Check if error is due to context cancellation (server shutdown)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				// Server is shutting down - return temporary failure without recording as auth failure
@@ -260,20 +279,6 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 					Type: imap.StatusResponseTypeNo,
 					Code: imap.ResponseCodeUnavailable,
 					Text: server.ErrServerShuttingDown.Error(),
-				}
-			}
-
-			// The database could not be asked, or the stored hash cannot be checked, so
-			// nothing is known about the credentials: a temporary failure (RFC 5530
-			// section 3, "a subsystem is down"), not counted as a failed login, or clients
-			// retrying a saved password through an outage stay blocked after it.
-			if server.IsTemporaryAuthFailure(err) {
-				s.WarnLog("authentication unavailable", "address", addressParsed.BaseAddress(), "reason", reason, "method", method, "error", err)
-				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
-				return &imap.Error{
-					Type: imap.StatusResponseTypeNo,
-					Code: imap.ResponseCodeUnavailable,
-					Text: server.ErrAuthServiceUnavailable.Error(),
 				}
 			}
 
