@@ -518,3 +518,20 @@ func TestParseLiteral(t *testing.T) {
 		})
 	}
 }
+
+func TestToUpperASCII(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"", ""},
+		{"LOGIN", "LOGIN"},
+		{"Login", "LOGIN"},
+		{"x-y_1.z", "X-Y_1.Z"},
+		{"pla\u0131n", "PLA\u0131N"},   // U+0131 stays
+		{"\u017felect", "\u017fELECT"}, // U+017F stays
+		{"\u212aey", "\u212aEY"},       // U+212A stays
+		{"\xff\x80a", "\xff\x80A"},
+	} {
+		if got := ToUpperASCII(tc.in); got != tc.want {
+			t.Errorf("ToUpperASCII(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

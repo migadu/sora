@@ -412,7 +412,7 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			authStart := time.Now()
-			if len(args) < 1 || strings.ToUpper(args[0]) != "PLAIN" {
+			if len(args) < 1 || server.ToUpperASCII(args[0]) != "PLAIN" {
 				if s.handleAuthError(fmt.Sprintf("%s NO AUTHENTICATE PLAIN is the only supported mechanism", tag)) {
 					return
 				}
