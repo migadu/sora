@@ -1,8 +1,12 @@
 package helpers
 
 import (
+	"io"
 	"strings"
 	"testing"
+
+	"github.com/emersion/go-message"
+	"github.com/migadu/go-imap"
 )
 
 // RFC 2045 §5.1 inherits RFC 822 comments and quoted-pairs. Comments have no
@@ -93,4 +97,115 @@ func TestAttachmentKeyword_EvidenceBeforeAmbiguousParameter(t *testing.T) {
 			t.Fatalf("valid filename before ambiguous parameter yielded %q, %v; want attachment", keyword, known)
 		}
 	}
+}
+
+// RFC 2045 §1: MIME header fields "can include RFC 822 comments, which have no
+// semantic content and should be ignored during MIME processing", so a
+// Content-Transfer-Encoding with comments is the mechanism it names, for the
+// stored BODYSTRUCTURE, the full-text search text and the PREVIEW alike.
+var cteCommentMessages = []struct {
+	name, raw, wantEncoding, wantText string
+}{
+	{
+		name: "single part",
+		raw: "From: a@example.com\r\nTo: b@example.com\r\nSubject: comment\r\nMIME-Version: 1.0\r\n" +
+			"Content-Type: text/plain\r\n" +
+			"Content-Transfer-Encoding: base64 (encoded)\r\n" +
+			"\r\n" +
+			"aGVsbG8gd29ybGQK\r\n",
+		wantEncoding: "base64",
+		wantText:     "hello world\n",
+	},
+	{
+		name: "multipart child",
+		raw: "From: a@example.com\r\nTo: b@example.com\r\nSubject: comment\r\nMIME-Version: 1.0\r\n" +
+			"Content-Type: multipart/alternative; boundary=b\r\n" +
+			"\r\n" +
+			"--b\r\n" +
+			"Content-Type: text/plain; charset=utf-8\r\n" +
+			"Content-Transfer-Encoding: (a (nested) comment) Quoted-Printable (with a \\) quoted-pair)\r\n" +
+			"\r\n" +
+			"hello wor=\r\nld=21\r\n" +
+			"--b--\r\n",
+		wantEncoding: "quoted-printable",
+		wantText:     "hello world!",
+	},
+}
+
+func TestCTEComments_BodyStructure(t *testing.T) {
+	for _, tc := range cteCommentMessages {
+		t.Run(tc.name, func(t *testing.T) {
+			bs, err := SafeBodyStructure([]byte(tc.raw))
+			if err != nil {
+				t.Fatalf("SafeBodyStructure: %v", err)
+			}
+			if mp, ok := bs.(*imap.BodyStructureMultiPart); ok {
+				bs = mp.Children[0]
+			}
+			leaf, ok := bs.(*imap.BodyStructureSinglePart)
+			if !ok {
+				t.Fatalf("leaf is %T, want *imap.BodyStructureSinglePart", bs)
+			}
+			if !strings.EqualFold(leaf.Encoding, tc.wantEncoding) {
+				t.Errorf("body-fld-enc = %q, want %q", leaf.Encoding, tc.wantEncoding)
+			}
+		})
+	}
+}
+
+func TestCTEComments_ExtractPlaintextBody(t *testing.T) {
+	for _, tc := range cteCommentMessages {
+		t.Run(tc.name, func(t *testing.T) {
+			// server.ParseMessage tolerates an unknown encoding the same way.
+			entity, err := message.Read(strings.NewReader(tc.raw))
+			if err != nil && !message.IsUnknownEncoding(err) {
+				t.Fatalf("message.Read: %v", err)
+			}
+			text, err := ExtractPlaintextBody(entity)
+			if err != nil {
+				t.Errorf("ExtractPlaintextBody error: %v", err)
+			}
+			if text == nil || strings.TrimRight(*text, "\r\n") != strings.TrimRight(tc.wantText, "\r\n") {
+				t.Errorf("ExtractPlaintextBody = %q, want %q", deref(text), tc.wantText)
+			}
+		})
+	}
+}
+
+func TestCTEComments_MessagePreview(t *testing.T) {
+	for _, tc := range cteCommentMessages {
+		t.Run(tc.name, func(t *testing.T) {
+			want := strings.TrimSpace(tc.wantText)
+			if got := MessagePreview(strings.NewReader(tc.raw)); got != want {
+				t.Errorf("MessagePreview = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestCTEComments_DecodeToBinary(t *testing.T) {
+	var h message.Header
+	h.Set("Content-Transfer-Encoding", "(encoded) BASE64 (as stored)")
+	r, err := DecodeToBinary(&message.Entity{Header: h, Body: strings.NewReader("aGVsbG8gd29ybGQK")})
+	if err != nil {
+		t.Fatalf("DecodeToBinary: %v", err)
+	}
+	if b, err := io.ReadAll(r); err != nil || string(b) != "hello world\n" {
+		t.Errorf("DecodeToBinary = %q, %v; want %q", b, err, "hello world\n")
+	}
+
+	// A comment is not part of the mechanism and separates tokens.
+	for _, enc := range []string{"x-uuencode (comment)", "base(comment)64"} {
+		h.Set("Content-Transfer-Encoding", enc)
+		if _, err := DecodeToBinary(&message.Entity{Header: h, Body: strings.NewReader("")}); err == nil {
+			t.Errorf("DecodeToBinary(%q): expected an unsupported-encoding error", enc)
+		}
+	}
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return "<nil>"
+	}
+	return *s
 }
