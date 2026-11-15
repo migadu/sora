@@ -169,3 +169,57 @@ func TestFetch_ChunkStaysChargedUntilWritten(t *testing.T) {
 		t.Errorf("memory tracker after the response = %d bytes, want the %d retained", got, retained)
 	}
 }
+
+// TestFetch_RetainedSectionYieldsToUnsizedBody: the section a session retains
+// for its next chunk gives way to a body the budget could otherwise hold,
+// also when the body has no recorded size and is only charged after the read
+// (memoryAvailable): bytes kept only to make the next chunk cheaper must never
+// be what refuses a FETCH. A refusal is NO [UNAVAILABLE] (#1256), and a retry
+// would find the same retained section in the way.
+func TestFetch_RetainedSectionYieldsToUnsizedBody(t *testing.T) {
+	body := multipartTestMessage(64 * 1024)
+	const retainedSize = 32 * 1024
+	for _, size := range []struct {
+		name string
+		size int
+	}{
+		{"size known", len(body)},
+		{"size unknown", 0},
+	} {
+		t.Run(size.name, func(t *testing.T) {
+			s, tracker := newFetchTestSession(int64(len(body)) + retainedSize/2)
+			c, err := cache.New(t.TempDir(), 1<<20, 1<<20, time.Hour, time.Hour, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { c.Close() })
+			s.server.cache = c
+			msg := fetchTestMessage(body)
+			msg.Size = size.size
+			msg.IsUploaded = true
+			putCacheFile(t, s, msg.ContentHash, string(body))
+
+			// A section of another message, retained for its next chunk.
+			if err := tracker.Allocate(retainedSize); err != nil {
+				t.Fatal(err)
+			}
+			if !s.retainBodySection("other", make([]byte, retainedSize)) {
+				t.Fatal("the other section was not retained")
+			}
+
+			var bodyData []byte
+			var bodyFetched bool
+			w := &fakeBodySectionWriter{}
+			if err := fetchBodySections(s, w, &bodyData, &bodyFetched,
+				&imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{{}}}, msg); err != nil {
+				t.Fatalf("BODY[] = %v, want the body", err)
+			}
+			if len(w.sections) != 1 || len(w.sections[0].data) != len(body) {
+				t.Fatalf("written sections = %d, want BODY[] with the %d-octet body", len(w.sections), len(body))
+			}
+			if s.cachedBodySection("other") != nil {
+				t.Error("the other section is still retained")
+			}
+		})
+	}
+}

@@ -1064,7 +1064,12 @@ func (s *IMAPSession) getMessageBody(ctx context.Context, msg *db.Message) ([]by
 	}
 
 	// Single accounting point for every source in loadMessageBody (cache, S3, disk).
+	// A body without a recorded size is checked only here, so memoryAvailable gives
+	// the retained section back first, as it does before the read for a sized body.
 	if s.memTracker != nil {
+		if !s.memoryAvailable(int64(len(data))) {
+			return nil, fmt.Errorf("%w: message body %d bytes exceeds available budget", errBodyOverMemoryBudget, len(data))
+		}
 		if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
 			return nil, fmt.Errorf("%w: %v", errBodyOverMemoryBudget, allocErr)
 		}
@@ -1140,7 +1145,7 @@ func (s *IMAPSession) loadMessageBody(ctx context.Context, msg *db.Message) ([]b
 			// Permanent. A NoSuchKey on an uploaded message is genuine content loss worth
 			// alerting on — logged only here, where the message is marked uploaded (a 404
 			// during the not-yet-uploaded race is expected and not logged). Either way it
-			// degrades to an empty body for the caller (see handleBodySections).
+			// degrades to an empty body for the caller (see loadSectionBody).
 			if resilient.IsNotFoundError(err) {
 				s.WarnLog("message marked uploaded but missing from S3 (NoSuchKey)", "uid", msg.UID, "content_hash", msg.ContentHash, "s3_domain", msg.S3Domain, "s3_localpart", msg.S3Localpart)
 			}
