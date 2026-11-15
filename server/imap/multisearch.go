@@ -42,6 +42,11 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 		return nil, err
 	}
 
+	// The selected mailbox's sequence numbering holds still while MultiSearch
+	// translates through it (seqViewMu); taken before s.mutex.
+	s.seqViewMu.RLock()
+	defer s.seqViewMu.RUnlock()
+
 	if s.useMasterDB.Load() {
 		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
@@ -72,6 +77,7 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 		selectedMailboxID = s.selectedMailbox.ID
 	}
 	savedSearchUIDs := s.savedSearchResultLocked()
+	view := s.seqViewLocked()
 	release()
 
 	var results []*imap.SearchData
@@ -100,11 +106,17 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 		if mbox.ID == selectedMailboxID {
 			mboxSaved = savedSearchUIDs
 		}
-		mboxCriteria, err := s.withSessionRecent(searchResAsUIDs(criteria, mboxSaved), mbox.ID)
+		mboxCriteria := searchResAsUIDs(criteria, mboxSaved)
+		searchCtx := ctx
+		if mbox.ID == selectedMailboxID && view.tracker != nil {
+			mboxCriteria = view.decodeCriteria(mboxCriteria)
+			searchCtx = view.context(ctx)
+		}
+		mboxCriteria, err = s.withSessionRecent(mboxCriteria, mbox.ID)
 		if err != nil {
 			return nil, err
 		}
-		messages, err := s.server.rdb.SearchMessagesWithCriteriaWithRetry(ctx, mbox.ID, mbox.AccountID, mboxCriteria, 0, 0)
+		messages, err := s.server.rdb.SearchMessagesWithCriteriaWithRetry(searchCtx, mbox.ID, mbox.AccountID, mboxCriteria, 0, 0)
 		if errors.Is(err, db.ErrSearchTooManyResults) {
 			return nil, s.searchResultLimitError("MULTISEARCH", "mailbox", mbox.Name)
 		}

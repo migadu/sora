@@ -792,7 +792,7 @@ func (s *ManageSieveSession) PutScript(ctx context.Context, name, content string
 	start := time.Now()
 	ctx, cancel := applyCommandTimeout(ctx, "PUTSCRIPT", s.server.commandTimeouts)
 	defer cancel()
-	accountID, readCtx, err := s.sessionState(ctx, "PUTSCRIPT")
+	accountID, _, err := s.sessionState(ctx, "PUTSCRIPT")
 	if err != nil {
 		return false, err
 	}
@@ -801,30 +801,18 @@ func (s *ManageSieveSession) PutScript(ctx context.Context, name, content string
 		return false, err
 	}
 
-	script, dbErr := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, accountID)
-	if dbErr != nil && dbErr != consts.ErrDBNotFound {
+	// Update or create is decided in the write transaction: a lookup before it
+	// (on a lagging replica, or racing another create of the name) can miss the
+	// script, and the create then fails on the unique name.
+	_, updated, err := s.server.rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, name, content)
+	if err != nil {
+		if errors.Is(err, db.ErrSieveScriptLimitReached) {
+			return false, &managesieveserver.Error{Code: "QUOTA/MAXSCRIPTS", Message: "Too many scripts for this account"}
+		}
+		if errors.Is(err, db.ErrSieveScriptNotStorable) {
+			return false, &managesieveserver.Error{Message: msieve.Quote("Script validation failed: " + msieve.SanitizeText(err.Error()))}
+		}
 		return false, errTryLater
-	}
-
-	updated := false
-	if script != nil {
-		if _, err := s.server.rdb.UpdateScriptWithRetry(ctx, script.ID, accountID, name, content); err != nil {
-			if errors.Is(err, db.ErrSieveScriptNotStorable) {
-				return false, &managesieveserver.Error{Message: msieve.Quote("Script validation failed: " + msieve.SanitizeText(err.Error()))}
-			}
-			return false, errTryLater
-		}
-		updated = true
-	} else {
-		if _, err := s.server.rdb.CreateScriptWithRetry(ctx, accountID, name, content); err != nil {
-			if errors.Is(err, db.ErrSieveScriptLimitReached) {
-				return false, &managesieveserver.Error{Code: "QUOTA/MAXSCRIPTS", Message: "Too many scripts for this account"}
-			}
-			if errors.Is(err, db.ErrSieveScriptNotStorable) {
-				return false, &managesieveserver.Error{Message: msieve.Quote("Script validation failed: " + msieve.SanitizeText(err.Error()))}
-			}
-			return false, errTryLater
-		}
 	}
 
 	s.pinToMasterDB("PUTSCRIPT")
