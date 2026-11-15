@@ -46,7 +46,9 @@ type DeliveryContext struct {
 	Logger        Logger
 	OwnerResolver *resilient.OwnerResolver
 	// SharedMailboxes is [shared_mailboxes]: Sieve fileinto :create never makes a
-	// personal mailbox in its namespace.
+	// personal mailbox in its namespace, and neither a fileinto, a target mailbox nor
+	// Sieve mailboxexists resolves its root (FileintoTarget). Left zero, sharing
+	// counts as disabled.
 	SharedMailboxes config.SharedMailboxesConfig
 }
 
