@@ -848,7 +848,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: failed to read UTF8 response: %w", server.ErrBackendConnectionFailed, err)
 		}
-		if !strings.HasPrefix(resp, "+OK") {
+		if !isPositiveResponse(resp) {
 			// Best-effort: pre-migration code never forwarded UTF8, so a
 			// backend without UTF8 support degrades exactly as it did before.
 			s.WarnLog("backend rejected UTF8 mode; continuing without it", "response", strings.TrimSpace(resp))
@@ -885,7 +885,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 		return fmt.Errorf("%w: failed to read auth response: %w", server.ErrBackendAuthFailed, err)
 	}
 
-	if !strings.HasPrefix(authResp, "+OK") {
+	if !isPositiveResponse(authResp) {
 		s.backendConn.Close()
 		// CRITICAL: Invalidate cache on backend authentication failure
 		// This ensures the next request does fresh remotelookup/database lookup
@@ -906,13 +906,21 @@ func (s *POP3ProxySession) connectToBackend() error {
 }
 
 // isPositiveResponse reports whether a backend response line carries the +OK status
-// indicator: ASCII case-insensitive (RFC 1939 section 3) and complete, so that a prefix
-// such as +OKAY is not an OK status.
-func isPositiveResponse(line string) bool {
-	if len(line) < 3 || !strings.EqualFold(line[:3], "+OK") {
+// indicator, and isNegativeResponse whether it carries -ERR. See hasStatusIndicator.
+func isPositiveResponse(line string) bool { return hasStatusIndicator(line, "+OK") }
+
+func isNegativeResponse(line string) bool { return hasStatusIndicator(line, "-ERR") }
+
+// hasStatusIndicator reports whether line starts with the status indicator status as a
+// whole: RFC 2449 section 3, single-line = status [SP text] CRLF, so that +OKAY is not
+// +OK. The match ignores case, as ABNF strings do (RFC 2234 section 2.3), though RFC
+// 1939 section 3 has servers send the indicators in upper case.
+func hasStatusIndicator(line, status string) bool {
+	if len(line) < len(status) || !strings.EqualFold(line[:len(status)], status) {
 		return false
 	}
-	return len(line) == 3 || line[3] == ' ' || line[3] == '\r' || line[3] == '\n'
+	rest := line[len(status):]
+	return rest == "" || rest[0] == ' ' || rest[0] == '\r' || rest[0] == '\n'
 }
 
 // startTLSWithBackend upgrades the backend connection with STLS (RFC 2595), within
