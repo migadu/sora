@@ -685,7 +685,7 @@ Newest expunge first. Response `200`; the message objects use Go field names:
     {
       "ID": 98321, "UID": 4410, "ContentHash": "4f1c...",
       "MailboxPath": "INBOX", "MailboxID": 5511,
-      "Subject": "Quarterly report", "MessageID": "<abc@example.com>",
+      "Subject": "Quarterly report", "MessageID": "abc@example.com",
       "InternalDate": "2026-03-04T10:11:12Z", "ExpungedAt": "2026-03-09T16:00:00Z",
       "Size": 48211
     }
@@ -694,9 +694,10 @@ Newest expunge first. Response `200`; the message objects use Go field names:
 }
 ```
 
-`MailboxID` is `null` when the mailbox itself has been deleted; `MailboxPath` is then the
-name recorded at deletion. A message with neither shows an empty `MailboxPath`; criteria-based
-restores skip it and it can only be named by id.
+`MessageID` is the bare `Message-ID` header without angle brackets, or `""` when the message had
+none that parsed. `MailboxID` is `null` when the mailbox itself has been deleted; `MailboxPath` is
+then the name recorded at deletion. A message with neither shows an empty `MailboxPath`;
+criteria-based restores skip it and it can only be named by id.
 
 Errors: `400` for a bad `since`, `until` or `limit`, or `since` after `until`;
 `404 Account not found`; `500` otherwise.
