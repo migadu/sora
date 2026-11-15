@@ -332,9 +332,8 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			s.DebugLog("Extracted recipient address", "to", to)
-			// No MAIL in effect (none yet, RSET, or one the backend refused while a
-			// pipelining MTA sent on): a bad sequence, answered here, as a backend asked
-			// would answer 5xx, which reads as a routing inconsistency below.
+			// No MAIL in effect (none yet or reset): a bad sequence, answered here, as a
+			// backend asked would answer 5xx, which reads as a routing inconsistency below.
 			if !s.mailFromReceived {
 				s.sendResponse("503 5.5.1 Error: need MAIL command")
 				continue
