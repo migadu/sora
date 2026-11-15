@@ -244,13 +244,28 @@ Description:
   - Detecting duplicate keys (warns and uses first occurrence)
   - Detecting unknown/deprecated keys (warns)
   - Detecting common typos (e.g., 'f' instead of 'false')
-  - Running the shared checks the server makes before service setup: the [[server]]
-    blocks (at least one; no duplicate names or addresses), [[pool]], [relay],
-    trusted_networks, [shared_mailboxes], and [uploader] and [cleanup] when a
-    mail backend (imap, lmtp, pop3) runs. Every problem is reported.
+  - Running the shared checks the server makes before service setup, and
+    reporting every problem they find. What the node does not run is not
+    checked:
+      [[server]] blocks (at least one; no duplicate names or addresses),
+        [[pool]], [relay], trusted_networks, [shared_mailboxes] and
+        [timeout_scheduler]
+      [relay.queue] when [relay] is configured
+      [uploader] and [cleanup] when a mail backend (imap, lmtp, pop3) runs
+      [database], [database.write] and [database.read] when a server queries
+        the database (imap, lmtp, pop3, managesieve, the HTTP APIs, and a
+        proxy that looks users up there)
+      [s3] (bucket, endpoint, timeout, access_key and secret_key set
+        together, encryption_key with encrypt = true) when the node connects
+        to S3 (a mail backend, or the User API when [s3] has an endpoint,
+        bucket or keys)
+      [cluster] and [tls] when enabled
 
-  This does not check required database/S3 settings, S3 timeout, connectivity,
-  or the node's disk. Those are still checked when services start.
+  It connects to nothing and does not look at the node's disk, so it does
+  not check connectivity. When services start, Sora connects to the database
+  and the certificate store and checks the node's disk. S3 and a remote
+  lookup are not reached until they are first used, so a clean start does
+  not show that they can be reached.
 
   Exit codes:
     0 - Configuration is valid (warnings OK)

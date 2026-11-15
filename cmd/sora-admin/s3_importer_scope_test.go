@@ -57,6 +57,9 @@ func TestS3Importer_SkipsObjectsOfAnotherUser(t *testing.T) {
 	}
 	si.totalObjects = 1
 
+	if err := si.lookupAccount(); err != nil {
+		t.Fatalf("lookupAccount: %v", err)
+	}
 	if err := si.importFromS3(); err != nil {
 		t.Fatalf("import: %v", err)
 	}
