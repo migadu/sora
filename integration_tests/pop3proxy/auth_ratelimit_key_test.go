@@ -16,8 +16,8 @@ import (
 )
 
 // setupPOP3ProxyWithRateLimiting creates a POP3 proxy with authentication rate
-// limiting enabled, fronting the given backends.
-func setupPOP3ProxyWithRateLimiting(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, rateLimitConfig server.AuthRateLimiterConfig) *common.TestServer {
+// limiting enabled, fronting the given backends. Each tune func adjusts the options.
+func setupPOP3ProxyWithRateLimiting(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, rateLimitConfig server.AuthRateLimiterConfig, tune ...func(*pop3proxy.POP3ProxyServerOptions)) *common.TestServer {
 	t.Helper()
 
 	opts := pop3proxy.POP3ProxyServerOptions{
@@ -32,6 +32,10 @@ func setupPOP3ProxyWithRateLimiting(t *testing.T, rdb *resilient.ResilientDataba
 		// No TrustedProxies: the proxy passes that list to the auth rate limiter as
 		// its exemption list, and the loopback test client would then be exempt from
 		// all IP-based blocking.
+	}
+
+	for _, f := range tune {
+		f(&opts)
 	}
 
 	proxy, err := pop3proxy.New(context.Background(), "test-proxy-rate-limit", proxyAddr, rdb, opts)

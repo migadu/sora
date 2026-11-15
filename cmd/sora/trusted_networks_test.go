@@ -73,7 +73,7 @@ func TestStartupRefusesMalformedTrustedNetworks(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.toml")
-			if err := os.WriteFile(path, []byte(tc.toml), 0o600); err != nil {
+			if err := os.WriteFile(path, []byte(storageTOML+tc.toml), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			cmd := exec.Command(os.Args[0], "-test.run=^TestStartupRefusesMalformedTrustedNetworks$")
@@ -106,10 +106,10 @@ func TestGlobalReloadReportsMalformedTrustedNetworks(t *testing.T) {
 	cfg := startupConfig()
 	want := startupConfig()
 
-	handleConfigReload(writeReloadConfig(t, `
+	handleConfigReload(&cfg, reloadedFrom(t, `
 [servers]
 trusted_networks = ["127.0.0.0/8", "10.0.0.0/33"]
-`), &cfg, nil)
+`))
 
 	if !slices.Equal(cfg.Servers.TrustedNetworks, want.Servers.TrustedNetworks) {
 		t.Errorf("trusted_networks = %v after the reload, want the start-up %v", cfg.Servers.TrustedNetworks, want.Servers.TrustedNetworks)

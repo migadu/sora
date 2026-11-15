@@ -35,7 +35,10 @@ const DefaultMaxMessageSize = 50 * 1024 * 1024
 // (security-audit M13)
 const defaultLMTPMaxConnections = 1000
 
-// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+// getProxyProtocolTrustedProxies returns the hosts trusted to send PROXY headers: the
+// ProxyProtocolTrustedProxies option if set, otherwise trusted_networks. No config key
+// sets that option (there is no proxy_protocol_trusted_proxies, #542), so in a running
+// server PROXY trust is always [servers] trusted_networks.
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {
 		return proxyProtocolTrusted
@@ -188,6 +191,7 @@ type LMTPServerBackend struct {
 	uploader     *uploader.UploadWorker
 	server       *smtp.Server
 	appCtx       context.Context
+	cancel       context.CancelFunc
 	tlsConfig    *tls.Config
 	ftsRetention time.Duration
 	relayQueue   delivery.RelayQueue // Disk-based queue for relay retry
@@ -270,7 +274,7 @@ type LMTPServerOptions struct {
 	FTSRetention                time.Duration
 	MaxMessageSize              int64    // Maximum size for incoming messages in bytes
 	SieveExtensions             []string // Sieve extensions to enable (nil/empty = all default extensions)
-	InsecureAuth                bool     // Allow PLAIN auth over non-TLS connections (default: true for LMTP behind trusted network)
+	InsecureAuth                bool     // Allow plaintext authentication over non-TLS connections
 	RedirectRateLimit           int
 	RedirectRateWindow          time.Duration
 	MaxRedirectHops             int
@@ -307,10 +311,19 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		options.TLSUseStartTLS = false
 	}
 
+	serverCtx, serverCancel := context.WithCancel(appCtx)
+	created := false
+	defer func() {
+		if !created {
+			serverCancel()
+		}
+	}()
+
 	backend := &LMTPServerBackend{
 		addr:               addr,
 		name:               name,
-		appCtx:             appCtx,
+		appCtx:             serverCtx,
+		cancel:             serverCancel,
 		hostname:           hostname,
 		instanceID:         instanceIDOrHostname(options.InstanceID, hostname),
 		maintenanceGate:    options.MaintenanceGate,
@@ -370,36 +383,18 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	backend.defaultSieveScript = compiledDefault
 	logger.Debug("default sieve script parsed and cached", "name", backend.name)
 
-	// Set up TLS config: Support both file-based certificates and global TLS manager
-	// 1. Per-server TLS: cert files provided (for both implicit TLS and STARTTLS)
-	// 2. Global TLS: options.TLS=true, no cert files, global TLS config provided (for both implicit TLS and STARTTLS)
-	// 3. No TLS: options.TLS=false
-	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
-		// Scenario 1: Per-server TLS with explicit cert files
-		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
+	// One TLS config for implicit TLS and STARTTLS; the certificate source and
+	// tls_verify follow the rule every listener shares (server.ListenerTLS).
+	if options.TLS {
+		tlsConfig, err := server.ListenerTLS{
+			Protocol: "LMTP", Name: name,
+			CertFile: options.TLSCertFile, KeyFile: options.TLSKeyFile, Verify: options.TLSVerify,
+			Global: options.TLSConfig, ALPN: []string{"lmtp"},
+		}.Config()
 		if err != nil {
-			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, err
 		}
-		backend.tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			ClientAuth:               tls.NoClientCert,
-			ServerName:               hostname,
-			PreferServerCipherSuites: true,
-			NextProtos:               []string{"lmtp"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-
-		if !options.TLSVerify {
-			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
-			logger.Debug("LMTP: WARNING - Client TLS certificate verification not enforced", "name", name)
-		}
-	} else if options.TLS && options.TLSConfig != nil {
-		// Scenario 2: Global TLS manager (works for both implicit TLS and STARTTLS)
-		backend.tlsConfig = options.TLSConfig
-	} else if options.TLS {
-		// TLS enabled but no cert files and no global TLS config provided
-		return nil, fmt.Errorf("TLS enabled for LMTP [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", name)
+		backend.tlsConfig = tlsConfig
 	}
 
 	s := smtp.NewServer(backend)
@@ -410,7 +405,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// context: go-smtp cancels the derived context when the client disconnects,
 	// the connection ends, or the server shuts down, and BaseContext adds app
 	// shutdown on top. Sessions derive their context from it in NewSession.
-	s.BaseContext = func(net.Listener) context.Context { return appCtx }
+	s.BaseContext = func(net.Listener) context.Context { return serverCtx }
 	s.AllowInsecureAuth = options.InsecureAuth
 	s.LMTP = true
 	s.MaxRecipients = 1 // Enforce single recipient per LMTP transaction.
@@ -494,7 +489,8 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	}
 
 	// Start connection limiter cleanup
-	backend.limiter.StartCleanup(appCtx)
+	backend.limiter.StartCleanup(serverCtx)
+	created = true
 
 	return backend, nil
 }
@@ -592,7 +588,7 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	}
 
 	// Initialize the mutex helper
-	s.mutexHelper = server.NewMutexTimeoutHelper(&s.mutex, sessionCtx, "LMTP", logFunc)
+	s.mutexHelper = server.NewMutexTimeoutHelper(&s.mutex, sessionCtx, "lmtp", logFunc)
 
 	// Log connection with connection counters
 	activeCount := b.activeConnections.Load()
@@ -602,6 +598,10 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 }
 
 func (b *LMTPServerBackend) Start(errChan chan error) {
+	if b.appCtx.Err() != nil {
+		return
+	}
+
 	var listener net.Listener
 	var err error
 
@@ -611,6 +611,9 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	// Create base TCP listener with custom backlog
 	tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", b.server.Addr, b.listenBacklog)
 	if err != nil {
+		if b.cancel != nil {
+			b.cancel()
+		}
 		errChan <- fmt.Errorf("failed to create listener: %w", err)
 		return
 	}
@@ -644,6 +647,16 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	}
 	defer listener.Close()
 
+	// cmd/sora calls Close from a watcher on the application context that
+	// races Start, and go-smtp's Close closes only the listeners Serve has
+	// already registered: a listener created after it would be served until
+	// the process exits. Close it on shutdown, as the POP3 and ManageSieve
+	// servers do.
+	go func() {
+		<-b.appCtx.Done()
+		listener.Close()
+	}()
+
 	// Wrap listener with connection limiting
 	limitedListener := &connectionLimitingListener{
 		Listener: listener,
@@ -671,7 +684,11 @@ func (b *LMTPServerBackend) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	next := *b.settings.Load()
 
-	if maxSize := cfg.GetMaxMessageSizeWithDefault(); maxSize != next.maxMessageSize {
+	// A value that does not parse keeps the running limit (start-up, which has none,
+	// uses the default).
+	if maxSize, err := cfg.GetMaxMessageSize(); err != nil {
+		logger.Warn("LMTP config reload: invalid max_message_size, keeping the running value", "name", b.name, "error", err, "running", next.maxMessageSize)
+	} else if maxSize != next.maxMessageSize {
 		next.maxMessageSize = maxSize
 		reloaded = append(reloaded, "max_message_size")
 	}
@@ -685,6 +702,9 @@ func (b *LMTPServerBackend) ReloadConfig(cfg config.ServerConfig) error {
 }
 
 func (b *LMTPServerBackend) Close() error {
+	if b.cancel != nil {
+		b.cancel()
+	}
 	if b.server != nil {
 		return b.server.Close()
 	}

@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -19,7 +21,7 @@ const (
 	AuthUserNotFound           AuthResult = iota // User doesn't exist in remotelookup - fallback controlled by lookup_local_users
 	AuthSuccess                                  // User found and authenticated - proceed with routing
 	AuthFailed                                   // User found but auth failed - reject, no fallback
-	AuthTemporarilyUnavailable                   // Auth service temporarily unavailable - fallback controlled by lookup_local_users
+	AuthTemporarilyUnavailable                   // Auth service gave no verdict - temporary failure, never a fallback to the local database
 )
 
 // String returns a human-readable representation of AuthResult
@@ -42,12 +44,22 @@ func (a AuthResult) String() string {
 var (
 	// ErrRemoteLookupTransient represents a transient error: the lookup service gave no
 	// verdict on the user (network issue, timeout, 5xx, a 4xx other than 401/403/404, a
-	// malformed 200, circuit breaker open). It is never a wrong password.
+	// malformed 200, circuit breaker open, a request that could not be built). It is
+	// never a wrong password. Every error the HTTP lookup client returns wraps it.
 	ErrRemoteLookupTransient = errors.New("remotelookup transient error")
 
 	// ErrRemoteLookupInvalidResponse represents an invalid 200 response (malformed JSON, missing
-	// required fields): a lookup service bug. Always returned wrapped in ErrRemoteLookupTransient.
+	// required fields, a password_hash sora cannot verify, which also carries
+	// db.ErrUnverifiableHash): a lookup service bug. Always returned wrapped in
+	// ErrRemoteLookupTransient.
 	ErrRemoteLookupInvalidResponse = errors.New("remotelookup invalid response")
+
+	// ErrRemoteLookupRefused is returned by a routing lookup (ConnectionManager.LookupUserRoute)
+	// that the lookup service answered 401/403: it refused the account. Unlike a 404 the
+	// account is not "unknown here", so there is no fallback to the local database
+	// (lookup_local_users), and named-pool routing refuses to use the default pool.
+	// Unlike an outage it is a verdict. Not wrapped in ErrRemoteLookupTransient.
+	ErrRemoteLookupRefused = errors.New("remotelookup refused the account")
 
 	// ErrUnknownPool is returned when a route names a pool this proxy does not have:
 	// a lookup answer for a pool the proxy's config lacks (rollout skew, a typo in
@@ -107,10 +119,15 @@ func NormalizeBackendAddr(addr string, defaultPort int) string {
 // named pools when the config declares [[pool]] blocks, else the flat remote_addrs list
 // with the server's own backend-leg settings.
 type ManagerOptions struct {
-	Pools              []PoolSpec
-	RemoteAddrs        []string
-	RemotePort         int
-	Settings           BackendSettings // flat-list settings; unused with Pools
+	Pools       []PoolSpec
+	RemoteAddrs []string
+	RemotePort  int
+	Settings    BackendSettings // flat-list settings; unused with Pools
+	// RemoteTLSCAFile is the [[server]] block's remote_tls_ca_file: a PEM file of CA
+	// certificates that the backends of a flat list, and with Pools any backend in no
+	// pool (a lookup pin), are verified against; "" = the system roots. A pool member is
+	// verified against its own pool's CA file only.
+	RemoteTLSCAFile    string
 	ConnectTimeout     time.Duration
 	RoutingLookup      UserRoutingLookup
 	ServerName         string
@@ -140,10 +157,25 @@ func poolRouteOutcome(err error) string {
 // NewConnectionManagerFromOptions builds a pool-routing manager when Pools is set and a
 // flat-list one otherwise.
 func NewConnectionManagerFromOptions(o ManagerOptions) (*ConnectionManager, error) {
-	if len(o.Pools) > 0 {
-		return NewConnectionManagerWithPools(o.Pools, o.RemotePort, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
+	var roots *x509.CertPool // nil = the system roots
+	if o.RemoteTLSCAFile != "" {
+		var err error
+		if roots, err = loadCAFile(o.RemoteTLSCAFile); err != nil {
+			return nil, fmt.Errorf("remote_tls_ca_file: %w", err)
+		}
 	}
-	return NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(o.RemoteAddrs, o.RemotePort, o.Settings.TLS, o.Settings.TLSUseStartTLS, o.Settings.TLSVerify, o.Settings.UseProxyProtocol, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
+	var cm *ConnectionManager
+	var err error
+	if len(o.Pools) > 0 {
+		cm, err = NewConnectionManagerWithPools(o.Pools, o.RemotePort, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
+	} else {
+		cm, err = NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(o.RemoteAddrs, o.RemotePort, o.Settings.TLS, o.Settings.TLSUseStartTLS, o.Settings.TLSVerify, o.Settings.UseProxyProtocol, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
+	}
+	if err != nil {
+		return nil, err
+	}
+	cm.SetRemoteTLSRootCAs(roots)
+	return cm, nil
 }
 
 // PoolSpecsFromConfig converts the [[pool]] blocks of a config file into pool specs.
@@ -231,13 +263,19 @@ func normalizeHostPort(addr string, defaultPort int) string {
 	if addr == "" {
 		return ""
 	}
-	// A complete IPv6 literal has no port, even when its last group is decimal.
-	// Trying the unbracketed host:port heuristic first silently changes the host.
-	if net.ParseIP(addr) != nil {
+	// A complete IPv6 literal (bare or bracketed without a port) has no port,
+	// even when its last group is decimal. Trying the unbracketed host:port
+	// heuristic first silently changes the host.
+	bare := addr
+	if strings.HasPrefix(addr, "[") && strings.HasSuffix(addr, "]") {
+		bare = addr[1 : len(addr)-1]
+	}
+	if ip := net.ParseIP(bare); ip != nil {
+		canonical := ip.String()
 		if defaultPort > 0 {
-			return net.JoinHostPort(addr, strconv.Itoa(defaultPort))
+			return net.JoinHostPort(canonical, strconv.Itoa(defaultPort))
 		}
-		return addr
+		return canonical
 	}
 
 	// net.SplitHostPort is the robust way to do this, as it correctly
@@ -271,10 +309,10 @@ func normalizeHostPort(addr string, defaultPort int) string {
 			portPart := addr[lastColon+1:]
 
 			// Check if the parts look like a valid IP and port.
-			if net.ParseIP(hostPart) != nil {
-				if _, pErr := strconv.Atoi(portPart); pErr == nil {
-					// This looks like a valid but malformed IPv6:port. Fix it.
-					fixedAddr := net.JoinHostPort(hostPart, portPart)
+			if ip := net.ParseIP(hostPart); ip != nil {
+				if portNum, pErr := strconv.Atoi(portPart); pErr == nil {
+					// This looks like a valid but malformed IPv6:port. Fix and canonicalize it.
+					fixedAddr := net.JoinHostPort(ip.String(), strconv.Itoa(portNum))
 					logger.Debug("Proxy: Corrected malformed IPv6 address", "original", addr, "corrected", fixedAddr)
 					return fixedAddr
 				}

@@ -12,7 +12,7 @@ import (
 // TestThunderingHerdPrevention verifies that singleflight prevents multiple concurrent
 // fetches for the same key when cache is cold
 func TestThunderingHerdPrevention(t *testing.T) {
-	cache := New(5*time.Minute, 1*time.Minute, 1000, 1*time.Minute, 30*time.Second)
+	cache := New("test", "test", 5*time.Minute, 1*time.Minute, 1000, 1*time.Minute, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	var fetchCount atomic.Int32
@@ -89,7 +89,7 @@ func TestThunderingHerdPrevention(t *testing.T) {
 // TestThunderingHerdPreventionMultipleKeys verifies that singleflight works correctly
 // with multiple different keys (should not block each other)
 func TestThunderingHerdPreventionMultipleKeys(t *testing.T) {
-	cache := New(5*time.Minute, 1*time.Minute, 1000, 1*time.Minute, 30*time.Second)
+	cache := New("test", "test", 5*time.Minute, 1*time.Minute, 1000, 1*time.Minute, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	var fetchCounts sync.Map // map[string]int32
@@ -152,7 +152,7 @@ func TestThunderingHerdPreventionMultipleKeys(t *testing.T) {
 
 // TestThunderingHerdPreventionWithErrors verifies that errors are also deduplicated
 func TestThunderingHerdPreventionWithErrors(t *testing.T) {
-	cache := New(5*time.Minute, 1*time.Minute, 1000, 1*time.Minute, 30*time.Second)
+	cache := New("test", "test", 5*time.Minute, 1*time.Minute, 1000, 1*time.Minute, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	var fetchCount atomic.Int32
@@ -205,7 +205,7 @@ func TestThunderingHerdPreventionWithErrors(t *testing.T) {
 
 // TestCacheHitDoesNotUseSingleflight verifies that cache hits bypass singleflight
 func TestCacheHitDoesNotUseSingleflight(t *testing.T) {
-	cache := New(5*time.Minute, 1*time.Minute, 1000, 1*time.Minute, 30*time.Second)
+	cache := New("test", "test", 5*time.Minute, 1*time.Minute, 1000, 1*time.Minute, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	var fetchCount atomic.Int32

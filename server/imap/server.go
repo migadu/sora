@@ -3,14 +3,15 @@ package imap
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -48,7 +49,10 @@ type warmupJob struct {
 	messageCount int
 }
 
-// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+// getProxyProtocolTrustedProxies returns the hosts trusted to send PROXY headers: the
+// ProxyProtocolTrustedProxies option if set, otherwise trusted_networks. No config key
+// sets that option (there is no proxy_protocol_trusted_proxies, #542), so in a running
+// server PROXY trust is always [servers] trusted_networks.
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {
 		return proxyProtocolTrusted
@@ -105,6 +109,12 @@ func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 		releaseConn, limitErr := l.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
 		if limitErr != nil {
 			logger.Debug("IMAP: Connection rejected", "name", l.name, "error", limitErr)
+			if serverPkg.IsProxiedClientRefusal(limitErr, proxyInfo) {
+				// Answered, not dropped: newSession completes the TLS handshake and
+				// greets with BYE, so the proxy fails this client's login and not
+				// the backend. The connection holds no limiter slot.
+				return &connectionLimitingConn{Conn: conn, proxyInfo: proxyInfo, refusal: limitErr}, nil
+			}
 			conn.Close()
 			continue // Try to accept the next connection
 		}
@@ -122,6 +132,11 @@ func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 				"ip", logIP,
 				"reason", "IP blocked by rate limiter (Tier 2)")
 			releaseConn() // Release the connection limit
+			if serverPkg.IsProxiedClientRefusal(serverPkg.ErrIPBlocked, proxyInfo) {
+				// Answered like the per-IP refusal above, so that one blocked
+				// client does not cost the proxy's backend its health.
+				return &connectionLimitingConn{Conn: conn, proxyInfo: proxyInfo, refusal: serverPkg.ErrIPBlocked}, nil
+			}
 			conn.Close()
 			continue // Try to accept the next connection
 		}
@@ -146,6 +161,7 @@ type connectionLimitingConn struct {
 	net.Conn
 	releaseFunc func()
 	proxyInfo   *serverPkg.ProxyProtocolInfo
+	refusal     error // non-nil: a limiter refused the client, and newSession answers it
 	closeMu     sync.Mutex
 	closed      bool
 }
@@ -254,7 +270,7 @@ type IMAPServer struct {
 	useStartTLS    bool // tlsConfig upgrades a plaintext listener on STARTTLS instead of wrapping it
 	masterUsername []byte
 	masterPassword []byte
-	appendLimit    uint32 // append_limit with the default applied, clamped to maxStoredMessageSize; a session lowers it to its memory budget (IMAPSession.AppendLimit)
+	appendLimit    uint32 // append_limit with the default applied, clamped to consts.MaxStoredMessageSize; a session lowers it to its memory budget (IMAPSession.AppendLimit)
 	ftsRetention   time.Duration
 	version        string
 	config         *config.Config       // Full config reference for shared mailboxes
@@ -309,7 +325,10 @@ type IMAPServer struct {
 	warmupSemaphore     chan struct{}  // Semaphore for sync warmups
 	warmupWg            sync.WaitGroup // Tracks active warmup workers for graceful shutdown
 	warmupStopOnce      sync.Once      // Ensures warmup channel is closed only once
-	lastWarmupTimes     sync.Map       // map[int64]time.Time - tracks last warmup time per user
+	warmupMu            sync.RWMutex   // Read-held by async enqueues, write-held by stopWarmupWorkers to close warmupQueue
+	warmupStopped       bool           // Set under warmupMu when warmupQueue is closed; nothing is sent after that
+	lastWarmupTimes     sync.Map       // map[int64]time.Time - last warmup start per account, see recordWarmup
+	warmupSweptAt       atomic.Int64   // UnixNano of the last sweep of expired lastWarmupTimes entries
 
 	// Highest UID at the last read-write SELECT per mailbox (server-wide, not
 	// per-session). Used to compute NumRecent across sessions per RFC 3501 §2.3.2.
@@ -339,7 +358,7 @@ type IMAPServer struct {
 	// Active connection tracking for graceful shutdown
 	activeConnsMutex sync.RWMutex
 	activeConns      map[*imapserver.Conn]struct{}
-	sessionsWg       sync.WaitGroup // Tracks active sessions for graceful drain
+	sessions         serverPkg.SessionGroup // Tracks active sessions for graceful drain
 }
 
 type IMAPServerOptions struct {
@@ -413,35 +432,31 @@ type IMAPServerOptions struct {
 	CommandTimeout          time.Duration            // Maximum idle time before disconnection
 	CommandTimeoutOverrides map[string]time.Duration // Per-command hard execution timeouts (overrides defaults)
 	AbsoluteSessionTimeout  time.Duration            // Maximum total session duration (0 = no absolute limit)
-	MinBytesPerMinute       int64                    // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
+	MinBytesPerMinute       int64                    // Minimum throughput to prevent slowloris (0 = disabled)
 	// Auth security
-	InsecureAuth bool // Allow PLAIN auth over non-TLS connections (default: true for backends behind proxy)
+	InsecureAuth bool // Allow plaintext authentication over non-TLS connections
 	// Full config for shared mailboxes and other features
 	Config *config.Config
 	// Spam training client (optional)
 	SpamTraining *spamtraining.Client
 }
 
-// maxStoredMessageSize is the largest message sora can store: messages.size and
-// pending_uploads.size are INTEGER columns, which refuse a larger value.
-const maxStoredMessageSize = math.MaxInt32
-
 // effectiveAppendLimit resolves the configured append_limit to the largest
 // message this server accepts, before a session's memory budget lowers it
 // (IMAPSession.AppendLimit). A value of 0 or less means the default. RFC 7889
 // §5: "The number indicates the fixed maximum message size in octets that the
-// server will accept", so a value above maxStoredMessageSize is clamped to it.
-// That also keeps it inside the RFC 3501 "number", an "Unsigned 32-bit integer
-// (0 <= n < 4,294,967,296)", which APPENDLIMIT is written as: converting a
-// larger value with uint32() wrapped "4gb" to 0, which advertised APPENDLIMIT=0
-// and refused every APPEND.
+// server will accept", so a value above consts.MaxStoredMessageSize (the largest
+// message sora can store) is clamped to it. That also keeps it inside the RFC
+// 3501 "number", an "Unsigned 32-bit integer (0 <= n < 4,294,967,296)", which
+// APPENDLIMIT is written as: converting a larger value with uint32() wrapped
+// "4gb" to 0, which advertised APPENDLIMIT=0 and refused every APPEND.
 func effectiveAppendLimit(name string, configured int64) uint32 {
 	if configured <= 0 {
 		return DefaultAppendLimit
 	}
-	if configured > maxStoredMessageSize {
-		logger.Warn("IMAP: append_limit exceeds the largest message sora can store; clamping", "name", name, "append_limit", configured, "clamped_to", maxStoredMessageSize)
-		return maxStoredMessageSize
+	if configured > consts.MaxStoredMessageSize {
+		logger.Warn("IMAP: append_limit exceeds the largest message sora can store; clamping", "name", name, "append_limit", configured, "clamped_to", consts.MaxStoredMessageSize)
+		return consts.MaxStoredMessageSize
 	}
 	return uint32(configured)
 }
@@ -464,6 +479,9 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	}
 	if rdb == nil {
 		return nil, fmt.Errorf("database is required for IMAP server")
+	}
+	if err := config.ValidateIMAPDisabledCaps(options.DisabledCaps); err != nil {
+		return nil, fmt.Errorf("server %q: %w", name, err)
 	}
 
 	// Wrap S3 storage with resilient patterns including circuit breakers
@@ -510,7 +528,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	}
 
 	// Initialize search rate limiter
-	searchRateLimiter := serverPkg.NewSearchRateLimiter("IMAP", options.SearchRateLimitPerMin, options.SearchRateLimitWindow, options.SearchRateLimitBurst)
+	searchRateLimiter := serverPkg.NewSearchRateLimiter("imap", options.SearchRateLimitPerMin, options.SearchRateLimitWindow, options.SearchRateLimitBurst)
 	threadMaxMessages := options.ThreadMaxMessages
 	if threadMaxMessages <= 0 {
 		threadMaxMessages = config.DefaultThreadMaxMessages
@@ -539,25 +557,30 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 
 		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("imap", name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("IMAP: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
-	// Parse warmup timeout with default fallback
+	// Parse warmup timeout with default fallback. Zero or a negative timeout would
+	// cancel every warmup before its first query, so it falls back too.
 	warmupTimeout := 5 * time.Minute // Default timeout
 	if options.WarmupTimeout != "" {
-		if parsed, err := helpers.ParseDuration(options.WarmupTimeout); err != nil {
-			logger.Debug("IMAP: WARNING - invalid warmup_timeout, using default", "name", name, "value", options.WarmupTimeout, "error", err, "default", warmupTimeout)
+		parsed, err := helpers.ParseDuration(options.WarmupTimeout)
+		if err == nil && parsed <= 0 {
+			err = errors.New("must be positive")
+		}
+		if err != nil {
+			logger.Warn("IMAP: invalid warmup_timeout, using the default", "name", name, "value", options.WarmupTimeout, "error", err, "default", warmupTimeout)
 		} else {
 			warmupTimeout = parsed
 		}
 	}
 
-	// Parse warmup interval with default fallback
+	// Parse warmup interval with default fallback. Zero warms at every login.
 	warmupInterval := 24 * time.Hour // Default: only warmup once per day per user
 	if options.WarmupInterval != "" {
 		if parsed, err := helpers.ParseDuration(options.WarmupInterval); err != nil {
-			logger.Debug("IMAP: WARNING - invalid warmup_interval, using default", "name", name, "value", options.WarmupInterval, "error", err, "default", warmupInterval)
+			logger.Warn("IMAP: invalid warmup_interval, using the default", "name", name, "value", options.WarmupInterval, "error", err, "default", warmupInterval)
 		} else {
 			warmupInterval = parsed
 		}
@@ -664,16 +687,18 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		s.commandTimeouts.ApplyOverrides(options.CommandTimeoutOverrides)
 	}
 
-	// Pre-compile regex patterns for capability filters for performance and correctness
+	// Pre-compile regex patterns for capability filters for performance and correctness.
+	// Config validation refuses a pattern that does not compile; a server built
+	// without it skips the filter, which must not go unnoticed at the default level.
 	validFilters := make([]ClientCapabilityFilter, 0, len(options.CapabilityFilters))
-	for _, configFilter := range options.CapabilityFilters {
+	for i, configFilter := range options.CapabilityFilters {
 		filter := ClientCapabilityFilter{ClientCapabilityFilter: configFilter}
 		isValid := true
 
 		if filter.ClientName != "" {
 			re, err := regexp.Compile(filter.ClientName)
 			if err != nil {
-				logger.Debug("IMAP: WARNING - invalid client_name regex in capability filter, skipping", "name", name, "pattern", filter.ClientName, "error", err)
+				logger.Warn("IMAP: Skipping client_filters entry, its client_name is not a valid regular expression", "name", name, "entry", i+1, "pattern", filter.ClientName, "error", err)
 				isValid = false
 			} else {
 				filter.clientNameRegexp = re
@@ -682,7 +707,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		if filter.ClientVersion != "" && isValid {
 			re, err := regexp.Compile(filter.ClientVersion)
 			if err != nil {
-				logger.Debug("IMAP: WARNING - invalid client_version regex in capability filter, skipping", "name", name, "pattern", filter.ClientVersion, "error", err)
+				logger.Warn("IMAP: Skipping client_filters entry, its client_version is not a valid regular expression", "name", name, "entry", i+1, "pattern", filter.ClientVersion, "error", err)
 				isValid = false
 			} else {
 				filter.clientVersionRegexp = re
@@ -694,7 +719,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			for _, pattern := range filter.JA4Fingerprints {
 				re, err := regexp.Compile(pattern)
 				if err != nil {
-					logger.Debug("IMAP: WARNING - invalid ja4_fingerprints regex in capability filter, skipping", "name", name, "pattern", pattern, "error", err)
+					logger.Warn("IMAP: Skipping client_filters entry, one of its ja4_fingerprints is not a valid regular expression", "name", name, "entry", i+1, "pattern", pattern, "error", err)
 					isValid = false
 					break
 				}
@@ -705,7 +730,9 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		// Only add the filter if all regex patterns are valid
 		if isValid {
 			for _, capStr := range filter.DisableCaps {
-				if _, ok := alwaysAdvertisedCaps[imap.Cap(capStr)]; ok {
+				if imap.Cap(capStr) == imap.CapIMAP4rev1 {
+					logger.Warn("IMAP: Capability filter cannot disable IMAP4rev1, go-imap selects connection protocol version from server-global capabilities", "name", name, "capability", capStr, "reason", filter.Reason)
+				} else if _, ok := alwaysAdvertisedCaps[imap.Cap(capStr)]; ok {
 					logger.Warn("IMAP: Capability filter cannot disable capability, go-imap always advertises it with IMAP4rev1", "name", name, "capability", capStr, "reason", filter.Reason)
 				}
 			}
@@ -767,24 +794,11 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	s.idVendor = options.IDVendor
 	s.idSupportURL = options.IDSupportURL
 
-	// Create connection limiter with trusted networks from server configuration
-	// For IMAP backend:
-	// - If PROXY protocol is enabled: only connections from trusted networks allowed, no per-IP limiting
-	// - If PROXY protocol is disabled: trusted networks bypass per-IP limits, others are limited per-IP
-	var limiterTrustedNets []string
-	var limiterMaxPerIP int
-
-	if options.ProxyProtocol {
-		// PROXY protocol enabled: use trusted networks, disable per-IP limiting
-		limiterTrustedNets = options.TrustedNetworks
-		limiterMaxPerIP = 0 // No per-IP limiting when PROXY protocol is enabled
-	} else {
-		// PROXY protocol disabled: use trusted networks for per-IP bypass
-		limiterTrustedNets = options.TrustedNetworks
-		limiterMaxPerIP = options.MaxConnectionsPerIP
-	}
-
-	s.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("IMAP", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
+	// Create the connection limiter. max_connections_per_ip counts the client a PROXY
+	// header names when there is one, else the socket peer, and trusted_networks
+	// exempt the counted address: a trusted proxy or load balancer passes the limit
+	// on to its clients and is only exempt itself when it names none.
+	s.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("IMAP", options.MaxConnections, options.MaxConnectionsPerIP, options.TrustedNetworks)
 
 	// Set listen backlog with reasonable default
 	s.listenBacklog = options.ListenBacklog
@@ -802,44 +816,18 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// commands (notably MYRIGHTS) are functional on a user's own mailboxes
 	// regardless of whether shared mailboxes are configured.
 
-	// Setup TLS: the global [tls] manager's config when there is one, the
-	// per-server certificate files otherwise.
-	if options.TLS && options.TLSConfig != nil {
-		if options.TLSCertFile != "" || options.TLSKeyFile != "" {
-			logger.Warn("IMAP: tls_cert_file/tls_key_file ignored - global [tls] is enabled", "name", name)
-		}
-		s.tlsConfig = options.TLSConfig
-	} else if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
-		logger.Debug("IMAP: Loading TLS certificate", "name", name, "cert", options.TLSCertFile, "key", options.TLSKeyFile)
-		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
+	// The certificate source and tls_verify follow the rule every listener
+	// shares (serverPkg.ListenerTLS).
+	if options.TLS {
+		tlsConfig, err := serverPkg.ListenerTLS{
+			Protocol: "IMAP", Name: name,
+			CertFile: options.TLSCertFile, KeyFile: options.TLSKeyFile, Verify: options.TLSVerify,
+			Global: options.TLSConfig, ALPN: []string{"imap"},
+		}.Config()
 		if err != nil {
-			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, err
 		}
-
-		// Warn if the certificate chain is incomplete.
-		if len(cert.Certificate) < 2 {
-			logger.Debug("IMAP: WARNING - TLS certificate file contains only one certificate, should contain full chain", "name", name, "cert_file", options.TLSCertFile)
-		}
-
-		s.tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12, // Allow older TLS versions for better compatibility
-			ClientAuth:               tls.NoClientCert,
-			ServerName:               hostname,
-			PreferServerCipherSuites: true, // Prefer server cipher suites over client cipher suites
-			NextProtos:               []string{"imap"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-
-		// This setting on the server listener is intended to control client certificate
-		// verification, which is now explicitly disabled via `ClientAuth: tls.NoClientCert`.
-		if !options.TLSVerify {
-			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
-			logger.Debug("IMAP: WARNING - Client TLS certificate verification not enforced", "name", name)
-		}
-	} else if options.TLS {
-		// Without a certificate the listener would be plaintext on the port meant for TLS.
-		return nil, fmt.Errorf("TLS enabled for IMAP [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", name)
+		s.tlsConfig = tlsConfig
 	}
 
 	var debugWriter io.Writer
@@ -924,6 +912,21 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 }
 
 func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+	// Count accepted work before TLS: shutdown must also drain handshakes.
+	// Transfer the registration to IMAPSession.Close only after initialization.
+	if !s.sessions.Add() {
+		return nil, nil, &imap.Error{
+			Type: imap.StatusResponseTypeBye,
+			Text: "Server shutting down, please reconnect",
+		}
+	}
+	initialized := false
+	defer func() {
+		if !initialized {
+			s.sessions.Done()
+		}
+	}()
+
 	// Complete the deferred TLS handshake here, in go-imap's per-connection
 	// goroutine — NOT in the accept loop, where one slow TLS client would
 	// serialize behind the handshake deadline and stall every other client.
@@ -946,7 +949,24 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		}
 	}
 
-	// Connection limits are handled at the listener level
+	// Connection limits and Tier 2 IP blocks are handled at the listener level, which
+	// passes on a refused client a PROXY peer named so that the refusal is answered
+	// here, after the TLS handshake.
+	if lc, ok := conn.NetConn().(*connectionLimitingConn); ok && lc.refusal != nil {
+		if errors.Is(lc.refusal, serverPkg.ErrIPBlocked) {
+			// The reply the IMAP proxy gives a client the auth rate limiter blocks.
+			return nil, nil, &imap.Error{
+				Type: imap.StatusResponseTypeBye,
+				Code: imap.ResponseCodeAlert,
+				Text: "Too many failed authentication attempts. Please try again later.",
+			}
+		}
+		return nil, nil, &imap.Error{
+			Type: imap.StatusResponseTypeBye,
+			Code: imap.ResponseCodeLimit,
+			Text: "Too many connections",
+		}
+	}
 	sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
 	// Prometheus metrics - connection established
@@ -1060,10 +1080,7 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	session.Id = idgen.New()
 	session.HostName = s.hostname
 	session.Stats = s
-	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "IMAP", session.InfoLog)
-
-	// Log connection at INFO level
-	session.InfoLog("connected")
+	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "imap", session.InfoLog)
 
 	greeting := &imapserver.GreetingData{
 		PreAuth: false,
@@ -1071,9 +1088,9 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 
 	// Track active connection for graceful shutdown
 	s.trackConnection(conn)
-
-	// Track session in WaitGroup for graceful drain
-	s.sessionsWg.Add(1)
+	if s.sessions.IsDraining() {
+		serverPkg.RawConn(conn.NetConn()).Close()
+	}
 
 	// Log proxy session ID if present for end-to-end tracing
 	if proxyInfo != nil && proxyInfo.ProxySessionID != "" {
@@ -1085,6 +1102,7 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	// Wrap the session so every IMAP command records throughput/latency metrics
 	// in one place (see metered.go). The wrapper embeds *IMAPSession, so all
 	// optional extension interfaces remain satisfied.
+	initialized = true
 	return newMeteredSession(session), greeting, nil
 }
 
@@ -1228,6 +1246,7 @@ func (s *IMAPServer) SetConnTracker(tracker *serverPkg.ConnectionTracker) {
 }
 
 func (s *IMAPServer) Close() {
+	s.sessions.BeginDrain()
 	s.preview.close()
 
 	// Unregister rate limiter from global registry
@@ -1262,16 +1281,9 @@ func (s *IMAPServer) Close() {
 
 // waitForSessionsDrain waits for all active sessions to finish with a timeout
 func (s *IMAPServer) waitForSessionsDrain(timeout time.Duration) {
-	done := make(chan struct{})
-	go func() {
-		s.sessionsWg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(timeout) {
 		logger.Debug("IMAP: All sessions drained gracefully", "name", s.name)
-	case <-time.After(timeout):
+	} else {
 		logger.Debug("IMAP: Session drain timeout, forcing shutdown", "name", s.name, "timeout", timeout)
 	}
 }
@@ -1362,20 +1374,38 @@ func (s *IMAPServer) DrainSessions() int64 {
 	return s.authenticatedConnections.Load()
 }
 
-// warmupStateFile is the filename for persisting warmup timestamps across restarts.
-// Stored in the cache directory alongside the cache index database.
+// warmupStateFile prefixes the file that keeps an IMAP server's warmup timestamps
+// across restarts, in the cache directory alongside the cache index database. Every
+// IMAP server of a process shares that cache, so the file is named after the server
+// (warmupStatePath): with one file for all of them, the first server to start took
+// every entry and the last one to stop overwrote the others'.
 const warmupStateFile = ".sora_warmup_state"
+
+// warmupStatePath returns this server's warmup state file. Server names are unique in
+// the configuration. A fixed-length lowercase digest keeps arbitrary names within
+// one filesystem component, including on case-insensitive filesystems.
+func (s *IMAPServer) warmupStatePath() string {
+	return filepath.Join(s.cache.GetBasePath(), fmt.Sprintf("%s.%x", warmupStateFile, sha256.Sum256([]byte(s.name))))
+}
+
+// keepsWarmupState reports whether this server has a cache directory to keep its
+// warmup state in. A cache without a base path (the zero-value cache.Cache test
+// fixtures pass; cache.New refuses an empty one) has none: a path joined onto the
+// empty base path names the working directory, which is no place for runtime state.
+func (s *IMAPServer) keepsWarmupState() bool {
+	return s.cache != nil && s.cache.GetBasePath() != ""
+}
 
 // persistWarmupState saves lastWarmupTimes to disk so that after restart,
 // users whose caches are still warm don't trigger unnecessary warmup storms.
 // Format: one line per entry, "accountID unixTimestamp\n"
 // Best-effort: errors are logged but don't affect shutdown.
 func (s *IMAPServer) persistWarmupState() {
-	if s.cache == nil {
+	if !s.keepsWarmupState() {
 		return
 	}
 
-	path := s.cache.GetBasePath() + "/" + warmupStateFile
+	path := s.warmupStatePath()
 
 	f, err := os.CreateTemp(s.cache.GetBasePath(), ".warmup_state_*.tmp")
 	if err != nil {
@@ -1428,11 +1458,15 @@ func (s *IMAPServer) loadWarmupState() {
 		}
 	}()
 
-	if s.cache == nil {
+	if !s.keepsWarmupState() {
 		return
 	}
 
-	path := s.cache.GetBasePath() + "/" + warmupStateFile
+	// The file every IMAP server used to share is not read: the server that starts
+	// first would take the others' entries. Remove it so it does not linger.
+	os.Remove(filepath.Join(s.cache.GetBasePath(), warmupStateFile))
+
+	path := s.warmupStatePath()
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -1503,10 +1537,16 @@ func (s *IMAPServer) startWarmupWorkers() {
 
 // stopWarmupWorkers gracefully shuts down the warmup worker pool.
 // Closes the queue channel (no more jobs accepted) and waits for in-flight jobs to finish.
+// Sessions keep running commands until they drain, so a login can still ask for a
+// warmup after this: the queue is closed under warmupMu with warmupStopped set, and
+// WarmupCache checks the flag under the same lock before it sends.
 func (s *IMAPServer) stopWarmupWorkers() {
 	if s.warmupQueue != nil {
 		s.warmupStopOnce.Do(func() {
+			s.warmupMu.Lock()
+			s.warmupStopped = true
 			close(s.warmupQueue)
+			s.warmupMu.Unlock()
 			// Wait for workers to finish current jobs with timeout
 			done := make(chan struct{})
 			go func() {
@@ -1553,6 +1593,16 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, AccountID int64, mailboxNa
 	}
 
 	if async {
+		// Once the workers are stopped the queue is closed, and a send on a closed
+		// channel panics even in a select with a default: check under the lock that
+		// stopWarmupWorkers closes it under. The send never blocks, so holding the
+		// read lock across it cannot hold up the stop.
+		s.warmupMu.RLock()
+		defer s.warmupMu.RUnlock()
+		if s.warmupStopped {
+			logger.Debug("IMAP: Warmup skipped - warmup workers stopped", "name", s.name, "account_id", AccountID)
+			return nil
+		}
 		// Non-blocking enqueue to the bounded worker pool queue.
 		// If queue is full, we skip warmup but do NOT stamp lastWarmupTimes,
 		// so the user will get a warmup attempt on their next login.
@@ -1581,6 +1631,31 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, AccountID int64, mailboxNa
 	return nil
 }
 
+// recordWarmup stamps the account's warmup as starting at now, so that its logins
+// within warmupInterval do not warm it again. An entry older than the interval
+// suppresses nothing, so at most once per interval the stamp also sweeps the expired
+// entries out: the map then holds at most the accounts warmed within two intervals,
+// not every account warmed since start-up. With no interval nothing is suppressed, so
+// nothing is kept.
+func (s *IMAPServer) recordWarmup(accountID int64, now time.Time) {
+	if s.warmupInterval <= 0 {
+		return
+	}
+	s.lastWarmupTimes.Store(accountID, now)
+
+	swept := s.warmupSweptAt.Load()
+	if now.UnixNano()-swept < int64(s.warmupInterval) || !s.warmupSweptAt.CompareAndSwap(swept, now.UnixNano()) {
+		return // swept within the interval, or another warmup is sweeping
+	}
+	s.lastWarmupTimes.Range(func(key, value any) bool {
+		if now.Sub(value.(time.Time)) >= s.warmupInterval {
+			// Not Delete: a warmup may have stamped the account since Range read it.
+			s.lastWarmupTimes.CompareAndDelete(key, value)
+		}
+		return true
+	})
+}
+
 // executeWarmup performs the actual cache warmup work for a single user.
 // Called by worker goroutines (async) or directly (sync).
 // Stamps lastWarmupTimes only on successful execution start (after dedup check passes again).
@@ -1596,7 +1671,7 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 	}
 
 	// Stamp NOW - we're about to do the work. This prevents duplicate work for this user.
-	s.lastWarmupTimes.Store(job.accountID, time.Now())
+	s.recordWarmup(job.accountID, time.Now())
 	metrics.WarmupOperationsTotal.WithLabelValues(s.name, "started").Inc()
 
 	// Defensive nil check - cache may not be initialized in edge cases or tests
@@ -1610,8 +1685,10 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 
 	logger.Debug("IMAP: Starting cache warmup", "name", s.name, "account_id", job.accountID, "message_count", job.messageCount, "mailboxes", job.mailboxNames)
 
-	// Get recent message content hashes from database through cache
-	messageHashes, err := s.cache.GetRecentMessagesForWarmup(warmupCtx, job.accountID, job.mailboxNames, job.messageCount)
+	// Get the bodies of the recent uploaded messages, each with the S3 key its message
+	// row was stored under. The key keeps the address that was primary when the body
+	// was stored, so it cannot be rebuilt from the account's current primary address.
+	messageBodies, err := s.rdb.GetRecentMessagesForWarmupWithRetry(warmupCtx, job.accountID, job.mailboxNames, job.messageCount)
 	if err != nil {
 		logger.Debug("IMAP: Failed to get recent messages for warmup", "name", s.name, "error", err)
 		metrics.WarmupOperationsTotal.WithLabelValues(s.name, "error").Inc()
@@ -1619,9 +1696,9 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 	}
 
 	totalHashes := 0
-	for mailbox, hashes := range messageHashes {
-		totalHashes += len(hashes)
-		logger.Debug("IMAP: Warmup found messages in mailbox", "name", s.name, "count", len(hashes), "mailbox", mailbox)
+	for mailbox, bodies := range messageBodies {
+		totalHashes += len(bodies)
+		logger.Debug("IMAP: Warmup found messages in mailbox", "name", s.name, "count", len(bodies), "mailbox", mailbox)
 	}
 
 	if totalHashes == 0 {
@@ -1630,20 +1707,13 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 		return
 	}
 
-	// Get user's primary email for S3 key construction
-	address, err := s.rdb.GetPrimaryEmailForAccountWithRetry(warmupCtx, job.accountID)
-	if err != nil {
-		logger.Debug("IMAP: Warmup - failed to get primary address", "name", s.name, "account_id", job.accountID, "error", err)
-		metrics.WarmupOperationsTotal.WithLabelValues(s.name, "error").Inc()
-		return
-	}
-
 	warmedCount := 0
 	skippedCount := 0
 
 	// Pre-fetch each message content
-	for _, hashes := range messageHashes {
-		for _, contentHash := range hashes {
+	for _, bodies := range messageBodies {
+		for _, body := range bodies {
+			contentHash := body.ContentHash
 			// Check for context cancellation
 			select {
 			case <-warmupCtx.Done():
@@ -1653,9 +1723,10 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 			default:
 			}
 
-			// Skip messages with empty content hash (pending upload)
-			if contentHash == "" {
-				logger.Debug("IMAP: Warmup - skipping message with empty content hash", "name", s.name)
+			// Skip a body the cache refuses for its size before downloading it: Put would
+			// only refuse it after the full S3 GET, at every warmup interval.
+			if s.cache.TooLarge(body.Size) {
+				logger.Debug("IMAP: Warmup - skipping, object too large for cache", "name", s.name, "hash", contentHash, "size", body.Size)
 				skippedCount++
 				continue
 			}
@@ -1672,10 +1743,8 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 				continue // Already cached
 			}
 
-			// Build S3 key and fetch from S3 (best-effort)
-			s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), contentHash)
-
-			reader, fetchErr := s.s3.GetWithRetry(warmupCtx, s3Key)
+			// Fetch from S3 (best-effort)
+			reader, fetchErr := s.s3.GetWithRetry(warmupCtx, body.Key())
 			if fetchErr != nil {
 				logger.Debug("IMAP: Warmup - skipping, failed to fetch from S3", "name", s.name, "hash", contentHash, "error", fetchErr)
 				skippedCount++
@@ -1712,10 +1781,17 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 
 // filterCapabilitiesForClient applies client-specific capability filtering and returns disabled capabilities
 func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, clientID *imap.IDData, tlsFingerprint string) []string {
-	var disabledCaps []string
+	disabledCaps, _ := s.filterCapabilitiesForClientExcept(sessionCaps, clientID, tlsFingerprint, nil)
+	return disabledCaps
+}
 
+// filterCapabilitiesForClientExcept applies client-specific capability filtering
+// while preserving capabilities in keep (and avoiding reverse-implication
+// cascades from kept capabilities), and skips IMAP4rev1 because go-imap selects
+// the connection's base IMAP version from server-global capabilities.
+func (s *IMAPServer) filterCapabilitiesForClientExcept(sessionCaps imap.CapSet, clientID *imap.IDData, tlsFingerprint string, keep imap.CapSet) (disabledCaps, keptCaps []string) {
 	if len(s.capFilters) == 0 {
-		return disabledCaps // No filters configured
+		return nil, nil // No filters configured
 	}
 
 	// Extract client info
@@ -1734,7 +1810,18 @@ func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, client
 		if s.clientMatches(clientName, clientVersion, tlsFingerprint, filter) {
 			logger.Debug("IMAP: Applying capability filter", "name", s.name, "reason", filter.Reason, "client_name", clientName, "client_version", clientVersion, "ja4", tlsFingerprint)
 
-			removed := disableCapabilities(sessionCaps, filter.DisableCaps)
+			names := make([]string, 0, len(filter.DisableCaps))
+			for _, capStr := range filter.DisableCaps {
+				if imap.Cap(capStr) == imap.CapIMAP4rev1 {
+					continue
+				}
+				names = append(names, capStr)
+			}
+
+			removed, kept := config.DisableIMAPCapabilities(sessionCaps, names, keep)
+			if len(kept) > 0 {
+				keptCaps = append(keptCaps, kept...)
+			}
 			if len(removed) > 0 {
 				disabledCaps = append(disabledCaps, removed...)
 				logger.Debug("IMAP: Disabled capabilities", "name", s.name, "capabilities", removed, "reason", filter.Reason)
@@ -1742,53 +1829,22 @@ func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, client
 		}
 	}
 
-	return disabledCaps
+	return disabledCaps, keptCaps
 }
 
-// alwaysAdvertisedCaps are the capabilities go-imap lists on every IMAP4rev1
-// server whatever the configured set holds (imapserver availableCaps: SASL-IR
-// and LITERAL- before login, UNSELECT, ENABLE and UTF8=ACCEPT after it), so
-// neither disabled_caps nor client_filters can withdraw them. All but
-// UTF8=ACCEPT are implied by IMAP4rev2, and LITERAL- also by LITERAL+:
-// removing those for them would downgrade the server and leave them advertised
-// all the same.
-var alwaysAdvertisedCaps = imap.CapSet{
-	imap.CapSASLIR:       {},
-	imap.CapLiteralMinus: {},
-	imap.CapUnselect:     {},
-	imap.CapEnable:       {},
-	imap.CapUTF8Accept:   {},
+// alwaysAdvertisedCaps aliases config.IMAPAlwaysAdvertisedCaps so server startup
+// and config validation share one definition.
+var alwaysAdvertisedCaps = config.IMAPAlwaysAdvertisedCaps
+
+// capImplies delegates to config.IMAPCapImplies.
+func capImplies(by, c imap.Cap) bool {
+	return config.IMAPCapImplies(by, c)
 }
 
-// disableCapabilities removes the named capabilities from caps and returns
-// the ones it removed. go-imap's CapSet.Has also reports a capability that
-// another one in the set implies, and builds both the CAPABILITY response and
-// its command gates on Has: IMAP4rev2 implies the extensions RFC 9051 folds
-// into the base protocol (IDLE, ESEARCH, SEARCHRES, MOVE, NAMESPACE, UIDPLUS,
-// ...), QRESYNC implies CONDSTORE (RFC 7162 §3.2.3). Deleting only the named key
-// left such a capability advertised and usable, so whatever implies it is
-// removed too. For IMAP4rev2 that downgrades the server or session to
-// IMAP4rev1, where go-imap lists each remaining extension on its own. The
-// implication test is go-imap's own Has, so it follows the library. A name in
-// alwaysAdvertisedCaps is skipped: nothing removed here can withdraw it.
+// disableCapabilities removes the named capabilities (and any capabilities that
+// imply them) from caps.
 func disableCapabilities(caps imap.CapSet, names []string) []string {
-	var removed []string
-	for _, name := range names {
-		c := imap.Cap(name)
-		if _, ok := alwaysAdvertisedCaps[c]; ok {
-			continue
-		}
-		if _, ok := caps[c]; ok {
-			delete(caps, c)
-			removed = append(removed, name)
-		}
-		for other := range caps {
-			if (imap.CapSet{other: {}}).Has(c) {
-				delete(caps, other)
-				removed = append(removed, string(other))
-			}
-		}
-	}
+	removed, _ := config.DisableIMAPCapabilities(caps, names, nil)
 	return removed
 }
 
@@ -1869,12 +1925,18 @@ func (s *IMAPServer) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	next := *s.settings.Load()
 
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+	// A value that does not parse keeps the running one (start-up, which has none,
+	// uses the default).
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("IMAP config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.commandTimeout)
+	} else if timeout != next.commandTimeout {
 		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 		s.reportCommandTimeout(timeout)
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("IMAP config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
@@ -1882,7 +1944,9 @@ func (s *IMAPServer) ReloadConfig(cfg config.ServerConfig) error {
 		next.minBytesPerMinute = bpm
 		reloaded = append(reloaded, "min_bytes_per_minute")
 	}
-	if limit, err := cfg.GetSessionMemoryLimit(); err == nil && limit != next.sessionMemoryLimit {
+	if limit, err := cfg.GetSessionMemoryLimit(); err != nil {
+		logger.Warn("IMAP config reload: invalid session_memory_limit, keeping the running value", "name", s.name, "error", err, "running", next.sessionMemoryLimit)
+	} else if limit != next.sessionMemoryLimit {
 		next.sessionMemoryLimit = limit
 		reloaded = append(reloaded, "session_memory_limit")
 		warnAppendLimitOverSessionMemory(s.name, s.appendLimit, limit)
@@ -1919,6 +1983,10 @@ func (s *IMAPServer) GetLookupCache() *lookupcache.LookupCache {
 // Authenticate authenticates a user with caching support.
 // This method wraps the database authentication with an optional lookup cache layer.
 // The cache decorates the database call - this is the proper architectural pattern.
+// An error wrapping server.ErrAuthServiceUnavailable (server.IsTemporaryAuthFailure)
+// is no verdict on the password: the database could not be asked, or the stored hash
+// cannot be checked. It is answered as a temporary failure and not counted as a failed
+// login.
 func (s *IMAPServer) Authenticate(ctx context.Context, address, password string) (accountID int64, err error) {
 	// Check context before any work
 	if err := ctx.Err(); err != nil {
@@ -1970,9 +2038,20 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 
 	// Verify password
 	if err := db.VerifyPassword(hashedPassword, password); err != nil {
+		if errors.Is(err, db.ErrUnverifiableHash) {
+			// No password matches the stored hash, so this is no verdict on the submitted
+			// one: the stored data is at fault, and only an administrator can repair it.
+			// Answered like a database outage, as the proxies do: a temporary failure,
+			// not counted as a failed login (a block earned on it would outlast the
+			// repair), nothing cached. A cached login this password missed was dropped
+			// before the database was asked (LookupCache.Authenticate), so it cannot
+			// answer the next guess. VerifyPassword logged why, without the address.
+			logger.Warn("authentication unavailable", "address", address, "reason", "unverifiable_hash", "method", "main_db", "error", err)
+			return 0, fmt.Errorf("%w: %w", serverPkg.ErrAuthServiceUnavailable, err)
+		}
 		// Cache negative result for invalid password if enabled
+		// AuthInvalidPassword = 2 (from lookupcache package)
 		if s.lookupCache != nil {
-			// AuthInvalidPassword = 2 (from lookupcache package)
 			s.lookupCache.SetFailure(address, 2)
 		}
 		logger.Info("authentication failed", "address", address, "reason", "invalid_password", "cached", false, "method", "main_db")

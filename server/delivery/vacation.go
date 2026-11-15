@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"mime"
+	"slices"
 	"strings"
 	"time"
 
@@ -31,6 +32,11 @@ type StandardVacationHandler struct {
 	// used to constrain a user-supplied SIEVE vacation ":from" to an address the
 	// account owns (RFC 5230 §4.4). When nil, any non-empty ":from" is ignored.
 	IsOwnedAddress func(ctx context.Context, accountID int64, address string) (bool, error)
+	// IsAnyOwnedAddress reports whether any of `addresses` is a credential of
+	// `accountID`, in one lookup. It decides the RFC 5230 §4.5 personal message check,
+	// which asks about every recipient of the original message. When nil, that check
+	// is skipped.
+	IsAnyOwnedAddress func(ctx context.Context, accountID int64, addresses []string) (bool, error)
 	// RelayNotify, when set, is called after a vacation response is successfully
 	// enqueued, so a relay worker can process it immediately instead of on its next
 	// poll. Optional.
@@ -88,27 +94,22 @@ func (h *StandardVacationHandler) recipientIsAddressed(ctx context.Context, acco
 			}
 		}
 	}
+	// Check every address as written and in its base form (without +detail), in one
+	// lookup. Credentials are stored without plus-addressing detail, and a
+	// plus-addressed or aliased recipient is still a personal recipient — so jane+tag@
+	// must not be suppressed.
+	candidates := make([]string, 0, 2*len(recipients))
 	for _, a := range recipients {
-		// Check the address as written and its base form (without +detail). Credentials
-		// are stored without plus-addressing detail, and a plus-addressed or aliased
-		// recipient is still a personal recipient — so jane+tag@ must not be suppressed.
-		candidates := []string{a.Address}
+		candidates = append(candidates, a.Address)
 		if parsed, err := server.NewAddress(a.Address); err == nil {
-			if base := parsed.BaseAddress(); base != a.Address {
-				candidates = append(candidates, base)
-			}
-		}
-		for _, c := range candidates {
-			owned, err := h.IsOwnedAddress(ctx, accountID, c)
-			if err != nil {
-				return false, err
-			}
-			if owned {
-				return true, nil
-			}
+			candidates = append(candidates, parsed.BaseAddress())
 		}
 	}
-	return false, nil
+	if len(candidates) == 0 {
+		return false, nil
+	}
+	slices.Sort(candidates)
+	return h.IsAnyOwnedAddress(ctx, accountID, slices.Compact(candidates))
 }
 
 // maxVacationSubjectCodePoints caps the reply's Subject. Without :subject it carries the
@@ -199,7 +200,7 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 	// addresses must appear in To/Cc/Bcc/Resent-*. Avoids backscatter to Bcc'd or
 	// list/alias mail the user wasn't directly addressed on. On lookup error, fail open
 	// and proceed (the null-sender/Auto-Submitted/per-sender-period protections still apply).
-	if h.IsOwnedAddress != nil {
+	if h.IsAnyOwnedAddress != nil {
 		addressed, err := h.recipientIsAddressed(ctx, AccountID, reply.Addresses, originalMessage)
 		if err != nil {
 			h.log("[VACATION] recipient ownership check failed, proceeding: %v", err)

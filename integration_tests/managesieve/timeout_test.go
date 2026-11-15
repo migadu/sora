@@ -97,7 +97,8 @@ func TestCommandTimeout(t *testing.T) {
 	t.Logf("✅ Command timeout test passed - server operates correctly with 10s timeout enabled")
 }
 
-// TestCommandTimeoutMetrics verifies that ManageSieve command timeout metrics are properly tracked
+// TestCommandTimeoutMetrics verifies that the ManageSieve command timeout threshold metric is
+// set. The timeouts themselves are counted in sora_connection_timeouts_total.
 func TestCommandTimeoutMetrics(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -113,33 +114,4 @@ func TestCommandTimeoutMetrics(t *testing.T) {
 		t.Errorf("Expected threshold %.0f seconds, got %.0f seconds", expectedThreshold, thresholdValue)
 	}
 	t.Logf("✅ CommandTimeoutThresholdSeconds[managesieve] = %.0f seconds", thresholdValue)
-
-	// Record initial timeout count
-	initialTimeoutCount := testutil.ToFloat64(metrics.CommandTimeoutsTotal.WithLabelValues("managesieve", "TEST"))
-	t.Logf("Initial timeout count: %.0f", initialTimeoutCount)
-
-	// Simulate a timeout event
-	metrics.CommandTimeoutsTotal.WithLabelValues("managesieve", "TEST").Inc()
-
-	// Verify the counter increased
-	newTimeoutCount := testutil.ToFloat64(metrics.CommandTimeoutsTotal.WithLabelValues("managesieve", "TEST"))
-	expectedCount := initialTimeoutCount + 1.0
-
-	if newTimeoutCount != expectedCount {
-		t.Errorf("Expected timeout count %.0f, got %.0f", expectedCount, newTimeoutCount)
-	}
-	t.Logf("✅ CommandTimeoutsTotal[managesieve,TEST] = %.0f (increased by 1)", newTimeoutCount)
-
-	// Test multiple increments for PUTSCRIPT
-	for i := 0; i < 3; i++ {
-		metrics.CommandTimeoutsTotal.WithLabelValues("managesieve", "PUTSCRIPT").Inc()
-	}
-
-	putscriptTimeouts := testutil.ToFloat64(metrics.CommandTimeoutsTotal.WithLabelValues("managesieve", "PUTSCRIPT"))
-	if putscriptTimeouts < 3.0 {
-		t.Errorf("Expected at least 3 PUTSCRIPT timeouts, got %.0f", putscriptTimeouts)
-	}
-	t.Logf("✅ CommandTimeoutsTotal[managesieve,PUTSCRIPT] = %.0f", putscriptTimeouts)
-
-	t.Log("✅ All command timeout metrics working correctly")
 }

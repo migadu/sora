@@ -1,10 +1,13 @@
 package adminapi
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
+	"time"
 )
 
 // AffinitySetRequest represents a request to set user affinity
@@ -22,30 +25,40 @@ type AffinityGetResponse struct {
 	Found    bool   `json:"found"`
 }
 
+// AffinityListEntry is one affinity in GET /admin/affinity/list
+type AffinityListEntry struct {
+	User       string    `json:"user"`
+	Protocol   string    `json:"protocol"`
+	Backend    string    `json:"backend"`
+	AssignedAt time.Time `json:"assigned_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	NodeID     string    `json:"node_id"` // node that assigned the affinity
+}
+
 // handleAffinitySet handles POST /admin/affinity - set affinity for a user
 func (s *Server) handleAffinitySet(w http.ResponseWriter, r *http.Request) {
 	var req AffinitySetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 
 	// Validate required fields
 	if req.User == "" || req.Protocol == "" || req.Backend == "" {
-		http.Error(w, `{"error": "user, protocol, and backend are required"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "user, protocol, and backend are required")
 		return
 	}
 
 	// Validate protocol
 	req.Protocol = strings.ToLower(req.Protocol)
 	if req.Protocol != "imap" && req.Protocol != "pop3" && req.Protocol != "managesieve" {
-		http.Error(w, `{"error": "protocol must be imap, pop3, or managesieve"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "protocol must be imap, pop3, or managesieve")
 		return
 	}
 
 	// Check if affinity manager is available
 	if s.affinityManager == nil {
-		http.Error(w, `{"error": "Affinity manager not enabled on this server"}`, http.StatusServiceUnavailable)
+		s.writeError(w, http.StatusServiceUnavailable, "Affinity manager not enabled on this server")
 		return
 	}
 
@@ -59,12 +72,12 @@ func (s *Server) handleAffinitySet(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !found {
-			http.Error(w, fmt.Sprintf(`{"error": "Backend %s is not configured for protocol %s. Valid backends: %v"}`, req.Backend, req.Protocol, validBackends), http.StatusBadRequest)
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Backend %s is not configured for protocol %s. Valid backends: %v", req.Backend, req.Protocol, validBackends))
 			return
 		}
 	} else {
 		// If no backends configured for this protocol, reject
-		http.Error(w, fmt.Sprintf(`{"error": "No backends configured for protocol %s"}`, req.Protocol), http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("No backends configured for protocol %s", req.Protocol))
 		return
 	}
 
@@ -88,13 +101,13 @@ func (s *Server) handleAffinityGet(w http.ResponseWriter, r *http.Request) {
 	protocol := strings.ToLower(r.URL.Query().Get("protocol"))
 
 	if user == "" || protocol == "" {
-		http.Error(w, `{"error": "user and protocol query parameters are required"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "user and protocol query parameters are required")
 		return
 	}
 
 	// Check if affinity manager is available
 	if s.affinityManager == nil {
-		http.Error(w, `{"error": "Affinity manager not enabled on this server"}`, http.StatusServiceUnavailable)
+		s.writeError(w, http.StatusServiceUnavailable, "Affinity manager not enabled on this server")
 		return
 	}
 
@@ -102,18 +115,16 @@ func (s *Server) handleAffinityGet(w http.ResponseWriter, r *http.Request) {
 	backend, found := s.affinityManager.GetBackend(user, protocol)
 
 	if !found {
-		http.Error(w, fmt.Sprintf(`{"error": "No affinity set for %s (%s)"}`, user, protocol), http.StatusNotFound)
+		s.writeError(w, http.StatusNotFound, fmt.Sprintf("No affinity set for %s (%s)", user, protocol))
 		return
 	}
 
-	resp := map[string]any{
-		"user":     user,
-		"protocol": protocol,
-		"backend":  backend,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	s.writeJSON(w, http.StatusOK, AffinityGetResponse{
+		User:     user,
+		Protocol: protocol,
+		Backend:  backend,
+		Found:    true,
+	})
 }
 
 // handleAffinityDelete handles DELETE /admin/affinity?user=x&protocol=y - delete affinity for a user
@@ -122,13 +133,13 @@ func (s *Server) handleAffinityDelete(w http.ResponseWriter, r *http.Request) {
 	protocol := strings.ToLower(r.URL.Query().Get("protocol"))
 
 	if user == "" || protocol == "" {
-		http.Error(w, `{"error": "user and protocol query parameters are required"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "user and protocol query parameters are required")
 		return
 	}
 
 	// Check if affinity manager is available
 	if s.affinityManager == nil {
-		http.Error(w, `{"error": "Affinity manager not enabled on this server"}`, http.StatusServiceUnavailable)
+		s.writeError(w, http.StatusServiceUnavailable, "Affinity manager not enabled on this server")
 		return
 	}
 
@@ -145,19 +156,42 @@ func (s *Server) handleAffinityDelete(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleAffinityList handles GET /admin/affinity/list - list all affinities
+// handleAffinityList handles GET /admin/affinity/list[?protocol=x][&backend=y] - lists
+// this node's affinities, optionally of one protocol or one backend: those it assigned
+// and those it received by gossip. A node that was down or joined after an affinity was
+// gossiped does not hold it (there is no full-state exchange), so nodes can differ.
 func (s *Server) handleAffinityList(w http.ResponseWriter, r *http.Request) {
+	protocol := strings.ToLower(r.URL.Query().Get("protocol"))
+	backend := r.URL.Query().Get("backend")
+
 	// Check if affinity manager is available
 	if s.affinityManager == nil {
-		http.Error(w, `{"error": "Affinity manager not enabled on this server"}`, http.StatusServiceUnavailable)
+		s.writeError(w, http.StatusServiceUnavailable, "Affinity manager not enabled on this server")
 		return
 	}
 
-	// Note: The AffinityManager interface doesn't have a List method
-	// Affinities are distributed via gossip and stored in memory on each node
-	// To list all affinities, you would need to query each node individually
-	// or extend the AffinityManager interface to support listing
-	http.Error(w, `{"error": "List operation not yet implemented - affinities are distributed via gossip. Use GET with specific user/protocol to check affinity."}`, http.StatusNotImplemented)
+	affinities := []AffinityListEntry{}
+	for _, e := range s.affinityManager.List() {
+		if (protocol != "" && e.Protocol != protocol) || (backend != "" && e.Backend != backend) {
+			continue
+		}
+		affinities = append(affinities, AffinityListEntry{
+			User:       e.Username,
+			Protocol:   e.Protocol,
+			Backend:    e.Backend,
+			AssignedAt: e.AssignedAt,
+			ExpiresAt:  e.ExpiresAt,
+			NodeID:     e.NodeID,
+		})
+	}
+	slices.SortFunc(affinities, func(a, b AffinityListEntry) int {
+		return cmp.Or(strings.Compare(a.User, b.User), strings.Compare(a.Protocol, b.Protocol))
+	})
+
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"affinities": affinities,
+		"count":      len(affinities),
+	})
 }
 
 // handleAffinityStats handles GET /admin/affinity/stats - returns affinity statistics

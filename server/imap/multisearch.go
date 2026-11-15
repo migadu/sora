@@ -17,6 +17,11 @@ import (
 // (sequence numbers are meaningless for unselected mailboxes), and every result
 // carries its Mailbox + UIDValidity so returned UIDs are unambiguous.
 func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource, criteria *imap.SearchCriteria, options *imap.SearchOptions) (_ []*imap.SearchData, err error) {
+	// RFC 7377 §2: the ESEARCH command, with or without IN, is MULTISEARCH's.
+	if err := s.requireCapability(imap.CapMultiSearch, "ESEARCH"); err != nil {
+		return nil, err
+	}
+
 	if options != nil && options.ReturnSave {
 		defer func() { s.emptySavedSearchOnNo(err) }()
 	}

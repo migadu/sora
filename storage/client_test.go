@@ -124,6 +124,45 @@ func TestNewDebugLogsRequests(t *testing.T) {
 	}
 }
 
+// TestNewDebugLogOmitsSignatureAndSessionToken: the request trace goes to the server
+// log, so it must not carry what lets a reader of that log replay the request (S3
+// accepts the same signed request again while its X-Amz-Date is recent) or sign with
+// the deployment's role: the SigV4 signature and the session token. The credential
+// scope stays, since it shows the signing region.
+func TestNewDebugLogOmitsSignatureAndSessionToken(t *testing.T) {
+	isolateAWSEnvironment(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIDFROMENVIRONMENT")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret-from-environment")
+	t.Setenv("AWS_SESSION_TOKEN", "session-token-from-environment")
+	logs := captureLog(t)
+
+	rec, endpoint := newRecordingS3(t)
+	s, err := New(endpoint, "", "", "mail", false, true, 5*time.Second)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	headObject(t, s)
+
+	auth := rec.lastAuthorization()
+	_, signature, ok := strings.Cut(auth, "Signature=")
+	if !ok || signature == "" {
+		t.Fatalf("Authorization = %q, want a SigV4 signature", auth)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "HEAD /mail/example.com/user/hash") {
+		t.Fatalf("debug = true logged no S3 request; log:\n%s", out)
+	}
+	if strings.Contains(out, signature) {
+		t.Errorf("debug log carries the request signature %q:\n%s", signature, out)
+	}
+	if strings.Contains(out, "session-token-from-environment") {
+		t.Errorf("debug log carries the session token:\n%s", out)
+	}
+	if !strings.Contains(out, "Credential=AKIDFROMENVIRONMENT/") || !strings.Contains(out, "/us-east-1/s3/aws4_request") {
+		t.Errorf("debug log lost the credential scope; log:\n%s", out)
+	}
+}
+
 // TestNewWithoutDebugWritesNothingToStderr: the server logs through the logger
 // package, and with debug = false the S3 client logs nothing at all - not even the
 // SDK's "Response has no supported checksum" warning, which a store that sends no

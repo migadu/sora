@@ -34,7 +34,6 @@ const s3OperationTimeout = 5 * time.Second
 type S3Cache struct {
 	client *s3.Client
 	bucket string
-	prefix string // Key prefix for certificate storage (default: "autocert/")
 	// sseAlgorithm is the server-side encryption asked of the store on every write.
 	// Empty sends no header.
 	sseAlgorithm types.ServerSideEncryption
@@ -128,7 +127,6 @@ func NewS3Cache(cfg config.TLSLetsEncryptS3Config, opts ...S3CacheOption) (*S3Ca
 	cache := &S3Cache{
 		client:       client,
 		bucket:       cfg.Bucket,
-		prefix:       "autocert/",
 		sseAlgorithm: defaultSSEAlgorithm,
 	}
 	for _, opt := range opts {
@@ -166,7 +164,7 @@ func (c *S3Cache) verifyBucketAccess(ctx context.Context) error {
 
 // Get retrieves a certificate data from S3.
 func (c *S3Cache) Get(ctx context.Context, key string) ([]byte, error) {
-	s3Key := c.prefix + hashKey(key)
+	s3Key := S3ObjectKey(key)
 
 	logger.Debug("S3-Cache: Getting certificate", "key", key, "s3_key", s3Key)
 
@@ -209,7 +207,7 @@ func (c *S3Cache) Get(ctx context.Context, key string) ([]byte, error) {
 
 // Put stores certificate data in S3.
 func (c *S3Cache) Put(ctx context.Context, key string, data []byte) error {
-	s3Key := c.prefix + hashKey(key)
+	s3Key := S3ObjectKey(key)
 
 	logger.Debug("S3-Cache: Putting certificate", "key", key, "s3_key", s3Key, "bytes", len(data))
 
@@ -246,7 +244,7 @@ func (c *S3Cache) Put(ctx context.Context, key string, data []byte) error {
 
 // Delete removes certificate data from S3.
 func (c *S3Cache) Delete(ctx context.Context, key string) error {
-	s3Key := c.prefix + hashKey(key)
+	s3Key := S3ObjectKey(key)
 
 	logger.Debug("S3-Cache: Deleting certificate", "key", key, "s3_key", s3Key)
 
@@ -275,6 +273,17 @@ func (c *S3Cache) Delete(ctx context.Context, key string) error {
 
 	logger.Debug("S3-Cache: Successfully deleted certificate", "key", key)
 	return nil
+}
+
+// s3KeyPrefix is the bucket prefix every S3 cache entry is stored under.
+const s3KeyPrefix = "autocert/"
+
+// S3ObjectKey returns the bucket key the S3 cache stores the autocert cache entry name
+// under. autocert names a domain's ECDSA certificate "<domain>" and its RSA one
+// "<domain>+rsa" (lowercase, Punycode, no trailing dot). Tools that manage the bucket
+// use this so that they address exactly the objects the server reads and writes.
+func S3ObjectKey(name string) string {
+	return s3KeyPrefix + hashKey(name)
 }
 
 // hashKey creates a deterministic hash of the certificate key for S3 storage.

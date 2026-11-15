@@ -38,9 +38,9 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 	highestModSeqToPollFrom := s.currentHighestModSeq.Load()
 	release()
 
-	// Hold off while a STORE .SILENT of this session is between its write and
-	// its own MODSEQ responses (the NOTIFY pump polls concurrently), so the
-	// delta read below either precedes that write or finds it in ownStoreEcho.
+	// Hold off while a STORE of this session is between its write and its own
+	// FETCH responses (the NOTIFY pump polls concurrently), so the delta read
+	// below either precedes that write or finds it in ownStoreEcho.
 	s.ownStoreMu.Lock()
 	unlockOwnStore := sync.OnceFunc(s.ownStoreMu.Unlock)
 	defer unlockOwnStore()
@@ -369,7 +369,7 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 			continue
 		}
 
-		// Already answered by this session's own STORE .SILENT, without FLAGS.
+		// Already answered by this session's own STORE.
 		if modSeq, ok := s.ownStoreEcho[update.UID]; ok && modSeq == update.EffectiveModSeq && s.ownStoreEchoMailboxID == mailboxID {
 			continue
 		}

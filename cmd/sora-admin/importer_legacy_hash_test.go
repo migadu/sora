@@ -96,6 +96,21 @@ func TestImporter_RerunOverPreBLAKE3Import(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Refusing a previously imported file under a temporary lower limit must
+	// preserve its cached legacy identity. Raising the limit again must still
+	// recognize the PostgreSQL rows instead of importing them under BLAKE3.
+	limitedOptions := options
+	limitedOptions.MaxMessageSize = 1
+	limited, err := NewImporter(context.Background(), maildirPath, testEmail, 1, rdb, nil, limitedOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := limited.Run(); err == nil {
+		t.Error("run under the lower size limit should report the refused files")
+	}
+	if err := limited.Close(); err != nil {
+		t.Fatal(err)
+	}
 	fourth := filepath.Join(maildirPath, "cur", "m4:2,S")
 	if err := os.WriteFile(fourth, message(4), 0644); err != nil {
 		t.Fatal(err)

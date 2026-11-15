@@ -235,6 +235,92 @@ func TestImporter_DryRunPreviewsTheImport(t *testing.T) {
 	}
 }
 
+// TestImporter_DovecotKeywordsPerFolder: the keyword letters in a maildir filename
+// index the dovecot-keywords file of that message's folder, and a folder without one
+// names none (Dovecot maildir-keywords.c clears the list on ENOENT). The dry-run
+// listing must show each message's flags as the import stores them, and neither may
+// read a folder's letters through INBOX's file at the maildir root.
+func TestImporter_DovecotKeywordsPerFolder(t *testing.T) {
+	rdb := setupTestDatabase(t)
+	defer rdb.Close()
+	ctx := context.Background()
+
+	const email = "keywords@example.com"
+	createSimpleTestAccount(t, rdb, email, "testpassword123")
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, email)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Every message carries keyword letter a (index 0), which INBOX's file names
+	// $Important, Work's file names Project, and Other has no file to name.
+	maildir := filepath.Join(t.TempDir(), "Maildir")
+	folders := []struct {
+		dir, mailbox, keywords, filename string
+		want                             []string
+	}{
+		{"", "INBOX", "0 $Important\n", "1700000001.M1P1.host", []string{`\Seen`, "$Important"}},
+		{".Work", "Work", "0 Project\n", "1700000002.M2P2.host", []string{`\Seen`, "Project"}},
+		{".Other", "Other", "", "1700000003.M3P3.host", []string{`\Seen`}},
+	}
+	for _, f := range folders {
+		path := filepath.Join(maildir, f.dir)
+		createMaildirFolder(t, path)
+		createMessagesInMaildir(t, path, []testMessage{{uid: 1, filename: f.filename, flags: "Sa",
+			subject: f.mailbox, from: "a@example.com", to: email, date: time.Now()}})
+		if f.keywords != "" {
+			if err := os.WriteFile(filepath.Join(path, "dovecot-keywords"), []byte(f.keywords), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	opts := ImporterOptions{Dovecot: true, PreserveFlags: true, TestMode: true, BatchSize: 10}
+	dryRun := opts
+	dryRun.DryRun = true
+	importer, err := NewImporter(ctx, maildir, email, 1, rdb, nil, dryRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	report := captureImporterStdout(t, func() { runErr = importer.Run() })
+	if runErr != nil {
+		t.Fatalf("dry run: %v", runErr)
+	}
+	for _, f := range folders {
+		want := fmt.Sprintf("Flags: %v", f.want)
+		_, entry, found := strings.Cut(report, "IMPORT "+f.filename)
+		entry, _, _ = strings.Cut(entry, "\n\n")
+		if !found || !strings.Contains(entry, want) {
+			t.Errorf("the dry run does not list the %s message with %q:\n%s", f.mailbox, want, report)
+		}
+	}
+
+	importer, err = NewImporter(ctx, maildir, email, 1, rdb, nil, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := importer.Run(); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	for _, f := range folders {
+		mailboxID, err := rdb.GetOwnedMailboxIDByNameWithRetry(ctx, accountID, f.mailbox)
+		if err != nil {
+			t.Fatalf("mailbox %s: %v", f.mailbox, err)
+		}
+		messages, err := rdb.ListMessagesWithRetry(ctx, mailboxID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(messages) != 1 {
+			t.Fatalf("%s has %d messages, want 1", f.mailbox, len(messages))
+		}
+		if got, want := fmt.Sprint(messages[0].CustomFlags), fmt.Sprint(f.want[1:]); got != want {
+			t.Errorf("the %s message was imported with keywords %s, want %s", f.mailbox, got, want)
+		}
+	}
+}
+
 // TestS3Importer_DryRunChangesNothing is TestImporter_DryRunChangesNothing for
 // `import s3 --dry-run`, whose analysis created the default mailboxes as well.
 func TestS3Importer_DryRunChangesNothing(t *testing.T) {

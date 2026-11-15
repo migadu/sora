@@ -45,6 +45,17 @@ func (rd *ResilientDatabase) IsAddressOwnedByAccountWithRetry(ctx context.Contex
 	return result.(bool), nil
 }
 
+func (rd *ResilientDatabase) IsAnyAddressOwnedByAccountWithRetry(ctx context.Context, accountID int64, addresses []string) (bool, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).IsAnyAddressOwnedByAccount(ctx, accountID, addresses)
+	}
+	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
+
 func (rd *ResilientDatabase) DeleteCredentialWithRetry(ctx context.Context, email string) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(ctx, true).DeleteCredential(ctx, tx, email)
@@ -562,15 +573,24 @@ func (rd *ResilientDatabase) PruneOldMessageVectorsWithRetry(ctx context.Context
 	}
 	return result.(int64), nil
 }
-func (rd *ResilientDatabase) GetUnusedFTSKeysWithRetry(ctx context.Context, batchSize int) ([]db.FTSKey, error) {
+func (rd *ResilientDatabase) GetUnusedFTSKeysWithRetry(ctx context.Context, after db.FTSKey, batchSize int) ([]db.FTSKey, db.FTSKey, error) {
+	type scanResult struct {
+		keys []db.FTSKey
+		next db.FTSKey
+	}
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetUnusedFTSKeys(ctx, batchSize)
+		keys, next, err := rd.getOperationalDatabaseForOperation(ctx, false).GetUnusedFTSKeys(ctx, after, batchSize)
+		if err != nil {
+			return nil, err
+		}
+		return scanResult{keys: keys, next: next}, nil
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutSearch, op)
 	if err != nil {
-		return nil, err
+		return nil, after, err
 	}
-	return result.([]db.FTSKey), nil
+	res := result.(scanResult)
+	return res.keys, res.next, nil
 }
 
 func (rd *ResilientDatabase) DeleteMessagesFTSByKeyBatchWithRetry(ctx context.Context, keys []db.FTSKey) (int64, error) {
@@ -642,7 +662,7 @@ var ErrCommitOutcomeUnknown = errors.New("database commit outcome unknown")
 func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, config retry.BackoffConfig, opType timeoutType, op func(ctx context.Context, tx pgx.Tx) (any, error), nonRetryableErrors ...error) (any, error) {
 	var result any
 	err := retry.WithRetryAdvanced(ctx, func() error {
-		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
+		tx, origin, err := rd.beginWriteTxWithRetry(ctx, pgx.TxOptions{})
 		if err != nil {
 			if rd.isRetryableError(err) {
 				return err
@@ -700,7 +720,7 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 			// will open a fresh connection that DNS / the load balancer can route to
 			// the new primary.
 			if isReadOnlyTransactionError(cbErr) {
-				rd.resetCurrentWritePool()
+				rd.onReadOnlyWriteTx(origin)
 			}
 
 			for _, nonRetryableErr := range nonRetryableErrors {

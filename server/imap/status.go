@@ -8,7 +8,42 @@ import (
 	"github.com/migadu/sora/consts"
 )
 
+// checkStatusItems refuses the STATUS data items this session does not offer,
+// for STATUS and for LIST RETURN (STATUS), whose items are those of STATUS (RFC
+// 5819 §2). It runs before anything is written: go-imap writes the STATUS line
+// as it goes and cannot take back an item the session leaves unset.
+func (s *IMAPSession) checkStatusItems(options *imap.StatusOptions) error {
+	// RFC 8438 §1: with LIST-STATUS, SIZE "can be queried for many mailboxes at
+	// once using just one LIST command", so it needs STATUS=SIZE there as well.
+	if options.Size {
+		if err := s.requireCapability(imap.CapStatusSize, "STATUS SIZE"); err != nil {
+			return err
+		}
+	}
+	// DELETED is IMAP4rev2's (RFC 9051 §6.3.11); RFC 3501 has no such item.
+	// QUOTA=RES-MESSAGE would offer it too (RFC 9208 §4.1.4), but sora offers no
+	// QUOTA.
+	if options.NumDeleted {
+		if err := s.requireCapability(imap.CapIMAP4rev2, "STATUS DELETED"); err != nil {
+			return err
+		}
+	}
+	// DELETED-STORAGE is QUOTA=RES-STORAGE's (RFC 9208 §4.1.4), which sora does
+	// not offer, so sora does not compute it either.
+	if options.DeletedStorage {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Code: imap.ResponseCodeClientBug,
+			Text: "STATUS DELETED-STORAGE is not supported",
+		}
+	}
+	return nil
+}
+
 func (s *IMAPSession) Status(ctx context.Context, mboxName string, options *imap.StatusOptions) (*imap.StatusData, error) {
+	if err := s.checkStatusItems(options); err != nil {
+		return nil, err
+	}
 	ctx = s.pinnedContext(ctx)
 
 	// First phase: Read validation with read lock
@@ -100,6 +135,14 @@ func (s *IMAPSession) Status(ctx context.Context, mboxName string, options *imap
 	if options.AppendLimit {
 		limit := s.AppendLimit()
 		statusData.AppendLimit = &limit
+	}
+	if options.NumDeleted {
+		deleted, err := s.server.rdb.CountDeletedMessagesWithRetry(ctx, []int64{mailbox.ID})
+		if err != nil {
+			return nil, s.internalError("failed to count deleted messages in '%s': %v", mboxName, err)
+		}
+		num := deleted[mailbox.ID]
+		statusData.NumDeleted = &num
 	}
 	if options.Size {
 		// RFC 8438: SIZE is the sum of RFC822.SIZE of all messages in the
