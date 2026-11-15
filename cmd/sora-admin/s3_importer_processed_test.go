@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"testing"
@@ -38,7 +39,7 @@ func insertS3Objects(t *testing.T, si *S3Importer, domain, localPart string, n i
 // at least a page per object in the temporary directory.
 func TestS3ImporterMarksEveryObjectProcessed(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
-	si, err := NewS3Importer(nil, nil, S3ImporterOptions{Email: "user@example.com", Workers: 5, CleanupDB: true})
+	si, err := NewS3Importer(context.Background(), nil, nil, S3ImporterOptions{Email: "user@example.com", Workers: 5, CleanupDB: true})
 	require.NoError(t, err)
 	defer si.Close()
 
