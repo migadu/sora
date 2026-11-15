@@ -222,11 +222,14 @@ Dovecot stores custom keywords as letters `a` to `z` in file names. Each folder 
 With `--dovecot`, the `subscriptions` file at the maildir root is read:
 
 1. Sora's default mailboxes are created: `INBOX`, `Sent`, `Drafts`, `Archive`, `Junk`, `Trash`.
-2. Each name in the file is decoded from modified UTF-7, passed through the folder mapping of
-   [section 3](#3-the-maildir-layout-sora-reads), and recorded as a subscription. Dovecot's
-   version-2 file separates the parts of a nested name with tab characters; they are joined with
-   `/`, so `Work` + tab + `2024` subscribes `Work/2024`. No mailbox is created for it:
-   subscriptions are names, and Dovecot allows subscriptions to folders that do not exist.
+2. Each name in the file is read as a folder name is, by rules 3 to 6 of
+   [section 3](#3-the-maildir-layout-sora-reads) (escaped characters restored, modified UTF-7
+   decoded, the folder mapping), and recorded as a subscription. Dovecot writes a folder's
+   subscription in the same form as the folder's directory name, so `v1\2e2` subscribes the
+   folder `.v1\2e2`, imported as `v1.2`. Dovecot's version-2 file separates the parts of a nested
+   name with tab characters; they are joined with `/`, so `Work` + tab + `2024` subscribes
+   `Work/2024`. No mailbox is created for it: subscriptions are names, and Dovecot allows
+   subscriptions to folders that do not exist.
 
 ### UIDs (`dovecot-uidlist`)
 
@@ -493,7 +496,8 @@ kept. A folder can name at most 26 keywords; further ones are logged and left ou
 **Subscriptions.** With `--dovecot`, `subscriptions` at the root lists every subscribed name,
 also of folders that no longer exist, in Dovecot's version-2 format: a `V` + tab + `2` line and an
 empty line, then one name per line, with the levels of a nested name separated by tab
-characters.
+characters. Each level is written as a folder's directory is (modified UTF-7, `.` and `\`
+escaped), as Dovecot writes it, so `v1.2` is subscribed as `v1\2e2`.
 
 **UID lists.** With `--dovecot` or `--export-dovecot-uidlist`, each exported folder gets a
 `dovecot-uidlist` with the mailbox's UIDVALIDITY and each message's Sora UID. An existing
@@ -517,8 +521,10 @@ Each message is tried three times. If any message or mailbox fails, the command 
 ## 15. Round trips and known limits
 
 - **Backslashes in folder names.** The importer reads `\` and two hex digits in a directory name
-  as an escaped character ([section 3](#3-the-maildir-layout-sora-reads)), so a folder from
-  another system whose name really contains `\2e` is imported with a `.` there instead.
+  or a subscription as an escaped character ([section 3](#3-the-maildir-layout-sora-reads)), so a
+  folder from another system whose name really contains `\2e` is imported with a `.` there
+  instead. The same applies to a subscription to such a name in an export made before
+  subscriptions were escaped.
 - **Exporting into an imported maildir.** Export and import share the file name
   `sora-maildir.db`. Export into an empty directory, not into a maildir you imported from.
 - **Not imported:** Dovecot's index files (`dovecot.index*`), quota files, ACL files, and

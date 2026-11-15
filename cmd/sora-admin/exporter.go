@@ -16,6 +16,7 @@ import (
 	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
@@ -448,7 +449,7 @@ func (exporter *Exporter) shouldExportMailbox(mailboxName string) bool {
 // exporter must never trust a name already persisted in the database.
 //
 // Each level of the name is one directory (Dovecot's LAYOUT=fs), named by
-// maildirFolderLevel so that the importer's resolveMailboxName reads it back.
+// maildirFolderName so that the importer's resolveMailboxName reads it back.
 func (exporter *Exporter) mailboxDir(mailboxName string) (string, error) {
 	if mailboxName == "INBOX" {
 		return exporter.maildirPath, nil
@@ -456,11 +457,7 @@ func (exporter *Exporter) mailboxDir(mailboxName string) (string, error) {
 	if helpers.MailboxNameHasTraversal(mailboxName) {
 		return "", fmt.Errorf("mailbox %q resolves outside the export directory", mailboxName)
 	}
-	levels := strings.Split(mailboxName, "/")
-	for i, level := range levels {
-		levels[i] = maildirFolderLevel(level)
-	}
-	dir := filepath.Join(exporter.maildirPath, filepath.Join(levels...))
+	dir := filepath.Join(exporter.maildirPath, filepath.FromSlash(maildirFolderName(mailboxName)))
 	rel, err := filepath.Rel(exporter.maildirPath, dir)
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("mailbox %q resolves outside the export directory", mailboxName)
@@ -474,6 +471,19 @@ func (exporter *Exporter) mailboxDir(mailboxName string) (string, error) {
 // default; mailbox_list_storage_escape_char in 2.4), whose
 // mailbox_list_escape_name_params writes the same form.
 const maildirEscapeChar = '\\'
+
+// maildirFolderName is a mailbox's name on disk, its levels joined by '/', each named
+// by maildirFolderLevel: Dovecot's storage name. The export names both the folder's
+// directories and its entry in the subscriptions file so, as Dovecot names both by
+// the storage name, and the importer reads both back through importedFolderName.
+func maildirFolderName(mailboxName string) string {
+	delim := string(consts.MailboxDelimiter)
+	levels := strings.Split(mailboxName, delim)
+	for i, level := range levels {
+		levels[i] = maildirFolderLevel(level)
+	}
+	return strings.Join(levels, delim)
+}
 
 // maildirFolderLevel is the directory name of one level of a mailbox name. It is
 // modified UTF-7, as Dovecot names folders on disk and as exportSubscriptions names
@@ -858,11 +868,13 @@ func (exporter *Exporter) exportSubscriptions(accountID int64) error {
 		return fmt.Errorf("failed to fetch subscriptions for export: %w", err)
 	}
 
-	// Dovecot's Maildir++ subscriptions file stores Modified UTF-7 mailbox names,
-	// matching parseDovecotSubscriptions + importedFolderName (DecodeModifiedUTF7) on import.
+	// Dovecot's subscriptions file holds storage names (index_storage_set_subscribed
+	// writes box->name), so each name is written as its folder's directories are named,
+	// modified UTF-7 and escaped (maildirFolderName). The import reads both back through
+	// importedFolderName, so a subscription names the mailbox its folder imports as.
 	encoded := make([]string, len(names))
 	for i, name := range names {
-		encoded[i] = helpers.EncodeModifiedUTF7(name)
+		encoded[i] = maildirFolderName(name)
 	}
 
 	return os.WriteFile(subscriptionsPath, []byte(formatDovecotSubscriptions(encoded)), 0644)

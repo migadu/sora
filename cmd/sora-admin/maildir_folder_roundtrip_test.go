@@ -106,3 +106,45 @@ func TestImportRestoresEscapedFolderNameCharacters(t *testing.T) {
 		}
 	}
 }
+
+// TestSubscriptionsNameTheMailboxesTheirFoldersImportAs: a subscriptions file names a
+// folder by its storage name, the name its directory has: Dovecot writes box->name
+// (index_storage_set_subscribed), escaped by its storage name escape character, and
+// reads it back with mailbox_list_get_vname. So a Dovecot Maildir++ maildir with
+// listescape has the folder ".v1\2e2.Notes" subscribed as "v1\2e2" TAB "Notes", and
+// both must import as "v1.2/Notes" (#1166). Sora's export writes a subscription the
+// same way, so each name's subscriptions entry imports as the name.
+func TestSubscriptionsNameTheMailboxesTheirFoldersImportAs(t *testing.T) {
+	root := t.TempDir()
+	importer := &Importer{maildirPath: root}
+	subscribedAs := func(file string) string {
+		t.Helper()
+		names := parseDovecotSubscriptions(file)
+		require.Len(t, names, 1, "%q", file)
+		name, err := importedFolderName(names[0])
+		require.NoError(t, err, file)
+		return name
+	}
+
+	for _, tc := range []struct{ dir, subscriptions string }{
+		{`.v1\2e2.Notes`, "V\t2\n\nv1\\2e2\tNotes\n"},
+		{`.v1\2e2.Notes`, "v1\\2e2.Notes\n"}, // unversioned: levels joined by '.'
+		{`.R\5cD`, "V\t2\n\nR\\5cD\n"},
+		{`.Donn&AOk-es\2e2026`, "V\t2\n\nDonn&AOk-es\\2e2026\n"},
+	} {
+		folder, err := importer.resolveMailboxName(filepath.Join(root, tc.dir))
+		require.NoError(t, err, tc.dir)
+		assert.Equal(t, folder, subscribedAs(tc.subscriptions), "folder %q, subscriptions %q", tc.dir, tc.subscriptions)
+	}
+
+	exporter := &Exporter{maildirPath: root}
+	for _, name := range roundTripFolderNames {
+		dir, err := exporter.mailboxDir(name)
+		require.NoError(t, err, name)
+		rel, err := filepath.Rel(root, dir)
+		require.NoError(t, err, name)
+		entry := maildirFolderName(name)
+		assert.Equal(t, filepath.ToSlash(rel), entry, "subscription of %q names its directory", name)
+		assert.Equal(t, name, subscribedAs(formatDovecotSubscriptions([]string{entry})), "subscription of %q", name)
+	}
+}

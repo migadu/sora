@@ -42,6 +42,7 @@ func TestExportImportKeepsFolderNames(t *testing.T) {
 		".Literal &-AOk-":  "Literal &AOk-",
 		".Donn&AOk-es.Q1":  "Données/Q1",
 		`.Work.v1\2e2.Old`: "Work/v1.2/Old",
+		`.a\5c2eb`:         `a\2eb`,
 	}
 	src := t.TempDir()
 	createMaildirFolder(t, src)
@@ -57,7 +58,9 @@ func TestExportImportKeepsFolderNames(t *testing.T) {
 		}})
 		want = append(want, name)
 	}
-	subscriptions := "V\t2\n\nv1.2\nR&-D25-Notes\nLiteral &-AOk-\nDonn&AOk-es\tQ1\nWork\tv1.2\tOld\n"
+	// Dovecot's subscriptions file holds the same storage names as the folders, levels
+	// joined by TAB (index_storage_set_subscribed writes box->name).
+	subscriptions := "V\t2\n\nv1\\2e2\nR&-D25-Notes\nLiteral &-AOk-\nDonn&AOk-es\tQ1\nWork\tv1\\2e2\tOld\na\\5c2eb\n"
 	if err := os.WriteFile(filepath.Join(src, "subscriptions"), []byte(subscriptions), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -74,6 +77,18 @@ func TestExportImportKeepsFolderNames(t *testing.T) {
 		}
 	}
 
+	// Every subscription names a mailbox: the import subscribes each mailbox it
+	// creates, so a subscription read under another name than its folder shows up as
+	// one naming no mailbox.
+	subscriptionsNameMailboxes := func(which string, names, subs []string) {
+		t.Helper()
+		for _, sub := range subs {
+			if !slices.Contains(names, sub) {
+				t.Errorf("%s: subscription %q names no mailbox; mailboxes %q", which, sub, names)
+			}
+		}
+	}
+
 	importInto(src, sourceEmail)
 	sourceNames, sourceSubs := folderNamesAndSubscriptions(t, ctx, rdb, sourceEmail)
 	for _, name := range want {
@@ -81,6 +96,7 @@ func TestExportImportKeepsFolderNames(t *testing.T) {
 			t.Errorf("source import: mailbox or subscription %q missing; mailboxes %q, subscriptions %q", name, sourceNames, sourceSubs)
 		}
 	}
+	subscriptionsNameMailboxes("source import", sourceNames, sourceSubs)
 
 	exportDir := filepath.Join(t.TempDir(), "export")
 	exporter, err := NewExporter(ctx, exportDir, sourceEmail, 2, rdb, s3Storage, ExporterOptions{Dovecot: true})
@@ -99,6 +115,7 @@ func TestExportImportKeepsFolderNames(t *testing.T) {
 	if !slices.Equal(sourceSubs, targetSubs) {
 		t.Errorf("subscriptions after export and import:\n got %q\nwant %q", targetSubs, sourceSubs)
 	}
+	subscriptionsNameMailboxes("export and import", targetNames, targetSubs)
 }
 
 // folderNamesAndSubscriptions returns an account's mailbox names and subscribed
