@@ -100,12 +100,13 @@ func newFetchTestSession(limit int64) (*IMAPSession, *serverPkg.SessionMemoryTra
 // opens its response: a refusal there fails the FETCH at this message with
 // nothing written and nothing set. write then writes the sections.
 func bodySectionsBeforeResponse(s *IMAPSession, bodyData *[]byte, bodyFetched *bool, options *imap.FetchOptions, msg *db.Message) (write func(bodySectionWriter) error, err error) {
-	ctx := context.Background()
-	if err := s.loadBodyForSections(ctx, msg, bodyData, bodyFetched, options); err != nil {
+	sections, err := s.extractBodySections(context.Background(), bodyData, bodyFetched, options, msg)
+	if err != nil {
 		return nil, err
 	}
 	return func(w bodySectionWriter) error {
-		return s.handleBodySections(ctx, w, bodyData, bodyFetched, options, msg)
+		defer s.freeSectionCopies(sections.charged)
+		return writeBodySections(w, options, sections)
 	}, nil
 }
 

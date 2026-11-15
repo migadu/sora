@@ -136,3 +136,36 @@ func TestFetch_SectionOverBudgetRefusedBeforeResponse(t *testing.T) {
 		})
 	}
 }
+
+// TestFetch_ChunkStaysChargedUntilWritten: the sections of a FETCH are held
+// until its response is written, and a chunk of a retained section stays
+// charged that long even when a later section of the same FETCH takes the
+// retention over (memoryAvailable may also give it up): the chunk is a copy
+// of its own, not a slice of a section nothing charges any more.
+func TestFetch_ChunkStaysChargedUntilWritten(t *testing.T) {
+	body := multipartTestMessage(64 * 1024)
+	const chunk = 16 * 1024
+	s, tracker := newFetchTestSession(0)
+	w := &fakeBodySectionWriter{tracker: tracker}
+	bodyData, bodyFetched := body, true
+	err := fetchBodySections(s, w, &bodyData, &bodyFetched, &imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{
+		{Part: []int{2}, Partial: &imap.SectionPartial{Offset: 0, Size: chunk}},
+		{Part: []int{1}, Partial: &imap.SectionPartial{Offset: 0, Size: 3}},
+	}}, fetchTestMessage(body))
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if len(w.sections) != 2 || len(w.sections[0].data) != chunk || string(w.sections[1].data) != "hel" {
+		t.Fatalf("written sections = %+v, want a %d-octet chunk of BODY[2] and \"hel\"", w.sections, chunk)
+	}
+	if got := w.sections[0].trackerAtWrite; got < chunk {
+		t.Errorf("memory tracker while writing the BODY[2] chunk = %d bytes, want at least the %d-octet chunk", got, chunk)
+	}
+	retained := int64(len(s.cachedBodySection(bodySectionCacheKey(fetchTestMessage(body).ContentHash, &imap.FetchItemBodySection{Part: []int{1}}))))
+	if retained == 0 {
+		t.Fatal("BODY[1] was not retained")
+	}
+	if got := tracker.Current(); got != retained {
+		t.Errorf("memory tracker after the response = %d bytes, want the %d retained", got, retained)
+	}
+}
