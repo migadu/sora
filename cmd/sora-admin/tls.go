@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -1266,6 +1267,54 @@ func removeExpiredLocalCopy(path string, now time.Time) (bool, error) {
 	return false, nil
 }
 
+// writeLocalCacheFile stores data as the local cache file path the way autocert.DirCache
+// does: it writes a temporary file in the same directory and renames it over path, so a
+// write that fails part-way (the disk fills) leaves no partial file under the cache name,
+// which a later run would skip as already cached and the server would read. The new file
+// gets the owner and group of the file it replaces, as writing into that file would keep
+// them, so that, run as root, tls cache --force leaves the server a file it can read.
+func writeLocalCacheFile(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".cache-")
+	if err != nil {
+		return err
+	}
+	if old, statErr := os.Stat(path); statErr == nil {
+		err = takeOwner(f, old)
+	}
+	if err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), path)
+	}
+	if err != nil {
+		os.Remove(f.Name())
+	}
+	return err
+}
+
+// takeOwner gives f the owner and group of the file old, if it has others.
+func takeOwner(f *os.File, old os.FileInfo) error {
+	want, ok := old.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if have, ok := info.Sys().(*syscall.Stat_t); ok && have.Uid == want.Uid && have.Gid == want.Gid {
+		return nil
+	}
+	return f.Chown(int(want.Uid), int(want.Gid))
+}
+
 func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, specificDomain string, force bool) error {
 	// Initialize S3 storage
 	if cfg.TLS.LetsEncrypt == nil {
@@ -1404,9 +1453,9 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			}
 
 			// Write to local cache
-			if err := os.WriteFile(localPath, certData, 0600); err != nil {
+			if err := writeLocalCacheFile(localPath, certData); err != nil {
 				logger.Warn("Failed to write certificate to local cache", "path", localPath, "error", err)
-				failures = append(failures, fmt.Errorf("write %s certificate for %s: %w", variant.name, domain, err))
+				failures = append(failures, fmt.Errorf("write %s certificate for %s to %s: %w", variant.name, domain, localPath, err))
 				continue
 			}
 
