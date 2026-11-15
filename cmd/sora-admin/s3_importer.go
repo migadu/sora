@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/emersion/go-message/mail"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
@@ -37,7 +39,7 @@ type S3ImporterOptions struct {
 	BatchSize         int // Number of S3 objects to process in each batch
 	MaxObjects        int // Maximum number of objects to process (0 = unlimited)
 	ShowProgress      bool
-	ForceReimport     bool          // Force reimport even if message already exists
+	ForceReimport     bool          // Import into INBOX even when another mailbox of the account holds the message
 	CleanupDB         bool          // Cleanup temporary database when done
 	ImportDelay       time.Duration // Delay between imports to control rate
 	ContinuationToken string        // S3 continuation token to resume from
@@ -380,33 +382,14 @@ func (si *S3Importer) performDryRun() error {
 
 		// Check if message already exists. A failed check answers nothing: the object
 		// is not reported as new.
-		alreadyExists := false
-		if !si.options.ForceReimport {
-			// Check if any message with this content hash exists for this account
-			var count int
-			if err := si.rdb.QueryRowWithRetry(ctx,
-				"SELECT COUNT(*) FROM messages WHERE content_hash = $1 AND account_id = $2 AND expunged_at IS NULL",
-				contentHash, accountID).Scan(&count); err != nil {
-				return fmt.Errorf("dry run: failed to check whether %s is already imported: %w", key, err)
-			}
-			alreadyExists = count > 0
+		inAccount, inInbox, err := si.existingCopies(ctx, accountID, contentHash)
+		if err != nil {
+			return fmt.Errorf("dry run: failed to check whether %s is already imported: %w", key, err)
 		}
-
-		action := "IMPORT"
-		reason := "new message"
-
-		if alreadyExists {
-			if si.options.ForceReimport {
-				action = "REIMPORT"
-				reason = "force reimport enabled"
-			} else {
-				action = "SKIP"
-				reason = "already exists in database"
-				totalWouldSkip++
-			}
-		}
-
-		if action == "IMPORT" || action == "REIMPORT" {
+		action, reason := si.importAction(inAccount, inInbox)
+		if action == "SKIP" {
+			totalWouldSkip++
+		} else {
 			totalWouldImport++
 		}
 
@@ -575,19 +558,13 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 
 	// Check if message already exists. A failed check is not a "no": importing anyway
 	// would duplicate a message that is there.
-	if !si.options.ForceReimport {
-		var count int
-		if err := si.rdb.QueryRowWithRetry(ctx,
-			"SELECT COUNT(*) FROM messages WHERE content_hash = $1 AND account_id = $2 AND expunged_at IS NULL",
-			contentHash, accountID).Scan(&count); err != nil {
-			return fmt.Errorf("failed to check whether the message is already imported: %w", err)
-		}
-		if count > 0 {
-			logger.Info("Message already exists - skipping", "progress", si.getProgressPrefix(), "key", obj.Key)
-			atomic.AddInt64(&si.skippedMessages, 1)
-			si.markObjectProcessed(obj.Key, true, "already exists")
-			return nil
-		}
+	inAccount, inInbox, err := si.existingCopies(ctx, accountID, contentHash)
+	if err != nil {
+		return fmt.Errorf("failed to check whether the message is already imported: %w", err)
+	}
+	if action, reason := si.importAction(inAccount, inInbox); action == "SKIP" {
+		si.skipExisting(obj.Key, reason)
+		return nil
 	}
 
 	// Download message content from S3
@@ -656,7 +633,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 
 	// Import into INBOX by default (since we don't have mailbox information from S3)
 	// Default mailboxes should already be created at this point
-	mailbox, err := si.rdb.GetMailboxByNameWithRetry(ctx, user.AccountID(), "INBOX")
+	mailbox, err := si.rdb.GetMailboxByNameWithRetry(ctx, user.AccountID(), consts.MailboxInbox)
 	if err != nil {
 		return fmt.Errorf("failed to get INBOX mailbox: %w", err)
 	}
@@ -698,6 +675,11 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 			AccountID:   user.AccountID(),
 		})
 
+	if errors.Is(err, consts.ErrMessageExists) {
+		// INBOX received the message since the check above.
+		si.skipExisting(obj.Key, "already in INBOX")
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("failed to insert message into database: %w", err)
 	}
@@ -723,6 +705,46 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	}
 
 	return nil
+}
+
+// existingCopies counts the account's live messages with this content hash: in all of
+// its mailboxes, and in its INBOX, the mailbox the import files every object in. The
+// INBOX is matched by name in the same query (as CreateDefaultMailboxes finds it), so
+// deciding a skip costs this one query, and an account without an INBOX yet (the
+// import creates it) holds nothing there.
+func (si *S3Importer) existingCopies(ctx context.Context, accountID int64, contentHash string) (inAccount, inInbox int, err error) {
+	err = si.rdb.QueryRowWithRetry(ctx, `
+		SELECT COUNT(*), COUNT(mb.id)
+		FROM messages m
+		LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id AND LOWER(mb.name) = 'inbox' AND mb.deleted_at IS NULL
+		WHERE m.content_hash = $1 AND m.account_id = $2 AND m.expunged_at IS NULL`,
+		contentHash, accountID).Scan(&inAccount, &inInbox)
+	return inAccount, inInbox, err
+}
+
+// importAction is what the import does with an object whose message the account holds
+// inAccount times, inInbox of them in INBOX: IMPORT or REIMPORT it into INBOX, or SKIP
+// it. The dry run reports it, so it predicts what the import does. --force-reimport
+// imports a message another mailbox holds, but not one INBOX already holds: that copy
+// would be a duplicate in the mailbox it is imported into.
+func (si *S3Importer) importAction(inAccount, inInbox int) (action, reason string) {
+	switch {
+	case inAccount == 0:
+		return "IMPORT", "new message"
+	case !si.options.ForceReimport:
+		return "SKIP", "already exists in database"
+	case inInbox > 0:
+		return "SKIP", "already in INBOX"
+	default:
+		return "REIMPORT", "in another mailbox, force reimport enabled"
+	}
+}
+
+// skipExisting counts an object whose message is already there as skipped.
+func (si *S3Importer) skipExisting(key, reason string) {
+	logger.Info("Message already exists - skipping", "progress", si.getProgressPrefix(), "key", key, "reason", reason)
+	atomic.AddInt64(&si.skippedMessages, 1)
+	si.markObjectProcessed(key, true, reason)
 }
 
 // markObjectProcessed updates the processing status of an S3 object in the database
