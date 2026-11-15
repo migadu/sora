@@ -281,6 +281,11 @@ func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options Server
 	return server
 }
 
+// writeTimeout is the http.Server WriteTimeout: no answer later than this after a request
+// was read reaches its client, unless the handler moves the deadline (a delayed login,
+// server.ApplyHTTPAuthenticationDelay).
+const writeTimeout = 30 * time.Second
+
 // Run starts the HTTP Mail API server and blocks until it stops. It returns nil
 // when stopped via ctx cancellation.
 func (s *Server) Run(ctx context.Context) error {
@@ -306,7 +311,7 @@ func (s *Server) Run(ctx context.Context) error {
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second, // slowloris-on-headers defense
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       120 * time.Second,
 	}
 	if s.tls {
