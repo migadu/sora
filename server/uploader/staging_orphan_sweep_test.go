@@ -123,8 +123,7 @@ func TestOrphanSweepDoesNotSubtractAFileThisRunNeverCounted(t *testing.T) {
 
 // What the count does hold must still leave it: an orphan staged while the refresh
 // measured the backlog, which the refresh counts as it is on disk, and one staged
-// after it. (In production the sweep reaches these only when the refresh has not
-// re-based the count for longer than the grace period.)
+// after it.
 func TestOrphanSweepSubtractsOrphansStagedSinceTheRefreshBegan(t *testing.T) {
 	w, rdb, _, _, _ := setupTestWorker(t)
 	w.maxStagingSize = 1000

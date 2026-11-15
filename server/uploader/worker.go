@@ -1685,10 +1685,13 @@ func (w *UploadWorker) restaged(path string, size int64) {
 }
 
 // countOnDisk puts the body staged at path, which an upload is about to finalize, in
-// onDisk at the size the count holds for it, its row's. The finalize drops the row
-// before the body leaves the spool, and a refresh whose snapshot falls in between would
-// otherwise drop the body from the count before its removal takes it out once more.
-// The caller does not hold path's staging lock.
+// onDisk at its size on disk, which for an intact body is its row's, the size the count
+// holds for it. The finalize drops the row before the body leaves the spool, and a
+// refresh whose snapshot falls in between would otherwise drop the body from the count
+// before its removal takes it out once more. The worker's loop runs the refresh and
+// its upload passes one at a time, so today only an upload run outside that loop
+// (sync-upload mode, DrainSync) can meet a refresh. The caller does not hold path's
+// staging lock.
 func (w *UploadWorker) countOnDisk(path string) {
 	pathMu := w.stagingPathLock(path)
 	pathMu.Lock()
