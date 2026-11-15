@@ -27,6 +27,13 @@ type MailboxPoll struct {
 	NumMessages uint32
 	ModSeq      uint64
 	HighestUID  imap.UID // mailboxes.highest_uid, read before NumMessages was counted
+	// PhantomModSeq is the highest modseq of a message created and expunged since
+	// sinceModSeq, which Updates leaves out: the client was never told it existed. A
+	// cursor advanced past the changes in Updates must also pass it, or the message
+	// would sit in the client's view as of the cursor (created at or before it,
+	// expunged after it) and the next poll would report its expunge at the sequence
+	// number of the message that follows it.
+	PhantomModSeq uint64
 }
 
 // pollMailboxStateQuery is the single statement a poll that finds nothing changed
@@ -108,6 +115,12 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			FROM message_state ms JOIN messages m ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 			-- Flag updates only for active messages; an expunge is reported by the branch above.
 			WHERE ms.mailbox_id = $1 AND ms.updated_modseq > $2 AND m.expunged_at IS NULL
+			UNION
+			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq, ms.updated_modseq, m.expunged_modseq
+			FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+			-- The create+expunge-in-window phantoms themselves: never reported, read only so the
+			-- cursor can pass them (MailboxPoll.PhantomModSeq).
+			WHERE m.mailbox_id = $1 AND m.created_modseq > $2 AND m.expunged_at IS NOT NULL
 		) sub
 	`, mailboxID, sinceModSeq)
 	if err != nil {
@@ -116,6 +129,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 	defer rows.Close()
 
 	var rawUpdates []MessageUpdate
+	var phantomModSeq uint64
 	for rows.Next() {
 		var uid uint32
 		var expungedAt sql.NullTime
@@ -129,13 +143,6 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			return nil, fmt.Errorf("failed to scan raw change: %w", err)
 		}
 
-		var customFlags []string
-		if customFlagsJSON != nil {
-			if err := json.Unmarshal(customFlagsJSON, &customFlags); err != nil {
-				return nil, fmt.Errorf("failed to unmarshal custom_flags in poll: %w", err)
-			}
-		}
-
 		effective := uint64(0)
 		if created.Valid && uint64(created.Int64) > effective {
 			effective = uint64(created.Int64)
@@ -145,6 +152,19 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		}
 		if expunged.Valid && uint64(expunged.Int64) > effective {
 			effective = uint64(expunged.Int64)
+		}
+
+		// A phantom (the last branch above) is never reported; only its modseq counts.
+		if expungedAt.Valid && created.Valid && uint64(created.Int64) > sinceModSeq {
+			phantomModSeq = max(phantomModSeq, effective)
+			continue
+		}
+
+		var customFlags []string
+		if customFlagsJSON != nil {
+			if err := json.Unmarshal(customFlagsJSON, &customFlags); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal custom_flags in poll: %w", err)
+			}
 		}
 
 		bitwise := 0
@@ -165,10 +185,11 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 	}
 
 	pollData := MailboxPoll{
-		Updates:     []MessageUpdate{},
-		NumMessages: uint32(messageCount),
-		ModSeq:      currentModSeq,
-		HighestUID:  imap.UID(uidNext),
+		Updates:       []MessageUpdate{},
+		NumMessages:   uint32(messageCount),
+		ModSeq:        currentModSeq,
+		HighestUID:    imap.UID(uidNext),
+		PhantomModSeq: phantomModSeq,
 	}
 
 	if len(rawUpdates) == 0 {

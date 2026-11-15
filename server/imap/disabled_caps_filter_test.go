@@ -193,8 +193,11 @@ func TestClientFilter_AfterEnableDoesNotCascadeFromKeptCapabilities(t *testing.T
 		}
 
 		c.mustOK("SELECT INBOX")
-		if resp := c.mustOK("SORT RETURN (MIN) (DATE) UTF-8 1"); !strings.Contains(resp, "* ESEARCH ") {
-			t.Errorf("SORT RETURN (MIN) after ENABLE IMAP4rev2 and ESEARCH filter: want ESEARCH, got:\n%s", resp)
+		// This backend has no database or selected-mailbox state. Reaching that
+		// backend may return NO; the capability gate must not refuse ESORT with
+		// BAD. Real SORT result data is covered by the database wire tests.
+		if resp, tagged, err := c.sendCmd("SORT RETURN (MIN) (DATE) UTF-8 1"); err != nil || strings.Contains(tagged, " BAD ") {
+			t.Errorf("SORT RETURN (MIN) after ENABLE IMAP4rev2 and ESEARCH filter: want acceptance by capability gate, got %v:\n%s", err, resp)
 		}
 		// Probe the handler's capability gate on an independent session. The wire
 		// session is owned by its connection goroutine and may close after SORT;
