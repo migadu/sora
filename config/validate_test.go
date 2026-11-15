@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -354,6 +355,83 @@ func TestConfigValidateProxyRefusesEmptyRemoteAddr(t *testing.T) {
 	}
 	if proxies != 5 {
 		t.Errorf("checked %d proxy types, want the 5 proxies", proxies)
+	}
+}
+
+// TestConfigValidateProxyRefusesWhitespaceInRemoteAddr: the loader trims the ends of every
+// string, so " 192.0.2.11:143" reaches the proxy as "192.0.2.11:143"; whitespace inside a
+// remote_addrs entry ("192.0.2.10 :143") passed Validate and the proxy dialed the entry as
+// written, a name that never resolves. No host or IP contains whitespace, so Validate
+// refuses the entry, naming it, as it refuses an empty one (#1322).
+func TestConfigValidateProxyRefusesWhitespaceInRemoteAddr(t *testing.T) {
+	tests := []struct {
+		remoteAddrs string
+		want        string // "" for a valid list
+	}{
+		{`["192.0.2.10 :143"]`, `server "proxy": remote_addrs #1: backend address "192.0.2.10 :143" contains whitespace`},
+		{`["192.0.2.10:143", "backend .example.com"]`, `server "proxy": remote_addrs #2: backend address "backend .example.com" contains whitespace`},
+		{`["backend.example.com\t:143"]`, `server "proxy": remote_addrs #1: backend address "backend.example.com\t:143" contains whitespace`},
+		{`["backend\u00a0.example.com"]`, `server "proxy": remote_addrs #1: backend address "backend\u00a0.example.com" contains whitespace`},
+		// The ends are trimmed when the file is loaded (TestLoadServerConfigTrimsBackendAddresses).
+		{`[" 192.0.2.10:143", "[2001:db8::1]:143 ", "\tbackend.example.com"]`, ""},
+	}
+	var proxies int
+	for _, typ := range ServerTypes {
+		if !strings.HasSuffix(typ, "_proxy") {
+			continue
+		}
+		proxies++
+		for _, tt := range tests {
+			t.Run(typ+" "+tt.remoteAddrs, func(t *testing.T) {
+				got := validateFile(t, storageTOML+"\n[[server]]\ntype = \""+typ+"\"\nname = \"proxy\"\naddr = \"127.0.0.1:1143\"\nremote_port = 143\nremote_addrs = "+tt.remoteAddrs+"\n")
+				if tt.want == "" {
+					if len(got) != 0 {
+						t.Errorf("Validate() = %v, want no problems", got)
+					}
+					return
+				}
+				if len(got) != 1 || got[0].Section != "server 'proxy'" || !strings.Contains(got[0].Err.Error(), tt.want) {
+					t.Errorf("Validate() = %v, want server 'proxy': %s", got, tt.want)
+				}
+			})
+		}
+	}
+	if proxies != 5 {
+		t.Errorf("checked %d proxy types, want the 5 proxies", proxies)
+	}
+}
+
+// TestLoadServerConfigTrimsBackendAddresses: a remote_addrs entry or a [[pool]] backend
+// written with a leading or trailing space reaches Validate and the proxies trimmed, from
+// the loader that startup, SIGHUP reload and `sora-admin config validate` share (#1322).
+func TestLoadServerConfigTrimsBackendAddresses(t *testing.T) {
+	load := func(t *testing.T, content string) Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var cfg Config
+		if err := LoadServerConfig(path, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+
+	cfg := load(t, storageTOML+"[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:11143\"\nremote_addrs = [\"192.0.2.10:143\", \" 192.0.2.11:143\", \"192.0.2.12:143\\t\"]\nremote_port = 143\n")
+	if got, want := cfg.DynamicServers[0].RemoteAddrs, []string{"192.0.2.10:143", "192.0.2.11:143", "192.0.2.12:143"}; !slices.Equal(got, want) {
+		t.Errorf("remote_addrs = %q, want %q", got, want)
+	}
+	if got := cfg.Validate(); len(got) != 0 {
+		t.Errorf("remote_addrs: Validate() = %v, want no problems", got)
+	}
+
+	cfg = load(t, storageTOML+"[[pool]]\nname = \"sora0\"\ndefault = true\nbackends = [\"192.0.2.10\", \"192.0.2.11 \", \" 192.0.2.12:143\"]\n\n[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:11143\"\nremote_port = 143\n")
+	if got, want := cfg.Pools[0].Backends, []string{"192.0.2.10", "192.0.2.11", "192.0.2.12:143"}; !slices.Equal(got, want) {
+		t.Errorf("[[pool]] backends = %q, want %q", got, want)
+	}
+	if got := cfg.Validate(); len(got) != 0 {
+		t.Errorf("[[pool]]: Validate() = %v, want no problems", got)
 	}
 }
 

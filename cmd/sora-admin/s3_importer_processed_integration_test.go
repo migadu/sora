@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"testing"
 
@@ -24,7 +25,7 @@ func TestS3Importer_MarksImportedObjectsProcessed(t *testing.T) {
 	createSimpleTestAccount(t, rdb, email, "testpassword123")
 	_, s3storage := common.NewFakeS3Storage(t)
 
-	si, err := NewS3Importer(rdb, s3storage, S3ImporterOptions{Email: email, Workers: 5, CleanupDB: true, InstanceID: "test-instance"})
+	si, err := NewS3Importer(context.Background(), rdb, s3storage, S3ImporterOptions{Email: email, Workers: 5, CleanupDB: true, InstanceID: "test-instance"})
 	if err != nil {
 		t.Fatal(err)
 	}

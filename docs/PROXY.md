@@ -466,6 +466,8 @@ with `remote_port = 24` dials `10.0.1.21:24`.
 Sora checks the pools at startup and refuses to start when:
 
 - a pool has no `name`, a name with whitespace, the same name as another pool, or no `backends`;
+- a backend is empty or has whitespace inside it (`"192.0.2.10 :143"`; spaces at the ends are
+  trimmed);
 - a backend appears twice, in one pool or in two. Names are compared without letter case and IPs in
   canonical form. A backend without a port stands for its host on every port, so it clashes with
   any other entry for that host. Entries with different explicit ports may share a host;

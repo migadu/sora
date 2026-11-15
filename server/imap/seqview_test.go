@@ -27,10 +27,11 @@ func TestSeqViewDirect(t *testing.T) {
 	require.True(t, v.direct)
 
 	require.Equal(t, imap.SeqSet{{Start: 2, Stop: 3}}, v.decode(imap.SeqSet{{Start: 2, Stop: 3}}))
-	// "*", and a range ending at the last message, end at the server view's last.
-	require.Equal(t, imap.SeqSet{{Start: 1, Stop: 0}}, v.decode(imap.SeqSet{{Start: 1, Stop: 0}}))
-	require.Equal(t, imap.SeqSet{{Start: 4, Stop: 0}}, v.decode(imap.SeqSet{{Start: 4, Stop: 9}}))
-	require.Equal(t, imap.SeqSet{{Start: 5, Stop: 0}}, v.decode(imap.SeqSet{{Start: 0, Stop: 0}}))
+	// "*", and a range past the last message, end at the client's last message, never
+	// at a "*" the database would resolve against its own view.
+	require.Equal(t, imap.SeqSet{{Start: 1, Stop: 5}}, v.decode(imap.SeqSet{{Start: 1, Stop: 0}}))
+	require.Equal(t, imap.SeqSet{{Start: 4, Stop: 5}}, v.decode(imap.SeqSet{{Start: 4, Stop: 9}}))
+	require.Equal(t, imap.SeqSet{{Start: 5, Stop: 5}}, v.decode(imap.SeqSet{{Start: 0, Stop: 0}}))
 	// Past the last message names nothing.
 	require.Empty(t, v.decode(imap.SeqSet{{Start: 6, Stop: 9}}))
 
@@ -86,9 +87,9 @@ func TestSeqViewDecodeCriteria(t *testing.T) {
 	got := v.decodeCriteria(criteria)
 
 	// The client's 1 is gone: an empty UID set, which matches nothing.
-	require.Equal(t, []imap.SeqSet{{{Start: 1, Stop: 0}}}, got.SeqNum)
+	require.Equal(t, []imap.SeqSet{{{Start: 1, Stop: 2}}}, got.SeqNum)
 	require.Equal(t, []imap.UIDSet{{{Start: 7, Stop: 9}}, {}}, got.UID)
-	require.Equal(t, []imap.SeqSet{{{Start: 2, Stop: 0}}}, got.Not[0].SeqNum)
+	require.Equal(t, []imap.SeqSet{{{Start: 2, Stop: 2}}}, got.Not[0].SeqNum)
 	// The caller's criteria are left as they were.
 	require.Equal(t, []imap.SeqSet{{{Start: 1, Stop: 1}}, {{Start: 2, Stop: 3}}}, criteria.SeqNum)
 	require.Len(t, criteria.UID, 1)
