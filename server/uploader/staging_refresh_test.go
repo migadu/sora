@@ -241,3 +241,47 @@ func TestStagingRefreshCountsAClampedChangeAsItLanded(t *testing.T) {
 		t.Errorf("staging size = %d with nothing left on the spool, want 0", got)
 	}
 }
+
+// afterWindowDB runs after once the backlog measurement has closed the refresh window
+// (the totals are read), before the measurement returns.
+type afterWindowDB struct {
+	*mockDB
+	after func()
+}
+
+func (d afterWindowDB) PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int, changed func() []StagedBody) (UploadBacklog, error) {
+	backlog, err := d.mockDB.PendingUploadBacklog(ctx, instanceID, maxAttempts, changed)
+	if err == nil {
+		d.after()
+	}
+	return backlog, err
+}
+
+// Changes made once the totals are read are ones the snapshot predates, and the window
+// no longer notes them: they must stay on the live count, which is why the refresh is
+// applied as a delta rather than as an assignment. The mock runs PendingUploadBacklogFunc
+// before it closes the window, so TestStagingSizeRefreshKeepsConcurrentWrites and
+// TestStagingRefreshKeepsARemovalTheSnapshotPredates change the spool inside the window;
+// this test changes it after.
+func TestStagingRefreshKeepsChangesAfterTheTotalsAreRead(t *testing.T) {
+	w, rdb, _, _, _ := setupTestWorker(t)
+	rows := newPendingRows()
+	deliver(t, w, rows, "a", 500)
+	b := deliver(t, w, rows, "b", 600)
+
+	rdb.PendingUploadBacklogFunc = func(ctx context.Context, instanceID string, maxAttempts int) (UploadBacklog, error) {
+		return rows.snapshot(), nil
+	}
+	w.rdb = afterWindowDB{mockDB: rdb, after: func() {
+		deliver(t, w, rows, "c", 700)
+		finishUpload(t, w, rows, "b", b)
+	}}
+
+	if err := w.monitorStuckUploads(context.Background()); err != nil {
+		t.Fatalf("monitorStuckUploads: %v", err)
+	}
+
+	if got := stagingSize(w); got != 1200 {
+		t.Errorf("staging size = %d after a 700-byte write and a 600-byte removal the 1100-byte snapshot predates, want 1200", got)
+	}
+}
