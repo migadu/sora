@@ -332,7 +332,7 @@ func handleImportS3(ctx context.Context) {
 		FTSRetention: ftsRetentionParsed,
 	}
 
-	importer, err := NewS3Importer(rdb, s3, options)
+	importer, err := NewS3Importer(ctx, rdb, s3, options)
 	if err != nil {
 		logger.Fatalf("Failed to create S3 importer: %v", err)
 	}
