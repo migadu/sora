@@ -82,7 +82,7 @@ func TestPools_AuthUsesEndpointJSONSchema(t *testing.T) {
 			lookup := poolAnswer("sora1")
 			s.routingLookup = lookup
 			req := httptest.NewRequest("POST", "/user/auth/"+tc.path, strings.NewReader(tc.body))
-			route, err := s.routeAuthRequest(req)
+			route, _, err := s.routeAuthRequest(req)
 			if err != nil || !strings.HasPrefix(route.addr, "10.0.1.") {
 				t.Fatalf("valid backend auth request routed to %+v, err=%v; lookup asked %v", route, err, lookup.asked())
 			}

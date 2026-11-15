@@ -166,18 +166,22 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	}
 	var responseMessages []storeResponseMessage
 
-	// RFC 7162 §3.1.3: a CONDSTORE-aware client gets FETCH (MODSEQ) for every
-	// message a .SILENT STORE updated. That is command response data, so STORE
-	// writes it itself rather than leaving it to the command-boundary Poll, which
-	// would add FLAGS, is skipped under NOTIFY, and stops at a pending expunge.
-	// Poll is held off until those rows are recorded in ownStoreEcho.
+	// RFC 9051 §6.4.6: a non-silent STORE returns the updated flags in an
+	// untagged FETCH, and RFC 7162 §3.1.3 gives a CONDSTORE-aware client FETCH
+	// (MODSEQ) for every message a .SILENT STORE updated. That is command
+	// response data, so STORE writes it itself rather than leaving it to the
+	// command-boundary Poll, which would add FLAGS to a .SILENT answer, is
+	// skipped under NOTIFY, and stops at a pending expunge. Poll is held off
+	// until the answered rows are recorded in ownStoreEcho, so it does not
+	// report them a second time.
 	silentModSeq := sanitizedStoreFlags.Silent && s.condStoreEnabled()
-	if silentModSeq {
+	answers := !sanitizedStoreFlags.Silent || silentModSeq
+	if answers {
 		s.ownStoreMu.Lock()
 		defer s.ownStoreMu.Unlock()
 	}
 	writeResponses := func() {
-		if sanitizedStoreFlags.Silent && !silentModSeq {
+		if !answers {
 			return
 		}
 		for _, modified := range responseMessages {
@@ -199,7 +203,11 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 				s.DebugLog("failed to close fetch response", "uid", modified.uid, "error", err)
 				continue
 			}
-			if silentModSeq && !modified.unchanged {
+			// Record the rows this answer told the client all Poll would: every
+			// row when it carried FLAGS, and only the rows this STORE changed
+			// for a .SILENT (MODSEQ only) answer, which says nothing about what
+			// another session changed on an unchanged row.
+			if !sanitizedStoreFlags.Silent || !modified.unchanged {
 				if s.ownStoreEcho == nil || s.ownStoreEchoMailboxID != selectedMailboxID {
 					s.ownStoreEcho = make(map[imap.UID]uint64)
 					s.ownStoreEchoMailboxID = selectedMailboxID
@@ -328,7 +336,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		// left the stored state unchanged. Batch updates omit such no-op rows.
 		// Read them from the master so a concurrent writer's flags are current;
 		// only validUIDs are eligible, preserving UNCHANGEDSINCE failures.
-		if (!sanitizedStoreFlags.Silent || silentModSeq) && len(batchResults) < len(validUIDs) {
+		if answers && len(batchResults) < len(validUIDs) {
 			changed := make(map[imap.UID]bool, len(batchResults))
 			for _, res := range batchResults {
 				changed[res.UID] = true

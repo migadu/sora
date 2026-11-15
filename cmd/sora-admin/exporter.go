@@ -19,6 +19,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/pkg/sqlitefile"
 	"github.com/migadu/sora/server"
 	_ "modernc.org/sqlite"
 )
@@ -76,10 +77,11 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
 	logger.Info("Using maildir database", "path", dbPath)
 
-	// Open SQLite with proper settings for concurrent access
-	// WAL mode enables concurrent readers and writers
-	// _busy_timeout=5000 means wait up to 5 seconds if database is locked
-	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL")
+	dsn, err := sqlitefile.DSN(dbPath, maildirCacheParams)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
 	}
@@ -818,7 +820,14 @@ func (exporter *Exporter) exportSubscriptions(accountID int64) error {
 		return fmt.Errorf("failed to fetch subscriptions for export: %w", err)
 	}
 
-	return os.WriteFile(subscriptionsPath, []byte(formatDovecotSubscriptions(names)), 0644)
+	// Dovecot's Maildir++ subscriptions file stores Modified UTF-7 mailbox names,
+	// matching parseDovecotSubscriptions + importedFolderName (DecodeModifiedUTF7) on import.
+	encoded := make([]string, len(names))
+	for i, name := range names {
+		encoded[i] = helpers.EncodeModifiedUTF7(name)
+	}
+
+	return os.WriteFile(subscriptionsPath, []byte(formatDovecotSubscriptions(encoded)), 0644)
 }
 
 // getProgressPrefix returns a progress prefix for log messages

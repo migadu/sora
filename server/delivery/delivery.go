@@ -210,6 +210,11 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			return result, nil
 		}
 
+		if outcome.AbortRedirect != nil {
+			// A delivery that fails is retried by its caller, which holds the
+			// redirects again: drop the ones this attempt has not handed over.
+			defer outcome.AbortRedirect()
+		}
 		if outcome.RedirectOnly {
 			if outcome.Redirect() {
 				result.Discarded = true
@@ -239,13 +244,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	mailHeader := mail.Header{Header: messageEntity.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
+	sentDate, _ := mailHeader.Date() // zero without a Date: header that parses (db.InsertMessageOptions.SentDate)
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
-
-	if sentDate.IsZero() {
-		sentDate = time.Now()
-	}
 
 	// Calculate content hash
 	contentHash := helpers.HashContent(messageBytes)
@@ -589,12 +590,8 @@ func (d *DeliveryContext) resolveOwnedTarget(ctx context.Context, recipient Reci
 	// hardlink it to the owner's staging path so the uploader writes the body under the
 	// owner's S3 path (B2).
 	if destAccountID != recipient.AccountID {
-		sourcePath := d.Uploader.FilePath(contentHash, recipient.AccountID)
-		destPath := d.Uploader.FilePath(contentHash, destAccountID)
-		if sourcePath != destPath {
-			if linkErr := helpers.LinkOrCopyFile(sourcePath, destPath); linkErr != nil {
-				d.Logger.Log("failed to stage local file for cross-account delivery: %v", linkErr)
-			}
+		if linkErr := d.Uploader.LinkStaged(contentHash, recipient.AccountID, destAccountID); linkErr != nil {
+			d.Logger.Log("failed to stage local file for cross-account delivery: %v", linkErr)
 		}
 	}
 
@@ -616,13 +613,9 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 	mailHeader := mail.Header{Header: messageEntity.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
+	sentDate, _ := mailHeader.Date() // zero without a Date: header that parses (db.InsertMessageOptions.SentDate)
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
-
-	if sentDate.IsZero() {
-		sentDate = time.Now()
-	}
 
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
 

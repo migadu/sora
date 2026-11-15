@@ -3,6 +3,7 @@ package sieveengine
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/mail"
 	"runtime/debug"
@@ -273,6 +274,16 @@ type CompiledScript struct {
 // enabledExtensions is the set a require may name; nil enables none (go-sieve), so
 // callers pass EffectiveExtensions.
 func CompileScript(scriptContent string, enabledExtensions []string) (*CompiledScript, error) {
+	// RFC 5228 sections 1.1, 2.4.2.1 and 8.1 require Sieve scripts to be valid UTF-8 and
+	// forbid NUL octets (0x00) inside strings and comments; PostgreSQL text columns also
+	// reject both with SQLSTATE 22021. go-sieve's lexer only rejects NUL at top-level
+	// token boundaries and never validates UTF-8.
+	if !helpers.TextStorable(scriptContent) {
+		if !utf8.ValidString(scriptContent) {
+			return nil, errors.New("sieve: script is not valid UTF-8")
+		}
+		return nil, errors.New("sieve: script contains NUL byte")
+	}
 	options := sieve.DefaultOptions()
 	options.EnabledExtensions = enabledExtensions
 	// Raise the per-match regex soft-wait cap to the whole-script budget. The match

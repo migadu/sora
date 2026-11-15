@@ -19,6 +19,7 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 	ctx = s.pinnedContext(ctx)
 
 	// First, safely read necessary session state
+	var selectedMailbox *db.DBMailbox
 	var selectedMailboxID int64
 	var decodedNumSet imap.NumSet
 
@@ -42,7 +43,21 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 			Text: "No mailbox selected",
 		}
 	}
-	selectedMailboxID = s.selectedMailbox.ID
+	// RFC 6851 §3.3: MOVE has the effect of COPY, STORE +FLAGS.SILENT \Deleted and
+	// UID EXPUNGE, so a read-only selection refuses it as it refuses STORE and EXPUNGE
+	// (RFC 9051 §6.3.3: after EXAMINE "No changes to the permanent state of the
+	// mailbox ... are permitted").
+	if s.selectedReadOnly.Load() {
+		release()
+		s.DebugLog("move rejected: mailbox selected read-only")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCode("READ-ONLY"),
+			Text: "Mailbox is read-only",
+		}
+	}
+	selectedMailbox = s.selectedMailbox
+	selectedMailboxID = selectedMailbox.ID
 
 	// Use our helper method that assumes the mutex is held (read lock is sufficient)
 	decodedNumSet = s.decodeNumSetLocked(numSet)
@@ -212,7 +227,7 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 
 	// Trigger spam training if configured and moving to/from Junk folder
 	if s.server.spamTraining != nil && len(messageUIDMap) > 0 {
-		s.triggerSpamTraining(s.selectedMailbox.Name, dest, messages, messageUIDMap, destMailbox.AccountID, destS3Domain, destS3Localpart)
+		s.triggerSpamTraining(selectedMailbox, destMailbox, messages, messageUIDMap, destS3Domain, destS3Localpart)
 	}
 
 	if len(messageUIDMap) > 0 {

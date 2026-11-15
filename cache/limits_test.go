@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -165,6 +166,30 @@ func TestObjectAboveShardCapacityIsRefused(t *testing.T) {
 			assert.False(t, fileExists(c, hash), "an object above its shard's capacity was cached")
 			for _, h := range small {
 				assert.True(t, fileExists(c, h), "writing an object above its shard's capacity evicted the shard")
+			}
+		})
+	}
+}
+
+// TooLarge lets a caller that would have to download an object first (the IMAP
+// warmup, #694) learn without the download whether the cache takes it. It agrees
+// with Put at both limits: max_object_size and one shard's share of the capacity.
+func TestTooLargeAgreesWithPut(t *testing.T) {
+	limits := map[string]struct{ capacity, maxObjectSize int64 }{
+		"max_object_size": {1 << 30, 100},
+		"shard capacity":  {100 * NumShards, 1024},
+	}
+	for name, l := range limits {
+		t.Run(name, func(t *testing.T) {
+			c, err := New(t.TempDir(), l.capacity, l.maxObjectSize, time.Hour, time.Hour, nil)
+			require.NoError(t, err)
+			defer c.Close()
+
+			for _, size := range []int{99, 100, 101} {
+				data, hash := randomDataAndHash(t, size)
+				refused := errors.Is(c.Put(hash, data), ErrObjectTooLarge)
+				assert.Equal(t, refused, c.TooLarge(int64(size)), "size %d", size)
+				assert.Equal(t, size > 100, refused, "size %d", size)
 			}
 		})
 	}

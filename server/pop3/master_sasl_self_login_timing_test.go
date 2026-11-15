@@ -88,3 +88,71 @@ func TestPOP3_MasterSASLSelfLoginTimingIsNotAPasswordOracle(t *testing.T) {
 		})
 	}
 }
+
+func TestPOP3_MasterSASLRefusalTimingIsNotAPasswordOracle(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+
+	saslUser := fmt.Sprintf("proxy-%d@example.com", time.Now().UnixNano())
+	unknownTarget := fmt.Sprintf("nobody-%d@example.com", time.Now().UnixNano())
+	const saslPass = "master-sasl-secret"
+
+	for _, tc := range []struct {
+		name         string
+		saslUser     string
+		saslPass     string
+		networks     []string
+		authzID      string
+		cacheEnabled bool
+		wantVerified int
+	}{
+		{"peer_outside_allowed_networks", saslUser, saslPass, []string{"192.0.2.0/24"}, account.Email, false, 1},
+		{"cached_peer_outside_allowed_networks", saslUser, saslPass, []string{"192.0.2.0/24"}, account.Email, true, 1},
+		{"malformed_target", saslUser, saslPass, nil, "not-an-address", false, 1},
+		{"cached_malformed_target", saslUser, saslPass, nil, "not-an-address", true, 1},
+		{"unknown_target", saslUser, saslPass, nil, unknownTarget, false, 1},
+		{"cached_unknown_target", saslUser, saslPass, nil, unknownTarget, true, 1},
+		{"non_address_master_username", "proxy-master", saslPass, nil, unknownTarget, false, 0},
+		{"account_owned_master_username", account.Email, account.Password, nil, unknownTarget, false, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := pop3.New(context.Background(), "test-master-sasl-refusal-timing", "localhost", common.GetRandomAddress(t),
+				&storage.S3Storage{}, rdb, nil, nil,
+				pop3.POP3ServerOptions{
+					InsecureAuth:              true,
+					Config:                    &config.Config{},
+					MasterSASLUsername:        tc.saslUser,
+					MasterSASLPassword:        tc.saslPass,
+					MasterSASLAllowedNetworks: tc.networks,
+					LookupCache:               &config.LookupCacheConfig{Enabled: tc.cacheEnabled},
+				})
+			if err != nil {
+				t.Fatalf("Failed to create POP3 server: %v", err)
+			}
+			t.Cleanup(srv.Close)
+
+			counted := func(password string) (string, int) {
+				c1, c2 := net.Pipe()
+				defer c1.Close()
+				defer c2.Close()
+				session := pop3.NewSessionForTest(srv, c1)
+				before := testutils.PasswordVerifications()
+				err := session.AuthenticatePlain(context.Background(), tc.authzID, tc.saslUser, password)
+				return fmt.Sprintf("%#v", err), testutils.PasswordVerifications() - before
+			}
+			wrongReply, wrongVerified := counted("wrong-password")
+			masterReply, masterVerified := counted(tc.saslPass)
+
+			if masterReply != wrongReply {
+				t.Fatalf("refusal answered differently by password:\n  wrong password:  %s\n  master password: %s", wrongReply, masterReply)
+			}
+			if wrongVerified != tc.wantVerified {
+				t.Fatalf("wrong password answered after %d password verifications, want %d", wrongVerified, tc.wantVerified)
+			}
+			if masterVerified != wrongVerified {
+				t.Errorf("master SASL password answered after %d password verifications, wrong password after %d: the response time confirms the master SASL password", masterVerified, wrongVerified)
+			}
+		})
+	}
+}

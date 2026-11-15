@@ -125,3 +125,81 @@ func TestManageSieve_MasterSASLSelfLoginTimingIsNotAPasswordOracle(t *testing.T)
 		})
 	}
 }
+
+func TestManageSieve_MasterSASLRefusalTimingIsNotAPasswordOracle(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+
+	saslUser := fmt.Sprintf("proxy-%d@example.com", time.Now().UnixNano())
+	unknownTarget := fmt.Sprintf("nobody-%d@example.com", time.Now().UnixNano())
+	const saslPass = "master-sasl-secret"
+
+	for _, tc := range []struct {
+		name         string
+		saslUser     string
+		saslPass     string
+		networks     []string
+		authzID      string
+		cacheEnabled bool
+		wantVerified int
+	}{
+		{"peer_outside_allowed_networks", saslUser, saslPass, []string{"192.0.2.0/24"}, account.Email, false, 1},
+		{"cached_peer_outside_allowed_networks", saslUser, saslPass, []string{"192.0.2.0/24"}, account.Email, true, 1},
+		{"malformed_target", saslUser, saslPass, nil, "not-an-address", false, 1},
+		{"cached_malformed_target", saslUser, saslPass, nil, "not-an-address", true, 1},
+		{"unknown_target", saslUser, saslPass, nil, unknownTarget, false, 1},
+		{"cached_unknown_target", saslUser, saslPass, nil, unknownTarget, true, 1},
+		{"non_address_master_username", "proxy-master", saslPass, nil, unknownTarget, false, 0},
+		{"account_owned_master_username", account.Email, account.Password, nil, unknownTarget, false, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			address := common.GetRandomAddress(t)
+			limiter := &gateCounter{}
+			srv, err := managesieve.New(context.Background(), "test-master-sasl-refusal-timing", "localhost", address, rdb,
+				managesieve.ManageSieveServerOptions{
+					Config:                    &config.Config{},
+					InsecureAuth:              true,
+					MasterSASLUsername:        tc.saslUser,
+					MasterSASLPassword:        tc.saslPass,
+					MasterSASLAllowedNetworks: tc.networks,
+					LookupCache:               &config.LookupCacheConfig{Enabled: tc.cacheEnabled},
+					AuthLimiterOverride:       limiter,
+				})
+			if err != nil {
+				t.Fatalf("Failed to create ManageSieve server: %v", err)
+			}
+			errChan := make(chan error, 1)
+			go func() { srv.Start(errChan) }()
+			time.Sleep(100 * time.Millisecond)
+			t.Cleanup(func() { srv.Close() })
+
+			type outcome struct {
+				reply                    string
+				delays, checks, failures int32
+				verifications            int
+			}
+			attempt := func(password string) outcome {
+				delays, checks, failures := limiter.delays.Load(), limiter.checks.Load(), limiter.failures.Load()
+				verifications := testutils.PasswordVerifications()
+				reply := msAuthPlain(t, address, tc.authzID, tc.saslUser, password)
+				return outcome{
+					reply:         reply,
+					delays:        limiter.delays.Load() - delays,
+					checks:        limiter.checks.Load() - checks,
+					failures:      limiter.failures.Load() - failures,
+					verifications: testutils.PasswordVerifications() - verifications,
+				}
+			}
+			wrong := attempt("wrong-password")
+			master := attempt(tc.saslPass)
+
+			if want := (outcome{reply: wrong.reply, delays: 1, checks: 1, failures: 1, verifications: tc.wantVerified}); wrong != want {
+				t.Fatalf("wrong password: %+v, want one delay lookup, one rate-limit check, one recorded failure and %d password verification(s)", wrong, tc.wantVerified)
+			}
+			if master != wrong {
+				t.Errorf("master SASL refusal answered differently by password:\n  wrong password:  %+v\n  master password: %+v", wrong, master)
+			}
+		})
+	}
+}

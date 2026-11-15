@@ -40,6 +40,12 @@ func TestImporter_DovecotSubscriptionsFile(t *testing.T) {
 			notWant: []string{"Work", "Projects", "Archives", "Sent Items"},
 		},
 		{
+			name:    "dovecot version 2 with CRLF",
+			file:    "V\t2\r\n\r\nINBOX\r\nWork\tProjects\r\nv1.2\r\nSent Items\r\n",
+			want:    []string{"INBOX", "Work/Projects", "v1.2", "Sent"},
+			notWant: []string{"V\t2", "Work\tProjects", "v1/2", "Sent Items"},
+		},
+		{
 			name:    "dovecot unversioned",
 			file:    "INBOX\nVendors\n",
 			want:    []string{"INBOX", "Vendors"},

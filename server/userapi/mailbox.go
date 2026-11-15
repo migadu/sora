@@ -12,6 +12,7 @@ import (
 
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 )
 
 // MailboxInfo represents mailbox information for API responses. Total, Unseen,
@@ -168,7 +169,14 @@ func (s *Server) handleCreateMailbox(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	canonicalName := strings.TrimRight(req.Name, string(consts.MailboxDelimiter))
+	// As IMAP CREATE: a trailing delimiter is no part of the name, and a name with
+	// an empty, "." or ".." level ("x//y", "/lead") is refused, not created with a
+	// parent such as "x/" or "" on the way.
+	canonicalName, err := helpers.MailboxNameToCreate(req.Name)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
+		return
+	}
 
 	// Create mailbox
 	if err := s.rdb.CreateMailboxForUserWithRetry(ctx, accountID, canonicalName); err != nil {
@@ -222,6 +230,12 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, consts.ErrMailboxHasChildren) {
 			s.writeError(w, http.StatusConflict, "Mailbox has child mailboxes; delete them first")
+			return
+		}
+		// A shared mailbox without the 'x' right (RFC 4314 §2.1), which IMAP DELETE
+		// answers NO [NOPERM].
+		if errors.Is(err, consts.ErrNotPermitted) {
+			s.writeError(w, http.StatusForbidden, "Not permitted to delete this mailbox")
 			return
 		}
 		logger.Warn("HTTP Mail API: Error deleting mailbox", "name", s.name, "error", err)
