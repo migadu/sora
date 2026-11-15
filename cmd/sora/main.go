@@ -265,7 +265,9 @@ func main() {
 	if logFile != nil {
 		defer func(f *logger.LogFile) {
 			logger.Sync() // Flush any buffered log entries
-			fmt.Fprintf(logger.Stderr(), "SORA: Closing log file %s\n", f.Name())
+			// A record, not a line through logger.Stderr(): that writes into the file
+			// too, and left a plain line in a JSON log file on every stop.
+			logger.Info("Closing log file", "path", f.Name())
 			if err := f.Close(); err != nil {
 				fmt.Fprintf(os.Stderr, "SORA: Error closing log file %s: %v\n", f.Name(), err)
 			}
