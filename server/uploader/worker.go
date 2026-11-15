@@ -260,11 +260,18 @@ type UploadWorker struct {
 	// currentStagingSize, while keeping temp-file writes and fsyncs parallel outside it.
 	stagingPathLocks [stagingPathLockStripes]sync.Mutex
 	// stagingRefreshMu orders every change of currentStagingSize against the start and
-	// end of a staging refresh, and guards stagingRefresh.
+	// end of a staging refresh, and guards stagingRefresh, stagingGen and stagedGen.
 	stagingRefreshMu sync.Mutex
 	// stagingRefresh is non-nil while monitorStuckUploads measures the backlog: for
 	// each staged path changed meanwhile, the bytes counted for it before that change.
 	stagingRefresh map[string]int64
+	// stagingGen numbers the staging refreshes begun. stagedGen holds every staged path
+	// whose bytes currentStagingSize counts as they are on disk, i.e. one changed since
+	// the last refresh that re-based the count began (or since the worker was made),
+	// with the stagingGen of its last change. Any other staged path counts what that
+	// refresh's snapshot had for it: its pending row, or nothing.
+	stagingGen uint64
+	stagedGen  map[string]uint64
 	// lastStallReport is when the current stall episode was last reported, in Unix
 	// nanoseconds; 0 means no episode is in progress. Atomic, like currentStagingSize.
 	lastStallReport int64
@@ -1498,7 +1505,7 @@ func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
 	// from here on, so that each is matched against the backlog's snapshot instead of
 	// assumed to be missing from it. Begun before the stats query, so that a delivery
 	// staged during it is matched too, whichever side of the snapshot its row commits.
-	countedBefore := w.beginStagingRefresh()
+	countedBefore, refreshGen := w.beginStagingRefresh()
 	var changed map[StagedBody]int64
 	endRefresh := func() []StagedBody {
 		changed = w.endStagingRefresh()
@@ -1539,7 +1546,7 @@ func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
 		for body, before := range changed {
 			delta += before - backlog.Included[body]
 		}
-		w.addStagingSize(delta)
+		w.rebaseStagingSize(refreshGen, delta)
 	}
 
 	// Log summary
@@ -1632,22 +1639,67 @@ func (w *UploadWorker) stagedSizeChanged(path string, before, after int64) {
 	}
 	w.stagingRefreshMu.Lock()
 	defer w.stagingRefreshMu.Unlock()
+	w.stagedSizeChangedLocked(path, before, after)
+}
+
+// stagedSizeChangedLocked is stagedSizeChanged with stagingRefreshMu held. An after of
+// 0 is a removal.
+func (w *UploadWorker) stagedSizeChangedLocked(path string, before, after int64) {
 	if w.stagingRefresh != nil {
 		if _, seen := w.stagingRefresh[path]; !seen {
 			w.stagingRefresh[path] = before
 		}
 	}
+	if after == 0 {
+		delete(w.stagedGen, path)
+	} else {
+		if w.stagedGen == nil {
+			w.stagedGen = make(map[string]uint64)
+		}
+		w.stagedGen[path] = w.stagingGen
+	}
 	w.addStagingSize(after - before)
+}
+
+// orphanRemoved applies the orphan sweep's removal of the size bytes staged at path,
+// which have no pending row. The count holds them only if path was staged since the
+// last re-base began (stagedGen). Otherwise that re-base counted pending rows and, with
+// none for path, already left these bytes out, as it leaves out a file an earlier run
+// left behind: subtracting them again would let the guard admit that much more than
+// fits until the next refresh. (A row deleted after the snapshot, as an account purge
+// does, leaves its bytes counted until then instead, which only refuses early.) The
+// caller holds path's staging lock.
+func (w *UploadWorker) orphanRemoved(path string, size int64) {
+	w.stagingRefreshMu.Lock()
+	defer w.stagingRefreshMu.Unlock()
+	if _, counted := w.stagedGen[path]; counted {
+		w.stagedSizeChangedLocked(path, size, 0)
+	}
 }
 
 // beginStagingRefresh starts noting staged-file changes for monitorStuckUploads, which
 // runs one at a time on the worker's loop, and returns the staging size they are
-// changes to.
-func (w *UploadWorker) beginStagingRefresh() int64 {
+// changes to and the refresh's generation.
+func (w *UploadWorker) beginStagingRefresh() (int64, uint64) {
 	w.stagingRefreshMu.Lock()
 	defer w.stagingRefreshMu.Unlock()
 	w.stagingRefresh = make(map[string]int64)
-	return atomic.LoadInt64(&w.currentStagingSize)
+	w.stagingGen++
+	return atomic.LoadInt64(&w.currentStagingSize), w.stagingGen
+}
+
+// rebaseStagingSize applies the delta that re-bases the staging size on the snapshot
+// of refresh gen. From then on, a path last changed before that refresh began counts
+// what the snapshot had for it rather than its bytes on disk, so it leaves stagedGen.
+func (w *UploadWorker) rebaseStagingSize(gen uint64, delta int64) {
+	w.stagingRefreshMu.Lock()
+	defer w.stagingRefreshMu.Unlock()
+	w.addStagingSize(delta)
+	for path, changed := range w.stagedGen {
+		if changed < gen {
+			delete(w.stagedGen, path)
+		}
+	}
 }
 
 // endStagingRefresh stops noting changes and returns, for each body changed since
@@ -1675,8 +1727,8 @@ func (w *UploadWorker) addStagingSize(delta int64) {
 	}
 	for {
 		cur := atomic.LoadInt64(&w.currentStagingSize)
-		// Removing files this process never counted - orphans left by a previous run -
-		// must clamp at zero rather than driving the running total below zero.
+		// Removing a body the last refresh did not count (its row committed after the
+		// snapshot) must clamp at zero rather than drive the running total below zero.
 		next := max(cur+delta, 0)
 		if atomic.CompareAndSwapInt64(&w.currentStagingSize, cur, next) {
 			return
@@ -1779,7 +1831,7 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 				size := info.Size()
 				removeErr := os.Remove(file.path)
 				if removeErr == nil {
-					w.stagedSizeChanged(file.path, size, 0)
+					w.orphanRemoved(file.path, size)
 				}
 				pathMu.Unlock()
 				if removeErr != nil {
