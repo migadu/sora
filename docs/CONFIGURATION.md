@@ -241,12 +241,27 @@ These conditions only log, and startup continues:
   allowed_hosts and/or api_key`.
 - The host name is not fully qualified: `Mail hostname is not fully qualified`. Sora uses the host
   name in greetings and in the `Received` header.
+- A setting has no effect on this node: `enable_affinity` on a proxy without `[cluster]` and
+  `[cluster.affinity]` enabled, `max_connections_per_user` or `max_connections_per_user_per_ip` on an
+  IMAP, POP3 or ManageSieve proxy without `[cluster]`, an `http_user_api` server without `[s3]` (it
+  serves no message bodies), an `http_admin_api` server without an `imap`, `pop3` or `lmtp` server
+  (`POST /admin/mail/deliver` answers 503), and a proxy on a node without a database (backend
+  maintenance is not honored).
+- `[relay]` relays to a host other than a loopback address in plaintext or without verifying its
+  certificate.
+- A value does not parse, and Sora uses the default instead: a size, timeout or duration of a
+  `[[server]]` block (with its `limits`, `timeouts` and `lookup_cache` tables) or of
+  `[cluster.affinity]`, `[backend_maintenance]`, `[relay.queue]`, `[local_cache]`, `[cleanup]`,
+  `[uploader]`, `[auth_cache]` or `[database]`, where the part of the node that reads it runs. The
+  `[database]` timeouts are logged at each query. A `[spam_training]` value that does not parse
+  leaves spam training out, and a `max_message_size` above 2147483647 bytes is lowered to that.
 
 Later steps can still fail, for example a TLS certificate that cannot be read, or a database that
 cannot be reached. Those are covered in the topic documents.
 
-`sora-admin config validate` runs every check in this list, without starting anything. See
-[ADMIN_CLI.md](ADMIN_CLI.md).
+`sora-admin config validate` runs every check in this list, without starting anything, except those
+that depend on the host: the publicly reachable address and host name checks. It prints each
+warning as a `[WARN]` line and still exits with status 0. See [ADMIN_CLI.md](ADMIN_CLI.md).
 
 ---
 

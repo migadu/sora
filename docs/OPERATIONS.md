@@ -214,7 +214,9 @@ Sora starts despite these, but each one points at something to fix:
 `sora-admin --config PATH config validate` parses the file, prints unknown and duplicate keys,
 validates every `[[server]]` block and runs the other checks `sora` makes on the file before it
 starts anything (see [CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup)), reporting
-every problem it finds. It connects to nothing and exits with status 0 when the file is valid.
+every problem it finds. It also prints, as `[WARN]` lines, the warnings startup logs about the file
+alone, such as a value that does not parse and is replaced with its default. It connects to nothing
+and exits with status 0 when the file is valid, warnings or not.
 `sora-admin --config PATH config dump` prints the parsed config with secrets masked.
 
 ---

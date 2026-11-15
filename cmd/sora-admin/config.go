@@ -279,9 +279,14 @@ Description:
         maintenance)
       a [relay] in plaintext or without certificate verification
       values start-up cannot parse and replaces with the default: the
-        [server.limits] windows and sizes, the timeouts.*_command_timeouts
-        tables, remote_dns_refresh, and the [cluster.affinity],
-        [backend_maintenance] and [relay.queue] durations
+        [[server]] sizes, timeouts and durations (with [server.limits],
+        [server.timeouts] and [server.lookup_cache]) of each server that
+        reads them, and the [cluster.affinity], [backend_maintenance],
+        [relay.queue], [local_cache], [cleanup], [uploader], [auth_cache] and
+        [database] durations and sizes of a node that reads them
+      a [spam_training] value start-up cannot parse, which leaves spam
+        training out, and a max_message_size above the largest message Sora
+        can store
 
   It connects to nothing and does not look at the node's disk, so it does
   not check connectivity. When services start, Sora connects to the database
