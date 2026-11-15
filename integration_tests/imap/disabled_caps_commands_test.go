@@ -287,3 +287,97 @@ func TestIMAP_DisabledListExtendedKeepsIndependentOptions(t *testing.T) {
 		})
 	}
 }
+
+// TestIMAP_DisabledCapsRefusesImpliedExtensions verifies that disabling
+// SPECIAL-USE or ESEARCH (via disabled_caps or client_filters) also withdraws
+// and refuses the extensions that RFC-imply them (#1011): CREATE-SPECIAL-USE ->
+// SPECIAL-USE (RFC 6154 §3), and SEARCHRES (RFC 5182 §2.1), ESORT (RFC 5267
+// §3.1) and MULTISEARCH (RFC 7377) -> ESEARCH.
+func TestIMAP_DisabledCapsRefusesImpliedExtensions(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	for _, mode := range []struct {
+		name     string
+		identify bool
+	}{
+		{"disabled_caps", false},
+		{"client_filters", true},
+	} {
+		t.Run(mode.name+"/SPECIAL-USE", func(t *testing.T) {
+			c := dialDisabledCaps(t, func(o *imapserver.IMAPServerOptions) {
+				if mode.identify {
+					o.CapabilityFilters = []config.ClientCapabilityFilter{{ClientName: "^buggy$", DisableCaps: []string{"SPECIAL-USE"}}}
+				} else {
+					o.DisabledCaps = []string{"SPECIAL-USE"}
+				}
+			}, mode.identify)
+
+			capLine, _, _ := strings.Cut(c.do("CAPABILITY"), "\r\n")
+			caps := strings.Fields(capLine)
+			for _, name := range []string{"SPECIAL-USE", "CREATE-SPECIAL-USE"} {
+				if slices.Contains(caps, name) {
+					t.Errorf("CAPABILITY still offers %s:\n%s", name, capLine)
+				}
+			}
+			if !slices.Contains(caps, "IMAP4rev2") {
+				t.Errorf("CAPABILITY lost IMAP4rev2 when disabling SPECIAL-USE:\n%s", capLine)
+			}
+
+			c.clearSpecialUse(`\Archive`)
+			c.wantBad(`CREATE Arch (USE (\Archive))`)
+			if resp := c.mustOK(`LIST "" "Arch"`); strings.Contains(resp, "* LIST ") {
+				t.Errorf("a refused CREATE created the mailbox:\n%s", resp)
+			}
+			c.wantBad(`LIST (SPECIAL-USE) "" "*"`)
+			c.wantBad(`LIST "" "*" RETURN (SPECIAL-USE)`)
+			c.mustOK("CREATE Plain")
+		})
+
+		t.Run(mode.name+"/ESEARCH", func(t *testing.T) {
+			c := dialDisabledCaps(t, func(o *imapserver.IMAPServerOptions) {
+				if mode.identify {
+					o.CapabilityFilters = []config.ClientCapabilityFilter{{ClientName: "^buggy$", DisableCaps: []string{"ESEARCH"}}}
+				} else {
+					o.DisabledCaps = []string{"ESEARCH"}
+				}
+			}, mode.identify)
+
+			capLine, _, _ := strings.Cut(c.do("CAPABILITY"), "\r\n")
+			caps := strings.Fields(capLine)
+			for _, name := range []string{"IMAP4rev2", "ESEARCH", "SEARCHRES", "ESORT", "MULTISEARCH"} {
+				if slices.Contains(caps, name) {
+					t.Errorf("CAPABILITY still offers %s:\n%s", name, capLine)
+				}
+			}
+			for _, name := range []string{"IMAP4rev1", "SORT", "SORT=DISPLAY"} {
+				if !slices.Contains(caps, name) {
+					t.Errorf("CAPABILITY lost %s:\n%s", name, capLine)
+				}
+			}
+
+			c.appendMessage()
+
+			c.wantBad("ESEARCH IN (personal) ALL")
+
+			c.mustOK("SELECT INBOX")
+			c.wantBad("ESEARCH ALL")
+			c.wantBad("ESEARCH IN (selected) RETURN (SAVE) ALL")
+			c.wantBad("SEARCH RETURN (SAVE) ALL")
+			c.wantBad("UID SEARCH RETURN (SAVE) ALL")
+			c.wantBad("SEARCH RETURN (COUNT) ALL")
+			c.wantBad("SORT RETURN (ALL) (DATE) UTF-8 ALL")
+			c.wantBad("SORT RETURN (COUNT) (DATE) UTF-8 ALL")
+			c.wantBad("UID SORT RETURN (MIN MAX) (DATE) UTF-8 ALL")
+
+			if resp := c.mustOK("SEARCH ALL"); !strings.Contains(resp, "* SEARCH 1") {
+				t.Errorf("plain SEARCH ALL: want * SEARCH 1, got:\n%s", resp)
+			}
+			if resp := c.mustOK("SORT (DATE) UTF-8 ALL"); !strings.Contains(resp, "* SORT 1") {
+				t.Errorf("plain SORT: want * SORT 1, got:\n%s", resp)
+			}
+			if resp := c.mustOK("SORT (DISPLAYFROM) UTF-8 ALL"); !strings.Contains(resp, "* SORT 1") {
+				t.Errorf("SORT (DISPLAYFROM): want * SORT 1, got:\n%s", resp)
+			}
+		})
+	}
+}

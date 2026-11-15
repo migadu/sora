@@ -34,9 +34,10 @@ import (
 //
 // Token matching ("re", "fw"/"fwd", "[fwd:", "(fwd)") is case-insensitive. We
 // fold the working string to upper case up front: this both makes the matching
-// case-insensitive and yields a case-folded key so that equal-modulo-case
-// subjects compare equal under plain octet comparison (the comparison required
-// by RFC 5256 is i;ascii-casemap, i.e. case-insensitive).
+// case-insensitive and yields a case-folded key. RFC 5256 §7 requires the
+// i;unicode-casemap collation, which also titlecases and decomposes (RFC 5051
+// §2); SORT and THREAD finish that preparation when they read the stored key
+// (db.subjectCasemapKey).
 func NormalizeSubjectForSort(subject string) string {
 	if subject == "" {
 		return ""

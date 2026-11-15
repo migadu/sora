@@ -651,6 +651,20 @@ func (rd *ResilientDatabase) HasMailboxWithSpecialUseWithRetry(ctx context.Conte
 	return result.(bool), nil
 }
 
+// GetPersonalMailboxNameBySpecialUseWithRetry returns the name of the account's
+// personal mailbox carrying the RFC 6154 special-use attribute attr, or
+// consts.ErrMailboxNotFound if there is none.
+func (rd *ResilientDatabase) GetPersonalMailboxNameBySpecialUseWithRetry(ctx context.Context, accountID int64, attr string) (string, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetPersonalMailboxNameBySpecialUse(ctx, accountID, attr)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
+	if err != nil {
+		return "", err
+	}
+	return result.(string), nil
+}
+
 func (rd *ResilientDatabase) CountMessagesGreaterThanUIDWithRetry(ctx context.Context, mailboxID int64, minUID imap.UID) (uint32, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).CountMessagesGreaterThanUID(ctx, mailboxID, minUID)
