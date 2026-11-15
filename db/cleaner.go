@@ -1006,6 +1006,9 @@ func (d *Database) DeleteMessagesFTSByKeyBatch(ctx context.Context, tx pgx.Tx, k
 func (d *Database) ListSoftDeletedAccountsForHardDelete(ctx context.Context, gracePeriod time.Duration, limit int) ([]int64, error) {
 	threshold := time.Now().Add(-gracePeriod).UTC()
 
+	// Plan this infrequent listing with its current arguments. Under skew, a cached
+	// generic plan can scan live messages once for every already-finished account.
+	// Exec keeps bound parameters but avoids reusing that named prepared plan.
 	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, `
 		SELECT a.id
 		FROM accounts a
@@ -1014,7 +1017,7 @@ func (d *Database) ListSoftDeletedAccountsForHardDelete(ctx context.Context, gra
 		     OR EXISTS (SELECT 1 FROM messages WHERE account_id = a.id AND expunged_at IS NULL))
 		ORDER BY a.deleted_at ASC
 		LIMIT $2
-	`, threshold, limit)
+	`, pgx.QueryExecModeExec, threshold, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query soft-deleted accounts: %w", err)
 	}
