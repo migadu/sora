@@ -11,8 +11,8 @@ import (
 // character. A host entry that carries a port ("db.example.com:5433",
 // "[2001:db8::1]:5433") keeps it; otherwise the endpoint's port applies, 5432 when
 // unset (config.DatabaseEndpointConfig.HostPort, which [database] validation checks
-// every host entry with). sslmode follows the endpoint's tls setting; callers add further parameters
-// to the returned URL's query.
+// every host entry with). sslmode follows the endpoint's tls setting; callers add
+// further parameters to the returned URL's query.
 func EndpointURL(endpoint *config.DatabaseEndpointConfig, host string) (*url.URL, error) {
 	hostPort, err := endpoint.HostPort(host)
 	if err != nil {
