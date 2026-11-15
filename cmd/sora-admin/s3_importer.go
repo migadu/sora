@@ -83,17 +83,28 @@ type S3ObjectInfo struct {
 func NewS3Importer(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, options S3ImporterOptions) (*S3Importer, error) {
 	// Wrap S3 storage with resilient patterns
 	resilientS3 := resilient.NewResilientS3Storage(s3)
-	// Create temporary SQLite database to track S3 objects
-	tempDir := os.TempDir()
-	dbPath := filepath.Join(tempDir, fmt.Sprintf("sora-s3-import-%d.db", time.Now().Unix()))
+	// Create temporary SQLite database to track S3 objects. Every run gets a file of its
+	// own, created exclusively and readable by its owner only (os.CreateTemp): importFromS3
+	// imports every row in it into this run's account, so a run must never open another's.
+	f, err := os.CreateTemp(os.TempDir(), "sora-s3-import-*.db")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temporary database: %w", err)
+	}
+	dbPath := f.Name()
+	if err := f.Close(); err != nil {
+		os.Remove(dbPath)
+		return nil, fmt.Errorf("failed to create temporary database: %w", err)
+	}
 	logger.Info("Using temporary database", "path", dbPath)
 
 	dsn, err := sqlitefile.DSN(dbPath, "")
 	if err != nil {
+		os.Remove(dbPath)
 		return nil, err
 	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
+		os.Remove(dbPath)
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
 	}
 
@@ -118,6 +129,8 @@ func NewS3Importer(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, opti
 		CREATE INDEX IF NOT EXISTS idx_content_hash ON s3_objects(content_hash);
 	`)
 	if err != nil {
+		db.Close()
+		os.Remove(dbPath)
 		return nil, fmt.Errorf("failed to create s3_objects table: %w", err)
 	}
 
@@ -450,6 +463,14 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 		return fmt.Errorf("invalid email address: %w", err)
 	}
 
+	// The message is filed under this user's prefix (S3Domain/S3Localpart and the key
+	// CompleteS3Upload confirms), so the object must be the one under that prefix: an
+	// object under any other is another user's mail.
+	s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), contentHash)
+	if obj.Key != s3Key {
+		return fmt.Errorf("S3 object %s is not under the prefix of %s", obj.Key, address.FullAddress())
+	}
+
 	accountID, err := si.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 	if err != nil {
 		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", si.options.Email, err, si.options.Email)
@@ -582,7 +603,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	}
 
 	// Since the content already exists in S3, mark the upload as complete
-	err = si.rdb.CompleteS3UploadWithRetry(ctx, contentHash, user.AccountID(), []string{helpers.NewS3Key(address.Domain(), address.LocalPart(), contentHash)})
+	err = si.rdb.CompleteS3UploadWithRetry(ctx, contentHash, user.AccountID(), []string{s3Key})
 	if err != nil {
 		return fmt.Errorf("failed to mark S3 upload as complete: %w", err)
 	}

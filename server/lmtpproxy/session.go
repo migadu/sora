@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/migadu/sora/consts"
@@ -29,7 +30,7 @@ type Session struct {
 	listenerConn          net.Conn            // The accepted connection, never reassigned: its SoraConn carries the JA4 and username, which the TLS conn above it after STARTTLS does not
 	startTLSInProgress    bool                // Between the 220 to STARTTLS and the end of its handshake, under mu: the client reads neither plaintext nor, yet, TLS
 	greeted               bool                // The 220 greeting has been written, under mu: before it the implicit-TLS handshake may be pending, and a notice written then would wait for it
-	noticeMu              sync.Mutex          // Orders the greeting and shutdown notice with STARTTLS, without holding mu during socket writes
+	noticeMu              sync.Mutex          // Orders the greeting and the shutdown and kick notices with STARTTLS, without holding mu during socket writes
 	backendConn           net.Conn            // Reassigned under mu on backend connect/STARTTLS/error; shutdown/cancellation snapshot it under mu
 	backendRoute          *proxy.BackendRoute // Authorization of the held socket; survives per-recipient routing and transaction resets
 	backendReader         *bufio.Reader
@@ -64,10 +65,15 @@ type Session struct {
 	// backend accepts a recipient for (forwardRCPT), on a new or an already held
 	// backend connection; a refused recipient is not registered.
 	// IMPORTANT: s.accountID is overwritten per RCPT; if we only unregister the last one,
-	// earlier recipients would leak connection counts permanently. Each account is
-	// registered at most once per session (a backend reconnect does not register it
-	// again), so close() unregisters each entry exactly once.
-	registeredAccountIDs map[int64]struct{}
+	// earlier recipients would leak connection counts permanently. Every accepted
+	// account subscribes to kicks, even if counting fails after backend acceptance.
+	// Successful counts happen at most once per account; failed counts can retry
+	// without creating another kick watcher. close() releases only successful counts.
+	registeredAccountIDs map[int64]accountRegistration
+	// kickedAccountID is the account whose kick ended the session, 0 if none. It is
+	// set by watchKick and logged by close(), on the session goroutine, which owns
+	// the fields the session logger reads.
+	kickedAccountID atomic.Int64
 
 	// Per-transaction state. The backend's view of a transaction must stay the MTA's:
 	// acceptedRcpts counts the recipients the backend accepted (2xx to RCPT), which is
@@ -92,6 +98,11 @@ type Session struct {
 	backendSIZE  bool
 }
 
+type accountRegistration struct {
+	kick    <-chan struct{}
+	counted bool
+}
+
 // newSession creates a new LMTP proxy session.
 func newSession(s *Server, conn net.Conn, proxyInfo *server.ProxyProtocolInfo) *Session {
 	sessionCtx, sessionCancel := context.WithCancel(s.ctx)
@@ -114,7 +125,7 @@ func newSession(s *Server, conn net.Conn, proxyInfo *server.ProxyProtocolInfo) *
 		cancel:               sessionCancel,
 		startTime:            time.Now(),
 		proxyInfo:            proxyInfo,
-		registeredAccountIDs: make(map[int64]struct{}),
+		registeredAccountIDs: make(map[int64]accountRegistration),
 		// Generate the session id once, up front, so every log line carries it.
 		// It's also forwarded to the backend (XCLIENT), logged there as proxy_session.
 		sessionID: idgen.New(),
@@ -1174,8 +1185,9 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 	return nil
 }
 
-// connectToBackend establishes a connection to the backend server.
-func (s *Session) connectToBackend() error {
+// connectToBackend establishes a connection to the backend server. When it fails, the
+// session holds no backend connection.
+func (s *Session) connectToBackend() (err error) {
 	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 		Ctx:                   s.ctx,
 		Username:              s.originalAddress, // Use original address (not resolved address) for route/affinity consistency
@@ -1261,6 +1273,14 @@ func (s *Session) connectToBackend() error {
 	s.backendWriter = bufio.NewWriter(backendConn)
 	s.mu.Unlock()
 	s.serverAddr = actualAddr
+	// From here on the session holds the connection, so a failure drops it (closed and
+	// cleared), or the next command would go to the closed connection instead of
+	// connecting afresh.
+	defer func() {
+		if err != nil {
+			s.loseBackend()
+		}
+	}()
 
 	// Enable TCP keepalive on backend connection to detect dead connections
 	// This helps detect network partitions and stale connections without waiting for read timeout
@@ -1291,11 +1311,9 @@ func (s *Session) connectToBackend() error {
 	// accepts TCP but never sends its greeting must not hang the session)
 	greeting, err := s.readBackendLine()
 	if err != nil {
-		s.backendConn.Close()
 		return fmt.Errorf("failed to read backend greeting: %w", err)
 	}
 	if !strings.HasPrefix(greeting, "220") {
-		s.backendConn.Close()
 		return fmt.Errorf("unexpected backend greeting: %q", strings.TrimSpace(greeting))
 	}
 
@@ -1303,7 +1321,6 @@ func (s *Session) connectToBackend() error {
 	lhloCmd := fmt.Sprintf("LHLO %s\r\n", s.server.hostname)
 	_, err = s.backendWriter.WriteString(lhloCmd)
 	if err != nil {
-		s.backendConn.Close()
 		return fmt.Errorf("failed to send LHLO: %w", err)
 	}
 	s.backendWriter.Flush()
@@ -1313,12 +1330,10 @@ func (s *Session) connectToBackend() error {
 	s.backendSMTPUTF8, s.backendSIZE = false, false
 	for lines := 0; ; lines++ {
 		if lines >= maxLHLOResponseLines {
-			s.backendConn.Close()
 			return fmt.Errorf("backend LHLO response exceeded %d lines", maxLHLOResponseLines)
 		}
 		response, err := s.readBackendLine()
 		if err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("failed to read LHLO response: %w", err)
 		}
 
@@ -1333,7 +1348,6 @@ func (s *Session) connectToBackend() error {
 		// Check if this is the last line (no hyphen after status code)
 		if len(response) >= 4 && response[3] != '-' {
 			if !strings.HasPrefix(response, "250") {
-				s.backendConn.Close()
 				return fmt.Errorf("backend LHLO failed: %s", response)
 			}
 			break
@@ -1349,7 +1363,6 @@ func (s *Session) connectToBackend() error {
 		// Send STARTTLS command
 		_, err := s.backendWriter.WriteString("STARTTLS\r\n")
 		if err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("failed to send STARTTLS command: %w", err)
 		}
 		s.backendWriter.Flush()
@@ -1357,12 +1370,10 @@ func (s *Session) connectToBackend() error {
 		// Read STARTTLS response (bounded, with read deadline)
 		response, err := s.readBackendLine()
 		if err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("failed to read STARTTLS response: %w", err)
 		}
 
 		if !strings.HasPrefix(strings.TrimSpace(response), "220") {
-			s.backendConn.Close()
 			return fmt.Errorf("backend STARTTLS failed: %s", strings.TrimSpace(response))
 		}
 
@@ -1370,7 +1381,6 @@ func (s *Session) connectToBackend() error {
 		// could have put them. The reader replaced below would drop them; a stream that
 		// broke the protocol there fails the connection instead (cf. CVE-2011-0411).
 		if s.backendReader.Buffered() > 0 {
-			s.backendConn.Close()
 			return errors.New("backend sent data after its STARTTLS response")
 		}
 
@@ -1378,18 +1388,15 @@ func (s *Session) connectToBackend() error {
 		// handshake gets its own: a backend that never answers must not hold the session.
 		if timeout := s.server.connManager.GetConnectTimeout(); timeout > 0 {
 			if err := s.backendConn.SetDeadline(time.Now().Add(timeout)); err != nil {
-				s.backendConn.Close()
 				return fmt.Errorf("failed to set the STARTTLS handshake deadline: %w", err)
 			}
 		}
 		tlsConn := tls.Client(s.backendConn, tlsConfig)
 		err = tlsConn.Handshake()
 		if err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("TLS handshake with backend failed: %w", err)
 		}
 		if err := tlsConn.SetDeadline(time.Time{}); err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("failed to clear the STARTTLS handshake deadline: %w", err)
 		}
 
@@ -1404,7 +1411,6 @@ func (s *Session) connectToBackend() error {
 		lhloCmd := fmt.Sprintf("LHLO %s\r\n", s.server.hostname)
 		_, err = s.backendWriter.WriteString(lhloCmd)
 		if err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("failed to send LHLO after STARTTLS: %w", err)
 		}
 		s.backendWriter.Flush()
@@ -1413,12 +1419,10 @@ func (s *Session) connectToBackend() error {
 		s.backendSMTPUTF8, s.backendSIZE = false, false
 		for lines := 0; ; lines++ {
 			if lines >= maxLHLOResponseLines {
-				s.backendConn.Close()
 				return fmt.Errorf("backend LHLO response after STARTTLS exceeded %d lines", maxLHLOResponseLines)
 			}
 			response, err := s.readBackendLine()
 			if err != nil {
-				s.backendConn.Close()
 				return fmt.Errorf("failed to read LHLO response after STARTTLS: %w", err)
 			}
 
@@ -1433,7 +1437,6 @@ func (s *Session) connectToBackend() error {
 			// Check if this is the last line
 			if len(response) >= 4 && response[3] != '-' {
 				if !strings.HasPrefix(response, "250") {
-					s.backendConn.Close()
 					return fmt.Errorf("backend LHLO after STARTTLS failed: %s", response)
 				}
 				break
@@ -1462,7 +1465,6 @@ func (s *Session) connectToBackend() error {
 		} else if err != nil {
 			// A reply of the exchange was not read (a write or read error, or the
 			// deadline). It may still come, and MAIL FROM would read it as its own.
-			s.backendConn.Close()
 			return fmt.Errorf("XCLIENT exchange with backend: %w", err)
 		}
 	}
@@ -1472,7 +1474,6 @@ func (s *Session) connectToBackend() error {
 		mailCmd := s.backendMailFrom() + "\r\n"
 		_, err = s.backendWriter.WriteString(mailCmd)
 		if err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("failed to send MAIL FROM: %w", err)
 		}
 		s.backendWriter.Flush()
@@ -1480,13 +1481,10 @@ func (s *Session) connectToBackend() error {
 		// Read MAIL FROM response (bounded, with read deadline)
 		response, err := s.readBackendLine()
 		if err != nil {
-			s.backendConn.Close()
 			return fmt.Errorf("failed to read MAIL FROM response: %w", err)
 		}
 
 		if !strings.HasPrefix(response, "250") {
-			// Dropped, not only closed: the next recipient connects afresh.
-			s.loseBackend()
 			if strings.HasPrefix(response, "552") {
 				return fmt.Errorf("%w: %s", errBackendRefusedSize, strings.TrimSpace(response))
 			}
@@ -1641,18 +1639,22 @@ func (s *Session) forwardRCPT(command string) {
 		return
 	}
 
-	// Backend accepted (2xx) - forward response to client. From here on this
-	// transaction is the backend's: a lost backend can no longer be replaced.
+	// Backend accepted (2xx). From here on this transaction is the backend's: a
+	// lost backend can no longer be replaced.
 	s.acceptedRcpts++
-	s.clientWriter.WriteString(response)
-	s.clientWriter.Flush()
 
 	// The session now delivers to this recipient's account, on a new backend
 	// connection or on the one it already held: count it for that account
-	// (once per session, however many of its recipients follow).
+	// (once per session, however many of its recipients follow). This comes
+	// before the reply, so the account's kick reaches the session from the
+	// moment the MTA learns of the acceptance.
 	if err := s.registerConnection(); err != nil {
 		s.InfoLog("rejected connection registration", "error", err)
 	}
+
+	// Forward the backend's acceptance to the client.
+	s.clientWriter.WriteString(response)
+	s.clientWriter.Flush()
 
 	// Log routing decision at INFO level with sender, recipient, and routing method
 	s.InfoLog("routing to backend", "backend", s.serverAddr, "method", s.routingMethod, "from", s.sender, "to", s.to)
@@ -1666,6 +1668,10 @@ func (s *Session) close() {
 	if s.releaseConn != nil {
 		s.releaseConn()
 		s.releaseConn = nil // Prevent double-release
+	}
+
+	if kicked := s.kickedAccountID.Load(); kicked != 0 {
+		s.InfoLog("connection kicked", "kicked_account_id", kicked)
 	}
 
 	// Log disconnection at INFO level
@@ -1691,12 +1697,11 @@ func (s *Session) close() {
 		// backend connect failed) or was rejected by a limit. Unregistering an
 		// account that was never registered decrements connection counts owned
 		// by the user's OTHER live sessions, eroding per-user limits.
-		accountIDs := make([]int64, 0, len(s.registeredAccountIDs))
-		for id := range s.registeredAccountIDs {
-			accountIDs = append(accountIDs, id)
-		}
-
-		for _, id := range accountIDs {
+		for id, registration := range s.registeredAccountIDs {
+			s.server.connTracker.UnregisterSession(id, registration.kick)
+			if !registration.counted {
+				continue
+			}
 			// Use cached client address to avoid race with connection close
 			if err := s.server.connTracker.UnregisterConnection(ctx, id, "LMTP", s.clientAddr); err != nil {
 				// Connection tracking is non-critical monitoring data, so log but continue
@@ -1746,58 +1751,68 @@ func (s *Session) registerConnection() error {
 		// the backend accepts and however many backend connections it opens (after a
 		// lost backend the next RCPT TO reconnects and lands here again), and close()
 		// unregisters each account once.
-		if _, ok := s.registeredAccountIDs[s.accountID]; ok {
+		registration, subscribed := s.registeredAccountIDs[s.accountID]
+		if !subscribed {
+			if s.registeredAccountIDs == nil {
+				s.registeredAccountIDs = make(map[int64]accountRegistration)
+			}
+			registration.kick = s.server.connTracker.RegisterSession(s.accountID)
+			s.registeredAccountIDs[s.accountID] = registration
+			go s.watchKick(s.accountID, registration.kick)
+		}
+		if registration.counted {
 			return nil
 		}
 		err := s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "LMTP", s.clientAddr)
 		if err != nil {
 			return err
 		}
-		// Remember which account we registered so close() can unregister the same one,
-		// even if s.accountID later changes due to additional RCPT TOs.
-		if s.registeredAccountIDs == nil {
-			s.registeredAccountIDs = make(map[int64]struct{})
-		}
-		s.registeredAccountIDs[s.accountID] = struct{}{}
+		registration.counted = true
+		s.registeredAccountIDs[s.accountID] = registration
 		return nil
 	}
 	return nil
 }
 
-// updateActivityPeriodically updates the connection activity in the database.
-func (s *Session) updateActivityPeriodically(ctx context.Context) {
-	// If connection tracking is disabled, do nothing and wait for session to end.
-	if s.server.connTracker == nil {
-		<-ctx.Done()
+// kickNoticeTimeout bounds the write of the 421 a kick sends before it closes
+// the session, as the shutdown notice is bounded, for a client that stops reading.
+const kickNoticeTimeout = time.Second
+
+// watchKick ends the session when the tracker kicks accountID (it closes kick),
+// whichever of the session's recipients the account is, and returns with the
+// session otherwise. The kick is an intentional close, which RFC 5321 section
+// 3.8 (LMTP is SMTP there, RFC 2033 section 4) allows only after a 421, sent
+// "asynchronously from command receipt" if need be: watchKick writes it the way
+// the shutdown notice does, then cancels the session context, which closes the
+// client and backend transports (handleConnection). The MTA retries whatever it
+// had not been told was delivered. It does not log: the session logger reads
+// fields the command loop writes, so close() reports the kick.
+func (s *Session) watchKick(accountID int64, kick <-chan struct{}) {
+	select {
+	case <-kick:
+	case <-s.ctx.Done():
 		return
 	}
+	if !s.kickedAccountID.CompareAndSwap(0, accountID) {
+		return // another of the session's accounts was kicked: that watcher ends it
+	}
 
-	// Register for kick notifications
-	kickChan := s.server.connTracker.RegisterSession(s.accountID)
-	defer s.server.connTracker.UnregisterSession(s.accountID, kickChan)
-
-	for {
-		select {
-		case <-kickChan:
-			// Kick notification received - close connections. Snapshot the
-			// conns under the session mutex: the command loop reassigns and
-			// nils backendConn on backend errors and STARTTLS (those writes
-			// hold mu), and backendConn may legitimately be nil here.
-			s.InfoLog("connection kicked")
-			s.mu.Lock()
-			clientConn, backendConn := s.clientConn, s.backendConn
-			s.mu.Unlock()
-			if clientConn != nil {
-				clientConn.Close()
-			}
-			if backendConn != nil {
-				backendConn.Close()
-			}
-			return
-		case <-ctx.Done():
-			return
+	// noticeMu orders the notice with STARTTLS and the shutdown notice: no
+	// plaintext 421 after the reply that makes the client expect TLS, and none
+	// after the shutdown's own 421.
+	s.noticeMu.Lock()
+	s.mu.Lock()
+	conn := s.clientConn
+	ready := s.greeted && !s.startTLSInProgress && !s.gracefulShutdown
+	s.mu.Unlock()
+	if conn != nil && ready {
+		if err := conn.SetWriteDeadline(time.Now().Add(kickNoticeTimeout)); err == nil {
+			fmt.Fprint(conn, "421 4.3.2 Service closing connection\r\n")
 		}
 	}
+	s.noticeMu.Unlock()
+
+	s.cancel()
 }
 
 func isClosingError(err error) bool {

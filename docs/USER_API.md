@@ -262,7 +262,7 @@ header listing the methods it does serve; a path no endpoint has is
 | 201 | Mailbox created. |
 | 400 | Bad request: bad JSON, a missing or invalid field or parameter, a script that does not compile. |
 | 401 | No, bad or expired token; failed login. |
-| 403 | Client address not in `allowed_hosts`; deleting `INBOX`; or deleting a shared mailbox, changing flags or deleting a message in one without the right. |
+| 403 | Client address not in `allowed_hosts`; creating a mailbox in the shared namespace; deleting `INBOX`; or deleting a shared mailbox, changing flags or deleting a message in one without the right. |
 | 404 | Mailbox, message or script not found, or no endpoint has the path. |
 | 405 | Wrong method for the path; `Allow` lists the methods it serves. |
 | 409 | Mailbox already exists, or has child mailboxes. |
@@ -353,13 +353,17 @@ mailboxes.
 {"name": "Projects/Acme"}
 ```
 
-Missing parent mailboxes are created too. A trailing `/` is removed.
+Missing parent mailboxes are created too. A trailing `/` is removed. The User API does not
+create shared mailboxes: with `[shared_mailboxes]` enabled, a name in the shared namespace
+(with the default prefix, `Shared` or any name under `Shared/`, in any letter case) is refused
+with 403. Create those over IMAP or with `sora-admin mailbox create`.
 
 Response `201 {"message":"Mailbox created successfully","name":"Projects/Acme"}`.
 
 | Status | Body `error` |
 |---|---|
 | 400 | `Invalid request body`, `Mailbox name is required`, `mailbox name contains invalid characters` (NUL, CR or LF), `mailbox name too long (max 255 characters)`, `Invalid mailbox name` |
+| 403 | `Mailboxes in the shared namespace cannot be created through the User API` |
 | 409 | `Mailbox already exists` |
 | 500 | `Failed to create mailbox` |
 
