@@ -63,6 +63,27 @@ func TestIMAP_MetadataScopeRootIsBAD(t *testing.T) {
 		require.Empty(t, untagged, "%q", command)
 	}
 
+	// RFC 5464 §3.2: "Invalid entry names result in a BAD response in any IMAP
+	// command in which they are used." Even when the mailbox argument contains a
+	// wildcard (which GETMETADATA otherwise rejects with NO [CLIENTBUG]), an
+	// invalid entry name must still produce BAD rather than NO.
+	_, tagged = rc.cmd("W", `GETMETADATA "*" (/private/comment)`)
+	require.True(t, strings.HasPrefix(tagged, "W NO [CLIENTBUG]"), "valid entry with wildcard mailbox: %s", tagged)
+
+	for _, mailbox := range []string{`"*"`, `"%"`, `"INBOX/*"`} {
+		for _, command := range []string{
+			fmt.Sprintf("GETMETADATA %s (/private/)", mailbox),
+			fmt.Sprintf("GETMETADATA %s (/shared/)", mailbox),
+			fmt.Sprintf("GETMETADATA (DEPTH infinity) %s (/private/)", mailbox),
+			fmt.Sprintf("GETMETADATA %s ({10+}\r\n/private/\x01)", mailbox),
+			fmt.Sprintf("GETMETADATA %s ({12+}\r\n/private/\xe2\x84\xaa)", mailbox),
+		} {
+			untagged, tagged := rc.cmd("W", command)
+			require.True(t, strings.HasPrefix(tagged, "W BAD"), "%q: %s", command, tagged)
+			require.Empty(t, untagged, "%q", command)
+		}
+	}
+
 	ctx := context.Background()
 	accountID, err := server.ResilientDB.GetAccountIDByAddressWithRetry(ctx, account.Email)
 	require.NoError(t, err)
