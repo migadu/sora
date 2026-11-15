@@ -148,13 +148,17 @@ created it.
   namespace, the root included, is refused with `403`.
 - `sora-admin messages restore` and the Admin API restore recreate a deleted folder under the
   prefix as a shared mailbox of the account, as `mailbox create` makes one, when sharing is
-  enabled. The ACL entries it had are not restored; it gets the initial ACL below.
+  enabled. It gets owner-only rights, even under a shared parent: one entry, the owner's primary
+  address with `default_rights`, as below for a folder with no shared parent. The ACL entries it
+  had are not restored either. Grant other users access again with `sora-admin acl grant`.
 - Sieve `fileinto :create` never creates a folder in the shared namespace.
 
 ### The initial ACL
 
 - A new shared folder **under a shared parent** copies the parent's ACL entries at that moment.
-  Later changes to the parent do not flow down.
+  Later changes to the parent do not flow down. A folder recreated by a restore does not: the
+  parent may grant users that the deleted folder no longer did, and the restore brings its
+  messages back.
 - A new shared folder **with no shared parent** gets one entry: the creator's primary address with
   `default_rights` (default `lrswipkxtea`). Because the creator is also the owner, and the owner
   always holds every right, this entry does not limit anyone. Grant rights to other users
