@@ -3,6 +3,7 @@ package imap
 import (
 	"context"
 	"errors"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -76,8 +77,8 @@ type notifySnapshotEntry struct {
 // notifyWatch is the per-session NOTIFY state installed by SetNotify. After
 // installation it is only touched by the pump goroutine (the library
 // guarantees NotifyPoll is stopped before SetNotify runs again), except for
-// the pointer swap itself, snapshot, own, ownStatus and ownTree, which are
-// guarded by IMAPSession.notifyMutex.
+// the pointer swap itself, snapshot, snapshotShared, own, ownStatus and
+// ownTree, which are guarded by IMAPSession.notifyMutex.
 type notifyWatch struct {
 	options *imap.NotifyOptions
 
@@ -100,7 +101,11 @@ type notifyWatch struct {
 	// snapshot is the previous tick's view of the account's mailboxes,
 	// diffed to detect MailboxName and SubscriptionChange events, with the
 	// changes the client has made to the tree since applied (ownTree).
-	snapshot map[int64]notifySnapshotEntry
+	// snapshotShared reports that it is the map of the tick that installed
+	// it, which notifyTick goes on reading without notifyMutex for the
+	// STATUS fan-in: an own change is applied to a copy (ownTreeChange.end).
+	snapshot       map[int64]notifySnapshotEntry
+	snapshotShared bool
 
 	// selectedMailboxID / nextFetchUID track MessageNew fetch-atts delivery
 	// for the selected mailbox: messages with UID >= nextFetchUID have not
@@ -391,9 +396,11 @@ func (c *ownTreeChange) subscribed(name string, subscribed bool) {
 	c.change = func(watch *notifyWatch) { watch.ownSubscribed(name, subscribed) }
 }
 
-// end applies the recorded change, if any, to the watch's snapshot. It must be
-// called after the session is pinned to the master database for the change,
-// so the pump reads the change back from where it was made.
+// end applies the recorded change, if any, to the watch's snapshot, copying
+// it first while the tick that installed it may still be reading it
+// (snapshotShared). It must be called after the session is pinned to the
+// master database for the change, so the pump reads the change back from
+// where it was made.
 func (c *ownTreeChange) end() {
 	if c.watch == nil {
 		return
@@ -401,9 +408,14 @@ func (c *ownTreeChange) end() {
 	c.s.notifyMutex.Lock()
 	defer c.s.notifyMutex.Unlock()
 	c.watch.ownTree.writes--
-	if c.change != nil {
-		c.change(c.watch)
+	if c.change == nil {
+		return
 	}
+	if c.watch.snapshotShared {
+		c.watch.snapshot = maps.Clone(c.watch.snapshot)
+		c.watch.snapshotShared = false
+	}
+	c.change(c.watch)
 }
 
 // ownCreated applies to the snapshot the creation of name and of those of its
@@ -1250,7 +1262,7 @@ func (s *IMAPSession) advanceNotifySnapshot(watch *notifyWatch, cur map[int64]no
 		resolveOwnCreated(prev, cur)
 		events = diffNotifySnapshots(prev, cur)
 	}
-	watch.snapshot = cur
+	watch.snapshot, watch.snapshotShared = cur, true
 	return events, false
 }
 
