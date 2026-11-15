@@ -439,7 +439,8 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 		if pgErr, ok := err.(*pgconn.PgError); ok {
 			switch pgErr.Code {
 			case "23505": // Unique constraint violation (a taken name is ON CONFLICT's)
-				// A duplicate special-use attribute (RFC 6154 §5).
+				// A special-use attribute another mailbox holds, refused as a conflict
+				// (RFC 6154 §3).
 				if pgErr.ConstraintName == "mailboxes_account_special_use_unique" {
 					logger.Warn("Database: special-use attribute already assigned", "special_use", specialUse, "account_id", AccountID)
 					return consts.ErrMailboxSpecialUseInUse
