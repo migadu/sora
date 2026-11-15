@@ -749,8 +749,8 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		envelopeTo = s.recipientAddr.FullAddress()
 	}
 
-	// Note: Header normalization is now handled by sieveengine.Evaluate()
-	// to ensure consistent case-insensitive matching per RFC 5228 §2.6.2.1
+	// sieveengine.Evaluate folds the header names: they compare under
+	// i;ascii-casemap (RFC 5228 §2.7)
 	sieveCtx := sieveengine.Context{
 		EnvelopeFrom: s.sender.FullAddress(),
 		EnvelopeTo:   envelopeTo,
