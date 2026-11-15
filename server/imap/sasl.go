@@ -436,9 +436,11 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 // for a refused master SASL impersonation (#846), which must not answer
 // AUTHORIZATIONFAILED when username names an account whose own password is the master
 // SASL password.
+// The caller logs why the login is refused; only a check that could not be made is
+// logged here, because it changes the reply.
 func (s *IMAPSession) refuseLikeWrongPassword(ctx context.Context, username, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) error {
 	if authnAddr, err := server.NewAddress(username); err == nil {
-		if _, authErr := s.server.Authenticate(ctx, authnAddr.BaseAddress(), password); authErr != nil {
+		if _, method, reason, authErr := s.server.Authenticate(ctx, authnAddr.BaseAddress(), password); authErr != nil {
 			if errors.Is(authErr, context.Canceled) || errors.Is(authErr, context.DeadlineExceeded) {
 				s.InfoLog("authentication cancelled due to server shutdown")
 				return &imap.Error{
@@ -448,6 +450,7 @@ func (s *IMAPSession) refuseLikeWrongPassword(ctx context.Context, username, pas
 				}
 			}
 			if server.IsTemporaryAuthFailure(authErr) {
+				s.WarnLog("authentication unavailable", "address", authnAddr.BaseAddress(), "reason", reason, "method", method, "error", authErr)
 				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
 				return &imap.Error{
 					Type: imap.StatusResponseTypeNo,
