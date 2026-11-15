@@ -204,19 +204,12 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 		// Use base address (without suffix) to get account
 		AccountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, addressParsed.BaseAddress())
 		if err != nil {
-			// Check if error is due to context cancellation (server shutdown)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				s.InfoLog("master username auth cancelled due to server shutdown")
-				return &imap.Error{
-					Type: imap.StatusResponseTypeNo,
-					Code: imap.ResponseCodeUnavailable,
-					Text: server.ErrServerShuttingDown.Error(),
-				}
-			}
-
 			// The database could not be asked, so nothing is known about the target:
 			// a temporary failure (RFC 5530 section 3), not a failed login charged to
-			// the master credential.
+			// the master credential. Checked before the context errors, as on the
+			// regular path: a lookup that timed out because the database hangs is no
+			// shutdown, and a wrong master password, which the regular path answers,
+			// must get the same reply.
 			if server.IsTemporaryAuthFailure(err) {
 				s.WarnLog("impersonation target lookup unavailable", "target_user", addressParsed.BaseAddress(), "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
@@ -224,6 +217,16 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 					Type: imap.StatusResponseTypeNo,
 					Code: imap.ResponseCodeUnavailable,
 					Text: server.ErrAuthServiceUnavailable.Error(),
+				}
+			}
+
+			// Check if error is due to context cancellation (server shutdown)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.InfoLog("master username auth cancelled due to server shutdown")
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeUnavailable,
+					Text: server.ErrServerShuttingDown.Error(),
 				}
 			}
 
