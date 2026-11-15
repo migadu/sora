@@ -749,12 +749,12 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		envelopeTo = s.recipientAddr.FullAddress()
 	}
 
-	// sieveengine.Evaluate folds the header names: they compare under
-	// i;ascii-casemap (RFC 5228 §2.7)
+	// HeaderMap folds the header names, which compare under i;ascii-casemap
+	// (RFC 5228 §2.7), and keeps the fields in message order.
 	sieveCtx := sieveengine.Context{
 		EnvelopeFrom: s.sender.FullAddress(),
 		EnvelopeTo:   envelopeTo,
-		Header:       messageContent.Header.Map(),
+		Header:       sieveengine.HeaderMap(messageContent.Header),
 		Message:      fullMessageBytes,
 		MailboxExists: func(ctx context.Context, mailbox string) (bool, error) {
 			if s.useMasterDB {

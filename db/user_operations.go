@@ -788,8 +788,8 @@ func (db *Database) CreateMailboxForUser(ctx context.Context, accountID int64, m
 // DeleteMailboxForUser deletes a mailbox
 func (db *Database) DeleteMailboxForUser(ctx context.Context, accountID int64, mailboxPath string) error {
 	// Prevent deletion of INBOX
-	if strings.EqualFold(mailboxPath, "INBOX") {
-		return errors.New("cannot delete INBOX")
+	if isInboxNameASCII(mailboxPath) {
+		return fmt.Errorf("cannot delete INBOX: %w", consts.ErrNotPermitted)
 	}
 
 	// Pin pre-transaction mailbox resolution and shared-mailbox ACL checks to the
@@ -800,6 +800,12 @@ func (db *Database) DeleteMailboxForUser(ctx context.Context, accountID int64, m
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
 		return err
+	}
+	// Check the mailbox the database resolved too: under a libc UTF-8 collation,
+	// LOWER('\u0130NBOX') = 'inbox' resolves to the account's canonical INBOX while
+	// ASCII case-folding on the client spelling does not match.
+	if mailbox.AccountID == accountID && isInboxNameASCII(mailbox.Name) {
+		return fmt.Errorf("cannot delete INBOX: %w", consts.ErrNotPermitted)
 	}
 
 	tx, err := db.GetWritePool().Begin(ctx)
@@ -865,6 +871,23 @@ func (db *Database) UnsubscribeFromMailbox(ctx context.Context, accountID int64,
 }
 
 // Helper functions
+
+// isInboxNameASCII reports whether s is the 5-byte ASCII name "INBOX" in any case.
+func isInboxNameASCII(s string) bool {
+	if len(s) != len(consts.MailboxInbox) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if 'a' <= c && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if c != consts.MailboxInbox[i] {
+			return false
+		}
+	}
+	return true
+}
 
 func bitwiseFlagsToStrings(flags any) []string {
 	var bitwiseFlags int

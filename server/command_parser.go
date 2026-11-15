@@ -115,6 +115,29 @@ func ToUpperASCII(s string) string {
 	return s
 }
 
+// EqualFoldASCII reports whether s and t are equal when ASCII letters are compared
+// case-insensitively and every other byte exactly. Unlike strings.EqualFold it does
+// not take U+017F (LATIN SMALL LETTER LONG S) for "s" or U+212A (KELVIN SIGN) for
+// "k"; see ToUpperASCII.
+func EqualFoldASCII(s, t string) bool {
+	if len(s) != len(t) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		a, b := s[i], t[i]
+		if 'a' <= a && a <= 'z' {
+			a -= 'a' - 'A'
+		}
+		if 'a' <= b && b <= 'z' {
+			b -= 'a' - 'A'
+		}
+		if a != b {
+			return false
+		}
+	}
+	return true
+}
+
 // UnquoteString removes surrounding double quotes from a string if present
 // and processes escape sequences according to RFC 3501.
 // RFC 3501: quoted-specials = DQUOTE / "\"
