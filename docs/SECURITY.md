@@ -130,15 +130,27 @@ balancers.
 | What | Effect of `trusted_networks` |
 |---|---|
 | PROXY protocol | A listener with `proxy_protocol = true` accepts connections only from these addresses (3.2). |
-| Client address forwarding | IMAP ID forwarding fields, POP3 `XCLIENT`, and LMTP `XCLIENT`/`XRCPTFORWARD` are honoured only from these addresses. From anyone else they are ignored (IMAP) or refused (POP3: `-ERR Connection not from trusted proxy`). |
+| Client address forwarding | IMAP ID forwarding fields, POP3 `XCLIENT`, and LMTP `XCLIENT`/`XRCPTFORWARD` are honoured only from these addresses. From anyone else they are ignored (IMAP) or refused (POP3: `-ERR Connection not from trusted proxy`). Behind a PROXY header, IMAP ID and POP3 `XCLIENT` are judged by the client the header names, not the load balancer that sent it; LMTP has its own rule (below). |
 | Per-IP connection limit | Connections from these addresses do not count against `max_connections_per_ip`. Behind a PROXY header the address is the client the header names, not the load balancer that sent it (section 4). |
 | Authentication rate limiting | These addresses are exempt, unless the server's `auth_rate_limit.exempt_networks` says otherwise ([AUTHENTICATION.md](AUTHENTICATION.md#105-exempt-networks)). |
 | LMTP backend admission | Only these addresses may connect to an `lmtp` listener. **When the list is empty**, the LMTP backend accepts `127.0.0.0/8`, `::1`, `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16` instead. |
 | LMTP proxy admission | Only these addresses may connect to an `lmtp_proxy` listener. Other connections are closed and logged as `LMTP Proxy: Connection rejected - not from trusted network`. An `lmtp_proxy` with an empty list is reported at startup. |
 
-All of these check the TCP peer, the host that actually connected, except the rate-limit exemption,
-which checks the client address after forwarding, and the per-IP limit, which checks the client a
-PROXY header names when there is one.
+Most of these check the TCP peer, the host that actually connected. The exceptions:
+
+- The rate-limit exemption checks the client address after forwarding.
+- The per-IP limit checks the client a PROXY header names when there is one.
+- IMAP ID forwarding and POP3 `XCLIENT` check the client a PROXY header names when there is one,
+  else the TCP peer (also when the header names no client: `LOCAL` or `UNKNOWN`). A load balancer
+  that sends PROXY headers is trusted to say who the client is, not to vouch for the commands that
+  follow, which are the client's own. So behind a trusted layer-4 load balancer (HAProxy, nginx
+  `stream`) only a proxy whose own address is in the list, such as a Sora proxy that reaches the
+  backend through the load balancer, may forward; a client's ID fields are ignored and its
+  `XCLIENT` is refused.
+- LMTP `XCLIENT` is accepted from a trusted TCP peer: an `lmtp_proxy` may send a PROXY header and
+  `XCLIENT` on one connection. Its `ADDR` and `PORT` replace the address a PROXY header gave only
+  when that address is itself in the list; otherwise they are ignored and the other attributes
+  (`HELO`, `PROTO`, `LOGIN`, `NAME`) still apply. `XRCPTFORWARD` checks the TCP peer.
 
 Sora reads `trusted_networks` at startup. A SIGHUP reload logs
 `Config reload: servers.trusted_networks changed but requires restart to take effect; ...` and keeps
@@ -183,8 +195,11 @@ With `proxy_protocol = true`:
 - A connection from a trusted address must send a valid header within `proxy_protocol_timeout`, or
   it is closed. There is no "optional" mode.
 - The client address from the header is used for logs, rate limiting and `max_connections_per_ip`.
-  The trust checks (which hosts may send a header, may forward with IMAP ID or XCLIENT, or may use
-  master SASL) use the TCP peer.
+  It is also the address IMAP ID forwarding and POP3 `XCLIENT` are judged by: a client behind a
+  trusted load balancer may forward an address only when its own address is in `trusted_networks`.
+  LMTP `XCLIENT` is accepted from the TCP peer, but its `ADDR` and `PORT` replace the header's
+  address only when that address is in `trusted_networks` (3.1). Which hosts may send a header,
+  and which may use master SASL (`master_sasl_allowed_networks`), are judged by the TCP peer.
 - A client the header names is exempt from `max_connections_per_ip` only when its own address is in
   `trusted_networks`: the load balancer's address does not exempt the clients behind it. A header
   that names no client (`LOCAL` or `UNKNOWN`) counts against the TCP peer, which is trusted and so
