@@ -185,7 +185,7 @@ func (c *Config) Warnings() []string {
 		{"[database]", "query_timeout", database, func() error { _, err := c.Database.GetQueryTimeout(); return err }, queriesDefault},
 		{"[database]", "search_timeout", database, func() error { _, err := c.Database.GetSearchTimeout(); return err }, queriesDefault},
 		{"[database]", "write_timeout", database, func() error { _, err := c.Database.GetWriteTimeout(); return err }, queriesDefault},
-		{endpointSection, "query_timeout", database && endpoint != nil, func() error { _, err := endpoint.GetQueryTimeout(); return err }, "every read uses the [database] query_timeout"},
+		{endpointSection, "query_timeout", database && endpoint != nil, func() error { _, err := endpoint.GetQueryTimeout(); return err }, "every read uses the [database] query_timeout or its default"},
 		// Spam training starts without a client when one of these does not parse.
 		{"[spam_training]", "timeout", c.SpamTraining.IsConfigured(), func() error { _, err := c.SpamTraining.GetTimeout(); return err }, noSpamTraining},
 		{"[spam_training]", "max_message_size", c.SpamTraining.IsConfigured(), func() error {
@@ -250,11 +250,22 @@ var serverValues = []struct {
 	{"lookup_cache.positive_ttl", lookupCacheServerTypes, lookupCacheValue((*LookupCacheConfig).GetPositiveTTL)},
 	{"lookup_cache.negative_ttl", lookupCacheServerTypes, lookupCacheValue((*LookupCacheConfig).GetNegativeTTL)},
 	{"lookup_cache.cleanup_interval", lookupCacheServerTypes, lookupCacheValue((*LookupCacheConfig).GetCleanupInterval)},
-	{"lookup_cache.positive_revalidation_window", []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "http_user_api"}, lookupCacheValue((*LookupCacheConfig).GetPositiveRevalidationWindow)},
+	{"lookup_cache.positive_revalidation_window", []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "http_user_api"}, lookupCacheRevalidationValue},
 }
 
 // maxMessageSizeServerTypes read max_message_size: LMTP, its proxy and Admin API delivery.
 var maxMessageSizeServerTypes = []string{"lmtp", "lmtp_proxy", "http_admin_api"}
+
+// The IMAP proxy parses this value before deciding whether to build its cache,
+// including a disabled cache or a remote lookup keyed by client IP. Other readers
+// parse it only while constructing their credential cache.
+func lookupCacheRevalidationValue(s *ServerConfig) error {
+	if s.Type == "imap_proxy" && s.LookupCache != nil {
+		_, err := s.LookupCache.GetPositiveRevalidationWindow()
+		return err
+	}
+	return lookupCacheValue((*LookupCacheConfig).GetPositiveRevalidationWindow)(s)
+}
 
 // lookupCacheValue is a serverValues parse of a lookup_cache duration, read only by a
 // server that builds a lookup cache from its lookup_cache table: one the table enables,

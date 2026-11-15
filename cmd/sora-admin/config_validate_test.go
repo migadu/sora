@@ -843,6 +843,18 @@ func TestConfigValidateReportsFileOnlyStartupWarnings(t *testing.T) {
 				imapProxy + "[server.remote_lookup]\nenabled = true\nurl = \"https://lookup.example.com/lookup?user=$email&ip=$ip\"\n" +
 				"[server.lookup_cache]\npositive_ttl = \"a while\"\n",
 		},
+		{
+			// The IMAP proxy parses this window before its cache-enabled gate.
+			name:     "IMAP proxy revalidation window with a disabled cache",
+			content:  storageTOML + imapProxy + "[server.lookup_cache]\nenabled = false\npositive_revalidation_window = \"a while\"\n",
+			wantWarn: []string{"[WARN] Server imap-proxy (type: imap_proxy) has an invalid 'lookup_cache.positive_revalidation_window', start-up uses the default"},
+		},
+		{
+			name: "IMAP proxy revalidation window with a client-IP route",
+			content: storageTOML + imap + imapProxy + "[server.remote_lookup]\nenabled = true\nurl = \"https://lookup.example.com/lookup?user=$email&ip=$ip\"\n" +
+				"[server.lookup_cache]\npositive_revalidation_window = \"a while\"\n",
+			wantWarn: []string{"[WARN] Server imap-proxy (type: imap_proxy) has an invalid 'lookup_cache.positive_revalidation_window', start-up uses the default"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
