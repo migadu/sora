@@ -373,7 +373,7 @@ A restart, planned or not, **loses**:
 - **In-memory state:** login lookup caches, auth rate-limit counters and blocks, search rate limits,
   connection counts. In a cluster, the other nodes keep the per-user and per-IP proxy connection
   counts, which the restarted node gets back from them, and the proxies' rate-limit blocks and
-  counts, which it does not ([CLUSTER.md](CLUSTER.md#a-node-comes-back)).
+  counts, which that state exchange does not restore ([CLUSTER.md](CLUSTER.md#a-node-comes-back)).
 - **Proxy affinity** held in this node's memory, unless `[cluster.affinity] cache_path` is set.
 - **Uploads and relay deliveries in flight.** They are retried after the start.
 

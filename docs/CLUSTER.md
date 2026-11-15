@@ -348,8 +348,8 @@ Details:
 - The other listeners on the same node get each event at once. Other nodes get it by gossip only,
   normally within a second (section 9), and ignore it when it arrives more than 5 minutes after it
   was sent. There is no full-state exchange for this state: a node that joins or restarts learns
-  only the blocks and counts sent after it joined. A restart clears the node's blocks, the received
-  ones included; the other nodes keep theirs.
+  from the gossip events it receives, including any recent events still queued by peers. A restart
+  clears the node's blocks, the received ones included; the other nodes keep theirs.
 - `sora-admin stats blocked` lists the blocks of one node, the ones it received included
   ([AUTHENTICATION.md](AUTHENTICATION.md#109-seeing-who-is-blocked)).
 - The limiters of the backends (`imap`, `pop3`, `managesieve`), of the `http_user_api` and of the
@@ -410,8 +410,8 @@ working on every node.
 
 A restarted node joins through its `peers` list. It gets the current connection counts, per user
 and per IP, from the next full-state exchange (within about 30 seconds), only new affinity
-assignments, unless `cache_path` is set, and only the rate-limit blocks and failure counts sent
-after it joined (section 6.6).
+assignments, unless `cache_path` is set, and rate-limit state from the gossip events it receives
+after joining (section 6.6).
 
 ### A network split
 
