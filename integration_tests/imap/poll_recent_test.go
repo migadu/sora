@@ -112,8 +112,8 @@ func TestIMAP_PollAnnouncesRecent(t *testing.T) {
 	search, _ = c.do("UID SEARCH RECENT")
 	assert.Equal(t, "6 7", responseNums(search, "* SEARCH"))
 
-	// A poll that only expunges does not change the mailbox's size upwards and
-	// sends no EXISTS, so no RECENT either.
+	// A poll that only expunges a message that is not \Recent sends no EXISTS
+	// (RFC 3501 §7.4.1), and the RECENT count the client holds is still right.
 	w.do(`UID STORE 2 +FLAGS.SILENT (\Deleted)`)
 	w.do("UID EXPUNGE 2")
 	lines, _ = c.do("NOOP")
@@ -121,6 +121,41 @@ func TestIMAP_PollAnnouncesRecent(t *testing.T) {
 	exists, recent, _ = pollRecent(lines)
 	assert.Equal(t, -1, exists, "NOOP: %q", lines)
 	assert.Equal(t, -1, recent, "NOOP: %q", lines)
+
+	// An expunge of a \Recent message also changes the size of the mailbox, and
+	// the client cannot tell from the EXPUNGE that the count dropped, so the
+	// corrected count follows it. The client knows UIDs 3, 4, 6, 7.
+	w.do(`UID STORE 6 +FLAGS.SILENT (\Deleted)`)
+	w.do("UID EXPUNGE 6")
+	lines, _ = c.do("NOOP")
+	exists, recent, _ = pollRecent(lines)
+	assert.Equal(t, -1, exists, "NOOP: %q", lines)
+	assert.Equal(t, 1, recent, "UID 6 was \\Recent, 7 still is: %q", lines)
+	assert.True(t, recentAfter(lines, "* 3 EXPUNGE"), "RECENT must follow the EXPUNGE it counts: %q", lines)
+	search, _ = c.do("UID SEARCH RECENT")
+	assert.Equal(t, "7", responseNums(search, "* SEARCH"))
+
+	// The same during a FETCH: the EXPUNGE waits for the NOOP, and so does the
+	// RECENT. The client knows UIDs 3, 4, 7.
+	w.do(`UID STORE 7 +FLAGS.SILENT (\Deleted)`)
+	w.do("UID EXPUNGE 7")
+	lines, _ = c.do("FETCH 1 (FLAGS)")
+	require.False(t, slices.Contains(lines, "* 3 EXPUNGE"), "harness: FETCH must hold the EXPUNGE back: %q", lines)
+	_, recent, _ = pollRecent(lines)
+	assert.Equal(t, -1, recent, "FETCH: no RECENT for an EXPUNGE the client has not been sent: %q", lines)
+	lines, _ = c.do("NOOP")
+	_, recent, _ = pollRecent(lines)
+	assert.Equal(t, 0, recent, "no \\Recent message is left: %q", lines)
+	assert.True(t, recentAfter(lines, "* 3 EXPUNGE"), "RECENT must follow the EXPUNGE it counts: %q", lines)
+}
+
+// recentAfter reports whether lines has a RECENT response after the line want.
+func recentAfter(lines []string, want string) bool {
+	at := slices.Index(lines, want)
+	if at < 0 {
+		return false
+	}
+	return slices.ContainsFunc(lines[at+1:], selectRecentRe.MatchString)
 }
 
 // TestIMAP_PollRecentLeavesOutMessagesSeenBeforeTheBaseline: the poll's RECENT
