@@ -298,7 +298,7 @@ paths:
         - $ref: '#/components/parameters/MailboxName'
         - name: q
           in: query
-          description: Search query
+          description: Search query, at most 1000 bytes of UTF-8.
           required: true
           schema:
             type: string
@@ -306,14 +306,14 @@ paths:
           in: query
           description: |
             Only messages whose sender's address or name contains this text
-            (case-insensitive, literal). ANDed with `q`.
+            (case-insensitive, literal, at most 1000 bytes). ANDed with `q`.
           schema:
             type: string
         - name: subject
           in: query
           description: |
             Only messages whose subject contains this text (case-insensitive,
-            literal). ANDed with `q`.
+            literal, at most 1000 bytes). ANDed with `q`.
           schema:
             type: string
         - name: unseen
