@@ -429,7 +429,7 @@ sora-admin --config config.toml import s3 --email user@example.com --workers 10
 | Flag | Default | Meaning |
 |---|---|---|
 | `--email` | | The account (required). Its domain and local part form the prefix that is listed. The account must exist. |
-| `--dry-run` | `false` | Preview each object as `IMPORT`, `REIMPORT` or `SKIP`, as the import would treat it, without creating messages or mailboxes. |
+| `--dry-run` | `false` | List each object as `IMPORT`, `REIMPORT` or `SKIP`, as the import would treat it, and change nothing in the account (not even its default mailboxes). |
 | `--workers` | `5` | Objects imported in parallel. |
 | `--max-objects` | `0` (no limit) | Stop the listing after this many objects. |
 | `--batch-size` | `1000` | Every this many listed objects, the key is remembered as a resume point (printed at the end as `Resumption token`). |
