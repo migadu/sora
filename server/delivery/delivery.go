@@ -119,7 +119,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	}
 
 	// Parse message
-	messageEntity, err := message.Read(bytes.NewReader(messageBytes))
+	messageEntity, err := server.ParseMessage(bytes.NewReader(messageBytes))
 	if err != nil {
 		result.ErrorMessage = fmt.Sprintf("Invalid RFC822 message: %v", err)
 		return result, err
@@ -151,7 +151,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		received := helpers.BuildReceivedHeader("", d.Hostname, "HTTP", deliveredTo, idgen.New(), time.Now().Format(time.RFC1123Z))
 		messageBytes = helpers.PrependRawHeader(messageBytes, received)
 		messageBytes = helpers.PrependHeaderLine(messageBytes, helpers.DeliveredToHeader, deliveredTo)
-		if messageEntity, err = message.Read(bytes.NewReader(messageBytes)); err != nil {
+		if messageEntity, err = server.ParseMessage(bytes.NewReader(messageBytes)); err != nil {
 			result.ErrorMessage = fmt.Sprintf("Invalid RFC822 message after Delivered-To/Received: %v", err)
 			return result, err
 		}
@@ -680,7 +680,7 @@ func ParseMessageReader(r io.Reader) ([]byte, *message.Entity, error) {
 	}
 
 	messageBytes := buf.Bytes()
-	messageEntity, err := message.Read(bytes.NewReader(messageBytes))
+	messageEntity, err := server.ParseMessage(bytes.NewReader(messageBytes))
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse message: %w", err)
 	}
