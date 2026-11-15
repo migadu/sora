@@ -835,7 +835,16 @@ func (i *Importer) performDryRun() error {
 	currentMailbox := ""
 	var mailboxWouldImport, mailboxWouldSkip int
 
+	// The current mailbox's ID in Sora, 0 while it does not exist yet.
+	var mailboxID int64
+
 	for rows.Next() {
+		// An interrupt stops the report: the messages after it are not checked, and a
+		// summary would claim they were.
+		if err := i.ctx.Err(); err != nil {
+			return fmt.Errorf("dry run interrupted: %w", err)
+		}
+
 		var path, filename, hash, mailbox string
 		var size int64
 		if err := rows.Scan(&path, &filename, &hash, &size, &mailbox); err != nil {
@@ -860,6 +869,17 @@ func (i *Importer) performDryRun() error {
 			mailboxWouldImport = 0
 			mailboxWouldSkip = 0
 			fmt.Printf("Mailbox: %s\n", mailbox)
+
+			// Look the mailbox up once (the rows come ordered by mailbox), among the
+			// account's own: the import never writes into a same-named mailbox shared
+			// with the account. Only a mailbox that does not exist yet means its
+			// messages are new; any other error leaves them unchecked.
+			mailboxID, err = i.rdb.GetOwnedMailboxIDByNameWithRetry(i.ctx, user.AccountID(), mailbox)
+			if errors.Is(err, consts.ErrMailboxNotFound) {
+				mailboxID = 0
+			} else if err != nil {
+				return fmt.Errorf("dry run: failed to look up mailbox %q: %w", mailbox, err)
+			}
 		}
 
 		// Check date filter if specified
@@ -869,16 +889,11 @@ func (i *Importer) performDryRun() error {
 			continue
 		}
 
-		// Check if message already exists in Sora, in the account's own mailbox of that
-		// name: the import never writes into a same-named mailbox shared with the account.
-		mailboxID, err := i.rdb.GetOwnedMailboxIDByNameWithRetry(i.ctx, user.AccountID(), mailbox)
+		// Check if message already exists in Sora
 		var alreadyExists bool
-		if err == nil {
-			if !i.options.ForceReimport {
-				alreadyExists, err = i.isMessageAlreadyImported(hash, mailboxID)
-				if err != nil {
-					logger.Info("Error checking if message exists", "error", err)
-				}
+		if mailboxID != 0 && !i.options.ForceReimport {
+			if alreadyExists, err = i.isMessageAlreadyImported(hash, mailboxID); err != nil {
+				return fmt.Errorf("dry run: %s in %s: %w", filename, mailbox, err)
 			}
 		}
 
@@ -950,6 +965,9 @@ func (i *Importer) performDryRun() error {
 		}
 
 		fmt.Println()
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read messages from sqlite: %w", err)
 	}
 
 	// Print summary for last mailbox
