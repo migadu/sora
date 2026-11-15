@@ -26,7 +26,6 @@ import (
 
 	"github.com/emersion/go-message/mail" // Import for mail.ReadMessage
 	"github.com/migadu/go-imap"
-	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
@@ -1965,7 +1964,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		references = nil
 	}
 
-	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(content))
+	bodyStructure := helpers.ExtractBodyStructure(bytes.NewReader(content))
 
 	// Validate body structure and use fallback if invalid (e.g., multipart with no children)
 	if err := helpers.ValidateBodyStructure(&bodyStructure); err != nil {
