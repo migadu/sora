@@ -236,4 +236,31 @@ func TestIMAP_FetchImplicitSeenUnansweredLeftToPoll(t *testing.T) {
 		}
 		require.True(t, reported, "message %d is \\Seen but the client was never told: FETCH %q, NOOP %q", seq, fetchLines, noopLines)
 	}
+	// A failed batch must also end its in-flight snapshot, or a later quiet
+	// FETCH would keep losing echo suppression.
+	c.appendMsg("INBOX", binaryFetchTestMessage)
+	requireSeenAnsweredOnce(t, c, "FETCH 4 BODY[TEXT]", false, 4)
+
+}
+
+// A UID not yet announced by EXISTS has no response sequence number. Filtering
+// it before the implicit Seen update also keeps an unanswered message unread.
+func TestIMAP_FetchImplicitSeenSkipsUnannouncedUID(t *testing.T) {
+	viewer, other := twoSessions(t, 3)
+	other.append("s1", "INBOX", msg(4))
+	_, tagged := other.cmd("s2", "SELECT INBOX")
+	require.Contains(t, tagged, "OK")
+	_, tagged = other.cmd("s3", `UID STORE 1 +FLAGS.SILENT (\Deleted)`)
+	require.Contains(t, tagged, "OK")
+	_, tagged = other.cmd("s4", "EXPUNGE")
+	require.Contains(t, tagged, "OK")
+	queued, tagged := viewer.cmd("s5", "FETCH 2 (UID)")
+	require.Contains(t, tagged, "OK")
+	require.Empty(t, expungeSeqs(queued))
+	require.Zero(t, existsCount(queued))
+	lines, tagged := viewer.cmd("s6", "UID FETCH 4 BODY[]")
+	require.Contains(t, tagged, "OK")
+	beforeUpdates := lines[:firstIndexOfResponse(lines, "EXPUNGE")]
+	require.Empty(t, seqUIDPairs(beforeUpdates), "unannounced UID must not get a response")
+	require.NotContains(t, flagsOfUID(t, viewer, "4"), `\Seen`, "unanswered UID was marked Seen")
 }

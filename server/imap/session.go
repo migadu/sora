@@ -78,6 +78,7 @@ type IMAPSession struct {
 	ownStoreMu            sync.Mutex
 	ownStoreEcho          map[imap.UID]uint64
 	ownStoreEchoMailboxID int64
+	fetchInFlight         int // metadata snapshots/responses in flight; guarded by ownStoreMu
 
 	// seqViewMu keeps the client's sequence numbering still while a command
 	// translates through it (seqView): the command holds it for reading from

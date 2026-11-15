@@ -171,6 +171,10 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 	// The client's numbering holds still until the last response (seqViewMu).
 	s.seqViewMu.RLock()
 	defer s.seqViewMu.RUnlock()
+	endFetch := s.beginFetch()
+	defer endFetch()
+	// A Seen update may have pinned reads to the primary while beginFetch waited.
+	ctx = s.pinnedContext(ctx)
 
 	// First, safely read necessary session state and decode the sequence numbers all within a single read lock
 	var selectedMailboxID int64
@@ -368,7 +372,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 					s.useMasterDB.Store(true)
 					seenChanged = applyImplicitSeenUpdates(messages, batchResults)
 				}
-				seenAnswer.expect(seenChanged, sessionTrackerSnapshot)
+				seenAnswer.expect(seenChanged, view.tracker)
 			}
 		}
 
