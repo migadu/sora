@@ -422,6 +422,50 @@ func TestSetMailboxSubscribed(t *testing.T) {
 	t.Logf("Successfully tested SetMailboxSubscribed with accountID: %d, mailboxID: %d", accountID, mailbox.ID)
 }
 
+// TestSetMailboxSubscribedUnsubscribesDefaultLookalike is issue #1584: "ſent" is a
+// mailbox of its own (lower('ſent') is 'ſent', not 'sent'), so unsubscribing it must
+// not be ignored as if it were the default Sent mailbox.
+func TestSetMailboxSubscribedUnsubscribesDefaultLookalike(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID := setupMailboxTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	setSubscribed := func(id int64, subscribed bool) {
+		t.Helper()
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		require.NoError(t, db.SetMailboxSubscribed(ctx, tx, id, accountID, subscribed))
+		require.NoError(t, tx.Commit(ctx))
+	}
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	require.NoError(t, db.CreateDefaultMailboxes(ctx, tx, accountID))
+	require.NoError(t, db.CreateMailbox(ctx, tx, accountID, "ſent", nil))
+	require.NoError(t, tx.Commit(ctx))
+
+	lookalike, err := db.GetMailboxByName(ctx, accountID, "ſent")
+	require.NoError(t, err)
+	require.Equal(t, "ſent", lookalike.Name)
+	sent, err := db.GetMailboxByName(ctx, accountID, "Sent")
+	require.NoError(t, err)
+
+	setSubscribed(lookalike.ID, true)
+	setSubscribed(lookalike.ID, false)
+	setSubscribed(sent.ID, false) // a default mailbox stays subscribed
+
+	names, err := db.GetSubscribedMailboxNames(ctx, accountID)
+	require.NoError(t, err)
+	assert.NotContains(t, names, "ſent", "unsubscribing \"ſent\" was ignored as if it were Sent")
+	assert.Contains(t, names, "Sent")
+}
+
 // TestDeleteMailbox tests mailbox deletion
 func TestDeleteMailbox(t *testing.T) {
 	if testing.Short() {
