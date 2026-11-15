@@ -866,12 +866,12 @@ func (s *IMAPSession) notifyFetchNewMessages(ctx context.Context, watch *notifyW
 	// RFC 7162 §3.1 applies in full: a CONDSTORE-aware client gets
 	// "mod-sequence data in all subsequent untagged FETCH responses", and
 	// §3.2.4 "both UID and mod-sequence data", whatever the fetch-atts name.
-	// Checked per delivery: the client may enable CONDSTORE after NOTIFY SET.
+	// Request MODSEQ even before CONDSTORE is enabled: a first enabling
+	// command can run while this fetch loads a body. The response writer
+	// checks current awareness when it writes the unsolicited response.
 	options := *watch.selected.MessageNewFetch
 	options.UID = true
-	if s.condStoreEnabled() {
-		options.ModSeq = true
-	}
+	options.ModSeq = true
 	if err := s.Fetch(ctx, w.FetchWriter(), uidSet, &options); err != nil {
 		s.WarnLog("NOTIFY: MessageNew fetch failed", "error", err)
 		return nil
