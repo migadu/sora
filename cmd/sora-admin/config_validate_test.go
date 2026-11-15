@@ -482,8 +482,10 @@ func TestConfigValidateHelpStartChecksNoS3(t *testing.T) {
 // TestConfigValidateReportsStartupWarnings (#1557): `sora-admin config validate` prints
 // the warnings start-up logs about the file: a key the server type does not read
 // (ServerConfig.WarnUnusedConfigOptions) and an imap or pop3 session_memory_limit below
-// an lmtp max_message_size (Config.SessionMemoryShortfalls). It used to print only
-// "[OK] Configuration is valid!". Warnings do not fail the file.
+// an lmtp max_message_size (Config.SessionMemoryShortfalls), and (#1601) [sieve]
+// enabled_extensions the engine does not support and [servers] trusted_networks that
+// include a whole private range. It used to print only "[OK] Configuration is valid!".
+// Warnings do not fail the file.
 func TestConfigValidateReportsStartupWarnings(t *testing.T) {
 	const lmtp = "\n[[server]]\ntype = \"lmtp\"\nname = \"lmtp\"\naddr = \"127.0.0.1:24\"\nmax_message_size = \"50mb\"\n"
 	tests := []struct {
@@ -512,6 +514,36 @@ func TestConfigValidateReportsStartupWarnings(t *testing.T) {
 		{
 			name:    "no warnings",
 			content: storageTOML + "[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n" + lmtp,
+		},
+		{
+			// #1601: start-up warns about names sieveengine.InvalidExtensions drops.
+			name: "unsupported sieve extension",
+			content: storageTOML + "[sieve]\nenabled_extensions = [\"fileinto\", \"no-such-extension\"]\n\n" +
+				"[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n" + lmtp,
+			wantWarn: []string{"[WARN] [sieve] enabled_extensions names extensions the engine does not support: no-such-extension; " +
+				"they are ignored, and the default set is used if none remain (effective: fileinto)"},
+		},
+		{
+			// #1601: start-up warns when config.TrustedNetworksHaveBroadPrivateRanges.
+			name: "trusted_networks with a whole private range",
+			content: storageTOML + "[servers]\ntrusted_networks = [\"192.0.2.10/32\", \"10.0.0.0/8\"]\n\n" +
+				"[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n" + lmtp,
+			wantWarn: []string{"[WARN] [servers] trusted_networks includes whole private ranges (e.g. 10.0.0.0/8): "},
+		},
+		{
+			// The file of #1601: both warnings, on a node that runs only a metrics server.
+			name: "sieve extension and trusted_networks on a metrics-only node",
+			content: "[servers]\ntrusted_networks = [\"10.0.0.0/8\"]\n\n[sieve]\nenabled_extensions = [\"fileinto\", \"no-such-extension\"]\n\n" +
+				"[[server]]\ntype = \"metrics\"\nname = \"metrics\"\naddr = \"127.0.0.1:9090\"\n",
+			wantWarn: []string{
+				"[WARN] [sieve] enabled_extensions names extensions the engine does not support: no-such-extension;",
+				"[WARN] [servers] trusted_networks includes whole private ranges",
+			},
+		},
+		{
+			name: "supported sieve extensions and narrow trusted_networks",
+			content: storageTOML + "[servers]\ntrusted_networks = [\"192.0.2.10/32\", \"10.1.2.0/24\"]\n\n[sieve]\nenabled_extensions = [\"fileinto\", \"vacation\"]\n\n" +
+				"[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n" + lmtp,
 		},
 	}
 	for _, tt := range tests {
