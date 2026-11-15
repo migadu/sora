@@ -151,6 +151,8 @@ func TestParseDateHeaderCFWS(t *testing.T) {
 		// Nested comments and quoted-pairs (RFC 5322 section 3.2.2).
 		{"Wed, 17 Jul 1996 02:23:25 (a (nested) \\) comment) -0700", -7 * h},
 		{"Wed, 17 Jul 1996 02:23:25 (\\(c) PDT", -7 * h},
+		// Obsolete quoted-pair permits an escaped NUL; unquoted NUL is invalid.
+		{"Wed, 17 Jul 1996 02:23:25 (quoted\\\x00) -0700", -7 * h},
 		// A comment holding the characters the zone and the time are found by.
 		{"Wed, 17 Jul 1996 02:23:25 (UTC-7) PDT", -7 * h},
 		{"(Wed: 17 Jul) Wed, 17 Jul 1996 02:23:25 PDT", -7 * h},
@@ -179,6 +181,57 @@ func TestParseDateHeaderCFWS(t *testing.T) {
 	}
 }
 
+// TestParseDateHeaderLeapSecond is issue #1384: a time-of-day whose second is 60, a leap
+// second, is a date-time. RFC 5322 section 3.3: "the time-of-day MUST be in the range
+// 00:00:00 through 23:59:60 (the number of seconds allowing for a leap second ...)".
+// net/mail.ParseDate does not parse it, so the message was stored with an unknown sent
+// date. time.Time cannot hold second 60: it is read as second 59 of the same minute, as
+// Dovecot's message_date_parse does.
+func TestParseDateHeaderLeapSecond(t *testing.T) {
+	const h = 3600
+	leap := time.Date(2016, 12, 31, 23, 59, 59, 0, time.UTC) // 2016-12-31T23:59:60Z, as second 59
+	cases := []struct {
+		value  string
+		want   time.Time
+		offset int // seconds east of UTC
+	}{
+		{"Sat, 31 Dec 2016 23:59:60 +0000", leap, 0},
+		{"Sun, 1 Jan 2017 00:59:60 +0100", leap, h},
+		{"Sat, 31 Dec 2016 15:59:60 -0800", leap, -8 * h},
+		{"Sat, 31 Dec 2016 23:59:60 GMT", leap, 0},
+		{"Sat, 31 Dec 2016 15:59:60 PST", leap, -8 * h},
+		{"Sat, 31 Dec 2016 23:59:60 GMT+0000", leap, 0},
+		{"31 Dec 2016 23:59:60 +0000", leap, 0},
+		{"Sat, 31 Dec 16 23:59:60 +0000", leap, 0},
+		{"Sat, 31 Dec 116 23:59:60 UT", leap, 0},
+		{"Sat, 31 Dec 2016 23:59:60\r\n +0000", leap, 0},
+		// Comments and white space around the seconds (obs-second = [CFWS] 2DIGIT [CFWS]).
+		{"Sat, 31 Dec 2016 23 : 59 : 60 +0000", leap, 0},
+		{"Sat, 31 Dec 2016 23:59:(s)60 (leap second) +0000", leap, 0},
+		{"Tue, 30 Jun 2015 23:59:60 +0000", time.Date(2015, 6, 30, 23, 59, 59, 0, time.UTC), 0},
+	}
+	for _, tc := range cases {
+		got, err := ParseDateHeader(tc.value)
+		if !assert.NoError(t, err, "%q", tc.value) {
+			continue
+		}
+		_, offset := got.Zone()
+		assert.True(t, got.Equal(tc.want), "%q: %v, want %v", tc.value, got, tc.want.In(time.FixedZone("", tc.offset)))
+		assert.Equal(t, tc.offset, offset, "%q: zone offset of %v", tc.value, got)
+	}
+
+	// Only a second of 60 is a leap second.
+	for _, value := range []string{
+		"Sat, 31 Dec 2016 23:59:61 +0000",
+		"Sat, 31 Dec 2016 23:59:600 +0000",
+		"Sat, 31 Dec 2016 23:60:00 +0000",
+		"Sat, 31 Dec 2016 24:00:00 +0000",
+	} {
+		got, err := ParseDateHeader(value)
+		assert.Error(t, err, "%q: parsed as %v", value, got)
+	}
+}
+
 // TestParseDateHeaderInvalid: a value net/mail does not parse is still an error.
 func TestParseDateHeaderInvalid(t *testing.T) {
 	for _, value := range []string{
@@ -204,6 +257,10 @@ func TestParseDateHeaderInvalid(t *testing.T) {
 		// year = 4*DIGIT / obs-year, and obs-year is 2*DIGIT (RFC 5322 sections 3.3, 4.3).
 		"Mon, 17 Jul 5 02:23:25 +0000",
 		"Mon, 17 Jul 50 02:23:25 PDT+0400",
+		// NUL is not comment text (ctext or obs-ctext), so removing a
+		// malformed comment must not turn a previously invalid value into a date.
+		"Wed, 17 Jul 1996 02:23:25 (bad\x00) -0700",
+		"Wed, 17 Jul 1996 02:23:25 (outer (bad\x00)) PDT",
 		// A comment that does not close, and a zone that is only in a comment.
 		"Wed, 17 Jul 1996 02:23:25 -0700 (PDT",
 		"Wed, 17 Jul 1996 02:23:25 PDT (Pacific",

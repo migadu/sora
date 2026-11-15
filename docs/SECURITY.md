@@ -437,14 +437,27 @@ When a request does not fit:
 
 | Request | Reply |
 |---|---|
-| IMAP `FETCH` of a body or section | `NO [UNAVAILABLE] Message too large for the session memory limit` |
+| IMAP `FETCH` of a body or section that can never fit the limit | `NO [LIMIT] Message too large for the session memory limit` |
+| IMAP `FETCH` of a body or section that fits the limit, but not what the session holds now | `NO [UNAVAILABLE] Session memory limit reached, please try again later` |
 | IMAP `APPEND` | `NO [UNAVAILABLE] Session memory limit reached, please try again later` |
 | IMAP `SEARCH` | an internal error reply |
-| POP3 `RETR`, `TOP` | `-ERR [SYS/TEMP] Message too large to retrieve in this session` |
+| POP3 `RETR`, `TOP` of a body that can never fit the limit | `-ERR [SYS/PERM] Message too large for the session memory limit` |
+| POP3 `RETR`, `TOP` of a body that fits the limit, but not what the session holds now | `-ERR [SYS/TEMP] Session memory limit reached, please try again later` |
 | POP3 opening a mailbox whose message list is too large | `-ERR [SYS/TEMP] Mailbox too large to open in this session` |
 
+An IMAP `FETCH` can never fit when the body is larger than the limit, or when a section such as
+`BODY[TEXT]` does not fit beside the body it is copied from. A POP3 body can never fit when it does
+not fit beside the session's message list. No retry helps then, so the permanent codes (RFC 5530
+`LIMIT`, RFC 3206 `SYS/PERM`) tell clients not to retry; the temporary ones (`UNAVAILABLE`,
+`SYS/TEMP`) are for a session that holds other data at the moment. A message the limit refuses is
+not marked `\Seen`.
+
 Each case is counted in `sora_session_memory_limit_exceeded_total{protocol, server_name, hostname}`.
-Raise the limit if legitimate users hit it with large messages.
+Raise the limit if legitimate users hit it with large messages. Keep it above the `max_message_size`
+of the `lmtp` servers: start-up and a reload warn about an `imap` or `pop3` server whose limit is
+below the largest one in the same file, since mail between the two sizes is delivered but never
+fetched. Messages imported with `sora-admin` are bounded by `[admin_cli] import_message_limit`
+instead.
 
 ---
 
