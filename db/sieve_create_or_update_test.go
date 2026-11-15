@@ -84,9 +84,8 @@ func TestCreateOrUpdateScript(t *testing.T) {
 	})
 }
 
-// A rename to the name, which does not take the account's script lock, commits
-// between the update finding no script and the insert: the insert must not fail on
-// UNIQUE (account_id, name), the renamed script is the one replaced.
+// The upsert waits for an open rename to its target name to commit under the
+// account's script lock, then replaces the renamed script.
 func TestCreateOrUpdateScriptWhileRenameToNameIsOpen(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
