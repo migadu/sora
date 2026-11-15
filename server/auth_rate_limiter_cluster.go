@@ -88,8 +88,11 @@ type ClusterRateLimiter struct {
 	// no gossip about this one's events reaches them
 	node *nodeRateLimiters
 
-	stopOnce sync.Once
-	stopped  atomic.Bool
+	stopOnce              sync.Once
+	stopped               atomic.Bool
+	eventMu               sync.RWMutex
+	unregisterHandler     func()
+	unregisterBroadcaster func()
 
 	// Configuration
 	syncBlocks        bool
@@ -119,10 +122,10 @@ func NewClusterRateLimiter(limiter *AuthRateLimiter, clusterMgr *cluster.Manager
 	crl.unblocked.maxEntries = limiter.config.MaxIPEntries
 
 	// Register with cluster manager to receive rate limit events
-	clusterMgr.RegisterRateLimitHandler(crl.HandleClusterEvent)
+	crl.unregisterHandler = clusterMgr.RegisterRateLimitHandler(crl.HandleClusterEvent)
 
 	// Register as broadcaster for outgoing events
-	clusterMgr.RegisterRateLimitBroadcaster(crl.GetBroadcasts)
+	crl.unregisterBroadcaster = clusterMgr.RegisterRateLimitBroadcaster(crl.GetBroadcasts)
 
 	crl.node = nodeRateLimitersOf(clusterMgr, limiter.protocol)
 	crl.node.join(crl)
@@ -262,6 +265,9 @@ func (crl *ClusterRateLimiter) queueEvent(event RateLimitEvent) {
 // first, within half of the datagram so a burst of them cannot stall the
 // failure counts behind it.
 func (crl *ClusterRateLimiter) GetBroadcasts(overhead, limit int) [][]byte {
+	if crl == nil || crl.stopped.Load() {
+		return nil
+	}
 	return drainTiers(nil, crl.blocks, crl.queue, overhead, limit)
 }
 
@@ -315,6 +321,11 @@ func (crl *ClusterRateLimiter) HandleClusterEvent(data []byte) {
 // node or on this one.
 func (crl *ClusterRateLimiter) apply(event RateLimitEvent) {
 	if crl == nil || crl.stopped.Load() {
+		return
+	}
+	crl.eventMu.RLock()
+	defer crl.eventMu.RUnlock()
+	if crl.stopped.Load() {
 		return
 	}
 	switch event.Type {
@@ -625,6 +636,16 @@ func (crl *ClusterRateLimiter) Stop() {
 		if crl.node != nil {
 			crl.node.leave(crl)
 		}
+		if crl.unregisterHandler != nil {
+			crl.unregisterHandler()
+		}
+		if crl.unregisterBroadcaster != nil {
+			crl.unregisterBroadcaster()
+		}
+		// A sibling may already hold a delivery snapshot. Its active apply
+		// finishes before Stop returns; later ones see stopped and do nothing.
+		crl.eventMu.Lock()
+		crl.eventMu.Unlock()
 	})
 }
 

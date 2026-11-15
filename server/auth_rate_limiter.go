@@ -1065,7 +1065,9 @@ func (a *AuthRateLimiter) Stop() {
 		return
 	}
 	a.stopOnce.Do(func() {
-		close(a.stopCleanup)
+		if a.stopCleanup != nil {
+			close(a.stopCleanup)
+		}
 	})
 	if a.clusterLimiter != nil {
 		a.clusterLimiter.Stop()

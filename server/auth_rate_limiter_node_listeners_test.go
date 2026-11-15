@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -417,4 +418,90 @@ func TestStoppedNodeRateLimiterLeavesSiblingGroupIdempotently(t *testing.T) {
 	if !imapsReloaded.IsIPBlocked(client2) {
 		t.Error("reloaded imaps-proxy did not receive intra-node IP block from imap-proxy")
 	}
+}
+
+// A stopped limiter must leave both manager callback registries as well as
+// its sibling group, or those method values retain the limiter and its maps.
+func TestStoppedRateLimiterReleasesManagerRegistrations(t *testing.T) {
+	node := newSingleNodeCluster(t, "retention-node")
+	counts := func() (int, int) {
+		state := reflect.ValueOf(node).Elem()
+		return state.FieldByName("rateLimitHandlers").Len(), state.FieldByName("rateLimitBroadcasts").Len()
+	}
+	handlers, broadcasters := counts()
+	for range 10 {
+		limiter := newNodeRateLimiter(t, node, "IMAP-PROXY", "temporary-listener", nodeRateLimiterConfig())
+		if h, b := counts(); h != handlers+1 || b != broadcasters+1 {
+			t.Fatalf("registration counts=%d/%d, want %d/%d", h, b, handlers+1, broadcasters+1)
+		}
+		limiter.Stop()
+		if h, b := counts(); h != handlers || b != broadcasters {
+			t.Fatalf("stopped limiter retained by %d handlers/%d broadcasters; baseline %d/%d", h, b, handlers, broadcasters)
+		}
+	}
+}
+
+func TestClusterRateLimiterStopWaitsForAdmittedSiblingApply(t *testing.T) {
+	node := newSingleNodeCluster(t, "stop-apply")
+	limiter := newNodeRateLimiter(t, node, "IMAP-PROXY", "stopping", nodeRateLimiterConfig())
+	crl := limiter.clusterLimiter
+	now := time.Now()
+	event := RateLimitEvent{Type: RateLimitEventBlockIP, IP: "192.0.2.100", Protocol: "IMAP-PROXY", Timestamp: now, BlockedUntil: now.Add(time.Hour), FailureCount: 3, FirstFailure: now}
+	// Hold the receiving map lock after apply takes its lifecycle read lock.
+	limiter.ipMu.Lock()
+	applied := make(chan struct{})
+	go func() { defer close(applied); crl.apply(event) }()
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		if !crl.eventMu.TryLock() {
+			break
+		}
+		crl.eventMu.Unlock()
+		if time.Now().After(deadline) {
+			limiter.ipMu.Unlock()
+			t.Fatal("apply did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	stopped := make(chan struct{})
+	go func() { crl.Stop(); close(stopped) }()
+	for !crl.stopped.Load() {
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-stopped:
+		limiter.ipMu.Unlock()
+		t.Fatal("Stop returned while an admitted apply was blocked")
+	default:
+	}
+	limiter.ipMu.Unlock()
+	<-applied
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not finish after apply")
+	}
+	event.IP = "192.0.2.101"
+	crl.apply(event)
+	if limiter.IsIPBlocked(&net.TCPAddr{IP: net.ParseIP(event.IP)}) {
+		t.Error("stopped limiter applied new state")
+	}
+	if got := crl.GetBroadcasts(0, 1400); len(got) != 0 {
+		t.Error("stopped limiter still broadcasts queued state")
+	}
+}
+
+func TestRateLimiterStopAcceptsZeroValues(t *testing.T) {
+	var nilCluster *ClusterRateLimiter
+	nilCluster.Stop()
+	crl := &ClusterRateLimiter{}
+	crl.Stop()
+	crl.Stop()
+	crl.HandleClusterEvent(nil)
+	crl.apply(RateLimitEvent{})
+	if got := crl.GetBroadcasts(0, 100); len(got) != 0 {
+		t.Fatal("zero stopped limiter broadcasts")
+	}
+	limiter := &AuthRateLimiter{}
+	limiter.Stop()
+	limiter.Stop()
 }
