@@ -11,6 +11,7 @@ import (
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/integration_tests/common"
+	imapServer "github.com/migadu/sora/server/imap"
 	"github.com/stretchr/testify/require"
 )
 
@@ -195,48 +196,55 @@ func TestIMAP_FetchImplicitSeenNotOvertakenByHeldUpdate(t *testing.T) {
 	require.Empty(t, fetchResponsesForSeq(lines, 1), "reported again: %q", lines)
 }
 
-// A FETCH that fails part way has set \Seen on every message of the batch,
-// but answered only the messages before the failure. The poll must report the
-// others, or the client never learns of their \Seen, and must still not
-// repeat the ones the FETCH answered.
+// A FETCH that fails part way after setting a message's \Seen, here at a
+// section copy the session memory budget refuses (NO [UNAVAILABLE]) once that
+// message's response is open, answered only the messages before it. The poll
+// must report the update the failed response did not complete, or the client
+// may never learn of that \Seen, and must still not repeat the ones the FETCH
+// answered. The messages after the failure stay unseen (#1222). A FETCH that
+// fails at a body it cannot load or a BINARY section it cannot decode fails
+// before the update (TestIMAP_FetchFailingPartWaySetsSeenOnlyOnAnswered).
 func TestIMAP_FetchImplicitSeenUnansweredLeftToPoll(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
-	server, owner := common.SetupIMAPServer(t)
+	// Room for message 2's body, not for the copy of its BODY[1] next to it.
+	server, owner, _ := common.SetupIMAPServerWithRealS3Options(t, func(o *imapServer.IMAPServerOptions) {
+		o.SessionMemoryLimit = 256 << 10
+	})
 	defer server.Close()
 
 	c := dialRawIMAP(t, server.Address)
 	c.do(fmt.Sprintf("LOGIN %s %s", owner.Email, owner.Password))
-	c.appendMsg("INBOX", binaryFetchTestMessage)
-	// A transfer encoding the server cannot decode: BINARY fails the request
-	// with NO [UNKNOWN-CTE] at this message (RFC 9051 §7.5.2).
-	c.appendMsg("INBOX", binaryDecodeTestMessage("cte", "text/plain", "x-uuencode", "begin 644 a.txt\r\n#86)C\r\n`\r\nend\r\n"))
-	c.appendMsg("INBOX", binaryFetchTestMessage)
+	small := binaryDecodeTestMessage("small", "text/plain", "7bit", "hello\r\n")
+	c.appendMsg("INBOX", small)
+	c.appendMsg("INBOX", binaryDecodeTestMessage("large", "text/plain", "7bit", strings.Repeat(strings.Repeat("x", 78)+"\r\n", 2048)))
+	c.appendMsg("INBOX", small)
 	c.do("SELECT INBOX")
 	lines, _ := c.do("FETCH 1:3 (FLAGS)")
 	require.NotRegexp(t, seenFlagsRe, strings.Join(lines, "\n"), "precondition: no message is \\Seen")
 
-	tag := c.send("FETCH 1:3 (BINARY[1])")
-	fetchLines, tagged := c.read(tag, "FETCH 1:3 (BINARY[1])")
-	require.Contains(t, tagged, " NO [UNKNOWN-CTE] ")
+	tag := c.send("FETCH 1:3 (BODY[1])")
+	fetchLines, tagged := c.read(tag, "FETCH 1:3 (BODY[1])")
+	require.Contains(t, tagged, " NO [UNAVAILABLE] ")
 	require.Len(t, fetchResponsesForSeq(fetchLines, 1), 1, "%q", fetchLines)
 	require.Regexp(t, seenFlagsRe, fetchResponsesForSeq(fetchLines, 1)[0])
+	require.Empty(t, fetchResponsesForSeq(fetchLines, 3), "%q", fetchLines)
 
 	noopLines, _ := c.do("NOOP")
 	require.Empty(t, fetchResponsesForSeq(noopLines, 1), "the answered \\Seen of message 1 echoed: %q", noopLines)
 
-	// Every message whose stored flags now carry \Seen was told so.
 	lines, _ = c.do("FETCH 2:3 (FLAGS)")
-	for _, seq := range []int{2, 3} {
-		stored := fetchResponsesForSeq(lines, seq)
-		require.Len(t, stored, 1, "%q", lines)
-		if !seenFlagsRe.MatchString(stored[0]) {
-			continue
-		}
+	stored := fetchResponsesForSeq(lines, 3)
+	require.Len(t, stored, 1, "%q", lines)
+	require.NotRegexp(t, seenFlagsRe, stored[0], "message 3, after the failure, is \\Seen")
+	// Message 2's update was not answered: the poll reports it.
+	stored = fetchResponsesForSeq(lines, 2)
+	require.Len(t, stored, 1, "%q", lines)
+	if seenFlagsRe.MatchString(stored[0]) {
 		reported := false
-		for _, resp := range fetchResponsesForSeq(append(fetchLines, noopLines...), seq) {
+		for _, resp := range fetchResponsesForSeq(noopLines, 2) {
 			reported = reported || seenFlagsRe.MatchString(resp)
 		}
-		require.True(t, reported, "message %d is \\Seen but the client was never told: FETCH %q, NOOP %q", seq, fetchLines, noopLines)
+		require.True(t, reported, "message 2 is \\Seen but the poll did not report it: FETCH %q, NOOP %q", fetchLines, noopLines)
 	}
 	// A failed batch must also end its in-flight snapshot, or a later quiet
 	// FETCH would keep losing echo suppression.
