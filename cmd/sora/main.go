@@ -2490,6 +2490,7 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		ProxyProtocolTrustedProxies: deps.config.Servers.TrustedNetworks,
 		TrustedNetworks:             deps.config.Servers.TrustedNetworks,
 		SieveExtensions:             deps.config.Sieve.EnabledExtensions,
+		SharedMailboxes:             deps.config.SharedMailboxes,
 	}
 
 	srv, err := mailapi.New(deps.resilientDB, options)

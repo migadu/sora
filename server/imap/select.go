@@ -210,6 +210,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 	s.currentHighestModSeq.Store(currentSummary.HighestModSeq)
 	s.reportedHighestModSeq.Store(currentSummary.HighestModSeq)
 	s.reportedModSeqGap.Store(false)
+	s.queuedFlagUpdates.Store(false)
 
 	// Extract the first unseen message sequence number lazily natively for SELECT explicitly.
 	// We do not compute this natively in GetMailboxSummary to prevent O(N) counts across all background STATUS checks.
