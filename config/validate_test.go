@@ -303,6 +303,8 @@ func TestConfigValidateProxyNeedsBackends(t *testing.T) {
 // TestConfigValidateProxyRefusesEmptyRemoteAddr: an empty remote_addrs entry passed
 // Validate, and the proxy was built with "" as a backend and routed users to it. Validate
 // refuses it as ValidatePools refuses an empty [[pool]] backend, naming the entry (#1147).
+// A port alone (":143") has an empty host too: the proxy dials it, and an empty host
+// dials this node itself.
 func TestConfigValidateProxyRefusesEmptyRemoteAddr(t *testing.T) {
 	tests := []struct {
 		remoteAddrs string
@@ -311,7 +313,10 @@ func TestConfigValidateProxyRefusesEmptyRemoteAddr(t *testing.T) {
 		{`[""]`, `server "proxy": remote_addrs #1: empty backend address`},
 		{`[" "]`, `server "proxy": remote_addrs #1: empty backend address`},
 		{`["192.0.2.10:143", "\t"]`, `server "proxy": remote_addrs #2: empty backend address`},
+		{`[":143"]`, `server "proxy": remote_addrs #1: empty backend address`},
+		{`["192.0.2.10:143", "[]:143"]`, `server "proxy": remote_addrs #2: empty backend address`},
 		{`["192.0.2.10:143", "backend.example.com"]`, ""},
+		{`["[2001:db8::1]:143", "2001:db8::2"]`, ""},
 	}
 	var proxies int
 	for _, typ := range ServerTypes {
@@ -336,6 +341,17 @@ func TestConfigValidateProxyRefusesEmptyRemoteAddr(t *testing.T) {
 	}
 	if proxies != 5 {
 		t.Errorf("checked %d proxy types, want the 5 proxies", proxies)
+	}
+
+	// The [[pool]] check refuses the same entries.
+	for _, backend := range []string{`""`, `" "`, `":143"`, `"[]:143"`} {
+		t.Run("pool "+backend, func(t *testing.T) {
+			got := validateFile(t, storageTOML+"\n[[server]]\ntype = \"imap_proxy\"\nname = \"proxy\"\naddr = \"127.0.0.1:1143\"\nremote_port = 143\n"+
+				"\n[[pool]]\nname = \"sora0\"\ndefault = true\nbackends = ["+backend+"]\n")
+			if len(got) != 1 || got[0].Section != "[[pool]]" || !strings.Contains(got[0].Err.Error(), `[[pool]] "sora0": empty backend address`) {
+				t.Errorf("Validate() = %v, want [[pool]]: empty backend address", got)
+			}
+		})
 	}
 }
 
