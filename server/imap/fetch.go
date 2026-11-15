@@ -745,7 +745,6 @@ func (s *IMAPSession) decodeBinaryPart(b *decodedBinary, p *binaryPart, options 
 	key := binarySectionCacheKey(msg.ContentHash, p.part)
 	section := s.cachedBodySection(key) // charged to the retention while it is retained
 	retained := section != nil
-	var charged int64 // charged here for section
 	if !retained {
 		body, err := loadBody()
 		if err != nil || body == nil {
@@ -765,19 +764,23 @@ func (s *IMAPSession) decodeBinaryPart(b *decodedBinary, p *binaryPart, options 
 		if section, err = safeDecodeBinarySection(body, &imap.FetchItemBinarySection{Part: p.part}); err != nil {
 			return s.unknownCTE(msg.UID)
 		}
-		var ok bool
-		if charged, ok = s.chargeSectionCopy(len(section)); !ok {
-			return s.sectionMemoryUnavailable(msg.UID, len(section))
-		}
 	}
 	for _, i := range p.sizes {
 		b.sizes[i] = uint32(len(section))
 	}
 
 	chunked := !slices.ContainsFunc(p.sections, func(i int) bool { return options.BinarySection[i].Partial == nil })
-	if !retained && !chunked {
+	if !chunked {
 		// The whole section is sent, so the items are slices of it, held and
-		// charged until the response is written.
+		// charged once until the response is written. A retained section needs
+		// one independent copy: charging it may reclaim the cache's charge.
+		if retained {
+			section = bytes.Clone(section)
+		}
+		charged, ok := s.chargeSectionCopy(len(section))
+		if !ok {
+			return s.sectionMemoryUnavailable(msg.UID, len(section))
+		}
 		for _, i := range p.sections {
 			b.sections[i] = applyPartial(section, options.BinarySection[i].Partial)
 		}
@@ -787,20 +790,25 @@ func (s *IMAPSession) decodeBinaryPart(b *decodedBinary, p *binaryPart, options 
 
 	// The items keep copies of their slices, which is what they charge: they are
 	// held until the response is written, while the section goes to the
-	// retention, which may give it up before then, or is given back now if the
-	// session cannot retain it.
+	// optional retention, which may give it up before then. The transient decoded
+	// section does not need a persistent charge when the session cannot retain it.
 	for _, i := range p.sections {
 		buf := bytes.Clone(applyPartial(section, options.BinarySection[i].Partial))
 		n, ok := s.chargeSectionCopy(len(buf))
 		if !ok {
-			s.freeSectionCopies(charged)
 			return s.sectionMemoryUnavailable(msg.UID, len(buf))
 		}
 		b.charged += n
 		b.sections[i] = buf
 	}
-	if !retained && !s.retainBodySection(key, section) {
-		s.freeSectionCopies(charged)
+	// Retention is optional. A partial that fits the remaining budget must
+	// still work when keeping the full section does not, or is not eligible.
+	if !retained && key != "" && len(section) > 0 && len(section) <= maxCachedBodySectionBytes {
+		if charged, ok := s.chargeSectionCopy(len(section)); ok {
+			if !s.retainBodySection(key, section) {
+				s.freeSectionCopies(charged)
+			}
+		}
 	}
 	return nil
 }
