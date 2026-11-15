@@ -28,6 +28,9 @@ func TestValidateScriptRefusesMalformedRegexKey(t *testing.T) {
 		{"pattern too long", `require "regex"; if header :regex "Subject" "` + strings.Repeat("a", 1001) + `" { stop; }`},
 		// Issue #1428: 1000 bytes that compile to about a million instructions.
 		{"program too large", `require "regex"; if header :regex "Received" "(?:` + strings.Repeat("a", 990) + `){1000}" { stop; }`},
+		// 10 bytes and some 990 instructions, but a one-pass program copies
+		// the 1318 range ends of \pL into each of them: some 8 MB.
+		{"character class program too large", `require "regex"; if header :regex "Subject" "^\\pL{990}$" { stop; }`},
 	}
 	for _, tc := range refused {
 		t.Run(tc.name, func(t *testing.T) {
@@ -45,6 +48,8 @@ func TestValidateScriptRefusesMalformedRegexKey(t *testing.T) {
 		`require "regex"; if header :regex "Subject" ["^a", "b(c)d$"] { stop; }`,
 		// A key with a variable is known only when the test runs.
 		`require ["variables", "regex"]; set "p" "("; if header :regex "Subject" "${p}" { stop; }`,
+		// A few Unicode property classes stay within the bound.
+		`require "regex"; if address :regex "from" "^[\\pL\\pN._%+-]+@[\\pL\\pN.-]+$" { stop; }`,
 	}
 	for _, script := range accepted {
 		if err := ValidateScript(script, nil); err != nil {
@@ -137,12 +142,21 @@ func evaluateReceived(t *testing.T, script string, fields int) (uint64, error) {
 // compiled, to about a million instructions (some 45 MB), for each of the ten
 // Received fields: some 300 ms and 2 GB for every message to the account.
 func TestRegexKeyTooLargeRefusedAtDelivery(t *testing.T) {
-	script := `require ["variables", "regex", "fileinto"];
-set "p" "(?:` + strings.Repeat("a", 990) + `){1000}";
+	keys := map[string]string{
+		"counted repetition": "(?:" + strings.Repeat("a", 990) + "){1000}",
+		// A one-pass program copies \pL into each of some 990 instructions.
+		"character class": `^\\pL{990}$`,
+	}
+	for name, key := range keys {
+		t.Run(name, func(t *testing.T) {
+			script := `require ["variables", "regex", "fileinto"];
+set "p" "` + key + `";
 if header :regex "Received" "${p}" { fileinto "hit"; }
 `
-	if _, err := evaluateReceived(t, script, 10); err == nil || !strings.Contains(err.Error(), "too complex") {
-		t.Fatalf("Evaluate: %v, want a too complex error", err)
+			if _, err := evaluateReceived(t, script, 10); err == nil || !strings.Contains(err.Error(), "too complex") {
+				t.Fatalf("Evaluate: %v, want a too complex error", err)
+			}
+		})
 	}
 }
 
