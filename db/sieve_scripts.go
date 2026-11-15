@@ -344,6 +344,10 @@ func (db *Database) SetScriptActiveByName(ctx context.Context, tx pgx.Tx, Accoun
 	return nil
 }
 
+// SetScriptActive sets the active state of the account's script with the given ID.
+// It returns consts.ErrDBNotFound when the account has no such script (the caller
+// looked the ID up before tx and the script was deleted since); the caller must then
+// roll tx back, which undoes the deactivation of the other scripts.
 func (db *Database) SetScriptActive(ctx context.Context, tx pgx.Tx, scriptID, AccountID int64, active bool) error {
 	// If we are activating a script, we must first deactivate all other scripts for this user
 	// to ensure the UNIQUE index on (account_id, active=true) is not violated.
@@ -355,8 +359,14 @@ func (db *Database) SetScriptActive(ctx context.Context, tx pgx.Tx, scriptID, Ac
 	}
 
 	// Now, set the active status for the target script.
-	_, err := tx.Exec(ctx, "UPDATE sieve_scripts SET active = $1, updated_at = now() WHERE id = $2 AND account_id = $3", active, scriptID, AccountID)
-	return err
+	tag, err := tx.Exec(ctx, "UPDATE sieve_scripts SET active = $1, updated_at = now() WHERE id = $2 AND account_id = $3", active, scriptID, AccountID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return consts.ErrDBNotFound
+	}
+	return nil
 }
 
 func (db *Database) DeactivateAllScripts(ctx context.Context, tx pgx.Tx, AccountID int64) error {

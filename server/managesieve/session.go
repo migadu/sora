@@ -857,7 +857,7 @@ func (s *ManageSieveSession) SetActive(ctx context.Context, name string) error {
 	start := time.Now()
 	ctx, cancel := applyCommandTimeout(ctx, "SETACTIVE", s.server.commandTimeouts)
 	defer cancel()
-	accountID, readCtx, err := s.sessionState(ctx, "SETACTIVE")
+	accountID, _, err := s.sessionState(ctx, "SETACTIVE")
 	if err != nil {
 		return err
 	}
@@ -871,7 +871,9 @@ func (s *ManageSieveSession) SetActive(ctx context.Context, name string) error {
 		return nil
 	}
 
-	script, dbErr := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, accountID)
+	// Read from the master: a replica may still hold a script deleted since, or
+	// content replaced since, which is not what the activation below activates.
+	script, dbErr := s.server.rdb.GetScriptByNameWithRetry(context.WithValue(ctx, consts.UseMasterDBKey, true), name, accountID)
 	if dbErr != nil {
 		if dbErr == consts.ErrDBNotFound {
 			return errNonExistent
@@ -884,7 +886,12 @@ func (s *ManageSieveSession) SetActive(ctx context.Context, name string) error {
 		return err
 	}
 
+	// Activate the row that was validated, by ID. The script may have been
+	// deleted since the lookup; nothing is changed then.
 	if err := s.server.rdb.SetScriptActiveWithRetry(ctx, script.ID, accountID, true); err != nil {
+		if errors.Is(err, consts.ErrDBNotFound) {
+			return errNonExistent
+		}
 		return errTryLater
 	}
 
