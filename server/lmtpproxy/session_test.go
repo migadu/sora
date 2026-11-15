@@ -68,6 +68,16 @@ func TestExtractAddress(t *testing.T) {
 			input:      "x",
 			unreadable: true,
 		},
+		{
+			name:       "quoted null path (invalid)",
+			input:      `"<>"`,
+			unreadable: true,
+		},
+		{
+			name:     "quoted address",
+			input:    `"<user@example.com>"`,
+			expected: "user@example.com",
+		},
 	}
 
 	for _, tt := range tests {
