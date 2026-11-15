@@ -115,6 +115,8 @@ func TestMAILRefusesDeclaredSizeOverTheAdvertisedLimit(t *testing.T) {
 // transaction starts.
 func TestMAILRefusesMalformedSizeParameter(t *testing.T) {
 	conn, r := startSizeDeclarationSession(t, 1024)
+	io.WriteString(conn, "LHLO client.example.org\r\n")
+	readReply(t, r)
 	for _, mail := range []string{
 		"MAIL FROM:<a@example.org> SIZE=12x",
 		"MAIL FROM:<a@example.org> SIZE=",
@@ -145,6 +147,8 @@ func TestMAILRefusesMalformedSizeParameter(t *testing.T) {
 // declaration.
 func TestMAILWithoutLimitAcceptsAnyDeclaredSize(t *testing.T) {
 	conn, r := startSizeDeclarationSession(t, 0)
+	io.WriteString(conn, "LHLO client.example.org\r\n")
+	readReply(t, r)
 	io.WriteString(conn, "MAIL FROM:<a@example.org> SIZE=104857600\r\n")
 	if got := readReply(t, r); !strings.HasPrefix(got, "250 ") {
 		t.Errorf("MAIL with SIZE and no limit: %q, want 250", got)
