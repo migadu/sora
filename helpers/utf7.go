@@ -12,9 +12,16 @@ var (
 	ErrInvalidModifiedUTF7 = errors.New("utf7: invalid Modified UTF-7")
 
 	// Modified Base64 alphabet: standard Base64 with ',' instead of '/'
-	modifiedBase64    = base64.NewEncoding("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+,")
-	modifiedBase64Raw = modifiedBase64.WithPadding(base64.NoPadding)
+	modifiedBase64 = base64.NewEncoding("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+,")
+	// Without the "=" pad (RFC 2152). Strict makes decoding refuse non-zero discarded
+	// bits, which RFC 2152 calls ill-formed; it does not change encoding.
+	modifiedBase64Raw = modifiedBase64.WithPadding(base64.NoPadding).Strict()
 )
+
+// isModifiedBase64 reports whether c is in the modified BASE64 alphabet.
+func isModifiedBase64(c byte) bool {
+	return 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '+' || c == ','
+}
 
 // EncodeModifiedUTF7 encodes a UTF-8 string into Modified UTF-7 (RFC 3501 §5.1.3).
 // Printable US-ASCII characters (0x20..0x7E) other than '&' represent themselves,
@@ -73,7 +80,9 @@ func EncodeModifiedUTF7(src string) string {
 
 // DecodeModifiedUTF7 decodes a Modified UTF-7 encoded string (RFC 3501) to UTF-8.
 // If the string contains no Modified UTF-7 sequences (i.e., no '&' characters),
-// it is returned as-is. BASE64 that encodes printable US-ASCII is invalid.
+// it is returned as-is. Only the canonical BASE64 form of a name decodes: BASE64 that
+// encodes printable US-ASCII, a null shift, a byte outside the modified BASE64
+// alphabet and non-zero discarded bits are invalid.
 func DecodeModifiedUTF7(src string) (string, error) {
 	// Fast path: no '&' means no Modified UTF-7 encoding
 	hasAmpersand := false
@@ -88,12 +97,14 @@ func DecodeModifiedUTF7(src string) (string, error) {
 	}
 
 	result := make([]byte, 0, len(src))
+	afterBase64 := false // the previous token was a BASE64 segment
 
 	for i := 0; i < len(src); i++ {
 		ch := src[i]
 
 		if ch != '&' {
 			result = append(result, ch)
+			afterBase64 = false
 			continue
 		}
 
@@ -101,6 +112,11 @@ func DecodeModifiedUTF7(src string) (string, error) {
 		start := i + 1
 		i++
 		for i < len(src) && src[i] != '-' {
+			// Only the modified BASE64 alphabet is permitted (RFC 9051 §A.1). The
+			// base64 package would take '=' and skip CR and LF.
+			if !isModifiedBase64(src[i]) {
+				return "", ErrInvalidModifiedUTF7
+			}
 			i++
 		}
 
@@ -112,24 +128,20 @@ func DecodeModifiedUTF7(src string) (string, error) {
 		if start == i {
 			// "&-" is the escape sequence for literal '&'
 			result = append(result, '&')
+			afterBase64 = false
 		} else {
-			// Decode the base64 segment
-			b64data := []byte(src[start:i])
-
-			// Add padding if necessary
-			switch len(b64data) % 4 {
-			case 2:
-				b64data = append(b64data, '=', '=')
-			case 3:
-				b64data = append(b64data, '=')
+			// "-&" while in BASE64 is a null shift (RFC 3501 §5.1.3): both segments
+			// belong in one.
+			if afterBase64 {
+				return "", ErrInvalidModifiedUTF7
 			}
+			afterBase64 = true
 
-			decoded := make([]byte, modifiedBase64.DecodedLen(len(b64data)))
-			n, err := modifiedBase64.Decode(decoded, b64data)
+			decoded, err := modifiedBase64Raw.DecodeString(src[start:i])
 			if err != nil {
 				return "", ErrInvalidModifiedUTF7
 			}
-			decoded = decoded[:n]
+			n := len(decoded)
 
 			// Must have even number of bytes (UTF-16-BE)
 			if n%2 != 0 {
