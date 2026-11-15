@@ -224,11 +224,13 @@ func TestParseDateHeaderPreservesParserExtensions(t *testing.T) {
 }
 
 // TestNoIngressPathParsesDateWithNetMail: every path that stores a message parses its Date:
-// header with ParseDateHeader. go-message's mail.Header.Date() is net/mail.ParseDate, which
-// reads an alphabetic zone (PDT, EST, CET, ...) in the host's time zone, so the stored
-// instant and offset would depend on the server's TZ.
+// header with ParseDateHeader, and builds its body structure with ExtractBodyStructure,
+// which reads an attached message's Date: with it too. go-message's mail.Header.Date() is
+// net/mail.ParseDate, which reads an alphabetic zone (PDT, EST, CET, ...) in the host's time
+// zone, so the stored instant and offset would depend on the server's TZ; the go-imap
+// extractors use it unless given a parser.
 func TestNoIngressPathParsesDateWithNetMail(t *testing.T) {
-	netMailDate := regexp.MustCompile(`[hH]eader\.Date\(\)|\bmail\.ParseDate\(`)
+	netMailDate := regexp.MustCompile(`[hH]eader\.Date\(\)|\bmail\.ParseDate\(|\bimapserver\.Extract(BodyStructure|Envelope)\(`)
 
 	var offenders []string
 	for _, dir := range []string{"server", "cmd", "db", "pkg"} {
@@ -253,6 +255,6 @@ func TestNoIngressPathParsesDateWithNetMail(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	assert.Empty(t, offenders, "Date: header parsed with net/mail; use helpers.ParseDateHeader:\n%s",
+	assert.Empty(t, offenders, "Date: header parsed with net/mail; use helpers.ParseDateHeader or helpers.ExtractBodyStructure:\n%s",
 		strings.Join(offenders, "\n"))
 }
