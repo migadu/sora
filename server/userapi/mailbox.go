@@ -1,15 +1,18 @@
 package userapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 )
 
 // MailboxInfo represents mailbox information for API responses. Total, Unseen,
@@ -30,6 +33,15 @@ type CreateMailboxRequest struct {
 	Name string `json:"name"`
 }
 
+// readFromWriter sends ctx's reads to the writer. The API is stateless, so a request
+// cannot tell whether the read pool has replayed what an earlier request wrote on
+// the writer, such as the default mailboxes its login created (handleLogin). A read
+// that finds no mailbox on the read pool asks the writer again before answering
+// none or 404, as POP3 and LMTP read from the writer once they have created them.
+func readFromWriter(ctx context.Context) context.Context {
+	return context.WithValue(ctx, consts.UseMasterDBKey, true)
+}
+
 // handleListMailboxes returns all mailboxes for the authenticated user
 func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -47,6 +59,14 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 	// subscriptions table (migration 000046), not the vestigial mailboxes.subscribed
 	// column, so we filter locally rather than pushing subscribedOnly into the query.
 	mailboxes, err := s.rdb.GetMailboxesForUserWithRetry(ctx, accountID, false)
+	if err == nil && !slices.ContainsFunc(mailboxes, func(mb *db.DBMailbox) bool {
+		return mb.AccountID == accountID && strings.EqualFold(mb.Name, "INBOX")
+	}) {
+		// The login made INBOX, which cannot be deleted; the read pool has not
+		// replayed it yet.
+		ctx = readFromWriter(ctx)
+		mailboxes, err = s.rdb.GetMailboxesForUserWithRetry(ctx, accountID, false)
+	}
 	if err != nil {
 		logger.Warn("HTTP Mail API: Error retrieving mailboxes", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve mailboxes")
@@ -149,7 +169,24 @@ func (s *Server) handleCreateMailbox(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	canonicalName := strings.TrimRight(req.Name, string(consts.MailboxDelimiter))
+	// As IMAP CREATE: a trailing delimiter is no part of the name, and a name with
+	// an empty, "." or ".." level ("x//y", "/lead") is refused, not created with a
+	// parent such as "x/" or "" on the way.
+	canonicalName, err := helpers.MailboxNameToCreate(req.Name)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
+		return
+	}
+
+	// A mailbox created in the shared namespace is a shared mailbox: IMAP CREATE makes
+	// it one or refuses it (the namespace root, or allow_user_create = false), and
+	// RENAME never moves a mailbox into the namespace. The User API does not create
+	// shared mailboxes, so it refuses these names rather than create personal
+	// mailboxes there.
+	if s.sharedMailboxes.InNamespace(canonicalName) {
+		s.writeError(w, http.StatusForbidden, "Mailboxes in the shared namespace cannot be created through the User API")
+		return
+	}
 
 	// Create mailbox
 	if err := s.rdb.CreateMailboxForUserWithRetry(ctx, accountID, canonicalName); err != nil {
@@ -203,6 +240,12 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, consts.ErrMailboxHasChildren) {
 			s.writeError(w, http.StatusConflict, "Mailbox has child mailboxes; delete them first")
+			return
+		}
+		// A shared mailbox without the 'x' right (RFC 4314 §2.1), which IMAP DELETE
+		// answers NO [NOPERM].
+		if errors.Is(err, consts.ErrNotPermitted) {
+			s.writeError(w, http.StatusForbidden, "Not permitted to delete this mailbox")
 			return
 		}
 		logger.Warn("HTTP Mail API: Error deleting mailbox", "name", s.name, "error", err)

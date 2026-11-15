@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"net"
 	"testing"
 
@@ -109,5 +110,42 @@ func TestParseIMAPID_MalformedTTLIsAnError(t *testing.T) {
 	params, err = ParseIMAPID(map[string]string{"x-originating-ip": "192.0.2.1"})
 	if err != nil || params.ProxyTTL != 0 {
 		t.Errorf("no x-proxy-ttl: params = %+v, err = %v", params, err)
+	}
+}
+
+// ForwardingSourceIP is the address IMAP ID forwarding and POP3 XCLIENT are judged by, and
+// the one LMTP XCLIENT ADDR needs trusted (docs/SECURITY.md 3.1): the client a PROXY header
+// names, else the socket peer. A header that names no client (v2 LOCAL, v1 UNKNOWN or an
+// UNSPEC v2 header) falls back to the socket peer, the trusted host that sent it, so a
+// proxy that reaches the backend that way can still forward.
+func TestForwardingSourceIP(t *testing.T) {
+	peer := &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 40000}
+	socket := &mockAddrConn{remote: peer}
+	proxied := func(info *ProxyProtocolInfo) net.Conn {
+		return &ProxyProtocolConn{Conn: socket, proxyInfo: info}
+	}
+	named := &ProxyProtocolInfo{Version: 2, Command: "PROXY", SrcIP: "198.51.100.7", SrcPort: 51000}
+
+	for _, tc := range []struct {
+		name string
+		conn net.Conn
+		want string
+	}{
+		{"no PROXY header", socket, "192.0.2.10"},
+		{"header names a client", proxied(named), "198.51.100.7"},
+		{"header names a client, behind TLS", tls.Server(proxied(named), &tls.Config{}), "198.51.100.7"},
+		{"v2 LOCAL", proxied(&ProxyProtocolInfo{Version: 2, Command: "LOCAL"}), "192.0.2.10"},
+		{"v1 UNKNOWN", proxied(&ProxyProtocolInfo{Version: 1, Command: "UNKNOWN", Protocol: "UNKNOWN"}), "192.0.2.10"},
+		{"v2 UNSPEC", proxied(&ProxyProtocolInfo{Version: 2, Command: "UNKNOWN", Protocol: "UNKNOWN"}), "192.0.2.10"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ForwardingSourceIP(tc.conn); !got.Equal(net.ParseIP(tc.want)) {
+				t.Errorf("ForwardingSourceIP = %v, want %s", got, tc.want)
+			}
+		})
+	}
+
+	if got := ForwardingSourceIP(nil); got != nil {
+		t.Errorf("ForwardingSourceIP(nil) = %v, want nil (in no network)", got)
 	}
 }

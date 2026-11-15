@@ -45,3 +45,32 @@ func TestMaxMessageSizeAboveStorableIsClamped(t *testing.T) {
 		})
 	}
 }
+
+// max_message_size "0" is the 50 MiB default, like an omitted value, and not "no
+// limit": the LMTP backend and the Admin API refuse anything above 50 MiB whatever is
+// stored, while the LMTP proxy advertised no SIZE for a stored 0 and a reload from
+// "50mb" to "0" reported a change that changed nothing (#962). RFC 1870 section 3
+// (3): "A parameter value of 0 (zero) indicates that no fixed maximum message size is
+// in force." A backend that refuses above 50 MiB has one, so 0 cannot mean that.
+func TestGetMaxMessageSizeZeroIsDefault(t *testing.T) {
+	for _, tt := range []struct {
+		in   string
+		want int64
+	}{
+		{"", 50 << 20},
+		{"0", 50 << 20},
+		{"0b", 50 << 20},
+		{"0kb", 50 << 20},
+		{"0 MB", 50 << 20},
+		{"1", 1},
+		{"60mb", 60 << 20},
+	} {
+		s := ServerConfig{Name: "lmtp", Type: "lmtp", MaxMessageSize: tt.in}
+		if got, err := s.GetMaxMessageSize(); err != nil || got != tt.want {
+			t.Errorf("GetMaxMessageSize(%q) = %d, %v; want %d, nil", tt.in, got, err, tt.want)
+		}
+		if got := s.GetMaxMessageSizeWithDefault(); got != tt.want {
+			t.Errorf("GetMaxMessageSizeWithDefault(%q) = %d, want %d", tt.in, got, tt.want)
+		}
+	}
+}

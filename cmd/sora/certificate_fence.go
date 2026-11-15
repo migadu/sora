@@ -26,9 +26,9 @@ type certificateIssuanceFence struct {
 // surface at the call site as a confusing conversion error.
 var _ tlsmanager.CertificateFence = certificateIssuanceFence{}
 
-// TryHoldIssuance claims the right to order a certificate for domain, returning a release
-// for a granted claim and a nil release when another node holds it.
-func (f certificateIssuanceFence) TryHoldIssuance(ctx context.Context, domain string, ttl time.Duration) (func(context.Context), error) {
+// TryHoldIssuance claims the right to order a certificate for domain, returning the
+// granted claim and nil when another node holds it.
+func (f certificateIssuanceFence) TryHoldIssuance(ctx context.Context, domain string, ttl time.Duration) (tlsmanager.IssuanceHold, error) {
 	name := db.CertificateIssuanceLock(domain)
 
 	lock, err := f.rdb.TryAcquireNamedLockWithRetry(ctx, name, ttl)
@@ -38,13 +38,29 @@ func (f certificateIssuanceFence) TryHoldIssuance(ctx context.Context, domain st
 	if lock == nil {
 		return nil, nil
 	}
+	return certificateIssuanceHold{rdb: f.rdb, domain: domain, lock: lock}, nil
+}
 
-	return func(releaseCtx context.Context) {
-		// A failed release is not fatal: the claim expires on its own, so the only cost
-		// is that the next order for this domain waits out the remaining ttl.
-		if err := f.rdb.ReleaseNamedLockWithRetry(releaseCtx, lock); err != nil {
-			logger.Warn("TLS: Failed to release certificate issuance claim - it will expire",
-				"domain", domain, "error", err)
-		}
-	}, nil
+// certificateIssuanceHold is a granted issuance claim: the lock row, named by its
+// fencing token.
+type certificateIssuanceHold struct {
+	rdb    *resilient.ResilientDatabase
+	domain string
+	lock   *db.NamedLock
+}
+
+// Extend moves the claim's expiry to no earlier than ttl from now, reporting false once
+// the claim is no longer this node's.
+func (h certificateIssuanceHold) Extend(ctx context.Context, ttl time.Duration) (bool, error) {
+	return h.rdb.ExtendNamedLockWithRetry(ctx, h.lock, ttl)
+}
+
+// Release gives the claim back before its expiry.
+func (h certificateIssuanceHold) Release(ctx context.Context) {
+	// A failed release is not fatal: the claim expires on its own, so the only cost is
+	// that the next order for this domain waits out the remaining ttl.
+	if err := h.rdb.ReleaseNamedLockWithRetry(ctx, h.lock); err != nil {
+		logger.Warn("TLS: Failed to release certificate issuance claim - it will expire",
+			"domain", h.domain, "error", err)
+	}
 }

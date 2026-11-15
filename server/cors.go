@@ -44,8 +44,9 @@ func SetCORSHeaders(h http.Header, origin string, allowedOrigins []string) {
 	// A cross-origin reader sees only the CORS-safelisted response
 	// headers and the ones named here (Fetch Standard, "CORS filtered
 	// response"): Retry-After on a 503 for a body not available yet,
-	// Content-Disposition on /raw. Static, so it needs no Vary.
-	h.Set("Access-Control-Expose-Headers", "Retry-After, Content-Disposition")
+	// Content-Disposition on /raw, WWW-Authenticate on a 401 (whether
+	// the token was refused). Static, so it needs no Vary.
+	h.Set("Access-Control-Expose-Headers", "Retry-After, Content-Disposition, WWW-Authenticate")
 	if wildcard {
 		// A wildcard origin must NOT be combined with credentials (CORS spec):
 		// reflecting a concrete origin + Allow-Credentials lets any site make

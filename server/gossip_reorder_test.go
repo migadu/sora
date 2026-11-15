@@ -259,7 +259,7 @@ func TestAffinityLocalDeleteIsNotResurrectedByAnOlderSet(t *testing.T) {
 func TestAffinityRetransmissionIsAppliedOnce(t *testing.T) {
 	store := &countingAffinityStore{}
 	am := newTestAffinityManager()
-	am.SetPersistStore(store)
+	am.persistStore = store
 
 	encoded, err := encodeAffinityEvent(AffinityEvent{
 		Type:      AffinityEventSet,
@@ -278,7 +278,9 @@ func TestAffinityRetransmissionIsAppliedOnce(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		am.HandleClusterEvent(encoded)
 	}
-	am.wg.Wait()
+	if !am.persistWrites.Drain(5 * time.Second) {
+		t.Fatal("the persistence writes did not finish")
+	}
 
 	if sets := store.setCount(); sets != 1 {
 		t.Errorf("a retransmitted affinity event was persisted %d times, want 1", sets)

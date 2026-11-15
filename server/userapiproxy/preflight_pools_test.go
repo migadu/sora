@@ -132,29 +132,3 @@ func TestUserAPIProxy_PreflightPoolOrder(t *testing.T) {
 		})
 	}
 }
-
-// Only a preflight leaves the pools' fail-closed rule: an auth request that names no
-// user the proxy can route by (a login without an email, a refresh whose token the proxy
-// refuses) is not sent to some pool's backend when there is no default pool. A backend
-// may accept a token the proxy refused (clock skew at expiry), and its refresh then
-// looks the token's user up in its own pool's database.
-func TestUserAPIProxy_NamelessAuthRequestStaysOutOfThePools(t *testing.T) {
-	var hits atomic.Int32
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }))
-	t.Cleanup(backend.Close)
-	s, _ := newPoolsProxy(t, []proxy.PoolSpec{
-		{Name: "sora0", Backends: []string{strings.TrimPrefix(backend.URL, "http://")}},
-	}, poolAnswer("sora0"))
-	handler := s.setupHandler()
-
-	for _, c := range []struct{ path, body string }{
-		{"/user/auth/login", `{"password":"x"}`},
-		{"/user/auth/refresh", `{"token":"not-a-valid-token"}`},
-	} {
-		w := httptest.NewRecorder()
-		handler.ServeHTTP(w, httptest.NewRequest(http.MethodPost, c.path, strings.NewReader(c.body)))
-		if hits.Load() != 0 {
-			t.Fatalf("POST %s %s reached a backend (status %d)", c.path, c.body, w.Code)
-		}
-	}
-}

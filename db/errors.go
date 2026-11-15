@@ -45,6 +45,12 @@ var (
 	// Connection errors
 	ErrFailedToConnect = errors.New("failed to connect to database")
 
+	// ErrConnectionClosed indicates the database closed the connection a statement
+	// ran on: PostgreSQL shutting down under it, or a pooled connection that the
+	// database side (or a relay in front of it) closed, which pgx then reports as
+	// closed.
+	ErrConnectionClosed = errors.New("database connection closed")
+
 	// ErrDBLockTimeout indicates a statement was canceled because it waited longer
 	// than lock_timeout for a row lock (PostgreSQL SQLSTATE 55P03). This is a
 	// transient contention condition, not a fault: the caller should back off and
@@ -71,7 +77,16 @@ func ClassifyDBError(err error) error {
 		switch pgErr.Code {
 		case "55P03": // lock_not_available — lock_timeout elapsed
 			return errors.Join(ErrDBLockTimeout, err)
+		case "57P01", // admin_shutdown: the server is shutting down
+			"57P02": // crash_shutdown: the server is resetting after a crash
+			return errors.Join(ErrConnectionClosed, err)
 		}
+	}
+
+	// pgx closes a connection once its socket fails or the server ends the session,
+	// and a statement on it then fails with pgconn.ErrConnClosed ("conn closed").
+	if errors.Is(err, pgconn.ErrConnClosed) {
+		return errors.Join(ErrConnectionClosed, err)
 	}
 
 	msg := err.Error()

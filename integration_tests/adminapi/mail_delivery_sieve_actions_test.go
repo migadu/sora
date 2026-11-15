@@ -33,6 +33,12 @@ func (q *captureRelay) Enqueue(from, to, messageType string, _ []byte) error {
 	return nil
 }
 
+// Hold records the message when it is committed, which is when the relay worker
+// would first see it.
+func (q *captureRelay) Hold(from, to, messageType string, messageBytes []byte) (func() error, func(), error) {
+	return func() error { return q.Enqueue(from, to, messageType, messageBytes) }, func() {}, nil
+}
+
 // redirectedTo returns the sorted redirect targets enqueued so far.
 func (q *captureRelay) redirectedTo() []string {
 	q.mu.Lock()

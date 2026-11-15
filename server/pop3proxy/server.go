@@ -224,17 +224,14 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	if options.RemoteLookup != nil && options.RemoteLookup.Enabled {
 		remotelookupClient, err := proxy.InitializeRemoteLookup("pop3", options.RemoteLookup, options.RemotePort)
 		if err != nil {
-			logger.Debug("POP3 Proxy: Failed to initialize remotelookup client", "proxy", options.Name, "error", err)
-			if !options.RemoteLookup.ShouldLookupLocalUsers() {
-				serverCancel()
-				return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
-			}
-			logger.Debug("POP3 Proxy: Continuing without remotelookup due to lookup_local_users=true", "proxy", options.Name)
-		} else {
-			routingLookup = remotelookupClient
-			if options.Debug {
-				logger.Debug("POP3 Proxy: RemoteLookup client initialized successfully", "proxy", options.Name)
-			}
+			// Also with lookup_local_users, which adds the database for the users the
+			// lookup does not know and does not make the lookup optional.
+			serverCancel()
+			return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
+		}
+		routingLookup = remotelookupClient
+		if options.Debug {
+			logger.Debug("POP3 Proxy: RemoteLookup client initialized successfully", "proxy", options.Name)
 		}
 	}
 
@@ -554,18 +551,20 @@ func (s *POP3ProxyServer) connConfig() server.SoraConnConfig {
 		MinBytesPerMinute:    settings.minBytesPerMinute,
 		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0 || settings.minBytesPerMinute > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
-			// Send POP3 error response before closing
-			// RFC 1939 doesn't define specific timeout response codes, but [IN-USE] is commonly used
+			// Best-effort notice before closing. It answers no command and
+			// carries no response code: [IN-USE] says a login succeeded with
+			// the maildrop locked (RFC 2449 section 8.1.2), and no RFC 2449 or
+			// RFC 3206 code describes a timeout.
 			var message string
 			switch reason {
 			case "idle":
-				message = "-ERR [IN-USE] Idle timeout, please reconnect\r\n"
+				message = "-ERR Idle timeout, please reconnect\r\n"
 			case "slow_throughput":
-				message = "-ERR [IN-USE] Connection too slow, please reconnect\r\n"
+				message = "-ERR Connection too slow, please reconnect\r\n"
 			case "session_max":
-				message = "-ERR [IN-USE] Maximum session duration exceeded, please reconnect\r\n"
+				message = "-ERR Maximum session duration exceeded, please reconnect\r\n"
 			default:
-				message = "-ERR [IN-USE] Connection timeout, please reconnect\r\n"
+				message = "-ERR Connection timeout, please reconnect\r\n"
 			}
 			_, _ = fmt.Fprint(conn, message)
 		},
@@ -740,6 +739,10 @@ func (s *POP3ProxyServer) Stop() error {
 		if err := s.lookupCache.Stop(stopCtx); err != nil {
 			logger.Error("Error stopping auth cache", "proxy", s.name, "error", err)
 		}
+	}
+
+	if s.authLimiter != nil {
+		s.authLimiter.Stop()
 	}
 
 	return nil
