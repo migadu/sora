@@ -20,7 +20,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/emersion/go-message/mail"
 	"github.com/migadu/go-imap"
-	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
@@ -79,21 +78,39 @@ type S3ObjectInfo struct {
 	ETag         string
 }
 
+// s3ImportDBParams are the connection settings of the work database. importFromS3's
+// workers mark their objects processed, each on a connection of its own, while the
+// feeder reads keys: in WAL mode a read does not block a writer (on the rollback journal
+// every UPDATE failed with SQLITE_BUSY while the feeder's read held its SHARED lock),
+// and a worker that commits while another does waits up to 5 seconds for the lock.
+const s3ImportDBParams = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+
 // NewS3Importer creates a new S3Importer instance
 func NewS3Importer(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, options S3ImporterOptions) (*S3Importer, error) {
 	// Wrap S3 storage with resilient patterns
 	resilientS3 := resilient.NewResilientS3Storage(s3)
-	// Create temporary SQLite database to track S3 objects
-	tempDir := os.TempDir()
-	dbPath := filepath.Join(tempDir, fmt.Sprintf("sora-s3-import-%d.db", time.Now().Unix()))
+	// Create temporary SQLite database to track S3 objects. Every run gets a file of its
+	// own, created exclusively and readable by its owner only (os.CreateTemp): importFromS3
+	// imports every row in it into this run's account, so a run must never open another's.
+	f, err := os.CreateTemp(os.TempDir(), "sora-s3-import-*.db")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temporary database: %w", err)
+	}
+	dbPath := f.Name()
+	if err := f.Close(); err != nil {
+		os.Remove(dbPath)
+		return nil, fmt.Errorf("failed to create temporary database: %w", err)
+	}
 	logger.Info("Using temporary database", "path", dbPath)
 
-	dsn, err := sqlitefile.DSN(dbPath, "")
+	dsn, err := sqlitefile.DSN(dbPath, s3ImportDBParams)
 	if err != nil {
+		os.Remove(dbPath)
 		return nil, err
 	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
+		os.Remove(dbPath)
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
 	}
 
@@ -118,6 +135,8 @@ func NewS3Importer(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, opti
 		CREATE INDEX IF NOT EXISTS idx_content_hash ON s3_objects(content_hash);
 	`)
 	if err != nil {
+		db.Close()
+		os.Remove(dbPath)
 		return nil, fmt.Errorf("failed to create s3_objects table: %w", err)
 	}
 
@@ -392,12 +411,6 @@ func (si *S3Importer) importFromS3() error {
 
 	logger.Info("Processing S3 objects", "count", si.totalObjects, "workers", si.options.Workers)
 
-	rows, err := si.db.Query("SELECT key FROM s3_objects WHERE processed = FALSE")
-	if err != nil {
-		return fmt.Errorf("failed to query unprocessed S3 objects: %w", err)
-	}
-	defer rows.Close()
-
 	var wg sync.WaitGroup
 	jobs := make(chan S3ObjectInfo, 100) // Buffer for better performance
 
@@ -411,27 +424,62 @@ func (si *S3Importer) importFromS3() error {
 					logger.Info("Failed to import S3 object", "worker", workerID,
 						"progress", si.getProgressPrefix(), "key", obj.Key, "error", err)
 					atomic.AddInt64(&si.failedMessages, 1)
+					si.markObjectProcessed(obj.Key, false, err.Error())
 				}
 				atomic.AddInt64(&si.processedObjects, 1)
 			}
 		}(w)
 	}
 
-	// Feed jobs to workers
-	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			logger.Info("Failed to scan row", "error", err)
-			continue
+	// Feed jobs to workers a page of keys at a time. A query's read transaction lasts
+	// until its rows are closed, and the feeder waits on the workers while it feeds
+	// them: a query left open for the whole run would hold the snapshot that keeps the
+	// checkpointer from ever resetting the WAL, which then grows with every worker's
+	// update. Each page is read in full, and its rows closed, before it is fed.
+	var feedErr error
+	for afterID := int64(0); ; {
+		var keys []string
+		keys, afterID, feedErr = si.unprocessedKeys(afterID, feedPageSize)
+		if feedErr != nil || len(keys) == 0 {
+			break
 		}
-
-		jobs <- S3ObjectInfo{Key: key}
+		for _, key := range keys {
+			jobs <- S3ObjectInfo{Key: key}
+		}
 	}
 
 	close(jobs)
 	wg.Wait()
 
+	if feedErr != nil {
+		return fmt.Errorf("failed to query unprocessed S3 objects: %w", feedErr)
+	}
 	return nil
+}
+
+// feedPageSize is how many keys importFromS3 reads from the work database at a time.
+const feedPageSize = 1000
+
+// unprocessedKeys returns the keys of up to limit unprocessed objects with an id above
+// afterID, in id order, and the id of the last one (afterID when there are none). It
+// reads every row before it returns, so its read transaction is over by then.
+func (si *S3Importer) unprocessedKeys(afterID int64, limit int) ([]string, int64, error) {
+	rows, err := si.db.Query("SELECT id, key FROM s3_objects WHERE processed = FALSE AND id > ? ORDER BY id LIMIT ?",
+		afterID, limit)
+	if err != nil {
+		return nil, afterID, err
+	}
+	defer rows.Close()
+
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&afterID, &key); err != nil {
+			return nil, afterID, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, afterID, rows.Err()
 }
 
 // importS3Object downloads and imports a single message from S3
@@ -448,6 +496,14 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	address, err := server.NewAddress(si.options.Email)
 	if err != nil {
 		return fmt.Errorf("invalid email address: %w", err)
+	}
+
+	// The message is filed under this user's prefix (S3Domain/S3Localpart and the key
+	// CompleteS3Upload confirms), so the object must be the one under that prefix: an
+	// object under any other is another user's mail.
+	s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), contentHash)
+	if obj.Key != s3Key {
+		return fmt.Errorf("S3 object %s is not under the prefix of %s", obj.Key, address.FullAddress())
 	}
 
 	accountID, err := si.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
@@ -501,7 +557,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	mailHeader := mail.Header{Header: messageContent.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
+	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date"))
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
 
@@ -519,7 +575,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 		internalDate = time.Now()
 	}
 
-	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(content))
+	bodyStructure := helpers.ExtractBodyStructure(bytes.NewReader(content))
 
 	// Validate body structure and use fallback if invalid (e.g., multipart with no children)
 	if err := helpers.ValidateBodyStructure(&bodyStructure); err != nil {
@@ -582,7 +638,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	}
 
 	// Since the content already exists in S3, mark the upload as complete
-	err = si.rdb.CompleteS3UploadWithRetry(ctx, contentHash, user.AccountID(), []string{helpers.NewS3Key(address.Domain(), address.LocalPart(), contentHash)})
+	err = si.rdb.CompleteS3UploadWithRetry(ctx, contentHash, user.AccountID(), []string{s3Key})
 	if err != nil {
 		return fmt.Errorf("failed to mark S3 upload as complete: %w", err)
 	}

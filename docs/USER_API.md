@@ -104,7 +104,9 @@ password change drops the account's cached logins.
 
 The HTTP server's limits are fixed: 10 seconds for the request headers, 30 seconds to read
 the request, 30 seconds to write the response (this bounds a `/raw` download), 120 seconds for
-an idle keep-alive connection, and 15 seconds to finish open requests at shutdown.
+an idle keep-alive connection, and 15 seconds to finish open requests at shutdown. A login the
+rate limit delays has its 30 seconds to write from the end of the delay
+([AUTHENTICATION.md](AUTHENTICATION.md#103-progressive-delays) section 10.3).
 
 **Reload.** On SIGHUP, `jwt_secret`, `allowed_origins` and `allowed_hosts` are re-read. A
 changed `jwt_secret` makes every token signed with the old one invalid at once. An empty
@@ -260,7 +262,7 @@ header listing the methods it does serve; a path no endpoint has is
 | 201 | Mailbox created. |
 | 400 | Bad request: bad JSON, a missing or invalid field or parameter, a script that does not compile. |
 | 401 | No, bad or expired token; failed login. |
-| 403 | Client address not in `allowed_hosts`; deleting `INBOX`; or deleting a shared mailbox, changing flags or deleting a message in one without the right. |
+| 403 | Client address not in `allowed_hosts`; creating a mailbox in the shared namespace; deleting `INBOX`; or deleting a shared mailbox, changing flags or deleting a message in one without the right. |
 | 404 | Mailbox, message or script not found, or no endpoint has the path. |
 | 405 | Wrong method for the path; `Allow` lists the methods it serves. |
 | 409 | Mailbox already exists, or has child mailboxes. |
@@ -351,13 +353,17 @@ mailboxes.
 {"name": "Projects/Acme"}
 ```
 
-Missing parent mailboxes are created too. A trailing `/` is removed.
+Missing parent mailboxes are created too. A trailing `/` is removed. The User API does not
+create shared mailboxes: with `[shared_mailboxes]` enabled, a name in the shared namespace
+(with the default prefix, `Shared` or any name under `Shared/`, in any letter case) is refused
+with 403. Create those over IMAP or with `sora-admin mailbox create`.
 
 Response `201 {"message":"Mailbox created successfully","name":"Projects/Acme"}`.
 
 | Status | Body `error` |
 |---|---|
 | 400 | `Invalid request body`, `Mailbox name is required`, `mailbox name contains invalid characters` (NUL, CR or LF), `mailbox name too long (max 255 characters)`, `Invalid mailbox name` |
+| 403 | `Mailboxes in the shared namespace cannot be created through the User API` |
 | 409 | `Mailbox already exists` |
 | 500 | `Failed to create mailbox` |
 
@@ -893,8 +899,8 @@ call the API through the proxy.
 each is reported with a startup warning. Affinity is
 used when the block sets `enable_affinity = true` and the cluster runs its affinity store
 (`[cluster.affinity] enabled = true`). The proxy's HTTP
-limits are fixed: 30 seconds to read a request and 30 seconds to write a response, 120 seconds
-for an idle connection.
+limits are fixed: 30 seconds to read a request and 30 seconds to write a response (from the end
+of the delay for a login the proxy's rate limit delays), 120 seconds for an idle connection.
 
 The Admin API shows the proxy's backends under the name `UserAPI-{name}` at
 `GET /admin/proxy/backends` (see [ADMIN_API.md](ADMIN_API.md#13-proxy-backends-and-affinity)).

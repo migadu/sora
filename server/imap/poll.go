@@ -3,7 +3,6 @@ package imap
 import (
 	"context"
 	"errors"
-	"sync"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
@@ -43,12 +42,21 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 	highestModSeqToPollFrom := s.currentHighestModSeq.Load()
 	release()
 
-	// Hold off while a STORE of this session is between its write and its own
-	// FETCH responses (the NOTIFY pump polls concurrently), so the delta read
-	// below either precedes that write or finds it in ownStoreEcho.
+	// Hold off while a STORE of this session, or a FETCH that implicitly sets
+	// \Seen, is between its write and its own FETCH responses (the NOTIFY pump
+	// polls concurrently), so the delta read below either precedes that write
+	// or finds it in ownStoreEcho.
+	//
+	// The lock is held until the updates this Poll queues are written, not
+	// only queued. The tracker hands them over in one batch: while that batch
+	// is being written to a slow client, a STORE or FETCH answer recorded in
+	// ownStoreEcho could otherwise be written ahead of an older state of the
+	// same row still in the batch, and that older state would be the last the
+	// client receives. (Updates still queued in the tracker are the other
+	// half: an answer records nothing while there are any, see
+	// implicitSeenAnswer.expect.)
 	s.ownStoreMu.Lock()
-	unlockOwnStore := sync.OnceFunc(s.ownStoreMu.Unlock)
-	defer unlockOwnStore()
+	defer s.ownStoreMu.Unlock()
 
 	// Create a context that signals to use the master DB if the session is pinned.
 	readCtx := ctx
@@ -372,15 +380,31 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		}
 	}
 
-	// Process message flag updates
+	// Read the writer's actual NOTIFY policy once, when the first flag update
+	// needs it. A nil backend watch can mean NOTIFY NONE as well as the
+	// default, and only the library knows which policy its writer applies.
+	var flagFilterRead, flagsFiltered bool
 	for _, update := range poll.Updates {
 		if update.IsExpunge {
 			continue
 		}
 
-		// Already answered by this session's own STORE.
+		// Already answered by this session's own STORE or FETCH.
 		if modSeq, ok := s.ownStoreEcho[update.UID]; ok && modSeq == update.EffectiveModSeq && s.ownStoreEchoMailboxID == mailboxID {
 			continue
+		}
+		if !flagFilterRead {
+			flagsFiltered = !w.FlagChangeAllowed()
+			flagFilterRead = true
+		}
+		// NOTIFY may discard this update instead of writing it. An empty
+		// tracker then does not mean every change through the cursor was
+		// reported: keep the preceding safe watermark for this selection,
+		// even if the client enables FlagChange again later.
+		if flagsFiltered {
+			s.reportedModSeqGap.Store(true)
+		} else {
+			s.queuedFlagUpdates.Store(true)
 		}
 
 		allFlags := db.BitwiseToFlags(update.BitwiseFlags)
@@ -413,13 +437,47 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 	// Store sessionTracker reference before releasing lock to avoid race condition
 	sessionTracker := s.sessionTracker
 
-	release() // Release lock before writing to the network
-	unlockOwnStore()
+	release() // Release the session lock before writing; ownStoreMu stays held (see above)
 
 	// Check if sessionTracker is still valid after releasing lock
 	if sessionTracker == nil {
 		return nil
 	}
 
-	return sessionTracker.Poll(w, allowExpunge)
+	if err := sessionTracker.Poll(w, allowExpunge); err != nil {
+		return err
+	}
+	// Every change up to the cursor has been queued, by this poll or an earlier
+	// one. Any flag update queued behind a withheld EXPUNGE stays queued until
+	// the tracker drains completely, so checking FlagChangeAllowed here catches
+	// a NOTIFY filter installed between queueing and delivery. Once nothing is
+	// left queued, and no NOTIFY filter consumed a flag change without
+	// reporting it, all of them have been sent. Polls run one at a time
+	// (seqViewMu) and the cursor never moves back.
+	if sessionTracker.QueuedUpdates() == 0 {
+		if s.queuedFlagUpdates.Swap(false) && !w.FlagChangeAllowed() {
+			s.reportedModSeqGap.Store(true)
+		}
+		if !s.reportedModSeqGap.Load() {
+			s.reportedHighestModSeq.Store(cursor)
+		}
+	}
+	return nil
+}
+
+var _ imapserver.SessionHighestModSeq = (*IMAPSession)(nil)
+
+// HighestModSeq implements imapserver.SessionHighestModSeq: the HIGHESTMODSEQ the
+// first CONDSTORE enabling command with a mailbox selected returns (RFC 7162
+// §3.1), and the one written after a command whose MODSEQ FETCH data items went
+// past it, such as a STORE answered while another session's VANISHED is held
+// back (RFC 7162 §3.2). The poll cursor is not it: it also covers what a FETCH,
+// STORE or SEARCH left queued, an EXPUNGE they may not send and whatever
+// follows it, and the client adopts the value "even if it has seen higher
+// mod-sequences" (RFC 7162 §6), so it would skip those changes if it
+// resynchronized from it. A flag
+// change consumed under a NOTIFY filter also holds this value back until a
+// new SELECT: changing the filter does not replay the consumed flag update.
+func (s *IMAPSession) HighestModSeq() uint64 {
+	return s.reportedHighestModSeq.Load()
 }

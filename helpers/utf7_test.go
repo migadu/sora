@@ -54,6 +54,18 @@ func TestDecodeModifiedUTF7(t *testing.T) {
 		{"encoded unit separator 0x1f", "&AB8-", "\x1f", false},
 		{"encoded del 0x7f", "&AH8-", "\x7f", false},
 
+		// RFC 3501 §5.1.3 / RFC 9051 §A.1: when Modified UTF-7 shifts ('&') are present,
+		// octets outside printable US-ASCII (0x20..0x7e) must not appear literally.
+		{"raw utf8 with shift", "Café &AOk-", "", true},
+		{"raw utf8 with ampersand escape", "Café &- Thé", "", true},
+		{"raw unit separator 0x1f outside shift", "\x1f&AOk-", "", true},
+		{"raw nul 0x00 outside shift", "\x00&-", "", true},
+		{"raw del 0x7f outside shift", "\x7f&-", "", true},
+		{"raw 0xff after ampersand escape", "&-\xff", "", true},
+		{"boundary space 0x20 outside shift", " &AOk-", " é", false},
+		{"boundary tilde 0x7e outside shift", "~&AOk-", "~é", false},
+		{"utf8 without ampersand fast path", "Café", "Café", false},
+
 		// RFC 3501 §5.1.3: null shifts ("-&" while in BASE64) are not permitted.
 		// "&U,BTFw-&ZeVnLIqe-" is the RFC's own example of a superfluous shift.
 		{"null shift", "&AOk-&AOk-", "", true},
