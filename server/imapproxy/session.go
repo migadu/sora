@@ -31,6 +31,7 @@ type Session struct {
 	server                *Server
 	settings              *reloadableSettings // the server's settings when the session started (see reloadableSettings)
 	startTLSInProgress    bool                // Protected by mu; asynchronous notices are omitted during negotiation
+	greeted               bool                // The greeting has been written, under mu: before it the implicit-TLS handshake may be pending, and a BYE written then would wait for it or be refused
 	clientConn            net.Conn            // The client transport: listenerConn, or the TLS conn above it after STARTTLS (reassigned under mu)
 	listenerConn          net.Conn            // The accepted connection, never reassigned: its SoraConn carries the JA4, username and timeouts
 	backendConn           net.Conn            // Reassigned on backend connect/error; writes must hold mu (sendGracefulShutdownMessage reads it from the Stop goroutine)
@@ -749,7 +750,11 @@ func (s *Session) sendGreeting() error {
 	if err != nil {
 		return err
 	}
-	return s.clientWriter.Flush()
+	if err := s.clientWriter.Flush(); err != nil {
+		return err
+	}
+	s.greeted = true
+	return nil
 }
 
 // sendResponse sends a response to the client.

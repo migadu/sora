@@ -62,6 +62,7 @@ func newProxiedSession(t *testing.T) *proxiedSession {
 		server: srv, ctx: ctx,
 		clientConn: clientProxy, listenerConn: clientProxy, clientReader: bufio.NewReader(clientProxy),
 		backendConn: backendProxy, backendReader: bufio.NewReader(backendProxy),
+		greeted: true,
 	}
 	srv.activeSessions[s] = struct{}{}
 	p := &proxiedSession{s: s, backend: backendEnd, client: clientEnd, clientEnded: make(chan struct{})}
