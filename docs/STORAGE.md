@@ -356,8 +356,11 @@ Your MTA keeps the message and retries a `452`. LMTP also answers `452 4.3.1` wh
 staging disk is full or read-only, whether or not a limit is set.
 
 The worker keeps the total in memory and corrects it every 5 minutes from this node's rows
-in `pending_uploads`. Set a limit below the free space of the staging disk, so that a long S3
-outage makes the MTA queue mail instead of filling the disk.
+in `pending_uploads`. A body the node staged since it started that has no row (a delivery
+whose transaction has yet to commit, one that failed after writing its file, or a duplicate
+of a body already in S3) stays counted until its row appears or the orphan sweep removes the
+file. Set a limit below the free space of the staging disk, so that a long S3 outage makes
+the MTA queue mail instead of filling the disk.
 
 ### 6.8 The orphan sweep
 

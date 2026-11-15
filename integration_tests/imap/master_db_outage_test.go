@@ -97,3 +97,94 @@ func TestIMAPMasterLoginDuringDatabaseOutage(t *testing.T) {
 		})
 	}
 }
+
+// TestIMAPMasterLoginDuringDatabaseStall: a master login whose impersonation target
+// lookup runs into its timeout because the database hangs is a database outage, as a
+// regular login during a stall is (TestIMAPLoginDuringDatabaseStall), not a server
+// shutdown. In the master username form the reply must also not depend on the master
+// password: a wrong one is the base address's own login, which the regular path
+// answers, so a reply that differs with the right one confirms a guessed master
+// password.
+func TestIMAPMasterLoginDuringDatabaseStall(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	const (
+		masterUser = "master_admin"
+		masterPass = "master_secret_pw"
+		saslUser   = "master_sasl"
+		saslPass   = "master_sasl_secret_pw"
+	)
+
+	forms := []struct {
+		name  string
+		probe func(t *testing.T, address, target string) string
+		// wrong probes the same form with a wrong master password, nil where that is
+		// not a regular login (a master SASL username that is not an address).
+		wrong func(t *testing.T, address, target string) string
+	}{
+		{"LOGIN_master_username",
+			func(t *testing.T, address, target string) string {
+				return imapRawCommand(t, address, fmt.Sprintf("LOGIN %q %q", target+"@"+masterUser, masterPass))
+			},
+			func(t *testing.T, address, target string) string {
+				return imapRawCommand(t, address, fmt.Sprintf("LOGIN %q %q", target+"@"+masterUser, "wrong-"+masterPass))
+			}},
+		{"AUTHENTICATE_master_username",
+			func(t *testing.T, address, target string) string {
+				return imapAuthPlain(t, address, "", target+"@"+masterUser, masterPass)
+			},
+			func(t *testing.T, address, target string) string {
+				return imapAuthPlain(t, address, "", target+"@"+masterUser, "wrong-"+masterPass)
+			}},
+		{"AUTHENTICATE_master_SASL",
+			func(t *testing.T, address, target string) string {
+				return imapAuthPlain(t, address, target, saslUser, saslPass)
+			},
+			nil},
+	}
+
+	for _, form := range forms {
+		t.Run(form.name, func(t *testing.T) {
+			rdb, outage := common.SetupTestDatabaseWithOutage(t)
+			account := common.CreateTestAccount(t, rdb)
+			address := common.GetRandomAddress(t)
+
+			srv, err := serverImap.New(context.Background(), "test-master-db-stall", "localhost", address,
+				&storage.S3Storage{}, rdb, nil, nil,
+				serverImap.IMAPServerOptions{
+					InsecureAuth:       true,
+					AuthRateLimit:      common.DBOutageAuthRateLimit(),
+					MasterUsername:     []byte(masterUser),
+					MasterPassword:     []byte(masterPass),
+					MasterSASLUsername: []byte(saslUser),
+					MasterSASLPassword: []byte(saslPass),
+				})
+			if err != nil {
+				t.Fatalf("Failed to create IMAP server: %v", err)
+			}
+			go func() { _ = srv.Serve(address) }()
+			t.Cleanup(func() { srv.Close() })
+			time.Sleep(100 * time.Millisecond)
+
+			outage.Stall()
+			// The first lookup may find its pooled connection dropped; the next ones stall.
+			var reply string
+			for i := 1; i <= 3; i++ {
+				reply = form.probe(t, address, account.Email)
+				if !strings.HasPrefix(reply, "A001 NO [UNAVAILABLE]") || strings.Contains(reply, "shutting down") {
+					t.Errorf("master login %d while the database stalls: %q, want A001 NO [UNAVAILABLE] that does not report a shutdown", i, reply)
+				}
+			}
+			if form.wrong != nil {
+				if wrong := form.wrong(t, address, account.Email); wrong != reply {
+					t.Errorf("while the database stalls, a wrong master password is answered %q and the master password %q: the reply confirms the master password", wrong, reply)
+				}
+			}
+			outage.End()
+
+			if reply := form.probe(t, address, account.Email); !strings.HasPrefix(reply, "A001 OK") {
+				t.Errorf("master login after the stall: %q, want A001 OK", reply)
+			}
+		})
+	}
+}

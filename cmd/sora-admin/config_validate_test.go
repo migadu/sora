@@ -168,6 +168,13 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 			wantErr: []string{"[FAIL] server 'imap-proxy':\n   remote_addrs is required unless the file declares [[pool]] blocks"},
 		},
 		{
+			// The issue's file: the proxy was built with "" as a backend (#1147).
+			name: "proxy with an empty remote_addrs entry",
+			content: imapProxy + "remote_addrs = [\"\"]\nremote_port = 143\n" +
+				"\n[server.remote_lookup]\nenabled = true\nurl = \"https://lookup.example.com/lookup?email=$email\"\n",
+			wantErr: []string{"[FAIL] server 'imap-proxy':\n   server \"imap-proxy\": remote_addrs #1: empty backend address"},
+		},
+		{
 			name:    "remote_lookup the proxies start with",
 			content: imapProxy + remoteLookup + "url = \"https://lookup.example.com/lookup?email=$email\"\ntimeout = \"5s\"\n",
 		},
@@ -211,6 +218,13 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 			name:    "mail backend without database and S3",
 			content: imapBackend,
 			wantErr: []string{`server "imap" (imap) needs the database`, "bucket is required"},
+		},
+		{
+			// Start-up opens no write pool and stops with "no healthy database pools
+			// available" (#1266).
+			name:    "managesieve with only [database.read] hosts",
+			content: "[database.read]\nhosts = [\"replica.example.com\"]\n\n[[server]]\ntype = \"managesieve\"\nname = \"managesieve\"\naddr = \"127.0.0.1:4190\"\n",
+			wantErr: []string{"[FAIL] [database.write]:\n   server \"managesieve\" (managesieve) needs the database, but [database.write] has no hosts"},
 		},
 		{
 			name:    "mail backend with an S3 timeout without a unit",

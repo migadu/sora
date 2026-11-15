@@ -423,7 +423,8 @@ var reloadableGlobalSettings = []string{
 // handleConfigReload reports the global settings next, the config a SIGHUP read,
 // changes from current, the running one, and leaves current as it is. Every one of
 // them takes effect on restart. Each server's [[server]] block is reloadServers' to
-// report, and its ReloadConfig's to apply.
+// apply. Whether a restart would start with next at all is this report's to say, for
+// the whole file, [[server]] blocks included.
 func handleConfigReload(current, next *config.Config) {
 	// Names only: values include passwords and keys.
 	if changed := current.RestartRequiredChanges(next, reloadableGlobalSettings); len(changed) > 0 {
@@ -431,25 +432,17 @@ func handleConfigReload(current, next *config.Config) {
 	}
 
 	// Every server and proxy takes trusted_networks at start-up: until a restart, the
-	// networks they started with stay trusted and added ones are not. A malformed entry
-	// is an error: the server would not start with this file.
-	if err := next.ValidateTrustedNetworks(); err != nil {
-		logger.Error("Config reload: servers.trusted_networks is invalid and the server will not start with this config; the networks the servers started with stay trusted", "error", err)
-	} else if !slices.Equal(next.Servers.TrustedNetworks, current.Servers.TrustedNetworks) {
+	// networks they started with stay trusted and added ones are not.
+	if !slices.Equal(next.Servers.TrustedNetworks, current.Servers.TrustedNetworks) {
 		logger.Warn("Config reload: servers.trusted_networks changed but requires restart to take effect; the networks the servers started with stay trusted until then",
 			"current", current.Servers.TrustedNetworks, "new", next.Servers.TrustedNetworks)
 	}
 
-	// The relay handler is built at start-up and keeps the [relay] it started with. One
-	// that start-up refuses is an error, not just a change: a restart would fail.
-	if err := next.Relay.Validate(); err != nil {
-		logger.Error("Config reload: [relay] is invalid and the server will not start with this config; the relay the server started with stays in use", "error", err)
-	}
-	// So is the relay worker with its [relay.queue] settings.
-	if next.Relay.IsQueueEnabled() {
-		if err := next.Relay.Queue.Validate(); err != nil {
-			logger.Error("Config reload: [relay.queue] is invalid and the server will not start with this config; the relay worker keeps the settings it started with", "error", err)
-		}
+	// A file start-up refuses is an error, not just a change: the restart the notices
+	// above ask for would fail. These are the checks start-up and `sora-admin config
+	// validate` run, and each problem is reported, as start-up reports them.
+	for _, p := range next.Validate() {
+		logger.Error("Config reload: "+p.Section+" is invalid and the server will not start with this config", "error", p.Err)
 	}
 }
 

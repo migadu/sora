@@ -723,6 +723,13 @@ Each message goes back to the mailbox it was expunged from. A mailbox that has s
 deleted is created again, with its parents. Restored messages get new UIDs, in their original
 arrival order per mailbox. Messages already restored or already purged are skipped.
 
+With `[shared_mailboxes]` enabled, a mailbox recreated in the shared namespace is a shared
+mailbox of the account, and so is a parent recreated there. Each one starts with owner-only
+rights: one entry, the owner's primary address with `default_rights`. The ACL entries it had
+before it was deleted are not restored, and a shared parent's entries are not copied as they
+are for a new folder ([SHARED_MAILBOXES.md](SHARED_MAILBOXES.md)). The server logs a warning
+naming it. Grant other users access again with `POST /admin/mailboxes/acl/grant` (section 12.1).
+
 The restore runs in chunks, each in its own transaction. Response `200`:
 
 ```json
