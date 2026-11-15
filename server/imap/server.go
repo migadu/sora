@@ -1381,12 +1381,20 @@ func (s *IMAPServer) warmupStatePath() string {
 	return filepath.Join(s.cache.GetBasePath(), fmt.Sprintf("%s.%x", warmupStateFile, sha256.Sum256([]byte(s.name))))
 }
 
+// keepsWarmupState reports whether this server has a cache directory to keep its
+// warmup state in. A cache without a base path (the zero-value cache.Cache test
+// fixtures pass; cache.New refuses an empty one) has none: a path joined onto the
+// empty base path names the working directory, which is no place for runtime state.
+func (s *IMAPServer) keepsWarmupState() bool {
+	return s.cache != nil && s.cache.GetBasePath() != ""
+}
+
 // persistWarmupState saves lastWarmupTimes to disk so that after restart,
 // users whose caches are still warm don't trigger unnecessary warmup storms.
 // Format: one line per entry, "accountID unixTimestamp\n"
 // Best-effort: errors are logged but don't affect shutdown.
 func (s *IMAPServer) persistWarmupState() {
-	if s.cache == nil {
+	if !s.keepsWarmupState() {
 		return
 	}
 
@@ -1443,7 +1451,7 @@ func (s *IMAPServer) loadWarmupState() {
 		}
 	}()
 
-	if s.cache == nil {
+	if !s.keepsWarmupState() {
 		return
 	}
 
@@ -1670,9 +1678,9 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 
 	logger.Debug("IMAP: Starting cache warmup", "name", s.name, "account_id", job.accountID, "message_count", job.messageCount, "mailboxes", job.mailboxNames)
 
-	// Get the bodies of the recent messages, each with the S3 key its message row was
-	// stored under. The key keeps the address that was primary when the body was stored,
-	// so it cannot be rebuilt from the account's current primary address.
+	// Get the bodies of the recent uploaded messages, each with the S3 key its message
+	// row was stored under. The key keeps the address that was primary when the body
+	// was stored, so it cannot be rebuilt from the account's current primary address.
 	messageBodies, err := s.rdb.GetRecentMessagesForWarmupWithRetry(warmupCtx, job.accountID, job.mailboxNames, job.messageCount)
 	if err != nil {
 		logger.Debug("IMAP: Failed to get recent messages for warmup", "name", s.name, "error", err)
@@ -1706,13 +1714,6 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 				metrics.WarmupOperationsTotal.WithLabelValues(s.name, "cancelled").Inc()
 				return
 			default:
-			}
-
-			// Skip messages with empty content hash (pending upload)
-			if contentHash == "" {
-				logger.Debug("IMAP: Warmup - skipping message with empty content hash", "name", s.name)
-				skippedCount++
-				continue
 			}
 
 			// Skip a body the cache refuses for its size before downloading it: Put would

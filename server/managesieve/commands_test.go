@@ -105,3 +105,56 @@ func TestHaveSpaceAdvisoryWithoutDB(t *testing.T) {
 		t.Errorf("HaveSpace without DB = %v, want nil (advisory)", err)
 	}
 }
+
+// Scripts containing NUL bytes or invalid UTF-8 must be rejected at validation time by
+// both CheckScript and PutScript as permanent uncoded NO validation errors rather than
+// answering OK on CHECKSCRIPT and hitting PostgreSQL SQLSTATE 22021 (NO (TRYLATER)) on
+// PUTSCRIPT.
+func TestCheckAndPutScriptRefuseNULAndInvalidUTF8(t *testing.T) {
+	addr, err := server.NewAddress("test@example.com")
+	if err != nil {
+		t.Fatalf("NewAddress failed: %v", err)
+	}
+	session := &ManageSieveSession{
+		Session:       server.Session{User: server.NewUser(addr, 123)},
+		authenticated: true,
+		ctx:           context.Background(),
+		server: &ManageSieveServer{
+			supportedExtensions: DefaultEnabledExtensions,
+		},
+	}
+	session.mutexHelper = server.NewMutexTimeoutHelper(&session.mutex, session.ctx, "MANAGESIEVE", func(string, ...any) {})
+
+	for _, tc := range []struct {
+		name   string
+		script string
+	}{
+		{"NUL in hash comment", "# \x00\r\nkeep;\r\n"},
+		{"NUL in bracket comment", "/* \x00 */\r\nkeep;\r\n"},
+		{"NUL in quoted string", "require \"fileinto\";\r\nfileinto \"Spam\x00\";\r\n"},
+		{"NUL in text block", "require \"vacation\";\r\nvacation text:\r\nout \x00\r\n.\r\n;\r\n"},
+		{"invalid UTF-8 in hash comment", "# \xff\r\nkeep;\r\n"},
+		{"invalid UTF-8 in quoted string", "require \"fileinto\";\r\nfileinto \"Spam\xff\";\r\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := session.CheckScript(context.Background(), tc.script)
+			var merr *managesieveserver.Error
+			if !errors.As(err, &merr) || merr.Code != "" || !strings.HasPrefix(merr.Message, `"Script validation failed:`) {
+				t.Errorf("CheckScript(%s) = %v, want uncoded validation *managesieveserver.Error", tc.name, err)
+			}
+
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Errorf("PutScript(%s) bypassed validation and touched nil rdb (%v)", tc.name, r)
+					}
+				}()
+				_, putErr := session.PutScript(context.Background(), "vacation", tc.script)
+				var putMerr *managesieveserver.Error
+				if !errors.As(putErr, &putMerr) || putMerr.Code != "" || !strings.HasPrefix(putMerr.Message, `"Script validation failed:`) {
+					t.Errorf("PutScript(%s) = %v, want uncoded validation *managesieveserver.Error", tc.name, putErr)
+				}
+			}()
+		})
+	}
+}

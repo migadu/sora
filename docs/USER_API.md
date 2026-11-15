@@ -411,7 +411,7 @@ right to read a message, the write and delete rights to change its flags.
 |---|---|---|
 | `limit` | `50` | Messages per page. At least 1. Values above 1000 are lowered to 1000. |
 | `offset` | `0` | How many to skip. |
-| `unseen` | `false` | `true`: only messages without `\Seen`. |
+| `unseen` | `false` | `true`: only messages without `\Seen`, including messages with no stored flags. |
 
 Newest arrival first (by `internal_date`).
 
@@ -556,10 +556,11 @@ its results, and all supplied filters must match:
 |---|---|
 | `from` | Literal substring of any sender's address or display name, ignoring case. |
 | `subject` | Literal substring of the subject, ignoring case. |
-| `unseen=true` | Only messages without `\\Seen`, including messages with no stored flags. |
+| `unseen=true` | Only messages without `\Seen`, including messages with no stored flags. |
 
 The text filters have no wildcard syntax. A `q`, `from` or `subject` containing a NUL or
-invalid UTF-8 is refused with `400 Bad Request`.
+invalid UTF-8 is refused with `400 Bad Request`, and so is one longer than 1000 bytes, the
+length IMAP `SEARCH` allows one search term ([SEARCH.md](SEARCH.md#9-limits)).
 
 Response `200`:
 
@@ -583,7 +584,7 @@ Response `200`:
 
 | Status | Body `error` |
 |---|---|
-| 400 | `Invalid mailbox name`, `Search query parameter 'q' is required`, `Search query parameter 'q' must be UTF-8 text without NUL`, `Search filters 'from' and 'subject' must be UTF-8 text without NUL` |
+| 400 | `Invalid mailbox name`, `Search query parameter 'q' is required`, `Search query parameter 'q' must be UTF-8 text without NUL`, `Search query parameter 'q' must be at most 1000 bytes`, `Search filters 'from' and 'subject' must be UTF-8 text without NUL`, `Search filters 'from' and 'subject' must be at most 1000 bytes each` |
 | 404 | `Mailbox not found` (also a shared mailbox without `r`) |
 | 500 | `Failed to search messages` |
 

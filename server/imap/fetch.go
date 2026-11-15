@@ -346,41 +346,16 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			return nil
 		}
 
+		var seenChanged map[imap.UID]bool
 		if markSeen {
-			var uidsToMarkSeen []imap.UID
-			for _, msg := range messages {
-				seen := false
-				systemFlags, _ := db.SplitFlags(db.BitwiseToFlags(msg.BitwiseFlags))
-				for _, flag := range systemFlags {
-					if flag == imap.FlagSeen {
-						seen = true
-						break
-					}
-				}
-				if !seen {
-					uidsToMarkSeen = append(uidsToMarkSeen, msg.UID)
-				}
-			}
-
+			uidsToMarkSeen := unseenMessageUIDs(messages)
 			if len(uidsToMarkSeen) > 0 {
-				_, err := s.server.rdb.AddMessageFlagsBatchWithRetry(ctx, uidsToMarkSeen, selectedMailboxID, []imap.Flag{imap.FlagSeen})
+				batchResults, err := s.server.rdb.AddMessageFlagsBatchWithRetry(ctx, uidsToMarkSeen, selectedMailboxID, []imap.Flag{imap.FlagSeen})
 				if err != nil {
 					s.DebugLog("failed to batch mark messages as seen", "error", err)
 				} else {
-					// Update in-memory models immediately so the fetch response has the flag
-					for i := range messages {
-						seen := false
-						flags := db.BitwiseToFlags(messages[i].BitwiseFlags)
-						for _, f := range flags {
-							if f == imap.FlagSeen {
-								seen = true
-								break
-							}
-						}
-						if !seen {
-							messages[i].BitwiseFlags = db.FlagsToBitwise(append(flags, imap.FlagSeen))
-						}
-					}
+					s.useMasterDB.Store(true)
+					seenChanged = applyImplicitSeenUpdates(messages, batchResults)
 				}
 			}
 		}
@@ -395,7 +370,8 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			if s.IMAPUser != nil {
 				metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
 			}
-			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID, preview); err != nil {
+			msgOptions := s.fetchOptionsForImplicitSeen(options, seenChanged[msg.UID])
+			if err := s.writeMessageFetchData(ctx, w, &msg, msgOptions, selectedMailboxID, preview); err != nil {
 				writeErr = err
 				return err
 			}

@@ -42,8 +42,15 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 		}
 	}
 
-	// If no patterns, just return a simple response without any database operations
+	// go-imap omits "" from patterns for both plain LIST ref "" and extended LIST
+	// with selection or return options. Per RFC 5258 §3 and RFC 9051 §6.3.9.1, an
+	// empty "" mailbox name argument has no special meaning when any selection or
+	// return options are specified and returns no LIST responses because there is
+	// no mailbox with an empty name.
 	if len(patterns) == 0 {
+		if hasListOptions(options) {
+			return nil
+		}
 		return w.WriteList(&imap.ListData{
 			Attrs: []imap.MailboxAttr{imap.MailboxAttrNoSelect},
 			Delim: consts.MailboxDelimiter,
@@ -233,6 +240,20 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 		}
 	}
 	return nil
+}
+
+// hasListOptions reports whether any LIST-EXTENDED selection or return option
+// is set on options. Empty option lists (() and RETURN ()) leave all fields
+// unset, which RFC 5258 §3 defines as equivalent to specifying no options.
+func hasListOptions(options *imap.ListOptions) bool {
+	if options == nil {
+		return false
+	}
+	return options.SelectSubscribed || options.SelectRemote ||
+		options.SelectRecursiveMatch || options.SelectSpecialUse ||
+		options.ReturnSubscribed || options.ReturnChildren ||
+		options.ReturnSpecialUse || options.ReturnStatus != nil ||
+		options.ReturnMetadata != nil
 }
 
 // matchesAnyPattern reports whether name matches any of the LIST patterns given

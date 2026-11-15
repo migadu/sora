@@ -492,14 +492,10 @@ func (db *Database) buildSortOrderClauseWithPrefix(sortCriteria []imap.SortCrite
 
 		orderClauses = append(orderClauses, fmt.Sprintf("%s %s", orderField, direction))
 	}
-	// Always include uid as the final sort criterion to ensure consistent ordering.
-	// We align the UID direction with the primary sort direction to allow PostgreSQL
-	// to use btree index scanning backwards instead of falling back to in-memory sorts.
-	uidDirection := "ASC"
-	if len(sortCriteria) > 0 && sortCriteria[0].Reverse {
-		uidDirection = "DESC"
-	}
-	orderClauses = append(orderClauses, fmt.Sprintf("%suid %s", colPrefix, uidDirection))
+	// The implicit last criterion is the sequence number, ascending, which UIDs follow:
+	// "REVERSE only reverses a single criterion, and does not affect the implicit
+	// "sequence number" sort criterion" (RFC 5256 §3).
+	orderClauses = append(orderClauses, colPrefix+"uid ASC")
 
 	return "ORDER BY " + strings.Join(orderClauses, ", ")
 }

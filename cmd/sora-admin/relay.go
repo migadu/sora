@@ -316,25 +316,10 @@ func handleRelayDelete(_ context.Context) {
 	queueDir := filepath.Join(cfg.Relay.GetQueuePath(), *queueType)
 
 	if *messageID == "all" {
-		// Delete all messages in the queue
-		entries, err := os.ReadDir(queueDir)
+		deleted, err := deleteAllMessagesInQueueDir(queueDir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error reading queue directory: %v\n", err)
 			os.Exit(1)
-		}
-
-		deleted := 0
-		for _, entry := range entries {
-			name := entry.Name()
-			if filepath.Ext(name) == ".json" || filepath.Ext(name) == ".msg" {
-				if err := os.Remove(filepath.Join(queueDir, name)); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: Could not delete %s: %v\n", name, err)
-				} else {
-					if filepath.Ext(name) == ".json" {
-						deleted++
-					}
-				}
-			}
 		}
 
 		fmt.Printf("Deleted %d messages from %s queue\n", deleted, *queueType)
@@ -361,6 +346,42 @@ func handleRelayDelete(_ context.Context) {
 
 		fmt.Printf("Deleted message %s from %s queue\n", *messageID, *queueType)
 	}
+}
+
+// deleteAllMessagesInQueueDir deletes every committed message (identified by its .json
+// metadata file) from queueDir, removing <id>.json before <id>.msg so a concurrent
+// worker never observes metadata without its body, while leaving uncommitted .held
+// redirects, scratch files, and unpaired .msg files untouched.
+func deleteAllMessagesInQueueDir(queueDir string) (int, error) {
+	entries, err := os.ReadDir(queueDir)
+	if err != nil {
+		return 0, err
+	}
+
+	deleted := 0
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		name := entry.Name()
+		id := strings.TrimSuffix(name, ".json")
+		metadataPath := filepath.Join(queueDir, name)
+		messagePath := filepath.Join(queueDir, id+".msg")
+
+		if err := os.Remove(metadataPath); err != nil {
+			// A worker may have claimed the metadata since ReadDir. Its body can
+			// still be here until the second rename; leave that body to the worker.
+			if !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "Warning: Could not delete %s: %v\n", name, err)
+			}
+			continue
+		}
+		if err := os.Remove(messagePath); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Warning: Could not delete %s: %v\n", id+".msg", err)
+		}
+		deleted++
+	}
+	return deleted, nil
 }
 
 func handleRelayRequeue(_ context.Context) {

@@ -613,8 +613,11 @@ components:
           example: "Meeting notes"
         MessageID:
           type: string
-          example: "<abc@example.com>"
-          description: "RFC822 Message-ID header"
+          example: "abc@example.com"
+          description: >-
+            The Message-ID header, without angle brackets. The empty string when the
+            message has no Message-ID that parses (the ID Sora stores for such a message
+            to detect duplicates is not its header and is never returned).
         InternalDate:
           type: string
           format: date-time

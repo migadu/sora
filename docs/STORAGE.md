@@ -494,9 +494,10 @@ Warmup preloads recent mail when a user logs in over IMAP, so that the first scr
 messages opens quickly.
 
 - With `enable_warmup = true` (the default), an IMAP login queues a warmup for the account.
-  It fetches the newest `warmup_message_count` messages (default 50) of each mailbox in
-  `warmup_mailboxes` (default `["INBOX"]`) from S3 into the cache, skipping bodies already
-  cached.
+  It fetches the newest `warmup_message_count` uploaded messages (default 50) of each mailbox
+  in `warmup_mailboxes` (default `["INBOX"]`) from S3 into the cache, skipping bodies already
+  cached. A message whose upload is still pending is not in S3 yet and is not counted; the
+  uploader moves its body into the cache of the node that stored it once it is uploaded.
 - One account is warmed at most once every `warmup_interval` (default 24 hours) per server.
   Each IMAP server saves the time of each warmup in its own `.sora_warmup_state.<server hash>`
   (the lowercase SHA-256 of its name) at shutdown and reads it back at startup, so a restart does not
@@ -969,9 +970,9 @@ An invalid duration or size in this section is logged as a warning and the defau
 |---|---|---|---|
 | `path` | string | `"/tmp/sora/uploads"` | Staging directory for bodies not yet in S3. Must be durable. |
 | `instance_id` | string | the hostname | The node's [instance ID](ARCHITECTURE.md#8-node-identity), the owner of its pending uploads. Unique per `sora` process, stable across restarts. |
-| `batch_size` | int | `10` | Pending rows taken per database query. Each body is still its own S3 request. |
-| `concurrency` | int | `20` | Uploads in flight at once. |
-| `max_attempts` | int | `20` | Content failures after which an upload is parked. |
+| `batch_size` | int | `10` | Pending rows taken per database query. Each body is still its own S3 request. Must be positive. |
+| `concurrency` | int | `20` | Uploads in flight at once. Must be positive. |
+| `max_attempts` | int | `20` | Content failures after which an upload is parked. Must be positive. |
 | `retry_interval` | duration | `"30s"` | How long a taken row waits before it can be taken again; also the first backoff pause. |
 | `cleanup_grace_period` | duration | `"1h"` | Minimum age of a staging file before the orphan sweep may remove it. Must be positive; an invalid value stops `sora`. |
 | `max_staging_size` | size | no limit | Most bytes this node may hold waiting for upload. An invalid value stops `sora`. |

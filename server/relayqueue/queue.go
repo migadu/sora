@@ -478,7 +478,10 @@ func (q *DiskQueue) Hold(from, to, messageType string, messageBytes []byte) (com
 		}
 
 		metadataPath := filepath.Join(q.pendingDir, id+".json")
-		err := os.Rename(heldPath, metadataPath)
+		_, err := os.Stat(messagePath)
+		if err == nil {
+			err = os.Rename(heldPath, metadataPath)
+		}
 		if err == nil {
 			// The rename must be durable before the caller acknowledges the delivery:
 			// for a redirect without :copy this message is the only copy.

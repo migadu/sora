@@ -657,9 +657,10 @@ type WarmupObject struct {
 }
 
 // GetRecentMessagesForWarmup fetches the most recent messages from specified mailboxes for cache warming.
-// Returns a map of mailboxName -> the bodies of up to messageCount of its most recent messages. Each
-// body is the S3 object its message row points at, under the address it was stored with, which is
-// not the account's primary address once that has changed.
+// Returns a map of mailboxName -> the bodies of up to messageCount of its most recent uploaded messages.
+// Each body is the S3 object its message row points at, under the address it was stored with, which is
+// not the account's primary address once that has changed. A message whose upload is still pending is
+// left out: its body is not in S3 yet, and the uploader moves it into its node's cache once uploaded.
 func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]WarmupObject, error) {
 	if messageCount <= 0 {
 		return make(map[string][]WarmupObject), nil
@@ -684,12 +685,12 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID in
 			continue // Skip this mailbox if not found
 		}
 
-		// The most recent messages by UID, which the (mailbox_id, uid) index returns in
-		// order, instead of sorting the mailbox by internal_date.
+		// The most recent uploaded messages by UID, which the (mailbox_id, uid) index
+		// returns in order, instead of sorting the mailbox by internal_date.
 		rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
 			SELECT s3_domain, s3_localpart, content_hash, size
 			FROM messages
-			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			WHERE mailbox_id = $1 AND expunged_at IS NULL AND uploaded = TRUE
 			ORDER BY uid DESC
 			LIMIT $2`, mailbox.ID, messageCount)
 		if err != nil {

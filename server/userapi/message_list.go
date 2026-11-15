@@ -2,6 +2,7 @@ package userapi
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -142,6 +143,12 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "Search query parameter 'q' must be UTF-8 text without NUL")
 		return
 	}
+	// Bounded as each IMAP SEARCH string is: every word of q is a term of the body's
+	// tsquery, whose database time grows with the square of the word count.
+	if len(searchQuery) > db.MaxSearchTermLength {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Search query parameter 'q' must be at most %d bytes", db.MaxSearchTermLength))
+		return
+	}
 
 	// The documented filters, each ANDed with q. unseen is parsed as in the list endpoint.
 	filter := db.UserAPISearchFilter{
@@ -151,6 +158,11 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validSearchText(filter.From) || !validSearchText(filter.Subject) {
 		s.writeError(w, http.StatusBadRequest, "Search filters 'from' and 'subject' must be UTF-8 text without NUL")
+		return
+	}
+	// Bounded as the values of IMAP SEARCH FROM and SUBJECT are.
+	if len(filter.From) > db.MaxSearchTermLength || len(filter.Subject) > db.MaxSearchTermLength {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Search filters 'from' and 'subject' must be at most %d bytes each", db.MaxSearchTermLength))
 		return
 	}
 
