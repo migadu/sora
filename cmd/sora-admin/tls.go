@@ -1319,8 +1319,15 @@ func takeOwner(f *os.File, old os.FileInfo) error {
 	if have, ok := info.Sys().(*syscall.Stat_t); ok && have.Uid == want.Uid && have.Gid == want.Gid {
 		return nil
 	}
-	return f.Chown(int(want.Uid), int(want.Gid))
+	return chownFile(f, int(want.Uid), int(want.Gid))
 }
+
+// geteuid is os.Geteuid and chownFile (*os.File).Chown. Only root can give a file to
+// another user, so tests replace them to reach that path and record the hand-over.
+var (
+	geteuid   = os.Geteuid
+	chownFile = (*os.File).Chown
+)
 
 func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, specificDomain string, force bool) error {
 	// Initialize S3 storage
