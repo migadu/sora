@@ -737,12 +737,13 @@ With `remote_use_xclient`, the POP3 proxy sends `XCLIENT ADDR=... PORT=... SESSI
 FORWARD=...` before it logs in; the LMTP proxy sends `XCLIENT ADDR=... PORT=... HELO=...
 PROTO=ESMTP` (IPv6 addresses as `ADDR=IPV6:...`) before `MAIL FROM`.
 
-A refusal (POP3 `-ERR`, LMTP `5xx`) is logged and the session continues without the client's
-address. When the reply is not read within `connect_timeout` (for an LMTP backend that answers with
-a new `220` greeting, also the reply to the `LHLO` the proxy then sends), the backend connection
-fails: POP3 answers `-ERR [SYS/TEMP]`, LMTP `451 4.4.1`. A late reply would otherwise be read as
-the reply to the next command (POP3 replies carry no tag, so a late `+OK` would pass for the
-login's).
+A refusal (POP3 `-ERR`; LMTP `5xx`, or `4xx` other than `421`) is logged and the session continues
+without the client's address. When the reply is not read within `connect_timeout` (for an LMTP
+backend that answers with a new `220` greeting, also the reply to the `LHLO` the proxy then sends),
+the backend connection fails: POP3 answers `-ERR [SYS/TEMP]`, LMTP `451 4.4.1`. A late reply would
+otherwise be read as the reply to the next command (POP3 replies carry no tag, so a late `+OK` would
+pass for the login's). The LMTP connection also fails on a `421`, on a malformed reply or one with
+any other code, and when the backend does not answer that `LHLO` with `250`.
 
 ### 8.7 POP3 UTF8
 
