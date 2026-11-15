@@ -48,6 +48,10 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	decodedNumSet := s.decodeNumSetLocked(view, numSet)
 	release()
 
+	if imapErr := s.sharedRootDestinationRefusal("COPY", mboxName); imapErr != nil {
+		return nil, imapErr
+	}
+
 	// Middle phase: Database operations outside lock
 	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, mboxName)
 	if err != nil {
