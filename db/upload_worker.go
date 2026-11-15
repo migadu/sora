@@ -658,23 +658,28 @@ func (db *Database) GetStrandedUploadInstances(ctx context.Context, maxAttempts 
 // no longer the tool's: it is deleted only while it is still parked (attempts at least
 // maxAttempts) and nobody holds a live lease on it, and the message rows go only with it.
 // Otherwise nothing is deleted and 0 is returned.
+//
+// The message rows may be live in several mailboxes. Those are locked before the pending
+// row, the order a delivery takes them in, and the rows are expunged before they are
+// deleted, so that they leave unseen_count (see notLiveInMailbox).
 func (d *Database) DeleteFailedUpload(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64, maxAttempts int) (int64, error) {
-	var deleted int64
-	err := tx.QueryRow(ctx, `
-		WITH deleted_pending AS (
-			DELETE FROM pending_uploads
-			WHERE content_hash = $1 AND account_id = $2 AND attempts >= $3
-			  AND (lease_until IS NULL OR lease_until < now())
-			RETURNING id
-		),
-		deleted_messages AS (
-			DELETE FROM messages
-			WHERE content_hash = $1 AND account_id = $2 AND uploaded = FALSE
-			  AND EXISTS (SELECT 1 FROM deleted_pending)
-			RETURNING id
-		)
-		SELECT count(*) FROM deleted_messages
-	`, contentHash, accountID, maxAttempts).Scan(&deleted)
+	const lost = `m.content_hash = $1 AND m.account_id = $2 AND m.uploaded = FALSE`
+	locked, err := lockLiveMessageMailboxes(ctx, tx, lost, contentHash, accountID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete failed upload (hash=%s, account=%d): %w", contentHash, accountID, err)
+	}
+	tag, err := tx.Exec(ctx, `
+		DELETE FROM pending_uploads
+		WHERE content_hash = $1 AND account_id = $2 AND attempts >= $3
+		  AND (lease_until IS NULL OR lease_until < now())
+	`, contentHash, accountID, maxAttempts)
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete failed upload (hash=%s, account=%d): %w", contentHash, accountID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return 0, nil
+	}
+	deleted, err := hardDeleteMessages(ctx, tx, locked, lost, contentHash, accountID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to delete failed upload (hash=%s, account=%d): %w", contentHash, accountID, err)
 	}
