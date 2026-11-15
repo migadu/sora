@@ -123,6 +123,15 @@ func openAndValidate(path, params string) (*sql.DB, error) {
 	if err := sqlitefile.Prepare(path, params); err != nil {
 		return nil, err
 	}
+	// SQLite creates the -wal and -shm files with the database file's mode, but reuses
+	// the ones a process that exited with the database open left behind, with the mode
+	// they have: a 0644 WAL from before the database was 0600 would keep receiving the
+	// affinities.
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if err := os.Chmod(path+suffix, 0600); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("failed to enforce 0600 permissions on %s: %w", path+suffix, err)
+		}
+	}
 	// Open that same file: a plain path would be cut at its first '?'.
 	if params != "" {
 		params += "&"
