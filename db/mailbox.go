@@ -28,6 +28,12 @@ type DBMailbox struct {
 	SpecialUse  string // RFC 6154 special-use attribute (e.g. "\Sent"); empty if none
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+
+	// NameKey is LOWER(name) as the database computes it: the mailbox's identity
+	// (unique per owner, migration 000041). lower() depends on the collation, and
+	// no Go case mapping matches it, so names are compared by this key. Set by
+	// GetMailboxes.
+	NameKey string
 }
 
 func NewDBMailbox(mboxId int64, name string, uidValidity uint32, path string, subscribed, hasChildren bool, createdAt, updatedAt time.Time) DBMailbox {
@@ -95,7 +101,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			ORDER BY LOWER(name), priority, id
 		)
 		SELECT
-			m.id, m.name, m.uid_validity, m.path,
+			m.id, m.name, LOWER(m.name), m.uid_validity, m.path,
 			-- Subscription state from the name-based subscriptions table (migration
 			-- 000046) via a LEFT JOIN: the planner hashes this account's (small)
 			-- subscription set once and probes per mailbox, instead of running a
@@ -137,7 +143,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 		var mailbox DBMailbox
 		var uidValidityInt64 int64
 
-		if err := rows.Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID, &mailbox.HasChildren); err != nil {
+		if err := rows.Scan(&mailbox.ID, &mailbox.Name, &mailbox.NameKey, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID, &mailbox.HasChildren); err != nil {
 			return nil, err
 		}
 
@@ -1271,6 +1277,24 @@ func (db *Database) RenameCrossesSharedBoundary(ctx context.Context, shared conf
 	return crossSharedBoundary(rows, &shared)
 }
 
+// isInboxMailboxName reports whether stored, a mailbox name resolved from the database,
+// is "INBOX" in any case of its ASCII letters.
+func isInboxMailboxName(stored string) bool {
+	if len(stored) != len(consts.MailboxInbox) {
+		return false
+	}
+	for i := 0; i < len(stored); i++ {
+		c := stored[i]
+		if 'a' <= c && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if c != consts.MailboxInbox[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64) error {
 	// The same names createMailbox refuses: control characters, empty levels and
 	// "." / ".." levels (maildir-export path traversal).
@@ -1282,16 +1306,20 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// Check if user has admin permission (ACL 'a' right) for shared mailboxes
 	// For personal mailboxes, ownership is sufficient
 	var isShared bool
+	var currentName string
 	err := tx.QueryRow(ctx, `
-		SELECT COALESCE(is_shared, FALSE)
+		SELECT COALESCE(is_shared, FALSE), name
 		FROM mailboxes
 		WHERE id = $1 AND (account_id = $2 OR COALESCE(is_shared, FALSE) = TRUE) AND deleted_at IS NULL
-	`, mailboxID, AccountID).Scan(&isShared)
+	`, mailboxID, AccountID).Scan(&isShared, &currentName)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return consts.ErrMailboxNotFound
 		}
 		return fmt.Errorf("failed to fetch mailbox for rename: %w", err)
+	}
+	if !isShared && isInboxMailboxName(currentName) {
+		return fmt.Errorf("cannot rename INBOX: %w", consts.ErrNotPermitted)
 	}
 
 	// Whether a mailbox is shared (is_shared, owner_domain, its ACL) is settled when
@@ -1345,6 +1373,9 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		}
 		logger.Error("Database: failed to fetch and lock mailbox to rename", "mailbox_id", mailboxID, "err", err)
 		return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
+	}
+	if !isShared && isInboxMailboxName(oldName) {
+		return fmt.Errorf("cannot rename INBOX: %w", consts.ErrNotPermitted)
 	}
 
 	// Validate mailbox path is not empty (data corruption check)

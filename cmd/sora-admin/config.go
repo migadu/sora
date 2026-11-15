@@ -115,11 +115,8 @@ func handleConfigValidate(_ context.Context) {
 		os.Exit(1)
 	}
 
-	// The warnings start-up logs about [sieve] enabled_extensions (and a managesieve_proxy's
-	// supported_extensions) the engine does not support, [servers] trusted_networks that
-	// include a whole private range, [[server]] keys a server type does not apply, and an
-	// imap or pop3 session_memory_limit below an lmtp max_message_size. They do not fail
-	// the file.
+	// Keep the Sieve capability diagnostics beside the engine's resolver. The other
+	// collected configuration warnings are returned by Config.Warnings.
 	if invalid := sieveengine.InvalidExtensions(cfg.Sieve.EnabledExtensions); len(invalid) > 0 {
 		fmt.Printf("[WARN] [sieve] enabled_extensions names extensions the engine does not support: %s; "+
 			"they are ignored, and the default set is used if none remain (effective: %s)\n",
@@ -131,11 +128,11 @@ func handleConfigValidate(_ context.Context) {
 			"Narrow trusted_networks to your actual proxy IPs; use auth_rate_limit.exempt_networks to scope " +
 			"rate-limit exemption separately\n")
 	}
+	for _, w := range cfg.Warnings() {
+		fmt.Printf("[WARN] %s\n", w)
+	}
 	allServers := cfg.GetAllServers()
 	for _, server := range allServers {
-		server.WarnUnusedConfigOptions(func(format string, args ...any) {
-			fmt.Printf("[WARN] %s\n", strings.TrimPrefix(fmt.Sprintf(format, args...), "WARNING: "))
-		})
 		if server.Type != "managesieve_proxy" {
 			continue
 		}
@@ -146,13 +143,6 @@ func handleConfigValidate(_ context.Context) {
 				strings.Join(sieveengine.EffectiveExtensions(server.SupportedExtensions), ", "))
 		}
 	}
-	for _, s := range cfg.SessionMemoryShortfalls() {
-		fmt.Printf("[WARN] Server %s (type: %s) has session_memory_limit %d bytes, below max_message_size %d bytes of lmtp server %s: "+
-			"a delivered message larger than session_memory_limit is stored, but this server can never fetch it (IMAP NO [LIMIT], POP3 -ERR [SYS/PERM]); "+
-			"sora-admin imports are bounded by [admin_cli] import_message_limit instead\n",
-			s.Server, s.Type, s.SessionMemoryLimit, s.MaxMessageSize, s.LMTPServer)
-	}
-
 	fmt.Printf("[OK] Configuration is valid!\n")
 	if len(allServers) > 0 {
 		fmt.Printf("\nConfigured servers:\n")
@@ -299,11 +289,29 @@ Description:
         to S3 (a mail backend, or the User API when [s3] has an endpoint,
         bucket or keys)
       [cluster] and [tls] when enabled
-  - Warning, as start-up does, about [sieve] enabled_extensions and a
-    managesieve_proxy's supported_extensions the engine does not support,
-    [servers] trusted_networks that include a whole private range (such as
-    10.0.0.0/8), [[server]] keys the server type does not use, and an imap
-    or pop3 session_memory_limit below the largest lmtp max_message_size
+  - Warning, as start-up does, about settings that do not do on this node
+    what they say:
+      [sieve] enabled_extensions and managesieve_proxy supported_extensions
+        the engine does not support, and broad [servers] trusted_networks
+      [[server]] keys the server type does not use
+      an imap or pop3 session_memory_limit below the largest lmtp
+        max_message_size
+      enable_affinity without [cluster] and [cluster.affinity], and per-user
+        proxy connection limits without [cluster]
+      a User API without [s3], an Admin API without an imap, pop3 or lmtp
+        server (no upload worker), and proxies without a database (backend
+        maintenance)
+      a [relay] in plaintext or without certificate verification
+      values start-up cannot parse and replaces with the default: the
+        [[server]] sizes, timeouts and durations (with [server.limits],
+        [server.timeouts] and [server.lookup_cache]) of each server that
+        reads them, and the [cluster.affinity], [backend_maintenance],
+        [relay.queue], [local_cache], [cleanup], [uploader], [auth_cache] and
+        [database] durations and sizes of a node that reads them
+      a [spam_training] value start-up cannot parse, which leaves spam
+        training out, and a max_message_size above the largest message Sora
+        can store
+
 
   It connects to nothing and does not look at the node's disk, so it does
   not check connectivity. When services start, Sora connects to the database

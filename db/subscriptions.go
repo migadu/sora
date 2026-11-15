@@ -91,6 +91,33 @@ func (db *Database) GetSubscribedMailboxNames(ctx context.Context, accountID int
 	return names, nil
 }
 
+// GetSubscribedMailboxNamesByKey returns every subscribed name for the account,
+// keyed by LOWER(mailbox_name) as the database computes it, the key a
+// subscription matches a mailbox by (DBMailbox.NameKey). Like
+// GetSubscribedMailboxNames it includes names with no mailbox.
+func (db *Database) GetSubscribedMailboxNamesByKey(ctx context.Context, accountID int64) (map[string]string, error) {
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+		SELECT LOWER(mailbox_name), mailbox_name FROM subscriptions WHERE account_id = $1
+	`, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list subscriptions: %w", err)
+	}
+	defer rows.Close()
+
+	names := make(map[string]string)
+	for rows.Next() {
+		var key, name string
+		if err := rows.Scan(&key, &name); err != nil {
+			return nil, fmt.Errorf("failed to scan subscription: %w", err)
+		}
+		names[key] = name
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating subscriptions: %w", err)
+	}
+	return names, nil
+}
+
 // RenameSubscriptions moves a subscription and all of its descendants from
 // oldName to newName when a mailbox is renamed, so the subscription follows the
 // rename (e.g. renaming "A" → "B" turns a subscription "A/x" into "B/x"). Any
