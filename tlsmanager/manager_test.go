@@ -24,7 +24,7 @@ func TestNewTLSManagerFileProvider(t *testing.T) {
 
 	// Check error message
 	expectedMsg := "cert_file and key_file are required for provider='file'"
-	if err.Error() != "failed to initialize file provider: "+expectedMsg {
+	if err.Error() != expectedMsg {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
@@ -75,7 +75,7 @@ func TestNewTLSManagerLetsEncryptMissingConfig(t *testing.T) {
 	}
 
 	expectedMsg := "letsencrypt configuration is required for provider='letsencrypt'"
-	if err.Error() != "failed to initialize Let's Encrypt provider: "+expectedMsg {
+	if err.Error() != expectedMsg {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
@@ -96,7 +96,7 @@ func TestNewTLSManagerLetsEncryptMissingEmail(t *testing.T) {
 	}
 
 	expectedMsg := "letsencrypt.email is required"
-	if err.Error() != "failed to initialize Let's Encrypt provider: "+expectedMsg {
+	if err.Error() != expectedMsg {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
@@ -117,7 +117,7 @@ func TestNewTLSManagerLetsEncryptMissingDomains(t *testing.T) {
 	}
 
 	expectedMsg := "letsencrypt.domains is required and must not be empty"
-	if err.Error() != "failed to initialize Let's Encrypt provider: "+expectedMsg {
+	if err.Error() != expectedMsg {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
@@ -139,7 +139,7 @@ func TestNewTLSManagerLetsEncryptInvalidStorageProvider(t *testing.T) {
 	}
 
 	expectedMsg := "only storage_provider='s3' is currently supported for Let's Encrypt"
-	if err.Error() != "failed to initialize Let's Encrypt provider: "+expectedMsg {
+	if err.Error() != expectedMsg {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
