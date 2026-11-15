@@ -13,9 +13,9 @@ import (
 	"github.com/migadu/sora/server"
 )
 
-// startPlainSession runs a session of a plain-text proxy whose max_message_size is
+// startSizeDeclarationSession runs a session of a plain-text proxy whose max_message_size is
 // maxSize over a pipe and returns the client end with the greeting read.
-func startPlainSession(t *testing.T, maxSize int64) (net.Conn, *bufio.Reader) {
+func startSizeDeclarationSession(t *testing.T, maxSize int64) (net.Conn, *bufio.Reader) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -55,7 +55,7 @@ func startPlainSession(t *testing.T, maxSize int64) (net.Conn, *bufio.Reader) {
 // refusal comes before RCPT, so the MTA never sends the body. A declaration at or under
 // the limit, or with no SIZE, is accepted, and so is a value that is no number, as before.
 func TestMAILRefusesDeclaredSizeOverTheAdvertisedLimit(t *testing.T) {
-	conn, r := startPlainSession(t, 1024)
+	conn, r := startSizeDeclarationSession(t, 1024)
 	io.WriteString(conn, "LHLO client.example.org\r\n")
 	var lhlo []string
 	for {
@@ -105,7 +105,7 @@ func TestMAILRefusesDeclaredSizeOverTheAdvertisedLimit(t *testing.T) {
 // With no limit (max_message_size = 0) the proxy advertises no SIZE and refuses no
 // declaration.
 func TestMAILWithoutLimitAcceptsAnyDeclaredSize(t *testing.T) {
-	conn, r := startPlainSession(t, 0)
+	conn, r := startSizeDeclarationSession(t, 0)
 	io.WriteString(conn, "MAIL FROM:<a@example.org> SIZE=104857600\r\n")
 	if got := readReply(t, r); !strings.HasPrefix(got, "250 ") {
 		t.Errorf("MAIL with SIZE and no limit: %q, want 250", got)
