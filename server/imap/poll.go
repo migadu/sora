@@ -380,7 +380,9 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		}
 	}
 
-	// Process message flag updates
+	// Process message flag updates. The NOTIFY event list is stable during
+	// this poll; take its pointer lock once rather than for every message.
+	flagsFiltered := s.notifySelectedFlagsFiltered()
 	for _, update := range poll.Updates {
 		if update.IsExpunge {
 			continue
@@ -389,6 +391,13 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		// Already answered by this session's own STORE or FETCH.
 		if modSeq, ok := s.ownStoreEcho[update.UID]; ok && modSeq == update.EffectiveModSeq && s.ownStoreEchoMailboxID == mailboxID {
 			continue
+		}
+		// NOTIFY may discard this update instead of writing it. An empty
+		// tracker then does not mean every change through the cursor was
+		// reported: keep the preceding safe watermark for this selection,
+		// even if the client enables FlagChange again later.
+		if flagsFiltered {
+			s.reportedModSeqGap.Store(true)
 		}
 
 		allFlags := db.BitwiseToFlags(update.BitwiseFlags)
@@ -432,9 +441,10 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		return err
 	}
 	// Every change up to the cursor has been queued, by this poll or an earlier
-	// one, so once nothing is left queued all of them have been sent. Polls run
-	// one at a time (seqViewMu) and the cursor never moves back.
-	if sessionTracker.QueuedUpdates() == 0 {
+	// one. Once nothing is left queued, and no NOTIFY filter consumed a flag
+	// change without reporting it, all of them have been sent. Polls run one
+	// at a time (seqViewMu) and the cursor never moves back.
+	if sessionTracker.QueuedUpdates() == 0 && !s.reportedModSeqGap.Load() {
 		s.reportedHighestModSeq.Store(cursor)
 	}
 	return nil
@@ -447,7 +457,9 @@ var _ imapserver.SessionHighestModSeq = (*IMAPSession)(nil)
 // §3.1). The poll cursor is not it: it also covers what a FETCH, STORE or SEARCH
 // left queued, an EXPUNGE they may not send and whatever follows it, and the
 // client adopts the value "even if it has seen higher mod-sequences" (RFC 7162
-// §6), so it would skip those changes if it resynchronized from it.
+// §6), so it would skip those changes if it resynchronized from it. A flag
+// change consumed under a NOTIFY filter also holds this value back until a
+// new SELECT: changing the filter does not replay the consumed flag update.
 func (s *IMAPSession) HighestModSeq() uint64 {
 	return s.reportedHighestModSeq.Load()
 }

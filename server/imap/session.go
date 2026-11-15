@@ -63,6 +63,10 @@ type IMAPSession struct {
 	// SELECT's value, then the cursor of the last poll that left nothing
 	// queued.
 	reportedHighestModSeq atomic.Uint64
+	// A NOTIFY filter can consume a flag change without sending it. The
+	// report then stays conservative until SELECT establishes a new baseline;
+	// enabling FlagChange again does not replay the consumed change.
+	reportedModSeqGap atomic.Bool
 
 	lastSelectedMailboxID int64
 	lastHighestUID        imap.UID
@@ -570,6 +574,7 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.sessionTracker = nil
 	s.currentHighestModSeq.Store(0)
 	s.reportedHighestModSeq.Store(0)
+	s.reportedModSeqGap.Store(false)
 	s.currentNumMessages.Store(0)
 	s.firstUnseenSeqNum.Store(0)
 	s.savedSearchUIDs = nil // saved "$" result is scoped to the selected mailbox
