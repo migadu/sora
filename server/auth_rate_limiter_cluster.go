@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/migadu/sora/cluster"
@@ -86,6 +87,9 @@ type ClusterRateLimiter struct {
 	// The cluster limiters of the protocol on this node, this one included:
 	// no gossip about this one's events reaches them
 	node *nodeRateLimiters
+
+	stopOnce sync.Once
+	stopped  atomic.Bool
 
 	// Configuration
 	syncBlocks        bool
@@ -226,6 +230,9 @@ func (crl *ClusterRateLimiter) BroadcastUsernameSuccess(username string) {
 // to every other node's. The caller holds none of the limiter's locks: another
 // limiter of the protocol on this node may be handing it an event of its own.
 func (crl *ClusterRateLimiter) queueEvent(event RateLimitEvent) {
+	if crl == nil || crl.stopped.Load() {
+		return
+	}
 	if event.EventID == "" {
 		event.EventID = idgen.New()
 	}
@@ -260,6 +267,9 @@ func (crl *ClusterRateLimiter) GetBroadcasts(overhead, limit int) [][]byte {
 
 // HandleClusterEvent processes a rate limit event from another node
 func (crl *ClusterRateLimiter) HandleClusterEvent(data []byte) {
+	if crl == nil || crl.stopped.Load() {
+		return
+	}
 	event, err := decodeRateLimitEvent(data)
 	if err != nil {
 		logger.Warn("Cluster limiter: Failed to decode rate limit event", "error", err)
@@ -304,6 +314,9 @@ func (crl *ClusterRateLimiter) HandleClusterEvent(data []byte) {
 // apply applies an event another limiter of the protocol recorded, on another
 // node or on this one.
 func (crl *ClusterRateLimiter) apply(event RateLimitEvent) {
+	if crl == nil || crl.stopped.Load() {
+		return
+	}
 	switch event.Type {
 	case RateLimitEventBlockIP:
 		crl.handleBlockIP(event)
@@ -565,6 +578,27 @@ func (n *nodeRateLimiters) join(crl *ClusterRateLimiter) {
 	n.limiters = append(n.limiters, crl)
 }
 
+func (n *nodeRateLimiters) leave(target *ClusterRateLimiter) {
+	if n == nil || target == nil {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	remaining := make([]*ClusterRateLimiter, 0, len(n.limiters))
+	removed := false
+	for _, crl := range n.limiters {
+		if crl == target {
+			removed = true
+			continue
+		}
+		remaining = append(remaining, crl)
+	}
+	if removed {
+		n.limiters = remaining
+	}
+}
+
 // deliver applies event, recorded by from, to the node's other limiters of the
 // protocol. Delivery is direct and happens once, so it needs neither the
 // duplicate suppression nor the staleness check of gossip.
@@ -580,9 +614,19 @@ func (n *nodeRateLimiters) deliver(from *ClusterRateLimiter, event RateLimitEven
 	}
 }
 
-// Stop releases the cluster rate limiter. It owns no goroutine - memberlist
-// drives the queue - but callers shut it down alongside the other components.
-func (crl *ClusterRateLimiter) Stop() {}
+// Stop detaches the cluster rate limiter from the node's sibling group and
+// stops applying events. It is safe to call multiple times.
+func (crl *ClusterRateLimiter) Stop() {
+	if crl == nil {
+		return
+	}
+	crl.stopOnce.Do(func() {
+		crl.stopped.Store(true)
+		if crl.node != nil {
+			crl.node.leave(crl)
+		}
+	})
+}
 
 // encodeRateLimitEvent encodes an event to bytes using gob
 func encodeRateLimitEvent(event RateLimitEvent) ([]byte, error) {

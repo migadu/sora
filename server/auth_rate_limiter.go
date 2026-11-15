@@ -128,6 +128,7 @@ type AuthRateLimiter struct {
 	clusterLimiter *ClusterRateLimiter
 
 	stopCleanup chan struct{}
+	stopOnce    sync.Once
 
 	// Cleanup counter for periodic memory reporting
 	cleanupCounter uint64
@@ -1063,7 +1064,12 @@ func (a *AuthRateLimiter) Stop() {
 	if a == nil {
 		return
 	}
-	close(a.stopCleanup)
+	a.stopOnce.Do(func() {
+		close(a.stopCleanup)
+	})
+	if a.clusterLimiter != nil {
+		a.clusterLimiter.Stop()
+	}
 }
 
 // addIPUsernameCounter stores info as the failure counter of key.
