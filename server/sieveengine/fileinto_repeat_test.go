@@ -2,7 +2,7 @@ package sieveengine
 
 import (
 	"context"
-	"slices"
+	"reflect"
 	"testing"
 )
 
@@ -77,7 +77,7 @@ func TestRepeatedFileintoTarget(t *testing.T) {
 			if err != nil {
 				t.Fatalf("evaluate: %v", err)
 			}
-			if got := result.Destinations(false); !slices.Equal(got, tt.want) {
+			if got := result.Destinations(false); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Destinations = %v, want %v (Mailboxes %v, CreateMailboxes %v, Copy %v)",
 					got, tt.want, result.Mailboxes, result.CreateMailboxes, result.Copy)
 			}
