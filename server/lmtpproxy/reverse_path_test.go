@@ -19,6 +19,10 @@ func TestUnreadableReversePathRefused(t *testing.T) {
 		{"one character", "x"},
 		{"quoted local part with space", `<"john doe"@example.org>`},
 		{"spaces inside brackets", "< a@example.org >"},
+		// Not "<>": a quoted string is a local part (section 4.1.2), and this one has
+		// no domain. A sora backend answers it as the other cases here.
+		{"quoted null path", `"<>"`},
+		{"quoted null path after a space", ` "<>"`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			backend := startNestedMailBackend(t)
