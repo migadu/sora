@@ -394,7 +394,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 
 	mailboxIDMap := make(map[string]int64)
 	for _, mailboxName := range names {
-		mailboxID, _, _, err := restoreMailbox(ctx, tx, accountID, mailboxName, false)
+		mailboxID, _, err := restoreMailbox(ctx, tx, accountID, mailboxName, false)
 		if err != nil {
 			return 0, err
 		}
@@ -510,52 +510,53 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	return restoredCount, nil
 }
 
-// restoreMailbox returns the id, path and is_shared of the live mailbox called name,
-// recreating it if it was deleted — linked under its parent, which is itself recreated
-// first if it is gone too. A recreated "Parent/Child" used to land at the root: the name
+// restoreMailbox returns the id and path of the live mailbox called name, recreating it
+// if it was deleted — linked under its parent, which is itself recreated first if it is
+// gone too. A recreated "Parent/Child" used to land at the root: the name
 // still showed the hierarchy in LIST, but the tree is path-based, so the parent lost
 // \HasChildren, RENAME of the parent stopped carrying the child, and a later DELETE of
 // the parent succeeded and stranded it.
 //
 // A name in the shared namespace of the [shared_mailboxes] config in ctx is recreated as
-// a shared mailbox of the account, with the initial ACL createMailbox gives a new one.
-// Recreated personal, it sat in the shared namespace where SETACL refuses to share it.
-// The entries the deleted mailbox had went with it and are not restored.
+// a shared mailbox of the account. Recreated personal, it sat in the shared namespace
+// where SETACL refuses to share it. The entries the deleted mailbox had went with it and
+// are not restored. Nor does it copy a live shared parent's entries, as CREATE does for
+// a new, empty mailbox (RFC 4314 section 4): a restore brings messages back, and the
+// parent may grant users that the deleted mailbox no longer did. Each level recreated
+// gets one entry, the owner's primary address with default_rights; an admin grants
+// other users access again.
 //
 // asParent takes FOR KEY SHARE on an existing mailbox that is about to receive a
 // recreated child — the same lock createMailbox takes — so the parent cannot be
 // soft-deleted underneath the child (see SoftDeleteMailbox).
-func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string, asParent bool) (int64, string, bool, error) {
-	lookup := `SELECT id, path, COALESCE(is_shared, FALSE) FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL`
+func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string, asParent bool) (int64, string, error) {
+	lookup := `SELECT id, path FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL`
 	if asParent {
 		lookup += ` FOR KEY SHARE`
 	}
 	var mailboxID int64
 	var path string
-	var isShared bool
-	err := tx.QueryRow(ctx, lookup, accountID, name).Scan(&mailboxID, &path, &isShared)
+	err := tx.QueryRow(ctx, lookup, accountID, name).Scan(&mailboxID, &path)
 	if err == nil {
-		return mailboxID, path, isShared, nil
+		return mailboxID, path, nil
 	}
 	if err != pgx.ErrNoRows {
-		return 0, "", false, fmt.Errorf("failed to check mailbox %s: %w", name, err)
+		return 0, "", fmt.Errorf("failed to check mailbox %s: %w", name, err)
 	}
 
 	// Gone: recreate its parent first, so this one can be linked under it.
-	var parentID int64
 	var parentPath string
-	var parentIsShared bool
 	if i := strings.LastIndex(name, string(consts.MailboxDelimiter)); i > 0 {
-		if parentID, parentPath, parentIsShared, err = restoreMailbox(ctx, tx, accountID, name[:i], true); err != nil {
-			return 0, "", false, err
+		if _, parentPath, err = restoreMailbox(ctx, tx, accountID, name[:i], true); err != nil {
+			return 0, "", err
 		}
 	}
 
 	ownerDomain, err := newMailboxOwnerDomain(ctx, tx, accountID, name)
 	if err != nil {
-		return 0, "", false, err
+		return 0, "", err
 	}
-	isShared = ownerDomain != nil
+	isShared := ownerDomain != nil
 
 	// Re-seed the RFC 6154 special-use attribute for a canonical top-level default name
 	// (consistent with CreateDefaultMailboxes / migration 000045), but ONLY if the
@@ -583,32 +584,29 @@ func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string
 	`, accountID, name, isShared, ownerDomain).Scan(&mailboxID)
 	if err == pgx.ErrNoRows {
 		// Concurrent recreate won the race; use its row as it is.
-		err = tx.QueryRow(ctx, lookup, accountID, name).Scan(&mailboxID, &path, &isShared)
+		err = tx.QueryRow(ctx, lookup, accountID, name).Scan(&mailboxID, &path)
 		if err != nil {
-			return 0, "", false, fmt.Errorf("failed to create mailbox %s: %w", name, err)
+			return 0, "", fmt.Errorf("failed to create mailbox %s: %w", name, err)
 		}
-		return mailboxID, path, isShared, nil
+		return mailboxID, path, nil
 	}
 	if err != nil {
-		return 0, "", false, fmt.Errorf("failed to create mailbox %s: %w", name, err)
+		return 0, "", fmt.Errorf("failed to create mailbox %s: %w", name, err)
 	}
 
 	// The path needs the id, so it is set once the row exists.
 	path = helpers.GetMailboxPath(parentPath, mailboxID)
 	if _, err := tx.Exec(ctx, `UPDATE mailboxes SET path = $1 WHERE id = $2`, path, mailboxID); err != nil {
-		return 0, "", false, fmt.Errorf("failed to update path for mailbox %s: %w", name, err)
+		return 0, "", fmt.Errorf("failed to update path for mailbox %s: %w", name, err)
 	}
 
 	if isShared {
-		var sharedParentID *int64
-		if parentIsShared {
-			sharedParentID = &parentID
+		// No sharedParentID, whatever the parent is: the owner's entry only.
+		if err := grantNewSharedMailboxACL(ctx, tx, accountID, name, mailboxID, nil, *ownerDomain); err != nil {
+			return 0, "", err
 		}
-		if err := grantNewSharedMailboxACL(ctx, tx, accountID, name, mailboxID, sharedParentID, *ownerDomain); err != nil {
-			return 0, "", false, err
-		}
-		logger.Warn("Database: restore recreated a deleted shared mailbox with the initial ACL of a new one; the entries it had before it was deleted are not restored",
+		logger.Warn("Database: restore recreated a deleted shared mailbox with owner-only rights; grant other users access again",
 			"account_id", accountID, "mailbox", name, "mailbox_id", mailboxID)
 	}
-	return mailboxID, path, isShared, nil
+	return mailboxID, path, nil
 }

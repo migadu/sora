@@ -229,3 +229,30 @@ func TestMailboxFixUTF7DryRunDatabaseDescendantCaseParity(t *testing.T) {
 		})
 	}
 }
+
+// A mailbox whose name does not start with the name of the parent its path links
+// it to (what issue #1298's race left behind) is not renamed in place: RenameMailbox
+// refuses a new parent that does not have the parent part of the new name, and the
+// dry run predicts that refusal.
+func TestMailboxFixUTF7DryRunParentNameMismatch(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	rdb := common.SetupTestDatabase(t)
+	ctx := context.Background()
+	account := common.CreateTestAccount(t, rdb)
+	id, err := rdb.GetAccountIDByEmailWithRetry(ctx, account.Email)
+	require.NoError(t, err)
+	_, err = rdb.ResolveOrCreateMailboxPathWithRetry(ctx, id, "Alpha/B&AOk-ta")
+	require.NoError(t, err)
+	alpha, err := rdb.GetMailboxByNameWithRetry(ctx, id, "Alpha")
+	require.NoError(t, err)
+	// The parent renamed without its child, as the race of issue #1298 left it.
+	_, err = rdb.GetOperationalDatabase().WritePool.Exec(ctx, `UPDATE mailboxes SET name = 'Gam' WHERE id = $1`, alpha.ID)
+	require.NoError(t, err)
+
+	dry := runMailboxFixUTF7(t, ctx, account.Email, "--dry-run")
+	live := runMailboxFixUTF7(t, ctx, account.Email)
+	require.Empty(t, parseFixUTF7Renames(live))
+	require.Equal(t, []string{`"Alpha/B&AOk-ta" -> "Alpha/Béta" (` + consts.ErrMailboxNotFound.Error() + `)`}, parseFixUTF7Failures(live))
+	require.Equal(t, parseFixUTF7Renames(live), parseFixUTF7Renames(dry), "dry=%s live=%s", dry, live)
+	require.Equal(t, parseFixUTF7Failures(live), parseFixUTF7Failures(dry), "dry=%s live=%s", dry, live)
+}

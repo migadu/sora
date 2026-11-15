@@ -317,13 +317,31 @@ func (db *Database) DeleteScriptByName(ctx context.Context, tx pgx.Tx, AccountID
 
 // SetScriptActiveByName sets the active state of the account's script called name,
 // as SetScriptActive. It returns consts.ErrDBNotFound when the account has no such
-// script.
+// script; the caller must then roll tx back, which undoes the deactivation of the
+// other scripts.
+//
+// The name is resolved by the UPDATE itself, in tx. Activation deactivates the
+// active script before it updates the target, the order in which SetScriptActive
+// takes the two row locks: locking the target first would deadlock with a
+// SetScriptActive of the same script that holds the active row.
 func (db *Database) SetScriptActiveByName(ctx context.Context, tx pgx.Tx, AccountID int64, name string, active bool) error {
-	id, _, err := lockScriptByName(ctx, tx, AccountID, name)
+	if !helpers.TextStorable(name) { // names no script, see GetScriptByName
+		return consts.ErrDBNotFound
+	}
+	if active {
+		if _, err := tx.Exec(ctx, "UPDATE sieve_scripts SET active = false WHERE account_id = $1 AND active = true", AccountID); err != nil {
+			return fmt.Errorf("failed to deactivate other scripts: %w", err)
+		}
+	}
+	tag, err := tx.Exec(ctx, "UPDATE sieve_scripts SET active = $1, updated_at = now() WHERE account_id = $2 AND name = $3",
+		active, AccountID, name)
 	if err != nil {
 		return err
 	}
-	return db.SetScriptActive(ctx, tx, id, AccountID, active)
+	if tag.RowsAffected() == 0 {
+		return consts.ErrDBNotFound
+	}
+	return nil
 }
 
 func (db *Database) SetScriptActive(ctx context.Context, tx pgx.Tx, scriptID, AccountID int64, active bool) error {
