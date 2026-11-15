@@ -152,6 +152,7 @@ func TestProcessSubscriptionsSkipsInvalidMailboxNames(t *testing.T) {
 	mockDB := &recordingSubMockDB{mockResilientDatabase: newMockResilientDatabase()}
 	importer := newTestModeImporter(t, root, mockDB, ImporterOptions{Dovecot: true})
 
+	require.NoError(t, importer.lookupAccount())
 	require.NoError(t, importer.processSubscriptions())
 	assert.Equal(t, []string{"INBOX", "v1.0"}, mockDB.subscribed)
 }
