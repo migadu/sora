@@ -70,39 +70,88 @@ func (db *Database) ExpungeMessagesByIDs(ctx context.Context, tx pgx.Tx, message
 		return 0, nil
 	}
 
-	// Lock the mailboxes rows of the live messages before expunging them, as every
-	// other unseen-mutating path does (see lockMailboxStats): without it the expunge
-	// trigger and a concurrent flag change's trigger can both charge the same unseen
-	// message to unseen_count. The messages may span several mailboxes (a purge passes
-	// a mailbox and its children), so the rows are locked in ascending id order, like
-	// the age-based expunge and MOVE, which keeps this deadlock-free against them.
-	rows, err := tx.Query(ctx, `
-		SELECT id FROM mailboxes
-		WHERE id IN (SELECT mailbox_id FROM messages WHERE id = ANY($1) AND expunged_at IS NULL)
-		ORDER BY id
-		FOR UPDATE
-	`, messageIDs)
-	if err != nil {
-		return 0, fmt.Errorf("failed to lock mailboxes for expunge by id: %w", err)
-	}
-	lockedMailboxIDs, err := pgx.CollectRows(rows, pgx.RowTo[int64])
-	if err != nil {
-		return 0, fmt.Errorf("failed to lock mailboxes for expunge by id: %w", err)
-	}
-
-	// Expunge only rows in a mailbox locked above. A message that was already expunged
-	// when the mailboxes were picked and has been restored since may sit in a mailbox
-	// this transaction does not hold, and locking that one now would break the ascending
-	// order; it is left alone, as if this ran before the restore. A row without a
-	// mailbox is expunged as before: the stats triggers skip it.
-	tag, err := tx.Exec(ctx, `
-		UPDATE messages
-		SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
-		WHERE id = ANY($1) AND expunged_at IS NULL
-		  AND (mailbox_id = ANY($2) OR mailbox_id IS NULL)
-	`, messageIDs, lockedMailboxIDs)
+	// The messages may span several mailboxes (a purge passes a mailbox and its
+	// children), so they are locked in ascending id order (see lockLiveMessageMailboxes).
+	const byID = `m.id = ANY($1)`
+	locked, err := lockLiveMessageMailboxes(ctx, tx, byID, messageIDs)
 	if err != nil {
 		return 0, fmt.Errorf("failed to expunge messages by id: %w", err)
+	}
+	n, err := expungeLiveMessages(ctx, tx, locked, byID, messageIDs)
+	if err != nil {
+		return 0, fmt.Errorf("failed to expunge messages by id: %w", err)
+	}
+	return n, nil
+}
+
+// lockLiveMessageMailboxes locks the mailboxes rows of the live messages that match cond,
+// a condition on messages m over args, and returns their ids. Every other
+// unseen-mutating path locks its mailbox first (see lockMailboxStats): without it the
+// expunge trigger and a concurrent flag change's trigger can both charge the same unseen
+// message to unseen_count. The rows are locked in ascending id order, like the age-based
+// expunge and MOVE, which keeps this deadlock-free against them.
+func lockLiveMessageMailboxes(ctx context.Context, tx pgx.Tx, cond string, args ...any) ([]int64, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT id FROM mailboxes
+		WHERE id IN (SELECT m.mailbox_id FROM messages m WHERE m.expunged_at IS NULL AND (`+cond+`))
+		ORDER BY id
+		FOR UPDATE
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to lock mailboxes: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return nil, fmt.Errorf("failed to lock mailboxes: %w", err)
+	}
+	return ids, nil
+}
+
+// expungeLiveMessages expunges the live messages that match cond (as for
+// lockLiveMessageMailboxes) and sit in one of mailboxIDs, the mailboxes the caller
+// locked. A message that was already expunged when the mailboxes were picked and has
+// been restored since may sit in a mailbox this transaction does not hold, and locking
+// that one now would break the ascending order; it is left alone, as if this ran before
+// the restore. A message without a mailbox is expunged as well: the stats triggers skip
+// it. Returns how many rows were expunged.
+func expungeLiveMessages(ctx context.Context, tx pgx.Tx, mailboxIDs []int64, cond string, args ...any) (int64, error) {
+	tag, err := tx.Exec(ctx, fmt.Sprintf(`
+		UPDATE messages m
+		SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
+		WHERE m.expunged_at IS NULL
+		  AND (m.mailbox_id = ANY($%d) OR m.mailbox_id IS NULL)
+		  AND (%s)
+	`, len(args)+1, cond), append(args[:len(args):len(args)], mailboxIDs)...)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// notLiveInMailbox holds for a message row that a hard delete may remove without
+// leaving it counted: one that is expunged, or in no mailbox.
+//
+// A DELETE on messages removes the message's message_state row by cascade before
+// either stats trigger runs, so the messages trigger can no longer read its flags and
+// the message_state trigger can no longer see that it was live: a live message deleted
+// directly stays in unseen_count. A hard delete therefore expunges the live rows it is
+// about to delete first (lockLiveMessageMailboxes, then expungeLiveMessages), so that
+// the expunge trigger takes them out of message_count, unseen_count and total_size
+// under the mailbox lock, and deletes only rows that are then not live. One that still
+// is came into a mailbox the delete did not lock, and is left for later.
+const notLiveInMailbox = `(m.expunged_at IS NOT NULL OR m.mailbox_id IS NULL)`
+
+// hardDeleteMessages deletes the messages that match cond (as for
+// lockLiveMessageMailboxes) for good, after expunging the live ones among them that sit
+// in mailboxIDs, the mailboxes the caller locked with lockLiveMessageMailboxes (see
+// notLiveInMailbox). Returns how many rows were deleted.
+func hardDeleteMessages(ctx context.Context, tx pgx.Tx, mailboxIDs []int64, cond string, args ...any) (int64, error) {
+	if _, err := expungeLiveMessages(ctx, tx, mailboxIDs, cond, args...); err != nil {
+		return 0, fmt.Errorf("failed to expunge messages before deleting them: %w", err)
+	}
+	tag, err := tx.Exec(ctx, `DELETE FROM messages m WHERE `+notLiveInMailbox+` AND (`+cond+`)`, args...)
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete messages: %w", err)
 	}
 	return tag.RowsAffected(), nil
 }
