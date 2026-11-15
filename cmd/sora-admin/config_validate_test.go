@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -355,5 +359,92 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// validateSections returns the sections Config.Validate reports problems under, read
+// from its source: the string literals it passes to add. A label that names neither a
+// table ("[s3]") nor a key ("trusted_networks"), such as "servers", is about the
+// [[server]] blocks.
+func validateSections(t *testing.T) []string {
+	t.Helper()
+	path := filepath.Join("..", "..", "config", "config.go")
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]bool)
+	var sections []string
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "Validate" || fn.Recv == nil || len(fn.Recv.List) != 1 {
+			continue
+		}
+		star, ok := fn.Recv.List[0].Type.(*ast.StarExpr)
+		if !ok {
+			continue
+		}
+		if recv, ok := star.X.(*ast.Ident); !ok || recv.Name != "Config" {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || len(call.Args) == 0 {
+				return true
+			}
+			if fun, ok := call.Fun.(*ast.Ident); !ok || fun.Name != "add" {
+				return true
+			}
+			lit, ok := call.Args[0].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			section, err := strconv.Unquote(lit.Value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(section, "[") && (strings.Contains(section, " ") || !strings.Contains(section, "_")) {
+				section = "[[server]]"
+			}
+			if !seen[section] {
+				seen[section] = true
+				sections = append(sections, section)
+			}
+			return true
+		})
+	}
+	return sections
+}
+
+// TestConfigValidateHelpNamesWhatItChecks (#1425): `config validate --help` names every
+// section the command checks (Config.Validate, read from its source, so a check added
+// there cannot be left out of the help), and does not say the database and S3 settings
+// are left to service start: the command refuses them (TestConfigValidateRefusesWhatStartupRefuses).
+func TestConfigValidateHelpNamesWhatItChecks(t *testing.T) {
+	sections := validateSections(t)
+	for _, want := range []string{"[[server]]", "[database]", "[s3]", "[tls]"} {
+		if !strings.Contains(strings.Join(sections, " "), want) {
+			t.Fatalf("read %q from Config.Validate, which lacks %s: is the parse still right?", sections, want)
+		}
+	}
+	help := captureStdout(t, func() error {
+		printConfigValidateUsage()
+		return nil
+	})
+	for _, section := range sections {
+		if !strings.Contains(help, section) {
+			t.Errorf("the help does not name %s, which config validate checks", section)
+		}
+	}
+	flat := strings.Join(strings.Fields(help), " ")
+	for _, stale := range []string{"does not check required database/S3 settings", "S3 timeout"} {
+		if strings.Contains(flat, stale) {
+			t.Errorf("the help says %q, but config validate checks the database and S3 settings and the S3 timeout:\n%s", stale, help)
+		}
+	}
+	for _, left := range []string{"connectivity", "disk"} {
+		if !strings.Contains(flat, left) {
+			t.Errorf("the help does not say %s is left to service start:\n%s", left, help)
+		}
 	}
 }
