@@ -391,15 +391,7 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 	}
 
 	// The session has now seen every change up to its cursor.
-	if s.ownStoreEchoMailboxID != mailboxID {
-		s.ownStoreEcho = nil
-	}
-	cursor := s.currentHighestModSeq.Load()
-	for uid, modSeq := range s.ownStoreEcho {
-		if modSeq <= cursor {
-			delete(s.ownStoreEcho, uid)
-		}
-	}
+	s.pruneOwnStoreEchoLocked(mailboxID, s.currentHighestModSeq.Load())
 
 	// Store sessionTracker reference before releasing lock to avoid race condition
 	sessionTracker := s.sessionTracker
@@ -413,4 +405,25 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 	}
 
 	return sessionTracker.Poll(w, allowExpunge)
+}
+
+// pruneOwnStoreEchoLocked forgets the rows of this session's own STORE that
+// Poll has now passed: all of them when they were recorded in another mailbox,
+// otherwise each one at or below cursor. A map left empty is dropped rather
+// than kept: Go never shrinks a map, so a STORE over a large mailbox would
+// otherwise hold its buckets for as long as the mailbox stays selected. The
+// caller holds ownStoreMu.
+func (s *IMAPSession) pruneOwnStoreEchoLocked(mailboxID int64, cursor uint64) {
+	if s.ownStoreEchoMailboxID != mailboxID {
+		s.ownStoreEcho = nil
+		return
+	}
+	for uid, modSeq := range s.ownStoreEcho {
+		if modSeq <= cursor {
+			delete(s.ownStoreEcho, uid)
+		}
+	}
+	if len(s.ownStoreEcho) == 0 {
+		s.ownStoreEcho = nil
+	}
 }

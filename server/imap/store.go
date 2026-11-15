@@ -209,7 +209,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 			// another session changed on an unchanged row.
 			if !sanitizedStoreFlags.Silent || !modified.unchanged {
 				if s.ownStoreEcho == nil || s.ownStoreEchoMailboxID != selectedMailboxID {
-					s.ownStoreEcho = make(map[imap.UID]uint64)
+					s.ownStoreEcho = make(map[imap.UID]uint64, len(responseMessages))
 					s.ownStoreEchoMailboxID = selectedMailboxID
 				}
 				s.ownStoreEcho[modified.uid] = uint64(modified.modSeq)
