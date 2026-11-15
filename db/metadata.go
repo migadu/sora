@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/consts"
 )
 
 // MetadataErrorType represents the type of metadata error.
@@ -214,6 +215,20 @@ func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 						MaxSize: limits.MaxEntrySize,
 					}
 				}
+			}
+		}
+
+		// The count and size limits are checked against what is stored and then
+		// written, so two writes of the account must not both read the old state:
+		// each would pass, and together they would store past the limit. The lock
+		// is per account, not per mailbox, as max_total_size sums every scope. It
+		// is transaction-scoped (pgbouncer transaction mode), and the queries below
+		// run after it is granted, so under READ COMMITTED they see what the
+		// previous holder committed.
+		if limits.MaxEntriesPerMailbox > 0 || limits.MaxEntriesPerServer > 0 || limits.MaxTotalSize > 0 {
+			if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int4, hashint8($2::int8))",
+				consts.SoraMetadataLimitLockClassID, accountID); err != nil {
+				return fmt.Errorf("failed to lock account metadata: %w", err)
 			}
 		}
 
