@@ -258,9 +258,11 @@ safely.
 | Per-user and per-IP connection counts on IMAP, POP3 and ManageSieve proxies, affinity | Memory, shared between nodes by gossip | Lost on restart. See [CLUSTER.md](CLUSTER.md). |
 | Client sessions | Memory of the node that holds the connection | |
 
-The default paths under `/tmp` are fine for a laptop and wrong for production: the staging
-directory holds the only copy of mail that has not reached S3 yet, and many systems clear
-`/tmp` at boot. Set `[uploader] path` to a persistent directory. See
+The staging directory holds the only copy of mail that has not reached S3 yet, so it must
+survive a restart and a reboot. The defaults, under `/var/spool/sora` and `/var/cache/sora`, do
+as long as those two directories exist and the user Sora runs as can write to them
+([OPERATIONS.md](OPERATIONS.md#5-what-a-restart-loses-and-keeps)). Never move `[uploader] path`
+to `tmpfs` or to a `/tmp` that is cleared at boot. See
 [STORAGE.md](STORAGE.md#14-what-to-back-up).
 
 ---
