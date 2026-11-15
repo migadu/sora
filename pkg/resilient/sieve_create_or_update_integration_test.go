@@ -90,15 +90,15 @@ func TestCreateOrUpdateScript_ReplicaHasNotReplayedCreate(t *testing.T) {
 	rd.failoverManager.readPools = []*DatabasePool{replica}
 	accountID := newSieveTestAccount(t, primary)
 
-	if _, err := rd.CreateOrUpdateScriptWithRetry(ctx, accountID, "filters", "keep;"); err != nil {
-		t.Fatalf("first PUT: %v", err)
+	if _, updated, err := rd.CreateOrUpdateScriptWithRetry(ctx, accountID, "filters", "keep;"); err != nil || updated {
+		t.Fatalf("first PUT: updated=%v err=%v, want a create", updated, err)
 	}
 	if _, err := rd.GetScriptByNameWithRetry(ctx, "filters", accountID); !errors.Is(err, consts.ErrDBNotFound) {
 		t.Fatalf("setup: the replica must not have the script yet, lookup got %v", err)
 	}
 
-	if _, err := rd.CreateOrUpdateScriptWithRetry(ctx, accountID, "filters", "discard;"); err != nil {
-		t.Fatalf("second PUT of the same name: %v", err)
+	if _, updated, err := rd.CreateOrUpdateScriptWithRetry(ctx, accountID, "filters", "discard;"); err != nil || !updated {
+		t.Fatalf("second PUT of the same name: updated=%v err=%v, want an update", updated, err)
 	}
 	requireStoredScript(t, primary, accountID, "filters", "discard;")
 }
@@ -129,7 +129,10 @@ func TestCreateOrUpdateScript_ConcurrentCreateOfSameName(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := rd.CreateOrUpdateScriptWithRetry(ctx, accountID, "filters", "discard;")
+		_, updated, err := rd.CreateOrUpdateScriptWithRetry(ctx, accountID, "filters", "discard;")
+		if err == nil && !updated {
+			err = errors.New("reported a create, want an update")
+		}
 		done <- err
 	}()
 
