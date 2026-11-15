@@ -59,7 +59,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 	if err != nil {
 		return nil, fmt.Errorf("failed to build search criteria for threading: %w", err)
 	}
-	whereArgs["mailbox_id"] = mailboxID
+	whereArgs["mailboxID"] = mailboxID
 	whereArgs["accountID"] = accountID
 
 	subjectSelect := `'' AS subject_sort`
@@ -84,7 +84,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 		}
 		seqCTE = `WITH seq AS (
 			SELECT uid, ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
-			FROM ` + seqCountedRows("@mailbox_id", viewParam, "") + ` counted
+			FROM ` + seqCountedRows("@mailboxID", viewParam, "") + ` counted
 		)`
 		seqJoin = "JOIN seq ON seq.uid = m.uid"
 		seqSelect = "seq.seqnum"
@@ -102,7 +102,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		%s
 		%s
-		WHERE m.mailbox_id = @mailbox_id
+		WHERE m.mailbox_id = @mailboxID
 		  AND m.expunged_at IS NULL
 		  AND %s
 		ORDER BY m.uid
