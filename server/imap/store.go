@@ -200,12 +200,8 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 			// row this STORE changed from a state the client already had: at or
 			// below the poll cursor, or this session's own previous answer.
 			// Otherwise Poll reports the flags (RFC 9051 §6.4.6 Note).
-			if !sanitizedStoreFlags.Silent || (!modified.unchanged && s.clientHasModSeqLocked(selectedMailboxID, modified.uid, modified.prevModSeq)) {
-				if s.ownStoreEcho == nil || s.ownStoreEchoMailboxID != selectedMailboxID {
-					s.ownStoreEcho = make(map[imap.UID]uint64)
-					s.ownStoreEchoMailboxID = selectedMailboxID
-				}
-				s.ownStoreEcho[modified.uid] = uint64(modified.modSeq)
+			if !sanitizedStoreFlags.Silent || (!modified.unchanged && s.clientHasModSeqLocked(view.tracker, selectedMailboxID, modified.uid, modified.prevModSeq)) {
+				s.recordOwnStoreEchoLocked(view.tracker, selectedMailboxID, modified.uid, uint64(modified.modSeq))
 			}
 		}
 	}
@@ -404,14 +400,48 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 }
 
 // clientHasModSeqLocked reports whether the client already has message uid's
-// state as of modSeq: Poll has reported (or queued) every change up to its
-// cursor, and ownStoreEcho holds the states this session's own STORE answers
-// gave the client. The caller holds ownStoreMu, which Poll holds while it
-// advances the cursor and queues the changes.
-func (s *IMAPSession) clientHasModSeqLocked(mailboxID int64, uid imap.UID, modSeq int64) bool {
+// state as of modSeq: Poll has delivered every change up to its cursor when the
+// session tracker holds no queued updates, and ownStoreEcho holds the states
+// this session's own STORE or FETCH answers gave the client. The caller holds
+// ownStoreMu, which Poll holds while it advances the cursor and queues the
+// changes.
+func (s *IMAPSession) clientHasModSeqLocked(tracker *imapserver.SessionTracker, mailboxID int64, uid imap.UID, modSeq int64) bool {
+	if tracker == nil || tracker.QueuedUpdates() > 0 {
+		return false
+	}
 	if uint64(modSeq) <= s.currentHighestModSeq.Load() {
 		return true
 	}
 	echoed, ok := s.ownStoreEcho[uid]
 	return ok && s.ownStoreEchoMailboxID == mailboxID && echoed == uint64(modSeq)
+}
+
+// recordOwnStoreEchoLocked records that this session's STORE already answered
+// message uid as of modSeq, so Poll skips repeating that exact state. Nothing
+// is recorded while the session tracker holds queued updates from an earlier
+// Poll or while a concurrent FETCH (e.g. NOTIFY MessageNew fetch-atts) is in
+// flight, because an older state of uid may still be flushed after STORE's
+// response and Poll must queue the current state behind it.
+func (s *IMAPSession) recordOwnStoreEchoLocked(tracker *imapserver.SessionTracker, mailboxID int64, uid imap.UID, modSeq uint64) {
+	if tracker == nil || tracker.QueuedUpdates() > 0 || s.fetchInFlight > 0 {
+		return
+	}
+	entries := 1
+	if s.ownStoreEchoMailboxID == mailboxID {
+		entries = len(s.ownStoreEcho)
+		if _, exists := s.ownStoreEcho[uid]; !exists {
+			entries++
+		}
+	}
+	// This metadata is optional: use the same conservative map-space estimate
+	// as implicitSeenAnswer.expect without reclaiming body cache or changing
+	// response budgets.
+	if entries > maxFetchSeenEchoEntries || (s.memTracker != nil && !s.memTracker.CanAllocate(256+64*int64(entries))) {
+		return
+	}
+	if s.ownStoreEcho == nil || s.ownStoreEchoMailboxID != mailboxID {
+		s.ownStoreEcho = make(map[imap.UID]uint64)
+		s.ownStoreEchoMailboxID = mailboxID
+	}
+	s.ownStoreEcho[uid] = modSeq
 }
