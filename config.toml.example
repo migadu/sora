@@ -1436,13 +1436,13 @@ limits.max_redirect_hops = 2             # Max times one message may be redirect
                                          # still applies regardless of this value.
 
 # --- TIMEOUT CONFIGURATION ---
-# The LMTP server's only connection timeout. absolute_session_timeout, min_bytes_per_minute,
-# auth_idle_timeout and limits.session_memory_limit do not apply to it.
+# absolute_session_timeout, min_bytes_per_minute, auth_idle_timeout and
+# limits.session_memory_limit do not apply to the LMTP backend.
 timeouts.command_timeout = "5m"  # Idle time between commands before 421 and disconnect
                                  # (default: 5m, the RFC 5321 §4.5.3.2.7 floor; "0" = the default).
-                                 # It also bounds receiving a message: the read deadline set for the
-                                 # DATA command is not extended while the data arrives, so a message
-                                 # that takes longer is refused with 421 and the MTA retries it.
+                                 # During DATA and BDAT it bounds each wait for more message content.
+                                 # A separate one-hour limit bounds one DATA body or BDAT chunk;
+                                 # a stalled or over-time transfer gets 421 and disconnects so the MTA retries.
 
 # --- PER-COMMAND EXECUTION TIMEOUTS (optional) ---
 # Hard caps on server-side work, mirroring imap_command_timeouts. On expiry
