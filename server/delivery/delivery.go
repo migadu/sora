@@ -319,7 +319,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// account), enforce the 'i' right, attribute the message to the mailbox owner, and
 	// stage the already-saved body under the owner's path. The body was stored locally
 	// under recipient.AccountID above.
-	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(ctx, recipient, mailboxName, contentHash)
+	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(ctx, recipient, mailboxName, contentHash, messageBytes)
 	if err != nil {
 		result.ErrorMessage = fmt.Sprintf("Failed to resolve destination mailbox: %v", err)
 		return result, err
@@ -543,14 +543,14 @@ func (d *DeliveryContext) createMissingMailbox(ctx context.Context, recipient Re
 // (insert) right (RFC 4314), falling back to the recipient's INBOX on denial, then
 // resolves the destination OWNER's account id + S3 domain/localpart (via OwnerResolver)
 // so the message is attributed to the mailbox owner rather than the recipient (B2), and
-// — for a cross-account target — hardlinks the already-staged body to the owner's
-// staging path so the uploader writes it under the owner's S3 path.
+// — for a cross-account target — stages the body (messageBytes) at the owner's staging
+// path so the uploader writes it under the owner's S3 path.
 //
 // The body MUST already be stored locally under recipient.AccountID (e.g. via
 // Uploader.StoreLocally) before this is called. DeliverMessage's inline save and
 // SaveMessageToMailbox both use this so the two paths cannot drift (e.g. one of them
 // skipping the 'i' right check).
-func (d *DeliveryContext) resolveOwnedTarget(ctx context.Context, recipient RecipientInfo, mailboxName, contentHash string) (mailbox *db.DBMailbox, destAccountID int64, destS3Domain, destS3Localpart string, err error) {
+func (d *DeliveryContext) resolveOwnedTarget(ctx context.Context, recipient RecipientInfo, mailboxName, contentHash string, messageBytes []byte) (mailbox *db.DBMailbox, destAccountID int64, destS3Domain, destS3Localpart string, err error) {
 	mailbox, err = d.RDB.GetMailboxByNameWithRetry(ctx, recipient.AccountID, mailboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
@@ -587,11 +587,12 @@ func (d *DeliveryContext) resolveOwnedTarget(ctx context.Context, recipient Reci
 	}
 
 	// For a cross-account target the body was staged under the recipient's account;
-	// hardlink it to the owner's staging path so the uploader writes the body under the
-	// owner's S3 path (B2).
+	// stage it under the owner's path too so the uploader writes the body under the
+	// owner's S3 path (B2). The owner's pending upload reads only that file, so a
+	// message stored without it has no body: a staging failure fails the delivery.
 	if destAccountID != recipient.AccountID {
-		if linkErr := d.Uploader.LinkStaged(contentHash, recipient.AccountID, destAccountID); linkErr != nil {
-			d.Logger.Log("failed to stage local file for cross-account delivery: %v", linkErr)
+		if err = d.Uploader.LinkStagedOrStore(contentHash, recipient.AccountID, destAccountID, messageBytes); err != nil {
+			return nil, 0, "", "", fmt.Errorf("failed to stage message body for the owner of mailbox '%s': %w", mailbox.Name, err)
 		}
 	}
 
@@ -604,7 +605,7 @@ func (d *DeliveryContext) resolveOwnedTarget(ctx context.Context, recipient Reci
 // and passes the final flags, Sieve-set ones plus the attachment keyword, so a
 // fileinto :copy stores the same metadata in both mailboxes.
 func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient RecipientInfo, mailboxName string, messageBytes []byte, messageEntity *message.Entity, plaintextBody *string, flags []imap.Flag, contentHash string, bodyStructure *imap.BodyStructure) error {
-	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(ctx, recipient, mailboxName, contentHash)
+	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(ctx, recipient, mailboxName, contentHash, messageBytes)
 	if err != nil {
 		return err
 	}

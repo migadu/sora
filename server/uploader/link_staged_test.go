@@ -157,3 +157,42 @@ func TestLinkStagedConcurrentWithStoreLocally(t *testing.T) {
 		})
 	}
 }
+
+// TestLinkStagedOrStore: a delivery into a shared mailbox another account owns stages
+// the body for the owner by linking the recipient's file, and from the bytes it holds
+// when that file is gone (the recipient's upload removed it), counting it once either
+// way (issue #1192).
+func TestLinkStagedOrStore(t *testing.T) {
+	body := bytes.Repeat([]byte("x"), 300)
+	for _, tc := range []struct {
+		name      string
+		srcStaged bool
+	}{{"source staged", true}, {"source gone", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &UploadWorker{path: t.TempDir(), maxStagingSize: 1 << 20}
+			hash := stagingHash("c")
+			var want int64 = 300
+			if tc.srcStaged {
+				_, err := w.StoreLocally(hash, 1, body)
+				require.NoError(t, err)
+				want = 600
+			}
+
+			require.NoError(t, w.LinkStagedOrStore(hash, 1, 2, body))
+
+			dst := w.FilePath(hash, 2)
+			got, err := os.ReadFile(dst)
+			require.NoError(t, err)
+			require.Equal(t, body, got)
+			if tc.srcStaged {
+				srcInfo, err := os.Stat(w.FilePath(hash, 1))
+				require.NoError(t, err)
+				dstInfo, err := os.Stat(dst)
+				require.NoError(t, err)
+				require.True(t, os.SameFile(srcInfo, dstInfo), "a staged source must be linked, not written again")
+			}
+			require.Equal(t, want, atomic.LoadInt64(&w.currentStagingSize))
+			requireNoTemporaryFiles(t, filepath.Dir(dst))
+		})
+	}
+}
