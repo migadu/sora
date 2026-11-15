@@ -267,7 +267,7 @@ func (s *Session) handleConnection() {
 					line = strings.TrimSpace(line)
 
 					if line == "" {
-						if s.handleAuthError(fmt.Sprintf("%s NO LOGIN requires username and password", tag)) {
+						if s.handleAuthError(fmt.Sprintf("%s BAD LOGIN requires username and password", tag)) {
 							return
 						}
 						continue
@@ -342,18 +342,21 @@ func (s *Session) handleConnection() {
 						}
 					}
 				} else {
-					if s.handleAuthError(fmt.Sprintf("%s NO LOGIN requires username and password", tag)) {
+					if s.handleAuthError(fmt.Sprintf("%s BAD LOGIN requires username and password", tag)) {
 						return
 					}
 					continue
 				}
 			} else {
-				if s.handleAuthError(fmt.Sprintf("%s NO LOGIN requires username and password", tag)) {
+				if s.handleAuthError(fmt.Sprintf("%s BAD LOGIN requires username and password", tag)) {
 					return
 				}
 				continue
 			}
 
+			// A missing argument above is BAD ("arguments invalid", RFC 9051
+			// §6.2.3); an empty user name or password given as a string is a
+			// well-formed LOGIN whose credentials are rejected: NO.
 			if username == "" || password == "" {
 				if s.handleAuthError(fmt.Sprintf("%s NO LOGIN requires username and password", tag)) {
 					return
@@ -412,7 +415,15 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			authStart := time.Now()
-			if len(args) < 1 || server.ToUpperASCII(args[0]) != "PLAIN" {
+			// RFC 9051 §6.2.2: a missing mechanism is "arguments invalid"
+			// (BAD); a named mechanism the proxy does not support is NO.
+			if len(args) < 1 {
+				if s.handleAuthError(fmt.Sprintf("%s BAD AUTHENTICATE requires a mechanism name", tag)) {
+					return
+				}
+				continue
+			}
+			if server.ToUpperASCII(args[0]) != "PLAIN" {
 				if s.handleAuthError(fmt.Sprintf("%s NO AUTHENTICATE PLAIN is the only supported mechanism", tag)) {
 					return
 				}
@@ -420,7 +431,8 @@ func (s *Session) handleConnection() {
 			}
 
 			var saslLine string
-			if len(args) > 1 {
+			initialResponse := len(args) > 1
+			if initialResponse {
 				// Initial response was provided with the command
 				saslLine = server.UnquoteString(args[1])
 			} else {
@@ -447,13 +459,19 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			// Decode SASL PLAIN
-			decoded, err := base64.StdEncoding.DecodeString(saslLine)
-			if err != nil {
-				if s.handleAuthError(fmt.Sprintf("%s NO Invalid base64 encoding", tag)) {
-					return
+			// Decode SASL PLAIN. RFC 9051 §6.2.2: a single "=" initial
+			// response is a zero-length response, and an invalid base64
+			// string MUST be rejected with a tagged BAD.
+			var decoded []byte
+			if !initialResponse || saslLine != "=" {
+				var err error
+				decoded, err = base64.StdEncoding.DecodeString(saslLine)
+				if err != nil {
+					if s.handleAuthError(fmt.Sprintf("%s BAD Invalid base64 encoding", tag)) {
+						return
+					}
+					continue
 				}
-				continue
 			}
 
 			parts := strings.Split(string(decoded), "\x00")
