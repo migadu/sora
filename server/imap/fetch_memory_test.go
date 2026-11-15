@@ -196,6 +196,15 @@ func TestFetch_PartialChunksReuseExtractedSection(t *testing.T) {
 	w2 := &fakeBodySectionWriter{tracker: tracker}
 	var noBody []byte
 	noBodyFetched := false
+	// Nor does loading the body ahead of the response, which is for sections
+	// the retained one cannot answer.
+	if err := s.loadBodyForSections(context.Background(), msg, &noBody, &noBodyFetched,
+		&imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{second}}); err != nil {
+		t.Fatalf("second chunk body load: %v", err)
+	}
+	if noBodyFetched {
+		t.Fatal("loading ahead of the second chunk consulted the body loader; the retained section answers it")
+	}
 	if err := s.handleBodySections(context.Background(), w2, &noBody, &noBodyFetched,
 		&imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{second}}, msg); err != nil {
 		t.Fatalf("second chunk: %v", err)

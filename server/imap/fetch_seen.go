@@ -1,49 +1,53 @@
 package imap
 
 import (
+	"context"
+
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/db"
 )
 
-// unseenMessageUIDs returns the UIDs of messages in the batch that do not yet
-// carry \Seen.
-func unseenMessageUIDs(messages []db.Message) []imap.UID {
-	var uids []imap.UID
-	for i := range messages {
-		if !db.ContainsFlag(messages[i].BitwiseFlags, db.FlagSeen) {
-			uids = append(uids, messages[i].UID)
-		}
+// setImplicitSeen sets \Seen on msg, whose BODY[] or BINARY[] section the FETCH
+// is about to return (RFC 9051 §6.4.5: "The \Seen flag is implicitly set; if
+// this causes the flags to change, they SHOULD be included as part of the
+// FETCH responses"), and returns the options to write its response with.
+//
+// It is called for one message at a time, after its body is loaded and its
+// BINARY sections are decoded, so a FETCH that fails part way sets \Seen only
+// on the messages it answered (#1222). Setting it for a whole stream chunk
+// ahead would have to be undone on failure, which would also clear a \Seen
+// another session set, or found already set, in the meantime. The update is
+// one write next to the body load the message needs anyway, and none for a
+// message that is \Seen already.
+func (s *IMAPSession) setImplicitSeen(ctx context.Context, msg *db.Message, options *imap.FetchOptions, mailboxID int64) *imap.FetchOptions {
+	if db.ContainsFlag(msg.BitwiseFlags, db.FlagSeen) {
+		return options
 	}
-	return uids
+	results, err := s.server.rdb.AddMessageFlagsBatchWithRetry(ctx, []imap.UID{msg.UID}, mailboxID, []imap.Flag{imap.FlagSeen})
+	if err != nil {
+		s.DebugLog("failed to mark message as seen", "uid", msg.UID, "error", err)
+		return options
+	}
+	s.useMasterDB.Store(true)
+	return s.fetchOptionsForImplicitSeen(options, applyImplicitSeenUpdate(msg, results))
 }
 
-// applyImplicitSeenUpdates updates the in-memory message models with the
-// authoritative post-update flags and mod-sequences returned by
-// AddMessageFlagsBatch, returning the set of UIDs whose flags actually changed.
-func applyImplicitSeenUpdates(messages []db.Message, batchResults []db.BatchFlagUpdateResult) map[imap.UID]bool {
-	if len(batchResults) == 0 {
-		return nil
-	}
-	byUID := make(map[imap.UID]db.BatchFlagUpdateResult, len(batchResults))
-	for _, res := range batchResults {
-		if !res.PreconditionFailed {
-			byUID[res.UID] = res
-		}
-	}
-	changed := make(map[imap.UID]bool, len(byUID))
-	for i := range messages {
-		res, ok := byUID[messages[i].UID]
-		if !ok {
+// applyImplicitSeenUpdate updates the in-memory message model with the
+// authoritative post-update flags and mod-sequence AddMessageFlagsBatch
+// returned for it, reporting whether its flags actually changed.
+func applyImplicitSeenUpdate(msg *db.Message, results []db.BatchFlagUpdateResult) bool {
+	for _, res := range results {
+		if res.UID != msg.UID || res.PreconditionFailed {
 			continue
 		}
 		sysFlags, customFlags := db.SplitFlags(res.Flags)
-		messages[i].BitwiseFlags = db.FlagsToBitwise(sysFlags)
-		messages[i].CustomFlags = customFlags
+		msg.BitwiseFlags = db.FlagsToBitwise(sysFlags)
+		msg.CustomFlags = customFlags
 		modSeq := res.ModSeq
-		messages[i].UpdatedModSeq = &modSeq
-		changed[messages[i].UID] = true
+		msg.UpdatedModSeq = &modSeq
+		return true
 	}
-	return changed
+	return false
 }
 
 // fetchOptionsForImplicitSeen returns the per-message FetchOptions to use when

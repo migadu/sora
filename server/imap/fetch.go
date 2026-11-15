@@ -354,20 +354,6 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			return nil
 		}
 
-		var seenChanged map[imap.UID]bool
-		if markSeen {
-			uidsToMarkSeen := unseenMessageUIDs(messages)
-			if len(uidsToMarkSeen) > 0 {
-				batchResults, err := s.server.rdb.AddMessageFlagsBatchWithRetry(ctx, uidsToMarkSeen, selectedMailboxID, []imap.Flag{imap.FlagSeen})
-				if err != nil {
-					s.DebugLog("failed to batch mark messages as seen", "error", err)
-				} else {
-					s.useMasterDB.Store(true)
-					seenChanged = applyImplicitSeenUpdates(messages, batchResults)
-				}
-			}
-		}
-
 		for _, msg := range messages {
 			if err := ctx.Err(); err != nil {
 				writeErr = err
@@ -378,8 +364,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			if s.IMAPUser != nil {
 				metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
 			}
-			msgOptions := s.fetchOptionsForImplicitSeen(options, seenChanged[msg.UID])
-			if err := s.writeMessageFetchData(ctx, w, &msg, msgOptions, selectedMailboxID, preview); err != nil {
+			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID, markSeen, preview); err != nil {
 				writeErr = err
 				return err
 			}
@@ -407,8 +392,9 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 }
 
 // writeMessageFetchData handles writing all FETCH data items for a single message.
-// preview is the command's PREVIEW state, nil unless PREVIEW was requested.
-func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, preview *previewRun) (retErr error) {
+// markSeen is whether the FETCH implicitly sets \Seen; preview is the command's
+// PREVIEW state, nil unless PREVIEW was requested.
+func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, markSeen bool, preview *previewRun) (retErr error) {
 	s.DebugLog("fetching message", "uid", msg.UID, "seq", msg.Seq)
 
 	// msg.Seq is the client's sequence number (Fetch translated it, see seqView).
@@ -419,8 +405,6 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 		s.DebugLog("skipping message with invalid sequence number", "uid", msg.UID, "seq", msg.Seq)
 		return nil
 	}
-
-	// Removed individual markSeen logic here because it is now batched before iteration.
 
 	// Declare bodyData and a flag to track if it has been fetched.
 	// These will be passed by pointer to handlers so they can lazily load it once if needed.
@@ -447,6 +431,21 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 			return err
 		}
 		defer s.freeSectionCopies(binary.charged)
+	}
+	// The body for BODY sections is loaded before the response too, for the
+	// same reason: one that cannot be read right now fails the command with
+	// NO [UNAVAILABLE].
+	if err := s.loadBodyForSections(ctx, msg, &bodyData, &bodyDataFetched, options); err != nil {
+		return err
+	}
+
+	// Loading and decoding are what fails the command at this message, so its
+	// implicit \Seen (RFC 9051 §6.4.5) is set only now, one message at a time
+	// rather than for the whole stream chunk up front: a FETCH that fails at a
+	// message leaves that message, and the ones after it whose bodies it never
+	// sent, as they were.
+	if markSeen {
+		options = s.setImplicitSeen(ctx, msg, options, selectedMailboxID)
 	}
 
 	m := w.CreateMessage(seqNum)
@@ -816,6 +815,40 @@ type bodySectionWriter interface {
 	WriteBodySection(section *imap.FetchItemBodySection, size int64) io.WriteCloser
 }
 
+// loadBodyForSections loads the body for the BODY sections of a FETCH before
+// the message's response is opened, unless every section is a chunk of the
+// section this session retained. handleBodySections then finds it loaded.
+func (s *IMAPSession) loadBodyForSections(ctx context.Context, msg *db.Message, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions) error {
+	needed := slices.ContainsFunc(options.BodySection, func(section *imap.FetchItemBodySection) bool {
+		return section.Partial == nil || s.cachedBodySection(bodySectionCacheKey(msg.ContentHash, section)) == nil
+	})
+	if !needed {
+		return nil
+	}
+	return s.loadSectionBody(ctx, msg, bodyData, bodyDataFetched)
+}
+
+// loadSectionBody loads the body a BODY section is extracted from. Only a body
+// that is transiently unavailable fails the FETCH; any other failure leaves it
+// nil, for an empty section.
+func (s *IMAPSession) loadSectionBody(ctx context.Context, msg *db.Message, bodyData *[]byte, bodyDataFetched *bool) error {
+	if loadErr := s.ensureBodyDataLoaded(ctx, msg, bodyData, bodyDataFetched); loadErr != nil {
+		// Transient: the body is staged for upload but not yet retrievable from
+		// this node (read-before-upload race, or cross-node staging). Fail the
+		// FETCH with NO [UNAVAILABLE] so the client retries instead of receiving
+		// (and possibly acting on) an empty body. See errBodyTransientlyUnavailable.
+		if errors.Is(loadErr, errBodyTransientlyUnavailable) {
+			return s.transientBodyUnavailable(msg.UID, loadErr)
+		}
+		// Graceful degradation: return empty body sections instead of failing
+		// the entire multi-message FETCH. This prevents one broken message
+		// (missing S3 content, 0-byte message, etc.) from making the whole
+		// mailbox listing fail for webmail clients like Roundcube/SOGo.
+		s.WarnLog("failed to load message body, returning empty body section", "uid", msg.UID, "error", loadErr)
+	}
+	return nil
+}
+
 func (s *IMAPSession) handleBodySections(ctx context.Context, w bodySectionWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
 	for _, section := range options.BodySection {
 		// Sequential <offset.size> chunking of one section: answer from the section this
@@ -832,19 +865,8 @@ func (s *IMAPSession) handleBodySections(ctx context.Context, w bodySectionWrite
 			}
 		}
 
-		if loadErr := s.ensureBodyDataLoaded(ctx, msg, bodyData, bodyDataFetched); loadErr != nil {
-			// Transient: the body is staged for upload but not yet retrievable from
-			// this node (read-before-upload race, or cross-node staging). Fail the
-			// FETCH with NO [UNAVAILABLE] so the client retries instead of receiving
-			// (and possibly acting on) an empty body. See errBodyTransientlyUnavailable.
-			if errors.Is(loadErr, errBodyTransientlyUnavailable) {
-				return s.transientBodyUnavailable(msg.UID, loadErr)
-			}
-			// Graceful degradation: return empty body sections instead of failing
-			// the entire multi-message FETCH. This prevents one broken message
-			// (missing S3 content, 0-byte message, etc.) from making the whole
-			// mailbox listing fail for webmail clients like Roundcube/SOGo.
-			s.WarnLog("failed to load message body, returning empty body section", "uid", msg.UID, "error", loadErr)
+		if err := s.loadSectionBody(ctx, msg, bodyData, bodyDataFetched); err != nil {
+			return err
 		}
 
 		var sectionContent []byte
