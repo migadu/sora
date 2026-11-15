@@ -49,7 +49,7 @@ type Session struct {
 	routingMethod         string
 	sessionID             string // Proxy session ID for end-to-end tracing (also forwarded to the backend)
 	clientAddr            string // Cached client address to avoid race with connection close
-	clientHelo            string // Client's announced HELO/EHLO/LHLO name, forwarded to the backend via XCLIENT
+	clientHelo            string // Client's announced LHLO name, forwarded to the backend via XCLIENT
 	releaseConn           func() // Connection limiter cleanup function
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
 	mu                    sync.Mutex
@@ -227,8 +227,14 @@ func (s *Session) handleConnection() {
 		}
 
 		switch command {
-		case "HELO", "EHLO", "LHLO":
-			// LHLO is LMTP-specific greeting
+		case "HELO", "EHLO":
+			// Not present in LMTP: a server MUST NOT accept them, 500 recommended
+			// (RFC 2033 section 4.1), so a client speaking SMTP is detected before
+			// it reads per-recipient DATA replies as answers to later commands.
+			// Same reply as the backend; no client name is recorded.
+			s.sendResponse("500 5.5.1 This is a LMTP server, use LHLO")
+
+		case "LHLO":
 			if len(args) < 1 {
 				s.sendResponse("501 5.5.4 Syntax error in parameters")
 				continue
@@ -237,30 +243,25 @@ func (s *Session) handleConnection() {
 			// XCLIENT (HELO=...); without it the backend's Received: trace falls back to the
 			// proxy's own LHLO name. args[0] is a single tokenized field (no spaces/CRLF).
 			s.clientHelo = args[0]
-			if command == "EHLO" || command == "LHLO" {
-				// Send extended response
-				s.sendResponse(fmt.Sprintf("250-%s", s.server.hostname))
+			s.sendResponse(fmt.Sprintf("250-%s", s.server.hostname))
 
-				// Advertise STARTTLS if configured and not already using TLS
-				if s.server.tls && s.server.tlsUseStartTLS {
-					if _, ok := s.clientConn.(*tls.Conn); !ok {
-						s.sendResponse("250-STARTTLS")
-					}
+			// Advertise STARTTLS if configured and not already using TLS
+			if s.server.tls && s.server.tlsUseStartTLS {
+				if _, ok := s.clientConn.(*tls.Conn); !ok {
+					s.sendResponse("250-STARTTLS")
 				}
-
-				s.sendResponse("250-PIPELINING")
-				if s.settings.maxMessageSize > 0 {
-					s.sendResponse(fmt.Sprintf("250-SIZE %d", s.settings.maxMessageSize))
-				}
-				s.sendResponse("250-ENHANCEDSTATUSCODES")
-				s.sendResponse("250-8BITMIME")
-				// No DSN, as on the backend: neither issues a "delivered" DSN (RFC 3461
-				// §5.2.3), so the MTA keeps the duties of §5.2.2 (a "relayed" DSN for
-				// NOTIFY=SUCCESS). DSN parameters sent anyway are dropped, not forwarded.
-				s.sendResponse("250 SMTPUTF8")
-			} else {
-				s.sendResponse(fmt.Sprintf("250 %s", s.server.hostname))
 			}
+
+			s.sendResponse("250-PIPELINING")
+			if s.settings.maxMessageSize > 0 {
+				s.sendResponse(fmt.Sprintf("250-SIZE %d", s.settings.maxMessageSize))
+			}
+			s.sendResponse("250-ENHANCEDSTATUSCODES")
+			s.sendResponse("250-8BITMIME")
+			// No DSN, as on the backend: neither issues a "delivered" DSN (RFC 3461
+			// §5.2.3), so the MTA keeps the duties of §5.2.2 (a "relayed" DSN for
+			// NOTIFY=SUCCESS). DSN parameters sent anyway are dropped, not forwarded.
+			s.sendResponse("250 SMTPUTF8")
 
 		case "MAIL":
 			fromParam, found := findParameter(args, "FROM:")
@@ -616,8 +617,8 @@ func (s *Session) handleConnection() {
 
 			s.DebugLog("STARTTLS negotiation successful")
 
-			// Client must send EHLO/LHLO again after STARTTLS (RFC 3207)
-			// Continue to next iteration to wait for new EHLO/LHLO
+			// Client must send LHLO again after STARTTLS (RFC 3207)
+			// Continue to next iteration to wait for a new LHLO
 
 		case "RSET":
 			s.resetTransaction()
