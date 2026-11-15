@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -29,6 +30,23 @@ type ClientCapabilityFilter struct {
 	JA4Fingerprints []string `toml:"ja4_fingerprints"` // JA4 TLS fingerprint patterns (regex). Can be a single string or array. Useful when a client has multiple fingerprints across versions/platforms. Format: "t13d1516h2_8daaf6152771_e5627efa2ab1"
 	DisableCaps     []string `toml:"disable_caps"`     // List of capabilities to disable
 	Reason          string   `toml:"reason"`           // Human-readable reason for the filter
+}
+
+// Validate reports the first pattern of the filter that does not compile. The IMAP
+// server skips such a filter, so the capabilities it names stay advertised.
+func (f ClientCapabilityFilter) Validate() error {
+	if _, err := regexp.Compile(f.ClientName); err != nil {
+		return fmt.Errorf("client_name %q: %w", f.ClientName, err)
+	}
+	if _, err := regexp.Compile(f.ClientVersion); err != nil {
+		return fmt.Errorf("client_version %q: %w", f.ClientVersion, err)
+	}
+	for _, pattern := range f.JA4Fingerprints {
+		if _, err := regexp.Compile(pattern); err != nil {
+			return fmt.Errorf("ja4_fingerprints %q: %w", pattern, err)
+		}
+	}
+	return nil
 }
 
 // DatabaseEndpointConfig holds configuration for a single database endpoint
@@ -192,6 +210,27 @@ func (s *S3Config) GetTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(s.Timeout)
 }
 
+// Validate checks the [s3] settings a node that uses S3 needs to connect: the bucket and
+// the endpoint, and a timeout that parses. Without access_key and secret_key the AWS
+// default credential chain supplies them, which only connecting can check.
+func (s *S3Config) Validate() error {
+	if s.Bucket == "" {
+		return errors.New("bucket is required for mail services (IMAP, LMTP, POP3) and for the User API to serve message bodies")
+	}
+	if s.Endpoint == "" {
+		return errors.New("endpoint is required for mail services (IMAP, LMTP, POP3) and for the User API to serve message bodies")
+	}
+	if _, err := s.GetTimeout(); err != nil {
+		return fmt.Errorf("invalid timeout %q: %w", s.Timeout, err)
+	}
+	return nil
+}
+
+// hasSettings reports whether the file sets any of the [s3] connection settings.
+func (s *S3Config) hasSettings() bool {
+	return s.Endpoint != "" || s.Bucket != "" || s.AccessKey != "" || s.SecretKey != ""
+}
+
 // ClusterRateLimitSyncConfig holds configuration for cluster-wide auth rate limiting
 type ClusterRateLimitSyncConfig struct {
 	Enabled           bool `toml:"enabled"`             // Enable cluster-wide rate limiting (default: true if cluster enabled)
@@ -276,6 +315,34 @@ func (c *ClusterConfig) GetMaxEventQueueSize() int {
 		return c.MaxEventQueueSize
 	}
 	return 50000 // Default: sufficient for busy servers
+}
+
+// Validate checks an enabled [cluster] for the settings gossip cannot run without.
+//
+// addr must be an IP address the other nodes can reach: it is bound and advertised as
+// is, so 0.0.0.0, ::, localhost or a host name cannot be used. secret_key is required
+// and must be the base64 of 32 bytes (AES-256): gossip carries auth-failure state, IP
+// blocks and connection-kick commands, which any host able to reach the gossip port
+// could forge without encryption.
+func (c *ClusterConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	bindAddr := c.GetBindAddr()
+	if ip := net.ParseIP(bindAddr); ip == nil || ip.IsUnspecified() {
+		return fmt.Errorf("cluster addr '%s' must be a specific IP address reachable from other nodes, such as \"10.10.10.40:7946\" (not 0.0.0.0, ::, localhost or a host name)", bindAddr)
+	}
+	if c.SecretKey == "" {
+		return errors.New("cluster secret_key is required when cluster mode is enabled (generate one with: openssl rand -base64 32)")
+	}
+	key, err := base64.StdEncoding.DecodeString(c.SecretKey)
+	if err != nil {
+		return fmt.Errorf("failed to decode cluster secret_key: %w", err)
+	}
+	if len(key) != 32 {
+		return fmt.Errorf("cluster secret_key must be 32 bytes (got %d bytes)", len(key))
+	}
+	return nil
 }
 
 // TLSLetsEncryptS3Config holds S3-specific configuration for Let's Encrypt certificate storage
@@ -605,11 +672,15 @@ type UploaderConfig struct {
 // DefaultUploaderMaxAttempts is [uploader] max_attempts when the key is absent.
 const DefaultUploaderMaxAttempts = 20
 
-// Validate rejects [uploader] settings that stop or crash the upload worker:
-// batch_size, concurrency and max_attempts must be positive. A zero concurrency
-// blocks the worker (and its instance heartbeat) for good, a negative one panics,
-// a zero batch_size leases nothing and a negative one is refused by PostgreSQL,
-// and max_attempts <= 0 leases nothing and fails the cleaner's failed-upload pass.
+// Validate rejects [uploader] settings that stop or crash the upload worker or lose
+// mail: batch_size, concurrency, max_attempts and cleanup_grace_period must be
+// positive. A zero concurrency blocks the worker (and its instance heartbeat) for
+// good, a negative one panics, a zero batch_size leases nothing and a negative one is
+// refused by PostgreSQL, and max_attempts <= 0 leases nothing and fails the cleaner's
+// failed-upload pass. A negative cleanup_grace_period puts the orphan cleanup's cutoff
+// in the future, so it removes staged bodies whose pending_uploads row is still in an
+// uncommitted delivery transaction. An unparseable cleanup_grace_period is refused
+// too: start-up exits on it, as there is no fallback.
 func (c *UploaderConfig) Validate() error {
 	for _, f := range []struct {
 		key   string
@@ -622,6 +693,13 @@ func (c *UploaderConfig) Validate() error {
 		if f.value <= 0 {
 			return fmt.Errorf("[uploader] %s must be positive, got %d", f.key, f.value)
 		}
+	}
+	d, err := c.GetCleanupGracePeriod()
+	if err != nil {
+		return fmt.Errorf("[uploader] cleanup_grace_period: %w", err)
+	}
+	if d <= 0 {
+		return fmt.Errorf("[uploader] cleanup_grace_period must be positive, got %q", c.CleanupGracePeriod)
 	}
 	return nil
 }
@@ -1844,13 +1922,17 @@ func (s *ServerConfig) GetMaxScriptSize() (int64, error) {
 }
 
 // GetMaxMessageSize returns max_message_size (LMTP, LMTP proxy, Admin API delivery),
-// 50 MB when omitted, capped at consts.MaxStoredMessageSize: a larger message would be
-// read in full and then refused by the database insert, and the LMTP proxy would
-// advertise a SIZE no backend accepts. RFC 1870 section 5: "The fixed maximum message
-// size is defined as the message size of the largest message that a server is ever
-// willing to accept. [...] The fixed maximum message size may be an implementation
-// artifact of the SMTP server". A value that does not parse is an error: start-up falls
-// back to the default (GetMaxMessageSizeWithDefault), a reload keeps the running limit.
+// 50 MB when omitted or zero, capped at consts.MaxStoredMessageSize: a larger message
+// would be read in full and then refused by the database insert, and the LMTP proxy
+// would advertise a SIZE no backend accepts. RFC 1870 section 5: "The fixed maximum
+// message size is defined as the message size of the largest message that a server is
+// ever willing to accept. [...] The fixed maximum message size may be an implementation
+// artifact of the SMTP server". Every delivery has such a limit, so zero is the default
+// and not "unlimited", at start-up and on reload alike, and the LMTP proxy advertises
+// it: RFC 1870 section 3 reads a SIZE of 0 as "no fixed maximum message size is in
+// force", and an omitted one as conveying no information. A value that does not parse
+// is an error: start-up falls back to the default (GetMaxMessageSizeWithDefault), a
+// reload keeps the running limit.
 func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
 	if s.MaxMessageSize == "" {
 		return 50 * 1024 * 1024, nil // 50MB default
@@ -1858,6 +1940,9 @@ func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
 	size, err := helpers.ParseSize(s.MaxMessageSize)
 	if err != nil {
 		return 0, err
+	}
+	if size == 0 {
+		return 50 * 1024 * 1024, nil
 	}
 	if size > consts.MaxStoredMessageSize {
 		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
@@ -2658,16 +2743,26 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
-	// A proxy dials a backend address without a port at its remote_port, or at its enabled
-	// lookup's remote_port for a lookup-routed one. No other server reads either, and a
+	// Only the IMAP backend reads client_filters. It would skip a filter whose pattern
+	// does not compile and keep advertising what the filter hides.
+	if s.Type == "imap" {
+		for i, filter := range s.ClientFilters {
+			if err := filter.Validate(); err != nil {
+				return fmt.Errorf("server %q: client_filters #%d: %w", s.Name, i+1, err)
+			}
+		}
+	}
+
+	// A proxy dials a backend address without a port at its remote_port, and builds a
+	// lookup client from its enabled remote_lookup. No other server reads either, and a
 	// disabled lookup is never initialized.
 	if strings.HasSuffix(s.Type, "_proxy") {
 		if _, err := s.GetRemotePort(); err != nil {
 			return fmt.Errorf("server %q: invalid remote_port: %w", s.Name, err)
 		}
 		if s.RemoteLookup != nil && s.RemoteLookup.Enabled {
-			if _, err := s.RemoteLookup.GetRemotePort(); err != nil {
-				return fmt.Errorf("server %q: invalid remote_lookup.remote_port: %w", s.Name, err)
+			if err := s.RemoteLookup.Validate(); err != nil {
+				return fmt.Errorf("server %q: %w", s.Name, err)
 			}
 		}
 	}
@@ -2678,6 +2773,12 @@ func (s *ServerConfig) Validate() error {
 		}
 		if err := validateMetricsPattern(s.MetricsPath()); err != nil {
 			return fmt.Errorf("server %q: invalid metrics path %q: %w", s.Name, s.Path, err)
+		}
+	}
+
+	if s.Type == "imap" {
+		if err := ValidateIMAPDisabledCaps(s.DisabledCaps); err != nil {
+			return fmt.Errorf("server %q: %w", s.Name, err)
 		}
 	}
 
@@ -2709,8 +2810,10 @@ func (s *ServerConfig) MetricsPath() string {
 
 // WarnUnusedConfigOptions logs warnings for config options that don't apply to this server type
 func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...any)) {
-	if s.ReadOnlyAPIKey != "" && s.Type != "http_admin_api" {
-		logger("WARNING: Server %s (type: %s) has 'read_only_api_key' configured, but this only applies to http_admin_api servers", s.Name, s.Type)
+	for _, k := range serverTypeKeys {
+		if k.set(s) && !slices.Contains(k.appliedBy, s.Type) {
+			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "))
+		}
 	}
 	// Only these filter clients by address. Every other type, the User API proxy
 	// included, serves every client whatever the list says.
@@ -2934,6 +3037,35 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	}
 }
 
+// serverTypeKeys is each [[server]] key that only some server types read, with
+// those types. Every type accepts every key; WarnUnusedConfigOptions reports one
+// set on a type not listed.
+var serverTypeKeys = []struct {
+	name      string
+	set       func(*ServerConfig) bool
+	appliedBy []string
+}{
+	// The mail servers and proxies open their listener with this backlog; the
+	// HTTP servers listen with the kernel's default.
+	{"listen_backlog", func(s *ServerConfig) bool { return s.ListenBacklog != 0 }, []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
+	{"api_key", func(s *ServerConfig) bool { return s.APIKey != "" }, []string{"metrics", "http_admin_api"}},
+	{"read_only_api_key", func(s *ServerConfig) bool { return s.ReadOnlyAPIKey != "" }, []string{"http_admin_api"}},
+	// The User API backend issues the tokens; the proxy checks them and sets the
+	// CORS headers of the errors it answers itself.
+	{"jwt_secret", func(s *ServerConfig) bool { return s.JWTSecret != "" }, []string{"http_user_api", "user_api_proxy"}},
+	{"allowed_origins", func(s *ServerConfig) bool { return len(s.AllowedOrigins) > 0 }, []string{"http_user_api", "user_api_proxy"}},
+	{"token_duration", func(s *ServerConfig) bool { return s.TokenDuration != "" }, []string{"http_user_api"}},
+	{"token_issuer", func(s *ServerConfig) bool { return s.TokenIssuer != "" }, []string{"http_user_api"}},
+	// The metrics listener's path, and the collection settings only a metrics
+	// block applies (configureMetrics).
+	{"path", func(s *ServerConfig) bool { return s.Path != "" }, []string{"metrics"}},
+	{"enable_user_metrics", func(s *ServerConfig) bool { return s.EnableUserMetrics }, []string{"metrics"}},
+	{"enable_domain_metrics", func(s *ServerConfig) bool { return s.EnableDomainMetrics != nil }, []string{"metrics"}},
+	{"user_metrics_threshold", func(s *ServerConfig) bool { return s.UserMetricsThreshold != nil }, []string{"metrics"}},
+	{"max_tracked_users", func(s *ServerConfig) bool { return s.MaxTrackedUsers != nil }, []string{"metrics"}},
+	{"hash_usernames", func(s *ServerConfig) bool { return s.HashUsernames != nil }, []string{"metrics"}},
+}
+
 // serverLimitKeys is every [server.limits] key with the server types whose start
 // functions read it. Every type accepts every key; WarnUnusedConfigOptions reports
 // one set on a type not listed. A new limits key belongs here.
@@ -3033,6 +3165,61 @@ func (c *Config) HasMailBackend() bool {
 	return false
 }
 
+// NeedsDatabase reports whether the server queries the database. The mail backends, the
+// ManageSieve backend and the HTTP APIs keep their accounts there. A mail proxy
+// authenticates its users there (the LMTP proxy looks up its recipients) unless a remote
+// lookup answers for all of them, which takes remote_lookup enabled with
+// lookup_local_users = false. The User API proxy leaves logins to its backends; it only
+// checks a local user's token there, with lookup_local_users = true.
+func (s *ServerConfig) NeedsDatabase() bool {
+	switch s.Type {
+	case "imap", "lmtp", "pop3", "managesieve", "http_admin_api", "http_user_api":
+		return true
+	case "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy":
+		return s.RemoteLookup == nil || !s.RemoteLookup.Enabled || s.RemoteLookup.ShouldLookupLocalUsers()
+	case "user_api_proxy":
+		return s.RemoteLookup != nil && s.RemoteLookup.ShouldLookupLocalUsers()
+	}
+	return false
+}
+
+// DatabaseUser returns the first enabled server that queries the database, or nil when
+// the node runs none and so connects to no database.
+func (c *Config) DatabaseUser() *ServerConfig {
+	servers := c.GetAllServers()
+	for i := range servers {
+		if servers[i].NeedsDatabase() {
+			return &servers[i]
+		}
+	}
+	return nil
+}
+
+// HasDatabaseEndpoint reports whether [database.write] or [database.read] names a host.
+func (c *Config) HasDatabaseEndpoint() bool {
+	return (c.Database.Write != nil && len(c.Database.Write.Hosts) > 0) ||
+		(c.Database.Read != nil && len(c.Database.Read.Hosts) > 0)
+}
+
+// NeedsS3 reports whether the node connects to [s3]. A mail backend stores message bodies
+// there. The User API serves them from there (/user/messages/{id}/body and /raw) on a
+// node without a mail backend too, when [s3] has any connection setting; without one it
+// serves everything but bodies.
+func (c *Config) NeedsS3() bool {
+	if c.HasMailBackend() {
+		return true
+	}
+	if !c.S3.hasSettings() {
+		return false
+	}
+	for _, s := range c.GetAllServers() {
+		if s.Type == "http_user_api" {
+			return true
+		}
+	}
+	return false
+}
+
 // Problem is one reason Validate refuses a file: the part of the file it is about, as
 // an operator finds it ("server 'imap'", "[relay]", "trusted_networks"), and what is
 // wrong there.
@@ -3045,8 +3232,9 @@ type Problem struct {
 // by `sora-admin config validate`, returning every problem these checks find.
 //
 // What a node does not run is not checked: [uploader] and [cleanup] only with a mail
-// backend. Service setup still checks required database and S3 settings, S3 timeout,
-// external connectivity and the node's disk; passing Validate does not check those.
+// backend, [database] only with a server that queries it, [s3] only on a node that
+// connects to it, [cluster] only when enabled. Service setup still checks external
+// connectivity and the node's disk; passing Validate does not check those.
 func (c *Config) Validate() []Problem {
 	var problems []Problem
 	add := func(section string, err error) {
@@ -3057,7 +3245,14 @@ func (c *Config) Validate() []Problem {
 
 	servers := c.GetAllServers()
 	for i := range servers {
-		add(fmt.Sprintf("server '%s'", servers[i].Name), servers[i].Validate())
+		section := fmt.Sprintf("server '%s'", servers[i].Name)
+		add(section, servers[i].Validate())
+		// A proxy routes into its remote_addrs or into the file's [[pool]] blocks, and is
+		// not built without either. Pools are file-level, so ServerConfig.Validate cannot
+		// tell; with pools, ValidatePools checks how the proxy uses them.
+		if strings.HasSuffix(servers[i].Type, "_proxy") && len(servers[i].RemoteAddrs) == 0 && !c.HasPools() {
+			add(section, fmt.Errorf("remote_addrs is required unless the file declares [[pool]] blocks"))
+		}
 	}
 
 	// Named backend pools are validated as a whole: the checks cross the [[pool]] blocks
@@ -3107,6 +3302,14 @@ func (c *Config) Validate() []Problem {
 		// The cleaner takes [cleanup]; delivery takes its fts_retention too.
 		add("[cleanup]", c.Cleanup.Validate())
 	}
+
+	if user := c.DatabaseUser(); user != nil && !c.HasDatabaseEndpoint() {
+		add("[database]", fmt.Errorf("server %q (%s) needs the database, but it is not configured in [database.write] or [database.read]", user.Name, user.Type))
+	}
+	if c.NeedsS3() {
+		add("[s3]", c.S3.Validate())
+	}
+	add("[cluster]", c.Cluster.Validate())
 
 	return problems
 }

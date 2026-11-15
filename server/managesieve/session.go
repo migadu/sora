@@ -805,6 +805,9 @@ func (s *ManageSieveSession) PutScript(ctx context.Context, name, content string
 	updated := false
 	if script != nil {
 		if _, err := s.server.rdb.UpdateScriptWithRetry(ctx, script.ID, accountID, name, content); err != nil {
+			if errors.Is(err, db.ErrSieveScriptNotStorable) {
+				return false, &managesieveserver.Error{Message: msieve.Quote("Script validation failed: " + msieve.SanitizeText(err.Error()))}
+			}
 			return false, errTryLater
 		}
 		updated = true
@@ -812,6 +815,9 @@ func (s *ManageSieveSession) PutScript(ctx context.Context, name, content string
 		if _, err := s.server.rdb.CreateScriptWithRetry(ctx, accountID, name, content); err != nil {
 			if errors.Is(err, db.ErrSieveScriptLimitReached) {
 				return false, &managesieveserver.Error{Code: "QUOTA/MAXSCRIPTS", Message: "Too many scripts for this account"}
+			}
+			if errors.Is(err, db.ErrSieveScriptNotStorable) {
+				return false, &managesieveserver.Error{Message: msieve.Quote("Script validation failed: " + msieve.SanitizeText(err.Error()))}
 			}
 			return false, errTryLater
 		}

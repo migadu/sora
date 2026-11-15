@@ -144,12 +144,22 @@ files are still scanned and hashed, and are counted as skipped.
 
 ## 5. What Sora stores for each message
 
-**Body.** The file content is uploaded to S3 as it is, after decompression:
+**Body.** The file content is uploaded to S3 as it is, or decompressed when Dovecot stored it
+compressed (the `zlib` plugin, `mail_compress` in Dovecot 2.4). The format is recognised by the
+file's first bytes, never by its name; a file that starts with none of these is a plain message:
 
-- gzip files (Dovecot `zlib` plugin, magic bytes `1f 8b`) and bzip2 files (`BZh`) are
-  decompressed, up to 256 MiB of output.
-- zstd and lz4 files are refused with `zstd-compressed maildir file is not supported; decompress it
-  first` (or the lz4 equivalent) and count as failed.
+| Format | First bytes | Import |
+|---|---|---|
+| gzip | `1f 8b` | Decompressed. |
+| bzip2 | `BZh`, a level digit `1` to `9`, then a block (`31 41 59 26 53 59`) or end-of-stream (`17 72 45 38 50 90`) signature | Decompressed. |
+| Dovecot lz4 | `Dovecot-LZ4` then `0d 2a 9b c5` | Decompressed. This is Dovecot's own chunked layout, not the LZ4 frame format. |
+| zstd | `28 b5 2f fd` | Decompressed. A frame that needs a window above 128 MiB (libzstd's default limit) is refused. |
+| xz | `fd 37 7a 58 5a 00` | Refused: `xz-compressed maildir file is not supported; decompress it first`. |
+| LZ4 frame format | `04 22 4d 18` | Refused: `lz4-compressed maildir file is not supported; decompress it first`. |
+
+Decompression stops at 256 MiB of output. A refused file, a corrupt one, and one that
+decompresses to more than 256 MiB count as failed
+([section 11](#11-failures-retries-and-exit-status)).
 
 The body is encrypted on the way to S3 when `[s3] encrypt` is on, like any other body. Imported
 messages are marked uploaded at once; they never go through the upload spool.

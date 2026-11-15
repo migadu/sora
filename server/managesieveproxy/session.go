@@ -902,14 +902,14 @@ func (s *Session) connectToBackendAndAuth() error {
 		}
 		backendWriter.Flush()
 
-		// Read STARTTLS response (bounded)
-		response, err := server.ReadBoundedLine(backendReader, 8192)
+		// Read the STARTTLS response (bounded), with any literal its text is sent as
+		response, err := readBackendRecord(backendReader)
 		if err != nil {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: failed to read STARTTLS response: %w", server.ErrBackendConnectionFailed, err)
 		}
 
-		if !strings.HasPrefix(strings.TrimSpace(response), "OK") {
+		if backendStatus(response) != "OK" {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: backend STARTTLS failed: %s", server.ErrBackendConnectionFailed, strings.TrimSpace(response))
 		}
@@ -953,40 +953,56 @@ func (s *Session) connectToBackendAndAuth() error {
 	return s.authenticateToBackend()
 }
 
+// backendStatus returns the status of a backend response line: "OK", "NO" or "BYE", or
+// "" when the line is none of them. RFC 5804 section 4: response-ok = "OK" [SP "("
+// resp-code ")"] [SP string] CRLF, response-nobye = ("NO" / "BYE") likewise, and
+// "Implementations MUST accept these strings in a case-insensitive fashion". The atom
+// begins at column 0 and ends at SP or CRLF, and the length check keeps the folding
+// ASCII-only so a multi-byte fold-equivalent such as U+212A (KELVIN SIGN) cannot match.
+func backendStatus(line string) string {
+	atom, _, _ := strings.Cut(strings.TrimRight(line, "\r\n"), " ")
+	for _, status := range []string{"OK", "NO", "BYE"} {
+		if len(atom) == len(status) && strings.EqualFold(atom, status) {
+			return status
+		}
+	}
+	return ""
+}
+
 // readBackendCapabilities reads a capability list from the backend (its greeting, or the
 // list it re-issues after STARTTLS) up to the response that ends it: RFC 5804 section 4,
 // response-capability = *(single-capability) response-oknobye. A capability name is a
-// quoted or literal string, so a record whose first atom is OK, NO or BYE (case-insensitive,
-// section 4) is that response. Literal data must be consumed before another record's
-// status is inspected. NO or BYE is the backend refusing the connection (a sora
-// backend over its max_connections_per_ip answers NO (TRYLATER)): it ends the read at once
-// with the backend's line instead of being read past until EOF or the read deadline.
-// The argument what names the list in a read error.
+// quoted or literal string, so a record with a backendStatus is that response. Literal
+// data must be consumed before another record's status is inspected. NO or BYE is the
+// backend refusing the connection (a sora backend over its max_connections_per_ip answers
+// NO (TRYLATER)): it ends the read at once with the backend's line instead of being read
+// past until EOF or the read deadline. The argument what names the list in a read error.
 func (s *Session) readBackendCapabilities(r *bufio.Reader, what string) error {
 	for {
 		// Bounded: a misbehaving backend must not be able to grow the buffer
 		// without limit with a newline-less stream inside the deadline window.
-		line, err := readBackendCapabilityRecord(r)
+		line, err := readBackendRecord(r)
 		if err != nil {
 			return fmt.Errorf("%w: failed to read backend %s: %w", server.ErrBackendConnectionFailed, what, err)
 		}
-		line = strings.TrimSpace(line)
-		status, _, _ := strings.Cut(line, " ")
-		switch {
-		case strings.EqualFold(status, "OK"):
+		switch backendStatus(line) {
+		case "OK":
 			return nil
-		case strings.EqualFold(status, "NO"), strings.EqualFold(status, "BYE"):
+		case "NO", "BYE":
+			line = strings.TrimSpace(line)
 			s.WarnLog("backend refused the connection", "backend", s.serverAddr, "response", line)
 			return fmt.Errorf("%w: backend refused the connection: %s", server.ErrBackendConnectionFailed, line)
 		}
 	}
 }
 
-// readBackendCapabilityRecord returns the first physical line after consuming a
-// whole capability or terminal response, including server literals. Literal
-// contents may contain CRLF and status words; none begin a new response. Keep the
-// existing 8 KiB bound across the complete record, including literal contents.
-func readBackendCapabilityRecord(r *bufio.Reader) (string, error) {
+// readBackendRecord returns the first physical line after consuming a whole
+// capability line or response, including server literals: a capability's value and
+// the text of an OK, NO or BYE are strings, which may be literal-s2c (RFC 5804
+// section 4). Literal contents may contain CRLF and status words; none begin a new
+// response. Keep the existing 8 KiB bound across the complete record, including
+// literal contents.
+func readBackendRecord(r *bufio.Reader) (string, error) {
 	remaining := 8192
 	line, err := server.ReadBoundedLine(r, remaining)
 	if err != nil {
@@ -1047,8 +1063,9 @@ func (s *Session) authenticateToBackend() error {
 	// Bound the backend auth-response read; cleared on success before the relay phase (M6).
 	s.backendConn.SetReadDeadline(time.Now().Add(backendHandshakeTimeout(s.server.connManager.GetConnectTimeout())))
 
-	// Read authentication response (bounded)
-	response, err := server.ReadBoundedLine(backendReader, 8192)
+	// Read the authentication response (bounded), with any literal its text is sent as:
+	// what is left in the reader goes to the client once the relay starts.
+	response, err := readBackendRecord(backendReader)
 	if err != nil {
 		// CRITICAL: Invalidate cache on backend authentication failure
 		s.invalidateLookupCache("backend auth read error")
@@ -1057,7 +1074,7 @@ func (s *Session) authenticateToBackend() error {
 
 	s.DebugLog("Backend auth response", "response", strings.TrimSpace(response))
 
-	if !strings.HasPrefix(response, "OK") {
+	if backendStatus(response) != "OK" {
 		// CRITICAL: Invalidate cache on backend authentication failure
 		// This ensures the next request does fresh remotelookup/database lookup
 		// to pick up backend changes (e.g., domain moved to different server)

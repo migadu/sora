@@ -24,6 +24,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/pkg/sqlitefile"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/storage"
 	_ "modernc.org/sqlite"
@@ -69,10 +70,11 @@ type S3Importer struct {
 	lastContinuationToken string
 }
 
-// S3ObjectInfo represents an S3 object found during scanning
+// S3ObjectInfo represents an S3 object found during scanning. It carries no size:
+// the listed size is the stored object's, which with S3 encryption on is the
+// AES-256-GCM output and not the message; the message's size is its decrypted length.
 type S3ObjectInfo struct {
 	Key          string
-	Size         int64
 	LastModified time.Time
 	ETag         string
 }
@@ -86,7 +88,11 @@ func NewS3Importer(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, opti
 	dbPath := filepath.Join(tempDir, fmt.Sprintf("sora-s3-import-%d.db", time.Now().Unix()))
 	logger.Info("Using temporary database", "path", dbPath)
 
-	db, err := sql.Open("sqlite", dbPath)
+	dsn, err := sqlitefile.DSN(dbPath, "")
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
 	}
@@ -386,7 +392,7 @@ func (si *S3Importer) importFromS3() error {
 
 	logger.Info("Processing S3 objects", "count", si.totalObjects, "workers", si.options.Workers)
 
-	rows, err := si.db.Query("SELECT key, size, domain, local_part, content_hash FROM s3_objects WHERE processed = FALSE")
+	rows, err := si.db.Query("SELECT key FROM s3_objects WHERE processed = FALSE")
 	if err != nil {
 		return fmt.Errorf("failed to query unprocessed S3 objects: %w", err)
 	}
@@ -413,17 +419,13 @@ func (si *S3Importer) importFromS3() error {
 
 	// Feed jobs to workers
 	for rows.Next() {
-		var key, domain, localPart, contentHash string
-		var size int64
-		if err := rows.Scan(&key, &size, &domain, &localPart, &contentHash); err != nil {
+		var key string
+		if err := rows.Scan(&key); err != nil {
 			logger.Info("Failed to scan row", "error", err)
 			continue
 		}
 
-		jobs <- S3ObjectInfo{
-			Key:  key,
-			Size: size,
-		}
+		jobs <- S3ObjectInfo{Key: key}
 	}
 
 	close(jobs)
@@ -482,11 +484,13 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	}
 	defer reader.Close()
 
-	// Read content
+	// Read content. This is the message as stored, decrypted when S3 encryption is
+	// on, so its length is the message's size; the listed object size is not.
 	content, err := io.ReadAll(reader)
 	if err != nil {
 		return fmt.Errorf("failed to read S3 content: %w", err)
 	}
+	size := int64(len(content))
 
 	// Parse message
 	messageContent, err := server.ParseMessage(bytes.NewReader(content))
@@ -508,8 +512,11 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 		references = nil
 	}
 
-	if sentDate.IsZero() {
-		sentDate = time.Now()
+	// The Date: header is the INTERNALDATE too; a message without one that parses
+	// arrives now and keeps a zero sentDate (db.InsertMessageOptions.SentDate).
+	internalDate := sentDate
+	if internalDate.IsZero() {
+		internalDate = time.Now()
 	}
 
 	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(content))
@@ -552,8 +559,8 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 			MailboxName:   mailbox.Name,
 			ContentHash:   contentHash,
 			MessageID:     messageID,
-			InternalDate:  sentDate,
-			Size:          obj.Size,
+			InternalDate:  internalDate,
+			Size:          size,
 			Subject:       subject,
 			PlaintextBody: actualPlaintextBody,
 			SentDate:      sentDate,
@@ -566,7 +573,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 		db.PendingUpload{
 			InstanceID:  hostname,
 			ContentHash: contentHash,
-			Size:        obj.Size,
+			Size:        size,
 			AccountID:   user.AccountID(),
 		})
 

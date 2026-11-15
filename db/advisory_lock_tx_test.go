@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -336,4 +337,87 @@ func TestAdvisoryLockTxGuardCancelsWhenLocksAreLost(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Release must cancel outstanding guards")
 	}
+}
+
+// A failover fences the locks held on the server Sora stopped writing through: the
+// guarded work is cancelled at once, also on a transaction whose statement is still in
+// flight (a Lock waiting for its holder), a lock taken across the fence does not count,
+// and a retired write database opens no lock transactions until it is reinstated.
+func TestAdvisoryLockTxFence(t *testing.T) {
+	database := advisoryLockTestDB(t)
+	ctx := context.Background()
+	id := GetS3ObjectLockID(1, fmt.Sprintf("advisory-fence-%d", time.Now().UnixNano()))
+
+	holder, err := database.BeginAdvisoryLockTx(ctx)
+	require.NoError(t, err)
+	defer holder.Release()
+	acquired, err := holder.TryLock(ctx, id)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	waiter, err := database.BeginAdvisoryLockTx(ctx)
+	require.NoError(t, err)
+	defer waiter.Release()
+	waiterGuard, doneWaiter := waiter.Guard(ctx)
+	defer doneWaiter()
+	waited := make(chan error, 1)
+	go func() { waited <- waiter.Lock(ctx, id) }()
+	require.Eventually(t, func() bool {
+		var waiting int
+		require.NoError(t, database.GetWritePool().QueryRow(ctx, `
+			SELECT count(*) FROM pg_locks
+			WHERE locktype = 'advisory' AND NOT granted
+			  AND classid = $1::bigint::oid AND objid = $2::bigint::oid AND objsubid = 1
+		`, int64(uint64(id)>>32), int64(uint32(uint64(id)))).Scan(&waiting))
+		return waiting == 1
+	}, 5*time.Second, 20*time.Millisecond, "the waiter must be waiting for the lock")
+
+	cause := errors.New("write operations moved to another host")
+	database.FenceAdvisoryLocks(cause)
+	assert.ErrorIs(t, context.Cause(waiterGuard), ErrAdvisoryLocksFenced, "the fence must not wait for the statement in flight")
+	assert.ErrorIs(t, context.Cause(waiterGuard), cause)
+	assert.ErrorIs(t, holder.Err(), ErrAdvisoryLocksFenced)
+	assert.ErrorIs(t, holder.Ping(ctx), ErrAdvisoryLocksFenced)
+
+	fresh, err := database.BeginAdvisoryLockTx(ctx)
+	require.NoError(t, err, "a lock transaction opened after a fence is not affected")
+	assert.NoError(t, fresh.Ping(ctx))
+	fresh.Release()
+
+	holder.Release()
+	assert.ErrorIs(t, <-waited, ErrAdvisoryLocksFenced, "a lock granted across the fence must not count")
+	waiter.Release()
+
+	database.RetireWriter(cause)
+	_, err = database.BeginAdvisoryLockTx(ctx)
+	assert.ErrorIs(t, err, ErrAdvisoryLocksFenced, "a retired write database must open no lock transactions")
+	database.ReinstateWriter()
+	again, err := database.BeginAdvisoryLockTx(ctx)
+	require.NoError(t, err)
+	defer again.Release()
+	acquired, err = again.TryLock(ctx, id)
+	require.NoError(t, err)
+	assert.True(t, acquired, "the fenced transactions must have released the lock")
+}
+
+// A lock transaction that started opening before a fence and registers after it may
+// hold one of the connections the fence revoked (the pool was reset in between), so it
+// is refused; one that starts after the fence is not.
+func TestAdvisoryLockFenceRefusesTransactionsOpenedAcrossIt(t *testing.T) {
+	var f advisoryLockFence
+	before, err := f.admit()
+	require.NoError(t, err)
+	f.revoke(errors.New("write pool reset"), false)
+	assert.ErrorIs(t, f.register(&AdvisoryLockTx{fence: &f}, before), ErrAdvisoryLocksFenced)
+
+	after, err := f.admit()
+	require.NoError(t, err)
+	assert.NoError(t, f.register(&AdvisoryLockTx{fence: &f}, after))
+
+	f.revoke(errors.New("write operations moved to another host"), true)
+	_, err = f.admit()
+	assert.ErrorIs(t, err, ErrAdvisoryLocksFenced)
+	f.reinstate()
+	_, err = f.admit()
+	assert.NoError(t, err)
 }
