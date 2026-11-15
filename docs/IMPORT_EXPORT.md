@@ -534,6 +534,18 @@ writes it, so `v1.2` is subscribed as `v1\2e2`.
 `dovecot-uidlist` with the mailbox's UIDVALIDITY and each message's Sora UID. An existing
 uidlist in the target is merged: its entries for files still present are kept.
 
+**Links in the target.** The target may be a maildir its owner could write to, while the export
+runs with more privileges, so message and Dovecot contents and Maildir child directories below
+it are accessed through the opened target directory. `--maildir-path` itself may be a link.
+Each exported content file (a message,
+`dovecot-keywords`, `subscriptions`, `dovecot-uidlist`) is written as a new file and renamed over
+its name, so a symbolic or hard link at that name is replaced, and the file it points to is left
+alone. A mailbox directory, `cur/`, `new/` or `tmp/` that is a link is followed only when the link
+is relative and its target is below the target directory; any other link makes the export fail
+before it writes a message, naming the path. An existing `dovecot-keywords` or `dovecot-uidlist`
+that is such a link is not read, and is replaced as if it were not there. The SQLite cache and
+its sidecars still use ordinary paths; their policy is unchanged ([section 8](#8-the-sqlite-cache-sora-maildirdb)).
+
 **Re-runs.** The exporter keeps `sora-maildir.db` in the target directory, with the same schema
 as the importer's ([section 8](#8-the-sqlite-cache-sora-maildirdb)), and records each exported
 message by content hash and mailbox. On a re-run:

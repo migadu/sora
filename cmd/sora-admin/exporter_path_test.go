@@ -1,12 +1,35 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// TestExporterMailboxDirContainment verifies that mailboxDir keeps every
+// mailboxDir is the path of the maildir directory (the parent of cur/new/tmp) of an
+// IMAP mailbox name: mailboxDirName below the export directory.
+func (exporter *Exporter) mailboxDir(mailboxName string) (string, error) {
+	name, err := exporter.mailboxDirName(mailboxName)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(exporter.maildirPath, name), nil
+}
+
+// newDirExporter returns an exporter that lays out mailbox directories and files in
+// dir, without the export cache NewExporter opens there.
+func newDirExporter(t *testing.T, dir string) *Exporter {
+	t.Helper()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { root.Close() })
+	return &Exporter{maildirPath: dir, root: root}
+}
+
+// TestExporterMailboxDirContainment verifies that mailboxDirName keeps every
 // resolved path within the export root, blocking path traversal via ".."
 // mailbox names (M5).
 func TestExporterMailboxDirContainment(t *testing.T) {
