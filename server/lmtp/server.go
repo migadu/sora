@@ -220,7 +220,8 @@ type LMTPServerBackend struct {
 	maxRedirectHops    int
 
 	// sharedMailboxes is [shared_mailboxes]: Sieve fileinto :create never makes a
-	// personal mailbox in its namespace.
+	// personal mailbox in its namespace, and neither a fileinto nor Sieve
+	// mailboxexists resolves its root (delivery.FileintoTarget).
 	sharedMailboxes config.SharedMailboxesConfig
 
 	// Per-command hard execution timeouts (nil = use defaults)
