@@ -98,6 +98,11 @@ mailboxes stay visible and usable for the users who have rights on them.
   `NO [CANNOT] Cannot create the shared namespace root directly...`, and `SELECT Shared` with
   `NO [CANNOT] The shared namespace root cannot be selected...`. When the root exists as a parent
   and has children, `LIST` marks it `\Noselect`.
+- **The root holds no messages.** `APPEND`, `COPY` and `MOVE` to it are refused with
+  `NO [CANNOT] The shared namespace root holds no messages...`, whether or not it exists. Sieve
+  `fileinto` of the root (also through the default script's `user+shared@` filing) and an Admin API
+  delivery naming it as the target mailbox keep the message in INBOX, and Sieve `mailboxexists`
+  reports it as missing.
 - **Whether a mailbox is shared is fixed when it is created.** `RENAME` cannot move a mailbox into
   or out of the namespace: `NO [CANNOT] Mailboxes cannot be moved into or out of the shared namespace`.
   The one exception is a personal folder that already sat under the prefix: it may be renamed out.
