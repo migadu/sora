@@ -87,3 +87,38 @@ func TestShutdownRacingStartEndsStart(t *testing.T) {
 		waitStartReturned(t, done, errChan)
 	}
 }
+
+// Close on its own, without the caller cancelling the parent context (for
+// example when New was handed context.Background()), must stop Start both
+// before and while Start creates its listener, just as POP3Server.Close and
+// ManageSieveServer.Close do via their child server context.
+func TestCloseBeforeStartDoesNotServe(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	b := newShutdownTestBackend(t, context.Background(), addr)
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	done, errChan := startBackend(b)
+	waitStartReturned(t, done, errChan)
+
+	if c, err := net.Dial("tcp", addr); err == nil {
+		c.Close()
+		t.Fatalf("%s accepts connections after Close before Start", addr)
+	}
+
+	for i := 0; i < 20; i++ {
+		b := newShutdownTestBackend(t, context.Background(), "127.0.0.1:0")
+		done, errChan := startBackend(b)
+		time.Sleep(time.Duration(i) * 100 * time.Microsecond)
+		if err := b.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		waitStartReturned(t, done, errChan)
+	}
+}
