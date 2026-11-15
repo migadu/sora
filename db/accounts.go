@@ -158,6 +158,10 @@ func (db *Database) AddCredential(ctx context.Context, tx pgx.Tx, req AddCredent
 
 	// If this should be the new primary identity, unset the current primary
 	if req.IsPrimary {
+		if err = lockPrimaryIdentityChanges(ctx, tx, req.AccountID); err != nil {
+			return err
+		}
+
 		// Guard: promoting a different-domain credential to primary on a populated account
 		// would split the account's message storage across two s3_domain prefixes.
 		if err = guardCrossDomainPrimaryChange(ctx, tx, req.AccountID, newAddress.Domain()); err != nil {
@@ -251,6 +255,10 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 
 	// Begin transaction if we need to handle primary identity change
 	if req.MakePrimary {
+		if err = lockPrimaryIdentityChanges(ctx, tx, accountID); err != nil {
+			return err
+		}
+
 		// Guard: switching the primary to a different-domain credential on a populated
 		// account would split the account's message storage across two s3_domain prefixes.
 		if err = guardCrossDomainPrimaryChange(ctx, tx, accountID, address.Domain()); err != nil {
@@ -423,6 +431,23 @@ func getPrimaryDomainInTx(ctx context.Context, tx pgx.Tx, accountID int64) (stri
 		return "", fmt.Errorf("invalid primary address %q in database: %w", addr, err)
 	}
 	return parsed.Domain(), nil
+}
+
+// lockPrimaryIdentityChanges serialises the account's primary-identity changes for the
+// rest of tx. It is taken before guardCrossDomainPrimaryChange reads the current primary
+// and before the UPDATE that clears it. Without it, a change that starts while another is
+// uncommitted reads the old primary, waits for the other's row lock on it and then skips
+// it (already cleared), never seeing the other's new primary: it clears nothing, and
+// setting its own credential primary violates idx_credentials_account_id_one_primary
+// (23505). Once the lock is granted, the next statement takes a new snapshot under READ
+// COMMITTED and sees the primary the previous holder committed. The lock is
+// transaction-scoped (pgbouncer transaction mode) and precedes the row locks.
+func lockPrimaryIdentityChanges(ctx context.Context, tx pgx.Tx, accountID int64) error {
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int4, hashint8($2::int8))",
+		consts.SoraPrimaryIdentityLockClassID, accountID); err != nil {
+		return fmt.Errorf("failed to lock account primary identity changes: %w", err)
+	}
+	return nil
 }
 
 // guardCrossDomainPrimaryChange blocks switching an account's primary identity to newDomain
