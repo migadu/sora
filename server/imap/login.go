@@ -197,9 +197,12 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 	// guesses at the master password stay metered; only a success is the account's.
 	masterForm := len(s.server.masterUsername) > 0 && addressParsed.HasSuffix() && checkMasterCredential(addressParsed.Suffix(), s.server.masterUsername)
 	if masterForm && len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
-		if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
-			metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-			return authFailedError()
+		// Every refusal of the correct master password below costs what a wrong one
+		// costs (refuseLikeWrongPassword), or its response time confirms the guessed
+		// password, here to a peer the gate keeps out. No limiter: the helper records
+		// the failure, once.
+		if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, nil, netConn, proxyInfo, authKey, "master username") {
+			return s.refuseLikeWrongPassword(ctx, address, password, netConn, proxyInfo, authKey)
 		}
 		// Use base address (without suffix) to get account
 		AccountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, addressParsed.BaseAddress())
@@ -230,17 +233,14 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 				}
 			}
 
-			// Same reply and same accounting as a bad credential, as in the
-			// AUTHENTICATE PLAIN master path (sasl.go). This site is reachable
-			// ONLY with the correct master password, so a distinguishable reply,
-			// or a failure the master credential is not charged for, confirms a
-			// guessed tenant-wide password without completing an authentication.
+			// Same reply, accounting and password-verification work as a bad
+			// credential, as in the AUTHENTICATE PLAIN master path (sasl.go). This
+			// site is reachable ONLY with the correct master password, so a
+			// distinguishable reply, a failure the master credential is not charged
+			// for, or a quicker one confirms a guessed tenant-wide password without
+			// completing an authentication.
 			s.WarnLog("impersonation target rejected (account not found)", "target_user", addressParsed.BaseAddress(), "error", err)
-			metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
-			return authFailedError()
+			return s.refuseLikeWrongPassword(ctx, address, password, netConn, proxyInfo, authKey)
 		}
 		method = "master"
 	} else {
