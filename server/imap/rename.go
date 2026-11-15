@@ -34,24 +34,28 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 		ctx = context.WithValue(ctx, consts.ConfigContextKey, s.server.config)
 	}
 
+	// The new name is checked as CREATE checks its name: a trailing delimiter is no
+	// part of it (RFC 9051 §6.3.4), and RENAME creates the superior names it needs
+	// (§6.3.6), so an empty level ("r//s", "/lead") or a "." / ".." level (maildir
+	// export path traversal) is refused before any of them is created.
+	// db.RenameMailbox refuses these names too, for non-IMAP callers.
+	created, err := helpers.MailboxNameToCreate(newName)
+	if err != nil {
+		s.DebugLog("rejecting rename to an invalid mailbox name", "name", newName)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeCannot,
+			Text: "Invalid mailbox name",
+		}
+	}
+	newName = created
+
 	if strings.EqualFold(existingName, newName) {
 		s.DebugLog("new mailbox name is the same as current one (case-insensitive)", "mailbox", existingName)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeAlreadyExists,
 			Text: "The new mailbox name is the same as the current one.",
-		}
-	}
-
-	// Reject path-traversal segments ("." / "..") in the destination with a
-	// clean client error (db.RenameMailbox enforces this too, as defence-in-depth
-	// for non-IMAP callers).
-	if helpers.MailboxNameHasTraversal(newName) {
-		s.DebugLog("rejecting rename to name with path traversal segment", "name", newName)
-		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeCannot,
-			Text: "Invalid mailbox name",
 		}
 	}
 
@@ -181,7 +185,7 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 			if resolveErr != nil {
 				return s.internalError("failed to resolve S3 owner for INBOX rename: %v", resolveErr)
 			}
-			_, err = s.server.rdb.MoveMessagesWithRetry(ctx, &uids, oldMailbox.ID, newMailbox.ID, AccountID, domain, localpart, s.server.hostname, nil, nil)
+			_, err = s.server.rdb.MoveMessagesWithRetry(ctx, &uids, oldMailbox.ID, newMailbox.ID, AccountID, domain, localpart, s.server.hostname, nil, nil, nil)
 		}
 		if err != nil {
 			return s.internalError("failed to move messages from INBOX to '%s': %v", newName, err)

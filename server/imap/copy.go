@@ -279,7 +279,7 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 // command read the message (a read racing the upload, or a lagging replica). The caller
 // then handles the body as an uploaded one, in S3.
 func (s *IMAPSession) stageCrossAccountBody(command, contentHash string, srcAccountID, destAccountID int64) (bool, *imap.Error) {
-	err := helpers.LinkOrCopyFile(s.server.uploader.FilePath(contentHash, srcAccountID), s.server.uploader.FilePath(contentHash, destAccountID))
+	err := s.server.uploader.LinkStaged(contentHash, srcAccountID, destAccountID)
 	if err == nil {
 		return true, nil
 	}
@@ -290,11 +290,7 @@ func (s *IMAPSession) stageCrossAccountBody(command, contentHash string, srcAcco
 	// A fault of this node's spool. The error names its files, which mean nothing to
 	// the client, so the response carries only the cause.
 	s.WarnLog("failed to stage body for cross-account "+command, "hash", contentHash, "error", err)
-	var pathErr *fs.PathError
-	if errors.As(err, &pathErr) {
-		err = pathErr.Err
-	}
-	return false, s.internalError("failed to stage message body for cross-account %s: %v", command, err)
+	return false, s.internalError("failed to stage message body for cross-account %s: %v", command, helpers.FileErrorCause(err))
 }
 
 // crossAccountObjectError answers a failed S3 check or copy of a cross-account body.

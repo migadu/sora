@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,15 +62,17 @@ type IMAPSession struct {
 	lastHighestUID        imap.UID
 	recentAboveUID        imap.UID    // Messages above this UID are \Recent in this session (RFC 3501 §2.3.2); set by SELECT
 	useMasterDB           atomic.Bool // Pin session to master DB after a write to ensure consistency
-	selectedReadOnly      atomic.Bool // True when the selected mailbox was opened with EXAMINE (RFC 3501 §6.3.2)
+	selectedReadOnly      atomic.Bool // True when the selected mailbox is read-only: opened with EXAMINE, or SELECTed without any of the 'iestw' rights
+	selectedExamined      atomic.Bool // True when the selected mailbox was opened with EXAMINE itself (RFC 9051 §6.3.3)
 
-	// A CONDSTORE STORE .SILENT answers its changed rows itself with
-	// FETCH (UID MODSEQ) (RFC 7162 §3.1.3). ownStoreMu serializes that STORE
-	// with Poll so Poll can tell those changes from foreign ones; it is taken
-	// before s.mutex, never while holding it. ownStoreEcho maps each UID so
-	// reported to its mod-sequence, in mailbox ownStoreEchoMailboxID; Poll
-	// skips exactly those updates instead of echoing them with FLAGS. Both
-	// fields are guarded by ownStoreMu.
+	// A STORE answers its rows itself: with FETCH (FLAGS) when not .SILENT
+	// (RFC 9051 §6.4.6), with FETCH (UID MODSEQ) for a CONDSTORE .SILENT
+	// (RFC 7162 §3.1.3). ownStoreMu serializes that STORE with Poll so Poll
+	// can tell those rows from foreign changes; it is taken before s.mutex,
+	// never while holding it. ownStoreEcho maps each UID so reported to its
+	// mod-sequence, in mailbox ownStoreEchoMailboxID; Poll skips exactly
+	// those updates instead of reporting them again. Both fields are guarded
+	// by ownStoreMu.
 	ownStoreMu            sync.Mutex
 	ownStoreEcho          map[imap.UID]uint64
 	ownStoreEchoMailboxID int64
@@ -171,9 +174,11 @@ func (s *IMAPSession) requireCapability(c imap.Cap, what string) error {
 // FETCH-style response for this session. Per RFC 7162 §3.2 that requires two things:
 // the client must have become CONDSTORE-aware on this connection (issued a
 // CONDSTORE-enabling command — tracked by go-imap), AND the session must still
-// advertise CONDSTORE (so a capability filter, e.g. for iOS, can suppress it
-// mid-connection). Emitting MODSEQ to a client that never enabled CONDSTORE breaks
-// strict parsers such as mbsync/isync.
+// advertise CONDSTORE. A capability filter (e.g. for iOS) withdraws CONDSTORE only
+// from a client that is not CONDSTORE-aware yet: one matched later leaves it in
+// place (applyCapabilityFilters), since RFC 7162 §3.1 wants mod-sequences "until
+// the connection is closed". Emitting MODSEQ to a client that never enabled
+// CONDSTORE breaks strict parsers such as mbsync/isync.
 func (s *IMAPSession) condStoreEnabled() bool {
 	return s.conn != nil && s.conn.CondStoreEnabled() && s.GetCapabilities().Has(imap.CapCondStore)
 }
@@ -227,12 +232,37 @@ func (s *IMAPSession) applyCapabilityFilters() {
 		caps[cap] = struct{}{}
 	}
 
+	// Capabilities already enabled on this connection cannot be withdrawn:
+	// "Once enabled using ENABLE, each extension remains active until the IMAP
+	// connection is closed" (RFC 9051 §6.3.1), and a CONDSTORE-aware client gets
+	// mod-sequences "until the connection is closed" (RFC 7162 §3.1). Pass keep
+	// into the filter pass so capabilities satisfied by keep are neither deleted
+	// nor cascaded from (preserving e.g. ESORT/MULTISEARCH when ESEARCH stays
+	// active via IMAP4rev2, or QRESYNC when CONDSTORE stays active).
+	var keep imap.CapSet
+	for c := range s.enabledCaps() {
+		if _, offered := s.server.caps[c]; !offered {
+			continue
+		}
+		if keep == nil {
+			keep = make(imap.CapSet)
+		}
+		keep[c] = struct{}{}
+	}
+
 	// Apply capability filtering based on client identification and/or TLS fingerprint
-	disabledCaps := s.server.filterCapabilitiesForClient(caps, s.clientID, s.ja4Fingerprint)
+	disabledCaps, kept := s.server.filterCapabilitiesForClientExcept(caps, s.clientID, s.ja4Fingerprint, keep)
+	if len(kept) > 0 {
+		slices.Sort(kept)
+		kept = slices.Compact(kept)
+	}
 
 	// Atomic store - safe for concurrent access
 	s.sessionCaps.Store(caps)
 
+	if len(kept) > 0 {
+		s.InfoLog("capability filters partly applied, the connection has enabled what they disable", "kept", kept)
+	}
 	if len(disabledCaps) > 0 {
 		var clientInfo string
 		if s.clientID != nil {
@@ -244,6 +274,25 @@ func (s *IMAPSession) applyCapabilityFilters() {
 		}
 		s.InfoLog("capability filters applied", "client", clientInfo, "disabled", disabledCaps, "enabled", len(caps), "total", originalCapCount)
 	}
+}
+
+// enabledCaps returns the extensions this connection has enabled: those the
+// client named in ENABLE, CONDSTORE once the client has issued any CONDSTORE
+// enabling command (SELECT (CONDSTORE), FETCH MODSEQ, ...: RFC 7162 §3.1), and
+// IMAP4rev2 on a server that does not offer IMAP4rev1, where go-imap serves
+// every connection IMAP4rev2.
+func (s *IMAPSession) enabledCaps() imap.CapSet {
+	if s.conn == nil {
+		return nil
+	}
+	enabled := s.conn.EnabledCaps()
+	if s.conn.IsIMAP4rev2() {
+		enabled[imap.CapIMAP4rev2] = struct{}{}
+	}
+	if s.conn.CondStoreEnabled() {
+		enabled[imap.CapCondStore] = struct{}{}
+	}
+	return enabled
 }
 
 // pinnedContext returns ctx marked to read from the master DB when the session is
@@ -497,6 +546,7 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.releaseBodySectionCache()
 	s.selectedMailbox = nil
 	s.selectedReadOnly.Store(false)
+	s.selectedExamined.Store(false)
 	s.mailboxTracker = nil
 	s.sessionTracker = nil
 	s.currentHighestModSeq.Store(0)

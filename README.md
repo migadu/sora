@@ -1,718 +1,132 @@
-# SORA — Mail Server
+# Sora
 
-**Sora** is a cloud-native email server built for scalability and resilience.  
-It provides enterprise-grade email infrastructure with modern storage backends, comprehensive monitoring, clustering capabilities, and advanced proxy features.
+Sora is a mail server written in Go. It stores mail for many accounts and serves it to mail
+clients over IMAP and POP3. It takes incoming mail from your mail transfer agent over LMTP, runs
+each user's Sieve filters, and lets users manage those filters over ManageSieve. An Admin API
+manages accounts and watches the servers, and a User API serves web and mobile apps.
 
----
+Sora keeps message metadata (mailboxes, flags, headers, structure) in PostgreSQL and message bodies
+in S3-compatible object storage. The same `sora` program runs as a backend, which stores mail, or
+as a proxy, which checks logins and routes each user to a backend, so one setup can grow from a
+single server to many.
 
-## Features
+## What it does
 
-### Core Protocols
-- **IMAP4rev1** server with IDLE, CONDSTORE, ESEARCH, SORT, MOVE, ACL, BINARY, and other extensions
-- **LMTP** for reliable message delivery with SIEVE filtering and vacation auto-reply loop prevention
-- **POP3** with SASL authentication and multi-layer timeout protection
-- **ManageSieve** for script management with STARTTLS
-- **SIEVE** filtering with vacation responses, editheader, fileinto :copy, redirect :copy
-- **HTTP API** for administration and monitoring
-
-### Storage Architecture
-- **PostgreSQL** for metadata with full-text search (pg_trgm, btree_gin)
-- **S3-compatible** object storage for message bodies with content deduplication
-- **Local cache** for frequently accessed messages, providing read-level deduplication
-- **Configurable retention** with grace periods and ephemeral storage
-
-### Shared Mailboxes (RFC 4314)
-- **Access Control Lists (ACL)** with 11 standard rights (lrswipkxtea)
-- **IMAP ACL commands**: MYRIGHTS, GETACL, SETACL, DELETEACL, LISTRIGHTS
-- **Same-domain enforcement** for security
-- **Configurable namespace** for shared mailboxes
-
-### Clustering Features
-- **Gossip-based coordination** using HashiCorp memberlist
-- **Let's Encrypt integration** with automatic certificate renewal
-- **S3-backed certificate storage** for cluster-wide sharing
-- **Cluster-wide rate limiting** with 50-200ms synchronization
-- **Hot reload** for TLS certificates without restart
-- **Leader election** for certificate management
-- **Connection tracking** across cluster nodes
-
-### Production Features
-- **Connection pooling** with read/write separation
-- **Circuit breakers** for external service failures
-- **Health monitoring** with component status tracking (26 Prometheus metrics)
-- **Rate limiting** with cluster-wide synchronization and IP blocking
-- **Connection limits** per protocol, per IP, and per user
-- **Background workers** with distributed task processing
-- **Relay queue** with disk persistence and exponential backoff retry
-- **JA4 TLS fingerprinting** for client detection and capability filtering
-
-### Proxy Mode 
-- **Multi-backend support** for horizontal scaling
-- **Load balancing** across backend servers
-- **Server affinity** for consistent user routing
-- **Health-based routing** with automatic failover
-- **Protocol support**: IMAP, POP3, ManageSieve, LMTP
-
----
-
-## Use Cases
-
-Sora is designed for:
-
-- **Production email infrastructure** at scale
-- **Multi-tenant email hosting** with proxy load balancing
-- **Cloud-native deployments** with Kubernetes/containers
-- **High-availability setups** with clustered nodes
-- **Custom email solutions** with modern storage backends
-- **Collaborative email** with shared mailboxes and ACL
-
----
+- **IMAP** (IMAP4rev1 and IMAP4rev2) with IDLE, NOTIFY, CONDSTORE and QRESYNC, MOVE, SORT and
+  THREAD, ESEARCH, METADATA, ACL and, when you turn it on, PREVIEW. See
+  [Protocol Support](https://github.com/migadu/sora/wiki/Protocol-Support).
+- **POP3**, **LMTP** and **ManageSieve**.
+- **Sieve** filtering at delivery, with vacation replies, redirects, `fileinto`, plus addressing
+  and, when you turn it on, `editheader`.
+- **Full-text search** of message bodies, indexed in PostgreSQL per account.
+- **Shared mailboxes** with RFC 4314 access control lists (off by default).
+- **Proxies** for every protocol, with routing by remote lookup, affinity, consistent hashing and
+  named backend pools.
+- **A gossip cluster** between nodes, for per-user connection limits on proxies, cluster-wide
+  kicks, routing affinity and Let's Encrypt certificates.
+- **Protection** with login rate limits, connection limits, command and idle timeouts, and limits
+  on message size, session memory and search cost.
+- **Operations**: Prometheus metrics, health checks, an Admin API, the `sora-admin` tool, and
+  maildir import and export (with Dovecot UIDs and keywords).
 
 ## Requirements
 
-- Go 1.24+
-- PostgreSQL 14+ with the pg_trgm and btree_gin extensions (both ship with contrib and are
-  trusted, so no superuser is needed)
-- S3-compatible object storage (MinIO, AWS S3, etc.)
-- Port 7946 (for cluster gossip protocol, optional)
-- Port 80 (for Let's Encrypt HTTP-01 challenges, optional)
+- Go 1.25.0 or later, to build (`go 1.25.0` in `go.mod`).
+- PostgreSQL 14 or later, with the `pg_trgm` and `btree_gin` extensions. Both ship with
+  PostgreSQL's contrib package. Sora applies its own database migrations when it starts.
+- An S3-compatible object store for message bodies, such as MinIO.
+- A mail transfer agent, such as Postfix, that delivers to Sora over LMTP.
 
----
+## Building
 
-## Getting Started
-
-1.  **Clone the repository:**
-```bash
-git clone https://github.com/yourname/sora.git
+```sh
+git clone https://github.com/migadu/sora.git
 cd sora
-```
-
-2.  **Create and edit your configuration file:**
-Copy the example configuration and then edit `config.toml` with your specific settings (database credentials, S3 details, server preferences, etc.).
-```bash
-cp config.toml.example config.toml
-nano config.toml # Or your preferred editor
-```
-Refer to the comments within `config.toml.example` for guidance on each option.
-
-3.  **Build the executables:**
-```bash
 make build
 ```
-This creates two executables:
-- `sora` - The main email server (from `cmd/sora`)
-- `sora-admin` - Administrative tool for account management (from `cmd/sora-admin`)
 
-4.  **Create accounts:**
-Before running the server, create email accounts using the admin tool:
-```bash
-./sora-admin accounts create --config config.toml --email user@example.com --password secretpassword
+`make build` creates two programs in the repository root, with the version, commit and build date
+stamped in:
+
+- `sora`, the server.
+- `sora-admin`, the command-line tool for accounts, mailboxes, messages, imports and checks.
+
+`make build-linux-musl` and `make build-freebsd` cross-compile static binaries. `make help` lists
+every target.
+
+## Running
+
+Sora reads one TOML file, given with `-config`:
+
+```sh
+./sora -config config.toml
+./sora -version
 ```
 
-5.  **Run Sora:**
-Start the email server:
-```bash
-./sora --config config.toml
+[`config.toml.example`](config.toml.example) shows every option with a comment. Start from a small
+file instead: [Configuration Overview](https://github.com/migadu/sora/wiki/Configuration-Overview)
+has a minimal working one, and [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) lists every key
+with its default. Check a file without starting the server:
+
+```sh
+./sora-admin --config config.toml config validate
 ```
 
----
+To try Sora on your own computer, follow
+[Local Try-Out](https://github.com/migadu/sora/wiki/Setup-Local-Try-Out). To run it as a service,
+see [Running in Production](https://github.com/migadu/sora/wiki/Running-in-Production) and the
+service files in [`dist/`](dist).
 
-## Configuration
+## Running the tests
 
-See `config.toml.example` for comprehensive documentation of all configuration options.
-
-### Key Configuration Areas
-
-#### Database Configuration
-```toml
-[database]
-host = "localhost"
-port = 5432
-dbname = "sora_mail_db"
-user = "postgres"
-password = "your-password"
-
-# Connection pooling with separate read/write endpoints
-max_conns = 100           # Maximum connections in pool
-min_conns = 10            # Minimum idle connections
-max_conn_lifetime = "1h"  # Connection lifetime
-max_conn_idle_time = "30m" # Maximum idle time
-
-# Optional read replicas for scaling
-[[database.read_endpoints]]
-host = "replica1.example.com"
-port = 5432
+```sh
+make tests                        # all Go tests; the db package needs PostgreSQL
+make integration-tests            # the integration suite; needs PostgreSQL
+make integration-tests-imap       # one area; `make help` lists them all
 ```
 
-#### S3 Storage Configuration
-```toml
-[s3]
-endpoint = "s3.amazonaws.com"
-region = "us-east-1"
-bucket = "sora-messages"
-access_key = "your-access-key"
-secret_key = "your-secret-key"
-use_ssl = true
-```
-
-#### Server Configuration
-```toml
-[[servers]]
-type = "imap"
-start = true
-addr = ":143"
-tls = false
-
-[[servers]]
-type = "imap"
-start = true
-addr = ":993"
-tls = true
-tls_cert_file = "/path/to/cert.pem"
-tls_key_file = "/path/to/key.pem"
-
-max_connections = 1000       # Total connection limit
-max_connections_per_ip = 10  # Per-IP limit
-```
-
-#### Cluster Configuration
-```toml
-[cluster]
-enabled = true
-addr = "10.10.10.40:7946"  # MUST be specific IP reachable from other nodes (NOT 0.0.0.0 or localhost)
-node_id = "node-1"
-peers = ["10.10.10.41:7946", "10.10.10.42:7946"]  # List OTHER nodes, not this node
-secret_key = "base64-encoded-32-byte-key"  # Generate: openssl rand -base64 32
-
-# Cluster-wide rate limiting (enabled by default when cluster is enabled)
-[cluster.rate_limit_sync]
-enabled = true              # Cluster-wide rate limiting
-sync_blocks = true          # Sync IP blocks across nodes
-sync_failure_counts = true  # Sync progressive delays
-```
-
-#### TLS with Let's Encrypt
-```toml
-[tls]
-enabled = true
-provider = "letsencrypt"
-
-[tls.letsencrypt]
-email = "admin@example.com"
-domains = ["mail.example.com", "imap.example.com"]
-storage_provider = "s3"
-renew_before = "720h"  # Optional: customize renewal window (default: 30 days)
-
-[tls.letsencrypt.s3]
-bucket = "sora-tls-certificates"
-region = "us-east-1"
-```
-
-#### Shared Mailboxes
-```toml
-[shared_mailboxes]
-enabled = true
-namespace_prefix = "Shared/"
-allow_user_create = true          # Allow users to create shared mailboxes (default: false, admin-only)
-allow_anyone_identifier = true    # Allow sharing with "anyone" in the domain (default: false)
-default_rights = "lrswipkxtea"    # Full rights for creators
-```
-
-#### HTTP API
-```toml
-[[servers]]
-type = "http_api"
-start = true
-addr = ":8080"
-api_key = "your-secure-api-key-here"
-allowed_hosts = ["127.0.0.1", "10.0.0.0/8"]  # Optional IP/CIDR restrictions
-```
-
-#### Proxy Mode Configuration
-```toml
-[[servers]]
-type = "imap_proxy"
-start = true
-addr = ":1143"            # Proxy listen port
-remote_addrs = [          # Backend servers to proxy to
-    "backend1.example.com:143",
-    "backend2.example.com:143",
-]
-```
-
-#### Rate Limiting
-```toml
-[servers.imap.auth_rate_limit]
-enabled = true
-max_attempts_per_ip = 10       # Max failed attempts per IP
-max_attempts_per_username = 5  # Max failed attempts per username
-ip_window_duration = "15m"     # Time window for IP-based limiting
-username_window_duration = "30m" # Time window for username-based limiting
-progressive_delay_enabled = true
-progressive_delay_min = "1s"
-progressive_delay_max = "30s"
-```
-
-#### Relay Queue
-```toml
-[relay]
-type = "smtp"
-smtp_host = "smtp.example.com:587"
-tls = false
-tls_verify = true
-tls_use_starttls = true
-
-[relay.queue]
-path = "/var/spool/sora/relay"
-worker_interval = "1m"
-batch_size = 100
-max_attempts = 10
-retry_backoff = ["1m", "5m", "15m", "1h", "6h", "24h"]
-```
-
-#### Health Monitoring
-```toml
-[health]
-enabled = true
-check_interval = "30s"       # How often to check health
-database_timeout = "5s"      # Database health check timeout
-s3_timeout = "10s"           # S3 health check timeout
-```
-
-### Message Expunge Behavior
-
-Sora implements a two-phase deletion process for expunged messages:
-
-1. When messages are expunged (via IMAP EXPUNGE command), they are marked with an `expunged_at` timestamp but not immediately deleted
-2. A background cleanup worker permanently deletes messages after a configurable grace period
-
-Configure this behavior in your `config.toml`:
-
-```toml
-[cleanup]
-# Time duration for which deleted items are kept before being permanently removed
-# Examples: "14d" (14 days), "30d" (30 days), "7d" (7 days), "24h" (24 hours)
-grace_period = "14d"
-
-# How often the cleanup process should run to remove old items  
-# Examples: "1h" (hourly), "24h" (daily), "6h" (every 6 hours)
-wake_interval = "1h"
-
-# Maximum age restriction for messages - enables ephemeral storage
-# Messages older than this will be automatically expunged
-# Leave empty for no restriction (messages can stay forever)
-# Examples: "30d" (30 days), "90d" (90 days), "365d" (1 year)
-max_age_restriction = "" # Empty means no restriction
-```
-
-This allows for:
-- Recovery of accidentally expunged messages within the grace period
-- Compliance with retention policies
-- Reduced load on the storage backend by batching deletions
-- **Ephemeral storage**: With `max_age_restriction` set, old messages are automatically expunged, ensuring storage doesn't grow indefinitely
-
-### JA4 TLS Fingerprinting
-
-Filter IMAP capabilities based on TLS client fingerprints:
-
-```toml
-[[servers]]
-type = "imap"
-# ... other settings ...
-
-# Disable IDLE for iOS Mail clients
-[[servers.client_filters]]
-ja4_fingerprint = "^t13d1516h2_.*"
-disable_caps = ["IDLE"]
-reason = "iOS Mail client with known IDLE issues"
-```
-
----
-
-## Admin Tool
-
-The `sora-admin` tool provides comprehensive administrative functions for managing accounts, monitoring connections, and system health.
-
-### Account Management
-
-Create new email accounts:
-
-```bash
-# Basic account creation
-./sora-admin accounts create --config config.toml --email user@example.com --password secretpassword
-
-# Create account with specific hash type
-./sora-admin accounts create --config config.toml --email user@example.com --password secretpassword --hash ssha512
-
-# Update existing account password
-./sora-admin accounts update --config config.toml --email user@example.com --password newpassword
-
-# List all accounts
-./sora-admin accounts list --config config.toml
-
-# Delete account (soft delete)
-./sora-admin accounts delete --config config.toml --email user@example.com
-
-# Restore deleted account
-./sora-admin accounts restore --config config.toml --email user@example.com
-```
-
-### Credential Management
-
-Manage multiple credentials per account:
-
-```bash
-# Add additional credential (alias)
-./sora-admin accounts credentials add --config config.toml \
-  --email user@example.com --alias alias@example.com --password aliaspass
-
-# List credentials for an account
-./sora-admin accounts credentials list --config config.toml --email user@example.com
-
-# Show specific credential
-./sora-admin credentials show --config config.toml --email alias@example.com
-
-# Delete credential
-./sora-admin credentials delete --config config.toml --email alias@example.com
-```
-
-### Monitoring Commands
-
-```bash
-# View connection statistics
-./sora-admin stats connection --config config.toml
-./sora-admin stats connection --config config.toml --user user@example.com
-
-# View cache performance metrics
-./sora-admin cache metrics --config config.toml
-./sora-admin cache stats --config config.toml
-
-# Purge cache
-./sora-admin cache purge --config config.toml
-
-# Check system health
-./sora-admin health --config config.toml
-./sora-admin health --config config.toml --detailed
-
-# List addresses blocked by the authentication rate limiters
-./sora-admin stats blocked --config config.toml
-./sora-admin stats blocked --config config.toml --protocol imap_proxy
-
-# Kick connections
-./sora-admin connections kick --config config.toml --user user@example.com
-./sora-admin connections kick --config config.toml --protocol imap
-./sora-admin connections kick --config config.toml --server backend1.example.com
-
-# List active connections
-./sora-admin connections list --config config.toml
-```
-
-### Import/Export Operations
-
-```bash
-# Import maildir format
-./sora-admin import-maildir --config config.toml --email user@example.com --path /path/to/maildir
-
-# Import with Dovecot UID preservation
-./sora-admin import-maildir --config config.toml --email user@example.com \
-  --path /path/to/maildir --preserve-uids
-
-# Import with SIEVE scripts
-./sora-admin import-maildir --config config.toml --email user@example.com \
-  --path /path/to/maildir --sieve-path /path/to/sieve
-
-# Export to maildir format
-./sora-admin export-maildir --config config.toml --email user@example.com --path /path/to/export
-```
-
-### Available Hash Types
-
-- `bcrypt` (default) - bcrypt hash with salt
-- `ssha512` - Salted SHA512 hash
-- `sha512` - SHA512 hash without salt
-
-### Help
-
-Get help for any command:
-
-```bash
-./sora-admin help
-./sora-admin accounts --help
-./sora-admin health --help
-
-# Show version information
-./sora-admin version
-```
-
----
-
-## HTTP API
-
-Sora provides a comprehensive REST API for administration and monitoring:
-
-```bash
-# Set your API key
-export API_KEY="your-api-key"
-export BASE_URL="http://localhost:8080/admin"
-
-# List a domain's accounts
-curl -H "Authorization: Bearer $API_KEY" $BASE_URL/domains/example.com/accounts
-
-# Create account
-curl -X POST -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","password":"secret"}' \
-  $BASE_URL/accounts
-
-# Get health status
-curl -H "Authorization: Bearer $API_KEY" $BASE_URL/health/overview
-
-# Get connection statistics
-curl -H "Authorization: Bearer $API_KEY" $BASE_URL/connections/stats
-
-# Kick user connections
-curl -X POST -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"user_email":"user@example.com"}' \
-  $BASE_URL/connections/kick
-
-# Get cache metrics
-curl -H "Authorization: Bearer $API_KEY" $BASE_URL/cache/metrics
-
-# View upload queue status
-curl -H "Authorization: Bearer $API_KEY" $BASE_URL/uploader/status
-```
-
-See `docs/admin-api.md` for complete API documentation.
-
----
-
-## Operational Guide
-
-### Running in Production
-
-#### Standalone Mode
-```bash
-# Run with specific config
-./sora --config /etc/sora/config.toml
-
-# Override specific settings via environment or flags
-./sora --config config.toml
-```
-
-#### Cluster Mode with Multiple Nodes
-```bash
-# Node 1 (leader will be automatically elected)
-./sora --config node1-config.toml
-
-# Node 2
-./sora --config node2-config.toml
-
-# Node 3
-./sora --config node3-config.toml
-
-# All nodes will gossip on port 7946 and automatically coordinate
-# Leader handles TLS certificate renewal
-# All nodes share rate limiting state
-# Connection tracking synchronized across cluster
-```
-
-#### Proxy Mode for Horizontal Scaling
-```bash
-# Run proxy on load balancer
-./sora --config proxy-config.toml  # Enable proxy sections, disable backend sections
-
-# Run backend servers
-./sora --config backend1-config.toml  # Port 143, proxy disabled
-./sora --config backend2-config.toml  # Port 143, proxy disabled
-```
-
-### Monitoring and Health Checks
-
-Sora provides comprehensive health monitoring:
-
-1. **Database Health**: Checks write/read pool connectivity
-2. **S3 Health**: Validates object storage accessibility  
-3. **Circuit Breaker Status**: Monitors service resilience
-4. **Connection Metrics**: Tracks active connections per protocol
-5. **Cluster Health**: Monitors gossip protocol and node status
-6. **TLS Certificate Status**: Tracks certificate expiration
-
-Access health status via:
-```bash
-./sora-admin health --config config.toml
-```
-
-Or via HTTP API:
-```bash
-curl -H "Authorization: Bearer $API_KEY" http://localhost:8080/admin/health/overview
-```
-
-### Prometheus Metrics
-
-Sora exposes 26 comprehensive Prometheus metrics at `/metrics`:
-
-- **Connection metrics**: Total, current, authenticated, duration
-- **Database metrics**: Query counts, duration, account/mailbox totals
-- **Storage metrics**: S3 operations, duration, upload attempts
-- **Cache metrics**: Hit/miss ratios, size, object count
-- **Protocol metrics**: LMTP relay, IMAP IDLE, ManageSieve scripts
-- **Worker metrics**: Upload worker jobs and duration
-- **Health metrics**: Component status, health checks
-- **Memory metrics**: Session peak memory, limit exceeded events
-
-Configure Prometheus to scrape:
-```yaml
-scrape_configs:
-  - job_name: 'sora'
-    static_configs:
-      - targets: ['localhost:8080']
-```
-
-### Performance Tuning
-
-#### Database Connection Pools
-```toml
-[database]
-max_conns = 100          # Adjust based on concurrent users
-min_conns = 10           # Maintain minimum ready connections
-max_conn_lifetime = "1h" # Refresh connections periodically
-max_conn_idle_time = "30m" # Close idle connections
-```
-
-#### Rate Limiting
-```toml
-[servers.imap.auth_rate_limit]
-max_attempts_per_ip = 10    # Adjust based on security needs
-ip_window_duration = "15m"   # Shorter window = more forgiving
-```
-
-#### Background Workers
-```toml
-[upload]
-workers = 10              # Parallel S3 uploads
-batch_size = 100         # Messages per batch
-
-[cleanup]
-wake_interval = "1h"     # Cleanup frequency
-grace_period = "7d"      # Recovery window
-
-[relay_queue]
-worker_interval = "1m"   # How often to process relay queue
-batch_size = 100         # Messages per batch
-```
-
-### Cluster Operations
-
-#### Checking Cluster Status
-```bash
-# View cluster health
-./sora-admin health --config config.toml | grep -i cluster
-
-# Monitor gossip logs
-journalctl -u sora -f | grep -i "cluster\|gossip"
-
-# Check TLS certificate status
-echo | openssl s_client -connect mail.example.com:993 -servername mail.example.com 2>/dev/null | \
-  openssl x509 -noout -dates
-
-# Monitor rate limiting synchronization
-journalctl -u sora -f | grep -i "rate limit\|cluster-limiter"
-```
-
-#### Leader Election
-- Leader is automatically elected (lexicographically smallest node ID)
-- Leader handles TLS certificate renewal
-- If leader fails, new leader is elected within 5-10 seconds
-- All nodes can respond to HTTP-01 challenges
-
-### Troubleshooting
-
-#### Connection Issues
-```bash
-# Check active connections
-./sora-admin connections list --config config.toml
-
-# View connection statistics
-./sora-admin stats connection --config config.toml
-
-# Kick stuck connections
-./sora-admin connections kick --config config.toml --user user@example.com
-```
-
-#### Performance Issues
-```bash
-# Check health status
-./sora-admin health --config config.toml
-
-# Monitor cache performance
-./sora-admin cache metrics --config config.toml
-
-# Review database connection pool
-grep "database" /var/log/sora.log | grep -i "pool\|connection"
-
-# Check circuit breaker status
-grep "circuit breaker" /var/log/sora.log
-```
-
-
-#### Cluster Issues
-```bash
-# Check cluster membership
-./sora-admin health --config config.toml | grep -i member
-
-# Verify gossip connectivity (port 7946)
-nc -zv node-2 7946
-
-# Check TLS certificate renewal
-grep "certificate\|renewal" /var/log/sora.log
-
-# Monitor rate limit synchronization
-grep "cluster.*rate limit" /var/log/sora.log
-```
-
----
+The database and integration tests need PostgreSQL on `localhost:5432`, where the `postgres` role
+can log in from localhost without a password and create databases and extensions. They use the
+database `sora_test_db`. [`docs/TESTING.md`](docs/TESTING.md) explains the test tiers, the test
+database and the known pitfalls.
 
 ## Documentation
 
-- **docs/architecture.md** - Detailed architecture guide
-- **docs/configuration.md** - Configuration reference
-- **docs/deployment.md** - Deployment guide
-- **docs/security.md** - Security features and best practices
-- **docs/admin-api.md** - HTTP API documentation
-- **docs/admin-cli.md** - CLI tool reference
-- **CLAUDE.md** - Developer guide for AI assistants
+The [wiki](https://github.com/migadu/sora/wiki) is the place to start: it explains Sora, walks
+through common setups, and covers configuration and operations in plain steps. The reference
+documents in [`docs/`](docs) give the full detail:
 
----
+| Document | What it covers |
+|---|---|
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The programs, backend and proxy roles, components, and a message's life from delivery to deletion. |
+| [STORAGE.md](docs/STORAGE.md) | PostgreSQL and S3, deduplication, encryption, the local cache, uploads, deletion, retention and account purge. |
+| [SEARCH.md](docs/SEARCH.md) | Full-text search, what is indexed, retention, limits and the search rate limit. |
+| [DATABASE.md](docs/DATABASE.md) | PostgreSQL requirements, read and write endpoints, timeouts, PgBouncer and migrations. |
+| [PROTOCOLS.md](docs/PROTOCOLS.md) | IMAP, POP3, LMTP and ManageSieve: capabilities, limits, timeouts and client filters. |
+| [PROXY.md](docs/PROXY.md) | Proxies, remote lookup, affinity, backend pools, backend TLS, maintenance mode and the proxy caches. |
+| [CLUSTER.md](docs/CLUSTER.md) | The gossip cluster: membership, what it shares, and what happens when nodes fail. |
+| [TLS.md](docs/TLS.md) | Certificates, implicit TLS and STARTTLS, and Let's Encrypt with S3 storage. |
+| [AUTHENTICATION.md](docs/AUTHENTICATION.md) | Credentials and aliases, password schemes, master users, SASL and login rate limits. |
+| [SECURITY.md](docs/SECURITY.md) | Connection limits, timeouts, size and memory limits, trusted networks and the PROXY protocol. |
+| [SIEVE.md](docs/SIEVE.md) | The Sieve engine and its extensions, vacation, redirect and ManageSieve. |
+| [RELAY.md](docs/RELAY.md) | The outbound relay, the relay queue and spam training. |
+| [SHARED_MAILBOXES.md](docs/SHARED_MAILBOXES.md) | The shared namespace and ACL rights. |
+| [CONFIGURATION.md](docs/CONFIGURATION.md) | The config file as a whole and every key with its default. |
+| [OPERATIONS.md](docs/OPERATIONS.md) | Service files, signals and reload, logs, disk use, upgrades, backups and outbound connections. |
+| [METRICS.md](docs/METRICS.md) | Every Prometheus metric, the health checks, and what to alert on. |
+| [ADMIN_CLI.md](docs/ADMIN_CLI.md) | Every `sora-admin` command and flag. |
+| [IMPORT_EXPORT.md](docs/IMPORT_EXPORT.md) | Maildir import and export, Dovecot UIDs and keywords, and incremental runs. |
+| [ADMIN_API.md](docs/ADMIN_API.md) | The Admin HTTP API, endpoint by endpoint. |
+| [USER_API.md](docs/USER_API.md) | The User HTTP API and the User API proxy, endpoint by endpoint. |
+| [HACKING.md](docs/HACKING.md) | A tour of the code, its conventions, and how to add a command or a migration. |
+| [TESTING.md](docs/TESTING.md) | Unit, database and integration tests, the test database and pitfalls. |
 
-## Development
+## Contributing
 
-### Building from Source
-```bash
-# Install dependencies
-go mod download
+Report bugs and send changes through GitHub issues and pull requests. Before you send a change,
+run the tests that cover it, and read [`docs/HACKING.md`](docs/HACKING.md) for the code's
+conventions.
 
-# Build server and admin tool
-make build
+## License
 
-# Run tests
-make test
-
-# Run integration tests (requires PostgreSQL)
-make test-integration
-
-# Run specific test scope
-./run_integration_tests.sh --scope imap
-```
-
-### Project Structure
-- `cmd/sora/` - Main server application
-- `cmd/sora-admin/` - Administrative CLI tool
-- `server/` - Protocol implementations (IMAP, LMTP, POP3, ManageSieve, HTTP API)
-- `db/` - Database layer and operations
-- `storage/` - S3 storage abstraction
-- `cache/` - Local filesystem cache
-- `cluster/` - Gossip-based cluster coordination
-- `tlsmanager/` - TLS certificate management
-- `pkg/metrics/` - Prometheus metrics
-- `integration_tests/` - Comprehensive integration test suite
+Sora is released under the MIT License. See [LICENSE](LICENSE).

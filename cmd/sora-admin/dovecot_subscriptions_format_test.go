@@ -36,9 +36,13 @@ func TestParseDovecotSubscriptionsLines(t *testing.T) {
 	}{
 		{"unversioned CRLF", "INBOX\r\nVendors\r\n", []string{"INBOX", "Vendors"}},
 		{"version 2 CRLF", "V\t2\n\nINBOX\r\nWork\tProjects\r\n", []string{"INBOX", "Work/Projects"}},
+		{"version 2 CRLF header and body", "V\t2\r\n\r\nINBOX\r\nWork\tProjects\r\nv1.2\r\na\x01tb\tx\x01ry\x01nz\r\n", []string{"INBOX", "Work/Projects", "v1.2", "a\tb/x\ry\nz"}},
+		{"version 2 CRLF empty", "V\t2\r\n\r\n", nil},
 		{"version 2 trailing separator", "V\t2\n\nWork\t\n\t\n", []string{"Work"}},
 		{"unversioned Maildir++", "INBOX\nWork.Projects\nDonn&AOk-es.Q1\nArchive.\n.\n", []string{"INBOX", "Work/Projects", "Donn&AOk-es/Q1", "Archive"}},
 		{"older sora-admin export", "V\t2\nWork/Projects\nv1.2\n", []string{"Work/Projects", "v1.2"}},
+		{"older sora-admin export CRLF", "V\t2\r\nWork/Projects\r\nv1.2\r\n", []string{"Work/Projects", "v1.2"}},
+		{"older sora-admin export CRLF empty", "V\t2\r\n", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, parseDovecotSubscriptions(tc.file))

@@ -662,7 +662,7 @@ var ErrCommitOutcomeUnknown = errors.New("database commit outcome unknown")
 func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, config retry.BackoffConfig, opType timeoutType, op func(ctx context.Context, tx pgx.Tx) (any, error), nonRetryableErrors ...error) (any, error) {
 	var result any
 	err := retry.WithRetryAdvanced(ctx, func() error {
-		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
+		tx, origin, err := rd.beginWriteTxWithRetry(ctx, pgx.TxOptions{})
 		if err != nil {
 			if rd.isRetryableError(err) {
 				return err
@@ -720,7 +720,7 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 			// will open a fresh connection that DNS / the load balancer can route to
 			// the new primary.
 			if isReadOnlyTransactionError(cbErr) {
-				rd.resetCurrentWritePool()
+				rd.onReadOnlyWriteTx(origin)
 			}
 
 			for _, nonRetryableErr := range nonRetryableErrors {
