@@ -211,3 +211,26 @@ func TestStatus_SharedNamespaceRootRefused(t *testing.T) {
 		})
 	}
 }
+
+// RFC 9051 has no RECENT status data item: Appendix E item 12 deprecates
+// "RECENT STATUS", and its grammar gives the LIST STATUS return option the
+// STATUS items ("status-option = "STATUS" SP "(" status-att *(SP status-att)
+// ")"", §9), where status-att is only MESSAGES, UIDNEXT, UIDVALIDITY, UNSEEN,
+// DELETED and SIZE. go-imap refuses STATUS (RECENT) once the client has
+// ENABLEd IMAP4rev2, and LIST RETURN (STATUS) "takes STATUS data items as
+// parameters" (RFC 9051 §6.3.9.2, RFC 5819 §2), so it must refuse RECENT the
+// same way (#1179). An IMAP4rev1 session keeps RECENT on both.
+func TestList_ReturnStatusRefusesRecentUnderIMAP4rev2(t *testing.T) {
+	c := dialWireListServer(t, IMAPServerOptions{})
+
+	// The empty pattern answers no LIST line (RFC 9051 §6.3.9.1) once the
+	// arguments have been checked, so the session needs no mailbox behind it.
+	const listRecent = `LIST "" "" RETURN (STATUS (MESSAGES RECENT))`
+	c.mustOK(listRecent)
+
+	c.mustOK("ENABLE IMAP4rev2")
+	c.mustBad("STATUS INBOX (MESSAGES RECENT)")
+	c.mustBad(listRecent)
+	c.mustBad(`LIST "" "" RETURN (STATUS (RECENT))`)
+	c.mustOK(`LIST "" "" RETURN (STATUS (MESSAGES DELETED))`)
+}

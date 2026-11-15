@@ -54,9 +54,10 @@ var reloadableServerSettings = map[string][]string{
 // that does not reload: metrics, one start-up skipped such as an Admin API without an
 // api_key, or a block whose type changed; a reload waits for the servers still
 // starting), a block removed from the file or set to enabled = false, whose server keeps
-// running, and a block added to it or enabled, which is not started. Blocks sharing a
-// duplicate server name are refused and skipped. The config the servers started with,
-// deps.config, is read and never written.
+// running, and a valid block added to it or enabled, which is not started. Blocks
+// sharing a duplicate server name are refused and skipped; that a restart refuses them,
+// and an invalid block, is handleConfigReload's to report. The config the servers
+// started with, deps.config, is read and never written.
 func (deps *serverDependencies) reloadServers(newCfg *config.Config) {
 	newServers := newCfg.GetAllServers()
 	newByName := make(map[string]config.ServerConfig, len(newServers))
@@ -111,23 +112,10 @@ func (deps *serverDependencies) reloadServers(newCfg *config.Config) {
 			logger.Info("Config reload: server settings changed but require restart to take effect", "server", name, "fields", changed)
 		}
 	}
-	reportedDuplicate := make(map[string]bool)
+	// An added block that is invalid or shares its name with another does not start on
+	// a restart either: the restart refuses the file, which handleConfigReload reports.
 	for _, s := range newServers {
-		if !startedByName[s.Name] {
-			if duplicateNames[s.Name] {
-				if !reportedDuplicate[s.Name] {
-					reportedDuplicate[s.Name] = true
-					logger.Error("Config reload: duplicate server name; a restart will refuse to start with it", "server", s.Name)
-				}
-				if err := s.Validate(); err != nil {
-					logger.Error("Config reload: invalid server config; a restart will refuse to start with it", "server", s.Name, "type", s.Type, "error", err)
-				}
-				continue
-			}
-			if err := s.Validate(); err != nil {
-				logger.Error("Config reload: invalid server config; a restart will refuse to start with it", "server", s.Name, "type", s.Type, "error", err)
-				continue
-			}
+		if !startedByName[s.Name] && !duplicateNames[s.Name] && s.Validate() == nil {
 			logger.Info("Config reload: server added or enabled but not running; it is not started until restart", "server", s.Name, "type", s.Type)
 		}
 	}

@@ -51,7 +51,7 @@ type IMAPSession struct {
 	clientID       *imap.IDData
 	ja4Fingerprint string                                           // JA4 TLS fingerprint
 	ja4Conn        interface{ GetJA4Fingerprint() (string, error) } // Reference to JA4 conn if fingerprint not yet available
-	sessionCaps    atomic.Value                                     // imap.CapSet - per-session capabilities after filtering (lock-free access)
+	sessionCaps    atomic.Value                                     // imap.CapSet - per-session capabilities after filtering (lock-free access); never modified once stored
 
 	// Atomic counters for lock-free access
 	currentHighestModSeq atomic.Uint64
@@ -143,6 +143,13 @@ func (s *IMAPSession) Context() context.Context {
 
 // GetCapabilities returns the effective capabilities for this session
 // If session-specific capabilities haven't been set, it returns the server's default capabilities
+//
+// The set is returned as stored, not copied, like the server's set below, and
+// callers must not modify it. No set is modified once stored in sessionCaps
+// (NewSession, applyCapabilityFilters and the lazy JA4 path below each store a
+// newly built one), so concurrent readers need no copy. Callers use it for a
+// Has check, go-imap once per MODSEQ item it writes, and a copy allocated a
+// map of the whole set for each (#1206).
 func (s *IMAPSession) GetCapabilities() imap.CapSet {
 
 	// If we have a pending JA4 connection, try to capture fingerprint now
@@ -165,15 +172,8 @@ func (s *IMAPSession) GetCapabilities() imap.CapSet {
 	}
 
 	// Atomic load - safe for concurrent access
-	// Return a copy to prevent concurrent modification issues
 	if capsVal := s.sessionCaps.Load(); capsVal != nil {
-		stored := capsVal.(imap.CapSet)
-		// Make a defensive copy - maps are reference types!
-		caps := make(imap.CapSet, len(stored))
-		for k, v := range stored {
-			caps[k] = v
-		}
-		return caps
+		return capsVal.(imap.CapSet)
 	}
 
 	// Fallback to server capabilities if not yet initialized
@@ -654,9 +654,11 @@ func (s *IMAPSession) triggerCacheWarmup() {
 	}
 }
 
-// registerConnection registers the connection in the connection tracker
-func (s *IMAPSession) registerConnection(email string) error {
-	if s.server.connTracker != nil && s.IMAPUser != nil {
+// registerConnection takes a slot for the logging-in account in the connection
+// tracker. It runs before s.IMAPUser / s.Session.User are set so a rejected
+// login leaves the session unauthenticated.
+func (s *IMAPSession) registerConnection(accountID int64, email string) error {
+	if s.server.connTracker != nil {
 		// Use configured database query timeout for connection tracking (database INSERT)
 		queryTimeout := s.server.rdb.GetQueryTimeout()
 		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
@@ -667,8 +669,8 @@ func (s *IMAPSession) registerConnection(email string) error {
 		// the PROXY header or a trusted proxy's ID forwarding.
 		clientAddr := s.RemoteIP
 
-		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "IMAP", clientAddr); err != nil {
-			s.InfoLog("connection registration rejected", "error", err)
+		if err := s.server.connTracker.RegisterConnection(ctx, accountID, email, "IMAP", clientAddr); err != nil {
+			s.InfoLog("connection registration rejected", "address", email, "error", err)
 			return err
 		}
 		s.trackedClientAddr = clientAddr

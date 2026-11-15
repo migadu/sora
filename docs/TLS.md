@@ -377,8 +377,11 @@ When several nodes use Let's Encrypt with the same bucket, run them in one clust
   node that receives Let's Encrypt's request on port 80 reads the token from there. A load
   balancer can therefore send port 80 to any node.
 - **A database claim stops duplicate orders.** On nodes that have a database, the leader takes a
-  claim in PostgreSQL (the `locks` row `acme_issuance:<name>`, held for up to 10 minutes) before it
-  orders a certificate, for a first issuance and for a renewal alike. During a network split both
+  claim in PostgreSQL (the `locks` row `acme_issuance:<name>`) before it orders a certificate, for
+  a first issuance and for a renewal alike. The claim is given back when the certificate is
+  stored. If the order fails or the node dies, the claim lapses after 10 minutes, or when the
+  last order started under it must end if that is later: an order that would outlive the claim
+  extends it first. During a network split both
   sides have a leader, but only one gets the claim. If the database cannot be reached, the order
   goes ahead anyway: an expired certificate is worse than a duplicate order. Nodes without a
   database (proxy-only) rely on leadership alone.

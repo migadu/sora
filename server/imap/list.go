@@ -90,8 +90,8 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 	// root \Noselect. Empty when shared mailboxes are disabled.
 	sharedNamespaceRoot := s.sharedNamespaceRoot()
 
-	// The capability set cannot change during a command, and GetCapabilities
-	// returns a fresh copy of it, so read it once rather than per mailbox.
+	// The capability set cannot change during a command, so read its immutable
+	// snapshot once rather than per mailbox.
 	caps := s.GetCapabilities()
 
 	var l []imap.ListData
@@ -121,16 +121,43 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 	// Use batch query to fetch all summaries in a single database round-trip
 	// instead of N individual Status() calls (which each do 3 queries).
 	if options.ReturnStatus != nil {
-		// Collect mailbox IDs for selectable listed mailboxes that matched the
-		// selection options (RFC 5819 §2 / RFC 9051 §6.3.9.2).
+		// Collect the listed entries that get a STATUS response: selectable
+		// mailboxes that matched the selection options and that this user may
+		// read (RFC 5819 §2 / RFC 9051 §6.3.9.2).
+		var wanted []int // indices into l
 		var mailboxIDs []int64
 		for i := range l {
-			if !listEntryWantsStatus(&l[i], options, subscribedSet) {
+			data := &l[i]
+			if !listEntryWantsStatus(data, options, subscribedSet) {
 				continue
 			}
-			if mbox, ok := nameToMailbox[l[i].Mailbox]; ok {
-				mailboxIDs = append(mailboxIDs, mbox.ID)
+			mbox, ok := nameToMailbox[data.Mailbox]
+			if !ok {
+				continue
 			}
+			// RFC 4314: STATUS data requires the 'r' (read) right. A shared mailbox can
+			// be listed with only 'l' (lookup); don't leak its counts via LIST-STATUS.
+			// Owned mailboxes (owner == this account) always have 'r', so only the few
+			// shared ones incur an ACL check — the batch fast path is preserved.
+			if mbox.AccountID != s.AccountID() {
+				hasRead, permErr := s.server.rdb.CheckMailboxPermissionWithRetry(readCtx, mbox.ID, s.AccountID(), 'r')
+				if permErr != nil {
+					// RFC 5819 §2: on unexpected problems the server "MAY drop the
+					// corresponding STATUS reply".
+					s.DebugLog("LIST-STATUS: skipping STATUS, ACL read-check failed", "mailbox", data.Mailbox, "error", permErr)
+					continue
+				}
+				if !hasRead {
+					// RFC 5819 §2: when STATUS fails because the mailbox can't be
+					// selected ("l" granted, "r" not), "the STATUS response MUST NOT
+					// be returned and the LIST response MUST include the \NoSelect
+					// attribute".
+					data.Attrs = append(data.Attrs, imap.MailboxAttrNoSelect)
+					continue
+				}
+			}
+			wanted = append(wanted, i)
+			mailboxIDs = append(mailboxIDs, mbox.ID)
 		}
 
 		if len(mailboxIDs) > 0 {
@@ -146,29 +173,9 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 				s.DebugLog("failed to get batch mailbox status", "error", err)
 			} else {
 				// Populate STATUS data from batch results
-				for i := range l {
+				for _, i := range wanted {
 					data := &l[i]
-					if !listEntryWantsStatus(data, options, subscribedSet) {
-						continue
-					}
-					mbox, ok := nameToMailbox[data.Mailbox]
-					if !ok {
-						continue
-					}
-					// RFC 4314: STATUS data requires the 'r' (read) right. A shared mailbox can
-					// be listed with only 'l' (lookup); don't leak its counts via LIST-STATUS.
-					// Owned mailboxes (owner == this account) always have 'r', so only the few
-					// shared ones incur an ACL check — the batch fast path is preserved.
-					if mbox.AccountID != s.AccountID() {
-						hasRead, permErr := s.server.rdb.CheckMailboxPermissionWithRetry(readCtx, mbox.ID, s.AccountID(), 'r')
-						if permErr != nil {
-							s.DebugLog("LIST-STATUS: skipping STATUS, ACL read-check failed", "mailbox", data.Mailbox, "error", permErr)
-							continue
-						}
-						if !hasRead {
-							continue
-						}
-					}
+					mbox := nameToMailbox[data.Mailbox]
 					summary, ok := summaries[mbox.ID]
 					if !ok {
 						continue

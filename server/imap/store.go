@@ -88,8 +88,12 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	if s.useMasterDB.Load() {
 		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
+	// Neither the capabilities nor the client's CONDSTORE awareness change
+	// during the command: read them once, not for every message (#1206).
+	checkUnchangedSince := options != nil && options.UnchangedSinceSet && s.GetCapabilities().Has(imap.CapCondStore)
+	writeModSeq := s.condStoreEnabled()
 	var unchangedSince []uint64
-	if s.GetCapabilities().Has(imap.CapCondStore) && options != nil && options.UnchangedSinceSet {
+	if checkUnchangedSince {
 		unchangedSince = []uint64{options.UnchangedSince}
 	}
 
@@ -161,7 +165,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	// skipped under NOTIFY, and stops at a pending expunge. Poll is held off
 	// until the answered rows are recorded in ownStoreEcho, so it does not
 	// report them a second time.
-	silentModSeq := sanitizedStoreFlags.Silent && s.condStoreEnabled()
+	silentModSeq := sanitizedStoreFlags.Silent && writeModSeq
 	answers := !sanitizedStoreFlags.Silent || silentModSeq
 	if answers {
 		s.ownStoreMu.Lock()
@@ -186,7 +190,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 			// RFC 7162 §3.2: include MODSEQ in the STORE-triggered FETCH reply only
 			// when the client is CONDSTORE-aware (issued an enabling command) and the
 			// session still advertises CONDSTORE.
-			if s.condStoreEnabled() {
+			if writeModSeq {
 				m.WriteModSeq(uint64(modified.modSeq))
 			}
 
@@ -227,11 +231,11 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	for _, msg := range messages {
 		// CONDSTORE functionality - only process if capability is enabled
 		// UnchangedSinceSet, not a non-zero value, is what marks the modifier as
-		// present: RFC 7162 §3.1.3.1 gives "UNCHANGEDSINCE 0" the opposite meaning
+		// present: RFC 7162 §3.1.3 gives "UNCHANGEDSINCE 0" the opposite meaning
 		// to an absent modifier -- it is the probe that must fail for every message
 		// -- so reading it as absent would modify exactly the messages the client
 		// asked never to touch.
-		if s.GetCapabilities().Has(imap.CapCondStore) && options != nil && options.UnchangedSinceSet {
+		if checkUnchangedSince {
 			var currentModSeq int64
 			currentModSeq = msg.CreatedModSeq
 
