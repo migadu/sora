@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -43,6 +45,7 @@ type ExporterOptions struct {
 type Exporter struct {
 	ctx         context.Context // Context for cancellation support
 	maildirPath string
+	root        *os.Root // the destination, which every file below it is written and read through (replaceFile)
 	email       string
 	jobs        int
 	db          *sql.DB
@@ -162,9 +165,16 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		return nil, fmt.Errorf("failed to create s3_uploaded index: %w", err)
 	}
 
+	root, err := os.OpenRoot(filepath.Clean(maildirPath))
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to open maildir path: %w", err)
+	}
+
 	exporter := &Exporter{
 		ctx:          ctx,
 		maildirPath:  maildirPath,
+		root:         root,
 		email:        email,
 		jobs:         jobs,
 		db:           db,
@@ -185,6 +195,9 @@ func (exporter *Exporter) Close() error {
 	if exporter.db != nil {
 		exporter.db.Close()
 		logger.Info("Maildir database saved", "path", exporter.dbPath)
+	}
+	if exporter.root != nil {
+		exporter.root.Close()
 	}
 	return nil
 }
@@ -448,29 +461,29 @@ func (exporter *Exporter) shouldExportMailbox(mailboxName string) bool {
 	return false
 }
 
-// mailboxDir resolves the on-disk maildir directory (the parent of cur/new/tmp)
-// for an IMAP mailbox name, guaranteeing the result stays within the export
-// root. A malicious or legacy mailbox name containing ".." path segments (e.g.
-// "../../etc") would otherwise let filepath.Join escape exporter.maildirPath and
-// write arbitrary files. This is defence-in-depth: mailbox creation, rename, and
-// import already reject such names (helpers.MailboxNameHasTraversal), but the
-// exporter must never trust a name already persisted in the database.
+// mailboxDirName resolves the maildir directory (the parent of cur/new/tmp) for an
+// IMAP mailbox name to its name below the export directory, as exporter.root opens
+// it, guaranteeing the name stays within the export root. A malicious or legacy
+// mailbox name containing ".." path segments (e.g. "../../etc") would otherwise
+// escape the export directory and write arbitrary files. This is defence-in-depth:
+// mailbox creation, rename, and import already reject such names
+// (helpers.MailboxNameHasTraversal), but the exporter must never trust a name
+// already persisted in the database.
 //
 // Each level of the name is one directory (Dovecot's LAYOUT=fs), named by
 // maildirFolderName so that the importer's resolveMailboxName reads it back.
-func (exporter *Exporter) mailboxDir(mailboxName string) (string, error) {
+func (exporter *Exporter) mailboxDirName(mailboxName string) (string, error) {
 	if mailboxName == "INBOX" {
-		return exporter.maildirPath, nil
+		return ".", nil
 	}
 	if helpers.MailboxNameHasTraversal(mailboxName) {
 		return "", fmt.Errorf("mailbox %q resolves outside the export directory", mailboxName)
 	}
-	dir := filepath.Join(exporter.maildirPath, filepath.FromSlash(maildirFolderName(mailboxName)))
-	rel, err := filepath.Rel(exporter.maildirPath, dir)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	name := filepath.Clean(filepath.FromSlash(maildirFolderName(mailboxName)))
+	if name == "." || !filepath.IsLocal(name) {
 		return "", fmt.Errorf("mailbox %q resolves outside the export directory", mailboxName)
 	}
-	return dir, nil
+	return name, nil
 }
 
 // maildirEscapeChar escapes a character in a folder's directory name as itself
@@ -543,16 +556,16 @@ func maildirDirectoryEntry(name string, top bool) bool {
 // createMailboxDirectory creates the maildir structure for a mailbox
 func (exporter *Exporter) createMailboxDirectory(mailboxName string) error {
 	// Convert IMAP mailbox name to a contained maildir path
-	dirName, err := exporter.mailboxDir(mailboxName)
+	dirName, err := exporter.mailboxDirName(mailboxName)
 	if err != nil {
 		return err
 	}
 
-	// Create cur, new, and tmp directories
+	// Create cur, new, and tmp directories. The root refuses a directory on the way
+	// that links out of the export directory.
 	for _, subdir := range []string{"cur", "new", "tmp"} {
-		path := filepath.Join(dirName, subdir)
-		if err := os.MkdirAll(path, 0755); err != nil {
-			return fmt.Errorf("failed to create directory %s: %w", path, err)
+		if err := exporter.root.MkdirAll(filepath.Join(dirName, subdir), 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", filepath.Join(exporter.maildirPath, dirName, subdir), err)
 		}
 	}
 
@@ -718,35 +731,36 @@ func (exporter *Exporter) exportMessage(msg *db.Message, mailboxName string) err
 	}
 
 	// Determine target directory (containment-checked against the export root)
-	mailboxDir, err := exporter.mailboxDir(mailboxName)
+	mailboxDir, err := exporter.mailboxDirName(mailboxName)
 	if err != nil {
 		return err
 	}
 	targetDir := filepath.Join(mailboxDir, "cur")
 
-	targetPath := filepath.Join(targetDir, filename)
+	targetName := filepath.Join(targetDir, filename)
 
 	// If updating flags on existing message, remove old file first
 	if alreadyExported && exporter.options.OverwriteFlags && existingFilename != "" {
-		oldPath := filepath.Join(targetDir, existingFilename)
-		if oldPath != targetPath {
-			os.Remove(oldPath)
+		oldName := filepath.Join(targetDir, existingFilename)
+		if oldName != targetName {
+			exporter.root.Remove(oldName)
 		}
 	}
 
 	// Write the message the maildir way: into tmp/, fsync, then rename into place. A
 	// crash or a full disk must never leave a truncated file where a maildir reader
 	// (Dovecot, or a re-import) would take it for the message.
-	if err := writeMaildirFile(targetPath, content); err != nil {
+	if err := writeMaildirFile(exporter.root, targetName, content); err != nil {
 		return fmt.Errorf("failed to write message file: %w", err)
 	}
 
 	// Set file modification time to internal date
-	if err := os.Chtimes(targetPath, msg.InternalDate, msg.InternalDate); err != nil {
+	if err := exporter.root.Chtimes(targetName, msg.InternalDate, msg.InternalDate); err != nil {
 		logger.Info("Warning: Failed to set file times", "error", err)
 	}
 
 	// Record export in database
+	targetPath := filepath.Join(exporter.maildirPath, targetName)
 	if err := exporter.recordExport(msg.ContentHash, mailboxName, filename, targetPath, int64(msg.Size)); err != nil {
 		logger.Info("Warning: Failed to record export", "error", err)
 	}
@@ -864,12 +878,12 @@ func (exporter *Exporter) isMessageExported(contentHash, mailbox string) (bool, 
 		return false, "", err
 	}
 
-	dir, err := exporter.mailboxDir(mailbox)
+	dir, err := exporter.mailboxDirName(mailbox)
 	if err != nil {
 		return false, "", err
 	}
 	// Check if the file still exists on disk
-	if _, err := os.Stat(filepath.Join(dir, "cur", filename)); os.IsNotExist(err) {
+	if _, err := exporter.root.Stat(filepath.Join(dir, "cur", filename)); os.IsNotExist(err) {
 		logger.Info("File in database but not on disk - will recreate with original filename", "filename", filename)
 		return false, filename, nil // Return the original filename for reuse
 	}
@@ -900,8 +914,6 @@ func (exporter *Exporter) exportDovecotFiles(accountID int64) error {
 
 // exportSubscriptions exports the Dovecot subscriptions file
 func (exporter *Exporter) exportSubscriptions(accountID int64) error {
-	subscriptionsPath := filepath.Join(exporter.maildirPath, "subscriptions")
-
 	// Subscriptions are name-based and may reference folders that
 	// no longer exist, so export ALL subscribed names — not just the subset that
 	// still has a live mailbox — for a lossless Dovecot round-trip.
@@ -919,7 +931,7 @@ func (exporter *Exporter) exportSubscriptions(accountID int64) error {
 		encoded[i] = maildirFolderName(name)
 	}
 
-	return os.WriteFile(subscriptionsPath, []byte(formatDovecotSubscriptions(encoded)), 0644)
+	return replaceFile(exporter.root, ".", "subscriptions", []byte(formatDovecotSubscriptions(encoded)))
 }
 
 // getProgressPrefix returns a progress prefix for log messages
@@ -997,8 +1009,8 @@ func (exporter *Exporter) generateDovecotUIDLists(mailboxes []*db.DBMailbox) err
 			logger.Info("Warning: No UIDVALIDITY found - using generated value", "mailbox", mailboxName, "uidvalidity", uidValidity)
 		}
 
-		// Determine maildir path for this mailbox (containment-checked)
-		maildirPath, err := exporter.mailboxDir(mailboxName)
+		// Determine maildir directory for this mailbox (containment-checked)
+		dir, err := exporter.mailboxDirName(mailboxName)
 		if err != nil {
 			logger.Info("Warning: Skipping dovecot-uidlist for unsafe mailbox name", "mailbox", mailboxName, "error", err)
 			continue
@@ -1010,13 +1022,13 @@ func (exporter *Exporter) generateDovecotUIDLists(mailboxes []*db.DBMailbox) err
 		// Rewriting the file with only this run's delta would make Dovecot reassign
 		// UIDs to every other message, so merge: keep the existing entries whose file
 		// still exists, and let this run's entries win for the UIDs it wrote.
-		mappings = mergeUIDMappings(maildirPath, mappings)
+		mappings = mergeUIDMappings(exporter.root, dir, mappings)
 
 		// Create DovecotUIDList from mappings
 		uidList := CreateDovecotUIDListFromMessages(uidValidity, mappings)
 
 		// Write dovecot-uidlist file
-		if err := WriteDovecotUIDList(maildirPath, uidList); err != nil {
+		if err := replaceFile(exporter.root, dir, filepath.Join(dir, "dovecot-uidlist"), formatDovecotUIDList(uidList)); err != nil {
 			errs = append(errs, fmt.Errorf("failed to write dovecot-uidlist for mailbox %s: %w", mailboxName, err))
 			continue
 		}
@@ -1028,43 +1040,55 @@ func (exporter *Exporter) generateDovecotUIDLists(mailboxes []*db.DBMailbox) err
 	return errors.Join(errs...)
 }
 
-// writeMaildirFile stores content at targetPath (a file under a maildir's cur/ or new/)
-// the way maildir requires: written to the maildir's tmp/ directory, fsync'd, then
-// renamed into place, with the containing directory fsync'd afterwards. A reader of the
-// maildir (Dovecot, or a re-import) therefore never sees a partially written message,
-// and a crash or a full disk leaves at most a stray file in tmp/, which maildir readers
-// ignore.
-func writeMaildirFile(targetPath string, content []byte) error {
-	targetDir := filepath.Dir(targetPath)
-	tmpDir := filepath.Join(filepath.Dir(targetDir), "tmp")
-	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+// writeMaildirFile stores content as the file name (below root, under a maildir's cur/
+// or new/) the way maildir requires: written to the maildir's tmp/ directory, fsync'd,
+// then renamed into place (replaceFile). A reader of the maildir (Dovecot, or a
+// re-import) therefore never sees a partially written message, and a crash or a full
+// disk leaves at most a stray file in tmp/, which maildir readers ignore.
+func writeMaildirFile(root *os.Root, name string, content []byte) error {
+	tmpDir := filepath.Join(filepath.Dir(filepath.Dir(name)), "tmp")
+	if err := root.MkdirAll(tmpDir, 0755); err != nil {
 		return fmt.Errorf("failed to create maildir tmp directory: %w", err)
 	}
-	tmpPath := filepath.Join(tmpDir, filepath.Base(targetPath))
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	return replaceFile(root, tmpDir, name, content)
+}
+
+// replaceFile stores content as the file name below root, the export directory: it
+// writes a new file in tmpDir (a directory of the same filesystem), fsyncs it, renames
+// it over name and fsyncs name's directory. The export may be given a directory its
+// owner could write to, and it runs with privileges the owner lacks, so it never writes
+// into a file already there: the new file is created with O_EXCL under a random name,
+// so nothing at that name (a link included) is opened, and the rename replaces the
+// entry at name, a symbolic or hard link to a file elsewhere included, instead of
+// writing into the file it names. The root resolves every directory on the way, a link
+// to one included, only within the export directory, and refuses one that leaves it.
+// A reader of name sees the old file or the whole new one, never a partial one.
+func replaceFile(root *os.Root, tmpDir, name string, content []byte) error {
+	// The '.' keeps the name apart from every folder directory, whose levels have
+	// theirs escaped (maildirFolderLevel).
+	tmpName := filepath.Join(tmpDir, filepath.Base(name)+"."+rand.Text())
+	f, err := root.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(content); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return err
+	_, err = f.Write(content)
+	if err == nil {
+		if err = f.Sync(); err != nil {
+			err = fmt.Errorf("failed to fsync %s: %w", tmpName, err)
+		}
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("failed to fsync message file: %w", err)
+	if cerr := f.Close(); err == nil {
+		err = cerr
 	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmpPath)
-		return err
+	if err == nil {
+		err = root.Rename(tmpName, name)
 	}
-	if err := os.Rename(tmpPath, targetPath); err != nil {
-		os.Remove(tmpPath)
+	if err != nil {
+		root.Remove(tmpName)
 		return err
 	}
 	// Make the rename durable: fsync the directory that now holds the entry.
-	if dir, err := os.Open(targetDir); err == nil {
+	if dir, err := root.Open(filepath.Dir(name)); err == nil {
 		_ = dir.Sync()
 		dir.Close()
 	}
@@ -1090,15 +1114,15 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 		}
 	}
 
-	dir, err := exporter.mailboxDir(mailboxName)
+	dir, err := exporter.mailboxDirName(mailboxName)
 	if err != nil {
 		return err
 	}
-	keywordsPath := filepath.Join(dir, "dovecot-keywords")
+	keywordsName := filepath.Join(dir, "dovecot-keywords")
 
 	index := make(map[string]int)
 	used := make(map[int]bool)
-	if existing, err := parseKeywordsFile(keywordsPath, os.ReadFile); err == nil {
+	if existing, err := parseKeywordsFile(keywordsName, exporter.root.ReadFile); err == nil {
 		for idx, kw := range existing {
 			if idx >= 0 && idx < maxMaildirKeywords {
 				index[kw] = idx
@@ -1136,7 +1160,7 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 	if len(index) == 0 {
 		return nil
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := exporter.root.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 	byIndex := make([]string, maxMaildirKeywords)
@@ -1149,15 +1173,17 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 			fmt.Fprintf(&b, "%d %s\n", idx, kw)
 		}
 	}
-	return os.WriteFile(keywordsPath, []byte(b.String()), 0644)
+	return replaceFile(exporter.root, dir, keywordsName, []byte(b.String()))
 }
 
 // mergeUIDMappings merges this run's UID → filename mappings with the dovecot-uidlist
-// already present in maildirPath (if any). Entries from the existing file are kept when
-// their file still exists in cur/ or new/ (matched on the base filename, ignoring the
-// ":2,flags" info part) and no entry of this run uses the same UID or filename.
-func mergeUIDMappings(maildirPath string, current []UIDFileMapping) []UIDFileMapping {
-	existing, err := ParseDovecotUIDList(maildirPath)
+// already present in the maildir directory dir below root (if any). Entries from the
+// existing file are kept when their file still exists in cur/ or new/ (matched on the
+// base filename, ignoring the ":2,flags" info part) and no entry of this run uses the
+// same UID or filename. The root reads no file through a link out of the export
+// directory.
+func mergeUIDMappings(root *os.Root, dir string, current []UIDFileMapping) []UIDFileMapping {
+	existing, err := parseDovecotUIDListFile(root.Open(filepath.Join(dir, "dovecot-uidlist")))
 	if err != nil || existing == nil || len(existing.UIDMappings) == 0 {
 		return current
 	}
@@ -1169,7 +1195,7 @@ func mergeUIDMappings(maildirPath string, current []UIDFileMapping) []UIDFileMap
 	}
 	present := make(map[string]bool)
 	for _, sub := range []string{"cur", "new"} {
-		entries, err := os.ReadDir(filepath.Join(maildirPath, sub))
+		entries, err := fs.ReadDir(root.FS(), filepath.ToSlash(filepath.Join(dir, sub)))
 		if err != nil {
 			continue
 		}
