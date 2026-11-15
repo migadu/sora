@@ -330,6 +330,24 @@ const uploadBackoffMax = 10 * time.Minute
 // nodes backing off together do not retry in lockstep.
 const uploadBackoffJitter = 4 * time.Second
 
+// defaultRetryInterval is [uploader] retry_interval when the worker is given a value
+// that is not positive (see leaseRetryInterval).
+const defaultRetryInterval = 30 * time.Second
+
+// leaseRetryInterval is the retry_interval the lease and the cycle backoff use. A pass
+// leases until the queue answers empty and relies on rows it has leased being excluded
+// by their fresh last_attempt (the lease takes rows whose last_attempt is before
+// now - retry_interval). With 0 or less that no longer holds: a row leased a moment ago
+// is due again, so an upload the provider refuses is retried at once, over and over, and
+// the pass never reaches the backoff. Config validation refuses such a value; the worker
+// uses the default for it all the same.
+func (w *UploadWorker) leaseRetryInterval() time.Duration {
+	if w.retryInterval <= 0 {
+		return defaultRetryInterval
+	}
+	return w.retryInterval
+}
+
 // syncBool is a goroutine-safe boolean flag backed by a sync.Mutex.
 // We avoid sync/atomic.Bool to prevent a formatter-induced import cycle:
 // the goimports tool would silently drop "sync/atomic" if the build tag
@@ -585,7 +603,7 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 	var done, retryLater atomic.Int64
 
 	for {
-		uploads, err := w.rdb.AcquireAndLeasePendingUploadsWithRetry(ctx, w.instanceID, w.batchSize, w.retryInterval, w.maxAttempts)
+		uploads, err := w.rdb.AcquireAndLeasePendingUploadsWithRetry(ctx, w.instanceID, w.batchSize, w.leaseRetryInterval(), w.maxAttempts)
 		if err != nil {
 			wg.Wait()
 			return fmt.Errorf("failed to list pending uploads: %w", err)
@@ -1194,10 +1212,7 @@ func (w *UploadWorker) noteCycleOutcome(succeeded, failed int64) {
 	}
 
 	w.backoffFailures++
-	delay := w.retryInterval
-	if delay <= 0 {
-		delay = 30 * time.Second
-	}
+	delay := w.leaseRetryInterval()
 	for i := 1; i < w.backoffFailures && delay < uploadBackoffMax; i++ {
 		delay *= 2
 	}

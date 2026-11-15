@@ -680,7 +680,11 @@ const DefaultUploaderMaxAttempts = 20
 // failed-upload pass. A negative cleanup_grace_period puts the orphan cleanup's cutoff
 // in the future, so it removes staged bodies whose pending_uploads row is still in an
 // uncommitted delivery transaction. An unparseable cleanup_grace_period is refused
-// too: start-up exits on it, as there is no fallback.
+// too: start-up exits on it, as there is no fallback. retry_interval must be positive
+// as well: the lease takes rows whose last_attempt is before now - retry_interval, so
+// with 0 or less it takes back rows leased a moment ago in the same pass and an upload
+// the provider refuses is retried in a tight loop that never reaches the cycle backoff.
+// An unparseable retry_interval falls back to 30s with a warning.
 func (c *UploaderConfig) Validate() error {
 	for _, f := range []struct {
 		key   string
@@ -700,6 +704,9 @@ func (c *UploaderConfig) Validate() error {
 	}
 	if d <= 0 {
 		return fmt.Errorf("[uploader] cleanup_grace_period must be positive, got %q", c.CleanupGracePeriod)
+	}
+	if d, err := helpers.ParseDuration(c.RetryInterval); err == nil && d <= 0 {
+		return fmt.Errorf("[uploader] retry_interval must be positive, got %q", c.RetryInterval)
 	}
 	return nil
 }
