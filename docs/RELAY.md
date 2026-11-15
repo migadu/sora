@@ -137,6 +137,7 @@ system roots, with TLS 1.2 or later.
 | Response | Class |
 |---|---|
 | `2xx` | Delivered. |
+| `3xx` | Temporary. Redirects are not followed, so `http_url` must answer the `POST` itself; the error names the `Location`. |
 | `4xx` | Permanent. The message goes to the failed queue. |
 | anything else, and connection errors | Temporary. The message is retried. |
 
@@ -481,7 +482,8 @@ As in the [HTTP relay request](#3-the-http-relay-request), each byte of `message
 UTF-8 is replaced with U+FFFD; the endpoint takes the message from `message_base64` when it is
 present and from `message` otherwise.
 
-A `2xx` answer is success. Anything else is a failure.
+A `2xx` answer is success. Anything else is a failure, a `3xx` too: redirects are not followed, so
+`endpoint` must answer the `POST` itself.
 
 ### Failures
 
