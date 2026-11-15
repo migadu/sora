@@ -341,9 +341,9 @@ Every run, default or user, is counted in `sora_sieve_executions_total{protocol,
 `100ms` and `60s`. An empty, unparsable, zero or negative value means the default. The value is
 read at startup; a change needs a restart.
 
-The budget also caps the wait for a single `:regex` or `:matches` match. Each run is also bounded
-by the time left on the LMTP `DATA` command, if that is shorter (`timeouts.lmtp_command_timeouts`,
-see [PROTOCOLS.md](PROTOCOLS.md)).
+The budget also bounds a single `:regex` or `:matches` match: a match still running when it runs
+out stops there. Each run is also bounded by the time left on the LMTP `DATA` command, if that is
+shorter (`timeouts.lmtp_command_timeouts`, see [PROTOCOLS.md](PROTOCOLS.md)).
 
 ### Fixed interpreter limits
 

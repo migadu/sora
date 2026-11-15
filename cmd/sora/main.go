@@ -255,7 +255,7 @@ func main() {
 	db.SetBcryptCost(cfg.GetBcryptCost())
 
 	// Apply the configured Sieve script execution budget (also the per-match regex
-	// soft-wait cap). Clamped to a sane range inside the setter.
+	// deadline). Clamped to a sane range inside the setter.
 	sieveengine.SetScriptExecutionTimeout(cfg.Sieve.GetMaxExecutionTime())
 
 	// Initialize logging (log/slog), flushing records held since logger.Hold.

@@ -31,9 +31,10 @@ const (
 
 // scriptExecutionTimeout bounds the total execution time of a single Sieve script
 // (CPU/resource-exhaustion guard). It is also passed to go-sieve as the per-match
-// regex soft-wait cap (Options.Interp.RegexLimits.MaxExecTime), so a large but
-// input-bounded body :matches/:regex completes within the script budget instead of
-// failing on go-sieve's tight 100ms default under load or race instrumentation.
+// regex deadline (Options.Interp.RegexLimits.MaxExecTime), so a large body
+// :matches/:regex may use the script budget instead of failing on go-sieve's tight
+// 100ms default under load or race instrumentation; a match still running at either
+// deadline stops there.
 // Configurable via SetScriptExecutionTimeout (from [sieve] max_execution_time).
 var scriptExecutionTimeout = 2 * time.Second
 
@@ -43,7 +44,7 @@ const (
 )
 
 // SetScriptExecutionTimeout overrides the Sieve script execution budget (and the
-// per-match regex soft-wait cap derived from it). The value is clamped to
+// per-match regex deadline derived from it). The value is clamped to
 // [100ms, 60s]; a non-positive value leaves the current setting unchanged. Call once
 // at startup before serving.
 func SetScriptExecutionTimeout(d time.Duration) {
@@ -286,9 +287,11 @@ func CompileScript(scriptContent string, enabledExtensions []string) (*CompiledS
 	}
 	options := sieve.DefaultOptions()
 	options.EnabledExtensions = enabledExtensions
-	// Raise the per-match regex soft-wait cap to the whole-script budget. The match
-	// input is already truncated to MaxInputLength, so a large body match is bounded;
-	// go-sieve's 100ms default can otherwise spuriously fail it under load or -race.
+	// Raise the per-match regex deadline to the whole-script budget: go-sieve's 100ms
+	// default can otherwise spuriously fail a large body match under load or -race.
+	// The match input is truncated to MaxInputLength, but its cost is that length
+	// times the key's program size, so what bounds a match is that go-sieve stops it
+	// at this deadline or the script's, whichever comes first.
 	options.Interp.RegexLimits.MaxExecTime = scriptExecutionTimeout
 	script, err := sieve.Load(strings.NewReader(scriptContent), options)
 	if err != nil {
