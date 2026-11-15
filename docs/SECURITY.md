@@ -138,7 +138,8 @@ balancers.
 
 Most of these check the TCP peer, the host that actually connected. The exceptions:
 
-- The rate-limit exemption checks the client address after forwarding.
+- The rate-limit exemption checks the client address after forwarding, subject to the POP3
+  `XCLIENT` metadata requirement in [AUTHENTICATION.md](AUTHENTICATION.md#11-trusted-networks-and-logins).
 - The per-IP limit checks the client a PROXY header names when there is one.
 - IMAP ID forwarding and POP3 `XCLIENT` check the client a PROXY header names when there is one,
   else the TCP peer (also when the header names no client: `LOCAL` or `UNKNOWN`). A load balancer

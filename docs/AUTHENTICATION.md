@@ -697,8 +697,11 @@ ways:
 
 - **The client IP.** A host in the list may pass on the client's address with a PROXY header (on a
   listener with `proxy_protocol = true`), with IMAP ID forwarding parameters, or with POP3 XCLIENT.
-  The rate limiter and the logs then use that forwarded address. From a host not in the list, ID and
-  XCLIENT forwarding are ignored or refused and the TCP peer is the client, and a
+  Logs use that forwarded address. Authentication rate-limit checks and counters do too, but POP3
+  `XCLIENT` needs `FORWARD` metadata containing `proxy-source-ip` when no client address came from
+  a PROXY header. Sora's POP3 proxy sends it; bare `ADDR` changes the logged address while those
+  checks and counters still use the TCP peer. From a host not in the list, ID and XCLIENT
+  forwarding are ignored or refused and the TCP peer is the client, and a
   `proxy_protocol = true` listener closes the connection. Behind a PROXY header, ID and POP3
   XCLIENT forwarding are judged by the client the header names, so a client behind a trusted load
   balancer cannot forward another address unless its own address is in the list
