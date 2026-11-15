@@ -366,8 +366,12 @@ These come from go-sieve and are not configurable.
 | Variable name length | 32 bytes | The script fails. |
 | Variable value length | 4000 bytes | The value is cut. |
 | Regex pattern length | 1000 bytes | The script fails. |
-| Compiled size of a `:regex` key | about 10000 instructions; a counted repeat such as `a{100}` counts what it repeats that many times | The script fails. |
+| Estimated compiled cost of a `:regex` key | 10000 weighted program-cost units; a counted repeat such as `a{100}` multiplies the repeated cost | The script fails. |
 | Text fed to one regex or `:matches` match | 256 KB | The text is cut, the match goes on. |
+
+The regex program estimate also accounts for character-class ranges and case folding. It is
+neither an exact VM instruction count nor a heap byte cap. The execution budget remains
+cooperative, with the inline-match and compilation limits described above.
 
 ---
 
