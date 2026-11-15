@@ -975,8 +975,12 @@ func stripUnsupportedRCPTParameters(command string) string {
 // null reverse-path of MAIL (RFC 5321 section 4.1.2), never a path that could not
 // be read.
 func (s *Session) extractAddress(param string) (address string, ok bool) {
-	// The parameter value might be quoted, so unquote it first.
-	param = server.UnquoteString(strings.TrimSpace(param))
+	// The parameter value might be quoted, so unquote it first. A quoted "<>" is not
+	// the null reverse-path: in a path a quoted string is a local part (section 4.1.2),
+	// and this one has no domain.
+	param = strings.TrimSpace(param)
+	quoted := strings.HasPrefix(param, `"`)
+	param = server.UnquoteString(param)
 
 	if len(param) < 2 {
 		return "", false
@@ -988,7 +992,8 @@ func (s *Session) extractAddress(param string) (address string, ok bool) {
 		endIdx := strings.Index(param, ">")
 		if endIdx > 0 {
 			// Found closing bracket - extract address between < and >
-			return param[1:endIdx], true
+			address = param[1:endIdx]
+			return address, address != "" || !quoted
 		}
 		// No closing bracket found - invalid format
 		return "", false
