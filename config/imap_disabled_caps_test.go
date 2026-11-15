@@ -18,6 +18,8 @@ func TestConfigValidate_IMAPDisabledCapsMustKeepBaseVersion(t *testing.T) {
 		{"rev1 and ESEARCH", `disabled_caps = ["IMAP4rev1", "ESEARCH"]`},
 		{"rev1 and SEARCHRES", `disabled_caps = ["IMAP4rev1", "SEARCHRES"]`},
 		{"rev1 and CHILDREN", `disabled_caps = ["IMAP4rev1", "CHILDREN"]`},
+		// Capability names are case-insensitive (#1114), here as in the server.
+		{"lowercase rev1 and move", `disabled_caps = ["imap4rev1", "move"]`},
 	} {
 		t.Run("rejects "+tc.name, func(t *testing.T) {
 			problems := validateFile(t, storageTOML+imapHeader+tc.disabledCaps+"\n")

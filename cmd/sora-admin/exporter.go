@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -238,30 +239,33 @@ func (exporter *Exporter) Run() error {
 	}
 
 	// Export Dovecot files if requested
+	var dovecotErr, uidListErr error
 	if exporter.options.Dovecot {
-		if err := exporter.exportDovecotFiles(accountID); err != nil {
-			logger.Info("Warning: Failed to export Dovecot files", "error", err)
+		if dovecotErr = exporter.exportDovecotFiles(accountID); dovecotErr != nil {
+			logger.Warn("Failed to export Dovecot files", "error", dovecotErr)
 		}
 	}
 
 	// Generate dovecot-uidlist files if requested
 	if exporter.options.ExportUIDList {
-		if err := exporter.generateDovecotUIDLists(mailboxes); err != nil {
-			logger.Info("Warning: Failed to generate dovecot-uidlist files", "error", err)
+		if uidListErr = exporter.generateDovecotUIDLists(mailboxes); uidListErr != nil {
+			logger.Warn("Failed to generate dovecot-uidlist files", "error", uidListErr)
 		}
 	}
 
-	if err := exporter.printSummary(); err != nil {
+	if err := exporter.printSummary(dovecotErr, uidListErr); err != nil {
 		return err
 	}
 	// An export that lost anything must not exit 0: an operator scripting a migration
-	// reads the exit code, not the log.
+	// reads the exit code, not the log. That includes the subscriptions and uidlist
+	// files: an import of an export without them loses the subscriptions or the UIDs.
+	filesErr := errors.Join(dovecotErr, uidListErr)
 	failedMsgs := atomic.LoadInt64(&exporter.failedMessages)
 	failedMboxes := atomic.LoadInt64(&exporter.failedMailboxes)
 	if failedMsgs > 0 || failedMboxes > 0 {
-		return fmt.Errorf("export incomplete: %d message(s) and %d mailbox(es) failed", failedMsgs, failedMboxes)
+		return errors.Join(fmt.Errorf("export incomplete: %d message(s) and %d mailbox(es) failed", failedMsgs, failedMboxes), filesErr)
 	}
-	return nil
+	return filesErr
 }
 
 // performDryRun analyzes what would be exported without making changes
@@ -480,19 +484,27 @@ func maildirFolderName(mailboxName string) string {
 	delim := string(consts.MailboxDelimiter)
 	levels := strings.Split(mailboxName, delim)
 	for i, level := range levels {
-		levels[i] = maildirFolderLevel(level)
+		levels[i] = maildirFolderLevel(level, i == 0)
 	}
 	return strings.Join(levels, delim)
 }
 
-// maildirFolderLevel is the directory name of one level of a mailbox name. It is
+// maildirFolderLevel is the directory name of one level of a mailbox name, top
+// telling whether it is the first level, whose directory is in the export root. It is
 // modified UTF-7, as Dovecot names folders on disk and as exportSubscriptions names
-// them, so the importer does not decode an '&' or a literal "&...-" of the name. A
-// '.' is escaped, because the importer reads a '.' as the Maildir++ hierarchy
-// separator, and so is the escape character, so that unescapeMaildirLevel restores
-// exactly the characters escaped here.
-func maildirFolderLevel(level string) string {
+// them, so the importer does not decode an '&' or a literal "&...-" of the name.
+// A level named after an entry of the directory that holds it (maildirDirectoryEntry)
+// escapes its first character, keeping the byte's case, so the two do not collide:
+// "cur" is \63ur and "subscriptions" \73ubscriptions. Dovecot escapes a level that
+// would clash with a name of its own storage the same way (need_escape_dirstart in
+// mailbox-list.c). A '.' is escaped because the importer reads it as the Maildir++
+// hierarchy separator, and so is the escape character, so
+// that unescapeMaildirLevel restores exactly the characters escaped here.
+func maildirFolderLevel(level string, top bool) string {
 	encoded := helpers.EncodeModifiedUTF7(level)
+	if maildirDirectoryEntry(encoded, top) {
+		return fmt.Sprintf(`\%02x%s`, encoded[0], encoded[1:])
+	}
 	if !strings.ContainsAny(encoded, ".\\") {
 		return encoded
 	}
@@ -505,6 +517,23 @@ func maildirFolderLevel(level string) string {
 		}
 	}
 	return b.String()
+}
+
+// maildirDirectoryEntry reports whether a level's directory name is an entry the
+// export writes in the directory that holds it, top telling whether that is the
+// export root: every mailbox directory holds a Maildir's cur/, new/ and tmp/ and the
+// dovecot-uidlist and dovecot-keywords files, and the export root, INBOX's directory,
+// also the subscriptions file. The names are compared without case for filesystems
+// that ignore it. sora-maildir.db and its -wal and -shm files, also in the root, need
+// no entry here: their '.' is escaped.
+func maildirDirectoryEntry(name string, top bool) bool {
+	switch strings.ToLower(name) {
+	case "cur", "new", "tmp", "dovecot-uidlist", "dovecot-keywords":
+		return true
+	case "subscriptions":
+		return top
+	}
+	return false
 }
 
 // createMailboxDirectory creates the maildir structure for a mailbox
@@ -902,8 +931,10 @@ func (exporter *Exporter) getProgressPrefix() string {
 	return fmt.Sprintf("[%d/%d %.1f%%]", processed, total, percentage)
 }
 
-// printSummary prints a summary of the export process
-func (exporter *Exporter) printSummary() error {
+// printSummary prints a summary of the export process. dovecotErr and uidListErr are
+// the failures of the subscriptions file and of the dovecot-uidlist files, which the
+// summary must not report as written.
+func (exporter *Exporter) printSummary(dovecotErr, uidListErr error) error {
 	duration := time.Since(exporter.startTime)
 	fmt.Printf("\n\nExport Summary:\n")
 	fmt.Printf("  Total messages:    %d\n", exporter.totalMessages)
@@ -916,21 +947,32 @@ func (exporter *Exporter) printSummary() error {
 		fmt.Printf("  Export rate:       %.1f messages/sec\n", rate)
 	}
 	if exporter.options.Dovecot {
-		fmt.Printf("\nNote: Dovecot subscriptions file exported.\n")
+		if dovecotErr == nil {
+			fmt.Printf("\nNote: Dovecot subscriptions file exported.\n")
+		} else {
+			fmt.Printf("\nNote: Dovecot subscriptions file NOT exported.\n")
+		}
 	}
 	if exporter.options.ExportUIDList {
-		fmt.Printf("Note: Dovecot uidlist files generated.\n")
+		if uidListErr == nil {
+			fmt.Printf("Note: Dovecot uidlist files generated.\n")
+		} else {
+			fmt.Printf("Note: Some Dovecot uidlist files could NOT be written.\n")
+		}
 	}
 	return nil
 }
 
-// generateDovecotUIDLists generates dovecot-uidlist files for all exported mailboxes
+// generateDovecotUIDLists generates dovecot-uidlist files for all exported mailboxes.
+// A mailbox whose file cannot be written does not cost the others theirs: every
+// failure is returned, after all the others are written.
 func (exporter *Exporter) generateDovecotUIDLists(mailboxes []*db.DBMailbox) error {
 	logger.Info("Generating dovecot-uidlist files...")
 
 	exporter.mu.Lock()
 	defer exporter.mu.Unlock()
 
+	var errs []error
 	for mailboxName, mappings := range exporter.uidMappings {
 		if len(mappings) == 0 {
 			continue
@@ -971,14 +1013,15 @@ func (exporter *Exporter) generateDovecotUIDLists(mailboxes []*db.DBMailbox) err
 
 		// Write dovecot-uidlist file
 		if err := WriteDovecotUIDList(maildirPath, uidList); err != nil {
-			return fmt.Errorf("failed to write dovecot-uidlist for mailbox %s: %w", mailboxName, err)
+			errs = append(errs, fmt.Errorf("failed to write dovecot-uidlist for mailbox %s: %w", mailboxName, err))
+			continue
 		}
 
 		logger.Info("Generated dovecot-uidlist for mailbox", "mailbox", mailboxName,
 			"messages", len(mappings), "uidvalidity", uidValidity, "next_uid", uidList.NextUID)
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // writeMaildirFile stores content at targetPath (a file under a maildir's cur/ or new/)
