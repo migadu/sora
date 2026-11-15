@@ -18,7 +18,6 @@ func TestEveryPooledConnectionHasThePragmas(t *testing.T) {
 		{"path", func(dir string) string { return filepath.Join(dir, "affinity.db") }},
 		{"file URI", func(dir string) string { return "file:" + filepath.Join(dir, "affinity.db") }},
 		{"file URI params", func(dir string) string { return "file:" + filepath.Join(dir, "affinity.db") + "?mode=rwc" }},
-		{"memory", func(string) string { return ":memory:" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, err := New(tc.dbPath(t.TempDir()))

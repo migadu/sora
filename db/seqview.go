@@ -11,12 +11,15 @@ type seqViewKey struct{}
 //
 // A client renumbers its messages when it is sent an EXPUNGE, not when another session
 // expunges (RFC 9051 §7.5.1), so a message expunged after modSeq keeps its sequence
-// number in that view, and a message created after it has none. The rows a sequence
-// number counts are the live messages plus those the view still holds although they
-// have since been expunged (heldExpungedCond). Nothing created after modSeq can come
-// before a message of the view, since UIDs only grow, so such messages only occupy
-// the numbers past the view's last message. "*" (0) in a sequence set means the
-// view's last message.
+// number in that view. The rows a sequence number counts are the live messages plus
+// those the view still holds although they have since been expunged (heldExpungedCond).
+// Nothing created after modSeq can come before a message of the view, since UIDs only
+// grow, so such messages only occupy the numbers past the view's last message; the
+// caller, which knows how many messages its client was told about, names no number past
+// them. "*" (0) in a sequence set means the view's last message, which also bounds a
+// range ending past the last message counted. A UID "*" is not this: it is "the unique
+// identifier of the last message in the mailbox" (RFC 9051 §9), the highest live UID
+// (uidsBySeqNumAndLiveLast).
 //
 // For append and soft-expunge changes, the view of a modseq is the same in every
 // snapshot: an expunge only moves a message from the live rows to the held ones.
@@ -45,17 +48,37 @@ func heldExpungedCond(m, param string) string {
 // seqCountedRows returns a FROM item listing (as column uid) the messages of mailbox
 // mailboxParam that a sequence number counts and that satisfy cond, a condition on the
 // unqualified uid column (empty for none): the live messages, plus, when viewParam is
-// not empty, the ones the view bound to it still holds (heldExpungedCond). The UNION
-// ALL keeps the live branch on the live-uid index, and the held branch reads only the
-// messages expunged after the view, which are few.
-func seqCountedRows(mailboxParam, viewParam, cond string) string {
+// not empty, the ones the view bound to it still holds (heldExpungedCond).
+//
+// order is the UID order ("ASC" or "DESC") the caller numbers the rows in, or empty
+// when it only counts them. In a view each branch of the UNION ALL is ordered by it,
+// which lets the planner merge the live branch, read in order from the live-uid index,
+// with the few held rows (a Merge Append) instead of sorting every live UID of the
+// mailbox: the numbering keeps streaming. The held branch reads only the messages
+// expunged after the view, which are few.
+//
+// limit (empty for none) is how many rows, in that order, the caller reads at most. A
+// LIMIT above the UNION ALL does not reach the plans of its ordered branches, which
+// PostgreSQL then plans for reading every row, so it can sort the whole mailbox rather
+// than read the index in order and stop early. In a view each branch is limited too:
+// neither can contribute more than limit rows to the first limit rows of the merge.
+func seqCountedRows(mailboxParam, viewParam, cond, order, limit string) string {
 	if cond != "" {
 		cond = " AND " + cond
 	}
-	rows := "SELECT uid FROM messages WHERE mailbox_id = " + mailboxParam + " AND expunged_at IS NULL" + cond
-	if viewParam != "" {
-		rows += " UNION ALL SELECT m.uid FROM messages m WHERE m.mailbox_id = " + mailboxParam +
-			" AND " + heldExpungedCond("m", viewParam) + cond
+	live := "SELECT uid FROM messages WHERE mailbox_id = " + mailboxParam + " AND expunged_at IS NULL" + cond
+	if viewParam == "" {
+		return "(" + live + ")"
 	}
-	return "(" + rows + ")"
+	held := "SELECT m.uid FROM messages m WHERE m.mailbox_id = " + mailboxParam +
+		" AND " + heldExpungedCond("m", viewParam) + cond
+	if order != "" {
+		live += " ORDER BY uid " + order
+		held += " ORDER BY m.uid " + order
+		if limit != "" {
+			live += " LIMIT " + limit
+			held += " LIMIT " + limit
+		}
+	}
+	return "((" + live + ") UNION ALL (" + held + "))"
 }

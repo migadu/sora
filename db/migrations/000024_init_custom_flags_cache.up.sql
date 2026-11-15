@@ -6,15 +6,26 @@
 --
 -- Solution: Change column default to '[]'::jsonb so all new rows are initialized automatically.
 
--- First, backfill existing NULL entries. NULL means "not yet populated": 000009 left
+-- First, complete the existing caches. NULL means "not yet populated": 000009 left
 -- it on every mailbox that existed then, and 000022 copied those mailboxes' keywords
--- into message_state without touching the cache. So fill each NULL cache from
--- message_state, as the Go fallback for a NULL cache reads it, and only then turn
+-- into message_state without touching the cache. Nor is every non-NULL cache
+-- complete: from 000019 on, the triggers union a keyword change into
+-- COALESCE(cache, '[]'), so on a database that ran at 19 to 23 the first keyword set
+-- in such a mailbox left its cache holding only that keyword. So add to every cache
+-- the keywords of its live messages, as the Go fallback for a NULL cache reads them
+-- (the registry only grows: nothing already listed is removed), and only then turn
 -- the rest into '[]'. Until #613 this file went straight to '[]', which dropped those
 -- keywords from the mailbox's FLAGS; golang-migrate records only the version, so a
 -- database at or past 24 never runs this again, and a fresh install has no rows.
 UPDATE mailbox_stats st
-SET custom_flags_cache = k.keywords
+SET custom_flags_cache = (
+    SELECT jsonb_agg(f.flag ORDER BY f.flag)
+    FROM (
+        SELECT jsonb_array_elements_text(COALESCE(st.custom_flags_cache, '[]'::jsonb))
+        UNION
+        SELECT jsonb_array_elements_text(k.keywords)
+    ) f(flag)
+)
 FROM (
     SELECT ms.mailbox_id, jsonb_agg(DISTINCT kw.flag ORDER BY kw.flag) AS keywords
     FROM message_state ms
@@ -23,7 +34,8 @@ FROM (
     WHERE m.expunged_at IS NULL AND kw.flag !~ '^\\'
     GROUP BY ms.mailbox_id
 ) k
-WHERE st.mailbox_id = k.mailbox_id AND st.custom_flags_cache IS NULL;
+WHERE st.mailbox_id = k.mailbox_id
+  AND (st.custom_flags_cache IS NULL OR NOT st.custom_flags_cache @> k.keywords);
 
 UPDATE mailbox_stats
 SET custom_flags_cache = '[]'::jsonb
