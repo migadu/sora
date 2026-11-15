@@ -279,7 +279,7 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 // command read the message (a read racing the upload, or a lagging replica). The caller
 // then handles the body as an uploaded one, in S3.
 func (s *IMAPSession) stageCrossAccountBody(command, contentHash string, srcAccountID, destAccountID int64) (bool, *imap.Error) {
-	err := helpers.LinkOrCopyFile(s.server.uploader.FilePath(contentHash, srcAccountID), s.server.uploader.FilePath(contentHash, destAccountID))
+	err := s.server.uploader.LinkStaged(contentHash, srcAccountID, destAccountID)
 	if err == nil {
 		return true, nil
 	}
