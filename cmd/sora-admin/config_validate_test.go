@@ -168,6 +168,13 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 			wantErr: []string{"[FAIL] server 'imap-proxy':\n   remote_addrs is required unless the file declares [[pool]] blocks"},
 		},
 		{
+			// The issue's file: the proxy was built with "" as a backend (#1147).
+			name: "proxy with an empty remote_addrs entry",
+			content: imapProxy + "remote_addrs = [\"\"]\nremote_port = 143\n" +
+				"\n[server.remote_lookup]\nenabled = true\nurl = \"https://lookup.example.com/lookup?email=$email\"\n",
+			wantErr: []string{"[FAIL] server 'imap-proxy':\n   server \"imap-proxy\": remote_addrs #1: empty backend address"},
+		},
+		{
 			name:    "remote_lookup the proxies start with",
 			content: imapProxy + remoteLookup + "url = \"https://lookup.example.com/lookup?email=$email\"\ntimeout = \"5s\"\n",
 		},

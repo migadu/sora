@@ -300,6 +300,45 @@ func TestConfigValidateProxyNeedsBackends(t *testing.T) {
 	}
 }
 
+// TestConfigValidateProxyRefusesEmptyRemoteAddr: an empty remote_addrs entry passed
+// Validate, and the proxy was built with "" as a backend and routed users to it. Validate
+// refuses it as ValidatePools refuses an empty [[pool]] backend, naming the entry (#1147).
+func TestConfigValidateProxyRefusesEmptyRemoteAddr(t *testing.T) {
+	tests := []struct {
+		remoteAddrs string
+		want        string // "" for a valid list
+	}{
+		{`[""]`, `server "proxy": remote_addrs #1: empty backend address`},
+		{`[" "]`, `server "proxy": remote_addrs #1: empty backend address`},
+		{`["192.0.2.10:143", "\t"]`, `server "proxy": remote_addrs #2: empty backend address`},
+		{`["192.0.2.10:143", "backend.example.com"]`, ""},
+	}
+	var proxies int
+	for _, typ := range ServerTypes {
+		if !strings.HasSuffix(typ, "_proxy") {
+			continue
+		}
+		proxies++
+		for _, tt := range tests {
+			t.Run(typ+" "+tt.remoteAddrs, func(t *testing.T) {
+				got := validateFile(t, storageTOML+"\n[[server]]\ntype = \""+typ+"\"\nname = \"proxy\"\naddr = \"127.0.0.1:1143\"\nremote_port = 143\nremote_addrs = "+tt.remoteAddrs+"\n")
+				if tt.want == "" {
+					if len(got) != 0 {
+						t.Errorf("Validate() = %v, want no problems", got)
+					}
+					return
+				}
+				if len(got) != 1 || got[0].Section != "server 'proxy'" || !strings.Contains(got[0].Err.Error(), tt.want) {
+					t.Errorf("Validate() = %v, want server 'proxy': %s", got, tt.want)
+				}
+			})
+		}
+	}
+	if proxies != 5 {
+		t.Errorf("checked %d proxy types, want the 5 proxies", proxies)
+	}
+}
+
 // validateFile loads content as the server loads its file and returns what Validate finds.
 func validateFile(t *testing.T, content string) []Problem {
 	t.Helper()

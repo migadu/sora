@@ -86,6 +86,13 @@ func TestStartupChecksTheWholeFile(t *testing.T) {
 			wantErr: []string{"invalid configuration - server 'imap-proxy': remote_addrs is required unless the file declares [[pool]] blocks"},
 		},
 		{
+			// The proxy was built with "" as a backend and routed users to it (#1147).
+			name: "proxy with an empty remote_addrs entry",
+			content: "\n[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:1143\"\nremote_addrs = [\"\"]\nremote_port = 143\n" +
+				"\n[server.remote_lookup]\nenabled = true\nurl = \"https://lookup.example.com/lookup?email=$email\"\n",
+			wantErr: []string{`invalid configuration - server 'imap-proxy': server "imap-proxy": remote_addrs #1: empty backend address`},
+		},
+		{
 			name:    "mail backend with database and S3",
 			content: storageTOML + imapBackend,
 		},
