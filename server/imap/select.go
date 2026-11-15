@@ -3,6 +3,7 @@ package imap
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/migadu/go-imap"
@@ -105,14 +106,14 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		currentSummary    *db.MailboxSummary
 		firstUnseenSeqNum uint32
 		displayFlags      []imap.Flag
-		vanishedUIDs      []imap.UID
+		vanished          imap.UIDSet
 		changedMsgs       []db.QResyncModifiedMessage
 	)
 	if err := s.server.rdb.InReadSnapshotWithRetry(readCtx, func(snapCtx context.Context) error {
 		currentSummary = nil
 		firstUnseenSeqNum = 0
 		displayFlags = nil
-		vanishedUIDs = nil
+		vanished = nil
 		changedMsgs = nil
 
 		summary, err := s.server.rdb.GetMailboxSummaryWithRetry(snapCtx, mailbox.ID)
@@ -161,8 +162,8 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 				if nonFatalErr != nil {
 					s.WarnLog("failed to get active UIDs for QRESYNC", "err", nonFatalErr)
 					fbErr, fbFatalErr := s.server.rdb.OptionalReadInSnapshot(snapCtx, func(spCtx context.Context) error {
-						var vErr error
-						vanishedUIDs, vErr = s.server.rdb.GetVanishedUIDsWithRetry(spCtx, mailbox.ID, qr.ModSeq, summary.HighestModSeq)
+						uids, vErr := s.server.rdb.GetVanishedUIDsWithRetry(spCtx, mailbox.ID, qr.ModSeq, summary.HighestModSeq)
+						vanished = convertUIDsToRanges(uids)
 						return vErr
 					})
 					if fbFatalErr != nil {
@@ -172,29 +173,12 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 						s.WarnLog("failed to get vanished UIDs fallback for QRESYNC", "err", fbErr)
 					}
 				} else {
-					activeMap := make(map[imap.UID]struct{}, len(activeUIDs))
-					for _, uid := range activeUIDs {
-						activeMap[uid] = struct{}{}
-					}
-
-					uidNext := imap.UID(summary.UIDNext)
-					for _, r := range qr.KnownUIDs {
-						start := r.Start
-						stop := r.Stop
-						if uidNext > 0 && stop >= uidNext {
-							stop = uidNext - 1
-						}
-						for uid := start; uid <= stop; uid++ {
-							if _, ok := activeMap[uid]; !ok {
-								vanishedUIDs = append(vanishedUIDs, uid)
-							}
-						}
-					}
+					vanished = knownUIDsGaps(qr.KnownUIDs, activeUIDs, imap.UID(summary.UIDNext))
 				}
 			} else {
 				nonFatalErr, fatalErr := s.server.rdb.OptionalReadInSnapshot(snapCtx, func(spCtx context.Context) error {
-					var vErr error
-					vanishedUIDs, vErr = s.server.rdb.GetVanishedUIDsWithRetry(spCtx, mailbox.ID, qr.ModSeq, summary.HighestModSeq)
+					uids, vErr := s.server.rdb.GetVanishedUIDsWithRetry(spCtx, mailbox.ID, qr.ModSeq, summary.HighestModSeq)
+					vanished = convertUIDsToRanges(uids)
 					return vErr
 				})
 				if fatalErr != nil {
@@ -405,10 +389,9 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 			return selectData, nil
 		}
 
-		if len(vanishedUIDs) > 0 {
-			// Convert UIDs to optimized ranges
-			selectData.Vanished = convertUIDsToRanges(vanishedUIDs)
-			s.DebugLog("QRESYNC VANISHED", "count", len(vanishedUIDs), "ranges", len(selectData.Vanished))
+		if len(vanished) > 0 {
+			selectData.Vanished = vanished
+			s.DebugLog("QRESYNC VANISHED", "ranges", len(vanished))
 		}
 
 		if len(changedMsgs) > 0 {
@@ -433,6 +416,39 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 	}
 
 	return selectData, nil
+}
+
+// knownUIDsGaps returns the UIDs of known below uidNext that are not in active: the
+// VANISHED (EARLIER) answer for a QRESYNC known-uids. active must be sorted (as
+// GetActiveUIDsInSet returns it); known is a static set of sorted ranges with holes
+// between them, as the parser gives it (RFC 7162 §7: in known-uids "*" is not allowed).
+// The gaps are taken range by range, so the cost follows the ranges and the active
+// UIDs, never the UIDs a range spans.
+func knownUIDsGaps(known imap.UIDSet, active []imap.UID, uidNext imap.UID) imap.UIDSet {
+	var gaps imap.UIDSet
+	for _, r := range known {
+		stop := r.Stop
+		if uidNext > 0 && stop >= uidNext {
+			stop = uidNext - 1
+		}
+		if r.Start == 0 || r.Start > stop {
+			continue
+		}
+		// next is the first UID of the range not yet accounted for; uint64, as it
+		// steps past an active UID 4294967295.
+		next := uint64(r.Start)
+		i, _ := slices.BinarySearch(active, r.Start)
+		for ; i < len(active) && active[i] <= stop; i++ {
+			if uint64(active[i]) > next {
+				gaps = append(gaps, imap.UIDRange{Start: imap.UID(next), Stop: active[i] - 1})
+			}
+			next = uint64(active[i]) + 1
+		}
+		if next <= uint64(stop) {
+			gaps = append(gaps, imap.UIDRange{Start: imap.UID(next), Stop: stop})
+		}
+	}
+	return gaps
 }
 
 func (s *IMAPSession) Unselect(ctx context.Context) error {

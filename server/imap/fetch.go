@@ -1312,7 +1312,14 @@ func convertUIDsToRanges(uids []imap.UID) imap.UIDSet {
 		return imap.UIDSet{}
 	}
 
-	uidSet := make(imap.UIDSet, 0, len(uids)/2+1) // Estimate ~50% compression
+	// Count the ranges first: a long run of consecutive UIDs is one range.
+	n := 1
+	for i := 1; i < len(uids); i++ {
+		if uids[i] != uids[i-1]+1 {
+			n++
+		}
+	}
+	uidSet := make(imap.UIDSet, 0, n)
 	start := uids[0]
 	prev := uids[0]
 

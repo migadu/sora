@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
@@ -236,31 +235,34 @@ func (d *Database) ValidateQResyncUIDValidityWithRetry(ctx context.Context, mail
 // In a view (WithSeqView) the messages the view still holds although they have since been
 // expunged are active too: the SELECT counts them in EXISTS, and the session's next poll
 // reports their expunge.
+//
+// uidSet is a static set (QRESYNC known-uids cannot hold "*", RFC 7162 §7). Its ranges
+// are sent as two arrays, so the statement is the same however many ranges a client
+// sends, and each range is one index range scan of the mailbox's UIDs.
 func (d *Database) GetActiveUIDsInSet(ctx context.Context, mailboxID int64, uidSet imap.UIDSet) ([]imap.UID, error) {
 	if len(uidSet) == 0 {
 		return nil, nil
 	}
 
-	var conditions []string
-	var args []any
-	args = append(args, mailboxID)
-
-	for _, uidRange := range uidSet {
-		if uidRange.Stop == imap.UID(0) || uidRange.Start == uidRange.Stop {
-			args = append(args, int64(uidRange.Start))
-			conditions = append(conditions, fmt.Sprintf("uid = $%d", len(args)))
-		} else {
-			args = append(args, int64(uidRange.Start), int64(uidRange.Stop))
-			conditions = append(conditions, fmt.Sprintf("(uid >= $%d AND uid <= $%d)", len(args)-1, len(args)))
-		}
+	starts := make([]int64, len(uidSet))
+	stops := make([]int64, len(uidSet))
+	for i, r := range uidSet {
+		starts[i], stops[i] = int64(r.Start), int64(r.Stop)
 	}
+	args := []any{mailboxID, starts, stops}
 
 	viewParam := ""
 	if view := seqViewOf(ctx); view > 0 {
 		args = append(args, int64(view))
 		viewParam = fmt.Sprintf("$%d", len(args))
 	}
-	query := `SELECT uid FROM ` + seqCountedRows("$1", viewParam, "("+strings.Join(conditions, " OR ")+")", "ASC", "") + ` counted ORDER BY uid`
+	// OFFSET 0 keeps the lateral subquery from being flattened into a plain join, which
+	// the planner may order the other way round when it underestimates the mailbox (a
+	// new one, before ANALYZE): every message then tested against every range.
+	query := `SELECT DISTINCT counted.uid FROM unnest($2::bigint[], $3::bigint[]) AS known(lo, hi)
+		CROSS JOIN LATERAL (SELECT uid FROM ` +
+		seqCountedRows("$1", viewParam, "uid BETWEEN known.lo AND known.hi", "", "") +
+		` c OFFSET 0) counted ORDER BY counted.uid`
 
 	rows, err := d.readQuerier(ctx).Query(ctx, query, args...)
 	if err != nil {
