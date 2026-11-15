@@ -3,6 +3,7 @@ package lmtp
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -743,7 +744,13 @@ func (b *LMTPServerBackend) Close() error {
 		b.cancel()
 	}
 	if b.server != nil {
-		return b.server.Close()
+		err := b.server.Close()
+		// Start's context watcher can close the listener before go-smtp's
+		// registered-listener loop reaches it. That is a completed shutdown.
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
 	}
 	return nil
 }

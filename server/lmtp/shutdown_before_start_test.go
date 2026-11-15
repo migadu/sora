@@ -2,14 +2,83 @@ package lmtp
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
 
+	"github.com/emersion/go-smtp"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
+
+type shutdownCloseListener struct {
+	net.Listener
+	accepting chan struct{}
+	closeErr  error
+}
+
+func (l *shutdownCloseListener) Accept() (net.Conn, error) {
+	close(l.accepting)
+	return l.Listener.Accept()
+}
+
+func (l *shutdownCloseListener) Close() error {
+	err := l.Listener.Close()
+	if l.closeErr != nil {
+		return l.closeErr
+	}
+	return err
+}
+
+func TestCloseAlreadyClosedListener(t *testing.T) {
+	closeFailure := errors.New("listener close failure")
+	for _, tt := range []struct {
+		name string
+		err  error
+	}{
+		{name: "already closed"},
+		{name: "other close error", err: closeFailure},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			b := newShutdownTestBackend(t, context.Background(), "127.0.0.1:0")
+			t.Cleanup(func() { b.Close() })
+			base, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { base.Close() })
+			l := &shutdownCloseListener{Listener: base, accepting: make(chan struct{}), closeErr: tt.err}
+			served := make(chan error, 1)
+			go func() { served <- b.server.Serve(l) }()
+			select {
+			case <-l.accepting: // Serve has registered the listener.
+			case <-time.After(3 * time.Second):
+				t.Fatal("Serve did not register the listener")
+			}
+			// The context watcher can close this socket before smtp.Close reaches
+			// its registered-listener loop. Force that ordering without a sleep.
+			if err := base.Close(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-served:
+				if !errors.Is(err, net.ErrClosed) {
+					t.Fatalf("Serve returned %v, want closed listener", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("Serve did not return after listener close")
+			}
+			if err := b.Close(); !errors.Is(err, tt.err) {
+				t.Fatalf("Close returned %v, want %v", err, tt.err)
+			}
+			if err := b.Close(); !errors.Is(err, smtp.ErrServerClosed) {
+				t.Fatalf("second Close returned %v, want ErrServerClosed", err)
+			}
+		})
+	}
+}
 
 func newShutdownTestBackend(t *testing.T, ctx context.Context, addr string) *LMTPServerBackend {
 	t.Helper()
