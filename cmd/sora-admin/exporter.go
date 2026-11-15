@@ -253,7 +253,7 @@ func (exporter *Exporter) Run() error {
 		}
 	}
 
-	if err := exporter.printSummary(); err != nil {
+	if err := exporter.printSummary(dovecotErr, uidListErr); err != nil {
 		return err
 	}
 	// An export that lost anything must not exit 0: an operator scripting a migration
@@ -931,8 +931,10 @@ func (exporter *Exporter) getProgressPrefix() string {
 	return fmt.Sprintf("[%d/%d %.1f%%]", processed, total, percentage)
 }
 
-// printSummary prints a summary of the export process
-func (exporter *Exporter) printSummary() error {
+// printSummary prints a summary of the export process. dovecotErr and uidListErr are
+// the failures of the subscriptions file and of the dovecot-uidlist files, which the
+// summary must not report as written.
+func (exporter *Exporter) printSummary(dovecotErr, uidListErr error) error {
 	duration := time.Since(exporter.startTime)
 	fmt.Printf("\n\nExport Summary:\n")
 	fmt.Printf("  Total messages:    %d\n", exporter.totalMessages)
@@ -945,10 +947,18 @@ func (exporter *Exporter) printSummary() error {
 		fmt.Printf("  Export rate:       %.1f messages/sec\n", rate)
 	}
 	if exporter.options.Dovecot {
-		fmt.Printf("\nNote: Dovecot subscriptions file exported.\n")
+		if dovecotErr == nil {
+			fmt.Printf("\nNote: Dovecot subscriptions file exported.\n")
+		} else {
+			fmt.Printf("\nNote: Dovecot subscriptions file NOT exported.\n")
+		}
 	}
 	if exporter.options.ExportUIDList {
-		fmt.Printf("Note: Dovecot uidlist files generated.\n")
+		if uidListErr == nil {
+			fmt.Printf("Note: Dovecot uidlist files generated.\n")
+		} else {
+			fmt.Printf("Note: Some Dovecot uidlist files could NOT be written.\n")
+		}
 	}
 	return nil
 }
