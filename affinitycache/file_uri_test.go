@@ -124,6 +124,10 @@ func TestExistingWorldReadableWALIsMadePrivate(t *testing.T) {
 				t.Fatalf("New() error: %v", err)
 			}
 			defer store.Close()
+			var committed int
+			if err := store.db.QueryRow("SELECT x FROM t").Scan(&committed); err != nil || committed != 1 {
+				t.Fatalf("committed WAL contents were lost: x=%d, err=%v", committed, err)
+			}
 			now := time.Now()
 			if err := store.Set(context.Background(), AffinityEntry{Username: "alice@example.com", Protocol: "imap", Backend: "backend1:143",
 				AssignedAt: now, ExpiresAt: now.Add(time.Hour), NodeID: "node-1"}); err != nil {

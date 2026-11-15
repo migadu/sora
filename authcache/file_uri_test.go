@@ -124,6 +124,10 @@ func TestExistingWorldReadableWALIsMadePrivate(t *testing.T) {
 				t.Fatalf("New() error: %v", err)
 			}
 			defer c.Close()
+			var committed int
+			if err := c.db.QueryRow("SELECT x FROM t").Scan(&committed); err != nil || committed != 1 {
+				t.Fatalf("committed WAL contents were lost: x=%d, err=%v", committed, err)
+			}
 			if err := c.Put(context.Background(), "user@example.com", 42, "$2a$10$hash"); err != nil {
 				t.Fatalf("Put() error: %v", err)
 			}
