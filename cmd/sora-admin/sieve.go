@@ -263,7 +263,7 @@ Examples:
 		os.Exit(1)
 	}
 
-	_, err = rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, *name, string(scriptContent))
+	_, _, err = rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, *name, string(scriptContent))
 	if err != nil {
 		fmt.Printf("Failed to save Sieve script: %v\n", err)
 		os.Exit(1)

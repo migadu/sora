@@ -306,10 +306,12 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 	if err != nil {
 		s.WarnLog("invalid to address", "error", err)
 		recordMetrics("failure")
+		// RFC 5321 4.2.2: 553 "mailbox name not allowed (e.g., mailbox syntax
+		// incorrect)"; RFC 3463 X.1.3 "Bad destination mailbox address syntax".
 		return &smtp.SMTPError{
-			Code:         513,
-			EnhancedCode: smtp.EnhancedCode{5, 0, 1},
-			Message:      "Invalid recipient",
+			Code:         553,
+			EnhancedCode: smtp.EnhancedCode{5, 1, 3},
+			Message:      "Invalid recipient address syntax",
 		}
 	}
 	fullAddress := toAddress.FullAddress()
@@ -413,7 +415,7 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 				Message:      "service shutting down",
 			}
 		}
-		s.WarnLog("failed to get primary email", "account_id", AccountID, "error", err)
+		s.WarnLog("failed to get primary email", "recipient_account_id", AccountID, "error", err)
 		recordMetrics("failure")
 		return &smtp.SMTPError{
 			Code:         451,
@@ -468,9 +470,9 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 
 	// Log recipient acceptance with alias detection
 	if fullAddress != primaryAddr.FullAddress() {
-		s.DebugLog("recipient accepted", "to", fullAddress, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID)
+		s.DebugLog("recipient accepted", "to", fullAddress, "primary_address", primaryAddr.FullAddress())
 	} else {
-		s.DebugLog("recipient accepted", "to", fullAddress, "account_id", AccountID)
+		s.DebugLog("recipient accepted", "to", fullAddress)
 	}
 	recordMetrics("success")
 	return nil
@@ -521,16 +523,16 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// Enforce message size limit BEFORE reading into memory to prevent DoS
 	// Default: 50MB (configurable). Without limit, malicious senders could
 	// deliver 50+ MB messages × concurrent connections causing memory exhaustion.
-	limitToUse := settings.maxMessageSize
-	if limitToUse <= 0 {
-		limitToUse = DefaultMaxMessageSize // 50MB fallback
-	}
+	limitToUse := settings.messageSizeLimit()
 
 	// Add 1 byte to detect when limit is exceeded
 	reader := io.LimitReader(r, limitToUse+1)
 
 	_, err := io.Copy(&buf, reader)
-	if err != nil {
+	// go-smtp's DATA reader stops at the same limit (Server.MaxMessageBytesFunc) with
+	// ErrDataTooLarge: the message is too big, which is no read error.
+	tooLarge := int64(buf.Len()) > limitToUse || errors.Is(err, smtp.ErrDataTooLarge)
+	if err != nil && !tooLarge {
 		// Read errors during DATA command:
 		// - unexpected EOF: client disconnected, incomplete transmission, or malformed message stream
 		// - context canceled: timeout or shutdown
@@ -552,15 +554,15 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	// Cap the delivery pipeline (SIEVE, spool, DB insert) from this point for
 	// the same reason: the body read above is client-paced wire I/O already
-	// governed by the server ReadTimeout and must not consume the execution
-	// budget. On expiry the pipeline aborts with a 4xx and the upstream MTA
-	// requeues the message.
+	// governed by the server ReadTimeout (per read) and DataTimeout (in total)
+	// and must not consume the execution budget. On expiry the pipeline aborts
+	// with a 4xx and the upstream MTA requeues the message.
 	ctx, cancel := applyCommandTimeout(ctx, "DATA", s.backend.commandTimeouts)
 	defer cancel()
 
 	// Check if message exceeds configured limit
 	// LimitReader allows reading limitToUse+1 bytes to detect oversized messages
-	if int64(buf.Len()) > limitToUse {
+	if tooLarge {
 		s.WarnLog("message size exceeds limit", "size", buf.Len(), "limit", limitToUse)
 		recordMetrics("failure")
 		return &smtp.SMTPError{
@@ -674,7 +676,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	mailHeader := mail.Header{Header: messageContent.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
+	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date"))
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
 
@@ -758,7 +760,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			if s.useMasterDB {
 				ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 			}
-			return delivery.CanFileInto(ctx, s.backend.rdb, s.AccountID(), mailbox)
+			return delivery.CanFileInto(ctx, s.backend.rdb, s.backend.sharedMailboxes, s.AccountID(), mailbox)
 		},
 	}
 
@@ -872,7 +874,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				mailHeader = mail.Header{Header: messageContent.Header}
 				subject, _ = mailHeader.Subject()
 				messageID, _ = mailHeader.MessageID()
-				sentDate, _ = mailHeader.Date()
+				sentDate, _ = helpers.ParseDateHeader(mailHeader.Get("Date"))
 				inReplyTo, _ = mailHeader.MsgIDList("In-Reply-To")
 				references, _ = mailHeader.MsgIDList("References")
 				if len(inReplyTo) == 0 {
@@ -1292,11 +1294,12 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 	}
 
 	// Resolve the name as for any fileinto: the user's own mailbox, else one shared
-	// with the user. :create (RFC 5490 §3.2) creates the mailbox only "if needed":
-	// "If the mailbox already exists, this argument is ignored", and a shared one
-	// exists for this user. It never makes a personal mailbox in the shared
-	// namespace, where a namesake would shadow a shared mailbox in later lookups.
-	mailbox, err := s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), mailboxName)
+	// with the user, never the shared namespace root (delivery.FileintoTarget). :create
+	// (RFC 5490 §3.2) creates the mailbox only "if needed": "If the mailbox already
+	// exists, this argument is ignored", and a shared one exists for this user. It
+	// never makes a personal mailbox in the shared namespace, where a namesake would
+	// shadow a shared mailbox in later lookups.
+	mailbox, err := delivery.FileintoTarget(readCtx, s.backend.rdb, s.backend.sharedMailboxes, s.AccountID(), mailboxName)
 	if errors.Is(err, consts.ErrMailboxNotFound) && createMailbox {
 		if s.backend.sharedMailboxes.InNamespace(mailboxName) {
 			s.WarnLog("fileinto :create refused in the shared namespace", "mailbox", mailboxName)
@@ -1318,7 +1321,7 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 		}
 	}
 	if errors.Is(err, consts.ErrMailboxNotFound) {
-		s.WarnLog("mailbox not found, falling back to inbox", "mailbox", mailboxName)
+		s.WarnLog("mailbox not found, falling back to inbox", "mailbox", mailboxName, "error", err)
 		mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), consts.MailboxInbox)
 		if err != nil {
 			return fmt.Errorf("failed to get INBOX mailbox: %v", err)
@@ -1355,15 +1358,11 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 	}
 
 	if destAccountID != s.AccountID() {
-
-		// Ensure the local file exists under the destination owner's staging directory.
-		// The original was staged under s.AccountID() by StoreLocally before Sieve.
-		sourcePath := s.backend.uploader.FilePath(contentHash, s.AccountID())
-		destPath := s.backend.uploader.FilePath(contentHash, destAccountID)
-		if sourcePath != destPath {
-			if err := helpers.LinkOrCopyFile(sourcePath, destPath); err != nil {
-				s.WarnLog("failed to stage local file for cross-account LMTP delivery", "source", sourcePath, "dest", destPath, "error", err)
-			}
+		// The owner's pending upload reads the body only from the owner's staging path;
+		// it was staged under s.AccountID() before this. A message stored without it is
+		// one whose upload finds no body, so a staging failure fails this delivery.
+		if err := s.backend.uploader.LinkStagedOrStore(contentHash, s.AccountID(), destAccountID, fullMessageBytes); err != nil {
+			return fmt.Errorf("failed to stage message body for the owner of mailbox '%s': %w", mailbox.Name, err)
 		}
 	}
 

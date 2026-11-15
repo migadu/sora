@@ -114,6 +114,16 @@ func TestMailboxRenameCommandRefusals(t *testing.T) {
 		require.Equal(t, before.ID, after.ID, `"TrailBox/" names TrailBox, not a mailbox below a new parent TrailBox`)
 		require.False(t, exists("TrailBox/"))
 	})
+	// Issue #1229: the children the rename carries along must stay on their side of
+	// the boundary too, and that refusal also comes before any parent is created.
+	t.Run("shared child out of the shared prefix", func(t *testing.T) {
+		require.NoError(t, rdb.CreateMailboxForUserWithRetry(ctx, accountID, "Shared/Namesake"))
+		require.NoError(t, rdb.CreateMailboxForUserWithRetry(sharedCtx, accountID, "Shared/Namesake/Kid"))
+		out, ok := runMailboxRename(t, account.Email, "Shared/Namesake", "NewParent/Namesake")
+		require.False(t, ok, "a shared child cannot be moved out of the shared namespace: %s", out)
+		require.True(t, exists("Shared/Namesake/Kid"))
+		require.False(t, exists("NewParent"), "a refused rename left the parent it created behind: %s", out)
+	})
 	t.Run("personal out of the shared prefix", func(t *testing.T) {
 		out, ok := runMailboxRename(t, account.Email, "Shared/Planted", "PersonalPlanted")
 		require.True(t, ok, "a personal mailbox under the shared prefix can be renamed out of it: %s", out)
