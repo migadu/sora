@@ -115,9 +115,11 @@ func TestConfigValidate(t *testing.T) {
 // TestConfigValidateDatabaseAndS3: a node that runs a server needing the database, or
 // one that stores or serves message bodies, is refused without [database] or [s3]. The
 // server refused these only in service setup, after it had opened what came before, and
-// `sora-admin config validate` passed them (#921).
+// `sora-admin config validate` passed them (#921); it passed [database.read] hosts without
+// [database.write] ones too (#1266).
 func TestConfigValidateDatabaseAndS3(t *testing.T) {
 	const db = "[database.write]\nhosts = [\"db.example.com\"]\n\n"
+	const readOnly = "[database.read]\nhosts = [\"replica.example.com\"]\n\n"
 	const s3 = "[s3]\nendpoint = \"s3.example.com\"\nbucket = \"mail\"\n\n"
 	const imapBackend = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"
 	const managesieve = "\n[[server]]\ntype = \"managesieve\"\nname = \"sieve\"\naddr = \"127.0.0.1:4190\"\n"
@@ -132,7 +134,17 @@ func TestConfigValidateDatabaseAndS3(t *testing.T) {
 		want    []problem
 	}{
 		{name: "mail backend", content: db + s3 + imapBackend},
-		{name: "mail backend with a read endpoint only", content: "[database.read]\nhosts = [\"db.example.com\"]\n\n" + s3 + imapBackend},
+		// Start-up opens write pools only from [database.write] and stops with "no healthy
+		// database pools available" without one, after trying every replica (#1266).
+		{name: "mail backend with a read endpoint only", content: readOnly + s3 + imapBackend,
+			want: []problem{{"[database.write]", `server "imap" (imap) needs the database, but [database.write] has no hosts`}}},
+		{name: "managesieve with a read endpoint only", content: readOnly + managesieve,
+			want: []problem{{"[database.write]", `server "sieve" (managesieve) needs the database, but [database.write] has no hosts`}}},
+		{name: "read endpoint and a write endpoint without hosts", content: "[database.write]\nhosts = []\n\n" + readOnly + managesieve,
+			want: []problem{{"[database.write]", `server "sieve" (managesieve) needs the database, but [database.write] has no hosts`}}},
+		{name: "proxy that authenticates against a read endpoint only", content: readOnly + imapProxy,
+			want: []problem{{"[database.write]", `server "imap-proxy" (imap_proxy) needs the database, but [database.write] has no hosts`}}},
+		{name: "write and read endpoints", content: db + readOnly + managesieve},
 		{name: "mail backend without a database", content: s3 + imapBackend,
 			want: []problem{{"[database]", `server "imap" (imap) needs the database, but it is not configured in [database.write] or [database.read]`}}},
 		{name: "database endpoint without hosts", content: "[database.write]\nhosts = []\n\n" + s3 + imapBackend,
@@ -180,7 +192,8 @@ func TestConfigValidateDatabaseAndS3(t *testing.T) {
 // them, after it had opened what came before, and `sora-admin config validate` passed
 // them: [uploader] max_staging_size (#1092), [s3] encryption_key and a lone access_key or
 // secret_key (#1095), the [database] durations (#1104) and [tls] (#1105). Each is checked
-// only where start-up reads it.
+// only where start-up reads it. [timeout_scheduler] shard_count is read on every node, by
+// the scheduler set up once logging is (#1325).
 func TestConfigValidateWhatServiceSetupRefuses(t *testing.T) {
 	const db = "[database.write]\nhosts = [\"db.example.com\"]\n"
 	const s3 = "[s3]\nendpoint = \"s3.example.com\"\nbucket = \"mail\"\n"
@@ -252,6 +265,11 @@ func TestConfigValidateWhatServiceSetupRefuses(t *testing.T) {
 		{name: "tls letsencrypt sync_interval unparsable", content: tls + "sync_interval = \"often\"\n" + metrics,
 			want: []problem{{"[tls]", `invalid sync_interval duration "often"`}}},
 		{name: "tls disabled is not checked", content: "[tls]\nenabled = false\nprovider = \"acme\"\n" + metrics},
+
+		// #1325: start-up exits on a shard_count below -1, after it has set up logging.
+		{name: "timeout_scheduler shard_count", content: "[timeout_scheduler]\nshard_count = -1\n" + metrics},
+		{name: "timeout_scheduler shard_count below -1", content: "[timeout_scheduler]\nshard_count = -2\n" + metrics,
+			want: []problem{{"[timeout_scheduler]", "shard_count must be >= -1, got -2"}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
