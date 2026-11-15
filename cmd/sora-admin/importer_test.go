@@ -499,3 +499,27 @@ func TestParseMessageMetadata(t *testing.T) {
 		assert.True(t, !metadata.internalDate.Before(before) && !metadata.internalDate.After(after), "internal date should fall back to time.Now()")
 	})
 }
+
+// TestParseMessageMetadataObsoleteZone: an alphabetic Date: zone has the offset RFC 5322
+// section 4.3 gives it ("PDT is semantically equivalent to -0700"), not the one it has in
+// the importing host's zone. At most one of PDT and EST can be the host's in July, so a
+// zone looked up in time.Local fails at least one of them.
+func TestParseMessageMetadataObsoleteZone(t *testing.T) {
+	importer := &Importer{}
+	for _, tc := range []struct {
+		header string
+		offset int // seconds east of UTC
+	}{
+		{"Wed, 17 Jul 1996 02:23:25 PDT", -7 * 3600},
+		{"Wed, 17 Jul 1996 02:23:25 EST", -5 * 3600},
+	} {
+		content := []byte("Date: " + tc.header + "\r\nSubject: Test\r\n\r\nBody")
+		metadata, err := importer.parseMessageMetadata(content, "test.eml", "/dummy/path")
+		require.NoError(t, err)
+
+		want := time.Date(1996, 7, 17, 2, 23, 25, 0, time.FixedZone("", tc.offset))
+		_, offset := metadata.sentDate.Zone()
+		assert.True(t, want.Equal(metadata.sentDate), "%s: sent date %v, want %v", tc.header, metadata.sentDate, want)
+		assert.Equal(t, tc.offset, offset, "%s: zone offset of %v", tc.header, metadata.sentDate)
+	}
+}
