@@ -693,6 +693,20 @@ func (rd *ResilientDatabase) GetSubscribedMailboxNamesWithRetry(ctx context.Cont
 	return result.([]string), nil
 }
 
+// GetSubscribedMailboxNamesByKeyWithRetry returns every subscribed name for the
+// account keyed by LOWER(mailbox_name) as the database computes it.
+func (rd *ResilientDatabase) GetSubscribedMailboxNamesByKeyWithRetry(ctx context.Context, accountID int64) (map[string]string, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetSubscribedMailboxNamesByKey(ctx, accountID)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	names, _ := result.(map[string]string)
+	return names, nil
+}
+
 // HasMailboxWithSpecialUseWithRetry reports whether the account already has a live
 // mailbox carrying the given special-use attribute (RFC 6154 §5 uniqueness check).
 func (rd *ResilientDatabase) HasMailboxWithSpecialUseWithRetry(ctx context.Context, accountID int64, attr string) (bool, error) {
