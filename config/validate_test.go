@@ -245,6 +245,15 @@ func TestConfigValidateWhatServiceSetupRefuses(t *testing.T) {
 			want: []problem{{"[database.read]", `invalid max_conn_idle_time "idle"`}}},
 		{name: "database.read without hosts is not checked", content: db + "\n[database.read]\nhosts = []\nmax_conn_idle_time = \"idle\"\n" + managesieve},
 		{name: "database on a node that queries none is not checked", content: "[database]\nmigration_timeout = \"soon\"\n\n" + db + "max_conn_lifetime = \"an hour\"\n" + metrics},
+		// So is a host whose connection string cannot be built from the endpoint's port.
+		{name: "database ports", content: db + "port = 5433\n\n[database.read]\nhosts = [\"replica.example.com\"]\nport = \"5434\"\n" + managesieve},
+		{name: "database.write port out of range", content: db + "port = 70000\n" + managesieve,
+			want: []problem{{"[database.write]", "port number 70000 is out of the valid range (1-65535)"}}},
+		{name: "database.read port not a number", content: db + "\n[database.read]\nhosts = [\"replica.example.com\"]\nport = \"x\"\n" + managesieve,
+			want: []problem{{"[database.read]", `invalid string for port: "x"`}}},
+		{name: "database port unused when every host names one", content: "[database.write]\nhosts = [\"db.example.com:5433\"]\nport = \"x\"\n" + managesieve},
+		{name: "database.write host port not a number", content: "[database.write]\nhosts = [\"db.example.com:5433\", \"db2.example.com:abc\"]\n" + managesieve,
+			want: []problem{{"[database.write]", `invalid port "abc" in host "db2.example.com:abc"`}}},
 
 		// #1105: the TLS manager refused these last, after every other service was up.
 		{name: "tls letsencrypt", content: tls + "renew_before = \"720h\"\nsync_interval = \"0\"\n" + metrics},
@@ -265,6 +274,18 @@ func TestConfigValidateWhatServiceSetupRefuses(t *testing.T) {
 			want: []problem{{"[tls]", `invalid renew_before duration "a month"`}}},
 		{name: "tls letsencrypt sync_interval unparsable", content: tls + "sync_interval = \"often\"\n" + metrics,
 			want: []problem{{"[tls]", `invalid sync_interval duration "often"`}}},
+		// The certificate store's client and its encryption settings are refused from the
+		// file as well, before the store is reached.
+		{name: "tls letsencrypt s3", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\naccess_key = \"AKIAEXAMPLE\"\nsecret_key = \"example-secret\"\nserver_side_encryption = \"aws:kms\"\nserver_side_encryption_kms_key_id = \"example-key\"\n" + metrics},
+		{name: "tls letsencrypt s3 without server-side encryption", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption = \"\"\n" + metrics},
+		{name: "tls letsencrypt s3 access_key without secret_key", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\naccess_key = \"AKIAEXAMPLE\"\n" + metrics,
+			want: []problem{{"[tls]", "letsencrypt.s3: access_key and secret_key must be set together"}}},
+		{name: "tls letsencrypt s3 server_side_encryption unsupported", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption = \"rot13\"\n" + metrics,
+			want: []problem{{"[tls]", `letsencrypt.s3: unsupported server-side encryption "rot13"`}}},
+		{name: "tls letsencrypt s3 aws:kms without key id", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption = \"aws:kms\"\n" + metrics,
+			want: []problem{{"[tls]", `letsencrypt.s3: server-side encryption "aws:kms" requires a KMS key id`}}},
+		{name: "tls letsencrypt s3 key id without aws:kms", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption_kms_key_id = \"example-key\"\n" + metrics,
+			want: []problem{{"[tls]", `letsencrypt.s3: a KMS key id is only used by server-side encryption "aws:kms", not "AES256"`}}},
 		{name: "tls disabled is not checked", content: "[tls]\nenabled = false\nprovider = \"acme\"\n" + metrics},
 
 		// #1325: start-up exits on a shard_count below -1, after it has set up logging.
