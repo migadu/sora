@@ -162,6 +162,11 @@ Examples:
 		os.Exit(1)
 	}
 
+	if *batchSize < 1 {
+		fmt.Printf("Error: --batch-size must be at least 1\n")
+		os.Exit(1)
+	}
+
 	// Parse date filters
 	var startDateParsed, endDateParsed *time.Time
 	if *startDate != "" {
