@@ -113,8 +113,8 @@ carries its own copy and these server keys are not used for pool members (except
 | `remote_tls_verify` | bool | `false` | all | Verify the backend's certificate. Note the default: on a `[[server]]` block it is **off** unless you set it. In `[[pool]]` and `[server.remote_lookup]` it defaults to on. |
 | `remote_tls_ca_file` | path | system roots | all | PEM file of CA certificates for verifying backends that are in no pool. Pool members use their pool's `remote_tls_ca_file`. |
 | `remote_use_proxy_protocol` | bool | `false` | all | Send a PROXY protocol v2 header with the client's address at the start of each backend connection. |
-| `remote_use_id_command` | bool | `false` | IMAP | Send an IMAP `ID` command with the client's address before logging in. |
-| `remote_use_xclient` | bool | `false` | POP3, LMTP | Send an `XCLIENT` command with the client's address. |
+| `remote_use_id_command` | bool | `false` | IMAP | Send an IMAP `ID` command with the client's address before logging in, unless a PROXY header was sent (8.1). |
+| `remote_use_xclient` | bool | `false` | POP3, LMTP | Send an `XCLIENT` command with the client's address. POP3: unless a PROXY header was sent (8.1). |
 | `remote_use_utf8` | bool | `false` | POP3 | Advertise `UTF8` and `LANG` before login, and repeat a client's pre-login `UTF8` to the backend. Turn on only when every backend is Sora. |
 
 ### Listener, limits and timeouts
@@ -672,10 +672,11 @@ the backend from seeing the proxy's address at all. `ID` and `XCLIENT` work with
 backend's listener. On IMAP and POP3, a backend that receives a PROXY header judges `ID` and
 `XCLIENT` by the client the header names, not by the proxy, so next to a header it ignores the `ID`
 forwarding fields and refuses the POP3 `XCLIENT` (unless that client is itself in
-`trusted_networks`); the login continues. The header already carries the client's address and
-port, its JA4 fingerprint and the proxy session ID (8.4). LMTP `XCLIENT` is judged by the proxy
-and still carries the client's `HELO` next to a PROXY header
-([SECURITY.md](SECURITY.md#31-trusted_networks)).
+`trusted_networks`). The IMAP and POP3 proxies therefore send no `ID` or `XCLIENT` on a connection
+they started with a PROXY header, which already carries the client's address and port (8.4). LMTP
+`XCLIENT` is judged by the proxy and still carries the client's `HELO`, so the LMTP proxy sends it
+next to a PROXY header too ([SECURITY.md](SECURITY.md#31-trusted_networks)). One pool can set
+`remote_use_proxy_protocol`, `remote_use_id_command` and `remote_use_xclient` together.
 
 ### 8.2 Which settings apply
 
@@ -720,7 +721,8 @@ the header carries two extra fields: type `0xE0` with the client's JA4 TLS finge
 
 ### 8.5 IMAP ID forwarding
 
-With `remote_use_id_command`, the IMAP proxy sends one `ID` command before it logs in. The fields
+With `remote_use_id_command`, the IMAP proxy sends one `ID` command before it logs in, unless it
+started the connection with a PROXY header (8.1). The fields
 are `name` (`Sora-Proxy`), `x-originating-ip`, `x-originating-port`, `x-connected-ip`,
 `x-connected-port`, `x-session-id`, `x-proxy-ttl` (10), and `x-forward-proxy-server`,
 `x-forward-proxy-user`, `x-forward-proxy-source-ip` and, when known, `x-forward-ja4-fingerprint`. A
@@ -729,8 +731,9 @@ failure is logged and the login continues.
 ### 8.6 XCLIENT
 
 With `remote_use_xclient`, the POP3 proxy sends `XCLIENT ADDR=... PORT=... SESSION=... TTL=10
-FORWARD=...` before it logs in; the LMTP proxy sends `XCLIENT ADDR=... PORT=... HELO=...
-PROTO=ESMTP` (IPv6 addresses as `ADDR=IPV6:...`).
+FORWARD=...` before it logs in, unless it started the connection with a PROXY header (8.1); the
+LMTP proxy sends `XCLIENT ADDR=... PORT=... HELO=... PROTO=ESMTP`, with or without a header (IPv6
+addresses as `ADDR=IPV6:...`).
 
 ### 8.7 POP3 UTF8
 

@@ -144,8 +144,9 @@ func TestProxyProtocolIncoming(t *testing.T) {
 		t.Logf("SUCCESS: PROXY protocol incoming support is working for POP3!")
 
 		// NOTE: To verify the real client IP reaches the backend, check the backend logs.
-		// The backend should log remote=203.0.113.42 instead of the proxy's IP.
-		// This is verified by the XCLIENT forwarding in sendForwardingParametersToBackend.
+		// The backend should log remote=203.0.113.42 instead of the proxy's IP. The
+		// proxy's own PROXY header to the backend carries it (no XCLIENT is sent next to
+		// a header: the backend would judge it by that client and refuse it).
 	})
 }
 

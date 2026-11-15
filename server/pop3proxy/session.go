@@ -806,6 +806,12 @@ func (s *POP3ProxySession) connectToBackend() error {
 	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
 		useXCLIENT = s.routingInfo.RemoteUseXCLIENT
 	}
+	// Not next to a PROXY header: the backend judges XCLIENT by the client the header names,
+	// not by this proxy, and refuses it, while the header already gives it the client's
+	// address and port. (The LMTP proxy still sends XCLIENT there, for the client's HELO.)
+	if useXCLIENT && s.server.connManager.SendsProxyHeader(s.routingInfo, s.serverAddr, clientHost, clientPort, serverHost, serverPort) {
+		useXCLIENT = false
+	}
 	if useXCLIENT {
 		if err := s.sendForwardingParametersToBackend(backendWriter, backendReader); errors.Is(err, errXCLIENTRefused) {
 			// Go on without them: the -ERR ended the exchange.

@@ -951,8 +951,8 @@ names it.
 | `remote_tls_verify` | bool | `false` | proxies | Verify backend certificates. |
 | `remote_tls_ca_file` | string | none | proxies | CA file for backend certificates. |
 | `remote_use_proxy_protocol` | bool | `false` | proxies | Send a PROXY protocol header to the backends. |
-| `remote_use_id_command` | bool | `false` | `imap_proxy` | Forward the client's address with IMAP ID. |
-| `remote_use_xclient` | bool | `false` | `pop3_proxy`, `lmtp_proxy` | Forward the client's address with XCLIENT. |
+| `remote_use_id_command` | bool | `false` | `imap_proxy` | Forward the client's address with IMAP ID. Not sent next to a PROXY header. |
+| `remote_use_xclient` | bool | `false` | `pop3_proxy`, `lmtp_proxy` | Forward the client's address with XCLIENT. POP3 sends none next to a PROXY header. |
 | `remote_use_utf8` | bool | `false` | `pop3_proxy` | Offer POP3 UTF8 and pass it to the backends. Only for Sora backends. |
 | `connect_timeout` | duration | `"30s"` | proxies | Time to connect to a backend. |
 | `auth_idle_timeout` | duration | `"2m"` | `imap`, `pop3`, `managesieve`, line proxies | Idle time allowed before login. |

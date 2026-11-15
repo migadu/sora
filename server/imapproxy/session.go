@@ -1498,6 +1498,12 @@ func (s *Session) connectToBackend() error {
 	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
 		useIDCommand = s.routingInfo.RemoteUseIDCommand
 	}
+	// Not next to a PROXY header: the backend judges ID forwarding by the client the header
+	// names, not by this proxy, and ignores the fields, while the header already gives it
+	// the client's address and port, its JA4 fingerprint and this session's ID.
+	if useIDCommand && s.server.connManager.SendsProxyHeader(s.routingInfo, s.serverAddr, clientHost, clientPort, serverHost, serverPort) {
+		useIDCommand = false
+	}
 	if useIDCommand {
 		if err := s.sendForwardingParametersToBackend(); errors.Is(err, errIDRefused) {
 			// Go on without them: the tagged reply ended the exchange.

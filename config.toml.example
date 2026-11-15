@@ -1625,8 +1625,8 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # backends = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"]
 # default = true                        # transitional: where answers without a pool go
 # remote_use_proxy_protocol = true
-# remote_use_id_command = true          # IMAP: forward the client IP via ID
-# remote_use_xclient = true             # POP3/LMTP: forward the client IP via XCLIENT
+# remote_use_id_command = true          # IMAP: forward the client IP via ID (not sent next to a PROXY header)
+# remote_use_xclient = true             # POP3/LMTP: forward the client IP via XCLIENT (POP3: not next to a PROXY header)
 # remote_use_utf8 = true                # POP3: sora backends only
 # remote_tls = false
 # remote_tls_use_starttls = false       # IMAP/POP3/LMTP/ManageSieve dial plaintext and STARTTLS after the greeting; the User API always uses implicit TLS
