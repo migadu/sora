@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -55,6 +56,42 @@ func TestLogCallsDoNotReuseRecordKeys(t *testing.T) {
 	}
 }
 
+// The session log helpers put the session's own fields in front of the caller's pairs
+// and append the pairs without looking at their keys, so a session log call that passes
+// one of those keys again makes the record carry it twice, often with two values
+// (#1168: "authentication successful" with account_id 0 and account_id 42). The fields
+// are those of server.Session.log (server/session.go) for backend sessions, plus the
+// trace_id LMTPSession.withTrace adds (server/lmtp/session.go), and those of
+// server.ProxySessionLogger.log (server/proxy_logging.go) for the proxies under
+// server/*proxy.
+func TestSessionLogCallsDoNotRepeatSessionKeys(t *testing.T) {
+	backend := []string{"protocol", "remote", "proxy", "user", "account_id", "session", "conn_total", "conn_auth"}
+	lmtp := append(slices.Clone(backend), "trace_id")
+	proxy := []string{"proto", "name", "remote", "user", "account_id", "session", "ja4"}
+	var offenders []string
+	for _, c := range logCalls(t) {
+		if !c.session {
+			continue
+		}
+		dir := filepath.ToSlash(filepath.Dir(c.file))
+		base := backend
+		switch {
+		case dir == "server/lmtp":
+			base = lmtp
+		case strings.HasPrefix(dir, "server/") && strings.HasSuffix(dir, "proxy"):
+			base = proxy
+		}
+		for _, key := range literalKeys(c.args) {
+			if slices.Contains(base, key) {
+				offenders = append(offenders, fmt.Sprintf("%s: key %q", c.pos, key))
+			}
+		}
+	}
+	if len(offenders) > 0 {
+		t.Errorf("session log calls passing a key the session helper already adds:\n%s", strings.Join(offenders, "\n"))
+	}
+}
+
 // TestLiteralKeys checks that the record-key guard sees the keys of both pair and
 // slog.Attr arguments.
 func TestLiteralKeys(t *testing.T) {
@@ -70,7 +107,8 @@ func TestLiteralKeys(t *testing.T) {
 }
 
 // TestFileLogCalls checks that the walk finds the logger package under an alias and
-// log/slog's own functions, and does not take a variable called logger for the package.
+// log/slog's own functions, does not take a variable called logger for the package, and
+// tells session method calls apart.
 func TestFileLogCalls(t *testing.T) {
 	const src = `package p
 
@@ -94,9 +132,9 @@ func f(s *session, logger *other) {
 	}
 	var got []string
 	for _, c := range fileLogCalls(fset, "p.go", file) {
-		got = append(got, c.pos+" "+strings.Join(literalKeys(c.args), ","))
+		got = append(got, fmt.Sprintf("%s %s session=%t", c.pos, strings.Join(literalKeys(c.args), ","), c.session))
 	}
-	want := []string{"p.go:10 k1", "p.go:11 k2", "p.go:12 k3"}
+	want := []string{"p.go:10 k1 session=false", "p.go:11 k2 session=false", "p.go:12 k3 session=true"}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("fileLogCalls = %q, want %q", got, want)
 	}
@@ -105,8 +143,10 @@ func f(s *session, logger *other) {
 // logCall is a structured log call found in the module's non-test sources: where it
 // is, and its arguments after the message.
 type logCall struct {
-	pos  string
-	args []ast.Expr
+	file    string // path relative to the module root
+	pos     string
+	session bool // a session DebugLog/InfoLog/WarnLog/ErrorLog method
+	args    []ast.Expr
 }
 
 // logCalls parses every non-test Go file of the module and returns its log calls (see
@@ -186,20 +226,22 @@ func fileLogCalls(fset *token.FileSet, name string, file *ast.File) []logCall {
 		if !ok {
 			return true
 		}
-		first := -1
+		first, session := -1, false
 		if pkg, ok := sel.X.(*ast.Ident); ok && logPackages[pkg.Name] {
 			if i, ok := loggerFuncs[sel.Sel.Name]; ok {
 				first = i
 			}
 		} else if sessionMethods[sel.Sel.Name] {
-			first = 1
+			first, session = 1, true
 		}
 		if first < 0 || len(call.Args) < first {
 			return true
 		}
 		calls = append(calls, logCall{
-			pos:  fmt.Sprintf("%s:%d", name, fset.Position(call.Pos()).Line),
-			args: call.Args[first:],
+			file:    name,
+			pos:     fmt.Sprintf("%s:%d", name, fset.Position(call.Pos()).Line),
+			session: session,
+			args:    call.Args[first:],
 		})
 		return true
 	})
