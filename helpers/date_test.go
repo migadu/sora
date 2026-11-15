@@ -151,6 +151,8 @@ func TestParseDateHeaderCFWS(t *testing.T) {
 		// Nested comments and quoted-pairs (RFC 5322 section 3.2.2).
 		{"Wed, 17 Jul 1996 02:23:25 (a (nested) \\) comment) -0700", -7 * h},
 		{"Wed, 17 Jul 1996 02:23:25 (\\(c) PDT", -7 * h},
+		// Obsolete quoted-pair permits an escaped NUL; unquoted NUL is invalid.
+		{"Wed, 17 Jul 1996 02:23:25 (quoted\\\x00) -0700", -7 * h},
 		// A comment holding the characters the zone and the time are found by.
 		{"Wed, 17 Jul 1996 02:23:25 (UTC-7) PDT", -7 * h},
 		{"(Wed: 17 Jul) Wed, 17 Jul 1996 02:23:25 PDT", -7 * h},
@@ -255,6 +257,10 @@ func TestParseDateHeaderInvalid(t *testing.T) {
 		// year = 4*DIGIT / obs-year, and obs-year is 2*DIGIT (RFC 5322 sections 3.3, 4.3).
 		"Mon, 17 Jul 5 02:23:25 +0000",
 		"Mon, 17 Jul 50 02:23:25 PDT+0400",
+		// NUL is not comment text (ctext or obs-ctext), so removing a
+		// malformed comment must not turn a previously invalid value into a date.
+		"Wed, 17 Jul 1996 02:23:25 (bad\x00) -0700",
+		"Wed, 17 Jul 1996 02:23:25 (outer (bad\x00)) PDT",
 		// A comment that does not close, and a zone that is only in a comment.
 		"Wed, 17 Jul 1996 02:23:25 -0700 (PDT",
 		"Wed, 17 Jul 1996 02:23:25 PDT (Pacific",
