@@ -2,6 +2,7 @@ package imap
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/logger"
 )
 
 // sessionEndErrors returns the errors pgx gives on a connection whose server ends the
@@ -127,6 +129,70 @@ func TestInternalErrorDatabaseConnectionClosedIsUnavailable(t *testing.T) {
 			}
 			if tc.code == imap.ResponseCodeUnavailable && strings.Contains(response.Text, tc.err.Error()) {
 				t.Fatalf("response exposes the driver error: %s", response.Text)
+			}
+		})
+	}
+}
+
+func TestLoginSetupError(t *testing.T) {
+	_, connClosed := sessionEndErrors(t, &pgproto3.ErrorResponse{
+		Severity: "FATAL",
+		Code:     "57P01",
+		Message:  "terminating connection due to administrator command",
+	})
+
+	for _, tc := range []struct {
+		name      string
+		err       error
+		wantLevel string
+		wantCode  imap.ResponseCode
+		wantText  string
+	}{
+		{
+			name:      "canceled",
+			err:       context.Canceled,
+			wantLevel: "level=INFO",
+			wantCode:  "",
+			wantText:  "Command aborted",
+		},
+		{
+			name:      "transient_db",
+			err:       connClosed,
+			wantLevel: "level=WARN",
+			wantCode:  imap.ResponseCodeUnavailable,
+			wantText:  "Service temporarily unavailable, please try again later",
+		},
+		{
+			name: "server_bug",
+			err: &pgconn.PgError{
+				Severity: "ERROR",
+				Code:     "23505",
+				Message:  "duplicate key value violates unique constraint",
+			},
+			wantLevel: "level=WARN",
+			wantCode:  imap.ResponseCodeServerBug,
+			wantText:  "failed to get primary email:",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &syncLogBuffer{}
+			prev := logger.Swap(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+			t.Cleanup(func() { logger.Swap(prev) })
+
+			sess := &IMAPSession{}
+			sess.Protocol = "IMAP-test"
+			sess.Id = "sess-setup"
+
+			resp := sess.loginSetupError("failed to get primary email", "alice@example.com", "master", tc.err)
+			if resp.Type != imap.StatusResponseTypeNo || resp.Code != tc.wantCode || !strings.HasPrefix(resp.Text, tc.wantText) {
+				t.Fatalf("response = %+v, want Type=NO Code=%q Text prefix=%q", resp, tc.wantCode, tc.wantText)
+			}
+
+			out := logs.String()
+			for _, part := range []string{tc.wantLevel, `msg="failed to get primary email"`, "address=alice@example.com", "method=master", "session=sess-setup"} {
+				if !strings.Contains(out, part) {
+					t.Errorf("log missing %q:\n%s", part, out)
+				}
 			}
 		})
 	}

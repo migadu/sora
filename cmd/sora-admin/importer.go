@@ -1399,6 +1399,16 @@ func (i *Importer) scanMaildir() error {
 		return fmt.Errorf("path '%s' is not a valid maildir root (must contain cur/ or new/)", cleanPath)
 	}
 
+	// filepath.Walk lstats its root and never follows a symbolic link, so a path that
+	// is a link to a maildir (accepted above: isMaildirFolder stats through it) was
+	// walked as a file and the run imported nothing. The walk starts at the directory
+	// the path names and reports every path below the path given, which mailbox names,
+	// keywords and uidlists are resolved against.
+	walkRoot, err := filepath.EvalSymlinks(cleanPath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve maildir path %s: %w", cleanPath, err)
+	}
+
 	// --- Parallel Processing Setup ---
 	var wg sync.WaitGroup
 	// This channel will be used by the producer (filepath.Walk) to send files to consumers (workers).
@@ -1469,7 +1479,7 @@ func (i *Importer) scanMaildir() error {
 	if i.options.PathsFile != "" {
 		walkErr = i.processPathsFile(cleanPath, filesToProcess)
 	} else {
-		walkErr = filepath.Walk(cleanPath, func(path string, info os.FileInfo, err error) error {
+		walkErr = filepath.Walk(walkRoot, func(walked string, info os.FileInfo, err error) error {
 			select {
 			case <-i.ctx.Done():
 				return i.ctx.Err() // Stop walking if context is cancelled.
@@ -1477,6 +1487,27 @@ func (i *Importer) scanMaildir() error {
 			}
 			if err != nil {
 				return err
+			}
+			rel, err := filepath.Rel(walkRoot, walked)
+			if err != nil {
+				return fmt.Errorf("could not get relative path for %s: %w", walked, err)
+			}
+			path := filepath.Join(cleanPath, rel)
+
+			// A folder below the root that is a symbolic link is not followed either: a
+			// link to a folder of the same maildir is an alias (dsync skips those too),
+			// and one pointing elsewhere would have the import read outside the path it
+			// was given. It is named, so its mail is never left out without a word.
+			// cur/ and new/ are read through a link (os.ReadDir below).
+			if info.Mode()&os.ModeSymlink != 0 {
+				switch info.Name() {
+				case "cur", "new", "tmp":
+				default:
+					if target, statErr := os.Stat(walked); statErr == nil && target.IsDir() {
+						logger.Warn("Skipping maildir folder: it is a symbolic link, which the import does not follow", "path", path)
+					}
+				}
+				return nil
 			}
 
 			// We are looking for directories that are maildir folders.

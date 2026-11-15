@@ -491,7 +491,13 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 			session.Stats = s
 			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "pop3", session.InfoLog)
 
-			session.InfoLog("connected")
+			// A pop3_proxy's PROXY v2 header names its session (TLV 0xE1): logging it
+			// leads from the proxy's session=<id> to this session.
+			if proxyInfo != nil && proxyInfo.ProxySessionID != "" {
+				session.InfoLog("connected", "proxy_session", proxyInfo.ProxySessionID)
+			} else {
+				session.InfoLog("connected")
+			}
 			s.addSession(session)
 
 			return session, nil

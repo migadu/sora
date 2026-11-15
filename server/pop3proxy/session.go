@@ -717,7 +717,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		s.ctx,
 		preferredAddr,
-		clientHost, clientPort, serverHost, serverPort, s.routingInfo,
+		clientHost, clientPort, serverHost, serverPort, s.routingInfo.ForDial(s.listenerConn, s.sessionID),
 	)
 	if err != nil {
 		s.DebugLog("Failed to connect to backend", "error", err, "addr", preferredAddr)
