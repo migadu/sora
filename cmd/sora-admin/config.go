@@ -114,8 +114,22 @@ func handleConfigValidate(_ context.Context) {
 		os.Exit(1)
 	}
 
+	// The warnings start-up logs about the file. They do not fail it.
+	allServers := cfg.GetAllServers()
+	for _, server := range allServers {
+		server.WarnUnusedConfigOptions(func(format string, args ...any) {
+			fmt.Printf("[WARN] %s\n", strings.TrimPrefix(fmt.Sprintf(format, args...), "WARNING: "))
+		})
+	}
+	for _, s := range cfg.SessionMemoryShortfalls() {
+		fmt.Printf("[WARN] Server %s (type: %s) has session_memory_limit %d bytes, below max_message_size %d bytes of lmtp server %s: "+
+			"a delivered message larger than session_memory_limit is stored, but this server can never fetch it (IMAP NO [LIMIT], POP3 -ERR [SYS/PERM]); "+
+			"sora-admin imports are bounded by [admin_cli] import_message_limit instead\n",
+			s.Server, s.Type, s.SessionMemoryLimit, s.MaxMessageSize, s.LMTPServer)
+	}
+
 	fmt.Printf("[OK] Configuration is valid!\n")
-	if allServers := cfg.GetAllServers(); len(allServers) > 0 {
+	if len(allServers) > 0 {
 		fmt.Printf("\nConfigured servers:\n")
 		for _, server := range allServers {
 			fmt.Printf("  - %s listening on %s\n", server.Name, server.Addr)
@@ -260,6 +274,9 @@ Description:
         to S3 (a mail backend, or the User API when [s3] has an endpoint,
         bucket or keys)
       [cluster] and [tls] when enabled
+  - Warning, as start-up does, about [[server]] keys the server type does
+    not use, and about an imap or pop3 session_memory_limit below the
+    largest lmtp max_message_size
 
   It connects to nothing and does not look at the node's disk, so it does
   not check connectivity. When services start, Sora connects to the database
