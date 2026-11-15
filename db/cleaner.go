@@ -990,10 +990,14 @@ func (d *Database) DeleteMessagesFTSByKeyBatch(ctx context.Context, tx pgx.Tx, k
 }
 
 // ListSoftDeletedAccountsForHardDelete returns up to limit accounts soft-deleted at least
-// gracePeriod ago that still hold mailboxes, oldest first: the ones HardDeleteAccountStep
-// has not finished with. An account it has finished with has no mailboxes left but stays
-// soft-deleted until its expunged messages are reaped (another grace period) and it is
-// finalized; selecting it again would take one of the slots, and enough of them would
+// gracePeriod ago that still own a mailbox or hold a live message, oldest first: the ones
+// HardDeleteAccountStep has not finished with. The live message matters once the last
+// mailbox is gone: the step then expunges the account's legacy rows in other accounts'
+// shared mailboxes, and a run that stops before it has (shutdown, a failed step) must
+// resume next cycle, since a live row keeps the account from being finalized for good.
+// An account the step has finished with owns no mailbox and holds no live message but
+// stays soft-deleted until its expunged messages are reaped (another grace period) and it
+// is finalized; selecting it again would take one of the slots, and enough of them would
 // starve every newer account.
 //
 // This is a fast, read-only query. The hard delete of each account is performed by the
@@ -1006,7 +1010,8 @@ func (d *Database) ListSoftDeletedAccountsForHardDelete(ctx context.Context, gra
 		SELECT a.id
 		FROM accounts a
 		WHERE a.deleted_at IS NOT NULL AND a.deleted_at < $1
-		AND EXISTS (SELECT 1 FROM mailboxes WHERE account_id = a.id)
+		AND (EXISTS (SELECT 1 FROM mailboxes WHERE account_id = a.id)
+		     OR EXISTS (SELECT 1 FROM messages WHERE account_id = a.id AND expunged_at IS NULL))
 		ORDER BY a.deleted_at ASC
 		LIMIT $2
 	`, threshold, limit)
