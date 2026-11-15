@@ -21,7 +21,7 @@ func TestS3Importer_AccountLookupErrors(t *testing.T) {
 
 	// No account has this address.
 	const email = "lookup-s3@example.com"
-	si, err := NewS3Importer(context.Background(), rdb, nil, S3ImporterOptions{Email: email, CleanupDB: true})
+	si, err := NewS3Importer(context.Background(), rdb, nil, S3ImporterOptions{Email: email, Workers: 1, CleanupDB: true})
 	if err != nil {
 		t.Fatal(err)
 	}
