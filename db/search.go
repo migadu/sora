@@ -1173,8 +1173,9 @@ func (db *Database) mapSeqNumCriteriaToUID(ctx context.Context, mailboxID int64,
 
 // uidsBySeqNum returns the UID at each of the given sequence numbers, in ctx's view
 // (WithSeqView). A sequence number past the last message is missing from the result.
-// Key zero always contains the last UID (of a live message, or in a view of the view's
-// last message), for wildcard resolution and clipping out-of-bounds range ends.
+// Key zero always contains the last UID counted (of a live message, or in a view also
+// of one the view still holds), for wildcard resolution and clipping out-of-bounds
+// range ends.
 func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums []int64) (map[uint32]imap.UID, error) {
 	args := []any{mailboxID, slices.Max(seqNums), seqNums}
 	viewParam := ""
@@ -1184,12 +1185,10 @@ func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums [
 	if view := seqViewOf(ctx); view > 0 {
 		args = append(args, int64(view))
 		viewParam = "$4"
-		// The view's last message is its last live one or a later one it still
-		// holds; a message created since the view is past it.
+		// The last row counted: the last live message, or a later one the view
+		// still holds.
 		last = `SELECT GREATEST(
-				(SELECT uid FROM messages
-				 WHERE mailbox_id = $1 AND expunged_at IS NULL AND created_modseq <= $4
-				 ORDER BY uid DESC LIMIT 1),
+				(` + last + `),
 				(SELECT MAX(m.uid) FROM messages m WHERE m.mailbox_id = $1 AND ` + heldExpungedCond("m", "$4") + `)
 			) AS uid`
 	}
@@ -1197,7 +1196,7 @@ func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums [
 		SELECT ranked.seqnum, ranked.uid
 		FROM (
 			SELECT uid, ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
-			FROM ` + seqCountedRows("$1", viewParam, "") + ` counted
+			FROM ` + seqCountedRows("$1", viewParam, "", "ASC") + ` counted
 			ORDER BY uid
 			LIMIT $2
 		) ranked

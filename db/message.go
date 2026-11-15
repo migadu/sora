@@ -370,8 +370,9 @@ func streamMessagesBySeqSet(ctx context.Context, run MessageStreamDBRunner, mail
 	if len(seqSet) == 0 {
 		return nil
 	}
-	if len(seqSet) == 1 && seqSet[0].Start == 1 && (seqSet[0].Stop == 0) {
-		// 1:* names every message: of the mailbox, or in a view (WithSeqView) of the view.
+	// 1:* names every live message, numbered by counting them. In a view (WithSeqView)
+	// the held messages are counted too, so the numbering goes through uidsBySeqNum.
+	if len(seqSet) == 1 && seqSet[0].Start == 1 && (seqSet[0].Stop == 0) && seqViewOf(ctx) == 0 {
 		logger.Debug("Database: Streaming SeqSet 1:* fetch", "mailbox_id", mailboxID)
 		return streamAllActiveMessagesRawChunked(ctx, run, mailboxID, cb, includeBodyStructure)
 	}
@@ -415,12 +416,6 @@ func streamAllActiveMessagesRawChunked(ctx context.Context, run MessageStreamDBR
 	if includeBodyStructure {
 		bsCol = "m.body_structure, "
 	}
-	// In a view, a message created since it is not one of its messages.
-	view := seqViewOf(ctx)
-	viewCond := ""
-	if view > 0 {
-		viewCond = "AND m.created_modseq <= $4"
-	}
 
 	query := fmt.Sprintf(`
 		SELECT
@@ -430,18 +425,14 @@ func streamAllActiveMessagesRawChunked(ctx context.Context, run MessageStreamDBR
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
-		  AND m.uid > $2 %s
+		  AND m.uid > $2
 		ORDER BY m.uid ASC
 		LIMIT $3
-	`, bsCol, viewCond)
+	`, bsCol)
 
 	return StreamMessageChunksWithRunner(ctx, run, "all_messages", func(stepCtx context.Context, db *Database, afterUID imap.UID, afterSeq uint32) ([]Message, int, error) {
 		chunkSize := db.effectiveFetchChunkSize()
-		args := []any{mailboxID, int64(afterUID), chunkSize}
-		if view > 0 {
-			args = append(args, int64(view))
-		}
-		rows, err := db.GetReadPoolWithContext(stepCtx).Query(stepCtx, query, args...)
+		rows, err := db.GetReadPoolWithContext(stepCtx).Query(stepCtx, query, mailboxID, int64(afterUID), chunkSize)
 		if err != nil {
 			return nil, 0, fmt.Errorf("fetchAllActiveMessagesRaw: failed to query chunk after uid %d: %w", afterUID, err)
 		}
@@ -449,17 +440,6 @@ func streamAllActiveMessagesRawChunked(ctx context.Context, run MessageStreamDBR
 		messages, err := scanMessages(rows, includeBodyStructure)
 		if err != nil {
 			return nil, 0, err
-		}
-
-		// In a view, messages expunged since it still hold sequence numbers between
-		// the live ones read here, so the database numbers the chunk.
-		if view > 0 {
-			if len(messages) > 0 {
-				if err := db.hydrateChunkSequences(stepCtx, mailboxID, messages, uint32(afterUID), afterSeq); err != nil {
-					return nil, 0, err
-				}
-			}
-			return messages, chunkSize, nil
 		}
 
 		// Every active message is read in UID order from the start, so sequence
@@ -792,7 +772,7 @@ func (db *Database) hydrateChunkSequences(ctx context.Context, mailboxID int64, 
 	}
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
 		SELECT uid, $2::bigint + ROW_NUMBER() OVER(ORDER BY uid)
-		FROM `+seqCountedRows("$1", viewParam, "uid > $3 AND uid <= $4")+` counted
+		FROM `+seqCountedRows("$1", viewParam, "uid > $3 AND uid <= $4", "ASC")+` counted
 	`, args...)
 	if err != nil {
 		return fmt.Errorf("failed to query sequence window after uid %d: %w", anchorUID, err)
@@ -888,7 +868,7 @@ func hydrateSequencesCore[T any](
 		query = `
 			WITH all_uids AS (
 				SELECT uid, ROW_NUMBER() OVER(ORDER BY uid) as seqnum
-				FROM ` + seqCountedRows("$1", viewParam, "uid <= $3") + ` counted
+				FROM ` + seqCountedRows("$1", viewParam, "uid <= $3", "ASC") + ` counted
 			)
 			SELECT a.uid, a.seqnum
 			FROM all_uids a
@@ -899,11 +879,11 @@ func hydrateSequencesCore[T any](
 		query = `
 			WITH counted_total AS (
 				SELECT COUNT(*)::int as cnt
-				FROM ` + seqCountedRows("$1", viewParam, "") + ` counted
+				FROM ` + seqCountedRows("$1", viewParam, "", "") + ` counted
 			),
 			all_uids AS (
 				SELECT uid, (SELECT cnt FROM counted_total) - ROW_NUMBER() OVER(ORDER BY uid DESC) + 1 as seqnum
-				FROM ` + seqCountedRows("$1", viewParam, "uid >= $3") + ` counted
+				FROM ` + seqCountedRows("$1", viewParam, "uid >= $3", "DESC") + ` counted
 			)
 			SELECT a.uid, a.seqnum
 			FROM all_uids a
