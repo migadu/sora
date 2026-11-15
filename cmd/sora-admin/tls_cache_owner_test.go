@@ -294,3 +294,28 @@ func TestTLSCacheAsRootGivesTheCacheToTheServersUser(t *testing.T) {
 		}
 	}
 }
+
+// TestTLSCacheGiveDirDoesNotFollowALink: the user a created directory is given to may
+// write its parent and replace the directory with a link; root must not give them the
+// link's target.
+func TestTLSCacheGiveDirDoesNotFollowALink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.Mkdir(target, 0700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "certs")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	realChown := chownFile
+	t.Cleanup(func() { chownFile = realChown })
+	chownFile = func(f *os.File, uid, gid int) error {
+		t.Errorf("giveDir gave %s away through a link", f.Name())
+		return nil
+	}
+
+	if err := giveDir(link, &fileOwner{uid: os.Geteuid(), gid: os.Getegid()}); err == nil {
+		t.Error("giveDir succeeded on a symbolic link")
+	}
+}

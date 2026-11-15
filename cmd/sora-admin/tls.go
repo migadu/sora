@@ -1271,19 +1271,27 @@ func removeExpiredLocalCopy(path string, now time.Time) (bool, error) {
 // does: it writes a temporary file in the same directory and renames it over path, so a
 // write that fails part-way (the disk fills) leaves no partial file under the cache name,
 // which a later run would skip as already cached and the server would read. The new file
-// keeps the owner, group and permissions of the file it replaces, as writing in place
-// would, so tls cache --force preserves the server's access to an existing cache.
-func writeLocalCacheFile(path string, data []byte) error {
+// keeps the permissions of the file it replaces, as writing in place would. It is given
+// to dirOwner, the owner of the cache directory when that is another user (see
+// cacheTLSCertificates), before it gets its name, so the server never sees a cache name
+// it cannot open. Without one it keeps the owner and group of the file it replaces, so
+// tls cache --force preserves the server's access to an existing cache.
+func writeLocalCacheFile(path string, data []byte, dirOwner *fileOwner) error {
 	f, err := os.CreateTemp(filepath.Dir(path), ".sora-tls-cache-")
 	if err != nil {
 		return err
 	}
 	mode := fs.FileMode(0600)
-	if old, statErr := os.Stat(path); statErr == nil {
+	old, statErr := os.Stat(path)
+	if statErr == nil {
 		mode = old.Mode().Perm()
-		err = takeOwner(f, old)
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		err = statErr
+	}
+	if err == nil && dirOwner != nil {
+		err = chownFile(f, dirOwner.uid, dirOwner.gid)
+	} else if err == nil && statErr == nil {
+		err = takeOwner(f, old)
 	}
 	if err == nil {
 		_, err = f.Write(data)
@@ -1329,6 +1337,74 @@ var (
 	chownFile = (*os.File).Chown
 )
 
+// fileOwner is the user and group tls cache gives a file or directory it creates.
+type fileOwner struct {
+	uid, gid int
+}
+
+// foreignOwner returns the owner of the file info describes when that is not the user
+// this process runs as, and nil when it is.
+func foreignOwner(info os.FileInfo) *fileOwner {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(st.Uid) == geteuid() {
+		return nil
+	}
+	return &fileOwner{uid: int(st.Uid), gid: int(st.Gid)}
+}
+
+// makeCacheDir creates dir, and each missing parent, with mode 0700, as the server
+// creates its fallback directory (tlsmanager.NewFallbackCache). Each directory it creates
+// is given the owner of the directory it is created in, when that is another user: run
+// as root on a node whose server runs as its own user, it would otherwise leave a
+// root-owned directory the server cannot write, where the default /var/lib/sora/certs
+// is made in the server's /var/lib/sora (the StateDirectory of dist/sora.service). In a
+// sticky directory such as /tmp each user's entries are their own, so what is made in
+// one stays its maker's.
+func makeCacheDir(dir string) error {
+	err := os.Mkdir(dir, 0700)
+	if parent := filepath.Dir(dir); errors.Is(err, fs.ErrNotExist) && parent != dir {
+		if err = makeCacheDir(parent); err == nil {
+			err = os.Mkdir(dir, 0700)
+		}
+	}
+	if errors.Is(err, fs.ErrExist) {
+		info, statErr := os.Stat(dir)
+		if statErr == nil && !info.IsDir() {
+			statErr = &fs.PathError{Op: "mkdir", Path: dir, Err: syscall.ENOTDIR}
+		}
+		return statErr
+	}
+	if err != nil {
+		return err
+	}
+
+	parent, err := os.Stat(filepath.Dir(dir))
+	if err == nil && parent.Mode()&fs.ModeSticky == 0 {
+		if owner := foreignOwner(parent); owner != nil {
+			if err = giveDir(dir, owner); err != nil {
+				err = fmt.Errorf("give %s to the owner of %s (%d:%d): %w", dir, filepath.Dir(dir), owner.uid, owner.gid, err)
+			}
+		}
+	}
+	if err != nil {
+		os.Remove(dir)
+	}
+	return err
+}
+
+// giveDir gives dir, a directory this process has just created, to owner. It opens dir
+// without following a symbolic link: the owner, who may write its parent, could have
+// replaced it with a link to a file of root's.
+func giveDir(dir string, owner *fileOwner) error {
+	fd, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return &fs.PathError{Op: "open", Path: dir, Err: err}
+	}
+	f := os.NewFile(uintptr(fd), dir)
+	defer f.Close()
+	return chownFile(f, owner.uid, owner.gid)
+}
+
 func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, specificDomain string, force bool) error {
 	// Initialize S3 storage
 	if cfg.TLS.LetsEncrypt == nil {
@@ -1362,10 +1438,18 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		return fmt.Errorf("failed to initialize S3 storage: %w", err)
 	}
 
-	// Create cache directory if it doesn't exist
-	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+	// The server reads and writes the cache directory as its own user (User=sora in
+	// dist/sora.service), while tls cache is usually run as root: what it creates goes to
+	// the owner of the directory it is created in, when that is another user, or the
+	// server cannot read the certificates nor, in a directory created here, write its own.
+	if err := makeCacheDir(cacheDir); err != nil {
 		return fmt.Errorf("failed to create cache directory: %w", err)
 	}
+	dirInfo, err := os.Stat(cacheDir)
+	if err != nil {
+		return fmt.Errorf("failed to read the cache directory: %w", err)
+	}
+	dirOwner := foreignOwner(dirInfo)
 
 	// Determine which domains to cache
 	var domainsToCache []string
@@ -1467,7 +1551,7 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			}
 
 			// Write to local cache
-			if err := writeLocalCacheFile(localPath, certData); err != nil {
+			if err := writeLocalCacheFile(localPath, certData, dirOwner); err != nil {
 				logger.Warn("Failed to write certificate to local cache", "path", localPath, "error", err)
 				failures = append(failures, fmt.Errorf("write %s certificate for %s to %s: %w", variant.name, domain, localPath, err))
 				continue
