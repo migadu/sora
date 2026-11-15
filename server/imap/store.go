@@ -158,11 +158,12 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	}
 
 	type storeResponseMessage struct {
-		seq       uint32
-		uid       imap.UID
-		flags     []imap.Flag
-		modSeq    int64
-		unchanged bool
+		seq        uint32
+		uid        imap.UID
+		flags      []imap.Flag
+		modSeq     int64
+		prevModSeq int64 // before this STORE's write; unset when unchanged
+		unchanged  bool
 	}
 	var responseMessages []storeResponseMessage
 
@@ -204,10 +205,12 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 				continue
 			}
 			// Record the rows this answer told the client all Poll would: every
-			// row when it carried FLAGS, and only the rows this STORE changed
-			// for a .SILENT (MODSEQ only) answer, which says nothing about what
-			// another session changed on an unchanged row.
-			if !sanitizedStoreFlags.Silent || !modified.unchanged {
+			// row when it carried FLAGS. A .SILENT (MODSEQ only) answer says
+			// nothing about what another session changed, so it covers only a
+			// row this STORE changed from a state the client already had: at or
+			// below the poll cursor, or this session's own previous answer.
+			// Otherwise Poll reports the flags (RFC 9051 §6.4.6 Note).
+			if !sanitizedStoreFlags.Silent || (!modified.unchanged && s.clientHasModSeqLocked(selectedMailboxID, modified.uid, modified.prevModSeq)) {
 				if s.ownStoreEcho == nil || s.ownStoreEchoMailboxID != selectedMailboxID {
 					s.ownStoreEcho = make(map[imap.UID]uint64)
 					s.ownStoreEchoMailboxID = selectedMailboxID
@@ -318,10 +321,11 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 				continue
 			}
 			responseMessages = append(responseMessages, storeResponseMessage{
-				seq:    seqMap[res.UID],
-				uid:    res.UID,
-				flags:  res.Flags,
-				modSeq: res.ModSeq,
+				seq:        seqMap[res.UID],
+				uid:        res.UID,
+				flags:      res.Flags,
+				modSeq:     res.ModSeq,
+				prevModSeq: res.PrevModSeq,
 			})
 			s.DebugLog("operation updated message", "uid", res.UID, "new_modseq", res.ModSeq)
 		}
@@ -410,4 +414,17 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	writeResponses()
 
 	return nil
+}
+
+// clientHasModSeqLocked reports whether the client already has message uid's
+// state as of modSeq: Poll has reported (or queued) every change up to its
+// cursor, and ownStoreEcho holds the states this session's own STORE answers
+// gave the client. The caller holds ownStoreMu, which Poll holds while it
+// advances the cursor and queues the changes.
+func (s *IMAPSession) clientHasModSeqLocked(mailboxID int64, uid imap.UID, modSeq int64) bool {
+	if uint64(modSeq) <= s.currentHighestModSeq.Load() {
+		return true
+	}
+	echoed, ok := s.ownStoreEcho[uid]
+	return ok && s.ownStoreEchoMailboxID == mailboxID && echoed == uint64(modSeq)
 }
