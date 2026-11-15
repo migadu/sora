@@ -3,18 +3,41 @@ package imapproxy
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"io"
 	"net"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/migadu/sora/server/proxy"
 )
+
+// proxyV2Signature opens every PROXY protocol v2 header.
+const proxyV2Signature = "\r\n\r\n\x00\r\nQUIT\n"
+
+// skipProxyV2Header consumes the PROXY v2 header r starts with, if there is one, and
+// reports whether there was. Without a header it waits for the first 12 bytes of the
+// proxy's first command (or the end of the connection).
+func skipProxyV2Header(r *bufio.Reader) bool {
+	signature, err := r.Peek(len(proxyV2Signature))
+	if err != nil || string(signature) != proxyV2Signature {
+		return false
+	}
+	fixed := make([]byte, 16) // signature, version and command, family, address length
+	if _, err := io.ReadFull(r, fixed); err != nil {
+		return false
+	}
+	_, err = r.Discard(int(binary.BigEndian.Uint16(fixed[14:])))
+	return err == nil
+}
 
 // idForwardingBackend serves one plaintext connection: a greeting, then the ID response
 // (an untagged ID and the tagged idStatus) idDelay after the ID command, and an OK at once
 // to AUTHENTICATE. commands waits for the connection to end and returns the command names
-// the backend read, in order.
+// the backend read, in order, with "PROXY" first when the connection started with a PROXY
+// v2 header.
 func idForwardingBackend(t *testing.T, idDelay time.Duration, idStatus string) (addr string, commands func() []string) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -35,6 +58,11 @@ func idForwardingBackend(t *testing.T, idDelay time.Duration, idStatus string) (
 		conn.SetDeadline(time.Now().Add(10 * time.Second))
 		io.WriteString(conn, "* OK ready\r\n")
 		r := bufio.NewReader(conn)
+		if skipProxyV2Header(r) {
+			mu.Lock()
+			got = append(got, "PROXY")
+			mu.Unlock()
+		}
 		for {
 			line, err := r.ReadString('\n')
 			if err != nil {
@@ -138,6 +166,81 @@ func TestPostAuthenticationSetupIDReplyNotRead(t *testing.T) {
 				t.Errorf("the client got %q, want %q", reply, tc.wantReply)
 			}
 			if strings.Join(sent, " ") != strings.Join(tc.wantSent, " ") {
+				t.Errorf("the backend read %q, want %q", sent, tc.wantSent)
+			}
+		})
+	}
+}
+
+// Next to a PROXY header an IMAP backend judges ID forwarding by the client the header
+// names, not by this proxy (server.ForwardingSourceIP), and ignores the fields: that client
+// is not in its trusted_networks. The header already carries the client's address and
+// port, its JA4 fingerprint and the session ID, so the ID there is a wasted round trip on
+// every login. The proxy sends it only on a leg without a header, by the settings the dial
+// uses: the server's, a lookup pin's, or the named pool's.
+func TestConnectToBackendSkipsIDNextToProxyHeader(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		route              string // "server" (remote_addrs), "pin" (remote lookup) or "pool"
+		proxyProtocol      bool   // the proxy server's remote_use_proxy_protocol
+		routeProxyProtocol bool   // the pin's or the pool's remote_use_proxy_protocol
+		wantSent           []string
+	}{
+		{"server settings, PROXY header", "server", true, false, []string{"PROXY"}},
+		{"server settings, no PROXY header", "server", false, false, []string{"ID"}},
+		{"lookup pin with PROXY header", "pin", false, true, []string{"PROXY"}},
+		{"lookup pin without PROXY header", "pin", true, false, []string{"ID"}},
+		{"pool with PROXY header", "pool", false, true, []string{"PROXY"}},
+		{"pool without PROXY header", "pool", true, false, []string{"ID"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, commands := idForwardingBackend(t, 0, "OK ID completed")
+			cm, err := proxy.NewConnectionManager([]string{addr}, 143, false, false, tc.proxyProtocol, 500*time.Millisecond)
+			if tc.route == "pool" {
+				cm, err = proxy.NewConnectionManagerWithPools([]proxy.PoolSpec{{
+					Name: "sora0", Backends: []string{addr}, Default: true,
+					Settings: proxy.BackendSettings{UseProxyProtocol: tc.routeProxyProtocol, UseIDCommand: true},
+				}}, 143, 500*time.Millisecond, nil, "test", true)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			srv := &Server{
+				name:               "test",
+				hostname:           "test-host",
+				ctx:                ctx,
+				cancel:             cancel,
+				activeSessions:     make(map[*Session]struct{}),
+				connManager:        cm,
+				authLimiter:        &fakeAuthLimiter{},
+				remoteUseIDCommand: true,
+			}
+			dialed, client := tcpPair(t)
+			t.Cleanup(func() { dialed.Close(); client.Close() })
+			sess := newSession(srv, client)
+			sess.username = "user@example.com"
+			// The routing info an uncached database login leaves (authenticate), or a pin.
+			sess.routingInfo = &proxy.UserRoutingInfo{RemoteUseIDCommand: true}
+			if tc.route == "pin" {
+				sess.isRemoteLookupAccount = true
+				sess.routingInfo = &proxy.UserRoutingInfo{
+					ServerAddress:          addr,
+					IsRemoteLookupAccount:  true,
+					RemoteUseProxyProtocol: tc.routeProxyProtocol,
+					RemoteUseIDCommand:     true,
+				}
+			}
+
+			err = sess.connectToBackend()
+			if sess.backendConn != nil {
+				sess.backendConn.Close() // ends the fake backend's connection
+			}
+			if err != nil {
+				t.Errorf("connectToBackend: %v", err)
+			}
+			if sent := commands(); strings.Join(sent, " ") != strings.Join(tc.wantSent, " ") {
 				t.Errorf("the backend read %q, want %q", sent, tc.wantSent)
 			}
 		})
