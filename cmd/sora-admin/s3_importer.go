@@ -24,6 +24,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/pkg/sqlitefile"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/storage"
 	_ "modernc.org/sqlite"
@@ -86,7 +87,11 @@ func NewS3Importer(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, opti
 	dbPath := filepath.Join(tempDir, fmt.Sprintf("sora-s3-import-%d.db", time.Now().Unix()))
 	logger.Info("Using temporary database", "path", dbPath)
 
-	db, err := sql.Open("sqlite", dbPath)
+	dsn, err := sqlitefile.DSN(dbPath, "")
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
 	}
