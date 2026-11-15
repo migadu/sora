@@ -125,6 +125,26 @@ func TestServerReloadRejectsInvalidExemptNetworks(t *testing.T) {
 	}
 }
 
+// A reload whose enabled remote_lookup the proxy could not build its lookup client from
+// is refused for that server, as a restart would refuse it; the server keeps the config
+// it has (#853).
+func TestServerReloadRejectsInvalidRemoteLookup(t *testing.T) {
+	logs := captureReloadLogs(t)
+	running := config.ServerConfig{Type: "imap_proxy", Name: "imap-proxy", Addr: ":1143", RemoteAddrs: []string{"192.0.2.10:143"}}
+	deps, reloaders := runningDeps(t, running)
+
+	next := running
+	next.RemoteLookup = &config.RemoteLookupConfig{Enabled: true, URL: "https://$email.lookup.example.com/lookup"}
+	deps.reloadServers(reloadedConfig(next))
+
+	if got := reloaders["imap-proxy"].reloaded; len(got) != 0 {
+		t.Fatalf("ReloadConfig got %+v, want no call", got)
+	}
+	if out := logs.String(); !hasLineWith(out, "Skipping reload", "server=imap-proxy", "remote_lookup.url", "allowed only in the path and query") {
+		t.Errorf("no error naming imap-proxy and its remote_lookup.url:\n%s", out)
+	}
+}
+
 // enabled = false on a running server's block takes effect at the next restart: the
 // reload says so instead of passing over the block in silence, and does not hand the
 // server a block that is no longer validated.
@@ -144,8 +164,9 @@ func TestServerReloadReportsBlockDisabledWhileRunning(t *testing.T) {
 }
 
 // A block that was not started (enabled = false at startup, or added since) and is
-// enabled now starts at the next restart, and the reload says so; if the block is
-// invalid, the reload says that the restart will refuse it.
+// enabled now starts at the next restart, and the reload says so. An invalid block does
+// not start then: the restart refuses the file, which the whole-file report says
+// (TestConfigReloadReportsARefusedAddedBlockOnce).
 func TestServerReloadReportsBlockEnabledWhileNotRunning(t *testing.T) {
 	logs := captureReloadLogs(t)
 	disabled := false
@@ -166,8 +187,8 @@ func TestServerReloadReportsBlockEnabledWhileNotRunning(t *testing.T) {
 			t.Errorf("no notice that starting %s needs a restart:\n%s", name, out)
 		}
 	}
-	if !hasLineWith(out, "server=sieve", "refuse", "server address is required") {
-		t.Errorf("no error that the added sieve block lacks its addr:\n%s", out)
+	if hasLineWith(out, "server=sieve") {
+		t.Errorf("the added sieve block, which lacks its addr, reported by the server reload:\n%s", out)
 	}
 	if hasLineWith(out, "server=pop3", "restart") {
 		t.Errorf("pop3, unchanged and running, reported as needing a restart:\n%s", out)
@@ -387,11 +408,56 @@ func TestServerReloadRefusesDuplicateServerNames(t *testing.T) {
 	if !hasLineWith(out, "level=ERROR", "server=imap", "duplicate server name") {
 		t.Errorf("no error refusing duplicate running server name imap:\n%s", out)
 	}
-	if !hasLineWith(out, "level=ERROR", "server=lmtp", "duplicate server name") {
-		t.Errorf("no error refusing duplicate added server name lmtp:\n%s", out)
-	}
+	// The restart refuses the duplicate added lmtp; the whole-file report says so
+	// (TestConfigReloadReportsARefusedAddedBlockOnce).
 	if hasLineWith(out, "server=lmtp", "added or enabled") {
 		t.Errorf("duplicate added server name lmtp logged as merely awaiting restart:\n%s", out)
+	}
+}
+
+// An added [[server]] block that a restart refuses, invalid or sharing its name with
+// another, is reported once, as a problem of the file the server will not start with
+// (#1106), and not as a block that starts at the next restart. The per-server reload
+// reported both itself, and the whole-file report now covers every block.
+func TestConfigReloadReportsARefusedAddedBlockOnce(t *testing.T) {
+	logs := captureReloadLogs(t)
+	deps, _ := runningDeps(t, config.ServerConfig{Type: "metrics", Name: "metrics", Addr: "127.0.0.1:9090", Path: "/metrics"})
+
+	deps.reloadConfig(writeReloadConfig(t, metricsServerTOML+`
+[[server]]
+type = "metrics"
+name = "noaddr"
+path = "/metrics"
+
+[[server]]
+type = "metrics"
+name = "twice"
+addr = "127.0.0.1:9091"
+path = "/metrics"
+
+[[server]]
+type = "metrics"
+name = "twice"
+addr = "127.0.0.1:9092"
+path = "/metrics"
+`))
+
+	out := logs.String()
+	for _, tt := range []struct{ name, section, err string }{
+		{"noaddr", "server 'noaddr'", "server address is required"},
+		{"twice", "server configuration", "duplicate server name 'twice' found"},
+	} {
+		var reports []string
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, tt.name) {
+				reports = append(reports, line)
+			}
+		}
+		if len(reports) != 1 || !hasLineWith(reports[0], "level=ERROR",
+			"Config reload: "+tt.section+" is invalid and the server will not start with this config", tt.err) {
+			t.Errorf("block %s: got %d reports, want one error saying the server will not start (%s):\n%s",
+				tt.name, len(reports), tt.err, out)
+		}
 	}
 }
 

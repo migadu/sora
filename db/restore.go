@@ -117,7 +117,8 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 	}
 	defer rows.Close()
 
-	var messages []DeletedMessage
+	// Never nil: an empty result is the JSON array [], not null.
+	messages := []DeletedMessage{}
 	for rows.Next() {
 		var msg DeletedMessage
 		err := rows.Scan(
@@ -135,6 +136,7 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan deleted message: %w", err)
 		}
+		msg.MessageID = headerMessageID(msg.MessageID)
 		messages = append(messages, msg)
 	}
 
@@ -510,10 +512,19 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 
 // restoreMailbox returns the id and path of the live mailbox called name, recreating it
 // if it was deleted — linked under its parent, which is itself recreated first if it is
-// gone too. A recreated "Parent/Child" used to land at the root: the name still showed
-// the hierarchy in LIST, but the tree is path-based, so the parent lost \HasChildren,
-// RENAME of the parent stopped carrying the child, and a later DELETE of the parent
-// succeeded and stranded it.
+// gone too. A recreated "Parent/Child" used to land at the root: the name
+// still showed the hierarchy in LIST, but the tree is path-based, so the parent lost
+// \HasChildren, RENAME of the parent stopped carrying the child, and a later DELETE of
+// the parent succeeded and stranded it.
+//
+// A name in the shared namespace of the [shared_mailboxes] config in ctx is recreated as
+// a shared mailbox of the account. Recreated personal, it sat in the shared namespace
+// where SETACL refuses to share it. The entries the deleted mailbox had went with it and
+// are not restored. Nor does it copy a live shared parent's entries, as CREATE does for
+// a new, empty mailbox (RFC 4314 section 4): a restore brings messages back, and the
+// parent may grant users that the deleted mailbox no longer did. Each level recreated
+// gets one entry, the owner's primary address with default_rights; an admin grants
+// other users access again.
 //
 // asParent takes FOR KEY SHARE on an existing mailbox that is about to receive a
 // recreated child — the same lock createMailbox takes — so the parent cannot be
@@ -541,6 +552,12 @@ func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string
 		}
 	}
 
+	ownerDomain, err := newMailboxOwnerDomain(ctx, tx, accountID, name)
+	if err != nil {
+		return 0, "", err
+	}
+	isShared := ownerDomain != nil
+
 	// Re-seed the RFC 6154 special-use attribute for a canonical top-level default name
 	// (consistent with CreateDefaultMailboxes / migration 000045), but ONLY if the
 	// attribute is not already held by another live mailbox — so a restore never
@@ -548,12 +565,13 @@ func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string
 	// ON CONFLICT tolerates a concurrent recreate of the same name; its row is then
 	// re-read below.
 	err = tx.QueryRow(ctx, `
-		INSERT INTO mailboxes (account_id, name, uid_validity, created_at, updated_at, path, special_use)
+		INSERT INTO mailboxes (account_id, name, uid_validity, created_at, updated_at, path, special_use, is_shared, owner_domain)
 		SELECT $1, $2, extract(epoch from now())::bigint, now(), now(), '',
 			CASE WHEN canon.su IS NOT NULL
 			          AND NOT EXISTS (SELECT 1 FROM mailboxes m2
 			                          WHERE m2.account_id = $1 AND m2.special_use = canon.su AND m2.deleted_at IS NULL)
-			     THEN canon.su END
+			     THEN canon.su END,
+			$3::boolean, $4::text
 		FROM (SELECT CASE LOWER($2)
 			WHEN 'sent'    THEN '\Sent'
 			WHEN 'drafts'  THEN '\Drafts'
@@ -563,7 +581,7 @@ func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string
 		END AS su) canon
 		ON CONFLICT (account_id, LOWER(name)) WHERE deleted_at IS NULL DO NOTHING
 		RETURNING id
-	`, accountID, name).Scan(&mailboxID)
+	`, accountID, name, isShared, ownerDomain).Scan(&mailboxID)
 	if err == pgx.ErrNoRows {
 		// Concurrent recreate won the race; use its row as it is.
 		err = tx.QueryRow(ctx, lookup, accountID, name).Scan(&mailboxID, &path)
@@ -580,6 +598,15 @@ func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string
 	path = helpers.GetMailboxPath(parentPath, mailboxID)
 	if _, err := tx.Exec(ctx, `UPDATE mailboxes SET path = $1 WHERE id = $2`, path, mailboxID); err != nil {
 		return 0, "", fmt.Errorf("failed to update path for mailbox %s: %w", name, err)
+	}
+
+	if isShared {
+		// No sharedParentID, whatever the parent is: the owner's entry only.
+		if err := grantNewSharedMailboxACL(ctx, tx, accountID, name, mailboxID, nil, *ownerDomain); err != nil {
+			return 0, "", err
+		}
+		logger.Warn("Database: restore recreated a deleted shared mailbox with owner-only rights; grant other users access again",
+			"account_id", accountID, "mailbox", name, "mailbox_id", mailboxID)
 	}
 	return mailboxID, path, nil
 }

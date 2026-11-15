@@ -92,3 +92,49 @@ func TestReloadConfigMaxMessageSize(t *testing.T) {
 		})
 	}
 }
+
+// A SIGHUP to max_message_size "0" applies the 50 MiB default, the limit each delivery
+// enforces anyway, and is reported as a change only when the running limit was another
+// one (#962). Before, the reload stored 0 and logged max_message_size as updated even
+// from "50mb", where the limit in force stays 50 MiB.
+func TestReloadConfigMaxMessageSizeZeroIsDefault(t *testing.T) {
+	logs := &reloadLogs{}
+	prev := logger.Swap(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { logger.Swap(prev) })
+
+	for _, tt := range []struct {
+		name         string
+		running      int64
+		reload       string
+		wantReloaded bool
+	}{
+		{name: "from the default", running: DefaultMaxMessageSize, reload: "0"},
+		{name: "from the default in kb", running: DefaultMaxMessageSize, reload: "0kb"},
+		{name: "from another limit", running: 100 << 20, reload: "0", wantReloaded: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			name := "lmtp-zero-" + strings.ReplaceAll(tt.name, " ", "-")
+			b := &LMTPServerBackend{name: name}
+			b.settings.Store(&reloadableSettings{maxMessageSize: tt.running})
+
+			logsBefore := len(logs.String())
+			if err := b.ReloadConfig(config.ServerConfig{Name: name, Type: "lmtp", MaxMessageSize: tt.reload}); err != nil {
+				t.Fatal(err)
+			}
+			logged := logs.String()[logsBefore:]
+
+			if got := b.settings.Load().maxMessageSize; got != DefaultMaxMessageSize {
+				t.Errorf("max_message_size after reloading %q = %d, want %d", tt.reload, got, DefaultMaxMessageSize)
+			}
+			reported := false
+			for _, line := range strings.Split(logged, "\n") {
+				if strings.Contains(line, "config reloaded") && strings.Contains(line, "max_message_size") && strings.Contains(line, "name="+name) {
+					reported = true
+				}
+			}
+			if reported != tt.wantReloaded {
+				t.Errorf("reloading %q over %d reported max_message_size as reloaded: %v, want %v; logged:\n%s", tt.reload, tt.running, reported, tt.wantReloaded, logged)
+			}
+		})
+	}
+}

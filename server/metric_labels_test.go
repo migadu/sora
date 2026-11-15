@@ -173,13 +173,14 @@ func TestAuthRateLimiterMetricsUseServerType(t *testing.T) {
 
 	// The names the servers give NewAuthRateLimiter*.
 	for name, want := range map[string]string{
-		"IMAP":        "imap",
-		"POP3":        "pop3",
-		"ManageSieve": "managesieve",
-		"IMAP-PROXY":  "imap_proxy",
-		"POP3-PROXY":  "pop3_proxy",
-		"SIEVE-PROXY": "managesieve_proxy",
-		"user-api":    "userapi",
+		"IMAP":           "imap",
+		"POP3":           "pop3",
+		"ManageSieve":    "managesieve",
+		"IMAP-PROXY":     "imap_proxy",
+		"POP3-PROXY":     "pop3_proxy",
+		"SIEVE-PROXY":    "managesieve_proxy",
+		"user-api":       "userapi",
+		"USER-API-PROXY": "userapi_proxy",
 	} {
 		t.Run(name, func(t *testing.T) {
 			serverName := "limiter-711-" + name
@@ -241,13 +242,15 @@ func serverTypeOf(dir string) string {
 }
 
 // TestAuthDelayCallersLabelTheServerType: every server passes ApplyAuthenticationDelay
-// its own server type, the protocol label its other metrics use, so the
-// sora_auth_delay_* series join them by protocol.
+// (or ApplyHTTPAuthenticationDelay) its own server type, the protocol label its other
+// metrics use, so the sora_auth_delay_* series join them by protocol.
 func TestAuthDelayCallersLabelTheServerType(t *testing.T) {
 	files, err := filepath.Glob("*/*.go")
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The index of the protocol argument of each delay function.
+	protocolArg := map[string]int{"ApplyAuthenticationDelay": 3, "ApplyHTTPAuthenticationDelay": 4}
 	fset := token.NewFileSet()
 	calls := 0
 	for _, path := range files {
@@ -265,17 +268,21 @@ func TestAuthDelayCallersLabelTheServerType(t *testing.T) {
 				return true
 			}
 			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || sel.Sel.Name != "ApplyAuthenticationDelay" || len(call.Args) != 4 {
+			if !ok {
+				return true
+			}
+			i, ok := protocolArg[sel.Sel.Name]
+			if !ok || len(call.Args) <= i {
 				return true
 			}
 			calls++
-			arg := call.Args[3]
+			arg := call.Args[i]
 			if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
 				if got, _ := strconv.Unquote(lit.Value); got == want {
 					return true
 				}
 			}
-			t.Errorf("%s: ApplyAuthenticationDelay(..., %s), want %q", fset.Position(call.Pos()), types.ExprString(arg), want)
+			t.Errorf("%s: %s(..., %s), want %q", fset.Position(call.Pos()), sel.Sel.Name, types.ExprString(arg), want)
 			return true
 		})
 	}

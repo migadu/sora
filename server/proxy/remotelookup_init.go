@@ -2,8 +2,6 @@ package proxy
 
 import (
 	"fmt"
-	"net"
-	"net/url"
 	"strings"
 
 	"github.com/migadu/sora/config"
@@ -15,47 +13,6 @@ import (
 // both authentication and route caches rather than reuse another network's verdict.
 func RemoteLookupUsesClientIP(cfg *config.RemoteLookupConfig) bool {
 	return cfg != nil && cfg.Enabled && strings.Contains(cfg.URL, "$ip")
-}
-
-// validateRemoteLookupURL checks that the template yields a request URL for every
-// lookup, and requires https:// for non-loopback hosts. A plaintext remote-lookup
-// endpoint exposes the user's password and the returned password hash to an on-path
-// attacker, who can also forge the backend-routing response.
-//
-// The template itself parsing is not enough: the client substitutes $email and $ip
-// with url.QueryEscape, so in the host they become %40 or %3A, which net/url refuses,
-// and every lookup would fail before a request is sent. Placeholders therefore belong
-// in the path and query, and sample request URLs are built the way the client builds
-// them (an IPv4, an IPv6 and no client IP) and parsed.
-func validateRemoteLookupURL(rawURL string) error {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return fmt.Errorf("invalid remotelookup.url: %w", config.MaskURLError(err))
-	}
-	if u.Hostname() == "" {
-		return fmt.Errorf("invalid remotelookup.url: no host")
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("invalid remotelookup.url: scheme must be http or https (got %q)", u.Scheme)
-	}
-	for _, placeholder := range []string{"$email", "$ip"} {
-		if strings.Contains(u.Host, placeholder) {
-			return fmt.Errorf("invalid remotelookup.url: %s is allowed only in the path and query, not in the host %q", placeholder, u.Host)
-		}
-	}
-	for _, clientIP := range []string{"192.0.2.1", "2001:db8::1", ""} {
-		if _, err := url.Parse(remoteLookupRequestURL(rawURL, "user@example.com", clientIP, false)); err != nil {
-			return fmt.Errorf("invalid remotelookup.url: lookup requests cannot be built: %w", config.MaskURLError(err))
-		}
-	}
-	if u.Scheme == "https" {
-		return nil
-	}
-	host := u.Hostname()
-	if ip := net.ParseIP(host); host == "localhost" || (ip != nil && ip.IsLoopback()) {
-		return nil // http:// allowed only to loopback (dev/test)
-	}
-	return fmt.Errorf("remotelookup.url must use https:// for non-loopback hosts (got scheme %q); plaintext exposes credentials and password hashes", u.Scheme)
 }
 
 // standardBackendPorts are the ports the backends listen on by default (as in
@@ -86,10 +43,9 @@ func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig, ser
 		logger.Info("RemoteLookup: Bypassing user-keyed lookup cache because URL uses $ip", "protocol", protocol)
 	}
 
-	if cfg.URL == "" {
-		return nil, fmt.Errorf("remotelookup.url is required when remotelookup is enabled")
-	}
-	if err := validateRemoteLookupURL(cfg.URL); err != nil {
+	// The checks ServerConfig.Validate runs, so a block that passes sora-admin config
+	// validate is not refused here.
+	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
