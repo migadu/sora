@@ -599,7 +599,7 @@ func (s *Server) setupHandler() http.Handler {
 		if isCORSPreflight(r) {
 			route, err = s.routeNameless(r)
 		} else {
-			route, login, err = s.routeAuthRequest(r)
+			route, login, err = s.routeAuthRequest(w, r)
 		}
 		if err != nil {
 			if errors.Is(err, errAuthBodyTooLarge) {
@@ -707,7 +707,8 @@ func (s *Server) routeNameless(r *http.Request) (backendRoute, error) {
 }
 
 // writeTimeout is the proxy's http.Server WriteTimeout: no answer later than this after a
-// request was read reaches its client.
+// request was read reaches its client, unless the handler moves the deadline (a delayed
+// login, admitLogin).
 const writeTimeout = 30 * time.Second
 
 // maxAuthBodyBytes bounds how much of an auth request body the proxy reads to find the
@@ -736,14 +737,15 @@ var errLoginRefused = errors.New("login refused")
 
 // routeAuthRequest picks the backend for an unauthenticated auth request, and returns
 // the login attempt the rate limit counts by the backend's answer (nil for a refresh, or
-// without a rate limit). A login is admitted by the rate limit first (admitLogin). A
+// without a rate limit). A login is admitted by the rate limit first (admitLogin), which
+// moves the write deadline of w past its delay. A
 // login for a user the lookup does not know or refuses reaches no backend, which would
 // verify the password before answering 401: the proxy verifies it against a dummy hash
 // instead, counts it as a failure and returns errLoginRefused, so that neither the
 // answer, nor its timing, nor the rate limit shows what the lookup said of the address.
 // A refresh for such a user carries a token the proxy accepted, so its caller learns
 // nothing from the refusal and it stays a temporary one.
-func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, *loginAttempt, error) {
+func (s *Server) routeAuthRequest(w http.ResponseWriter, r *http.Request) (backendRoute, *loginAttempt, error) {
 	id, err := s.peekAuthIdentity(r)
 	if err != nil {
 		return backendRoute{}, nil, err
@@ -755,7 +757,7 @@ func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, *loginAttempt,
 	var login *loginAttempt
 	if id.password != "" && s.authLimiter != nil {
 		login = &loginAttempt{addr: &server.StringAddr{Addr: s.getRealClientIP(r)}, key: server.AuthRateLimitKey(id.email)}
-		if err := s.admitLogin(r.Context(), login); err != nil {
+		if err := s.admitLogin(r.Context(), w, login); err != nil {
 			return backendRoute{}, nil, err
 		}
 	}
@@ -786,9 +788,11 @@ type loginAttempt struct {
 // would let a blocked client spend the proxy's CPU. One limiter counts every login
 // through the proxy, those a backend answers (proxyRequest) and those the proxy refuses
 // itself, so neither a delay nor a block depends on whether the lookup knows the address.
-// A login delay that cannot be served is server.ErrDelayQueueFull.
-func (s *Server) admitLogin(ctx context.Context, login *loginAttempt) error {
-	if err := server.ApplyAuthenticationDelay(ctx, s.authLimiter, login.addr, "userapi_proxy"); err != nil {
+// A login delay that cannot be served is server.ErrDelayQueueFull. The delay runs after
+// net/http set the request's write deadline, so it moves the deadline of w past itself,
+// leaving the login writeTimeout after it.
+func (s *Server) admitLogin(ctx context.Context, w http.ResponseWriter, login *loginAttempt) error {
+	if err := server.ApplyHTTPAuthenticationDelay(ctx, w, s.authLimiter, login.addr, "userapi_proxy", writeTimeout); err != nil {
 		return fmt.Errorf("login delay: %w", err)
 	}
 	if err := s.authLimiter.CanAttemptAuth(ctx, login.addr, login.key); err != nil {

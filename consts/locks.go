@@ -30,3 +30,13 @@ const SoraMailboxACLLockClassID = int32(0x41434C31) // "ACL1" in hex = 109492945
 // keyed by hashint8(account_id), that sora-admin import rekey (db.RekeyContentHash) takes
 // exclusively and COPY and MOVE take shared for the accounts whose rows they copy.
 const SoraContentRekeyLockClassID = int32(0x524B4559) // "RKEY" in hex = 1380664665
+
+// SoraMetadataLimitLockClassID is the class ID of the transaction-scoped advisory lock,
+// keyed by hashint8(account_id), that serialises the [metadata] limit check and write of
+// db.SetMetadata per account, so two SETMETADATA commands cannot both pass a limit.
+const SoraMetadataLimitLockClassID = int32(0x4D455441) // "META" in hex = 1296389185
+
+// SoraSieveScriptLimitLockClassID is the class ID of the transaction-scoped advisory lock,
+// keyed by hashint8(account_id), that serialises Sieve script creates and name changes
+// (db.CreateScript, db.CreateOrUpdateScript, db.UpdateScript, db.RenameScript) per account.
+const SoraSieveScriptLimitLockClassID = int32(0x53494556) // "SIEV" in hex = 1397310806

@@ -61,6 +61,9 @@ var (
 	_ imapserver.SessionID              = (*meteredSession)(nil)
 	_ imapserver.SessionNotify          = (*meteredSession)(nil)
 	_ imapserver.SessionSearchRes       = (*meteredSession)(nil)
+	// Without it the first CONDSTORE enabling command with a mailbox selected
+	// silently stops returning HIGHESTMODSEQ (RFC 7162 §3.1).
+	_ imapserver.SessionHighestModSeq = (*meteredSession)(nil)
 )
 
 // newMeteredSession wraps an IMAP session for command metric collection.
