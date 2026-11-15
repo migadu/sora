@@ -3049,10 +3049,6 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 
 	switch s.Type {
 	case "lmtp":
-		// Its only timeout setting is timeouts.command_timeout (the idle timeout).
-		s.warnKeysNotApplied(logger, "the LMTP server does not apply it",
-			configKey{"timeouts.absolute_session_timeout", s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != ""},
-			configKey{"timeouts.min_bytes_per_minute", s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0})
 		// MTAs deliver many messages at once from few addresses.
 		s.warnKeysNotApplied(logger, "the LMTP server limits only its total connections (max_connections)",
 			configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
@@ -3060,10 +3056,6 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 
 	case "lmtp_proxy":
-		// Its timeouts are auth_idle_timeout and timeouts.absolute_session_timeout.
-		s.warnKeysNotApplied(logger, "the LMTP proxy does not apply it",
-			configKey{"timeouts.command_timeout", s.Timeouts != nil && s.Timeouts.CommandTimeout != ""},
-			configKey{"timeouts.min_bytes_per_minute", s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0})
 		// MTAs deliver many messages at once from few addresses, and an LMTP client
 		// does not log in as a user.
 		s.warnKeysNotApplied(logger, "the LMTP proxy limits only its total connections (max_connections)",
@@ -3172,13 +3164,38 @@ var serverTypeKeys = []struct {
 	{"append_limit", func(s *ServerConfig) bool { return s.AppendLimit != "" }, []string{"imap"}},
 	{"max_script_size", func(s *ServerConfig) bool { return s.MaxScriptSize != "" }, []string{"managesieve"}},
 	{"supported_extensions", func(s *ServerConfig) bool { return len(s.SupportedExtensions) > 0 }, []string{"managesieve_proxy"}},
+	// The nested tables, warned about whole. Only a proxy builds a lookup client; the
+	// LMTP proxy and the Admin API have no login to rate limit, and the LMTP backend,
+	// the Admin API and the metrics listener look up no credentials to cache.
+	{"remote_lookup", func(s *ServerConfig) bool { return s.RemoteLookup != nil }, proxyServerTypes},
+	{"auth_rate_limit", func(s *ServerConfig) bool { return s.AuthRateLimit != nil }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "http_user_api", "user_api_proxy"}},
+	{"lookup_cache", func(s *ServerConfig) bool { return s.LookupCache != nil }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_user_api", "user_api_proxy"}},
+	// Session timeouts. The LMTP backend's command_timeout is its idle timeout, and
+	// the LMTP proxy's timeouts are auth_idle_timeout and absolute_session_timeout.
+	// The HTTP servers time out no sessions, and each per-command table is its own
+	// protocol backend's.
+	{"timeouts.command_timeout", func(s *ServerConfig) bool { return s.Timeouts != nil && s.Timeouts.CommandTimeout != "" }, []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}},
+	{"timeouts.absolute_session_timeout", func(s *ServerConfig) bool { return s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != "" }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
+	{"timeouts.min_bytes_per_minute", func(s *ServerConfig) bool { return s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0 }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}},
+	{"timeouts.imap_command_timeouts", func(s *ServerConfig) bool { return s.Timeouts != nil && s.Timeouts.IMAPCommandTimeouts != nil }, []string{"imap"}},
+	{"timeouts.pop3_command_timeouts", func(s *ServerConfig) bool { return s.Timeouts != nil && s.Timeouts.POP3CommandTimeouts != nil }, []string{"pop3"}},
+	{"timeouts.managesieve_command_timeouts", func(s *ServerConfig) bool { return s.Timeouts != nil && s.Timeouts.ManageSieveCommandTimeouts != nil }, []string{"managesieve"}},
+	{"timeouts.lmtp_command_timeouts", func(s *ServerConfig) bool { return s.Timeouts != nil && s.Timeouts.LMTPCommandTimeouts != nil }, []string{"lmtp"}},
+	// The metrics endpoint is always plain HTTP and reads no PROXY header; its tls and
+	// proxy_protocol are warned about below.
+	{"tls_cert_file", func(s *ServerConfig) bool { return s.TLSCertFile != "" }, listenerServerTypes},
+	{"tls_key_file", func(s *ServerConfig) bool { return s.TLSKeyFile != "" }, listenerServerTypes},
+	{"tls_default_domain", func(s *ServerConfig) bool { return s.TLSDefaultDomain != "" }, listenerServerTypes},
+	{"proxy_protocol_timeout", func(s *ServerConfig) bool { return s.ProxyProtocolTimeout != "" }, listenerServerTypes},
 }
 
 // loginServerTypes are the server types with a password login, proxyServerTypes
-// those that dial backends.
+// those that dial backends, and listenerServerTypes those that serve TLS and read
+// PROXY headers on their listener (every type but metrics).
 var (
-	loginServerTypes = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
-	proxyServerTypes = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
+	loginServerTypes    = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
+	proxyServerTypes    = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
+	listenerServerTypes = []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_admin_api", "http_user_api", "user_api_proxy"}
 )
 
 // serverLimitKeys is every [server.limits] key with the server types whose start
