@@ -15,6 +15,11 @@ import (
 // combination of the header-list and key-list arguments match and returns
 // false otherwise." §5.7: "if the named header is not present, it does not
 // match any key, including the empty key."
+//
+// The fix tells the two apart by the number of values the header map holds,
+// so the empty field is covered too: the parse delivery uses must keep a
+// present but empty Cc: as one empty value, which still matches the empty key
+// (Pigeonhole's test-address.svtest: ":all failed to match empty address").
 func TestAddressTestAbsentHeaderMatchesNoKey(t *testing.T) {
 	const script = `require "fileinto";
 if address :matches "Cc" "*" { fileinto "has-cc"; }
@@ -40,6 +45,11 @@ if not address :matches "cc" "*" { fileinto "no-cc"; }
 			name: "Cc field",
 			raw:  "From: a@example.com\r\nTo: user@example.com\r\nCc: c@example.org\r\nSubject: s\r\n\r\nbody\r\n",
 			want: []string{"has-cc"},
+		},
+		{
+			name: "empty Cc field",
+			raw:  "From: a@example.com\r\nTo: user@example.com\r\nCc:\r\nSubject: s\r\n\r\nbody\r\n",
+			want: []string{"has-cc", "empty-cc"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
