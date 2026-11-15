@@ -44,7 +44,7 @@ func TestCloseDoesNotUnregisterUnregisteredAccount(t *testing.T) {
 		accountID:            accountID,
 		ctx:                  context.Background(),
 		startTime:            time.Now(),
-		registeredAccountIDs: make(map[int64]struct{}), // nothing registered
+		registeredAccountIDs: make(map[int64]<-chan struct{}), // nothing registered
 	}
 
 	sess.close()

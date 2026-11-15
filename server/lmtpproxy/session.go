@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/migadu/sora/consts"
@@ -67,7 +68,13 @@ type Session struct {
 	// earlier recipients would leak connection counts permanently. Each account is
 	// registered at most once per session (a backend reconnect does not register it
 	// again), so close() unregisters each entry exactly once.
-	registeredAccountIDs map[int64]struct{}
+	// Each entry holds the channel the tracker closes when that account is kicked:
+	// a kick of any account the session delivers to ends the session (watchKick).
+	registeredAccountIDs map[int64]<-chan struct{}
+	// kickedAccountID is the account whose kick ended the session, 0 if none. It is
+	// set by watchKick and logged by close(), on the session goroutine, which owns
+	// the fields the session logger reads.
+	kickedAccountID atomic.Int64
 
 	// Per-transaction state. The backend's view of a transaction must stay the MTA's:
 	// acceptedRcpts counts the recipients the backend accepted (2xx to RCPT), which is
@@ -114,7 +121,7 @@ func newSession(s *Server, conn net.Conn, proxyInfo *server.ProxyProtocolInfo) *
 		cancel:               sessionCancel,
 		startTime:            time.Now(),
 		proxyInfo:            proxyInfo,
-		registeredAccountIDs: make(map[int64]struct{}),
+		registeredAccountIDs: make(map[int64]<-chan struct{}),
 		// Generate the session id once, up front, so every log line carries it.
 		// It's also forwarded to the backend (XCLIENT), logged there as proxy_session.
 		sessionID: idgen.New(),
@@ -1623,18 +1630,22 @@ func (s *Session) forwardRCPT(command string) {
 		return
 	}
 
-	// Backend accepted (2xx) - forward response to client. From here on this
-	// transaction is the backend's: a lost backend can no longer be replaced.
+	// Backend accepted (2xx). From here on this transaction is the backend's: a
+	// lost backend can no longer be replaced.
 	s.acceptedRcpts++
-	s.clientWriter.WriteString(response)
-	s.clientWriter.Flush()
 
 	// The session now delivers to this recipient's account, on a new backend
 	// connection or on the one it already held: count it for that account
-	// (once per session, however many of its recipients follow).
+	// (once per session, however many of its recipients follow). This comes
+	// before the reply, so the account's kick reaches the session from the
+	// moment the MTA learns of the acceptance.
 	if err := s.registerConnection(); err != nil {
 		s.InfoLog("rejected connection registration", "error", err)
 	}
+
+	// Forward the backend's acceptance to the client.
+	s.clientWriter.WriteString(response)
+	s.clientWriter.Flush()
 
 	// Log routing decision at INFO level with sender, recipient, and routing method
 	s.InfoLog("routing to backend", "backend", s.serverAddr, "method", s.routingMethod, "from", s.sender, "to", s.to)
@@ -1648,6 +1659,10 @@ func (s *Session) close() {
 	if s.releaseConn != nil {
 		s.releaseConn()
 		s.releaseConn = nil // Prevent double-release
+	}
+
+	if kicked := s.kickedAccountID.Load(); kicked != 0 {
+		s.InfoLog("connection kicked", "kicked_account_id", kicked)
 	}
 
 	// Log disconnection at INFO level
@@ -1673,12 +1688,8 @@ func (s *Session) close() {
 		// backend connect failed) or was rejected by a limit. Unregistering an
 		// account that was never registered decrements connection counts owned
 		// by the user's OTHER live sessions, eroding per-user limits.
-		accountIDs := make([]int64, 0, len(s.registeredAccountIDs))
-		for id := range s.registeredAccountIDs {
-			accountIDs = append(accountIDs, id)
-		}
-
-		for _, id := range accountIDs {
+		for id, kick := range s.registeredAccountIDs {
+			s.server.connTracker.UnregisterSession(id, kick)
 			// Use cached client address to avoid race with connection close
 			if err := s.server.connTracker.UnregisterConnection(ctx, id, "LMTP", s.clientAddr); err != nil {
 				// Connection tracking is non-critical monitoring data, so log but continue
@@ -1736,49 +1747,31 @@ func (s *Session) registerConnection() error {
 			return err
 		}
 		// Remember which account we registered so close() can unregister the same one,
-		// even if s.accountID later changes due to additional RCPT TOs.
+		// even if s.accountID later changes due to additional RCPT TOs, and from now
+		// on end the session when that account is kicked.
 		if s.registeredAccountIDs == nil {
-			s.registeredAccountIDs = make(map[int64]struct{})
+			s.registeredAccountIDs = make(map[int64]<-chan struct{})
 		}
-		s.registeredAccountIDs[s.accountID] = struct{}{}
+		kick := s.server.connTracker.RegisterSession(s.accountID)
+		s.registeredAccountIDs[s.accountID] = kick
+		go s.watchKick(s.accountID, kick)
 		return nil
 	}
 	return nil
 }
 
-// updateActivityPeriodically updates the connection activity in the database.
-func (s *Session) updateActivityPeriodically(ctx context.Context) {
-	// If connection tracking is disabled, do nothing and wait for session to end.
-	if s.server.connTracker == nil {
-		<-ctx.Done()
-		return
-	}
-
-	// Register for kick notifications
-	kickChan := s.server.connTracker.RegisterSession(s.accountID)
-	defer s.server.connTracker.UnregisterSession(s.accountID, kickChan)
-
-	for {
-		select {
-		case <-kickChan:
-			// Kick notification received - close connections. Snapshot the
-			// conns under the session mutex: the command loop reassigns and
-			// nils backendConn on backend errors and STARTTLS (those writes
-			// hold mu), and backendConn may legitimately be nil here.
-			s.InfoLog("connection kicked")
-			s.mu.Lock()
-			clientConn, backendConn := s.clientConn, s.backendConn
-			s.mu.Unlock()
-			if clientConn != nil {
-				clientConn.Close()
-			}
-			if backendConn != nil {
-				backendConn.Close()
-			}
-			return
-		case <-ctx.Done():
-			return
-		}
+// watchKick ends the session when the tracker kicks accountID (it closes kick),
+// whichever of the session's recipients the account is, and returns with the
+// session otherwise. Cancelling the session context closes the client and
+// backend transports (handleConnection); the MTA retries whatever it had not
+// been told was delivered. It does not log: the session logger reads fields
+// the command loop writes, so close() reports the kick.
+func (s *Session) watchKick(accountID int64, kick <-chan struct{}) {
+	select {
+	case <-kick:
+		s.kickedAccountID.CompareAndSwap(0, accountID)
+		s.cancel()
+	case <-s.ctx.Done():
 	}
 }
 

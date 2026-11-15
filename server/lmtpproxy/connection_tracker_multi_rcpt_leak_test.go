@@ -41,7 +41,7 @@ func TestConnectionTracker_MultiRCPTDoesNotLeak(t *testing.T) {
 		clientAddr:           "192.0.2.10:12345",
 		ctx:                  context.Background(),
 		startTime:            time.Now(),
-		registeredAccountIDs: make(map[int64]struct{}),
+		registeredAccountIDs: make(map[int64]<-chan struct{}),
 	}
 
 	// registerConnection() falls back to a safe default timeout if s.server.rdb is nil.
@@ -93,7 +93,7 @@ func TestConnectionTracker_BackendReconnectDoesNotLeak(t *testing.T) {
 		clientAddr:           "192.0.2.10:12345",
 		ctx:                  context.Background(),
 		startTime:            time.Now(),
-		registeredAccountIDs: make(map[int64]struct{}),
+		registeredAccountIDs: make(map[int64]<-chan struct{}),
 		accountID:            1,
 		username:             "user@example.com",
 	}
