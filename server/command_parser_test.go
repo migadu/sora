@@ -185,6 +185,39 @@ func TestParseLine(t *testing.T) {
 			wantArgs: []string{`"my vacation script"`},
 			wantErr:  false,
 		},
+		// Command names are ABNF strings, case-insensitive over US-ASCII only
+		// (RFC 5234 §2.3). strings.ToUpper maps U+0131 (dotless i) to "I" and
+		// U+017F (long s) to "S", which turned these into CAPABILITY, SELECT
+		// and MAIL (#1511).
+		{
+			name:    "lower-case ASCII command is upper-cased",
+			line:    "a1 capability",
+			hasTag:  true,
+			wantTag: "a1",
+			wantCmd: "CAPABILITY",
+		},
+		{
+			name:    "dotless i is not an I",
+			line:    "p CAPAB\u0131LITY",
+			hasTag:  true,
+			wantTag: "p",
+			wantCmd: "CAPAB\u0131LITY",
+		},
+		{
+			name:     "long s is not an S",
+			line:     "a \u017felect INBOX",
+			hasTag:   true,
+			wantTag:  "a",
+			wantCmd:  "\u017fELECT",
+			wantArgs: []string{"INBOX"},
+		},
+		{
+			name:     "LMTP command with dotless i",
+			line:     "ma\u0131l FROM:<a@example.com>",
+			hasTag:   false,
+			wantCmd:  "MA\u0131L",
+			wantArgs: []string{"FROM:<a@example.com>"},
+		},
 	}
 
 	for _, tt := range tests {
