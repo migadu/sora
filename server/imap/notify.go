@@ -427,13 +427,20 @@ func (c *ownTreeChange) end() {
 // placeholder ID until the next diff (resolveOwnCreated). The caller holds
 // notifyMutex, as for the other own* changes below.
 func (watch *notifyWatch) ownCreated(name string) {
+	watch.ownCreatedLevels(name, false)
+}
+
+// ownCreatedLevels gives a placeholder to each level of name that the
+// snapshot lacks: a superior name (notifySnapshotEntry.superior), except the
+// last level of a mailbox the client created when superior is false.
+func (watch *notifyWatch) ownCreatedLevels(name string, superior bool) {
 	delim := string(consts.MailboxDelimiter)
 	levels := strings.Split(name, delim)
 	for i := range levels {
 		level := strings.Join(levels[:i+1], delim)
 		if !watch.snapshotHas(level) {
 			watch.ownTree.placeholder--
-			watch.snapshot[watch.ownTree.placeholder] = notifySnapshotEntry{name: level, superior: i < len(levels)-1}
+			watch.snapshot[watch.ownTree.placeholder] = notifySnapshotEntry{name: level, superior: superior || i < len(levels)-1}
 		}
 	}
 }
@@ -463,7 +470,7 @@ func (watch *notifyWatch) ownRenamed(oldName, newName string) {
 		watch.snapshot[id] = entry
 	}
 	if i := strings.LastIndex(newName, string(consts.MailboxDelimiter)); i >= 0 {
-		watch.ownCreated(newName[:i])
+		watch.ownCreatedLevels(newName[:i], true)
 	}
 }
 

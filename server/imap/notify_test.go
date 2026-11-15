@@ -456,6 +456,14 @@ func TestNotifyOwnTreeChanges(t *testing.T) {
 			}),
 		},
 		{
+			name: "RENAME below levels the snapshot does not show",
+			own:  func(w *notifyWatch) { w.ownRenamed("Old", "Shared/Team/Old") },
+			cur: with(func(s snap) {
+				s[2] = notifySnapshotEntry{name: "Shared/Team/Old"}
+				s[3] = notifySnapshotEntry{name: "Shared/Team/Old/Kid"}
+			}),
+		},
+		{
 			name: "RENAME of INBOX creates the new name",
 			own:  func(w *notifyWatch) { w.ownCreated("Saved") },
 			cur:  with(func(s snap) { s[10] = notifySnapshotEntry{name: "Saved"} }),
