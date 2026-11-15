@@ -95,6 +95,12 @@ func isCorruptionError(err error) bool {
 	return false
 }
 
+// connParams are the settings of each SQLite connection: a locked database is waited for
+// up to 5 seconds, and commits sync at NORMAL, which WAL mode is safe from corruption
+// with. They go in the DSN, which the driver applies to every connection the *sql.DB pool
+// opens; a PRAGMA run with Exec on the pool sets them on one pooled connection only.
+const connParams = "_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
+
 // openAndValidate opens a SQLite database, sets pragmas, and creates the schema.
 func openAndValidate(dbPath string) (*sql.DB, error) {
 	dsn := dbPath
@@ -111,9 +117,13 @@ func openAndValidate(dbPath string) (*sql.DB, error) {
 			return nil, fmt.Errorf("failed to enforce 0600 permissions on database file: %w", err)
 		}
 		// Open that same file: a plain path would be cut at its first '?'.
-		if dsn, err = sqlitefile.DSN(dbPath, ""); err != nil {
+		if dsn, err = sqlitefile.DSN(dbPath, connParams); err != nil {
 			return nil, err
 		}
+	} else if strings.Contains(dsn, "?") {
+		dsn += "&" + connParams
+	} else {
+		dsn += "?" + connParams
 	}
 
 	sqliteDB, err := sql.Open("sqlite", dsn)
@@ -124,14 +134,6 @@ func openAndValidate(dbPath string) (*sql.DB, error) {
 	if _, err := sqliteDB.Exec(`PRAGMA journal_mode = WAL`); err != nil {
 		sqliteDB.Close()
 		return nil, fmt.Errorf("failed to set WAL mode: %w", err)
-	}
-	if _, err := sqliteDB.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
-		sqliteDB.Close()
-		return nil, fmt.Errorf("failed to set busy_timeout: %w", err)
-	}
-	if _, err := sqliteDB.Exec(`PRAGMA synchronous = NORMAL`); err != nil {
-		sqliteDB.Close()
-		return nil, fmt.Errorf("failed to set synchronous mode: %w", err)
 	}
 
 	schema := `
