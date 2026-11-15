@@ -353,14 +353,6 @@ func (si *S3Importer) performDryRun() error {
 	if err != nil {
 		return accountLookupError(si.options.Email, err)
 	}
-	// The import files every object in INBOX. An account without one holds nothing there
-	// yet: the import creates it.
-	var inboxID int64
-	if inbox, err := si.rdb.GetMailboxByNameWithRetry(ctx, accountID, consts.MailboxInbox); err == nil {
-		inboxID = inbox.ID
-	} else if !errors.Is(err, consts.ErrMailboxNotFound) {
-		return fmt.Errorf("dry run: failed to look up INBOX: %w", err)
-	}
 
 	rows, err := si.db.Query(`
 		SELECT key, size, domain, local_part, content_hash, last_modified
@@ -390,7 +382,7 @@ func (si *S3Importer) performDryRun() error {
 
 		// Check if message already exists. A failed check answers nothing: the object
 		// is not reported as new.
-		inAccount, inInbox, err := si.existingCopies(ctx, accountID, inboxID, contentHash)
+		inAccount, inInbox, err := si.existingCopies(ctx, accountID, contentHash)
 		if err != nil {
 			return fmt.Errorf("dry run: failed to check whether %s is already imported: %w", key, err)
 		}
@@ -564,16 +556,9 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 		// Don't fail the import, as mailboxes might already exist
 	}
 
-	// Import into INBOX by default (since we don't have mailbox information from S3)
-	// Default mailboxes should already be created at this point
-	mailbox, err := si.rdb.GetMailboxByNameWithRetry(ctx, user.AccountID(), consts.MailboxInbox)
-	if err != nil {
-		return fmt.Errorf("failed to get INBOX mailbox: %w", err)
-	}
-
 	// Check if message already exists. A failed check is not a "no": importing anyway
 	// would duplicate a message that is there.
-	inAccount, inInbox, err := si.existingCopies(ctx, accountID, mailbox.ID, contentHash)
+	inAccount, inInbox, err := si.existingCopies(ctx, accountID, contentHash)
 	if err != nil {
 		return fmt.Errorf("failed to check whether the message is already imported: %w", err)
 	}
@@ -646,6 +631,13 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
 
+	// Import into INBOX by default (since we don't have mailbox information from S3)
+	// Default mailboxes should already be created at this point
+	mailbox, err := si.rdb.GetMailboxByNameWithRetry(ctx, user.AccountID(), consts.MailboxInbox)
+	if err != nil {
+		return fmt.Errorf("failed to get INBOX mailbox: %w", err)
+	}
+
 	// The insert and marking the body uploaded run to the end even if an interrupt
 	// lands between or during them: cut there, the message would stay in
 	// pending_uploads, waiting for an upload of a body that is already in S3. An
@@ -716,13 +708,17 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 }
 
 // existingCopies counts the account's live messages with this content hash: in all of
-// its mailboxes, and in INBOX (inboxID), the mailbox the import files every object in.
-func (si *S3Importer) existingCopies(ctx context.Context, accountID, inboxID int64, contentHash string) (inAccount, inInbox int, err error) {
+// its mailboxes, and in its INBOX, the mailbox the import files every object in. The
+// INBOX is matched by name in the same query (as CreateDefaultMailboxes finds it), so
+// deciding a skip costs this one query, and an account without an INBOX yet (the
+// import creates it) holds nothing there.
+func (si *S3Importer) existingCopies(ctx context.Context, accountID int64, contentHash string) (inAccount, inInbox int, err error) {
 	err = si.rdb.QueryRowWithRetry(ctx, `
-		SELECT COUNT(*), COUNT(*) FILTER (WHERE mailbox_id = $3)
-		FROM messages
-		WHERE content_hash = $1 AND account_id = $2 AND expunged_at IS NULL`,
-		contentHash, accountID, inboxID).Scan(&inAccount, &inInbox)
+		SELECT COUNT(*), COUNT(mb.id)
+		FROM messages m
+		LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id AND LOWER(mb.name) = 'inbox' AND mb.deleted_at IS NULL
+		WHERE m.content_hash = $1 AND m.account_id = $2 AND m.expunged_at IS NULL`,
+		contentHash, accountID).Scan(&inAccount, &inInbox)
 	return inAccount, inInbox, err
 }
 
