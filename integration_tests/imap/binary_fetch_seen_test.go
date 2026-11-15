@@ -119,9 +119,9 @@ func extractModSeq(t *testing.T, s, ctx string) uint64 {
 //     created by setting \Seen, never the stale pre-FETCH mod-sequence.
 //  2. When FLAGS was not explicitly requested, the FETCH response itself still
 //     includes FLAGS (\Seen ...) when \Seen changed (RFC 3501 §6.4.5 / RFC 9051
-//     §6.4.5), plus MODSEQ when CONDSTORE is enabled on the session (RFC 7162
-//     §3.1.3 / §3.2) and UID when QRESYNC is enabled (RFC 7162 §3.2.4), even
-//     when NOTIFY suppresses FlagChange responses from Poll.
+//     §6.4.5), plus MODSEQ and UID once the client issued a CONDSTORE enabling
+//     command (RFC 7162 §3.1.3 / §3.2 / §3.2.4), even when NOTIFY suppresses
+//     FlagChange responses from Poll.
 func TestIMAP_FetchImplicitSeenFlagsAndModSeq(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -289,5 +289,65 @@ func TestIMAP_FetchImplicitSeenFlagsAndModSeq(t *testing.T) {
 			t.Errorf("FETCH 1 (BINARY[1]) under QRESYNC: want UID item (RFC 7162 §3.2.4), got:\n%s", resp)
 		}
 		extractModSeq(t, resp, "FETCH 1 (BINARY[1]) under QRESYNC")
+	})
+
+	// RFC 7162 §3.2.4: "Once a CONDSTORE enabling command is issued by the
+	// client, the server MUST automatically include both UID and mod-sequence
+	// data in all subsequent untagged FETCH responses ... whether they were
+	// caused by ... a FETCH/UID FETCH that implicitly set the \Seen flag". The
+	// trigger is any CONDSTORE enabling command, not ENABLE QRESYNC (#1197).
+	// NOTIFY without FlagChange keeps the post-command poll from reporting the
+	// change again, so the FETCH response is the client's only report of it.
+	t.Run("CONDSTORE enabling command without QRESYNC includes UID on implicit Seen", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			enable []string
+		}{
+			{"SELECT CONDSTORE", []string{"SELECT INBOX (CONDSTORE)"}},
+			{"ENABLE CONDSTORE", []string{"ENABLE CONDSTORE", "SELECT INBOX"}},
+			{"FETCH MODSEQ", []string{"SELECT INBOX", "FETCH 2 (MODSEQ)"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				server, account := common.SetupIMAPServer(t)
+				defer server.Close()
+
+				c := dialRawIMAP(t, server.Address)
+				c.do(fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password))
+				for range 2 {
+					c.appendMsg("INBOX", binaryFetchTestMessage)
+				}
+				for _, cmd := range tc.enable {
+					c.do(cmd)
+				}
+				uids := make([]string, 3)
+				for seq := 1; seq <= 2; seq++ {
+					untagged, _ := c.do(fmt.Sprintf("FETCH %d (UID)", seq))
+					m := uidItemRe.FindStringSubmatch(strings.Join(untagged, "\r\n"))
+					if m == nil {
+						t.Fatalf("FETCH %d (UID): missing UID in %q", seq, untagged)
+					}
+					uids[seq] = m[1]
+				}
+				c.do("NOTIFY SET (SELECTED (MessageNew MessageExpunge))")
+
+				for _, f := range []struct {
+					seq int
+					cmd string
+				}{
+					{2, "FETCH 2 (BODY[1])"},
+					{1, "FETCH 1 (BINARY[1])"},
+				} {
+					untagged, _ := c.do(f.cmd)
+					resp := strings.Join(untagged, "\r\n")
+					if !seenFlagsRe.MatchString(resp) {
+						t.Errorf("%s: want FLAGS (\\Seen ...), got:\n%s", f.cmd, resp)
+					}
+					if m := uidItemRe.FindStringSubmatch(resp); m == nil || m[1] != uids[f.seq] {
+						t.Errorf("%s: want UID %s (RFC 7162 §3.2.4), got:\n%s", f.cmd, uids[f.seq], resp)
+					}
+					extractModSeq(t, resp, f.cmd)
+				}
+			})
+		}
 	})
 }
