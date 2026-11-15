@@ -9,6 +9,7 @@ import (
 	imap "github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapclient"
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/stretchr/testify/require"
 )
 
 // TestIMAP_EnvelopeDate_UsesDateHeaderNotInternalDate is a regression test for
@@ -98,5 +99,52 @@ func TestIMAP_EnvelopeDate_UsesDateHeaderNotInternalDate(t *testing.T) {
 			t.Errorf("REGRESSION: ENVELOPE date %v does not match the Date: header %v (RFC 3501 §7.4.2)",
 				envDate, dateHeader)
 		}
+	}
+}
+
+// TestIMAP_EnvelopeAbsentDateIsNIL: a message without a Date: header has a NIL date
+// member in its ENVELOPE, however it reached the mailbox. RFC 9051 section 7.5.2: "If the
+// Date, Subject, In-Reply-To, and Message-ID header fields are absent in the [RFC5322]
+// header, the corresponding member of the envelope is NIL". Before the fix the APPEND
+// time was reported as the Date: header.
+func TestIMAP_EnvelopeAbsentDateIsNIL(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	rc := dialRaw(t, server.Address)
+	defer rc.conn.Close()
+	rc.login(account)
+
+	rc.append("a1", "INBOX", "From: alice@example.com\r\nTo: bob@example.com\r\nSubject: no date\r\n\r\nbody\r\n")
+	rc.append("a2", "INBOX", "From: alice@example.com\r\nTo: bob@example.com\r\nSubject: dated\r\nDate: Thu, 02 Jan 2020 03:04:05 -0800\r\n\r\nbody\r\n")
+	for _, name := range []string{"Copied", "Moved"} {
+		_, tagged := rc.cmd("c", "CREATE "+name)
+		require.Contains(t, tagged, "OK")
+	}
+	_, tagged := rc.cmd("s", "SELECT INBOX")
+	require.Contains(t, tagged, "OK")
+
+	untagged, tagged := rc.cmd("f", "FETCH 1:2 (ENVELOPE)")
+	require.Contains(t, tagged, "OK")
+	require.Len(t, untagged, 2, "one FETCH response per message: %v", untagged)
+	require.Contains(t, untagged[0], `(ENVELOPE (NIL "no date" `,
+		"the date member must be NIL for a message without a Date: header: %s", untagged[0])
+	require.Contains(t, untagged[1], `(ENVELOPE ("`, "a Date: header is reported: %s", untagged[1])
+	require.Contains(t, untagged[1], `Jan 2020`, "a Date: header is reported: %s", untagged[1])
+
+	_, tagged = rc.cmd("cp", "COPY 1 Copied")
+	require.Contains(t, tagged, "OK")
+	_, tagged = rc.cmd("mv", "MOVE 1 Moved")
+	require.Contains(t, tagged, "OK")
+
+	for _, name := range []string{"Copied", "Moved"} {
+		_, tagged := rc.cmd("s", "SELECT "+name)
+		require.Contains(t, tagged, "OK")
+		untagged, tagged := rc.cmd("f", "FETCH 1 (ENVELOPE)")
+		require.Contains(t, tagged, "OK")
+		require.Len(t, untagged, 1, "%s: %v", name, untagged)
+		require.Contains(t, untagged[0], `(ENVELOPE (NIL "no date" `,
+			"%s: the date member must stay NIL: %s", name, untagged[0])
 	}
 }

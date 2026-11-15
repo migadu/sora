@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -272,29 +273,35 @@ func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options Server
 		errChan <- fmt.Errorf("failed to create HTTP Mail API server: %w", err)
 		return nil
 	}
-
-	protocol := "HTTP"
-	if options.TLS {
-		protocol = "HTTPS"
-	}
-	serverName := options.Name
-	if serverName == "" {
-		serverName = "default"
-	}
-	logger.Info("HTTP Mail API: Starting server", "name", serverName, "protocol", protocol, "addr", options.Addr)
 	go func() {
-		if err := server.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
+		if err := server.Run(ctx); err != nil && ctx.Err() == nil {
 			errChan <- fmt.Errorf("HTTP Mail API server failed: %w", err)
 		}
 	}()
 	return server
 }
 
-// start initializes and starts the HTTP server
-func (s *Server) start(ctx context.Context) error {
+// Run starts the HTTP Mail API server and blocks until it stops. It returns nil
+// when stopped via ctx cancellation.
+func (s *Server) Run(ctx context.Context) error {
+	defer server.UnregisterRateLimiter("userapi", s.name)
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	protocol := "HTTP"
+	if s.tls {
+		protocol = "HTTPS"
+	}
+	serverName := s.name
+	if serverName == "" {
+		serverName = "default"
+	}
+	logger.Info("HTTP Mail API: Starting server", "name", serverName, "protocol", protocol, "addr", s.addr)
+
 	router := s.SetupRoutes()
 
-	s.server = &http.Server{
+	httpServer := &http.Server{
 		Addr:              s.addr,
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second, // slowloris-on-headers defense
@@ -302,15 +309,31 @@ func (s *Server) start(ctx context.Context) error {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	if s.tls {
+		httpServer.TLSConfig = s.tlsConfig
+	}
+	s.server = httpServer
+
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	stopCtx, stopCancel := context.WithCancel(ctx)
+	defer stopCancel()
 
 	// Graceful shutdown
+	shutdownDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
+		defer close(shutdownDone)
+		<-stopCtx.Done()
+		if ctx.Err() == nil {
+			return
+		}
 		logger.Info("HTTP Mail API: Shutting down server...", "name", s.name)
 		server.UnregisterRateLimiter("userapi", s.name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if err := s.server.Shutdown(shutdownCtx); err != nil {
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			logger.Warn("HTTP Mail API: Error shutting down server", "name", s.name, "error", err)
 		}
 	}()
@@ -318,6 +341,8 @@ func (s *Server) start(ctx context.Context) error {
 	// Create listener
 	listener, err := net.Listen("tcp", s.addr)
 	if err != nil {
+		stopCancel()
+		<-shutdownDone
 		return fmt.Errorf("failed to create listener: %w", err)
 	}
 
@@ -336,13 +361,26 @@ func (s *Server) start(ctx context.Context) error {
 		listener = netutil.LimitListener(listener, s.maxConnections)
 	}
 
+	if ctx.Err() != nil {
+		listener.Close()
+		<-shutdownDone
+		return nil
+	}
+
 	// Start server with or without TLS. The certificate is in TLSConfig
 	// already, from the global [tls] manager or the certificate files.
 	if s.tls {
-		s.server.TLSConfig = s.tlsConfig
-		return s.server.ServeTLS(listener, "", "")
+		err = httpServer.ServeTLS(listener, "", "")
+	} else {
+		err = httpServer.Serve(listener)
 	}
-	return s.server.Serve(listener)
+	if errors.Is(err, http.ErrServerClosed) && ctx.Err() != nil {
+		<-shutdownDone
+		return nil
+	}
+	stopCancel()
+	<-shutdownDone
+	return err
 }
 
 // SetupRoutes configures all HTTP routes and middleware

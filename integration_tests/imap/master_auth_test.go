@@ -288,22 +288,21 @@ func TestIMAP_MasterAuthenticationPriority(t *testing.T) {
 	server, account := setupIMAPServerWithMasterAuth(t)
 	defer server.Close()
 
-	t.Run("Master username overrides regular auth", func(t *testing.T) {
+	t.Run("Account password under the master username suffix is the account's own login", func(t *testing.T) {
 		c, err := imapclient.DialInsecure(server.Address, nil)
 		if err != nil {
 			t.Fatalf("Failed to dial IMAP server: %v", err)
 		}
 		defer c.Logout()
 
-		// Even if we provide the account's real password, master username should use master password
+		// The master username form without the master password is the account's
+		// own login, as under any other suffix (#949): refused there alone, it
+		// confirmed the master username to any account holder.
 		loginUsername := account.Email + "@" + masterUsername
-
-		// This should fail because we're using the account password instead of master password
-		err = c.Login(loginUsername, account.Password).Wait()
-		if err == nil {
-			t.Fatal("Expected login to fail when using account password with master username suffix")
+		if err := c.Login(loginUsername, account.Password).Wait(); err != nil {
+			t.Fatalf("account password under the master username suffix: %v, want the account's own login", err)
 		}
-		t.Log("✓ Correctly rejected account password when master username suffix is present")
+		t.Log("✓ Account password under the master username suffix logs in as the account")
 	})
 
 	t.Run("Regular auth still works without suffix", func(t *testing.T) {

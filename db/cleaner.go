@@ -674,6 +674,16 @@ func (d *Database) PruneOldMessageVectors(ctx context.Context, tx pgx.Tx, retent
 // Account deletion previously had no way to reach this data at all: the rows were only ever
 // reclaimed by the orphan sweep, which has to scan the whole table to find them. The
 // per-account index makes the direct delete possible.
+//
+// A row of this account may be what another account's row of the same body waits for: a
+// copy into another account (restageFTS) and a delivery of a body already indexed (stageFTS)
+// stage no text, and the FTS worker fills them from a sibling. Before deleting, the batch
+// hands those rows the data (fillWaitingFTSRows) under the bodies' exclusive orphan-sweep
+// locks, as DeleteMessagesFTSByKeyBatch does. A body that a delivery or COPY is staging right
+// now, holding its lock shared, is left to a later batch: its waiting row is not visible yet.
+// The locks are tried, never waited for, so this cannot deadlock with a COPY that takes the
+// shared locks of several bodies in another order. FinalizeAccountDeletions keeps an account
+// until this has removed every row.
 func (d *Database) DeleteFTSRowsForAccount(ctx context.Context, tx pgx.Tx, accountID int64, limit int) (int64, error) {
 	// The caller found the account on the read pool, possibly a while ago. The rows are
 	// the only copy of the account's search data (text_body is nulled once vectorised),
@@ -692,17 +702,48 @@ func (d *Database) DeleteFTSRowsForAccount(ctx context.Context, tx pgx.Tx, accou
 		return 0, nil
 	}
 
-	tag, err := tx.Exec(ctx, `
-		WITH doomed AS (
-			SELECT ctid FROM messages_fts_v2
+	// Bound the candidates first so at most limit advisory locks are taken (see the lock
+	// table note on DeleteMessagesFTSByKeyBatch), and acquire the advisory locks BEFORE
+	// locking messages_fts_v2 rows FOR UPDATE: locking the rows first would retain heap
+	// tuple locks on skipped hashes and deadlock with another drain's fillWaitingFTSRows.
+	// A row the FTS worker holds is skipped, as is a body whose lock is held; both are
+	// retried by a later batch.
+	rows, err := tx.Query(ctx, `
+		WITH candidates AS MATERIALIZED (
+			SELECT content_hash
+			FROM messages_fts_v2
 			WHERE account_id = $1
 			ORDER BY content_hash
-			FOR UPDATE SKIP LOCKED
 			LIMIT $2
+		),
+		locked_hashes AS MATERIALIZED (
+			SELECT content_hash
+			FROM candidates
+			WHERE pg_try_advisory_xact_lock($3, hashtext(content_hash))
 		)
-		DELETE FROM messages_fts_v2
-		WHERE ctid IN (SELECT ctid FROM doomed)
-	`, accountID, limit)
+		SELECT v.content_hash
+		FROM messages_fts_v2 v
+		JOIN locked_hashes l ON v.content_hash = l.content_hash
+		WHERE v.account_id = $1
+		ORDER BY v.content_hash
+		FOR UPDATE OF v SKIP LOCKED
+	`, accountID, limit, consts.SoraFTSOrphanSweepLockClassID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to lock fts rows for account %d: %w", accountID, err)
+	}
+	hashes, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return 0, fmt.Errorf("failed to read fts rows for account %d: %w", accountID, err)
+	}
+	if len(hashes) == 0 {
+		return 0, nil
+	}
+
+	if err := fillWaitingFTSRows(ctx, tx, hashes); err != nil {
+		return 0, err
+	}
+
+	tag, err := tx.Exec(ctx, `DELETE FROM messages_fts_v2 WHERE account_id = $1 AND content_hash = ANY($2)`, accountID, hashes)
 	if err != nil {
 		return 0, fmt.Errorf("failed to delete fts rows for account %d: %w", accountID, err)
 	}
@@ -830,8 +871,12 @@ func (d *Database) GetUnusedFTSKeys(ctx context.Context, after FTSKey, limit int
 //     per content_hash and locks the candidate rows (FOR UPDATE OF v SKIP LOCKED). If a
 //     delivery transaction is currently staging that hash, it holds a shared advisory lock,
 //     so the sweep skips it.
-//  2. Statement 2 runs in a new statement snapshot, re-checks ftsKeyReferencedSQL, and
-//     deletes unreferenced rows. Any delivery arriving after statement 1 waits on the
+//  2. The rows of other accounts that wait for these bodies' vectors are filled
+//     (fillWaitingFTSRows): the orphan may be the only row they can be filled from. Once
+//     an account's last message with a body is gone, the copies of that body other
+//     accounts received from it can still be waiting for the FTS worker.
+//  3. The last statement runs in a new statement snapshot, re-checks ftsKeyReferencedSQL,
+//     and deletes unreferenced rows. Any delivery arriving after statement 1 waits on the
 //     shared advisory lock until this transaction commits, ensuring its subsequent v2
 //     insert snapshot sees the deletion and inserts fresh.
 //
@@ -884,6 +929,10 @@ func (d *Database) DeleteMessagesFTSByKeyBatch(ctx context.Context, tx pgx.Tx, k
 
 	if len(lockedHashes) == 0 {
 		return 0, nil
+	}
+
+	if err := fillWaitingFTSRows(ctx, tx, lockedHashes); err != nil {
+		return 0, err
 	}
 
 	tag, err := tx.Exec(ctx, `
@@ -1207,9 +1256,15 @@ func (d *Database) FinalizeAccountDeletions(ctx context.Context, tx pgx.Tx, acco
 	// must not be finalized; and the scan may have read a lagging replica, in which case
 	// an account that still holds rows would fail the whole batch and be picked again
 	// next cycle. Only the ids that pass go on; the caller reports the rest.
+	//
+	// The account's FTS rows must be gone too. Only DeleteFTSRowsForAccount removes them,
+	// because one may be the row another account's copy of the body waits for, and the
+	// drain first hands that copy its data. This used to delete whatever rows the drain had
+	// left; an account the drain did not finish now waits for the next drain.
 	rows, err := tx.Query(ctx, `
 		SELECT a.id FROM accounts a
 		WHERE a.id = ANY($1) AND `+accountFinalizableSQL("a")+`
+		  AND NOT EXISTS (SELECT 1 FROM messages_fts_v2 WHERE account_id = a.id)
 		FOR UPDATE`, accountIDs)
 	if err != nil {
 		return 0, fmt.Errorf("failed to lock accounts for finalization: %w", err)
@@ -1235,17 +1290,6 @@ func (d *Database) FinalizeAccountDeletions(ctx context.Context, tx pgx.Tx, acco
 	_, err = tx.Exec(ctx, "DELETE FROM credentials WHERE account_id = ANY($1)", confirmed)
 	if err != nil {
 		return 0, fmt.Errorf("failed to batch delete credentials during finalization: %w", err)
-	}
-
-	// The account's FTS rows. By this point every messages row of the account is gone
-	// (the DELETE below is guarded by ON DELETE RESTRICT on messages), so these pairs are
-	// orphans by definition and deleting them here needs no re-validation.
-	//
-	// The orphan sweep would eventually find them anyway, but only by scanning the whole
-	// table in bounded windows, so on a large deployment they would linger for many cycles.
-	// This is bounded work on an index the account leads.
-	if _, err = tx.Exec(ctx, "DELETE FROM messages_fts_v2 WHERE account_id = ANY($1)", confirmed); err != nil {
-		return 0, fmt.Errorf("failed to batch delete fts rows during finalization: %w", err)
 	}
 
 	// Finally, delete the accounts themselves.
@@ -1282,7 +1326,7 @@ func (d *Database) GetMessagesForMailboxAndChildren(ctx context.Context, account
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart,
 			m.uploaded, ms.flags, ms.custom_flags, m.internal_date, m.size,
 			m.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
@@ -1334,7 +1378,7 @@ func (d *Database) GetMessagesForAccount(ctx context.Context, accountID int64) (
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart,
 			m.uploaded, ms.flags, ms.custom_flags, m.internal_date, m.size,
 			m.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.account_id = $1

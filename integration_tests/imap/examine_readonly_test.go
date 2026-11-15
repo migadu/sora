@@ -3,7 +3,11 @@
 package imap_test
 
 import (
+	"fmt"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	imap "github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapclient"
@@ -178,5 +182,179 @@ func TestIMAP_Examine_Close_Succeeds(t *testing.T) {
 	}
 	if sd.NumMessages != 1 {
 		t.Errorf("CLOSE after SELECT should have expunged the \\Deleted message: NumMessages = %d, want 1", sd.NumMessages)
+	}
+}
+
+// TestIMAP_Examine_FetchDoesNotSetSeen: RFC 9051 §6.3.3 says of a mailbox
+// opened with EXAMINE: "No changes to the permanent state of the mailbox,
+// including per-user state, are permitted." FETCH BODY[] and BINARY[], which
+// set \Seen in a read-write mailbox (§6.4.5), leave it alone there (#1041).
+func TestIMAP_Examine_FetchDoesNotSetSeen(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("login failed: %v", err)
+	}
+	for range 2 {
+		appendCmd := c.Append("INBOX", int64(len(binaryFetchTestMessage)), nil)
+		if _, err := appendCmd.Write([]byte(binaryFetchTestMessage)); err != nil {
+			t.Fatalf("APPEND write failed: %v", err)
+		}
+		if err := appendCmd.Close(); err != nil {
+			t.Fatalf("APPEND close failed: %v", err)
+		}
+		if _, err := appendCmd.Wait(); err != nil {
+			t.Fatalf("APPEND failed: %v", err)
+		}
+	}
+
+	if _, err := c.Select("INBOX", &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
+		t.Fatalf("EXAMINE failed: %v", err)
+	}
+	bodySection := &imap.FetchItemBodySection{}
+	binarySection := &imap.FetchItemBinarySection{Part: []int{1}}
+	for _, tc := range []struct {
+		name  string
+		seq   uint32
+		fetch *imap.FetchOptions
+		data  func(*imapclient.FetchMessageBuffer) []byte
+		want  string
+	}{
+		{"BODY[]", 1, &imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{bodySection}},
+			func(m *imapclient.FetchMessageBuffer) []byte { return m.FindBodySection(bodySection) }, binaryFetchTestMessage},
+		{"BINARY[1]", 2, &imap.FetchOptions{BinarySection: []*imap.FetchItemBinarySection{binarySection}},
+			func(m *imapclient.FetchMessageBuffer) []byte { return m.FindBinarySection(binarySection) }, "hello world"},
+	} {
+		msgs, err := c.Fetch(imap.SeqSetNum(tc.seq), tc.fetch).Collect()
+		if err != nil {
+			t.Fatalf("FETCH %d (%s) after EXAMINE failed: %v", tc.seq, tc.name, err)
+		}
+		// The FETCH still returns the data, and reports no flag change.
+		if len(msgs) != 1 {
+			t.Fatalf("FETCH %d (%s) after EXAMINE: got %d messages, want 1", tc.seq, tc.name, len(msgs))
+		}
+		if got := string(tc.data(msgs[0])); got != tc.want {
+			t.Errorf("FETCH %d (%s) after EXAMINE returned %q, want %q", tc.seq, tc.name, got, tc.want)
+		}
+		if slices.Contains(msgs[0].Flags, imap.FlagSeen) {
+			t.Errorf("FETCH %d (%s) after EXAMINE reported FLAGS %v", tc.seq, tc.name, msgs[0].Flags)
+		}
+	}
+
+	// A read-write SELECT shows what the EXAMINE session left behind.
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("SELECT failed: %v", err)
+	}
+	msgs, err := c.Fetch(imap.SeqSetNum(1, 2), &imap.FetchOptions{Flags: true}).Collect()
+	if err != nil {
+		t.Fatalf("FETCH FLAGS failed: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("FETCH 1:2 (FLAGS): got %d messages, want 2", len(msgs))
+	}
+	for _, msg := range msgs {
+		if slices.Contains(msg.Flags, imap.FlagSeen) {
+			t.Errorf("message %d is \\Seen after a FETCH in a mailbox opened with EXAMINE", msg.SeqNum)
+		}
+	}
+}
+
+// TestIMAP_Examine_NotifyMessageNewDoesNotSetSeen: NOTIFY's MessageNew
+// fetch-att list (RFC 5465 §5.2) is answered through FETCH, so a BODY[] there
+// must not set \Seen in a mailbox opened with EXAMINE either (RFC 9051 §6.3.3).
+func TestIMAP_Examine_NotifyMessageNewDoesNotSetSeen(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+	login := fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password)
+
+	watcher := dialRawIMAP(t, server.Address)
+	watcher.do(login)
+	watcher.do("EXAMINE INBOX")
+	watcher.do("NOTIFY SET (SELECTED (MessageNew (UID BODY[]) MessageExpunge))")
+
+	other := dialRawIMAP(t, server.Address)
+	other.do(login)
+	other.appendMsg("INBOX", binaryFetchTestMessage)
+
+	// The NOTIFY pump delivers asynchronously; NOOP collects what arrived.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		untagged, _ := watcher.do("NOOP")
+		if resp := strings.Join(untagged, "\r\n"); strings.Contains(resp, "BODY[]") {
+			if seenFlagsRe.MatchString(resp) {
+				t.Errorf("NOTIFY MessageNew FETCH after EXAMINE reported \\Seen:\n%s", resp)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timeout waiting for the NOTIFY MessageNew FETCH (BODY[])")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	other.do("SELECT INBOX")
+	if untagged, _ := other.do("FETCH 1 (FLAGS)"); seenFlagsRe.MatchString(strings.Join(untagged, "\r\n")) {
+		t.Errorf("NOTIFY MessageNew FETCH (BODY[]) set \\Seen in a mailbox opened with EXAMINE: %v", untagged)
+	}
+}
+
+// TestIMAP_Examine_ReadOnly_RejectsMove: RFC 9051 §6.3.3 permits "No changes to
+// the permanent state of the mailbox" opened with EXAMINE, and RFC 6851 §3.3
+// gives MOVE "the same effect for each message as this sequence: 1. [UID] COPY
+// 2. [UID] STORE +FLAGS.SILENT \DELETED 3. UID EXPUNGE", the last two of which
+// are refused after EXAMINE. MOVE and UID MOVE must be refused the same way and
+// leave the message in the source mailbox and out of the destination (#1058).
+func TestIMAP_Examine_ReadOnly_RejectsMove(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c := dialRawIMAP(t, server.Address)
+	c.do(fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password))
+	c.do("CREATE Other")
+	uid := c.appendMsg("INBOX", "From: a@example.com\r\nSubject: s\r\n\r\nbody\r\n")
+
+	if _, tagged := c.do("EXAMINE INBOX"); !strings.Contains(tagged, "OK [READ-ONLY]") {
+		t.Fatalf("EXAMINE INBOX: %s, want OK [READ-ONLY]", tagged)
+	}
+	for _, cmd := range []string{"MOVE 1 Other", fmt.Sprintf("UID MOVE %d Other", uid)} {
+		tag := c.send(cmd)
+		untagged, tagged := c.read(tag, cmd)
+		if !strings.HasPrefix(tagged, tag+" NO ") {
+			t.Errorf("%s after EXAMINE: %s, want a tagged NO", cmd, tagged)
+		}
+		for _, line := range untagged {
+			if strings.HasSuffix(line, " EXPUNGE") || strings.Contains(line, "COPYUID") {
+				t.Errorf("%s after EXAMINE answered %q", cmd, line)
+			}
+		}
+	}
+
+	// The message is still in INBOX and never reached Other.
+	if untagged, _ := c.do("STATUS Other (MESSAGES)"); !strings.Contains(strings.Join(untagged, "\r\n"), "(MESSAGES 0)") {
+		t.Errorf("STATUS Other after a refused MOVE: %v, want MESSAGES 0", untagged)
+	}
+	if untagged, _ := c.do("SELECT INBOX"); !slices.Contains(untagged, "* 1 EXISTS") {
+		t.Errorf("SELECT INBOX after a refused MOVE: %v, want * 1 EXISTS", untagged)
+	}
+
+	// The same MOVE in a read-write selection still moves the message.
+	if _, tagged := c.do("MOVE 1 Other"); !strings.Contains(tagged, "OK") {
+		t.Fatalf("MOVE after SELECT: %s", tagged)
+	}
+	if untagged, _ := c.do("STATUS Other (MESSAGES)"); !strings.Contains(strings.Join(untagged, "\r\n"), "(MESSAGES 1)") {
+		t.Errorf("STATUS Other after MOVE in a read-write selection: %v, want MESSAGES 1", untagged)
 	}
 }

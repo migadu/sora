@@ -92,9 +92,9 @@ Rules for `addr`:
 
 - It must be an **IP address literal** (IPv4 or IPv6) that exists on this host and that the other
   nodes can reach. Sora binds to it and advertises it unchanged.
-- `0.0.0.0`, `localhost`, an empty value and `::` are refused at startup with
-  `cluster addr '<value>' must be a specific IP address reachable from other nodes`. Host names fail
-  at startup inside memberlist (`failed to create memberlist: ...`).
+- `0.0.0.0`, `::`, `localhost`, a host name and an empty value are refused at startup, and by
+  `sora-admin config validate`, with
+  `cluster addr '<value>' must be a specific IP address reachable from other nodes, ...`.
 - `127.0.0.1` and `::1` are accepted with a warning. They only work when every node runs on the same
   machine.
 - The port can be written in `addr` (`"10.0.0.11:7946"`, or `"[2001:db8::11]:7946"` for IPv6) or in
@@ -163,7 +163,8 @@ openssl rand -base64 32
 
 A key that is not valid base64 stops startup with `failed to decode cluster secret_key: ...`. A key
 that does not decode to exactly 32 bytes stops startup with
-`cluster secret_key must be 32 bytes (got N bytes)`.
+`cluster secret_key must be 32 bytes (got N bytes)`. `sora-admin config validate` refuses the same
+keys, and a missing one.
 
 memberlist encrypts every packet with AES-256-GCM and drops anything it cannot decrypt. A node with
 a different key cannot join: it logs `Failed to join cluster peers`, then `Cluster: Retry join

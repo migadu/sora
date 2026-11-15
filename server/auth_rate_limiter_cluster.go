@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"encoding/gob"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/migadu/sora/cluster"
@@ -82,6 +84,16 @@ type ClusterRateLimiter struct {
 	unblocked gossipTombstones
 	succeeded gossipTombstones
 
+	// The cluster limiters of the protocol on this node, this one included:
+	// no gossip about this one's events reaches them
+	node *nodeRateLimiters
+
+	stopOnce              sync.Once
+	stopped               atomic.Bool
+	eventMu               sync.RWMutex
+	unregisterHandler     func()
+	unregisterBroadcaster func()
+
 	// Configuration
 	syncBlocks        bool
 	syncFailureCounts bool
@@ -110,10 +122,13 @@ func NewClusterRateLimiter(limiter *AuthRateLimiter, clusterMgr *cluster.Manager
 	crl.unblocked.maxEntries = limiter.config.MaxIPEntries
 
 	// Register with cluster manager to receive rate limit events
-	clusterMgr.RegisterRateLimitHandler(crl.HandleClusterEvent)
+	crl.unregisterHandler = clusterMgr.RegisterRateLimitHandler(crl.HandleClusterEvent)
 
 	// Register as broadcaster for outgoing events
-	clusterMgr.RegisterRateLimitBroadcaster(crl.GetBroadcasts)
+	crl.unregisterBroadcaster = clusterMgr.RegisterRateLimitBroadcaster(crl.GetBroadcasts)
+
+	crl.node = nodeRateLimitersOf(clusterMgr, limiter.protocol)
+	crl.node.join(crl)
 
 	logger.Info("CLUSTER-LIMITER: initialized cluster rate limiting", "protocol", limiter.protocol,
 		"sync_blocks", syncBlocks, "sync_failure_counts", syncFailureCounts)
@@ -123,9 +138,9 @@ func NewClusterRateLimiter(limiter *AuthRateLimiter, clusterMgr *cluster.Manager
 
 // JoinCluster makes the limiter share its IP blocks, progressive-delay failure
 // counts and username failures with the limiters of the same protocol on the
-// other cluster nodes, as [cluster.rate_limit_sync] configures. It does nothing
-// on a disabled (nil) limiter, without a cluster manager, or with sync disabled.
-// Call it before the limiter records its first attempt.
+// other cluster nodes and on this one, as [cluster.rate_limit_sync] configures.
+// It does nothing on a disabled (nil) limiter, without a cluster manager, or
+// with sync disabled. Call it before the limiter records its first attempt.
 func (a *AuthRateLimiter) JoinCluster(clusterMgr *cluster.Manager, sync config.ClusterRateLimitSyncConfig) {
 	if a == nil || clusterMgr == nil || !sync.Enabled {
 		return
@@ -213,12 +228,22 @@ func (crl *ClusterRateLimiter) BroadcastUsernameSuccess(username string) {
 	crl.queueEvent(event)
 }
 
-// queueEvent encodes an event and hands it to the gossip queue
+// queueEvent hands an event this limiter recorded to the protocol's other
+// limiters on this node, then encodes it for the gossip queue, which carries it
+// to every other node's. The caller holds none of the limiter's locks: another
+// limiter of the protocol on this node may be handing it an event of its own.
 func (crl *ClusterRateLimiter) queueEvent(event RateLimitEvent) {
+	if crl == nil || crl.stopped.Load() {
+		return
+	}
 	if event.EventID == "" {
 		event.EventID = idgen.New()
 	}
 	event.Protocol = crl.limiter.protocol
+
+	if crl.node != nil {
+		crl.node.deliver(crl, event)
+	}
 
 	encoded, err := encodeRateLimitEvent(event)
 	if err != nil {
@@ -240,18 +265,25 @@ func (crl *ClusterRateLimiter) queueEvent(event RateLimitEvent) {
 // first, within half of the datagram so a burst of them cannot stall the
 // failure counts behind it.
 func (crl *ClusterRateLimiter) GetBroadcasts(overhead, limit int) [][]byte {
+	if crl == nil || crl.stopped.Load() {
+		return nil
+	}
 	return drainTiers(nil, crl.blocks, crl.queue, overhead, limit)
 }
 
 // HandleClusterEvent processes a rate limit event from another node
 func (crl *ClusterRateLimiter) HandleClusterEvent(data []byte) {
+	if crl == nil || crl.stopped.Load() {
+		return
+	}
 	event, err := decodeRateLimitEvent(data)
 	if err != nil {
 		logger.Warn("Cluster limiter: Failed to decode rate limit event", "error", err)
 		return
 	}
 
-	// Skip events from this node (we already applied them locally)
+	// Skip events from this node: its limiters of the protocol applied them
+	// when they were recorded (queueEvent)
 	if event.NodeID == crl.clusterManager.GetNodeID() {
 		return
 	}
@@ -282,6 +314,20 @@ func (crl *ClusterRateLimiter) HandleClusterEvent(data []byte) {
 	// build that keyed them as given may spell this one another way.
 	event.IP = clientIPOf(event.IP)
 
+	crl.apply(event)
+}
+
+// apply applies an event another limiter of the protocol recorded, on another
+// node or on this one.
+func (crl *ClusterRateLimiter) apply(event RateLimitEvent) {
+	if crl == nil || crl.stopped.Load() {
+		return
+	}
+	crl.eventMu.RLock()
+	defer crl.eventMu.RUnlock()
+	if crl.stopped.Load() {
+		return
+	}
 	switch event.Type {
 	case RateLimitEventBlockIP:
 		crl.handleBlockIP(event)
@@ -519,9 +565,89 @@ func (crl *ClusterRateLimiter) handleUsernameSuccess(event RateLimitEvent) {
 		"username", event.Username, "from_node", event.NodeID)
 }
 
-// Stop releases the cluster rate limiter. It owns no goroutine - memberlist
-// drives the queue - but callers shut it down alongside the other components.
-func (crl *ClusterRateLimiter) Stop() {}
+// nodeRateLimiters lists the cluster rate limiters of one protocol on one node.
+// A limiter's events reach every other node's limiters of the protocol over
+// gossip, but memberlist delivers no broadcast back to the node that sent it, so
+// the protocol's other limiters on its own node (an IMAP proxy on 143 and one on
+// 993) are handed each event from here, and apply it as a peer's limiters do.
+type nodeRateLimiters struct {
+	mu       sync.RWMutex
+	limiters []*ClusterRateLimiter
+}
+
+// nodeRateLimitersOf returns the cluster rate limiters of protocol on the node
+// of clusterMgr.
+func nodeRateLimitersOf(clusterMgr *cluster.Manager, protocol string) *nodeRateLimiters {
+	return clusterMgr.Shared("rate-limiters:"+protocol, func() any {
+		return &nodeRateLimiters{}
+	}).(*nodeRateLimiters)
+}
+
+func (n *nodeRateLimiters) join(crl *ClusterRateLimiter) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.limiters = append(n.limiters, crl)
+}
+
+func (n *nodeRateLimiters) leave(target *ClusterRateLimiter) {
+	if n == nil || target == nil {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	remaining := make([]*ClusterRateLimiter, 0, len(n.limiters))
+	removed := false
+	for _, crl := range n.limiters {
+		if crl == target {
+			removed = true
+			continue
+		}
+		remaining = append(remaining, crl)
+	}
+	if removed {
+		n.limiters = remaining
+	}
+}
+
+// deliver applies event, recorded by from, to the node's other limiters of the
+// protocol. Delivery is direct and happens once, so it needs neither the
+// duplicate suppression nor the staleness check of gossip.
+func (n *nodeRateLimiters) deliver(from *ClusterRateLimiter, event RateLimitEvent) {
+	n.mu.RLock()
+	limiters := n.limiters
+	n.mu.RUnlock()
+
+	for _, crl := range limiters {
+		if crl != from {
+			crl.apply(event)
+		}
+	}
+}
+
+// Stop detaches the cluster rate limiter from the node's sibling group and
+// stops applying events. It is safe to call multiple times.
+func (crl *ClusterRateLimiter) Stop() {
+	if crl == nil {
+		return
+	}
+	crl.stopOnce.Do(func() {
+		crl.stopped.Store(true)
+		if crl.node != nil {
+			crl.node.leave(crl)
+		}
+		if crl.unregisterHandler != nil {
+			crl.unregisterHandler()
+		}
+		if crl.unregisterBroadcaster != nil {
+			crl.unregisterBroadcaster()
+		}
+		// A sibling may already hold a delivery snapshot. Its active apply
+		// finishes before Stop returns; later ones see stopped and do nothing.
+		crl.eventMu.Lock()
+		crl.eventMu.Unlock()
+	})
+}
 
 // encodeRateLimitEvent encodes an event to bytes using gob
 func encodeRateLimitEvent(event RateLimitEvent) ([]byte, error) {

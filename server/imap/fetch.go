@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/migadu/go-imap"
@@ -104,26 +105,28 @@ func applyPartial(b []byte, partial *imap.SectionPartial) []byte {
 	return b[partial.Offset:end]
 }
 
-// safeExtractBinarySection wraps imapserver.ExtractBinarySection with panic recovery.
-func safeExtractBinarySection(bodyData []byte, section *imap.FetchItemBinarySection) []byte {
+// safeDecodeBinarySection wraps imapserver.DecodeBinarySection with panic recovery.
+func safeDecodeBinarySection(bodyData []byte, section *imap.FetchItemBinarySection) (buf []byte, err error) {
 	defer func() {
 		if recover() != nil {
 			// MIME parser panicked - return empty
+			buf, err = nil, nil
 		}
 	}()
 
-	return imapserver.ExtractBinarySection(bytes.NewReader(bodyData), section)
+	return imapserver.DecodeBinarySection(bytes.NewReader(bodyData), section)
 }
 
-// safeExtractBinarySectionSize wraps imapserver.ExtractBinarySectionSize with panic recovery.
-func safeExtractBinarySectionSize(bodyData []byte, section *imap.FetchItemBinarySectionSize) uint32 {
+// safeDecodeBinarySectionSize wraps imapserver.DecodeBinarySectionSize with panic recovery.
+func safeDecodeBinarySectionSize(bodyData []byte, section *imap.FetchItemBinarySectionSize) (n uint32, err error) {
 	defer func() {
 		if recover() != nil {
 			// MIME parser panicked - return 0
+			n, err = 0, nil
 		}
 	}()
 
-	return imapserver.ExtractBinarySectionSize(bytes.NewReader(bodyData), section)
+	return imapserver.DecodeBinarySectionSize(bytes.NewReader(bodyData), section)
 }
 
 // requireFetchBinary refuses the BINARY, BINARY.PEEK and BINARY.SIZE items of
@@ -168,6 +171,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 	// First, safely read necessary session state and decode the sequence numbers all within a single read lock
 	var selectedMailboxID int64
 	var selectedMailboxOwnerID int64
+	var selectedExamined bool
 	var sessionTrackerSnapshot *imapserver.SessionTracker
 	var decodedNumSet imap.NumSet
 
@@ -197,6 +201,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 
 	selectedMailboxID = s.selectedMailbox.ID
 	selectedMailboxOwnerID = s.selectedMailbox.AccountID
+	selectedExamined = s.selectedExamined.Load()
 	sessionTrackerSnapshot = s.sessionTracker
 
 	// Capture modseq before unlocking
@@ -261,16 +266,17 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 		}
 	}
 
-	// Determine if this FETCH implicitly marks messages as \Seen (any non-PEEK body section)
-	markSeen := false
-	for _, bs := range options.BodySection {
-		if !bs.Peek {
-			markSeen = true
-			break
-		}
-	}
+	// Determine if this FETCH implicitly marks messages as \Seen: any BODY[] or
+	// BINARY[] that is not the .PEEK form (RFC 9051 §6.4.5). Not in a mailbox
+	// opened with EXAMINE, where "No changes to the permanent state of the
+	// mailbox, including per-user state, are permitted" (RFC 9051 §6.3.3). A
+	// SELECT that the ACL made read-only is not EXAMINE (RFC 9051 §6.3.2); the
+	// 's' right below decides there.
+	markSeen := !selectedExamined &&
+		(slices.ContainsFunc(options.BodySection, func(bs *imap.FetchItemBodySection) bool { return !bs.Peek }) ||
+			slices.ContainsFunc(options.BinarySection, func(bs *imap.FetchItemBinarySection) bool { return !bs.Peek }))
 
-	// RFC 4314 §5.1.1: a FETCH that would implicitly set \Seen MUST NOT do so when the
+	// RFC 4314 §4: a FETCH that would implicitly set \Seen MUST NOT do so when the
 	// user lacks the 's' right on the mailbox. The owner always holds every right, so
 	// only shared-mailbox grantees incur the permission check. Fail closed (suppress the
 	// implicit \Seen) if the check itself errors.
@@ -310,8 +316,9 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			writeErr = err
 			return err
 		}
-		// CONDSTORE functionality - only process if capability is enabled
-		if s.GetCapabilities().Has(imap.CapCondStore) && options.ChangedSince > 0 {
+		// The parser accepted CHANGEDSINCE only if the session offers
+		// CONDSTORE, so the request alone gates it here.
+		if options.ChangedSince > 0 {
 			s.DebugLog("CONDSTORE FETCH with CHANGEDSINCE", "changed_since", options.ChangedSince)
 			var filteredMessages []db.Message
 
@@ -342,41 +349,16 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			return nil
 		}
 
+		var seenChanged map[imap.UID]bool
 		if markSeen {
-			var uidsToMarkSeen []imap.UID
-			for _, msg := range messages {
-				seen := false
-				systemFlags, _ := db.SplitFlags(db.BitwiseToFlags(msg.BitwiseFlags))
-				for _, flag := range systemFlags {
-					if flag == imap.FlagSeen {
-						seen = true
-						break
-					}
-				}
-				if !seen {
-					uidsToMarkSeen = append(uidsToMarkSeen, msg.UID)
-				}
-			}
-
+			uidsToMarkSeen := unseenMessageUIDs(messages)
 			if len(uidsToMarkSeen) > 0 {
-				_, err := s.server.rdb.AddMessageFlagsBatchWithRetry(ctx, uidsToMarkSeen, selectedMailboxID, []imap.Flag{imap.FlagSeen})
+				batchResults, err := s.server.rdb.AddMessageFlagsBatchWithRetry(ctx, uidsToMarkSeen, selectedMailboxID, []imap.Flag{imap.FlagSeen})
 				if err != nil {
 					s.DebugLog("failed to batch mark messages as seen", "error", err)
 				} else {
-					// Update in-memory models immediately so the fetch response has the flag
-					for i := range messages {
-						seen := false
-						flags := db.BitwiseToFlags(messages[i].BitwiseFlags)
-						for _, f := range flags {
-							if f == imap.FlagSeen {
-								seen = true
-								break
-							}
-						}
-						if !seen {
-							messages[i].BitwiseFlags = db.FlagsToBitwise(append(flags, imap.FlagSeen))
-						}
-					}
+					s.useMasterDB.Store(true)
+					seenChanged = applyImplicitSeenUpdates(messages, batchResults)
 				}
 			}
 		}
@@ -391,7 +373,8 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			if s.IMAPUser != nil {
 				metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
 			}
-			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID, preview); err != nil {
+			msgOptions := s.fetchOptionsForImplicitSeen(options, seenChanged[msg.UID])
+			if err := s.writeMessageFetchData(ctx, w, &msg, msgOptions, selectedMailboxID, preview); err != nil {
 				writeErr = err
 				return err
 			}
@@ -454,6 +437,33 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 
 	// Removed individual markSeen logic here because it is now batched before iteration.
 
+	// Declare bodyData and a flag to track if it has been fetched.
+	// These will be passed by pointer to handlers so they can lazily load it once if needed.
+	var bodyData []byte
+	var bodyDataFetched bool
+
+	// Defer memory cleanup for this message's body data
+	defer func() {
+		if bodyDataFetched && bodyData != nil && s.memTracker != nil {
+			s.memTracker.Free(int64(len(bodyData)))
+		}
+	}()
+
+	// BINARY and BINARY.SIZE are decoded before the message's FETCH response
+	// is opened: a section whose Content-Transfer-Encoding cannot be decoded
+	// fails the command with NO [UNKNOWN-CTE] (RFC 9051 §7.5.2), which must not
+	// leave a partial response, possibly an empty "* n FETCH ()", behind it.
+	// Fetch has refused the items up front unless the session offers them,
+	// through BINARY or IMAP4rev2.
+	var binary *decodedBinary
+	if len(options.BinarySection) > 0 || len(options.BinarySectionSize) > 0 {
+		var err error
+		if binary, err = s.decodeBinary(ctx, &bodyData, &bodyDataFetched, options, msg); err != nil {
+			return err
+		}
+		defer s.freeSectionCopies(binary.charged)
+	}
+
 	m := w.CreateMessage(seqNum)
 	if m == nil {
 		// This indicates an issue with the imapserver library or FetchWriter.
@@ -513,37 +523,15 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 		}
 	}
 
-	// Declare bodyData and a flag to track if it has been fetched.
-	// These will be passed by pointer to handlers so they can lazily load it once if needed.
-	var bodyData []byte
-	var bodyDataFetched bool
-
-	// Defer memory cleanup for this message's body data
-	defer func() {
-		if bodyDataFetched && bodyData != nil && s.memTracker != nil {
-			s.memTracker.Free(int64(len(bodyData)))
+	if len(options.BodySection) > 0 {
+		if err := s.handleBodySections(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
+			return err
 		}
-	}()
+	}
 
-	if len(options.BodySection) > 0 || len(options.BinarySection) > 0 || len(options.BinarySectionSize) > 0 {
-		if len(options.BodySection) > 0 {
-			if err := s.handleBodySections(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
-				return err
-			}
-		}
-
-		// Fetch has refused the BINARY items up front unless the session
-		// offers them, through BINARY or IMAP4rev2.
-		if len(options.BinarySection) > 0 {
-			if err := s.handleBinarySections(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
-				return err
-			}
-		}
-
-		if len(options.BinarySectionSize) > 0 {
-			if err := s.handleBinarySectionSize(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
-				return err
-			}
+	if binary != nil {
+		if err := writeDecodedBinary(m, options, binary); err != nil {
+			return err
 		}
 	}
 
@@ -553,7 +541,10 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 		s.writePreview(ctx, m, msg, options.Preview.Lazy, preview, &bodyData, &bodyDataFetched)
 	}
 
-	if s.GetCapabilities().Has(imap.CapCondStore) && options.ModSeq {
+	// Likewise MODSEQ, and CHANGEDSINCE, which implies it: the parser accepted
+	// them only if the session offers CONDSTORE. Requesting MODSEQ also makes
+	// the client CONDSTORE-aware, so a later capability filter preserves it.
+	if options.ModSeq {
 		var highestModSeq int64
 		highestModSeq = msg.CreatedModSeq
 
@@ -660,35 +651,80 @@ func (s *IMAPSession) ensureBodyDataLoaded(ctx context.Context, msg *db.Message,
 	return nil
 }
 
-func (s *IMAPSession) handleBinarySections(ctx context.Context, w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
+// decodedBinary is a message's BINARY sections and BINARY.SIZE values, in the
+// order of the FETCH options' BinarySection and BinarySectionSize.
+type decodedBinary struct {
+	sections [][]byte
+	sizes    []uint32
+	charged  int64 // session memory charged for sections
+}
+
+// decodeBinary decodes the BINARY sections and BINARY.SIZE values a FETCH asks
+// for. A section whose Content-Transfer-Encoding cannot be decoded fails with
+// NO [UNKNOWN-CTE]: RFC 9051 §7.5.2, for both items, "If the server does not
+// know how to decode the section's Content-Transfer-Encoding, it MUST fail
+// the request and issue a "NO" response that contains the "UNKNOWN-CTE"
+// response code."
+func (s *IMAPSession) decodeBinary(ctx context.Context, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) (*decodedBinary, error) {
 	if err := s.ensureBodyDataLoaded(ctx, msg, bodyData, bodyDataFetched); err != nil {
 		// Transient: body staged for upload but not yet retrievable from this node.
 		// Ask the client to retry instead of returning an empty section.
 		if errors.Is(err, errBodyTransientlyUnavailable) {
-			return s.transientBodyUnavailable(msg.UID, err)
+			return nil, s.transientBodyUnavailable(msg.UID, err)
 		}
-		// Graceful degradation: return empty binary sections instead of failing the
-		// entire multi-message FETCH. This prevents one broken message (missing S3
-		// content, etc.) from making the whole mailbox listing fail for webmail clients.
+		// Graceful degradation: return empty binary sections and zero sizes instead
+		// of failing the entire multi-message FETCH. This prevents one broken message
+		// (missing S3 content, etc.) from making the whole mailbox listing fail for
+		// webmail clients.
 		s.WarnLog("failed to load message body, returning empty binary sections", "uid", msg.UID, "error", err)
 	}
 
-	for _, section := range options.BinarySection {
-		var buf []byte
-		var charged int64
-		if *bodyData != nil {
-			buf = safeExtractBinarySection(*bodyData, section)
-			var ok bool
-			if charged, ok = s.chargeSectionCopy(len(buf)); !ok {
-				return s.sectionMemoryUnavailable(msg.UID, len(buf))
-			}
+	b := &decodedBinary{
+		sections: make([][]byte, len(options.BinarySection)),
+		sizes:    make([]uint32, len(options.BinarySectionSize)),
+	}
+	if *bodyData == nil {
+		return b, nil
+	}
+	for i, section := range options.BinarySection {
+		buf, err := safeDecodeBinarySection(*bodyData, section)
+		if err != nil {
+			s.freeSectionCopies(b.charged)
+			return nil, s.unknownCTE(msg.UID)
 		}
-		wc := w.WriteBinarySection(section, int64(len(buf)))
-		_, writeErr := wc.Write(buf)
+		if section.Partial != nil {
+			// A <partial> is a slice of the whole decoded section. Keep only the
+			// slice, which is what is charged: the sections are held until the
+			// response is written, and one command line can name the same part
+			// thousands of times.
+			buf = bytes.Clone(buf)
+		}
+		charged, ok := s.chargeSectionCopy(len(buf))
+		if !ok {
+			s.freeSectionCopies(b.charged)
+			return nil, s.sectionMemoryUnavailable(msg.UID, len(buf))
+		}
+		b.charged += charged
+		b.sections[i] = buf
+	}
+	for i, section := range options.BinarySectionSize {
+		n, err := safeDecodeBinarySectionSize(*bodyData, section)
+		if err != nil {
+			s.freeSectionCopies(b.charged)
+			return nil, s.unknownCTE(msg.UID)
+		}
+		b.sizes[i] = n
+	}
+	return b, nil
+}
+
+// writeDecodedBinary writes the BINARY sections and BINARY.SIZE values
+// decodeBinary returned.
+func writeDecodedBinary(w *imapserver.FetchResponseWriter, options *imap.FetchOptions, b *decodedBinary) error {
+	for i, section := range options.BinarySection {
+		wc := w.WriteBinarySection(section, int64(len(b.sections[i])))
+		_, writeErr := wc.Write(b.sections[i])
 		closeErr := wc.Close()
-		if charged > 0 {
-			s.memTracker.Free(charged)
-		}
 		if writeErr != nil {
 			return writeErr
 		}
@@ -696,26 +732,8 @@ func (s *IMAPSession) handleBinarySections(ctx context.Context, w *imapserver.Fe
 			return closeErr
 		}
 	}
-	return nil
-}
-
-func (s *IMAPSession) handleBinarySectionSize(ctx context.Context, w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
-	if err := s.ensureBodyDataLoaded(ctx, msg, bodyData, bodyDataFetched); err != nil {
-		// Transient: body staged for upload but not yet retrievable from this node.
-		// Ask the client to retry instead of reporting a zero size.
-		if errors.Is(err, errBodyTransientlyUnavailable) {
-			return s.transientBodyUnavailable(msg.UID, err)
-		}
-		// Graceful degradation: return zero sizes instead of failing the entire FETCH.
-		s.WarnLog("failed to load message body, returning zero binary section sizes", "uid", msg.UID, "error", err)
-	}
-
-	for _, section := range options.BinarySectionSize {
-		var n uint32
-		if *bodyData != nil {
-			n = safeExtractBinarySectionSize(*bodyData, section)
-		}
-		w.WriteBinarySectionSize(section, n)
+	for i, section := range options.BinarySectionSize {
+		w.WriteBinarySectionSize(section, b.sizes[i])
 	}
 	return nil
 }
@@ -833,6 +851,23 @@ func (s *IMAPSession) sectionMemoryUnavailable(uid imap.UID, n int) *imap.Error 
 		Code: imap.ResponseCodeUnavailable,
 		Text: "Message too large for the session memory limit",
 	}
+	metrics.CommandsTotal.WithLabelValues("imap", "FETCH", commandStatus(imapErr)).Inc()
+	return imapErr
+}
+
+// freeSectionCopies returns what chargeSectionCopy charged to the session budget.
+func (s *IMAPSession) freeSectionCopies(charged int64) {
+	if charged > 0 {
+		s.memTracker.Free(charged)
+	}
+}
+
+// unknownCTE answers a BINARY or BINARY.SIZE item whose section has a
+// Content-Transfer-Encoding the server cannot decode with NO [UNKNOWN-CTE]
+// (RFC 9051 §7.5.2).
+func (s *IMAPSession) unknownCTE(uid imap.UID) *imap.Error {
+	s.InfoLog("cannot decode the Content-Transfer-Encoding of a BINARY section", "uid", uid)
+	imapErr := imapserver.ErrUnknownCTE
 	metrics.CommandsTotal.WithLabelValues("imap", "FETCH", commandStatus(imapErr)).Inc()
 	return imapErr
 }

@@ -130,7 +130,8 @@ the correct format` (IMAP), `-ERR [AUTH] Invalid username format` (POP3),
 `NO "Invalid username format"` (ManageSieve `AUTHENTICATE`) and `NO "Invalid address"` (ManageSieve
 `LOGIN`). Except on ManageSieve's `LOGIN`, it counts as a failed attempt for the rate limiter.
 
-A suffix that is not the configured `master_username`:
+A suffix that is not the configured `master_username`, and the `master_username` suffix with any
+password other than `master_password` (section 8.1):
 
 - on a proxy with remote lookup, is part of the name sent to the lookup service, which can treat it
   as a token ([PROXY.md](PROXY.md#4-remote-lookup));
@@ -197,7 +198,9 @@ spare at the login peak (for example after a restart, when every client logs in 
 
 - bcrypt hashes the server writes (Admin API account and credential changes);
 - bcrypt hashes `sora-admin` writes (`accounts create`, `accounts update`, `credentials add`);
-- the rehash target.
+- the rehash target;
+- what a failed login costs: the dummy check for an unknown address, and the least a wrong
+  password costs whatever the stored hash (section 6).
 
 **Rehash.** After a successful login that was checked against PostgreSQL, Sora looks at the stored
 hash. If it is bcrypt (with or without `{BLF-CRYPT}`) and its cost differs from `bcrypt_cost`, higher
@@ -237,7 +240,12 @@ This is the order on an IMAP, POP3 or ManageSieve backend. The code is in `serve
    deleted accounts. The query runs on the read pool and is retried up to two times on errors.
 10. **Unknown address.** Sora runs a bcrypt check against a dummy hash at the current cost, so that
     the reply takes about as long as for a wrong password. The address does not leak through timing.
-11. **Verify** the password against the hash (section 4).
+11. **Verify** the password against the hash (section 4). A wrong password costs at least one
+    bcrypt check at `bcrypt_cost`, whatever the stored hash: after a failed SHA-512 check Sora runs
+    one against a dummy hash, and after a failed check of a bcrypt hash below `bcrypt_cost` one at
+    each cost from the hash's up to `bcrypt_cost` - 1, which adds up to one check at `bcrypt_cost`.
+    A wrong password then takes about as long as an unknown address, whatever the account's scheme.
+    A bcrypt hash above `bcrypt_cost` takes longer, until the rehash (section 5) brings it down.
 12. **Failure.** The attempt is recorded for the rate limiter and the reply is the "bad credentials"
     reply of the protocol. A database error is not a failed login: it gets a temporary failure
     (below).
@@ -361,9 +369,12 @@ a1 LOGIN user@example.com@support a-long-random-secret
 - The suffix must equal `master_username` exactly, including case.
 - On a backend with SASL PLAIN, if the client also sends an authorization identity, that identity is
   the user to log in as. Otherwise it is the address before the suffix.
-- The target must be an active account. A wrong master password, a target that is not a valid
-  address, or a target account that does not exist gets the protocol's bad-credentials reply and is
-  counted as a failed login.
+- The target must be an active account. A target that is not a valid address, or a target account
+  that does not exist, gets the protocol's bad-credentials reply and is counted as a failed login.
+- Any other password is not a master login. The name is then handled like a name with any other
+  suffix (section 3): the user's own password logs in as the user, and anything else gets the
+  bad-credentials reply. The failure is counted under the master credential's key, the success
+  under the user's (section 10.2).
 
 ### 8.2 Master SASL: `master_sasl_username` and `master_sasl_password`
 
@@ -474,9 +485,15 @@ enabled = true
 
 The dotted form inside the block works too: `auth_rate_limit.enabled = true`.
 
-It applies to `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` and
-`http_user_api` blocks. Turn it on wherever clients log in: on the proxies when you run proxies, on
-the backends otherwise.
+It applies to `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`,
+`http_user_api` and `user_api_proxy` blocks. Turn it on wherever clients log in: on the proxies when
+you run proxies, on the backends otherwise.
+
+A `user_api_proxy` limits every login that passes it, with one count per client: those its backends
+answer, and those it answers itself (with named pools, a login for an address the remote lookup does
+not know or refuses; [USER_API.md](USER_API.md#121-how-a-request-is-routed)). Leave the limiter off
+on the `http_user_api` backends behind it: they see only the logins for addresses the lookup knows,
+so their delays and blocks would show which addresses those are.
 
 With `enabled = true`, every key you leave out, or set to `0`, gets its default. A `0` therefore never
 switches a tier off or removes a size cap.
@@ -512,7 +529,9 @@ durations.
 - the base address of the login name, lower case, without `+tag` (section 3). `User@Example.com`,
   `user+a@example.com` and `user@example.com` are one key, so varying them does not get more tries;
 - for the master username form `user@example.com@support`, the key `master:support`, so the attempt
-  is charged to the master credential and not to `user@example.com`;
+  is charged to the master credential and not to `user@example.com`. A success with the user's own
+  password instead of the master password (section 8.1) is the user's login: it is recorded under
+  `user@example.com`, so it cannot clear the failed guesses at the master password;
 - for a master SASL login, the master SASL username;
 - for a name that does not parse, the name itself, trimmed and lower-cased.
 
@@ -579,7 +598,7 @@ goroutines with delayed logins. The limit is fixed. The replies are:
 | IMAP proxy | `<tag> NO Authentication failed` |
 | POP3 proxy | `-ERR [AUTH] Authentication failed` |
 | ManageSieve proxy | `NO "Authentication failed"` |
-| User API | HTTP 429 `Too many concurrent authentication attempts. Please try again later.` |
+| User API, User API proxy | HTTP 429 `Too many concurrent authentication attempts. Please try again later.` |
 
 ### 10.5 Exempt networks
 
@@ -619,13 +638,13 @@ normal load (`Auth rate limiter stats` lines, below).
 
 | Listener | Login while blocked | Connection |
 |---|---|---|
-| `imap` | `NO [AUTHENTICATIONFAILED] Invalid address or password`, the same as a wrong password | Stays open. In addition, a new TCP connection from a Tier 2 blocked IP is closed before the TLS handshake, with no greeting. |
+| `imap` | `NO [AUTHENTICATIONFAILED] Invalid address or password`, the same as a wrong password | Stays open. In addition, a new TCP connection from a Tier 2 blocked IP is closed before the TLS handshake, with no greeting; when a PROXY header names the blocked client, it gets `* BYE [ALERT] Too many failed authentication attempts. Please try again later.` after the TLS handshake instead ([SECURITY.md](SECURITY.md#4-connection-limits)). |
 | `pop3` | `-ERR [AUTH] Authentication failed`, the same as a wrong password | Stays open, but every error counts towards the POP3 error limit (4 errors, then the connection closes; [SECURITY.md](SECURITY.md#6-limits-on-failed-logins-per-connection)). |
 | `managesieve` | `NO "Authentication failed"`, the same as a wrong password | Stays open; 10 errors close it. |
 | `imap_proxy` | `<tag> NO Authentication failed`, then `* BYE [ALERT] Too many failed authentication attempts. Please try again later.` | Closed. |
 | `pop3_proxy` | `-ERR [AUTH] Authentication failed`, the same as a wrong password | Closed. |
 | `managesieve_proxy` | `NO "Authentication failed"`, the same as a wrong password | Closed. |
-| `http_user_api` | HTTP 401 `Invalid credentials` | n/a |
+| `http_user_api`, `user_api_proxy` | HTTP 401 `Invalid credentials`, the same as a wrong password | n/a |
 
 Backends hide the block on purpose: a reply that differs from a wrong password would tell an attacker
 that an account or address is being limited. The IMAP proxy is the exception and says so with an
@@ -636,7 +655,13 @@ The wait of section 10.3 comes before the reply in every case.
 ### 10.8 Scope
 
 - Each `[[server]]` block has its own limiter, in memory. Failures on the IMAP listener do not count
-  on the POP3 listener, and two IMAP listeners on one node count separately.
+  on the POP3 listener, and two IMAP backend listeners on one node count separately.
+- In cluster mode, with `[cluster.rate_limit_sync] enabled` (the default), the `imap_proxy`,
+  `pop3_proxy` and `managesieve_proxy` limiters share their state with the proxies of the same type
+  on every node, their own node included: Tier 2 blocks (`sync_blocks`), Tier 2 counts from
+  `delay_start_threshold` on (`sync_failure_counts`), and the name statistics. A shared count only
+  raises a listener's own, its `exempt_networks` are not counted, and a shared wait is capped at its
+  `max_delay`. Tier 1 blocks stay on the listener that set them.
 - A restart forgets all counts and blocks.
 - `auth_rate_limit` is read at startup. A SIGHUP reload does not change it.
 
@@ -649,8 +674,8 @@ sora-admin --config config.toml stats blocked --protocol imap_proxy
 
 This asks the Admin API at `[admin_cli] addr` (`GET /admin/auth/blocked`, optionally
 `?protocol=...`), so it shows the blocks of that one node. Protocol names are `imap`, `pop3`,
-`managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` and `userapi`. Each entry has the IP,
-the name for a Tier 1 block, `blocked_until`, the failure count, the first and last failure and the
+`managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `userapi` and `userapi_proxy`. Each
+entry has the IP, the name for a Tier 1 block, `blocked_until`, the failure count, the first and last failure and the
 type (`ip_username` or `ip`). There is no command to lift a block early; a restart of the node clears
 them all. See [ADMIN_API.md](ADMIN_API.md#16-authentication-statistics).
 
@@ -709,7 +734,7 @@ Log lines (INFO unless noted), with the session's fields:
 | `Auth delay: Queue full, rejecting connection` | The limit of section 10.4 was hit. |
 | `Auth rate limiter stats` | Every 10th cleanup: table sizes and caps. |
 | `Rehash: Successfully rehashed and updated password` | Section 5. |
-| `Slow password verification` | A hash check took more than 100 ms. bcrypt at the default cost often takes about that long, so expect this line. |
+| `Slow password verification` | A hash check took more than 100 ms. bcrypt at the default cost often takes about that long, so expect this line. A wrong password takes about that long whatever the scheme (section 6). |
 | WARN `master username authentication failed (invalid master password)` | Section 8. |
 | WARN `master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting` | Section 8.3. |
 

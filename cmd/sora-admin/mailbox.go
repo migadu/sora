@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/migadu/sora/config"
@@ -591,6 +592,7 @@ Examples:
 	// Find affected mailboxes using a regex that matches Modified UTF-7 sequences.
 	// Modified UTF-7 uses '&' followed by base64 chars and terminated by '-'.
 	// We exclude '&-' (which is a literal ampersand escape).
+	const encoded = `&[A-Za-z0-9+,]+-`
 	var query string
 	var args []any
 
@@ -600,10 +602,10 @@ Examples:
 			fmt.Printf("Failed to find account: %v\n", err)
 			os.Exit(1)
 		}
-		query = `SELECT id, account_id, name FROM mailboxes WHERE account_id = $1 AND name ~ '&[A-Za-z0-9+,]+-' AND deleted_at IS NULL ORDER BY account_id, name`
+		query = `SELECT id, account_id, name, path FROM mailboxes WHERE account_id = $1 AND name ~ '` + encoded + `' AND deleted_at IS NULL ORDER BY account_id, name`
 		args = []any{accountID}
 	} else {
-		query = `SELECT id, account_id, name FROM mailboxes WHERE name ~ '&[A-Za-z0-9+,]+-' AND deleted_at IS NULL ORDER BY account_id, name`
+		query = `SELECT id, account_id, name, path FROM mailboxes WHERE name ~ '` + encoded + `' AND deleted_at IS NULL ORDER BY account_id, name`
 	}
 
 	db := rdb.GetOperationalDatabase()
@@ -612,6 +614,15 @@ Examples:
 	// shallowest-first. RenameMailbox cascades name changes to children,
 	// so after renaming a parent its children's prefixes are updated.
 	// We re-query after each depth level to pick up the cascaded changes.
+	// A dry run writes nothing for a query to see: it carries each rename down
+	// to the children in memory and keeps the rows the query would still match.
+
+	type candidate struct {
+		MailboxID   int64
+		AccountID   int64
+		MailboxName string
+		Path        string
+	}
 
 	fixed := 0
 	skipped := 0
@@ -621,43 +632,39 @@ Examples:
 	// Track mailbox IDs we've already skipped/failed so we don't retry them
 	processedIDs := make(map[int64]bool)
 
+	stillEncoded := regexp.MustCompile(encoded)
+	var simulated []candidate // dry run: the rows as its renames so far leave them
+	fromDB := true
+
 	for {
-		var rows []struct {
-			MailboxID   int64
-			AccountID   int64
-			MailboxName string
-		}
+		var rows []candidate
 
-		dbRows, err := db.WritePool.Query(ctx, query, args...)
-		if err != nil {
-			fmt.Printf("Failed to query mailboxes: %v\n", err)
-			os.Exit(1)
-		}
-
-		for dbRows.Next() {
-			var r struct {
-				MailboxID   int64
-				AccountID   int64
-				MailboxName string
-			}
-			if err := dbRows.Scan(&r.MailboxID, &r.AccountID, &r.MailboxName); err != nil {
-				fmt.Printf("Failed to scan row: %v\n", err)
+		if !fromDB {
+			rows = simulated
+		} else {
+			dbRows, err := db.WritePool.Query(ctx, query, args...)
+			if err != nil {
+				fmt.Printf("Failed to query mailboxes: %v\n", err)
 				os.Exit(1)
 			}
-			rows = append(rows, r)
+
+			for dbRows.Next() {
+				var r candidate
+				if err := dbRows.Scan(&r.MailboxID, &r.AccountID, &r.MailboxName, &r.Path); err != nil {
+					fmt.Printf("Failed to scan row: %v\n", err)
+					os.Exit(1)
+				}
+				rows = append(rows, r)
+			}
+			if err := dbRows.Err(); err != nil {
+				fmt.Printf("Failed to iterate mailbox rows: %v\n", err)
+				os.Exit(1)
+			}
+			dbRows.Close()
 		}
-		if err := dbRows.Err(); err != nil {
-			fmt.Printf("Failed to iterate mailbox rows: %v\n", err)
-			os.Exit(1)
-		}
-		dbRows.Close()
 
 		// Filter out already-processed IDs
-		var unprocessed []struct {
-			MailboxID   int64
-			AccountID   int64
-			MailboxName string
-		}
+		var unprocessed []candidate
 		for _, r := range rows {
 			if !processedIDs[r.MailboxID] {
 				unprocessed = append(unprocessed, r)
@@ -692,7 +699,7 @@ Examples:
 				continue
 			}
 
-			decoded, err := helpers.DecodeModifiedUTF7(r.MailboxName)
+			decoded, err := decodeMailboxLevelUTF7(r.MailboxName)
 			if err != nil {
 				fmt.Printf("  SKIP  %-40s  (decode error: %v)\n", r.MailboxName, err)
 				skipped++
@@ -713,11 +720,27 @@ Examples:
 				fixed++
 				processedIDs[r.MailboxID] = true
 				renamedInRound++
+				// As the rename would, carry the new name down to the children.
+				prefix := r.MailboxName + string(consts.MailboxDelimiter)
+				for j := range rows {
+					c := &rows[j]
+					if c.AccountID == r.AccountID && helpers.IsDescendantOf(c.Path, r.Path) && strings.HasPrefix(c.MailboxName, prefix) {
+						c.MailboxName = decoded + c.MailboxName[len(r.MailboxName):]
+					}
+				}
 				continue
 			}
 
-			// Perform the rename (this cascades to children)
-			err = rdb.RenameMailboxWithRetry(ctx, r.MailboxID, r.AccountID, decoded, nil)
+			// Rename in place, under the parent the path links it to: a nil parent
+			// would move it to the top level. The rename cascades to its children.
+			ids, err := helpers.GetIdsFromPath(r.Path)
+			if err == nil {
+				var parentID *int64
+				if len(ids) > 1 {
+					parentID = &ids[len(ids)-2]
+				}
+				err = rdb.RenameMailboxWithRetry(ctx, r.MailboxID, r.AccountID, decoded, parentID)
+			}
 			if err != nil {
 				fmt.Printf("  FAIL  account_id=%-6d  %q  ->  %q  (error: %v)\n", r.AccountID, r.MailboxName, decoded, err)
 				failed++
@@ -731,26 +754,15 @@ Examples:
 			renamedInRound++
 		}
 
-		// In dry-run mode nothing changes in the DB, so process all depths in one pass
 		if *dryRun {
-			for _, r := range unprocessed {
-				if processedIDs[r.MailboxID] {
-					continue
-				}
-				processedIDs[r.MailboxID] = true
-				decoded, err := helpers.DecodeModifiedUTF7(r.MailboxName)
-				if err != nil {
-					fmt.Printf("  SKIP  %-40s  (decode error: %v)\n", r.MailboxName, err)
-					skipped++
-				} else if decoded == r.MailboxName {
-					fmt.Printf("  SKIP  %-40s  (no change after decode)\n", r.MailboxName)
-					skipped++
-				} else {
-					fmt.Printf("  WOULD RENAME  account_id=%-6d  %q  ->  %q\n", r.AccountID, r.MailboxName, decoded)
-					fixed++
+			// What the query would return now: a child that its parent's rename left
+			// with no encoded level drops out, as it does from the query.
+			simulated, fromDB = nil, false
+			for _, r := range rows {
+				if stillEncoded.MatchString(r.MailboxName) {
+					simulated = append(simulated, r)
 				}
 			}
-			break
 		}
 
 		if renamedInRound == 0 {
@@ -768,6 +780,20 @@ Examples:
 	} else {
 		fmt.Printf("Done: %d renamed, %d skipped, %d failed\n", fixed, skipped, failed)
 	}
+}
+
+// decodeMailboxLevelUTF7 decodes the last level of a mailbox name from Modified UTF-7
+// and keeps the levels above it, which are its ancestors' names. fix-utf7 renames
+// shallowest first and a rename carries the new name down to the children, so an
+// ancestor that is still encoded was not renamed: the child stays linked under it,
+// and its name must keep naming it.
+func decodeMailboxLevelUTF7(name string) (string, error) {
+	i := strings.LastIndexByte(name, consts.MailboxDelimiter) + 1
+	level, err := helpers.DecodeModifiedUTF7(name[i:])
+	if err != nil {
+		return "", err
+	}
+	return name[:i] + level, nil
 }
 
 // printMailboxUsage prints usage information for the 'mailbox' command

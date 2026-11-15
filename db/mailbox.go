@@ -548,7 +548,7 @@ func (db *Database) SoftDeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID 
 			return fmt.Errorf("failed to check delete permission: %w", err)
 		}
 		if !hasDeleteRight {
-			return fmt.Errorf("permission denied: user does not have delete right on shared mailbox")
+			return fmt.Errorf("%w: no delete right on shared mailbox %d", consts.ErrNotPermitted, mailboxID)
 		}
 	}
 
@@ -842,6 +842,28 @@ func (db *Database) HasMailboxWithSpecialUse(ctx context.Context, accountID int6
 	return exists, nil
 }
 
+// GetPersonalMailboxNameBySpecialUse returns the name of the account's mailbox in
+// its personal namespace that carries the RFC 6154 special-use attribute attr, or
+// consts.ErrMailboxNotFound if there is none. A mailbox the account owns in the
+// shared namespace does not count: RFC 8579 §4 looks the attribute up "in the
+// user's personal namespace". An attribute marks at most one live mailbox of an
+// account (mailboxes_account_special_use_unique).
+func (db *Database) GetPersonalMailboxNameBySpecialUse(ctx context.Context, accountID int64, attr string) (string, error) {
+	var name string
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT name FROM mailboxes
+		WHERE account_id = $1 AND special_use = $2 AND deleted_at IS NULL
+		  AND NOT COALESCE(is_shared, FALSE)
+	`, accountID, attr).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", consts.ErrMailboxNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to look up the %s mailbox: %w", attr, err)
+	}
+	return name, nil
+}
+
 func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, AccountID int64) error {
 	// OPTIMIZATION: Early exit if INBOX already exists
 	// This avoids 5 INSERT attempts on every LMTP delivery when mailboxes already exist
@@ -1054,6 +1076,54 @@ func (d *Database) GetMailboxSummariesBatch(ctx context.Context, mailboxIDs []in
 	}
 	if err = rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating batch mailbox summaries: %w", err)
+	}
+
+	return result, nil
+}
+
+// CountDeletedMessages returns, per mailbox, how many of its messages that are
+// not expunged have the \Deleted flag set: the DELETED status data item (RFC
+// 9051 §6.3.11). A mailbox without any is left out of the map. mailbox_stats
+// keeps no such count, so this reads the mailboxes' message_state rows; STATUS
+// runs it only when a client asks for DELETED.
+func (d *Database) CountDeletedMessages(ctx context.Context, mailboxIDs []int64) (map[int64]uint32, error) {
+	if len(mailboxIDs) == 0 {
+		return map[int64]uint32{}, nil
+	}
+
+	start := time.Now()
+	var err error
+	defer func() {
+		status := "success"
+		if err != nil {
+			status = "error"
+		}
+		metrics.DBQueryDuration.WithLabelValues("mailbox_deleted_count", "read").Observe(time.Since(start).Seconds())
+		metrics.DBQueriesTotal.WithLabelValues("mailbox_deleted_count", status, "read").Inc()
+	}()
+
+	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, `
+		SELECT mst.mailbox_id, COUNT(*)
+		FROM message_state mst
+		JOIN messages m ON m.id = mst.message_id AND m.mailbox_id = mst.mailbox_id
+		WHERE mst.mailbox_id = ANY($1) AND (mst.flags & $2) <> 0 AND m.expunged_at IS NULL
+		GROUP BY mst.mailbox_id
+	`, mailboxIDs, FlagDeleted)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count deleted messages: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[int64]uint32, len(mailboxIDs))
+	for rows.Next() {
+		var mailboxID, count int64
+		if err = rows.Scan(&mailboxID, &count); err != nil {
+			return nil, fmt.Errorf("failed to scan deleted message count: %w", err)
+		}
+		result[mailboxID] = uint32(count)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating deleted message counts: %w", err)
 	}
 
 	return result, nil

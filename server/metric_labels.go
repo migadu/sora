@@ -20,6 +20,8 @@ func metricsProtocol(name string) string {
 		return "managesieve_proxy"
 	case "user-api":
 		return "userapi"
+	case "USER-API-PROXY":
+		return "userapi_proxy"
 	}
 	return strings.ToLower(name) // IMAP, POP3, ManageSieve, LMTP
 }

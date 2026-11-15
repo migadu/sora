@@ -959,11 +959,28 @@ defaults to `[tls.letsencrypt] fallback_dir`, or `/var/lib/sora/certs`.
 Notes on `delete`:
 
 - Give exactly one of `--domain` and `--key`.
-- `--key` takes the full S3 key as `tls list --details` shows it (`autocert/cert-...`). A shorter
-  value, or one ending in `...`, is treated as a prefix; it must match exactly one key.
+- `--key` takes the full S3 key as `tls list --details` shows it (`autocert/cert-...`). A value
+  that is not a key in the bucket, or one ending in `...`, is treated as a prefix; it must match
+  exactly one key. A key that exists is deleted even when it is also the prefix of another key.
 - `--domain` deletes both the ECDSA and the RSA certificate of the domain, from S3 and from the
   local mirror.
 - `--key` leaves the local mirror alone.
+
+Notes on `clean`:
+
+- A node can renew an expired certificate while `clean` runs, after `clean` has read the
+  expired one. On a bucket that keeps versions (Backblaze B2 buckets always do), `clean`
+  deletes only the version it read and found expired, so the renewal, a newer version, stays.
+  If deleting that version brings back an older one that has expired too, `clean` deletes that
+  one as well. This needs the right to delete object versions: `s3:DeleteObjectVersion` on
+  AWS, the `deleteFiles` capability on Backblaze B2.
+- Without a usable version id, including a `null` version exposed after a version delete,
+  `clean` sends the inspected object's ETag in `If-Match`. A changed object is kept.
+  This requires conditional DELETE support from the S3 provider; a missing ETag or an
+  unsupported condition fails that cleanup operation and keeps the object. `clean` never
+  retries it as an unconditional delete. Versioned B2 objects continue to use version ids.
+- A local copy is removed only if it still holds an expired certificate when `clean` removes
+  it. A renewal written over it during the run stays.
 
 `cache` writes files with mode `0600` as the user running the command. Run it as the user the
 server runs as, or fix the ownership afterwards.
@@ -976,7 +993,7 @@ Checks and prints a config file. These subcommands read only the file.
 
 | Subcommand | Flags | What it does |
 |---|---|---|
-| `validate` | | Loads the file with the server's loader (warnings for unknown and duplicate keys), validates every `[[server]]` block, and checks that server names and addresses are unique. Prints `[OK] Configuration is valid!` and the servers, or `[FAIL]` lines. Exits `1` on errors. |
+| `validate` | | Loads the file with the server's loader (warnings for unknown and duplicate keys) and runs the checks `sora` makes on the file before it starts anything ([CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup)), without connecting to anything. Prints `[OK] Configuration is valid!` and the servers, or a `[FAIL]` line for each problem. Exits `1` on errors. |
 | `dump` | `--format` (`toml` or `json`, default `toml`), `--mask-secrets` (default `true`) | Prints the configuration as loaded, with defaults applied. |
 
 `--mask-secrets` masks the database passwords, `[s3]` access key, secret key and encryption key,

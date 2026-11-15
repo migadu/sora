@@ -256,23 +256,15 @@ func TestIMAP_CONDSTOREFiltering_iOSBeforeAfterID(t *testing.T) {
 	writer.Flush()
 	readResponse("A09")
 
-	// Search with MODSEQ criteria - should work but not return MODSEQ-specific data when filtered
+	// The MODSEQ search key is CONDSTORE's (RFC 7162 §3.1.5): with CONDSTORE
+	// filtered it is refused with BAD, not dropped (which matched every message).
 	sendCommand("A10", "SEARCH MODSEQ 1")
 	searchResponses := readResponse("A10")
 
-	var foundCondstoreInSearch bool
-	for _, resp := range searchResponses {
-		// Look for any CONDSTORE-specific extensions in search response
-		if strings.Contains(resp, "MODSEQ") && !strings.Contains(resp, "SEARCH MODSEQ") {
-			foundCondstoreInSearch = true
-			t.Logf("SEARCH response includes CONDSTORE data: %s", resp)
-		}
-	}
-
-	if foundCondstoreInSearch {
-		t.Errorf("✗ FAILURE: SEARCH response includes CONDSTORE extensions when should be filtered")
+	if tagged := searchResponses[len(searchResponses)-1]; !strings.HasPrefix(tagged, "A10 BAD ") || len(searchResponses) > 1 {
+		t.Errorf("✗ FAILURE: SEARCH MODSEQ with CONDSTORE filtered: want only a tagged BAD, got:\n%s", strings.Join(searchResponses, "\n"))
 	} else {
-		t.Logf("✓ SUCCESS: SEARCH correctly processes MODSEQ criteria but excludes CONDSTORE extensions when filtered")
+		t.Logf("✓ SUCCESS: SEARCH MODSEQ correctly refused when CONDSTORE is filtered")
 	}
 
 	// STEP 8: Test UNCHANGEDSINCE with STORE (should be ignored when CONDSTORE filtered)

@@ -152,9 +152,11 @@ At startup `sora` looks at the server types in the config and decides what it ne
 | Only proxies that use remote lookup, or `metrics` | Not needed | No |
 
 If a server type needs PostgreSQL and the config has no `[database.write]` section, `sora`
-stops with "database is required for configured servers but not configured". On a node that
-needs S3, `[s3] endpoint`, `access_key`, `secret_key` and `bucket` must all be set, or `sora`
-stops with "missing required S3 credentials" or "S3 endpoint not specified".
+stops with `[database]: server "<name>" (<type>) needs the database, but it is not configured in
+[database.write] or [database.read]`. On a node that needs S3, `[s3] endpoint` and `bucket` must
+be set, or `sora` stops with `[s3]: endpoint is required ...` or `[s3]: bucket is required ...`;
+without `access_key` and `secret_key` the AWS default credential chain must supply them.
+`sora-admin config validate` refuses such a file too.
 
 A node without storage workers does not need the upload staging directory or the local
 cache, and an Admin API on it cannot deliver messages. Run the Admin API on a node that also
