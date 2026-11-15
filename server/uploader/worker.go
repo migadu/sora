@@ -1289,25 +1289,47 @@ func (w *UploadWorker) LinkStaged(contentHash string, srcAccountID, destAccountI
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
+	var reuseExisting bool
+	var chtimesErr error
 	pathMu := w.stagingPathLock(dst)
 	pathMu.Lock()
 	err := linkFile(src, dst)
-	if err == nil {
+	switch {
+	case err == nil:
+		// os.Link shares src's inode and its st_mtime; touch dst under pathMu so
+		// cleanupOrphanedFiles grants destAccountID a full grace period before its
+		// pending_uploads row commits.
+		now := time.Now()
+		chtimesErr = os.Chtimes(dst, now, now)
 		w.stagedSizeChanged(dst, 0, fileSize(dst))
+	case errors.Is(err, fs.ErrExist):
+		// Reuse dst only if its size matches src and its grace window is refreshed
+		// under pathMu; otherwise fall through to stageFrom to replace it atomically.
+		dstInfo, dstErr := os.Stat(dst)
+		srcInfo, srcErr := os.Stat(src)
+		if dstErr == nil && srcErr == nil && dstInfo.Size() == srcInfo.Size() {
+			now := time.Now()
+			if chtimesErr = os.Chtimes(dst, now, now); chtimesErr == nil {
+				reuseExisting = true
+			}
+		}
 	}
 	pathMu.Unlock()
+	if chtimesErr != nil {
+		logger.Warn("Uploader: Failed to refresh staged file mtime", "path", dst, "error", chtimesErr)
+	}
 	switch {
 	case err == nil:
 		if err := syncDir(dir); err != nil {
 			logger.Warn("Uploader: Failed to fsync directory (non-fatal)", "dir", dir, "error", err)
 		}
 		return nil
-	case errors.Is(err, fs.ErrExist):
-		return nil // staged for destAccountID already, and counted then
+	case reuseExisting:
+		return nil // staged for destAccountID already with matching size, and counted then
 	}
 
-	// No hard link here (another filesystem, a link limit, ...): copy the body. A
-	// missing source fails the open, before anything is written.
+	// No hard link here (another filesystem, a link limit, or an invalid existing dst):
+	// copy the body. A missing source fails the open, before anything is written.
 	in, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("failed to open staged body %s: %w", src, err)
