@@ -22,6 +22,9 @@ const (
 	beforeChanges pollStep = iota
 	// beforeNumbering is just before the batch that numbers the changed messages.
 	beforeNumbering
+	// beforeDenseNumbering is just before the single stream that numbers the changed
+	// messages when there are more than 50 of them.
+	beforeDenseNumbering
 )
 
 // pollStepTracer runs inject once, from the poll's own goroutine, just before PollMailbox
@@ -44,6 +47,11 @@ func (tr *pollStepTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data
 	// The changes query is the only statement of the poll that is a UNION.
 	if strings.Contains(data.SQL, "UNION") {
 		tr.at(beforeChanges)
+	}
+	// The dense numbering is the only statement of the poll that streams the mailbox in
+	// UID order.
+	if strings.Contains(data.SQL, "ORDER BY uid ASC") {
+		tr.at(beforeDenseNumbering)
 	}
 	return ctx
 }
@@ -147,30 +155,52 @@ func TestPollMailboxReadsOneSnapshot(t *testing.T) {
 		require.NoError(t, tx.Commit(ctx))
 	}
 
+	// report is the delivery that gives the poll something to report: UID 4 alone is
+	// numbered by the batch, UIDs 4-54 (more than 50 changes) by the dense stream.
+	sparse := []uint32{4}
+	var dense []uint32
+	for uid := uint32(4); uid <= 54; uid++ {
+		dense = append(dense, uid)
+	}
+
 	cases := []struct {
-		name  string
-		step  pollStep
-		write func(t *testing.T, ctx context.Context, accountID, mailboxID int64, mailboxName string)
+		name   string
+		report []uint32
+		step   pollStep
+		write  func(t *testing.T, ctx context.Context, accountID, mailboxID int64, mailboxName string)
 	}{
 		{
-			name: "delivery before the changes are read",
-			step: beforeChanges,
+			name:   "delivery before the changes are read",
+			report: sparse,
+			step:   beforeChanges,
 			write: func(t *testing.T, ctx context.Context, accountID, mailboxID int64, mailboxName string) {
 				insert(t, ctx, accountID, mailboxID, mailboxName, 5)
 			},
 		},
 		{
-			name: "expunge before the changes are read",
-			step: beforeChanges,
+			name:   "expunge before the changes are read",
+			report: sparse,
+			step:   beforeChanges,
 			write: func(t *testing.T, ctx context.Context, _, mailboxID int64, _ string) {
 				expunge(t, ctx, mailboxID, 2)
 			},
 		},
 		{
-			name: "delivery before the changes are numbered",
-			step: beforeNumbering,
+			name:   "delivery before the changes are numbered",
+			report: sparse,
+			step:   beforeNumbering,
 			write: func(t *testing.T, ctx context.Context, accountID, mailboxID int64, mailboxName string) {
 				insert(t, ctx, accountID, mailboxID, mailboxName, 5)
+			},
+		},
+		{
+			// The stream counts the messages the client knows in UID order, so an expunge
+			// it sees but the changes did not report shifts every number after it.
+			name:   "expunge before the dense numbering",
+			report: dense,
+			step:   beforeDenseNumbering,
+			write: func(t *testing.T, ctx context.Context, _, mailboxID int64, _ string) {
+				expunge(t, ctx, mailboxID, 2)
 			},
 		},
 	}
@@ -188,7 +218,7 @@ func TestPollMailboxReadsOneSnapshot(t *testing.T) {
 			client := &pollClient{uids: []imap.UID{1, 2, 3}, cursor: getHighestModSeq(t, database, ctx, mailboxID)}
 
 			// A delivery gives its next poll something to report...
-			insert(t, ctx, accountID, mailboxID, mailboxName, 4)
+			insert(t, ctx, accountID, mailboxID, mailboxName, tc.report...)
 
 			// ...and another write commits in the middle of that poll.
 			tracer := &pollStepTracer{step: tc.step, inject: func() { tc.write(t, ctx, accountID, mailboxID, mailboxName) }}
