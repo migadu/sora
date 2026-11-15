@@ -501,7 +501,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	mailHeader := mail.Header{Header: messageContent.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
+	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date"))
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
 
