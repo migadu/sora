@@ -90,7 +90,8 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 	}
 
 	// EXAMINE and ACL-forced read-only SELECT must use the same state rules.
-	isReadOnly := (options != nil && options.ReadOnly) || !strings.ContainsAny(userRights, "iestw")
+	examined := options != nil && options.ReadOnly
+	isReadOnly := examined || !strings.ContainsAny(userRights, "iestw")
 
 	currentSummary, err := s.server.rdb.GetMailboxSummaryWithRetry(readCtx, mailbox.ID)
 	if err != nil {
@@ -229,7 +230,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 	// mutating commands (STORE, EXPUNGE) can be rejected on a read-only selection.
 	s.selectedReadOnly.Store(isReadOnly)
 	// RFC 9051 §6.3.3: EXAMINE itself, which also keeps FETCH from setting \Seen.
-	s.selectedExamined.Store(options != nil && options.ReadOnly)
+	s.selectedExamined.Store(examined)
 	s.mailboxTracker = imapserver.NewMailboxTracker(s.currentNumMessages.Load())
 	s.sessionTracker = s.mailboxTracker.NewSession()
 	s.savedSearchUIDs = nil // RFC 5182: the "$" saved result is reset on mailbox change
@@ -240,11 +241,21 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		metrics.TrackUserActivity("imap", s.IMAPUser.Address.FullAddress(), "command", 1)
 	}
 
+	// After EXAMINE "No changes to the permanent state of the mailbox, including
+	// per-user state, are permitted" (RFC 9051 §6.3.3), so no flag is permanent
+	// there. The response is still sent, with an empty list as in the §6.3.3
+	// example: without it "the client should assume that all flags can be
+	// changed permanently" (§6.3.2).
+	var permanentFlags []imap.Flag
+	if !examined {
+		permanentFlags = getPermanentFlags(userRights)
+	}
+
 	selectData := &imap.SelectData{
 		// Flags defined for this mailbox (system flags, common keywords, and in-use custom flags)
 		Flags: getDisplayFlags(readCtx, s.server.rdb, mailbox, s.DebugLog),
 		// Flags that can be changed, restricted to the user's flag rights (RFC 4314 §5.1.1)
-		PermanentFlags: getPermanentFlags(userRights),
+		PermanentFlags: permanentFlags,
 		// RFC 4314 §5.2: SELECT is READ-ONLY when the user holds none of the rights
 		// that permit modifying the mailbox — insert ('i'), expunge ('e'), or the
 		// shared-flag rights (Sora shares all flags: 's','t','w').
