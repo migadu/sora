@@ -104,11 +104,12 @@ func TestOrphanSweepFollowsSymlinkedSpoolDirectories(t *testing.T) {
 	}
 }
 
-// The refresh counts pending rows, so it drops an orphan staged before it from the
-// count. Sweeping that orphan later took its bytes out a second time: with 600 bytes
-// staged the count read 300, and the guard admitted 700 bytes under a 1000-byte limit
-// until the next refresh (#1183).
-func TestOrphanSweepDoesNotSubtractWhatTheRefreshDropped(t *testing.T) {
+// A refresh cannot tell an orphan staged before it from a delivery whose row has yet
+// to commit, so it keeps counting the file as it is on disk (#1302), and the sweep
+// takes it out once. When the refresh dropped it, the sweep took its bytes out a
+// second time: with 600 bytes staged the count read 300, and the guard admitted 700
+// bytes under a 1000-byte limit until the next refresh (#1183).
+func TestOrphanSweepSubtractsAnOrphanStagedBeforeTheRefreshOnce(t *testing.T) {
 	w, rdb, _, _, _ := setupTestWorker(t)
 	w.maxStagingSize = 1000
 	rows := newPendingRows()
@@ -126,8 +127,8 @@ func TestOrphanSweepDoesNotSubtractWhatTheRefreshDropped(t *testing.T) {
 	if err := w.monitorStuckUploads(context.Background()); err != nil {
 		t.Fatalf("monitorStuckUploads: %v", err)
 	}
-	if got := stagingSize(w); got != 600 {
-		t.Fatalf("staging size = %d after a refresh whose backlog holds 600 bytes, want 600", got)
+	if got := stagingSize(w); got != 900 {
+		t.Fatalf("staging size = %d after a refresh with 900 bytes staged, want 900", got)
 	}
 
 	ageStaged(t, orphan)
@@ -137,7 +138,7 @@ func TestOrphanSweepDoesNotSubtractWhatTheRefreshDropped(t *testing.T) {
 	requireSwept(t, orphan)
 
 	if got := stagingSize(w); got != 600 {
-		t.Errorf("staging size = %d after sweeping an orphan the refresh did not count, want the 600 bytes still staged", got)
+		t.Errorf("staging size = %d after sweeping a 300-byte orphan, want the 600 bytes still staged", got)
 	}
 	if !w.IsStagingLimitExceeded(700) {
 		t.Errorf("a 700-byte delivery is admitted with 600 bytes staged under a 1000-byte limit (counted %d)", stagingSize(w))
@@ -173,8 +174,7 @@ func TestOrphanSweepDoesNotSubtractAFileThisRunNeverCounted(t *testing.T) {
 
 // What the count does hold must still leave it: an orphan staged while the refresh
 // measured the backlog, which the refresh counts as it is on disk, and one staged
-// after it. (In production the sweep reaches these only when the refresh has not
-// re-based the count for longer than the grace period.)
+// after it.
 func TestOrphanSweepSubtractsOrphansStagedSinceTheRefreshBegan(t *testing.T) {
 	w, rdb, _, _, _ := setupTestWorker(t)
 	w.maxStagingSize = 1000
