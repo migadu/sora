@@ -760,7 +760,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			if s.useMasterDB {
 				ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 			}
-			return delivery.CanFileInto(ctx, s.backend.rdb, s.AccountID(), mailbox)
+			return delivery.CanFileInto(ctx, s.backend.rdb, s.backend.sharedMailboxes, s.AccountID(), mailbox)
 		},
 	}
 
@@ -1294,11 +1294,12 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 	}
 
 	// Resolve the name as for any fileinto: the user's own mailbox, else one shared
-	// with the user. :create (RFC 5490 §3.2) creates the mailbox only "if needed":
-	// "If the mailbox already exists, this argument is ignored", and a shared one
-	// exists for this user. It never makes a personal mailbox in the shared
-	// namespace, where a namesake would shadow a shared mailbox in later lookups.
-	mailbox, err := s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), mailboxName)
+	// with the user, never the shared namespace root (delivery.FileintoTarget). :create
+	// (RFC 5490 §3.2) creates the mailbox only "if needed": "If the mailbox already
+	// exists, this argument is ignored", and a shared one exists for this user. It
+	// never makes a personal mailbox in the shared namespace, where a namesake would
+	// shadow a shared mailbox in later lookups.
+	mailbox, err := delivery.FileintoTarget(readCtx, s.backend.rdb, s.backend.sharedMailboxes, s.AccountID(), mailboxName)
 	if errors.Is(err, consts.ErrMailboxNotFound) && createMailbox {
 		if s.backend.sharedMailboxes.InNamespace(mailboxName) {
 			s.WarnLog("fileinto :create refused in the shared namespace", "mailbox", mailboxName)
@@ -1320,7 +1321,7 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 		}
 	}
 	if errors.Is(err, consts.ErrMailboxNotFound) {
-		s.WarnLog("mailbox not found, falling back to inbox", "mailbox", mailboxName)
+		s.WarnLog("mailbox not found, falling back to inbox", "mailbox", mailboxName, "error", err)
 		mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), consts.MailboxInbox)
 		if err != nil {
 			return fmt.Errorf("failed to get INBOX mailbox: %v", err)

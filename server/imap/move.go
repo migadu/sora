@@ -67,6 +67,10 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 	decodedNumSet = s.decodeNumSetLocked(view, numSet)
 	release() // Release read lock
 
+	if imapErr := s.sharedRootDestinationRefusal("MOVE", dest); imapErr != nil {
+		return imapErr
+	}
+
 	// Perform database operations outside of lock
 	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, s.AccountID(), dest)
 	if err != nil {
