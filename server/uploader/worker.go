@@ -82,9 +82,9 @@ type UploaderDB interface {
 	// a file on that node's disk), so this is the queue this worker alone can drain.
 	//
 	// changed is called once the totals are read, while their snapshot is still held.
-	// It names the bodies whose staged files changed while the measurement was in
-	// flight, and Included reports, from that same snapshot, what the totals count for
-	// each of them.
+	// It names the bodies the staging count holds as they are on disk, among them those
+	// whose staged files changed while the measurement was in flight, and Included
+	// reports, from that same snapshot, what the totals count for each of them.
 	PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int, changed func() []StagedBody) (UploadBacklog, error)
 	// RecordInstanceHeartbeatWithRetry proves this instance still exists. Pending
 	// uploads are leased only by their creating instance, so the cleaner reaps an
@@ -260,18 +260,19 @@ type UploadWorker struct {
 	// currentStagingSize, while keeping temp-file writes and fsyncs parallel outside it.
 	stagingPathLocks [stagingPathLockStripes]sync.Mutex
 	// stagingRefreshMu orders every change of currentStagingSize against the start and
-	// end of a staging refresh, and guards stagingRefresh, stagingGen and stagedGen.
+	// end of a staging refresh, and guards stagingRefresh, stagingGen and onDisk.
 	stagingRefreshMu sync.Mutex
 	// stagingRefresh is non-nil while monitorStuckUploads measures the backlog: for
 	// each staged path changed meanwhile, the bytes counted for it before that change.
 	stagingRefresh map[string]int64
-	// stagingGen numbers the staging refreshes begun. stagedGen holds every staged path
-	// whose bytes currentStagingSize counts as they are on disk, i.e. one changed since
-	// the last refresh that re-based the count began (or since the worker was made),
-	// with the stagingGen of its last change. Any other staged path counts what that
-	// refresh's snapshot had for it: its pending row, or nothing.
+	// stagingGen numbers the staging refreshes begun. onDisk holds every staged path
+	// whose bytes currentStagingSize counts as they are on disk: one changed, or taken
+	// up by an upload's finalize, since the last refresh that re-based the count began
+	// (or since the worker was made), and one whose body that refresh's snapshot had no
+	// pending row for. Any other staged path counts what the snapshot had for it: its
+	// pending row, or nothing for a file an earlier run left.
 	stagingGen uint64
-	stagedGen  map[string]uint64
+	onDisk     map[string]countedFile
 	// lastStallReport is when the current stall episode was last reported, in Unix
 	// nanoseconds; 0 means no episode is in progress. Atomic, like currentStagingSize.
 	lastStallReport int64
@@ -286,6 +287,12 @@ type UploadWorker struct {
 }
 
 const stagingPathLockStripes = 64
+
+// countedFile is what currentStagingSize counts for a path in onDisk.
+type countedFile struct {
+	size int64  // its bytes on disk
+	gen  uint64 // the stagingGen when it last changed or entered onDisk
+}
 
 // stagingPathLock returns the striped mutex guarding path's on-disk replacement/removal
 // and its matching currentStagingSize delta.
@@ -743,6 +750,10 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	lease := w.holdLease(ctx, upload, owner)
 	finalized := false
 	defer func() { lease.end(ctx, finalized) }()
+
+	// The finalize drops the row before the body leaves the spool: count the body as it
+	// is on disk until then.
+	w.countOnDisk(filePath)
 
 	if len(keys) == 0 {
 		logger.Info("Uploader: Content hash already uploaded - skipping S3 upload", "hash", upload.ContentHash, "account_id", upload.AccountID)
@@ -1401,15 +1412,14 @@ func (w *UploadWorker) stageFrom(path string, r io.Reader) error {
 		return fmt.Errorf("failed to close file %s: %w", tmpPath, err)
 	}
 
-	// Bytes already accounted for at this path are sampled under the per-path lock
-	// right around the rename so concurrent stagings of the same body replace rather
-	// than multiply the counted size, while temp-file I/O and fsyncs run in parallel.
+	// What the count holds for this path is replaced under the per-path lock right
+	// around the rename so concurrent stagings of the same body replace rather than
+	// multiply the counted size, while temp-file I/O and fsyncs run in parallel.
 	pathMu := w.stagingPathLock(path)
 	pathMu.Lock()
-	previousSize := fileSize(path)
 	renameErr := os.Rename(tmpPath, path)
 	if renameErr == nil {
-		w.stagedSizeChanged(path, previousSize, size)
+		w.restaged(path, size)
 	}
 	pathMu.Unlock()
 	if renameErr != nil {
@@ -1529,11 +1539,12 @@ func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
 	//
 	// Staged files keep changing while the queries run, and the snapshot may or may not
 	// hold a change: a delivery stages its body before its row commits, an upload drops
-	// its row before its body leaves the spool. So a body changed since countedBefore
-	// is counted as it is on disk, as the live counter already counts it, and its share
-	// is taken out of both the snapshot (Included) and countedBefore (before); every
-	// other body is counted as the snapshot has it. Applied as a delta, so changes
-	// after endRefresh, which the snapshot predates, stay counted too.
+	// its row before its body leaves the spool. So a body changed since countedBefore,
+	// or one the count holds as it is on disk (onDisk), is counted as it is on disk, as
+	// the live counter already counts it, and its share is taken out of both the
+	// snapshot (Included) and countedBefore (before); every other body is counted as
+	// the snapshot has it. Applied as a delta, so changes after endRefresh, which the
+	// snapshot predates, stay counted too.
 	backlog, backlogErr := w.rdb.PendingUploadBacklog(ctx, w.instanceID, w.maxAttempts, endRefresh)
 	if backlogErr != nil {
 		if ctx.Err() != nil {
@@ -1546,7 +1557,7 @@ func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
 		for body, before := range changed {
 			delta += before - backlog.Included[body]
 		}
-		w.rebaseStagingSize(refreshGen, delta)
+		w.rebaseStagingSize(refreshGen, delta, backlog.Included)
 	}
 
 	// Log summary
@@ -1651,28 +1662,59 @@ func (w *UploadWorker) stagedSizeChangedLocked(path string, before, after int64)
 		}
 	}
 	if after == 0 {
-		delete(w.stagedGen, path)
+		delete(w.onDisk, path)
 	} else {
-		if w.stagedGen == nil {
-			w.stagedGen = make(map[string]uint64)
+		if w.onDisk == nil {
+			w.onDisk = make(map[string]countedFile)
 		}
-		w.stagedGen[path] = w.stagingGen
+		w.onDisk[path] = countedFile{size: after, gen: w.stagingGen}
 	}
 	w.addStagingSize(after - before)
 }
 
+// restaged applies a staging of size bytes at path. It replaces what the count holds
+// for path, which is not always the file on disk there: a path not in onDisk holds a
+// file only if the last re-base counted the file's row, or found no row for a file an
+// earlier run left and counted nothing. The staging takes it for the latter, which is
+// exact there; the former is then counted twice until the next re-base, which only
+// refuses early. The caller holds path's staging lock.
+func (w *UploadWorker) restaged(path string, size int64) {
+	w.stagingRefreshMu.Lock()
+	defer w.stagingRefreshMu.Unlock()
+	w.stagedSizeChangedLocked(path, w.onDisk[path].size, size)
+}
+
+// countOnDisk puts the body staged at path, which an upload is about to finalize, in
+// onDisk at the size the count holds for it, its row's. The finalize drops the row
+// before the body leaves the spool, and a refresh whose snapshot falls in between would
+// otherwise drop the body from the count before its removal takes it out once more.
+// The caller does not hold path's staging lock.
+func (w *UploadWorker) countOnDisk(path string) {
+	pathMu := w.stagingPathLock(path)
+	pathMu.Lock()
+	defer pathMu.Unlock()
+	size := fileSize(path)
+	if size == 0 {
+		return
+	}
+	w.stagingRefreshMu.Lock()
+	defer w.stagingRefreshMu.Unlock()
+	if _, counted := w.onDisk[path]; !counted {
+		w.stagedSizeChangedLocked(path, size, size)
+	}
+}
+
 // orphanRemoved applies the orphan sweep's removal of the size bytes staged at path,
-// which have no pending row. The count holds them only if path was staged since the
-// last re-base began (stagedGen). Otherwise that re-base counted pending rows and, with
-// none for path, already left these bytes out, as it leaves out a file an earlier run
-// left behind: subtracting them again would let the guard admit that much more than
-// fits until the next refresh. (A row deleted after the snapshot, as an account purge
-// does, leaves its bytes counted until then instead, which only refuses early.) The
-// caller holds path's staging lock.
+// which have no pending row. The count holds them only if path is in onDisk. Otherwise
+// the file is one an earlier run left, which no re-base counts: subtracting its bytes
+// would let the guard admit that much more than fits until the next refresh. (Or the
+// last re-base counted its row, which was deleted after the snapshot, as an account
+// purge does: its bytes stay counted until the next refresh instead, which only
+// refuses early.) The caller holds path's staging lock.
 func (w *UploadWorker) orphanRemoved(path string, size int64) {
 	w.stagingRefreshMu.Lock()
 	defer w.stagingRefreshMu.Unlock()
-	if _, counted := w.stagedGen[path]; counted {
+	if _, counted := w.onDisk[path]; counted {
 		w.stagedSizeChangedLocked(path, size, 0)
 	}
 }
@@ -1689,26 +1731,42 @@ func (w *UploadWorker) beginStagingRefresh() (int64, uint64) {
 }
 
 // rebaseStagingSize applies the delta that re-bases the staging size on the snapshot
-// of refresh gen. From then on, a path last changed before that refresh began counts
-// what the snapshot had for it rather than its bytes on disk, so it leaves stagedGen.
-func (w *UploadWorker) rebaseStagingSize(gen uint64, delta int64) {
+// of refresh gen. A path last changed before that refresh began whose body has a row
+// in the snapshot (included) counts that row from then on, so it leaves onDisk. One
+// with no row stays, counted as it is on disk: a delivery stages its body before its
+// row commits and an upload drops the row before the body goes, and the snapshot
+// cannot tell such a body from an orphan. Dropped from the count, it would be taken
+// out once more when it leaves the spool. It leaves onDisk when a later re-base has
+// its row, or with its file, an orphan's through the orphan sweep (orphanRemoved).
+func (w *UploadWorker) rebaseStagingSize(gen uint64, delta int64, included map[StagedBody]int64) {
 	w.stagingRefreshMu.Lock()
 	defer w.stagingRefreshMu.Unlock()
 	w.addStagingSize(delta)
-	for path, changed := range w.stagedGen {
-		if changed < gen {
-			delete(w.stagedGen, path)
+	for body := range included {
+		path := w.FilePath(body.ContentHash, body.AccountID)
+		if counted, ok := w.onDisk[path]; ok && counted.gen < gen {
+			delete(w.onDisk, path)
 		}
 	}
 }
 
-// endStagingRefresh stops noting changes and returns, for each body changed since
-// beginStagingRefresh, the bytes counted for it then. A path that does not name a body
-// (none should) is left out, so its change counts as one the snapshot predates.
+// endStagingRefresh stops noting changes and returns, for each body in onDisk or
+// changed since beginStagingRefresh, the bytes counted for it then. A path that does
+// not name a body (none should) is left out, so its change counts as one the snapshot
+// predates.
 func (w *UploadWorker) endStagingRefresh() map[StagedBody]int64 {
 	w.stagingRefreshMu.Lock()
 	paths := w.stagingRefresh
 	w.stagingRefresh = nil
+	if paths != nil {
+		// A path in onDisk that did not change since beginStagingRefresh is counted
+		// as it was then.
+		for path, counted := range w.onDisk {
+			if _, changed := paths[path]; !changed {
+				paths[path] = counted.size
+			}
+		}
+	}
 	w.stagingRefreshMu.Unlock()
 
 	changed := make(map[StagedBody]int64, len(paths))
@@ -1727,8 +1785,9 @@ func (w *UploadWorker) addStagingSize(delta int64) {
 	}
 	for {
 		cur := atomic.LoadInt64(&w.currentStagingSize)
-		// Removing a body the last refresh did not count (its row committed after the
-		// snapshot) must clamp at zero rather than drive the running total below zero.
+		// Removing a body the count does not hold (a file an earlier run left, queued
+		// again without being staged again) must clamp at zero rather than drive the
+		// running total below zero.
 		next := max(cur+delta, 0)
 		if atomic.CompareAndSwapInt64(&w.currentStagingSize, cur, next) {
 			return
