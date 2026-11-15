@@ -181,7 +181,9 @@ type Context struct {
 	EnvelopeTo   string
 	// Header is the parsed header block of Message. The body test reads the top-level
 	// Content-Type and Content-Transfer-Encoding from here and the body from Message,
-	// so the two must describe the same bytes.
+	// so the two must describe the same bytes. Build it with HeaderMap: keys that fold
+	// to one name under i;ascii-casemap are merged, but only HeaderMap keeps their
+	// fields in message order.
 	Header map[string][]string
 	// Message is the complete raw message as received, after any Received and
 	// Delivered-To headers delivery stamps and before any header edits this evaluation
@@ -329,9 +331,15 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 
 	// Header names compare under i;ascii-casemap (RFC 5228 §2.7): the map is
 	// keyed by the lower-cased name and HeaderGet lowers the name it looks up.
+	// Keys that fold to one name are that name's fields, so their values are
+	// merged rather than one key's replacing the other's.
 	normalizedHeaders := make(map[string][]string, len(ctx.Header))
 	for key, values := range ctx.Header {
-		normalizedHeaders[lowerASCII(key)] = values
+		name := lowerASCII(key)
+		if prev, ok := normalizedHeaders[name]; ok {
+			values = append(slices.Clip(prev), values...)
+		}
+		normalizedHeaders[name] = values
 	}
 
 	message := &SieveMessage{
@@ -651,6 +659,25 @@ type SieveMessage struct {
 
 func (m *SieveMessage) HeaderGet(key string) ([]string, error) {
 	return m.Headers[lowerASCII(key)], nil
+}
+
+// HeaderMap returns the fields of h for Context.Header, keyed by the name folded
+// under i;ascii-casemap (RFC 5228 §2.7), each name's values in message order.
+//
+// go-message's Header.Map keys a field by textproto.CanonicalMIMEHeaderKey, which
+// returns a name holding a byte that is not an RFC 7230 token character, such as
+// "(" or "/", as written, although RFC 5322 §3.6.8 allows those bytes in a field
+// name (ftext = %d33-57 / %d59-126). "X(a" and "x(A" are then two keys of one
+// field name, and a map cannot say which field came first, which :index counts
+// from (RFC 5260 §6) and the date test takes (RFC 5260 §4).
+func HeaderMap(h message.Header) map[string][]string {
+	m := make(map[string][]string, h.Len())
+	fields := h.Fields()
+	for fields.Next() {
+		name := lowerASCII(fields.Key())
+		m[name] = append(m[name], fields.Value())
+	}
+	return m
 }
 
 // lowerASCII lowers the US-ASCII letters of a header name and leaves every other
