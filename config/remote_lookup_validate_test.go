@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -168,6 +169,43 @@ func TestValidateRemoteLookupURLPlaceholders(t *testing.T) {
 		err := validateRemoteLookupURL(c.url)
 		if (err != nil) != c.wantErr {
 			t.Errorf("validateRemoteLookupURL(%q) err=%v, wantErr=%v", c.url, err, c.wantErr)
+		}
+	}
+}
+
+// TestRemoteLookupRequestURLKeepsValidTemplateParseable holds the argument
+// validateRemoteLookupURL relies on instead of building sample requests: once the host
+// carries no placeholder, every request the client builds from an accepted template
+// parses, for any address and client IP, and goes to the template's host.
+func TestRemoteLookupRequestURLKeepsValidTemplateParseable(t *testing.T) {
+	templates := []string{
+		"https://lookup.example.com/lookup?email=$email&ip=$ip",
+		"https://lookup.example.com/user/$email/$ip/info",
+		"https://$email:$ip@lookup.example.com/lookup",
+		"https://lookup.example.com:8443/lookup?email=$email#$ip",
+		"http://[::1]:8080/$email?ip=$ip",
+	}
+	emails := []string{"user@example.com", "user@example.com@TOKEN", "jos\u00e9@example.com", "a/b?c#d%e:f[g]@example.com"}
+	clientIPs := []string{"192.0.2.1", "2001:db8::1", "fe80::1%eth0", ""}
+	for _, template := range templates {
+		if err := validateRemoteLookupURL(template); err != nil {
+			t.Fatalf("validateRemoteLookupURL(%q) = %v", template, err)
+		}
+		want, _ := url.Parse(template)
+		for _, email := range emails {
+			for _, clientIP := range clientIPs {
+				for _, routeOnly := range []bool{false, true} {
+					requestURL := RemoteLookupRequestURL(template, email, clientIP, routeOnly)
+					got, err := url.Parse(requestURL)
+					if err != nil {
+						t.Errorf("template %q, email %q, ip %q: request URL does not parse: %v", template, email, clientIP, err)
+						continue
+					}
+					if got.Scheme != want.Scheme || got.Host != want.Host {
+						t.Errorf("template %q, email %q, ip %q: request goes to %s://%s, want %s://%s", template, email, clientIP, got.Scheme, got.Host, want.Scheme, want.Host)
+					}
+				}
+			}
 		}
 	}
 }

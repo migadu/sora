@@ -27,11 +27,17 @@ func TestMaskSecretsMalformedURLUserInfo(t *testing.T) {
 		// sees no userinfo and takes the start of the password for a port (#806).
 		"https://fixture-user:fixture/password@example.invalid/send",
 		"https://fixture-user:fixture#password@example.invalid/send",
+		// When that start is a number, or empty, the URL parses: host "fixture-user"
+		// with a port, the rest of the password and the "@" in the path or fragment.
+		"https://fixture-user:2024/password@example.invalid/send",
+		"https://fixture-user:2024/password@example.invalid/send?api_key=fixture-query-secret",
+		"https://fixture-user:/password@example.invalid/send",
+		"https://fixture-user:2024#password@example.invalid/send",
 	} {
 		cfg := Config{Relay: RelayConfig{HTTPURL: endpoint}}
 		MaskSecrets(&cfg)
 		if cfg.Relay.HTTPURL != SecretMask {
-			t.Fatal("unparseable URL exposed fixture credentials")
+			t.Errorf("credential-bearing URL %q dumped as %q", endpoint, cfg.Relay.HTTPURL)
 		}
 	}
 }

@@ -245,8 +245,14 @@ Where each applies:
 `lmtp_proxy` ignores the per-user limits, with a warning.
 
 Behind Sora proxies that send PROXY headers (`remote_use_proxy_protocol`), a backend's
-`max_connections_per_ip` limits each client a second time, by the address the proxy names. Set it no
-lower than on the proxies, or to `0` to leave the limit to them.
+`max_connections_per_ip` limits each client a second time, by the address the proxy names, and a
+client over it fails its login on the proxy. Set it to `0` to leave the limit to the proxies, or
+above the most connections the proxies let one address open in total. In cluster mode that is the
+proxies' own `max_connections_per_ip`, which `imap_proxy`, `pop3_proxy` and `managesieve_proxy`
+count across all proxy nodes of the protocol. Without `[cluster]` each proxy listener counts only
+its own connections, so it is that limit times the number of proxy listeners. Leave headroom above
+it: the cluster-wide count is eventually consistent, and when a proxy closes a session the backend
+can still count its connection for a moment after the proxy has freed the client's slot.
 
 What a client sees:
 
@@ -498,7 +504,7 @@ one.**
 | Key | Meaning |
 |---|---|
 | `allowed_hosts` | IPs or CIDRs allowed to scrape. Matched against the TCP peer; `X-Forwarded-For` is ignored. Others get HTTP 403 `forbidden`. |
-| `api_key` | Requires `Authorization: Bearer <key>`, compared in constant time. A missing token gets 401 with `WWW-Authenticate: Bearer realm="metrics"`; a wrong one gets 403. |
+| `api_key` | Requires `Authorization: Bearer <key>`, compared in constant time. A missing token gets 401 with `WWW-Authenticate: Bearer realm="metrics"`; a wrong one gets 403 with `WWW-Authenticate: Bearer realm="metrics", error="invalid_token"`. |
 
 With both set, a request must pass both. The endpoint is always plain HTTP: `tls` on a metrics block
 is ignored with a warning, so put a TLS proxy in front if a token crosses an untrusted network.

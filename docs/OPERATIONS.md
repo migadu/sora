@@ -83,8 +83,9 @@ Sora starts in this order. A failure in any step ends the process with status 1,
 
 1. **Flags.** `-version` prints and exits here.
 2. **Config file.** Sora reads and parses the file. Unknown keys and duplicate keys are warnings, not
-   errors ([CONFIGURATION.md](CONFIGURATION.md)). These warnings go to standard error, because
-   logging is not set up yet.
+   errors ([CONFIGURATION.md](CONFIGURATION.md)). Logging is not set up yet, so Sora holds these
+   warnings and writes them to the `[logging]` output at step 6, at its level. If startup stops
+   before step 6, it writes them to standard error.
 3. **Validation.** In this order:
    - Unknown names in `[sieve] enabled_extensions` are a warning.
    - Each `[[server]]` block is validated: a `type`, `name` and `addr`, a known `type`, and no
@@ -143,11 +144,12 @@ with status 1. It does not leave the other listeners running.
 ### Messages that stop startup
 
 Errors from steps 2 to 9 are written by Sora's error handler. Before step 6 the `[logging]` output
-is not open yet, so they go to standard error, in this form:
+is not open yet, so they go to standard error, after what Sora logged until then, in this form:
 
 ```
+[ERROR] 2026/01/15 10:00:00 ERROR: configuration file '<path>' not found: <why>
+[ERROR] 2026/01/15 10:00:00 ERROR: failed to parse configuration file '<path>': <why>
 [ERROR] 2026/01/15 10:00:00 ERROR: invalid configuration - <what>: <why>
-[ERROR] 2026/01/15 10:00:00 FATAL: operation '<what>' failed: <why>
 ```
 
 From step 6 on they are ERROR records of the `[logging]` output, in its format, like every other
@@ -463,8 +465,9 @@ keys. Use it when a log collector parses the lines.
 
 A few things are always written to the process's standard error, whatever `output` says:
 
-- Warnings from reading the config at startup (unknown keys, duplicate keys) and the startup errors
-  that happen before logging is set up ([Startup](#messages-that-stop-startup)).
+- The startup errors that happen before logging is set up ([Startup](#messages-that-stop-startup)),
+  with what Sora logged until then, such as the warnings about unknown or duplicate keys in the
+  config file. When startup gets past that point, those go to the `[logging]` output instead.
 - A Go panic and its stack trace.
 
 Under systemd these are in the journal even when Sora logs to a file. Check both when Sora does not

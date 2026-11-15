@@ -16,7 +16,10 @@ type PendingUpload struct {
 	ID          int64
 	AccountID   int64
 	ContentHash string // serves also as unique identifier in S3
-	InstanceID  string // hostname of the instance that created the upload
+	// InstanceID is the upload instance id of the node holding the staged body
+	// (config.InstanceID, the key its uploader leases under), not its mail hostname:
+	// AcquireAndLeasePendingUploads hands the row only to that instance.
+	InstanceID  string
 	Size        int64
 	Attempts    int
 	CreatedAt   time.Time
@@ -260,8 +263,8 @@ const (
 	// now leased to this upload alone until the lease expires.
 	S3WriteOpen S3WriteGate = iota
 	// S3WriteBusy: someone else is at the body right now — the cleaner or a purge
-	// confirming it is an orphan and deleting it, a restore, a cross-account COPY, or
-	// another upload of it that holds the row's lease. The upload is deferred.
+	// confirming it is an orphan and deleting it, a restore, a cross-account COPY or
+	// MOVE, or another upload of it that holds the row's lease. The upload is deferred.
 	S3WriteBusy
 	// S3WriteAbandoned: the pending row is gone (the account was deleted, the upload
 	// reaped, or another upload finished it), so there is nothing left to upload.

@@ -21,6 +21,12 @@ func TestMaskEndpointURL(t *testing.T) {
 		{"https://fixture-user:fixture-password@relay.example.invalid/send?api_key=fixture-query-secret",
 			"https://%2A%2A%2AMASKED%2A%2A%2A:%2A%2A%2AMASKED%2A%2A%2A@relay.example.invalid/send?api_key=" + m},
 		{"https://fixture-user:fixture/password@relay.example.invalid/send", m},
+		// A password that starts with a number before its "/" or "#" parses: the
+		// number is taken for a port, the rest of the password for the path or fragment.
+		{"https://fixture-user:2024/password@relay.example.invalid/send", m},
+		{"https://fixture-user:2024#password@relay.example.invalid/send", m},
+		{"https://[2001:db8::1]:8443/users/fixture@example.com", m},
+		{"https://[2001:db8::1]/users/fixture@example.com", "https://[2001:db8::1]/users/fixture@example.com"},
 		// Without a scheme the masker cannot find the userinfo or the query.
 		{"fixture-user:fixture-password@relay.example.invalid/send", m},
 		{"relay.example.invalid/send?api_key=fixture-query-secret", m},

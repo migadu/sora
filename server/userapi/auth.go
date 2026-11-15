@@ -422,7 +422,7 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 		// Validate JWT token from Authorization header
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
-			server.SetBearerChallenge(w.Header(), server.UserAPIRealm, false)
+			server.SetBearerChallenge(w.Header(), server.UserAPIRealm, "")
 			s.writeError(w, http.StatusUnauthorized, "Authorization header required")
 			return
 		}
@@ -430,7 +430,7 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 		// Extract token from "Bearer <token>"
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-			server.SetBearerChallenge(w.Header(), server.UserAPIRealm, false)
+			server.SetBearerChallenge(w.Header(), server.UserAPIRealm, "")
 			s.writeError(w, http.StatusUnauthorized, "Authorization header must be 'Bearer <token>'")
 			return
 		}

@@ -276,6 +276,31 @@ func TestCTEComments_PreviewMatchesReaderForWhitespace(t *testing.T) {
 	}
 }
 
+// FuzzTransferEncodingMechanismAgreesWithGoMessage pins the property PREVIEW
+// relies on against go-message itself: every value transferEncodingMechanism
+// reduces to a mechanism go-message knows is one go-message decodes.
+func FuzzTransferEncodingMechanismAgreesWithGoMessage(f *testing.F) {
+	for _, seed := range []string{
+		"base64", "BASE64 (encoded)", "(a (nested) comment) Quoted-Printable (with a \\) quoted-pair)",
+		"(only a comment)", "base64 (unclosed", "base(comment)64", "\rbase64", "base64\r ",
+		" base64", "base64\r\n (folded)", "7bit\t", "x-uuencode (comment)",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, cte string) {
+		switch transferEncodingMechanism(cte) {
+		case "", "7bit", "8bit", "binary", "quoted-printable", "base64":
+		default:
+			return
+		}
+		var h message.Header
+		h.Set("Content-Transfer-Encoding", cte)
+		if _, err := message.New(h, strings.NewReader("")); message.IsUnknownEncoding(err) {
+			t.Errorf("transferEncodingMechanism(%q) = %q, but go-message: %v", cte, transferEncodingMechanism(cte), err)
+		}
+	})
+}
+
 func deref(s *string) string {
 	if s == nil {
 		return "<nil>"

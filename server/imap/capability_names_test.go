@@ -43,7 +43,8 @@ func TestDisabledCaps_NamesAreCaseInsensitive(t *testing.T) {
 // withdraw does nothing. disabled_caps logged it at DEBUG and disable_caps not at
 // all, so at the default level a typo, or a capability go-imap adds by itself
 // such as ACL, went unnoticed (#1114). PREVIEW counts as withdrawable when it is
-// enabled, and a lowercase name is not a typo.
+// enabled, and a lowercase name is not a typo. Every client_filters WARN names
+// the entry, including the ones for IMAP4rev1 and the always advertised names.
 func TestDisabledCaps_UnknownNameWarns(t *testing.T) {
 	logs := &syncLogBuffer{}
 	prev := logger.Swap(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
@@ -54,7 +55,7 @@ func TestDisabledCaps_UnknownNameWarns(t *testing.T) {
 		Preview:      PreviewOptions{Enabled: true},
 		CapabilityFilters: []config.ClientCapabilityFilter{{
 			ClientName:  "^ExampleMail$",
-			DisableCaps: []string{"CONDSTOR", "ACL", "preview"},
+			DisableCaps: []string{"CONDSTOR", "ACL", "preview", "imap4rev1", "sasl-ir"},
 		}},
 	})
 
@@ -70,7 +71,7 @@ func TestDisabledCaps_UnknownNameWarns(t *testing.T) {
 	if line := warned("IDEL"); line == "" {
 		t.Errorf("disabled_caps = [IDEL]: no WARN; WARN output:\n%s", out)
 	}
-	for _, capability := range []string{"CONDSTOR", "ACL"} {
+	for _, capability := range []string{"CONDSTOR", "ACL", "imap4rev1", "sasl-ir"} {
 		line := warned(capability)
 		if line == "" {
 			t.Errorf("client_filters disable_caps = [%s]: no WARN; WARN output:\n%s", capability, out)

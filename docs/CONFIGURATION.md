@@ -66,21 +66,21 @@ only some sections (`[database]`, `[s3]`, `[local_cache]`, `[uploader]`, `[clean
 
 ### Unknown keys
 
-A key Sora does not know is ignored, and Sora prints a warning that names it:
+A key Sora does not know is ignored, and Sora logs a warning that names it (console format):
 
 ```
-WARNING: Configuration file 'config.toml' contains unknown keys that will be ignored:
-WARNING:   - servers.imap
-WARNING:   - servers.imap.start
-WARNING:   - servers.imap.addr
-WARNING: These keys may be typos or deprecated settings. Please review your configuration.
+level=WARN msg="Configuration file 'config.toml': unknown key 'servers.imap' will be ignored (a typo or a deprecated setting?)"
+level=WARN msg="Configuration file 'config.toml': unknown key 'servers.imap.start' will be ignored (a typo or a deprecated setting?)"
+level=WARN msg="Configuration file 'config.toml': unknown key 'servers.imap.addr' will be ignored (a typo or a deprecated setting?)"
 ```
 
 An unknown table is listed together with each key in it.
 
 The key keeps its default, so a misspelt key silently does nothing. Read these warnings after every
-change. At startup they are printed to standard error, before logging is set up, so they do not
-reach a log file named in `[logging] output`. On a `SIGHUP` reload they go through the logger.
+change. At startup the file is read before logging is set up, so Sora holds them and writes them to
+the `[logging]` output once it is open, at its level. If startup stops before that, for example on a
+check in [section 4](#4-checks-at-startup) that runs before logging is set up, they are written to
+standard error with the error. On a `SIGHUP` reload they go through the logger.
 
 ### Duplicate keys
 
@@ -191,17 +191,19 @@ to standard error, one for each problem the file has.
 | `master_sasl_username` is set and `master_sasl_password` is empty | `server "<name>": master_sasl_username is set but master_sasl_password is empty; refusing to start ...` |
 | `[[pool]]` blocks are inconsistent (see [section 10](#10-named-backend-pools-pool)) | `[[pool]]: ...` |
 | A proxy server (a type ending in `_proxy`) has no `remote_addrs` and the file has no `[[pool]]` blocks | `server '<name>': remote_addrs is required unless the file declares [[pool]] blocks` |
-| A proxy server has a `remote_addrs` entry that is empty or only spaces | `server "<name>": remote_addrs #<n>: empty backend address` |
+| A proxy server has a `remote_addrs` entry without a host: empty, only spaces, or a port alone such as `":143"` | `server "<name>": remote_addrs #<n>: empty backend address` |
 | A proxy server has a `remote_addrs` entry with whitespace inside it (`"192.0.2.10 :143"`; spaces at the ends are trimmed) | `server "<name>": remote_addrs #<n>: backend address "<entry>" contains whitespace` |
 | A server has `proxy_protocol = true` and `[servers] trusted_networks` is empty | `trusted_networks: proxy_protocol is enabled on server(s) <names> but [servers] trusted_networks is empty; ...` |
 | Two servers have the same `name` | `duplicate server name '<name>' found. Each server must have a unique name` |
 | Two servers have the same `addr` string | `duplicate server address '<addr>' found. Server '<a>' and '<b>' cannot bind to the same address` |
 | A `[[server]]` block lacks `type`, `name` or `addr` | for example `server address is required` |
 | No server is configured | `no servers configured. Please configure at least one server in a [[server]] section` |
-| An IMAP, POP3 or LMTP server is configured, or an `http_user_api` server with any `[s3]` connection setting, and `[s3] bucket` or `endpoint` is empty, or `timeout` is not a duration | `[s3]: bucket is required ...`, `[s3]: endpoint is required ...` or `[s3]: invalid timeout "<value>": ...` |
+| An IMAP, POP3 or LMTP server is configured, or an `http_user_api` server with any `[s3]` connection setting, and `[s3] bucket` or `endpoint` is empty, `timeout` is not a duration, only one of `access_key` and `secret_key` is set, or `encrypt = true` and `encryption_key` is missing or not the hex encoding of 32 bytes | `[s3]: bucket is required ...`, `[s3]: endpoint is required ...`, `[s3]: invalid timeout "<value>": ...`, `[s3]: access_key and secret_key must be set together; ...`, `[s3]: encryption_key is required when encrypt = true`, `[s3]: encryption_key must be 64 hex characters (a 32-byte key)` or `[s3]: encryption_key must be 32 bytes (64 hex characters), got <n> bytes` |
 | A server that needs the database is configured and there is no database endpoint (see [section 3](#3-defaults)) | `[database]: server "<name>" (<type>) needs the database, but it is not configured in [database.write] or [database.read]` |
 | A server that needs the database is configured and `[database.read]` has hosts but `[database.write]` has none | `[database.write]: server "<name>" (<type>) needs the database, but [database.write] has no hosts; ...` |
+| A server that needs the database is configured and `[database] migration_timeout` is not a duration, or a `[database.write]` or `[database.read]` endpoint with hosts has a `max_conn_lifetime` or `max_conn_idle_time` that is not a duration, a `port` that is not a number from 1 to 65535 (used by every host entry without a port of its own), or a host entry whose own port is not one | `[database]: invalid migration_timeout "<value>": ...`, `[database.write]: invalid max_conn_lifetime "<value>": ...` (likewise `max_conn_idle_time`, and `[database.read]`), `[database.write]: port number <n> is out of the valid range (1-65535)`, `[database.write]: invalid string for port: "<value>"` or `[database.write]: invalid port "<port>" in host "<host>" (must be 1-65535)` |
 | `[cluster] enabled = true` and `addr` is not an IP address other than `0.0.0.0` or `::`, or `secret_key` is missing or not the base64 of 32 bytes (see [CLUSTER.md](CLUSTER.md)) | `[cluster]: cluster addr '<host>' must be a specific IP address reachable from other nodes, ...`, `[cluster]: cluster secret_key is required when cluster mode is enabled ...`, `[cluster]: failed to decode cluster secret_key: ...` or `[cluster]: cluster secret_key must be 32 bytes (got <n> bytes)` |
+| `[tls] enabled = true` and `provider` is neither `"file"` nor `"letsencrypt"`; `provider = "file"` without `cert_file` or `key_file`; or `provider = "letsencrypt"` without a `[tls.letsencrypt]` table, `email` or `domains`, with a `storage_provider` other than `"s3"`, a `renew_before` or `sync_interval` that is not a duration, only one of `[tls.letsencrypt.s3] access_key` and `secret_key`, or a `server_side_encryption` and `server_side_encryption_kms_key_id` the store cannot be asked for (see [TLS.md](TLS.md)) | `[tls]: unknown TLS provider: <value> (must be 'file' or 'letsencrypt')`, `[tls]: cert_file and key_file are required for provider='file'`, `[tls]: letsencrypt configuration is required for provider='letsencrypt'`, `[tls]: letsencrypt.email is required`, `[tls]: letsencrypt.domains is required and must not be empty`, `[tls]: only storage_provider='s3' is currently supported for Let's Encrypt`, `[tls]: invalid renew_before duration "<value>": ...` (likewise `sync_interval`) or `[tls]: letsencrypt.s3: ...` |
 | `[servers] trusted_networks` has an entry that is neither an IP address nor a CIDR block | names the invalid entry |
 | A server's `auth_rate_limit.exempt_networks` has an entry that is neither an IP address nor a CIDR block | `server "<name>": auth_rate_limit.exempt_networks has entries that are neither an IP address nor a CIDR: [...]` |
 | An `imap` server's `client_filters` entry has a `client_name`, `client_version` or `ja4_fingerprints` pattern that is not a valid regular expression | `server "<name>": client_filters #<n>: <key> "<pattern>": error parsing regexp: ...` |
@@ -216,7 +218,7 @@ to standard error, one for each problem the file has.
 | `[relay.queue] worker_interval` is `0` or less, or `failed_retention` is negative, with `[relay]` configured | `[relay.queue]: worker_interval must be positive, got ...` or `[relay.queue]: failed_retention must not be negative, got ...` |
 | `[relay.queue] circuit_breaker_timeout`, `cleanup_interval` or `failed_retention` is not a duration, with `[relay]` configured | `[relay.queue]: invalid <key> "<value>": ...` |
 | An IMAP, POP3 or LMTP server is configured and `[cleanup]` has a negative `grace_period`, `max_age_restriction`, `fts_retention` or `health_status_retention`, or an `instance_liveness_threshold` of zero or less | `[cleanup]: <key> must not be negative, got "<value>"` or `[cleanup]: instance_liveness_threshold must be positive, got "<value>"` |
-| An IMAP, POP3 or LMTP server is configured and `[uploader]` has a `batch_size`, `concurrency` or `max_attempts` of zero or less, a `cleanup_grace_period` of zero or less or that is not a duration, or a `retry_interval` of zero or less | `[uploader] <key> must be positive, got <n>`, `[uploader] cleanup_grace_period must be positive, got "<value>"`, `[uploader] cleanup_grace_period: <parse error>` or `[uploader] retry_interval must be positive, got "<value>"` |
+| An IMAP, POP3 or LMTP server is configured and `[uploader]` has a `batch_size`, `concurrency` or `max_attempts` of zero or less, a `cleanup_grace_period` of zero or less or that is not a duration, a `retry_interval` of zero or less, or a `max_staging_size` that is not a size | `[uploader] <key> must be positive, got <n>`, `[uploader] cleanup_grace_period must be positive, got "<value>"`, `[uploader] cleanup_grace_period: <parse error>`, `[uploader] retry_interval must be positive, got "<value>"` or `[uploader] max_staging_size: <parse error>` |
 | `[shared_mailboxes] enabled = true` and `namespace_prefix` is not a mailbox name followed by `/` (for example `""`, `"Shared"` or `"Shared//"`), or is `INBOX/` in any letter case | `[shared_mailboxes]: namespace_prefix "<value>" must be a mailbox name followed by the hierarchy delimiter "/", such as "Shared/"` or `[shared_mailboxes]: namespace_prefix "<value>" conflicts with the reserved personal INBOX` |
 | `[timeout_scheduler] shard_count` is below -1 | `[timeout_scheduler]: shard_count must be >= -1, got <n>` |
 
@@ -794,7 +796,7 @@ See [SECURITY.md](SECURITY.md).
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
 | `max_connections` | integer | `0` (no limit); `1000` on `lmtp` | all but `metrics` | Concurrent connections of this server. On `lmtp`, `0` or less means 1000. |
-| `max_connections_per_ip` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `user_api_proxy` | Concurrent connections from one IP. Hosts in `trusted_networks` are not limited. With `[cluster] enabled = true`, `imap_proxy`, `pop3_proxy` and `managesieve_proxy` count the IP's connections on every node ([CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies)). |
+| `max_connections_per_ip` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `user_api_proxy` | Concurrent connections from one client IP: with `proxy_protocol`, the client the header names. A client whose own IP is in `trusted_networks` is not limited. With `[cluster] enabled = true`, `imap_proxy`, `pop3_proxy` and `managesieve_proxy` count the IP's connections on every node ([CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies)). |
 | `max_connections_per_user` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Logged-in sessions of one user. Enforced on this server by `imap`, `pop3` and `managesieve`. Enforced across the cluster for proxies, which track connections only with `[cluster] enabled = true`; without it a proxy ignores the key, with a startup warning. Ignored by `lmtp_proxy` with a warning. |
 | `max_connections_per_user_per_ip` | integer | `0` (no limit) | as `max_connections_per_user` | Logged-in sessions of one user from one IP. |
 | `listen_backlog` | integer | `1024` | backends, line proxies | TCP listen backlog. `0` means 1024. The HTTP servers listen with the kernel's default backlog; on them the key is ignored, with a startup warning. |
@@ -952,7 +954,7 @@ names it.
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
-| `remote_addrs` | list of strings | none | proxies | Backends. Required unless the file has `[[pool]]` blocks, and not allowed together with them. An empty entry, or one with whitespace inside it, is refused. |
+| `remote_addrs` | list of strings | none | proxies | Backends. Required unless the file has `[[pool]]` blocks, and not allowed together with them. An entry without a host (`""`, `":143"`), or one with whitespace inside it, is refused. |
 | `remote_port` | integer or string | none | proxies | Port for backends written without one. |
 | `remote_tls` | bool | `false` | proxies | TLS to the backends (HTTPS for `user_api_proxy`). |
 | `remote_tls_use_starttls` | bool | `false` | line proxies | STARTTLS to the backends. Needs `remote_tls`. |

@@ -48,6 +48,15 @@ components:
       description: >-
         The key is neither api_key nor read_only_api_key, the read-only key was sent with a
         method other than GET, or allowed_hosts is set and does not match the client address.
+        A refused key carries a Bearer challenge with the reason (RFC 6750 section 3.1):
+        `WWW-Authenticate: Bearer realm="admin-api", error="invalid_token"` for a wrong key,
+        `error="insufficient_scope"` for the read-only key on a write. A client address
+        refused by allowed_hosts gets no challenge.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+          example: 'Bearer realm="admin-api", error="invalid_token"'
       content:
         application/json:
           schema:
@@ -481,7 +490,7 @@ components:
           example: 1042
         ContentHash:
           type: string
-          description: "BLAKE3 hash of the message body, its S3 object name."
+          description: "BLAKE3 hash of the message body, the last segment of its S3 key (<domain>/<local part>/<hash>)."
         InstanceID:
           type: string
           description: "The node that staged the body; only that node can upload it."
@@ -2610,7 +2619,7 @@ paths:
           schema:
             type: string
             format: date-time
-          description: "Return metrics recorded after this timestamp (RFC3339). Defaults to 24 hours ago."
+          description: "Return metrics recorded at or after this timestamp (RFC3339). Defaults to 24 hours ago."
         - name: limit
           in: query
           schema:

@@ -667,7 +667,6 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	writeCtx := context.WithoutCancel(ctx)
 
 	// Insert message into database
-	hostname := si.options.InstanceID
 	msgID, uid, err := si.rdb.InsertMessageWithRetry(writeCtx,
 		&db.InsertMessageOptions{
 			AccountID:     user.AccountID(),
@@ -689,7 +688,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 			FTSRetention:  si.options.FTSRetention,
 		},
 		db.PendingUpload{
-			InstanceID:  hostname,
+			InstanceID:  si.options.InstanceID,
 			ContentHash: contentHash,
 			Size:        size,
 			AccountID:   user.AccountID(),
