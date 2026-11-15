@@ -142,8 +142,8 @@ func tlsTestConfig(endpoint string) AdminConfig {
 	}}}
 }
 
-// putServerCertificates stores the autocert cache entries through the server's own S3
-// cache, so the bucket holds exactly the keys a running server writes.
+// putServerCertificates stores valid autocert cache entries through the server's own S3
+// cache, so the bucket holds both the keys and the PEM format a running server writes.
 func putServerCertificates(t *testing.T, cfg AdminConfig, names ...string) {
 	t.Helper()
 	cache, err := tlsmanager.NewS3Cache(cfg.TLS.LetsEncrypt.S3)
@@ -151,7 +151,7 @@ func putServerCertificates(t *testing.T, cfg AdminConfig, names ...string) {
 		t.Fatalf("NewS3Cache: %v", err)
 	}
 	for _, name := range names {
-		if err := cache.Put(context.Background(), name, []byte("certificate for "+name)); err != nil {
+		if err := cache.Put(context.Background(), name, validAutocertEntry(t, name)); err != nil {
 			t.Fatalf("Put %s: %v", name, err)
 		}
 	}
@@ -334,7 +334,7 @@ func TestTLSDeleteKeyLongPrefix(t *testing.T) {
 // TestTLSCacheUsesServerKeys: tls cache reads the objects the server wrote and stores
 // them under the names autocert's DirCache reads, whatever the case of --domain.
 func TestTLSCacheUsesServerKeys(t *testing.T) {
-	_, endpoint := newTLSStubS3(t)
+	stub, endpoint := newTLSStubS3(t)
 	cfg := tlsTestConfig(endpoint)
 	cacheDir := t.TempDir()
 	putServerCertificates(t, cfg, "mail.example.com", "mail.example.com+rsa")
@@ -352,8 +352,11 @@ func TestTLSCacheUsesServerKeys(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if string(data) != "certificate for "+name {
-			t.Errorf("%s holds %q, want the S3 object", name, data)
+		stub.mu.Lock()
+		wantData := stub.objects["/certs/"+tlsmanager.S3ObjectKey(name)]
+		stub.mu.Unlock()
+		if !slices.Equal(data, wantData) {
+			t.Errorf("%s does not match the S3 object", name)
 		}
 	}
 }
