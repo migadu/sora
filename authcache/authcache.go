@@ -75,7 +75,8 @@ type Cache struct {
 
 // New creates a new authentication cache backed by a SQLite database at dbPath, a file
 // path or a file: URI (sqlitefile.Parse).
-// If the existing database is corrupted, it is automatically deleted and recreated.
+// If the existing database is corrupted, it is deleted and recreated only when
+// the URI mode permits creating files (the default or mode=rwc).
 // The cache is strictly optional — callers should handle errors gracefully and
 // continue without caching rather than crashing.
 func New(dbPath string, maxAge, purgeUnused, cleanupInterval time.Duration) (*Cache, error) {

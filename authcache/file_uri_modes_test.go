@@ -134,7 +134,7 @@ func TestURIExistingFileRetainsOptions(t *testing.T) {
 }
 
 func TestURIOptionsThatAllowFileCreation(t *testing.T) {
-	for _, query := range []string{"mode=rwc", "mode=memory&mode=rwc", "vfs=memdb&vfs=unix"} {
+	for _, query := range []string{"mode=rwc", "mode=memory&mode=rwc"} {
 		t.Run(query, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "created.db")
 			c, err := openCacheForURIModeTest(t, (&url.URL{Scheme: "file", Path: path, RawQuery: query}).String())
@@ -151,5 +151,18 @@ func TestURIOptionsThatAllowFileCreation(t *testing.T) {
 				t.Fatalf("created file mode/stat: %v,%v", i, err)
 			}
 		})
+	}
+}
+
+// The modernc driver rejects conflicting VFS values before SQLite opens the DB.
+// Keep the original query so its driver-level option validation still runs.
+func TestURIConflictingVFSIsRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.db")
+	c, err := openCacheForURIModeTest(t, (&url.URL{Scheme: "file", Path: path, RawQuery: "vfs=memdb&vfs=unix"}).String())
+	if c != nil {
+		c.Close()
+	}
+	if err == nil {
+		t.Fatal("conflicting VFS values accepted")
 	}
 }

@@ -60,7 +60,9 @@ func Parse(name string) (path, query string, err error) {
 	path = unescape(uri)
 
 	// SQLite validates access modes in order and uses the last accepted mode
-	// and the last VFS. Validate before callers prepare the file or its directory.
+	// and the last VFS. The raw query is retained so the driver may apply its
+	// own restrictions, including refusal of conflicting VFS values. Validate
+	// modes before callers prepare the file or its directory.
 	mode, _, err := parseMode(query)
 	if err != nil {
 		return "", "", err

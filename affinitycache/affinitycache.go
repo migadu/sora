@@ -51,7 +51,8 @@ type Store struct {
 
 // New creates a new affinity persistence store at dbPath, a file path or a file: URI
 // (sqlitefile.Parse).
-// If the database is corrupted, it is automatically deleted and recreated.
+// If the database is corrupted, it is deleted and recreated only when the URI
+// mode permits creating files (the default or mode=rwc).
 func New(dbPath string) (*Store, error) {
 	file, query, err := sqlitefile.Parse(dbPath)
 	if err == nil && file == "" {
