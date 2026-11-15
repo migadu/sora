@@ -274,6 +274,15 @@ var disabledCapCommands = []struct {
 	{"STATUS=SIZE", "LIST RETURN (STATUS (SIZE))", func(s *IMAPSession) error {
 		return s.List(context.Background(), nil, "", []string{"*"}, &imap.ListOptions{ReturnStatus: &imap.StatusOptions{Size: true}})
 	}},
+	// DELETED is a status data item of IMAP4rev2 (RFC 9051 §6.3.11), not of
+	// RFC 3501.
+	{"IMAP4rev2", "STATUS (DELETED)", func(s *IMAPSession) error {
+		_, err := s.Status(context.Background(), "INBOX", &imap.StatusOptions{NumDeleted: true})
+		return err
+	}},
+	{"IMAP4rev2", "LIST RETURN (STATUS (DELETED))", func(s *IMAPSession) error {
+		return s.List(context.Background(), nil, "", []string{"*"}, &imap.ListOptions{ReturnStatus: &imap.StatusOptions{NumDeleted: true}})
+	}},
 	{"METADATA", "GETMETADATA", func(s *IMAPSession) error {
 		_, err := s.GetMetadata(context.Background(), "", []string{"/shared/comment"}, &imap.GetMetadataOptions{})
 		return err
@@ -435,4 +444,28 @@ func TestList_RefusesReturnMetadataWithoutListMetadata(t *testing.T) {
 		return s.List(context.Background(), nil, "", []string{"*"}, &imap.ListOptions{ReturnMetadata: []string{"/private/comment"}})
 	})
 	assertRefusedAsBad(t, "without LIST-METADATA", "LIST RETURN (METADATA)", err)
+}
+
+// DELETED-STORAGE is QUOTA=RES-STORAGE's status data item (RFC 9208 §4.1.4),
+// which sora does not offer. go-imap parses it whatever the capabilities, and
+// left unset it ended the STATUS line half-written before a tagged NO (#1063).
+// STATUS answers invalid arguments with "BAD - command unknown or arguments
+// invalid" (RFC 9051 §6.3.11).
+func TestStatus_RefusesDeletedStorage(t *testing.T) {
+	srv := newDisabledCapsTestServer(t, IMAPServerOptions{})
+	s := newDisabledCapsTestSession(srv)
+	for _, tc := range []struct {
+		name string
+		call func() error
+	}{
+		{"STATUS (DELETED-STORAGE)", func() error {
+			_, err := s.Status(context.Background(), "INBOX", &imap.StatusOptions{NumMessages: true, DeletedStorage: true})
+			return err
+		}},
+		{"LIST RETURN (STATUS (DELETED-STORAGE))", func() error {
+			return s.List(context.Background(), nil, "", []string{"*"}, &imap.ListOptions{ReturnStatus: &imap.StatusOptions{DeletedStorage: true}})
+		}},
+	} {
+		assertRefusedAsBad(t, "without QUOTA=RES-STORAGE", tc.name, callHandler(tc.call))
+	}
 }

@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
@@ -75,7 +78,12 @@ type UploaderDB interface {
 	// PendingUploadBacklog reports the retryable uploads this instance owns. Scoped to
 	// the instance because a pending upload is leased only by its creator (the body is
 	// a file on that node's disk), so this is the queue this worker alone can drain.
-	PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int) (UploadBacklog, error)
+	//
+	// changed is called once the totals are read, while their snapshot is still held.
+	// It names the bodies whose staged files changed while the measurement was in
+	// flight, and Included reports, from that same snapshot, what the totals count for
+	// each of them.
+	PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int, changed func() []StagedBody) (UploadBacklog, error)
 	// RecordInstanceHeartbeatWithRetry proves this instance still exists. Pending
 	// uploads are leased only by their creating instance, so the cleaner reaps an
 	// unfinished upload once its owner stops beating (db.CleanupFailedUploads).
@@ -88,6 +96,16 @@ type UploadBacklog struct {
 	Count  int64
 	Bytes  int64
 	Oldest time.Time // zero when Count is 0
+	// Included is what Bytes counts for each body the changed callback named; a body
+	// with no entry has no row in the snapshot.
+	Included map[StagedBody]int64
+}
+
+// StagedBody names a body staged on this node: the (account_id, content_hash) pair
+// pending_uploads is unique on.
+type StagedBody struct {
+	AccountID   int64
+	ContentHash string
 }
 
 // resilientUploaderDB adapts the resilient database to UploaderDB, adding the
@@ -98,10 +116,22 @@ type resilientUploaderDB struct {
 
 // PendingUploadBacklog measures the queue this instance still has to write. Served by
 // idx_pending_uploads_instance_id_created_at, so the MIN is an index lookup.
-func (d resilientUploaderDB) PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int) (UploadBacklog, error) {
+//
+// Both statements read one REPEATABLE READ snapshot, so Included tells what the totals
+// already count for each changed body. It is the primary's: a replica's snapshot lags
+// the rows this node's own deliveries have just committed.
+func (d resilientUploaderDB) PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int, changed func() []StagedBody) (UploadBacklog, error) {
+	tx, err := d.BeginTxWithRetry(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return UploadBacklog{}, fmt.Errorf("failed to measure pending upload backlog of instance %s: %w", instanceID, err)
+	}
+	defer tx.Rollback(context.Background())
+	ctx, cancel := context.WithTimeout(ctx, d.GetQueryTimeout())
+	defer cancel()
+
 	var backlog UploadBacklog
 	var oldest sql.NullTime
-	err := d.QueryRowWithRetry(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT COUNT(*), COALESCE(SUM(size), 0), MIN(created_at)
 		FROM pending_uploads
 		WHERE instance_id = $1 AND attempts < $2
@@ -111,6 +141,38 @@ func (d resilientUploaderDB) PendingUploadBacklog(ctx context.Context, instanceI
 	}
 	if oldest.Valid {
 		backlog.Oldest = oldest.Time
+	}
+
+	bodies := changed()
+	if len(bodies) == 0 || backlog.Count == 0 {
+		return backlog, nil
+	}
+	accountIDs := make([]int64, len(bodies))
+	contentHashes := make([]string, len(bodies))
+	for i, body := range bodies {
+		accountIDs[i], contentHashes[i] = body.AccountID, body.ContentHash
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT p.account_id, p.content_hash, p.size
+		FROM unnest($3::bigint[], $4::text[]) AS c(account_id, content_hash)
+		JOIN pending_uploads p ON p.account_id = c.account_id AND p.content_hash = c.content_hash
+		WHERE p.instance_id = $1 AND p.attempts < $2
+	`, instanceID, maxAttempts, accountIDs, contentHashes)
+	if err != nil {
+		return UploadBacklog{}, fmt.Errorf("failed to look up changed staged bodies of instance %s: %w", instanceID, err)
+	}
+	defer rows.Close()
+	backlog.Included = make(map[StagedBody]int64, len(bodies))
+	for rows.Next() {
+		var body StagedBody
+		var size int64
+		if err := rows.Scan(&body.AccountID, &body.ContentHash, &size); err != nil {
+			return UploadBacklog{}, fmt.Errorf("failed to scan changed staged body: %w", err)
+		}
+		backlog.Included[body] = size
+	}
+	if err := rows.Err(); err != nil {
+		return UploadBacklog{}, fmt.Errorf("failed to look up changed staged bodies of instance %s: %w", instanceID, err)
 	}
 	return backlog, nil
 }
@@ -195,6 +257,12 @@ type UploadWorker struct {
 	// accounting so concurrent stagings and removals of the same body cannot drift
 	// currentStagingSize, while keeping temp-file writes and fsyncs parallel outside it.
 	stagingPathLocks [stagingPathLockStripes]sync.Mutex
+	// stagingRefreshMu orders every change of currentStagingSize against the start and
+	// end of a staging refresh, and guards stagingRefresh.
+	stagingRefreshMu sync.Mutex
+	// stagingRefresh is non-nil while monitorStuckUploads measures the backlog: for
+	// each staged path changed meanwhile, the bytes counted for it before that change.
+	stagingRefresh map[string]int64
 	// lastStallReport is when the current stall episode was last reported, in Unix
 	// nanoseconds; 0 means no episode is in progress. Atomic, like currentStagingSize.
 	lastStallReport int64
@@ -851,10 +919,10 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		size := fileSize(filePath)
 		err := w.cache.MoveIn(filePath, upload.ContentHash)
 		if err == nil {
-			w.addStagingSize(-size)
+			w.stagedSizeChanged(filePath, size, 0)
 		} else if size > 0 {
 			if _, statErr := os.Stat(filePath); os.IsNotExist(statErr) {
-				w.addStagingSize(-size)
+				w.stagedSizeChanged(filePath, size, 0)
 			}
 		}
 		pathMu.Unlock()
@@ -1065,6 +1133,23 @@ func StagingFilePath(basePath, contentHash string, accountID int64) string {
 	return filepath.Join(basePath, fmt.Sprintf("%d", accountID), contentHash)
 }
 
+// stagedBodyAt is the inverse of FilePath: the body staged at path, if path is one.
+func (w *UploadWorker) stagedBodyAt(path string) (StagedBody, bool) {
+	rel, err := filepath.Rel(w.path, path)
+	if err != nil {
+		return StagedBody{}, false
+	}
+	account, contentHash, ok := strings.Cut(rel, string(filepath.Separator))
+	if !ok || !isValidContentHash(contentHash) {
+		return StagedBody{}, false
+	}
+	accountID, err := strconv.ParseInt(account, 10, 64)
+	if err != nil {
+		return StagedBody{}, false
+	}
+	return StagedBody{AccountID: accountID, ContentHash: contentHash}, true
+}
+
 // MaxAttempts is the attempts value at which the worker stops leasing a pending upload.
 // Readers use it to tell a row still being retried from one the worker has given up on.
 func (w *UploadWorker) MaxAttempts() int {
@@ -1194,7 +1279,7 @@ func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []
 	previousSize := fileSize(path)
 	renameErr := os.Rename(tmpPath, path)
 	if renameErr == nil {
-		w.addStagingSize(int64(len(data)) - previousSize)
+		w.stagedSizeChanged(path, previousSize, int64(len(data)))
 	}
 	pathMu.Unlock()
 	if renameErr != nil {
@@ -1274,7 +1359,7 @@ func (w *UploadWorker) RemoveLocalFile(path string) error {
 	size := fileSize(path)
 	err := os.Remove(path)
 	if err == nil {
-		w.addStagingSize(-size)
+		w.stagedSizeChanged(path, size, 0)
 	}
 	pathMu.Unlock()
 	if err != nil {
@@ -1286,7 +1371,17 @@ func (w *UploadWorker) RemoveLocalFile(path string) error {
 // monitorStuckUploads checks for uploads that have exceeded max attempts and logs warnings.
 // This provides visibility into failed uploads that need manual intervention.
 func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
-	sizeBeforeQuery := atomic.LoadInt64(&w.currentStagingSize)
+	// The staging size is re-based on the backlog below. Note every staged-file change
+	// from here on, so that each is matched against the backlog's snapshot instead of
+	// assumed to be missing from it. Begun before the stats query, so that a delivery
+	// staged during it is matched too, whichever side of the snapshot its row commits.
+	countedBefore := w.beginStagingRefresh()
+	var changed map[StagedBody]int64
+	endRefresh := func() []StagedBody {
+		changed = w.endStagingRefresh()
+		return slices.Collect(maps.Keys(changed))
+	}
+	defer w.endStagingRefresh() // ends it if the measurement failed before endRefresh did
 
 	stats, err := w.rdb.GetUploaderStatsWithRetry(ctx, w.maxAttempts)
 	if err != nil {
@@ -1301,9 +1396,15 @@ func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
 	// cluster-wide (GetUploaderStats has no instance filter), and max_staging_size
 	// guards this node's own staging directory: rebasing from the cluster total would
 	// make one node's backlog reject deliveries on every node, however empty its disk.
-	// Applied as a delta so that messages staged while the query was in flight - which
-	// the snapshot predates - are not dropped from the count.
-	backlog, backlogErr := w.rdb.PendingUploadBacklog(ctx, w.instanceID, w.maxAttempts)
+	//
+	// Staged files keep changing while the queries run, and the snapshot may or may not
+	// hold a change: a delivery stages its body before its row commits, an upload drops
+	// its row before its body leaves the spool. So a body changed since countedBefore
+	// is counted as it is on disk, as the live counter already counts it, and its share
+	// is taken out of both the snapshot (Included) and countedBefore (before); every
+	// other body is counted as the snapshot has it. Applied as a delta, so changes
+	// after endRefresh, which the snapshot predates, stay counted too.
+	backlog, backlogErr := w.rdb.PendingUploadBacklog(ctx, w.instanceID, w.maxAttempts, endRefresh)
 	if backlogErr != nil {
 		if ctx.Err() != nil {
 			return nil // shutting down
@@ -1311,7 +1412,11 @@ func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
 		// Leave the counter alone rather than rebasing from a number that is not ours.
 		logger.Error("UploaderMonitor: Failed to measure pending upload backlog", "instance_id", w.instanceID, "error", backlogErr)
 	} else {
-		w.addStagingSize(backlog.Bytes - sizeBeforeQuery)
+		delta := backlog.Bytes - countedBefore
+		for body, before := range changed {
+			delta += before - backlog.Included[body]
+		}
+		w.addStagingSize(delta)
 	}
 
 	// Log summary
@@ -1393,9 +1498,54 @@ func (w *UploadWorker) reportStalledBacklog(backlog UploadBacklog) {
 		"hint", "transient S3 errors do not count toward max_attempts, so this backlog never appears in the failed-upload alert; these message bodies exist only on this instance's disk")
 }
 
-// addStagingSize applies a local write or removal to the cached staging size, so the
-// limit guard reflects what happened since the last authoritative refresh in
-// monitorStuckUploads rather than a value that is up to one monitor interval stale.
+// stagedSizeChanged applies a local write or removal of the body staged at path, from
+// before to after bytes, to the cached staging size, so the limit guard reflects what
+// happened since the last authoritative refresh in monitorStuckUploads rather than a
+// value that is up to one monitor interval stale. The caller holds path's staging
+// lock, so before is what is counted for path.
+func (w *UploadWorker) stagedSizeChanged(path string, before, after int64) {
+	if before == after {
+		return
+	}
+	w.stagingRefreshMu.Lock()
+	defer w.stagingRefreshMu.Unlock()
+	if w.stagingRefresh != nil {
+		if _, seen := w.stagingRefresh[path]; !seen {
+			w.stagingRefresh[path] = before
+		}
+	}
+	w.addStagingSize(after - before)
+}
+
+// beginStagingRefresh starts noting staged-file changes for monitorStuckUploads, which
+// runs one at a time on the worker's loop, and returns the staging size they are
+// changes to.
+func (w *UploadWorker) beginStagingRefresh() int64 {
+	w.stagingRefreshMu.Lock()
+	defer w.stagingRefreshMu.Unlock()
+	w.stagingRefresh = make(map[string]int64)
+	return atomic.LoadInt64(&w.currentStagingSize)
+}
+
+// endStagingRefresh stops noting changes and returns, for each body changed since
+// beginStagingRefresh, the bytes counted for it then. A path that does not name a body
+// (none should) is left out, so its change counts as one the snapshot predates.
+func (w *UploadWorker) endStagingRefresh() map[StagedBody]int64 {
+	w.stagingRefreshMu.Lock()
+	paths := w.stagingRefresh
+	w.stagingRefresh = nil
+	w.stagingRefreshMu.Unlock()
+
+	changed := make(map[StagedBody]int64, len(paths))
+	for path, before := range paths {
+		if body, ok := w.stagedBodyAt(path); ok {
+			changed[body] = before
+		}
+	}
+	return changed
+}
+
+// addStagingSize adds delta to the cached staging size, clamped at zero.
 func (w *UploadWorker) addStagingSize(delta int64) {
 	if delta == 0 {
 		return
@@ -1506,7 +1656,7 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 				size := info.Size()
 				removeErr := os.Remove(file.path)
 				if removeErr == nil {
-					w.addStagingSize(-size)
+					w.stagedSizeChanged(file.path, size, 0)
 				}
 				pathMu.Unlock()
 				if removeErr != nil {
