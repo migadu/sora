@@ -2690,7 +2690,7 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 			// the batch did not store is not a failure: its cache rows stay unmarked,
 			// pending for the next run, and importMessages reports the interruption.
 			// The batch returns the interruption, not the error of the call it cut
-			// short ("account not found: ... context canceled").
+			// short ("failed to look up account: ... context canceled").
 			atomic.AddInt64(&i.importedMessages, int64(len(successHashes)))
 			logger.Info("Import interrupted, rest of the batch left for the next run",
 				"imported", len(successHashes), "batch_size", len(batch))
