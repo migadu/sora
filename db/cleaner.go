@@ -1401,8 +1401,10 @@ func (d *Database) CleanupOldHealthStatuses(ctx context.Context, tx pgx.Tx, rete
 	return result.RowsAffected(), nil
 }
 
-// GetMessagesForMailboxAndChildren retrieves all messages for a mailbox and its children
-// This is used by the admin tool for immediate purging of messages
+// GetMessagesForMailboxAndChildren retrieves all messages for a mailbox and its children.
+// accountID is the mailbox owner's account ID (mb.account_id), so shared-mailbox messages
+// are matched whether stored under the owner's account_id or a grantee's; an empty
+// mailboxPath is guarded so corrupt empty paths cannot match the entire account.
 func (d *Database) GetMessagesForMailboxAndChildren(ctx context.Context, accountID int64, mailboxID int64, mailboxPath string) ([]Message, error) {
 	query := `
 		SELECT
@@ -1413,12 +1415,12 @@ func (d *Database) GetMessagesForMailboxAndChildren(ctx context.Context, account
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-		WHERE m.account_id = $1
-		  AND (mb.id = $2 OR mb.path LIKE $3 || '%')
+		WHERE mb.account_id = $1
+		  AND (mb.id = $2 OR ($3 != '' AND mb.path LIKE $3 || '%'))
 		ORDER BY m.id
 	`
 
-	rows, err := d.GetReadPool().Query(ctx, query, accountID, mailboxID, mailboxPath)
+	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, query, accountID, mailboxID, mailboxPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query messages for mailbox and children: %w", err)
 	}
