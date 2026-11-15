@@ -133,8 +133,8 @@ func TestExportImportFoldersNamedAfterDirectoryEntries(t *testing.T) {
 }
 
 // TestExportFailsWhenADovecotFileCannotBeWritten: an export whose subscriptions file or
-// a folder's dovecot-uidlist cannot be written exits non-zero, and the other folders
-// still get their dovecot-uidlist (#1225). Before, both were logged as warnings and
+// a folder's dovecot-uidlist cannot be written exits non-zero, its summary does not
+// report them written, and the other folders still get their dovecot-uidlist (#1225). Before, both were logged as warnings and
 // the export exited 0, and the first uidlist that failed ended the loop. Here the
 // paths are taken by directories, as an export from before #1225 left a mailbox named
 // "subscriptions" in the export root.
@@ -177,13 +177,19 @@ func TestExportFailsWhenADovecotFileCannotBeWritten(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = exporter.Run()
+	summary := captureStdout(t, func() error { err = exporter.Run(); return nil })
 	if err == nil {
 		t.Fatal("export exited 0 although neither the subscriptions file nor Sent's dovecot-uidlist could be written")
 	}
 	for _, want := range []string{"subscriptions", "dovecot-uidlist for mailbox Sent"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("export error %q does not report %q", err, want)
+		}
+	}
+	// The summary printed before the error must not claim the files were written.
+	for _, claim := range []string{"Dovecot subscriptions file exported", "Dovecot uidlist files generated"} {
+		if strings.Contains(summary, claim) {
+			t.Errorf("export summary says %q although the file was not written:\n%s", claim, summary)
 		}
 	}
 	if uidList, err := ParseDovecotUIDList(exportDir); err != nil || uidList == nil || len(uidList.UIDMappings) != 1 {
