@@ -633,13 +633,16 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		warmupMaxConcurrent:          warmupMaxConcurrent,
 		warmupQueue:                  warmupQueue,
 		warmupSemaphore:              warmupSemaphore,
+		// No AUTH= entry: go-imap advertises AUTH= from the session's
+		// AuthenticateMechanisms and never reads it from this set, so one here
+		// would let disabled_caps and client_filters report it removed while
+		// it stays advertised and usable.
 		caps: imap.CapSet{
 			imap.CapIMAP4rev1:                 struct{}{},
 			imap.CapIMAP4rev2:                 struct{}{},
 			imap.CapLiteralPlus:               struct{}{},
 			imap.CapSASLIR:                    struct{}{},
 			imap.CapMove:                      struct{}{},
-			imap.AuthCap("PLAIN"):             struct{}{},
 			imap.CapIdle:                      struct{}{},
 			imap.CapUIDPlus:                   struct{}{},
 			imap.CapESearch:                   struct{}{},
