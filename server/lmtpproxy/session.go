@@ -344,8 +344,10 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			s.DebugLog("Extracted recipient address", "to", to)
-			// No MAIL in effect (none yet or reset): a bad sequence, answered here, as a
-			// backend asked would answer 5xx, which reads as a routing inconsistency below.
+			// No MAIL in effect (none yet, RSET, the end of a transaction, or a MAIL the
+			// proxy refused while a pipelining MTA sent on): a bad sequence, answered here,
+			// as a backend asked would answer 5xx, which reads as a routing inconsistency
+			// below.
 			if !s.mailFromReceived {
 				s.sendResponse("503 5.5.1 Error: need MAIL command")
 				continue
@@ -453,7 +455,7 @@ func (s *Session) handleConnection() {
 			// transaction has no accepted recipient, the recipient is routed as on a
 			// fresh connection: a held backend it does not route to is dropped (nothing
 			// is poisoned) and the connect below reaches the recipient's backend and
-			// re-sends MAIL FROM. Otherwise an MTA that keeps this connection would get
+			// sends MAIL FROM there. Otherwise an MTA that keeps this connection would get
 			// 451 for every transaction whose first recipient lives elsewhere. Once a
 			// recipient is accepted the held backend is the transaction's, and one that
 			// needs another backend gets 451, to be sent in a new transaction.
