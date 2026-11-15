@@ -65,13 +65,14 @@ type IMAPSession struct {
 	selectedReadOnly      atomic.Bool // True when the selected mailbox is read-only: opened with EXAMINE, or SELECTed without any of the 'iestw' rights
 	selectedExamined      atomic.Bool // True when the selected mailbox was opened with EXAMINE itself (RFC 9051 §6.3.3)
 
-	// A CONDSTORE STORE .SILENT answers its changed rows itself with
-	// FETCH (UID MODSEQ) (RFC 7162 §3.1.3). ownStoreMu serializes that STORE
-	// with Poll so Poll can tell those changes from foreign ones; it is taken
-	// before s.mutex, never while holding it. ownStoreEcho maps each UID so
-	// reported to its mod-sequence, in mailbox ownStoreEchoMailboxID; Poll
-	// skips exactly those updates instead of echoing them with FLAGS. Both
-	// fields are guarded by ownStoreMu.
+	// A STORE answers its rows itself: with FETCH (FLAGS) when not .SILENT
+	// (RFC 9051 §6.4.6), with FETCH (UID MODSEQ) for a CONDSTORE .SILENT
+	// (RFC 7162 §3.1.3). ownStoreMu serializes that STORE with Poll so Poll
+	// can tell those rows from foreign changes; it is taken before s.mutex,
+	// never while holding it. ownStoreEcho maps each UID so reported to its
+	// mod-sequence, in mailbox ownStoreEchoMailboxID; Poll skips exactly
+	// those updates instead of reporting them again. Both fields are guarded
+	// by ownStoreMu.
 	ownStoreMu            sync.Mutex
 	ownStoreEcho          map[imap.UID]uint64
 	ownStoreEchoMailboxID int64
