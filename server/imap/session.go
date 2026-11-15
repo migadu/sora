@@ -75,6 +75,8 @@ type IMAPSession struct {
 	lastSelectedMailboxID int64
 	lastHighestUID        imap.UID
 	recentAboveUID        imap.UID    // Messages above this UID are \Recent in this session (RFC 3501 §2.3.2); set by SELECT
+	numRecent             uint32      // The RECENT count: messages above recentAboveUID in the server view (currentNumMessages); set by SELECT, moved by Poll
+	recentUnsent          atomic.Bool // Poll grew the mailbox and has not yet written the RECENT count that goes with that EXISTS
 	useMasterDB           atomic.Bool // Pin session to master DB after a write to ensure consistency
 	selectedReadOnly      atomic.Bool // True when the selected mailbox is read-only: opened with EXAMINE, or SELECTed without any of the 'iestw' rights
 	selectedExamined      atomic.Bool // True when the selected mailbox was opened with EXAMINE itself (RFC 9051 §6.3.3)
@@ -581,6 +583,7 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.reportedHighestModSeq.Store(0)
 	s.reportedModSeqGap.Store(false)
 	s.queuedFlagUpdates.Store(false)
+	s.recentUnsent.Store(false)
 	s.currentNumMessages.Store(0)
 	s.firstUnseenSeqNum.Store(0)
 	s.savedSearchUIDs = nil // saved "$" result is scoped to the selected mailbox

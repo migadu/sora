@@ -252,6 +252,10 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		s.currentNumMessages.Add(^uint32(0)) // Equivalent to -1 for unsigned
 		// Track that the mailbox tracker's count decreased
 		trackerExpectedCount--
+		// An expunged \Recent message leaves the RECENT count with it.
+		if update.UID > s.recentAboveUID && s.numRecent > 0 {
+			s.numRecent--
+		}
 
 		// Mark this sequence number as already expunged to prevent duplicates
 		expungedSeqNums[update.SeqNum] = true
@@ -369,6 +373,20 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		}
 		s.currentNumMessages.Store(poll.NumMessages)
 
+		// RFC 3501 §7.3.2: RECENT "occurs ... if the size of the mailbox changes
+		// (e.g., new messages)", so this EXISTS is followed by the RECENT count
+		// (written once the EXISTS is, below). The new messages follow the
+		// finalCount ones the client knew, and each one counts when it is above
+		// recentAboveUID, the set SEARCH RECENT answers with. Normally that is
+		// all of them; one another read-write session had already seen when this
+		// SELECT read its baseline is not.
+		for _, update := range poll.Updates {
+			if !update.IsExpunge && update.SeqNum > finalCount && update.UID > s.recentAboveUID {
+				s.numRecent++
+			}
+		}
+		s.recentUnsent.Store(true)
+
 		// RFC 3501 §2.3.2: a read-write session that is notified of a message is
 		// the one that sees it as \Recent; later opens must not. Advance the same
 		// baselines a read-write SELECT sets, so that EXAMINE/SELECT after this
@@ -430,6 +448,7 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 
 	// Store sessionTracker reference before releasing lock to avoid race condition
 	sessionTracker := s.sessionTracker
+	numRecent := s.numRecent
 
 	release() // Release the session lock before writing; ownStoreMu stays held (see above)
 
@@ -438,7 +457,17 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		return nil
 	}
 
-	if err := sessionTracker.Poll(w, allowExpunge); err != nil {
+	// The RECENT count goes out once the EXISTS that grew the mailbox has: a
+	// FETCH, STORE or SEARCH holds that EXISTS back behind an EXPUNGE, and a
+	// later poll delivers both. Only with nothing left queued does the client
+	// know the messages numRecent counts. go-imap writes no RECENT to an
+	// IMAP4rev2 session.
+	if err := sessionTracker.PollWith(w, allowExpunge, func() error {
+		if sessionTracker.QueuedUpdates() == 0 && s.recentUnsent.Swap(false) {
+			return w.WriteNumRecent(numRecent)
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	// Every change up to the cursor has been queued, by this poll or an earlier
