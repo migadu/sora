@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -346,5 +348,44 @@ func TestSuccessSendsNoIPGossipForACountNeverShared(t *testing.T) {
 	noCounts.RecordAuthAttempt(ctx, client, "carol@example.com", true)
 	if got := rateLimitBroadcastTypes(t, takeRateLimitBroadcasts(t, noCounts.clusterLimiter)); !reflect.DeepEqual(got, []RateLimitEventType{RateLimitEventUsernameSuccess}) {
 		t.Errorf("a login with sync_failure_counts off queued %v, want only %s", got, RateLimitEventUsernameSuccess)
+	}
+}
+
+// TestSiblingListenersRecordSuccessesConcurrently: a success hands IP_SUCCESS to
+// the protocol's other listeners on the node under their locks while they may be
+// handing this one their failure counts, so the two paths must not deadlock.
+func TestSiblingListenersRecordSuccessesConcurrently(t *testing.T) {
+	node := newSingleNodeCluster(t, "node-1")
+	cfg := ipSuccessTestConfig()
+	cfg.MaxAttemptsPerIP = 1000
+	cfg.DelayStartThreshold = 1
+	limiters := []*AuthRateLimiter{
+		newNodeRateLimiter(t, node, "IMAP-PROXY", "imap-proxy", cfg),
+		newNodeRateLimiter(t, node, "IMAP-PROXY", "imaps-proxy", cfg),
+	}
+
+	ctx := context.Background()
+	client := &net.TCPAddr{IP: net.ParseIP("192.0.2.9"), Port: 40000}
+	var wg sync.WaitGroup
+	for _, limiter := range limiters {
+		for w := range 4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range 50 {
+					limiter.RecordAuthAttempt(ctx, client, fmt.Sprintf("user%d-%d@example.com", w, i), i%5 == 4)
+				}
+			}()
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("listeners recording failures and successes of one address deadlocked")
 	}
 }
