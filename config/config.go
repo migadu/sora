@@ -3007,9 +3007,10 @@ func (s *ServerConfig) Validate() error {
 		// The proxy adds every entry as a backend, as loaded, and routes users to it. The
 		// loader trims each entry's ends; an empty entry, or whitespace left inside one
 		// ("192.0.2.10 :143": no host or IP has any), is a backend that never resolves.
-		// ValidatePools refuses such a [[pool]] backend the same way.
+		// A port alone (":143") is as empty, and worse: a dial to an empty host reaches
+		// this node itself. ValidatePools refuses such a [[pool]] backend the same way.
 		for i, addr := range s.RemoteAddrs {
-			if strings.TrimSpace(addr) == "" {
+			if host, _ := poolBackendHost(addr); host == "" {
 				return fmt.Errorf("server %q: remote_addrs #%d: empty backend address", s.Name, i+1)
 			}
 			if strings.ContainsFunc(addr, unicode.IsSpace) {

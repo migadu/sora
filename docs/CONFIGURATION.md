@@ -191,7 +191,7 @@ to standard error, one for each problem the file has.
 | `master_sasl_username` is set and `master_sasl_password` is empty | `server "<name>": master_sasl_username is set but master_sasl_password is empty; refusing to start ...` |
 | `[[pool]]` blocks are inconsistent (see [section 10](#10-named-backend-pools-pool)) | `[[pool]]: ...` |
 | A proxy server (a type ending in `_proxy`) has no `remote_addrs` and the file has no `[[pool]]` blocks | `server '<name>': remote_addrs is required unless the file declares [[pool]] blocks` |
-| A proxy server has a `remote_addrs` entry that is empty or only spaces | `server "<name>": remote_addrs #<n>: empty backend address` |
+| A proxy server has a `remote_addrs` entry without a host: empty, only spaces, or a port alone such as `":143"` | `server "<name>": remote_addrs #<n>: empty backend address` |
 | A proxy server has a `remote_addrs` entry with whitespace inside it (`"192.0.2.10 :143"`; spaces at the ends are trimmed) | `server "<name>": remote_addrs #<n>: backend address "<entry>" contains whitespace` |
 | A server has `proxy_protocol = true` and `[servers] trusted_networks` is empty | `trusted_networks: proxy_protocol is enabled on server(s) <names> but [servers] trusted_networks is empty; ...` |
 | Two servers have the same `name` | `duplicate server name '<name>' found. Each server must have a unique name` |
@@ -954,7 +954,7 @@ names it.
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
-| `remote_addrs` | list of strings | none | proxies | Backends. Required unless the file has `[[pool]]` blocks, and not allowed together with them. An empty entry, or one with whitespace inside it, is refused. |
+| `remote_addrs` | list of strings | none | proxies | Backends. Required unless the file has `[[pool]]` blocks, and not allowed together with them. An entry without a host (`""`, `":143"`), or one with whitespace inside it, is refused. |
 | `remote_port` | integer or string | none | proxies | Port for backends written without one. |
 | `remote_tls` | bool | `false` | proxies | TLS to the backends (HTTPS for `user_api_proxy`). |
 | `remote_tls_use_starttls` | bool | `false` | line proxies | STARTTLS to the backends. Needs `remote_tls`. |
