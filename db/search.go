@@ -1209,7 +1209,7 @@ func (db *Database) uidsBySeqNumAndLiveLast(ctx context.Context, mailboxID int64
 		SELECT ranked.seqnum, ranked.uid
 		FROM (
 			SELECT uid, ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
-			FROM ` + seqCountedRows("$1", viewParam, "") + ` counted
+			FROM ` + seqCountedRows("$1", viewParam, "", "ASC", "$2") + ` counted
 			ORDER BY uid
 			LIMIT $2
 		) ranked
