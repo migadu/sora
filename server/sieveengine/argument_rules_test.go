@@ -105,12 +105,15 @@ func TestValidateScriptRefusesUnrequiredRegex(t *testing.T) {
 		exts   []string
 	}{
 		{`require "regex"; if header :regex "Subject" "^x" { stop; }`, nil},
+		{`require ["imap4flags", "regex"]; if hasflag :regex "^x" { stop; }`, nil},
+		{`require ["variables", "regex"]; if string :regex "abc" "^a" { stop; }`, nil},
 		{`require "regex"; if address :regex "from" "^x" { stop; }`, nil},
 		{`require ["envelope", "regex"]; if envelope :regex "from" "^x" { stop; }`, nil},
 		{`require ["body", "regex"]; if body :regex "^x" { stop; }`, nil},
 		{`require ["date", "regex"]; if date :regex "date" "year" "^2" { stop; }`, nil},
 		{`require ["date", "regex"]; if currentdate :regex "year" "^2" { stop; }`, nil},
 		{`require ["editheader", "regex"]; deleteheader :regex "X-Foo" "^x";`, editheader},
+		{`require ["editheader", "regex"]; deleteheader :regex "X-Foo";`, editheader},
 	}
 	for _, tc := range accepted {
 		if err := ValidateScript(tc.script, tc.exts); err != nil {
