@@ -411,7 +411,7 @@ right to read a message, the write and delete rights to change its flags.
 |---|---|---|
 | `limit` | `50` | Messages per page. At least 1. Values above 1000 are lowered to 1000. |
 | `offset` | `0` | How many to skip. |
-| `unseen` | `false` | `true`: only messages without `\Seen`. |
+| `unseen` | `false` | `true`: only messages without `\Seen`, including messages with no stored flags. |
 
 Newest arrival first (by `internal_date`).
 
@@ -556,7 +556,7 @@ its results, and all supplied filters must match:
 |---|---|
 | `from` | Literal substring of any sender's address or display name, ignoring case. |
 | `subject` | Literal substring of the subject, ignoring case. |
-| `unseen=true` | Only messages without `\\Seen`, including messages with no stored flags. |
+| `unseen=true` | Only messages without `\Seen`, including messages with no stored flags. |
 
 The text filters have no wildcard syntax. A `q`, `from` or `subject` containing a NUL or
 invalid UTF-8 is refused with `400 Bad Request`.
