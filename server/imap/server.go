@@ -1381,12 +1381,20 @@ func (s *IMAPServer) warmupStatePath() string {
 	return filepath.Join(s.cache.GetBasePath(), fmt.Sprintf("%s.%x", warmupStateFile, sha256.Sum256([]byte(s.name))))
 }
 
+// keepsWarmupState reports whether this server has a cache directory to keep its
+// warmup state in. A cache without a base path (the zero-value cache.Cache test
+// fixtures pass; cache.New refuses an empty one) has none: a path joined onto the
+// empty base path names the working directory, which is no place for runtime state.
+func (s *IMAPServer) keepsWarmupState() bool {
+	return s.cache != nil && s.cache.GetBasePath() != ""
+}
+
 // persistWarmupState saves lastWarmupTimes to disk so that after restart,
 // users whose caches are still warm don't trigger unnecessary warmup storms.
 // Format: one line per entry, "accountID unixTimestamp\n"
 // Best-effort: errors are logged but don't affect shutdown.
 func (s *IMAPServer) persistWarmupState() {
-	if s.cache == nil {
+	if !s.keepsWarmupState() {
 		return
 	}
 
@@ -1443,7 +1451,7 @@ func (s *IMAPServer) loadWarmupState() {
 		}
 	}()
 
-	if s.cache == nil {
+	if !s.keepsWarmupState() {
 		return
 	}
 
