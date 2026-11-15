@@ -382,19 +382,22 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Validate before creating parents, so a refused rename leaves no hierarchy. The
-	// namespace boundary is checked against the stored flag, as db.RenameMailbox does:
-	// a personal mailbox under the shared prefix may only be renamed out of it.
-	isShared, err := rdb.IsMailboxSharedWithRetry(ctx, mbox.ID)
-	if err != nil {
-		fmt.Printf("Failed to check whether mailbox '%s' is shared: %v\n", *oldName, err)
-		os.Exit(1)
-	}
-	// As on IMAP RENAME, a trailing delimiter is no part of the new name, and a name
-	// with an empty, "." or ".." level is refused.
+	// Validate before creating parents, so a refused rename leaves no hierarchy. As on
+	// IMAP RENAME, a trailing delimiter is no part of the new name, and a name with an
+	// empty, "." or ".." level is refused.
 	created, nameErr := helpers.MailboxNameToCreate(*newName)
-	if nameErr != nil ||
-		(globalConfig.SharedMailboxes.Enabled && globalConfig.SharedMailboxes.InNamespace(created) != isShared) {
+	// The namespace boundary is checked against the stored flags, as db.RenameMailbox
+	// does: a personal mailbox under the shared prefix may only be renamed out of it,
+	// and the descendants the rename carries along must stay on their side too.
+	crosses := false
+	if nameErr == nil {
+		crosses, err = rdb.RenameCrossesSharedBoundaryWithRetry(ctx, globalConfig.SharedMailboxes, mbox, created)
+		if err != nil {
+			fmt.Printf("Failed to check mailbox '%s' against the shared namespace: %v\n", *oldName, err)
+			os.Exit(1)
+		}
+	}
+	if nameErr != nil || crosses {
 		fmt.Println("Failed to rename mailbox: invalid destination or shared namespace boundary")
 		os.Exit(1)
 	}

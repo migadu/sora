@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/retry"
@@ -85,6 +86,19 @@ func (rd *ResilientDatabase) IsMailboxSharedWithRetry(ctx context.Context, mailb
 		return rd.getOperationalDatabaseForOperation(ctx, false).IsMailboxShared(ctx, mailboxID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
+
+// RenameCrossesSharedBoundaryWithRetry reports whether renaming mbox to newName would
+// take it, or a live descendant, across the shared namespace boundary.
+func (rd *ResilientDatabase) RenameCrossesSharedBoundaryWithRetry(ctx context.Context, shared config.SharedMailboxesConfig, mbox *db.DBMailbox, newName string) (bool, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).RenameCrossesSharedBoundary(ctx, shared, mbox, newName)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
 	if err != nil {
 		return false, err
 	}
