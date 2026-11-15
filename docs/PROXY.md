@@ -130,7 +130,7 @@ carries its own copy and these server keys are not used for pool members (except
 | `timeouts.absolute_session_timeout` | `24h`, LMTP `5m` | Longest a session may last. |
 | `timeouts.min_bytes_per_minute` | `0` (off) | Slow-client guard. |
 | `max_connections` | `0` (unlimited) | Per proxy listener. |
-| `max_connections_per_ip` | `0` (unlimited) | Per proxy listener. The LMTP proxy ignores it with a warning. With `[cluster]` enabled, the IMAP, POP3 and ManageSieve proxies count an address's connections on every node; see [CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies). |
+| `max_connections_per_ip` | `0` (unlimited) | Per proxy listener. The LMTP proxy ignores it with a warning. With `[cluster]` enabled, the IMAP, POP3 and ManageSieve proxies count an address's connections on every node; see [CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies). With `proxy_protocol`, the address counted is the client the header names ([SECURITY.md](SECURITY.md#4-connection-limits)). |
 | `max_connections_per_user`, `max_connections_per_user_per_ip` | `0` | IMAP, POP3 and ManageSieve proxies only, and only with `[cluster]` enabled; see [CLUSTER.md](CLUSTER.md). The LMTP proxy ignores them with a warning. |
 | `limits.max_auth_errors` | `2` | Protocol errors before login (unknown or malformed commands, logins refused without TLS) before the connection is closed. Wrong passwords do not count. |
 | `auth_rate_limit` | off | See [AUTHENTICATION.md](AUTHENTICATION.md). With `[cluster]` enabled, the IMAP, POP3 and ManageSieve proxies share it; see [CLUSTER.md](CLUSTER.md#66-authentication-rate-limits-imap-pop3-and-managesieve-proxies). |
@@ -726,13 +726,25 @@ With `remote_use_id_command`, the IMAP proxy sends one `ID` command before it lo
 are `name` (`Sora-Proxy`), `x-originating-ip`, `x-originating-port`, `x-connected-ip`,
 `x-connected-port`, `x-session-id`, `x-proxy-ttl` (10), and `x-forward-proxy-server`,
 `x-forward-proxy-user`, `x-forward-proxy-source-ip` and, when known, `x-forward-ja4-fingerprint`. A
-failure is logged and the login continues.
+backend that refuses it (a tagged `NO` or `BAD`) is logged and the login continues without the
+fields. When the tagged reply is not read within `connect_timeout`, or the connection fails before
+it, the login fails as a backend failure (`NO [UNAVAILABLE]`): a late reply would be read as the
+reply to the login.
 
 ### 8.6 XCLIENT
 
 With `remote_use_xclient`, the POP3 proxy sends `XCLIENT ADDR=... PORT=... SESSION=... TTL=10
 FORWARD=...` before it logs in; the LMTP proxy sends `XCLIENT ADDR=... PORT=... HELO=...
-PROTO=ESMTP` (IPv6 addresses as `ADDR=IPV6:...`).
+PROTO=ESMTP` (IPv6 addresses as `ADDR=IPV6:...`) before `MAIL FROM`.
+
+A refusal (POP3 `-ERR`; LMTP `5xx`, or `4xx` other than `421`) is logged and the session
+continues. The client's address can still have been supplied by a PROXY header. When the reply
+is not read within `connect_timeout` (for an LMTP
+backend that answers with a new `220` greeting, also the reply to the `LHLO` the proxy then sends),
+the backend connection fails: POP3 answers `-ERR [SYS/TEMP]`, LMTP `451 4.4.1`. A late reply would
+otherwise be read as the reply to the next command (POP3 replies carry no tag, so a late `+OK` would
+pass for the login's). The LMTP connection also fails on a `421`, on a malformed reply or one with
+any other code, and when the backend does not answer that `LHLO` with `250`.
 
 ### 8.7 POP3 UTF8
 
@@ -978,11 +990,11 @@ cache_path = "/var/lib/sora/affinity_cache.db"
 ```
 
 - Used only with `[cluster]` and `[cluster.affinity]` enabled and `cache_path` set.
-- At startup, entries that have not expired are loaded. The gossip handler is registered
-  before the file is loaded, and queues incoming
-  events until the initial snapshot is ready. Those events are then applied and written using
-  their timestamps: an older SET cannot replace a newer stored assignment, and a newer delete
-  removes the stored entry.
+- At startup, entries that have not expired are loaded. The file is opened before the node joins
+  the cluster, and the gossip handler is registered right after the join, before the file is
+  loaded; it queues incoming events until the initial snapshot is ready. Those events are then
+  applied and written using their timestamps: an older SET cannot replace a newer stored
+  assignment, and a newer delete removes the stored entry.
 - Every change (set, update, delete, also those received by gossip) is written to the file in the
   background, in the order the changes were made, each write with a 2-second limit. A key changed
   again before its write starts is written once, with its latest state. Gossip changes apply only

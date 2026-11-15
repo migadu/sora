@@ -369,7 +369,7 @@ writes move to the server that answers as primary within one check interval.
 ### Advisory locks across a failover
 
 Sora orders the deletion of a message body in S3 (the cleaner, account purges, `import rekey`)
-against the writes that claim one (uploads, restores, cross-account copies) with advisory locks
+against the writes that claim one (uploads, restores, cross-account copies and moves) with advisory locks
 on the write host. A lock excludes only what runs on the server that holds it. So when Sora stops
 writing through a server, it revokes the locks it holds there: the work they guard is cancelled
 (a cleanup batch or purge runs again in a later cycle; a copy or `import rekey` fails and can be
@@ -461,7 +461,7 @@ These hold one server connection behind the pooler for as long as they run:
 |---|---|
 | The cleanup cycle | Two on the node running the cycle: one for the whole cycle, one during each batch of S3 deletes. |
 | An account purge | One per node while it purges an account. |
-| IMAP `COPY` into a folder owned by another account | One per copy in progress, across the S3 copy. |
+| IMAP `COPY` or `MOVE` into a folder owned by another account | One per command in progress: its own transaction, from the S3 check and copy until its rows commit. |
 | Migrations | Two on the node applying them, for the whole run: the leader lock and the connection the migrations run on. |
 
 S3 uploads hold no connection across the transfer. An upload uses the pool only for a few short
@@ -470,7 +470,7 @@ statements, so `[uploader] concurrency` is bounded by S3, not by the pool.
 Size the pooler's pool for Sora's database user with this in mind:
 
 ```
-pool_size >= 2 + headroom for interactive writes, cross-account copies and uploader statements
+pool_size >= 2 + headroom for interactive writes, cross-account copies and moves, and uploader statements
 ```
 
 A pool sized only for short IMAP and LMTP transactions can queue mail delivery behind the

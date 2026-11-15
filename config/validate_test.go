@@ -245,6 +245,15 @@ func TestConfigValidateWhatServiceSetupRefuses(t *testing.T) {
 			want: []problem{{"[database.read]", `invalid max_conn_idle_time "idle"`}}},
 		{name: "database.read without hosts is not checked", content: db + "\n[database.read]\nhosts = []\nmax_conn_idle_time = \"idle\"\n" + managesieve},
 		{name: "database on a node that queries none is not checked", content: "[database]\nmigration_timeout = \"soon\"\n\n" + db + "max_conn_lifetime = \"an hour\"\n" + metrics},
+		// So is a host whose connection string cannot be built from the endpoint's port.
+		{name: "database ports", content: db + "port = 5433\n\n[database.read]\nhosts = [\"replica.example.com\"]\nport = \"5434\"\n" + managesieve},
+		{name: "database.write port out of range", content: db + "port = 70000\n" + managesieve,
+			want: []problem{{"[database.write]", "port number 70000 is out of the valid range (1-65535)"}}},
+		{name: "database.read port not a number", content: db + "\n[database.read]\nhosts = [\"replica.example.com\"]\nport = \"x\"\n" + managesieve,
+			want: []problem{{"[database.read]", `invalid string for port: "x"`}}},
+		{name: "database port unused when every host names one", content: "[database.write]\nhosts = [\"db.example.com:5433\"]\nport = \"x\"\n" + managesieve},
+		{name: "database.write host port not a number", content: "[database.write]\nhosts = [\"db.example.com:5433\", \"db2.example.com:abc\"]\n" + managesieve,
+			want: []problem{{"[database.write]", `invalid port "abc" in host "db2.example.com:abc"`}}},
 
 		// #1105: the TLS manager refused these last, after every other service was up.
 		{name: "tls letsencrypt", content: tls + "renew_before = \"720h\"\nsync_interval = \"0\"\n" + metrics},
@@ -265,6 +274,18 @@ func TestConfigValidateWhatServiceSetupRefuses(t *testing.T) {
 			want: []problem{{"[tls]", `invalid renew_before duration "a month"`}}},
 		{name: "tls letsencrypt sync_interval unparsable", content: tls + "sync_interval = \"often\"\n" + metrics,
 			want: []problem{{"[tls]", `invalid sync_interval duration "often"`}}},
+		// The certificate store's client and its encryption settings are refused from the
+		// file as well, before the store is reached.
+		{name: "tls letsencrypt s3", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\naccess_key = \"AKIAEXAMPLE\"\nsecret_key = \"example-secret\"\nserver_side_encryption = \"aws:kms\"\nserver_side_encryption_kms_key_id = \"example-key\"\n" + metrics},
+		{name: "tls letsencrypt s3 without server-side encryption", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption = \"\"\n" + metrics},
+		{name: "tls letsencrypt s3 access_key without secret_key", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\naccess_key = \"AKIAEXAMPLE\"\n" + metrics,
+			want: []problem{{"[tls]", "letsencrypt.s3: access_key and secret_key must be set together"}}},
+		{name: "tls letsencrypt s3 server_side_encryption unsupported", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption = \"rot13\"\n" + metrics,
+			want: []problem{{"[tls]", `letsencrypt.s3: unsupported server-side encryption "rot13"`}}},
+		{name: "tls letsencrypt s3 aws:kms without key id", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption = \"aws:kms\"\n" + metrics,
+			want: []problem{{"[tls]", `letsencrypt.s3: server-side encryption "aws:kms" requires a KMS key id`}}},
+		{name: "tls letsencrypt s3 key id without aws:kms", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption_kms_key_id = \"example-key\"\n" + metrics,
+			want: []problem{{"[tls]", `letsencrypt.s3: a KMS key id is only used by server-side encryption "aws:kms", not "AES256"`}}},
 		{name: "tls disabled is not checked", content: "[tls]\nenabled = false\nprovider = \"acme\"\n" + metrics},
 
 		// #1325: start-up exits on a shard_count below -1, after it has set up logging.
@@ -322,6 +343,8 @@ func TestConfigValidateProxyNeedsBackends(t *testing.T) {
 // TestConfigValidateProxyRefusesEmptyRemoteAddr: an empty remote_addrs entry passed
 // Validate, and the proxy was built with "" as a backend and routed users to it. Validate
 // refuses it as ValidatePools refuses an empty [[pool]] backend, naming the entry (#1147).
+// A port alone (":143") has an empty host too: the proxy dials it, and an empty host
+// dials this node itself.
 func TestConfigValidateProxyRefusesEmptyRemoteAddr(t *testing.T) {
 	tests := []struct {
 		remoteAddrs string
@@ -330,7 +353,10 @@ func TestConfigValidateProxyRefusesEmptyRemoteAddr(t *testing.T) {
 		{`[""]`, `server "proxy": remote_addrs #1: empty backend address`},
 		{`[" "]`, `server "proxy": remote_addrs #1: empty backend address`},
 		{`["192.0.2.10:143", "\t"]`, `server "proxy": remote_addrs #2: empty backend address`},
+		{`[":143"]`, `server "proxy": remote_addrs #1: empty backend address`},
+		{`["192.0.2.10:143", "[]:143"]`, `server "proxy": remote_addrs #2: empty backend address`},
 		{`["192.0.2.10:143", "backend.example.com"]`, ""},
+		{`["[2001:db8::1]:143", "2001:db8::2"]`, ""},
 	}
 	var proxies int
 	for _, typ := range ServerTypes {
@@ -355,6 +381,17 @@ func TestConfigValidateProxyRefusesEmptyRemoteAddr(t *testing.T) {
 	}
 	if proxies != 5 {
 		t.Errorf("checked %d proxy types, want the 5 proxies", proxies)
+	}
+
+	// The [[pool]] check refuses the same entries.
+	for _, backend := range []string{`""`, `" "`, `":143"`, `"[]:143"`} {
+		t.Run("pool "+backend, func(t *testing.T) {
+			got := validateFile(t, storageTOML+"\n[[server]]\ntype = \"imap_proxy\"\nname = \"proxy\"\naddr = \"127.0.0.1:1143\"\nremote_port = 143\n"+
+				"\n[[pool]]\nname = \"sora0\"\ndefault = true\nbackends = ["+backend+"]\n")
+			if len(got) != 1 || got[0].Section != "[[pool]]" || !strings.Contains(got[0].Err.Error(), `[[pool]] "sora0": empty backend address`) {
+				t.Errorf("Validate() = %v, want [[pool]]: empty backend address", got)
+			}
+		})
 	}
 }
 

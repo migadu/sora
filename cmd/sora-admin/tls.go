@@ -22,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/storage"
@@ -1531,7 +1532,12 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			// Download from S3
 			reader, err := s3store.Get(s3Key)
 			if err != nil {
-				if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), "not found") {
+				// Only NoSuchKey, S3's answer for an object that does not exist, means the
+				// variant is absent. The message is the provider's free text: matching it
+				// for "not found" passed a missing bucket or a refusal off as absent and
+				// exited 0 without caching anything.
+				var noSuchKey *types.NoSuchKey
+				if errors.As(err, &noSuchKey) {
 					logger.Info("Certificate not found in S3", "domain", domain, "type", variant.name)
 					notFound++
 				} else {
