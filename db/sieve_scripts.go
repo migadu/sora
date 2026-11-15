@@ -108,6 +108,16 @@ func (db *Database) CreateScript(ctx context.Context, tx pgx.Tx, AccountID int64
 	if !helpers.TextStorable(name) || !helpers.TextStorable(script) {
 		return nil, ErrSieveScriptNotStorable
 	}
+	// The limit is checked against the stored count and then inserted, so two
+	// creates of the account must not both read the old count: each would pass,
+	// and together they would store past the limit. The lock is
+	// transaction-scoped (pgbouncer transaction mode), and the count below runs
+	// after it is granted, so under READ COMMITTED it sees what the previous
+	// holder committed.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int4, hashint8($2::int8))",
+		consts.SoraSieveScriptLimitLockClassID, AccountID); err != nil {
+		return nil, fmt.Errorf("failed to lock account sieve scripts: %w", err)
+	}
 	var count int
 	if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM sieve_scripts WHERE account_id = $1", AccountID).Scan(&count); err != nil {
 		return nil, err
