@@ -392,6 +392,20 @@ func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options Server
 
 // Serve starts the server in the background; a failure to serve is sent to errChan.
 func (s *Server) Serve(ctx context.Context, errChan chan error) {
+	go func() {
+		if err := s.Run(ctx); err != nil && ctx.Err() == nil {
+			errChan <- fmt.Errorf("HTTP API server failed: %w", err)
+		}
+	}()
+}
+
+// Run starts the HTTP server and blocks until it stops. It returns nil when
+// stopped via ctx cancellation.
+func (s *Server) Run(ctx context.Context) error {
+	if ctx.Err() != nil {
+		return nil
+	}
+
 	protocol := "HTTP"
 	if s.tls {
 		protocol = "HTTPS"
@@ -401,18 +415,10 @@ func (s *Server) Serve(ctx context.Context, errChan chan error) {
 		serverName = "default"
 	}
 	logger.Info("HTTP API: Starting server", "name", serverName, "protocol", protocol, "addr", s.addr)
-	go func() {
-		if err := s.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
-			errChan <- fmt.Errorf("HTTP API server failed: %w", err)
-		}
-	}()
-}
 
-// start initializes and starts the HTTP server
-func (s *Server) start(ctx context.Context) error {
 	router := s.setupRoutes()
 
-	s.server = &http.Server{
+	httpServer := &http.Server{
 		Addr:    s.addr,
 		Handler: router,
 		// ReadHeaderTimeout bounds slowloris-on-headers. Read/Write are generous on
@@ -424,14 +430,30 @@ func (s *Server) start(ctx context.Context) error {
 		WriteTimeout:      5 * time.Minute,
 		IdleTimeout:       120 * time.Second,
 	}
+	if s.tls {
+		httpServer.TLSConfig = s.tlsConfig
+	}
+	s.server = httpServer
+
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	stopCtx, stopCancel := context.WithCancel(ctx)
+	defer stopCancel()
 
 	// Graceful shutdown
+	shutdownDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
+		defer close(shutdownDone)
+		<-stopCtx.Done()
+		if ctx.Err() == nil {
+			return
+		}
 		logger.Info("HTTP API: Shutting down server", "name", s.name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := s.server.Shutdown(shutdownCtx); err != nil {
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			logger.Warn("HTTP API: Error shutting down server", "name", s.name, "error", err)
 		}
 	}()
@@ -439,6 +461,8 @@ func (s *Server) start(ctx context.Context) error {
 	// Create listener
 	listener, err := net.Listen("tcp", s.addr)
 	if err != nil {
+		stopCancel()
+		<-shutdownDone
 		return fmt.Errorf("failed to create listener: %w", err)
 	}
 
@@ -457,14 +481,27 @@ func (s *Server) start(ctx context.Context) error {
 		listener = netutil.LimitListener(listener, s.maxConnections)
 	}
 
+	if ctx.Err() != nil {
+		listener.Close()
+		<-shutdownDone
+		return nil
+	}
+
 	// Start server with or without TLS. The certificate is in TLSConfig
 	// already: certificate files passed to ServeTLS would be loaded again and
 	// served, next to the global certificate, to clients that send no SNI.
 	if s.tls {
-		s.server.TLSConfig = s.tlsConfig
-		return s.server.ServeTLS(listener, "", "")
+		err = httpServer.ServeTLS(listener, "", "")
+	} else {
+		err = httpServer.Serve(listener)
 	}
-	return s.server.Serve(listener)
+	if errors.Is(err, http.ErrServerClosed) && ctx.Err() != nil {
+		<-shutdownDone
+		return nil
+	}
+	stopCancel()
+	<-shutdownDone
+	return err
 }
 
 // setupRoutes configures all HTTP routes and middleware
