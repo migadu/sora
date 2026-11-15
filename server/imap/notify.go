@@ -666,12 +666,27 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 
 		// Guard against a read-pool failover to a more-lagged replica, whose
 		// sharply smaller view would otherwise be diffed into a storm of false
-		// deletions (and, next tick, false creations). Skip the whole tick and
-		// keep the prior snapshot/marks; retry next tick.
-		if watch.snapshot != nil && notifySnapshotLooksStale(watch.snapshot, snapshot) {
-			s.WarnLog("NOTIFY: account snapshot shrank sharply, likely replica lag; skipping tick",
-				"prev", len(watch.snapshot), "cur", len(snapshot))
-			return false, nil
+		// deletions (and, next tick, false creations). A genuine bulk delete
+		// looks the same, so re-read the account from the primary, which
+		// cannot lag, and go on with its view either way (the STATUS fan-in
+		// of this tick reads from it too). Skipping the tick instead would
+		// keep the previous snapshot, and with it the same verdict, on every
+		// later tick. A session pinned to the primary has read from it
+		// already.
+		if pinned, _ := readCtx.Value(consts.UseMasterDBKey).(bool); !pinned &&
+			watch.snapshot != nil && notifySnapshotLooksStale(watch.snapshot, snapshot) {
+			replicaLen := len(snapshot)
+			readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+			snapshot, matchedIDs, err = s.notifySnapshotAndMatches(readCtx, watch, selectedID)
+			if err != nil {
+				s.WarnLog("NOTIFY: account snapshot shrank sharply and the primary re-read failed; skipping tick",
+					"prev", len(watch.snapshot), "replica", replicaLen, "error", err)
+				return false, nil
+			}
+			if !notifySnapshotLooksStale(watch.snapshot, snapshot) {
+				s.WarnLog("NOTIFY: account snapshot shrank sharply on the read pool, likely replica lag; using the primary's",
+					"prev", len(watch.snapshot), "replica", replicaLen, "primary", len(snapshot))
+			}
 		}
 
 		if watch.wantsTreeEvents() {
@@ -901,10 +916,10 @@ func diffNotifySnapshots(prev, cur map[int64]notifySnapshotEntry) []notifyTreeEv
 
 // notifySnapshotLooksStale reports whether cur is a sharply smaller view of the
 // account than prev — the signature of a read-pool failover to a more-lagged
-// replica rather than a real bulk deletion. Used to suppress a whole fan-in
-// tick so it does not emit a storm of false \NonExistent (then, next tick,
-// false creation) LIST events. Genuine bulk deletes beyond the threshold are
-// reported when the client next re-LISTs.
+// replica, and also of a genuine bulk delete. The pump then re-reads the
+// account from the primary to tell the two apart, so a lagging replica does
+// not emit a storm of false \NonExistent (then, next tick, false creation)
+// LIST events and a real bulk delete is still reported.
 func notifySnapshotLooksStale(prev, cur map[int64]notifySnapshotEntry) bool {
 	return len(prev) >= 4 && len(cur)*2 < len(prev)
 }
