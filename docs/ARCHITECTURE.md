@@ -249,8 +249,8 @@ safely.
 | Sieve scripts, vacation reply records | PostgreSQL | |
 | The upload queue and node heartbeats | PostgreSQL (`pending_uploads`, `instance_heartbeats`) | |
 | Message bodies | S3 bucket | Keyed `<domain>/<localpart>/<content hash>`. See [STORAGE.md](STORAGE.md#2-s3-keys). |
-| Bodies not yet uploaded | Local disk of the node that accepted them, `[uploader] path` (default `/tmp/sora/uploads`) | The only copy until the upload finishes. |
-| Cached bodies | Local disk, `[local_cache] path` (default `/tmp/sora/cache`) | Disposable. |
+| Bodies not yet uploaded | Local disk of the node that accepted them, `[uploader] path` (default `/var/spool/sora/uploads`) | The only copy until the upload finishes. |
+| Cached bodies | Local disk, `[local_cache] path` (default `/var/cache/sora/cache`) | Disposable. |
 | Outgoing relay messages | Local disk, `[relay.queue] path` (default `/var/spool/sora/relay`) | See [RELAY.md](RELAY.md). |
 | Auth cache, affinity cache | Local SQLite files on proxy nodes | Disposable. See [PROXY.md](PROXY.md). |
 | Let's Encrypt certificates | The S3 bucket in `[tls.letsencrypt.s3]`, mirrored to a local fallback directory | See [TLS.md](TLS.md). |
