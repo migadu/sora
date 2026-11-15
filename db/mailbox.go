@@ -1182,6 +1182,54 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailbox
 	return db.Unsubscribe(ctx, tx, AccountID, mboxName)
 }
 
+// renameCrossesSharedBoundary reports whether renaming the mailbox oldName, at oldPath
+// of accountID, to newName takes it or a live descendant the rename carries along to
+// the other side of the shared namespace boundary from its is_shared. A descendant
+// can cross although the mailbox does not: below a namespace_prefix of several levels
+// ("Foo" -> "Team" takes "Foo/Shared" to the root of "Team/Shared/"), or below a
+// personal mailbox at the namespace root that has shared children. Each new name is
+// computed as RenameMailbox's child UPDATE computes it, and classified by InNamespace
+// as at creation. forUpdate locks the rows read, for a caller in the rename's
+// transaction.
+func renameCrossesSharedBoundary(ctx context.Context, q rowsQuerier, shared *config.SharedMailboxesConfig, accountID int64, oldName, oldPath, newName string, forUpdate bool) (bool, error) {
+	query := `
+		SELECT $3 || SUBSTRING(name FROM LENGTH($4) + 1), COALESCE(is_shared, FALSE)
+		FROM mailboxes
+		WHERE account_id = $1 AND path LIKE $2 || '%' AND deleted_at IS NULL`
+	if forUpdate {
+		query += " FOR UPDATE"
+	}
+	rows, err := q.Query(ctx, query, accountID, oldPath, newName, oldName)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		var isShared bool
+		if err := rows.Scan(&name, &isShared); err != nil {
+			return false, err
+		}
+		if shared.InNamespace(name) != isShared {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// RenameCrossesSharedBoundary reports whether renaming mbox to newName would take it,
+// or a live descendant, across the shared namespace boundary, which RenameMailbox
+// refuses with consts.ErrMailboxSharedBoundary. For callers that create the new name's
+// parents before renaming, so that a refused rename leaves none behind.
+func (db *Database) RenameCrossesSharedBoundary(ctx context.Context, shared config.SharedMailboxesConfig, mbox *DBMailbox, newName string) (bool, error) {
+	// An empty path would match every mailbox of the account; RenameMailbox refuses
+	// to rename such a mailbox at all.
+	if !shared.Enabled || mbox.Path == "" {
+		return false, nil
+	}
+	return renameCrossesSharedBoundary(ctx, db.GetReadPoolWithContext(ctx), &shared, mbox.AccountID, mbox.Name, mbox.Path, newName, false)
+}
+
 func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64) error {
 	// The same names createMailbox refuses: control characters, empty levels and
 	// "." / ".." levels (maildir-export path traversal).
@@ -1207,9 +1255,13 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 
 	// Whether a mailbox is shared (is_shared, owner_domain, its ACL) is settled when
 	// it is created in or outside the shared namespace; a rename to the other side
-	// would leave that describing the old name, so it is refused (issue #160).
-	if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.Enabled &&
-		cfg.SharedMailboxes.InNamespace(newName) != isShared {
+	// would leave that describing the old name, so it is refused (issue #160). The
+	// descendants the rename carries along are checked below, once they are locked.
+	var sharedCfg *config.SharedMailboxesConfig
+	if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.Enabled {
+		sharedCfg = &cfg.SharedMailboxes
+	}
+	if sharedCfg != nil && sharedCfg.InNamespace(newName) != isShared {
 		return consts.ErrMailboxSharedBoundary
 	}
 
@@ -1317,6 +1369,20 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		delimiter := string(consts.MailboxDelimiter)
 		oldPrefix := oldName + delimiter
 		newPrefix := newName + delimiter
+
+		// The descendants cross the boundary with the rename (issue #1229). Their rows
+		// are locked here: the child UPDATE below locks them anyway, and a concurrent
+		// rename inside the subtree must not change a name once it has been checked.
+		if sharedCfg != nil {
+			crosses, err := renameCrossesSharedBoundary(ctx, tx, sharedCfg, ownerAccountID, oldName, oldPath, newName, true)
+			if err != nil {
+				logger.Error("Database: failed to check children of mailbox against the shared namespace", "mailbox_id", mailboxID, "err", err)
+				return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
+			}
+			if crosses {
+				return consts.ErrMailboxSharedBoundary
+			}
+		}
 
 		// Check if any child's new name would conflict with an existing mailbox
 		var conflictCount int
