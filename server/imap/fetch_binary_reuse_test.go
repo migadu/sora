@@ -165,7 +165,7 @@ func TestFetch_BinaryChunksReuseDecodedSection(t *testing.T) {
 		t.Errorf("BINARY[1] without a body = %d bytes, %v; want an empty section", len(other.sections[0]), err)
 	}
 	w := &fakeBodySectionWriter{tracker: tracker}
-	if err := s.handleBodySections(context.Background(), w, &noBody, &noBodyFetched, &imap.FetchOptions{
+	if err := fetchBodySections(s, w, &noBody, &noBodyFetched, &imap.FetchOptions{
 		BodySection: []*imap.FetchItemBodySection{{Part: []int{2}, Peek: true, Partial: &imap.SectionPartial{Offset: 0, Size: chunk}}},
 	}, msg); err != nil {
 		t.Fatalf("BODY[2]: %v", err)

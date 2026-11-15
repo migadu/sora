@@ -60,13 +60,42 @@ func TestClientFiltersPatternAccepted(t *testing.T) {
 	for _, tt := range []struct{ serverType, filters string }{
 		{"imap", `client_name = "com\\.apple\\.email\\.maild"` + "\nclient_version = \"16\\\\..*\""},
 		{"imap", `ja4_fingerprints = ["^t13d411100_6be44479b708_.*", "^t13d2014ip_a09f3c656075_"]`},
-		{"imap", `client_name = ""`},
+		{"imap", `client_name = ""` + "\nclient_version = \"^1\""},
 		{"pop3", `client_name = "Mail("`},
 		{"imap_proxy", `ja4_fingerprints = ["t13d**"]`},
+		{"pop3", ``},
+		{"imap_proxy", `ja4_fingerprints = [""]`},
 	} {
 		s := decodeClientFiltersServer(t, tt.serverType, tt.filters)
 		if err := s.Validate(); err != nil {
 			t.Errorf("%s: %s rejected: %v", tt.serverType, tt.filters, err)
+		}
+	}
+}
+
+// A client_filters entry without a client_name, client_version or ja4_fingerprints
+// pattern never matches a client, so the capabilities it names stayed advertised and
+// nothing said so (#1114). An empty ja4_fingerprints pattern is not a way to leave
+// the key out: it matches every fingerprint, so ja4_fingerprints = [""] hid the
+// capabilities from every TLS client. Both are refused, naming the entry.
+func TestClientFiltersWithoutMatchCriterionRejected(t *testing.T) {
+	for _, tt := range []struct{ filters, want string }{
+		{``, "matches no client"},
+		{`client_name = ""` + "\nclient_version = \"\"", "matches no client"},
+		{`ja4_fingerprints = []`, "matches no client"},
+		{`ja4_fingerprints = [""]`, `ja4_fingerprints ""`},
+		{`ja4_fingerprints = ["^t13d1516h2_", ""]`, `ja4_fingerprints ""`},
+	} {
+		s := decodeClientFiltersServer(t, "imap", tt.filters)
+		err := s.Validate()
+		if err == nil {
+			t.Errorf("%q accepted", tt.filters)
+			continue
+		}
+		for _, want := range []string{`server "imap"`, "client_filters #2", tt.want} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%q: error %q does not contain %q", tt.filters, err, want)
+			}
 		}
 	}
 }

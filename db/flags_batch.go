@@ -27,7 +27,7 @@ type BatchFlagUpdateResult struct {
 // filterConditionalFlagIDs checks the mod-sequences resolveMessageIDsBatch read
 // after lockMailboxStats in the write transaction. Checking the server's earlier
 // read snapshot is insufficient: another STORE may have committed between that
-// read and this lock (RFC 7162 §3.1.3.1).
+// read and this lock (RFC 7162 §3.1.3).
 func filterConditionalFlagIDs(ids []int64, idToUID map[int64]imap.UID, modSeqs map[int64]int64, unchangedSince []uint64) ([]int64, []BatchFlagUpdateResult) {
 	if len(unchangedSince) == 0 {
 		return ids, nil
