@@ -388,7 +388,7 @@ How to send the signal, and how shutdown works, is in [OPERATIONS.md](OPERATIONS
 | `[relay]`, `[relay.queue]` | Outbound relay for redirect and vacation | [8.11](#811-relay-relay-and-relayqueue), [RELAY.md](RELAY.md) |
 | `[spam_training]` | Spam filter training on moves to and from Junk | [8.12](#812-spam-training-spam_training), [RELAY.md](RELAY.md) |
 | `[tls]`, `[tls.letsencrypt]`, `[tls.letsencrypt.s3]` | Shared certificates, Let's Encrypt | [8.13](#813-tls-tls), [TLS.md](TLS.md) |
-| `[cluster]`, `[cluster.affinity]` | Gossip cluster | [8.14](#814-cluster-cluster), [CLUSTER.md](CLUSTER.md) |
+| `[cluster]`, `[cluster.affinity]`, `[cluster.rate_limit_sync]` | Gossip cluster | [8.14](#814-cluster-cluster), [CLUSTER.md](CLUSTER.md) |
 | `[auth_cache]` | Persistent login cache for proxies | [8.15](#815-persistent-auth-cache-auth_cache), [PROXY.md](PROXY.md) |
 | `[backend_maintenance]` | How proxies drain backends in maintenance | [8.16](#816-backend-maintenance-backend_maintenance), [PROXY.md](PROXY.md) |
 | `[servers]` | `trusted_networks` | [8.17](#817-trusted-networks-servers), [SECURITY.md](SECURITY.md) |
@@ -672,6 +672,15 @@ See [CLUSTER.md](CLUSTER.md).
 | `cleanup_interval` | duration | `"1h"` | How often expired affinities are removed. |
 | `cache_path` | string | none | SQLite file that keeps affinities across restarts. Unset keeps them in memory only. |
 
+`[cluster.rate_limit_sync]`, for the `imap_proxy`, `pop3_proxy` and `managesieve_proxy` listeners with
+`auth_rate_limit` enabled ([CLUSTER.md](CLUSTER.md#66-authentication-rate-limits-imap-pop3-and-managesieve-proxies)):
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `true` | Share the rate limiters with the proxies of the same protocol on every node, this one included. The name statistics are always shared while it is on. |
+| `sync_blocks` | bool | `true` | Share Tier 2 IP blocks. |
+| `sync_failure_counts` | bool | `true` | Share Tier 2 failure counts and progressive delays, from `delay_start_threshold` on. |
+
 ### 8.15 Persistent auth cache (`[auth_cache]`)
 
 A SQLite cache of credentials, used by proxies that check passwords in the database. See
@@ -781,7 +790,7 @@ See [SECURITY.md](SECURITY.md).
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
 | `max_connections` | integer | `0` (no limit); `1000` on `lmtp` | all but `metrics` | Concurrent connections of this server. On `lmtp`, `0` or less means 1000. |
-| `max_connections_per_ip` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `user_api_proxy` | Concurrent connections from one IP. Hosts in `trusted_networks` are not limited. |
+| `max_connections_per_ip` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `user_api_proxy` | Concurrent connections from one IP. Hosts in `trusted_networks` are not limited. With `[cluster] enabled = true`, `imap_proxy`, `pop3_proxy` and `managesieve_proxy` count the IP's connections on every node ([CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies)). |
 | `max_connections_per_user` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Logged-in sessions of one user. Enforced on this server by `imap`, `pop3` and `managesieve`. Enforced across the cluster for proxies, which track connections only with `[cluster] enabled = true`; without it a proxy ignores the key, with a startup warning. Ignored by `lmtp_proxy` with a warning. |
 | `max_connections_per_user_per_ip` | integer | `0` (no limit) | as `max_connections_per_user` | Logged-in sessions of one user from one IP. |
 | `listen_backlog` | integer | `1024` | backends, line proxies | TCP listen backlog. `0` means 1024. The HTTP servers listen with the kernel's default backlog; on them the key is ignored, with a startup warning. |
