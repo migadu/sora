@@ -77,6 +77,35 @@ func TestIMAPLoginDuringDatabaseOutage(t *testing.T) {
 	}
 }
 
+// TestIMAPCachedLoginDuringDatabaseOutageIsUnavailable: a login answered from the
+// lookup cache during a database outage passes the password check and then fails to
+// ensure the default mailboxes, on a pooled connection the outage closed. A subsystem
+// is down: the reply is NO [UNAVAILABLE] (RFC 5530 section 3), not
+// NO [SERVERBUG] ...: conn closed.
+func TestIMAPCachedLoginDuringDatabaseOutageIsUnavailable(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	rdb, outage := common.SetupTestDatabaseWithOutage(t)
+	account := common.CreateTestAccount(t, rdb)
+	address := startIMAPWithMasterSASL(t, rdb, common.DBOutageAuthRateLimit(), "", "")
+
+	if reply := imapLoginReply(t, address, account.Email, account.Password); !strings.HasPrefix(reply, "a1 OK") {
+		t.Fatalf("LOGIN before the outage: %q, want a1 OK", reply)
+	}
+
+	logs := common.CaptureLogs(t)
+	outage.Begin()
+	defer outage.End()
+	reply := imapLoginReply(t, address, account.Email, account.Password)
+	// The session went on to the default mailboxes, so the password check passed: the
+	// lookup cache answered it, the database could not have. The login did not
+	// succeed, so there is no "authentication successful" line to say so.
+	logs.WaitForLine(t, "failed to create default mailboxes")
+	if !strings.HasPrefix(reply, "a1 NO [UNAVAILABLE]") {
+		t.Errorf("cached LOGIN during a database outage: %q, want a1 NO [UNAVAILABLE] ...", reply)
+	}
+}
+
 // TestIMAPDatabaseOutageDropsCachedLogin: a login in the backend's lookup cache keeps
 // signing in during a database outage while it is younger than
 // positive_revalidation_window (30s by default). A password that misses it goes to the
@@ -98,10 +127,10 @@ func TestIMAPDatabaseOutageDropsCachedLogin(t *testing.T) {
 	logs := common.CaptureLogs(t)
 	outage.Begin()
 	// Before any guess the cached login still signs in. The session it opens needs the
-	// database, so the reply is not the point: the log line says where the login was
-	// answered.
+	// database, so the reply is not the point: the session going on to the default
+	// mailboxes says the lookup cache passed the password, as the database could not.
 	imapLoginReply(t, address, account.Email, account.Password)
-	logs.WaitForLine(t, "authentication successful", account.Email, "method=cache")
+	logs.WaitForLine(t, "failed to create default mailboxes")
 
 	for i := 1; i <= 3; i++ {
 		if reply := imapLoginReply(t, address, account.Email, fmt.Sprintf("guess-%d", i)); !strings.HasPrefix(reply, "a1 NO [UNAVAILABLE]") {

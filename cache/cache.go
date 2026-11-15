@@ -68,7 +68,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,6 +78,7 @@ import (
 
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/pkg/sqlitefile"
 	_ "modernc.org/sqlite"
 )
 
@@ -102,7 +102,7 @@ const tmpInfix = ".tmp."
 const staleTmpAge = time.Hour
 
 // ErrObjectTooLarge is returned when attempting to cache an object that exceeds the size
-// limit: max_object_size, or one shard's share of the capacity (see tooLarge).
+// limit: max_object_size, or one shard's share of the capacity (see TooLarge).
 var ErrObjectTooLarge = errors.New("object size exceeds limit")
 
 type cacheShard struct {
@@ -199,15 +199,18 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval
 
 	for i := 0; i < NumShards; i++ {
 		shardHex := fmt.Sprintf("%02x", i)
-		dbPath := shardIndexPath(basePath, i)
-		db, err := sql.Open("sqlite", dbPath)
+		// busy_timeout is a setting of each connection, so it goes in the DSN, which the
+		// driver applies to every connection the pool opens; a PRAGMA run with Exec on
+		// the pool sets it on one pooled connection only.
+		dsn, err := sqlitefile.DSN(shardIndexPath(basePath, i), "_pragma=busy_timeout(5000)")
+		if err != nil {
+			return nil, err
+		}
+		db, err := sql.Open("sqlite", dsn)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open cache index DB for shard %s: %w", shardHex, err)
 		}
 
-		if _, err := db.Exec(`PRAGMA busy_timeout = 5000;`); err != nil {
-			logger.Warn("Cache: Failed to set busy_timeout", "error", err)
-		}
 		if _, err := db.Exec(`PRAGMA journal_mode = WAL;`); err != nil {
 			logger.Warn("Cache: Failed to enable WAL mode on cache index DB", "error", err)
 		}
@@ -243,11 +246,12 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval
 	return c, nil
 }
 
-// tooLarge reports whether an object of size bytes is refused: above max_object_size, or
+// TooLarge reports whether an object of size bytes is refused: above max_object_size, or
 // above its shard's share of the capacity. Capacity is enforced per shard, so an object
 // larger than that share cannot stay cached: writing it would evict every other object
-// of its shard and then the object itself.
-func (c *Cache) tooLarge(size int64) bool {
+// of its shard and then the object itself. Put and MoveIn refuse such an object with
+// ErrObjectTooLarge; a caller that would have to download it first asks here instead.
+func (c *Cache) TooLarge(size int64) bool {
 	return size > c.maxObjectSize || size > c.capacity/NumShards
 }
 
@@ -273,7 +277,10 @@ func Usage(basePath string) (objects, totalSize int64, err error) {
 		if _, err := os.Stat(dbPath); err != nil {
 			return 0, 0, fmt.Errorf("no cache index at %s: %w", dbPath, err)
 		}
-		dsn := (&url.URL{Scheme: "file", Path: dbPath, RawQuery: "mode=ro&_pragma=busy_timeout(5000)"}).String()
+		dsn, err := sqlitefile.DSN(dbPath, "mode=ro&_pragma=busy_timeout(5000)")
+		if err != nil {
+			return 0, 0, err
+		}
 		db, err := sql.Open("sqlite", dsn)
 		if err != nil {
 			return 0, 0, fmt.Errorf("failed to open cache index %s: %w", dbPath, err)
@@ -412,10 +419,10 @@ func (c *Cache) Delete(contentHash string) error {
 // MoveIn moves a file into the cache directory structure and tracks it.
 // The file at sourcePath will be removed (either by rename or explicit removal if it already exists).
 // This is typically used to move a downloaded temp file into the cache.
-// A file the cache does not take (see tooLarge) is refused with ErrObjectTooLarge and,
+// A file the cache does not take (see TooLarge) is refused with ErrObjectTooLarge and,
 // as when the move itself fails, left for the caller to remove.
 func (c *Cache) MoveIn(sourcePath string, contentHash string) error {
-	if info, err := os.Stat(sourcePath); err == nil && c.tooLarge(info.Size()) {
+	if info, err := os.Stat(sourcePath); err == nil && c.TooLarge(info.Size()) {
 		return ErrObjectTooLarge
 	}
 
@@ -514,7 +521,7 @@ func (c *Cache) Get(contentHash string) ([]byte, error) {
 
 // Put writes an object to the cache.
 func (c *Cache) Put(contentHash string, data []byte) error {
-	if c.tooLarge(int64(len(data))) {
+	if c.TooLarge(int64(len(data))) {
 		return ErrObjectTooLarge
 	}
 

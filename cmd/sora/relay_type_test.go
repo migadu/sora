@@ -46,11 +46,18 @@ func TestStartupRefusesUnsupportedRelayType(t *testing.T) {
 		{name: "smtp without smtp_host", relay: "[relay]\ntype = \"smtp\"\n", wantErr: `[relay] type "smtp" requires smtp_host as host:port`},
 		{name: "smtp_host without port", relay: "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com\"\n", wantErr: `[relay] smtp_host "smtp.example.com" must be host:port`},
 		{name: "http without http_url", relay: "[relay]\ntype = \"http\"\n", wantErr: `[relay] type "http" requires http_url`},
+		// #643: a worker_interval of zero or less reached time.NewTicker in the relay
+		// worker's goroutine and panicked; a negative failed_retention made every failed
+		// message overdue for deletion. failed_retention = "0" keeps failed messages.
+		{name: "worker_interval 0", relay: "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com:587\"\n[relay.queue]\nworker_interval = \"0\"\n", wantErr: `[relay.queue]: worker_interval must be positive, got "0"`},
+		{name: "worker_interval negative", relay: "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com:587\"\n[relay.queue]\nworker_interval = \"-1m\"\n", wantErr: `[relay.queue]: worker_interval must be positive, got "-1m"`},
+		{name: "failed_retention negative", relay: "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com:587\"\n[relay.queue]\nfailed_retention = \"-1h\"\n", wantErr: `[relay.queue]: failed_retention must not be negative, got "-1h"`},
+		{name: "failed_retention 0", relay: "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com:587\"\n[relay.queue]\nfailed_retention = \"0\"\n", wantErr: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.toml")
-			content := tt.relay + "\n[[server]]\ntype = \"lmtp\"\nname = \"lmtp\"\naddr = \"127.0.0.1:0\"\n"
+			content := storageTOML + tt.relay + "\n[[server]]\ntype = \"lmtp\"\nname = \"lmtp\"\naddr = \"127.0.0.1:0\"\n"
 			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 				t.Fatal(err)
 			}
