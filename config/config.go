@@ -2203,19 +2203,32 @@ func (s *ServerConfig) GetMaxScriptSize() (int64, error) {
 // is an error: start-up falls back to the default (GetMaxMessageSizeWithDefault), a
 // reload keeps the running limit.
 func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
+	size, err := s.configuredMaxMessageSize()
+	if err != nil {
+		return 0, err
+	}
+	if size > consts.MaxStoredMessageSize {
+		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
+		return consts.MaxStoredMessageSize, nil
+	}
+	return size, nil
+}
+
+// defaultMaxMessageSize is max_message_size when omitted, zero or, at start-up, invalid.
+const defaultMaxMessageSize = 50 * 1024 * 1024
+
+// configuredMaxMessageSize is max_message_size as the file sets it, before
+// GetMaxMessageSize caps it, and without its warning.
+func (s *ServerConfig) configuredMaxMessageSize() (int64, error) {
 	if s.MaxMessageSize == "" {
-		return 50 * 1024 * 1024, nil // 50MB default
+		return defaultMaxMessageSize, nil
 	}
 	size, err := helpers.ParseSize(s.MaxMessageSize)
 	if err != nil {
 		return 0, err
 	}
 	if size == 0 {
-		return 50 * 1024 * 1024, nil
-	}
-	if size > consts.MaxStoredMessageSize {
-		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
-		return consts.MaxStoredMessageSize, nil
+		return defaultMaxMessageSize, nil
 	}
 	return size, nil
 }
@@ -2383,7 +2396,13 @@ func (c *Config) SessionMemoryShortfalls() []SessionMemoryShortfall {
 		if servers[i].Type != "lmtp" {
 			continue
 		}
-		if size := servers[i].GetMaxMessageSizeWithDefault(); size > maxMessageSize {
+		// The lmtp server's limit as GetMaxMessageSizeWithDefault sets it, without logging
+		// again what its start function and Warnings report.
+		size, err := servers[i].configuredMaxMessageSize()
+		if err != nil {
+			size = defaultMaxMessageSize
+		}
+		if size = min(size, consts.MaxStoredMessageSize); size > maxMessageSize {
 			lmtp, maxMessageSize = servers[i].Name, size
 		}
 	}
@@ -2848,7 +2867,7 @@ func (s *ServerConfig) GetMaxMessageSizeWithDefault() int64 {
 	size, err := s.GetMaxMessageSize()
 	if err != nil {
 		warnf("Failed to parse max message size for server '%s': %v, using default (50MB)", s.Name, err)
-		return 52428800 // 50MB default
+		return defaultMaxMessageSize
 	}
 	return size
 }
