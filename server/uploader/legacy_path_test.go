@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -457,5 +458,76 @@ func TestCheckLegacyStagingIgnoresAnotherUsersEntries(t *testing.T) {
 	}
 	if err := CheckLegacyStaging(active, active, legacy, uid); err == nil || !strings.Contains(err.Error(), own) {
 		t.Fatalf("own body next to another user's entries: want a refusal naming %s, got %v", own, err)
+	}
+}
+
+// TestCheckLegacyStagingIgnoresFileAtLegacyPath: bodies are staged at
+// <account id>/<content hash> below the legacy path, so a file at the path itself holds
+// none. Where a user may hard link another user's file (the BSD default), another user
+// can put root's file there, and root's entries count.
+func TestCheckLegacyStagingIgnoresFileAtLegacyPath(t *testing.T) {
+	t.Run("file", func(t *testing.T) {
+		root := t.TempDir()
+		active, legacy := filepath.Join(root, "spool", "uploads"), filepath.Join(root, "tmp", "sora", "uploads")
+		if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(legacy, []byte("no spool"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for _, uid := range []int{os.Geteuid(), AnyOwner} {
+			if err := CheckLegacyStaging(active, active, legacy, uid); err != nil {
+				t.Fatalf("uid %d: file at the legacy path refused startup: %v", uid, err)
+			}
+		}
+	})
+
+	t.Run("hard link to root's file", func(t *testing.T) {
+		root := t.TempDir()
+		active, legacy := filepath.Join(root, "spool", "uploads"), filepath.Join(root, "tmp", "sora", "uploads")
+		if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link("/etc/hosts", legacy); err != nil {
+			t.Skipf("this user cannot hard link root's file here: %v", err)
+		}
+		info, err := os.Lstat(legacy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st, ok := info.Sys().(*syscall.Stat_t); !ok || st.Uid != 0 {
+			t.Skip("/etc/hosts is not root's")
+		}
+		// Not the link itself: it is /etc/hosts.
+		uid := anotherUsersEntries(t, filepath.Dir(legacy))
+		if err := CheckLegacyStaging(active, active, legacy, uid); err != nil {
+			t.Fatalf("another user's hard link to root's file refused startup: %v", err)
+		}
+	})
+}
+
+// TestCheckLegacyStagingIgnoresAnotherUsersLinkAbove: a link another user makes above
+// the legacy path, as /tmp/sora above /tmp/sora/uploads, points the path at a directory
+// of that user's choice (here root's /etc), and must not be followed any more than a
+// link at the path itself.
+func TestCheckLegacyStagingIgnoresAnotherUsersLinkAbove(t *testing.T) {
+	root := t.TempDir()
+	active, link := filepath.Join(root, "spool", "uploads"), filepath.Join(root, "tmp", "sora")
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/", link); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(link, "etc")
+	if err := CheckLegacyStaging(active, active, legacy, os.Geteuid()); err == nil {
+		t.Fatal("legacy path below this user's link to root's files: want refusal, got nil")
+	}
+	uid := anotherUsersEntries(t, link)
+	if err := CheckLegacyStaging(active, active, legacy, uid); err != nil {
+		t.Fatalf("legacy path below another user's link to root's files refused startup: %v", err)
+	}
+	if err := CheckLegacyStaging(active, active, legacy, AnyOwner); err == nil {
+		t.Fatal("AnyOwner: legacy path below another user's link to root's files: want refusal, got nil")
 	}
 }
