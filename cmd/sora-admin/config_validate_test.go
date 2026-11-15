@@ -478,3 +478,65 @@ func TestConfigValidateHelpStartChecksNoS3(t *testing.T) {
 		t.Errorf("the help does not say what service start checks:\n%s", help)
 	}
 }
+
+// TestConfigValidateReportsStartupWarnings (#1557): `sora-admin config validate` prints
+// the warnings start-up logs about the file: a key the server type does not read
+// (ServerConfig.WarnUnusedConfigOptions) and an imap or pop3 session_memory_limit below
+// an lmtp max_message_size (Config.SessionMemoryShortfalls). It used to print only
+// "[OK] Configuration is valid!". Warnings do not fail the file.
+func TestConfigValidateReportsStartupWarnings(t *testing.T) {
+	const lmtp = "\n[[server]]\ntype = \"lmtp\"\nname = \"lmtp\"\naddr = \"127.0.0.1:24\"\nmax_message_size = \"50mb\"\n"
+	tests := []struct {
+		name     string
+		content  string
+		wantWarn []string // substrings of the [WARN] lines, none for a file without warnings
+	}{
+		{
+			// The issue's file.
+			name:     "debug on pop3",
+			content:  storageTOML + "[[server]]\ntype = \"pop3\"\nname = \"pop3\"\naddr = \"127.0.0.1:110\"\ndebug = true\n",
+			wantWarn: []string{"[WARN] Server pop3 (type: pop3) has 'debug' configured, but only "},
+		},
+		{
+			name: "lookup_cache key on a proxy that does not read it",
+			content: storageTOML + "[[server]]\ntype = \"lmtp_proxy\"\nname = \"lmtp-proxy\"\naddr = \"127.0.0.1:2424\"\n" +
+				"remote_addrs = [\"192.0.2.10:24\"]\n\n[server.lookup_cache]\npositive_revalidation_window = \"1m\"\n",
+			wantWarn: []string{"[WARN] Server lmtp-proxy (type: lmtp_proxy) has 'lookup_cache.positive_revalidation_window' configured, but only "},
+		},
+		{
+			name: "imap session_memory_limit below the lmtp max_message_size",
+			content: storageTOML + "[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n\n[server.limits]\nsession_memory_limit = \"10mb\"\n" +
+				lmtp,
+			wantWarn: []string{"[WARN] Server imap (type: imap) has session_memory_limit 10485760 bytes, below max_message_size 52428800 bytes of lmtp server lmtp"},
+		},
+		{
+			name:    "no warnings",
+			content: storageTOML + "[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n" + lmtp,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tt.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(os.Args[0], "-test.run=^TestConfigValidateCommandHelper$")
+			cmd.Env = append(os.Environ(), configValidateHelperEnv+"="+path)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("config validate failed a valid file (warnings must not fail it): %v\n%s", err, out)
+			}
+			if !strings.Contains(string(out), "[OK] Configuration is valid!") {
+				t.Errorf("config validate did not report the file valid:\n%s", out)
+			}
+			for _, want := range tt.wantWarn {
+				if !strings.Contains(string(out), want) {
+					t.Errorf("config validate output does not warn %q:\n%s", want, out)
+				}
+			}
+			if len(tt.wantWarn) == 0 && strings.Contains(string(out), "[WARN]") {
+				t.Errorf("config validate warned about a file without warnings:\n%s", out)
+			}
+		})
+	}
+}
