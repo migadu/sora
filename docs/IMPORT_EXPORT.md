@@ -131,8 +131,9 @@ is not read: such a message file is reported as failed by its path, and such a `
 skipped with a warning naming it.
 
 This policy covers source message and Dovecot metadata contents and `cur/`/`new/` listings. It
-does not change how the SQLite cache or explicitly supplied `--sieve` and `--paths-file` files
-are opened. Folder discovery and file existence/timestamp checks still use ordinary paths.
+does not change how the SQLite cache or an explicitly supplied `--paths-file` file are opened;
+`--sieve` has its own rule ([section 7](#7-importing-a-sieve-script)). Folder discovery and file
+existence/timestamp checks still use ordinary paths.
 
 ---
 
@@ -290,6 +291,14 @@ Very large UIDVALIDITY values in the uidlist are truncated to 32 bits.
 
 `--sieve PATH` stores the file as a Sieve script of the account before the messages are
 imported. If the file does not exist, it is ignored with a log line.
+
+The file is read through its directory. The usual file from Dovecot, the user's
+`~/.dovecot.sieve`, is a symbolic link the user owns, so a link is followed only when it is
+relative and its target is within that directory, as Pigeonhole's own
+`.dovecot.sieve -> sieve/<name>.sieve`. Any other link (one out of the directory, or any absolute
+link) is refused: the log names the file and nothing is stored. Where Pigeonhole's script
+directory is not below the link's directory, its link is absolute; name the script it points to
+instead.
 
 | Situation | Result |
 |---|---|
