@@ -3,6 +3,7 @@ package authcache
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -41,6 +42,32 @@ func TestDatabaseThatIsNotAFileIsRefused(t *testing.T) {
 			}
 			if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
 				t.Errorf("New(%q) left %d files in the working directory (err %v)", dbPath, len(entries), err)
+			}
+		})
+	}
+}
+
+// Refusing a database that is not a file is not corruption. Handled as corruption, New
+// logged "Database appears corrupted, recreating", deleted the files named after the
+// configured path (a file merely called ":memory:" in the working directory), opened it
+// again, and reported "failed to recreate auth cache db".
+func TestDatabaseThatIsNotAFileIsNotTreatedAsCorrupt(t *testing.T) {
+	for _, dbPath := range []string{":memory:", "file::memory:", "file:auth_cache.db?mode=memory", "file:"} {
+		t.Run(dbPath, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			if err := os.WriteFile(dbPath, []byte("keep"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			c, err := New(dbPath, time.Hour, 24*time.Hour, time.Hour)
+			if err == nil {
+				c.Close()
+				t.Fatalf("New(%q) accepted a database that is not a file", dbPath)
+			}
+			if strings.Contains(err.Error(), "recreate") {
+				t.Errorf("New(%q) handled the refusal as corruption: %v", dbPath, err)
+			}
+			if _, statErr := os.Stat(dbPath); statErr != nil {
+				t.Errorf("New(%q) removed a file named after the path: %v", dbPath, statErr)
 			}
 		})
 	}
