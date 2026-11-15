@@ -78,6 +78,36 @@ func TestExtractAddress(t *testing.T) {
 			input:    `"<user@example.com>"`,
 			expected: "user@example.com",
 		},
+		{
+			name:       "null path with trailing domain (invalid)",
+			input:      "<>@example.org",
+			unreadable: true,
+		},
+		{
+			name:       "null path followed by second path (invalid)",
+			input:      "<><sender@example.org>",
+			unreadable: true,
+		},
+		{
+			name:       "angle bracket address with trailing domain (invalid)",
+			input:      "<user@example.com>@other.org",
+			unreadable: true,
+		},
+		{
+			name:       "angle bracket address with unseparated parameter (invalid)",
+			input:      "<user@example.com>SIZE=1234",
+			unreadable: true,
+		},
+		{
+			name:       "quoted address with trailing parameter (invalid)",
+			input:      `"<user@example.com> NOTIFY=NEVER"`,
+			unreadable: true,
+		},
+		{
+			name:       "unclosed quoted address (invalid)",
+			input:      `"<user@example.com>`,
+			unreadable: true,
+		},
 	}
 
 	for _, tt := range tests {

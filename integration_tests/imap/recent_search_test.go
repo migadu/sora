@@ -18,7 +18,12 @@ import (
 // TestIMAP_RecentIsSessionState: \Recent sent in STORE or APPEND is not stored
 // (RFC 3501 §2.3.2: it "can not be altered by the client"), and SEARCH, SORT,
 // THREAD and multimailbox SEARCH answer RECENT, NEW and OLD with the messages
-// that arrived since the last read-write SELECT, as the RECENT count does.
+// that arrived since the last read-write SELECT, as the RECENT count does. The
+// FLAGS of every FETCH response (FETCH, STORE, QRESYNC and unsolicited) carry
+// \Recent for exactly those messages in an IMAP4rev1 session (RFC 3501 §7.3.2:
+// "The only reliable way to identify recent messages is to look at message
+// flags to see which have the \Recent flag set, or to do a SEARCH RECENT"),
+// and never in an IMAP4rev2 one (RFC 9051 Appendix E item 12).
 func TestIMAP_RecentIsSessionState(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -61,6 +66,28 @@ func TestIMAP_RecentIsSessionState(t *testing.T) {
 		t.Errorf("%d messages have the \\Recent bit stored, want 0", stored)
 	}
 
+	// INBOX has no expunged messages, so a message's number is its UID below.
+	// EXAMINE leaves \Recent to the next read-write SELECT (RFC 3501 §6.3.2),
+	// so UIDs 3 and 4 are \Recent in each of these sessions and still in B's.
+	connQ, rQ := esearchDialLogin(t, server, account.Email, account.Password)
+	defer connQ.Close()
+	esearchCmdOK(t, connQ, rQ, "q1", "ENABLE QRESYNC")
+	var uidValidity uint32
+	for _, l := range esearchCmdOK(t, connQ, rQ, "q2", "STATUS INBOX (UIDVALIDITY)") {
+		fmt.Sscanf(l, "* STATUS INBOX (UIDVALIDITY %d)", &uidValidity)
+	}
+	if uidValidity == 0 {
+		t.Fatal("STATUS INBOX returned no UIDVALIDITY")
+	}
+	qresync := esearchCmdOK(t, connQ, rQ, "q3", fmt.Sprintf("EXAMINE INBOX (QRESYNC (%d 1))", uidValidity))
+	assertFetchRecent(t, "EXAMINE INBOX (QRESYNC)", qresync, []int{3, 4}, []int{3, 4})
+
+	connR2, rR2 := esearchDialLogin(t, server, account.Email, account.Password)
+	defer connR2.Close()
+	esearchCmdOK(t, connR2, rR2, "r1", "ENABLE IMAP4rev2")
+	esearchCmdOK(t, connR2, rR2, "r2", "EXAMINE INBOX")
+	assertFetchRecent(t, "IMAP4rev2 FETCH 1:* FLAGS", esearchCmdOK(t, connR2, rR2, "r3", "FETCH 1:* FLAGS"), []int{1, 2, 3, 4}, nil)
+
 	// Session B: UIDs 3 and 4 arrived since A's SELECT.
 	connB, rB := esearchDialLogin(t, server, account.Email, account.Password)
 	defer connB.Close()
@@ -82,11 +109,10 @@ func TestIMAP_RecentIsSessionState(t *testing.T) {
 		}
 	}
 
-	for _, l := range esearchCmdOK(t, connB, rB, "b3", "FETCH 1:* FLAGS") {
-		if strings.Contains(strings.ToLower(l), `\recent`) {
-			t.Errorf("FETCH FLAGS reports a stored \\Recent: %q", l)
-		}
-	}
+	assertFetchRecent(t, "FETCH 1:* FLAGS", esearchCmdOK(t, connB, rB, "b3", "FETCH 1:* FLAGS"), []int{1, 2, 3, 4}, []int{3, 4})
+	// STORE returns the new flags "as if a FETCH of those flags was done"
+	// (RFC 3501 §6.4.6).
+	assertFetchRecent(t, "UID STORE 1,3 +FLAGS", esearchCmdOK(t, connB, rB, "b3s", `UID STORE 1,3 +FLAGS (\Flagged)`), []int{1, 3}, []int{3})
 
 	// Multimailbox SEARCH: B has seen nothing arrive in Other, so nothing there
 	// is recent, though its UIDs are above INBOX's threshold.
@@ -97,6 +123,36 @@ func TestIMAP_RecentIsSessionState(t *testing.T) {
 	old := esearchCmdOK(t, connB, rB, "b5", `ESEARCH IN (personal) RETURN (ALL) OLD`)
 	if !strings.HasSuffix(esearchLine(old, "INBOX"), " ALL 1:2") || !strings.HasSuffix(esearchLine(old, "Other"), " ALL 1:3") {
 		t.Errorf("ESEARCH IN (personal) OLD: want INBOX 1:2 and Other 1:3, got %q", old)
+	}
+
+	// A selects INBOX after B: nothing is \Recent for A. A's flag changes reach
+	// B as unsolicited FETCH responses, with B's \Recent.
+	esearchCmdOK(t, connA, rA, "a9", "SELECT INBOX")
+	assertFetchRecent(t, "A: UID STORE 2,4 +FLAGS", esearchCmdOK(t, connA, rA, "a10", `UID STORE 2,4 +FLAGS (\Seen)`), []int{2, 4}, nil)
+	assertFetchRecent(t, "B: NOOP after A's STORE", esearchCmdOK(t, connB, rB, "b6", "NOOP"), []int{2, 4}, []int{4})
+}
+
+// assertFetchRecent checks that lines hold a FETCH response with FLAGS for each
+// message number in fetched, and that \Recent is in the FLAGS of exactly the
+// messages in recent.
+func assertFetchRecent(t *testing.T, what string, lines []string, fetched, recent []int) {
+	t.Helper()
+	var gotFetched, gotRecent []int
+	for _, l := range lines {
+		var n int
+		if _, err := fmt.Sscanf(l, "* %d FETCH", &n); err != nil || !strings.Contains(l, "FLAGS (") {
+			continue
+		}
+		gotFetched = append(gotFetched, n)
+		if strings.Contains(strings.ToLower(l), `\recent`) {
+			gotRecent = append(gotRecent, n)
+		}
+	}
+	slices.Sort(gotRecent)
+	missing := slices.ContainsFunc(fetched, func(n int) bool { return !slices.Contains(gotFetched, n) })
+	if missing || !slices.Equal(gotRecent, recent) {
+		t.Errorf("%s: FLAGS for %v, \\Recent on %v; want FLAGS for %v, \\Recent on %v; responses %q",
+			what, gotFetched, gotRecent, fetched, recent, lines)
 	}
 }
 

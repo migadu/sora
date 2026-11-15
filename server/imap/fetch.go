@@ -202,6 +202,7 @@ func (s *IMAPSession) fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 	var selectedMailboxID int64
 	var selectedMailboxOwnerID int64
 	var selectedExamined bool
+	var recentAbove imap.UID
 	var view seqView
 	var decodedNumSet imap.NumSet
 
@@ -232,6 +233,7 @@ func (s *IMAPSession) fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 	selectedMailboxID = s.selectedMailbox.ID
 	selectedMailboxOwnerID = s.selectedMailbox.AccountID
 	selectedExamined = s.selectedExamined.Load()
+	recentAbove = s.recentFlagAboveLocked()
 	view = s.seqViewLocked()
 	decodedNumSet = s.decodeNumSetLocked(view, numSet)
 	release()
@@ -390,7 +392,7 @@ func (s *IMAPSession) fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			if s.IMAPUser != nil {
 				metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
 			}
-			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID, markSeen, view.tracker, preview); err != nil {
+			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID, recentAbove, markSeen, view.tracker, preview); err != nil {
 				if progress != nil {
 					progress.failed = msg.UID
 				}
@@ -424,9 +426,10 @@ func (s *IMAPSession) fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 }
 
 // writeMessageFetchData handles writing all FETCH data items for a single message.
+// recentAbove is the session's \Recent threshold (recentFlagAboveLocked);
 // markSeen is whether the FETCH implicitly sets \Seen; preview is the command's
 // PREVIEW state, nil unless PREVIEW was requested.
-func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, markSeen bool, tracker *imapserver.SessionTracker, preview *previewRun) (retErr error) {
+func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, recentAbove imap.UID, markSeen bool, tracker *imapserver.SessionTracker, preview *previewRun) (retErr error) {
 	s.DebugLog("fetching message", "uid", msg.UID, "seq", msg.Seq)
 
 	// msg.Seq is the client's sequence number (Fetch translated it, see seqView).
@@ -521,7 +524,7 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 		}
 	}()
 
-	if err := s.writeBasicMessageData(m, msg, options); err != nil {
+	if err := s.writeBasicMessageData(m, msg, options, recentAbove); err != nil {
 		return err
 	}
 
@@ -604,7 +607,7 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 	return nil
 }
 
-func (s *IMAPSession) writeBasicMessageData(m *imapserver.FetchResponseWriter, msg *db.Message, options *imap.FetchOptions) error {
+func (s *IMAPSession) writeBasicMessageData(m *imapserver.FetchResponseWriter, msg *db.Message, options *imap.FetchOptions, recentAbove imap.UID) error {
 	if options.Flags {
 		allFlags := db.BitwiseToFlags(msg.BitwiseFlags) // System flags
 		for _, customFlag := range msg.CustomFlags {
@@ -614,7 +617,7 @@ func (s *IMAPSession) writeBasicMessageData(m *imapserver.FetchResponseWriter, m
 		// stored in the database before validation was added
 		allFlags = helpers.SanitizeFlags(allFlags)
 
-		m.WriteFlags(allFlags)
+		m.WriteFlags(withRecentFlag(allFlags, msg.UID, recentAbove))
 	}
 	if options.UID {
 		m.WriteUID(msg.UID)

@@ -384,6 +384,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 			selectData.Modified = make([]imap.SelectModifiedData, 0, len(changedMsgs))
 
 			// For QRESYNC, we report messages that still exist (not expunged)
+			recentFlagAbove := s.recentFlagAboveLocked()
 			for _, msg := range changedMsgs {
 				if msg.SeqNum == 0 {
 					s.WarnLog("skipping modified message with invalid sequence number 0", "uid", msg.UID)
@@ -392,7 +393,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 				selectData.Modified = append(selectData.Modified, imap.SelectModifiedData{
 					SeqNum: msg.SeqNum,
 					UID:    msg.UID,
-					Flags:  msg.Flags,
+					Flags:  withRecentFlag(msg.Flags, msg.UID, recentFlagAbove),
 					ModSeq: msg.ModSeq,
 				})
 			}
