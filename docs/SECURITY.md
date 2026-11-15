@@ -498,7 +498,7 @@ one.**
 | Key | Meaning |
 |---|---|
 | `allowed_hosts` | IPs or CIDRs allowed to scrape. Matched against the TCP peer; `X-Forwarded-For` is ignored. Others get HTTP 403 `forbidden`. |
-| `api_key` | Requires `Authorization: Bearer <key>`, compared in constant time. A missing token gets 401 with `WWW-Authenticate: Bearer realm="metrics"`; a wrong one gets 403. |
+| `api_key` | Requires `Authorization: Bearer <key>`, compared in constant time. A missing token gets 401 with `WWW-Authenticate: Bearer realm="metrics"`; a wrong one gets 403 with `WWW-Authenticate: Bearer realm="metrics", error="invalid_token"`. |
 
 With both set, a request must pass both. The endpoint is always plain HTTP: `tls` on a metrics block
 is ignored with a warning, so put a TLS proxy in front if a token crosses an untrusted network.
