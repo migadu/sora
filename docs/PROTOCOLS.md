@@ -1057,7 +1057,7 @@ plain number of bytes.
 | `type` | string | required | all | `imap`, `pop3`, `lmtp` or `managesieve`. |
 | `name` | string | required | all | Unique server name. |
 | `addr` | string | required | all | Listen address. |
-| `debug` | bool | `false` | IMAP, LMTP | IMAP: writes a raw protocol trace, with LOGIN and AUTHENTICATE passwords masked but message content included, to the log file when `[logging] output` is a file, otherwise to standard output. LMTP: logs each message's headers at debug level before Sieve runs. No effect on POP3 and ManageSieve. Needs a restart. |
+| `debug` | bool | `false` | IMAP, LMTP | IMAP: writes a raw protocol trace, with LOGIN and AUTHENTICATE passwords masked but message content included, to the log file when `[logging] output` is a file, otherwise to standard output. LMTP: logs each message's headers at debug level before Sieve runs. No effect on POP3 and ManageSieve, where it is ignored with a startup warning. Needs a restart. |
 
 ### 10.2 TLS
 

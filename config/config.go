@@ -2943,7 +2943,7 @@ func (s *ServerConfig) MetricsPath() string {
 func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...any)) {
 	for _, k := range serverTypeKeys {
 		if k.set(s) && !slices.Contains(k.appliedBy, s.Type) {
-			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "))
+			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it%s", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "), serverTypeKeyNotes[k.name])
 		}
 	}
 	// Only these filter clients by address. Every other type, the User API proxy
@@ -3129,7 +3129,9 @@ var serverTypeKeys = []struct {
 	{"insecure_auth", func(s *ServerConfig) bool { return s.InsecureAuth }, loginServerTypes},
 	// The LMTP backend's only timeout is timeouts.command_timeout.
 	{"auth_idle_timeout", func(s *ServerConfig) bool { return s.AuthIdleTimeout != "" }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
-	{"debug", func(s *ServerConfig) bool { return s.Debug }, []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
+	// The POP3 and ManageSieve backends take debug in their options and write
+	// nothing with it.
+	{"debug", func(s *ServerConfig) bool { return s.Debug }, []string{"imap", "lmtp", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
 	// The proxies' backend legs.
 	{"remote_port", func(s *ServerConfig) bool { return s.RemotePort != nil }, proxyServerTypes},
 	{"connect_timeout", func(s *ServerConfig) bool { return s.ConnectTimeout != "" }, proxyServerTypes},
@@ -3145,6 +3147,12 @@ var serverTypeKeys = []struct {
 	{"append_limit", func(s *ServerConfig) bool { return s.AppendLimit != "" }, []string{"imap"}},
 	{"max_script_size", func(s *ServerConfig) bool { return s.MaxScriptSize != "" }, []string{"managesieve"}},
 	{"supported_extensions", func(s *ServerConfig) bool { return len(s.SupportedExtensions) > 0 }, []string{"managesieve_proxy"}},
+}
+
+// serverTypeKeyNotes ends the warning about a serverTypeKeys key with the setting
+// that applies in its place.
+var serverTypeKeyNotes = map[string]string{
+	"supported_extensions": "; a ManageSieve server advertises the [sieve] enabled_extensions",
 }
 
 // loginServerTypes are the server types with a password login, proxyServerTypes
