@@ -160,3 +160,27 @@ func TestMailboxFixUTF7DryRunParityOnRefusedRenames(t *testing.T) {
 		require.Contains(t, dryOut, "4 would be renamed, 1 skipped, 3 would fail")
 	})
 }
+
+// PostgreSQL LOWER, used by RenameMailbox and its unique index, is not
+// Unicode simple case folding (for example Greek final sigma and dotted I).
+func TestMailboxFixUTF7DryRunDatabaseCaseParity(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	rdb := common.SetupTestDatabase(t)
+	ctx := context.Background()
+	for _, tc := range []struct{ name, existing, encoded string }{
+		{"final sigma is distinct", "ς", "&A6M-"},
+		{"dotted I lower expansion conflicts", "i\u0307", "&ATA-"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			account := common.CreateTestAccount(t, rdb)
+			id, err := rdb.GetAccountIDByEmailWithRetry(ctx, account.Email)
+			require.NoError(t, err)
+			require.NoError(t, rdb.CreateMailboxWithRetry(ctx, id, tc.existing, nil))
+			require.NoError(t, rdb.CreateMailboxWithRetry(ctx, id, tc.encoded, nil))
+			dry := runMailboxFixUTF7(t, ctx, account.Email, "--dry-run")
+			live := runMailboxFixUTF7(t, ctx, account.Email)
+			require.Equal(t, parseFixUTF7Renames(live), parseFixUTF7Renames(dry), "dry=%s live=%s", dry, live)
+			require.Equal(t, parseFixUTF7Failures(live), parseFixUTF7Failures(dry), "dry=%s live=%s", dry, live)
+		})
+	}
+}
