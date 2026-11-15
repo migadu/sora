@@ -261,7 +261,8 @@ type UploadWorker struct {
 	// end of a staging refresh, and guards stagingRefresh.
 	stagingRefreshMu sync.Mutex
 	// stagingRefresh is non-nil while monitorStuckUploads measures the backlog: for
-	// each staged path changed meanwhile, the bytes counted for it before that change.
+	// each staged path changed meanwhile, the bytes counted for it before that change
+	// (its size on disk then, less any part of a change the clamp at zero kept off).
 	stagingRefresh map[string]int64
 	// lastStallReport is when the current stall episode was last reported, in Unix
 	// nanoseconds; 0 means no episode is in progress. Atomic, like currentStagingSize.
@@ -1502,19 +1503,23 @@ func (w *UploadWorker) reportStalledBacklog(backlog UploadBacklog) {
 // before to after bytes, to the cached staging size, so the limit guard reflects what
 // happened since the last authoritative refresh in monitorStuckUploads rather than a
 // value that is up to one monitor interval stale. The caller holds path's staging
-// lock, so before is what is counted for path.
+// lock, so before is what is on disk at path.
 func (w *UploadWorker) stagedSizeChanged(path string, before, after int64) {
 	if before == after {
 		return
 	}
 	w.stagingRefreshMu.Lock()
 	defer w.stagingRefreshMu.Unlock()
+	applied := w.addStagingSize(after - before)
 	if w.stagingRefresh != nil {
 		if _, seen := w.stagingRefresh[path]; !seen {
 			w.stagingRefresh[path] = before
 		}
+		// The refresh swaps the entry for the body as it is on disk, so the entry must
+		// be what is on disk less what the count took of its changes. Part of a change
+		// the clamp at zero kept off the count was never counted: it is not taken out.
+		w.stagingRefresh[path] += after - before - applied
 	}
-	w.addStagingSize(after - before)
 }
 
 // beginStagingRefresh starts noting staged-file changes for monitorStuckUploads, which
@@ -1545,10 +1550,11 @@ func (w *UploadWorker) endStagingRefresh() map[StagedBody]int64 {
 	return changed
 }
 
-// addStagingSize adds delta to the cached staging size, clamped at zero.
-func (w *UploadWorker) addStagingSize(delta int64) {
+// addStagingSize adds delta to the cached staging size, clamped at zero, and returns
+// the change it made.
+func (w *UploadWorker) addStagingSize(delta int64) int64 {
 	if delta == 0 {
-		return
+		return 0
 	}
 	for {
 		cur := atomic.LoadInt64(&w.currentStagingSize)
@@ -1556,7 +1562,7 @@ func (w *UploadWorker) addStagingSize(delta int64) {
 		// must clamp at zero rather than driving the running total below zero.
 		next := max(cur+delta, 0)
 		if atomic.CompareAndSwapInt64(&w.currentStagingSize, cur, next) {
-			return
+			return next - cur
 		}
 	}
 }
