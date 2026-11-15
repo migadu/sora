@@ -219,20 +219,21 @@ func TestIMAPProxy_MasterAuthenticationPriority(t *testing.T) {
 	proxy := setupIMAPProxyWithMasterAuth(t, backendServer, proxyAddress, []string{backendServer.Address})
 	defer proxy.Close()
 
-	t.Run("Master username overrides regular auth at proxy", func(t *testing.T) {
+	t.Run("Account password under the master username suffix is the account's own login at proxy", func(t *testing.T) {
 		c, err := imapclient.DialInsecure(proxyAddress, nil)
 		if err != nil {
 			t.Fatalf("Failed to dial IMAP proxy: %v", err)
 		}
 		defer c.Logout()
 
-		// Try proxy master username suffix with account password (should fail)
+		// The master username form without the master password is the account's
+		// own login, as under any other suffix (#949): refused there alone, it
+		// confirmed the master username to any account holder.
 		loginUsername := account.Email + "@" + proxyMasterUsername
-		err = c.Login(loginUsername, account.Password).Wait()
-		if err == nil {
-			t.Fatal("Expected login to fail when using account password with proxy master username suffix")
+		if err := c.Login(loginUsername, account.Password).Wait(); err != nil {
+			t.Fatalf("account password under the proxy master username suffix: %v, want the account's own login", err)
 		}
-		t.Log("✓ Correctly rejected account password when proxy master username suffix is present")
+		t.Log("✓ Account password under the proxy master username suffix logs in as the account")
 	})
 
 	t.Run("Regular auth still works through proxy without suffix", func(t *testing.T) {

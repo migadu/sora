@@ -308,3 +308,117 @@ func TestIMAP_Examine_NotifyMessageNewDoesNotSetSeen(t *testing.T) {
 		t.Errorf("NOTIFY MessageNew FETCH (BODY[]) set \\Seen in a mailbox opened with EXAMINE: %v", untagged)
 	}
 }
+
+// TestIMAP_Examine_ReadOnly_RejectsMove: RFC 9051 §6.3.3 permits "No changes to
+// the permanent state of the mailbox" opened with EXAMINE, and RFC 6851 §3.3
+// gives MOVE "the same effect for each message as this sequence: 1. [UID] COPY
+// 2. [UID] STORE +FLAGS.SILENT \DELETED 3. UID EXPUNGE", the last two of which
+// are refused after EXAMINE. MOVE and UID MOVE must be refused the same way and
+// leave the message in the source mailbox and out of the destination (#1058).
+func TestIMAP_Examine_ReadOnly_RejectsMove(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c := dialRawIMAP(t, server.Address)
+	c.do(fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password))
+	c.do("CREATE Other")
+	uid := c.appendMsg("INBOX", "From: a@example.com\r\nSubject: s\r\n\r\nbody\r\n")
+
+	if _, tagged := c.do("EXAMINE INBOX"); !strings.Contains(tagged, "OK [READ-ONLY]") {
+		t.Fatalf("EXAMINE INBOX: %s, want OK [READ-ONLY]", tagged)
+	}
+	for _, cmd := range []string{"MOVE 1 Other", fmt.Sprintf("UID MOVE %d Other", uid)} {
+		tag := c.send(cmd)
+		untagged, tagged := c.read(tag, cmd)
+		if !strings.HasPrefix(tagged, tag+" NO ") {
+			t.Errorf("%s after EXAMINE: %s, want a tagged NO", cmd, tagged)
+		}
+		for _, line := range untagged {
+			if strings.HasSuffix(line, " EXPUNGE") || strings.Contains(line, "COPYUID") {
+				t.Errorf("%s after EXAMINE answered %q", cmd, line)
+			}
+		}
+	}
+
+	// The message is still in INBOX and never reached Other.
+	if untagged, _ := c.do("STATUS Other (MESSAGES)"); !strings.Contains(strings.Join(untagged, "\r\n"), "(MESSAGES 0)") {
+		t.Errorf("STATUS Other after a refused MOVE: %v, want MESSAGES 0", untagged)
+	}
+	if untagged, _ := c.do("SELECT INBOX"); !slices.Contains(untagged, "* 1 EXISTS") {
+		t.Errorf("SELECT INBOX after a refused MOVE: %v, want * 1 EXISTS", untagged)
+	}
+
+	// The same MOVE in a read-write selection still moves the message.
+	if _, tagged := c.do("MOVE 1 Other"); !strings.Contains(tagged, "OK") {
+		t.Fatalf("MOVE after SELECT: %s", tagged)
+	}
+	if untagged, _ := c.do("STATUS Other (MESSAGES)"); !strings.Contains(strings.Join(untagged, "\r\n"), "(MESSAGES 1)") {
+		t.Errorf("STATUS Other after MOVE in a read-write selection: %v, want MESSAGES 1", untagged)
+	}
+}
+
+// TestIMAP_Examine_PermanentFlagsEmpty: no flag can be changed in a mailbox
+// opened with EXAMINE (RFC 9051 §6.3.3: "No changes to the permanent state of
+// the mailbox, including per-user state, are permitted"), so its PERMANENTFLAGS,
+// "A list of message flags that the client can change permanently" (§6.3.2),
+// is the empty list of the §6.3.3 example. It is sent empty rather than left
+// out: "If this is missing, the client should assume that all flags can be
+// changed permanently" (§6.3.2). A SELECT of the same mailbox still lists the
+// flags the user's rights allow, for the owner and for a grantee (#1059).
+func TestIMAP_Examine_PermanentFlagsEmpty(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	// permanentFlags runs cmd and returns the list of its one PERMANENTFLAGS
+	// response code.
+	permanentFlags := func(c *rawIMAP, cmd string) string {
+		t.Helper()
+		untagged, _ := c.do(cmd)
+		var lists []string
+		for _, line := range untagged {
+			if _, rest, ok := strings.Cut(line, "[PERMANENTFLAGS ("); ok {
+				list, _, _ := strings.Cut(rest, ")]")
+				lists = append(lists, list)
+			}
+		}
+		if len(lists) != 1 {
+			t.Fatalf("%s: got %d PERMANENTFLAGS responses, want 1: %q", cmd, len(lists), untagged)
+		}
+		return lists[0]
+	}
+
+	owner := dialRawIMAP(t, server.Address)
+	owner.do(fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password))
+	for _, tc := range []struct{ cmd, want string }{
+		{"EXAMINE INBOX", ""},
+		{"SELECT INBOX", `\Seen \Answered \Flagged \Deleted \Draft \*`},
+		{"EXAMINE INBOX", ""},
+	} {
+		if got := permanentFlags(owner, tc.cmd); got != tc.want {
+			t.Errorf("owner %s: PERMANENTFLAGS (%s), want (%s)", tc.cmd, got, tc.want)
+		}
+	}
+
+	// A grantee whose rights allow \Seen only ('s').
+	email2, password2 := createSecondUser(t, server, "example.com", "examinepf")
+	shared := fmt.Sprintf("Shared/ExaminePermFlags-%d", common.GetTimestamp())
+	owner.do(fmt.Sprintf(`CREATE "%s"`, shared))
+	defer owner.status(fmt.Sprintf(`DELETE "%s"`, shared))
+	owner.do(fmt.Sprintf(`SETACL "%s" "%s" lrs`, shared, email2))
+
+	grantee := dialRawIMAP(t, server.Address)
+	grantee.do(fmt.Sprintf(`LOGIN "%s" "%s"`, email2, password2))
+	for _, tc := range []struct{ cmd, want string }{
+		{fmt.Sprintf(`EXAMINE "%s"`, shared), ""},
+		{fmt.Sprintf(`SELECT "%s"`, shared), `\Seen`},
+		{fmt.Sprintf(`EXAMINE "%s"`, shared), ""},
+	} {
+		if got := permanentFlags(grantee, tc.cmd); got != tc.want {
+			t.Errorf("grantee with lrs %s: PERMANENTFLAGS (%s), want (%s)", tc.cmd, got, tc.want)
+		}
+	}
+}

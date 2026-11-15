@@ -14,7 +14,7 @@ import (
 )
 
 // TestIMAP_StoreUnchangedSinceZero_FailsEveryMessage covers the always-fail probe
-// of RFC 7162 §3.1.3.1: "UNCHANGEDSINCE 0" can never be satisfied, because every
+// of RFC 7162 §3.1.3: "UNCHANGEDSINCE 0" can never be satisfied, because every
 // message's mod-sequence is greater than zero.
 //
 // An absent modifier and an explicit zero mean opposite things — store

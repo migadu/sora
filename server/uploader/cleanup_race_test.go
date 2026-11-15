@@ -137,7 +137,8 @@ func (m *mockUploaderDB) GetFailedUploadsWithRetry(ctx context.Context, maxAttem
 
 // The backlog measurement is reporting-only; these tests exercise the upload/cleanup
 // paths, so answer with an empty queue rather than requiring a per-test expectation.
-func (m *mockUploaderDB) PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int) (UploadBacklog, error) {
+func (m *mockUploaderDB) PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int, changed func() []StagedBody) (UploadBacklog, error) {
+	changed()
 	return UploadBacklog{}, nil
 }
 

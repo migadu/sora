@@ -1361,10 +1361,11 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 			return nil, "", err
 		}
 
-		// Record failure in health tracking only if the caller still had time: a slow
-		// remote_lookup consuming the deadline, a client disconnect or a global timeout
-		// is not the backend's failure. See callerGaveUp.
-		callerDone := callerGaveUp(ctx)
+		// Record failure in health tracking only if the backend exhausted its own
+		// connect_timeout or the caller still had time left: a slow remote_lookup
+		// consuming the deadline, a client disconnect or a global timeout that cut
+		// the dial short is not the backend's failure. See shouldIgnoreDialFailure.
+		callerDone := shouldIgnoreDialFailure(ctx, err)
 		if !callerDone {
 			cm.RecordConnectionFailure(addr)
 		}
@@ -1377,6 +1378,40 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 		return nil, "", fmt.Errorf("all remote servers are in maintenance")
 	}
 	return nil, "", fmt.Errorf("all remote servers are unavailable")
+}
+
+// backendConnectTimeoutError wraps a TCP dial or implicit-TLS handshake error when
+// that phase ran for at least cm.connectTimeout without explicit caller cancellation
+// (context.Canceled). Even if the caller's overall deadline also elapsed while the
+// goroutine was waking up, the backend received its full connect_timeout and failed
+// to respond, so its failure counts against backend health.
+type backendConnectTimeoutError struct {
+	err error
+}
+
+func (e *backendConnectTimeoutError) Error() string { return e.err.Error() }
+func (e *backendConnectTimeoutError) Unwrap() error { return e.err }
+
+func (cm *ConnectionManager) phaseExhaustedConnectTimeout(ctx context.Context, phaseStart time.Time) bool {
+	if cm.connectTimeout <= 0 || time.Since(phaseStart) < cm.connectTimeout ||
+		errors.Is(ctx.Err(), context.Canceled) {
+		return false
+	}
+	// The process may resume after both timers expired. Time spent waiting to
+	// be scheduled does not give the backend a full phase when the caller's
+	// earlier deadline cut it short.
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(phaseStart.Add(cm.connectTimeout)) {
+		return false
+	}
+	return true
+}
+
+func shouldIgnoreDialFailure(ctx context.Context, err error) bool {
+	var backendTimeout *backendConnectTimeoutError
+	if errors.As(err, &backendTimeout) {
+		return false
+	}
+	return callerGaveUp(ctx)
 }
 
 // callerGaveUp reports whether a failed backend dial is down to the caller rather than
@@ -1469,17 +1504,17 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 		return conn, preferredAddr, nil, false // No fallback
 	}
 
-	// Connection failed. Mark it as unhealthy if it's in our managed list, but only if
-	// the caller still had time, as on the round-robin path (callerGaveUp).
+	// Connection failed. Mark it as unhealthy if it's in our managed list, unless the
+	// caller cut the dial short before connect_timeout elapsed (shouldIgnoreDialFailure).
 	if isInList {
-		callerDone := callerGaveUp(ctx)
+		callerDone := shouldIgnoreDialFailure(ctx, err)
 		if !callerDone {
 			cm.RecordConnectionFailure(preferredAddr)
 		}
 		logger.Warn("Failed to connect to preferred backend", "addr", preferredAddr, "error", err, "is_remotelookup", isRemoteLookupRoute, "ctx_err", ctx.Err(), "caller_done", callerDone, "server", cm.serverName)
 	} else if isRemoteLookupRoute {
 		// Track remote lookup backend failure (not in pool), same rule as above.
-		callerDone := callerGaveUp(ctx)
+		callerDone := shouldIgnoreDialFailure(ctx, err)
 		if !callerDone {
 			cm.RecordRemoteLookupFailure(preferredAddr)
 		}
@@ -1793,7 +1828,8 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 		// Verified by the backend's configured name (or its address), not by the formatted
 		// dial target alone; see BackendClientTLS.
 		tlsConfig := cm.BackendClientTLS(cm.remoteTLSVerify, addr)
-		conn, err = tls.DialWithDialer(dialer, "tcp", resolvedAddr, tlsConfig)
+		tlsDialer := &tls.Dialer{NetDialer: dialer, Config: tlsConfig}
+		conn, err = tlsDialer.DialContext(ctx, "tcp", resolvedAddr)
 	} else {
 		// Plain connection (either no TLS, or TLS will be negotiated via StartTLS)
 		conn, err = dialer.DialContext(ctx, "tcp", resolvedAddr)
@@ -1853,9 +1889,14 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	logger.Debug("Attempting to connect to backend", "addr", resolvedAddr)
 
 	// Always establish plain TCP connection first
+	callerAlreadyDone := callerGaveUp(ctx)
+	tcpStart := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", resolvedAddr)
 	if err != nil {
 		logger.Warn("ConnectionManager: TCP dial failed", "addr", resolvedAddr, "original_addr", addr, "error", err, "server", cm.serverName)
+		if !callerAlreadyDone && cm.phaseExhaustedConnectTimeout(ctx, tcpStart) {
+			return nil, &backendConnectTimeoutError{err: err}
+		}
 		return nil, err
 	}
 
@@ -1914,27 +1955,35 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	// Now establish TLS if required (only for implicit TLS, not StartTLS)
 	// When StartTLS is enabled, the protocol layer will handle TLS upgrade
 	if remoteTLS && !remoteTLSUseStartTLS {
+		if callerGaveUp(ctx) {
+			conn.Close()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("TLS handshake failed: %w", ctxErr)
+			}
+			return nil, fmt.Errorf("TLS handshake failed: %w", context.DeadlineExceeded)
+		}
+
 		tlsConfig := route.TLSConfig(remoteTLSVerify, conn)
 		logger.Debug("Starting TLS handshake", "addr", addr, "InsecureSkipVerify", !remoteTLSVerify, "server_name", tlsConfig.ServerName)
 		tlsConn := tls.Client(conn, tlsConfig)
 
-		// Set a deadline for the TLS handshake
-		if err := conn.SetDeadline(time.Now().Add(cm.connectTimeout)); err != nil {
-			conn.Close()
-			logger.Debug("ConnectionManager: Failed to set TLS handshake deadline", "addr", addr, "error", err)
-			return nil, fmt.Errorf("failed to set TLS deadline: %w", err)
+		handshakeCtx := ctx
+		if cm.connectTimeout > 0 {
+			var cancel context.CancelFunc
+			handshakeCtx, cancel = context.WithTimeout(ctx, cm.connectTimeout)
+			defer cancel()
 		}
 
-		err = tlsConn.Handshake()
+		tlsStart := time.Now()
+		err = tlsConn.HandshakeContext(handshakeCtx)
 		if err != nil {
 			conn.Close()
 			logger.Debug("ConnectionManager: TLS handshake failed", "addr", addr, "error", err, "verify", remoteTLSVerify)
-			return nil, fmt.Errorf("TLS handshake failed: %w", err)
-		}
-
-		// Clear the deadline after successful handshake
-		if err := conn.SetDeadline(time.Time{}); err != nil {
-			logger.Debug("ConnectionManager: Warning: failed to clear TLS deadline", "addr", addr, "error", err)
+			wrapped := fmt.Errorf("TLS handshake failed: %w", err)
+			if cm.phaseExhaustedConnectTimeout(ctx, tlsStart) {
+				return nil, &backendConnectTimeoutError{err: wrapped}
+			}
+			return nil, wrapped
 		}
 
 		return tlsConn, nil
@@ -2079,35 +2128,59 @@ func (cm *ConnectionManager) GetConnectTimeout() time.Duration {
 }
 
 const (
-	// maxConnectAttempts caps how many dials one ConnectWithProxy call is given budget
-	// for, so a broadly dead pool cannot stretch a single login to len(pool) x connect_timeout.
-	maxConnectAttempts = 3
+	// maxConnectAttempts caps how many per-attempt connect budgets one ConnectWithProxy
+	// call is given (up to three full backend attempts plus one attempt of slack/preferred
+	// headroom), so a broadly dead pool cannot stretch a single login to len(pool) x connect_timeout.
+	maxConnectAttempts = 4
 
 	// defaultConnectBudgetPerDial bounds a manager configured without a connect timeout,
 	// where net.Dialer imposes no per-dial limit of its own.
 	defaultConnectBudgetPerDial = 30 * time.Second
 )
 
+func (cm *ConnectionManager) hasImplicitTLS() bool {
+	if cm.remoteTLS && !cm.remoteTLSUseStartTLS {
+		return true
+	}
+	for _, p := range cm.pools {
+		if p.settings.TLS && !p.settings.TLSUseStartTLS {
+			return true
+		}
+	}
+	return false
+}
+
 // ConnectBudget returns the overall deadline a caller should put around one
-// ConnectWithProxy call. connect_timeout is a per-dial budget (net.Dialer.Timeout) and
-// ConnectWithProxy dials the preferred backend and then falls back through the pool, so a
-// deadline of one connect_timeout lets a black-holed backend spend the whole budget and
-// leaves every fallback dial to fail instantly on an already-expired context.
+// ConnectWithProxy call. connect_timeout is a per-phase budget (TCP dial and, when
+// implicit TLS is used, TLS handshake) and ConnectWithProxy dials the preferred backend
+// and then falls back through the pool, so a deadline of one connect_timeout lets a
+// black-holed backend spend the whole budget and leaves every fallback dial to fail
+// instantly on an already-expired context.
 func (cm *ConnectionManager) ConnectBudget() time.Duration {
-	perDial := cm.connectTimeout
-	if perDial <= 0 {
-		perDial = defaultConnectBudgetPerDial
+	perAttempt := cm.connectTimeout
+	if perAttempt <= 0 {
+		perAttempt = defaultConnectBudgetPerDial
+	}
+	if cm.hasImplicitTLS() {
+		perAttempt *= 2
 	}
 
 	cm.healthMu.RLock()
 	attempts := len(cm.remoteAddrs) + 1 // preferred dial plus one round-robin dial per backend
 	cm.healthMu.RUnlock()
 
-	if attempts > maxConnectAttempts {
-		attempts = maxConnectAttempts
+	maxBudget := perAttempt * maxConnectAttempts
+	if attempts >= maxConnectAttempts {
+		return maxBudget
 	}
 
-	return perDial * time.Duration(attempts)
+	// Add half an attempt of inter-dial scheduling/teardown slack so the final dial
+	// of a small pool is not cut off slightly before its own connect_timeout expires.
+	budget := perAttempt*time.Duration(attempts) + perAttempt/2
+	if budget > maxBudget {
+		return maxBudget
+	}
+	return budget
 }
 
 // HasRouting returns true if a user routing lookup is configured.

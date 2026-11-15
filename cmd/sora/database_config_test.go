@@ -23,10 +23,29 @@ func loadStartupDatabaseConfig(t *testing.T, content string) config.Config {
 }
 
 const imapServerTOML = `
+[s3]
+endpoint = "s3.example.com"
+bucket = "mail"
+
 [[server]]
 type = "imap"
 name = "imap"
 addr = ":143"
+`
+
+// proxyOnlyTOML is a proxy that needs no database: a remote lookup answers for every
+// user.
+const proxyOnlyTOML = `
+[[server]]
+type = "imap_proxy"
+name = "imap-proxy"
+addr = ":1143"
+remote_addrs = ["backend1.example.com:143"]
+
+[server.remote_lookup]
+enabled = true
+url = "https://lookup.example.com/lookup?email=$email"
+lookup_local_users = false
 `
 
 // TestStartupKeepsDatabaseTablesTheFileDefines pins that a [database.write] or
@@ -96,23 +115,11 @@ hosts = ["db1.example.com"]
 			toml: `
 [database]
 query_timeout = "30s"
-
-[[server]]
-type = "imap_proxy"
-name = "imap-proxy"
-addr = ":1143"
-remote_addrs = ["backend1.example.com:143"]
-`,
+` + proxyOnlyTOML,
 		},
 		{
 			name: "no database table",
-			toml: `
-[[server]]
-type = "imap_proxy"
-name = "imap-proxy"
-addr = ":1143"
-remote_addrs = ["backend1.example.com:143"]
-`,
+			toml: proxyOnlyTOML,
 		},
 	}
 

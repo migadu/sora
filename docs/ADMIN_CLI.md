@@ -526,6 +526,13 @@ sora-admin --config config.toml messages restore --email user@example.com --ids 
 - Without `--confirm`, the command lists up to ten of the matching messages and asks
   `Continue with restoration? (yes/no)`. Only `yes` or `y` continues.
 - A mailbox that no longer exists is created again. Restored messages get new UIDs.
+- With sharing enabled in the config file you pass, a mailbox recreated in the shared namespace
+  is a shared mailbox of the account, as `mailbox create` makes one, and so is a parent recreated
+  there. Each one starts with owner-only rights: one entry, the owner's primary address with
+  `default_rights`. The ACL entries it had before it was deleted are not restored, and a shared
+  parent's entries are not copied as they are for a new folder
+  ([SHARED_MAILBOXES.md](SHARED_MAILBOXES.md)). The restore logs a warning naming it. Grant
+  other users access again with `acl grant`.
 - Restores run in chunks, each committed on its own. If a run fails partway, the restored
   messages stay restored; run the same command again for the rest. Messages already back are
   skipped, not duplicated.
@@ -966,8 +973,29 @@ Notes on `delete`:
   local mirror.
 - `--key` leaves the local mirror alone.
 
-`cache` writes files with mode `0600` as the user running the command. Run it as the user the
-server runs as, or fix the ownership afterwards.
+Notes on `clean`:
+
+- A node can renew an expired certificate while `clean` runs, after `clean` has read the
+  expired one. On a bucket that keeps versions (Backblaze B2 buckets always do), `clean`
+  deletes only the version it read and found expired, so the renewal, a newer version, stays.
+  If deleting that version brings back an older one that has expired too, `clean` deletes that
+  one as well. This needs the right to delete object versions: `s3:DeleteObjectVersion` on
+  AWS, the `deleteFiles` capability on Backblaze B2.
+- Without a usable version id, including a `null` version exposed after a version delete,
+  `clean` sends the inspected object's ETag in `If-Match`. A changed object is kept.
+  This requires conditional DELETE support from the S3 provider; a missing ETag or an
+  unsupported condition fails that cleanup operation and keeps the object. `clean` never
+  retries it as an unconditional delete. Versioned B2 objects continue to use version ids.
+- A local copy is removed only if it still holds an expired certificate when `clean` removes
+  it. A renewal written over it during the run stays.
+
+`cache` writes a new certificate with mode `0600` and a replacement with the mode of the file
+it replaces. When the directory belongs to another user, as the server's directory does when
+you run `cache` as root, each file it writes is given to that user; otherwise a replacement
+keeps the owner of the file it replaces. A missing directory is created with mode `0700`, as
+the server creates it, and given to the owner of the directory it is created in: for the
+default `/var/lib/sora/certs`, the owner of `/var/lib/sora`, the server's user under
+`dist/sora.service`. A directory created in a sticky directory such as `/tmp` stays yours.
 
 ---
 
@@ -977,7 +1005,7 @@ Checks and prints a config file. These subcommands read only the file.
 
 | Subcommand | Flags | What it does |
 |---|---|---|
-| `validate` | | Loads the file with the server's loader (warnings for unknown and duplicate keys), validates every `[[server]]` block, and checks that server names and addresses are unique. Prints `[OK] Configuration is valid!` and the servers, or `[FAIL]` lines. Exits `1` on errors. |
+| `validate` | | Loads the file with the server's loader (warnings for unknown and duplicate keys) and runs the checks `sora` makes on the file before it starts anything ([CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup)), without connecting to anything. Prints `[OK] Configuration is valid!` and the servers, or a `[FAIL]` line for each problem. Exits `1` on errors. |
 | `dump` | `--format` (`toml` or `json`, default `toml`), `--mask-secrets` (default `true`) | Prints the configuration as loaded, with defaults applied. |
 
 `--mask-secrets` masks the database passwords, `[s3]` access key, secret key and encryption key,

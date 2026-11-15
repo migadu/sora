@@ -1,11 +1,13 @@
 package db
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/consts"
 	"github.com/stretchr/testify/require"
 )
 
@@ -198,4 +200,168 @@ func TestOrphanSweepKeepsCopiesSearchable(t *testing.T) {
 			f.requireSearchable(f.b, hash)
 		})
 	}
+}
+
+// TestAccountFTSDrainConcurrentDrainsDoNotDeadlock: DeleteFTSRowsForAccount must not keep
+// FOR UPDATE tuple locks on messages_fts_v2 rows whose advisory try-lock failed. Otherwise,
+// two concurrent account drains (two purge workers, or a purge racing the cleaner) can each
+// hold a tuple lock on a hash whose advisory lock the other won, and deadlock (40P01) when
+// fillWaitingFTSRows updates waiting copies of those hashes.
+func TestAccountFTSDrainConcurrentDrainsDoNotDeadlock(t *testing.T) {
+	f := newRekeyFTSFixture(t)
+	c, inboxC := f.a, f.inboxA
+	a, inboxA := f.b, f.inboxB
+	b, inboxB := f.account("c", "INBOX")
+	require.True(t, c < a && a < b)
+
+	h1 := f.hash("h1")
+	var h2 string
+	for i := 0; ; i++ {
+		h2 = f.hash(fmt.Sprintf("h2_%d", i))
+		if h1 > h2 {
+			h1, h2 = h2, h1
+		}
+		var distinct bool
+		require.NoError(t, f.d.GetWritePool().QueryRow(f.ctx,
+			`SELECT $1::varchar(64) < $2::varchar(64) AND hashtext($1) <> hashtext($2)`,
+			h1, h2).Scan(&distinct))
+		if distinct {
+			break
+		}
+	}
+
+	// (h1, b) and (h2, a) hold the only indexed vectors; c (live) and the opposite purged
+	// account hold waiting copy rows (text_body IS NULL AND text_body_tsv IS NULL).
+	uidH1 := f.importBody(b, inboxB, h1)
+	uidH2 := f.importBody(a, inboxA, h2)
+	f.drainFTS()
+
+	f.inTx(func(tx pgx.Tx) { f.copyTo(tx, uidH1, inboxB, inboxC, c, h1) })
+	f.inTx(func(tx pgx.Tx) { f.copyTo(tx, uidH1, inboxB, inboxA, a, h1) })
+	f.inTx(func(tx pgx.Tx) { f.copyTo(tx, uidH2, inboxA, inboxC, c, h2) })
+	f.inTx(func(tx pgx.Tx) { f.copyTo(tx, uidH2, inboxA, inboxB, b, h2) })
+
+	f.purgeAccountMessages(a)
+	f.purgeAccountMessages(b)
+
+	// Simulate an FTS worker holding (h1, c) FOR UPDATE while an in-flight delivery holds
+	// the shared orphan-sweep advisory lock on h2.
+	txWorker, err := f.d.GetWritePool().Begin(f.ctx)
+	require.NoError(t, err)
+	defer txWorker.Rollback(context.Background())
+	_, err = txWorker.Exec(f.ctx,
+		`SELECT 1 FROM messages_fts_v2 WHERE content_hash = $1 AND account_id = $2 FOR UPDATE`,
+		h1, c)
+	require.NoError(t, err)
+
+	txDeliv, err := f.d.GetWritePool().Begin(f.ctx)
+	require.NoError(t, err)
+	defer txDeliv.Rollback(context.Background())
+	_, err = txDeliv.Exec(f.ctx,
+		`SELECT pg_advisory_xact_lock_shared($1, hashtext($2))`,
+		consts.SoraFTSOrphanSweepLockClassID, h2)
+	require.NoError(t, err)
+
+	type drainResult struct {
+		deleted int64
+		err     error
+	}
+	startDrain := func(accountID int64) (int, <-chan drainResult) {
+		conn, err := f.d.GetWritePool().Acquire(f.ctx)
+		require.NoError(t, err)
+		var pid int
+		require.NoError(t, conn.QueryRow(f.ctx, `SELECT pg_backend_pid()`).Scan(&pid))
+		ch := make(chan drainResult, 1)
+		go func() {
+			defer conn.Release()
+			ctx, cancel := context.WithTimeout(f.ctx, 10*time.Second)
+			defer cancel()
+			tx, err := conn.Begin(ctx)
+			if err != nil {
+				ch <- drainResult{err: err}
+				return
+			}
+			defer tx.Rollback(context.Background())
+			if _, err := tx.Exec(ctx, `SAVEPOINT sp_dl`); err == nil {
+				if _, err := tx.Exec(ctx, `SET LOCAL deadlock_timeout = '50ms'`); err != nil {
+					_, _ = tx.Exec(ctx, `ROLLBACK TO SAVEPOINT sp_dl`)
+				}
+				_, _ = tx.Exec(ctx, `RELEASE SAVEPOINT sp_dl`)
+			}
+			n, err := f.d.DeleteFTSRowsForAccount(ctx, tx, accountID, 100)
+			if err != nil {
+				ch <- drainResult{err: err}
+				return
+			}
+			ch <- drainResult{deleted: n, err: tx.Commit(ctx)}
+		}()
+		return pid, ch
+	}
+
+	isWaitingOnLock := func(pid int) bool {
+		var waiting bool
+		require.NoError(t, f.d.GetWritePool().QueryRow(f.ctx,
+			`SELECT COALESCE(bool_or(wait_event_type = 'Lock'), false) FROM pg_stat_activity WHERE pid = $1`,
+			pid).Scan(&waiting))
+		return waiting
+	}
+
+	// 1. B's drain wins h1's advisory lock, skips h2 (held shared by txDeliv), and blocks in
+	// fillWaitingFTSRows([h1]) on (h1, c) held by txWorker.
+	pidB, doneB := startDrain(b)
+	deadline := time.Now().Add(5 * time.Second)
+	for !isWaitingOnLock(pidB) {
+		select {
+		case res := <-doneB:
+			t.Fatalf("drain B finished before blocking on worker lock: %+v", res)
+		default:
+		}
+		require.False(t, time.Now().After(deadline), "drain B did not reach lock wait on (h1, c)")
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 2. Delivery finishes, releasing h2's shared advisory lock.
+	require.NoError(t, txDeliv.Rollback(f.ctx))
+
+	// 3. A's drain skips h1 (advisory lock held by B), wins h2's advisory lock, and runs
+	// fillWaitingFTSRows([h2]). When B did not retain a tuple lock on skipped (h2, b), A
+	// finishes immediately; when B retained FOR UPDATE on (h2, b), A blocks on it.
+	pidA, doneA := startDrain(a)
+	var resA drainResult
+	aDone := false
+	deadline = time.Now().Add(5 * time.Second)
+	for !aDone {
+		select {
+		case resA = <-doneA:
+			aDone = true
+		case <-time.After(5 * time.Millisecond):
+			if isWaitingOnLock(pidA) {
+				break
+			}
+			require.False(t, time.Now().After(deadline), "drain A neither finished nor waited on a lock")
+			continue
+		}
+		break
+	}
+
+	// 4. Worker finishes, releasing (h1, c) so B can complete fillWaitingFTSRows([h1]).
+	require.NoError(t, txWorker.Rollback(f.ctx))
+
+	resB := <-doneB
+	if !aDone {
+		resA = <-doneA
+	}
+	require.NoError(t, resB.err, "concurrent drain B must not deadlock or fail")
+	require.NoError(t, resA.err, "concurrent drain A must not deadlock or fail")
+	require.EqualValues(t, 1, resB.deleted)
+	require.EqualValues(t, 1, resA.deleted)
+
+	// Next pass removes the skipped rows and finalizes both purged accounts while c stays searchable.
+	require.EqualValues(t, 1, f.drainAccountFTS(a))
+	require.EqualValues(t, 1, f.drainAccountFTS(b))
+	require.EqualValues(t, 1, f.finalize(a))
+	require.EqualValues(t, 1, f.finalize(b))
+
+	f.drainFTS()
+	f.requireSearchable(c, h1, h2)
 }
