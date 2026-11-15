@@ -18,6 +18,7 @@ type MessageUpdate struct {
 	SeqNum          uint32
 	BitwiseFlags    int // Matches the 'flags' column type in messages table (INTEGER)
 	IsExpunge       bool
+	IsNew           bool // Created after sinceModSeq; announced via EXISTS rather than FlagChange
 	CustomFlags     []string
 	EffectiveModSeq uint64 // The modseq that triggered this update
 }
@@ -215,6 +216,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			UID:             imap.UID(uid),
 			BitwiseFlags:    bitwise,
 			IsExpunge:       expungedAt.Valid,
+			IsNew:           !expungedAt.Valid && created.Valid && uint64(created.Int64) > sinceModSeq,
 			CustomFlags:     customFlags,
 			EffectiveModSeq: effective,
 		})

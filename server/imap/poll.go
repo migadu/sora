@@ -385,7 +385,13 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 	// default, and only the library knows which policy its writer applies.
 	var flagFilterRead, flagsFiltered bool
 	for _, update := range poll.Updates {
-		if update.IsExpunge {
+		// New messages are announced via QueueNumMessages (EXISTS) above and,
+		// when NOTIFY MessageNew fetch-atts are watched, fetched once by
+		// notifyFetchNewMessages (skipping watch.own, RFC 5465 §5.2). Treating
+		// them as FlagChange updates here would emit unsolicited FETCHes on own
+		// APPEND/COPY/MOVE, duplicate MessageNew FETCHes, and falsely latch
+		// reportedModSeqGap when FlagChange is filtered.
+		if update.IsExpunge || update.IsNew {
 			continue
 		}
 
