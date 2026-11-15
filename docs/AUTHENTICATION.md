@@ -514,7 +514,7 @@ durations.
 | `username_window_duration` | `60m` | Statistics only: how long a name's failure count is kept. |
 | `delay_start_threshold` | `2` | Failures from an IP before its logins are delayed. |
 | `initial_delay` | `1s` | The first delay. |
-| `max_delay` | `30s` | The longest delay. |
+| `max_delay` | `30s` | The longest delay. An HTTP login's write timeout starts after it (section 10.3). |
 | `delay_multiplier` | `2.0` | Each further failure multiplies the delay by this. |
 | `cleanup_interval` | `5m` | How often expired entries are removed and the gauges updated. |
 | `max_ip_username_entries` | `100000` | Size cap of the Tier 1 table. |
@@ -583,6 +583,11 @@ defaults:
 The wait applies to every login from that IP, including a correct password, until a success clears
 the count or the count is forgotten. It applies once per login command. A client that closes the
 connection while waiting ends the wait.
+
+On the User API and the User API proxy the wait runs inside the HTTP request, whose 30-second write
+timeout has already started. The timeout is moved to the end of the wait, so a delayed login is
+answered and still has 30 seconds for its own work and its answer, whatever `max_delay` is. The wait
+is never shortened to fit the timeout.
 
 ### 10.4 Waits in parallel
 
@@ -659,9 +664,12 @@ The wait of section 10.3 comes before the reply in every case.
 - In cluster mode, with `[cluster.rate_limit_sync] enabled` (the default), the `imap_proxy`,
   `pop3_proxy` and `managesieve_proxy` limiters share their state with the proxies of the same type
   on every node, their own node included: Tier 2 blocks (`sync_blocks`), Tier 2 counts from
-  `delay_start_threshold` on (`sync_failure_counts`), and the name statistics. A shared count only
-  raises a listener's own, its `exempt_networks` are not counted, and a shared wait is capped at its
-  `max_delay`. Tier 1 blocks stay on the listener that set them.
+  `delay_start_threshold` on and the successes that clear them (`sync_failure_counts`), and the
+  name statistics. A shared count only raises a listener's own, its `exempt_networks` are not
+  counted, and a shared wait is capped at its `max_delay`. Tier 1 blocks stay on the listener that
+  set them. See
+  [CLUSTER.md](CLUSTER.md#66-authentication-rate-limits-imap-pop3-and-managesieve-proxies) for the
+  details and [CONFIGURATION.md](CONFIGURATION.md#814-cluster-cluster) for the keys.
 - A restart forgets all counts and blocks.
 - `auth_rate_limit` is read at startup. A SIGHUP reload does not change it.
 
@@ -690,8 +698,15 @@ ways:
 
 - **The client IP.** A host in the list may pass on the client's address with a PROXY header (on a
   listener with `proxy_protocol = true`), with IMAP ID forwarding parameters, or with POP3 XCLIENT.
-  The rate limiter and the logs then use that forwarded address. From a host not in the list, these
-  are ignored and the TCP peer is the client.
+  Logs use that forwarded address. Authentication rate-limit checks and counters do too, but POP3
+  `XCLIENT` needs `FORWARD` metadata containing `proxy-source-ip` when no client address came from
+  a PROXY header. Sora's POP3 proxy sends it; bare `ADDR` changes the logged address while those
+  checks and counters still use the TCP peer. From a host not in the list, ID and XCLIENT
+  forwarding are ignored or refused and the TCP peer is the client, and a
+  `proxy_protocol = true` listener closes the connection. Behind a PROXY header, ID and POP3
+  XCLIENT forwarding are judged by the client the header names, so a client behind a trusted load
+  balancer cannot forward another address unless its own address is in the list
+  ([SECURITY.md](SECURITY.md#31-trusted_networks)).
 - **Rate-limit exemption.** Unless `exempt_networks` is set, addresses in the list are exempt from
   rate limiting (section 10.5).
 

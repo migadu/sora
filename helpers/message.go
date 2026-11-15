@@ -183,9 +183,17 @@ func ValidateBodyStructure(bs *imap.BodyStructure) error {
 	return nil
 }
 
-// ExtractBodyStructure is imapserver.ExtractBodyStructure, indirected so tests
-// can exercise SafeBodyStructure's recovery path.
-var ExtractBodyStructure = imapserver.ExtractBodyStructure
+// extractOptions reads the Date: of an attached message/rfc822 or message/global part,
+// whose envelope the body structure stores, with ParseDateHeader like the message's own.
+// go-imap's default is net/mail, which reads an obsolete zone such as PDT in time.Local.
+var extractOptions = &imapserver.ExtractOptions{ParseDate: ParseDateHeader}
+
+// ExtractBodyStructure is imapserver.ExtractBodyStructure with the envelope dates of
+// attached messages read by ParseDateHeader, indirected so tests can exercise
+// SafeBodyStructure's recovery path.
+var ExtractBodyStructure = func(r io.Reader) imap.BodyStructure {
+	return imapserver.ExtractBodyStructureWithOptions(r, extractOptions)
+}
 
 // SafeBodyStructure returns the BODYSTRUCTURE to store for a raw message. Every
 // ingestion path (LMTP, APPEND, Admin API delivery) stores one and FETCH later

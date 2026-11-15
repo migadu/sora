@@ -84,6 +84,8 @@ func TestIMAP_FetchBinaryDecodesTransferEncodingOnly(t *testing.T) {
 		binaryDecodeTestMessage("latin1", "text/plain; charset=iso-8859-1", "quoted-printable", "caf=E9\r\n"),
 		// 4: message 1 with a comment in its Content-Transfer-Encoding
 		binaryDecodeTestMessage("comment", "text/plain", "base64 (encoded)", "bGluZTEKbGluZTIK\r\n"),
+		// 5: "\x00\x01\xffa"
+		binaryDecodeTestMessage("nul", "application/octet-stream", "base64", "AAH/YQ==\r\n"),
 	} {
 		tag := fmt.Sprintf("a%d", i+1)
 		if _, err := fmt.Fprintf(conn, "%s APPEND INBOX {%d+}\r\n%s\r\n", tag, len(msg), msg); err != nil {
@@ -122,7 +124,7 @@ func TestIMAP_FetchBinaryDecodesTransferEncodingOnly(t *testing.T) {
 	})
 
 	t.Run("text sent with CRLF", func(t *testing.T) {
-		const want = "BINARY[1] ~{14}\r\nline1\r\nline2\r\n BINARY.SIZE[1] 14)"
+		const want = "BINARY[1] {14}\r\nline1\r\nline2\r\n BINARY.SIZE[1] 14)"
 		for _, cmd := range []string{"FETCH 1 (BINARY.PEEK[1] BINARY.SIZE[1])", "UID FETCH 1 (BINARY.PEEK[1] BINARY.SIZE[1])"} {
 			if resp := mustOK(t, cmd); !strings.Contains(resp, want) {
 				t.Errorf("%s: want %q in:\n%q", cmd, want, resp)
@@ -134,14 +136,33 @@ func TestIMAP_FetchBinaryDecodesTransferEncodingOnly(t *testing.T) {
 	// semantic content and should be ignored during MIME processing", so the
 	// server knows how to decode "base64 (encoded)".
 	t.Run("comment in CTE ignored", func(t *testing.T) {
-		const want = "BINARY[1] ~{14}\r\nline1\r\nline2\r\n BINARY.SIZE[1] 14)"
+		const want = "BINARY[1] {14}\r\nline1\r\nline2\r\n BINARY.SIZE[1] 14)"
 		if resp := mustOK(t, "FETCH 4 (BINARY.PEEK[1] BINARY.SIZE[1])"); !strings.Contains(resp, want) {
 			t.Errorf("want %q in:\n%q", want, resp)
 		}
 	})
 
+	// RFC 9051 §7.5.2: "If the domain of the decoded data is "8bit" and the
+	// data does not contain the NUL octet, the server SHOULD return the data
+	// in a <string> instead of a <literal8>" (RFC 3516 §4.3 likewise). A
+	// literal carries any octet but NUL, so only a NUL needs a literal8 (#1077).
+	t.Run("literal8 only with a NUL", func(t *testing.T) {
+		for _, tc := range []struct{ cmd, want string }{
+			{"FETCH 1 (BINARY.PEEK[1])", "BINARY[1] {14}\r\nline1\r\nline2\r\n)"},
+			{"FETCH 1 (BINARY.PEEK[1]<5.2>)", "BINARY[1]<5> {2}\r\n\r\n)"},
+			{"FETCH 5 (BINARY.PEEK[1] BINARY.SIZE[1])", "BINARY[1] ~{4}\r\n\x00\x01\xffa BINARY.SIZE[1] 4)"},
+			{"FETCH 5 (BINARY.PEEK[1]<0.2>)", "BINARY[1]<0> ~{2}\r\n\x00\x01)"},
+			{"FETCH 5 (BINARY.PEEK[1]<1.3>)", "BINARY[1]<1> {3}\r\n\x01\xffa)"},
+			{"FETCH 5 (BINARY.PEEK[1]<4.1>)", "BINARY[1]<4> {0}\r\n)"},
+		} {
+			if resp := mustOK(t, tc.cmd); !strings.Contains(resp, tc.want) {
+				t.Errorf("%s: want %q in:\n%q", tc.cmd, tc.want, resp)
+			}
+		}
+	})
+
 	t.Run("charset kept", func(t *testing.T) {
-		const want = "BINARY[1] ~{6}\r\ncaf\xe9\r\n BINARY.SIZE[1] 6)"
+		const want = "BINARY[1] {6}\r\ncaf\xe9\r\n BINARY.SIZE[1] 6)"
 		if resp := mustOK(t, "FETCH 3 (BINARY.PEEK[1] BINARY.SIZE[1])"); !strings.Contains(resp, want) {
 			t.Errorf("want %q in:\n%q", want, resp)
 		}

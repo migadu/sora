@@ -18,6 +18,9 @@ func (s *IMAPSession) GetMetadata(ctx context.Context, mailbox string, entries [
 	if err := s.requireCapability(imap.CapMetadata, "GETMETADATA"); err != nil {
 		return nil, err
 	}
+	if len(entries) == 0 {
+		return nil, emptyMetadataEntryList("GETMETADATA")
+	}
 	ctx = s.pinnedContext(ctx)
 
 	s.DebugLog("GETMETADATA command", "mailbox", mailbox, "entries", entries)
@@ -121,6 +124,9 @@ func (s *IMAPSession) MetadataMaxSize() uint32 {
 func (s *IMAPSession) SetMetadata(ctx context.Context, mailbox string, entries map[string]*[]byte) error {
 	if err := s.requireCapability(imap.CapMetadata, "SETMETADATA"); err != nil {
 		return err
+	}
+	if len(entries) == 0 {
+		return emptyMetadataEntryList("SETMETADATA")
 	}
 	ctx = s.pinnedContext(ctx)
 
@@ -310,4 +316,14 @@ func invalidMetadataEntry(text string) error {
 		Code: imap.ResponseCodeClientBug,
 		Text: text,
 	}
+}
+
+// emptyMetadataEntryList refuses a GETMETADATA or SETMETADATA whose entry
+// list is "()". RFC 5464 §5 gives both lists at least one entry ("entries =
+// entry / "(" entry *(SP entry) ")"", "entry-values = "(" entry-value *(SP
+// entry-value) ")""), and §4.2/§4.3 answer "BAD - command unknown or arguments
+// invalid". go-imap's list parser accepts "()" and passes no entries, so the
+// handlers refuse it first, before any mailbox lookup or ACL check.
+func emptyMetadataEntryList(command string) error {
+	return invalidMetadataEntry(command + " requires at least one metadata entry")
 }

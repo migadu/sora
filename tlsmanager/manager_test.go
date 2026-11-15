@@ -1,6 +1,7 @@
 package tlsmanager
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -23,7 +24,7 @@ func TestNewTLSManagerFileProvider(t *testing.T) {
 
 	// Check error message
 	expectedMsg := "cert_file and key_file are required for provider='file'"
-	if err.Error() != "failed to initialize file provider: "+expectedMsg {
+	if err.Error() != expectedMsg {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
@@ -74,7 +75,7 @@ func TestNewTLSManagerLetsEncryptMissingConfig(t *testing.T) {
 	}
 
 	expectedMsg := "letsencrypt configuration is required for provider='letsencrypt'"
-	if err.Error() != "failed to initialize Let's Encrypt provider: "+expectedMsg {
+	if err.Error() != expectedMsg {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
@@ -95,7 +96,7 @@ func TestNewTLSManagerLetsEncryptMissingEmail(t *testing.T) {
 	}
 
 	expectedMsg := "letsencrypt.email is required"
-	if err.Error() != "failed to initialize Let's Encrypt provider: "+expectedMsg {
+	if err.Error() != expectedMsg {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
@@ -116,7 +117,7 @@ func TestNewTLSManagerLetsEncryptMissingDomains(t *testing.T) {
 	}
 
 	expectedMsg := "letsencrypt.domains is required and must not be empty"
-	if err.Error() != "failed to initialize Let's Encrypt provider: "+expectedMsg {
+	if err.Error() != expectedMsg {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
@@ -138,8 +139,40 @@ func TestNewTLSManagerLetsEncryptInvalidStorageProvider(t *testing.T) {
 	}
 
 	expectedMsg := "only storage_provider='s3' is currently supported for Let's Encrypt"
-	if err.Error() != "failed to initialize Let's Encrypt provider: "+expectedMsg {
+	if err.Error() != expectedMsg {
 		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// New runs the [tls] checks the server runs on the whole file before it starts anything
+// (config.Config.Validate), so a renew_before that does not parse is refused before the
+// certificate store is opened (#1105). It was parsed only after the S3 cache was set up,
+// so an unreachable store hid it.
+func TestNewTLSManagerChecksTheConfigFirst(t *testing.T) {
+	cfg := config.TLSConfig{
+		Enabled:  true,
+		Provider: "letsencrypt",
+		LetsEncrypt: &config.TLSLetsEncryptConfig{
+			Email:           "test@example.com",
+			Domains:         []string{"example.com"},
+			StorageProvider: "s3",
+			RenewBefore:     "a month",
+			S3: config.TLSLetsEncryptS3Config{
+				Endpoint:   "127.0.0.1:1", // nothing listens: the store cannot be opened
+				DisableTLS: true,
+				Bucket:     "certs",
+				AccessKey:  "AKIAEXAMPLE",
+				SecretKey:  "example-secret",
+			},
+		},
+	}
+
+	_, err := New(cfg, nil)
+	if err == nil {
+		t.Fatal("New accepted an unparsable renew_before")
+	}
+	if want := `invalid renew_before duration "a month"`; !strings.Contains(err.Error(), want) {
+		t.Errorf("New: %v, want ...%s...", err, want)
 	}
 }
 
