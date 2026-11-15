@@ -1670,6 +1670,14 @@ func (c SharedMailboxesConfig) InNamespace(name string) bool {
 	return strings.HasPrefix(name, prefix) || name == strings.TrimSuffix(prefix, "/")
 }
 
+// IsNamespaceRoot reports whether name is the shared namespace root ("Shared" for
+// "Shared/"), in any case, while sharing is enabled. The root is a container that holds
+// no messages: IMAP refuses to CREATE or SELECT it and LIST marks it \Noselect, so
+// nothing may store a message in it either. It matches case as InNamespace does.
+func (c SharedMailboxesConfig) IsNamespaceRoot(name string) bool {
+	return c.Enabled && strings.ToLower(name) == strings.TrimSuffix(strings.ToLower(c.NamespacePrefix), "/")
+}
+
 // Validate checks namespace_prefix when sharing is enabled. The personal namespace has
 // the empty prefix, so InNamespace tells shared names apart by the prefix alone, and the
 // prefix must be a mailbox name followed by the hierarchy delimiter: an empty prefix puts
