@@ -865,24 +865,53 @@ type notifyTreeEvent struct {
 	event   imap.NotifyEvent // MailboxName or SubscriptionChange
 	name    string
 	oldName string // for renames
+	// deleted marks a name that refers to no mailbox the client can access
+	// after the change: a deleted mailbox, or the missing parent of a
+	// created or deleted one.
 	deleted bool
-	entry   notifySnapshotEntry
+	// hasChildren reports whether a mailbox the client can access is below
+	// name after the change.
+	hasChildren bool
+	entry       notifySnapshotEntry
 }
 
 // diffNotifySnapshots compares two account snapshots and returns the
 // mailbox-tree changes between them: creations, deletions, renames (same ID,
 // new name) and subscription flips.
 //
+// RFC 5465 §5.4: "If a mailbox is created or deleted, the mailbox itself and
+// its direct parent (whether it is an existing mailbox or not) are considered
+// to be affected", so the parent of each created or deleted mailbox is
+// reported too, once. "When a mailbox is renamed, its children are renamed
+// too. No additional MailboxName events are sent for children in this case":
+// a mailbox whose rename is that of a superior renamed in the same diff is not
+// reported (renamedWithSuperior).
+//
 // Deletions are emitted before creations/renames so that a delete+recreate of
 // a same-named mailbox within one tick (distinct IDs: the old ID vanishes, a
 // new ID appears under the same name) leaves the client with the mailbox
 // present. Emitting the create-then-delete order would leave it believing the
-// name no longer exists.
+// name no longer exists. The parents come last, as they are after all the
+// changes.
 func diffNotifySnapshots(prev, cur map[int64]notifySnapshotEntry) []notifyTreeEvent {
+	// renamed maps the lower-cased old name of each mailbox renamed in this
+	// diff to its new name.
+	var renamed map[string]string
+	for id, entry := range cur {
+		if old, existed := prev[id]; existed && old.name != entry.name {
+			if renamed == nil {
+				renamed = make(map[string]string)
+			}
+			renamed[strings.ToLower(old.name)] = entry.name
+		}
+	}
+
 	var events []notifyTreeEvent
+	var createdOrDeleted []string
 	for id, old := range prev {
 		if _, exists := cur[id]; !exists {
 			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: old.name, deleted: true, entry: old})
+			createdOrDeleted = append(createdOrDeleted, old.name)
 		}
 	}
 	for id, entry := range cur {
@@ -890,13 +919,74 @@ func diffNotifySnapshots(prev, cur map[int64]notifySnapshotEntry) []notifyTreeEv
 		switch {
 		case !existed:
 			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: entry.name, entry: entry})
-		case old.name != entry.name:
+			createdOrDeleted = append(createdOrDeleted, entry.name)
+		case old.name != entry.name && !renamedWithSuperior(old.name, entry.name, renamed):
 			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: entry.name, oldName: old.name, entry: entry})
 		case old.subscribed != entry.subscribed:
 			events = append(events, notifyTreeEvent{event: imap.NotifyEventSubscriptionChange, name: entry.name, entry: entry})
 		}
 	}
+	if len(events) == 0 {
+		return nil
+	}
+
+	// live holds the mailboxes the client can access by lower-cased name, and
+	// superiors every lower-cased name that one of them is below.
+	live := make(map[string]notifySnapshotEntry, len(cur))
+	superiors := make(map[string]bool)
+	for _, entry := range cur {
+		lower := strings.ToLower(entry.name)
+		live[lower] = entry
+		for i := strings.LastIndexByte(lower, consts.MailboxDelimiter); i > 0 && !superiors[lower[:i]]; i = strings.LastIndexByte(lower[:i], consts.MailboxDelimiter) {
+			superiors[lower[:i]] = true
+		}
+	}
+
+	reported := make(map[string]bool, len(events))
+	for _, ev := range events {
+		if ev.event == imap.NotifyEventMailboxName {
+			reported[strings.ToLower(ev.name)] = true
+		}
+	}
+	for _, name := range createdOrDeleted {
+		i := strings.LastIndexByte(name, consts.MailboxDelimiter)
+		if i <= 0 {
+			continue
+		}
+		parent := name[:i]
+		lower := strings.ToLower(parent)
+		if reported[lower] {
+			continue
+		}
+		reported[lower] = true
+		if entry, ok := live[lower]; ok {
+			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: entry.name, entry: entry})
+		} else {
+			// §5.4: "If, after the event, the mailbox name does not refer
+			// to a mailbox accessible to the client, the \Nonexistent flag
+			// MUST be included."
+			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: parent, deleted: true})
+		}
+	}
+
+	for i := range events {
+		events[i].hasChildren = superiors[strings.ToLower(events[i].name)]
+	}
 	return events
+}
+
+// renamedWithSuperior reports whether the rename of a mailbox from oldName to
+// newName is the one a superior renamed in the same diff gave it. A RENAME
+// renames the inferiors of the mailbox by replacing its old name at the start
+// of their names with the new one (db.RenameMailbox). renamed maps the
+// lower-cased old name of each renamed mailbox to its new name.
+func renamedWithSuperior(oldName, newName string, renamed map[string]string) bool {
+	for i := strings.LastIndexByte(oldName, consts.MailboxDelimiter); i > 0; i = strings.LastIndexByte(oldName[:i], consts.MailboxDelimiter) {
+		if to, ok := renamed[strings.ToLower(oldName[:i])]; ok && newName == to+oldName[i:] {
+			return true
+		}
+	}
+	return false
 }
 
 // notifySnapshotLooksStale reports whether cur is a sharply smaller view of the
@@ -914,7 +1004,13 @@ func notifySnapshotLooksStale(prev, cur map[int64]notifySnapshotEntry) bool {
 // against the bootstrap snapshot, so only changes after NOTIFY SET are
 // reported.
 func (s *IMAPSession) notifyDiffSnapshots(watch *notifyWatch, cur map[int64]notifySnapshotEntry, sharedRoot string, w *imapserver.UpdateWriter) error {
-	for _, ev := range diffNotifySnapshots(watch.snapshot, cur) {
+	events := diffNotifySnapshots(watch.snapshot, cur)
+	if len(events) == 0 {
+		return nil
+	}
+	// As in LIST, the child attributes go with the CHILDREN capability.
+	children := s.GetCapabilities().Has(imap.CapChildren)
+	for _, ev := range events {
 		if !watch.eventsForMailbox(ev.name, ev.entry.subscribed, sharedRoot)[ev.event] {
 			continue
 		}
@@ -935,6 +1031,11 @@ func (s *IMAPSession) notifyDiffSnapshots(watch *notifyWatch, cur map[int64]noti
 				// §5.5: \Subscribed if and only if subscribed after the event.
 				data.Attrs = append(data.Attrs, imap.MailboxAttrSubscribed)
 			}
+		}
+		if children {
+			// §5.4: "The server SHOULD also include \HasChildren or
+			// \HasNoChildren attributes [RFC5258] as appropriate."
+			data.Attrs = append(data.Attrs, childAttr(ev.hasChildren))
 		}
 		if err := w.WriteList(data); err != nil {
 			return err

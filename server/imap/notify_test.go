@@ -189,11 +189,13 @@ func TestDiffNotifySnapshots(t *testing.T) {
 // MailboxName events are sent for children in this case."
 func TestDiffNotifySnapshotsAffectedNames(t *testing.T) {
 	// want describes one expected event: its type, whether it carries
-	// \NonExistent, and its OLDNAME.
+	// \NonExistent, its OLDNAME, and whether the name has children after the
+	// change (\HasChildren or \HasNoChildren).
 	type want struct {
-		event   imap.NotifyEvent
-		deleted bool
-		oldName string
+		event       imap.NotifyEvent
+		deleted     bool
+		oldName     string
+		hasChildren bool
 	}
 	mailboxName := imap.NotifyEventMailboxName
 
@@ -214,8 +216,8 @@ func TestDiffNotifySnapshotsAffectedNames(t *testing.T) {
 				4: {name: "Attic"},
 			},
 			want: map[string]want{
-				"Attic":     {event: mailboxName},
-				"Attic/Old": {event: mailboxName, oldName: "Old"},
+				"Attic":     {event: mailboxName, hasChildren: true},
+				"Attic/Old": {event: mailboxName, oldName: "Old", hasChildren: true},
 			},
 		},
 		{
@@ -226,7 +228,7 @@ func TestDiffNotifySnapshotsAffectedNames(t *testing.T) {
 			prev: map[int64]notifySnapshotEntry{1: {name: "Old"}, 2: {name: "OLD/Kid"}},
 			cur:  map[int64]notifySnapshotEntry{1: {name: "New"}, 2: {name: "New/Kid"}},
 			want: map[string]want{
-				"New": {event: mailboxName, oldName: "Old"},
+				"New": {event: mailboxName, oldName: "Old", hasChildren: true},
 			},
 		},
 		{
@@ -237,7 +239,7 @@ func TestDiffNotifySnapshotsAffectedNames(t *testing.T) {
 			cur:  map[int64]notifySnapshotEntry{1: {name: "New"}, 2: {name: "Other"}, 3: {name: "Other/Kid"}},
 			want: map[string]want{
 				"New":   {event: mailboxName, oldName: "Old"},
-				"Other": {event: mailboxName, oldName: "Old/Mid"},
+				"Other": {event: mailboxName, oldName: "Old/Mid", hasChildren: true},
 			},
 		},
 		{
@@ -247,7 +249,7 @@ func TestDiffNotifySnapshotsAffectedNames(t *testing.T) {
 			prev: map[int64]notifySnapshotEntry{1: {name: "Old"}, 2: {name: "Old/Kid"}},
 			cur:  map[int64]notifySnapshotEntry{1: {name: "New"}, 2: {name: "New/Kid", subscribed: true}},
 			want: map[string]want{
-				"New":     {event: mailboxName, oldName: "Old"},
+				"New":     {event: mailboxName, oldName: "Old", hasChildren: true},
 				"New/Kid": {event: imap.NotifyEventSubscriptionChange},
 			},
 		},
@@ -258,7 +260,7 @@ func TestDiffNotifySnapshotsAffectedNames(t *testing.T) {
 			cur:  map[int64]notifySnapshotEntry{1: {name: "Parent"}, 2: {name: "Parent/Child"}},
 			want: map[string]want{
 				"Parent/Child": {event: mailboxName},
-				"Parent":       {event: mailboxName},
+				"Parent":       {event: mailboxName, hasChildren: true},
 			},
 		},
 		{
@@ -278,7 +280,7 @@ func TestDiffNotifySnapshotsAffectedNames(t *testing.T) {
 			cur:  map[int64]notifySnapshotEntry{2: {name: "Hidden/Child"}},
 			want: map[string]want{
 				"Hidden/Child": {event: mailboxName},
-				"Hidden":       {event: mailboxName, deleted: true},
+				"Hidden":       {event: mailboxName, deleted: true, hasChildren: true},
 			},
 		},
 		{
@@ -291,7 +293,7 @@ func TestDiffNotifySnapshotsAffectedNames(t *testing.T) {
 				"Parent/Gone": {event: mailboxName, deleted: true},
 				"Parent/A":    {event: mailboxName},
 				"Parent/B":    {event: mailboxName},
-				"Parent":      {event: mailboxName},
+				"Parent":      {event: mailboxName, hasChildren: true},
 			},
 		},
 		{
@@ -301,8 +303,8 @@ func TestDiffNotifySnapshotsAffectedNames(t *testing.T) {
 			prev: map[int64]notifySnapshotEntry{},
 			cur:  map[int64]notifySnapshotEntry{1: {name: "a"}, 2: {name: "a/b"}, 3: {name: "a/b/c"}},
 			want: map[string]want{
-				"a":     {event: mailboxName},
-				"a/b":   {event: mailboxName},
+				"a":     {event: mailboxName, hasChildren: true},
+				"a/b":   {event: mailboxName, hasChildren: true},
 				"a/b/c": {event: mailboxName},
 			},
 		},
@@ -316,7 +318,7 @@ func TestDiffNotifySnapshotsAffectedNames(t *testing.T) {
 				if _, dup := got[ev.name]; dup {
 					t.Errorf("%q reported more than once: %+v", ev.name, events)
 				}
-				got[ev.name] = want{event: ev.event, deleted: ev.deleted, oldName: ev.oldName}
+				got[ev.name] = want{event: ev.event, deleted: ev.deleted, oldName: ev.oldName, hasChildren: ev.hasChildren}
 			}
 			for name, w := range tc.want {
 				g, ok := got[name]
