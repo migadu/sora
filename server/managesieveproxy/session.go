@@ -957,11 +957,12 @@ func (s *Session) connectToBackendAndAuth() error {
 // "" when the line is none of them. RFC 5804 section 4: response-ok = "OK" [SP "("
 // resp-code ")"] [SP string] CRLF, response-nobye = ("NO" / "BYE") likewise, and
 // "Implementations MUST accept these strings in a case-insensitive fashion". The atom
-// ends at SP or the line end, so neither OKAY nor OK run into its string is an OK.
+// begins at column 0 and ends at SP or CRLF, and the length check keeps the folding
+// ASCII-only so a multi-byte fold-equivalent such as U+212A (KELVIN SIGN) cannot match.
 func backendStatus(line string) string {
-	atom, _, _ := strings.Cut(strings.TrimSpace(line), " ")
+	atom, _, _ := strings.Cut(strings.TrimRight(line, "\r\n"), " ")
 	for _, status := range []string{"OK", "NO", "BYE"} {
-		if strings.EqualFold(atom, status) {
+		if len(atom) == len(status) && strings.EqualFold(atom, status) {
 			return status
 		}
 	}
@@ -984,11 +985,11 @@ func (s *Session) readBackendCapabilities(r *bufio.Reader, what string) error {
 		if err != nil {
 			return fmt.Errorf("%w: failed to read backend %s: %w", server.ErrBackendConnectionFailed, what, err)
 		}
-		line = strings.TrimSpace(line)
 		switch backendStatus(line) {
 		case "OK":
 			return nil
 		case "NO", "BYE":
+			line = strings.TrimSpace(line)
 			s.WarnLog("backend refused the connection", "backend", s.serverAddr, "response", line)
 			return fmt.Errorf("%w: backend refused the connection: %s", server.ErrBackendConnectionFailed, line)
 		}
