@@ -186,10 +186,13 @@ CPUs, whichever is larger).
   `[database.read]`) section in the file, Sora has no such endpoint. This is how a proxy-only node
   runs without a database. A node that needs a database and has none refuses to start, and
   `sora-admin config validate` refuses the file, with `[database]: server "<name>" (<type>) needs
-  the database, but it is not configured in [database.write] or [database.read]`. `[database.read]`
-  alone is not enough: the migrations and every write go to `[database.write]`, and a node with
-  read hosts but no write host is refused with `[database.write]: server "<name>" (<type>) needs
-  the database, but [database.write] has no hosts; ...`.
+  the database, but it is not configured in [database.write] or [database.read]`.
+- **`[database.read]` alone is not enough.** The migrations and every write go to
+  `[database.write]`, so a node that needs a database needs `[database.write]` hosts, a proxy
+  that only checks passwords included. With `[database.read]` hosts and none in
+  `[database.write]`, Sora refuses to start, and `sora-admin config validate` refuses the file,
+  with `[database.write]: server "<name>" (<type>) needs the database, but [database.write] has
+  no hosts; ...`. Other `sora-admin` commands stop with `[database.write] has no hosts`.
 - **User name and password** may contain any characters. Sora escapes them in the connection URL.
 - **IPv6 addresses** go in brackets with a port: `hosts = ["[2001:db8::10]:5432"]`.
 
