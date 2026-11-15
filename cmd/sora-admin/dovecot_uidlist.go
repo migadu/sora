@@ -22,9 +22,12 @@ type DovecotUIDList struct {
 
 // ParseDovecotUIDList parses a dovecot-uidlist file from the given maildir path
 func ParseDovecotUIDList(maildirPath string) (*DovecotUIDList, error) {
-	uidlistPath := filepath.Join(maildirPath, "dovecot-uidlist")
+	return parseDovecotUIDListFile(os.Open(filepath.Join(maildirPath, "dovecot-uidlist")))
+}
 
-	file, err := os.Open(uidlistPath)
+// parseDovecotUIDListFile parses the dovecot-uidlist file that opening it returned,
+// and closes it.
+func parseDovecotUIDListFile(file *os.File, err error) (*DovecotUIDList, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			// No uidlist file, return nil (not an error for maildir without one)
