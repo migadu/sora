@@ -180,7 +180,8 @@ func TestConfigValidateDatabaseAndS3(t *testing.T) {
 // them, after it had opened what came before, and `sora-admin config validate` passed
 // them: [uploader] max_staging_size (#1092), [s3] encryption_key and a lone access_key or
 // secret_key (#1095), the [database] durations (#1104) and [tls] (#1105). Each is checked
-// only where start-up reads it.
+// only where start-up reads it. [timeout_scheduler] shard_count is read on every node, by
+// the scheduler set up once logging is (#1325).
 func TestConfigValidateWhatServiceSetupRefuses(t *testing.T) {
 	const db = "[database.write]\nhosts = [\"db.example.com\"]\n"
 	const s3 = "[s3]\nendpoint = \"s3.example.com\"\nbucket = \"mail\"\n"
@@ -252,6 +253,11 @@ func TestConfigValidateWhatServiceSetupRefuses(t *testing.T) {
 		{name: "tls letsencrypt sync_interval unparsable", content: tls + "sync_interval = \"often\"\n" + metrics,
 			want: []problem{{"[tls]", `invalid sync_interval duration "often"`}}},
 		{name: "tls disabled is not checked", content: "[tls]\nenabled = false\nprovider = \"acme\"\n" + metrics},
+
+		// #1325: start-up exits on a shard_count below -1, after it has set up logging.
+		{name: "timeout_scheduler shard_count", content: "[timeout_scheduler]\nshard_count = -1\n" + metrics},
+		{name: "timeout_scheduler shard_count below -1", content: "[timeout_scheduler]\nshard_count = -2\n" + metrics,
+			want: []problem{{"[timeout_scheduler]", "shard_count must be >= -1, got -2"}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
