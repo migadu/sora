@@ -44,7 +44,7 @@ func TestIMAP_FetchVanishedRequiresEnableQResync(t *testing.T) {
 		"UID FETCH 1:* (FLAGS) (CHANGEDSINCE 1) VANISHED",
 		"UID FETCH 1:* (FLAGS) CHANGEDSINCE 1 VANISHED",
 	}
-	run := func(cmd string) (untagged []string, status, resp string) {
+	run := func(c *rawIMAP, cmd string) (untagged []string, status, resp string) {
 		t.Helper()
 		tag := c.send(cmd)
 		untagged, tagged := c.read(tag, cmd)
@@ -52,26 +52,29 @@ func TestIMAP_FetchVanishedRequiresEnableQResync(t *testing.T) {
 	}
 
 	for _, cmd := range cmds {
-		untagged, status, resp := run(cmd)
+		untagged, status, resp := run(c, cmd)
 		if !strings.HasPrefix(status, "BAD ") || len(untagged) > 0 {
 			t.Errorf("%s without ENABLE QRESYNC: want BAD and no untagged response, got:\n%s", cmd, resp)
 		}
 	}
 	// CHANGEDSINCE alone is CONDSTORE's and needs no ENABLE (RFC 7162 §3.1).
-	if _, status, resp := run("UID FETCH 1:* (FLAGS) (CHANGEDSINCE 1)"); !strings.HasPrefix(status, "OK ") {
+	if _, status, resp := run(c, "UID FETCH 1:* (FLAGS) (CHANGEDSINCE 1)"); !strings.HasPrefix(status, "OK ") {
 		t.Errorf("UID FETCH CHANGEDSINCE without ENABLE QRESYNC: want OK, got:\n%s", resp)
 	}
 
-	// ENABLE is an authenticated-state command (RFC 5161 §3.1).
-	c.do("CLOSE")
-	if enabled, _ := c.do("ENABLE QRESYNC"); !slices.Contains(enabled, "* ENABLED QRESYNC") {
+	// A second connection enables QRESYNC the way RFC 5161 §3.1 requires:
+	// "Clients MUST NOT issue ENABLE once they SELECT/EXAMINE a mailbox", so
+	// CLOSE on the first connection would not do.
+	q := dialRawIMAP(t, server.Address)
+	q.do(fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password))
+	if enabled, _ := q.do("ENABLE QRESYNC"); !slices.Contains(enabled, "* ENABLED QRESYNC") {
 		t.Fatalf("ENABLE QRESYNC: want * ENABLED QRESYNC, got:\n%s", strings.Join(enabled, "\n"))
 	}
-	c.do("SELECT INBOX")
+	q.do("SELECT INBOX")
 
 	wantVanished := fmt.Sprintf("* VANISHED (EARLIER) %d", expunged)
 	for _, cmd := range cmds {
-		untagged, status, resp := run(cmd)
+		untagged, status, resp := run(q, cmd)
 		if !strings.HasPrefix(status, "OK ") || len(untagged) == 0 || untagged[0] != wantVanished {
 			t.Errorf("%s after ENABLE QRESYNC: want OK with %q first, got:\n%s", cmd, wantVanished, resp)
 		}
