@@ -126,7 +126,7 @@ carries its own copy and these server keys are not used for pool members (except
 | `timeouts.absolute_session_timeout` | `24h`, LMTP `5m` | Longest a session may last. |
 | `timeouts.min_bytes_per_minute` | `0` (off) | Slow-client guard. |
 | `max_connections` | `0` (unlimited) | Per proxy listener. |
-| `max_connections_per_ip` | `0` (unlimited) | Per proxy listener. With `[cluster]` enabled, the IMAP, POP3 and ManageSieve proxies count an address's connections on every node; see [CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies). |
+| `max_connections_per_ip` | `0` (unlimited) | Per proxy listener. The LMTP proxy ignores it with a warning. With `[cluster]` enabled, the IMAP, POP3 and ManageSieve proxies count an address's connections on every node; see [CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies). |
 | `max_connections_per_user`, `max_connections_per_user_per_ip` | `0` | IMAP, POP3 and ManageSieve proxies only, and only with `[cluster]` enabled; see [CLUSTER.md](CLUSTER.md). The LMTP proxy ignores them with a warning. |
 | `limits.max_auth_errors` | `2` | Protocol errors before login (unknown or malformed commands, logins refused without TLS) before the connection is closed. Wrong passwords do not count. |
 | `auth_rate_limit` | off | See [AUTHENTICATION.md](AUTHENTICATION.md). With `[cluster]` enabled, the IMAP, POP3 and ManageSieve proxies share it; see [CLUSTER.md](CLUSTER.md#66-authentication-rate-limits-imap-pop3-and-managesieve-proxies). |

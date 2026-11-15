@@ -371,8 +371,9 @@ A restart, planned or not, **loses**:
   LMTP transactions without a final answer are retried by the MTA. ManageSieve sessions are short and
   lose nothing that was saved.
 - **In-memory state:** login lookup caches, auth rate-limit counters and blocks, search rate limits,
-  connection counts. In a cluster, the other nodes keep the per-user proxy connection counts
-  ([CLUSTER.md](CLUSTER.md)).
+  connection counts. In a cluster, the other nodes keep the per-user and per-IP proxy connection
+  counts, which the restarted node gets back from them, and the proxies' rate-limit blocks and
+  counts, which it does not ([CLUSTER.md](CLUSTER.md#a-node-comes-back)).
 - **Proxy affinity** held in this node's memory, unless `[cluster.affinity] cache_path` is set.
 - **Uploads and relay deliveries in flight.** They are retried after the start.
 
