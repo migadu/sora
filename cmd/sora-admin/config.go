@@ -14,6 +14,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/server/sieveengine"
 )
 
 func handleConfigCommand(ctx context.Context) {
@@ -114,13 +115,34 @@ func handleConfigValidate(_ context.Context) {
 		os.Exit(1)
 	}
 
-	// The warnings start-up logs about the file alone (Config.Warnings). They do not
-	// fail it.
+	// Keep the Sieve capability diagnostics beside the engine's resolver. The other
+	// collected configuration warnings are returned by Config.Warnings.
+	if invalid := sieveengine.InvalidExtensions(cfg.Sieve.EnabledExtensions); len(invalid) > 0 {
+		fmt.Printf("[WARN] [sieve] enabled_extensions names extensions the engine does not support: %s; "+
+			"they are ignored, and the default set is used if none remain (effective: %s)\n",
+			strings.Join(invalid, ", "), strings.Join(sieveengine.EffectiveExtensions(cfg.Sieve.EnabledExtensions), ", "))
+	}
+	if config.TrustedNetworksHaveBroadPrivateRanges(cfg.Servers.TrustedNetworks) {
+		fmt.Printf("[WARN] [servers] trusted_networks includes whole private ranges (e.g. 10.0.0.0/8): every host on those " +
+			"networks is trusted to spoof client IPs via PROXY/XCLIENT and to bypass auth rate limiting. " +
+			"Narrow trusted_networks to your actual proxy IPs; use auth_rate_limit.exempt_networks to scope " +
+			"rate-limit exemption separately\n")
+	}
 	for _, w := range cfg.Warnings() {
 		fmt.Printf("[WARN] %s\n", w)
 	}
-
 	allServers := cfg.GetAllServers()
+	for _, server := range allServers {
+		if server.Type != "managesieve_proxy" {
+			continue
+		}
+		if invalid := sieveengine.InvalidExtensions(server.SupportedExtensions); len(invalid) > 0 {
+			fmt.Printf("[WARN] Server %s (type: %s) has supported_extensions the engine does not support: %s; "+
+				"they are ignored, and the default set is advertised if none remain (effective: %s)\n",
+				server.Name, server.Type, strings.Join(invalid, ", "),
+				strings.Join(sieveengine.EffectiveExtensions(server.SupportedExtensions), ", "))
+		}
+	}
 	fmt.Printf("[OK] Configuration is valid!\n")
 	if len(allServers) > 0 {
 		fmt.Printf("\nConfigured servers:\n")
@@ -269,6 +291,8 @@ Description:
       [cluster] and [tls] when enabled
   - Warning, as start-up does, about settings that do not do on this node
     what they say:
+      [sieve] enabled_extensions and managesieve_proxy supported_extensions
+        the engine does not support, and broad [servers] trusted_networks
       [[server]] keys the server type does not use
       an imap or pop3 session_memory_limit below the largest lmtp
         max_message_size
@@ -287,6 +311,7 @@ Description:
       a [spam_training] value start-up cannot parse, which leaves spam
         training out, and a max_message_size above the largest message Sora
         can store
+
 
   It connects to nothing and does not look at the node's disk, so it does
   not check connectivity. When services start, Sora connects to the database

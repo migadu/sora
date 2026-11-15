@@ -11,7 +11,7 @@ import (
 	"github.com/migadu/sora/helpers"
 )
 
-// Warnings returns the warnings start-up logs about the file alone, one line each, so
+// Warnings returns the file-derived startup warning classes collected here, one line each, so
 // that `sora-admin config validate` can print them before the file is deployed. Each is
 // about a setting start-up accepts but that does not do on this node what it says:
 //
@@ -32,8 +32,8 @@ import (
 //   - a max_message_size above the largest message Sora can store, which start-up caps.
 //
 // Start-up logs each where the part that uses the setting starts, so a new start-up
-// warning about the file belongs here as well. Warnings that depend on the host (its
-// addresses, its name) are start-up's alone. Like start-up, Warnings assumes the file
+// warning about the file can be added here as well. Additional package-specific and
+// host-dependent warnings remain at startup. Like start-up, Warnings assumes the file
 // passes Validate.
 func (c *Config) Warnings() []string {
 	var warnings []string
