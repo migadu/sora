@@ -29,24 +29,27 @@ CREATE TABLE IF NOT EXISTS message_state (
 -- change committed after the copy would be lost with the columns; creating the
 -- table's foreign key takes the same lock, but not when the table already exists.
 -- The message_state triggers do not exist yet, so mailbox_stats is left alone: its
--- unseen_count already counts these flags, and 000024 fills the keyword caches that
--- are still NULL.
+-- unseen_count already counts these flags, and 000024 adds these keywords to the
+-- keyword caches that lack them.
 -- On a large database the copy can be made ahead, in id-range batches of this same
--- INSERT after the CREATE TABLE above; this statement then rewrites only the rows
--- whose flags changed since.
+-- INSERT after the CREATE TABLE above; this statement then writes only the rows
+-- whose flags changed since. The join leaves out the rows that are already
+-- identical, rather than a WHERE on the DO UPDATE: ON CONFLICT locks, and so writes
+-- to, every row it meets, including one its WHERE then leaves alone.
 LOCK TABLE messages IN SHARE ROW EXCLUSIVE MODE;
 INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
-SELECT id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq FROM messages
+SELECT m.id, m.mailbox_id, m.flags, m.custom_flags, m.flags_changed_at, m.updated_modseq
+FROM messages m
+LEFT JOIN message_state ms ON ms.message_id = m.id
+WHERE ms.message_id IS NULL
+   OR (ms.mailbox_id, ms.flags, ms.custom_flags, ms.flags_changed_at, ms.updated_modseq)
+      IS DISTINCT FROM (m.mailbox_id, m.flags, m.custom_flags, m.flags_changed_at, m.updated_modseq)
 ON CONFLICT (message_id) DO UPDATE SET
     mailbox_id = EXCLUDED.mailbox_id,
     flags = EXCLUDED.flags,
     custom_flags = EXCLUDED.custom_flags,
     flags_changed_at = EXCLUDED.flags_changed_at,
-    updated_modseq = EXCLUDED.updated_modseq
-WHERE (message_state.mailbox_id, message_state.flags, message_state.custom_flags,
-       message_state.flags_changed_at, message_state.updated_modseq)
-    IS DISTINCT FROM (EXCLUDED.mailbox_id, EXCLUDED.flags, EXCLUDED.custom_flags,
-                      EXCLUDED.flags_changed_at, EXCLUDED.updated_modseq);
+    updated_modseq = EXCLUDED.updated_modseq;
 
 -- Indexes for the new state table
 CREATE INDEX IF NOT EXISTS idx_message_state_mailbox_id_updated_modseq ON message_state (mailbox_id, updated_modseq) WHERE updated_modseq IS NOT NULL;

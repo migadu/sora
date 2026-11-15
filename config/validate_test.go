@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -115,9 +116,11 @@ func TestConfigValidate(t *testing.T) {
 // TestConfigValidateDatabaseAndS3: a node that runs a server needing the database, or
 // one that stores or serves message bodies, is refused without [database] or [s3]. The
 // server refused these only in service setup, after it had opened what came before, and
-// `sora-admin config validate` passed them (#921).
+// `sora-admin config validate` passed them (#921); it passed [database.read] hosts without
+// [database.write] ones too (#1266).
 func TestConfigValidateDatabaseAndS3(t *testing.T) {
 	const db = "[database.write]\nhosts = [\"db.example.com\"]\n\n"
+	const readOnly = "[database.read]\nhosts = [\"replica.example.com\"]\n\n"
 	const s3 = "[s3]\nendpoint = \"s3.example.com\"\nbucket = \"mail\"\n\n"
 	const imapBackend = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"
 	const managesieve = "\n[[server]]\ntype = \"managesieve\"\nname = \"sieve\"\naddr = \"127.0.0.1:4190\"\n"
@@ -132,7 +135,17 @@ func TestConfigValidateDatabaseAndS3(t *testing.T) {
 		want    []problem
 	}{
 		{name: "mail backend", content: db + s3 + imapBackend},
-		{name: "mail backend with a read endpoint only", content: "[database.read]\nhosts = [\"db.example.com\"]\n\n" + s3 + imapBackend},
+		// Start-up opens write pools only from [database.write] and stops with "no healthy
+		// database pools available" without one, after trying every replica (#1266).
+		{name: "mail backend with a read endpoint only", content: readOnly + s3 + imapBackend,
+			want: []problem{{"[database.write]", `server "imap" (imap) needs the database, but [database.write] has no hosts`}}},
+		{name: "managesieve with a read endpoint only", content: readOnly + managesieve,
+			want: []problem{{"[database.write]", `server "sieve" (managesieve) needs the database, but [database.write] has no hosts`}}},
+		{name: "read endpoint and a write endpoint without hosts", content: "[database.write]\nhosts = []\n\n" + readOnly + managesieve,
+			want: []problem{{"[database.write]", `server "sieve" (managesieve) needs the database, but [database.write] has no hosts`}}},
+		{name: "proxy that authenticates against a read endpoint only", content: readOnly + imapProxy,
+			want: []problem{{"[database.write]", `server "imap-proxy" (imap_proxy) needs the database, but [database.write] has no hosts`}}},
+		{name: "write and read endpoints", content: db + readOnly + managesieve},
 		{name: "mail backend without a database", content: s3 + imapBackend,
 			want: []problem{{"[database]", `server "imap" (imap) needs the database, but it is not configured in [database.write] or [database.read]`}}},
 		{name: "database endpoint without hosts", content: "[database.write]\nhosts = []\n\n" + s3 + imapBackend,
@@ -180,7 +193,8 @@ func TestConfigValidateDatabaseAndS3(t *testing.T) {
 // them, after it had opened what came before, and `sora-admin config validate` passed
 // them: [uploader] max_staging_size (#1092), [s3] encryption_key and a lone access_key or
 // secret_key (#1095), the [database] durations (#1104) and [tls] (#1105). Each is checked
-// only where start-up reads it.
+// only where start-up reads it. [timeout_scheduler] shard_count is read on every node, by
+// the scheduler set up once logging is (#1325).
 func TestConfigValidateWhatServiceSetupRefuses(t *testing.T) {
 	const db = "[database.write]\nhosts = [\"db.example.com\"]\n"
 	const s3 = "[s3]\nendpoint = \"s3.example.com\"\nbucket = \"mail\"\n"
@@ -273,6 +287,11 @@ func TestConfigValidateWhatServiceSetupRefuses(t *testing.T) {
 		{name: "tls letsencrypt s3 key id without aws:kms", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption_kms_key_id = \"example-key\"\n" + metrics,
 			want: []problem{{"[tls]", `letsencrypt.s3: a KMS key id is only used by server-side encryption "aws:kms", not "AES256"`}}},
 		{name: "tls disabled is not checked", content: "[tls]\nenabled = false\nprovider = \"acme\"\n" + metrics},
+
+		// #1325: start-up exits on a shard_count below -1, after it has set up logging.
+		{name: "timeout_scheduler shard_count", content: "[timeout_scheduler]\nshard_count = -1\n" + metrics},
+		{name: "timeout_scheduler shard_count below -1", content: "[timeout_scheduler]\nshard_count = -2\n" + metrics,
+			want: []problem{{"[timeout_scheduler]", "shard_count must be >= -1, got -2"}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -318,6 +337,122 @@ func TestConfigValidateProxyNeedsBackends(t *testing.T) {
 	}
 	if proxies != 5 {
 		t.Errorf("checked %d proxy types, want the 5 proxies", proxies)
+	}
+}
+
+// TestConfigValidateProxyRefusesEmptyRemoteAddr: an empty remote_addrs entry passed
+// Validate, and the proxy was built with "" as a backend and routed users to it. Validate
+// refuses it as ValidatePools refuses an empty [[pool]] backend, naming the entry (#1147).
+func TestConfigValidateProxyRefusesEmptyRemoteAddr(t *testing.T) {
+	tests := []struct {
+		remoteAddrs string
+		want        string // "" for a valid list
+	}{
+		{`[""]`, `server "proxy": remote_addrs #1: empty backend address`},
+		{`[" "]`, `server "proxy": remote_addrs #1: empty backend address`},
+		{`["192.0.2.10:143", "\t"]`, `server "proxy": remote_addrs #2: empty backend address`},
+		{`["192.0.2.10:143", "backend.example.com"]`, ""},
+	}
+	var proxies int
+	for _, typ := range ServerTypes {
+		if !strings.HasSuffix(typ, "_proxy") {
+			continue
+		}
+		proxies++
+		for _, tt := range tests {
+			t.Run(typ+" "+tt.remoteAddrs, func(t *testing.T) {
+				got := validateFile(t, storageTOML+"\n[[server]]\ntype = \""+typ+"\"\nname = \"proxy\"\naddr = \"127.0.0.1:1143\"\nremote_port = 143\nremote_addrs = "+tt.remoteAddrs+"\n")
+				if tt.want == "" {
+					if len(got) != 0 {
+						t.Errorf("Validate() = %v, want no problems", got)
+					}
+					return
+				}
+				if len(got) != 1 || got[0].Section != "server 'proxy'" || !strings.Contains(got[0].Err.Error(), tt.want) {
+					t.Errorf("Validate() = %v, want server 'proxy': %s", got, tt.want)
+				}
+			})
+		}
+	}
+	if proxies != 5 {
+		t.Errorf("checked %d proxy types, want the 5 proxies", proxies)
+	}
+}
+
+// TestConfigValidateProxyRefusesWhitespaceInRemoteAddr: the loader trims the ends of every
+// string, so " 192.0.2.11:143" reaches the proxy as "192.0.2.11:143"; whitespace inside a
+// remote_addrs entry ("192.0.2.10 :143") passed Validate and the proxy dialed the entry as
+// written, a name that never resolves. No host or IP contains whitespace, so Validate
+// refuses the entry, naming it, as it refuses an empty one (#1322).
+func TestConfigValidateProxyRefusesWhitespaceInRemoteAddr(t *testing.T) {
+	tests := []struct {
+		remoteAddrs string
+		want        string // "" for a valid list
+	}{
+		{`["192.0.2.10 :143"]`, `server "proxy": remote_addrs #1: backend address "192.0.2.10 :143" contains whitespace`},
+		{`["192.0.2.10:143", "backend .example.com"]`, `server "proxy": remote_addrs #2: backend address "backend .example.com" contains whitespace`},
+		{`["backend.example.com\t:143"]`, `server "proxy": remote_addrs #1: backend address "backend.example.com\t:143" contains whitespace`},
+		{`["backend\u00a0.example.com"]`, `server "proxy": remote_addrs #1: backend address "backend\u00a0.example.com" contains whitespace`},
+		// The ends are trimmed when the file is loaded (TestLoadServerConfigTrimsBackendAddresses).
+		{`[" 192.0.2.10:143", "[2001:db8::1]:143 ", "\tbackend.example.com"]`, ""},
+	}
+	var proxies int
+	for _, typ := range ServerTypes {
+		if !strings.HasSuffix(typ, "_proxy") {
+			continue
+		}
+		proxies++
+		for _, tt := range tests {
+			t.Run(typ+" "+tt.remoteAddrs, func(t *testing.T) {
+				got := validateFile(t, storageTOML+"\n[[server]]\ntype = \""+typ+"\"\nname = \"proxy\"\naddr = \"127.0.0.1:1143\"\nremote_port = 143\nremote_addrs = "+tt.remoteAddrs+"\n")
+				if tt.want == "" {
+					if len(got) != 0 {
+						t.Errorf("Validate() = %v, want no problems", got)
+					}
+					return
+				}
+				if len(got) != 1 || got[0].Section != "server 'proxy'" || !strings.Contains(got[0].Err.Error(), tt.want) {
+					t.Errorf("Validate() = %v, want server 'proxy': %s", got, tt.want)
+				}
+			})
+		}
+	}
+	if proxies != 5 {
+		t.Errorf("checked %d proxy types, want the 5 proxies", proxies)
+	}
+}
+
+// TestLoadServerConfigTrimsBackendAddresses: a remote_addrs entry or a [[pool]] backend
+// written with a leading or trailing space reaches Validate and the proxies trimmed, from
+// the loader that startup, SIGHUP reload and `sora-admin config validate` share (#1322).
+func TestLoadServerConfigTrimsBackendAddresses(t *testing.T) {
+	load := func(t *testing.T, content string) Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var cfg Config
+		if err := LoadServerConfig(path, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+
+	cfg := load(t, storageTOML+"[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:11143\"\nremote_addrs = [\"192.0.2.10:143\", \" 192.0.2.11:143\", \"192.0.2.12:143\\t\"]\nremote_port = 143\n")
+	if got, want := cfg.DynamicServers[0].RemoteAddrs, []string{"192.0.2.10:143", "192.0.2.11:143", "192.0.2.12:143"}; !slices.Equal(got, want) {
+		t.Errorf("remote_addrs = %q, want %q", got, want)
+	}
+	if got := cfg.Validate(); len(got) != 0 {
+		t.Errorf("remote_addrs: Validate() = %v, want no problems", got)
+	}
+
+	cfg = load(t, storageTOML+"[[pool]]\nname = \"sora0\"\ndefault = true\nbackends = [\"192.0.2.10\", \"192.0.2.11 \", \" 192.0.2.12:143\"]\n\n[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:11143\"\nremote_port = 143\n")
+	if got, want := cfg.Pools[0].Backends, []string{"192.0.2.10", "192.0.2.11", "192.0.2.12:143"}; !slices.Equal(got, want) {
+		t.Errorf("[[pool]] backends = %q, want %q", got, want)
+	}
+	if got := cfg.Validate(); len(got) != 0 {
+		t.Errorf("[[pool]]: Validate() = %v, want no problems", got)
 	}
 }
 
