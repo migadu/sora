@@ -72,11 +72,6 @@ func TestIMAP_StatusHighestModSeqEnablesCondStore(t *testing.T) {
 			}
 
 			c.do("SELECT INBOX")
-			if tt.wantModSeq {
-				if status := c.status("UID FETCH 1:* (FLAGS) (CHANGEDSINCE 1 VANISHED)"); !strings.HasPrefix(status, "BAD ") {
-					t.Fatalf("STATUS must not enable QRESYNC: VANISHED without ENABLE returned %s", status)
-				}
-			}
 			c.do(`ID ("name" "late-filter" "version" "1")`)
 			caps, _ := c.do("CAPABILITY")
 			capList := " " + strings.Join(caps, " ") + " "
@@ -111,6 +106,14 @@ func TestIMAP_StatusHighestModSeqEnablesCondStore(t *testing.T) {
 			}
 			if got := strings.Contains(fetchLine, "MODSEQ ("); got != tt.wantModSeq {
 				t.Errorf("after %s, unsolicited FETCH = %q: MODSEQ present = %v, want %v", tt.cmd, fetchLine, got, tt.wantModSeq)
+			}
+
+			// Keep this after the MODSEQ checks: parsing CHANGEDSINCE can itself
+			// enable CONDSTORE, even when VANISHED is subsequently rejected.
+			if tt.wantModSeq {
+				if status := c.status("UID FETCH 1:* (FLAGS) (CHANGEDSINCE 1 VANISHED)"); !strings.HasPrefix(status, "BAD ") {
+					t.Fatalf("STATUS must not enable QRESYNC: VANISHED without ENABLE returned %s", status)
+				}
 			}
 		})
 	}
