@@ -3,6 +3,7 @@ package uploader
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -50,6 +51,56 @@ func requireSwept(t *testing.T, paths ...string) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("orphan %s is still staged after the sweep (stat: %v)", path, err)
 		}
+	}
+}
+
+// The spool is often a symbolic link to another volume, or holds an account directory
+// that is one. Staging and uploading follow such links, but the orphan sweep walked the
+// spool with filepath.Walk, which does not: it never saw a body under the link, so on
+// such a node no orphan was ever removed (#1312). The removal must also use the path
+// FilePath builds, which staging locks and counts by, so the orphan's bytes leave the
+// staging count.
+func TestOrphanSweepFollowsSymlinkedSpoolDirectories(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// link returns the [uploader] path to use for the spool directory dir.
+		link func(t *testing.T, dir string) string
+	}{
+		{"spool path", func(t *testing.T, dir string) string {
+			link := filepath.Join(t.TempDir(), "uploads")
+			if err := os.Symlink(dir, link); err != nil {
+				t.Fatalf("Symlink: %v", err)
+			}
+			return link
+		}},
+		{"account directory", func(t *testing.T, dir string) string {
+			if err := os.Symlink(t.TempDir(), filepath.Join(dir, "1")); err != nil {
+				t.Fatalf("Symlink: %v", err)
+			}
+			return dir
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, rdb, _, _, dir := setupTestWorker(t)
+			w.path = tc.link(t, dir)
+			rows := newPendingRows()
+			rdb.ExistingPendingUploadsFunc = rows.existing
+
+			queued := deliver(t, w, rows, "a", 600)
+			orphan := stageOrphan(t, w, "b", 300)
+			ageStaged(t, queued, orphan)
+
+			if err := w.cleanupOrphanedFiles(context.Background()); err != nil {
+				t.Fatalf("cleanupOrphanedFiles: %v", err)
+			}
+			requireSwept(t, orphan)
+			if _, err := os.Stat(queued); err != nil {
+				t.Fatalf("body %s with a pending row was removed by the sweep: %v", queued, err)
+			}
+			if got := stagingSize(w); got != 600 {
+				t.Errorf("staging size = %d after sweeping the 300-byte orphan, want the 600 bytes still queued", got)
+			}
+		})
 	}
 }
 
