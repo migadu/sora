@@ -128,19 +128,12 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					AccountID, err := s.server.rdb.GetMasterLoginTargetWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
-						// Check if error is due to context cancellation (server shutdown)
-						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-							s.InfoLog("master username auth cancelled due to server shutdown")
-							return &imap.Error{
-								Type: imap.StatusResponseTypeNo,
-								Code: imap.ResponseCodeUnavailable,
-								Text: server.ErrServerShuttingDown.Error(),
-							}
-						}
-
 						// The database could not be asked, so nothing is known about the
 						// target: a temporary failure (RFC 5530 section 3), not a failed
-						// login charged to the master credential.
+						// login charged to the master credential. Checked before the
+						// context errors, as in login.go: a lookup that timed out because
+						// the database hangs is no shutdown, and a wrong master password,
+						// which the regular path answers, must get the same reply.
 						if server.IsTemporaryAuthFailure(err) {
 							s.WarnLog("impersonation target lookup unavailable", "target_user", targetUserToImpersonate, "error", err)
 							metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
@@ -148,6 +141,16 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 								Type: imap.StatusResponseTypeNo,
 								Code: imap.ResponseCodeUnavailable,
 								Text: server.ErrAuthServiceUnavailable.Error(),
+							}
+						}
+
+						// Check if error is due to context cancellation (server shutdown)
+						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+							s.InfoLog("master username auth cancelled due to server shutdown")
+							return &imap.Error{
+								Type: imap.StatusResponseTypeNo,
+								Code: imap.ResponseCodeUnavailable,
+								Text: server.ErrServerShuttingDown.Error(),
 							}
 						}
 
@@ -229,19 +232,11 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					AccountID, err := s.server.rdb.GetMasterLoginTargetWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
-						// Check if error is due to context cancellation (server shutdown)
-						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-							s.InfoLog("master SASL auth cancelled due to server shutdown")
-							return &imap.Error{
-								Type: imap.StatusResponseTypeNo,
-								Code: imap.ResponseCodeUnavailable,
-								Text: server.ErrServerShuttingDown.Error(),
-							}
-						}
-
 						// The database could not be asked, so nothing is known about the
 						// target: a temporary failure (RFC 5530 section 3), not a failed
-						// login charged to the master credential.
+						// login charged to the master credential. Checked before the
+						// context errors: a lookup that timed out because the database
+						// hangs is no shutdown (see the master username path above).
 						if server.IsTemporaryAuthFailure(err) {
 							s.WarnLog("impersonation target lookup unavailable", "target_user", targetUserToImpersonate, "error", err)
 							metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
@@ -249,6 +244,16 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 								Type: imap.StatusResponseTypeNo,
 								Code: imap.ResponseCodeUnavailable,
 								Text: server.ErrAuthServiceUnavailable.Error(),
+							}
+						}
+
+						// Check if error is due to context cancellation (server shutdown)
+						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+							s.InfoLog("master SASL auth cancelled due to server shutdown")
+							return &imap.Error{
+								Type: imap.StatusResponseTypeNo,
+								Code: imap.ResponseCodeUnavailable,
+								Text: server.ErrServerShuttingDown.Error(),
 							}
 						}
 
@@ -345,14 +350,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 func (s *IMAPSession) refuseLikeWrongPassword(ctx context.Context, username, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) error {
 	if authnAddr, err := server.NewAddress(username); err == nil {
 		if _, method, reason, authErr := s.server.Authenticate(ctx, authnAddr.BaseAddress(), password); authErr != nil {
-			if errors.Is(authErr, context.Canceled) || errors.Is(authErr, context.DeadlineExceeded) {
-				s.InfoLog("authentication cancelled due to server shutdown")
-				return &imap.Error{
-					Type: imap.StatusResponseTypeNo,
-					Code: imap.ResponseCodeUnavailable,
-					Text: server.ErrServerShuttingDown.Error(),
-				}
-			}
+			// In the regular login's order (login.go), so the reply is the same.
 			if server.IsTemporaryAuthFailure(authErr) {
 				s.WarnLog("authentication unavailable", "address", authnAddr.BaseAddress(), "reason", reason, "method", method, "error", authErr)
 				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
@@ -360,6 +358,14 @@ func (s *IMAPSession) refuseLikeWrongPassword(ctx context.Context, username, pas
 					Type: imap.StatusResponseTypeNo,
 					Code: imap.ResponseCodeUnavailable,
 					Text: server.ErrAuthServiceUnavailable.Error(),
+				}
+			}
+			if errors.Is(authErr, context.Canceled) || errors.Is(authErr, context.DeadlineExceeded) {
+				s.InfoLog("authentication cancelled due to server shutdown")
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeUnavailable,
+					Text: server.ErrServerShuttingDown.Error(),
 				}
 			}
 		}
