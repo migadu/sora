@@ -590,12 +590,8 @@ func (d *DeliveryContext) resolveOwnedTarget(ctx context.Context, recipient Reci
 	// hardlink it to the owner's staging path so the uploader writes the body under the
 	// owner's S3 path (B2).
 	if destAccountID != recipient.AccountID {
-		sourcePath := d.Uploader.FilePath(contentHash, recipient.AccountID)
-		destPath := d.Uploader.FilePath(contentHash, destAccountID)
-		if sourcePath != destPath {
-			if linkErr := helpers.LinkOrCopyFile(sourcePath, destPath); linkErr != nil {
-				d.Logger.Log("failed to stage local file for cross-account delivery: %v", linkErr)
-			}
+		if linkErr := d.Uploader.LinkStaged(contentHash, recipient.AccountID, destAccountID); linkErr != nil {
+			d.Logger.Log("failed to stage local file for cross-account delivery: %v", linkErr)
 		}
 	}
 

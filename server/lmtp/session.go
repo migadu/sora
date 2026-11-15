@@ -413,7 +413,7 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 				Message:      "service shutting down",
 			}
 		}
-		s.WarnLog("failed to get primary email", "account_id", AccountID, "error", err)
+		s.WarnLog("failed to get primary email", "recipient_account_id", AccountID, "error", err)
 		recordMetrics("failure")
 		return &smtp.SMTPError{
 			Code:         451,
@@ -468,9 +468,9 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 
 	// Log recipient acceptance with alias detection
 	if fullAddress != primaryAddr.FullAddress() {
-		s.DebugLog("recipient accepted", "to", fullAddress, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID)
+		s.DebugLog("recipient accepted", "to", fullAddress, "primary_address", primaryAddr.FullAddress())
 	} else {
-		s.DebugLog("recipient accepted", "to", fullAddress, "account_id", AccountID)
+		s.DebugLog("recipient accepted", "to", fullAddress)
 	}
 	recordMetrics("success")
 	return nil
@@ -1358,12 +1358,8 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 
 		// Ensure the local file exists under the destination owner's staging directory.
 		// The original was staged under s.AccountID() by StoreLocally before Sieve.
-		sourcePath := s.backend.uploader.FilePath(contentHash, s.AccountID())
-		destPath := s.backend.uploader.FilePath(contentHash, destAccountID)
-		if sourcePath != destPath {
-			if err := helpers.LinkOrCopyFile(sourcePath, destPath); err != nil {
-				s.WarnLog("failed to stage local file for cross-account LMTP delivery", "source", sourcePath, "dest", destPath, "error", err)
-			}
+		if err := s.backend.uploader.LinkStaged(contentHash, s.AccountID(), destAccountID); err != nil {
+			s.WarnLog("failed to stage local file for cross-account LMTP delivery", "hash", contentHash, "dest_account_id", destAccountID, "error", err)
 		}
 	}
 
