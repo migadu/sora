@@ -250,8 +250,8 @@ cannot be reached. Those are covered in the topic documents.
 
 `sora-admin config validate` runs every check in the table, without starting anything, and prints a
 `[WARN]` line for each WARN of the first four items of this list; they do not change its exit
-status. The plaintext-authentication, metrics and host-name warnings depend on the node's addresses
-and host name, so only startup reports them. See [ADMIN_CLI.md](ADMIN_CLI.md).
+status. The plaintext-authentication, metrics and host-name warnings are currently reported only at
+startup. See [ADMIN_CLI.md](ADMIN_CLI.md).
 
 ---
 
