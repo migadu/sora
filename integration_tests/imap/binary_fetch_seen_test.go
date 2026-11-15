@@ -158,7 +158,7 @@ func TestIMAP_FetchImplicitSeenFlagsAndModSeq(t *testing.T) {
 		}{
 			{1, "FETCH 1 (FLAGS MODSEQ BINARY[1])", "BINARY[1]"},
 			{2, "FETCH 2 (FLAGS MODSEQ BODY[1])", "BODY[1]"},
-			{3, fmt.Sprintf("UID FETCH %s (FLAGS BINARY[1]) (CHANGEDSINCE 0)", uid3), "BINARY[1]"},
+			{3, fmt.Sprintf("UID FETCH %s (FLAGS BINARY[1]) (CHANGEDSINCE 1)", uid3), "BINARY[1]"},
 		} {
 			untagged, _ := c.do(tc.cmd)
 			var bodyFetch string
