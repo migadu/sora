@@ -71,3 +71,30 @@ elsif date :count "eq" :comparator "i;ascii-numeric" "resent-date" "year" "0" { 
 		})
 	}
 }
+
+// TestCurrentDateCount: RFC 5260 §5: "The :count value of a currentdate test is
+// always 1." go-sieve handed currentdate's :count to its string matcher, which
+// panics on :count, so the script failed and its fileinto was dropped.
+func TestCurrentDateCount(t *testing.T) {
+	const script = `require ["date", "relational", "comparator-i;ascii-numeric", "fileinto"];
+if currentdate :count "eq" :comparator "i;ascii-numeric" "year" "1" { fileinto "one"; }
+`
+	if err := ValidateScript(script, nil); err != nil {
+		t.Fatalf("ValidateScript: %v", err)
+	}
+	executor, err := NewSieveExecutorWithExtensions(script, EffectiveExtensions(nil))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	result, err := executor.Evaluate(context.Background(), rawContext(t,
+		"From: sender@example.net\r\n"+
+			"To: user@example.com\r\n"+
+			"\r\n"+
+			"body\r\n"))
+	if err != nil {
+		t.Fatalf("evaluate: %.200v", err)
+	}
+	if !slices.Equal(result.Mailboxes, []string{"one"}) {
+		t.Errorf("mailboxes = %q, want [\"one\"]", result.Mailboxes)
+	}
+}
