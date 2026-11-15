@@ -602,16 +602,18 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 				fetchUpto = imap.UID(rows[0].HighestUID)
 			}
 		}
-		hasNewToFetch := wantFetch && watch.nextFetchUID != 0 && fetchUpto >= watch.nextFetchUID
-
-		// SELECTED-DELAYED defers expunges to a sync point (RFC 5465 §6.1.2).
-		// IDLE is such a sync point, so release them while idling. Also release
-		// them when there are new messages whose fetch-atts we must deliver:
-		// §6.1.2 permits a SELECTED-DELAYED server to return expunges early
-		// (MAY), and holding them here would withhold the new-message EXISTS
-		// behind a queued expunge, blocking the FETCH. w.ExpungeAllowed() still
-		// forbids expunges while an expunge-unsafe command is mid-flight.
-		allowExpunge := (!watch.delayed || s.idling.Load() || hasNewToFetch) && w.ExpungeAllowed()
+		// w.ExpungeAllowed() withholds expunges while FETCH, STORE, SEARCH,
+		// SORT or THREAD is in progress (RFC 3501 §7.4.1). SELECTED-DELAYED
+		// "requires the server to delay a MessageExpunge event until the
+		// client issues a command that allows returning information about
+		// expunged messages" (RFC 5465 §6.1.2), so they also wait while no
+		// command is in progress: the pump releases them during NOOP, IDLE,
+		// CHECK and EXPUNGE, and any other command that allows them releases
+		// them in its own poll when it ends.
+		allowExpunge := w.ExpungeAllowed()
+		if watch.delayed {
+			allowExpunge = w.DelayedExpungeAllowed()
+		}
 		polled := true
 		if err := s.Poll(ctx, w, allowExpunge); err != nil {
 			var imapErr *imap.Error
@@ -629,10 +631,14 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 			polled = false
 		}
 
-		// Deliver fetch-atts only when the EXISTS was actually delivered: the
-		// poll succeeded and was not withheld (allowExpunge). Otherwise defer
-		// to a later tick, leaving nextFetchUID unadvanced so nothing is lost.
-		if wantFetch && polled && allowExpunge {
+		// Deliver fetch-atts only once the EXISTS was delivered (RFC 5465 §5.2:
+		// the EXISTS comes first): the poll succeeded and left nothing queued.
+		// A withheld expunge holds back the EXISTS queued behind it, and the
+		// FETCH then waits for the client's next sync point, as §6.1.2 allows
+		// for SELECTED-DELAYED ("the server MAY also delay returning other
+		// <message-event>s"). nextFetchUID stays unadvanced, so nothing is
+		// lost.
+		if wantFetch && polled && s.selectedUpdatesDelivered() {
 			if err := s.notifyFetchNewMessages(ctx, watch, fetchUpto, w); err != nil {
 				return false, err
 			}
@@ -1048,6 +1054,18 @@ func (s *IMAPSession) notifyFetchNewMessages(ctx context.Context, watch *notifyW
 		watch.nextFetchUID = progress.failed + 1
 	}
 	return nil
+}
+
+// selectedUpdatesDelivered reports whether the session tracker holds no update
+// for the client, so that every EXISTS a poll queued has been sent. It is
+// false when no mailbox is selected, or when the session lock is contended.
+func (s *IMAPSession) selectedUpdatesDelivered() bool {
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
+	if !acquired {
+		return false
+	}
+	defer release()
+	return s.sessionTracker != nil && s.sessionTracker.QueuedUpdates() == 0
 }
 
 // currentSelectedMailboxID reads the selected mailbox ID under the session
