@@ -1,6 +1,7 @@
 package helpers
 
 import (
+	"errors"
 	"net/mail"
 	"regexp"
 	"strconv"
@@ -29,6 +30,10 @@ var alphabeticZone = regexp.MustCompile(`^[^:]*\d:\d{2}(?::\d{2})?([ \t]*)([A-Za
 // follows.
 var obsYear = regexp.MustCompile(`^[^:]*[ \t](\d{2,3})[ \t]+\d{1,2}:`)
 
+// gmtHourOffset matches a zone of GMT and a signed hour other than zero, the form
+// time.Parse (and so net/mail.ParseDate) accepts after GMT: GMT+1, GMT-05, GMT+0001.
+var gmtHourOffset = regexp.MustCompile(`^GMT[+-]0*[1-9]`)
+
 // ParseDateHeader parses the value of a Date: header field (RFC 5322 §3.3), like
 // net/mail.ParseDate but reading an alphabetic zone by RFC 5322 §4.3 instead of by the
 // host's time zone, a two- or three-digit year by §4.3 too, and comments and white
@@ -51,6 +56,11 @@ var obsYear = regexp.MustCompile(`^[^:]*[ \t](\d{2,3})[ \t]+\d{1,2}:`)
 // the tokens (obs-day-of-week, obs-day, obs-year, obs-hour, obs-minute and obs-second
 // are each "[CFWS] ... [CFWS]"), so they are first reduced to the separators net/mail's
 // layouts have.
+//
+// GMT with a signed hour other than zero (GMT+1) is not parsed. It is no zone of RFC
+// 5322 (§3.3; the obs-zone names of §4.3 are alphabetic) and has no single meaning, an
+// offset of +0100 or, as a POSIX TZ, UTC-1. net/mail.ParseDate takes the time of day as
+// UTC and labels it with the offset, a time of day neither reading gives.
 func ParseDateHeader(value string) (time.Time, error) {
 	// Unfold exactly as net/mail does, without turning an unpaired CR or LF
 	// before the zone into valid white space during the replacement below.
@@ -76,6 +86,13 @@ func ParseDateHeader(value string) (time.Time, error) {
 		// (unfolded is the value net/mail would see, with the separators and
 		// the year rewritten).
 		if end < len(unfolded) && unfolded[end] != ' ' && unfolded[end] != '\t' && unfolded[end] != '(' {
+			// Except GMT with a signed hour other than zero (see above), which
+			// time.Parse builds in UTC and only labels with the offset: 12:00:00
+			// GMT+1 would be 13:00:00 +0100. Like GMT+0200, which net/mail rejects,
+			// it leaves the sent date unknown.
+			if gmtHourOffset.MatchString(unfolded[m[4]:]) {
+				return time.Time{}, errors.New("mail: GMT with an hour offset is not an RFC 5322 zone")
+			}
 			return mail.ParseDate(unfolded)
 		}
 		// Nor are the letters the zone when a numeric offset follows them after
