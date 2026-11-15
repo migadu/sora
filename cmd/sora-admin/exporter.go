@@ -1098,7 +1098,7 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 
 	index := make(map[string]int)
 	used := make(map[int]bool)
-	if existing, err := parseKeywordsFile(keywordsPath); err == nil {
+	if existing, err := parseKeywordsFile(keywordsPath, os.ReadFile); err == nil {
 		for idx, kw := range existing {
 			if idx >= 0 && idx < maxMaildirKeywords {
 				index[kw] = idx
