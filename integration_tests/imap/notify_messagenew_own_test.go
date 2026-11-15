@@ -96,9 +96,10 @@ func TestNotifyMessageNewNoFetchForOwnMessages(t *testing.T) {
 	}
 }
 
-// countUIDFetches counts the FETCH responses that carry UID uid.
+// countUIDFetches counts the FETCH responses that carry UID uid, whether UID
+// is their first item or a later one.
 func countUIDFetches(resps []string, uid imap.UID) int {
-	re := regexp.MustCompile(fmt.Sprintf(`^\* \d+ FETCH \(.*[( ]UID %d[ )]`, uid))
+	re := regexp.MustCompile(fmt.Sprintf(`^\* \d+ FETCH \((?:.*[( ])?UID %d[ )]`, uid))
 	n := 0
 	for _, resp := range resps {
 		if re.MatchString(resp) {
@@ -106,4 +107,27 @@ func countUIDFetches(resps []string, uid imap.UID) int {
 		}
 	}
 	return n
+}
+
+// TestCountUIDFetches: the helper finds UID in any position of a FETCH, so a
+// MessageNew FETCH for fetch-atts that put UID first, "(UID 3)", is not missed
+// and the assertions above cannot pass for want of a match.
+func TestCountUIDFetches(t *testing.T) {
+	for _, tc := range []struct {
+		resp string
+		want int
+	}{
+		{`* 2 FETCH (UID 3)`, 1},
+		{`* 2 FETCH (UID 3 FLAGS (\Seen))`, 1},
+		{`* 2 FETCH (FLAGS ($hasnoattachment) UID 3)`, 1},
+		{`* 2 FETCH (FLAGS (\Seen) UID 3 MODSEQ (7))`, 1},
+		{`* 2 FETCH (UID 30)`, 0},
+		{`* 2 FETCH (UID 13)`, 0},
+		{`* 3 FETCH (FLAGS (\Seen))`, 0},
+		{`* 3 EXISTS`, 0},
+	} {
+		if got := countUIDFetches([]string{tc.resp}, 3); got != tc.want {
+			t.Errorf("countUIDFetches(%q, 3) = %d, want %d", tc.resp, got, tc.want)
+		}
+	}
 }
