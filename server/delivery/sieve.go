@@ -243,7 +243,7 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	sieveCtx := sieveengine.Context{
 		EnvelopeFrom: envelopeFrom,
 		EnvelopeTo:   recipient.ToAddress.FullAddress(),
-		Header:       messageEntity.Header.Map(),
+		Header:       sieveengine.HeaderMap(messageEntity.Header),
 		Message:      fullMessageBytes,
 		MailboxExists: func(ctx context.Context, mailbox string) (bool, error) {
 			return CanFileInto(ctx, s.DeliveryCtx.RDB, s.DeliveryCtx.SharedMailboxes, recipient.AccountID, mailbox)
