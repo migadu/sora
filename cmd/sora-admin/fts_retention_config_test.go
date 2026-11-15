@@ -22,7 +22,7 @@ func TestNegativeFTSRetentionRejected(t *testing.T) {
 		{name: "negative", value: "-30d", wantErr: `fts_retention must not be negative, got "-30d"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			content := "[[server]]\ntype = \"lmtp\"\nname = \"lmtp\"\naddr = \"127.0.0.1:0\"\n"
+			content := storageTOML + "[[server]]\ntype = \"lmtp\"\nname = \"lmtp\"\naddr = \"127.0.0.1:0\"\n"
 			if tc.value != "" {
 				content += "\n[cleanup]\nfts_retention = \"" + tc.value + "\"\n"
 			}

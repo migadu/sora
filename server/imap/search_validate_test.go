@@ -106,3 +106,27 @@ func TestValidateSearchCriteria_AcceptsSearchesThatMatchNothingOrAll(t *testing.
 		}
 	}
 }
+
+// A NUL or a byte that is not UTF-8 in a search string is a protocol error in
+// the client's command (RFC 9051 §9 rule 3, §6.4.4), answered BAD [CLIENTBUG]
+// before it can reach PostgreSQL and come back as NO [SERVERBUG] (#594).
+func TestValidateSearchCriteria_RejectsMalformedStringsWithBad(t *testing.T) {
+	s := &IMAPSession{}
+
+	for name, criteria := range map[string]*imap.SearchCriteria{
+		"NUL in HEADER Subject": {Header: []imap.SearchCriteriaHeaderField{{Key: "Subject", Value: "\x00"}}},
+		"invalid UTF-8 in BODY": {Body: []string{"\xff"}},
+		"invalid UTF-8 in TEXT": {Text: []string{"\xff"}},
+		"NUL in BODY":           {Body: []string{"\x00"}},
+	} {
+		err := s.validateSearchCriteria("SEARCH", criteria)
+		imapErr, ok := err.(*imap.Error)
+		if !ok {
+			t.Errorf("%s: got %T (%v), want BAD *imap.Error", name, err, err)
+			continue
+		}
+		if imapErr.Type != imap.StatusResponseTypeBad || imapErr.Code != imap.ResponseCodeClientBug {
+			t.Errorf("%s: got %s [%s], want BAD [CLIENTBUG]", name, imapErr.Type, imapErr.Code)
+		}
+	}
+}

@@ -70,7 +70,6 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -83,6 +82,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
@@ -137,21 +137,12 @@ func New(endpoint, accessKeyID, secretAccessKey, bucketName string, useSSL bool,
 	}, nil
 }
 
-// EnableEncryption enables client-side encryption for S3 storage
+// EnableEncryption enables client-side encryption for S3 storage with the [s3]
+// encryption_key, which config.S3Config.Validate checks with the same parse.
 func (s *S3Storage) EnableEncryption(encryptionKey string) error {
-	if encryptionKey == "" {
-		return fmt.Errorf("encryption key is required when encryption is enabled")
-	}
-
-	// Decode the hex-encoded encryption key
-	masterKey, err := hex.DecodeString(encryptionKey)
+	masterKey, err := config.ParseS3EncryptionKey(encryptionKey)
 	if err != nil {
-		return fmt.Errorf("failed to decode encryption key: %w", err)
-	}
-
-	// Check if the key is 32 bytes (256 bits)
-	if len(masterKey) != 32 {
-		return fmt.Errorf("encryption key must be 32 bytes (64 hex characters)")
+		return err
 	}
 
 	s.Encrypt = true

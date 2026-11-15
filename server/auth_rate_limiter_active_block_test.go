@@ -402,9 +402,8 @@ func TestIPUsernameBlockRenewalNeverShortensBlock(t *testing.T) {
 	}
 }
 
-// A full block table is searched for a block that has ended only once the earliest one
-// can have ended. A block stored with an earlier end than those already there (its
-// failure time was taken first) moves that point, so its slot is reused once it ends.
+// A block stored with an earlier end than those already in a full block table (its
+// failure time was taken first) is the first to make room, once it ends.
 func TestIPUsernameFullBlockTableReusesOutOfOrderBlock(t *testing.T) {
 	limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
 		Enabled:                  true,
@@ -436,7 +435,7 @@ func TestIPUsernameFullBlockTableReusesOutOfOrderBlock(t *testing.T) {
 	// .1's block is gone (as when CanAttemptAuth removes it), and a failure taken
 	// before the others is stored in its slot.
 	limiter.ipUsernameMu.Lock()
-	delete(limiter.blockedIPUsernames, "198.51.100.1|user@example.com")
+	limiter.dropIPUsernameBlock("198.51.100.1|user@example.com")
 	limiter.ipUsernameMu.Unlock()
 	fail("198.51.100.4", 10*time.Second) // blocked until t0+70s
 
@@ -444,6 +443,87 @@ func TestIPUsernameFullBlockTableReusesOutOfOrderBlock(t *testing.T) {
 	if !isBlocked("198.51.100.5") {
 		t.Error("a block that had ended kept its slot in a full table")
 	}
+}
+
+// A failure while blocked renews the block: in a full block table it is no longer the
+// first block to end, and a block that has ended since makes room ahead of it.
+func TestIPUsernameFullBlockTableReusesSlotPastRenewedBlock(t *testing.T) {
+	limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+		Enabled:                  true,
+		MaxAttemptsPerIPUsername: 1,
+		IPUsernameBlockDuration:  time.Minute,
+		IPUsernameWindowDuration: time.Hour,
+		CleanupInterval:          time.Hour,
+		MaxIPUsernameEntries:     2,
+	})
+	defer limiter.Stop()
+	t0 := time.Now()
+	fail := func(ip string, at time.Duration) {
+		limiter.updateIPUsernameFailure(ip, "user@example.com", t0.Add(at))
+	}
+	blockedUntil := func(ip string) (time.Duration, bool) {
+		limiter.ipUsernameMu.RLock()
+		defer limiter.ipUsernameMu.RUnlock()
+		blocked, ok := limiter.blockedIPUsernames[ip+"|user@example.com"]
+		if !ok {
+			return 0, false
+		}
+		return blocked.BlockedUntil.Sub(t0), true
+	}
+
+	fail("198.51.100.1", 0)              // blocked until t0+60s
+	fail("198.51.100.2", 10*time.Second) // blocked until t0+70s: the table is full
+	fail("198.51.100.1", 50*time.Second) // renewed until t0+110s
+	fail("198.51.100.3", 75*time.Second) // .2's block has ended: .3 takes its slot
+	if _, ok := blockedUntil("198.51.100.3"); !ok {
+		t.Error("a block that had ended kept its slot in a full table while an earlier block was renewed")
+	}
+	if end, ok := blockedUntil("198.51.100.1"); !ok || end != 110*time.Second {
+		t.Errorf("renewed block: blocked = %v, ends %v after t0, want until t0+110s", ok, end)
+	}
+	if _, ok := blockedUntil("198.51.100.2"); ok {
+		t.Error("the block that had ended is still stored")
+	}
+}
+
+// Every path that deletes a block that has ended takes it out of the block queue too.
+// A block deleted from the table but left queued is later dropped by its key to make
+// room: that deletes nothing, or the block the pair got since, and the table either
+// outgrows max_ip_username_entries or loses an active block.
+func TestIPUsernameBlockQueueFollowsEveryRemoval(t *testing.T) {
+	discardAuthLimiterLogs(t)
+	limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+		Enabled:                  true,
+		MaxAttemptsPerIPUsername: 1,
+		IPUsernameBlockDuration:  time.Minute,
+		IPUsernameWindowDuration: time.Hour,
+		CleanupInterval:          time.Hour,
+		MaxIPUsernameEntries:     4,
+	})
+	defer limiter.Stop()
+	ctx := context.Background()
+	const username = "user@example.com"
+	check := func(step string) {
+		t.Helper()
+		limiter.ipUsernameMu.RLock()
+		defer limiter.ipUsernameMu.RUnlock()
+		requireQueueMirrorsTable(t, step+": IP+username block", limiter.ipUsernameBlockQueue, limiter.blockedIPUsernames)
+	}
+
+	ended := time.Now().Add(-2 * time.Minute) // blocked until a minute ago
+	for i := 1; i <= 4; i++ {
+		limiter.updateIPUsernameFailure(fmt.Sprintf("198.51.100.%d", i), username, ended)
+	}
+	check("full table of ended blocks")
+	_ = limiter.CanAttemptAuth(ctx, &StringAddr{Addr: "198.51.100.1"}, username)
+	check("check of a pair whose block ended")
+	limiter.RecordAuthAttempt(ctx, &StringAddr{Addr: "198.51.100.2"}, username, true)
+	check("success of a pair whose block ended")
+	limiter.updateIPUsernameFailure("198.51.100.3", username, time.Now())
+	check("failure of a pair whose block ended")
+	limiter.cleanupExpiredEntries()
+	check("cleanup")
+	requireKeys(t, &limiter.ipUsernameMu, limiter.blockedIPUsernames, "198.51.100.3|"+username)
 }
 
 // CanAttemptAuth removes a block that has ended after trading its read lock for the
@@ -508,7 +588,8 @@ func TestExpiredBlockRemovalKeepsNewBlock(t *testing.T) {
 		race(t, limiter, func() {
 			limiter.ipUsernameMu.Lock()
 			defer limiter.ipUsernameMu.Unlock()
-			limiter.blockedIPUsernames[key] = &BlockedIPUsernameInfo{BlockedUntil: time.Now().Add(-time.Second)}
+			limiter.dropIPUsernameBlock(key)
+			limiter.addIPUsernameBlock(key, &BlockedIPUsernameInfo{BlockedUntil: time.Now().Add(-time.Second)})
 		}, func() { limiter.updateIPUsernameFailure(ip, username, time.Now()) }, "ip_username_blocked")
 	})
 }
@@ -583,6 +664,28 @@ func TestIPUsernameTablesConcurrentUse(t *testing.T) {
 	defer limiter.ipUsernameMu.RUnlock()
 	if c, b := len(limiter.ipUsernameFailureCounts), len(limiter.blockedIPUsernames); c > limit || b > limit {
 		t.Errorf("%d IP+username counters and %d blocks, want at most %d of each", c, b, limit)
+	}
+	requireQueueMirrorsTable(t, "IP+username counter", limiter.ipUsernameQueue, limiter.ipUsernameFailureCounts)
+	requireQueueMirrorsTable(t, "IP+username block", limiter.ipUsernameBlockQueue, limiter.blockedIPUsernames)
+}
+
+// requireQueueMirrorsTable fails t unless q holds exactly the entries of table, each at
+// the position it records, in heap order: an entry stored or deleted past its queue is
+// either never given up to make room or given up while another entry holds its key, and
+// one out of order (a change of its time not fixed) hides an earlier one from the front.
+func requireQueueMirrorsTable[T queuedCounter](t *testing.T, name string, q evictionQueue[T], table map[string]T) {
+	t.Helper()
+	if len(q) != len(table) {
+		t.Errorf("%d %ss queued, %d stored", len(q), name, len(table))
+	}
+	for i, entry := range q {
+		stored, ok := table[entry.slot().key]
+		if !ok || stored.slot() != entry.slot() || entry.slot().index != i {
+			t.Errorf("queued %s %q at %d (index %d) is not the one stored", name, entry.slot().key, i, entry.slot().index)
+		}
+		if parent := (i - 1) / 2; i > 0 && q.Less(i, parent) {
+			t.Errorf("queued %s %q at %d comes before its parent at %d: the queue is out of order", name, entry.slot().key, i, parent)
+		}
 	}
 }
 

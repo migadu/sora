@@ -73,7 +73,7 @@ func TestStartupRefusesMalformedTrustedNetworks(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.toml")
-			if err := os.WriteFile(path, []byte(tc.toml), 0o600); err != nil {
+			if err := os.WriteFile(path, []byte(storageTOML+tc.toml), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			cmd := exec.Command(os.Args[0], "-test.run=^TestStartupRefusesMalformedTrustedNetworks$")
