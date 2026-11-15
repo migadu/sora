@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/consts"
 )
 
 // Subscriptions (RFC 3501 §6.3.6 / RFC 9051 §6.3.7) are NAME-based and decoupled
@@ -14,6 +15,16 @@ import (
 // report it with \NonExistent). The `subscriptions` table (migration 000046) is
 // the authoritative store; the legacy `mailboxes.subscribed` column is unused by
 // the subscription code path from here on.
+
+// defaultMailboxNamesLower holds consts.DefaultMailboxes in lower case (they are
+// ASCII), for Unsubscribe.
+var defaultMailboxNamesLower = func() []string {
+	names := make([]string, len(consts.DefaultMailboxes))
+	for i, name := range consts.DefaultMailboxes {
+		names[i] = strings.ToLower(name)
+	}
+	return names
+}()
 
 // Subscribe records a name-based subscription for the account. Idempotent and
 // case-insensitive (matching mailbox-name case-insensitivity, migration 000041).
@@ -30,11 +41,18 @@ func (db *Database) Subscribe(ctx context.Context, tx pgx.Tx, accountID int64, m
 }
 
 // Unsubscribe removes a name-based subscription. Idempotent and case-insensitive.
+// A default mailbox's subscription is kept: default mailboxes stay permanently
+// subscribed. Whether the name is a default mailbox's is asked of the row it
+// matches, as helpers.IsDefaultMailboxName asks it of a stored name (lower() under
+// the "C" collation folds ASCII letters only), so the answer is the database's
+// LOWER() under any collation: "ſent" matches only a "ſent" row, while "Jun\u212A"
+// matches Junk's under a UTF-8 collation and leaves it.
 func (db *Database) Unsubscribe(ctx context.Context, tx pgx.Tx, accountID int64, mailboxName string) error {
 	_, err := tx.Exec(ctx, `
 		DELETE FROM subscriptions
 		WHERE account_id = $1 AND LOWER(mailbox_name) = LOWER($2)
-	`, accountID, mailboxName)
+		  AND LOWER(mailbox_name COLLATE "C") <> ALL ($3)
+	`, accountID, mailboxName, defaultMailboxNamesLower)
 	if err != nil {
 		return fmt.Errorf("failed to unsubscribe %q: %w", mailboxName, err)
 	}

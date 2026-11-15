@@ -71,3 +71,36 @@ func TestSubscriptions_NameBased(t *testing.T) {
 	require.Equal(t, []string{"Ghost/Reports", "Ghost/Reports/2026"},
 		subNames(t, db, ctx, accountID))
 }
+
+// TestUnsubscribe_KeepsDefaultMailboxSubscriptions is issue #1584. Unsubscribe
+// keeps the subscription of a default mailbox under any name the database takes for
+// it, and removes that of a mailbox named like one ("ſent": lower() leaves U+017F as
+// it is, so the name matches only its own row).
+func TestUnsubscribe_KeepsDefaultMailboxSubscriptions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping database integration test")
+	}
+	db := setupTestDatabase(t)
+	ctx := context.Background()
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-subs-default-%d@example.com", time.Now().UnixNano()), "password")
+
+	tx := func(fn func(tx pgx.Tx) error) {
+		t.Helper()
+		wtx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer wtx.Rollback(ctx)
+		require.NoError(t, fn(wtx))
+		require.NoError(t, wtx.Commit(ctx))
+	}
+
+	tx(func(t2 pgx.Tx) error { return db.CreateDefaultMailboxes(ctx, t2, accountID) })
+	tx(func(t2 pgx.Tx) error { return db.Subscribe(ctx, t2, accountID, "ſent") })
+	defaults := []string{"Archive", "Drafts", "INBOX", "Junk", "Sent", "Trash"}
+	require.Equal(t, append(append([]string{}, defaults...), "ſent"), subNames(t, db, ctx, accountID))
+
+	for _, name := range []string{"sent", "INBOX", "trash", "Jun\u212A", "\u0130NBOX"} {
+		tx(func(t2 pgx.Tx) error { return db.Unsubscribe(ctx, t2, accountID, name) })
+	}
+	tx(func(t2 pgx.Tx) error { return db.Unsubscribe(ctx, t2, accountID, "ſent") })
+	require.Equal(t, defaults, subNames(t, db, ctx, accountID))
+}

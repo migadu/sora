@@ -1208,7 +1208,7 @@ func (d *Database) GetMailboxMessageCountAndSizeSum(ctx context.Context, mailbox
 // 000046) — this by-ID helper resolves the mailbox's name and writes there, so
 // non-IMAP callers (admin/user API, importer) stay consistent with LSUB/LIST
 // (SUBSCRIBED). Unsubscribing a default mailbox is ignored (defaults stay
-// permanently subscribed).
+// permanently subscribed; Unsubscribe keeps them).
 func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, subscribed bool) error {
 	// First, check if the mailbox exists and belongs to the user.
 	var mboxName string
@@ -1218,16 +1218,6 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailbox
 			return consts.ErrMailboxNotFound
 		}
 		return fmt.Errorf("failed to fetch mailbox %d for subscription update: %w", mailboxID, err)
-	}
-
-	// Prevent unsubscribing default mailboxes (they stay permanently subscribed).
-	if !subscribed {
-		for _, rootFolder := range consts.DefaultMailboxes {
-			if strings.EqualFold(mboxName, rootFolder) {
-				logger.Debug("Database: ignoring unsubscribe for default mailbox", "mailbox", mboxName)
-				return nil
-			}
-		}
 	}
 
 	if subscribed {
