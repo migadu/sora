@@ -160,7 +160,13 @@ func TestFailedSTARTTLSConnectIsNotHeld(t *testing.T) {
 			if sess.backendConn != nil || sess.backendRoute != nil {
 				t.Errorf("after %q the session holds backendConn %T, backendRoute %v; want neither", err, sess.backendConn, sess.backendRoute)
 			}
-			commands() // fails the test unless the backend connection was closed
+			// The fake backend also ends the connection on its own 10 s deadline, so
+			// only a prompt end shows that connectToBackend closed it.
+			waitStart := time.Now()
+			commands()
+			if waited := time.Since(waitStart); waited > 2*time.Second {
+				t.Errorf("the backend saw its connection end %v after connectToBackend failed (its own deadline): the connection was left open", waited.Round(time.Second))
+			}
 		})
 	}
 }
