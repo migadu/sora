@@ -274,20 +274,28 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 		}
 
 		// Update password and/or set as primary
+		var tag pgconn.CommandTag
 		if updatePassword {
-			_, err = tx.Exec(ctx,
+			tag, err = tx.Exec(ctx,
 				"UPDATE credentials SET password = $1, primary_identity = true, updated_at = now() WHERE account_id = $2 AND LOWER(address) = $3",
 				hashedPassword, accountID, normalizedEmail)
 			if err != nil {
 				return fmt.Errorf("failed to update account password and set primary: %w", err)
 			}
 		} else {
-			_, err = tx.Exec(ctx,
+			tag, err = tx.Exec(ctx,
 				"UPDATE credentials SET primary_identity = true, updated_at = now() WHERE account_id = $1 AND LOWER(address) = $2",
 				accountID, normalizedEmail)
 			if err != nil {
 				return fmt.Errorf("failed to set credential as primary: %w", err)
 			}
+		}
+		// The credential was deleted after the lookup above, while this change waited
+		// for the primary-identity lock or for the delete's row lock. Committing now
+		// would leave the account without a primary identity; the caller rolls tx
+		// back, which restores the primary cleared above.
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("%w: account with email %s does not exist", consts.ErrUserNotFound, normalizedEmail)
 		}
 
 	} else {
