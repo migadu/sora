@@ -534,6 +534,11 @@ message by content hash and mailbox. On a re-run:
   old file is removed.
 - Two messages with the same content in one mailbox are exported as one file.
 
+If an earlier run failed to write a `dovecot-uidlist`, an ordinary re-run that only skips
+existing message files does not rebuild that UID list. Fix the path that prevented the
+write and re-run with `--overwrite-flags`, or export into a fresh directory, to generate
+the UID lists again.
+
 Each message is tried three times. If any message or mailbox fails, the command exits `1` with
 `export incomplete: N message(s) and M mailbox(es) failed`. It also exits `1`, naming the file,
 when the `subscriptions` file or a folder's `dovecot-uidlist` cannot be written; the other folders'
