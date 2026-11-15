@@ -1529,8 +1529,8 @@ type ServerConfig struct {
 
 	// Auth security
 	// InsecureAuth allows plaintext authentication over non-TLS connections (default:
-	// false). Without tls = true it is allowed regardless: the IMAP, POP3, ManageSieve and
-	// LMTP servers and the IMAP, POP3 and ManageSieve proxies apply insecure_auth || !tls.
+	// false). Without tls = true it is allowed regardless: the IMAP, POP3 and ManageSieve
+	// servers and proxies apply insecure_auth || !tls. LMTP offers no AUTH.
 	InsecureAuth bool `toml:"insecure_auth,omitempty"`
 
 	// ManageSieve specific
@@ -3021,81 +3021,18 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	}
 
 	switch s.Type {
-	case "imap":
-		// IMAP server
-		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
-		}
-		if s.RemoteUseIDCommand {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
-		}
-
 	case "lmtp":
-		// LMTP server
-		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
-		}
-		if s.RemoteUseXCLIENT {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP and POP3 proxy servers", s.Name, s.Type)
-		}
 		// Its only timeout setting is timeouts.command_timeout (the idle timeout).
 		s.warnKeysNotApplied(logger, "the LMTP server does not apply it",
 			configKey{"timeouts.absolute_session_timeout", s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != ""},
-			configKey{"timeouts.min_bytes_per_minute", s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0},
-			configKey{"auth_idle_timeout", s.AuthIdleTimeout != ""})
+			configKey{"timeouts.min_bytes_per_minute", s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0})
 		// MTAs deliver many messages at once from few addresses.
 		s.warnKeysNotApplied(logger, "the LMTP server limits only its total connections (max_connections)",
 			configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
 			configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
 			configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 
-	case "pop3":
-		// POP3 server
-		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
-		}
-
-	case "managesieve":
-		// ManageSieve server
-		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but a ManageSieve server offers the [sieve] enabled_extensions; this only applies to ManageSieve proxy servers", s.Name, s.Type)
-		}
-
-	case "imap_proxy":
-		// IMAP proxy
-		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
-		}
-		if s.MaxScriptSize != "" {
-			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
-		}
-		if s.RemoteUseXCLIENT {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP and POP3 proxy servers", s.Name, s.Type)
-		}
-
-	case "pop3_proxy":
-		// POP3 proxy
-		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
-		}
-		if s.MaxScriptSize != "" {
-			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
-		}
-		if s.RemoteUseIDCommand {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
-		}
-
 	case "lmtp_proxy":
-		// LMTP proxy
-		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
-		}
-		if s.MaxScriptSize != "" {
-			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
-		}
-		if s.RemoteUseIDCommand {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
-		}
 		// Its timeouts are auth_idle_timeout and timeouts.absolute_session_timeout.
 		s.warnKeysNotApplied(logger, "the LMTP proxy does not apply it",
 			configKey{"timeouts.command_timeout", s.Timeouts != nil && s.Timeouts.CommandTimeout != ""},
@@ -3107,18 +3044,6 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
 			configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 
-	case "managesieve_proxy":
-		// ManageSieve proxy
-		if s.AppendLimit != "" {
-			logger("WARNING: Server %s (type: %s) has 'append_limit' configured, but this only applies to IMAP servers", s.Name, s.Type)
-		}
-		if s.RemoteUseIDCommand {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
-		}
-		if s.RemoteUseXCLIENT {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP and POP3 proxy servers", s.Name, s.Type)
-		}
-
 	case "user_api_proxy":
 		// An HTTP request is not a logged-in session: nothing counts connections per user.
 		s.warnKeysNotApplied(logger, "the User API proxy limits only its total connections and those per IP (max_connections, max_connections_per_ip)",
@@ -3126,16 +3051,6 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 
 	case "metrics", "http_admin_api", "http_user_api":
-		// HTTP servers - warn about protocol-specific options
-		if len(s.SupportedExtensions) > 0 {
-			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
-		}
-		if s.MaxScriptSize != "" {
-			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
-		}
-		if s.AppendLimit != "" {
-			logger("WARNING: Server %s (type: %s) has 'append_limit' configured, but this only applies to IMAP servers", s.Name, s.Type)
-		}
 		// An HTTP request is not a logged-in session, so nothing counts connections
 		// per user. The Admin and User APIs cap their total connections, the metrics
 		// listener none.
@@ -3195,7 +3110,49 @@ var serverTypeKeys = []struct {
 	{"user_metrics_threshold", func(s *ServerConfig) bool { return s.UserMetricsThreshold != nil }, []string{"metrics"}},
 	{"max_tracked_users", func(s *ServerConfig) bool { return s.MaxTrackedUsers != nil }, []string{"metrics"}},
 	{"hash_usernames", func(s *ServerConfig) bool { return s.HashUsernames != nil }, []string{"metrics"}},
+	// The IMAP backend's capabilities, and the ID answer of the backend and its proxy.
+	{"client_filters", func(s *ServerConfig) bool { return len(s.ClientFilters) > 0 }, []string{"imap"}},
+	{"disabled_caps", func(s *ServerConfig) bool { return len(s.DisabledCaps) > 0 }, []string{"imap"}},
+	{"enable_preview", func(s *ServerConfig) bool { return s.EnablePreview }, []string{"imap"}},
+	{"additional_caps", func(s *ServerConfig) bool { return len(s.AdditionalCaps) > 0 }, []string{"imap", "imap_proxy"}},
+	{"id_name", func(s *ServerConfig) bool { return s.IDName != "" }, []string{"imap", "imap_proxy"}},
+	{"id_version", func(s *ServerConfig) bool { return s.IDVersion != "" }, []string{"imap", "imap_proxy"}},
+	{"id_vendor", func(s *ServerConfig) bool { return s.IDVendor != "" }, []string{"imap", "imap_proxy"}},
+	{"id_support_url", func(s *ServerConfig) bool { return s.IDSupportURL != "" }, []string{"imap", "imap_proxy"}},
+	// Password logins. The LMTP backend offers no AUTH, so insecure_auth has nothing
+	// to allow there; only the backends limit the SASL master login by network.
+	{"master_username", func(s *ServerConfig) bool { return s.MasterUsername != "" }, loginServerTypes},
+	{"master_password", func(s *ServerConfig) bool { return s.MasterPassword != "" }, loginServerTypes},
+	{"master_sasl_username", func(s *ServerConfig) bool { return s.MasterSASLUsername != "" }, loginServerTypes},
+	{"master_sasl_password", func(s *ServerConfig) bool { return s.MasterSASLPassword != "" }, loginServerTypes},
+	{"master_sasl_allowed_networks", func(s *ServerConfig) bool { return len(s.MasterSASLAllowedNetworks) > 0 }, []string{"imap", "pop3", "managesieve"}},
+	{"insecure_auth", func(s *ServerConfig) bool { return s.InsecureAuth }, loginServerTypes},
+	// The LMTP backend's only timeout is timeouts.command_timeout.
+	{"auth_idle_timeout", func(s *ServerConfig) bool { return s.AuthIdleTimeout != "" }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
+	{"debug", func(s *ServerConfig) bool { return s.Debug }, []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
+	// The proxies' backend legs.
+	{"remote_port", func(s *ServerConfig) bool { return s.RemotePort != nil }, proxyServerTypes},
+	{"connect_timeout", func(s *ServerConfig) bool { return s.ConnectTimeout != "" }, proxyServerTypes},
+	{"remote_dns_refresh", func(s *ServerConfig) bool { return s.RemoteDNSRefresh != "" }, proxyServerTypes},
+	{"remote_health_checks", func(s *ServerConfig) bool { return s.RemoteHealthChecks != nil }, proxyServerTypes},
+	{"enable_affinity", func(s *ServerConfig) bool { return s.EnableAffinity }, proxyServerTypes},
+	{"remote_use_id_command", func(s *ServerConfig) bool { return s.RemoteUseIDCommand }, []string{"imap_proxy"}},
+	{"remote_use_xclient", func(s *ServerConfig) bool { return s.RemoteUseXCLIENT }, []string{"pop3_proxy", "lmtp_proxy"}},
+	{"remote_use_utf8", func(s *ServerConfig) bool { return s.RemoteUseUTF8 }, []string{"pop3_proxy"}},
+	// Size limits, and the Sieve extensions the ManageSieve proxy advertises (a
+	// ManageSieve backend advertises the [sieve] enabled_extensions).
+	{"max_message_size", func(s *ServerConfig) bool { return s.MaxMessageSize != "" }, []string{"lmtp", "lmtp_proxy", "http_admin_api"}},
+	{"append_limit", func(s *ServerConfig) bool { return s.AppendLimit != "" }, []string{"imap"}},
+	{"max_script_size", func(s *ServerConfig) bool { return s.MaxScriptSize != "" }, []string{"managesieve"}},
+	{"supported_extensions", func(s *ServerConfig) bool { return len(s.SupportedExtensions) > 0 }, []string{"managesieve_proxy"}},
 }
+
+// loginServerTypes are the server types with a password login, proxyServerTypes
+// those that dial backends.
+var (
+	loginServerTypes = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
+	proxyServerTypes = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
+)
 
 // serverLimitKeys is every [server.limits] key with the server types whose start
 // functions read it. Every type accepts every key; WarnUnusedConfigOptions reports

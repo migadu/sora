@@ -742,7 +742,7 @@ to" column, "backends" means `imap`, `pop3`, `lmtp` and `managesieve`, and "line
 | `type` | string | required | all | See [section 5](#5-server-blocks). |
 | `name` | string | required | all | Unique name. |
 | `addr` | string | required | all | Listen address. |
-| `debug` | bool | `false` | backends, line proxies | Extra diagnostics for this server. Some protocols write a raw protocol trace to the log output whatever the level. See [PROTOCOLS.md](PROTOCOLS.md). |
+| `debug` | bool | `false` | backends, line proxies | Extra diagnostics for this server. Some protocols write a raw protocol trace to the log output whatever the level. On the HTTP servers it is ignored, with a startup warning. See [PROTOCOLS.md](PROTOCOLS.md). |
 
 ### 9.2 TLS on the listener
 
@@ -755,7 +755,7 @@ See [TLS.md](TLS.md).
 | `tls_cert_file`, `tls_key_file` | string | none | all but `metrics` | Certificate files for this listener. |
 | `tls_verify` | bool | `false` | all but `metrics` | See [TLS.md](TLS.md). |
 | `tls_default_domain` | string | `[tls.letsencrypt] default_domain` | all but `metrics` | Certificate for clients that send no SNI. |
-| `insecure_auth` | bool | `false` | `imap`, `pop3`, `managesieve`, `lmtp`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Allow password logins on a plain connection. Without `tls = true` it is always allowed. See [SECURITY.md](SECURITY.md). |
+| `insecure_auth` | bool | `false` | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Allow password logins on a plain connection. Without `tls = true` it is always allowed. The other server types have no password login; on them the key is ignored, with a startup warning. See [SECURITY.md](SECURITY.md). |
 
 The `metrics` server always speaks plain HTTP. `tls` on it only causes a startup warning.
 
@@ -837,6 +837,8 @@ out keeps its default. On POP3, LMTP and ManageSieve an explicit `"0"` turns tha
 ### 9.7 Protocol-specific keys
 
 See [PROTOCOLS.md](PROTOCOLS.md).
+A key set on a server type not listed under "Applies to" is ignored, with a startup warning that
+names it. The same holds for `[[server.client_filters]]`.
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
@@ -865,6 +867,8 @@ See [PROTOCOLS.md](PROTOCOLS.md).
 ### 9.8 Master credentials
 
 See [AUTHENTICATION.md](AUTHENTICATION.md).
+A key set on a server type not listed under "Applies to" is ignored, with a startup warning that
+names it.
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
@@ -921,6 +925,8 @@ By default the cache is on for `imap`, `pop3`, `managesieve` and the line proxie
 ### 9.11 Proxy keys
 
 Read by the line proxies and `user_api_proxy`. See [PROXY.md](PROXY.md).
+A key set on a server type not listed under "Applies to" is ignored, with a startup warning that
+names it.
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
