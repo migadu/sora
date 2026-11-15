@@ -113,7 +113,8 @@ type IMAPSession struct {
 	// NOTIFY (RFC 5465) watch state. notifyMutex guards the pointer swap:
 	// SetNotify/Close write it on the command goroutine, NotifyPoll reads it
 	// on the pump goroutine (the library stops the pump before SetNotify
-	// runs, so the watch internals are only ever touched by one goroutine).
+	// runs, so the watch internals are only ever touched by one goroutine,
+	// except notifyWatch.own, which notifyMutex guards as well).
 	notifyMutex sync.Mutex
 	notifyWatch *notifyWatch
 
