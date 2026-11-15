@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
 )
 
@@ -21,6 +22,8 @@ import (
 //
 // LIST ... RETURN (STATUS (HIGHESTMODSEQ)) (RFC 5819) asks for the same STATUS
 // data item and counts as well. STATUS without HIGHESTMODSEQ is the control.
+// A late client filter must preserve enabled CONDSTORE (#1071), while STATUS
+// must not implicitly enable QRESYNC or permit its VANISHED modifier (#1187).
 func TestIMAP_StatusHighestModSeqEnablesCondStore(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -51,7 +54,11 @@ func TestIMAP_StatusHighestModSeqEnablesCondStore(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			server, account := common.SetupIMAPServer(t)
+			server, account := setupIMAPServerWithCapabilityFilters(t, []config.ClientCapabilityFilter{{
+				ClientName:    "late-filter",
+				ClientVersion: ".*",
+				DisableCaps:   []string{"CONDSTORE", "QRESYNC"},
+			}})
 			defer server.Close()
 
 			seedMessage(t, server, account)
@@ -65,6 +72,20 @@ func TestIMAP_StatusHighestModSeqEnablesCondStore(t *testing.T) {
 			}
 
 			c.do("SELECT INBOX")
+			if tt.wantModSeq {
+				if status := c.status("UID FETCH 1:* (FLAGS) (CHANGEDSINCE 1 VANISHED)"); !strings.HasPrefix(status, "BAD ") {
+					t.Fatalf("STATUS must not enable QRESYNC: VANISHED without ENABLE returned %s", status)
+				}
+			}
+			c.do(`ID ("name" "late-filter" "version" "1")`)
+			caps, _ := c.do("CAPABILITY")
+			capList := " " + strings.Join(caps, " ") + " "
+			if got := strings.Contains(capList, " CONDSTORE "); got != tt.wantModSeq {
+				t.Fatalf("after %s and late ID, CONDSTORE advertised = %v, want %v: %q", tt.cmd, got, tt.wantModSeq, caps)
+			}
+			if strings.Contains(capList, " QRESYNC ") {
+				t.Fatalf("late ID must withdraw unenabled QRESYNC: %q", caps)
+			}
 
 			// A FETCH caused by this session's own STORE.
 			untagged, _ = c.do(`STORE 1 +FLAGS (\Seen)`)
