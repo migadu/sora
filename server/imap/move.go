@@ -43,6 +43,19 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 			Text: "No mailbox selected",
 		}
 	}
+	// RFC 6851 §3.3: MOVE has the effect of COPY, STORE +FLAGS.SILENT \Deleted and
+	// UID EXPUNGE, so a read-only selection refuses it as it refuses STORE and EXPUNGE
+	// (RFC 9051 §6.3.3: after EXAMINE "No changes to the permanent state of the
+	// mailbox ... are permitted").
+	if s.selectedReadOnly.Load() {
+		release()
+		s.DebugLog("move rejected: mailbox selected read-only")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCode("READ-ONLY"),
+			Text: "Mailbox is read-only",
+		}
+	}
 	selectedMailbox = s.selectedMailbox
 	selectedMailboxID = selectedMailbox.ID
 

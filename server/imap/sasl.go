@@ -222,12 +222,10 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					return nil
 				}
 
-				// Answer exactly like any other bad credential, at the same cost: a
-				// distinct reply, or a quicker one, is reachable with only the master
-				// USERNAME and confirms it to an attacker (see login.go). Reason kept for
-				// the operator at WARN.
-				s.WarnLog("master username authentication failed (invalid master password)")
-				return s.refuseLikeWrongPassword(s.ctx, username, password, netConn, proxyInfo, authKey)
+				// Any other password is the base address's own login, answered by regular
+				// authentication exactly as under any other suffix (see login.go, #801,
+				// #949). Already gated above, under the same authKey.
+				return s.login(s.ctx, username, password, identity, false)
 			}
 
 			// 2. Check for Master SASL Authentication (traditional SASL proxy authentication)
@@ -435,8 +433,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 // check would be answered one verification sooner and confirm what made it one. Used
 // for a refused master SASL impersonation (#846), which must not answer
 // AUTHORIZATIONFAILED when username names an account whose own password is the master
-// SASL password, and for a wrong password in the master username form (#801), which
-// must not log in even when it is the account's own password.
+// SASL password.
 func (s *IMAPSession) refuseLikeWrongPassword(ctx context.Context, username, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) error {
 	if authnAddr, err := server.NewAddress(username); err == nil {
 		if _, authErr := s.server.Authenticate(ctx, authnAddr.BaseAddress(), password); authErr != nil {

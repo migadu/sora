@@ -104,13 +104,17 @@ func TestIMAP_AppendInternalDate_CommandDateTakesPrecedence(t *testing.T) {
 	}
 }
 
-// TestIMAP_AppendInternalDate_FallsBackToMessageDate verifies that when the
-// APPEND command does NOT specify a date-time, the message's Date: header is
-// used as INTERNALDATE.
+// TestIMAP_AppendInternalDate_NoCommandDateUsesCurrentTime verifies that an
+// APPEND without a date-time gets the current time as INTERNALDATE, even when
+// the message carries an old Date: header, and that the Date: header is still
+// reported as the ENVELOPE date.
 //
-// This is the "no regression" half of the InternalDate tests — the fallback
-// path must continue to work after the precedence fix.
-func TestIMAP_AppendInternalDate_FallsBackToMessageDate(t *testing.T) {
+// RFC 9051 §6.3.12 (same text in RFC 3501 §6.3.11):
+//
+//	"If a date-time is specified, the internal date SHOULD be set in the
+//	 resulting message; otherwise, the internal date of the resulting message
+//	 is set to the current date and time by default."
+func TestIMAP_AppendInternalDate_NoCommandDateUsesCurrentTime(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	server, account := common.SetupIMAPServer(t)
@@ -129,15 +133,16 @@ func TestIMAP_AppendInternalDate_FallsBackToMessageDate(t *testing.T) {
 		t.Fatalf("SELECT INBOX failed: %v", err)
 	}
 
-	// Message has a specific Date: header; no APPEND date-time is provided.
-	msgDate := time.Date(2023, 6, 15, 12, 0, 0, 0, time.UTC).Truncate(time.Second)
+	// An old Date: header (a restored or re-filed copy); no APPEND date-time.
+	msgDate := time.Date(2020, 1, 2, 11, 4, 5, 0, time.UTC)
 	msg := "From: sender@example.com\r\n" +
 		"To: " + account.Email + "\r\n" +
-		"Subject: InternalDate Fallback Test\r\n" +
-		"Date: " + msgDate.Format("Mon, 02 Jan 2006 15:04:05 -0700") + "\r\n" +
+		"Subject: InternalDate Current Time Test\r\n" +
+		"Date: Thu, 02 Jan 2020 03:04:05 -0800\r\n" +
 		"\r\n" +
-		"Fallback to Date: header when no APPEND date is specified."
+		"No APPEND date-time: INTERNALDATE is the time of the APPEND.\r\n"
 
+	before := time.Now().Truncate(time.Second)
 	appendCmd := c.Append("INBOX", int64(len(msg)), nil) // no AppendOptions.Time
 	if _, err := appendCmd.Write([]byte(msg)); err != nil {
 		t.Fatalf("APPEND write failed: %v", err)
@@ -149,27 +154,27 @@ func TestIMAP_AppendInternalDate_FallsBackToMessageDate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("APPEND failed: %v", err)
 	}
+	after := time.Now().Add(time.Second)
 
 	fetchResults, err := c.Fetch(
 		imap.UIDSetNum(appendData.UID),
-		&imap.FetchOptions{InternalDate: true, UID: true},
+		&imap.FetchOptions{InternalDate: true, Envelope: true, UID: true},
 	).Collect()
 	if err != nil {
 		t.Fatalf("FETCH failed: %v", err)
 	}
-	if len(fetchResults) == 0 {
-		t.Fatal("FETCH returned no results")
+	if len(fetchResults) != 1 || fetchResults[0].Envelope == nil {
+		t.Fatalf("FETCH returned %d results (envelope present: %v), want one with an envelope",
+			len(fetchResults), len(fetchResults) == 1 && fetchResults[0].Envelope != nil)
 	}
 
-	internalDate := fetchResults[0].InternalDate.UTC().Truncate(time.Second)
-	t.Logf("Message Date: header: %v", msgDate)
-	t.Logf("FETCH INTERNALDATE  : %v", internalDate)
-
-	if !internalDate.Equal(msgDate) {
-		t.Errorf("FAIL: when no APPEND date is given, INTERNALDATE should be %v (from Date: header), got %v",
-			msgDate, internalDate)
-	} else {
-		t.Logf("PASS: INTERNALDATE correctly falls back to Date: header %v", msgDate)
+	internalDate := fetchResults[0].InternalDate.UTC()
+	if internalDate.Before(before) || internalDate.After(after) {
+		t.Errorf("INTERNALDATE = %v, want the time of the APPEND (within [%v, %v]); Date: header is %v",
+			internalDate, before.UTC(), after.UTC(), msgDate)
+	}
+	if envDate := fetchResults[0].Envelope.Date.UTC(); !envDate.Equal(msgDate) {
+		t.Errorf("ENVELOPE date = %v, want the Date: header %v", envDate, msgDate)
 	}
 }
 

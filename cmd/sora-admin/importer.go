@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -32,6 +31,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/pkg/sqlitefile"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/sieveengine"
 	_ "modernc.org/sqlite"
@@ -177,19 +177,6 @@ type Importer struct {
 // database is waited for up to 5 seconds.
 const maildirCacheParams = "_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL"
 
-// sqliteFileDSN returns the DSN that opens the SQLite database at path with params: a
-// file: URI of the absolute path. modernc.org/sqlite cuts any other DSN at its first
-// '?' and reads the rest as parameters, so a plain path with a '?' in it would open a
-// different file. In the URI the path is percent-encoded and SQLite decodes it, so a
-// '?', '#' or '%' in it stays part of the file name.
-func sqliteFileDSN(path, params string) (string, error) {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve database path %s: %w", path, err)
-	}
-	return (&url.URL{Scheme: "file", Path: absPath, RawQuery: params}).String(), nil
-}
-
 // NewImporter creates a new Importer instance.
 func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ImporterOptions) (*Importer, error) {
 	// Always create SQLite database in the maildir path to persist maildir state
@@ -201,7 +188,7 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		logger.Info("Incremental mode disabled - will read all files (database still created for tracking)", "path", dbPath)
 	}
 
-	dsn, err := sqliteFileDSN(dbPath, maildirCacheParams)
+	dsn, err := sqlitefile.DSN(dbPath, maildirCacheParams)
 	if err != nil {
 		return nil, err
 	}
@@ -1035,19 +1022,32 @@ func (i *Importer) printSummary() error {
 	return nil
 }
 
-// errMessageTooLarge is the scan's refusal of a message larger than the import takes.
+// errMessageTooLarge is the refusal, by the scan or the upload, of a message larger
+// than the import takes.
 var errMessageTooLarge = errors.New("message too large")
+
+// importSizeLimit is the largest message the import takes: maxSize bytes, capped at
+// consts.MaxStoredMessageSize (also the default when maxSize is 0 or less), and, for
+// a compressed file, at maxDecompressedSize.
+func importSizeLimit(maxSize int64, compressed bool) int64 {
+	limit := maxSize
+	if limit <= 0 || limit > consts.MaxStoredMessageSize {
+		limit = consts.MaxStoredMessageSize
+	}
+	if compressed && limit > maxDecompressedSize {
+		limit = maxDecompressedSize
+	}
+	return limit
+}
 
 // hashFile returns the content hash (helpers.HashContent) and size of the message in a
 // maildir file, decompressing it the way the upload does. It streams the file, so the
 // scan never holds a whole message in memory.
 //
-// It reads no more of the message than the import takes: maxSize bytes, capped at
-// consts.MaxStoredMessageSize (also the default when maxSize is 0 or less), and, for
-// a compressed file, no more than the upload decompresses (maxDecompressedSize).
-// Past that it fails with errMessageTooLarge without reading the rest: a compressed file
-// of a few hundred bytes can expand to gigabytes, and hashing all of it only to refuse
-// it afterwards keeps a scan worker busy for as long as that takes.
+// It reads no more of the message than the import takes (importSizeLimit). Past that
+// it fails with errMessageTooLarge without reading the rest: a compressed file of a
+// few hundred bytes can expand to gigabytes, and hashing all of it only to refuse it
+// afterwards keeps a scan worker busy for as long as that takes.
 func hashFile(path string, maxSize int64) (string, int64, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -1061,13 +1061,7 @@ func hashFile(path string, maxSize int64) (string, int64, error) {
 	}
 	defer reader.Close()
 
-	limit := maxSize
-	if limit <= 0 || limit > consts.MaxStoredMessageSize {
-		limit = consts.MaxStoredMessageSize
-	}
-	if compressed && limit > maxDecompressedSize {
-		limit = maxDecompressedSize
-	}
+	limit := importSizeLimit(maxSize, compressed)
 	src := io.LimitReader(reader, limit+1)
 
 	hasher := helpers.NewContentHasher()
@@ -1135,11 +1129,22 @@ func (i *Importer) resolveMailboxName(path string) (string, error) {
 // non-ASCII names), trimmed, and special folders mapped. A name with TAB, CR or LF is
 // refused. Folders and the subscriptions file are both named through it, so a
 // subscription names the mailbox the folder's messages went to.
+//
+// Each level is decoded on its own, and one that is not valid modified UTF-7 keeps
+// its raw name. The levels above it still decode as the parent folders' own names
+// did, so the mailbox stays below them instead of below a raw-named copy of them.
 func importedFolderName(name string) (string, error) {
-	if decoded, err := helpers.DecodeModifiedUTF7(name); err != nil {
-		logger.Warn("Failed to decode Modified UTF-7 mailbox name, using raw name", "name", name, "error", err)
-	} else {
-		name = decoded
+	if strings.Contains(name, "&") {
+		delim := string(consts.MailboxDelimiter)
+		levels := strings.Split(name, delim)
+		for i, level := range levels {
+			if decoded, err := helpers.DecodeModifiedUTF7(level); err != nil {
+				logger.Warn("Failed to decode Modified UTF-7 mailbox name level, using raw level", "name", name, "mailbox_level", level, "error", err)
+			} else {
+				levels[i] = decoded
+			}
+		}
+		name = strings.Join(levels, delim)
 	}
 	if strings.ContainsAny(name, "\t\r\n") {
 		return "", fmt.Errorf("invalid characters in mailbox name %q", name)
@@ -1224,11 +1229,7 @@ func (i *Importer) validateMessage(size int64) error {
 	if size == 0 {
 		return errors.New("empty message")
 	}
-	limit := i.options.MaxMessageSize
-	if limit <= 0 || limit > consts.MaxStoredMessageSize {
-		limit = consts.MaxStoredMessageSize
-	}
-	if size > limit {
+	if limit := importSizeLimit(i.options.MaxMessageSize, false); size > limit {
 		return fmt.Errorf("message too large: %d bytes (max: %d)", size, limit)
 	}
 	return nil
@@ -1808,26 +1809,51 @@ func (z *maildirZstdReader) Close() error {
 // compression bomb cannot exhaust memory in the upload or keep the scan busy.
 const maxDecompressedSize = 256 << 20 // 256 MiB
 
-// decompressIfNeeded returns the message stored in a maildir file's content (see
-// maildirContentReader): the content itself, or its decompression.
-func decompressIfNeeded(content []byte) ([]byte, error) {
-	reader, compressed, err := maildirContentReader(bytes.NewReader(content))
+// readMessage returns the message in a maildir file, decompressed as hashFile reads it
+// (maildirContentReader). Like hashFile it reads no more of the message than the import
+// takes (importSizeLimit), and past that fails with errMessageTooLarge without reading
+// the rest: the file may have grown since the scan sized it, or this run's scan may not
+// have visited it (--paths-file), so only what is read now can decide, and refusing it
+// must not cost memory in proportion to the file.
+func readMessage(path string, maxSize int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	reader, compressed, err := maildirContentReader(file)
 	if err != nil {
 		return nil, err
 	}
 	defer reader.Close()
-	if !compressed {
-		return content, nil
-	}
 
-	decompressed, err := io.ReadAll(io.LimitReader(reader, maxDecompressedSize+1))
+	limit := importSizeLimit(maxSize, compressed)
+	src := io.LimitReader(reader, limit+1)
+	var content []byte
+	if fi, serr := file.Stat(); serr == nil && !compressed {
+		// An uncompressed file is the message: allocate it at once, as os.ReadFile
+		// does, with room for the read that sees the end of it (bytes.MinRead). One
+		// above the limit is read to the byte past it, and is allocated no more.
+		buf := bytes.NewBuffer(make([]byte, 0, int(min(fi.Size(), limit+1))+bytes.MinRead))
+		_, err = buf.ReadFrom(src)
+		content = buf.Bytes()
+	} else {
+		// A decompressed size is known only once read. The batch holds the message
+		// until the insert, and io.ReadAll leaves far less spare capacity than a
+		// bytes.Buffer, which doubles.
+		content, err = io.ReadAll(src)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to decompress content: %w", err)
+		if compressed {
+			return nil, fmt.Errorf("failed to decompress content: %w", err)
+		}
+		return nil, err
 	}
-	if len(decompressed) > maxDecompressedSize {
-		return nil, fmt.Errorf("decompressed content exceeds %d bytes", maxDecompressedSize)
+	if int64(len(content)) > limit {
+		return nil, fmt.Errorf("%w: more than %d bytes", errMessageTooLarge, limit)
 	}
-	return decompressed, nil
+	return content, nil
 }
 
 // parseMessageMetadata extracts metadata from message content
@@ -1851,17 +1877,6 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 	}
 	if len(references) == 0 {
 		references = nil
-	}
-
-	// If the Date header is missing or invalid, fall back to the file's modification time.
-	// This is a more accurate timestamp than time.Now().
-	if sentDate.IsZero() {
-		if info, statErr := os.Stat(path); statErr == nil {
-			sentDate = info.ModTime()
-		} else {
-			// As a last resort, use the current time.
-			sentDate = time.Now()
-		}
 	}
 
 	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(content))
@@ -1956,43 +1971,33 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 			default:
 			}
 
-			// Read file
-			content, err := os.ReadFile(msg.path)
-			if err != nil {
-				// If file not found, it might have been renamed (e.g. flags changed)
-				// Try to find it by unique ID prefix
-				if os.IsNotExist(err) {
-					if newPath, found := i.findMovedFile(msg.path); found {
-						logger.Info("File moved, found at new path", "old", msg.path, "new", newPath)
-						msg.path = newPath
-						msg.filename = filepath.Base(newPath)
-						content, err = os.ReadFile(newPath)
-					}
-				}
-
-				if err != nil {
-					logger.Warn("Failed to read file", "path", msg.path, "error", err)
-					i.recordFailedPath(msg.path, fmt.Sprintf("read error: %v", err))
-					atomic.AddInt64(&i.failedMessages, 1)
-					return
-				}
-			}
-
-			// Decompress if Dovecot stored the file compressed
-			content, err = decompressIfNeeded(content)
-			if err != nil {
-				logger.Warn("Failed to decompress file", "path", msg.path, "error", err)
-				i.recordFailedPath(msg.path, fmt.Sprintf("decompression error: %v", err))
-				atomic.AddInt64(&i.failedMessages, 1)
-				return
-			}
-
+			// Read the message, decompressed if Dovecot stored the file compressed.
 			// The scan's size check does not cover these bytes: the row may be one an
 			// earlier run cached under a higher limit, for a file this scan did not
 			// visit (--paths-file), and the file may have changed since the scan. The
 			// cached size may be stale for the same reasons, so the check is on what
-			// would be stored.
-			if err := i.validateMessage(int64(len(content))); err != nil {
+			// would be stored, which readMessage reads no more of than the limit.
+			content, err := readMessage(msg.path, i.options.MaxMessageSize)
+			if os.IsNotExist(err) {
+				// If file not found, it might have been renamed (e.g. flags changed)
+				// Try to find it by unique ID prefix
+				if newPath, found := i.findMovedFile(msg.path); found {
+					logger.Info("File moved, found at new path", "old", msg.path, "new", newPath)
+					msg.path = newPath
+					msg.filename = filepath.Base(newPath)
+					content, err = readMessage(newPath, i.options.MaxMessageSize)
+				}
+			}
+			if err != nil && !errors.Is(err, errMessageTooLarge) {
+				logger.Warn("Failed to read file", "path", msg.path, "error", err)
+				i.recordFailedPath(msg.path, fmt.Sprintf("read error: %v", err))
+				atomic.AddInt64(&i.failedMessages, 1)
+				return
+			}
+			if err == nil {
+				err = i.validateMessage(int64(len(content)))
+			}
+			if err != nil {
 				logger.Warn("Invalid message", "path", msg.path, "error", err)
 				i.recordFailedPath(msg.path, fmt.Sprintf("invalid message: %v", err))
 				atomic.AddInt64(&i.failedMessages, 1)
@@ -2093,6 +2098,10 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 
 // insertBatchToDB inserts all uploaded messages in a batch
 // It groups messages by mailbox and uses the highly-optimized InsertMessagesFromImporterBatchWithRetry
+//
+// It returns an error only before it stores anything, or when the import is
+// interrupted (i.ctx cancelled): it then stops and returns the messages committed
+// before the interrupt along with the error, and leaves the rest uncounted.
 func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, error) {
 	// Get user info once
 	address, err := server.NewAddress(i.email)
@@ -2121,6 +2130,9 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 		// Get/create mailbox (cached)
 		mailbox, err := i.getOrCreateMailbox(i.ctx, user.AccountID(), up.msg.mailbox)
 		if err != nil {
+			if i.ctx.Err() != nil {
+				return nil, err // interrupted; nothing is stored yet
+			}
 			logger.Error("Failed to get or create mailbox", "mailbox", up.msg.mailbox, "error", err)
 			i.recordFailedPath(up.msg.path, fmt.Sprintf("mailbox error: %v", err))
 			atomic.AddInt64(&i.failedMessages, 1)
@@ -2173,6 +2185,11 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 
 			_, _, insertedHashesBatch, err := i.rdb.InsertMessagesFromImporterBatchWithRetry(i.ctx, opts)
 			if err != nil {
+				if i.ctx.Err() != nil {
+					// Interrupted: inserting the chunk message by message on the
+					// cancelled context would only fail each one.
+					return successHashes, err
+				}
 				{
 					// The batch failed as a whole — a unique violation the dedup did not
 					// catch, or one message that could not be prepared (the batch refuses
@@ -2184,6 +2201,9 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 					for _, gm := range chunk {
 						_, _, indErr := i.rdb.InsertMessageFromImporterWithRetry(i.ctx, gm.opt)
 						if indErr != nil {
+							if i.ctx.Err() != nil {
+								return successHashes, indErr // interrupted
+							}
 							if errors.Is(indErr, consts.ErrUIDConflict) {
 								// The preserved UID is already taken in the target mailbox: the
 								// message was NOT stored. A "skip" would hide a lost message.
@@ -2251,6 +2271,12 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 	// Get the underlying database for direct access to InsertMessageFromImporter
 	database := i.rdb.GetOperationalDatabase()
 
+	// Stage per-message UID conflicts and dedup skips until tx.Commit and
+	// markBatchInSQLite succeed: if the batch aborts, processBatch records and
+	// counts the entire uploaded slice as failed.
+	var uidConflicts []failedImport
+	var skipped int64
+
 	// Track mailbox IDs for rollback compensation
 	var successList []struct {
 		hash      string
@@ -2295,13 +2321,15 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 				// was NOT stored. Report it as failed (never as a dedup skip) and go on
 				// with the batch.
 				logger.Error("Preserved UID already in use, message not imported", "path", up.msg.path, "hash", up.msg.hash)
-				i.recordFailedPath(up.msg.path, "preserved UID already in use in the target mailbox (re-run without --preserve-uids to import it)")
-				atomic.AddInt64(&i.failedMessages, 1)
+				uidConflicts = append(uidConflicts, failedImport{
+					path:   up.msg.path,
+					reason: "preserved UID already in use in the target mailbox (re-run without --preserve-uids to import it)",
+				})
 				continue
 			}
 			if errors.Is(err, consts.ErrDBUniqueViolation) {
 				// Message already exists - skip but continue processing batch
-				atomic.AddInt64(&i.skippedMessages, 1)
+				skipped++
 				continue
 			}
 			// Non-recoverable error - rollback entire batch (defer handles this)
@@ -2352,6 +2380,16 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 		// Compensation succeeded - messages removed from PostgreSQL
 		logger.Info("Rollback compensation succeeded - batch reverted", "batch_size", len(successHashes))
 		return nil, fmt.Errorf("failed to update SQLite cache (batch reverted): %w", err)
+	}
+
+	for _, f := range uidConflicts {
+		i.recordFailedPath(f.path, f.reason)
+	}
+	if len(uidConflicts) > 0 {
+		atomic.AddInt64(&i.failedMessages, int64(len(uidConflicts)))
+	}
+	if skipped > 0 {
+		atomic.AddInt64(&i.skippedMessages, skipped)
 	}
 
 	return successHashes, nil
@@ -2491,10 +2529,17 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 
 	logger.Info("Upload phase complete", "uploaded", len(uploaded), "batch_size", len(batch))
 
+	// An interrupt (SIGINT/SIGTERM cancel i.ctx) stops the batch before its insert
+	// phase, whose database calls would only fail on the cancelled context. Uploads
+	// that saw it returned without counting their message, and none of the batch is
+	// stored yet: what was not counted stays pending for the next run.
+	if err := i.ctx.Err(); err != nil {
+		logger.Info("Import interrupted, batch left for the next run", "uploaded", len(uploaded), "batch_size", len(batch))
+		return err
+	}
+
 	if len(uploaded) == 0 {
-		// uploadBatchToS3 already counted and recorded each message it dropped. The
-		// others were skipped by a cancellation, which importMessages reports: they
-		// were never attempted, so they are not failures.
+		// uploadBatchToS3 already counted and recorded each message it dropped.
 		logger.Warn("No message in the batch was uploaded", "batch_size", len(batch))
 		return nil
 	}
@@ -2515,9 +2560,9 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 		// Need to update SQLite after since each message commits individually
 		logger.Info("Using individual transaction mode")
 		successHashes, err = i.insertBatchToDB(uploaded)
-		if err != nil {
-			// insertBatchToDB fails only before it stores anything (address or
-			// account lookup), so none of the batch was imported.
+		if err != nil && i.ctx.Err() == nil {
+			// Unless interrupted, insertBatchToDB fails only before it stores
+			// anything (address or account lookup), so none of the batch was imported.
 			logger.Error("DB inserts failed", "error", err)
 			for _, up := range uploaded {
 				i.recordFailedPath(up.msg.path, fmt.Sprintf("db insert error: %v", err))
@@ -2526,6 +2571,8 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 			return err
 		}
 
+		// After an interrupt err is set, and successHashes holds the messages
+		// committed before it: they are marked like any others.
 		logger.Info("DB inserts complete, marking in SQLite", "count", len(successHashes))
 
 		// Phase 3: Mark successful messages in SQLite cache
@@ -2541,6 +2588,15 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 	}
 
 	if err != nil {
+		if i.ctx.Err() != nil {
+			// Interrupted: the database calls failed on the cancelled context. What
+			// the batch did not store is not a failure: its cache rows stay unmarked,
+			// pending for the next run, and importMessages reports the interruption.
+			atomic.AddInt64(&i.importedMessages, int64(len(successHashes)))
+			logger.Info("Import interrupted, rest of the batch left for the next run",
+				"imported", len(successHashes), "batch_size", len(batch))
+			return err
+		}
 		logger.Error("Batch processing failed", "error", err)
 		// Everything in uploaded that wasn't successfully inserted is already tracked if individual mode
 		// Let's ensure BatchTransactionMode logs all if it aborted
@@ -2806,7 +2862,8 @@ func (i *Importer) keywordsForMessagePath(path string) map[int]string {
 // filename (what Dovecot and the exporter here write) and, failing that, as the file's
 // modification time. The Date: header (sentDate) is the sender's clock, not arrival;
 // using it as INTERNALDATE altered the arrival time of every imported message and
-// re-stamped mtimes on export.
+// re-stamped mtimes on export. sentDate is zero for a message without a Date: header
+// that parses; it is stored with its INTERNALDATE as the sent date.
 func maildirInternalDate(filename, path string, sentDate time.Time) time.Time {
 	base := filepath.Base(filename)
 	if dot := strings.IndexByte(base, '.'); dot > 0 {
@@ -2816,6 +2873,9 @@ func maildirInternalDate(filename, path string, sentDate time.Time) time.Time {
 	}
 	if info, err := os.Stat(path); err == nil && !info.ModTime().IsZero() {
 		return info.ModTime()
+	}
+	if sentDate.IsZero() {
+		return time.Now()
 	}
 	return sentDate
 }

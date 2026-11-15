@@ -266,6 +266,11 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// bucket by varying the target, leaving the proxy's tenant-wide password unmetered.
 	// Decided here, from the raw identity, so check site and record sites cannot drift.
 	authKey := server.AuthRateLimitKeyWithMaster(username, s.server.masterUsername)
+	// A success is recorded under the master credential's key only for a master
+	// login. The master form with any other password is the base address's own login
+	// (#949), and its success, recorded under the master credential's key, would
+	// clear that key's failed guesses at the master password.
+	successKey := server.AuthSuccessRateLimitKey(username, password, s.server.masterUsername, s.server.masterPassword)
 
 	// Use configured remotelookup timeout instead of hardcoded value
 	authTimeout := s.server.connManager.GetRemoteLookupTimeout()
@@ -375,7 +380,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					s.routingInfo = proxy.RouteFromCache(cached)
 
 					// Track successful authentication using resolved email
-					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
+					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
 					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "success").Inc()
 					if addr, err := server.NewAddress(s.username); err == nil {
 						metrics.TrackDomainConnection("managesieve_proxy", addr.Domain())
@@ -393,8 +398,10 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 
 					return nil // Authentication complete from cache
 				} else {
-					// Different password on positive cache - revalidate if old enough
-					if cached.IsOld(s.server.positiveRevalidationWindow) {
+					// Different password on positive cache - revalidate if old enough, or if
+					// the two passwords are the master username form's two credentials (#949)
+					if cached.IsOld(s.server.positiveRevalidationWindow) ||
+						proxy.MasterFormOtherCredential(username, password, cached.PasswordDigest, s.server.masterUsername, s.server.masterPassword) {
 						s.DebugLog("cache hit - positive entry with different password (old enough to revalidate)", "username", username, "age", time.Since(cached.CreatedAt))
 						metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "revalidate_positive_different_pw").Inc()
 						// The database or the remote lookup decides this password, so drop
@@ -431,25 +438,22 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// Otherwise: treat as token, send full username (including @SUFFIX) to remotelookup
 	var usernameForRemoteLookup string
 	var masterAuthValidated bool
-	// The master username form with a wrong master password: refused whatever the
-	// credential check below says, even for the account's own password (#801).
-	var wrongMasterPassword bool
 
 	if parseErr == nil && parsedAddr.HasSuffix() {
 		// Has suffix - check if it matches configured master username
 		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), s.server.masterUsername) {
 			// Suffix matches master username - validate master password locally
 			if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, s.server.masterPassword) {
-				// Wrong master password. Refused like a wrong password under any other
-				// suffix, and only after the same work: the regular credential path below
-				// (lookup, password verification, lookup-cache entry). An
-				// immediate refusal is answered one verification sooner, which confirms
-				// a guessed master username (#801).
-				s.DebugLog("wrong master password, refusing after the credential check of the base address", "address", parsedAddr.BaseAddress())
-				// A refused master guess must query the same submitted name as
-				// another suffix. The service may route or refuse tokens differently.
+				// Not the master password: the base address's own login, checked below
+				// exactly as under any other suffix, with the same lookup, password
+				// verification and lookup-cache entry, and under the same submitted name
+				// (the lookup service may route or refuse tokens differently). A distinct
+				// reply, a quicker one (#801), or a refusal of the account's own password
+				// (#949) confirms a guessed master username. Its failure is still recorded
+				// under authKey, the master credential's key; only a success is the
+				// account's (successKey).
+				s.DebugLog("master username without the master password, checked like another suffix", "address", parsedAddr.BaseAddress())
 				usernameForRemoteLookup = username
-				wrongMasterPassword = true
 			} else {
 				// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
 				s.DebugLog("master username authentication successful, using base address for routing", "address", parsedAddr.BaseAddress())
@@ -490,10 +494,6 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			s.DebugLog("remotelookup authentication", "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
 		} else {
 			s.DebugLog("remotelookup authentication", "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
-		}
-		if err == nil && authResult == proxy.AuthSuccess && wrongMasterPassword {
-			// The account's own password, not the master password: refused as a wrong one.
-			authResult = proxy.AuthFailed
 		}
 
 		if err != nil {
@@ -554,7 +554,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				}
 
 				// Use resolvedEmail for rate limiting (not submitted username with token)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "success").Inc()
 
 				// For metrics, use resolvedEmail for accurate tracking
@@ -688,10 +688,6 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		s.DebugLog("Authenticating via main DB")
 		// Use base address (without +detail) for authentication
 		accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
-		if err == nil && wrongMasterPassword {
-			// The account's own password, not the master password: refused as a wrong one.
-			err = db.ErrInvalidCredentials
-		}
 		if err != nil {
 			// Check if error is due to session context cancellation (server shutdown)
 			// Note: Must check s.ctx.Err(), not just the query error, because the query context
@@ -747,7 +743,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		AccountID: accountID,
 	}
 	s.username = address.BaseAddress() // Set username for backend impersonation (without +detail)
-	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
+	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
 	metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "success").Inc()
 	metrics.TrackDomainConnection("managesieve_proxy", address.Domain())
 	// The base address, the name a lookup-cache hit replaying this login counts the user under.
@@ -902,14 +898,14 @@ func (s *Session) connectToBackendAndAuth() error {
 		}
 		backendWriter.Flush()
 
-		// Read STARTTLS response (bounded)
-		response, err := server.ReadBoundedLine(backendReader, 8192)
+		// Read the STARTTLS response (bounded), with any literal its text is sent as
+		response, err := readBackendRecord(backendReader)
 		if err != nil {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: failed to read STARTTLS response: %w", server.ErrBackendConnectionFailed, err)
 		}
 
-		if !strings.HasPrefix(strings.TrimSpace(response), "OK") {
+		if backendStatus(response) != "OK" {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: backend STARTTLS failed: %s", server.ErrBackendConnectionFailed, strings.TrimSpace(response))
 		}
@@ -953,40 +949,56 @@ func (s *Session) connectToBackendAndAuth() error {
 	return s.authenticateToBackend()
 }
 
+// backendStatus returns the status of a backend response line: "OK", "NO" or "BYE", or
+// "" when the line is none of them. RFC 5804 section 4: response-ok = "OK" [SP "("
+// resp-code ")"] [SP string] CRLF, response-nobye = ("NO" / "BYE") likewise, and
+// "Implementations MUST accept these strings in a case-insensitive fashion". The atom
+// begins at column 0 and ends at SP or CRLF, and the length check keeps the folding
+// ASCII-only so a multi-byte fold-equivalent such as U+212A (KELVIN SIGN) cannot match.
+func backendStatus(line string) string {
+	atom, _, _ := strings.Cut(strings.TrimRight(line, "\r\n"), " ")
+	for _, status := range []string{"OK", "NO", "BYE"} {
+		if len(atom) == len(status) && strings.EqualFold(atom, status) {
+			return status
+		}
+	}
+	return ""
+}
+
 // readBackendCapabilities reads a capability list from the backend (its greeting, or the
 // list it re-issues after STARTTLS) up to the response that ends it: RFC 5804 section 4,
 // response-capability = *(single-capability) response-oknobye. A capability name is a
-// quoted or literal string, so a record whose first atom is OK, NO or BYE (case-insensitive,
-// section 4) is that response. Literal data must be consumed before another record's
-// status is inspected. NO or BYE is the backend refusing the connection (a sora
-// backend over its max_connections_per_ip answers NO (TRYLATER)): it ends the read at once
-// with the backend's line instead of being read past until EOF or the read deadline.
-// The argument what names the list in a read error.
+// quoted or literal string, so a record with a backendStatus is that response. Literal
+// data must be consumed before another record's status is inspected. NO or BYE is the
+// backend refusing the connection (a sora backend over its max_connections_per_ip answers
+// NO (TRYLATER)): it ends the read at once with the backend's line instead of being read
+// past until EOF or the read deadline. The argument what names the list in a read error.
 func (s *Session) readBackendCapabilities(r *bufio.Reader, what string) error {
 	for {
 		// Bounded: a misbehaving backend must not be able to grow the buffer
 		// without limit with a newline-less stream inside the deadline window.
-		line, err := readBackendCapabilityRecord(r)
+		line, err := readBackendRecord(r)
 		if err != nil {
 			return fmt.Errorf("%w: failed to read backend %s: %w", server.ErrBackendConnectionFailed, what, err)
 		}
-		line = strings.TrimSpace(line)
-		status, _, _ := strings.Cut(line, " ")
-		switch {
-		case strings.EqualFold(status, "OK"):
+		switch backendStatus(line) {
+		case "OK":
 			return nil
-		case strings.EqualFold(status, "NO"), strings.EqualFold(status, "BYE"):
+		case "NO", "BYE":
+			line = strings.TrimSpace(line)
 			s.WarnLog("backend refused the connection", "backend", s.serverAddr, "response", line)
 			return fmt.Errorf("%w: backend refused the connection: %s", server.ErrBackendConnectionFailed, line)
 		}
 	}
 }
 
-// readBackendCapabilityRecord returns the first physical line after consuming a
-// whole capability or terminal response, including server literals. Literal
-// contents may contain CRLF and status words; none begin a new response. Keep the
-// existing 8 KiB bound across the complete record, including literal contents.
-func readBackendCapabilityRecord(r *bufio.Reader) (string, error) {
+// readBackendRecord returns the first physical line after consuming a whole
+// capability line or response, including server literals: a capability's value and
+// the text of an OK, NO or BYE are strings, which may be literal-s2c (RFC 5804
+// section 4). Literal contents may contain CRLF and status words; none begin a new
+// response. Keep the existing 8 KiB bound across the complete record, including
+// literal contents.
+func readBackendRecord(r *bufio.Reader) (string, error) {
 	remaining := 8192
 	line, err := server.ReadBoundedLine(r, remaining)
 	if err != nil {
@@ -1047,8 +1059,9 @@ func (s *Session) authenticateToBackend() error {
 	// Bound the backend auth-response read; cleared on success before the relay phase (M6).
 	s.backendConn.SetReadDeadline(time.Now().Add(backendHandshakeTimeout(s.server.connManager.GetConnectTimeout())))
 
-	// Read authentication response (bounded)
-	response, err := server.ReadBoundedLine(backendReader, 8192)
+	// Read the authentication response (bounded), with any literal its text is sent as:
+	// what is left in the reader goes to the client once the relay starts.
+	response, err := readBackendRecord(backendReader)
 	if err != nil {
 		// CRITICAL: Invalidate cache on backend authentication failure
 		s.invalidateLookupCache("backend auth read error")
@@ -1057,7 +1070,7 @@ func (s *Session) authenticateToBackend() error {
 
 	s.DebugLog("Backend auth response", "response", strings.TrimSpace(response))
 
-	if !strings.HasPrefix(response, "OK") {
+	if backendStatus(response) != "OK" {
 		// CRITICAL: Invalidate cache on backend authentication failure
 		// This ensures the next request does fresh remotelookup/database lookup
 		// to pick up backend changes (e.g., domain moved to different server)

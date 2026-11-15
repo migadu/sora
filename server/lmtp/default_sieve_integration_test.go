@@ -38,6 +38,12 @@ func (q *defaultVacationQueue) Enqueue(envelopeFrom, to, kind string, body []byt
 	return nil
 }
 
+// Hold records the message when it is committed, which is when the relay worker
+// would first see it.
+func (q *defaultVacationQueue) Hold(from, to, messageType string, messageBytes []byte) (func() error, func(), error) {
+	return func() error { return q.Enqueue(from, to, messageType, messageBytes) }, func() {}, nil
+}
+
 func (q *defaultVacationQueue) snapshot() []defaultVacationItem {
 	q.mu.Lock()
 	defer q.mu.Unlock()

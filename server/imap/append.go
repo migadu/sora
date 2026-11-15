@@ -239,21 +239,16 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		recipients = helpers.ExtractRecipients(messageContent.Header)
 	}
 
-	// RFC 3501 §6.3.11: when the APPEND command supplies an explicit date-time,
-	// that value MUST be used as INTERNALDATE regardless of the message's own
-	// Date: header.  The Date: header value is kept separately as SentDate.
-	internalDate := options.Time // APPEND command date-time (may be zero)
+	// RFC 9051 §6.3.12: "If a date-time is specified, the internal date SHOULD be
+	// set in the resulting message; otherwise, the internal date of the resulting
+	// message is set to the current date and time by default." The Date: header
+	// never sets INTERNALDATE; it is kept separately as SentDate.
+	internalDate := options.Time
 	if internalDate.IsZero() {
-		internalDate = sentDate // fall back to message's Date: header
+		internalDate = time.Now()
 	}
-	if internalDate.IsZero() {
-		internalDate = time.Now() // last-resort: current time
-	}
-	// sentDate is kept as-is (from the message's Date: header) for SentDate.
-	// If the message had no Date: header at all, align SentDate with internalDate.
-	if sentDate.IsZero() {
-		sentDate = internalDate
-	}
+	// sentDate stays zero without a Date: header that parses: the insert stores the
+	// INTERNALDATE as the sent date and the ENVELOPE reports the date as NIL.
 
 	// Extract body structure with panic recovery for malformed messages
 	// Attachment classification reads the raw message separately, so a
@@ -393,7 +388,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 			ContentHash:   contentHash,
 			MessageID:     messageID,
 			Flags:         appendFlags,
-			InternalDate:  internalDate, // RFC 3501 §6.3.11: APPEND date-time takes precedence
+			InternalDate:  internalDate, // RFC 9051 §6.3.12: APPEND date-time, else now
 			Size:          size,
 			Subject:       subject,
 			PlaintextBody: actualPlaintextBody,

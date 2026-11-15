@@ -265,3 +265,103 @@ func TestIMAP_SearchDateKeysDayBoundaries(t *testing.T) {
 		})
 	}
 }
+
+// TestIMAP_SearchSentKeysUseHeaderDay is the regression test for #867, the steps from the
+// issue. RFC 9051 §6.4.4 (same text in RFC 3501):
+//
+//	SENTON <date>  Messages whose [RFC5322] Date: header field (disregarding time and
+//	               timezone) is within the specified date.
+//
+// Disregarding the time and timezone of "Tue, 31 Dec 2024 20:00:00 -0800" leaves
+// 31 Dec 2024, although the instant is 1 Jan 2025 04:00 UTC. A COPY carries the zone with
+// the message.
+func TestIMAP_SearchSentKeysUseHeaderDay(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("login failed: %v", err)
+	}
+
+	body := "From: a@example.com\r\n" +
+		"To: b@example.com\r\n" +
+		"Subject: x\r\n" +
+		"Date: Tue, 31 Dec 2024 20:00:00 -0800\r\n" +
+		"\r\n" +
+		"x\r\n"
+	appendCmd := c.Append("INBOX", int64(len(body)), nil)
+	if _, err := appendCmd.Write([]byte(body)); err != nil {
+		t.Fatalf("APPEND write failed: %v", err)
+	}
+	if err := appendCmd.Close(); err != nil {
+		t.Fatalf("APPEND close failed: %v", err)
+	}
+	appended, err := appendCmd.Wait()
+	if err != nil {
+		t.Fatalf("APPEND failed: %v", err)
+	}
+
+	const copyMailbox = "SentDayCopy"
+	if err := c.Create(copyMailbox, nil).Wait(); err != nil {
+		t.Fatalf("CREATE failed: %v", err)
+	}
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("SELECT INBOX failed: %v", err)
+	}
+	copied, err := c.Copy(imap.UIDSetNum(appended.UID), copyMailbox).Wait()
+	if err != nil {
+		t.Fatalf("COPY failed: %v", err)
+	}
+	if len(copied.UIDMapping) != 1 {
+		t.Fatalf("COPY returned UID mapping %v, want one message", copied.UIDMapping)
+	}
+
+	day := func(y int, mo time.Month, d int) time.Time { return time.Date(y, mo, d, 0, 0, 0, 0, time.UTC) }
+	dec31, jan1 := day(2024, 12, 31), day(2025, 1, 1)
+	senton := func(d time.Time) imap.SearchCriteria {
+		return imap.SearchCriteria{SentSince: d, SentBefore: d.AddDate(0, 0, 1)}
+	}
+	tests := []struct {
+		key      string
+		criteria imap.SearchCriteria
+		found    bool
+	}{
+		{"SENTON 31-Dec-2024", senton(dec31), true},
+		{"SENTON 1-Jan-2025", senton(jan1), false},
+		{"SENTBEFORE 1-Jan-2025", imap.SearchCriteria{SentBefore: jan1}, true},
+		{"SENTSINCE 1-Jan-2025", imap.SearchCriteria{SentSince: jan1}, false},
+	}
+
+	for _, mailbox := range []struct {
+		name string
+		uid  imap.UID
+	}{{"INBOX", appended.UID}, {copyMailbox, copied.UIDMapping[0].Dest.Start}} {
+		if _, err := c.Select(mailbox.name, nil).Wait(); err != nil {
+			t.Fatalf("SELECT %s failed: %v", mailbox.name, err)
+		}
+		for _, tt := range tests {
+			t.Run(mailbox.name+" "+tt.key, func(t *testing.T) {
+				criteria := tt.criteria
+				data, err := c.UIDSearch(&criteria, nil).Wait()
+				if err != nil {
+					t.Fatalf("UID SEARCH %s failed: %v", tt.key, err)
+				}
+				var want []imap.UID
+				if tt.found {
+					want = []imap.UID{mailbox.uid}
+				}
+				if got := data.AllUIDs(); !slices.Equal(got, want) {
+					t.Errorf("UID SEARCH %s = %v, want %v", tt.key, got, want)
+				}
+			})
+		}
+	}
+}
