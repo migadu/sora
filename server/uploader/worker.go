@@ -1280,6 +1280,18 @@ func (w *UploadWorker) LinkStaged(contentHash string, srcAccountID, destAccountI
 	if err == nil {
 		w.stagedSizeChanged(dst, 0, fileSize(dst))
 	}
+	if err == nil || errors.Is(err, fs.ErrExist) {
+		// The caller inserts the destination's pending row after this returns, so until
+		// it commits the orphan sweep finds no row for dst. A link keeps the source
+		// inode's mtime and a dst already staged may be an old orphan: either can be past
+		// the grace period, and a sweep in that window would remove the file the row is
+		// about to name. Refresh it under the lock the sweep rechecks the mtime under, as
+		// a delivery does for a body it finds staged.
+		now := time.Now()
+		if terr := os.Chtimes(dst, now, now); terr != nil {
+			logger.Warn("Uploader: Failed to refresh staged file mtime", "path", dst, "error", terr)
+		}
+	}
 	pathMu.Unlock()
 	switch {
 	case err == nil:

@@ -2,6 +2,7 @@ package uploader
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -193,6 +195,48 @@ func TestLinkStagedOrStore(t *testing.T) {
 			}
 			require.Equal(t, want, atomic.LoadInt64(&w.currentStagingSize))
 			requireNoTemporaryFiles(t, filepath.Dir(dst))
+		})
+	}
+}
+
+// TestLinkStagedOutlivesTheOrphanSweep: the caller of LinkStaged inserts the destination's
+// pending row only after it returns, so until that commits the destination's staging file
+// is one the orphan sweep finds no row for. A hard link keeps the source inode's mtime
+// (an hour old for a body whose upload is stuck), and a destination already staged can be
+// an orphan an hour old; either way the grace period had already run out, and a sweep
+// in that window removed the file, leaving the owner's message with no body to upload.
+func TestLinkStagedOutlivesTheOrphanSweep(t *testing.T) {
+	old := time.Now().Add(-2 * time.Hour)
+	for _, tc := range []struct {
+		name      string
+		dstStaged bool // an orphan staged for the destination before the link
+	}{{"linked old source", false}, {"destination already staged", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			mockDB := new(mockUploaderDB)
+			w := &UploadWorker{rdb: mockDB, path: t.TempDir(), maxStagingSize: 1 << 20}
+			hash := stagingHash("d")
+			body := bytes.Repeat([]byte("y"), 300)
+
+			_, err := w.StoreLocally(hash, 1, body)
+			require.NoError(t, err)
+			mockDB.setPendingUpload(1, hash) // the source's upload is still queued
+			if tc.dstStaged {
+				_, err := w.StoreLocally(hash, 2, body)
+				require.NoError(t, err)
+			}
+			for _, accountID := range []int64{1, 2} {
+				if p := w.FilePath(hash, accountID); fileSize(p) > 0 {
+					require.NoError(t, os.Chtimes(p, old, old))
+				}
+			}
+
+			require.NoError(t, w.LinkStaged(hash, 1, 2))
+			// The destination's insert has not committed: the sweep sees no row for it.
+			require.NoError(t, w.cleanupOrphanedFiles(context.Background()))
+
+			got, err := os.ReadFile(w.FilePath(hash, 2))
+			require.NoError(t, err, "the destination's file must outlive a sweep that runs before its pending row commits")
+			require.Equal(t, body, got)
 		})
 	}
 }
