@@ -596,7 +596,7 @@ func (s *Session) handleConnection() {
 			}
 			// No recipient accepted: 503 (RFC 2033 section 4.2), answered here whether or
 			// not a backend is held. A held one lacks this transaction's MAIL until the
-			// first accepted recipient, or holds no transaction after RSET or DATA.
+			// first recipient is routed, or holds no transaction after RSET or DATA.
 			if s.acceptedRcpts == 0 {
 				s.sendResponse("503 5.5.1 Bad sequence of commands (no valid recipients)")
 				continue
