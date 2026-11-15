@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/stretchr/testify/require"
@@ -81,24 +82,20 @@ func TestRenameMailbox_SharedBoundaryConcurrentCreate(t *testing.T) {
 	if !finished {
 		renameErr = <-done
 	}
-	if renameErr != nil {
-		require.ErrorIs(t, renameErr, consts.ErrMailboxSharedBoundary)
-	}
-
-	// Whichever went first, no live mailbox of the account is on the other side of
-	// the boundary from its is_shared.
+	// The rename waits for the CREATE, on its lock of "Shared/Old" (issue #1298), and
+	// then renames "Shared/Old/New" with the rest of the subtree, which would carry a
+	// shared mailbox out of the namespace: it is refused, and nothing is renamed.
+	require.ErrorIs(t, renameErr, consts.ErrMailboxSharedBoundary)
+	require.NoError(t, txRename.Rollback(ctx))
 	rows, err := db.GetWritePool().Query(ctx,
 		`SELECT name, COALESCE(is_shared, FALSE) FROM mailboxes WHERE account_id = $1 AND deleted_at IS NULL`, accountID)
 	require.NoError(t, err)
-	defer rows.Close()
-	seen := 0
-	for rows.Next() {
+	got, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (string, error) {
 		var name string
 		var isShared bool
-		require.NoError(t, rows.Scan(&name, &isShared))
-		require.Equal(t, shared.InNamespace(name), isShared, "is_shared of %q (rename error: %v)", name, renameErr)
-		seen++
-	}
-	require.NoError(t, rows.Err())
-	require.GreaterOrEqual(t, seen, 3)
+		err := row.Scan(&name, &isShared)
+		return fmt.Sprintf("%s shared=%t", name, isShared), err
+	})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"Shared shared=false", "Shared/Old shared=false", "Shared/Old/New shared=true"}, got)
 }
