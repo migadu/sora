@@ -30,7 +30,8 @@ type Session struct {
 	listenerConn          net.Conn            // The accepted connection, never reassigned: its SoraConn carries the JA4 and username, which the TLS conn above it after STARTTLS does not
 	startTLSInProgress    bool                // Between the 220 to STARTTLS and the end of its handshake, under mu: the client reads neither plaintext nor, yet, TLS
 	greeted               bool                // The 220 greeting has been written, under mu: before it the implicit-TLS handshake may be pending, and a notice written then would wait for it
-	noticeMu              sync.Mutex          // Orders the greeting and the shutdown and kick notices with STARTTLS, without holding mu during socket writes
+	closingNoticeSent     bool                // A closing reply (421 notice or 221 QUIT) has claimed the client stream, under mu: nothing may be written after it
+	noticeMu              sync.Mutex          // Serializes all client wire writes so async 421 notices never interleave with or precede session replies
 	backendConn           net.Conn            // Reassigned under mu on backend connect/STARTTLS/error; shutdown/cancellation snapshot it under mu
 	backendRoute          *proxy.BackendRoute // Authorization of the held socket; survives per-recipient routing and transaction resets
 	backendReader         *bufio.Reader
@@ -51,6 +52,7 @@ type Session struct {
 	sessionID             string // Proxy session ID for end-to-end tracing (also forwarded to the backend)
 	clientAddr            string // Cached client address to avoid race with connection close
 	clientHelo            string // Client's announced LHLO name, forwarded to the backend via XCLIENT
+	lhloAccepted          bool   // An LHLO was accepted since the greeting or the last STARTTLS; MAIL needs one
 	releaseConn           func() // Connection limiter cleanup function
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
 	mu                    sync.Mutex
@@ -83,6 +85,12 @@ type Session struct {
 	// RSET or QUIT (see loseBackend).
 	acceptedRcpts int
 	txPoisoned    bool
+	// backendHasMail records that the held backend accepted the current transaction's
+	// MAIL FROM. The proxy answers MAIL itself; a backend is sent it with the first
+	// recipient that stays on it (connectToBackend, or the RCPT handler for a backend
+	// held from an earlier transaction). Cleared with the rest of the transaction state
+	// and when the backend is lost.
+	backendHasMail bool
 
 	// smtputf8 marks the current transaction as internationalized (RFC 6531): the MTA
 	// gave the SMTPUTF8 MAIL parameter, or sent a non-ASCII address without it. Cleared
@@ -181,15 +189,7 @@ func (s *Session) handleConnection() {
 	}
 
 	// Send greeting
-	s.noticeMu.Lock()
-	err := s.sendGreeting()
-	if err == nil {
-		s.mu.Lock()
-		s.greeted = true
-		s.mu.Unlock()
-	}
-	s.noticeMu.Unlock()
-	if err != nil {
+	if err := s.sendGreeting(); err != nil {
 		s.DebugLog("Failed to send greeting", "error", err)
 		return
 	}
@@ -255,39 +255,61 @@ func (s *Session) handleConnection() {
 				s.sendResponse("501 5.5.4 Syntax error in parameters")
 				continue
 			}
+			// An accepted LHLO resets the session as RSET would (RFC 5321 section 4.1.4;
+			// LHLO is LMTP's EHLO, RFC 2033 section 4.1).
+			s.restartSession()
 			// Remember the client's announced name so we can forward it to the backend via
 			// XCLIENT (HELO=...); without it the backend's Received: trace falls back to the
 			// proxy's own LHLO name. args[0] is a single tokenized field (no spaces/CRLF).
 			s.clientHelo = args[0]
-			s.sendResponse(fmt.Sprintf("250-%s", s.server.hostname))
+			s.lhloAccepted = true
+			var lhlo strings.Builder
+			fmt.Fprintf(&lhlo, "250-%s\r\n", s.server.hostname)
 
 			// Advertise STARTTLS if configured and not already using TLS
 			if s.server.tls && s.server.tlsUseStartTLS {
 				if _, ok := s.clientConn.(*tls.Conn); !ok {
-					s.sendResponse("250-STARTTLS")
+					lhlo.WriteString("250-STARTTLS\r\n")
 				}
 			}
 
-			s.sendResponse("250-PIPELINING")
+			lhlo.WriteString("250-PIPELINING\r\n")
 			if s.settings.maxMessageSize > 0 {
-				s.sendResponse(fmt.Sprintf("250-SIZE %d", s.settings.maxMessageSize))
+				fmt.Fprintf(&lhlo, "250-SIZE %d\r\n", s.settings.maxMessageSize)
 			}
-			s.sendResponse("250-ENHANCEDSTATUSCODES")
-			s.sendResponse("250-8BITMIME")
+			lhlo.WriteString("250-ENHANCEDSTATUSCODES\r\n")
+			lhlo.WriteString("250-8BITMIME\r\n")
 			// No DSN, as on the backend: neither issues a "delivered" DSN (RFC 3461
 			// §5.2.3), so the MTA keeps the duties of §5.2.2 (a "relayed" DSN for
 			// NOTIFY=SUCCESS). DSN parameters sent anyway are dropped, not forwarded.
-			s.sendResponse("250 SMTPUTF8")
+			lhlo.WriteString("250 SMTPUTF8\r\n")
+			if _, err := s.writeClientReply(lhlo.String(), false); err != nil {
+				return
+			}
 
 		case "MAIL":
+			// RFC 5321 section 4.1.1.1: "a client MUST issue HELO or EHLO before starting
+			// a mail transaction" (LHLO in LMTP). 503, a MAIL reply of section 4.3.2, with
+			// the backend's text.
+			if !s.lhloAccepted {
+				s.sendResponse("503 5.5.1 Please introduce yourself first.")
+				continue
+			}
+			// RFC 5321 section 4.1.1.2: MAIL is only permitted when no mail transaction
+			// is in progress; a nested MAIL gets 503 5.5.1 (matching go-smtp's reply)
+			// and leaves the open transaction and any held backend untouched.
+			if s.mailFromReceived {
+				s.sendResponse("503 5.5.1 Sender already specified")
+				continue
+			}
 			fromParam, found := findParameter(args, "FROM:")
 			if !found {
 				s.sendResponse("501 5.5.4 Syntax error in MAIL command (missing FROM)")
 				continue
 			}
 			// The limit advertised in LHLO is the proxy's own, checked here before the MTA
-			// sends the body (RFC 1870 section 6.1): no backend may be connected yet, and
-			// one that is may not take SIZE. A refused MAIL starts no transaction and
+			// sends the body (RFC 1870 section 6.1): no recipient is routed yet, so no
+			// backend is the transaction's. A refused MAIL starts no transaction and
 			// leaves the current one alone.
 			declaredSize, reply := mailSizeParameter(args, s.settings.maxMessageSize)
 			if reply != "" {
@@ -303,29 +325,11 @@ func (s *Session) handleConnection() {
 			s.mailFromReceived = true
 			s.smtputf8 = hasSMTPUTF8Param(args) || !server.IsASCII(sender)
 			s.declaredSize = declaredSize
-			// A held backend that has gone into maintenance is dropped before it is asked
-			// (past refuse_after it refuses every MAIL, and the MTA keeping this connection
-			// would get that for every message): the transaction has no recipient yet, and
-			// the first RCPT routes afresh. The RCPT check below covers maintenance that
-			// begins between the two.
-			if s.backendConn != nil && s.backendInMaintenance() {
-				s.InfoLog("dropping backend connection: backend in maintenance", "backend", s.serverAddr)
-				s.loseBackend()
-			}
-			// A connected backend must learn the new sender too (RFC 5321 §4.1.1.2: MAIL
-			// after a completed or reset transaction), or it would deliver with the
-			// previous transaction's Return-Path. Its answer is the answer; a backend
-			// lost here is harmless — the next RCPT reconnects and re-sends MAIL FROM.
-			if s.backendConn != nil {
-				if reply, ok := s.forwardSimpleCommand(s.backendMailFrom()); ok {
-					if !strings.HasPrefix(reply, "2") {
-						s.mailFromReceived = false
-					}
-					s.clientWriter.WriteString(reply)
-					s.clientWriter.Flush()
-					continue
-				}
-			}
+			// Answered here also when a backend is held from an earlier transaction: that
+			// backend need not be where any recipient of this one routes, so its answer
+			// must not decide the message (its 552 would have the MTA bounce it for every
+			// recipient, RFC 1870 section 6.2 (2)). It is sent the MAIL with the first
+			// recipient that stays on it (RCPT below), as a new backend is.
 			s.sendResponse("250 2.1.0 Ok")
 
 		case "RCPT":
@@ -347,9 +351,10 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			s.DebugLog("Extracted recipient address", "to", to)
-			// No MAIL in effect (none yet, RSET, or one the backend refused while a
-			// pipelining MTA sent on): a bad sequence, answered here, as a backend asked
-			// would answer 5xx, which reads as a routing inconsistency below.
+			// No MAIL in effect (none yet, RSET, the end of a transaction, or a MAIL the
+			// proxy refused while a pipelining MTA sent on): a bad sequence, answered here,
+			// as a backend asked would answer 5xx, which reads as a routing inconsistency
+			// below.
 			if !s.mailFromReceived {
 				s.sendResponse("503 5.5.1 Error: need MAIL command")
 				continue
@@ -444,9 +449,10 @@ func (s *Session) handleConnection() {
 
 			// A session keeps its backend across transactions (an MTA may reuse its LMTP
 			// connection), so one held to a backend that has since gone into maintenance
-			// is dropped here, at the first recipient of a transaction: the backend holds
-			// no accepted recipient yet, so nothing is poisoned, and the connect below
-			// routes afresh and re-sends MAIL FROM. Never later in a transaction.
+			// is dropped here, at the first recipient of a transaction and before it is
+			// sent the MAIL (past refuse_after it refuses every MAIL): the backend holds no
+			// accepted recipient yet, so nothing is poisoned, and the connect below routes
+			// afresh and sends MAIL FROM. Never later in a transaction.
 			if s.backendConn != nil && s.acceptedRcpts == 0 && s.backendInMaintenance() {
 				s.InfoLog("dropping backend connection: backend in maintenance", "backend", s.serverAddr)
 				s.loseBackend()
@@ -456,7 +462,7 @@ func (s *Session) handleConnection() {
 			// transaction has no accepted recipient, the recipient is routed as on a
 			// fresh connection: a held backend it does not route to is dropped (nothing
 			// is poisoned) and the connect below reaches the recipient's backend and
-			// re-sends MAIL FROM. Otherwise an MTA that keeps this connection would get
+			// sends MAIL FROM there. Otherwise an MTA that keeps this connection would get
 			// 451 for every transaction whose first recipient lives elsewhere. Once a
 			// recipient is accepted the held backend is the transaction's, and one that
 			// needs another backend gets 451, to be sent in a new transaction.
@@ -532,6 +538,23 @@ func (s *Session) handleConnection() {
 				}
 			}
 
+			// A held backend this recipient stays on is sent the transaction's MAIL now,
+			// as a new backend is on connecting: the MAIL initiates the transaction there
+			// (RFC 5321 §4.1.1.2). One that refuses it, or is lost, holds no recipient of
+			// this transaction: it is dropped and the connect below asks afresh, so the
+			// recipient is answered as on a new connection (552 5.3.4 for a refused size,
+			// RFC 1870 section 6.4).
+			if s.backendConn != nil && !s.backendHasMail {
+				if reply, ok := s.forwardSimpleCommand(s.backendMailFrom()); !ok {
+					s.DebugLog("held backend lost on MAIL FROM; reconnecting", "backend", s.serverAddr)
+				} else if !strings.HasPrefix(reply, "250") {
+					s.InfoLog("dropping backend connection: backend refused MAIL FROM", "backend", s.serverAddr, "response", strings.TrimSpace(reply))
+					s.loseBackend()
+				} else {
+					s.backendHasMail = true
+				}
+			}
+
 			// Connect to backend if not already connected
 			if s.backendConn == nil {
 				if err := s.connectToBackend(); err != nil {
@@ -571,8 +594,11 @@ func (s *Session) handleConnection() {
 				s.sendResponse("451 4.4.2 Backend connection lost, please retry the transaction")
 				continue
 			}
-			if s.backendConn == nil {
-				s.sendResponse("503 5.5.1 Bad sequence of commands (not connected to backend)")
+			// No recipient accepted: 503 (RFC 2033 section 4.2), answered here whether or
+			// not a backend is held. A held one lacks this transaction's MAIL until the
+			// first recipient is routed, or holds no transaction after RSET or DATA.
+			if s.acceptedRcpts == 0 {
+				s.sendResponse("503 5.5.1 Bad sequence of commands (no valid recipients)")
 				continue
 			}
 
@@ -583,8 +609,9 @@ func (s *Session) handleConnection() {
 				s.sendResponse("451 4.4.2 Backend error")
 				continue
 			}
-			s.clientWriter.WriteString(reply)
-			s.clientWriter.Flush()
+			if _, err := s.writeClientReply(reply, false); err != nil {
+				return
+			}
 			if !strings.HasPrefix(reply, "354") {
 				continue // backend declined DATA; its answer was relayed
 			}
@@ -627,14 +654,9 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			// Order a shutdown notice before the reply that makes the client expect
-			// TLS, so no plaintext 421 can follow that reply.
-			s.noticeMu.Lock()
-			s.mu.Lock()
-			s.startTLSInProgress = true
-			s.mu.Unlock()
-			s.noticeMu.Unlock()
-			if err := s.sendResponse("220 2.0.0 Ready to start TLS"); err != nil {
+			// Order a shutdown or kick notice before the reply that makes the client
+			// expect TLS, so no plaintext 421 can follow that reply.
+			if err := s.beginSTARTTLS(); err != nil {
 				s.DebugLog("Failed to send STARTTLS response", "error", err)
 				return
 			}
@@ -651,17 +673,27 @@ func (s *Session) handleConnection() {
 			}
 
 			// Update session with TLS connection
+			s.noticeMu.Lock()
 			s.mu.Lock()
 			s.clientConn = tlsConn
 			s.startTLSInProgress = false
 			s.clientReader = bufio.NewReader(tlsConn)
 			s.clientWriter = bufio.NewWriter(tlsConn)
+			closing := s.closingNoticeSent
 			s.mu.Unlock()
+			s.noticeMu.Unlock()
+			if closing {
+				return
+			}
 
 			s.DebugLog("STARTTLS negotiation successful")
 
-			// Client must send LHLO again after STARTTLS (RFC 3207)
-			// Continue to next iteration to wait for a new LHLO
+			// RFC 3207 section 4.2: the session is back in its initial state, and the
+			// server "MUST discard any knowledge obtained from the client, such as the
+			// argument to the EHLO command". MAIL needs a new LHLO.
+			s.restartSession()
+			s.clientHelo = ""
+			s.lhloAccepted = false
 
 		case "RSET":
 			s.resetTransaction()
@@ -701,23 +733,85 @@ func (s *Session) handleConnection() {
 	}
 }
 
-// sendGreeting sends the LMTP greeting.
+var errSessionClosing = errors.New("session closing notice already sent")
+
+// sendGreeting sends the LMTP greeting atomically under noticeMu and marks the
+// session greeted unless a closing notice already claimed the connection.
 func (s *Session) sendGreeting() error {
+	s.noticeMu.Lock()
+	defer s.noticeMu.Unlock()
+	s.mu.Lock()
+	if s.closingNoticeSent {
+		s.mu.Unlock()
+		return errSessionClosing
+	}
+	s.mu.Unlock()
+
 	greeting := fmt.Sprintf("220 %s LMTP Service Ready\r\n", s.server.hostname)
-	_, err := s.clientWriter.WriteString(greeting)
-	if err != nil {
+	if _, err := s.clientWriter.WriteString(greeting); err != nil {
+		return err
+	}
+	if err := s.clientWriter.Flush(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.greeted = true
+	s.mu.Unlock()
+	return nil
+}
+
+// beginSTARTTLS atomically marks STARTTLS in progress and flushes the 220 reply
+// under noticeMu unless a closing notice already claimed the connection.
+func (s *Session) beginSTARTTLS() error {
+	s.noticeMu.Lock()
+	defer s.noticeMu.Unlock()
+	s.mu.Lock()
+	if s.closingNoticeSent {
+		s.mu.Unlock()
+		return errSessionClosing
+	}
+	s.startTLSInProgress = true
+	s.mu.Unlock()
+
+	if _, err := s.clientWriter.WriteString("220 2.0.0 Ready to start TLS\r\n"); err != nil {
 		return err
 	}
 	return s.clientWriter.Flush()
 }
 
+// writeClientReply writes a complete single- or multi-line wire reply (CRLF
+// included) to the client under noticeMu, refusing the write once a closing
+// reply has claimed the connection. When closing is true, it marks
+// closingNoticeSent so later async kick/shutdown notices do not emit another 421.
+func (s *Session) writeClientReply(raw string, closing bool) (int, error) {
+	s.noticeMu.Lock()
+	defer s.noticeMu.Unlock()
+	s.mu.Lock()
+	if s.closingNoticeSent {
+		s.mu.Unlock()
+		return 0, errSessionClosing
+	}
+	if closing {
+		s.closingNoticeSent = true
+	}
+	s.mu.Unlock()
+
+	n, err := s.clientWriter.WriteString(raw)
+	if err != nil {
+		return n, err
+	}
+	if err := s.clientWriter.Flush(); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
 // sendResponse sends a response to the client.
 func (s *Session) sendResponse(response string) error {
-	_, err := s.clientWriter.WriteString(response + "\r\n")
-	if err != nil {
-		return err
-	}
-	return s.clientWriter.Flush()
+	closing := strings.HasPrefix(response, "421 ") || response == "421" ||
+		strings.HasPrefix(response, "221 ") || response == "221"
+	_, err := s.writeClientReply(response+"\r\n", closing)
+	return err
 }
 
 // Log logs a client command if debug is enabled.
@@ -1492,6 +1586,7 @@ func (s *Session) connectToBackend() (err error) {
 		}
 
 		s.DebugLog("Backend MAIL FROM accepted")
+		s.backendHasMail = true
 	}
 
 	return nil
@@ -1634,8 +1729,7 @@ func (s *Session) forwardRCPT(command string) {
 	} else if strings.HasPrefix(trimmedResponse, "4") {
 		// Backend rejected with temporary error (4xx) - forward as-is
 		s.InfoLog("backend temporarily rejected recipient", "backend", s.serverAddr, "method", s.routingMethod, "from", s.sender, "to", s.to, "response", trimmedResponse)
-		s.clientWriter.WriteString(response)
-		s.clientWriter.Flush()
+		_, _ = s.writeClientReply(response, false)
 		return
 	}
 
@@ -1653,8 +1747,9 @@ func (s *Session) forwardRCPT(command string) {
 	}
 
 	// Forward the backend's acceptance to the client.
-	s.clientWriter.WriteString(response)
-	s.clientWriter.Flush()
+	if _, err := s.writeClientReply(response, false); err != nil {
+		return
+	}
 
 	// Log routing decision at INFO level with sender, recipient, and routing method
 	s.InfoLog("routing to backend", "backend", s.serverAddr, "method", s.routingMethod, "from", s.sender, "to", s.to)
@@ -1797,17 +1892,34 @@ func (s *Session) watchKick(accountID int64, kick <-chan struct{}) {
 		return // another of the session's accounts was kicked: that watcher ends it
 	}
 
-	// noticeMu orders the notice with STARTTLS and the shutdown notice: no
-	// plaintext 421 after the reply that makes the client expect TLS, and none
-	// after the shutdown's own 421.
+	// Bound the wait for noticeMu (if the session goroutine is wedged flushing
+	// an earlier reply to an unresponsive client) and for TLS close_notify.
+	var aborted atomic.Bool
+	abortTimer := time.AfterFunc(kickNoticeTimeout, func() {
+		aborted.Store(true)
+		s.cancel()
+		s.mu.Lock()
+		client, backend := s.clientConn, s.backendConn
+		s.mu.Unlock()
+		closeSessionTransport(client)
+		closeSessionTransport(backend)
+	})
+	defer abortTimer.Stop()
+
+	// noticeMu serializes the 421 with every session reply, greeting, STARTTLS,
+	// and server shutdown notice: once closingNoticeSent is set, nothing else is
+	// ever written after this 421.
 	s.noticeMu.Lock()
 	s.mu.Lock()
 	conn := s.clientConn
-	ready := s.greeted && !s.startTLSInProgress && !s.gracefulShutdown
+	ready := s.greeted && !s.startTLSInProgress && !s.closingNoticeSent && !aborted.Load()
+	s.closingNoticeSent = true
 	s.mu.Unlock()
 	if conn != nil && ready {
 		if err := conn.SetWriteDeadline(time.Now().Add(kickNoticeTimeout)); err == nil {
-			fmt.Fprint(conn, "421 4.3.2 Service closing connection\r\n")
+			if _, err := fmt.Fprint(conn, "421 4.3.2 Service closing connection\r\n"); err == nil {
+				conn.Close()
+			}
 		}
 	}
 	s.noticeMu.Unlock()
@@ -1933,8 +2045,22 @@ func (s *Session) resetTransaction() {
 	s.mailFromReceived = false
 	s.acceptedRcpts = 0
 	s.txPoisoned = false
+	s.backendHasMail = false
 	s.smtputf8 = false
 	s.declaredSize = ""
+}
+
+// restartSession ends the current transaction and drops a held backend, for an
+// accepted LHLO and a completed STARTTLS, which each start the session over. The
+// held backend's XCLIENT carried the client's earlier LHLO name: the next RCPT
+// connects afresh, and XCLIENT gives the backend the name in effect then. The
+// transaction is reset first, so the drop poisons nothing (see loseBackend).
+func (s *Session) restartSession() {
+	s.resetTransaction()
+	if s.backendConn != nil {
+		s.InfoLog("dropping backend connection: client started the session over", "backend", s.serverAddr)
+		s.loseBackend()
+	}
 }
 
 // loseBackend drops the backend connection. If the backend had already accepted a
@@ -1945,12 +2071,14 @@ func (s *Session) resetTransaction() {
 // recipients and its single end-of-data reply would be attributed to the wrong one.
 func (s *Session) loseBackend() {
 	s.mu.Lock()
-	if s.backendConn != nil {
-		s.backendConn.Close()
-		s.backendConn = nil
-	}
+	backend := s.backendConn
+	s.backendConn = nil
 	s.backendRoute = nil
 	s.mu.Unlock()
+	s.backendHasMail = false
+	// This connection is being abandoned. Interrupt transport I/O before TLS
+	// cleanup, outside the mutex that cancellation and shutdown need too.
+	closeSessionTransport(backend)
 	if s.acceptedRcpts > 0 {
 		s.txPoisoned = true
 	}
@@ -2114,8 +2242,9 @@ func (s *Session) relayMessageData() bool {
 	}
 
 	// End-of-data replies: the backend sends one final reply line per recipient it
-	// accepted (that is what acceptedRcpts counts). Relay each line as it arrives,
-	// continuation lines included; count only final lines.
+	// accepted (that is what acceptedRcpts counts). Buffer each recipient's complete
+	// single- or multi-line reply and flush it atomically under noticeMu so an async
+	// 421 notice never splits continuation lines or shifts positional LMTP replies.
 	want := s.acceptedRcpts
 	if err := s.backendConn.SetReadDeadline(time.Now().Add(relayEndOfDataTimeout)); err != nil {
 		s.DebugLog("failed to set backend read deadline for end-of-data replies", "error", err)
@@ -2127,25 +2256,37 @@ func (s *Session) relayMessageData() bool {
 			_ = s.backendConn.SetReadDeadline(time.Time{})
 		}
 	}()
-	for got := 0; got < want; {
-		reply, err := server.ReadBoundedLine(s.backendReader, backendResponseLineMax)
-		if len(reply) > 0 {
-			n, _ := s.clientWriter.WriteString(reply)
-			bytesOut += int64(n)
-			if ferr := s.clientWriter.Flush(); ferr != nil {
-				s.DebugLog("client gone while relaying end-of-data replies", "error", ferr)
+	for got := 0; got < want; got++ {
+		var b strings.Builder
+		complete := false
+		for lines := 0; lines < maxLHLOResponseLines; lines++ {
+			reply, err := server.ReadBoundedLine(s.backendReader, backendResponseLineMax)
+			if err != nil {
+				s.InfoLog("backend closed or timed out before all end-of-data replies were relayed",
+					"expected", want, "relayed", got, "error", err)
 				s.loseBackend()
 				return false
 			}
+			b.WriteString(reply)
+			if len(reply) >= 4 && reply[3] != '-' {
+				complete = true
+				break
+			}
 		}
-		if err != nil {
-			s.InfoLog("backend closed or timed out before all end-of-data replies were relayed",
-				"expected", want, "relayed", got, "error", err)
+		if !complete {
+			s.InfoLog("backend end-of-data reply exceeded line limit",
+				"expected", want, "relayed", got, "limit", maxLHLOResponseLines)
 			s.loseBackend()
 			return false
 		}
-		if len(reply) >= 4 && reply[3] != '-' {
-			got++
+		n, ferr := s.writeClientReply(b.String(), false)
+		bytesOut += int64(n)
+		if ferr != nil {
+			if !errors.Is(ferr, errSessionClosing) {
+				s.DebugLog("client gone while relaying end-of-data replies", "error", ferr)
+			}
+			s.loseBackend()
+			return false
 		}
 	}
 	return true

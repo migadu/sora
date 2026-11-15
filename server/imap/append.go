@@ -85,6 +85,12 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		metrics.CommandDuration.WithLabelValues("imap", "APPEND").Observe(time.Since(start).Seconds())
 	}
 
+	if imapErr := s.sharedRootDestinationRefusal("APPEND", mboxName); imapErr != nil {
+		s.classifyAndTrackError("APPEND", nil, imapErr)
+		recordMetrics(imapErr)
+		return nil, imapErr
+	}
+
 	// Create a context that signals to use the master DB if the session is pinned.
 	readCtx := ctx
 	if s.useMasterDB.Load() {

@@ -161,14 +161,14 @@ func TestRenameMailboxHierarchy(t *testing.T) {
 	require.NoError(t, err)
 	defer tx.Rollback(ctx)
 
-	err = db.CreateMailbox(ctx, tx, accountID, "ChildFolder", &parentMailboxID)
+	err = db.CreateMailbox(ctx, tx, accountID, "TestFolder/ChildFolder", &parentMailboxID)
 	require.NoError(t, err)
 
 	err = tx.Commit(ctx)
 	require.NoError(t, err)
 
 	// Get child mailbox
-	childMailbox, err := db.GetMailboxByName(ctx, accountID, "ChildFolder")
+	childMailbox, err := db.GetMailboxByName(ctx, accountID, "TestFolder/ChildFolder")
 	require.NoError(t, err)
 
 	// Test 2: Rename parent mailbox (should update child paths)
@@ -190,15 +190,16 @@ func TestRenameMailboxHierarchy(t *testing.T) {
 	// Test 4: Verify child path was updated
 	updatedChild, err := db.GetMailbox(ctx, childMailbox.ID, accountID)
 	assert.NoError(t, err)
-	assert.NotNil(t, updatedChild)
-	// Child name should still be "ChildFolder" but path should be updated
+	if assert.NotNil(t, updatedChild) {
+		assert.Equal(t, "RenamedParent/ChildFolder", updatedChild.Name)
+	}
 
 	// Test 5: Try to move mailbox into its own child (should fail)
 	tx3, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer tx3.Rollback(ctx)
 
-	err = db.RenameMailbox(ctx, tx3, parentMailboxID, accountID, "MovedParent", &childMailbox.ID)
+	err = db.RenameMailbox(ctx, tx3, parentMailboxID, accountID, "RenamedParent/ChildFolder/MovedParent", &childMailbox.ID)
 	assert.Error(t, err) // Should fail - can't move parent into child
 
 	tx3.Rollback(ctx)

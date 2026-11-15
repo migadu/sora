@@ -26,7 +26,7 @@ import (
 
 	"github.com/emersion/go-message/mail" // Import for mail.ReadMessage
 	"github.com/migadu/go-imap"
-	"github.com/migadu/go-imap/imapserver"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -59,6 +59,9 @@ type ImporterOptions struct {
 	MaxMessageSize       int64         // Maximum message size to import (bytes); 0 or above consts.MaxStoredMessageSize means that maximum
 	PathsFile            string        // Path to a file containing a list of relative or absolute paths to import
 	FTSRetention         time.Duration // Skip the search row for messages sent before this window (0 = index all)
+	// SharedMailboxes is the [shared_mailboxes] config: with sharing enabled, a folder
+	// in the shared namespace is imported into a shared mailbox the account owns.
+	SharedMailboxes config.SharedMailboxesConfig
 }
 
 // resilientDB defines the interface for database operations needed by the importer.
@@ -576,6 +579,18 @@ func (i *Importer) Run() (err error) {
 	return nil
 }
 
+// accountLookupError is the error of a failed lookup of the account email names, for
+// `import maildir` and `import s3`. Only consts.ErrUserNotFound says the account does
+// not exist, and only then is the operator told to create it: any other error (the
+// database unreachable past the retries, an interrupt cancelling the context) is a
+// lookup that failed, for an account that may well exist.
+func accountLookupError(email string, err error) error {
+	if errors.Is(err, consts.ErrUserNotFound) {
+		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", email, err, email)
+	}
+	return fmt.Errorf("failed to look up account %s: %w", email, err)
+}
+
 // processSubscriptions reads and processes the Dovecot subscriptions file
 func (i *Importer) processSubscriptions() error {
 	subscriptionsPath := filepath.Join(i.maildirPath, "subscriptions")
@@ -610,7 +625,7 @@ func (i *Importer) processSubscriptions() error {
 
 	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
 	if err != nil {
-		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", i.email, err, i.email)
+		return accountLookupError(i.email, err)
 	}
 	user := server.NewUser(address, accountID)
 
@@ -693,7 +708,7 @@ func (i *Importer) importSieveScript() error {
 
 	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
 	if err != nil {
-		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", i.email, err, i.email)
+		return accountLookupError(i.email, err)
 	}
 	user := server.NewUser(address, accountID)
 
@@ -807,7 +822,7 @@ func (i *Importer) performDryRun() error {
 
 	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
 	if err != nil {
-		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", i.email, err, i.email)
+		return accountLookupError(i.email, err)
 	}
 	user := server.NewUser(address, accountID)
 
@@ -831,7 +846,16 @@ func (i *Importer) performDryRun() error {
 	currentMailbox := ""
 	var mailboxWouldImport, mailboxWouldSkip int
 
+	// The current mailbox's ID in Sora, 0 while it does not exist yet.
+	var mailboxID int64
+
 	for rows.Next() {
+		// An interrupt stops the report: the messages after it are not checked, and a
+		// summary would claim they were.
+		if err := i.ctx.Err(); err != nil {
+			return fmt.Errorf("dry run interrupted: %w", err)
+		}
+
 		var path, filename, hash, mailbox string
 		var size int64
 		if err := rows.Scan(&path, &filename, &hash, &size, &mailbox); err != nil {
@@ -856,6 +880,17 @@ func (i *Importer) performDryRun() error {
 			mailboxWouldImport = 0
 			mailboxWouldSkip = 0
 			fmt.Printf("Mailbox: %s\n", mailbox)
+
+			// Look the mailbox up once (the rows come ordered by mailbox), among the
+			// account's own: the import never writes into a same-named mailbox shared
+			// with the account. Only a mailbox that does not exist yet means its
+			// messages are new; any other error leaves them unchecked.
+			mailboxID, err = i.rdb.GetOwnedMailboxIDByNameWithRetry(i.ctx, user.AccountID(), mailbox)
+			if errors.Is(err, consts.ErrMailboxNotFound) {
+				mailboxID = 0
+			} else if err != nil {
+				return fmt.Errorf("dry run: failed to look up mailbox %q: %w", mailbox, err)
+			}
 		}
 
 		// Check date filter if specified
@@ -865,16 +900,11 @@ func (i *Importer) performDryRun() error {
 			continue
 		}
 
-		// Check if message already exists in Sora, in the account's own mailbox of that
-		// name: the import never writes into a same-named mailbox shared with the account.
-		mailboxID, err := i.rdb.GetOwnedMailboxIDByNameWithRetry(i.ctx, user.AccountID(), mailbox)
+		// Check if message already exists in Sora
 		var alreadyExists bool
-		if err == nil {
-			if !i.options.ForceReimport {
-				alreadyExists, err = i.isMessageAlreadyImported(hash, mailboxID)
-				if err != nil {
-					logger.Info("Error checking if message exists", "error", err)
-				}
+		if mailboxID != 0 && !i.options.ForceReimport {
+			if alreadyExists, err = i.isMessageAlreadyImported(hash, mailboxID); err != nil {
+				return fmt.Errorf("dry run: %s in %s: %w", filename, mailbox, err)
 			}
 		}
 
@@ -946,6 +976,9 @@ func (i *Importer) performDryRun() error {
 		}
 
 		fmt.Println()
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read messages from sqlite: %w", err)
 	}
 
 	// Print summary for last mailbox
@@ -1394,9 +1427,9 @@ func (i *Importer) scanMaildir() error {
 	// Refusals apply only to this run. Deleting a prior cache row would also lose
 	// a successful legacy import's SHA-256 identity and duplicate it under BLAKE3
 	// if a later run raises the limit again.
-	refuse := func(file fileToProcess, err error) {
-		logger.Warn("Invalid message", "path", file.path, "error", err)
-		i.recordFailedPath(file.path, fmt.Sprintf("invalid message: %v", err))
+	refuse := func(file fileToProcess, reason string) {
+		logger.Warn("Refusing message", "path", file.path, "reason", reason)
+		i.recordFailedPath(file.path, reason)
 		atomic.AddInt64(&i.failedMessages, 1)
 		refusedMu.Lock()
 		refusedFiles[maildirFileKey{file.filename, file.mailboxName}] = struct{}{}
@@ -1409,12 +1442,17 @@ func (i *Importer) scanMaildir() error {
 		go func() {
 			defer wg.Done()
 			for file := range filesToProcess {
+				if i.isSharedNamespaceRoot(file.mailboxName) {
+					refuse(file, fmt.Sprintf("folder maps to the shared namespace root %q, which holds no messages; import it under another name", file.mailboxName))
+					continue
+				}
+
 				// Use streaming hash function
 				// Every file the scan drops is reported by path at the end: a message that
 				// never reaches the cache is otherwise invisible to every later count.
 				hash, size, err := hashFile(file.path, i.options.MaxMessageSize)
 				if errors.Is(err, errMessageTooLarge) {
-					refuse(file, err)
+					refuse(file, fmt.Sprintf("invalid message: %v", err))
 					continue
 				}
 				if err != nil {
@@ -1426,7 +1464,7 @@ func (i *Importer) scanMaildir() error {
 
 				// Validate message
 				if err := i.validateMessage(size); err != nil {
-					refuse(file, err)
+					refuse(file, fmt.Sprintf("invalid message: %v", err))
 					continue
 				}
 
@@ -1573,7 +1611,7 @@ func (i *Importer) syncMailboxState() error {
 			continue
 		}
 
-		if !i.shouldImportMailbox(mailboxName) {
+		if !i.shouldImportMailbox(mailboxName) || i.isSharedNamespaceRoot(mailboxName) {
 			continue
 		}
 
@@ -1722,6 +1760,18 @@ func (i *Importer) shouldSkipMessage(path string) bool {
 	return false
 }
 
+// isSharedNamespaceRoot reports whether mailboxName is the shared namespace root
+// ("Shared" for "Shared/") while sharing is enabled. The root is a container: IMAP
+// refuses to CREATE or SELECT it, so messages imported into it could not be read, and
+// as a shared mailbox it cannot be renamed out of the namespace to reach them. The scan
+// refuses the messages of such a folder; the root itself is still created as the
+// parent of the folders below it.
+func (i *Importer) isSharedNamespaceRoot(mailboxName string) bool {
+	shared := i.options.SharedMailboxes
+	return shared.Enabled &&
+		strings.EqualFold(mailboxName, strings.TrimSuffix(shared.NamespacePrefix, string(consts.MailboxDelimiter)))
+}
+
 // getOrCreateMailbox returns cached mailbox or fetches/creates it
 func (i *Importer) getOrCreateMailbox(ctx context.Context, AccountID int64, name string) (*db.DBMailbox, error) {
 	// First, check with a read lock for high concurrency
@@ -1743,6 +1793,11 @@ func (i *Importer) getOrCreateMailbox(ctx context.Context, AccountID int64, name
 
 	// Still not there, so we are responsible for creating it
 	// This single call handles both getting and creating, avoiding a redundant lookup.
+	// With the shared mailbox config in the context, a name in the shared namespace
+	// (and each missing level above it) becomes a shared mailbox the account owns, as
+	// `sora-admin mailbox create` makes it; without it, a personal mailbox in the
+	// shared namespace, which IMAP then cannot share.
+	ctx = context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: i.options.SharedMailboxes})
 	mailbox, err := i.rdb.GetOrCreateMailboxByNameWithRetry(ctx, AccountID, name)
 
 	if err == nil {
@@ -1921,7 +1976,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		references = nil
 	}
 
-	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(content))
+	bodyStructure := helpers.ExtractBodyStructure(bytes.NewReader(content))
 
 	// Validate body structure and use fallback if invalid (e.g., multipart with no children)
 	if err := helpers.ValidateBodyStructure(&bodyStructure); err != nil {
@@ -2153,7 +2208,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 
 	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
 	if err != nil {
-		return nil, fmt.Errorf("account not found: %w", err)
+		return nil, fmt.Errorf("failed to look up account: %w", err)
 	}
 	user := server.NewUser(address, accountID)
 
@@ -2297,7 +2352,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 
 	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
 	if err != nil {
-		return nil, fmt.Errorf("account not found: %w", err)
+		return nil, fmt.Errorf("failed to look up account: %w", err)
 	}
 	user := server.NewUser(address, accountID)
 
