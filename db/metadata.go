@@ -197,7 +197,10 @@ type MetadataLimits struct {
 // SetMetadata sets or removes server or mailbox metadata entries.
 // If mailboxID is nil, sets server metadata.
 // To remove an entry, set its value to nil.
-// Returns ErrMetadataTooBig, ErrMetadataTooMany, or ErrMetadataQuotaExceeded if limits are exceeded.
+// Returns a *MetadataError (MetadataErrMaxSize, MetadataErrTooMany or
+// MetadataErrQuotaExceeded) when the command would break a limit. The count
+// and size limits refuse only a command that raises the count or the size, so
+// an account already past one can still delete, overwrite and shrink entries.
 func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64, mailboxID *int64, entries map[string]*[]byte, limits *MetadataLimits) error {
 	if len(entries) == 0 {
 		return nil

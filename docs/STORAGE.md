@@ -1008,4 +1008,6 @@ and on the account. Entries are stored in PostgreSQL. Only the IMAP server uses 
 
 A `SETMETADATA` that would break a limit is refused with `NO`, and nothing in it is stored. A
 limit of `0` turns that check off. An overwrite counts only its change in size, and a delete
-frees its slot.
+frees its slot. The count and size limits refuse only a command that raises the count or the
+size, so an account already past one (the limit was lowered) can still delete, overwrite and
+shrink entries to get back under it.
