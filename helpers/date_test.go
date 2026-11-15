@@ -192,13 +192,15 @@ func TestParseDateHeaderInvalid(t *testing.T) {
 		"Wed, 17 Jul 1996 02:23:25\n PDT",
 		"Wed, 17 Jul 1996 02:23:25 GMT+0200",
 		"Wed, 17 Jul 1996 02:23:25 UTC-0500",
-		// Nor are letters a zone when a numeric offset follows them after white space:
-		// the RFC 5322 section 3.3 grammar has one zone after the time of day ("time =
-		// time-of-day zone"), and the offset after the letters would be discarded.
+		// Nor are letters a zone when a numeric offset follows them after white space
+		// or a comment: the RFC 5322 section 3.3 grammar has one zone after the time of
+		// day ("time = time-of-day zone"), and the offset after the letters would be
+		// discarded.
 		"Wed, 17 Jul 1996 02:23:25 PM -0700",
 		"Wed, 17 Jul 1996 02:23:25 PDT +0500",
 		"Wed, 17 Jul 1996 02:23:25 PDT\r\n +0500",
 		"Wed, 17 Jul 1996 02:23:25 Z\t-0700",
+		"Wed, 17 Jul 1996 02:23:25 PDT (c) +0500",
 		// year = 4*DIGIT / obs-year, and obs-year is 2*DIGIT (RFC 5322 sections 3.3, 4.3).
 		"Mon, 17 Jul 5 02:23:25 +0000",
 		"Mon, 17 Jul 50 02:23:25 PDT+0400",
