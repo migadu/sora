@@ -739,9 +739,9 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			for _, capStr := range filter.DisableCaps {
 				c := config.IMAPCap(capStr)
 				if c == imap.CapIMAP4rev1 {
-					logger.Warn("IMAP: Capability filter cannot disable IMAP4rev1, go-imap selects connection protocol version from server-global capabilities", "name", name, "capability", capStr, "reason", filter.Reason)
+					logger.Warn("IMAP: Capability filter cannot disable IMAP4rev1, go-imap selects connection protocol version from server-global capabilities", "name", name, "entry", i+1, "capability", capStr, "reason", filter.Reason)
 				} else if _, ok := alwaysAdvertisedCaps[c]; ok {
-					logger.Warn("IMAP: Capability filter cannot disable capability, go-imap always advertises it with IMAP4rev1", "name", name, "capability", capStr, "reason", filter.Reason)
+					logger.Warn("IMAP: Capability filter cannot disable capability, go-imap always advertises it with IMAP4rev1", "name", name, "entry", i+1, "capability", capStr, "reason", filter.Reason)
 				} else if !s.caps.Has(c) {
 					logger.Warn("IMAP: Capability filter cannot disable capability, it is not one this server can withdraw", "name", name, "entry", i+1, "capability", capStr, "reason", filter.Reason)
 				}
