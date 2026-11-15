@@ -588,8 +588,11 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 	//    statement saw. A concurrent delivery or copy can re-arm a row while DELETE
 	//    waits for its lock. READ COMMITTED rechecks the new target version, but its
 	//    heartbeat subquery keeps the old statement snapshot, so liveness alone is
-	//    insufficient. Compare xmin with a separate snapshot lookup by primary key:
+	//    insufficient. Compare ctid with a separate snapshot lookup by primary key:
 	//    a changed row stays for a later cycle, whose snapshot can judge it afresh.
+	//    This is a statement-local version check, not a persistent row identifier:
+	//    the active snapshot keeps the old tuple from being recycled, and the DELETE's
+	//    relation lock excludes table rewrites. id remains the logical lookup key.
 	//    The old message reaped above is gone either way; a newly delivered one remains.
 	// 3. The `deleted_instances` CTE retires heartbeat rows of long-gone instances, but
 	//    only while they own no pending upload at all: as long as one exists, that row
@@ -613,7 +616,7 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 		deleted_pending AS (
 			DELETE FROM pending_uploads pu
 			WHERE (pu.content_hash, pu.account_id) IN (SELECT content_hash, account_id FROM deleted_messages)
-			  AND pu.xmin = (SELECT snapshot_pu.xmin FROM pending_uploads snapshot_pu WHERE snapshot_pu.id = pu.id)
+			  AND pu.ctid = (SELECT snapshot_pu.ctid FROM pending_uploads snapshot_pu WHERE snapshot_pu.id = pu.id)
 			  AND ` + livePendingUpload + ` IS NOT TRUE
 		),
 		deleted_instances AS (
