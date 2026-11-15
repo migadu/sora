@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
+	imapServer "github.com/migadu/sora/server/imap"
 )
 
 // RFC 5465 §5.2: "If the new/appended message is in the selected mailbox, the
@@ -68,6 +70,56 @@ func TestNotifyMessageNewFetchPassesOverUnknownCTE(t *testing.T) {
 	}
 	if n := countFetches(got, 2); n != 1 {
 		t.Errorf("want one MessageNew FETCH for message 2, got %d:\n%s", n, strings.Join(got, "\r\n"))
+	}
+}
+
+// TestNotifyMessageNewFetchPassesOverBodyOverMemoryLimit: a body larger than
+// the watching session's whole memory budget (session_memory_limit) fails
+// with NO [LIMIT], which, as NO [UNKNOWN-CTE], no later tick can change: the
+// message is passed over at once instead of being retried, and the message
+// after it still gets its FETCH.
+func TestNotifyMessageNewFetchPassesOverBodyOverMemoryLimit(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	logs := common.CaptureLogs(t)
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+	login := fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password)
+
+	other := dialRawIMAP(t, server.Address)
+	other.do(login)
+	other.do("CREATE Staging")
+	other.appendMsg("Staging", messageOfSize(300<<10))
+	other.appendMsg("Staging", binaryDecodeTestMessage("second", "text/plain", "7bit", "body second\r\n"))
+
+	// The watcher starts after session_memory_limit is reloaded to 256 KiB.
+	imapSrv, ok := server.Server.(*imapServer.IMAPServer)
+	if !ok {
+		t.Fatalf("server.Server is %T, want *imap.IMAPServer", server.Server)
+	}
+	if err := imapSrv.ReloadConfig(config.ServerConfig{
+		Limits: &config.ServerLimitsConfig{SessionMemoryLimit: "256kb"},
+	}); err != nil {
+		t.Fatalf("ReloadConfig: %v", err)
+	}
+	watcher := dialRawIMAP(t, server.Address)
+	watcher.do(login)
+	watcher.do("SELECT INBOX")
+	watcher.do("NOTIFY SET (SELECTED (MessageNew (UID BODY.PEEK[HEADER.FIELDS (SUBJECT)]) MessageExpunge))")
+
+	other.do("SELECT Staging")
+	// One COPY: both messages are new to the watcher in the same tick.
+	other.do("COPY 1:2 INBOX")
+
+	logs.WaitForLine(t, "NOTIFY: MessageNew fetch-atts cannot be answered for a message, passing over it", "LIMIT")
+	got := readNotifyUntil(t, watcher, 10*time.Second, func(resps []string) bool {
+		return countFetches(resps, 2) > 0
+	})
+	got = append(got, notifyNoop(t, watcher)...)
+	if n := countFetches(got, 1); n != 0 {
+		t.Errorf("message 1 is larger than the session memory budget, want no FETCH for it, got %d:\n%s", n, strings.Join(got, "\r\n"))
+	}
+	if n := countFetches(got, 2); n != 1 || !strings.Contains(findFetch(got, 2), "Subject: second") {
+		t.Errorf("want one MessageNew FETCH with the subject of message 2, got %d:\n%s", n, strings.Join(got, "\r\n"))
 	}
 }
 

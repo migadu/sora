@@ -3,7 +3,6 @@ package imap
 import (
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -160,7 +159,8 @@ func TestFetch_BodySectionCopyIsCharged(t *testing.T) {
 
 // TestFetch_SectionOverBudgetIsRefused: once the extractor's copy is charged, a section
 // that does not fit the session budget must be refused explicitly. Handing the client an
-// empty literal instead would be indistinguishable from a genuinely empty message.
+// empty literal instead would be indistinguishable from a genuinely empty message. A
+// section larger than the whole budget can never be fetched: NO [LIMIT].
 func TestFetch_SectionOverBudgetIsRefused(t *testing.T) {
 	body := multipartTestMessage(64 * 1024)
 	section := &imap.FetchItemBodySection{Part: []int{2}}
@@ -173,13 +173,7 @@ func TestFetch_SectionOverBudgetIsRefused(t *testing.T) {
 	err := fetchBodySections(s, w, &bodyData, &bodyFetched,
 		&imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{section}}, fetchTestMessage(body))
 
-	var imapErr *imap.Error
-	if !errors.As(err, &imapErr) {
-		t.Fatalf("error = %v, want an *imap.Error", err)
-	}
-	if imapErr.Type != imap.StatusResponseTypeNo || imapErr.Code != imap.ResponseCodeUnavailable {
-		t.Errorf("error = %v [%v], want NO [UNAVAILABLE]", imapErr.Type, imapErr.Code)
-	}
+	requireMemoryRefusal(t, err, imap.ResponseCodeLimit)
 	if len(w.sections) != 0 {
 		t.Errorf("wrote %d sections for a refused fetch, want 0", len(w.sections))
 	}
