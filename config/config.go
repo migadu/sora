@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/consts"
@@ -2899,11 +2900,16 @@ func (s *ServerConfig) Validate() error {
 	// lookup client from its enabled remote_lookup. No other server reads either, and a
 	// disabled lookup is never initialized.
 	if strings.HasSuffix(s.Type, "_proxy") {
-		// The proxy adds every entry as a backend, an empty one included, and routes
-		// users to it; ValidatePools refuses an empty [[pool]] backend the same way.
+		// The proxy adds every entry as a backend, as loaded, and routes users to it. The
+		// loader trims each entry's ends; an empty entry, or whitespace left inside one
+		// ("192.0.2.10 :143": no host or IP has any), is a backend that never resolves.
+		// ValidatePools refuses such a [[pool]] backend the same way.
 		for i, addr := range s.RemoteAddrs {
 			if strings.TrimSpace(addr) == "" {
 				return fmt.Errorf("server %q: remote_addrs #%d: empty backend address", s.Name, i+1)
+			}
+			if strings.ContainsFunc(addr, unicode.IsSpace) {
+				return fmt.Errorf("server %q: remote_addrs #%d: backend address %q contains whitespace", s.Name, i+1, addr)
 			}
 		}
 		if _, err := s.GetRemotePort(); err != nil {
