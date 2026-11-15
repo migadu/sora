@@ -49,6 +49,7 @@ func TestNewPasswordsRefuseUnsaltedSHA512(t *testing.T) {
 		t.Helper()
 		if assert.Error(t, err, "sha512 was accepted for a new password") {
 			assert.ErrorIs(t, err, ErrUnsupportedHashType)
+			assert.ErrorIs(t, err, ErrInvalidAccountRequest)
 		}
 		assert.False(t, strings.HasPrefix(storedHash(t, address), "{SHA512}"), "an unsalted SHA-512 hash was stored for %s", address)
 	}
@@ -95,4 +96,28 @@ func TestNewPasswordsRefuseUnsaltedSHA512(t *testing.T) {
 		})
 		refused(t, err, existing)
 	})
+}
+
+// TestCreateAccountWithCredentialsUnsupportedHashTypeWrapsInvalidAccountRequest pins that
+// CreateAccountWithCredentials wraps ErrInvalidAccountRequest (alongside ErrUnsupportedHashType)
+// when ValidateNewHashType rejects a credential's hash_type, matching CreateAccount,
+// UpdateAccount, AddCredential, and the ErrInvalidAccountRequest contract.
+func TestCreateAccountWithCredentialsUnsupportedHashTypeWrapsInvalidAccountRequest(t *testing.T) {
+	ctx := context.Background()
+	var d Database
+
+	for _, hashType := range []string{"md5", "sha512", "argon2id"} {
+		t.Run(hashType, func(t *testing.T) {
+			_, err := d.CreateAccountWithCredentials(ctx, nil, CreateAccountWithCredentialsRequest{
+				Credentials: []CredentialSpec{
+					{Email: "primary@example.com", Password: "pw-123456", IsPrimary: true, HashType: "bcrypt"},
+					{Email: "alias@example.com", Password: "pw-123456", IsPrimary: false, HashType: hashType},
+				},
+			})
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrUnsupportedHashType)
+			assert.ErrorIs(t, err, ErrInvalidAccountRequest)
+			assert.Contains(t, err.Error(), "credential 2")
+		})
+	}
 }

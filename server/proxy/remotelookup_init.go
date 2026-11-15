@@ -2,8 +2,6 @@ package proxy
 
 import (
 	"fmt"
-	"net"
-	"net/url"
 	"strings"
 
 	"github.com/migadu/sora/config"
@@ -15,24 +13,6 @@ import (
 // both authentication and route caches rather than reuse another network's verdict.
 func RemoteLookupUsesClientIP(cfg *config.RemoteLookupConfig) bool {
 	return cfg != nil && cfg.Enabled && strings.Contains(cfg.URL, "$ip")
-}
-
-// validateRemoteLookupURL requires https:// for non-loopback hosts. A plaintext
-// remote-lookup endpoint exposes the user's password and the returned password hash
-// to an on-path attacker, who can also forge the backend-routing response.
-func validateRemoteLookupURL(rawURL string) error {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return fmt.Errorf("invalid remotelookup.url: %w", err)
-	}
-	if u.Scheme == "https" {
-		return nil
-	}
-	host := u.Hostname()
-	if ip := net.ParseIP(host); host == "localhost" || (ip != nil && ip.IsLoopback()) {
-		return nil // http:// allowed only to loopback (dev/test)
-	}
-	return fmt.Errorf("remotelookup.url must use https:// for non-loopback hosts (got scheme %q); plaintext exposes credentials and password hashes", u.Scheme)
 }
 
 // standardBackendPorts are the ports the backends listen on by default (as in
@@ -63,10 +43,9 @@ func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig, ser
 		logger.Info("RemoteLookup: Bypassing user-keyed lookup cache because URL uses $ip", "protocol", protocol)
 	}
 
-	if cfg.URL == "" {
-		return nil, fmt.Errorf("remotelookup.url is required when remotelookup is enabled")
-	}
-	if err := validateRemoteLookupURL(cfg.URL); err != nil {
+	// The checks ServerConfig.Validate runs, so a block that passes sora-admin config
+	// validate is not refused here.
+	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
@@ -102,7 +81,7 @@ func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig, ser
 	}
 
 	hasAuth := cfg.AuthToken != ""
-	logger.Debug("RemoteLookup: Initializing HTTP remotelookup (NO caching)", "url", cfg.URL, "timeout", timeout, "remote_port", remotePort, "auth_enabled", hasAuth)
+	logger.Debug("RemoteLookup: Initializing HTTP remotelookup (NO caching)", "url", config.MaskEndpointURL(cfg.URL), "timeout", timeout, "remote_port", remotePort, "auth_enabled", hasAuth)
 
 	// Parse circuit breaker settings
 	var cbSettings *CircuitBreakerSettings

@@ -134,7 +134,7 @@ func TestSlowThroughputNoticeAfterSTLSIsReadableThroughTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the timeout notice through TLS: %v", err)
 	}
-	if want := "-ERR [IN-USE] Connection too slow, please reconnect\r\n"; line != want {
+	if want := "-ERR Connection too slow, please reconnect\r\n"; line != want {
 		t.Fatalf("timeout notice through TLS = %q, want %q", line, want)
 	}
 	if _, err := tlsReader.ReadString('\n'); err == nil {

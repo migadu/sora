@@ -142,7 +142,7 @@ func TestUserAPITLSReuseStaysWithPoolAfterDNSOwnershipChange(t *testing.T) {
 			s.routingLookup = &poolTransferLookup{}
 			handler := s.setupHandler()
 			firstDone := make(chan int, 1)
-			go func() { firstDone <- login(handler, `{"email":"a@example.com"}`) }()
+			go func() { firstDone <- login(handler, `{"email":"a@example.com","password":"x"}`) }()
 			if inFlight {
 				select {
 				case <-entered:
@@ -154,7 +154,7 @@ func TestUserAPITLSReuseStaysWithPoolAfterDNSOwnershipChange(t *testing.T) {
 					t.Fatalf("warm A connection: %d", code)
 				}
 				firstAddr := <-addresses
-				if code := login(handler, `{"email":"a@example.com"}`); code != http.StatusTeapot {
+				if code := login(handler, `{"email":"a@example.com","password":"x"}`); code != http.StatusTeapot {
 					t.Fatalf("reuse within A: %d", code)
 				}
 				if reused := <-addresses; reused != firstAddr {
@@ -177,7 +177,7 @@ func TestUserAPITLSReuseStaysWithPoolAfterDNSOwnershipChange(t *testing.T) {
 				t.Fatal("B's CA unexpectedly trusted the A endpoint")
 			}
 			if inFlight {
-				if code := login(handler, `{"email":"b@example.com"}`); code != http.StatusBadGateway {
+				if code := login(handler, `{"email":"b@example.com","password":"x"}`); code != http.StatusBadGateway {
 					t.Fatalf("fresh B request: %d", code)
 				}
 				close(release)
@@ -185,7 +185,7 @@ func TestUserAPITLSReuseStaysWithPoolAfterDNSOwnershipChange(t *testing.T) {
 					t.Fatalf("complete A request: %d", code)
 				}
 			}
-			if code := login(handler, `{"email":"b@example.com"}`); code != http.StatusBadGateway {
+			if code := login(handler, `{"email":"b@example.com","password":"x"}`); code != http.StatusBadGateway {
 				t.Fatalf("B reused an A TLS connection: status=%d backend_requests=%d", code, hits.Load())
 			}
 			want := int32(2)

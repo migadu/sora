@@ -120,11 +120,12 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	if err := config.LoadServerConfig(configPath, fullCfg); err != nil {
 		return err
 	}
-	// `mailbox create` and `mailbox rename` classify names by namespace_prefix.
+	// `mailbox create`, `mailbox rename` and `import maildir` classify names by namespace_prefix.
 	if err := fullCfg.SharedMailboxes.Validate(); err != nil {
 		return fmt.Errorf("[shared_mailboxes]: %w", err)
 	}
-	// Imports index mail by [cleanup] fts_retention, as delivery does.
+	// Imports index mail by [cleanup] fts_retention, as delivery does. The server refuses
+	// the other [cleanup] values Validate rejects too.
 	if err := fullCfg.Cleanup.Validate(); err != nil {
 		return fmt.Errorf("[cleanup]: %w", err)
 	}
@@ -223,6 +224,7 @@ func main() {
 
 	// Determine the command first
 	command := ""
+	wantHelp := false
 	for i := 1; i < len(os.Args); i++ {
 		if !strings.HasPrefix(os.Args[i], "-") {
 			command = os.Args[i]
@@ -234,11 +236,16 @@ func main() {
 		} else if strings.HasPrefix(os.Args[i], "--config=") {
 			// Skip the --config=value flag entirely
 			continue
+		} else if os.Args[i] == "--help" || os.Args[i] == "-h" {
+			wantHelp = true
 		}
 	}
 
 	if command == "" {
 		printUsage()
+		if wantHelp {
+			os.Exit(0)
+		}
 		os.Exit(1)
 	}
 

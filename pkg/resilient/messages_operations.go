@@ -153,14 +153,17 @@ func (rd *ResilientDatabase) SearchMessagesSortedWithRetry(ctx context.Context, 
 	return result.([]db.SearchMessageResult), nil
 }
 
-// destObjectKeepalive is the longest a move transaction sits without a statement while
+// destObjectKeepalive is the longest a COPY/MOVE transaction sits without a statement while
 // it makes its destination objects exist in S3. The server kills a session idle in a
 // transaction for idle_in_transaction_session_timeout, and the S3 round trips of a large
-// move can outlast that. A variable so tests can shorten it.
+// operation can outlast that. A variable so tests can shorten it.
 var destObjectKeepalive = 30 * time.Second
 
 // MoveMessagesWithRetry moves ids from srcMailboxID into destMailboxID, owned by
-// destAccountID, in one write transaction (db.MoveMessages).
+// destAccountID, in one write transaction (db.MoveMessages). sourceHashes are the hashes,
+// by source UID, whose bodies the caller made available under destAccountID's key; a
+// cross-account source renamed since fails the move with db.ErrMoveSourceChanged, which
+// is not retried (a retry would carry the same stale hashes).
 //
 // destObjects are the bodies of a cross-account move that are in S3 under their source
 // key. The moved rows point at destAccountID's key, and ensureDestObject makes the
@@ -181,7 +184,7 @@ var destObjectKeepalive = 30 * time.Second
 // move with a *DestObjectError, which the write circuit breaker does not count and the
 // retry does not repeat (the S3 calls retry on their own). A statement keeps the
 // transaction alive at least every destObjectKeepalive.
-func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, destObjects []string, ensureDestObject func(ctx context.Context, contentHash string) error) (map[imap.UID]imap.UID, error) {
+func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string, destObjects []string, ensureDestObject func(ctx context.Context, contentHash string) error) (map[imap.UID]imap.UID, error) {
 	op := func(opCtx context.Context, tx pgx.Tx) (any, error) {
 		if len(destObjects) > 0 {
 			if err := db.LockS3ObjectsSharedInTx(opCtx, tx, destAccountID, destObjects); err != nil {
@@ -194,7 +197,7 @@ func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]i
 			defer cancel()
 			opCtx = writeCtx
 		}
-		return rd.getOperationalDatabaseForOperation(opCtx, true).MoveMessages(opCtx, tx, ids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID, destObjects)
+		return rd.getOperationalDatabaseForOperation(opCtx, true).MoveMessages(opCtx, tx, ids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID, sourceHashes, destObjects)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
 	if err != nil {
@@ -233,7 +236,7 @@ func (rd *ResilientDatabase) ensureDestObjects(ctx context.Context, tx pgx.Tx, h
 					if ctx.Err() != nil {
 						done <- nil
 					} else {
-						done <- fmt.Errorf("failed to keep the move transaction alive: %w", err)
+						done <- fmt.Errorf("failed to keep the destination object transaction alive: %w", err)
 					}
 					return
 				}
@@ -254,7 +257,7 @@ func (rd *ResilientDatabase) ensureDestObjects(ctx context.Context, tx pgx.Tx, h
 	return nil
 }
 
-// DestObjectError is a failure to make a cross-account move's destination object exist
+// DestObjectError is a failure to make a cross-account COPY/MOVE destination object exist
 // in S3. It has no Unwrap on purpose: an S3 timeout, a refused connection or an open S3
 // circuit breaker must not pass for a database failure with the write circuit breaker
 // or the retry. The caller classifies Err itself.

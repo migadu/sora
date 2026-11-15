@@ -41,15 +41,14 @@ func TestLookupCache_SuccessfulAuth(t *testing.T) {
 		t.Errorf("Expected accountID=%d, got %d", accountID, cachedID)
 	}
 
-	// Wrong password - should be cache hit but auth failure
-	// With revalidation windows, the entry remains in cache (not immediately invalidated)
+	// Wrong password - a cache hit, left to the database, and the entry is dropped
 	if cachedID, found, _ := cache.Authenticate(address, "wrongpassword"); found {
 		t.Error("Expected authentication failure with wrong password")
 	} else if cachedID != 0 {
 		t.Errorf("Expected accountID=0 on auth failure, got %d", cachedID)
 	}
 
-	// Verify stats - entry remains in cache with revalidation window
+	// Verify stats
 	hits, misses, size, hitRate := cache.GetStats()
 	if misses != 1 {
 		t.Errorf("Expected 1 miss, got %d", misses)
@@ -57,9 +56,9 @@ func TestLookupCache_SuccessfulAuth(t *testing.T) {
 	if hits != 2 {
 		t.Errorf("Expected 2 hits (1 success + 1 wrong password), got %d", hits)
 	}
-	// After password mismatch, entry remains in cache (revalidation window protection)
-	if size != 1 {
-		t.Errorf("Expected 1 cached entry (revalidation window), got %d", size)
+	// The password missed the entry, so the entry is gone
+	if size != 0 {
+		t.Errorf("Expected 0 cached entries after a password missed the entry, got %d", size)
 	}
 	if hitRate < 66 || hitRate > 67 {
 		t.Errorf("Expected hit rate ~66.7%%, got %.2f%%", hitRate)
@@ -230,16 +229,15 @@ func TestLookupCache_PasswordChangeInvalidation(t *testing.T) {
 	// User changes password (simulate by trying new password)
 	newPassword := "newpassword456"
 
-	// Try to authenticate with new password - should fail but entry remains in cache
-	// (revalidation window prevents immediate cache invalidation)
+	// Try to authenticate with new password - left to the database (cache has old
+	// hash), and the entry is dropped
 	if _, found, _ := cache.Authenticate(address, newPassword); found {
 		t.Error("Expected authentication failure with new password (cache has old hash)")
 	}
 
-	// Cache entry remains (revalidation window protection)
 	_, _, sizeAfter, _ := cache.GetStats()
-	if sizeAfter != 1 {
-		t.Errorf("Expected entry to remain in cache (revalidation window), got size=%d", sizeAfter)
+	if sizeAfter != 0 {
+		t.Errorf("Expected the entry the new password missed to be dropped, got size=%d", sizeAfter)
 	}
 
 	// Now simulate DB returning new hash and caching it
@@ -253,15 +251,14 @@ func TestLookupCache_PasswordChangeInvalidation(t *testing.T) {
 		t.Errorf("Expected accountID=%d, got %d", accountID, cachedID)
 	}
 
-	// Old password should fail but entry remains (revalidation window)
+	// Old password is left to the database, and the entry is dropped
 	if _, found, _ := cache.Authenticate(address, oldPassword); found {
 		t.Error("Expected authentication failure with old password")
 	}
 
-	// Cache entry remains (revalidation window protection)
 	_, _, sizeFinal, _ := cache.GetStats()
-	if sizeFinal != 1 {
-		t.Errorf("Expected entry to remain in cache (revalidation window), got size=%d", sizeFinal)
+	if sizeFinal != 0 {
+		t.Errorf("Expected the entry the old password missed to be dropped, got size=%d", sizeFinal)
 	}
 }
 
@@ -496,5 +493,36 @@ func TestLookupCache_PositiveCacheDifferentPasswordAllowsRevalidation(t *testing
 
 	if cachedID2 != 0 {
 		t.Errorf("Expected accountID=0 for revalidation, got %d", cachedID2)
+	}
+}
+
+// TestLookupCache_PasswordMissDropsPositiveEntry: a password that misses a fresh
+// positive entry is left to the database, and the entry is dropped first. During a
+// database outage the database gives no verdict and the login is not counted by the
+// auth rate limiter; a kept entry would still sign in its password, so every guess
+// during the outage would be checked against it, unseen by the rate limiter, until
+// the entry was older than positive_revalidation_window.
+func TestLookupCache_PasswordMissDropsPositiveEntry(t *testing.T) {
+	cache := New("test", "test", 10*time.Second, 10*time.Second, 100, time.Hour, 30*time.Second)
+	defer cache.Stop(context.Background())
+
+	address := "user@example.com"
+	password := "cachedpassword"
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("Failed to generate password hash: %v", err)
+	}
+	cache.SetSuccess(address, 42, string(hash), password)
+	other := "other@example.com"
+	cache.SetSuccess(other, 43, string(hash), password)
+
+	if id, found, err := cache.Authenticate(address, "guess-1"); found || err != nil {
+		t.Fatalf("Authenticate with a guess = (%d, %v, %v), want (0, false, nil): left to the database", id, found, err)
+	}
+	if id, found, _ := cache.Authenticate(address, password); found {
+		t.Errorf("Authenticate with the cached password after a guess missed the entry: account %d from the cache, want a database check (the guess left the cached login in place)", id)
+	}
+	if _, found, _ := cache.Authenticate(other, password); !found {
+		t.Error("Authenticate for another address: not found, want its cached login (a miss drops only the entry it missed)")
 	}
 }
