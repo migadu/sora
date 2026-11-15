@@ -2,6 +2,7 @@ package uploader
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -120,10 +121,49 @@ func TestOrphanSweepDoesNotSubtractAFileThisRunNeverCounted(t *testing.T) {
 	}
 }
 
+// A refresh that cannot measure the backlog does not re-base the count, so an orphan
+// staged before it is still counted, and sweeping it must take its bytes out. Were the
+// sweep's bookkeeping dropped when a refresh begins rather than when one re-bases,
+// every orphan swept during a run of failing refreshes (a cancelled or duplicate
+// delivery leaves one) would stay counted until a refresh succeeds, and the guard
+// would refuse deliveries into an emptying spool.
+func TestOrphanSweepSubtractsAnOrphanAFailedRefreshLeftCounted(t *testing.T) {
+	w, rdb, _, _, _ := setupTestWorker(t)
+	w.maxStagingSize = 1000
+	rows := newPendingRows()
+	rdb.ExistingPendingUploadsFunc = rows.existing
+	rdb.PendingUploadBacklogFunc = func(ctx context.Context, instanceID string, maxAttempts int) (UploadBacklog, error) {
+		return UploadBacklog{}, errors.New("database unavailable")
+	}
+
+	deliver(t, w, rows, "a", 600)
+	orphan := stageOrphan(t, w, "b", 300)
+	if err := w.monitorStuckUploads(context.Background()); err != nil {
+		t.Fatalf("monitorStuckUploads: %v", err)
+	}
+	if got := stagingSize(w); got != 900 {
+		t.Fatalf("staging size = %d after a refresh that could not measure the backlog, want the local 900", got)
+	}
+
+	ageStaged(t, orphan)
+	if err := w.cleanupOrphanedFiles(context.Background()); err != nil {
+		t.Fatalf("cleanupOrphanedFiles: %v", err)
+	}
+	requireSwept(t, orphan)
+
+	if got := stagingSize(w); got != 600 {
+		t.Errorf("staging size = %d after sweeping an orphan the failed refresh left counted, want the 600 bytes still staged", got)
+	}
+	if w.IsStagingLimitExceeded(400) {
+		t.Errorf("a 400-byte delivery is refused with 600 bytes staged under a 1000-byte limit (counted %d)", stagingSize(w))
+	}
+}
+
 // What the count does hold must still leave it: an orphan staged while the refresh
 // measured the backlog, which the refresh counts as it is on disk, and one staged
-// after it. (In production the sweep reaches these only when the refresh has not
-// re-based the count for longer than the grace period.)
+// after it. (In production the sweep reaches these when cleanup_grace_period is
+// shorter than the 5-minute refresh interval, or when refreshes have failed for
+// longer than the grace period.)
 func TestOrphanSweepSubtractsOrphansStagedSinceTheRefreshBegan(t *testing.T) {
 	w, rdb, _, _, _ := setupTestWorker(t)
 	w.maxStagingSize = 1000
