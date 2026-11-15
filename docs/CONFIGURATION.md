@@ -667,7 +667,7 @@ See [CLUSTER.md](CLUSTER.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `enabled` | bool | `false` | Share affinities across the cluster. |
+| `enabled` | bool | `true` | Share affinities across the cluster. |
 | `ttl` | duration | `"24h"` | How long an affinity lasts. |
 | `cleanup_interval` | duration | `"1h"` | How often expired affinities are removed. |
 | `cache_path` | string | none | SQLite file that keeps affinities across restarts. Unset keeps them in memory only. |
