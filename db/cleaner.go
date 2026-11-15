@@ -702,17 +702,31 @@ func (d *Database) DeleteFTSRowsForAccount(ctx context.Context, tx pgx.Tx, accou
 		return 0, nil
 	}
 
-	// The LIMIT is in the subquery, so at most limit advisory locks are taken (see the
-	// lock table note on DeleteMessagesFTSByKeyBatch). A row the FTS worker holds is skipped,
-	// as is a body whose lock is held; both are retried by a later batch.
+	// Bound the candidates first so at most limit advisory locks are taken (see the lock
+	// table note on DeleteMessagesFTSByKeyBatch), and acquire the advisory locks BEFORE
+	// locking messages_fts_v2 rows FOR UPDATE: locking the rows first would retain heap
+	// tuple locks on skipped hashes and deadlock with another drain's fillWaitingFTSRows.
+	// A row the FTS worker holds is skipped, as is a body whose lock is held; both are
+	// retried by a later batch.
 	rows, err := tx.Query(ctx, `
-		SELECT c.content_hash
-		FROM (SELECT content_hash FROM messages_fts_v2
-		      WHERE account_id = $1
-		      ORDER BY content_hash
-		      FOR UPDATE SKIP LOCKED
-		      LIMIT $2) c
-		WHERE pg_try_advisory_xact_lock($3, hashtext(c.content_hash))
+		WITH candidates AS MATERIALIZED (
+			SELECT content_hash
+			FROM messages_fts_v2
+			WHERE account_id = $1
+			ORDER BY content_hash
+			LIMIT $2
+		),
+		locked_hashes AS MATERIALIZED (
+			SELECT content_hash
+			FROM candidates
+			WHERE pg_try_advisory_xact_lock($3, hashtext(content_hash))
+		)
+		SELECT v.content_hash
+		FROM messages_fts_v2 v
+		JOIN locked_hashes l ON v.content_hash = l.content_hash
+		WHERE v.account_id = $1
+		ORDER BY v.content_hash
+		FOR UPDATE OF v SKIP LOCKED
 	`, accountID, limit, consts.SoraFTSOrphanSweepLockClassID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to lock fts rows for account %d: %w", accountID, err)
