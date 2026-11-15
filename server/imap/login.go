@@ -185,7 +185,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 	// them, so a master login prepares the account exactly like a regular one
 	// (default mailboxes, cache warmup, connection tracking, kick poller).
 	var AccountID int64
-	method := "main_db"
+	var method string
 
 	// Master username authentication: user@domain.com@MASTER_USERNAME, with the master
 	// password. Any other password in that form is not answered here: it is the base
@@ -247,11 +247,11 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 
 		s.DebugLog("authentication attempt", "address", addressParsed.BaseAddress())
 
-		// Use base address (without +detail and without suffix) for authentication
-		AccountID, err = s.server.Authenticate(ctx, addressParsed.BaseAddress(), password)
+		// Use base address (without +detail and without suffix) for authentication.
+		// Its result is logged here, once, with the session's fields.
+		var reason string
+		AccountID, method, reason, err = s.server.Authenticate(ctx, addressParsed.BaseAddress(), password)
 		if err != nil {
-			s.DebugLog("authentication failed", "error", err)
-
 			// Check if error is due to context cancellation (server shutdown)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				// Server is shutting down - return temporary failure without recording as auth failure
@@ -268,6 +268,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 			// section 3, "a subsystem is down"), not counted as a failed login, or clients
 			// retrying a saved password through an outage stay blocked after it.
 			if server.IsTemporaryAuthFailure(err) {
+				s.WarnLog("authentication unavailable", "address", addressParsed.BaseAddress(), "reason", reason, "method", method, "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
 				return &imap.Error{
 					Type: imap.StatusResponseTypeNo,
@@ -276,6 +277,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 				}
 			}
 
+			s.InfoLog("authentication failed", "address", addressParsed.BaseAddress(), "reason", reason, "cached", false, "method", method)
 			if masterForm {
 				// Kept for the operator debugging a client with the wrong master password.
 				s.WarnLog("master username authentication failed (invalid master password)")
@@ -339,10 +341,11 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 	// Log authentication with alias detection, once the session's user and account_id
 	// fields name the account
 	loginAddr := addressParsed.BaseAddress()
+	cached := method == "cache"
 	if loginAddr != primaryAddr.FullAddress() {
-		s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "cached", false, "method", method, "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+		s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "cached", cached, "method", method, "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 	} else {
-		s.InfoLog("authentication successful", "address", loginAddr, "cached", false, "method", method, "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+		s.InfoLog("authentication successful", "address", loginAddr, "cached", cached, "method", method, "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 	}
 
 	// Domain and user tracking
