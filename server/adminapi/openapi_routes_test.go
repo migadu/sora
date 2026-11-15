@@ -66,10 +66,10 @@ func registeredRoutes(t *testing.T) map[string][]string {
 			if !ok {
 				t.Fatalf("%s: handler is not wrapped in routeHandler/multiMethodHandler; teach this test its methods", path)
 			}
-			switch ident, _ := wrapper.Fun.(*ast.Ident); {
-			case ident != nil && ident.Name == "routeHandler":
+			switch sel, _ := wrapper.Fun.(*ast.SelectorExpr); {
+			case sel != nil && sel.Sel.Name == "routeHandler":
 				routes[path] = append(routes[path], unquote(wrapper.Args[0]))
-			case ident != nil && ident.Name == "multiMethodHandler":
+			case sel != nil && sel.Sel.Name == "multiMethodHandler":
 				for _, elt := range wrapper.Args[0].(*ast.CompositeLit).Elts {
 					routes[path] = append(routes[path], unquote(elt.(*ast.KeyValueExpr).Key))
 				}

@@ -168,7 +168,7 @@ type UploaderCache interface {
 }
 
 type UploadWorker struct {
-	cleanupGracePeriod time.Duration // set via SetCleanupGracePeriod; 0 → default 1h
+	cleanupGracePeriod time.Duration // set via SetCleanupGracePeriod; <= 0 → default 1h
 	rdb                UploaderDB
 	s3                 UploaderS3
 	cache              UploaderCache
@@ -456,7 +456,7 @@ func (w *UploadWorker) Stop() {
 // record) has committed before the cleanup consults the database.
 //
 // Set from cfg.Uploader.GetCleanupGracePeriod() at startup.
-// If never called (or called with 0), the default of 1 hour is used.
+// If never called (or called with a value <= 0), the default of 1 hour is used.
 func (w *UploadWorker) SetCleanupGracePeriod(d time.Duration) {
 	w.cleanupGracePeriod = d
 }
@@ -1458,7 +1458,9 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 	// on every retry and the message was permanently lost (see incident
 	// upload id=6197517, account=22385, hash=66e220f4…).
 	gracePeriod := w.cleanupGracePeriod
-	if gracePeriod == 0 {
+	if gracePeriod <= 0 {
+		// A negative value would put the cutoff in the future and make every
+		// staged body a candidate, however fresh.
 		gracePeriod = time.Hour // safe default - see SetCleanupGracePeriod
 	}
 	cutoffTime := time.Now().Add(-gracePeriod)

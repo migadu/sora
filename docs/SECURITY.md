@@ -131,13 +131,14 @@ balancers.
 |---|---|
 | PROXY protocol | A listener with `proxy_protocol = true` accepts connections only from these addresses (3.2). |
 | Client address forwarding | IMAP ID forwarding fields, POP3 `XCLIENT`, and LMTP `XCLIENT`/`XRCPTFORWARD` are honoured only from these addresses. From anyone else they are ignored (IMAP) or refused (POP3: `-ERR Connection not from trusted proxy`). |
-| Per-IP connection limit | Connections from these addresses do not count against `max_connections_per_ip` (section 4). |
+| Per-IP connection limit | Connections from these addresses do not count against `max_connections_per_ip`. Behind a PROXY header the address is the client the header names, not the load balancer that sent it (section 4). |
 | Authentication rate limiting | These addresses are exempt, unless the server's `auth_rate_limit.exempt_networks` says otherwise ([AUTHENTICATION.md](AUTHENTICATION.md#105-exempt-networks)). |
 | LMTP backend admission | Only these addresses may connect to an `lmtp` listener. **When the list is empty**, the LMTP backend accepts `127.0.0.0/8`, `::1`, `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16` instead. |
 | LMTP proxy admission | Only these addresses may connect to an `lmtp_proxy` listener. Other connections are closed and logged as `LMTP Proxy: Connection rejected - not from trusted network`. An `lmtp_proxy` with an empty list is reported at startup. |
 
 All of these check the TCP peer, the host that actually connected, except the rate-limit exemption,
-which checks the client address after forwarding.
+which checks the client address after forwarding, and the per-IP limit, which checks the client a
+PROXY header names when there is one.
 
 Sora reads `trusted_networks` at startup. A SIGHUP reload logs
 `Config reload: servers.trusted_networks changed but requires restart to take effect; ...` and keeps
@@ -181,10 +182,14 @@ With `proxy_protocol = true`:
 - A connection from an address **not** in `trusted_networks` is closed at once, without a reply.
 - A connection from a trusted address must send a valid header within `proxy_protocol_timeout`, or
   it is closed. There is no "optional" mode.
-- The client address from the header is used for logs and rate limiting. The trust checks (which
-  hosts may send a header, may forward with IMAP ID or XCLIENT, or may use master SASL) use the TCP
-  peer.
-- `max_connections_per_ip` does not apply on that listener (section 4).
+- The client address from the header is used for logs, rate limiting and `max_connections_per_ip`.
+  The trust checks (which hosts may send a header, may forward with IMAP ID or XCLIENT, or may use
+  master SASL) use the TCP peer.
+- A client the header names is exempt from `max_connections_per_ip` only when its own address is in
+  `trusted_networks`: the load balancer's address does not exempt the clients behind it. A header
+  that names no client (`LOCAL` or `UNKNOWN`) counts against the TCP peer, which is trusted and so
+  exempt. On `imap`, `pop3` and `managesieve`, a client the header names that is refused for its own
+  address gets a refusal greeting instead of a silent close (section 4).
 - Headers are read in parallel, at most 1024 at a time per listener, so a peer that never sends its
   header delays only its own connection.
 
@@ -215,18 +220,36 @@ Where each applies:
 | Key | `imap`, `pop3`, `managesieve` | `imap_proxy`, `pop3_proxy`, `managesieve_proxy` |
 |---|---|---|
 | `max_connections` | yes | yes |
-| `max_connections_per_ip` | yes, except for trusted networks; not applied when `proxy_protocol = true` | yes, except for trusted networks |
+| `max_connections_per_ip` | yes, except for trusted networks; with `proxy_protocol = true` it counts the client the header names | as on the backends |
 | `max_connections_per_user` | enforced, per listener | enforced across the cluster; needs `[cluster]`, otherwise not enforced |
 | `max_connections_per_user_per_ip` | as above; on `imap` the IP is the client's real address, as forwarded by a proxy | as above |
 
 `max_connections` also applies to `lmtp` (unset, `0` or less gives 1000) and `lmtp_proxy` listeners.
 `lmtp_proxy` ignores the per-user limits, with a warning.
 
+Behind Sora proxies that send PROXY headers (`remote_use_proxy_protocol`), a backend's
+`max_connections_per_ip` limits each client a second time, by the address the proxy names. Set it no
+lower than on the proxies, or to `0` to leave the limit to them.
+
 What a client sees:
 
 - Over `max_connections` or `max_connections_per_ip`: the TCP connection is closed before any
   greeting or TLS handshake. Sora sends no banner on purpose, so a flooder cannot see where the limit
-  is.
+  is. On `imap`, a connection from an IP the authentication rate limiter has blocked is closed the
+  same way.
+- The exception is a client named by a PROXY header on an `imap`, `pop3` or `managesieve` listener,
+  when it is refused for its own address: over `max_connections_per_ip`, or, on `imap`, blocked by
+  the rate limiter. Such a client is answered. The TLS handshake completes (on an implicit-TLS
+  listener), then Sora sends a refusal greeting and closes the connection:
+  `* BYE [LIMIT] Too many connections` (IMAP; a blocked IP gets
+  `* BYE [ALERT] Too many failed authentication attempts. Please try again later.`),
+  `-ERR [SYS/TEMP] Too many connections` (POP3), `NO (TRYLATER) "Too many connections"`
+  (ManageSieve). The header's sender is a proxy or load balancer, not the client: a Sora proxy that
+  saw its backend close the socket before the TLS handshake would count a backend failure and could
+  mark a healthy backend down for every user. The refusal greeting fails only that client's login.
+  Over `max_connections` the connection is still closed silently, and so is every connection that
+  `imap_proxy`, `pop3_proxy` and `managesieve_proxy` refuse over `max_connections_per_ip`, with or
+  without a PROXY header.
 - Over a per-user limit on a backend, after a correct login: `NO [LIMIT] Maximum connections reached`
   (IMAP), or a temporary error, `-ERR [SYS/TEMP]` (POP3) or `NO (TRYLATER)` (ManageSieve).
 - Over a per-user limit on a proxy: `<tag> NO [LIMIT] Too many connections` and

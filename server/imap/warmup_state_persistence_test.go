@@ -1,6 +1,8 @@
 package imap
 
 import (
+	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +12,10 @@ import (
 	"time"
 
 	"github.com/migadu/sora/cache"
+	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server/uploader"
+	"github.com/migadu/sora/storage"
 )
 
 // mockCacheForState is a minimal mock that satisfies cache.GetBasePath()
@@ -548,6 +554,65 @@ func TestWarmupStateNamesArePortable(t *testing.T) {
 		}
 		if _, ok := b.lastWarmupTimes.Load(int64(2)); !ok {
 			t.Errorf("server %q lost its own persisted entry", b.name)
+		}
+	}
+}
+
+// A cache without a base path, the zero-value cache.Cache that many server fixtures
+// pass, has no directory to keep warmup state in. The server must not fall back to
+// its working directory, which a path joined onto the empty base path names: started
+// with warmup enabled it read and removed state files there, and on Close it wrote
+// one, so tests left .sora_warmup_state.* files in the source tree (#995, #997).
+func TestWarmupStateWithoutCacheDirectoryLeavesWorkingDirectoryAlone(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	const name = "warmup-no-cache-dir"
+	state := fmt.Sprintf("42 %d\n", time.Now().Unix())
+	files := []string{
+		warmupStateFile, // the file all servers used to share
+		fmt.Sprintf("%s.%x", warmupStateFile, sha256.Sum256([]byte(name))),
+	}
+	for _, f := range files {
+		if err := os.WriteFile(f, []byte(state), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv, err := New(ctx, name, "localhost", "127.0.0.1:0", &storage.S3Storage{}, &resilient.ResilientDatabase{}, &uploader.UploadWorker{}, &cache.Cache{}, IMAPServerOptions{
+		AppendLimit:    DefaultAppendLimit,
+		MaxConnections: 10,
+		Config:         &config.Config{},
+		EnableWarmup:   true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, ok := srv.lastWarmupTimes.Load(int64(42)); ok {
+		t.Error("server loaded warmup state from its working directory")
+	}
+	srv.lastWarmupTimes.Store(int64(7), time.Now())
+	srv.Close()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range entries {
+		got = append(got, e.Name())
+	}
+	if len(got) != len(files) {
+		t.Errorf("working directory holds %q, want only the files the test wrote %q", got, files)
+	}
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Errorf("%s: %v", f, err)
+		} else if string(b) != state {
+			t.Errorf("%s was rewritten: %q, want %q", f, b, state)
 		}
 	}
 }

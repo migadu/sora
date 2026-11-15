@@ -61,7 +61,9 @@ type Session struct {
 	// LMTP sessions can contain multiple RCPT TO commands (multiple recipients).
 	// We register the session as a "connection" against each recipient account we handle.
 	// IMPORTANT: s.accountID is overwritten per RCPT; if we only unregister the last one,
-	// earlier recipients would leak connection counts permanently.
+	// earlier recipients would leak connection counts permanently. Each account is
+	// registered at most once per session (a backend reconnect does not register it
+	// again), so close() unregisters each entry exactly once.
 	registeredAccountIDs map[int64]struct{}
 
 	// Per-transaction state. The backend's view of a transaction must stay the MTA's:
@@ -249,8 +251,10 @@ func (s *Session) handleConnection() {
 				}
 				s.sendResponse("250-ENHANCEDSTATUSCODES")
 				s.sendResponse("250-8BITMIME")
-				s.sendResponse("250-SMTPUTF8")
-				s.sendResponse("250 DSN")
+				// No DSN, as on the backend: neither issues a "delivered" DSN (RFC 3461
+				// §5.2.3), so the MTA keeps the duties of §5.2.2 (a "relayed" DSN for
+				// NOTIFY=SUCCESS). DSN parameters sent anyway are dropped, not forwarded.
+				s.sendResponse("250 SMTPUTF8")
 			} else {
 				s.sendResponse(fmt.Sprintf("250 %s", s.server.hostname))
 			}
@@ -627,8 +631,21 @@ func (s *Session) handleConnection() {
 			s.sendResponse("221 2.0.0 Bye")
 			return
 
+		case "VRFY":
+			// Every SMTP server MUST support VRFY (RFC 5321 section 4.5.1), and
+			// one that does not verify MUST answer 252 (section 7.3), as the
+			// backend does.
+			s.sendResponse("252 2.5.0 Cannot VRFY user, but will accept message")
+
+		case "EXPN", "HELP", "SEND", "SOML", "SAML", "TURN", "BDAT", "AUTH", "XCLIENT":
+			// Known commands the proxy does not implement: 502 (RFC 5321 section
+			// 4.2.4). BDAT, AUTH and XCLIENT are the backend's, never advertised
+			// here.
+			s.sendResponse(fmt.Sprintf("502 5.5.1 %s command not implemented", command))
+
 		default:
-			s.sendResponse("502 5.5.2 Command not implemented")
+			// Not echoed: the verb is whatever the client sent.
+			s.sendResponse("500 5.5.2 Syntax error, command unrecognized")
 		}
 	}
 }
@@ -714,8 +731,10 @@ func (s *Session) ErrorLog(msg string, keyvals ...any) {
 // Allowed RCPT TO parameters for LMTP:
 //   - XRCPTFORWARD: Dovecot-specific forwarding information (original recipient)
 //
-// Stripped parameters (SMTP-only, not supported by typical LMTP servers):
-//   - NOTIFY, ORCPT, RET, ENVID: DSN extensions (RFC 3461)
+// Stripped parameters:
+//   - NOTIFY, ORCPT: DSN (RFC 3461 §4.1, §4.2), which neither the proxy nor the
+//     backend announces; an MTA should not send them, but some do. RET and ENVID,
+//     the DSN parameters of MAIL (§4.3, §4.4), are dropped by backendMailFrom.
 //   - Any other unknown ESMTP parameters
 //
 // Examples:
@@ -1466,8 +1485,8 @@ func (s *Session) invalidateLookupCache(reason string) {
 
 // forwardRCPT sends the RCPT TO command to backend and handles response interception
 func (s *Session) forwardRCPT(command string) {
-	// Strip unsupported ESMTP parameters from RCPT TO before forwarding to backend
-	// Most ESMTP extensions (especially DSN) are SMTP-specific and not supported by LMTP
+	// Strip the RCPT TO parameters the backend does not take before forwarding
+	// (DSN parameters among them: neither the proxy nor the backend announces DSN).
 	cleanedCommand := stripUnsupportedRCPTParameters(command)
 	if cleanedCommand != command {
 		s.DebugLog("Stripped unsupported ESMTP parameters from RCPT TO", "original", command, "cleaned", cleanedCommand)
@@ -1660,6 +1679,12 @@ func (s *Session) registerConnection() error {
 
 	// Use cached client address (real IP) to match UnregisterConnection in close()
 	if s.server.connTracker != nil {
+		// One LMTP session counts once per account, however many backend connections
+		// it opens: after a lost backend (loseBackend) the next RCPT TO reconnects and
+		// lands here again, and close() unregisters each account once.
+		if _, ok := s.registeredAccountIDs[s.accountID]; ok {
+			return nil
+		}
 		err := s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "LMTP", s.clientAddr)
 		if err != nil {
 			return err
@@ -1754,6 +1779,7 @@ func isSMTPUTF8Capability(line string) bool {
 }
 
 // backendMailFrom is the MAIL command sent to the backend for the current transaction.
+// The MTA's other MAIL parameters (RET and ENVID among them) are not forwarded.
 // The SMTPUTF8 parameter goes with it only when the backend advertised the extension
 // (RFC 6531 §3.2): a backend without it gets the plain command and, if the envelope is
 // in fact non-ASCII, decides for itself — sora backends accept it — which is what keeps

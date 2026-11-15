@@ -285,8 +285,8 @@ func hasLineWith(logs string, parts ...string) bool {
 	return false
 }
 
-// proxyNodeConfig is a proxy node: no [database] (so start-up runs it without one),
-// named pools and a relay.
+// proxyNodeConfig is a proxy node: no [database] (so start-up runs it without one, with
+// a remote lookup for every user), named pools and a relay.
 const proxyNodeConfig = `
 bcrypt_cost = 12
 
@@ -303,6 +303,10 @@ default = true
 type = "imap_proxy"
 name = "imap-proxy"
 addr = ":1993"
+
+[server.remote_lookup]
+enabled = true
+url = "https://lookup.example.com/lookup?email=$email"
 `
 
 // reportsRestart reports whether a restart notice in logs names key as a whole field.
