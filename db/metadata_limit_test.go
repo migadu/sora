@@ -108,3 +108,114 @@ func TestMetadataSizeQuotaAccountsForOverwrites(t *testing.T) {
 		t.Fatalf("expected MetadataErrQuotaExceeded, got %T: %v", err, err)
 	}
 }
+
+// TestMetadataOverLimitAccountCanShrink verifies that an account already past a
+// count or size limit (the limit was lowered after the entries were stored) can
+// get back under it one command at a time. Only a command that grows the usage
+// is refused: RFC 5464 §4.3 sends [METADATA TOOMANY] when the server "is unable
+// to set a new annotation because the maximum number of allowed annotations has
+// already been reached", and RFC 9208 §4.3.1 sends OVERQUOTA when "the addition
+// of the message(s) puts the target mailbox over any one of its quota limits".
+func TestMetadataOverLimitAccountCanShrink(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping database integration test")
+	}
+
+	db := setupTestDatabase(t)
+	ctx := context.Background()
+
+	set := func(t *testing.T, accountID int64, entries map[string]*[]byte, limits *MetadataLimits) error {
+		t.Helper()
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		if err := db.SetMetadata(ctx, tx, accountID, nil, entries, limits); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+
+	// newAccount stores /private/k0 .. /private/k3, 4 bytes each, with no
+	// limits: 4 entries and 16 bytes.
+	newAccount := func(t *testing.T) int64 {
+		t.Helper()
+		accountID := createTestAccount(t, db, fmt.Sprintf("test-meta-over-%d@example.com", time.Now().UnixNano()), "password")
+		require.NoError(t, set(t, accountID, map[string]*[]byte{
+			"/private/k0": bytePtr([]byte("val0")),
+			"/private/k1": bytePtr([]byte("val1")),
+			"/private/k2": bytePtr([]byte("val2")),
+			"/private/k3": bytePtr([]byte("val3")),
+		}, nil))
+		return accountID
+	}
+
+	requireRefused := func(t *testing.T, err error, want MetadataErrorType) {
+		t.Helper()
+		var metaErr *MetadataError
+		require.ErrorAs(t, err, &metaErr)
+		require.Equal(t, want, metaErr.Type, "error: %v", err)
+	}
+
+	t.Run("count", func(t *testing.T) {
+		limits := &MetadataLimits{MaxEntriesPerServer: 2}
+
+		cases := []struct {
+			name    string
+			entries map[string]*[]byte
+		}{
+			{"delete", map[string]*[]byte{"/private/k0": nil}},
+			{"overwrite", map[string]*[]byte{"/private/k1": bytePtr([]byte("v"))}},
+			{"delete absent", map[string]*[]byte{"/private/none": nil}},
+			{"add and delete", map[string]*[]byte{"/private/new": bytePtr([]byte("v")), "/private/k2": nil}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				accountID := newAccount(t)
+				require.NoError(t, set(t, accountID, tc.entries, limits),
+					"a command adding no entry overall must not be refused with TOOMANY")
+			})
+		}
+
+		t.Run("add", func(t *testing.T) {
+			accountID := newAccount(t)
+			err := set(t, accountID, map[string]*[]byte{"/private/new": bytePtr([]byte("v"))}, limits)
+			requireRefused(t, err, MetadataErrTooMany)
+		})
+
+		t.Run("one at a time back under the limit", func(t *testing.T) {
+			accountID := newAccount(t)
+			require.NoError(t, set(t, accountID, map[string]*[]byte{"/private/k0": nil}, limits))
+			require.NoError(t, set(t, accountID, map[string]*[]byte{"/private/k1": nil}, limits))
+			// At the limit now: one more entry is still refused.
+			err := set(t, accountID, map[string]*[]byte{"/private/new": bytePtr([]byte("v"))}, limits)
+			requireRefused(t, err, MetadataErrTooMany)
+		})
+	})
+
+	t.Run("size", func(t *testing.T) {
+		limits := &MetadataLimits{MaxTotalSize: 8}
+
+		cases := []struct {
+			name    string
+			entries map[string]*[]byte
+		}{
+			{"delete", map[string]*[]byte{"/private/k1": nil}},
+			{"shrink", map[string]*[]byte{"/private/k1": bytePtr([]byte("v"))}},
+			{"same size", map[string]*[]byte{"/private/k1": bytePtr([]byte("VAL1"))}},
+			{"grow one shrink another", map[string]*[]byte{"/private/k1": bytePtr([]byte("val1+")), "/private/k2": nil}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				accountID := newAccount(t)
+				require.NoError(t, set(t, accountID, tc.entries, limits),
+					"a command not increasing the total size must not be refused with OVERQUOTA")
+			})
+		}
+
+		t.Run("grow", func(t *testing.T) {
+			accountID := newAccount(t)
+			err := set(t, accountID, map[string]*[]byte{"/private/k1": bytePtr([]byte("val1+"))}, limits)
+			requireRefused(t, err, MetadataErrQuotaExceeded)
+		})
+	})
+}

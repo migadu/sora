@@ -93,8 +93,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Apply progressive authentication delay BEFORE any other checks
-	if err := server.ApplyAuthenticationDelay(ctx, s.authLimiter, remoteAddr, "userapi"); err != nil {
+	// Apply progressive authentication delay BEFORE any other checks. It runs after
+	// net/http set the request's write deadline, so it moves that deadline past itself.
+	if err := server.ApplyHTTPAuthenticationDelay(ctx, w, s.authLimiter, remoteAddr, "userapi", writeTimeout); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
 			logger.Info("User API: Delay queue full, rejecting connection", "email", req.Email, "remote", remoteAddr)
@@ -245,6 +246,13 @@ generateToken:
 	// can skip the DB, so fetch it here for both paths).
 	_, epoch, err := s.rdb.GetCredentialEpochWithRetry(ctx, email)
 	if err != nil {
+		if errors.Is(err, consts.ErrUserNotFound) {
+			// No active account any more: deleted since its credentials were cached
+			// (or since the lookup above). Refused, as the refresh refuses it.
+			logger.Info("HTTP Mail API: Refusing login for deleted/unknown account", "name", s.name, "email", email)
+			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+			return
+		}
 		logger.Warn("HTTP Mail API: Error fetching credential epoch", "name", s.name, "error", err)
 		s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
 		return

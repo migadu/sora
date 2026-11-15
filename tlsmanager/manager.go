@@ -66,18 +66,19 @@ type Manager struct {
 // same domain; missedKeys and orders keep a fast variant's Put from releasing the
 // domain's claim while the sibling variant still orders.
 //
-// The work is not tied to the claim it started under. A claim lapses after
-// issuanceClaimTTL whatever still runs under it, so an order started late under one
+// The work is not tied to the claim it started under. A claim is extended over the
+// work admitted under it, but the fence lets it go at its expiry whatever still runs:
+// when the fence could not be reached to extend it, an order admitted late under one
 // can still be running when its sibling's order takes a fresh claim, and neither
 // newOrder nor Put says which claim an order ran under. Each reference therefore
 // lasts until its own autocert exchange is over, across claims. The exchange is what
 // names an order: autocert sends the newOrder and stores the certificate under the
 // same context, so the end of that context ties a Put to the orders it completes.
 type issuanceClaim struct {
-	release    func(context.Context) // nil while this node holds no claim
-	expires    time.Time             // when the fence lets the claim go by itself; no later than its own expiry
-	missedKeys map[string]time.Time  // cache keys that missed Get and have not yet completed Put, until their exchange ends
-	orders     []time.Time           // accepted newOrder attempts not yet completed by their exchange's Put, by when that exchange ends
+	hold       IssuanceHold         // nil while this node holds no claim
+	expires    time.Time            // when the fence lets the claim go by itself; no later than its own expiry
+	missedKeys map[string]time.Time // cache keys that missed Get and have not yet completed Put, until their exchange ends
+	orders     []time.Time          // accepted newOrder attempts not yet completed by their exchange's Put, by when that exchange ends
 }
 
 // issuanceOrderRef records the reference taken by one newOrder attempt, so a failed
@@ -123,15 +124,27 @@ func exchangeEnd(ctx context.Context) time.Time {
 // CertificateFence is a store that cannot be partitioned into two writable copies, used
 // to decide which node runs an ACME order. Implemented over the database.
 type CertificateFence interface {
-	// TryHoldIssuance claims the right to order a certificate for domain. It returns the
-	// release for a granted claim, and a nil release when another node already holds it.
-	TryHoldIssuance(ctx context.Context, domain string, ttl time.Duration) (release func(context.Context), err error)
+	// TryHoldIssuance claims the right to order a certificate for domain for ttl. It
+	// returns the granted claim, and nil when another node already holds it.
+	TryHoldIssuance(ctx context.Context, domain string, ttl time.Duration) (IssuanceHold, error)
+}
+
+// IssuanceHold is a claim granted by a CertificateFence.
+type IssuanceHold interface {
+	// Extend moves the claim's expiry to no earlier than ttl from now. It reports false
+	// when the claim is no longer held: it was released, or it lapsed and another node
+	// took it.
+	Extend(ctx context.Context, ttl time.Duration) (bool, error)
+	// Release gives the claim back before its expiry.
+	Release(ctx context.Context)
 }
 
 const (
-	// issuanceClaimTTL bounds a claim whose holder died mid-order. It has to exceed a
-	// whole ACME exchange - order, challenge, validation, finalize - or the claim lapses
-	// while its holder is still working and a second node starts a duplicate order.
+	// issuanceClaimTTL bounds a claim whose holder died mid-order: a claim is taken, and
+	// extended, for this long, or to the end of the exchange of the work it admits if
+	// that is later. The fence lets a claim go at its expiry whatever its holder is still
+	// doing, so a claim that ended before an ACME exchange under it - order, challenge,
+	// validation, finalize - would let a second node start a duplicate order.
 	issuanceClaimTTL = 10 * time.Minute
 	// issuanceStoreGrace covers the Put that follows an exchange which succeeded just
 	// before its context ended; the cache gives up on that same context.
@@ -193,19 +206,46 @@ func (m *Manager) holdIssuanceWith(domain, cacheKey string, until time.Time, ord
 	// the claim go, though. It is given back when the certificate is stored, and an order
 	// that fails stores none: autocert retries a failed renewal 30-60 minutes later, by
 	// which time another node may hold the claim, so the retry has to ask the fence.
-	if claim.release != nil && time.Now().Before(claim.expires) {
-		recordRef()
-		return nil
+	if claim.hold != nil && time.Now().Before(claim.expires) {
+		if !until.After(claim.expires) {
+			recordRef()
+			return nil
+		}
+		// The work would outlive the claim, which can be seconds from its expiry when a
+		// renewal or a handshake re-enters a claim kept after a failed order. Extend it
+		// over the work's exchange, or the other partition's leader takes it at its
+		// expiry and orders this certificate while this node still does.
+		ctx, cancel := context.WithTimeout(context.Background(), issuanceFenceTimeout)
+		defer cancel()
+		asked := time.Now()
+		ttl := issuanceClaimTTLFor(until, asked)
+		held, err := claim.hold.Extend(ctx, ttl)
+		if err != nil {
+			// As for a claim that cannot be taken: an expired certificate is worse.
+			logger.Warn("TLS: Certificate issuance fence unavailable - ordering past the claim's expiry",
+				"domain", domain, "error", err)
+			recordRef()
+			return nil
+		}
+		if held {
+			claim.expires = asked.Add(ttl)
+			recordRef()
+			return nil
+		}
+		// The fence let the claim go before the expiry this node counts on, so this
+		// node's clock runs behind the fence's. Ask the fence again, as for any lapsed
+		// claim.
 	}
 	// The claim has lapsed, but the work started under it is still running.
-	claim.release = nil
+	claim.hold = nil
 
 	ctx, cancel := context.WithTimeout(context.Background(), issuanceFenceTimeout)
 	defer cancel()
 
 	// Taken before the fence is asked, so the claim is never thought held past its expiry.
 	asked := time.Now()
-	release, err := m.certFence.TryHoldIssuance(ctx, domain, issuanceClaimTTL)
+	ttl := issuanceClaimTTLFor(until, asked)
+	hold, err := m.certFence.TryHoldIssuance(ctx, domain, ttl)
 	if err != nil {
 		// The fence is unreachable. Allow the order: an expired certificate takes the
 		// whole node's TLS down, while the worst case here is a duplicate order that
@@ -216,20 +256,28 @@ func (m *Manager) holdIssuanceWith(domain, cacheKey string, until time.Time, ord
 		recordRef()
 		return nil
 	}
-	if release == nil {
+	if hold == nil {
 		logger.Info("TLS: Another node is ordering this certificate", "domain", domain)
 		return fmt.Errorf("%w: %s (claimed by another node)", errIssuanceDeferred, domain)
 	}
 
-	claim.release, claim.expires = release, asked.Add(issuanceClaimTTL)
+	claim.hold, claim.expires = hold, asked.Add(ttl)
 	recordRef()
 	return nil
+}
+
+// issuanceClaimTTLFor is how long a claim taken or extended at now must last to cover
+// work whose exchange ends at until. Never less than issuanceClaimTTL: every handshake
+// that misses the cache brings an exchange ending a little later than the last, and a
+// claim extended only as far as each would be extended on every handshake.
+func issuanceClaimTTLFor(until, now time.Time) time.Duration {
+	return max(issuanceClaimTTL, until.Sub(now))
 }
 
 // storeClaim records domain's claim, or forgets it once it holds neither the fence nor
 // any work. claimMu must be held.
 func (m *Manager) storeClaim(domain string, claim issuanceClaim) {
-	if claim.release == nil && !claim.busy() {
+	if claim.hold == nil && !claim.busy() {
 		delete(m.issuanceClaims, domain)
 		return
 	}
@@ -287,13 +335,13 @@ func (m *Manager) releaseKeyIssuance(domain, cacheKey string, until time.Time) {
 	delete(m.issuanceClaims, domain)
 	m.claimMu.Unlock()
 
-	if claim.release == nil {
+	if claim.hold == nil {
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), issuanceFenceTimeout)
 	defer cancel()
-	claim.release(ctx)
+	claim.hold.Release(ctx)
 }
 
 // New creates a new TLS manager based on the provided configuration.
@@ -310,6 +358,11 @@ func New(cfg config.TLSConfig, clusterMgr *cluster.Manager) (*Manager, error) {
 func newManager(cfg config.TLSConfig, clusterMgr clusterCoordinator) (*Manager, error) {
 	if !cfg.Enabled {
 		return nil, fmt.Errorf("TLS is not enabled in configuration")
+	}
+	// The provider, required keys and durations are the [tls] checks the server runs on
+	// the whole file before it starts anything (config.Config.Validate).
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 
 	m := &Manager{
@@ -336,8 +389,6 @@ func newManager(cfg config.TLSConfig, clusterMgr clusterCoordinator) (*Manager, 
 		if err := m.initLetsEncryptProvider(); err != nil {
 			return nil, fmt.Errorf("failed to initialize Let's Encrypt provider: %w", err)
 		}
-	default:
-		return nil, fmt.Errorf("unknown TLS provider: %s (must be 'file' or 'letsencrypt')", cfg.Provider)
 	}
 
 	logger.Info("TLS manager initialized", "provider", cfg.Provider)
@@ -361,10 +412,6 @@ func acmeCapableProtocols() []string {
 
 // initFileProvider initializes TLS with certificate files
 func (m *Manager) initFileProvider() error {
-	if m.config.CertFile == "" || m.config.KeyFile == "" {
-		return fmt.Errorf("cert_file and key_file are required for provider='file'")
-	}
-
 	cert, err := tls.LoadX509KeyPair(m.config.CertFile, m.config.KeyFile)
 	if err != nil {
 		return fmt.Errorf("failed to load certificate: %w", err)
@@ -406,23 +453,7 @@ func resolveFallbackDir(leCfg *config.TLSLetsEncryptConfig) string {
 
 // initLetsEncryptProvider initializes autocert for automatic certificate management
 func (m *Manager) initLetsEncryptProvider() error {
-	if m.config.LetsEncrypt == nil {
-		return fmt.Errorf("letsencrypt configuration is required for provider='letsencrypt'")
-	}
-
 	leCfg := m.config.LetsEncrypt
-
-	if leCfg.Email == "" {
-		return fmt.Errorf("letsencrypt.email is required")
-	}
-
-	if len(leCfg.Domains) == 0 {
-		return fmt.Errorf("letsencrypt.domains is required and must not be empty")
-	}
-
-	if leCfg.StorageProvider != "s3" {
-		return fmt.Errorf("only storage_provider='s3' is currently supported for Let's Encrypt")
-	}
 
 	// Initialize S3 cache
 	s3cache, err := NewS3Cache(leCfg.S3, encryptionOptions(leCfg.S3)...)

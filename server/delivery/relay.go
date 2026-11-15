@@ -307,8 +307,9 @@ func (r *HTTPRelayHandler) httpClient() *http.Client {
 			},
 			// Never follow a redirect: a followed 301/302/303 turns the POST into a
 			// body-less GET whose 2xx would count as delivered, and a 307/308 replays
-			// the message and the bearer token to the Location. The 3xx reaches the
-			// status check in sendToHTTPRelay as a failure.
+			// the message to the Location (with the bearer token when the Location is
+			// the same host or a subdomain). The 3xx reaches the status check in
+			// sendToHTTPRelay as a failure.
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},

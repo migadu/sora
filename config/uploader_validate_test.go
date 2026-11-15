@@ -60,3 +60,28 @@ func TestUploaderConfigValidateCleanupGracePeriod(t *testing.T) {
 		}
 	}
 }
+
+// [uploader] retry_interval must be positive: the lease takes rows whose last_attempt is
+// before now - retry_interval, so with 0 or less a row leased a moment ago in the same
+// pass is due again, and an upload the provider keeps refusing is retried in a tight
+// loop that never reaches the cycle backoff (#1091). Empty means the 30s default; an
+// unparseable value keeps falling back to it with a warning.
+func TestUploaderConfigValidateRetryInterval(t *testing.T) {
+	for _, v := range []string{"", "30s", "1s", "5m", "1d"} {
+		c := NewDefaultConfig().Uploader
+		c.RetryInterval = v
+		if err := c.Validate(); err != nil {
+			t.Errorf("retry_interval = %q rejected: %v", v, err)
+		}
+	}
+	for _, v := range []string{"0", "0s", "-1ns", "-30s", "-1d"} {
+		c := NewDefaultConfig().Uploader
+		c.RetryInterval = v
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("retry_interval = %q accepted", v)
+		} else if !strings.Contains(err.Error(), "retry_interval") {
+			t.Errorf("retry_interval = %q: error %q does not name the key", v, err)
+		}
+	}
+}

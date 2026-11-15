@@ -225,7 +225,7 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		Header:       messageEntity.Header.Map(),
 		Message:      fullMessageBytes,
 		MailboxExists: func(ctx context.Context, mailbox string) (bool, error) {
-			return CanFileInto(ctx, s.DeliveryCtx.RDB, recipient.AccountID, mailbox)
+			return CanFileInto(ctx, s.DeliveryCtx.RDB, s.DeliveryCtx.SharedMailboxes, recipient.AccountID, mailbox)
 		},
 	}
 

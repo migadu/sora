@@ -169,6 +169,11 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            A name in the shared namespace, the namespace root included, while
+            `[shared_mailboxes]` is enabled. The User API does not create shared
+            mailboxes.
         '409':
           description: Mailbox already exists
 

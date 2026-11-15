@@ -97,7 +97,10 @@ func TestIMAPCachedLoginDuringDatabaseOutageIsUnavailable(t *testing.T) {
 	outage.Begin()
 	defer outage.End()
 	reply := imapLoginReply(t, address, account.Email, account.Password)
-	logs.WaitForLine(t, "authentication successful", account.Email, "method=cache")
+	// The session went on to the default mailboxes, so the password check passed: the
+	// lookup cache answered it, the database could not have. The login did not
+	// succeed, so there is no "authentication successful" line to say so.
+	logs.WaitForLine(t, "failed to create default mailboxes")
 	if !strings.HasPrefix(reply, "a1 NO [UNAVAILABLE]") {
 		t.Errorf("cached LOGIN during a database outage: %q, want a1 NO [UNAVAILABLE] ...", reply)
 	}
@@ -124,10 +127,10 @@ func TestIMAPDatabaseOutageDropsCachedLogin(t *testing.T) {
 	logs := common.CaptureLogs(t)
 	outage.Begin()
 	// Before any guess the cached login still signs in. The session it opens needs the
-	// database, so the reply is not the point: the log line says where the login was
-	// answered.
+	// database, so the reply is not the point: the session going on to the default
+	// mailboxes says the lookup cache passed the password, as the database could not.
 	imapLoginReply(t, address, account.Email, account.Password)
-	logs.WaitForLine(t, "authentication successful", account.Email, "method=cache")
+	logs.WaitForLine(t, "failed to create default mailboxes")
 
 	for i := 1; i <= 3; i++ {
 		if reply := imapLoginReply(t, address, account.Email, fmt.Sprintf("guess-%d", i)); !strings.HasPrefix(reply, "a1 NO [UNAVAILABLE]") {
@@ -141,5 +144,43 @@ func TestIMAPDatabaseOutageDropsCachedLogin(t *testing.T) {
 
 	if reply := imapLoginReply(t, address, account.Email, account.Password); !strings.HasPrefix(reply, "a1 OK") {
 		t.Errorf("LOGIN after the outage: %q, want a1 OK (the guesses were counted as failed logins)", reply)
+	}
+}
+
+// TestIMAPLoginDuringDatabaseStall: a database that stops answering, so that the
+// credential lookup runs into its timeout, is a temporary failure as well, and the
+// reply says so: it is not a server shutdown.
+func TestIMAPLoginDuringDatabaseStall(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	rdb, outage := common.SetupTestDatabaseWithOutage(t)
+	account := common.CreateTestAccount(t, rdb)
+	address := common.GetRandomAddress(t)
+
+	srv, err := serverImap.New(context.Background(), "test-db-stall", "localhost", address,
+		&storage.S3Storage{}, rdb, nil, nil,
+		serverImap.IMAPServerOptions{
+			InsecureAuth:  true,
+			AuthRateLimit: common.DBOutageAuthRateLimit(),
+		})
+	if err != nil {
+		t.Fatalf("Failed to create IMAP server: %v", err)
+	}
+	go func() { _ = srv.Serve(address) }()
+	defer srv.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	outage.Stall()
+	// The first lookup may find its pooled connection dropped; the next ones stall.
+	for i := 1; i <= 3; i++ {
+		reply := imapLoginReply(t, address, account.Email, account.Password)
+		if !strings.HasPrefix(reply, "a1 NO [UNAVAILABLE]") || strings.Contains(reply, "shutting down") {
+			t.Errorf("LOGIN %d while the database stalls: %q, want a1 NO [UNAVAILABLE] that does not report a shutdown", i, reply)
+		}
+	}
+	outage.End()
+
+	if reply := imapLoginReply(t, address, account.Email, account.Password); !strings.HasPrefix(reply, "a1 OK") {
+		t.Errorf("LOGIN after the stall: %q, want a1 OK", reply)
 	}
 }

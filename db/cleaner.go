@@ -525,6 +525,24 @@ func (d *Database) DeleteMessageByHashAndMailbox(ctx context.Context, tx pgx.Tx,
 	return tag.RowsAffected(), nil
 }
 
+// livePendingUpload holds for a pending_uploads row pu that an upload can still come
+// from (see CleanupFailedUploads): one leased to an upload in flight, or one with
+// attempts left ($2) whose owner instance was seen within the liveness threshold ($3),
+// or never seen at all.
+//
+// GREATEST ignores NULLs in PostgreSQL, so it yields the most recent evidence that the
+// owning instance existed, and NULL only when there is no evidence at all, which COALESCE
+// counts as alive. That evidence is written with the database clock (heartbeats and leases
+// both use now()), so the liveness cutoff is derived from now() too rather than from this
+// node's clock. The heartbeat is read by a subquery correlated to pu.instance_id, not a
+// join, so a re-check on a newer version of pu (deleted_pending) looks up the instance
+// named on that version. It still reads the statement's heartbeat snapshot; the row
+// version guard in deleted_pending protects a concurrent re-arm with newer evidence.
+const livePendingUpload = `(pu.lease_until > now()
+	OR (pu.attempts < $2
+	    AND COALESCE(GREATEST((SELECT ih.last_seen FROM instance_heartbeats ih WHERE ih.instance_id = pu.instance_id),
+	                          pu.last_attempt) > now() - $3::interval, TRUE)))`
+
 // CleanupFailedUploads deletes message rows and their corresponding pending_uploads
 // once nothing can ever upload their bodies any more.
 // This prevents orphaned message metadata from accumulating due to persistent upload failures.
@@ -566,7 +584,16 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 	// 1. The `deleted_messages` CTE deletes old, non-uploaded messages that no pending
 	//    upload will retry any more, and returns their keys.
 	// 2. The `deleted_pending` CTE then uses these keys to remove the corresponding
-	//    entries from `pending_uploads`.
+	//    entries from `pending_uploads`, but only the same still-dead row version the
+	//    statement saw. A concurrent delivery or copy can re-arm a row while DELETE
+	//    waits for its lock. READ COMMITTED rechecks the new target version, but its
+	//    heartbeat subquery keeps the old statement snapshot, so liveness alone is
+	//    insufficient. Compare ctid with a separate snapshot lookup by primary key:
+	//    a changed row stays for a later cycle, whose snapshot can judge it afresh.
+	//    This is a statement-local version check, not a persistent row identifier:
+	//    the active snapshot keeps the old tuple from being recycled, and the DELETE's
+	//    relation lock excludes table rewrites. id remains the logical lookup key.
+	//    The old message reaped above is gone either way; a newly delivered one remains.
 	// 3. The `deleted_instances` CTE retires heartbeat rows of long-gone instances, but
 	//    only while they own no pending upload at all: as long as one exists, that row
 	//    is the evidence that permits reaping it. CTEs see the pre-statement snapshot,
@@ -575,29 +602,22 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 	//    instances silent as long, on the same terms, and not while a backend in
 	//    maintenance names the instance: otherwise a retired id would stay "known" for ever.
 	// The final SELECT returns the count of messages that were deleted.
-	//
-	// GREATEST ignores NULLs in PostgreSQL, so it yields the most recent evidence that
-	// the owning instance existed, and NULL only when there is no evidence at all. That
-	// evidence is written with the database clock (heartbeats and leases both use now()),
-	// so the liveness cutoff is derived from now() too rather than from this node's clock.
 	query := `
 		WITH deleted_messages AS (
 			DELETE FROM messages m
 			WHERE m.uploaded = FALSE AND m.created_at < $1
 			  AND NOT EXISTS (
 				SELECT 1 FROM pending_uploads pu
-				LEFT JOIN instance_heartbeats ih ON ih.instance_id = pu.instance_id
 				WHERE pu.content_hash = m.content_hash AND pu.account_id = m.account_id
-				  AND (pu.lease_until > now()
-				       OR (pu.attempts < $2
-				           AND (GREATEST(ih.last_seen, pu.last_attempt) IS NULL
-				                OR GREATEST(ih.last_seen, pu.last_attempt) > now() - $3::interval)))
+				  AND ` + livePendingUpload + `
 			  )
 			RETURNING m.content_hash, m.account_id
 		),
 		deleted_pending AS (
 			DELETE FROM pending_uploads pu
 			WHERE (pu.content_hash, pu.account_id) IN (SELECT content_hash, account_id FROM deleted_messages)
+			  AND pu.ctid = (SELECT snapshot_pu.ctid FROM pending_uploads snapshot_pu WHERE snapshot_pu.id = pu.id)
+			  AND ` + livePendingUpload + ` IS NOT TRUE
 		),
 		deleted_instances AS (
 			DELETE FROM instance_heartbeats ih
