@@ -104,7 +104,9 @@ password change drops the account's cached logins.
 
 The HTTP server's limits are fixed: 10 seconds for the request headers, 30 seconds to read
 the request, 30 seconds to write the response (this bounds a `/raw` download), 120 seconds for
-an idle keep-alive connection, and 15 seconds to finish open requests at shutdown.
+an idle keep-alive connection, and 15 seconds to finish open requests at shutdown. A login the
+rate limit delays has its 30 seconds to write from the end of the delay
+([AUTHENTICATION.md](AUTHENTICATION.md#103-progressive-delays) section 10.3).
 
 **Reload.** On SIGHUP, `jwt_secret`, `allowed_origins` and `allowed_hosts` are re-read. A
 changed `jwt_secret` makes every token signed with the old one invalid at once. An empty
@@ -893,8 +895,8 @@ call the API through the proxy.
 each is reported with a startup warning. Affinity is
 used when the block sets `enable_affinity = true` and the cluster runs its affinity store
 (`[cluster.affinity] enabled = true`). The proxy's HTTP
-limits are fixed: 30 seconds to read a request and 30 seconds to write a response, 120 seconds
-for an idle connection.
+limits are fixed: 30 seconds to read a request and 30 seconds to write a response (from the end
+of the delay for a login the proxy's rate limit delays), 120 seconds for an idle connection.
 
 The Admin API shows the proxy's backends under the name `UserAPI-{name}` at
 `GET /admin/proxy/backends` (see [ADMIN_API.md](ADMIN_API.md#13-proxy-backends-and-affinity)).
