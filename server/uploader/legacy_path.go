@@ -28,9 +28,10 @@ func sameStagedFile(legacyFile, activeFile string) bool {
 	return os.SameFile(legacyInfo, activeInfo)
 }
 
-// spoolError returns nil for an error that means the legacy spool entry at p holds no
-// body staged as uid: it is gone, or, unless uid is AnyOwner, this process cannot read
-// it, which it logs. Otherwise it returns err.
+// spoolError returns nil for an error the legacy startup check ignores: the entry at
+// p is gone, or, unless uid is AnyOwner, this process cannot read it, which it logs.
+// An unreadable entry can still contain a body recoverable after permissions are repaired.
+// Otherwise it returns err.
 func spoolError(p string, err error, uid int) error {
 	if errors.Is(err, fs.ErrPermission) && uid != AnyOwner {
 		logger.Warn("Uploader: ignoring an entry under the previous default [uploader] path that this process cannot read", "path", p, "error", err)

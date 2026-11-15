@@ -427,6 +427,12 @@ logged as a warning (`Uploader: ignoring an entry under the previous default [up
 and passed over with everything below it. `resolve`, often run as root, cannot tell which user
 the server runs as: it counts every entry and refuses when it cannot read one.
 
+The startup check assumes the service user is unchanged from the version that staged those
+bodies. Changing that user in the same upgrade, or leaving genuine old bodies unreadable, can
+make startup pass over bodies the database still needs. Inspect and drain or migrate those
+bodies before starting on the new path. File ownership does not establish that a spool belongs
+to the connected database; use the matching instance and configuration.
+
 Check the host's old spool before the first start with the new systemd unit. Its
 [`PrivateTmp=true`](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#PrivateTmp=)
 gives Sora a different `/tmp`, so the startup check cannot see the host's
