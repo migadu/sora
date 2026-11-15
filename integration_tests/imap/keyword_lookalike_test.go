@@ -5,6 +5,7 @@ package imap_test
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/stretchr/testify/assert"
@@ -30,6 +31,12 @@ func TestIMAP_KeywordLookalikesAreNotKeywords(t *testing.T) {
 	pre := dialRaw(t, server.Address)
 	untagged, tagged := pre.cmd("p", "CAPAB"+dotlessI+"LITY")
 	assert.True(t, strings.HasPrefix(tagged, "p BAD"), "CAPAB%sLITY: %s (untagged %q)", dotlessI, tagged, untagged)
+	_ = pre.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	bye, err := pre.r.ReadString('\n')
+	assert.NoError(t, err, "after CAPAB%sLITY", dotlessI)
+	assert.True(t, strings.HasPrefix(bye, "* BYE"), "after CAPAB%sLITY: %q, want BYE", dotlessI, bye)
+	_, err = pre.r.ReadString('\n')
+	assert.Error(t, err, "connection still open after BYE")
 	pre.conn.Close()
 
 	rc := dialRaw(t, server.Address)
