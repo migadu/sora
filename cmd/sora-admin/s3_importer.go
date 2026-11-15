@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/emersion/go-message/mail"
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -50,10 +51,24 @@ type S3ImporterOptions struct {
 	FTSRetention time.Duration
 }
 
+// s3ImportDB is the part of the database the S3 importer uses, satisfied by
+// *resilient.ResilientDatabase.
+type s3ImportDB interface {
+	GetAccountIDByAddressWithRetry(ctx context.Context, address string) (int64, error)
+	CreateDefaultMailboxesWithRetry(ctx context.Context, accountID int64) error
+	QueryRowWithRetry(ctx context.Context, sql string, args ...any) pgx.Row
+	GetMailboxByNameWithRetry(ctx context.Context, accountID int64, name string) (*db.DBMailbox, error)
+	InsertMessageWithRetry(ctx context.Context, options *db.InsertMessageOptions, upload db.PendingUpload) (int64, int64, error)
+	CompleteS3UploadWithRetry(ctx context.Context, hash string, accountID int64, writtenKeys []string) error
+}
+
 // S3Importer handles the S3 import process
 type S3Importer struct {
+	// ctx is the command's context, cancelled on SIGINT/SIGTERM: it stops the scan,
+	// the dry run and the import.
+	ctx     context.Context
 	s3      *resilient.ResilientS3Storage
-	rdb     *resilient.ResilientDatabase
+	rdb     s3ImportDB
 	db      *sql.DB
 	dbPath  string
 	options S3ImporterOptions
@@ -79,7 +94,7 @@ type S3ObjectInfo struct {
 }
 
 // NewS3Importer creates a new S3Importer instance
-func NewS3Importer(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, options S3ImporterOptions) (*S3Importer, error) {
+func NewS3Importer(ctx context.Context, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, options S3ImporterOptions) (*S3Importer, error) {
 	// Wrap S3 storage with resilient patterns
 	resilientS3 := resilient.NewResilientS3Storage(s3)
 	// Create temporary SQLite database to track S3 objects. Every run gets a file of its
@@ -134,6 +149,7 @@ func NewS3Importer(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, opti
 	}
 
 	return &S3Importer{
+		ctx:       ctx,
 		s3:        resilientS3,
 		rdb:       rdb,
 		db:        db,
@@ -213,7 +229,6 @@ func (si *S3Importer) scanS3Objects() error {
 	s3Prefix := fmt.Sprintf("%s/%s/", address.Domain(), address.LocalPart())
 	logger.Info("Scanning S3 bucket for user", "email", si.options.Email, "prefix", s3Prefix)
 
-	ctx := context.Background()
 	input := &s3.ListObjectsV2Input{
 		Bucket:     aws.String(si.s3.GetStorage().BucketName),
 		Prefix:     aws.String(s3Prefix),
@@ -227,8 +242,11 @@ func (si *S3Importer) scanS3Objects() error {
 	paginator := s3.NewListObjectsV2Paginator(si.s3.GetStorage().Client, input)
 
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+		page, err := paginator.NextPage(si.ctx)
 		if err != nil {
+			if ctxErr := si.ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("S3 scan interrupted: %w", ctxErr)
+			}
 			return fmt.Errorf("error listing S3 objects: %w", err)
 		}
 
@@ -309,7 +327,7 @@ func (si *S3Importer) performDryRun() error {
 	fmt.Printf("\n=== DRY RUN: S3 Import Analysis ===\n\n")
 	fmt.Printf("Analyzing S3 messages for user: %s\n\n", si.options.Email)
 
-	ctx := context.Background()
+	ctx := si.ctx
 
 	// Parse email address for user lookup
 	address, err := server.NewAddress(si.options.Email)
@@ -336,6 +354,12 @@ func (si *S3Importer) performDryRun() error {
 	var totalWouldImport, totalWouldSkip int64
 
 	for rows.Next() {
+		// An interrupt stops the report: the objects after it are not checked, and a
+		// summary would claim they were.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("dry run interrupted: %w", err)
+		}
+
 		var key, domain, localPart, contentHash, lastModified string
 		var size int64
 		if err := rows.Scan(&key, &size, &domain, &localPart, &contentHash, &lastModified); err != nil {
@@ -343,17 +367,18 @@ func (si *S3Importer) performDryRun() error {
 			continue
 		}
 
-		// Check if message already exists
+		// Check if message already exists. A failed check answers nothing: the object
+		// is not reported as new.
 		alreadyExists := false
 		if !si.options.ForceReimport {
 			// Check if any message with this content hash exists for this account
 			var count int
-			err = si.rdb.QueryRowWithRetry(ctx,
+			if err := si.rdb.QueryRowWithRetry(ctx,
 				"SELECT COUNT(*) FROM messages WHERE content_hash = $1 AND account_id = $2 AND expunged_at IS NULL",
-				contentHash, accountID).Scan(&count)
-			if err == nil && count > 0 {
-				alreadyExists = true
+				contentHash, accountID).Scan(&count); err != nil {
+				return fmt.Errorf("dry run: failed to check whether %s is already imported: %w", key, err)
 			}
+			alreadyExists = count > 0
 		}
 
 		action := "IMPORT"
@@ -382,6 +407,9 @@ func (si *S3Importer) performDryRun() error {
 			contentHash[:12]+"...", sizeStr, lastModified)
 		fmt.Printf("    Action: %s (%s)\n", action, reason)
 		fmt.Println()
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("dry run: failed to read S3 objects: %w", err)
 	}
 
 	// Overall summary
@@ -419,6 +447,9 @@ func (si *S3Importer) importFromS3() error {
 		go func(workerID int) {
 			defer wg.Done()
 			for obj := range jobs {
+				if si.ctx.Err() != nil {
+					continue // interrupted: what the feeder queued is left for the next run
+				}
 				if err := si.importS3Object(obj); err != nil {
 					logger.Info("Failed to import S3 object", "worker", workerID,
 						"progress", si.getProgressPrefix(), "key", obj.Key, "error", err)
@@ -429,7 +460,8 @@ func (si *S3Importer) importFromS3() error {
 		}(w)
 	}
 
-	// Feed jobs to workers
+	// Feed jobs to workers until the rows run out or the import is interrupted
+feed:
 	for rows.Next() {
 		var key string
 		if err := rows.Scan(&key); err != nil {
@@ -437,12 +469,22 @@ func (si *S3Importer) importFromS3() error {
 			continue
 		}
 
-		jobs <- S3ObjectInfo{Key: key}
+		select {
+		case jobs <- S3ObjectInfo{Key: key}:
+		case <-si.ctx.Done():
+			break feed
+		}
 	}
 
 	close(jobs)
 	wg.Wait()
 
+	if err := si.ctx.Err(); err != nil {
+		return fmt.Errorf("import interrupted: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read unprocessed S3 objects: %w", err)
+	}
 	return nil
 }
 
@@ -456,7 +498,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 
 	contentHash := parts[2]
 
-	ctx := context.Background()
+	ctx := si.ctx
 	address, err := server.NewAddress(si.options.Email)
 	if err != nil {
 		return fmt.Errorf("invalid email address: %w", err)
@@ -483,13 +525,16 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 		// Don't fail the import, as mailboxes might already exist
 	}
 
-	// Check if message already exists
+	// Check if message already exists. A failed check is not a "no": importing anyway
+	// would duplicate a message that is there.
 	if !si.options.ForceReimport {
 		var count int
-		err = si.rdb.QueryRowWithRetry(ctx,
+		if err := si.rdb.QueryRowWithRetry(ctx,
 			"SELECT COUNT(*) FROM messages WHERE content_hash = $1 AND account_id = $2 AND expunged_at IS NULL",
-			contentHash, accountID).Scan(&count)
-		if err == nil && count > 0 {
+			contentHash, accountID).Scan(&count); err != nil {
+			return fmt.Errorf("failed to check whether the message is already imported: %w", err)
+		}
+		if count > 0 {
 			logger.Info("Message already exists - skipping", "progress", si.getProgressPrefix(), "key", obj.Key)
 			atomic.AddInt64(&si.skippedMessages, 1)
 			si.markObjectProcessed(obj.Key, true, "already exists")
@@ -568,9 +613,18 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 		return fmt.Errorf("failed to get INBOX mailbox: %w", err)
 	}
 
+	// The insert and marking the body uploaded run to the end even if an interrupt
+	// lands between or during them: cut there, the message would stay in
+	// pending_uploads, waiting for an upload of a body that is already in S3. An
+	// interrupt before the insert leaves the object for the next run.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	writeCtx := context.WithoutCancel(ctx)
+
 	// Insert message into database
 	hostname := si.options.InstanceID
-	msgID, uid, err := si.rdb.InsertMessageWithRetry(ctx,
+	msgID, uid, err := si.rdb.InsertMessageWithRetry(writeCtx,
 		&db.InsertMessageOptions{
 			AccountID:     user.AccountID(),
 			MailboxID:     mailbox.ID,
@@ -602,7 +656,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	}
 
 	// Since the content already exists in S3, mark the upload as complete
-	err = si.rdb.CompleteS3UploadWithRetry(ctx, contentHash, user.AccountID(), []string{s3Key})
+	err = si.rdb.CompleteS3UploadWithRetry(writeCtx, contentHash, user.AccountID(), []string{s3Key})
 	if err != nil {
 		return fmt.Errorf("failed to mark S3 upload as complete: %w", err)
 	}
@@ -613,9 +667,12 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 
 	si.markObjectProcessed(obj.Key, true, "imported successfully")
 
-	// Add delay if configured
+	// Add delay if configured; an interrupt ends it
 	if si.options.ImportDelay > 0 {
-		time.Sleep(si.options.ImportDelay)
+		select {
+		case <-time.After(si.options.ImportDelay):
+		case <-ctx.Done():
+		}
 	}
 
 	return nil
