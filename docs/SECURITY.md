@@ -144,9 +144,9 @@ Most of these check the TCP peer, the host that actually connected. The exceptio
   else the TCP peer (also when the header names no client: `LOCAL` or `UNKNOWN`). A load balancer
   that sends PROXY headers is trusted to say who the client is, not to vouch for the commands that
   follow, which are the client's own. So behind a trusted layer-4 load balancer (HAProxy, nginx
-  `stream`) only a proxy whose own address is in the list, such as a Sora proxy that reaches the
-  backend through the load balancer, may forward; a client's ID fields are ignored and its
-  `XCLIENT` is refused.
+  `stream`), a proxy that reaches the backend through the load balancer may forward only when its
+  own address is in the list. Other clients have their ID forwarding fields ignored and `XCLIENT`
+  refused unless their own address is also in the list.
 - LMTP `XCLIENT` is accepted from a trusted TCP peer: an `lmtp_proxy` may send a PROXY header and
   `XCLIENT` on one connection. Its `ADDR` and `PORT` replace the address a PROXY header gave only
   when that address is itself in the list; otherwise they are ignored and the other attributes
