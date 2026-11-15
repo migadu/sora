@@ -140,8 +140,9 @@ Examples:
 func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, limit int) error {
 	// [DELETE] below rests on the body being absent from cfg.Uploader.Path. With the
 	// default path, bodies a previous release staged under its /tmp default are not
-	// there, yet intact: refuse, as the server does at start.
-	if err := uploader.CheckLegacyStaging(cfg.Uploader.Path, config.DefaultUploaderPath, legacyUploaderPath); err != nil {
+	// there, yet intact: refuse, as the server does at start. sora-admin, often run as
+	// root, does not know which user the server stages as, so every entry counts.
+	if err := uploader.CheckLegacyStaging(cfg.Uploader.Path, config.DefaultUploaderPath, legacyUploaderPath, uploader.AnyOwner); err != nil {
 		return err
 	}
 
