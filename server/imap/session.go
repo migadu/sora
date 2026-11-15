@@ -58,6 +58,16 @@ type IMAPSession struct {
 	currentNumMessages   atomic.Uint32
 	firstUnseenSeqNum    atomic.Uint32 // Sequence number of the first unseen message
 
+	// reportedHighestModSeq is the mod-sequence up to which every change of
+	// the selected mailbox has been sent to the client (HighestModSeq): the
+	// SELECT's value, then the cursor of the last poll that left nothing
+	// queued.
+	reportedHighestModSeq atomic.Uint64
+	// A NOTIFY filter can consume a flag change without sending it. The
+	// report then stays conservative until SELECT establishes a new baseline;
+	// enabling FlagChange again does not replay the consumed change.
+	reportedModSeqGap atomic.Bool
+
 	lastSelectedMailboxID int64
 	lastHighestUID        imap.UID
 	recentAboveUID        imap.UID    // Messages above this UID are \Recent in this session (RFC 3501 §2.3.2); set by SELECT
@@ -563,6 +573,8 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.mailboxTracker = nil
 	s.sessionTracker = nil
 	s.currentHighestModSeq.Store(0)
+	s.reportedHighestModSeq.Store(0)
+	s.reportedModSeqGap.Store(false)
 	s.currentNumMessages.Store(0)
 	s.firstUnseenSeqNum.Store(0)
 	s.savedSearchUIDs = nil // saved "$" result is scoped to the selected mailbox
