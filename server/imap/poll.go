@@ -3,7 +3,6 @@ package imap
 import (
 	"context"
 	"errors"
-	"sync"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
@@ -42,9 +41,17 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 	// \Seen, is between its write and its own FETCH responses (the NOTIFY pump
 	// polls concurrently), so the delta read below either precedes that write
 	// or finds it in ownStoreEcho.
+	//
+	// The lock is held until the updates this Poll queues are written, not
+	// only queued. The tracker hands them over in one batch: while that batch
+	// is being written to a slow client, a STORE or FETCH answer recorded in
+	// ownStoreEcho could otherwise be written ahead of an older state of the
+	// same row still in the batch, and that older state would be the last the
+	// client receives. (Updates still queued in the tracker are the other
+	// half: an answer records nothing while there are any, see
+	// implicitSeenAnswer.expect.)
 	s.ownStoreMu.Lock()
-	unlockOwnStore := sync.OnceFunc(s.ownStoreMu.Unlock)
-	defer unlockOwnStore()
+	defer s.ownStoreMu.Unlock()
 
 	// Create a context that signals to use the master DB if the session is pinned.
 	readCtx := ctx
@@ -405,8 +412,7 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 	// Store sessionTracker reference before releasing lock to avoid race condition
 	sessionTracker := s.sessionTracker
 
-	release() // Release lock before writing to the network
-	unlockOwnStore()
+	release() // Release the session lock before writing; ownStoreMu stays held (see above)
 
 	// Check if sessionTracker is still valid after releasing lock
 	if sessionTracker == nil {
