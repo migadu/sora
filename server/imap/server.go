@@ -687,6 +687,13 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		s.commandTimeouts.ApplyOverrides(options.CommandTimeoutOverrides)
 	}
 
+	// PREVIEW is opt-in: answering it for mail that is not on this node costs an
+	// S3 download per message. Like every capability it can still be removed
+	// per client (client_filters) or globally (disabled_caps).
+	if options.Preview.Enabled {
+		s.caps[imap.CapPreview] = struct{}{}
+	}
+
 	// Pre-compile regex patterns for capability filters for performance and correctness.
 	// Config validation refuses a pattern that does not compile; a server built
 	// without it skips the filter, which must not go unnoticed at the default level.
@@ -730,10 +737,13 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		// Only add the filter if all regex patterns are valid
 		if isValid {
 			for _, capStr := range filter.DisableCaps {
-				if imap.Cap(capStr) == imap.CapIMAP4rev1 {
+				c := config.IMAPCap(capStr)
+				if c == imap.CapIMAP4rev1 {
 					logger.Warn("IMAP: Capability filter cannot disable IMAP4rev1, go-imap selects connection protocol version from server-global capabilities", "name", name, "capability", capStr, "reason", filter.Reason)
-				} else if _, ok := alwaysAdvertisedCaps[imap.Cap(capStr)]; ok {
+				} else if _, ok := alwaysAdvertisedCaps[c]; ok {
 					logger.Warn("IMAP: Capability filter cannot disable capability, go-imap always advertises it with IMAP4rev1", "name", name, "capability", capStr, "reason", filter.Reason)
+				} else if !s.caps.Has(c) {
+					logger.Warn("IMAP: Capability filter cannot disable capability, it is not one this server can withdraw", "name", name, "entry", i+1, "capability", capStr, "reason", filter.Reason)
 				}
 			}
 			validFilters = append(validFilters, filter)
@@ -743,20 +753,14 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// Store the valid filters
 	s.capFilters = validFilters
 
-	// PREVIEW is opt-in: answering it for mail that is not on this node costs an
-	// S3 download per message. Like every capability it can still be removed
-	// per client (client_filters) or below (disabled_caps).
-	if options.Preview.Enabled {
-		s.caps[imap.CapPreview] = struct{}{}
-	}
-
 	// Remove globally disabled capabilities from the server
 	if len(options.DisabledCaps) > 0 {
 		for _, capStr := range options.DisabledCaps {
-			if _, ok := alwaysAdvertisedCaps[imap.Cap(capStr)]; ok {
+			c := config.IMAPCap(capStr)
+			if _, ok := alwaysAdvertisedCaps[c]; ok {
 				logger.Warn("IMAP: Cannot disable capability, go-imap always advertises it with IMAP4rev1", "name", name, "capability", capStr)
-			} else if !s.caps.Has(imap.Cap(capStr)) {
-				logger.Debug("IMAP: WARNING - Cannot disable capability, not found in defaults", "name", name, "capability", capStr)
+			} else if !s.caps.Has(c) {
+				logger.Warn("IMAP: Cannot disable capability, it is not one this server can withdraw", "name", name, "capability", capStr)
 			}
 		}
 		if removed := disableCapabilities(s.caps, options.DisabledCaps); len(removed) > 0 {
@@ -1812,7 +1816,7 @@ func (s *IMAPServer) filterCapabilitiesForClientExcept(sessionCaps imap.CapSet, 
 
 			names := make([]string, 0, len(filter.DisableCaps))
 			for _, capStr := range filter.DisableCaps {
-				if imap.Cap(capStr) == imap.CapIMAP4rev1 {
+				if config.IMAPCap(capStr) == imap.CapIMAP4rev1 {
 					continue
 				}
 				names = append(names, capStr)
@@ -1883,7 +1887,8 @@ func (s *IMAPServer) clientMatches(clientName, clientVersion, tlsFingerprint str
 		return clientNameMatches && clientVersionMatches
 	}
 
-	// If we reach here, no filter criteria were specified (shouldn't happen due to validation)
+	// No JA4 pattern matched, and there is no name or version pattern.
+	// ClientCapabilityFilter.Validate refuses a filter without any pattern.
 	return false
 }
 

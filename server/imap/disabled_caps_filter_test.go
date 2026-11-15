@@ -358,6 +358,7 @@ func TestDisabledCaps_RefusesRemovingBothIMAPVersions(t *testing.T) {
 		{"IMAP4rev1", "ESEARCH"},
 		{"IMAP4rev1", "SEARCHRES"},
 		{"IMAP4rev1", "CHILDREN"},
+		{"imap4rev1", "move"}, // capability names are case-insensitive (#1114)
 	} {
 		if _, err := newServer(invalid); err == nil {
 			t.Errorf("disabled_caps = %v: expected error when neither IMAP4rev1 nor IMAP4rev2 remains", invalid)
