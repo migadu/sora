@@ -322,6 +322,30 @@ func TestIMAP_ListSubscribedKeysNamesAsTheDatabaseDoes(t *testing.T) {
 		})
 	}
 
+	// The issue's own steps: "İNBOX" subscribed next to the INBOX, where the database
+	// keeps the two apart (ICU). Both are subscribed, so both are listed.
+	t.Run("İNBOX next to INBOX", func(t *testing.T) {
+		name := "İNBOX"
+		if sameMailboxName(t, server, name, "INBOX") {
+			t.Skipf("the database takes %q for INBOX", name)
+		}
+		if err := c.Create(name, nil).Wait(); err != nil {
+			t.Fatalf("CREATE %q: %v", name, err)
+		}
+		defer func() { c.Delete(name).Wait() }()
+		if err := c.Subscribe(name).Wait(); err != nil {
+			t.Fatalf("SUBSCRIBE %q: %v", name, err)
+		}
+		defer func() { c.Unsubscribe(name).Wait() }()
+
+		listed := listByName(t, c, "*", &imap.ListOptions{SelectSubscribed: true})
+		for _, want := range []string{"INBOX", name} {
+			if got := listed[want]; got == nil || !slices.Contains(got.Attrs, imap.MailboxAttrSubscribed) || slices.Contains(got.Attrs, imap.MailboxAttrNonExistent) {
+				t.Errorf("LIST (SUBSCRIBED) \"\" *: want live %q listed \\Subscribed; got %+v; listed %v", want, got, mapKeys(listed))
+			}
+		}
+	})
+
 	// RECURSIVEMATCH reports a parent of a subscribed name with CHILDINFO, and the
 	// parent is the mailbox the database takes the subscribed name's top level for.
 	t.Run("RECURSIVEMATCH", func(t *testing.T) {
