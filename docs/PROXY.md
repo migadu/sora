@@ -888,7 +888,7 @@ used it recently, and the new one may be refused for up to `positive_revalidatio
 | `negative_ttl` | `1m` | How long a failure is kept. |
 | `max_size` | `50000` | Entries per proxy server. When full, the oldest entry is removed. |
 | `cleanup_interval` | `5m` | How often expired entries are removed. |
-| `positive_revalidation_window` | `30s` | Age below which a different password on a success entry is rejected without a check. |
+| `positive_revalidation_window` | `30s` | Age below which a different password on a success entry is rejected without a check. Not used by the LMTP and User API proxies, which check no passwords against the cache; they warn at startup when it is set. |
 
 Durations take Go units (`90s`, `5m`, `1h`) or whole days (`1d`).
 
