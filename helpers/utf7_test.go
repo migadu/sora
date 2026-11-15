@@ -40,6 +40,20 @@ func TestDecodeModifiedUTF7(t *testing.T) {
 		{"unterminated shift 2", "folder&abc", "", true},
 		{"lone surrogate", "&2AA-", "", true},
 
+		// RFC 3501 §5.1.3: modified BASE64 MUST NOT represent a printable
+		// US-ASCII character (0x20-0x7e). "&" has its own form, "&-".
+		{"encoded delimiter", "a&AC8-b", "", true},
+		{"encoded letter", "&AGE-", "", true},
+		{"encoded space", "&ACA-", "", true},
+		{"encoded tilde", "&AH4-", "", true},
+		{"encoded ampersand", "&ACY-", "", true},
+		{"delimiter after non-ascii in one shift", "&AOkALw-", "", true},
+		{"letter after non-ascii in one shift", "x&AOkAYQ-", "", true},
+
+		// Control characters and DEL cannot represent themselves, so BASE64 is their form.
+		{"encoded unit separator 0x1f", "&AB8-", "\x1f", false},
+		{"encoded del 0x7f", "&AH8-", "\x7f", false},
+
 		// Edge cases
 		{"just ampersand-dash", "&-", "&", false},
 		{"multiple ampersand escapes", "&-&-&-", "&&&", false},

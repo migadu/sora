@@ -146,3 +146,37 @@ func TestHoldCommitFailureRemovesMessage(t *testing.T) {
 		t.Errorf("AcquireNext after a failed commit = %v, %v; want nothing", msg, err)
 	}
 }
+
+// TestHoldCommitFailsWhenBodyMissing: if pending/<id>.msg was unlinked while the hold was
+// open, commit must fail and clean up pending/<id>.held instead of renaming it to a
+// bodiless pending/<id>.json (which would make a RedirectOnly delivery skip its INBOX
+// fallback and return 250 OK for a message AcquireNext can never read).
+func TestHoldCommitFailsWhenBodyMissing(t *testing.T) {
+	q, err := NewDiskQueue(t.TempDir(), 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, abort, err := q.Hold("from@example.com", "to@example.org", "redirect", []byte("held body"))
+	if err != nil {
+		t.Fatalf("Hold: %v", err)
+	}
+	defer abort()
+	for _, name := range pendingFiles(t, q) {
+		if filepath.Ext(name) == ".msg" {
+			if err := os.Remove(filepath.Join(q.pendingDir, name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if err := commit(); err == nil {
+		t.Fatalf("commit without its message body succeeded; pending holds %v", pendingFiles(t, q))
+	}
+	if files := pendingFiles(t, q); len(files) != 0 {
+		t.Errorf("pending holds %v after a failed commit, want nothing", files)
+	}
+	q.pending.invalidate()
+	if msg, _, err := q.AcquireNext(); err != nil || msg != nil {
+		t.Errorf("AcquireNext after a failed commit = %v, %v; want nothing", msg, err)
+	}
+}

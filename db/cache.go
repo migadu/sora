@@ -90,7 +90,8 @@ func (d *Database) GetCacheMetrics(ctx context.Context, instanceID string, since
 	}
 	defer rows.Close()
 
-	var metrics []*CacheMetricsRecord
+	// Never nil: an empty result is the JSON array [], not null.
+	metrics := []*CacheMetricsRecord{}
 	for rows.Next() {
 		var m CacheMetricsRecord
 		if err := rows.Scan(&m.InstanceID, &m.ServerHostname, &m.Hits, &m.Misses,
@@ -121,7 +122,8 @@ func (d *Database) GetLatestCacheMetrics(ctx context.Context) ([]*CacheMetricsRe
 	}
 	defer rows.Close()
 
-	var metrics []*CacheMetricsRecord
+	// Never nil: an empty result is the JSON array [], not null.
+	metrics := []*CacheMetricsRecord{}
 	for rows.Next() {
 		var m CacheMetricsRecord
 		if err := rows.Scan(&m.InstanceID, &m.ServerHostname, &m.Hits, &m.Misses,

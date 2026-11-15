@@ -63,8 +63,10 @@ After the backend accepts the login, the proxy sends the backend's reply to the 
 a byte pipe. Everything after login (capabilities, IDLE, FETCH) is the backend's.
 
 The LMTP proxy does not log in. For each `RCPT TO` it finds the recipient's backend, connects (or
-reuses the connection it holds) and forwards the command. The User API proxy forwards each HTTP
-request; the backend checks the JWT token.
+reuses the connection it holds) and forwards the command. Like the backend, it does not announce
+`DSN`, so the sending MTA issues the notifications a sender asked for (RFC 3461 §5.2.2); `NOTIFY`,
+`ORCPT`, `RET` and `ENVID` sent anyway are accepted and not forwarded. The User API proxy forwards
+each HTTP request; the backend checks the JWT token.
 
 A node can run proxies and backend servers in the same process. A node that runs only proxies is a
 **proxy node**. [Section 13](#13-proxy-nodes-and-the-database) explains when such a node connects
@@ -241,11 +243,12 @@ The proxy sends `GET` to `url` after replacing placeholders:
 
 With `auth_token` set, the request carries `Authorization: Bearer <auth_token>`.
 
-The URL must use `https://`, unless its host is `localhost` or a loopback address. Sora refuses to
-start a proxy with a plain `http://` URL to any other host, because the request and answer carry
-password hashes. It also refuses a URL with `$email` or `$ip` in the host, and a `timeout`,
-`circuit_breaker` or `transport` duration it cannot parse, with `lookup_local_users` or without.
-`sora-admin config validate` fails the file for the same reasons.
+The URL must be an absolute URL with a host, and use `https://` unless its host is `localhost` or
+a loopback address. Sora refuses to start a proxy with a plain `http://` URL to any other host,
+because the request and answer carry password hashes. It also refuses a URL that does not parse,
+has no host or has a scheme other than `http` or `https`, a URL with `$email` or `$ip` in the host,
+and a `timeout`, `circuit_breaker` or `transport` duration or a `remote_port` it cannot parse, with
+`lookup_local_users` or without. `sora-admin config validate` fails the file for the same reasons.
 
 ### 4.2 The answer
 

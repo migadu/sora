@@ -19,6 +19,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/pkg/sqlitefile"
 	"github.com/migadu/sora/server"
 	_ "modernc.org/sqlite"
 )
@@ -76,7 +77,7 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
 	logger.Info("Using maildir database", "path", dbPath)
 
-	dsn, err := sqliteFileDSN(dbPath, maildirCacheParams)
+	dsn, err := sqlitefile.DSN(dbPath, maildirCacheParams)
 	if err != nil {
 		return nil, err
 	}

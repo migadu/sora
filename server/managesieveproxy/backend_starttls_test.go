@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,7 @@ const fakeSieveCapabilities = "\"IMPLEMENTATION\" \"fake\"\r\n\"SASL\" \"PLAIN\"
 // fakeSieveBackend scripts one backend connection for the STARTTLS tests.
 type fakeSieveBackend struct {
 	implicitTLS   bool   // the listener speaks TLS from the first byte
+	offerTLS      bool   // upgrade to TLS after startTLSReply regardless of its spelling
 	startTLSReply string // reply to STARTTLS; "" refuses it with NO
 	afterTLSCaps  string // sent in one write with the capabilities that follow the handshake
 	greeting      string // sent on connect in place of fakeSieveCapabilities
@@ -89,9 +91,9 @@ func (b fakeSieveBackend) start(t *testing.T) (addr string, commands func() []st
 				continue
 			}
 			io.WriteString(conn, reply)
-			// Any reply starting with the letters OK goes on to the handshake, so a proxy
-			// that takes it for an OK gets as far as authenticating.
-			if len(reply) < 2 || !strings.EqualFold(reply[:2], "OK") {
+			// Any reply starting with the letters OK (or when offerTLS is set) goes on to the
+			// handshake, so a proxy that takes it for an OK gets as far as authenticating.
+			if !b.offerTLS && (len(reply) < 2 || !strings.EqualFold(reply[:2], "OK")) {
 				continue
 			}
 			secure := tls.Server(conn, tlsConfig)
@@ -119,11 +121,16 @@ func (b fakeSieveBackend) start(t *testing.T) (addr string, commands func() []st
 // backend settings are settings, for a user routed by route (nil: no remote lookup route).
 func connectSieveBackend(t *testing.T, addr string, settings proxy.BackendSettings, route *proxy.UserRoutingInfo) (*Session, error) {
 	t.Helper()
+	return connectSieveBackendWithTimeout(t, addr, settings, route, 2*time.Second)
+}
+
+func connectSieveBackendWithTimeout(t *testing.T, addr string, settings proxy.BackendSettings, route *proxy.UserRoutingInfo, timeout time.Duration) (*Session, error) {
+	t.Helper()
 	cm, err := proxy.NewConnectionManagerFromOptions(proxy.ManagerOptions{
 		RemoteAddrs:        []string{addr},
 		RemotePort:         4190,
 		Settings:           settings,
-		ConnectTimeout:     2 * time.Second,
+		ConnectTimeout:     timeout,
 		ServerName:         "test",
 		DisableHealthCheck: true,
 	})
@@ -219,11 +226,52 @@ func TestConnectToBackendRefusesDataAfterSTARTTLSResponse(t *testing.T) {
 	}
 }
 
-// The reply to STARTTLS is OK when its first atom is OK in any case: RFC 5804 section 4,
-// response-starttls = (response-ok response-capability) / response-nobye, response-ok =
-// "OK" [SP "(" resp-code ")"] [SP string] CRLF, and "Implementations MUST accept these
-// strings in a case-insensitive fashion". OKAY, or OK run into its string, is not an OK:
-// the proxy must not go on to the handshake after it.
+// backendStatus matches only the ASCII status atoms OK, NO and BYE at the very start of
+// the line, delimited by SP or CRLF (RFC 5804 section 4). Unicode fold-equivalents such
+// as U+212A KELVIN SIGN ("O\u212a") and lines with leading spaces or tabs are not valid
+// RFC 5804 status atoms.
+func TestBackendStatus(t *testing.T) {
+	for _, tc := range []struct {
+		line string
+		want string
+	}{
+		{"OK\r\n", "OK"},
+		{"ok \"Begin TLS\"\r\n", "OK"},
+		{"oK (TRYLATER) \"msg\"\r\n", "OK"},
+		{"NO\r\n", "NO"},
+		{"no (TRYLATER) \"busy\"\r\n", "NO"},
+		{"BYE\r\n", "BYE"},
+		{"bye \"closing\"\r\n", "BYE"},
+		{"O\u212a \"Begin TLS\"\r\n", ""},
+		{"O\u212a\r\n", ""},
+		{" OK\r\n", ""},
+		{" OK \"Begin TLS\"\r\n", ""},
+		{"\tOK\r\n", ""},
+		{"OK\t\r\n", ""},
+		{"OK\t\"Begin TLS\"\r\n", ""},
+		{" NO\r\n", ""},
+		{"\tNO\r\n", ""},
+		{"NO\t\r\n", ""},
+		{" BYE\r\n", ""},
+		{"\tBYE\r\n", ""},
+		{"BYE\t\r\n", ""},
+		{"OKAY\r\n", ""},
+		{"OK\"Begin TLS\"\r\n", ""},
+	} {
+		t.Run(strconv.QuoteToASCII(strings.TrimRight(tc.line, "\r\n")), func(t *testing.T) {
+			if got := backendStatus(tc.line); got != tc.want {
+				t.Errorf("backendStatus(%q) = %q, want %q", tc.line, got, tc.want)
+			}
+		})
+	}
+}
+
+// The reply to STARTTLS is OK when its first atom is ASCII OK in any case: RFC 5804
+// section 4, response-starttls = (response-ok response-capability) / response-nobye,
+// response-ok = "OK" [SP "(" resp-code ")"] [SP string] CRLF, and "Implementations MUST
+// accept these strings in a case-insensitive fashion". OKAY, OK run into its string,
+// Unicode Kelvin sign ("O\u212a"), or leading/tab whitespace is not an OK: the proxy must
+// not go on to the handshake after it.
 func TestConnectToBackendSTARTTLSReplyStatus(t *testing.T) {
 	for _, tc := range []struct {
 		reply string
@@ -235,9 +283,14 @@ func TestConnectToBackendSTARTTLSReplyStatus(t *testing.T) {
 		{"oK (XTEST) \"Begin TLS negotiation now.\"\r\n", true},
 		{"OKAY \"Begin TLS negotiation now.\"\r\n", false},
 		{"OK\"Begin TLS negotiation now.\"\r\n", false},
+		{"O\u212a \"Begin TLS\"\r\n", false},
+		{"O\u212a\r\n", false},
+		{" OK\r\n", false},
+		{"\tOK\r\n", false},
+		{"OK\t\r\n", false},
 	} {
-		t.Run(strings.TrimSpace(tc.reply), func(t *testing.T) {
-			addr, commands := fakeSieveBackend{startTLSReply: tc.reply}.start(t)
+		t.Run(strconv.QuoteToASCII(strings.TrimRight(tc.reply, "\r\n")), func(t *testing.T) {
+			addr, commands := fakeSieveBackend{offerTLS: true, startTLSReply: tc.reply}.start(t)
 			sess, err := connectSieveBackend(t, addr, proxy.BackendSettings{TLS: true, TLSUseStartTLS: true}, nil)
 			_, upgraded := sess.backendConn.(*tls.Conn)
 			if sess.backendConn != nil {
@@ -268,8 +321,9 @@ func TestConnectToBackendSTARTTLSReplyStatus(t *testing.T) {
 
 // The reply to AUTHENTICATE is matched the same way: RFC 5804 section 4,
 // response-authenticate = *(string CRLF) ((response-ok [response-capability]) /
-// response-nobye), case-insensitive. A lower-case ok logs the user in; OKAY, or OK run
-// into its string, is the backend failing the proxy's login.
+// response-nobye), case-insensitive ASCII. A lower-case ok logs the user in; OKAY, OK run
+// into its string, Unicode Kelvin sign ("O\u212a"), or leading/tab whitespace is the
+// backend failing the proxy's login.
 func TestConnectToBackendAuthenticateReplyStatus(t *testing.T) {
 	for _, tc := range []struct {
 		reply string
@@ -281,8 +335,13 @@ func TestConnectToBackendAuthenticateReplyStatus(t *testing.T) {
 		{"oK (XTEST) \"Logged in.\"\r\n", true},
 		{"OKAY \"Logged in.\"\r\n", false},
 		{"OK\"Logged in.\"\r\n", false},
+		{"O\u212a \"Begin TLS\"\r\n", false},
+		{"O\u212a\r\n", false},
+		{" OK\r\n", false},
+		{"\tOK\r\n", false},
+		{"OK\t\r\n", false},
 	} {
-		t.Run(strings.TrimSpace(tc.reply), func(t *testing.T) {
+		t.Run(strconv.QuoteToASCII(strings.TrimRight(tc.reply, "\r\n")), func(t *testing.T) {
 			addr, commands := fakeSieveBackend{authReply: tc.reply}.start(t)
 			sess, err := connectSieveBackend(t, addr, proxy.BackendSettings{}, nil)
 			if sess.backendConn != nil {
@@ -395,6 +454,49 @@ func TestConnectToBackendEndsGreetingAtLowerCaseOK(t *testing.T) {
 	sess.backendConn.Close()
 	if got := commands(); len(got) != 1 || !strings.HasPrefix(got[0], "AUTHENTICATE \"PLAIN\" ") {
 		t.Errorf("backend received %q, want AUTHENTICATE", got)
+	}
+}
+
+// A non-ASCII fold-equivalent ("O\u212a") or a status atom preceded or followed by spaces
+// or tabs is not a valid RFC 5804 response-ok ending a greeting or post-STARTTLS
+// capability list: the proxy must not treat the greeting as complete and send master
+// credentials.
+func TestConnectToBackendGreetingRejectsMalformedStatus(t *testing.T) {
+	startTLS := proxy.BackendSettings{TLS: true, TLSUseStartTLS: true}
+	for _, statusLine := range []string{
+		"O\u212a \"Begin TLS\"\r\n",
+		"O\u212a\r\n",
+		" OK\r\n",
+		"\tOK\r\n",
+		"OK\t\r\n",
+	} {
+		caps := "\"IMPLEMENTATION\" \"fake\"\r\n\"SASL\" \"PLAIN\"\r\n" + statusLine
+		t.Run("greeting/"+strconv.QuoteToASCII(strings.TrimRight(statusLine, "\r\n")), func(t *testing.T) {
+			addr, commands := fakeSieveBackend{greeting: caps}.start(t)
+			sess, err := connectSieveBackendWithTimeout(t, addr, proxy.BackendSettings{}, nil, 100*time.Millisecond)
+			if sess.backendConn != nil {
+				sess.backendConn.Close()
+			}
+			if !errors.Is(err, server.ErrBackendConnectionFailed) {
+				t.Errorf("connectToBackendAndAuth = %v, want a backend connection failure", err)
+			}
+			if got := commands(); len(got) != 0 {
+				t.Errorf("backend received %q after malformed greeting, want nothing", got)
+			}
+		})
+		t.Run("after_STARTTLS/"+strconv.QuoteToASCII(strings.TrimRight(statusLine, "\r\n")), func(t *testing.T) {
+			addr, commands := fakeSieveBackend{startTLSReply: "OK\r\n", tlsGreeting: caps}.start(t)
+			sess, err := connectSieveBackendWithTimeout(t, addr, startTLS, nil, 100*time.Millisecond)
+			if sess.backendConn != nil {
+				sess.backendConn.Close()
+			}
+			if !errors.Is(err, server.ErrBackendConnectionFailed) {
+				t.Errorf("connectToBackendAndAuth = %v, want a backend connection failure", err)
+			}
+			if got := commands(); !slices.Equal(got, []string{"STARTTLS"}) {
+				t.Errorf("backend received %q after malformed post-STARTTLS capabilities, want STARTTLS alone", got)
+			}
+		})
 	}
 }
 

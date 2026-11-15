@@ -129,6 +129,13 @@ func (db *Database) GetMessageCountForMailbox(ctx context.Context, accountID int
 	return count, nil
 }
 
+// userAPIUnseenCond keeps the messages without \Seen, for the statements that LEFT JOIN
+// message_state as ms. A message with no state row has no flags (every User API read
+// returns it with COALESCE(ms.flags, 0)), so it is unseen; a bare (ms.flags & \Seen) = 0
+// is NULL for it and would drop the message. The list, its unseen total and search's
+// unseen filter all use this one predicate, so they cannot disagree.
+var userAPIUnseenCond = fmt.Sprintf("(ms.flags IS NULL OR (ms.flags & %d) = 0)", FlagSeen)
+
 // GetUnseenCountForMailbox retrieves unseen message count
 func (db *Database) GetUnseenCountForMailbox(ctx context.Context, accountID int64, mailboxPath string) (int, error) {
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
@@ -143,12 +150,11 @@ func (db *Database) GetUnseenCountForMailbox(ctx context.Context, accountID int6
 	}
 
 	var count int
-	query := fmt.Sprintf(`
-		SELECT COUNT(*) 
+	query := `
+		SELECT COUNT(*)
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL AND (ms.flags & %d) = 0
-	`, FlagSeen)
+		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL AND ` + userAPIUnseenCond
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, query, mailbox.ID).Scan(&count)
 
 	if err != nil {
@@ -188,7 +194,7 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 	argPos := 2
 
 	if unseenOnly {
-		query += fmt.Sprintf(" AND (ms.flags & %d) = 0", FlagSeen)
+		query += " AND " + userAPIUnseenCond
 	}
 
 	query += " ORDER BY m.internal_date DESC"
@@ -327,7 +333,7 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 		filterCond += " AND " + substringCond("LOWER(m.subject)", fmt.Sprintf("$%d", len(args)))
 	}
 	if filter.UnseenOnly {
-		filterCond += fmt.Sprintf(" AND (ms.flags IS NULL OR (ms.flags & %d) = 0)", FlagSeen)
+		filterCond += " AND " + userAPIUnseenCond
 	}
 
 	searchQuery = strings.Replace(searchQuery, "__HEADER_COND__", headerSubstringCond("m.", "$2"), 1)

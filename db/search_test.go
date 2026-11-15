@@ -719,6 +719,30 @@ func TestBuildSortOrderClause(t *testing.T) {
 	}
 }
 
+// TestBuildSortOrderClauseSequenceTieBreak pins RFC 5256 §3's implicit last sort
+// criterion: messages that tie on every key come back "in the order in which they appear
+// in the mailbox", and "REVERSE only reverses a single criterion, and does not affect the
+// implicit "sequence number" sort criterion". UIDs ascend with sequence numbers, so the
+// clause must end in uid ASC whatever the criteria and their REVERSE flags.
+func TestBuildSortOrderClauseSequenceTieBreak(t *testing.T) {
+	db := &Database{}
+	keys := []imap.SortKey{imap.SortKeyArrival, imap.SortKeyCc, imap.SortKeyDate, imap.SortKeyDisplayFrom,
+		imap.SortKeyDisplayTo, imap.SortKeyFrom, imap.SortKeySize, imap.SortKeySubject, imap.SortKeyTo}
+	for _, key := range keys {
+		for _, criteria := range [][]imap.SortCriterion{
+			{{Key: key}},
+			{{Key: key, Reverse: true}},
+			{{Key: key, Reverse: true}, {Key: imap.SortKeyDate, Reverse: true}},
+			{{Key: imap.SortKeySize}, {Key: key, Reverse: true}},
+		} {
+			clause := db.buildSortOrderClause(criteria)
+			if !strings.HasSuffix(clause, ", m.uid ASC") {
+				t.Errorf("sort %v: %q does not end in the ascending sequence tie-break \", m.uid ASC\" (RFC 5256 §3)", criteria, clause)
+			}
+		}
+	}
+}
+
 // TestNeedsComplexQuery tests complex query detection
 func TestNeedsComplexQuery(t *testing.T) {
 	if testing.Short() {

@@ -46,8 +46,9 @@ flowchart LR
     F -->|sora-admin relay requeue| P
 ```
 
-Without a relay (`[relay] type` empty), there is no queue and no worker. A redirected message is
-then kept in INBOX instead, and vacation replies are not sent.
+Without a relay (`[relay] type` empty), there is no queue and no worker. Sieve redirects are then
+skipped: the message is stored where the rest of the script puts it, in INBOX when a redirect was
+the only place it went. Vacation replies are not sent.
 
 The relay has to accept these messages from the Sora node. A redirect keeps the original sender's
 address, so the relay must allow foreign senders from Sora; Sora does not rewrite the sender

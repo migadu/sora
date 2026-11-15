@@ -1376,7 +1376,11 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 
 			// Parse to check expiry
 			certInfo := CertificateInfo{}
-			parseCertificateData(certData, &certInfo)
+			if err := parseCertificate(certData, &certInfo); err != nil {
+				logger.Warn("Failed to parse certificate from S3", "domain", domain, "type", variant.name, "key", s3Key, "error", err)
+				failures = append(failures, fmt.Errorf("parse %s certificate for %s (S3 object %s): %w", variant.name, domain, s3Key, err))
+				continue
+			}
 
 			// Skip if expired
 			if !certInfo.Expiry.IsZero() && certInfo.Expiry.Before(now) {
