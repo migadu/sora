@@ -81,7 +81,9 @@ func getDelayManager() *DelayManager {
 }
 
 // ApplyAuthenticationDelay applies progressive delays before authentication attempts
-// Returns ErrDelayQueueFull if too many concurrent delays are already in progress for this IP
+// Returns ErrDelayQueueFull if too many concurrent delays are already in progress for this IP.
+// protocol labels the sora_auth_delay_* metrics: the caller's server type, spelled as
+// its other metrics spell it ("imap", "imap_proxy", "userapi", ...).
 func ApplyAuthenticationDelay(ctx context.Context, limiter any, remoteAddr net.Addr, protocol string) error {
 	return applyAuthenticationDelayWithManager(ctx, limiter, remoteAddr, protocol, getDelayManager())
 }
@@ -99,10 +101,8 @@ func applyAuthenticationDelayWithManager(ctx context.Context, limiter any, remot
 		return nil
 	}
 
-	ip, _, err := net.SplitHostPort(remoteAddr.String())
-	if err != nil {
-		ip = remoteAddr.String()
-	}
+	// One slot count per client, however its address is spelled (see clientIPOf).
+	ip := clientIPOf(remoteAddr.String())
 
 	// Try to acquire a delay slot (non-blocking)
 	if !dm.tryAcquire(ip) {

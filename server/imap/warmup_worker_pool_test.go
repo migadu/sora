@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/migadu/sora/cache"
 )
 
 // TestWorkerPoolStartStop verifies workers start and stop gracefully
@@ -209,7 +211,7 @@ func TestWorkerPoolProcessesJobs(t *testing.T) {
 		warmupMaxConcurrent: 3,
 		warmupQueue:         make(chan warmupJob, 50),
 		warmupSemaphore:     make(chan struct{}, 3),
-		warmupInterval:      time.Millisecond, // Very short interval so dedup re-check passes
+		warmupInterval:      time.Hour, // Unique account IDs pass the dedup re-check; the stamps outlive the count below
 		warmupTimeout:       5 * time.Second,
 		// cache is nil — executeWarmup will stamp lastWarmupTimes then fail on cache access
 		// That's fine; we're testing that workers pick up jobs.
@@ -466,4 +468,78 @@ func TestWarmupQueueDedupSameUserMultipleEnqueues(t *testing.T) {
 
 	// The second job should have been deduped by the re-check in executeWarmup
 	// (We can't directly count executions without mocking, but the dedup logic is tested above)
+}
+
+// TestWarmupCacheAfterStopIsSkipped covers a login that completes after Close has
+// stopped the warmup workers: its async warmup must be skipped, not sent on the
+// closed queue (a send on a closed channel panics even in a select with a default).
+func TestWarmupCacheAfterStopIsSkipped(t *testing.T) {
+	s := &IMAPServer{
+		name:                "test",
+		warmupMaxConcurrent: 1,
+		warmupQueue:         make(chan warmupJob, 5),
+		warmupInterval:      time.Hour,
+		enableWarmup:        true,
+		cache:               &cache.Cache{},
+	}
+	s.startWarmupWorkers()
+	s.stopWarmupWorkers()
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("WarmupCache after stopWarmupWorkers panicked: %v", r)
+		}
+	}()
+	if err := s.WarmupCache(context.Background(), 1, []string{"INBOX"}, 10, true); err != nil {
+		t.Fatalf("WarmupCache returned error: %v", err)
+	}
+	if n := len(s.warmupQueue); n != 0 {
+		t.Fatalf("expected no job queued after stop, got %d", n)
+	}
+}
+
+// TestWarmupCacheConcurrentWithStop races logins enqueueing async warmups against
+// stopWarmupWorkers, as a shutdown does while sessions are still authenticating.
+// No enqueue may panic, whichever side wins. Run with -race.
+func TestWarmupCacheConcurrentWithStop(t *testing.T) {
+	for round := 0; round < 50; round++ {
+		s := &IMAPServer{
+			name:           "test",
+			warmupQueue:    make(chan warmupJob, 5),
+			warmupInterval: time.Hour,
+			enableWarmup:   true,
+			cache:          &cache.Cache{},
+		}
+
+		const senders = 8
+		var (
+			wg     sync.WaitGroup
+			start  = make(chan struct{})
+			panics = make(chan any, senders)
+			nextID atomic.Int64
+		)
+		for i := 0; i < senders; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						panics <- r
+					}
+				}()
+				<-start
+				for j := 0; j < 200; j++ {
+					// No workers run, so nothing is stamped and every call reaches the enqueue.
+					_ = s.WarmupCache(context.Background(), nextID.Add(1), []string{"INBOX"}, 10, true)
+				}
+			}()
+		}
+		close(start)
+		s.stopWarmupWorkers()
+		wg.Wait()
+		close(panics)
+		for r := range panics {
+			t.Fatalf("round %d: WarmupCache racing stopWarmupWorkers panicked: %v", round, r)
+		}
+	}
 }

@@ -1,14 +1,18 @@
 package uploader
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"maps"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
@@ -75,7 +80,12 @@ type UploaderDB interface {
 	// PendingUploadBacklog reports the retryable uploads this instance owns. Scoped to
 	// the instance because a pending upload is leased only by its creator (the body is
 	// a file on that node's disk), so this is the queue this worker alone can drain.
-	PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int) (UploadBacklog, error)
+	//
+	// changed is called once the totals are read, while their snapshot is still held.
+	// It names the bodies whose staged files changed while the measurement was in
+	// flight, and Included reports, from that same snapshot, what the totals count for
+	// each of them.
+	PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int, changed func() []StagedBody) (UploadBacklog, error)
 	// RecordInstanceHeartbeatWithRetry proves this instance still exists. Pending
 	// uploads are leased only by their creating instance, so the cleaner reaps an
 	// unfinished upload once its owner stops beating (db.CleanupFailedUploads).
@@ -88,6 +98,16 @@ type UploadBacklog struct {
 	Count  int64
 	Bytes  int64
 	Oldest time.Time // zero when Count is 0
+	// Included is what Bytes counts for each body the changed callback named; a body
+	// with no entry has no row in the snapshot.
+	Included map[StagedBody]int64
+}
+
+// StagedBody names a body staged on this node: the (account_id, content_hash) pair
+// pending_uploads is unique on.
+type StagedBody struct {
+	AccountID   int64
+	ContentHash string
 }
 
 // resilientUploaderDB adapts the resilient database to UploaderDB, adding the
@@ -98,10 +118,22 @@ type resilientUploaderDB struct {
 
 // PendingUploadBacklog measures the queue this instance still has to write. Served by
 // idx_pending_uploads_instance_id_created_at, so the MIN is an index lookup.
-func (d resilientUploaderDB) PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int) (UploadBacklog, error) {
+//
+// Both statements read one REPEATABLE READ snapshot, so Included tells what the totals
+// already count for each changed body. It is the primary's: a replica's snapshot lags
+// the rows this node's own deliveries have just committed.
+func (d resilientUploaderDB) PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int, changed func() []StagedBody) (UploadBacklog, error) {
+	tx, err := d.BeginTxWithRetry(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return UploadBacklog{}, fmt.Errorf("failed to measure pending upload backlog of instance %s: %w", instanceID, err)
+	}
+	defer tx.Rollback(context.Background())
+	ctx, cancel := context.WithTimeout(ctx, d.GetQueryTimeout())
+	defer cancel()
+
 	var backlog UploadBacklog
 	var oldest sql.NullTime
-	err := d.QueryRowWithRetry(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT COUNT(*), COALESCE(SUM(size), 0), MIN(created_at)
 		FROM pending_uploads
 		WHERE instance_id = $1 AND attempts < $2
@@ -111,6 +143,38 @@ func (d resilientUploaderDB) PendingUploadBacklog(ctx context.Context, instanceI
 	}
 	if oldest.Valid {
 		backlog.Oldest = oldest.Time
+	}
+
+	bodies := changed()
+	if len(bodies) == 0 || backlog.Count == 0 {
+		return backlog, nil
+	}
+	accountIDs := make([]int64, len(bodies))
+	contentHashes := make([]string, len(bodies))
+	for i, body := range bodies {
+		accountIDs[i], contentHashes[i] = body.AccountID, body.ContentHash
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT p.account_id, p.content_hash, p.size
+		FROM unnest($3::bigint[], $4::text[]) AS c(account_id, content_hash)
+		JOIN pending_uploads p ON p.account_id = c.account_id AND p.content_hash = c.content_hash
+		WHERE p.instance_id = $1 AND p.attempts < $2
+	`, instanceID, maxAttempts, accountIDs, contentHashes)
+	if err != nil {
+		return UploadBacklog{}, fmt.Errorf("failed to look up changed staged bodies of instance %s: %w", instanceID, err)
+	}
+	defer rows.Close()
+	backlog.Included = make(map[StagedBody]int64, len(bodies))
+	for rows.Next() {
+		var body StagedBody
+		var size int64
+		if err := rows.Scan(&body.AccountID, &body.ContentHash, &size); err != nil {
+			return UploadBacklog{}, fmt.Errorf("failed to scan changed staged body: %w", err)
+		}
+		backlog.Included[body] = size
+	}
+	if err := rows.Err(); err != nil {
+		return UploadBacklog{}, fmt.Errorf("failed to look up changed staged bodies of instance %s: %w", instanceID, err)
 	}
 	return backlog, nil
 }
@@ -168,7 +232,7 @@ type UploaderCache interface {
 }
 
 type UploadWorker struct {
-	cleanupGracePeriod time.Duration // set via SetCleanupGracePeriod; 0 → default 1h
+	cleanupGracePeriod time.Duration // set via SetCleanupGracePeriod; <= 0 → default 1h
 	rdb                UploaderDB
 	s3                 UploaderS3
 	cache              UploaderCache
@@ -191,6 +255,16 @@ type UploadWorker struct {
 
 	maxStagingSize     int64
 	currentStagingSize int64 // Atomic tracker for this instance's own staging backlog (max_staging_size)
+	// stagingPathLocks serializes per-path stat + rename/remove + currentStagingSize
+	// accounting so concurrent stagings and removals of the same body cannot drift
+	// currentStagingSize, while keeping temp-file writes and fsyncs parallel outside it.
+	stagingPathLocks [stagingPathLockStripes]sync.Mutex
+	// stagingRefreshMu orders every change of currentStagingSize against the start and
+	// end of a staging refresh, and guards stagingRefresh.
+	stagingRefreshMu sync.Mutex
+	// stagingRefresh is non-nil while monitorStuckUploads measures the backlog: for
+	// each staged path changed meanwhile, the bytes counted for it before that change.
+	stagingRefresh map[string]int64
 	// lastStallReport is when the current stall episode was last reported, in Unix
 	// nanoseconds; 0 means no episode is in progress. Atomic, like currentStagingSize.
 	lastStallReport int64
@@ -202,6 +276,24 @@ type UploadWorker struct {
 	backoffMu       sync.Mutex
 	backoffUntil    time.Time
 	backoffFailures int
+}
+
+const stagingPathLockStripes = 64
+
+// stagingPathLock returns the striped mutex guarding path's on-disk replacement/removal
+// and its matching currentStagingSize delta.
+func (w *UploadWorker) stagingPathLock(path string) *sync.Mutex {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	clean := filepath.Clean(path)
+	var h uint64 = offset64
+	for i := 0; i < len(clean); i++ {
+		h ^= uint64(clean[i])
+		h *= prime64
+	}
+	return &w.stagingPathLocks[h%stagingPathLockStripes]
 }
 
 // uploadOutcome classifies what one lease of a pending upload achieved.
@@ -434,7 +526,7 @@ func (w *UploadWorker) Stop() {
 // record) has committed before the cleanup consults the database.
 //
 // Set from cfg.Uploader.GetCleanupGracePeriod() at startup.
-// If never called (or called with 0), the default of 1 hour is used.
+// If never called (or called with a value <= 0), the default of 1 hour is used.
 func (w *UploadWorker) SetCleanupGracePeriod(d time.Duration) {
 	w.cleanupGracePeriod = d
 }
@@ -824,7 +916,19 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	// Move the uploaded file to the global cache (if a cache is configured).
 	// If the move fails, or no cache is present, delete the local file.
 	if w.cache != nil {
-		if err := w.cache.MoveIn(filePath, upload.ContentHash); err != nil {
+		pathMu := w.stagingPathLock(filePath)
+		pathMu.Lock()
+		size := fileSize(filePath)
+		err := w.cache.MoveIn(filePath, upload.ContentHash)
+		if err == nil {
+			w.stagedSizeChanged(filePath, size, 0)
+		} else if size > 0 {
+			if _, statErr := os.Stat(filePath); os.IsNotExist(statErr) {
+				w.stagedSizeChanged(filePath, size, 0)
+			}
+		}
+		pathMu.Unlock()
+		if err != nil {
 			if errors.Is(err, cache.ErrObjectTooLarge) {
 				logger.Debug("Uploader: Uploaded hash is too large for the cache - deleting local file", "hash", upload.ContentHash, "size", upload.Size)
 			} else {
@@ -834,7 +938,6 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 				// Log is inside RemoveLocalFile
 			}
 		} else {
-			w.addStagingSize(-upload.Size)
 			logger.Info("Uploader: Moved hash to cache after upload", "hash", upload.ContentHash)
 		}
 	} else {
@@ -1032,6 +1135,23 @@ func StagingFilePath(basePath, contentHash string, accountID int64) string {
 	return filepath.Join(basePath, fmt.Sprintf("%d", accountID), contentHash)
 }
 
+// stagedBodyAt is the inverse of FilePath: the body staged at path, if path is one.
+func (w *UploadWorker) stagedBodyAt(path string) (StagedBody, bool) {
+	rel, err := filepath.Rel(w.path, path)
+	if err != nil {
+		return StagedBody{}, false
+	}
+	account, contentHash, ok := strings.Cut(rel, string(filepath.Separator))
+	if !ok || !isValidContentHash(contentHash) {
+		return StagedBody{}, false
+	}
+	accountID, err := strconv.ParseInt(account, 10, 64)
+	if err != nil {
+		return StagedBody{}, false
+	}
+	return StagedBody{AccountID: accountID, ContentHash: contentHash}, true
+}
+
 // MaxAttempts is the attempts value at which the worker stops leasing a pending upload.
 // Readers use it to tell a row still being retried from one the worker has given up on.
 func (w *UploadWorker) MaxAttempts() int {
@@ -1111,53 +1231,137 @@ func isValidContentHash(hash string) bool {
 func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []byte) (*string, error) {
 	path := w.FilePath(contentHash, accountID)
 	dir := filepath.Dir(path)
+	// Nothing removes an account's staging directory once it exists, so it is still
+	// there when stageFrom creates its file. The uploader used to remove it as soon as
+	// the account's last staged file left, which could land between these two steps
+	// and fail the delivery with ENOENT. An empty directory left behind costs an inode,
+	// and on ext4 (without inline_data) also its one directory block.
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
-
-	// Bytes already accounted for at this path: an overwrite replaces them rather
-	// than adding to the spool.
-	previousSize := fileSize(path)
-
-	// Write to a temporary name, fsync, then rename into place. The final path is
-	// only ever a complete, durable file: a crash mid-write leaves a stray .tmp that
-	// nobody reads (and the orphan sweep removes), never a truncated body that a later
-	// delivery of the same bytes would adopt ("file exists, skip write") and a reader
-	// would serve. The rename also keeps a concurrent reader or uploader on the old
-	// inode, so a rewrite never changes bytes under an open descriptor.
-	tmpPath := path + ".tmp"
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create file %s: %w", tmpPath, err)
+	if err := w.stageFrom(path, bytes.NewReader(data)); err != nil {
+		return nil, err
 	}
-	if _, err := f.Write(data); err != nil {
+	return &path, nil
+}
+
+// linkFile makes a hard link; a variable so tests can refuse one.
+var linkFile = os.Link
+
+// LinkStaged stages for destAccountID a body staged on this node for srcAccountID. A
+// cross-account COPY or MOVE, and a delivery into a shared mailbox another account owns,
+// store the body under the mailbox owner, whose own pending upload reads this file. It
+// is hard-linked where the filesystem allows it and copied otherwise; a destination
+// already staged is left as it is.
+//
+// The staging counts against max_staging_size like any other. The monitor refresh
+// counts one pending row per account and body, and the destination's upload subtracts
+// the body's size when it removes its file, whether or not that file shares the
+// source's inode; were the link not added here, the guard would count one body short
+// per cross-account staging until the next refresh.
+//
+// An error wrapping fs.ErrNotExist means the body is not staged here for srcAccountID.
+func (w *UploadWorker) LinkStaged(contentHash string, srcAccountID, destAccountID int64) error {
+	if !isValidContentHash(contentHash) {
+		return fmt.Errorf("invalid content hash %q", contentHash)
+	}
+	src, dst := w.FilePath(contentHash, srcAccountID), w.FilePath(contentHash, destAccountID)
+	if src == dst {
+		return nil
+	}
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0755); err != nil { // never removed once made, see StoreLocally
+		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	}
+
+	pathMu := w.stagingPathLock(dst)
+	pathMu.Lock()
+	err := linkFile(src, dst)
+	if err == nil {
+		w.stagedSizeChanged(dst, 0, fileSize(dst))
+	}
+	pathMu.Unlock()
+	switch {
+	case err == nil:
+		if err := syncDir(dir); err != nil {
+			logger.Warn("Uploader: Failed to fsync directory (non-fatal)", "dir", dir, "error", err)
+		}
+		return nil
+	case errors.Is(err, fs.ErrExist):
+		return nil // staged for destAccountID already, and counted then
+	}
+
+	// No hard link here (another filesystem, a link limit, ...): copy the body. A
+	// missing source fails the open, before anything is written.
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open staged body %s: %w", src, err)
+	}
+	defer in.Close()
+	return w.stageFrom(dst, in)
+}
+
+// stageFrom stages at path, whose directory exists, the body read from r, and counts it
+// against max_staging_size.
+//
+// It writes to a temporary name, fsyncs, then renames into place. The final path is
+// only ever a complete, durable file: a crash mid-write leaves a stray .tmp that nobody
+// reads (and the orphan sweep removes), never a truncated body that a later delivery of
+// the same bytes would adopt ("file exists, skip write") and a reader would serve. The
+// rename also keeps a concurrent reader or uploader on the old inode, so a rewrite never
+// changes bytes under an open descriptor.
+//
+// The temporary name is this call's own, created exclusively: two stagings of the same
+// body (duplicate APPENDs or deliveries that both passed their caller's Stat) run here
+// at once. With a shared name the first rename took the name from under the second,
+// which then failed with ENOENT, and a second open with O_TRUNC could empty an inode the
+// first was about to rename into place as staged. Each writer now fills its own inode
+// and renames a complete file over <hash>.
+func (w *UploadWorker) stageFrom(path string, r io.Reader) error {
+	tmpPath := fmt.Sprintf("%s.%016x.tmp", path, rand.Uint64())
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create file %s: %w", tmpPath, err)
+	}
+	size, err := io.Copy(f, r)
+	if err != nil {
 		f.Close()
 		os.Remove(tmpPath)
-		return nil, fmt.Errorf("failed to write file %s: %w", tmpPath, err)
+		return fmt.Errorf("failed to write file %s: %w", tmpPath, err)
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmpPath) // an unsynced file must not be left where "exists" means "staged"
-		return nil, fmt.Errorf("failed to fsync file %s: %w", tmpPath, err)
+		return fmt.Errorf("failed to fsync file %s: %w", tmpPath, err)
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(tmpPath)
-		return nil, fmt.Errorf("failed to close file %s: %w", tmpPath, err)
+		return fmt.Errorf("failed to close file %s: %w", tmpPath, err)
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+
+	// Bytes already accounted for at this path are sampled under the per-path lock
+	// right around the rename so concurrent stagings of the same body replace rather
+	// than multiply the counted size, while temp-file I/O and fsyncs run in parallel.
+	pathMu := w.stagingPathLock(path)
+	pathMu.Lock()
+	previousSize := fileSize(path)
+	renameErr := os.Rename(tmpPath, path)
+	if renameErr == nil {
+		w.stagedSizeChanged(path, previousSize, size)
+	}
+	pathMu.Unlock()
+	if renameErr != nil {
 		os.Remove(tmpPath)
-		return nil, fmt.Errorf("failed to move %s into place: %w", tmpPath, err)
+		return fmt.Errorf("failed to move %s into place: %w", tmpPath, renameErr)
 	}
 
 	// Fsync the parent directory to ensure the directory entry is durable.
+	dir := filepath.Dir(path)
 	if err := syncDir(dir); err != nil {
 		logger.Warn("Uploader: Failed to fsync directory (non-fatal)", "dir", dir, "error", err)
 		// Non-fatal: the file data is already synced, directory entry may survive without this
 	}
-
-	w.addStagingSize(int64(len(data)) - previousSize)
-
-	return &path, nil
+	return nil
 }
 
 // fileSize returns the size of a file, or 0 if it cannot be stat'ed.
@@ -1214,14 +1418,20 @@ func (w *UploadWorker) isTransientS3Error(err error) bool {
 	return false
 }
 
+// RemoveLocalFile removes a staged body. The account's staging directory stays, even
+// when empty: a delivery may have just created it and be about to stage into it (see
+// StoreLocally).
 func (w *UploadWorker) RemoveLocalFile(path string) error {
+	pathMu := w.stagingPathLock(path)
+	pathMu.Lock()
 	size := fileSize(path)
-	if err := os.Remove(path); err != nil {
+	err := os.Remove(path)
+	if err == nil {
+		w.stagedSizeChanged(path, size, 0)
+	}
+	pathMu.Unlock()
+	if err != nil {
 		logger.Warn("Uploader: Uploaded but could not delete file", "path", path, "error", err)
-	} else {
-		w.addStagingSize(-size)
-		stopAt, _ := filepath.Abs(w.path)
-		removeEmptyParents(path, stopAt)
 	}
 	return nil
 }
@@ -1229,7 +1439,17 @@ func (w *UploadWorker) RemoveLocalFile(path string) error {
 // monitorStuckUploads checks for uploads that have exceeded max attempts and logs warnings.
 // This provides visibility into failed uploads that need manual intervention.
 func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
-	sizeBeforeQuery := atomic.LoadInt64(&w.currentStagingSize)
+	// The staging size is re-based on the backlog below. Note every staged-file change
+	// from here on, so that each is matched against the backlog's snapshot instead of
+	// assumed to be missing from it. Begun before the stats query, so that a delivery
+	// staged during it is matched too, whichever side of the snapshot its row commits.
+	countedBefore := w.beginStagingRefresh()
+	var changed map[StagedBody]int64
+	endRefresh := func() []StagedBody {
+		changed = w.endStagingRefresh()
+		return slices.Collect(maps.Keys(changed))
+	}
+	defer w.endStagingRefresh() // ends it if the measurement failed before endRefresh did
 
 	stats, err := w.rdb.GetUploaderStatsWithRetry(ctx, w.maxAttempts)
 	if err != nil {
@@ -1244,9 +1464,15 @@ func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
 	// cluster-wide (GetUploaderStats has no instance filter), and max_staging_size
 	// guards this node's own staging directory: rebasing from the cluster total would
 	// make one node's backlog reject deliveries on every node, however empty its disk.
-	// Applied as a delta so that messages staged while the query was in flight - which
-	// the snapshot predates - are not dropped from the count.
-	backlog, backlogErr := w.rdb.PendingUploadBacklog(ctx, w.instanceID, w.maxAttempts)
+	//
+	// Staged files keep changing while the queries run, and the snapshot may or may not
+	// hold a change: a delivery stages its body before its row commits, an upload drops
+	// its row before its body leaves the spool. So a body changed since countedBefore
+	// is counted as it is on disk, as the live counter already counts it, and its share
+	// is taken out of both the snapshot (Included) and countedBefore (before); every
+	// other body is counted as the snapshot has it. Applied as a delta, so changes
+	// after endRefresh, which the snapshot predates, stay counted too.
+	backlog, backlogErr := w.rdb.PendingUploadBacklog(ctx, w.instanceID, w.maxAttempts, endRefresh)
 	if backlogErr != nil {
 		if ctx.Err() != nil {
 			return nil // shutting down
@@ -1254,7 +1480,11 @@ func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
 		// Leave the counter alone rather than rebasing from a number that is not ours.
 		logger.Error("UploaderMonitor: Failed to measure pending upload backlog", "instance_id", w.instanceID, "error", backlogErr)
 	} else {
-		w.addStagingSize(backlog.Bytes - sizeBeforeQuery)
+		delta := backlog.Bytes - countedBefore
+		for body, before := range changed {
+			delta += before - backlog.Included[body]
+		}
+		w.addStagingSize(delta)
 	}
 
 	// Log summary
@@ -1336,17 +1566,66 @@ func (w *UploadWorker) reportStalledBacklog(backlog UploadBacklog) {
 		"hint", "transient S3 errors do not count toward max_attempts, so this backlog never appears in the failed-upload alert; these message bodies exist only on this instance's disk")
 }
 
-// addStagingSize applies a local write or removal to the cached staging size, so the
-// limit guard reflects what happened since the last authoritative refresh in
-// monitorStuckUploads rather than a value that is up to one monitor interval stale.
+// stagedSizeChanged applies a local write or removal of the body staged at path, from
+// before to after bytes, to the cached staging size, so the limit guard reflects what
+// happened since the last authoritative refresh in monitorStuckUploads rather than a
+// value that is up to one monitor interval stale. The caller holds path's staging
+// lock, so before is what is counted for path.
+func (w *UploadWorker) stagedSizeChanged(path string, before, after int64) {
+	if before == after {
+		return
+	}
+	w.stagingRefreshMu.Lock()
+	defer w.stagingRefreshMu.Unlock()
+	if w.stagingRefresh != nil {
+		if _, seen := w.stagingRefresh[path]; !seen {
+			w.stagingRefresh[path] = before
+		}
+	}
+	w.addStagingSize(after - before)
+}
+
+// beginStagingRefresh starts noting staged-file changes for monitorStuckUploads, which
+// runs one at a time on the worker's loop, and returns the staging size they are
+// changes to.
+func (w *UploadWorker) beginStagingRefresh() int64 {
+	w.stagingRefreshMu.Lock()
+	defer w.stagingRefreshMu.Unlock()
+	w.stagingRefresh = make(map[string]int64)
+	return atomic.LoadInt64(&w.currentStagingSize)
+}
+
+// endStagingRefresh stops noting changes and returns, for each body changed since
+// beginStagingRefresh, the bytes counted for it then. A path that does not name a body
+// (none should) is left out, so its change counts as one the snapshot predates.
+func (w *UploadWorker) endStagingRefresh() map[StagedBody]int64 {
+	w.stagingRefreshMu.Lock()
+	paths := w.stagingRefresh
+	w.stagingRefresh = nil
+	w.stagingRefreshMu.Unlock()
+
+	changed := make(map[StagedBody]int64, len(paths))
+	for path, before := range paths {
+		if body, ok := w.stagedBodyAt(path); ok {
+			changed[body] = before
+		}
+	}
+	return changed
+}
+
+// addStagingSize adds delta to the cached staging size, clamped at zero.
 func (w *UploadWorker) addStagingSize(delta int64) {
 	if delta == 0 {
 		return
 	}
-	if size := atomic.AddInt64(&w.currentStagingSize, delta); size < 0 {
+	for {
+		cur := atomic.LoadInt64(&w.currentStagingSize)
 		// Removing files this process never counted - orphans left by a previous run -
-		// can drive the running total below zero.
-		atomic.CompareAndSwapInt64(&w.currentStagingSize, size, 0)
+		// must clamp at zero rather than driving the running total below zero.
+		next := max(cur+delta, 0)
+		if atomic.CompareAndSwapInt64(&w.currentStagingSize, cur, next) {
+			return
+		}
 	}
 }
 
@@ -1359,22 +1638,6 @@ func (w *UploadWorker) IsStagingLimitExceeded(additionalSize int64) bool {
 	}
 	currentSize := atomic.LoadInt64(&w.currentStagingSize)
 	return currentSize+additionalSize > w.maxStagingSize
-}
-
-func removeEmptyParents(path, stopAt string) {
-	for {
-		parent := filepath.Dir(path)
-		if parent == stopAt || parent == "." || parent == "/" {
-			break
-		}
-		// Try removing the parent directory
-		err := os.Remove(parent)
-		if err != nil {
-			// Stop if not empty or permission denied
-			break
-		}
-		path = parent
-	}
 }
 
 // stagedFile is a file in the staging tree that the cleanup scan has yet to resolve
@@ -1413,15 +1676,15 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 	// on every retry and the message was permanently lost (see incident
 	// upload id=6197517, account=22385, hash=66e220f4…).
 	gracePeriod := w.cleanupGracePeriod
-	if gracePeriod == 0 {
+	if gracePeriod <= 0 {
+		// A negative value would put the cutoff in the future and make every
+		// staged body a candidate, however fresh.
 		gracePeriod = time.Hour // safe default - see SetCleanupGracePeriod
 	}
 	cutoffTime := time.Now().Add(-gracePeriod)
 
 	var filesChecked, filesRemoved int64
 	var totalSize int64
-
-	stopAt, _ := filepath.Abs(w.path)
 
 	// Candidate files grouped by account, resolved one batch at a time. A lookup
 	// failure leaves its whole group on disk: an unanswered query is not evidence
@@ -1445,15 +1708,32 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 				if _, stillQueued := existing[file.contentHash]; stillQueued {
 					continue
 				}
-				if removeErr := os.Remove(file.path); removeErr != nil {
+				pathMu := w.stagingPathLock(file.path)
+				pathMu.Lock()
+				// A delivery may have replaced this old candidate while the lookup
+				// was in flight, before its new pending row committed. Recheck the
+				// grace period under the same lock as staging and removal.
+				info, statErr := os.Stat(file.path)
+				if statErr != nil || info.ModTime().After(cutoffTime) {
+					pathMu.Unlock()
+					if statErr != nil && !os.IsNotExist(statErr) {
+						logger.Warn("UploaderCleanup: Failed to stat orphan candidate", "path", file.path, "error", statErr)
+					}
+					continue
+				}
+				size := info.Size()
+				removeErr := os.Remove(file.path)
+				if removeErr == nil {
+					w.stagedSizeChanged(file.path, size, 0)
+				}
+				pathMu.Unlock()
+				if removeErr != nil {
 					logger.Warn("UploaderCleanup: Failed to remove orphaned file", "path", file.path, "error", removeErr)
 					continue
 				}
 				filesRemoved++
-				totalSize += file.size
-				w.addStagingSize(-file.size)
-				logger.Info("UploaderCleanup: Removed orphaned file", "hash", file.contentHash, "account_id", accountID, "size", file.size)
-				removeEmptyParents(file.path, stopAt)
+				totalSize += size
+				logger.Info("UploaderCleanup: Removed orphaned file", "hash", file.contentHash, "account_id", accountID, "size", size)
 			}
 		}
 	}
@@ -1517,13 +1797,14 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 		// Validate content hash
 		if !isValidContentHash(contentHash) {
 			logger.Warn("UploaderCleanup: Invalid content hash in path", "path", path)
-			// Remove invalid files
+			// Remove invalid files (such as <hash>.<16hex>.tmp crash leftovers).
+			// Do not subtract info.Size() from currentStagingSize: non-content-hash
+			// files were never staged into place or counted in currentStagingSize.
 			if removeErr := os.Remove(path); removeErr != nil {
 				logger.Warn("UploaderCleanup: Failed to remove invalid file", "path", path, "error", removeErr)
 			} else {
 				filesRemoved++
 				totalSize += info.Size()
-				w.addStagingSize(-info.Size())
 				logger.Info("UploaderCleanup: Removed invalid file", "path", path)
 			}
 			return nil

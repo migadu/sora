@@ -137,3 +137,192 @@ func TestCheckLegacyStagingSymlinkCycleWithoutBodies(t *testing.T) {
 		t.Errorf("empty legacy spool with a symlink cycle: %v", err)
 	}
 }
+
+func TestCheckLegacyStagingSharedSymlinkTarget(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+
+	t.Run("legacy symlinked to active default", func(t *testing.T) {
+		root := t.TempDir()
+		newDefault := filepath.Join(root, "spool", "uploads")
+		legacy := filepath.Join(root, "tmp", "uploads")
+		if err := os.MkdirAll(filepath.Join(newDefault, "42"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(newDefault, "42", hash), []byte("live"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(newDefault, legacy); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckLegacyStaging(newDefault, newDefault, legacy); err != nil {
+			t.Fatalf("legacy compatibility symlink to active spool refused startup: %v", err)
+		}
+	})
+
+	t.Run("active default symlinked to legacy or shared persistent target", func(t *testing.T) {
+		root := t.TempDir()
+		persistent := filepath.Join(root, "data", "uploads")
+		newDefault := filepath.Join(root, "spool", "uploads")
+		legacy := filepath.Join(root, "tmp", "uploads")
+		if err := os.MkdirAll(filepath.Join(persistent, "42"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(persistent, "42", hash), []byte("live"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, link := range []string{newDefault, legacy} {
+			if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(persistent, link); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := CheckLegacyStaging(newDefault, newDefault, legacy); err != nil {
+			t.Fatalf("active and legacy spool sharing symlink target refused startup: %v", err)
+		}
+	})
+
+	t.Run("nested account symlinks", func(t *testing.T) {
+		root := t.TempDir()
+		persistent := filepath.Join(root, "data", "42")
+		newDefault := filepath.Join(root, "spool", "uploads")
+		legacy := filepath.Join(root, "tmp", "uploads")
+		if err := os.MkdirAll(persistent, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(persistent, hash), []byte("live"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(newDefault, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(legacy, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(persistent, filepath.Join(newDefault, "42")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(persistent, filepath.Join(legacy, "42")); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckLegacyStaging(newDefault, newDefault, legacy); err != nil {
+			t.Fatalf("same account directory reachable under both spools refused startup: %v", err)
+		}
+
+		// A second account under legacy pointing at persistent while missing under newDefault IS stranded.
+		if err := os.Symlink(persistent, filepath.Join(legacy, "99")); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckLegacyStaging(newDefault, newDefault, legacy); err == nil {
+			t.Fatal("legacy account 99 missing under active spool was not refused")
+		}
+	})
+}
+
+func TestCheckLegacyStagingBodyIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		kind          string
+		activeAccount string
+		wantRefusal   bool
+	}{
+		{"hard-linked body", "hardlink", "42", false},
+		{"symlinked body", "symlink", "42", false},
+		{"same bytes in a distinct file", "copy", "42", true},
+		{"same body at a different account path", "hardlink", "99", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			legacy, active := filepath.Join(root, "old"), filepath.Join(root, "new")
+			hash := strings.Repeat("a", 64)
+			legacyBody := filepath.Join(legacy, "42", hash)
+			activeBody := filepath.Join(active, tc.activeAccount, hash)
+			for _, body := range []string{legacyBody, activeBody} {
+				if err := os.MkdirAll(filepath.Dir(body), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			const payload = "the only staged copy"
+			if err := os.WriteFile(legacyBody, []byte(payload), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			switch tc.kind {
+			case "hardlink":
+				err = os.Link(legacyBody, activeBody)
+			case "symlink":
+				err = os.Symlink(legacyBody, activeBody)
+			case "copy":
+				err = os.WriteFile(activeBody, []byte(payload), 0o600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = CheckLegacyStaging(active, active, legacy)
+			if (err != nil) != tc.wantRefusal {
+				t.Fatalf("refusal = %v, want %v (error: %v)", err != nil, tc.wantRefusal, err)
+			}
+			for _, body := range []string{legacyBody, activeBody} {
+				data, err := os.ReadFile(body)
+				if err != nil || string(data) != payload {
+					t.Fatalf("staged body changed at %s: data=%q error=%v", body, data, err)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckLegacyStagingCycleDoesNotHideStrandedBody(t *testing.T) {
+	root := t.TempDir()
+	legacy, active := filepath.Join(root, "old"), filepath.Join(root, "new")
+	for _, dir := range []string{legacy, active} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hash := strings.Repeat("a", 64)
+	legacyBody := filepath.Join(legacy, hash)
+	if err := os.WriteFile(legacyBody, []byte("staged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(legacyBody, filepath.Join(active, hash)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(legacy, filepath.Join(legacy, "42")); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckLegacyStaging(active, active, legacy); err == nil {
+		t.Fatal("legacy account 42 reaches a body that is absent under the active account path; want refusal")
+	}
+	// The alias is safe once its identical subtree is also reachable at the same
+	// logical account path under the active spool.
+	if err := os.Symlink(legacy, filepath.Join(active, "42")); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckLegacyStaging(active, active, legacy); err != nil {
+		t.Fatalf("cyclic account alias is reachable through the active spool too: %v", err)
+	}
+	// The cycle's presence check also follows a body symlink outside the spool.
+	if err := os.Remove(filepath.Join(active, "42")); err != nil {
+		t.Fatal(err)
+	}
+	persistentBody := filepath.Join(root, "persistent-body")
+	if err := os.WriteFile(persistentBody, []byte("staged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{legacyBody, filepath.Join(active, hash)} {
+		if err := os.Remove(body); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(persistentBody, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := CheckLegacyStaging(active, active, legacy); err == nil {
+		t.Fatal("cyclic account alias reaches an external body symlink missing under active account 42; want refusal")
+	}
+}

@@ -66,7 +66,7 @@ type POP3ProxyServer struct {
 	masterPassword     string
 	connManager        *proxy.ConnectionManager
 	connTracker        *server.ConnectionTracker
-	wg                 sync.WaitGroup
+	sessions           server.SessionGroup // Session goroutines, which Stop drains
 	enableAffinity     bool
 	authLimiter        server.AuthLimiter
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
@@ -224,17 +224,14 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	if options.RemoteLookup != nil && options.RemoteLookup.Enabled {
 		remotelookupClient, err := proxy.InitializeRemoteLookup("pop3", options.RemoteLookup, options.RemotePort)
 		if err != nil {
-			logger.Debug("POP3 Proxy: Failed to initialize remotelookup client", "proxy", options.Name, "error", err)
-			if !options.RemoteLookup.ShouldLookupLocalUsers() {
-				serverCancel()
-				return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
-			}
-			logger.Debug("POP3 Proxy: Continuing without remotelookup due to lookup_local_users=true", "proxy", options.Name)
-		} else {
-			routingLookup = remotelookupClient
-			if options.Debug {
-				logger.Debug("POP3 Proxy: RemoteLookup client initialized successfully", "proxy", options.Name)
-			}
+			// Also with lookup_local_users, which adds the database for the users the
+			// lookup does not know and does not make the lookup optional.
+			serverCancel()
+			return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
+		}
+		routingLookup = remotelookupClient
+		if options.Debug {
+			logger.Debug("POP3 Proxy: RemoteLookup client initialized successfully", "proxy", options.Name)
 		}
 	}
 
@@ -470,6 +467,8 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 		SuppressedCaps:                  suppressedCaps,
 		NewSession: func(c *pop3server.Conn) (pop3server.Session, error) {
 			netConn := c.NetConn()
+			endInitialization := s.sessions.GuardInitialization(s.appCtx, netConn)
+			defer endInitialization()
 			proxyInfo := server.GetProxyProtocolInfo(netConn)
 
 			var releaseConn func()
@@ -552,18 +551,20 @@ func (s *POP3ProxyServer) connConfig() server.SoraConnConfig {
 		MinBytesPerMinute:    settings.minBytesPerMinute,
 		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0 || settings.minBytesPerMinute > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
-			// Send POP3 error response before closing
-			// RFC 1939 doesn't define specific timeout response codes, but [IN-USE] is commonly used
+			// Best-effort notice before closing. It answers no command and
+			// carries no response code: [IN-USE] says a login succeeded with
+			// the maildrop locked (RFC 2449 section 8.1.2), and no RFC 2449 or
+			// RFC 3206 code describes a timeout.
 			var message string
 			switch reason {
 			case "idle":
-				message = "-ERR [IN-USE] Idle timeout, please reconnect\r\n"
+				message = "-ERR Idle timeout, please reconnect\r\n"
 			case "slow_throughput":
-				message = "-ERR [IN-USE] Connection too slow, please reconnect\r\n"
+				message = "-ERR Connection too slow, please reconnect\r\n"
 			case "session_max":
-				message = "-ERR [IN-USE] Maximum session duration exceeded, please reconnect\r\n"
+				message = "-ERR Maximum session duration exceeded, please reconnect\r\n"
 			default:
-				message = "-ERR [IN-USE] Connection timeout, please reconnect\r\n"
+				message = "-ERR Connection timeout, please reconnect\r\n"
 			}
 			_, _ = fmt.Fprint(conn, message)
 		},
@@ -653,16 +654,19 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 		// connections never inflate the gauges (they have no session to
 		// decrement them).
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		started := s.sessions.Go(func() {
 			defer func() {
 				if r := recover(); r != nil {
 					logger.Error("POP3 Proxy: panic in connection handler", "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
 			s.pop3libServer.Load().ServeConn(conn)
-		}()
+		})
+		if !started {
+			// Stop is draining the sessions and no longer waits for new ones.
+			conn.Close()
+			return nil
+		}
 	}
 }
 
@@ -686,6 +690,7 @@ func (s *POP3ProxyServer) GetConnectionManager() *proxy.ConnectionManager {
 }
 
 func (s *POP3ProxyServer) Stop() error {
+	s.sessions.BeginDrain()
 	logger.Debug("POP3 Proxy: Stopping", "proxy", s.name)
 
 	// Unregister rate limiter from global registry
@@ -711,16 +716,9 @@ func (s *POP3ProxyServer) Stop() error {
 		lib.Close()
 	}
 
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(30 * time.Second) {
 		logger.Debug("POP3 Proxy: Server stopped gracefully", "name", s.name)
-	case <-time.After(30 * time.Second):
+	} else {
 		logger.Debug("POP3 Proxy: Server stop timeout", "proxy", s.name)
 	}
 
@@ -741,6 +739,10 @@ func (s *POP3ProxyServer) Stop() error {
 		if err := s.lookupCache.Stop(stopCtx); err != nil {
 			logger.Error("Error stopping auth cache", "proxy", s.name, "error", err)
 		}
+	}
+
+	if s.authLimiter != nil {
+		s.authLimiter.Stop()
 	}
 
 	return nil

@@ -35,7 +35,10 @@ const DefaultMaxMessageSize = 50 * 1024 * 1024
 // (security-audit M13)
 const defaultLMTPMaxConnections = 1000
 
-// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+// getProxyProtocolTrustedProxies returns the hosts trusted to send PROXY headers: the
+// ProxyProtocolTrustedProxies option if set, otherwise trusted_networks. No config key
+// sets that option (there is no proxy_protocol_trusted_proxies, #542), so in a running
+// server PROXY trust is always [servers] trusted_networks.
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {
 		return proxyProtocolTrusted
@@ -188,6 +191,7 @@ type LMTPServerBackend struct {
 	uploader     *uploader.UploadWorker
 	server       *smtp.Server
 	appCtx       context.Context
+	cancel       context.CancelFunc
 	tlsConfig    *tls.Config
 	ftsRetention time.Duration
 	relayQueue   delivery.RelayQueue // Disk-based queue for relay retry
@@ -307,10 +311,19 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		options.TLSUseStartTLS = false
 	}
 
+	serverCtx, serverCancel := context.WithCancel(appCtx)
+	created := false
+	defer func() {
+		if !created {
+			serverCancel()
+		}
+	}()
+
 	backend := &LMTPServerBackend{
 		addr:               addr,
 		name:               name,
-		appCtx:             appCtx,
+		appCtx:             serverCtx,
+		cancel:             serverCancel,
 		hostname:           hostname,
 		instanceID:         instanceIDOrHostname(options.InstanceID, hostname),
 		maintenanceGate:    options.MaintenanceGate,
@@ -392,7 +405,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// context: go-smtp cancels the derived context when the client disconnects,
 	// the connection ends, or the server shuts down, and BaseContext adds app
 	// shutdown on top. Sessions derive their context from it in NewSession.
-	s.BaseContext = func(net.Listener) context.Context { return appCtx }
+	s.BaseContext = func(net.Listener) context.Context { return serverCtx }
 	s.AllowInsecureAuth = options.InsecureAuth
 	s.LMTP = true
 	s.MaxRecipients = 1 // Enforce single recipient per LMTP transaction.
@@ -476,7 +489,8 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	}
 
 	// Start connection limiter cleanup
-	backend.limiter.StartCleanup(appCtx)
+	backend.limiter.StartCleanup(serverCtx)
+	created = true
 
 	return backend, nil
 }
@@ -584,6 +598,10 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 }
 
 func (b *LMTPServerBackend) Start(errChan chan error) {
+	if b.appCtx.Err() != nil {
+		return
+	}
+
 	var listener net.Listener
 	var err error
 
@@ -593,6 +611,9 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	// Create base TCP listener with custom backlog
 	tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", b.server.Addr, b.listenBacklog)
 	if err != nil {
+		if b.cancel != nil {
+			b.cancel()
+		}
 		errChan <- fmt.Errorf("failed to create listener: %w", err)
 		return
 	}
@@ -626,6 +647,16 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	}
 	defer listener.Close()
 
+	// cmd/sora calls Close from a watcher on the application context that
+	// races Start, and go-smtp's Close closes only the listeners Serve has
+	// already registered: a listener created after it would be served until
+	// the process exits. Close it on shutdown, as the POP3 and ManageSieve
+	// servers do.
+	go func() {
+		<-b.appCtx.Done()
+		listener.Close()
+	}()
+
 	// Wrap listener with connection limiting
 	limitedListener := &connectionLimitingListener{
 		Listener: listener,
@@ -653,7 +684,11 @@ func (b *LMTPServerBackend) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	next := *b.settings.Load()
 
-	if maxSize := cfg.GetMaxMessageSizeWithDefault(); maxSize != next.maxMessageSize {
+	// A value that does not parse keeps the running limit (start-up, which has none,
+	// uses the default).
+	if maxSize, err := cfg.GetMaxMessageSize(); err != nil {
+		logger.Warn("LMTP config reload: invalid max_message_size, keeping the running value", "name", b.name, "error", err, "running", next.maxMessageSize)
+	} else if maxSize != next.maxMessageSize {
 		next.maxMessageSize = maxSize
 		reloaded = append(reloaded, "max_message_size")
 	}
@@ -667,6 +702,9 @@ func (b *LMTPServerBackend) ReloadConfig(cfg config.ServerConfig) error {
 }
 
 func (b *LMTPServerBackend) Close() error {
+	if b.cancel != nil {
+		b.cancel()
+	}
 	if b.server != nil {
 		return b.server.Close()
 	}

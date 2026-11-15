@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/emersion/go-smtp"
+	"github.com/migadu/sora/config"
 	soralogger "github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
@@ -324,7 +326,14 @@ func (r *HTTPRelayHandler) GetCircuitBreaker() *circuitbreaker.CircuitBreaker {
 type HTTPRelayRequest struct {
 	From       string   `json:"from"`
 	Recipients []string `json:"recipients"`
-	Message    string   `json:"message"` // RFC822 message as string
+	// Message is the RFC 5322 message as a string. A JSON string holds Unicode
+	// text only, so a message that is not valid UTF-8 arrives here with each
+	// invalid byte replaced by U+FFFD and is also sent as MessageBase64.
+	Message string `json:"message"`
+	// MessageBase64 is the message byte for byte, base64 on the wire (RFC 4648
+	// section 4). sendToHTTPRelay sets it when the message is not valid UTF-8,
+	// the one case Message cannot carry exactly; it is absent otherwise.
+	MessageBase64 []byte `json:"message_base64,omitempty"`
 }
 
 // SendToExternalRelay sends a message to the external HTTP API with circuit breaker protection.
@@ -340,7 +349,7 @@ func (r *HTTPRelayHandler) SendToExternalRelay(from string, to string, messageBy
 		})
 		// Check if circuit breaker is open
 		if errors.Is(err, circuitbreaker.ErrCircuitBreakerOpen) {
-			soralogger.Warn("HTTP Relay: Circuit breaker is OPEN - skipping delivery", "url", r.HTTPURL)
+			soralogger.Warn("HTTP Relay: Circuit breaker is OPEN - skipping delivery", "url", config.MaskEndpointURL(r.HTTPURL))
 			metrics.LMTPExternalRelay.WithLabelValues("circuit_breaker_open").Inc()
 			return fmt.Errorf("HTTP relay circuit breaker is open: %w", err)
 		}
@@ -359,6 +368,13 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 		Recipients: []string{to},
 		Message:    string(messageBytes),
 	}
+	// json.Marshal replaces every byte of a string that is not valid UTF-8 with
+	// U+FFFD, which destroys 8-bit text in any other charset: a body, a part of a
+	// multipart, a raw header value. Such a message also goes byte for byte in
+	// message_base64; message stays as it was for relay APIs that do not read it.
+	if !utf8.Valid(messageBytes) {
+		payload.MessageBase64 = messageBytes
+	}
 
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
@@ -371,8 +387,9 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 	req, err := http.NewRequest("POST", r.HTTPURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-		// Invalid URL is a configuration error (permanent)
-		return &RelayError{Err: fmt.Errorf("failed to create HTTP request: %w", err), Permanent: true}
+		// Invalid URL is a configuration error (permanent). The error quotes http_url,
+		// which may carry credentials, as does any error from Do.
+		return &RelayError{Err: fmt.Errorf("failed to create HTTP request: %w", config.MaskURLError(err)), Permanent: true}
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -384,7 +401,7 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 	if err != nil {
 		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
 		// Network/connection errors are temporary
-		return &RelayError{Err: fmt.Errorf("failed to send HTTP relay request: %w", err), Permanent: false}
+		return &RelayError{Err: fmt.Errorf("failed to send HTTP relay request: %w", config.MaskURLError(err)), Permanent: false}
 	}
 	defer func() {
 		// Read the body to EOF so the transport keeps the connection for the
@@ -403,7 +420,7 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 		err := fmt.Errorf("HTTP relay returned error status: %d", resp.StatusCode)
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			err = fmt.Errorf("HTTP relay returned redirect status %d to %q; redirects are not followed, so [relay] http_url must be the final URL",
-				resp.StatusCode, resp.Header.Get("Location"))
+				resp.StatusCode, config.MaskEndpointURL(resp.Header.Get("Location")))
 		}
 		return &RelayError{Err: err, Permanent: permanent}
 	}

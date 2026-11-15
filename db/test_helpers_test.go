@@ -36,8 +36,9 @@ func setupTestDatabase(t testing.TB) *Database {
 
 // setupTestDatabaseWithSuffix connects like setupTestDatabase, but to the database
 // named after the configured one plus suffix, creating it if it does not exist yet.
-// It is for tests that empty whole tables: the configured database is shared with
-// every other test package, and go test runs packages at the same time.
+// It is for tests that empty whole tables or work through a table-wide queue: the
+// configured database is shared with every other test package, and go test runs
+// packages at the same time.
 func setupTestDatabaseWithSuffix(t testing.TB, suffix string) *Database {
 	skipDatabaseTestInShortMode(t)
 	ctx := context.Background()

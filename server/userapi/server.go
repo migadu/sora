@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -272,29 +273,35 @@ func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options Server
 		errChan <- fmt.Errorf("failed to create HTTP Mail API server: %w", err)
 		return nil
 	}
-
-	protocol := "HTTP"
-	if options.TLS {
-		protocol = "HTTPS"
-	}
-	serverName := options.Name
-	if serverName == "" {
-		serverName = "default"
-	}
-	logger.Info("HTTP Mail API: Starting server", "name", serverName, "protocol", protocol, "addr", options.Addr)
 	go func() {
-		if err := server.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
+		if err := server.Run(ctx); err != nil && ctx.Err() == nil {
 			errChan <- fmt.Errorf("HTTP Mail API server failed: %w", err)
 		}
 	}()
 	return server
 }
 
-// start initializes and starts the HTTP server
-func (s *Server) start(ctx context.Context) error {
+// Run starts the HTTP Mail API server and blocks until it stops. It returns nil
+// when stopped via ctx cancellation.
+func (s *Server) Run(ctx context.Context) error {
+	defer server.UnregisterRateLimiter("userapi", s.name)
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	protocol := "HTTP"
+	if s.tls {
+		protocol = "HTTPS"
+	}
+	serverName := s.name
+	if serverName == "" {
+		serverName = "default"
+	}
+	logger.Info("HTTP Mail API: Starting server", "name", serverName, "protocol", protocol, "addr", s.addr)
+
 	router := s.SetupRoutes()
 
-	s.server = &http.Server{
+	httpServer := &http.Server{
 		Addr:              s.addr,
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second, // slowloris-on-headers defense
@@ -302,15 +309,31 @@ func (s *Server) start(ctx context.Context) error {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	if s.tls {
+		httpServer.TLSConfig = s.tlsConfig
+	}
+	s.server = httpServer
+
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	stopCtx, stopCancel := context.WithCancel(ctx)
+	defer stopCancel()
 
 	// Graceful shutdown
+	shutdownDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
+		defer close(shutdownDone)
+		<-stopCtx.Done()
+		if ctx.Err() == nil {
+			return
+		}
 		logger.Info("HTTP Mail API: Shutting down server...", "name", s.name)
 		server.UnregisterRateLimiter("userapi", s.name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if err := s.server.Shutdown(shutdownCtx); err != nil {
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			logger.Warn("HTTP Mail API: Error shutting down server", "name", s.name, "error", err)
 		}
 	}()
@@ -318,6 +341,8 @@ func (s *Server) start(ctx context.Context) error {
 	// Create listener
 	listener, err := net.Listen("tcp", s.addr)
 	if err != nil {
+		stopCancel()
+		<-shutdownDone
 		return fmt.Errorf("failed to create listener: %w", err)
 	}
 
@@ -336,13 +361,26 @@ func (s *Server) start(ctx context.Context) error {
 		listener = netutil.LimitListener(listener, s.maxConnections)
 	}
 
+	if ctx.Err() != nil {
+		listener.Close()
+		<-shutdownDone
+		return nil
+	}
+
 	// Start server with or without TLS. The certificate is in TLSConfig
 	// already, from the global [tls] manager or the certificate files.
 	if s.tls {
-		s.server.TLSConfig = s.tlsConfig
-		return s.server.ServeTLS(listener, "", "")
+		err = httpServer.ServeTLS(listener, "", "")
+	} else {
+		err = httpServer.Serve(listener)
 	}
-	return s.server.Serve(listener)
+	if errors.Is(err, http.ErrServerClosed) && ctx.Err() != nil {
+		<-shutdownDone
+		return nil
+	}
+	stopCancel()
+	<-shutdownDone
+	return err
 }
 
 // SetupRoutes configures all HTTP routes and middleware
@@ -350,11 +388,11 @@ func (s *Server) SetupRoutes() http.Handler {
 	mux := http.NewServeMux()
 
 	// Public routes (no authentication required)
-	mux.HandleFunc("/user/auth/login", routeHandler("POST", s.handleLogin))
-	mux.HandleFunc("/user/auth/refresh", routeHandler("POST", s.handleRefreshToken))
+	mux.HandleFunc("/user/auth/login", s.routeHandler("POST", s.handleLogin))
+	mux.HandleFunc("/user/auth/refresh", s.routeHandler("POST", s.handleRefreshToken))
 
 	// Mailbox operations
-	mux.Handle("/user/mailboxes", s.jwtAuthMiddleware(multiMethodHandler(map[string]http.HandlerFunc{
+	mux.Handle("/user/mailboxes", s.jwtAuthMiddleware(s.multiMethodHandler(map[string]http.HandlerFunc{
 		"GET":  s.handleListMailboxes,
 		"POST": s.handleCreateMailbox,
 	})))
@@ -364,8 +402,11 @@ func (s *Server) SetupRoutes() http.Handler {
 	mux.Handle("/user/messages/", s.jwtAuthMiddleware(http.HandlerFunc(s.handleMessageOperations)))
 
 	// Sieve filter operations
-	mux.Handle("/user/filters", s.jwtAuthMiddleware(routeHandler("GET", s.handleListFilters)))
+	mux.Handle("/user/filters", s.jwtAuthMiddleware(s.routeHandler("GET", s.handleListFilters)))
 	mux.Handle("/user/filters/", s.jwtAuthMiddleware(http.HandlerFunc(s.handleFilterOperations)))
+
+	// Every other path (ServeMux's own 404 is text/plain)
+	mux.HandleFunc("/", s.notFound)
 
 	// Wrap with middleware (in reverse order - last applied is outermost)
 	handler := s.loggingMiddleware(mux)
@@ -385,7 +426,7 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	// Check for subscribe/unsubscribe operations
 	if strings.HasSuffix(path, "/subscribe") {
 		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "POST")
 			return
 		}
 		s.handleSubscribeMailbox(w, r)
@@ -393,7 +434,7 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasSuffix(path, "/unsubscribe") {
 		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "POST")
 			return
 		}
 		s.handleUnsubscribeMailbox(w, r)
@@ -403,7 +444,7 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	// Check for message listing/search
 	if strings.HasSuffix(path, "/messages") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleListMessages(w, r)
@@ -411,20 +452,20 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasSuffix(path, "/search") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleSearchMessages(w, r)
 		return
 	}
 
-	// Otherwise it's a delete operation on the mailbox itself
+	// Otherwise it's the mailbox itself, which can only be deleted
 	if r.Method == "DELETE" {
 		s.handleDeleteMailbox(w, r)
 		return
 	}
 
-	http.Error(w, "Not found", http.StatusNotFound)
+	s.methodNotAllowed(w, "DELETE")
 }
 
 // handleMessageOperations routes message operations
@@ -434,7 +475,7 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 	// Check for body/raw endpoints
 	if strings.HasSuffix(path, "/body") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleGetMessageBody(w, r)
@@ -442,7 +483,7 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 	}
 	if strings.HasSuffix(path, "/raw") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleGetMessageRaw(w, r)
@@ -458,7 +499,7 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 	case "DELETE":
 		s.handleDeleteMessage(w, r)
 	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		s.methodNotAllowed(w, "GET", "PATCH", "DELETE")
 	}
 }
 
@@ -471,7 +512,7 @@ func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) 
 	// Check for capabilities endpoint
 	if path == "capabilities" {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleGetCapabilities(w, r)
@@ -481,7 +522,7 @@ func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) 
 	// Check for activate endpoint
 	if strings.HasSuffix(path, "/activate") {
 		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "POST")
 			return
 		}
 		s.handleActivateFilter(w, r)
@@ -497,7 +538,7 @@ func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) 
 	case "DELETE":
 		s.handleDeleteFilter(w, r)
 	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		s.methodNotAllowed(w, "GET", "PUT", "DELETE")
 	}
 }
 
@@ -586,7 +627,19 @@ func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 	s.writeJSON(w, status, map[string]string{"error": message})
 }
 
-// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+// writeTokenRefused answers 401 for a bearer token the request presented and that was
+// refused: expired, malformed, badly signed, or no longer valid for its account. The
+// challenge says error="invalid_token" (RFC 6750 section 3.1), so a client can tell it
+// apart from a request that carried no token.
+func (s *Server) writeTokenRefused(w http.ResponseWriter) {
+	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, true)
+	s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+}
+
+// getProxyProtocolTrustedProxies returns the hosts trusted to send PROXY headers: the
+// ProxyProtocolTrustedProxies option if set, otherwise trusted_networks. No config key
+// sets that option (there is no proxy_protocol_trusted_proxies, #542), so in a running
+// server PROXY trust is always [servers] trusted_networks.
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {
 		return proxyProtocolTrusted

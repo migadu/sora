@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -12,6 +13,23 @@ import (
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 )
+
+// ErrMaxConnectionsPerIP is a refusal over max_connections_per_ip: one client has too
+// many connections, as opposed to the server being full (max_connections).
+var ErrMaxConnectionsPerIP = errors.New("maximum connections per IP reached")
+
+// IsProxiedClientRefusal reports whether err refused the client a PROXY header named for
+// a reason of that client's own: over its max_connections_per_ip (ErrMaxConnectionsPerIP)
+// or with its IP blocked by the auth rate limiter (ErrIPBlocked). Such a refusal is
+// answered with a protocol reply after the TLS handshake instead of a silent close: the
+// PROXY peer is a proxy or load balancer (the header is only read from a trusted peer),
+// and a sora proxy that sees the socket close before its TLS handshake counts a backend
+// failure, quarantining the backend for every user over one client. Every other refusal
+// stays a silent close, so a flooder connecting directly is told nothing.
+func IsProxiedClientRefusal(err error, proxyInfo *ProxyProtocolInfo) bool {
+	return proxyInfo != nil && proxyInfo.SrcIP != "" &&
+		(errors.Is(err, ErrMaxConnectionsPerIP) || errors.Is(err, ErrIPBlocked))
+}
 
 // ConnectionLimiter manages connection limits for protocol servers
 type ConnectionLimiter struct {
@@ -164,7 +182,7 @@ func (cl *ConnectionLimiter) CanAccept(remoteAddr net.Addr) error {
 			current := ipCounter.Load()
 			if current >= int64(cl.maxPerIP) {
 				logger.Info("Connection limiter: Maximum connections per IP reached", "protocol", cl.protocol, "ip", ip, "current", current, "max", cl.maxPerIP)
-				return fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", ip, current, cl.maxPerIP)
+				return fmt.Errorf("%w for %s (%d/%d)", ErrMaxConnectionsPerIP, ip, current, cl.maxPerIP)
 			}
 		}
 	}
@@ -204,26 +222,28 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 	if cl.maxPerIP > 0 && !exempt {
 		// Use cluster-wide tracking if available, otherwise use local tracking
 		if cl.ipTracker != nil {
-			// Cluster mode: increment cluster-wide counter
-			cl.ipTracker.IncrementIP(trackingIP)
-			perIP = int64(cl.ipTracker.GetIPCount(trackingIP))
+			// Cluster mode: the tracker checks the cluster-wide count and counts
+			// the connection at once, so concurrent accepts from one IP, on this
+			// listener or a sibling of it on this node, can't overshoot maxPerIP.
+			count, ok := cl.ipTracker.TryIncrementIP(trackingIP, cl.maxPerIP)
+			if !ok {
+				cl.currentTotal.Add(-1)
+				return nil, fmt.Errorf("%w for %s (%d/%d)", ErrMaxConnectionsPerIP, trackingIP, count, cl.maxPerIP)
+			}
+			perIP = int64(count)
 		} else {
 			// Local mode: increment local counter using lock-free LoadOrStore
 			value, _ := cl.perIPConnections.LoadOrStore(trackingIP, &atomic.Int64{})
 			ipCounter = value.(*atomic.Int64)
 			perIP = ipCounter.Add(1)
-		}
 
-		// Post-increment per-IP guard, mirroring the total-counter guard above: close the
-		// check/increment TOCTOU so concurrent accepts from one IP can't overshoot maxPerIP.
-		if perIP > int64(cl.maxPerIP) {
-			if cl.ipTracker != nil {
-				cl.ipTracker.DecrementIP(trackingIP)
-			} else if ipCounter != nil {
+			// Post-increment per-IP guard, mirroring the total-counter guard above: close the
+			// check/increment TOCTOU so concurrent accepts from one IP can't overshoot maxPerIP.
+			if perIP > int64(cl.maxPerIP) {
 				ipCounter.Add(-1)
+				cl.currentTotal.Add(-1)
+				return nil, fmt.Errorf("%w for %s (%d/%d)", ErrMaxConnectionsPerIP, trackingIP, cl.maxPerIP, cl.maxPerIP)
 			}
-			cl.currentTotal.Add(-1)
-			return nil, fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", trackingIP, cl.maxPerIP, cl.maxPerIP)
 		}
 
 		if realClientIP != "" {
@@ -332,7 +352,7 @@ func (cl *ConnectionLimiter) CanAcceptWithRealIP(remoteAddr net.Addr, realClient
 		}
 
 		if current >= int64(cl.maxPerIP) {
-			return fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", checkIP, current, cl.maxPerIP)
+			return fmt.Errorf("%w for %s (%d/%d)", ErrMaxConnectionsPerIP, checkIP, current, cl.maxPerIP)
 		}
 	}
 
@@ -351,14 +371,27 @@ func (cl *ConnectionLimiter) GetStats() ConnectionStats {
 
 	// Get per-IP counts from cluster tracker if available, otherwise from local map
 	if cl.ipTracker != nil {
-		// Cluster mode: get cluster-wide IP counts from tracker
-		cl.ipTracker.mu.RLock()
-		for ip, info := range cl.ipTracker.connections {
-			if info.TotalCount > 0 {
-				stats.IPConnections[ip] = int64(info.TotalCount)
+		// Snapshot the same counts admission checks, including sibling-only IPs.
+		// Keep the tracker -> node lock order used by TryIncrementIP/GetIPCount.
+		tracker := cl.ipTracker
+		tracker.mu.RLock()
+		if tracker.node != nil {
+			tracker.node.mu.Lock()
+		}
+		for ip := range tracker.connections {
+			if count := tracker.countLocked(ip); count > 0 {
+				stats.IPConnections[ip] = int64(count)
 			}
 		}
-		cl.ipTracker.mu.RUnlock()
+		if tracker.node != nil {
+			for ip := range tracker.node.counts {
+				if count := tracker.countLocked(ip); count > 0 {
+					stats.IPConnections[ip] = int64(count)
+				}
+			}
+			tracker.node.mu.Unlock()
+		}
+		tracker.mu.RUnlock()
 	} else {
 		// Local mode: get local IP counts from map
 		cl.perIPConnections.Range(func(key, value interface{}) bool {

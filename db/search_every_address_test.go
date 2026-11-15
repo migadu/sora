@@ -123,10 +123,10 @@ func TestHeaderSearchMatchesEveryAddress(t *testing.T) {
 		require.NoError(t, err)
 		defer tx.Rollback(ctx)
 		copyUIDs := []imap.UID{imap.UID(uidInsert)}
-		copied, _, err := db.CopyMessages(ctx, tx, &copyUIDs, inboxID, archiveID, accountID, "example.com", "everyaddr", "test")
+		copied, _, err := db.CopyMessages(ctx, tx, &copyUIDs, inboxID, archiveID, accountID, "example.com", "everyaddr", "test", nil, nil)
 		require.NoError(t, err)
 		moveUIDs := []imap.UID{imap.UID(uidImport)}
-		moved, err := db.MoveMessages(ctx, tx, &moveUIDs, inboxID, archiveID, accountID, "example.com", "everyaddr", "test")
+		moved, err := db.MoveMessages(ctx, tx, &moveUIDs, inboxID, archiveID, accountID, "example.com", "everyaddr", "test", nil, nil)
 		require.NoError(t, err)
 		require.NoError(t, tx.Commit(ctx))
 

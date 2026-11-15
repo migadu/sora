@@ -30,6 +30,9 @@ func handleConfigCommand(ctx context.Context) {
 			skipNext = true
 			continue
 		}
+		if strings.HasPrefix(os.Args[i], "--config=") {
+			continue
+		}
 		if os.Args[i] == "config" {
 			// Skip the "config" command itself
 			continue
@@ -101,71 +104,18 @@ func handleConfigValidate(_ context.Context) {
 		os.Exit(1)
 	}
 
-	// Validate all server configurations
-	allServers := cfg.GetAllServers()
-
-	if len(allServers) == 0 {
-		fmt.Printf("[WARN] Warning: No servers configured\n")
-		fmt.Printf("   Please configure at least one server in the config file\n\n")
+	// The shared checks the server runs before service setup.
+	problems := cfg.Validate()
+	for _, p := range problems {
+		fmt.Printf("[FAIL] %s:\n   %v\n", p.Section, p.Err)
 	}
-
-	hasErrors := false
-	for _, server := range allServers {
-		if err := server.Validate(); err != nil {
-			fmt.Printf("[FAIL] Server '%s' validation failed:\n", server.Name)
-			fmt.Printf("   %v\n", err)
-			hasErrors = true
-		}
-	}
-
-	if err := cfg.ValidateTrustedNetworks(); err != nil {
-		fmt.Printf("[FAIL] trusted_networks validation failed:\n   %v\n", err)
-		hasErrors = true
-	}
-
-	if err := cfg.Relay.Validate(); err != nil {
-		fmt.Printf("[FAIL] [relay] validation failed:\n")
-		fmt.Printf("   %v\n", err)
-		hasErrors = true
-	}
-
-	if err := cfg.Cleanup.Validate(); err != nil {
-		fmt.Printf("[FAIL] [cleanup] validation failed:\n")
-		fmt.Printf("   %v\n", err)
-		hasErrors = true
-	}
-
-	// Check for server name conflicts. A missing name or addr was reported above.
-	serverNames := make(map[string]bool)
-	serverAddresses := make(map[string]string) // addr -> server name
-	for _, server := range allServers {
-		if server.Name == "" || server.Addr == "" {
-			continue
-		}
-		if serverNames[server.Name] {
-			fmt.Printf("[FAIL] Duplicate server name '%s' found\n", server.Name)
-			fmt.Printf("   Each server must have a unique name\n")
-			hasErrors = true
-		}
-		serverNames[server.Name] = true
-
-		// Check for address conflicts
-		if existingServerName, exists := serverAddresses[server.Addr]; exists {
-			fmt.Printf("[FAIL] Duplicate server address '%s' found\n", server.Addr)
-			fmt.Printf("   Server '%s' and '%s' cannot bind to the same address\n",
-				existingServerName, server.Name)
-			hasErrors = true
-		}
-		serverAddresses[server.Addr] = server.Name
-	}
-
-	if hasErrors {
+	if len(problems) > 0 {
 		fmt.Printf("\n[FAIL] Configuration validation FAILED with errors\n")
 		os.Exit(1)
 	}
 
 	fmt.Printf("[OK] Configuration is valid!\n")
-	if len(allServers) > 0 {
+	if allServers := cfg.GetAllServers(); len(allServers) > 0 {
 		fmt.Printf("\nConfigured servers:\n")
 		for _, server := range allServers {
 			fmt.Printf("  - %s listening on %s\n", server.Name, server.Addr)
@@ -174,38 +124,49 @@ func handleConfigValidate(_ context.Context) {
 }
 
 func handleConfigDump(_ context.Context) {
-	// Extract config path from os.Args (it was preserved for config subcommand)
-	// os.Args format: [prog, --config, PATH, config, dump, FLAGS...]
+	// Extract config path from os.Args (it was preserved for config subcommand;
+	// the first --config counts, matching handleConfigValidate) and collect any
+	// flags after "dump" with --config stripped.
 	var configFile string
 	var format string = "toml"
 	var maskSecrets bool = true
-	var flagsStartIndex int
+	var configSeen, missingConfigValue bool
 
-	// Look for --config flag and find where "dump" ends
-	skipNext := false
+	seenDump := false
+	var dumpArgs []string
 	for i := 1; i < len(os.Args); i++ {
-		if skipNext {
-			skipNext = false
+		if os.Args[i] == "--config" {
+			if i+1 < len(os.Args) {
+				if !configSeen {
+					configFile = os.Args[i+1]
+					configSeen = true
+				}
+				i++ // the value, even when it starts with "-" or is "dump"
+			} else {
+				missingConfigValue = true
+			}
 			continue
 		}
-		if os.Args[i] == "--config" && i+1 < len(os.Args) {
-			configFile = os.Args[i+1]
-			skipNext = true
-			continue
-		} else if strings.HasPrefix(os.Args[i], "--config=") {
-			configFile = strings.TrimPrefix(os.Args[i], "--config=")
+		if strings.HasPrefix(os.Args[i], "--config=") {
+			if !configSeen {
+				configFile = strings.TrimPrefix(os.Args[i], "--config=")
+				configSeen = true
+			}
 			continue
 		}
-		if os.Args[i] == "dump" {
-			flagsStartIndex = i + 1
-			break
+		if !seenDump {
+			if os.Args[i] == "dump" {
+				seenDump = true
+			}
+			continue
 		}
+		dumpArgs = append(dumpArgs, os.Args[i])
 	}
 
 	// Parse additional flags after the subcommand
 	flagSet := flag.NewFlagSet("config-dump", flag.ExitOnError)
 	flagSet.StringVar(&format, "format", "toml", "Output format: toml or json")
-	flagSet.BoolVar(&maskSecrets, "mask-secrets", true, "Mask sensitive values (passwords, keys)")
+	flagSet.BoolVar(&maskSecrets, "mask-secrets", true, "Mask sensitive values (passwords, keys, URL userinfo and query values)")
 	flagSet.Usage = func() {
 		fmt.Printf(`Dump the parsed configuration for debugging
 
@@ -214,7 +175,8 @@ Usage:
 
 Options:
   --format FORMAT      Output format: toml or json (default: toml)
-  --mask-secrets       Mask sensitive values like passwords (default: true)
+  --mask-secrets       Mask sensitive values: passwords, keys, and the userinfo
+                       and query values of URLs (default: true)
 
 Examples:
   sora-admin --config sora.config.toml config dump
@@ -222,8 +184,15 @@ Examples:
 `)
 	}
 
-	if flagsStartIndex > 0 && flagsStartIndex < len(os.Args) {
-		flagSet.Parse(os.Args[flagsStartIndex:])
+	if len(dumpArgs) > 0 {
+		flagSet.Parse(dumpArgs)
+	}
+	// Let an earlier --help retain flag.FlagSet's usual success behavior.
+	// Otherwise a stripped --config still needs its required argument.
+	if missingConfigValue {
+		fmt.Fprintln(os.Stderr, "flag needs an argument: -config")
+		flagSet.Usage()
+		os.Exit(2)
 	}
 
 	if configFile == "" {
@@ -275,8 +244,13 @@ Description:
   - Detecting duplicate keys (warns and uses first occurrence)
   - Detecting unknown/deprecated keys (warns)
   - Detecting common typos (e.g., 'f' instead of 'false')
-  - Validating server configurations
-  - Checking for conflicts (duplicate names, addresses)
+  - Running the shared checks the server makes before service setup: the [[server]]
+    blocks (at least one; no duplicate names or addresses), [[pool]], [relay],
+    trusted_networks, [shared_mailboxes], and [uploader] and [cleanup] when a
+    mail backend (imap, lmtp, pop3) runs. Every problem is reported.
+
+  This does not check required database/S3 settings, S3 timeout, connectivity,
+  or the node's disk. Those are still checked when services start.
 
   Exit codes:
     0 - Configuration is valid (warnings OK)

@@ -90,6 +90,23 @@ type RecipientInfo struct {
 	DeliveryHash string
 }
 
+// ErrMessageTooLarge is returned for a message larger than consts.MaxStoredMessageSize,
+// the largest message sora can store.
+var ErrMessageTooLarge = errors.New("message too large to store")
+
+// CheckStorableSize refuses a message of size octets that sora cannot store. A
+// delivery's max_message_size is capped at consts.MaxStoredMessageSize, but what it
+// stores is larger than what it read: the Received and Delivered-To trace headers and
+// any Sieve header edits are added afterwards. Checked on the final bytes, before
+// they are staged, so such a message is refused as too large instead of failing at
+// the database insert (messages.size is an INTEGER column).
+func CheckStorableSize(size int) error {
+	if int64(size) > consts.MaxStoredMessageSize {
+		return fmt.Errorf("%w: %d bytes (max: %d)", ErrMessageTooLarge, size, consts.MaxStoredMessageSize)
+	}
+	return nil
+}
+
 // DeliverMessage is the main entry point for message delivery.
 // It handles the complete delivery flow: parsing, Sieve execution, and storage.
 func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes []byte) (*DeliveryResult, error) {
@@ -193,6 +210,11 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			return result, nil
 		}
 
+		if outcome.AbortRedirect != nil {
+			// A delivery that fails is retried by its caller, which holds the
+			// redirects again: drop the ones this attempt has not handed over.
+			defer outcome.AbortRedirect()
+		}
 		if outcome.RedirectOnly {
 			if outcome.Redirect() {
 				result.Discarded = true
@@ -213,17 +235,18 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		messageEntity = outcome.MessageEntity
 	}
 
+	if err := CheckStorableSize(len(messageBytes)); err != nil {
+		result.ErrorMessage = err.Error()
+		return result, err
+	}
+
 	// Parse message metadata
 	mailHeader := mail.Header{Header: messageEntity.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
+	sentDate, _ := mailHeader.Date() // zero without a Date: header that parses (db.InsertMessageOptions.SentDate)
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
-
-	if sentDate.IsZero() {
-		sentDate = time.Now()
-	}
 
 	// Calculate content hash
 	contentHash := helpers.HashContent(messageBytes)
@@ -567,12 +590,8 @@ func (d *DeliveryContext) resolveOwnedTarget(ctx context.Context, recipient Reci
 	// hardlink it to the owner's staging path so the uploader writes the body under the
 	// owner's S3 path (B2).
 	if destAccountID != recipient.AccountID {
-		sourcePath := d.Uploader.FilePath(contentHash, recipient.AccountID)
-		destPath := d.Uploader.FilePath(contentHash, destAccountID)
-		if sourcePath != destPath {
-			if linkErr := helpers.LinkOrCopyFile(sourcePath, destPath); linkErr != nil {
-				d.Logger.Log("failed to stage local file for cross-account delivery: %v", linkErr)
-			}
+		if linkErr := d.Uploader.LinkStaged(contentHash, recipient.AccountID, destAccountID); linkErr != nil {
+			d.Logger.Log("failed to stage local file for cross-account delivery: %v", linkErr)
 		}
 	}
 
@@ -594,13 +613,9 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 	mailHeader := mail.Header{Header: messageEntity.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
+	sentDate, _ := mailHeader.Date() // zero without a Date: header that parses (db.InsertMessageOptions.SentDate)
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
-
-	if sentDate.IsZero() {
-		sentDate = time.Now()
-	}
 
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
 

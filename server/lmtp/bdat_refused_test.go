@@ -27,8 +27,9 @@ func TestRefusedBDATChunkIsNotReadAsCommands(t *testing.T) {
 		args   string // after the chunk size
 		reply  string
 	}{
-		{"no MAIL", nil, " LAST", "502 "},
-		{"no RCPT", []string{"MAIL FROM:<sender@example.org>"}, " LAST", "502 "},
+		{"no MAIL", nil, " LAST", "503 "},
+		// A final chunk after MAIL with no accepted RCPT returns zero replies (RFC 2033).
+		{"no RCPT, nonfinal chunk", []string{"MAIL FROM:<sender@example.org>"}, "", "503 "},
 		{"unknown argument", nil, " FIRST", "501 "},
 		{"too many arguments", nil, " LAST LAST", "501 "},
 	} {
