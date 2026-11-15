@@ -565,7 +565,7 @@ it sends and to what it accepts; set them the same on every node.
 |---|---|---|---|
 | `enabled` | bool | `true` | Share the proxies' rate limiters with the listeners of the same protocol on every node, this one included. The name statistics are always shared while it is on. `false` shares nothing: each listener counts and blocks on its own. |
 | `sync_blocks` | bool | `true` | Send and apply Tier 2 IP blocks. |
-| `sync_failure_counts` | bool | `true` | Send and apply Tier 2 failure counts and progressive delays, from `delay_start_threshold` on. |
+| `sync_failure_counts` | bool | `true` | Send and apply Tier 2 failure counts and progressive delays, from `delay_start_threshold` on, and the successful logins that clear them. |
 
 ### Related `[[server]]` keys
 
