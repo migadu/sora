@@ -944,7 +944,7 @@ lookup cache; on them the table is ignored, with a startup warning.
 | `negative_ttl` | duration | `"1m"` | How long a failed lookup is kept. |
 | `max_size` | integer | `10000`; `50000` on line proxies | Entries kept. |
 | `cleanup_interval` | duration | `"5m"` | How often expired entries are removed. |
-| `positive_revalidation_window` | duration | `"30s"` | Age after which a successful credential check is revalidated. Not used by `lmtp_proxy` or `user_api_proxy`, which cache routes and warn at startup when it is set. |
+| `positive_revalidation_window` | duration | `"30s"` | Revalidation age for successful credential entries; line proxies apply it when a different password arrives. Not used by `lmtp_proxy` or `user_api_proxy`, which cache routes and warn at startup when it is set. |
 
 ### 9.11 Proxy keys
 
