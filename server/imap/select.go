@@ -8,6 +8,7 @@ import (
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -212,11 +213,21 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 	s.reportedModSeqGap.Store(false)
 	s.queuedFlagUpdates.Store(false)
 
+	// The response describes the mailbox as the summary found it: EXISTS and
+	// HIGHESTMODSEQ come from it, and the session's cursor now stands at that modseq.
+	// Everything else the response numbers or reports is read later, in statements of
+	// their own, and so in the view as of that modseq (db.WithSeqView), however much
+	// other sessions have written since. A message delivered after the summary would
+	// otherwise be sent as a FETCH past EXISTS, and an expunge would shift the numbers
+	// after it (a client numbers new messages from EXISTS, RFC 9051 §2.3.1.2). The
+	// session's first poll reports what changed after that modseq.
+	viewCtx := db.WithSeqView(readCtx, currentSummary.HighestModSeq)
+
 	// Extract the first unseen message sequence number lazily natively for SELECT explicitly.
 	// We do not compute this natively in GetMailboxSummary to prevent O(N) counts across all background STATUS checks.
 	var firstUnseenSeqNum uint32
 	if currentSummary.UnseenCount > 0 {
-		seq, seqErr := s.server.rdb.GetFirstUnseenSeqNumWithRetry(readCtx, mailbox.ID)
+		seq, seqErr := s.server.rdb.GetFirstUnseenSeqNumWithRetry(viewCtx, mailbox.ID)
 		if seqErr == nil {
 			firstUnseenSeqNum = seq
 		} else {
@@ -296,11 +307,11 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		if len(qr.KnownUIDs) > 0 {
 			// Compute vanished UIDs by comparing KnownUIDs with active UIDs in the database.
 			// This is 100% accurate, handles cleaner purges, and prevents sequence staleness bugs.
-			activeUIDs, err := s.server.rdb.GetActiveUIDsInSetWithRetry(readCtx, mailbox.ID, qr.KnownUIDs)
+			activeUIDs, err := s.server.rdb.GetActiveUIDsInSetWithRetry(viewCtx, mailbox.ID, qr.KnownUIDs)
 			if err != nil {
 				s.WarnLog("failed to get active UIDs for QRESYNC", "err", err)
 				// Fallback to database vanished log history
-				vanishedUIDs, err = s.server.rdb.GetVanishedUIDsWithRetry(readCtx, mailbox.ID, qr.ModSeq, selectData.HighestModSeq)
+				vanishedUIDs, err = s.server.rdb.GetVanishedUIDsWithRetry(readCtx, mailbox.ID, qr.ModSeq, currentSummary.HighestModSeq)
 				if err != nil {
 					s.WarnLog("failed to get vanished UIDs fallback for QRESYNC", "err", err)
 				}
@@ -329,7 +340,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		} else {
 			// Fallback to database vanished log history when KnownUIDs is empty
 			var err error
-			vanishedUIDs, err = s.server.rdb.GetVanishedUIDsWithRetry(readCtx, mailbox.ID, qr.ModSeq, selectData.HighestModSeq)
+			vanishedUIDs, err = s.server.rdb.GetVanishedUIDsWithRetry(readCtx, mailbox.ID, qr.ModSeq, currentSummary.HighestModSeq)
 			if err != nil {
 				s.WarnLog("failed to get vanished UIDs for QRESYNC", "err", err)
 			}
@@ -342,7 +353,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		}
 
 		// Get messages that changed since client's last modseq
-		changedMsgs, err := s.server.rdb.GetMessagesChangedSinceWithRetry(readCtx, mailbox.ID, qr.ModSeq)
+		changedMsgs, err := s.server.rdb.GetMessagesChangedSinceWithRetry(viewCtx, mailbox.ID, qr.ModSeq)
 		if err != nil {
 			s.WarnLog("failed to get changed messages for QRESYNC", "err", err)
 			// Don't fail the SELECT - just omit Modified responses
