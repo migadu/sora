@@ -19,6 +19,11 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		return nil
 	}
 
+	// Moving the cursor and delivering the tracker's updates renumber the
+	// client's messages, which no command may see happen halfway (seqViewMu).
+	s.seqViewMu.Lock()
+	defer s.seqViewMu.Unlock()
+
 	// First phase: Read state with read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
@@ -106,7 +111,11 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 	}
 
 	// Determine the highest MODSEQ from the updates processed in this poll.
-	// Start with the MODSEQ we polled from, in case no updates are found.
+	// Start with the MODSEQ we polled from, in case no updates are found. The
+	// cursor also passes the messages created and expunged in this window, which
+	// are not reported (MailboxPoll.PhantomModSeq): the cursor is the view the
+	// client's sequence numbers are counted in (db.WithSeqView), and the client
+	// never saw them.
 	maxModSeqInThisPoll := highestModSeqToPollFrom
 	if len(poll.Updates) > 0 {
 		for _, update := range poll.Updates {
@@ -114,8 +123,8 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 				maxModSeqInThisPoll = update.EffectiveModSeq
 			}
 		}
-		s.currentHighestModSeq.Store(maxModSeqInThisPoll)
-	} else if poll.ModSeq > highestModSeqToPollFrom {
+		s.currentHighestModSeq.Store(max(maxModSeqInThisPoll, poll.PhantomModSeq))
+	} else if next := max(poll.ModSeq, poll.PhantomModSeq); next > highestModSeqToPollFrom {
 		// If there were no specific message updates, update to the global current_modseq
 		// to ensure the session eventually catches up if the mailbox is truly idle.
 		//
@@ -125,7 +134,7 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		// updates the client already saw on the next poll — duplicate
 		// unsolicited FETCHes at best, re-queued EXPUNGEs tripping the
 		// desync-BYE path at worst.
-		s.currentHighestModSeq.Store(poll.ModSeq)
+		s.currentHighestModSeq.Store(next)
 	}
 
 	// A count increase is deliberately NOT queued here: it is queued by the final
