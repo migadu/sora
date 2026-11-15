@@ -27,7 +27,8 @@ import (
 // expunge is not sent while the watching connection has no command in
 // progress, neither when a new message arrives behind it nor when the watching
 // connection appended one itself just before. It comes with the next NOOP, and
-// the new message's MessageNew FETCH comes after its EXISTS.
+// the new message's MessageNew FETCH comes after its EXISTS, once; an own
+// APPEND gets none.
 func TestNotifySelectedDelayedHoldsExpungeBetweenCommands(t *testing.T) {
 	// A slow pump, so that its first tick sees the expunge and the new message
 	// together: everything below happens well within one interval.
@@ -89,22 +90,27 @@ func TestNotifySelectedDelayedHoldsExpungeBetweenCommands(t *testing.T) {
 			if expunge < 0 {
 				t.Fatalf("want the delayed EXPUNGE with NOOP, got:\n%s", strings.Join(got, "\r\n"))
 			}
-			if tc.own {
-				if n := countUIDFetches(got, newUID); n != 0 {
-					t.Errorf("UID %d was appended on this connection, want no MessageNew FETCH for it, got %d:\n%s", newUID, n, strings.Join(got, "\r\n"))
+			if !tc.own {
+				exists := slices.Index(got, "* 2 EXISTS")
+				fetch := slices.IndexFunc(got, func(resp string) bool { return countUIDFetches([]string{resp}, newUID) > 0 })
+				if exists < expunge || fetch < exists {
+					t.Errorf("want EXPUNGE, then EXISTS, then the MessageNew FETCH, got:\n%s", strings.Join(got, "\r\n"))
 				}
-				return
+				if want := fmt.Sprintf("* 2 FETCH (UID %d)", newUID); got[fetch] != want {
+					t.Errorf("MessageNew FETCH = %q, want %q", got[fetch], want)
+				}
 			}
-			exists := slices.Index(got, "* 2 EXISTS")
-			fetch := slices.IndexFunc(got, func(resp string) bool { return countUIDFetches([]string{resp}, newUID) > 0 })
-			if exists < expunge || fetch < exists {
-				t.Errorf("want EXPUNGE, then EXISTS, then the MessageNew FETCH, got:\n%s", strings.Join(got, "\r\n"))
+
+			// The pump sends a MessageNew FETCH on its first tick after the
+			// release, so watch one more tick before counting: an own APPEND
+			// gets none, another connection's message exactly one.
+			got = append(got, readNotifyFor(t, watcher, interval+interval/2)...)
+			want := 1
+			if tc.own {
+				want = 0
 			}
-			if want := fmt.Sprintf("* 2 FETCH (UID %d)", newUID); got[fetch] != want {
-				t.Errorf("MessageNew FETCH = %q, want %q", got[fetch], want)
-			}
-			if n := countUIDFetches(got, newUID); n != 1 {
-				t.Errorf("want one MessageNew FETCH for UID %d, got %d:\n%s", newUID, n, strings.Join(got, "\r\n"))
+			if n := countUIDFetches(got, newUID); n != want {
+				t.Errorf("want %d MessageNew FETCH for UID %d (own APPEND: %v), got %d:\n%s", want, newUID, tc.own, n, strings.Join(got, "\r\n"))
 			}
 		})
 	}
