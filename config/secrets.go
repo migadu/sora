@@ -249,9 +249,9 @@ func maskSingleURL(value string) (string, bool) {
 	if strings.Contains(rest, "://") && !hasQuery {
 		return SecretMask, true
 	}
-	// An unencoded "/" or "#" in the password ends the authority early, leaving the
-	// "@" in the path or fragment, and the parser takes the start of the password
-	// for a port and refuses the URL. So any "@" after the scheme is checked here.
+	// An unencoded "/", "?" or "#" in the password ends the authority early, leaving
+	// the "@" in the path, query or fragment, and the parser takes the start of the
+	// password for a port and refuses the URL. So any "@" after the scheme is checked here.
 	if !strings.Contains(rest, "@") && !hasQuery {
 		return value, false
 	}
@@ -262,11 +262,11 @@ func maskSingleURL(value string) (string, bool) {
 		return SecretMask, true
 	}
 	// Unless that start of the password is a number, or empty: then it is a valid
-	// port and the URL parses, with the rest of the password and its "@" in the path
-	// or fragment. Mask such a URL whole too, as the parser cannot tell it from a
-	// host with a port and an "@" in its path.
+	// port and the URL parses, with the rest of the password and its "@" in the path,
+	// query or fragment. Mask such a URL whole too, as the parser cannot tell it from
+	// a host with a port and an "@" in its path, query or fragment.
 	if u.User == nil && hasPortSeparator(u.Host) &&
-		(strings.Contains(u.EscapedPath(), "@") || strings.Contains(u.EscapedFragment(), "@")) {
+		(strings.Contains(u.EscapedPath(), "@") || strings.Contains(u.RawQuery, "@") || strings.Contains(u.EscapedFragment(), "@")) {
 		return SecretMask, true
 	}
 	if u.User == nil && u.RawQuery == "" {
