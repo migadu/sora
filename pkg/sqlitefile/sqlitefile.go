@@ -58,6 +58,9 @@ func Parse(name string) (path, query string, err error) {
 		uri = rest[len(authority):]
 	}
 	path = unescape(uri)
+	if err := validateDriverQuery(query); err != nil {
+		return "", "", err
+	}
 
 	// SQLite validates access modes in order and uses the last accepted mode
 	// and the last VFS. The raw query is retained so the driver may apply its
@@ -77,8 +80,29 @@ func Parse(name string) (path, query string, err error) {
 // CanCreate reports whether the final accepted URI mode permits creating a file,
 // including percent-escaped keys and values. Validate before touching files.
 func CanCreate(params string) (bool, error) {
+	if err := validateDriverQuery(params); err != nil {
+		return false, err
+	}
 	mode, present, err := parseMode(params)
 	return !present || mode == "rwc", err
+}
+
+// modernc.org/sqlite validates these parameters before opening SQLite. Mirror
+// that validation before permission preparation can create or change a file.
+// Empty and identical repeated VFS values follow its getVFSName semantics.
+func validateDriverQuery(query string) error {
+	params, err := url.ParseQuery(query)
+	if err != nil {
+		return fmt.Errorf("invalid database URI parameters: %w", err)
+	}
+	var vfs string
+	for _, value := range params["vfs"] {
+		if vfs != "" && vfs != value {
+			return fmt.Errorf("conflicting vfs query parameters: %v", params["vfs"])
+		}
+		vfs = value
+	}
+	return nil
 }
 
 // Prepare secures the database and any existing journal files before SQLite
