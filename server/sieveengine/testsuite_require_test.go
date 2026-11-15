@@ -48,16 +48,35 @@ func TestValidateScriptRefusesTestsuiteCommands(t *testing.T) {
 
 // TestTestsuiteConfigSetCannotLiftVariableLimit is the reproducer from #1340:
 // with test_config_set the script filed into "len-163840" instead of
-// "len-4000". It must not compile, so delivery never runs it.
+// "len-4000". It must not compile, so delivery never runs it. The same script
+// without the line compiles and files into "len-4000", so the refusal is the
+// test_config_set line and not something else in the script.
 func TestTestsuiteConfigSetCannotLiftVariableLimit(t *testing.T) {
-	script := `require ["variables", "fileinto"];
-test_config_set "sieve_variables_max_variable_size" "100000000";
-set "a" "0123456789012345678901234567890123456789";
+	const configSet = "test_config_set \"sieve_variables_max_variable_size\" \"100000000\";\n"
+	body := `set "a" "0123456789012345678901234567890123456789";
 ` + strings.Repeat(`set "a" "${a}${a}";
 `, 12) + `set :length "n" "${a}";
 fileinto "len-${n}";
 `
-	if _, err := CompileScript(script, EffectiveExtensions(nil)); err == nil {
+	const require = "require [\"variables\", \"fileinto\"];\n"
+
+	compiled, err := CompileScript(require+body, EffectiveExtensions(nil))
+	if err != nil {
+		t.Fatalf("CompileScript without test_config_set: %v", err)
+	}
+	target, err := evaluateFileintoTarget(compiled)
+	if err != nil {
+		t.Fatalf("Evaluate without test_config_set: %v", err)
+	}
+	if target != "len-4000" {
+		t.Fatalf("fileinto %q without test_config_set, want len-4000", target)
+	}
+
+	_, err = CompileScript(require+configSet+body, EffectiveExtensions(nil))
+	if err == nil {
 		t.Fatal("CompileScript accepted a script that raises sieve_variables_max_variable_size")
+	}
+	if !strings.Contains(err.Error(), "vnd.dovecot.testsuite") {
+		t.Fatalf("CompileScript: %v, want an error naming vnd.dovecot.testsuite", err)
 	}
 }
