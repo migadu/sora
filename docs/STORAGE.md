@@ -294,9 +294,11 @@ seconds, and at once whenever a message is queued on this node. In each pass it:
 
 ### 6.4 Leases and the write gate
 
-S3 deletes (by the cleanup worker and by account purges) and S3 writes for the same body
-must never overlap. Sora orders them with a per-body PostgreSQL advisory lock and a lease on
-the pending row:
+Within an account, Sora orders S3 deletes (by the cleanup worker and by account purges)
+and writes of a body with a PostgreSQL advisory lock keyed by `(accountID, contentHash)`
+and a lease on the pending row. Another account's reference to the same physical S3 key
+uses a different advisory lock; these locks do not exclude every writer of that key.
+For operations using the same account/hash key:
 
 - Before it writes, an upload briefly takes the body's lock. If a delete, a restore, or a
   cross-account copy or move of that body is running, the upload is deferred until the
