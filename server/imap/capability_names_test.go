@@ -87,3 +87,52 @@ func TestDisabledCaps_UnknownNameWarns(t *testing.T) {
 		}
 	}
 }
+
+// AUTH=PLAIN was in the configured set, so disabled_caps and client_filters
+// deleted it from that set and the startup log said it was disabled. But go-imap
+// builds the AUTH= list from the session's AuthenticateMechanisms, never from the
+// set, so clients still saw AUTH=PLAIN and could AUTHENTICATE PLAIN (#1323). It is
+// one of the names the server cannot withdraw (it follows tls, tls_use_starttls
+// and insecure_auth), so naming it must WARN like STARTTLS and ACL do, and no
+// INFO line may claim it was disabled.
+func TestDisabledCaps_AuthPlainCannotBeWithdrawn(t *testing.T) {
+	logs := &syncLogBuffer{}
+	prev := logger.Swap(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	defer logger.Swap(prev)
+
+	c := dialWireCapServerNotAuthenticated(t, IMAPServerOptions{
+		DisabledCaps: []string{"AUTH=PLAIN"},
+		CapabilityFilters: []config.ClientCapabilityFilter{{
+			ClientName:  "^ExampleMail$",
+			DisableCaps: []string{"auth=plain"},
+		}},
+	})
+	c.mustOK(`ID ("name" "ExampleMail")`)
+	if caps := parseWireCaps(t, c.mustOK("CAPABILITY")); !slices.Contains(caps, "AUTH=PLAIN") {
+		t.Fatalf("CAPABILITY before login lost AUTH=PLAIN: %v", caps)
+	}
+
+	out := logs.String()
+	lines := strings.Split(out, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "level=INFO") && strings.Contains(strings.ToUpper(line), "AUTH=PLAIN") {
+			t.Errorf("INFO line claims AUTH=PLAIN was disabled: %s", line)
+		}
+	}
+	warned := func(capability string) string {
+		for _, line := range lines {
+			if strings.Contains(line, "level=WARN") && strings.Contains(line, `capability="`+capability+`"`) {
+				return line
+			}
+		}
+		return ""
+	}
+	if warned("AUTH=PLAIN") == "" {
+		t.Errorf("disabled_caps = [AUTH=PLAIN]: no WARN; output:\n%s", out)
+	}
+	if line := warned("auth=plain"); line == "" {
+		t.Errorf("client_filters disable_caps = [auth=plain]: no WARN; output:\n%s", out)
+	} else if !strings.Contains(line, "entry=1") {
+		t.Errorf("client_filters disable_caps = [auth=plain]: WARN does not name the entry: %s", line)
+	}
+}
