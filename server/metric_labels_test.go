@@ -2,6 +2,13 @@ package server
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -123,4 +130,164 @@ func TestSearchRateLimiterProtocolLabelIsLowercase(t *testing.T) {
 	if d := count("IMAP") - upper0; d != 0 {
 		t.Errorf(`protocol="IMAP" grew by %v, want 0`, d)
 	}
+}
+
+// checkProtocolLabels fails unless each of families has one series for serverName,
+// labelled protocol=want.
+func checkProtocolLabels(t *testing.T, families []string, serverName, want string) {
+	t.Helper()
+	var got []string
+	ok := true
+	for _, family := range families {
+		series := seriesWith(t, family, map[string]string{"server_name": serverName})
+		if len(series) != 1 {
+			ok = false
+		}
+		for _, m := range series {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "protocol" {
+					got = append(got, lp.GetValue())
+					ok = ok && lp.GetValue() == want
+				}
+			}
+		}
+	}
+	if !ok {
+		t.Errorf("server_name=%q: protocol = %q, want %q in each family", serverName, got, want)
+	}
+}
+
+// TestAuthRateLimiterMetricsUseServerType: the rate limiter's gauges label protocol with
+// the lowercase server type the other metrics use. The name a server gives its limiter
+// keys the limiter's cluster gossip, so it stays as it is and only the label is mapped.
+func TestAuthRateLimiterMetricsUseServerType(t *testing.T) {
+	families := []string{
+		"sora_auth_rate_limiter_ip_username_entries",
+		"sora_auth_rate_limiter_ip_entries",
+		"sora_auth_rate_limiter_username_entries",
+		"sora_auth_rate_limiter_blocked_ips",
+	}
+	cfg := DefaultAuthRateLimiterConfig()
+	cfg.Enabled = true
+	cfg.CleanupInterval = time.Hour
+
+	// The names the servers give NewAuthRateLimiter*.
+	for name, want := range map[string]string{
+		"IMAP":           "imap",
+		"POP3":           "pop3",
+		"ManageSieve":    "managesieve",
+		"IMAP-PROXY":     "imap_proxy",
+		"POP3-PROXY":     "pop3_proxy",
+		"SIEVE-PROXY":    "managesieve_proxy",
+		"user-api":       "userapi",
+		"USER-API-PROXY": "userapi_proxy",
+	} {
+		t.Run(name, func(t *testing.T) {
+			serverName := "limiter-711-" + name
+			limiter := NewAuthRateLimiter(name, serverName, "mail.example.com", cfg)
+			defer limiter.Stop()
+			checkProtocolLabels(t, families, serverName, want) // set by the constructor
+
+			limiter.cleanupExpiredEntries() // and by the periodic update
+			checkProtocolLabels(t, families, serverName, want)
+		})
+	}
+}
+
+// TestConnectionTrackerMetricsUseServerType: a connection tracker's gauges label
+// protocol with the server type it serves. A proxy's tracker has the protocol's name like
+// a backend's (it keys the tracker's gossip and the Admin API's tracker list), so the
+// proxy constructor is what tells the two apart.
+func TestConnectionTrackerMetricsUseServerType(t *testing.T) {
+	families := []string{
+		"sora_connection_tracker_users",
+		"sora_connection_tracker_instance_ids",
+		"sora_connection_tracker_ips",
+		"sora_connection_tracker_broadcast_queue_size",
+	}
+	for _, c := range []struct {
+		name  string
+		proxy bool
+		want  string
+	}{
+		{"IMAP", false, "imap"},
+		{"POP3", false, "pop3"},
+		{"ManageSieve", false, "managesieve"},
+		{"IMAP", true, "imap_proxy"},
+		{"POP3", true, "pop3_proxy"},
+		{"ManageSieve", true, "managesieve_proxy"},
+		{"LMTP", true, "lmtp_proxy"},
+	} {
+		t.Run(c.want, func(t *testing.T) {
+			serverName := "tracker-711-" + c.want
+			newTracker := NewConnectionTracker
+			if c.proxy {
+				newTracker = NewProxyConnectionTracker
+			}
+			tracker := newTracker(c.name, serverName, "mail.example.com", serverName, nil, 0, 0, 0, false)
+			defer tracker.Stop()
+			tracker.cleanup()
+			checkProtocolLabels(t, families, serverName, c.want)
+		})
+	}
+}
+
+// serverTypeOf returns the protocol label of the metrics of the server in package dir
+// (a directory under server/): "imap", "imap_proxy", "userapi", ...
+func serverTypeOf(dir string) string {
+	if base, ok := strings.CutSuffix(dir, "proxy"); ok && base != "" {
+		return base + "_proxy"
+	}
+	return dir
+}
+
+// TestAuthDelayCallersLabelTheServerType: every server passes ApplyAuthenticationDelay
+// (or ApplyHTTPAuthenticationDelay) its own server type, the protocol label its other
+// metrics use, so the sora_auth_delay_* series join them by protocol.
+func TestAuthDelayCallersLabelTheServerType(t *testing.T) {
+	files, err := filepath.Glob("*/*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The index of the protocol argument of each delay function.
+	protocolArg := map[string]int{"ApplyAuthenticationDelay": 3, "ApplyHTTPAuthenticationDelay": 4}
+	fset := token.NewFileSet()
+	calls := 0
+	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := serverTypeOf(filepath.Base(filepath.Dir(path)))
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			i, ok := protocolArg[sel.Sel.Name]
+			if !ok || len(call.Args) <= i {
+				return true
+			}
+			calls++
+			arg := call.Args[i]
+			if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+				if got, _ := strconv.Unquote(lit.Value); got == want {
+					return true
+				}
+			}
+			t.Errorf("%s: %s(..., %s), want %q", fset.Position(call.Pos()), sel.Sel.Name, types.ExprString(arg), want)
+			return true
+		})
+	}
+	if calls == 0 {
+		t.Fatal("no ApplyAuthenticationDelay call found under server/")
+	}
+	t.Logf("%d calls checked", calls)
 }

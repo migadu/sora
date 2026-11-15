@@ -40,6 +40,54 @@ func TestDecodeModifiedUTF7(t *testing.T) {
 		{"unterminated shift 2", "folder&abc", "", true},
 		{"lone surrogate", "&2AA-", "", true},
 
+		// RFC 3501 §5.1.3: modified BASE64 MUST NOT represent a printable
+		// US-ASCII character (0x20-0x7e). "&" has its own form, "&-".
+		{"encoded delimiter", "a&AC8-b", "", true},
+		{"encoded letter", "&AGE-", "", true},
+		{"encoded space", "&ACA-", "", true},
+		{"encoded tilde", "&AH4-", "", true},
+		{"encoded ampersand", "&ACY-", "", true},
+		{"delimiter after non-ascii in one shift", "&AOkALw-", "", true},
+		{"letter after non-ascii in one shift", "x&AOkAYQ-", "", true},
+
+		// Control characters and DEL cannot represent themselves, so BASE64 is their form.
+		{"encoded unit separator 0x1f", "&AB8-", "\x1f", false},
+		{"encoded del 0x7f", "&AH8-", "\x7f", false},
+
+		// RFC 3501 §5.1.3 / RFC 9051 §A.1: when Modified UTF-7 shifts ('&') are present,
+		// octets outside printable US-ASCII (0x20..0x7e) must not appear literally.
+		{"raw utf8 with shift", "Café &AOk-", "", true},
+		{"raw utf8 with ampersand escape", "Café &- Thé", "", true},
+		{"raw unit separator 0x1f outside shift", "\x1f&AOk-", "", true},
+		{"raw nul 0x00 outside shift", "\x00&-", "", true},
+		{"raw del 0x7f outside shift", "\x7f&-", "", true},
+		{"raw 0xff after ampersand escape", "&-\xff", "", true},
+		{"boundary space 0x20 outside shift", " &AOk-", " é", false},
+		{"boundary tilde 0x7e outside shift", "~&AOk-", "~é", false},
+		{"utf8 without ampersand fast path", "Café", "Café", false},
+
+		// RFC 3501 §5.1.3: null shifts ("-&" while in BASE64) are not permitted.
+		// "&U,BTFw-&ZeVnLIqe-" is the RFC's own example of a superfluous shift.
+		{"null shift", "&AOk-&AOk-", "", true},
+		{"null shift rfc example", "&U,BTFw-&ZeVnLIqe-", "", true},
+		{"superfluous shift corrected", "&U,BTF2XlZyyKng-", "台北日本語", false},
+		{"escaped ampersand between shifts", "&AOk-&-&AOk-", "é&é", false},
+		{"ascii between shifts", "&AOk-a&AOk-", "éaé", false},
+
+		// RFC 9051 §A.1: only the modified base64 alphabet is permitted in modified
+		// base64 text; RFC 2152 omits the "=" pad character.
+		{"pad in segment", "&AOk=-", "", true},
+		{"pads after surrogate pair", "&2D3eCg==-", "", true},
+		{"crlf in segment", "&AO\r\n\r\nk-", "", true},
+		{"lf in segment", "&A\n\n\n\nOk-", "", true},
+		{"standard base64 slash", "&U/BTFw-", "", true},
+
+		// RFC 2152: discarded bits at the end of the segment must be zero.
+		{"non-zero 2 discarded bits", "&AOl-", "", true},
+		{"non-zero 2 discarded bits 2", "&AOn-", "", true},
+		{"non-zero 4 discarded bits", "&AOkA6R-", "", true},
+		{"zero 4 discarded bits", "&AOkA6Q-", "éé", false},
+
 		// Edge cases
 		{"just ampersand-dash", "&-", "&", false},
 		{"multiple ampersand escapes", "&-&-&-", "&&&", false},

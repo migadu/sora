@@ -75,7 +75,7 @@ func mustDecodeHex(t *testing.T, s string) []byte {
 // by magic bytes, as Dovecot's compression_detect_handler() does, never by file name.
 // Dovecot's lz4 is not the LZ4 frame format but its own header and chunk layout, and zstd
 // is what current Dovecot setups write: both are read, and the scan (hashFile) and the
-// upload (decompressIfNeeded) must see the same message. xz, which only Dovecot 2.2 wrote,
+// upload (readMessage) must see the same message. xz, which only Dovecot 2.2 wrote,
 // is refused by name instead of being imported as a garbled message.
 func TestMaildirDovecotCompression(t *testing.T) {
 	// Three Dovecot-sized chunks: 64 KiB, 64 KiB and the rest.
@@ -132,14 +132,14 @@ func TestMaildirDovecotCompression(t *testing.T) {
 			}
 
 			hash, size, hashErr := hashFile(path, 0)
-			content, decErr := decompressIfNeeded(tt.onDisk)
+			content, decErr := readMessage(path, 0)
 
 			if tt.wantErr != "" {
 				if hashErr == nil || !strings.Contains(hashErr.Error(), tt.wantErr) {
 					t.Errorf("hashFile error = %v, want one containing %q", hashErr, tt.wantErr)
 				}
 				if decErr == nil || !strings.Contains(decErr.Error(), tt.wantErr) {
-					t.Errorf("decompressIfNeeded error = %v, want one containing %q", decErr, tt.wantErr)
+					t.Errorf("readMessage error = %v, want one containing %q", decErr, tt.wantErr)
 				}
 				return
 			}
@@ -154,10 +154,10 @@ func TestMaildirDovecotCompression(t *testing.T) {
 				t.Errorf("hashFile size = %d, want the message size %d", size, len(tt.message))
 			}
 			if decErr != nil {
-				t.Fatalf("decompressIfNeeded: %v", decErr)
+				t.Fatalf("readMessage: %v", decErr)
 			}
 			if string(content) != tt.message {
-				t.Errorf("decompressIfNeeded = %.60q (%d bytes), want %.60q (%d bytes)", content, len(content), tt.message, len(tt.message))
+				t.Errorf("readMessage = %.60q (%d bytes), want %.60q (%d bytes)", content, len(content), tt.message, len(tt.message))
 			}
 		})
 	}
@@ -182,7 +182,7 @@ func TestMaildirZstdDecoderReuse(t *testing.T) {
 		if _, _, err := hashFile(path, 0); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := decompressIfNeeded(onDisk); err != nil {
+		if _, err := readMessage(path, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -235,23 +235,24 @@ func TestMaildirZstdConcurrentFiles(t *testing.T) {
 			for n := range 40 {
 				i := (g + n) % len(files)
 				f := files[i]
-				hash, _, hashErr := hashFile(filepath.Join(dir, strconv.Itoa(i)), 0)
-				content, decErr := decompressIfNeeded(f.onDisk)
+				path := filepath.Join(dir, strconv.Itoa(i))
+				hash, _, hashErr := hashFile(path, 0)
+				content, decErr := readMessage(path, 0)
 				if f.message == nil {
 					if hashErr == nil || decErr == nil {
-						t.Errorf("file %d: hashFile error %v, decompressIfNeeded error %v, want both to fail", i, hashErr, decErr)
+						t.Errorf("file %d: hashFile error %v, readMessage error %v, want both to fail", i, hashErr, decErr)
 					}
 					continue
 				}
 				if hashErr != nil || decErr != nil {
-					t.Errorf("file %d: hashFile error %v, decompressIfNeeded error %v", i, hashErr, decErr)
+					t.Errorf("file %d: hashFile error %v, readMessage error %v", i, hashErr, decErr)
 					continue
 				}
 				if want := helpers.HashContent(f.message); hash != want {
 					t.Errorf("file %d: hashFile = %s, want %s", i, hash, want)
 				}
 				if string(content) != string(f.message) {
-					t.Errorf("file %d: decompressIfNeeded returned %d bytes that differ from the %d-byte message", i, len(content), len(f.message))
+					t.Errorf("file %d: readMessage returned %d bytes that differ from the %d-byte message", i, len(content), len(f.message))
 				}
 			}
 		}()

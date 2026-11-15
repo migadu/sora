@@ -395,6 +395,15 @@ func (s *Server) Start() error {
 		s.listenerMu.Unlock()
 	}
 
+	// Stop cancels s.ctx before it looks for a listener to close, so a Stop
+	// that ran before the listener existed (cmd/sora calls it from a context
+	// watcher that races Start) found none. Checked once the listener is set,
+	// either Stop closes it or this does: never serve after Stop.
+	if s.ctx.Err() != nil {
+		s.listener.Close()
+		return nil
+	}
+
 	// Start connection limiter cleanup if enabled
 	if s.limiter != nil {
 		s.limiter.StartCleanup(s.ctx)
@@ -619,7 +628,8 @@ func (s *Server) sendGracefulShutdownMessage() {
 			session.mu.Lock()
 			session.gracefulShutdown = true
 			conn := session.clientConn
-			ready := session.greeted && !session.startTLSInProgress
+			ready := session.greeted && !session.startTLSInProgress && !session.closingNoticeSent
+			session.closingNoticeSent = true
 			session.mu.Unlock()
 			if conn != nil && ready {
 				if err := conn.SetWriteDeadline(deadline); err == nil {

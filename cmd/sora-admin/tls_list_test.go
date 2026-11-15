@@ -140,7 +140,7 @@ func TestTLSCleanShortCertName(t *testing.T) {
 	stub, endpoint := newTLSStubS3(t)
 	cfg := tlsTestConfig(endpoint)
 	cacheDir := t.TempDir()
-	putServerCertificates(t, cfg, "mail.example.com")
+	putServerEntry(t, cfg, "mail.example.com", autocertEntry(t, "mail.example.com", time.Now().Add(60*24*time.Hour)))
 	stub.put("certs", "autocert/cert-test", expiredAutocertEntry(t, "old.example.com"))
 	writeLocalCertificates(t, cacheDir, "test")
 	before := stub.keys()
@@ -215,10 +215,17 @@ func TestTLSCleanRemovesOnlyTheObjectsOwnLocalCopy(t *testing.T) {
 	cacheDir := t.TempDir()
 	currentKey := tlsmanager.S3ObjectKey("mail.example.com")
 	expiredKey := tlsmanager.S3ObjectKey("gone.example.com")
-	stub.put("certs", currentKey, autocertEntry(t, "mail.example.com", time.Now().Add(60*24*time.Hour)))
-	stub.put("certs", expiredKey, expiredAutocertEntry(t, "gone.example.com"))
+	validEntry := autocertEntry(t, "mail.example.com", time.Now().Add(60*24*time.Hour))
+	expiredEntry := expiredAutocertEntry(t, "gone.example.com")
+	stub.put("certs", currentKey, validEntry)
+	stub.put("certs", expiredKey, expiredEntry)
 	stub.put("certs", "autocert/cert-old", expiredAutocertEntry(t, "mail.example.com"))
-	writeLocalCertificates(t, cacheDir, "mail.example.com", "gone.example.com")
+	if err := os.WriteFile(filepath.Join(cacheDir, "mail.example.com"), validEntry, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, "gone.example.com"), expiredEntry, 0600); err != nil {
+		t.Fatal(err)
+	}
 
 	captureStdout(t, func() error {
 		return cleanTLSCertificates(context.Background(), cfg, cacheDir, false, true)

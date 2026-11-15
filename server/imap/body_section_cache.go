@@ -6,9 +6,10 @@ import (
 	"github.com/migadu/go-imap"
 )
 
-// A session retains the last body section it fully extracted so that a client pulling
-// one part in <offset.size> chunks does not reload the message and re-extract the part
-// for every chunk. The retention is bounded three ways:
+// A session retains the last body section it fully extracted, or BINARY section it
+// fully decoded, so that a client pulling one part in <offset.size> chunks does not
+// reload the message and re-extract or re-decode the part for every chunk. The
+// retention is bounded three ways:
 //
 //   - one section per session, dropped as soon as another section is retained, the
 //     mailbox selection is cleared, or the client goes into IDLE;
@@ -32,6 +33,17 @@ func bodySectionCacheKey(contentHash string, section *imap.FetchItemBodySection)
 	}
 	return fmt.Sprintf("%s|%s|%v|%v|%v", contentHash, section.Specifier, section.Part,
 		section.HeaderFields, section.HeaderFieldsNot)
+}
+
+// binarySectionCacheKey identifies the decoded BINARY section of a part, which shares
+// the one retained section with BODY: "BINARY" is no BODY section specifier, so the
+// keys of the two never meet. Like bodySectionCacheKey it is empty without a content
+// hash.
+func binarySectionCacheKey(contentHash string, part []int) string {
+	if contentHash == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s|BINARY|%v", contentHash, part)
 }
 
 // cachedBodySection returns the retained section for key, or nil.
