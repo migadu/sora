@@ -93,6 +93,8 @@ folder. Its mailbox name comes from its path relative to the root:
 3. In each level, `\` followed by two hex digits is the character with that value, as Dovecot's
    storage name escape character (`\` by default) writes it: `.v1\2e2.Notes` becomes
    `v1.2/Notes`. Only printable US-ASCII characters are restored; any other `\` stays as it is.
+   An escaped `/` is refused: Sora cannot represent a literal hierarchy delimiter inside one
+   level, and treating it as hierarchy would merge distinct source folders.
 4. IMAP modified UTF-7 is decoded: `.R&AOk-pertoire` becomes `Répertoire`.
 5. Leading and trailing spaces are trimmed. A name containing a tab, CR or LF is skipped with a
    warning.

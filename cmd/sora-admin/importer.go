@@ -1174,6 +1174,12 @@ func importedFolderName(name string) (string, error) {
 			} else {
 				level = decoded
 			}
+			// A storage escape must not introduce hierarchy. Dovecot can escape a
+			// visible separator inside one level; Sora uses '/' as its hierarchy
+			// delimiter and cannot represent that literal character in a level.
+			if strings.Contains(level, delim) {
+				return "", fmt.Errorf("hierarchy delimiter in escaped mailbox level %q", level)
+			}
 			levels[i] = level
 		}
 		name = strings.Join(levels, delim)

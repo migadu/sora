@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -181,4 +182,43 @@ func TestReexportWritesMessagesWhereTheFolderIsNamedNow(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, exported, "the file is where this export writes \"v1.2\"")
 	assert.Equal(t, filename, existing)
+}
+
+// A slash escaped within a storage level is a literal character there, not a
+// hierarchy separator. Sora cannot represent it in a level, so skip that source
+// instead of merging it into an unrelated hierarchy (and do so for subscriptions).
+func TestImportRefusesEscapedHierarchyDelimiter(t *testing.T) {
+	root := t.TempDir()
+	importer := &Importer{maildirPath: root}
+	for _, storageName := range []string{`Work\2fSecret`, `Work\2FSecret`, `Work\2f..\2fX`, `\2fShared`, `Work/child\2fleaf`} {
+		t.Run(storageName, func(t *testing.T) {
+			_, err := importedFolderName(storageName)
+			require.Error(t, err)
+			_, err = importer.resolveMailboxName(filepath.Join(root, "."+storageName))
+			require.Error(t, err)
+		})
+	}
+	// A literal backslash followed by 2f is representable and only unescaped once.
+	got, err := importedFolderName(`Work/a\5c2fb`)
+	require.NoError(t, err)
+	require.Equal(t, `Work/a\2fb`, got)
+}
+
+func TestImportEscapedSlashDoesNotMergeFolders(t *testing.T) {
+	root := t.TempDir()
+	exporter := &Exporter{maildirPath: root}
+	require.NoError(t, exporter.createMailboxDirectory("INBOX"))
+	for n, name := range []string{`.Work\2fSecret`, `.Work.Secret`} {
+		dir := filepath.Join(root, name)
+		for _, part := range []string{"cur", "new", "tmp"} {
+			require.NoError(t, os.MkdirAll(filepath.Join(dir, part), 0o755))
+		}
+		filename := fmt.Sprintf("1700000000.M%dP1.host:2,S", n)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "cur", filename), []byte("Subject: "+name+"\r\n\r\nx\r\n"), 0o644))
+	}
+	importer := newTestModeImporter(t, root, newMockResilientDatabase(), ImporterOptions{})
+	require.NoError(t, importer.scanMaildir())
+	var count int
+	require.NoError(t, importer.sqliteDB.QueryRow("SELECT COUNT(*) FROM messages WHERE mailbox = 'Work/Secret'").Scan(&count))
+	require.Equal(t, 1, count, "the escaped source must not be merged into the hierarchy")
 }
