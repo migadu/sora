@@ -30,7 +30,8 @@ type Session struct {
 	listenerConn          net.Conn            // The accepted connection, never reassigned: its SoraConn carries the JA4 and username, which the TLS conn above it after STARTTLS does not
 	startTLSInProgress    bool                // Between the 220 to STARTTLS and the end of its handshake, under mu: the client reads neither plaintext nor, yet, TLS
 	greeted               bool                // The 220 greeting has been written, under mu: before it the implicit-TLS handshake may be pending, and a notice written then would wait for it
-	noticeMu              sync.Mutex          // Orders the greeting and the shutdown and kick notices with STARTTLS, without holding mu during socket writes
+	closingNoticeSent     bool                // A closing reply (421 notice or 221 QUIT) has claimed the client stream, under mu: nothing may be written after it
+	noticeMu              sync.Mutex          // Serializes all client wire writes so async 421 notices never interleave with or precede session replies
 	backendConn           net.Conn            // Reassigned under mu on backend connect/STARTTLS/error; shutdown/cancellation snapshot it under mu
 	backendRoute          *proxy.BackendRoute // Authorization of the held socket; survives per-recipient routing and transaction resets
 	backendReader         *bufio.Reader
@@ -181,15 +182,7 @@ func (s *Session) handleConnection() {
 	}
 
 	// Send greeting
-	s.noticeMu.Lock()
-	err := s.sendGreeting()
-	if err == nil {
-		s.mu.Lock()
-		s.greeted = true
-		s.mu.Unlock()
-	}
-	s.noticeMu.Unlock()
-	if err != nil {
+	if err := s.sendGreeting(); err != nil {
 		s.DebugLog("Failed to send greeting", "error", err)
 		return
 	}
@@ -259,25 +252,29 @@ func (s *Session) handleConnection() {
 			// XCLIENT (HELO=...); without it the backend's Received: trace falls back to the
 			// proxy's own LHLO name. args[0] is a single tokenized field (no spaces/CRLF).
 			s.clientHelo = args[0]
-			s.sendResponse(fmt.Sprintf("250-%s", s.server.hostname))
+			var lhlo strings.Builder
+			fmt.Fprintf(&lhlo, "250-%s\r\n", s.server.hostname)
 
 			// Advertise STARTTLS if configured and not already using TLS
 			if s.server.tls && s.server.tlsUseStartTLS {
 				if _, ok := s.clientConn.(*tls.Conn); !ok {
-					s.sendResponse("250-STARTTLS")
+					lhlo.WriteString("250-STARTTLS\r\n")
 				}
 			}
 
-			s.sendResponse("250-PIPELINING")
+			lhlo.WriteString("250-PIPELINING\r\n")
 			if s.settings.maxMessageSize > 0 {
-				s.sendResponse(fmt.Sprintf("250-SIZE %d", s.settings.maxMessageSize))
+				fmt.Fprintf(&lhlo, "250-SIZE %d\r\n", s.settings.maxMessageSize)
 			}
-			s.sendResponse("250-ENHANCEDSTATUSCODES")
-			s.sendResponse("250-8BITMIME")
+			lhlo.WriteString("250-ENHANCEDSTATUSCODES\r\n")
+			lhlo.WriteString("250-8BITMIME\r\n")
 			// No DSN, as on the backend: neither issues a "delivered" DSN (RFC 3461
 			// §5.2.3), so the MTA keeps the duties of §5.2.2 (a "relayed" DSN for
 			// NOTIFY=SUCCESS). DSN parameters sent anyway are dropped, not forwarded.
-			s.sendResponse("250 SMTPUTF8")
+			lhlo.WriteString("250 SMTPUTF8\r\n")
+			if _, err := s.writeClientReply(lhlo.String(), false); err != nil {
+				return
+			}
 
 		case "MAIL":
 			fromParam, found := findParameter(args, "FROM:")
@@ -321,8 +318,9 @@ func (s *Session) handleConnection() {
 					if !strings.HasPrefix(reply, "2") {
 						s.mailFromReceived = false
 					}
-					s.clientWriter.WriteString(reply)
-					s.clientWriter.Flush()
+					if _, err := s.writeClientReply(reply, false); err != nil {
+						return
+					}
 					continue
 				}
 			}
@@ -583,8 +581,9 @@ func (s *Session) handleConnection() {
 				s.sendResponse("451 4.4.2 Backend error")
 				continue
 			}
-			s.clientWriter.WriteString(reply)
-			s.clientWriter.Flush()
+			if _, err := s.writeClientReply(reply, false); err != nil {
+				return
+			}
 			if !strings.HasPrefix(reply, "354") {
 				continue // backend declined DATA; its answer was relayed
 			}
@@ -627,14 +626,9 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			// Order a shutdown notice before the reply that makes the client expect
-			// TLS, so no plaintext 421 can follow that reply.
-			s.noticeMu.Lock()
-			s.mu.Lock()
-			s.startTLSInProgress = true
-			s.mu.Unlock()
-			s.noticeMu.Unlock()
-			if err := s.sendResponse("220 2.0.0 Ready to start TLS"); err != nil {
+			// Order a shutdown or kick notice before the reply that makes the client
+			// expect TLS, so no plaintext 421 can follow that reply.
+			if err := s.beginSTARTTLS(); err != nil {
 				s.DebugLog("Failed to send STARTTLS response", "error", err)
 				return
 			}
@@ -651,12 +645,18 @@ func (s *Session) handleConnection() {
 			}
 
 			// Update session with TLS connection
+			s.noticeMu.Lock()
 			s.mu.Lock()
 			s.clientConn = tlsConn
 			s.startTLSInProgress = false
 			s.clientReader = bufio.NewReader(tlsConn)
 			s.clientWriter = bufio.NewWriter(tlsConn)
+			closing := s.closingNoticeSent
 			s.mu.Unlock()
+			s.noticeMu.Unlock()
+			if closing {
+				return
+			}
 
 			s.DebugLog("STARTTLS negotiation successful")
 
@@ -701,23 +701,85 @@ func (s *Session) handleConnection() {
 	}
 }
 
-// sendGreeting sends the LMTP greeting.
+var errSessionClosing = errors.New("session closing notice already sent")
+
+// sendGreeting sends the LMTP greeting atomically under noticeMu and marks the
+// session greeted unless a closing notice already claimed the connection.
 func (s *Session) sendGreeting() error {
+	s.noticeMu.Lock()
+	defer s.noticeMu.Unlock()
+	s.mu.Lock()
+	if s.closingNoticeSent {
+		s.mu.Unlock()
+		return errSessionClosing
+	}
+	s.mu.Unlock()
+
 	greeting := fmt.Sprintf("220 %s LMTP Service Ready\r\n", s.server.hostname)
-	_, err := s.clientWriter.WriteString(greeting)
-	if err != nil {
+	if _, err := s.clientWriter.WriteString(greeting); err != nil {
+		return err
+	}
+	if err := s.clientWriter.Flush(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.greeted = true
+	s.mu.Unlock()
+	return nil
+}
+
+// beginSTARTTLS atomically marks STARTTLS in progress and flushes the 220 reply
+// under noticeMu unless a closing notice already claimed the connection.
+func (s *Session) beginSTARTTLS() error {
+	s.noticeMu.Lock()
+	defer s.noticeMu.Unlock()
+	s.mu.Lock()
+	if s.closingNoticeSent {
+		s.mu.Unlock()
+		return errSessionClosing
+	}
+	s.startTLSInProgress = true
+	s.mu.Unlock()
+
+	if _, err := s.clientWriter.WriteString("220 2.0.0 Ready to start TLS\r\n"); err != nil {
 		return err
 	}
 	return s.clientWriter.Flush()
 }
 
+// writeClientReply writes a complete single- or multi-line wire reply (CRLF
+// included) to the client under noticeMu, refusing the write once a closing
+// reply has claimed the connection. When closing is true, it marks
+// closingNoticeSent so later async kick/shutdown notices do not emit another 421.
+func (s *Session) writeClientReply(raw string, closing bool) (int, error) {
+	s.noticeMu.Lock()
+	defer s.noticeMu.Unlock()
+	s.mu.Lock()
+	if s.closingNoticeSent {
+		s.mu.Unlock()
+		return 0, errSessionClosing
+	}
+	if closing {
+		s.closingNoticeSent = true
+	}
+	s.mu.Unlock()
+
+	n, err := s.clientWriter.WriteString(raw)
+	if err != nil {
+		return n, err
+	}
+	if err := s.clientWriter.Flush(); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
 // sendResponse sends a response to the client.
 func (s *Session) sendResponse(response string) error {
-	_, err := s.clientWriter.WriteString(response + "\r\n")
-	if err != nil {
-		return err
-	}
-	return s.clientWriter.Flush()
+	closing := strings.HasPrefix(response, "421 ") || response == "421" ||
+		strings.HasPrefix(response, "221 ") || response == "221"
+	_, err := s.writeClientReply(response+"\r\n", closing)
+	return err
 }
 
 // Log logs a client command if debug is enabled.
@@ -1634,8 +1696,7 @@ func (s *Session) forwardRCPT(command string) {
 	} else if strings.HasPrefix(trimmedResponse, "4") {
 		// Backend rejected with temporary error (4xx) - forward as-is
 		s.InfoLog("backend temporarily rejected recipient", "backend", s.serverAddr, "method", s.routingMethod, "from", s.sender, "to", s.to, "response", trimmedResponse)
-		s.clientWriter.WriteString(response)
-		s.clientWriter.Flush()
+		_, _ = s.writeClientReply(response, false)
 		return
 	}
 
@@ -1653,8 +1714,9 @@ func (s *Session) forwardRCPT(command string) {
 	}
 
 	// Forward the backend's acceptance to the client.
-	s.clientWriter.WriteString(response)
-	s.clientWriter.Flush()
+	if _, err := s.writeClientReply(response, false); err != nil {
+		return
+	}
 
 	// Log routing decision at INFO level with sender, recipient, and routing method
 	s.InfoLog("routing to backend", "backend", s.serverAddr, "method", s.routingMethod, "from", s.sender, "to", s.to)
@@ -1797,17 +1859,34 @@ func (s *Session) watchKick(accountID int64, kick <-chan struct{}) {
 		return // another of the session's accounts was kicked: that watcher ends it
 	}
 
-	// noticeMu orders the notice with STARTTLS and the shutdown notice: no
-	// plaintext 421 after the reply that makes the client expect TLS, and none
-	// after the shutdown's own 421.
+	// Bound the wait for noticeMu (if the session goroutine is wedged flushing
+	// an earlier reply to an unresponsive client) and for TLS close_notify.
+	var aborted atomic.Bool
+	abortTimer := time.AfterFunc(kickNoticeTimeout, func() {
+		aborted.Store(true)
+		s.cancel()
+		s.mu.Lock()
+		client, backend := s.clientConn, s.backendConn
+		s.mu.Unlock()
+		closeSessionTransport(client)
+		closeSessionTransport(backend)
+	})
+	defer abortTimer.Stop()
+
+	// noticeMu serializes the 421 with every session reply, greeting, STARTTLS,
+	// and server shutdown notice: once closingNoticeSent is set, nothing else is
+	// ever written after this 421.
 	s.noticeMu.Lock()
 	s.mu.Lock()
 	conn := s.clientConn
-	ready := s.greeted && !s.startTLSInProgress && !s.gracefulShutdown
+	ready := s.greeted && !s.startTLSInProgress && !s.closingNoticeSent && !aborted.Load()
+	s.closingNoticeSent = true
 	s.mu.Unlock()
 	if conn != nil && ready {
 		if err := conn.SetWriteDeadline(time.Now().Add(kickNoticeTimeout)); err == nil {
-			fmt.Fprint(conn, "421 4.3.2 Service closing connection\r\n")
+			if _, err := fmt.Fprint(conn, "421 4.3.2 Service closing connection\r\n"); err == nil {
+				conn.Close()
+			}
 		}
 	}
 	s.noticeMu.Unlock()
@@ -2114,8 +2193,9 @@ func (s *Session) relayMessageData() bool {
 	}
 
 	// End-of-data replies: the backend sends one final reply line per recipient it
-	// accepted (that is what acceptedRcpts counts). Relay each line as it arrives,
-	// continuation lines included; count only final lines.
+	// accepted (that is what acceptedRcpts counts). Buffer each recipient's complete
+	// single- or multi-line reply and flush it atomically under noticeMu so an async
+	// 421 notice never splits continuation lines or shifts positional LMTP replies.
 	want := s.acceptedRcpts
 	if err := s.backendConn.SetReadDeadline(time.Now().Add(relayEndOfDataTimeout)); err != nil {
 		s.DebugLog("failed to set backend read deadline for end-of-data replies", "error", err)
@@ -2127,25 +2207,37 @@ func (s *Session) relayMessageData() bool {
 			_ = s.backendConn.SetReadDeadline(time.Time{})
 		}
 	}()
-	for got := 0; got < want; {
-		reply, err := server.ReadBoundedLine(s.backendReader, backendResponseLineMax)
-		if len(reply) > 0 {
-			n, _ := s.clientWriter.WriteString(reply)
-			bytesOut += int64(n)
-			if ferr := s.clientWriter.Flush(); ferr != nil {
-				s.DebugLog("client gone while relaying end-of-data replies", "error", ferr)
+	for got := 0; got < want; got++ {
+		var b strings.Builder
+		complete := false
+		for lines := 0; lines < maxLHLOResponseLines; lines++ {
+			reply, err := server.ReadBoundedLine(s.backendReader, backendResponseLineMax)
+			if err != nil {
+				s.InfoLog("backend closed or timed out before all end-of-data replies were relayed",
+					"expected", want, "relayed", got, "error", err)
 				s.loseBackend()
 				return false
 			}
+			b.WriteString(reply)
+			if len(reply) >= 4 && reply[3] != '-' {
+				complete = true
+				break
+			}
 		}
-		if err != nil {
-			s.InfoLog("backend closed or timed out before all end-of-data replies were relayed",
-				"expected", want, "relayed", got, "error", err)
+		if !complete {
+			s.InfoLog("backend end-of-data reply exceeded line limit",
+				"expected", want, "relayed", got, "limit", maxLHLOResponseLines)
 			s.loseBackend()
 			return false
 		}
-		if len(reply) >= 4 && reply[3] != '-' {
-			got++
+		n, ferr := s.writeClientReply(b.String(), false)
+		bytesOut += int64(n)
+		if ferr != nil {
+			if !errors.Is(ferr, errSessionClosing) {
+				s.DebugLog("client gone while relaying end-of-data replies", "error", ferr)
+			}
+			s.loseBackend()
+			return false
 		}
 	}
 	return true
