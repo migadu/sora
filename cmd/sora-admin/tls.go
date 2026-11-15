@@ -1271,8 +1271,9 @@ func removeExpiredLocalCopy(path string, now time.Time) (bool, error) {
 // does: it writes a temporary file in the same directory and renames it over path, so a
 // write that fails part-way (the disk fills) leaves no partial file under the cache name,
 // which a later run would skip as already cached and the server would read. The new file
-// gets the owner and group of the file it replaces, as writing into that file would keep
-// them, so that, run as root, tls cache --force leaves the server a file it can read.
+// gets the owner, group and permissions of the file it replaces, as writing into that file
+// would keep them, so that, run as root, tls cache --force leaves the server a file it can
+// read (the temporary file is 0600, which would hide a group-readable 0640 file from it).
 func writeLocalCacheFile(path string, data []byte) error {
 	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".cache-")
 	if err != nil {
@@ -1280,6 +1281,9 @@ func writeLocalCacheFile(path string, data []byte) error {
 	}
 	if old, statErr := os.Stat(path); statErr == nil {
 		err = takeOwner(f, old)
+		if err == nil {
+			err = f.Chmod(old.Mode().Perm())
+		}
 	}
 	if err == nil {
 		_, err = f.Write(data)
