@@ -91,3 +91,36 @@ else { fileinto "date"; }
 		}
 	}
 }
+
+// Invalid comment text cannot become a date when CFWS is removed. RFC 5322
+// permits NUL only as an obsolete quoted-pair, not as unquoted comment text.
+func TestDateCFWSInvalidComment(t *testing.T) {
+	const script = `require ["date", "fileinto", "relational", "comparator-i;ascii-numeric"];
+if date :count "eq" :comparator "i;ascii-numeric" "date" "year" "0" { fileinto "nodate"; }
+else { fileinto "date"; }`
+	if err := ValidateScript(script, nil); err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewSieveExecutorWithExtensions(script, EffectiveExtensions(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ value, mailbox string }{
+		{"Wed, 17 Jul 1996 02:23:25 (bad\x00) -0700", "nodate"},
+		{"Wed, 17 Jul 1996 02:23:25 (outer (bad\x00)) PDT", "nodate"},
+		{"Wed, 17 Jul 1996 02:23:25 (quoted\\\x00) -0700", "date"},
+		{"Wed, 17 Jul 1996 02:23:25 (nested (valid)) -0700", "date"},
+	} {
+		result, err := executor.Evaluate(context.Background(), Context{
+			EnvelopeFrom: "sender@example.com", EnvelopeTo: "user@example.com",
+			Header:  map[string][]string{"Date": {tc.value}, "From": {"sender@example.com"}},
+			Message: bodyOnly("body"),
+		})
+		if err != nil {
+			t.Fatalf("%q: %v", tc.value, err)
+		}
+		if !slices.Equal(result.Mailboxes, []string{tc.mailbox}) {
+			t.Errorf("%q: mailboxes=%q, want %q", tc.value, result.Mailboxes, tc.mailbox)
+		}
+	}
+}

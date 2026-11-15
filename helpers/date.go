@@ -139,11 +139,15 @@ func normalizeCFWS(s string) string {
 func isDigit(c byte) bool { return '0' <= c && c <= '9' }
 
 // commentLen returns the length of the comment s starts with, nested comments and
-// quoted-pairs included (RFC 5322 §3.2.2), or 0 if it does not close.
+// quoted-pairs included (RFC 5322 §3.2.2), or 0 if it is malformed or
+// does not close. An unquoted NUL is not ctext, including obsolete ctext;
+// a quoted NUL remains allowed by obs-qp (§4.1).
 func commentLen(s string) int {
 	depth := 0
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
+		case 0:
+			return 0
 		case '\\':
 			i++
 		case '(':
