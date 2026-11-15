@@ -1120,8 +1120,37 @@ func (i *Importer) resolveMailboxName(path string) (string, error) {
 	}
 	// Folders are named Maildir++ style (".Sent", ".Work.Projects") or without the
 	// leading dot ("Sent"): drop the dot, then turn the maildir separator (.) into
-	// the IMAP one (/).
-	return importedFolderName(strings.ReplaceAll(strings.TrimPrefix(relPath, "."), ".", "/"))
+	// the IMAP one (/). Escaped characters are restored after that split, so an
+	// escaped '.' ("v1\2e2", as the exporter writes "v1.2") stays in its level.
+	levels := strings.Split(strings.ReplaceAll(strings.TrimPrefix(relPath, "."), ".", "/"), "/")
+	for n, level := range levels {
+		levels[n] = unescapeMaildirLevel(level)
+	}
+	return importedFolderName(strings.Join(levels, "/"))
+}
+
+// unescapeMaildirLevel restores the characters of a folder directory name's level
+// escaped with maildirEscapeChar, before the level is decoded from modified UTF-7, as
+// Dovecot's mailbox_list_unescape_name_params does. Only a printable US-ASCII
+// character is restored: escaping only ever applies to those, and a mailbox name
+// must not gain a control character or a byte of invalid UTF-8 from a directory
+// name. Any other escape character is kept as it is.
+func unescapeMaildirLevel(level string) string {
+	if strings.IndexByte(level, maildirEscapeChar) < 0 {
+		return level
+	}
+	var b strings.Builder
+	for n := 0; n < len(level); n++ {
+		if level[n] == maildirEscapeChar && n+2 < len(level) {
+			if v, err := hex.DecodeString(level[n+1 : n+3]); err == nil && v[0] >= 0x20 && v[0] <= 0x7e {
+				b.WriteByte(v[0])
+				n += 2
+				continue
+			}
+		}
+		b.WriteByte(level[n])
+	}
+	return b.String()
 }
 
 // importedFolderName is the Sora mailbox name for a folder name read from a maildir,

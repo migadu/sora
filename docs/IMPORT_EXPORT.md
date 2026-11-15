@@ -90,10 +90,13 @@ folder. Its mailbox name comes from its path relative to the root:
 2. A leading `.` is removed and the remaining `.` characters become `/`. So the Maildir++ folder
    `.Work.2024` becomes `Work/2024`. A folder without a leading dot (`Sent`) is read the same
    way. Nested directories (`Work/2024`) keep their `/`.
-3. IMAP modified UTF-7 is decoded: `.R&AOk-pertoire` becomes `Répertoire`.
-4. Leading and trailing spaces are trimmed. A name containing a tab, CR or LF is skipped with a
+3. In each level, `\` followed by two hex digits is the character with that value, as Dovecot's
+   storage name escape character (`\` by default) writes it: `.v1\2e2.Notes` becomes
+   `v1.2/Notes`. Only printable US-ASCII characters are restored; any other `\` stays as it is.
+4. IMAP modified UTF-7 is decoded: `.R&AOk-pertoire` becomes `Répertoire`.
+5. Leading and trailing spaces are trimmed. A name containing a tab, CR or LF is skipped with a
    warning.
-5. Some names are mapped to Sora's standard folders, compared case-insensitively, for the whole
+6. Some names are mapped to Sora's standard folders, compared case-insensitively, for the whole
    name only (`Work/Sent` is not mapped):
 
 | Folder name | Mailbox in Sora |
@@ -466,10 +469,16 @@ to, and every message that is not expunged. Bodies are downloaded from S3 under 
 each message and decrypted.
 
 **Layout.** INBOX is the root (`cur/`, `new/`, `tmp/`). Every other mailbox is a directory under
-the root named after the mailbox, with `/` creating subdirectories: `Work/2024` becomes
-`<root>/Work/2024/cur`. Names are written in UTF-8. This is not the Maildir++ layout with dotted
-names (`.Work.2024`) that Dovecot uses by default; a Dovecot reading the export needs a
-filesystem-style folder layout (Dovecot's `LAYOUT=fs`). Sora's own importer reads it back.
+the root, with one directory per level of its name: `Work/2024` becomes `<root>/Work/2024/cur`.
+Each level is written in IMAP modified UTF-7, as Dovecot names folders on disk (`Données` becomes
+`Donn&AOk-es`, `R&D` becomes `R&-D`), and a `.` or `\` in it is escaped as `\2e` or `\5c`
+(`v1.2` becomes `v1\2e2`), because the importer reads a `.` as the Maildir++ separator. A mailbox
+with a level `.` or `..` fails to export. This is not the Maildir++ layout with dotted names
+(`.Work.2024`) that Dovecot uses by default; a Dovecot reading the export needs a
+filesystem-style folder layout (Dovecot's `LAYOUT=fs`), and shows escaped names right only with
+`\` as its storage name escape character (the 2.3 `listescape` plugin, or
+`mailbox_list_storage_escape_char` in 2.4). Sora's own importer reads each name back as it was
+exported, under the rules of [section 3](#3-the-maildir-layout-sora-reads).
 
 **Files.** Each message is written to `tmp/`, synced to disk and renamed into `cur/`, so a reader
 never sees half a file. The name is `<INTERNALDATE as Unix time>.M<same>P<UID>.<hostname>:2,<flags>`
@@ -507,8 +516,9 @@ Each message is tried three times. If any message or mailbox fails, the command 
 
 ## 15. Round trips and known limits
 
-- **Dots in names.** Export writes a mailbox `Foo.Bar` as a directory `Foo.Bar`; the importer reads
-  that back as `Foo/Bar`.
+- **Backslashes in folder names.** The importer reads `\` and two hex digits in a directory name
+  as an escaped character ([section 3](#3-the-maildir-layout-sora-reads)), so a folder from
+  another system whose name really contains `\2e` is imported with a `.` there instead.
 - **Exporting into an imported maildir.** Export and import share the file name
   `sora-maildir.db`. Export into an empty directory, not into a maildir you imported from.
 - **Not imported:** Dovecot's index files (`dovecot.index*`), quota files, ACL files, and

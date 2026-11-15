@@ -446,17 +446,55 @@ func (exporter *Exporter) shouldExportMailbox(mailboxName string) bool {
 // write arbitrary files. This is defence-in-depth: mailbox creation, rename, and
 // import already reject such names (helpers.MailboxNameHasTraversal), but the
 // exporter must never trust a name already persisted in the database.
+//
+// Each level of the name is one directory (Dovecot's LAYOUT=fs), named by
+// maildirFolderLevel so that the importer's resolveMailboxName reads it back.
 func (exporter *Exporter) mailboxDir(mailboxName string) (string, error) {
 	if mailboxName == "INBOX" {
 		return exporter.maildirPath, nil
 	}
-	// Standard maildir uses folders without leading dots.
-	dir := filepath.Join(exporter.maildirPath, mailboxName)
+	if helpers.MailboxNameHasTraversal(mailboxName) {
+		return "", fmt.Errorf("mailbox %q resolves outside the export directory", mailboxName)
+	}
+	levels := strings.Split(mailboxName, "/")
+	for i, level := range levels {
+		levels[i] = maildirFolderLevel(level)
+	}
+	dir := filepath.Join(exporter.maildirPath, filepath.Join(levels...))
 	rel, err := filepath.Rel(exporter.maildirPath, dir)
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("mailbox %q resolves outside the export directory", mailboxName)
 	}
 	return dir, nil
+}
+
+// maildirEscapeChar escapes a character in a folder's directory name as itself
+// followed by the character's value in two hex digits: "v1.2" is written "v1\2e2".
+// It is Dovecot's storage name escape character ('\', the 2.3 listescape plugin's
+// default; mailbox_list_storage_escape_char in 2.4), whose
+// mailbox_list_escape_name_params writes the same form.
+const maildirEscapeChar = '\\'
+
+// maildirFolderLevel is the directory name of one level of a mailbox name. It is
+// modified UTF-7, as Dovecot names folders on disk and as exportSubscriptions names
+// them, so the importer does not decode an '&' or a literal "&...-" of the name. A
+// '.' is escaped, because the importer reads a '.' as the Maildir++ hierarchy
+// separator, and so is the escape character, so that unescapeMaildirLevel restores
+// exactly the characters escaped here.
+func maildirFolderLevel(level string) string {
+	encoded := helpers.EncodeModifiedUTF7(level)
+	if !strings.ContainsAny(encoded, ".\\") {
+		return encoded
+	}
+	var b strings.Builder
+	for i := 0; i < len(encoded); i++ {
+		if c := encoded[i]; c == '.' || c == maildirEscapeChar {
+			fmt.Fprintf(&b, "%c%02x", maildirEscapeChar, c)
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // createMailboxDirectory creates the maildir structure for a mailbox
