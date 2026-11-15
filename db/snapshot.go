@@ -46,7 +46,8 @@ func HasReadSnapshot(ctx context.Context) bool {
 // opened on d.GetReadPoolWithContext(ctx) (honouring consts.UseMasterDBKey).
 // The first query executed inside fn fixes the PostgreSQL MVCC snapshot that all
 // subsequent readQuerier reads in fn observe; the transaction is always rolled
-// back when fn returns.
+// back when fn returns. The callback context is scoped to fn and must only be
+// used with snapshot-aware read methods on this Database.
 func (d *Database) InReadSnapshot(ctx context.Context, fn func(ctx context.Context) error) error {
 	if HasReadSnapshot(ctx) {
 		return fn(ctx)
@@ -82,7 +83,9 @@ func InReadSavepoint(ctx context.Context, fn func(ctx context.Context) error) er
 	}
 	if err := fn(context.WithValue(ctx, readSnapshotTxKey{}, sp)); err != nil {
 		if rbErr := sp.Rollback(ctx); rbErr != nil {
-			return fmt.Errorf("%w: %w (rollback: %w)", ErrReadSnapshotAborted, err, rbErr)
+			// A failed rollback is the terminal failure. Preserve the statement error
+			// diagnostically without hiding a connection failure from error classifiers.
+			return fmt.Errorf("%w: rollback failed: %w (statement: %v)", ErrReadSnapshotAborted, rbErr, err)
 		}
 		return err
 	}

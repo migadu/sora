@@ -218,8 +218,9 @@ func (rd *ResilientDatabase) GetMailboxSummaryWithRetry(ctx context.Context, mai
 
 // InReadSnapshotWithRetry runs fn inside a single REPEATABLE READ READ ONLY transaction
 // on the read pool (or write pool when consts.UseMasterDBKey is set on ctx), retrying
-// the entire snapshot as a unit on transient database errors. Nested *WithRetry read
-// helpers called with snapCtx reuse the open snapshot transaction directly.
+// the entire snapshot as a unit on transient database errors. Snapshot-aware read
+// helpers called with snapCtx reuse the open transaction directly. The callback
+// context is scoped to fn and must only be used with this ResilientDatabase.
 func (rd *ResilientDatabase) InReadSnapshotWithRetry(ctx context.Context, fn func(ctx context.Context) error) error {
 	op := func(opCtx context.Context) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(opCtx, false).InReadSnapshot(opCtx, fn)
