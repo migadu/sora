@@ -2,6 +2,7 @@ package helpers
 
 import (
 	"io/fs"
+	"net/mail"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -41,7 +42,9 @@ func TestParseDateHeaderObsoleteZone(t *testing.T) {
 		{"Wed, 17 Jul 1996 02:23:25 Gmt", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC), 0},
 		{"Wed, 17 Jul 1996 02:23:25 PDT (Pacific Daylight Time)", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC), -7 * h},
 		{"Wed, 17 Jul 1996 02:23:25\r\n PDT", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC), -7 * h},
+		{"Wed, 17 Jul 1996 02:23:25\r\n\tPdT", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC), -7 * h},
 		{"Wed, 17 Jul 1996 02:23:25PDT", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC), -7 * h},
+		{"Wed, 17 Jul 1996 02:23:25 PDT(comment)", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC), -7 * h},
 		{"17 Jul 96 02:23 PDT", time.Date(1996, 7, 17, 2, 23, 0, 0, time.UTC), -7 * h},
 		// Military zones and other names: "-0000".
 		{"Wed, 17 Jul 1996 02:23:25 Z", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC), 0},
@@ -77,9 +80,36 @@ func TestParseDateHeaderObsoleteZone(t *testing.T) {
 
 // TestParseDateHeaderInvalid: a value net/mail does not parse is still an error.
 func TestParseDateHeaderInvalid(t *testing.T) {
-	for _, value := range []string{"", "PDT", "Wed, 17 Jul 1996 PDT", "not a date 12:00 PDT"} {
+	for _, value := range []string{
+		"", "PDT", "Wed, 17 Jul 1996 PDT", "not a date 12:00 PDT",
+		// Replacing only the alphabetic prefix would let net/mail discard the
+		// rest after the numeric replacement, turning these errors into dates.
+		"Wed, 17 Jul 1996 02:23:25 PDT+0400",
+		"Wed, 17 Jul 1996 02:23:25 PDT0",
+		"Wed, 17 Jul 1996 02:23:25 PDT-0700",
+		"Wed, 17 Jul 1996 02:23:25\r PDT",
+		"Wed, 17 Jul 1996 02:23:25\n PDT",
+	} {
 		_, err := ParseDateHeader(value)
 		assert.Error(t, err, "%q", value)
+	}
+}
+
+// An alphabetic prefix that is not a whole obs-zone must retain net/mail's
+// behavior, including its accepted GMT extension and permissive suffix handling.
+func TestParseDateHeaderPreservesParserExtensions(t *testing.T) {
+	for _, value := range []string{
+		"Wed, 17 Jul 1996 02:23:25 GMT+0000",
+		"Wed, 17 Jul 1996 02:23:25 PDT/UTC",
+	} {
+		want, err := mail.ParseDate(value)
+		require.NoError(t, err)
+		got, err := ParseDateHeader(value)
+		require.NoError(t, err)
+		assert.True(t, got.Equal(want))
+		_, wantOffset := want.Zone()
+		_, gotOffset := got.Zone()
+		assert.Equal(t, wantOffset, gotOffset)
 	}
 }
 

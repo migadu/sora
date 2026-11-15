@@ -222,6 +222,10 @@ func TestIMAP_EnvelopeDateObsoleteZone(t *testing.T) {
 		{"Wed, 17 Jul 1996 02:23:25 pdt", `"Wed, 17 Jul 1996 02:23:25 -0700"`},
 		{"Wed, 17 Jul 1996 02:23:25 Z", `"Wed, 17 Jul 1996 02:23:25 +0000"`},
 		{"Wed, 17 Jan 1996 02:23:25 CET", `"Wed, 17 Jan 1996 02:23:25 +0000"`},
+		{"Wed, 17 Jul 1996 02:23:25\r\n\tpdt", `"Wed, 17 Jul 1996 02:23:25 -0700"`},
+		// A name prefix must not turn an invalid field into a parsed Date.
+		{"Wed, 17 Jul 1996 02:23:25 PDT+0400", "NIL"},
+		{"Wed, 17 Jul 1996 02:23:25 PDT0", "NIL"},
 	}
 	for i, d := range dates {
 		rc.append(fmt.Sprintf("a%d", i), "INBOX", "From: alice@example.com\r\nTo: bob@example.com\r\n"+

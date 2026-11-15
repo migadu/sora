@@ -21,7 +21,7 @@ var obsZones = map[string]string{
 // alphabeticZone matches a date-time (RFC 5322 §3.3) up to the end of its time-of-day
 // (the field's first colon is the one after the hour) and the run of letters that follows
 // it after any folding white space: the zone.
-var alphabeticZone = regexp.MustCompile(`^[^:]*\d:\d{2}(?::\d{2})?([ \t\r\n]*)([A-Za-z]+)`)
+var alphabeticZone = regexp.MustCompile(`^[^:]*\d:\d{2}(?::\d{2})?([ \t]*)([A-Za-z]+)`)
 
 // ParseDateHeader parses the value of a Date: header field (RFC 5322 §3.3), like
 // net/mail.ParseDate but reading an alphabetic zone by RFC 5322 §4.3 instead of by the
@@ -34,13 +34,26 @@ var alphabeticZone = regexp.MustCompile(`^[^:]*\d:\d{2}(?::\d{2})?([ \t\r\n]*)([
 // the military zones and any other name by "-0000", which §4.3 says they "SHOULD all be
 // considered equivalent to" without out-of-band information.
 func ParseDateHeader(value string) (time.Time, error) {
-	if m := alphabeticZone.FindStringSubmatchIndex(value); m != nil {
-		zone, ok := obsZones[strings.ToUpper(value[m[4]:m[5]])]
+	// Unfold exactly as net/mail does, without turning an unpaired CR or LF
+	// before the zone into valid white space during the replacement below.
+	unfolded := strings.ReplaceAll(value, "\r\n", "")
+	if strings.ContainsAny(unfolded, "\r\n") {
+		return mail.ParseDate(value)
+	}
+	if m := alphabeticZone.FindStringSubmatchIndex(unfolded); m != nil {
+		end := m[5]
+		// Replace a whole zone token only. For example, PDT+0400 is not PDT:
+		// net/mail would discard the suffix after a numeric replacement. Keep
+		// its existing behavior for extensions it accepts, such as GMT+0000.
+		if end < len(unfolded) && unfolded[end] != ' ' && unfolded[end] != '\t' && unfolded[end] != '(' {
+			return mail.ParseDate(value)
+		}
+		zone, ok := obsZones[strings.ToUpper(unfolded[m[4]:end])]
 		if !ok {
 			zone = "-0000"
 		}
 		// An obs-zone needs no white space before it, a numeric zone does.
-		value = value[:m[2]] + " " + zone + value[m[5]:]
+		unfolded = unfolded[:m[2]] + " " + zone + unfolded[end:]
 	}
-	return mail.ParseDate(value)
+	return mail.ParseDate(unfolded)
 }
