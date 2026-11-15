@@ -49,14 +49,14 @@ var lookupTableKeysReadBy = func() map[string]map[string]struct {
 			"circuit_breaker":           {`circuit_breaker = { max_requests = 5 }`, proxies},
 			"transport":                 {`transport = { max_idle_conns = 10 }`, proxies},
 		},
-		// The LMTP proxy checks no passwords, so it has none to revalidate.
+		// LMTP and User API proxies cache routes without checking passwords.
 		"lookup_cache": {
 			"enabled":                      {`enabled = false`, cacheReaders},
 			"positive_ttl":                 {`positive_ttl = "10m"`, cacheReaders},
 			"negative_ttl":                 {`negative_ttl = "2m"`, cacheReaders},
 			"max_size":                     {`max_size = 1000`, cacheReaders},
 			"cleanup_interval":             {`cleanup_interval = "10m"`, cacheReaders},
-			"positive_revalidation_window": {`positive_revalidation_window = "1m"`, slices.DeleteFunc(slices.Clone(cacheReaders), func(t string) bool { return t == "lmtp_proxy" })},
+			"positive_revalidation_window": {`positive_revalidation_window = "1m"`, slices.DeleteFunc(slices.Clone(cacheReaders), func(t string) bool { return t == "lmtp_proxy" || t == "user_api_proxy" })},
 		},
 	}
 }()

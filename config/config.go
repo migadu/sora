@@ -1122,7 +1122,7 @@ type LookupCacheConfig struct {
 
 	// positiveRevalidationWindowSet records that the table names
 	// positive_revalidation_window, which the defaults otherwise fill in; the LMTP
-	// proxy does not apply it.
+	// and User API proxies do not apply it.
 	positiveRevalidationWindowSet bool
 }
 
@@ -3395,10 +3395,10 @@ var serverTableKeys = []struct {
 	{"remote_lookup.remote_use_id_command", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseIDCommand }, proxyServerTypes, []string{"imap_proxy"}},
 	{"remote_lookup.remote_use_xclient", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseXCLIENT }, proxyServerTypes, []string{"pop3_proxy", "lmtp_proxy"}},
 	{"remote_lookup.remote_use_utf8", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseUTF8 }, proxyServerTypes, []string{"pop3_proxy"}},
-	// The LMTP proxy checks no passwords, so it has none to revalidate.
+	// These route-only proxies check no passwords, so have none to revalidate.
 	{"lookup_cache.positive_revalidation_window", func(s *ServerConfig) bool {
 		return s.LookupCache != nil && s.LookupCache.positiveRevalidationWindowSet
-	}, lookupCacheServerTypes, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "http_user_api", "user_api_proxy"}},
+	}, lookupCacheServerTypes, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "http_user_api"}},
 }
 
 // serverTypeKeyNotes ends the warning about a serverTypeKeys or serverTableKeys key
@@ -3408,7 +3408,7 @@ var serverTypeKeyNotes = map[string]string{
 	"remote_lookup.remote_tls":                  "; the User API proxy dials a backend a lookup names with the block's own 'remote_tls'",
 	"remote_lookup.remote_tls_verify":           "; the User API proxy dials a backend a lookup names with the block's own 'remote_tls_verify'",
 	"remote_lookup.remote_use_proxy_protocol":   "; the User API proxy dials a backend a lookup names with the block's own 'remote_use_proxy_protocol'",
-	"lookup_cache.positive_revalidation_window": "; the LMTP proxy checks no passwords",
+	"lookup_cache.positive_revalidation_window": "; LMTP and User API proxies cache routes without checking passwords",
 }
 
 // loginServerTypes are the IMAP, POP3 and ManageSieve servers and proxies, the line
