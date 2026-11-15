@@ -628,7 +628,8 @@ func (s *Server) sendGracefulShutdownMessage() {
 			session.mu.Lock()
 			session.gracefulShutdown = true
 			conn := session.clientConn
-			ready := session.greeted && !session.startTLSInProgress
+			ready := session.greeted && !session.startTLSInProgress && !session.closingNoticeSent
+			session.closingNoticeSent = true
 			session.mu.Unlock()
 			if conn != nil && ready {
 				if err := conn.SetWriteDeadline(deadline); err == nil {
