@@ -187,11 +187,15 @@ paths:
         '200':
           description: Mailbox deleted successfully
         '400':
-          description: Cannot delete INBOX
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: INBOX, or a shared mailbox without the `x` (delete mailbox) right.
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: The mailbox has child mailboxes; delete them first.
 
   /mailboxes/{name}/subscribe:
     post:

@@ -232,6 +232,12 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusConflict, "Mailbox has child mailboxes; delete them first")
 			return
 		}
+		// A shared mailbox without the 'x' right (RFC 4314 §2.1), which IMAP DELETE
+		// answers NO [NOPERM].
+		if errors.Is(err, consts.ErrNotPermitted) {
+			s.writeError(w, http.StatusForbidden, "Not permitted to delete this mailbox")
+			return
+		}
 		logger.Warn("HTTP Mail API: Error deleting mailbox", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to delete mailbox")
 		return

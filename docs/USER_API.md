@@ -260,7 +260,7 @@ header listing the methods it does serve; a path no endpoint has is
 | 201 | Mailbox created. |
 | 400 | Bad request: bad JSON, a missing or invalid field or parameter, a script that does not compile. |
 | 401 | No, bad or expired token; failed login. |
-| 403 | Client address not in `allowed_hosts`; deleting `INBOX`; or changing flags or deleting a message in a shared mailbox without the right. |
+| 403 | Client address not in `allowed_hosts`; deleting `INBOX`; or deleting a shared mailbox, changing flags or deleting a message in one without the right. |
 | 404 | Mailbox, message or script not found, or no endpoint has the path. |
 | 405 | Wrong method for the path; `Allow` lists the methods it serves. |
 | 409 | Mailbox already exists, or has child mailboxes. |
@@ -375,10 +375,10 @@ Response `200 {"message":"Mailbox deleted successfully","name":"Projects/Acme"}`
 | Status | Body `error` |
 |---|---|
 | 400 | `Invalid mailbox name` |
-| 403 | `Cannot delete INBOX` |
+| 403 | `Cannot delete INBOX`; `Not permitted to delete this mailbox` (a shared mailbox without the `x` right) |
 | 404 | `Mailbox not found` |
 | 409 | `Mailbox has child mailboxes; delete them first` |
-| 500 | `Failed to delete mailbox` (also for a shared mailbox without the delete right) |
+| 500 | `Failed to delete mailbox` |
 
 ### 6.4 Subscribe and unsubscribe
 
