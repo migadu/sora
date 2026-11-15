@@ -1139,7 +1139,7 @@ func importedFolderName(name string) (string, error) {
 		levels := strings.Split(name, delim)
 		for i, level := range levels {
 			if decoded, err := helpers.DecodeModifiedUTF7(level); err != nil {
-				logger.Warn("Failed to decode Modified UTF-7 mailbox name level, using raw level", "name", name, "level", level, "error", err)
+				logger.Warn("Failed to decode Modified UTF-7 mailbox name level, using raw level", "name", name, "mailbox_level", level, "error", err)
 			} else {
 				levels[i] = decoded
 			}
