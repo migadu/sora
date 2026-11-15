@@ -513,7 +513,7 @@ func (d *Database) DeleteExpungedMessagesByS3KeyPartsBatch(ctx context.Context, 
 
 // DeleteMessageByHashAndMailbox deletes message rows from the database that match
 // the given AccountID, MailboxID, and ContentHash. This is a hard delete used
-// by the importer for the --force-reimport option.
+// by importer rollback compensation when updating its SQLite cache fails after commit.
 // It returns the number of messages deleted.
 func (d *Database) DeleteMessageByHashAndMailbox(ctx context.Context, tx pgx.Tx, accountID int64, mailboxID int64, contentHash string) (int64, error) {
 	// Live rows are expunged first, under the mailbox lock, so that they leave
