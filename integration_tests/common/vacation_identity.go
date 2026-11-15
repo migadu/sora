@@ -18,6 +18,7 @@ func VacationIdentityCases() []VacationIdentityCase {
 		{"different implicit subjects", `require "vacation"; if header :is "subject" "first" { vacation :subject "One" "Away"; } else { vacation :subject "Two" "Away"; }`, 2},
 		{"explicit empty handle", `require "vacation"; if header :is "subject" "first" { vacation :handle "" "Away"; } else { vacation :handle "" "Contact support"; }`, 1},
 		{"empty and omitted handles differ", `require "vacation"; if header :is "subject" "first" { vacation :handle "" "Away"; } else { vacation "Away"; }`, 2},
+		{"empty and omitted subjects differ", `require "vacation"; if header :is "subject" "first" { vacation :subject "" "Away"; } else { vacation "Away"; }`, 2},
 		{"variables do not change implicit identity", `require ["vacation", "variables"]; if header :matches "subject" "*" { vacation :subject "Automatic ${1}" "Away"; }`, 1},
 		{"variables do not change explicit identity", `require ["vacation", "variables"]; if header :matches "subject" "*" { vacation :handle "${1}" "Away"; }`, 1},
 	}

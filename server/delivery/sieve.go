@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -21,12 +22,55 @@ import (
 )
 
 // DefaultSieveScript is the built-in script every delivery runs before the user's
-// own: it files spam into Junk and a +detail recipient into the detail folder. Both
-// delivery paths run it and merge its result with the user script's
-// (MergeSieveResults), so one message is filed the same way whichever way it came.
+// own: it files spam into Junk (ResolveDefaultJunk) and a +detail recipient into the
+// detail folder. Both delivery paths run it and merge its result with the user
+// script's (MergeSieveResults), so one message is filed the same way whichever way
+// it came.
 //
 //go:embed default.sieve
 var DefaultSieveScript string
+
+// defaultJunkIndex returns the position in the default script's result of its spam
+// filing, the plain fileinto "Junk" of default.sieve, or -1 if it has none. The
+// script's other filing, by +detail, is a fileinto :create of a lower-case name.
+func defaultJunkIndex(result sieveengine.Result) int {
+	i := slices.Index(result.Mailboxes, consts.MailboxJunk)
+	if i < 0 || slices.Contains(result.CreateMailboxes, consts.MailboxJunk) {
+		return -1
+	}
+	return i
+}
+
+// ResolveDefaultJunk points the default script's spam filing at the account's \Junk
+// mailbox (RFC 6154 §2), the one LIST shows as the Junk folder. default.sieve files
+// spam with fileinto "Junk", but the attribute, not the name, says which mailbox
+// that is: it survives RENAME, and a plain folder may be named Junk. The filing is
+// carried out as RFC 8579 §4 has fileinto :specialuse "\\Junk" "Junk" do: it "first
+// checks whether a mailbox exists in the user's personal namespace [NAMESPACE] with
+// the specified special-use attribute assigned to it", and only without one is the
+// mailbox named Junk used. A user script's fileinto "Junk" still names a mailbox
+// (RFC 5228 §4.1), so this is applied to the default script's result only, before
+// it is merged with the user script's.
+//
+// A failed lookup fails the delivery, to be retried: RFC 8579 §4 does not let a
+// failure that is not about the special-use mailbox's existence fall back to the
+// named one, which would spread the account's spam over two folders.
+func ResolveDefaultJunk(ctx context.Context, rdb *resilient.ResilientDatabase, accountID int64, result sieveengine.Result) (sieveengine.Result, error) {
+	i := defaultJunkIndex(result)
+	if i < 0 {
+		return result, nil
+	}
+	name, err := rdb.GetPersonalMailboxNameBySpecialUseWithRetry(ctx, accountID, string(imap.MailboxAttrJunk))
+	if errors.Is(err, consts.ErrMailboxNotFound) {
+		return result, nil
+	}
+	if err != nil {
+		return result, err // already "failed to look up the \Junk mailbox: ..."
+	}
+	result.Mailboxes = slices.Clone(result.Mailboxes)
+	result.Mailboxes[i] = name
+	return result, nil
+}
 
 // SieveOutcome is the result of evaluating a recipient's Sieve script for one delivery.
 type SieveOutcome struct {
@@ -48,10 +92,16 @@ type SieveOutcome struct {
 	// CreateMailboxes are the fileinto :create targets (RFC 5490 §3.2): the caller
 	// creates each missing mailbox before saving the copies.
 	CreateMailboxes []string
-	// Redirect hands every redirect to the relay, after all requested copies are stored.
-	// RedirectOnly has no requested copy: call Redirect first, keeping INBOX only if it fails.
-	Redirect     func() bool
-	RedirectOnly bool
+	// Redirect hands the script's redirects to the relay worker. ExecuteSieve has
+	// already written them to the relay queue (RelayQueue.Hold), so the caller calls it
+	// once every requested copy is stored, and it reports false only for a redirect
+	// that could not be handed over after all. RedirectOnly has no requested copy: call
+	// Redirect first, keeping INBOX only if it fails. AbortRedirect drops every redirect
+	// Redirect has not handed over; the caller calls it when the delivery returns, so
+	// that a failed delivery leaves nothing for the relay and its retry relays once.
+	Redirect      func() bool
+	AbortRedirect func()
+	RedirectOnly  bool
 }
 
 // SieveExecutor interface defines the contract for Sieve script execution.
@@ -91,6 +141,11 @@ func (o *VacationOracle) RecordRedirect(ctx context.Context, accountID int64) er
 // RelayQueue interface defines operations for queuing relay messages
 type RelayQueue interface {
 	Enqueue(from, to, messageType string, messageBytes []byte) error
+	// Hold writes a message without handing it to the relay worker: commit hands it
+	// over, abort removes it instead and does nothing after commit. A Sieve redirect is
+	// held until the delivery that runs it can no longer fail, so that a delivery that
+	// fails and is retried never relays it twice.
+	Hold(from, to, messageType string, messageBytes []byte) (commit func() error, abort func(), err error)
 }
 
 // StandardSieveExecutor implements the standard Sieve execution flow.
@@ -148,7 +203,8 @@ func (s *StandardSieveExecutor) evaluate(ctx context.Context, recipient Recipien
 
 // ExecuteSieve executes Sieve scripts and sends the vacation reply. The caller
 // stores every requested copy from SieveOutcome.MessageBytes before invoking
-// SieveOutcome.Redirect. A redirect-only delivery uses INBOX only if handoff fails.
+// SieveOutcome.Redirect, and calls SieveOutcome.AbortRedirect when it returns. A
+// redirect-only delivery uses INBOX only if handoff fails.
 func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient RecipientInfo, messageEntity *message.Entity, fullMessageBytes []byte) (*SieveOutcome, error) {
 	// Default to INBOX with the message unmodified
 	outcome := &SieveOutcome{
@@ -169,14 +225,18 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		Header:       messageEntity.Header.Map(),
 		Message:      fullMessageBytes,
 		MailboxExists: func(ctx context.Context, mailbox string) (bool, error) {
-			return CanFileInto(ctx, s.DeliveryCtx.RDB, recipient.AccountID, mailbox)
+			return CanFileInto(ctx, s.DeliveryCtx.RDB, s.DeliveryCtx.SharedMailboxes, recipient.AccountID, mailbox)
 		},
 	}
 
 	// The built-in default script runs first, as on LMTP, and the user's script then
 	// takes the message over or keeps the default's filing (MergeSieveResults). A
 	// script that fails to compile or run leaves the result before it standing.
-	result := s.evaluate(ctx, recipient, sieveCtx, DefaultSieveScript, "default")
+	result, err := ResolveDefaultJunk(ctx, s.DeliveryCtx.RDB, recipient.AccountID,
+		s.evaluate(ctx, recipient, sieveCtx, DefaultSieveScript, "default"))
+	if err != nil {
+		return nil, err
+	}
 	activeScript, err := s.DeliveryCtx.RDB.GetActiveScriptWithRetry(ctx, recipient.AccountID)
 	if err != nil && err != consts.ErrDBNotFound {
 		s.DeliveryCtx.Logger.Log("Failed to get the active Sieve script, using the default script's result: %v", err)
@@ -221,10 +281,13 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		_ = s.VacationHandler.HandleVacationResponse(ctx, recipient.AccountID, *result.Vacation, recipient.FromAddress, recipient.Address, outcome.MessageEntity)
 	}
 
+	// Write every redirect to the relay queue now, but hand none to the relay worker
+	// before the caller has stored what this delivery stores: a target the queue cannot
+	// take keeps the message in INBOX when nothing else stores it, and a delivery that
+	// fails after a handoff would relay it again on every retry.
+	allHeld := true
 	if len(result.RedirectTo) > 0 {
-		outcome.Redirect = func() bool {
-			return s.relayRedirects(ctx, recipient, result, outcome.MessageBytes, outcome.MessageEntity)
-		}
+		outcome.Redirect, outcome.AbortRedirect, allHeld = s.holdRedirects(ctx, recipient, result, outcome.MessageBytes, outcome.MessageEntity)
 	}
 
 	if result.Action == sieveengine.ActionDiscard && result.Rejected {
@@ -232,9 +295,9 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		s.DeliveryCtx.Logger.Log("Sieve %s treated as discard, no bounce sent: %q", action, reason)
 	}
 
-	// Compute the requested copies before relaying. With no requested copy the
-	// caller tries the redirect first, using INBOX only when handoff fails.
-	destinations := result.Destinations(false)
+	// With every redirect held and no requested copy, the caller hands the redirects
+	// over first, using INBOX only when that fails.
+	destinations := result.Destinations(!allHeld)
 	if len(destinations) == 0 {
 		if outcome.Redirect != nil {
 			outcome.RedirectOnly = true
@@ -258,50 +321,79 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	return outcome, nil
 }
 
-// relayRedirects hands every redirect to the relay and charges only successful handoffs.
-func (s *StandardSieveExecutor) relayRedirects(ctx context.Context, recipient RecipientInfo, result sieveengine.Result, messageBytes []byte, messageEntity *message.Entity) bool {
-	// Every redirect is relayed, whatever else the script did with the message.
-	redirectFailed := false
-	if len(result.RedirectTo) > 0 {
-		if recipient.FromAddress != nil && (s.RelayQueue != nil || s.RelayHandler != nil) {
-			// Stamp the outgoing copy with an incremented hop count (loop backstop).
-			relayBytes := helpers.PrependHeaderLine(messageBytes, helpers.RedirectLoopHeader, strconv.Itoa(helpers.RedirectHopCount(helpers.HeaderGetter(messageEntity.Header.Map()))+1))
-			// Attribute this redirect to the script owner, replacing any earlier or
-			// sender-supplied attribution. Aliases still use the account's primary address.
-			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, recipient.Address.FullAddress())
-			from := recipient.FromAddress.FullAddress()
-			for _, redirectTo := range result.RedirectTo {
-				switch {
-				case s.RelayQueue != nil:
-					if err := s.RelayQueue.Enqueue(from, redirectTo, "redirect", relayBytes); err != nil {
-						s.DeliveryCtx.Logger.Log("Failed to enqueue redirect message: %v", err)
-						logger.Warn("Sieve redirect could not be queued",
-							"account_id", recipient.AccountID, "redirect_to", redirectTo, "error", err)
-						redirectFailed = true
-						continue
-					}
-					if s.RelayNotify != nil {
-						s.RelayNotify()
-					}
-				case s.RelayHandler != nil:
-					if err := s.RelayHandler.SendToExternalRelay(from, redirectTo, relayBytes); err != nil {
-						redirectFailed = true
-						continue
-					}
-				}
-				if result.RecordRedirect != nil {
-					if err := result.RecordRedirect(ctx); err != nil {
-						logger.Warn("Sieve redirect could not be charged against the rate limit",
-							"account_id", recipient.AccountID, "redirect_to", redirectTo, "error", err)
-					}
-				}
+// holdRedirects writes the message to the relay queue for every redirect without
+// handing it to the relay worker, and reports whether every target was held. commit
+// hands over every redirect still held, charges each one handed over against the rate
+// limit, and reports whether all of them went; abort drops the ones still held. A
+// direct relay handler cannot hold a message: its commit sends it.
+func (s *StandardSieveExecutor) holdRedirects(ctx context.Context, recipient RecipientInfo, result sieveengine.Result, messageBytes []byte, messageEntity *message.Entity) (commit func() bool, abort func(), allHeld bool) {
+	type heldRedirect struct {
+		to     string
+		commit func() error
+		abort  func()
+	}
+	var held []heldRedirect
+	allHeld = true
+	if recipient.FromAddress != nil && (s.RelayQueue != nil || s.RelayHandler != nil) {
+		// Stamp the outgoing copy with an incremented hop count (loop backstop).
+		relayBytes := helpers.PrependHeaderLine(messageBytes, helpers.RedirectLoopHeader, strconv.Itoa(helpers.RedirectHopCount(helpers.HeaderGetter(messageEntity.Header.Map()))+1))
+		// Attribute this redirect to the script owner, replacing any earlier or
+		// sender-supplied attribution. Aliases still use the account's primary address.
+		relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, recipient.Address.FullAddress())
+		from := recipient.FromAddress.FullAddress()
+		for _, redirectTo := range result.RedirectTo {
+			if s.RelayQueue == nil {
+				held = append(held, heldRedirect{
+					to:     redirectTo,
+					commit: func() error { return s.RelayHandler.SendToExternalRelay(from, redirectTo, relayBytes) },
+					abort:  func() {},
+				})
+				continue
 			}
-		} else {
-			redirectFailed = true
+			commit, abort, err := s.RelayQueue.Hold(from, redirectTo, "redirect", relayBytes)
+			if err != nil {
+				s.DeliveryCtx.Logger.Log("Failed to enqueue redirect message: %v", err)
+				logger.Warn("Sieve redirect could not be queued",
+					"account_id", recipient.AccountID, "redirect_to", redirectTo, "error", err)
+				allHeld = false
+				continue
+			}
+			held = append(held, heldRedirect{to: redirectTo, commit: commit, abort: abort})
 		}
+	} else {
+		allHeld = false
 	}
 
-	return !redirectFailed
+	commit = func() bool {
+		ok := true
+		for _, h := range held {
+			if err := h.commit(); err != nil {
+				s.DeliveryCtx.Logger.Log("Failed to hand redirect message to the relay: %v", err)
+				logger.Warn("Sieve redirect could not be handed to the relay",
+					"account_id", recipient.AccountID, "redirect_to", h.to, "error", err)
+				ok = false
+				continue
+			}
+			if s.RelayQueue != nil && s.RelayNotify != nil {
+				s.RelayNotify()
+			}
+			if result.RecordRedirect != nil {
+				if err := result.RecordRedirect(ctx); err != nil {
+					logger.Warn("Sieve redirect could not be charged against the rate limit",
+						"account_id", recipient.AccountID, "redirect_to", h.to, "error", err)
+				}
+			}
+		}
+		held = nil
+		return ok
+	}
+	abort = func() {
+		for _, h := range held {
+			h.abort()
+		}
+		held = nil
+	}
+	return commit, abort, allHeld
 }
 
 // MergeSieveResults decides what the default script and the user script together

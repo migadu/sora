@@ -63,8 +63,14 @@ After the backend accepts the login, the proxy sends the backend's reply to the 
 a byte pipe. Everything after login (capabilities, IDLE, FETCH) is the backend's.
 
 The LMTP proxy does not log in. For each `RCPT TO` it finds the recipient's backend, connects (or
-reuses the connection it holds) and forwards the command. The User API proxy forwards each HTTP
-request; the backend checks the JWT token.
+reuses the connection it holds) and forwards the command. Like the backend, it does not announce
+`DSN`, so the sending MTA issues the notifications a sender asked for (RFC 3461 §5.2.2); `NOTIFY`,
+`ORCPT`, `RET` and `ENVID` sent anyway are accepted and not forwarded. As on the backend, `MAIL`
+before `LHLO` gets `503 5.5.1`. A later `LHLO`, or a completed `STARTTLS`, starts the session over:
+the transaction in progress ends, and a held backend connection is closed, so the next recipient
+reaches the backend on a new connection (with `remote_use_xclient`, its `XCLIENT HELO=` is the new
+`LHLO` name). After `STARTTLS` the MTA must send `LHLO` again before `MAIL`. The User API proxy
+forwards each HTTP request; the backend checks the JWT token.
 
 A node can run proxies and backend servers in the same process. A node that runs only proxies is a
 **proxy node**. [Section 13](#13-proxy-nodes-and-the-database) explains when such a node connects
@@ -123,10 +129,11 @@ carries its own copy and these server keys are not used for pool members (except
 | `timeouts.command_timeout` | IMAP `30m`, POP3 `10m`, ManageSieve `3m` | Idle timeout. |
 | `timeouts.absolute_session_timeout` | `24h`, LMTP `5m` | Longest a session may last. |
 | `timeouts.min_bytes_per_minute` | `0` (off) | Slow-client guard. |
-| `max_connections`, `max_connections_per_ip` | `0` (unlimited) | Per proxy instance. |
+| `max_connections` | `0` (unlimited) | Per proxy listener. |
+| `max_connections_per_ip` | `0` (unlimited) | Per proxy listener. The LMTP proxy ignores it with a warning. With `[cluster]` enabled, the IMAP, POP3 and ManageSieve proxies count an address's connections on every node; see [CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies). |
 | `max_connections_per_user`, `max_connections_per_user_per_ip` | `0` | IMAP, POP3 and ManageSieve proxies only, and only with `[cluster]` enabled; see [CLUSTER.md](CLUSTER.md). The LMTP proxy ignores them with a warning. |
 | `limits.max_auth_errors` | `2` | Protocol errors before login (unknown or malformed commands, logins refused without TLS) before the connection is closed. Wrong passwords do not count. |
-| `auth_rate_limit` | off | See [AUTHENTICATION.md](AUTHENTICATION.md). |
+| `auth_rate_limit` | off | See [AUTHENTICATION.md](AUTHENTICATION.md). With `[cluster]` enabled, the IMAP, POP3 and ManageSieve proxies share it; see [CLUSTER.md](CLUSTER.md#66-authentication-rate-limits-imap-pop3-and-managesieve-proxies). |
 | `listen_backlog` | `1024` (mail proxies) | TCP accept backlog. |
 | `debug` | `false` | Log the protocol exchange, with passwords masked. |
 | `proxy_protocol`, `proxy_protocol_timeout` | off, `5s` | Accept a PROXY header from a load balancer in front of the proxy. The load balancer's address must be in `[servers] trusted_networks`. |
@@ -241,11 +248,12 @@ The proxy sends `GET` to `url` after replacing placeholders:
 
 With `auth_token` set, the request carries `Authorization: Bearer <auth_token>`.
 
-The URL must use `https://`, unless its host is `localhost` or a loopback address. Sora refuses to
-start a proxy with a plain `http://` URL to any other host, because the request and answer carry
-password hashes. (With `lookup_local_users = true`, a proxy instead logs the error and runs without
-the remote lookup, checking every user in PostgreSQL. The User API proxy does so only when the file
-has no `[[pool]]` blocks.)
+The URL must be an absolute URL with a host, and use `https://` unless its host is `localhost` or
+a loopback address. Sora refuses to start a proxy with a plain `http://` URL to any other host,
+because the request and answer carry password hashes. It also refuses a URL that does not parse,
+has no host or has a scheme other than `http` or `https`, a URL with `$email` or `$ip` in the host,
+and a `timeout`, `circuit_breaker` or `transport` duration or a `remote_port` it cannot parse, with
+`lookup_local_users` or without. `sora-admin config validate` fails the file for the same reasons.
 
 ### 4.2 The answer
 
@@ -458,6 +466,8 @@ with `remote_port = 24` dials `10.0.1.21:24`.
 Sora checks the pools at startup and refuses to start when:
 
 - a pool has no `name`, a name with whitespace, the same name as another pool, or no `backends`;
+- a backend is empty or has whitespace inside it (`"192.0.2.10 :143"`; spaces at the ends are
+  trimmed);
 - a backend appears twice, in one pool or in two. Names are compared without letter case and IPs in
   canonical form. A backend without a port stands for its host on every port, so it clashes with
   any other entry for that host. Entries with different explicit ports may share a host;
@@ -484,8 +494,11 @@ Sora checks the pools at startup and refuses to start when:
 - An affinity that points outside the user's current pool is deleted and the user is routed
   afresh. This is how a user the API moves to another pool lands there. An affinity of another
   protocol outside the pool is skipped, not deleted.
-- The LMTP proxy holds one backend connection per session. A recipient whose pool or backend differs
-  from the held connection's gets `451 4.3.0`, so the sending MTA retries it in a new transaction.
+- The LMTP proxy holds one backend connection per session, across transactions. Until a recipient
+  of a transaction is accepted, each recipient is routed as on a fresh connection: if its pool or
+  backend differs from the held connection's, that connection is dropped and the proxy connects to
+  the recipient's backend. After that, a recipient of the same transaction that needs another pool
+  or backend gets `451 4.3.0`, so the sending MTA retries it in a new transaction.
 
 Each routing decision on a proxy with pools increments
 `sora_proxy_pool_route_total{protocol, pool, result}`, where `result` is `routed`,
@@ -621,10 +634,17 @@ A remote lookup `server` given as a hostname is resolved when it is dialed.
 
 ### 7.3 Connect timeouts
 
-`connect_timeout` (default `30s`) limits one TCP connect and the TLS handshake. Because a login may
-try the preferred backend and then fall back, the whole attempt gets
-`connect_timeout × min(number of backends + 1, 3)` (90 seconds with the default). A backend that
-drops packets cannot use up the time of every fallback.
+`connect_timeout` (default `30s`) limits each TCP connect and each implicit-TLS handshake.
+The IMAP and ManageSieve proxies put an overall deadline around a connection attempt, so a dead
+pool cannot take one timeout per backend. One attempt's budget is `connect_timeout`, doubled
+when the manager or any named pool uses implicit TLS. With `n = number of backends + 1` (the
+preferred backend plus fallbacks), the overall budget is `min(n + 0.5, 4)` times that per-attempt
+budget. The extra half attempt allows scheduling and teardown between dials. At the default,
+the cap is 120 seconds for plaintext and 240 seconds for implicit TLS.
+
+A caller cancellation or a shorter caller deadline is not charged to backend health. A phase
+that was allowed its full `connect_timeout` and failed counts even when the process resumes
+after the overall deadline has also elapsed.
 
 After connecting, the proxy reads the backend's greeting and does its own login within
 `connect_timeout` each. A greeting other than `* OK` (IMAP) is a failure.
@@ -651,7 +671,13 @@ addresses: every host in the list may claim any client address. See [SECURITY.md
 
 You need only one way to pass the client address. PROXY protocol works for all protocols and keeps
 the backend from seeing the proxy's address at all. `ID` and `XCLIENT` work without changing the
-backend's listener.
+backend's listener. On IMAP and POP3, a backend that receives a PROXY header judges `ID` and
+`XCLIENT` by the client the header names, not by the proxy, so next to a header it ignores the `ID`
+forwarding fields and refuses the POP3 `XCLIENT` (unless that client is itself in
+`trusted_networks`); the login continues. The header already carries the client's address and
+port, its JA4 fingerprint and the proxy session ID (8.4). LMTP `XCLIENT` is judged by the proxy
+and still carries the client's `HELO` next to a PROXY header
+([SECURITY.md](SECURITY.md#31-trusted_networks)).
 
 ### 8.2 Which settings apply
 
@@ -820,6 +846,11 @@ written to disk, and the cache is empty after a restart.
 | success | accepted from the cache, routed as before | entry younger than `positive_revalidation_window`: rejected without asking; older: checked again |
 | failure | rejected from the cache | checked again |
 
+The master username form `user@example.com@MASTERUSER` logs in with two passwords, `master_password`
+and the user's own ([AUTHENTICATION.md](AUTHENTICATION.md#81-master-username-master_username-and-master_password)),
+and both use the one entry for that name. A success entry made with one of them never rejects the
+other: the login is checked again, as for an older entry.
+
 Entries are not extended by use: a success entry expires `positive_ttl` after it was made, and the
 next login checks again. The IMAP and POP3 proxies delete the entry when the backend cannot be
 reached or refuses the proxy's login, so the next attempt routes afresh. The LMTP proxy does not
@@ -947,11 +978,15 @@ cache_path = "/var/lib/sora/affinity_cache.db"
 ```
 
 - Used only with `[cluster]` and `[cluster.affinity]` enabled and `cache_path` set.
-- At startup, entries that have not expired are loaded, except for users gossip has already
-  provided.
+- At startup, entries that have not expired are loaded. The gossip handler is registered
+  before the file is loaded, and queues incoming
+  events until the initial snapshot is ready. Those events are then applied and written using
+  their timestamps: an older SET cannot replace a newer stored assignment, and a newer delete
+  removes the stored entry.
 - Every change (set, update, delete, also those received by gossip) is written to the file in the
-  background, each write with a 2-second limit. Gossip changes apply only if newer than what the
-  node has. Pending writes finish at shutdown.
+  background, in the order the changes were made, each write with a 2-second limit. A key changed
+  again before its write starts is written once, with its latest state. Gossip changes apply only
+  if newer than what the node has. Pending writes finish at shutdown.
 - Expired entries are removed from memory and from the file every `cleanup_interval`.
 - The directory must exist; Sora does not create it. The file gets mode `0600`, WAL mode.
 - A corrupt file is deleted and recreated as for the auth cache. Any other error is logged
@@ -991,8 +1026,9 @@ An `http_admin_api` server on a proxy node lets you see the proxies' backend hea
 `sora-admin health status --backends`, since that state lives in the proxy process.
 
 Sora treats the database as not configured when `[database.write]` and `[database.read]` are absent
-or have empty `hosts`. A node that needs the database while it is not configured refuses to start
-with `database is required for configured servers but not configured in [database.write] or [database.read]`.
+or have empty `hosts`. A node that needs the database while it is not configured refuses to start,
+and `sora-admin config validate` refuses its file, with `[database]: server "<name>" (<type>) needs
+the database, but it is not configured in [database.write] or [database.read]`.
 
 ---
 
@@ -1003,7 +1039,7 @@ with `database is required for configured servers but not configured in [databas
 | No pool for the route, pin unavailable, no backend reachable, backend login failed | `NO [UNAVAILABLE] Backend server temporarily unavailable` then `* BYE` | `-ERR [SYS/TEMP] Backend server temporarily unavailable` | `NO (UNAVAILABLE) "Backend server temporarily unavailable"` | `451 4.4.1 Backend connection failed` | `503` |
 | Remote lookup unavailable (timeout, 5xx, breaker open) | `NO [UNAVAILABLE]` | `-ERR [SYS/TEMP]` | `NO (UNAVAILABLE)` | `451 4.4.3 Service temporarily unavailable, please try again later` | pools: `503`; no pools: routed by hash |
 | Remote lookup invalid answer | `NO Authentication failed` | `-ERR [AUTH] Authentication failed` | `NO "Authentication failed"` | `451 4.4.3` | as above |
-| User not found | `NO Authentication failed` | `-ERR [AUTH] Authentication failed` | `NO "Authentication failed"` | `550 5.1.1 User unknown` or `450 4.1.1` | no pools: routed by hash, the backend answers; pools: `503` unless `lookup_local_users` |
+| User not found | `NO Authentication failed` | `-ERR [AUTH] Authentication failed` | `NO "Authentication failed"` | `550 5.1.1 User unknown` or `450 4.1.1` | login: `401 Invalid credentials`; with a token: `503`; unless `lookup_local_users` |
 | Proxy shutting down | `NO [UNAVAILABLE]` | `-ERR [SYS/TEMP]` | `NO (UNAVAILABLE)` | `421 4.3.2` | |
 | Maintenance list never loaded | as "no backend reachable" | | | | `503` |
 
@@ -1018,8 +1054,10 @@ Notes:
   of maintenance, because it cannot be sure. A recipient the remote lookup does not know gets the
   same reply whether the answer is fresh or comes from the lookup cache: `550 5.1.1`, or `450 4.1.1`
   with `user_not_found_response = "tempfail"`.
-- An LMTP recipient that needs another backend or pool than the session's held connection gets
+- An LMTP recipient that needs another backend or pool than the one holding an already accepted
+  recipient of the same transaction gets
   `451 4.3.0 Recipient requires different backend server, start new transaction` (or `... pool ...`).
+  While the transaction has no accepted recipient, the held connection is replaced instead.
 
 ---
 
@@ -1083,7 +1121,7 @@ On `SIGHUP` the proxies apply these `[[server]]` keys:
 | `imap_proxy` | `limits.max_auth_errors`, `auth_idle_timeout`, `timeouts.command_timeout`, `timeouts.absolute_session_timeout`, `timeouts.min_bytes_per_minute`, `master_sasl_username`, `master_sasl_password` |
 | `pop3_proxy`, `managesieve_proxy` | the same, and `debug` |
 | `lmtp_proxy` | `timeouts.absolute_session_timeout`, `max_message_size` |
-| `user_api_proxy` | `jwt_secret` |
+| `user_api_proxy` | `jwt_secret`, `allowed_origins` |
 
 Everything else in this document needs a restart: `remote_addrs`, `[[pool]]`, `[server.remote_lookup]`,
 `[server.lookup_cache]`, the backend-leg keys, `[auth_cache]`, `[backend_maintenance]` and

@@ -142,16 +142,24 @@ with status 1. It does not leave the other listeners running.
 
 ### Messages that stop startup
 
-Errors from steps 2 to 9 are written by Sora's error handler, in this form:
+Errors from steps 2 to 9 are written by Sora's error handler. Before step 6 the `[logging]` output
+is not open yet, so they go to standard error, in this form:
 
 ```
 [ERROR] 2026/01/15 10:00:00 ERROR: invalid configuration - <what>: <why>
 [ERROR] 2026/01/15 10:00:00 FATAL: operation '<what>' failed: <why>
 ```
 
-Before step 6 they go to standard error. From step 6 on they go to the `[logging]` output. With
-`output` set to a file, a node that fails to start under systemd may therefore show nothing in the
-journal: look in the log file.
+From step 6 on they are ERROR records of the `[logging]` output, in its format, like every other
+error Sora logs. With the console format:
+
+```
+time=2026-01-15T10:00:00.000+01:00 level=ERROR msg="Invalid configuration" field=<what> error=<why>
+time=2026-01-15T10:00:00.000+01:00 level=ERROR msg="Fatal error" operation=<what> error=<why>
+```
+
+With `output` set to a file or to `syslog`, a node that fails to start under systemd may therefore
+show nothing on standard error: look in the log file or in syslog.
 
 | Message contains | Cause | Fix |
 |---|---|---|
@@ -163,13 +171,13 @@ journal: look in the log file.
 | `master_username is set but master_password is empty` | A master user without a password would let anyone in. | Set the password or remove the user. |
 | `proxy_protocol is enabled on server(s) ... but [servers] trusted_networks is empty` | PROXY protocol without trusted senders. | Set `[servers] trusted_networks`. |
 | `duplicate server name` / `duplicate server address` | Two blocks share a `name` or `addr`. | Make them unique. |
-| `database is required for configured servers but not configured` | No `[database.write]` section (step 4). | Configure `[database.write]`. |
-| `missing required S3 credentials` / `S3 endpoint not specified` | A backend without `[s3]` settings. | Set `[s3]`. |
-| `Failed to initialize resilient database` | No write host reachable, or migrations failed. The line before it says why. | See [Database migrations](#10-database-migrations) and [DATABASE.md](DATABASE.md). |
-| `FATAL: operation 'initialize cache' failed` | `[local_cache] path` cannot be created. | Fix the path or its permissions. |
-| `FATAL: operation 'create upload worker' failed` | `[uploader] path` cannot be created. | Fix the path or its permissions. |
-| `FATAL: operation 'initialize TLS manager' failed` | Certificate files unreadable, or a Let's Encrypt setting is missing. | See [TLS.md](TLS.md). |
-| `FATAL: operation 'server operation' failed` | A listener could not start or failed later, for example `address already in use`. | Free the port, or check privileges for ports below 1024. |
+| `[database]: server "<name>" (<type>) needs the database, but it is not configured ...` | No `[database.write]` section (step 4). | Configure `[database.write]`. |
+| `[s3]: bucket is required ...` / `[s3]: endpoint is required ...` | A backend without `[s3]` settings. | Set `[s3]`. |
+| `Fatal error` with operation `initialize resilient database` | No write host reachable, or migrations failed. The line before it says why. | See [Database migrations](#10-database-migrations) and [DATABASE.md](DATABASE.md). |
+| `Fatal error` with operation `initialize cache` | `[local_cache] path` cannot be created. | Fix the path or its permissions. |
+| `Fatal error` with operation `create upload worker` | `[uploader] path` cannot be created. | Fix the path or its permissions. |
+| `Fatal error` with operation `initialize TLS manager` | Certificate files unreadable, or a Let's Encrypt setting is missing. | See [TLS.md](TLS.md). |
+| `Fatal error` with operation `server operation` | A listener could not start or failed later, for example `address already in use`. | Free the port, or check privileges for ports below 1024. |
 
 ### Warnings worth reading at startup
 
@@ -189,11 +197,10 @@ Sora starts despite these, but each one points at something to fix:
 ### Checking a config before you start
 
 `sora-admin --config PATH config validate` parses the file, prints unknown and duplicate keys,
-validates every `[[server]]` block and checks for duplicate names and addresses. It connects to
-nothing and exits with status 0 when the file is valid. It does not run every check `sora` runs at
-startup: it skips the `[[pool]]` checks, the `proxy_protocol`/`trusted_networks` check and the
-database and S3 checks. `sora-admin --config PATH config dump` prints the parsed config with secrets
-masked.
+validates every `[[server]]` block and runs the other checks `sora` makes on the file before it
+starts anything (see [CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup)), reporting
+every problem it finds. It connects to nothing and exits with status 0 when the file is valid.
+`sora-admin --config PATH config dump` prints the parsed config with secrets masked.
 
 ---
 
@@ -266,7 +273,7 @@ already open keep the settings they started with.
 | `lmtp_proxy` | `timeouts.absolute_session_timeout`, `max_message_size` |
 | `http_admin_api` | `api_key`, `read_only_api_key`, `allowed_hosts` |
 | `http_user_api` | `jwt_secret`, `allowed_origins`, `allowed_hosts` |
-| `user_api_proxy` | `jwt_secret` |
+| `user_api_proxy` | `jwt_secret`, `allowed_origins` |
 | `metrics` | nothing; changes are not reported either |
 
 The list lives in `reloadableServerSettings` in
@@ -293,6 +300,11 @@ changed, each with a line `Config reload: <section> changed but requires restart
   stay trusted and added ones are not)
 - `[database]`, `[s3]`, `[local_cache]`, `[uploader]`, `[relay]`, `[cluster]`, `[tls]`,
   `[auth_cache]`, `[[pool]]`, `[spam_training]`, `[timeout_scheduler]` and `bcrypt_cost`
+
+Sora also checks the new file as startup does (the checks `sora-admin config validate` runs) and logs
+an error for each problem it finds, `Config reload: <section> is invalid and the server will not
+start with this config`, with the reason in `error`. Fix these before the next restart, which
+would refuse the file.
 
 TLS certificates are never reloaded by SIGHUP. Certificate files (`[tls] cert_file`/`key_file` and
 per-server `tls_cert_file`/`tls_key_file`) are read once, at startup, so a renewed certificate needs
@@ -359,8 +371,9 @@ A restart, planned or not, **loses**:
   LMTP transactions without a final answer are retried by the MTA. ManageSieve sessions are short and
   lose nothing that was saved.
 - **In-memory state:** login lookup caches, auth rate-limit counters and blocks, search rate limits,
-  connection counts. In a cluster, the other nodes keep the per-user proxy connection counts
-  ([CLUSTER.md](CLUSTER.md)).
+  connection counts. In a cluster, the other nodes keep the per-user and per-IP proxy connection
+  counts, which the restarted node gets back from them, and the proxies' rate-limit blocks and
+  counts, which that state exchange does not restore ([CLUSTER.md](CLUSTER.md#a-node-comes-back)).
 - **Proxy affinity** held in this node's memory, unless `[cluster.affinity] cache_path` is set.
 - **Uploads and relay deliveries in flight.** They are retried after the start.
 
@@ -386,7 +399,7 @@ other paths) to a directory that persists
 | What | Key | Default | Written when | Contents | Can it be lost? |
 |---|---|---|---|---|---|
 | Upload spool | `[uploader] path` | `/tmp/sora/uploads` | The node has an `imap`, `pop3` or `lmtp` server | One file per message body not yet in S3, at `<path>/<account_id>/<content_hash>`. Written to a `.tmp` name, synced, then renamed. | **No.** Until a body is in S3, this file is its only copy. |
-| Local cache | `[local_cache] path` | `/tmp/sora/cache` | Same | Bodies in `<path>/data/`, 256 SQLite index files `cache_index_00.db` to `cache_index_ff.db` (WAL mode), and `.sora_warmup_state`, written when an IMAP server stops with cache warmup on (the default). | Yes. Sora fetches bodies from S3 again. |
+| Local cache | `[local_cache] path` | `/tmp/sora/cache` | Same | Bodies in `<path>/data/`, 256 SQLite index files `cache_index_00.db` to `cache_index_ff.db` (WAL mode), and one `.sora_warmup_state.<server hash>` per IMAP server (lowercase SHA-256 of its name), written when it stops with cache warmup on (the default). | Yes. Sora fetches bodies from S3 again. |
 | Auth cache | `[auth_cache] path` | `/tmp/sora/auth_cache.db` | `[auth_cache] enabled = true` | SQLite file (mode 0600, WAL) with addresses, account IDs and password hashes. Its parent directory is created. | Yes. It refills from the database. Treat it as secret: it holds password hashes. |
 | Affinity cache | `[cluster.affinity] cache_path` | none (off) | Cluster and `[cluster.affinity]` enabled, and `cache_path` set | SQLite file (mode 0600, WAL) with user-to-backend affinity. | Yes. Users are routed afresh. |
 | Relay queue | `[relay.queue] path` | `/var/spool/sora/relay` | `[relay] type` is set | `pending/`, `processing/` and `failed/` directories with outgoing Sieve redirects and vacation replies. | Losing `pending/` loses those messages. |
@@ -457,9 +470,9 @@ A few things are always written to the process's standard error, whatever `outpu
 Under systemd these are in the journal even when Sora logs to a file. Check both when Sora does not
 start.
 
-Errors after logging is set up, and protocol traces from `debug = true` on a `[[server]]`, go to the
-log file when `output` is a file path, and to standard error or standard output otherwise. They are
-plain text, not `slog` lines.
+Protocol traces from `debug = true` on a `[[server]]` go to the log file when `output` is a file
+path, and to standard output otherwise. They are plain text, not `slog` lines. Errors that stop Sora
+after logging is set up go through `[logging]`, like every other error.
 
 ### Rotating the log file
 

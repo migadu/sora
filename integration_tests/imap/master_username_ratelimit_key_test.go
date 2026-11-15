@@ -175,3 +175,55 @@ func TestIMAP_MasterUsername_BruteForceIsMeteredAcrossTargets(t *testing.T) {
 		})
 	}
 }
+
+// TestIMAP_MasterUsername_AccountPasswordLogsInWithoutClearingMasterFailures (#949): the
+// account's own password in the master form logs in as that account, as it does under any
+// other suffix. Refused under the master suffix alone, it confirmed the master username to
+// any account holder. That login is the account's own, so its success is recorded under
+// the account's key: recorded under the master credential's, every account holder could
+// clear the failed guesses at the master password.
+func TestIMAP_MasterUsername_AccountPasswordLogsInWithoutClearingMasterFailures(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+
+	masterUser := fmt.Sprintf("masteruser-%d", time.Now().UnixNano())
+	const masterPass = "master_secret_pw"
+
+	for _, verb := range masterUsernameVerbs {
+		t.Run(verb.name, func(t *testing.T) {
+			address := startIMAPWithMasterUsername(t, rdb, masterUsernameRateLimit(), masterUser, masterPass)
+
+			// Control: the master password logs in, so the block asserted at the end cannot
+			// come from a broken master login.
+			if resp := verb.probe(t, address, account.Email+"@"+masterUser, masterPass); !strings.HasPrefix(resp, "A001 OK") {
+				t.Fatalf("control: master username login must work, got %q", resp)
+			}
+			other := verb.probe(t, address, account.Email+"@other", account.Password)
+			if !strings.HasPrefix(other, "A001 OK") {
+				t.Fatalf("the account's own password under another suffix: %q, want a login", other)
+			}
+
+			// Two wrong master passwords, one short of the master credential's block.
+			for i := 0; i < 2; i++ {
+				if resp := verb.probe(t, address, account.Email+"@"+masterUser, fmt.Sprintf("wrong-master-pw-%d", i)); strings.HasPrefix(resp, "A001 OK") {
+					t.Fatalf("attempt %d: a wrong master password must not authenticate, got %q", i+1, resp)
+				}
+			}
+
+			if own := verb.probe(t, address, account.Email+"@"+masterUser, account.Password); own != other {
+				t.Errorf("the account's own password under the master suffix: %q, under another suffix: %q: the reply confirms the master username", own, other)
+			}
+
+			// The third wrong master password blocks the master credential, unless the
+			// account's own login above cleared its failures.
+			if resp := verb.probe(t, address, account.Email+"@"+masterUser, "wrong-master-pw-2"); strings.HasPrefix(resp, "A001 OK") {
+				t.Fatalf("attempt 3: a wrong master password must not authenticate, got %q", resp)
+			}
+			if resp := verb.probe(t, address, account.Email+"@"+masterUser, masterPass); strings.HasPrefix(resp, "A001 OK") {
+				t.Errorf("the master password still logs in after 3 failed guesses: the account's own login between them cleared the master credential's failures (got %q)", resp)
+			}
+		})
+	}
+}

@@ -164,6 +164,24 @@ func SieveRawMessageCases() []SieveRawMessageCase {
 			},
 			Mailbox: "Archive",
 		},
+		{
+			Name:   "body text of a base64 message with CTE comments",
+			Script: `require ["body", "fileinto"]; if body :contains "hello world" { fileinto "Archive"; }`,
+			Message: func(to, subject string) string {
+				return strings.Replace(Base64TextMessage(to, subject, "hello world"),
+					"Content-Transfer-Encoding: base64\r\n", "Content-Transfer-Encoding: (encoded) BASE64 (comment)\r\n", 1)
+			},
+			Mailbox: "Archive",
+		},
+		{
+			Name:   "body text of quoted-printable with nested CTE comments",
+			Script: `require ["body", "fileinto"]; if body :contains "hello world" { fileinto "Archive"; }`,
+			Message: func(to, subject string) string {
+				return strings.Replace(QuotedPrintableHTMLMessage(to, subject, "<p>hello=20world</p>"),
+					"Content-Transfer-Encoding: quoted-printable\r\n", "Content-Transfer-Encoding: (outer (nested)) Quoted-Printable (comment)\r\n", 1)
+			},
+			Mailbox: "Archive",
+		},
 	}
 }
 

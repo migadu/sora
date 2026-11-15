@@ -1,8 +1,10 @@
 package config
 
 import (
+	"errors"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 )
 
@@ -62,6 +64,119 @@ func maskSecrets(v reflect.Value, secret bool) {
 		} else {
 			v.SetString(maskURLCredentials(v.String()))
 		}
+	}
+}
+
+// MaskEndpointURL returns an endpoint setting (an http_url, a lookup URL, an
+// smtp_host) as a log record or an error may show it: masked as the config dump
+// masks it (see maskURLCredentials), keeping its scheme, host, port and path. A value
+// without a scheme, which the URL masker cannot take apart, is masked whole if it may
+// carry userinfo or a query.
+func MaskEndpointURL(value string) string {
+	if !strings.Contains(value, "://") && strings.ContainsAny(value, "?@") {
+		return SecretMask
+	}
+	return maskURLCredentials(value)
+}
+
+// MaskURLError masks, in place, the URL that the *url.Error in err's chain quotes,
+// as MaskEndpointURL masks it. Call it on an error owned by this request before it
+// is published or logged. Display wrappers preserve the original error chain,
+// including when fmt.Errorf has already copied the URL into its own text.
+// net/http quotes the request URL in its errors with the user name and the query
+// (it replaces only the password, with "***"), and url.Parse quotes the whole string
+// it refuses. Such a string's reason quotes a piece of it too, `invalid port ":pass"
+// after host` for "https://user:pass/word@host/", so when the string carries
+// credentials the quoted parts of its reason are masked as well.
+func MaskURLError(err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+	masked := MaskEndpointURL(urlErr.URL)
+	if urlErr.Err != nil {
+		reason := urlErr.Err.Error()
+		shown := maskURLErrorText(reason)
+		if masked != urlErr.URL && urlErr.Op == "parse" {
+			shown = maskQuoted(shown)
+		}
+		if shown != reason {
+			urlErr.Err = &maskedURLCause{cause: urlErr.Err, text: shown}
+		}
+	}
+	urlErr.URL = masked
+	if err != urlErr {
+		text := err.Error()
+		if shown := maskURLErrorText(text); shown != text {
+			return &maskedURLCause{cause: err, text: shown}
+		}
+	}
+	return err
+}
+
+// A redirect's malformed Location is quoted inside Client.Do's source error,
+// before CheckRedirect can refuse it. When a reason contains a credential URL,
+// mask quoted parts too: its parser may quote only part of the password as an
+// invalid port. Keep the category text, and mask any unquoted URLs as well.
+func maskURLErrorText(text string) string {
+	if shown := maskURLCredentials(text); shown != text {
+		return maskURLCredentials(maskQuoted(text))
+	}
+	// Location can also be a network-path or relative reference, with no "://"
+	// for maskURLCredentials to find. net/http quotes that reference with %q.
+	for rest := text; ; {
+		i := strings.IndexByte(rest, '"')
+		if i < 0 {
+			break
+		}
+		quoted, err := strconv.QuotedPrefix(rest[i:])
+		if err != nil {
+			if MaskEndpointURL(rest[i:]) != rest[i:] {
+				return maskURLCredentials(maskQuoted(text))
+			}
+			break
+		}
+		value, _ := strconv.Unquote(quoted)
+		if MaskEndpointURL(value) != value {
+			return maskURLCredentials(maskQuoted(text))
+		}
+		rest = rest[i+len(quoted):]
+	}
+	return text
+}
+
+type maskedURLCause struct {
+	cause error
+	text  string
+}
+
+func (e *maskedURLCause) Error() string { return e.text }
+func (e *maskedURLCause) Unwrap() error { return e.cause }
+func (e *maskedURLCause) Timeout() bool {
+	var timeout interface{ Timeout() bool }
+	return errors.As(e.cause, &timeout) && timeout.Timeout()
+}
+func (e *maskedURLCause) Temporary() bool {
+	var temporary interface{ Temporary() bool }
+	return errors.As(e.cause, &temporary) && temporary.Temporary()
+}
+
+// maskQuoted replaces every Go-quoted string in s with a quoted SecretMask.
+func maskQuoted(s string) string {
+	var out strings.Builder
+	for {
+		i := strings.IndexByte(s, '"')
+		if i < 0 {
+			out.WriteString(s)
+			return out.String()
+		}
+		out.WriteString(s[:i])
+		out.WriteString(strconv.Quote(SecretMask))
+		quoted, err := strconv.QuotedPrefix(s[i:])
+		if err != nil {
+			return out.String() // unterminated: the rest is quoted text
+		}
+		s = s[i+len(quoted):]
 	}
 }
 
@@ -134,7 +249,10 @@ func maskSingleURL(value string) (string, bool) {
 	if strings.Contains(rest, "://") && !hasQuery {
 		return SecretMask, true
 	}
-	if !strings.Contains(authority, "@") && !hasQuery {
+	// An unencoded "/" or "#" in the password ends the authority early, leaving the
+	// "@" in the path or fragment, and the parser takes the start of the password
+	// for a port and refuses the URL. So any "@" after the scheme is checked here.
+	if !strings.Contains(rest, "@") && !hasQuery {
 		return value, false
 	}
 	u, err := url.Parse(value)
