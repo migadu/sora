@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go/logging"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 )
 
@@ -66,7 +67,8 @@ func NewClient(ctx context.Context, cfg ClientConfig, optFns ...func(*s3.Options
 		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")))
 	case cfg.AccessKey != "" || cfg.SecretKey != "":
-		return nil, errors.New("access_key and secret_key must be set together; leave both empty to use the AWS default credential chain")
+		// config.S3Config.Validate refuses such an [s3] pair with the file.
+		return nil, config.ErrS3KeysNotPaired
 	}
 	if cfg.Debug {
 		// ClientLogMode alone selects what to trace; without a logger the SDK discards it.

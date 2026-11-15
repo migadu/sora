@@ -93,8 +93,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Apply progressive authentication delay BEFORE any other checks
-	if err := server.ApplyAuthenticationDelay(ctx, s.authLimiter, remoteAddr, "userapi"); err != nil {
+	// Apply progressive authentication delay BEFORE any other checks. It runs after
+	// net/http set the request's write deadline, so it moves that deadline past itself.
+	if err := server.ApplyHTTPAuthenticationDelay(ctx, w, s.authLimiter, remoteAddr, "userapi", writeTimeout); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
 			logger.Info("User API: Delay queue full, rejecting connection", "email", req.Email, "remote", remoteAddr)

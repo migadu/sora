@@ -8,6 +8,7 @@ import (
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -56,7 +57,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, AccountID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
-			s.DebugLog("mailbox does not exist", "mailbox", mboxName, "account_id", s.AccountID())
+			s.DebugLog("mailbox does not exist", "mailbox", mboxName)
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeNonExistent,
@@ -74,7 +75,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		return nil, s.internalError("failed to check read permission for mailbox '%s': %v", mboxName, err)
 	}
 	if !hasReadRight {
-		s.DebugLog("user does not have read permission on mailbox", "account_id", AccountID, "mailbox", mboxName)
+		s.DebugLog("user does not have read permission on mailbox", "mailbox", mboxName)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -103,8 +104,132 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		permanentFlags = getPermanentFlags(userRights)
 	}
 
-	currentSummary, err := s.server.rdb.GetMailboxSummaryWithRetry(readCtx, mailbox.ID)
-	if err != nil {
+	// Read the mailbox summary, first-unseen sequence number, defined flags, and QRESYNC
+	// VANISHED/FETCH state inside one REPEATABLE READ READ ONLY transaction so every part
+	// of the SELECT response describes the exact MVCC snapshot whose EXISTS, UIDNEXT, and
+	// HIGHESTMODSEQ come from GetMailboxSummary. Changes committed by other sessions after
+	// that snapshot (including in-place message_state overwrites and expunges of newly
+	// delivered messages) remain invisible here and are reported by the session's next poll
+	// from HighestModSeq.
+	var (
+		currentSummary    *db.MailboxSummary
+		firstUnseenSeqNum uint32
+		displayFlags      []imap.Flag
+		vanishedUIDs      []imap.UID
+		changedMsgs       []db.QResyncModifiedMessage
+	)
+	if err := s.server.rdb.InReadSnapshotWithRetry(readCtx, func(snapCtx context.Context) error {
+		currentSummary = nil
+		firstUnseenSeqNum = 0
+		displayFlags = nil
+		vanishedUIDs = nil
+		changedMsgs = nil
+
+		summary, err := s.server.rdb.GetMailboxSummaryWithRetry(snapCtx, mailbox.ID)
+		if err != nil {
+			return err
+		}
+		currentSummary = summary
+
+		// Extract the first unseen message sequence number lazily for SELECT only.
+		// We do not compute this in GetMailboxSummary to avoid O(N) counts in background STATUS checks.
+		if summary.UnseenCount > 0 {
+			nonFatalErr, fatalErr := s.server.rdb.OptionalReadInSnapshot(snapCtx, func(spCtx context.Context) error {
+				seq, seqErr := s.server.rdb.GetFirstUnseenSeqNumWithRetry(spCtx, mailbox.ID)
+				if seqErr != nil {
+					return seqErr
+				}
+				firstUnseenSeqNum = seq
+				return nil
+			})
+			if fatalErr != nil {
+				return fatalErr
+			}
+			if nonFatalErr != nil {
+				s.WarnLog("failed to dynamically compute first unseen sequence number", "mailbox_id", mailbox.ID, "err", nonFatalErr)
+			}
+		}
+
+		flags, fatalErr := getDisplayFlagsInSnapshot(snapCtx, s.server.rdb, mailbox, s.DebugLog)
+		if fatalErr != nil {
+			return fatalErr
+		}
+		displayFlags = flags
+
+		if options != nil && options.QResync != nil && options.QResync.UIDValidity == mailbox.UIDValidity {
+			qr := options.QResync
+			if len(qr.KnownUIDs) > 0 {
+				var activeUIDs []imap.UID
+				nonFatalErr, fatalErr := s.server.rdb.OptionalReadInSnapshot(snapCtx, func(spCtx context.Context) error {
+					var activeErr error
+					activeUIDs, activeErr = s.server.rdb.GetActiveUIDsInSetWithRetry(spCtx, mailbox.ID, qr.KnownUIDs)
+					return activeErr
+				})
+				if fatalErr != nil {
+					return fatalErr
+				}
+				if nonFatalErr != nil {
+					s.WarnLog("failed to get active UIDs for QRESYNC", "err", nonFatalErr)
+					fbErr, fbFatalErr := s.server.rdb.OptionalReadInSnapshot(snapCtx, func(spCtx context.Context) error {
+						var vErr error
+						vanishedUIDs, vErr = s.server.rdb.GetVanishedUIDsWithRetry(spCtx, mailbox.ID, qr.ModSeq, summary.HighestModSeq)
+						return vErr
+					})
+					if fbFatalErr != nil {
+						return fbFatalErr
+					}
+					if fbErr != nil {
+						s.WarnLog("failed to get vanished UIDs fallback for QRESYNC", "err", fbErr)
+					}
+				} else {
+					activeMap := make(map[imap.UID]struct{}, len(activeUIDs))
+					for _, uid := range activeUIDs {
+						activeMap[uid] = struct{}{}
+					}
+
+					uidNext := imap.UID(summary.UIDNext)
+					for _, r := range qr.KnownUIDs {
+						start := r.Start
+						stop := r.Stop
+						if uidNext > 0 && stop >= uidNext {
+							stop = uidNext - 1
+						}
+						for uid := start; uid <= stop; uid++ {
+							if _, ok := activeMap[uid]; !ok {
+								vanishedUIDs = append(vanishedUIDs, uid)
+							}
+						}
+					}
+				}
+			} else {
+				nonFatalErr, fatalErr := s.server.rdb.OptionalReadInSnapshot(snapCtx, func(spCtx context.Context) error {
+					var vErr error
+					vanishedUIDs, vErr = s.server.rdb.GetVanishedUIDsWithRetry(spCtx, mailbox.ID, qr.ModSeq, summary.HighestModSeq)
+					return vErr
+				})
+				if fatalErr != nil {
+					return fatalErr
+				}
+				if nonFatalErr != nil {
+					s.WarnLog("failed to get vanished UIDs for QRESYNC", "err", nonFatalErr)
+				}
+			}
+
+			nonFatalErr, fatalErr := s.server.rdb.OptionalReadInSnapshot(snapCtx, func(spCtx context.Context) error {
+				var cErr error
+				changedMsgs, cErr = s.server.rdb.GetMessagesChangedSinceWithRetry(spCtx, mailbox.ID, qr.ModSeq)
+				return cErr
+			})
+			if fatalErr != nil {
+				return fatalErr
+			}
+			if nonFatalErr != nil {
+				s.WarnLog("failed to get changed messages for QRESYNC", "err", nonFatalErr)
+			}
+		}
+
+		return nil
+	}); err != nil {
 		return nil, s.internalError("failed to get current summary for selected mailbox '%s': %v", mboxName, err)
 	}
 
@@ -218,18 +343,10 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 
 	s.currentNumMessages.Store(uint32(currentSummary.NumMessages))
 	s.currentHighestModSeq.Store(currentSummary.HighestModSeq)
+	s.reportedHighestModSeq.Store(currentSummary.HighestModSeq)
+	s.reportedModSeqGap.Store(false)
+	s.queuedFlagUpdates.Store(false)
 
-	// Extract the first unseen message sequence number lazily natively for SELECT explicitly.
-	// We do not compute this natively in GetMailboxSummary to prevent O(N) counts across all background STATUS checks.
-	var firstUnseenSeqNum uint32
-	if currentSummary.UnseenCount > 0 {
-		seq, seqErr := s.server.rdb.GetFirstUnseenSeqNumWithRetry(readCtx, mailbox.ID)
-		if seqErr == nil {
-			firstUnseenSeqNum = seq
-		} else {
-			s.WarnLog("failed to dynamically compute first unseen sequence number", "mailbox_id", mailbox.ID, "err", seqErr)
-		}
-	}
 	s.firstUnseenSeqNum.Store(firstUnseenSeqNum)
 	if firstUnseenSeqNum > 0 {
 		s.DebugLog("first unseen message dynamically bound", "seq", firstUnseenSeqNum)
@@ -253,7 +370,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 
 	selectData := &imap.SelectData{
 		// Flags defined for this mailbox (system flags, common keywords, and in-use custom flags)
-		Flags: getDisplayFlags(readCtx, s.server.rdb, mailbox, s.DebugLog),
+		Flags: displayFlags,
 		// Flags that can be changed: none after EXAMINE, else restricted to the
 		// user's flag rights (RFC 4314 §5.1.1)
 		PermanentFlags: permanentFlags,
@@ -289,62 +406,13 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 			return selectData, nil
 		}
 
-		// Get vanished UIDs since client's last modseq
-		var vanishedUIDs []imap.UID
-		if len(qr.KnownUIDs) > 0 {
-			// Compute vanished UIDs by comparing KnownUIDs with active UIDs in the database.
-			// This is 100% accurate, handles cleaner purges, and prevents sequence staleness bugs.
-			activeUIDs, err := s.server.rdb.GetActiveUIDsInSetWithRetry(readCtx, mailbox.ID, qr.KnownUIDs)
-			if err != nil {
-				s.WarnLog("failed to get active UIDs for QRESYNC", "err", err)
-				// Fallback to database vanished log history
-				vanishedUIDs, err = s.server.rdb.GetVanishedUIDsWithRetry(readCtx, mailbox.ID, qr.ModSeq, selectData.HighestModSeq)
-				if err != nil {
-					s.WarnLog("failed to get vanished UIDs fallback for QRESYNC", "err", err)
-				}
-			} else {
-				// Convert active UIDs slice to a set for O(1) checks
-				activeMap := make(map[imap.UID]struct{}, len(activeUIDs))
-				for _, uid := range activeUIDs {
-					activeMap[uid] = struct{}{}
-				}
-
-				// Find which of the client's known UIDs are no longer active
-				uidNext := selectData.UIDNext
-				for _, r := range qr.KnownUIDs {
-					start := r.Start
-					stop := r.Stop
-					if uidNext > 0 && stop >= uidNext {
-						stop = uidNext - 1
-					}
-					for uid := start; uid <= stop; uid++ {
-						if _, ok := activeMap[uid]; !ok {
-							vanishedUIDs = append(vanishedUIDs, uid)
-						}
-					}
-				}
-			}
-		} else {
-			// Fallback to database vanished log history when KnownUIDs is empty
-			var err error
-			vanishedUIDs, err = s.server.rdb.GetVanishedUIDsWithRetry(readCtx, mailbox.ID, qr.ModSeq, selectData.HighestModSeq)
-			if err != nil {
-				s.WarnLog("failed to get vanished UIDs for QRESYNC", "err", err)
-			}
-		}
-
 		if len(vanishedUIDs) > 0 {
 			// Convert UIDs to optimized ranges
 			selectData.Vanished = convertUIDsToRanges(vanishedUIDs)
 			s.DebugLog("QRESYNC VANISHED", "count", len(vanishedUIDs), "ranges", len(selectData.Vanished))
 		}
 
-		// Get messages that changed since client's last modseq
-		changedMsgs, err := s.server.rdb.GetMessagesChangedSinceWithRetry(readCtx, mailbox.ID, qr.ModSeq)
-		if err != nil {
-			s.WarnLog("failed to get changed messages for QRESYNC", "err", err)
-			// Don't fail the SELECT - just omit Modified responses
-		} else if len(changedMsgs) > 0 {
+		if len(changedMsgs) > 0 {
 			// Build Modified slice with sequence numbers
 			selectData.Modified = make([]imap.SelectModifiedData, 0, len(changedMsgs))
 

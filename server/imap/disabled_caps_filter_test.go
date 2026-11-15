@@ -61,6 +61,14 @@ type wireCapClient struct {
 
 func dialWireCapServer(t *testing.T, opts IMAPServerOptions) *wireCapClient {
 	t.Helper()
+	c := dialWireCapServerNotAuthenticated(t, opts)
+	c.mustOK("LOGIN user@example.com secret")
+	return c
+}
+
+// dialWireCapServerNotAuthenticated is dialWireCapServer without the LOGIN.
+func dialWireCapServerNotAuthenticated(t *testing.T, opts IMAPServerOptions) *wireCapClient {
+	t.Helper()
 	srv := newDisabledCapsTestServer(t, opts)
 	sessions := make(chan *IMAPSession, 1)
 	is := imapserver.New(&imapserver.Options{
@@ -104,9 +112,7 @@ func dialWireCapServer(t *testing.T, opts IMAPServerOptions) *wireCapClient {
 		t.Fatal("timed out waiting for session")
 	}
 
-	c := &wireCapClient{t: t, conn: conn, br: br, sess: imapSess}
-	c.mustOK("LOGIN user@example.com secret")
-	return c
+	return &wireCapClient{t: t, conn: conn, br: br, sess: imapSess}
 }
 
 func (c *wireCapClient) sendCmd(cmd string) (resp, tagged string, err error) {
@@ -193,8 +199,11 @@ func TestClientFilter_AfterEnableDoesNotCascadeFromKeptCapabilities(t *testing.T
 		}
 
 		c.mustOK("SELECT INBOX")
-		if resp := c.mustOK("SORT RETURN (MIN) (DATE) UTF-8 1"); !strings.Contains(resp, "* ESEARCH ") {
-			t.Errorf("SORT RETURN (MIN) after ENABLE IMAP4rev2 and ESEARCH filter: want ESEARCH, got:\n%s", resp)
+		// This backend has no database or selected-mailbox state. Reaching that
+		// backend may return NO; the capability gate must not refuse ESORT with
+		// BAD. Real SORT result data is covered by the database wire tests.
+		if resp, tagged, err := c.sendCmd("SORT RETURN (MIN) (DATE) UTF-8 1"); err != nil || strings.Contains(tagged, " BAD ") {
+			t.Errorf("SORT RETURN (MIN) after ENABLE IMAP4rev2 and ESEARCH filter: want acceptance by capability gate, got %v:\n%s", err, resp)
 		}
 		// Probe the handler's capability gate on an independent session. The wire
 		// session is owned by its connection goroutine and may close after SORT;
@@ -355,6 +364,7 @@ func TestDisabledCaps_RefusesRemovingBothIMAPVersions(t *testing.T) {
 		{"IMAP4rev1", "ESEARCH"},
 		{"IMAP4rev1", "SEARCHRES"},
 		{"IMAP4rev1", "CHILDREN"},
+		{"imap4rev1", "move"}, // capability names are case-insensitive (#1114)
 	} {
 		if _, err := newServer(invalid); err == nil {
 			t.Errorf("disabled_caps = %v: expected error when neither IMAP4rev1 nor IMAP4rev2 remains", invalid)

@@ -34,6 +34,11 @@ import (
 // carries the specific cause for logging.
 var errBodyTransientlyUnavailable = errors.New("message body temporarily unavailable")
 
+// errBodyOverMemoryBudget marks a message body the session memory budget
+// (session_memory_limit) cannot hold. The FETCH is answered as for a section
+// copy the budget refuses (sectionMemoryUnavailable), not with an empty body.
+var errBodyOverMemoryBudget = errors.New("message body exceeds the session memory budget")
+
 // bodyFetchRetry* tune the bounded retry of the S3 read on the not-yet-uploaded path.
 // They absorb the read-before-write race where the background S3 PUT lands shortly after
 // the FETCH (e.g. a cross-node delivery still uploading). The wait is only ever spent
@@ -147,6 +152,18 @@ func (s *IMAPSession) requireFetchBinary(options *imap.FetchOptions) error {
 }
 
 func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
+	return s.fetch(ctx, w, numSet, options, nil)
+}
+
+// fetchProgress is how far a fetch got through its messages, which it answers
+// in ascending UID order.
+type fetchProgress struct {
+	answered imap.UID // the last message it wrote a response for
+	failed   imap.UID // the message it failed at, 0 if it did not fail at one
+}
+
+// fetch is Fetch, recording in progress, when it is not nil, how far it got.
+func (s *IMAPSession) fetch(ctx context.Context, w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions, progress *fetchProgress) error {
 	ctx = s.pinnedContext(ctx)
 
 	// FETCH is not wrapped by meteredSession (it self-instruments below), so the
@@ -168,11 +185,19 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 		return err
 	}
 
+	// The client's numbering holds still until the last response (seqViewMu).
+	s.seqViewMu.RLock()
+	defer s.seqViewMu.RUnlock()
+	endFetch := s.beginFetch()
+	defer endFetch()
+	// A Seen update may have pinned reads to the primary while beginFetch waited.
+	ctx = s.pinnedContext(ctx)
+
 	// First, safely read necessary session state and decode the sequence numbers all within a single read lock
 	var selectedMailboxID int64
 	var selectedMailboxOwnerID int64
 	var selectedExamined bool
-	var sessionTrackerSnapshot *imapserver.SessionTracker
+	var view seqView
 	var decodedNumSet imap.NumSet
 
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
@@ -202,19 +227,18 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 	selectedMailboxID = s.selectedMailbox.ID
 	selectedMailboxOwnerID = s.selectedMailbox.AccountID
 	selectedExamined = s.selectedExamined.Load()
-	sessionTrackerSnapshot = s.sessionTracker
-
-	// Capture modseq before unlocking
-	modSeqSnapshot := s.currentHighestModSeq.Load()
-
-	// Use our helper method that assumes the mutex is held (read lock is sufficient here)
-	decodedNumSet = s.decodeNumSetLocked(numSet)
+	view = s.seqViewLocked()
+	decodedNumSet = s.decodeNumSetLocked(view, numSet)
 	release()
 
-	// QRESYNC: Handle VANISHED modifier (RFC 7162 §3.2.4)
-	// VANISHED returns UIDs of expunged messages since ChangedSince modseq
-	// Only valid with QRESYNC enabled and ChangedSince parameter
-	if s.GetCapabilities().Has(imap.CapQResync) && options.Vanished && options.ChangedSince > 0 {
+	// QRESYNC: Handle VANISHED modifier (RFC 7162 §3.2.6)
+	// VANISHED returns UIDs of expunged messages since ChangedSince modseq.
+	// It needs CHANGEDSINCE and a client that issued ENABLE QRESYNC on this
+	// connection; QRESYNC being advertised is not enough: "A server MUST
+	// respond with a tagged BAD response if the VANISHED UID FETCH modifier is
+	// specified and the client hasn't issued "ENABLE QRESYNC" in the current
+	// connection" (RFC 7162 §3.2.6).
+	if options.Vanished && options.ChangedSince > 0 && s.conn != nil && s.conn.EnabledCaps().Has(imap.CapQResync) {
 		s.DebugLog("FETCH with VANISHED modifier", "changed_since", options.ChangedSince)
 
 		vanishedUIDs, err := s.server.rdb.GetVanishedUIDsForFetchWithRetry(ctx, selectedMailboxID, options.ChangedSince)
@@ -246,25 +270,17 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			}
 		}
 	} else if options.Vanished {
-		// VANISHED modifier used without QRESYNC or ChangedSince - protocol violation
+		// VANISHED modifier used without ENABLE QRESYNC or ChangedSince - protocol violation
 		imapErr := &imap.Error{
 			Type: imap.StatusResponseTypeBad,
-			Text: "VANISHED requires QRESYNC and CHANGEDSINCE",
+			Code: imap.ResponseCodeClientBug,
+			Text: "VANISHED requires ENABLE QRESYNC and CHANGEDSINCE",
 		}
 		recordMetrics(imapErr)
 		return imapErr
 	}
 
 	needsBodyStructure := options.BodyStructure != nil
-
-	// Check if mailbox changed IMMEDIATELY after acquiring the read lock.
-	if modSeqSnapshot > 0 && s.currentHighestModSeq.Load() > modSeqSnapshot {
-		s.WarnLog("mailbox changed during FETCH operation startup", "old_modseq", modSeqSnapshot, "new_modseq", s.currentHighestModSeq.Load())
-		if _, isSeqSet := numSet.(imap.SeqSet); isSeqSet {
-			// Re-decode to ensure consistency before we lock-in the streaming pipeline
-			decodedNumSet = s.decodeNumSet(numSet)
-		}
-	}
 
 	// Determine if this FETCH implicitly marks messages as \Seen: any BODY[] or
 	// BINARY[] that is not the .PEEK form (RFC 9051 §6.4.5). Not in a mailbox
@@ -291,7 +307,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 		}
 	}
 
-	if sessionTrackerSnapshot == nil {
+	if view.tracker == nil {
 		s.DebugLog("session tracker is nil, cannot process messages")
 		return nil
 	}
@@ -316,6 +332,16 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			writeErr = err
 			return err
 		}
+		// Number the messages as the client does. A message it has not been told
+		// about (a UID FETCH may name one) has no number it could be sent under,
+		// and is neither returned nor marked \Seen.
+		known := make([]db.Message, 0, len(messages))
+		for _, msg := range messages {
+			if msg.Seq = view.encode(msg.Seq); msg.Seq != 0 {
+				known = append(known, msg)
+			}
+		}
+		messages = known
 		// The parser accepted CHANGEDSINCE only if the session offers
 		// CONDSTORE, so the request alone gates it here.
 		if options.ChangedSince > 0 {
@@ -349,20 +375,6 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			return nil
 		}
 
-		var seenChanged map[imap.UID]bool
-		if markSeen {
-			uidsToMarkSeen := unseenMessageUIDs(messages)
-			if len(uidsToMarkSeen) > 0 {
-				batchResults, err := s.server.rdb.AddMessageFlagsBatchWithRetry(ctx, uidsToMarkSeen, selectedMailboxID, []imap.Flag{imap.FlagSeen})
-				if err != nil {
-					s.DebugLog("failed to batch mark messages as seen", "error", err)
-				} else {
-					s.useMasterDB.Store(true)
-					seenChanged = applyImplicitSeenUpdates(messages, batchResults)
-				}
-			}
-		}
-
 		for _, msg := range messages {
 			if err := ctx.Err(); err != nil {
 				writeErr = err
@@ -373,16 +385,21 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			if s.IMAPUser != nil {
 				metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
 			}
-			msgOptions := s.fetchOptionsForImplicitSeen(options, seenChanged[msg.UID])
-			if err := s.writeMessageFetchData(ctx, w, &msg, msgOptions, selectedMailboxID, preview); err != nil {
+			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID, markSeen, view.tracker, preview); err != nil {
+				if progress != nil {
+					progress.failed = msg.UID
+				}
 				writeErr = err
 				return err
+			}
+			if progress != nil {
+				progress.answered = msg.UID
 			}
 		}
 		return nil
 	}
 
-	err := s.server.rdb.StreamMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet, cb, needsBodyStructure)
+	err := s.server.rdb.StreamMessagesByNumSetWithRetry(view.context(ctx), selectedMailboxID, decodedNumSet, cb, needsBodyStructure)
 	if writeErr != nil {
 		// Bypass explicit metric tracking for socket disconnections, identically to pre-streaming behavior
 		return writeErr
@@ -402,31 +419,12 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 }
 
 // writeMessageFetchData handles writing all FETCH data items for a single message.
-// preview is the command's PREVIEW state, nil unless PREVIEW was requested.
-func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, preview *previewRun) (retErr error) {
+// markSeen is whether the FETCH implicitly sets \Seen; preview is the command's
+// PREVIEW state, nil unless PREVIEW was requested.
+func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, markSeen bool, tracker *imapserver.SessionTracker, preview *previewRun) (retErr error) {
 	s.DebugLog("fetching message", "uid", msg.UID, "seq", msg.Seq)
 
-	// ARCHITECTURE DECISION: Use database sequence numbers directly, not sessionTracker.EncodeSeqNum().
-	//
-	// Sequence numbers are computed dynamically via ROW_NUMBER() OVER (ORDER BY uid) at query time,
-	// ensuring they always reflect the canonical mailbox state without relying on cached tables.
-	//
-	// Why NOT EncodeSeqNum:
-	//   1. EncodeSeqNum is designed for in-memory servers that track deltas from a snapshot.
-	//      Our server uses PostgreSQL as the authority — applying EncodeSeqNum on top of
-	//      dynamically-computed sequences causes off-by-one errors.
-	//   2. The go-imap MailboxTracker/SessionTracker pair translates from an initial snapshot
-	//      through in-flight expunges.  Our database queries already compute correct positions,
-	//      making the tracker layer redundant for sequence number translation.
-	//
-	// Trade-off: if a concurrent EXPUNGE changes sequence positions between the DB query and the
-	// response write, the seqnums in THIS response may not match the client's pre-expunge
-	// view.  The Poll mechanism detects desyncs and forces a reconnection (BYE) in extreme
-	// cases.  In practice this race is rare because expunge notifications are delivered to
-	// clients before subsequent FETCH responses via the go-imap write goroutine's poll cycle.
-	//
-	// This design is validated by TestIMAP_SequenceNumberConsistency_* in
-	// integration_tests/imap/sequence_number_consistency_test.go.
+	// msg.Seq is the client's sequence number (Fetch translated it, see seqView).
 	seqNum := msg.Seq
 
 	if seqNum == 0 {
@@ -434,8 +432,6 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 		s.DebugLog("skipping message with invalid sequence number", "uid", msg.UID, "seq", msg.Seq)
 		return nil
 	}
-
-	// Removed individual markSeen logic here because it is now batched before iteration.
 
 	// Declare bodyData and a flag to track if it has been fetched.
 	// These will be passed by pointer to handlers so they can lazily load it once if needed.
@@ -463,6 +459,36 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 		}
 		defer s.freeSectionCopies(binary.charged)
 	}
+	// BODY sections are extracted before the response too, for the same
+	// reason: a body that cannot be read right now, or a body or section the
+	// session memory budget cannot hold, fails the command with
+	// NO [UNAVAILABLE].
+	var sections *bodySections
+	if len(options.BodySection) > 0 {
+		var err error
+		if sections, err = s.extractBodySections(ctx, &bodyData, &bodyDataFetched, options, msg); err != nil {
+			return err
+		}
+		defer s.freeSectionCopies(sections.charged)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Loading, decoding and extracting are what usually fails the command at
+	// this message, so its implicit \Seen (RFC 9051 §6.4.5) is set only now, one
+	// message at a time rather than for the whole stream chunk up front: a
+	// FETCH that fails there leaves that message, and the ones after it whose
+	// bodies it never sent, as they were. A failure once the response is open
+	// (an ENVELOPE that cannot be built from the stored recipients, a write
+	// error) still leaves this one message \Seen, and its update to Poll.
+	var seenAnswer *implicitSeenAnswer
+	if markSeen {
+		options, seenAnswer = s.setImplicitSeen(ctx, msg, options, selectedMailboxID, tracker)
+		if seenAnswer != nil {
+			defer seenAnswer.release()
+		}
+	}
 
 	m := w.CreateMessage(seqNum)
 	if m == nil {
@@ -478,6 +504,11 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 			if retErr == nil {
 				retErr = closeErr
 			}
+		}
+		// Suppress only the update this successfully completed response carried.
+		// A failed or partial response leaves it for Poll to announce.
+		if retErr == nil && seenAnswer != nil {
+			seenAnswer.answered(msg.UID, uint64(*msg.UpdatedModSeq))
 		}
 	}()
 
@@ -523,8 +554,8 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 		}
 	}
 
-	if len(options.BodySection) > 0 {
-		if err := s.handleBodySections(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
+	if sections != nil {
+		if err := writeBodySections(m, options, sections); err != nil {
 			return err
 		}
 	}
@@ -659,77 +690,156 @@ type decodedBinary struct {
 	charged  int64 // session memory charged for sections
 }
 
-// decodeBinary decodes the BINARY sections and BINARY.SIZE values a FETCH asks
-// for. A section whose Content-Transfer-Encoding cannot be decoded fails with
-// NO [UNKNOWN-CTE]: RFC 9051 §7.5.2, for both items, "If the server does not
-// know how to decode the section's Content-Transfer-Encoding, it MUST fail
-// the request and issue a "NO" response that contains the "UNKNOWN-CTE"
-// response code."
-func (s *IMAPSession) decodeBinary(ctx context.Context, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) (*decodedBinary, error) {
-	if err := s.ensureBodyDataLoaded(ctx, msg, bodyData, bodyDataFetched); err != nil {
-		// Transient: body staged for upload but not yet retrievable from this node.
-		// Ask the client to retry instead of returning an empty section.
-		if errors.Is(err, errBodyTransientlyUnavailable) {
-			return nil, s.transientBodyUnavailable(msg.UID, err)
+// binaryPart is a part a FETCH names in BINARY or BINARY.SIZE items, with the
+// indexes of those items in the FETCH options.
+type binaryPart struct {
+	part     []int
+	sections []int // into BinarySection
+	sizes    []int // into BinarySectionSize
+}
+
+// binaryParts groups the BINARY and BINARY.SIZE items of a FETCH by the part
+// they name, in the order the parts are first named.
+func binaryParts(options *imap.FetchOptions) []*binaryPart {
+	var parts []*binaryPart
+	byPart := make(map[string]*binaryPart)
+	named := func(part []int) *binaryPart {
+		key := fmt.Sprint(part)
+		p := byPart[key]
+		if p == nil {
+			p = &binaryPart{part: part}
+			byPart[key] = p
+			parts = append(parts, p)
 		}
-		// Graceful degradation: return empty binary sections and zero sizes instead
-		// of failing the entire multi-message FETCH. This prevents one broken message
-		// (missing S3 content, etc.) from making the whole mailbox listing fail for
-		// webmail clients.
-		s.WarnLog("failed to load message body, returning empty binary sections", "uid", msg.UID, "error", err)
+		return p
+	}
+	for i, section := range options.BinarySection {
+		p := named(section.Part)
+		p.sections = append(p.sections, i)
+	}
+	for i, section := range options.BinarySectionSize {
+		p := named(section.Part)
+		p.sizes = append(p.sizes, i)
+	}
+	return parts
+}
+
+// decodeBinary decodes the BINARY sections and BINARY.SIZE values a FETCH asks
+// for. Each part is decoded once, however many items name it: one command line
+// has room for thousands of items like BINARY.PEEK[2]<0.1>, and a decode is
+// work in the size of the whole part. A section whose Content-Transfer-Encoding
+// cannot be decoded fails with NO [UNKNOWN-CTE]: RFC 9051 §7.5.2, for both
+// items, "If the server does not know how to decode the section's
+// Content-Transfer-Encoding, it MUST fail the request and issue a "NO" response
+// that contains the "UNKNOWN-CTE" response code."
+func (s *IMAPSession) decodeBinary(ctx context.Context, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) (*decodedBinary, error) {
+	// The body is loaded only for a part the session has not retained. A body
+	// loadSectionBody leaves nil gives empty sections and zero sizes.
+	loadBody := func() ([]byte, error) {
+		if err := s.loadSectionBody(ctx, msg, bodyData, bodyDataFetched); err != nil {
+			return nil, err
+		}
+		return *bodyData, nil
 	}
 
 	b := &decodedBinary{
 		sections: make([][]byte, len(options.BinarySection)),
 		sizes:    make([]uint32, len(options.BinarySectionSize)),
 	}
-	if *bodyData == nil {
-		return b, nil
-	}
-	for i, section := range options.BinarySection {
-		buf, err := safeDecodeBinarySection(*bodyData, section)
-		if err != nil {
+	for _, p := range binaryParts(options) {
+		if err := s.decodeBinaryPart(b, p, options, msg, loadBody); err != nil {
 			s.freeSectionCopies(b.charged)
-			return nil, s.unknownCTE(msg.UID)
+			return nil, err
 		}
-		if section.Partial != nil {
-			// A <partial> is a slice of the whole decoded section. Keep only the
-			// slice, which is what is charged: the sections are held until the
-			// response is written, and one command line can name the same part
-			// thousands of times.
-			buf = bytes.Clone(buf)
-		}
-		charged, ok := s.chargeSectionCopy(len(buf))
-		if !ok {
-			s.freeSectionCopies(b.charged)
-			return nil, s.sectionMemoryUnavailable(msg.UID, len(buf))
-		}
-		b.charged += charged
-		b.sections[i] = buf
-	}
-	for i, section := range options.BinarySectionSize {
-		n, err := safeDecodeBinarySectionSize(*bodyData, section)
-		if err != nil {
-			s.freeSectionCopies(b.charged)
-			return nil, s.unknownCTE(msg.UID)
-		}
-		b.sizes[i] = n
 	}
 	return b, nil
 }
 
+// decodeBinaryPart fills in b the items that name p, from the one decoded
+// section of p. A part named only with a <partial> is being fetched in chunks:
+// its decoded section is retained for the session's next chunk of it, as a BODY
+// section is (body_section_cache.go), and answered from there while it is.
+func (s *IMAPSession) decodeBinaryPart(b *decodedBinary, p *binaryPart, options *imap.FetchOptions, msg *db.Message, loadBody func() ([]byte, error)) error {
+	key := binarySectionCacheKey(msg.ContentHash, p.part)
+	section := s.cachedBodySection(key) // charged to the retention while it is retained
+	retained := section != nil
+	if !retained {
+		body, err := loadBody()
+		if err != nil || body == nil {
+			return err // no body: empty sections and zero sizes
+		}
+		if len(p.sections) == 0 {
+			// BINARY.SIZE alone: count the decoded octets without holding them.
+			n, err := safeDecodeBinarySectionSize(body, &imap.FetchItemBinarySectionSize{Part: p.part})
+			if err != nil {
+				return s.unknownCTE(msg.UID)
+			}
+			for _, i := range p.sizes {
+				b.sizes[i] = n
+			}
+			return nil
+		}
+		if section, err = safeDecodeBinarySection(body, &imap.FetchItemBinarySection{Part: p.part}); err != nil {
+			return s.unknownCTE(msg.UID)
+		}
+	}
+	for _, i := range p.sizes {
+		b.sizes[i] = uint32(len(section))
+	}
+
+	chunked := !slices.ContainsFunc(p.sections, func(i int) bool { return options.BinarySection[i].Partial == nil })
+	if !chunked {
+		// The whole section is sent, so the items are slices of it, held and
+		// charged once until the response is written. A retained section needs
+		// one independent copy: charging it may reclaim the cache's charge.
+		if retained {
+			section = bytes.Clone(section)
+		}
+		charged, ok := s.chargeSectionCopy(len(section))
+		if !ok {
+			return s.sectionMemoryUnavailable(msg.UID, len(section))
+		}
+		for _, i := range p.sections {
+			b.sections[i] = applyPartial(section, options.BinarySection[i].Partial)
+		}
+		b.charged += charged
+		return nil
+	}
+
+	// The items keep copies of their slices, which is what they charge: they are
+	// held until the response is written, while the section goes to the
+	// optional retention, which may give it up before then. The transient decoded
+	// section does not need a persistent charge when the session cannot retain it.
+	for _, i := range p.sections {
+		buf := bytes.Clone(applyPartial(section, options.BinarySection[i].Partial))
+		n, ok := s.chargeSectionCopy(len(buf))
+		if !ok {
+			return s.sectionMemoryUnavailable(msg.UID, len(buf))
+		}
+		b.charged += n
+		b.sections[i] = buf
+	}
+	// Retention is optional. A partial that fits the remaining budget must
+	// still work when keeping the full section does not, or is not eligible.
+	if !retained && key != "" && len(section) > 0 && len(section) <= maxCachedBodySectionBytes {
+		if charged, ok := s.chargeSectionCopy(len(section)); ok {
+			if !s.retainBodySection(key, section) {
+				s.freeSectionCopies(charged)
+			}
+		}
+	}
+	return nil
+}
+
 // writeDecodedBinary writes the BINARY sections and BINARY.SIZE values
-// decodeBinary returned.
+// decodeBinary returned. A section goes as a literal8 only when it contains a
+// NUL octet: RFC 9051 §7.5.2, "If the domain of the decoded data is "8bit"
+// and the data does not contain the NUL octet, the server SHOULD return the
+// data in a <string> instead of a <literal8>".
 func writeDecodedBinary(w *imapserver.FetchResponseWriter, options *imap.FetchOptions, b *decodedBinary) error {
 	for i, section := range options.BinarySection {
-		wc := w.WriteBinarySection(section, int64(len(b.sections[i])))
-		_, writeErr := wc.Write(b.sections[i])
-		closeErr := wc.Close()
-		if writeErr != nil {
-			return writeErr
-		}
-		if closeErr != nil {
-			return closeErr
+		if err := w.WriteBinarySectionBytes(section, b.sections[i]); err != nil {
+			return err
 		}
 	}
 	for i, section := range options.BinarySectionSize {
@@ -738,71 +848,121 @@ func writeDecodedBinary(w *imapserver.FetchResponseWriter, options *imap.FetchOp
 	return nil
 }
 
-// bodySectionWriter is the part of *imapserver.FetchResponseWriter that the body
-// section handler uses.
+// bodySectionWriter is the part of *imapserver.FetchResponseWriter that
+// writeBodySections uses.
 type bodySectionWriter interface {
 	WriteBodySection(section *imap.FetchItemBodySection, size int64) io.WriteCloser
 }
 
-func (s *IMAPSession) handleBodySections(ctx context.Context, w bodySectionWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
-	for _, section := range options.BodySection {
-		// Sequential <offset.size> chunking of one section: answer from the section this
-		// session already extracted instead of reloading and re-extracting the message
-		// for every chunk.
-		var cacheKey string
-		if section.Partial != nil {
-			cacheKey = bodySectionCacheKey(msg.ContentHash, section)
-			if retained := s.cachedBodySection(cacheKey); retained != nil {
-				if err := writeBodySectionData(w, section, applyPartial(retained, section.Partial)); err != nil {
-					return err
-				}
-				continue
-			}
-		}
+// bodySections is a message's BODY sections, in the order of the FETCH
+// options' BodySection.
+type bodySections struct {
+	contents [][]byte
+	charged  int64 // session memory charged for contents
+}
 
-		if loadErr := s.ensureBodyDataLoaded(ctx, msg, bodyData, bodyDataFetched); loadErr != nil {
-			// Transient: the body is staged for upload but not yet retrievable from
-			// this node (read-before-upload race, or cross-node staging). Fail the
-			// FETCH with NO [UNAVAILABLE] so the client retries instead of receiving
-			// (and possibly acting on) an empty body. See errBodyTransientlyUnavailable.
-			if errors.Is(loadErr, errBodyTransientlyUnavailable) {
-				return s.transientBodyUnavailable(msg.UID, loadErr)
-			}
-			// Graceful degradation: return empty body sections instead of failing
-			// the entire multi-message FETCH. This prevents one broken message
-			// (missing S3 content, 0-byte message, etc.) from making the whole
-			// mailbox listing fail for webmail clients like Roundcube/SOGo.
-			s.WarnLog("failed to load message body, returning empty body section", "uid", msg.UID, "error", loadErr)
-		}
-
-		var sectionContent []byte
-		var charged int64
-		if *bodyData != nil { // Only extract if bodyData was successfully loaded
-			// Extract section. If MIME parsing fails/panics, safeExtractBodySection handles it gracefully.
-			// We return whatever the extractor gives us - email servers should be transparent conduits.
-			// The whole section is extracted even for a chunk request, so the chunks that
-			// follow can be served from it.
-			full, copied := safeExtractBodySection(*bodyData, sectionWithoutPartial(section))
-			if copied {
-				var ok bool
-				if charged, ok = s.chargeSectionCopy(len(full)); !ok {
-					return s.sectionMemoryUnavailable(msg.UID, len(full))
-				}
-			}
-			sectionContent = applyPartial(full, section.Partial)
-			if copied && section.Partial != nil && s.retainBodySection(cacheKey, full) {
-				charged = 0 // the retained section carries the charge now
-			}
-		} else {
-			s.DebugLog("body data is nil, returning empty", "uid", msg.UID)
-			// sectionContent remains nil, will be set to []byte{} below
-		}
-
-		err := writeBodySectionData(w, section, sectionContent)
-		if charged > 0 {
-			s.memTracker.Free(charged)
-		}
+// extractBodySections extracts the BODY sections a FETCH asks for before the
+// message's response is opened and its implicit \Seen set, as decodeBinary
+// decodes BINARY sections: a body that cannot be read right now, or a body or
+// a section copy the session memory budget cannot hold, then fails the
+// command at this message with nothing written and nothing set. The body is
+// loaded unless the section this session retained answers every chunk asked
+// for. The sections are held, and charged, until the response is written.
+func (s *IMAPSession) extractBodySections(ctx context.Context, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) (*bodySections, error) {
+	b := &bodySections{contents: make([][]byte, len(options.BodySection))}
+	for i, section := range options.BodySection {
+		content, charged, err := s.extractBodySection(ctx, bodyData, bodyDataFetched, section, msg)
 		if err != nil {
+			s.freeSectionCopies(b.charged)
+			return nil, err
+		}
+		b.contents[i] = content
+		b.charged += charged
+	}
+	return b, nil
+}
+
+// extractBodySection returns one BODY section and what it charged to the
+// session budget for it. For a chunk request the whole section is extracted
+// and retained, so that the chunks which follow are answered from it instead
+// of reloading and re-extracting the message for every chunk. A chunk of the
+// retained section is held as a copy of its own, which is what it charges:
+// the retention may give the section up before the response is written.
+func (s *IMAPSession) extractBodySection(ctx context.Context, bodyData *[]byte, bodyDataFetched *bool, section *imap.FetchItemBodySection, msg *db.Message) ([]byte, int64, error) {
+	var cacheKey string
+	if section.Partial != nil {
+		cacheKey = bodySectionCacheKey(msg.ContentHash, section)
+		if retained := s.cachedBodySection(cacheKey); retained != nil {
+			return s.retainedSectionChunk(msg.UID, applyPartial(retained, section.Partial))
+		}
+	}
+
+	if err := s.loadSectionBody(ctx, msg, bodyData, bodyDataFetched); err != nil {
+		return nil, 0, err
+	}
+	if *bodyData == nil {
+		return nil, 0, nil // no body: an empty section
+	}
+	// If MIME parsing fails or panics, safeExtractBodySection returns what it
+	// can: the server hands back what it stored and lets the client parse it.
+	full, copied := safeExtractBodySection(*bodyData, sectionWithoutPartial(section))
+	if !copied {
+		return applyPartial(full, section.Partial), 0, nil // the body itself, charged as such
+	}
+	charged, ok := s.chargeSectionCopy(len(full))
+	if !ok {
+		return nil, 0, s.sectionMemoryUnavailable(msg.UID, len(full))
+	}
+	if section.Partial == nil || !s.retainBodySection(cacheKey, full) {
+		return applyPartial(full, section.Partial), charged, nil
+	}
+	// The retained section carries the charge now.
+	return s.retainedSectionChunk(msg.UID, applyPartial(full, section.Partial))
+}
+
+// retainedSectionChunk returns a copy of a chunk of the retained section,
+// charged to the session budget.
+func (s *IMAPSession) retainedSectionChunk(uid imap.UID, chunk []byte) ([]byte, int64, error) {
+	chunk = bytes.Clone(chunk)
+	charged, ok := s.chargeSectionCopy(len(chunk))
+	if !ok {
+		return nil, 0, s.sectionMemoryUnavailable(uid, len(chunk))
+	}
+	return chunk, charged, nil
+}
+
+// loadSectionBody loads the body BODY and BINARY sections are taken from. A
+// body that cannot be read right now, or that the session memory budget
+// cannot hold, fails the FETCH; any other failure leaves it nil, for empty
+// sections.
+func (s *IMAPSession) loadSectionBody(ctx context.Context, msg *db.Message, bodyData *[]byte, bodyDataFetched *bool) error {
+	if loadErr := s.ensureBodyDataLoaded(ctx, msg, bodyData, bodyDataFetched); loadErr != nil {
+		// Transient: the body is staged for upload but not yet retrievable from
+		// this node (read-before-upload race, or cross-node staging). Fail the
+		// FETCH with NO [UNAVAILABLE] so the client retries instead of receiving
+		// (and possibly acting on) an empty body. See errBodyTransientlyUnavailable.
+		if errors.Is(loadErr, errBodyTransientlyUnavailable) {
+			return s.transientBodyUnavailable(msg.UID, loadErr)
+		}
+		// The body exists but the session budget cannot hold it: refused like a
+		// section copy the budget cannot hold, as an empty section would pass
+		// for the message.
+		if errors.Is(loadErr, errBodyOverMemoryBudget) {
+			return s.sectionMemoryUnavailable(msg.UID, msg.Size)
+		}
+		// Graceful degradation: return empty sections instead of failing the
+		// entire multi-message FETCH. This prevents one broken message (missing
+		// S3 content, 0-byte message, etc.) from making the whole mailbox
+		// listing fail for webmail clients like Roundcube/SOGo.
+		s.WarnLog("failed to load message body, returning empty sections", "uid", msg.UID, "error", loadErr)
+	}
+	return nil
+}
+
+// writeBodySections writes the BODY sections extractBodySections returned.
+func writeBodySections(w bodySectionWriter, options *imap.FetchOptions, b *bodySections) error {
+	for i, section := range options.BodySection {
+		if err := writeBodySectionData(w, section, b.contents[i]); err != nil {
 			return err
 		}
 	}
@@ -838,12 +998,12 @@ func (s *IMAPSession) chargeSectionCopy(n int) (int64, bool) {
 	return int64(n), true
 }
 
-// sectionMemoryUnavailable answers a section the session budget cannot hold with
-// NO [UNAVAILABLE] rather than an empty literal: an empty body section is
+// sectionMemoryUnavailable answers a body or section the session budget cannot hold
+// with NO [UNAVAILABLE] rather than an empty literal: an empty body section is
 // indistinguishable from a genuinely empty message to the client, which may act on it
 // destructively (see errBodyTransientlyUnavailable).
 func (s *IMAPSession) sectionMemoryUnavailable(uid imap.UID, n int) *imap.Error {
-	s.WarnLog("session memory limit exceeded serving a message section", "uid", uid, "bytes", n,
+	s.WarnLog("session memory limit exceeded serving a message", "uid", uid, "bytes", n,
 		"limit", s.memTracker.MaxAllowed())
 	metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
 	imapErr := &imap.Error{
@@ -895,9 +1055,9 @@ func (s *IMAPSession) getMessageBody(ctx context.Context, msg *db.Message) ([]by
 	// into memory. The post-read Allocate() below can only detect the overrun once the
 	// body is already resident — too late to prevent the OOM. msg.Size is the stored
 	// metadata size, so this bounds the single allocation. (security-audit M13)
+	// Both refusals are errBodyOverMemoryBudget.
 	if msg.Size > 0 && !s.memoryAvailable(int64(msg.Size)) {
-		metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
-		return nil, fmt.Errorf("session memory limit exceeded: message size %d bytes exceeds available budget", msg.Size)
+		return nil, fmt.Errorf("%w: message size %d bytes exceeds available budget", errBodyOverMemoryBudget, msg.Size)
 	}
 
 	data, err := s.loadMessageBody(ctx, msg)
@@ -906,10 +1066,14 @@ func (s *IMAPSession) getMessageBody(ctx context.Context, msg *db.Message) ([]by
 	}
 
 	// Single accounting point for every source in loadMessageBody (cache, S3, disk).
+	// A body without a recorded size is checked only here, so memoryAvailable gives
+	// the retained section back first, as it does before the read for a sized body.
 	if s.memTracker != nil {
+		if !s.memoryAvailable(int64(len(data))) {
+			return nil, fmt.Errorf("%w: message body %d bytes exceeds available budget", errBodyOverMemoryBudget, len(data))
+		}
 		if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-			metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
-			return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
+			return nil, fmt.Errorf("%w: %v", errBodyOverMemoryBudget, allocErr)
 		}
 	}
 	return data, nil
@@ -983,7 +1147,7 @@ func (s *IMAPSession) loadMessageBody(ctx context.Context, msg *db.Message) ([]b
 			// Permanent. A NoSuchKey on an uploaded message is genuine content loss worth
 			// alerting on — logged only here, where the message is marked uploaded (a 404
 			// during the not-yet-uploaded race is expected and not logged). Either way it
-			// degrades to an empty body for the caller (see handleBodySections).
+			// degrades to an empty body for the caller (see loadSectionBody).
 			if resilient.IsNotFoundError(err) {
 				s.WarnLog("message marked uploaded but missing from S3 (NoSuchKey)", "uid", msg.UID, "content_hash", msg.ContentHash, "s3_domain", msg.S3Domain, "s3_localpart", msg.S3Localpart)
 			}

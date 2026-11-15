@@ -29,7 +29,7 @@ var imapLoginCommands = []struct {
 // TestIMAPLoginWithUnverifiableStoredHash: a stored hash sora cannot check says
 // nothing about the submitted password, and only an administrator can repair it. The
 // backend answers NO [UNAVAILABLE] (RFC 5530 section 3), as the proxies do, logs the
-// reason unverifiable_hash in the line that names the address, and does not count the
+// reason unverifiable_hash in the session's line naming the address, and does not count the
 // login in the auth rate limiter: the user logs in as soon as the hash is repaired.
 func TestIMAPLoginWithUnverifiableStoredHash(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
@@ -54,7 +54,7 @@ func TestIMAPLoginWithUnverifiableStoredHash(t *testing.T) {
 			t.Errorf("%s after the hash was repaired: %q, want OK (the unverifiable hash was counted as failed logins)", cmd.name, reply)
 		}
 	}
-	logs.WaitForLine(t, "authentication unavailable", account.Email, "reason=unverifiable_hash")
+	logs.WaitForLine(t, "authentication unavailable", account.Email, "reason=unverifiable_hash", "session=")
 }
 
 // TestIMAPUnverifiableStoredHashDropsCachedLogin: a login in the backend's lookup

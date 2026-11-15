@@ -41,6 +41,12 @@ func (s *POP3Session) handleXCLIENT(args string) (bool, string) {
 		return false, xclientTTLExpired
 	}
 
+	if forwardingParams.OriginatingIP != "" && !s.mayReplaceClientAddr() {
+		s.DebugLog("xclient client address ignored: the PROXY header's source is not trusted", "client_ip", forwardingParams.OriginatingIP)
+		forwardingParams.OriginatingIP = ""
+		forwardingParams.OriginatingPort = 0
+	}
+
 	// Store forwarding parameters in session
 	s.ForwardingParams = forwardingParams
 
@@ -63,12 +69,25 @@ func (s *POP3Session) handleXCLIENT(args string) (bool, string) {
 	return true, "XCLIENT parameters accepted"
 }
 
-// isFromTrustedProxy checks if the connection is from a trusted network that can send
-// forwarding parameters. With a PROXY header that is the header's source, not the load
-// balancer that sent it (see server.ForwardingSourceIP).
+// isFromTrustedProxy reports whether this connection may send XCLIENT: its socket peer or,
+// with a PROXY header, the header's source is in trusted_networks (the limiter's list,
+// consistent with connection limiting). A trusted peer may relay a client's own XCLIENT,
+// so only mayReplaceClientAddr decides whether XCLIENT ADDR is applied.
 func (s *POP3Session) isFromTrustedProxy() bool {
-	// Use the server's limiter trusted networks for XCLIENT command forwarding
-	// This ensures consistency with connection limiting behavior
+	if s.server.limiter == nil {
+		return false
+	}
+	return s.server.limiter.IsTrustedConnection(s.conn.RemoteAddr()) || s.mayReplaceClientAddr()
+}
+
+// mayReplaceClientAddr reports whether XCLIENT ADDR may replace the client address the
+// connection established, as for LMTP XCLIENT (server/lmtp/xclient.go): only when the
+// source of the PROXY header, else the socket peer, is in trusted_networks (see
+// server.ForwardingSourceIP). A pop3_proxy may send a PROXY header and XCLIENT on one
+// connection, so XCLIENT from a trusted peer is still answered +OK: refusing it would be
+// a warning on that proxy at every login. Behind a layer-4 load balancer the XCLIENT is
+// the client's own, and its address stays the one the header gave.
+func (s *POP3Session) mayReplaceClientAddr() bool {
 	if s.server.limiter == nil {
 		return false
 	}
