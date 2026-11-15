@@ -233,6 +233,19 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			authStart := time.Now()
+			// LOGIN has exactly two arguments. A username literal ends this
+			// physical line; its password follows the literal's octets.
+			usernameLiteral := len(args) > 0 && strings.HasPrefix(args[0], "{") && strings.HasSuffix(args[0], "}")
+			passwordLiteral := len(args) == 2 && strings.HasPrefix(args[1], "{") && strings.HasSuffix(args[1], "}")
+			_, _, hasTrailingLiteral := trailingLiteral(line)
+			if len(args) > 2 || (usernameLiteral && len(args) > 1) ||
+				(hasTrailingLiteral && !usernameLiteral && !passwordLiteral) {
+				if s.skipLiterals(line, false) != nil ||
+					s.handleAuthError(fmt.Sprintf("%s BAD Invalid LOGIN arguments", tag)) {
+					return
+				}
+				continue
+			}
 			var username, password string
 
 			// Handle literals in LOGIN command
@@ -259,10 +272,8 @@ func (s *Session) handleConnection() {
 					// Read literal data
 					literalBuf := make([]byte, literalSize)
 					if _, err := io.ReadFull(s.clientReader, literalBuf); err != nil {
-						if s.handleAuthError(fmt.Sprintf("%s BAD Failed to read username literal", tag)) {
-							return
-						}
-						continue
+						s.handleAuthError(fmt.Sprintf("%s BAD Failed to read username literal", tag))
+						return // The literal boundary is unknown after a partial read.
 					}
 					username = string(literalBuf)
 
@@ -279,6 +290,19 @@ func (s *Session) handleConnection() {
 
 					if line == "" {
 						if s.handleAuthError(fmt.Sprintf("%s BAD LOGIN requires username and password", tag)) {
+							return
+						}
+						continue
+					}
+
+					// The remainder must contain just the password. Parse it as
+					// an argument so quoted spaces and escapes stay one value.
+					_, _, passwordArgs, parseErr := server.ParseLine("x LOGIN "+line, true)
+					_, _, hasTrailingLiteral := trailingLiteral(line)
+					passwordLiteral := strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}")
+					if parseErr != nil || len(passwordArgs) != 1 || (hasTrailingLiteral && !passwordLiteral) {
+						if s.skipLiterals(line, false) != nil ||
+							s.handleAuthError(fmt.Sprintf("%s BAD Invalid LOGIN arguments", tag)) {
 							return
 						}
 						continue
@@ -304,16 +328,22 @@ func (s *Session) handleConnection() {
 						// Read literal data
 						literalBuf := make([]byte, literalSize)
 						if _, err := io.ReadFull(s.clientReader, literalBuf); err != nil {
-							if s.handleAuthError(fmt.Sprintf("%s BAD Failed to read password literal", tag)) {
-								return
-							}
-							continue
+							s.handleAuthError(fmt.Sprintf("%s BAD Failed to read password literal", tag))
+							return // The literal boundary is unknown after a partial read.
 						}
 						password = string(literalBuf)
 
-						// Read CRLF after literal
-						if _, err := server.ReadBoundedLine(s.clientReader, 1024); err != nil && err != io.EOF {
-							s.DebugLog("error reading CRLF after password literal", "error", err)
+						// The password is the final argument: drain any extra
+						// literal before refusing it, never authenticate a prefix.
+						extra, err := s.finishLoginLiteral()
+						if err != nil {
+							return
+						}
+						if extra {
+							if s.handleAuthError(fmt.Sprintf("%s BAD Invalid LOGIN arguments", tag)) {
+								return
+							}
+							continue
 						}
 					} else {
 						password = server.UnquoteString(line)
@@ -342,16 +372,22 @@ func (s *Session) handleConnection() {
 						// Read literal data
 						literalBuf := make([]byte, literalSize)
 						if _, err := io.ReadFull(s.clientReader, literalBuf); err != nil {
-							if s.handleAuthError(fmt.Sprintf("%s BAD Failed to read password literal", tag)) {
-								return
-							}
-							continue
+							s.handleAuthError(fmt.Sprintf("%s BAD Failed to read password literal", tag))
+							return // The literal boundary is unknown after a partial read.
 						}
 						password = string(literalBuf)
 
-						// Read CRLF after literal
-						if _, err := server.ReadBoundedLine(s.clientReader, 1024); err != nil && err != io.EOF {
-							s.DebugLog("error reading CRLF after password literal", "error", err)
+						// The password is the final argument: drain any extra
+						// literal before refusing it, never authenticate a prefix.
+						extra, err := s.finishLoginLiteral()
+						if err != nil {
+							return
+						}
+						if extra {
+							if s.handleAuthError(fmt.Sprintf("%s BAD Invalid LOGIN arguments", tag)) {
+								return
+							}
+							continue
 						}
 					}
 				} else {
@@ -613,6 +649,21 @@ func (s *Session) handleConnection() {
 	s.startProxy()
 }
 
+// finishLoginLiteral consumes the final command line after a password literal.
+// Anything but whitespace is an extra argument; its literals still belong to
+// LOGIN and must be drained before the command can be rejected.
+func (s *Session) finishLoginLiteral() (extra bool, err error) {
+	rest, err := server.ReadBoundedLine(s.clientReader, 65536)
+	if err != nil {
+		return false, err
+	}
+	rest = strings.TrimRight(rest, "\r\n")
+	if strings.TrimSpace(rest) == "" {
+		return false, nil
+	}
+	return true, s.skipLiterals(rest, false)
+}
+
 // maxPreAuthLiteral bounds each literal the pre-auth loop reads.
 const maxPreAuthLiteral = 8192
 
@@ -686,8 +737,29 @@ func trailingLiteral(line string) (size int, nonSync, ok bool) {
 	if start < 0 {
 		return 0, false, false
 	}
-	size, nonSync, err := server.ParseLiteral(line[start:])
-	return size, nonSync, err == nil
+	digits := line[start+1 : len(line)-1]
+	if strings.HasSuffix(digits, "+") {
+		nonSync = true
+		digits = digits[:len(digits)-1]
+	}
+	if digits == "" {
+		return 0, false, false
+	}
+	// Only the pre-auth bound matters here. Saturate instead of using
+	// Atoi: an all-digit count overflowing int is still an oversized literal,
+	// whose in-flight payload cannot safely become further commands.
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return 0, false, false
+		}
+		if size <= maxPreAuthLiteral {
+			size = size*10 + int(c-'0')
+			if size > maxPreAuthLiteral {
+				size = maxPreAuthLiteral + 1
+			}
+		}
+	}
+	return size, nonSync, true
 }
 
 // preAuthRequiredState maps the commands a backend implements that are not
