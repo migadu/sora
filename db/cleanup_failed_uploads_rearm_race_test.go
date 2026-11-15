@@ -33,14 +33,16 @@ func TestCleanupFailedUploadsSparesAPendingUploadReArmedMidStatement(t *testing.
 	// Each case makes the first delivery's pending row one that nothing will upload, as
 	// of the cleaner's snapshot.
 	cases := []struct {
-		name      string
-		exhaust   bool // the row has used up its attempts
-		goneOwner bool // the row belongs to an instance that stopped beating
+		name               string
+		exhaust            bool // the row has used up its attempts
+		goneOwner          bool // the row belongs to an instance that stopped beating
+		heartbeatCatchesUp bool // the heartbeat commits after the cleaner takes its snapshot
 	}{
 		{name: "attempts exhausted", exhaust: true},
 		// The re-arm also moves the row to another instance, so the re-check has to look
 		// up the heartbeat of the instance on the re-armed version.
 		{name: "owner instance gone", goneOwner: true},
+		{name: "heartbeat catches up while waiting", exhaust: true, heartbeatCatchesUp: true},
 	}
 
 	for _, tc := range cases {
@@ -58,9 +60,13 @@ func TestCleanupFailedUploadsSparesAPendingUploadReArmedMidStatement(t *testing.
 
 			liveInstance := fmt.Sprintf("rearm_race_live_%d", ts)
 			goneInstance := fmt.Sprintf("rearm_race_gone_%d", ts)
+			liveSeen := time.Now()
+			if tc.heartbeatCatchesUp {
+				liveSeen = liveSeen.Add(-2 * time.Hour)
+			}
 			_, err := db.GetWritePool().Exec(ctx, `
 				INSERT INTO instance_heartbeats (instance_id, last_seen)
-				VALUES ($1, now()), ($2, now() - interval '2 hours')`, liveInstance, goneInstance)
+				VALUES ($1, $3), ($2, now() - interval '2 hours')`, liveInstance, goneInstance, liveSeen)
 			require.NoError(t, err)
 			t.Cleanup(func() {
 				_, _ = db.GetWritePool().Exec(context.Background(),
@@ -116,6 +122,15 @@ func TestCleanupFailedUploadsSparesAPendingUploadReArmedMidStatement(t *testing.
 			}()
 
 			waitForBlockedOn(t, db, deliveryPID)
+			if tc.heartbeatCatchesUp {
+				// The pending-row recheck sees the delivery's new version, but
+				// its heartbeat subquery still reads the cleaner's old snapshot.
+				hbCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+				defer cancel()
+				_, err := db.GetWritePool().Exec(hbCtx,
+					`UPDATE instance_heartbeats SET last_seen = now() WHERE instance_id = $1`, liveInstance)
+				require.NoError(t, err)
+			}
 			require.NoError(t, deliveryTx.Commit(ctx))
 
 			res := <-done

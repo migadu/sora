@@ -536,7 +536,8 @@ func (d *Database) DeleteMessageByHashAndMailbox(ctx context.Context, tx pgx.Tx,
 // both use now()), so the liveness cutoff is derived from now() too rather than from this
 // node's clock. The heartbeat is read by a subquery correlated to pu.instance_id, not a
 // join, so a re-check on a newer version of pu (deleted_pending) looks up the instance
-// named on that version.
+// named on that version. It still reads the statement's heartbeat snapshot; the row
+// version guard in deleted_pending protects a concurrent re-arm with newer evidence.
 const livePendingUpload = `(pu.lease_until > now()
 	OR (pu.attempts < $2
 	    AND COALESCE(GREATEST((SELECT ih.last_seen FROM instance_heartbeats ih WHERE ih.instance_id = pu.instance_id),
@@ -583,12 +584,13 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 	// 1. The `deleted_messages` CTE deletes old, non-uploaded messages that no pending
 	//    upload will retry any more, and returns their keys.
 	// 2. The `deleted_pending` CTE then uses these keys to remove the corresponding
-	//    entries from `pending_uploads`, but only those still dead on the version it
-	//    deletes. A delivery or copy that re-armed a row after this statement's snapshot
-	//    (InsertMessage, restagePendingUploads) holds its lock; the DELETE waits for it
-	//    and, under READ COMMITTED, re-evaluates its WHERE clause on the re-armed version,
-	//    where livePendingUpload holds again, so the row stays and the message delivered
-	//    under it is uploaded. The message reaped from the old version is gone either way.
+	//    entries from `pending_uploads`, but only the same still-dead row version the
+	//    statement saw. A concurrent delivery or copy can re-arm a row while DELETE
+	//    waits for its lock. READ COMMITTED rechecks the new target version, but its
+	//    heartbeat subquery keeps the old statement snapshot, so liveness alone is
+	//    insufficient. Compare xmin with a separate snapshot lookup by primary key:
+	//    a changed row stays for a later cycle, whose snapshot can judge it afresh.
+	//    The old message reaped above is gone either way; a newly delivered one remains.
 	// 3. The `deleted_instances` CTE retires heartbeat rows of long-gone instances, but
 	//    only while they own no pending upload at all: as long as one exists, that row
 	//    is the evidence that permits reaping it. CTEs see the pre-statement snapshot,
@@ -611,6 +613,7 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 		deleted_pending AS (
 			DELETE FROM pending_uploads pu
 			WHERE (pu.content_hash, pu.account_id) IN (SELECT content_hash, account_id FROM deleted_messages)
+			  AND pu.xmin = (SELECT snapshot_pu.xmin FROM pending_uploads snapshot_pu WHERE snapshot_pu.id = pu.id)
 			  AND ` + livePendingUpload + ` IS NOT TRUE
 		),
 		deleted_instances AS (
