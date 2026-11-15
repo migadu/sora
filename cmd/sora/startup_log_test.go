@@ -62,9 +62,12 @@ func TestStartupConfigWarningsReachTheConfiguredLog(t *testing.T) {
 		}
 		data, err := os.ReadFile(logPath)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("%v\nstderr:\n%s", err, out)
 		}
 		logged := string(data)
+		if !strings.Contains(logged, "metrics server failed") {
+			t.Fatalf("start-up did not stop at the metrics listener:\n%s\nstderr:\n%s", logged, out)
+		}
 		if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, "cleanup.grace_periood") {
 			t.Errorf("the log file has no WARN record naming cleanup.grace_periood:\n%s\nstderr:\n%s", logged, out)
 		}

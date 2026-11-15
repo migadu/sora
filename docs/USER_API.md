@@ -242,7 +242,8 @@ Because the path ends in an operation name, a mailbox whose last level is called
 mailbox with one of those names cannot be listed or searched.
 
 **Responses** are JSON with `Content-Type: application/json`, except the message body and raw
-message (section 7). Times are RFC 3339.
+message (section 7). Times are RFC 3339, except a token's `expires_at`, which is Unix seconds
+(section 3.1).
 
 **Errors** are JSON objects with an `error` field:
 
@@ -271,7 +272,7 @@ header listing the methods it does serve; a path no endpoint has is
 | 422 | A message would have more than 50 keywords. |
 | 429 | Too many logins waiting on a delay. |
 | 500 | Server error. |
-| 503 | Message body not available yet, or storage unreachable (with `Retry-After`). |
+| 503 | Message body not available yet, or storage unreachable (with `Retry-After`); a database error at login or refresh. |
 
 **Access control.** The `allowed_hosts` check runs first on every request, the login
 included: `403 {"error":"Host not allowed"}`. Then CORS (section 11), then the token. The
@@ -407,7 +408,8 @@ A mailbox that does not exist gives `404 Mailbox not found`.
 Messages are addressed by their `id`, a number that identifies the message row across the
 whole system. The `id`-based endpoints (7.2 to 7.7) work on every message the account can list,
 in its own mailboxes and in shared mailboxes, subject to the mailbox's ACL as in IMAP: the `r`
-right to read a message, the write and delete rights to change its flags.
+right to read a message; to change its flags, `s` for `\Seen`, `t` for `\Deleted` and `w` for
+every other flag and keyword (RFC 4314 section 2.1).
 
 ### 7.1 List a mailbox's messages
 
@@ -445,7 +447,7 @@ the pages.
 
 `GET /user/messages/{id}`
 
-Returns one message object (section 10), with `references` and without `bcc`.
+Returns one message object (section 10), with `references`.
 
 `400 Invalid message ID`, `404 Message not found`, `500 Failed to retrieve message`.
 
@@ -582,7 +584,7 @@ Response `200`:
 
 | Field | Meaning |
 |---|---|
-| `messages` | Up to 100 matches, newest arrival first. Message objects without `bcc` and `references`. |
+| `messages` | Up to 100 matches, newest arrival first. Message objects without `references`. |
 | `total` | The number of messages in this response. |
 | `truncated` | `true` when more than 100 messages matched. Narrow the query to reach the others. |
 | `limit` | Always `100`. |
@@ -728,14 +730,14 @@ return messages in this shape:
 | `mailbox_id`, `mailbox_path` | The mailbox it is in. |
 | `subject` | The decoded `Subject`. |
 | `from` | The first `From` address, address only (no display name). |
-| `to`, `cc`, `bcc` | Addresses only. `cc` is filled in lists, search results and `GET /user/messages/{id}`; `bcc` only in lists. `to` is always present (`[]` when the message has none); empty `cc` and `bcc` are left out. |
+| `to`, `cc`, `bcc` | Addresses only, the same in lists, search results and `GET /user/messages/{id}`. `to` is always present (`[]` when the message has none); empty `cc` and `bcc` are left out. |
 | `date` | The message's `Date` header; its `internal_date` when it has none that parses. |
 | `internal_date` | When the message arrived in Sora. |
 | `size` | Bytes. |
 | `flags` | System flags. `[]` when there are none. |
 | `custom_flags` | Keywords. Left out when there are none. |
 | `message_id`, `in_reply_to` | From the headers, without angle brackets; `in_reply_to` holds its IDs separated by spaces and is left out when there are none. `message_id` is `""` when the message has no `Message-ID` that parses. |
-| `references` | The `References` header; only in `GET /user/messages/{id}`. |
+| `references` | The `References` header; only in `GET /user/messages/{id}` and the `data` of a flag change. |
 | `content_hash` | The hash that names the stored body. Messages with the same content share it. |
 | `has_attachments` | From the RFC 9979 keywords: `true` with `$hasattachment`, `false` with `$hasnoattachment`, left out when the message carries neither (mail Sora stored before it set them, or mail it could not inspect). |
 
