@@ -96,12 +96,15 @@ func TestWarnUnusedConfigOptions_KeysOnlySomeServerTypesRead(t *testing.T) {
 	metricsOnly := []string{"metrics"}
 	imapOnly := []string{"imap"}
 	imapAndProxy := []string{"imap", "imap_proxy"}
-	// The servers with a password login. The LMTP backend offers no AUTH, so
-	// insecure_auth has nothing to allow there.
+	// The IMAP, POP3 and ManageSieve servers and proxies. The LMTP backend offers no
+	// AUTH, so insecure_auth has nothing to allow there, and the HTTP User API's
+	// login reads none of these keys.
 	loginServers := []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
 	proxies := []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
 	// The LMTP backend's only timeout is timeouts.command_timeout.
 	authIdle := []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}
+	// The POP3 and ManageSieve backends take debug and write nothing with it.
+	debugReaders := []string{"imap", "lmtp", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}
 	no, yes, n := false, true, 50
 	keys := []struct {
 		key    string
@@ -142,7 +145,7 @@ func TestWarnUnusedConfigOptions_KeysOnlySomeServerTypesRead(t *testing.T) {
 		{"master_sasl_allowed_networks", func(s *ServerConfig) { s.MasterSASLAllowedNetworks = []string{"10.0.0.0/8"} }, []string{"imap", "pop3", "managesieve"}},
 		{"insecure_auth", func(s *ServerConfig) { s.InsecureAuth = true }, loginServers},
 		{"auth_idle_timeout", func(s *ServerConfig) { s.AuthIdleTimeout = "2m" }, authIdle},
-		{"debug", func(s *ServerConfig) { s.Debug = true }, mailServers},
+		{"debug", func(s *ServerConfig) { s.Debug = true }, debugReaders},
 
 		// The proxies' backend legs.
 		{"remote_port", func(s *ServerConfig) { s.RemotePort = int64(143) }, proxies},

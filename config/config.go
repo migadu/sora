@@ -1619,6 +1619,15 @@ type TimeoutSchedulerConfig struct {
 	ShardCount int `toml:"shard_count"` // Number of timeout scheduler shards (0=runtime.NumCPU(), -1=runtime.NumCPU()/2, >0=specific value)
 }
 
+// Validate checks shard_count as server.InitializeGlobalTimeoutScheduler does: 0 and -1
+// select a count from the CPUs, and nothing below -1 has a meaning.
+func (c TimeoutSchedulerConfig) Validate() error {
+	if c.ShardCount < -1 {
+		return fmt.Errorf("shard_count must be >= -1, got %d", c.ShardCount)
+	}
+	return nil
+}
+
 // ServersConfig holds all server configurations.
 type ServersConfig struct {
 	TrustedNetworks []string `toml:"trusted_networks"` // Global trusted networks for proxy parameter forwarding
@@ -2967,7 +2976,7 @@ func (s *ServerConfig) MetricsPath() string {
 func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...any)) {
 	for _, k := range serverTypeKeys {
 		if k.set(s) && !slices.Contains(k.appliedBy, s.Type) {
-			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "))
+			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it%s", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "), serverTypeKeyNotes[k.name])
 		}
 	}
 	// Only these filter clients by address. Every other type, the User API proxy
@@ -3153,7 +3162,9 @@ var serverTypeKeys = []struct {
 	{"insecure_auth", func(s *ServerConfig) bool { return s.InsecureAuth }, loginServerTypes},
 	// The LMTP backend's only timeout is timeouts.command_timeout.
 	{"auth_idle_timeout", func(s *ServerConfig) bool { return s.AuthIdleTimeout != "" }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
-	{"debug", func(s *ServerConfig) bool { return s.Debug }, []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
+	// The POP3 and ManageSieve backends take debug in their options and write
+	// nothing with it.
+	{"debug", func(s *ServerConfig) bool { return s.Debug }, []string{"imap", "lmtp", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
 	// The proxies' backend legs.
 	{"remote_port", func(s *ServerConfig) bool { return s.RemotePort != nil }, proxyServerTypes},
 	{"connect_timeout", func(s *ServerConfig) bool { return s.ConnectTimeout != "" }, proxyServerTypes},
@@ -3171,8 +3182,15 @@ var serverTypeKeys = []struct {
 	{"supported_extensions", func(s *ServerConfig) bool { return len(s.SupportedExtensions) > 0 }, []string{"managesieve_proxy"}},
 }
 
-// loginServerTypes are the server types with a password login, proxyServerTypes
-// those that dial backends.
+// serverTypeKeyNotes ends the warning about a serverTypeKeys key with the setting
+// that applies in its place.
+var serverTypeKeyNotes = map[string]string{
+	"supported_extensions": "; a ManageSieve server advertises the [sieve] enabled_extensions",
+}
+
+// loginServerTypes are the IMAP, POP3 and ManageSieve servers and proxies, the line
+// protocols with a password login (the HTTP User API's login reads none of the keys
+// they share); proxyServerTypes are those that dial backends.
 var (
 	loginServerTypes = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
 	proxyServerTypes = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
@@ -3307,12 +3325,6 @@ func (c *Config) DatabaseUser() *ServerConfig {
 	return nil
 }
 
-// HasDatabaseEndpoint reports whether [database.write] or [database.read] names a host.
-func (c *Config) HasDatabaseEndpoint() bool {
-	return (c.Database.Write != nil && len(c.Database.Write.Hosts) > 0) ||
-		(c.Database.Read != nil && len(c.Database.Read.Hosts) > 0)
-}
-
 // NeedsS3 reports whether the node connects to [s3]. A mail backend stores message bodies
 // there. The User API serves them from there (/user/messages/{id}/body and /raw) on a
 // node without a mail backend too, when [s3] has any connection setting; without one it
@@ -3377,6 +3389,7 @@ func (c *Config) Validate() []Problem {
 	// One malformed trusted_networks entry would leave LMTP admission with no peers.
 	add("trusted_networks", c.ValidateTrustedNetworks())
 	add("[shared_mailboxes]", c.SharedMailboxes.Validate())
+	add("[timeout_scheduler]", c.TimeoutScheduler.Validate())
 
 	// Fail closed: a listener that accepts PROXY protocol with an empty trusted_networks
 	// would let any reachable host spoof the client IP via a PROXY header. (security-audit M2)
@@ -3416,15 +3429,24 @@ func (c *Config) Validate() []Problem {
 	}
 
 	if user := c.DatabaseUser(); user != nil {
-		if !c.HasDatabaseEndpoint() {
+		// An endpoint without hosts opens no pool.
+		writeHosts := c.Database.Write != nil && len(c.Database.Write.Hosts) > 0
+		readHosts := c.Database.Read != nil && len(c.Database.Read.Hosts) > 0
+		switch {
+		case !writeHosts && !readHosts:
 			add("[database]", fmt.Errorf("server %q (%s) needs the database, but it is not configured in [database.write] or [database.read]", user.Name, user.Type))
+		case !writeHosts:
+			// Start-up opens write pools only from [database.write] and stops without one,
+			// whatever the replicas do: the migrations and every write run there, and
+			// [database.read] only takes reads off it.
+			add("[database.write]", fmt.Errorf("server %q (%s) needs the database, but [database.write] has no hosts; "+
+				"[database.read] alone is not enough: the migrations and every write go to [database.write]", user.Name, user.Type))
 		}
 		add("[database]", c.Database.Validate())
-		// An endpoint without hosts opens no pool.
-		if c.Database.Write != nil && len(c.Database.Write.Hosts) > 0 {
+		if writeHosts {
 			add("[database.write]", c.Database.Write.Validate())
 		}
-		if c.Database.Read != nil && len(c.Database.Read.Hosts) > 0 {
+		if readHosts {
 			add("[database.read]", c.Database.Read.Validate())
 		}
 	}

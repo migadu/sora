@@ -172,7 +172,8 @@ Things to know:
   `[database.read]`) section in the file, Sora has no such endpoint. This is how a proxy-only node
   runs without one. A node that needs a database and has none stops with `[database]: server
   "<name>" (<type>) needs the database, but it is not configured in [database.write] or
-  [database.read]`.
+  [database.read]`. `[database.read]` alone is not enough: the migrations and every write go to
+  `[database.write]`.
 
 ---
 
@@ -181,8 +182,7 @@ Things to know:
 After parsing, Sora checks the configuration before it opens any listener. Each failed check below
 stops startup with exit status 1. The checks on the file itself run before logging is set up, so
 they write a line of the form `[ERROR] <date> <time> ERROR: invalid configuration - <what>: <reason>`
-to standard error, one for each problem the file has. The `[timeout_scheduler]` check runs after it,
-so its failure is an ERROR record of the `[logging]` output, in its format.
+to standard error, one for each problem the file has.
 
 | Check | Message |
 |---|---|
@@ -200,6 +200,7 @@ so its failure is an ERROR record of the `[logging]` output, in its format.
 | No server is configured | `no servers configured. Please configure at least one server in a [[server]] section` |
 | An IMAP, POP3 or LMTP server is configured, or an `http_user_api` server with any `[s3]` connection setting, and `[s3] bucket` or `endpoint` is empty, or `timeout` is not a duration | `[s3]: bucket is required ...`, `[s3]: endpoint is required ...` or `[s3]: invalid timeout "<value>": ...` |
 | A server that needs the database is configured and there is no database endpoint (see [section 3](#3-defaults)) | `[database]: server "<name>" (<type>) needs the database, but it is not configured in [database.write] or [database.read]` |
+| A server that needs the database is configured and `[database.read]` has hosts but `[database.write]` has none | `[database.write]: server "<name>" (<type>) needs the database, but [database.write] has no hosts; ...` |
 | `[cluster] enabled = true` and `addr` is not an IP address other than `0.0.0.0` or `::`, or `secret_key` is missing or not the base64 of 32 bytes (see [CLUSTER.md](CLUSTER.md)) | `[cluster]: cluster addr '<host>' must be a specific IP address reachable from other nodes, ...`, `[cluster]: cluster secret_key is required when cluster mode is enabled ...`, `[cluster]: failed to decode cluster secret_key: ...` or `[cluster]: cluster secret_key must be 32 bytes (got <n> bytes)` |
 | `[servers] trusted_networks` has an entry that is neither an IP address nor a CIDR block | names the invalid entry |
 | A server's `auth_rate_limit.exempt_networks` has an entry that is neither an IP address nor a CIDR block | `server "<name>": auth_rate_limit.exempt_networks has entries that are neither an IP address nor a CIDR: [...]` |
@@ -217,7 +218,7 @@ so its failure is an ERROR record of the `[logging]` output, in its format.
 | An IMAP, POP3 or LMTP server is configured and `[cleanup]` has a negative `grace_period`, `max_age_restriction`, `fts_retention` or `health_status_retention`, or an `instance_liveness_threshold` of zero or less | `[cleanup]: <key> must not be negative, got "<value>"` or `[cleanup]: instance_liveness_threshold must be positive, got "<value>"` |
 | An IMAP, POP3 or LMTP server is configured and `[uploader]` has a `batch_size`, `concurrency` or `max_attempts` of zero or less, a `cleanup_grace_period` of zero or less or that is not a duration, or a `retry_interval` of zero or less | `[uploader] <key> must be positive, got <n>`, `[uploader] cleanup_grace_period must be positive, got "<value>"`, `[uploader] cleanup_grace_period: <parse error>` or `[uploader] retry_interval must be positive, got "<value>"` |
 | `[shared_mailboxes] enabled = true` and `namespace_prefix` is not a mailbox name followed by `/` (for example `""`, `"Shared"` or `"Shared//"`), or is `INBOX/` in any letter case | `[shared_mailboxes]: namespace_prefix "<value>" must be a mailbox name followed by the hierarchy delimiter "/", such as "Shared/"` or `[shared_mailboxes]: namespace_prefix "<value>" conflicts with the reserved personal INBOX` |
-| `[timeout_scheduler] shard_count` is below -1 | `msg="Fatal error" operation="initialize timeout scheduler" error="invalid shard count: <n> (must be >= -1)"` |
+| `[timeout_scheduler] shard_count` is below -1 | `[timeout_scheduler]: shard_count must be >= -1, got <n>` |
 
 The address check compares the strings, so `":143"` and `"0.0.0.0:143"` pass it and fail later when
 the second listener cannot bind.
@@ -242,8 +243,8 @@ These conditions only log, and startup continues:
 Later steps can still fail, for example a TLS certificate that cannot be read, or a database that
 cannot be reached. Those are covered in the topic documents.
 
-`sora-admin config validate` runs every check in this list but the `[timeout_scheduler]` one,
-without starting anything. See [ADMIN_CLI.md](ADMIN_CLI.md).
+`sora-admin config validate` runs every check in this list, without starting anything. See
+[ADMIN_CLI.md](ADMIN_CLI.md).
 
 ---
 
@@ -361,8 +362,8 @@ Adding, removing or renaming a `[[server]]` block also needs a restart, and Sora
 removed blocks. A new block is not started, and a running server whose block was removed or renamed
 keeps running with its old settings.
 
-A reload also runs the checks of [section 4](#4-checks-at-startup) that
-`sora-admin config validate` runs (all but `[timeout_scheduler]`) on the new file. For each problem
+A reload also runs the checks of [section 4](#4-checks-at-startup), the ones
+`sora-admin config validate` runs, on the new file. For each problem
 it logs an error, for example
 `Config reload: [cluster] is invalid and the server will not start with this config`, with the
 reason in `error`, so a file the next restart would refuse is caught at the reload. It still
@@ -757,7 +758,7 @@ to" column, "backends" means `imap`, `pop3`, `lmtp` and `managesieve`, and "line
 | `type` | string | required | all | See [section 5](#5-server-blocks). |
 | `name` | string | required | all | Unique name. |
 | `addr` | string | required | all | Listen address. |
-| `debug` | bool | `false` | backends, line proxies | Extra diagnostics for this server. Some protocols write a raw protocol trace to the log output whatever the level. On the HTTP servers it is ignored, with a startup warning. See [PROTOCOLS.md](PROTOCOLS.md). |
+| `debug` | bool | `false` | `imap`, `lmtp`, line proxies | Extra diagnostics for this server. Some protocols write a raw protocol trace to the log output whatever the level. On the other server types (`pop3` and `managesieve` included) it is ignored, with a startup warning. See [PROTOCOLS.md](PROTOCOLS.md). |
 
 ### 9.2 TLS on the listener
 
@@ -770,7 +771,7 @@ See [TLS.md](TLS.md).
 | `tls_cert_file`, `tls_key_file` | string | none | all but `metrics` | Certificate files for this listener. |
 | `tls_verify` | bool | `false` | all but `metrics` | See [TLS.md](TLS.md). |
 | `tls_default_domain` | string | `[tls.letsencrypt] default_domain` | all but `metrics` | Certificate for clients that send no SNI. |
-| `insecure_auth` | bool | `false` | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Allow password logins on a plain connection. Without `tls = true` it is always allowed. The other server types have no password login; on them the key is ignored, with a startup warning. See [SECURITY.md](SECURITY.md). |
+| `insecure_auth` | bool | `false` | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Allow password logins on a plain connection. Without `tls = true` it is always allowed. LMTP has no login and the HTTP servers do not use the key; on the other server types it is ignored, with a startup warning. See [SECURITY.md](SECURITY.md). |
 
 The `metrics` server always speaks plain HTTP. `tls` on it only causes a startup warning.
 
