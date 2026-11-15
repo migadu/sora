@@ -5,6 +5,7 @@ package imap_test
 import (
 	"bufio"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -98,5 +99,40 @@ func TestIMAP_AuthenticateOverlongResponse(t *testing.T) {
 	fmt.Fprintf(conn, "A2 LOGIN %q %q\r\n", account.Email, account.Password)
 	if got := readTagged(t, reader, "A2"); !strings.HasPrefix(got, "A2 OK") {
 		t.Fatalf("LOGIN after the refused AUTHENTICATE = %q, want A2 OK", got)
+	}
+}
+
+// A timeout cannot supply the missing line boundary of an oversized SASL
+// response. The connection closes when that response cannot be drained.
+func TestIMAP_AuthenticateUnterminatedOverlongResponseCloses(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, _ := common.SetupIMAPServer(t)
+	defer server.Close()
+	conn, reader := dialAuthenticate(t, server.Address)
+	if err := conn.SetDeadline(time.Now().Add(40 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprint(conn, "A1 AUTHENTICATE PLAIN\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := reader.ReadString('\n'); err != nil || line != "+ \r\n" {
+		t.Fatalf("continuation request = %q, %v", line, err)
+	}
+	if _, err := fmt.Fprint(conn, strings.Repeat("A", 5000)); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "* BYE ") {
+		t.Fatalf("incomplete response = %q, %v; want BYE", line, err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	line, err := reader.ReadString('\n')
+	if err == nil || line != "" {
+		t.Fatalf("after BYE = %q, %v; want closed connection", line, err)
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		t.Fatalf("connection remained open after BYE: %v", err)
 	}
 }
