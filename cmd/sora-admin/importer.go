@@ -1394,9 +1394,9 @@ func (i *Importer) scanMaildir() error {
 	// Refusals apply only to this run. Deleting a prior cache row would also lose
 	// a successful legacy import's SHA-256 identity and duplicate it under BLAKE3
 	// if a later run raises the limit again.
-	refuse := func(file fileToProcess, err error) {
-		logger.Warn("Invalid message", "path", file.path, "error", err)
-		i.recordFailedPath(file.path, fmt.Sprintf("invalid message: %v", err))
+	refuse := func(file fileToProcess, reason string) {
+		logger.Warn("Refusing message", "path", file.path, "reason", reason)
+		i.recordFailedPath(file.path, reason)
 		atomic.AddInt64(&i.failedMessages, 1)
 		refusedMu.Lock()
 		refusedFiles[maildirFileKey{file.filename, file.mailboxName}] = struct{}{}
@@ -1409,12 +1409,17 @@ func (i *Importer) scanMaildir() error {
 		go func() {
 			defer wg.Done()
 			for file := range filesToProcess {
+				if i.isSharedNamespaceRoot(file.mailboxName) {
+					refuse(file, fmt.Sprintf("folder maps to the shared namespace root %q, which holds no messages; import it under another name", file.mailboxName))
+					continue
+				}
+
 				// Use streaming hash function
 				// Every file the scan drops is reported by path at the end: a message that
 				// never reaches the cache is otherwise invisible to every later count.
 				hash, size, err := hashFile(file.path, i.options.MaxMessageSize)
 				if errors.Is(err, errMessageTooLarge) {
-					refuse(file, err)
+					refuse(file, fmt.Sprintf("invalid message: %v", err))
 					continue
 				}
 				if err != nil {
@@ -1426,7 +1431,7 @@ func (i *Importer) scanMaildir() error {
 
 				// Validate message
 				if err := i.validateMessage(size); err != nil {
-					refuse(file, err)
+					refuse(file, fmt.Sprintf("invalid message: %v", err))
 					continue
 				}
 
@@ -1573,7 +1578,7 @@ func (i *Importer) syncMailboxState() error {
 			continue
 		}
 
-		if !i.shouldImportMailbox(mailboxName) {
+		if !i.shouldImportMailbox(mailboxName) || i.isSharedNamespaceRoot(mailboxName) {
 			continue
 		}
 
@@ -1720,6 +1725,18 @@ func (i *Importer) shouldSkipMessage(path string) bool {
 		return true
 	}
 	return false
+}
+
+// isSharedNamespaceRoot reports whether mailboxName is the shared namespace root
+// ("Shared" for "Shared/") while sharing is enabled. The root is a container: IMAP
+// refuses to CREATE or SELECT it, so messages imported into it could not be read, and
+// as a shared mailbox it cannot be renamed out of the namespace to reach them. The scan
+// refuses the messages of such a folder; the root itself is still created as the
+// parent of the folders below it.
+func (i *Importer) isSharedNamespaceRoot(mailboxName string) bool {
+	shared := i.options.SharedMailboxes
+	return shared.Enabled &&
+		strings.EqualFold(mailboxName, strings.TrimSuffix(shared.NamespacePrefix, string(consts.MailboxDelimiter)))
 }
 
 // getOrCreateMailbox returns cached mailbox or fetches/creates it

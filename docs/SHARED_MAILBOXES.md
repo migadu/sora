@@ -136,7 +136,8 @@ created it.
 ### Other paths
 
 - `sora-admin import maildir` imports a folder under the prefix into a shared mailbox the account
-  owns, as `mailbox create` makes one, when sharing is enabled in the config file you pass. See
+  owns, as `mailbox create` makes one, when sharing is enabled in the config file you pass. The
+  messages of a folder named like the namespace root are not imported. See
   [IMPORT_EXPORT.md](IMPORT_EXPORT.md).
 - The User API does not create shared folders: `POST /user/mailboxes` with a name in the shared
   namespace, the root included, is refused with `403`.

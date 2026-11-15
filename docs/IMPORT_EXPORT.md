@@ -112,7 +112,10 @@ folder. Its mailbox name comes from its path relative to the root:
 Mailboxes are created as needed. With `[shared_mailboxes] enabled = true` in the config file
 you pass, a folder in the shared namespace (`.Shared.Team` with the default prefix) becomes a
 shared mailbox the account owns, as `sora-admin mailbox create` makes one; see
-[SHARED_MAILBOXES.md](SHARED_MAILBOXES.md).
+[SHARED_MAILBOXES.md](SHARED_MAILBOXES.md). The namespace root itself (`Shared`) is only created
+as the parent of such folders: it is a container IMAP clients cannot select, so the messages of a
+folder named like it (`.Shared`) are not imported and are reported as failed. Rename that folder
+in the maildir to import them.
 
 Within each folder, every regular file in `cur/` and `new/` whose name does not start with `.`
 is a message. Files in `new/` usually carry no flags, so they arrive unread.

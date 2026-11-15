@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,5 +84,82 @@ func TestImporter_SharedNamespaceFolders(t *testing.T) {
 		if len(acls) != 1 || acls[0].Identifier != email || acls[0].Rights != "lrswipkxtea" {
 			t.Errorf("ACL of %s = %+v, want the owner %s with lrswipkxtea", name, acls, email)
 		}
+	}
+}
+
+// TestImporter_SharedNamespaceRootFolder: with [shared_mailboxes] enabled, the messages
+// of a maildir folder named like the namespace root (".Shared") are refused and
+// reported as failed, not imported. The root is a container: IMAP refuses to CREATE
+// or SELECT it, so messages in it could not be read, and a shared root cannot be
+// renamed out of the namespace to reach them. The root is still created as the
+// parent of the folders below it. With sharing off, "Shared" is an ordinary folder.
+func TestImporter_SharedNamespaceRootFolder(t *testing.T) {
+	rdb := setupTestDatabase(t)
+	defer rdb.Close()
+	ctx := context.Background()
+	date := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name    string
+		email   string
+		enabled bool
+	}{
+		{"sharing on", "shared-root-import@example.com", true},
+		{"sharing off", "shared-root-off-import@example.com", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			createSimpleTestAccount(t, rdb, tc.email, "testpassword123")
+			accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, tc.email)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			maildir := filepath.Join(t.TempDir(), "Maildir")
+			createMaildirFolder(t, maildir)
+			createMaildirFolder(t, filepath.Join(maildir, ".Shared"))
+			createMessagesInMaildir(t, filepath.Join(maildir, ".Shared"), []testMessage{{uid: 1, filename: "1700000003.M3P3.host",
+				flags: "S", subject: "root", from: "a@example.com", to: tc.email, date: date}})
+			createMaildirFolder(t, filepath.Join(maildir, ".Shared.Team"))
+			createMessagesInMaildir(t, filepath.Join(maildir, ".Shared.Team"), []testMessage{{uid: 1, filename: "1700000004.M4P4.host",
+				flags: "S", subject: "team", from: "a@example.com", to: tc.email, date: date}})
+
+			importer, err := NewImporter(ctx, maildir, tc.email, 1, rdb, nil, ImporterOptions{TestMode: true, BatchSize: 10,
+				SharedMailboxes: config.SharedMailboxesConfig{Enabled: tc.enabled, NamespacePrefix: "Shared/", DefaultRights: "lrswipkxtea"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			runErr := importer.Run()
+
+			rootMessages := int64(1)
+			if tc.enabled {
+				rootMessages = 0
+				if runErr == nil {
+					t.Error("import reported success, want the root folder's message reported as failed")
+				}
+				if importer.failedMessages != 1 || len(importer.failedPaths) != 1 ||
+					!strings.Contains(importer.failedPaths[0].reason, "shared namespace root") {
+					t.Errorf("failed = %d %+v, want the one message of .Shared refused as in the shared namespace root",
+						importer.failedMessages, importer.failedPaths)
+				}
+			} else if runErr != nil {
+				t.Errorf("import: %v", runErr)
+			}
+
+			for name, want := range map[string]int64{"Shared": rootMessages, "Shared/Team": 1} {
+				var shared bool
+				var messages int64
+				if err := rdb.GetOperationalDatabase().WritePool.QueryRow(ctx, `
+					SELECT COALESCE(is_shared, FALSE),
+						(SELECT COUNT(*) FROM messages WHERE mailbox_id = m.id AND expunged_at IS NULL)
+					FROM mailboxes m WHERE account_id = $1 AND name = $2 AND deleted_at IS NULL`,
+					accountID, name).Scan(&shared, &messages); err != nil {
+					t.Errorf("mailbox %s: %v", name, err)
+					continue
+				}
+				if shared != tc.enabled || messages != want {
+					t.Errorf("mailbox %s: is_shared=%v messages=%d, want is_shared=%v messages=%d", name, shared, messages, tc.enabled, want)
+				}
+			}
+		})
 	}
 }
