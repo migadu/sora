@@ -2053,12 +2053,13 @@ func (s *Session) restartSession() {
 // recipients and its single end-of-data reply would be attributed to the wrong one.
 func (s *Session) loseBackend() {
 	s.mu.Lock()
-	if s.backendConn != nil {
-		s.backendConn.Close()
-		s.backendConn = nil
-	}
+	backend := s.backendConn
+	s.backendConn = nil
 	s.backendRoute = nil
 	s.mu.Unlock()
+	// This connection is being abandoned. Interrupt transport I/O before TLS
+	// cleanup, outside the mutex that cancellation and shutdown need too.
+	closeSessionTransport(backend)
 	if s.acceptedRcpts > 0 {
 		s.txPoisoned = true
 	}
