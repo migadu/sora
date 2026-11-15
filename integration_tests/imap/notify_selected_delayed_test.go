@@ -94,7 +94,7 @@ func TestNotifySelectedDelayedHoldsExpungeBetweenCommands(t *testing.T) {
 				exists := slices.Index(got, "* 2 EXISTS")
 				fetch := slices.IndexFunc(got, func(resp string) bool { return countUIDFetches([]string{resp}, newUID) > 0 })
 				if exists < expunge || fetch < exists {
-					t.Errorf("want EXPUNGE, then EXISTS, then the MessageNew FETCH, got:\n%s", strings.Join(got, "\r\n"))
+					t.Fatalf("want EXPUNGE, then EXISTS, then the MessageNew FETCH, got:\n%s", strings.Join(got, "\r\n"))
 				}
 				if want := fmt.Sprintf("* 2 FETCH (UID %d)", newUID); got[fetch] != want {
 					t.Errorf("MessageNew FETCH = %q, want %q", got[fetch], want)
