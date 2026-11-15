@@ -487,12 +487,22 @@ func maildirFolderName(mailboxName string) string {
 
 // maildirFolderLevel is the directory name of one level of a mailbox name. It is
 // modified UTF-7, as Dovecot names folders on disk and as exportSubscriptions names
-// them, so the importer does not decode an '&' or a literal "&...-" of the name. A
-// '.' is escaped, because the importer reads a '.' as the Maildir++ hierarchy
-// separator, and so is the escape character, so that unescapeMaildirLevel restores
-// exactly the characters escaped here.
+// them, so the importer does not decode an '&' or a literal "&...-" of the name.
+// Levels named "cur", "new", or "tmp" escape their first character (\63ur, \6eew,
+// \74mp, as Dovecot LAYOUT=fs does) so they do not collide with a Maildir's own
+// cur/, new/, and tmp/ subdirectories. A '.' is escaped, because the importer reads
+// a '.' as the Maildir++ hierarchy separator, and so is the escape character, so
+// that unescapeMaildirLevel restores exactly the characters escaped here.
 func maildirFolderLevel(level string) string {
 	encoded := helpers.EncodeModifiedUTF7(level)
+	switch encoded {
+	case "cur":
+		return `\63ur`
+	case "new":
+		return `\6eew`
+	case "tmp":
+		return `\74mp`
+	}
 	if !strings.ContainsAny(encoded, ".\\") {
 		return encoded
 	}
