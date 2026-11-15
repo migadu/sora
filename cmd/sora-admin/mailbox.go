@@ -749,16 +749,30 @@ Examples:
 			if *parentID == r.MailboxID {
 				return fmt.Errorf("mailbox %d cannot be its own parent", r.MailboxID)
 			}
-			var parentPath string
+			var parentPath, parentName string
 			foundParent := false
 			for _, m := range mboxes {
 				if m.ID == *parentID {
-					parentPath = m.Path
+					parentPath, parentName = m.Path, m.Name
 					foundParent = true
 					break
 				}
 			}
 			if !foundParent {
+				return consts.ErrMailboxNotFound
+			}
+			// RenameMailbox refuses a parent that does not have the parent part of the
+			// new name (compared with LOWER), so a mailbox already detached by name from
+			// the parent its path links it to is not renamed in place.
+			decodedParent := ""
+			if i := strings.LastIndex(decoded, string(consts.MailboxDelimiter)); i >= 0 {
+				decodedParent = decoded[:i]
+			}
+			matches, err := countConflicts([]string{parentName}, []string{decodedParent}, true)
+			if err != nil {
+				return err
+			}
+			if matches == 0 {
 				return consts.ErrMailboxNotFound
 			}
 			if strings.HasPrefix(parentPath, r.Path) {
