@@ -67,12 +67,14 @@ type IMAPSession struct {
 
 	// A STORE answers its rows itself: with FETCH (FLAGS) when not .SILENT
 	// (RFC 9051 §6.4.6), with FETCH (UID MODSEQ) for a CONDSTORE .SILENT
-	// (RFC 7162 §3.1.3). ownStoreMu serializes that STORE with Poll so Poll
-	// can tell those rows from foreign changes; it is taken before s.mutex,
-	// never while holding it. ownStoreEcho maps each UID whose state the
-	// client has from such an answer to that state's mod-sequence, in mailbox
-	// ownStoreEchoMailboxID; Poll skips exactly those updates instead of
-	// reporting them again. Both fields are guarded by ownStoreMu.
+	// (RFC 7162 §3.1.3). So does a FETCH that implicitly sets \Seen, with
+	// FLAGS in its own FETCH responses (RFC 9051 §6.4.5). ownStoreMu
+	// serializes that STORE or FETCH with Poll so Poll can tell those rows
+	// from foreign changes; it is taken before s.mutex, never while holding
+	// it. ownStoreEcho maps each UID whose state the client has from such an
+	// answer to that state's mod-sequence, in mailbox ownStoreEchoMailboxID;
+	// Poll skips exactly those updates instead of reporting them again. Both
+	// fields are guarded by ownStoreMu.
 	ownStoreMu            sync.Mutex
 	ownStoreEcho          map[imap.UID]uint64
 	ownStoreEchoMailboxID int64
