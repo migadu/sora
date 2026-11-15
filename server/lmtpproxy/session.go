@@ -980,22 +980,26 @@ func (s *Session) extractAddress(param string) (address string, ok bool) {
 	// and this one has no domain.
 	param = strings.TrimSpace(param)
 	quoted := strings.HasPrefix(param, `"`)
+	if quoted && (len(param) < 2 || !strings.HasSuffix(param, `"`)) {
+		return "", false
+	}
 	param = server.UnquoteString(param)
 
 	if len(param) < 2 {
 		return "", false
 	}
 
-	// Handle <address> format with or without additional ESMTP parameters
-	// Extract everything between < and > (the address), ignoring anything after >
+	// Handle <address> format with or without space-separated ESMTP parameters
+	// (RFC 5321 section 4.1.2 requires SP before any parameters; nothing may
+	// follow > inside a quoted parameter).
 	if param[0] == '<' {
 		endIdx := strings.Index(param, ">")
-		if endIdx > 0 {
+		if endIdx > 0 && (endIdx+1 == len(param) || (!quoted && param[endIdx+1] == ' ')) {
 			// Found closing bracket - extract address between < and >
 			address = param[1:endIdx]
 			return address, address != "" || !quoted
 		}
-		// No closing bracket found - invalid format
+		// No valid closing bracket found - invalid format
 		return "", false
 	}
 

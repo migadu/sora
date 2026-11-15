@@ -23,6 +23,14 @@ func TestUnreadableReversePathRefused(t *testing.T) {
 		// no domain. A sora backend answers it as the other cases here.
 		{"quoted null path", `"<>"`},
 		{"quoted null path after a space", ` "<>"`},
+		{"trailing text after null path", "<>@example.org"},
+		{"second path after null path", "<><sender@example.org>"},
+		{"extra closing bracket after null path", "<>>"},
+		{"trailing text after path", "<sender@example.org>@other.org"},
+		{"quoted local part with inner closing bracket", `<"alice@evil.com>"@example.org>`},
+		{"unseparated parameter after path", "<sender@example.org>SIZE=999999999"},
+		{"quoted path with trailing text", `"<user@example.com> foo"`},
+		{"quoted path with trailing text after a space", ` "<user@example.com> foo"`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			backend := startNestedMailBackend(t)
@@ -96,6 +104,44 @@ func TestUnreadableReversePathRefused(t *testing.T) {
 		wantDelivered := "250 2.0.0 Delivered from <> to <a@example.com>"
 		if got := send("Subject: bounce\r\n\r\nhello\r\n."); got != wantDelivered {
 			t.Fatalf("end of data: %q, want %q", got, wantDelivered)
+		}
+	})
+
+	// Trailing characters immediately after ">" in RCPT TO (no SP before parameters)
+	// must be refused with 501 5.1.3 without reaching the backend or having the
+	// trailing text stripped as an ESMTP parameter.
+	t.Run("trailing text after forward-path", func(t *testing.T) {
+		backend := startNestedMailBackend(t)
+		conn, reader, _ := startNestedMailProxySession(t, backend.addr)
+		send := func(cmd string) string {
+			t.Helper()
+			if _, err := io.WriteString(conn, cmd+"\r\n"); err != nil {
+				t.Fatalf("writing %q: %v", cmd, err)
+			}
+			return readReply(t, reader)
+		}
+
+		if got := send("LHLO client.example.com"); !strings.HasPrefix(got, "250 ") {
+			t.Fatalf("LHLO: %q, want 250", got)
+		}
+		if got := send("MAIL FROM:<sender@example.com>"); !strings.HasPrefix(got, "250 ") {
+			t.Fatalf("MAIL FROM: %q, want 250", got)
+		}
+		for _, rcpt := range []string{
+			"RCPT TO:<a@example.com>@other.org",
+			"RCPT TO:<a@example.com>NOTIFY=NEVER",
+			`RCPT TO: "<a@example.com> NOTIFY=NEVER"`,
+		} {
+			want := "501 5.1.3 Bad recipient address syntax"
+			if got := send(rcpt); got != want {
+				t.Errorf("%s: %q, want %q", rcpt, got, want)
+			}
+		}
+		if got := send("DATA"); !strings.HasPrefix(got, "503 5.5.1 ") {
+			t.Errorf("DATA after refused RCPTs: %q, want 503 5.5.1", got)
+		}
+		for _, cmd := range backend.commands() {
+			t.Errorf("backend was sent %q for refused RCPT", cmd)
 		}
 	})
 }
