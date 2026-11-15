@@ -526,6 +526,11 @@ sora-admin --config config.toml messages restore --email user@example.com --ids 
 - Without `--confirm`, the command lists up to ten of the matching messages and asks
   `Continue with restoration? (yes/no)`. Only `yes` or `y` continues.
 - A mailbox that no longer exists is created again. Restored messages get new UIDs.
+- With sharing enabled in the config file you pass, a mailbox recreated in the shared namespace
+  is a shared mailbox of the account, as `mailbox create` makes one, and so is a parent recreated
+  there. The ACL entries it had before it was deleted are not restored: it starts with the
+  initial ACL of a new shared mailbox ([SHARED_MAILBOXES.md](SHARED_MAILBOXES.md)), and the
+  restore logs a warning naming it. Grant the rights again with `acl grant`.
 - Restores run in chunks, each committed on its own. If a run fails partway, the restored
   messages stay restored; run the same command again for the rest. Messages already back are
   skipped, not duplicated.

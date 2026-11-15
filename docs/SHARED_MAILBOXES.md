@@ -141,6 +141,9 @@ created it.
   [IMPORT_EXPORT.md](IMPORT_EXPORT.md).
 - The User API does not create shared folders: `POST /user/mailboxes` with a name in the shared
   namespace, the root included, is refused with `403`.
+- `sora-admin messages restore` and the Admin API restore recreate a deleted folder under the
+  prefix as a shared mailbox of the account, as `mailbox create` makes one, when sharing is
+  enabled. The ACL entries it had are not restored; it gets the initial ACL below.
 - Sieve `fileinto :create` never creates a folder in the shared namespace.
 
 ### The initial ACL
