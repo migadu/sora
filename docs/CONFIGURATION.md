@@ -757,7 +757,7 @@ to" column, "backends" means `imap`, `pop3`, `lmtp` and `managesieve`, and "line
 | `type` | string | required | all | See [section 5](#5-server-blocks). |
 | `name` | string | required | all | Unique name. |
 | `addr` | string | required | all | Listen address. |
-| `debug` | bool | `false` | backends, line proxies | Extra diagnostics for this server. Some protocols write a raw protocol trace to the log output whatever the level. On the HTTP servers it is ignored, with a startup warning. See [PROTOCOLS.md](PROTOCOLS.md). |
+| `debug` | bool | `false` | `imap`, `lmtp`, line proxies | Extra diagnostics for this server. Some protocols write a raw protocol trace to the log output whatever the level. On the other server types (`pop3` and `managesieve` included) it is ignored, with a startup warning. See [PROTOCOLS.md](PROTOCOLS.md). |
 
 ### 9.2 TLS on the listener
 
@@ -770,7 +770,7 @@ See [TLS.md](TLS.md).
 | `tls_cert_file`, `tls_key_file` | string | none | all but `metrics` | Certificate files for this listener. |
 | `tls_verify` | bool | `false` | all but `metrics` | See [TLS.md](TLS.md). |
 | `tls_default_domain` | string | `[tls.letsencrypt] default_domain` | all but `metrics` | Certificate for clients that send no SNI. |
-| `insecure_auth` | bool | `false` | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Allow password logins on a plain connection. Without `tls = true` it is always allowed. The other server types have no password login; on them the key is ignored, with a startup warning. See [SECURITY.md](SECURITY.md). |
+| `insecure_auth` | bool | `false` | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Allow password logins on a plain connection. Without `tls = true` it is always allowed. LMTP has no login and the HTTP servers do not use the key; on the other server types it is ignored, with a startup warning. See [SECURITY.md](SECURITY.md). |
 
 The `metrics` server always speaks plain HTTP. `tls` on it only causes a startup warning.
 

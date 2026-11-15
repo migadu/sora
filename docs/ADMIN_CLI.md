@@ -987,8 +987,13 @@ Notes on `clean`:
 - A local copy is removed only if it still holds an expired certificate when `clean` removes
   it. A renewal written over it during the run stays.
 
-`cache` writes files with mode `0600` as the user running the command. Run it as the user the
-server runs as, or fix the ownership afterwards.
+`cache` writes a new certificate with mode `0600` and a replacement with the mode of the file
+it replaces. When the directory belongs to another user, as the server's directory does when
+you run `cache` as root, each file it writes is given to that user; otherwise a replacement
+keeps the owner of the file it replaces. A missing directory is created with mode `0700`, as
+the server creates it, and given to the owner of the directory it is created in: for the
+default `/var/lib/sora/certs`, the owner of `/var/lib/sora`, the server's user under
+`dist/sora.service`. A directory created in a sticky directory such as `/tmp` stays yours.
 
 ---
 
