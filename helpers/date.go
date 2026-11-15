@@ -29,6 +29,10 @@ var alphabeticZone = regexp.MustCompile(`^[^:]*\d:\d{2}(?::\d{2})?([ \t]*)([A-Za
 // follows.
 var obsYear = regexp.MustCompile(`^[^:]*[ \t](\d{2,3})[ \t]+\d{1,2}:`)
 
+// leapSecond matches a date-time (RFC 5322 §3.3) up to the seconds of its time-of-day
+// (the field's first colon is the one after the hour) when they are 60: a leap second.
+var leapSecond = regexp.MustCompile(`^[^:]*\d:\d{2}:(60)(?:\D|$)`)
+
 // ParseDateHeader parses the value of a Date: header field (RFC 5322 §3.3), like
 // net/mail.ParseDate but reading an alphabetic zone by RFC 5322 §4.3 instead of by the
 // host's time zone, a two- or three-digit year by §4.3 too, and comments and white
@@ -51,6 +55,10 @@ var obsYear = regexp.MustCompile(`^[^:]*[ \t](\d{2,3})[ \t]+\d{1,2}:`)
 // the tokens (obs-day-of-week, obs-day, obs-year, obs-hour, obs-minute and obs-second
 // are each "[CFWS] ... [CFWS]"), so they are first reduced to the separators net/mail's
 // layouts have.
+//
+// A time-of-day whose second is 60, a leap second (§3.3: "the time-of-day MUST be in the
+// range 00:00:00 through 23:59:60"), is read as second 59 of the same minute, as Dovecot
+// reads it: time.Time cannot hold second 60, and net/mail.ParseDate does not parse it.
 func ParseDateHeader(value string) (time.Time, error) {
 	// Unfold exactly as net/mail does, without turning an unpaired CR or LF
 	// before the zone into valid white space during the replacement below.
@@ -59,6 +67,9 @@ func ParseDateHeader(value string) (time.Time, error) {
 		return mail.ParseDate(value)
 	}
 	unfolded = normalizeCFWS(unfolded)
+	if m := leapSecond.FindStringSubmatchIndex(unfolded); m != nil {
+		unfolded = unfolded[:m[2]] + "59" + unfolded[m[3]:]
+	}
 	if m := obsYear.FindStringSubmatchIndex(unfolded); m != nil {
 		year, _ := strconv.Atoi(unfolded[m[2]:m[3]])
 		if m[3]-m[2] == 2 && year < 50 {
@@ -73,8 +84,8 @@ func ParseDateHeader(value string) (time.Time, error) {
 		// Replace a whole zone token only. For example, PDT+0400 is not PDT:
 		// net/mail would discard the suffix after a numeric replacement. Keep
 		// its existing behavior for extensions it accepts, such as GMT+0000
-		// (unfolded is the value net/mail would see, with the separators and
-		// the year rewritten).
+		// (unfolded is the value net/mail would see, with the separators, the
+		// year and a leap second rewritten).
 		if end < len(unfolded) && unfolded[end] != ' ' && unfolded[end] != '\t' && unfolded[end] != '(' {
 			return mail.ParseDate(unfolded)
 		}
