@@ -368,8 +368,12 @@ func deleteAllMessagesInQueueDir(queueDir string) (int, error) {
 		metadataPath := filepath.Join(queueDir, name)
 		messagePath := filepath.Join(queueDir, id+".msg")
 
-		if err := os.Remove(metadataPath); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "Warning: Could not delete %s: %v\n", name, err)
+		if err := os.Remove(metadataPath); err != nil {
+			// A worker may have claimed the metadata since ReadDir. Its body can
+			// still be here until the second rename; leave that body to the worker.
+			if !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "Warning: Could not delete %s: %v\n", name, err)
+			}
 			continue
 		}
 		if err := os.Remove(messagePath); err != nil && !os.IsNotExist(err) {
