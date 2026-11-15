@@ -104,7 +104,11 @@ var (
 	errServerBusy      = &pop3server.Error{Code: "SYS/TEMP", Message: "Server busy, please try again"}
 	errInMaintenance   = &pop3server.Error{Code: "SYS/TEMP", Message: "Server in maintenance, please try again later"}
 	errMailboxTooBig   = &pop3server.Error{Code: "SYS/TEMP", Message: "Mailbox too large to open in this session"}
-	errBodyTooBig      = &pop3server.Error{Code: "SYS/TEMP", Message: "Message too large to retrieve in this session"}
+
+	// errBodyTooBig and errBodyMemoryBusy refuse a body the session memory budget
+	// cannot hold (bodyOverBudget).
+	errBodyTooBig     = &pop3server.Error{Code: "SYS/PERM", Message: "Message too large for the session memory limit"}
+	errBodyMemoryBusy = &pop3server.Error{Code: "SYS/TEMP", Message: "Session memory limit reached, please try again later"}
 
 	// errTooManyConnections refuses a login over max_connections_per_user or
 	// max_connections_per_user_per_ip, with the reply pop3_proxy sends.
@@ -496,7 +500,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		// a password check, which confirmed the master SASL username. Not recorded as
 		// a failure: the credentials were right.
 		if identity != "" && identity != username {
-			s.DebugLog("proxy authentication requires master credentials", "username", username, "identity", identity)
+			s.InfoLog("authorization failed", "address", userAddress.BaseAddress(), "authzid", identity, "method", method)
 			return 0, pop3AuthError("Proxy authentication requires master credentials")
 		}
 		authSuccess = true
@@ -510,8 +514,10 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	}
 
 	// Ensure default mailboxes exist
+	// The credentials checked out, so a failure from here on is the login's result: logged
+	// with the address, which the session's user field does not name yet.
 	if err := s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, accountID); err != nil {
-		s.DebugLog("error creating default mailboxes", "error", err)
+		s.WarnLog("error creating default mailboxes", "address", userAddress.BaseAddress(), "method", method, "error", err)
 		return 0, errTempUnavailable
 	}
 
@@ -519,7 +525,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	readCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
 	inboxMailboxID, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, accountID, consts.MailboxInbox)
 	if err != nil {
-		s.DebugLog("error getting inbox", "error", err)
+		s.WarnLog("error getting inbox", "address", userAddress.BaseAddress(), "method", method, "error", err)
 		return 0, errTempUnavailable
 	}
 
@@ -1082,9 +1088,7 @@ func (s *POP3Session) getMessageBody(ctx context.Context, msg *db.POP3Message) (
 	// body is already resident — too late to prevent the OOM. msg.Size is the stored
 	// metadata size, so this bounds the single allocation. (security-audit M13)
 	if s.memTracker != nil && msg.Size > 0 && !s.memTracker.CanAllocate(int64(msg.Size)) {
-		metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
-		s.WarnLog("session memory limit exceeded", "uid", msg.UID, "size", msg.Size)
-		return nil, errBodyTooBig
+		return nil, s.bodyOverBudget(msg.UID, msg.Size)
 	}
 
 	data, err := s.loadMessageBody(ctx, msg)
@@ -1095,12 +1099,31 @@ func (s *POP3Session) getMessageBody(ctx context.Context, msg *db.POP3Message) (
 	// Single accounting point for every source in loadMessageBody (cache, S3, disk).
 	if s.memTracker != nil {
 		if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-			metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
-			s.WarnLog("session memory limit exceeded", "uid", msg.UID, "size", len(data), "error", allocErr)
-			return nil, errBodyTooBig
+			return nil, s.bodyOverBudget(msg.UID, len(data))
 		}
 	}
 	return data, nil
+}
+
+// bodyOverBudget answers RETR or TOP of a body of size bytes the session memory budget
+// refused. The body is held beside the session's message list, so a body that does not
+// fit beside it can never be retrieved until an operator raises session_memory_limit:
+// RFC 3206 section 4 SYS/PERM, "problems which are unlikely to be resolved without
+// intervention", such as "system configuration errors". One that fits is refused only
+// because other data of the session holds the budget now: SYS/TEMP, "a problem which is
+// likely to be temporary in nature", such as "insufficient free disk or memory".
+func (s *POP3Session) bodyOverBudget(uid imap.UID, size int) *pop3server.Error {
+	s.mutex.RLock()
+	need := int64(size) + s.messagesMemBytes
+	s.mutex.RUnlock()
+	limit := s.memTracker.MaxAllowed()
+	perr := errBodyMemoryBusy
+	if limit > 0 && need > limit {
+		perr = errBodyTooBig
+	}
+	metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
+	s.WarnLog("session memory limit exceeded", "uid", uid, "size", size, "bytes", need, "limit", limit, "code", perr.Code)
+	return perr
 }
 
 // loadMessageBody returns the raw message body from the fastest available source.

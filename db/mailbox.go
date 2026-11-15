@@ -412,27 +412,39 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 		specialUseParam = &specialUse
 	}
 
-	// Insert the mailbox with shared mailbox fields
+	// Insert the mailbox with shared mailbox fields. A taken name, including one that
+	// a transaction committed while this INSERT waited on the unique index, is
+	// skipped by ON CONFLICT instead of raised: a unique violation aborts the
+	// caller's transaction, and the callers that tolerate ErrDBUniqueViolation
+	// (CreateMailboxForUser, GetOrCreateMailboxByNameWithRetry) read the existing
+	// mailbox back in it (issue #1396).
 	var mailboxID int64
 	err = tx.QueryRow(ctx, `
 		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path, is_shared, owner_domain, special_use)
 		VALUES ($1, $2, $3, $4, '', $5, $6, $7)
+		ON CONFLICT (account_id, LOWER(name)) WHERE deleted_at IS NULL DO NOTHING
 		RETURNING id
 	`, AccountID, name, int64(uidValidity), false, isShared, ownerDomain, specialUseParam).Scan(&mailboxID)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Distinct from a duplicate special-use attribute below, so the caller can
+		// return NO [ALREADYEXISTS] vs NO [USEATTR].
+		logger.Warn("Database: mailbox already exists", "name", name, "account_id", AccountID)
+		return consts.ErrDBUniqueViolation
+	}
 
 	// Handle errors, including unique constraint and foreign key violations
 	if err != nil {
 		// Use pgx/v5's pgconn.PgError for error handling
 		if pgErr, ok := err.(*pgconn.PgError); ok {
 			switch pgErr.Code {
-			case "23505": // Unique constraint violation
-				// Distinguish a duplicate special-use attribute (RFC 6154 §5) from a
-				// duplicate name so the caller can return NO [USEATTR] vs [ALREADYEXISTS].
+			case "23505": // Unique constraint violation (a taken name is ON CONFLICT's)
+				// A special-use attribute another mailbox holds, refused as a conflict
+				// (RFC 6154 §3).
 				if pgErr.ConstraintName == "mailboxes_account_special_use_unique" {
 					logger.Warn("Database: special-use attribute already assigned", "special_use", specialUse, "account_id", AccountID)
 					return consts.ErrMailboxSpecialUseInUse
 				}
-				logger.Warn("Database: mailbox already exists", "name", name, "account_id", AccountID)
 				return consts.ErrDBUniqueViolation
 			case "23503": // Foreign key violation
 				if pgErr.ConstraintName == "mailboxes_account_id_fkey" {
