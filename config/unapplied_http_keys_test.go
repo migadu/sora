@@ -194,9 +194,11 @@ func TestWarnUnusedConfigOptions_KeysOnlySomeServerTypesRead(t *testing.T) {
 		}, []string{"lmtp"}},
 
 		// The listener keys of the metrics endpoint, which is always plain HTTP and
-		// reads no PROXY header (#1326).
+		// reads no PROXY header (#1326). tls_verify is set with tls = true, which the
+		// other types need for it; on metrics the 'tls' warning does not name it.
 		{"tls_cert_file", func(s *ServerConfig) { s.TLSCertFile = "/etc/sora/cert.pem" }, allButMetrics},
 		{"tls_key_file", func(s *ServerConfig) { s.TLSKeyFile = "/etc/sora/key.pem" }, allButMetrics},
+		{"tls_verify", func(s *ServerConfig) { s.TLS, s.TLSVerify = true, true }, allButMetrics},
 		{"tls_default_domain", func(s *ServerConfig) { s.TLSDefaultDomain = "mail.example.com" }, allButMetrics},
 		{"proxy_protocol_timeout", func(s *ServerConfig) { s.ProxyProtocolTimeout = "10s" }, allButMetrics},
 	}
