@@ -77,10 +77,10 @@ func ClassifyDBError(err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch {
-		case pgErr.Code == "55P03": // lock_not_available — lock_timeout elapsed
-			return errors.Join(ErrDBLockTimeout, err)
 		case endsSession(pgErr):
 			return errors.Join(ErrConnectionClosed, err)
+		case pgErr.Code == "55P03": // lock_not_available — lock_timeout elapsed
+			return errors.Join(ErrDBLockTimeout, err)
 		}
 	}
 
