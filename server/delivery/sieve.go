@@ -65,7 +65,7 @@ func ResolveDefaultJunk(ctx context.Context, rdb *resilient.ResilientDatabase, a
 		return result, nil
 	}
 	if err != nil {
-		return result, fmt.Errorf("failed to look up the \\Junk mailbox: %w", err)
+		return result, err // already "failed to look up the \Junk mailbox: ..."
 	}
 	result.Mailboxes = slices.Clone(result.Mailboxes)
 	result.Mailboxes[i] = name
