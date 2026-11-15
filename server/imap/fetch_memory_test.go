@@ -95,6 +95,29 @@ func newFetchTestSession(limit int64) (*IMAPSession, *serverPkg.SessionMemoryTra
 	return &IMAPSession{server: &IMAPServer{}, memTracker: tracker}, tracker
 }
 
+// bodySectionsBeforeResponse runs, for msg's BODY sections, what
+// writeMessageFetchData runs before it sets the message's implicit \Seen and
+// opens its response: a refusal there fails the FETCH at this message with
+// nothing written and nothing set. write then writes the sections.
+func bodySectionsBeforeResponse(s *IMAPSession, bodyData *[]byte, bodyFetched *bool, options *imap.FetchOptions, msg *db.Message) (write func(bodySectionWriter) error, err error) {
+	ctx := context.Background()
+	if err := s.loadBodyForSections(ctx, msg, bodyData, bodyFetched, options); err != nil {
+		return nil, err
+	}
+	return func(w bodySectionWriter) error {
+		return s.handleBodySections(ctx, w, bodyData, bodyFetched, options, msg)
+	}, nil
+}
+
+// fetchBodySections runs msg's BODY sections through to the write.
+func fetchBodySections(s *IMAPSession, w bodySectionWriter, bodyData *[]byte, bodyFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
+	write, err := bodySectionsBeforeResponse(s, bodyData, bodyFetched, options, msg)
+	if err != nil {
+		return err
+	}
+	return write(w)
+}
+
 // TestFetch_BodySectionCopyIsCharged covers FETCH-1(a): the buffer the section extractor
 // allocates is a second full copy of the served bytes and must be visible to the session
 // memory tracker while it is live.
@@ -116,7 +139,7 @@ func TestFetch_BodySectionCopyIsCharged(t *testing.T) {
 	bodyFetched := true
 
 	options := &imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{section}}
-	if err := s.handleBodySections(context.Background(), w, &bodyData, &bodyFetched, options, fetchTestMessage(body)); err != nil {
+	if err := fetchBodySections(s, w, &bodyData, &bodyFetched, options, fetchTestMessage(body)); err != nil {
 		t.Fatalf("handleBodySections: %v", err)
 	}
 
@@ -146,7 +169,7 @@ func TestFetch_SectionOverBudgetIsRefused(t *testing.T) {
 	bodyData := body
 	bodyFetched := true
 
-	err := s.handleBodySections(context.Background(), w, &bodyData, &bodyFetched,
+	err := fetchBodySections(s, w, &bodyData, &bodyFetched,
 		&imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{section}}, fetchTestMessage(body))
 
 	var imapErr *imap.Error
@@ -183,7 +206,7 @@ func TestFetch_PartialChunksReuseExtractedSection(t *testing.T) {
 	w1 := &fakeBodySectionWriter{tracker: tracker}
 	bodyData := body
 	bodyFetched := true
-	if err := s.handleBodySections(context.Background(), w1, &bodyData, &bodyFetched,
+	if err := fetchBodySections(s, w1, &bodyData, &bodyFetched,
 		&imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{first}}, msg); err != nil {
 		t.Fatalf("first chunk: %v", err)
 	}
@@ -196,17 +219,17 @@ func TestFetch_PartialChunksReuseExtractedSection(t *testing.T) {
 	w2 := &fakeBodySectionWriter{tracker: tracker}
 	var noBody []byte
 	noBodyFetched := false
-	// Nor does loading the body ahead of the response, which is for sections
-	// the retained one cannot answer.
-	if err := s.loadBodyForSections(context.Background(), msg, &noBody, &noBodyFetched,
-		&imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{second}}); err != nil {
-		t.Fatalf("second chunk body load: %v", err)
+	// Nor does what runs ahead of the response, which loads the body for
+	// sections the retained one cannot answer.
+	write, err := bodySectionsBeforeResponse(s, &noBody, &noBodyFetched,
+		&imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{second}}, msg)
+	if err != nil {
+		t.Fatalf("second chunk before the response: %v", err)
 	}
 	if noBodyFetched {
 		t.Fatal("loading ahead of the second chunk consulted the body loader; the retained section answers it")
 	}
-	if err := s.handleBodySections(context.Background(), w2, &noBody, &noBodyFetched,
-		&imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{second}}, msg); err != nil {
+	if err := write(w2); err != nil {
 		t.Fatalf("second chunk: %v", err)
 	}
 	if len(w2.sections) != 1 {
@@ -244,7 +267,7 @@ func TestFetch_PartialOfMalformedBodyIsSliced(t *testing.T) {
 	w := &fakeBodySectionWriter{tracker: tracker}
 	bodyData := body
 	bodyFetched := true
-	if err := s.handleBodySections(context.Background(), w, &bodyData, &bodyFetched,
+	if err := fetchBodySections(s, w, &bodyData, &bodyFetched,
 		&imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{section}}, fetchTestMessage(body)); err != nil {
 		t.Fatalf("handleBodySections: %v", err)
 	}
@@ -267,7 +290,7 @@ func TestFetch_FullBodyOfMalformedMessageIsVerbatim(t *testing.T) {
 	w := &fakeBodySectionWriter{tracker: tracker}
 	bodyData := body
 	bodyFetched := true
-	if err := s.handleBodySections(context.Background(), w, &bodyData, &bodyFetched,
+	if err := fetchBodySections(s, w, &bodyData, &bodyFetched,
 		&imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{{}}}, fetchTestMessage(body)); err != nil {
 		t.Fatalf("handleBodySections: %v", err)
 	}
