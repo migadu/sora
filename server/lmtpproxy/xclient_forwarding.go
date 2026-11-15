@@ -77,10 +77,11 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 	// NewForwardingParams will extract real client IP from PROXY protocol or connection.
 	forwardingParams := server.NewForwardingParams(s.clientConn, s.proxyInfo)
 
-	// No session ID: XCLIENT has no attribute for it (Postfix XCLIENT_README: NAME, ADDR,
-	// PORT, PROTO, HELO, LOGIN, DESTADDR, DESTPORT), and the LMTP backend answers an
-	// attribute it does not advertise with 501, refusing the whole XCLIENT. The session ID
-	// reaches the backend in the PROXY v2 header (TLV 0xE1).
+	// No session ID: Postfix's XCLIENT has no attribute for it (XCLIENT_README: NAME, ADDR,
+	// PORT, PROTO, HELO, LOGIN, DESTADDR, DESTPORT). Dovecot's adds SESSION, but the Sora
+	// LMTP backend (go-smtp) advertises only ADDR PORT PROTO HELO LOGIN NAME and answers any
+	// other attribute with 501, refusing the whole XCLIENT. The session ID reaches the
+	// backend in the PROXY v2 header (TLV 0xE1).
 	//
 	// Use ESMTP for PROTO parameter as per Postfix XCLIENT spec (valid values: SMTP, ESMTP)
 	forwardingParams.Protocol = "ESMTP"
