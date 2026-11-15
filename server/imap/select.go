@@ -45,6 +45,9 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		}
 	}
 	AccountID := s.AccountID()
+	// The session's Recent baseline. Only SELECT and the poll of the selected mailbox
+	// move it, and the previous mailbox is no longer selected here.
+	lastSelectedMailboxID, lastHighestUID := s.lastSelectedMailboxID, s.lastHighestUID
 	release()
 
 	// Create a context that signals to use the master DB if the session is pinned.
@@ -104,15 +107,21 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		permanentFlags = getPermanentFlags(userRights)
 	}
 
-	// Read the mailbox summary, first-unseen sequence number, defined flags, and QRESYNC
-	// VANISHED/FETCH state inside one REPEATABLE READ READ ONLY transaction so every part
-	// of the SELECT response describes the exact MVCC snapshot whose EXISTS, UIDNEXT, and
-	// HIGHESTMODSEQ come from GetMailboxSummary. Changes committed by other sessions after
-	// that snapshot (including in-place message_state overwrites and expunges of newly
-	// delivered messages) remain invisible here and are reported by the session's next poll
-	// from HighestModSeq.
+	// This mailbox was the one most recently selected read-write in this session (and
+	// then unselected by the imapserver library).
+	isReselectOfPrevious := lastSelectedMailboxID == mailbox.ID
+
+	// Read the mailbox summary, RECENT count, first-unseen sequence number, defined flags,
+	// and QRESYNC VANISHED/FETCH state inside one REPEATABLE READ READ ONLY transaction so
+	// every part of the SELECT response describes the exact MVCC snapshot whose EXISTS,
+	// UIDNEXT, and HIGHESTMODSEQ come from GetMailboxSummary. Changes committed by other
+	// sessions after that snapshot (including in-place message_state overwrites and
+	// expunges of newly delivered messages) remain invisible here and are reported by the
+	// session's next poll from HighestModSeq.
 	var (
 		currentSummary    *db.MailboxSummary
+		numRecent         uint32
+		recentAbove       imap.UID // numRecent counts the messages above this UID
 		firstUnseenSeqNum uint32
 		displayFlags      []imap.Flag
 		vanishedUIDs      []imap.UID
@@ -120,6 +129,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 	)
 	if err := s.server.rdb.InReadSnapshotWithRetry(readCtx, func(snapCtx context.Context) error {
 		currentSummary = nil
+		numRecent, recentAbove = 0, 0
 		firstUnseenSeqNum = 0
 		displayFlags = nil
 		vanishedUIDs = nil
@@ -130,6 +140,49 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 			return err
 		}
 		currentSummary = summary
+
+		// RFC 3501 §2.3.2: \Recent messages are those that arrived since the last
+		// time any read-write session selected this mailbox.
+		//
+		// We use a server-wide map (mailboxRecentUIDs) that records the highest UID
+		// at the time of the last read-write SELECT by ANY session on this server.
+		// This is correct for single-node deployments. The state is in-memory and
+		// resets on restart; true cross-node \Recent tracking would require a
+		// persistent store. Without a baseline (no read-write SELECT of this mailbox
+		// since server start) all messages are recent.
+		//
+		// On a reselect, a read-only open did not advance our last read-write
+		// baseline, and another session may since have consumed newer Recent while
+		// this mailbox was closed here, so the older of the two must not revive
+		// those messages.
+		//
+		// The count runs in the snapshot of EXISTS, so that RECENT counts among the
+		// messages EXISTS counts. No UID in the snapshot is above UIDNEXT-1, so a
+		// baseline there (a reselect or another session's SELECT without new mail)
+		// needs no statement.
+		numRecent = uint32(summary.NumMessages)
+		baseline, hasBaseline := s.server.mailboxRecentUIDs.Load(mailbox.ID)
+		if isReselectOfPrevious {
+			baseline, hasBaseline = max(baseline, lastHighestUID), true
+		}
+		if hasBaseline && int64(baseline) >= summary.UIDNext-1 {
+			numRecent, recentAbove = 0, baseline
+		} else if hasBaseline {
+			nonFatalErr, fatalErr := s.server.rdb.OptionalReadInSnapshot(snapCtx, func(spCtx context.Context) error {
+				count, countErr := s.server.rdb.CountMessagesGreaterThanUIDWithRetry(spCtx, mailbox.ID, baseline)
+				if countErr != nil {
+					return countErr
+				}
+				numRecent, recentAbove = count, baseline
+				return nil
+			})
+			if fatalErr != nil {
+				return fatalErr
+			}
+			if nonFatalErr != nil {
+				s.DebugLog("error counting messages greater than UID, defaulting RECENT to total", "uid", baseline, "mailbox_id", mailbox.ID, "error", nonFatalErr)
+			}
+		}
 
 		// Extract the first unseen message sequence number lazily for SELECT only.
 		// We do not compute this in GetMailboxSummary to avoid O(N) counts in background STATUS checks.
@@ -231,78 +284,6 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		return nil
 	}); err != nil {
 		return nil, s.internalError("failed to get current summary for selected mailbox '%s': %v", mboxName, err)
-	}
-
-	// First, acquire the read lock once to read necessary session state
-	acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(ctx)
-	if !acquired {
-		s.WarnLog("failed to acquire second read lock within timeout")
-		return nil, &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeServerBug,
-			Text: "Server busy, please try again",
-		}
-	}
-
-	// Check if this is a reselection of the previously selected mailbox
-	isReselectOfPrevious := (s.lastSelectedMailboxID == mailbox.ID)
-	// Store the highest UID from previous selection to calculate recent messages
-	uidToCompareAgainst := s.lastHighestUID
-	// Check if the context is already cancelled before proceeding with DB operations
-	if ctx.Err() != nil {
-		release()
-		s.DebugLog("context already cancelled before selecting mailbox", "mailbox", mboxName)
-		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed during select operation"}
-	}
-	release()
-
-	// Now perform all database operations outside the lock
-	var numRecent uint32
-	var recentAbove imap.UID // numRecent counts the messages above this UID
-
-	if isReselectOfPrevious {
-		s.DebugLog("mailbox reselected", "mailbox", mboxName)
-		// A read-only open did not advance our last read-write baseline. Another
-		// session may since have consumed newer Recent while this mailbox was
-		// closed here, so an older local baseline must not revive those messages.
-		if lastSeenUID, ok := s.server.mailboxRecentUIDs.Load(mailbox.ID); ok {
-			uidToCompareAgainst = max(uidToCompareAgainst, lastSeenUID)
-		}
-		// This mailbox was the one most recently selected (and then unselected by the imapserver library).
-		// Count messages with UID > uidToCompareAgainst. Use the potentially master-pinned context.
-		count, dbErr := s.server.rdb.CountMessagesGreaterThanUIDWithRetry(readCtx, mailbox.ID, uidToCompareAgainst)
-		if dbErr != nil {
-			s.DebugLog("error counting messages greater than UID, defaulting RECENT to total", "uid", uidToCompareAgainst, "mailbox_id", mailbox.ID, "error", dbErr)
-			numRecent = uint32(currentSummary.NumMessages) // Fallback
-		} else {
-			numRecent = count
-			recentAbove = uidToCompareAgainst
-		}
-	} else {
-		// Different mailbox or first select in this session.
-		// RFC 3501 §2.3.2: \Recent messages are those that arrived since the last
-		// time any read-write session selected this mailbox.
-		//
-		// We use a server-wide map (mailboxRecentUIDs) that records the highest UID
-		// at the time of the last read-write SELECT by ANY session on this server.
-		// This is an improvement over the previous per-session-only approach (which
-		// reported ALL messages as recent for any new session) and is correct for
-		// single-node deployments.  The state is in-memory and resets on restart;
-		// true cross-node \Recent tracking would require a persistent store.
-		if lastSeenUID, ok := s.server.mailboxRecentUIDs.Load(mailbox.ID); ok {
-			count, dbErr := s.server.rdb.CountMessagesGreaterThanUIDWithRetry(readCtx, mailbox.ID, lastSeenUID)
-			if dbErr != nil {
-				s.DebugLog("error counting recent messages from server-wide UID, defaulting to total", "uid", lastSeenUID, "mailbox_id", mailbox.ID, "error", dbErr)
-				numRecent = uint32(currentSummary.NumMessages)
-			} else {
-				numRecent = count
-				recentAbove = lastSeenUID
-			}
-		} else {
-			// No previous read-write SELECT on any session for this mailbox (since
-			// server start).  All messages are considered recent.
-			numRecent = uint32(currentSummary.NumMessages)
-		}
 	}
 
 	// Acquire the lock once after all DB operations to update session state
