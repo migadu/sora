@@ -62,3 +62,59 @@ func TestValidateScriptRefusesUnrequiredComparatorAndLateTag(t *testing.T) {
 		t.Errorf("deleteheader without value patterns, required comparator with :contains: %v", err)
 	}
 }
+
+// TestValidateScriptRefusesUnrequiredRegex is issue #1235: header, hasflag and
+// string refused :regex without require "regex", but address, envelope, body,
+// date, currentdate and deleteheader loaded it and ran the regex.
+//
+// RFC 5228 §2.10.5: "If an extension is not enabled with "require",
+// implementations MUST treat it as if they did not support it at all."
+func TestValidateScriptRefusesUnrequiredRegex(t *testing.T) {
+	// editheader is not in the default set.
+	editheader := []string{"editheader", "regex"}
+	refused := []struct {
+		name   string
+		script string
+		exts   []string
+	}{
+		{"header", `if header :regex "Subject" "^x" { stop; }`, nil},
+		{"hasflag", `require "imap4flags"; if hasflag :regex "^x" { stop; }`, nil},
+		{"string", `require "variables"; if string :regex "abc" "^a" { stop; }`, nil},
+		{"address", `if address :regex "from" "^x" { stop; }`, nil},
+		{"envelope", `require "envelope"; if envelope :regex "from" "^x" { stop; }`, nil},
+		{"body", `require "body"; if body :regex "^x" { stop; }`, nil},
+		{"date", `require "date"; if date :regex "date" "year" "^2" { stop; }`, nil},
+		{"currentdate", `require "date"; if currentdate :regex "year" "^2" { stop; }`, nil},
+		{"deleteheader", `require "editheader"; deleteheader :regex "X-Foo" "^x";`, editheader},
+		{"deleteheader without value patterns", `require "editheader"; deleteheader :regex "X-Foo";`, editheader},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateScript(tc.script, tc.exts)
+			if err == nil {
+				t.Fatal("ValidateScript accepted the script")
+			}
+			if !strings.Contains(err.Error(), "missing require 'regex'") {
+				t.Fatalf("ValidateScript: %v, want missing require 'regex'", err)
+			}
+		})
+	}
+
+	accepted := []struct {
+		script string
+		exts   []string
+	}{
+		{`require "regex"; if header :regex "Subject" "^x" { stop; }`, nil},
+		{`require "regex"; if address :regex "from" "^x" { stop; }`, nil},
+		{`require ["envelope", "regex"]; if envelope :regex "from" "^x" { stop; }`, nil},
+		{`require ["body", "regex"]; if body :regex "^x" { stop; }`, nil},
+		{`require ["date", "regex"]; if date :regex "date" "year" "^2" { stop; }`, nil},
+		{`require ["date", "regex"]; if currentdate :regex "year" "^2" { stop; }`, nil},
+		{`require ["editheader", "regex"]; deleteheader :regex "X-Foo" "^x";`, editheader},
+	}
+	for _, tc := range accepted {
+		if err := ValidateScript(tc.script, tc.exts); err != nil {
+			t.Errorf("ValidateScript(%s): %v", tc.script, err)
+		}
+	}
+}
