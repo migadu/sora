@@ -610,6 +610,11 @@ Examples:
 
 	db := rdb.GetOperationalDatabase()
 
+	// With the shared mailbox config, db.RenameMailbox refuses a rename across the
+	// shared namespace boundary, as on "mailbox rename" and IMAP RENAME: a personal
+	// mailbox whose name decodes onto namespace_prefix stays where it is.
+	renameCtx := context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: globalConfig.SharedMailboxes})
+
 	// Fetch all affected mailboxes, decode their names, and process them
 	// shallowest-first. RenameMailbox cascades name changes to children,
 	// so after renaming a parent its children's prefixes are updated.
@@ -739,7 +744,7 @@ Examples:
 				if len(ids) > 1 {
 					parentID = &ids[len(ids)-2]
 				}
-				err = rdb.RenameMailboxWithRetry(ctx, r.MailboxID, r.AccountID, decoded, parentID)
+				err = rdb.RenameMailboxWithRetry(renameCtx, r.MailboxID, r.AccountID, decoded, parentID)
 			}
 			if err != nil {
 				fmt.Printf("  FAIL  account_id=%-6d  %q  ->  %q  (error: %v)\n", r.AccountID, r.MailboxName, decoded, err)
