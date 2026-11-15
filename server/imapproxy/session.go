@@ -928,10 +928,10 @@ func (s *Session) authenticateUser(username, password string) error {
 				// positive_ttl to allow periodic revalidation via remotelookup/database.
 				// This ensures that when a domain moves backends or password changes,
 				// active users eventually pick up the changes.
-				s.DebugLog("cache hit - using cached auth", "username", username, "account_id", cached.AccountID, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
+				s.accountID = cached.AccountID
+				s.DebugLog("cache hit - using cached auth", "username", username, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
 				metrics.LookupCacheResults.WithLabelValues("imap_proxy", "hit").Inc()
 
-				s.accountID = cached.AccountID
 				s.isRemoteLookupAccount = cached.FromRemoteLookup
 				// Rebuilt exactly as the uncached login routed (proxy.RouteFromCache): the pin,
 				// its enforcement and every backend-leg setting the lookup answer carried.
@@ -1096,9 +1096,9 @@ func (s *Session) authenticateUser(username, password string) error {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// RemoteLookup returned success - use routing info
-				s.DebugLog("remotelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
-				metrics.RemoteLookupResult.WithLabelValues("imap", "success").Inc()
 				s.accountID = routingInfo.AccountID
+				s.DebugLog("remotelookup successful", "master_auth_validated", masterAuthValidated)
+				metrics.RemoteLookupResult.WithLabelValues("imap", "success").Inc()
 				s.isRemoteLookupAccount = routingInfo.IsRemoteLookupAccount
 				s.routingInfo = routingInfo
 
@@ -1151,7 +1151,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// For master username, this shouldn't happen (password already validated)
 				// For others, reject immediately
 				if masterAuthValidated {
-					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "user", username)
+					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "username", username)
 				}
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
@@ -1239,12 +1239,12 @@ func (s *Session) authenticateUser(username, password string) error {
 			// temporary failure (NO [UNAVAILABLE]), not a failed login charged to the master
 			// credential. The bare sentinel, because the reply carries the error's text.
 			if server.IsTemporaryAuthFailure(err) {
-				s.WarnLog("authentication unavailable", "method", "master", "user", address.BaseAddress(), "error", err)
+				s.WarnLog("authentication unavailable", "method", "master", "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
 				return server.ErrAuthServiceUnavailable
 			}
 
-			s.InfoLog("master auth failed - account not found", "user", address.BaseAddress(), "error", err)
+			s.InfoLog("master auth failed - account not found", "error", err)
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 			metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 			return fmt.Errorf("account not found: %w", err)

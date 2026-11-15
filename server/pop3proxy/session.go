@@ -241,10 +241,10 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					// positive_ttl to allow periodic revalidation via remotelookup/database.
 					// This ensures that when a domain moves backends or password changes,
 					// active users eventually pick up the changes.
-					s.DebugLog("cache hit - using cached auth", "username", username, "account_id", cached.AccountID, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
+					s.accountID = cached.AccountID
+					s.DebugLog("cache hit - using cached auth", "username", username, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
 					metrics.LookupCacheResults.WithLabelValues("pop3_proxy", "hit").Inc()
 
-					s.accountID = cached.AccountID
 					s.isRemoteLookupAccount = cached.FromRemoteLookup
 					// Rebuilt exactly as the uncached login routed (proxy.RouteFromCache): the pin,
 					// its enforcement and every backend-leg setting the lookup answer carried.
@@ -407,9 +407,9 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// RemoteLookup returned success - use routing info
-				s.DebugLog("remotelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
-				metrics.RemoteLookupResult.WithLabelValues("pop3", "success").Inc()
 				s.accountID = routingInfo.AccountID
+				s.DebugLog("remotelookup successful", "master_auth_validated", masterAuthValidated)
+				metrics.RemoteLookupResult.WithLabelValues("pop3", "success").Inc()
 				s.isRemoteLookupAccount = routingInfo.IsRemoteLookupAccount
 				s.routingInfo = routingInfo
 
@@ -474,7 +474,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				// For master username, this shouldn't happen (password already validated)
 				// For others, reject immediately
 				if masterAuthValidated {
-					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "user", username)
+					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "username", username)
 				}
 
 				// Cache negative result (wrong password)
@@ -565,7 +565,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			// temporary failure (-ERR [SYS/TEMP]), not a failed login charged to the master
 			// credential.
 			if server.IsTemporaryAuthFailure(err) {
-				s.WarnLog("authentication unavailable", "method", "master", "user", address.BaseAddress(), "error", err)
+				s.WarnLog("authentication unavailable", "method", "master", "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
 				return server.ErrAuthServiceUnavailable
 			}
