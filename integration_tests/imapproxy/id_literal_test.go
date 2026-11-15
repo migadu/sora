@@ -92,8 +92,11 @@ func TestIMAPProxyIDWithLiterals(t *testing.T) {
 			if strings.HasPrefix(l, "A2 OK") {
 				sawLoginOK = true
 			}
-			if strings.Contains(l, "Command not supported before authentication") ||
-				strings.Contains(l, "Command is missing") {
+			// Anything but an untagged reply, a continuation or a reply to
+			// A1/A2 is the proxy answering a literal payload line read
+			// back as a command, whatever the error wording.
+			if !strings.HasPrefix(l, "A1 ") && !strings.HasPrefix(l, "A2 ") &&
+				!strings.HasPrefix(l, "* ") && !strings.HasPrefix(l, "+") {
 				t.Fatalf("literal payload was read as a command: %v", lines)
 			}
 		}
