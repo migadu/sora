@@ -726,13 +726,25 @@ With `remote_use_id_command`, the IMAP proxy sends one `ID` command before it lo
 are `name` (`Sora-Proxy`), `x-originating-ip`, `x-originating-port`, `x-connected-ip`,
 `x-connected-port`, `x-session-id`, `x-proxy-ttl` (10), and `x-forward-proxy-server`,
 `x-forward-proxy-user`, `x-forward-proxy-source-ip` and, when known, `x-forward-ja4-fingerprint`. A
-failure is logged and the login continues.
+backend that refuses it (a tagged `NO` or `BAD`) is logged and the login continues without the
+fields. When the tagged reply is not read within `connect_timeout`, or the connection fails before
+it, the login fails as a backend failure (`NO [UNAVAILABLE]`): a late reply would be read as the
+reply to the login.
 
 ### 8.6 XCLIENT
 
 With `remote_use_xclient`, the POP3 proxy sends `XCLIENT ADDR=... PORT=... SESSION=... TTL=10
 FORWARD=...` before it logs in; the LMTP proxy sends `XCLIENT ADDR=... PORT=... HELO=...
-PROTO=ESMTP` (IPv6 addresses as `ADDR=IPV6:...`).
+PROTO=ESMTP` (IPv6 addresses as `ADDR=IPV6:...`) before `MAIL FROM`.
+
+A refusal (POP3 `-ERR`; LMTP `5xx`, or `4xx` other than `421`) is logged and the session
+continues. The client's address can still have been supplied by a PROXY header. When the reply
+is not read within `connect_timeout` (for an LMTP
+backend that answers with a new `220` greeting, also the reply to the `LHLO` the proxy then sends),
+the backend connection fails: POP3 answers `-ERR [SYS/TEMP]`, LMTP `451 4.4.1`. A late reply would
+otherwise be read as the reply to the next command (POP3 replies carry no tag, so a late `+OK` would
+pass for the login's). The LMTP connection also fails on a `421`, on a malformed reply or one with
+any other code, and when the backend does not answer that `LHLO` with `250`.
 
 ### 8.7 POP3 UTF8
 
