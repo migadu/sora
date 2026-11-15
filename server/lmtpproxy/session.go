@@ -295,6 +295,13 @@ func (s *Session) handleConnection() {
 				s.sendResponse("503 5.5.1 Please introduce yourself first.")
 				continue
 			}
+			// RFC 5321 section 4.1.1.2: MAIL is only permitted when no mail transaction
+			// is in progress; a nested MAIL gets 503 5.5.1 (matching go-smtp's reply)
+			// and leaves the open transaction and any held backend untouched.
+			if s.mailFromReceived {
+				s.sendResponse("503 5.5.1 Sender already specified")
+				continue
+			}
 			fromParam, found := findParameter(args, "FROM:")
 			if !found {
 				s.sendResponse("501 5.5.4 Syntax error in MAIL command (missing FROM)")
@@ -588,8 +595,8 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			// No recipient accepted: 503 (RFC 2033 section 4.2), answered here whether or
-			// not a backend is held. A held one may lack this transaction's MAIL, or still
-			// have an earlier transaction open after a MAIL sent within it.
+			// not a backend is held. A held one lacks this transaction's MAIL until the
+			// first recipient is routed, or holds no transaction after RSET or DATA.
 			if s.acceptedRcpts == 0 {
 				s.sendResponse("503 5.5.1 Bad sequence of commands (no valid recipients)")
 				continue
