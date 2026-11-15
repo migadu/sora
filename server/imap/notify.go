@@ -3,6 +3,7 @@ package imap
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"time"
 
@@ -75,7 +76,8 @@ type notifySnapshotEntry struct {
 // notifyWatch is the per-session NOTIFY state installed by SetNotify. After
 // installation it is only touched by the pump goroutine (the library
 // guarantees NotifyPoll is stopped before SetNotify runs again), except for
-// the pointer swap itself, which is guarded by IMAPSession.notifyMutex.
+// the pointer swap itself and own, which are guarded by
+// IMAPSession.notifyMutex.
 type notifyWatch struct {
 	options *imap.NotifyOptions
 
@@ -109,6 +111,100 @@ type notifyWatch struct {
 	// fetchAttempts counts the ticks in a row whose fetch failed at
 	// nextFetchUID (see notifyMaxFetchAttempts).
 	fetchAttempts int
+
+	// own is written by APPEND and MOVE on the command goroutine too.
+	own notifyOwnMessages
+}
+
+// notifyOwnMessages records the messages this connection's own APPEND and
+// MOVE added to the selected mailbox. RFC 5465 §5.2: "A FETCH response SHOULD
+// NOT be generated for a new message created by the client on this particular
+// connection, for instance, as the result of an APPEND or COPY command to the
+// selected mailbox performed by the client itself." The client has their UIDs
+// from APPENDUID and COPYUID. (A COPY never adds to the selected mailbox: its
+// source is that mailbox, and a COPY into its own source is refused.)
+type notifyOwnMessages struct {
+	// writes counts the own writes into the selected mailbox still in flight.
+	// One may already have committed under a UID it has not recorded yet, so
+	// the MessageNew fetch waits until none is.
+	writes    int
+	mailboxID int64
+	uids      imap.UIDSet
+}
+
+// beginOwnMessages is called by APPEND and MOVE before they add messages to
+// mailboxID. When a NOTIFY watch sends MessageNew fetch-atts and mailboxID is
+// the selected mailbox, the write is announced to the watch, and the returned
+// function, which the caller must call once the write is done, records the
+// UIDs it created (none when it failed). Otherwise the function does nothing.
+func (s *IMAPSession) beginOwnMessages(mailboxID int64) (done func(created ...imap.UID)) {
+	s.notifyMutex.Lock()
+	watch := s.notifyWatch
+	s.notifyMutex.Unlock()
+	if watch == nil || watch.selected == nil || watch.selected.MessageNewFetch == nil {
+		return func(...imap.UID) {}
+	}
+	if selectedID, ok := s.currentSelectedMailboxID(); !ok || selectedID != mailboxID {
+		return func(...imap.UID) {}
+	}
+
+	s.notifyMutex.Lock()
+	watch.own.writes++
+	s.notifyMutex.Unlock()
+	return func(created ...imap.UID) {
+		s.notifyMutex.Lock()
+		defer s.notifyMutex.Unlock()
+		watch.own.writes--
+		if len(created) == 0 {
+			return
+		}
+		if watch.own.mailboxID != mailboxID {
+			watch.own.mailboxID, watch.own.uids = mailboxID, nil
+		}
+		watch.own.uids.AddNum(created...)
+	}
+}
+
+// ownMessages returns the UIDs from nextFetchUID on that this connection's
+// own writes added to the selected mailbox, forgetting the ones the fetch has
+// passed and those of a mailbox no longer selected. busy reports an own write
+// still in flight, whose UIDs are not known yet.
+func (s *IMAPSession) ownMessages(watch *notifyWatch) (uids imap.UIDSet, busy bool) {
+	s.notifyMutex.Lock()
+	defer s.notifyMutex.Unlock()
+	own := &watch.own
+	if own.mailboxID != watch.selectedMailboxID {
+		own.mailboxID, own.uids = watch.selectedMailboxID, nil
+	}
+	passed := 0
+	for passed < len(own.uids) && own.uids[passed].Stop < watch.nextFetchUID {
+		passed++
+	}
+	own.uids = own.uids[passed:]
+	return slices.Clone(own.uids), own.writes > 0
+}
+
+// uidRangeExcept returns the UIDs from first to last that are not in except,
+// which is sorted and merged, as UIDSet.AddNum keeps it.
+func uidRangeExcept(first, last imap.UID, except imap.UIDSet) imap.UIDSet {
+	var set imap.UIDSet
+	for _, r := range except {
+		if r.Stop < first {
+			continue
+		}
+		if r.Start > last {
+			break
+		}
+		if r.Start > first {
+			set.AddRange(first, r.Start-1)
+		}
+		if r.Stop >= last {
+			return set
+		}
+		first = r.Stop + 1
+	}
+	set.AddRange(first, last)
+	return set
 }
 
 // hasSelectedMessageEvents reports whether the watch requests message events
@@ -872,6 +968,14 @@ func (s *IMAPSession) notifyFetchNewMessages(ctx context.Context, watch *notifyW
 		upper = watch.nextFetchUID + imap.UID(notifyMaxFetchPerTick) - 1
 	}
 
+	// The messages this connection added itself get no FETCH (RFC 5465 §5.2).
+	// While one of its writes is in flight, one of them may be up to fetchUpto
+	// unrecorded: wait for a later tick.
+	own, busy := s.ownMessages(watch)
+	if busy {
+		return nil
+	}
+
 	// This is an unsolicited FETCH, not the answer to a FETCH command, so
 	// RFC 7162 §3.1 applies in full: a CONDSTORE-aware client gets
 	// "mod-sequence data in all subsequent untagged FETCH responses", and
@@ -893,8 +997,11 @@ func (s *IMAPSession) notifyFetchNewMessages(ctx context.Context, watch *notifyW
 	// cannot be read right now (NO [UNAVAILABLE]), is retried on the next
 	// tick, until notifyMaxFetchAttempts gives the message up.
 	for watch.nextFetchUID <= upper {
-		var uidSet imap.UIDSet
-		uidSet.AddRange(watch.nextFetchUID, upper)
+		uidSet := uidRangeExcept(watch.nextFetchUID, upper, own)
+		if len(uidSet) == 0 {
+			watch.nextFetchUID, watch.fetchAttempts = upper+1, 0
+			return nil
+		}
 		var progress fetchProgress
 		err := s.fetch(ctx, w.FetchWriter(), uidSet, &options, &progress)
 		if err == nil {
