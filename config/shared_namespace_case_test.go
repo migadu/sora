@@ -21,3 +21,30 @@ func TestSharedNamespaceMatchesMailboxCaseRules(t *testing.T) {
 		}
 	}
 }
+
+func TestSharedNamespaceRootMatchesMailboxCaseRules(t *testing.T) {
+	for _, tc := range []struct {
+		prefix, name string
+		enabled      bool
+		want         bool
+	}{
+		{"Shared/", "Shared", true, true},
+		{"Shared/", "sHARED", true, true},
+		{"Public/Rooms/", "public/ROOMS", true, true},
+		{"Shared/", "Shared", false, false},
+		{"Shared/", "Shared/Team", true, false},
+		{"Shared/", "Shared/", true, false},
+		{"Shared/", "SharedDocs", true, false},
+		{"Public/Rooms/", "Public", true, false},
+		{"Shared/", "", true, false},
+	} {
+		cfg := SharedMailboxesConfig{Enabled: tc.enabled, NamespacePrefix: tc.prefix}
+		got := cfg.IsNamespaceRoot(tc.name)
+		if got != tc.want {
+			t.Errorf("%q is the root of %q (enabled=%v) = %v, want %v", tc.name, tc.prefix, tc.enabled, got, tc.want)
+		}
+		if got && !cfg.InNamespace(tc.name) {
+			t.Errorf("%q is the root of %q but not in its namespace", tc.name, tc.prefix)
+		}
+	}
+}

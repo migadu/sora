@@ -99,6 +99,8 @@ func startTracedIMAPServer(t *testing.T, source *resilient.ResilientDatabase, tr
 var (
 	qrsExistsRe      = regexp.MustCompile(`^\* (\d+) EXISTS$`)
 	qrsFetchRe       = regexp.MustCompile(`^\* (\d+) FETCH \(`)
+	qrsFetchFlagsRe  = regexp.MustCompile(`FLAGS \(([^)]*)\)`)
+	qrsSelectFlagsRe = regexp.MustCompile(`^\* FLAGS \(([^)]*)\)$`)
 	qrsModSeqRe      = regexp.MustCompile(`MODSEQ \((\d+)\)`)
 	qrsHighestRe     = regexp.MustCompile(`^\* OK \[HIGHESTMODSEQ (\d+)\]`)
 	qrsUnseenRe      = regexp.MustCompile(`^\* OK \[UNSEEN (\d+)\]`)
@@ -159,13 +161,14 @@ func mailboxUIDsAt(t *testing.T, rdb *resilient.ResilientDatabase, mailboxID int
 	return uids
 }
 
-// TestIMAP_QResyncSelectDescribesOneState is the regression test for #1293: a QRESYNC
-// SELECT took EXISTS and HIGHESTMODSEQ from the mailbox summary, then read the vanished
-// UIDs, the changes and their sequence numbers (and [UNSEEN n]) in later statements, each
-// in its own snapshot. A delivery committing after the summary was sent as a FETCH past
-// the EXISTS, a flag change as a FETCH past the HIGHESTMODSEQ, and an expunge shifted the
-// numbers of the FETCHes after it and, with known UIDs, was reported as VANISHED
-// (EARLIER) while EXISTS still counted the message.
+// TestIMAP_QResyncSelectDescribesOneState is the regression test for #1293 and #1380: a
+// QRESYNC SELECT took EXISTS and HIGHESTMODSEQ from the mailbox summary, then read the
+// vanished UIDs, the changes and their sequence numbers, [UNSEEN n], and FLAGS in later
+// statements, each in its own READ COMMITTED snapshot. Even when post-summary reads are
+// bounded by HIGHESTMODSEQ (#1360), a post-summary flag overwrite on a message already
+// changed or delivered in (cached, H] advances ms.updated_modseq past H and drops the
+// message from SELECT's FETCH responses (#1380), while [UNSEEN n] and FLAGS read live
+// message_state/custom_flags_cache instead of the snapshot at H.
 //
 // The SELECT is paused just after the summary while another session writes. Its response
 // must describe the mailbox as of the HIGHESTMODSEQ it sends (RFC 9051 §2.3.1.2: a client
@@ -178,16 +181,45 @@ func TestIMAP_QResyncSelectDescribesOneState(t *testing.T) {
 		return fmt.Sprintf("From: sender@example.com\r\nTo: user@example.com\r\nSubject: snapshot %d\r\n\r\nbody %d\r\n", n, n)
 	}
 
+	hasFlagFold := func(flags []string, want string) bool {
+		return slices.ContainsFunc(flags, func(f string) bool { return strings.EqualFold(f, want) })
+	}
+
 	cases := []struct {
 		name      string
 		knownUIDs string // the client's known-uids, or none
 		// write commits from another session while the SELECT is paused.
-		write func(w *rawIMAP)
+		write         func(w *rawIMAP)
+		wantNoopFlags map[imap.UID][]string
 	}{
 		{name: "delivery after the summary", write: func(w *rawIMAP) { w.appendMsg("INBOX", msg(5)) }},
 		{name: "flag change after the summary", write: func(w *rawIMAP) { w.do(`UID STORE 1 +FLAGS.SILENT (\Answered)`) }},
 		{name: "expunge after the summary", write: func(w *rawIMAP) { w.do("EXPUNGE") }},
 		{name: "expunge after the summary with known UIDs", knownUIDs: "1:3", write: func(w *rawIMAP) { w.do("EXPUNGE") }},
+		{
+			name: "flag change and seen on modified message after the summary",
+			write: func(w *rawIMAP) {
+				w.do(`UID STORE 3 +FLAGS.SILENT (\Seen \Answered $AfterSummary)`)
+			},
+			wantNoopFlags: map[imap.UID][]string{
+				3: {`\Seen`, `\Answered`, `\Flagged`, `$AfterSummary`},
+			},
+		},
+		{
+			name: "delete and expunge of new message after the summary",
+			write: func(w *rawIMAP) {
+				w.do(`UID STORE 4 +FLAGS.SILENT (\Deleted)`)
+				w.do("UID EXPUNGE 4")
+			},
+		},
+		{
+			name:      "delete and expunge of new message after the summary with known UIDs",
+			knownUIDs: "1:3",
+			write: func(w *rawIMAP) {
+				w.do(`UID STORE 4 +FLAGS.SILENT (\Deleted)`)
+				w.do("UID EXPUNGE 4")
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -263,11 +295,23 @@ func TestIMAP_QResyncSelectDescribesOneState(t *testing.T) {
 			view := mailboxUIDsAt(t, server.ResilientDB, mailbox.ID, highest)
 			require.Equalf(t, len(view), int(exists), "* %d EXISTS, but the mailbox at HIGHESTMODSEQ %d holds %v", exists, highest, view)
 
-			var fetched []imap.UID
+			var (
+				fetched        []imap.UID
+				selectVanished []imap.UID
+				fetchedBySeq   = make(map[int]imap.UID)
+				fetchedFlags   = make(map[imap.UID][]string)
+			)
 			for _, l := range lines {
+				if m := qrsSelectFlagsRe.FindStringSubmatch(l); m != nil {
+					flags := strings.Fields(m[1])
+					assert.Falsef(t, hasFlagFold(flags, "$AfterSummary"),
+						"%s leaks keyword added after * OK [HIGHESTMODSEQ %d]", l, highest)
+					continue
+				}
 				if m := qrsVanishedRe.FindStringSubmatch(l); m != nil {
 					assert.NotEmptyf(t, m[1], "a SELECT reports expunges as VANISHED (EARLIER): %s", l)
 					for _, uid := range qrsUIDSet(t, m[2]) {
+						selectVanished = append(selectVanished, uid)
 						assert.Falsef(t, slices.Contains(view, uid),
 							"%s reports UID %d, which * %d EXISTS still counts in %v", l, uid, exists, view)
 					}
@@ -282,6 +326,10 @@ func TestIMAP_QResyncSelectDescribesOneState(t *testing.T) {
 				require.NotNilf(t, um, "QRESYNC FETCH without UID: %s", l)
 				uid := imap.UID(mustAtoi(t, um[1]))
 				fetched = append(fetched, uid)
+				fetchedBySeq[seq] = uid
+				if fm := qrsFetchFlagsRe.FindStringSubmatch(l); fm != nil {
+					fetchedFlags[uid] = strings.Fields(fm[1])
+				}
 				assert.Truef(t, seq >= 1 && seq <= len(view) && view[seq-1] == uid,
 					"%s does not name that message in the mailbox %v announced by * %d EXISTS", l, view, exists)
 				if mm := qrsModSeqRe.FindStringSubmatch(l); mm != nil {
@@ -290,32 +338,68 @@ func TestIMAP_QResyncSelectDescribesOneState(t *testing.T) {
 					assert.LessOrEqualf(t, modSeq, highest, "%s reports a change past * OK [HIGHESTMODSEQ %d]", l, highest)
 				}
 			}
-			// UIDs 2 and 3 changed after the client's mod-sequence and before HIGHESTMODSEQ,
-			// and both are still in the mailbox at HIGHESTMODSEQ.
-			for _, uid := range []imap.UID{2, 3} {
-				assert.Containsf(t, fetched, uid, "the SELECT does not report the flag change of UID %d", uid)
+			// UIDs 2, 3 and 4 changed (or arrived) after the client's mod-sequence and before
+			// HIGHESTMODSEQ, and all three are in the mailbox at HIGHESTMODSEQ.
+			for _, uid := range []imap.UID{2, 3, 4} {
+				assert.Containsf(t, fetched, uid, "the SELECT does not report the change of UID %d", uid)
+			}
+			if flags, ok := fetchedFlags[2]; ok {
+				assert.Truef(t, hasFlagFold(flags, `\Seen`) && hasFlagFold(flags, `\Deleted`),
+					"UID 2 flags at HIGHESTMODSEQ must include \\Seen and \\Deleted, got %v", flags)
+			}
+			if flags, ok := fetchedFlags[3]; ok {
+				assert.Truef(t, hasFlagFold(flags, `\Flagged`),
+					"UID 3 flags at HIGHESTMODSEQ must include \\Flagged, got %v", flags)
+				assert.Falsef(t, hasFlagFold(flags, `\Seen`) || hasFlagFold(flags, `\Answered`) || hasFlagFold(flags, `$AfterSummary`),
+					"UID 3 flags at HIGHESTMODSEQ must not include post-summary flags, got %v", flags)
+			}
+			if flags, ok := fetchedFlags[4]; ok {
+				assert.Falsef(t, hasFlagFold(flags, `\Deleted`),
+					"UID 4 flags at HIGHESTMODSEQ must not include post-summary \\Deleted, got %v", flags)
 			}
 
-			// UIDs 1 and 2 are \Seen, so the first unseen message is UID 3.
+			// UIDs 1 and 2 are \Seen, so the first unseen message at HIGHESTMODSEQ is UID 3.
 			unseen, ok := qrsNumber(t, qrsUnseenRe, lines)
-			require.True(t, ok, "no [UNSEEN n] in the SELECT response")
-			assert.Truef(t, unseen >= 1 && int(unseen) <= len(view) && view[unseen-1] == 3,
-				"[UNSEEN %d] does not name UID 3, the first unseen message of %v", unseen, view)
-			if t.Failed() {
-				return
+			if assert.True(t, ok, "no [UNSEEN n] in the SELECT response") {
+				assert.Truef(t, unseen >= 1 && int(unseen) <= len(view) && view[unseen-1] == 3,
+					"[UNSEEN %d] does not name UID 3, the first unseen message of %v", unseen, view)
 			}
+
+			// Reconstruct the client's UID map solely from its cached [1, 2, 3] plus
+			// SELECT's VANISHED (EARLIER), EXISTS, and FETCH responses (RFC 7162 §3.2.5.2).
+			client := []imap.UID{1, 2, 3}
+			for _, uid := range selectVanished {
+				if i := slices.Index(client, uid); i >= 0 {
+					client = slices.Delete(client, i, i+1)
+				}
+			}
+			require.LessOrEqualf(t, len(client), int(exists),
+				"cached UIDs remaining after VANISHED (EARLIER) (%v) exceed * %d EXISTS", client, exists)
+			for len(client) < int(exists) {
+				client = append(client, 0)
+			}
+			for seq, uid := range fetchedBySeq {
+				if seq >= 1 && seq <= len(client) {
+					assert.Truef(t, client[seq-1] == 0 || client[seq-1] == uid,
+						"SELECT FETCH at seq %d gives UID %d, conflicting with client view %v", seq, uid, client)
+					client[seq-1] = uid
+				}
+			}
+			assert.Equal(t, view, client,
+				"client UID map reconstructed from cached [1 2 3] + SELECT responses must match mailbox at HIGHESTMODSEQ")
 
 			// The next poll reports what happened after HIGHESTMODSEQ.
-			client := slices.Clone(view)
+			noopFlags := make(map[imap.UID][]string)
 			noop, _ := c.do("NOOP")
 			t.Logf("NOOP response:\n%s", strings.Join(noop, "\n"))
 			for _, l := range noop {
 				if m := qrsVanishedRe.FindStringSubmatch(l); m != nil {
-					require.Emptyf(t, m[1], "a poll reports expunges as VANISHED without EARLIER: %s", l)
+					assert.Emptyf(t, m[1], "a poll reports expunges as VANISHED without EARLIER: %s", l)
 					for _, uid := range qrsUIDSet(t, m[2]) {
 						i := slices.Index(client, uid)
-						require.GreaterOrEqualf(t, i, 0, "%s names a message the client does not have in %v", l, client)
-						client = slices.Delete(client, i, i+1)
+						if assert.GreaterOrEqualf(t, i, 0, "%s names a message the client does not have in %v", l, client) {
+							client = slices.Delete(client, i, i+1)
+						}
 					}
 				} else if m := qrsExistsRe.FindStringSubmatch(l); m != nil {
 					n := mustAtoi(t, m[1])
@@ -325,15 +409,32 @@ func TestIMAP_QResyncSelectDescribesOneState(t *testing.T) {
 					}
 				} else if m := qrsFetchRe.FindStringSubmatch(l); m != nil {
 					seq := mustAtoi(t, m[1])
-					require.Truef(t, seq >= 1 && seq <= len(client), "%s is past the %d messages of %v", l, len(client), client)
-					if um := uidRe.FindStringSubmatch(l); um != nil {
-						uid := imap.UID(mustAtoi(t, um[1]))
-						require.Truef(t, client[seq-1] == 0 || client[seq-1] == uid, "%s does not name that message in %v", l, client)
-						client[seq-1] = uid
+					if assert.Truef(t, seq >= 1 && seq <= len(client), "%s is past the %d messages of %v", l, len(client), client) {
+						if um := uidRe.FindStringSubmatch(l); um != nil {
+							uid := imap.UID(mustAtoi(t, um[1]))
+							assert.Truef(t, client[seq-1] == 0 || client[seq-1] == uid, "%s does not name that message in %v", l, client)
+							client[seq-1] = uid
+							if fm := qrsFetchFlagsRe.FindStringSubmatch(l); fm != nil {
+								noopFlags[uid] = strings.Fields(fm[1])
+							}
+							if mm := qrsModSeqRe.FindStringSubmatch(l); mm != nil {
+								modSeq, err := strconv.ParseUint(mm[1], 10, 64)
+								require.NoError(t, err)
+								assert.Greaterf(t, modSeq, highest, "%s in NOOP does not advance past SELECT HIGHESTMODSEQ %d", l, highest)
+							}
+						}
 					}
 				}
 			}
-			require.Equal(t, mailboxUIDsAt(t, server.ResilientDB, mailbox.ID, 1<<62), client,
+			for uid, want := range tc.wantNoopFlags {
+				got, ok := noopFlags[uid]
+				if assert.Truef(t, ok, "NOOP did not deliver post-summary flag update for UID %d", uid) {
+					for _, f := range want {
+						assert.Truef(t, hasFlagFold(got, f), "NOOP FETCH for UID %d missing flag %s in %v", uid, f, got)
+					}
+				}
+			}
+			assert.Equal(t, mailboxUIDsAt(t, server.ResilientDB, mailbox.ID, 1<<62), client,
 				"after the next poll the client's view must be the mailbox")
 		})
 	}
