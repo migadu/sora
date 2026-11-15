@@ -181,8 +181,7 @@ Things to know:
 After parsing, Sora checks the configuration before it opens any listener. Each failed check below
 stops startup with exit status 1. The checks on the file itself run before logging is set up, so
 they write a line of the form `[ERROR] <date> <time> ERROR: invalid configuration - <what>: <reason>`
-to standard error, one for each problem the file has. The `[timeout_scheduler]` check runs after it,
-so its failure is an ERROR record of the `[logging]` output, in its format.
+to standard error, one for each problem the file has.
 
 | Check | Message |
 |---|---|
@@ -216,7 +215,7 @@ so its failure is an ERROR record of the `[logging]` output, in its format.
 | An IMAP, POP3 or LMTP server is configured and `[cleanup]` has a negative `grace_period`, `max_age_restriction`, `fts_retention` or `health_status_retention`, or an `instance_liveness_threshold` of zero or less | `[cleanup]: <key> must not be negative, got "<value>"` or `[cleanup]: instance_liveness_threshold must be positive, got "<value>"` |
 | An IMAP, POP3 or LMTP server is configured and `[uploader]` has a `batch_size`, `concurrency` or `max_attempts` of zero or less, a `cleanup_grace_period` of zero or less or that is not a duration, or a `retry_interval` of zero or less | `[uploader] <key> must be positive, got <n>`, `[uploader] cleanup_grace_period must be positive, got "<value>"`, `[uploader] cleanup_grace_period: <parse error>` or `[uploader] retry_interval must be positive, got "<value>"` |
 | `[shared_mailboxes] enabled = true` and `namespace_prefix` is not a mailbox name followed by `/` (for example `""`, `"Shared"` or `"Shared//"`), or is `INBOX/` in any letter case | `[shared_mailboxes]: namespace_prefix "<value>" must be a mailbox name followed by the hierarchy delimiter "/", such as "Shared/"` or `[shared_mailboxes]: namespace_prefix "<value>" conflicts with the reserved personal INBOX` |
-| `[timeout_scheduler] shard_count` is below -1 | `msg="Fatal error" operation="initialize timeout scheduler" error="invalid shard count: <n> (must be >= -1)"` |
+| `[timeout_scheduler] shard_count` is below -1 | `[timeout_scheduler]: shard_count must be >= -1, got <n>` |
 
 The address check compares the strings, so `":143"` and `"0.0.0.0:143"` pass it and fail later when
 the second listener cannot bind.
@@ -241,8 +240,8 @@ These conditions only log, and startup continues:
 Later steps can still fail, for example a TLS certificate that cannot be read, or a database that
 cannot be reached. Those are covered in the topic documents.
 
-`sora-admin config validate` runs every check in this list but the `[timeout_scheduler]` one,
-without starting anything. See [ADMIN_CLI.md](ADMIN_CLI.md).
+`sora-admin config validate` runs every check in this list, without starting anything. See
+[ADMIN_CLI.md](ADMIN_CLI.md).
 
 ---
 
@@ -360,8 +359,8 @@ Adding, removing or renaming a `[[server]]` block also needs a restart, and Sora
 removed blocks. A new block is not started, and a running server whose block was removed or renamed
 keeps running with its old settings.
 
-A reload also runs the checks of [section 4](#4-checks-at-startup) that
-`sora-admin config validate` runs (all but `[timeout_scheduler]`) on the new file. For each problem
+A reload also runs the checks of [section 4](#4-checks-at-startup), the ones
+`sora-admin config validate` runs, on the new file. For each problem
 it logs an error, for example
 `Config reload: [cluster] is invalid and the server will not start with this config`, with the
 reason in `error`, so a file the next restart would refuse is caught at the reload. It still
