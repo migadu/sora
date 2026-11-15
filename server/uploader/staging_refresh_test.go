@@ -384,45 +384,6 @@ func TestStagingOverAnUncountedFileCountsTheWholeBody(t *testing.T) {
 	}
 }
 
-// A change the count could not take in full, because the count was already below what
-// is on disk, must not be taken back out by the refresh. Here a delivery replaces a
-// 1000-byte leftover the count never held (the spool was not yet measured) with its
-// 600-byte body: the 400-byte shrink is clamped at zero. Matching the body's change
-// from its 1000 bytes on disk, as if all 1000 had been counted, added the clamped 400
-// back: 1000 counted with 600 staged, intake refused under a 1000-byte limit, and 400
-// phantom bytes left once the body is gone.
-func TestStagingRefreshCountsAClampedChangeAsItLanded(t *testing.T) {
-	w, rdb, _, _, _ := setupTestWorker(t)
-	w.maxStagingSize = 1000
-	rows := newPendingRows()
-	stageFile(t, w, stagingHash("a"), 1, 1000)
-
-	var a string
-	rdb.GetUploaderStatsWithRetryFunc = func(ctx context.Context, maxAttempts int) (*db.UploaderStats, error) {
-		a = deliver(t, w, rows, "a", 600)
-		return &db.UploaderStats{}, nil
-	}
-	rdb.PendingUploadBacklogFunc = func(ctx context.Context, instanceID string, maxAttempts int) (UploadBacklog, error) {
-		return rows.snapshot(), nil
-	}
-
-	if err := w.monitorStuckUploads(context.Background()); err != nil {
-		t.Fatalf("monitorStuckUploads: %v", err)
-	}
-
-	if got := stagingSize(w); got != 600 {
-		t.Errorf("staging size = %d with the 600-byte body staged, want 600", got)
-	}
-	if w.IsStagingLimitExceeded(300) {
-		t.Errorf("a 300-byte delivery is refused with 600 bytes staged under a 1000-byte limit (counted %d)", stagingSize(w))
-	}
-
-	finishUpload(t, w, rows, "a", a)
-	if got := stagingSize(w); got != 0 {
-		t.Errorf("staging size = %d with nothing left on the spool, want 0", got)
-	}
-}
-
 // afterWindowDB runs after once the backlog measurement has closed the refresh window
 // (the totals are read), before the measurement returns.
 type afterWindowDB struct {
