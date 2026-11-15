@@ -308,3 +308,53 @@ func TestIMAP_Examine_NotifyMessageNewDoesNotSetSeen(t *testing.T) {
 		t.Errorf("NOTIFY MessageNew FETCH (BODY[]) set \\Seen in a mailbox opened with EXAMINE: %v", untagged)
 	}
 }
+
+// TestIMAP_Examine_ReadOnly_RejectsMove: RFC 9051 §6.3.3 permits "No changes to
+// the permanent state of the mailbox" opened with EXAMINE, and RFC 6851 §3.3
+// gives MOVE "the same effect for each message as this sequence: 1. [UID] COPY
+// 2. [UID] STORE +FLAGS.SILENT \DELETED 3. UID EXPUNGE", the last two of which
+// are refused after EXAMINE. MOVE and UID MOVE must be refused the same way and
+// leave the message in the source mailbox and out of the destination (#1058).
+func TestIMAP_Examine_ReadOnly_RejectsMove(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c := dialRawIMAP(t, server.Address)
+	c.do(fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password))
+	c.do("CREATE Other")
+	uid := c.appendMsg("INBOX", "From: a@example.com\r\nSubject: s\r\n\r\nbody\r\n")
+
+	if _, tagged := c.do("EXAMINE INBOX"); !strings.Contains(tagged, "OK [READ-ONLY]") {
+		t.Fatalf("EXAMINE INBOX: %s, want OK [READ-ONLY]", tagged)
+	}
+	for _, cmd := range []string{"MOVE 1 Other", fmt.Sprintf("UID MOVE %d Other", uid)} {
+		tag := c.send(cmd)
+		untagged, tagged := c.read(tag, cmd)
+		if !strings.HasPrefix(tagged, tag+" NO ") {
+			t.Errorf("%s after EXAMINE: %s, want a tagged NO", cmd, tagged)
+		}
+		for _, line := range untagged {
+			if strings.HasSuffix(line, " EXPUNGE") || strings.Contains(line, "COPYUID") {
+				t.Errorf("%s after EXAMINE answered %q", cmd, line)
+			}
+		}
+	}
+
+	// The message is still in INBOX and never reached Other.
+	if untagged, _ := c.do("STATUS Other (MESSAGES)"); !strings.Contains(strings.Join(untagged, "\r\n"), "(MESSAGES 0)") {
+		t.Errorf("STATUS Other after a refused MOVE: %v, want MESSAGES 0", untagged)
+	}
+	if untagged, _ := c.do("SELECT INBOX"); !slices.Contains(untagged, "* 1 EXISTS") {
+		t.Errorf("SELECT INBOX after a refused MOVE: %v, want * 1 EXISTS", untagged)
+	}
+
+	// The same MOVE in a read-write selection still moves the message.
+	if _, tagged := c.do("MOVE 1 Other"); !strings.Contains(tagged, "OK") {
+		t.Fatalf("MOVE after SELECT: %s", tagged)
+	}
+	if untagged, _ := c.do("STATUS Other (MESSAGES)"); !strings.Contains(strings.Join(untagged, "\r\n"), "(MESSAGES 1)") {
+		t.Errorf("STATUS Other after MOVE in a read-write selection: %v, want MESSAGES 1", untagged)
+	}
+}
