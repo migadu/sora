@@ -171,6 +171,10 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 	// The client's numbering holds still until the last response (seqViewMu).
 	s.seqViewMu.RLock()
 	defer s.seqViewMu.RUnlock()
+	endFetch := s.beginFetch()
+	defer endFetch()
+	// A Seen update may have pinned reads to the primary while beginFetch waited.
+	ctx = s.pinnedContext(ctx)
 
 	// First, safely read necessary session state and decode the sequence numbers all within a single read lock
 	var selectedMailboxID int64
@@ -355,9 +359,12 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 		}
 
 		var seenChanged map[imap.UID]bool
+		var seenAnswer *implicitSeenAnswer
 		if markSeen {
 			uidsToMarkSeen := unseenMessageUIDs(messages)
 			if len(uidsToMarkSeen) > 0 {
+				seenAnswer = s.lockImplicitSeenAnswer(selectedMailboxID)
+				defer seenAnswer.release()
 				batchResults, err := s.server.rdb.AddMessageFlagsBatchWithRetry(ctx, uidsToMarkSeen, selectedMailboxID, []imap.Flag{imap.FlagSeen})
 				if err != nil {
 					s.DebugLog("failed to batch mark messages as seen", "error", err)
@@ -365,6 +372,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 					s.useMasterDB.Store(true)
 					seenChanged = applyImplicitSeenUpdates(messages, batchResults)
 				}
+				seenAnswer.expect(seenChanged, view.tracker)
 			}
 		}
 
@@ -382,6 +390,11 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			if err := s.writeMessageFetchData(ctx, w, &msg, msgOptions, selectedMailboxID, preview); err != nil {
 				writeErr = err
 				return err
+			}
+			// The response carried the \Seen the update set (a message
+			// without a sequence number is skipped, not answered).
+			if seenChanged[msg.UID] && msg.Seq != 0 {
+				seenAnswer.answered(msg.UID, uint64(*msg.UpdatedModSeq))
 			}
 		}
 		return nil
