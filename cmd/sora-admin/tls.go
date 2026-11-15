@@ -1361,14 +1361,38 @@ func foreignOwner(info os.FileInfo) *fileOwner {
 // sticky directory such as /tmp each user's entries are their own, so what is made in
 // one stays its maker's.
 func makeCacheDir(dir string) error {
-	err := os.Mkdir(dir, 0700)
-	if parent := filepath.Dir(dir); errors.Is(err, fs.ErrNotExist) && parent != dir {
-		if err = makeCacheDir(parent); err == nil {
-			err = os.Mkdir(dir, 0700)
+	if info, err := os.Stat(dir); err == nil {
+		if !info.IsDir() {
+			return &fs.PathError{Op: "mkdir", Path: dir, Err: syscall.ENOTDIR}
+		}
+		return nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+
+	// Resolve configured parent symlinks once, then keep that directory open through
+	// creation and hand-over. Its owner may replace an ancestor after Mkdir; opening
+	// dir by its full path then could give an unrelated directory away instead.
+	// Split without cleaning the parent: a configured symlink followed by ".."
+	// must retain its filesystem meaning. Ignore trailing separators on a new leaf.
+	dir = strings.TrimRight(dir, string(filepath.Separator))
+	parentPath, name := filepath.Split(dir)
+	if parentPath == "" {
+		parentPath = "."
+	}
+	parent, err := os.OpenRoot(parentPath)
+	if errors.Is(err, fs.ErrNotExist) && parentPath != dir {
+		if err = makeCacheDir(parentPath); err == nil {
+			parent, err = os.OpenRoot(parentPath)
 		}
 	}
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
+	err = parent.Mkdir(name, 0700)
 	if errors.Is(err, fs.ErrExist) {
-		info, statErr := os.Stat(dir)
+		info, statErr := parent.Stat(name)
 		if statErr == nil && !info.IsDir() {
 			statErr = &fs.PathError{Op: "mkdir", Path: dir, Err: syscall.ENOTDIR}
 		}
@@ -1378,29 +1402,27 @@ func makeCacheDir(dir string) error {
 		return err
 	}
 
-	parent, err := os.Stat(filepath.Dir(dir))
-	if err == nil && parent.Mode()&fs.ModeSticky == 0 {
-		if owner := foreignOwner(parent); owner != nil {
-			if err = giveDir(dir, owner); err != nil {
+	parentInfo, err := parent.Stat(".")
+	if err == nil && parentInfo.Mode()&fs.ModeSticky == 0 {
+		if owner := foreignOwner(parentInfo); owner != nil {
+			if err = giveDir(parent, name, owner); err != nil {
 				err = fmt.Errorf("give %s to the owner of %s (%d:%d): %w", dir, filepath.Dir(dir), owner.uid, owner.gid, err)
 			}
 		}
 	}
 	if err != nil {
-		os.Remove(dir)
+		parent.Remove(name)
 	}
 	return err
 }
 
-// giveDir gives dir, a directory this process has just created, to owner. It opens dir
-// without following a symbolic link: the owner, who may write its parent, could have
-// replaced it with a link to a file of root's.
-func giveDir(dir string, owner *fileOwner) error {
-	fd, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+// giveDir gives the directory name, just created under the held parent, to owner.
+// Neither an ancestor replacement nor a leaf symlink may redirect the hand-over.
+func giveDir(parent *os.Root, name string, owner *fileOwner) error {
+	f, err := parent.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return &fs.PathError{Op: "open", Path: dir, Err: err}
+		return err
 	}
-	f := os.NewFile(uintptr(fd), dir)
 	defer f.Close()
 	return chownFile(f, owner.uid, owner.gid)
 }

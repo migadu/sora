@@ -315,7 +315,65 @@ func TestTLSCacheGiveDirDoesNotFollowALink(t *testing.T) {
 		return nil
 	}
 
-	if err := giveDir(link, &fileOwner{uid: os.Geteuid(), gid: os.Getegid()}); err == nil {
+	parent, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	if err := giveDir(parent, filepath.Base(link), &fileOwner{uid: os.Geteuid(), gid: os.Getegid()}); err == nil {
 		t.Error("giveDir succeeded on a symbolic link")
+	}
+}
+
+// A server-owned ancestor can be replaced after creation but before hand-over.
+// Hold the parent directory rather than resolving that ancestor again for chown.
+func TestTLSCacheGiveDirDoesNotFollowAnAncestorReplacement(t *testing.T) {
+	top := t.TempDir()
+	parent := filepath.Join(top, "state")
+	outside := filepath.Join(top, "unrelated")
+	for _, path := range []string{parent, filepath.Join(outside, "certs")} {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	untouched, err := os.Stat(filepath.Join(outside, "certs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	realGeteuid, realChown := geteuid, chownFile
+	t.Cleanup(func() { geteuid, chownFile = realGeteuid, realChown })
+	flipped, gaveCreated := false, false
+	geteuid = func() int {
+		if !flipped {
+			flipped = true
+			if err := os.Rename(parent, parent+"-created"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, parent); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return os.Geteuid() + 1
+	}
+	chownFile = func(f *os.File, uid, gid int) error {
+		info, err := f.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(info, untouched) {
+			t.Error("giveDir gave an unrelated directory away through a replaced ancestor")
+		}
+		created, err := os.Stat(filepath.Join(parent+"-created", "certs"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		gaveCreated = os.SameFile(info, created)
+		return nil
+	}
+	if err := makeCacheDir(filepath.Join(parent, "certs")); err != nil {
+		t.Fatal(err)
+	}
+	if !flipped || !gaveCreated {
+		t.Errorf("ancestor replaced=%v, ownership given to the created directory=%v", flipped, gaveCreated)
 	}
 }
