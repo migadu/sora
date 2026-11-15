@@ -1161,27 +1161,39 @@ func (db *Database) mapSeqNumCriteriaToUID(ctx context.Context, mailboxID int64,
 	var seqNums []int64
 	collectSeqNums(c, &seqNums)
 	uidBySeq := map[uint32]imap.UID{}
+	var liveLastUID imap.UID
+	var hasLiveLast bool
 	if len(seqNums) > 0 {
 		var err error
-		if uidBySeq, err = db.uidsBySeqNum(ctx, mailboxID, seqNums); err != nil {
+		if uidBySeq, liveLastUID, hasLiveLast, err = db.uidsBySeqNumAndLiveLast(ctx, mailboxID, seqNums); err != nil {
 			return err
 		}
 	}
-	rewriteSeqNumCriteria(c, uidBySeq)
+	rewriteSeqNumCriteria(c, uidBySeq, liveLastUID, hasLiveLast)
 	return nil
 }
 
 // uidsBySeqNum returns the UID at each of the given sequence numbers, in ctx's view
 // (WithSeqView). A sequence number past the last message is missing from the result.
 // Key zero always contains the last UID (of a live message, or in a view of the view's
-// last message), for wildcard resolution and clipping out-of-bounds range ends.
+// last message), for sequence wildcard resolution and clipping out-of-bounds range ends.
 func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums []int64) (map[uint32]imap.UID, error) {
+	uidBySeq, _, _, err := db.uidsBySeqNumAndLiveLast(ctx, mailboxID, seqNums)
+	return uidBySeq, err
+}
+
+// uidsBySeqNumAndLiveLast is uidsBySeqNum plus the mailbox's highest live UID from the
+// same MVCC snapshot, used to resolve '*' in UID <sequence-set> criteria (RFC 9051
+// §6.4.4, §9) independently of ctx's sequence-number view.
+func (db *Database) uidsBySeqNumAndLiveLast(ctx context.Context, mailboxID int64, seqNums []int64) (map[uint32]imap.UID, imap.UID, bool, error) {
 	args := []any{mailboxID, slices.Max(seqNums), seqNums}
+	view := seqViewOf(ctx)
 	viewParam := ""
-	last := `SELECT uid FROM messages
+	liveLast := `SELECT uid FROM messages
 			WHERE mailbox_id = $1 AND expunged_at IS NULL
 			ORDER BY uid DESC LIMIT 1`
-	if view := seqViewOf(ctx); view > 0 {
+	last := liveLast
+	if view > 0 {
 		args = append(args, int64(view))
 		viewParam = "$4"
 		// The view's last message is its last live one or a later one it still
@@ -1209,27 +1221,42 @@ func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums [
 	query += ` UNION ALL
 		SELECT 0 AS seqnum, last.uid FROM (` + last + `) last
 		WHERE last.uid IS NOT NULL`
+	if view > 0 {
+		query += ` UNION ALL
+		SELECT -1::bigint AS seqnum, live.uid FROM (` + liveLast + `) live
+		WHERE live.uid IS NOT NULL`
+	}
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to map sequence numbers to UIDs: %w", err)
+		return nil, 0, false, fmt.Errorf("failed to map sequence numbers to UIDs: %w", err)
 	}
 	defer rows.Close()
 
 	uidBySeq := make(map[uint32]imap.UID, len(seqNums))
+	var liveLastUID imap.UID
+	var hasLiveLast bool
 	for rows.Next() {
 		var seq int64
 		var uid int64
 		if err := rows.Scan(&seq, &uid); err != nil {
-			return nil, fmt.Errorf("failed to scan sequence number mapping: %w", err)
+			return nil, 0, false, fmt.Errorf("failed to scan sequence number mapping: %w", err)
+		}
+		if seq < 0 {
+			liveLastUID = imap.UID(uid)
+			hasLiveLast = true
+			continue
 		}
 		uidBySeq[uint32(seq)] = imap.UID(uid)
 	}
 	// An error the server raises while the statement runs (a statement timeout, a
 	// dropped connection) arrives here rather than from Query.
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to map sequence numbers to UIDs: %w", err)
+		return nil, 0, false, fmt.Errorf("failed to map sequence numbers to UIDs: %w", err)
 	}
-	return uidBySeq, nil
+	if view == 0 {
+		liveLastUID, hasLiveLast = uidBySeq[0]
+	}
+	return uidBySeq, liveLastUID, hasLiveLast, nil
 }
 
 // appendSeqSetNums includes zero as a marker for a target-mailbox '*' lookup.
@@ -1297,28 +1324,29 @@ func collectSeqNums(c *imap.SearchCriteria, seqNums *[]int64) {
 	}
 }
 
-// rewriteSeqNumCriteria replaces c's sequence sets, nested ones included, with the UID
-// sets they name according to uidBySeq (see seqSetToUIDSet). A set naming no message at
-// all becomes UID 0, which matches nothing.
-func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID) {
+// rewriteSeqNumCriteria resolves '*' in c's UID sets against liveLastUID (when
+// hasLiveLast holds) and replaces c's sequence sets, nested ones included, with the
+// UID sets they name according to uidBySeq (see seqSetToUIDSet). A sequence set naming
+// no message at all becomes UID 0, which matches nothing.
+func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID, liveLastUID imap.UID, hasLiveLast bool) {
 	if c == nil {
 		return
 	}
-	// UID '*' denotes the last live UID, not MaxUint32. Resolve it before
-	// appending sequence rewrites, whose UID 0 sentinel deliberately matches none.
+	// UID '*' denotes the last live UID in the mailbox (RFC 9051 §6.4.4, §9), not
+	// the session view's last slot and not MaxUint32. Resolve it before appending
+	// sequence rewrites, whose UID 0 sentinel deliberately matches none.
 	for i, set := range c.UID {
 		var resolved imap.UIDSet
 		for _, r := range set {
 			if r.Start == 0 || r.Stop == 0 {
-				last, exists := uidBySeq[0]
-				if !exists {
+				if !hasLiveLast {
 					continue // an empty mailbox has no wildcard endpoint
 				}
 				if r.Start == 0 {
-					r.Start = last
+					r.Start = liveLastUID
 				}
 				if r.Stop == 0 {
-					r.Stop = last
+					r.Stop = liveLastUID
 				}
 				r.Start, r.Stop = min(r.Start, r.Stop), max(r.Start, r.Stop)
 			}
@@ -1337,11 +1365,11 @@ func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID)
 	// Clear the SeqNum criteria since we moved them to UID
 	c.SeqNum = nil
 	for i := range c.Not {
-		rewriteSeqNumCriteria(&c.Not[i], uidBySeq)
+		rewriteSeqNumCriteria(&c.Not[i], uidBySeq, liveLastUID, hasLiveLast)
 	}
 	for i := range c.Or {
-		rewriteSeqNumCriteria(&c.Or[i][0], uidBySeq)
-		rewriteSeqNumCriteria(&c.Or[i][1], uidBySeq)
+		rewriteSeqNumCriteria(&c.Or[i][0], uidBySeq, liveLastUID, hasLiveLast)
+		rewriteSeqNumCriteria(&c.Or[i][1], uidBySeq, liveLastUID, hasLiveLast)
 	}
 }
 
