@@ -20,45 +20,37 @@ type BatchFlagUpdateResult struct {
 	UID                imap.UID
 	Flags              []imap.Flag
 	ModSeq             int64
-	PreconditionFailed bool // current mod-sequence exceeded the optional UNCHANGEDSINCE bound
+	PrevModSeq         int64 // the message's mod-sequence just before this write (unset when PreconditionFailed)
+	PreconditionFailed bool  // current mod-sequence exceeded the optional UNCHANGEDSINCE bound
 }
 
-// filterConditionalFlagIDs runs after lockMailboxStats in the write transaction.
-// Checking the server's earlier read snapshot is insufficient: another STORE may
-// have committed between that read and this lock (RFC 7162 §3.1.3.1).
-func filterConditionalFlagIDs(ctx context.Context, tx pgx.Tx, ids []int64, idToUID map[int64]imap.UID, unchangedSince []uint64) ([]int64, []BatchFlagUpdateResult, error) {
-	if len(unchangedSince) == 0 || len(ids) == 0 {
-		return ids, nil, nil
+// filterConditionalFlagIDs checks the mod-sequences resolveMessageIDsBatch read
+// after lockMailboxStats in the write transaction. Checking the server's earlier
+// read snapshot is insufficient: another STORE may have committed between that
+// read and this lock (RFC 7162 §3.1.3.1).
+func filterConditionalFlagIDs(ids []int64, idToUID map[int64]imap.UID, modSeqs map[int64]int64, unchangedSince []uint64) ([]int64, []BatchFlagUpdateResult) {
+	if len(unchangedSince) == 0 {
+		return ids, nil
 	}
-	rows, err := tx.Query(ctx, `
-		SELECT m.id, GREATEST(m.created_modseq, COALESCE(ms.updated_modseq, 0))
-		FROM messages m
-		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-		WHERE m.id = ANY($1) AND m.expunged_at IS NULL
-	`, ids)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer rows.Close()
 	var allowed []int64
 	var failed []BatchFlagUpdateResult
-	for rows.Next() {
-		var id, modSeq int64
-		if err := rows.Scan(&id, &modSeq); err != nil {
-			return nil, nil, err
-		}
-		if uint64(modSeq) > unchangedSince[0] {
-			failed = append(failed, BatchFlagUpdateResult{UID: idToUID[id], ModSeq: modSeq, PreconditionFailed: true})
+	for _, id := range ids {
+		if uint64(modSeqs[id]) > unchangedSince[0] {
+			failed = append(failed, BatchFlagUpdateResult{UID: idToUID[id], ModSeq: modSeqs[id], PreconditionFailed: true})
 		} else {
 			allowed = append(allowed, id)
 		}
 	}
-	return allowed, failed, rows.Err()
+	return allowed, failed
 }
 
-func (db *Database) resolveMessageIDsBatch(ctx context.Context, tx pgx.Tx, mailboxID int64, messageUIDs []imap.UID) (map[int64]imap.UID, []int64, error) {
+// resolveMessageIDsBatch maps the UIDs to message ids and reads each message's
+// current mod-sequence. Callers hold the mailbox lock (lockMailboxStats), which
+// every flag writer takes, so that mod-sequence is still the message's own when
+// their UPDATE runs: it is the PrevModSeq of the write.
+func (db *Database) resolveMessageIDsBatch(ctx context.Context, tx pgx.Tx, mailboxID int64, messageUIDs []imap.UID) (map[int64]imap.UID, []int64, map[int64]int64, error) {
 	if len(messageUIDs) == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	uids := make([]int64, len(messageUIDs))
 	for i, uid := range messageUIDs {
@@ -66,26 +58,29 @@ func (db *Database) resolveMessageIDsBatch(ctx context.Context, tx pgx.Tx, mailb
 	}
 
 	rows, err := tx.Query(ctx, `
-		SELECT id, uid FROM messages
-		WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL
+		SELECT m.id, m.uid, GREATEST(m.created_modseq, COALESCE(ms.updated_modseq, 0))
+		FROM messages m
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+		WHERE m.mailbox_id = $1 AND m.uid = ANY($2) AND m.expunged_at IS NULL
 	`, mailboxID, uids)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to resolve message IDs batch in mailbox %d: %w", mailboxID, err)
+		return nil, nil, nil, fmt.Errorf("failed to resolve message IDs batch in mailbox %d: %w", mailboxID, err)
 	}
 	defer rows.Close()
 
 	idToUID := make(map[int64]imap.UID)
+	modSeqs := make(map[int64]int64)
 	var messageIDs []int64
 	for rows.Next() {
-		var id int64
-		var uid int64
-		if err := rows.Scan(&id, &uid); err != nil {
-			return nil, nil, err
+		var id, uid, modSeq int64
+		if err := rows.Scan(&id, &uid, &modSeq); err != nil {
+			return nil, nil, nil, err
 		}
 		idToUID[id] = imap.UID(uid)
+		modSeqs[id] = modSeq
 		messageIDs = append(messageIDs, id)
 	}
-	return idToUID, messageIDs, rows.Err()
+	return idToUID, messageIDs, modSeqs, rows.Err()
 }
 
 func (db *Database) getAllFlagsForMessages(ctx context.Context, tx pgx.Tx, messageIDs []int64) (map[int64][]imap.Flag, error) {
@@ -151,13 +146,13 @@ func (db *Database) setMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 		return nil, err
 	}
 
-	idToUID, messageIDs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
+	idToUID, messageIDs, prevModSeqs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
 	if err != nil || len(messageIDs) == 0 {
 		return nil, err
 	}
-	messageIDs, failed, err := filterConditionalFlagIDs(ctx, tx, messageIDs, idToUID, unchangedSince)
-	if err != nil || len(messageIDs) == 0 {
-		return failed, err
+	messageIDs, failed := filterConditionalFlagIDs(messageIDs, idToUID, prevModSeqs, unchangedSince)
+	if len(messageIDs) == 0 {
+		return failed, nil
 	}
 
 	preserveSystem := 0
@@ -236,9 +231,10 @@ func (db *Database) setMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 	for _, id := range messageIDs {
 		if modSeq, ok := updatedModSeqs[id]; ok {
 			results = append(results, BatchFlagUpdateResult{
-				UID:    idToUID[id],
-				Flags:  currentFlagsMap[id],
-				ModSeq: modSeq,
+				UID:        idToUID[id],
+				Flags:      currentFlagsMap[id],
+				ModSeq:     modSeq,
+				PrevModSeq: prevModSeqs[id],
 			})
 		}
 	}
@@ -259,13 +255,13 @@ func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 		return nil, err
 	}
 
-	idToUID, messageIDs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
+	idToUID, messageIDs, prevModSeqs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
 	if err != nil || len(messageIDs) == 0 {
 		return nil, err
 	}
-	messageIDs, failed, err := filterConditionalFlagIDs(ctx, tx, messageIDs, idToUID, unchangedSince)
-	if err != nil || len(messageIDs) == 0 {
-		return failed, err
+	messageIDs, failed := filterConditionalFlagIDs(messageIDs, idToUID, prevModSeqs, unchangedSince)
+	if len(messageIDs) == 0 {
+		return failed, nil
 	}
 
 	attachmentRemovals := attachmentKeywordRemovals(newFlags)
@@ -361,9 +357,10 @@ func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 	for _, id := range messageIDs {
 		if modSeq, ok := updatedModSeqs[id]; ok {
 			results = append(results, BatchFlagUpdateResult{
-				UID:    idToUID[id],
-				Flags:  currentFlagsMap[id],
-				ModSeq: modSeq,
+				UID:        idToUID[id],
+				Flags:      currentFlagsMap[id],
+				ModSeq:     modSeq,
+				PrevModSeq: prevModSeqs[id],
 			})
 		}
 	}
@@ -384,13 +381,13 @@ func (db *Database) RemoveMessageFlagsBatch(ctx context.Context, tx pgx.Tx, mess
 		return nil, err
 	}
 
-	idToUID, messageIDs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
+	idToUID, messageIDs, prevModSeqs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
 	if err != nil || len(messageIDs) == 0 {
 		return nil, err
 	}
-	messageIDs, failed, err := filterConditionalFlagIDs(ctx, tx, messageIDs, idToUID, unchangedSince)
-	if err != nil || len(messageIDs) == 0 {
-		return failed, err
+	messageIDs, failed := filterConditionalFlagIDs(messageIDs, idToUID, prevModSeqs, unchangedSince)
+	if len(messageIDs) == 0 {
+		return failed, nil
 	}
 
 	systemFlagsToRemove, customKeywordsToRemove := SplitFlags(flagsToRemove)
@@ -446,9 +443,10 @@ func (db *Database) RemoveMessageFlagsBatch(ctx context.Context, tx pgx.Tx, mess
 	for _, id := range messageIDs {
 		if modSeq, ok := updatedModSeqs[id]; ok {
 			results = append(results, BatchFlagUpdateResult{
-				UID:    idToUID[id],
-				Flags:  currentFlagsMap[id],
-				ModSeq: modSeq,
+				UID:        idToUID[id],
+				Flags:      currentFlagsMap[id],
+				ModSeq:     modSeq,
+				PrevModSeq: prevModSeqs[id],
 			})
 		}
 	}
