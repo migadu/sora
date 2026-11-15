@@ -2,12 +2,16 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
 	"github.com/stretchr/testify/require"
@@ -169,6 +173,68 @@ func TestMetadataFoldEntryNamesMigration(t *testing.T) {
 	require.NoError(t, tx.QueryRow(ctx, `SELECT count(*) FROM metadata WHERE account_id = $1 AND mailbox_id IS NULL
 		AND lower(entry_name) = '/private/comment'`, acctA).Scan(&count))
 	require.Zero(t, count)
+}
+
+// TestMetadataFoldEntryNamesOnUpgrade runs the issue's steps against a database
+// upgraded the way a starting server upgrades it: the schema of 000062, the last
+// version before the fold, holds a row stored before IMAP folded entry names,
+// and NewDatabaseFromConfig then runs the pending migrations through Sora's own
+// migration driver. The row must be readable, overwritable at the entry limit and
+// deletable under its folded name.
+//
+// Runs against the dedicated migration test database (see migrationTestDBName).
+func TestMetadataFoldEntryNamesOnUpgrade(t *testing.T) {
+	skipDatabaseTestInShortMode(t)
+	ctx := context.Background()
+
+	old, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(t), false)
+	require.NoError(t, err)
+	_, err = old.WritePool.Exec(ctx, "DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+	old.Close()
+	require.NoError(t, err)
+	migrations, err := fs.Sub(MigrationsFS, "migrations")
+	require.NoError(t, err)
+	source, err := iofs.New(migrations, ".")
+	require.NoError(t, err)
+	m, err := migrate.NewWithSourceInstance("iofs", source, migrationTestConnStr(t))
+	require.NoError(t, err)
+	require.NoError(t, m.Migrate(62))
+	srcErr, dbErr := m.Close()
+	require.NoError(t, errors.Join(srcErr, dbErr))
+
+	// What an older binary stored for SETMETADATA "" (/private/Comment "x"),
+	// next to one entry stored under a folded name.
+	old, err = NewDatabaseFromConfig(ctx, makeTestDBConfig(t), false)
+	require.NoError(t, err)
+	var accountID int64
+	require.NoError(t, old.WritePool.QueryRow(ctx, `INSERT INTO accounts DEFAULT VALUES RETURNING id`).Scan(&accountID))
+	_, err = old.WritePool.Exec(ctx, `INSERT INTO metadata (account_id, mailbox_id, entry_name, entry_value)
+		VALUES ($1, NULL, '/private/Comment', 'x'), ($1, NULL, '/private/other', 'o')`, accountID)
+	old.Close()
+	require.NoError(t, err)
+
+	database, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(t), true)
+	require.NoError(t, err)
+	t.Cleanup(database.Close)
+	tx, err := database.WritePool.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	got, err := database.GetMetadata(ctx, tx, accountID, nil, []string{"/private/comment"}, nil)
+	require.NoError(t, err)
+	require.Contains(t, got.Entries, "/private/comment", "GETMETADATA must find the entry stored as /private/Comment")
+	require.Equal(t, "x", string(*got.Entries["/private/comment"]))
+
+	// Two entries at max_entries_per_server = 2: writing one of them overwrites it.
+	limits := &MetadataLimits{MaxEntriesPerServer: 2}
+	require.NoError(t, database.SetMetadata(ctx, tx, accountID, nil, map[string]*[]byte{"/private/comment": bytePtr([]byte("y"))}, limits),
+		"an overwrite at the entry limit must not be TOOMANY")
+	require.NoError(t, database.SetMetadata(ctx, tx, accountID, nil, map[string]*[]byte{"/private/comment": nil}, limits))
+	rows, err := tx.Query(ctx, `SELECT entry_name FROM metadata WHERE account_id = $1 ORDER BY entry_name`, accountID)
+	require.NoError(t, err)
+	names, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	require.NoError(t, err)
+	require.Equal(t, []string{"/private/other"}, names, "SETMETADATA NIL must delete the entry")
 }
 
 func keysOf(m map[string]*[]byte) []string {
