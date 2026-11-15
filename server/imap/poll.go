@@ -252,9 +252,13 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		s.currentNumMessages.Add(^uint32(0)) // Equivalent to -1 for unsigned
 		// Track that the mailbox tracker's count decreased
 		trackerExpectedCount--
-		// An expunged \Recent message leaves the RECENT count with it.
+		// An expunged \Recent message leaves the RECENT count with it. The
+		// mailbox's size changed, so the new count follows the EXPUNGE (RFC 3501
+		// §7.3.2): unlike the message count, which the EXPUNGE decrements itself
+		// (§7.4.1), nothing tells the client that its RECENT count dropped.
 		if update.UID > s.recentAboveUID && s.numRecent > 0 {
 			s.numRecent--
+			s.recentUnsent.Store(true)
 		}
 
 		// Mark this sequence number as already expunged to prevent duplicates
@@ -456,10 +460,10 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		return nil
 	}
 
-	// The RECENT count goes out once the EXISTS that grew the mailbox has: a
-	// FETCH, STORE or SEARCH holds that EXISTS back behind an EXPUNGE, and a
-	// later poll delivers both. Only with nothing left queued does the client
-	// know the messages numRecent counts. go-imap writes no RECENT to an
+	// The RECENT count goes out once the EXISTS or EXPUNGE that changed it has:
+	// a FETCH, STORE or SEARCH holds an EXPUNGE back, and the EXISTS behind it,
+	// and a later poll delivers them. Only with nothing left queued does the
+	// client know the messages numRecent counts. go-imap writes no RECENT to an
 	// IMAP4rev2 session.
 	if err := sessionTracker.PollWith(w, allowExpunge, func() error {
 		if sessionTracker.QueuedUpdates() == 0 && s.recentUnsent.Swap(false) {

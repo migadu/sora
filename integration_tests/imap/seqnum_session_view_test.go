@@ -201,10 +201,12 @@ func TestIMAP_SessionSeqNums_SearchAfterForeignExpunge(t *testing.T) {
 	require.Contains(t, tagged, "OK")
 	require.Equal(t, []string{"* SEARCH 2 3"}, untagged)
 
-	// UID SEARCH may send the EXPUNGE, after its results.
+	// UID SEARCH may send the EXPUNGE, after its results. UID 1 was \Recent in
+	// the viewer, so the corrected RECENT count follows the EXPUNGE (RFC 3501
+	// §7.3.2).
 	untagged, tagged = viewer.cmd("s4", "UID SEARCH 2")
 	require.Contains(t, tagged, "OK")
-	require.Equal(t, []string{"* SEARCH 2", "* 1 EXPUNGE"}, untagged, "the client's message 2 is UID 2")
+	require.Equal(t, []string{"* SEARCH 2", "* 1 EXPUNGE", "* 2 RECENT"}, untagged, "the client's message 2 is UID 2")
 }
 
 // TestIMAP_SessionSeqNums_SortAfterForeignExpunge: SORT results are sequence
