@@ -14,8 +14,8 @@ import (
 // not valid in the not-authenticated state with a tagged BAD, in the backend's
 // wording, not with NO. RFC 9051 §7.1.3: a tagged BAD "reports a protocol-level
 // error in the client's command"; §7.1.2: a tagged NO "indicates unsuccessful
-// completion of the associated command". A client must see the same status
-// whether its connection lands on a proxy or directly on a backend.
+// completion of the associated command". The proxy chooses BAD to match the
+// backend's status; §3 also permits NO for a command in the wrong state.
 func TestPreAuthUnknownAndWrongStateCommandsAnswerBAD(t *testing.T) {
 	tests := []struct {
 		line string

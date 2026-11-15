@@ -623,8 +623,11 @@ func (s *Session) drainLiterals(args []string) error {
 }
 
 // preAuthRequiredState maps the commands a backend implements that are not
-// valid in the not-authenticated state to the state they require, as the
-// backend (go-imap) checks it. UID commands are keyed "UID <command>".
+// valid in the not-authenticated state to their minimum required state.
+// Fixed-state commands use the backend's (go-imap) state wording. ESEARCH
+// uses the authenticated minimum: the backend can require a selected mailbox
+// depending on its IN clause, which this pre-auth rejection does not parse.
+// UID commands are keyed "UID <command>".
 var preAuthRequiredState = map[string]string{
 	"UNAUTHENTICATE": "authenticated",
 	"ENABLE":         "authenticated",
@@ -673,10 +676,10 @@ var preAuthRequiredState = map[string]string{
 
 // preAuthCommandError is the tagged reply text (without the tag) for a command
 // the pre-auth loop does not handle: an unknown command, or one valid only
-// after authentication. Both are protocol-level errors in the client's
-// command, reported with BAD (RFC 9051 §7.1.3), not NO, which reports the
-// unsuccessful completion of a valid command (§7.1.2). The wording is the
-// backend's, so a client gets the same reply from a proxy as from a backend.
+// after authentication. Unknown commands receive BAD (RFC 9051 §7.1.3).
+// For a known command in the wrong state, §3 permits BAD or NO; choosing BAD
+// matches the backend's status. The fixed-state commands also use its wording;
+// ESEARCH reports the authenticated minimum rather than parsing its scope.
 func preAuthCommandError(command string, args []string) string {
 	name := command
 	if command == "UID" && len(args) > 0 {
