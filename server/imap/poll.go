@@ -403,6 +403,8 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		// even if the client enables FlagChange again later.
 		if flagsFiltered {
 			s.reportedModSeqGap.Store(true)
+		} else {
+			s.queuedFlagUpdates.Store(true)
 		}
 
 		allFlags := db.BitwiseToFlags(update.BitwiseFlags)
@@ -446,11 +448,19 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		return err
 	}
 	// Every change up to the cursor has been queued, by this poll or an earlier
-	// one. Once nothing is left queued, and no NOTIFY filter consumed a flag
-	// change without reporting it, all of them have been sent. Polls run one
-	// at a time (seqViewMu) and the cursor never moves back.
-	if sessionTracker.QueuedUpdates() == 0 && !s.reportedModSeqGap.Load() {
-		s.reportedHighestModSeq.Store(cursor)
+	// one. Any flag update queued behind a withheld EXPUNGE stays queued until
+	// the tracker drains completely, so checking FlagChangeAllowed here catches
+	// a NOTIFY filter installed between queueing and delivery. Once nothing is
+	// left queued, and no NOTIFY filter consumed a flag change without
+	// reporting it, all of them have been sent. Polls run one at a time
+	// (seqViewMu) and the cursor never moves back.
+	if sessionTracker.QueuedUpdates() == 0 {
+		if s.queuedFlagUpdates.Swap(false) && !w.FlagChangeAllowed() {
+			s.reportedModSeqGap.Store(true)
+		}
+		if !s.reportedModSeqGap.Load() {
+			s.reportedHighestModSeq.Store(cursor)
+		}
 	}
 	return nil
 }

@@ -67,6 +67,10 @@ type IMAPSession struct {
 	// report then stays conservative until SELECT establishes a new baseline;
 	// enabling FlagChange again does not replay the consumed change.
 	reportedModSeqGap atomic.Bool
+	// queuedFlagUpdates records that the tracker holds a flag update queued
+	// while FlagChange was allowed, so draining it after NOTIFY suppresses
+	// FlagChange still marks reportedModSeqGap.
+	queuedFlagUpdates atomic.Bool
 
 	lastSelectedMailboxID int64
 	lastHighestUID        imap.UID
@@ -575,6 +579,7 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.currentHighestModSeq.Store(0)
 	s.reportedHighestModSeq.Store(0)
 	s.reportedModSeqGap.Store(false)
+	s.queuedFlagUpdates.Store(false)
 	s.currentNumMessages.Store(0)
 	s.firstUnseenSeqNum.Store(0)
 	s.savedSearchUIDs = nil // saved "$" result is scoped to the selected mailbox
