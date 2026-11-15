@@ -475,11 +475,12 @@ func (s *IMAPSession) HighestModSeq() uint64 {
 	return s.reportedHighestModSeq.Load()
 }
 
-// pruneOwnStoreEchoLocked forgets the rows of this session's own STORE that
-// Poll has now passed: all of them when they were recorded in another mailbox,
-// otherwise each one at or below cursor. A map left empty is dropped rather
-// than kept: Go never shrinks a map, so a STORE over a large mailbox would
-// otherwise hold its buckets for as long as the mailbox stays selected. The
+// pruneOwnStoreEchoLocked forgets the rows this session's own STORE and FETCH
+// answers recorded that Poll has now passed: all of them when they were
+// recorded in another mailbox, otherwise each one at or below cursor. A map
+// left empty is dropped rather than kept: Go never shrinks a map, so a STORE
+// over a large mailbox would otherwise hold its buckets (up to
+// maxFetchSeenEchoEntries rows) for as long as the mailbox stays selected. The
 // caller holds ownStoreMu.
 func (s *IMAPSession) pruneOwnStoreEchoLocked(mailboxID int64, cursor uint64) {
 	if s.ownStoreEchoMailboxID != mailboxID {
