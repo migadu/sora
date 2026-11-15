@@ -654,7 +654,7 @@ func (s *ManageSieveSession) completeAuthentication(ctx context.Context, address
 	// Acquire write lock for updating session authentication state
 	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(ctx)
 	if !acquired {
-		s.WarnLog("failed to acquire write lock", "operation", "authenticate")
+		s.WarnLog("failed to acquire write lock", "operation", "authenticate", "address", address.BaseAddress(), "method", method)
 		return errServerBusy
 	}
 	defer release()
