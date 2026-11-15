@@ -180,6 +180,10 @@ type IPFailureInfo struct {
 	// delay_start_threshold here, from where each failure is sent, or a peer's
 	// count was merged into it. Only then does a success clear it there too.
 	shared bool
+
+	// The last local count or merged count, ordered at the point it was recorded.
+	// LastFailure remains the authentication attempt time for window/block metadata.
+	lastCounted time.Time
 }
 
 func (i *IPFailureInfo) evictionTime() time.Time {
@@ -553,7 +557,7 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 		return // Skip if IP-only blocking is disabled
 	}
 
-	failures, delay, firstFailure, blockedUntil := a.countIPFailure(ip, failureTime)
+	failures, delay, firstFailure, blockedUntil, countedAt := a.countIPFailure(ip, failureTime)
 
 	// The cluster is told with ipMu released: queueEvent applies the event to the
 	// protocol's other limiters on this node under their locks, and any of them
@@ -565,16 +569,17 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 		a.clusterLimiter.BroadcastBlockIP(ip, blockedUntil, failures, firstFailure)
 	} else if failures >= a.config.DelayStartThreshold {
 		// Failure count for progressive delays
-		a.clusterLimiter.BroadcastFailureCount(ip, failures, delay, firstFailure)
+		a.clusterLimiter.BroadcastFailureCount(ip, failures, delay, firstFailure, countedAt)
 	}
 }
 
 // countIPFailure counts a failure of ip, moves its progressive delay and blocks
 // it at max_attempts_per_ip. It returns the failure count, the delay, the first
-// failure and, if the failure blocked ip, the end of the block.
-func (a *AuthRateLimiter) countIPFailure(ip string, failureTime time.Time) (failures int, delay time.Duration, firstFailure, blockedUntil time.Time) {
+// failure, the end of any block, and the time the count was recorded under ipMu.
+func (a *AuthRateLimiter) countIPFailure(ip string, failureTime time.Time) (failures int, delay time.Duration, firstFailure, blockedUntil, countedAt time.Time) {
 	a.ipMu.Lock()
 	defer a.ipMu.Unlock()
+	countedAt = time.Now()
 
 	// Enforce size limit with LRU eviction (if configured)
 	if _, exists := a.ipFailureCounts[ip]; !exists && a.config.MaxIPEntries > 0 && len(a.ipFailureCounts) >= a.config.MaxIPEntries {
@@ -588,6 +593,9 @@ func (a *AuthRateLimiter) countIPFailure(ip string, failureTime time.Time) (fail
 	}
 
 	info.FailureCount++
+	if countedAt.After(info.lastCounted) {
+		info.lastCounted = countedAt
+	}
 	if failureTime.After(info.LastFailure) {
 		info.LastFailure = failureTime
 	}
@@ -632,7 +640,7 @@ func (a *AuthRateLimiter) countIPFailure(ip string, failureTime time.Time) (fail
 	} else if info.FailureCount >= a.config.DelayStartThreshold {
 		logger.Debug("Auth limiter: Progressive delay for IP", "protocol", a.protocol, "ip", ip, "delay", info.LastDelay, "failures", info.FailureCount)
 	}
-	return info.FailureCount, info.LastDelay, info.FirstFailure, blockedUntil
+	return info.FailureCount, info.LastDelay, info.FirstFailure, blockedUntil, countedAt
 }
 
 // clearFailureTracking clears the Tier 2 state of ip after a successful login, unless
@@ -652,6 +660,12 @@ func (a *AuthRateLimiter) clearFailureTracking(ip string) {
 	}
 	info, tracked := a.ipFailureCounts[ip]
 	shared := tracked && info.shared
+	// Own-node events do not loop back through gossip. Record the local clear
+	// under the same lock as counts, even when no known shared count needs gossip:
+	// an older peer count may still be on its way here.
+	if a.clusterLimiter != nil && a.clusterLimiter.syncFailureCounts {
+		a.clusterLimiter.ipSucceeded.mark(ip, clearedAt)
+	}
 	a.dropIPCounter(ip)
 	delete(a.blockedIPs, ip)
 	a.ipMu.Unlock()

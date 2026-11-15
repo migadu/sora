@@ -175,8 +175,10 @@ func (crl *ClusterRateLimiter) BroadcastBlockIP(ip string, blockedUntil time.Tim
 	crl.queueEvent(event)
 }
 
-// BroadcastFailureCount broadcasts a progressive delay failure count update
-func (crl *ClusterRateLimiter) BroadcastFailureCount(ip string, failureCount int, lastDelay time.Duration, firstFailure time.Time) {
+// BroadcastFailureCount broadcasts a progressive delay failure count update.
+// countedAt is captured with the count under ipMu, rather than when it is sent:
+// a goroutine paused before broadcasting must not resurrect a cleared count.
+func (crl *ClusterRateLimiter) BroadcastFailureCount(ip string, failureCount int, lastDelay time.Duration, firstFailure, countedAt time.Time) {
 	if !crl.syncFailureCounts {
 		return
 	}
@@ -184,7 +186,7 @@ func (crl *ClusterRateLimiter) BroadcastFailureCount(ip string, failureCount int
 	event := RateLimitEvent{
 		Type:         RateLimitEventFailureCount,
 		IP:           ip,
-		Timestamp:    time.Now(),
+		Timestamp:    countedAt,
 		NodeID:       crl.clusterManager.GetNodeID(),
 		FailureCount: failureCount,
 		LastDelay:    lastDelay,
@@ -487,6 +489,9 @@ func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
 
 	info.FailureCount = max(info.FailureCount, event.FailureCount)
 	info.shared = true
+	if event.Timestamp.After(info.lastCounted) {
+		info.lastCounted = event.Timestamp
+	}
 	// A peer's delay is capped by this node's max_delay, as every local step
 	// is in updateFailureTracking. Peers of one protocol may run with other
 	// limits (a rolling change of max_delay, or two [[server]] entries of the
@@ -537,7 +542,7 @@ func (crl *ClusterRateLimiter) handleIPSuccess(event RateLimitEvent) {
 	if !exists {
 		return
 	}
-	if info.LastFailure.After(event.Timestamp) {
+	if info.LastFailure.After(event.Timestamp) || info.lastCounted.After(event.Timestamp) {
 		logger.Debug("Cluster limiter: Ignoring success older than the failures it clears", "protocol", crl.limiter.protocol,
 			"ip", event.IP, "from_node", event.NodeID)
 		return
