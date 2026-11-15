@@ -81,3 +81,17 @@ func TestMailboxNameToCreate(t *testing.T) {
 		}
 	}
 }
+
+func TestMailboxNameValid(t *testing.T) {
+	for _, name := range []string{"INBOX", "Archive/2024", "Foo.Bar/..baz", "José"} {
+		if !MailboxNameValid(name) {
+			t.Errorf("MailboxNameValid(%q) = false, want true", name)
+		}
+	}
+	// A stored name has no trailing delimiter: "Foo/" is the name CREATE makes "Foo".
+	for _, name := range []string{"", "/", "Foo/", "/Foo", "x//y", "a/../b", "a\tb", "caf\xe9"} {
+		if MailboxNameValid(name) {
+			t.Errorf("MailboxNameValid(%q) = true, want false", name)
+		}
+	}
+}

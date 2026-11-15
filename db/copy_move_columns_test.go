@@ -48,7 +48,8 @@ func TestCopyMoveCarryEveryMessageColumn(t *testing.T) {
 
 	var bs imap.BodyStructure = &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain", Size: 100}
 	base := time.Now().UnixNano()
-	// Every header column is populated, extra_addresses included (two To and two Cc).
+	// Every header column is populated, extra_addresses included (two To and two Cc). There
+	// is no Date: header (SentDate is zero), so sent_date_unknown (migration 000061) is set.
 	insert := func(n int) (id int64, uid imap.UID) {
 		t.Helper()
 		hash := fmt.Sprintf("copymovecols-%d-%d", base, n)
@@ -58,7 +59,7 @@ func TestCopyMoveCarryEveryMessageColumn(t *testing.T) {
 		id, u, err := db.InsertMessage(ctx, tx, &InsertMessageOptions{
 			AccountID: accountID, MailboxID: inboxID, MailboxName: "INBOX",
 			S3Domain: "example.com", S3Localpart: "copymovecols", ContentHash: hash,
-			MessageID: fmt.Sprintf("%s@example.com", hash), InternalDate: time.Now(), SentDate: time.Now(),
+			MessageID: fmt.Sprintf("%s@example.com", hash), InternalDate: time.Now(),
 			Size: 100, Subject: fmt.Sprintf("Re: message %d", n), BodyStructure: &bs,
 			InReplyTo:  []string{"parent@example.com"},
 			References: []string{"ancestor@example.com", "parent@example.com"},

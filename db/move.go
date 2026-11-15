@@ -98,6 +98,12 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		return nil, fmt.Errorf("failed to lock mailbox stats for move on mailboxes %d and %d: %w", srcMailboxID, destMailboxID, err)
 	}
 
+	// From here to the commit a rekey must not rename a source. The row locks below would
+	// hold it off too, but a rekey waiting for them holds the FTS lock restageFTS needs.
+	if err := lockRekeySources(ctx, tx, srcMailboxID, ids); err != nil {
+		return nil, err
+	}
+
 	// Lock source message rows early (before INSERT triggers) to establish a
 	// consistent lock ordering: mailbox_stats row locks → row locks on source rows.
 	// Every unseen-mutating path (MOVE, EXPUNGE, STORE) acquires the mailbox_stats
@@ -117,7 +123,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	// Collect message IDs and source UIDs
 	var messageIDs []int64
 	var sourceUIDsForMap []imap.UID
-	crossAccount := false // any source row owned by another account: see restageFTS
+	var rekeyed []bool // per message: re-keyed from another account to destAccountID
 	for rows.Next() {
 		var messageID, sourceAccountID int64
 		var sourceUID imap.UID
@@ -133,7 +139,9 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		}
 		messageIDs = append(messageIDs, messageID)
 		sourceUIDsForMap = append(sourceUIDsForMap, sourceUID)
-		crossAccount = crossAccount || sourceAccountID != destAccountID
+		// A move within one mailbox keeps every row's account and S3 key (see below), so it
+		// re-keys nothing, even a row of another account than the mailbox owner.
+		rekeyed = append(rekeyed, sourceAccountID != destAccountID && srcMailboxID != destMailboxID)
 	}
 	if err = rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating through source messages: %w", err)
@@ -153,12 +161,18 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		return nil, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 	}
 
-	// Calculate the new UIDs for the moved messages.
-	var newUIDs []int64
+	// Calculate the new UIDs for the moved messages, and split them by whether the
+	// move is re-keyed to the destination owner (see restagePendingUploads).
+	var newUIDs, keptUIDs, rekeyedUIDs []int64
 	startUID := newHighestUID - numToMove + 1
 	for i, sourceUID := range sourceUIDsForMap {
 		newUID := startUID + int64(i)
 		newUIDs = append(newUIDs, newUID)
+		if rekeyed[i] {
+			rekeyedUIDs = append(rekeyedUIDs, newUID)
+		} else {
+			keptUIDs = append(keptUIDs, newUID)
+		}
 		messageUIDMap[sourceUID] = imap.UID(newUID)
 	}
 
@@ -190,7 +204,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 			WITH src_data AS (
 				SELECT
 					m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to, m."references",
-					m.subject, m.sent_date, m.internal_date, m.size,
+					m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown, m.internal_date, m.size,
 					m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
 					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses,
 					m.id AS original_id,
@@ -201,14 +215,14 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 			inserted AS (
 				INSERT INTO messages (
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
-					subject, sent_date, internal_date, size,
+					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
 					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
 					mailbox_id, mailbox_path, created_modseq, uid
 				)
 				SELECT
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
-					subject, sent_date, internal_date, size,
+					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
 					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
 					$1 AS mailbox_id,
@@ -246,7 +260,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 			WITH src_data AS (
 				SELECT
 					m.content_hash, m.uploaded, m.message_id, m.in_reply_to, m."references",
-					m.subject, m.sent_date, m.internal_date, m.size,
+					m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown, m.internal_date, m.size,
 					m.body_structure, m.recipients_json,
 					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses,
 					m.id AS original_id,
@@ -259,7 +273,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 			inserted AS (
 				INSERT INTO messages (
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
-					subject, sent_date, internal_date, size,
+					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
 					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
 					mailbox_id, mailbox_path, created_modseq, uid
@@ -268,7 +282,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					$6 AS account_id, content_hash,
 					CASE WHEN src_account_id = $6 THEN uploaded ELSE content_hash = ANY($9::text[]) END AS uploaded,
 					message_id, in_reply_to, "references",
-					subject, sent_date, internal_date, size,
+					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json,
 					-- Same-account moves keep the source row's S3 key (the object lives there);
 					-- only a move into another account's mailbox is re-keyed to the owner,
@@ -300,12 +314,11 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	// background uploader writes the body under the destination owner's S3 path
 	// and marks the new row uploaded. Without this, a cross-account move of a
 	// not-yet-uploaded message would never reach the owner's path and would
-	// become unreadable once local staging is cleaned up. ON CONFLICT makes this
-	// a no-op for same-account moves (the source's pending_upload still applies).
-	if err := db.restagePendingUploads(ctx, tx, destMailboxID, newUIDs, instanceID); err != nil {
+	// become unreadable once local staging is cleaned up.
+	if err := db.restagePendingUploads(ctx, tx, destMailboxID, keptUIDs, rekeyedUIDs, instanceID); err != nil {
 		return nil, err
 	}
-	if crossAccount {
+	if len(rekeyedUIDs) > 0 {
 		if err := db.restageFTS(ctx, tx, destMailboxID, newUIDs); err != nil {
 			return nil, err
 		}

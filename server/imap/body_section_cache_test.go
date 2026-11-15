@@ -129,19 +129,22 @@ func TestApplyPartial_ClientSuppliedBounds(t *testing.T) {
 }
 
 // TestBodySectionCacheKey_DistinguishesSections keeps chunk requests for different
-// sections of the same message from sharing one cache entry.
+// sections of the same message, BODY or BINARY, from sharing one cache entry.
 func TestBodySectionCacheKey_DistinguishesSections(t *testing.T) {
 	hash := strings.Repeat("a", 64)
 	keys := map[string]string{
-		"full":      bodySectionCacheKey(hash, &imap.FetchItemBodySection{}),
-		"part 1":    bodySectionCacheKey(hash, &imap.FetchItemBodySection{Part: []int{1}}),
-		"part 2":    bodySectionCacheKey(hash, &imap.FetchItemBodySection{Part: []int{2}}),
-		"part 2.1":  bodySectionCacheKey(hash, &imap.FetchItemBodySection{Part: []int{2, 1}}),
-		"header":    bodySectionCacheKey(hash, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader}),
-		"text":      bodySectionCacheKey(hash, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierText}),
-		"fields":    bodySectionCacheKey(hash, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{"From"}}),
-		"fieldsnot": bodySectionCacheKey(hash, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFieldsNot: []string{"From"}}),
-		"other msg": bodySectionCacheKey(strings.Repeat("b", 64), &imap.FetchItemBodySection{Part: []int{2}}),
+		"full":       bodySectionCacheKey(hash, &imap.FetchItemBodySection{}),
+		"part 1":     bodySectionCacheKey(hash, &imap.FetchItemBodySection{Part: []int{1}}),
+		"part 2":     bodySectionCacheKey(hash, &imap.FetchItemBodySection{Part: []int{2}}),
+		"part 2.1":   bodySectionCacheKey(hash, &imap.FetchItemBodySection{Part: []int{2, 1}}),
+		"header":     bodySectionCacheKey(hash, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader}),
+		"text":       bodySectionCacheKey(hash, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierText}),
+		"fields":     bodySectionCacheKey(hash, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{"From"}}),
+		"fieldsnot":  bodySectionCacheKey(hash, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFieldsNot: []string{"From"}}),
+		"other msg":  bodySectionCacheKey(strings.Repeat("b", 64), &imap.FetchItemBodySection{Part: []int{2}}),
+		"binary":     binarySectionCacheKey(hash, nil),
+		"binary 2":   binarySectionCacheKey(hash, []int{2}),
+		"binary 2.1": binarySectionCacheKey(hash, []int{2, 1}),
 	}
 	seen := make(map[string]string, len(keys))
 	for name, key := range keys {
@@ -163,5 +166,8 @@ func TestBodySectionCacheKey_DistinguishesSections(t *testing.T) {
 	// A message with no content hash gets no key at all.
 	if got := bodySectionCacheKey("", &imap.FetchItemBodySection{Part: []int{2}}); got != "" {
 		t.Errorf("cache key for a hashless message = %q, want \"\"", got)
+	}
+	if got := binarySectionCacheKey("", []int{2}); got != "" {
+		t.Errorf("BINARY cache key for a hashless message = %q, want \"\"", got)
 	}
 }

@@ -97,6 +97,10 @@ type IPLimitTracker struct {
 	connections map[string]*IPConnectionInfo // IP -> info
 	mu          sync.RWMutex
 
+	// The connections of this node's trackers of the protocol, this one's
+	// included (cluster mode only): no gossip about them reaches this node
+	node *nodeIPConnections
+
 	// Instance tracking for liveness detection
 	instanceLastSeen map[string]time.Time
 
@@ -150,6 +154,8 @@ func NewIPLimitTracker(protocol string, instanceID string, clusterMgr *cluster.M
 	}
 
 	if clusterMgr != nil {
+		tracker.node = nodeIPConnectionsOf(clusterMgr, protocol)
+
 		// Cluster mode: register with cluster manager for gossip
 		logger.Debug("IP limit tracker: Registering handlers with cluster manager", "protocol", protocol)
 		clusterMgr.RegisterIPLimitHandler(tracker.HandleClusterEvent)
@@ -182,17 +188,38 @@ func (t *IPLimitTracker) markInstanceSeen(instanceID string) {
 
 // IncrementIP increments the connection count for an IP
 func (t *IPLimitTracker) IncrementIP(ip string) {
+	t.TryIncrementIP(ip, 0)
+}
+
+// TryIncrementIP counts a connection from ip unless limit (if positive) is
+// already reached, and returns the count the limit is checked against
+// (GetIPCount), with this connection when it was counted. The count is checked
+// and moved under the same locks, the node's shared counts included, so two
+// accepts, on this listener or on another listener of the protocol on this
+// node, cannot both take the last place.
+func (t *IPLimitTracker) TryIncrementIP(ip string, limit int) (int, bool) {
 	// Encoding happens outside the tracker lock: every accept on this listener
 	// serialises on it, and gob encoding an event is orders of magnitude more
 	// work than the bookkeeping it protects.
-	if event := t.incrementLocked(ip); event != nil {
+	count, ok, event := t.incrementLocked(ip, limit)
+	if event != nil {
 		t.queueEvent(*event)
 	}
+	return count, ok
 }
 
-func (t *IPLimitTracker) incrementLocked(ip string) *IPLimitEvent {
+func (t *IPLimitTracker) incrementLocked(ip string, limit int) (int, bool, *IPLimitEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.node != nil {
+		t.node.mu.Lock()
+		defer t.node.mu.Unlock()
+	}
+
+	count := t.countLocked(ip)
+	if limit > 0 && count >= limit {
+		return count, false, nil
+	}
 
 	info, exists := t.connections[ip]
 	if !exists {
@@ -208,13 +235,16 @@ func (t *IPLimitTracker) incrementLocked(ip string) *IPLimitEvent {
 	info.LocalInstances[t.instanceID]++
 	info.LastUpdate = time.Now()
 	info.recalculate(t.instanceID)
+	if t.node != nil {
+		t.node.add(ip, 1)
+	}
 
 	// Broadcast event (if in cluster mode)
 	if t.clusterManager == nil {
-		return nil
+		return count + 1, true, nil
 	}
 
-	return &IPLimitEvent{
+	return count + 1, true, &IPLimitEvent{
 		Type:       IPLimitEventIncrement,
 		IP:         ip,
 		Protocol:   t.protocol,
@@ -249,6 +279,11 @@ func (t *IPLimitTracker) decrementLocked(ip string) *IPLimitEvent {
 	info.LocalInstances[t.instanceID]--
 	info.LastUpdate = time.Now()
 	info.recalculate(t.instanceID)
+	if t.node != nil {
+		t.node.mu.Lock()
+		t.node.add(ip, -1)
+		t.node.mu.Unlock()
+	}
 
 	// Clean up IP entry if no connections remain
 	if info.TotalCount == 0 && len(info.LocalInstances) == 0 {
@@ -270,15 +305,60 @@ func (t *IPLimitTracker) decrementLocked(ip string) *IPLimitEvent {
 	}
 }
 
-// GetIPCount returns the cluster-wide connection count for an IP
+// GetIPCount returns the cluster-wide connection count for an IP: this
+// tracker's connections, other nodes' and those of this node's other trackers
+// of the protocol.
 func (t *IPLimitTracker) GetIPCount(ip string) int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-
-	if info, exists := t.connections[ip]; exists {
-		return info.TotalCount
+	if t.node != nil {
+		t.node.mu.Lock()
+		defer t.node.mu.Unlock()
 	}
-	return 0
+
+	return t.countLocked(ip)
+}
+
+// countLocked returns GetIPCount. The caller holds t.mu and, in cluster mode,
+// t.node.mu.
+func (t *IPLimitTracker) countLocked(ip string) int {
+	total, own := 0, 0
+	if info, exists := t.connections[ip]; exists {
+		total, own = info.TotalCount, info.LocalCount
+	}
+	if t.node != nil {
+		// The node's count includes this tracker's own.
+		total += t.node.counts[ip] - own
+	}
+	return total
+}
+
+// nodeIPConnections counts, by client IP, the connections the per-IP trackers
+// of one protocol hold on one node: the sum of what each reports to its peers
+// as its own. A tracker hears of every other node's connections over gossip and
+// push/pull, but memberlist delivers neither back to the node that sent it, so
+// the connections of the protocol's other listeners on its own node (an IMAP
+// proxy on 143 and one on 993) are counted from here. mu is taken while holding
+// a tracker's mu, never the other way round.
+type nodeIPConnections struct {
+	mu     sync.Mutex
+	counts map[string]int // client IP -> connections
+}
+
+// nodeIPConnectionsOf returns the counts the per-IP trackers of protocol share
+// on the node of clusterMgr.
+func nodeIPConnectionsOf(clusterMgr *cluster.Manager, protocol string) *nodeIPConnections {
+	return clusterMgr.Shared("ip-limit-connections:"+protocol, func() any {
+		return &nodeIPConnections{counts: make(map[string]int)}
+	}).(*nodeIPConnections)
+}
+
+// add moves the count of connections from ip by delta. The caller holds n.mu.
+func (n *nodeIPConnections) add(ip string, delta int) {
+	n.counts[ip] += delta
+	if n.counts[ip] <= 0 {
+		delete(n.counts, ip)
+	}
 }
 
 // queueEvent encodes an event and hands it to the right gossip queue. A

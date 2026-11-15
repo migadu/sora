@@ -14,8 +14,8 @@ import (
 )
 
 // errorBody decodes an error response of the User API: Content-Type application/json and
-// a body that is one object holding a non-empty "error" string (docs/user-api.md, "Error
-// Response Format"; components/responses in user_api_openapi.yaml).
+// a body that is one object holding a non-empty "error" string (docs/USER_API.md, section 4
+// "Requests, responses and errors"; components/responses in user_api_openapi.yaml).
 func errorBody(t *testing.T, w *httptest.ResponseRecorder) string {
 	t.Helper()
 	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
