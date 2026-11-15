@@ -220,6 +220,13 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 			wantErr: []string{`server "imap" (imap) needs the database`, "bucket is required"},
 		},
 		{
+			// Start-up opens no write pool and stops with "no healthy database pools
+			// available" (#1266).
+			name:    "managesieve with only [database.read] hosts",
+			content: "[database.read]\nhosts = [\"replica.example.com\"]\n\n[[server]]\ntype = \"managesieve\"\nname = \"managesieve\"\naddr = \"127.0.0.1:4190\"\n",
+			wantErr: []string{"[FAIL] [database.write]:\n   server \"managesieve\" (managesieve) needs the database, but [database.write] has no hosts"},
+		},
+		{
 			name:    "mail backend with an S3 timeout without a unit",
 			content: storageTOML + "timeout = \"30\"\n" + imapBackend,
 			wantErr: []string{`invalid timeout "30"`},
