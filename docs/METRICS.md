@@ -525,4 +525,5 @@ messages point at trouble that a metric shows late or not at all.
 | `Connection tracker: Maximum connections per user reached` | INFO | A per-user limit refused a login. |
 | `Config reload: ... requires restart to take effect` | INFO, WARN | A `SIGHUP` found changes it cannot apply. |
 | `Config reload failed - keeping current config` | ERROR | The file did not parse on `SIGHUP`. |
+| `Config reload: ... is invalid and the server will not start with this config` | ERROR | The file a `SIGHUP` read fails the startup checks, with the reason in `error`. The running process carries on, but the next restart refuses the file. |
 | `MetricsCollector: error collecting metrics` | ERROR | The database gauges are stale. |
