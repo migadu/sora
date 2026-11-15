@@ -944,7 +944,7 @@ lookup cache; on them the table is ignored, with a startup warning.
 | `negative_ttl` | duration | `"1m"` | How long a failed lookup is kept. |
 | `max_size` | integer | `10000`; `50000` on line proxies | Entries kept. |
 | `cleanup_interval` | duration | `"5m"` | How often expired entries are removed. |
-| `positive_revalidation_window` | duration | `"30s"` | How soon a cached success is checked again when a different password arrives. Not used by `lmtp_proxy`. |
+| `positive_revalidation_window` | duration | `"30s"` | How soon a cached success is checked again when a different password arrives. Not used by `lmtp_proxy`, which warns at startup when it is set. |
 
 ### 9.11 Proxy keys
 
@@ -974,7 +974,8 @@ names it.
 
 Asks an HTTP API which backend serves a user, or checks the password there. Applies to the line
 proxies and `user_api_proxy`; on another server type the table is ignored, with a startup warning.
-See [PROXY.md](PROXY.md).
+A key that only some of them read says which; on the others it is ignored, with a startup warning
+that names it. See [PROXY.md](PROXY.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
@@ -983,13 +984,13 @@ See [PROXY.md](PROXY.md).
 | `timeout` | duration | `"5s"` | HTTP timeout. |
 | `auth_token` | string | none | Bearer token. |
 | `lookup_local_users` | bool | `false` | Look in the local database when the API does not know the user. Needs a database. |
-| `user_not_found_response` | string | `"reject"` | LMTP answer for an unknown user: `"reject"` (550) or `"tempfail"`. Other values mean `"reject"`. |
+| `user_not_found_response` | string | `"reject"` | `lmtp_proxy` only. LMTP answer for an unknown user: `"reject"` (550) or `"tempfail"`. Other values mean `"reject"`. |
 | `restrict_to_pool` | bool | `false` | Refuse a backend address from the API that is not one of this proxy's own backends (`remote_addrs` or `[[pool]]` members). |
-| `remote_tls` | bool | `false` | TLS to backends the API names. |
-| `remote_tls_use_starttls` | bool | `false` | STARTTLS to those backends. Needs `remote_tls`. |
-| `remote_tls_verify` | bool | `true` | Verify their certificates. |
+| `remote_tls` | bool | `false` | TLS to backends the API names. Line proxies only: `user_api_proxy` dials them with the `[[server]]` block's own `remote_tls`, `remote_tls_verify` and `remote_use_proxy_protocol`. |
+| `remote_tls_use_starttls` | bool | `false` | STARTTLS to those backends. Needs `remote_tls`. Line proxies only. |
+| `remote_tls_verify` | bool | `true` | Verify their certificates. Line proxies only. |
 | `remote_port` | integer or string | none | Port for backends the API names without one. |
-| `remote_use_proxy_protocol` | bool | `false` | |
+| `remote_use_proxy_protocol` | bool | `false` | Line proxies only. |
 | `remote_use_id_command` | bool | `false` | IMAP only. |
 | `remote_use_xclient` | bool | `false` | POP3 and LMTP only. |
 | `remote_use_utf8` | bool | `false` | POP3 only. |
