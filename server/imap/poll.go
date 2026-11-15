@@ -402,6 +402,7 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 	// needs it. A nil backend watch can mean NOTIFY NONE as well as the
 	// default, and only the library knows which policy its writer applies.
 	var flagFilterRead, flagsFiltered bool
+	recentAbove := s.recentFlagAboveLocked()
 	for _, update := range poll.Updates {
 		if update.IsExpunge {
 			continue
@@ -435,7 +436,7 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		// Same filter FETCH and SELECT apply: a stored keyword that is not an
 		// IMAP atom cannot be encoded, and an unsolicited FETCH carrying one
 		// aborts the write and drops the session (helpers.IsValidFlagName).
-		allFlags = helpers.SanitizeFlags(allFlags)
+		allFlags = withRecentFlag(helpers.SanitizeFlags(allFlags), update.UID, recentAbove)
 		// Pass the change's modseq so CONDSTORE-aware sessions receive MODSEQ in the
 		// unsolicited FETCH response (RFC 7162 §3.2); the writer omits it otherwise.
 		s.mailboxTracker.QueueMessageFlags(update.SeqNum, update.UID, allFlags, update.EffectiveModSeq, nil)

@@ -2,6 +2,7 @@ package imap
 
 import (
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/migadu/go-imap"
@@ -80,5 +81,32 @@ func TestMentionsRecent_None(t *testing.T) {
 	}
 	if mentionsRecent(&c) {
 		t.Errorf("mentionsRecent(%+v) = true", c)
+	}
+}
+
+// TestWithRecentFlag: FETCH FLAGS carry \Recent above the session's threshold
+// only, none when the threshold is math.MaxUint32 (IMAP4rev2), and the stored
+// flags are not written through.
+func TestWithRecentFlag(t *testing.T) {
+	stored := make([]imap.Flag, 1, 4)
+	stored[0] = imap.FlagSeen
+	for _, tc := range []struct {
+		uid, above imap.UID
+		want       string
+	}{
+		{uid: 2, above: 2, want: `[\Seen]`},
+		{uid: 3, above: 2, want: `[\Seen \Recent]`},
+		{uid: 1, above: 0, want: `[\Seen \Recent]`},
+		{uid: math.MaxUint32, above: math.MaxUint32, want: `[\Seen]`},
+	} {
+		if got := fmt.Sprint(withRecentFlag(stored, tc.uid, tc.above)); got != tc.want {
+			t.Errorf("withRecentFlag(%v, %d, %d) = %s, want %s", stored, tc.uid, tc.above, got, tc.want)
+		}
+	}
+	if extra := stored[:2][1]; extra != "" {
+		t.Errorf("withRecentFlag wrote %q into the stored flags' array", extra)
+	}
+	if got := (&IMAPSession{recentAboveUID: 7}).recentFlagAboveLocked(); got != 7 {
+		t.Errorf("recentFlagAboveLocked without IMAP4rev2 = %d, want 7", got)
 	}
 }

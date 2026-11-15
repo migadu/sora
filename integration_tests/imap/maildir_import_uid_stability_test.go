@@ -87,6 +87,9 @@ func TestIMAP_MaildirImport_UIDStability(t *testing.T) {
 	// Fetch UIDs + FLAGS for first N messages and check:
 	// - UID exists in dovecot-uidlist mapping
 	// - \\Recent is not present
+	// The imported messages are \\Recent in this first session to select INBOX
+	// (RFC 3501 §2.3.2), so the flags are read in a second session: a \\Recent
+	// there could only have been stored by the import.
 	const maxCheck = 25
 	seqEnd := uint32(mbox.NumMessages)
 	if seqEnd > maxCheck {
@@ -96,7 +99,19 @@ func TestIMAP_MaildirImport_UIDStability(t *testing.T) {
 		t.Fatalf("expected non-empty INBOX after import")
 	}
 
-	fetchCmd := c.Fetch(imap.SeqSetNum(1, seqEnd), &imap.FetchOptions{UID: true, Flags: true})
+	c2, err := imapclient.DialInsecure(srv.Address, nil)
+	if err != nil {
+		t.Fatalf("failed to connect to IMAP (second session): %v", err)
+	}
+	defer c2.Close()
+	if err := c2.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("LOGIN (second session) failed: %v", err)
+	}
+	if _, err := c2.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("SELECT INBOX (second session) failed: %v", err)
+	}
+
+	fetchCmd := c2.Fetch(imap.SeqSetNum(1, seqEnd), &imap.FetchOptions{UID: true, Flags: true})
 	msgs, err := fetchCmd.Collect()
 	if err != nil {
 		t.Fatalf("FETCH failed: %v", err)
