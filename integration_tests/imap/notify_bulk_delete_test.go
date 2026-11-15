@@ -3,11 +3,13 @@
 package imap_test
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	imap "github.com/migadu/go-imap"
 	"github.com/migadu/sora/integration_tests/common"
 )
@@ -113,5 +115,104 @@ func TestNotifyBulkMailboxDeleteIsReported(t *testing.T) {
 				t.Errorf("STATUS INBOX MESSAGES = %v, want 1", status.NumMessages)
 			}
 		})
+	}
+}
+
+// TestNotifyLaggingReplicaShrinkUsesPrimary is the other side of the guard:
+// the read pool falls far behind (here it shows none of the account's
+// mailboxes, as after a failover to a replica that has not replayed them).
+// That view must not be diffed into LIST \NonExistent for mailboxes that
+// still exist, and it must not silence the watch either: the pump takes the
+// primary's view, so a real deletion made meanwhile is reported, and only it,
+// and a new message in another mailbox still arrives as STATUS. Before the
+// fix every tick was skipped while the replica lagged.
+func TestNotifyLaggingReplicaShrinkUsesPrimary(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	other := notifyLoginAndSelect(t, server.Address, account, nil, "")
+	defer other.Logout()
+	if err := other.Create("Doomed", nil).Wait(); err != nil {
+		t.Fatalf("Create(Doomed) = %v", err)
+	}
+
+	// The replica starts out current: a copy of the mailboxes as they are now.
+	// It is installed before the watcher connects, so no NOTIFY pump is
+	// running while the read pool is swapped (and the watcher's logout,
+	// deferred later, runs before the swap back).
+	defer installLaggingReplica(t, server, nil, []string{"mailboxes"}, false)()
+	database := server.ResilientDB.GetOperationalDatabase()
+	var replicaSchema string
+	if err := database.ReadPool.QueryRow(context.Background(), "SELECT current_schema()").Scan(&replicaSchema); err != nil {
+		t.Fatalf("current_schema() = %v", err)
+	}
+	if replicaSchema == "public" {
+		t.Fatalf("lagging replica reads the public schema")
+	}
+
+	rec := newNotifyRecorder()
+	watcher := notifyLoginAndSelect(t, server.Address, account, rec.options(), "")
+	defer watcher.Logout()
+
+	cmd, err := watcher.Notify(&imap.NotifyOptions{
+		Items: []imap.NotifyItem{{
+			MailboxSpec: imap.NotifyMailboxSpecPersonal,
+			Events: []imap.NotifyEvent{
+				imap.NotifyEventMessageNew,
+				imap.NotifyEventMessageExpunge,
+				imap.NotifyEventMailboxName,
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Notify() = %v", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("Notify().Wait() = %v", err)
+	}
+
+	// The read pool falls far behind: it shows no mailboxes at all.
+	if _, err := database.WritePool.Exec(context.Background(),
+		"DELETE FROM "+pgx.Identifier{replicaSchema, "mailboxes"}.Sanitize()); err != nil {
+		t.Fatalf("emptying the replica's mailboxes = %v", err)
+	}
+	// Let a few ticks see only the lag, then make real changes on the primary.
+	time.Sleep(3 * notifyTestPollInterval)
+	if err := other.Delete("Doomed").Wait(); err != nil {
+		t.Fatalf("Delete(Doomed) = %v", err)
+	}
+	notifyAppend(t, other, "INBOX")
+
+	var gotDeleted, gotStatus bool
+	deadline := time.After(5 * time.Second)
+	for !gotDeleted || !gotStatus {
+		select {
+		case data := <-rec.list:
+			if !strings.EqualFold(data.Mailbox, "Doomed") || !listHasAttr(data, imap.MailboxAttrNonExistent) {
+				t.Fatalf("unexpected LIST %q %v: the lagging replica's view was diffed", data.Mailbox, data.Attrs)
+			}
+			gotDeleted = true
+		case data := <-rec.status:
+			if !strings.EqualFold(data.Mailbox, "INBOX") {
+				t.Fatalf("unexpected STATUS for %q", data.Mailbox)
+			}
+			if data.NumMessages == nil || *data.NumMessages != 1 {
+				t.Fatalf("STATUS INBOX MESSAGES = %v, want 1", data.NumMessages)
+			}
+			gotStatus = true
+		case <-deadline:
+			t.Fatalf("watch silenced by the lagging replica: LIST \\NonExistent Doomed received = %v, STATUS INBOX received = %v", gotDeleted, gotStatus)
+		}
+	}
+
+	// Later ticks, still on the lagging replica, report nothing more.
+	select {
+	case data := <-rec.list:
+		t.Fatalf("unexpected LIST %q %v after the deletion was reported", data.Mailbox, data.Attrs)
+	case data := <-rec.status:
+		t.Fatalf("unexpected STATUS for %q after the message was reported", data.Mailbox)
+	case <-time.After(3 * notifyTestPollInterval):
 	}
 }
