@@ -327,14 +327,6 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 	}
 	duration := time.Since(authStart)
 
-	// Log authentication with alias detection
-	loginAddr := addressParsed.BaseAddress()
-	if loginAddr != primaryAddr.FullAddress() {
-		s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID, "cached", false, "method", method, "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-	} else {
-		s.InfoLog("authentication successful", "address", loginAddr, "account_id", AccountID, "cached", false, "method", method, "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-	}
-
 	// Prometheus metrics - successful authentication
 	metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
 	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
@@ -343,6 +335,15 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 	// If session closes between counter increments and user state setting, cleanup won't decrement
 	s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
 	s.Session.User = &s.IMAPUser.User
+
+	// Log authentication with alias detection, once the session's user and account_id
+	// fields name the account
+	loginAddr := addressParsed.BaseAddress()
+	if loginAddr != primaryAddr.FullAddress() {
+		s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "cached", false, "method", method, "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+	} else {
+		s.InfoLog("authentication successful", "address", loginAddr, "cached", false, "method", method, "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+	}
 
 	// Domain and user tracking
 	metrics.TrackDomainConnection("imap", addressParsed.Domain())
