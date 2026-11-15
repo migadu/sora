@@ -144,6 +144,8 @@ func TestStartupChecksTheWholeFile(t *testing.T) {
 			content: "[cluster]\nenabled = true\naddr = \"10.10.10.40:70000\"\nsecret_key = \"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\"\n" + metrics,
 			wantErr: []string{"invalid configuration - [cluster]: cluster port 70000 is not a valid port"},
 		},
+
+		{name: "cluster port overflow", content: "[cluster]\nenabled = true\naddr = \"10.10.10.40:999999999999999999999999999999\"\nsecret_key = \"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\"\n" + metrics, wantErr: []string{`invalid configuration - [cluster]: cluster port "999999999999999999999999999999" is not a valid port`}},
 		{
 			name: "every problem reported",
 			content: "[servers]\ntrusted_networks = []\n\n[relay]\ntype = \"SMTP\"\nsmtp_host = \"smtp.example.com:587\"\n" +

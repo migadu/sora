@@ -100,6 +100,8 @@ func TestConfigValidate(t *testing.T) {
 		// A negative port key bound the default 7946 instead of being refused.
 		{name: "cluster negative port field", content: cluster + "addr = \"10.10.10.40\"\nport = -1\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend,
 			want: []problem{{"[cluster]", "cluster port -1 is not a valid port"}}},
+
+		{name: "cluster port overflow", content: cluster + "addr = \"10.10.10.40:999999999999999999999999999999\"\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend, want: []problem{{"[cluster]", `cluster port "999999999999999999999999999999" is not a valid port`}}},
 		{name: "every problem, in order", content: "[servers]\ntrusted_networks = []\n\n[relay]\ntype = \"SMTP\"\n\n[uploader]\nbatch_size = 0\n" +
 			imapBackend + "proxy_protocol = true\n" + imapBackend,
 			want: []problem{
