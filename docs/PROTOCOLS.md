@@ -645,9 +645,12 @@ Rules:
   `CHILDREN`. Removing one of these with `disabled_caps` also removes `IMAP4rev2`, so clients fall
   back to IMAP4rev1 and really lose the extension, and Sora logs it. `client_filters` follows the
   same rule (see below).
-- `SASL-IR`, `STARTTLS`, `LOGINDISABLED`, `AUTH=PLAIN`, `UNSELECT`, `ENABLE`, `UTF8=ACCEPT`,
-  `ACL`, `RIGHTS=` and `APPENDLIMIT=` cannot be removed this way. The first four follow `tls`,
-  `tls_use_starttls` and `insecure_auth`.
+- With `IMAP4rev1`, `SASL-IR` is always advertised, and `LITERAL-` is offered until
+  `LITERAL+` replaces it after login. After login, `UNSELECT`, `ENABLE` and `UTF8=ACCEPT`
+  are also always advertised. These names cannot be removed this way; naming one of them
+  removes neither it nor `IMAP4rev2`. `STARTTLS`, `LOGINDISABLED` and
+  `AUTH=PLAIN` follow `tls`, `tls_use_starttls` and `insecure_auth`; `disabled_caps` does not
+  change them. `ACL`, `RIGHTS=` and `APPENDLIMIT=` cannot be removed either.
 - Do not remove both `IMAP4rev1` and `IMAP4rev2`.
 - Most commands and modifiers of a removed extension are also refused by the library, so a client
   that ignores the list cannot use them.
