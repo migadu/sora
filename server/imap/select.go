@@ -147,13 +147,17 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		// those messages.
 		//
 		// The count runs in the snapshot of EXISTS, so that RECENT counts among the
-		// messages EXISTS counts.
+		// messages EXISTS counts. No UID in the snapshot is above UIDNEXT-1, so a
+		// baseline there (a reselect or another session's SELECT without new mail)
+		// needs no statement.
 		numRecent = uint32(summary.NumMessages)
 		baseline, hasBaseline := s.server.mailboxRecentUIDs.Load(mailbox.ID)
 		if isReselectOfPrevious {
 			baseline, hasBaseline = max(baseline, lastHighestUID), true
 		}
-		if hasBaseline {
+		if hasBaseline && int64(baseline) >= summary.UIDNext-1 {
+			numRecent, recentAbove = 0, baseline
+		} else if hasBaseline {
 			nonFatalErr, fatalErr := s.server.rdb.OptionalReadInSnapshot(snapCtx, func(spCtx context.Context) error {
 				count, countErr := s.server.rdb.CountMessagesGreaterThanUIDWithRetry(spCtx, mailbox.ID, baseline)
 				if countErr != nil {
