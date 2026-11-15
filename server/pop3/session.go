@@ -278,7 +278,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	}
 
 	authSuccess := false
-	masterAuthUsed := false
+	var method string   // how the credentials were checked: "master", or as Authenticate says
 	masterForm := false // the username is user@domain.com@MASTER_USERNAME
 	var accountID int64
 	var userAddress *server.Address
@@ -328,19 +328,22 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 
 		accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, targetAddr.BaseAddress())
 		if err != nil {
-			// The lookup was cut short (server shutdown, client gone), so nothing is
-			// known about the target: a temporary failure, not counted as a failed
-			// login, as on the regular login path below.
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				s.InfoLog("master SASL authentication cancelled during the impersonation target lookup", "target_user", targetAddr.BaseAddress(), "error", err)
-				return 0, errTempUnavailable
-			}
 			// The database could not be asked, so nothing is known about the target:
 			// [SYS/TEMP] (RFC 3206 section 4), not a failed login charged to the master
-			// credential.
+			// credential. Checked before the context errors, as on the regular login
+			// path below: a lookup that timed out because the database hangs carries
+			// DeadlineExceeded too, and is not a shutdown.
 			if server.IsTemporaryAuthFailure(err) {
 				s.WarnLog("impersonation target lookup unavailable", "target_user", targetAddr.BaseAddress(), "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
+				return 0, errTempUnavailable
+			}
+			// The lookup was cut short (server shutdown, command_timeout,
+			// absolute_session_timeout, or the database read timeout), so nothing
+			// is known about the target: a temporary failure, not counted as a
+			// failed login, as on the regular login path below.
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.InfoLog("master SASL authentication cancelled during the impersonation target lookup", "target_user", targetAddr.BaseAddress(), "error", err)
 				return 0, errTempUnavailable
 			}
 			s.WarnLog("impersonation target rejected (account not found)", "target_user", targetAddr.BaseAddress(), "error", err)
@@ -351,7 +354,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 			// A self-login: answered by regular authentication below (see above).
 		} else {
 			authSuccess = true
-			masterAuthUsed = true
+			method = "master"
 			// The session belongs to the impersonated account, not the master credential.
 			userAddress = &targetAddr
 		}
@@ -431,15 +434,15 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 
 			accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, targetAddr.BaseAddress())
 			if err != nil {
-				// Cut short: a temporary failure, see the master SASL path above.
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					s.InfoLog("master username authentication cancelled during the impersonation target lookup", "target_user", targetAddr.BaseAddress(), "error", err)
-					return 0, errTempUnavailable
-				}
-				// Database unavailable: see the master SASL path above.
+				// Database unavailable (a hang included): see the master SASL path above.
 				if server.IsTemporaryAuthFailure(err) {
 					s.WarnLog("impersonation target lookup unavailable", "target_user", targetAddr.BaseAddress(), "error", err)
 					metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
+					return 0, errTempUnavailable
+				}
+				// Cut short: a temporary failure, see the master SASL path above.
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					s.InfoLog("master username authentication cancelled during the impersonation target lookup", "target_user", targetAddr.BaseAddress(), "error", err)
 					return 0, errTempUnavailable
 				}
 				// Same reply and same accounting as a bad credential (see above).
@@ -451,28 +454,33 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 				return 0, errAuthFailed
 			}
 			authSuccess = true
-			masterAuthUsed = true
+			method = "master"
 			userAddress = &targetAddr
 		}
 	}
 
-	// Regular authentication
+	// Regular authentication. Its result is logged here, once, with the session's fields.
 	if !authSuccess {
+		var reason string
 		var err error
-		accountID, err = s.server.Authenticate(ctx, userAddress.BaseAddress(), password)
+		accountID, method, reason, err = s.server.Authenticate(ctx, userAddress.BaseAddress(), password)
 		if err != nil {
+			// The database could not be asked, or the stored hash cannot be checked, so
+			// nothing is known about the credentials: [SYS/TEMP] (RFC 3206 section 4), not
+			// [AUTH], and not counted as a failed login. Checked before the context errors
+			// below: a lookup that ran into its timeout because the database hangs carries
+			// DeadlineExceeded too, and is not a shutdown.
+			if server.IsTemporaryAuthFailure(err) {
+				s.WarnLog("authentication unavailable", "address", userAddress.BaseAddress(), "reason", reason, "method", method, "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
+				return 0, errTempUnavailable
+			}
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				s.InfoLog("authentication cancelled due to server shutdown")
 				return 0, errTempUnavailable
 			}
-			// The database could not be asked, or the stored hash cannot be checked, so
-			// nothing is known about the credentials: [SYS/TEMP] (RFC 3206 section 4), not
-			// [AUTH], and not counted as a failed login.
-			if server.IsTemporaryAuthFailure(err) {
-				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
-				return 0, errTempUnavailable
-			}
 
+			s.InfoLog("authentication failed", "address", userAddress.BaseAddress(), "reason", reason, "cached", false, "method", method)
 			if masterForm {
 				// Kept for the operator debugging a client with the wrong master password.
 				s.WarnLog("master username authentication failed (invalid master password)")
@@ -542,9 +550,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	s.useMasterDB.Store(true)
 	s.mutex.Unlock()
 
-	if masterAuthUsed {
-		s.InfoLog("authentication successful", "address", userAddress.BaseAddress(), "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", time.Since(start).Seconds()))
-	}
+	s.InfoLog("authentication successful", "address", userAddress.BaseAddress(), "cached", method == "cache", "method", method, "duration", fmt.Sprintf("%.3fs", time.Since(start).Seconds()))
 
 	metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "success").Inc()
 	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
@@ -567,15 +573,19 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 // for a refused master SASL impersonation (#846), which must not answer with the
 // proxy-auth error when username names an account whose own password is the master
 // SASL password.
+// The caller logs why the login is refused; only a check that could not be made is
+// logged here, because it changes the reply.
 func (s *POP3Session) refuseLikeWrongPassword(ctx context.Context, username, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) error {
 	if authnAddr, err := server.NewAddress(username); err == nil {
-		if _, authErr := s.server.Authenticate(ctx, authnAddr.BaseAddress(), password); authErr != nil {
-			if errors.Is(authErr, context.Canceled) || errors.Is(authErr, context.DeadlineExceeded) {
-				s.InfoLog("authentication cancelled due to server shutdown")
+		if _, method, reason, authErr := s.server.Authenticate(ctx, authnAddr.BaseAddress(), password); authErr != nil {
+			// In the regular login's order (authenticateUser).
+			if server.IsTemporaryAuthFailure(authErr) {
+				s.WarnLog("authentication unavailable", "address", authnAddr.BaseAddress(), "reason", reason, "method", method, "error", authErr)
+				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
 				return errTempUnavailable
 			}
-			if server.IsTemporaryAuthFailure(authErr) {
-				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
+			if errors.Is(authErr, context.Canceled) || errors.Is(authErr, context.DeadlineExceeded) {
+				s.InfoLog("authentication cancelled due to server shutdown")
 				return errTempUnavailable
 			}
 		}

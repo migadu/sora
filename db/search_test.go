@@ -133,12 +133,15 @@ func TestBuildSearchHeaderConditions(t *testing.T) {
 // header's wall-clock time, sent_date shifted by sent_utc_offset, against the date. The
 // offset is read by primary key, and only for a message sent within a day of the date
 // (p2 decides every message outside that band, p3 bounds the band), so the mailbox scan
-// itself stays on the header covering index.
+// itself stays on the header covering index. A message without a Date: header matches
+// none of them (#1118); its id is in the mailbox's sent_date_unknown set, collected once.
+// SENTON is both bounds, and tests that set once.
 func TestBuildSearchDateConditions(t *testing.T) {
 	var db *Database // builder does not dereference the receiver
 	day := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	dayBefore, dayAfter := day.Add(-24*time.Hour), day.Add(24*time.Hour)
 	const headerTime = "m.sent_date + make_interval(secs => COALESCE(message_sent_utc_offset(m.id), 0))"
+	const dated = " AND NOT EXISTS (SELECT 1 FROM messages nd WHERE nd.mailbox_id = @mailboxID AND nd.id = m.id AND nd.sent_date_unknown AND nd.expunged_at IS NULL)"
 
 	tests := []struct {
 		name     string
@@ -150,15 +153,19 @@ func TestBuildSearchDateConditions(t *testing.T) {
 		{"SINCE", &imap.SearchCriteria{Since: day}, "m", "m.internal_date >= @p1", pgx.NamedArgs{"p1": day}},
 		{"BEFORE", &imap.SearchCriteria{Before: day}, "m", "m.internal_date < @p1", pgx.NamedArgs{"p1": day}},
 		{"SENTSINCE", &imap.SearchCriteria{SentSince: day}, "m",
-			"(m.sent_date >= @p2 OR (m.sent_date >= @p3 AND " + headerTime + " >= @p1))",
+			"(m.sent_date >= @p2 OR (m.sent_date >= @p3 AND " + headerTime + " >= @p1))" + dated,
 			pgx.NamedArgs{"p1": day, "p2": dayAfter, "p3": dayBefore}},
 		{"SENTBEFORE", &imap.SearchCriteria{SentBefore: day}, "m",
-			"(m.sent_date < @p2 OR (m.sent_date < @p3 AND " + headerTime + " < @p1))",
+			"(m.sent_date < @p2 OR (m.sent_date < @p3 AND " + headerTime + " < @p1))" + dated,
 			pgx.NamedArgs{"p1": day, "p2": dayBefore, "p3": dayAfter}},
+		{"SENTON", &imap.SearchCriteria{SentSince: day, SentBefore: dayAfter}, "m",
+			"(m.sent_date >= @p2 OR (m.sent_date >= @p3 AND " + headerTime + " >= @p1))" +
+				" AND (m.sent_date < @p5 OR (m.sent_date < @p6 AND " + headerTime + " < @p4))" + dated,
+			pgx.NamedArgs{"p1": day, "p2": dayAfter, "p3": dayBefore, "p4": dayAfter, "p5": day, "p6": dayAfter.Add(24 * time.Hour)}},
 		// The legacy seqnum statement passes no prefix, but its messages alias is m, and an
 		// unqualified id would be ambiguous there (message_seqs has one too).
 		{"SENTSINCE without prefix", &imap.SearchCriteria{SentSince: day}, "",
-			"(m.sent_date >= @p2 OR (m.sent_date >= @p3 AND " + headerTime + " >= @p1))",
+			"(m.sent_date >= @p2 OR (m.sent_date >= @p3 AND " + headerTime + " >= @p1))" + dated,
 			pgx.NamedArgs{"p1": day, "p2": dayAfter, "p3": dayBefore}},
 	}
 

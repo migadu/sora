@@ -3,7 +3,6 @@ package imap
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"time"
 
@@ -130,19 +129,12 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					AccountID, err := s.server.rdb.GetMasterLoginTargetWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
-						// Check if error is due to context cancellation (server shutdown)
-						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-							s.InfoLog("master username auth cancelled due to server shutdown")
-							return &imap.Error{
-								Type: imap.StatusResponseTypeNo,
-								Code: imap.ResponseCodeUnavailable,
-								Text: server.ErrServerShuttingDown.Error(),
-							}
-						}
-
 						// The database could not be asked, so nothing is known about the
 						// target: a temporary failure (RFC 5530 section 3), not a failed
-						// login charged to the master credential.
+						// login charged to the master credential. Checked before the
+						// context errors, as in login.go: a lookup that timed out because
+						// the database hangs is no shutdown, and a wrong master password,
+						// which the regular path answers, must get the same reply.
 						if server.IsTemporaryAuthFailure(err) {
 							s.WarnLog("impersonation target lookup unavailable", "target_user", targetUserToImpersonate, "error", err)
 							metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
@@ -150,6 +142,16 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 								Type: imap.StatusResponseTypeNo,
 								Code: imap.ResponseCodeUnavailable,
 								Text: server.ErrAuthServiceUnavailable.Error(),
+							}
+						}
+
+						// Check if error is due to context cancellation (server shutdown)
+						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+							s.InfoLog("master username auth cancelled due to server shutdown")
+							return &imap.Error{
+								Type: imap.StatusResponseTypeNo,
+								Code: imap.ResponseCodeUnavailable,
+								Text: server.ErrServerShuttingDown.Error(),
 							}
 						}
 
@@ -174,53 +176,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
 					}
 
-					if !s.server.maintenanceGate.Admit(&s.server.authenticatedConnections, "imap") {
-						return s.refusedInMaintenance()
-					}
-					duration := time.Since(authStart)
-
-					metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
-					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
-
-					// IMPORTANT: Set user state AFTER incrementing both counters to prevent race condition
-					// If session closes between counter increments and user state setting, cleanup won't decrement
-					s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
-					s.Session.User = &s.IMAPUser.User
-
-					// Log authentication with alias detection, once the session's user and
-					// account_id fields name the account
-					loginAddr := address.BaseAddress()
-					if loginAddr != primaryAddr.FullAddress() {
-						s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-					} else {
-						s.InfoLog("authentication successful", "address", loginAddr, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-					}
-
-					// Register connection for tracking
-					if err := s.registerConnection(address.BaseAddress()); err != nil {
-						// Connection limit reached - undo authentication and reject
-						s.server.authenticatedConnections.Add(-1)
-						metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Dec()
-						s.IMAPUser = nil
-						s.Session.User = nil
-						return &imap.Error{
-							Type: imap.StatusResponseTypeNo,
-							Code: imap.ResponseCodeLimit,
-							Text: "Maximum connections reached",
-						}
-					}
-
-					// Start termination poller to check for kick commands. Required on
-					// every authenticated path: it is the only delivery path for kicks,
-					// and imapproxy authenticates to its backends with exactly this
-					// master AUTHENTICATE, so without it proxied backend sessions are
-					// tracked but unkickable.
-					s.startTerminationPoller()
-
-					// Trigger cache warmup for the authenticated user (if configured)
-					s.triggerCacheWarmup()
-
-					return nil
+					return s.completeAuthentication(AccountID, address, primaryAddr, "master", authStart, false)
 				}
 
 				// Any other password is the base address's own login, answered by regular
@@ -280,19 +236,11 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					AccountID, err := s.server.rdb.GetMasterLoginTargetWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
-						// Check if error is due to context cancellation (server shutdown)
-						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-							s.InfoLog("master SASL auth cancelled due to server shutdown")
-							return &imap.Error{
-								Type: imap.StatusResponseTypeNo,
-								Code: imap.ResponseCodeUnavailable,
-								Text: server.ErrServerShuttingDown.Error(),
-							}
-						}
-
 						// The database could not be asked, so nothing is known about the
 						// target: a temporary failure (RFC 5530 section 3), not a failed
-						// login charged to the master credential.
+						// login charged to the master credential. Checked before the
+						// context errors: a lookup that timed out because the database
+						// hangs is no shutdown (see the master username path above).
 						if server.IsTemporaryAuthFailure(err) {
 							s.WarnLog("impersonation target lookup unavailable", "target_user", targetUserToImpersonate, "error", err)
 							metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
@@ -300,6 +248,16 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 								Type: imap.StatusResponseTypeNo,
 								Code: imap.ResponseCodeUnavailable,
 								Text: server.ErrAuthServiceUnavailable.Error(),
+							}
+						}
+
+						// Check if error is due to context cancellation (server shutdown)
+						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+							s.InfoLog("master SASL auth cancelled due to server shutdown")
+							return &imap.Error{
+								Type: imap.StatusResponseTypeNo,
+								Code: imap.ResponseCodeUnavailable,
+								Text: server.ErrServerShuttingDown.Error(),
 							}
 						}
 
@@ -324,53 +282,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
 					}
 
-					if !s.server.maintenanceGate.Admit(&s.server.authenticatedConnections, "imap") {
-						return s.refusedInMaintenance()
-					}
-					duration := time.Since(authStart)
-
-					metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
-					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
-
-					// IMPORTANT: Set user state AFTER incrementing both counters to prevent race condition
-					// If session closes between counter increments and user state setting, cleanup won't decrement
-					s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
-					s.Session.User = &s.IMAPUser.User
-
-					// Log authentication with alias detection, once the session's user and
-					// account_id fields name the account
-					loginAddr := address.BaseAddress()
-					if loginAddr != primaryAddr.FullAddress() {
-						s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-					} else {
-						s.InfoLog("authentication successful", "address", loginAddr, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-					}
-
-					// Register connection for tracking
-					if err := s.registerConnection(address.BaseAddress()); err != nil {
-						// Connection limit reached - undo authentication and reject
-						s.server.authenticatedConnections.Add(-1)
-						metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Dec()
-						s.IMAPUser = nil
-						s.Session.User = nil
-						return &imap.Error{
-							Type: imap.StatusResponseTypeNo,
-							Code: imap.ResponseCodeLimit,
-							Text: "Maximum connections reached",
-						}
-					}
-
-					// Start termination poller to check for kick commands. Required on
-					// every authenticated path: it is the only delivery path for kicks,
-					// and imapproxy authenticates to its backends with exactly this
-					// master AUTHENTICATE, so without it proxied backend sessions are
-					// tracked but unkickable.
-					s.startTerminationPoller()
-
-					// Trigger cache warmup for the authenticated user (if configured)
-					s.triggerCacheWarmup()
-
-					return nil
+					return s.completeAuthentication(AccountID, address, primaryAddr, "master", authStart, false)
 				} else if checkMasterCredential(username, settings.masterSASLUsername) && identity != username {
 					// The master SASL username asking to act as somebody else, with a
 					// wrong password. Not answered from here: like any other password
@@ -436,23 +348,27 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 // for a refused master SASL impersonation (#846), which must not answer
 // AUTHORIZATIONFAILED when username names an account whose own password is the master
 // SASL password.
+// The caller logs why the login is refused; only a check that could not be made is
+// logged here, because it changes the reply.
 func (s *IMAPSession) refuseLikeWrongPassword(ctx context.Context, username, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) error {
 	if authnAddr, err := server.NewAddress(username); err == nil {
-		if _, authErr := s.server.Authenticate(ctx, authnAddr.BaseAddress(), password); authErr != nil {
+		if _, method, reason, authErr := s.server.Authenticate(ctx, authnAddr.BaseAddress(), password); authErr != nil {
+			// In the regular login's order (login.go), so the reply is the same.
+			if server.IsTemporaryAuthFailure(authErr) {
+				s.WarnLog("authentication unavailable", "address", authnAddr.BaseAddress(), "reason", reason, "method", method, "error", authErr)
+				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeUnavailable,
+					Text: server.ErrAuthServiceUnavailable.Error(),
+				}
+			}
 			if errors.Is(authErr, context.Canceled) || errors.Is(authErr, context.DeadlineExceeded) {
 				s.InfoLog("authentication cancelled due to server shutdown")
 				return &imap.Error{
 					Type: imap.StatusResponseTypeNo,
 					Code: imap.ResponseCodeUnavailable,
 					Text: server.ErrServerShuttingDown.Error(),
-				}
-			}
-			if server.IsTemporaryAuthFailure(authErr) {
-				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
-				return &imap.Error{
-					Type: imap.StatusResponseTypeNo,
-					Code: imap.ResponseCodeUnavailable,
-					Text: server.ErrAuthServiceUnavailable.Error(),
 				}
 			}
 		}

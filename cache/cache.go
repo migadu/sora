@@ -199,7 +199,10 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval
 
 	for i := 0; i < NumShards; i++ {
 		shardHex := fmt.Sprintf("%02x", i)
-		dsn, err := sqlitefile.DSN(shardIndexPath(basePath, i), "")
+		// busy_timeout is a setting of each connection, so it goes in the DSN, which the
+		// driver applies to every connection the pool opens; a PRAGMA run with Exec on
+		// the pool sets it on one pooled connection only.
+		dsn, err := sqlitefile.DSN(shardIndexPath(basePath, i), "_pragma=busy_timeout(5000)")
 		if err != nil {
 			return nil, err
 		}
@@ -208,9 +211,6 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval
 			return nil, fmt.Errorf("failed to open cache index DB for shard %s: %w", shardHex, err)
 		}
 
-		if _, err := db.Exec(`PRAGMA busy_timeout = 5000;`); err != nil {
-			logger.Warn("Cache: Failed to set busy_timeout", "error", err)
-		}
 		if _, err := db.Exec(`PRAGMA journal_mode = WAL;`); err != nil {
 			logger.Warn("Cache: Failed to enable WAL mode on cache index DB", "error", err)
 		}
