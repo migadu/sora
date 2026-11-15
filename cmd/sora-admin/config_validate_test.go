@@ -692,6 +692,111 @@ func TestConfigValidateReportsFileOnlyStartupWarnings(t *testing.T) {
 			name:    "refuse_after on a proxy-only node",
 			content: storageTOML + "[backend_maintenance]\nrefuse_after = \"30 sec\"\n\n" + imapProxy,
 		},
+		{
+			// The [[server]] values the config getters and the servers' constructors
+			// replace with the default, each on a server type that reads it.
+			name: "[[server]] values the servers replace with the default",
+			content: storageTOML + "[servers]\ntrusted_networks = [\"192.0.2.0/24\"]\n\n" +
+				"[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\nappend_limit = \"lots\"\nauth_idle_timeout = \"soon\"\n" +
+				"proxy_protocol = true\nproxy_protocol_timeout = \"0s\"\n" +
+				"[server.timeouts]\ncommand_timeout = \"soon\"\nabsolute_session_timeout = \"a day\"\n" +
+				"[server.lookup_cache]\npositive_ttl = \"a while\"\npositive_revalidation_window = \"a moment\"\n\n" +
+				"[[server]]\ntype = \"managesieve\"\nname = \"sieve\"\naddr = \"127.0.0.1:4190\"\nmax_script_size = \"lots\"\n\n" +
+				"[[server]]\ntype = \"lmtp\"\nname = \"lmtp\"\naddr = \"127.0.0.1:24\"\nmax_message_size = \"lots\"\n\n" +
+				imapProxy + "connect_timeout = \"soon\"\n\n" +
+				userAPI + "token_duration = \"a while\"\n",
+			wantWarn: []string{
+				"[WARN] Server imap (type: imap) has an invalid 'append_limit', start-up uses the default",
+				"[WARN] Server imap (type: imap) has an invalid 'auth_idle_timeout', start-up uses the default",
+				"[WARN] Server imap (type: imap) has an invalid 'proxy_protocol_timeout', start-up uses the default",
+				"[WARN] Server imap (type: imap) has an invalid 'timeouts.command_timeout', start-up uses the default",
+				"[WARN] Server imap (type: imap) has an invalid 'timeouts.absolute_session_timeout', start-up uses the default",
+				"[WARN] Server imap (type: imap) has an invalid 'lookup_cache.positive_ttl', start-up uses the default",
+				"[WARN] Server imap (type: imap) has an invalid 'lookup_cache.positive_revalidation_window', start-up uses the default",
+				"[WARN] Server sieve (type: managesieve) has an invalid 'max_script_size', start-up uses the default",
+				"[WARN] Server lmtp (type: lmtp) has an invalid 'max_message_size', start-up uses the default",
+				"[WARN] Server imap-proxy (type: imap_proxy) has an invalid 'connect_timeout', start-up uses the default",
+				"[WARN] Server user-api (type: http_user_api) has an invalid 'token_duration', start-up uses the default",
+			},
+		},
+		{
+			// GetMaxMessageSize caps max_message_size at the largest message Sora can store.
+			name: "max_message_size above the largest message Sora stores",
+			content: storageTOML + "[[server]]\ntype = \"lmtp\"\nname = \"lmtp\"\naddr = \"127.0.0.1:24\"\nmax_message_size = \"4gb\"\n\n" +
+				adminAPI + "max_message_size = \"4gb\"\n",
+			wantWarn: []string{
+				"[WARN] Server lmtp (type: lmtp) has max_message_size 4294967296 bytes, above the largest message Sora can store: start-up uses 2147483647",
+				"[WARN] Server admin-api (type: http_admin_api) has max_message_size 4294967296 bytes, above the largest message Sora can store: start-up uses 2147483647",
+			},
+		},
+		{
+			// The section values a mail backend's workers, its IMAP server, the auth cache,
+			// the database connection and spam training replace with the default (spam
+			// training is left out instead).
+			name: "section values a mail backend replaces with the default",
+			content: "[database]\nlock_timeout = \"soon\"\nquery_timeout = \"soon\"\nsearch_timeout = \"soon\"\nwrite_timeout = \"soon\"\n\n" +
+				"[database.write]\nhosts = [\"db.example.com\"]\nquery_timeout = \"soon\"\n\n" +
+				"[s3]\nendpoint = \"s3.example.com\"\nbucket = \"mail\"\n\n" +
+				"[local_cache]\ncapacity = \"huge\"\nmax_object_size = \"huge\"\npurge_interval = \"often\"\norphan_cleanup_age = \"old\"\n" +
+				"metrics_interval = \"often\"\nmetrics_retention = \"long\"\nwarmup_timeout = \"0s\"\nwarmup_interval = \"daily\"\n\n" +
+				"[cleanup]\ngrace_period = \"two weeks\"\nwake_interval = \"hourly\"\nmax_age_restriction = \"a year\"\nfts_retention = \"forever\"\n" +
+				"health_status_retention = \"a month\"\ninstance_liveness_threshold = \"a week\"\npurge_poll_interval = \"often\"\n\n" +
+				"[uploader]\nretry_interval = \"soon\"\n\n" +
+				"[auth_cache]\nenabled = true\nmax_age = \"a day\"\npurge_unused = \"a week\"\ncleanup_interval = \"hourly\"\n\n" +
+				"[spam_training]\nenabled = true\nendpoint = \"https://spam.example.com/train\"\ntimeout = \"soon\"\nmax_message_size = \"0\"\n\n" +
+				"[spam_training.circuit_breaker]\ntimeout = \"soon\"\n\n" + imap,
+			wantWarn: []string{
+				"[WARN] [local_cache] has an invalid 'capacity', start-up uses the default",
+				"[WARN] [local_cache] has an invalid 'max_object_size', start-up uses the default",
+				"[WARN] [local_cache] has an invalid 'purge_interval', start-up uses the default",
+				"[WARN] [local_cache] has an invalid 'orphan_cleanup_age', start-up uses the default",
+				"[WARN] [local_cache] has an invalid 'metrics_interval', start-up uses the default",
+				"[WARN] [local_cache] has an invalid 'metrics_retention', start-up uses the default",
+				"[WARN] [local_cache] has an invalid 'warmup_timeout', start-up uses the default",
+				"[WARN] [local_cache] has an invalid 'warmup_interval', start-up uses the default",
+				"[WARN] [cleanup] has an invalid 'grace_period', start-up uses the default",
+				"[WARN] [cleanup] has an invalid 'wake_interval', start-up uses the default",
+				"[WARN] [cleanup] has an invalid 'max_age_restriction', start-up uses the default",
+				"[WARN] [cleanup] has an invalid 'fts_retention', start-up uses the default",
+				"[WARN] [cleanup] has an invalid 'health_status_retention', start-up uses the default",
+				"[WARN] [cleanup] has an invalid 'instance_liveness_threshold', start-up uses the default",
+				"[WARN] [cleanup] has an invalid 'purge_poll_interval', start-up uses the default",
+				"[WARN] [uploader] has an invalid 'retry_interval', start-up uses the default",
+				"[WARN] [auth_cache] has an invalid 'max_age', start-up uses the default",
+				"[WARN] [auth_cache] has an invalid 'purge_unused', start-up uses the default",
+				"[WARN] [auth_cache] has an invalid 'cleanup_interval', start-up uses the default",
+				"[WARN] [database] has an invalid 'lock_timeout', start-up uses the default",
+				"[WARN] [database] has an invalid 'query_timeout', every query uses the default",
+				"[WARN] [database] has an invalid 'search_timeout', every query uses the default",
+				"[WARN] [database] has an invalid 'write_timeout', every query uses the default",
+				"[WARN] [database.write] has an invalid 'query_timeout', every read uses the [database] query_timeout",
+				"[WARN] [spam_training] has an invalid 'timeout', start-up runs without spam training",
+				"[WARN] [spam_training] has an invalid 'max_message_size', start-up runs without spam training",
+				"[WARN] [spam_training.circuit_breaker] has an invalid 'timeout', start-up runs without spam training",
+			},
+		},
+		{
+			// Without a mail backend start-up runs no cache, cleaner or upload worker,
+			// without an imap server no warmup, and it leaves out a disabled auth cache and
+			// spam training.
+			name: "section values a proxy-only node does not read",
+			content: storageTOML + "[local_cache]\ncapacity = \"huge\"\nwarmup_timeout = \"soon\"\n\n[cleanup]\ngrace_period = \"two weeks\"\n\n" +
+				"[uploader]\nretry_interval = \"soon\"\n\n[auth_cache]\nenabled = false\nmax_age = \"a day\"\n\n" +
+				"[spam_training]\nenabled = false\nendpoint = \"https://spam.example.com/train\"\ntimeout = \"soon\"\n\n" + imapProxy,
+		},
+		{
+			// Nor the [database] values on a node that connects to no database.
+			name:    "[database] values on a node without a database",
+			content: "[database]\nlock_timeout = \"soon\"\nwrite_timeout = \"soon\"\n\n[[server]]\ntype = \"metrics\"\nname = \"metrics\"\naddr = \"127.0.0.1:9090\"\n",
+		},
+		{
+			// A disabled lookup cache, a proxy whose remote lookup URL names $ip (it
+			// caches nothing), and proxy_protocol_timeout without proxy_protocol.
+			name: "[[server]] values the servers do not read",
+			content: storageTOML + imap + "proxy_protocol_timeout = \"soon\"\n[server.lookup_cache]\nenabled = false\npositive_ttl = \"a while\"\n\n" +
+				imapProxy + "[server.remote_lookup]\nenabled = true\nurl = \"https://lookup.example.com/lookup?user=$email&ip=$ip\"\n" +
+				"[server.lookup_cache]\npositive_ttl = \"a while\"\n",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
