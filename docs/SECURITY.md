@@ -104,8 +104,7 @@ plaintext authentication is allowed without TLS on a publicly reachable address;
 "Publicly reachable" means bound to a public IP, or to a wildcard address (`:143`, `0.0.0.0`, `::`)
 on a host that has a public address. Loopback, private (RFC 1918, ULA), link-local and CGNAT binds
 do not warn. On a listener with `tls = false`, setting `insecure_auth = false` does not change
-anything: configure TLS instead. The POP3 backend also logs
-`POP3: TLS not configured; cleartext authentication auto-enabled. ...` whenever its `tls` is off.
+anything: configure TLS instead.
 
 A backend behind Sora proxies usually runs with `tls = false` on a private address. Keep its ports
 reachable only from the proxies, or turn on TLS on the backend leg ([PROXY.md](PROXY.md#8-the-backend-leg)):

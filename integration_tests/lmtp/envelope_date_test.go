@@ -87,11 +87,19 @@ func TestLMTP_ObsoleteZoneDate(t *testing.T) {
 
 	marker := fmt.Sprintf("lmtp-obszone-%d", common.GetTimestamp())
 	for _, tc := range []struct {
-		zone   string
-		offset int32 // seconds east of UTC
+		zone    string
+		offset  int32 // seconds east of UTC
+		unknown bool
 	}{
-		{"PDT", -7 * 3600},
-		{"EST", -5 * 3600},
+		{"PDT", -7 * 3600, false},
+		{"EST", -5 * 3600, false},
+		{"+0000", 0, false},
+		{"UT", 0, false},
+		{"GMT", 0, false},
+		{"-0000", 0, true},
+		{"GMT+1", 0, true},
+		{"+01", 0, true},
+		{"Z", 0, true},
 	} {
 		subject := marker + " " + tc.zone
 		msg := "From: sender@example.com\r\nTo: " + account.Email + "\r\nSubject: " + subject + "\r\n" +
@@ -102,16 +110,22 @@ func TestLMTP_ObsoleteZoneDate(t *testing.T) {
 
 		var sentDate time.Time
 		var offset *int32
+		var uid, mailboxID int64
 		require.NoError(t, rdb.QueryRowWithRetry(ctx, `
-			SELECT m.sent_date, m.sent_utc_offset
+			SELECT m.sent_date, m.sent_utc_offset, m.uid, m.mailbox_id
 			FROM messages m JOIN mailboxes mb ON mb.id = m.mailbox_id
 			WHERE mb.account_id = $1 AND mb.name = 'INBOX' AND m.subject = $2 AND m.expunged_at IS NULL
-		`, accountID, subject).Scan(&sentDate, &offset))
+		`, accountID, subject).Scan(&sentDate, &offset, &uid, &mailboxID))
 
 		want := time.Date(1996, 7, 17, 2, 23, 25, 0, time.FixedZone("", int(tc.offset)))
 		assert.True(t, sentDate.Equal(want), "%s: stored sent_date %v, want %v", tc.zone, sentDate, want)
-		if assert.NotNil(t, offset, "%s: sent_utc_offset", tc.zone) {
+		if tc.unknown {
+			assert.Nil(t, offset, "%s: unknown zone must persist as NULL", tc.zone)
+		} else if assert.NotNil(t, offset, "%s: sent_utc_offset", tc.zone) {
 			assert.Equal(t, tc.offset, *offset, "%s: sent_utc_offset", tc.zone)
 		}
+		envelope, err := rdb.GetDatabase().GetMessageEnvelope(ctx, imap.UID(uid), mailboxID)
+		require.NoError(t, err)
+		assert.Equal(t, tc.unknown, envelope.DateUnknownZone, tc.zone)
 	}
 }

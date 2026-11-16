@@ -3146,6 +3146,16 @@ func (s *ServerConfig) Validate() error {
 	if s.MasterSASLUsername != "" && s.MasterSASLPassword == "" {
 		return fmt.Errorf("server %q: master_sasl_username is set but master_sasl_password is empty; refusing to start (an empty password would allow impersonation of any account)", s.Name)
 	}
+	// These servers build their master SASL gate from the list with the same parser and
+	// refuse to start on an entry that is not an IP address or CIDR, rather than drop it
+	// and admit master logins from sources the operator meant to exclude. Other types do
+	// not read the key; WarnUnusedConfigOptions says so.
+	switch s.Type {
+	case "imap", "pop3", "managesieve":
+		if _, err := helpers.ParseTrustedNetworks(s.MasterSASLAllowedNetworks); err != nil {
+			return fmt.Errorf("server %q: invalid master_sasl_allowed_networks: %w", s.Name, err)
+		}
+	}
 
 	if s.AuthRateLimit != nil {
 		if err := s.AuthRateLimit.Validate(); err != nil {

@@ -17,6 +17,11 @@ import (
 // The body structure is built at APPEND and was given net/mail's reading of the zone in the
 // server's time.Local: PDT came out as +0000 on a server in UTC, and a lower-case zone as NIL.
 // At most one of PDT and EST can be the server's in July.
+//
+// A zone that is malformed or not defined keeps the date and time as written with the zone
+// "-0000", through the stored body structure (RFC 5256 section 2.2: "If the time zone is
+// invalid, the date and time SHOULD be treated as UTC"). Before, Z was written "+0000" and
+// GMT+1 was NIL.
 func TestIMAP_BodyStructureAttachedEnvelopeDateObsoleteZone(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	server, account := common.SetupIMAPServer(t)
@@ -30,7 +35,10 @@ func TestIMAP_BodyStructureAttachedEnvelopeDateObsoleteZone(t *testing.T) {
 		{"Wed, 17 Jul 1996 02:23:25 PDT", `"Wed, 17 Jul 1996 02:23:25 -0700"`},
 		{"Wed, 17 Jul 1996 02:23:25 EST", `"Wed, 17 Jul 1996 02:23:25 -0500"`},
 		{"Wed, 17 Jul 1996 02:23:25 pdt", `"Wed, 17 Jul 1996 02:23:25 -0700"`},
-		{"Wed, 17 Jul 1996 02:23:25 Z", `"Wed, 17 Jul 1996 02:23:25 +0000"`},
+		{"Wed, 17 Jul 1996 02:23:25 Z", `"Wed, 17 Jul 1996 02:23:25 -0000"`},
+		{"Wed, 17 Jul 1996 02:23:25 GMT+1", `"Wed, 17 Jul 1996 02:23:25 -0000"`},
+		{"Wed, 17 Jul 1996 02:23:25 +01", `"Wed, 17 Jul 1996 02:23:25 -0000"`},
+		{"Wed, 17 Jul 1996 02:23:25 +0000", `"Wed, 17 Jul 1996 02:23:25 +0000"`},
 	}
 	for i, d := range dates {
 		rc.append(fmt.Sprintf("a%d", i), "INBOX", "From: alice@example.com\r\nTo: bob@example.com\r\n"+

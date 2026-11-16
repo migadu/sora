@@ -215,6 +215,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	// Parse message headers (this does not consume the body)
 	var subject, messageID string
 	var sentDate time.Time
+	var sentDateUnknownZone bool
 	var inReplyTo []string
 	var references []string
 	var actualPlaintextBody string
@@ -224,7 +225,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		mailHeader := mail.Header{Header: messageContent.Header}
 		subject, _ = mailHeader.Subject()
 		messageID, _ = mailHeader.MessageID()
-		sentDate, _ = helpers.ParseDateHeader(mailHeader.Get("Date"))
+		sentDate, sentDateUnknownZone, _ = helpers.ParseDateHeaderWithZone(mailHeader.Get("Date"))
 		inReplyTo, _ = mailHeader.MsgIDList("In-Reply-To")
 		references, _ = mailHeader.MsgIDList("References")
 
@@ -387,24 +388,25 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	ownMessagesDone := s.beginOwnMessages(mailbox.ID)
 	_, messageUID, err := s.server.rdb.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
-			AccountID:     destAccountID,
-			MailboxID:     mailbox.ID,
-			S3Domain:      destS3Domain,
-			S3Localpart:   destS3Localpart,
-			MailboxName:   mailbox.Name,
-			ContentHash:   contentHash,
-			MessageID:     messageID,
-			Flags:         appendFlags,
-			InternalDate:  internalDate, // RFC 9051 §6.3.12: APPEND date-time, else now
-			Size:          size,
-			Subject:       subject,
-			PlaintextBody: actualPlaintextBody,
-			SentDate:      sentDate,
-			InReplyTo:     inReplyTo,
-			References:    references,
-			BodyStructure: &bodyStructure,
-			Recipients:    recipients,
-			FTSRetention:  s.server.ftsRetention,
+			AccountID:           destAccountID,
+			MailboxID:           mailbox.ID,
+			S3Domain:            destS3Domain,
+			S3Localpart:         destS3Localpart,
+			MailboxName:         mailbox.Name,
+			ContentHash:         contentHash,
+			MessageID:           messageID,
+			Flags:               appendFlags,
+			InternalDate:        internalDate, // RFC 9051 §6.3.12: APPEND date-time, else now
+			Size:                size,
+			Subject:             subject,
+			PlaintextBody:       actualPlaintextBody,
+			SentDate:            sentDate,
+			SentDateUnknownZone: sentDateUnknownZone,
+			InReplyTo:           inReplyTo,
+			References:          references,
+			BodyStructure:       &bodyStructure,
+			Recipients:          recipients,
+			FTSRetention:        s.server.ftsRetention,
 		},
 		db.PendingUpload{
 			InstanceID:  s.server.instanceID,

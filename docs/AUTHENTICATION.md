@@ -420,7 +420,8 @@ master_sasl_allowed_networks = ["10.20.0.5", "10.20.0.6"]
 - Empty (the default): master SASL is accepted from any source. If master SASL is configured without
   this list, the backend logs a warning at startup, for example `IMAP: master SASL enabled without
   master_sasl_allowed_networks; backend trusts any source that knows the secret. ...`
-- An entry that is not an IP or CIDR stops the server at startup.
+- An entry that is not an IP or CIDR is refused: startup stops, `sora-admin config validate` fails
+  the file, and a SIGHUP reload skips that server's block, which keeps its previous settings.
 - A login with correct master SASL credentials from another address gets the bad-credentials reply
   and logs `master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting`.
 

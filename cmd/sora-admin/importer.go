@@ -117,6 +117,7 @@ type messageMetadata struct {
 	subject              string
 	plaintextBody        string
 	sentDate             time.Time
+	sentDateUnknownZone  bool
 	internalDate         time.Time // arrival time: maildir filename timestamp / file mtime
 	inReplyTo            []string
 	references           []string
@@ -628,7 +629,7 @@ func (i *Importer) processSubscriptions() error {
 	logger.Info("Processing Dovecot subscriptions", "path", subscriptionsPath)
 
 	// Read the subscriptions file
-	content, err := i.readMaildirFile(subscriptionsPath)
+	content, err := i.readMaildirFile(subscriptionsPath, maxDovecotSubscriptionsSize)
 	if err != nil {
 		return fmt.Errorf("failed to read subscriptions file: %w", err)
 	}
@@ -687,7 +688,8 @@ func (i *Importer) processSubscriptions() error {
 // not open. The usual --sieve file of a Dovecot migration is that link, which is the
 // user's, and the import runs with privileges the user lacks: the link must not
 // choose which file those privileges read into the user's account. Only a regular
-// file is read (openRegularFile).
+// file is read (openRegularFile), at most maxSieveScriptSize+1 bytes to detect an
+// oversized file without reading it whole.
 func readSieveFile(path string) ([]byte, error) {
 	path = filepath.Clean(path)
 	root, err := os.OpenRoot(filepath.Dir(path))
@@ -700,7 +702,14 @@ func readSieveFile(path string) ([]byte, error) {
 		return nil, err
 	}
 	defer file.Close()
-	return io.ReadAll(file)
+	content, err := io.ReadAll(io.LimitReader(file, maxSieveScriptSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(content) > maxSieveScriptSize {
+		return nil, fmt.Errorf("script exceeds the maximum size of %d bytes", maxSieveScriptSize)
+	}
+	return content, nil
 }
 
 // importSieveScript imports a Sieve script file for the user
@@ -817,7 +826,7 @@ func (i *Importer) parseDovecotKeywords() error {
 
 	logger.Info("Parsing Dovecot keywords", "path", keywordsPath)
 
-	keywords, err := parseKeywordsFile(keywordsPath, i.readMaildirFile)
+	keywords, err := parseKeywordsFile(keywordsPath, i.openMaildirFile)
 	if err != nil {
 		return err
 	}
@@ -1391,28 +1400,72 @@ func (i *Importer) openMaildirFile(path string) (*os.File, error) {
 	return openRegularFile(i.root, name)
 }
 
-// readMaildirFile is os.ReadFile through the maildir root (openMaildirFile).
-func (i *Importer) readMaildirFile(path string) ([]byte, error) {
+// readMaildirFile is os.ReadFile through the maildir root (openMaildirFile), for a
+// file of at most limit bytes (readFileUpTo).
+func (i *Importer) readMaildirFile(path string, limit int64) ([]byte, error) {
 	file, err := i.openMaildirFile(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	return io.ReadAll(file)
+	return readFileUpTo(file, limit)
+}
+
+// maxDovecotKeywordsSize and maxDovecotSubscriptionsSize are the most of a
+// dovecot-keywords and a subscriptions file the import and the export read. Whoever
+// can write to the maildir, or to the export's destination, decides their size, and a
+// sparse file costs them no disk: read whole, a huge one would exhaust the memory of
+// the host running sora-admin. These are resource limits for metadata reads. Ordinary
+// Dovecot-generated keywords use at most 26 lines, with a 1 KiB reader line bound
+// (maildir-keywords.c); subscriptions use one line per subscribed folder.
+const (
+	maxDovecotKeywordsSize      = 64 << 10 // 64 KiB
+	maxDovecotSubscriptionsSize = 4 << 20  // 4 MiB
+)
+
+// readFileUpTo reads file to its end, which must come within limit bytes: a larger
+// file is refused, naming it, after reading limit+1 bytes of it, however large it is
+// or grows.
+func readFileUpTo(file *os.File, limit int64) ([]byte, error) {
+	content, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(content)) > limit {
+		return nil, fmt.Errorf("%s is larger than %d bytes", file.Name(), limit)
+	}
+	return content, nil
 }
 
 // errNotRegularFile refuses a file the import would read that is a FIFO, a socket or
 // a device.
 var errNotRegularFile = errors.New("not a regular file")
 
-// openRegularFile opens name below root for reading if it is a regular file, and
-// fails with errNotRegularFile otherwise. The files the import reads may have been
-// written by their owner, who can make one a FIFO (mkfifo; rsync -a copies them), and
-// opening a FIFO for reading waits until something opens it for writing: the run
-// would never finish, and cancelling it would not end the wait. The file is opened
-// with O_NONBLOCK to avoid that FIFO writer wait, and the open file is checked, so
-// a file replaced since a stat or directory listing cannot get past the check. A regular
-// file is then read in blocking mode, as os.Open reads it.
+// errAnotherUsersFile refuses a file the import would read that whoever named it may
+// not have been able to read (checkNamedByOwner).
+var errAnotherUsersFile = errors.New("may be another user's file")
+
+// fileUID returns the user that owns the file info describes. It is a variable so that
+// a test can make a file appear to belong to another user, which only root can arrange.
+var fileUID = func(info fs.FileInfo) uint32 { return info.Sys().(*syscall.Stat_t).Uid }
+
+// openRegularFile opens name below root if it is regular and passes the Unix
+// owner-directory check below. It fails with errNotRegularFile or
+// errAnotherUsersFile otherwise. The files the import reads may have been written by their owner, who can
+// make one a FIFO (mkfifo; rsync -a copies them), and opening a FIFO for reading waits
+// until something opens it for writing: the run would never finish, and cancelling it
+// would not end the wait. The file is opened with O_NONBLOCK to avoid that FIFO writer
+// wait, and the open file is checked, so a file replaced since a stat or directory
+// listing cannot get past the check. A regular file is then read in blocking mode, as
+// os.Open reads it.
+//
+// The owner can also make a name a hard link, which root cannot tell from the file's
+// first name, to a file elsewhere on the same file system, one they cannot read where
+// the system lets them link it (BSD and macOS do, as Linux does with
+// fs.protected_hardlinks = 0). The import runs with privileges the owner lacks, so a
+// file others may not read must pass checkNamedByOwner. A
+// link count is no test: Dovecot copies a message between folders as a hard link
+// (maildir_copy_with_hardlinks), and cp -al backups link every file.
 func openRegularFile(root *os.Root, name string) (*os.File, error) {
 	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -1421,6 +1474,9 @@ func openRegularFile(root *os.Root, name string) (*os.File, error) {
 	info, err := file.Stat()
 	if err == nil && !info.Mode().IsRegular() {
 		err = &fs.PathError{Op: "open", Path: name, Err: errNotRegularFile}
+	}
+	if err == nil && info.Mode().Perm()&0o004 == 0 {
+		err = checkNamedByOwner(root, name, info)
 	}
 	if err == nil {
 		var conn syscall.RawConn
@@ -1436,6 +1492,46 @@ func openRegularFile(root *os.Root, name string) (*os.File, error) {
 		return nil, err
 	}
 	return file, nil
+}
+
+// checkNamedByOwner refuses info, the file openRegularFile opened as name below root,
+// with errAnotherUsersFile unless the directory that holds name belongs to the file's
+// owner and its mode bits grant neither group nor other write access. Group members
+// with write access can also add a name, including a hard link. This checks Unix UID
+// and mode bits, not access granted through filesystem ACLs.
+// The root's own owner says nothing: --maildir-path, or the --sieve file's directory,
+// may be a link the user made to a directory of root's that anyone may write into
+// (/tmp), and a maildir extracted as root into a directory root made keeps its owner's
+// files below it. The directory is opened, and name looked up in it, by descriptor,
+// with the file found there required to be the file opened, so a directory renamed or
+// replaced meanwhile cannot vouch for it. A name that is a link vouches only for a file
+// below its own directory, as Pigeonhole's ~/.dovecot.sieve -> sieve/<name>.sieve: the
+// link's owner may not have been able to read one elsewhere in the root.
+func checkNamedByOwner(root *os.Root, name string, info fs.FileInfo) error {
+	dir, err := root.OpenRoot(filepath.Dir(name))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	dirInfo, err := dir.Stat(".")
+	if err != nil {
+		return err
+	}
+	named, err := dir.Stat(filepath.Base(name))
+	var reason string
+	switch {
+	case err != nil:
+		reason = fmt.Sprintf("it is not found below the directory that holds its name (%v)", errors.Unwrap(err))
+	case !os.SameFile(named, info):
+		reason = "it was replaced while it was opened"
+	case dirInfo.Mode().Perm()&0o022 != 0:
+		reason = "group or others may write into the directory that holds it"
+	case fileUID(info) != fileUID(dirInfo):
+		reason = fmt.Sprintf("it belongs to uid %d, the directory that holds it to uid %d", fileUID(info), fileUID(dirInfo))
+	default:
+		return nil
+	}
+	return &fs.PathError{Op: "open", Path: name, Err: fmt.Errorf("%w: %s, and others may not read it", errAnotherUsersFile, reason)}
 }
 
 // readMaildirDir is os.ReadDir through the maildir root (openMaildirFile). Only a
@@ -2157,7 +2253,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date"))
+	sentDate, sentDateUnknownZone, _ := helpers.ParseDateHeaderWithZone(mailHeader.Get("Date"))
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
 
@@ -2223,6 +2319,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		subject:              subject,
 		plaintextBody:        plaintextBody,
 		sentDate:             sentDate,
+		sentDateUnknownZone:  sentDateUnknownZone,
 		internalDate:         maildirInternalDate(filename, path, sentDate),
 		inReplyTo:            inReplyTo,
 		references:           references,
@@ -2432,6 +2529,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 			Subject:              up.metadata.subject,
 			PlaintextBody:        up.metadata.plaintextBody,
 			SentDate:             up.metadata.sentDate,
+			SentDateUnknownZone:  up.metadata.sentDateUnknownZone,
 			InReplyTo:            up.metadata.inReplyTo,
 			References:           up.metadata.references,
 			BodyStructure:        up.metadata.bodyStructure,
@@ -2590,6 +2688,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 			Subject:              up.metadata.subject,
 			PlaintextBody:        up.metadata.plaintextBody,
 			SentDate:             up.metadata.sentDate,
+			SentDateUnknownZone:  up.metadata.sentDateUnknownZone,
 			InReplyTo:            up.metadata.inReplyTo,
 			References:           up.metadata.references,
 			BodyStructure:        up.metadata.bodyStructure,
@@ -3051,30 +3150,41 @@ func (i *Importer) getProgressPrefix() string {
 }
 
 // parseKeywordsFile reads one dovecot-keywords file ("<index> <keyword>" per line,
-// index 0-25 ↔ letters a-z in maildir filenames) with readFile. Malformed lines are
-// skipped.
-func parseKeywordsFile(path string, readFile func(string) ([]byte, error)) (map[int]string, error) {
-	content, err := readFile(path)
+// index 0-25 ↔ letters a-z in maildir filenames), opened with open, of at most
+// maxDovecotKeywordsSize bytes. Malformed lines are skipped, and so is a line whose
+// index no letter names, as Dovecot skips it (maildir-keywords.c). The file's writer
+// decides how long and how many those lines are, so one warning names the file, how
+// many were skipped and the first of them, shortened.
+func parseKeywordsFile(path string, open func(string) (*os.File, error)) (map[int]string, error) {
+	var content []byte
+	file, err := open(path)
+	if err == nil {
+		content, err = readFileUpTo(file, maxDovecotKeywordsSize)
+		file.Close()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to read dovecot-keywords file: %w", err)
 	}
 	keywords := make(map[int]string)
+	skipped, firstSkipped := 0, ""
 	for _, line := range strings.Split(string(content), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, " ", 2)
-		if len(parts) != 2 {
-			logger.Info("Warning: Skipping malformed dovecot-keywords line", "path", path, "line", line)
+		index, keyword, found := strings.Cut(line, " ")
+		id, err := strconv.Atoi(index)
+		if !found || err != nil || id < 0 || id >= maxMaildirKeywords {
+			if skipped == 0 {
+				firstSkipped = line
+			}
+			skipped++
 			continue
 		}
-		id, err := strconv.Atoi(parts[0])
-		if err != nil {
-			logger.Info("Warning: Invalid keyword ID in line", "path", path, "line", line)
-			continue
-		}
-		keywords[id] = parts[1]
+		keywords[id] = keyword
+	}
+	if skipped > 0 {
+		logger.Warn("Skipping malformed dovecot-keywords lines", "path", path, "count", skipped, "first", truncateString(firstSkipped, 80))
 	}
 	return keywords, nil
 }
@@ -3106,7 +3216,7 @@ func (i *Importer) keywordsForMessagePath(path string) map[int]string {
 		kws = i.dovecotKeywords
 	} else if i.options.Dovecot {
 		if _, err := os.Stat(keywordsPath); err == nil {
-			parsed, perr := parseKeywordsFile(keywordsPath, i.readMaildirFile)
+			parsed, perr := parseKeywordsFile(keywordsPath, i.openMaildirFile)
 			if perr != nil {
 				logger.Warn("Failed to read folder dovecot-keywords, importing its messages without keywords", "path", keywordsPath, "error", perr)
 			} else {
