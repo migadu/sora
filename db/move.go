@@ -45,7 +45,7 @@ func LockS3ObjectsSharedInTx(ctx context.Context, tx pgx.Tx, accountID int64, co
 	if _, err := tx.Exec(ctx, sql); err != nil {
 		return fmt.Errorf("failed to lock S3 objects: %w", err)
 	}
-	return nil
+	return CheckS3BodyClaims(ctx, tx, contentHashes)
 }
 
 // ErrMoveSourceChanged is returned by MoveMessages when a source row owned by another

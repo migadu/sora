@@ -30,6 +30,8 @@ func handleVerifyCommand(ctx context.Context) {
 		handleVerifyS3(ctx)
 	case "hash":
 		handleVerifyHash(ctx)
+	case "body-deletions":
+		handleVerifyBodyDeletions(ctx)
 	case "help", "--help", "-h":
 		printVerifyUsage()
 	default:
@@ -47,6 +49,7 @@ Usage:
 
 Subcommands:
   s3       Verify S3 storage consistency for a user
+  body-deletions  List/reconcile durable body-deletion quarantine
   hash     Verify a specific content hash exists in S3 and is intact (download + decrypt + re-hash)
 
 Examples:

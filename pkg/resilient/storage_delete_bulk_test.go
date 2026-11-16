@@ -80,3 +80,48 @@ func TestDeleteBulkWithRetry_SplitsOversizedBatches(t *testing.T) {
 		}
 	}
 }
+
+func TestDeleteBulkUnknownOutcomeIsNotReplayed(t *testing.T) {
+	for _, kind := range []string{"server-error", "partial-result"} {
+		t.Run(kind, func(t *testing.T) {
+			var calls int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.Header().Set("Content-Type", "application/xml")
+				if kind == "server-error" {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = w.Write([]byte(`<Error><Code>ServiceUnavailable</Code><Message>possibly accepted</Message></Error>`))
+					return
+				}
+				_, _ = w.Write([]byte(`<DeleteResult><Error><Key>denied</Key><Code>AccessDenied</Code><Message>no</Message></Error><Error><Key>unknown</Key><Code>InternalError</Code><Message>unknown</Message></Error></DeleteResult>`))
+			}))
+			defer server.Close()
+			st, err := storage.New(strings.TrimPrefix(server.URL, "http://"), "test", "secret", "bucket", false, false, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			failures := NewResilientS3Storage(st).DeleteBulkWithRetry(t.Context(), []string{"gone", "denied", "unknown"})
+			if calls != 1 {
+				t.Fatalf("replayed potentially accepted DELETE: %d HTTP requests", calls)
+			}
+			if kind == "partial-result" {
+				if _, bad := failures["gone"]; bad {
+					t.Fatal("confirmed key reported failed")
+				}
+				if !storage.DeleteDefinitelyRefused(failures["denied"]) {
+					t.Fatal("explicit refusal lost")
+				}
+				if storage.DeleteDefinitelyRefused(failures["unknown"]) {
+					t.Fatal("unknown per-key result can clear fence")
+				}
+			} else {
+				for _, key := range []string{"gone", "denied", "unknown"} {
+					if failures[key] == nil || storage.DeleteDefinitelyRefused(failures[key]) {
+						t.Fatalf("server outcome for %s lost uncertainty: %v", key, failures[key])
+					}
+				}
+			}
+		})
+	}
+}
