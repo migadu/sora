@@ -26,6 +26,6 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_attribute
                    WHERE attrelid = 'messages'::regclass AND attname = 'restored_at' AND NOT attisdropped) THEN
-        ALTER TABLE messages ADD COLUMN restored_at TIMESTAMPTZ;
+        ALTER TABLE messages ADD COLUMN IF NOT EXISTS restored_at TIMESTAMPTZ;
     END IF;
 END $$;

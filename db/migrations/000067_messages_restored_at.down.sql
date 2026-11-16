@@ -10,6 +10,6 @@ DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_attribute
                WHERE attrelid = 'messages'::regclass AND attname = 'restored_at' AND NOT attisdropped) THEN
-        ALTER TABLE messages DROP COLUMN restored_at;
+        ALTER TABLE messages DROP COLUMN IF EXISTS restored_at;
     END IF;
 END $$;
