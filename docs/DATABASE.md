@@ -554,7 +554,7 @@ sora-admin migrate force   --config /etc/sora/config.toml 49
 |---|---|
 | `version` | Prints the current version and whether it is dirty (`Dirty state: no`). A plain read: safe while Sora runs. |
 | `up` | Applies every pending migration. |
-| `down` | Reverts the last migration, or `--limit N` of them, or `--all`. |
+| `down` | Reverts the last migration, or `--limit N` of them, or with `--all` every one after 000001. It never reverts 000001 ([Rolling back](#rolling-back)). |
 | `force VERSION` | Sets the version and clears the dirty flag, without running anything. |
 
 The tool's help asks you to stop Sora before `up`, `down` and `force`. `migrate` connects through
