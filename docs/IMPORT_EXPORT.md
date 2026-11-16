@@ -131,13 +131,17 @@ is not read: such a message file is reported as failed by its path, and such a `
 skipped with a warning naming it.
 
 A hard link is another name for the same file, which the root cannot tell apart, so a message or
-metadata file is read only if it belongs to the owner of the maildir directory (`--maildir-path`,
-after any link) or anyone may read it. Any other file is not read and is reported as failed by its
-path, as the owner could otherwise link in a file of another user's from the same file system.
-Hard links between the owner's own files, as Dovecot's `maildir_copy_with_hardlinks` and `cp -al`
-backups make, are read as before. A maildir whose files belong to another user than its directory
-(for example, extracted as root into a directory root created) has its files refused; give the
-directory to the files' owner first.
+metadata file that others may not read is read only if the directory holding its name (`cur/`,
+`new/`, or the folder for a metadata file) belongs to the file's owner and others may not write into
+it: only that owner can have named the file there. Otherwise a user who can write in that
+directory could link in another user's file from the same file system. Such a name that is a
+symbolic link is followed only to a file below its own directory. A file anyone may read is read as
+before, and so are hard links between the owner's own files, as Dovecot's
+`maildir_copy_with_hardlinks` and `cp -al` backups make. A refused message file is reported as
+failed by its path; a refused metadata file is treated like one that cannot be read. A maildir
+extracted as root into a directory root created keeps its messages, but its top-level
+`subscriptions`, `dovecot-keywords` and `dovecot-uidlist` belong to another user than that
+directory; give the directory to the files' owner first.
 
 This policy covers source message and Dovecot metadata contents and `cur/`/`new/` listings. It
 does not change how the SQLite cache or an explicitly supplied `--paths-file` file are opened;
@@ -307,8 +311,10 @@ relative and its target is within that directory, as Pigeonhole's own
 `.dovecot.sieve -> sieve/<name>.sieve`. Any other link (one out of the directory, or any absolute
 link) is refused: nothing is stored, and the summary and the log name the file. Where Pigeonhole's script
 directory is not below the link's directory, its link is absolute; name the script it points to
-instead. As a hard link cannot be told apart from the file, the file is read only if it belongs to
-the owner of that directory or anyone may read it; otherwise it is refused in the same way.
+instead. As a hard link cannot be told apart from the file, a file others may not read is read
+only if the directory holding its name (the link's, for a link) belongs to the file's owner and
+others may not write into it; otherwise, as for a script only its owner may read in `/tmp`, it is
+refused in the same way.
 
 | Situation | Result |
 |---|---|

@@ -1405,16 +1405,16 @@ func (i *Importer) readMaildirFile(path string) ([]byte, error) {
 // a device.
 var errNotRegularFile = errors.New("not a regular file")
 
-// errAnotherUsersFile refuses a file the import would read that the owner of the
-// directory it is read through could not have read (openRegularFile).
-var errAnotherUsersFile = errors.New("belongs to another user than the directory it is read through")
+// errAnotherUsersFile refuses a file the import would read that whoever named it may
+// not have been able to read (checkNamedByOwner).
+var errAnotherUsersFile = errors.New("may be another user's file")
 
 // fileUID returns the user that owns the file info describes. It is a variable so that
 // a test can make a file appear to belong to another user, which only root can arrange.
 var fileUID = func(info fs.FileInfo) uint32 { return info.Sys().(*syscall.Stat_t).Uid }
 
-// openRegularFile opens name below root for reading if it is a regular file the owner
-// of root could have read, and fails with errNotRegularFile or errAnotherUsersFile
+// openRegularFile opens name below root for reading if it is a regular file whoever
+// named it could have read, and fails with errNotRegularFile or errAnotherUsersFile
 // otherwise. The files the import reads may have been written by their owner, who can
 // make one a FIFO (mkfifo; rsync -a copies them), and opening a FIFO for reading waits
 // until something opens it for writing: the run would never finish, and cancelling it
@@ -1427,8 +1427,8 @@ var fileUID = func(info fs.FileInfo) uint32 { return info.Sys().(*syscall.Stat_t
 // first name, to a file elsewhere on the same file system, one they cannot read where
 // the system lets them link it (BSD and macOS do, as Linux does with
 // fs.protected_hardlinks = 0). The import runs with privileges the owner lacks, so a
-// file is read only if it is the owner's or anyone may read it. A link count is no
-// test: Dovecot copies a message between folders as a hard link
+// file others may not read is read only if its owner named it (checkNamedByOwner). A
+// link count is no test: Dovecot copies a message between folders as a hard link
 // (maildir_copy_with_hardlinks), and cp -al backups link every file.
 func openRegularFile(root *os.Root, name string) (*os.File, error) {
 	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
@@ -1440,11 +1440,7 @@ func openRegularFile(root *os.Root, name string) (*os.File, error) {
 		err = &fs.PathError{Op: "open", Path: name, Err: errNotRegularFile}
 	}
 	if err == nil && info.Mode().Perm()&0o004 == 0 {
-		var dir fs.FileInfo
-		if dir, err = root.Stat("."); err == nil && fileUID(info) != fileUID(dir) {
-			err = &fs.PathError{Op: "open", Path: name, Err: fmt.Errorf("%w (uid %d, not %d) and others may not read it",
-				errAnotherUsersFile, fileUID(info), fileUID(dir))}
-		}
+		err = checkNamedByOwner(root, name, info)
 	}
 	if err == nil {
 		var conn syscall.RawConn
@@ -1460,6 +1456,45 @@ func openRegularFile(root *os.Root, name string) (*os.File, error) {
 		return nil, err
 	}
 	return file, nil
+}
+
+// checkNamedByOwner refuses info, the file openRegularFile opened as name below root,
+// with errAnotherUsersFile unless the directory that holds name belongs to the file's
+// owner and others may not write into it. Only who may write into a directory can add
+// a name to it, a hard link included, so the file's owner (or root) named it there.
+// The root's own owner says nothing: --maildir-path, or the --sieve file's directory,
+// may be a link the user made to a directory of root's that anyone may write into
+// (/tmp), and a maildir extracted as root into a directory root made keeps its owner's
+// files below it. The directory is opened, and name looked up in it, by descriptor,
+// with the file found there required to be the file opened, so a directory renamed or
+// replaced meanwhile cannot vouch for it. A name that is a link vouches only for a file
+// below its own directory, as Pigeonhole's ~/.dovecot.sieve -> sieve/<name>.sieve: the
+// link's owner may not have been able to read one elsewhere in the root.
+func checkNamedByOwner(root *os.Root, name string, info fs.FileInfo) error {
+	dir, err := root.OpenRoot(filepath.Dir(name))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	dirInfo, err := dir.Stat(".")
+	if err != nil {
+		return err
+	}
+	named, err := dir.Stat(filepath.Base(name))
+	var reason string
+	switch {
+	case err != nil:
+		reason = fmt.Sprintf("it is not found below the directory that holds its name (%v)", errors.Unwrap(err))
+	case !os.SameFile(named, info):
+		reason = "it was replaced while it was opened"
+	case dirInfo.Mode().Perm()&0o002 != 0:
+		reason = "anyone may write into the directory that holds it"
+	case fileUID(info) != fileUID(dirInfo):
+		reason = fmt.Sprintf("it belongs to uid %d, the directory that holds it to uid %d", fileUID(info), fileUID(dirInfo))
+	default:
+		return nil
+	}
+	return &fs.PathError{Op: "open", Path: name, Err: fmt.Errorf("%w: %s, and others may not read it", errAnotherUsersFile, reason)}
 }
 
 // readMaildirDir is os.ReadDir through the maildir root (openMaildirFile). Only a

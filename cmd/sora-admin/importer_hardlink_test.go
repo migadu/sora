@@ -281,3 +281,42 @@ func TestImportSieveScriptRefusesAHardLinkInADirectoryAnyoneMayWrite(t *testing.
 		})
 	}
 }
+
+// A name that is a link vouches for a file others may not read only below its own
+// directory. Pigeonhole's ~/.dovecot.sieve -> sieve/<name>.sieve is, and Pigeonhole
+// writes the script for its owner only; a message file linked to another folder's
+// is not.
+func TestImportFollowsALinkToAFileOthersMayNotReadOnlyBelowItsDirectory(t *testing.T) {
+	t.Run("Pigeonhole link to a script only its owner may read", func(t *testing.T) {
+		home := t.TempDir()
+		require.NoError(t, os.Mkdir(filepath.Join(home, "sieve"), 0700))
+		require.NoError(t, os.WriteFile(filepath.Join(home, "sieve", "managesieve.sieve"), []byte("keep;\n"), 0600))
+		sievePath := filepath.Join(home, ".dovecot.sieve")
+		require.NoError(t, os.Symlink(filepath.Join("sieve", "managesieve.sieve"), sievePath))
+
+		rdb := &sieveRecordingDB{mockResilientDatabase: newMockResilientDatabase()}
+		importer := newTestModeImporter(t, newMaildirWith(t, nil), rdb, ImporterOptions{SievePath: sievePath})
+		require.NoError(t, importer.lookupAccount())
+		require.NoError(t, importer.importSieveScript())
+		assert.Equal(t, []string{"keep;\n"}, rdb.stored)
+	})
+
+	t.Run("message link to another folder's file only its owner may read", func(t *testing.T) {
+		const sentName = "1700000003.M3P1.host:2,S"
+		const linkName = "1700000002.M2P1.host:2,S"
+		maildirPath := newMaildirWith(t, nil)
+		addMaildirFolder(t, maildirPath, ".Sent", sentName, cachedSizeMessage("Sent", 100))
+		sent := filepath.Join(maildirPath, ".Sent", "cur", sentName)
+		require.NoError(t, os.Chmod(sent, 0600))
+		link := filepath.Join(maildirPath, "cur", linkName)
+		require.NoError(t, os.Symlink(relativeLink(t, link, sent), link))
+
+		importer := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), ImporterOptions{})
+		require.NoError(t, importer.scanMaildir())
+
+		assert.Equal(t, map[string]string{sent: "Sent"}, scannedMessages(t, importer))
+		if reasons := failureReasons(importer, link); assert.Len(t, reasons, 1) {
+			assert.Contains(t, reasons[0], "not found below the directory that holds its name")
+		}
+	})
+}
