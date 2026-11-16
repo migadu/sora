@@ -629,14 +629,19 @@ sora-admin --config config.toml export maildir --email user@example.com \
 | `--jobs` | `4` | Messages exported in parallel within a mailbox. |
 | `--delay` | `0` | Pause after each exported message (Go duration). |
 
-**Dry-run cache snapshot.** A missing target or cache stays missing. When a cache
-exists, preview copies its database and WAL into an owner-only temporary directory,
-reads that private copy, and removes it on close. The source database, WAL and SHM
-are never opened by SQLite or changed; source SHM is not copied. Committed rows left
-in WAL after a crash are included. The preview runs a separate helper process that
-holds a nonblocking exclusive POSIX lock while copying, so an active SQLite user
-causes a clear refusal. Stop users of that cache and retry; do not remove its WAL.
-A rollback journal is also refused: recover and close it normally before preview.
+**Dry-run cache snapshot.** A missing target or cache stays missing. The dry run
+reaches the target as the export does ("Links in the target" below): a link the export
+refuses makes the dry run refuse to start too, naming the link, before any cache is
+looked for, and a target the export would create is missing, with every message new.
+When a cache exists, preview copies its database and WAL into an owner-only temporary
+directory, reads that private copy, and removes it on close. The copy is made through
+the directory the dry run checked, not by the target's name again. The source
+database, WAL and SHM are never opened by SQLite or changed; source SHM is not copied.
+Committed rows left in WAL after a crash are included. The preview runs a separate
+helper process that holds a nonblocking exclusive POSIX lock while copying, so an
+active SQLite user causes a clear refusal. Stop users of that cache and retry; do not
+remove its WAL. A rollback journal is also refused: recover and close it normally
+before preview.
 
 This snapshot is supported on local POSIX-locking Linux filesystems
 (ext2/3/4, XFS, Btrfs, tmpfs or overlayfs) and macOS APFS/HFS/UFS/tmpfs. Other
@@ -693,7 +698,21 @@ uidlist in the target is merged: its entries for files still present are kept.
 
 **Links in the target.** The target may be a maildir its owner could write to, while the export
 runs with more privileges, so message and Dovecot contents and Maildir child directories below
-it are accessed through the opened target directory. `--maildir-path` itself may be a link.
+it are accessed through the opened target directory. `--maildir-path` itself, or a directory on
+the way to it, may be a symbolic link under the import's rule
+([section 3](#3-the-maildir-layout-sora-reads)): only when the link belongs to root, to the user
+running `sora-admin`, or to the owner of the directory it leads to. A user who can replace
+`~/Maildir`, or a directory above it, could
+otherwise point it at another user's maildir or home and have the account's mail, Dovecot files
+and `sora-maildir.db` written there. Any other link makes the export refuse to start, naming the
+link, before anything is created. The directories missing on the way are created only once every
+link on the way is checked, and never through a link to a directory that does not exist. As for
+the import, the directories above the target need only be searchable, and those a directory is
+created in writable, by the user running the export. Once checked, the target is reached through
+the directory the check opened: every directory and every file below it, the cache included, is
+created through that directory. Only SQLite opens the cache's files by a name again, as section 8
+describes: on Linux through that directory's descriptor, elsewhere by the target's name, which
+must still lead to the checked directory.
 Each exported content file (a message,
 `dovecot-keywords`, `subscriptions`, `dovecot-uidlist`) is written as a new file and renamed over
 its name, so a symbolic or hard link at that name is replaced, and the file it points to is left
@@ -706,8 +725,8 @@ Dovecot create these files by renaming a new file over the name, so theirs have 
 is there but not read is logged as a warning: the folder's keyword numbering, or the UIDs of the
 files an earlier run wrote, are then not kept. A copy of the target made with `cp -al`, or a tool
 that replaces identical files with hard links, gives these files a second link. The SQLite
-cache and its sidecars still use ordinary paths; their policy is unchanged
-([section 8](#8-the-sqlite-cache-sora-maildirdb)).
+cache and its sidecars are not replaced this way: one that is a symbolic link, or anything else
+but a regular file, makes the export refuse to start ([section 8](#8-the-sqlite-cache-sora-maildirdb)).
 
 **Re-runs.** The exporter keeps `sora-maildir.db` in the target directory, with the same schema
 as the importer's ([section 8](#8-the-sqlite-cache-sora-maildirdb)), and records each exported

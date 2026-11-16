@@ -71,27 +71,41 @@ type Exporter struct {
 	keywordIndex map[string]map[string]int
 }
 
+// exportRootOpened, when set, runs in NewExporter as soon as the root is open: a test
+// replaces --maildir-path there, as the owner of the directory holding it can at any
+// moment.
+var exportRootOpened func()
+
 // NewExporter creates a new Exporter instance.
 func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ExporterOptions) (*Exporter, error) {
 	// The export runs on exactly this many workers: with none it would write nothing.
 	if jobs < 1 {
 		return nil, fmt.Errorf("jobs must be at least 1, got %d", jobs)
 	}
-	// Preview never creates or migrates anything in the selected maildir.
+	// Preview never creates or migrates anything in the selected maildir. It reaches
+	// the target as the export does, refusing the links the export refuses, and copies
+	// the cache through the directory it checked (openExportCacheForDryRun). A target
+	// that is missing holds no cache: every message is new.
 	if options.DryRun {
+		root, err := openExportPreviewRoot(maildirPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open maildir path: %w", err)
+		}
+		if root != nil && exportRootOpened != nil {
+			exportRootOpened()
+		}
 		maildirPath = effectiveMaildirPath(maildirPath)
 		dbPath := filepath.Join(maildirPath, maildirCacheName)
-		cache, privateDir, err := openExportCacheForDryRun(ctx, dbPath)
-		if err != nil {
-			return nil, err
-		}
-		var root *os.Root
-		if cache != nil {
-			root, err = os.OpenRoot(filepath.Clean(maildirPath))
+		var cache *sql.DB
+		var privateDir string
+		if root != nil {
+			cache, privateDir, err = openExportCacheForDryRun(ctx, root)
+			if err != nil || cache == nil {
+				root.Close()
+				root = nil
+			}
 			if err != nil {
-				cache.Close()
-				os.RemoveAll(privateDir)
-				return nil, fmt.Errorf("failed to open maildir path: %w", err)
+				return nil, err
 			}
 		}
 		return &Exporter{ctx: ctx, maildirPath: maildirPath, root: root, email: email,
@@ -100,23 +114,11 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 			keywordIndex: make(map[string]map[string]int)}, nil
 	}
 
-	// Ensure maildir path exists
-	if err := os.MkdirAll(maildirPath, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create maildir path: %w", err)
-	}
-	maildirPath = effectiveMaildirPath(maildirPath)
-
-	// Use the shared SQLite database in the maildir path
-	dbPath := filepath.Join(maildirPath, maildirCacheName)
-	logger.Info("Using maildir database", "path", dbPath)
-
-	// The root is opened by the directory's name with every link resolved, as
-	// openMaildirCache requires, and the cache through it.
-	resolved, err := resolveMaildirDir(maildirPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open maildir path: %w", err)
-	}
-	root, err := os.OpenRoot(resolved)
+	// Every message and metadata file is written through this root. It is opened, and
+	// the directories missing on the way created, first: a directory that a link on the
+	// path may not choose is refused before anything is created in it, the cache
+	// included (openExportRoot).
+	root, err := openExportRoot(maildirPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open maildir path: %w", err)
 	}
@@ -126,7 +128,17 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 			root.Close()
 		}
 	}()
+	if exportRootOpened != nil {
+		exportRootOpened()
+	}
+	maildirPath = effectiveMaildirPath(maildirPath)
 
+	// Use the shared SQLite database in the maildir path
+	dbPath := filepath.Join(maildirPath, maildirCacheName)
+	logger.Info("Using maildir database", "path", dbPath)
+
+	// The cache is opened in the directory the walk checked, through root: the path
+	// may lead elsewhere by now.
 	db, err := openMaildirCache(root)
 	if err != nil {
 		return nil, err
