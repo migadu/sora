@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -83,5 +84,29 @@ func TestRunFailsOnAForeignClosingRef(t *testing.T) {
 	out.Reset()
 	if code := run(strings.NewReader("Fixes #1646.\n\nDepends on migadu/go-imap#227.\n"), &out, "migadu/sora"); code != 0 || out.Len() != 0 {
 		t.Errorf("exit status %d, output %q; want 0 and no output", code, out.String())
+	}
+}
+
+// TestWorkflowChecksTitleDescriptionAndCommits: every text GitHub reads closing keywords
+// from when the pull request merges has to reach the check. Besides the description and
+// the commit messages that includes the title: a merge commit's message is the pull
+// request's title (the repository's merge_commit_message is PR_TITLE), and a squash
+// commit's subject is the title for a pull request of several commits.
+func TestWorkflowChecksTitleDescriptionAndCommits(t *testing.T) {
+	workflow, err := os.ReadFile("../../.github/workflows/closing-references.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"PR_TITLE: ${{ github.event.pull_request.title }}",
+		"PR_BODY: ${{ github.event.pull_request.body }}",
+		`"$PR_TITLE"`,
+		`"$PR_BODY"`,
+		`pulls/$PR_NUMBER/commits`,
+		"| go run ./scripts/check-closing-refs",
+	} {
+		if !strings.Contains(string(workflow), want) {
+			t.Errorf("closing-references.yml does not contain %q", want)
+		}
 	}
 }
