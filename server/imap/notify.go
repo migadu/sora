@@ -497,7 +497,8 @@ func (s *IMAPSession) SetNotify(ctx context.Context, options *imap.NotifyOptions
 	// Bootstrap the watch: the account snapshot (specifier matching and
 	// tree-event diffing), the fan-in cursor, the MessageNew fetch-atts
 	// high-water mark, and — when the STATUS indicator is present — the
-	// initial STATUS responses, all from at most two queries. A watch
+	// initial STATUS responses. Resolving name-based specifiers adds one query to
+	// the snapshot and statistics queries. A watch
 	// covering only the selected mailbox skips the snapshot entirely.
 	needSelectedStats := selectedID != 0 && watch.selected != nil && watch.selected.MessageNewFetch != nil
 	var bootstrapIDs []int64

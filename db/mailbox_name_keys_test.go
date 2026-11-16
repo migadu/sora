@@ -40,4 +40,11 @@ func TestMailboxNameKeys(t *testing.T) {
 	keys, err = database.MailboxNameKeys(ctx, nil)
 	require.NoError(t, err)
 	assert.Empty(t, keys)
+
+	// The new database lookup must preserve cancellation for its caller.
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	keys, err = database.MailboxNameKeys(canceled, []string{"INBOX"})
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, keys)
 }
