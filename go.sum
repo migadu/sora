@@ -261,8 +261,8 @@ github.com/migadu/go-sieve v1.4.5-0.20261115220842-1474bec4fdc5 h1:3PlopwfHFsuAy
 github.com/migadu/go-sieve v1.4.5-0.20261115220842-1474bec4fdc5/go.mod h1:xHAx5kMQ5hw/YJziHobNfLDpMK4jjxMJ5sZAHi3uFr8=
 github.com/migadu/go-sieve v1.5.1 h1:GLHNzVFZKbfLEldsSu09UQivBRKMMpEvKO8vKujI1x8=
 github.com/migadu/go-sieve v1.5.1/go.mod h1:xHAx5kMQ5hw/YJziHobNfLDpMK4jjxMJ5sZAHi3uFr8=
-github.com/migadu/go-sieve v1.5.2-0.20261116080422-f6c2459117ae h1:eK4/kPQR8Fb5D1M57jfvrJOTLvbZXwcz8XsrGyom9MY=
-github.com/migadu/go-sieve v1.5.2-0.20261116080422-f6c2459117ae/go.mod h1:xHAx5kMQ5hw/YJziHobNfLDpMK4jjxMJ5sZAHi3uFr8=
+github.com/migadu/go-sieve v1.5.2-0.20261116081737-be158627ae5f h1:CdXvYIbhOdAI2stqpOKH8Uo0nLevsbOX1cJ32N7K1NI=
+github.com/migadu/go-sieve v1.5.2-0.20261116081737-be158627ae5f/go.mod h1:xHAx5kMQ5hw/YJziHobNfLDpMK4jjxMJ5sZAHi3uFr8=
 github.com/migadu/go-smtp v0.0.0-20261115213624-e2128ee885bd h1:vbj0EnLbR3uKLN7WR7bFEZqTKzKnzZ347mU3dDkeTwA=
 github.com/migadu/go-smtp v0.0.0-20261115213624-e2128ee885bd/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/migadu/go-smtp v0.0.0-20261115221208-dbc7824090f0 h1:BZ7Cj9szp+yjlLT6qN00wCh1lYphI0do5PWHNHOHssE=
