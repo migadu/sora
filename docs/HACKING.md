@@ -51,7 +51,8 @@ Sora is one Go module, `github.com/migadu/sora`. It builds two programs: `sora`,
 | [`integration_tests`](../integration_tests) | The integration suite, one Go package per area, plus shared helpers in `integration_tests/common`. See [TESTING.md](TESTING.md#5-integration-tests). |
 | [`testutils`](../testutils) | Small test helpers: a database setup helper that reads `config-test.toml`, and a file-based S3 mock. |
 | [`testdata`](../testdata) | Test fixtures: a sample Dovecot maildir and a self-signed certificate (`sora.crt`, `sora.key`). |
-| [`scripts`](../scripts) | `reset-test-db` (empties the test database) and two SQL scripts for operators. |
+| [`scripts`](../scripts) | `reset-test-db` (empties the test database), `check-closing-refs` (the pull request check in [section 11](#11-making-and-sending-a-change)) and SQL scripts for operators. |
+| [`.github/workflows`](../.github/workflows) | The checks GitHub runs on pull requests. |
 | [`dist`](../dist) | Service files: `sora.service` for systemd and `sora.rc` for FreeBSD. |
 
 ### 1.2 The `pkg` packages
@@ -269,6 +270,10 @@ go mod tidy
 ```
 
 Then build and run the tests that cover the protocol. Commit `go.mod` and `go.sum` together.
+
+A pin may combine fork pull requests that have not merged yet. Before you replace it with a release
+tag, check that the tag contains each of their changes. A fork pull request that shows as closed
+may have been closed without being merged (see [section 11](#11-making-and-sending-a-change)).
 
 ### 3.2 Working on a fork and Sora at the same time
 
@@ -785,3 +790,15 @@ When `sora` starts, the first write pool that connects runs the migrations (see 
 
 If your change needs a new version of one of the forks, land the library change first, then bump
 the pin in the same Sora pull request as the code that needs it.
+
+Use closing keywords (`Fixes #N`, `Closes`, `Resolves` and their other forms) only for the Sora
+issues the pull request resolves. GitHub reads them in the description and in the commit messages
+when the pull request merges. It closes what they name in other repositories too, and closes a
+pull request it names whether or not that one was merged. Refer to a fork pull request without a
+keyword, for example `Depends on migadu/go-imap#227`. The `Closing references` check fails a pull
+request that puts a keyword in front of another repository's issue or pull request. To run it on a
+description before you open the pull request:
+
+```sh
+go run ./scripts/check-closing-refs < body.md
+```
