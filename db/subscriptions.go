@@ -141,14 +141,15 @@ func (db *Database) RenameSubscriptions(ctx context.Context, tx pgx.Tx, accountI
 	}
 
 	// Move the exact name and every descendant, preserving each descendant's
-	// suffix after the old prefix.
+	// levels after the old name's (see mailboxNameLevels): a subscription matches
+	// by LOWER(mailbox_name), so it can spell the old name with another length.
 	if _, err := tx.Exec(ctx, `
 		UPDATE subscriptions
-		SET mailbox_name = $2 || SUBSTRING(mailbox_name FROM LENGTH($4) + 1)
+		SET mailbox_name = array_to_string(ARRAY[$2::text] || (string_to_array(mailbox_name, $5))[$6::int + 1:], $5)
 		WHERE account_id = $1
 		  AND (LOWER(mailbox_name) = LOWER($4)
 		       OR LOWER(mailbox_name) LIKE LOWER($3) ESCAPE '\')
-	`, accountID, newName, descPattern, oldName); err != nil {
+	`, accountID, newName, descPattern, oldName, delimiter, mailboxNameLevels(oldName, delimiter)); err != nil {
 		return fmt.Errorf("failed to move subscriptions for rename: %w", err)
 	}
 	return nil
