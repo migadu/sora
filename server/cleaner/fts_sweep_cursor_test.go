@@ -33,7 +33,7 @@ func expectIdleCyclePhases(m *mockDatabase, ctx context.Context) {
 func TestCleanupWorker_FTSOrphanSweepResumes(t *testing.T) {
 	mockDB := new(mockDatabase)
 	ctx := context.Background()
-	worker := &CleanupWorker{rdb: mockDB, s3: &mockS3{healthy: true}, cache: new(mockCache)}
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1", rdb: mockDB, s3: &mockS3{healthy: true}, cache: new(mockCache)}
 	expectIdleCyclePhases(mockDB, ctx)
 
 	k1 := db.FTSKey{ContentHash: "1111", AccountID: 1}
@@ -61,7 +61,7 @@ func TestCleanupWorker_FTSOrphanSweepRetriesFailedDelete(t *testing.T) {
 	mockDB := new(mockDatabase)
 	ctx := context.Background()
 	start := db.FTSKey{ContentHash: "4444", AccountID: 4}
-	worker := &CleanupWorker{rdb: mockDB, s3: &mockS3{healthy: true}, cache: new(mockCache), ftsSweepCursor: start}
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1", rdb: mockDB, s3: &mockS3{healthy: true}, cache: new(mockCache), ftsSweepCursor: start}
 	expectIdleCyclePhases(mockDB, ctx)
 
 	orphans := []db.FTSKey{{ContentHash: "5555", AccountID: 5}}
@@ -82,7 +82,7 @@ func TestCleanupWorker_FTSOrphanSweepRetriesFailedDelete(t *testing.T) {
 func TestCleanupWorker_FTSOrphanSweepSurvivesRetentionChanges(t *testing.T) {
 	m := new(mockDatabase)
 	ctx := context.Background()
-	w := &CleanupWorker{rdb: m, s3: &mockS3{healthy: true}, cache: new(mockCache)}
+	w := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1", rdb: m, s3: &mockS3{healthy: true}, cache: new(mockCache)}
 	expectIdleCyclePhases(m, ctx)
 	m.On("PruneOldMessageVectorsWithRetry", ctx, time.Hour).Return(int64(0), nil).Twice()
 	mid := db.FTSKey{ContentHash: "5555", AccountID: 1}
@@ -102,7 +102,7 @@ func TestCleanupWorker_FTSOrphanSweepKeepsCursorOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	start := db.FTSKey{ContentHash: "4444", AccountID: 1}
-	w := &CleanupWorker{rdb: m, s3: &mockS3{healthy: true}, cache: new(mockCache), ftsSweepCursor: start}
+	w := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1", rdb: m, s3: &mockS3{healthy: true}, cache: new(mockCache), ftsSweepCursor: start}
 	expectIdleCyclePhases(m, ctx)
 	m.On("GetUnusedFTSKeysWithRetry", ctx, start, db.BATCH_PURGE_SIZE).
 		Run(func(mock.Arguments) { cancel() }).Return([]db.FTSKey{}, db.FTSKey{}, context.Canceled).Once()

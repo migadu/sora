@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/migadu/go-imap"
@@ -110,7 +112,7 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 		destS3Localpart = localpart
 	}
 
-	// COPY's transaction holds the destination object locks before checking S3 and
+	// COPY's transaction holds account-independent destination body locks before checking S3 and
 	// until its rows commit, as MOVE does. A body staged locally is re-staged instead.
 	type crossAccountObject struct {
 		sourceKey, destKey string
@@ -172,7 +174,10 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	}
 
 	// Perform the batch copy operation
-	uidMap, newMessageIDs, err := s.server.rdb.CopyMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.instanceID, sourceHashes, destHashes, ensureDestObject)
+	writeCtx, ownMessagesDone := s.beginOwnMessages(ctx, destMailbox.ID)
+	var copied []imap.UID
+	defer func() { ownMessagesDone(copied...) }()
+	uidMap, newMessageIDs, err := s.server.rdb.CopyMessagesWithRetry(writeCtx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.instanceID, sourceHashes, destHashes, ensureDestObject)
 	if err != nil {
 		var destErr *resilient.DestObjectError
 		switch {
@@ -227,6 +232,8 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 			return nil, s.internalError("failed to copy messages: %v", err)
 		}
 	}
+
+	copied = slices.Collect(maps.Values(uidMap))
 
 	// Pin this session to the master DB (same rationale as APPEND, append.go).
 	// COPY writes into the destination mailbox; pinning gives read-your-writes so

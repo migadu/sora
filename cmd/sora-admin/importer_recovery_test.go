@@ -11,9 +11,10 @@ import (
 )
 
 // TestRecoverOrphanedSQLiteState_AllUploadedRows verifies that orphan recovery
-// inspects every row marked uploaded in the SQLite cache, not just a bounded
-// prefix. Rows left marked uploaded are skipped forever by incremental imports,
-// even though the cleaner already removed their PostgreSQL rows and S3 objects.
+// inspects every row marked uploaded without this account's stamp, not just a
+// bounded prefix. Rows left marked uploaded are skipped forever by incremental
+// imports, so an unstamped one whose message never reached this account must be
+// re-armed. (A stamped row whose message is gone was deleted in Sora and stays.)
 func TestRecoverOrphanedSQLiteState_AllUploadedRows(t *testing.T) {
 	if os.Getenv("SKIP_DB_TESTS") == "true" {
 		t.Skip("Skipping database tests")
@@ -51,9 +52,10 @@ func TestRecoverOrphanedSQLiteState_AllUploadedRows(t *testing.T) {
 		t.Fatalf("Initial import failed: %v", err)
 	}
 
-	// Reopen the cache and seed rows marked uploaded that have no PostgreSQL
-	// counterpart: exactly the state left behind after the cleaner purged
-	// expunged messages and their S3 objects.
+	// Reopen the cache and seed rows marked uploaded, with no account stamp, that
+	// have no PostgreSQL counterpart: rows marked before the stamp existed, written
+	// by the exporter, or imported into another account. (Rows stamped with this
+	// account are trusted; see TestImporter_IncrementalRunKeepsMessagesDeletedInSora.)
 	importer, err = NewImporter(context.Background(), maildirPath, testEmail, 1, rdb, nil, options)
 	if err != nil {
 		t.Fatalf("Failed to reopen importer: %v", err)
