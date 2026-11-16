@@ -204,9 +204,9 @@ func worldWritableDirOf(t *testing.T, paths ...string) string {
 	return dir
 }
 
-// The user chooses the directory --maildir-path names when it is a link they made, and
-// can point it at a directory of the linked file's owner that anyone may write into, as
-// /tmp is root's: its owner vouches for none of the names in it.
+// --maildir-path may be a link root made to a directory of the linked file's owner that
+// anyone may write into, as /tmp is root's: its owner vouches for none of the names in
+// it. (A link the user made there is refused before the scan, #1729.)
 func TestScanMaildirRefusesAHardLinkInAMaildirLinkedToADirectoryAnyoneMayWrite(t *testing.T) {
 	// Exercise the content-reader policy on the protected-hardlink cache branch.
 	// The unprotected branch now refuses this world-writable cache directory before
@@ -226,6 +226,7 @@ func TestScanMaildirRefusesAHardLinkInAMaildirLinkedToADirectoryAnyoneMayWrite(t
 	ownedByAnotherUser(t, filepath.Join(shared, "dovecot-keywords"))
 	maildirPath := filepath.Join(t.TempDir(), "Maildir")
 	require.NoError(t, os.Symlink(shared, maildirPath))
+	ownedByUID(t, 0, maildirPath)
 
 	importer := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), ImporterOptions{Dovecot: true})
 	require.NoError(t, importer.scanMaildir())
@@ -260,8 +261,8 @@ func TestScanMaildirInADirectoryOfAnotherUser(t *testing.T) {
 }
 
 // --sieve may name a file in a directory anyone may write into, as /tmp is root's, or in
-// one a link the user made leads to: anyone may have named there a file of the
-// directory's owner.
+// one a link root made leads to: anyone may have named there a file of the directory's
+// owner. (A link the user made there is refused before the file is opened, #1729.)
 func TestImportSieveScriptRefusesAHardLinkInADirectoryAnyoneMayWrite(t *testing.T) {
 	secret := outsideFile(t, []byte("root:secret-hash:19000:0:99999:7:::\n"))
 	require.NoError(t, os.Chmod(secret, 0600))
@@ -269,6 +270,7 @@ func TestImportSieveScriptRefusesAHardLinkInADirectoryAnyoneMayWrite(t *testing.
 	require.NoError(t, os.Link(secret, filepath.Join(shared, "x.sieve")))
 	home := t.TempDir()
 	require.NoError(t, os.Symlink(shared, filepath.Join(home, "sieve")))
+	ownedByUID(t, 0, filepath.Join(home, "sieve"))
 
 	for name, sievePath := range map[string]string{
 		"named":          filepath.Join(shared, "x.sieve"),
