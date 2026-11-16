@@ -280,7 +280,8 @@ Description:
         [[pool]], [relay], trusted_networks, [shared_mailboxes] and
         [timeout_scheduler]
       [relay.queue] when [relay] is configured
-      [uploader] and [cleanup] when a mail backend (imap, lmtp, pop3) runs
+      [uploader], [cleanup] and [local_cache] when a mail backend (imap, lmtp,
+        pop3) runs
       [database], [database.write] and [database.read] when a server queries
         the database (imap, lmtp, pop3, managesieve, the HTTP APIs, and a
         proxy that looks users up there)
@@ -288,7 +289,8 @@ Description:
         together, encryption_key with encrypt = true) when the node connects
         to S3 (a mail backend, or the User API when [s3] has an endpoint,
         bucket or keys)
-      [cluster] and [tls] when enabled
+      [cluster], [tls] and [auth_cache] when enabled, and [cluster.affinity]
+        when it and [cluster] are enabled
   - Warning, as start-up does, about settings that do not do on this node
     what they say:
       [sieve] enabled_extensions and managesieve_proxy supported_extensions

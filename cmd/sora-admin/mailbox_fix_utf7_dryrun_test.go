@@ -256,3 +256,41 @@ func TestMailboxFixUTF7DryRunParentNameMismatch(t *testing.T) {
 	require.Equal(t, parseFixUTF7Renames(live), parseFixUTF7Renames(dry), "dry=%s live=%s", dry, live)
 	require.Equal(t, parseFixUTF7Failures(live), parseFixUTF7Failures(dry), "dry=%s live=%s", dry, live)
 }
+
+// The dry run carries a rename down to the descendants as db.RenameMailbox does
+// (issue #1650): a descendant keeps its levels after the renamed mailbox's level
+// count, whatever it spells those levels with. Under an ICU collation lower('İ') is
+// "i̇" (i + U+0307), so a child created as "i̇q/&AOk-/&AOk-" sits below "İq/&AOk-"
+// with a one character longer prefix, and the rename of "İq/&AOk-" to "İq/é" makes
+// it "İq/é/&AOk-". A libc collation lowers one code point to one, so under it no
+// two spellings of one name differ in length and the test is skipped.
+func TestMailboxFixUTF7DryRunDescendantSpelledLonger(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	rdb := common.SetupTestDatabase(t)
+	ctx := context.Background()
+
+	const iDot = "i\u0307" // i + U+0307 COMBINING DOT ABOVE, ICU's lower('İ')
+	var same bool
+	require.NoError(t, rdb.GetOperationalDatabase().WritePool.QueryRow(ctx,
+		`SELECT LOWER($1::text) = LOWER($2::text)`, "\u0130q", iDot+"q").Scan(&same))
+	if !same {
+		t.Skipf("the database keeps %q and %q apart: no two spellings of one name differ in length", "\u0130q", iDot+"q")
+	}
+
+	account := common.CreateTestAccount(t, rdb)
+	id, err := rdb.GetAccountIDByEmailWithRetry(ctx, account.Email)
+	require.NoError(t, err)
+	_, err = rdb.ResolveOrCreateMailboxPathWithRetry(ctx, id, "\u0130q/&AOk-")
+	require.NoError(t, err)
+	_, err = rdb.ResolveOrCreateMailboxPathWithRetry(ctx, id, iDot+"q/&AOk-/&AOk-")
+	require.NoError(t, err)
+
+	dry := runMailboxFixUTF7(t, ctx, account.Email, "--dry-run")
+	live := runMailboxFixUTF7(t, ctx, account.Email)
+	require.Equal(t, []string{
+		`"İq/&AOk-" -> "İq/é"`,
+		`"İq/é/&AOk-" -> "İq/é/é"`,
+	}, parseFixUTF7Renames(live))
+	require.Equal(t, parseFixUTF7Renames(live), parseFixUTF7Renames(dry), "dry=%s live=%s", dry, live)
+	require.Equal(t, parseFixUTF7Failures(live), parseFixUTF7Failures(dry), "dry=%s live=%s", dry, live)
+}
