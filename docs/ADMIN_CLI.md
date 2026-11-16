@@ -478,6 +478,31 @@ sora-admin --config config.toml mailbox fix-utf7 --email user@example.com
 
 Names that do not decode, or decode to themselves, are reported as `SKIP`.
 
+### mailbox repair-unseen
+
+Finds mailboxes whose cached unseen count (served by STATUS, LIST and NOTIFY) is higher than
+the number of unseen messages they hold, and with `--apply` recomputes it. Older builds left
+such counts when the failed-upload cleanup, `uploader resolve` or an importer rollback
+hard-deleted an unseen message. A count that has gone negative is repaired by the server
+itself.
+
+```sh
+sora-admin --config config.toml mailbox repair-unseen
+sora-admin --config config.toml mailbox repair-unseen --apply
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--email` | all accounts | Limit to one account. Optional for this subcommand. |
+| `--apply` | `false` | Repair the mailboxes found. Without it, print `WOULD REPAIR` lines and change nothing. |
+| `--batch-size` | `200` | Mailboxes checked per batch. |
+| `--start-after` | `0` | Resume after this mailbox id. |
+
+Mailboxes are checked in id order. After each batch the command prints the id to pass to
+`--start-after` if it is interrupted. Each repair is a short transaction that holds only that
+mailbox's lock, so it can run while the servers are serving mail. It is safe to run again: a
+repaired mailbox is not reported any more.
+
 ---
 
 ## 7. messages

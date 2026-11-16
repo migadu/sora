@@ -38,6 +38,8 @@ func handleMailboxCommand(ctx context.Context) {
 		handleMailboxUnsubscribe(ctx)
 	case "fix-utf7":
 		handleMailboxFixUTF7(ctx)
+	case "repair-unseen":
+		handleMailboxRepairUnseen(ctx)
 	case "help", "--help", "-h":
 		printMailboxUsage()
 	default:
@@ -604,6 +606,10 @@ Examples:
   # Preview changes for all accounts
   sora-admin mailbox fix-utf7 --config config.toml --dry-run
 
+  # Report mailboxes whose cached unseen count is too high (dry run), then repair them
+  sora-admin mailbox repair-unseen --config config.toml
+  sora-admin mailbox repair-unseen --config config.toml --apply
+
   # Fix all accounts
   sora-admin mailbox fix-utf7 --config config.toml
 
@@ -809,22 +815,12 @@ Examples:
 			}
 		}
 
-		delim := string(consts.MailboxDelimiter)
-		oldPrefix := r.MailboxName + delim
-		newPrefix := decoded + delim
-		oldPrefixRunes := len([]rune(oldPrefix))
-
 		var cascadedNames []string
 		for _, child := range mboxes {
 			if !helpers.IsDescendantOf(child.Path, r.Path) {
 				continue
 			}
-			childRunes := []rune(child.Name)
-			var suffix string
-			if oldPrefixRunes <= len(childRunes) {
-				suffix = string(childRunes[oldPrefixRunes:])
-			}
-			newName := newPrefix + suffix
+			newName := renamedDescendantName(child.Name, r.MailboxName, decoded)
 			if globalConfig.SharedMailboxes.Enabled && globalConfig.SharedMailboxes.InNamespace(newName) != child.IsShared {
 				return consts.ErrMailboxSharedBoundary
 			}
@@ -963,29 +959,22 @@ Examples:
 				processedIDs[r.MailboxID] = true
 				renamedInRound++
 
-				delim := string(consts.MailboxDelimiter)
-				oldPrefix := r.MailboxName + delim
-				newPrefix := decoded + delim
-				oldPrefixRunes := len([]rune(oldPrefix))
 				mboxes := accountMailboxes[r.AccountID]
 				for j := range mboxes {
 					if mboxes[j].ID == r.MailboxID {
 						mboxes[j].Name = decoded
 					} else if helpers.IsDescendantOf(mboxes[j].Path, r.Path) {
-						childRunes := []rune(mboxes[j].Name)
-						var suffix string
-						if oldPrefixRunes <= len(childRunes) {
-							suffix = string(childRunes[oldPrefixRunes:])
-						}
-						mboxes[j].Name = newPrefix + suffix
+						mboxes[j].Name = renamedDescendantName(mboxes[j].Name, r.MailboxName, decoded)
 					}
 				}
 
-				// As the rename would, carry the new name down to the children.
+				// As the rename would, carry the new name down to the children: every
+				// descendant its path links below the mailbox, however it spells the
+				// mailbox's levels.
 				for j := range rows {
 					c := &rows[j]
-					if c.AccountID == r.AccountID && helpers.IsDescendantOf(c.Path, r.Path) && strings.HasPrefix(c.MailboxName, oldPrefix) {
-						c.MailboxName = decoded + c.MailboxName[len(r.MailboxName):]
+					if c.AccountID == r.AccountID && helpers.IsDescendantOf(c.Path, r.Path) {
+						c.MailboxName = renamedDescendantName(c.MailboxName, r.MailboxName, decoded)
 					}
 				}
 				continue
@@ -1060,6 +1049,21 @@ func decodeMailboxLevelUTF7(name string) (string, error) {
 	return name[:i] + level, nil
 }
 
+// renamedDescendantName is the name db.RenameMailbox gives a descendant called name
+// when its ancestor oldName is renamed to newName: newName followed by name's levels
+// after as many as oldName has. A descendant is linked below its ancestor by
+// LOWER(name), which can spell the ancestor with another number of characters (under
+// ICU lower('İ') is "i̇", issue #1650) but never with another number of levels.
+func renamedDescendantName(name, oldName, newName string) string {
+	delim := string(consts.MailboxDelimiter)
+	levels := strings.Split(name, delim)
+	n := strings.Count(oldName, delim) + 1
+	if n >= len(levels) {
+		return newName
+	}
+	return newName + delim + strings.Join(levels[n:], delim)
+}
+
 // printMailboxUsage prints usage information for the 'mailbox' command
 func printMailboxUsage() {
 	fmt.Println(`Usage: sora-admin mailbox <subcommand> [options]
@@ -1072,6 +1076,7 @@ Subcommands:
   subscribe     Subscribe to a mailbox
   unsubscribe   Unsubscribe from a mailbox
   fix-utf7      Fix mailbox names with un-decoded Modified UTF-7 encoding
+  repair-unseen Find and repair cached unseen counts that are too high
 
 Examples:
   # Create a new mailbox

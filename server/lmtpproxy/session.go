@@ -904,66 +904,52 @@ func (s *Session) ErrorLog(msg string, keyvals ...any) {
 //   - "RCPT TO:<user@example.com> NOTIFY=NEVER XRCPTFORWARD=fwd@example.com" -> "RCPT TO:<user@example.com> XRCPTFORWARD=fwd@example.com"
 //   - "RCPT TO:<user@example.com> UNKNOWN=value" -> "RCPT TO:<user@example.com>"
 func stripUnsupportedRCPTParameters(command string) string {
-	// Only process RCPT TO commands
-	if !strings.HasPrefix(server.ToUpperASCII(command), "RCPT TO") {
+	recipient, keptParams, ok := parseRCPTCommand(command)
+	if !ok {
 		return command
 	}
+	return formatCanonicalRCPT(recipient, keptParams)
+}
 
-	// Find the recipient address (between < and >)
-	startIdx := strings.Index(command, "<")
-	if startIdx == -1 {
-		return command // No angle bracket, return as-is
-	}
-
-	endIdx := strings.Index(command[startIdx:], ">")
-	if endIdx == -1 {
-		return command // No closing bracket, return as-is
-	}
-	endIdx += startIdx // Adjust to absolute position
-
-	// Extract the RCPT TO prefix and the address
-	// Everything before and including the closing > bracket
-	cleanCommand := command[:endIdx+1]
-
-	// Check if there are any parameters after the address
-	remainder := strings.TrimSpace(command[endIdx+1:])
-	if remainder == "" {
-		return cleanCommand // No parameters, already clean
-	}
-
-	// Allowlist of RCPT TO parameters supported by LMTP servers
-	// Using a map for O(1) lookup
-	allowedParams := map[string]bool{
-		"XRCPTFORWARD": true, // Dovecot-specific: original recipient for forwarding
-		// Add more LMTP-supported parameters here if needed
-	}
-
-	// Parse parameters and keep only allowed ones
-	params := strings.Fields(remainder)
-	var keptParams []string
-
-	for _, param := range params {
-		// Extract parameter name (before '=')
-		parts := strings.SplitN(param, "=", 2)
-		if len(parts) == 0 {
-			continue // Malformed parameter
-		}
-
-		paramName := server.ToUpperASCII(parts[0])
-
-		// Keep only if in allowlist
-		if allowedParams[paramName] {
-			keptParams = append(keptParams, param)
-		}
-		// Silently drop everything else (DSN parameters, unknown parameters, etc.)
-	}
-
-	// Reconstruct command with kept parameters
+func formatCanonicalRCPT(recipient string, keptParams []string) string {
 	if len(keptParams) > 0 {
-		return cleanCommand + " " + strings.Join(keptParams, " ")
+		return "RCPT TO:<" + recipient + "> " + strings.Join(keptParams, " ")
 	}
+	return "RCPT TO:<" + recipient + ">"
+}
 
-	return cleanCommand
+// parseRCPTCommand parses a RCPT TO command line using the proxy's command and
+// address parsers, returning the extracted recipient address and any allowed
+// ESMTP parameters (non-empty XRCPTFORWARD=<value> tokens).
+func parseRCPTCommand(command string) (address string, keptParams []string, ok bool) {
+	trimmed := strings.TrimSpace(command)
+	if len(trimmed) <= 4 || !server.EqualFoldASCII(trimmed[:4], "RCPT") || (trimmed[4] != ' ' && trimmed[4] != '\t') {
+		return "", nil, false
+	}
+	_, verb, args, err := server.ParseLine("RCPT "+strings.TrimSpace(trimmed[4:]), false)
+	if err != nil || verb != "RCPT" {
+		return "", nil, false
+	}
+	toParam, rest, found := findParameterWithRest(args, "TO:")
+	if !found {
+		return "", nil, false
+	}
+	address, ok = extractAddressString(toParam)
+	if !ok || address == "" {
+		return "", nil, false
+	}
+	for _, rawArg := range rest {
+		if strings.HasPrefix(rawArg, `"`) {
+			continue
+		}
+		for _, param := range strings.Fields(rawArg) {
+			key, val, hasEq := strings.Cut(param, "=")
+			if hasEq && val != "" && server.EqualFoldASCII(key, "XRCPTFORWARD") {
+				keptParams = append(keptParams, param)
+			}
+		}
+	}
+	return address, keptParams, true
 }
 
 // extractAddress extracts email address from MAIL FROM or RCPT TO parameter.
@@ -975,6 +961,10 @@ func stripUnsupportedRCPTParameters(command string) string {
 // null reverse-path of MAIL (RFC 5321 section 4.1.2), never a path that could not
 // be read.
 func (s *Session) extractAddress(param string) (address string, ok bool) {
+	return extractAddressString(param)
+}
+
+func extractAddressString(param string) (address string, ok bool) {
 	// The parameter value might be quoted, so unquote it first. A quoted "<>" is not
 	// the null reverse-path: in a path a quoted string is a local part (section 4.1.2),
 	// and this one has no domain.
@@ -1665,51 +1655,45 @@ func (s *Session) invalidateLookupCache(reason string) {
 	s.InfoLog("invalidated lookup cache entry", "reason", reason, "address", s.originalAddress, "backend", s.serverAddr)
 }
 
-// forwardRCPT sends the RCPT TO command to backend and handles response interception
-func (s *Session) forwardRCPT(command string) {
-	// Strip the RCPT TO parameters the backend does not take before forwarding
-	// (DSN parameters among them: neither the proxy nor the backend announces DSN).
-	cleanedCommand := stripUnsupportedRCPTParameters(command)
-	if cleanedCommand != command {
-		s.DebugLog("Stripped unsupported ESMTP parameters from RCPT TO", "original", command, "cleaned", cleanedCommand)
+// backendRcptTo builds the canonical RCPT TO:<recipient> command sent to the backend,
+// mirroring backendMailFrom. Unsupported ESMTP parameters (including DSN NOTIFY/ORCPT)
+// are dropped, keeping only valid XRCPTFORWARD=<value> tokens, and the base address is
+// rewritten when remotelookup resolved an alias (preserving any +detail).
+func (s *Session) backendRcptTo(command string) (backendCommand string, rewrote bool, resolvedRecipient string) {
+	parsedRecipient, keptParams, ok := parseRCPTCommand(command)
+	recipient := s.to
+	if recipient == "" && ok {
+		recipient = parsedRecipient
 	}
 
-	// IMPORTANT: If remotelookup resolved the recipient to a different email (ActualEmail),
-	// we must rewrite the RCPT TO command to use the resolved email, not the original.
-	// This handles cases where remotelookup returns a token-based or aliased address.
-	// However, we must preserve the detail part (e.g., +test) from the original address.
-	backendCommand := cleanedCommand
-	if s.username != s.toAddress.BaseAddress() {
-		// Username was resolved to a different email - rewrite RCPT TO
-		// Extract any ESMTP parameters from cleaned command (after the address)
-		params := ""
-		if idx := strings.Index(cleanedCommand, ">"); idx != -1 && idx+1 < len(cleanedCommand) {
-			params = strings.TrimSpace(cleanedCommand[idx+1:])
-		}
-
-		// Reconstruct resolved email with detail if present
-		var resolvedRecipient string
+	if s.toAddress != nil && s.username != "" && s.username != s.toAddress.BaseAddress() {
 		if s.toAddress.Detail() != "" {
-			// Preserve detail part from original address
-			resolvedAddr, parseErr := server.NewAddress(s.username)
-			if parseErr == nil {
+			if resolvedAddr, parseErr := server.NewAddress(s.username); parseErr == nil {
 				resolvedRecipient = fmt.Sprintf("%s+%s@%s", resolvedAddr.LocalPart(), s.toAddress.Detail(), resolvedAddr.Domain())
 			} else {
-				// Fallback: use resolved username as-is if parsing fails
 				s.WarnLog("Failed to parse resolved username for detail preservation", "username", s.username, "error", parseErr)
 				resolvedRecipient = s.username
 			}
 		} else {
 			resolvedRecipient = s.username
 		}
+		recipient = resolvedRecipient
+		rewrote = true
+	}
 
-		// Reconstruct RCPT TO with resolved email (with detail if present)
-		if params != "" {
-			backendCommand = fmt.Sprintf("RCPT TO:<%s> %s", resolvedRecipient, params)
-		} else {
-			backendCommand = fmt.Sprintf("RCPT TO:<%s>", resolvedRecipient)
-		}
+	if recipient == "" {
+		return stripUnsupportedRCPTParameters(command), false, ""
+	}
+	return formatCanonicalRCPT(recipient, keptParams), rewrote, resolvedRecipient
+}
+
+// forwardRCPT sends the RCPT TO command to backend and handles response interception
+func (s *Session) forwardRCPT(command string) {
+	backendCommand, rewrote, resolvedRecipient := s.backendRcptTo(command)
+	if rewrote {
 		s.DebugLog("Rewrote RCPT TO for backend", "original_recipient", s.to, "resolved_recipient", resolvedRecipient, "backend_command", backendCommand)
+	} else if backendCommand != command {
+		s.DebugLog("Canonicalized RCPT TO for backend", "original", command, "cleaned", backendCommand)
 	}
 
 	// Send the RCPT TO command
@@ -1965,25 +1949,44 @@ func isClosingError(err error) bool {
 }
 
 // findParameter searches for a parameter with a given prefix in a list of arguments.
-// It is case-insensitive over ASCII letters (see server.ToUpperASCII) and supports
+// It is case-insensitive over ASCII letters (see server.EqualFoldASCII) and supports
 // prefixes like "FROM:" or "TO:".
 // It handles both "KEY:value" and "KEY: value" formats.
 func findParameter(args []string, prefix string) (string, bool) {
+	val, _, found := findParameterWithRest(args, prefix)
+	return val, found
+}
+
+// findParameterWithRest is findParameter and also returns the remaining arguments
+// outside the matched parameter token(s).
+func findParameterWithRest(args []string, prefix string) (string, []string, bool) {
 	for i, arg := range args {
 		// Handle "KEY: value" format where KEY: is a standalone token.
-		if server.ToUpperASCII(arg) == prefix {
+		if server.EqualFoldASCII(arg, prefix) {
 			if i+1 < len(args) {
-				return args[i+1], true
+				if i == 0 {
+					return args[1], args[2:], true
+				}
+				rest := make([]string, 0, len(args)-2)
+				rest = append(rest, args[:i]...)
+				rest = append(rest, args[i+2:]...)
+				return args[i+1], rest, true
 			}
-			return "", false // Found prefix but no value.
+			return "", nil, false // Found prefix but no value.
 		}
 
 		// Handle "KEY:value" format where it's a single token.
-		if strings.HasPrefix(server.ToUpperASCII(arg), prefix) {
-			return arg[len(prefix):], true
+		if len(arg) > len(prefix) && server.EqualFoldASCII(arg[:len(prefix)], prefix) {
+			if i == 0 {
+				return arg[len(prefix):], args[1:], true
+			}
+			rest := make([]string, 0, len(args)-1)
+			rest = append(rest, args[:i]...)
+			rest = append(rest, args[i+1:]...)
+			return arg[len(prefix):], rest, true
 		}
 	}
-	return "", false
+	return "", nil, false
 }
 
 // hasSMTPUTF8Param reports whether the MAIL FROM arguments carry the SMTPUTF8 parameter
