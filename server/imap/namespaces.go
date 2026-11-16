@@ -48,24 +48,39 @@ func (s *IMAPSession) Namespace(ctx context.Context) (*imap.NamespaceData, error
 // namespace(s)" (RFC 5465 §6.2, RFC 7377 §2.2), so both ask this, never who owns the
 // mailbox: a shared mailbox the user created is the user's own.
 func inSharedNamespace(name, sharedRoot string) bool {
+	rest, ok := cutSharedNamespaceRoot(name, sharedRoot)
+	return ok && (rest == "" || rest[0] == byte(consts.MailboxDelimiter))
+}
+
+// isSharedNamespaceRoot reports whether name is the shared namespace root
+// sharedRoot ("Shared" for the prefix "Shared/"), in any case. sharedRoot is
+// sharedNamespaceRoot(), "" while sharing is disabled. It matches case as
+// config.SharedMailboxesConfig.IsNamespaceRoot does, without allocating: LIST
+// and NOTIFY ask it for every listed or changed mailbox.
+func isSharedNamespaceRoot(name, sharedRoot string) bool {
+	rest, ok := cutSharedNamespaceRoot(name, sharedRoot)
+	return ok && rest == ""
+}
+
+func cutSharedNamespaceRoot(name, sharedRoot string) (string, bool) {
 	if sharedRoot == "" {
-		return false
+		return "", false
 	}
 	// Match strings.ToLower in the creation policy, not Unicode case folding:
 	// final sigma and long s must remain distinct, and lowercasing can change
 	// UTF-8 widths (for example, İ becomes i). Walk both names independently.
 	for sharedRoot != "" {
 		if name == "" {
-			return false
+			return "", false
 		}
 		n, nameSize := utf8.DecodeRuneInString(name)
 		r, rootSize := utf8.DecodeRuneInString(sharedRoot)
 		if unicode.ToLower(n) != unicode.ToLower(r) {
-			return false
+			return "", false
 		}
 		name, sharedRoot = name[nameSize:], sharedRoot[rootSize:]
 	}
-	return name == "" || name[0] == byte(consts.MailboxDelimiter)
+	return name, true
 }
 
 // sharedRootDestinationRefusal refuses the shared namespace root as the mailbox that
