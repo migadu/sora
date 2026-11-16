@@ -640,6 +640,9 @@ A node that has never written a heartbeat or taken a lease counts as alive, beca
 cannot tell whether it is gone. Deleting mail by mistake is permanent; keeping it costs only
 disk.
 
+The worker never waits for a folder that another session is changing at that moment (a
+delivery, a flag change, an expunge). It leaves that folder's messages for a later cycle.
+
 With the defaults this means:
 
 - A **parked upload** loses its messages 14 days after they were stored, unless you fix it
