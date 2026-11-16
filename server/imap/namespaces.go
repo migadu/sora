@@ -2,6 +2,7 @@ package imap
 
 import (
 	"context"
+	"strings"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
@@ -32,6 +33,21 @@ func (s *IMAPSession) Namespace(ctx context.Context) (*imap.NamespaceData, error
 	}
 
 	return data, nil
+}
+
+// inSharedNamespace reports whether the mailbox named name is in the shared namespace
+// NAMESPACE advertises: the root sharedRoot ("Shared" for the prefix "Shared/"), a
+// \Noselect container, or a mailbox below it, in any case. sharedRoot is
+// sharedNamespaceRoot(), "" while sharing is disabled. It classifies names as
+// config.SharedMailboxesConfig.InNamespace does when a mailbox is created, without
+// allocating: NOTIFY asks it for every mailbox on every tick.
+//
+// Everything else is in the personal namespace, the prefix "". ESEARCH IN (PERSONAL)
+// and NOTIFY's PERSONAL both take "all selectable mailboxes in the user's personal
+// namespace(s)" (RFC 5465 §6.2, RFC 7377 §2.2), so both ask this, never who owns the
+// mailbox: a shared mailbox the user created is the user's own.
+func inSharedNamespace(name, sharedRoot string) bool {
+	return sharedRoot != "" && (strings.EqualFold(name, sharedRoot) || mailboxNameHasPrefix(name, sharedRoot))
 }
 
 // sharedRootDestinationRefusal refuses the shared namespace root as the mailbox that
