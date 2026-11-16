@@ -60,6 +60,9 @@ func SieveFlagsBySubject(t *testing.T, rdb *resilient.ResilientDatabase, account
 			t.Errorf("copy of %q in %s has keywords %v, want exactly one RFC 9979 attachment keyword", subject, mailbox, custom)
 		}
 		slices.Sort(flags)
+		if _, exists := copies[mailbox]; exists {
+			t.Fatalf("more than one physical copy of %q in %s", subject, mailbox)
+		}
 		copies[mailbox] = flags
 	}
 	if err := rows.Err(); err != nil {
