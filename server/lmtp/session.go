@@ -874,10 +874,10 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// relayed again by every retry. Whatever is not handed over when this delivery
 	// returns is dropped; the retry holds it again.
 	//
-	// The hop count is the one the message arrived with, as the script saw it and
-	// RedirectAllowed checked it: an editheader script may delete X-Sora-Loop (RFC 5293
-	// §6 leaves which fields it may delete to local policy), and a count read after its
-	// edits would restart on every pass and never reach max_redirect_hops.
+	// The hop count is the one the message arrived with, before the script's header
+	// edits, which RedirectAllowed checked: an editheader script may delete X-Sora-Loop
+	// (RFC 5293 §6 leaves which fields it may delete to local policy), and a count read
+	// after its edits would restart on every pass and never reach max_redirect_hops.
 	arrivedHops := helpers.RedirectHopCount(helpers.HeaderGetter(sieveCtx.Header))
 	commitRedirects, abortRedirects, allHeld := s.holdRedirects(ctx, result, arrivedHops, fullMessageBytes)
 	defer abortRedirects()

@@ -300,9 +300,9 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	// before the caller has stored what this delivery stores: a target the queue cannot
 	// take keeps the message in INBOX when nothing else stores it, and a delivery that
 	// fails after a handoff would relay it again on every retry. The hop count is the
-	// one the message arrived with, as the script saw it and RedirectAllowed checked it:
-	// a count read after an editheader script deleted X-Sora-Loop would restart on
-	// every pass and never reach max_redirect_hops.
+	// one the message arrived with, before the script's header edits, which
+	// RedirectAllowed checked: a count read after an editheader script deleted
+	// X-Sora-Loop would restart on every pass and never reach max_redirect_hops.
 	allHeld := true
 	if len(result.RedirectTo) > 0 {
 		arrivedHops := helpers.RedirectHopCount(helpers.HeaderGetter(sieveCtx.Header))
