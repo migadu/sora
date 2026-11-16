@@ -122,6 +122,62 @@ func TestNewImporterFollowsALinkOfRootOrOfTheMaildirsOwner(t *testing.T) {
 	}
 }
 
+// A link that belongs to the user running the import can only lead where that user
+// could name directly, as root's links can when the import runs as root: a link an
+// operator who is not root made, ~/imports/alice -> /var/vmail/alice, a directory of
+// vmail, is followed, as the cache's rule (maildirCacheLinkRule) trusts that user. A
+// third user's link on the way is still refused. The links the test makes belong to
+// the user running it; run as root, they are root's links.
+func TestOpenImportRootFollowsALinkOfTheUserRunningTheImport(t *testing.T) {
+	const name = "1700000001.M1P1.host:2,S"
+	const script = "keep;\n"
+	alice, bob := rootLinkUIDs()
+
+	t.Run("maildir", func(t *testing.T) {
+		real := newMaildirWith(t, map[string][]byte{name: cachedSizeMessage("Vmail", 100)})
+		ownedByUID(t, bob, real)
+		link := filepath.Join(t.TempDir(), "alice")
+		require.NoError(t, os.Symlink(real, link))
+
+		importer := newTestModeImporter(t, link, newMockResilientDatabase(), ImporterOptions{})
+		require.NoError(t, importer.scanMaildir())
+		assert.Equal(t, map[string]string{filepath.Join(link, "cur", name): "INBOX"}, scannedMessages(t, importer))
+	})
+
+	t.Run("sieve", func(t *testing.T) {
+		target := filepath.Join(t.TempDir(), "sieve")
+		require.NoError(t, os.Mkdir(target, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(target, "managesieve.sieve"), []byte(script), 0644))
+		ownedByUID(t, bob, target)
+		link := filepath.Join(t.TempDir(), "sieve")
+		require.NoError(t, os.Symlink(target, link))
+
+		content, err := readSieveFile(filepath.Join(link, "managesieve.sieve"))
+		require.NoError(t, err)
+		assert.Equal(t, script, string(content))
+	})
+
+	// The running user's link is followed, but not a third user's link it leads to.
+	t.Run("the running user's link to a third user's link", func(t *testing.T) {
+		victim := newMaildirWith(t, map[string][]byte{name: cachedSizeMessage("Victim", 100)})
+		ownedByUID(t, bob, victim)
+		aliceLink := filepath.Join(t.TempDir(), "Maildir")
+		require.NoError(t, os.Symlink(victim, aliceLink))
+		ownedByUID(t, alice, aliceLink)
+		link := filepath.Join(t.TempDir(), "alice")
+		require.NoError(t, os.Symlink(aliceLink, link))
+
+		importer, err := NewImporter(context.Background(), link, "alice@example.com", 1, nil, nil, ImporterOptions{TestMode: true})
+		if importer != nil {
+			importer.Close()
+		}
+		if assert.Error(t, err, "another user's maildir was opened through alice's link") {
+			assert.Contains(t, err.Error(), resolvedName(t, aliceLink), "the refusal does not name alice's link")
+		}
+		assert.NoFileExists(t, filepath.Join(victim, maildirCacheName), "the cache was created in the directory the link leads to")
+	})
+}
+
 func TestImportSieveScriptRefusesAUsersLinkedDirectoryToAnotherUsers(t *testing.T) {
 	const script = "keep;\n"
 	alice, bob := rootLinkUIDs()
