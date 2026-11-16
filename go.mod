@@ -23,7 +23,7 @@ require (
 	github.com/migadu/go-imap v1.2.8-0.20261116124110-7fdba57026df
 	github.com/migadu/go-managesieve v0.1.5
 	github.com/migadu/go-pop3 v0.1.6
-	github.com/migadu/go-sieve v1.5.2-0.20261116104804-8b2aed89ea87
+	github.com/migadu/go-sieve v1.5.2-0.20261116134132-b7823a9c6607
 	github.com/pierrec/lz4/v4 v4.1.33
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.2
