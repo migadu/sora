@@ -354,7 +354,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	// Collect messages and their target mailboxes
 	type msgToRestore struct {
 		id           int64
-		mailboxName  string  // effective name: live mailbox's current name, else the stored string
+		mailboxName  string // effective name: live mailbox's current name, else the stored string
 		messageID    string
 		deliveryHash *string // set by MTA delivery only; deduplicates headerless redeliveries per mailbox
 		contentHash  string  // for the per-object lock shared with the cleaner
@@ -541,14 +541,14 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
 					delivery_hash, mailbox_id, mailbox_path, uid, created_modseq
 				)
 				SELECT
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
 					delivery_hash, $2::bigint, $3::text, $4::bigint, nextval('messages_modseq')
 				FROM source
 				RETURNING id
