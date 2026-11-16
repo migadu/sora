@@ -670,6 +670,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 			References:          references,
 			BodyStructure:       &bodyStructure,
 			Recipients:          recipients,
+			HeaderPresence:      helpers.ExtractHeaderPresence(messageContent.Header),
 			FTSRetention:        si.options.FTSRetention,
 		},
 		db.PendingUpload{
