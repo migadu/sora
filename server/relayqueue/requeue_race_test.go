@@ -1,0 +1,134 @@
+package relayqueue
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// TestRequeueConcurrentPermanentFailureDoesNotLoseMessage reproduces the cross-process
+// race between `sora-admin relay requeue` (adminQ) and the running server's relay worker
+// (serverQ): as soon as Requeue publishes pending/<id>.json, the server worker can
+// acquire <id> and fail it permanently back into failed/<id>.{msg,json} before Requeue
+// finishes removing the old failed/<id>.{msg,json} pair. Requeue must never delete the
+// newly failed message.
+func TestRequeueConcurrentPermanentFailureDoesNotLoseMessage(t *testing.T) {
+	dir := t.TempDir()
+	serverQ, err := NewDiskQueue(dir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminQ, err := NewDiskQueue(dir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := failMessage(t, serverQ, "recipient@example.com", "550 5.1.1 initial permanent failure")
+	pendingMeta := filepath.Join(dir, "pending", id+".json")
+
+	realSyncDir := syncDir
+	t.Cleanup(func() { syncDir = realSyncDir })
+	workerRan := false
+	syncDir = func(d string) error {
+		err := realSyncDir(d)
+		if !workerRan && d == adminQ.pendingDir && fileExists(pendingMeta) {
+			workerRan = true
+			serverQ.pending.invalidate()
+			msg, _, acqErr := serverQ.AcquireNext()
+			if acqErr != nil || msg != nil {
+				t.Fatalf("worker crossed the active publication lease: %v %v", msg, acqErr)
+			}
+		}
+		return err
+	}
+
+	if err := adminQ.Requeue(id); err != nil {
+		t.Fatalf("Requeue: %v", err)
+	}
+	if !workerRan {
+		t.Fatal("worker seam did not fire when pending/<id>.json became visible")
+	}
+	serverQ.pending.invalidate()
+	msg, _, err := acquireProtocolEventually(t, serverQ)
+	if err != nil || msg == nil {
+		t.Fatalf("worker acquire after handoff: %v %v", msg, err)
+	}
+	if err := serverQ.MarkPermanentFailure(msg.ID, "550 5.1.1 still rejected"); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, processing, failed, err := serverQ.GetStats()
+	if err != nil {
+		t.Fatalf("GetStats: %v", err)
+	}
+	if failed != 1 || pending != 0 || processing != 0 {
+		t.Fatalf("message %s lost after concurrent permanent failure: pending=%d processing=%d failed=%d (want pending=0 processing=0 failed=1)",
+			id, pending, processing, failed)
+	}
+	if !fileExists(filepath.Join(dir, "failed", id+".msg")) || !fileExists(filepath.Join(dir, "failed", id+".json")) {
+		t.Fatalf("failed/%s.{msg,json} missing after concurrent permanent failure", id)
+	}
+	var got QueuedMessage
+	if err := serverQ.readMetadata(filepath.Join(dir, "failed", id+".json"), &got); err != nil {
+		t.Fatalf("readMetadata: %v", err)
+	}
+	if got.Attempts != 1 || lastError(got) == "" {
+		t.Fatalf("unexpected failed metadata after second failure: %+v", got)
+	}
+}
+
+func TestRecoverOrphanedMessagesFinishesInterruptedRequeue(t *testing.T) {
+	dir := t.TempDir()
+	q, err := NewDiskQueue(dir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := failMessage(t, q, "recipient@example.com", "550 5.1.1 initial permanent failure")
+
+	// Simulate crash after Requeue staged pending/<id>.msg + pending/.requeue-<id>.staged
+	// and retired failed/<id>.{json,msg} to .old, right before renaming .staged -> .json.
+	metaBytes, err := os.ReadFile(filepath.Join(dir, "failed", id+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgBytes, err := os.ReadFile(filepath.Join(dir, "failed", id+".msg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pending", id+".msg"), msgBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pending", requeueStagedPrefix+id+requeueStagedSuffix), metaBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "failed", id+".json"), filepath.Join(dir, "failed", requeueRetiringPrefix+id+requeueRetiringJSON)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "failed", id+".msg"), filepath.Join(dir, "failed", requeueRetiringPrefix+id+requeueRetiringMsg)); err != nil {
+		t.Fatal(err)
+	}
+
+	var metadata QueuedMessage
+	if err := json.Unmarshal(metaBytes, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.writeState(requeueState{Phase: "publishing", Metadata: metadata}); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := q.RecoverOrphanedMessages()
+	if err != nil {
+		t.Fatalf("RecoverOrphanedMessages: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered = %d, want 1", recovered)
+	}
+	pending, processing, failed, err := q.GetStats()
+	if err != nil {
+		t.Fatalf("GetStats: %v", err)
+	}
+	if pending != 1 || processing != 0 || failed != 0 {
+		t.Fatalf("after recovery: pending=%d processing=%d failed=%d, want 1/0/0", pending, processing, failed)
+	}
+}
