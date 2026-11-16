@@ -124,3 +124,66 @@ func TestUnsupportedMailRcptParametersGet555(t *testing.T) {
 		t.Errorf("backend RCPT commands = %q, want %q (refused recipients are not routed)", rcpt, want)
 	}
 }
+
+// A parameter written with "=" and nothing after it is malformed whatever its keyword:
+// "esmtp-param = esmtp-keyword ["=" esmtp-value]" and "esmtp-value = 1*(%d33-60 /
+// %d62-126)" (RFC 5321 section 4.1.2). It gets 501 5.5.4, as on the backend (#1709),
+// whose go-smtp refuses the command so before it looks at any parameter. The proxy
+// answered 555 for an unrecognized one and took XRCPTFORWARD= on RCPT, which the backend
+// refuses.
+func TestEmptyParameterValueGets501(t *testing.T) {
+	addr, lines := scriptedLMTPBackendLines(t, map[string][]lmtpStep{
+		"LHLO": {{0, "250-fake\r\n250 PIPELINING"}},
+		"MAIL": {{0, "250 2.1.0 OK"}},
+		"RCPT": {{0, "250 2.1.5 OK"}},
+		"RSET": {{0, "250 2.0.0 OK"}},
+	})
+	send := startSizeForwardingSession(t, addr)
+
+	for _, param := range []string{
+		"FOO=",
+		"AUTH=",
+		"RET=",
+		"SMTPUTF8=",
+		"FOO=1 BAR=", // the backend parses every parameter before it refuses FOO=1
+		"SIZE=10 x-unknown=",
+	} {
+		if reply := send("MAIL FROM:<a@example.org> " + param); !strings.HasPrefix(reply, "501 5.5.4 ") {
+			t.Errorf("MAIL FROM with %s: %q, want 501 5.5.4", param, reply)
+		}
+		send("RSET")
+	}
+
+	if reply := send("MAIL FROM:<a@example.org>"); !strings.HasPrefix(reply, "250 ") {
+		t.Fatalf("MAIL: %q", reply)
+	}
+	for _, param := range []string{
+		"FOO=",
+		"NOTIFY=",
+		"XRCPTFORWARD=",
+		"xrcptforward=",
+		"FOO=1 BAR=",
+		"XRCPTFORWARD=eD15 FOO=",
+	} {
+		if reply := send("RCPT TO:<user@example.com> " + param); !strings.HasPrefix(reply, "501 5.5.4 ") {
+			t.Errorf("RCPT TO with %s: %q, want 501 5.5.4", param, reply)
+		}
+	}
+	// The transaction is still open.
+	if reply := send("RCPT TO:<user@example.com> XRCPTFORWARD=eD15"); !strings.HasPrefix(reply, "250 ") {
+		t.Errorf("RCPT TO with XRCPTFORWARD after refused parameters: %q, want 250", reply)
+	}
+	if reply := send("QUIT"); !strings.HasPrefix(reply, "221 ") {
+		t.Errorf("QUIT: %q, want 221", reply)
+	}
+
+	var rcpt []string
+	for _, line := range lines() {
+		if verb, _, _ := strings.Cut(line, " "); verb == "RCPT" {
+			rcpt = append(rcpt, line)
+		}
+	}
+	if want := []string{"RCPT TO:<user@example.com> XRCPTFORWARD=eD15"}; strings.Join(rcpt, "\n") != strings.Join(want, "\n") {
+		t.Errorf("backend RCPT commands = %q, want %q (refused recipients are not routed)", rcpt, want)
+	}
+}

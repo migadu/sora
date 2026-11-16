@@ -164,7 +164,7 @@ func (s *Session) handleConnection() {
 		}
 
 		// Read command from client
-		line, err := server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth line to prevent memory exhaustion
+		line, err := s.readPreAuthLine() // bound pre-auth line to prevent memory exhaustion
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				s.DebugLog("client timed out waiting for command")
@@ -241,7 +241,7 @@ func (s *Session) handleConnection() {
 			usernameLiteral := len(args) > 0 && strings.HasPrefix(args[0], "{") && strings.HasSuffix(args[0], "}")
 			passwordLiteral := len(args) == 2 && strings.HasPrefix(args[1], "{") && strings.HasSuffix(args[1], "}")
 			_, _, hasTrailingLiteral := trailingLiteral(line)
-			if len(args) > 2 || (usernameLiteral && len(args) > 1) ||
+			if strings.Contains(line, "\r") || len(args) > 2 || (usernameLiteral && len(args) > 1) ||
 				(hasTrailingLiteral && !usernameLiteral && !passwordLiteral) ||
 				((usernameLiteral || passwordLiteral) && !strings.HasSuffix(line, "}")) {
 				if s.skipLiterals(line, false) != nil ||
@@ -282,7 +282,7 @@ func (s *Session) handleConnection() {
 					username = string(literalBuf)
 
 					// Read the rest of the line (should be password or another literal)
-					line, err := server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth line to prevent memory exhaustion
+					line, err := s.readPreAuthLine() // bound pre-auth line to prevent memory exhaustion
 					if err != nil {
 						if err != io.EOF {
 							s.DebugLog("error reading password after username literal", "error", err)
@@ -290,14 +290,26 @@ func (s *Session) handleConnection() {
 						return
 					}
 					rest := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
-					line = strings.TrimSpace(rest)
-
-					if line == "" {
+					if rest == "" {
 						if s.handleAuthError(fmt.Sprintf("%s BAD LOGIN requires username and password", tag)) {
 							return
 						}
 						continue
 					}
+
+					// RFC 9051 §9: login = "LOGIN" SP userid SP password. After reading the
+					// username literal octets, the continuation line must start with a single
+					// SP followed immediately by the password, without embedded CR or
+					// surrounding whitespace.
+					afterSP, hasLeadingSP := strings.CutPrefix(rest, " ")
+					if !hasLeadingSP || afterSP == "" || strings.Contains(afterSP, "\r") || strings.TrimSpace(afterSP) != afterSP {
+						if s.skipLiterals(rest, false) != nil ||
+							s.handleAuthError(fmt.Sprintf("%s BAD Invalid LOGIN arguments", tag)) {
+							return
+						}
+						continue
+					}
+					line = afterSP
 
 					// The remainder must contain just the password. Parse it as
 					// an argument so quoted spaces and escapes stay one value.
@@ -501,6 +513,14 @@ func (s *Session) handleConnection() {
 					continue
 				}
 			}
+			// server.ParseLine trims whitespace (including CR) around the line and
+			// between tokens; reject any bare or duplicate CR remaining in line.
+			if strings.Contains(line, "\r") {
+				if s.handleAuthError(fmt.Sprintf("%s BAD Invalid AUTHENTICATE arguments", tag)) {
+					return
+				}
+				continue
+			}
 
 			if server.ToUpperASCII(args[0]) != "PLAIN" {
 				if s.handleAuthError(fmt.Sprintf("%s NO AUTHENTICATE PLAIN is the only supported mechanism", tag)) {
@@ -515,7 +535,7 @@ func (s *Session) handleConnection() {
 				s.sendResponse("+ ")
 
 				// Read SASL response from client
-				saslLine, err := server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth SASL response
+				saslLine, err := s.readPreAuthLine() // bound pre-auth SASL response
 				if err != nil {
 					if err != io.EOF {
 						s.DebugLog("error reading SASL response", "error", err)
@@ -683,16 +703,29 @@ func (s *Session) handleConnection() {
 	s.startProxy()
 }
 
-// finishLoginLiteral consumes the final command line after a password literal.
-// Anything but whitespace is an extra argument; its literals still belong to
-// LOGIN and must be drained before the command can be rejected.
+// readPreAuthLine requires a complete physical line before pre-authentication
+// consumes it. ReadBoundedLine also returns partial EOF data without an error;
+// that must not authenticate a prefix or finish a literal command. Keep the
+// existing line bound and bare-LF tolerance local to this proxy unchanged.
+func (s *Session) readPreAuthLine() (string, error) {
+	line, err := server.ReadBoundedLine(s.clientReader, 65536)
+	if err == nil && !strings.HasSuffix(line, "\n") {
+		return "", io.ErrUnexpectedEOF
+	}
+	return line, err
+}
+
+// finishLoginLiteral consumes the final CRLF after a password literal.
+// Anything before the line ending (including whitespace or an extra CR) is
+// invalid; any trailing literals still belong to LOGIN and must be drained
+// before the command can be rejected.
 func (s *Session) finishLoginLiteral() (extra bool, err error) {
-	rest, err := server.ReadBoundedLine(s.clientReader, 65536)
+	rest, err := s.readPreAuthLine()
 	if err != nil {
 		return false, err
 	}
 	rest = strings.TrimSuffix(strings.TrimSuffix(rest, "\n"), "\r")
-	if strings.TrimSpace(rest) == "" {
+	if rest == "" {
 		return false, nil
 	}
 	return true, s.skipLiterals(rest, false)
@@ -766,7 +799,7 @@ func (s *Session) skipLiterals(line string, sync bool) error {
 		if _, err := s.clientReader.Discard(size); err != nil {
 			return err
 		}
-		next, err := server.ReadBoundedLine(s.clientReader, 65536)
+		next, err := s.readPreAuthLine()
 		if err != nil {
 			return err
 		}
