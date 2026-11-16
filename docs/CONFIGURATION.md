@@ -530,6 +530,7 @@ See [STORAGE.md](STORAGE.md).
 | `timeout` | duration | `"30s"` | Timeout of one S3 operation. |
 | `encrypt` | bool | `false` | Encrypt bodies on the client before upload. |
 | `encryption_key` | string | none | Key for `encrypt`. |
+| `body_deletion_protocol` | string | `"paused"` | Message-body deletion and reference retirement stay paused until the [fleet cutover](OPERATIONS.md#upgrading-the-s3-message-body-lock-protocol) is complete; only then acknowledge `"global-hash-v1"`. Delivery, reads and uploads remain available. |
 
 ### 8.5 Local cache (`[local_cache]`)
 
