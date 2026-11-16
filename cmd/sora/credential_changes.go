@@ -59,6 +59,7 @@ func startCredentialChanges(ctx context.Context, deps *serverDependencies) {
 		return deps.resilientDB.GetCredentialChangesSinceWithRetry(ctx, cursor)
 	}
 	w := credchanges.New(load, deps.resilientDB.PruneCredentialChangesWithRetry, sinks, lookback)
+	deps.credChanges.Store(w)
 	readCtx, cancel := context.WithTimeout(ctx, credentialChangesInitialReadTimeout)
 	err := w.Refresh(readCtx)
 	cancel()
@@ -66,6 +67,12 @@ func startCredentialChanges(ctx context.Context, deps *serverDependencies) {
 		logger.Warn("Credential changes: initial synchronization failed; login caches remain suspended and authentication falls back to primary reads", "error", err)
 	}
 	go w.Run(ctx, credchanges.PollInterval)
+}
+
+func (deps *serverDependencies) notifyCredentialChanges() {
+	if w := deps.credChanges.Load(); w != nil {
+		w.Trigger()
+	}
 }
 
 // lookupCaches returns a snapshot, including caches introduced by reload.

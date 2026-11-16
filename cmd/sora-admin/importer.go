@@ -2939,8 +2939,7 @@ func (i *Importer) insertBatchToDB(ctx context.Context, uploaded []uploadedMsg) 
 								continue
 							}
 							if errors.Is(indErr, consts.ErrDBUniqueViolation) {
-								present = append(present, markedMessage{hash: gm.hash, mailbox: mailboxName})
-								atomic.AddInt64(&i.skippedMessages, 1)
+								present = append(present, markedMessage{hash: gm.hash, mailbox: mailboxName, path: gm.path})
 								continue
 							}
 							logger.Error("DB insert failed for message", "hash", gm.hash, "error", indErr)
@@ -2948,21 +2947,22 @@ func (i *Importer) insertBatchToDB(ctx context.Context, uploaded []uploadedMsg) 
 							atomic.AddInt64(&i.failedMessages, 1)
 							continue
 						}
-						inserted = append(inserted, markedMessage{hash: gm.hash, mailbox: mailboxName})
+						inserted = append(inserted, markedMessage{hash: gm.hash, mailbox: mailboxName, path: gm.path})
 					}
 					continue
 				}
 			}
 
-			wasInserted := make(map[string]bool, len(insertedHashesBatch))
+			remainingInserted := make(map[string]int, len(insertedHashesBatch))
 			for _, hash := range insertedHashesBatch {
-				wasInserted[hash] = true
-				inserted = append(inserted, markedMessage{hash: hash, mailbox: mailboxName})
+				remainingInserted[hash]++
 			}
 			for _, gm := range chunk {
-				if !wasInserted[gm.hash] {
-					present = append(present, markedMessage{hash: gm.hash, mailbox: mailboxName})
-					atomic.AddInt64(&i.skippedMessages, 1)
+				if remainingInserted[gm.hash] > 0 {
+					remainingInserted[gm.hash]--
+					inserted = append(inserted, markedMessage{hash: gm.hash, mailbox: mailboxName, path: gm.path})
+				} else {
+					present = append(present, markedMessage{hash: gm.hash, mailbox: mailboxName, path: gm.path})
 				}
 			}
 		}
@@ -3168,6 +3168,7 @@ func shortHash(hash string) string {
 type markedMessage struct {
 	hash    string
 	mailbox string
+	path    string
 }
 
 // sqliteMarkTimeout bounds markBatchInSQLite. Marking one batch is a short local
@@ -3367,11 +3368,18 @@ func (i *Importer) storeBatch(ctx context.Context, batch []msgInfo, read []uploa
 
 		// Phase 4: Mark successful messages in SQLite cache
 		// For safe mode, this happens AFTER individual commits
-		if err := i.markBatchInSQLite(append(append([]markedMessage(nil), successHashes...), present...)); err != nil {
+		toMark := append(append([]markedMessage(nil), successHashes...), present...)
+		if markErr := i.markBatchInSQLite(toMark); markErr != nil {
 			// FATAL: If SQLite update fails, messages will be re-imported
-			logger.Error("Failed to update SQLite cache - messages may be re-imported on retry", "error", err)
-			atomic.AddInt64(&i.failedMessages, int64(len(successHashes)))
-			return fmt.Errorf("failed to update SQLite cache: %w", err)
+			logger.Error("Failed to update SQLite cache - messages may be re-imported on retry", "error", markErr)
+			for _, m := range toMark {
+				i.recordFailedPath(m.path, fmt.Sprintf("failed to update SQLite cache: %v", markErr))
+			}
+			atomic.AddInt64(&i.failedMessages, int64(len(toMark)))
+			return fmt.Errorf("failed to update SQLite cache: %w", markErr)
+		}
+		if len(present) > 0 {
+			atomic.AddInt64(&i.skippedMessages, int64(len(present)))
 		}
 
 		logger.Info("SQLite marking complete")
