@@ -52,7 +52,7 @@ func tlsOwner(t *testing.T, path string) tlsHandOver {
 }
 
 func isTLSCacheTempFile(dir, path string) bool {
-	return filepath.Dir(path) == dir && strings.HasPrefix(filepath.Base(path), ".sora-tls-cache-")
+	return filepath.Dir(path) == dir && (strings.HasPrefix(filepath.Base(path), ".sora-tls-cache-") || strings.HasPrefix(filepath.Base(path), ".sora-temp-"))
 }
 
 // TestTLSCacheGivesNewFilesToTheCacheDirOwner: each certificate tls cache writes into a

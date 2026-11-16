@@ -270,9 +270,8 @@ const (
 	// S3WriteOpen: no deleter holds the object, the pending row still stands, and it is
 	// now leased to this upload alone until the lease expires.
 	S3WriteOpen S3WriteGate = iota
-	// S3WriteBusy: someone else is at the body right now — the cleaner or a purge
-	// confirming it is an orphan and deleting it, a restore, a cross-account COPY or
-	// MOVE, or another upload of it that holds the row's lease. The upload is deferred.
+	// S3WriteBusy: a destructive holder or deletion intent excludes the body, or
+	// another upload holds the pending row's lease. The upload is deferred.
 	S3WriteBusy
 	// S3WriteAbandoned: the pending row is gone (the account was deleted, the upload
 	// reaped, or another upload finished it), so there is nothing left to upload.
@@ -308,9 +307,11 @@ const (
 // live is answered S3WriteBusy. Renewal, release and the finalize act only for the owner,
 // so the one that lost cannot finalize, and drop the row, under the one still writing.
 //
-// A short READ COMMITTED transaction takes a try-lock, then checks deletion
-// intents and grants the lease from a fresh snapshot. It never waits for a body lock
-// and ends before storage I/O, retaining no connection across the transfer.
+// A short READ COMMITTED transaction takes a shared try-lock, then checks deletion
+// intents and grants the lease from a fresh snapshot. Immutable body claimants such
+// as COPY, MOVE and restore may overlap; destructive holders remain exclusive. It
+// never waits for a body lock and ends before storage I/O, retaining no connection
+// across the transfer.
 func (db *Database) PassS3WriteGate(ctx context.Context, pendingID, accountID int64, contentHash, owner string, ttl time.Duration) (S3WriteGate, error) {
 	// The intent read must take a fresh snapshot AFTER the global try-lock. A
 	// single-statement CTE could resume with a snapshot from before intent commit.
@@ -324,7 +325,7 @@ func (db *Database) PassS3WriteGate(ctx context.Context, pendingID, accountID in
 		_ = tx.Rollback(rollbackCtx)
 	}()
 	var open bool
-	if err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock($1)", GetS3ObjectLockID(accountID, contentHash)).Scan(&open); err != nil {
+	if err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock_shared($1)", GetS3ObjectLockID(accountID, contentHash)).Scan(&open); err != nil {
 		return S3WriteBusy, err
 	}
 	if !open {

@@ -44,6 +44,13 @@ func TestRekeyOldObjectDeleteKeepsOutAnotherAccountsUpload(t *testing.T) {
 	f.put(oldKey, body)
 
 	store := &pausingDeleteStore{FileBasedS3Mock: f.store, deleting: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() {
+		select {
+		case <-store.release:
+		default:
+			close(store.release)
+		}
+	})
 	r := &rekeyRun{rdb: f.rdb, store: store, accountID: accountID, opts: rekeyOptions{DeleteOldObjects: true, BodyDeletionProtocol: "global-hash-v1", BatchSize: 10, Jobs: 1},
 		report: &rekeyReport{}, written: map[db.ContentObject]bool{}}
 	deleted := make(chan struct{})
@@ -58,8 +65,12 @@ func TestRekeyOldObjectDeleteKeepsOutAnotherAccountsUpload(t *testing.T) {
 		t.Fatal("the old object's DELETE did not start")
 	}
 
-	row := f.insert(otherID, "INBOX", domain, local, oldHash, body, "claimed-"+f.nonce)
-	f.exec("UPDATE messages SET uploaded = FALSE WHERE id = $1", row)
+	// Stage a not-uploaded reference while DELETE is in flight. This raw fixture
+	// does not claim existing remote bytes; uploaded admission uses the guarded APIs.
+	mb, err := f.rdb.GetMailboxByNameWithRetry(f.ctx, otherID, "INBOX")
+	require.NoError(t, err)
+	var row int64
+	require.NoError(t, f.rdb.QueryRowWithRetry(f.ctx, `WITH next AS(UPDATE mailboxes SET highest_uid=highest_uid+1 WHERE id=$2 RETURNING highest_uid), ins AS(INSERT INTO messages(account_id,mailbox_id,uid,content_hash,sent_date,internal_date,size,uploaded,s3_domain,s3_localpart,message_id,body_structure,recipients_json,created_modseq) SELECT $1,$2,highest_uid,$3,now(),now(),$4,false,$5,$6,$7,'body','[]',nextval('messages_modseq') FROM next RETURNING id,mailbox_id), state AS(INSERT INTO message_state(message_id,mailbox_id,flags) SELECT id,mailbox_id,0 FROM ins) SELECT id FROM ins`, otherID, mb.ID, oldHash, len(body), domain, local, "claimed-"+f.nonce).Scan(&row))
 	var pendingID int64
 	require.NoError(t, f.rdb.QueryRowWithRetry(f.ctx,
 		`INSERT INTO pending_uploads (instance_id, content_hash, size, account_id) VALUES ('other-node', $1, $2, $3) RETURNING id`,
