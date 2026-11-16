@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -61,10 +62,29 @@ func tlsCleanAutocertEntry(t *testing.T, domain string, useRSA bool, notAfter ti
 	return append(pem.EncodeToMemory(keyBlock), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
 }
 
-// putServerEntry stores data as autocert cache entry name through the server's own S3
-// cache, so the bucket holds exactly the object a running server writes.
+// putServerEntry publishes valid entries through the server cache. Historical
+// expired fixtures are seeded directly: the upgraded publisher refuses them.
 func putServerEntry(t *testing.T, cfg AdminConfig, name string, data []byte) {
 	t.Helper()
+	var info CertificateInfo
+	if parseCertificate(data, &info) == nil && !time.Now().Before(info.Expiry) {
+		// This represents bytes published while valid and inspected after expiry.
+		c := cfg.TLS.LetsEncrypt.S3
+		req, err := http.NewRequest(http.MethodPut, c.Endpoint+"/"+c.Bucket+"/"+tlsmanager.S3ObjectKey(name), bytes.NewReader(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("historical fixture seed status=%d", resp.StatusCode)
+		}
+		return
+	}
 	cache, err := tlsmanager.NewS3Cache(cfg.TLS.LetsEncrypt.S3)
 	if err != nil {
 		t.Fatalf("NewS3Cache: %v", err)
@@ -116,7 +136,7 @@ func TestTLSCleanRemovesExpiredLocalCopies(t *testing.T) {
 		t.Fatalf("cleanTLSCertificates: %v", err)
 	}
 
-	if got := stub.keys(); !slices.Equal(got, unexpired) {
+	if got := stub.activeKeys(); !slices.Equal(got, unexpired) {
 		t.Errorf("S3 objects after clean = %v, want only the valid domain's %v", got, unexpired)
 	}
 	if got, want := localNames(t, cacheDir), []string{"other.example.com", "other.example.com+rsa"}; !slices.Equal(got, want) {
@@ -148,7 +168,7 @@ func TestTLSCleanKeepsValidLocalCopy(t *testing.T) {
 		t.Fatalf("cleanTLSCertificates: %v", err)
 	}
 
-	if got := stub.keys(); len(got) != 0 {
+	if got := stub.activeKeys(); len(got) != 0 {
 		t.Errorf("S3 objects after clean = %v, want none", got)
 	}
 	for name, want := range renewals {
@@ -161,16 +181,18 @@ func TestTLSCleanKeepsValidLocalCopy(t *testing.T) {
 	}
 }
 
-// TestTLSCleanFailsWhenS3DeleteFails: a failed S3 delete must fail the command, as it
+// TestTLSCleanFailsWhenS3ConditionalWriteFails: a failed S3 conditional clear must fail the command, as it
 // does for tls delete, instead of printing "Deleted 0 expired certificate(s)".
-func TestTLSCleanFailsWhenS3DeleteFails(t *testing.T) {
+func TestTLSCleanFailsWhenS3ConditionalWriteFails(t *testing.T) {
 	stub, endpoint := newTLSStubS3(t)
 	cfg := tlsTestConfig(endpoint)
 	putExpiredEntries(t, cfg, t.TempDir(), "mail.example.com")
-	stub.failDeletes(http.StatusInternalServerError)
+	stub.mu.Lock()
+	stub.putStatus = http.StatusInternalServerError
+	stub.mu.Unlock()
 
 	if err := cleanTLSCertificates(context.Background(), cfg, t.TempDir(), false, true); err == nil {
-		t.Fatal("cleanTLSCertificates succeeded although every S3 delete failed")
+		t.Fatal("cleanTLSCertificates succeeded although the conditional S3 clear failed")
 	}
 }
 
@@ -216,7 +238,7 @@ func TestTLSCleanStaysInTheCacheDir(t *testing.T) {
 		t.Fatalf("cleanTLSCertificates: %v", err)
 	}
 
-	if got := stub.keys(); len(got) != 0 {
+	if got := stub.activeKeys(); len(got) != 0 {
 		t.Errorf("S3 objects after clean = %v, want none", got)
 	}
 	if _, err := os.Stat(victim); err != nil {
@@ -245,7 +267,7 @@ func TestTLSCleanFailsWhenACertificateCannotBeRead(t *testing.T) {
 	if err := cleanTLSCertificates(context.Background(), cfg, t.TempDir(), false, true); err == nil {
 		t.Fatal("cleanTLSCertificates succeeded although it could not read a certificate")
 	}
-	if got, want := stub.keys(), []string{unreadable}; !slices.Equal(got, want) {
+	if got, want := stub.activeKeys(), []string{unreadable}; !slices.Equal(got, want) {
 		t.Errorf("S3 objects after clean = %v, want only the unreadable %v", got, want)
 	}
 }

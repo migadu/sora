@@ -339,6 +339,13 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		return 0, err
 	}
 
+	// Freeze candidate hashes before reading them. Rekey changes content_hash
+	// under the exclusive account lock; a pre-lock snapshot cannot select one
+	// hash and later admit a different, unlocked hash from the same source row.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock_shared($1::int4, hashint8($2::int8))", consts.SoraContentRekeyLockClassID, accountID); err != nil {
+		return 0, fmt.Errorf("failed to hold restore hashes against rekey: %w", err)
+	}
+
 	if err := warnUnroutableCandidates(ctx, tx, accountID, params); err != nil {
 		return 0, err
 	}
@@ -454,15 +461,12 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		// The row itself may have vanished since the candidate list was built (already
 		// restored by a concurrent run, or purged by the cleaner); that is a skip, not an
 		// error, so a restore is always safe to re-run.
-		// Hold the object's lock while the message comes back to life: the cleaner takes
-		// the same lock (session try-lock) around "confirm orphan → delete object",
-		// so a restore can no longer slip between its check and its delete and leave a
-		// live row whose object is gone.
-		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", GetS3ObjectLockID(accountID, msg.contentHash)); err != nil {
-			return 0, fmt.Errorf("failed to lock object for message %d: %w", msg.id, err)
-		}
-		if err := CheckS3BodyClaims(ctx, tx, []string{msg.contentHash}); err != nil {
-			return 0, err
+		// Restoring claims immutable body bytes, so shared admission excludes
+		// destructive cleanup while overlapping importers and other claimants.
+		// An exclusive lock here would wait on an import's outer shared holder
+		// while that import waits for our target mailbox on another connection.
+		if err := LockS3ObjectsSharedInTx(ctx, tx, accountID, []string{msg.contentHash}); err != nil {
+			return 0, fmt.Errorf("failed to admit object for message %d: %w", msg.id, err)
 		}
 
 		var restorable bool

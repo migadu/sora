@@ -182,10 +182,10 @@ type rekeyedObject struct {
 }
 
 type rekeyDB interface {
+	ExecuteWithS3BodyCleanup(context.Context, []db.UserScopedObjectForCleanup, time.Duration, func(context.Context, []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error)) (int64, error)
+	ExecuteWithSharedS3ObjectLocks(context.Context, int64, []string, func(context.Context) error) error
 	PendingUploadExistsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error)
-	ExecuteWithS3ObjectLock(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error
 	RekeyContentHashWithRetry(ctx context.Context, accountID int64, obj db.ContentObject, newHash string) (int64, error)
-	IsContentObjectReferencedWithRetry(ctx context.Context, obj db.ContentObject) (bool, error)
 }
 
 type rekeyRun struct {
@@ -386,7 +386,7 @@ func (r *rekeyRun) moveBody(ctx context.Context, obj, newObj db.ContentObject, c
 		return 0, false, db.ErrRekeyUploadPending
 	}
 
-	err = r.rdb.ExecuteWithS3ObjectLock(ctx, newObj.ContentHash, r.accountID, func(ctx context.Context) error {
+	err = r.rdb.ExecuteWithSharedS3ObjectLocks(ctx, r.accountID, []string{newObj.ContentHash}, func(ctx context.Context) error {
 		// An object already under the new key is reused only if it holds the body.
 		// The old object stays unless deletion was requested for drained mail nodes.
 		existing, err := readStoredBodyContext(ctx, r.store, newObj.Key())
@@ -433,26 +433,36 @@ func (r *rekeyRun) deleteOldObjects(ctx context.Context, wait bool) {
 	r.oldObjects = waiting
 }
 
-// deleteOldObject deletes old if nothing references it, holding the S3 advisory lock
-// keyed by old.ContentHash across the check and delete, as the cleaner does.
-// Restore, COPY/MOVE and upload gates of every account meet on this lock.
+// deleteOldObject uses the same durable destructive-operation protocol as the
+// cleaner and verifier. Account0 owns no rows, so every real reference keeps old.
 func (r *rekeyRun) deleteOldObject(ctx context.Context, old db.ContentObject) {
 	if err := (&config.S3Config{BodyDeletionProtocol: r.opts.BodyDeletionProtocol}).RequireBodyDeletionProtocol(); err != nil {
 		r.report.OldLeft = append(r.report.OldLeft, old.Key()+": "+err.Error())
 		return
 	}
+	candidate := db.UserScopedObjectForCleanup{AccountID: 0, ContentHash: old.ContentHash, S3Domain: old.S3Domain, S3Localpart: old.S3Localpart}
 	var referenced, deleted bool
-	err := r.rdb.ExecuteWithS3ObjectLock(ctx, old.ContentHash, r.accountID, func(ctx context.Context) error {
-		var err error
-		if referenced, err = r.rdb.IsContentObjectReferencedWithRetry(ctx, old); err != nil || referenced {
-			return err
+	var deleteErr error
+	_, err := r.rdb.ExecuteWithS3BodyCleanup(ctx, []db.UserScopedObjectForCleanup{candidate}, 0, func(c context.Context, objects []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error) {
+		var result db.S3BodyCleanupResult
+		for _, o := range objects {
+			if o.KeepObject {
+				referenced = true
+				continue
+			}
+			if err := deleteStoredBody(c, r.store, old.Key()); err != nil {
+				deleteErr = err
+				if storage.DeleteDefinitelyRefused(err) {
+					result.Rejected = append(result.Rejected, o)
+				}
+				return result, nil
+			}
+			deleted = true
+			result.Gone = append(result.Gone, o)
 		}
-		if err := deleteStoredBody(ctx, r.store, old.Key()); err != nil {
-			return err
-		}
-		deleted = true
-		return nil
+		return result, nil
 	})
+	err = errors.Join(err, deleteErr)
 	if deleted {
 		r.report.OldDeleted++
 	}
@@ -463,6 +473,8 @@ func (r *rekeyRun) deleteOldObject(ctx context.Context, old db.ContentObject) {
 		r.report.OldKept = append(r.report.OldKept, old.Key())
 	case err != nil:
 		r.report.OldLeft = append(r.report.OldLeft, fmt.Sprintf("%s: %v", old.Key(), err))
+	case !deleted:
+		r.report.OldLeft = append(r.report.OldLeft, old.Key()+": body is busy or quarantined; retry after safe reconciliation")
 	}
 }
 
