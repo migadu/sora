@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1100,6 +1101,13 @@ func replaceFile(root *os.Root, tmpDir, name string, content []byte) error {
 // can take its place afterwards, and O_NONBLOCK is cleared before returning so the
 // regular file is read in blocking mode (as os.Open reads it). The root follows no link
 // out of the export directory.
+//
+// The owner can also make the name a hard link, which the root cannot tell from the
+// file's first name, to a file elsewhere on the same file system, one they cannot read
+// where the system lets them link it (BSD and macOS do, as Linux does with
+// fs.protected_hardlinks = 0). The files the export reads back are created by renaming
+// a new file over the name, by the export (replaceFile) as by Dovecot, so they have one
+// link: a regular file with more is refused.
 func openExportEntry(root *os.Root, name string, dir bool) (*os.File, error) {
 	if dir {
 		f, err := root.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY, 0)
@@ -1124,6 +1132,10 @@ func openExportEntry(root *os.Root, name string, dir bool) (*os.File, error) {
 	if !info.Mode().IsRegular() {
 		f.Close()
 		return nil, fmt.Errorf("refusing %s in the export directory: it is not a regular file", name)
+	}
+	if links := info.Sys().(*syscall.Stat_t).Nlink; links > 1 {
+		f.Close()
+		return nil, fmt.Errorf("refusing %s in the export directory: it is a hard link (%d links)", name, links)
 	}
 	conn, err := f.SyscallConn()
 	if err == nil {
@@ -1175,10 +1187,13 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 			index[kw] = idx
 			used[idx] = true
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		unreadable = true
-		logger.Warn("Replacing a dovecot-keywords file that cannot be read",
-			"path", filepath.Join(exporter.maildirPath, keywordsName), "error", err)
+		// A file that is there but is not read (a link, a FIFO, a file with more than
+		// one link) is replaced without its numbering, so the letters of files an
+		// earlier run wrote may name other keywords now.
+		logger.Warn("Existing dovecot-keywords not read; it is replaced and its keyword numbering is not kept",
+			"mailbox", mailboxName, "path", filepath.Join(exporter.root.Name(), keywordsName), "error", err)
 	}
 
 	names := make([]string, 0, len(seen))
@@ -1237,7 +1252,13 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 // (openExportEntry).
 func mergeUIDMappings(root *os.Root, dir string, current []UIDFileMapping) []UIDFileMapping {
 	existing, err := parseDovecotUIDListFile(openExportEntry(root, filepath.Join(dir, "dovecot-uidlist"), false))
-	if err != nil || existing == nil || len(existing.UIDMappings) == 0 {
+	if err != nil {
+		// Dovecot then gives new UIDs to the files of earlier runs that the file listed.
+		logger.Warn("Existing dovecot-uidlist not read; it is replaced without the entries of earlier runs",
+			"path", filepath.Join(root.Name(), dir, "dovecot-uidlist"), "error", err)
+		return current
+	}
+	if existing == nil || len(existing.UIDMappings) == 0 {
 		return current
 	}
 	usedUID := make(map[uint32]bool, len(current))
