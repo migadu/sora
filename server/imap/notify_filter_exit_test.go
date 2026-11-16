@@ -23,7 +23,7 @@ type notifyDiffTestSession struct {
 func (s *notifyDiffTestSession) SetNotify(_ context.Context, options *imap.NotifyOptions, w *imapserver.UpdateWriter) error {
 	watch := newTestWatch(options.Items...)
 	watch.snapshot = s.prev
-	return s.IMAPSession.notifyDiffSnapshots(watch, s.cur, s.sharedRoot, w)
+	return s.IMAPSession.notifyWriteTreeEvents(watch, diffNotifySnapshots(watch.snapshot, s.cur), s.sharedRoot, w)
 }
 
 func (s *notifyDiffTestSession) NotifyPoll(_ context.Context, _ *imapserver.UpdateWriter, stop <-chan struct{}) error {

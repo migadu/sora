@@ -93,7 +93,7 @@ func (t *scriptedBatchTx) QueryRow(ctx context.Context, sql string, args ...any)
 			}}
 		}
 	}
-	return &mockRow{}
+	return t.mockTx.QueryRow(ctx, sql, args...)
 }
 
 type scriptedBatchTxDB struct {
@@ -291,7 +291,8 @@ func TestBatchTxAbortCounts(t *testing.T) {
 		assert.Empty(t, recordedFailedPaths(importer))
 
 		imported, pending := uploadedCounts(t, maildirPath)
-		assert.Equal(t, 2, imported)
-		assert.Equal(t, 1, pending)
+		// Both newly inserted and duplicate-skipped copies are complete after commit.
+		assert.Equal(t, 3, imported)
+		assert.Equal(t, 0, pending)
 	})
 }

@@ -69,8 +69,8 @@ type NullReferencesBatch struct {
 // that another row with the same content_hash holds a value for, that value.
 //
 // It only reads, in one statement through the read pool, planned with its arguments
-// (QueryExecModeExec) so a cached generic plan cannot trade the primary key and the
-// content_hash index for a scan of the table. It keeps no session state, so it is safe
+// (QueryExecModeExec), avoiding a cached generic plan; the selected custom plan
+// still depends on the table statistics and arguments. It keeps no session state, so it is safe
 // under PgBouncer transaction pooling.
 func (d *Database) FindNullReferences(ctx context.Context, afterID int64, limit int) (NullReferencesBatch, error) {
 	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, nullReferencesBatchSQL, pgx.QueryExecModeExec, afterID, limit)
@@ -105,7 +105,7 @@ func (d *Database) FindNullReferences(ctx context.Context, afterID int64, limit 
 
 // FillNullReferences writes the values FindNullReferences found, in one statement, and
 // returns how many rows it filled. A row expunged or filled since the scan is skipped.
-// The rows are locked in id order, the order the scan returns them. No modseq changes:
+// The write transaction bounds lock waits; its UPDATE determines lock order. No modseq changes:
 // FETCH reads a message's headers from its body, so no client-visible data changes, only
 // what SEARCH HEADER References and THREAD find. The column is in no index, so a fill can
 // be a heap-only update.

@@ -46,11 +46,9 @@ type ImporterOptions struct {
 	EndDate              *time.Time
 	MailboxFilter        []string
 	PreserveFlags        bool
-	ShowProgress         bool
-	ForceReimport        bool
 	CleanupDB            bool
 	Dovecot              bool
-	ImportDelay          time.Duration // Delay between imports to control rate
+	ImportDelay          time.Duration // Wait before each message, per worker, to control the rate
 	SievePath            string        // Path to Sieve script file to import
 	SieveExtensions      []string      // [sieve] enabled_extensions the script is validated against (empty = default set)
 	PreserveUIDs         bool          // Preserve UIDs from dovecot-uidlist files
@@ -69,6 +67,7 @@ type ImporterOptions struct {
 // resilientDB defines the interface for database operations needed by the importer.
 // This allows for mocking the database during testing.
 type resilientDB interface {
+	GetDatabaseIdentityWithRetry(ctx context.Context) (string, error)
 	GetAccountIDByAddressWithRetry(ctx context.Context, address string) (int64, error)
 	CreateDefaultMailboxesWithRetry(ctx context.Context, accountID int64) error
 	GetOwnedMailboxIDByNameWithRetry(ctx context.Context, accountID int64, name string) (int64, error)
@@ -86,6 +85,7 @@ type resilientDB interface {
 	DeleteMessageByHashAndMailboxWithRetry(ctx context.Context, accountID, mailboxID int64, hash string) (int64, error)
 	BeginTxWithRetry(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error)
 	GetOperationalDatabase() *db.Database
+	ExecuteWithSharedS3ObjectLocks(ctx context.Context, accountID int64, contentHashes []string, executionFunc func(ctx context.Context) error) error
 }
 
 // msgInfo represents a message to import (used for batching)
@@ -95,13 +95,13 @@ type msgInfo struct {
 	hash     string
 	size     int64
 	mailbox  string
-	// imported is the cache row's s3_uploaded mark: an earlier run imported the file
-	// under hash (recoverOrphanedSQLiteState clears the mark when the account has no
-	// live row with that hash).
+	// imported is this destination's completion proof for the cached hash, used
+	// to retain the identity of files imported before the BLAKE3 transition.
 	imported bool
 }
 
-// uploadedMsg represents a successfully uploaded message
+// uploadedMsg is a message read and parsed from the maildir, on its way to S3 and the
+// database.
 type uploadedMsg struct {
 	msg      msgInfo
 	content  []byte
@@ -123,6 +123,7 @@ type messageMetadata struct {
 	references           []string
 	bodyStructure        *imap.BodyStructure
 	recipients           []helpers.Recipient
+	headerPresence       *int16
 	flags                []imap.Flag
 	preservedUID         *uint32
 	preservedUIDValidity *uint32
@@ -149,6 +150,9 @@ type Importer struct {
 	// user is the account the import is for. Run looks it up once (lookupAccount),
 	// before it scans or uploads anything, and every step uses it from there.
 	user *server.User
+
+	// databaseUUID is the primary database identity, resolved once before recovery/import.
+	databaseUUID string
 
 	totalMessages    int64
 	importedMessages int64
@@ -240,17 +244,11 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 
 	if !columnExists {
 		logger.Info("Migrating SQLite database: adding s3_uploaded columns")
-		// DEFAULT 0 must match the fresh schema above: a column default added here is
-		// permanent for this database file, and scanMaildir inserts newly discovered
-		// files without naming s3_uploaded. A default of 1 would make every file found
-		// by a later scan born "already uploaded", invisible to the import (which
-		// selects WHERE s3_uploaded = 0) and to orphan recovery, which runs before the
-		// scan. Pre-existing rows are marked below instead, once.
-		// All three statements commit together. Splitting the column default from the
-		// backfill means a crash between them is not resumable: the next run sees the
-		// column present, skips this whole block, and every legacy row stays at the new
-		// default of 0 forever - re-importing the entire maildir on every subsequent run.
-		// SQLite runs DDL inside transactions, so one transaction covers the lot.
+		// Keep the compatibility columns' default at zero for newly scanned files.
+		// Pre-existing rows are marked once so recovery can verify their destination;
+		// only the per-destination completion ledger is authoritative thereafter.
+		// Commit the columns and legacy backfill together so an interrupted upgrade
+		// does not strand an existing cache between those states.
 		migrationTx, err := sqliteDB.Begin()
 		if err != nil {
 			return nil, fmt.Errorf("failed to begin SQLite migration: %w", err)
@@ -277,6 +275,36 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		}
 
 		logger.Info("SQLite database migration completed successfully - all existing messages marked as uploaded")
+	}
+
+	// Older importer builds recorded only this database-local numeric account ID.
+	// Keep the column readable, but never treat it as a destination identity.
+	var hasAccountID bool
+	if err := sqliteDB.QueryRow(`SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'account_id'`).Scan(&hasAccountID); err != nil {
+		return nil, fmt.Errorf("failed to check for account_id column: %w", err)
+	}
+	if !hasAccountID {
+		if _, err := sqliteDB.Exec(`ALTER TABLE messages ADD COLUMN account_id INTEGER`); err != nil {
+			return nil, fmt.Errorf("failed to add account_id column: %w", err)
+		}
+	}
+	// Histories are independent: importing A -> B -> A must still remember mail
+	// deliberately deleted from A. Exported/legacy cache rows have no such proof.
+	if _, err := sqliteDB.Exec(`CREATE TABLE IF NOT EXISTS import_completions (
+		database_uuid TEXT NOT NULL,
+		account_id INTEGER NOT NULL,
+		hash TEXT NOT NULL,
+		mailbox TEXT NOT NULL,
+		completed_at TIMESTAMP NOT NULL,
+		PRIMARY KEY (database_uuid, account_id, hash, mailbox)
+	)`); err != nil {
+		return nil, fmt.Errorf("failed to create import completion ledger: %w", err)
+	}
+
+	// The rare legacy-SHA path asks whether any destination completed this exact
+	// copy. Keep that lookup indexed independently of the destination-leading PK.
+	if _, err := sqliteDB.Exec(`CREATE INDEX IF NOT EXISTS idx_import_completion_copy ON import_completions(hash, mailbox)`); err != nil {
+		return nil, fmt.Errorf("failed to index import completion copies: %w", err)
 	}
 
 	// Create index after migration (idempotent operation)
@@ -378,92 +406,6 @@ func (i *Importer) finish(runErr error) {
 // PostgreSQL per round trip during orphan recovery.
 const recoveryHashBatchSize = 500
 
-// recoverOrphanedSQLiteState checks for messages marked as uploaded in SQLite
-// but not actually present in PostgreSQL. This can happen if:
-// 1. PostgreSQL commit failed after SQLite update (rare but possible)
-// 2. Previous import was interrupted between SQLite update and PG commit
-//
-// Recovery: Reset s3_uploaded=0 for messages not found in PostgreSQL
-func (i *Importer) recoverOrphanedSQLiteState() error {
-	accountID := i.user.AccountID()
-
-	// Query SQLite for ALL messages marked as uploaded. Any row left marked
-	// uploaded is skipped forever by incremental imports, so the check must not
-	// be bounded. The cursor is drained before touching PostgreSQL because the
-	// SQLite pool holds a single connection.
-	rows, err := i.sqliteDB.Query("SELECT hash FROM messages WHERE s3_uploaded = 1")
-	if err != nil {
-		return fmt.Errorf("failed to query SQLite: %w", err)
-	}
-
-	var uploadedHashes []string
-	for rows.Next() {
-		var hash string
-		if err := rows.Scan(&hash); err != nil {
-			continue
-		}
-		uploadedHashes = append(uploadedHashes, hash)
-	}
-	rows.Close() // CRITICAL: Close rows to release SQLite connection
-
-	// Check existence in PostgreSQL in batches (one round trip per batch)
-	var orphanedHashes []string
-	for start := 0; start < len(uploadedHashes); start += recoveryHashBatchSize {
-		end := start + recoveryHashBatchSize
-		if end > len(uploadedHashes) {
-			end = len(uploadedHashes)
-		}
-		chunk := uploadedHashes[start:end]
-
-		var missing []string
-		err = i.rdb.QueryRowWithRetry(i.ctx, `
-			SELECT COALESCE(ARRAY_AGG(h), '{}')
-			FROM UNNEST($2::text[]) AS h
-			WHERE NOT EXISTS (
-				SELECT 1 FROM messages
-				WHERE account_id = $1 AND content_hash = h AND expunged_at IS NULL
-			)`, accountID, chunk).Scan(&missing)
-
-		if err != nil {
-			logger.Warn("Failed to check message existence", "count", len(chunk), "error", err)
-			continue
-		}
-
-		orphanedHashes = append(orphanedHashes, missing...)
-	}
-
-	if len(orphanedHashes) > 0 {
-		logger.Info("Found orphaned SQLite state, resetting", "count", len(orphanedHashes))
-
-		// Reset s3_uploaded for orphaned messages
-		tx, err := i.sqliteDB.Begin()
-		if err != nil {
-			return fmt.Errorf("failed to begin recovery transaction: %w", err)
-		}
-		defer tx.Rollback()
-
-		stmt, err := tx.Prepare("UPDATE messages SET s3_uploaded = 0, s3_uploaded_at = NULL WHERE hash = ?")
-		if err != nil {
-			return fmt.Errorf("failed to prepare recovery statement: %w", err)
-		}
-		defer stmt.Close()
-
-		for _, hash := range orphanedHashes {
-			if _, err := stmt.Exec(hash); err != nil {
-				logger.Warn("Failed to reset orphaned hash", "hash", shortHash(hash), "error", err)
-			}
-		}
-
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("failed to commit recovery transaction: %w", err)
-		}
-
-		logger.Info("Successfully recovered orphaned SQLite state", "recovered", len(orphanedHashes))
-	}
-
-	return nil
-}
-
 // Run starts the import process.
 func (i *Importer) Run() (err error) {
 	defer func() {
@@ -481,11 +423,11 @@ func (i *Importer) Run() (err error) {
 		return err
 	}
 
-	// Recovery: Check for messages marked in SQLite but not in PostgreSQL
-	// This can happen if PostgreSQL commit failed after SQLite update
+	// Resolve the primary destination identity and recover the cache before any
+	// scan, subscription/script write, upload or message insert. An unchecked
+	// completion mark must never silently hide a message in an incremental run.
 	if err := i.recoverOrphanedSQLiteState(); err != nil {
-		logger.Warn("Failed to recover orphaned SQLite state", "error", err)
-		// Non-fatal - continue with import
+		return fmt.Errorf("failed to recover import cache: %w", err)
 	}
 
 	// Process Dovecot subscriptions if Dovecot mode is enabled
@@ -531,14 +473,17 @@ func (i *Importer) Run() (err error) {
 	// Count messages based on mode
 	var totalCount, alreadyOnS3 int64
 	if i.options.Incremental {
-		// Incremental mode: count only NEW (not yet on S3) messages in SQLite database
-		countErr := i.sqliteDB.QueryRow("SELECT COUNT(*) FROM messages WHERE s3_uploaded = 0").Scan(&totalCount)
+		// Eligibility is destination-specific even when two imports share this cache.
+		countErr := i.sqliteDB.QueryRow("SELECT COUNT(*) FROM messages m WHERE NOT "+destinationCompletedSQL,
+			i.databaseUUID, i.user.AccountID()).Scan(&totalCount)
 		if countErr != nil {
 			return fmt.Errorf("failed to count messages in database: %w", countErr)
 		}
 
-		// Also count messages already on S3 for logging
-		i.sqliteDB.QueryRow("SELECT COUNT(*) FROM messages WHERE s3_uploaded = 1").Scan(&alreadyOnS3)
+		if err := i.sqliteDB.QueryRow("SELECT COUNT(*) FROM messages m WHERE "+destinationCompletedSQL,
+			i.databaseUUID, i.user.AccountID()).Scan(&alreadyOnS3); err != nil {
+			return fmt.Errorf("failed to count completed messages: %w", err)
+		}
 
 		// Set totalMessages to the actual count in database
 		atomic.StoreInt64(&i.totalMessages, totalCount)
@@ -849,17 +794,16 @@ func (i *Importer) performDryRun() error {
 
 	user := i.user
 
-	// Query the SQLite database for messages
-	var query string
+	// The ledger, rather than another destination's compatibility projection,
+	// determines which messages this incremental preview includes.
+	query := "SELECT path, filename, hash, size, mailbox FROM messages m"
+	var args []any
 	if i.options.Incremental {
-		// Incremental mode: only show messages not yet uploaded
-		query = "SELECT path, filename, hash, size, mailbox FROM messages WHERE s3_uploaded = 0 ORDER BY mailbox, path"
-	} else {
-		// Non-incremental mode: show all messages
-		query = "SELECT path, filename, hash, size, mailbox FROM messages ORDER BY mailbox, path"
+		query += " WHERE NOT " + destinationCompletedSQL
+		args = []any{i.databaseUUID, user.AccountID()}
 	}
-
-	rows, err := i.sqliteDB.Query(query)
+	query += " ORDER BY mailbox, path"
+	rows, err := i.sqliteDB.QueryContext(i.ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("failed to query messages from sqlite: %w", err)
 	}
@@ -925,7 +869,7 @@ func (i *Importer) performDryRun() error {
 
 		// Check if message already exists in Sora
 		var alreadyExists bool
-		if mailboxID != 0 && !i.options.ForceReimport {
+		if mailboxID != 0 {
 			if alreadyExists, err = i.isMessageAlreadyImported(hash, mailboxID); err != nil {
 				return fmt.Errorf("dry run: %s in %s: %w", filename, mailbox, err)
 			}
@@ -935,16 +879,9 @@ func (i *Importer) performDryRun() error {
 		reason := "new message"
 
 		if alreadyExists {
-			if i.options.ForceReimport {
-				action = "REIMPORT"
-				reason = "force reimport enabled"
-			} else {
-				action = "SKIP"
-				reason = "already exists in Sora"
-				mailboxWouldSkip++
-				totalWouldSkip++
-				continue
-			}
+			mailboxWouldSkip++
+			totalWouldSkip++
+			continue
 		}
 
 		mailboxWouldImport++
@@ -2441,21 +2378,24 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		references:           references,
 		bodyStructure:        &bodyStructure,
 		recipients:           recipients,
+		headerPresence:       helpers.ExtractHeaderPresence(messageContent.Header),
 		flags:                flags,
 		preservedUID:         preservedUID,
 		preservedUIDValidity: preservedUIDValidity,
 	}, nil
 }
 
-// uploadBatchToS3 uploads messages to S3 in parallel using a worker pool
-func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
+// readBatch reads and parses the batch's files in parallel using a worker pool. It
+// writes nothing: the hash a body is stored under is final only once its bytes are
+// read, and processBatch locks the bodies by those hashes before it writes any.
+func (i *Importer) readBatch(batch []msgInfo) []uploadedMsg {
 	var (
-		uploaded []uploadedMsg
-		mu       sync.Mutex
-		wg       sync.WaitGroup
+		read []uploadedMsg
+		mu   sync.Mutex
+		wg   sync.WaitGroup
 	)
 
-	// Use semaphore to limit concurrent uploads
+	// Use semaphore to limit concurrent reads
 	sem := make(chan struct{}, i.jobs) // Reuse jobs config
 
 	for _, msg := range batch {
@@ -2471,6 +2411,15 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 			case <-i.ctx.Done():
 				return
 			default:
+			}
+
+			// --delay waits before each message, independently in each worker.
+			if i.options.ImportDelay > 0 {
+				select {
+				case <-i.ctx.Done():
+					return
+				case <-time.After(i.options.ImportDelay):
+				}
 			}
 
 			// Read the message, decompressed if Dovecot stored the file compressed.
@@ -2518,19 +2467,27 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 			// content. That hash is kept, so the batch insert recognises the row the
 			// earlier run inserted (its duplicate check is on message_id and content_hash)
 			// instead of importing the message a second time under the new hash.
-			if got := helpers.HashContent(content); got != msg.hash &&
-				!(msg.imported && msg.hash == legacyImportHash(content)) {
-				logger.Warn("File content changed since the scan; using its current hash",
-					"path", msg.path, "scanned_hash", msg.hash, "current_hash", got)
-				if _, uerr := i.sqliteDB.Exec("UPDATE messages SET hash = ?, size = ?, s3_uploaded = 0 WHERE path = ? AND mailbox = ?",
-					got, len(content), msg.path, msg.mailbox); uerr != nil {
-					logger.Warn("Failed to update the cached hash", "path", msg.path, "error", uerr)
-					i.recordFailedPath(msg.path, fmt.Sprintf("content changed since scan and the cache could not be updated: %v", uerr))
+			if got := helpers.HashContent(content); got != msg.hash {
+				keepLegacy, err := i.keepLegacyImportIdentity(msg, content)
+				if err != nil {
+					logger.Warn("Failed to verify the cached legacy identity", "path", msg.path, "error", err)
+					i.recordFailedPath(msg.path, fmt.Sprintf("legacy identity verification failed: %v", err))
 					atomic.AddInt64(&i.failedMessages, 1)
 					return
 				}
-				msg.hash = got
-				msg.size = int64(len(content))
+				if !keepLegacy {
+					logger.Warn("File content changed since the scan; using its current hash",
+						"path", msg.path, "scanned_hash", msg.hash, "current_hash", got)
+					if _, uerr := i.sqliteDB.Exec("UPDATE messages SET hash = ?, size = ?, s3_uploaded = 0 WHERE path = ? AND mailbox = ?",
+						got, len(content), msg.path, msg.mailbox); uerr != nil {
+						logger.Warn("Failed to update the cached hash", "path", msg.path, "error", uerr)
+						i.recordFailedPath(msg.path, fmt.Sprintf("content changed since scan and the cache could not be updated: %v", uerr))
+						atomic.AddInt64(&i.failedMessages, 1)
+						return
+					}
+					msg.hash = got
+					msg.size = int64(len(content))
+				}
 			}
 
 			// Check for cancellation after I/O
@@ -2549,35 +2506,77 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 				return
 			}
 
+			mu.Lock()
+			read = append(read, uploadedMsg{
+				msg:      msg,
+				content:  content,
+				metadata: metadata,
+			})
+			mu.Unlock()
+		}(msg)
+	}
+
+	wg.Wait()
+	return read
+}
+
+// uploadBatchToS3 uploads the read messages to S3 in parallel using a worker pool and
+// returns the ones stored (in test mode, which stores nothing, all of them). It runs
+// under the bodies' S3 object locks, and ctx is cancelled if they are lost.
+func (i *Importer) uploadBatchToS3(ctx context.Context, read []uploadedMsg) []uploadedMsg {
+	var (
+		uploaded []uploadedMsg
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+	)
+
+	// Use semaphore to limit concurrent uploads
+	sem := make(chan struct{}, i.jobs) // Reuse jobs config
+
+	for _, up := range read {
+		wg.Add(1)
+		sem <- struct{}{} // Acquire
+
+		go func(up uploadedMsg) {
+			defer wg.Done()
+			defer func() { <-sem }() // Release
+
 			// Check for cancellation before S3 upload
 			select {
-			case <-i.ctx.Done():
+			case <-ctx.Done():
 				return
 			default:
 			}
 
 			// Upload to S3 (FileBasedS3Mock now has proper locking for directory creation)
 			if !i.options.TestMode && i.s3 != nil {
-				s3Key := helpers.NewS3Key(metadata.domain, metadata.localpart, msg.hash)
+				s3Key := helpers.NewS3Key(up.metadata.domain, up.metadata.localpart, up.msg.hash)
 
 				var s3Err error
 				maxRetries := 3
 				backoff := 500 * time.Millisecond
 				for attempt := 1; attempt <= maxRetries; attempt++ {
 					if attempt > 1 {
-						time.Sleep(backoff)
+						select {
+						case <-time.After(backoff):
+						case <-ctx.Done():
+							return
+						}
 						backoff *= 2
-						logger.Info("Retrying S3 upload", "path", msg.path, "attempt", attempt)
+						logger.Info("Retrying S3 upload", "path", up.msg.path, "attempt", attempt)
 					}
-					s3Err = i.s3.Put(s3Key, bytes.NewReader(content), int64(len(content)))
+					s3Err = putStoredBody(ctx, i.s3, s3Key, bytes.NewReader(up.content), int64(len(up.content)))
+					if ctx.Err() != nil {
+						return
+					}
 					if s3Err == nil {
 						break
 					}
 				}
 
 				if s3Err != nil {
-					logger.Warn("S3 upload failed after retries", "path", msg.path, "error", s3Err)
-					i.recordFailedPath(msg.path, fmt.Sprintf("s3 upload error: %v", s3Err))
+					logger.Warn("S3 upload failed after retries", "path", up.msg.path, "error", s3Err)
+					i.recordFailedPath(up.msg.path, fmt.Sprintf("s3 upload error: %v", s3Err))
 					atomic.AddInt64(&i.failedMessages, 1)
 					return
 				}
@@ -2585,13 +2584,9 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 
 			// Success - add to uploaded list
 			mu.Lock()
-			uploaded = append(uploaded, uploadedMsg{
-				msg:      msg,
-				content:  content,
-				metadata: metadata,
-			})
+			uploaded = append(uploaded, up)
 			mu.Unlock()
-		}(msg)
+		}(up)
 	}
 
 	wg.Wait()
@@ -2604,10 +2599,8 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 // It returns an error only when the import is interrupted (i.ctx cancelled): it then
 // stops and returns the messages committed before the interrupt along with the
 // error, and leaves the rest uncounted.
-func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, error) {
+func (i *Importer) insertBatchToDB(ctx context.Context, uploaded []uploadedMsg) (inserted, present []markedMessage, err error) {
 	user := i.user
-
-	var successHashes []markedMessage
 
 	// Group messages by mailbox to take advantage of batch inserts
 	type groupedMsg struct {
@@ -2620,10 +2613,10 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 
 	for _, up := range uploaded {
 		// Get/create mailbox (cached)
-		mailbox, err := i.getOrCreateMailbox(i.ctx, user.AccountID(), up.msg.mailbox)
+		mailbox, err := i.getOrCreateMailbox(ctx, user.AccountID(), up.msg.mailbox)
 		if err != nil {
-			if i.ctx.Err() != nil {
-				return nil, err // interrupted; nothing is stored yet
+			if ctx.Err() != nil {
+				return nil, nil, err // interrupted; nothing is stored yet
 			}
 			logger.Error("Failed to get or create mailbox", "mailbox", up.msg.mailbox, "error", err)
 			i.recordFailedPath(up.msg.path, fmt.Sprintf("mailbox error: %v", err))
@@ -2650,6 +2643,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 			References:           up.metadata.references,
 			BodyStructure:        up.metadata.bodyStructure,
 			Recipients:           up.metadata.recipients,
+			HeaderPresence:       up.metadata.headerPresence,
 			PreservedUID:         up.metadata.preservedUID,
 			PreservedUIDValidity: up.metadata.preservedUIDValidity,
 			FTSRetention:         i.options.FTSRetention,
@@ -2676,12 +2670,12 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 				opts = append(opts, gm.opt)
 			}
 
-			_, _, insertedHashesBatch, err := i.rdb.InsertMessagesFromImporterBatchWithRetry(i.ctx, opts)
+			_, _, insertedHashesBatch, err := i.rdb.InsertMessagesFromImporterBatchWithRetry(ctx, opts)
 			if err != nil {
-				if i.ctx.Err() != nil {
+				if ctx.Err() != nil {
 					// Interrupted: inserting the chunk message by message on the
 					// cancelled context would only fail each one.
-					return successHashes, err
+					return inserted, present, err
 				}
 				{
 					// The batch failed as a whole — a unique violation the dedup did not
@@ -2692,10 +2686,10 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 					// by path instead of writing off the chunk.
 					logger.Info("Batch insert failed, falling back to individual inserts", "mailbox_id", opts[0].MailboxID, "chunk_size", len(chunk), "error", err)
 					for _, gm := range chunk {
-						_, _, indErr := i.rdb.InsertMessageFromImporterWithRetry(i.ctx, gm.opt)
+						_, _, indErr := i.rdb.InsertMessageFromImporterWithRetry(ctx, gm.opt)
 						if indErr != nil {
-							if i.ctx.Err() != nil {
-								return successHashes, indErr // interrupted
+							if ctx.Err() != nil {
+								return inserted, present, indErr // interrupted
 							}
 							if errors.Is(indErr, consts.ErrUIDConflict) {
 								// The preserved UID is already taken in the target mailbox: the
@@ -2706,6 +2700,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 								continue
 							}
 							if errors.Is(indErr, consts.ErrDBUniqueViolation) {
+								present = append(present, markedMessage{hash: gm.hash, mailbox: mailboxName})
 								atomic.AddInt64(&i.skippedMessages, 1)
 								continue
 							}
@@ -2714,27 +2709,27 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 							atomic.AddInt64(&i.failedMessages, 1)
 							continue
 						}
-						successHashes = append(successHashes, markedMessage{hash: gm.hash, mailbox: mailboxName})
+						inserted = append(inserted, markedMessage{hash: gm.hash, mailbox: mailboxName})
 					}
 					continue
 				}
 			}
 
-			// Add successfully inserted hashes to successHashes, tagged with the mailbox
-			// this group belongs to so the cache row for this copy is the one marked.
+			wasInserted := make(map[string]bool, len(insertedHashesBatch))
 			for _, hash := range insertedHashesBatch {
-				successHashes = append(successHashes, markedMessage{hash: hash, mailbox: mailboxName})
+				wasInserted[hash] = true
+				inserted = append(inserted, markedMessage{hash: hash, mailbox: mailboxName})
 			}
-
-			// Calculate skipped messages (deduplicated by the database)
-			skipped := len(chunk) - len(insertedHashesBatch)
-			if skipped > 0 {
-				atomic.AddInt64(&i.skippedMessages, int64(skipped))
+			for _, gm := range chunk {
+				if !wasInserted[gm.hash] {
+					present = append(present, markedMessage{hash: gm.hash, mailbox: mailboxName})
+					atomic.AddInt64(&i.skippedMessages, 1)
+				}
 			}
 		}
 	}
 
-	return successHashes, nil
+	return inserted, present, nil
 }
 
 // uidConflictReason is the failure reason of a message whose preserved UID the
@@ -2756,13 +2751,13 @@ func (e *batchUIDConflictError) Unwrap() error { return e.err }
 
 // insertBatchToDBWithTransaction inserts all uploaded messages in a SINGLE transaction
 // This is faster (20x) but less resilient - if one message fails, entire batch rolls back
-func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]markedMessage, error) {
+func (i *Importer) insertBatchToDBWithTransaction(ctx context.Context, uploaded []uploadedMsg) ([]markedMessage, error) {
 	user := i.user
 
-	var successHashes []markedMessage
+	var successHashes, present []markedMessage
 
 	// Begin a single transaction for the entire batch
-	tx, err := i.rdb.BeginTxWithRetry(i.ctx, pgx.TxOptions{})
+	tx, err := i.rdb.BeginTxWithRetry(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -2784,13 +2779,13 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 	// Process all messages in this single transaction
 	for _, up := range uploaded {
 		// Get/create mailbox (cached)
-		mailbox, err := i.getOrCreateMailbox(i.ctx, user.AccountID(), up.msg.mailbox)
+		mailbox, err := i.getOrCreateMailbox(ctx, user.AccountID(), up.msg.mailbox)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get or create mailbox '%s': %w", up.msg.mailbox, err)
 		}
 
 		// Insert using the transaction handle (no retry wrapper - transaction handles atomicity)
-		_, _, err = database.InsertMessageFromImporter(i.ctx, tx, &db.InsertMessageOptions{
+		_, _, err = database.InsertMessageFromImporter(ctx, tx, &db.InsertMessageOptions{
 			AccountID:            user.AccountID(),
 			MailboxID:            mailbox.ID,
 			S3Domain:             user.Domain(),
@@ -2809,6 +2804,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 			References:           up.metadata.references,
 			BodyStructure:        up.metadata.bodyStructure,
 			Recipients:           up.metadata.recipients,
+			HeaderPresence:       up.metadata.headerPresence,
 			PreservedUID:         up.metadata.preservedUID,
 			PreservedUIDValidity: up.metadata.preservedUIDValidity,
 			FTSRetention:         i.options.FTSRetention,
@@ -2825,7 +2821,8 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 				return nil, &batchUIDConflictError{path: up.msg.path, err: err}
 			}
 			if errors.Is(err, consts.ErrDBUniqueViolation) {
-				// Message already exists - skip but continue processing batch
+				// Message already exists - remember completion after this transaction commits.
+				present = append(present, markedMessage{hash: up.msg.hash, mailbox: up.msg.mailbox})
 				skipped++
 				continue
 			}
@@ -2844,7 +2841,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 	}
 
 	// Commit the PostgreSQL transaction first
-	if err := tx.Commit(i.ctx); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("failed to commit batch transaction: %w", err)
 	}
 
@@ -2852,7 +2849,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 	// If SQLite update fails, we have messages in PG but not marked in cache
 	// This is safe: next run will try to re-import, S3 upload is idempotent,
 	// and PG insert will return ErrDBUniqueViolation (we skip and continue)
-	if err := i.markBatchInSQLite(successHashes); err != nil {
+	if err := i.markBatchInSQLite(append(append([]markedMessage(nil), successHashes...), present...)); err != nil {
 		// PostgreSQL already committed - we can't rollback
 		// Log the error and try to delete from PostgreSQL to maintain consistency
 		logger.Error("Failed to update SQLite cache after PG commit - attempting rollback compensation",
@@ -2975,12 +2972,11 @@ func (i *Importer) markRowsInSQLite(ctx context.Context, marked []markedMessage)
 	}
 	defer tx.Rollback()
 
-	// Scoped to (hash, mailbox): s3_uploaded is what an incremental import filters
-	// on, so marking by hash alone would hide every other mailbox's copy of this
-	// content from the next run even though it was never imported.
+	// The projection and ledger use the exact (hash, mailbox) cache identity.
+	// A completion in one folder cannot hide an unimported copy in another.
 	stmt, err := tx.PrepareContext(ctx, `
 		UPDATE messages
-		SET s3_uploaded = 1, s3_uploaded_at = ?
+		SET s3_uploaded = 1, s3_uploaded_at = ?, account_id = ?
 		WHERE hash = ? AND mailbox = ?
 	`)
 	if err != nil {
@@ -2989,10 +2985,22 @@ func (i *Importer) markRowsInSQLite(ctx context.Context, marked []markedMessage)
 	defer stmt.Close()
 
 	now := time.Now()
+	var accountID any
+	if i.user != nil {
+		accountID = i.user.AccountID()
+	}
 	for _, m := range marked {
-		if _, err := stmt.ExecContext(ctx, now, m.hash, m.mailbox); err != nil {
+		if _, err := stmt.ExecContext(ctx, now, accountID, m.hash, m.mailbox); err != nil {
 			return fmt.Errorf("failed to update SQLite for hash %s in %s: %w",
 				shortHash(m.hash), m.mailbox, err)
+		}
+		if i.databaseUUID != "" && i.user != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO import_completions
+				(database_uuid, account_id, hash, mailbox, completed_at)
+				SELECT ?, ?, hash, mailbox, ? FROM messages WHERE hash = ? AND mailbox = ?`,
+				i.databaseUUID, i.user.AccountID(), now, m.hash, m.mailbox); err != nil {
+				return fmt.Errorf("failed to record import completion: %w", err)
+			}
 		}
 	}
 
@@ -3002,14 +3010,83 @@ func (i *Importer) markRowsInSQLite(ctx context.Context, marked []markedMessage)
 	return nil
 }
 
-// processBatch processes a batch of messages with sequential S3 uploads
-// and transactional DB inserts
+// processBatch reads a batch, uploads bodies under shared global hash locks, and
+// carries the holder capability into each actual uploaded-state write transaction.
+// Each transaction verifies an overlap with the original holder and retains its own
+// locks through commit; the outer connection alone cannot fence a later SQL commit.
+// Existing per-message versus batch commit and SQLite completion semantics remain.
 func (i *Importer) processBatch(batch []msgInfo) error {
 	logger.Info("Processing batch", "size", len(batch),
 		"progress", i.getProgressPrefix())
 
-	// Phase 1: Sequential S3 uploads (no DB state modified yet)
-	uploaded := i.uploadBatchToS3(batch)
+	// Phase 1: Read and parse the files (nothing is written yet)
+	read := i.readBatch(batch)
+	if len(read) == 0 {
+		logger.Warn("No message in batch could be read")
+		// readBatch already recorded real read failures; an interrupt remains pending.
+		if err := i.ctx.Err(); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	stored, err := i.withBodiesLocked(read, func(ctx context.Context) error {
+		return i.storeBatch(ctx, batch, read)
+	})
+	if err != nil && !stored {
+		// Nothing of the batch was stored.
+		logger.Error("Batch not stored", "error", err)
+		for _, up := range read {
+			i.recordFailedPath(up.msg.path, err.Error())
+		}
+		atomic.AddInt64(&i.failedMessages, int64(len(read)))
+	}
+	return err
+}
+
+// writePoolLockedJobs returns how many of jobs database's write pool can run at once when
+// each holds one of its connections for S3 object locks (ExecuteWithSharedS3ObjectLocks)
+// and needs a second one for the rows it commits under them, as the imports do: jobs
+// whose locks held every connection would each wait for a second one until its write
+// timeout failed it. It fails when the pool cannot run a single job.
+func writePoolLockedJobs(database *db.Database, jobs int) (int, error) {
+	if database == nil {
+		return jobs, nil
+	} // in-memory test/custom database double
+	poolSize := int(database.GetWritePool().Stat().MaxConns())
+	if poolSize < 2 {
+		return 0, fmt.Errorf("import requires at least 2 write-pool connections; configure database.write.max_connections >= 2 (got %d)", poolSize)
+	}
+	return max(1, min(jobs, poolSize/2)), nil
+}
+
+// withBodiesLocked runs fn while the S3 object locks of read's bodies are held in shared
+// mode (see processBatch), and reports whether fn ran. When it did not, nothing was
+// stored.
+func (i *Importer) withBodiesLocked(read []uploadedMsg, fn func(ctx context.Context) error) (ran bool, err error) {
+	if i.user == nil {
+		return false, fmt.Errorf("import user has not been initialized")
+	}
+	accountID := i.user.AccountID()
+	hashes := make([]string, len(read))
+	for k, up := range read {
+		hashes[k] = up.msg.hash
+	}
+	err = i.rdb.ExecuteWithSharedS3ObjectLocks(i.ctx, accountID, hashes, func(ctx context.Context) error {
+		ran = true
+		return fn(ctx)
+	})
+	if err != nil && !ran {
+		return false, fmt.Errorf("failed to lock the message bodies: %w", err)
+	}
+	return ran, err
+}
+
+// storeBatch uploads the read messages' bodies to S3 and inserts their rows, under the
+// bodies' S3 object locks; ctx is cancelled if they are lost.
+func (i *Importer) storeBatch(ctx context.Context, batch []msgInfo, read []uploadedMsg) error {
+	// Phase 2: Parallel S3 uploads (no DB state modified yet)
+	uploaded := i.uploadBatchToS3(ctx, read)
 
 	logger.Info("Upload phase complete", "uploaded", len(uploaded), "batch_size", len(batch))
 
@@ -3030,7 +3107,7 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 
 	logger.Info("Starting DB insert phase", "count", len(uploaded))
 
-	// Phase 2: DB inserts (strategy depends on BatchTransactionMode flag)
+	// Phase 3: DB inserts (strategy depends on BatchTransactionMode flag)
 	var successHashes []markedMessage
 	var err error
 
@@ -3038,19 +3115,20 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 		// One PostgreSQL transaction covers the batch. SQLite marks follow its commit;
 		// a mark failure invokes best-effort PostgreSQL compensation.
 		logger.Info("Using batch transaction mode")
-		successHashes, err = i.insertBatchToDBWithTransaction(uploaded)
+		successHashes, err = i.insertBatchToDBWithTransaction(ctx, uploaded)
 	} else {
 		// Safe path: Individual transactions per message (more resilient)
 		// Need to update SQLite after since each message commits individually
 		logger.Info("Using individual transaction mode")
 		// insertBatchToDB fails only on an interrupt, and successHashes then holds
 		// the messages committed before it: they are marked like any others.
-		successHashes, err = i.insertBatchToDB(uploaded)
-		logger.Info("DB inserts complete, marking in SQLite", "count", len(successHashes))
+		var present []markedMessage
+		successHashes, present, err = i.insertBatchToDB(ctx, uploaded)
+		logger.Info("DB inserts complete, marking in SQLite", "count", len(successHashes)+len(present))
 
-		// Phase 3: Mark successful messages in SQLite cache
+		// Phase 4: Mark successful messages in SQLite cache
 		// For safe mode, this happens AFTER individual commits
-		if err := i.markBatchInSQLite(successHashes); err != nil {
+		if err := i.markBatchInSQLite(append(append([]markedMessage(nil), successHashes...), present...)); err != nil {
 			// FATAL: If SQLite update fails, messages will be re-imported
 			logger.Error("Failed to update SQLite cache - messages may be re-imported on retry", "error", err)
 			atomic.AddInt64(&i.failedMessages, int64(len(successHashes)))
@@ -3168,21 +3246,25 @@ func (i *Importer) importMessages() error {
 		return nil
 	}
 
+	// One connection holds admission locks; inserts need another.
+	if database := i.rdb.GetOperationalDatabase(); database != nil {
+		if _, err := writePoolLockedJobs(database, 1); err != nil {
+			return err
+		}
+	}
 	// Initialize mailbox cache
 	i.mailboxCache = make(map[string]*db.DBMailbox)
 
-	// Read ALL messages into memory first, then close the cursor
-	// This prevents holding the SQLite connection while processing batches
-	var query string
+	// Drain the SQLite cursor before processing batches. Both the selection
+	// and the legacy-hash flag use this destination's ledger, not s3_uploaded.
+	query := "SELECT path, filename, hash, size, mailbox, " + destinationCompletedSQL + " FROM messages m"
+	args := []any{i.databaseUUID, i.user.AccountID()}
 	if i.options.Incremental {
-		// Incremental mode: only load messages not yet uploaded
-		query = `SELECT path, filename, hash, size, mailbox, COALESCE(s3_uploaded, 0) = 1 FROM messages WHERE s3_uploaded = 0 ORDER BY mailbox, path`
-	} else {
-		// Non-incremental mode: load all messages
-		query = `SELECT path, filename, hash, size, mailbox, COALESCE(s3_uploaded, 0) = 1 FROM messages ORDER BY mailbox, path`
+		query += " WHERE NOT " + destinationCompletedSQL
+		args = append(args, i.databaseUUID, i.user.AccountID())
 	}
-
-	rows, err := i.sqliteDB.Query(query)
+	query += " ORDER BY mailbox, path"
+	rows, err := i.sqliteDB.QueryContext(i.ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("failed to query messages: %w", err)
 	}
@@ -3213,6 +3295,7 @@ func (i *Importer) importMessages() error {
 
 	// Now process in batches without holding the SQLite connection
 	batch := make([]msgInfo, 0, i.batchSize)
+	var firstBatchErr error
 
 	for _, msg := range allMessages {
 		// Check for cancellation
@@ -3230,6 +3313,9 @@ func (i *Importer) importMessages() error {
 		if len(batch) >= i.batchSize {
 			if err := i.processBatch(batch); err != nil && i.ctx.Err() == nil {
 				logger.Warn("Batch processing had errors", "error", err)
+				if firstBatchErr == nil {
+					firstBatchErr = err
+				}
 			}
 			batch = batch[:0] // Reset batch
 		}
@@ -3239,6 +3325,9 @@ func (i *Importer) importMessages() error {
 	if len(batch) > 0 {
 		if err := i.processBatch(batch); err != nil && i.ctx.Err() == nil {
 			logger.Warn("Final batch had errors", "error", err)
+			if firstBatchErr == nil {
+				firstBatchErr = err
+			}
 		}
 	}
 
@@ -3247,6 +3336,12 @@ func (i *Importer) importMessages() error {
 	if err := i.ctx.Err(); err != nil {
 		logger.Info("Import cancelled by user")
 		return err
+	}
+
+	// Counted message failures keep Run's existing summary. A holder failure after
+	// otherwise counted completion must still give the command a nonzero outcome.
+	if firstBatchErr != nil && atomic.LoadInt64(&i.failedMessages) == 0 {
+		return firstBatchErr
 	}
 
 	return nil

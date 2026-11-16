@@ -1069,6 +1069,21 @@ metadata file and a `<id>.msg` body in one of `pending/`, `processing/` or `fail
 `--queue` is `pending`, `processing` or `failed`. `--confirm` does not prompt; without it,
 `delete` and `requeue` refuse.
 
+Requeue, deletion, worker claims and recovery share a per-message lease on Unix
+(Linux/macOS), backed by the spool filesystem's advisory locks. A live message is
+reported busy; file age does not override its lease. Upgrade every server and admin
+binary using a spool before relying on this coordination: older binaries ignore
+these locks. Keep the spool on a filesystem supporting these locks and directory
+fsync; do not manipulate its files while the worker is running.
+
+A durable journal records whether an interrupted requeue should be rolled back or
+published and whether delivery or an operator discard has completed. Recovery
+checks each restore step and keeps failed recovery evidence for another attempt.
+Old `.requeuing-*` pairs without a journal are retained and reported for manual
+inspection; an empty queue cannot establish that they were never sent. SMTP/HTTP
+remains at least once: a relay can accept mail before a crash prevents Sora from
+recording local completion, so that boundary can still cause a retry.
+
 ---
 
 ## 21. tls
@@ -1089,28 +1104,44 @@ defaults to `[tls.letsencrypt] fallback_dir`, or `/var/lib/sora/certs`.
 Notes on `delete`:
 
 - Give exactly one of `--domain` and `--key`.
-- `--key` takes the full S3 key as `tls list --details` shows it (`autocert/cert-...`). A value
-  that is not a key in the bucket, or one ending in `...`, is treated as a prefix; it must match
-  exactly one key. A key that exists is deleted even when it is also the prefix of another key.
-- `--domain` deletes both the ECDSA and the RSA certificate of the domain, from S3 and from the
-  local mirror.
-- `--key` leaves the local mirror alone.
+- `--key` takes the full S3 key as `tls list --details` shows it (`autocert/cert-...`). An
+  abbreviated key must match exactly one active certificate. Internal state and ACME account/
+  challenge keys are not certificate-selection candidates.
+- `--domain` fences both ECDSA and RSA names, including an absent variant, and conditionally
+  removes the inspected local files. A concurrent local renewal is kept. `--key` leaves this
+  host's local mirror alone.
+- Deletion is a conditional PUT of a key-free generation barrier at the canonical S3 key, not
+  a physical name DELETE. Queued and in-flight publishers retain their original generation;
+  fingerprints also reject older previously published entries after a replacement is deleted.
+  A genuinely new issuance can publish in the new generation. Keep the barriers: a bucket
+  lifecycle rule, old binary or manual restore must not erase them.
+- All bucket/local-directory writers must be quiesced and upgraded before this protocol is
+  used. There is no mixed-version detection. Known local outage copies and already-loaded
+  `autocert` memory may continue serving until successful fence sync/local cleanup and the
+  necessary process restart; restart alone during an outage is not a revocation guarantee.
+  This does not revoke a certificate at the CA or erase quarantine/backups/private-key copies.
 
 Notes on `clean`:
 
-- A node can renew an expired certificate while `clean` runs, after `clean` has read the
-  expired one. On a bucket that keeps versions (Backblaze B2 buckets always do), `clean`
-  deletes only the version it read and found expired, so the renewal, a newer version, stays.
-  If deleting that version brings back an older one that has expired too, `clean` deletes that
-  one as well. This needs the right to delete object versions: `s3:DeleteObjectVersion` on
-  AWS, the `deleteFiles` capability on Backblaze B2.
-- Without a usable version id, including a `null` version exposed after a version delete,
-  `clean` sends the inspected object's ETag in `If-Match`. A changed object is kept.
-  This requires conditional DELETE support from the S3 provider; a missing ETag or an
-  unsupported condition fails that cleanup operation and keeps the object. `clean` never
-  retries it as an unconditional delete. Versioned B2 objects continue to use version ids.
-- A local copy is removed only if it still holds an expired certificate when `clean` removes
-  it. A renewal written over it during the run stays.
+- `clean` replaces only the inspected expired current object, using its specific ETag in
+  `If-Match`. A concurrent replacement is kept. It leaves a key-free same-generation vacancy,
+  so a valid node-local outage renewal can still publish. Expired retry snapshots cannot fill
+  that vacancy. Missing/wildcard ETags or unsupported conditional PUTs fail the operation;
+  there is no unconditional fallback.
+- With usable immutable version IDs, cleanup records retryable intent in the state footer,
+  then lists historical versions and deletes only those proved expired. The current latest
+  version, key-free state versions, valid renewals and mutable `null` versions are kept.
+  This needs `s3:ListBucketVersions` and `s3:DeleteObjectVersion` on AWS, or equivalent provider
+  permissions. Failure preserves the intent for a later `clean`. A retry may finish historical
+  cleanup before a following run processes a newly expired current certificate.
+- Local cleanup holds the shared entry lease and removes only the inspected expired bytes.
+  A valid replacement written during cleanup remains. Unknown legacy shared provenance is
+  not repaired merely by cleaning expiry: establish a new explicit deletion barrier after
+  upgrading all writers if the command reports an ambiguous legacy deletion marker.
+- State/lock/quarantine files use private `.sora-*` names and are excluded from replay/serving.
+  Quarantine retains unproven private-key copies for operator recovery and has no automatic
+  expiry; delete/clean do not claim to remove these copies. See [TLS.md](TLS.md) for cutover
+  and in-memory cache limits.
 
 `cache` writes a new certificate with mode `0600` and a replacement with the mode of the file
 it replaces. When the directory belongs to another user, as the server's directory does when

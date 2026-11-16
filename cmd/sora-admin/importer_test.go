@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -86,6 +87,13 @@ func (m *mockResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Co
 
 // --- Unused methods for this test, but required by the interface ---
 
+func (m *mockResilientDatabase) GetDatabaseIdentityWithRetry(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return "4a6ea2d2-8d86-4fba-a4e9-c00f11122101", nil
+}
+
 func (m *mockResilientDatabase) GetAccountIDByAddressWithRetry(ctx context.Context, address string) (int64, error) {
 	return 1, nil
 }
@@ -145,6 +153,10 @@ func (m *mockResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions 
 func (m *mockResilientDatabase) GetOperationalDatabase() *db.Database {
 	// For tests, we don't need the actual database
 	return nil
+}
+func (m *mockResilientDatabase) ExecuteWithSharedS3ObjectLocks(ctx context.Context, accountID int64, contentHashes []string, executionFunc func(ctx context.Context) error) error {
+	// No deleter runs against the mock, so there is nothing to wait for.
+	return executionFunc(ctx)
 }
 
 func (m *mockResilientDatabase) resetCounters() {
@@ -424,6 +436,9 @@ func (m *mockTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, 
 	return nil, errors.New("not implemented")
 }
 func (m *mockTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "current_setting('transaction_isolation')") {
+		return scriptedBatchRow{scan: func(dest ...any) error { *dest[0].(*string) = "read committed"; *dest[1].(*bool) = false; return nil }}
+	}
 	return &mockRow{}
 }
 func (m *mockTx) Conn() *pgx.Conn {

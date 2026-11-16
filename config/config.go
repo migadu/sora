@@ -272,16 +272,18 @@ func (d *DatabaseConfig) GetFetchChunkSize() int {
 
 // S3Config holds S3 configuration.
 type S3Config struct {
-	Endpoint      string `toml:"endpoint"`
-	DisableTLS    bool   `toml:"disable_tls"`
-	Region        string `toml:"region"`                   // Signing region (default: AWS_REGION or the shared AWS config, else "us-east-1")
-	AccessKey     string `toml:"access_key" secret:"true"` // Without both keys the AWS default credential chain is used
-	SecretKey     string `toml:"secret_key" secret:"true"`
-	Bucket        string `toml:"bucket"`
-	Debug         bool   `toml:"debug"`   // Enable detailed S3 request/response tracing
-	Timeout       string `toml:"timeout"` // Timeout for individual S3 operations (default: 30s)
-	Encrypt       bool   `toml:"encrypt"`
-	EncryptionKey string `toml:"encryption_key" secret:"true"`
+	// BodyDeletionProtocol enables destructive message-body work only after the documented fleet drain.
+	BodyDeletionProtocol string `toml:"body_deletion_protocol"`
+	Endpoint             string `toml:"endpoint"`
+	DisableTLS           bool   `toml:"disable_tls"`
+	Region               string `toml:"region"`                   // Signing region (default: AWS_REGION or the shared AWS config, else "us-east-1")
+	AccessKey            string `toml:"access_key" secret:"true"` // Without both keys the AWS default credential chain is used
+	SecretKey            string `toml:"secret_key" secret:"true"`
+	Bucket               string `toml:"bucket"`
+	Debug                bool   `toml:"debug"`   // Enable detailed S3 request/response tracing
+	Timeout              string `toml:"timeout"` // Timeout for individual S3 operations (default: 30s)
+	Encrypt              bool   `toml:"encrypt"`
+	EncryptionKey        string `toml:"encryption_key" secret:"true"`
 }
 
 // GetDebug returns the debug flag
@@ -303,6 +305,9 @@ func (s *S3Config) GetTimeout() (time.Duration, error) {
 // Without access_key and secret_key the AWS default credential chain supplies them, which
 // only connecting can check.
 func (s *S3Config) Validate() error {
+	if err := s.ValidateBodyDeletionProtocol(); err != nil {
+		return err
+	}
 	if s.Bucket == "" {
 		return errors.New("bucket is required for mail services (IMAP, LMTP, POP3) and for the User API to serve message bodies")
 	}
@@ -1361,16 +1366,17 @@ type RemoteLookupConfig struct {
 	AuthToken string `toml:"auth_token" secret:"true"` // Bearer token for HTTP authentication (optional)
 
 	// Backend connection settings
-	LookupLocalUsers       bool   `toml:"lookup_local_users"`        // Check local DB when remote returns 404/3xx (for split user scenarios)
-	UserNotFoundResponse   string `toml:"user_not_found_response"`   // LMTP response when user not found: "reject" (550), "tempfail" (450) - default: "reject"
-	RemoteTLS              bool   `toml:"remote_tls"`                // Use TLS for backend connections
-	RemoteTLSUseStartTLS   bool   `toml:"remote_tls_use_starttls"`   // Use STARTTLS for backend connections (requires remote_tls)
-	RemoteTLSVerify        *bool  `toml:"remote_tls_verify"`         // Verify backend TLS certificate
-	RemotePort             any    `toml:"remote_port"`               // Default port for routed backends if not in address
-	RemoteUseProxyProtocol bool   `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
-	RemoteUseIDCommand     bool   `toml:"remote_use_id_command"`     // Use IMAP ID command (IMAP only)
-	RemoteUseXCLIENT       bool   `toml:"remote_use_xclient"`        // Use XCLIENT command (POP3/LMTP)
-	RemoteUseUTF8          bool   `toml:"remote_use_utf8"`           // Lookup-routed backends support POP3 UTF8/RFC 6856 (mirror client's pre-auth UTF8 to them). Keep false for Dovecot backends. (POP3 only)
+	LookupLocalUsers                      bool   `toml:"lookup_local_users"`                         // Check local DB when remote returns 404/3xx (for split user scenarios)
+	UserNotFoundResponse                  string `toml:"user_not_found_response"`                    // LMTP response when user not found: "reject" (550), "tempfail" (450) - default: "reject"
+	RemoteTLS                             bool   `toml:"remote_tls"`                                 // Use TLS for backend connections
+	RemoteTLSUseStartTLS                  bool   `toml:"remote_tls_use_starttls"`                    // Use STARTTLS for backend connections (requires remote_tls)
+	RemoteTLSVerify                       *bool  `toml:"remote_tls_verify"`                          // Verify backend TLS certificate
+	RemotePort                            any    `toml:"remote_port"`                                // Default port for routed backends if not in address
+	RemoteUseProxyProtocol                bool   `toml:"remote_use_proxy_protocol"`                  // Use PROXY protocol for backend connections
+	RemoteUseIDCommand                    bool   `toml:"remote_use_id_command"`                      // Use IMAP ID command (IMAP only)
+	RemoteSkipForwardingWithProxyProtocol bool   `toml:"remote_skip_forwarding_with_proxy_protocol"` // Explicitly omit ID/XCLIENT only when this leg sends PROXY (IMAP/POP3).
+	RemoteUseXCLIENT                      bool   `toml:"remote_use_xclient"`                         // Use XCLIENT command (POP3/LMTP)
+	RemoteUseUTF8                         bool   `toml:"remote_use_utf8"`                            // Lookup-routed backends support POP3 UTF8/RFC 6856 (mirror client's pre-auth UTF8 to them). Keep false for Dovecot backends. (POP3 only)
 
 	// RestrictToPool, when true, refuses a backend address returned by the remote-lookup
 	// API unless it is in the configured pool (remote_addrs); routing then falls back to
@@ -1724,20 +1730,21 @@ type ServerConfig struct {
 	SupportedExtensions []string `toml:"supported_extensions,omitempty"` // managesieve_proxy only: supported names replace the default advertised SIEVE set; if none remain after filtering, the default set is used. A managesieve server uses [sieve] enabled_extensions.
 
 	// Proxy specific
-	RemoteAddrs            []string `toml:"remote_addrs,omitempty"`
-	RemotePort             any      `toml:"remote_port,omitempty"` // Default port for backends if not in address
-	RemoteTLS              bool     `toml:"remote_tls,omitempty"`
-	RemoteTLSUseStartTLS   bool     `toml:"remote_tls_use_starttls,omitempty"` // Use STARTTLS for backend connections
-	RemoteTLSVerify        bool     `toml:"remote_tls_verify,omitempty"`
-	RemoteTLSCAFile        string   `toml:"remote_tls_ca_file,omitempty"` // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
-	RemoteUseProxyProtocol bool     `toml:"remote_use_proxy_protocol,omitempty"`
-	RemoteUseIDCommand     bool     `toml:"remote_use_id_command,omitempty"`
-	RemoteUseXCLIENT       bool     `toml:"remote_use_xclient,omitempty"`
-	RemoteUseUTF8          bool     `toml:"remote_use_utf8,omitempty"` // POP3 proxy only: advertise UTF8/LANG in pre-auth CAPA and mirror UTF8 to pool backends. Enable ONLY when every backend is sora: classic Outlook sends UTF8 post-auth when advertised, and non-sora backends reject it fatally (0x800CCC90).
-	ConnectTimeout         string   `toml:"connect_timeout,omitempty"`
-	AuthIdleTimeout        string   `toml:"auth_idle_timeout,omitempty"`
-	EnableAffinity         bool     `toml:"enable_affinity,omitempty"`
-	RemoteHealthChecks     *bool    `toml:"remote_health_checks,omitempty"` // Enable backend health checking (default: true)
+	RemoteAddrs                           []string `toml:"remote_addrs,omitempty"`
+	RemotePort                            any      `toml:"remote_port,omitempty"` // Default port for backends if not in address
+	RemoteTLS                             bool     `toml:"remote_tls,omitempty"`
+	RemoteTLSUseStartTLS                  bool     `toml:"remote_tls_use_starttls,omitempty"` // Use STARTTLS for backend connections
+	RemoteTLSVerify                       bool     `toml:"remote_tls_verify,omitempty"`
+	RemoteTLSCAFile                       string   `toml:"remote_tls_ca_file,omitempty"` // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
+	RemoteUseProxyProtocol                bool     `toml:"remote_use_proxy_protocol,omitempty"`
+	RemoteUseIDCommand                    bool     `toml:"remote_use_id_command,omitempty"`
+	RemoteSkipForwardingWithProxyProtocol bool     `toml:"remote_skip_forwarding_with_proxy_protocol"` // Explicitly omit ID/XCLIENT only when this leg sends PROXY (IMAP/POP3).
+	RemoteUseXCLIENT                      bool     `toml:"remote_use_xclient,omitempty"`
+	RemoteUseUTF8                         bool     `toml:"remote_use_utf8,omitempty"` // POP3 proxy only: advertise UTF8/LANG in pre-auth CAPA and mirror UTF8 to pool backends. Enable ONLY when every backend is sora: classic Outlook sends UTF8 post-auth when advertised, and non-sora backends reject it fatally (0x800CCC90).
+	ConnectTimeout                        string   `toml:"connect_timeout,omitempty"`
+	AuthIdleTimeout                       string   `toml:"auth_idle_timeout,omitempty"`
+	EnableAffinity                        bool     `toml:"enable_affinity,omitempty"`
+	RemoteHealthChecks                    *bool    `toml:"remote_health_checks,omitempty"` // Enable backend health checking (default: true)
 	// RemoteDNSRefresh is how often the proxy re-resolves the hostnames in remote_addrs,
 	// so a backend that changes address (rolling replacement, container reschedule, DNS
 	// failover) is picked up without a restart. Empty = 5m. "0" pins the pool to the
@@ -3451,6 +3458,7 @@ var serverTypeKeys = []struct {
 	{"remote_health_checks", func(s *ServerConfig) bool { return s.RemoteHealthChecks != nil }, proxyServerTypes},
 	{"enable_affinity", func(s *ServerConfig) bool { return s.EnableAffinity }, proxyServerTypes},
 	{"remote_use_id_command", func(s *ServerConfig) bool { return s.RemoteUseIDCommand }, []string{"imap_proxy"}},
+	{"remote_skip_forwarding_with_proxy_protocol", func(s *ServerConfig) bool { return s.RemoteSkipForwardingWithProxyProtocol }, []string{"imap_proxy", "pop3_proxy"}},
 	{"remote_use_xclient", func(s *ServerConfig) bool { return s.RemoteUseXCLIENT }, []string{"pop3_proxy", "lmtp_proxy"}},
 	{"remote_use_utf8", func(s *ServerConfig) bool { return s.RemoteUseUTF8 }, []string{"pop3_proxy"}},
 	// Size limits, and the Sieve extensions the ManageSieve proxy advertises (a
@@ -3505,12 +3513,15 @@ var serverTableKeys = []struct {
 	{"remote_lookup.remote_tls_verify", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteTLSVerify != nil }, proxyServerTypes, lineProxyServerTypes},
 	{"remote_lookup.remote_use_proxy_protocol", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseProxyProtocol }, proxyServerTypes, lineProxyServerTypes},
 	{"remote_lookup.remote_use_id_command", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseIDCommand }, proxyServerTypes, []string{"imap_proxy"}},
+	{"remote_lookup.remote_skip_forwarding_with_proxy_protocol", func(s *ServerConfig) bool {
+		return s.RemoteLookup != nil && s.RemoteLookup.RemoteSkipForwardingWithProxyProtocol
+	}, proxyServerTypes, []string{"imap_proxy", "pop3_proxy"}},
 	{"remote_lookup.remote_use_xclient", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseXCLIENT }, proxyServerTypes, []string{"pop3_proxy", "lmtp_proxy"}},
 	{"remote_lookup.remote_use_utf8", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseUTF8 }, proxyServerTypes, []string{"pop3_proxy"}},
 	// These route-only proxies check no passwords, so have none to revalidate.
 	{"lookup_cache.positive_revalidation_window", func(s *ServerConfig) bool {
 		return s.LookupCache != nil && s.LookupCache.positiveRevalidationWindowSet
-	}, lookupCacheServerTypes, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "http_user_api"}},
+	}, lookupCacheServerTypes, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}},
 }
 
 // serverTypeKeyNotes ends the warning about a serverTypeKeys or serverTableKeys key
@@ -3533,7 +3544,7 @@ var (
 	loginServerTypes       = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
 	proxyServerTypes       = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
 	lineProxyServerTypes   = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}
-	lookupCacheServerTypes = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_user_api", "user_api_proxy"}
+	lookupCacheServerTypes = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
 	listenerServerTypes    = []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_admin_api", "http_user_api", "user_api_proxy"}
 )
 

@@ -32,6 +32,7 @@ import (
 // authenticates the backend, then hijacks the raw client socket and relays
 // bytes bidirectionally.
 type Session struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server                *Server
 	settings              *reloadableSettings     // the settings its protocol server was built with (see reloadableSettings)
 	msConn                *managesieveserver.Conn // library connection (Hijack seam)
@@ -251,6 +252,9 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 }
 
 func (s *Session) authenticateUserWithAuthzID(authzID, username, password string, authStart time.Time) (retErr error) {
+	s.authSessionGeneration = s.server.connTracker.SessionGeneration()
+	cacheGeneration := s.server.lookupCache.Generation()
+
 	defer func() {
 		if retErr != nil {
 			s.submittedUsername = ""
@@ -583,7 +587,7 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 						IsNegative:     false,
 					}
 					proxy.CacheRoute(entry, routingInfo) // the route, its settings, FromRemoteLookup
-					s.server.lookupCache.Set(s.server.name, username, entry)
+					s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, entry)
 				}
 
 				method := "remotelookup"
@@ -630,7 +634,7 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 
 				// Cache negative result (wrong password)
 				if s.server.lookupCache != nil {
-					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 						PasswordDigest: lookupcache.NewPasswordDigest(password),
 						Result:         lookupcache.AuthFailed,
 						IsNegative:     true,
@@ -668,7 +672,7 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 						db.DummyVerifyPassword(password)
 					}
 					if s.server.lookupCache != nil {
-						s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+						s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 							PasswordDigest: lookupcache.NewPasswordDigest(password),
 							Result:         lookupcache.AuthUserNotFound,
 							IsNegative:     true,
@@ -755,7 +759,7 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 
 			if isDefinitiveFailure {
 				if s.server.lookupCache != nil {
-					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 						PasswordDigest: lookupcache.NewPasswordDigest(password),
 						Result:         lookupcache.AuthFailed,
 						IsNegative:     true,
@@ -777,7 +781,7 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 
 	// Cache successful authentication (main DB)
 	if s.server.lookupCache != nil {
-		s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+		s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 			AccountID:        accountID,
 			PasswordDigest:   lookupcache.NewPasswordDigest(password),
 			ServerAddress:    "", // Will be populated by affinity/routing in next connection
@@ -1384,7 +1388,7 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 	}
 
 	// Register for kick notifications
-	kickChan := s.server.connTracker.RegisterSession(s.accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(s.accountID, s.authSessionGeneration)
 	defer s.server.connTracker.UnregisterSession(s.accountID, kickChan)
 
 	for {
