@@ -92,13 +92,19 @@ func TestCleanupFailedUploadsSparesAPendingUploadReArmedMidStatement(t *testing.
 				`UPDATE messages SET created_at = now() - interval '25 hours' WHERE content_hash = $1`, contentHash)
 			require.NoError(t, err)
 
-			// Second delivery on the live node re-arms the row and holds its lock.
+			// Second delivery on the live node re-arms the row and holds its lock. It goes
+			// to another mailbox: the cleaner locks the mailbox of a message it reaps
+			// before judging it, so a delivery into the same mailbox would make it wait
+			// before its snapshot and then spare the first delivery, whose upload is live
+			// again.
+			otherMailboxName := mailboxName + "_other"
+			otherMailboxID := createTestMailbox(t, db, accountID, otherMailboxName)
 			deliveryTx, err := db.GetWritePool().Begin(ctx)
 			require.NoError(t, err)
 			defer deliveryTx.Rollback(context.Background())
 			var deliveryPID int
 			require.NoError(t, deliveryTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&deliveryPID))
-			insertDeliveredMessageTx(t, db, deliveryTx, accountID, mailboxID, mailboxName, contentHash, liveInstance, 2)
+			insertDeliveredMessageTx(t, db, deliveryTx, accountID, otherMailboxID, otherMailboxName, contentHash, liveInstance, 2)
 
 			// The cleaner starts while the delivery is open, so its snapshot still holds
 			// the dead row.
@@ -139,21 +145,21 @@ func TestCleanupFailedUploadsSparesAPendingUploadReArmedMidStatement(t *testing.
 			// outcome by this test's own rows.
 			t.Logf("CleanupFailedUploads reported %d message(s) deleted", res.cleaned)
 
-			var uids []int64
+			var mailboxes []int64
 			var uploaded []bool
 			rows, err := db.GetReadPool().Query(ctx,
-				`SELECT uid, uploaded FROM messages WHERE content_hash = $1 AND account_id = $2 ORDER BY uid`,
+				`SELECT mailbox_id, uploaded FROM messages WHERE content_hash = $1 AND account_id = $2 ORDER BY id`,
 				contentHash, accountID)
 			require.NoError(t, err)
 			for rows.Next() {
-				var uid int64
+				var mailbox int64
 				var up bool
-				require.NoError(t, rows.Scan(&uid, &up))
-				uids = append(uids, uid)
+				require.NoError(t, rows.Scan(&mailbox, &up))
+				mailboxes = append(mailboxes, mailbox)
 				uploaded = append(uploaded, up)
 			}
 			require.NoError(t, rows.Err())
-			require.Equal(t, []int64{2}, uids,
+			require.Equal(t, []int64{otherMailboxID}, mailboxes,
 				"precondition: the cleaner reaps the first delivery, judged dead from its snapshot, and not the second")
 			require.Equal(t, []bool{false}, uploaded, "the second delivery is staged on the live node, not uploaded yet")
 

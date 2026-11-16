@@ -40,8 +40,8 @@ func TestReloadConfig_DuringRequests(t *testing.T) {
 			r.Header.Set("Authorization", "Bearer wrong-key")
 			w := httptest.NewRecorder()
 			h.ServeHTTP(w, r)
-			if w.Code != http.StatusForbidden {
-				t.Fatalf("wrong API key: status %d, want 403", w.Code)
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("wrong API key: status %d, want 401", w.Code)
 			}
 		}
 	})
@@ -72,8 +72,8 @@ func TestReloadConfig_APIKey(t *testing.T) {
 	if got := status(keyB); got != http.StatusOK {
 		t.Errorf("reloaded api_key: status %d, want 200", got)
 	}
-	if got := status(keyA); got != http.StatusForbidden {
-		t.Errorf("replaced api_key: status %d, want 403", got)
+	if got := status(keyA); got != http.StatusUnauthorized {
+		t.Errorf("replaced api_key: status %d, want 401", got)
 	}
 
 	for _, weak := range []string{"short", "your-api-key-here"} {
@@ -82,7 +82,7 @@ func TestReloadConfig_APIKey(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "api_key") || strings.Contains(err.Error(), weak) {
 			t.Errorf("reloading api_key %q, which New refuses: error %v, want one naming api_key without its value", weak, err)
 		}
-		if got := status(weak); got != http.StatusForbidden {
+		if got := status(weak); got != http.StatusUnauthorized {
 			t.Errorf("api_key %q, which New refuses, was taken on reload: status %d", weak, got)
 		}
 		if got := status(keyB); got != http.StatusOK {

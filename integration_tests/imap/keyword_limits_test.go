@@ -379,10 +379,17 @@ func TestIMAP_KeywordCapStoreReturnsLimit(t *testing.T) {
 	assertLimitNo(t, err)
 
 	// The STORE must have applied nothing: the original keywords remain, the
-	// overflow keywords are absent, and the distinct count is unchanged.
+	// overflow keywords are absent, and the distinct keyword count is unchanged.
+	// System flags (the message is \Recent in this session) are not keywords.
 	got := flagSet(fetchFlags(t, c, uid))
-	if n := len(got); n != maxKw {
-		t.Errorf("rejected STORE must leave the message unchanged (%d keywords), got %d", maxKw, n)
+	keywords := 0
+	for f := range got {
+		if !strings.HasPrefix(f, `\`) {
+			keywords++
+		}
+	}
+	if keywords != maxKw {
+		t.Errorf("rejected STORE must leave the message unchanged (%d keywords), got %d", maxKw, keywords)
 	}
 	for _, kw := range existing {
 		if !got[strings.ToLower(string(kw))] {

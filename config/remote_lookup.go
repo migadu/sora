@@ -61,8 +61,9 @@ func (c *RemoteLookupConfig) Validate() error {
 // The template itself parsing is not enough: the client substitutes $email and $ip
 // with url.QueryEscape, so in the host they become %40 or %3A, which net/url refuses,
 // and every lookup would fail before a request is sent. Placeholders therefore belong
-// in the path and query, and sample request URLs are built the way the client builds
-// them (an IPv4, an IPv6 and no client IP) and parsed.
+// in the path and query. There the substituted values always parse: QueryEscape
+// leaves only unreserved characters, '+' and %XX escapes, none of which can end a
+// component or is refused outside the host.
 func validateRemoteLookupURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -79,11 +80,6 @@ func validateRemoteLookupURL(rawURL string) error {
 			return fmt.Errorf("invalid remote_lookup.url: %s is allowed only in the path and query, not in the host %q", placeholder, u.Host)
 		}
 	}
-	for _, clientIP := range []string{"192.0.2.1", "2001:db8::1", ""} {
-		if _, err := url.Parse(RemoteLookupRequestURL(rawURL, "user@example.com", clientIP, false)); err != nil {
-			return fmt.Errorf("invalid remote_lookup.url: lookup requests cannot be built: %w", MaskURLError(err))
-		}
-	}
 	if u.Scheme == "https" {
 		return nil
 	}
@@ -98,8 +94,6 @@ func validateRemoteLookupURL(rawURL string) error {
 // interpolating its placeholders:
 //   - $email: user email (MasterAddress - includes master token but not +detail)
 //   - $ip: client IP address; empty when the caller has none, never the literal placeholder
-//
-// validateRemoteLookupURL checks the template through this same function.
 func RemoteLookupRequestURL(template, email, clientIP string, routeOnly bool) string {
 	requestURL := strings.ReplaceAll(template, "$email", url.QueryEscape(email))
 	requestURL = strings.ReplaceAll(requestURL, "$ip", url.QueryEscape(clientIP))

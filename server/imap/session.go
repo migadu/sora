@@ -23,6 +23,7 @@ import (
 )
 
 type IMAPSession struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server.Session
 	*IMAPUser
 	server      *IMAPServer
@@ -51,7 +52,7 @@ type IMAPSession struct {
 	clientID       *imap.IDData
 	ja4Fingerprint string                                           // JA4 TLS fingerprint
 	ja4Conn        interface{ GetJA4Fingerprint() (string, error) } // Reference to JA4 conn if fingerprint not yet available
-	sessionCaps    atomic.Value                                     // imap.CapSet - per-session capabilities after filtering (lock-free access)
+	sessionCaps    atomic.Value                                     // imap.CapSet - per-session capabilities after filtering (lock-free access); never modified once stored
 
 	// Atomic counters for lock-free access
 	currentHighestModSeq atomic.Uint64
@@ -67,10 +68,16 @@ type IMAPSession struct {
 	// report then stays conservative until SELECT establishes a new baseline;
 	// enabling FlagChange again does not replay the consumed change.
 	reportedModSeqGap atomic.Bool
+	// queuedFlagUpdates records that the tracker holds a flag update queued
+	// while FlagChange was allowed, so draining it after NOTIFY suppresses
+	// FlagChange still marks reportedModSeqGap.
+	queuedFlagUpdates atomic.Bool
 
 	lastSelectedMailboxID int64
 	lastHighestUID        imap.UID
 	recentAboveUID        imap.UID    // Messages above this UID are \Recent in this session (RFC 3501 §2.3.2); set by SELECT
+	numRecent             uint32      // The RECENT count: messages above recentAboveUID in the server view (currentNumMessages); set by SELECT, moved by Poll
+	recentUnsent          atomic.Bool // Poll grew the mailbox or expunged a \Recent message and has not yet written the RECENT count that goes with that EXISTS or EXPUNGE
 	useMasterDB           atomic.Bool // Pin session to master DB after a write to ensure consistency
 	selectedReadOnly      atomic.Bool // True when the selected mailbox is read-only: opened with EXAMINE, or SELECTed without any of the 'iestw' rights
 	selectedExamined      atomic.Bool // True when the selected mailbox was opened with EXAMINE itself (RFC 9051 §6.3.3)
@@ -109,14 +116,10 @@ type IMAPSession struct {
 	// NOTIFY (RFC 5465) watch state. notifyMutex guards the pointer swap:
 	// SetNotify/Close write it on the command goroutine, NotifyPoll reads it
 	// on the pump goroutine (the library stops the pump before SetNotify
-	// runs, so the watch internals are only ever touched by one goroutine).
+	// runs, so the watch internals are only ever touched by one goroutine,
+	// except notifyWatch.own, which notifyMutex guards as well).
 	notifyMutex sync.Mutex
 	notifyWatch *notifyWatch
-
-	// idling is true while the client is in an IDLE command. The NOTIFY pump
-	// reads it to release SELECTED-DELAYED expunges, since IDLE is a delayed-
-	// expunge sync point (RFC 5465 §6.1.2).
-	idling atomic.Bool
 
 	// Memory tracking
 	memTracker *server.SessionMemoryTracker
@@ -139,6 +142,13 @@ func (s *IMAPSession) Context() context.Context {
 
 // GetCapabilities returns the effective capabilities for this session
 // If session-specific capabilities haven't been set, it returns the server's default capabilities
+//
+// The set is returned as stored, not copied, like the server's set below, and
+// callers must not modify it. No set is modified once stored in sessionCaps
+// (NewSession, applyCapabilityFilters and the lazy JA4 path below each store a
+// newly built one), so concurrent readers need no copy. Callers use it for a
+// Has check, go-imap once per MODSEQ item it writes, and a copy allocated a
+// map of the whole set for each (#1206).
 func (s *IMAPSession) GetCapabilities() imap.CapSet {
 
 	// If we have a pending JA4 connection, try to capture fingerprint now
@@ -161,15 +171,8 @@ func (s *IMAPSession) GetCapabilities() imap.CapSet {
 	}
 
 	// Atomic load - safe for concurrent access
-	// Return a copy to prevent concurrent modification issues
 	if capsVal := s.sessionCaps.Load(); capsVal != nil {
-		stored := capsVal.(imap.CapSet)
-		// Make a defensive copy - maps are reference types!
-		caps := make(imap.CapSet, len(stored))
-		for k, v := range stored {
-			caps[k] = v
-		}
-		return caps
+		return capsVal.(imap.CapSet)
 	}
 
 	// Fallback to server capabilities if not yet initialized
@@ -575,6 +578,8 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.currentHighestModSeq.Store(0)
 	s.reportedHighestModSeq.Store(0)
 	s.reportedModSeqGap.Store(false)
+	s.queuedFlagUpdates.Store(false)
+	s.recentUnsent.Store(false)
 	s.currentNumMessages.Store(0)
 	s.firstUnseenSeqNum.Store(0)
 	s.savedSearchUIDs = nil // saved "$" result is scoped to the selected mailbox
@@ -649,9 +654,11 @@ func (s *IMAPSession) triggerCacheWarmup() {
 	}
 }
 
-// registerConnection registers the connection in the connection tracker
-func (s *IMAPSession) registerConnection(email string) error {
-	if s.server.connTracker != nil && s.IMAPUser != nil {
+// registerConnection takes a slot for the logging-in account in the connection
+// tracker. It runs before s.IMAPUser / s.Session.User are set so a rejected
+// login leaves the session unauthenticated.
+func (s *IMAPSession) registerConnection(accountID int64, email string) error {
+	if s.server.connTracker != nil {
 		// Use configured database query timeout for connection tracking (database INSERT)
 		queryTimeout := s.server.rdb.GetQueryTimeout()
 		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
@@ -662,8 +669,8 @@ func (s *IMAPSession) registerConnection(email string) error {
 		// the PROXY header or a trusted proxy's ID forwarding.
 		clientAddr := s.RemoteIP
 
-		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "IMAP", clientAddr); err != nil {
-			s.InfoLog("connection registration rejected", "error", err)
+		if err := s.server.connTracker.RegisterConnection(ctx, accountID, email, "IMAP", clientAddr); err != nil {
+			s.InfoLog("connection registration rejected", "address", email, "error", err)
 			return err
 		}
 		s.trackedClientAddr = clientAddr
@@ -702,7 +709,7 @@ func (s *IMAPSession) startTerminationPoller() {
 	netConn := s.conn.NetConn()
 
 	// Register session for kick notifications and get a channel that closes on kick
-	kickChan := s.server.connTracker.RegisterSession(accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(accountID, s.authSessionGeneration)
 
 	go func() {
 		// Unregister when done

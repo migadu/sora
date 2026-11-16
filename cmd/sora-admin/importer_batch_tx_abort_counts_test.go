@@ -120,9 +120,10 @@ func (d *scriptedBatchTxDB) DeleteMessageByHashAndMailboxWithRetry(ctx context.C
 
 // TestBatchTxAbortCounts (#1004): when --batch-transaction (BatchTransactionMode)
 // aborts a batch, processBatch records and counts every uploaded message in that batch
-// as failed. Earlier per-message ErrUIDConflict failures and ErrDBUniqueViolation skips
-// inside insertBatchToDBWithTransaction must not be applied until tx.Commit and
-// markBatchInSQLite succeed, otherwise an abort double-counts them.
+// as failed. ErrDBUniqueViolation skips inside insertBatchToDBWithTransaction must not
+// be applied until tx.Commit and markBatchInSQLite succeed, otherwise an abort
+// double-counts them. An ErrUIDConflict ends the batch (the unique violation has
+// aborted the PostgreSQL transaction); its message keeps its own reason (#546).
 func TestBatchTxAbortCounts(t *testing.T) {
 	t.Run("UID conflict before batch abort is counted once", func(t *testing.T) {
 		maildirPath := newCleanupDBMaildir(t, 3)
@@ -158,6 +159,14 @@ func TestBatchTxAbortCounts(t *testing.T) {
 				filepath.Base(failed[1]),
 				filepath.Base(failed[2]),
 			})
+			// The conflict ends the transaction: the conflicting message keeps its own
+			// reason and the others are reported as rolled back because of it.
+			reasons := recordedFailedReasons(importer)
+			assert.Equal(t, uidConflictReason, reasons[1])
+			for _, k := range []int{0, 2} {
+				assert.True(t, strings.HasPrefix(reasons[k], "batch transaction aborted: preserved UID of "),
+					"%s: %s", filepath.Base(failed[k]), reasons[k])
+			}
 		}
 
 		imported, pending := uploadedCounts(t, maildirPath)
@@ -200,7 +209,7 @@ func TestBatchTxAbortCounts(t *testing.T) {
 			mockResilientDatabase: newMockResilientDatabase(),
 			outcomes: map[string]batchTxMsgOutcome{
 				"cleanup-1@example.com": batchTxDuplicate,
-				"cleanup-2@example.com": batchTxUIDConflict,
+				"cleanup-2@example.com": batchTxInsertOK,
 				"cleanup-3@example.com": batchTxInsertOK,
 			},
 			commitErr: pgx.ErrTxCommitRollback,
@@ -229,7 +238,7 @@ func TestBatchTxAbortCounts(t *testing.T) {
 			mockResilientDatabase: newMockResilientDatabase(),
 			outcomes: map[string]batchTxMsgOutcome{
 				"cleanup-1@example.com": batchTxDuplicate,
-				"cleanup-2@example.com": batchTxUIDConflict,
+				"cleanup-2@example.com": batchTxDuplicate,
 				"cleanup-3@example.com": batchTxInsertOK,
 			},
 		}
@@ -258,13 +267,15 @@ func TestBatchTxAbortCounts(t *testing.T) {
 		assert.Equal(t, 3, pending)
 	})
 
-	t.Run("committed batch records UID conflicts and skips once", func(t *testing.T) {
+	// PostgreSQL commits nothing after a UID conflict (the unique violation aborts the
+	// transaction), so only skips can sit next to a committed batch.
+	t.Run("committed batch records skips once", func(t *testing.T) {
 		maildirPath := newCleanupDBMaildir(t, 3)
 		rdb := &scriptedBatchTxDB{
 			mockResilientDatabase: newMockResilientDatabase(),
 			outcomes: map[string]batchTxMsgOutcome{
 				"cleanup-1@example.com": batchTxDuplicate,
-				"cleanup-2@example.com": batchTxUIDConflict,
+				"cleanup-2@example.com": batchTxInsertOK,
 				"cleanup-3@example.com": batchTxInsertOK,
 			},
 		}
@@ -272,21 +283,16 @@ func TestBatchTxAbortCounts(t *testing.T) {
 			BatchTransactionMode: true,
 		})
 
-		err := importer.Run()
-		require.Error(t, err)
-		assert.Equal(t, "import completed with 1 failed messages", err.Error())
+		require.NoError(t, importer.Run())
 		assert.Equal(t, int64(3), importer.totalMessages)
-		assert.Equal(t, int64(1), importer.importedMessages)
+		assert.Equal(t, int64(2), importer.importedMessages)
 		assert.Equal(t, int64(1), importer.skippedMessages)
-		assert.Equal(t, int64(1), importer.failedMessages)
-
-		failed := recordedFailedPaths(importer)
-		if assert.Len(t, failed, 1) {
-			assert.Equal(t, "1700000002.M2P1.host:2,S", filepath.Base(failed[0]))
-		}
+		assert.Zero(t, importer.failedMessages)
+		assert.Empty(t, recordedFailedPaths(importer))
 
 		imported, pending := uploadedCounts(t, maildirPath)
-		assert.Equal(t, 1, imported)
-		assert.Equal(t, 2, pending)
+		// Both newly inserted and duplicate-skipped copies are complete after commit.
+		assert.Equal(t, 3, imported)
+		assert.Equal(t, 0, pending)
 	})
 }

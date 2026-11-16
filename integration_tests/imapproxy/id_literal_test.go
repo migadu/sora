@@ -92,8 +92,11 @@ func TestIMAPProxyIDWithLiterals(t *testing.T) {
 			if strings.HasPrefix(l, "A2 OK") {
 				sawLoginOK = true
 			}
-			if strings.Contains(l, "Command not supported before authentication") ||
-				strings.Contains(l, "Command is missing") {
+			// Anything but an untagged reply, a continuation or a reply to
+			// A1/A2 is the proxy answering a literal payload line read
+			// back as a command, whatever the error wording.
+			if !strings.HasPrefix(l, "A1 ") && !strings.HasPrefix(l, "A2 ") &&
+				!strings.HasPrefix(l, "* ") && !strings.HasPrefix(l, "+") {
 				t.Fatalf("literal payload was read as a command: %v", lines)
 			}
 		}
@@ -149,12 +152,15 @@ func TestIMAPProxyIDWithLiterals(t *testing.T) {
 		reader := bufio.NewReader(conn)
 		reader.ReadString('\n') // greeting
 		conn.Write([]byte("A1 ID (\"name\" {999999+}\r\n"))
+		// The octets are in flight and the proxy will not read that many before
+		// authentication, so it ends the session (RFC 7888 sections 4 and 5)
+		// rather than read them as commands.
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		if !strings.HasPrefix(line, "A1 BAD") {
-			t.Fatalf("expected A1 BAD for oversized literal, got %q", line)
+		if !strings.HasPrefix(line, "* BYE [TOOBIG]") {
+			t.Fatalf("expected * BYE [TOOBIG] for oversized literal, got %q", line)
 		}
 	})
 }

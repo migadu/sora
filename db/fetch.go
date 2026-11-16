@@ -20,6 +20,7 @@ func BuildEnvelope(msg *Message) (*imap.Envelope, error) {
 	// THREAD use instead.
 	if !msg.NoDateHeader {
 		envelope.Date = msg.SentDate
+		envelope.DateUnknownZone = msg.SentDateUnknownZone && !msg.SentDate.IsZero()
 	}
 	envelope.Subject = msg.Subject
 	// RFC 9051 §7.5.2: an absent Message-ID is a NIL member, which go-imap writes for
@@ -110,6 +111,7 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 		return nil, err
 	}
 	msg.SentDate = sentDateInHeaderZone(msg.SentDate, sentUTCOffset)
+	msg.SentDateUnknownZone = sentUTCOffset == nil && !msg.NoDateHeader && !msg.SentDate.IsZero()
 
 	return BuildEnvelope(&msg)
 }

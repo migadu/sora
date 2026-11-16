@@ -29,9 +29,11 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/pkg/spamtraining"
+	"github.com/migadu/sora/pkg/sqlitefile"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/adminapi"
 	"github.com/migadu/sora/server/cleaner"
+	"github.com/migadu/sora/server/credchanges"
 	"github.com/migadu/sora/server/delivery"
 	"github.com/migadu/sora/server/fts"
 	"github.com/migadu/sora/server/imap"
@@ -143,6 +145,13 @@ type ConfigReloader interface {
 
 // registerServer tracks a running server for config reload
 func (deps *serverDependencies) registerServer(name string, server ConfigReloader) {
+	// New DB-backed caches cannot serve a verdict until the next successful
+	// revocation synchronization, including servers introduced by reload.
+	if deps.resilientDB != nil {
+		if holder, ok := server.(loginCacheHolder); ok {
+			holder.GetLookupCache().Suspend()
+		}
+	}
 	deps.runningServersMux.Lock()
 	defer deps.runningServersMux.Unlock()
 	if deps.runningServers == nil {
@@ -254,7 +263,7 @@ func main() {
 	db.SetBcryptCost(cfg.GetBcryptCost())
 
 	// Apply the configured Sieve script execution budget (also the per-match regex
-	// soft-wait cap). Clamped to a sane range inside the setter.
+	// large-input deadline). Clamped to a sane range inside the setter.
 	sieveengine.SetScriptExecutionTimeout(cfg.Sieve.GetMaxExecutionTime())
 
 	// Initialize logging (log/slog), flushing records held since logger.Hold.
@@ -265,7 +274,9 @@ func main() {
 	if logFile != nil {
 		defer func(f *logger.LogFile) {
 			logger.Sync() // Flush any buffered log entries
-			fmt.Fprintf(logger.Stderr(), "SORA: Closing log file %s\n", f.Name())
+			// A record, not a line through logger.Stderr(): that writes into the file
+			// too, and left a plain line in a JSON log file on every stop.
+			logger.Info("Closing log file", "path", f.Name())
 			if err := f.Close(); err != nil {
 				fmt.Fprintf(os.Stderr, "SORA: Error closing log file %s: %v\n", f.Name(), err)
 			}
@@ -423,7 +434,8 @@ var reloadableGlobalSettings = []string{
 // handleConfigReload reports the global settings next, the config a SIGHUP read,
 // changes from current, the running one, and leaves current as it is. Every one of
 // them takes effect on restart. Each server's [[server]] block is reloadServers' to
-// report, and its ReloadConfig's to apply.
+// apply. Whether a restart would start with next at all is this report's to say, for
+// the whole file, [[server]] blocks included.
 func handleConfigReload(current, next *config.Config) {
 	// Names only: values include passwords and keys.
 	if changed := current.RestartRequiredChanges(next, reloadableGlobalSettings); len(changed) > 0 {
@@ -431,25 +443,32 @@ func handleConfigReload(current, next *config.Config) {
 	}
 
 	// Every server and proxy takes trusted_networks at start-up: until a restart, the
-	// networks they started with stay trusted and added ones are not. A malformed entry
-	// is an error: the server would not start with this file.
-	if err := next.ValidateTrustedNetworks(); err != nil {
-		logger.Error("Config reload: servers.trusted_networks is invalid and the server will not start with this config; the networks the servers started with stay trusted", "error", err)
-	} else if !slices.Equal(next.Servers.TrustedNetworks, current.Servers.TrustedNetworks) {
+	// networks they started with stay trusted and added ones are not.
+	if !slices.Equal(next.Servers.TrustedNetworks, current.Servers.TrustedNetworks) {
 		logger.Warn("Config reload: servers.trusted_networks changed but requires restart to take effect; the networks the servers started with stay trusted until then",
 			"current", current.Servers.TrustedNetworks, "new", next.Servers.TrustedNetworks)
 	}
 
-	// The relay handler is built at start-up and keeps the [relay] it started with. One
-	// that start-up refuses is an error, not just a change: a restart would fail.
-	if err := next.Relay.Validate(); err != nil {
-		logger.Error("Config reload: [relay] is invalid and the server will not start with this config; the relay the server started with stays in use", "error", err)
+	// A file start-up refuses is an error, not just a change: the restart the notices
+	// above ask for would fail. These are the checks start-up and `sora-admin config
+	// validate` run, and each problem is reported, as start-up reports them.
+	for _, p := range next.Validate() {
+		logger.Error("Config reload: "+p.Section+" is invalid and the server will not start with this config", "error", p.Err)
 	}
-	// So is the relay worker with its [relay.queue] settings.
-	if next.Relay.IsQueueEnabled() {
-		if err := next.Relay.Queue.Validate(); err != nil {
-			logger.Error("Config reload: [relay.queue] is invalid and the server will not start with this config; the relay worker keeps the settings it started with", "error", err)
-		}
+	// session_memory_limit and max_message_size are both reloadable.
+	warnSessionMemoryShortfalls(next)
+}
+
+// warnSessionMemoryShortfalls warns about each imap and pop3 server of cfg that never
+// fetches some of the messages an lmtp server of cfg delivers: FETCH and RETR hold the
+// whole body in the session memory budget, and refuse one larger than the budget with
+// NO [LIMIT] and -ERR [SYS/PERM].
+func warnSessionMemoryShortfalls(cfg *config.Config) {
+	for _, s := range cfg.SessionMemoryShortfalls() {
+		logger.Warn("session_memory_limit is below the max_message_size of an lmtp server: a delivered message larger than session_memory_limit is stored, "+
+			"but this server can never fetch it (IMAP NO [LIMIT], POP3 -ERR [SYS/PERM]); sora-admin imports are bounded by [admin_cli] import_message_limit instead",
+			"server", s.Server, "type", s.Type, "session_memory_limit", s.SessionMemoryLimit,
+			"lmtp_server", s.LMTPServer, "max_message_size", s.MaxMessageSize)
 	}
 }
 
@@ -491,11 +510,20 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 	// The whole-file checks are the ones `sora-admin config validate` runs. Report every
 	// problem before exiting, so one restart attempt shows all that is left to fix.
 	if problems := cfg.Validate(); len(problems) > 0 {
+		// The file has been parsed, and Validate does not check [logging]: report the
+		// problems where it says (syslog, a log file, ...), after what start-up held, like
+		// every later start-up failure. Initialize falls back to stderr for an output it
+		// cannot open. A file that cannot be read has no [logging], so ConfigError above
+		// writes to stderr.
+		if _, err := logger.Initialize(cfg.Logging); err != nil {
+			fmt.Fprintf(logger.Stderr(), "SORA: Warning initializing logger: %v\n", err)
+		}
 		for _, p := range problems {
 			errorHandler.ValidationError(p.Section, p.Err)
 		}
 		os.Exit(errorHandler.WaitForExit())
 	}
+	warnSessionMemoryShortfalls(cfg)
 
 	// Surface the trusted_networks posture so operators notice the fail-closed default and
 	// the insecure-wide pattern. (security-audit M2)
@@ -616,8 +644,8 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	// Check the staging path before any uploader or cleanup worker starts.
 	if storageServicesNeeded {
 		// The default [uploader] path moved off /tmp. Before any worker starts, refuse to
-		// strand bodies a previous release staged at the old default.
-		if err := uploader.CheckLegacyStaging(cfg.Uploader.Path, config.DefaultUploaderPath, config.LegacyDefaultUploaderPath); err != nil {
+		// strand bodies a previous release staged at the old default, as this user.
+		if err := uploader.CheckLegacyStaging(cfg.Uploader.Path, config.DefaultUploaderPath, config.LegacyDefaultUploaderPath, os.Geteuid()); err != nil {
 			errorHandler.ValidationError("uploader path", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
@@ -678,10 +706,21 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		acMaxAge := cfg.AuthCache.GetMaxAgeWithDefault()
 		acPurgeUnused := cfg.AuthCache.GetPurgeUnusedWithDefault()
 		acCleanupInterval := cfg.AuthCache.GetCleanupIntervalWithDefault()
+		// Keep the configured persistent-cache lifetime within the feed retention.
+		// Startup provenance checks flush untracked/other-database rows; full-gap
+		// recovery flushes all local state before re-enabling hits.
+		if acMaxAge > credchanges.Retention {
+			logger.Warn("AuthCache: max_age capped to the retention of credential changes", "max_age", acMaxAge, "capped_to", credchanges.Retention)
+			acMaxAge = credchanges.Retention
+		}
 
-		// Ensure parent directory exists
-		if dir := filepath.Dir(acPath); dir != "" && dir != "." {
-			os.MkdirAll(dir, 0755)
+		// Ensure the database file's parent directory exists. For a file: URI that is the
+		// directory of the file the URI names, not filepath.Dir of the URI; a name that is
+		// not a file is refused by authcache.New.
+		if file, _, err := sqlitefile.Parse(acPath); err == nil && file != "" {
+			if dir := filepath.Dir(file); dir != "." {
+				os.MkdirAll(dir, 0755)
+			}
 		}
 
 		ac, err := authcache.New(acPath, acMaxAge, acPurgeUnused, acCleanupInterval)
@@ -690,6 +729,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		} else {
 			deps.authCacheInstance = ac
 			if deps.resilientDB != nil {
+				ac.Suspend()
 				deps.resilientDB.SetAuthCache(ac)
 			}
 			ac.StartCleanupLoop(ctx)
@@ -1042,13 +1082,20 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 	// Initialize cluster manager if enabled
 	if cfg.Cluster.Enabled {
-		logger.Info("Initializing cluster manager")
-		deps.clusterManager, err = cluster.New(cfg.Cluster)
-		if err != nil {
-			errorHandler.FatalError("initialize cluster manager", err)
-			os.Exit(errorHandler.WaitForExit())
+		// Open the persistent affinity store, if configured, before joining the cluster:
+		// the affinity manager writes every gossip event it applies to the store, and
+		// affinity gossip that arrives between the join and the manager's creation finds
+		// no handler and is dropped, so nothing slow may run there.
+		var affinityStore server.AffinityPersistStore
+		if cfg.Cluster.Affinity.Enabled && cfg.Cluster.Affinity.CachePath != "" {
+			store, err := affinitycache.New(cfg.Cluster.Affinity.CachePath)
+			if err != nil {
+				logger.Error("Failed to initialize affinity cache - continuing without persistence", "path", cfg.Cluster.Affinity.CachePath, "error", err)
+			} else {
+				affinityStore = store
+				logger.Info("Affinity cache initialized", "path", cfg.Cluster.Affinity.CachePath)
+			}
 		}
-		logger.Info("Cluster manager initialized", "node_id", deps.clusterManager.GetNodeID(), "members", deps.clusterManager.GetMemberCount(), "leader", deps.clusterManager.GetLeaderID())
 
 		affinityTTL, err := cfg.Cluster.Affinity.GetTTL()
 		if err != nil {
@@ -1062,19 +1109,13 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			affinityCleanup = 1 * time.Hour
 		}
 
-		// Open the persistent affinity store, if configured, before creating the affinity
-		// manager: the node has already joined the cluster, and every gossip event the
-		// manager applies, also while it loads the store, must be written to the store.
-		var affinityStore server.AffinityPersistStore
-		if cfg.Cluster.Affinity.Enabled && cfg.Cluster.Affinity.CachePath != "" {
-			store, err := affinitycache.New(cfg.Cluster.Affinity.CachePath)
-			if err != nil {
-				logger.Error("Failed to initialize affinity cache - continuing without persistence", "path", cfg.Cluster.Affinity.CachePath, "error", err)
-			} else {
-				affinityStore = store
-				logger.Info("Affinity cache initialized", "path", cfg.Cluster.Affinity.CachePath)
-			}
+		logger.Info("Initializing cluster manager")
+		deps.clusterManager, err = cluster.New(cfg.Cluster)
+		if err != nil {
+			errorHandler.FatalError("initialize cluster manager", err)
+			os.Exit(errorHandler.WaitForExit())
 		}
+		logger.Info("Cluster manager initialized", "node_id", deps.clusterManager.GetNodeID(), "members", deps.clusterManager.GetMemberCount(), "leader", deps.clusterManager.GetLeaderID())
 
 		// Initialize affinity manager for cluster-wide user-to-backend affinity. With
 		// [cluster.affinity] enabled = false there is none: proxies with enable_affinity
@@ -1155,6 +1196,9 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 	// the backend servers admit their sessions through deps.maintenanceGate.
 	deps.maintenance = startBackendMaintenance(ctx, deps)
 	startSessionsReport(ctx, deps)
+	// Before any server starts too: the persistent auth cache may hold a login that
+	// changed while this node was down.
+	startCredentialChanges(ctx, deps)
 
 	// Start HTTP-01 challenge server for Let's Encrypt if using autocert
 	if deps.tlsManager != nil {
@@ -1281,7 +1325,9 @@ func proxyTrackerInstanceID(clusterMgr *cluster.Manager, hostname, serverName st
 
 // startConnectionTrackerForProxy initializes and starts a connection tracker for a proxy server (with gossip).
 // Returns both the tracker and the map key to use for registration.
-func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, clusterMgr *cluster.Manager, clusterCfg *config.ClusterConfig, srv interface {
+// authCache, when not nil, is the node's persistent auth cache: a kick or forgotten
+// logins drop the account from it too.
+func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, clusterMgr *cluster.Manager, clusterCfg *config.ClusterConfig, authCache *authcache.Cache, srv interface {
 	SetConnectionTracker(*server.ConnectionTracker)
 }) (*server.ConnectionTracker, string) {
 	instanceID := proxyTrackerInstanceID(clusterMgr, hostname, serverName)
@@ -1341,6 +1387,9 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 
 	tracker := server.NewProxyConnectionTracker(protocol, serverName, hostname, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize, false)
 	if tracker != nil {
+		if authCache != nil {
+			tracker.SetAuthCache(authCache)
+		}
 		srv.SetConnectionTracker(tracker)
 	}
 
@@ -1920,7 +1969,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker, mapKey := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker, mapKey := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, deps.authCacheInstance, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
 		deps.connectionTrackers[mapKey] = tracker
@@ -2047,7 +2096,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker, mapKey := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker, mapKey := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, deps.authCacheInstance, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
 		deps.connectionTrackers[mapKey] = tracker
@@ -2174,7 +2223,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	}
 
 	// Start connection tracker if enabled.
-	if tracker, mapKey := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker, mapKey := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, deps.authCacheInstance, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
 		deps.connectionTrackers[mapKey] = tracker
@@ -2283,7 +2332,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker, mapKey := startConnectionTrackerForProxy("LMTP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker, mapKey := startConnectionTrackerForProxy("LMTP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, deps.authCacheInstance, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
 		deps.connectionTrackers[mapKey] = tracker
@@ -2490,6 +2539,7 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		ProxyProtocolTrustedProxies: deps.config.Servers.TrustedNetworks,
 		TrustedNetworks:             deps.config.Servers.TrustedNetworks,
 		SieveExtensions:             deps.config.Sieve.EnabledExtensions,
+		SharedMailboxes:             deps.config.SharedMailboxes,
 	}
 
 	srv, err := mailapi.New(deps.resilientDB, options)

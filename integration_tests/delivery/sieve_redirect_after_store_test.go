@@ -21,12 +21,14 @@ import (
 // the redirect been relayed first, every retry would relay it again.
 func TestDelivery_SieveRedirectRelayedOnlyAfterStore(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		script   string
-		multiple bool
+		name       string
+		script     string
+		multiple   bool
+		failInsert bool
 	}{
-		{"redirect copy", `require ["copy"]; redirect :copy "other@example.org";`, false},
-		{"multiple fileinto and redirect", `require ["fileinto"]; fileinto "Archive"; fileinto "Projects"; fileinto "Missing"; redirect "other@example.org";`, true},
+		{"redirect copy", `require ["copy"]; redirect :copy "other@example.org";`, false, false},
+		{"multiple fileinto and redirect", `require ["fileinto"]; fileinto "Archive"; fileinto "Projects"; fileinto "Missing"; redirect "other@example.org";`, true, true},
+		{"multiple fileinto missing preflight", `require ["fileinto"]; fileinto "Archive"; fileinto "Projects"; fileinto "Missing"; redirect "other@example.org";`, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			common.SkipIfDatabaseUnavailable(t)
@@ -62,20 +64,35 @@ func TestDelivery_SieveRedirectRelayedOnlyAfterStore(t *testing.T) {
 			msg := []byte(fmt.Sprintf("From: sender@example.com\r\nTo: %s\r\nSubject: redirect after store\r\nMessage-ID: <%d@example.com>\r\n\r\nbody\r\n",
 				account.Email, time.Now().UnixNano()))
 
-			// First attempt: INBOX is gone, so storing the :copy fails.
-			_, err = rdb.ExecWithRetry(ctx,
-				"UPDATE mailboxes SET deleted_at = NOW() WHERE account_id = $1 AND LOWER(name) = 'inbox' AND deleted_at IS NULL", accountID)
-			require.NoError(t, err)
+			// Keep the target resolvable for the insert-phase failure; a separate
+			// case retains the missing-INBOX preflight failure schedule.
+			restore := func() {}
+			defer func() { restore() }()
+			if tc.failInsert {
+				inbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, "INBOX")
+				require.NoError(t, err)
+				restore = common.FailMailboxInserts(t, rdb, inbox.ID)
+			} else {
+				_, err = rdb.ExecWithRetry(ctx, "UPDATE mailboxes SET deleted_at = NOW() WHERE account_id = $1 AND LOWER(name) = 'inbox' AND deleted_at IS NULL", accountID)
+				require.NoError(t, err)
+			}
 			res, err := dctx.DeliverMessage(recipient, msg)
 			require.Error(t, err, "a delivery that cannot store the message must fail (result=%+v)", res)
 			assert.Empty(t, rq.snapshot(), "a delivery whose store failed must not have relayed the message")
 			assert.Zero(t, redirects(), "a failed store must not consume the redirect allowance")
 
-			if tc.multiple {
+			if tc.multiple && tc.failInsert {
 				assert.Equal(t, 1, countLiveInMailbox(t, rdb, accountID, "Projects"), "a preceding copy was stored before the failure")
 			}
 
+			if tc.multiple && !tc.failInsert {
+				for _, name := range []string{"Archive", "Projects"} {
+					assert.Zero(t, countLiveInMailbox(t, rdb, accountID, name), "preflight failure must precede storage")
+				}
+			}
+
 			// The caller's retry, once INBOX is back: stored, and relayed once.
+			restore()
 			require.NoError(t, rdb.CreateDefaultMailboxesWithRetry(ctx, accountID))
 			res, err = dctx.DeliverMessage(recipient, msg)
 			require.NoError(t, err)

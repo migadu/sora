@@ -628,7 +628,8 @@ func (s *Server) sendGracefulShutdownMessage() {
 			session.mu.Lock()
 			session.gracefulShutdown = true
 			conn := session.clientConn
-			ready := session.greeted && !session.startTLSInProgress
+			ready := session.greeted && !session.startTLSInProgress && !session.closingNoticeSent
+			session.closingNoticeSent = true
 			session.mu.Unlock()
 			if conn != nil && ready {
 				if err := conn.SetWriteDeadline(deadline); err == nil {
@@ -771,3 +772,6 @@ func (s *Server) monitorActiveSessions() {
 func (s *Server) wrapProxyProtocol(l net.Listener) net.Listener {
 	return server.WrapProxyProtocol(l, s.proxyReader, "LMTP-PROXY")
 }
+
+// GetLookupCache exposes the recipient route cache for credential revocation/reset.
+func (s *Server) GetLookupCache() *lookupcache.LookupCache { return s.lookupCache }

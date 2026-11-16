@@ -11,7 +11,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
+	imapServer "github.com/migadu/sora/server/imap"
 )
 
 // fetchSeqRe extracts the sequence number of an untagged FETCH response.
@@ -73,6 +75,53 @@ func TestIMAP_FetchFailingPartWaySetsSeenOnlyOnAnswered(t *testing.T) {
 
 		requireFetchFailsAtSecond(t, c, "FETCH 1:3 (BODY[])", " NO [UNAVAILABLE] ")
 	})
+
+	// A body the session memory budget cannot hold (#1256), and a BODY[TEXT]
+	// copy it refuses once the body is loaded, fail with NO [LIMIT], not an
+	// empty literal and not after the response is opened: neither fits the
+	// whole budget, beside its body for the copy, so no retry can fetch it
+	// (RFC 5530: "The operation ran up against an implementation limit of some
+	// kind"). The messages are appended before session_memory_limit is
+	// reloaded to 256 KiB, and fetched by a session that starts after the
+	// reload.
+	for _, tc := range []struct {
+		name    string
+		size    int
+		command string
+	}{
+		{"body over the session memory budget", 300 << 10, "FETCH 1:3 (BODY[])"},
+		{"section copy over the session memory budget", 200 << 10, "FETCH 1:3 (BODY[TEXT])"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			common.SkipIfDatabaseUnavailable(t)
+			server, account := common.SetupIMAPServer(t)
+			defer server.Close()
+
+			login := func() *rawIMAP {
+				c := dialRawIMAP(t, server.Address)
+				c.do(fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password))
+				return c
+			}
+			c := login()
+			c.appendMsg("INBOX", binaryDecodeTestMessage("one", "text/plain", "7bit", "body one\r\n"))
+			c.appendMsg("INBOX", messageOfSize(tc.size))
+			c.appendMsg("INBOX", binaryDecodeTestMessage("three", "text/plain", "7bit", "body three\r\n"))
+
+			imapSrv, ok := server.Server.(*imapServer.IMAPServer)
+			if !ok {
+				t.Fatalf("server.Server is %T, want *imap.IMAPServer", server.Server)
+			}
+			if err := imapSrv.ReloadConfig(config.ServerConfig{
+				Limits: &config.ServerLimitsConfig{SessionMemoryLimit: "256kb"},
+			}); err != nil {
+				t.Fatalf("ReloadConfig: %v", err)
+			}
+
+			c = login()
+			c.do("SELECT INBOX")
+			requireFetchFailsAtSecond(t, c, tc.command, " NO [LIMIT] ")
+		})
+	}
 }
 
 // requireFetchFailsAtSecond runs a non-PEEK FETCH of messages 1:3 that fails at

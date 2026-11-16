@@ -104,8 +104,7 @@ plaintext authentication is allowed without TLS on a publicly reachable address;
 "Publicly reachable" means bound to a public IP, or to a wildcard address (`:143`, `0.0.0.0`, `::`)
 on a host that has a public address. Loopback, private (RFC 1918, ULA), link-local and CGNAT binds
 do not warn. On a listener with `tls = false`, setting `insecure_auth = false` does not change
-anything: configure TLS instead. The POP3 backend also logs
-`POP3: TLS not configured; cleartext authentication auto-enabled. ...` whenever its `tls` is off.
+anything: configure TLS instead.
 
 A backend behind Sora proxies usually runs with `tls = false` on a private address. Keep its ports
 reachable only from the proxies, or turn on TLS on the backend leg ([PROXY.md](PROXY.md#8-the-backend-leg)):
@@ -130,15 +129,29 @@ balancers.
 | What | Effect of `trusted_networks` |
 |---|---|
 | PROXY protocol | A listener with `proxy_protocol = true` accepts connections only from these addresses (3.2). |
-| Client address forwarding | IMAP ID forwarding fields, POP3 `XCLIENT`, and LMTP `XCLIENT`/`XRCPTFORWARD` are honoured only from these addresses. From anyone else they are ignored (IMAP) or refused (POP3: `-ERR Connection not from trusted proxy`). |
+| Client address forwarding | IMAP ID forwarding fields, POP3 `XCLIENT`, and LMTP `XCLIENT`/`XRCPTFORWARD` are honoured only from these addresses. From anyone else they are ignored (IMAP) or refused (POP3: `-ERR Connection not from trusted proxy`). Behind a PROXY header, IMAP ID and POP3 `XCLIENT` are judged by the client the header names, not the load balancer that sent it; LMTP has its own rule (below). |
 | Per-IP connection limit | Connections from these addresses do not count against `max_connections_per_ip`. Behind a PROXY header the address is the client the header names, not the load balancer that sent it (section 4). |
 | Authentication rate limiting | These addresses are exempt, unless the server's `auth_rate_limit.exempt_networks` says otherwise ([AUTHENTICATION.md](AUTHENTICATION.md#105-exempt-networks)). |
 | LMTP backend admission | Only these addresses may connect to an `lmtp` listener. **When the list is empty**, the LMTP backend accepts `127.0.0.0/8`, `::1`, `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16` instead. |
 | LMTP proxy admission | Only these addresses may connect to an `lmtp_proxy` listener. Other connections are closed and logged as `LMTP Proxy: Connection rejected - not from trusted network`. An `lmtp_proxy` with an empty list is reported at startup. |
 
-All of these check the TCP peer, the host that actually connected, except the rate-limit exemption,
-which checks the client address after forwarding, and the per-IP limit, which checks the client a
-PROXY header names when there is one.
+Most of these check the TCP peer, the host that actually connected. The exceptions:
+
+- The rate-limit exemption checks the client address after forwarding, subject to the POP3
+  `XCLIENT` metadata requirement in
+  [AUTHENTICATION.md](AUTHENTICATION.md#11-trusted-networks-and-logins).
+- The per-IP limit checks the client a PROXY header names when there is one.
+- IMAP ID forwarding and POP3 `XCLIENT` check the client a PROXY header names when there is one,
+  else the TCP peer (also when the header names no client: `LOCAL` or `UNKNOWN`). A load balancer
+  that sends PROXY headers is trusted to say who the client is, not to vouch for the commands that
+  follow, which are the client's own. So behind a trusted layer-4 load balancer (HAProxy, nginx
+  `stream`), a proxy that reaches the backend through the load balancer may forward only when its
+  own address is in the list. Other clients have their ID forwarding fields ignored and `XCLIENT`
+  refused unless their own address is also in the list.
+- LMTP `XCLIENT` is accepted from a trusted TCP peer: an `lmtp_proxy` may send a PROXY header and
+  `XCLIENT` on one connection. Its `ADDR` and `PORT` replace the address a PROXY header gave only
+  when that address is itself in the list; otherwise they are ignored and the other attributes
+  (`HELO`, `PROTO`, `LOGIN`, `NAME`) still apply. `XRCPTFORWARD` checks the TCP peer.
 
 Sora reads `trusted_networks` at startup. A SIGHUP reload logs
 `Config reload: servers.trusted_networks changed but requires restart to take effect; ...` and keeps
@@ -183,8 +196,11 @@ With `proxy_protocol = true`:
 - A connection from a trusted address must send a valid header within `proxy_protocol_timeout`, or
   it is closed. There is no "optional" mode.
 - The client address from the header is used for logs, rate limiting and `max_connections_per_ip`.
-  The trust checks (which hosts may send a header, may forward with IMAP ID or XCLIENT, or may use
-  master SASL) use the TCP peer.
+  It is also the address IMAP ID forwarding and POP3 `XCLIENT` are judged by: a client behind a
+  trusted load balancer may forward an address only when its own address is in `trusted_networks`.
+  LMTP `XCLIENT` is accepted from the TCP peer, but its `ADDR` and `PORT` replace the header's
+  address only when that address is in `trusted_networks` (3.1). Which hosts may send a header,
+  and which may use master SASL (`master_sasl_allowed_networks`), are judged by the TCP peer.
 - A client the header names is exempt from `max_connections_per_ip` only when its own address is in
   `trusted_networks`: the load balancer's address does not exempt the clients behind it. A header
   that names no client (`LOCAL` or `UNKNOWN`) counts against the TCP peer, which is trusted and so
@@ -220,7 +236,7 @@ Where each applies:
 | Key | `imap`, `pop3`, `managesieve` | `imap_proxy`, `pop3_proxy`, `managesieve_proxy` |
 |---|---|---|
 | `max_connections` | yes | yes |
-| `max_connections_per_ip` | yes, except for trusted networks; with `proxy_protocol = true` it counts the client the header names | as on the backends |
+| `max_connections_per_ip` | yes, except for trusted networks; with `proxy_protocol = true` it counts the client the header names | as on the backends; with `[cluster]`, counted across the cluster ([CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies)) |
 | `max_connections_per_user` | enforced, per listener | enforced across the cluster; needs `[cluster]`, otherwise not enforced |
 | `max_connections_per_user_per_ip` | as above; on `imap` the IP is the client's real address, as forwarded by a proxy | as above |
 
@@ -228,8 +244,14 @@ Where each applies:
 `lmtp_proxy` ignores the per-user limits, with a warning.
 
 Behind Sora proxies that send PROXY headers (`remote_use_proxy_protocol`), a backend's
-`max_connections_per_ip` limits each client a second time, by the address the proxy names. Set it no
-lower than on the proxies, or to `0` to leave the limit to them.
+`max_connections_per_ip` limits each client a second time, by the address the proxy names, and a
+client over it fails its login on the proxy. Set it to `0` to leave the limit to the proxies, or
+above the most connections the proxies let one address open in total. In cluster mode that is the
+proxies' own `max_connections_per_ip`, which `imap_proxy`, `pop3_proxy` and `managesieve_proxy`
+count across all proxy nodes of the protocol. Without `[cluster]` each proxy listener counts only
+its own connections, so it is that limit times the number of proxy listeners. Leave headroom above
+it: the cluster-wide count is eventually consistent, and when a proxy closes a session the backend
+can still count its connection for a moment after the proxy has freed the client's slot.
 
 What a client sees:
 
@@ -414,14 +436,27 @@ When a request does not fit:
 
 | Request | Reply |
 |---|---|
-| IMAP `FETCH` of a body or section | `NO [UNAVAILABLE] Message too large for the session memory limit` |
+| IMAP `FETCH` of a body or section that can never fit the limit | `NO [LIMIT] Message too large for the session memory limit` |
+| IMAP `FETCH` of a body or section that fits the limit, but not what the session holds now | `NO [UNAVAILABLE] Session memory limit reached, please try again later` |
 | IMAP `APPEND` | `NO [UNAVAILABLE] Session memory limit reached, please try again later` |
 | IMAP `SEARCH` | an internal error reply |
-| POP3 `RETR`, `TOP` | `-ERR [SYS/TEMP] Message too large to retrieve in this session` |
+| POP3 `RETR`, `TOP` of a body that can never fit the limit | `-ERR [SYS/PERM] Message too large for the session memory limit` |
+| POP3 `RETR`, `TOP` of a body that fits the limit, but not what the session holds now | `-ERR [SYS/TEMP] Session memory limit reached, please try again later` |
 | POP3 opening a mailbox whose message list is too large | `-ERR [SYS/TEMP] Mailbox too large to open in this session` |
 
+An IMAP `FETCH` can never fit when the body is larger than the limit, or when a section such as
+`BODY[TEXT]` does not fit beside the body it is copied from. A POP3 body can never fit when it does
+not fit beside the session's message list. No retry helps then, so the permanent codes (RFC 5530
+`LIMIT`, RFC 3206 `SYS/PERM`) tell clients not to retry; the temporary ones (`UNAVAILABLE`,
+`SYS/TEMP`) are for a session that holds other data at the moment. A message the limit refuses is
+not marked `\Seen`.
+
 Each case is counted in `sora_session_memory_limit_exceeded_total{protocol, server_name, hostname}`.
-Raise the limit if legitimate users hit it with large messages.
+Raise the limit if legitimate users hit it with large messages. Keep it above the `max_message_size`
+of the `lmtp` servers: start-up and a reload warn about an `imap` or `pop3` server whose limit is
+below the largest one in the same file, since mail between the two sizes is delivered but never
+fetched. Messages imported with `sora-admin` are bounded by `[admin_cli] import_message_limit`
+instead.
 
 ---
 
@@ -481,7 +516,7 @@ one.**
 | Key | Meaning |
 |---|---|
 | `allowed_hosts` | IPs or CIDRs allowed to scrape. Matched against the TCP peer; `X-Forwarded-For` is ignored. Others get HTTP 403 `forbidden`. |
-| `api_key` | Requires `Authorization: Bearer <key>`, compared in constant time. A missing token gets 401 with `WWW-Authenticate: Bearer realm="metrics"`; a wrong one gets 403. |
+| `api_key` | Requires `Authorization: Bearer <key>`, compared in constant time. A missing token gets 401 with `WWW-Authenticate: Bearer realm="metrics"`; a wrong one gets 401 with `WWW-Authenticate: Bearer realm="metrics", error="invalid_token"`. |
 
 With both set, a request must pass both. The endpoint is always plain HTTP: `tls` on a metrics block
 is ignored with a warning, so put a TLS proxy in front if a token crosses an untrusted network.
@@ -540,9 +575,12 @@ same key on every node. Details are in [STORAGE.md](STORAGE.md).
 | Protection | Counted |
 |---|---|
 | Limit of 10 waiting logins per IP | Per node, over all its listeners. |
-| `max_connections`; `max_connections_per_ip` on backends | Per listener on each node. |
+| `max_connections`; `max_connections_per_ip` on backends and the User API proxy | Per listener on each node. |
+| `max_connections_per_ip` on IMAP, POP3 and ManageSieve proxies | Across the cluster, through gossip. Per listener without `[cluster]`. |
 | `max_connections_per_user`, `..._per_user_per_ip` on proxies | Across the cluster, through gossip. Not enforced without `[cluster]`. |
 | `max_connections_per_user`, `..._per_user_per_ip` on backends | Per listener. |
+| Authentication rate limits on IMAP, POP3 and ManageSieve proxies | Tier 2 blocks, Tier 2 counts and the name statistics across the cluster, through gossip, as `[cluster.rate_limit_sync]` says; Tier 1 blocks per listener. Per listener without `[cluster]`. |
+| Authentication rate limits on backends, the User API and the User API proxy | Per listener. |
 | Search rate limit | Per account in each IMAP listener of each node. |
 | Session memory, error counts, timeouts | Per connection. |
 | Lookup caches | Per listener; an account's entries are dropped on every node after a kick or an Admin API change. |

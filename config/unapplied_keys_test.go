@@ -77,6 +77,15 @@ func TestWarnUnusedConfigOptions_KeysTheServerTypeDoesNotApply(t *testing.T) {
 	}
 }
 
+// A ManageSieve backend advertises the [sieve] enabled_extensions, so the warning about
+// a supported_extensions it ignores names the setting that does apply there.
+func TestWarnUnusedConfigOptions_SupportedExtensionsNamesSieveEnabledExtensions(t *testing.T) {
+	warnings := warningsFor(ServerConfig{Type: "managesieve", Name: "sieve", SupportedExtensions: []string{"vacation"}})
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "'supported_extensions'") || !strings.Contains(warnings[0], "[sieve] enabled_extensions") {
+		t.Errorf("want one warning naming 'supported_extensions' and [sieve] enabled_extensions, got %v", warnings)
+	}
+}
+
 // The LMTP backend's command_timeout is its idle timeout. Absent, it is the 5
 // minutes the server has always used, which RFC 5321 section 4.5.3.2.7 sets as
 // the floor ("An SMTP server SHOULD have a timeout of at least 5 minutes while

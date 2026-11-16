@@ -12,6 +12,10 @@ import (
 	"github.com/migadu/sora/server/sieveengine"
 )
 
+// maxSieveScriptSize is the largest Sieve script sora-admin stores, through `sieve
+// put` or `import maildir --sieve`: the limit the User API enforces and advertises.
+const maxSieveScriptSize = 65536
+
 // handleSieveCommand handles the 'sieve' command
 func handleSieveCommand(ctx context.Context) {
 	if len(os.Args) < 3 {
@@ -237,9 +241,8 @@ Examples:
 		}
 	}
 
-	// 64KB max script size
-	if len(scriptContent) > 65536 {
-		fmt.Printf("Error: script size exceeds maximum allowed limit of 65536 bytes (got %d bytes)\n", len(scriptContent))
+	if len(scriptContent) > maxSieveScriptSize {
+		fmt.Printf("Error: script size exceeds maximum allowed limit of %d bytes (got %d bytes)\n", maxSieveScriptSize, len(scriptContent))
 		os.Exit(1)
 	}
 
@@ -263,7 +266,7 @@ Examples:
 		os.Exit(1)
 	}
 
-	_, err = rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, *name, string(scriptContent))
+	_, _, err = rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, *name, string(scriptContent))
 	if err != nil {
 		fmt.Printf("Failed to save Sieve script: %v\n", err)
 		os.Exit(1)

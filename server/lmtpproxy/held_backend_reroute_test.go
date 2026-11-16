@@ -112,8 +112,9 @@ func (b *rerouteBackend) serve(conn net.Conn, id int32) {
 // #1236: one LMTP connection the MTA keeps open delivers to a@example.com on
 // backend A, then starts new transactions (after DATA, and after RSET) whose first
 // recipient lives elsewhere. A transaction without an accepted recipient must be
-// routed as on a fresh connection: the held backend is dropped and the proxy
-// connects to the recipient's backend, re-sending MAIL FROM there. A later
+// routed as on a fresh connection: the held backend is dropped, never having been
+// sent the transaction's MAIL FROM, and the proxy connects to the recipient's
+// backend and sends MAIL FROM there. A later
 // recipient of the same transaction that needs another backend still gets 451.
 // Covered for a remote-lookup server pin (backend mismatch) and for named pools
 // (pool mismatch).
@@ -240,13 +241,12 @@ func TestHeldBackendReroutesFirstRecipientOfTransaction(t *testing.T) {
 				"A#1 MAIL FROM:<sender@example.com>",
 				"A#1 RCPT TO:<a@example.com>",
 				"A#1 DATA",
-				"A#1 MAIL FROM:<sender@example.com>", // forwarded to the held A on MAIL
-				"B#1 MAIL FROM:<sender@example.com>", // re-sent on the new B connection
+				// The held A is not asked for a transaction none of whose recipients
+				// stays on it: MAIL goes to a backend with its first recipient there.
+				"B#1 MAIL FROM:<sender@example.com>",
 				"B#1 RCPT TO:<b@example.com>",
 				"B#1 DATA",
-				"B#1 MAIL FROM:<sender@example.com>",
 				"B#1 RSET",
-				"B#1 MAIL FROM:<other@example.com>",
 				"A#2 MAIL FROM:<other@example.com>",
 				"A#2 RCPT TO:<a@example.com>",
 			}, "\n")

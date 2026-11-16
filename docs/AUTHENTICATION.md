@@ -100,7 +100,7 @@ sora-admin --config config.toml credentials add --primary user@example.com \
 sora-admin --config config.toml accounts update --email user@example.com --password 'changed-passphrase'
 ```
 
-A change made through the Admin API or `sora-admin` also drops the account's cached logins
+A change made through the Admin API or `sora-admin` also requests invalidation of the account's cached logins
 (section 12).
 
 ---
@@ -327,9 +327,14 @@ the proxy. Restrict where those may come from with `master_sasl_allowed_networks
 
 What a client cannot do through a proxy:
 
-- Use a SASL authorization identity. The IMAP and ManageSieve proxies ignore it. The POP3 proxy
-  refuses an `AUTH PLAIN` whose authorization identity differs from the authentication identity,
-  with `-ERR [AUTH] Authorization identity not supported on proxy (configure master SASL on backend)`.
+- Act as another user with a SASL authorization identity. The IMAP and ManageSieve proxies accept
+  one that names the user the login reaches (the authentication identity, or the address the login
+  resolved to, such as the master username form's target) and refuse any other once the password
+  checked out, with the backends' replies (section 8.2): `NO [AUTHORIZATIONFAILED] Proxy login not
+  permitted for this user.` (IMAP), `NO "Proxy authentication requires master credentials"`
+  (ManageSieve). The POP3 proxy refuses an `AUTH PLAIN` whose authorization identity differs from
+  the authentication identity, with
+  `-ERR [AUTH] Authorization identity not supported on proxy (configure master SASL on backend)`.
 - Use master SASL credentials. Those are for the proxy's own login to backends.
 
 A backend behind proxies usually listens without TLS on a private address. Plaintext logins are then
@@ -368,7 +373,8 @@ a1 LOGIN user@example.com@support a-long-random-secret
   the master password itself and then routes the user like any other login.
 - The suffix must equal `master_username` exactly, including case.
 - On a backend with SASL PLAIN, if the client also sends an authorization identity, that identity is
-  the user to log in as. Otherwise it is the address before the suffix.
+  the user to log in as. Otherwise it is the address before the suffix. A proxy logs in only as the
+  address before the suffix and refuses an authorization identity naming anybody else (section 7).
 - The target must be an active account. A target that is not a valid address, or a target account
   that does not exist, gets the protocol's bad-credentials reply and is counted as a failed login.
 - Any other password is not a master login. The name is then handled like a name with any other
@@ -398,8 +404,8 @@ AUTHENTICATE PLAIN base64("user@example.com" NUL "proxyuser" NUL "proxy-secret")
 - A client that does not use the master SASL username, and sends an authorization identity that
   differs from its authentication identity, is refused: `NO [AUTHORIZATIONFAILED] Proxy login not permitted for this user.`
   (IMAP), `-ERR [AUTH] Proxy authentication requires master credentials` (POP3), `NO "Proxy
-  authentication requires master_sasl_username and master_sasl_password to be configured"`
-  (ManageSieve).
+  authentication requires master credentials"` (ManageSieve). The refusal comes only after the
+  password checked out, and logs `authorization failed`.
 
 ### 8.3 `master_sasl_allowed_networks`
 
@@ -414,7 +420,8 @@ master_sasl_allowed_networks = ["10.20.0.5", "10.20.0.6"]
 - Empty (the default): master SASL is accepted from any source. If master SASL is configured without
   this list, the backend logs a warning at startup, for example `IMAP: master SASL enabled without
   master_sasl_allowed_networks; backend trusts any source that knows the secret. ...`
-- An entry that is not an IP or CIDR stops the server at startup.
+- An entry that is not an IP or CIDR is refused: startup stops, `sora-admin config validate` fails
+  the file, and a SIGHUP reload skips that server's block, which keeps its previous settings.
 - A login with correct master SASL credentials from another address gets the bad-credentials reply
   and logs `master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting`.
 
@@ -643,7 +650,7 @@ normal load (`Auth rate limiter stats` lines, below).
 
 | Listener | Login while blocked | Connection |
 |---|---|---|
-| `imap` | `NO [AUTHENTICATIONFAILED] Invalid address or password`, the same as a wrong password | Stays open. In addition, a new TCP connection from a Tier 2 blocked IP is closed before the TLS handshake, with no greeting; when a PROXY header names the blocked client, it gets `* BYE [ALERT] Too many failed authentication attempts. Please try again later.` after the TLS handshake instead ([SECURITY.md](SECURITY.md#4-connection-limits)). |
+| `imap` | `NO [AUTHENTICATIONFAILED] Invalid address or password`, the same as a wrong password | Stays open. In addition, a new TCP connection from a Tier 2 blocked IP is closed before the TLS handshake, with no greeting; when a PROXY header names the blocked client, it gets `* BYE [ALERT] Too many failed authentication attempts. Please try again later.` instead, after the TLS handshake on an implicit-TLS listener ([SECURITY.md](SECURITY.md#4-connection-limits)). |
 | `pop3` | `-ERR [AUTH] Authentication failed`, the same as a wrong password | Stays open, but every error counts towards the POP3 error limit (4 errors, then the connection closes; [SECURITY.md](SECURITY.md#6-limits-on-failed-logins-per-connection)). |
 | `managesieve` | `NO "Authentication failed"`, the same as a wrong password | Stays open; 10 errors close it. |
 | `imap_proxy` | `<tag> NO Authentication failed`, then `* BYE [ALERT] Too many failed authentication attempts. Please try again later.` | Closed. |
@@ -664,9 +671,12 @@ The wait of section 10.3 comes before the reply in every case.
 - In cluster mode, with `[cluster.rate_limit_sync] enabled` (the default), the `imap_proxy`,
   `pop3_proxy` and `managesieve_proxy` limiters share their state with the proxies of the same type
   on every node, their own node included: Tier 2 blocks (`sync_blocks`), Tier 2 counts from
-  `delay_start_threshold` on (`sync_failure_counts`), and the name statistics. A shared count only
-  raises a listener's own, its `exempt_networks` are not counted, and a shared wait is capped at its
-  `max_delay`. Tier 1 blocks stay on the listener that set them.
+  `delay_start_threshold` on and the successes that clear them (`sync_failure_counts`), and the
+  name statistics. A shared count only raises a listener's own, its `exempt_networks` are not
+  counted, and a shared wait is capped at its `max_delay`. Tier 1 blocks stay on the listener that
+  set them. See
+  [CLUSTER.md](CLUSTER.md#66-authentication-rate-limits-imap-pop3-and-managesieve-proxies) for the
+  details and [CONFIGURATION.md](CONFIGURATION.md#814-cluster-cluster) for the keys.
 - A restart forgets all counts and blocks.
 - `auth_rate_limit` is read at startup. A SIGHUP reload does not change it.
 
@@ -695,8 +705,15 @@ ways:
 
 - **The client IP.** A host in the list may pass on the client's address with a PROXY header (on a
   listener with `proxy_protocol = true`), with IMAP ID forwarding parameters, or with POP3 XCLIENT.
-  The rate limiter and the logs then use that forwarded address. From a host not in the list, these
-  are ignored and the TCP peer is the client.
+  Logs use that forwarded address. Authentication rate-limit checks and counters do too, but POP3
+  `XCLIENT` needs `FORWARD` metadata containing `proxy-source-ip` when no client address came from
+  a PROXY header. Sora's POP3 proxy sends it; bare `ADDR` changes the logged address while those
+  checks and counters still use the TCP peer. From a host not in the list, ID and XCLIENT
+  forwarding are ignored or refused and the TCP peer is the client, and a
+  `proxy_protocol = true` listener closes the connection. Behind a PROXY header, ID and POP3
+  XCLIENT forwarding are judged by the client the header names, so a client behind a trusted load
+  balancer cannot forward another address unless its own address is in the list
+  ([SECURITY.md](SECURITY.md#31-trusted_networks)).
 - **Rate-limit exemption.** Unless `exempt_networks` is set, addresses in the list are exempt from
   rate limiting (section 10.5).
 
@@ -706,21 +723,41 @@ The master SASL gate (`master_sasl_allowed_networks`) is separate and always use
 
 ## 12. Cached logins and password changes
 
-Several caches answer logins without asking PostgreSQL. Until an entry is dropped or expires, it
-can still accept the state from before a password change, a credential deletion or an account
-deletion:
+Backend and proxy lookup caches keep recent verdicts in memory; `[auth_cache]` can also retain
+successful PostgreSQL checks in SQLite across restarts. On nodes with database access, migration 69
+records password changes, credential removals and accounts taken out of service. Each node reads
+this feed from the primary, normally every five seconds, and invalidates affected cache entries.
+The cursor follows the primary snapshot's safe transaction horizon: an arbitrarily late commit
+cannot fall behind it because of its trigger timestamp. It advances only after the local sinks
+and synchronization callback succeed. Administrative gossip can deliver changes sooner.
 
-| Cache | Where | How long an entry can keep answering |
-|---|---|---|
-| Backend lookup cache (section 6) | each backend listener, memory | up to `positive_revalidation_window` (30 s), for a user who logged in with it shortly before |
-| Proxy lookup cache | each proxy listener, memory | up to `positive_ttl` (5 minutes); see [PROXY.md](PROXY.md#10-lookup-cache) |
-| Auth cache (`[auth_cache]`) | each proxy node, SQLite | until the entry is older than `max_age` (24 hours when unset), or until the user logs in through that node with the new password; see [PROXY.md](PROXY.md#11-auth-cache) |
+Database-backed caches start suspended, including new listeners introduced by reload. Before the
+persistent cache resumes, its marker must match the primary database UUID and tracking version;
+old untracked rows or rows from another database are flushed atomically. A matching marker allows
+a normal restart to retain warm entries after synchronization. Feed-read or sink failures suspend
+cache hits and fills; authentication then uses primary credential reads. Recovery re-enables the
+caches after successful synchronization. Healthy polling does not flush unaffected warm entries.
 
-Changes made through the Admin API or `sora-admin` (password update, credential deletion, account
-deletion) take effect across the cluster at once, whichever node or tool makes them: they drop the
-account's entries from the backend and proxy lookup caches, the User API's lookup cache and the
-proxies' SQLite auth cache on every node. An account deletion also ends the account's sessions. Kicking a user
-(`sora-admin connections kick`) also drops the lookup-cache entries.
+Cache fills carry an invalidation generation captured before their lookup. A lookup racing a
+change can finish its own already-started check, but cannot persist an obsolete verdict after the
+invalidation. A generation fence also closes authenticated mail sessions that register after an
+account-removal notification passed. It is conservative: a concurrent unrelated removal can make
+an in-flight login reconnect. Accounts taken out of service have their local sessions ended on
+each node. After a feed gap of at least seven days, a backwards database clock or cursor rollback,
+account attribution may be incomplete: all local login caches and mail sessions are reset before
+resuming. Entries are retained for pruning from their first observation, not their pre-commit
+trigger time.
+
+The User API has no login cache. It reads the password hash and credential epoch together from
+the primary, and token refresh reads the epoch from the primary too. A configured User API
+`lookup_cache` is ignored and warned about. Existing access tokens retain their normal JWT expiry
+rules; this feed is not a per-request JWT revocation service.
+
+Upgrade every cache-serving node before relying on this behavior. Nodes without database access
+and credentials owned by an external remote-lookup service still follow that service's cache and
+invalidation policy ([PROXY.md](PROXY.md#10-lookup-cache)). After restoring PostgreSQL to an older
+state, clear its associated persistent auth caches before admitting logins; preserving a logical
+database UUID does not prove that a restored database contains the cache's newer credential state.
 
 ---
 
@@ -732,6 +769,8 @@ Log lines (INFO unless noted), with the session's fields:
 |---|---|
 | `authentication successful` | A login succeeded. `method` is `main_db`, `cache`, `master` or `remotelookup`; `cached` says whether a cache answered. |
 | `authentication failed` | A login failed. `reason` is `user_not_found`, `invalid_password` or `transient_error`. |
+| WARN `authentication unavailable` | The password could not be checked, so the client got a temporary failure and the attempt was not counted. `reason` is `transient_error` (the database could not be asked) or `unverifiable_hash` (the stored hash cannot be checked, for example an unknown scheme). |
+| `authorization failed` | On a backend: the password was right, but the client asked to act as another user (`authzid`) without master credentials (section 8.2). On the IMAP or ManageSieve proxy: the password was right, but the `authzid` names another user than the one the login reaches (section 7). |
 | `rate limit exceeded` | A login was refused by the rate limiter; with `reason` (`ip_blocked` or `ip_username_blocked`), `failure_count`, `blocked_until`. |
 | `Auth rate limiter: IP+username blocked (Tier 1)` | A Tier 1 block started. |
 | `Auth rate limiter: IP blocked (Tier 2)` | A Tier 2 block started. |

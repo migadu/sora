@@ -20,32 +20,92 @@ import (
 // The fence is a store that cannot be partitioned into two writable copies.
 
 // fakeFence is one shared claim store, standing in for the database both partitions
-// still reach.
+// still reach. Like the database's locks, it lets a claim go at its expiry whatever its
+// holder is still doing, and an extension or a release acts only on the claim it was
+// granted with.
 type fakeFence struct {
 	mu     sync.Mutex
-	held   map[string]bool
+	held   map[string]fakeClaim
+	ahead  time.Duration // how far the fence's clock runs ahead of this process's
 	err    error
 	grants int
+	asks   int // TryHoldIssuance and Extend calls
 }
 
-func newFakeFence() *fakeFence { return &fakeFence{held: map[string]bool{}} }
+// fakeClaim is a claim the fence holds: grant is its fencing token, and a zero expires
+// never lapses.
+type fakeClaim struct {
+	grant   int
+	expires time.Time
+}
 
-func (f *fakeFence) TryHoldIssuance(_ context.Context, domain string, _ time.Duration) (func(context.Context), error) {
+func newFakeFence() *fakeFence { return &fakeFence{held: map[string]fakeClaim{}} }
+
+// now is the fence's clock. mu must be held.
+func (f *fakeFence) now() time.Time { return time.Now().Add(f.ahead) }
+
+func (f *fakeFence) TryHoldIssuance(_ context.Context, domain string, ttl time.Duration) (IssuanceHold, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.asks++
 	if f.err != nil {
 		return nil, f.err
 	}
-	if f.held[domain] {
+	if claim, held := f.held[domain]; held && (claim.expires.IsZero() || f.now().Before(claim.expires)) {
 		return nil, nil
 	}
-	f.held[domain] = true
 	f.grants++
-	return func(context.Context) {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		delete(f.held, domain)
-	}, nil
+	f.held[domain] = fakeClaim{grant: f.grants, expires: f.now().Add(ttl)}
+	return fakeHold{fence: f, domain: domain, grant: f.grants}, nil
+}
+
+// fakeHold is a claim granted by a fakeFence.
+type fakeHold struct {
+	fence  *fakeFence
+	domain string
+	grant  int
+}
+
+func (h fakeHold) Extend(_ context.Context, ttl time.Duration) (bool, error) {
+	f := h.fence
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.asks++
+	if f.err != nil {
+		return false, f.err
+	}
+	claim, held := f.held[h.domain]
+	if !held || claim.grant != h.grant {
+		return false, nil
+	}
+	if expires := f.now().Add(ttl); expires.After(claim.expires) {
+		claim.expires = expires
+	}
+	f.held[h.domain] = claim
+	return true, nil
+}
+
+func (h fakeHold) Release(context.Context) {
+	f := h.fence
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.held[h.domain].grant == h.grant {
+		delete(f.held, h.domain)
+	}
+}
+
+// at sets the fence's clock to read t now, which is how a test lets time pass for the
+// claims the fence holds.
+func (f *fakeFence) at(t time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ahead = time.Until(t)
+}
+
+func (f *fakeFence) askCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.asks
 }
 
 func (f *fakeFence) grantCount() int {

@@ -95,3 +95,26 @@ func TestMailboxNameValid(t *testing.T) {
 		}
 	}
 }
+
+// TestIsDefaultMailboxName is issue #1584: a stored name is a default mailbox's in
+// any case of its ASCII letters, and in no other spelling.
+func TestIsDefaultMailboxName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"Sent":       true,
+		"sent":       true,
+		"TRASH":      true,
+		"inbox":      true,
+		"Archive":    true,
+		"ſent":       false, // U+017F LATIN SMALL LETTER LONG S
+		"Draftſ":     false,
+		"Sent/Sub":   false,
+		"Sents":      false,
+		"":           false,
+		"Jun\u212A":  false, // U+212A KELVIN SIGN is no ASCII letter
+		"\u0130NBOX": false, // nor is U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE
+	} {
+		if got := IsDefaultMailboxName(name); got != want {
+			t.Errorf("IsDefaultMailboxName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}

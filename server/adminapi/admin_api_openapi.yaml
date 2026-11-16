@@ -16,21 +16,23 @@ components:
       bearerFormat: API Key
       description: >-
         api_key or read_only_api_key, as 'Bearer <API_KEY>' in the Authorization header. The
-        read-only key grants GET operations only. A missing or non-Bearer header is answered
-        401, a wrong key 403.
+        read-only key grants GET operations only. A missing or non-Bearer header, or a key
+        that is neither, is answered 401; the read-only key on a write 403.
 
   # Refusals of the access checks every request passes before its route: the client
   # address against allowed_hosts, then the API key. Every operation can answer them.
   responses:
     Unauthorized:
       description: >-
-        The Authorization header is missing or is not a Bearer header. The response carries
-        the challenge `WWW-Authenticate: Bearer realm="admin-api"`.
+        The Authorization header is missing or is not a Bearer header, or the key is neither
+        api_key nor read_only_api_key. The response carries the challenge
+        `WWW-Authenticate: Bearer realm="admin-api"`; for a wrong key it adds the reason
+        (RFC 6750 section 3.1): `Bearer realm="admin-api", error="invalid_token"`.
       headers:
         WWW-Authenticate:
           schema:
             type: string
-          example: 'Bearer realm="admin-api"'
+          example: 'Bearer realm="admin-api", error="invalid_token"'
       content:
         application/json:
           schema:
@@ -44,19 +46,26 @@ components:
               summary: Not a Bearer header
               value:
                 error: "Authorization header must be 'Bearer <token>'"
+            invalid_key:
+              summary: Wrong key
+              value:
+                error: "Invalid API key"
     Forbidden:
       description: >-
-        The key is neither api_key nor read_only_api_key, the read-only key was sent with a
-        method other than GET, or allowed_hosts is set and does not match the client address.
+        The read-only key was sent with a method other than GET, or allowed_hosts is set and
+        does not match the client address. The read-only key on a write carries the challenge
+        `WWW-Authenticate: Bearer realm="admin-api", error="insufficient_scope"` (RFC 6750
+        section 3.1). A client address refused by allowed_hosts gets no challenge.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+          example: 'Bearer realm="admin-api", error="insufficient_scope"'
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
           examples:
-            invalid_key:
-              summary: Wrong key
-              value:
-                error: "Invalid API key"
             read_only:
               summary: Read-only key on a write
               value:
@@ -481,7 +490,7 @@ components:
           example: 1042
         ContentHash:
           type: string
-          description: "BLAKE3 hash of the message body, its S3 object name."
+          description: "BLAKE3 hash of the message body, the last segment of its S3 key (<domain>/<local part>/<hash>)."
         InstanceID:
           type: string
           description: "The node that staged the body; only that node can upload it."
@@ -1643,7 +1652,10 @@ paths:
         - Time range (messages deleted within the range)
 
         At least one criterion must be provided. Restored messages will be assigned new UIDs but preserve all other metadata and flags.
-        If the original mailbox was deleted, it will be automatically recreated.
+        If the original mailbox was deleted, it will be automatically recreated. With [shared_mailboxes] enabled, a mailbox
+        recreated in the shared namespace is a shared mailbox of the account with owner-only rights: one entry, the owner
+        with default_rights. The ACL entries it had before it was deleted are not restored, and a shared parent's entries
+        are not copied, so other users have no access until they are granted it again (POST /admin/mailboxes/acl/grant).
 
         Large restores are processed in chunks, each committed in its own transaction. If the operation fails part-way,
         the messages restored so far are kept and the error message states how many; repeating the same request restores
@@ -2607,7 +2619,7 @@ paths:
           schema:
             type: string
             format: date-time
-          description: "Return metrics recorded after this timestamp (RFC3339). Defaults to 24 hours ago."
+          description: "Return metrics recorded at or after this timestamp (RFC3339). Defaults to 24 hours ago."
         - name: limit
           in: query
           schema:

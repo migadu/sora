@@ -80,8 +80,6 @@ func TestImporter_DovecotUIDPreservation(t *testing.T) {
 	options := ImporterOptions{
 		DryRun:        false,
 		PreserveFlags: true,
-		ShowProgress:  true,
-		ForceReimport: false,
 		CleanupDB:     true,
 		Dovecot:       true,
 		PreserveUIDs:  true, // This is the key option we're testing

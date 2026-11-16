@@ -48,6 +48,7 @@ var (
 )
 
 type POP3ProxySession struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server                *POP3ProxyServer
 	settings              *reloadableSettings // the settings its protocol server was built with (see reloadableSettings)
 	clientConn            net.Conn            // Reassigned on hijack; writes must hold mutex (sendGracefulShutdownMessage reads it from the Stop goroutine)
@@ -113,6 +114,9 @@ func (s *POP3ProxySession) ErrorLog(msg string, keysAndValues ...any) {
 }
 
 func (s *POP3ProxySession) authenticate(username, password string) error {
+	s.authSessionGeneration = s.server.connTracker.SessionGeneration()
+	cacheGeneration := s.server.lookupCache.Generation()
+
 	// Remember the username exactly as submitted: the lookup cache is keyed on
 	// it (every Set below uses it), so invalidation must use the same value —
 	// not the resolved s.username, which can differ for token/master/+detail logins.
@@ -442,7 +446,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 						IsNegative:     false,
 					}
 					proxy.CacheRoute(entry, routingInfo) // the route, its settings, FromRemoteLookup
-					s.server.lookupCache.Set(s.server.name, username, entry)
+					s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, entry)
 				}
 
 				s.authenticated = true
@@ -479,7 +483,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 				// Cache negative result (wrong password)
 				if s.server.lookupCache != nil {
-					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 						PasswordDigest: lookupcache.NewPasswordDigest(password),
 						Result:         lookupcache.AuthFailed,
 						IsNegative:     true,
@@ -517,7 +521,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 						db.DummyVerifyPassword(password)
 					}
 					if s.server.lookupCache != nil {
-						s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+						s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 							PasswordDigest: lookupcache.NewPasswordDigest(password),
 							Result:         lookupcache.AuthUserNotFound,
 							IsNegative:     true,
@@ -604,7 +608,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 			if isDefinitiveFailure {
 				if s.server.lookupCache != nil {
-					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 						PasswordDigest: lookupcache.NewPasswordDigest(password),
 						Result:         lookupcache.AuthFailed,
 						IsNegative:     true,
@@ -641,7 +645,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 	// Cache successful authentication (main DB)
 	if s.server.lookupCache != nil {
-		s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+		s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 			AccountID:        accountID,
 			PasswordDigest:   lookupcache.NewPasswordDigest(password),
 			ServerAddress:    "", // Will be populated by affinity/routing in next connection
@@ -717,7 +721,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		s.ctx,
 		preferredAddr,
-		clientHost, clientPort, serverHost, serverPort, s.routingInfo,
+		clientHost, clientPort, serverHost, serverPort, s.routingInfo.ForDial(s.listenerConn, s.sessionID),
 	)
 	if err != nil {
 		s.DebugLog("Failed to connect to backend", "error", err, "addr", preferredAddr)
@@ -1179,7 +1183,7 @@ func (s *POP3ProxySession) updateActivityPeriodically(ctx context.Context) {
 	}
 
 	// Register for kick notifications
-	kickChan := s.server.connTracker.RegisterSession(s.accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(s.accountID, s.authSessionGeneration)
 	defer s.server.connTracker.UnregisterSession(s.accountID, kickChan)
 
 	for {
@@ -1540,11 +1544,12 @@ func (s *POP3ProxySession) EnableUTF8(ctx context.Context) error {
 }
 
 func (s *POP3ProxySession) SetLanguage(ctx context.Context, lang string) (string, error) {
-	langTag := strings.ToLower(lang)
-	if langTag != "en" && langTag != "*" && langTag != "i-default" {
+	// A language range is ASCII (RFC 4647 section 2.1), matched case-insensitively.
+	isDefault := server.EqualFoldASCII(lang, "i-default")
+	if !isDefault && lang != "*" && !server.EqualFoldASCII(lang, "en") {
 		return "", &pop3server.Error{Message: "Unsupported language"}
 	}
-	if langTag == "i-default" {
+	if isDefault {
 		return "i-default", nil
 	}
 	return "en", nil

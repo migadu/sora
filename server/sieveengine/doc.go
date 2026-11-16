@@ -104,7 +104,7 @@
 //		dests = result.Destinations(true) // keep it after all
 //	}
 //	for _, dest := range dests {
-//		if err := deliverToMailbox(dest.Mailbox); err != nil {
+//		if err := deliverToMailbox(dest.Mailbox, dest.Flags); err != nil {
 //			return err // nothing handed over yet
 //		}
 //	}

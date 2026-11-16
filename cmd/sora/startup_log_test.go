@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,21 +45,30 @@ func TestStartupConfigWarningsReachTheConfiguredLog(t *testing.T) {
 	}
 
 	const misspelt = "[cleanup]\ngrace_periood = \"7d\"\n"
-	const pop3 = "\n[[server]]\ntype = \"pop3\"\nname = \"pop3\"\naddr = \"127.0.0.1:0\"\n"
 
 	t.Run("logging configured", func(t *testing.T) {
 		logPath := filepath.Join(t.TempDir(), "sora.log")
-		// shard_count = -2 stops start-up right after logging is configured: the timeout
-		// scheduler refuses it before any database or listener is touched.
-		out, err := run(t, fmt.Sprintf("[logging]\noutput = %q\nlevel = \"warn\"\n\n[timeout_scheduler]\nshard_count = -2\n\n", logPath)+storageTOML+misspelt+pop3)
-		if err == nil {
-			t.Fatalf("start-up went on; want it stopped by shard_count = -2:\n%s", out)
-		}
-		data, err := os.ReadFile(logPath)
+		// A reserved local metrics address stops start-up after logging is configured.
+		// It needs no database or S3, and still exercises held startup warnings now
+		// that invalid scheduler settings are refused by the configuration check.
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer listener.Close()
+		metrics := fmt.Sprintf("\n[[server]]\ntype = \"metrics\"\nname = \"metrics\"\naddr = %q\n", listener.Addr().String())
+		out, err := run(t, fmt.Sprintf("[logging]\noutput = %q\nlevel = \"warn\"\n\n", logPath)+misspelt+metrics)
+		if err == nil {
+			t.Fatalf("start-up went on; want it stopped by the occupied metrics address:\n%s", out)
+		}
+		data, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Fatalf("%v\nstderr:\n%s", err, out)
+		}
 		logged := string(data)
+		if !strings.Contains(logged, "metrics server failed") {
+			t.Fatalf("start-up did not stop at the metrics listener:\n%s\nstderr:\n%s", logged, out)
+		}
 		if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, "cleanup.grace_periood") {
 			t.Errorf("the log file has no WARN record naming cleanup.grace_periood:\n%s\nstderr:\n%s", logged, out)
 		}
@@ -66,16 +77,76 @@ func TestStartupConfigWarningsReachTheConfiguredLog(t *testing.T) {
 		}
 	})
 
-	// A start-up refused before logging is configured still shows what it held.
-	t.Run("refused before logging is configured", func(t *testing.T) {
+	// A file the configuration check refuses has a [logging] section, so the reason
+	// start-up stops goes there with what it held (#1762). It went to stderr, as a plain
+	// "[ERROR] ... invalid configuration - ..." line, so with output = syslog or a file the
+	// log never said why sora did not start.
+	t.Run("refused by the configuration check", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "sora.log")
+		out, err := run(t, fmt.Sprintf("[logging]\noutput = %q\nformat = \"json\"\nlevel = \"warn\"\n\n", logPath)+
+			misspelt+"\n[[server]]\ntype = \"pop3\"\nname = \"pop3\"\n")
+		if err == nil {
+			t.Fatalf("start-up went on; want it refused for the missing addr:\n%s", out)
+		}
+		data, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Fatalf("%v\nstderr:\n%s", err, out)
+		}
+		var warned, refused bool
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			var rec map[string]any
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				t.Errorf("the JSON log file has a line that is not JSON (%v): %q", err, line)
+				continue
+			}
+			switch {
+			case rec["level"] == "WARN" && strings.Contains(line, "cleanup.grace_periood"):
+				warned = true
+			case rec["level"] == "ERROR" && rec["msg"] == "Invalid configuration" &&
+				strings.Contains(fmt.Sprint(rec["error"]), "server address is required"):
+				refused = true
+			case rec["level"] == "INFO":
+				t.Errorf("the log file has an INFO record with level = \"warn\": %s", line)
+			}
+		}
+		if !warned || !refused {
+			t.Errorf("the log file does not have the held warning for cleanup.grace_periood (%v) and the refusal (%v):\n%s\nstderr:\n%s",
+				warned, refused, data, out)
+		}
+		if strings.Contains(out, "server address is required") {
+			t.Errorf("the refusal was also written to stderr:\n%s", out)
+		}
+	})
+
+	// Without a [logging] section the output is stderr, which shows what start-up held
+	// and then the refusal.
+	t.Run("refused by the configuration check without [logging]", func(t *testing.T) {
 		out, err := run(t, misspelt+"\n[[server]]\ntype = \"pop3\"\nname = \"pop3\"\n")
 		if err == nil {
 			t.Fatalf("start-up went on; want it refused for the missing addr:\n%s", out)
 		}
-		for _, want := range []string{"cleanup.grace_periood", "server address is required"} {
+		held := strings.Index(out, "cleanup.grace_periood")
+		refusal := strings.Index(out, "server address is required")
+		if held < 0 || refusal < 0 || held > refusal {
+			t.Errorf("output does not show the held warning and then the refusal:\n%s", out)
+		}
+	})
+
+	// A file that cannot be parsed has no [logging] to follow, even when it names one:
+	// the failure, after what start-up held, goes to stderr.
+	t.Run("refused before logging is configured", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "sora.log")
+		out, err := run(t, fmt.Sprintf("[logging]\noutput = %q\n\n[cleanup\n", logPath))
+		if err == nil {
+			t.Fatalf("start-up went on; want it refused for the syntax error:\n%s", out)
+		}
+		for _, want := range []string{"SORA application starting", "ERROR: failed to parse configuration file"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("output does not name %q:\n%s", want, out)
 			}
+		}
+		if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+			t.Errorf("the log file named by a file that cannot be parsed was opened (%v)", err)
 		}
 	})
 }

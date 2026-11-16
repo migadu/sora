@@ -252,6 +252,14 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		s.currentNumMessages.Add(^uint32(0)) // Equivalent to -1 for unsigned
 		// Track that the mailbox tracker's count decreased
 		trackerExpectedCount--
+		// An expunged \Recent message leaves the RECENT count with it. The
+		// mailbox's size changed, so the new count follows the EXPUNGE (RFC 3501
+		// §7.3.2): unlike the message count, which the EXPUNGE decrements itself
+		// (§7.4.1), nothing tells the client that its RECENT count dropped.
+		if update.UID > s.recentAboveUID && s.numRecent > 0 {
+			s.numRecent--
+			s.recentUnsent.Store(true)
+		}
 
 		// Mark this sequence number as already expunged to prevent duplicates
 		expungedSeqNums[update.SeqNum] = true
@@ -369,6 +377,20 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		}
 		s.currentNumMessages.Store(poll.NumMessages)
 
+		// RFC 3501 §7.3.2: RECENT "occurs ... if the size of the mailbox changes
+		// (e.g., new messages)", so this EXISTS is followed by the RECENT count
+		// (written once the EXISTS is, below). The new messages follow the
+		// finalCount ones the client knew, and each one counts when it is above
+		// recentAboveUID, the set SEARCH RECENT answers with. Normally that is
+		// all of them; one another read-write session had already seen when this
+		// SELECT read its baseline is not.
+		for _, update := range poll.Updates {
+			if !update.IsExpunge && update.SeqNum > finalCount && update.UID > s.recentAboveUID {
+				s.numRecent++
+			}
+		}
+		s.recentUnsent.Store(true)
+
 		// RFC 3501 §2.3.2: a read-write session that is notified of a message is
 		// the one that sees it as \Recent; later opens must not. Advance the same
 		// baselines a read-write SELECT sets, so that EXAMINE/SELECT after this
@@ -384,6 +406,7 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 	// needs it. A nil backend watch can mean NOTIFY NONE as well as the
 	// default, and only the library knows which policy its writer applies.
 	var flagFilterRead, flagsFiltered bool
+	recentAbove := s.recentFlagAboveLocked()
 	for _, update := range poll.Updates {
 		if update.IsExpunge {
 			continue
@@ -403,6 +426,8 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		// even if the client enables FlagChange again later.
 		if flagsFiltered {
 			s.reportedModSeqGap.Store(true)
+		} else {
+			s.queuedFlagUpdates.Store(true)
 		}
 
 		allFlags := db.BitwiseToFlags(update.BitwiseFlags)
@@ -415,25 +440,19 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		// Same filter FETCH and SELECT apply: a stored keyword that is not an
 		// IMAP atom cannot be encoded, and an unsolicited FETCH carrying one
 		// aborts the write and drops the session (helpers.IsValidFlagName).
-		allFlags = helpers.SanitizeFlags(allFlags)
+		allFlags = withRecentFlag(helpers.SanitizeFlags(allFlags), update.UID, recentAbove)
 		// Pass the change's modseq so CONDSTORE-aware sessions receive MODSEQ in the
 		// unsolicited FETCH response (RFC 7162 §3.2); the writer omits it otherwise.
 		s.mailboxTracker.QueueMessageFlags(update.SeqNum, update.UID, allFlags, update.EffectiveModSeq, nil)
 	}
 
 	// The session has now seen every change up to its cursor.
-	if s.ownStoreEchoMailboxID != mailboxID {
-		s.ownStoreEcho = nil
-	}
 	cursor := s.currentHighestModSeq.Load()
-	for uid, modSeq := range s.ownStoreEcho {
-		if modSeq <= cursor {
-			delete(s.ownStoreEcho, uid)
-		}
-	}
+	s.pruneOwnStoreEchoLocked(mailboxID, cursor)
 
 	// Store sessionTracker reference before releasing lock to avoid race condition
 	sessionTracker := s.sessionTracker
+	numRecent := s.numRecent
 
 	release() // Release the session lock before writing; ownStoreMu stays held (see above)
 
@@ -442,15 +461,33 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		return nil
 	}
 
-	if err := sessionTracker.Poll(w, allowExpunge); err != nil {
+	// The RECENT count goes out once the EXISTS or EXPUNGE that changed it has:
+	// a FETCH, STORE or SEARCH holds an EXPUNGE back, and the EXISTS behind it,
+	// and a later poll delivers them. Only with nothing left queued does the
+	// client know the messages numRecent counts. go-imap writes no RECENT to an
+	// IMAP4rev2 session.
+	if err := sessionTracker.PollWith(w, allowExpunge, func() error {
+		if sessionTracker.QueuedUpdates() == 0 && s.recentUnsent.Swap(false) {
+			return w.WriteNumRecent(numRecent)
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	// Every change up to the cursor has been queued, by this poll or an earlier
-	// one. Once nothing is left queued, and no NOTIFY filter consumed a flag
-	// change without reporting it, all of them have been sent. Polls run one
-	// at a time (seqViewMu) and the cursor never moves back.
-	if sessionTracker.QueuedUpdates() == 0 && !s.reportedModSeqGap.Load() {
-		s.reportedHighestModSeq.Store(cursor)
+	// one. Any flag update queued behind a withheld EXPUNGE stays queued until
+	// the tracker drains completely, so checking FlagChangeAllowed here catches
+	// a NOTIFY filter installed between queueing and delivery. Once nothing is
+	// left queued, and no NOTIFY filter consumed a flag change without
+	// reporting it, all of them have been sent. Polls run one at a time
+	// (seqViewMu) and the cursor never moves back.
+	if sessionTracker.QueuedUpdates() == 0 {
+		if s.queuedFlagUpdates.Swap(false) && !w.FlagChangeAllowed() {
+			s.reportedModSeqGap.Store(true)
+		}
+		if !s.reportedModSeqGap.Load() {
+			s.reportedHighestModSeq.Store(cursor)
+		}
 	}
 	return nil
 }
@@ -459,12 +496,37 @@ var _ imapserver.SessionHighestModSeq = (*IMAPSession)(nil)
 
 // HighestModSeq implements imapserver.SessionHighestModSeq: the HIGHESTMODSEQ the
 // first CONDSTORE enabling command with a mailbox selected returns (RFC 7162
-// §3.1). The poll cursor is not it: it also covers what a FETCH, STORE or SEARCH
-// left queued, an EXPUNGE they may not send and whatever follows it, and the
-// client adopts the value "even if it has seen higher mod-sequences" (RFC 7162
-// §6), so it would skip those changes if it resynchronized from it. A flag
+// §3.1), and the one written after a command whose MODSEQ FETCH data items went
+// past it, such as a STORE answered while another session's VANISHED is held
+// back (RFC 7162 §3.2). The poll cursor is not it: it also covers what a FETCH,
+// STORE or SEARCH left queued, an EXPUNGE they may not send and whatever
+// follows it, and the client adopts the value "even if it has seen higher
+// mod-sequences" (RFC 7162 §6), so it would skip those changes if it
+// resynchronized from it. A flag
 // change consumed under a NOTIFY filter also holds this value back until a
 // new SELECT: changing the filter does not replay the consumed flag update.
 func (s *IMAPSession) HighestModSeq() uint64 {
 	return s.reportedHighestModSeq.Load()
+}
+
+// pruneOwnStoreEchoLocked forgets the rows this session's own STORE and FETCH
+// answers recorded that Poll has now passed: all of them when they were
+// recorded in another mailbox, otherwise each one at or below cursor. A map
+// left empty is dropped rather than kept: Go never shrinks a map, so a STORE
+// over a large mailbox would otherwise hold its buckets (up to
+// maxFetchSeenEchoEntries rows) for as long as the mailbox stays selected. The
+// caller holds ownStoreMu.
+func (s *IMAPSession) pruneOwnStoreEchoLocked(mailboxID int64, cursor uint64) {
+	if s.ownStoreEchoMailboxID != mailboxID {
+		s.ownStoreEcho = nil
+		return
+	}
+	for uid, modSeq := range s.ownStoreEcho {
+		if modSeq <= cursor {
+			delete(s.ownStoreEcho, uid)
+		}
+	}
+	if len(s.ownStoreEcho) == 0 {
+		s.ownStoreEcho = nil
+	}
 }

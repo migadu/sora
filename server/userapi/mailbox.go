@@ -55,12 +55,13 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 	// Check if we should filter by subscribed status
 	subscribedOnly := r.URL.Query().Get("subscribed") == "true"
 
-	// Get ALL mailboxes; subscription state is sourced from the name-based
-	// subscriptions table (migration 000046), not the vestigial mailboxes.subscribed
-	// column, so we filter locally rather than pushing subscribedOnly into the query.
+	// Fetch all visible mailboxes so the writer fallback below sees INBOX even when
+	// subscribedOnly is set. GetMailboxesForUserWithRetry already computes
+	// mb.Subscribed from the subscriptions table using PostgreSQL's LOWER(), so
+	// subscription matching stays consistent with the database collation.
 	mailboxes, err := s.rdb.GetMailboxesForUserWithRetry(ctx, accountID, false)
 	if err == nil && !slices.ContainsFunc(mailboxes, func(mb *db.DBMailbox) bool {
-		return mb.AccountID == accountID && strings.EqualFold(mb.Name, "INBOX")
+		return mb.AccountID == accountID && isInboxNameASCII(mb.Name)
 	}) {
 		// The login made INBOX, which cannot be deleted; the read pool has not
 		// replayed it yet.
@@ -73,20 +74,9 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	subNames, err := s.rdb.GetSubscribedMailboxNamesWithRetry(ctx, accountID)
-	if err != nil {
-		logger.Warn("HTTP Mail API: Error retrieving subscriptions", "name", s.name, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve subscriptions")
-		return
-	}
-	subscribedSet := make(map[string]bool, len(subNames))
-	for _, n := range subNames {
-		subscribedSet[strings.ToLower(n)] = true
-	}
-
 	listed := make([]*db.DBMailbox, 0, len(mailboxes))
 	for _, mb := range mailboxes {
-		if !subscribedOnly || subscribedSet[strings.ToLower(mb.Name)] {
+		if !subscribedOnly || mb.Subscribed {
 			listed = append(listed, mb)
 		}
 	}
@@ -109,7 +99,7 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 		info := MailboxInfo{
 			Name:       mb.Name,
 			Path:       mb.Name, // Same as name for now
-			Subscribed: subscribedSet[strings.ToLower(mb.Name)],
+			Subscribed: mb.Subscribed,
 		}
 
 		// RFC 4314 §4: STATUS needs the "r" right. A shared mailbox listed with only "l"
@@ -178,6 +168,16 @@ func (s *Server) handleCreateMailbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A mailbox created in the shared namespace is a shared mailbox: IMAP CREATE makes
+	// it one or refuses it (the namespace root, or allow_user_create = false), and
+	// RENAME never moves a mailbox into the namespace. The User API does not create
+	// shared mailboxes, so it refuses these names rather than create personal
+	// mailboxes there.
+	if s.sharedMailboxes.InNamespace(canonicalName) {
+		s.writeError(w, http.StatusForbidden, "Mailboxes in the shared namespace cannot be created through the User API")
+		return
+	}
+
 	// Create mailbox
 	if err := s.rdb.CreateMailboxForUserWithRetry(ctx, accountID, canonicalName); err != nil {
 		if errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -217,7 +217,7 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Prevent deletion of INBOX
-	if strings.EqualFold(name, "INBOX") {
+	if isInboxNameASCII(name) {
 		s.writeError(w, http.StatusForbidden, "Cannot delete INBOX")
 		return
 	}
@@ -232,9 +232,14 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusConflict, "Mailbox has child mailboxes; delete them first")
 			return
 		}
-		// A shared mailbox without the 'x' right (RFC 4314 §2.1), which IMAP DELETE
+		// INBOX resolved via database collation (e.g. "İNBOX" under libc UTF-8), or
+		// a shared mailbox without the 'x' right (RFC 4314 §2.1), which IMAP DELETE
 		// answers NO [NOPERM].
 		if errors.Is(err, consts.ErrNotPermitted) {
+			if strings.Contains(err.Error(), "INBOX") {
+				s.writeError(w, http.StatusForbidden, "Cannot delete INBOX")
+				return
+			}
 			s.writeError(w, http.StatusForbidden, "Not permitted to delete this mailbox")
 			return
 		}
@@ -336,4 +341,21 @@ func validateMailboxName(name string) error {
 	}
 
 	return nil
+}
+
+// isInboxNameASCII reports whether s is the 5-byte ASCII name "INBOX" in any case.
+func isInboxNameASCII(s string) bool {
+	if len(s) != len(consts.MailboxInbox) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if 'a' <= c && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if c != consts.MailboxInbox[i] {
+			return false
+		}
+	}
+	return true
 }

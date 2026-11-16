@@ -201,9 +201,9 @@ func TestList_ExtendedEmptyPatternStillEnforcesCapabilityGates(t *testing.T) {
 // both empty and non-empty reference names.
 func TestList_EmptyPatternMatchesNoMailbox(t *testing.T) {
 	mboxes := []*db.DBMailbox{
-		{ID: 1, Name: "INBOX", Subscribed: true},
-		{ID: 2, Name: "Work", HasChildren: true, Subscribed: true},
-		{ID: 3, Name: "Work/Sub", Subscribed: true},
+		{ID: 1, Name: "INBOX", NameKey: "inbox", Subscribed: true},
+		{ID: 2, Name: "Work", NameKey: "work", HasChildren: true, Subscribed: true},
+		{ID: 3, Name: "Work/Sub", NameKey: "work/sub", Subscribed: true},
 	}
 	subscribed := map[string]string{
 		"inbox":    "INBOX",

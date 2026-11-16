@@ -1,6 +1,7 @@
 package relayqueue
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -35,11 +36,8 @@ func TestRequeueConcurrentPermanentFailureDoesNotLoseMessage(t *testing.T) {
 			workerRan = true
 			serverQ.pending.invalidate()
 			msg, _, acqErr := serverQ.AcquireNext()
-			if acqErr != nil || msg == nil {
-				t.Fatalf("worker AcquireNext after pending/%s.json appeared: msg=%v err=%v", id, msg, acqErr)
-			}
-			if failErr := serverQ.MarkPermanentFailure(msg.ID, "550 5.1.1 still rejected"); failErr != nil {
-				t.Fatalf("worker MarkPermanentFailure: %v", failErr)
+			if acqErr != nil || msg != nil {
+				t.Fatalf("worker crossed the active publication lease: %v %v", msg, acqErr)
 			}
 		}
 		return err
@@ -50,6 +48,14 @@ func TestRequeueConcurrentPermanentFailureDoesNotLoseMessage(t *testing.T) {
 	}
 	if !workerRan {
 		t.Fatal("worker seam did not fire when pending/<id>.json became visible")
+	}
+	serverQ.pending.invalidate()
+	msg, _, err := acquireProtocolEventually(t, serverQ)
+	if err != nil || msg == nil {
+		t.Fatalf("worker acquire after handoff: %v %v", msg, err)
+	}
+	if err := serverQ.MarkPermanentFailure(msg.ID, "550 5.1.1 still rejected"); err != nil {
+		t.Fatal(err)
 	}
 
 	pending, processing, failed, err := serverQ.GetStats()
@@ -104,6 +110,13 @@ func TestRecoverOrphanedMessagesFinishesInterruptedRequeue(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var metadata QueuedMessage
+	if err := json.Unmarshal(metaBytes, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.writeState(requeueState{Phase: "publishing", Metadata: metadata}); err != nil {
+		t.Fatal(err)
+	}
 	recovered, err := q.RecoverOrphanedMessages()
 	if err != nil {
 		t.Fatalf("RecoverOrphanedMessages: %v", err)

@@ -19,6 +19,7 @@ type fakeLMTPBackend struct {
 	implicitTLS   bool   // the listener speaks TLS from the first byte
 	startTLSReply string // reply to STARTTLS; "" refuses it with 502
 	noHandshake   bool   // after a 220 reply stay silent instead of handshaking
+	lhloAfterTLS  string // reply to LHLO once TLS is up; "" accepts it with 250
 }
 
 // start serves one connection and returns its address and a function that waits for
@@ -56,6 +57,7 @@ func (b fakeLMTPBackend) start(t *testing.T) (addr string, commands func() []str
 		}
 		r := bufio.NewReader(conn)
 		io.WriteString(conn, "220 fake LMTP backend ready\r\n")
+		secured := false
 		for {
 			line, err := r.ReadString('\n')
 			if err != nil {
@@ -65,6 +67,10 @@ func (b fakeLMTPBackend) start(t *testing.T) (addr string, commands func() []str
 			mu.Lock()
 			got = append(got, line)
 			mu.Unlock()
+			if secured && b.lhloAfterTLS != "" && strings.HasPrefix(strings.ToUpper(line), "LHLO ") {
+				io.WriteString(conn, b.lhloAfterTLS)
+				continue
+			}
 			if !strings.EqualFold(line, "STARTTLS") {
 				io.WriteString(conn, "250 OK\r\n")
 				continue
@@ -82,6 +88,7 @@ func (b fakeLMTPBackend) start(t *testing.T) (addr string, commands func() []str
 				return
 			}
 			conn, r = secure, bufio.NewReader(secure)
+			secured = true
 		}
 	}()
 	return ln.Addr().String(), func() []string {
