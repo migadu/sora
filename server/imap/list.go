@@ -449,7 +449,7 @@ func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.
 	// sharedNamespaceRoot is empty when shared mailboxes are disabled, so a
 	// personal folder that happens to be named like the prefix is not falsely
 	// marked \Noselect.
-	if sharedNamespaceRoot != "" && strings.EqualFold(mbox.Name, sharedNamespaceRoot) {
+	if isSharedNamespaceRoot(mbox.Name, sharedNamespaceRoot) {
 		attributes = append(attributes, imap.MailboxAttrNoSelect)
 	}
 

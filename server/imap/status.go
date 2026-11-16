@@ -3,7 +3,6 @@ package imap
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
@@ -56,7 +55,7 @@ func (s *IMAPSession) Status(ctx context.Context, mboxName string, options *imap
 	}
 	// Prevent querying STATUS on the shared-namespace root, which is a
 	// non-selectable container (matching SELECT/EXAMINE and LIST's \Noselect).
-	if sharedRoot := s.sharedNamespaceRoot(); sharedRoot != "" && strings.EqualFold(mboxName, sharedRoot) {
+	if s.server.config != nil && s.server.config.SharedMailboxes.IsNamespaceRoot(mboxName) {
 		s.DebugLog("cannot get status of shared namespace root", "mailbox", mboxName)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,

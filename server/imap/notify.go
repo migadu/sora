@@ -1215,7 +1215,7 @@ func (s *IMAPSession) notifyDiffSnapshots(watch *notifyWatch, cur map[int64]noti
 		}
 		// As in LIST, the configured shared namespace root is always a
 		// non-selectable container, including after its last child is deleted.
-		if sharedRoot != "" && strings.EqualFold(ev.name, sharedRoot) {
+		if isSharedNamespaceRoot(ev.name, sharedRoot) {
 			data.Attrs = append(data.Attrs, imap.MailboxAttrNoSelect)
 		}
 		if children {
