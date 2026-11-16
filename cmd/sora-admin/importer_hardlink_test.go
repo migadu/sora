@@ -320,3 +320,38 @@ func TestImportFollowsALinkToAFileOthersMayNotReadOnlyBelowItsDirectory(t *testi
 		}
 	})
 }
+
+// A group member with write access can place the same hard link as any other writer.
+// The directory's matching owner alone cannot vouch for a private file in that case.
+func TestScanMaildirRefusesPrivateHardLinkInGroupWritableDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		directoryMode os.FileMode
+		fileMode      os.FileMode
+		wantCached    bool
+	}{
+		{"group write and private file", 0770, 0600, false},
+		{"group read without write and private file", 0750, 0600, true},
+		{"group write and public file", 0770, 0644, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const name = "1700000002.M2P1.host:2,S"
+			maildir := newMaildirWith(t, nil)
+			directory := filepath.Join(maildir, "cur")
+			require.NoError(t, os.Chmod(directory, tc.directoryMode))
+			secret := outsideFile(t, cachedSizeMessage("Group secret", 100))
+			require.NoError(t, os.Chmod(secret, tc.fileMode))
+			ownedByAnotherUser(t, directory, secret)
+			path := filepath.Join(directory, name)
+			require.NoError(t, os.Link(secret, path))
+			importer := newTestModeImporter(t, maildir, newMockResilientDatabase(), ImporterOptions{})
+			require.NoError(t, importer.scanMaildir())
+			_, cached := scannedMessages(t, importer)[path]
+			assert.Equal(t, tc.wantCached, cached)
+			if !tc.wantCached {
+				require.Len(t, failureReasons(importer, path), 1)
+				assert.Contains(t, failureReasons(importer, path)[0], "group or others may write")
+			}
+		})
+	}
+}
