@@ -687,7 +687,8 @@ func (i *Importer) processSubscriptions() error {
 // not open. The usual --sieve file of a Dovecot migration is that link, which is the
 // user's, and the import runs with privileges the user lacks: the link must not
 // choose which file those privileges read into the user's account. Only a regular
-// file is read (openRegularFile).
+// file is read (openRegularFile), at most maxSieveScriptSize+1 bytes to detect an
+// oversized file without reading it whole.
 func readSieveFile(path string) ([]byte, error) {
 	path = filepath.Clean(path)
 	root, err := os.OpenRoot(filepath.Dir(path))
@@ -700,7 +701,14 @@ func readSieveFile(path string) ([]byte, error) {
 		return nil, err
 	}
 	defer file.Close()
-	return io.ReadAll(file)
+	content, err := io.ReadAll(io.LimitReader(file, maxSieveScriptSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(content) > maxSieveScriptSize {
+		return nil, fmt.Errorf("script exceeds the maximum size of %d bytes", maxSieveScriptSize)
+	}
+	return content, nil
 }
 
 // importSieveScript imports a Sieve script file for the user
