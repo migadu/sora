@@ -145,9 +145,9 @@ func TestBodySectionCacheKey_DistinguishesSections(t *testing.T) {
 		"binary":     binarySectionCacheKey(hash, nil),
 		"binary 2":   binarySectionCacheKey(hash, []int{2}),
 		"binary 2.1": binarySectionCacheKey(hash, []int{2, 1}),
-		// A requested name is an astring (header-fld-name, RFC 9051 §9) and a field-name
-		// may hold any printable but ':' (RFC 5322 §3.6.8), so neither a space nor a
-		// separator character inside a name may pass for list structure.
+		// A requested name is an astring (header-fld-name, RFC 9051 §9), which may
+		// contain spaces; valid field-names may contain punctuation such as '|' and
+		// ']' (RFC 5322 §3.6.8). Neither may pass for list structure in the key.
 		"fields (A B)":     bodySectionCacheKey(hash, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{"A", "B"}}),
 		"fields (\"A B\")": bodySectionCacheKey(hash, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{"A B"}}),
 		"fields (]|[q)":    bodySectionCacheKey(hash, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{"]|[q"}}),
