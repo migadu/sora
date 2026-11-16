@@ -1705,6 +1705,7 @@ remote_tls_verify = true              # Verify backend server TLS certificates
 # remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots; only for backends in no [[pool]].
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_id_command = false         # Send IMAP ID command to backends
+remote_skip_forwarding_with_proxy_protocol = false # IMAP/POP3 only: opt in to omitting ID/XCLIENT when PROXY is actually sent; loses extra metadata
 remote_health_checks = true           # Enable backend health tracking (default: true)
                                       # When false, all backends are always considered healthy.
                                       # Disable only for debugging or when backends have external health monitoring.
