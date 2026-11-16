@@ -70,6 +70,47 @@ func TestMailSizeDeclarationBeyond32Bits(t *testing.T) {
 	}
 }
 
+// "size-value ::= 1*20DIGIT" (RFC 1870 section 3 (4)) bounds the value to 20 digits: a
+// longer one is a syntax error, 501 5.5.4, as the LMTP proxy answers it
+// (TestMAILRefusesMalformedSizeParameter), even when its leading zeros leave a small
+// number.
+func TestMailSizeLongerThan20Digits(t *testing.T) {
+	addr := startSizeTestBackend(t, DefaultMaxMessageSize)
+	conn := dialUntilListening(t, addr)
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	r := bufio.NewReader(conn)
+
+	if line := readReplyLine(t, r); !strings.HasPrefix(line, "220 ") {
+		t.Fatalf("greeting %q, want 220", line)
+	}
+	io.WriteString(conn, "LHLO client.example.org\r\n")
+	for {
+		line := readReplyLine(t, r)
+		if len(line) < 4 || !strings.HasPrefix(line, "250") {
+			t.Fatalf("LHLO reply line %q, want 250", line)
+		}
+		if line[3] == ' ' {
+			break
+		}
+	}
+
+	for _, tc := range []struct{ size, want string }{
+		{"000000000000000000001", "501 5.5.4 "}, // 21 digits, the number 1
+		{"123456789012345678901", "501 5.5.4 "}, // 21 digits
+		{"00000000000000000001", "250 "},        // 20 digits
+	} {
+		fmt.Fprintf(conn, "MAIL FROM:<sender@example.org> SIZE=%s\r\n", tc.size)
+		if got := readReplyLine(t, r); !strings.HasPrefix(got, tc.want) {
+			t.Errorf("MAIL SIZE=%s: %q, want %q", tc.size, got, tc.want)
+		}
+		io.WriteString(conn, "RSET\r\n")
+		if got := readReplyLine(t, r); !strings.HasPrefix(got, "250 ") {
+			t.Fatalf("RSET: %q, want 250", got)
+		}
+	}
+}
+
 // startSizeTestBackend starts an LMTP backend (no database) that trusts the loopback
 // peer and has the given maximum message size, and returns its address.
 func startSizeTestBackend(t *testing.T, maxMessageSize int64) string {
