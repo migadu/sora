@@ -29,8 +29,9 @@ func openSearchDir(dirfd int, name string) (int, error) {
 	return fd, err
 }
 
-// lstatAt is os.Lstat of name in the directory dirfd.
-func lstatAt(dirfd int, name string) (*statInfo, error) {
+// lstatAt is os.Lstat of name in the directory dirfd. It is a variable so that a test
+// can make an entry stat as an automount point does before it is mounted.
+var lstatAt = func(dirfd int, name string) (*statInfo, error) {
 	info := &statInfo{name: name}
 	err := ignoringEINTR(func() error { return unix.Fstatat(dirfd, name, &info.st, unix.AT_SYMLINK_NOFOLLOW) })
 	if err != nil {

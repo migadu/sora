@@ -408,7 +408,14 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 	var flagFilterRead, flagsFiltered bool
 	recentAbove := s.recentFlagAboveLocked()
 	for _, update := range poll.Updates {
-		if update.IsExpunge {
+		// Creation's initial flags are announced by EXISTS and the optional
+		// MessageNew FETCH (which excludes own APPEND/COPY/MOVE). Suppress only
+		// that known initial state. A STORE can commit after creation but before
+		// this poll, including on an own arrival whose MessageNew FETCH is
+		// suppressed. It must still be reported as FlagChange, or keep the safe
+		// reported watermark below it when that event is filtered. Unknown legacy
+		// state versions conservatively follow the same flag-update path.
+		if update.IsExpunge || (update.IsNew && update.FlagsAreInitial) {
 			continue
 		}
 

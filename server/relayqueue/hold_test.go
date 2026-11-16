@@ -89,9 +89,15 @@ func TestCleanupOrphansRemovesDeadHold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := q.Hold("from@example.com", "dead@example.org", "redirect", []byte("dead")); err != nil {
-		t.Fatalf("Hold: %v", err)
+	// This dead writer has no live lease. Actual process-death lease release is
+	// covered by the subprocess protocol controls.
+	if err := os.WriteFile(filepath.Join(q.pendingDir, "dead-hold.msg"), []byte("dead"), 0600); err != nil {
+		t.Fatal(err)
 	}
+	if err := q.writeFileAtomic(filepath.Join(q.pendingDir, "dead-hold"+heldExt), QueuedMessage{ID: "dead-hold"}); err != nil {
+		t.Fatal(err)
+	}
+
 	old := time.Now().Add(-2 * orphanGracePeriod)
 	for _, name := range pendingFiles(t, q) {
 		if err := os.Chtimes(filepath.Join(q.pendingDir, name), old, old); err != nil {

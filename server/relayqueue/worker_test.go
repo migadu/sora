@@ -867,6 +867,9 @@ func TestWorkerCircuitBreakerNoInfiniteLoop(t *testing.T) {
 	}
 
 success:
+	// A handler's success precedes durable local terminal cleanup. Join workers
+	// before asserting that all queue files have been removed.
+	worker.Stop()
 	t.Logf("All 8 messages delivered after %d total handler calls", handler.getCallCount())
 
 	// Verify queue is empty

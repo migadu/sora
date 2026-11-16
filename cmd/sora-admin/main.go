@@ -120,6 +120,9 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	if err := config.LoadServerConfig(configPath, fullCfg); err != nil {
 		return err
 	}
+	if err := fullCfg.S3.ValidateBodyDeletionProtocol(); err != nil {
+		return fmt.Errorf("[s3]: %w", err)
+	}
 	// `mailbox create`, `mailbox rename` and `import maildir` classify names by namespace_prefix.
 	if err := fullCfg.SharedMailboxes.Validate(); err != nil {
 		return fmt.Errorf("[shared_mailboxes]: %w", err)

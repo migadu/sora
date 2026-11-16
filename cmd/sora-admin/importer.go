@@ -123,6 +123,7 @@ type messageMetadata struct {
 	references           []string
 	bodyStructure        *imap.BodyStructure
 	recipients           []helpers.Recipient
+	headerPresence       *int16
 	flags                []imap.Flag
 	preservedUID         *uint32
 	preservedUIDValidity *uint32
@@ -1630,11 +1631,13 @@ const maxImportRootLinks = 255
 // and a user can make an entry of their home directory (~/Maildir, ~/sieve) a symbolic
 // link to any directory the import can read, such as another user's maildir, which
 // would then be read into the account named by --email. So a link on the way is
-// followed only when it belongs to root or to the owner of the directory it leads to,
-// as a link a user made to a directory of their own does; any other is refused,
-// naming it, so the operator can name the directory itself. The owner of a link says
-// who made it, not who gave it its name: where users may hard-link a file they do not
-// own, a link with more than one name is refused too.
+// followed only when it belongs to root, to the user the import runs as, or to the
+// owner of the directory it leads to, as a link a user made to a directory of their
+// own does. A link of root or of that user leads only where that user could name
+// directly, as maildirCacheLinkRule trusts them. Any other link is refused, naming it,
+// so the operator can name the directory itself. The owner of a link says who made
+// it, not who gave it its name: where users may hard-link a file they do not own, a
+// link with more than one name is refused too.
 //
 // path is walked a component at a time by descriptor from the file system root (a
 // relative one from the working directory), as the system resolves it: a ".." after a
@@ -1664,6 +1667,7 @@ func openExportRoot(path string) (*os.Root, error) {
 // openLinkCheckedRoot is openImportRoot and, with create, openExportRoot.
 func openLinkCheckedRoot(path string, create bool) (*os.Root, error) {
 	sep := string(filepath.Separator)
+	euid := uint32(geteuid())
 	given := path
 	if !filepath.IsAbs(path) {
 		wd, err := os.Getwd()
@@ -1749,7 +1753,7 @@ func openLinkCheckedRoot(path string, create bool) (*os.Root, error) {
 				return nil, &fs.PathError{Op: "stat", Path: resolved, Err: err}
 			}
 			if uid := fileUID(info); uid != st.linkUID {
-				return nil, fmt.Errorf("refusing %s: %s is a symbolic link of uid %d to %s, a directory of uid %d, and a link is followed only if it belongs to root or to the owner of the directory it leads to; name that directory instead", given, st.link, st.linkUID, resolved, uid)
+				return nil, fmt.Errorf("refusing %s: %s is a symbolic link of uid %d to %s, a directory of uid %d, and a link is followed only if it belongs to root, to the user this runs as (uid %d) or to the owner of the directory it leads to; name that directory instead", given, st.link, st.linkUID, resolved, uid, euid)
 			}
 			continue
 		case st.name == "..":
@@ -1802,7 +1806,7 @@ func openLinkCheckedRoot(path string, create bool) (*os.Root, error) {
 				return nil, fmt.Errorf("refusing %s: %s is a symbolic link with %d names, and on this system any user may have given it this one with a hard link; name the directory it leads to instead", given, name, nlink)
 			}
 			next := split(target)
-			if uid := fileUID(again); uid != 0 {
+			if uid := fileUID(again); uid != 0 && uid != euid {
 				next = append(next, step{link: name, linkUID: uid})
 			}
 			steps = append(next, steps...)
@@ -1816,14 +1820,17 @@ func openLinkCheckedRoot(path string, create bool) (*os.Root, error) {
 		if !info.IsDir() {
 			return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.ENOTDIR}
 		}
+		// The walk goes on from the directory opened here, not from the one lstatted:
+		// the open does not follow a link, and every later check looks at what it
+		// opened. The two differ at an automount point that is not mounted yet, which
+		// lstats as the directory that triggers the mount (stat does not mount, the
+		// open of a directory does), and the open reaches the directory a walk by
+		// path reaches. A directory renamed in between is walked as if renamed before.
 		dir, err := openSearchDir(cur, st.name)
 		if err != nil {
 			return nil, &fs.PathError{Op: "open", Path: name, Err: err}
 		}
 		dirs = append(dirs, dir)
-		if dirInfo, err := fstatDir(dir, name); err != nil || !sameStat(info, dirInfo) {
-			return nil, fmt.Errorf("refusing %s: %s was replaced while it was opened", given, name)
-		}
 		resolved = name
 	}
 
@@ -2652,6 +2659,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		references:           references,
 		bodyStructure:        &bodyStructure,
 		recipients:           recipients,
+		headerPresence:       helpers.ExtractHeaderPresence(messageContent.Header),
 		flags:                flags,
 		preservedUID:         preservedUID,
 		preservedUIDValidity: preservedUIDValidity,
@@ -2876,6 +2884,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) (inserted, present []
 			References:           up.metadata.references,
 			BodyStructure:        up.metadata.bodyStructure,
 			Recipients:           up.metadata.recipients,
+			HeaderPresence:       up.metadata.headerPresence,
 			PreservedUID:         up.metadata.preservedUID,
 			PreservedUIDValidity: up.metadata.preservedUIDValidity,
 			FTSRetention:         i.options.FTSRetention,
@@ -3036,6 +3045,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 			References:           up.metadata.references,
 			BodyStructure:        up.metadata.bodyStructure,
 			Recipients:           up.metadata.recipients,
+			HeaderPresence:       up.metadata.headerPresence,
 			PreservedUID:         up.metadata.preservedUID,
 			PreservedUIDValidity: up.metadata.preservedUIDValidity,
 			FTSRetention:         i.options.FTSRetention,

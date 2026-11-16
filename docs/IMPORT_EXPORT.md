@@ -125,20 +125,23 @@ is a message. Files in `new/` usually carry no flags, so they arrive unread.
 The maildir may have been written by its owner, while the import runs with more privileges, so
 source messages and Dovecot metadata are read through the opened maildir root. Symbolic links
 below it cannot redirect those reads outside the root. `--maildir-path` itself, or a directory
-on the way to it, may be a symbolic link only when the link belongs to root or to the owner of
-the directory it leads to, as `/var/mail/alice -> /srv/mail/alice` made by root or a user's own
-`~/Maildir -> ~/mail/Maildir` does. A user who can replace `~/Maildir` could otherwise point it at
-another user's maildir and have that read into the account. Any other link makes the import
-refuse to start, naming the link, its owner and the directory it leads to, before the
-`sora-maildir.db` cache is created; name that directory itself to import it. A link's owner says
-who made it, not who gave it its name, so where users may hard-link a file they do not own (macOS
-and the BSDs, and Linux with `fs.protected_hardlinks = 0`) a link with more than one name is
-refused as well: `ln -P /var/mail/bob ~/Maildir` would otherwise pass as root's link. The import
-sees only the names a link has when it runs: on such a system, a hard link a user made earlier
-to root's link (or to another user's link to their own maildir) has one name again once that
-original name is removed (root deletes `/var/mail/bob`, or bob replaces his link), and it is then
-followed as the link of its owner. Where users may make such links, name the maildir's own
-directory, with no link on the way, as `--maildir-path` (or `--sieve`). These are
+on the way to it, may be a symbolic link only when the link belongs to root, to the user running
+`sora-admin`, or to the owner of the directory it leads to, as
+`/var/mail/alice -> /srv/mail/alice` made by root, `/srv/import/alice -> /var/vmail/alice` made by
+an operator who is not root, or a user's own `~/Maildir -> ~/mail/Maildir` does. A link of root or
+of the user running `sora-admin` leads only where that user could name directly. A user who can
+replace `~/Maildir` could otherwise point it at another user's maildir and have that read into the
+account. Any other link makes the import refuse to start, naming the link, its owner and the
+directory it leads to, before the `sora-maildir.db` cache is created; name that directory itself
+to import it. A link's owner says who made it, not who gave it its name, so where users may
+hard-link a file they do not own (macOS and the BSDs, and Linux with `fs.protected_hardlinks = 0`)
+a link with more than one name is refused as well: `ln -P /var/mail/bob ~/Maildir` would otherwise
+pass as root's link. The import sees only the names a link has when it runs: on such a system, a
+hard link a user made earlier to root's link (or to a link of the user running `sora-admin`, or to
+another user's link to their own maildir) has one name again once that original name is removed
+(root deletes `/var/mail/bob`, or bob replaces his link), and it is then followed as the link of
+its owner. Where users may make such links, name the maildir's own directory, with no link on the
+way, as `--maildir-path` (or `--sieve`). These are
 Unix UID checks. Checking them needs no more permission than opening the path does: the
 directories above the maildir need only be searchable (`x`), not readable, by the user running
 the import. Below the root, a folder that is a link is not walked and is named in a warning.
@@ -617,7 +620,7 @@ sora-admin --config config.toml export maildir --email user@example.com \
 |---|---|---|
 | `--email` | | Any address of the account (required). |
 | `--maildir-path` | | Target directory (required). Created if missing. |
-| `--dry-run` | `false` | List each message as `EXPORT` or `SKIP` and write no messages. The target directory and its cache file are still created. |
+| `--dry-run` | `false` | List each message as `EXPORT`, `SKIP` or `UPDATE` without changing the target directory, cache or SQLite sidecars. See the snapshot requirements below. |
 | `--mailbox-filter` | all | Comma-separated mailbox names, case-insensitive, `*` suffix for a prefix. |
 | `--start-date`, `--end-date` | | `YYYY-MM-DD`, by INTERNALDATE (UTC); the end day is included. |
 | `--dovecot` | `false` | Also write `dovecot-keywords` per folder, the `subscriptions` file, and `dovecot-uidlist` files. |
@@ -625,6 +628,25 @@ sora-admin --config config.toml export maildir --email user@example.com \
 | `--overwrite-flags` | `false` | Rewrite messages exported earlier with their current flags. |
 | `--jobs` | `4` | Messages exported in parallel within a mailbox. |
 | `--delay` | `0` | Pause after each exported message (Go duration). |
+
+**Dry-run cache snapshot.** A missing target or cache stays missing. When a cache
+exists, preview copies its database and WAL into an owner-only temporary directory,
+reads that private copy, and removes it on close. The source database, WAL and SHM
+are never opened by SQLite or changed; source SHM is not copied. Committed rows left
+in WAL after a crash are included. The preview runs a separate helper process that
+holds a nonblocking exclusive POSIX lock while copying, so an active SQLite user
+causes a clear refusal. Stop users of that cache and retry; do not remove its WAL.
+A rollback journal is also refused: recover and close it normally before preview.
+
+This snapshot is supported on local POSIX-locking Linux filesystems
+(ext2/3/4, XFS, Btrfs, tmpfs or overlayfs) and macOS APFS/HFS/UFS/tmpfs. Other
+filesystems/platforms fail closed when a cache exists. It assumes the normal Unix
+SQLite locking protocol and functioning filesystem locks; custom/no-lock VFSes or
+programs changing the files outside that protocol are not supported. The helper
+requires permission to open the main database read/write to acquire the exclusive
+lock, but never writes it. Temporary space must fit the database and WAL; an
+unsafe cache (including linked or nonregular DB/WAL files), copy/read failure or cancellation fails the preview and removes the
+private copy. Message files retain the export's directory confinement checks.
 
 **What is exported.** Every mailbox the account can see, including shared mailboxes it has access
 to, and every message that is not expunged. Bodies are downloaded from S3 under the key stored on
