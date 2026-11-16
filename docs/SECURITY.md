@@ -466,7 +466,7 @@ instead.
 |---|---|---|---|
 | `append_limit` | `imap` | `25mb` | `NO [TOOBIG] Literals are limited to <n> bytes for this command`, before the data is accepted (data already sent with a non-synchronizing literal is read and dropped). Advertised as `APPENDLIMIT=<n>`. `0` also gives 25 MiB: there is no "unlimited". |
 | `max_message_size` | `lmtp` | `50mb` | `552 5.3.4 message size exceeds maximum allowed size of <n> bytes`. Sora reads at most the limit plus one byte into memory. `0` also gives 50 MiB. Reloads on SIGHUP. |
-| `max_message_size` | `lmtp_proxy` | `50mb` | Advertised as `SIZE <n>` in the proxy's `LHLO` reply. A `MAIL` whose `SIZE=` is above it gets `552 5.3.4`, one whose `SIZE=` is not a number `501 5.5.4`, before the data. The declared size is passed on to a backend that advertises `SIZE`, and the backend enforces its own limit. |
+| `max_message_size` | `lmtp_proxy` | `50mb` | Advertised as `SIZE <n>` in the proxy's `LHLO` reply. A `MAIL` whose `SIZE=` is above it gets `552 5.3.4`, one whose `SIZE=` is not 1 to 20 digits `501 5.5.4`, before the data. The declared size is passed on to a backend that advertises `SIZE`, and the backend enforces its own limit. |
 | `max_script_size` | `managesieve` | `16kb` | `NO (QUOTA/MAXSIZE)`. Advertised as `MAXSCRIPTSIZE`. Reloads on SIGHUP. |
 
 LMTP accepts one recipient per transaction (`RCPTMAX=1`), so one `DATA` is stored for one account.
