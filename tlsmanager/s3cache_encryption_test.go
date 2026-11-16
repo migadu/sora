@@ -35,6 +35,13 @@ func newEncryptionRecorder(t *testing.T) (*encryptionRecorder, string) {
 }
 
 func (r *encryptionRecorder) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// CAS publication first reads the object and any legacy deletion marker.
+	// This recorder has no stored entries; its focus remains PUT encryption headers.
+	if req.Method == http.MethodGet {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`<Error><Code>NoSuchKey</Code></Error>`))
+		return
+	}
 	if req.Method == http.MethodPut {
 		r.mu.Lock()
 		r.puts++
