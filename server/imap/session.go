@@ -129,6 +129,8 @@ type IMAPSession struct {
 	bodySectionCacheMu   sync.Mutex
 	bodySectionCacheKey  string
 	bodySectionCacheData []byte
+	bodySectionCacheFile *os.File
+	bodySectionCacheSize int
 
 	// Session statistics for summary logging
 	messagesAppended atomic.Uint32

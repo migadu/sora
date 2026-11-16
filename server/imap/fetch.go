@@ -775,6 +775,16 @@ func (s *IMAPSession) decodeBinaryPart(b *decodedBinary, p *binaryPart, options 
 	key := binarySectionCacheKey(msg.ContentHash, p.part)
 	section := s.cachedBodySection(key) // charged to the retention while it is retained
 	retained := section != nil
+
+	chunked := !slices.ContainsFunc(p.sections, func(i int) bool { return options.BinarySection[i].Partial == nil })
+	if !retained {
+		if spilledSize, ok := s.cachedSpilledSectionSize(key); ok {
+			if ok, err := s.answerBinaryFromSpill(b, p, options, msg.UID, key, spilledSize, chunked, int64(len(*bodyData))); ok || err != nil {
+				return err
+			}
+		}
+	}
+
 	var body []byte // the body the section is decoded from, held with its copies
 	if !retained {
 		var err error
@@ -800,7 +810,6 @@ func (s *IMAPSession) decodeBinaryPart(b *decodedBinary, p *binaryPart, options 
 		b.sizes[i] = uint32(len(section))
 	}
 
-	chunked := !slices.ContainsFunc(p.sections, func(i int) bool { return options.BinarySection[i].Partial == nil })
 	if !chunked {
 		// The whole section is sent, so the items are slices of it, held and
 		// charged once until the response is written. A retained section needs
@@ -834,14 +843,66 @@ func (s *IMAPSession) decodeBinaryPart(b *decodedBinary, p *binaryPart, options 
 	}
 	// Retention is optional. A partial that fits the remaining budget must
 	// still work when keeping the full section does not, or is not eligible.
-	if !retained && key != "" && len(section) > 0 && len(section) <= maxCachedBodySectionBytes {
-		if charged, ok := s.chargeSectionCopy(len(section)); ok {
-			if !s.retainBodySection(key, section) {
-				s.freeSectionCopies(charged)
+	if !retained && key != "" && len(section) > 0 {
+		if len(section) <= maxCachedBodySectionBytes {
+			if charged, ok := s.chargeSectionCopy(len(section)); ok {
+				if !s.retainBodySection(key, section) {
+					s.freeSectionCopies(charged)
+				}
 			}
+		} else {
+			s.spillBodySection(key, section)
 		}
 	}
 	return nil
+}
+
+// answerBinaryFromSpill serves p's BINARY and BINARY.SIZE items from a disk-spilled
+// section, charging session memory before allocating buffers. If the spilled file can no
+// longer be read, it releases any partial charges made for p and returns (false, nil) so
+// the caller falls back to loading and decoding the raw message.
+func (s *IMAPSession) answerBinaryFromSpill(b *decodedBinary, p *binaryPart, options *imap.FetchOptions, uid imap.UID, key string, spilledSize int, chunked bool, loadedBody int64) (bool, error) {
+	for _, i := range p.sizes {
+		b.sizes[i] = uint32(spilledSize)
+	}
+	if len(p.sections) == 0 {
+		return true, nil
+	}
+	if !chunked {
+		charged, ok := s.chargeSectionCopy(spilledSize)
+		if !ok {
+			return false, s.sectionMemoryRefused(uid, loadedBody+b.charged+int64(spilledSize))
+		}
+		full := make([]byte, spilledSize)
+		if !s.readSpilledSectionInto(key, 0, full) {
+			s.freeSectionCopies(charged)
+			return false, nil
+		}
+		for _, i := range p.sections {
+			b.sections[i] = applyPartial(full, options.BinarySection[i].Partial)
+		}
+		b.charged += charged
+		return true, nil
+	}
+
+	var partCharged int64
+	for _, i := range p.sections {
+		off, length := partialBounds(spilledSize, options.BinarySection[i].Partial)
+		n, ok := s.chargeSectionCopy(length)
+		if !ok {
+			s.freeSectionCopies(partCharged)
+			return false, s.sectionMemoryRefused(uid, loadedBody+b.charged+partCharged+int64(length))
+		}
+		buf := make([]byte, length)
+		if !s.readSpilledSectionInto(key, off, buf) {
+			s.freeSectionCopies(partCharged + n)
+			return false, nil
+		}
+		partCharged += n
+		b.sections[i] = buf
+	}
+	b.charged += partCharged
+	return true, nil
 }
 
 // writeDecodedBinary writes the BINARY sections and BINARY.SIZE values
@@ -909,6 +970,18 @@ func (s *IMAPSession) extractBodySection(ctx context.Context, bodyData *[]byte, 
 		if retained := s.cachedBodySection(cacheKey); retained != nil {
 			return s.retainedSectionChunk(msg.UID, applyPartial(retained, section.Partial), int64(len(*bodyData))+priorCopies)
 		}
+		if spilledSize, ok := s.cachedSpilledSectionSize(cacheKey); ok {
+			off, length := partialBounds(spilledSize, section.Partial)
+			charged, ok := s.chargeSectionCopy(length)
+			if !ok {
+				return nil, 0, s.sectionMemoryRefused(msg.UID, int64(len(*bodyData))+priorCopies+int64(length))
+			}
+			buf := make([]byte, length)
+			if s.readSpilledSectionInto(cacheKey, off, buf) {
+				return buf, charged, nil
+			}
+			s.freeSectionCopies(charged)
+		}
 	}
 
 	if err := s.loadSectionBody(ctx, msg, bodyData, bodyDataFetched, priorCopies); err != nil {
@@ -922,6 +995,14 @@ func (s *IMAPSession) extractBodySection(ctx context.Context, bodyData *[]byte, 
 	full, copied := safeExtractBodySection(*bodyData, sectionWithoutPartial(section))
 	if !copied {
 		return applyPartial(full, section.Partial), 0, nil // the body itself, charged as such
+	}
+	if section.Partial != nil && len(full) > maxCachedBodySectionBytes {
+		chunk, charged, err := s.retainedSectionChunk(msg.UID, applyPartial(full, section.Partial), int64(len(*bodyData))+priorCopies)
+		if err != nil {
+			return nil, 0, err
+		}
+		s.spillBodySection(cacheKey, full)
+		return chunk, charged, nil
 	}
 	charged, ok := s.chargeSectionCopy(len(full))
 	if !ok {
