@@ -628,7 +628,7 @@ func (i *Importer) processSubscriptions() error {
 	logger.Info("Processing Dovecot subscriptions", "path", subscriptionsPath)
 
 	// Read the subscriptions file
-	content, err := i.readMaildirFile(subscriptionsPath)
+	content, err := i.readMaildirFile(subscriptionsPath, maxDovecotSubscriptionsSize)
 	if err != nil {
 		return fmt.Errorf("failed to read subscriptions file: %w", err)
 	}
@@ -817,7 +817,7 @@ func (i *Importer) parseDovecotKeywords() error {
 
 	logger.Info("Parsing Dovecot keywords", "path", keywordsPath)
 
-	keywords, err := parseKeywordsFile(keywordsPath, i.readMaildirFile)
+	keywords, err := parseKeywordsFile(keywordsPath, i.openMaildirFile)
 	if err != nil {
 		return err
 	}
@@ -1391,14 +1391,41 @@ func (i *Importer) openMaildirFile(path string) (*os.File, error) {
 	return openRegularFile(i.root, name)
 }
 
-// readMaildirFile is os.ReadFile through the maildir root (openMaildirFile).
-func (i *Importer) readMaildirFile(path string) ([]byte, error) {
+// readMaildirFile is os.ReadFile through the maildir root (openMaildirFile), for a
+// file of at most limit bytes (readFileUpTo).
+func (i *Importer) readMaildirFile(path string, limit int64) ([]byte, error) {
 	file, err := i.openMaildirFile(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	return io.ReadAll(file)
+	return readFileUpTo(file, limit)
+}
+
+// maxDovecotKeywordsSize and maxDovecotSubscriptionsSize are the most of a
+// dovecot-keywords and a subscriptions file the import and the export read. Whoever
+// can write to the maildir, or to the export's destination, decides their size, and a
+// sparse file costs them no disk: read whole, a huge one would exhaust the memory of
+// the host running sora-admin. Both limits are far above any real file: Dovecot writes
+// at most 26 lines to dovecot-keywords and reads none longer than 1 KiB
+// (maildir-keywords.c), and a subscriptions file has one line per subscribed folder.
+const (
+	maxDovecotKeywordsSize      = 64 << 10 // 64 KiB
+	maxDovecotSubscriptionsSize = 4 << 20  // 4 MiB
+)
+
+// readFileUpTo reads file to its end, which must come within limit bytes: a larger
+// file is refused, naming it, after reading limit+1 bytes of it, however large it is
+// or grows.
+func readFileUpTo(file *os.File, limit int64) ([]byte, error) {
+	content, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(content)) > limit {
+		return nil, fmt.Errorf("%s is larger than %d bytes", file.Name(), limit)
+	}
+	return content, nil
 }
 
 // errNotRegularFile refuses a file the import would read that is a FIFO, a socket or
@@ -3051,30 +3078,41 @@ func (i *Importer) getProgressPrefix() string {
 }
 
 // parseKeywordsFile reads one dovecot-keywords file ("<index> <keyword>" per line,
-// index 0-25 ↔ letters a-z in maildir filenames) with readFile. Malformed lines are
-// skipped.
-func parseKeywordsFile(path string, readFile func(string) ([]byte, error)) (map[int]string, error) {
-	content, err := readFile(path)
+// index 0-25 ↔ letters a-z in maildir filenames), opened with open, of at most
+// maxDovecotKeywordsSize bytes. Malformed lines are skipped, and so is a line whose
+// index no letter names, as Dovecot skips it (maildir-keywords.c). The file's writer
+// decides how long and how many those lines are, so one warning names the file, how
+// many were skipped and the first of them, shortened.
+func parseKeywordsFile(path string, open func(string) (*os.File, error)) (map[int]string, error) {
+	var content []byte
+	file, err := open(path)
+	if err == nil {
+		content, err = readFileUpTo(file, maxDovecotKeywordsSize)
+		file.Close()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to read dovecot-keywords file: %w", err)
 	}
 	keywords := make(map[int]string)
+	skipped, firstSkipped := 0, ""
 	for _, line := range strings.Split(string(content), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, " ", 2)
-		if len(parts) != 2 {
-			logger.Info("Warning: Skipping malformed dovecot-keywords line", "path", path, "line", line)
+		index, keyword, found := strings.Cut(line, " ")
+		id, err := strconv.Atoi(index)
+		if !found || err != nil || id < 0 || id >= maxMaildirKeywords {
+			if skipped == 0 {
+				firstSkipped = line
+			}
+			skipped++
 			continue
 		}
-		id, err := strconv.Atoi(parts[0])
-		if err != nil {
-			logger.Info("Warning: Invalid keyword ID in line", "path", path, "line", line)
-			continue
-		}
-		keywords[id] = parts[1]
+		keywords[id] = keyword
+	}
+	if skipped > 0 {
+		logger.Warn("Skipping malformed dovecot-keywords lines", "path", path, "count", skipped, "first", truncateString(firstSkipped, 80))
 	}
 	return keywords, nil
 }
@@ -3106,7 +3144,7 @@ func (i *Importer) keywordsForMessagePath(path string) map[int]string {
 		kws = i.dovecotKeywords
 	} else if i.options.Dovecot {
 		if _, err := os.Stat(keywordsPath); err == nil {
-			parsed, perr := parseKeywordsFile(keywordsPath, i.readMaildirFile)
+			parsed, perr := parseKeywordsFile(keywordsPath, i.openMaildirFile)
 			if perr != nil {
 				logger.Warn("Failed to read folder dovecot-keywords, importing its messages without keywords", "path", keywordsPath, "error", perr)
 			} else {
