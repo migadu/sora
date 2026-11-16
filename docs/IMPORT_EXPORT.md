@@ -393,15 +393,22 @@ Table `messages`:
 | `hash` | BLAKE3 hash of the (decompressed) content. |
 | `size` | Content size in bytes. |
 | `mailbox` | Mapped mailbox name. |
-| `s3_uploaded`, `s3_uploaded_at` | `1` once the message is in S3 and PostgreSQL. |
+| `s3_uploaded`, `s3_uploaded_at` | Compatibility projection of the last recovery/import; completion decisions use the destination ledger. |
+| `account_id` | Legacy numeric stamp, retained for compatibility; it is not sufficient proof of a destination. |
 
 Rows are unique per (`hash`, `mailbox`) and per (`filename`, `mailbox`).
 
 On every run:
 
-1. **Recovery.** Rows marked imported whose message never reached PostgreSQL are reset to "not
-   imported". This repairs a run that stopped between the database and the cache. A message the
-   user deleted in Sora since then stays deleted.
+1. **Recovery.** The importer reads the logical database UUID from the primary, once, before
+   scanning or writing account data. The `import_completions` table records each completed
+   (`database_uuid`, `account_id`, `hash`, `mailbox`) copy independently. A completion for this
+   destination remains trusted if the user later deleted that message in Sora. Switching from
+   destination A to B and back to A retains both histories. Legacy numeric-only marks and rows
+   written by the exporter have no trusted completion: they are checked against a live copy in
+   the account's own target mailbox, then recorded or reset to "not imported". A matching hash
+   in a different mailbox is insufficient. Failure to read the identity, verify the destination,
+   or update the cache stops the run rather than silently skipping unchecked rows.
 2. **Scan.** The whole maildir (or the `--paths-file` list) is walked and every file is read and
    hashed. New files get rows; files already known keep theirs.
 3. **Import** of the selected rows ([section 9](#9-re-runs-duplicates-and-incremental-imports)).
@@ -409,8 +416,25 @@ On every run:
 
 A cache written by an older build, without the `s3_uploaded` columns, is upgraded on open: the
 columns are added and existing rows are marked imported, then step 1 checks them against
-PostgreSQL. `--cleanup-db` deletes the file after a run without errors. `export maildir` uses a file of
+PostgreSQL. Old caches cannot prove whether an absent message was previously imported and
+then deleted; that first verification can re-import it. Later completed runs retain deletion
+history per destination. `--cleanup-db` deletes the file after a run without errors. `export maildir` uses a file of
 the same name and layout in its target directory ([section 14](#14-export-maildir)).
+
+The logical database UUID is stored by PostgreSQL migration 68 in
+`public.database_identity`. Restarts, backups restored as the same destination, and replicated
+failover must preserve it; a hostname, connection string or server process is not the identity.
+When operating a copied database as an **independent destination**, stop imports against that
+copy and give it a new identity before reusing a Maildir cache:
+
+```sql
+UPDATE public.database_identity SET identity = gen_random_uuid() WHERE singleton;
+```
+
+Perform this only on the independent copy. Rotating an existing destination's identity makes
+its old completion history unverified; missing messages can then be imported again. All import
+clients sharing a cache need this version's destination-aware completion handling. Removing
+`sora-maildir.db` also discards its completion and deletion history.
 
 ---
 
@@ -426,8 +450,13 @@ marked imported in the cache.
 uploaded to S3 again, and offered to the database, which skips the duplicates. This is slow for a
 large maildir but needs nothing from the cache.
 
-**With `--incremental`**, only rows not marked imported are processed. Use it for every pass
-after the first.
+**With `--incremental`**, only rows not completed for the current database and account are
+processed. Use it for every pass after the first. An intentional deletion in Sora stays deleted
+while the corresponding destination completion history remains in the cache.
+
+The unused Maildir `--force-reimport`, import/export `--progress`, and S3 `--show-progress`
+flags have been removed. The S3 importer's separate `--force-reimport` option remains supported
+([section 13](#13-import-s3)).
 
 Things a later pass does not do:
 
@@ -493,12 +522,14 @@ The importer loads the selected rows and processes them in batches of `--batch-s
 2. **Insert.** By default, the uploaded messages are inserted per mailbox in chunks of up to 500
    rows, with duplicates filtered out. If a chunk fails as a whole, its messages are inserted one
    by one so that each failure is reported by path.
-3. **Mark.** The inserted messages are marked imported in the cache.
+3. **Mark.** Newly inserted and already-present copies are recorded completed in the cache.
+   The row projection and destination completion ledger commit in one SQLite transaction.
 
 With `--batch-transaction`, step 2 inserts the whole batch in one transaction. It is faster, but
 an error other than a duplicate or a UID conflict rolls back the whole batch, and all of its
-messages count as failed. If marking the cache fails after the commit, the importer deletes the
-batch's messages from PostgreSQL again.
+messages count as failed. If marking the cache fails after the commit, the importer attempts
+rollback compensation for the messages newly inserted by that batch; pre-existing duplicates
+are retained.
 
 Raise `--jobs` and `--batch-size` for faster imports over a fast network; lower them to reduce
 load on PostgreSQL and S3.
