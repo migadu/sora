@@ -214,3 +214,40 @@ func TestNewImporterRefusesAHardLinkedSymbolicLinkToAnotherUsersMaildir(t *testi
 		})
 	}
 }
+
+// openImportRoot walks the path by descriptor to check the links on the way. The
+// os.OpenRoot it replaced, like any open by path, needed only search permission on
+// the directories above the root, not read permission: an import run by a user who
+// may pass through a directory without listing it (a mode 0711 home, or root on an
+// NFS mount with root_squash) must still open the maildir and the --sieve file.
+func TestOpenImportRootNeedsOnlySearchPermissionAboveTheRoot(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root may read every directory")
+	}
+	const name = "1700000001.M1P1.host:2,S"
+	const script = "keep;\n"
+	home := filepath.Join(t.TempDir(), "home")
+	maildirPath := filepath.Join(home, "alice", "Maildir")
+	for _, dir := range []string{"cur", "new", "tmp"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(maildirPath, dir), 0755))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(maildirPath, "cur", name), cachedSizeMessage("Own", 100), 0644))
+	sievePath := filepath.Join(home, "alice", "sieve", "managesieve.sieve")
+	require.NoError(t, os.Mkdir(filepath.Dir(sievePath), 0755))
+	require.NoError(t, os.WriteFile(sievePath, []byte(script), 0644))
+	require.NoError(t, os.Chmod(home, 0311))
+	t.Cleanup(func() { os.Chmod(home, 0755) })
+	_, err := os.ReadDir(home)
+	require.ErrorIs(t, err, fs.ErrPermission, "the test user may still list the directory")
+
+	t.Run("maildir", func(t *testing.T) {
+		importer := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), ImporterOptions{})
+		require.NoError(t, importer.scanMaildir())
+		assert.Equal(t, map[string]string{filepath.Join(maildirPath, "cur", name): "INBOX"}, scannedMessages(t, importer))
+	})
+	t.Run("sieve", func(t *testing.T) {
+		content, err := readSieveFile(sievePath)
+		require.NoError(t, err)
+		assert.Equal(t, script, string(content))
+	})
+}
