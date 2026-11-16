@@ -182,3 +182,43 @@ func TestIMAP_AuthenticateLonePadOnlyInInitialResponse(t *testing.T) {
 		})
 	}
 }
+
+// A reply to a continuation request is a base64 line (RFC 9051 §9:
+// authenticate = ... *(CRLF base64), base64-char = ALPHA / DIGIT / "+" / "/").
+// A CR inside it is outside the base64 alphabet, which the server MUST reject
+// with a tagged BAD (RFC 9051 §6.2.2). Valid credentials with a CR spliced in
+// must not log the client in.
+func TestIMAP_AuthenticateReplyWithBareCRIsBad(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	creds := base64.StdEncoding.EncodeToString([]byte("\x00" + account.Email + "\x00" + account.Password))
+	for _, tc := range []struct {
+		name, reply string
+	}{
+		{name: "CR inside", reply: creds[:4] + "\r" + creds[4:]},
+		{name: "CR before the CRLF", reply: creds + "\r"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, reader := dialAuthenticate(t, server.Address)
+
+			fmt.Fprintf(conn, "A1 AUTHENTICATE PLAIN\r\n")
+			if line, err := reader.ReadString('\n'); err != nil || line != "+ \r\n" {
+				t.Fatalf("continuation request = %q, %v", line, err)
+			}
+			fmt.Fprintf(conn, "%s\r\n", tc.reply)
+			if got, want := readTagged(t, reader, "A1"), "A1 BAD Malformed SASL response"; got != want {
+				t.Fatalf("%s: got %q, want %q", tc.name, got, want)
+			}
+
+			// Still not authenticated: the same credentials, sent cleanly,
+			// log in on the same connection.
+			fmt.Fprintf(conn, "A2 AUTHENTICATE PLAIN %s\r\n", creds)
+			if got := readTagged(t, reader, "A2"); !strings.HasPrefix(got, "A2 OK") {
+				t.Fatalf("AUTHENTICATE after the refused one = %q, want A2 OK", got)
+			}
+		})
+	}
+}
