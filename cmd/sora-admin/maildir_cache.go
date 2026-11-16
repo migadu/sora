@@ -69,7 +69,7 @@ func openMaildirCache(dir string) (*sql.DB, error) {
 	// the files beside it are checked in that resolved directory.
 	dir, err := resolveMaildirDir(dir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open maildir database: %w", err)
 	}
 	refuseHardLinks, err := maildirCacheLinkRule(dir)
 	if err != nil {
