@@ -68,7 +68,7 @@ type DatabaseManager interface {
 	CleanupOldRedirectsWithRetry(ctx context.Context, olderThan time.Duration) (int64, error)
 	CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error)
-	// ExecuteWithLockedS3Orphans runs fn with the objects that are still orphans, or
+	// ExecuteWithS3BodyCleanup runs fn with the objects that are still orphans, or
 	// whose rows alone may go (KeepObject), while holding their per-object locks; fn's
 	// context is cancelled if the locks are lost.
 	ExecuteWithS3BodyCleanup(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(context.Context, []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error)) (int64, error)
@@ -296,10 +296,10 @@ type S3BulkDeleter interface {
 // and how many rows went. It is the cleaner's S3 phase, and the account purge's.
 //
 // Ordering is deliberate and unchanged: the S3 object goes first and the rows follow.
-// If the process dies in between, the rows are expunged rows nothing can read, the next
-// cycle lists them again and re-issues a delete for an object that is already gone
-// (DeleteObjects treats that as success), and the rows are removed then. The reverse
-// order would strand the body in the bucket with nothing left pointing at it.
+// If the process dies in between, its durable intent keeps the hash quarantined;
+// operator reconciliation must settle the remote outcome before new claims. Later
+// cleanup may retire the remaining expired candidates after reconciliation. Deleting
+// rows before storage would strand the body with no candidate pointing at it.
 func reapS3Objects(ctx context.Context, rdb s3ObjectReaper, s3 S3BulkDeleter, gracePeriod time.Duration, candidates []db.UserScopedObjectForCleanup) (int, int64, error) {
 	deleted := 0
 	var rowsDeleted int64
