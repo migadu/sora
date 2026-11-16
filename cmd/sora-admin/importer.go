@@ -1764,14 +1764,17 @@ func openImportRoot(path string) (*os.Root, error) {
 		if !info.IsDir() {
 			return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.ENOTDIR}
 		}
+		// The walk goes on from the directory opened here, not from the one lstatted:
+		// the open does not follow a link, and every later check looks at what it
+		// opened. The two differ at an automount point that is not mounted yet, which
+		// lstats as the directory that triggers the mount (stat does not mount, the
+		// open of a directory does), and the open reaches the directory a walk by
+		// path reaches. A directory renamed in between is walked as if renamed before.
 		dir, err := openSearchDir(cur, st.name)
 		if err != nil {
 			return nil, &fs.PathError{Op: "open", Path: name, Err: err}
 		}
 		dirs = append(dirs, dir)
-		if dirInfo, err := fstatDir(dir, name); err != nil || !sameStat(info, dirInfo) {
-			return nil, fmt.Errorf("refusing %s: %s was replaced while it was opened", given, name)
-		}
 		resolved = name
 	}
 
