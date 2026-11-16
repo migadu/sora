@@ -129,8 +129,11 @@ func handleMigrateDown(ctx context.Context) {
 			logger.Fatalf("Database is in a dirty state (version %d). Please fix manually with 'force' command.", version)
 		}
 
-		logger.Info("Reverting all migrations", "count", version)
-		if err := m.Steps(-int(version)); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		// Down reverts every applied migration. The version is not a count of them: the
+		// migration numbers have gaps, and Steps(-version) ran out of migrations to
+		// revert and failed with "limit N short" after reverting them all.
+		logger.Info("Reverting all migrations", "from_version", version)
+		if err := m.Down(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 			logger.Fatalf("Failed to revert all migrations: %v", err)
 		}
 	} else {

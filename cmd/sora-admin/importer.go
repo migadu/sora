@@ -1409,8 +1409,8 @@ var errNotRegularFile = errors.New("not a regular file")
 // written by their owner, who can make one a FIFO (mkfifo; rsync -a copies them), and
 // opening a FIFO for reading waits until something opens it for writing: the run
 // would never finish, and cancelling it would not end the wait. The file is opened
-// with O_NONBLOCK, which does not wait, and the open file is checked, so a file
-// replaced since a stat or a directory listing cannot get past the check. A regular
+// with O_NONBLOCK to avoid that FIFO writer wait, and the open file is checked, so
+// a file replaced since a stat or directory listing cannot get past the check. A regular
 // file is then read in blocking mode, as os.Open reads it.
 func openRegularFile(root *os.Root, name string) (*os.File, error) {
 	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
