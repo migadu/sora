@@ -15,10 +15,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -683,7 +685,8 @@ func (i *Importer) processSubscriptions() error {
 // ~/.dovecot.sieve -> sieve/<name>.sieve; a link out of it, or an absolute one, does
 // not open. The usual --sieve file of a Dovecot migration is that link, which is the
 // user's, and the import runs with privileges the user lacks: the link must not
-// choose which file those privileges read into the user's account.
+// choose which file those privileges read into the user's account. Only a regular
+// file is read (openRegularFile).
 func readSieveFile(path string) ([]byte, error) {
 	path = filepath.Clean(path)
 	root, err := os.OpenRoot(filepath.Dir(path))
@@ -691,7 +694,12 @@ func readSieveFile(path string) ([]byte, error) {
 		return nil, err
 	}
 	defer root.Close()
-	return root.ReadFile(filepath.Base(path))
+	file, err := openRegularFile(root, filepath.Base(path))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return io.ReadAll(file)
 }
 
 // importSieveScript imports a Sieve script file for the user
@@ -1372,31 +1380,79 @@ func (i *Importer) isMessageAlreadyImported(hash string, mailboxID int64) (bool,
 // or metadata file) and however it changes while the import runs. The maildir may have
 // been written by its owner, and the import runs with privileges the owner lacks: a
 // link must not choose which files those privileges read into the owner's mailbox.
-// Folders that are links are not walked at all (scanMaildir).
+// Folders that are links are not walked at all (scanMaildir). Only a regular file
+// opens (openRegularFile).
 func (i *Importer) openMaildirFile(path string) (*os.File, error) {
 	name, err := i.maildirName(path)
 	if err != nil {
 		return nil, err
 	}
-	return i.root.Open(name)
+	return openRegularFile(i.root, name)
 }
 
 // readMaildirFile is os.ReadFile through the maildir root (openMaildirFile).
 func (i *Importer) readMaildirFile(path string) ([]byte, error) {
-	name, err := i.maildirName(path)
+	file, err := i.openMaildirFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return i.root.ReadFile(name)
+	defer file.Close()
+	return io.ReadAll(file)
 }
 
-// readMaildirDir is os.ReadDir through the maildir root (openMaildirFile).
+// errNotRegularFile refuses a file the import would read that is a FIFO, a socket or
+// a device.
+var errNotRegularFile = errors.New("not a regular file")
+
+// openRegularFile opens name below root for reading if it is a regular file, and
+// fails with errNotRegularFile otherwise. The files the import reads may have been
+// written by their owner, who can make one a FIFO (mkfifo; rsync -a copies them), and
+// opening a FIFO for reading waits until something opens it for writing: the run
+// would never finish, and cancelling it would not end the wait. The file is opened
+// with O_NONBLOCK, which does not wait, and the open file is checked, so a file
+// replaced since a stat or a directory listing cannot get past the check. A regular
+// file is then read in blocking mode, as os.Open reads it.
+func openRegularFile(root *os.Root, name string) (*os.File, error) {
+	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err == nil && !info.Mode().IsRegular() {
+		err = &fs.PathError{Op: "open", Path: name, Err: errNotRegularFile}
+	}
+	if err == nil {
+		var conn syscall.RawConn
+		if conn, err = file.SyscallConn(); err == nil {
+			cerr := conn.Control(func(fd uintptr) { err = syscall.SetNonblock(int(fd), false) })
+			if cerr != nil {
+				err = cerr
+			}
+		}
+	}
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+// readMaildirDir is os.ReadDir through the maildir root (openMaildirFile). Only a
+// directory opens: with O_DIRECTORY anything else fails before it is opened, so a
+// FIFO does not wait for a writer (openRegularFile).
 func (i *Importer) readMaildirDir(path string) ([]os.DirEntry, error) {
 	name, err := i.maildirName(path)
 	if err != nil {
 		return nil, err
 	}
-	return fs.ReadDir(i.root.FS(), filepath.ToSlash(name))
+	dir, err := i.root.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	entries, err := dir.ReadDir(-1)
+	slices.SortFunc(entries, func(a, b os.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+	return entries, err
 }
 
 // maildirName returns the name of path below the maildir root. A path the cache holds
@@ -1673,17 +1729,23 @@ func (i *Importer) scanMaildir() error {
 				}
 
 				for _, message := range messages {
-					if message.IsDir() {
+					if message.IsDir() || !isValidMaildirMessage(message.Name()) {
 						continue
 					}
 
-					if isValidMaildirMessage(message.Name()) {
-						filesToProcess <- fileToProcess{
-							path:        filepath.Join(path, subDir, message.Name()),
-							filename:    message.Name(),
-							mailboxName: mailboxName,
-						}
+					file := fileToProcess{
+						path:        filepath.Join(path, subDir, message.Name()),
+						filename:    message.Name(),
+						mailboxName: mailboxName,
 					}
+					// A FIFO, socket or device is refused without being opened, as
+					// opening one may act on the device. A symbolic link is opened,
+					// which refuses it unless it names a regular file (openMaildirFile).
+					if typ := message.Type(); typ&os.ModeSymlink == 0 && !typ.IsRegular() {
+						refuse(file, errNotRegularFile.Error())
+						continue
+					}
+					filesToProcess <- file
 				}
 			}
 

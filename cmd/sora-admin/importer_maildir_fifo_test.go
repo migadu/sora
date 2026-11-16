@@ -12,6 +12,7 @@ import (
 	"github.com/migadu/sora/logger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // A maildir's owner can make any file in it a named pipe (mkfifo), and rsync -a copies
@@ -258,4 +259,25 @@ func TestImportSieveScriptRefusesAFIFO(t *testing.T) {
 		assert.Contains(t, err.Error(), sievePath, "the refusal does not name the file")
 	}
 	assert.Empty(t, rdb.stored)
+}
+
+// openRegularFile opens with O_NONBLOCK so that a FIFO does not wait, and must leave a
+// regular file in blocking mode: a filesystem that honours O_NONBLOCK for regular files
+// would otherwise fail a read with EAGAIN.
+func TestOpenRegularFileReadsInBlockingMode(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "message"), []byte("x"), 0644))
+	root, err := os.OpenRoot(dir)
+	require.NoError(t, err)
+	defer root.Close()
+
+	file, err := openRegularFile(root, "message")
+	require.NoError(t, err)
+	defer file.Close()
+	conn, err := file.SyscallConn()
+	require.NoError(t, err)
+	var flags int
+	require.NoError(t, conn.Control(func(fd uintptr) { flags, err = unix.FcntlInt(fd, unix.F_GETFL, 0) }))
+	require.NoError(t, err)
+	assert.Zero(t, flags&unix.O_NONBLOCK, "a regular file was left in non-blocking mode")
 }
