@@ -53,3 +53,52 @@ foreverypart { extracttext "x"; if string :contains "${x}" "café" { fileinto "e
 		})
 	}
 }
+
+// TestLeafUnknownCharsetKeepsTransferDecodeFailure: decoding a part by its
+// recovered charset must not let an unknown charset hide an unknown transfer
+// encoding. go-message reports only the charset error when both are unknown,
+// and the body test tolerates that error to match raw octets, so a part it
+// cannot transfer-decode was matched and counted. Before the ";;" form was
+// decoded with its charset, go-message saw no charset there and the part was
+// skipped; it must stay skipped, like the canonical form.
+func TestLeafUnknownCharsetKeepsTransferDecodeFailure(t *testing.T) {
+	const script = `require ["body", "fileinto", "relational"];
+if body :text :contains "needle" { fileinto "text"; }
+if body :text :count "eq" "0" { fileinto "zero"; }
+if body :raw :contains "needle" { fileinto "raw"; }`
+	want := []string{"zero", "raw"}
+
+	for _, contentType := range []string{
+		"text/plain; charset=x-unknown",
+		"text/plain; charset=x-unknown;;",
+		"text/plain; charset=x-unknown; ;",
+	} {
+		leaf := "Content-Type: " + contentType + "\r\n" +
+			"Content-Transfer-Encoding: x-unknown\r\n" +
+			"\r\n" +
+			"needle\r\n"
+		for _, tc := range []struct{ name, part string }{
+			{"part", leaf},
+			{"nested message", "Content-Type: message/rfc822\r\n\r\n" + leaf},
+		} {
+			t.Run(tc.name+"/"+contentType, func(t *testing.T) {
+				raw := "From: a@example.com\r\n" +
+					"MIME-Version: 1.0\r\n" +
+					"Content-Type: multipart/mixed; boundary=B\r\n" +
+					"\r\n" +
+					"--B\r\n" + tc.part + "--B--\r\n"
+				executor, err := NewSieveExecutorWithExtensions(script, DefaultSieveExtensions)
+				if err != nil {
+					t.Fatalf("compile: %v", err)
+				}
+				result, err := executor.Evaluate(context.Background(), rawContext(t, raw))
+				if err != nil {
+					t.Fatalf("evaluate: %v", err)
+				}
+				if !slices.Equal(result.Mailboxes, want) {
+					t.Errorf("mailboxes = %q, want %q", result.Mailboxes, want)
+				}
+			})
+		}
+	}
+}
