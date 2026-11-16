@@ -501,6 +501,19 @@ func (rd *ResilientDatabase) ReconcileNegativeMailboxStatsWithRetry(ctx context.
 	return rd.getOperationalDatabaseForOperation(ctx, true).ReconcileNegativeMailboxStats(ctx)
 }
 
+// FindExcessUnseenCountsWithRetry checks one batch of mailboxes for a cached unseen_count
+// above the live count (see db.FindExcessUnseenCounts).
+func (rd *ResilientDatabase) FindExcessUnseenCountsWithRetry(ctx context.Context, accountID, afterMailboxID int64, limit int) (db.UnseenExcessBatch, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).FindExcessUnseenCounts(ctx, accountID, afterMailboxID, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return db.UnseenExcessBatch{}, err
+	}
+	return result.(db.UnseenExcessBatch), nil
+}
+
 func (rd *ResilientDatabase) GetPrimaryEmailForAccountWithRetry(ctx context.Context, accountID int64) (server.Address, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).GetPrimaryEmailForAccount(ctx, accountID)
