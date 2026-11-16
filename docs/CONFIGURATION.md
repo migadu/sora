@@ -189,6 +189,7 @@ to standard error, one for each problem the file has.
 | A server has a type that is not in the list in [section 5](#5-server-blocks) | `invalid server type '<type>', must be one of: imap, lmtp, ...` |
 | `master_username` is set and `master_password` is empty | `server "<name>": master_username is set but master_password is empty; refusing to start ...` |
 | `master_sasl_username` is set and `master_sasl_password` is empty | `server "<name>": master_sasl_username is set but master_sasl_password is empty; refusing to start ...` |
+| An `imap`, `pop3` or `managesieve` server's `master_sasl_allowed_networks` has an entry that is neither an IP address nor a CIDR block | `server "<name>": invalid master_sasl_allowed_networks: invalid trusted network '<entry>': not a valid IP address or CIDR` |
 | `[[pool]]` blocks are inconsistent (see [section 10](#10-named-backend-pools-pool)) | `[[pool]]: ...` |
 | A proxy server (a type ending in `_proxy`) has no `remote_addrs` and the file has no `[[pool]]` blocks | `server '<name>': remote_addrs is required unless the file declares [[pool]] blocks` |
 | A proxy server has a `remote_addrs` entry without a host: empty, only spaces, or a port alone such as `":143"` | `server "<name>": remote_addrs #<n>: empty backend address` |
@@ -350,9 +351,9 @@ start. Rewrite each one as a `[[server]]` block with `type`, `name` and `addr`.
    server applies the settings it can change at runtime. New sessions use the new values. Sessions
    that are already open keep the values they started with.
 
-Before applying a block, Sora runs the same per-server check as at startup (type, master passwords).
-A block that fails it is skipped with `Skipping reload: invalid new server config`, and that server
-keeps its old settings.
+Before applying a block, Sora runs the same per-server check as at startup (type, master passwords,
+`master_sasl_allowed_networks`). A block that fails it is skipped with
+`Skipping reload: invalid new server config`, and that server keeps its old settings.
 
 Only the settings in this table reload:
 

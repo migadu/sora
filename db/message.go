@@ -17,31 +17,32 @@ import (
 
 // Message struct to represent an email message
 type Message struct {
-	ID             int64      // ID of the message
-	AccountID      int64      // ID of the user who owns the message
-	UID            imap.UID   // Unique identifier for the message
-	ContentHash    string     // Hash of the message content
-	S3Domain       string     // S3 domain for the message
-	S3Localpart    string     // S3 localpart for the message
-	MailboxID      int64      // ID of the mailbox the message belongs to
-	IsUploaded     bool       // Indicates if the message is uploaded to S3
-	Seq            uint32     // Sequence number of the message in the mailbox
-	BitwiseFlags   int        // Bitwise flags for the message (e.g., \Seen, \Flagged)
-	CustomFlags    []string   // Custom flags for the message
-	FlagsChangedAt *time.Time // Time when the flags were last changed
-	Subject        string     // Subject of the message
-	InternalDate   time.Time  // The internal date the message was received
-	SentDate       time.Time  // The Date: header in its own zone (sentDateInHeaderZone); its INTERNALDATE when NoDateHeader
-	NoDateHeader   bool       // No Date: header that parses (sent_date_unknown): the ENVELOPE date is NIL
-	Size           int        // Size of the message in bytes
-	MessageID      string     // Unique Message-ID from the message headers
-	InReplyTo      string
-	References     string
-	BodyStructure  *imap.BodyStructure
-	CreatedModSeq  int64
-	UpdatedModSeq  *int64
-	RecipientsJSON []byte
-	ExpungedModSeq *int64
+	ID                  int64      // ID of the message
+	AccountID           int64      // ID of the user who owns the message
+	UID                 imap.UID   // Unique identifier for the message
+	ContentHash         string     // Hash of the message content
+	S3Domain            string     // S3 domain for the message
+	S3Localpart         string     // S3 localpart for the message
+	MailboxID           int64      // ID of the mailbox the message belongs to
+	IsUploaded          bool       // Indicates if the message is uploaded to S3
+	Seq                 uint32     // Sequence number of the message in the mailbox
+	BitwiseFlags        int        // Bitwise flags for the message (e.g., \Seen, \Flagged)
+	CustomFlags         []string   // Custom flags for the message
+	FlagsChangedAt      *time.Time // Time when the flags were last changed
+	Subject             string     // Subject of the message
+	InternalDate        time.Time  // The internal date the message was received
+	SentDate            time.Time  // The Date: header in its own zone (sentDateInHeaderZone); its INTERNALDATE when NoDateHeader
+	SentDateUnknownZone bool       // Source zone unavailable (NULL sent_utc_offset), independently of NoDateHeader
+	NoDateHeader        bool       // No Date: header that parses (sent_date_unknown): the ENVELOPE date is NIL
+	Size                int        // Size of the message in bytes
+	MessageID           string     // Unique Message-ID from the message headers
+	InReplyTo           string
+	References          string
+	BodyStructure       *imap.BodyStructure
+	CreatedModSeq       int64
+	UpdatedModSeq       *int64
+	RecipientsJSON      []byte
+	ExpungedModSeq      *int64
 }
 
 // POP3Message is the minimal per-message projection used by the POP3 protocol
@@ -482,6 +483,7 @@ func scanMessages(rows pgx.Rows, includeBodyStructure bool) ([]Message, error) {
 			return nil, fmt.Errorf("failed to scan message: %w", err)
 		}
 		msg.SentDate = sentDateInHeaderZone(msg.SentDate, sentUTCOffset)
+		msg.SentDateUnknownZone = sentUTCOffset == nil && !msg.NoDateHeader && !msg.SentDate.IsZero()
 
 		if includeBodyStructure {
 			msg.BodyStructure = deserializeBodyStructure(bodyStructureBytes, msg.Size, msg.AccountID, msg.MailboxID, msg.UID, msg.ContentHash)

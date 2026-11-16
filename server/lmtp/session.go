@@ -961,7 +961,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	mailHeader := mail.Header{Header: messageContent.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date"))
+	sentDate, sentDateUnknownZone, _ := helpers.ParseDateHeaderWithZone(mailHeader.Get("Date"))
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
 	if len(inReplyTo) == 0 {
@@ -1089,7 +1089,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	for _, dest := range resolvedDestinations {
 		mailboxNames = append(mailboxNames, dest.Mailbox)
 		err = s.saveMessageToMailbox(ctx, dest.Target, fullMessageBytes, contentHash, deliveryHash,
-			subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, storedFlags(dest.Destination))
+			subject, messageID, sentDate, sentDateUnknownZone, inReplyTo, references, bodyStructure, plaintextBody, recipients, storedFlags(dest.Destination))
 		if err == nil {
 			continue
 		}
@@ -1300,7 +1300,7 @@ func (s *LMTPSession) handleVacationResponse(ctx context.Context, reply sieveeng
 // they are stored on the message (InsertMessage folds keyword case per RFC 9051 §2.3.2).
 func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailbox *db.DBMailbox,
 	fullMessageBytes []byte, contentHash string, deliveryHash string, subject string, messageID string,
-	sentDate time.Time, inReplyTo []string, references []string, bodyStructure *imap.BodyStructure,
+	sentDate time.Time, sentDateUnknownZone bool, inReplyTo []string, references []string, bodyStructure *imap.BodyStructure,
 	plaintextBody *string, recipients []helpers.Recipient,
 	flags []imap.Flag) error {
 
@@ -1337,25 +1337,26 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailbox *db.DBMa
 	// No need to query - it's already cached in the session
 	_, messageUID, err := s.backend.rdb.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
-			AccountID:     destAccountID,
-			MailboxID:     mailbox.ID,
-			S3Domain:      destS3Domain,
-			S3Localpart:   destS3Localpart,
-			MailboxName:   mailbox.Name,
-			ContentHash:   contentHash,
-			DeliveryHash:  deliveryHash,
-			MessageID:     messageID,
-			InternalDate:  time.Now(),
-			Size:          size,
-			Subject:       subject,
-			PlaintextBody: *plaintextBody,
-			SentDate:      sentDate,
-			InReplyTo:     inReplyTo,
-			References:    references,
-			BodyStructure: bodyStructure,
-			Recipients:    recipients,
-			Flags:         flags, // Sieve-set flags (imap4flags) plus the attachment keyword; no \Seen -> unread
-			FTSRetention:  s.backend.ftsRetention,
+			AccountID:           destAccountID,
+			MailboxID:           mailbox.ID,
+			S3Domain:            destS3Domain,
+			S3Localpart:         destS3Localpart,
+			MailboxName:         mailbox.Name,
+			ContentHash:         contentHash,
+			DeliveryHash:        deliveryHash,
+			MessageID:           messageID,
+			InternalDate:        time.Now(),
+			Size:                size,
+			Subject:             subject,
+			PlaintextBody:       *plaintextBody,
+			SentDate:            sentDate,
+			SentDateUnknownZone: sentDateUnknownZone,
+			InReplyTo:           inReplyTo,
+			References:          references,
+			BodyStructure:       bodyStructure,
+			Recipients:          recipients,
+			Flags:               flags, // Sieve-set flags (imap4flags) plus the attachment keyword; no \Seen -> unread
+			FTSRetention:        s.backend.ftsRetention,
 		},
 		db.PendingUpload{
 			ContentHash: contentHash,

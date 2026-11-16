@@ -64,7 +64,9 @@ running Sora server, and they can run while servers are running.
   keys from an address, such as `verify hash`, then need that same address.
 - **Run it where the maildir is.** The importer reads the files directly and writes its cache,
   `sora-maildir.db`, **into the maildir directory**. The user running `sora-admin` needs write
-  access to that directory, even for a dry run.
+  access to that directory, even for a dry run. Except on Linux with `fs.protected_hardlinks = 1`,
+  no other user may be able to write in it, or to rename it through a directory above it
+  ([section 8](#8-the-sqlite-cache-sora-maildirdb)).
 - **Check the size limit.** Messages larger than `[admin_cli] import_message_limit` are not
   imported and count as failed. Unset, the limit is the `append_limit` of the first IMAP
   `[[server]]` block in the file (default 25 MB), or 50 MB without one. See
@@ -253,7 +255,13 @@ Dovecot stores custom keywords as letters `a` to `z` in file names. Each folder 
 `dovecot-keywords` file that maps those letters (`0 $Label1`, `1 $Junk`, ... : index 0 is `a`).
 
 - Each folder's own `dovecot-keywords` file maps that folder's letters.
-- A folder without its own file uses the root file's mapping.
+- The root file maps the letters of the root folder (INBOX) only. A folder without its own file
+  names no keywords, as in Dovecot, which clears a folder's list when its file is missing: its
+  letters are dropped, each with an `Unknown keyword ID` warning.
+- A line that is malformed, or whose index is not 0 to 25, is skipped; one warning per file names
+  the file, the number of lines skipped and the first of them, shortened.
+- A file larger than 64 KiB is not read: a warning names it, and the folder's keywords are not
+  imported.
 
 ### Subscriptions (`subscriptions`)
 
@@ -268,6 +276,9 @@ With `--dovecot`, the `subscriptions` file at the maildir root is read:
    name with tab characters; they are joined with `/`, so `Work` + tab + `2024` subscribes
    `Work/2024`. No mailbox is created for it: subscriptions are names, and Dovecot allows
    subscriptions to folders that do not exist.
+
+A `subscriptions` file larger than 4 MiB is not read: a warning names it, and no subscriptions are
+imported.
 
 ### UIDs (`dovecot-uidlist`)
 
@@ -312,10 +323,12 @@ relative and its target is within that directory, as Pigeonhole's own
 `.dovecot.sieve -> sieve/<name>.sieve`. Any other link (one out of the directory, or any absolute
 link) is refused: nothing is stored, and the summary and the log name the file. Where Pigeonhole's script
 directory is not below the link's directory, its link is absolute; name the script it points to
-instead. As a hard link cannot be told apart from the file, a file others may not read is read
-only if the directory holding its name (the link's, for a link) belongs to the file's owner and
-its Unix mode grants neither group nor other write access; otherwise, as for a script only its owner may read in `/tmp`, it is
-refused in the same way.
+instead. A file larger than 65536 bytes, the limit of `sora-admin sieve put`, is refused the same
+way. At most 65537 bytes are read to detect a file above the limit. As a hard link cannot be told
+apart from the file, a file others may not read is read only if the directory holding its name
+(the link's, for a link) belongs to the file's owner and its Unix mode grants neither group nor
+other write access; otherwise, as for a script only its owner may read in `/tmp`, it is refused
+in the same way.
 
 | Situation | Result |
 |---|---|
@@ -323,7 +336,7 @@ refused in the same way.
 | The script compiles, no active script | Stored as `imported` and activated. |
 | The script does not compile | Stored as `imported-invalid`, inactive, so delivery keeps working. The import goes on. |
 | It does not compile, and an earlier run's `imported-invalid` compiles | The user fixed it; it is kept and the file is not stored. |
-| The file is a refused link or cannot be read, or the database fails | The `Sieve script:` line says `NOT imported` and why. The import goes on. |
+| The file is a refused link, over 65536 bytes or cannot be read, or the database fails | The `Sieve script:` line says `NOT imported` and why. The import goes on. |
 
 Compilation uses `[sieve] enabled_extensions` from the config file. The summary ends with a
 `Sieve script:` line that says what happened. Dovecot's global or `sieve_before` scripts are not
@@ -343,6 +356,25 @@ them is a symbolic link, even to a file inside the maildir, or another kind of f
 refuses to start and names it. The cache is opened without following a link, so a link put in its
 place while the run starts is refused as well. The export applies the same rule to the
 `sora-maildir.db` in its target directory.
+
+SQLite also writes through a hard link at those names, and a hard link cannot be refused
+without a race in a directory another user can write: SQLite opens the `-wal` and `-shm` files by
+name after any check. On Linux with `fs.protected_hardlinks = 1`, the default of most
+distributions, a user can hard-link only a file they own or may read and write, so such a link
+gains them nothing, and the cache is kept in the maildir whoever can write in it. Elsewhere
+(macOS, FreeBSD by default, Linux with `fs.protected_hardlinks = 0`) the directory that holds the
+cache must belong to the user running `sora-admin`, and its group and others must not be able to
+write in it. Every directory above it must belong to root or to that user, and its group and
+others may write in it only with the sticky bit set, as on `/tmp`: whoever can rename the
+directory could put one of their own, with such links, in its place after the check. Otherwise
+the import or export refuses to start and names the directory. The check walks from the filesystem
+root towards the cache and refuses a newly introduced symbolic-link component. It checks Unix
+ownership and mode bits, not filesystem ACLs. Run `sora-admin` as the maildir's
+owner, or import a copy that belongs to the user running it, in a directory no other user can
+rename (not, for example, in the home directory of the maildir's owner). In such
+a directory a `sora-maildir.db`, `-wal`, `-shm` or `-journal` that is a hard link (its file has
+another name too, for example in a backup made with `cp -al`) is refused as well; replace it with
+a copy, or remove it.
 
 Table `messages`:
 
@@ -554,7 +586,8 @@ and the file's modification time is set to INTERNALDATE. Flags are written as `D
 
 **Keywords.** Only with `--dovecot`: each folder gets a `dovecot-keywords` file and keywords
 become letters `a` to `z`. Keywords are numbered in sorted order; an existing file's numbering is
-kept. A folder can name at most 26 keywords; further ones are logged and left out. Without
+kept. An existing file that cannot be read, or is larger than 64 KiB, is replaced, with a warning
+that names it. A folder can name at most 26 keywords; further ones are logged and left out. Without
 `--dovecot`, keywords are not exported.
 
 **Subscriptions.** With `--dovecot`, `subscriptions` at the root lists every subscribed name,
@@ -577,8 +610,14 @@ its name, so a symbolic or hard link at that name is replaced, and the file it p
 alone. A mailbox directory, `cur/`, `new/` or `tmp/` that is a link is followed only when the link
 is relative and its target is below the target directory; any other link makes the export fail
 before it writes a message, naming the path. An existing `dovecot-keywords` or `dovecot-uidlist`
-that is such a link is not read, and is replaced as if it were not there. The SQLite cache and
-its sidecars still use ordinary paths; their policy is unchanged ([section 8](#8-the-sqlite-cache-sora-maildirdb)).
+that is such a link is not read, and is replaced as if it were not there. Neither is one with more
+than one link: a hard link cannot be told apart from the file it names, while the export and
+Dovecot create these files by renaming a new file over the name, so theirs have one. A file that
+is there but not read is logged as a warning: the folder's keyword numbering, or the UIDs of the
+files an earlier run wrote, are then not kept. A copy of the target made with `cp -al`, or a tool
+that replaces identical files with hard links, gives these files a second link. The SQLite
+cache and its sidecars still use ordinary paths; their policy is unchanged
+([section 8](#8-the-sqlite-cache-sora-maildirdb)).
 
 **Re-runs.** The exporter keeps `sora-maildir.db` in the target directory, with the same schema
 as the importer's ([section 8](#8-the-sqlite-cache-sora-maildirdb)), and records each exported
