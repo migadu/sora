@@ -65,19 +65,30 @@ func assertEmptyDir(t *testing.T, path string) {
 	assert.Empty(t, dirNames(t, path), "the export wrote into %s outside its destination", path)
 }
 
+// linkKinds are the links the destination's owner can put at the name of a file the
+// export reads back and replaces. A hard link is another name for the same file, which
+// the root cannot tell from a file an earlier run wrote (#1671): one on the same file
+// system as its target, where the system lets the owner link a file they cannot read
+// (BSD and macOS do, as Linux does with fs.protected_hardlinks = 0).
+var linkKinds = []struct {
+	name string
+	link func(t *testing.T, target, link string)
+}{
+	{"absolute link", func(t *testing.T, target, link string) { linkOut(t, target, link, false) }},
+	{"relative link", func(t *testing.T, target, link string) { linkOut(t, target, link, true) }},
+	{"hard link", func(t *testing.T, target, link string) { require.NoError(t, os.Link(target, link)) }},
+}
+
 func TestExportReplacesLinkedDovecotUIDList(t *testing.T) {
-	secret := []byte("root:secret-hash:19000:0:99999:7:::\n")
-	for _, tc := range []struct {
-		name string
-		link func(t *testing.T, target, link string)
-	}{
-		{"absolute link", func(t *testing.T, target, link string) { linkOut(t, target, link, false) }},
-		{"relative link", func(t *testing.T, target, link string) { linkOut(t, target, link, true) }},
-		{"hard link", func(t *testing.T, target, link string) { require.NoError(t, os.Link(target, link)) }},
-	} {
+	// An entry of the file the link names is merged when a file of its name is in cur/
+	// (mergeUIDMappings), which the owner can arrange: its UID would be written out.
+	const ownersFile = "1700000009.M9P9.host"
+	secret := []byte("3 V99 N6\n5 :" + ownersFile + "\n")
+	for _, tc := range linkKinds {
 		t.Run(tc.name, func(t *testing.T) {
 			outside := outsideFile(t, secret)
 			exporter, dest := newLinkTestExporter(t, nil, ExporterOptions{ExportUIDList: true})
+			require.NoError(t, os.WriteFile(filepath.Join(dest, "cur", ownersFile+":2,S"), nil, 0644))
 			uidlist := filepath.Join(dest, "dovecot-uidlist")
 			tc.link(t, outside, uidlist)
 
@@ -90,19 +101,20 @@ func TestExportReplacesLinkedDovecotUIDList(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, written)
 			assert.Equal(t, uint32(42), written.UIDValidity)
-			assert.Equal(t, map[string]uint32{"1700000001.M1P1.host": 7}, written.UIDMappings)
+			assert.Equal(t, map[string]uint32{"1700000001.M1P1.host": 7}, written.UIDMappings,
+				"an entry of the uidlist read through the link was carried into the export")
 		})
 	}
 }
 
 func TestExportReplacesLinkedDovecotKeywords(t *testing.T) {
 	secret := []byte("0 $Secret\n")
-	for _, relative := range []bool{false, true} {
-		t.Run(map[bool]string{false: "absolute link", true: "relative link"}[relative], func(t *testing.T) {
+	for _, tc := range linkKinds {
+		t.Run(tc.name, func(t *testing.T) {
 			outside := outsideFile(t, secret)
 			exporter, dest := newLinkTestExporter(t, nil, ExporterOptions{Dovecot: true})
 			keywords := filepath.Join(dest, "dovecot-keywords")
-			linkOut(t, outside, keywords, relative)
+			tc.link(t, outside, keywords)
 
 			require.NoError(t, exporter.prepareKeywords("INBOX", []db.Message{{UID: 1, CustomFlags: []string{"$Work"}}}))
 
