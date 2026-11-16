@@ -37,8 +37,8 @@ func TestParameterLookalikesAreNotKeywords(t *testing.T) {
 }
 
 // On the wire a look-alike of SIZE is an unknown parameter, answered as the proxy answers
-// any other: the MAIL is not refused for a size it does not declare. A look-alike command
-// name is an unknown command.
+// any other (555 5.5.4), not as a size it does not declare. A look-alike command name is
+// an unknown command.
 func TestMAILLookalikesOnTheWire(t *testing.T) {
 	conn, r := startSizeDeclarationSession(t, 1024)
 	io.WriteString(conn, "LHLO client.example.org\r\n")
@@ -46,8 +46,8 @@ func TestMAILLookalikesOnTheWire(t *testing.T) {
 
 	for _, tt := range []struct{ line, want string }{
 		{"MAıL FROM:<a@example.org>", "500 5.5.2 "},
-		{"MAIL FROM:<a@example.org> XSIZE=2048", "250 "},
-		{"MAIL FROM:<a@example.org> ſIZE=2048", "250 "},
+		{"MAIL FROM:<a@example.org> XSIZE=2048", "555 5.5.4 "},
+		{"MAIL FROM:<a@example.org> ſIZE=2048", "555 5.5.4 "},
 		{"MAIL FROM:<a@example.org> SIZE=2048", "552 5.3.4 "},
 	} {
 		io.WriteString(conn, tt.line+"\r\n")
