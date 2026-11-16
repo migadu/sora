@@ -147,6 +147,31 @@ func TestMigrateDownAll_KeepsInitialMigrationSoUpSucceeds(t *testing.T) {
 	checkSchemaVersion(t, conn, "a second migrate down --all", first)
 }
 
+// TestMigrateDownAll_ThenSoraStartupMigrates (#1667): after `migrate down --all`, the
+// startup migration of the next sora start ran 000001's up again, failed on the tables
+// it had left, and stopped startup with version 1 dirty. It must apply the migrations
+// after the first and reach the latest version.
+func TestMigrateDownAll_ThenSoraStartupMigrates(t *testing.T) {
+	conn, configPath := migrateTestDB(t)
+	versions := embeddedMigrationVersions(t)
+	latest := versions[len(versions)-1]
+
+	if out, code := runAdminMain(t, "--config", configPath, "migrate", "up"); code != 0 {
+		t.Fatalf("migrate up: exit code %d:\n%s", code, out)
+	}
+	if out, code := runAdminMain(t, "--config", configPath, "migrate", "down", "--all"); code != 0 {
+		t.Fatalf("migrate down --all: exit code %d, want 0:\n%s", code, out)
+	}
+
+	// The startup migration of sora (db.migrate), as NewDatabaseFromConfig runs it.
+	database, err := db.NewDatabaseFromConfig(context.Background(), adminTestDBConfig(t), true)
+	if err != nil {
+		t.Fatalf("sora startup migration after migrate down --all: %v", err)
+	}
+	database.Close()
+	checkSchemaVersion(t, conn, "sora startup migration after migrate down --all", latest)
+}
+
 // TestMigrateDownLimit_RefusesToRevertInitialMigration (#1667): a `migrate down
 // --limit N` that reaches past the first migration ran its deliberately empty down
 // file, recording no version while the initial tables stayed. It must refuse before
@@ -169,6 +194,9 @@ func TestMigrateDownLimit_RefusesToRevertInitialMigration(t *testing.T) {
 	}
 	if strings.Contains(out, "Migrations reverted successfully") {
 		t.Errorf("migrate down --limit %s reported success:\n%s", all, out)
+	}
+	if !strings.Contains(out, "would revert the first migration") {
+		t.Errorf("migrate down --limit %s did not say why it refused:\n%s", all, out)
 	}
 	checkSchemaVersion(t, conn, "a refused migrate down --limit "+all, latest)
 
