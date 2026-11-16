@@ -220,3 +220,56 @@ func TestFetch_RetainedHeaderFieldsSectionAnswersOnlyItsOwnRequest(t *testing.T)
 		})
 	}
 }
+
+// TestFetch_LongHeaderListIsNotRetained: the HEADER.FIELDS and HEADER.FIELDS.NOT names
+// are the client's, and each may be a literal of up to 4096 bytes that the command length
+// limit does not count, so one FETCH can name megabytes of them. The key carrying the
+// names is held beside the retained section but charged to neither the session budget
+// nor the node-wide one, and quoting writes a control byte as four: a list past
+// maxCachedHeaderListBytes is answered but not retained.
+func TestFetch_LongHeaderListIsNotRetained(t *testing.T) {
+	body := []byte("From: a@example.com\r\nSubject: s\r\n\r\nbody\r\n")
+	long := []string{"Subject"}
+	for range 256 {
+		long = append(long, strings.Repeat("\x01", 4096))
+	}
+	empties := append([]string{"Subject"}, make([]string, 2*maxCachedHeaderListBytes)...)
+
+	for _, tc := range []struct {
+		name    string
+		section *imap.FetchItemBodySection
+		want    string
+	}{
+		{"fields with long names", &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: long}, "Subject: s\r\n\r\n"},
+		{"fields.not with long names", &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFieldsNot: long}, "From: a@example.com\r\n\r\n"},
+		{"fields with many empty names", &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: empties}, "Subject: s\r\n\r\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, tracker := newFetchTestSession(0)
+			tc.section.Partial = &imap.SectionPartial{Offset: 0, Size: 100}
+			w := &fakeBodySectionWriter{tracker: tracker}
+			bodyData, bodyFetched := body, true
+			if err := fetchBodySections(s, w, &bodyData, &bodyFetched, &imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{tc.section}}, fetchTestMessage(body)); err != nil {
+				t.Fatal(err)
+			}
+			if got := string(w.sections[0].data); got != tc.want {
+				t.Errorf("section = %q, want %q", got, tc.want)
+			}
+			if n := len(s.bodySectionCacheKey); n != 0 {
+				t.Errorf("section retained under a %d-byte key, want it answered without retention", n)
+			}
+			if got := s.server.bodySectionCacheBytes.Load(); got != 0 {
+				t.Errorf("node-wide retained bytes = %d, want 0", got)
+			}
+		})
+	}
+
+	// A list of ordinary length is still retained.
+	short := &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{
+		"From", "To", "Cc", "Bcc", "Subject", "Date", "Message-ID", "Priority", "X-Priority",
+		"References", "Newsgroups", "In-Reply-To", "Content-Type", "Reply-To",
+	}}
+	if bodySectionCacheKey(strings.Repeat("a", 64), short) == "" {
+		t.Error("a 14-name HEADER.FIELDS list is not retained")
+	}
+}
