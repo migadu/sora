@@ -259,12 +259,22 @@ func (watch *notifyWatch) wantsNonSelectedItems() bool {
 // MAILBOXES and SUBTREE specifiers by its key, LOWER(name) as the database
 // computes it (see nameKeys).
 func (watch *notifyWatch) eventsForMailbox(name, key string, subscribed bool, sharedRoot string) map[imap.NotifyEvent]bool {
+	nonSelectable := isSharedNamespaceRoot(name, sharedRoot)
 	var events map[imap.NotifyEvent]bool
 	add := func(item *imap.NotifyItem) {
-		if events == nil {
-			events = make(map[imap.NotifyEvent]bool)
-		}
 		for _, ev := range item.Events {
+			// Sora treats the configured shared root as hierarchy-only. Omit
+			// its message events, whose unselected-mailbox responses use STATUS;
+			// retain MailboxName and SubscriptionChange tree events
+			// (RFC 5465 §5.4–§5.5) for the \Noselect container.
+			if nonSelectable && (ev == imap.NotifyEventMessageNew ||
+				ev == imap.NotifyEventMessageExpunge ||
+				ev == imap.NotifyEventFlagChange) {
+				continue
+			}
+			if events == nil {
+				events = make(map[imap.NotifyEvent]bool)
+			}
 			events[ev] = true
 		}
 	}

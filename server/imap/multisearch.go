@@ -246,6 +246,11 @@ func (s *IMAPSession) resolveSearchSource(ctx context.Context, source *imap.Sear
 		if m == nil {
 			return
 		}
+		// Apply Sora's \Noselect shared-root policy to message searches too.
+		// NOTIFY tree-event source matching remains separate.
+		if s.server.config != nil && s.server.config.SharedMailboxes.IsNamespaceRoot(m.Name) {
+			return
+		}
 		if _, ok := seen[m.ID]; ok {
 			return
 		}
