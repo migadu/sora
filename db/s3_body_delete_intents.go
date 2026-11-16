@@ -49,6 +49,9 @@ func CheckS3BodyClaims(ctx context.Context, tx pgx.Tx, hashes []string) error {
 	if isolation != "read committed" {
 		return fmt.Errorf("S3 body admission requires READ COMMITTED: %w", ErrS3BodyQuarantined)
 	}
+	if err := checkS3BodyClaimContinuity(ctx, tx, hashes); err != nil {
+		return err
+	}
 	if quarantined {
 		return ErrS3BodyQuarantined
 	}

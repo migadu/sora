@@ -89,6 +89,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		logger.Info("Database: moving messages within the same mailbox, will assign new UIDs", "mailbox_id", srcMailboxID)
 	}
 
+	if err := lockS3SourceClaims(ctx, tx, srcMailboxID, ids); err != nil {
+		return nil, err
+	}
+
 	// Serialize unseen_count maintenance for both mailboxes by locking their
 	// mailbox rows in ascending id order (see lockMailboxStats). This both
 	// prevents the flag/expunge-vs-move trigger race from drifting the cache and
