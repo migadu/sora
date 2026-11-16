@@ -550,7 +550,7 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			// authzID := parts[0] // Not used in proxy
+			authzID := parts[0]
 			authnID := parts[1]
 			password := parts[2]
 
@@ -573,6 +573,21 @@ func (s *Session) handleConnection() {
 				} else {
 					s.sendResponse(fmt.Sprintf("%s NO Authentication failed", tag))
 				}
+				continue
+			}
+
+			// The credentials checked out; now the authorization. RFC 4616 section 2: the
+			// server "will verify that the authentication credentials permit the client to
+			// act as the (presented or derived) authorization identity". They permit acting
+			// only as the account they log in to, which this proxy presents to the backend
+			// as s.username: named by the authentication identity itself or by the address
+			// the login resolved to (the master username form's target). Any other is
+			// refused as the backends refuse it (RFC 5530 section 3 AUTHORIZATIONFAILED),
+			// and only now, so only a client that proved the credentials learns it. Not a
+			// command error, and not a failed login: the credentials were right.
+			if authzID != "" && authzID != authnID && authzID != s.username {
+				s.InfoLog("authorization failed", "authzid", authzID)
+				s.sendResponse(fmt.Sprintf("%s NO [AUTHORIZATIONFAILED] Proxy login not permitted for this user.", tag))
 				continue
 			}
 
