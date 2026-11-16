@@ -904,9 +904,7 @@ There is no `AUTH`, `DSN` or `BINARYMIME`.
   to its ASCII form. The local part may be up to 256 octets (longer than RFC 5321's 64, to allow SRS
   addresses), the domain up to 255, and the address up to 512. A non-ASCII address is accepted even
   when the MTA did not send the `SMTPUTF8` parameter.
-- A `MAIL` or `RCPT` parameter the server does not implement gets `555 5.5.4` (RFC 5321
-  §4.1.1.11), the DSN parameters `NOTIFY`, `ORCPT`, `RET` and `ENVID` among them. `XRCPTFORWARD`
-  is the only `RCPT` parameter taken.
+- Unknown `RCPT` parameters are ignored. `NOTIFY` and `ORCPT` get `504`.
 - `VRFY` answers `252 2.5.0 Cannot VRFY user, but will accept message`.
 
 ### 8.4 Message size

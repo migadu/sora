@@ -282,8 +282,7 @@ func (s *Session) handleConnection() {
 			lhlo.WriteString("250-8BITMIME\r\n")
 			// No DSN, as on the backend: neither issues a "delivered" DSN (RFC 3461
 			// §5.2.3), so the MTA keeps the duties of §5.2.2 (a "relayed" DSN for
-			// NOTIFY=SUCCESS). DSN parameters sent anyway get 555, as on the backend
-			// (mailParameterReply, unsupportedRcptParameter).
+			// NOTIFY=SUCCESS). DSN parameters sent anyway are dropped, not forwarded.
 			lhlo.WriteString("250 SMTPUTF8\r\n")
 			if _, err := s.writeClientReply(lhlo.String(), false); err != nil {
 				return
@@ -304,7 +303,7 @@ func (s *Session) handleConnection() {
 				s.sendResponse("503 5.5.1 Sender already specified")
 				continue
 			}
-			fromParam, params, found := findParameter(args, "FROM:")
+			fromParam, found := findParameter(args, "FROM:")
 			if !found {
 				s.sendResponse("501 5.5.4 Syntax error in MAIL command (missing FROM)")
 				continue
@@ -320,18 +319,11 @@ func (s *Session) handleConnection() {
 				s.sendResponse("501 5.5.2 Was expecting MAIL arg syntax of FROM:<address>")
 				continue
 			}
-			// A parameter the proxy does not implement gets 555, as on the backend, and
-			// starts no transaction.
-			if param, reply := mailParameterReply(params); reply != "" {
-				s.InfoLog("MAIL refused for a parameter", "parameter", param, "response", reply)
-				s.sendResponse(reply)
-				continue
-			}
 			// The limit advertised in LHLO is the proxy's own, checked here before the MTA
 			// sends the body (RFC 1870 section 6.1): no recipient is routed yet, so no
 			// backend is the transaction's. A refused MAIL starts no transaction and
 			// leaves the current one alone.
-			declaredSize, reply := mailSizeParameter(params, s.settings.maxMessageSize)
+			declaredSize, reply := mailSizeParameter(args, s.settings.maxMessageSize)
 			if reply != "" {
 				s.InfoLog("MAIL refused for its SIZE parameter", "limit", s.settings.maxMessageSize, "response", reply)
 				s.sendResponse(reply)
@@ -341,7 +333,7 @@ func (s *Session) handleConnection() {
 			s.resetTransaction()
 			s.sender = sender
 			s.mailFromReceived = true
-			s.smtputf8 = hasSMTPUTF8Param(params) || !server.IsASCII(sender)
+			s.smtputf8 = hasSMTPUTF8Param(args) || !server.IsASCII(sender)
 			s.declaredSize = declaredSize
 			// Answered here also when a backend is held from an earlier transaction: that
 			// backend need not be where any recipient of this one routes, so its answer
@@ -351,13 +343,16 @@ func (s *Session) handleConnection() {
 			s.sendResponse("250 2.1.0 Ok")
 
 		case "RCPT":
-			toParam, params, found := findParameter(args, "TO:")
+			toParam, found := findParameter(args, "TO:")
 			if !found {
 				s.DebugLog("RCPT command missing TO parameter", "args", fmt.Sprintf("%v", args))
 				s.sendResponse("501 5.5.4 Syntax error in RCPT command (missing TO)")
 				continue
 			}
 
+			// Extract the recipient address (first part before any parameters)
+			// toParam may contain the address and additional ESMTP parameters
+			// Example: "<user@example.com> NOTIFY=NEVER ORCPT=rfc822;user@example.com"
 			s.DebugLog("Parsing RCPT TO", "toParam", toParam, "args", fmt.Sprintf("%v", args))
 			to, ok := s.extractAddress(toParam)
 			if !ok || to == "" {
@@ -372,13 +367,6 @@ func (s *Session) handleConnection() {
 			// below.
 			if !s.mailFromReceived {
 				s.sendResponse("503 5.5.1 Error: need MAIL command")
-				continue
-			}
-			// A parameter the proxy does not take gets 555, as on the backend, before the
-			// recipient is routed. The transaction stays open for the next recipient.
-			if param := unsupportedRcptParameter(params); param != "" {
-				s.InfoLog("RCPT refused for a parameter", "to", to, "parameter", param)
-				s.sendResponse("555 5.5.4 RCPT TO parameter not recognized or not implemented")
 				continue
 			}
 			if !server.IsASCII(to) {
@@ -898,6 +886,31 @@ func (s *Session) ErrorLog(msg string, keyvals ...any) {
 	s.getLogger().ErrorLog(msg, keyvals...)
 }
 
+// stripUnsupportedRCPTParameters removes ESMTP parameters from RCPT TO commands that
+// are not commonly supported by LMTP servers. This uses an allowlist approach - only
+// explicitly allowed parameters are kept, everything else is stripped.
+//
+// Allowed RCPT TO parameters for LMTP:
+//   - XRCPTFORWARD: Dovecot-specific forwarding information (original recipient)
+//
+// Stripped parameters:
+//   - NOTIFY, ORCPT: DSN (RFC 3461 §4.1, §4.2), which neither the proxy nor the
+//     backend announces; an MTA should not send them, but some do. RET and ENVID,
+//     the DSN parameters of MAIL (§4.3, §4.4), are dropped by backendMailFrom.
+//   - Any other unknown ESMTP parameters
+//
+// Examples:
+//   - "RCPT TO:<user@example.com> NOTIFY=NEVER" -> "RCPT TO:<user@example.com>"
+//   - "RCPT TO:<user@example.com> NOTIFY=NEVER XRCPTFORWARD=fwd@example.com" -> "RCPT TO:<user@example.com> XRCPTFORWARD=fwd@example.com"
+//   - "RCPT TO:<user@example.com> UNKNOWN=value" -> "RCPT TO:<user@example.com>"
+func stripUnsupportedRCPTParameters(command string) string {
+	recipient, keptParams, ok := parseRCPTCommand(command)
+	if !ok {
+		return command
+	}
+	return formatCanonicalRCPT(recipient, keptParams)
+}
+
 func formatCanonicalRCPT(recipient string, keptParams []string) string {
 	if len(keptParams) > 0 {
 		return "RCPT TO:<" + recipient + "> " + strings.Join(keptParams, " ")
@@ -905,7 +918,9 @@ func formatCanonicalRCPT(recipient string, keptParams []string) string {
 	return "RCPT TO:<" + recipient + ">"
 }
 
-// parseRCPTCommand uses the same path-first parameter contract as the RCPT handler.
+// parseRCPTCommand parses a RCPT TO command line using the proxy's command and
+// address parsers, returning the extracted recipient address and any allowed
+// ESMTP parameters (non-empty XRCPTFORWARD=<value> tokens).
 func parseRCPTCommand(command string) (address string, keptParams []string, ok bool) {
 	trimmed := strings.TrimSpace(command)
 	if len(trimmed) <= 4 || !server.EqualFoldASCII(trimmed[:4], "RCPT") || (trimmed[4] != ' ' && trimmed[4] != '\t') {
@@ -915,7 +930,7 @@ func parseRCPTCommand(command string) (address string, keptParams []string, ok b
 	if err != nil || verb != "RCPT" {
 		return "", nil, false
 	}
-	toParam, rest, found := findParameter(args, "TO:")
+	toParam, rest, found := findParameterWithRest(args, "TO:")
 	if !found {
 		return "", nil, false
 	}
@@ -935,62 +950,6 @@ func parseRCPTCommand(command string) (address string, keptParams []string, ok b
 		}
 	}
 	return address, keptParams, true
-}
-
-// mailParameterReply returns the first MAIL parameter the proxy refuses and the reply
-// refusing the command ("" for none). It takes the parameters of the extensions its LHLO
-// reply advertises: SIZE (RFC 1870, checked by mailSizeParameter); SMTPUTF8 (RFC 6531),
-// which "does not accept a value" (section 3.4); and BODY (RFC 6152), whose value is
-// "body-value = "7BIT" / "8BITMIME"" (section 2), of which "Only one BODY parameter may
-// be used in a single MAIL command" (section 3). A value it does not take is a syntax
-// error (501), but BODY=BINARYMIME belongs to an extension that is not advertised (RFC
-// 3030). That one and every other parameter, the DSN ones (RFC 3461) among them, get 555
-// 5.5.4, as on the backend. RFC 5321 section 4.1.1.11: "If the server SMTP does not
-// recognize or cannot implement one or more of the parameters associated with a
-// particular MAIL FROM or RCPT TO command, it will return code 555."
-func mailParameterReply(params []string) (param, reply string) {
-	const unsupported = "555 5.5.4 MAIL FROM parameter not recognized or not implemented"
-	body := false
-	for _, p := range params {
-		keyword, value, hasValue := strings.Cut(p, "=")
-		switch server.ToUpperASCII(keyword) {
-		case "SIZE":
-		case "SMTPUTF8":
-			if hasValue {
-				return p, "501 5.5.4 Syntax error in SMTPUTF8 parameter"
-			}
-		case "BODY":
-			switch server.ToUpperASCII(value) {
-			case "7BIT", "8BITMIME":
-				if body {
-					return p, "501 5.5.4 Syntax error in BODY parameter"
-				}
-				body = true
-			case "BINARYMIME":
-				return p, unsupported
-			default:
-				return p, "501 5.5.4 Syntax error in BODY parameter"
-			}
-		default:
-			return p, unsupported
-		}
-	}
-	return "", ""
-}
-
-// unsupportedRcptParameter returns the first RCPT parameter the proxy does not take, ""
-// if there is none. XRCPTFORWARD is the only one: it is forwarded, and it is the only
-// one the backend takes. The DSN parameters NOTIFY and ORCPT (RFC 3461) are refused like
-// any other, as DSN is not advertised: "The client MUST NOT transmit parameters other
-// than those associated with a service extension offered by the server in its EHLO
-// response" (RFC 5321 section 4.1.1.3).
-func unsupportedRcptParameter(params []string) string {
-	for _, p := range params {
-		if keyword, _, _ := strings.Cut(p, "="); server.ToUpperASCII(keyword) != "XRCPTFORWARD" {
-			return p
-		}
-	}
-	return ""
 }
 
 // extractAddress extracts email address from MAIL FROM or RCPT TO parameter.
@@ -1696,9 +1655,10 @@ func (s *Session) invalidateLookupCache(reason string) {
 	s.InfoLog("invalidated lookup cache entry", "reason", reason, "address", s.originalAddress, "backend", s.serverAddr)
 }
 
-// backendRcptTo builds a canonical recipient path and preserves accepted XRCPTFORWARD
-// tokens after the RCPT handler has refused every unsupported parameter. Alias
-// resolution preserves the original recipient detail as before.
+// backendRcptTo builds the canonical RCPT TO:<recipient> command sent to the backend,
+// mirroring backendMailFrom. Unsupported ESMTP parameters (including DSN NOTIFY/ORCPT)
+// are dropped, keeping only valid XRCPTFORWARD=<value> tokens, and the base address is
+// rewritten when remotelookup resolved an alias (preserving any +detail).
 func (s *Session) backendRcptTo(command string) (backendCommand string, rewrote bool, resolvedRecipient string) {
 	parsedRecipient, keptParams, ok := parseRCPTCommand(command)
 	recipient := s.to
@@ -1722,12 +1682,12 @@ func (s *Session) backendRcptTo(command string) (backendCommand string, rewrote 
 	}
 
 	if recipient == "" {
-		return command, false, ""
+		return stripUnsupportedRCPTParameters(command), false, ""
 	}
 	return formatCanonicalRCPT(recipient, keptParams), rewrote, resolvedRecipient
 }
 
-// forwardRCPT preserves canonical path and accepted forwarding tokens after validation.
+// forwardRCPT sends the RCPT TO command to backend and handles response interception
 func (s *Session) forwardRCPT(command string) {
 	backendCommand, rewrote, resolvedRecipient := s.backendRcptTo(command)
 	if rewrote {
@@ -1988,25 +1948,43 @@ func isClosingError(err error) bool {
 	return server.IsConnectionError(err)
 }
 
-// findParameter reads the path of a MAIL or RCPT command from its arguments: the first
-// one, which starts with prefix ("FROM:" or "TO:", case-insensitive over ASCII letters,
-// see server.ToUpperASCII), or the one after a standalone prefix ("KEY: value"). The
-// arguments after the path are the command's parameters, as in "MAIL
-// FROM:<reverse-path> [SP <mail-parameters> ] <CRLF>" (RFC 5321 section 4.1.1.2). A
-// command that does not start with the prefix has no path (found is false), so no
-// parameter can come before it.
-func findParameter(args []string, prefix string) (value string, params []string, found bool) {
-	if len(args) == 0 {
-		return "", nil, false
-	}
-	switch first := server.ToUpperASCII(args[0]); {
-	case first == prefix:
-		if len(args) < 2 {
+// findParameter searches for a parameter with a given prefix in a list of arguments.
+// It is case-insensitive over ASCII letters (see server.EqualFoldASCII) and supports
+// prefixes like "FROM:" or "TO:".
+// It handles both "KEY:value" and "KEY: value" formats.
+func findParameter(args []string, prefix string) (string, bool) {
+	val, _, found := findParameterWithRest(args, prefix)
+	return val, found
+}
+
+// findParameterWithRest is findParameter and also returns the remaining arguments
+// outside the matched parameter token(s).
+func findParameterWithRest(args []string, prefix string) (string, []string, bool) {
+	for i, arg := range args {
+		// Handle "KEY: value" format where KEY: is a standalone token.
+		if server.EqualFoldASCII(arg, prefix) {
+			if i+1 < len(args) {
+				if i == 0 {
+					return args[1], args[2:], true
+				}
+				rest := make([]string, 0, len(args)-2)
+				rest = append(rest, args[:i]...)
+				rest = append(rest, args[i+2:]...)
+				return args[i+1], rest, true
+			}
 			return "", nil, false // Found prefix but no value.
 		}
-		return args[1], args[2:], true
-	case strings.HasPrefix(first, prefix):
-		return args[0][len(prefix):], args[1:], true
+
+		// Handle "KEY:value" format where it's a single token.
+		if len(arg) > len(prefix) && server.EqualFoldASCII(arg[:len(prefix)], prefix) {
+			if i == 0 {
+				return arg[len(prefix):], args[1:], true
+			}
+			rest := make([]string, 0, len(args)-1)
+			rest = append(rest, args[:i]...)
+			rest = append(rest, args[i+1:]...)
+			return arg[len(prefix):], rest, true
+		}
 	}
 	return "", nil, false
 }
@@ -2084,8 +2062,7 @@ func isSIZECapability(line string) bool {
 }
 
 // backendMailFrom is the MAIL command sent to the backend for the current transaction.
-// The MTA's BODY parameter is not forwarded; the MAIL handler refuses every parameter
-// other than SIZE, SMTPUTF8 and BODY (mailParameterReply).
+// The MTA's other MAIL parameters (RET and ENVID among them) are not forwarded.
 // The SMTPUTF8 parameter goes with it only when the backend advertised the extension
 // (RFC 6531 §3.2): a backend without it gets the plain command and, if the envelope is
 // in fact non-ASCII, decides for itself — sora backends accept it — which is what keeps
