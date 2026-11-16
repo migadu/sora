@@ -478,6 +478,80 @@ sora-admin --config config.toml mailbox fix-utf7 --email user@example.com
 
 Names that do not decode, or decode to themselves, are reported as `SKIP`.
 
+### mailbox repair-hierarchy
+
+Finds mailboxes whose place in the hierarchy disagrees with their name and, with `--apply`,
+repairs them. Clients find a mailbox by its name (LIST, SELECT, APPEND, Sieve `fileinto`), while
+`\HasChildren`, the renaming of children on RENAME and the refusal to DELETE a mailbox with
+children follow its place in the hierarchy. Where the two disagree, LIST shows the mailbox without
+its parent, the parent shows no children, and a RENAME of the parent leaves the mailbox behind.
+
+```sh
+sora-admin --config config.toml mailbox repair-hierarchy
+sora-admin --config config.toml mailbox repair-hierarchy --email user@example.com --apply
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--email` | all accounts | Limit to one account. Optional for this subcommand. |
+| `--apply` | `false` | Repair. Without it the command is a dry run: it changes nothing and prints `WOULD REPAIR` lines for what `--apply` does. |
+| `--batch-size` | `1000` | Accounts read per query when walking all accounts (1 to 10000). |
+
+It reports these problems (the second column of each line):
+
+| Problem | Meaning |
+|---|---|
+| `root_with_delimiter` | A name with `/` at the top level, such as `Parent/Child` with no parent. |
+| `detached` | Below a mailbox that is not its name's parent, such as `Alpha/Beta` below `Gamma`. Only the top of such a subtree is listed. |
+| `parent_deleted` | Below a deleted mailbox. |
+| `parent_missing` | Below a mailbox that does not exist. |
+| `bad_path` | The stored hierarchy path is malformed or contains anything except canonical lowercase ASCII hex. Reported only (`REPORT`); nothing is changed. |
+
+What `--apply` does with each one (`REPAIRED`):
+
+- It moves the mailbox, with every mailbox below it, under the mailbox whose name is its name's
+  parent part: `Parent/Child` under `Parent`, and a name without `/` to the top level. Names, ids,
+  UIDVALIDITY, messages, flags and subscriptions stay as they are, so clients do not resync.
+- A missing parent is created as IMAP CREATE creates it (RFC 9051 section 6.3.4), empty and
+  unsubscribed. The line names the mailboxes created.
+
+A mailbox is left alone (`MANUAL`) when no mailbox has its name's parent part and its place gives
+it another name: `Alpha/Beta` below `Gamma` with no `Alpha`, or `X/a/Beta` below `X`, whose place
+makes it `X/Beta`. A CREATE that raced a RENAME of the parent, or a later RENAME, left it so, and
+only the user knows which name is right. The line shows the name its place gives it. Fix it with
+`mailbox rename` to the right name; the rename links it under that name's parent and creates the
+parent if needed.
+
+Each account is repaired in a transaction of its own, which locks the account's mailboxes while it
+runs, and is rolled back unless every mailbox it repaired comes out right. Run it again after
+`--apply`: only `MANUAL` and `REPORT` lines are left. The exit status is `1` only when an account
+fails; `MANUAL` and `REPORT` lines do not change it.
+
+### mailbox repair-unseen
+
+Finds mailboxes whose cached unseen count (served by STATUS, LIST and NOTIFY) is higher than
+the number of unseen messages they hold, and with `--apply` recomputes it. Older builds left
+such counts when the failed-upload cleanup, `uploader resolve` or an importer rollback
+hard-deleted an unseen message. A count that has gone negative is repaired by the server
+itself.
+
+```sh
+sora-admin --config config.toml mailbox repair-unseen
+sora-admin --config config.toml mailbox repair-unseen --apply
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--email` | all accounts | Limit to one account. Optional for this subcommand. |
+| `--apply` | `false` | Repair the mailboxes found. Without it, print `WOULD REPAIR` lines and change nothing. |
+| `--batch-size` | `200` | Mailboxes checked per batch. |
+| `--start-after` | `0` | Resume after this mailbox id. |
+
+Mailboxes are checked in id order. After each batch the command prints the id to pass to
+`--start-after` if it is interrupted. Each repair is a short transaction that holds only that
+mailbox's lock, so it can run while the servers are serving mail. It is safe to run again: a
+repaired mailbox is not reported any more.
+
 ---
 
 ## 7. messages
@@ -525,7 +599,8 @@ sora-admin --config config.toml messages restore --email user@example.com --ids 
   they all apply.
 - Without `--confirm`, the command lists up to ten of the matching messages and asks
   `Continue with restoration? (yes/no)`. Only `yes` or `y` continues.
-- A mailbox that no longer exists is created again. Restored messages get new UIDs.
+- A mailbox that no longer exists is created again. Restored messages get new UIDs and new
+  mod-sequences, so IMAP clients are told of them as new messages.
 - With sharing enabled in the config file you pass, a mailbox recreated in the shared namespace
   is a shared mailbox of the account, as `mailbox create` makes one, and so is a parent recreated
   there. Each one starts with owner-only rights: one entry, the owner's primary address with

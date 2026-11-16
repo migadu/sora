@@ -636,12 +636,24 @@ func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 }
 
 // writeTokenRefused answers 401 for a bearer token the request presented and that was
-// refused: expired, malformed, badly signed, or no longer valid for its account. The
-// challenge says error="invalid_token" (RFC 6750 section 3.1), so a client can tell it
-// apart from a request that carried no token.
+// refused: expired, malformed, badly signed, or no longer valid for its account, in the
+// Authorization header or as the token of a refresh. The challenge says
+// error="invalid_token" (RFC 6750 section 3.1), so a client can tell it apart from a
+// request that carried no token.
 func (s *Server) writeTokenRefused(w http.ResponseWriter) {
 	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, server.BearerInvalidToken)
 	s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+}
+
+// writeLoginRefused answers 401 {"error": "Invalid credentials"} for a refused login:
+// unknown address, deleted account, wrong password, or a client the rate limiter blocks,
+// all alike. RFC 9110 section 15.5.2 requires a challenge on every 401, and RFC 6750
+// section 3 lets a resource server send the Bearer one "in response to other conditions
+// as well": it is the realm's challenge, without an error code because a login presents
+// no token (section 3.1), the one a request without a token gets on every other endpoint.
+func (s *Server) writeLoginRefused(w http.ResponseWriter) {
+	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, "")
+	s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
 }
 
 // getProxyProtocolTrustedProxies returns the hosts trusted to send PROXY headers: the

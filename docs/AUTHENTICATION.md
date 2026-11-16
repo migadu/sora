@@ -327,9 +327,14 @@ the proxy. Restrict where those may come from with `master_sasl_allowed_networks
 
 What a client cannot do through a proxy:
 
-- Use a SASL authorization identity. The IMAP and ManageSieve proxies ignore it. The POP3 proxy
-  refuses an `AUTH PLAIN` whose authorization identity differs from the authentication identity,
-  with `-ERR [AUTH] Authorization identity not supported on proxy (configure master SASL on backend)`.
+- Act as another user with a SASL authorization identity. The IMAP and ManageSieve proxies accept
+  one that names the user the login reaches (the authentication identity, or the address the login
+  resolved to, such as the master username form's target) and refuse any other once the password
+  checked out, with the backends' replies (section 8.2): `NO [AUTHORIZATIONFAILED] Proxy login not
+  permitted for this user.` (IMAP), `NO "Proxy authentication requires master credentials"`
+  (ManageSieve). The POP3 proxy refuses an `AUTH PLAIN` whose authorization identity differs from
+  the authentication identity, with
+  `-ERR [AUTH] Authorization identity not supported on proxy (configure master SASL on backend)`.
 - Use master SASL credentials. Those are for the proxy's own login to backends.
 
 A backend behind proxies usually listens without TLS on a private address. Plaintext logins are then
@@ -368,7 +373,8 @@ a1 LOGIN user@example.com@support a-long-random-secret
   the master password itself and then routes the user like any other login.
 - The suffix must equal `master_username` exactly, including case.
 - On a backend with SASL PLAIN, if the client also sends an authorization identity, that identity is
-  the user to log in as. Otherwise it is the address before the suffix.
+  the user to log in as. Otherwise it is the address before the suffix. A proxy logs in only as the
+  address before the suffix and refuses an authorization identity naming anybody else (section 7).
 - The target must be an active account. A target that is not a valid address, or a target account
   that does not exist, gets the protocol's bad-credentials reply and is counted as a failed login.
 - Any other password is not a master login. The name is then handled like a name with any other
@@ -743,7 +749,7 @@ Log lines (INFO unless noted), with the session's fields:
 | `authentication successful` | A login succeeded. `method` is `main_db`, `cache`, `master` or `remotelookup`; `cached` says whether a cache answered. |
 | `authentication failed` | A login failed. `reason` is `user_not_found`, `invalid_password` or `transient_error`. |
 | WARN `authentication unavailable` | The password could not be checked, so the client got a temporary failure and the attempt was not counted. `reason` is `transient_error` (the database could not be asked) or `unverifiable_hash` (the stored hash cannot be checked, for example an unknown scheme). |
-| `authorization failed` | On a backend: the password was right, but the client asked to act as another user (`authzid`) without master credentials (section 8.2). |
+| `authorization failed` | On a backend: the password was right, but the client asked to act as another user (`authzid`) without master credentials (section 8.2). On the IMAP or ManageSieve proxy: the password was right, but the `authzid` names another user than the one the login reaches (section 7). |
 | `rate limit exceeded` | A login was refused by the rate limiter; with `reason` (`ip_blocked` or `ip_username_blocked`), `failure_count`, `blocked_until`. |
 | `Auth rate limiter: IP+username blocked (Tier 1)` | A Tier 1 block started. |
 | `Auth rate limiter: IP blocked (Tier 2)` | A Tier 2 block started. |

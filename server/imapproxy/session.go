@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
@@ -180,7 +181,7 @@ func (s *Session) handleConnection() {
 			return
 		}
 
-		line = strings.TrimRight(line, "\r\n")
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 
 		// Use the shared command parser. IMAP commands have tags.
 		tag, command, args, err := server.ParseLine(line, true)
@@ -234,12 +235,15 @@ func (s *Session) handleConnection() {
 			}
 			authStart := time.Now()
 			// LOGIN has exactly two arguments. A username literal ends this
-			// physical line; its password follows the literal's octets.
+			// physical line; its password follows the literal's octets. A
+			// literal is announced immediately before the CRLF: "{N+}" or "{N}"
+			// followed by white space is neither a literal nor an atom.
 			usernameLiteral := len(args) > 0 && strings.HasPrefix(args[0], "{") && strings.HasSuffix(args[0], "}")
 			passwordLiteral := len(args) == 2 && strings.HasPrefix(args[1], "{") && strings.HasSuffix(args[1], "}")
 			_, _, hasTrailingLiteral := trailingLiteral(line)
 			if len(args) > 2 || (usernameLiteral && len(args) > 1) ||
-				(hasTrailingLiteral && !usernameLiteral && !passwordLiteral) {
+				(hasTrailingLiteral && !usernameLiteral && !passwordLiteral) ||
+				((usernameLiteral || passwordLiteral) && !strings.HasSuffix(line, "}")) {
 				if s.skipLiterals(line, false) != nil ||
 					s.handleAuthError(fmt.Sprintf("%s BAD Invalid LOGIN arguments", tag)) {
 					return
@@ -255,7 +259,7 @@ func (s *Session) handleConnection() {
 				// Check if username is a literal
 				if strings.HasPrefix(args[0], "{") && strings.HasSuffix(args[0], "}") {
 					literalSize, nonSync, err := server.ParseLiteral(args[0])
-					if err != nil || literalSize > maxPreAuthLiteral {
+					if err != nil || preAuthLiteralTooBig(literalSize, nonSync) {
 						if s.skipLiterals(line, false) != nil ||
 							s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in username", tag)) {
 							return
@@ -285,8 +289,8 @@ func (s *Session) handleConnection() {
 						}
 						return
 					}
-					line = strings.TrimRight(line, "\r\n")
-					line = strings.TrimSpace(line)
+					rest := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+					line = strings.TrimSpace(rest)
 
 					if line == "" {
 						if s.handleAuthError(fmt.Sprintf("%s BAD LOGIN requires username and password", tag)) {
@@ -298,10 +302,11 @@ func (s *Session) handleConnection() {
 					// The remainder must contain just the password. Parse it as
 					// an argument so quoted spaces and escapes stay one value.
 					_, _, passwordArgs, parseErr := server.ParseLine("x LOGIN "+line, true)
-					_, _, hasTrailingLiteral := trailingLiteral(line)
+					_, _, hasTrailingLiteral := trailingLiteral(rest)
 					passwordLiteral := strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}")
-					if parseErr != nil || len(passwordArgs) != 1 || (hasTrailingLiteral && !passwordLiteral) {
-						if s.skipLiterals(line, false) != nil ||
+					if parseErr != nil || len(passwordArgs) != 1 || (hasTrailingLiteral && !passwordLiteral) ||
+						(passwordLiteral && !strings.HasSuffix(rest, "}")) {
+						if s.skipLiterals(rest, false) != nil ||
 							s.handleAuthError(fmt.Sprintf("%s BAD Invalid LOGIN arguments", tag)) {
 							return
 						}
@@ -311,7 +316,7 @@ func (s *Session) handleConnection() {
 					// Check if password is a literal
 					if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
 						literalSize, nonSync, err := server.ParseLiteral(line)
-						if err != nil || literalSize > maxPreAuthLiteral {
+						if err != nil || preAuthLiteralTooBig(literalSize, nonSync) {
 							if s.skipLiterals(line, false) != nil ||
 								s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
 								return
@@ -355,7 +360,7 @@ func (s *Session) handleConnection() {
 					// Check if password is a literal (username was not)
 					if strings.HasPrefix(args[1], "{") && strings.HasSuffix(args[1], "}") {
 						literalSize, nonSync, err := server.ParseLiteral(args[1])
-						if err != nil || literalSize > maxPreAuthLiteral {
+						if err != nil || preAuthLiteralTooBig(literalSize, nonSync) {
 							if s.skipLiterals(line, false) != nil ||
 								s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
 								return
@@ -464,14 +469,39 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			authStart := time.Now()
-			// RFC 9051 §6.2.2: a missing mechanism is "arguments invalid"
-			// (BAD); a named mechanism the proxy does not support is NO.
+			// RFC 9051 §6.2.2 and §9:
+			//   authenticate = "AUTHENTICATE" SP auth-type [SP initial-resp] *(CRLF base64)
+			//   auth-type    = atom
+			//   initial-resp = (base64 / "=")
+			// A missing mechanism, extra arguments, a non-atom mechanism, or a
+			// trailing literal is "arguments invalid" (BAD); a named mechanism
+			// the proxy does not support is NO.
 			if len(args) < 1 {
 				if s.handleAuthError(fmt.Sprintf("%s BAD AUTHENTICATE requires a mechanism name", tag)) {
 					return
 				}
 				continue
 			}
+			_, _, hasTrailingLiteral := trailingLiteral(line)
+			if len(args) > 2 || hasTrailingLiteral || !isIMAPAtom(args[0]) {
+				if s.handleAuthError(fmt.Sprintf("%s BAD Invalid AUTHENTICATE arguments", tag)) {
+					return
+				}
+				continue
+			}
+
+			var decoded []byte
+			if len(args) == 2 {
+				var ok bool
+				decoded, ok = decodeSASLResponse(args[1], true)
+				if !ok {
+					if s.handleAuthError(fmt.Sprintf("%s BAD Invalid base64 encoding", tag)) {
+						return
+					}
+					continue
+				}
+			}
+
 			if server.ToUpperASCII(args[0]) != "PLAIN" {
 				if s.handleAuthError(fmt.Sprintf("%s NO AUTHENTICATE PLAIN is the only supported mechanism", tag)) {
 					return
@@ -479,43 +509,32 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			var saslLine string
-			initialResponse := len(args) > 1
-			if initialResponse {
-				// Initial response was provided with the command
-				saslLine = server.UnquoteString(args[1])
-			} else {
+			if len(args) == 1 {
 				// No initial response, send continuation request
 				// (RFC 9051: continue-req = "+" SP ...)
 				s.sendResponse("+ ")
 
 				// Read SASL response from client
-				var err error
-				saslLine, err = server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth SASL response
+				saslLine, err := server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth SASL response
 				if err != nil {
 					if err != io.EOF {
 						s.DebugLog("error reading SASL response", "error", err)
 					}
 					return // Client connection error, can't continue
 				}
-				// The response to a continuation can also be a quoted string.
-				saslLine = server.UnquoteString(strings.TrimRight(saslLine, "\r\n"))
-			}
+				saslLine = strings.TrimSuffix(strings.TrimSuffix(saslLine, "\n"), "\r")
 
-			if saslLine == "*" {
-				// Client-side cancellation is not an error we should count.
-				s.sendResponse(fmt.Sprintf("%s BAD Authentication cancelled", tag))
-				continue
-			}
+				if saslLine == "*" {
+					// RFC 9051 §6.2.2: a single "*" in reply to a continuation
+					// request cancels the authentication exchange. Client-side
+					// cancellation is not an error we should count.
+					s.sendResponse(fmt.Sprintf("%s BAD Authentication cancelled", tag))
+					continue
+				}
 
-			// Decode SASL PLAIN. RFC 9051 §6.2.2: a single "=" initial
-			// response is a zero-length response, and an invalid base64
-			// string MUST be rejected with a tagged BAD.
-			var decoded []byte
-			if !initialResponse || saslLine != "=" {
-				var err error
-				decoded, err = base64.StdEncoding.DecodeString(saslLine)
-				if err != nil {
+				var ok bool
+				decoded, ok = decodeSASLResponse(saslLine, false)
+				if !ok {
 					if s.handleAuthError(fmt.Sprintf("%s BAD Invalid base64 encoding", tag)) {
 						return
 					}
@@ -531,7 +550,7 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			// authzID := parts[0] // Not used in proxy
+			authzID := parts[0]
 			authnID := parts[1]
 			password := parts[2]
 
@@ -554,6 +573,21 @@ func (s *Session) handleConnection() {
 				} else {
 					s.sendResponse(fmt.Sprintf("%s NO Authentication failed", tag))
 				}
+				continue
+			}
+
+			// The credentials checked out; now the authorization. RFC 4616 section 2: the
+			// server "will verify that the authentication credentials permit the client to
+			// act as the (presented or derived) authorization identity". They permit acting
+			// only as the account they log in to, which this proxy presents to the backend
+			// as s.username: named by the authentication identity itself or by the address
+			// the login resolved to (the master username form's target). Any other is
+			// refused as the backends refuse it (RFC 5530 section 3 AUTHORIZATIONFAILED),
+			// and only now, so only a client that proved the credentials learns it. Not a
+			// command error, and not a failed login: the credentials were right.
+			if authzID != "" && authzID != authnID && authzID != s.username {
+				s.InfoLog("authorization failed", "authzid", authzID)
+				s.sendResponse(fmt.Sprintf("%s NO [AUTHORIZATIONFAILED] Proxy login not permitted for this user.", tag))
 				continue
 			}
 
@@ -657,15 +691,31 @@ func (s *Session) finishLoginLiteral() (extra bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	rest = strings.TrimRight(rest, "\r\n")
+	rest = strings.TrimSuffix(strings.TrimSuffix(rest, "\n"), "\r")
 	if strings.TrimSpace(rest) == "" {
 		return false, nil
 	}
 	return true, s.skipLiterals(rest, false)
 }
 
-// maxPreAuthLiteral bounds each literal the pre-auth loop reads.
+// maxNonSyncLiteral is the most octets a non-synchronizing literal may carry.
+// Before authentication the proxy advertises LITERAL- and IMAP4rev2, and under
+// both a larger one is invalid: "non-synchronizing literals used in any command
+// MUST NOT be larger than 4096 bytes" (RFC 7888 §5; RFC 9051 §4.3).
+const maxNonSyncLiteral = 4096
+
+// maxPreAuthLiteral bounds each synchronizing literal the pre-auth loop reads.
 const maxPreAuthLiteral = 8192
+
+// preAuthLiteralTooBig reports whether the pre-auth loop refuses a literal of
+// size octets: over maxNonSyncLiteral for a non-synchronizing one, over
+// maxPreAuthLiteral for a synchronizing one.
+func preAuthLiteralTooBig(size int, nonSync bool) bool {
+	if nonSync {
+		return size > maxNonSyncLiteral
+	}
+	return size > maxPreAuthLiteral
+}
 
 var (
 	// errSyncLiteralTooBig: skipLiterals sent no continuation request for a
@@ -673,7 +723,7 @@ var (
 	// more of the command, and the caller rejects it.
 	errSyncLiteralTooBig = errors.New("synchronizing literal too big")
 	// errNonSyncLiteralTooBig: skipLiterals ended the session with BYE over a
-	// non-synchronizing literal over maxPreAuthLiteral.
+	// non-synchronizing literal over maxNonSyncLiteral.
 	errNonSyncLiteralTooBig = errors.New("non-synchronizing literal too big")
 )
 
@@ -691,9 +741,9 @@ var (
 // and the response that rejects the command tells it to send no more of it
 // (RFC 9051 §2.2.1).
 //
-// A literal over maxPreAuthLiteral is not read. For a non-synchronizing one the
-// octets are already in flight and nothing after them can be found, so the
-// session ends with BYE [TOOBIG] (RFC 7888 §4 and §5) and
+// A literal preAuthLiteralTooBig refuses is not read. A non-synchronizing one
+// over the LITERAL- bound is invalid and its octets are already in flight, so
+// the session ends with BYE [TOOBIG] (RFC 7888 §4 and §5) and
 // errNonSyncLiteralTooBig. With sync set, a synchronizing one gets no
 // continuation request and errSyncLiteralTooBig. A read error is returned as is.
 func (s *Session) skipLiterals(line string, sync bool) error {
@@ -702,11 +752,11 @@ func (s *Session) skipLiterals(line string, sync bool) error {
 		if !ok || (!nonSync && !sync) {
 			return nil
 		}
-		if size > maxPreAuthLiteral {
+		if preAuthLiteralTooBig(size, nonSync) {
 			if !nonSync {
 				return errSyncLiteralTooBig
 			}
-			s.DebugLog("non-synchronizing literal over the pre-auth bound", "size", size)
+			s.DebugLog("non-synchronizing literal over the LITERAL- bound", "size", size)
 			s.sendResponse("* BYE [TOOBIG] Non-synchronizing literal too big")
 			return errNonSyncLiteralTooBig
 		}
@@ -720,16 +770,16 @@ func (s *Session) skipLiterals(line string, sync bool) error {
 		if err != nil {
 			return err
 		}
-		line = strings.TrimRight(next, "\r\n")
+		line = strings.TrimSuffix(strings.TrimSuffix(next, "\n"), "\r")
 	}
 }
 
 // trailingLiteral reports the literal announced at the end of a command line
-// without its CRLF: "{N}", or "{N+}" for a non-synchronizing one. Trailing
-// white space is ignored, as ParseLine ignores it, so that a literal LOGIN
-// rejects is found here too.
+// without its CRLF: "{N}", or "{N+}" for a non-synchronizing one. Only an
+// announcement "immediately preceding the CRLF" is one (RFC 7888 §3; RFC 9051
+// §9: literal = "{" number64 ["+"] "}" CRLF *CHAR8): followed by white space it
+// announces nothing, and the line is the whole command.
 func trailingLiteral(line string) (size int, nonSync, ok bool) {
-	line = strings.TrimSpace(line)
 	if !strings.HasSuffix(line, "}") {
 		return 0, false, false
 	}
@@ -760,6 +810,43 @@ func trailingLiteral(line string) (size int, nonSync, ok bool) {
 		}
 	}
 	return size, nonSync, true
+}
+
+// isIMAPAtom reports whether s is a non-empty IMAP atom (RFC 9051 §9), matching
+// go-imap's imapwire.IsAtomChar so quoted strings, literals, wildcards, and
+// control characters are rejected as invalid AUTHENTICATE mechanism syntax.
+func isIMAPAtom(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(', ')', '{', ' ', '%', '*', '"', '\\', ']':
+			return false
+		}
+		if unicode.IsControl(rune(s[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+// decodeSASLResponse decodes an IMAP SASL initial-resp or continuation base64
+// response (RFC 9051 §6.2.2, §9). A single "=" is valid only as initial-resp
+// (zero-length response). Quoted strings are not unquoted, and embedded CR/LF
+// (which Go's base64 decoder silently ignores) are rejected.
+func decodeSASLResponse(s string, initial bool) ([]byte, bool) {
+	if initial && s == "=" {
+		return []byte{}, true
+	}
+	if strings.ContainsAny(s, "\r\n") {
+		return nil, false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, false
+	}
+	return decoded, true
 }
 
 // preAuthRequiredState maps the commands a backend implements that are not
@@ -854,10 +941,10 @@ func (s *Session) handleAuthError(response string) bool {
 //     baseline behavior; the pre-auth parser accepts them (LOGIN, ID).
 //   - SASL-IR (RFC 4959): AUTHENTICATE PLAIN <initial-response> is accepted;
 //     advertising it saves compliant clients a round trip.
-//   - LITERAL- (RFC 7888): non-synchronizing literals up to 4096 bytes. The
-//     pre-auth path bounds literals at 8 KiB, so LITERAL+ (any size) would be
-//     a promise it cannot keep — a client streaming a large {N+} literal would
-//     get BAD after the bytes are already in flight and desynchronize.
+//   - LITERAL- (RFC 7888): non-synchronizing literals up to 4096 bytes, which
+//     the pre-auth loop enforces (maxNonSyncLiteral; a larger one ends the
+//     session with BYE [TOOBIG]). It reads synchronizing literals up to 8 KiB,
+//     so LITERAL+ (any size) would be a promise it cannot keep.
 //     Credentials and ID values fit comfortably; larger literals fall back to
 //     synchronizing form, which is handled with a continuation.
 //   - AUTH=PLAIN: the only SASL mechanism the proxy accepts. Do NOT list
