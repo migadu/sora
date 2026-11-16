@@ -193,3 +193,91 @@ func TestImportSieveScriptRefusesAHardLinkToAnotherUsersFile(t *testing.T) {
 		}
 	})
 }
+
+// worldWritableDirOf returns a directory anyone may write into (mode 1777) that appears
+// to belong to the owner of the files at paths, as /tmp is root's.
+func worldWritableDirOf(t *testing.T, paths ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	require.NoError(t, os.Chmod(dir, 0o1777))
+	ownedByAnotherUser(t, append([]string{dir}, paths...)...)
+	return dir
+}
+
+// The user chooses the directory --maildir-path names when it is a link they made, and
+// can point it at a directory of the linked file's owner that anyone may write into, as
+// /tmp is root's: its owner vouches for none of the names in it.
+func TestScanMaildirRefusesAHardLinkInAMaildirLinkedToADirectoryAnyoneMayWrite(t *testing.T) {
+	const linkName = "1700000002.M2P1.host:2,S"
+	secret := outsideFile(t, cachedSizeMessage("Secret", 100))
+	require.NoError(t, os.Chmod(secret, 0600))
+	shared := worldWritableDirOf(t, secret)
+	for _, dir := range []string{"cur", "new"} {
+		require.NoError(t, os.Mkdir(filepath.Join(shared, dir), 0755))
+	}
+	require.NoError(t, os.Link(secret, filepath.Join(shared, "cur", linkName)))
+	require.NoError(t, os.WriteFile(filepath.Join(shared, "dovecot-keywords"), []byte("0 Secret\n"), 0600))
+	ownedByAnotherUser(t, filepath.Join(shared, "dovecot-keywords"))
+	maildirPath := filepath.Join(t.TempDir(), "Maildir")
+	require.NoError(t, os.Symlink(shared, maildirPath))
+
+	importer := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), ImporterOptions{Dovecot: true})
+	require.NoError(t, importer.scanMaildir())
+
+	assert.Empty(t, scannedMessages(t, importer), "a hard link to another user's file was cached for import")
+	assert.Len(t, failureReasons(importer, filepath.Join(maildirPath, "cur", linkName)), 1)
+	assert.Empty(t, importer.dovecotKeywords, "a dovecot-keywords file in a directory anyone may write was read")
+}
+
+// A maildir extracted as root into a directory root made keeps its files' owner below
+// that directory. The owner's own messages are theirs to import; a file of root's they
+// linked into their cur/ is not, though it belongs to the owner of the maildir root.
+func TestScanMaildirInADirectoryOfAnotherUser(t *testing.T) {
+	const ownName = "1700000001.M1P1.host:2,S"
+	const linkName = "1700000002.M2P1.host:2,S"
+	maildirPath := newMaildirWith(t, nil)
+	own := filepath.Join(maildirPath, "cur", ownName)
+	require.NoError(t, os.WriteFile(own, cachedSizeMessage("Own", 100), 0600))
+	secret := outsideFile(t, cachedSizeMessage("Secret", 100))
+	require.NoError(t, os.Chmod(secret, 0600))
+	ownedByAnotherUser(t, maildirPath, secret)
+	link := filepath.Join(maildirPath, "cur", linkName)
+	require.NoError(t, os.Link(secret, link))
+
+	importer := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), ImporterOptions{})
+	require.NoError(t, importer.scanMaildir())
+
+	assert.Equal(t, map[string]string{own: "INBOX"}, scannedMessages(t, importer),
+		"the owner's own message was refused, or root's file they linked in was cached")
+	assert.Len(t, failureReasons(importer, link), 1)
+	assert.Empty(t, failureReasons(importer, own))
+}
+
+// --sieve may name a file in a directory anyone may write into, as /tmp is root's, or in
+// one a link the user made leads to: anyone may have named there a file of the
+// directory's owner.
+func TestImportSieveScriptRefusesAHardLinkInADirectoryAnyoneMayWrite(t *testing.T) {
+	secret := outsideFile(t, []byte("root:secret-hash:19000:0:99999:7:::\n"))
+	require.NoError(t, os.Chmod(secret, 0600))
+	shared := worldWritableDirOf(t, secret)
+	require.NoError(t, os.Link(secret, filepath.Join(shared, "x.sieve")))
+	home := t.TempDir()
+	require.NoError(t, os.Symlink(shared, filepath.Join(home, "sieve")))
+
+	for name, sievePath := range map[string]string{
+		"named":          filepath.Join(shared, "x.sieve"),
+		"through a link": filepath.Join(home, "sieve", "x.sieve"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			rdb := &sieveRecordingDB{mockResilientDatabase: newMockResilientDatabase()}
+			importer := newTestModeImporter(t, newMaildirWith(t, nil), rdb, ImporterOptions{SievePath: sievePath})
+			require.NoError(t, importer.lookupAccount())
+
+			err := importer.importSieveScript()
+			if assert.Error(t, err, "the hard link was read") {
+				assert.Contains(t, err.Error(), "another user")
+			}
+			assert.Empty(t, rdb.stored, "the file the hard link names was stored as a Sieve script")
+		})
+	}
+}
