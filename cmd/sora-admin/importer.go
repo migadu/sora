@@ -188,6 +188,7 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	if jobs < 1 {
 		return nil, fmt.Errorf("jobs must be at least 1, got %d", jobs)
 	}
+	maildirPath = effectiveMaildirPath(maildirPath)
 	// Always create SQLite database in the maildir path to persist maildir state
 	dbPath := filepath.Join(maildirPath, maildirCacheName)
 

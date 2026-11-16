@@ -80,6 +80,7 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	if err := os.MkdirAll(maildirPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create maildir path: %w", err)
 	}
+	maildirPath = effectiveMaildirPath(maildirPath)
 
 	// Use the shared SQLite database in the maildir path
 	dbPath := filepath.Join(maildirPath, maildirCacheName)
