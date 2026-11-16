@@ -69,6 +69,9 @@ func TestAuthenticatePlainRefusesOtherAuthorizationIdentity(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
+			srv.authLimiter.Stop()
+			limiter := &failureCountingLimiter{}
+			srv.authLimiter = limiter
 			go func() { _ = srv.Start() }()
 			t.Cleanup(func() { srv.Stop() })
 
@@ -102,8 +105,25 @@ func TestAuthenticatePlainRefusesOtherAuthorizationIdentity(t *testing.T) {
 			if got := authenticate(tc.authzid, tc.authcid, tc.password); got != tc.want {
 				t.Fatalf("AUTHENTICATE PLAIN %q/%q: reply %q, want %q", tc.authzid, tc.authcid, got, tc.want)
 			}
+			wantFailures := int32(0)
+			if tc.password == "wrong" {
+				wantFailures = 1
+			}
+			if got := limiter.failures.Load(); got != wantFailures {
+				t.Fatalf("failed-login charges = %d, want %d", got, wantFailures)
+			}
 			wantBackend := tc.backendAs
 			if wantBackend == "" {
+				if tc.want == refused {
+					for range 4 {
+						if got := authenticate(tc.authzid, tc.authcid, tc.password); got != refused {
+							t.Fatalf("repeated authorization refusal: %q", got)
+						}
+					}
+					if got := limiter.failures.Load(); got != 0 {
+						t.Fatalf("authorization refusals charged %d failed logins", got)
+					}
+				}
 				// The refusal leaves the session in the not authenticated state, ready for
 				// another attempt, which is the only one the backend may see.
 				if got := authenticate("", sieveTestUser, sieveTestPassword); got != `OK "Authenticated"` {

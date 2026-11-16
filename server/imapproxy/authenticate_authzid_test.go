@@ -79,6 +79,9 @@ func TestAuthenticatePlainRefusesOtherAuthorizationIdentity(t *testing.T) {
 		{name: "no authorization identity", authcid: "user@example.com", password: "secret", want: "a1 OK", backendAs: "user@example.com"},
 		{name: "own identity", authzid: "user@example.com", authcid: "user@example.com", password: "secret", want: "a1 OK", backendAs: "user@example.com"},
 		{name: "own identity, +detail", authzid: "user+tag@example.com", authcid: "user+tag@example.com", password: "secret", want: "a1 OK", backendAs: "user@example.com"},
+		{name: "resolved identity for +detail", authzid: "user@example.com", authcid: "user+tag@example.com", password: "secret", want: "a1 OK", backendAs: "user@example.com"},
+		{name: "resolved cached token identity", authzid: "user@example.com", authcid: "user@TOKEN", password: "secret", want: "a1 OK", backendAs: "user@example.com"},
+		{name: "cached token, other identity", authzid: "other@example.com", authcid: "user@TOKEN", password: "secret", want: refused},
 		{name: "master username form", authcid: "user@example.com@admin", password: "master-secret", want: "a1 OK", backendAs: "user@example.com"},
 		{name: "master username form, its target", authzid: "user@example.com", authcid: "user@example.com@admin", password: "master-secret", want: "a1 OK", backendAs: "user@example.com"},
 		{name: "master username form, other identity", authzid: "other@example.com", authcid: "user@example.com@admin", password: "master-secret", want: refused},
@@ -100,6 +103,7 @@ func TestAuthenticatePlainRefusesOtherAuthorizationIdentity(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			cache := newTestLookupCache(t)
+			limiter := &failureCountingLimiter{}
 			srv := &Server{
 				name:                       "test",
 				hostname:                   "test-host",
@@ -108,7 +112,7 @@ func TestAuthenticatePlainRefusesOtherAuthorizationIdentity(t *testing.T) {
 				activeSessions:             make(map[*Session]struct{}),
 				connManager:                cm,
 				lookupCache:                cache,
-				authLimiter:                &fakeAuthLimiter{},
+				authLimiter:                limiter,
 				positiveRevalidationWindow: 30 * time.Second,
 				masterUsername:             []byte("admin"),
 				masterPassword:             []byte("master-secret"),
@@ -132,6 +136,10 @@ func TestAuthenticatePlainRefusesOtherAuthorizationIdentity(t *testing.T) {
 					Result:         lookupcache.AuthSuccess,
 				})
 			}
+			cache.Set("test", "user@TOKEN", &lookupcache.CacheEntry{
+				AccountID: 42, ActualEmail: "user@example.com",
+				PasswordDigest: lookupcache.NewPasswordDigest("secret"), Result: lookupcache.AuthSuccess,
+			})
 
 			client, remote := net.Pipe()
 			sess := newSession(srv, client)
@@ -171,6 +179,13 @@ func TestAuthenticatePlainRefusesOtherAuthorizationIdentity(t *testing.T) {
 			if got != tc.want && !(tc.want == "a1 OK" && strings.HasPrefix(got, "a1 OK ")) {
 				t.Fatalf("AUTHENTICATE PLAIN %q/%q: reply %q, want %q", tc.authzid, tc.authcid, got, tc.want)
 			}
+			wantFailures := int32(0)
+			if tc.password == "wrong" {
+				wantFailures = 1
+			}
+			if got := limiter.failures.Load(); got != wantFailures {
+				t.Fatalf("failed-login charges = %d, want %d", got, wantFailures)
+			}
 			if tc.backendAs != "" {
 				select {
 				case as := <-loggedInAs:
@@ -186,6 +201,18 @@ func TestAuthenticatePlainRefusesOtherAuthorizationIdentity(t *testing.T) {
 			case as := <-loggedInAs:
 				t.Fatalf("a refused login logged in to the backend as %q", as)
 			default:
+			}
+			if tc.want == refused {
+				// More refusals than maxAuthErrors must still permit a later login:
+				// proven credentials plus refused authorization is no command error.
+				for range 4 {
+					if got := authenticate("a1", tc.authzid, tc.authcid, tc.password); got != refused {
+						t.Fatalf("repeated authorization refusal: %q", got)
+					}
+				}
+				if got := limiter.failures.Load(); got != 0 {
+					t.Fatalf("authorization refusals charged %d failed logins", got)
+				}
 			}
 
 			// The refusal leaves the session in the not authenticated state, ready for
