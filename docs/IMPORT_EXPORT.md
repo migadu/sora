@@ -299,7 +299,7 @@ relative and its target is within that directory, as Pigeonhole's own
 link) is refused: nothing is stored, and the summary and the log name the file. Where Pigeonhole's script
 directory is not below the link's directory, its link is absolute; name the script it points to
 instead. A file larger than 65536 bytes, the limit of `sora-admin sieve put`, is refused the same
-way, and is not read past the limit.
+way. At most 65537 bytes are read to detect a file above the limit.
 
 | Situation | Result |
 |---|---|
