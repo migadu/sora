@@ -32,6 +32,8 @@ func handleMessagesCommand(ctx context.Context) {
 		handleRestoreMessages(ctx)
 	case "repair-references":
 		handleRepairReferences(ctx)
+	case "repair-header-presence":
+		handleRepairHeaderPresence(ctx)
 	case "help", "--help", "-h":
 		printMessagesUsage()
 	default:
@@ -243,9 +245,10 @@ Usage:
   sora-admin messages <subcommand> [options]
 
 Subcommands:
-  list-deleted       List deleted (expunged) messages for an account
-  restore            Restore deleted messages to their original mailboxes
-  repair-references  Fill in the stored References of messages that have none
+  list-deleted            List deleted (expunged) messages for an account
+  restore                 Restore deleted messages to their original mailboxes
+  repair-references       Fill in the stored References of messages that have none
+  repair-header-presence  Fill in the stored header_presence bitmask of messages that have none
 
 Examples:
   sora-admin messages list-deleted --email user@example.com
@@ -254,6 +257,8 @@ Examples:
   sora-admin messages restore --email user@example.com --ids 123,456,789
   sora-admin messages repair-references
   sora-admin messages repair-references --apply
+  sora-admin messages repair-header-presence
+  sora-admin messages repair-header-presence --from-s3 --apply
 
 Use 'sora-admin messages <subcommand> --help' for detailed help.
 `)

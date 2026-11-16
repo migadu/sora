@@ -443,3 +443,29 @@ func (rd *ResilientDatabase) FillNullReferencesWithRetry(ctx context.Context, fi
 	}
 	return result.(int64), nil
 }
+
+// FindNullHeaderPresenceWithRetry reads one batch of messages for the header_presence
+// repair (see db.FindNullHeaderPresence).
+func (rd *ResilientDatabase) FindNullHeaderPresenceWithRetry(ctx context.Context, afterID int64, limit int) (db.NullHeaderPresenceBatch, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).FindNullHeaderPresence(ctx, afterID, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return db.NullHeaderPresenceBatch{}, err
+	}
+	return result.(db.NullHeaderPresenceBatch), nil
+}
+
+// FillNullHeaderPresenceWithRetry writes resolved header_presence masks for one batch in a
+// short primary transaction (see db.FillNullHeaderPresence).
+func (rd *ResilientDatabase) FillNullHeaderPresenceWithRetry(ctx context.Context, fills []db.HeaderPresenceFill) (int64, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).FillNullHeaderPresence(ctx, tx, fills)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
+}

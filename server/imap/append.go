@@ -246,6 +246,8 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 
 		recipients = helpers.ExtractRecipients(messageContent.Header)
 		headerPresence = helpers.ExtractHeaderPresence(messageContent.Header)
+	} else {
+		headerPresence = helpers.ExtractRawHeaderPresence(fullMessageBytes)
 	}
 
 	// RFC 9051 §6.3.12: "If a date-time is specified, the internal date SHOULD be
