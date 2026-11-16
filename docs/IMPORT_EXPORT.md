@@ -680,9 +680,11 @@ and `sora-maildir.db` written there. Any other link makes the export refuse to s
 link, before anything is created. The directories missing on the way are created only once every
 link on the way is checked, and never through a link to a directory that does not exist. As for
 the import, the directories above the target need only be searchable, and those a directory is
-created in writable, by the user running the export. Once checked, the target is not looked up by
-its path again: the cache, every directory and every file is created through the opened target
-directory, as section 8 describes for the cache.
+created in writable, by the user running the export. Once checked, the target is reached through
+the directory the check opened: every directory and every file below it, the cache included, is
+created through that directory. Only SQLite opens the cache's files by a name again, as section 8
+describes: on Linux through that directory's descriptor, elsewhere by the target's name, which
+must still lead to the checked directory.
 Each exported content file (a message,
 `dovecot-keywords`, `subscriptions`, `dovecot-uidlist`) is written as a new file and renamed over
 its name, so a symbolic or hard link at that name is replaced, and the file it points to is left
@@ -695,8 +697,8 @@ Dovecot create these files by renaming a new file over the name, so theirs have 
 is there but not read is logged as a warning: the folder's keyword numbering, or the UIDs of the
 files an earlier run wrote, are then not kept. A copy of the target made with `cp -al`, or a tool
 that replaces identical files with hard links, gives these files a second link. The SQLite
-cache and its sidecars still use ordinary paths; their policy is unchanged
-([section 8](#8-the-sqlite-cache-sora-maildirdb)).
+cache and its sidecars are not replaced this way: one that is a symbolic link, or anything else
+but a regular file, makes the export refuse to start ([section 8](#8-the-sqlite-cache-sora-maildirdb)).
 
 **Re-runs.** The exporter keeps `sora-maildir.db` in the target directory, with the same schema
 as the importer's ([section 8](#8-the-sqlite-cache-sora-maildirdb)), and records each exported
