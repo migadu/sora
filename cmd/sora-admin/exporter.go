@@ -86,7 +86,24 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	dbPath := filepath.Join(maildirPath, maildirCacheName)
 	logger.Info("Using maildir database", "path", dbPath)
 
-	db, err := openMaildirCache(maildirPath)
+	// The root is opened by the directory's name with every link resolved, as
+	// openMaildirCache requires, and the cache through it.
+	resolved, err := resolveMaildirDir(maildirPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open maildir path: %w", err)
+	}
+	root, err := os.OpenRoot(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open maildir path: %w", err)
+	}
+	var exporter *Exporter
+	defer func() {
+		if exporter == nil {
+			root.Close()
+		}
+	}()
+
+	db, err := openMaildirCache(root)
 	if err != nil {
 		return nil, err
 	}
@@ -156,13 +173,7 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		return nil, fmt.Errorf("failed to create s3_uploaded index: %w", err)
 	}
 
-	root, err := os.OpenRoot(filepath.Clean(maildirPath))
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to open maildir path: %w", err)
-	}
-
-	exporter := &Exporter{
+	exporter = &Exporter{
 		ctx:          ctx,
 		maildirPath:  maildirPath,
 		root:         root,

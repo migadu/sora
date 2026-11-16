@@ -385,6 +385,15 @@ refuses to start and names it. The cache is opened without following a link, so 
 place while the run starts is refused as well. The export applies the same rule to the
 `sora-maildir.db` in its target directory.
 
+Once the import has checked the directory `--maildir-path` leads to (section 3), it does not look
+the path up again: the cache is checked and created, and the folders are listed, through the
+directory it opened, so the maildir's owner cannot make them land in another directory by renaming
+`~/Maildir` and putting a link in its place during the run. On Linux SQLite opens the cache, and its
+`-wal` and `-shm`, as `/proc/self/fd/N/sora-maildir.db`, through that directory's descriptor, which
+needs `/proc`. Elsewhere it opens them by the directory's name, which the rule below lets only root
+and the user running `sora-admin` change, and only while that name still leads to the directory
+that was checked.
+
 SQLite also writes through a hard link at those names, and a hard link cannot be refused
 without a race in a directory another user can write: SQLite opens the `-wal` and `-shm` files by
 name after any check. On Linux with `fs.protected_hardlinks = 1`, the default of most
