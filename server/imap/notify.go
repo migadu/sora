@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
@@ -259,12 +261,23 @@ func (watch *notifyWatch) wantsNonSelectedItems() bool {
 // MAILBOXES and SUBTREE specifiers by its key, LOWER(name) as the database
 // computes it (see nameKeys).
 func (watch *notifyWatch) eventsForMailbox(name, key string, subscribed bool, sharedRoot string) map[imap.NotifyEvent]bool {
+	nonSelectable := notifySharedNamespaceRoot(name, sharedRoot)
 	var events map[imap.NotifyEvent]bool
 	add := func(item *imap.NotifyItem) {
-		if events == nil {
-			events = make(map[imap.NotifyEvent]bool)
-		}
 		for _, ev := range item.Events {
+			// RFC 5465 §5.1–§5.3, §6.4–§6.6: message events apply only to
+			// selectable mailboxes (their notification for unselected mailboxes
+			// is a STATUS response, forbidden on \Noselect containers), whereas
+			// tree events (MailboxName, SubscriptionChange, §5.4–§5.5) still
+			// report \Noselect hierarchy containers.
+			if nonSelectable && (ev == imap.NotifyEventMessageNew ||
+				ev == imap.NotifyEventMessageExpunge ||
+				ev == imap.NotifyEventFlagChange) {
+				continue
+			}
+			if events == nil {
+				events = make(map[imap.NotifyEvent]bool)
+			}
 			events[ev] = true
 		}
 	}
@@ -312,6 +325,28 @@ func (watch *notifyWatch) eventsForMailbox(name, key string, subscribed bool, sh
 // mailbox on every tick, so it does not build root plus delimiter.
 func notifyKeyBelow(key, root string) bool {
 	return len(key) > len(root) && key[len(root)] == consts.MailboxDelimiter && strings.HasPrefix(key, root)
+}
+
+// notifySharedNamespaceRoot reports whether name is the configured \Noselect
+// shared namespace root (sharedRoot == "" when shared mailboxes are disabled),
+// matching config.SharedMailboxesConfig.IsNamespaceRoot per rune without
+// allocating on every pump tick.
+func notifySharedNamespaceRoot(name, sharedRoot string) bool {
+	if sharedRoot == "" {
+		return false
+	}
+	for sharedRoot != "" {
+		if name == "" {
+			return false
+		}
+		n, nameSize := utf8.DecodeRuneInString(name)
+		r, rootSize := utf8.DecodeRuneInString(sharedRoot)
+		if unicode.ToLower(n) != unicode.ToLower(r) {
+			return false
+		}
+		name, sharedRoot = name[nameSize:], sharedRoot[rootSize:]
+	}
+	return name == ""
 }
 
 // resolveNotifyNames sets watch.nameKeys: the database computes the key of each
