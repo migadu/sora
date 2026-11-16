@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
@@ -468,14 +469,39 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			authStart := time.Now()
-			// RFC 9051 §6.2.2: a missing mechanism is "arguments invalid"
-			// (BAD); a named mechanism the proxy does not support is NO.
+			// RFC 9051 §6.2.2 and §9:
+			//   authenticate = "AUTHENTICATE" SP auth-type [SP initial-resp] *(CRLF base64)
+			//   auth-type    = atom
+			//   initial-resp = (base64 / "=")
+			// A missing mechanism, extra arguments, a non-atom mechanism, or a
+			// trailing literal is "arguments invalid" (BAD); a named mechanism
+			// the proxy does not support is NO.
 			if len(args) < 1 {
 				if s.handleAuthError(fmt.Sprintf("%s BAD AUTHENTICATE requires a mechanism name", tag)) {
 					return
 				}
 				continue
 			}
+			_, _, hasTrailingLiteral := trailingLiteral(line)
+			if len(args) > 2 || hasTrailingLiteral || !isIMAPAtom(args[0]) {
+				if s.handleAuthError(fmt.Sprintf("%s BAD Invalid AUTHENTICATE arguments", tag)) {
+					return
+				}
+				continue
+			}
+
+			var decoded []byte
+			if len(args) == 2 {
+				var ok bool
+				decoded, ok = decodeSASLResponse(args[1], true)
+				if !ok {
+					if s.handleAuthError(fmt.Sprintf("%s BAD Invalid base64 encoding", tag)) {
+						return
+					}
+					continue
+				}
+			}
+
 			if server.ToUpperASCII(args[0]) != "PLAIN" {
 				if s.handleAuthError(fmt.Sprintf("%s NO AUTHENTICATE PLAIN is the only supported mechanism", tag)) {
 					return
@@ -483,43 +509,32 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			var saslLine string
-			initialResponse := len(args) > 1
-			if initialResponse {
-				// Initial response was provided with the command
-				saslLine = server.UnquoteString(args[1])
-			} else {
+			if len(args) == 1 {
 				// No initial response, send continuation request
 				// (RFC 9051: continue-req = "+" SP ...)
 				s.sendResponse("+ ")
 
 				// Read SASL response from client
-				var err error
-				saslLine, err = server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth SASL response
+				saslLine, err := server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth SASL response
 				if err != nil {
 					if err != io.EOF {
 						s.DebugLog("error reading SASL response", "error", err)
 					}
 					return // Client connection error, can't continue
 				}
-				// The response to a continuation can also be a quoted string.
-				saslLine = server.UnquoteString(strings.TrimRight(saslLine, "\r\n"))
-			}
+				saslLine = strings.TrimSuffix(strings.TrimSuffix(saslLine, "\n"), "\r")
 
-			if saslLine == "*" {
-				// Client-side cancellation is not an error we should count.
-				s.sendResponse(fmt.Sprintf("%s BAD Authentication cancelled", tag))
-				continue
-			}
+				if saslLine == "*" {
+					// RFC 9051 §6.2.2: a single "*" in reply to a continuation
+					// request cancels the authentication exchange. Client-side
+					// cancellation is not an error we should count.
+					s.sendResponse(fmt.Sprintf("%s BAD Authentication cancelled", tag))
+					continue
+				}
 
-			// Decode SASL PLAIN. RFC 9051 §6.2.2: a single "=" initial
-			// response is a zero-length response, and an invalid base64
-			// string MUST be rejected with a tagged BAD.
-			var decoded []byte
-			if !initialResponse || saslLine != "=" {
-				var err error
-				decoded, err = base64.StdEncoding.DecodeString(saslLine)
-				if err != nil {
+				var ok bool
+				decoded, ok = decodeSASLResponse(saslLine, false)
+				if !ok {
 					if s.handleAuthError(fmt.Sprintf("%s BAD Invalid base64 encoding", tag)) {
 						return
 					}
@@ -535,7 +550,7 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			// authzID := parts[0] // Not used in proxy
+			authzID := parts[0]
 			authnID := parts[1]
 			password := parts[2]
 
@@ -558,6 +573,21 @@ func (s *Session) handleConnection() {
 				} else {
 					s.sendResponse(fmt.Sprintf("%s NO Authentication failed", tag))
 				}
+				continue
+			}
+
+			// The credentials checked out; now the authorization. RFC 4616 section 2: the
+			// server "will verify that the authentication credentials permit the client to
+			// act as the (presented or derived) authorization identity". They permit acting
+			// only as the account they log in to, which this proxy presents to the backend
+			// as s.username: named by the authentication identity itself or by the address
+			// the login resolved to (the master username form's target). Any other is
+			// refused as the backends refuse it (RFC 5530 section 3 AUTHORIZATIONFAILED),
+			// and only now, so only a client that proved the credentials learns it. Not a
+			// command error, and not a failed login: the credentials were right.
+			if authzID != "" && authzID != authnID && authzID != s.username {
+				s.InfoLog("authorization failed", "authzid", authzID)
+				s.sendResponse(fmt.Sprintf("%s NO [AUTHORIZATIONFAILED] Proxy login not permitted for this user.", tag))
 				continue
 			}
 
@@ -780,6 +810,43 @@ func trailingLiteral(line string) (size int, nonSync, ok bool) {
 		}
 	}
 	return size, nonSync, true
+}
+
+// isIMAPAtom reports whether s is a non-empty IMAP atom (RFC 9051 §9), matching
+// go-imap's imapwire.IsAtomChar so quoted strings, literals, wildcards, and
+// control characters are rejected as invalid AUTHENTICATE mechanism syntax.
+func isIMAPAtom(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(', ')', '{', ' ', '%', '*', '"', '\\', ']':
+			return false
+		}
+		if unicode.IsControl(rune(s[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+// decodeSASLResponse decodes an IMAP SASL initial-resp or continuation base64
+// response (RFC 9051 §6.2.2, §9). A single "=" is valid only as initial-resp
+// (zero-length response). Quoted strings are not unquoted, and embedded CR/LF
+// (which Go's base64 decoder silently ignores) are rejected.
+func decodeSASLResponse(s string, initial bool) ([]byte, bool) {
+	if initial && s == "=" {
+		return []byte{}, true
+	}
+	if strings.ContainsAny(s, "\r\n") {
+		return nil, false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, false
+	}
+	return decoded, true
 }
 
 // preAuthRequiredState maps the commands a backend implements that are not

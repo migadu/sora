@@ -136,3 +136,49 @@ func TestIMAP_AuthenticateUnterminatedOverlongResponseCloses(t *testing.T) {
 		t.Fatalf("connection remained open after BYE: %v", err)
 	}
 }
+
+// "=" is a zero-length response only as the AUTHENTICATE initial response
+// (RFC 9051 §9: initial-resp = (base64 / "=")). A reply to a continuation
+// request is base64 (authenticate = ... *(CRLF base64)), where a zero-length
+// response is an empty line and a lone pad character is invalid base64, which
+// the server MUST reject with a tagged BAD (RFC 9051 §6.2.2). The IMAP proxy
+// answers the same (TestPreAuthMalformedLoginAndAuthenticateAnswerBAD).
+func TestIMAP_AuthenticateLonePadOnlyInInitialResponse(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	for _, tc := range []struct {
+		name    string
+		cmd     string
+		replies []string // lines sent after each continuation request
+		want    string
+	}{
+		// A zero-length PLAIN message reaches the mechanism and is refused there.
+		{name: "pad as initial response", cmd: "A1 AUTHENTICATE PLAIN =", want: "A1 NO Invalid SASL PLAIN response"},
+		{name: "empty continuation reply", cmd: "A1 AUTHENTICATE PLAIN", replies: []string{""}, want: "A1 NO Invalid SASL PLAIN response"},
+		{name: "pad as continuation reply", cmd: "A1 AUTHENTICATE PLAIN", replies: []string{"="}, want: "A1 BAD Malformed SASL response"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, reader := dialAuthenticate(t, server.Address)
+
+			fmt.Fprintf(conn, "%s\r\n", tc.cmd)
+			for _, reply := range tc.replies {
+				if line, err := reader.ReadString('\n'); err != nil || line != "+ \r\n" {
+					t.Fatalf("continuation request = %q, %v", line, err)
+				}
+				fmt.Fprintf(conn, "%s\r\n", reply)
+			}
+			if got := readTagged(t, reader, "A1"); got != tc.want {
+				t.Fatalf("%s: got %q, want %q", tc.name, got, tc.want)
+			}
+
+			// Only the command was refused, not the connection.
+			fmt.Fprintf(conn, "A2 LOGIN %q %q\r\n", account.Email, account.Password)
+			if got := readTagged(t, reader, "A2"); !strings.HasPrefix(got, "A2 OK") {
+				t.Fatalf("LOGIN after the refused AUTHENTICATE = %q, want A2 OK", got)
+			}
+		})
+	}
+}

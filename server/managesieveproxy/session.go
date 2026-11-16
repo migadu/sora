@@ -75,10 +75,9 @@ func (s *Session) Close() error {
 // (the library's command loop is parked in this call until the relay
 // finishes; returning triggers session teardown).
 //
-// The authorization identity is deliberately ignored (pre-migration parity):
-// impersonation is only meaningful on the backend, where the proxy
-// re-authenticates with master SASL credentials.
-func (s *Session) AuthenticatePlain(_ context.Context, _, username, password string) error {
+// The proxy logs in to the backend as the account the credentials log in to, so
+// an authorization identity naming any other account is refused (see below).
+func (s *Session) AuthenticatePlain(_ context.Context, authzID, username, password string) error {
 	authStart := time.Now()
 	if err := s.authenticateUser(username, password, authStart); err != nil {
 		s.DebugLog("authentication failed", "error", err)
@@ -96,6 +95,19 @@ func (s *Session) AuthenticatePlain(_ context.Context, _, username, password str
 			return &managesieveserver.Error{Code: "TRYLATER", Message: "Service temporarily unavailable, please try again later"}
 		}
 		return &managesieveserver.Error{Message: `"Authentication failed"`}
+	}
+
+	// The credentials checked out; now the authorization. RFC 4616 section 2: the
+	// server "will verify that the authentication credentials permit the client to act
+	// as the (presented or derived) authorization identity". They permit acting only
+	// as the account they log in to, which this proxy presents to the backend as
+	// s.username: named by the authentication identity itself or by the address the
+	// login resolved to (the master username form's target). Any other is refused with
+	// the backend's reply, and only now, so only a client that proved the credentials
+	// learns it. Not a failed login: the credentials were right.
+	if authzID != "" && authzID != username && authzID != s.username {
+		s.InfoLog("authorization failed", "authzid", authzID)
+		return &managesieveserver.Error{Message: `"Proxy authentication requires master credentials"`}
 	}
 
 	// Connect to backend and authenticate
