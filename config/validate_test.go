@@ -102,6 +102,33 @@ func TestConfigValidate(t *testing.T) {
 			want: []problem{{"[cluster]", "cluster port -1 is not a valid port"}}},
 
 		{name: "cluster port overflow", content: cluster + "addr = \"10.10.10.40:999999999999999999999999999999\"\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend, want: []problem{{"[cluster]", `cluster port "999999999999999999999999999999" is not a valid port`}}},
+		// Each of these intervals is the period of a ticker that start-up runs in a
+		// goroutine, and time.NewTicker panics on one of zero or less, which stopped the
+		// server (#1643). A value that does not parse takes its default.
+		{name: "local_cache intervals on a mail backend", content: "[local_cache]\npurge_interval = \"30m\"\nmetrics_interval = \"soon\"\n" + imapBackend},
+		{name: "local_cache purge_interval 0s", content: "[local_cache]\npurge_interval = \"0s\"\n" + imapBackend,
+			want: []problem{{"[local_cache]", `purge_interval must be positive, got "0s"`}}},
+		{name: "local_cache purge_interval -1h", content: "[local_cache]\npurge_interval = \"-1h\"\n" + imapBackend,
+			want: []problem{{"[local_cache]", `purge_interval must be positive, got "-1h"`}}},
+		{name: "local_cache metrics_interval 0", content: "[local_cache]\nmetrics_interval = \"0\"\n" + imapBackend,
+			want: []problem{{"[local_cache]", `metrics_interval must be positive, got "0"`}}},
+		{name: "local_cache metrics_interval -5m", content: "[local_cache]\nmetrics_interval = \"-5m\"\n" + imapBackend,
+			want: []problem{{"[local_cache]", `metrics_interval must be positive, got "-5m"`}}},
+		{name: "local_cache on a proxy is not checked", content: "[local_cache]\npurge_interval = \"0s\"\nmetrics_interval = \"-1m\"\n" + imapProxy},
+		{name: "auth_cache cleanup_interval", content: "[auth_cache]\nenabled = true\ncleanup_interval = \"30m\"\n" + imapProxy},
+		{name: "auth_cache cleanup_interval unparsable", content: "[auth_cache]\nenabled = true\ncleanup_interval = \"hourly\"\n" + imapProxy},
+		{name: "auth_cache cleanup_interval 0s", content: "[auth_cache]\nenabled = true\ncleanup_interval = \"0s\"\n" + imapProxy,
+			want: []problem{{"[auth_cache]", `cleanup_interval must be positive, got "0s"`}}},
+		{name: "auth_cache cleanup_interval -1h on a mail backend", content: "[auth_cache]\nenabled = true\ncleanup_interval = \"-1h\"\n" + imapBackend,
+			want: []problem{{"[auth_cache]", `cleanup_interval must be positive, got "-1h"`}}},
+		{name: "auth_cache disabled is not checked", content: "[auth_cache]\ncleanup_interval = \"0s\"\n" + imapProxy},
+		{name: "cluster.affinity cleanup_interval", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"" + validClusterKey + "\"\n\n[cluster.affinity]\ncleanup_interval = \"30m\"\n" + imapBackend},
+		{name: "cluster.affinity cleanup_interval 0s", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"" + validClusterKey + "\"\n\n[cluster.affinity]\ncleanup_interval = \"0s\"\n" + imapBackend,
+			want: []problem{{"[cluster.affinity]", `cleanup_interval must be positive, got "0s"`}}},
+		{name: "cluster.affinity cleanup_interval -1h", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"" + validClusterKey + "\"\n\n[cluster.affinity]\ncleanup_interval = \"-1h\"\n" + imapBackend,
+			want: []problem{{"[cluster.affinity]", `cleanup_interval must be positive, got "-1h"`}}},
+		{name: "cluster.affinity disabled is not checked", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"" + validClusterKey + "\"\n\n[cluster.affinity]\nenabled = false\ncleanup_interval = \"-1h\"\n" + imapBackend},
+		{name: "cluster.affinity without cluster is not checked", content: "[cluster.affinity]\ncleanup_interval = \"-1h\"\n" + imapBackend},
 		{name: "every problem, in order", content: "[servers]\ntrusted_networks = []\n\n[relay]\ntype = \"SMTP\"\n\n[uploader]\nbatch_size = 0\n" +
 			imapBackend + "proxy_protocol = true\n" + imapBackend,
 			want: []problem{
