@@ -221,12 +221,8 @@ github.com/migadu/go-managesieve v0.1.5 h1:oJi41X93PoYihSxYo/SkYQyIoR8G4Ln8Tv3f2
 github.com/migadu/go-managesieve v0.1.5/go.mod h1:E38XgVuCDYRSNz/9ku4Sc7CvVDmJ8FLqGc1udcxP9SE=
 github.com/migadu/go-message v0.0.0-20261115010257-aa2abe055119 h1:5wZ36W5frh1ZaSuIIvw2Afyr8mNT4mfGcGSeAgSXAIQ=
 github.com/migadu/go-message v0.0.0-20261115010257-aa2abe055119/go.mod h1:XpJyL70LwRvq2a8rVbHXikPgKj8+aI0kGdHlg16ibYA=
-github.com/migadu/go-pop3 v0.1.5-0.20261114174148-24ad5702c60a h1:Xy5B3IMkUlQRYaL5sxKjjDrqL8FEh4oiGzBG7tNPPls=
-github.com/migadu/go-pop3 v0.1.5-0.20261114174148-24ad5702c60a/go.mod h1:TcqnbNVPK/1+Z1XbFE48L1zoLsakwvc4DzrHCJBMgxM=
-github.com/migadu/go-pop3 v0.1.6-0.20261115212610-3451e4d02c5f h1:hTTrs8FrFttsBDCKfOVObOdtx9OpwFi3y4mo1kMK9tE=
-github.com/migadu/go-pop3 v0.1.6-0.20261115212610-3451e4d02c5f/go.mod h1:TcqnbNVPK/1+Z1XbFE48L1zoLsakwvc4DzrHCJBMgxM=
-github.com/migadu/go-pop3 v0.1.6 h1:R54su0kh7ZqyIankvrK/nc8fx++R1+P/pjl6rDMllao=
-github.com/migadu/go-pop3 v0.1.6/go.mod h1:TcqnbNVPK/1+Z1XbFE48L1zoLsakwvc4DzrHCJBMgxM=
+github.com/migadu/go-pop3 v0.1.7 h1:MIXGy/UDz0zxM1GFhrE89UkLKKPCs+SAZgUVNy3jhF0=
+github.com/migadu/go-pop3 v0.1.7/go.mod h1:TcqnbNVPK/1+Z1XbFE48L1zoLsakwvc4DzrHCJBMgxM=
 github.com/migadu/go-sieve v1.4.5-0.20261115114147-a3dca5dd79d9 h1:+OeNsZf6Fffa95DaoVHpP3gr046KXyoT0EYrgW6jSRY=
 github.com/migadu/go-sieve v1.4.5-0.20261115114147-a3dca5dd79d9/go.mod h1:xHAx5kMQ5hw/YJziHobNfLDpMK4jjxMJ5sZAHi3uFr8=
 github.com/migadu/go-sieve v1.4.5-0.20261115120903-65bf2094bfa6 h1:8Dd6Waq2Xg7UWRJomBnRqIlcw2q6AWaVs9dcYB5cOn8=
