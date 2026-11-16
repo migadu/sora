@@ -197,6 +197,22 @@ func TestNotifyEventsForMailbox(t *testing.T) {
 			want:       nil,
 		},
 		{
+			// The root CREATE Shared/Team makes is a \Noselect container of the
+			// shared namespace; RFC 5465 §6.2 takes selectable mailboxes only.
+			name:       "PersonalExcludesSharedNamespaceRoot",
+			watch:      newTestWatch(imap.NotifyItem{MailboxSpec: imap.NotifyMailboxSpecPersonal, Events: msgEvents}),
+			mailbox:    "shared",
+			sharedRoot: "Shared",
+			want:       nil,
+		},
+		{
+			name:       "PersonalMatchesSiblingOfSharedRoot",
+			watch:      newTestWatch(imap.NotifyItem{MailboxSpec: imap.NotifyMailboxSpecPersonal, Events: msgEvents}),
+			mailbox:    "SharedDocs",
+			sharedRoot: "Shared",
+			want:       msgEvents,
+		},
+		{
 			name:    "InboxesMatchesOnlyInbox",
 			watch:   newTestWatch(imap.NotifyItem{MailboxSpec: imap.NotifyMailboxSpecInboxes, Events: msgEvents}),
 			mailbox: "Archive",

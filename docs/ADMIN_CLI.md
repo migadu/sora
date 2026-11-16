@@ -1111,7 +1111,7 @@ upgrades.
 | Subcommand | Flags | What it does |
 |---|---|---|
 | `up` | | Applies every pending migration. |
-| `down` | `--limit N` (default `1`), `--all` | Reverts the last N migrations, or all of them. No prompt. |
+| `down` | `--limit N` (default `1`), `--all` | Reverts the last N migrations, or with `--all` every migration after 000001. 000001, the initial schema, is never reverted: a `--limit` that reaches it is refused. No prompt. |
 | `version` | | Prints the current version and whether it is dirty. Safe while servers run: a plain read of `schema_migrations`, no lock. |
 | `force VERSION` | | Records VERSION as the current version and clears the dirty flag, without running anything. |
 

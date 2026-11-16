@@ -107,8 +107,14 @@ chk AS (
 	            AND (NOT m.has_delim OR lower(p.name) <> lower(m.name_parent)) THEN 'detached'
 	       END AS problem
 	FROM m
-	-- path is unique (it ends in the row's own ID), so this matches at most one row
-	LEFT JOIN mailboxes p ON p.account_id = m.account_id AND p.path = m.parent_path
+	-- a well-formed path ends in the row's own ID, so this matches at most one row
+	LEFT JOIN mailboxes p
+	       ON p.account_id = m.account_id
+	      AND p.path = m.parent_path
+	      AND length(p.path) > 0
+	      AND length(p.path) % 16 = 0
+	      AND p.path COLLATE "C" ~ '^[0-9a-f]+$'
+	      AND right(p.path, 16) = lpad(to_hex(p.id), 16, '0')
 )
 SELECT chk.problem,
        chk.account_id,
@@ -231,6 +237,7 @@ func (db *Database) RepairMailboxHierarchy(ctx context.Context, accountID int64,
 			rows.Close()
 			return nil, fmt.Errorf("failed to scan mailbox: %w", err)
 		}
+		m.badPath = !validMailboxPath(m.path, m.id)
 		r.add(m)
 	}
 	rows.Close()
@@ -288,10 +295,11 @@ func (db *Database) RepairMailboxHierarchy(ctx context.Context, accountID int64,
 // hierarchyMailbox is a live mailbox as the repair sees it: lower is its name as
 // PostgreSQL's LOWER folds it, the key ancestors are looked up by, as CREATE does.
 type hierarchyMailbox struct {
-	id    int64
-	name  string
-	lower string
-	path  string
+	id      int64
+	name    string
+	lower   string
+	path    string
+	badPath bool
 }
 
 // hierarchyRepairer keeps the account's live mailboxes in step with the repairs: a dry
@@ -357,7 +365,7 @@ func (r *hierarchyRepairer) repair(ctx context.Context, p MailboxHierarchyProble
 		if strings.HasPrefix(parent.path, m.path) {
 			return manual("its parent %q is inside its own subtree", parent.name)
 		}
-		if parent.id > 0 && !validMailboxPath(parent.path, parent.id) {
+		if parent.badPath {
 			return manual("its parent %q has a malformed path", parent.name)
 		}
 	}
@@ -382,6 +390,7 @@ func (r *hierarchyRepairer) repair(ctx context.Context, p MailboxHierarchyProble
 
 // create creates the ancestor name below parent (nil: at the top level), as CREATE does.
 func (r *hierarchyRepairer) create(ctx context.Context, name, lower string, parent *hierarchyMailbox) (*hierarchyMailbox, error) {
+	name = helpers.CanonicalMailboxName(name)
 	var parentID *int64
 	parentPath := ""
 	if parent != nil {
@@ -408,12 +417,14 @@ func (r *hierarchyRepairer) create(ctx context.Context, name, lower string, pare
 	if err != nil {
 		return nil, fmt.Errorf("failed to read back %q: %w", name, err)
 	}
+	m.badPath = !validMailboxPath(m.path, m.id)
 	r.add(m)
 	return m, nil
 }
 
 // reparent links m, with its subtree, below parent (nil: at the top level). Only paths
-// change. Soft-deleted rows of the subtree move too, as they do on RENAME.
+// change. Soft-deleted rows of the subtree move too, as they do on RENAME; rows with
+// malformed paths are reported only and left untouched.
 func (r *hierarchyRepairer) reparent(ctx context.Context, m, parent *hierarchyMailbox) error {
 	parentPath := ""
 	if parent != nil {
@@ -424,13 +435,23 @@ func (r *hierarchyRepairer) reparent(ctx context.Context, m, parent *hierarchyMa
 		if _, err := r.tx.Exec(ctx, `
 			UPDATE mailboxes
 			SET path = $3 || SUBSTRING(path FROM LENGTH($2) + 1), updated_at = now()
-			WHERE account_id = $1 AND path LIKE $2 || '%'
-		`, r.accountID, oldPath, newPath); err != nil {
+			WHERE account_id = $1
+			  AND path LIKE $2 || '%'
+			  AND (
+			      id = $4
+			      OR (
+			          length(path) > length($2)
+			          AND length(path) % 16 = 0
+			          AND path COLLATE "C" ~ '^[0-9a-f]+$'
+			          AND right(path, 16) = lpad(to_hex(id), 16, '0')
+			      )
+			  )
+		`, r.accountID, oldPath, newPath, m.id); err != nil {
 			return fmt.Errorf("failed to move the subtree: %w", err)
 		}
 	}
 	for _, b := range r.boxes {
-		if strings.HasPrefix(b.path, oldPath) {
+		if !b.badPath && strings.HasPrefix(b.path, oldPath) && (b == m || validMailboxPath(b.path[len(oldPath):], b.id)) {
 			b.path = newPath + b.path[len(oldPath):]
 		}
 	}

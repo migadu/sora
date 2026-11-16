@@ -2,9 +2,10 @@
 -- It drops all tables and destroys the entire database schema.
 --
 -- This down migration is intentionally COMMENTED OUT to prevent accidental data loss.
--- If you really need to tear down the database, uncomment the statements below.
+-- `sora-admin migrate down` never runs it: `--all` stops at this migration and a
+-- `--limit` that would revert it is refused, so uncommenting it changes nothing.
 --
--- RECOMMENDED: Instead of using this migration, manually drop the database and recreate it.
+-- To tear down the database, drop it and recreate it.
 
 /*
 -- Drop all functions
