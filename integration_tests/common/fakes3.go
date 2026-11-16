@@ -37,7 +37,16 @@ type FakeS3 struct {
 	failDeletes bool                // when set, every delete is refused with AccessDenied
 	onDelete    func(keys []string) // called before a delete is applied, outside the lock
 	onGet       func(key string)    // called before a GET responds, outside the lock
+	onPut       func(key string)    // called before a PUT is stored, outside the lock
 	getCount    int
+}
+
+// OnPut registers a barrier before storing a PUT, outside the object lock.
+// Tests can observe a post-database-commit upload without a timing race.
+func (f *FakeS3) OnPut(fn func(key string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onPut = fn
 }
 
 // OnGet registers fn to run before each GET response, outside the object lock.
@@ -150,6 +159,12 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeS3Error(w, http.StatusInternalServerError, "InternalError", key)
 			return
+		}
+		f.mu.Lock()
+		hook := f.onPut
+		f.mu.Unlock()
+		if hook != nil {
+			hook(key)
 		}
 		f.mu.Lock()
 		if f.failPuts {

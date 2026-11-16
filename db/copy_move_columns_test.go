@@ -54,6 +54,14 @@ func TestCopyMoveCarryEveryMessageColumn(t *testing.T) {
 
 	var bs imap.BodyStructure = &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain", Size: 100}
 	base := time.Now().UnixNano()
+	// This fixture represents known headers, so every carried metadata column
+	// (including migration70 presence) has a non-NULL value to compare.
+	var knownHeaders int16
+	for _, key := range []string{"from", "to", "cc", "subject", "message-id", "in-reply-to", "references"} {
+		bit, ok := helpers.HeaderPresenceBit(key)
+		require.True(t, ok)
+		knownHeaders |= bit
+	}
 	// Every header column is populated, extra_addresses included (two To and two Cc). There
 	// is no Date: header (SentDate is zero), so sent_date_unknown (migration 000061) is set.
 	insert := func(n int) (id int64, uid imap.UID) {
@@ -66,7 +74,7 @@ func TestCopyMoveCarryEveryMessageColumn(t *testing.T) {
 			AccountID: accountID, MailboxID: inboxID, MailboxName: "INBOX",
 			S3Domain: "example.com", S3Localpart: "copymovecols", ContentHash: hash,
 			MessageID: fmt.Sprintf("%s@example.com", hash), InternalDate: time.Now(),
-			Size: 100, Subject: fmt.Sprintf("Re: message %d", n), BodyStructure: &bs,
+			Size: 100, Subject: fmt.Sprintf("Re: message %d", n), BodyStructure: &bs, HeaderPresence: &knownHeaders,
 			InReplyTo:  []string{"parent@example.com"},
 			References: []string{"ancestor@example.com", "parent@example.com"},
 			Recipients: []helpers.Recipient{
