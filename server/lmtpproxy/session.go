@@ -905,7 +905,7 @@ func formatCanonicalRCPT(recipient string, keptParams []string) string {
 	return "RCPT TO:<" + recipient + ">"
 }
 
-// Parse using the same path-first parameter contract as the RCPT handler.
+// parseRCPTCommand uses the same path-first parameter contract as the RCPT handler.
 func parseRCPTCommand(command string) (address string, keptParams []string, ok bool) {
 	trimmed := strings.TrimSpace(command)
 	if len(trimmed) <= 4 || !server.EqualFoldASCII(trimmed[:4], "RCPT") || (trimmed[4] != ' ' && trimmed[4] != '\t') {
@@ -1696,8 +1696,9 @@ func (s *Session) invalidateLookupCache(reason string) {
 	s.InfoLog("invalidated lookup cache entry", "reason", reason, "address", s.originalAddress, "backend", s.serverAddr)
 }
 
-// forwardRCPT sends the RCPT TO command to backend and handles response interception.
-// Its only parameter can be XRCPTFORWARD: the RCPT handler refuses any other.
+// backendRcptTo builds a canonical recipient path and preserves accepted XRCPTFORWARD
+// tokens after the RCPT handler has refused every unsupported parameter. Alias
+// resolution preserves the original recipient detail as before.
 func (s *Session) backendRcptTo(command string) (backendCommand string, rewrote bool, resolvedRecipient string) {
 	parsedRecipient, keptParams, ok := parseRCPTCommand(command)
 	recipient := s.to
