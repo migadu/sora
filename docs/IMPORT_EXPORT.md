@@ -556,15 +556,23 @@ sora-admin --config config.toml import s3 --email user@example.com --workers 10
 | `--continuation-token KEY` | | Start listing after this key. Pass a `Resumption token` from an earlier run. |
 | `--force-reimport` | `false` | Import objects even when a live message of the account in another mailbox already has that hash (`REIMPORT`). An object whose message INBOX already holds is still skipped. |
 | `--import-delay` | `0` | Pause after each imported message (Go duration, for example `200ms`). |
-| `--cleanup-db` | `true` | Delete the temporary SQLite file at the end. |
+| `--cleanup-db` | `true` | Delete the temporary SQLite file, and the directory that holds it, at the end. |
 | `--fts-retention` | `[cleanup] fts_retention` | As for `import maildir`. |
 
 How it works:
 
 1. It lists `domain/localpart/` and keeps keys of the form `domain/localpart/<64 hex digits>`,
-   recording them in a temporary SQLite file `sora-s3-import-<random>.db` in the system's
-   temporary directory. Every run creates a file of its own, readable by its owner only, so
-   runs for several users can go in parallel.
+   recording them in a temporary SQLite file `sora-s3-import.db`, in a directory
+   `sora-s3-import-<random>` of its own in the system's temporary directory (`TMPDIR`, else
+   `/tmp`). Every run creates a directory of its own that only its owner can read or create
+   files in, so runs for several users can go in parallel, and no other user can put a hard
+   link at the names of the files SQLite keeps beside the database (`-wal`, `-shm`), which
+   SQLite would write through. On Linux with `fs.protected_hardlinks = 1` that is all. Elsewhere
+   (macOS, FreeBSD by default, Linux with `fs.protected_hardlinks = 0`) every directory above
+   it must also belong to root or to the user running `sora-admin`, and its group and others
+   may write in it only with the sticky bit set, as on `/tmp`: whoever can rename the directory
+   could put one of their own, with such links, in its place. Otherwise the import refuses to
+   start and names the directory; set `TMPDIR` to a directory that passes.
 2. For each object, it skips it when a live message of the account already has that content hash
    (with `--force-reimport`, only when that message is in INBOX). Otherwise it downloads and
    decrypts the object, parses it, and inserts it into **INBOX**: S3 holds no folder
