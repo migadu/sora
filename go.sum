@@ -269,10 +269,8 @@ github.com/migadu/go-sieve v1.5.2-0.20261116074343-3cb84c417b75 h1:TNVmjcd3LOoiv
 github.com/migadu/go-sieve v1.5.2-0.20261116074343-3cb84c417b75/go.mod h1:xHAx5kMQ5hw/YJziHobNfLDpMK4jjxMJ5sZAHi3uFr8=
 github.com/migadu/go-sieve v1.5.2-0.20261116091750-537173a6fa6b h1:XtgboFYBxy0elDLzAiYDM+2gwoR7hGSkeFxn8anGLng=
 github.com/migadu/go-sieve v1.5.2-0.20261116091750-537173a6fa6b/go.mod h1:xHAx5kMQ5hw/YJziHobNfLDpMK4jjxMJ5sZAHi3uFr8=
-github.com/migadu/go-smtp v0.0.0-20261115213624-e2128ee885bd h1:vbj0EnLbR3uKLN7WR7bFEZqTKzKnzZ347mU3dDkeTwA=
-github.com/migadu/go-smtp v0.0.0-20261115213624-e2128ee885bd/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
-github.com/migadu/go-smtp v0.0.0-20261115221208-dbc7824090f0 h1:BZ7Cj9szp+yjlLT6qN00wCh1lYphI0do5PWHNHOHssE=
-github.com/migadu/go-smtp v0.0.0-20261115221208-dbc7824090f0/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
+github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116094727-0b0aaa23d4af h1:esW6dMERJsVDxQlLk7Ak/vycaGJ57Fw5odWKrppivJY=
+github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116094727-0b0aaa23d4af/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/moby/docker-image-spec v1.3.1 h1:jMKff3w6PgbfSa69GfNg+zN/XLhfXJGnEx3Nl2EsFP0=
 github.com/moby/docker-image-spec v1.3.1/go.mod h1:eKmb5VW8vQEh/BAr2yvVNvuiJuY6UIocYsFu/DxxRpo=
 github.com/moby/term v0.5.0 h1:xt8Q1nalod/v7BqbG21f8mQPqH+xAaC9C3N3wfWbVP0=
