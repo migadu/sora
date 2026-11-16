@@ -15,8 +15,9 @@ import (
 )
 
 // TestManageSieve_AuthenticateRefusesNonBase64Response: a SASL PLAIN response with a
-// CR or CRLF inside a quoted string or a literal, or a continuation line with
-// whitespace around it, is refused and never becomes a login (#1772). RFC 5804
+// CR or CRLF inside a quoted string or a literal, a backslash inside a quoted string,
+// or a continuation line or an unquoted initial response with whitespace or a CR
+// around it, is refused and never becomes a login (#1772). RFC 5804
 // section 2.1: "A client response consists of a string (quoted or literal) with the
 // base-64 encoding of the SASL data followed by a CRLF", and RFC 4648 section 3.3:
 // "Implementations MUST reject the encoded data if it contains characters outside the
@@ -37,6 +38,11 @@ func TestManageSieve_AuthenticateRefusesNonBase64Response(t *testing.T) {
 		{"literal initial response, CRLF inside", fmt.Sprintf("AUTHENTICATE \"PLAIN\" {%d+}\r\n%s\r\n", len(crlfInside), crlfInside)},
 		{"quoted continuation, CR inside", "AUTHENTICATE \"PLAIN\"\r\n\"" + crInside + "\"\r\n"},
 		{"continuation, leading space", "AUTHENTICATE \"PLAIN\"\r\n " + plain + "\r\n"},
+		// An unquoted initial response is accepted like a bare continuation line and,
+		// like one, runs to the CRLF; a backslash inside a quoted response is no
+		// QUOTED-CHAR escape of a base64 character (RFC 5804 section 4).
+		{"unquoted initial response, CR before the CRLF", `AUTHENTICATE "PLAIN" ` + plain + "\r\r\n"},
+		{"quoted initial response, backslash inside", `AUTHENTICATE "PLAIN" "` + plain[:4] + `\` + plain[4:] + "\"\r\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
