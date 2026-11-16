@@ -436,29 +436,40 @@ func contentObjectFromKey(key string) (db.ContentObject, bool) {
 	return db.ContentObject{S3Domain: key[:first], S3Localpart: key[first+1 : last], ContentHash: key[last+1:]}, true
 }
 
-// deleteOrphanedObject deletes the object at key unless something references it by now,
-// and reports whether it did. Like every S3 delete (the cleaner's, the purge's, rekey's),
-// it holds the body's object lock across the re-check and the delete: an upload, restore
-// or cross-account COPY of the body is either seen by the re-check or waits for the
-// delete to finish (see db.PassS3WriteGate).
-func deleteOrphanedObject(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage *storage.S3Storage, accountID int64, key string) (bool, error) {
+// deleteOrphanedObject rechecks all accounts and pending claims under the shared
+// body protocol. Account0 deliberately has no eligible rows: every real account's
+// reference protects this physical key. A durable intent fences a DELETE that
+// outlives its database holder; only explicit refusal can release that uncertainty.
+func deleteOrphanedObject(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage *storage.S3Storage, _ int64, key string) (bool, error) {
 	obj, ok := contentObjectFromKey(key)
 	if !ok {
 		return false, fmt.Errorf("unexpected S3 key %q", key)
 	}
+	candidate := db.UserScopedObjectForCleanup{AccountID: 0, ContentHash: obj.ContentHash, S3Domain: obj.S3Domain, S3Localpart: obj.S3Localpart}
 	deleted := false
-	err := rdb.ExecuteWithS3ObjectLock(ctx, obj.ContentHash, accountID, func(ctx context.Context) error {
-		referenced, err := rdb.IsContentObjectReferencedWithRetry(ctx, obj)
-		if err != nil || referenced {
-			return err
+	var deleteErr error
+	_, err := rdb.ExecuteWithS3BodyCleanup(ctx, []db.UserScopedObjectForCleanup{candidate}, 0, func(ctx context.Context, objects []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error) {
+		var result db.S3BodyCleanupResult
+		for _, object := range objects {
+			if object.KeepObject {
+				continue
+			}
+			if err := s3Storage.DeleteContext(ctx, key); err != nil {
+				if storage.DeleteDefinitelyRefused(err) {
+					result.Rejected = append(result.Rejected, object)
+				}
+				deleteErr = err
+				return result, nil
+			}
+			deleted = true
+			result.Gone = append(result.Gone, object)
 		}
-		if err := s3Storage.DeleteContext(ctx, key); err != nil {
-			return err
-		}
-		deleted = true
-		return nil
+		return result, nil
 	})
-	return deleted, err
+	if err != nil {
+		return false, errors.Join(err, deleteErr)
+	}
+	return deleted, deleteErr
 }
 
 func applyFixes(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage *storage.S3Storage, accountID int64, result *verificationResult, fixOrphaned, fixMissing bool) error {

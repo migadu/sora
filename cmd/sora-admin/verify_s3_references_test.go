@@ -141,12 +141,13 @@ func verifyTestConfig(t *testing.T, endpoint string) AdminConfig {
 	return AdminConfig{
 		Database: *adminTestDBConfig(t),
 		S3: config.S3Config{
-			Endpoint:   endpoint,
-			DisableTLS: true,
-			AccessKey:  "test-access-key",
-			SecretKey:  "test-secret-key",
-			Bucket:     verifyTestBucket,
-			Timeout:    "5s",
+			BodyDeletionProtocol: "global-hash-v1",
+			Endpoint:             endpoint,
+			DisableTLS:           true,
+			AccessKey:            "test-access-key",
+			SecretKey:            "test-secret-key",
+			Bucket:               verifyTestBucket,
+			Timeout:              "5s",
 		},
 	}
 }
