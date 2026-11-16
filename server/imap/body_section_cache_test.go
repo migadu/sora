@@ -145,6 +145,13 @@ func TestBodySectionCacheKey_DistinguishesSections(t *testing.T) {
 		"binary":     binarySectionCacheKey(hash, nil),
 		"binary 2":   binarySectionCacheKey(hash, []int{2}),
 		"binary 2.1": binarySectionCacheKey(hash, []int{2, 1}),
+		// A requested name is an astring (header-fld-name, RFC 9051 §9) and a field-name
+		// may hold any printable but ':' (RFC 5322 §3.6.8), so neither a space nor a
+		// separator character inside a name may pass for list structure.
+		"fields (A B)":     bodySectionCacheKey(hash, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{"A", "B"}}),
+		"fields (\"A B\")": bodySectionCacheKey(hash, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{"A B"}}),
+		"fields (]|[q)":    bodySectionCacheKey(hash, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{"]|[q"}}),
+		"fieldsnot (q]|[)": bodySectionCacheKey(hash, &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFieldsNot: []string{"q]|["}}),
 	}
 	seen := make(map[string]string, len(keys))
 	for name, key := range keys {
@@ -169,5 +176,47 @@ func TestBodySectionCacheKey_DistinguishesSections(t *testing.T) {
 	}
 	if got := binarySectionCacheKey("", []int{2}); got != "" {
 		t.Errorf("BINARY cache key for a hashless message = %q, want \"\"", got)
+	}
+}
+
+// TestFetch_RetainedHeaderFieldsSectionAnswersOnlyItsOwnRequest: a chunk request for
+// one HEADER.FIELDS or HEADER.FIELDS.NOT list is never answered from the section
+// retained for another list, however the names in the two lists are spelled: the
+// subset is defined by the requested field-names alone (RFC 9051 §6.4.5.1).
+func TestFetch_RetainedHeaderFieldsSectionAnswersOnlyItsOwnRequest(t *testing.T) {
+	body := []byte("From: a@example.com\r\nA: 1\r\nB: 2\r\nSubject: s\r\n\r\nbody\r\n")
+	partial := func() *imap.SectionPartial { return &imap.SectionPartial{Offset: 0, Size: 100} }
+	for _, tc := range []struct {
+		name          string
+		first, second *imap.FetchItemBodySection
+		want          string
+	}{
+		{
+			name:   `HEADER.FIELDS ("A B") then HEADER.FIELDS (A B)`,
+			first:  &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{"A B"}, Partial: partial()},
+			second: &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{"A", "B"}, Partial: partial()},
+			want:   "A: 1\r\nB: 2\r\n\r\n",
+		},
+		{
+			name:   `HEADER.FIELDS ("]|[q") then HEADER.FIELDS.NOT ("q]|[")`,
+			first:  &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{"]|[q"}, Partial: partial()},
+			second: &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFieldsNot: []string{"q]|["}, Partial: partial()},
+			want:   "From: a@example.com\r\nA: 1\r\nB: 2\r\nSubject: s\r\n\r\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, tracker := newFetchTestSession(0)
+			msg := fetchTestMessage(body)
+			for i, section := range []*imap.FetchItemBodySection{tc.first, tc.second} {
+				w := &fakeBodySectionWriter{tracker: tracker}
+				bodyData, bodyFetched := body, true
+				if err := fetchBodySections(s, w, &bodyData, &bodyFetched, &imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{section}}, msg); err != nil {
+					t.Fatalf("fetch %d: %v", i+1, err)
+				}
+				if i == 1 && string(w.sections[0].data) != tc.want {
+					t.Errorf("second fetch = %q, want %q", w.sections[0].data, tc.want)
+				}
+			}
+		})
 	}
 }
