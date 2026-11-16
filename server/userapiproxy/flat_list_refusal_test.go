@@ -14,7 +14,6 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/resilient"
-	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/testutils"
 	"golang.org/x/crypto/bcrypt"
@@ -50,11 +49,7 @@ func TestUserAPIProxy_FlatListRefusesWhatTheLookupRefuses(t *testing.T) {
 	token := corsTestToken(t, time.Hour) // user@example.com, account 42
 	refresh := `{"token":"` + token + `"}`
 
-	// What a backend's wrong-password answer carries (userapi corsMiddleware, then
-	// writeError through writeJSON), with the same allowed_origins as the proxy's.
-	wantHeader := http.Header{}
-	server.SetCORSHeaders(wantHeader, corsTestOrigin, []string{corsTestOrigin})
-	wantHeader.Set("Content-Type", "application/json")
+	wantHeader := wrongPasswordHeader()
 
 	refused := func() *scriptedLookup { return &scriptedLookup{result: proxy.AuthFailed} }
 	unknown := func() *scriptedLookup { return &scriptedLookup{result: proxy.AuthUserNotFound} }

@@ -19,8 +19,11 @@ import (
 // The proxy must not announce DSN (RFC 3461): neither it nor the LMTP backend
 // issues a "delivered" DSN (§5.2.3), and the parameters are not forwarded. An
 // MTA that sees no DSN keeps the duties of §5.2.2 for itself (a "relayed" DSN
-// for NOTIFY=SUCCESS). Parameters an MTA sends anyway are still accepted and
-// still not passed to the backend, which does not announce DSN either.
+// for NOTIFY=SUCCESS). Parameters an MTA sends anyway are refused with 555 5.5.4,
+// as the backend, which does not announce DSN either, refuses them: RFC 5321
+// section 4.1.1.11, "If the server SMTP does not recognize or cannot implement one
+// or more of the parameters associated with a particular MAIL FROM or RCPT TO
+// command, it will return code 555." None reaches the backend.
 func TestLMTPProxyDoesNotAnnounceDSN(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -95,29 +98,39 @@ func TestLMTPProxyDoesNotAnnounceDSN(t *testing.T) {
 	}
 
 	send("MAIL FROM:<sender@example.org> RET=HDRS ENVID=abc123")
+	if reply := readReply(t, reader); !strings.HasPrefix(reply, "555 5.5.4 ") {
+		t.Errorf("MAIL with RET and ENVID = %q, want 555 5.5.4", reply)
+		send("RSET")
+		readReply(t, reader)
+	}
+	send("MAIL FROM:<sender@example.org>")
 	if reply := readReply(t, reader); !strings.HasPrefix(reply, "250 ") {
-		t.Fatalf("MAIL with RET and ENVID = %q, want 250", reply)
+		t.Fatalf("MAIL = %q, want 250", reply)
 	}
 	send("RCPT TO:<user@example.com> NOTIFY=SUCCESS ORCPT=rfc822;user@example.com")
+	if reply := readReply(t, reader); !strings.HasPrefix(reply, "555 5.5.4 ") {
+		t.Errorf("RCPT with NOTIFY and ORCPT = %q, want 555 5.5.4", reply)
+	}
+	send("RCPT TO:<user@example.com>")
 	if reply := readReply(t, reader); !strings.HasPrefix(reply, "250 ") {
-		t.Fatalf("RCPT with NOTIFY and ORCPT = %q, want 250", reply)
+		t.Fatalf("RCPT = %q, want 250", reply)
 	}
 
-	// The backend has answered the RCPT, so it has received every command by now.
-	var mail, rcpt string
+	// The backend has answered the last RCPT, so it has received every command by now.
+	var mail, rcpt []string
 	for len(backendCommands) > 0 {
 		switch cmd := <-backendCommands; strings.ToUpper(cmd[:min(len(cmd), 4)]) {
 		case "MAIL":
-			mail = cmd
+			mail = append(mail, cmd)
 		case "RCPT":
-			rcpt = cmd
+			rcpt = append(rcpt, cmd)
 		}
 	}
-	if want := "MAIL FROM:<sender@example.org>"; mail != want {
-		t.Errorf("backend received %q, want %q (RET and ENVID are not forwarded)", mail, want)
+	if want := "MAIL FROM:<sender@example.org>"; len(mail) != 1 || mail[0] != want {
+		t.Errorf("backend received %q, want [%q] (RET and ENVID are not forwarded)", mail, want)
 	}
-	if want := "RCPT TO:<user@example.com>"; rcpt != want {
-		t.Errorf("backend received %q, want %q (NOTIFY and ORCPT are not forwarded)", rcpt, want)
+	if want := "RCPT TO:<user@example.com>"; len(rcpt) != 1 || rcpt[0] != want {
+		t.Errorf("backend received %q, want [%q] (NOTIFY and ORCPT are not forwarded)", rcpt, want)
 	}
 
 	send("QUIT")
