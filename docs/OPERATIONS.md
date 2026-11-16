@@ -949,3 +949,56 @@ bodies that are not in S3 yet.
 
 **My certificate was renewed on disk. Do I need a restart?** Yes, for certificate files. Let's
 Encrypt certificates renew inside the process.
+
+
+## Upgrading the S3 message-body lock protocol
+
+Message-body deletion is paused by default. `[s3] body_deletion_protocol` accepts
+`"paused"` (also the default when omitted) or `"global-hash-v1"`. The latter is an
+operator acknowledgment that the following cutover has completed; Sora cannot
+inspect every running binary, external job, or outstanding storage request.
+Unknown values are refused.
+
+The new lock depends on the content hash, independently of account ID. Two accounts
+can reference one physical `domain/localpart/hash` key after address reassignment
+or copying. Equal hashes under different keys also share a lock, conservatively.
+Old binaries lock `(accountID, hash)` and do not honor the new pause setting. Taking
+both an old account lock and the new hash lock in a new process cannot exclude an
+old writer using a different account's lock.
+
+1. Stop scheduling **all old message-body deleters** and wait for their current work
+   to finish: cleaner body/reference retirement, purge workers and direct account or
+   domain purges, `verify s3 --fix-orphaned`, and `import rekey --delete-old-objects`.
+   Stop the jobs/processes themselves; adding this setting does not pause old binaries.
+   Prevent external bucket lifecycle rules or administrative tools from deleting the
+   same body keys during this interval.
+2. Keep deletion paused while upgrading every body claimant and deleter, including
+   backends, upload workers, restore/COPY/MOVE operations, and every Maildir/S3 import
+   or rekey process. Deploy the complete claim/commit and global reference-retirement
+   protocol before enabling deletion; the lock-name change alone is insufficient.
+   Drain old processes and their queued or in-flight storage requests. Outstanding
+   external write capabilities must finish, expire, or be revoked before proceeding.
+3. Confirm that no old participant or operation can resume, then set
+   `body_deletion_protocol = "global-hash-v1"` in every process allowed to retire body
+   references or delete message bodies, and restart those processes. Queued purges and
+   retained cleanup candidates can now resume. Keep the normal grace period and
+   restore policy; this acknowledgment does not shorten either.
+
+Mail delivery, message reads and uploads can remain available while destructive
+cleanup is paused, subject to the deployment's ability to isolate and drain those
+jobs. Storage usage grows during the pause. The switch is a startup configuration,
+not an online cancellation mechanism: changing a file alone does not drain an
+already running operation. When paused, new cleanup workers retain failed-upload,
+account/mailbox and S3 candidate state, purge workers retain queued requests, and
+explicit destructive CLI requests refuse without reporting a successful purge.
+Dry-run verification and rekeying that retains old bodies remain available.
+TLS certificate objects use their separate publication/deletion protocol.
+All accounts sharing physical message-body keys must use the same logical PostgreSQL
+coordination database. Advisory locks do not coordinate independent databases sharing
+the same bucket namespace.
+
+Rollback also requires pausing and draining all message-body deletion first. Do not
+resume old deleters alongside new claimers or resume deletion while old work or
+write capabilities can still arrive. This runbook does not establish storage fencing
+across independent PostgreSQL writers after failover; the deployment must retain its
+existing single-writer/fencing guarantees.
