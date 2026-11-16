@@ -2,7 +2,8 @@ package imap
 
 import (
 	"context"
-	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
@@ -47,7 +48,24 @@ func (s *IMAPSession) Namespace(ctx context.Context) (*imap.NamespaceData, error
 // namespace(s)" (RFC 5465 §6.2, RFC 7377 §2.2), so both ask this, never who owns the
 // mailbox: a shared mailbox the user created is the user's own.
 func inSharedNamespace(name, sharedRoot string) bool {
-	return sharedRoot != "" && (strings.EqualFold(name, sharedRoot) || mailboxNameHasPrefix(name, sharedRoot))
+	if sharedRoot == "" {
+		return false
+	}
+	// Match strings.ToLower in the creation policy, not Unicode case folding:
+	// final sigma and long s must remain distinct, and lowercasing can change
+	// UTF-8 widths (for example, İ becomes i). Walk both names independently.
+	for sharedRoot != "" {
+		if name == "" {
+			return false
+		}
+		n, nameSize := utf8.DecodeRuneInString(name)
+		r, rootSize := utf8.DecodeRuneInString(sharedRoot)
+		if unicode.ToLower(n) != unicode.ToLower(r) {
+			return false
+		}
+		name, sharedRoot = name[nameSize:], sharedRoot[rootSize:]
+	}
+	return name == "" || name[0] == byte(consts.MailboxDelimiter)
 }
 
 // sharedRootDestinationRefusal refuses the shared namespace root as the mailbox that
