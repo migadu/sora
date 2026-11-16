@@ -37,8 +37,15 @@ func tlsCacheStub(t *testing.T, path string, handle http.HandlerFunc) (*tlsStubS
 	stub := &tlsStubS3{objects: make(map[string][]byte)}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == path {
-			handle(w, r)
-			return
+			// Let a setup CAS discover its initially absent object. Once seeded, the
+			// selected GET fails exactly as the read-behavior control requests.
+			stub.mu.Lock()
+			_, seeded := stub.objects[path]
+			stub.mu.Unlock()
+			if seeded {
+				handle(w, r)
+				return
+			}
 		}
 		stub.ServeHTTP(w, r)
 	}))

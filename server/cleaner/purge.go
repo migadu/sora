@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
@@ -83,7 +84,14 @@ type PurgeStats struct {
 // is still there) is followed by another after a pause, up to purgeMaxPasses. Every
 // failure leaves the account soft-deleted with its credentials, so it can be run again.
 // It never deletes the body of a live message.
-func PurgeAccount(ctx context.Context, rdb AccountPurgeDatabase, s3 S3BulkDeleter, accountID int64) (PurgeStats, error) {
+func PurgeAccount(ctx context.Context, rdb AccountPurgeDatabase, s3 S3BulkDeleter, accountID int64, bodyDeletionProtocol ...string) (PurgeStats, error) {
+	protocol := ""
+	if len(bodyDeletionProtocol) > 0 {
+		protocol = bodyDeletionProtocol[0]
+	}
+	if err := (&config.S3Config{BodyDeletionProtocol: protocol}).RequireBodyDeletionProtocol(); err != nil {
+		return PurgeStats{}, err
+	}
 	// Every read sees the deletes this purge just made.
 	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 

@@ -73,6 +73,9 @@ func (s *IMAPSession) Delete(ctx context.Context, mboxName string) error {
 		}
 	}
 
+	own := s.beginOwnTreeChange()
+	defer own.end()
+
 	// Final phase: two-phase deletion. Mark the mailbox deleted (O(1) single-row
 	// update) and return immediately; the background cleaner expunges its messages
 	// and removes the row. This keeps DELETE off the per-mailbox lock for the whole
@@ -92,5 +95,6 @@ func (s *IMAPSession) Delete(ctx context.Context, mboxName string) error {
 
 	s.DebugLog("mailbox soft-deleted (pending background purge)", "mailbox", mboxName)
 	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
+	own.deleted(mailbox.ID)
 	return nil
 }

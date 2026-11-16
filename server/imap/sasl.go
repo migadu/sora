@@ -26,6 +26,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 	switch mechanism {
 	case "PLAIN":
 		return &plainServer{session: s, Server: sasl.NewPlainServer(func(identity, username, password string) error {
+			s.authSessionGeneration = s.server.connTracker.SessionGeneration()
 			// SASL PLAIN payload: [authorization-identity] \0 authentication-identity \0 password
 			// callback `identity`: authorization-identity (user to act as, can be empty)
 			// callback `username`: authentication-identity (user whose credentials are provided)

@@ -132,12 +132,27 @@ func (rd *ResilientDatabase) RenameCrossesSharedBoundaryWithRetry(ctx context.Co
 }
 
 func (rd *ResilientDatabase) InsertMessageWithRetry(ctx context.Context, options *db.InsertMessageOptions, upload db.PendingUpload) (messageID int64, uid int64, err error) {
+	return rd.insertMessageWithRetry(ctx, options, upload, nil)
+}
+
+// InsertStoredMessageWithRetry admits a previously verified stored body and its
+// message in one write transaction. Failure cannot leave a spool-less pending row
+// between insertion and uploaded-state finalization. The caller's S3 claim context
+// is checked while this transaction overlaps the original holder.
+func (rd *ResilientDatabase) InsertStoredMessageWithRetry(ctx context.Context, options *db.InsertMessageOptions, upload db.PendingUpload, writtenKeys []string) (int64, int64, error) {
+	return rd.insertMessageWithRetry(ctx, options, upload, &writtenKeys)
+}
+
+func (rd *ResilientDatabase) insertMessageWithRetry(ctx context.Context, options *db.InsertMessageOptions, upload db.PendingUpload, writtenKeys *[]string) (messageID int64, uid int64, err error) {
 	// Lock the mailbox at the Go level to prevent connection pool starvation during mass concurrent inserts.
 	unlock := rd.getOperationalDatabaseForOperation(ctx, true).LockMailbox(options.MailboxID)
 	defer unlock()
 
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		id, u, opErr := rd.getOperationalDatabaseForOperation(ctx, true).InsertMessage(ctx, tx, options, upload)
+		if opErr == nil && writtenKeys != nil {
+			opErr = rd.getOperationalDatabaseForOperation(ctx, true).CompleteS3Upload(ctx, tx, upload.ContentHash, upload.AccountID, *writtenKeys)
+		}
 		// Always return the result slice (including UID), even on error
 		// This allows ErrMessageExists to return the existing UID
 		if opErr != nil {

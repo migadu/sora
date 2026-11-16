@@ -156,7 +156,7 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 	healthRetention := 30 * 24 * time.Hour
 	redirectRetention := time.Hour
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    mockS3,
 		cache:                 mockCache,
@@ -225,7 +225,7 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 
 func TestCleanupWorker_RunOnce_LockNotAcquired(t *testing.T) {
 	mockDB := new(mockDatabase)
-	worker := &CleanupWorker{rdb: mockDB}
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1", rdb: mockDB}
 	ctx := context.Background()
 
 	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(false, nil).Once()
@@ -242,7 +242,7 @@ func TestCleanupWorker_RunOnce_PartialFailures(t *testing.T) {
 	mockS3 := &mockS3{healthy: true}
 	mockCache := new(mockCache)
 	ctx := context.Background()
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    mockS3,
 		cache:                 mockCache,
@@ -279,7 +279,7 @@ func TestCleanupWorker_RunOnce_S3DeleteFails(t *testing.T) {
 	mockDB := new(mockDatabase)
 	mockS3 := &mockS3{healthy: true}
 	ctx := context.Background()
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    mockS3,
 		maxAgeRestriction:     1 * time.Hour,
@@ -323,7 +323,7 @@ func TestCleanupWorker_RunOnce_NoOp(t *testing.T) {
 	mockDB := new(mockDatabase)
 	mockCache := new(mockCache)
 	ctx := context.Background()
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,
@@ -359,7 +359,7 @@ func TestCleanupWorker_RunOnce_VectorPruning(t *testing.T) {
 
 	ftsRetention := 1095 * 24 * time.Hour // 3 years
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,
@@ -395,7 +395,7 @@ func TestCleanupWorker_RunOnce_NoFTSPruningWhenBothZero(t *testing.T) {
 	mockCache := new(mockCache)
 	ctx := context.Background()
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,
@@ -433,7 +433,7 @@ func TestCleanupWorker_RunOnce_NoFTSRetention(t *testing.T) {
 	mockCache := new(mockCache)
 	ctx := context.Background()
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,
@@ -472,7 +472,7 @@ func TestCleanupWorker_RunOnce_SkipsFailedUploadCleanupWhenS3Unhealthy(t *testin
 	mockCache := new(mockCache)
 	ctx := context.Background()
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    mockS3,
 		cache:                 mockCache,
@@ -512,7 +512,7 @@ func TestCleanupWorker_RunOnce_VectorOnlyPruning(t *testing.T) {
 
 	ftsRetention := 1095 * 24 * time.Hour // 3 years
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,

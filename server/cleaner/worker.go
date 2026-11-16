@@ -68,10 +68,10 @@ type DatabaseManager interface {
 	CleanupOldRedirectsWithRetry(ctx context.Context, olderThan time.Duration) (int64, error)
 	CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error)
-	// ExecuteWithLockedS3Orphans runs fn with the objects that are still orphans while
-	// holding their per-object locks; fn's context is cancelled if the locks are lost.
-	ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error) error
-	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
+	// ExecuteWithS3BodyCleanup runs fn with the objects that are still orphans, or
+	// whose rows alone may go (KeepObject), while holding their per-object locks; fn's
+	// context is cancelled if the locks are lost.
+	ExecuteWithS3BodyCleanup(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(context.Context, []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error)) (int64, error)
 	PruneOldMessageVectorsWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUnusedFTSKeysWithRetry(ctx context.Context, after db.FTSKey, limit int) ([]db.FTSKey, db.FTSKey, error)
 	DeleteMessagesFTSByKeyBatchWithRetry(ctx context.Context, keys []db.FTSKey) (int64, error)
@@ -96,6 +96,7 @@ type CacheManager interface {
 }
 
 type CleanupWorker struct {
+	bodyDeletionProtocol  string
 	rdb                   DatabaseManager
 	s3                    S3Manager
 	cache                 CacheManager
@@ -117,7 +118,11 @@ type CleanupWorker struct {
 
 // New creates a new CleanupWorker. redirectRateWindow is the longest redirect rate
 // window of this node's servers (config.LongestRedirectRateWindow).
-func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, redirectRateWindow time.Duration, uploadMaxAttempts int, instanceLiveness time.Duration, errCh chan<- error) *CleanupWorker {
+func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, redirectRateWindow time.Duration, uploadMaxAttempts int, instanceLiveness time.Duration, errCh chan<- error, bodyDeletionProtocol ...string) *CleanupWorker {
+	protocol := ""
+	if len(bodyDeletionProtocol) > 0 {
+		protocol = bodyDeletionProtocol[0]
+	}
 	// Wrap S3 storage with resilient patterns including circuit breakers
 	resilientS3 := resilient.NewResilientS3Storage(s3)
 
@@ -133,6 +138,7 @@ func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.C
 	ftsSweepStart := db.FTSKey{ContentHash: fmt.Sprintf("%016x", rand.Uint64())}
 
 	return &CleanupWorker{
+		bodyDeletionProtocol:  protocol,
 		rdb:                   rdb,         // *resilient.ResilientDatabase implements DatabaseManager
 		s3:                    resilientS3, // *resilient.ResilientS3Storage implements S3Manager
 		cache:                 cache,       // *cache.Cache implements CacheManager
@@ -266,14 +272,16 @@ func (w *CleanupWorker) reportStrandedInstances(ctx context.Context) {
 // deleteS3Objects removes the S3 bodies of candidates and then the message rows that
 // referenced them, in batches. It returns how many bodies are gone from S3.
 func (w *CleanupWorker) deleteS3Objects(ctx context.Context, candidates []db.UserScopedObjectForCleanup) (int, error) {
+	if err := (&config.S3Config{BodyDeletionProtocol: w.bodyDeletionProtocol}).RequireBodyDeletionProtocol(); err != nil {
+		return 0, err
+	}
 	deleted, _, err := reapS3Objects(ctx, w.rdb, w.s3, w.gracePeriod, candidates)
 	return deleted, err
 }
 
 // s3ObjectReaper is the database side of reapS3Objects.
 type s3ObjectReaper interface {
-	ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error) error
-	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
+	ExecuteWithS3BodyCleanup(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(context.Context, []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error)) (int64, error)
 }
 
 // S3BulkDeleter deletes objects by key and reports the keys it could not delete.
@@ -282,18 +290,20 @@ type S3BulkDeleter interface {
 }
 
 // reapS3Objects removes the S3 bodies of candidates and then the expunged message rows
-// that referenced them, in batches, holding each body's advisory lock throughout. It
-// returns how many bodies are gone from S3 and how many rows went with them. It is the
-// cleaner's S3 phase, and the account purge's.
+// that referenced them, in batches, holding each body's advisory lock throughout. A body
+// that rows of another account still point at stays, and only the candidate's rows go
+// (db.UserScopedObjectForCleanup.KeepObject). It returns how many bodies are gone from S3
+// and how many rows went. It is the cleaner's S3 phase, and the account purge's.
 //
 // Ordering is deliberate and unchanged: the S3 object goes first and the rows follow.
-// If the process dies in between, the rows are expunged rows nothing can read, the next
-// cycle lists them again and re-issues a delete for an object that is already gone
-// (DeleteObjects treats that as success), and the rows are removed then. The reverse
-// order would strand the body in the bucket with nothing left pointing at it.
+// If the process dies in between, its durable intent keeps the hash quarantined;
+// operator reconciliation must settle the remote outcome before new claims. Later
+// cleanup may retire the remaining expired candidates after reconciliation. Deleting
+// rows before storage would strand the body with no candidate pointing at it.
 func reapS3Objects(ctx context.Context, rdb s3ObjectReaper, s3 S3BulkDeleter, gracePeriod time.Duration, candidates []db.UserScopedObjectForCleanup) (int, int64, error) {
 	deleted := 0
 	var rowsDeleted int64
+	var phaseErr error
 
 	batch := make([]db.UserScopedObjectForCleanup, 0, s3DeleteBatchSize)
 	// flush reports whether the phase can continue; a failure to take the locks (or to
@@ -305,48 +315,71 @@ func reapS3Objects(ctx context.Context, rdb s3ObjectReaper, s3 S3BulkDeleter, gr
 		// The advisory locks are held for the whole callback: the orphan re-check, the
 		// S3 delete and the row delete all see the same "nothing references this body"
 		// verdict, and no upload of the body passes its write gate in between.
-		err := rdb.ExecuteWithLockedS3Orphans(ctx, batch, gracePeriod, func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error {
+		retired, err := rdb.ExecuteWithS3BodyCleanup(ctx, batch, gracePeriod, func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error) {
 			if skipped := len(batch) - len(orphans); skipped > 0 {
 				logger.Info("Cleanup: objects are no longer orphans or are being uploaded, skipping S3 deletion", "count", skipped)
 			}
 			if len(orphans) == 0 {
-				return nil
+				return db.S3BodyCleanupResult{}, nil
 			}
 
-			keys := make([]string, 0, len(orphans))
-			byKey := make(map[string]db.UserScopedObjectForCleanup, len(orphans))
+			// Rows of several accounts can carry one key, so an object can come with
+			// several candidates: it is deleted once, and the rows of each follow once it
+			// is gone. An object that rows of other accounts still point at stays, and only
+			// the candidate's rows go.
+			keyOf := func(o db.UserScopedObjectForCleanup) string {
+				return helpers.NewS3Key(o.S3Domain, o.S3Localpart, o.ContentHash)
+			}
+			var keys []string
+			seen := make(map[string]bool, len(orphans))
+			kept := 0
 			for _, orphan := range orphans {
-				key := helpers.NewS3Key(orphan.S3Domain, orphan.S3Localpart, orphan.ContentHash)
-				keys = append(keys, key)
-				byKey[key] = orphan
+				if orphan.KeepObject {
+					kept++
+				} else if key := keyOf(orphan); !seen[key] {
+					seen[key] = true
+					keys = append(keys, key)
+				}
+			}
+			if kept > 0 {
+				logger.Info("Cleanup: objects are still used by other accounts' rows, deleting only the candidates' rows", "count", kept)
 			}
 
-			failures := s3.DeleteBulkWithRetry(ctx, keys)
-			gone := make([]db.UserScopedObjectForCleanup, 0, len(keys))
+			var failures map[string]error
+			if len(keys) > 0 {
+				failures = s3.DeleteBulkWithRetry(ctx, keys)
+			}
 			for _, key := range keys {
 				if err, failed := failures[key]; failed {
 					logger.Error("Cleanup: Failed to delete S3 object", "key", key, "error", err)
 					continue
 				}
-				gone = append(gone, byKey[key])
+				deleted++
 			}
-			if len(gone) == 0 {
-				return nil
+			gone := make([]db.UserScopedObjectForCleanup, 0, len(orphans))
+			for _, orphan := range orphans {
+				if !orphan.KeepObject {
+					if _, failed := failures[keyOf(orphan)]; failed {
+						continue // the body is still there, and so are the rows
+					}
+				}
+				gone = append(gone, orphan)
 			}
-
-			deletedCount, err := rdb.DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx, gone)
-			if err != nil {
-				// The bodies are gone; their rows are picked up again next cycle.
-				logger.Error("Cleanup: Failed to batch delete DB message rows", "error", err)
-			} else {
-				logger.Info("Cleanup: Successfully cleaned up user-scoped message rows", "count", deletedCount)
-				rowsDeleted += deletedCount
+			result := db.S3BodyCleanupResult{Gone: gone}
+			for _, orphan := range orphans {
+				if orphan.KeepObject {
+					continue
+				}
+				if failure, failed := failures[keyOf(orphan)]; failed && storage.DeleteDefinitelyRefused(failure) {
+					result.Rejected = append(result.Rejected, orphan)
+				}
 			}
-			deleted += len(gone)
-			return nil
+			return result, nil
 		})
+		rowsDeleted += retired
 		batch = batch[:0]
 		if err != nil {
+			phaseErr = err
 			logger.Error("Cleanup: Failed to lock S3 objects for deletion", "error", err)
 			return false
 		}
@@ -370,12 +403,12 @@ func reapS3Objects(ctx context.Context, rdb s3ObjectReaper, s3 S3BulkDeleter, gr
 
 		batch = append(batch, candidate)
 		if len(batch) == s3DeleteBatchSize && !flush() {
-			return deleted, rowsDeleted, nil
+			return deleted, rowsDeleted, phaseErr
 		}
 	}
 
 	flush()
-	return deleted, rowsDeleted, nil
+	return deleted, rowsDeleted, phaseErr
 }
 
 func (w *CleanupWorker) runOnce(ctx context.Context) error {
@@ -426,47 +459,52 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		}
 	}
 
-	// --- Phase 0a: Cleanup of failed uploads ---
-	// This removes message metadata for messages that were never successfully uploaded to S3.
-	// SAFETY: Only run when S3 is healthy. If S3 is down, messages can't be uploaded,
-	// and deleting their metadata would cause permanent message loss.
-	if !w.s3.IsHealthy() {
-		logger.Warn("Cleanup: Skipping failed upload cleanup - S3 is unhealthy (circuit breaker open). Messages preserved for retry when S3 recovers.")
+	if err := (&config.S3Config{BodyDeletionProtocol: w.bodyDeletionProtocol}).RequireBodyDeletionProtocol(); err != nil {
+		logger.Info("Cleanup: failed-upload and account/mailbox retirement deferred during the body-lock cutover", "reason", err)
 	} else {
-		// Report before reaping: an instance that stopped retrying is invisible to the
-		// failed-upload alerting (which only counts attempts >= max_attempts), yet it
-		// is exactly the case where mail is about to be dropped.
-		w.reportStrandedInstances(ctx)
+		// --- Phase 0a: Cleanup of failed uploads ---
+		// This removes message metadata for messages that were never successfully uploaded to S3.
+		// SAFETY: Only run when S3 is healthy. If S3 is down, messages can't be uploaded,
+		// and deleting their metadata would cause permanent message loss.
+		if !w.s3.IsHealthy() {
+			logger.Warn("Cleanup: Skipping failed upload cleanup - S3 is unhealthy (circuit breaker open). Messages preserved for retry when S3 recovers.")
+		} else {
+			// Report before reaping: an instance that stopped retrying is invisible to the
+			// failed-upload alerting (which only counts attempts >= max_attempts), yet it
+			// is exactly the case where mail is about to be dropped.
+			w.reportStrandedInstances(ctx)
 
-		failedUploadsCount, err = w.rdb.CleanupFailedUploadsWithRetry(ctx, w.gracePeriod, w.uploadMaxAttempts, w.instanceLiveness)
+			failedUploadsCount, err = w.rdb.CleanupFailedUploadsWithRetry(ctx, w.gracePeriod, w.uploadMaxAttempts, w.instanceLiveness)
+			if err != nil {
+				// Log the error but continue, as other cleanup tasks can still proceed.
+				logger.Error("Cleanup: Failed to clean up failed uploads", "error", err)
+			} else if failedUploadsCount > 0 {
+				logger.Info("Cleanup: Cleaned up failed upload messages", "count", failedUploadsCount)
+			}
+		} // end S3 healthy check
+
+		// --- Phase 0: Process soft-deleted accounts ---
+		// This prepares accounts for deletion by expunging their messages and removing
+		// associated data, making them ready for the subsequent cleanup phases.
+		deletedAccountCount, err = w.rdb.CleanupSoftDeletedAccountsWithRetry(ctx, w.gracePeriod)
 		if err != nil {
-			// Log the error but continue, as other cleanup tasks can still proceed.
-			logger.Error("Cleanup: Failed to clean up failed uploads", "error", err)
-		} else if failedUploadsCount > 0 {
-			logger.Info("Cleanup: Cleaned up failed upload messages", "count", failedUploadsCount)
+			logger.Error("Cleanup: Failed to process soft-deleted accounts", "error", err)
+		} else if deletedAccountCount > 0 {
+			logger.Info("Cleanup: Processed soft-deleted accounts", "count", deletedAccountCount)
 		}
-	} // end S3 healthy check
 
-	// --- Phase 0: Process soft-deleted accounts ---
-	// This prepares accounts for deletion by expunging their messages and removing
-	// associated data, making them ready for the subsequent cleanup phases.
-	deletedAccountCount, err = w.rdb.CleanupSoftDeletedAccountsWithRetry(ctx, w.gracePeriod)
-	if err != nil {
-		logger.Error("Cleanup: Failed to process soft-deleted accounts", "error", err)
-	} else if deletedAccountCount > 0 {
-		logger.Info("Cleanup: Processed soft-deleted accounts", "count", deletedAccountCount)
-	}
+		// --- Two-phase mailbox deletion: purge soft-deleted mailboxes ---
+		// IMAP DELETE only stamps mailboxes.deleted_at (O(1)) and returns; the heavy
+		// per-message expunge + row removal happens here, off the client command path.
+		// No grace period: unlike accounts there is no IMAP "undelete", and quota/restore
+		// availability should track the deletion as closely as the cleanup cadence allows,
+		// so tombstones are purged on the next tick.
+		if purgedMailboxCount, err := w.rdb.PurgeSoftDeletedMailboxesWithRetry(ctx, 0); err != nil {
+			logger.Error("Cleanup: Failed to purge soft-deleted mailboxes", "error", err)
+		} else if purgedMailboxCount > 0 {
+			logger.Info("Cleanup: Purged soft-deleted mailboxes", "count", purgedMailboxCount)
+		}
 
-	// --- Two-phase mailbox deletion: purge soft-deleted mailboxes ---
-	// IMAP DELETE only stamps mailboxes.deleted_at (O(1)) and returns; the heavy
-	// per-message expunge + row removal happens here, off the client command path.
-	// No grace period: unlike accounts there is no IMAP "undelete", and quota/restore
-	// availability should track the deletion as closely as the cleanup cadence allows,
-	// so tombstones are purged on the next tick.
-	if purgedMailboxCount, err := w.rdb.PurgeSoftDeletedMailboxesWithRetry(ctx, 0); err != nil {
-		logger.Error("Cleanup: Failed to purge soft-deleted mailboxes", "error", err)
-	} else if purgedMailboxCount > 0 {
-		logger.Info("Cleanup: Purged soft-deleted mailboxes", "count", purgedMailboxCount)
 	}
 
 	// Clean up old vacation responses. A row is what stops a second reply to its sender
@@ -519,32 +557,37 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	// never drain, no matter how often the worker wakes up. The loop also stops as soon
 	// as a round makes no progress, so candidates whose S3 delete keeps failing are
 	// left to the next cycle instead of being re-fetched forever.
-	s3Budget := time.Now().Add(s3CleanupBudget)
-	for {
-		candidates, err := w.rdb.GetUserScopedObjectsForCleanupWithRetry(ctx, w.gracePeriod, db.BATCH_PURGE_SIZE)
-		if err != nil {
-			logger.Error("Cleanup: Failed to list user-scoped objects for cleanup", "error", err)
-			return fmt.Errorf("failed to list user-scoped objects for cleanup: %w", err)
-		}
-
-		if len(candidates) == 0 {
-			if s3DeletedCount == 0 {
-				logger.Info("Cleanup: no user-scoped objects to clean up")
+	if err := (&config.S3Config{BodyDeletionProtocol: w.bodyDeletionProtocol}).RequireBodyDeletionProtocol(); err != nil {
+		logger.Info("Cleanup: message bodies and their candidate rows retained while S3 deletion is paused", "reason", err)
+	} else {
+		s3Budget := time.Now().Add(s3CleanupBudget)
+		for {
+			candidates, err := w.rdb.GetUserScopedObjectsForCleanupWithRetry(ctx, w.gracePeriod, db.BATCH_PURGE_SIZE)
+			if err != nil {
+				logger.Error("Cleanup: Failed to list user-scoped objects for cleanup", "error", err)
+				return fmt.Errorf("failed to list user-scoped objects for cleanup: %w", err)
 			}
-			break
+
+			if len(candidates) == 0 {
+				if s3DeletedCount == 0 {
+					logger.Info("Cleanup: no user-scoped objects to clean up")
+				}
+				break
+			}
+
+			logger.Info("Cleanup: Found user-scoped object groups for S3 cleanup", "count", len(candidates))
+
+			deleted, err := w.deleteS3Objects(ctx, candidates)
+			s3DeletedCount += deleted
+			if err != nil {
+				return err
+			}
+
+			if deleted == 0 || len(candidates) < db.BATCH_PURGE_SIZE || time.Now().After(s3Budget) {
+				break
+			}
 		}
 
-		logger.Info("Cleanup: Found user-scoped object groups for S3 cleanup", "count", len(candidates))
-
-		deleted, err := w.deleteS3Objects(ctx, candidates)
-		s3DeletedCount += deleted
-		if err != nil {
-			return err
-		}
-
-		if deleted == 0 || len(candidates) < db.BATCH_PURGE_SIZE || time.Now().After(s3Budget) {
-			break
-		}
 	}
 
 	// --- Phase 2a: FTS Vector & Queue Pruning ---

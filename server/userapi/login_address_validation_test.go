@@ -1,7 +1,6 @@
 package userapi
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,7 +12,6 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/migadu/sora/db"
-	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/testutils"
 )
@@ -24,7 +22,7 @@ import (
 // API proxy (#850), it must be gated by the rate limiter first, answered 401
 // {"error": "Invalid credentials"} with a wrong password's Bearer challenge after one
 // dummy password verification, and recorded as a failed login attempt without touching
-// the auth cache or the database.
+// the database.
 func TestLoginWithInvalidAddressLooksLikeAWrongPasswordWithoutDatabase(t *testing.T) {
 	origCost := db.BcryptCost
 	db.BcryptCost = bcrypt.MinCost
@@ -109,15 +107,8 @@ func TestLoginWithInvalidAddressLooksLikeAWrongPasswordWithoutDatabase(t *testin
 			})
 			t.Cleanup(limiter.Stop)
 
-			cache := lookupcache.New("userapi", "test-invalid-addr", 5*time.Minute, time.Minute, 100, 5*time.Minute, 30*time.Second)
-			t.Cleanup(func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				_ = cache.Stop(ctx)
-			})
-
 			// s.rdb is nil: touching PostgreSQL panics and fails the test.
-			s := &Server{name: "test-invalid-addr", authCache: cache, authLimiter: limiter}
+			s := &Server{name: "test-invalid-addr", authLimiter: limiter}
 			clientAddr := fmt.Sprintf("198.51.100.%d:40000", idx+1)
 
 			postLogin := func(rawBody string) (*httptest.ResponseRecorder, int) {
@@ -167,10 +158,6 @@ func TestLoginWithInvalidAddressLooksLikeAWrongPasswordWithoutDatabase(t *testin
 			rec3, ver3 := postLogin(tc.body1)
 			assertRefused401("attempt 3 (rate-limited)", rec3, ver3, 0)
 
-			hits, misses, size, _ := cache.GetStats()
-			if hits != 0 || misses != 0 || size != 0 {
-				t.Errorf("authCache touched for invalid address: hits=%d misses=%d size=%d, want 0/0/0", hits, misses, size)
-			}
 		})
 	}
 }
