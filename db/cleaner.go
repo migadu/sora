@@ -90,7 +90,9 @@ func (d *Database) AcquireS3ObjectLock(ctx context.Context, tx pgx.Tx, accountID
 // themselves are never waited for.
 const s3ObjectLockTimeout = 30 * time.Second
 
-// ExecuteWithLockedS3Orphans runs fn with the subset of objects whose account no longer
+// ExecuteWithLockedS3Orphans is for lock-only inspection. Do not perform remote
+// DELETE or row retirement in fn: use ExecuteWithS3BodyCleanup for durable fences.
+// It runs fn with the subset of objects whose account no longer
 // needs them (see filterS3Orphans), while holding their per-object advisory locks in one
 // dedicated lock transaction. Such an object is an orphan, to be deleted with the
 // account's expunged rows under its key, unless it carries KeepObject: rows of another

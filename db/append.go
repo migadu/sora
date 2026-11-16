@@ -179,6 +179,11 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 	}
+	// The highest_uid UPDATE holds the destination's row lock from here on.
+	window := modSeqWindowFor(ctx, destMailboxID)
+	if err := window.begin(ctx, tx); err != nil {
+		return nil, nil, err
+	}
 
 	// Calculate the new UIDs for the copied messages, and split them by whether the
 	// copy is re-keyed to the destination owner (see restagePendingUploads).
@@ -314,6 +319,9 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		}
 	}
 
+	if err := window.end(ctx, tx); err != nil {
+		return nil, nil, err
+	}
 	return messageUIDMap, newMessageIDs, nil
 }
 
@@ -715,6 +723,12 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		uidToUse = highestUID
 	}
 
+	// The highest_uid UPDATE holds the mailbox row lock from here on.
+	window := modSeqWindowFor(ctx, options.MailboxID)
+	if err := window.begin(ctx, tx); err != nil {
+		return 0, 0, err
+	}
+
 	// Check for existing EXACT duplicate message
 	var existingUID int64
 	var existingContentHash string
@@ -1001,6 +1015,9 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		}
 	}
 
+	if err := window.end(ctx, tx); err != nil {
+		return 0, 0, err
+	}
 	return messageRowId, uidToUse, nil
 }
 

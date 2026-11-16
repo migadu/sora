@@ -101,6 +101,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	if err := lockMailboxStatsPair(ctx, tx, srcMailboxID, destMailboxID); err != nil {
 		return nil, fmt.Errorf("failed to lock mailbox stats for move on mailboxes %d and %d: %w", srcMailboxID, destMailboxID, err)
 	}
+	window := modSeqWindowFor(ctx, destMailboxID)
+	if err := window.begin(ctx, tx); err != nil {
+		return nil, err
+	}
 
 	// From here to the commit a rekey must not rename a source. The row locks below would
 	// hold it off too, but a rekey waiting for them holds the FTS lock restageFTS needs.
@@ -349,6 +353,9 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		}
 	}
 
+	if err := window.end(ctx, tx); err != nil {
+		return nil, err
+	}
 	return messageUIDMap, nil
 }
 

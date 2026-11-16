@@ -1883,9 +1883,16 @@ func (s *Session) connectToBackend() error {
 	// This MUST be done before authenticating to the backend, as the ID command
 	// is only valid in the "Not Authenticated" state.
 	useIDCommand := s.server.remoteUseIDCommand
+	skipForwarding := s.server.remoteSkipForwardingWithProxyProtocol
 	// The route's setting applies to the backend the lookup named or its pool picked (as for the dial)
 	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
 		useIDCommand = s.routingInfo.RemoteUseIDCommand
+		skipForwarding = s.routingInfo.RemoteSkipForwardingWithProxyProtocol
+	}
+	// Explicit opt-in: PROXY does not carry all ID/XCLIENT metadata.
+	// Preserve configured forwarding unless this route accepts that omission.
+	if skipForwarding && useIDCommand && s.server.connManager.SendsProxyHeader(s.routingInfo, s.serverAddr, clientHost, clientPort, serverHost, serverPort) {
+		useIDCommand = false
 	}
 	if useIDCommand {
 		if err := s.sendForwardingParametersToBackend(); errors.Is(err, errIDRefused) {
