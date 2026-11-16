@@ -298,11 +298,13 @@ github.com/migadu/go-smtp v0.0.0-20261115213624-e2128ee885bd/go.mod h1:3DhKoQGRM
 github.com/migadu/go-smtp v0.0.0-20261115221208-dbc7824090f0 h1:BZ7Cj9szp+yjlLT6qN00wCh1lYphI0do5PWHNHOHssE=
 github.com/migadu/go-smtp v0.0.0-20261115221208-dbc7824090f0/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/migadu/go-smtp v0.24.0-migadu.1 h1:j6FYFCntMYAlEYsFfmKNnopvGcRJFdLnb9TQA+UBd5w=
+github.com/migadu/go-smtp v0.24.0-migadu.1/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116094727-0b0aaa23d4af h1:esW6dMERJsVDxQlLk7Ak/vycaGJ57Fw5odWKrppivJY=
 github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116094727-0b0aaa23d4af/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116103044-679096c1387b h1:qRJsYbDLZYRS5VaT0tpfhdk9+PVjmJqGrIKeAaEAvmo=
 github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116103044-679096c1387b/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
-github.com/migadu/go-smtp v0.24.0-migadu.1/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
+github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116184846-184971fe7f8a h1:3GnML9oNINMLKMqUyPkYA9obX31Sq99LjRFLQC6pmN4=
+github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116184846-184971fe7f8a/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/moby/docker-image-spec v1.3.1 h1:jMKff3w6PgbfSa69GfNg+zN/XLhfXJGnEx3Nl2EsFP0=
 github.com/moby/docker-image-spec v1.3.1/go.mod h1:eKmb5VW8vQEh/BAr2yvVNvuiJuY6UIocYsFu/DxxRpo=
 github.com/moby/term v0.5.0 h1:xt8Q1nalod/v7BqbG21f8mQPqH+xAaC9C3N3wfWbVP0=
