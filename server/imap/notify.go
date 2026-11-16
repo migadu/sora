@@ -294,12 +294,8 @@ func (watch *notifyWatch) eventsForMailbox(name, key string, subscribed bool, sh
 			}
 		default:
 			for _, given := range item.Mailboxes {
-				// A descendant's key starts with its ancestor's: lower() leaves
-				// the hierarchy delimiter alone, as the database relies on when
-				// it matches descendants by LOWER(name) LIKE LOWER(prefix) || '%'.
 				root, ok := watch.nameKeys[given]
-				if ok && root != "" && (key == root ||
-					(item.Subtree && strings.HasPrefix(key, root+string(consts.MailboxDelimiter)))) {
+				if ok && root != "" && (key == root || (item.Subtree && notifyKeyBelow(key, root))) {
 					add(item)
 					break
 				}
@@ -307,6 +303,15 @@ func (watch *notifyWatch) eventsForMailbox(name, key string, subscribed bool, sh
 		}
 	}
 	return events
+}
+
+// notifyKeyBelow reports whether key is the key of a mailbox below the one whose
+// key is root. A descendant's key starts with its ancestor's: lower() leaves the
+// hierarchy delimiter alone, as the database relies on when it matches
+// descendants by LOWER(name) LIKE LOWER(prefix) || '%'. It runs for every
+// mailbox on every tick, so it does not build root plus delimiter.
+func notifyKeyBelow(key, root string) bool {
+	return len(key) > len(root) && key[len(root)] == consts.MailboxDelimiter && strings.HasPrefix(key, root)
 }
 
 // resolveNotifyNames sets watch.nameKeys: the database computes the key of each

@@ -112,6 +112,23 @@ func TestNotifyEventsForMailboxMatchesKeys(t *testing.T) {
 	}
 }
 
+// TestNotifyEventsForMailboxSubtreeDoesNotAllocate: the pump matches every
+// mailbox of the account against the specifiers on each tick, so a SUBTREE that
+// does not match must cost no allocation, as the name match it replaced did not.
+// Building root+"/" per call allocated once a name is longer than the
+// compiler's 32-byte stack buffer for a concatenation.
+func TestNotifyEventsForMailboxSubtreeDoesNotAllocate(t *testing.T) {
+	root := "Archive/2024/Projects/Example Client"
+	watch := newTestWatch(imap.NotifyItem{Mailboxes: []string{root}, Subtree: true, Events: []imap.NotifyEvent{imap.NotifyEventMessageNew}})
+	name := "Archive/2024/Projects/Other Client/Reports"
+	key := testNameKey(name)
+	if n := testing.AllocsPerRun(100, func() {
+		_ = watch.eventsForMailbox(name, key, false, "")
+	}); n != 0 {
+		t.Errorf("eventsForMailbox for a mailbox outside SUBTREE %q allocates %v times per call, want 0", root, n)
+	}
+}
+
 // TestDiffNotifySnapshotsKeysNames: the diff compares names by key, as the
 // database does (issue #1649). The keys are ICU's, under which "İx" and "ix"
 // are two mailboxes and "ΑΣ" and "ας" one.
