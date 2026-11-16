@@ -133,8 +133,15 @@ refuse to start, naming the link, its owner and the directory it leads to, befor
 `sora-maildir.db` cache is created; name that directory itself to import it. A link's owner says
 who made it, not who gave it its name, so where users may hard-link a file they do not own (macOS
 and the BSDs, and Linux with `fs.protected_hardlinks = 0`) a link with more than one name is
-refused as well: `ln -P /var/mail/bob ~/Maildir` would otherwise pass as root's link. These are
-Unix UID checks. Below the root, a folder that is a link is not walked and is named in a warning.
+refused as well: `ln -P /var/mail/bob ~/Maildir` would otherwise pass as root's link. The import
+sees only the names a link has when it runs: on such a system, a hard link a user made earlier
+to root's link (or to another user's link to their own maildir) has one name again once that
+original name is removed (root deletes `/var/mail/bob`, or bob replaces his link), and it is then
+followed as the link of its owner. Where users may make such links, name the maildir's own
+directory, with no link on the way, as `--maildir-path` (or `--sieve`). These are
+Unix UID checks. Checking them needs no more permission than opening the path does: the
+directories above the maildir need only be searchable (`x`), not readable, by the user running
+the import. Below the root, a folder that is a link is not walked and is named in a warning.
 A message file, a `cur/` or `new/` directory, or a `subscriptions`, `dovecot-keywords` or `dovecot-uidlist`
 file that is a link is read only when the link is relative and its target is below the root. Any
 other link (one pointing outside the root, or any absolute link, even to a file inside the root)
@@ -377,6 +384,15 @@ them is a symbolic link, even to a file inside the maildir, or another kind of f
 refuses to start and names it. The cache is opened without following a link, so a link put in its
 place while the run starts is refused as well. The export applies the same rule to the
 `sora-maildir.db` in its target directory.
+
+Once the import has checked the directory `--maildir-path` leads to (section 3), it does not look
+the path up again: the cache is checked and created, and the folders are listed, through the
+directory it opened, so the maildir's owner cannot make them land in another directory by renaming
+`~/Maildir` and putting a link in its place during the run. On Linux SQLite opens the cache, and its
+`-wal` and `-shm`, as `/proc/self/fd/N/sora-maildir.db`, through that directory's descriptor, which
+needs `/proc`. Elsewhere it opens them by the directory's name, which the rule below lets only root
+and the user running `sora-admin` change, and only while that name still leads to the directory
+that was checked.
 
 SQLite also writes through a hard link at those names, and a hard link cannot be refused
 without a race in a directory another user can write: SQLite opens the `-wal` and `-shm` files by
@@ -662,7 +678,11 @@ of the directory it leads to. A user who can replace `~/Maildir`, or a directory
 otherwise point it at another user's maildir or home and have the account's mail, Dovecot files
 and `sora-maildir.db` written there. Any other link makes the export refuse to start, naming the
 link, before anything is created. The directories missing on the way are created only once every
-link on the way is checked, and never through a link to a directory that does not exist.
+link on the way is checked, and never through a link to a directory that does not exist. As for
+the import, the directories above the target need only be searchable, and those a directory is
+created in writable, by the user running the export. Once checked, the target is not looked up by
+its path again: the cache, every directory and every file is created through the opened target
+directory, as section 8 describes for the cache.
 Each exported content file (a message,
 `dovecot-keywords`, `subscriptions`, `dovecot-uidlist`) is written as a new file and renamed over
 its name, so a symbolic or hard link at that name is replaced, and the file it points to is left

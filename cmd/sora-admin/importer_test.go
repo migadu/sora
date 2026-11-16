@@ -438,8 +438,13 @@ func (m *mockTx) Conn() *pgx.Conn {
 }
 
 func TestParseMessageMetadata(t *testing.T) {
-	// Dummy importer needed for the method receiver
-	importer := &Importer{}
+	// Dummy importer needed for the method receiver. A message file's modification time
+	// is read through the maildir root.
+	maildirPath := t.TempDir()
+	root, err := os.OpenRoot(maildirPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { root.Close() })
+	importer := &Importer{maildirPath: maildirPath, root: root}
 
 	t.Run("with valid date header", func(t *testing.T) {
 		dateStr := "Tue, 15 Nov 1994 08:12:31 -0500"
@@ -460,7 +465,7 @@ func TestParseMessageMetadata(t *testing.T) {
 		content := []byte("Subject: Test\r\n\r\nBody")
 
 		// Create a temp file and set its modification time
-		tempFile, err := os.CreateTemp(t.TempDir(), "test-*.eml")
+		tempFile, err := os.CreateTemp(maildirPath, "test-*.eml")
 		require.NoError(t, err)
 		defer tempFile.Close()
 		_, err = tempFile.Write(content)
@@ -482,7 +487,7 @@ func TestParseMessageMetadata(t *testing.T) {
 	t.Run("with invalid date header, internal date from file mod time", func(t *testing.T) {
 		content := []byte("Date: not-a-valid-date\r\nSubject: Test\r\n\r\nBody")
 
-		tempFile, err := os.CreateTemp(t.TempDir(), "test-*.eml")
+		tempFile, err := os.CreateTemp(maildirPath, "test-*.eml")
 		require.NoError(t, err)
 		defer tempFile.Close()
 		_, err = tempFile.Write(content)

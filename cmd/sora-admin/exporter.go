@@ -104,9 +104,9 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	dbPath := filepath.Join(maildirPath, maildirCacheName)
 	logger.Info("Using maildir database", "path", dbPath)
 
-	// The cache is opened in the directory the walk checked, by the name the walk
-	// reached it by, which has no link in it.
-	db, err := openMaildirCache(root.Name())
+	// The cache is opened in the directory the walk checked, through root: the path
+	// may lead elsewhere by now.
+	db, err := openMaildirCache(root)
 	if err != nil {
 		return nil, err
 	}

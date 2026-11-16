@@ -32,7 +32,7 @@ func ownedByAnotherUser(t *testing.T, paths ...string) {
 	t.Cleanup(func() { fileUID = realFileUID })
 	fileUID = func(info fs.FileInfo) uint32 {
 		for _, other := range others {
-			if os.SameFile(info, other) {
+			if sameFileID(info, other) {
 				return realFileUID(info) + 1
 			}
 		}
@@ -378,7 +378,7 @@ func ownedByUID(t *testing.T, uid uint32, paths ...string) {
 	t.Cleanup(func() { fileUID = prevFileUID })
 	fileUID = func(info fs.FileInfo) uint32 {
 		for _, entry := range entries {
-			if os.SameFile(info, entry) {
+			if sameFileID(info, entry) {
 				return uid
 			}
 		}
