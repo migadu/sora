@@ -23,15 +23,25 @@ func TestMaskSecretsMalformedURLUserInfo(t *testing.T) {
 	for _, endpoint := range []string{
 		"https://fixture-user:fixture-password@example.invalid/%zz",
 		"https://fixture-user:fixture-password@example.invalid:bad/path",
-		// An unencoded "/" or "#" in the password ends the authority, so the parser
+		// An unencoded "/", "?" or "#" in the password ends the authority, so the parser
 		// sees no userinfo and takes the start of the password for a port (#806).
 		"https://fixture-user:fixture/password@example.invalid/send",
+		"https://fixture-user:fixture?password@example.invalid/send",
 		"https://fixture-user:fixture#password@example.invalid/send",
+		// When that start is a number, or empty, the URL parses: host "fixture-user"
+		// with a port, the rest of the password and the "@" in the path, query or fragment.
+		"https://fixture-user:2024/password@example.invalid/send",
+		"https://fixture-user:2024/password@example.invalid/send?api_key=fixture-query-secret",
+		"https://fixture-user:/password@example.invalid/send",
+		"https://fixture-user:2024?password@example.invalid/send",
+		"https://fixture-user:2024?s3cret=1@example.invalid/send",
+		"https://fixture-user:?password@example.invalid/send",
+		"https://fixture-user:2024#password@example.invalid/send",
 	} {
 		cfg := Config{Relay: RelayConfig{HTTPURL: endpoint}}
 		MaskSecrets(&cfg)
 		if cfg.Relay.HTTPURL != SecretMask {
-			t.Fatal("unparseable URL exposed fixture credentials")
+			t.Errorf("credential-bearing URL %q dumped as %q", endpoint, cfg.Relay.HTTPURL)
 		}
 	}
 }
@@ -52,9 +62,10 @@ func TestMaskSecretsURLQueryValues(t *testing.T) {
 		// Only "&" separates parameters, so a ";" stays inside the masked value.
 		{"https://relay.example.invalid/send?mode=fixture;token=fixture-query-secret",
 			"https://relay.example.invalid/send?mode=" + m},
-		// An empty value stays empty, as an unset secret does.
+		// A component with an empty value is masked whole, as it may be a bare base64
+		// token ending in "=" padding (#1761). An empty component has nothing to mask.
 		{"https://relay.example.invalid/send?empty=&&token=fixture-query-secret",
-			"https://relay.example.invalid/send?empty=&&token=" + m},
+			"https://relay.example.invalid/send?" + m + "&&token=" + m},
 		// Remote lookup fills in $email and $ip per request: templates, not credentials.
 		{"https://lookup.example.invalid/lookup?email=$email&ip=$ip&token=fixture-query-secret",
 			"https://lookup.example.invalid/lookup?email=$email&ip=$ip&token=" + m},
@@ -68,6 +79,40 @@ func TestMaskSecretsURLQueryValues(t *testing.T) {
 		{"https://relay.example.invalid/%zz?api_key=fixture-query-secret", m},
 		{"https://relay.example.invalid:bad/send?fixture-bare-token", m},
 	} {
+		cfg := Config{Relay: RelayConfig{HTTPURL: tc.in}}
+		MaskSecrets(&cfg)
+		if cfg.Relay.HTTPURL != tc.want {
+			t.Errorf("MaskSecrets(%q) = %q, want %q", tc.in, cfg.Relay.HTTPURL, tc.want)
+		}
+	}
+}
+
+// A bare base64 token ends in "=" padding (RFC 4648 section 4), so the text before its
+// first "=" is no parameter name: a component whose value is empty or only "=" signs is
+// masked whole, in the config dump and in log lines alike (#1761).
+func TestMaskURLQueryBareTokenWithPadding(t *testing.T) {
+	const m = SecretMask
+	for _, tc := range []struct{ in, want string }{
+		// Two padding characters: only the padding was masked ("?dGhpcw=***MASKED***").
+		{"https://hooks.example.invalid/notify?dGhpcw==", "https://hooks.example.invalid/notify?" + m},
+		// One padding character: the token was printed whole, as a name with no value.
+		{"https://hooks.example.invalid/notify?dGhpcy4=", "https://hooks.example.invalid/notify?" + m},
+		{"https://hooks.example.invalid/notify?mode=fixture&dGhpcw==&dGhpcy4=#fragment",
+			"https://hooks.example.invalid/notify?mode=" + m + "&" + m + "&" + m + "#fragment"},
+		// A name with a value keeps its name.
+		{"https://relay.example.invalid/send?api_key=fixture-query-secret",
+			"https://relay.example.invalid/send?api_key=" + m},
+		{"https://relay.example.invalid/send?sig=Zml4dHVyZS10b2tlbg==",
+			"https://relay.example.invalid/send?sig=" + m},
+		// An empty value, and a flag-like parameter, cannot be told from such a token.
+		{"https://relay.example.invalid/send?api_key=", "https://relay.example.invalid/send?" + m},
+		{"https://relay.example.invalid/send?debug=", "https://relay.example.invalid/send?" + m},
+		{"https://relay.example.invalid/send?debug=&token=fixture-query-secret",
+			"https://relay.example.invalid/send?" + m + "&token=" + m},
+	} {
+		if got := MaskEndpointURL(tc.in); got != tc.want {
+			t.Errorf("MaskEndpointURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 		cfg := Config{Relay: RelayConfig{HTTPURL: tc.in}}
 		MaskSecrets(&cfg)
 		if cfg.Relay.HTTPURL != tc.want {

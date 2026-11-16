@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -87,6 +88,48 @@ func TestConfigValidate(t *testing.T) {
 		{name: "cluster secret_key of 16 bytes", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"MDEyMzQ1Njc4OWFiY2RlZg==\"\n" + imapBackend,
 			want: []problem{{"[cluster]", "cluster secret_key must be 32 bytes (got 16 bytes)"}}},
 		{name: "cluster disabled is not checked", content: "[cluster]\nenabled = false\naddr = \"0.0.0.0:7946\"\n" + imapBackend},
+		// memberlist cannot bind these either, and start-up stopped there only once the
+		// database and S3 were up. Port 0 binds a free port, which memberlist advertises.
+		{name: "cluster dynamic port", content: cluster + "addr = \"10.10.10.40:0\"\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend},
+		{name: "cluster port in addr out of range", content: cluster + "addr = \"10.10.10.40:70000\"\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend,
+			want: []problem{{"[cluster]", "cluster port 70000 is not a valid port"}}},
+		{name: "cluster negative port in addr", content: cluster + "addr = \"10.10.10.40:-1\"\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend,
+			want: []problem{{"[cluster]", "cluster port -1 is not a valid port"}}},
+		{name: "cluster port field out of range", content: cluster + "addr = \"10.10.10.40\"\nport = 70000\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend,
+			want: []problem{{"[cluster]", "cluster port 70000 is not a valid port"}}},
+		// A negative port key bound the default 7946 instead of being refused.
+		{name: "cluster negative port field", content: cluster + "addr = \"10.10.10.40\"\nport = -1\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend,
+			want: []problem{{"[cluster]", "cluster port -1 is not a valid port"}}},
+
+		{name: "cluster port overflow", content: cluster + "addr = \"10.10.10.40:999999999999999999999999999999\"\nsecret_key = \"" + validClusterKey + "\"\n" + imapBackend, want: []problem{{"[cluster]", `cluster port "999999999999999999999999999999" is not a valid port`}}},
+		// Each of these intervals is the period of a ticker that start-up runs in a
+		// goroutine, and time.NewTicker panics on one of zero or less, which stopped the
+		// server (#1643). A value that does not parse takes its default.
+		{name: "local_cache intervals on a mail backend", content: "[local_cache]\npurge_interval = \"30m\"\nmetrics_interval = \"soon\"\n" + imapBackend},
+		{name: "local_cache purge_interval 0s", content: "[local_cache]\npurge_interval = \"0s\"\n" + imapBackend,
+			want: []problem{{"[local_cache]", `purge_interval must be positive, got "0s"`}}},
+		{name: "local_cache purge_interval -1h", content: "[local_cache]\npurge_interval = \"-1h\"\n" + imapBackend,
+			want: []problem{{"[local_cache]", `purge_interval must be positive, got "-1h"`}}},
+		{name: "local_cache metrics_interval 0", content: "[local_cache]\nmetrics_interval = \"0\"\n" + imapBackend,
+			want: []problem{{"[local_cache]", `metrics_interval must be positive, got "0"`}}},
+		{name: "local_cache metrics_interval -5m", content: "[local_cache]\nmetrics_interval = \"-5m\"\n" + imapBackend,
+			want: []problem{{"[local_cache]", `metrics_interval must be positive, got "-5m"`}}},
+		{name: "local_cache on a proxy is not checked", content: "[local_cache]\npurge_interval = \"0s\"\nmetrics_interval = \"-1m\"\n" + imapProxy},
+		{name: "auth_cache cleanup_interval", content: "[auth_cache]\nenabled = true\ncleanup_interval = \"30m\"\n" + imapProxy},
+		{name: "auth_cache cleanup_interval unparsable", content: "[auth_cache]\nenabled = true\ncleanup_interval = \"hourly\"\n" + imapProxy},
+		{name: "auth_cache cleanup_interval 0s", content: "[auth_cache]\nenabled = true\ncleanup_interval = \"0s\"\n" + imapProxy,
+			want: []problem{{"[auth_cache]", `cleanup_interval must be positive, got "0s"`}}},
+		{name: "auth_cache cleanup_interval -1h on a mail backend", content: "[auth_cache]\nenabled = true\ncleanup_interval = \"-1h\"\n" + imapBackend,
+			want: []problem{{"[auth_cache]", `cleanup_interval must be positive, got "-1h"`}}},
+		{name: "auth_cache disabled is not checked", content: "[auth_cache]\ncleanup_interval = \"0s\"\n" + imapProxy},
+		{name: "cluster.affinity cleanup_interval", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"" + validClusterKey + "\"\n\n[cluster.affinity]\ncleanup_interval = \"30m\"\n" + imapBackend},
+		// The affinity manager runs its ticker at the 1h default for 0, so a file with 0
+		// starts and is not refused; a negative value reaches time.NewTicker.
+		{name: "cluster.affinity cleanup_interval 0s", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"" + validClusterKey + "\"\n\n[cluster.affinity]\ncleanup_interval = \"0s\"\n" + imapBackend},
+		{name: "cluster.affinity cleanup_interval -1h", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"" + validClusterKey + "\"\n\n[cluster.affinity]\ncleanup_interval = \"-1h\"\n" + imapBackend,
+			want: []problem{{"[cluster.affinity]", `cleanup_interval must not be negative, got "-1h"`}}},
+		{name: "cluster.affinity disabled is not checked", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"" + validClusterKey + "\"\n\n[cluster.affinity]\nenabled = false\ncleanup_interval = \"-1h\"\n" + imapBackend},
+		{name: "cluster.affinity without cluster is not checked", content: "[cluster.affinity]\ncleanup_interval = \"-1h\"\n" + imapBackend},
 		{name: "every problem, in order", content: "[servers]\ntrusted_networks = []\n\n[relay]\ntype = \"SMTP\"\n\n[uploader]\nbatch_size = 0\n" +
 			imapBackend + "proxy_protocol = true\n" + imapBackend,
 			want: []problem{
@@ -115,9 +158,11 @@ func TestConfigValidate(t *testing.T) {
 // TestConfigValidateDatabaseAndS3: a node that runs a server needing the database, or
 // one that stores or serves message bodies, is refused without [database] or [s3]. The
 // server refused these only in service setup, after it had opened what came before, and
-// `sora-admin config validate` passed them (#921).
+// `sora-admin config validate` passed them (#921); it passed [database.read] hosts without
+// [database.write] ones too (#1266).
 func TestConfigValidateDatabaseAndS3(t *testing.T) {
 	const db = "[database.write]\nhosts = [\"db.example.com\"]\n\n"
+	const readOnly = "[database.read]\nhosts = [\"replica.example.com\"]\n\n"
 	const s3 = "[s3]\nendpoint = \"s3.example.com\"\nbucket = \"mail\"\n\n"
 	const imapBackend = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"
 	const managesieve = "\n[[server]]\ntype = \"managesieve\"\nname = \"sieve\"\naddr = \"127.0.0.1:4190\"\n"
@@ -132,7 +177,17 @@ func TestConfigValidateDatabaseAndS3(t *testing.T) {
 		want    []problem
 	}{
 		{name: "mail backend", content: db + s3 + imapBackend},
-		{name: "mail backend with a read endpoint only", content: "[database.read]\nhosts = [\"db.example.com\"]\n\n" + s3 + imapBackend},
+		// Start-up opens write pools only from [database.write] and stops with "no healthy
+		// database pools available" without one, after trying every replica (#1266).
+		{name: "mail backend with a read endpoint only", content: readOnly + s3 + imapBackend,
+			want: []problem{{"[database.write]", `server "imap" (imap) needs the database, but [database.write] has no hosts`}}},
+		{name: "managesieve with a read endpoint only", content: readOnly + managesieve,
+			want: []problem{{"[database.write]", `server "sieve" (managesieve) needs the database, but [database.write] has no hosts`}}},
+		{name: "read endpoint and a write endpoint without hosts", content: "[database.write]\nhosts = []\n\n" + readOnly + managesieve,
+			want: []problem{{"[database.write]", `server "sieve" (managesieve) needs the database, but [database.write] has no hosts`}}},
+		{name: "proxy that authenticates against a read endpoint only", content: readOnly + imapProxy,
+			want: []problem{{"[database.write]", `server "imap-proxy" (imap_proxy) needs the database, but [database.write] has no hosts`}}},
+		{name: "write and read endpoints", content: db + readOnly + managesieve},
 		{name: "mail backend without a database", content: s3 + imapBackend,
 			want: []problem{{"[database]", `server "imap" (imap) needs the database, but it is not configured in [database.write] or [database.read]`}}},
 		{name: "database endpoint without hosts", content: "[database.write]\nhosts = []\n\n" + s3 + imapBackend,
@@ -159,6 +214,126 @@ func TestConfigValidateDatabaseAndS3(t *testing.T) {
 			want: []problem{{"[database]", `server "imap-proxy" (imap_proxy) needs the database`}}},
 		{name: "metrics only", content: metrics},
 		{name: "disabled mail backend", content: metrics + "\n[[server]]\nenabled = false\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := validateFile(t, tt.content)
+			if len(got) != len(tt.want) {
+				t.Fatalf("Validate() = %v, want %d problem(s) %v", got, len(tt.want), tt.want)
+			}
+			for i, w := range tt.want {
+				if got[i].Section != w.section || !strings.Contains(got[i].Err.Error(), w.err) {
+					t.Errorf("problem %d = %s: %v, want %s: ...%s...", i, got[i].Section, got[i].Err, w.section, w.err)
+				}
+			}
+		})
+	}
+}
+
+// TestConfigValidateWhatServiceSetupRefuses: these settings are known to be wrong from
+// the file alone, but the server found them only while it set up the service that reads
+// them, after it had opened what came before, and `sora-admin config validate` passed
+// them: [uploader] max_staging_size (#1092), [s3] encryption_key and a lone access_key or
+// secret_key (#1095), the [database] durations (#1104) and [tls] (#1105). Each is checked
+// only where start-up reads it. [timeout_scheduler] shard_count is read on every node, by
+// the scheduler set up once logging is (#1325).
+func TestConfigValidateWhatServiceSetupRefuses(t *testing.T) {
+	const db = "[database.write]\nhosts = [\"db.example.com\"]\n"
+	const s3 = "[s3]\nendpoint = \"s3.example.com\"\nbucket = \"mail\"\n"
+	const imapBackend = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"
+	const managesieve = "\n[[server]]\ntype = \"managesieve\"\nname = \"sieve\"\naddr = \"127.0.0.1:4190\"\n"
+	const imapProxy = "\n[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:1143\"\nremote_addrs = [\"192.0.2.10:143\"]\n" +
+		"\n[server.remote_lookup]\nenabled = true\nurl = \"https://lookup.example.com/lookup?email=$email\"\n"
+	const metrics = "\n[[server]]\ntype = \"metrics\"\nname = \"metrics\"\naddr = \"127.0.0.1:9090\"\n"
+	const encryptionKey = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" // 32 bytes
+	const tls = "[tls]\nenabled = true\nprovider = \"letsencrypt\"\n\n[tls.letsencrypt]\nemail = \"postmaster@example.com\"\ndomains = [\"mail.example.com\"]\nstorage_provider = \"s3\"\n"
+	type problem struct{ section, err string } // err: a substring of the problem's error
+	tests := []struct {
+		name    string
+		content string
+		want    []problem
+	}{
+		// #1092: start-up exits on a max_staging_size it cannot parse.
+		{name: "uploader max_staging_size", content: "[uploader]\nmax_staging_size = \"100gb\"\n" + db + s3 + imapBackend},
+		{name: "uploader max_staging_size unparsable", content: "[uploader]\nmax_staging_size = \"100 gigs\"\n" + db + s3 + imapBackend,
+			want: []problem{{"[uploader]", "[uploader] max_staging_size: invalid size format: '100 gigs'"}}},
+		{name: "uploader max_staging_size on a proxy is not checked", content: "[uploader]\nmax_staging_size = \"100 gigs\"\n" + imapProxy},
+
+		// #1095: storage set-up refuses these with encrypt = true, or with one key alone.
+		{name: "s3 encrypt", content: db + s3 + "encrypt = true\nencryption_key = \"" + encryptionKey + "\"\n" + imapBackend},
+		{name: "s3 encrypt without encryption_key", content: db + s3 + "encrypt = true\n" + imapBackend,
+			want: []problem{{"[s3]", "encryption_key is required when encrypt = true"}}},
+		{name: "s3 encryption_key not hex", content: db + s3 + "encrypt = true\nencryption_key = \"not-hex\"\n" + imapBackend,
+			want: []problem{{"[s3]", "encryption_key must be 64 hex characters"}}},
+		{name: "s3 encryption_key of 16 bytes", content: db + s3 + "encrypt = true\nencryption_key = \"" + encryptionKey[:32] + "\"\n" + imapBackend,
+			want: []problem{{"[s3]", "encryption_key must be 32 bytes (64 hex characters), got 16 bytes"}}},
+		{name: "s3 encryption_key without encrypt is not used", content: db + s3 + "encryption_key = \"not-hex\"\n" + imapBackend},
+		{name: "s3 access_key without secret_key", content: db + s3 + "access_key = \"AKIAEXAMPLE\"\n" + imapBackend,
+			want: []problem{{"[s3]", "access_key and secret_key must be set together"}}},
+		{name: "s3 secret_key without access_key", content: db + s3 + "secret_key = \"example-secret\"\n" + imapBackend,
+			want: []problem{{"[s3]", "access_key and secret_key must be set together"}}},
+		{name: "s3 access_key and secret_key", content: db + s3 + "access_key = \"AKIAEXAMPLE\"\nsecret_key = \"example-secret\"\n" + imapBackend},
+		{name: "s3 on a proxy is not checked", content: s3 + "encrypt = true\naccess_key = \"AKIAEXAMPLE\"\n" + imapProxy},
+
+		// #1104: a write host whose pool settings do not parse is marked failed, and
+		// start-up stops with "no healthy database pools available"; a read replica is
+		// retried for good.
+		{name: "database durations", content: "[database]\nmigration_timeout = \"5m\"\n\n" + db + "max_conn_lifetime = \"1h\"\nmax_conn_idle_time = \"30m\"\n" + managesieve},
+		{name: "database migration_timeout unparsable", content: "[database]\nmigration_timeout = \"soon\"\n\n" + db + managesieve,
+			want: []problem{{"[database]", `invalid migration_timeout "soon"`}}},
+		{name: "database.write max_conn_lifetime unparsable", content: db + "max_conn_lifetime = \"an hour\"\n" + managesieve,
+			want: []problem{{"[database.write]", `invalid max_conn_lifetime "an hour"`}}},
+		{name: "database.read max_conn_idle_time unparsable", content: db + "\n[database.read]\nhosts = [\"replica.example.com\"]\nmax_conn_idle_time = \"idle\"\n" + managesieve,
+			want: []problem{{"[database.read]", `invalid max_conn_idle_time "idle"`}}},
+		{name: "database.read without hosts is not checked", content: db + "\n[database.read]\nhosts = []\nmax_conn_idle_time = \"idle\"\n" + managesieve},
+		{name: "database on a node that queries none is not checked", content: "[database]\nmigration_timeout = \"soon\"\n\n" + db + "max_conn_lifetime = \"an hour\"\n" + metrics},
+		// So is a host whose connection string cannot be built from the endpoint's port.
+		{name: "database ports", content: db + "port = 5433\n\n[database.read]\nhosts = [\"replica.example.com\"]\nport = \"5434\"\n" + managesieve},
+		{name: "database.write port out of range", content: db + "port = 70000\n" + managesieve,
+			want: []problem{{"[database.write]", "port number 70000 is out of the valid range (1-65535)"}}},
+		{name: "database.read port not a number", content: db + "\n[database.read]\nhosts = [\"replica.example.com\"]\nport = \"x\"\n" + managesieve,
+			want: []problem{{"[database.read]", `invalid string for port: "x"`}}},
+		{name: "database port unused when every host names one", content: "[database.write]\nhosts = [\"db.example.com:5433\"]\nport = \"x\"\n" + managesieve},
+		{name: "database.write host port not a number", content: "[database.write]\nhosts = [\"db.example.com:5433\", \"db2.example.com:abc\"]\n" + managesieve,
+			want: []problem{{"[database.write]", `invalid port "abc" in host "db2.example.com:abc"`}}},
+
+		// #1105: the TLS manager refused these last, after every other service was up.
+		{name: "tls letsencrypt", content: tls + "renew_before = \"720h\"\nsync_interval = \"0\"\n" + metrics},
+		{name: "tls file", content: "[tls]\nenabled = true\nprovider = \"file\"\ncert_file = \"/etc/sora/cert.pem\"\nkey_file = \"/etc/sora/key.pem\"\n" + metrics},
+		{name: "tls provider unknown", content: "[tls]\nenabled = true\nprovider = \"acme\"\n" + metrics,
+			want: []problem{{"[tls]", "unknown TLS provider: acme (must be 'file' or 'letsencrypt')"}}},
+		{name: "tls file without key_file", content: "[tls]\nenabled = true\nprovider = \"file\"\ncert_file = \"/etc/sora/cert.pem\"\n" + metrics,
+			want: []problem{{"[tls]", "cert_file and key_file are required for provider='file'"}}},
+		{name: "tls letsencrypt without its table", content: "[tls]\nenabled = true\nprovider = \"letsencrypt\"\n" + metrics,
+			want: []problem{{"[tls]", "letsencrypt configuration is required for provider='letsencrypt'"}}},
+		{name: "tls letsencrypt without email", content: "[tls]\nenabled = true\nprovider = \"letsencrypt\"\n\n[tls.letsencrypt]\ndomains = [\"mail.example.com\"]\nstorage_provider = \"s3\"\n" + metrics,
+			want: []problem{{"[tls]", "letsencrypt.email is required"}}},
+		{name: "tls letsencrypt without domains", content: "[tls]\nenabled = true\nprovider = \"letsencrypt\"\n\n[tls.letsencrypt]\nemail = \"postmaster@example.com\"\nstorage_provider = \"s3\"\n" + metrics,
+			want: []problem{{"[tls]", "letsencrypt.domains is required and must not be empty"}}},
+		{name: "tls letsencrypt without storage_provider", content: "[tls]\nenabled = true\nprovider = \"letsencrypt\"\n\n[tls.letsencrypt]\nemail = \"postmaster@example.com\"\ndomains = [\"mail.example.com\"]\n" + metrics,
+			want: []problem{{"[tls]", "only storage_provider='s3' is currently supported for Let's Encrypt"}}},
+		{name: "tls letsencrypt renew_before unparsable", content: tls + "renew_before = \"a month\"\n" + metrics,
+			want: []problem{{"[tls]", `invalid renew_before duration "a month"`}}},
+		{name: "tls letsencrypt sync_interval unparsable", content: tls + "sync_interval = \"often\"\n" + metrics,
+			want: []problem{{"[tls]", `invalid sync_interval duration "often"`}}},
+		// The certificate store's client and its encryption settings are refused from the
+		// file as well, before the store is reached.
+		{name: "tls letsencrypt s3", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\naccess_key = \"AKIAEXAMPLE\"\nsecret_key = \"example-secret\"\nserver_side_encryption = \"aws:kms\"\nserver_side_encryption_kms_key_id = \"example-key\"\n" + metrics},
+		{name: "tls letsencrypt s3 without server-side encryption", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption = \"\"\n" + metrics},
+		{name: "tls letsencrypt s3 access_key without secret_key", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\naccess_key = \"AKIAEXAMPLE\"\n" + metrics,
+			want: []problem{{"[tls]", "letsencrypt.s3: access_key and secret_key must be set together"}}},
+		{name: "tls letsencrypt s3 server_side_encryption unsupported", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption = \"rot13\"\n" + metrics,
+			want: []problem{{"[tls]", `letsencrypt.s3: unsupported server-side encryption "rot13"`}}},
+		{name: "tls letsencrypt s3 aws:kms without key id", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption = \"aws:kms\"\n" + metrics,
+			want: []problem{{"[tls]", `letsencrypt.s3: server-side encryption "aws:kms" requires a KMS key id`}}},
+		{name: "tls letsencrypt s3 key id without aws:kms", content: tls + "\n[tls.letsencrypt.s3]\nbucket = \"certs\"\nserver_side_encryption_kms_key_id = \"example-key\"\n" + metrics,
+			want: []problem{{"[tls]", `letsencrypt.s3: a KMS key id is only used by server-side encryption "aws:kms", not "AES256"`}}},
+		{name: "tls disabled is not checked", content: "[tls]\nenabled = false\nprovider = \"acme\"\n" + metrics},
+
+		// #1325: start-up exits on a shard_count below -1, after it has set up logging.
+		{name: "timeout_scheduler shard_count", content: "[timeout_scheduler]\nshard_count = -1\n" + metrics},
+		{name: "timeout_scheduler shard_count below -1", content: "[timeout_scheduler]\nshard_count = -2\n" + metrics,
+			want: []problem{{"[timeout_scheduler]", "shard_count must be >= -1, got -2"}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -204,6 +379,138 @@ func TestConfigValidateProxyNeedsBackends(t *testing.T) {
 	}
 	if proxies != 5 {
 		t.Errorf("checked %d proxy types, want the 5 proxies", proxies)
+	}
+}
+
+// TestConfigValidateProxyRefusesEmptyRemoteAddr: an empty remote_addrs entry passed
+// Validate, and the proxy was built with "" as a backend and routed users to it. Validate
+// refuses it as ValidatePools refuses an empty [[pool]] backend, naming the entry (#1147).
+// A port alone (":143") has an empty host too: the proxy dials it, and an empty host
+// dials this node itself.
+func TestConfigValidateProxyRefusesEmptyRemoteAddr(t *testing.T) {
+	tests := []struct {
+		remoteAddrs string
+		want        string // "" for a valid list
+	}{
+		{`[""]`, `server "proxy": remote_addrs #1: empty backend address`},
+		{`[" "]`, `server "proxy": remote_addrs #1: empty backend address`},
+		{`["192.0.2.10:143", "\t"]`, `server "proxy": remote_addrs #2: empty backend address`},
+		{`[":143"]`, `server "proxy": remote_addrs #1: empty backend address`},
+		{`["192.0.2.10:143", "[]:143"]`, `server "proxy": remote_addrs #2: empty backend address`},
+		{`["192.0.2.10:143", "backend.example.com"]`, ""},
+		{`["[2001:db8::1]:143", "2001:db8::2"]`, ""},
+	}
+	var proxies int
+	for _, typ := range ServerTypes {
+		if !strings.HasSuffix(typ, "_proxy") {
+			continue
+		}
+		proxies++
+		for _, tt := range tests {
+			t.Run(typ+" "+tt.remoteAddrs, func(t *testing.T) {
+				got := validateFile(t, storageTOML+"\n[[server]]\ntype = \""+typ+"\"\nname = \"proxy\"\naddr = \"127.0.0.1:1143\"\nremote_port = 143\nremote_addrs = "+tt.remoteAddrs+"\n")
+				if tt.want == "" {
+					if len(got) != 0 {
+						t.Errorf("Validate() = %v, want no problems", got)
+					}
+					return
+				}
+				if len(got) != 1 || got[0].Section != "server 'proxy'" || !strings.Contains(got[0].Err.Error(), tt.want) {
+					t.Errorf("Validate() = %v, want server 'proxy': %s", got, tt.want)
+				}
+			})
+		}
+	}
+	if proxies != 5 {
+		t.Errorf("checked %d proxy types, want the 5 proxies", proxies)
+	}
+
+	// The [[pool]] check refuses the same entries.
+	for _, backend := range []string{`""`, `" "`, `":143"`, `"[]:143"`} {
+		t.Run("pool "+backend, func(t *testing.T) {
+			got := validateFile(t, storageTOML+"\n[[server]]\ntype = \"imap_proxy\"\nname = \"proxy\"\naddr = \"127.0.0.1:1143\"\nremote_port = 143\n"+
+				"\n[[pool]]\nname = \"sora0\"\ndefault = true\nbackends = ["+backend+"]\n")
+			if len(got) != 1 || got[0].Section != "[[pool]]" || !strings.Contains(got[0].Err.Error(), `[[pool]] "sora0": empty backend address`) {
+				t.Errorf("Validate() = %v, want [[pool]]: empty backend address", got)
+			}
+		})
+	}
+}
+
+// TestConfigValidateProxyRefusesWhitespaceInRemoteAddr: the loader trims the ends of every
+// string, so " 192.0.2.11:143" reaches the proxy as "192.0.2.11:143"; whitespace inside a
+// remote_addrs entry ("192.0.2.10 :143") passed Validate and the proxy dialed the entry as
+// written, a name that never resolves. No host or IP contains whitespace, so Validate
+// refuses the entry, naming it, as it refuses an empty one (#1322).
+func TestConfigValidateProxyRefusesWhitespaceInRemoteAddr(t *testing.T) {
+	tests := []struct {
+		remoteAddrs string
+		want        string // "" for a valid list
+	}{
+		{`["192.0.2.10 :143"]`, `server "proxy": remote_addrs #1: backend address "192.0.2.10 :143" contains whitespace`},
+		{`["192.0.2.10:143", "backend .example.com"]`, `server "proxy": remote_addrs #2: backend address "backend .example.com" contains whitespace`},
+		{`["backend.example.com\t:143"]`, `server "proxy": remote_addrs #1: backend address "backend.example.com\t:143" contains whitespace`},
+		{`["backend\u00a0.example.com"]`, `server "proxy": remote_addrs #1: backend address "backend\u00a0.example.com" contains whitespace`},
+		// The ends are trimmed when the file is loaded (TestLoadServerConfigTrimsBackendAddresses).
+		{`[" 192.0.2.10:143", "[2001:db8::1]:143 ", "\tbackend.example.com"]`, ""},
+	}
+	var proxies int
+	for _, typ := range ServerTypes {
+		if !strings.HasSuffix(typ, "_proxy") {
+			continue
+		}
+		proxies++
+		for _, tt := range tests {
+			t.Run(typ+" "+tt.remoteAddrs, func(t *testing.T) {
+				got := validateFile(t, storageTOML+"\n[[server]]\ntype = \""+typ+"\"\nname = \"proxy\"\naddr = \"127.0.0.1:1143\"\nremote_port = 143\nremote_addrs = "+tt.remoteAddrs+"\n")
+				if tt.want == "" {
+					if len(got) != 0 {
+						t.Errorf("Validate() = %v, want no problems", got)
+					}
+					return
+				}
+				if len(got) != 1 || got[0].Section != "server 'proxy'" || !strings.Contains(got[0].Err.Error(), tt.want) {
+					t.Errorf("Validate() = %v, want server 'proxy': %s", got, tt.want)
+				}
+			})
+		}
+	}
+	if proxies != 5 {
+		t.Errorf("checked %d proxy types, want the 5 proxies", proxies)
+	}
+}
+
+// TestLoadServerConfigTrimsBackendAddresses: a remote_addrs entry or a [[pool]] backend
+// written with a leading or trailing space reaches Validate and the proxies trimmed, from
+// the loader that startup, SIGHUP reload and `sora-admin config validate` share (#1322).
+func TestLoadServerConfigTrimsBackendAddresses(t *testing.T) {
+	load := func(t *testing.T, content string) Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var cfg Config
+		if err := LoadServerConfig(path, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+
+	cfg := load(t, storageTOML+"[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:11143\"\nremote_addrs = [\"192.0.2.10:143\", \" 192.0.2.11:143\", \"192.0.2.12:143\\t\"]\nremote_port = 143\n")
+	if got, want := cfg.DynamicServers[0].RemoteAddrs, []string{"192.0.2.10:143", "192.0.2.11:143", "192.0.2.12:143"}; !slices.Equal(got, want) {
+		t.Errorf("remote_addrs = %q, want %q", got, want)
+	}
+	if got := cfg.Validate(); len(got) != 0 {
+		t.Errorf("remote_addrs: Validate() = %v, want no problems", got)
+	}
+
+	cfg = load(t, storageTOML+"[[pool]]\nname = \"sora0\"\ndefault = true\nbackends = [\"192.0.2.10\", \"192.0.2.11 \", \" 192.0.2.12:143\"]\n\n[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:11143\"\nremote_port = 143\n")
+	if got, want := cfg.Pools[0].Backends, []string{"192.0.2.10", "192.0.2.11", "192.0.2.12:143"}; !slices.Equal(got, want) {
+		t.Errorf("[[pool]] backends = %q, want %q", got, want)
+	}
+	if got := cfg.Validate(); len(got) != 0 {
+		t.Errorf("[[pool]]: Validate() = %v, want no problems", got)
 	}
 }
 

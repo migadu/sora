@@ -123,7 +123,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	// Collect message IDs and source UIDs
 	var messageIDs []int64
 	var sourceUIDsForMap []imap.UID
-	crossAccount := false // any source row owned by another account: see restageFTS
+	var rekeyed []bool // per message: re-keyed from another account to destAccountID
 	for rows.Next() {
 		var messageID, sourceAccountID int64
 		var sourceUID imap.UID
@@ -139,7 +139,9 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		}
 		messageIDs = append(messageIDs, messageID)
 		sourceUIDsForMap = append(sourceUIDsForMap, sourceUID)
-		crossAccount = crossAccount || sourceAccountID != destAccountID
+		// A move within one mailbox keeps every row's account and S3 key (see below), so it
+		// re-keys nothing, even a row of another account than the mailbox owner.
+		rekeyed = append(rekeyed, sourceAccountID != destAccountID && srcMailboxID != destMailboxID)
 	}
 	if err = rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating through source messages: %w", err)
@@ -159,12 +161,18 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		return nil, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 	}
 
-	// Calculate the new UIDs for the moved messages.
-	var newUIDs []int64
+	// Calculate the new UIDs for the moved messages, and split them by whether the
+	// move is re-keyed to the destination owner (see restagePendingUploads).
+	var newUIDs, keptUIDs, rekeyedUIDs []int64
 	startUID := newHighestUID - numToMove + 1
 	for i, sourceUID := range sourceUIDsForMap {
 		newUID := startUID + int64(i)
 		newUIDs = append(newUIDs, newUID)
+		if rekeyed[i] {
+			rekeyedUIDs = append(rekeyedUIDs, newUID)
+		} else {
+			keptUIDs = append(keptUIDs, newUID)
+		}
 		messageUIDMap[sourceUID] = imap.UID(newUID)
 	}
 
@@ -180,7 +188,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	// new ones to avoid having two active copies of the same message.
 	//
 	// Both paths carry the source's flags. A source without a message_state row (left
-	// by an older build, see migration 000063) has none, and the moved message gets a
+	// by an older build) has none, and the moved message gets a
 	// row with none.
 	if srcMailboxID == destMailboxID {
 		// Step 1: Mark old messages as expunged to remove them from the unique index
@@ -310,12 +318,11 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	// background uploader writes the body under the destination owner's S3 path
 	// and marks the new row uploaded. Without this, a cross-account move of a
 	// not-yet-uploaded message would never reach the owner's path and would
-	// become unreadable once local staging is cleaned up. ON CONFLICT makes this
-	// a no-op for same-account moves (the source's pending_upload still applies).
-	if err := db.restagePendingUploads(ctx, tx, destMailboxID, newUIDs, instanceID); err != nil {
+	// become unreadable once local staging is cleaned up.
+	if err := db.restagePendingUploads(ctx, tx, destMailboxID, keptUIDs, rekeyedUIDs, instanceID); err != nil {
 		return nil, err
 	}
-	if crossAccount {
+	if len(rekeyedUIDs) > 0 {
 		if err := db.restageFTS(ctx, tx, destMailboxID, newUIDs); err != nil {
 			return nil, err
 		}

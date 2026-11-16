@@ -21,6 +21,18 @@ func TestMaskEndpointURL(t *testing.T) {
 		{"https://fixture-user:fixture-password@relay.example.invalid/send?api_key=fixture-query-secret",
 			"https://%2A%2A%2AMASKED%2A%2A%2A:%2A%2A%2AMASKED%2A%2A%2A@relay.example.invalid/send?api_key=" + m},
 		{"https://fixture-user:fixture/password@relay.example.invalid/send", m},
+		{"https://fixture-user:fixture?password@example.invalid/send", m},
+		// A password that starts with a number, or is empty, before its "/", "?" or "#"
+		// parses: that start is taken for a port, the rest for the path, query or fragment.
+		{"https://fixture-user:2024/password@relay.example.invalid/send", m},
+		{"https://fixture-user:2024?password@example.invalid/send", m},
+		{"https://fixture-user:2024?s3cret=1@example.invalid/send", m},
+		{"https://fixture-user:?password@example.invalid/send", m},
+		{"https://fixture-user:2024#password@relay.example.invalid/send", m},
+		{"https://[2001:db8::1]:8443/users/fixture@example.com", m},
+		{"https://[2001:db8::1]:8443/lookup?email=fixture%40example.com",
+			"https://[2001:db8::1]:8443/lookup?email=" + m},
+		{"https://[2001:db8::1]/users/fixture@example.com", "https://[2001:db8::1]/users/fixture@example.com"},
 		// Without a scheme the masker cannot find the userinfo or the query.
 		{"fixture-user:fixture-password@relay.example.invalid/send", m},
 		{"relay.example.invalid/send?api_key=fixture-query-secret", m},

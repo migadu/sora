@@ -12,12 +12,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -26,12 +29,11 @@ import (
 
 	"github.com/emersion/go-message/mail" // Import for mail.ReadMessage
 	"github.com/migadu/go-imap"
-	"github.com/migadu/go-imap/imapserver"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
-	"github.com/migadu/sora/pkg/sqlitefile"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/sieveengine"
 	_ "modernc.org/sqlite"
@@ -44,11 +46,9 @@ type ImporterOptions struct {
 	EndDate              *time.Time
 	MailboxFilter        []string
 	PreserveFlags        bool
-	ShowProgress         bool
-	ForceReimport        bool
 	CleanupDB            bool
 	Dovecot              bool
-	ImportDelay          time.Duration // Delay between imports to control rate
+	ImportDelay          time.Duration // Wait before each message, per worker, to control the rate
 	SievePath            string        // Path to Sieve script file to import
 	SieveExtensions      []string      // [sieve] enabled_extensions the script is validated against (empty = default set)
 	PreserveUIDs         bool          // Preserve UIDs from dovecot-uidlist files
@@ -59,11 +59,15 @@ type ImporterOptions struct {
 	MaxMessageSize       int64         // Maximum message size to import (bytes); 0 or above consts.MaxStoredMessageSize means that maximum
 	PathsFile            string        // Path to a file containing a list of relative or absolute paths to import
 	FTSRetention         time.Duration // Skip the search row for messages sent before this window (0 = index all)
+	// SharedMailboxes is the [shared_mailboxes] config: with sharing enabled, a folder
+	// in the shared namespace is imported into a shared mailbox the account owns.
+	SharedMailboxes config.SharedMailboxesConfig
 }
 
 // resilientDB defines the interface for database operations needed by the importer.
 // This allows for mocking the database during testing.
 type resilientDB interface {
+	GetDatabaseIdentityWithRetry(ctx context.Context) (string, error)
 	GetAccountIDByAddressWithRetry(ctx context.Context, address string) (int64, error)
 	CreateDefaultMailboxesWithRetry(ctx context.Context, accountID int64) error
 	GetOwnedMailboxIDByNameWithRetry(ctx context.Context, accountID int64, name string) (int64, error)
@@ -90,9 +94,8 @@ type msgInfo struct {
 	hash     string
 	size     int64
 	mailbox  string
-	// imported is the cache row's s3_uploaded mark: an earlier run imported the file
-	// under hash (recoverOrphanedSQLiteState clears the mark when the account has no
-	// live row with that hash).
+	// imported is this destination's completion proof for the cached hash, used
+	// to retain the identity of files imported before the BLAKE3 transition.
 	imported bool
 }
 
@@ -112,6 +115,7 @@ type messageMetadata struct {
 	subject              string
 	plaintextBody        string
 	sentDate             time.Time
+	sentDateUnknownZone  bool
 	internalDate         time.Time // arrival time: maildir filename timestamp / file mtime
 	inReplyTo            []string
 	references           []string
@@ -131,6 +135,7 @@ type failedImport struct {
 type Importer struct {
 	ctx         context.Context // Context for cancellation support
 	maildirPath string
+	root        *os.Root // the maildir, which every file below it is read through (openMaildirFile)
 	email       string
 	jobs        int
 	sqliteDB    *sql.DB // SQLite database for caching (nil in non-incremental mode)
@@ -138,6 +143,13 @@ type Importer struct {
 	rdb         resilientDB
 	s3          objectStorage
 	options     ImporterOptions
+
+	// user is the account the import is for. Run looks it up once (lookupAccount),
+	// before it scans or uploads anything, and every step uses it from there.
+	user *server.User
+
+	// databaseUUID is the primary database identity, resolved once before recovery/import.
+	databaseUUID string
 
 	totalMessages    int64
 	importedMessages int64
@@ -172,15 +184,15 @@ type Importer struct {
 	batchSize int // default: 20
 }
 
-// maildirCacheParams are the connection settings of sora-maildir.db, for import and
-// export alike: WAL lets readers and the writer work concurrently, and a locked
-// database is waited for up to 5 seconds.
-const maildirCacheParams = "_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL"
-
 // NewImporter creates a new Importer instance.
 func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ImporterOptions) (*Importer, error) {
+	// The import runs on exactly this many workers: with none it would never drain its queue.
+	if jobs < 1 {
+		return nil, fmt.Errorf("jobs must be at least 1, got %d", jobs)
+	}
+	maildirPath = effectiveMaildirPath(maildirPath)
 	// Always create SQLite database in the maildir path to persist maildir state
-	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
+	dbPath := filepath.Join(maildirPath, maildirCacheName)
 
 	if options.Incremental {
 		logger.Info("Using maildir database for incremental import", "path", dbPath)
@@ -188,19 +200,10 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		logger.Info("Incremental mode disabled - will read all files (database still created for tracking)", "path", dbPath)
 	}
 
-	dsn, err := sqlitefile.DSN(dbPath, maildirCacheParams)
+	sqliteDB, err := openMaildirCache(maildirPath)
 	if err != nil {
 		return nil, err
 	}
-	sqliteDB, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
-	}
-
-	// Configure connection pool for better concurrency
-	// SQLite works best with a single writer connection
-	sqliteDB.SetMaxOpenConns(1)
-	sqliteDB.SetMaxIdleConns(1)
 
 	// Create the table for storing message information.
 	// s3_uploaded tracks whether the message has been successfully uploaded to S3
@@ -238,17 +241,11 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 
 	if !columnExists {
 		logger.Info("Migrating SQLite database: adding s3_uploaded columns")
-		// DEFAULT 0 must match the fresh schema above: a column default added here is
-		// permanent for this database file, and scanMaildir inserts newly discovered
-		// files without naming s3_uploaded. A default of 1 would make every file found
-		// by a later scan born "already uploaded", invisible to the import (which
-		// selects WHERE s3_uploaded = 0) and to orphan recovery, which runs before the
-		// scan. Pre-existing rows are marked below instead, once.
-		// All three statements commit together. Splitting the column default from the
-		// backfill means a crash between them is not resumable: the next run sees the
-		// column present, skips this whole block, and every legacy row stays at the new
-		// default of 0 forever - re-importing the entire maildir on every subsequent run.
-		// SQLite runs DDL inside transactions, so one transaction covers the lot.
+		// Keep the compatibility columns' default at zero for newly scanned files.
+		// Pre-existing rows are marked once so recovery can verify their destination;
+		// only the per-destination completion ledger is authoritative thereafter.
+		// Commit the columns and legacy backfill together so an interrupted upgrade
+		// does not strand an existing cache between those states.
 		migrationTx, err := sqliteDB.Begin()
 		if err != nil {
 			return nil, fmt.Errorf("failed to begin SQLite migration: %w", err)
@@ -277,6 +274,36 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		logger.Info("SQLite database migration completed successfully - all existing messages marked as uploaded")
 	}
 
+	// Older importer builds recorded only this database-local numeric account ID.
+	// Keep the column readable, but never treat it as a destination identity.
+	var hasAccountID bool
+	if err := sqliteDB.QueryRow(`SELECT COUNT(*) > 0 FROM pragma_table_info('messages') WHERE name = 'account_id'`).Scan(&hasAccountID); err != nil {
+		return nil, fmt.Errorf("failed to check for account_id column: %w", err)
+	}
+	if !hasAccountID {
+		if _, err := sqliteDB.Exec(`ALTER TABLE messages ADD COLUMN account_id INTEGER`); err != nil {
+			return nil, fmt.Errorf("failed to add account_id column: %w", err)
+		}
+	}
+	// Histories are independent: importing A -> B -> A must still remember mail
+	// deliberately deleted from A. Exported/legacy cache rows have no such proof.
+	if _, err := sqliteDB.Exec(`CREATE TABLE IF NOT EXISTS import_completions (
+		database_uuid TEXT NOT NULL,
+		account_id INTEGER NOT NULL,
+		hash TEXT NOT NULL,
+		mailbox TEXT NOT NULL,
+		completed_at TIMESTAMP NOT NULL,
+		PRIMARY KEY (database_uuid, account_id, hash, mailbox)
+	)`); err != nil {
+		return nil, fmt.Errorf("failed to create import completion ledger: %w", err)
+	}
+
+	// The rare legacy-SHA path asks whether any destination completed this exact
+	// copy. Keep that lookup indexed independently of the destination-leading PK.
+	if _, err := sqliteDB.Exec(`CREATE INDEX IF NOT EXISTS idx_import_completion_copy ON import_completions(hash, mailbox)`); err != nil {
+		return nil, fmt.Errorf("failed to index import completion copies: %w", err)
+	}
+
 	// Create index after migration (idempotent operation)
 	_, err = sqliteDB.Exec(`CREATE INDEX IF NOT EXISTS idx_s3_uploaded ON messages(s3_uploaded)`)
 	if err != nil {
@@ -289,9 +316,16 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		batchSize = options.BatchSize
 	}
 
+	root, err := os.OpenRoot(filepath.Clean(maildirPath))
+	if err != nil {
+		sqliteDB.Close()
+		return nil, fmt.Errorf("failed to open maildir: %w", err)
+	}
+
 	importer := &Importer{
 		ctx:             ctx,
 		maildirPath:     maildirPath,
+		root:            root,
 		email:           email,
 		jobs:            jobs,
 		sqliteDB:        sqliteDB,
@@ -328,6 +362,9 @@ func (i *Importer) recordFailedPath(path, reason string) {
 // Close closes the importer and its resources. The maildir database file stays on
 // disk: Run removes it for --cleanup-db, and only after an import that succeeded.
 func (i *Importer) Close() error {
+	if i.root != nil {
+		i.root.Close()
+	}
 	if i.sqliteDB != nil {
 		if err := i.sqliteDB.Close(); err != nil {
 			return fmt.Errorf("failed to close maildir database: %w", err)
@@ -366,105 +403,6 @@ func (i *Importer) finish(runErr error) {
 // PostgreSQL per round trip during orphan recovery.
 const recoveryHashBatchSize = 500
 
-// recoverOrphanedSQLiteState checks for messages marked as uploaded in SQLite
-// but not actually present in PostgreSQL. This can happen if:
-// 1. PostgreSQL commit failed after SQLite update (rare but possible)
-// 2. Previous import was interrupted between SQLite update and PG commit
-//
-// Recovery: Reset s3_uploaded=0 for messages not found in PostgreSQL
-func (i *Importer) recoverOrphanedSQLiteState() error {
-	// Get account info
-	address, err := server.NewAddress(i.email)
-	if err != nil {
-		return fmt.Errorf("invalid email: %w", err)
-	}
-
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
-	if err != nil {
-		// Account doesn't exist yet - nothing to recover
-		if errors.Is(err, consts.ErrUserNotFound) {
-			return nil
-		}
-		return fmt.Errorf("failed to get account: %w", err)
-	}
-
-	// Query SQLite for ALL messages marked as uploaded. Any row left marked
-	// uploaded is skipped forever by incremental imports, so the check must not
-	// be bounded. The cursor is drained before touching PostgreSQL because the
-	// SQLite pool holds a single connection.
-	rows, err := i.sqliteDB.Query("SELECT hash FROM messages WHERE s3_uploaded = 1")
-	if err != nil {
-		return fmt.Errorf("failed to query SQLite: %w", err)
-	}
-
-	var uploadedHashes []string
-	for rows.Next() {
-		var hash string
-		if err := rows.Scan(&hash); err != nil {
-			continue
-		}
-		uploadedHashes = append(uploadedHashes, hash)
-	}
-	rows.Close() // CRITICAL: Close rows to release SQLite connection
-
-	// Check existence in PostgreSQL in batches (one round trip per batch)
-	var orphanedHashes []string
-	for start := 0; start < len(uploadedHashes); start += recoveryHashBatchSize {
-		end := start + recoveryHashBatchSize
-		if end > len(uploadedHashes) {
-			end = len(uploadedHashes)
-		}
-		chunk := uploadedHashes[start:end]
-
-		var missing []string
-		err = i.rdb.QueryRowWithRetry(i.ctx, `
-			SELECT COALESCE(ARRAY_AGG(h), '{}')
-			FROM UNNEST($2::text[]) AS h
-			WHERE NOT EXISTS (
-				SELECT 1 FROM messages
-				WHERE account_id = $1 AND content_hash = h AND expunged_at IS NULL
-			)`, accountID, chunk).Scan(&missing)
-
-		if err != nil {
-			logger.Warn("Failed to check message existence", "count", len(chunk), "error", err)
-			continue
-		}
-
-		orphanedHashes = append(orphanedHashes, missing...)
-	}
-
-	if len(orphanedHashes) > 0 {
-		logger.Info("Found orphaned SQLite state, resetting", "count", len(orphanedHashes))
-
-		// Reset s3_uploaded for orphaned messages
-		tx, err := i.sqliteDB.Begin()
-		if err != nil {
-			return fmt.Errorf("failed to begin recovery transaction: %w", err)
-		}
-		defer tx.Rollback()
-
-		stmt, err := tx.Prepare("UPDATE messages SET s3_uploaded = 0, s3_uploaded_at = NULL WHERE hash = ?")
-		if err != nil {
-			return fmt.Errorf("failed to prepare recovery statement: %w", err)
-		}
-		defer stmt.Close()
-
-		for _, hash := range orphanedHashes {
-			if _, err := stmt.Exec(hash); err != nil {
-				logger.Warn("Failed to reset orphaned hash", "hash", shortHash(hash), "error", err)
-			}
-		}
-
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("failed to commit recovery transaction: %w", err)
-		}
-
-		logger.Info("Successfully recovered orphaned SQLite state", "recovered", len(orphanedHashes))
-	}
-
-	return nil
-}
-
 // Run starts the import process.
 func (i *Importer) Run() (err error) {
 	defer func() {
@@ -476,11 +414,17 @@ func (i *Importer) Run() (err error) {
 		i.finish(err)
 	}()
 
-	// Recovery: Check for messages marked in SQLite but not in PostgreSQL
-	// This can happen if PostgreSQL commit failed after SQLite update
+	// The account first: an import for an address without one would otherwise scan
+	// the maildir and upload every message to S3, only to fail each at its insert.
+	if err := i.lookupAccount(); err != nil {
+		return err
+	}
+
+	// Resolve the primary destination identity and recover the cache before any
+	// scan, subscription/script write, upload or message insert. An unchecked
+	// completion mark must never silently hide a message in an incremental run.
 	if err := i.recoverOrphanedSQLiteState(); err != nil {
-		logger.Warn("Failed to recover orphaned SQLite state", "error", err)
-		// Non-fatal - continue with import
+		return fmt.Errorf("failed to recover import cache: %w", err)
 	}
 
 	// Process Dovecot subscriptions if Dovecot mode is enabled
@@ -494,7 +438,16 @@ func (i *Importer) Run() (err error) {
 	// Import Sieve script if provided
 	if i.options.SievePath != "" {
 		if err := i.importSieveScript(); err != nil {
-			logger.Info("Warning: Failed to import Sieve script", "error", err)
+			// The summary says what became of the script on every path: a refused
+			// link (readSieveFile) or a database error must not pass unnoticed in
+			// a migration of many accounts, which leaves the account without its
+			// filter.
+			if i.options.DryRun {
+				i.sieveOutcome = fmt.Sprintf("would NOT be imported: %v", err)
+			} else {
+				i.sieveOutcome = fmt.Sprintf("NOT imported: %v", err)
+			}
+			logger.Warn("Failed to import Sieve script", "error", err)
 		}
 	}
 
@@ -517,14 +470,17 @@ func (i *Importer) Run() (err error) {
 	// Count messages based on mode
 	var totalCount, alreadyOnS3 int64
 	if i.options.Incremental {
-		// Incremental mode: count only NEW (not yet on S3) messages in SQLite database
-		countErr := i.sqliteDB.QueryRow("SELECT COUNT(*) FROM messages WHERE s3_uploaded = 0").Scan(&totalCount)
+		// Eligibility is destination-specific even when two imports share this cache.
+		countErr := i.sqliteDB.QueryRow("SELECT COUNT(*) FROM messages m WHERE NOT "+destinationCompletedSQL,
+			i.databaseUUID, i.user.AccountID()).Scan(&totalCount)
 		if countErr != nil {
 			return fmt.Errorf("failed to count messages in database: %w", countErr)
 		}
 
-		// Also count messages already on S3 for logging
-		i.sqliteDB.QueryRow("SELECT COUNT(*) FROM messages WHERE s3_uploaded = 1").Scan(&alreadyOnS3)
+		if err := i.sqliteDB.QueryRow("SELECT COUNT(*) FROM messages m WHERE "+destinationCompletedSQL,
+			i.databaseUUID, i.user.AccountID()).Scan(&alreadyOnS3); err != nil {
+			return fmt.Errorf("failed to count completed messages: %w", err)
+		}
 
 		// Set totalMessages to the actual count in database
 		atomic.StoreInt64(&i.totalMessages, totalCount)
@@ -576,6 +532,32 @@ func (i *Importer) Run() (err error) {
 	return nil
 }
 
+// accountLookupError is the error of a failed lookup of the account email names, for
+// `import maildir` and `import s3`. Only consts.ErrUserNotFound says the account does
+// not exist, and only then is the operator told to create it: any other error (the
+// database unreachable past the retries, an interrupt cancelling the context) is a
+// lookup that failed, for an account that may well exist.
+func accountLookupError(email string, err error) error {
+	if errors.Is(err, consts.ErrUserNotFound) {
+		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", email, err, email)
+	}
+	return fmt.Errorf("failed to look up account %s: %w", email, err)
+}
+
+// lookupAccount looks up the account the import is for and keeps it on the importer.
+func (i *Importer) lookupAccount() error {
+	address, err := server.NewAddress(i.email)
+	if err != nil {
+		return fmt.Errorf("invalid email address: %w", err)
+	}
+	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
+	if err != nil {
+		return accountLookupError(i.email, err)
+	}
+	i.user = server.NewUser(address, accountID)
+	return nil
+}
+
 // processSubscriptions reads and processes the Dovecot subscriptions file
 func (i *Importer) processSubscriptions() error {
 	subscriptionsPath := filepath.Join(i.maildirPath, "subscriptions")
@@ -589,7 +571,7 @@ func (i *Importer) processSubscriptions() error {
 	logger.Info("Processing Dovecot subscriptions", "path", subscriptionsPath)
 
 	// Read the subscriptions file
-	content, err := os.ReadFile(subscriptionsPath)
+	content, err := i.readMaildirFile(subscriptionsPath, maxDovecotSubscriptionsSize)
 	if err != nil {
 		return fmt.Errorf("failed to read subscriptions file: %w", err)
 	}
@@ -602,17 +584,7 @@ func (i *Importer) processSubscriptions() error {
 
 	logger.Info("Found subscribed folders", "count", len(folders), "folders", folders)
 
-	// Get user context for database operations
-	address, err := server.NewAddress(i.email)
-	if err != nil {
-		return fmt.Errorf("invalid email address: %w", err)
-	}
-
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
-	if err != nil {
-		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", i.email, err, i.email)
-	}
-	user := server.NewUser(address, accountID)
+	user := i.user
 
 	// Ensure default mailboxes exist first
 	if i.options.DryRun {
@@ -652,18 +624,45 @@ func (i *Importer) processSubscriptions() error {
 	return nil
 }
 
+// readSieveFile reads path through a root at its directory. The root follows a
+// symbolic link only to a file within that directory, as Pigeonhole's own
+// ~/.dovecot.sieve -> sieve/<name>.sieve; a link out of it, or an absolute one, does
+// not open. The usual --sieve file of a Dovecot migration is that link, which is the
+// user's, and the import runs with privileges the user lacks: the link must not
+// choose which file those privileges read into the user's account. Only a regular
+// file is read (openRegularFile), at most maxSieveScriptSize+1 bytes to detect an
+// oversized file without reading it whole.
+func readSieveFile(path string) ([]byte, error) {
+	path = filepath.Clean(path)
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	file, err := openRegularFile(root, filepath.Base(path))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	content, err := io.ReadAll(io.LimitReader(file, maxSieveScriptSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(content) > maxSieveScriptSize {
+		return nil, fmt.Errorf("script exceeds the maximum size of %d bytes", maxSieveScriptSize)
+	}
+	return content, nil
+}
+
 // importSieveScript imports a Sieve script file for the user
 func (i *Importer) importSieveScript() error {
-	// Check if file exists (follow symlinks if present)
-	if _, err := os.Stat(i.options.SievePath); os.IsNotExist(err) {
+	scriptContent, err := readSieveFile(i.options.SievePath)
+	if errors.Is(err, fs.ErrNotExist) {
 		logger.Info("Sieve script file does not exist - ignoring", "path", i.options.SievePath)
 		return nil
 	}
-
-	// Read the script content
-	scriptContent, err := os.ReadFile(i.options.SievePath)
 	if err != nil {
-		return fmt.Errorf("failed to read Sieve script file: %w", err)
+		return fmt.Errorf("failed to read Sieve script file %s: %w", i.options.SievePath, err)
 	}
 
 	// A script delivery cannot compile is skipped whole, so it must not become
@@ -685,17 +684,7 @@ func (i *Importer) importSieveScript() error {
 
 	logger.Info("Importing Sieve script", "path", i.options.SievePath)
 
-	// Get user context for database operations
-	address, err := server.NewAddress(i.email)
-	if err != nil {
-		return fmt.Errorf("invalid email address: %w", err)
-	}
-
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
-	if err != nil {
-		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", i.email, err, i.email)
-	}
-	user := server.NewUser(address, accountID)
+	user := i.user
 
 	scriptName := "imported"
 	if compileErr != nil {
@@ -779,7 +768,7 @@ func (i *Importer) parseDovecotKeywords() error {
 
 	logger.Info("Parsing Dovecot keywords", "path", keywordsPath)
 
-	keywords, err := parseKeywordsFile(keywordsPath)
+	keywords, err := parseKeywordsFile(keywordsPath, i.openMaildirFile)
 	if err != nil {
 		return err
 	}
@@ -800,28 +789,18 @@ func (i *Importer) parseDovecotKeywords() error {
 func (i *Importer) performDryRun() error {
 	fmt.Printf("\n=== DRY RUN: Import Analysis ===\n\n")
 
-	address, err := server.NewAddress(i.email)
-	if err != nil {
-		return fmt.Errorf("invalid email address: %w", err)
-	}
+	user := i.user
 
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
-	if err != nil {
-		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", i.email, err, i.email)
-	}
-	user := server.NewUser(address, accountID)
-
-	// Query the SQLite database for messages
-	var query string
+	// The ledger, rather than another destination's compatibility projection,
+	// determines which messages this incremental preview includes.
+	query := "SELECT path, filename, hash, size, mailbox FROM messages m"
+	var args []any
 	if i.options.Incremental {
-		// Incremental mode: only show messages not yet uploaded
-		query = "SELECT path, filename, hash, size, mailbox FROM messages WHERE s3_uploaded = 0 ORDER BY mailbox, path"
-	} else {
-		// Non-incremental mode: show all messages
-		query = "SELECT path, filename, hash, size, mailbox FROM messages ORDER BY mailbox, path"
+		query += " WHERE NOT " + destinationCompletedSQL
+		args = []any{i.databaseUUID, user.AccountID()}
 	}
-
-	rows, err := i.sqliteDB.Query(query)
+	query += " ORDER BY mailbox, path"
+	rows, err := i.sqliteDB.QueryContext(i.ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("failed to query messages from sqlite: %w", err)
 	}
@@ -831,7 +810,16 @@ func (i *Importer) performDryRun() error {
 	currentMailbox := ""
 	var mailboxWouldImport, mailboxWouldSkip int
 
+	// The current mailbox's ID in Sora, 0 while it does not exist yet.
+	var mailboxID int64
+
 	for rows.Next() {
+		// An interrupt stops the report: the messages after it are not checked, and a
+		// summary would claim they were.
+		if err := i.ctx.Err(); err != nil {
+			return fmt.Errorf("dry run interrupted: %w", err)
+		}
+
 		var path, filename, hash, mailbox string
 		var size int64
 		if err := rows.Scan(&path, &filename, &hash, &size, &mailbox); err != nil {
@@ -856,6 +844,17 @@ func (i *Importer) performDryRun() error {
 			mailboxWouldImport = 0
 			mailboxWouldSkip = 0
 			fmt.Printf("Mailbox: %s\n", mailbox)
+
+			// Look the mailbox up once (the rows come ordered by mailbox), among the
+			// account's own: the import never writes into a same-named mailbox shared
+			// with the account. Only a mailbox that does not exist yet means its
+			// messages are new; any other error leaves them unchecked.
+			mailboxID, err = i.rdb.GetOwnedMailboxIDByNameWithRetry(i.ctx, user.AccountID(), mailbox)
+			if errors.Is(err, consts.ErrMailboxNotFound) {
+				mailboxID = 0
+			} else if err != nil {
+				return fmt.Errorf("dry run: failed to look up mailbox %q: %w", mailbox, err)
+			}
 		}
 
 		// Check date filter if specified
@@ -865,16 +864,11 @@ func (i *Importer) performDryRun() error {
 			continue
 		}
 
-		// Check if message already exists in Sora, in the account's own mailbox of that
-		// name: the import never writes into a same-named mailbox shared with the account.
-		mailboxID, err := i.rdb.GetOwnedMailboxIDByNameWithRetry(i.ctx, user.AccountID(), mailbox)
+		// Check if message already exists in Sora
 		var alreadyExists bool
-		if err == nil {
-			if !i.options.ForceReimport {
-				alreadyExists, err = i.isMessageAlreadyImported(hash, mailboxID)
-				if err != nil {
-					logger.Info("Error checking if message exists", "error", err)
-				}
+		if mailboxID != 0 {
+			if alreadyExists, err = i.isMessageAlreadyImported(hash, mailboxID); err != nil {
+				return fmt.Errorf("dry run: %s in %s: %w", filename, mailbox, err)
 			}
 		}
 
@@ -882,16 +876,9 @@ func (i *Importer) performDryRun() error {
 		reason := "new message"
 
 		if alreadyExists {
-			if i.options.ForceReimport {
-				action = "REIMPORT"
-				reason = "force reimport enabled"
-			} else {
-				action = "SKIP"
-				reason = "already exists in Sora"
-				mailboxWouldSkip++
-				totalWouldSkip++
-				continue
-			}
+			mailboxWouldSkip++
+			totalWouldSkip++
+			continue
 		}
 
 		mailboxWouldImport++
@@ -907,7 +894,7 @@ func (i *Importer) performDryRun() error {
 
 		// Try to get subject from the first KB of the message, decompressed as the
 		// import reads it
-		if head := messageHead(path, 1024); head != "" {
+		if head := i.messageHead(path, 1024); head != "" {
 			// Simple subject extraction
 			if idx := strings.Index(strings.ToLower(head), "subject:"); idx != -1 {
 				subjectLine := head[idx+8:]
@@ -946,6 +933,9 @@ func (i *Importer) performDryRun() error {
 		}
 
 		fmt.Println()
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read messages from sqlite: %w", err)
 	}
 
 	// Print summary for last mailbox
@@ -1040,21 +1030,25 @@ func importSizeLimit(maxSize int64, compressed bool) int64 {
 	return limit
 }
 
-// hashFile returns the content hash (helpers.HashContent) and size of the message in a
-// maildir file, decompressing it the way the upload does. It streams the file, so the
-// scan never holds a whole message in memory.
+// hashMaildirFile is hashMessageFile of the maildir file at path (openMaildirFile).
+func (i *Importer) hashMaildirFile(path string) (string, int64, error) {
+	file, err := i.openMaildirFile(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer file.Close()
+	return hashMessageFile(file, i.options.MaxMessageSize)
+}
+
+// hashMessageFile returns the content hash (helpers.HashContent) and size of the
+// message in a maildir file, decompressing it the way the upload does. It streams the
+// file, so the scan never holds a whole message in memory.
 //
 // It reads no more of the message than the import takes (importSizeLimit). Past that
 // it fails with errMessageTooLarge without reading the rest: a compressed file of a
 // few hundred bytes can expand to gigabytes, and hashing all of it only to refuse it
 // afterwards keeps a scan worker busy for as long as that takes.
-func hashFile(path string, maxSize int64) (string, int64, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", 0, err
-	}
-	defer file.Close()
-
+func hashMessageFile(file *os.File, maxSize int64) (string, int64, error) {
 	reader, compressed, err := maildirContentReader(file)
 	if err != nil {
 		return "", 0, err
@@ -1076,11 +1070,11 @@ func hashFile(path string, maxSize int64) (string, int64, error) {
 	return hex.EncodeToString(hasher.Sum(nil)), size, nil
 }
 
-// messageHead returns up to n bytes from the start of the message in a maildir file,
-// decompressed as the import reads it (maildirContentReader), or "" when the file cannot
-// be read.
-func messageHead(path string, n int) string {
-	file, err := os.Open(path)
+// messageHead returns up to n bytes from the start of the message in a maildir file
+// (openMaildirFile), decompressed as the import reads it (maildirContentReader), or ""
+// when the file cannot be read.
+func (i *Importer) messageHead(path string, n int) string {
+	file, err := i.openMaildirFile(path)
 	if err != nil {
 		return ""
 	}
@@ -1120,29 +1114,67 @@ func (i *Importer) resolveMailboxName(path string) (string, error) {
 	}
 	// Folders are named Maildir++ style (".Sent", ".Work.Projects") or without the
 	// leading dot ("Sent"): drop the dot, then turn the maildir separator (.) into
-	// the IMAP one (/).
+	// the IMAP one (/). importedFolderName restores escaped characters after that
+	// split, so an escaped '.' ("v1\2e2", as the exporter writes "v1.2") stays in its
+	// level.
 	return importedFolderName(strings.ReplaceAll(strings.TrimPrefix(relPath, "."), ".", "/"))
 }
 
+// unescapeMaildirLevel restores the characters of one level of a folder name (a
+// directory's or a subscription's) escaped with maildirEscapeChar, before the level
+// is decoded from modified UTF-7, as
+// Dovecot's mailbox_list_unescape_name_params does. Only a printable US-ASCII
+// character is restored: escaping only ever applies to those, and a mailbox name
+// must not gain a control character or a byte of invalid UTF-8 from a directory
+// name. Any other escape character is kept as it is.
+func unescapeMaildirLevel(level string) string {
+	if strings.IndexByte(level, maildirEscapeChar) < 0 {
+		return level
+	}
+	var b strings.Builder
+	for n := 0; n < len(level); n++ {
+		if level[n] == maildirEscapeChar && n+2 < len(level) {
+			if v, err := hex.DecodeString(level[n+1 : n+3]); err == nil && v[0] >= 0x20 && v[0] <= 0x7e {
+				b.WriteByte(v[0])
+				n += 2
+				continue
+			}
+		}
+		b.WriteByte(level[n])
+	}
+	return b.String()
+}
+
 // importedFolderName is the Sora mailbox name for a folder name read from a maildir,
-// its levels already separated by '/': modified UTF-7 decoded (Dovecot's encoding of
-// non-ASCII names), trimmed, and special folders mapped. A name with TAB, CR or LF is
-// refused. Folders and the subscriptions file are both named through it, so a
-// subscription names the mailbox the folder's messages went to.
+// its levels already separated by '/': in each level the escaped characters restored
+// (unescapeMaildirLevel) and then modified UTF-7 decoded (Dovecot's encoding of
+// non-ASCII names), as Dovecot's mailbox_list_default_get_vname_part turns a storage
+// name into a mailbox name; then trimmed, and special folders mapped. A name with TAB,
+// CR or LF is refused. Folders and the subscriptions file are both named through it,
+// as Dovecot names both by the storage name, so a subscription names the mailbox the
+// folder's messages went to.
 //
 // Each level is decoded on its own, and one that is not valid modified UTF-7 keeps
 // its raw name. The levels above it still decode as the parent folders' own names
 // did, so the mailbox stays below them instead of below a raw-named copy of them.
 func importedFolderName(name string) (string, error) {
-	if strings.Contains(name, "&") {
+	if strings.ContainsAny(name, "&"+string(maildirEscapeChar)) {
 		delim := string(consts.MailboxDelimiter)
 		levels := strings.Split(name, delim)
 		for i, level := range levels {
+			level = unescapeMaildirLevel(level)
 			if decoded, err := helpers.DecodeModifiedUTF7(level); err != nil {
 				logger.Warn("Failed to decode Modified UTF-7 mailbox name level, using raw level", "name", name, "mailbox_level", level, "error", err)
 			} else {
-				levels[i] = decoded
+				level = decoded
 			}
+			// A storage escape must not introduce hierarchy. Dovecot can escape a
+			// visible separator inside one level; Sora uses '/' as its hierarchy
+			// delimiter and cannot represent that literal character in a level.
+			if strings.Contains(level, delim) {
+				return "", fmt.Errorf("hierarchy delimiter in escaped mailbox level %q", level)
+			}
+			levels[i] = level
 		}
 		name = strings.Join(levels, delim)
 	}
@@ -1153,7 +1185,11 @@ func importedFolderName(name string) (string, error) {
 	if name == "" {
 		return "", errors.New("empty mailbox name")
 	}
-	return specialFolderName(name), nil
+	name = specialFolderName(name)
+	if !helpers.MailboxNameValid(name) {
+		return "", fmt.Errorf("invalid mailbox name %q", name)
+	}
+	return name, nil
 }
 
 // specialFolderName maps the names other mail systems give their special folders
@@ -1281,6 +1317,320 @@ func (i *Importer) isMessageAlreadyImported(hash string, mailboxID int64) (bool,
 	return count > 0, nil
 }
 
+// openMaildirFile opens path, a file below the maildir (as the scan names it, or as the
+// import cache holds it), through the maildir root. The root follows a symbolic link
+// only to a file below it: a link pointing out of the maildir, or an absolute one, does
+// not open, wherever it is in the path (a cur/ or new/ directory as well as a message
+// or metadata file) and however it changes while the import runs. The maildir may have
+// been written by its owner, and the import runs with privileges the owner lacks: a
+// link must not choose which files those privileges read into the owner's mailbox.
+// Folders that are links are not walked at all (scanMaildir). Only a regular file
+// opens (openRegularFile).
+func (i *Importer) openMaildirFile(path string) (*os.File, error) {
+	name, err := i.maildirName(path)
+	if err != nil {
+		return nil, err
+	}
+	return openRegularFile(i.root, name)
+}
+
+// readMaildirFile is os.ReadFile through the maildir root (openMaildirFile), for a
+// file of at most limit bytes (readFileUpTo).
+func (i *Importer) readMaildirFile(path string, limit int64) ([]byte, error) {
+	file, err := i.openMaildirFile(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return readFileUpTo(file, limit)
+}
+
+// maxDovecotKeywordsSize and maxDovecotSubscriptionsSize are the most of a
+// dovecot-keywords and a subscriptions file the import and the export read. Whoever
+// can write to the maildir, or to the export's destination, decides their size, and a
+// sparse file costs them no disk: read whole, a huge one would exhaust the memory of
+// the host running sora-admin. These are resource limits for metadata reads. Ordinary
+// Dovecot-generated keywords use at most 26 lines, with a 1 KiB reader line bound
+// (maildir-keywords.c); subscriptions use one line per subscribed folder.
+const (
+	maxDovecotKeywordsSize      = 64 << 10 // 64 KiB
+	maxDovecotSubscriptionsSize = 4 << 20  // 4 MiB
+)
+
+// readFileUpTo reads file to its end, which must come within limit bytes: a larger
+// file is refused, naming it, after reading limit+1 bytes of it, however large it is
+// or grows.
+func readFileUpTo(file *os.File, limit int64) ([]byte, error) {
+	content, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(content)) > limit {
+		return nil, fmt.Errorf("%s is larger than %d bytes", file.Name(), limit)
+	}
+	return content, nil
+}
+
+// errNotRegularFile refuses a file the import would read that is a FIFO, a socket or
+// a device.
+var errNotRegularFile = errors.New("not a regular file")
+
+// errAnotherUsersFile refuses a file the import would read that whoever named it may
+// not have been able to read (checkNamedByOwner).
+var errAnotherUsersFile = errors.New("may be another user's file")
+
+// fileUID returns the user that owns the file info describes. It is a variable so that
+// a test can make a file appear to belong to another user, which only root can arrange.
+var fileUID = func(info fs.FileInfo) uint32 { return info.Sys().(*syscall.Stat_t).Uid }
+
+// openRegularFile opens name below root if it is regular and passes the Unix
+// owner-directory check below. It fails with errNotRegularFile or
+// errAnotherUsersFile otherwise. The files the import reads may have been written by their owner, who can
+// make one a FIFO (mkfifo; rsync -a copies them), and opening a FIFO for reading waits
+// until something opens it for writing: the run would never finish, and cancelling it
+// would not end the wait. The file is opened with O_NONBLOCK to avoid that FIFO writer
+// wait, and the open file is checked, so a file replaced since a stat or directory
+// listing cannot get past the check. A regular file is then read in blocking mode, as
+// os.Open reads it.
+//
+// The owner can also make a name a hard link, which root cannot tell from the file's
+// first name, to a file elsewhere on the same file system, one they cannot read where
+// the system lets them link it (BSD and macOS do, as Linux does with
+// fs.protected_hardlinks = 0). The import runs with privileges the owner lacks, so any
+// file without read bits set in all three Unix DAC classes (0o444) must pass
+// checkNamedByOwner; Unix evaluates owner, group, and other classes in
+// first-match order, so 0o004 alone (e.g. 0604 or 0044) still denies group members or
+// the owner. A link count is no test: Dovecot copies a message between folders as a
+// hard link (maildir_copy_with_hardlinks), and cp -al backups link every file.
+func openRegularFile(root *os.Root, name string) (*os.File, error) {
+	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err == nil && !info.Mode().IsRegular() {
+		err = &fs.PathError{Op: "open", Path: name, Err: errNotRegularFile}
+	}
+	if err == nil && info.Mode().Perm()&0o444 != 0o444 {
+		err = checkNamedByOwner(root, name, info)
+	}
+	if err == nil {
+		var conn syscall.RawConn
+		if conn, err = file.SyscallConn(); err == nil {
+			cerr := conn.Control(func(fd uintptr) { err = syscall.SetNonblock(int(fd), false) })
+			if cerr != nil {
+				err = cerr
+			}
+		}
+	}
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+// checkNamedByOwner refuses info, the file openRegularFile opened as name below root,
+// with errAnotherUsersFile unless the directory that actually holds the resolved file
+// belongs to the file's owner, grants neither group nor other write access (0o022 == 0),
+// and (for non-root owners) info grants owner read access (0o400). Group members with
+// write access can also add a name, including a hard link. This checks Unix UID and
+// mode bits, not access granted through filesystem ACLs.
+//
+// The root's own owner says nothing: --maildir-path, or the --sieve file's directory,
+// may be a link the user made to a directory of root's that anyone may write into
+// (/tmp), and a maildir extracted as root into a directory root made keeps its owner's
+// files below it. Components are walked from root by descriptor (Lstat, Readlink,
+// OpenRoot), requiring the final entry to be the file opened so a directory or entry
+// replaced meanwhile cannot vouch for it. Any symbolic link along the path must stay
+// strictly below the directory holding that link (no absolute or .. segments), live in
+// a directory without group or other write access, and belong (together with its
+// directory) to root or to the file's owner — allowing Pigeonhole's
+// ~/.dovecot.sieve -> sieve/<name>.sieve under either a user-owned or root-owned home
+// directory while checking the target sieve/ directory itself.
+func checkNamedByOwner(root *os.Root, name string, info fs.FileInfo) error {
+	refuse := func(reason string) error {
+		return &fs.PathError{
+			Op:   "open",
+			Path: name,
+			Err:  fmt.Errorf("%w: %s, and not everyone may read it", errAnotherUsersFile, reason),
+		}
+	}
+	unwrap := func(err error) error {
+		if cause := errors.Unwrap(err); cause != nil {
+			return cause
+		}
+		return err
+	}
+
+	clean := filepath.Clean(name)
+	if !filepath.IsLocal(clean) || clean == "." {
+		return refuse("it is not found below the directory that holds its name")
+	}
+	sep := string(filepath.Separator)
+	parts := strings.Split(clean, sep)
+
+	curDir := root
+	ownCur := false
+	defer func() {
+		if ownCur {
+			curDir.Close()
+		}
+	}()
+
+	const maxSymlinks = 8
+	uid := fileUID(info)
+	symlinks := 0
+	followedLink := false
+
+	for len(parts) > 0 {
+		curDirInfo, err := curDir.Stat(".")
+		if err != nil {
+			return err
+		}
+		seg, rest := parts[0], parts[1:]
+		linfo, err := curDir.Lstat(seg)
+		if err != nil {
+			return refuse(fmt.Sprintf("it is not found below the directory that holds its name (%v)", unwrap(err)))
+		}
+
+		if linfo.Mode()&fs.ModeSymlink != 0 {
+			symlinks++
+			if symlinks > maxSymlinks {
+				return refuse("too many symbolic links hold its name")
+			}
+			if curDirInfo.Mode().Perm()&0o022 != 0 {
+				return refuse("group or others may write into the directory that holds it")
+			}
+			target, err := curDir.Readlink(seg)
+			if err != nil {
+				return refuse(fmt.Sprintf("it is not found below the directory that holds its name (%v)", unwrap(err)))
+			}
+			if target == "" || strings.HasPrefix(target, sep) {
+				return refuse("it is not found below the directory that holds its name")
+			}
+			rawTarget := strings.Split(target, sep)
+			targetParts := make([]string, 0, len(rawTarget))
+			for _, p := range rawTarget {
+				switch p {
+				case "", ".":
+					continue
+				case "..":
+					return refuse("it is not found below the directory that holds its name")
+				default:
+					targetParts = append(targetParts, p)
+				}
+			}
+			if len(targetParts) == 0 {
+				return refuse("it is not found below the directory that holds its name")
+			}
+			if dirUID := fileUID(curDirInfo); dirUID != 0 && dirUID != uid {
+				return refuse(fmt.Sprintf("it belongs to uid %d, the directory that holds its link to uid %d", uid, dirUID))
+			}
+			if linkUID := fileUID(linfo); linkUID != 0 && linkUID != uid {
+				return refuse(fmt.Sprintf("it belongs to uid %d, the link that names it to uid %d", uid, linkUID))
+			}
+			parts = append(targetParts, rest...)
+			followedLink = true
+			continue
+		}
+
+		if len(rest) == 0 {
+			switch {
+			case !os.SameFile(linfo, info):
+				return refuse("it was replaced while it was opened")
+			case curDirInfo.Mode().Perm()&0o022 != 0:
+				return refuse("group or others may write into the directory that holds it")
+			case uid != fileUID(curDirInfo):
+				return refuse(fmt.Sprintf("it belongs to uid %d, the directory that holds it to uid %d", uid, fileUID(curDirInfo)))
+			case uid != 0 && info.Mode().Perm()&0o400 == 0:
+				return refuse("its owner may not read it")
+			default:
+				return nil
+			}
+		}
+
+		if !linfo.IsDir() {
+			return refuse("it was replaced while it was opened")
+		}
+		if followedLink {
+			if curDirInfo.Mode().Perm()&0o022 != 0 {
+				return refuse("group or others may write into the directory that holds it")
+			}
+			if dirUID := fileUID(curDirInfo); dirUID != 0 && dirUID != uid {
+				return refuse(fmt.Sprintf("it belongs to uid %d, a directory on its link path to uid %d", uid, dirUID))
+			}
+		}
+		nextDir, err := curDir.OpenRoot(seg)
+		if err != nil {
+			return refuse(fmt.Sprintf("it is not found below the directory that holds its name (%v)", unwrap(err)))
+		}
+		nextInfo, err := nextDir.Stat(".")
+		if err != nil {
+			nextDir.Close()
+			return err
+		}
+		if !os.SameFile(linfo, nextInfo) {
+			nextDir.Close()
+			return refuse("it was replaced while it was opened")
+		}
+		if ownCur {
+			curDir.Close()
+		}
+		curDir = nextDir
+		ownCur = true
+		parts = rest
+	}
+	return refuse("it was replaced while it was opened")
+}
+
+// readMaildirDir is os.ReadDir through the maildir root (openMaildirFile). Only a
+// directory opens: with O_DIRECTORY anything else fails before it is opened, so a
+// FIFO does not wait for a writer (openRegularFile).
+func (i *Importer) readMaildirDir(path string) ([]os.DirEntry, error) {
+	name, err := i.maildirName(path)
+	if err != nil {
+		return nil, err
+	}
+	dir, err := i.root.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	entries, err := dir.ReadDir(-1)
+	slices.SortFunc(entries, func(a, b os.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+	return entries, err
+}
+
+// maildirName returns the name of path below the maildir root. A path the cache holds
+// from a run given another spelling of the maildir (a link to it, or the directory a
+// link names) is named by its resolved directory; the root still decides what the name
+// reaches.
+func (i *Importer) maildirName(path string) (string, error) {
+	if name, err := filepath.Rel(filepath.Clean(i.maildirPath), path); err == nil && filepath.IsLocal(name) {
+		return name, nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err != nil {
+		return "", err
+	}
+	root, err := filepath.Abs(i.maildirPath)
+	if err == nil {
+		root, err = filepath.EvalSymlinks(root)
+	}
+	if err != nil {
+		return "", err
+	}
+	if name, err := filepath.Rel(root, filepath.Join(dir, filepath.Base(abs))); err == nil && filepath.IsLocal(name) {
+		return name, nil
+	}
+	return "", fmt.Errorf("%s is not below the maildir %s", path, i.maildirPath)
+}
+
 // isMaildirFolder checks if a directory is a valid maildir folder.
 func isMaildirFolder(path string) bool {
 	// A maildir folder is one that holds messages: cur/ or new/. tmp/ is where a
@@ -1295,6 +1645,16 @@ func isMaildirFolder(path string) bool {
 		logger.Info("Maildir folder has no tmp/ directory; importing it anyway", "path", path)
 	}
 	return true
+}
+
+// isMaildirMessageDir reports whether name is one of a maildir folder's message
+// directories, which hold message files and never a folder.
+func isMaildirMessageDir(name string) bool {
+	switch name {
+	case "cur", "new", "tmp":
+		return true
+	}
+	return false
 }
 
 // fileToProcess is a struct to send file info to worker goroutines for processing.
@@ -1342,19 +1702,32 @@ func (i *Importer) scanMaildir() error {
 		return fmt.Errorf("path '%s' is not a valid maildir root (must contain cur/ or new/)", cleanPath)
 	}
 
+	// The walk lstats its root and never follows a symbolic link, so a path that is a
+	// link to a maildir (accepted above: isMaildirFolder stats through it) was walked
+	// as a file and the run imported nothing. The walk starts at the directory the
+	// path names and reports every path below the path given, which mailbox names,
+	// keywords and uidlists are resolved against.
+	walkRoot, err := filepath.EvalSymlinks(cleanPath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve maildir path %s: %w", cleanPath, err)
+	}
+
 	// --- Parallel Processing Setup ---
 	var wg sync.WaitGroup
-	// This channel will be used by the producer (filepath.Walk) to send files to consumers (workers).
+	// This channel will be used by the producer (the walk) to send files to consumers (workers).
 	filesToProcess := make(chan fileToProcess, i.jobs*10) // Buffered channel
 
 	var refusedMu sync.Mutex
 	refusedFiles := make(map[maildirFileKey]struct{})
-	// Refusals apply only to this run. Deleting a prior cache row would also lose
-	// a successful legacy import's SHA-256 identity and duplicate it under BLAKE3
-	// if a later run raises the limit again.
-	refuse := func(file fileToProcess, err error) {
-		logger.Warn("Invalid message", "path", file.path, "error", err)
-		i.recordFailedPath(file.path, fmt.Sprintf("invalid message: %v", err))
+	// refuse reports a file the scan drops, once, and leaves it out of this run's
+	// import: a cache row an earlier run left for it would otherwise be read again
+	// and the file reported a second time. Refusals apply only to this run.
+	// Deleting a prior cache row would also lose a successful legacy import's
+	// SHA-256 identity and duplicate it under BLAKE3 if a later run raises the limit
+	// again.
+	refuse := func(file fileToProcess, reason string) {
+		logger.Warn("Refusing message", "path", file.path, "reason", reason)
+		i.recordFailedPath(file.path, reason)
 		atomic.AddInt64(&i.failedMessages, 1)
 		refusedMu.Lock()
 		refusedFiles[maildirFileKey{file.filename, file.mailboxName}] = struct{}{}
@@ -1367,24 +1740,27 @@ func (i *Importer) scanMaildir() error {
 		go func() {
 			defer wg.Done()
 			for file := range filesToProcess {
+				if i.isSharedNamespaceRoot(file.mailboxName) {
+					refuse(file, fmt.Sprintf("folder maps to the shared namespace root %q, which holds no messages; import it under another name", file.mailboxName))
+					continue
+				}
+
 				// Use streaming hash function
 				// Every file the scan drops is reported by path at the end: a message that
 				// never reaches the cache is otherwise invisible to every later count.
-				hash, size, err := hashFile(file.path, i.options.MaxMessageSize)
+				hash, size, err := i.hashMaildirFile(file.path)
 				if errors.Is(err, errMessageTooLarge) {
-					refuse(file, err)
+					refuse(file, fmt.Sprintf("invalid message: %v", err))
 					continue
 				}
 				if err != nil {
-					logger.Warn("Failed to hash file", "path", file.path, "error", err)
-					i.recordFailedPath(file.path, fmt.Sprintf("read/hash error: %v", err))
-					atomic.AddInt64(&i.failedMessages, 1)
+					refuse(file, fmt.Sprintf("read/hash error: %v", err))
 					continue
 				}
 
 				// Validate message
 				if err := i.validateMessage(size); err != nil {
-					refuse(file, err)
+					refuse(file, fmt.Sprintf("invalid message: %v", err))
 					continue
 				}
 
@@ -1394,9 +1770,7 @@ func (i *Importer) scanMaildir() error {
 				_, err = i.sqliteDB.Exec("INSERT OR IGNORE INTO messages (path, filename, hash, size, mailbox) VALUES (?, ?, ?, ?, ?)",
 					file.path, file.filename, hash, size, file.mailboxName)
 				if err != nil {
-					logger.Warn("Failed to insert message into sqlite db", "path", file.path, "error", err)
-					i.recordFailedPath(file.path, fmt.Sprintf("cache insert error: %v", err))
-					atomic.AddInt64(&i.failedMessages, 1)
+					refuse(file, fmt.Sprintf("cache insert error: %v", err))
 					continue
 				}
 			}
@@ -1408,7 +1782,13 @@ func (i *Importer) scanMaildir() error {
 	if i.options.PathsFile != "" {
 		walkErr = i.processPathsFile(cleanPath, filesToProcess)
 	} else {
-		walkErr = filepath.Walk(cleanPath, func(path string, info os.FileInfo, err error) error {
+		// filepath.WalkDir lists a directory through an O_DIRECTORY open (os.ReadDir),
+		// which fails on anything else before opening it. filepath.Walk opened a folder
+		// it had lstatted with a blocking open, and the maildir's owner can swap the
+		// folder for a FIFO in between with one rename: the open waited for a writer
+		// and the scan never returned. A folder swapped away is a scan error, as any
+		// folder that cannot be listed is.
+		walkErr = filepath.WalkDir(walkRoot, func(walked string, entry fs.DirEntry, err error) error {
 			select {
 			case <-i.ctx.Done():
 				return i.ctx.Err() // Stop walking if context is cancelled.
@@ -1417,9 +1797,38 @@ func (i *Importer) scanMaildir() error {
 			if err != nil {
 				return err
 			}
+			rel, err := filepath.Rel(walkRoot, walked)
+			if err != nil {
+				return fmt.Errorf("could not get relative path for %s: %w", walked, err)
+			}
+			path := filepath.Join(cleanPath, rel)
+
+			// A folder below the root that is a symbolic link is not followed either: a
+			// link to a folder of the same maildir is an alias (dsync skips those too),
+			// and one pointing elsewhere would have the import read outside the path it
+			// was given. It is named, so its mail is never left out without a word; so is
+			// a link whose target cannot be read (a volume that is not mounted), which
+			// may be a folder too. cur/, new/ and tmp/ and the message files in them are
+			// not folders: they are read through the maildir root (openMaildirFile),
+			// which follows a link only within the maildir. A cur/ or new/ it does not
+			// read is named below, and a message file it does not read is refused by path.
+			if entry.Type()&os.ModeSymlink != 0 {
+				parent := filepath.Dir(walked)
+				// The root itself may be named cur, new or tmp; only a message
+				// directory below it makes this entry a message rather than a folder.
+				inMessageDir := parent != walkRoot && isMaildirMessageDir(filepath.Base(parent))
+				if !isMaildirMessageDir(entry.Name()) && !inMessageDir {
+					if target, statErr := os.Stat(walked); statErr != nil {
+						logger.Warn("Skipping maildir entry: it is a symbolic link whose target cannot be read", "path", path, "error", statErr)
+					} else if target.IsDir() {
+						logger.Warn("Skipping maildir folder: it is a symbolic link, which the import does not follow", "path", path)
+					}
+				}
+				return nil
+			}
 
 			// We are looking for directories that are maildir folders.
-			if !info.IsDir() {
+			if !entry.IsDir() {
 				return nil
 			}
 
@@ -1459,30 +1868,43 @@ func (i *Importer) scanMaildir() error {
 			// This is a maildir folder, process the messages within it.
 			// Only scan 'cur' and 'new' directories (skip 'tmp' as it contains incomplete messages)
 			for _, subDir := range []string{"cur", "new"} {
-				messages, err := os.ReadDir(filepath.Join(path, subDir))
-				if err != nil {
+				messages, err := i.readMaildirDir(filepath.Join(path, subDir))
+				if os.IsNotExist(err) {
+					// A folder may hold only one of cur/ and new/ (isMaildirFolder).
 					logger.Info("Failed to read directory", "path", filepath.Join(path, subDir), "error", err)
+					continue
+				}
+				if err != nil {
+					// One that exists and is not read (a link out of the maildir, no
+					// permission) leaves its messages out of the import: name it.
+					logger.Warn("Skipping maildir message directory: it cannot be read", "path", filepath.Join(path, subDir), "error", err)
 					continue
 				}
 
 				for _, message := range messages {
-					if message.IsDir() {
+					if message.IsDir() || !isValidMaildirMessage(message.Name()) {
 						continue
 					}
 
-					if isValidMaildirMessage(message.Name()) {
-						filesToProcess <- fileToProcess{
-							path:        filepath.Join(path, subDir, message.Name()),
-							filename:    message.Name(),
-							mailboxName: mailboxName,
-						}
+					file := fileToProcess{
+						path:        filepath.Join(path, subDir, message.Name()),
+						filename:    message.Name(),
+						mailboxName: mailboxName,
 					}
+					// A FIFO, socket or device is refused without being opened, as
+					// opening one may act on the device. A symbolic link is opened,
+					// which refuses it unless it names a regular file (openMaildirFile).
+					if typ := message.Type(); typ&os.ModeSymlink == 0 && !typ.IsRegular() {
+						refuse(file, errNotRegularFile.Error())
+						continue
+					}
+					filesToProcess <- file
 				}
 			}
 
 			// Parse dovecot-uidlist if preserving UIDs
 			if i.options.PreserveUIDs {
-				uidList, err := ParseDovecotUIDList(path)
+				uidList, err := parseDovecotUIDListFile(i.openMaildirFile(filepath.Join(path, "dovecot-uidlist")))
 				if err != nil {
 					logger.Info("Warning: Failed to parse dovecot-uidlist", "path", path, "error", err)
 				} else if uidList != nil {
@@ -1509,16 +1931,7 @@ func (i *Importer) scanMaildir() error {
 
 // syncMailboxState ensures mailboxes exist and have correct UIDVALIDITY
 func (i *Importer) syncMailboxState() error {
-	address, err := server.NewAddress(i.email)
-	if err != nil {
-		return fmt.Errorf("invalid email: %w", err)
-	}
-
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
-	if err != nil {
-		return fmt.Errorf("failed to get account: %w", err)
-	}
-	user := server.NewUser(address, accountID)
+	user := i.user
 
 	for path, uidList := range i.dovecotUIDLists {
 		if uidList == nil {
@@ -1531,7 +1944,7 @@ func (i *Importer) syncMailboxState() error {
 			continue
 		}
 
-		if !i.shouldImportMailbox(mailboxName) {
+		if !i.shouldImportMailbox(mailboxName) || i.isSharedNamespaceRoot(mailboxName) {
 			continue
 		}
 
@@ -1640,7 +2053,7 @@ func (i *Importer) findMovedFile(originalPath string) (string, bool) {
 	}
 	prefix := parts[0] + ":2,"
 
-	entries, err := os.ReadDir(dir)
+	entries, err := i.readMaildirDir(dir)
 	if err != nil {
 		return "", false
 	}
@@ -1680,6 +2093,18 @@ func (i *Importer) shouldSkipMessage(path string) bool {
 	return false
 }
 
+// isSharedNamespaceRoot reports whether mailboxName is the shared namespace root
+// ("Shared" for "Shared/") while sharing is enabled. The root is a container: IMAP
+// refuses to CREATE or SELECT it, so messages imported into it could not be read, and
+// as a shared mailbox it cannot be renamed out of the namespace to reach them. The scan
+// refuses the messages of such a folder; the root itself is still created as the
+// parent of the folders below it.
+func (i *Importer) isSharedNamespaceRoot(mailboxName string) bool {
+	shared := i.options.SharedMailboxes
+	return shared.Enabled &&
+		strings.EqualFold(mailboxName, strings.TrimSuffix(shared.NamespacePrefix, string(consts.MailboxDelimiter)))
+}
+
 // getOrCreateMailbox returns cached mailbox or fetches/creates it
 func (i *Importer) getOrCreateMailbox(ctx context.Context, AccountID int64, name string) (*db.DBMailbox, error) {
 	// First, check with a read lock for high concurrency
@@ -1701,6 +2126,11 @@ func (i *Importer) getOrCreateMailbox(ctx context.Context, AccountID int64, name
 
 	// Still not there, so we are responsible for creating it
 	// This single call handles both getting and creating, avoiding a redundant lookup.
+	// With the shared mailbox config in the context, a name in the shared namespace
+	// (and each missing level above it) becomes a shared mailbox the account owns, as
+	// `sora-admin mailbox create` makes it; without it, a personal mailbox in the
+	// shared namespace, which IMAP then cannot share.
+	ctx = context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: i.options.SharedMailboxes})
 	mailbox, err := i.rdb.GetOrCreateMailboxByNameWithRetry(ctx, AccountID, name)
 
 	if err == nil {
@@ -1809,19 +2239,24 @@ func (z *maildirZstdReader) Close() error {
 // compression bomb cannot exhaust memory in the upload or keep the scan busy.
 const maxDecompressedSize = 256 << 20 // 256 MiB
 
-// readMessage returns the message in a maildir file, decompressed as hashFile reads it
-// (maildirContentReader). Like hashFile it reads no more of the message than the import
-// takes (importSizeLimit), and past that fails with errMessageTooLarge without reading
-// the rest: the file may have grown since the scan sized it, or this run's scan may not
-// have visited it (--paths-file), so only what is read now can decide, and refusing it
-// must not cost memory in proportion to the file.
-func readMessage(path string, maxSize int64) ([]byte, error) {
-	file, err := os.Open(path)
+// readMaildirMessage is readMessageFile of the maildir file at path (openMaildirFile).
+func (i *Importer) readMaildirMessage(path string) ([]byte, error) {
+	file, err := i.openMaildirFile(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
+	return readMessageFile(file, i.options.MaxMessageSize)
+}
 
+// readMessageFile returns the message in a maildir file, decompressed as
+// hashMessageFile reads it (maildirContentReader). Like hashMessageFile it reads no
+// more of the message than the import takes (importSizeLimit), and past that fails
+// with errMessageTooLarge without reading the rest: the file may have grown since the
+// scan sized it, or this run's scan may not have visited it (--paths-file), so only
+// what is read now can decide, and refusing it must not cost memory in proportion to
+// the file.
+func readMessageFile(file *os.File, maxSize int64) ([]byte, error) {
 	reader, compressed, err := maildirContentReader(file)
 	if err != nil {
 		return nil, err
@@ -1868,7 +2303,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
+	sentDate, sentDateUnknownZone, _ := helpers.ParseDateHeaderWithZone(mailHeader.Get("Date"))
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
 
@@ -1879,7 +2314,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		references = nil
 	}
 
-	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(content))
+	bodyStructure := helpers.ExtractBodyStructure(bytes.NewReader(content))
 
 	// Validate body structure and use fallback if invalid (e.g., multipart with no children)
 	if err := helpers.ValidateBodyStructure(&bodyStructure); err != nil {
@@ -1934,6 +2369,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		subject:              subject,
 		plaintextBody:        plaintextBody,
 		sentDate:             sentDate,
+		sentDateUnknownZone:  sentDateUnknownZone,
 		internalDate:         maildirInternalDate(filename, path, sentDate),
 		inReplyTo:            inReplyTo,
 		references:           references,
@@ -1971,13 +2407,22 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 			default:
 			}
 
+			// --delay waits before each message, independently in each worker.
+			if i.options.ImportDelay > 0 {
+				select {
+				case <-i.ctx.Done():
+					return
+				case <-time.After(i.options.ImportDelay):
+				}
+			}
+
 			// Read the message, decompressed if Dovecot stored the file compressed.
 			// The scan's size check does not cover these bytes: the row may be one an
 			// earlier run cached under a higher limit, for a file this scan did not
 			// visit (--paths-file), and the file may have changed since the scan. The
 			// cached size may be stale for the same reasons, so the check is on what
-			// would be stored, which readMessage reads no more of than the limit.
-			content, err := readMessage(msg.path, i.options.MaxMessageSize)
+			// would be stored, which readMaildirMessage reads no more of than the limit.
+			content, err := i.readMaildirMessage(msg.path)
 			if os.IsNotExist(err) {
 				// If file not found, it might have been renamed (e.g. flags changed)
 				// Try to find it by unique ID prefix
@@ -1985,7 +2430,7 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 					logger.Info("File moved, found at new path", "old", msg.path, "new", newPath)
 					msg.path = newPath
 					msg.filename = filepath.Base(newPath)
-					content, err = readMessage(newPath, i.options.MaxMessageSize)
+					content, err = i.readMaildirMessage(newPath)
 				}
 			}
 			if err != nil && !errors.Is(err, errMessageTooLarge) {
@@ -2016,19 +2461,27 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 			// content. That hash is kept, so the batch insert recognises the row the
 			// earlier run inserted (its duplicate check is on message_id and content_hash)
 			// instead of importing the message a second time under the new hash.
-			if got := helpers.HashContent(content); got != msg.hash &&
-				!(msg.imported && msg.hash == legacyImportHash(content)) {
-				logger.Warn("File content changed since the scan; using its current hash",
-					"path", msg.path, "scanned_hash", msg.hash, "current_hash", got)
-				if _, uerr := i.sqliteDB.Exec("UPDATE messages SET hash = ?, size = ?, s3_uploaded = 0 WHERE path = ? AND mailbox = ?",
-					got, len(content), msg.path, msg.mailbox); uerr != nil {
-					logger.Warn("Failed to update the cached hash", "path", msg.path, "error", uerr)
-					i.recordFailedPath(msg.path, fmt.Sprintf("content changed since scan and the cache could not be updated: %v", uerr))
+			if got := helpers.HashContent(content); got != msg.hash {
+				keepLegacy, err := i.keepLegacyImportIdentity(msg, content)
+				if err != nil {
+					logger.Warn("Failed to verify the cached legacy identity", "path", msg.path, "error", err)
+					i.recordFailedPath(msg.path, fmt.Sprintf("legacy identity verification failed: %v", err))
 					atomic.AddInt64(&i.failedMessages, 1)
 					return
 				}
-				msg.hash = got
-				msg.size = int64(len(content))
+				if !keepLegacy {
+					logger.Warn("File content changed since the scan; using its current hash",
+						"path", msg.path, "scanned_hash", msg.hash, "current_hash", got)
+					if _, uerr := i.sqliteDB.Exec("UPDATE messages SET hash = ?, size = ?, s3_uploaded = 0 WHERE path = ? AND mailbox = ?",
+						got, len(content), msg.path, msg.mailbox); uerr != nil {
+						logger.Warn("Failed to update the cached hash", "path", msg.path, "error", uerr)
+						i.recordFailedPath(msg.path, fmt.Sprintf("content changed since scan and the cache could not be updated: %v", uerr))
+						atomic.AddInt64(&i.failedMessages, 1)
+						return
+					}
+					msg.hash = got
+					msg.size = int64(len(content))
+				}
 			}
 
 			// Check for cancellation after I/O
@@ -2099,23 +2552,11 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 // insertBatchToDB inserts all uploaded messages in a batch
 // It groups messages by mailbox and uses the highly-optimized InsertMessagesFromImporterBatchWithRetry
 //
-// It returns an error only before it stores anything, or when the import is
-// interrupted (i.ctx cancelled): it then stops and returns the messages committed
-// before the interrupt along with the error, and leaves the rest uncounted.
-func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, error) {
-	// Get user info once
-	address, err := server.NewAddress(i.email)
-	if err != nil {
-		return nil, fmt.Errorf("invalid email address format: %w", err)
-	}
-
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
-	if err != nil {
-		return nil, fmt.Errorf("account not found: %w", err)
-	}
-	user := server.NewUser(address, accountID)
-
-	var successHashes []markedMessage
+// It returns an error only when the import is interrupted (i.ctx cancelled): it then
+// stops and returns the messages committed before the interrupt along with the
+// error, and leaves the rest uncounted.
+func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) (inserted, present []markedMessage, err error) {
+	user := i.user
 
 	// Group messages by mailbox to take advantage of batch inserts
 	type groupedMsg struct {
@@ -2131,7 +2572,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 		mailbox, err := i.getOrCreateMailbox(i.ctx, user.AccountID(), up.msg.mailbox)
 		if err != nil {
 			if i.ctx.Err() != nil {
-				return nil, err // interrupted; nothing is stored yet
+				return nil, nil, err // interrupted; nothing is stored yet
 			}
 			logger.Error("Failed to get or create mailbox", "mailbox", up.msg.mailbox, "error", err)
 			i.recordFailedPath(up.msg.path, fmt.Sprintf("mailbox error: %v", err))
@@ -2142,8 +2583,8 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 		opt := &db.InsertMessageOptions{
 			AccountID:            user.AccountID(),
 			MailboxID:            mailbox.ID,
-			S3Domain:             address.Domain(),
-			S3Localpart:          address.LocalPart(),
+			S3Domain:             user.Domain(),
+			S3Localpart:          user.LocalPart(),
 			MailboxName:          mailbox.Name,
 			ContentHash:          up.msg.hash,
 			MessageID:            up.metadata.messageID,
@@ -2153,6 +2594,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 			Subject:              up.metadata.subject,
 			PlaintextBody:        up.metadata.plaintextBody,
 			SentDate:             up.metadata.sentDate,
+			SentDateUnknownZone:  up.metadata.sentDateUnknownZone,
 			InReplyTo:            up.metadata.inReplyTo,
 			References:           up.metadata.references,
 			BodyStructure:        up.metadata.bodyStructure,
@@ -2188,7 +2630,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 				if i.ctx.Err() != nil {
 					// Interrupted: inserting the chunk message by message on the
 					// cancelled context would only fail each one.
-					return successHashes, err
+					return inserted, present, err
 				}
 				{
 					// The batch failed as a whole — a unique violation the dedup did not
@@ -2202,17 +2644,18 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 						_, _, indErr := i.rdb.InsertMessageFromImporterWithRetry(i.ctx, gm.opt)
 						if indErr != nil {
 							if i.ctx.Err() != nil {
-								return successHashes, indErr // interrupted
+								return inserted, present, indErr // interrupted
 							}
 							if errors.Is(indErr, consts.ErrUIDConflict) {
 								// The preserved UID is already taken in the target mailbox: the
 								// message was NOT stored. A "skip" would hide a lost message.
 								logger.Error("Preserved UID already in use, message not imported", "path", gm.path, "hash", gm.hash)
-								i.recordFailedPath(gm.path, "preserved UID already in use in the target mailbox (re-run without --preserve-uids to import it)")
+								i.recordFailedPath(gm.path, uidConflictReason)
 								atomic.AddInt64(&i.failedMessages, 1)
 								continue
 							}
 							if errors.Is(indErr, consts.ErrDBUniqueViolation) {
+								present = append(present, markedMessage{hash: gm.hash, mailbox: mailboxName})
 								atomic.AddInt64(&i.skippedMessages, 1)
 								continue
 							}
@@ -2221,45 +2664,52 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 							atomic.AddInt64(&i.failedMessages, 1)
 							continue
 						}
-						successHashes = append(successHashes, markedMessage{hash: gm.hash, mailbox: mailboxName})
+						inserted = append(inserted, markedMessage{hash: gm.hash, mailbox: mailboxName})
 					}
 					continue
 				}
 			}
 
-			// Add successfully inserted hashes to successHashes, tagged with the mailbox
-			// this group belongs to so the cache row for this copy is the one marked.
+			wasInserted := make(map[string]bool, len(insertedHashesBatch))
 			for _, hash := range insertedHashesBatch {
-				successHashes = append(successHashes, markedMessage{hash: hash, mailbox: mailboxName})
+				wasInserted[hash] = true
+				inserted = append(inserted, markedMessage{hash: hash, mailbox: mailboxName})
 			}
-
-			// Calculate skipped messages (deduplicated by the database)
-			skipped := len(chunk) - len(insertedHashesBatch)
-			if skipped > 0 {
-				atomic.AddInt64(&i.skippedMessages, int64(skipped))
+			for _, gm := range chunk {
+				if !wasInserted[gm.hash] {
+					present = append(present, markedMessage{hash: gm.hash, mailbox: mailboxName})
+					atomic.AddInt64(&i.skippedMessages, 1)
+				}
 			}
 		}
 	}
 
-	return successHashes, nil
+	return inserted, present, nil
 }
+
+// uidConflictReason is the failure reason of a message whose preserved UID the
+// target mailbox already uses.
+const uidConflictReason = "preserved UID already in use in the target mailbox (re-run without --preserve-uids to import it)"
+
+// batchUIDConflictError ends a batch transaction at the message whose preserved UID
+// the target mailbox already uses.
+type batchUIDConflictError struct {
+	path string
+	err  error
+}
+
+func (e *batchUIDConflictError) Error() string {
+	return fmt.Sprintf("preserved UID of %s already in use in the target mailbox: %v", e.path, e.err)
+}
+
+func (e *batchUIDConflictError) Unwrap() error { return e.err }
 
 // insertBatchToDBWithTransaction inserts all uploaded messages in a SINGLE transaction
 // This is faster (20x) but less resilient - if one message fails, entire batch rolls back
 func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]markedMessage, error) {
-	// Get user info once
-	address, err := server.NewAddress(i.email)
-	if err != nil {
-		return nil, fmt.Errorf("invalid email address format: %w", err)
-	}
+	user := i.user
 
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
-	if err != nil {
-		return nil, fmt.Errorf("account not found: %w", err)
-	}
-	user := server.NewUser(address, accountID)
-
-	var successHashes []markedMessage
+	var successHashes, present []markedMessage
 
 	// Begin a single transaction for the entire batch
 	tx, err := i.rdb.BeginTxWithRetry(i.ctx, pgx.TxOptions{})
@@ -2271,10 +2721,8 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 	// Get the underlying database for direct access to InsertMessageFromImporter
 	database := i.rdb.GetOperationalDatabase()
 
-	// Stage per-message UID conflicts and dedup skips until tx.Commit and
-	// markBatchInSQLite succeed: if the batch aborts, processBatch records and
-	// counts the entire uploaded slice as failed.
-	var uidConflicts []failedImport
+	// Stage dedup skips until tx.Commit and markBatchInSQLite succeed: if the batch
+	// aborts, processBatch records and counts the entire uploaded slice as failed.
 	var skipped int64
 
 	// Track mailbox IDs for rollback compensation
@@ -2295,8 +2743,8 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 		_, _, err = database.InsertMessageFromImporter(i.ctx, tx, &db.InsertMessageOptions{
 			AccountID:            user.AccountID(),
 			MailboxID:            mailbox.ID,
-			S3Domain:             address.Domain(),
-			S3Localpart:          address.LocalPart(),
+			S3Domain:             user.Domain(),
+			S3Localpart:          user.LocalPart(),
 			MailboxName:          mailbox.Name,
 			ContentHash:          up.msg.hash,
 			MessageID:            up.metadata.messageID,
@@ -2306,6 +2754,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 			Subject:              up.metadata.subject,
 			PlaintextBody:        up.metadata.plaintextBody,
 			SentDate:             up.metadata.sentDate,
+			SentDateUnknownZone:  up.metadata.sentDateUnknownZone,
 			InReplyTo:            up.metadata.inReplyTo,
 			References:           up.metadata.references,
 			BodyStructure:        up.metadata.bodyStructure,
@@ -2318,17 +2767,16 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 		if err != nil {
 			if errors.Is(err, consts.ErrUIDConflict) {
 				// The preserved UID is already taken in the target mailbox: this message
-				// was NOT stored. Report it as failed (never as a dedup skip) and go on
-				// with the batch.
+				// was NOT stored (never a dedup skip). The unique violation behind it has
+				// aborted the transaction, so nothing else of the batch can be stored
+				// either: stop here instead of sending statements PostgreSQL ignores
+				// until the rollback, whose error would then hide this cause.
 				logger.Error("Preserved UID already in use, message not imported", "path", up.msg.path, "hash", up.msg.hash)
-				uidConflicts = append(uidConflicts, failedImport{
-					path:   up.msg.path,
-					reason: "preserved UID already in use in the target mailbox (re-run without --preserve-uids to import it)",
-				})
-				continue
+				return nil, &batchUIDConflictError{path: up.msg.path, err: err}
 			}
 			if errors.Is(err, consts.ErrDBUniqueViolation) {
-				// Message already exists - skip but continue processing batch
+				// Message already exists - remember completion after this transaction commits.
+				present = append(present, markedMessage{hash: up.msg.hash, mailbox: up.msg.mailbox})
 				skipped++
 				continue
 			}
@@ -2355,21 +2803,14 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 	// If SQLite update fails, we have messages in PG but not marked in cache
 	// This is safe: next run will try to re-import, S3 upload is idempotent,
 	// and PG insert will return ErrDBUniqueViolation (we skip and continue)
-	if err := i.markBatchInSQLite(successHashes); err != nil {
+	if err := i.markBatchInSQLite(append(append([]markedMessage(nil), successHashes...), present...)); err != nil {
 		// PostgreSQL already committed - we can't rollback
 		// Log the error and try to delete from PostgreSQL to maintain consistency
 		logger.Error("Failed to update SQLite cache after PG commit - attempting rollback compensation",
 			"error", err, "batch_size", len(successHashes))
 
 		// Attempt to delete the just-inserted messages from PostgreSQL
-		accountID, accErr := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, i.email)
-		if accErr != nil {
-			logger.Error("CRITICAL: Failed to get account ID for rollback - messages orphaned in PostgreSQL",
-				"error", accErr, "original_error", err, "batch_size", len(successHashes))
-			return nil, fmt.Errorf("failed to update SQLite cache and cannot rollback (messages orphaned): %w", err)
-		}
-
-		if rollbackErr := i.rollbackBatchFromPostgreSQL(accountID, successList); rollbackErr != nil {
+		if rollbackErr := i.rollbackBatchFromPostgreSQL(user.AccountID(), successList); rollbackErr != nil {
 			// Both SQLite update AND compensation failed - messages are in PG only
 			// Recovery mechanism will NOT fix this (it only resets SQLite orphans)
 			logger.Error("CRITICAL: Rollback compensation failed - messages orphaned in PostgreSQL",
@@ -2382,12 +2823,6 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 		return nil, fmt.Errorf("failed to update SQLite cache (batch reverted): %w", err)
 	}
 
-	for _, f := range uidConflicts {
-		i.recordFailedPath(f.path, f.reason)
-	}
-	if len(uidConflicts) > 0 {
-		atomic.AddInt64(&i.failedMessages, int64(len(uidConflicts)))
-	}
 	if skipped > 0 {
 		atomic.AddInt64(&i.skippedMessages, skipped)
 	}
@@ -2491,12 +2926,11 @@ func (i *Importer) markRowsInSQLite(ctx context.Context, marked []markedMessage)
 	}
 	defer tx.Rollback()
 
-	// Scoped to (hash, mailbox): s3_uploaded is what an incremental import filters
-	// on, so marking by hash alone would hide every other mailbox's copy of this
-	// content from the next run even though it was never imported.
+	// The projection and ledger use the exact (hash, mailbox) cache identity.
+	// A completion in one folder cannot hide an unimported copy in another.
 	stmt, err := tx.PrepareContext(ctx, `
 		UPDATE messages
-		SET s3_uploaded = 1, s3_uploaded_at = ?
+		SET s3_uploaded = 1, s3_uploaded_at = ?, account_id = ?
 		WHERE hash = ? AND mailbox = ?
 	`)
 	if err != nil {
@@ -2505,10 +2939,22 @@ func (i *Importer) markRowsInSQLite(ctx context.Context, marked []markedMessage)
 	defer stmt.Close()
 
 	now := time.Now()
+	var accountID any
+	if i.user != nil {
+		accountID = i.user.AccountID()
+	}
 	for _, m := range marked {
-		if _, err := stmt.ExecContext(ctx, now, m.hash, m.mailbox); err != nil {
+		if _, err := stmt.ExecContext(ctx, now, accountID, m.hash, m.mailbox); err != nil {
 			return fmt.Errorf("failed to update SQLite for hash %s in %s: %w",
 				shortHash(m.hash), m.mailbox, err)
+		}
+		if i.databaseUUID != "" && i.user != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO import_completions
+				(database_uuid, account_id, hash, mailbox, completed_at)
+				SELECT ?, ?, hash, mailbox, ? FROM messages WHERE hash = ? AND mailbox = ?`,
+				i.databaseUUID, i.user.AccountID(), now, m.hash, m.mailbox); err != nil {
+				return fmt.Errorf("failed to record import completion: %w", err)
+			}
 		}
 	}
 
@@ -2551,33 +2997,23 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 	var err error
 
 	if i.options.BatchTransactionMode {
-		// Fast path: Single transaction for entire batch (20x faster)
-		// SQLite is updated BEFORE PostgreSQL commit (atomicity guaranteed)
+		// One PostgreSQL transaction covers the batch. SQLite marks follow its commit;
+		// a mark failure invokes best-effort PostgreSQL compensation.
 		logger.Info("Using batch transaction mode")
 		successHashes, err = i.insertBatchToDBWithTransaction(uploaded)
 	} else {
 		// Safe path: Individual transactions per message (more resilient)
 		// Need to update SQLite after since each message commits individually
 		logger.Info("Using individual transaction mode")
-		successHashes, err = i.insertBatchToDB(uploaded)
-		if err != nil && i.ctx.Err() == nil {
-			// Unless interrupted, insertBatchToDB fails only before it stores
-			// anything (address or account lookup), so none of the batch was imported.
-			logger.Error("DB inserts failed", "error", err)
-			for _, up := range uploaded {
-				i.recordFailedPath(up.msg.path, fmt.Sprintf("db insert error: %v", err))
-			}
-			atomic.AddInt64(&i.failedMessages, int64(len(uploaded)))
-			return err
-		}
-
-		// After an interrupt err is set, and successHashes holds the messages
-		// committed before it: they are marked like any others.
-		logger.Info("DB inserts complete, marking in SQLite", "count", len(successHashes))
+		// insertBatchToDB fails only on an interrupt, and successHashes then holds
+		// the messages committed before it: they are marked like any others.
+		var present []markedMessage
+		successHashes, present, err = i.insertBatchToDB(uploaded)
+		logger.Info("DB inserts complete, marking in SQLite", "count", len(successHashes)+len(present))
 
 		// Phase 3: Mark successful messages in SQLite cache
 		// For safe mode, this happens AFTER individual commits
-		if err := i.markBatchInSQLite(successHashes); err != nil {
+		if err := i.markBatchInSQLite(append(append([]markedMessage(nil), successHashes...), present...)); err != nil {
 			// FATAL: If SQLite update fails, messages will be re-imported
 			logger.Error("Failed to update SQLite cache - messages may be re-imported on retry", "error", err)
 			atomic.AddInt64(&i.failedMessages, int64(len(successHashes)))
@@ -2592,16 +3028,25 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 			// Interrupted: the database calls failed on the cancelled context. What
 			// the batch did not store is not a failure: its cache rows stay unmarked,
 			// pending for the next run, and importMessages reports the interruption.
+			// The batch returns the interruption, not the error of the call it cut
+			// short ("failed to begin transaction: context canceled").
 			atomic.AddInt64(&i.importedMessages, int64(len(successHashes)))
 			logger.Info("Import interrupted, rest of the batch left for the next run",
 				"imported", len(successHashes), "batch_size", len(batch))
-			return err
+			return i.ctx.Err()
 		}
 		logger.Error("Batch processing failed", "error", err)
 		// Everything in uploaded that wasn't successfully inserted is already tracked if individual mode
-		// Let's ensure BatchTransactionMode logs all if it aborted
+		// Let's ensure BatchTransactionMode logs all if it aborted: the message
+		// whose preserved UID ended the transaction with its own reason.
 		if i.options.BatchTransactionMode {
+			var conflict *batchUIDConflictError
+			errors.As(err, &conflict)
 			for _, up := range uploaded {
+				if conflict != nil && up.msg.path == conflict.path {
+					i.recordFailedPath(up.msg.path, uidConflictReason)
+					continue
+				}
 				i.recordFailedPath(up.msg.path, fmt.Sprintf("batch transaction aborted: %v", err))
 			}
 			atomic.AddInt64(&i.failedMessages, int64(len(uploaded)))
@@ -2648,7 +3093,7 @@ func (i *Importer) processPathsFile(cleanPath string, filesToProcess chan<- file
 		dir := filepath.Dir(filepath.Dir(fullPath))
 
 		if i.options.PreserveUIDs && !processedDirs[dir] {
-			uidList, err := ParseDovecotUIDList(dir)
+			uidList, err := parseDovecotUIDListFile(i.openMaildirFile(filepath.Join(dir, "dovecot-uidlist")))
 			if err == nil && uidList != nil {
 				i.dovecotUIDLists[dir] = uidList
 				logger.Info("Loaded dovecot-uidlist", "path", dir)
@@ -2686,28 +3131,19 @@ func (i *Importer) importMessages() error {
 		return nil
 	}
 
-	// Initialize batch size
-	if i.options.BatchSize == 0 {
-		i.batchSize = 20 // Default
-	} else {
-		i.batchSize = i.options.BatchSize
-	}
-
 	// Initialize mailbox cache
 	i.mailboxCache = make(map[string]*db.DBMailbox)
 
-	// Read ALL messages into memory first, then close the cursor
-	// This prevents holding the SQLite connection while processing batches
-	var query string
+	// Drain the SQLite cursor before processing batches. Both the selection
+	// and the legacy-hash flag use this destination's ledger, not s3_uploaded.
+	query := "SELECT path, filename, hash, size, mailbox, " + destinationCompletedSQL + " FROM messages m"
+	args := []any{i.databaseUUID, i.user.AccountID()}
 	if i.options.Incremental {
-		// Incremental mode: only load messages not yet uploaded
-		query = `SELECT path, filename, hash, size, mailbox, COALESCE(s3_uploaded, 0) = 1 FROM messages WHERE s3_uploaded = 0 ORDER BY mailbox, path`
-	} else {
-		// Non-incremental mode: load all messages
-		query = `SELECT path, filename, hash, size, mailbox, COALESCE(s3_uploaded, 0) = 1 FROM messages ORDER BY mailbox, path`
+		query += " WHERE NOT " + destinationCompletedSQL
+		args = append(args, i.databaseUUID, i.user.AccountID())
 	}
-
-	rows, err := i.sqliteDB.Query(query)
+	query += " ORDER BY mailbox, path"
+	rows, err := i.sqliteDB.QueryContext(i.ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("failed to query messages: %w", err)
 	}
@@ -2750,9 +3186,10 @@ func (i *Importer) importMessages() error {
 
 		batch = append(batch, msg)
 
-		// Process when batch is full
+		// Process when batch is full. A batch the interrupt ended has logged it
+		// already, and an interrupt is not a batch error.
 		if len(batch) >= i.batchSize {
-			if err := i.processBatch(batch); err != nil {
+			if err := i.processBatch(batch); err != nil && i.ctx.Err() == nil {
 				logger.Warn("Batch processing had errors", "error", err)
 			}
 			batch = batch[:0] // Reset batch
@@ -2761,7 +3198,7 @@ func (i *Importer) importMessages() error {
 
 	// Process remaining messages
 	if len(batch) > 0 {
-		if err := i.processBatch(batch); err != nil {
+		if err := i.processBatch(batch); err != nil && i.ctx.Err() == nil {
 			logger.Warn("Final batch had errors", "error", err)
 		}
 	}
@@ -2790,29 +3227,41 @@ func (i *Importer) getProgressPrefix() string {
 }
 
 // parseKeywordsFile reads one dovecot-keywords file ("<index> <keyword>" per line,
-// index 0-25 ↔ letters a-z in maildir filenames). Malformed lines are skipped.
-func parseKeywordsFile(path string) (map[int]string, error) {
-	content, err := os.ReadFile(path)
+// index 0-25 ↔ letters a-z in maildir filenames), opened with open, of at most
+// maxDovecotKeywordsSize bytes. Malformed lines are skipped, and so is a line whose
+// index no letter names, as Dovecot skips it (maildir-keywords.c). The file's writer
+// decides how long and how many those lines are, so one warning names the file, how
+// many were skipped and the first of them, shortened.
+func parseKeywordsFile(path string, open func(string) (*os.File, error)) (map[int]string, error) {
+	var content []byte
+	file, err := open(path)
+	if err == nil {
+		content, err = readFileUpTo(file, maxDovecotKeywordsSize)
+		file.Close()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to read dovecot-keywords file: %w", err)
 	}
 	keywords := make(map[int]string)
+	skipped, firstSkipped := 0, ""
 	for _, line := range strings.Split(string(content), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, " ", 2)
-		if len(parts) != 2 {
-			logger.Info("Warning: Skipping malformed dovecot-keywords line", "path", path, "line", line)
+		index, keyword, found := strings.Cut(line, " ")
+		id, err := strconv.Atoi(index)
+		if !found || err != nil || id < 0 || id >= maxMaildirKeywords {
+			if skipped == 0 {
+				firstSkipped = line
+			}
+			skipped++
 			continue
 		}
-		id, err := strconv.Atoi(parts[0])
-		if err != nil {
-			logger.Info("Warning: Invalid keyword ID in line", "path", path, "line", line)
-			continue
-		}
-		keywords[id] = parts[1]
+		keywords[id] = keyword
+	}
+	if skipped > 0 {
+		logger.Warn("Skipping malformed dovecot-keywords lines", "path", path, "count", skipped, "first", truncateString(firstSkipped, 80))
 	}
 	return keywords, nil
 }
@@ -2844,7 +3293,7 @@ func (i *Importer) keywordsForMessagePath(path string) map[int]string {
 		kws = i.dovecotKeywords
 	} else if i.options.Dovecot {
 		if _, err := os.Stat(keywordsPath); err == nil {
-			parsed, perr := parseKeywordsFile(keywordsPath)
+			parsed, perr := parseKeywordsFile(keywordsPath, i.openMaildirFile)
 			if perr != nil {
 				logger.Warn("Failed to read folder dovecot-keywords, importing its messages without keywords", "path", keywordsPath, "error", perr)
 			} else {

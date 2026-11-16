@@ -26,6 +26,10 @@ func keywordLimitExceededError() *imap.Error {
 }
 
 func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
+	// The client's numbering holds still until the last response (seqViewMu).
+	s.seqViewMu.RLock()
+	defer s.seqViewMu.RUnlock()
+
 	// First, safely read session state with a single mutex acquisition
 	var selectedMailboxID int64
 	var selectedMailboxOwnerID int64
@@ -66,12 +70,11 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 
 	selectedMailboxID = s.selectedMailbox.ID
 	selectedMailboxOwnerID = s.selectedMailbox.AccountID
-
-	// Capture modseq before unlocking
-	modSeqSnapshot := s.currentHighestModSeq.Load()
-
-	// Use our helper method that assumes the mutex is held (read lock is sufficient)
-	decodedNumSet = s.decodeNumSetLocked(numSet)
+	// RFC 3501 §6.4.6: the new flags are returned "as if a FETCH of those
+	// flags was done", \Recent included.
+	recentAbove := s.recentFlagAboveLocked()
+	view := s.seqViewLocked()
+	decodedNumSet = s.decodeNumSetLocked(view, numSet)
 	release()
 
 	// Sanitize flags to remove invalid values (e.g., NIL, NULL, empty strings)
@@ -88,8 +91,12 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	if s.useMasterDB.Load() {
 		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
+	// Neither the capabilities nor the client's CONDSTORE awareness change
+	// during the command: read them once, not for every message (#1206).
+	checkUnchangedSince := options != nil && options.UnchangedSinceSet && s.GetCapabilities().Has(imap.CapCondStore)
+	writeModSeq := s.condStoreEnabled()
 	var unchangedSince []uint64
-	if s.GetCapabilities().Has(imap.CapCondStore) && options != nil && options.UnchangedSinceSet {
+	if checkUnchangedSince {
 		unchangedSince = []uint64{options.UnchangedSince}
 	}
 
@@ -138,23 +145,9 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	}
 
 	// Perform database operations outside of lock
-	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet)
+	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(view.context(ctx), selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return s.internalError("failed to retrieve messages: %v", err)
-	}
-
-	// Check if mailbox changed during our operation
-	if modSeqSnapshot > 0 && s.currentHighestModSeq.Load() > modSeqSnapshot {
-		s.DebugLog("mailbox changed during STORE operation", "old_modseq", modSeqSnapshot, "new_modseq", s.currentHighestModSeq.Load())
-		// For sequence sets, this could mean we're updating wrong messages
-		if _, isSeqSet := numSet.(imap.SeqSet); isSeqSet {
-			// Re-decode and re-fetch to ensure consistency
-			decodedNumSet = s.decodeNumSet(numSet) // This will re-lock, but it's a rare case
-			messages, err = s.server.rdb.GetMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet)
-			if err != nil {
-				return s.internalError("failed to retrieve messages: %v", err)
-			}
-		}
 	}
 
 	type storeResponseMessage struct {
@@ -175,7 +168,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	// skipped under NOTIFY, and stops at a pending expunge. Poll is held off
 	// until the answered rows are recorded in ownStoreEcho, so it does not
 	// report them a second time.
-	silentModSeq := sanitizedStoreFlags.Silent && s.condStoreEnabled()
+	silentModSeq := sanitizedStoreFlags.Silent && writeModSeq
 	answers := !sanitizedStoreFlags.Silent || silentModSeq
 	if answers {
 		s.ownStoreMu.Lock()
@@ -186,17 +179,21 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 			return
 		}
 		for _, modified := range responseMessages {
-			// Use database sequence number directly (no encoding needed)
+			// A message the client has not been told about has no number to be
+			// answered under; Poll reports it once the client knows it.
+			if modified.seq == 0 {
+				continue
+			}
 			m := w.CreateMessage(modified.seq)
 
 			if !sanitizedStoreFlags.Silent {
-				m.WriteFlags(modified.flags)
+				m.WriteFlags(withRecentFlag(modified.flags, modified.uid, recentAbove))
 			}
 			m.WriteUID(modified.uid)
 			// RFC 7162 §3.2: include MODSEQ in the STORE-triggered FETCH reply only
 			// when the client is CONDSTORE-aware (issued an enabling command) and the
 			// session still advertises CONDSTORE.
-			if s.condStoreEnabled() {
+			if writeModSeq {
 				m.WriteModSeq(uint64(modified.modSeq))
 			}
 
@@ -210,12 +207,8 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 			// row this STORE changed from a state the client already had: at or
 			// below the poll cursor, or this session's own previous answer.
 			// Otherwise Poll reports the flags (RFC 9051 §6.4.6 Note).
-			if !sanitizedStoreFlags.Silent || (!modified.unchanged && s.clientHasModSeqLocked(selectedMailboxID, modified.uid, modified.prevModSeq)) {
-				if s.ownStoreEcho == nil || s.ownStoreEchoMailboxID != selectedMailboxID {
-					s.ownStoreEcho = make(map[imap.UID]uint64)
-					s.ownStoreEchoMailboxID = selectedMailboxID
-				}
-				s.ownStoreEcho[modified.uid] = uint64(modified.modSeq)
+			if !sanitizedStoreFlags.Silent || (!modified.unchanged && s.clientHasModSeqLocked(view.tracker, selectedMailboxID, modified.uid, modified.prevModSeq)) {
+				s.recordOwnStoreEchoLocked(view.tracker, selectedMailboxID, modified.uid, uint64(modified.modSeq))
 			}
 		}
 	}
@@ -241,11 +234,11 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	for _, msg := range messages {
 		// CONDSTORE functionality - only process if capability is enabled
 		// UnchangedSinceSet, not a non-zero value, is what marks the modifier as
-		// present: RFC 7162 §3.1.3.1 gives "UNCHANGEDSINCE 0" the opposite meaning
+		// present: RFC 7162 §3.1.3 gives "UNCHANGEDSINCE 0" the opposite meaning
 		// to an absent modifier -- it is the probe that must fail for every message
 		// -- so reading it as absent would modify exactly the messages the client
 		// asked never to touch.
-		if s.GetCapabilities().Has(imap.CapCondStore) && options != nil && options.UnchangedSinceSet {
+		if checkUnchangedSince {
 			var currentModSeq int64
 			currentModSeq = msg.CreatedModSeq
 
@@ -260,13 +253,16 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 			if uint64(currentModSeq) > options.UnchangedSince {
 				s.DebugLog("CONDSTORE skipping message", "uid", msg.UID, "modseq", currentModSeq, "unchanged_since", options.UnchangedSince)
 				failedUIDs.AddNum(msg.UID)
-				failedSeqs.AddNum(msg.Seq)
+				if seq := view.encode(msg.Seq); seq != 0 {
+					failedSeqs.AddNum(seq) // 0 would read as "*"
+				}
 				continue
 			}
 		}
 
 		validUIDs = append(validUIDs, msg.UID)
-		seqMap[msg.UID] = msg.Seq
+		// The client's number for the message, 0 if it has none (seqView.encode).
+		seqMap[msg.UID] = view.encode(msg.Seq)
 
 		// RFC 5530 [LIMIT]: reject a STORE that would push this message past the
 		// per-message keyword cap, rather than silently dropping keywords (which
@@ -317,7 +313,9 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		for _, res := range batchResults {
 			if res.PreconditionFailed {
 				failedUIDs.AddNum(res.UID)
-				failedSeqs.AddNum(seqMap[res.UID])
+				if seq := seqMap[res.UID]; seq != 0 {
+					failedSeqs.AddNum(seq) // 0 would read as "*"
+				}
 				continue
 			}
 			responseMessages = append(responseMessages, storeResponseMessage{
@@ -403,28 +401,54 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		return nil
 	}
 
-	// Re-acquire read mutex to access session tracker for encoding sequence numbers in the response
-	acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(ctx)
-	if !acquired {
-		s.DebugLog("failed to acquire second read lock within timeout")
-		return nil // Continue without sending responses since we already updated the flags
-	}
-	release()
-
 	writeResponses()
 
 	return nil
 }
 
 // clientHasModSeqLocked reports whether the client already has message uid's
-// state as of modSeq: Poll has reported (or queued) every change up to its
-// cursor, and ownStoreEcho holds the states this session's own STORE answers
-// gave the client. The caller holds ownStoreMu, which Poll holds while it
-// advances the cursor and queues the changes.
-func (s *IMAPSession) clientHasModSeqLocked(mailboxID int64, uid imap.UID, modSeq int64) bool {
+// state as of modSeq: Poll has delivered every change up to its cursor when the
+// session tracker holds no queued updates, and ownStoreEcho holds the states
+// this session's own STORE or FETCH answers gave the client. The caller holds
+// ownStoreMu, which Poll holds while it advances the cursor and queues the
+// changes.
+func (s *IMAPSession) clientHasModSeqLocked(tracker *imapserver.SessionTracker, mailboxID int64, uid imap.UID, modSeq int64) bool {
+	if tracker == nil || tracker.QueuedUpdates() > 0 {
+		return false
+	}
 	if uint64(modSeq) <= s.currentHighestModSeq.Load() {
 		return true
 	}
 	echoed, ok := s.ownStoreEcho[uid]
 	return ok && s.ownStoreEchoMailboxID == mailboxID && echoed == uint64(modSeq)
+}
+
+// recordOwnStoreEchoLocked records that this session's STORE already answered
+// message uid as of modSeq, so Poll skips repeating that exact state. Nothing
+// is recorded while the session tracker holds queued updates from an earlier
+// Poll or while a concurrent FETCH (e.g. NOTIFY MessageNew fetch-atts) is in
+// flight, because an older state of uid may still be flushed after STORE's
+// response and Poll must queue the current state behind it.
+func (s *IMAPSession) recordOwnStoreEchoLocked(tracker *imapserver.SessionTracker, mailboxID int64, uid imap.UID, modSeq uint64) {
+	if tracker == nil || tracker.QueuedUpdates() > 0 || s.fetchInFlight > 0 {
+		return
+	}
+	entries := 1
+	if s.ownStoreEchoMailboxID == mailboxID {
+		entries = len(s.ownStoreEcho)
+		if _, exists := s.ownStoreEcho[uid]; !exists {
+			entries++
+		}
+	}
+	// This metadata is optional: use the same conservative map-space estimate
+	// as implicitSeenAnswer.expect without reclaiming body cache or changing
+	// response budgets.
+	if entries > maxFetchSeenEchoEntries || (s.memTracker != nil && !s.memTracker.CanAllocate(256+64*int64(entries))) {
+		return
+	}
+	if s.ownStoreEcho == nil || s.ownStoreEchoMailboxID != mailboxID {
+		s.ownStoreEcho = make(map[imap.UID]uint64)
+		s.ownStoreEchoMailboxID = mailboxID
+	}
+	s.ownStoreEcho[uid] = modSeq
 }

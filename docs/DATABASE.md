@@ -187,6 +187,12 @@ CPUs, whichever is larger).
   runs without a database. A node that needs a database and has none refuses to start, and
   `sora-admin config validate` refuses the file, with `[database]: server "<name>" (<type>) needs
   the database, but it is not configured in [database.write] or [database.read]`.
+- **`[database.read]` alone is not enough.** The migrations and every write go to
+  `[database.write]`, so a node that needs a database needs `[database.write]` hosts, a proxy
+  that only checks passwords included. With `[database.read]` hosts and none in
+  `[database.write]`, Sora refuses to start, and `sora-admin config validate` refuses the file,
+  with `[database.write]: server "<name>" (<type>) needs the database, but [database.write] has
+  no hosts; ...`. Other `sora-admin` commands stop with `[database.write] has no hosts`.
 - **User name and password** may contain any characters. Sora escapes them in the connection URL.
 - **IPv6 addresses** go in brackets with a port: `hosts = ["[2001:db8::10]:5432"]`.
 
@@ -369,7 +375,7 @@ writes move to the server that answers as primary within one check interval.
 ### Advisory locks across a failover
 
 Sora orders the deletion of a message body in S3 (the cleaner, account purges, `import rekey`)
-against the writes that claim one (uploads, restores, cross-account copies) with advisory locks
+against the writes that claim one (uploads, restores, cross-account copies and moves) with advisory locks
 on the write host. A lock excludes only what runs on the server that holds it. So when Sora stops
 writing through a server, it revokes the locks it holds there: the work they guard is cancelled
 (a cleanup batch or purge runs again in a later cycle; a copy or `import rekey` fails and can be
@@ -461,7 +467,7 @@ These hold one server connection behind the pooler for as long as they run:
 |---|---|
 | The cleanup cycle | Two on the node running the cycle: one for the whole cycle, one during each batch of S3 deletes. |
 | An account purge | One per node while it purges an account. |
-| IMAP `COPY` into a folder owned by another account | One per copy in progress, across the S3 copy. |
+| IMAP `COPY` or `MOVE` into a folder owned by another account | One per command in progress: its own transaction, from the S3 check and copy until its rows commit. |
 | Migrations | Two on the node applying them, for the whole run: the leader lock and the connection the migrations run on. |
 
 S3 uploads hold no connection across the transfer. An upload uses the pool only for a few short
@@ -470,7 +476,7 @@ statements, so `[uploader] concurrency` is bounded by S3, not by the pool.
 Size the pooler's pool for Sora's database user with this in mind:
 
 ```
-pool_size >= 2 + headroom for interactive writes, cross-account copies and uploader statements
+pool_size >= 2 + headroom for interactive writes, cross-account copies and moves, and uploader statements
 ```
 
 A pool sized only for short IMAP and LMTP transactions can queue mail delivery behind the
@@ -548,7 +554,7 @@ sora-admin migrate force   --config /etc/sora/config.toml 49
 |---|---|
 | `version` | Prints the current version and whether it is dirty (`Dirty state: no`). A plain read: safe while Sora runs. |
 | `up` | Applies every pending migration. |
-| `down` | Reverts the last migration, or `--limit N` of them, or `--all`. |
+| `down` | Reverts the last migration, or `--limit N` of them, or with `--all` every one after 000001. It never reverts 000001 ([Rolling back](#rolling-back)). |
 | `force VERSION` | Sets the version and clears the dirty flag, without running anything. |
 
 The tool's help asks you to stop Sora before `up`, `down` and `force`. `migrate` connects through
@@ -623,7 +629,7 @@ pooler), off-peak. The migrations on `main` that need it on a large database:
 | 000050 | `messages_fts_v2`, the per-account search table, and `btree_gin`. | See [Migration 000050](#migration-000050) below. |
 | 000051 | Replaces seven indexes on `messages` with `idx_messages_mailbox_active`. | Create the new index with `CREATE INDEX CONCURRENTLY`, then drop the seven old ones with `DROP INDEX CONCURRENTLY`, one at a time. |
 | 000052 | `idx_messages_mailbox_headers`, the covering index for header search. | Fix over-long rows with [scripts/fix_oversized_header_columns.sql](../scripts/fix_oversized_header_columns.sql), then build the index with `CREATE INDEX CONCURRENTLY`, using exactly the definition in the file. |
-| 000063 | A `message_state` row for every live message. | Where message ids span more than 1,000,000, see [Migration 000063](#migration-000063) below. |
+| 000062 | `idx_messages_mailbox_sent_date_unknown`, the messages without a usable `Date:` header, which SENTBEFORE, SENTON and SENTSINCE leave out. | Build the index with `CREATE INDEX CONCURRENTLY`, using exactly the definition in the file, and check that it is valid. On more than 25,000 messages the migration refuses to build it itself. |
 
 Older migrations (for example 000008, 000010, 000012, 000014, 000038 and 000039) carry the same
 kind of note. Copy index definitions exactly from the migration file: the migration only checks
@@ -698,32 +704,6 @@ with `CREATE INDEX CONCURRENTLY`, using the definition from the migration file. 
 header comment lists the session settings that help a large build (`maintenance_work_mem`,
 `temp_file_limit`, `statement_timeout`).
 
-#### Migration 000063
-
-Every live message has a `message_state` row, which holds its flags. Older releases could leave
-messages without one (migration 000022 run without its copy, and messages restored after their
-folder was purged). 000063 gives each of them a row with no flags, which is how they were shown,
-and counts them as unseen in their folder.
-
-Finding them reads the id of every message, so the migration checks at most 1,000,000 ids by
-itself. Where the ids span more, it stops with `message ids ... have not been checked for a
-missing message_state row` until [scripts/message_state_backfill.sql](../scripts/message_state_backfill.sql)
-has run. On the primary, over a direct connection, while the old release keeps serving mail:
-
-```sh
-psql -h <primary> -d <db> -f scripts/message_state_backfill.sql
-psql -h <primary> -d <db> -c 'CALL sora_backfill_message_state()'
-```
-
-The arguments are the ids per batch and the milliseconds to sleep between batches, default
-`(10000, 100)`. The procedure commits after every batch and records its progress, so it can be
-stopped and called again. Call it once more right before the upgrade: the migration then checks
-only the ids that arrived after it, and drops the progress table.
-
-If the migration already stopped and left the version dirty at 63, run the script, then
-`sora-admin migrate force <N>` with the number of the previous migration file, and start Sora
-again.
-
 ---
 
 ## 10. Maintenance
@@ -797,3 +777,17 @@ transaction` for a long time are usually the lock holders of [section 8](#8-pgbo
 | `out of shared memory` (SQLSTATE `53200`) | The shared lock table is full. | Look for long-held locks in `pg_locks`; with a transaction pooler, look for session-level advisory locks left behind. |
 | Writes fail with `read-only transaction` after a failover | The write host name still points at the old primary. | Point it at the new primary (DNS, virtual IP or pooler); Sora reconnects on its own. |
 | Clients get `NO [UNAVAILABLE]` under load | Timeouts, lock timeouts, an open circuit breaker or an exhausted pool. | Check the circuit breaker log lines, `sora_db_pool_in_use_conns` and slow queries in PostgreSQL. |
+
+
+### Message state for newly created rows
+
+COPY and MOVE create a `message_state` row for each destination message even when
+an older source message has none. Missing source state is represented by empty
+flags and keywords, matching the source's existing displayed state. Delivery,
+APPEND, imports and restore also create state for their newly inserted rows.
+
+This is a forward-only repair after all writers have been upgraded. Existing
+messages without state are left unchanged; their historical SEARCH UNSEEN,
+STATUS counts and flag-update inconsistencies are not repaired. There is no
+historical backfill, backfill migration or startup scan for this change. Older
+writers and transactions started before upgrade can still create missing rows.

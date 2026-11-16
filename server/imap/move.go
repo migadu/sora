@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
@@ -17,6 +19,10 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		return err
 	}
 	ctx = s.pinnedContext(ctx)
+
+	// The client's numbering holds still while its numbers are resolved (seqViewMu).
+	s.seqViewMu.RLock()
+	defer s.seqViewMu.RUnlock()
 
 	// First, safely read necessary session state
 	var selectedMailbox *db.DBMailbox
@@ -59,9 +65,13 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 	selectedMailbox = s.selectedMailbox
 	selectedMailboxID = selectedMailbox.ID
 
-	// Use our helper method that assumes the mutex is held (read lock is sufficient)
-	decodedNumSet = s.decodeNumSetLocked(numSet)
+	view := s.seqViewLocked()
+	decodedNumSet = s.decodeNumSetLocked(view, numSet)
 	release() // Release read lock
+
+	if imapErr := s.sharedRootDestinationRefusal("MOVE", dest); imapErr != nil {
+		return imapErr
+	}
 
 	// Perform database operations outside of lock
 	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, s.AccountID(), dest)
@@ -107,7 +117,7 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		}
 	}
 
-	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet)
+	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(view.context(ctx), selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return s.internalError("failed to retrieve messages: %v", err)
 	}
@@ -196,8 +206,10 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		return s.server.s3.CopyWithRetry(ctx, obj.sourceKey, obj.destKey)
 	}
 
+	ownMessagesDone := s.beginOwnMessages(destMailbox.ID) // a MOVE within the selected mailbox
 	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.instanceID, sourceHashes, destHashes, ensureDestObject)
 	if err != nil {
+		ownMessagesDone()
 		var destErr *resilient.DestObjectError
 		if errors.As(err, &destErr) {
 			return s.crossAccountObjectError(destObjects[destErr.ContentHash].sourcePending, destErr.Err)
@@ -216,6 +228,7 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		}
 		return s.internalError("failed to move messages: %v", err)
 	}
+	ownMessagesDone(slices.Collect(maps.Values(messageUIDMap))...)
 
 	// Pin this session to the master DB (same rationale as APPEND, append.go).
 	// MOVE's RFC 6851 §3.3 inline EXPUNGE notifications are emitted by the

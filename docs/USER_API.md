@@ -83,28 +83,19 @@ allowed_origins = ["https://webmail.example.com"]
 | `proxy_protocol` | `false` | Expect a PROXY protocol header on each connection, from an address in `[servers] trusted_networks`. The client address in it is then used for `allowed_hosts` and rate limiting. See [PROXY.md](PROXY.md). |
 | `proxy_protocol_timeout` | `"5s"` | How long to wait for that header. |
 | `[server.auth_rate_limit]` | off | Login rate limiting and progressive delays. The keys are in [AUTHENTICATION.md](AUTHENTICATION.md). |
-| `[server.lookup_cache]` | off | A cache of login results, see below. |
+| `[server.lookup_cache]` | ignored | Accepted for compatibility, with a warning; every login reads the primary credential. |
 
-**`[server.lookup_cache]`** keeps successful logins in memory. A repeated login with the same
-password, while the cached entry is younger than `positive_revalidation_window`, skips the
-credential lookup and the password check. Every other login is checked against the database.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `enabled` | `false` | Turn the cache on. |
-| `positive_ttl` | `"5m"` | How long a successful login stays in the cache. |
-| `negative_ttl` | `"1m"` | How long a failed login stays in the cache. A cached failure never refuses a login; the next attempt is checked again. |
-| `max_size` | `10000` | Most entries. |
-| `cleanup_interval` | `"5m"` | How often expired entries are removed. |
-| `positive_revalidation_window` | `"30s"` | A cached success is used only while it is younger than this. |
-
-The durations here take Go units or whole days, like the other durations; a value that does not
-parse means the default. A
-password change drops the account's cached logins.
+The User API does not cache password verdicts. Each login reads the password hash and credential
+epoch together from the primary, so a password change cannot pair an old cached verdict with a
+new token epoch. Token refresh also checks the primary. Configuring `[server.lookup_cache]` on
+this backend has no effect and produces a warning. The User API **proxy** can still cache route
+lookups ([section 12](#12-the-user-api-proxy)).
 
 The HTTP server's limits are fixed: 10 seconds for the request headers, 30 seconds to read
 the request, 30 seconds to write the response (this bounds a `/raw` download), 120 seconds for
-an idle keep-alive connection, and 15 seconds to finish open requests at shutdown.
+an idle keep-alive connection, and 15 seconds to finish open requests at shutdown. A login the
+rate limit delays has its 30 seconds to write from the end of the delay
+([AUTHENTICATION.md](AUTHENTICATION.md#103-progressive-delays) section 10.3).
 
 **Reload.** On SIGHUP, `jwt_secret`, `allowed_origins` and `allowed_hosts` are re-read. A
 changed `jwt_secret` makes every token signed with the old one invalid at once. An empty
@@ -143,7 +134,7 @@ Response `200`:
 |---|---|---|
 | 400 | `Invalid request body` | Not JSON. |
 | 400 | `Email and password are required` | A field is missing or empty. |
-| 401 | `Invalid credentials` | Unknown address, deleted account, wrong password, or the client is blocked by the rate limiter. The four look the same on purpose. |
+| 401 | `Invalid credentials` | Unknown address, deleted account, wrong password, or the client is blocked by the rate limiter. The four look the same on purpose, `WWW-Authenticate: Bearer realm="user-api"` included (section 3.2). |
 | 429 | `Too many concurrent authentication attempts. Please try again later.` | Too many logins are waiting out a progressive delay at once. |
 | 503 | `Service unavailable` | Database error, a stored password hash that cannot be verified, or the request was cancelled while it waited out a delay. Not counted as a failed login. |
 | 500 | `Token generation failed` | Signing error. |
@@ -166,6 +157,12 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 | No header | 401 | `{"error":"Authorization header required"}` |
 | Not `Bearer <token>` | 401 | `{"error":"Authorization header must be 'Bearer <token>'"}` |
 | Bad signature, expired, wrong issuer, not HS256 | 401 | `{"error":"Invalid or expired token"}` |
+
+Every `401` of the API carries the challenge `WWW-Authenticate: Bearer realm="user-api"`
+(RFC 9110 section 15.5.2). When the request presented a token and it was refused (the last
+row, or a refused refresh in 3.3), the challenge adds `error="invalid_token"` (RFC 6750
+section 3.1); a request without a token, and a refused login, get it without. Web clients
+on another origin can read the header: it is in `Access-Control-Expose-Headers`.
 
 On these requests the server checks the token only: its HS256 signature with `jwt_secret`, its
 expiry, and its issuer. It does **not** look up the account. A token keeps working until it
@@ -192,7 +189,7 @@ the login response, with the current `account_id`. Otherwise it is
 | Status | Body `error` |
 |---|---|
 | 400 | `Invalid request body`, `Token is required` |
-| 401 | `Invalid or expired token` |
+| 401 | `Invalid or expired token`, with `WWW-Authenticate: Bearer realm="user-api", error="invalid_token"` |
 | 503 | `Service unavailable` (database error while checking the account) |
 | 500 | `Token generation failed` |
 
@@ -240,7 +237,8 @@ Because the path ends in an operation name, a mailbox whose last level is called
 mailbox with one of those names cannot be listed or searched.
 
 **Responses** are JSON with `Content-Type: application/json`, except the message body and raw
-message (section 7). Times are RFC 3339.
+message (section 7). Times are RFC 3339, except a token's `expires_at`, which is Unix seconds
+(section 3.1).
 
 **Errors** are JSON objects with an `error` field:
 
@@ -260,7 +258,7 @@ header listing the methods it does serve; a path no endpoint has is
 | 201 | Mailbox created. |
 | 400 | Bad request: bad JSON, a missing or invalid field or parameter, a script that does not compile. |
 | 401 | No, bad or expired token; failed login. |
-| 403 | Client address not in `allowed_hosts`; deleting `INBOX`; or deleting a shared mailbox, changing flags or deleting a message in one without the right. |
+| 403 | Client address not in `allowed_hosts`; creating a mailbox in the shared namespace; deleting `INBOX`; or deleting a shared mailbox, changing flags or deleting a message in one without the right. |
 | 404 | Mailbox, message or script not found, or no endpoint has the path. |
 | 405 | Wrong method for the path; `Allow` lists the methods it serves. |
 | 409 | Mailbox already exists, or has child mailboxes. |
@@ -269,7 +267,7 @@ header listing the methods it does serve; a path no endpoint has is
 | 422 | A message would have more than 50 keywords. |
 | 429 | Too many logins waiting on a delay. |
 | 500 | Server error. |
-| 503 | Message body not available yet, or storage unreachable (with `Retry-After`). |
+| 503 | Message body not available yet, or storage unreachable (with `Retry-After`); a database error at login or refresh. |
 
 **Access control.** The `allowed_hosts` check runs first on every request, the login
 included: `403 {"error":"Host not allowed"}`. Then CORS (section 11), then the token. The
@@ -351,13 +349,17 @@ mailboxes.
 {"name": "Projects/Acme"}
 ```
 
-Missing parent mailboxes are created too. A trailing `/` is removed.
+Missing parent mailboxes are created too. A trailing `/` is removed. The User API does not
+create shared mailboxes: with `[shared_mailboxes]` enabled, a name in the shared namespace
+(with the default prefix, `Shared` or any name under `Shared/`, in any letter case) is refused
+with 403. Create those over IMAP or with `sora-admin mailbox create`.
 
 Response `201 {"message":"Mailbox created successfully","name":"Projects/Acme"}`.
 
 | Status | Body `error` |
 |---|---|
 | 400 | `Invalid request body`, `Mailbox name is required`, `mailbox name contains invalid characters` (NUL, CR or LF), `mailbox name too long (max 255 characters)`, `Invalid mailbox name` |
+| 403 | `Mailboxes in the shared namespace cannot be created through the User API` |
 | 409 | `Mailbox already exists` |
 | 500 | `Failed to create mailbox` |
 
@@ -401,7 +403,8 @@ A mailbox that does not exist gives `404 Mailbox not found`.
 Messages are addressed by their `id`, a number that identifies the message row across the
 whole system. The `id`-based endpoints (7.2 to 7.7) work on every message the account can list,
 in its own mailboxes and in shared mailboxes, subject to the mailbox's ACL as in IMAP: the `r`
-right to read a message, the write and delete rights to change its flags.
+right to read a message; to change its flags, `s` for `\Seen`, `t` for `\Deleted` and `w` for
+every other flag and keyword (RFC 4314 section 2.1).
 
 ### 7.1 List a mailbox's messages
 
@@ -439,7 +442,7 @@ the pages.
 
 `GET /user/messages/{id}`
 
-Returns one message object (section 10), with `references` and without `bcc`.
+Returns one message object (section 10), with `references`.
 
 `400 Invalid message ID`, `404 Message not found`, `500 Failed to retrieve message`.
 
@@ -576,7 +579,7 @@ Response `200`:
 
 | Field | Meaning |
 |---|---|
-| `messages` | Up to 100 matches, newest arrival first. Message objects without `bcc` and `references`. |
+| `messages` | Up to 100 matches, newest arrival first. Message objects without `references`. |
 | `total` | The number of messages in this response. |
 | `truncated` | `true` when more than 100 messages matched. Narrow the query to reach the others. |
 | `limit` | Always `100`. |
@@ -722,14 +725,14 @@ return messages in this shape:
 | `mailbox_id`, `mailbox_path` | The mailbox it is in. |
 | `subject` | The decoded `Subject`. |
 | `from` | The first `From` address, address only (no display name). |
-| `to`, `cc`, `bcc` | Addresses only. `cc` is filled in lists, search results and `GET /user/messages/{id}`; `bcc` only in lists. `to` is always present (`[]` when the message has none); empty `cc` and `bcc` are left out. |
+| `to`, `cc`, `bcc` | Addresses only, the same in lists, search results and `GET /user/messages/{id}`. `to` is always present (`[]` when the message has none); empty `cc` and `bcc` are left out. |
 | `date` | The message's `Date` header; its `internal_date` when it has none that parses. |
 | `internal_date` | When the message arrived in Sora. |
 | `size` | Bytes. |
 | `flags` | System flags. `[]` when there are none. |
 | `custom_flags` | Keywords. Left out when there are none. |
 | `message_id`, `in_reply_to` | From the headers, without angle brackets; `in_reply_to` holds its IDs separated by spaces and is left out when there are none. `message_id` is `""` when the message has no `Message-ID` that parses. |
-| `references` | The `References` header; only in `GET /user/messages/{id}`. |
+| `references` | The `References` header; only in `GET /user/messages/{id}` and the `data` of a flag change. |
 | `content_hash` | The hash that names the stored body. Messages with the same content share it. |
 | `has_attachments` | From the RFC 9979 keywords: `true` with `$hasattachment`, `false` with `$hasnoattachment`, left out when the message carries neither (mail Sora stored before it set them, or mail it could not inspect). |
 
@@ -855,8 +858,8 @@ Each body is `{"error":"message"}` with the message below. Set the proxy's
 | 502 | `Bad gateway` | The backend request failed. |
 | 500 | `Internal server error` | The backend request could not be constructed. |
 
-Backend responses are passed through unchanged. Protected bearer-token errors carry a
-`WWW-Authenticate: Bearer` challenge; public JSON login and refresh errors do not.
+Backend responses are passed through unchanged. Every 401 carries the
+`WWW-Authenticate` challenge a backend sends for the same refusal (section 3.2).
 
 A CORS preflight (`OPTIONS`) needs no token, on any path. It is answered with the backend's
 CORS headers, as when the backend is reached directly, so browser clients on another origin can
@@ -886,15 +889,15 @@ call the API through the proxy.
 | `tls_verify` | `false` | Require client certificates. |
 | `tls_default_domain` | none | Certificate name for clients without SNI, with the `[tls]` manager. |
 | `[server.remote_lookup]` | off | Route lookups; see [PROXY.md](PROXY.md). |
-| `[server.lookup_cache]` | off | Caches lookup answers; same keys and defaults as in section 2. |
+| `[server.lookup_cache]` | off | Caches route lookup answers; keys and defaults are described in [CONFIGURATION.md](CONFIGURATION.md#910-lookup-cache-serverlookup_cache). The proxy checks no passwords and warns if `positive_revalidation_window` is set. |
 | `[server.auth_rate_limit]` | off | Login rate limiting of every login through the proxy (12.1). The keys are in [AUTHENTICATION.md](AUTHENTICATION.md). Blocked clients show at `GET /admin/auth/blocked?protocol=userapi_proxy`. |
 
 `allowed_hosts`, `token_duration` and `token_issuer` have no effect on this proxy; set in its block,
 each is reported with a startup warning. Affinity is
 used when the block sets `enable_affinity = true` and the cluster runs its affinity store
 (`[cluster.affinity] enabled = true`). The proxy's HTTP
-limits are fixed: 30 seconds to read a request and 30 seconds to write a response, 120 seconds
-for an idle connection.
+limits are fixed: 30 seconds to read a request and 30 seconds to write a response (from the end
+of the delay for a login the proxy's rate limit delays), 120 seconds for an idle connection.
 
 The Admin API shows the proxy's backends under the name `UserAPI-{name}` at
 `GET /admin/proxy/backends` (see [ADMIN_API.md](ADMIN_API.md#13-proxy-backends-and-affinity)).

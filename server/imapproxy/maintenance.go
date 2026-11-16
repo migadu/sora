@@ -177,8 +177,13 @@ func (s *Session) sendBye(bye string) {
 	s.mu.Lock()
 	conn := s.clientConn
 	upgrading := s.startTLSInProgress
+	greeted := s.greeted
 	s.mu.Unlock()
-	if conn == nil || upgrading {
+	// Before the greeting the implicit-TLS handshake may not have started (the
+	// write is refused and logged as a listener wiring bug) or may be pending (the
+	// write waits for it, and would precede the greeting): the session closes
+	// without a BYE, which also ends the handshake.
+	if conn == nil || upgrading || !greeted {
 		return
 	}
 	// Bounded: a client that stopped reading must not hold this goroutine. The session

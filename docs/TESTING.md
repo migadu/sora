@@ -43,8 +43,8 @@ For the code layout and conventions, see [HACKING.md](HACKING.md).
     createdb -h localhost -U postgres sora_test_db
     ```
 
-- **No S3 server.** The integration tests run the upload path against in-process fakes. Only the
-  spam-training tests need a real S3, and they skip themselves unless `S3_ENDPOINT` is set.
+- **No S3 server.** The tests run the upload path against in-process fakes, and none of them
+  reads S3 settings from the environment.
 
 You do not need to create tables. Every test helper migrates its database to the newest version
 when it connects.
@@ -348,8 +348,6 @@ also has `[s3]` and `[[server]]` blocks with placeholder values. The integration
 | `SKIP_DB_TESTS=true` | many `cmd/sora-admin` tests | Skips them. |
 | `SORA_ADMIN_BIN` | `common.GetSoraAdminBinary` | Use this `sora-admin` binary instead of building one. |
 | `SORA_BIN` | `common.GetSoraBinary` | Use this `sora` binary instead of building one. |
-| `S3_ENDPOINT` | the spam-training tests in `integration_tests/imap` | They skip unless it is set. |
-| `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_BUCKET_NAME` | `TestImporter_SynchronousUploadFlow` in `cmd/sora-admin` | S3 settings, defaulting to a local MinIO. The test runs the importer in test mode, so it passes without S3. |
 
 `SORA_ADMIN_SKIP_S3=1` is read by `sora-admin` itself, in `import`: it skips the S3 upload. The
 maildir import test sets it.

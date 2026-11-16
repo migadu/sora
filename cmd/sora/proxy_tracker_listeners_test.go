@@ -37,7 +37,7 @@ func TestProxyListenersOfANodeShareTheUserLimit(t *testing.T) {
 
 	startListener := func(node *cluster.Manager, serverName string) *server.ConnectionTracker {
 		t.Helper()
-		tracker, _ := startConnectionTrackerForProxy("IMAP", serverName, "mail", 3, 0, node, &config.ClusterConfig{}, &trackerSink{})
+		tracker, _ := startConnectionTrackerForProxy("IMAP", serverName, "mail", 3, 0, node, &config.ClusterConfig{}, nil, &trackerSink{})
 		if tracker == nil {
 			t.Fatalf("no tracker for %s on %s", serverName, node.GetNodeID())
 		}

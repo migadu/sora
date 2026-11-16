@@ -75,9 +75,9 @@ func (s *POP3ProxySession) sendForwardingParametersToBackend(writer *bufio.Write
 
 	response = strings.TrimRight(response, "\r\n")
 
-	if strings.HasPrefix(response, "+OK") {
+	if isPositiveResponse(response) {
 		s.DebugLog("XCLIENT forwarding completed successfully", "params", xclientParams)
-	} else if strings.HasPrefix(response, "-ERR") {
+	} else if isNegativeResponse(response) {
 		return fmt.Errorf("%w: %s", errXCLIENTRefused, response)
 	} else {
 		// Unexpected response - log but don't fail

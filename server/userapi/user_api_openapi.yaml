@@ -56,10 +56,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TokenResponse'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          description: Too many logins are waiting out a progressive delay at once.
+        '503':
+          description: |
+            The account could not be checked (database error, or a stored password
+            hash that cannot be verified), or the request was cancelled while it
+            waited out a delay. Not counted as a failed login.
 
   /auth/refresh:
     post:
@@ -169,6 +176,11 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            A name in the shared namespace, the namespace root included, while
+            `[shared_mailboxes]` is enabled. The User API does not create shared
+            mailboxes.
         '409':
           description: Mailbox already exists
 
@@ -503,10 +515,16 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/BodyGone'
+        '503':
+          $ref: '#/components/responses/BodyUnavailable'
 
   /messages/{id}/raw:
     get:
@@ -527,10 +545,16 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/BodyGone'
+        '503':
+          $ref: '#/components/responses/BodyUnavailable'
 
   /filters:
     get:
@@ -973,14 +997,14 @@ components:
                 type: string
 
     Unauthorized:
-      description: Unauthorized - invalid or missing JWT token
+      description: Unauthorized - invalid or missing JWT token, or a refused login
       headers:
         WWW-Authenticate:
           description: >-
-            On Bearer-protected endpoints (RFC 9110 section 15.5.2, RFC 6750 section 3):
-            Bearer realm="user-api" for a request without a bearer token,
-            with error="invalid_token" added when a token was sent and refused.
-            The public JSON login and refresh endpoints do not send this header.
+            Sent with every 401 (RFC 9110 section 15.5.2, RFC 6750 section 3):
+            Bearer realm="user-api" for a request without a bearer token, a refused
+            login included, with error="invalid_token" added when a token was sent
+            and refused, in the Authorization header or as the token of a refresh.
           schema:
             type: string
             example: Bearer realm="user-api", error="invalid_token"
@@ -1003,3 +1027,35 @@ components:
               error:
                 type: string
                 example: Resource not found
+
+    BodyGone:
+      description: The message body is gone and is not coming back.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Message body is no longer available
+
+    BodyUnavailable:
+      description: |
+        The body cannot be served yet: its upload is still pending (Retry-After: 5,
+        "Message body not yet available, retry shortly"), or storage did not answer
+        (Retry-After: 30, "Storage temporarily unavailable, retry later"). Retry
+        after the given number of seconds.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+            example: 5
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Message body not yet available, retry shortly

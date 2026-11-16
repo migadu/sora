@@ -75,6 +75,7 @@ func rateLimitedProxyWith(t *testing.T, limit config.AuthRateLimiterConfig, veri
 			_, _ = w.Write([]byte(`{"token":"t","expires_at":0,"email":"` + req.Email + `","account_id":42}`))
 			return
 		}
+		server.SetBearerChallenge(w.Header(), server.UserAPIRealm, "")
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(`{"error":"Invalid credentials"}` + "\n"))
 	}))
@@ -165,9 +166,7 @@ func checkFailed(t *testing.T, res loginResult, known bool, what string) {
 // without asking a backend.
 func checkBlocked(t *testing.T, res loginResult, what string) {
 	t.Helper()
-	wantHeader := http.Header{}
-	server.SetCORSHeaders(wantHeader, corsTestOrigin, []string{corsTestOrigin})
-	wantHeader.Set("Content-Type", "application/json")
+	wantHeader := wrongPasswordHeader()
 	if res.code != http.StatusUnauthorized {
 		t.Errorf("%s: status %d, want 401", what, res.code)
 	}

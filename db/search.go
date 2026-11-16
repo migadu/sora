@@ -127,10 +127,10 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 		args[param] = criteria.Before
 		conditions = append(conditions, fmt.Sprintf("%sinternal_date < @%s", datePrefix, param))
 	}
-	// SENTSINCE / SENTBEFORE compare the day of the Date: header in its own zone (#867). The
-	// test looks the row up by its id, which is ambiguous unqualified in the legacy seqnum
-	// statement (message_seqs has one too); that statement passes no prefix, but it too
-	// names its messages row m.
+	// SENTSINCE / SENTBEFORE compare the day of the Date: header in its own zone (#867), and
+	// match only a message that has one (#1118). The test looks the row up by its id, which
+	// is ambiguous unqualified in the legacy seqnum statement (message_seqs has one too);
+	// that statement passes no prefix, but it too names its messages row m.
 	sentAlias := tablePrefix
 	if sentAlias == "" {
 		sentAlias = "m"
@@ -140,6 +140,9 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 	}
 	if !criteria.SentBefore.IsZero() {
 		conditions = append(conditions, sentDayCond(sentAlias, "<", criteria.SentBefore, args, nextParam))
+	}
+	if !criteria.SentSince.IsZero() || !criteria.SentBefore.IsZero() {
+		conditions = append(conditions, sentDateKnownCond(sentAlias))
 	}
 
 	// Message size
@@ -240,7 +243,10 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 	// Header conditions
 	for _, header := range criteria.Header {
 		lowerValue := strings.ToLower(header.Value)
-		lowerKey := strings.ToLower(header.Key)
+		// A field name is printable US-ASCII (RFC 5322 §2.2): fold its ASCII
+		// letters only. strings.ToLower maps U+0130 to "i" and U+212A to "k",
+		// turning a name no message can have into Message-ID or In-Reply-To.
+		lowerKey := lowerASCII(header.Key)
 		switch lowerKey {
 		case "subject":
 			param := nextParam()
@@ -424,6 +430,21 @@ func sentDayCond(alias, op string, day time.Time, args pgx.NamedArgs, nextParam 
 	headerTime := fmt.Sprintf("%[1]s.sent_date + make_interval(secs => COALESCE(message_sent_utc_offset(%[1]s.id), 0))", alias)
 	return fmt.Sprintf("(%[1]s.sent_date %[2]s @%[3]s OR (%[1]s.sent_date %[2]s @%[4]s AND %[5]s %[2]s @%[6]s))",
 		alias, op, sureParam, edgeParam, headerTime, dayParam)
+}
+
+// sentDateKnownCond holds for a message that has a Date: header, the only kind the SENTBEFORE,
+// SENTON and SENTSINCE keys can match (RFC 9051 §6.4.4: "Messages whose [RFC5322] Date: header
+// field ..."). A message without one that parses keeps its INTERNALDATE in sent_date, as SORT
+// and THREAD need (RFC 5256 §2.2), and is marked sent_date_unknown (migration 000061); a row
+// written before that migration cannot be told apart and still counts as dated.
+//
+// Like sent_utc_offset (see sentDayCond), sent_date_unknown is not in the header covering
+// index, so the test must not read it from the messages row. The partial index (migration
+// 000062) permits an anti-join or an indexed lookup. NOT IN can instead rescan a materialized
+// ID list per candidate when that set outgrows work_mem. It names the mailbox @mailboxID,
+// which every statement that takes search criteria binds.
+func sentDateKnownCond(alias string) string {
+	return "NOT EXISTS (SELECT 1 FROM messages nd WHERE nd.mailbox_id = @mailboxID AND nd.id = " + alias + ".id AND nd.sent_date_unknown AND nd.expunged_at IS NULL)"
 }
 
 // buildSortOrderClause builds an SQL ORDER BY clause from IMAP sort criteria
@@ -1143,26 +1164,55 @@ func (db *Database) mapSeqNumCriteriaToUID(ctx context.Context, mailboxID int64,
 	var seqNums []int64
 	collectSeqNums(c, &seqNums)
 	uidBySeq := map[uint32]imap.UID{}
+	var liveLastUID imap.UID
+	var hasLiveLast bool
 	if len(seqNums) > 0 {
 		var err error
-		if uidBySeq, err = db.uidsBySeqNum(ctx, mailboxID, seqNums); err != nil {
+		if uidBySeq, liveLastUID, hasLiveLast, err = db.uidsBySeqNumAndLiveLast(ctx, mailboxID, seqNums); err != nil {
 			return err
 		}
 	}
-	rewriteSeqNumCriteria(c, uidBySeq)
+	rewriteSeqNumCriteria(c, uidBySeq, liveLastUID, hasLiveLast)
 	return nil
 }
 
-// uidsBySeqNum returns the UID at each of the given sequence numbers. A sequence number
-// past the last message is missing from the result. Key zero always contains the
-// last live UID, for wildcard resolution and clipping out-of-bounds range ends.
+// uidsBySeqNum returns the UID at each of the given sequence numbers, in ctx's view
+// (WithSeqView). A sequence number past the last message is missing from the result.
+// Key zero always contains the last UID (of a live message, or in a view of the view's
+// last message), for sequence wildcard resolution and clipping out-of-bounds range ends.
 func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums []int64) (map[uint32]imap.UID, error) {
+	uidBySeq, _, _, err := db.uidsBySeqNumAndLiveLast(ctx, mailboxID, seqNums)
+	return uidBySeq, err
+}
+
+// uidsBySeqNumAndLiveLast is uidsBySeqNum plus the mailbox's highest live UID from the
+// same MVCC snapshot, used to resolve '*' in UID <sequence-set> criteria (RFC 9051
+// §6.4.4, §9) independently of ctx's sequence-number view.
+func (db *Database) uidsBySeqNumAndLiveLast(ctx context.Context, mailboxID int64, seqNums []int64) (map[uint32]imap.UID, imap.UID, bool, error) {
+	args := []any{mailboxID, slices.Max(seqNums), seqNums}
+	view := seqViewOf(ctx)
+	viewParam := ""
+	liveLast := `SELECT uid FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			ORDER BY uid DESC LIMIT 1`
+	last := liveLast
+	if view > 0 {
+		args = append(args, int64(view))
+		viewParam = "$4"
+		// The view's last message is its last live one or a later one it still
+		// holds; a message created since the view is past it.
+		last = `SELECT GREATEST(
+				(SELECT uid FROM messages
+				 WHERE mailbox_id = $1 AND expunged_at IS NULL AND created_modseq <= $4
+				 ORDER BY uid DESC LIMIT 1),
+				(SELECT MAX(m.uid) FROM messages m WHERE m.mailbox_id = $1 AND ` + heldExpungedCond("m", "$4") + `)
+			) AS uid`
+	}
 	query := `
 		SELECT ranked.seqnum, ranked.uid
 		FROM (
 			SELECT uid, ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
-			FROM messages
-			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			FROM ` + seqCountedRows("$1", viewParam, "", "ASC", "$2") + ` counted
 			ORDER BY uid
 			LIMIT $2
 		) ranked
@@ -1172,32 +1222,44 @@ func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums [
 	// a ranked read and a separate last-UID read can create a range that
 	// names the wrong messages in every possible mailbox state.
 	query += ` UNION ALL
-		SELECT 0 AS seqnum, last.uid FROM (
-			SELECT uid FROM messages
-			WHERE mailbox_id = $1 AND expunged_at IS NULL
-			ORDER BY uid DESC LIMIT 1
-		) last`
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, slices.Max(seqNums), seqNums)
+		SELECT 0 AS seqnum, last.uid FROM (` + last + `) last
+		WHERE last.uid IS NOT NULL`
+	if view > 0 {
+		query += ` UNION ALL
+		SELECT -1::bigint AS seqnum, live.uid FROM (` + liveLast + `) live
+		WHERE live.uid IS NOT NULL`
+	}
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to map sequence numbers to UIDs: %w", err)
+		return nil, 0, false, fmt.Errorf("failed to map sequence numbers to UIDs: %w", err)
 	}
 	defer rows.Close()
 
 	uidBySeq := make(map[uint32]imap.UID, len(seqNums))
+	var liveLastUID imap.UID
+	var hasLiveLast bool
 	for rows.Next() {
 		var seq int64
 		var uid int64
 		if err := rows.Scan(&seq, &uid); err != nil {
-			return nil, fmt.Errorf("failed to scan sequence number mapping: %w", err)
+			return nil, 0, false, fmt.Errorf("failed to scan sequence number mapping: %w", err)
+		}
+		if seq < 0 {
+			liveLastUID = imap.UID(uid)
+			hasLiveLast = true
+			continue
 		}
 		uidBySeq[uint32(seq)] = imap.UID(uid)
 	}
 	// An error the server raises while the statement runs (a statement timeout, a
 	// dropped connection) arrives here rather than from Query.
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to map sequence numbers to UIDs: %w", err)
+		return nil, 0, false, fmt.Errorf("failed to map sequence numbers to UIDs: %w", err)
 	}
-	return uidBySeq, nil
+	if view == 0 {
+		liveLastUID, hasLiveLast = uidBySeq[0]
+	}
+	return uidBySeq, liveLastUID, hasLiveLast, nil
 }
 
 // appendSeqSetNums includes zero as a marker for a target-mailbox '*' lookup.
@@ -1265,28 +1327,29 @@ func collectSeqNums(c *imap.SearchCriteria, seqNums *[]int64) {
 	}
 }
 
-// rewriteSeqNumCriteria replaces c's sequence sets, nested ones included, with the UID
-// sets they name according to uidBySeq (see seqSetToUIDSet). A set naming no message at
-// all becomes UID 0, which matches nothing.
-func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID) {
+// rewriteSeqNumCriteria resolves '*' in c's UID sets against liveLastUID (when
+// hasLiveLast holds) and replaces c's sequence sets, nested ones included, with the
+// UID sets they name according to uidBySeq (see seqSetToUIDSet). A sequence set naming
+// no message at all becomes UID 0, which matches nothing.
+func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID, liveLastUID imap.UID, hasLiveLast bool) {
 	if c == nil {
 		return
 	}
-	// UID '*' denotes the last live UID, not MaxUint32. Resolve it before
-	// appending sequence rewrites, whose UID 0 sentinel deliberately matches none.
+	// UID '*' denotes the last live UID in the mailbox (RFC 9051 §6.4.4, §9), not
+	// the session view's last slot and not MaxUint32. Resolve it before appending
+	// sequence rewrites, whose UID 0 sentinel deliberately matches none.
 	for i, set := range c.UID {
 		var resolved imap.UIDSet
 		for _, r := range set {
 			if r.Start == 0 || r.Stop == 0 {
-				last, exists := uidBySeq[0]
-				if !exists {
+				if !hasLiveLast {
 					continue // an empty mailbox has no wildcard endpoint
 				}
 				if r.Start == 0 {
-					r.Start = last
+					r.Start = liveLastUID
 				}
 				if r.Stop == 0 {
-					r.Stop = last
+					r.Stop = liveLastUID
 				}
 				r.Start, r.Stop = min(r.Start, r.Stop), max(r.Start, r.Stop)
 			}
@@ -1305,11 +1368,11 @@ func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID)
 	// Clear the SeqNum criteria since we moved them to UID
 	c.SeqNum = nil
 	for i := range c.Not {
-		rewriteSeqNumCriteria(&c.Not[i], uidBySeq)
+		rewriteSeqNumCriteria(&c.Not[i], uidBySeq, liveLastUID, hasLiveLast)
 	}
 	for i := range c.Or {
-		rewriteSeqNumCriteria(&c.Or[i][0], uidBySeq)
-		rewriteSeqNumCriteria(&c.Or[i][1], uidBySeq)
+		rewriteSeqNumCriteria(&c.Or[i][0], uidBySeq, liveLastUID, hasLiveLast)
+		rewriteSeqNumCriteria(&c.Or[i][1], uidBySeq, liveLastUID, hasLiveLast)
 	}
 }
 

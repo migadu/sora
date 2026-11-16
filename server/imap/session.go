@@ -23,6 +23,7 @@ import (
 )
 
 type IMAPSession struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server.Session
 	*IMAPUser
 	server      *IMAPServer
@@ -51,31 +52,60 @@ type IMAPSession struct {
 	clientID       *imap.IDData
 	ja4Fingerprint string                                           // JA4 TLS fingerprint
 	ja4Conn        interface{ GetJA4Fingerprint() (string, error) } // Reference to JA4 conn if fingerprint not yet available
-	sessionCaps    atomic.Value                                     // imap.CapSet - per-session capabilities after filtering (lock-free access)
+	sessionCaps    atomic.Value                                     // imap.CapSet - per-session capabilities after filtering (lock-free access); never modified once stored
 
 	// Atomic counters for lock-free access
 	currentHighestModSeq atomic.Uint64
 	currentNumMessages   atomic.Uint32
 	firstUnseenSeqNum    atomic.Uint32 // Sequence number of the first unseen message
 
+	// reportedHighestModSeq is the mod-sequence up to which every change of
+	// the selected mailbox has been sent to the client (HighestModSeq): the
+	// SELECT's value, then the cursor of the last poll that left nothing
+	// queued.
+	reportedHighestModSeq atomic.Uint64
+	// A NOTIFY filter can consume a flag change without sending it. The
+	// report then stays conservative until SELECT establishes a new baseline;
+	// enabling FlagChange again does not replay the consumed change.
+	reportedModSeqGap atomic.Bool
+	// queuedFlagUpdates records that the tracker holds a flag update queued
+	// while FlagChange was allowed, so draining it after NOTIFY suppresses
+	// FlagChange still marks reportedModSeqGap.
+	queuedFlagUpdates atomic.Bool
+
 	lastSelectedMailboxID int64
 	lastHighestUID        imap.UID
 	recentAboveUID        imap.UID    // Messages above this UID are \Recent in this session (RFC 3501 §2.3.2); set by SELECT
+	numRecent             uint32      // The RECENT count: messages above recentAboveUID in the server view (currentNumMessages); set by SELECT, moved by Poll
+	recentUnsent          atomic.Bool // Poll grew the mailbox or expunged a \Recent message and has not yet written the RECENT count that goes with that EXISTS or EXPUNGE
 	useMasterDB           atomic.Bool // Pin session to master DB after a write to ensure consistency
 	selectedReadOnly      atomic.Bool // True when the selected mailbox is read-only: opened with EXAMINE, or SELECTed without any of the 'iestw' rights
 	selectedExamined      atomic.Bool // True when the selected mailbox was opened with EXAMINE itself (RFC 9051 §6.3.3)
 
 	// A STORE answers its rows itself: with FETCH (FLAGS) when not .SILENT
 	// (RFC 9051 §6.4.6), with FETCH (UID MODSEQ) for a CONDSTORE .SILENT
-	// (RFC 7162 §3.1.3). ownStoreMu serializes that STORE with Poll so Poll
-	// can tell those rows from foreign changes; it is taken before s.mutex,
-	// never while holding it. ownStoreEcho maps each UID whose state the
-	// client has from such an answer to that state's mod-sequence, in mailbox
-	// ownStoreEchoMailboxID; Poll skips exactly those updates instead of
-	// reporting them again. Both fields are guarded by ownStoreMu.
+	// (RFC 7162 §3.1.3). So does a FETCH that implicitly sets \Seen, with
+	// FLAGS in its own FETCH responses (RFC 9051 §6.4.5). ownStoreMu
+	// serializes that STORE or FETCH with Poll so Poll can tell those rows
+	// from foreign changes; it is taken before s.mutex, never while holding
+	// it. ownStoreEcho maps each UID whose state the client has from such an
+	// answer to that state's mod-sequence, in mailbox ownStoreEchoMailboxID;
+	// Poll skips exactly those updates instead of reporting them again. Both
+	// fields are guarded by ownStoreMu.
 	ownStoreMu            sync.Mutex
 	ownStoreEcho          map[imap.UID]uint64
 	ownStoreEchoMailboxID int64
+	fetchInFlight         int // metadata snapshots/responses in flight; guarded by ownStoreMu
+
+	// seqViewMu keeps the client's sequence numbering still while a command
+	// translates through it (seqView): the command holds it for reading from
+	// before it reads the poll cursor and the tracker until its last response,
+	// and Poll, which moves both and delivers what the tracker holds, holds it
+	// for writing. Otherwise a NOTIFY pump poll during a command would number
+	// the command's first responses in one view and the rest in another. It is
+	// taken before ownStoreMu and s.mutex, and only once per command: a second
+	// read lock queued behind a waiting Poll would deadlock.
+	seqViewMu sync.RWMutex
 
 	// savedSearchUIDs holds the SEARCH RETURN (SAVE) result set referenced by
 	// "$" (RFC 5182 / RFC 9051 §6.4.4.1). It is per-session, scoped to the
@@ -86,19 +116,15 @@ type IMAPSession struct {
 	// NOTIFY (RFC 5465) watch state. notifyMutex guards the pointer swap:
 	// SetNotify/Close write it on the command goroutine, NotifyPoll reads it
 	// on the pump goroutine (the library stops the pump before SetNotify
-	// runs, so the watch internals are only ever touched by one goroutine).
+	// runs, so the watch internals are only ever touched by one goroutine,
+	// except notifyWatch.own, which notifyMutex guards as well).
 	notifyMutex sync.Mutex
 	notifyWatch *notifyWatch
-
-	// idling is true while the client is in an IDLE command. The NOTIFY pump
-	// reads it to release SELECTED-DELAYED expunges, since IDLE is a delayed-
-	// expunge sync point (RFC 5465 §6.1.2).
-	idling atomic.Bool
 
 	// Memory tracking
 	memTracker *server.SessionMemoryTracker
 
-	// Body section retained for <offset.size> chunk fetches (see body_section_cache.go).
+	// BODY or BINARY section retained for <offset.size> chunk fetches (see body_section_cache.go).
 	bodySectionCacheMu   sync.Mutex
 	bodySectionCacheKey  string
 	bodySectionCacheData []byte
@@ -116,6 +142,13 @@ func (s *IMAPSession) Context() context.Context {
 
 // GetCapabilities returns the effective capabilities for this session
 // If session-specific capabilities haven't been set, it returns the server's default capabilities
+//
+// The set is returned as stored, not copied, like the server's set below, and
+// callers must not modify it. No set is modified once stored in sessionCaps
+// (NewSession, applyCapabilityFilters and the lazy JA4 path below each store a
+// newly built one), so concurrent readers need no copy. Callers use it for a
+// Has check, go-imap once per MODSEQ item it writes, and a copy allocated a
+// map of the whole set for each (#1206).
 func (s *IMAPSession) GetCapabilities() imap.CapSet {
 
 	// If we have a pending JA4 connection, try to capture fingerprint now
@@ -138,15 +171,8 @@ func (s *IMAPSession) GetCapabilities() imap.CapSet {
 	}
 
 	// Atomic load - safe for concurrent access
-	// Return a copy to prevent concurrent modification issues
 	if capsVal := s.sessionCaps.Load(); capsVal != nil {
-		stored := capsVal.(imap.CapSet)
-		// Make a defensive copy - maps are reference types!
-		caps := make(imap.CapSet, len(stored))
-		for k, v := range stored {
-			caps[k] = v
-		}
-		return caps
+		return capsVal.(imap.CapSet)
 	}
 
 	// Fallback to server capabilities if not yet initialized
@@ -550,6 +576,10 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.mailboxTracker = nil
 	s.sessionTracker = nil
 	s.currentHighestModSeq.Store(0)
+	s.reportedHighestModSeq.Store(0)
+	s.reportedModSeqGap.Store(false)
+	s.queuedFlagUpdates.Store(false)
+	s.recentUnsent.Store(false)
 	s.currentNumMessages.Store(0)
 	s.firstUnseenSeqNum.Store(0)
 	s.savedSearchUIDs = nil // saved "$" result is scoped to the selected mailbox
@@ -581,98 +611,20 @@ func (s *IMAPSession) savedSearchResultLocked() imap.UIDSet {
 	return out
 }
 
-// decodeNumSetLocked translates client sequence numbers to server sequence numbers.
-// IMPORTANT: The caller MUST hold s.mutex (either read or write lock) when calling this method.
-func (s *IMAPSession) decodeNumSetLocked(numSet imap.NumSet) imap.NumSet {
+// decodeNumSetLocked translates a command's message set into the server view the
+// database numbers (seqView.decode). The caller holds s.mutex (a read lock will do)
+// and seqViewMu.
+func (s *IMAPSession) decodeNumSetLocked(view seqView, numSet imap.NumSet) imap.NumSet {
 	// RFC 5182 / RFC 9051 §6.4.4.1: resolve the "$" saved-search-result marker to
 	// this session's saved UID set (empty if nothing has been saved). The marker
 	// is always a UIDSet, so the result bypasses sequence-number translation.
 	if imap.IsSearchRes(numSet) {
 		return s.savedSearchResultLocked()
 	}
-
-	if s.sessionTracker == nil {
-		return numSet
+	if seqSet, ok := numSet.(imap.SeqSet); ok && view.tracker != nil {
+		return view.decode(seqSet)
 	}
-
-	// Only handle SeqSet, not UIDSet - UIDs don't need sequence number translation
-
-	seqSet, ok := numSet.(imap.SeqSet)
-	if !ok {
-		return numSet
-	}
-
-	// Use the session's current understanding of the total number of messages
-	// to resolve '*' (represented by 0 in imap.SeqRange Start/Stop).
-	// This count (s.currentNumMessages) is maintained by SELECT, APPEND (for this session),
-	// and POLL, reflecting this session's potentially slightly delayed view of the mailbox.
-	currentTotalMessagesInMailbox := s.currentNumMessages.Load()
-
-	var out imap.SeqSet
-	for _, seqRange := range seqSet {
-		actualStart := seqRange.Start
-		if seqRange.Start == 0 { // Represents '*' for the start of the range
-			if currentTotalMessagesInMailbox == 0 {
-				actualStart = 0 // Or 1, but 0 is fine; DecodeSeqNum(0) is 0.
-			} else {
-				actualStart = currentTotalMessagesInMailbox
-			}
-		}
-
-		actualStop := seqRange.Stop
-		if seqRange.Stop == 0 { // Represents '*' for the end of the range
-			if currentTotalMessagesInMailbox == 0 {
-				actualStop = 0
-			} else {
-				actualStop = currentTotalMessagesInMailbox
-			}
-		}
-
-		// Use the sequence numbers directly without decoding.
-		// In our database-authoritative design, the database maintains canonical sequence
-		// numbers via triggers, and client sequence numbers should match database sequences.
-		// We don't use DecodeSeqNum because:
-		// 1. Database triggers immediately renumber sequences after expunge
-		// 2. Clients receive expunge notifications to stay in sync
-		// 3. DecodeSeqNum would double-adjust for expunges already reflected in the database
-		start := actualStart
-		stop := actualStop
-
-		// Validate the range is non-zero and within bounds
-		if start == 0 && seqRange.Start != 0 {
-			continue
-		}
-		if stop == 0 && seqRange.Stop != 0 {
-			continue
-		}
-		out = append(out, imap.SeqRange{Start: start, Stop: stop})
-	}
-	if len(out) == 0 && len(seqSet) > 0 {
-		return imap.SeqSet{}
-	}
-	return out
-}
-
-// decodeNumSet translates client sequence numbers to server sequence numbers.
-// It safely acquires the read mutex to protect access to session state.
-func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
-	// Acquire read mutex with timeout to protect access to session state
-	if s.ctx.Err() != nil {
-		s.DebugLog("session context cancelled, skipping decodeNumSet")
-		// Return unmodified set if context is cancelled
-		return numSet
-	}
-
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-	if !acquired {
-		s.DebugLog("failed to acquire read lock for decodeNumSet within timeout")
-		// Return unmodified set if we can't acquire the lock
-		return numSet
-	}
-	defer release()
-
-	// Use the helper method that assumes the caller holds the lock
-	return s.decodeNumSetLocked(numSet)
+	return numSet
 }
 
 // triggerCacheWarmup starts the cache warmup process if configured.
@@ -702,9 +654,11 @@ func (s *IMAPSession) triggerCacheWarmup() {
 	}
 }
 
-// registerConnection registers the connection in the connection tracker
-func (s *IMAPSession) registerConnection(email string) error {
-	if s.server.connTracker != nil && s.IMAPUser != nil {
+// registerConnection takes a slot for the logging-in account in the connection
+// tracker. It runs before s.IMAPUser / s.Session.User are set so a rejected
+// login leaves the session unauthenticated.
+func (s *IMAPSession) registerConnection(accountID int64, email string) error {
+	if s.server.connTracker != nil {
 		// Use configured database query timeout for connection tracking (database INSERT)
 		queryTimeout := s.server.rdb.GetQueryTimeout()
 		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
@@ -715,8 +669,8 @@ func (s *IMAPSession) registerConnection(email string) error {
 		// the PROXY header or a trusted proxy's ID forwarding.
 		clientAddr := s.RemoteIP
 
-		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "IMAP", clientAddr); err != nil {
-			s.InfoLog("connection registration rejected", "error", err)
+		if err := s.server.connTracker.RegisterConnection(ctx, accountID, email, "IMAP", clientAddr); err != nil {
+			s.InfoLog("connection registration rejected", "address", email, "error", err)
 			return err
 		}
 		s.trackedClientAddr = clientAddr
@@ -755,7 +709,7 @@ func (s *IMAPSession) startTerminationPoller() {
 	netConn := s.conn.NetConn()
 
 	// Register session for kick notifications and get a channel that closes on kick
-	kickChan := s.server.connTracker.RegisterSession(accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(accountID, s.authSessionGeneration)
 
 	go func() {
 		// Unregister when done

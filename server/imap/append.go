@@ -85,6 +85,12 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		metrics.CommandDuration.WithLabelValues("imap", "APPEND").Observe(time.Since(start).Seconds())
 	}
 
+	if imapErr := s.sharedRootDestinationRefusal("APPEND", mboxName); imapErr != nil {
+		s.classifyAndTrackError("APPEND", nil, imapErr)
+		recordMetrics(imapErr)
+		return nil, imapErr
+	}
+
 	// Create a context that signals to use the master DB if the session is pinned.
 	readCtx := ctx
 	if s.useMasterDB.Load() {
@@ -209,6 +215,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	// Parse message headers (this does not consume the body)
 	var subject, messageID string
 	var sentDate time.Time
+	var sentDateUnknownZone bool
 	var inReplyTo []string
 	var references []string
 	var actualPlaintextBody string
@@ -218,7 +225,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		mailHeader := mail.Header{Header: messageContent.Header}
 		subject, _ = mailHeader.Subject()
 		messageID, _ = mailHeader.MessageID()
-		sentDate, _ = mailHeader.Date()
+		sentDate, sentDateUnknownZone, _ = helpers.ParseDateHeaderWithZone(mailHeader.Get("Date"))
 		inReplyTo, _ = mailHeader.MsgIDList("In-Reply-To")
 		references, _ = mailHeader.MsgIDList("References")
 
@@ -378,26 +385,28 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	// attachment from an undecidable or synthetic BODYSTRUCTURE.
 	appendFlags = db.WithAttachmentKeyword(appendFlags, fullMessageBytes, false)
 
+	ownMessagesDone := s.beginOwnMessages(mailbox.ID)
 	_, messageUID, err := s.server.rdb.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
-			AccountID:     destAccountID,
-			MailboxID:     mailbox.ID,
-			S3Domain:      destS3Domain,
-			S3Localpart:   destS3Localpart,
-			MailboxName:   mailbox.Name,
-			ContentHash:   contentHash,
-			MessageID:     messageID,
-			Flags:         appendFlags,
-			InternalDate:  internalDate, // RFC 9051 §6.3.12: APPEND date-time, else now
-			Size:          size,
-			Subject:       subject,
-			PlaintextBody: actualPlaintextBody,
-			SentDate:      sentDate,
-			InReplyTo:     inReplyTo,
-			References:    references,
-			BodyStructure: &bodyStructure,
-			Recipients:    recipients,
-			FTSRetention:  s.server.ftsRetention,
+			AccountID:           destAccountID,
+			MailboxID:           mailbox.ID,
+			S3Domain:            destS3Domain,
+			S3Localpart:         destS3Localpart,
+			MailboxName:         mailbox.Name,
+			ContentHash:         contentHash,
+			MessageID:           messageID,
+			Flags:               appendFlags,
+			InternalDate:        internalDate, // RFC 9051 §6.3.12: APPEND date-time, else now
+			Size:                size,
+			Subject:             subject,
+			PlaintextBody:       actualPlaintextBody,
+			SentDate:            sentDate,
+			SentDateUnknownZone: sentDateUnknownZone,
+			InReplyTo:           inReplyTo,
+			References:          references,
+			BodyStructure:       &bodyStructure,
+			Recipients:          recipients,
+			FTSRetention:        s.server.ftsRetention,
 		},
 		db.PendingUpload{
 			InstanceID:  s.server.instanceID,
@@ -406,6 +415,10 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 			AccountID:   destAccountID,
 		})
 	if err != nil {
+		// A duplicate is answered with the UID of a message this APPEND did
+		// not create, which still gets its NOTIFY MessageNew FETCH.
+		ownMessagesDone()
+
 		// Handle duplicate messages (either pre-detected or from unique constraint violation)
 		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
 			// For duplicates, NEVER delete the file. This prevents a race condition where:
@@ -440,6 +453,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		recordMetrics(ierr)
 		return nil, ierr
 	}
+	ownMessagesDone(imap.UID(messageUID))
 
 	// Before updating the session state, check if the context is still valid
 	// and then update the session state under mutex protection

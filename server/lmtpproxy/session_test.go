@@ -1,6 +1,7 @@
 package lmtpproxy
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/migadu/sora/server"
@@ -8,9 +9,10 @@ import (
 
 func TestExtractAddress(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		expected string
+		name       string
+		input      string
+		expected   string
+		unreadable bool
 	}{
 		{
 			name:     "basic angle bracket address",
@@ -53,9 +55,59 @@ func TestExtractAddress(t *testing.T) {
 			expected: "user@example.com",
 		},
 		{
-			name:     "address with no closing bracket (invalid)",
-			input:    "<user@example.com",
-			expected: "",
+			name:       "address with no closing bracket (invalid)",
+			input:      "<user@example.com",
+			unreadable: true,
+		},
+		{
+			name:       "opening bracket only (invalid)",
+			input:      "<",
+			unreadable: true,
+		},
+		{
+			name:       "one character (invalid)",
+			input:      "x",
+			unreadable: true,
+		},
+		{
+			name:       "quoted null path (invalid)",
+			input:      `"<>"`,
+			unreadable: true,
+		},
+		{
+			name:     "quoted address",
+			input:    `"<user@example.com>"`,
+			expected: "user@example.com",
+		},
+		{
+			name:       "null path with trailing domain (invalid)",
+			input:      "<>@example.org",
+			unreadable: true,
+		},
+		{
+			name:       "null path followed by second path (invalid)",
+			input:      "<><sender@example.org>",
+			unreadable: true,
+		},
+		{
+			name:       "angle bracket address with trailing domain (invalid)",
+			input:      "<user@example.com>@other.org",
+			unreadable: true,
+		},
+		{
+			name:       "angle bracket address with unseparated parameter (invalid)",
+			input:      "<user@example.com>SIZE=1234",
+			unreadable: true,
+		},
+		{
+			name:       "quoted address with trailing parameter (invalid)",
+			input:      `"<user@example.com> NOTIFY=NEVER"`,
+			unreadable: true,
+		},
+		{
+			name:       "unclosed quoted address (invalid)",
+			input:      `"<user@example.com>`,
+			unreadable: true,
 		},
 	}
 
@@ -65,9 +117,9 @@ func TestExtractAddress(t *testing.T) {
 			s := &Session{
 				server: &Server{},
 			}
-			result := s.extractAddress(tt.input)
-			if result != tt.expected {
-				t.Errorf("extractAddress(%q) = %q, want %q", tt.input, result, tt.expected)
+			result, ok := s.extractAddress(tt.input)
+			if result != tt.expected || ok == tt.unreadable {
+				t.Errorf("extractAddress(%q) = %q, %v, want %q, %v", tt.input, result, ok, tt.expected, !tt.unreadable)
 			}
 		})
 	}
@@ -79,6 +131,7 @@ func TestFindParameter(t *testing.T) {
 		args     []string
 		prefix   string
 		expected string
+		params   []string
 		found    bool
 	}{
 		{
@@ -86,6 +139,7 @@ func TestFindParameter(t *testing.T) {
 			args:     []string{"TO:", "<user@example.com>", "NOTIFY=NEVER"},
 			prefix:   "TO:",
 			expected: "<user@example.com>",
+			params:   []string{"NOTIFY=NEVER"},
 			found:    true,
 		},
 		{
@@ -93,6 +147,7 @@ func TestFindParameter(t *testing.T) {
 			args:     []string{"TO:<user@example.com>", "NOTIFY=NEVER"},
 			prefix:   "TO:",
 			expected: "<user@example.com>",
+			params:   []string{"NOTIFY=NEVER"},
 			found:    true,
 		},
 		{
@@ -100,140 +155,55 @@ func TestFindParameter(t *testing.T) {
 			args:     []string{"FROM:", "<sender@example.com>", "SIZE=1234"},
 			prefix:   "FROM:",
 			expected: "<sender@example.com>",
+			params:   []string{"SIZE=1234"},
 			found:    true,
 		},
 		{
 			name:     "FROM: without space",
-			args:     []string{"FROM:<sender@example.com>", "SIZE=1234"},
+			args:     []string{"FROM:<sender@example.com>", "SIZE=1234", "SMTPUTF8"},
+			prefix:   "FROM:",
+			expected: "<sender@example.com>",
+			params:   []string{"SIZE=1234", "SMTPUTF8"},
+			found:    true,
+		},
+		{
+			name:     "no parameters",
+			args:     []string{"from:<sender@example.com>"},
 			prefix:   "FROM:",
 			expected: "<sender@example.com>",
 			found:    true,
 		},
 		{
-			name:     "parameter not found",
-			args:     []string{"SIZE=1234"},
-			prefix:   "TO:",
-			expected: "",
-			found:    false,
+			name:   "parameter not found",
+			args:   []string{"SIZE=1234"},
+			prefix: "TO:",
+			found:  false,
+		},
+		{
+			name:   "parameter before the path",
+			args:   []string{"NOTIFY=NEVER", "TO:<user@example.com>"},
+			prefix: "TO:",
+			found:  false,
+		},
+		{
+			name:   "prefix without a path",
+			args:   []string{"TO:"},
+			prefix: "TO:",
+			found:  false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, found := findParameter(tt.args, tt.prefix)
+			result, params, found := findParameter(tt.args, tt.prefix)
 			if found != tt.found {
 				t.Errorf("findParameter(%v, %q) found = %v, want %v", tt.args, tt.prefix, found, tt.found)
 			}
 			if result != tt.expected {
 				t.Errorf("findParameter(%v, %q) = %q, want %q", tt.args, tt.prefix, result, tt.expected)
 			}
-		})
-	}
-}
-
-func TestStripUnsupportedRCPTParameters(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{
-			name:     "RCPT with NOTIFY=NEVER",
-			input:    "RCPT TO:<user@example.com> NOTIFY=NEVER",
-			expected: "RCPT TO:<user@example.com>",
-		},
-		{
-			name:     "RCPT with NOTIFY=SUCCESS,FAILURE",
-			input:    "RCPT TO:<user@example.com> NOTIFY=SUCCESS,FAILURE",
-			expected: "RCPT TO:<user@example.com>",
-		},
-		{
-			name:     "RCPT with ORCPT parameter",
-			input:    "RCPT TO:<user@example.com> ORCPT=rfc822;user@example.com",
-			expected: "RCPT TO:<user@example.com>",
-		},
-		{
-			name:     "RCPT with both NOTIFY and ORCPT",
-			input:    "RCPT TO:<user@example.com> NOTIFY=NEVER ORCPT=rfc822;user@example.com",
-			expected: "RCPT TO:<user@example.com>",
-		},
-		{
-			name:     "RCPT with NOTIFY and unknown parameter (allowlist: both stripped)",
-			input:    "RCPT TO:<user@example.com> NOTIFY=NEVER SOMEOTHER=value",
-			expected: "RCPT TO:<user@example.com>",
-		},
-		{
-			name:     "Plain RCPT without parameters",
-			input:    "RCPT TO:<user@example.com>",
-			expected: "RCPT TO:<user@example.com>",
-		},
-		{
-			name:     "RCPT with space after TO:",
-			input:    "RCPT TO: <user@example.com> NOTIFY=NEVER",
-			expected: "RCPT TO: <user@example.com>",
-		},
-		{
-			name:     "Non-RCPT command (should not be modified)",
-			input:    "MAIL FROM:<sender@example.com> NOTIFY=NEVER",
-			expected: "MAIL FROM:<sender@example.com> NOTIFY=NEVER",
-		},
-		{
-			name:     "Mixed case NOTIFY",
-			input:    "RCPT TO:<user@example.com> notify=never",
-			expected: "RCPT TO:<user@example.com>",
-		},
-		{
-			name:     "Case insensitive RCPT command",
-			input:    "rcpt to:<user@example.com> NOTIFY=NEVER",
-			expected: "rcpt to:<user@example.com>",
-		},
-		{
-			name:     "RCPT with RET parameter",
-			input:    "RCPT TO:<user@example.com> RET=FULL",
-			expected: "RCPT TO:<user@example.com>",
-		},
-		{
-			name:     "RCPT with ENVID parameter",
-			input:    "RCPT TO:<user@example.com> ENVID=abc123",
-			expected: "RCPT TO:<user@example.com>",
-		},
-		{
-			name:     "RCPT with all DSN parameters",
-			input:    "RCPT TO:<user@example.com> NOTIFY=NEVER ORCPT=rfc822;user@example.com RET=FULL ENVID=abc123",
-			expected: "RCPT TO:<user@example.com>",
-		},
-		{
-			name:     "RCPT with XRCPTFORWARD (should be kept)",
-			input:    "RCPT TO:<user@example.com> XRCPTFORWARD=forward@example.com",
-			expected: "RCPT TO:<user@example.com> XRCPTFORWARD=forward@example.com",
-		},
-		{
-			name:     "RCPT with DSN and XRCPTFORWARD mixed",
-			input:    "RCPT TO:<user@example.com> NOTIFY=NEVER XRCPTFORWARD=forward@example.com ORCPT=rfc822;user@example.com",
-			expected: "RCPT TO:<user@example.com> XRCPTFORWARD=forward@example.com",
-		},
-		{
-			name:     "RCPT with unknown parameter (allowlist approach - should be stripped)",
-			input:    "RCPT TO:<user@example.com> UNKNOWN=value",
-			expected: "RCPT TO:<user@example.com>",
-		},
-		{
-			name:     "RCPT with SIZE parameter (not in allowlist - should be stripped)",
-			input:    "RCPT TO:<user@example.com> SIZE=1234",
-			expected: "RCPT TO:<user@example.com>",
-		},
-		{
-			name:     "RCPT with mix of allowed and disallowed",
-			input:    "RCPT TO:<user@example.com> UNKNOWN1=a XRCPTFORWARD=fwd@example.com UNKNOWN2=b NOTIFY=NEVER",
-			expected: "RCPT TO:<user@example.com> XRCPTFORWARD=fwd@example.com",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := stripUnsupportedRCPTParameters(tt.input)
-			if result != tt.expected {
-				t.Errorf("stripUnsupportedRCPTParameters(%q) = %q, want %q", tt.input, result, tt.expected)
+			if !slices.Equal(params, tt.params) {
+				t.Errorf("findParameter(%v, %q) params = %q, want %q", tt.args, tt.prefix, params, tt.params)
 			}
 		})
 	}
@@ -299,16 +269,16 @@ func TestRCPTWithESMTPParameters(t *testing.T) {
 				prefix = "FROM:"
 			}
 
-			param, found := findParameter(args, prefix)
+			param, _, found := findParameter(args, prefix)
 			if !found {
 				t.Fatalf("findParameter(%v, %q) not found", args, prefix)
 			}
 
 			// Extract the address
 			s := &Session{server: &Server{}}
-			address := s.extractAddress(param)
-			if address != tt.expectedAddress {
-				t.Errorf("extractAddress(%q) = %q, want %q", param, address, tt.expectedAddress)
+			address, ok := s.extractAddress(param)
+			if !ok || address != tt.expectedAddress {
+				t.Errorf("extractAddress(%q) = %q, %v, want %q, true", param, address, ok, tt.expectedAddress)
 			}
 		})
 	}

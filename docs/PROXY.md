@@ -64,9 +64,18 @@ a byte pipe. Everything after login (capabilities, IDLE, FETCH) is the backend's
 
 The LMTP proxy does not log in. For each `RCPT TO` it finds the recipient's backend, connects (or
 reuses the connection it holds) and forwards the command. Like the backend, it does not announce
-`DSN`, so the sending MTA issues the notifications a sender asked for (RFC 3461 §5.2.2); `NOTIFY`,
-`ORCPT`, `RET` and `ENVID` sent anyway are accepted and not forwarded. The User API proxy forwards
-each HTTP request; the backend checks the JWT token.
+`DSN`, so the sending MTA issues the notifications a sender asked for (RFC 3461 §5.2.2). As on the
+backend, a `MAIL` or `RCPT` parameter the proxy does not implement gets `555 5.5.4` (RFC 5321
+§4.1.1.11), `NOTIFY`, `ORCPT`, `RET`, `ENVID` and `AUTH` among them. It takes `SIZE`, `SMTPUTF8` and
+`BODY=7BIT` or `BODY=8BITMIME` on `MAIL`, and `XRCPTFORWARD` on `RCPT`, which it forwards. As on
+the backend, a malformed parameter gets `501 5.5.4`: `SMTPUTF8` with a value, or any parameter
+written with `=` and no value (RFC 5321 §4.1.2). A `MAIL`
+refused for a parameter starts no transaction; a refused `RCPT` leaves the transaction open for the
+next recipient. As on the backend, `MAIL` before `LHLO` gets `503 5.5.1`. A later `LHLO`, or a completed `STARTTLS`, starts the session over:
+the transaction in progress ends, and a held backend connection is closed, so the next recipient
+reaches the backend on a new connection (with `remote_use_xclient`, its `XCLIENT HELO=` is the new
+`LHLO` name). After `STARTTLS` the MTA must send `LHLO` again before `MAIL`. The User API proxy
+forwards each HTTP request; the backend checks the JWT token.
 
 A node can run proxies and backend servers in the same process. A node that runs only proxies is a
 **proxy node**. [Section 13](#13-proxy-nodes-and-the-database) explains when such a node connects
@@ -125,10 +134,11 @@ carries its own copy and these server keys are not used for pool members (except
 | `timeouts.command_timeout` | IMAP `30m`, POP3 `10m`, ManageSieve `3m` | Idle timeout. |
 | `timeouts.absolute_session_timeout` | `24h`, LMTP `5m` | Longest a session may last. |
 | `timeouts.min_bytes_per_minute` | `0` (off) | Slow-client guard. |
-| `max_connections`, `max_connections_per_ip` | `0` (unlimited) | Per proxy instance. |
+| `max_connections` | `0` (unlimited) | Per proxy listener. |
+| `max_connections_per_ip` | `0` (unlimited) | Per proxy listener. The LMTP proxy ignores it with a warning. With `[cluster]` enabled, the IMAP, POP3 and ManageSieve proxies count an address's connections on every node; see [CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies). With `proxy_protocol`, the address counted is the client the header names ([SECURITY.md](SECURITY.md#4-connection-limits)). |
 | `max_connections_per_user`, `max_connections_per_user_per_ip` | `0` | IMAP, POP3 and ManageSieve proxies only, and only with `[cluster]` enabled; see [CLUSTER.md](CLUSTER.md). The LMTP proxy ignores them with a warning. |
 | `limits.max_auth_errors` | `2` | Protocol errors before login (unknown or malformed commands, logins refused without TLS) before the connection is closed. Wrong passwords do not count. |
-| `auth_rate_limit` | off | See [AUTHENTICATION.md](AUTHENTICATION.md). |
+| `auth_rate_limit` | off | See [AUTHENTICATION.md](AUTHENTICATION.md). With `[cluster]` enabled, the IMAP, POP3 and ManageSieve proxies share it; see [CLUSTER.md](CLUSTER.md#66-authentication-rate-limits-imap-pop3-and-managesieve-proxies). |
 | `listen_backlog` | `1024` (mail proxies) | TCP accept backlog. |
 | `debug` | `false` | Log the protocol exchange, with passwords masked. |
 | `proxy_protocol`, `proxy_protocol_timeout` | off, `5s` | Accept a PROXY header from a load balancer in front of the proxy. The load balancer's address must be in `[servers] trusted_networks`. |
@@ -461,6 +471,8 @@ with `remote_port = 24` dials `10.0.1.21:24`.
 Sora checks the pools at startup and refuses to start when:
 
 - a pool has no `name`, a name with whitespace, the same name as another pool, or no `backends`;
+- a backend is empty or has whitespace inside it (`"192.0.2.10 :143"`; spaces at the ends are
+  trimmed);
 - a backend appears twice, in one pool or in two. Names are compared without letter case and IPs in
   canonical form. A backend without a port stands for its host on every port, so it clashes with
   any other entry for that host. Entries with different explicit ports may share a host;
@@ -487,8 +499,11 @@ Sora checks the pools at startup and refuses to start when:
 - An affinity that points outside the user's current pool is deleted and the user is routed
   afresh. This is how a user the API moves to another pool lands there. An affinity of another
   protocol outside the pool is skipped, not deleted.
-- The LMTP proxy holds one backend connection per session. A recipient whose pool or backend differs
-  from the held connection's gets `451 4.3.0`, so the sending MTA retries it in a new transaction.
+- The LMTP proxy holds one backend connection per session, across transactions. Until a recipient
+  of a transaction is accepted, each recipient is routed as on a fresh connection: if its pool or
+  backend differs from the held connection's, that connection is dropped and the proxy connects to
+  the recipient's backend. After that, a recipient of the same transaction that needs another pool
+  or backend gets `451 4.3.0`, so the sending MTA retries it in a new transaction.
 
 Each routing decision on a proxy with pools increments
 `sora_proxy_pool_route_total{protocol, pool, result}`, where `result` is `routed`,
@@ -661,7 +676,13 @@ addresses: every host in the list may claim any client address. See [SECURITY.md
 
 You need only one way to pass the client address. PROXY protocol works for all protocols and keeps
 the backend from seeing the proxy's address at all. `ID` and `XCLIENT` work without changing the
-backend's listener.
+backend's listener. On IMAP and POP3, a backend that receives a PROXY header judges `ID` and
+`XCLIENT` by the client the header names, not by the proxy, so next to a header it ignores the `ID`
+forwarding fields and refuses the POP3 `XCLIENT` (unless that client is itself in
+`trusted_networks`); the login continues. The header already carries the client's address and
+port, its JA4 fingerprint and the proxy session ID (8.4). LMTP `XCLIENT` is judged by the proxy
+and still carries the client's `HELO` next to a PROXY header
+([SECURITY.md](SECURITY.md#31-trusted_networks)).
 
 ### 8.2 Which settings apply
 
@@ -710,13 +731,25 @@ With `remote_use_id_command`, the IMAP proxy sends one `ID` command before it lo
 are `name` (`Sora-Proxy`), `x-originating-ip`, `x-originating-port`, `x-connected-ip`,
 `x-connected-port`, `x-session-id`, `x-proxy-ttl` (10), and `x-forward-proxy-server`,
 `x-forward-proxy-user`, `x-forward-proxy-source-ip` and, when known, `x-forward-ja4-fingerprint`. A
-failure is logged and the login continues.
+backend that refuses it (a tagged `NO` or `BAD`) is logged and the login continues without the
+fields. When the tagged reply is not read within `connect_timeout`, or the connection fails before
+it, the login fails as a backend failure (`NO [UNAVAILABLE]`): a late reply would be read as the
+reply to the login.
 
 ### 8.6 XCLIENT
 
 With `remote_use_xclient`, the POP3 proxy sends `XCLIENT ADDR=... PORT=... SESSION=... TTL=10
 FORWARD=...` before it logs in; the LMTP proxy sends `XCLIENT ADDR=... PORT=... HELO=...
-PROTO=ESMTP` (IPv6 addresses as `ADDR=IPV6:...`).
+PROTO=ESMTP` (IPv6 addresses as `ADDR=IPV6:...`) before `MAIL FROM`.
+
+A refusal (POP3 `-ERR`; LMTP `5xx`, or `4xx` other than `421`) is logged and the session
+continues. The client's address can still have been supplied by a PROXY header. When the reply
+is not read within `connect_timeout` (for an LMTP
+backend that answers with a new `220` greeting, also the reply to the `LHLO` the proxy then sends),
+the backend connection fails: POP3 answers `-ERR [SYS/TEMP]`, LMTP `451 4.4.1`. A late reply would
+otherwise be read as the reply to the next command (POP3 replies carry no tag, so a late `+OK` would
+pass for the login's). The LMTP connection also fails on a `421`, on a malformed reply or one with
+any other code, and when the backend does not answer that `LHLO` with `250`.
 
 ### 8.7 POP3 UTF8
 
@@ -843,9 +876,12 @@ delete it on a failed backend connection, so an outage does not send one lookup 
 Failures are cached only when definite: a wrong password, or a user who does not exist. Database and
 API outages are not cached.
 
-A password change, credential removal or account deletion made through the Admin API or
-`sora-admin` drops the account's entries from the lookup cache of every proxy, whichever node or
-tool makes the change, so the old credentials stop working at once. A password changed in the remote lookup API's own system reaches
+Nodes with database access synchronize PostgreSQL credential changes from the primary, normally
+on the next five-second poll, in addition to administrative invalidation gossip. Failed feed or
+cache synchronization suspends hits and fills until recovery; cache misses authenticate on the
+primary. In-flight fills are fenced against invalidation. See
+[AUTHENTICATION.md](AUTHENTICATION.md#12-cached-logins-and-password-changes) for startup, upgrade,
+retention-gap and restore requirements. A password changed in the remote lookup API's own system reaches
 the proxy as entries expire: the old password still works for up to `positive_ttl` for a user who
 used it recently, and the new one may be refused for up to `positive_revalidation_window`.
 
@@ -860,7 +896,7 @@ used it recently, and the new one may be refused for up to `positive_revalidatio
 | `negative_ttl` | `1m` | How long a failure is kept. |
 | `max_size` | `50000` | Entries per proxy server. When full, the oldest entry is removed. |
 | `cleanup_interval` | `5m` | How often expired entries are removed. |
-| `positive_revalidation_window` | `30s` | Age below which a different password on a success entry is rejected without a check. |
+| `positive_revalidation_window` | `30s` | Age below which a different password on a success entry is rejected without a check. Not used by the LMTP and User API proxies, which check no passwords against the cache; they warn at startup when it is set. |
 
 Durations take Go units (`90s`, `5m`, `1h`) or whole days (`1d`).
 
@@ -898,9 +934,14 @@ by the remote lookup, and master logins, never use it. It needs the node to have
 Errors reading the file are logged and the login goes to the database. The cache never fails a
 login by itself.
 
-A password change, credential removal or account deletion made through the Admin API or
-`sora-admin` removes the account's entries on every node, so the old credentials stop working at
-the proxies at once.
+The primary credential-change feed invalidates this cache without depending on gossip reaching
+every node. The cache stays suspended until initial namespace/provenance checks and feed
+synchronization succeed; subsequent synchronization failures disable it again. Credential reads
+and fills use primary data, and a generation fence rejects fills that crossed an invalidation.
+An untracked or different-database cache is cleared before reuse; normal restarts with matching
+provenance can retain warm rows. See
+[AUTHENTICATION.md](AUTHENTICATION.md#12-cached-logins-and-password-changes) for limitations and
+operational requirements.
 
 ### 11.3 On disk
 
@@ -934,10 +975,10 @@ Sora logs `AuthCache: Failed to initialize - continuing without auth cache` and 
 | Key (`[auth_cache]`) | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Turn the cache on. |
-| `path` | `/tmp/sora/auth_cache.db` | The SQLite file. |
-| `max_age` | `24h` | Entries older than this are not used, and are deleted at cleanup. |
+| `path` | `/var/cache/sora/auth_cache.db` | The SQLite file. |
+| `max_age` | `24h` | Entries older than this are not used, and are deleted at cleanup. Capped at seven days, the credential-feed retention. |
 | `purge_unused` | `168h` | Entries not used for this long are deleted at cleanup. |
-| `cleanup_interval` | `1h` | How often cleanup runs. |
+| `cleanup_interval` | `1h` | How often cleanup runs. Must be positive. |
 
 Durations accept `d` for days (`7d`).
 
@@ -962,11 +1003,11 @@ cache_path = "/var/lib/sora/affinity_cache.db"
 ```
 
 - Used only with `[cluster]` and `[cluster.affinity]` enabled and `cache_path` set.
-- At startup, entries that have not expired are loaded. The gossip handler is registered
-  before the file is loaded, and queues incoming
-  events until the initial snapshot is ready. Those events are then applied and written using
-  their timestamps: an older SET cannot replace a newer stored assignment, and a newer delete
-  removes the stored entry.
+- At startup, entries that have not expired are loaded. The file is opened before the node joins
+  the cluster, and the gossip handler is registered right after the join, before the file is
+  loaded; it queues incoming events until the initial snapshot is ready. Those events are then
+  applied and written using their timestamps: an older SET cannot replace a newer stored
+  assignment, and a newer delete removes the stored entry.
 - Every change (set, update, delete, also those received by gossip) is written to the file in the
   background, in the order the changes were made, each write with a 2-second limit. A key changed
   again before its write starts is written once, with its latest state. Gossip changes apply only
@@ -999,7 +1040,7 @@ What a proxy needs PostgreSQL for:
 A node that runs only proxies, all of them with a remote lookup and none with
 `lookup_local_users = true`, does not need PostgreSQL to check users and can leave `[database]`
 out. It logs
-`Skipping database initialization - running in proxy-only mode with remote_lookup`.
+`Skipping database initialization - no server on this node queries it`.
 
 On a node without database access:
 
@@ -1012,7 +1053,11 @@ An `http_admin_api` server on a proxy node lets you see the proxies' backend hea
 Sora treats the database as not configured when `[database.write]` and `[database.read]` are absent
 or have empty `hosts`. A node that needs the database while it is not configured refuses to start,
 and `sora-admin config validate` refuses its file, with `[database]: server "<name>" (<type>) needs
-the database, but it is not configured in [database.write] or [database.read]`.
+the database, but it is not configured in [database.write] or [database.read]`. A proxy that checks
+passwords in the database needs `[database.write]` hosts even though it mostly reads: start-up runs
+the migrations there, and a login rehashes a password whose hash is outdated. With `[database.read]`
+hosts alone the proxy refuses to start with `[database.write]: server "<name>" (<type>) needs the
+database, but [database.write] has no hosts; ...`.
 
 ---
 
@@ -1038,8 +1083,15 @@ Notes:
   of maintenance, because it cannot be sure. A recipient the remote lookup does not know gets the
   same reply whether the answer is fresh or comes from the lookup cache: `550 5.1.1`, or `450 4.1.1`
   with `user_not_found_response = "tempfail"`.
-- An LMTP recipient that needs another backend or pool than the session's held connection gets
+- An LMTP recipient that needs another backend or pool than the one holding an already accepted
+  recipient of the same transaction gets
   `451 4.3.0 Recipient requires different backend server, start new transaction` (or `... pool ...`).
+  While the transaction has no accepted recipient, the held connection is replaced instead.
+- The LMTP proxy answers `MAIL` itself and sends it to the backend with the first recipient. When
+  the backend refuses the sender (`501` or `553`, as a Sora backend answers a sender it cannot
+  parse or does not accept), each recipient gets `553 5.1.7 Invalid sender`, a bounce, as on a
+  direct connection; when it refuses the declared `SIZE=` (`552`), each recipient gets
+  `552 5.3.4`. Any other refusal of `MAIL` counts as a failed backend connection (`451 4.4.1`).
 
 ---
 

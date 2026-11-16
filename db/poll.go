@@ -26,7 +26,14 @@ type MailboxPoll struct {
 	Updates     []MessageUpdate
 	NumMessages uint32
 	ModSeq      uint64
-	HighestUID  imap.UID // mailboxes.highest_uid, read before NumMessages was counted
+	HighestUID  imap.UID // mailboxes.highest_uid, read no later than NumMessages was counted
+	// PhantomModSeq is the highest modseq of a message created and expunged since
+	// sinceModSeq, which Updates leaves out: the client was never told it existed. A
+	// cursor advanced past the changes in Updates must also pass it, or the message
+	// would sit in the client's view as of the cursor (created at or before it,
+	// expunged after it) and the next poll would report its expunge at the sequence
+	// number of the message that follows it.
+	PhantomModSeq uint64
 }
 
 // pollMailboxStateQuery is the single statement a poll that finds nothing changed
@@ -43,10 +50,34 @@ const pollMailboxStateQuery = `
 	WHERE mb.id = $1
 `
 
-// pollMailboxActiveCountQuery counts the messages a client can see, for the polls that
-// have changes to report.
+// pollMailboxActiveCountQuery counts the messages a client can see, for a poll with
+// nothing to report that found no mailbox_stats row to take the count from.
 const pollMailboxActiveCountQuery = `SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL`
 
+// pollMailboxSnapshotQuery is the first statement of a poll that has changes to report,
+// so it fixes the snapshot the rest of the poll reads: the mailbox state again, as of that
+// snapshot, and the live message count.
+const pollMailboxSnapshotQuery = `
+	SELECT
+		COALESCE(ms.highest_modseq, 0) AS highest_modseq,
+		mb.highest_uid,
+		(SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL) AS message_count
+	FROM mailboxes mb
+	LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
+	WHERE mb.id = $1
+`
+
+// PollMailbox reports what changed in a mailbox since sinceModSeq, numbered for a client
+// whose view stands at it.
+//
+// A poll that has changes to report reads them in one REPEATABLE READ snapshot, so that the
+// count, the changes and their sequence numbers describe the same mailbox. Otherwise a write
+// committing between two of those statements makes them disagree: a message delivered after
+// the count is reported as new at a sequence number past the EXISTS the count gives (a
+// client numbers new messages from EXISTS, RFC 9051 §2.3.1.2), an expunge after the count is
+// reported while the count still holds the message, and a delivery before the numbering
+// shifts the numbers counted back from the total. A write that commits after the snapshot
+// is left to the next poll: the cursor only passes changes the snapshot holds.
 func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSeq uint64) (*MailboxPoll, error) {
 	// OPTIMIZATION: Early exit if modseq hasn't changed
 	// This avoids expensive window functions when mailbox is idle
@@ -62,21 +93,19 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		return nil, fmt.Errorf("failed to get mailbox stats: %w", err)
 	}
 
-	// The count is measured live whenever this poll has changes to report. A poll that
-	// reports nothing takes the cached counter instead: mailbox_stats.message_count is
-	// written by the same trigger statement that advances highest_modseq, so while the
-	// modseq stands still that counter stands still too, and it is the very value SELECT
-	// seeded the session's message count from (GetMailboxSummary). A missing stats row is
-	// the state the cache is known to get wrong, so it falls back to counting.
-	messageCount := int(cachedMessageCount.Int32)
-	if currentModSeq > sinceModSeq || !cachedMessageCount.Valid {
-		if err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, pollMailboxActiveCountQuery, mailboxID).Scan(&messageCount); err != nil {
-			return nil, fmt.Errorf("failed to count active messages: %w", err)
-		}
-	}
-
-	// If modseq hasn't changed, return early with no updates
+	// If modseq hasn't changed, return early with no updates. Such a poll takes the cached
+	// counter: mailbox_stats.message_count is written by the same trigger statement that
+	// advances highest_modseq, so while the modseq stands still that counter stands still
+	// too, and it is the very value SELECT seeded the session's message count from
+	// (GetMailboxSummary). A missing stats row is the state the cache is known to get
+	// wrong, so it falls back to counting.
 	if currentModSeq <= sinceModSeq {
+		messageCount := int(cachedMessageCount.Int32)
+		if !cachedMessageCount.Valid {
+			if err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, pollMailboxActiveCountQuery, mailboxID).Scan(&messageCount); err != nil {
+				return nil, fmt.Errorf("failed to count active messages: %w", err)
+			}
+		}
 		return &MailboxPoll{
 			Updates:     []MessageUpdate{},
 			NumMessages: uint32(messageCount),
@@ -85,9 +114,26 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		}, nil
 	}
 
+	// Everything from here on reads one snapshot (see above). REPEATABLE READ takes it at
+	// the first statement, which re-reads the state the early exit was decided on, so the
+	// modseq, the highest UID and the count all describe the mailbox the changes come from.
+	tx, err := db.GetReadPoolWithContext(ctx).BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin poll snapshot: %w", err)
+	}
+	defer tx.Rollback(context.Background())
+
+	var messageCount int
+	if err := tx.QueryRow(ctx, pollMailboxSnapshotQuery, mailboxID).Scan(&currentModSeq, &uidNext, &messageCount); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrMailboxNotFound
+		}
+		return nil, fmt.Errorf("failed to count active messages: %w", err)
+	}
+
 	// Phase 1: Fetch Raw Changes
 	// Instead of a massive CTE pipeline, we directly pull exactly the messages that changed.
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+	rows, err := tx.Query(ctx, `
 		SELECT uid, expunged_at, flags, custom_flags, created, updated, expunged FROM (
 			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq as created, ms.updated_modseq as updated, m.expunged_modseq as expunged
 			FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
@@ -108,6 +154,12 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			FROM message_state ms JOIN messages m ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 			-- Flag updates only for active messages; an expunge is reported by the branch above.
 			WHERE ms.mailbox_id = $1 AND ms.updated_modseq > $2 AND m.expunged_at IS NULL
+			UNION
+			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq, ms.updated_modseq, m.expunged_modseq
+			FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+			-- The create+expunge-in-window phantoms themselves: never reported, read only so the
+			-- cursor can pass them (MailboxPoll.PhantomModSeq).
+			WHERE m.mailbox_id = $1 AND m.created_modseq > $2 AND m.expunged_at IS NOT NULL
 		) sub
 	`, mailboxID, sinceModSeq)
 	if err != nil {
@@ -116,6 +168,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 	defer rows.Close()
 
 	var rawUpdates []MessageUpdate
+	var phantomModSeq uint64
 	for rows.Next() {
 		var uid uint32
 		var expungedAt sql.NullTime
@@ -129,13 +182,6 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			return nil, fmt.Errorf("failed to scan raw change: %w", err)
 		}
 
-		var customFlags []string
-		if customFlagsJSON != nil {
-			if err := json.Unmarshal(customFlagsJSON, &customFlags); err != nil {
-				return nil, fmt.Errorf("failed to unmarshal custom_flags in poll: %w", err)
-			}
-		}
-
 		effective := uint64(0)
 		if created.Valid && uint64(created.Int64) > effective {
 			effective = uint64(created.Int64)
@@ -145,6 +191,19 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		}
 		if expunged.Valid && uint64(expunged.Int64) > effective {
 			effective = uint64(expunged.Int64)
+		}
+
+		// A phantom (the last branch above) is never reported; only its modseq counts.
+		if expungedAt.Valid && created.Valid && uint64(created.Int64) > sinceModSeq {
+			phantomModSeq = max(phantomModSeq, effective)
+			continue
+		}
+
+		var customFlags []string
+		if customFlagsJSON != nil {
+			if err := json.Unmarshal(customFlagsJSON, &customFlags); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal custom_flags in poll: %w", err)
+			}
 		}
 
 		bitwise := 0
@@ -165,10 +224,11 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 	}
 
 	pollData := MailboxPoll{
-		Updates:     []MessageUpdate{},
-		NumMessages: uint32(messageCount),
-		ModSeq:      currentModSeq,
-		HighestUID:  imap.UID(uidNext),
+		Updates:       []MessageUpdate{},
+		NumMessages:   uint32(messageCount),
+		ModSeq:        currentModSeq,
+		HighestUID:    imap.UID(uidNext),
+		PhantomModSeq: phantomModSeq,
 	}
 
 	if len(rawUpdates) == 0 {
@@ -187,8 +247,8 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		// pre-poll total is one query. They used to be re-evaluated inside every queued
 		// statement — a full-mailbox COUNT(*) per updated message, so a STORE over 50
 		// recent messages in a 100k mailbox cost every session's next poll ~50 index
-		// scans. Every statement of a batch gets its own READ COMMITTED snapshot anyway,
-		// so hoisting the totals adds no inconsistency the batch did not already have.
+		// scans. Every statement reads the poll's one snapshot, so the hoisted totals are
+		// exactly what each statement would have counted itself.
 		var clientTotal int
 		clientTotalKnown := false
 		batch := &pgx.Batch{}
@@ -218,7 +278,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 					// ClientTotal = ClientKnownActive + ClientKnownExpungedSince
 					// SeqNum = ClientTotal - COUNT(ClientView AND uid > Target)
 					if !clientTotalKnown {
-						if err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+						if err := tx.QueryRow(ctx, `
 							SELECT COUNT(*)::int FROM messages
 							WHERE mailbox_id = $1 AND created_modseq <= $2
 							  AND (expunged_at IS NULL OR expunged_modseq > $2)
@@ -243,7 +303,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			}
 		}
 
-		br := db.GetReadPoolWithContext(ctx).SendBatch(ctx, batch)
+		br := tx.SendBatch(ctx, batch)
 		for i := range rawUpdates {
 			var seq uint32
 			if err := br.QueryRow().Scan(&seq); err != nil {
@@ -264,7 +324,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		seqMap := make(map[uint32]uint32, len(rawUpdates))
 
 		// OPTIMIZATION: Using expunged_at IS NULL matches the active partial covering index.
-		seqRows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+		seqRows, err := tx.Query(ctx, `
 			SELECT uid, expunged_modseq
 			FROM messages
 			WHERE mailbox_id = $1 AND (expunged_at IS NULL OR (expunged_modseq > $2 AND created_modseq <= $2))

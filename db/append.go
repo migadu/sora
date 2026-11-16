@@ -148,7 +148,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	var messageIDs []int64
 	var sourceUIDsForMap []imap.UID
 	var expectedHashes []string // per message: sourceHashes, checked for re-keyed rows only
-	crossAccount := false       // any source row owned by another account: see restageFTS
+	var rekeyed []bool          // per message: owned by another account than destAccountID
 	for rows.Next() {
 		var messageID, sourceAccountID int64
 		var sourceUID imap.UID
@@ -158,7 +158,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		messageIDs = append(messageIDs, messageID)
 		sourceUIDsForMap = append(sourceUIDsForMap, sourceUID)
 		expectedHashes = append(expectedHashes, sourceHashes[sourceUID])
-		crossAccount = crossAccount || sourceAccountID != destAccountID
+		rekeyed = append(rekeyed, sourceAccountID != destAccountID)
 	}
 	if err = rows.Err(); err != nil {
 		return nil, nil, fmt.Errorf("error iterating through source messages: %w", err)
@@ -176,12 +176,18 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		return nil, nil, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 	}
 
-	// Calculate the new UIDs for the copied messages.
-	var newUIDs []int64
+	// Calculate the new UIDs for the copied messages, and split them by whether the
+	// copy is re-keyed to the destination owner (see restagePendingUploads).
+	var newUIDs, keptUIDs, rekeyedUIDs []int64
 	startUID := newHighestUID - numToCopy + 1
 	for i, sourceUID := range sourceUIDsForMap {
 		newUID := startUID + int64(i)
 		newUIDs = append(newUIDs, newUID)
+		if rekeyed[i] {
+			rekeyedUIDs = append(rekeyedUIDs, newUID)
+		} else {
+			keptUIDs = append(keptUIDs, newUID)
+		}
 		messageUIDMap[sourceUID] = imap.UID(newUID)
 	}
 
@@ -212,8 +218,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	// comment above).
 	// RFC 3501 §2.3.2: \Recent is a session flag and must NOT be stored
 	// persistently.  Preserve only the source message's existing flags.
-	// A source without a message_state row (left by an older build, see
-	// migration 000063) has none, and its copy gets a row with none.
+	// A source without a message_state row (left by an older build) has none, and its copy gets a row with none.
 	insRows, err := tx.Query(ctx, `
 		WITH src_data AS (
 			SELECT
@@ -296,12 +301,10 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	// (s3_domain/s3_localpart) and marks the new row uploaded. Without this, a
 	// cross-account copy of a not-yet-uploaded message would never reach the
 	// owner's path and would become unreadable once local staging is cleaned up.
-	// ON CONFLICT makes this a no-op for same-account copies, where the source's
-	// pending_upload already covers (content_hash, account_id).
-	if err := db.restagePendingUploads(ctx, tx, destMailboxID, newUIDs, instanceID); err != nil {
+	if err := db.restagePendingUploads(ctx, tx, destMailboxID, keptUIDs, rekeyedUIDs, instanceID); err != nil {
 		return nil, nil, err
 	}
-	if crossAccount {
+	if len(rekeyedUIDs) > 0 {
 		if err := db.restageFTS(ctx, tx, destMailboxID, newUIDs); err != nil {
 			return nil, nil, err
 		}
@@ -311,25 +314,45 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 }
 
 // restagePendingUploads ensures every just-inserted, not-yet-uploaded message in
-// (mailboxID, newUIDs) has a pending_upload under its own account so the uploader
-// writes the body under that account's S3 path. The local staging file must already
-// exist under FilePath(content_hash, account_id) (the caller hardlinks it for
-// cross-account inserts). instanceID must be the upload instance id of the node holding
-// the local file (config.InstanceID, the key its uploader leases under), not its mail
-// hostname, so its own worker, not a peer or nobody, picks the task up.
-func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailboxID int64, newUIDs []int64, instanceID string) error {
-	if len(newUIDs) == 0 {
-		return nil
+// mailboxID has a pending_upload under its own account so the uploader writes the body
+// under that account's S3 path. instanceID must be the upload instance id of the node
+// holding the local file (config.InstanceID, the key its uploader leases under), not its
+// mail hostname, so its own worker, not a peer or nobody, picks the task up.
+//
+// rekeyedUIDs are the copies of another account's rows, re-keyed to the mailbox owner. One
+// that is not uploaded is one whose body the caller has just staged on this node under
+// FilePath(content_hash, owner) (see CopyMessages), so the owner's row is re-armed for
+// this node as a fresh delivery re-arms it (InsertMessage): an existing row may be one no
+// uploader leases any more, its attempts used up or its instance gone, and left as it is
+// the copy is never uploaded and CleanupFailedUploads deletes it. DISTINCT ON because two
+// copies of one body propose the same row, which ON CONFLICT DO UPDATE refuses.
+//
+// keptUIDs are the copies of the owner's own rows. They stage nothing here: the body is
+// wherever the source was delivered, possibly another node, so an existing row is left
+// alone (DO NOTHING) rather than taken over by this one.
+func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailboxID int64, keptUIDs, rekeyedUIDs []int64, instanceID string) error {
+	if len(rekeyedUIDs) > 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO pending_uploads (instance_id, content_hash, size, created_at, account_id)
+			SELECT DISTINCT ON (m.content_hash, m.account_id) $1, m.content_hash, m.size, NOW(), m.account_id
+			FROM messages m
+			WHERE m.mailbox_id = $2 AND m.uid = ANY($3) AND m.uploaded = FALSE AND m.expunged_at IS NULL
+			ON CONFLICT (content_hash, account_id) DO UPDATE
+			SET attempts = 0, instance_id = EXCLUDED.instance_id, last_attempt = NULL`,
+			instanceID, mailboxID, rekeyedUIDs); err != nil {
+			return fmt.Errorf("failed to re-stage pending uploads: %w", err)
+		}
 	}
-	_, err := tx.Exec(ctx, `
-		INSERT INTO pending_uploads (instance_id, content_hash, size, created_at, account_id)
-		SELECT $1, m.content_hash, m.size, NOW(), m.account_id
-		FROM messages m
-		WHERE m.mailbox_id = $2 AND m.uid = ANY($3) AND m.uploaded = FALSE AND m.expunged_at IS NULL
-		ON CONFLICT (content_hash, account_id) DO NOTHING`,
-		instanceID, mailboxID, newUIDs)
-	if err != nil {
-		return fmt.Errorf("failed to re-stage pending uploads: %w", err)
+	if len(keptUIDs) > 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO pending_uploads (instance_id, content_hash, size, created_at, account_id)
+			SELECT $1, m.content_hash, m.size, NOW(), m.account_id
+			FROM messages m
+			WHERE m.mailbox_id = $2 AND m.uid = ANY($3) AND m.uploaded = FALSE AND m.expunged_at IS NULL
+			ON CONFLICT (content_hash, account_id) DO NOTHING`,
+			instanceID, mailboxID, keptUIDs); err != nil {
+			return fmt.Errorf("failed to re-stage pending uploads: %w", err)
+		}
 	}
 	return nil
 }
@@ -410,7 +433,8 @@ type InsertMessageOptions struct {
 	Size                 int64
 	Subject              string
 	PlaintextBody        string
-	SentDate             time.Time // the Date: header; zero when none parses (see storedSentDate)
+	SentDate             time.Time // The parsed Date: header; zero when none parses (see storedSentDate)
+	SentDateUnknownZone  bool      // The parser explicitly reported no known source zone
 	InReplyTo            []string
 	References           []string
 	BodyStructure        *imap.BodyStructure
@@ -502,8 +526,13 @@ const maxSentUTCOffset = 24 * 60 * 60
 // seconds, of the zone it is expressed in. Ingress passes the parsed Date: header in its own
 // zone, so sent_date plus this offset is the header's wall-clock time, whose day the SENT*
 // keys compare (RFC 9051 §6.4.4: "disregarding time and timezone"). nil (NULL, searched by
-// the UTC day) for an offset beyond maxSentUTCOffset.
-func sentUTCOffset(sentDate time.Time) *int32 {
+// the UTC day) for an offset beyond maxSentUTCOffset, and for a date whose zone is unknown
+// (unknownZone, RFC 5322 §3.3 "-0000"): its UTC day is the day it names, and
+// sentDateInHeaderZone gives it back in UTC, so its ENVELOPE date keeps the zone "-0000".
+func sentUTCOffset(sentDate time.Time, unknownZone bool) *int32 {
+	if unknownZone {
+		return nil
+	}
 	_, offset := sentDate.Zone()
 	if offset < -maxSentUTCOffset || offset > maxSentUTCOffset {
 		return nil
@@ -516,9 +545,11 @@ func sentUTCOffset(sentDate time.Time) *int32 {
 // the Date: header it was parsed from, given that row's sent_utc_offset. The ENVELOPE date
 // is formatted from it and must name the header's own day, time of day and zone (RFC 9051
 // §7.5.2: the envelope "is computed by the server by parsing the [RFC5322] header into the
-// component parts"). A row without an offset (written before migration 000060, or with a
-// zone beyond maxSentUTCOffset) is given in UTC rather than in the time.Local pgx decodes a
-// timestamptz into, so the ENVELOPE never depends on the server's TZ.
+// component parts"). A row without an offset (a zone that is unknown, one beyond
+// maxSentUTCOffset, or a row written before migration 000060) is given in UTC rather than
+// in the time.Local pgx decodes a timestamptz into, so the ENVELOPE never depends on the
+// server's TZ. Readers separately record an unknown source zone for a present
+// Date header when offset is NULL; time.Location does not carry that status.
 func sentDateInHeaderZone(sentDate time.Time, offset *int32) time.Time {
 	if offset == nil {
 		return sentDate.UTC()
@@ -799,7 +830,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		"size":            options.Size,
 		"subject":         saneSubject,
 		"sent_date":       sentDate,
-		"sent_utc_offset": sentUTCOffset(sentDate),
+		"sent_utc_offset": sentUTCOffset(sentDate, options.SentDateUnknownZone && !options.SentDate.IsZero()),
 		"date_unknown":    sentDateUnknown,
 		"in_reply_to":     saneInReplyToStr,
 		"references":      saneReferencesStr,
@@ -1172,7 +1203,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		"size":            options.Size,
 		"subject":         saneSubject,
 		"sent_date":       sentDate,
-		"sent_utc_offset": sentUTCOffset(sentDate),
+		"sent_utc_offset": sentUTCOffset(sentDate, options.SentDateUnknownZone && !options.SentDate.IsZero()),
 		"date_unknown":    sentDateUnknown,
 		"in_reply_to":     saneInReplyToStr,
 		"references":      saneReferencesStr,
@@ -1568,7 +1599,7 @@ func (d *Database) InsertMessagesBatch(
 			p.Opt.S3Domain, p.Opt.S3Localpart, p.Opt.InternalDate, p.Opt.Size, p.SaneSubject, p.SentDate,
 			p.SaneInReplyToStr, p.SaneReferencesStr, p.BodyStructureData, p.RecipientsJSON, uploaded, p.SubjectSort,
 			p.FromNameSort, p.FromEmailSort, p.ToNameSort, p.ToEmailSort, p.CcEmailSort,
-			p.BitwiseFlags, p.CustomKeywordsJSON, p.ExtraAddresses, sentUTCOffset(p.SentDate), p.SentDateUnknown,
+			p.BitwiseFlags, p.CustomKeywordsJSON, p.ExtraAddresses, sentUTCOffset(p.SentDate, p.Opt.SentDateUnknownZone && !p.Opt.SentDate.IsZero()), p.SentDateUnknown,
 		)
 
 		if !uploaded && p.Upload != nil {

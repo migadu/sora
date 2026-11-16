@@ -20,12 +20,14 @@ import (
 // retry would relay it again.
 func TestLMTP_SieveRedirectRelayedOnlyAfterStore(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		script   string
-		multiple bool
+		name       string
+		script     string
+		multiple   bool
+		failInsert bool
 	}{
-		{"redirect copy", `require ["copy"]; redirect :copy "other@example.org";`, false},
-		{"multiple fileinto and redirect", `require ["fileinto"]; fileinto "Archive"; fileinto "Projects"; fileinto "Missing"; redirect "other@example.org";`, true},
+		{"redirect copy", `require ["copy"]; redirect :copy "other@example.org";`, false, false},
+		{"multiple fileinto and redirect", `require ["fileinto"]; fileinto "Archive"; fileinto "Projects"; fileinto "Missing"; redirect "other@example.org";`, true, true},
+		{"multiple fileinto missing preflight", `require ["fileinto"]; fileinto "Archive"; fileinto "Projects"; fileinto "Missing"; redirect "other@example.org";`, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			common.SkipIfDatabaseUnavailable(t)
@@ -65,17 +67,26 @@ func TestLMTP_SieveRedirectRelayedOnlyAfterStore(t *testing.T) {
 				"body",
 			}, "\r\n")
 
-			// First attempt: INBOX goes away between RCPT, which creates the default
-			// mailboxes, and DATA, so storing the :copy fails.
+			// Keep the target resolvable for the insert-phase failure; a separate
+			// case retains the missing-INBOX preflight failure schedule.
+			restore := func() {}
+			defer func() { restore() }()
 			resp := deliverLMTPRawBeforeData(t, lmtpAddr, sender, account.Email, msg, func() {
-				if _, err := rdb.ExecWithRetry(ctx,
-					"UPDATE mailboxes SET deleted_at = NOW() WHERE account_id = $1 AND LOWER(name) = 'inbox' AND deleted_at IS NULL",
-					accountID); err != nil {
-					t.Fatalf("remove INBOX: %v", err)
+				if tc.failInsert {
+					inbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, "INBOX")
+					if err != nil {
+						t.Fatal(err)
+					}
+					restore = common.FailMailboxInserts(t, rdb, inbox.ID)
+				} else if _, err := rdb.ExecWithRetry(ctx, "UPDATE mailboxes SET deleted_at = NOW() WHERE account_id = $1 AND LOWER(name) = 'inbox' AND deleted_at IS NULL", accountID); err != nil {
+					t.Fatal(err)
 				}
 			})
 			if !strings.HasPrefix(resp, "4") {
 				t.Fatalf("want a temporary failure when the message cannot be stored, got %s", resp)
+			}
+			if !strings.Contains(resp, "failed to save message") || strings.Contains(resp, "mailbox not found") || strings.Contains(resp, "forced mailbox insert failure") || strings.Contains(resp, "Missing") {
+				t.Fatalf("storage failure must keep private mailbox/database causes out of the SMTP reply: %s", resp)
 			}
 			if got := rq.relayedTo(); len(got) != 0 {
 				t.Errorf("a delivery whose store failed relayed the message to %v", got)
@@ -84,11 +95,20 @@ func TestLMTP_SieveRedirectRelayedOnlyAfterStore(t *testing.T) {
 				t.Errorf("a failed store consumed %d redirects, want 0", n)
 			}
 
-			if tc.multiple && countInMailbox(t, rdb, accountID, "Projects") != 1 {
+			if tc.multiple && tc.failInsert && countInMailbox(t, rdb, accountID, "Projects") != 1 {
 				t.Fatal("the failure must occur after a preceding copy was stored")
 			}
 
+			if tc.multiple && !tc.failInsert {
+				for _, name := range []string{"Archive", "Projects"} {
+					if got := countInMailbox(t, rdb, accountID, name); got != 0 {
+						t.Fatalf("preflight failure stored %d copies in %s", got, name)
+					}
+				}
+			}
+
 			// The MTA's retry: RCPT recreates INBOX, the message is stored and relayed once.
+			restore()
 			if resp := deliverLMTPRaw(t, lmtpAddr, sender, account.Email, msg); !strings.HasPrefix(resp, "250") {
 				t.Fatalf("retry: want 250, got %s", resp)
 			}

@@ -13,6 +13,15 @@ import (
 // 5819 §2). It runs before anything is written: go-imap writes the STATUS line
 // as it goes and cannot take back an item the session leaves unset.
 func (s *IMAPSession) checkStatusItems(options *imap.StatusOptions) error {
+	// IMAP4rev2 has no RECENT item (RFC 9051 Appendix E item 12; status-att in
+	// §9). go-imap refuses it on STATUS for a session served IMAP4rev2 but not
+	// on LIST RETURN (STATUS), so refuse it here, with STATUS's answer.
+	if options.NumRecent && s.conn != nil && s.conn.IsIMAP4rev2() {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Text: "Unknown STATUS data item",
+		}
+	}
 	// RFC 8438 §1: with LIST-STATUS, SIZE "can be queried for many mailboxes at
 	// once using just one LIST command", so it needs STATUS=SIZE there as well.
 	if options.Size {
@@ -43,6 +52,16 @@ func (s *IMAPSession) checkStatusItems(options *imap.StatusOptions) error {
 func (s *IMAPSession) Status(ctx context.Context, mboxName string, options *imap.StatusOptions) (*imap.StatusData, error) {
 	if err := s.checkStatusItems(options); err != nil {
 		return nil, err
+	}
+	// Prevent querying STATUS on the shared-namespace root, which is a
+	// non-selectable container (matching SELECT/EXAMINE and LIST's \Noselect).
+	if s.server.config != nil && s.server.config.SharedMailboxes.IsNamespaceRoot(mboxName) {
+		s.DebugLog("cannot get status of shared namespace root", "mailbox", mboxName)
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeCannot,
+			Text: "The shared namespace root cannot be queried with STATUS",
+		}
 	}
 	ctx = s.pinnedContext(ctx)
 
