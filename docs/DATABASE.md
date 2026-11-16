@@ -777,3 +777,17 @@ transaction` for a long time are usually the lock holders of [section 8](#8-pgbo
 | `out of shared memory` (SQLSTATE `53200`) | The shared lock table is full. | Look for long-held locks in `pg_locks`; with a transaction pooler, look for session-level advisory locks left behind. |
 | Writes fail with `read-only transaction` after a failover | The write host name still points at the old primary. | Point it at the new primary (DNS, virtual IP or pooler); Sora reconnects on its own. |
 | Clients get `NO [UNAVAILABLE]` under load | Timeouts, lock timeouts, an open circuit breaker or an exhausted pool. | Check the circuit breaker log lines, `sora_db_pool_in_use_conns` and slow queries in PostgreSQL. |
+
+
+### Message state for newly created rows
+
+COPY and MOVE create a `message_state` row for each destination message even when
+an older source message has none. Missing source state is represented by empty
+flags and keywords, matching the source's existing displayed state. Delivery,
+APPEND, imports and restore also create state for their newly inserted rows.
+
+This is a forward-only repair after all writers have been upgraded. Existing
+messages without state are left unchanged; their historical SEARCH UNSEEN,
+STATUS counts and flag-update inconsistencies are not repaired. There is no
+historical backfill, backfill migration or startup scan for this change. Older
+writers and transactions started before upgrade can still create missing rows.

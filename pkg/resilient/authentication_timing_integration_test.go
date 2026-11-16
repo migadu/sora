@@ -17,13 +17,29 @@ import (
 
 // mapAuthCache stands in for the proxies' persistent auth cache (authcache.Cache).
 type mapAuthCache struct {
-	mu      sync.Mutex
-	entries map[string]mapAuthCacheEntry
+	mu         sync.Mutex
+	entries    map[string]mapAuthCacheEntry
+	generation uint64
 }
 
 type mapAuthCacheEntry struct {
 	accountID int64
 	hash      string
+}
+
+func (c *mapAuthCache) Generation() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.generation
+}
+
+func (c *mapAuthCache) PutIfGeneration(_ context.Context, address string, accountID int64, hash string, generation uint64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if generation == c.generation {
+		c.entries[address] = mapAuthCacheEntry{accountID: accountID, hash: hash}
+	}
+	return nil
 }
 
 func (c *mapAuthCache) Get(_ context.Context, address string) (int64, string, error) {
@@ -46,6 +62,7 @@ func (c *mapAuthCache) Put(_ context.Context, address string, accountID int64, h
 func (c *mapAuthCache) Invalidate(_ context.Context, address string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.generation++
 	delete(c.entries, address)
 	return nil
 }
@@ -53,6 +70,7 @@ func (c *mapAuthCache) Invalidate(_ context.Context, address string) error {
 func (c *mapAuthCache) InvalidateAccount(_ context.Context, accountID int64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.generation++
 	for address, e := range c.entries {
 		if e.accountID == accountID {
 			delete(c.entries, address)

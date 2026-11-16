@@ -83,24 +83,13 @@ allowed_origins = ["https://webmail.example.com"]
 | `proxy_protocol` | `false` | Expect a PROXY protocol header on each connection, from an address in `[servers] trusted_networks`. The client address in it is then used for `allowed_hosts` and rate limiting. See [PROXY.md](PROXY.md). |
 | `proxy_protocol_timeout` | `"5s"` | How long to wait for that header. |
 | `[server.auth_rate_limit]` | off | Login rate limiting and progressive delays. The keys are in [AUTHENTICATION.md](AUTHENTICATION.md). |
-| `[server.lookup_cache]` | off | A cache of login results, see below. |
+| `[server.lookup_cache]` | ignored | Accepted for compatibility, with a warning; every login reads the primary credential. |
 
-**`[server.lookup_cache]`** keeps successful logins in memory. A repeated login with the same
-password, while the cached entry is younger than `positive_revalidation_window`, skips the
-credential lookup and the password check. Every other login is checked against the database.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `enabled` | `false` | Turn the cache on. |
-| `positive_ttl` | `"5m"` | How long a successful login stays in the cache. |
-| `negative_ttl` | `"1m"` | How long a failed login stays in the cache. A cached failure never refuses a login; the next attempt is checked again. |
-| `max_size` | `10000` | Most entries. |
-| `cleanup_interval` | `"5m"` | How often expired entries are removed. |
-| `positive_revalidation_window` | `"30s"` | A cached success is used only while it is younger than this. |
-
-The durations here take Go units or whole days, like the other durations; a value that does not
-parse means the default. A
-password change drops the account's cached logins.
+The User API does not cache password verdicts. Each login reads the password hash and credential
+epoch together from the primary, so a password change cannot pair an old cached verdict with a
+new token epoch. Token refresh also checks the primary. Configuring `[server.lookup_cache]` on
+this backend has no effect and produces a warning. The User API **proxy** can still cache route
+lookups ([section 12](#12-the-user-api-proxy)).
 
 The HTTP server's limits are fixed: 10 seconds for the request headers, 30 seconds to read
 the request, 30 seconds to write the response (this bounds a `/raw` download), 120 seconds for
@@ -900,7 +889,7 @@ call the API through the proxy.
 | `tls_verify` | `false` | Require client certificates. |
 | `tls_default_domain` | none | Certificate name for clients without SNI, with the `[tls]` manager. |
 | `[server.remote_lookup]` | off | Route lookups; see [PROXY.md](PROXY.md). |
-| `[server.lookup_cache]` | off | Caches lookup answers; same keys and defaults as in section 2, except `positive_revalidation_window`: the proxy checks no passwords (the backend does), and warns at startup when it is set. |
+| `[server.lookup_cache]` | off | Caches route lookup answers; keys and defaults are described in [CONFIGURATION.md](CONFIGURATION.md#910-lookup-cache-serverlookup_cache). The proxy checks no passwords and warns if `positive_revalidation_window` is set. |
 | `[server.auth_rate_limit]` | off | Login rate limiting of every login through the proxy (12.1). The keys are in [AUTHENTICATION.md](AUTHENTICATION.md). Blocked clients show at `GET /admin/auth/blocked?protocol=userapi_proxy`. |
 
 `allowed_hosts`, `token_duration` and `token_issuer` have no effect on this proxy; set in its block,

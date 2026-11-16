@@ -1030,6 +1030,21 @@ metadata file and a `<id>.msg` body in one of `pending/`, `processing/` or `fail
 `--queue` is `pending`, `processing` or `failed`. `--confirm` does not prompt; without it,
 `delete` and `requeue` refuse.
 
+Requeue, deletion, worker claims and recovery share a per-message lease on Unix
+(Linux/macOS), backed by the spool filesystem's advisory locks. A live message is
+reported busy; file age does not override its lease. Upgrade every server and admin
+binary using a spool before relying on this coordination: older binaries ignore
+these locks. Keep the spool on a filesystem supporting these locks and directory
+fsync; do not manipulate its files while the worker is running.
+
+A durable journal records whether an interrupted requeue should be rolled back or
+published and whether delivery or an operator discard has completed. Recovery
+checks each restore step and keeps failed recovery evidence for another attempt.
+Old `.requeuing-*` pairs without a journal are retained and reported for manual
+inspection; an empty queue cannot establish that they were never sent. SMTP/HTTP
+remains at least once: a relay can accept mail before a crash prevents Sora from
+recording local completion, so that boundary can still cause a retry.
+
 ---
 
 ## 21. tls

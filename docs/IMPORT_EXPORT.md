@@ -617,7 +617,7 @@ sora-admin --config config.toml export maildir --email user@example.com \
 |---|---|---|
 | `--email` | | Any address of the account (required). |
 | `--maildir-path` | | Target directory (required). Created if missing. |
-| `--dry-run` | `false` | List each message as `EXPORT` or `SKIP` and write no messages. The target directory and its cache file are still created. |
+| `--dry-run` | `false` | List each message as `EXPORT`, `SKIP` or `UPDATE` without changing the target directory, cache or SQLite sidecars. See the snapshot requirements below. |
 | `--mailbox-filter` | all | Comma-separated mailbox names, case-insensitive, `*` suffix for a prefix. |
 | `--start-date`, `--end-date` | | `YYYY-MM-DD`, by INTERNALDATE (UTC); the end day is included. |
 | `--dovecot` | `false` | Also write `dovecot-keywords` per folder, the `subscriptions` file, and `dovecot-uidlist` files. |
@@ -625,6 +625,25 @@ sora-admin --config config.toml export maildir --email user@example.com \
 | `--overwrite-flags` | `false` | Rewrite messages exported earlier with their current flags. |
 | `--jobs` | `4` | Messages exported in parallel within a mailbox. |
 | `--delay` | `0` | Pause after each exported message (Go duration). |
+
+**Dry-run cache snapshot.** A missing target or cache stays missing. When a cache
+exists, preview copies its database and WAL into an owner-only temporary directory,
+reads that private copy, and removes it on close. The source database, WAL and SHM
+are never opened by SQLite or changed; source SHM is not copied. Committed rows left
+in WAL after a crash are included. The preview runs a separate helper process that
+holds a nonblocking exclusive POSIX lock while copying, so an active SQLite user
+causes a clear refusal. Stop users of that cache and retry; do not remove its WAL.
+A rollback journal is also refused: recover and close it normally before preview.
+
+This snapshot is supported on local POSIX-locking Linux filesystems
+(ext2/3/4, XFS, Btrfs, tmpfs or overlayfs) and macOS APFS/HFS/UFS/tmpfs. Other
+filesystems/platforms fail closed when a cache exists. It assumes the normal Unix
+SQLite locking protocol and functioning filesystem locks; custom/no-lock VFSes or
+programs changing the files outside that protocol are not supported. The helper
+requires permission to open the main database read/write to acquire the exclusive
+lock, but never writes it. Temporary space must fit the database and WAL; an
+unsafe cache (including linked or nonregular DB/WAL files), copy/read failure or cancellation fails the preview and removes the
+private copy. Message files retain the export's directory confinement checks.
 
 **What is exported.** Every mailbox the account can see, including shared mailboxes it has access
 to, and every message that is not expunged. Bodies are downloaded from S3 under the key stored on

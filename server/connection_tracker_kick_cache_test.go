@@ -1,6 +1,9 @@
 package server
 
 import (
+	"context"
+	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -226,5 +229,119 @@ func TestForgetLoginsLeavesSessions(t *testing.T) {
 	case <-session:
 		t.Error("forgetting logins ended the account's session")
 	default:
+	}
+}
+
+// orderLog records which cache was dropped when, across caches.
+type orderLog struct {
+	mu    sync.Mutex
+	steps []string
+}
+
+func (o *orderLog) add(step string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.steps = append(o.steps, step)
+}
+
+func (o *orderLog) all() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]string(nil), o.steps...)
+}
+
+// fakeAuthCache stands in for authcache.Cache, the proxies' persistent auth cache.
+type fakeAuthCache struct{ log *orderLog }
+
+func (f fakeAuthCache) InvalidateAccount(_ context.Context, accountID int64) error {
+	f.log.add(fmt.Sprintf("auth-cache:%d", accountID))
+	return nil
+}
+
+// orderedLookupCache is a fakeLookupCache that also logs into a shared orderLog.
+type orderedLookupCache struct {
+	*fakeLookupCache
+	log *orderLog
+}
+
+func (o orderedLookupCache) InvalidateAccount(accountID int64) {
+	o.log.add(fmt.Sprintf("lookup-cache:%d", accountID))
+	o.fakeLookupCache.InvalidateAccount(accountID)
+}
+
+// TestForgottenLoginsLeaveThePersistentAuthCache verifies that forgotten logins and
+// kicks, a peer's or this node's own, also drop the account from the proxies'
+// persistent auth cache, and do so before the in-memory lookup cache: a login missing
+// the lookup cache is answered from the auth cache, so dropping the lookup cache alone
+// lets the old password straight back in, and dropping it first lets a login in between
+// refill it from the auth cache.
+func TestForgottenLoginsLeaveThePersistentAuthCache(t *testing.T) {
+	const accountID int64 = 12345
+	cases := map[string]func(tracker *ConnectionTracker){
+		"own forget-logins": func(tracker *ConnectionTracker) {
+			if err := tracker.ForgetLogins(accountID, "user@example.com"); err != nil {
+				t.Fatalf("ForgetLogins: %v", err)
+			}
+		},
+		"own kick": func(tracker *ConnectionTracker) {
+			if err := tracker.KickUser(accountID, kickCacheProtocol); err != nil {
+				t.Fatalf("KickUser: %v", err)
+			}
+		},
+		"peer kick": func(tracker *ConnectionTracker) {
+			tracker.handleKick(ConnectionEvent{Type: ConnectionEventKick, AccountID: accountID, Protocol: kickCacheProtocol, NodeID: "node-2", Timestamp: time.Now()})
+		},
+	}
+	for name, change := range cases {
+		t.Run(name, func(t *testing.T) {
+			tracker := NewConnectionTracker(kickCacheProtocol, kickCacheServerName, "", "test-instance", nil, 0, 0, 100, false)
+			defer tracker.Stop()
+			log := &orderLog{}
+			tracker.SetLookupCache(orderedLookupCache{newFakeLookupCache(), log})
+			tracker.SetAuthCache(fakeAuthCache{log})
+
+			change(tracker)
+
+			want := []string{fmt.Sprintf("auth-cache:%d", accountID), fmt.Sprintf("lookup-cache:%d", accountID)}
+			if got := log.all(); !slices.Equal(got, want) {
+				t.Errorf("caches dropped %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestEndLocalSessions verifies that the account's sessions on this node end, and no
+// other account's: every node reads the credential changes itself, so each ends its
+// own sessions and tells no peer.
+func TestEndLocalSessions(t *testing.T) {
+	tracker := NewConnectionTracker(kickCacheProtocol, kickCacheServerName, "", "test-instance", nil, 0, 0, 100, false)
+	defer tracker.Stop()
+
+	first := tracker.RegisterSession(12345)
+	second := tracker.RegisterSession(12345)
+	other := tracker.RegisterSession(67890)
+
+	if n := tracker.EndLocalSessions(12345); n != 2 {
+		t.Errorf("EndLocalSessions ended %d sessions, want 2", n)
+	}
+	for i, ch := range []<-chan struct{}{first, second} {
+		select {
+		case <-ch:
+		default:
+			t.Errorf("session %d of the account is still open", i)
+		}
+	}
+	select {
+	case <-other:
+		t.Error("another account's session was ended")
+	default:
+	}
+	if n := tracker.EndLocalSessions(12345); n != 0 {
+		t.Errorf("a second EndLocalSessions ended %d sessions, want 0", n)
+	}
+
+	var none *ConnectionTracker
+	if n := none.EndLocalSessions(12345); n != 0 { // a server without a tracker
+		t.Errorf("nil tracker ended %d sessions", n)
 	}
 }
