@@ -30,7 +30,8 @@ const (
 	HierarchyParentDeleted = "parent_deleted"
 	// HierarchyParentMissing: the path parent row does not exist.
 	HierarchyParentMissing = "parent_missing"
-	// HierarchyBadPath: path empty, not a multiple of 16, or not ending in the mailbox's ID.
+	// HierarchyBadPath: path not canonical lowercase hex, not a multiple of 16,
+	// or not ending in the mailbox's ID.
 	HierarchyBadPath = "bad_path"
 )
 
@@ -97,6 +98,7 @@ chk AS (
 	       CASE
 	           WHEN length(m.path) = 0
 	             OR length(m.path) % 16 <> 0
+	             OR m.path COLLATE "C" !~ '^[0-9a-f]+$'
 	             OR right(m.path, 16) <> lpad(to_hex(m.id), 16, '0')         THEN 'bad_path'
 	           WHEN m.parent_path IS NULL AND m.has_delim                     THEN 'root_with_delimiter'
 	           WHEN m.parent_path IS NOT NULL AND p.id IS NULL                THEN 'parent_missing'
@@ -209,10 +211,17 @@ func (db *Database) RepairMailboxHierarchy(ctx context.Context, accountID int64,
 
 	r := &hierarchyRepairer{db: db, tx: tx, accountID: accountID, apply: apply,
 		byID: map[int64]*hierarchyMailbox{}, byLower: map[string]*hierarchyMailbox{}}
+	// The first locking statement can wait for a create and miss a new root in
+	// its snapshot. Lock the rows this fresh load actually sees too, so a newly
+	// committed intended parent cannot be renamed before this repair commits.
+	loadLock := ""
+	if apply {
+		loadLock = " FOR UPDATE"
+	}
 	rows, err := tx.Query(ctx, `
 		SELECT id, name, LOWER(name), path FROM mailboxes
 		WHERE account_id = $1 AND deleted_at IS NULL
-	`, accountID)
+		ORDER BY id`+loadLock, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load mailboxes: %w", err)
 	}
@@ -394,6 +403,7 @@ func (r *hierarchyRepairer) create(ctx context.Context, name, lower string, pare
 	err := r.tx.QueryRow(ctx, `
 		SELECT id, name, path FROM mailboxes
 		WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
+		FOR UPDATE
 	`, r.accountID, name).Scan(&m.id, &m.name, &m.path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read back %q: %w", name, err)
@@ -428,7 +438,15 @@ func (r *hierarchyRepairer) reparent(ctx context.Context, m, parent *hierarchyMa
 }
 
 // validMailboxPath reports whether path is well formed for the mailbox id: whole
-// 16-digit segments, the last one id's.
+// lowercase ASCII-hex 16-digit segments, the last one id's.
 func validMailboxPath(path string, id int64) bool {
-	return path != "" && len(path)%helpers.HexIDLength == 0 && strings.HasSuffix(path, helpers.FormatMailboxID(id))
+	if path == "" || len(path)%helpers.HexIDLength != 0 || !strings.HasSuffix(path, helpers.FormatMailboxID(id)) {
+		return false
+	}
+	for i := range path {
+		if !('0' <= path[i] && path[i] <= '9') && !('a' <= path[i] && path[i] <= 'f') {
+			return false
+		}
+	}
+	return true
 }

@@ -505,7 +505,7 @@ It reports these problems (the second column of each line):
 | `detached` | Below a mailbox that is not its name's parent, such as `Alpha/Beta` below `Gamma`. Only the top of such a subtree is listed. |
 | `parent_deleted` | Below a deleted mailbox. |
 | `parent_missing` | Below a mailbox that does not exist. |
-| `bad_path` | The stored hierarchy path is malformed. Reported only (`REPORT`); nothing is changed. |
+| `bad_path` | The stored hierarchy path is malformed or contains anything except canonical lowercase ASCII hex. Reported only (`REPORT`); nothing is changed. |
 
 What `--apply` does with each one (`REPAIRED`):
 
