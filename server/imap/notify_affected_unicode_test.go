@@ -19,7 +19,7 @@ func TestDiffNotifyAffectedUnicodeAndIndependentChanges(t *testing.T) {
 		3: {name: "Detached"},
 		4: {name: "Archive"},
 	}
-	events := diffNotifySnapshots(prev, cur)
+	events := diffNotifySnapshots(keyedSnapshot(prev), keyedSnapshot(cur))
 	got := make(map[string]notifyTreeEvent)
 	for _, ev := range events {
 		got[ev.name] = ev
@@ -43,7 +43,7 @@ func TestDiffNotifyParentStoredCaseAndInaccessibleUnicode(t *testing.T) {
 		prev := map[int64]notifySnapshotEntry{1: {name: "MiXeD", subscribed: true}, 2: {name: "mixed/旧"}}
 		cur := map[int64]notifySnapshotEntry{1: {name: "MiXeD", subscribed: true}, 3: {name: "MIXED/新"}}
 		var parent *notifyTreeEvent
-		for _, ev := range diffNotifySnapshots(prev, cur) {
+		for _, ev := range diffNotifySnapshots(keyedSnapshot(prev), keyedSnapshot(cur)) {
 			if ev.name == "MiXeD" {
 				copy := ev
 				parent = &copy
@@ -55,7 +55,7 @@ func TestDiffNotifyParentStoredCaseAndInaccessibleUnicode(t *testing.T) {
 	})
 	t.Run("missing parent remains nonexistent with children", func(t *testing.T) {
 		var parent *notifyTreeEvent
-		for _, ev := range diffNotifySnapshots(nil, map[int64]notifySnapshotEntry{1: {name: "不可視/子"}}) {
+		for _, ev := range diffNotifySnapshots(nil, keyedSnapshot(map[int64]notifySnapshotEntry{1: {name: "不可視/子"}})) {
 			if ev.name == "不可視" {
 				copy := ev
 				parent = &copy
