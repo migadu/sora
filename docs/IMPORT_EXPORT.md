@@ -339,7 +339,9 @@ cache must belong to the user running `sora-admin`, and its group and others mus
 write in it. Every directory above it must belong to root or to that user, and its group and
 others may write in it only with the sticky bit set, as on `/tmp`: whoever can rename the
 directory could put one of their own, with such links, in its place after the check. Otherwise
-the import or export refuses to start and names the directory. Run `sora-admin` as the maildir's
+the import or export refuses to start and names the directory. The check walks from the filesystem
+root towards the cache and refuses a newly introduced symbolic-link component. It checks Unix
+ownership and mode bits, not filesystem ACLs. Run `sora-admin` as the maildir's
 owner, or import a copy that belongs to the user running it, in a directory no other user can
 rename (not, for example, in the home directory of the maildir's owner). In such
 a directory a `sora-maildir.db`, `-wal`, `-shm` or `-journal` that is a hard link (its file has

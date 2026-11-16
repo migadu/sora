@@ -121,14 +121,18 @@ func maildirCacheLinkRule(dir string) (refuseHardLinks bool, err error) {
 		return false, nil
 	}
 	euid := geteuid()
-	owner, mode, err := directoryOwnerAndMode(dir)
-	if err != nil {
-		return false, err
-	}
-	if owner != euid || mode&0o022 != 0 {
-		return false, fmt.Errorf("refusing to keep the maildir database in %s: users other than uid %d can create files in it (owner uid %d, mode %04o), and SQLite would write through a hard link one of them puts at the database's names; run as the directory's owner, or use a directory only uid %d can write", dir, euid, owner, mode, euid)
-	}
+	var parents []string
 	for parent := filepath.Dir(dir); ; parent = filepath.Dir(parent) {
+		parents = append(parents, parent)
+		if parent == filepath.Dir(parent) {
+			break
+		}
+	}
+	// Check from the filesystem root towards dir. Each accepted component then
+	// protects the next name from another user's rename. Lstat below refuses a
+	// symbolic link introduced after resolveMaildirDir, even to a trusted target.
+	for index := len(parents) - 1; index >= 0; index-- {
+		parent := parents[index]
 		owner, mode, err := directoryOwnerAndMode(parent)
 		if err != nil {
 			return false, err
@@ -136,18 +140,27 @@ func maildirCacheLinkRule(dir string) (refuseHardLinks bool, err error) {
 		if (owner != 0 && owner != euid) || (mode&0o022 != 0 && mode&syscall.S_ISVTX == 0) {
 			return false, fmt.Errorf("refusing to keep the maildir database in %s: users other than uid %d can rename entries of %s above it (owner uid %d, mode %04o), and so put a directory of their own, with hard links at the database's names, in its place after it is checked; use a directory whose parents only root and uid %d can write", dir, euid, parent, owner, mode, euid)
 		}
-		if parent == filepath.Dir(parent) {
-			return true, nil
-		}
 	}
+	owner, mode, err := directoryOwnerAndMode(dir)
+	if err != nil {
+		return false, err
+	}
+	if owner != euid || mode&0o022 != 0 {
+		return false, fmt.Errorf("refusing to keep the maildir database in %s: users other than uid %d can create files in it (owner uid %d, mode %04o), and SQLite would write through a hard link one of them puts at the database's names; run as the directory's owner, or use a directory only uid %d can write", dir, euid, owner, mode, euid)
+	}
+	return true, nil
 }
 
 // directoryOwnerAndMode returns the owner of the directory at path and its permission
-// bits, with the set-user-ID, set-group-ID and sticky bits.
-func directoryOwnerAndMode(path string) (owner int, mode uint32, err error) {
-	info, err := os.Stat(path)
+// bits, with the set-user-ID, set-group-ID and sticky bits. It is replaceable in
+// tests to schedule a directory pivot around a real metadata read.
+var directoryOwnerAndMode = func(path string) (owner int, mode uint32, err error) {
+	info, err := os.Lstat(path)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to check maildir database directory: %w", err)
+	}
+	if !info.IsDir() {
+		return 0, 0, fmt.Errorf("refusing maildir database directory %s: it is not a directory", path)
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
