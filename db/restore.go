@@ -483,8 +483,9 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		// using an external mechanism), the server generates a new modification sequence
 		// that is higher than the highest modification sequence of all messages in the
 		// mailbox and assigns it to the appended message"). The stats trigger raises the
-		// mailbox's highest_modseq to it, and every reader that learns of new messages by
-		// mod-sequence (the session poll, NOTIFY, QRESYNC, CHANGEDSINCE) reports it.
+		// mailbox's highest_modseq to it, so readers synchronized past the expunge can
+		// report the new arrival. Restoring a row still held by an older sequence view
+		// does not preserve its previous UID/expunge history (issue #1712).
 		result, err := tx.Exec(ctx, `
 			UPDATE messages
 			SET expunged_at = NULL,
