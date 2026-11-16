@@ -115,13 +115,19 @@ var mkdirTemp = os.MkdirTemp
 
 // createS3ImportDir creates a directory for a run's work database in the temporary
 // directory, which only its owner may read, write or create a name in, and returns
-// its name with every link resolved. SQLite opens the database's -wal and -shm files
-// by name at the first transaction and writes through a hard link at those names, so
-// the database is not kept in the temporary directory itself: another user who may
-// create names there (as in /tmp) could link a file they cannot write at them as soon
-// as they see the database (#1739). SQLite resolves links in the database's name and
-// opens those files beside the file it resolves to, so the database is named by the
-// resolved directory.
+// its name. SQLite opens the database's -wal and -shm files by name at the first
+// transaction and writes through a hard link at those names, so the database is not
+// kept in the temporary directory itself: another user who may create names there
+// (as in /tmp) could link a file they cannot write at them as soon as they see the
+// database (#1739). SQLite resolves links in the database's name and opens those
+// files beside the file it resolves to, so the directory is made in the temporary
+// directory named with every link resolved.
+//
+// The new directory's own name is not resolved: a user who may rename entries of the
+// temporary directory could put a symbolic link at it the moment it appears, and its
+// target would become the directory the run keeps the database in, checks the
+// parents of, and removes at the end (--cleanup-db) with everything in it. Close
+// removes the name it was given, which removes only such a link.
 //
 // That holds while no other user can rename the directory, or one above it, to put a
 // directory of their own in its place before SQLite opens the files. Where a user may
@@ -130,7 +136,11 @@ var mkdirTemp = os.MkdirTemp
 // others may write in it only with the sticky bit set (renamableParent), as for the
 // maildir cache (#1669). /tmp and the per-user temporary directory of macOS pass.
 func createS3ImportDir() (dir string, err error) {
-	created, err := mkdirTemp("", "sora-s3-import-*")
+	tmp, err := resolveMaildirDir(os.TempDir())
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary database directory: %w", err)
+	}
+	created, err := mkdirTemp(tmp, "sora-s3-import-*")
 	if err != nil {
 		return "", fmt.Errorf("failed to create temporary database directory: %w", err)
 	}
@@ -139,21 +149,18 @@ func createS3ImportDir() (dir string, err error) {
 			os.RemoveAll(created)
 		}
 	}()
-	if dir, err = resolveMaildirDir(created); err != nil {
-		return "", fmt.Errorf("failed to create temporary database directory: %w", err)
-	}
 	if hardLinksProtected() {
-		return dir, nil
+		return created, nil
 	}
 	euid := geteuid()
-	parent, owner, mode, err := renamableParent(dir, euid)
+	parent, owner, mode, err := renamableParent(created, euid)
 	if err != nil {
 		return "", fmt.Errorf("failed to check where to keep the S3 import's work database: %w", err)
 	}
 	if parent != "" {
-		return "", fmt.Errorf("refusing to keep the S3 import's work database in %s: users other than uid %d can rename entries of %s above it (owner uid %d, mode %04o), and so put a directory of their own, with hard links at the database's names, in its place; set TMPDIR to a directory that, like every directory above it, only root and uid %d can write, unless it has the sticky bit (as /tmp has)", dir, euid, parent, owner, mode, euid)
+		return "", fmt.Errorf("refusing to keep the S3 import's work database in %s: users other than uid %d can rename entries of %s above it (owner uid %d, mode %04o), and so put a directory of their own, with hard links at the database's names, in its place; set TMPDIR to a directory that, like every directory above it, only root and uid %d can write, unless it has the sticky bit (as /tmp has)", created, euid, parent, owner, mode, euid)
 	}
-	return dir, nil
+	return created, nil
 }
 
 // NewS3Importer creates a new S3Importer instance
@@ -239,7 +246,9 @@ func (si *S3Importer) Close() error {
 		}
 		if si.options.CleanupDB {
 			// The database's directory is the run's own, and holds nothing but the
-			// database and the files SQLite keeps beside it.
+			// database and the files SQLite keeps beside it. It is the name
+			// createS3ImportDir made, unresolved: os.RemoveAll removes a symbolic
+			// link someone put at that name, not the link's target.
 			dir := filepath.Dir(si.dbPath)
 			logger.Info("Cleaning up temporary database", "path", dir)
 			if err := os.RemoveAll(dir); err != nil {
