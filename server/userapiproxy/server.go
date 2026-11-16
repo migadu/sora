@@ -22,6 +22,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/lookupcache"
@@ -1071,6 +1072,8 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			}
 			localCtx, cancel := context.WithTimeout(ctx, s.rdb.GetQueryTimeout())
 			defer cancel()
+			// A read replica may retain active account state after revocation.
+			localCtx = context.WithValue(localCtx, consts.UseMasterDBKey, true)
 			localID, err := s.rdb.GetActiveAccountIDByAddressWithRetry(localCtx, email)
 			if err != nil || accountID <= 0 || localID != accountID {
 				return backendRoute{}, fmt.Errorf("token does not identify an active local account")
