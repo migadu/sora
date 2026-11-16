@@ -92,21 +92,11 @@ func (s *soraLikeSMTPSession) Mail(_ context.Context, _ string, _ *smtp.MailOpti
 	return nil
 }
 
-func (s *soraLikeSMTPSession) Rcpt(_ context.Context, to string, opts *smtp.RcptOptions) error {
-	// Match server/lmtp/session.go: go-smtp rejects NOTIFY/ORCPT/RRVS with 555 and
-	// syntax/unbracketed-with-params/unclosed-quote with 501; LMTPSession.Rcpt rejects
-	// any remaining unknown extension parameter other than XRCPTFORWARD with 555 5.5.4.
-	if opts != nil {
-		for keyword := range opts.Extensions {
-			if keyword != "XRCPTFORWARD" {
-				return &smtp.SMTPError{
-					Code:         555,
-					EnhancedCode: smtp.EnhancedCode{5, 5, 4},
-					Message:      "Unknown RCPT parameter",
-				}
-			}
-		}
-	}
+// Rcpt sees XRCPTFORWARD alone among the RCPT parameters: as on the sora backend
+// (server/lmtp/server.go), go-smtp takes no other custom one (RCPTExtensions) and
+// refuses it, NOTIFY/ORCPT/RRVS among them, with 555 where it stands, and a syntax
+// error with 501.
+func (s *soraLikeSMTPSession) Rcpt(_ context.Context, to string, _ *smtp.RcptOptions) error {
 	switch strings.ToLower(to) {
 	case "user@example.com", "real@example.com", "real+tag@example.com":
 		return nil
@@ -148,6 +138,7 @@ func startSoraLikeLMTPBackend(t *testing.T) *rcptWireBackend {
 	srv.LMTP = true
 	srv.EnableXCLIENT = true
 	srv.EnableRCPTExtensions = true
+	srv.RCPTExtensions = []string{"XRCPTFORWARD"}
 	srv.EnableSMTPUTF8 = true
 
 	go func() {
