@@ -32,8 +32,8 @@ func deleteUnderCleanerLock(t *testing.T, f *rekeyFixture, obj db.UserScopedObje
 	var claimErr error
 	finished := false
 
-	err := f.rdb.ExecuteWithLockedS3Orphans(f.ctx, []db.UserScopedObjectForCleanup{obj}, time.Hour,
-		func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error {
+	_, err := f.rdb.ExecuteWithS3BodyCleanup(f.ctx, []db.UserScopedObjectForCleanup{obj}, time.Hour,
+		func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error) {
 			require.Len(t, orphans, 1, "precondition: the cleaner confirms the body as an orphan before the import")
 			go func() { done <- claim() }()
 
@@ -57,7 +57,10 @@ func deleteUnderCleanerLock(t *testing.T, f *rekeyFixture, obj db.UserScopedObje
 				case <-time.After(10 * time.Millisecond):
 				}
 			}
-			return del()
+			if err := del(); err != nil {
+				return db.S3BodyCleanupResult{}, err
+			}
+			return db.S3BodyCleanupResult{Gone: orphans}, nil
 		})
 	require.NoError(t, err)
 	if !finished {
@@ -142,7 +145,7 @@ func TestImportS3WaitsForCleanerDeleteOfBody(t *testing.T) {
 
 	fake, s3storage := common.NewFakeS3Storage(t)
 	require.NoError(t, s3storage.Put(key, bytes.NewReader(body), int64(len(body))))
-	importer, err := NewS3Importer(f.rdb, s3storage, S3ImporterOptions{
+	importer, err := NewS3Importer(f.ctx, f.rdb, s3storage, S3ImporterOptions{
 		Email:      localpart + "@" + domain,
 		Workers:    1,
 		BatchSize:  1,
@@ -150,9 +153,10 @@ func TestImportS3WaitsForCleanerDeleteOfBody(t *testing.T) {
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { importer.Close() })
+	require.NoError(t, importer.lookupAccount())
 
 	err = deleteUnderCleanerLock(t, f, obj, func() error { return s3storage.Delete(key) }, func() error {
-		return importer.importS3Object(S3ObjectInfo{Key: key, Size: int64(len(body))})
+		return importer.importS3Object(S3ObjectInfo{Key: key})
 	})
 
 	live, uploaded := liveRows(t, f, accountID, obj.ContentHash)
@@ -178,7 +182,7 @@ func TestImportS3WorkersFitTheWritePool(t *testing.T) {
 
 	accountID, domain, localpart := f.account("import-s3-pool")
 	fake, s3storage := common.NewFakeS3Storage(t)
-	importer, err := NewS3Importer(rdb, s3storage, S3ImporterOptions{
+	importer, err := NewS3Importer(f.ctx, rdb, s3storage, S3ImporterOptions{
 		Email:      localpart + "@" + domain,
 		Workers:    2,
 		BatchSize:  10,
@@ -199,6 +203,7 @@ func TestImportS3WorkersFitTheWritePool(t *testing.T) {
 		hashes = append(hashes, hash)
 	}
 	importer.totalObjects = int64(len(hashes))
+	require.NoError(t, importer.lookupAccount())
 
 	// A worker reads its body under the lock: each read waits (for at most a second) for
 	// the other's, so that two workers hold their locks at once if they run at once.

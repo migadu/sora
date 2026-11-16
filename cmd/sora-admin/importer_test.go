@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -435,6 +436,9 @@ func (m *mockTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, 
 	return nil, errors.New("not implemented")
 }
 func (m *mockTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "current_setting('transaction_isolation')") {
+		return scriptedBatchRow{scan: func(dest ...any) error { *dest[0].(*string) = "read committed"; *dest[1].(*bool) = false; return nil }}
+	}
 	return &mockRow{}
 }
 func (m *mockTx) Conn() *pgx.Conn {

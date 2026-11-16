@@ -136,6 +136,10 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		return nil, nil, fmt.Errorf("source and destination mailboxes cannot be the same")
 	}
 
+	if err := lockS3SourceClaims(ctx, tx, srcMailboxID, uids); err != nil {
+		return nil, nil, err
+	}
+
 	// The caller is responsible for beginning and committing/rolling back the transaction.
 
 	// Get the source message IDs and UIDs
@@ -612,6 +616,15 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		return 0, 0, consts.ErrSerializationFailed
 	}
 
+	bodyClaimable := true
+	if claimErr := LockS3ObjectsSharedInTx(ctx, tx, options.AccountID, []string{options.ContentHash}); claimErr != nil {
+		if errors.Is(claimErr, ErrS3BodyQuarantined) {
+			bodyClaimable = false
+		} else {
+			return 0, 0, claimErr
+		}
+	}
+
 	if options.InternalDate.IsZero() {
 		options.InternalDate = time.Now()
 	}
@@ -901,7 +914,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	err = tx.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM messages
-			WHERE content_hash = $1
+			WHERE $5::bool AND content_hash = $1
 			  AND account_id = $2
 			  AND s3_domain = $3
 			  AND s3_localpart = $4
@@ -909,7 +922,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			  AND expunged_at IS NULL
 			LIMIT 1
 		)
-	`, options.ContentHash, upload.AccountID, options.S3Domain, options.S3Localpart).Scan(&alreadyUploaded)
+	`, options.ContentHash, upload.AccountID, options.S3Domain, options.S3Localpart, bodyClaimable).Scan(&alreadyUploaded)
 	if err != nil {
 		logger.Error("Database: failed to check if content already uploaded", "content_hash", upload.ContentHash, "err", err)
 		return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBQueryFailed, err)
@@ -1010,6 +1023,10 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	if err != nil {
 		logger.Error("Database: failed to serialize BodyStructure", "err", err)
 		return 0, 0, consts.ErrSerializationFailed
+	}
+
+	if err := LockS3ObjectsSharedInTx(ctx, tx, options.AccountID, []string{options.ContentHash}); err != nil {
+		return 0, 0, err
 	}
 
 	if options.InternalDate.IsZero() {
@@ -1457,6 +1474,15 @@ func (d *Database) InsertMessagesBatch(
 		return nil, nil, nil, nil
 	}
 
+	bodyClaimable := true
+	if claimErr := LockS3ObjectsSharedInTx(ctx, tx, accountID, contentHashes); claimErr != nil {
+		if !isImporter && errors.Is(claimErr, ErrS3BodyQuarantined) {
+			bodyClaimable = false
+		} else {
+			return nil, nil, nil, claimErr
+		}
+	}
+
 	// 3. Deduplication (Find exact duplicates in one query)
 	rows, err := tx.Query(ctx, `
 		SELECT message_id, content_hash FROM messages 
@@ -1497,7 +1523,7 @@ func (d *Database) InsertMessagesBatch(
 
 	// 4. Content Deduplication (Find already uploaded S3 hashes)
 	uploadedHashesSet := make(map[string]bool)
-	if !isImporter {
+	if !isImporter && bodyClaimable {
 		uHashes := make([]string, 0, len(uniqueProcessed))
 		for _, p := range uniqueProcessed {
 			uHashes = append(uHashes, p.Opt.ContentHash)

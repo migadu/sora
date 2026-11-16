@@ -2557,11 +2557,18 @@ func (i *Importer) uploadBatchToS3(ctx context.Context, read []uploadedMsg) []up
 				backoff := 500 * time.Millisecond
 				for attempt := 1; attempt <= maxRetries; attempt++ {
 					if attempt > 1 {
-						time.Sleep(backoff)
+						select {
+						case <-time.After(backoff):
+						case <-ctx.Done():
+							return
+						}
 						backoff *= 2
 						logger.Info("Retrying S3 upload", "path", up.msg.path, "attempt", attempt)
 					}
-					s3Err = i.s3.Put(s3Key, bytes.NewReader(up.content), int64(len(up.content)))
+					s3Err = putStoredBody(ctx, i.s3, s3Key, bytes.NewReader(up.content), int64(len(up.content)))
+					if ctx.Err() != nil {
+						return
+					}
 					if s3Err == nil {
 						break
 					}
@@ -3003,16 +3010,11 @@ func (i *Importer) markRowsInSQLite(ctx context.Context, marked []markedMessage)
 	return nil
 }
 
-// processBatch reads a batch of messages, uploads their bodies to S3 and inserts their
-// rows.
-//
-// The upload and the inserts run under the bodies' S3 object locks, held in shared mode
-// (ExecuteWithSharedS3ObjectLocks). The cleaner, the account purge and `import rekey`
-// delete a body only under the same lock, after a re-check that nothing references it.
-// Holding it from before the upload until the rows commit means that such a delete either
-// sees the rows and leaves the body be, or is over before the upload writes the body
-// again; a delete whose re-check ran before the rows committed would otherwise remove the
-// body under rows marked uploaded.
+// processBatch reads a batch, uploads bodies under shared global hash locks, and
+// carries the holder capability into each actual uploaded-state write transaction.
+// Each transaction verifies an overlap with the original holder and retains its own
+// locks through commit; the outer connection alone cannot fence a later SQL commit.
+// Existing per-message versus batch commit and SQLite completion semantics remain.
 func (i *Importer) processBatch(batch []msgInfo) error {
 	logger.Info("Processing batch", "size", len(batch),
 		"progress", i.getProgressPrefix())
@@ -3021,7 +3023,10 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 	read := i.readBatch(batch)
 	if len(read) == 0 {
 		logger.Warn("No message in batch could be read")
-		atomic.AddInt64(&i.failedMessages, int64(len(batch)))
+		// readBatch already recorded real read failures; an interrupt remains pending.
+		if err := i.ctx.Err(); err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -3045,6 +3050,9 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 // whose locks held every connection would each wait for a second one until its write
 // timeout failed it. It fails when the pool cannot run a single job.
 func writePoolLockedJobs(database *db.Database, jobs int) (int, error) {
+	if database == nil {
+		return jobs, nil
+	} // in-memory test/custom database double
 	poolSize := int(database.GetWritePool().Stat().MaxConns())
 	if poolSize < 2 {
 		return 0, fmt.Errorf("import requires at least 2 write-pool connections; configure database.write.max_connections >= 2 (got %d)", poolSize)
@@ -3064,7 +3072,7 @@ func (i *Importer) withBodiesLocked(read []uploadedMsg, fn func(ctx context.Cont
 	for k, up := range read {
 		hashes[k] = up.msg.hash
 	}
-	err := i.rdb.ExecuteWithSharedS3ObjectLocks(i.ctx, accountID, hashes, func(ctx context.Context) error {
+	err = i.rdb.ExecuteWithSharedS3ObjectLocks(i.ctx, accountID, hashes, func(ctx context.Context) error {
 		ran = true
 		return fn(ctx)
 	})
@@ -3287,6 +3295,7 @@ func (i *Importer) importMessages() error {
 
 	// Now process in batches without holding the SQLite connection
 	batch := make([]msgInfo, 0, i.batchSize)
+	var firstBatchErr error
 
 	for _, msg := range allMessages {
 		// Check for cancellation
@@ -3304,6 +3313,9 @@ func (i *Importer) importMessages() error {
 		if len(batch) >= i.batchSize {
 			if err := i.processBatch(batch); err != nil && i.ctx.Err() == nil {
 				logger.Warn("Batch processing had errors", "error", err)
+				if firstBatchErr == nil {
+					firstBatchErr = err
+				}
 			}
 			batch = batch[:0] // Reset batch
 		}
@@ -3313,6 +3325,9 @@ func (i *Importer) importMessages() error {
 	if len(batch) > 0 {
 		if err := i.processBatch(batch); err != nil && i.ctx.Err() == nil {
 			logger.Warn("Final batch had errors", "error", err)
+			if firstBatchErr == nil {
+				firstBatchErr = err
+			}
 		}
 	}
 
@@ -3321,6 +3336,12 @@ func (i *Importer) importMessages() error {
 	if err := i.ctx.Err(); err != nil {
 		logger.Info("Import cancelled by user")
 		return err
+	}
+
+	// Counted message failures keep Run's existing summary. A holder failure after
+	// otherwise counted completion must still give the command a nonzero outcome.
+	if firstBatchErr != nil && atomic.LoadInt64(&i.failedMessages) == 0 {
+		return firstBatchErr
 	}
 
 	return nil

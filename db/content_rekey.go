@@ -90,6 +90,10 @@ func (d *Database) ListRekeyCandidates(ctx context.Context, accountID int64, aft
 // staging that hash is waited for and its rows are seen. All the locks are taken before any
 // row is touched, so this cannot wait on a lock while holding row locks.
 func (d *Database) RekeyContentHash(ctx context.Context, tx pgx.Tx, accountID int64, obj ContentObject, newHash string) (int64, error) {
+	if err := LockS3ObjectsSharedInTx(ctx, tx, accountID, []string{newHash}); err != nil {
+		return 0, err
+	}
+
 	var pending bool
 	if err := tx.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM pending_uploads WHERE content_hash = $1 AND account_id = $2)`,

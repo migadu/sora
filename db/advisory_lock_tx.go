@@ -462,8 +462,8 @@ func (l *AdvisoryLockTx) Release() {
 		if err := l.tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) && (l.Err() == nil || errors.Is(l.Err(), ErrAdvisoryLocksFenced)) {
 			logger.Warn("Database: advisory lock transaction could not be rolled back, discarding its connection", "err", err)
 		}
-		l.conn.Release()
 		l.fail(errAdvisoryLockTxReleased)
+		l.conn.Release()
 		l.fence.unregister(l)
 	})
 }

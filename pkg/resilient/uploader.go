@@ -12,50 +12,44 @@ import (
 
 // --- Uploader Worker Wrappers ---
 
-// ExecuteWithS3ObjectLock runs executionFunc while holding the advisory lock keyed by
-// contentHash that the cleaner's S3 deletion takes as well (db.GetS3ObjectLockID).
-// The account does not affect this lock; equal hashes under different S3 keys also
-// coordinate conservatively.
-// sora-admin import rekey holds it while it writes a body's new object and while it
-// deletes the old one.
-// A cross-account IMAP COPY or MOVE takes the same lock in shared mode in its own
-// transaction instead (db.LockS3ObjectsSharedInTx), and an upload only passes
-// db.PassS3WriteGate and holds nothing across its transfer. The lock is held in a
-// db.AdvisoryLockTx for exactly the duration of executionFunc: transaction-scoped, so
-// it is released with its backend whatever pooler the write pool goes through, and
-// held in a transaction that is otherwise idle and read-only, so the S3 transfer inside
-// executionFunc pins one pooled connection but no write transaction, snapshot or xid.
-// It waits for a current holder (a cleaner batch confirming this object is an orphan)
-// for at most 30 seconds.
+// ExecuteWithS3ObjectLock runs executionFunc under an exclusive global content-hash
+// lock. Account ID does not change its namespace; equal hashes under different S3
+// keys also coordinate conservatively. It checks durable deletion intents first.
+// This is a lock/claim helper, not a remote DELETE protocol: destructive body
+// operations must use ExecuteWithS3BodyCleanup so uncertainty remains fenced.
 //
-// executionFunc runs under a context that is cancelled if the lock is lost meanwhile
-// (the backend died, a failover, a failed keepalive), so the S3 transfer stops rather
-// than finishing unprotected; a loss noticed only after it returned is reported as an
-// error.
+// The callback gets a context canceled on observed holder loss and bound to this
+// holder/hash. Cancellation cannot retract an accepted provider operation. SQL that
+// admits an uploaded reference must take its own shared locks and synchronously
+// verify overlap with this original holder, then retain those locks through commit.
+// The outer read-only holder uses one pooled connection; acquiring it is bounded by
+// 30 seconds, and the callback uses its caller's context.
 func (rd *ResilientDatabase) ExecuteWithS3ObjectLock(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error {
-	return rd.executeWithS3ObjectLocks(ctx, func(ctx context.Context, lock *db.AdvisoryLockTx) error {
-		return lock.Lock(ctx, db.GetS3ObjectLockID(accountID, contentHash))
+	return rd.executeWithS3ObjectLocks(ctx, []string{contentHash}, func(ctx context.Context, lock *db.AdvisoryLockTx) error {
+		if err := lock.Lock(ctx, db.GetS3ObjectLockID(accountID, contentHash)); err != nil {
+			return err
+		}
+		return lock.CheckS3BodyClaims(ctx, []string{contentHash})
 	}, executionFunc)
 }
 
-// ExecuteWithSharedS3ObjectLocks runs executionFunc while holding accountID's S3 object
-// locks of contentHashes in shared mode (db.LockS3ObjectsSharedInTx). It is for work that
-// writes the objects, or relies on them being stored, and then commits rows that point at
-// them in transactions of its own, as sora-admin's imports do. Every deleter holds the
-// same lock exclusively across its re-check that nothing references the object and its
-// DELETE, so holding it from before the write until the rows commit orders the two: the
-// deleter's re-check sees the rows, or its DELETE is over before the write. Shared holders
-// do not exclude one another. It waits for a deleter for at most 30 seconds; the locks
-// are held, and lost, as in ExecuteWithS3ObjectLock.
+// ExecuteWithSharedS3ObjectLocks runs storage work under global content-hash locks
+// in shared mode; accountID is compatibility metadata, not part of their namespace.
+// Imports and rekey new-body writes carry the resulting exact-hash claim context
+// into their own write transactions. Those transactions must acquire their shared
+// locks before checking the original holder, closing the gap even when an intervening
+// DELETE already completed and cleared its intent. Shared holders can overlap each
+// other but exclude destructive cleanup. Lifetime and failure limits are the same
+// as ExecuteWithS3ObjectLock; this helper alone is not a SQL commit fence.
 func (rd *ResilientDatabase) ExecuteWithSharedS3ObjectLocks(ctx context.Context, accountID int64, contentHashes []string, executionFunc func(ctx context.Context) error) error {
-	return rd.executeWithS3ObjectLocks(ctx, func(ctx context.Context, lock *db.AdvisoryLockTx) error {
+	return rd.executeWithS3ObjectLocks(ctx, contentHashes, func(ctx context.Context, lock *db.AdvisoryLockTx) error {
 		return lock.LockS3ObjectsShared(ctx, accountID, contentHashes)
 	}, executionFunc)
 }
 
 // executeWithS3ObjectLocks opens a db.AdvisoryLockTx, takes its locks with acquire, and
 // runs executionFunc while they are held (see ExecuteWithS3ObjectLock).
-func (rd *ResilientDatabase) executeWithS3ObjectLocks(ctx context.Context, acquire func(ctx context.Context, lock *db.AdvisoryLockTx) error, executionFunc func(ctx context.Context) error) error {
+func (rd *ResilientDatabase) executeWithS3ObjectLocks(ctx context.Context, hashes []string, acquire func(ctx context.Context, lock *db.AdvisoryLockTx) error, executionFunc func(ctx context.Context) error) error {
 	// Bounds acquiring the connection and waiting for the lock, not executionFunc.
 	lockCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -69,16 +63,15 @@ func (rd *ResilientDatabase) executeWithS3ObjectLocks(ctx context.Context, acqui
 	if err := acquire(lockCtx, lock); err != nil {
 		return err // Could not acquire lock or context was canceled
 	}
-	if err := lock.CheckS3BodyClaims(lockCtx, []string{contentHash}); err != nil {
-		return err
-	}
-
 	guarded, done := lock.Guard(ctx)
 	defer done()
+	guarded = lock.S3BodyClaimContext(guarded, hashes)
 	if err := executionFunc(guarded); err != nil {
 		return err
 	}
-	if err := lock.Err(); err != nil {
+	checkCtx, stopCheck := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer stopCheck()
+	if err := lock.Ping(checkCtx); err != nil {
 		return fmt.Errorf("S3 object lock was lost while the guarded work ran: %w", err)
 	}
 	return nil
