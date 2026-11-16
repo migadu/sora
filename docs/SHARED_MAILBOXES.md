@@ -330,9 +330,10 @@ message counts, as shown by `sora-admin` and the Admin API. Sora has no storage 
 
 A `COPY` or `MOVE` between folders of different owners (into a shared folder, out of one into
 the user's own folders, or between the shared folders of two owners) hands each message to the
-destination's owner, and may carry at most 1,000 distinct messages; copies of one message count
-once. A larger one is refused with
-`NO [LIMIT] COPY between mailboxes of different users is limited to 1000 messages at a time`
+destination's owner. If any selected row is rekeyed, the command may carry at most 1,000
+distinct source bodies, including legacy rows already owned by the destination; repeated
+copies of one body count once. A larger one is refused with
+`NO [LIMIT] COPY across accounts is limited to 1000 distinct message bodies`
 (or `MOVE ...`) and copies or moves nothing; select fewer messages and repeat. The limit keeps one
 command from filling PostgreSQL's lock table (see
 [DATABASE.md](DATABASE.md#server-settings)). A `COPY` or `MOVE` between folders of the same owner

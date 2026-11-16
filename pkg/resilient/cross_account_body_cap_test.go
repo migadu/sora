@@ -43,8 +43,9 @@ func heldAdvisoryLocks(t *testing.T, pool *pgxpool.Pool, accountID int64, hash s
 // PostgreSQL keeps every one of them in its shared lock table, max_locks_per_transaction x
 // (max_connections + max_prepared_transactions) entries for the whole server, so one command
 // over tens of thousands of messages fails every session with "out of shared memory". One
-// over the cap must be refused before its transaction takes any lock, changing nothing.
-func TestCrossAccountCopyMoveOverTheBodyCapTakeNoLocks(t *testing.T) {
+// over the cap is refused before any body lock or storage callback, changing no
+// rows. A fresh check may hold account-rekey guards until rollback.
+func TestCrossAccountCopyMoveOverTheBodyCapTakeNoBodyLocks(t *testing.T) {
 	ctx := context.Background()
 	cfg := testDatabaseConfig()
 	plain := newTestPool(t, cfg, nil)

@@ -15,25 +15,22 @@ import (
 	"github.com/migadu/sora/logger"
 )
 
-// MaxCrossAccountBodies is the most distinct bodies one COPY or MOVE may re-key into the
-// account that owns its destination mailbox. Such a command holds two shared advisory locks
-// per body until it commits, the destination object's S3 lock (LockS3ObjectsSharedInTx) and
-// the FTS orphan-sweep lock (restageFTS), and PostgreSQL keeps each one in its shared lock
-// table: max_locks_per_transaction × (max_connections + max_prepared_transactions) entries
-// for the whole server. Once they are used up, every session fails with "out of shared
-// memory" (SQLSTATE 53200). The command cannot be split into smaller transactions instead:
-// RFC 9051 §6.4.7, "partial copy MUST NOT be done". The value is the lock budget of the
-// cleaner's FTS orphan sweep batch (BATCH_PURGE_SIZE).
+// MaxCrossAccountBodies bounds all distinct source bodies when any selected row
+// is rekeyed to another account, including legacy rows already owned by the
+// destination. Source/destination global body claims and FTS locks remain held
+// through commit. Their budget excludes source-account and ordinary SQL locks,
+// and concurrent commands still need shared lock-table capacity. Pure same-owner
+// commands retain their existing policy. COPY cannot be split into partial commits.
 const MaxCrossAccountBodies = 1000
 
-// ErrCrossAccountBodyLimit refuses a COPY or MOVE that would re-key more than
-// MaxCrossAccountBodies distinct bodies into another account; nothing is locked or written.
-var ErrCrossAccountBodyLimit = fmt.Errorf("a copy or move into another account's mailbox is limited to %d distinct messages", MaxCrossAccountBodies)
+// ErrCrossAccountBodyLimit refuses an oversized cross-account source budget.
+// Account guards may be held for a fresh check, but no body lock, storage callback
+// or message write has started.
+var ErrCrossAccountBodyLimit = fmt.Errorf("a copy or move into another account's mailbox is limited to %d distinct source bodies", MaxCrossAccountBodies)
 
-// CheckCrossAccountBodies returns ErrCrossAccountBodyLimit when sourceHashes, the hashes by
-// source UID of the rows a COPY or MOVE re-keys to the destination owner (see CopyMessages
-// and MoveMessages), name more than MaxCrossAccountBodies distinct bodies. Copies of one body
-// count once, as they take its locks once.
+// CheckCrossAccountBodies checks a protocol preflight map containing every selected
+// source UID when any row is rekeyed. The actual write transaction repeats the
+// complete-source check under account-rekey guards. Repeated bodies count once.
 func CheckCrossAccountBodies(sourceHashes map[imap.UID]string) error {
 	if len(sourceHashes) <= MaxCrossAccountBodies {
 		return nil
@@ -51,10 +48,10 @@ func CheckCrossAccountBodies(sourceHashes map[imap.UID]string) error {
 // LockS3ObjectsSharedInTx takes the S3 object locks (GetS3ObjectLockID) of accountID's
 // contentHashes in shared mode on tx, in id order, waiting for an exclusive holder (for at
 // most the transaction's lock_timeout). They last until tx ends. Shared holders do not
-// exclude one another; they keep out every exclusive locker of the same objects: the
-// cleaner's and the purge's deletes (which only try the lock and skip a busy object), a
-// restore, sora-admin rekey, and the uploader's write gate. Each lock is a lock-table entry
-// until tx ends, so the caller bounds contentHashes (CheckCrossAccountBodies).
+// exclude one another; they keep out the exclusive holders used by typed durable
+// body cleanup (the cleaner and purge skip a busy object). Restore, rekey admission and the uploader gate share
+// immutable claims. Each lock consumes a lock-table entry until tx ends; callers
+// budget their batches, including the complete-source COPY/MOVE check.
 //
 // The statement carries the ids as literals, so it goes over the simple protocol and
 // leaves no portal or snapshot behind: a transaction that holds the locks across S3 round
@@ -79,7 +76,7 @@ func LockS3ObjectsSharedInTx(ctx context.Context, tx pgx.Tx, accountID int64, co
 	if _, err := tx.Exec(ctx, sql); err != nil {
 		return fmt.Errorf("failed to lock S3 objects: %w", err)
 	}
-	return nil
+	return CheckS3BodyClaims(ctx, tx, contentHashes)
 }
 
 // ErrMoveSourceChanged is returned by MoveMessages when a source row owned by another
@@ -123,6 +120,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		logger.Info("Database: moving messages within the same mailbox, will assign new UIDs", "mailbox_id", srcMailboxID)
 	}
 
+	if err := lockS3SourceClaims(ctx, tx, srcMailboxID, destMailboxID, destAccountID, ids, destObjects); err != nil {
+		return nil, err
+	}
+
 	// Serialize unseen_count maintenance for both mailboxes by locking their
 	// mailbox rows in ascending id order (see lockMailboxStats). This both
 	// prevents the flag/expunge-vs-move trigger race from drifting the cache and
@@ -130,6 +131,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	// mailboxes cannot deadlock (A->B and B->A lock the same rows in the same order).
 	if err := lockMailboxStatsPair(ctx, tx, srcMailboxID, destMailboxID); err != nil {
 		return nil, fmt.Errorf("failed to lock mailbox stats for move on mailboxes %d and %d: %w", srcMailboxID, destMailboxID, err)
+	}
+	window := modSeqWindowFor(ctx, destMailboxID)
+	if err := window.begin(ctx, tx); err != nil {
+		return nil, err
 	}
 
 	// From here to the commit a rekey must not rename a source. The row locks below would
@@ -220,6 +225,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	//
 	// For same-mailbox moves, we must mark old messages as expunged BEFORE inserting
 	// new ones to avoid having two active copies of the same message.
+	//
+	// Both paths carry the source's flags. A source without a message_state row (left
+	// by an older build) has none, and the moved message gets a
+	// row with none.
 	if srcMailboxID == destMailboxID {
 		// Step 1: Mark old messages as expunged to remove them from the unique index
 		_, err = tx.Exec(ctx, `
@@ -240,7 +249,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to, m."references",
 					m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown, m.internal_date, m.size,
 					m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
-					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses,
+					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses, m.header_presence,
 					m.id AS original_id,
 					d.new_uid
 				FROM messages m
@@ -251,14 +260,14 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
 					mailbox_id, mailbox_path, created_modseq, uid
 				)
 				SELECT
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
 					$1 AS mailbox_id,
 					$2 AS mailbox_path,
 					nextval('messages_modseq') AS created_modseq,
@@ -267,10 +276,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 				RETURNING id, uid
 			)
 			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
-			SELECT i.id, $1, ms.flags, ms.custom_flags, NOW(), nextval('messages_modseq')
+			SELECT i.id, $1, COALESCE(ms.flags, 0), COALESCE(ms.custom_flags, '[]'::jsonb), NOW(), nextval('messages_modseq')
 			FROM inserted i
 			JOIN src_data s ON s.new_uid = i.uid
-			JOIN message_state ms ON ms.message_id = s.original_id
+			LEFT JOIN message_state ms ON ms.message_id = s.original_id
 		`, srcMailboxID, destMailboxName, messageIDs, newUIDs)
 		if err != nil {
 			logger.Error("Database: failed to insert new messages for same-mailbox move", "err", err)
@@ -296,7 +305,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					m.content_hash, m.uploaded, m.message_id, m.in_reply_to, m."references",
 					m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown, m.internal_date, m.size,
 					m.body_structure, m.recipients_json,
-					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses,
+					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses, m.header_presence,
 					m.id AS original_id,
 					m.account_id AS src_account_id, m.s3_domain AS src_s3_domain, m.s3_localpart AS src_s3_localpart,
 					d.new_uid,
@@ -309,7 +318,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
 					mailbox_id, mailbox_path, created_modseq, uid
 				)
 				SELECT
@@ -324,7 +333,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					-- (destObjects, above).
 					CASE WHEN src_account_id = $6 THEN src_s3_domain ELSE $7 END AS s3_domain,
 					CASE WHEN src_account_id = $6 THEN src_s3_localpart ELSE $8 END AS s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
 					$1 AS mailbox_id,
 					$2 AS mailbox_path,
 					nextval('messages_modseq') AS created_modseq,
@@ -333,10 +342,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 				RETURNING id, uid
 			)
 			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
-			SELECT i.id, $1, ms.flags, s.custom_flags_canon, NOW(), nextval('messages_modseq')
+			SELECT i.id, $1, COALESCE(ms.flags, 0), s.custom_flags_canon, NOW(), nextval('messages_modseq')
 			FROM inserted i
 			JOIN src_data s ON s.new_uid = i.uid
-			JOIN message_state ms ON ms.message_id = s.original_id
+			LEFT JOIN message_state ms ON ms.message_id = s.original_id
 		`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart, destObjects)
 		if err != nil {
 			logger.Error("Database: failed to batch insert messages into destination mailbox", "err", err)
@@ -373,6 +382,9 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		}
 	}
 
+	if err := window.end(ctx, tx); err != nil {
+		return nil, err
+	}
 	return messageUIDMap, nil
 }
 

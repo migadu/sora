@@ -530,6 +530,7 @@ See [STORAGE.md](STORAGE.md).
 | `timeout` | duration | `"30s"` | Timeout of one S3 operation. |
 | `encrypt` | bool | `false` | Encrypt bodies on the client before upload. |
 | `encryption_key` | string | none | Key for `encrypt`. |
+| `body_deletion_protocol` | string | `"paused"` | Message-body deletion and reference retirement stay paused until the [fleet cutover](OPERATIONS.md#upgrading-the-s3-message-body-lock-protocol) is complete; only then acknowledge `"global-hash-v1"`. Delivery, reads and uploads remain available. |
 
 ### 8.5 Local cache (`[local_cache]`)
 
@@ -741,7 +742,7 @@ A SQLite cache of credentials, used by proxies that check passwords in the datab
 |---|---|---|---|
 | `enabled` | bool | `false` | |
 | `path` | string | `"/var/cache/sora/auth_cache.db"` | Database file. Its directory is created. |
-| `max_age` | duration | `"24h"` | Age after which an entry is fetched again. |
+| `max_age` | duration | `"24h"` | Age after which an entry is fetched again; capped at the seven-day credential-feed retention. |
 | `purge_unused` | duration | `"168h"` | Entries unused this long are removed. |
 | `cleanup_interval` | duration | `"1h"` | How often old entries are removed. Must be positive. |
 
@@ -980,9 +981,10 @@ An in-memory cache of login results. See [AUTHENTICATION.md](AUTHENTICATION.md) 
 [PROXY.md](PROXY.md).
 
 By default the cache is on for `imap`, `pop3`, `managesieve` and the line proxies, and off for
-`http_user_api` and `user_api_proxy`. A table you write changes only the keys it names; the others,
-`enabled` included, keep their defaults. The `lmtp`, `metrics` and `http_admin_api` servers keep no
-lookup cache; on them the table is ignored, with a startup warning.
+`user_api_proxy`. A table you write changes only the keys it names; the others, `enabled` included,
+keep their defaults. The `http_user_api` backend always reads its credential hash and token epoch
+from the primary. It keeps no login cache, like the `lmtp`, `metrics` and `http_admin_api` servers;
+on these types the table is ignored, with a startup warning.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
@@ -1134,3 +1136,9 @@ At startup Sora checks the pools as a whole (`Config.ValidatePools` in
 - a proxy server also has `remote_addrs`;
 - a pool backend has no port and a proxy server has no `remote_port`;
 - there is no default pool and a proxy has no remote lookup, or has `lookup_local_users = true`.
+
+
+For IMAP/POP3 proxy backend legs, `remote_skip_forwarding_with_proxy_protocol`
+defaults to `false`. Set it explicitly on the server, pool or remote-lookup settings
+to omit configured ID/XCLIENT when a PROXY header is actually sent. See
+[PROXY.md](PROXY.md#explicit-suppression-alongside-proxy) for the metadata omitted.

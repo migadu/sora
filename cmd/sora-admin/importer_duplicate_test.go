@@ -74,8 +74,6 @@ func TestImporter_DuplicateMessageHandling(t *testing.T) {
 	options := ImporterOptions{
 		DryRun:               false,
 		PreserveFlags:        true,
-		ShowProgress:         false,
-		ForceReimport:        false,
 		CleanupDB:            true,
 		Dovecot:              false,
 		PreserveUIDs:         false,
@@ -182,8 +180,6 @@ func TestImporter_ReimportExistingMessages(t *testing.T) {
 	options := ImporterOptions{
 		DryRun:               false,
 		PreserveFlags:        true,
-		ShowProgress:         false,
-		ForceReimport:        false,
 		CleanupDB:            false, // Keep SQLite DB for second run
 		Dovecot:              false,
 		PreserveUIDs:         false,

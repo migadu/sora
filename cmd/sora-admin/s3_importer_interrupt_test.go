@@ -371,7 +371,7 @@ func TestS3ImportDoesNotImportWhenTheExistenceCheckFails(t *testing.T) {
 	si.rdb = mock
 
 	_, err = runS3Import(t, si)
-	require.NoError(t, err)
+	require.ErrorContains(t, err, "import completed with 3 failed objects")
 
 	require.Empty(t, mock.inserted, "objects whose existence check failed were imported")
 	require.Zero(t, bucket.gets, "objects whose existence check failed were read from S3")
@@ -438,4 +438,17 @@ func TestS3ImportInterruptIsNotAFailure(t *testing.T) {
 	var marked int
 	require.NoError(t, si.db.QueryRow(`SELECT COUNT(*) FROM s3_objects WHERE processed`).Scan(&marked))
 	require.Zero(t, marked, "an object the interrupt stopped was recorded as processed")
+}
+
+func (m *s3ImportTestDB) GetOperationalDatabase() *db.Database { return nil }
+func (m *s3ImportTestDB) ExecuteWithSharedS3ObjectLocks(ctx context.Context, _ int64, _ []string, fn func(context.Context) error) error {
+	return fn(ctx)
+}
+
+func (m *s3ImportTestDB) InsertStoredMessageWithRetry(ctx context.Context, o *db.InsertMessageOptions, u db.PendingUpload, keys []string) (int64, int64, error) {
+	id, uid, err := m.InsertMessageWithRetry(ctx, o, u)
+	if err != nil {
+		return id, uid, err
+	}
+	return id, uid, m.CompleteS3UploadWithRetry(ctx, u.ContentHash, u.AccountID, keys)
 }

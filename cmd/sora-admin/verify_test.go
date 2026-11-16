@@ -94,3 +94,23 @@ func TestVerifyS3_Integration(t *testing.T) {
 	assert.Equal(t, expectedCount, result.MessagesInDB)
 }
 */
+
+func TestContentObjectFromKey(t *testing.T) {
+	obj, ok := contentObjectFromKey("example.com/user/abc123")
+	assert.True(t, ok)
+	assert.Equal(t, "example.com", obj.S3Domain)
+	assert.Equal(t, "user", obj.S3Localpart)
+	assert.Equal(t, "abc123", obj.ContentHash)
+	assert.Equal(t, "example.com/user/abc123", obj.Key())
+
+	// A local part may contain "/"; a domain and a hash never do.
+	obj, ok = contentObjectFromKey("example.com/a/b/abc123")
+	assert.True(t, ok)
+	assert.Equal(t, "a/b", obj.S3Localpart)
+	assert.Equal(t, "abc123", obj.ContentHash)
+
+	for _, key := range []string{"", "abc123", "example.com/abc123", "example.com/user/", "/user/abc123", "example.com//abc123"} {
+		_, ok := contentObjectFromKey(key)
+		assert.False(t, ok, "key %q", key)
+	}
+}

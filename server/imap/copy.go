@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/migadu/go-imap"
@@ -101,7 +103,7 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	// The hash each cross-account body is made available for below. CopyMessages copies a
 	// source only if it still has it, since a rekey can rename it before the INSERT.
 	sourceHashes := crossAccountSourceHashes(messages, destMailbox.AccountID)
-	if err := db.CheckCrossAccountBodies(sourceHashes); err != nil {
+	if selectedMailboxID != destMailbox.ID && checkCrossAccountSourceBudget(messages, sourceHashes) != nil {
 		return nil, s.crossAccountBodyLimitError("COPY")
 	}
 
@@ -117,7 +119,7 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 		destS3Localpart = localpart
 	}
 
-	// COPY's transaction holds the destination object locks before checking S3 and
+	// COPY's transaction holds account-independent destination body locks before checking S3 and
 	// until its rows commit, as MOVE does. A body staged locally is re-staged instead.
 	type crossAccountObject struct {
 		sourceKey, destKey string
@@ -175,7 +177,10 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	}
 
 	// Perform the batch copy operation
-	uidMap, newMessageIDs, err := s.server.rdb.CopyMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.instanceID, sourceHashes, destHashes, ensureDestObject)
+	writeCtx, ownMessagesDone := s.beginOwnMessages(ctx, destMailbox.ID)
+	var copied []imap.UID
+	defer func() { ownMessagesDone(copied...) }()
+	uidMap, newMessageIDs, err := s.server.rdb.CopyMessagesWithRetry(writeCtx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.instanceID, sourceHashes, destHashes, ensureDestObject)
 	if err != nil {
 		var destErr *resilient.DestObjectError
 		switch {
@@ -210,6 +215,8 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 			// authoritative, so fall through to the normal success path.
 			s.WarnLog("COPY commit acknowledgement was lost but read-back confirms the copy committed; answering OK",
 				"messages", len(newMessageIDs))
+		case errors.Is(err, db.ErrCrossAccountBodyLimit):
+			return nil, s.crossAccountBodyLimitError("COPY")
 		case errors.Is(err, db.ErrCopySourceChanged):
 			// A source body was renamed (sora-admin import rekey) after it was made
 			// available above, under the old hash. Nothing was written; a new COPY reads the
@@ -230,6 +237,8 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 			return nil, s.internalError("failed to copy messages: %v", err)
 		}
 	}
+
+	copied = slices.Collect(maps.Values(uidMap))
 
 	// Pin this session to the master DB (same rationale as APPEND, append.go).
 	// COPY writes into the destination mailbox; pinning gives read-your-writes so
@@ -293,17 +302,31 @@ func crossAccountSourceHashes(messages []db.Message, destAccountID int64) map[im
 	return hashes
 }
 
+// checkCrossAccountSourceBudget includes destination-owned legacy rows whenever
+// any selected row is rekeyed. The primary write transaction repeats this check
+// from a fresh read under account-rekey guards before taking body locks.
+func checkCrossAccountSourceBudget(messages []db.Message, rekeyed map[imap.UID]string) error {
+	if len(rekeyed) == 0 {
+		return nil
+	}
+	hashes := make(map[imap.UID]string, len(messages))
+	for _, msg := range messages {
+		hashes[msg.UID] = msg.ContentHash
+	}
+	return db.CheckCrossAccountBodies(hashes)
+}
+
 // crossAccountBodyLimitError answers a COPY or MOVE that would re-key more distinct
-// messages into another account than db.MaxCrossAccountBodies: its transaction would hold
-// two lock-table entries per message until it commits. Nothing was copied or moved, and a
+// source bodies into another account than db.MaxCrossAccountBodies. The budget
+// includes source/destination body claims and FTS locks. Nothing was copied or moved, and a
 // smaller set succeeds. RFC 5530 §3, LIMIT: "The operation ran up against an implementation
 // limit of some kind".
 func (s *IMAPSession) crossAccountBodyLimitError(command string) *imap.Error {
-	s.InfoLog("refused a cross-account command over the message limit", "command", command, "max", db.MaxCrossAccountBodies)
+	s.InfoLog("refused a cross-account command over the body limit", "command", command, "max", db.MaxCrossAccountBodies)
 	return &imap.Error{
 		Type: imap.StatusResponseTypeNo,
 		Code: imap.ResponseCodeLimit,
-		Text: fmt.Sprintf("%s between mailboxes of different users is limited to %d messages at a time", command, db.MaxCrossAccountBodies),
+		Text: fmt.Sprintf("%s across accounts is limited to %d distinct message bodies", command, db.MaxCrossAccountBodies),
 	}
 }
 

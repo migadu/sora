@@ -945,6 +945,8 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 // forAuth is set for a login or refresh, which carries no token yet: anyone can name any
 // user in one, so it reads affinity but never writes it (no gossip per made-up user).
 func (s *Server) routeUser(ctx context.Context, email string, accountID int64, forAuth bool) (backendRoute, error) {
+	cacheGeneration := s.lookupCache.Generation()
+
 	named := s.connManager.HasNamedPools()
 	poolName := ""
 	havePool := false
@@ -1010,7 +1012,7 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			}
 			// A flat list is one pool: route into it, as before pools; nothing is cached.
 		case routingInfo == nil && result == proxy.AuthUserNotFound:
-			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, IsNegative: true})
+			s.cacheRoute(cacheGeneration, email, &lookupcache.CacheEntry{AccountID: accountID, IsNegative: true})
 			notFound = true
 		case routingInfo == nil && result == proxy.AuthFailed:
 			// 401/403: the lookup refuses the account, a verdict and not an outage, with
@@ -1034,7 +1036,7 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			}
 			// The answer is cached as given, in maintenance or not: routing decides each
 			// time, so the pin returns the user to its backend once maintenance ends.
-			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, ServerAddress: routingInfo.ServerAddress})
+			s.cacheRoute(cacheGeneration, email, &lookupcache.CacheEntry{AccountID: accountID, ServerAddress: routingInfo.ServerAddress})
 			if s.connManager.InMaintenance(routingInfo.ServerAddress) {
 				logger.Info("User API Proxy: Remote lookup backend in maintenance - routing among its siblings", "name", s.name, "user", email, "backend", routingInfo.ServerAddress)
 				poolName, havePool, pinInMaintenance = s.connManager.PoolOfBackend(routingInfo.ServerAddress), true, true
@@ -1050,7 +1052,7 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			return s.serverRoute(routingInfo.ServerAddress), nil
 		default:
 			poolName, havePool = routingInfo.PoolName, true
-			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, PoolName: routingInfo.PoolName})
+			s.cacheRoute(cacheGeneration, email, &lookupcache.CacheEntry{AccountID: accountID, PoolName: routingInfo.PoolName})
 		}
 	}
 	if notFound && !s.lookupLocalUsers {
@@ -1130,12 +1132,12 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 
 // cacheRoute remembers a lookup answer for the configured positive TTL (negative TTL for
 // a user the lookup does not know), if the lookup cache is enabled.
-func (s *Server) cacheRoute(email string, entry *lookupcache.CacheEntry) {
+func (s *Server) cacheRoute(generation uint64, email string, entry *lookupcache.CacheEntry) {
 	if s.lookupCache == nil {
 		return
 	}
 	// ExpiresAt left zero: Set applies the configured TTL
-	s.lookupCache.Set(s.name, email, entry)
+	s.lookupCache.SetIfGeneration(generation, s.name, email, entry)
 }
 
 // proxyRequest proxies the request to the backend. login is the login attempt r is, if
@@ -1423,3 +1425,6 @@ func (s *Server) Stop() error {
 
 	return nil
 }
+
+// GetLookupCache exposes the route cache for database credential revocation/reset.
+func (s *Server) GetLookupCache() *lookupcache.LookupCache { return s.lookupCache }

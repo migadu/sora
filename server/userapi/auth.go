@@ -107,14 +107,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var accountID int64
-	var hashedPassword string
-	var err error
-
-	// Check authentication rate limiting before the auth cache: a blocked address or
-	// IP+username pair is refused whether or not the answer is cached (the cache only
-	// saves the database work), and a cached success must not be recorded for an
-	// attempt the limiter would have refused.
+	// Check authentication rate limiting before credential work. A blocked address
+	// or IP+username pair must not reach the database or record a successful attempt.
 	if s.authLimiter != nil {
 		if err := s.authLimiter.CanAttemptAuth(ctx, remoteAddr, authKey); err != nil {
 			// Return the SAME response as a bad-credential failure (401 "Invalid credentials")
@@ -136,7 +130,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// input that does not parse as a user address (or carries an @-suffix, which User
 	// API logins never use and NewAddress leaves unvalidated) names no account: answer
 	// it like an unknown user after one dummy verification and record the failed
-	// attempt, without touching the auth cache or PostgreSQL (where NUL bytes fail with
+	// attempt, without touching PostgreSQL (where NUL bytes fail with
 	// SQLSTATE 22021 and used to answer 503 uncounted).
 	addr, err := server.NewAddress(strings.TrimSpace(req.Email))
 	if err != nil || addr.HasSuffix() {
@@ -150,43 +144,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	email := addr.FullAddress()
 
-	// Check cache (if enabled)
-	if s.authCache != nil {
-		cachedAccountID, found, cacheErr := s.authCache.Authenticate(email, req.Password)
-		if cacheErr != nil {
-			// Cached failure (same wrong password)
-			logger.Debug("User API: Cache hit - authentication failed", "name", s.name, "email", email)
-			if s.authLimiter != nil {
-				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
-			}
-			s.writeLoginRefused(w)
-			return
-		}
-		if found {
-			// Cache hit - successful authentication
-			logger.Debug("User API: Cache hit - using cached auth", "name", s.name, "email", email, "account_id", cachedAccountID)
-			accountID = cachedAccountID
-			if s.authLimiter != nil {
-				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, true)
-			}
-			// Skip database lookup - use cached account ID
-			goto generateToken
-		}
-		// Cache miss or revalidation needed - fall through to full auth
-		logger.Debug("User API: Cache miss - performing full authentication", "name", s.name, "email", email)
-	}
-
-	// Authenticate user (full database lookup)
-	accountID, hashedPassword, err = s.rdb.GetCredentialForAuthWithRetry(ctx, email)
+	// Read the hash and token epoch together from the primary. There is no login
+	// cache: a cached password verdict cannot supply the epoch of that same hash.
+	accountID, hashedPassword, epoch, err := s.rdb.GetCredentialForTokenWithRetry(ctx, email)
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
 			// Equalize response timing with the wrong-password path (which runs bcrypt) so
 			// response time can't reveal whether the account exists. (security-audit M14)
 			db.DummyVerifyPassword(req.Password)
-			// Cache negative result if cache enabled (result=1 for user not found)
-			if s.authCache != nil {
-				s.authCache.SetFailure(email, 1)
-			}
 			// Record failed attempt
 			if s.authLimiter != nil {
 				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
@@ -209,17 +174,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			// one: the stored data is at fault, and only an administrator can repair it.
 			// Answered like a database outage, as the proxies and the backends do: a
 			// temporary failure, not counted as a failed login (a block earned on it
-			// would outlast the repair), nothing cached. A cached login this password
-			// missed was dropped before the database was asked (LookupCache.Authenticate),
-			// so it cannot answer the next guess. VerifyPassword logged why, without the
-			// address.
+			// would outlast the repair). VerifyPassword logged why, without the address.
 			logger.Warn("User API: authentication unavailable", "name", s.name, "email", email, "reason", "unverifiable_hash", "error", err)
 			s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
 			return
-		}
-		// Cache negative result if cache enabled (result=2 for invalid password)
-		if s.authCache != nil {
-			s.authCache.SetFailure(email, 2)
 		}
 		// Record failed attempt
 		if s.authLimiter != nil {
@@ -229,33 +187,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cache positive result if cache enabled
-	if s.authCache != nil {
-		s.authCache.SetSuccess(email, accountID, hashedPassword, req.Password)
-	}
-
 	// Record successful attempt
 	if s.authLimiter != nil {
 		s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, true)
-	}
-
-generateToken:
-
-	// Bind the token to the current password epoch so a later password change or
-	// account deletion invalidates it at refresh time (the cache fast-path above
-	// can skip the DB, so fetch it here for both paths).
-	_, epoch, err := s.rdb.GetCredentialEpochWithRetry(ctx, email)
-	if err != nil {
-		if errors.Is(err, consts.ErrUserNotFound) {
-			// No active account any more: deleted since its credentials were cached
-			// (or since the lookup above). Refused, as the refresh refuses it.
-			logger.Info("HTTP Mail API: Refusing login for deleted/unknown account", "name", s.name, "email", email)
-			s.writeLoginRefused(w)
-			return
-		}
-		logger.Warn("HTTP Mail API: Error fetching credential epoch", "name", s.name, "error", err)
-		s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
-		return
 	}
 
 	// Account creation makes no mailboxes: like an IMAP or POP3 login, this one

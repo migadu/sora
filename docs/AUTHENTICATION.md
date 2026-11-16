@@ -100,7 +100,7 @@ sora-admin --config config.toml credentials add --primary user@example.com \
 sora-admin --config config.toml accounts update --email user@example.com --password 'changed-passphrase'
 ```
 
-A change made through the Admin API or `sora-admin` also drops the account's cached logins
+A change made through the Admin API or `sora-admin` also requests invalidation of the account's cached logins
 (section 12).
 
 ---
@@ -723,21 +723,41 @@ The master SASL gate (`master_sasl_allowed_networks`) is separate and always use
 
 ## 12. Cached logins and password changes
 
-Several caches answer logins without asking PostgreSQL. Until an entry is dropped or expires, it
-can still accept the state from before a password change, a credential deletion or an account
-deletion:
+Backend and proxy lookup caches keep recent verdicts in memory; `[auth_cache]` can also retain
+successful PostgreSQL checks in SQLite across restarts. On nodes with database access, migration 69
+records password changes, credential removals and accounts taken out of service. Each node reads
+this feed from the primary, normally every five seconds, and invalidates affected cache entries.
+The cursor follows the primary snapshot's safe transaction horizon: an arbitrarily late commit
+cannot fall behind it because of its trigger timestamp. It advances only after the local sinks
+and synchronization callback succeed. Administrative gossip can deliver changes sooner.
 
-| Cache | Where | How long an entry can keep answering |
-|---|---|---|
-| Backend lookup cache (section 6) | each backend listener, memory | up to `positive_revalidation_window` (30 s), for a user who logged in with it shortly before |
-| Proxy lookup cache | each proxy listener, memory | up to `positive_ttl` (5 minutes); see [PROXY.md](PROXY.md#10-lookup-cache) |
-| Auth cache (`[auth_cache]`) | each proxy node, SQLite | until the entry is older than `max_age` (24 hours when unset), or until the user logs in through that node with the new password; see [PROXY.md](PROXY.md#11-auth-cache) |
+Database-backed caches start suspended, including new listeners introduced by reload. Before the
+persistent cache resumes, its marker must match the primary database UUID and tracking version;
+old untracked rows or rows from another database are flushed atomically. A matching marker allows
+a normal restart to retain warm entries after synchronization. Feed-read or sink failures suspend
+cache hits and fills; authentication then uses primary credential reads. Recovery re-enables the
+caches after successful synchronization. Healthy polling does not flush unaffected warm entries.
 
-Changes made through the Admin API or `sora-admin` (password update, credential deletion, account
-deletion) take effect across the cluster at once, whichever node or tool makes them: they drop the
-account's entries from the backend and proxy lookup caches, the User API's lookup cache and the
-proxies' SQLite auth cache on every node. An account deletion also ends the account's sessions. Kicking a user
-(`sora-admin connections kick`) also drops the lookup-cache entries.
+Cache fills carry an invalidation generation captured before their lookup. A lookup racing a
+change can finish its own already-started check, but cannot persist an obsolete verdict after the
+invalidation. A generation fence also closes authenticated mail sessions that register after an
+account-removal notification passed. It is conservative: a concurrent unrelated removal can make
+an in-flight login reconnect. Accounts taken out of service have their local sessions ended on
+each node. After a feed gap of at least seven days, a backwards database clock or cursor rollback,
+account attribution may be incomplete: all local login caches and mail sessions are reset before
+resuming. Entries are retained for pruning from their first observation, not their pre-commit
+trigger time.
+
+The User API has no login cache. It reads the password hash and credential epoch together from
+the primary, and token refresh reads the epoch from the primary too. A configured User API
+`lookup_cache` is ignored and warned about. Existing access tokens retain their normal JWT expiry
+rules; this feed is not a per-request JWT revocation service.
+
+Upgrade every cache-serving node before relying on this behavior. Nodes without database access
+and credentials owned by an external remote-lookup service still follow that service's cache and
+invalidation policy ([PROXY.md](PROXY.md#10-lookup-cache)). After restoring PostgreSQL to an older
+state, clear its associated persistent auth caches before admitting logins; preserving a logical
+database UUID does not prove that a restored database contains the cache's newer credential state.
 
 ---
 

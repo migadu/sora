@@ -48,6 +48,7 @@ var (
 )
 
 type POP3ProxySession struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server                *POP3ProxyServer
 	settings              *reloadableSettings // the settings its protocol server was built with (see reloadableSettings)
 	clientConn            net.Conn            // Reassigned on hijack; writes must hold mutex (sendGracefulShutdownMessage reads it from the Stop goroutine)
@@ -113,6 +114,9 @@ func (s *POP3ProxySession) ErrorLog(msg string, keysAndValues ...any) {
 }
 
 func (s *POP3ProxySession) authenticate(username, password string) error {
+	s.authSessionGeneration = s.server.connTracker.SessionGeneration()
+	cacheGeneration := s.server.lookupCache.Generation()
+
 	// Remember the username exactly as submitted: the lookup cache is keyed on
 	// it (every Set below uses it), so invalidation must use the same value —
 	// not the resolved s.username, which can differ for token/master/+detail logins.
@@ -442,7 +446,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 						IsNegative:     false,
 					}
 					proxy.CacheRoute(entry, routingInfo) // the route, its settings, FromRemoteLookup
-					s.server.lookupCache.Set(s.server.name, username, entry)
+					s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, entry)
 				}
 
 				s.authenticated = true
@@ -479,7 +483,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 				// Cache negative result (wrong password)
 				if s.server.lookupCache != nil {
-					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 						PasswordDigest: lookupcache.NewPasswordDigest(password),
 						Result:         lookupcache.AuthFailed,
 						IsNegative:     true,
@@ -517,7 +521,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 						db.DummyVerifyPassword(password)
 					}
 					if s.server.lookupCache != nil {
-						s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+						s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 							PasswordDigest: lookupcache.NewPasswordDigest(password),
 							Result:         lookupcache.AuthUserNotFound,
 							IsNegative:     true,
@@ -604,7 +608,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 			if isDefinitiveFailure {
 				if s.server.lookupCache != nil {
-					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 						PasswordDigest: lookupcache.NewPasswordDigest(password),
 						Result:         lookupcache.AuthFailed,
 						IsNegative:     true,
@@ -641,7 +645,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 	// Cache successful authentication (main DB)
 	if s.server.lookupCache != nil {
-		s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+		s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 			AccountID:        accountID,
 			PasswordDigest:   lookupcache.NewPasswordDigest(password),
 			ServerAddress:    "", // Will be populated by affinity/routing in next connection
@@ -802,9 +806,16 @@ func (s *POP3ProxySession) connectToBackend() error {
 	// Send XCLIENT command to backend with forwarding parameters if enabled.
 	// This MUST be done before authenticating.
 	useXCLIENT := s.server.remoteUseXCLIENT
+	skipForwarding := s.server.remoteSkipForwardingWithProxyProtocol
 	// The route's setting applies to the backend the lookup named or its pool picked (as for the dial)
 	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
 		useXCLIENT = s.routingInfo.RemoteUseXCLIENT
+		skipForwarding = s.routingInfo.RemoteSkipForwardingWithProxyProtocol
+	}
+	// Explicit opt-in: PROXY does not carry all ID/XCLIENT metadata.
+	// Preserve configured forwarding unless this route accepts that omission.
+	if skipForwarding && useXCLIENT && s.server.connManager.SendsProxyHeader(s.routingInfo, s.serverAddr, clientHost, clientPort, serverHost, serverPort) {
+		useXCLIENT = false
 	}
 	if useXCLIENT {
 		if err := s.sendForwardingParametersToBackend(backendWriter, backendReader); errors.Is(err, errXCLIENTRefused) {
@@ -1179,7 +1190,7 @@ func (s *POP3ProxySession) updateActivityPeriodically(ctx context.Context) {
 	}
 
 	// Register for kick notifications
-	kickChan := s.server.connTracker.RegisterSession(s.accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(s.accountID, s.authSessionGeneration)
 	defer s.server.connTracker.UnregisterSession(s.accountID, kickChan)
 
 	for {

@@ -130,7 +130,7 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 	// The hash each cross-account body is made available for below. MoveMessages moves a
 	// source only if it still has it, since a rekey can rename it before the rows are locked.
 	sourceHashes := crossAccountSourceHashes(messages, destMailbox.AccountID)
-	if err := db.CheckCrossAccountBodies(sourceHashes); err != nil {
+	if selectedMailboxID != destMailbox.ID && checkCrossAccountSourceBudget(messages, sourceHashes) != nil {
 		return s.crossAccountBodyLimitError("MOVE")
 	}
 
@@ -209,13 +209,16 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		return s.server.s3.CopyWithRetry(ctx, obj.sourceKey, obj.destKey)
 	}
 
-	ownMessagesDone := s.beginOwnMessages(destMailbox.ID) // a MOVE within the selected mailbox
-	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.instanceID, sourceHashes, destHashes, ensureDestObject)
+	writeCtx, ownMessagesDone := s.beginOwnMessages(ctx, destMailbox.ID)
+	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(writeCtx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.instanceID, sourceHashes, destHashes, ensureDestObject)
 	if err != nil {
 		ownMessagesDone()
 		var destErr *resilient.DestObjectError
 		if errors.As(err, &destErr) {
 			return s.crossAccountObjectError(destObjects[destErr.ContentHash].sourcePending, destErr.Err)
+		}
+		if errors.Is(err, db.ErrCrossAccountBodyLimit) {
+			return s.crossAccountBodyLimitError("MOVE")
 		}
 		if errors.Is(err, db.ErrMoveSourceChanged) {
 			// A source body was renamed (sora-admin import rekey) after it was made

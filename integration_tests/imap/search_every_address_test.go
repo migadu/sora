@@ -104,3 +104,79 @@ func TestIMAP_SearchEveryAddress(t *testing.T) {
 		})
 	}
 }
+
+// TestIMAP_SearchEmptyAddressTermTestsPresence: RFC 9051 §6.4.4: "Note that the empty
+// string is a substring; this is useful when performing a HEADER search in order to test
+// for a header field presence in the message." A message without a To or Cc stores the
+// empty string in those columns, which the empty term matched too, so CC "" returned every
+// message and NOT CC "", the test for absence, returned none (#661).
+func TestIMAP_SearchEmptyAddressTermTestsPresence(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	date := time.Now().Format(time.RFC1123Z)
+	messages := []string{
+		// UID 1 and 2: the messages from the issue, with and without a Cc.
+		"From: a@example.com\r\nTo: b@example.com\r\nCc: c@example.com\r\nSubject: with cc\r\nDate: " + date + "\r\n\r\nbody\r\n",
+		"From: a@example.com\r\nTo: b@example.com\r\nSubject: without cc\r\nDate: " + date + "\r\n\r\nbody\r\n",
+		// UID 3: no To either, as in a draft.
+		"From: a@example.com\r\nSubject: draft\r\nDate: " + date + "\r\n\r\nbody\r\n",
+	}
+	for i, msg := range messages {
+		cmd := c.Append("INBOX", int64(len(msg)), nil)
+		if _, err := cmd.Write([]byte(msg)); err != nil {
+			t.Fatalf("APPEND %d write: %v", i+1, err)
+		}
+		if err := cmd.Close(); err != nil {
+			t.Fatalf("APPEND %d close: %v", i+1, err)
+		}
+		if _, err := cmd.Wait(); err != nil {
+			t.Fatalf("APPEND %d: %v", i+1, err)
+		}
+	}
+
+	header := func(key string) imap.SearchCriteria {
+		return imap.SearchCriteria{Header: []imap.SearchCriteriaHeaderField{{Key: key, Value: ""}}}
+	}
+	notCrit := func(c imap.SearchCriteria) imap.SearchCriteria {
+		return imap.SearchCriteria{Not: []imap.SearchCriteria{c}}
+	}
+	for _, tc := range []struct {
+		name     string
+		criteria imap.SearchCriteria
+		want     []imap.UID
+	}{
+		{`CC "" (issue a1)`, header("Cc"), []imap.UID{1}},
+		{`NOT CC "" (issue a2)`, notCrit(header("Cc")), []imap.UID{2, 3}},
+		{`TO ""`, header("To"), []imap.UID{1, 2}},
+		{`NOT TO ""`, notCrit(header("To")), []imap.UID{3}},
+		{`FROM ""`, header("From"), []imap.UID{1, 2, 3}},
+		{`NOT FROM ""`, notCrit(header("From")), nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := c.UIDSearch(&tc.criteria, nil).Wait()
+			if err != nil {
+				t.Fatalf("UID SEARCH: %v", err)
+			}
+			got := data.AllUIDs()
+			slices.Sort(got)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("UID SEARCH = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

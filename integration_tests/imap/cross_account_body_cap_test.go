@@ -108,4 +108,14 @@ func TestIMAP_CrossAccountCopyMoveOverTheBodyCapAnswersLimit(t *testing.T) {
 	if n := fake.ObjectCount(); n != objects {
 		t.Errorf("refused commands changed the S3 object count from %d to %d", objects, n)
 	}
+
+	// Legacy destination-owned rows still need source body admission. One row is
+	// rekeyed, but all1001 distinct source bodies must count before any S3 copy.
+	_, err = rdb.ExecWithRetry(ctx, `UPDATE messages SET account_id=$2 WHERE mailbox_id=$1 AND uid>1`, inboxID, ownerID)
+	require.NoError(t, err)
+	_, err = cc.Copy(all, shared).Wait()
+	requireLimit("COPY mixed ownership", err)
+	_, err = cc.Move(all, shared).Wait()
+	requireLimit("MOVE mixed ownership", err)
+	require.Equal(t, objects, fake.ObjectCount(), "mixed-ownership refusal must precede storage changes")
 }
