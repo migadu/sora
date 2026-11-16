@@ -125,31 +125,36 @@ func (db *Database) GetSubscribedMailboxNamesByKey(ctx context.Context, accountI
 // per-account unique index cannot be violated. delimiter is the hierarchy
 // separator (e.g. "/").
 func (db *Database) RenameSubscriptions(ctx context.Context, tx pgx.Tx, accountID int64, oldName, newName, delimiter string) error {
-	// LIKE pattern matching the descendants of oldName ("oldName/<anything>").
-	descPattern := escapeLike(oldName+delimiter) + "%"
+	oldDescPattern := escapeLike(oldName+delimiter) + "%"
+	newDescPattern := escapeLike(newName+delimiter) + "%"
 
-	// Drop any destination-namespace subscriptions that would collide with the
-	// moved rows (the caller has already verified the destination MAILBOX does not
-	// exist, but a subscription to the bare name can exist independently).
+	// Remove both colliding destination subscriptions and the source subscriptions
+	// being moved, then re-insert only the source rows under their rewritten names
+	// (preserving each descendant's levels after oldName's; see mailboxNameLevels).
+	// Deleting and sorting before INSERT keeps overlapping source/destination
+	// namespaces (case-only, ancestor-shortening, or lengthening renames) from
+	// either wiping the moved subtree or colliding with subscriptions_account_lname_unique
+	// mid-statement regardless of heap order.
 	if _, err := tx.Exec(ctx, `
-		DELETE FROM subscriptions
-		WHERE account_id = $1
-		  AND (LOWER(mailbox_name) = LOWER($2)
-		       OR LOWER(mailbox_name) LIKE LOWER($3) ESCAPE '\')
-	`, accountID, newName, escapeLike(newName+delimiter)+"%"); err != nil {
-		return fmt.Errorf("failed to clear destination subscriptions for rename: %w", err)
-	}
-
-	// Move the exact name and every descendant, preserving each descendant's
-	// levels after the old name's (see mailboxNameLevels): a subscription matches
-	// by LOWER(mailbox_name), so it can spell the old name with another length.
-	if _, err := tx.Exec(ctx, `
-		UPDATE subscriptions
-		SET mailbox_name = array_to_string(ARRAY[$2::text] || (string_to_array(mailbox_name, $5))[$6::int + 1:], $5)
-		WHERE account_id = $1
-		  AND (LOWER(mailbox_name) = LOWER($4)
-		       OR LOWER(mailbox_name) LIKE LOWER($3) ESCAPE '\')
-	`, accountID, newName, descPattern, oldName, delimiter, mailboxNameLevels(oldName, delimiter)); err != nil {
+		WITH removed AS (
+			DELETE FROM subscriptions
+			WHERE account_id = $1
+			  AND (LOWER(mailbox_name) = LOWER($2)
+			       OR LOWER(mailbox_name) LIKE LOWER($3) ESCAPE '\'
+			       OR LOWER(mailbox_name) = LOWER($4)
+			       OR LOWER(mailbox_name) LIKE LOWER($5) ESCAPE '\')
+			RETURNING id, mailbox_name, created_at
+		)
+		INSERT INTO subscriptions (account_id, mailbox_name, created_at)
+		SELECT $1,
+		       array_to_string(ARRAY[$2::text] || (string_to_array(mailbox_name, $6))[$7::int + 1:], $6),
+		       created_at
+		FROM removed
+		WHERE LOWER(mailbox_name) = LOWER($4)
+		   OR LOWER(mailbox_name) LIKE LOWER($5) ESCAPE '\'
+		ORDER BY id
+		ON CONFLICT (account_id, LOWER(mailbox_name)) DO NOTHING
+	`, accountID, newName, newDescPattern, oldName, oldDescPattern, delimiter, mailboxNameLevels(oldName, delimiter)); err != nil {
 		return fmt.Errorf("failed to move subscriptions for rename: %w", err)
 	}
 	return nil

@@ -375,6 +375,12 @@ func (s *Session) handleConnection() {
 				s.sendResponse("503 5.5.1 Error: need MAIL command")
 				continue
 			}
+			// Empty parameter values are a syntax error before extension checks.
+			if param := emptyParameterValue(params); param != "" {
+				s.InfoLog("RCPT refused for a parameter", "to", to, "parameter", param)
+				s.sendResponse("501 5.5.4 Syntax error in RCPT TO parameters")
+				continue
+			}
 			// A parameter the proxy does not take gets 555 (or 501 for a malformed or
 			// repeated XRCPTFORWARD), as on the backend, before the recipient is routed.
 			// The transaction stays open for the next recipient.
@@ -947,9 +953,13 @@ func parseRCPTCommand(command string) (address string, keptParams []string, ok b
 // 3030). That one and every other parameter, the DSN ones (RFC 3461) among them, get 555
 // 5.5.4, as on the backend. RFC 5321 section 4.1.1.11: "If the server SMTP does not
 // recognize or cannot implement one or more of the parameters associated with a
-// particular MAIL FROM or RCPT TO command, it will return code 555."
+// particular MAIL FROM or RCPT TO command, it will return code 555." A parameter with
+// "=" and no value is refused with 501 before any of that (emptyParameterValue).
 func mailParameterReply(params []string) (param, reply string) {
 	const unsupported = "555 5.5.4 MAIL FROM parameter not recognized or not implemented"
+	if p := emptyParameterValue(params); p != "" {
+		return p, "501 5.5.4 Syntax error in MAIL FROM parameters"
+	}
 	body, smtputf8 := false, false
 	for _, p := range params {
 		keyword, value, hasValue := strings.Cut(p, "=")
@@ -1022,6 +1032,20 @@ func validXRCPTFORWARD(value string) bool {
 		}
 	}
 	return true
+}
+
+// emptyParameterValue returns the first MAIL or RCPT parameter written with "=" and
+// nothing after it, "" if there is none. "esmtp-param = esmtp-keyword ["=" esmtp-value]"
+// and "esmtp-value = 1*(%d33-60 / %d62-126)" (RFC 5321 section 4.1.2): such a parameter
+// is malformed whatever its keyword, a syntax error (501). The backend's go-smtp refuses
+// the command so before it looks at any parameter (#1709), and so does the proxy.
+func emptyParameterValue(params []string) string {
+	for _, p := range params {
+		if _, value, hasValue := strings.Cut(p, "="); hasValue && value == "" {
+			return p
+		}
+	}
+	return ""
 }
 
 // extractAddress extracts email address from MAIL FROM or RCPT TO parameter.

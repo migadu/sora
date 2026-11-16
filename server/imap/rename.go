@@ -290,6 +290,13 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 		if errors.Is(err, consts.ErrMailboxSharedBoundary) {
 			return sharedBoundaryError()
 		}
+		if errors.Is(err, consts.ErrMailboxAlreadyExists) {
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeAlreadyExists,
+				Text: "Mailbox already exists",
+			}
+		}
 		return s.internalError("failed to rename mailbox '%s' to '%s': %v", existingName, newName, err)
 	}
 
