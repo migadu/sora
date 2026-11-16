@@ -57,10 +57,11 @@ var leapSecond = regexp.MustCompile(`^[^:]*\d:\d{2}:(60)(?:\D|$)`)
 //     net/mail gives a name the offset it has in time.Local, and offset zero when
 //     time.Local does not know it: PDT is 02:23:25 UTC on a server in UTC, and EST in
 //     July is given in EDT on one in America/New_York.
-//   - Any other token is unknown: the military zones and other names, which §4.3 says
+//   - Any other token beginning with a letter or sign is unknown: military zones and
+//     other names, which §4.3 says
 //     "SHOULD all be considered equivalent to "-0000"" without out-of-band information,
-//     and every zone that is not RFC 5322's at all (zone = (FWS ( "+" / "-" ) 4DIGIT) /
-//     obs-zone): GMT+1, GMT+0200, UTC-0500, PDT+0400, a sign with fewer than four digits
+//     and recognized malformed forms: GMT+1, GMT+0200, UTC-0500, PDT+0400,
+//     a sign with fewer than four digits
 //     (+01), a name run into another (CET/CEST). RFC 5256 §2.2: "If the time zone is
 //     invalid, the date and time SHOULD be treated as UTC." The date and time of day
 //     are kept as written: net/mail read +01 and CET/CEST in time.Local, and GMT+1 as
