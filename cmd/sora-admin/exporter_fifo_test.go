@@ -52,6 +52,20 @@ func TestExportDoesNotBlockOnFIFODovecotKeywords(t *testing.T) {
 	assert.Equal(t, "0 $Work\n", string(got))
 }
 
+// A regular dovecot-keywords an earlier run left is still read: the numbering it gives
+// is kept, so files that run wrote keep their meaning.
+func TestExportKeepsExistingDovecotKeywordsNumbering(t *testing.T) {
+	exporter, dest := newLinkTestExporter(t, nil, ExporterOptions{Dovecot: true})
+	keywords := filepath.Join(dest, "dovecot-keywords")
+	require.NoError(t, os.WriteFile(keywords, []byte("3 $Old\n"), 0o644))
+
+	require.NoError(t, exporter.prepareKeywords("INBOX", []db.Message{{UID: 1, CustomFlags: []string{"$Old", "$Work"}}}))
+
+	got, err := os.ReadFile(keywords)
+	require.NoError(t, err)
+	assert.Equal(t, "0 $Work\n3 $Old\n", string(got))
+}
+
 func TestExportDoesNotBlockOnFIFODovecotUIDList(t *testing.T) {
 	exporter, dest := newLinkTestExporter(t, nil, ExporterOptions{ExportUIDList: true})
 	uidlist := filepath.Join(dest, "dovecot-uidlist")

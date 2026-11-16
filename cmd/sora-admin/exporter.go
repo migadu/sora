@@ -7,13 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/migadu/sora/logger"
@@ -1078,11 +1078,52 @@ func replaceFile(root *os.Root, tmpDir, name string, content []byte) error {
 		return err
 	}
 	// Make the rename durable: fsync the directory that now holds the entry.
-	if dir, err := root.Open(filepath.Dir(name)); err == nil {
+	if dir, err := openExportEntry(root, filepath.Dir(name), true); err == nil {
 		_ = dir.Sync()
 		dir.Close()
 	}
 	return nil
+}
+
+// openExportEntry opens name below root, the export directory, for reading, and only
+// a regular file or, with dir, a directory. The export may be given a directory its
+// owner could write to (replaceFile), so whatever it reads back there (a file an
+// earlier run left, or a directory it created) may have been replaced by anything, a
+// FIFO included, and opening a FIFO for reading blocks until something opens it for
+// writing: the export would never finish. The open is O_NONBLOCK, which returns at
+// once whatever is at name and changes nothing for reading a regular file or a
+// directory, and the file opened is refused unless it is of the kind asked for. The
+// check is on the open file, so nothing can take its place afterwards. The root
+// follows no link out of the export directory.
+func openExportEntry(root *os.Root, name string, dir bool) (*os.File, error) {
+	f, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	kind, ok := "a regular file", info.Mode().IsRegular()
+	if dir {
+		kind, ok = "a directory", info.IsDir()
+	}
+	if !ok {
+		f.Close()
+		return nil, fmt.Errorf("refusing %s in the export directory: it is not %s", name, kind)
+	}
+	return f, nil
+}
+
+// readExportFile reads the regular file name below root (openExportEntry).
+func readExportFile(root *os.Root, name string) ([]byte, error) {
+	f, err := openExportEntry(root, name, false)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
 }
 
 // maxMaildirKeywords is how many custom keywords a maildir folder can name: the info
@@ -1112,7 +1153,8 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 
 	index := make(map[string]int)
 	used := make(map[int]bool)
-	if existing, err := parseKeywordsFile(keywordsName, exporter.root.ReadFile); err == nil {
+	readFile := func(name string) ([]byte, error) { return readExportFile(exporter.root, name) }
+	if existing, err := parseKeywordsFile(keywordsName, readFile); err == nil {
 		for idx, kw := range existing {
 			if idx >= 0 && idx < maxMaildirKeywords {
 				index[kw] = idx
@@ -1171,9 +1213,10 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 // existing file are kept when their file still exists in cur/ or new/ (matched on the
 // base filename, ignoring the ":2,flags" info part) and no entry of this run uses the
 // same UID or filename. The root reads no file through a link out of the export
-// directory.
+// directory, and a dovecot-uidlist, cur/ or new/ of another kind is not read
+// (openExportEntry).
 func mergeUIDMappings(root *os.Root, dir string, current []UIDFileMapping) []UIDFileMapping {
-	existing, err := parseDovecotUIDListFile(root.Open(filepath.Join(dir, "dovecot-uidlist")))
+	existing, err := parseDovecotUIDListFile(openExportEntry(root, filepath.Join(dir, "dovecot-uidlist"), false))
 	if err != nil || existing == nil || len(existing.UIDMappings) == 0 {
 		return current
 	}
@@ -1185,7 +1228,12 @@ func mergeUIDMappings(root *os.Root, dir string, current []UIDFileMapping) []UID
 	}
 	present := make(map[string]bool)
 	for _, sub := range []string{"cur", "new"} {
-		entries, err := fs.ReadDir(root.FS(), filepath.ToSlash(filepath.Join(dir, sub)))
+		d, err := openExportEntry(root, filepath.Join(dir, sub), true)
+		if err != nil {
+			continue
+		}
+		entries, err := d.ReadDir(-1)
+		d.Close()
 		if err != nil {
 			continue
 		}
