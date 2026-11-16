@@ -1406,9 +1406,9 @@ func (i *Importer) readMaildirFile(path string, limit int64) ([]byte, error) {
 // dovecot-keywords and a subscriptions file the import and the export read. Whoever
 // can write to the maildir, or to the export's destination, decides their size, and a
 // sparse file costs them no disk: read whole, a huge one would exhaust the memory of
-// the host running sora-admin. Both limits are far above any real file: Dovecot writes
-// at most 26 lines to dovecot-keywords and reads none longer than 1 KiB
-// (maildir-keywords.c), and a subscriptions file has one line per subscribed folder.
+// the host running sora-admin. These are resource limits for metadata reads. Ordinary
+// Dovecot-generated keywords use at most 26 lines, with a 1 KiB reader line bound
+// (maildir-keywords.c); subscriptions use one line per subscribed folder.
 const (
 	maxDovecotKeywordsSize      = 64 << 10 // 64 KiB
 	maxDovecotSubscriptionsSize = 4 << 20  // 4 MiB
