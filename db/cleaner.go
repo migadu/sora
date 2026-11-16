@@ -990,11 +990,19 @@ func (d *Database) DeleteMessagesFTSByKeyBatch(ctx context.Context, tx pgx.Tx, k
 }
 
 // ListSoftDeletedAccountsForHardDelete returns up to limit accounts soft-deleted at least
-// gracePeriod ago that still hold mailboxes, oldest first: the ones HardDeleteAccountStep
-// has not finished with. An account it has finished with has no mailboxes left but stays
-// soft-deleted until its expunged messages are reaped (another grace period) and it is
-// finalized; selecting it again would take one of the slots, and enough of them would
-// starve every newer account.
+// gracePeriod ago that HardDeleteAccountStep still has work for, oldest first: owning a
+// mailbox, holding a live message, or still holding an unleased pending_uploads row, a
+// sieve_scripts row, or a vacation_responses row.
+//
+// Once the last mailbox is gone, HardDeleteAccountStep expunges legacy rows in other
+// accounts' shared mailboxes and only deletes the remaining dependents on the following
+// step; a run that stops in between must resume next cycle. Matching unleased
+// pending_uploads also re-lists an account whose in-flight upload held a lease when
+// deleteAccountDependents ran and later released that lease or let it expire, while
+// skipping transfers whose lease is still live. An account the step has finished with
+// stays soft-deleted until its expunged messages are reaped (another grace period) and it
+// is finalized; excluding it here keeps it from occupying a batch slot and starving newer
+// accounts.
 //
 // This is a fast, read-only query. The hard delete of each account is performed by the
 // caller in bounded steps, each in its own transaction — see
@@ -1002,14 +1010,23 @@ func (d *Database) DeleteMessagesFTSByKeyBatch(ctx context.Context, tx pgx.Tx, k
 func (d *Database) ListSoftDeletedAccountsForHardDelete(ctx context.Context, gracePeriod time.Duration, limit int) ([]int64, error) {
 	threshold := time.Now().Add(-gracePeriod).UTC()
 
+	// Plan this infrequent listing with its current arguments. Under skew, a cached
+	// generic plan can scan live messages once for every already-finished account.
+	// Exec keeps bound parameters but avoids reusing that named prepared plan.
+	// Keep pending membership uncorrelated and deduplicated by account, so the
+	// planner need not rescan an unrelated backlog for every finished account.
 	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, `
 		SELECT a.id
 		FROM accounts a
 		WHERE a.deleted_at IS NOT NULL AND a.deleted_at < $1
-		AND EXISTS (SELECT 1 FROM mailboxes WHERE account_id = a.id)
+		AND (EXISTS (SELECT 1 FROM mailboxes WHERE account_id = a.id)
+		     OR EXISTS (SELECT 1 FROM messages WHERE account_id = a.id AND expunged_at IS NULL)
+		     OR a.id IN (SELECT DISTINCT account_id FROM pending_uploads WHERE lease_until IS NULL OR lease_until < now())
+		     OR EXISTS (SELECT 1 FROM sieve_scripts WHERE account_id = a.id)
+		     OR EXISTS (SELECT 1 FROM vacation_responses WHERE account_id = a.id))
 		ORDER BY a.deleted_at ASC
 		LIMIT $2
-	`, threshold, limit)
+	`, pgx.QueryExecModeExec, threshold, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query soft-deleted accounts: %w", err)
 	}
@@ -1384,8 +1401,10 @@ func (d *Database) CleanupOldHealthStatuses(ctx context.Context, tx pgx.Tx, rete
 	return result.RowsAffected(), nil
 }
 
-// GetMessagesForMailboxAndChildren retrieves all messages for a mailbox and its children
-// This is used by the admin tool for immediate purging of messages
+// GetMessagesForMailboxAndChildren retrieves all messages for a mailbox and its children.
+// accountID is the mailbox owner's account ID (mb.account_id), so shared-mailbox messages
+// are matched whether stored under the owner's account_id or a grantee's; an empty
+// mailboxPath is guarded so corrupt empty paths cannot match the entire account.
 func (d *Database) GetMessagesForMailboxAndChildren(ctx context.Context, accountID int64, mailboxID int64, mailboxPath string) ([]Message, error) {
 	query := `
 		SELECT
@@ -1396,12 +1415,12 @@ func (d *Database) GetMessagesForMailboxAndChildren(ctx context.Context, account
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-		WHERE m.account_id = $1
-		  AND (mb.id = $2 OR mb.path LIKE $3 || '%')
+		WHERE mb.account_id = $1
+		  AND (mb.id = $2 OR ($3 != '' AND mb.path LIKE $3 || '%'))
 		ORDER BY m.id
 	`
 
-	rows, err := d.GetReadPool().Query(ctx, query, accountID, mailboxID, mailboxPath)
+	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, query, accountID, mailboxID, mailboxPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query messages for mailbox and children: %w", err)
 	}

@@ -535,3 +535,28 @@ func TestToUpperASCII(t *testing.T) {
 		}
 	}
 }
+
+func TestEqualFoldASCII(t *testing.T) {
+	for _, tc := range []struct {
+		s, t string
+		want bool
+	}{
+		{"", "", true},
+		{"SIZE", "SIZE", true},
+		{"size", "SIZE", true},
+		{"SmtpUtf8", "SMTPUTF8", true},
+		{"i-default", "I-DEFAULT", true},
+		{"SIZE", "SIZ", false},
+		{"SIZE", "SIZF", false},
+		{"@", "`", false},                      // 0x40 and 0x60 are not a case pair
+		{"\u017fIZE", "SIZE", false},           // U+017F is not "s"
+		{"PLA\u0131N", "PLAIN", false},         // U+0131 is not "i"
+		{"\u212a", "k", false},                 // U+212A is not "k"
+		{"\u0130-default", "i-default", false}, // U+0130 is not "i"
+		{"\xff", "\xff", true},
+	} {
+		if got := EqualFoldASCII(tc.s, tc.t); got != tc.want {
+			t.Errorf("EqualFoldASCII(%q, %q) = %v, want %v", tc.s, tc.t, got, tc.want)
+		}
+	}
+}

@@ -181,6 +181,164 @@ func TestDiffNotifySnapshots(t *testing.T) {
 	}
 }
 
+// TestDiffNotifySnapshotsAffectedNames checks which names a diff reports for
+// the mailboxes created, deleted and renamed in it. RFC 5465 section 5.4: "If
+// a mailbox is created or deleted, the mailbox itself and its direct parent
+// (whether it is an existing mailbox or not) are considered to be affected."
+// and "When a mailbox is renamed, its children are renamed too. No additional
+// MailboxName events are sent for children in this case."
+func TestDiffNotifySnapshotsAffectedNames(t *testing.T) {
+	// want describes one expected event: its type, whether it carries
+	// \NonExistent, its OLDNAME, and whether the name has children after the
+	// change (\HasChildren or \HasNoChildren).
+	type want struct {
+		event       imap.NotifyEvent
+		deleted     bool
+		oldName     string
+		hasChildren bool
+	}
+	mailboxName := imap.NotifyEventMailboxName
+
+	tests := []struct {
+		name      string
+		prev, cur map[int64]notifySnapshotEntry
+		want      map[string]want
+	}{
+		{
+			// The issue's RENAME Old Attic/Old: Attic is created by the
+			// rename, Old/Kid and Old/Kid/Grand are carried along with Old.
+			name: "RenameCarriesChildrenSilently",
+			prev: map[int64]notifySnapshotEntry{
+				1: {name: "Old"}, 2: {name: "Old/Kid"}, 3: {name: "Old/Kid/Grand"},
+			},
+			cur: map[int64]notifySnapshotEntry{
+				1: {name: "Attic/Old"}, 2: {name: "Attic/Old/Kid"}, 3: {name: "Attic/Old/Kid/Grand"},
+				4: {name: "Attic"},
+			},
+			want: map[string]want{
+				"Attic":     {event: mailboxName, hasChildren: true},
+				"Attic/Old": {event: mailboxName, oldName: "Old", hasChildren: true},
+			},
+		},
+		{
+			// The database renames a child by replacing as many characters
+			// of its name as the old name of the renamed mailbox has, so a
+			// child stored under a differently cased prefix is carried too.
+			name: "RenameCarriesDifferentlyCasedChild",
+			prev: map[int64]notifySnapshotEntry{1: {name: "Old"}, 2: {name: "OLD/Kid"}},
+			cur:  map[int64]notifySnapshotEntry{1: {name: "New"}, 2: {name: "New/Kid"}},
+			want: map[string]want{
+				"New": {event: mailboxName, oldName: "Old", hasChildren: true},
+			},
+		},
+		{
+			// A child renamed on its own in the same diff is not a child the
+			// parent's rename carried along.
+			name: "ChildRenamedOnItsOwnIsReported",
+			prev: map[int64]notifySnapshotEntry{1: {name: "Old"}, 2: {name: "Old/Mid"}, 3: {name: "Old/Mid/Kid"}},
+			cur:  map[int64]notifySnapshotEntry{1: {name: "New"}, 2: {name: "Other"}, 3: {name: "Other/Kid"}},
+			want: map[string]want{
+				"New":   {event: mailboxName, oldName: "Old"},
+				"Other": {event: mailboxName, oldName: "Old/Mid", hasChildren: true},
+			},
+		},
+		{
+			// A carried child whose subscription changed in the same diff
+			// still gets its SubscriptionChange.
+			name: "CarriedChildSubscriptionChange",
+			prev: map[int64]notifySnapshotEntry{1: {name: "Old"}, 2: {name: "Old/Kid"}},
+			cur:  map[int64]notifySnapshotEntry{1: {name: "New"}, 2: {name: "New/Kid", subscribed: true}},
+			want: map[string]want{
+				"New":     {event: mailboxName, oldName: "Old", hasChildren: true},
+				"New/Kid": {event: imap.NotifyEventSubscriptionChange},
+			},
+		},
+		{
+			// The issue's CREATE Parent/Child.
+			name: "CreateReportsExistingParent",
+			prev: map[int64]notifySnapshotEntry{1: {name: "Parent"}},
+			cur:  map[int64]notifySnapshotEntry{1: {name: "Parent"}, 2: {name: "Parent/Child"}},
+			want: map[string]want{
+				"Parent/Child": {event: mailboxName},
+				"Parent":       {event: mailboxName, hasChildren: true},
+			},
+		},
+		{
+			name: "DeleteReportsExistingParent",
+			prev: map[int64]notifySnapshotEntry{1: {name: "Parent"}, 2: {name: "Parent/Child"}},
+			cur:  map[int64]notifySnapshotEntry{1: {name: "Parent"}},
+			want: map[string]want{
+				"Parent/Child": {event: mailboxName, deleted: true},
+				"Parent":       {event: mailboxName},
+			},
+		},
+		{
+			// A parent the client cannot see (no RFC 4314 'l' right) is
+			// still affected, and carries \NonExistent.
+			name: "CreateReportsInaccessibleParentNonExistent",
+			prev: map[int64]notifySnapshotEntry{},
+			cur:  map[int64]notifySnapshotEntry{2: {name: "Hidden/Child"}},
+			want: map[string]want{
+				"Hidden/Child": {event: mailboxName},
+				"Hidden":       {event: mailboxName, deleted: true, hasChildren: true},
+			},
+		},
+		{
+			name: "ParentReportedOncePerDiff",
+			prev: map[int64]notifySnapshotEntry{1: {name: "Parent", subscribed: true}, 2: {name: "Parent/Gone"}},
+			cur: map[int64]notifySnapshotEntry{
+				1: {name: "Parent", subscribed: true}, 3: {name: "Parent/A"}, 4: {name: "Parent/B"},
+			},
+			want: map[string]want{
+				"Parent/Gone": {event: mailboxName, deleted: true},
+				"Parent/A":    {event: mailboxName},
+				"Parent/B":    {event: mailboxName},
+				"Parent":      {event: mailboxName, hasChildren: true},
+			},
+		},
+		{
+			// CREATE a/b/c creating its superiors: each parent is reported
+			// once, by its own creation.
+			name: "ParentCreatedInSameDiffNotRepeated",
+			prev: map[int64]notifySnapshotEntry{},
+			cur:  map[int64]notifySnapshotEntry{1: {name: "a"}, 2: {name: "a/b"}, 3: {name: "a/b/c"}},
+			want: map[string]want{
+				"a":     {event: mailboxName, hasChildren: true},
+				"a/b":   {event: mailboxName, hasChildren: true},
+				"a/b/c": {event: mailboxName},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			events := diffNotifySnapshots(tc.prev, tc.cur)
+			got := make(map[string]want, len(events))
+			for _, ev := range events {
+				if _, dup := got[ev.name]; dup {
+					t.Errorf("%q reported more than once: %+v", ev.name, events)
+				}
+				got[ev.name] = want{event: ev.event, deleted: ev.deleted, oldName: ev.oldName, hasChildren: ev.hasChildren}
+			}
+			for name, w := range tc.want {
+				g, ok := got[name]
+				if !ok {
+					t.Errorf("no event for %q, want %+v (got %+v)", name, w, got)
+					continue
+				}
+				if g != w {
+					t.Errorf("event for %q = %+v, want %+v", name, g, w)
+				}
+			}
+			for name, g := range got {
+				if _, ok := tc.want[name]; !ok {
+					t.Errorf("unexpected event for %q: %+v", name, g)
+				}
+			}
+		})
+	}
+}
+
 func TestNotifyStatusOptions(t *testing.T) {
 	messageNew := map[imap.NotifyEvent]bool{imap.NotifyEventMessageNew: true, imap.NotifyEventMessageExpunge: true}
 	flagChange := map[imap.NotifyEvent]bool{imap.NotifyEventFlagChange: true}

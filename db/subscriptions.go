@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/consts"
 )
 
 // Subscriptions (RFC 3501 §6.3.6 / RFC 9051 §6.3.7) are NAME-based and decoupled
@@ -14,6 +15,16 @@ import (
 // report it with \NonExistent). The `subscriptions` table (migration 000046) is
 // the authoritative store; the legacy `mailboxes.subscribed` column is unused by
 // the subscription code path from here on.
+
+// defaultMailboxNamesLower holds consts.DefaultMailboxes in lower case (they are
+// ASCII), for Unsubscribe.
+var defaultMailboxNamesLower = func() []string {
+	names := make([]string, len(consts.DefaultMailboxes))
+	for i, name := range consts.DefaultMailboxes {
+		names[i] = strings.ToLower(name)
+	}
+	return names
+}()
 
 // Subscribe records a name-based subscription for the account. Idempotent and
 // case-insensitive (matching mailbox-name case-insensitivity, migration 000041).
@@ -30,11 +41,25 @@ func (db *Database) Subscribe(ctx context.Context, tx pgx.Tx, accountID int64, m
 }
 
 // Unsubscribe removes a name-based subscription. Idempotent and case-insensitive.
+// A default mailbox's subscription is kept: default mailboxes stay permanently
+// subscribed. Whether the name is a default mailbox's is asked of the row it
+// matches (lower() under the "C" collation folds ASCII letters only). Also
+// keep a legacy Unicode-spelled subscription when the database resolves it to
+// a live, canonically named default mailbox of this account. An ordinary
+// Unicode-named physical mailbox is not a default just because its lower()
+// happens to match one: the stored physical name must be an ASCII default.
 func (db *Database) Unsubscribe(ctx context.Context, tx pgx.Tx, accountID int64, mailboxName string) error {
 	_, err := tx.Exec(ctx, `
-		DELETE FROM subscriptions
-		WHERE account_id = $1 AND LOWER(mailbox_name) = LOWER($2)
-	`, accountID, mailboxName)
+		DELETE FROM subscriptions s
+		WHERE s.account_id = $1 AND LOWER(s.mailbox_name) = LOWER($2)
+		  AND LOWER(s.mailbox_name COLLATE "C") <> ALL ($3)
+		  AND NOT EXISTS (
+		      SELECT 1 FROM mailboxes m
+		      WHERE m.account_id = s.account_id AND m.deleted_at IS NULL
+		        AND LOWER(m.name) = LOWER(s.mailbox_name)
+		        AND LOWER(m.name COLLATE "C") = ANY ($3)
+		  )
+	`, accountID, mailboxName, defaultMailboxNamesLower)
 	if err != nil {
 		return fmt.Errorf("failed to unsubscribe %q: %w", mailboxName, err)
 	}
@@ -59,6 +84,33 @@ func (db *Database) GetSubscribedMailboxNames(ctx context.Context, accountID int
 			return nil, fmt.Errorf("failed to scan subscription: %w", err)
 		}
 		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating subscriptions: %w", err)
+	}
+	return names, nil
+}
+
+// GetSubscribedMailboxNamesByKey returns every subscribed name for the account,
+// keyed by LOWER(mailbox_name) as the database computes it, the key a
+// subscription matches a mailbox by (DBMailbox.NameKey). Like
+// GetSubscribedMailboxNames it includes names with no mailbox.
+func (db *Database) GetSubscribedMailboxNamesByKey(ctx context.Context, accountID int64) (map[string]string, error) {
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+		SELECT LOWER(mailbox_name), mailbox_name FROM subscriptions WHERE account_id = $1
+	`, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list subscriptions: %w", err)
+	}
+	defer rows.Close()
+
+	names := make(map[string]string)
+	for rows.Next() {
+		var key, name string
+		if err := rows.Scan(&key, &name); err != nil {
+			return nil, fmt.Errorf("failed to scan subscription: %w", err)
+		}
+		names[key] = name
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating subscriptions: %w", err)

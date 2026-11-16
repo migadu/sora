@@ -672,45 +672,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	contentHash := helpers.HashContent(fullMessageBytes)
 	s.DebugLog("message parsed", "content_hash", contentHash)
 
-	// Parse message headers (this does not consume the body)
-	mailHeader := mail.Header{Header: messageContent.Header}
-	subject, _ := mailHeader.Subject()
-	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date"))
-	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
-	references, _ := mailHeader.MsgIDList("References")
-
-	if len(inReplyTo) == 0 {
-		inReplyTo = nil
-	}
-	if len(references) == 0 {
-		references = nil
-	}
-
-	// A zero sentDate (no Date: header that parses) is stored as the internal date and
-	// reported as absent (db.InsertMessageOptions.SentDate).
-	s.DebugLog("message sent date", "sent_date", sentDate)
-
-	var plaintextBody *string
-	plaintextBodyResult, extractErr := helpers.ExtractPlaintextBody(messageContent)
-	if extractErr != nil {
-		// Plaintext extraction had errors but may have succeeded partially.
-		// Log the issues for debugging malformed MIME (invalid Content-Type, truncated parts, etc.)
-		s.DebugLog("plaintext extraction encountered errors", "error", extractErr)
-	}
-
-	// Use whatever text was extracted (may be nil, partial, or complete)
-	if plaintextBodyResult == nil {
-		// No plaintext or HTML body found in the message
-		// Use empty string as fallback for FTS indexing
-		emptyStr := new(string)
-		plaintextBody = emptyStr
-	} else {
-		plaintextBody = plaintextBodyResult
-	}
-
-	recipients := helpers.ExtractRecipients(messageContent.Header)
-
 	// Safety guard: Reject if this node's staging limit is exceeded. Checked before Sieve runs,
 	// as on the Admin API path: the MTA retries a 452, and a refused attempt must not have
 	// sent a vacation reply or charged redirects to the rate limit first.
@@ -749,12 +710,12 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		envelopeTo = s.recipientAddr.FullAddress()
 	}
 
-	// sieveengine.Evaluate folds the header names: they compare under
-	// i;ascii-casemap (RFC 5228 §2.7)
+	// HeaderMap folds the header names, which compare under i;ascii-casemap
+	// (RFC 5228 §2.7), and keeps the fields in message order.
 	sieveCtx := sieveengine.Context{
 		EnvelopeFrom: s.sender.FullAddress(),
 		EnvelopeTo:   envelopeTo,
-		Header:       messageContent.Header.Map(),
+		Header:       sieveengine.HeaderMap(messageContent.Header),
 		Message:      fullMessageBytes,
 		MailboxExists: func(ctx context.Context, mailbox string) (bool, error) {
 			if s.useMasterDB {
@@ -859,32 +820,14 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		if err != nil {
 			s.WarnLog("failed to apply header edits", "error", err)
 			// Continue with original message on error
+		} else if reparsed, err := server.ParseMessage(bytes.NewReader(modifiedBytes)); err != nil {
+			// Keep bytes, hash, and entity consistent when the edited header cannot be parsed.
+			s.WarnLog("failed to re-parse message after header edits", "error", err)
 		} else {
-			// Update fullMessageBytes with modified version
 			fullMessageBytes = modifiedBytes
-			// Recalculate content hash with modified message
 			contentHash = helpers.HashContent(fullMessageBytes)
-			// Re-parse message content for updated headers
-			messageContent, err = server.ParseMessage(bytes.NewReader(fullMessageBytes))
-			if err != nil {
-				s.WarnLog("failed to re-parse message after header edits", "error", err)
-				// Continue with what we have
-			} else {
-				// Update extracted header data
-				mailHeader = mail.Header{Header: messageContent.Header}
-				subject, _ = mailHeader.Subject()
-				messageID, _ = mailHeader.MessageID()
-				sentDate, _ = helpers.ParseDateHeader(mailHeader.Get("Date"))
-				inReplyTo, _ = mailHeader.MsgIDList("In-Reply-To")
-				references, _ = mailHeader.MsgIDList("References")
-				if len(inReplyTo) == 0 {
-					inReplyTo = nil
-				}
-				if len(references) == 0 {
-					references = nil
-				}
-				s.DebugLog("message headers updated after edits", "content_hash", contentHash)
-			}
+			messageContent = reparsed
+			s.DebugLog("message headers updated after edits", "content_hash", contentHash)
 		}
 	}
 
@@ -915,7 +858,8 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// returns is dropped; the retry holds it again.
 	commitRedirects, abortRedirects, allHeld := s.holdRedirects(ctx, result, messageContent, fullMessageBytes)
 	defer abortRedirects()
-	destinations := result.Destinations(!allHeld)
+	redirectFailed := !allHeld
+	destinations := result.Destinations(redirectFailed)
 	if len(destinations) == 0 {
 		// A redirect without :copy, every target held: there is nothing to store.
 		if commitRedirects() {
@@ -924,6 +868,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			return nil
 		}
 		// A target the queue did not take after all: keep the message.
+		redirectFailed = true
 		destinations = result.Destinations(true)
 	}
 
@@ -988,24 +933,40 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	s.InfoLog("executing sieve action", "action", result.Action)
 
-	// Flags set by the Sieve script via imap4flags (RFC 5232: setflag/addflag/
-	// removeflag). The Sieve engine resolves them into result.Flags; apply them to
-	// every locally stored copy. Sanitize to drop NIL/empty values and anything
-	// that is not a valid IMAP flag-keyword -- a Sieve script is the one flag
-	// source that never passes an IMAP parser, so this is where an unencodable
-	// keyword would otherwise enter the system.
-	rawSieveFlags := helpers.StringsToFlags(result.Flags)
-	sieveFlags := helpers.SanitizeFlags(rawSieveFlags)
-	if len(sieveFlags) > 0 {
-		s.InfoLog("sieve set flags on message", "flags", result.Flags)
+	// Extract header, recipient, body, and MIME metadata once from the final message
+	// (after any Sieve editheader changes, RFC 5293 §7) and reuse across destinations.
+	mailHeader := mail.Header{Header: messageContent.Header}
+	subject, _ := mailHeader.Subject()
+	messageID, _ := mailHeader.MessageID()
+	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date"))
+	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
+	references, _ := mailHeader.MsgIDList("References")
+	if len(inReplyTo) == 0 {
+		inReplyTo = nil
 	}
-	// Dropping a flag silently would leave the user's script looking like it
-	// worked; name the rejected keywords so support can point at the line.
-	if rejected := helpers.DroppedFlags(rawSieveFlags, sieveFlags); len(rejected) > 0 {
-		s.WarnLog("sieve set invalid IMAP keywords, dropped",
-			"flags", strings.Join(rejected, ","),
-			"reason", "not a valid IMAP flag-keyword (RFC 9051 §9: ASCII atom, no specials)")
+	if len(references) == 0 {
+		references = nil
 	}
+	// A zero sentDate (no Date: header that parses) is stored as the internal date and
+	// reported as absent (db.InsertMessageOptions.SentDate).
+	s.DebugLog("message sent date", "sent_date", sentDate)
+
+	var plaintextBody *string
+	plaintextBodyResult, extractErr := helpers.ExtractPlaintextBody(messageContent)
+	if extractErr != nil {
+		// Plaintext extraction had errors but may have succeeded partially.
+		// Log the issues for debugging malformed MIME (invalid Content-Type, truncated parts, etc.)
+		s.DebugLog("plaintext extraction encountered errors", "error", extractErr)
+	}
+	if plaintextBodyResult == nil {
+		// No plaintext or HTML body found in the message; use empty string fallback for FTS.
+		emptyStr := new(string)
+		plaintextBody = emptyStr
+	} else {
+		plaintextBody = plaintextBodyResult
+	}
+
+	recipients := helpers.ExtractRecipients(messageContent.Header)
 
 	// Classify and extract the final stored MIME once, after editheader, and
 	// reuse both results for every destination. The structure
@@ -1016,39 +977,38 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		s.WarnLog("storing a fallback body structure", "error", bsErr)
 	}
 	bodyStructure := &bodyStructureVal
-	sieveFlags = db.WithAttachmentKeyword(sieveFlags, fullMessageBytes, true)
+	attachmentKeyword, attachmentKnown := helpers.AttachmentKeyword(fullMessageBytes)
+
+	// Flags set by the Sieve script via imap4flags (RFC 5232) belong to one stored
+	// copy, the one its keep or fileinto stores (Destination.Flags). storedFlags
+	// turns them into the flags that copy is stored with, next to the attachment
+	// keyword classified above. Sanitize to drop NIL/empty values and anything
+	// that is not a valid IMAP flag-keyword -- a Sieve script is the one flag
+	// source that never passes an IMAP parser, so this is where an unencodable
+	// keyword would otherwise enter the system.
+	storedFlags := func(dest sieveengine.Destination) []imap.Flag {
+		raw := helpers.StringsToFlags(dest.Flags)
+		flags := helpers.SanitizeFlags(raw)
+		if len(flags) > 0 {
+			s.InfoLog("sieve set flags on message", "mailbox", dest.Mailbox, "flags", dest.Flags)
+		}
+		// Dropping a flag silently would leave the user's script looking like it
+		// worked; name the rejected keywords so support can point at the line.
+		if rejected := helpers.DroppedFlags(raw, flags); len(rejected) > 0 {
+			s.WarnLog("sieve set invalid IMAP keywords, dropped",
+				"mailbox", dest.Mailbox,
+				"flags", strings.Join(rejected, ","),
+				"reason", "not a valid IMAP flag-keyword (RFC 9051 §9: ASCII atom, no specials)")
+		}
+		return db.WithClassifiedAttachmentKeyword(flags, attachmentKeyword, attachmentKnown, true)
+	}
 
 	// Store one copy in every fileinto target, and in INBOX when the message is kept
 	// (or a failed redirect left it stored nowhere).
 	if result.Action == sieveengine.ActionKeep {
 		s.DebugLog("sieve keep action")
 	}
-	mailboxNames := make([]string, 0, len(destinations))
-	for _, dest := range destinations {
-		mailboxNames = append(mailboxNames, dest.Mailbox)
-		err = s.saveMessageToMailbox(ctx, dest.Mailbox, fullMessageBytes, contentHash, deliveryHash,
-			subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, dest.Create, sieveFlags)
-		if err == nil {
-			continue
-		}
-		// Handle duplicate messages (acceptable in LMTP - return success)
-		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
-			// For duplicates, NEVER delete the file. This prevents a race condition where:
-			// 1. Message A arrives, writes file, INSERT succeeds, creates pending_upload
-			// 2. Message B (duplicate) arrives, due to TOCTOU race also writes file
-			// 3. Message B's INSERT fails as duplicate
-			// 4. If Message B deletes the file, Message A's pending upload loses its source file
-			//
-			// The file will be cleaned up by the uploader's cleanupOrphanedFiles job
-			// (runs every 5 minutes with 10-minute grace period) if it's truly orphaned.
-			if filePath != nil {
-				s.DebugLog("duplicate message detected, keeping file for potential pending upload", "content_hash", contentHash)
-			}
-			// The copy is already there: this one is delivered, carry on with the next.
-			s.DebugLog("duplicate message accepted (already exists), skipping storage", "message_id", messageID, "mailbox", dest.Mailbox)
-			continue
-		}
-
+	handleStoreError := func(err error, mailbox string) error {
 		// Context error: DATA cap timeout vs disconnect/shutdown. In both
 		// cases DO NOT delete the file. Even though we wrote it, there's a
 		// race window where another concurrent delivery might have seen the
@@ -1093,8 +1053,42 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		recordMetrics("failure")
 		// The reply text reaches the sender in a delay or bounce notice: the folder the
 		// recipient's script files into and the database error stay in the log.
-		s.WarnLog("failed to save message", "mailbox", dest.Mailbox, "error", err)
+		s.WarnLog("failed to save message", "mailbox", mailbox, "error", err)
 		return s.InternalError("failed to save message")
+	}
+	resolvedDestinations, resolveErr := delivery.ResolveSieveDestinations(ctx, s.backend.rdb, s.backend.sharedMailboxes, s.AccountID(), result, redirectFailed, func(format string, args ...any) {
+		s.WarnLog(fmt.Sprintf(format, args...))
+	})
+	if resolveErr != nil {
+		return handleStoreError(resolveErr, "")
+	}
+	mailboxNames := make([]string, 0, len(resolvedDestinations))
+	for _, dest := range resolvedDestinations {
+		mailboxNames = append(mailboxNames, dest.Mailbox)
+		err = s.saveMessageToMailbox(ctx, dest.Target, fullMessageBytes, contentHash, deliveryHash,
+			subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, storedFlags(dest.Destination))
+		if err == nil {
+			continue
+		}
+		// Handle duplicate messages (acceptable in LMTP - return success)
+		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
+			// For duplicates, NEVER delete the file. This prevents a race condition where:
+			// 1. Message A arrives, writes file, INSERT succeeds, creates pending_upload
+			// 2. Message B (duplicate) arrives, due to TOCTOU race also writes file
+			// 3. Message B's INSERT fails as duplicate
+			// 4. If Message B deletes the file, Message A's pending upload loses its source file
+			//
+			// The file will be cleaned up by the uploader's cleanupOrphanedFiles job
+			// (runs every 5 minutes with 10-minute grace period) if it's truly orphaned.
+			if filePath != nil {
+				s.DebugLog("duplicate message detected, keeping file for potential pending upload", "content_hash", contentHash)
+			}
+			// The copy is already there: this one is delivered, carry on with the next.
+			s.DebugLog("duplicate message accepted (already exists), skipping storage", "message_id", messageID, "mailbox", dest.Mailbox)
+			continue
+		}
+
+		return handleStoreError(err, dest.Mailbox)
 	}
 
 	commitRedirects()
@@ -1281,67 +1275,16 @@ func (s *LMTPSession) handleVacationResponse(ctx context.Context, reply sieveeng
 // saveMessageToMailbox saves a message to the specified mailbox.
 // flags carries any keywords/flags set by the Sieve script (imap4flags, RFC 5232);
 // they are stored on the message (InsertMessage folds keyword case per RFC 9051 §2.3.2).
-func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName string,
+func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailbox *db.DBMailbox,
 	fullMessageBytes []byte, contentHash string, deliveryHash string, subject string, messageID string,
 	sentDate time.Time, inReplyTo []string, references []string, bodyStructure *imap.BodyStructure,
-	plaintextBody *string, recipients []helpers.Recipient, createMailbox bool,
+	plaintextBody *string, recipients []helpers.Recipient,
 	flags []imap.Flag) error {
 
 	// Create a context for read operations that respects session pinning
 	readCtx := ctx
 	if s.useMasterDB {
 		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-	}
-
-	// Resolve the name as for any fileinto: the user's own mailbox, else one shared
-	// with the user, never the shared namespace root (delivery.FileintoTarget). :create
-	// (RFC 5490 §3.2) creates the mailbox only "if needed": "If the mailbox already
-	// exists, this argument is ignored", and a shared one exists for this user. It
-	// never makes a personal mailbox in the shared namespace, where a namesake would
-	// shadow a shared mailbox in later lookups.
-	mailbox, err := delivery.FileintoTarget(readCtx, s.backend.rdb, s.backend.sharedMailboxes, s.AccountID(), mailboxName)
-	if errors.Is(err, consts.ErrMailboxNotFound) && createMailbox {
-		if s.backend.sharedMailboxes.InNamespace(mailboxName) {
-			s.WarnLog("fileinto :create refused in the shared namespace", "mailbox", mailboxName)
-		} else {
-			s.DebugLog("creating mailbox", "mailbox", mailboxName)
-			mailbox, err = s.backend.rdb.GetOrCreateMailboxByNameWithRetry(ctx, s.AccountID(), mailboxName)
-			if errors.Is(err, consts.ErrMailboxInvalidName) {
-				// No mailbox can have that name. "Failure to create the specified
-				// mailbox is considered to be an error" (RFC 5490 §3.2), and on an
-				// error implementations "do an implicit keep" (RFC 5228 §2.10.6):
-				// INBOX, below. Failing the delivery would only have it retried until
-				// it bounces, and through the default script's +detail filing any
-				// sender picks the name.
-				s.WarnLog("fileinto :create of an invalid mailbox name", "mailbox", mailboxName, "error", err)
-				err = consts.ErrMailboxNotFound
-			} else if err != nil {
-				return fmt.Errorf("failed to get or create mailbox '%s': %v", mailboxName, err)
-			}
-		}
-	}
-	if errors.Is(err, consts.ErrMailboxNotFound) {
-		s.WarnLog("mailbox not found, falling back to inbox", "mailbox", mailboxName, "error", err)
-		mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), consts.MailboxInbox)
-		if err != nil {
-			return fmt.Errorf("failed to get INBOX mailbox: %v", err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("failed to get mailbox '%s': %v", mailboxName, err)
-	}
-
-	// Enforce the insert ('i') right for shared mailboxes owned by another account: a
-	// SIEVE fileinto must not write into a mailbox the recipient can only look up
-	// (RFC 4314). On denial (or check error) deliver to the recipient's own INBOX.
-	if mailbox.AccountID != s.AccountID() {
-		canInsert, permErr := s.backend.rdb.CheckMailboxPermissionWithRetry(readCtx, mailbox.ID, s.AccountID(), db.ACLRightInsert)
-		if permErr != nil || !canInsert {
-			s.WarnLog("fileinto denied: no insert right on shared mailbox, delivering to INBOX", "mailbox", mailbox.Name, "error", permErr)
-			mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), consts.MailboxInbox)
-			if err != nil {
-				return fmt.Errorf("failed to get INBOX mailbox: %v", err)
-			}
-		}
 	}
 
 	// Determine destination owner

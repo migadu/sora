@@ -721,9 +721,10 @@ that owns the uploads, with its own config file. Always look at a `--dry-run` fi
 
 With the default `[uploader] path`, `resolve`, `--dry-run` included, refuses to run while
 `/tmp/sora/uploads`, the default of earlier releases, still holds staged bodies: they are not in
-the spool it checks, so `[DELETE]` would take them for lost. It fails with
-`Failed to resolve uploads:` and the error the server stops with at startup
-([OPERATIONS.md](OPERATIONS.md#5-what-a-restart-loses-and-keeps)).
+the spool it checks, so `[DELETE]` would take them for lost. Unlike the server, it counts a file
+there whoever owns it, and refuses when it cannot read a directory there: it cannot tell which
+user the server stages as. It fails with `Failed to resolve uploads:` and an error that names
+the old spool ([OPERATIONS.md](OPERATIONS.md#5-what-a-restart-loses-and-keeps)).
 
 ---
 
@@ -1011,7 +1012,7 @@ Checks and prints a config file. These subcommands read only the file.
 
 | Subcommand | Flags | What it does |
 |---|---|---|
-| `validate` | | Loads the file with the server's loader (warnings for unknown and duplicate keys) and runs the checks `sora` makes on the file before it starts anything ([CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup)), without connecting to anything. Prints `[OK] Configuration is valid!` and the servers, or a `[FAIL]` line for each problem. Exits `1` on errors. |
+| `validate` | | Loads the file with the server's loader (warnings for unknown and duplicate keys) and runs the checks `sora` makes on the file before it starts anything ([CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup)), without connecting to anything. Reports unsupported Sieve extension names (including ManageSieve proxies), broad trusted networks, unused server keys, session-memory shortfalls, inactive feature settings and collected parse-fallback warnings as `[WARN]`, then prints `[OK] Configuration is valid!` and the servers, or a `[FAIL]` line for each problem. Exits `1` on errors, not on warnings. |
 | `dump` | `--format` (`toml` or `json`, default `toml`), `--mask-secrets` (default `true`) | Prints the configuration as loaded, with defaults applied. |
 
 `--mask-secrets` masks the database passwords, `[s3]` access key, secret key and encryption key,
