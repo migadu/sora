@@ -4,11 +4,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/migadu/sora/db"
+	"os"
+	"path/filepath"
+	"reflect"
 	"slices"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/BurntSushi/toml"
+	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/authcache"
+	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/lookupcache"
+	"github.com/migadu/sora/server"
 )
 
 type steps struct {
@@ -367,5 +377,334 @@ func TestPruneFailureRetriesCleanupWithoutBlockingDelivery(t *testing.T) {
 	}
 	if got := steps.take(); !slices.Equal(got, []string{"auth-cache [1]", "auth-cache [2]"}) {
 		t.Fatal(got)
+	}
+}
+
+type watcherTestDBConfig struct {
+	Database struct {
+		Write struct {
+			Hosts    []string `toml:"hosts"`
+			Port     int      `toml:"port"`
+			User     string   `toml:"user"`
+			Password string   `toml:"password"`
+			Name     string   `toml:"name"`
+			TLS      bool     `toml:"tls"`
+		} `toml:"write"`
+	} `toml:"database"`
+}
+
+func setupWatcherTestDB(t *testing.T, suffix string) *db.Database {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	ctx := context.Background()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var configPath string
+	for {
+		candidate := filepath.Join(dir, "config-test.toml")
+		if _, err := os.Stat(candidate); err == nil {
+			configPath = candidate
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("config-test.toml not found")
+		}
+		dir = parent
+	}
+	var cfg watcherTestDBConfig
+	if _, err := toml.DecodeFile(configPath, &cfg); err != nil {
+		t.Fatalf("decode config-test.toml: %v", err)
+	}
+	if name := os.Getenv("SORA_TEST_DB_NAME"); name != "" {
+		cfg.Database.Write.Name = name
+	}
+	cfg.Database.Write.Name += suffix
+	endpoint := &config.DatabaseEndpointConfig{
+		Hosts:    cfg.Database.Write.Hosts,
+		Port:     cfg.Database.Write.Port,
+		User:     cfg.Database.Write.User,
+		Password: cfg.Database.Write.Password,
+		Name:     cfg.Database.Write.Name,
+		TLSMode:  cfg.Database.Write.TLS,
+	}
+	if suffix != "" {
+		maint := *endpoint
+		maint.Name = "postgres"
+		admin, err := db.NewDatabaseFromConfig(ctx, &config.DatabaseConfig{Write: &maint}, false)
+		if err != nil {
+			t.Fatalf("connect postgres maintenance db: %v", err)
+		}
+		var exists bool
+		if err := admin.GetWritePool().QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", endpoint.Name).Scan(&exists); err != nil {
+			admin.Close()
+			t.Fatalf("check test db existence: %v", err)
+		}
+		if !exists {
+			if _, err := admin.GetWritePool().Exec(ctx, "CREATE DATABASE "+pgx.Identifier{endpoint.Name}.Sanitize()); err != nil {
+				admin.Close()
+				t.Fatalf("create test db %s: %v", endpoint.Name, err)
+			}
+		}
+		admin.Close()
+	}
+	database, err := db.NewDatabaseFromConfig(ctx, &config.DatabaseConfig{Write: endpoint}, true)
+	if err != nil {
+		t.Fatalf("open test db %s: %v", endpoint.Name, err)
+	}
+	t.Cleanup(database.Close)
+	if _, err := database.GetWritePool().Exec(ctx, "CREATE EXTENSION IF NOT EXISTS pg_trgm"); err != nil {
+		t.Fatalf("create pg_trgm: %v", err)
+	}
+	return database
+}
+
+func createWatcherTestAccount(t *testing.T, d *db.Database, label string) (int64, string) {
+	t.Helper()
+	ctx := context.Background()
+	email := fmt.Sprintf("watcher-%s-%d@example.com", label, time.Now().UnixNano())
+	tx, err := d.GetWritePool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	id, err := d.CreateAccount(ctx, tx, db.CreateAccountRequest{
+		Email:     email,
+		Password:  "first-password",
+		IsPrimary: true,
+		HashType:  "bcrypt",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return id, email
+}
+
+func inWatcherTx(t *testing.T, d *db.Database, fn func(tx pgx.Tx)) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := d.GetWritePool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	fn(tx)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func appliedLen(t *testing.T, w *Watcher) int {
+	t.Helper()
+	f := reflect.ValueOf(w).Elem().FieldByName("applied")
+	if !f.IsValid() {
+		t.Fatal("Watcher has no applied event tracking field")
+	}
+	return f.Len()
+}
+
+func TestRefreshPinnedXminDoesNotReapplyChangesOrFenceUnrelatedLogins(t *testing.T) {
+	d := setupWatcherTestDB(t, "_watcher_pinned")
+	ctx := context.Background()
+
+	persistent, err := authcache.New(filepath.Join(t.TempDir(), "auth.db"), time.Hour, time.Hour, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = persistent.Close() })
+
+	lookup := lookupcache.New("imap", "test-imap", time.Hour, time.Minute, 100, time.Hour, time.Hour)
+	t.Cleanup(func() { _ = lookup.Stop(context.Background()) })
+
+	tracker := server.NewConnectionTracker("IMAP", "test-imap", "localhost", "localhost-imap", nil, 0, 0, 0, true)
+	t.Cleanup(tracker.Stop)
+
+	prune := func(ctx context.Context, before time.Time) (int64, error) {
+		tx, err := d.GetWritePool().Begin(ctx)
+		if err != nil {
+			return 0, err
+		}
+		defer tx.Rollback(ctx)
+		n, err := d.PruneCredentialChanges(ctx, tx, before)
+		if err != nil {
+			return 0, err
+		}
+		return n, tx.Commit(ctx)
+	}
+
+	namespaceBound := false
+	load := func(ctx context.Context, cursor int64) (db.CredentialChanges, error) {
+		if !namespaceBound {
+			identity, err := d.GetDatabaseIdentity(ctx)
+			if err != nil {
+				return db.CredentialChanges{}, err
+			}
+			if err := persistent.EnsureRevocationNamespace(ctx, identity); err != nil {
+				return db.CredentialChanges{}, err
+			}
+			namespaceBound = true
+		}
+		return d.GetCredentialChangesSince(ctx, cursor)
+	}
+
+	w := New(load, prune, Sinks{
+		AuthCache:   persistent,
+		LoginCaches: func() []LoginCache { return []LoginCache{lookup} },
+		Sessions:    func() []SessionEnder { return []SessionEnder{tracker} },
+		Suspend: func() {
+			persistent.Suspend()
+			lookup.Suspend()
+		},
+		Synchronized: func(ctx context.Context) error {
+			if err := persistent.Resume(ctx); err != nil {
+				return err
+			}
+			lookup.Resume()
+			return nil
+		},
+		Reset: func(ctx context.Context) error {
+			persistent.Suspend()
+			lookup.Suspend()
+			err := persistent.InvalidateAll(ctx)
+			lookup.Clear()
+			tracker.EndAllLocalSessions()
+			return err
+		},
+	}, time.Hour)
+
+	accountA, emailA := createWatcherTestAccount(t, d, "acct-a")
+	accountB, emailB := createWatcherTestAccount(t, d, "acct-b")
+	accountC, _ := createWatcherTestAccount(t, d, "acct-c")
+
+	// Synchronize baseline state before pinning snapshot xmin.
+	if err := w.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := persistent.Put(ctx, emailA, accountA, "hash-first"); err != nil {
+		t.Fatal(err)
+	}
+	lookup.Set("test-imap", emailA, &lookupcache.CacheEntry{AccountID: accountA, HashedPassword: "hash-first"})
+	sessionB := tracker.RegisterSession(accountB)
+
+	// Hold an open write transaction on a separate connection so pg_snapshot_xmin stays pinned.
+	pinTx, err := d.GetWritePool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pinTx.Rollback(ctx)
+	var pinXID int64
+	if err := pinTx.QueryRow(ctx, "SELECT pg_current_xact_id()::text::bigint").Scan(&pinXID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Commit a password change on Account A and a soft-delete on Account B.
+	inWatcherTx(t, d, func(tx pgx.Tx) {
+		if err := d.UpdateAccount(ctx, tx, db.UpdateAccountRequest{
+			Email: emailA, Password: "second-password", HashType: "bcrypt",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.DeleteAccount(ctx, tx, emailB); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// Poll 1: applies Account A's invalidation and Account B's session termination while xmin stays pinned.
+	if err := w.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if w.cursor > pinXID {
+		t.Fatalf("cursor %d advanced past pinned xid %d", w.cursor, pinXID)
+	}
+	if _, ok := lookup.Get("test-imap", emailA); ok {
+		t.Fatal("Poll 1 failed to evict Account A from LookupCache")
+	}
+	if _, _, err := persistent.Get(ctx, emailA); !errors.Is(err, authcache.ErrCacheMiss) {
+		t.Fatalf("Poll 1 failed to evict Account A from AuthCache: %v", err)
+	}
+	select {
+	case <-sessionB:
+	default:
+		t.Fatal("Poll 1 failed to close deleted Account B session")
+	}
+
+	// Account A signs in with its new password and caches it; unrelated Account C begins authenticating.
+	if err := persistent.Put(ctx, emailA, accountA, "hash-second"); err != nil {
+		t.Fatal(err)
+	}
+	lookup.Set("test-imap", emailA, &lookupcache.CacheEntry{AccountID: accountA, HashedPassword: "hash-second"})
+	authGenBefore := persistent.Generation()
+	lookupGenBefore := lookup.Generation()
+	sessionGenC := tracker.SessionGeneration()
+
+	// Poll 2 while xmin is still pinned: already-applied changes must NOT re-invalidate A or kick in-flight C.
+	if err := w.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := lookup.Get("test-imap", emailA); !ok {
+		t.Error("pinned xmin poll re-evicted Account A's newly cached LookupCache entry")
+	}
+	if lookup.Generation() != lookupGenBefore {
+		t.Errorf("pinned xmin poll bumped LookupCache generation from %d to %d", lookupGenBefore, lookup.Generation())
+	}
+	if _, _, err := persistent.Get(ctx, emailA); err != nil {
+		t.Errorf("pinned xmin poll re-evicted Account A's newly cached AuthCache entry: %v", err)
+	}
+	if persistent.Generation() != authGenBefore {
+		t.Errorf("pinned xmin poll bumped AuthCache generation from %d to %d", authGenBefore, persistent.Generation())
+	}
+	sessionC := tracker.RegisterSessionIfGeneration(accountC, sessionGenC)
+	select {
+	case <-sessionC:
+		t.Error("pinned xmin poll bumped sessionGeneration and disconnected unrelated Account C login")
+	default:
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	// Poll 3 while xmin is still pinned: a second password change on Account A MUST be applied.
+	inWatcherTx(t, d, func(tx pgx.Tx) {
+		if err := d.UpdateAccount(ctx, tx, db.UpdateAccountRequest{
+			Email: emailA, Password: "third-password", HashType: "bcrypt",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := w.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := lookup.Get("test-imap", emailA); ok {
+		t.Fatal("Poll 3 missed second password change on Account A while xmin remained pinned")
+	}
+	if _, _, err := persistent.Get(ctx, emailA); !errors.Is(err, authcache.ErrCacheMiss) {
+		t.Fatalf("Poll 3 missed second password change in AuthCache while xmin remained pinned: %v", err)
+	}
+	select {
+	case <-sessionC:
+		t.Fatal("Poll 3 password change on Account A unexpectedly ended Account C session")
+	default:
+	}
+	if appliedLen(t, w) == 0 {
+		t.Fatal("expected applied map to track events at or above pinned xmin")
+	}
+
+	// Poll 4 after releasing the pinning transaction: safe xmin advances and applied map empties.
+	if err := pinTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := appliedLen(t, w); got != 0 {
+		t.Fatalf("applied map retained %d entries after snapshot xmin advanced, want 0", got)
 	}
 }

@@ -39,10 +39,10 @@ func TestManageSieve_AuthenticateRefusesNonBase64Response(t *testing.T) {
 		{"quoted continuation, CR inside", "AUTHENTICATE \"PLAIN\"\r\n\"" + crInside + "\"\r\n"},
 		{"continuation, leading space", "AUTHENTICATE \"PLAIN\"\r\n " + plain + "\r\n"},
 		// An unquoted initial response is accepted like a bare continuation line and,
-		// like one, runs to the CRLF; a backslash inside a quoted response is no
-		// QUOTED-CHAR escape of a base64 character (RFC 5804 section 4).
+		// like one, runs to the CRLF. A valid quoted-pair encodes a literal
+		// backslash, so parsing succeeds before base64 validation refuses it.
 		{"unquoted initial response, CR before the CRLF", `AUTHENTICATE "PLAIN" ` + plain + "\r\r\n"},
-		{"quoted initial response, backslash inside", `AUTHENTICATE "PLAIN" "` + plain[:4] + `\` + plain[4:] + "\"\r\n"},
+		{"quoted initial response, backslash inside", `AUTHENTICATE "PLAIN" "` + plain[:4] + `\\` + plain[4:] + "\"\r\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

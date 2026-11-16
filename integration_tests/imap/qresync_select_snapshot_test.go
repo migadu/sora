@@ -434,6 +434,26 @@ func TestIMAP_QResyncSelectDescribesOneState(t *testing.T) {
 					}
 				}
 			}
+			// EXISTS announces new messages without necessarily supplying their
+			// UIDs. RFC 7162 section 6 leaves those descriptors for the client
+			// to fetch. Discover only unknown slots, preserving every known
+			// mapping and the independent NOOP flag assertions above.
+			for i, uid := range client {
+				if uid != 0 {
+					continue
+				}
+				fetched, _ := c.do(fmt.Sprintf("FETCH %d (UID)", i+1))
+				for _, line := range fetched {
+					m := qrsFetchRe.FindStringSubmatch(line)
+					if m == nil || mustAtoi(t, m[1]) != i+1 {
+						continue
+					}
+					um := uidRe.FindStringSubmatch(line)
+					require.NotNilf(t, um, "UID discovery FETCH has no UID: %s", line)
+					client[i] = imap.UID(mustAtoi(t, um[1]))
+				}
+				require.NotZerof(t, client[i], "new message at sequence %d has no UID in %v", i+1, fetched)
+			}
 			assert.Equal(t, mailboxUIDsAt(t, server.ResilientDB, mailbox.ID, 1<<62), client,
 				"after the next poll the client's view must be the mailbox")
 		})

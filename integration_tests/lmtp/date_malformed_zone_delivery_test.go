@@ -13,6 +13,11 @@ import (
 	lmtpserver "github.com/migadu/sora/server/lmtp"
 )
 
+// TestLMTP_MalformedDateZoneDelivery is issues #1514 and #1778 through LMTP
+// delivery: a Date: zone that is not an RFC 5322 zone makes the field no
+// date-time, so every date test is false and :count is 0 (RFC 5260 §4); an
+// alphabetic zone whose meaning is not known is "-0000" (RFC 5322 §4.3), the
+// time of day as written at offset zero.
 func TestLMTP_MalformedDateZoneDelivery(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	rdb := common.SetupTestDatabase(t)
@@ -22,7 +27,9 @@ func TestLMTP_MalformedDateZoneDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	setActiveSieveScript(t, rdb, id, `require ["date", "fileinto", "mailbox", "relational", "comparator-i;ascii-numeric"];
-if allof (date :count "eq" :comparator "i;ascii-numeric" "date" "hour" "1",
+if allof (date :count "eq" :comparator "i;ascii-numeric" "date" "hour" "0",
+ not date :matches "date" "hour" "*") { fileinto :create "Invalid"; }
+elsif allof (date :count "eq" :comparator "i;ascii-numeric" "date" "hour" "1",
  date :originalzone "date" "hour" "12",
  date :originalzone "date" "zone" "+0000",
  date :originalzone "date" "iso8601" "2019-01-01T12:00:00Z",
@@ -32,10 +39,12 @@ else { fileinto :create "Other"; }
 `)
 	addr, _ := startTestLMTPServerWithOptions(t, rdb, lmtpserver.LMTPServerOptions{})
 	for i, tc := range []struct{ zone, want string }{
-		{"GMT+1", "Written"}, {"GMT-5", "Written"}, {"GMT+0200", "Written"},
-		{"UTC-0500", "Written"}, {"PDT+0400", "Written"}, {"+01", "Written"},
-		{"CET/CEST", "Written"}, {"PDT/UTC", "Written"}, {"XYZ", "Written"},
-		{"+0000", "Written"}, {"-0000", "Written"}, {"PDT", "Other"}, {"PM -0700", "Other"},
+		{"GMT+1", "Invalid"}, {"GMT-5", "Invalid"}, {"GMT+0200", "Invalid"},
+		{"UTC-0500", "Invalid"}, {"PDT+0400", "Invalid"}, {"+01", "Invalid"},
+		{"+01:00", "Invalid"}, {"CET/CEST", "Invalid"}, {"PDT/UTC", "Invalid"},
+		{"+0060", "Invalid"}, {"PM -0700", "Invalid"},
+		{"XYZ", "Written"}, {"CET", "Written"},
+		{"+0000", "Written"}, {"-0000", "Written"}, {"PDT", "Other"}, {"+0100", "Other"},
 	} {
 		t.Run(tc.zone, func(t *testing.T) {
 			marker := fmt.Sprintf("zone-%d-%d", time.Now().UnixNano(), i)

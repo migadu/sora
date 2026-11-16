@@ -19,6 +19,12 @@ import (
 // shared mailbox the user created, and the shared namespace root, are not
 // personal although the user owns them. NOTIFY's PERSONAL must name the same
 // mailboxes.
+//
+// INBOXES names them too (issue #1744). RFC 5465 §6.3: "If the IMAP server
+// cannot easily compute this set, it MUST treat "inboxes" as equivalent to
+// "personal"." Sora does not compute the mailboxes an MDA may deliver to:
+// Sieve fileinto, with :create, and the Admin API's target mailbox can name
+// any personal mailbox.
 func TestResolveSearchSourcePersonalNamespace(t *testing.T) {
 	const me, other = 1, 2
 	mailbox := func(id, owner int64, name string) *db.DBMailbox {
@@ -69,34 +75,45 @@ func TestResolveSearchSourcePersonalNamespace(t *testing.T) {
 		},
 	}
 
+	specifiers := []struct {
+		name   string
+		source imap.SearchSource
+		notify imap.NotifyMailboxSpec
+	}{
+		{"PERSONAL", imap.SearchSource{Personal: true}, imap.NotifyMailboxSpecPersonal},
+		{"INBOXES", imap.SearchSource{Inboxes: true}, imap.NotifyMailboxSpecInboxes},
+	}
+
 	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			s := newPersonalTestSession(t, me, tc.shared)
+		for _, spec := range specifiers {
+			t.Run(tc.name+"/"+spec.name, func(t *testing.T) {
+				s := newPersonalTestSession(t, me, tc.shared)
 
-			got, err := s.resolveSearchSource(context.Background(), &imap.SearchSource{Personal: true}, tc.all)
-			if err != nil {
-				t.Fatalf("resolveSearchSource: %v", err)
-			}
-			var names []string
-			for _, m := range got {
-				names = append(names, m.Name)
-			}
-			if !slices.Equal(names, tc.want) {
-				t.Errorf("ESEARCH IN (PERSONAL) searches %q, want %q", names, tc.want)
-			}
-
-			// One rule for both: NOTIFY's PERSONAL watches exactly these mailboxes.
-			watch := newTestWatch(imap.NotifyItem{
-				MailboxSpec: imap.NotifyMailboxSpecPersonal,
-				Events:      []imap.NotifyEvent{imap.NotifyEventMessageNew},
-			})
-			for _, m := range tc.all {
-				inNotify := watch.eventsForMailbox(m.Name, m.NameKey, false, s.sharedNamespaceRoot()) != nil
-				if inSearch := slices.Contains(names, m.Name); inNotify != inSearch {
-					t.Errorf("%q: NOTIFY PERSONAL watches it = %v, ESEARCH IN (PERSONAL) searches it = %v", m.Name, inNotify, inSearch)
+				got, err := s.resolveSearchSource(context.Background(), &spec.source, tc.all)
+				if err != nil {
+					t.Fatalf("resolveSearchSource: %v", err)
 				}
-			}
-		})
+				var names []string
+				for _, m := range got {
+					names = append(names, m.Name)
+				}
+				if !slices.Equal(names, tc.want) {
+					t.Errorf("ESEARCH IN (%s) searches %q, want %q", spec.name, names, tc.want)
+				}
+
+				// One rule for both: NOTIFY watches exactly these mailboxes.
+				watch := newTestWatch(imap.NotifyItem{
+					MailboxSpec: spec.notify,
+					Events:      []imap.NotifyEvent{imap.NotifyEventMessageNew},
+				})
+				for _, m := range tc.all {
+					inNotify := watch.eventsForMailbox(m.Name, m.NameKey, false, s.sharedNamespaceRoot()) != nil
+					if inSearch := slices.Contains(names, m.Name); inNotify != inSearch {
+						t.Errorf("%q: NOTIFY %s watches it = %v, ESEARCH IN (%s) searches it = %v", m.Name, spec.name, inNotify, spec.name, inSearch)
+					}
+				}
+			})
+		}
 	}
 }
 
