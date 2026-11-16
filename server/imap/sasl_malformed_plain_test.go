@@ -58,3 +58,35 @@ func TestAuthenticateMalformedPlainIsNotServerBug(t *testing.T) {
 		})
 	}
 }
+
+// "=" is a zero-length response only as the initial response (RFC 9051 §9:
+// initial-resp = (base64 / "=")). A reply to a continuation request is base64
+// (authenticate = ... *(CRLF base64)), where a lone pad character is invalid
+// and the server MUST answer a tagged BAD (RFC 9051 §6.2.2), as the IMAP proxy
+// does (TestPreAuthMalformedLoginAndAuthenticateAnswerBAD). It must not reach
+// PLAIN as a zero-length message and be answered NO. No database is needed.
+func TestAuthenticateLonePadReplyIsBad(t *testing.T) {
+	srv, addr := newReloadTestServer(t, IMAPServerOptions{})
+	serveReloadTestServer(t, srv, addr)
+
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	r := bufio.NewReader(c)
+	readTagged(t, r, "* OK")
+
+	c.Write([]byte("a AUTHENTICATE PLAIN\r\n"))
+	readTagged(t, r, "+")
+	c.Write([]byte("=\r\n"))
+	if line := strings.TrimRight(readTagged(t, r, "a "), "\r\n"); line != "a BAD Malformed SASL response" {
+		t.Fatalf(`"=" as a continuation reply = %q, want "a BAD Malformed SASL response"`, line)
+	}
+
+	c.Write([]byte("b NOOP\r\n"))
+	if line := readTagged(t, r, "b "); !strings.HasPrefix(line, "b OK") {
+		t.Fatalf("NOOP after the refused AUTHENTICATE = %q, want b OK", line)
+	}
+}

@@ -112,3 +112,99 @@ func TestExportDoesNotBlockOnFIFOMaildirDirectory(t *testing.T) {
 		})
 	}
 }
+
+func fileStatusFlags(t *testing.T, f *os.File) int {
+	t.Helper()
+	conn, err := f.SyscallConn()
+	require.NoError(t, err)
+	var flags int
+	var fcntlErr error
+	require.NoError(t, conn.Control(func(fd uintptr) {
+		flags, fcntlErr = unix.FcntlInt(fd, unix.F_GETFL, 0)
+	}))
+	require.NoError(t, fcntlErr)
+	return flags
+}
+
+// openExportEntry opens regular files with O_NONBLOCK so a FIFO does not block, and must
+// clear O_NONBLOCK before returning: Go does not register regular files with the runtime
+// poller, so a filesystem that honours O_NONBLOCK for regular files would otherwise fail
+// reads with EAGAIN (silently discarding existing dovecot-keywords and dovecot-uidlist
+// state). Directories must likewise be returned without O_NONBLOCK set.
+func TestOpenExportEntryReadsInBlockingMode(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "dovecot-keywords"), []byte("0 $Work\n"), 0o644))
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "cur"), 0o755))
+	root, err := os.OpenRoot(dir)
+	require.NoError(t, err)
+	defer root.Close()
+
+	t.Run("regular file", func(t *testing.T) {
+		f, err := openExportEntry(root, "dovecot-keywords", false)
+		require.NoError(t, err)
+		defer f.Close()
+		assert.Zero(t, fileStatusFlags(t, f)&unix.O_NONBLOCK, "a regular export file was left in non-blocking mode")
+	})
+
+	t.Run("directory", func(t *testing.T) {
+		for _, name := range []string{"cur", "."} {
+			d, err := openExportEntry(root, name, true)
+			require.NoError(t, err)
+			flags := fileStatusFlags(t, d)
+			require.NoError(t, d.Close())
+			assert.Zero(t, flags&unix.O_NONBLOCK, "export directory %q was left in non-blocking mode", name)
+		}
+	})
+}
+
+// Opening a directory entry with dir == true must pass O_DIRECTORY so the kernel rejects
+// any non-directory (regular file, FIFO, or device node) with ENOTDIR before opening it.
+func TestOpenExportEntryRejectsNonDirectoryWithoutOpening(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "regular"), []byte("x"), 0o644))
+	root, err := os.OpenRoot(dir)
+	require.NoError(t, err)
+	defer root.Close()
+
+	t.Run("regular file", func(t *testing.T) {
+		f, err := openExportEntry(root, "regular", true)
+		if f != nil {
+			f.Close()
+		}
+		require.Error(t, err)
+		assert.False(t, os.IsNotExist(err))
+		assert.ErrorIs(t, err, unix.ENOTDIR)
+		assert.Contains(t, err.Error(), "refusing regular in the export directory: it is not a directory")
+	})
+
+	t.Run("FIFO", func(t *testing.T) {
+		fifoPath := filepath.Join(dir, "cur")
+		err := returnsDespiteFIFO(t, fifoPath, func() error {
+			f, err := openExportEntry(root, "cur", true)
+			if f != nil {
+				f.Close()
+			}
+			return err
+		})
+		require.Error(t, err)
+		assert.False(t, os.IsNotExist(err))
+		assert.ErrorIs(t, err, unix.ENOTDIR)
+		assert.Contains(t, err.Error(), "refusing cur in the export directory: it is not a directory")
+	})
+
+	t.Run("link to FIFO within export directory", func(t *testing.T) {
+		targetFIFO := filepath.Join(dir, "tmp-fifo")
+		require.NoError(t, os.Symlink("tmp-fifo", filepath.Join(dir, "new")))
+		err := returnsDespiteFIFO(t, targetFIFO, func() error {
+			f, err := openExportEntry(root, "new", true)
+			if f != nil {
+				f.Close()
+			}
+			return err
+		})
+		require.Error(t, err)
+		assert.False(t, os.IsNotExist(err))
+		assert.ErrorIs(t, err, unix.ENOTDIR)
+		assert.Contains(t, err.Error(), "refusing new in the export directory: it is not a directory")
+	})
+}
