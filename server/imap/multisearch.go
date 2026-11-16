@@ -92,13 +92,17 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 		// RFC 4314: SEARCH requires the 'r' (read) right. GetMailboxes also lists
 		// shared mailboxes that are visible with only the 'l' (lookup) right, and
 		// scope verbs may resolve to them; skip any the user cannot read so ESEARCH
-		// cannot leak message UIDs/counts from them.
-		hasRead, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, mbox.ID, accountID, 'r')
-		if err != nil {
-			return nil, s.internalError("failed to check read permission for %s: %v", mbox.Name, err)
-		}
-		if !hasRead {
-			continue
+		// cannot leak message UIDs/counts from them. The owner has every right
+		// (has_mailbox_right returns TRUE for it first), so only a mailbox another
+		// account owns costs the round trip, as in NOTIFY's STATUS fan-in.
+		if mbox.AccountID != accountID {
+			hasRead, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, mbox.ID, accountID, db.ACLRightRead)
+			if err != nil {
+				return nil, s.internalError("failed to check read permission for %s: %v", mbox.Name, err)
+			}
+			if !hasRead {
+				continue
+			}
 		}
 
 		// mbox.AccountID, never the session accountID above: for a shared mailbox the FTS
