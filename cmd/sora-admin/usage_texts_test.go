@@ -343,12 +343,17 @@ func TestUsageTextsMatchTheCode(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if !isMaildirFolder(filepath.Join(parent, "Maildir")) {
+		if !isMaildirFolder(os.DirFS(parent), "Maildir") {
 			t.Fatal("a maildir with cur/ and no tmp/ is not accepted")
 		}
 		// "Did you mean Maildir", "Found possible maildir(s)", and no maildir at all.
 		for _, path := range []string{parent, other, filepath.Join(parent, "Maildir", "cur")} {
-			err := (&Importer{maildirPath: path}).scanMaildir()
+			root, err := os.OpenRoot(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = (&Importer{maildirPath: path, root: root}).scanMaildir()
+			root.Close()
 			if err == nil {
 				t.Fatalf("%s accepted as a maildir root", path)
 			}

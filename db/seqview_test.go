@@ -179,10 +179,14 @@ func TestSeqViewNumberingCostsWhatTheLiveNumberingCosts(t *testing.T) {
 		return rows
 	}
 
-	// Without a view 2:3 are UIDs 3 and 4; in the view (UID 1 still held) UIDs 2 and 3.
+	// The same two messages, UIDs 3 and 4: 2:3 without a view, 3:4 in the view (UID 1
+	// still held). Every statement but the numbering is then the same statement with the
+	// same arguments in both, so it costs the same in both. Fetching other UIDs lets the
+	// row fetch's join plan, which the UID statistics of every other mailbox decide,
+	// differ between the two by a pass over the mailbox's message_state rows (#1748).
 	live := cost(ctx, imap.SeqSet{{Start: 2, Stop: 3}}, []imap.UID{3, 4})
-	view := cost(WithSeqView(ctx, messages), imap.SeqSet{{Start: 2, Stop: 3}}, []imap.UID{2, 3})
-	t.Logf("rows for FETCH 2:3 in a mailbox of %d: %.0f without a view, %.0f in a view", messages, live, view)
+	view := cost(WithSeqView(ctx, messages), imap.SeqSet{{Start: 3, Stop: 4}}, []imap.UID{3, 4})
+	t.Logf("rows for FETCH of UIDs 3:4 in a mailbox of %d: %.0f without a view, %.0f in a view", messages, live, view)
 	require.LessOrEqualf(t, view, live+maxExtraRows,
 		"numbering in a view read %.0f rows against %.0f without one: the held rows must be merged "+
 			"into the live index order, not sorted together with every live UID", view, live)

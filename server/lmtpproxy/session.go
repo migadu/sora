@@ -369,8 +369,9 @@ func (s *Session) handleConnection() {
 				s.sendResponse("503 5.5.1 Error: need MAIL command")
 				continue
 			}
-			// Empty parameter values are a syntax error before extension checks.
-			if param := emptyParameterValue(params); param != "" {
+			// Empty parameter values and repeated keywords are a syntax error before
+			// extension checks.
+			if param := malformedParameter(params); param != "" {
 				s.InfoLog("RCPT refused for a parameter", "to", to, "parameter", param)
 				s.sendResponse("501 5.5.4 Syntax error in RCPT TO parameters")
 				continue
@@ -939,8 +940,8 @@ func parseRCPTCommand(command string) (address string, keptParams []string, ok b
 
 // mailParameters checks the MAIL parameters in the order given and returns the size the
 // SIZE parameter declares, as given ("" for none), or the first parameter refused and
-// the reply refusing the command (reply "" for none). The first parameter refused
-// decides the reply, as on the backend, so a command with more than one wrong gets the
+// the reply refusing the command (reply "" for none). After the generic malformed
+// prepass, the first parameter refused decides the reply, as on the backend, so it gets the
 // same reply every time: RFC 5321 gives 555 for a parameter the server "does not
 // recognize or cannot implement" (section 4.1.1.11) and 501 for a "Syntax error in
 // parameters or arguments" (section 4.2.2), and ranks neither above the other.
@@ -958,14 +959,13 @@ func parseRCPTCommand(command string) (address string, keptParams []string, ok b
 // one and every other parameter, the DSN ones (RFC 3461) among them, get 555 5.5.4, as
 // on the backend. RFC 5321 section 4.1.1.11: "If the server SMTP does not recognize or
 // cannot implement one or more of the parameters associated with a particular MAIL FROM
-// or RCPT TO command, it will return code 555." A parameter with "=" and no value is
-// refused with 501 before any of that (emptyParameterValue).
+// or RCPT TO command, it will return code 555." A parameter with "=" and no value, or
+// a repeated keyword, is refused with 501 before semantic checks (malformedParameter).
 func mailParameters(params []string, limit int64) (size, param, reply string) {
 	const unsupported = "555 5.5.4 MAIL FROM parameter not recognized or not implemented"
-	if p := emptyParameterValue(params); p != "" {
+	if p := malformedParameter(params); p != "" {
 		return "", p, "501 5.5.4 Syntax error in MAIL FROM parameters"
 	}
-	body, smtputf8 := false, false
 	for _, p := range params {
 		keyword, value, hasValue := strings.Cut(p, "=")
 		switch server.ToUpperASCII(keyword) {
@@ -981,17 +981,12 @@ func mailParameters(params []string, limit int64) (size, param, reply string) {
 			}
 			size = value
 		case "SMTPUTF8":
-			if hasValue || smtputf8 {
+			if hasValue {
 				return "", p, "501 5.5.4 Syntax error in SMTPUTF8 parameter"
 			}
-			smtputf8 = true
 		case "BODY":
 			switch server.ToUpperASCII(value) {
 			case "7BIT", "8BITMIME":
-				if body {
-					return "", p, "501 5.5.4 Syntax error in BODY parameter"
-				}
-				body = true
 			case "BINARYMIME":
 				return "", p, unsupported
 			default:
@@ -1049,16 +1044,27 @@ func validXRCPTFORWARD(value string) bool {
 	return true
 }
 
-// emptyParameterValue returns the first MAIL or RCPT parameter written with "=" and
-// nothing after it, "" if there is none. "esmtp-param = esmtp-keyword ["=" esmtp-value]"
-// and "esmtp-value = 1*(%d33-60 / %d62-126)" (RFC 5321 section 4.1.2): such a parameter
-// is malformed whatever its keyword, a syntax error (501). The backend's go-smtp refuses
-// the command so before it looks at any parameter (#1709), and so does the proxy.
-func emptyParameterValue(params []string) string {
+// malformedParameter returns the first MAIL or RCPT parameter that is malformed whatever
+// its keyword, "" if there is none. One is written with "=" and nothing after it:
+// "esmtp-param = esmtp-keyword ["=" esmtp-value]" and "esmtp-value = 1*(%d33-60 /
+// %d62-126)" (RFC 5321 section 4.1.2). The other repeats the keyword of an earlier one,
+// compared case-insensitively, so which value the client meant cannot be told: "Only one
+// BODY parameter may be used in a single MAIL command" (RFC 6152 section 3), and RFC 1870
+// section 6 says the same of SIZE. Either is a syntax error (501). The backend's go-smtp
+// refuses the command so before it looks at any parameter (#1709, #1721), and so does the
+// proxy.
+func malformedParameter(params []string) string {
+	seen := make(map[string]bool, len(params))
 	for _, p := range params {
-		if _, value, hasValue := strings.Cut(p, "="); hasValue && value == "" {
+		keyword, value, hasValue := strings.Cut(p, "=")
+		if hasValue && value == "" {
 			return p
 		}
+		keyword = server.ToUpperASCII(keyword)
+		if seen[keyword] {
+			return p
+		}
+		seen[keyword] = true
 	}
 	return ""
 }
@@ -1345,6 +1351,9 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 	queryTimeout := s.server.rdb.GetQueryTimeout()
 	dbCtx, dbCancel := context.WithTimeout(s.ctx, queryTimeout)
 	defer dbCancel()
+	// A read replica may retain active account state after revocation and refill
+	// lookupCache past Watcher's invalidation cursor.
+	dbCtx = context.WithValue(dbCtx, consts.UseMasterDBKey, true)
 
 	// Use GetActiveAccountIDByAddressWithRetry which properly handles ErrUserNotFound
 	// as a business logic error (not a circuit breaker failure)
