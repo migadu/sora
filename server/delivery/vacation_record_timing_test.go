@@ -60,6 +60,12 @@ func (q *orderedRelayQueue) Enqueue(_, _, _ string, _ []byte) error {
 	return q.err
 }
 
+// Hold records the message when it is committed, which is when the relay worker
+// would first see it.
+func (q *orderedRelayQueue) Hold(from, to, messageType string, messageBytes []byte) (func() error, func(), error) {
+	return func() error { return q.Enqueue(from, to, messageType, messageBytes) }, func() {}, nil
+}
+
 const vacationScript = `require "vacation";
 vacation :days 7 :subject "Away" "I am away";
 `
@@ -104,7 +110,7 @@ func TestVacationSuppressionRecordedOnlyOnSend(t *testing.T) {
 		reply := evaluateVacation(t, oracle, "bob@external.com")
 
 		rq := &orderedRelayQueue{oracle: oracle}
-		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane}
+		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane, IsAnyOwnedAddress: ownsAny(ownsJane)}
 		// The account is not in To/Cc, so HandleVacationResponse must not reply.
 		orig := makeMessage(map[string]string{"From": "bob@external.com", "To": "list@example.com"})
 

@@ -166,7 +166,7 @@ func TestImporter_IncrementalRunKeepsMessagesDeletedInSora(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = cache.Exec(`UPDATE messages SET account_id = NULL`)
+		_, err = cache.Exec(`DELETE FROM import_completions`)
 		cache.Close()
 		if err != nil {
 			t.Fatal(err)

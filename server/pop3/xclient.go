@@ -41,6 +41,12 @@ func (s *POP3Session) handleXCLIENT(args string) (bool, string) {
 		return false, xclientTTLExpired
 	}
 
+	if forwardingParams.OriginatingIP != "" && !s.mayReplaceClientAddr() {
+		s.DebugLog("xclient client address ignored: the PROXY header's source is not trusted", "client_ip", forwardingParams.OriginatingIP)
+		forwardingParams.OriginatingIP = ""
+		forwardingParams.OriginatingPort = 0
+	}
+
 	// Store forwarding parameters in session
 	s.ForwardingParams = forwardingParams
 
@@ -58,30 +64,37 @@ func (s *POP3Session) handleXCLIENT(args string) (bool, string) {
 		}
 	}
 
-	s.DebugLog("processed xclient forwarding parameters", "client_ip", forwardingParams.OriginatingIP, "client_port", forwardingParams.OriginatingPort, "session_id", forwardingParams.SessionID, "ttl", forwardingParams.ProxyTTL, "variables_count", len(forwardingParams.Variables))
+	// A pop3_proxy names its session in SESSION=: logged as on the "connected" line for
+	// a PROXY v2 header, it leads from the proxy's session=<id> to this session.
+	if forwardingParams.SessionID != "" {
+		s.InfoLog("forwarding parameters accepted", "proxy_session", forwardingParams.SessionID)
+	}
+	s.DebugLog("processed xclient forwarding parameters", "client_ip", forwardingParams.OriginatingIP, "client_port", forwardingParams.OriginatingPort, "ttl", forwardingParams.ProxyTTL, "variables_count", len(forwardingParams.Variables))
 
 	return true, "XCLIENT parameters accepted"
 }
 
-// isFromTrustedProxy checks if the connection is from a trusted network that can send forwarding parameters
+// isFromTrustedProxy reports whether this connection may send XCLIENT: its socket peer or,
+// with a PROXY header, the header's source is in trusted_networks (the limiter's list,
+// consistent with connection limiting). A trusted peer may relay a client's own XCLIENT,
+// so only mayReplaceClientAddr decides whether XCLIENT ADDR is applied.
 func (s *POP3Session) isFromTrustedProxy() bool {
-	// Use the server's limiter trusted networks for XCLIENT command forwarding
-	// This ensures consistency with connection limiting behavior
 	if s.server.limiter == nil {
 		return false
 	}
+	return s.server.limiter.IsTrustedConnection(s.conn.RemoteAddr()) || s.mayReplaceClientAddr()
+}
 
-	// When PROXY protocol is used, check the proxy's IP (not the real client IP)
-	// The ProxyIP contains the actual IP of the proxy server that sent the PROXY header
-	if s.ProxyIP != "" {
-		// Create a fake net.Addr with the proxy IP for trusted network checking
-		proxyAddr := &net.TCPAddr{
-			IP: net.ParseIP(s.ProxyIP),
-		}
-		return s.server.limiter.IsTrustedConnection(proxyAddr)
+// mayReplaceClientAddr reports whether XCLIENT ADDR may replace the client address the
+// connection established, as for LMTP XCLIENT (server/lmtp/xclient.go): only when the
+// source of the PROXY header, else the socket peer, is in trusted_networks (see
+// server.ForwardingSourceIP). A pop3_proxy may send a PROXY header and XCLIENT on one
+// connection, so XCLIENT from a trusted peer is still answered +OK: refusing it would be
+// a warning on that proxy at every login. Behind a layer-4 load balancer the XCLIENT is
+// the client's own, and its address stays the one the header gave.
+func (s *POP3Session) mayReplaceClientAddr() bool {
+	if s.server.limiter == nil {
+		return false
 	}
-
-	// Fall back to checking the direct connection's remote address (no PROXY protocol)
-	remoteAddr := s.conn.RemoteAddr()
-	return s.server.limiter.IsTrustedConnection(remoteAddr)
+	return s.server.limiter.IsTrustedConnection(&net.TCPAddr{IP: server.ForwardingSourceIP(s.conn)})
 }

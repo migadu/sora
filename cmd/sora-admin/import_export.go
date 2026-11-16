@@ -28,6 +28,8 @@ func handleImportCommand(ctx context.Context) {
 		handleImportMaildir(ctx)
 	case "s3":
 		handleImportS3(ctx)
+	case "rekey":
+		handleImportRekey(ctx)
 	case "--help", "-h":
 		printImportUsage()
 	default:
@@ -68,7 +70,7 @@ Usage:
 
 Options:
   --email string          Email address for the account to import mail to (required)
-  --maildir-path string   Path to the maildir root directory (must contain cur/, new/, tmp/) (required)
+  --maildir-path string   Path to the maildir root directory (must contain cur/ or new/) (required)
   --jobs int              Number of parallel import jobs (default: 4)
   --batch-size int        Number of messages to process in each batch (default: 20)
   --batch-transaction     Use single transaction per batch (20x faster but less resilient, default: false)
@@ -89,7 +91,7 @@ Options:
                           (default: [cleanup] fts_retention from the config; unset = index all)
   --config string        Path to TOML configuration file (required)
 
-IMPORTANT: --maildir-path must point to a maildir root directory (containing cur/, new/, tmp/ subdirectories),
+IMPORTANT: --maildir-path must point to a maildir root directory (containing cur/ or new/ subdirectories),
 not to a parent directory containing multiple maildirs.
 
 The --incremental flag controls whether to use the SQLite cache to skip already-imported messages:
@@ -119,7 +121,7 @@ Examples:
   # Import from specific paths file
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --paths-file failed_paths.txt
 
-  # Import with cleanup (removes SQLite database after completion)
+  # Import with cleanup (removes the SQLite database after a successful import)
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --cleanup-db
 
   # Import from Dovecot with subscriptions and custom keywords
@@ -148,6 +150,16 @@ Examples:
 	if *maildirPath == "" {
 		fmt.Printf("Error: --maildir-path is required\n\n")
 		fs.Usage()
+		os.Exit(1)
+	}
+
+	if *jobs < 1 {
+		fmt.Printf("Error: --jobs must be at least 1\n")
+		os.Exit(1)
+	}
+
+	if *batchSize < 1 {
+		fmt.Printf("Error: --batch-size must be at least 1\n")
 		os.Exit(1)
 	}
 
@@ -207,7 +219,7 @@ Examples:
 		if err != nil {
 			logger.Fatalf("Failed to parse S3 timeout: %v", err)
 		}
-		s3, err = storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout)
+		s3, err = storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout, storage.WithRegion(globalConfig.S3.Region))
 		if err != nil {
 			logger.Fatalf("Failed to connect to S3: %v", err)
 		}
@@ -238,6 +250,7 @@ Examples:
 		MaxMessageSize:       globalConfig.GetImportMessageLimit(),
 		PathsFile:            *pathsFile,
 		FTSRetention:         ftsRetentionParsed,
+		SharedMailboxes:      globalConfig.SharedMailboxes,
 	}
 
 	importer, err := NewImporter(ctx, *maildirPath, *email, *jobs, rdb, s3, options)
@@ -261,7 +274,7 @@ func handleImportS3(ctx context.Context) {
 	maxObjects := fs.Int("max-objects", 0, "Maximum number of objects to process (0 = unlimited)")
 	workers := fs.Int("workers", 5, "Number of concurrent workers")
 	dryRun := fs.Bool("dry-run", false, "Show what would be imported without making changes")
-	forceReimport := fs.Bool("force-reimport", false, "Force reimport even if message already exists")
+	forceReimport := fs.Bool("force-reimport", false, "Import into INBOX even when another mailbox of the account holds the message")
 	cleanupDB := fs.Bool("cleanup-db", true, "Cleanup temporary database when done")
 	importDelay := fs.Duration("import-delay", 0, "Delay between imports to control rate")
 	continuationToken := fs.String("continuation-token", "", "S3 continuation token to resume from")
@@ -276,6 +289,9 @@ func handleImportS3(ctx context.Context) {
 	// Validate required flags
 	if *email == "" {
 		logger.Fatal("--email is required (e.g., 'user@example.com')")
+	}
+	if *workers < 1 {
+		logger.Fatal("--workers must be at least 1")
 	}
 	ftsRetentionParsed, err := resolveImportFTSRetention(*ftsRetention)
 	if err != nil {
@@ -294,7 +310,7 @@ func handleImportS3(ctx context.Context) {
 	if err != nil {
 		logger.Fatalf("Failed to parse S3 timeout: %v", err)
 	}
-	s3, err := storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout)
+	s3, err := storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout, storage.WithRegion(globalConfig.S3.Region))
 	if err != nil {
 		logger.Fatalf("Failed to connect to S3: %v", err)
 	}
@@ -321,7 +337,7 @@ func handleImportS3(ctx context.Context) {
 		FTSRetention: ftsRetentionParsed,
 	}
 
-	importer, err := NewS3Importer(rdb, s3, options)
+	importer, err := NewS3Importer(ctx, rdb, s3, options)
 	if err != nil {
 		logger.Fatalf("Failed to create S3 importer: %v", err)
 	}
@@ -387,9 +403,10 @@ Options:
   --end-date string       Export only messages before this date (YYYY-MM-DD)
   --config string        Path to TOML configuration file (required)
 
-The exporter creates a SQLite database (sora-export.db) in the maildir path to track
-exported messages and avoid duplicates. If exporting to an existing maildir, messages
-with the same content hash will be skipped unless --overwrite-flags is specified.
+The exporter keeps a SQLite database (sora-maildir.db, the same file import maildir uses)
+in the maildir path to track exported messages and avoid duplicates. If exporting to an
+existing maildir, messages with the same content hash will be skipped unless
+--overwrite-flags is specified.
 
 Examples:
   # Export all mail to a new maildir
@@ -424,6 +441,11 @@ Examples:
 	if *maildirPath == "" {
 		fmt.Printf("Error: --maildir-path is required\n\n")
 		fs.Usage()
+		os.Exit(1)
+	}
+
+	if *jobs < 1 {
+		fmt.Printf("Error: --jobs must be at least 1\n")
 		os.Exit(1)
 	}
 
@@ -469,7 +491,7 @@ Examples:
 	if err != nil {
 		logger.Fatalf("Failed to parse S3 timeout: %v", err)
 	}
-	s3, err := storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout)
+	s3, err := storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout, storage.WithRegion(globalConfig.S3.Region))
 	if err != nil {
 		logger.Fatalf("Failed to connect to S3: %v", err)
 	}
@@ -514,7 +536,7 @@ Usage:
 Subcommands:
   maildir        Import maildir data
   s3             Import messages from S3 storage (recovery scenario)
-  fix-subscriptions  Fix subscription status for default mailboxes
+  rekey          Re-key bodies an older import stored under their SHA-256 digest
 
 Examples:
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir
@@ -522,6 +544,7 @@ Examples:
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot
   sora-admin import s3 --email user@example.com --dry-run
   sora-admin import s3 --email user@example.com --workers 5 --batch-size 500
+  sora-admin import rekey --email user@example.com --dry-run
 
 Use 'sora-admin import <subcommand> --help' for detailed help.
 `)

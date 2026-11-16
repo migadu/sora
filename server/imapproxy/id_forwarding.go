@@ -1,6 +1,7 @@
 package imapproxy
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -9,12 +10,18 @@ import (
 	"github.com/migadu/sora/server"
 )
 
+// errIDRefused is the backend refusing the forwarded ID with a tagged NO or BAD. Its
+// tagged reply was read, so the stream is at a command boundary and the login can go on
+// without the forwarding parameters. Any other error of the exchange leaves the reply
+// unread, or partly read, and the connection unusable.
+var errIDRefused = errors.New("backend rejected ID command")
+
 // sendForwardingParametersToBackend sends an ID command to the backend server
 // with forwarding parameters containing the real client information
 func (s *Session) sendForwardingParametersToBackend() error {
-	// Create forwarding parameters using the helper function.
-	// The session does not have proxyInfo, so we pass nil.
-	forwardingParams := server.NewForwardingParams(s.clientConn, nil)
+	// Create forwarding parameters using the helper function. With a PROXY header the
+	// client is its source address, not the socket peer (the load balancer).
+	forwardingParams := server.NewForwardingParams(s.clientConn, s.proxyInfo)
 
 	// Add proxy-specific information. The session id is generated once at session
 	// construction and reused here so the proxy's logs (session=<id>) and the
@@ -54,8 +61,9 @@ func (s *Session) sendForwardingParametersToBackend() error {
 		fields = append(fields, fmt.Sprintf(`"%s" "%s"`, escapeIMAPString(key), escapeIMAPString(value)))
 	}
 
-	// Generate a random tag to avoid conflicts with client tags
-	tag := fmt.Sprintf("p%d", rand.Intn(10000))
+	// Generate a random tag to avoid conflicts with client tags. Its prefix differs from
+	// the AUTHENTICATE tag's, so the two replies can never be taken for each other.
+	tag := fmt.Sprintf("i%d", rand.Intn(10000))
 	idCommand := fmt.Sprintf("%s ID (%s)\r\n", tag, strings.Join(fields, " "))
 
 	// Send ID command to backend
@@ -80,27 +88,42 @@ func (s *Session) sendForwardingParametersToBackend() error {
 		}
 	}()
 
-	// Read backend response (we expect "* ID (...)" followed by "A002 OK")
+	// Read backend response (we expect "* ID (...)" followed by the tagged OK). The tagged
+	// reply ends the exchange whatever its status (RFC 9051 section 2.2.2). The read is
+	// bounded like every other backend read: RFC 2971 section 3.3 keeps a
+	// well-formed ID response far below 64 KiB (at most 30 pairs of a field of up to 30
+	// octets and a value of up to 1024).
+	warnedTooLong := false
 	for {
-		response, err := s.backendReader.ReadString('\n')
+		response, err := server.ReadBoundedLine(s.backendReader, 65536)
+		if errors.Is(err, server.ErrLineTooLong) {
+			// ReadBoundedLine drained the line. Read on to the tagged reply: only it
+			// tells a refusal, after which the login goes on, from an exchange left
+			// unfinished, which fails the backend leg.
+			if !warnedTooLong {
+				s.WarnLog("skipping oversized line in backend ID response", "backend", s.serverAddr)
+				warnedTooLong = true
+			}
+			continue
+		}
 		if err != nil {
-			return fmt.Errorf("failed to read ID response: %v", err)
+			return fmt.Errorf("failed to read ID response: %w", err)
 		}
 
 		response = strings.TrimRight(response, "\r\n")
 
-		if strings.HasPrefix(response, "* ID") {
-			// Backend sent ID response, continue reading
+		responseTag, ok := statusOK(response)
+		if responseTag != tag {
+			// The backend's own "* ID (...)", or other data before the tagged reply
 			s.DebugLog("backend ID response", "response", response)
-		} else if strings.HasPrefix(response, tag+" OK") {
-			s.DebugLog("ID forwarding completed successfully")
-			break
-		} else if strings.HasPrefix(response, tag+" NO") || strings.HasPrefix(response, tag+" BAD") {
-			return fmt.Errorf("backend rejected ID command: %s", response)
+			continue
 		}
+		if !ok {
+			return fmt.Errorf("%w: %s", errIDRefused, response)
+		}
+		s.DebugLog("ID forwarding completed successfully")
+		return nil
 	}
-
-	return nil
 }
 
 // escapeIMAPString escapes characters that have special meaning in IMAP strings.

@@ -38,12 +38,17 @@ import (
 
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/pkg/sqlitefile"
 	_ "modernc.org/sqlite"
 )
 
 var (
 	// ErrCacheMiss indicates the requested entry was not found in cache.
 	ErrCacheMiss = errors.New("auth cache miss")
+
+	// errNotAFile refuses an in-memory or temporary database. It is not corruption:
+	// deleting the files named after the path and opening it again cannot help.
+	errNotAFile = errors.New("an in-memory or temporary database does not persist")
 )
 
 // Cache provides persistent authentication cache using SQLite.
@@ -60,16 +65,29 @@ type Cache struct {
 	// Protects write operations to SQLite (reads are concurrent via WAL)
 	mu sync.Mutex
 
-	// Tracks pending async goroutines (e.g., last_used updates)
-	wg sync.WaitGroup
+	// Tracks pending async goroutines (e.g., last_used updates). They
+	// register under closeMu and only until closed is set, so that none
+	// starts once Close has begun (see goAsync).
+	closeMu sync.Mutex
+	closed  bool
+	wg      sync.WaitGroup
 }
 
-// New creates a new authentication cache backed by a SQLite database at dbPath.
-// If the existing database is corrupted, it is automatically deleted and recreated.
+// New creates a new authentication cache backed by a SQLite database at dbPath, a file
+// path or a file: URI (sqlitefile.Parse).
+// If the existing database is corrupted, it is deleted and recreated only when
+// the URI mode permits creating files (the default or mode=rwc).
 // The cache is strictly optional — callers should handle errors gracefully and
 // continue without caching rather than crashing.
 func New(dbPath string, maxAge, purgeUnused, cleanupInterval time.Duration) (*Cache, error) {
-	sqliteDB, err := openAndValidate(dbPath)
+	file, query, err := sqlitefile.Parse(dbPath)
+	if err == nil && file == "" {
+		err = fmt.Errorf("%q is not a file: %w", dbPath, errNotAFile)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to open auth cache db: %w", err)
+	}
+	sqliteDB, err := openAndValidate(file, query)
 	if err != nil {
 		if !isCorruptionError(err) {
 			// Not corruption (e.g. permission denied, missing directory,
@@ -78,12 +96,15 @@ func New(dbPath string, maxAge, purgeUnused, cleanupInterval time.Duration) (*Ca
 			// real error so the operator can fix the path/permissions.
 			return nil, fmt.Errorf("failed to open auth cache db: %w", err)
 		}
+		if create, _ := sqlitefile.CanCreate(query); !create {
+			return nil, fmt.Errorf("cannot recreate corrupt auth cache with a no-create URI mode: %w", err)
+		}
 		// Database is genuinely corrupted — delete and recreate.
 		logger.Warn("AuthCache: Database appears corrupted, recreating", "path", dbPath, "error", err)
-		if removeErr := removeDBFiles(dbPath); removeErr != nil {
+		if removeErr := removeDBFiles(file); removeErr != nil {
 			return nil, fmt.Errorf("failed to remove corrupted auth cache db: %w", removeErr)
 		}
-		sqliteDB, err = openAndValidate(dbPath)
+		sqliteDB, err = openAndValidate(file, query)
 		if err != nil {
 			return nil, fmt.Errorf("failed to recreate auth cache db: %w", err)
 		}
@@ -106,8 +127,8 @@ func New(dbPath string, maxAge, purgeUnused, cleanupInterval time.Duration) (*Ca
 // and read-only errors must be surfaced so an operator can fix them rather than
 // being silently (and futilely) "recreated".
 func isCorruptionError(err error) bool {
-	// Filesystem/access problems are never corruption.
-	if errors.Is(err, fs.ErrPermission) || errors.Is(err, fs.ErrNotExist) {
+	// Filesystem/access problems, and a database that is not a file, are never corruption.
+	if errors.Is(err, fs.ErrPermission) || errors.Is(err, fs.ErrNotExist) || errors.Is(err, errNotAFile) {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
@@ -124,40 +145,53 @@ func isCorruptionError(err error) bool {
 	return false
 }
 
-// openAndValidate opens a SQLite database, sets pragmas, creates the schema,
-// and runs an integrity check. Returns an error if any step fails.
-func openAndValidate(dbPath string) (*sql.DB, error) {
-	if dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") {
-		// Ensure the database file has 0600 permissions.
-		// If the file does not exist, pre-create it with 0600 permissions.
-		f, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, 0600)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create or set permissions on database file: %w", err)
-		}
-		f.Close()
-		// If the file already exists, enforce 0600 permissions on it.
-		if err := os.Chmod(dbPath, 0600); err != nil {
-			return nil, fmt.Errorf("failed to enforce 0600 permissions on database file: %w", err)
-		}
+// connParams are the settings of each SQLite connection: a locked database is waited for
+// up to 5 seconds, and commits sync at NORMAL, which WAL mode is safe from corruption
+// with. They go in the DSN, which the driver applies to every connection the *sql.DB pool
+// opens; a PRAGMA run with Exec on the pool sets them on one pooled connection only.
+const connParams = "_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
+
+// openAndValidate opens the SQLite database file at path, 0600, with the URI query
+// params (empty for none), sets pragmas, creates the schema, and runs an integrity
+// check. Returns an error if any step fails.
+func openAndValidate(path, params string) (*sql.DB, error) {
+	if err := sqlitefile.Prepare(path, params); err != nil {
+		return nil, err
+	}
+	// Open that same file: a plain path would be cut at its first '?'.
+	if params != "" {
+		params += "&"
+	}
+	dsn, err := sqlitefile.DSN(path, params+connParams)
+	if err != nil {
+		return nil, err
 	}
 
-	sqliteDB, err := sql.Open("sqlite", dbPath)
+	sqliteDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open: %w", err)
+	}
+
+	// The cache must be a database file. An in-memory or temporary database (":memory:",
+	// "file::memory:", mode=memory, vfs=memdb, an empty name), for which SQLite reports
+	// no file name, is private to the connection that opened it, or with a shared cache
+	// lasts only while a connection is open: the pool's other connections would have no
+	// schema and no rows, and none of it survives the restart the cache exists for. New
+	// refuses the names known to open one before creating anything; this catches the rest.
+	var file string
+	if err := sqliteDB.QueryRow(`SELECT file FROM pragma_database_list WHERE name = 'main'`).Scan(&file); err != nil {
+		sqliteDB.Close()
+		return nil, fmt.Errorf("failed to read database file name: %w", err)
+	}
+	if file == "" {
+		sqliteDB.Close()
+		return nil, fmt.Errorf("%q is not a file: %w", path, errNotAFile)
 	}
 
 	// Set pragmas for performance
 	if _, err := sqliteDB.Exec(`PRAGMA journal_mode = WAL`); err != nil {
 		sqliteDB.Close()
 		return nil, fmt.Errorf("failed to set WAL mode: %w", err)
-	}
-	if _, err := sqliteDB.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
-		sqliteDB.Close()
-		return nil, fmt.Errorf("failed to set busy_timeout: %w", err)
-	}
-	if _, err := sqliteDB.Exec(`PRAGMA synchronous = NORMAL`); err != nil {
-		sqliteDB.Close()
-		return nil, fmt.Errorf("failed to set synchronous mode: %w", err)
 	}
 
 	// Create schema
@@ -225,11 +259,10 @@ func (c *Cache) Get(ctx context.Context, address string) (accountID int64, hashe
 		return 0, "", fmt.Errorf("auth cache query error: %w", err)
 	}
 
-	// Update last_used and hit_count asynchronously
+	// Update last_used and hit_count asynchronously (skipped once Close has
+	// begun; the lookup still answers).
 	now := time.Now().Unix()
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
+	c.goAsync(func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if _, err := c.db.Exec(`
@@ -239,7 +272,7 @@ func (c *Cache) Get(ctx context.Context, address string) (accountID int64, hashe
 		`, now, address); err != nil {
 			logger.Warn("AuthCache: Failed to update last_used", "address", address, "error", err)
 		}
-	}()
+	})
 
 	c.hits.Add(1)
 	metrics.AuthCacheOperations.WithLabelValues("hit").Inc()
@@ -382,8 +415,29 @@ func (c *Cache) Stats(ctx context.Context) (totalEntries, lifetimeHits int64, hi
 	return
 }
 
-// Close waits for pending async operations and closes the underlying SQLite database.
+// goAsync runs f in a new goroutine that Close waits for, or not at all once
+// Close has begun. Registering under closeMu orders every wg.Add before
+// Close's wg.Wait, as sync.WaitGroup requires, so no update can start after
+// the wait and reach the closed database.
+func (c *Cache) goAsync(f func()) {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+	if c.closed {
+		return
+	}
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		f()
+	}()
+}
+
+// Close stops starting async operations, waits for the pending ones and
+// closes the underlying SQLite database.
 func (c *Cache) Close() error {
+	c.closeMu.Lock()
+	c.closed = true
+	c.closeMu.Unlock()
 	c.wg.Wait() // Wait for pending async goroutines (last_used updates)
 	if c.db != nil {
 		return c.db.Close()

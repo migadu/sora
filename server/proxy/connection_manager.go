@@ -1065,19 +1065,9 @@ func (cm *ConnectionManager) RecordRemoteLookupFailure(backend string) bool {
 	return false
 }
 
-// AuthenticateAndRoute delegates to the routing lookup if available
-func (cm *ConnectionManager) AuthenticateAndRoute(ctx context.Context, email, password string) (*UserRoutingInfo, AuthResult, error) {
-	return cm.AuthenticateAndRouteWithOptions(ctx, email, password, false)
-}
-
-// AuthenticateAndRouteWithOptions performs authentication and routing with additional options
-// routeOnly: if true, skip password validation and only return routing info (for master username auth)
-func (cm *ConnectionManager) AuthenticateAndRouteWithOptions(ctx context.Context, email, password string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
-	return cm.AuthenticateAndRouteWithClientIP(ctx, email, password, "", routeOnly)
-}
-
 // AuthenticateAndRouteWithClientIP performs authentication and routing with client IP and additional options
-// clientIP: client IP address to include in remotelookup URL (supports $ip placeholder)
+// clientIP: the real client's IP (the PROXY header source when there is one), the
+// remotelookup URL's $ip placeholder
 // routeOnly: if true, skip password validation and only return routing info (for master username auth)
 func (cm *ConnectionManager) AuthenticateAndRouteWithClientIP(ctx context.Context, email, password, clientIP string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
 	if cm.routingLookup == nil {
@@ -1159,7 +1149,7 @@ func loadCAFile(path string) (*x509.CertPool, error) {
 //   - the hardening of backendTLSConfig, verifying certificates when verify is set;
 //   - the roots: a member of a named pool is verified against its pool's remote_tls_ca_file
 //     (the system roots without one): a certificate belongs to the host, however routing
-//     reached it. Any other backend uses the server's remote_tls_ca_file (POP3) or the
+//     reached it. Any other backend uses the server's remote_tls_ca_file or the
 //     system roots;
 //   - the name: a pool or remote_addrs entry configured by hostname is dialed at an address
 //     the name resolved to, but the certificate is issued for the name. ServerName (SNI) is
@@ -1293,6 +1283,10 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 	}
 	cm.refreshResolvedAddrsIfStale()
 
+	// failedPreferred is the preferred backend whose dial just failed. The round-robin
+	// fallback does not dial it again: that would count one failed attempt twice
+	// against its health, and spend a second connect timeout on a dead backend.
+	var failedPreferred string
 	if preferredAddr != "" {
 		if err := cm.backendPoolError(preferredAddr); err != nil {
 			return nil, "", err
@@ -1301,6 +1295,9 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 		if !fallback {
 			// If no fallback is needed, we either succeeded or had a hard failure.
 			return conn, addr, err
+		}
+		if err != nil {
+			failedPreferred = preferredAddr
 		}
 		// If fallback is true, the connection failed but we should proceed to round-robin.
 		// The error from tryPreferredAddress is logged but not returned to the client yet.
@@ -1338,6 +1335,10 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 			continue
 		}
 
+		if addr == failedPreferred {
+			continue
+		}
+
 		// Skip unhealthy backends
 		if !cm.IsBackendHealthy(addr) {
 			continue
@@ -1360,16 +1361,15 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 			return nil, "", err
 		}
 
-		// Record failure in health tracking only if the caller's context is still live.
-		// ctx.Err() is the only usable discriminator: a dial that exhausted its own
-		// connect_timeout — the black-holed backend case — also reports as
-		// context.DeadlineExceeded, so the error identity cannot tell a dead backend
-		// apart from a caller-side timeout or cancellation (slow remote_lookup consuming
-		// the deadline, client disconnect, global timeout).
-		if ctx.Err() == nil {
+		// Record failure in health tracking only if the backend exhausted its own
+		// connect_timeout or the caller still had time left: a slow remote_lookup
+		// consuming the deadline, a client disconnect or a global timeout that cut
+		// the dial short is not the backend's failure. See shouldIgnoreDialFailure.
+		callerDone := shouldIgnoreDialFailure(ctx, err)
+		if !callerDone {
 			cm.RecordConnectionFailure(addr)
 		}
-		logger.Warn("Failed to connect to backend (round-robin)", "addr", addr, "error", err, "ctx_err", ctx.Err(), "server", cm.serverName)
+		logger.Warn("Failed to connect to backend (round-robin)", "addr", addr, "error", err, "ctx_err", ctx.Err(), "caller_done", callerDone, "server", cm.serverName)
 	}
 
 	if inMaintenance > 0 && inMaintenance == len(currentRemoteAddrs) {
@@ -1378,6 +1378,57 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 		return nil, "", fmt.Errorf("all remote servers are in maintenance")
 	}
 	return nil, "", fmt.Errorf("all remote servers are unavailable")
+}
+
+// backendConnectTimeoutError wraps a TCP dial or implicit-TLS handshake error when
+// that phase ran for at least cm.connectTimeout without explicit caller cancellation
+// (context.Canceled). Even if the caller's overall deadline also elapsed while the
+// goroutine was waking up, the backend received its full connect_timeout and failed
+// to respond, so its failure counts against backend health.
+type backendConnectTimeoutError struct {
+	err error
+}
+
+func (e *backendConnectTimeoutError) Error() string { return e.err.Error() }
+func (e *backendConnectTimeoutError) Unwrap() error { return e.err }
+
+func (cm *ConnectionManager) phaseExhaustedConnectTimeout(ctx context.Context, phaseStart time.Time) bool {
+	if cm.connectTimeout <= 0 || time.Since(phaseStart) < cm.connectTimeout ||
+		errors.Is(ctx.Err(), context.Canceled) {
+		return false
+	}
+	// The process may resume after both timers expired. Time spent waiting to
+	// be scheduled does not give the backend a full phase when the caller's
+	// earlier deadline cut it short.
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(phaseStart.Add(cm.connectTimeout)) {
+		return false
+	}
+	return true
+}
+
+func shouldIgnoreDialFailure(ctx context.Context, err error) bool {
+	var backendTimeout *backendConnectTimeoutError
+	if errors.As(err, &backendTimeout) {
+		return false
+	}
+	return callerGaveUp(ctx)
+}
+
+// callerGaveUp reports whether a failed backend dial is down to the caller rather than
+// the backend: ctx was canceled or its deadline has passed. Such a failure says nothing
+// about the backend and must not count against its health.
+//
+// ctx.Err() alone lags the deadline: it is set only once the context's timer has run,
+// while net.Dialer reads ctx.Deadline() itself and refuses a dial whose budget is spent
+// with an i/o timeout before then. The returned error cannot decide it either: a dial
+// that exhausted its own connect_timeout (a black-holed backend) is a timeout too, and
+// that one is the backend's failure while the caller still has time left.
+func callerGaveUp(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	deadline, ok := ctx.Deadline()
+	return ok && !time.Now().Before(deadline)
 }
 
 // tryPreferredAddress attempts to connect to a preferred address (from affinity or remotelookup).
@@ -1453,22 +1504,21 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 		return conn, preferredAddr, nil, false // No fallback
 	}
 
-	// Connection failed. Mark it as unhealthy if it's in our managed list.
+	// Connection failed. Mark it as unhealthy if it's in our managed list, unless the
+	// caller cut the dial short before connect_timeout elapsed (shouldIgnoreDialFailure).
 	if isInList {
-		// Only record failure if the caller's context is still live. Same discriminator as
-		// the round-robin path: a dial that exhausted its own connect_timeout reports as
-		// context.DeadlineExceeded even though ctx never expired, so only ctx.Err() tells a
-		// dead backend apart from a caller-side timeout or cancellation.
-		if ctx.Err() == nil {
+		callerDone := shouldIgnoreDialFailure(ctx, err)
+		if !callerDone {
 			cm.RecordConnectionFailure(preferredAddr)
 		}
-		logger.Warn("Failed to connect to preferred backend", "addr", preferredAddr, "error", err, "is_remotelookup", isRemoteLookupRoute, "ctx_err", ctx.Err(), "server", cm.serverName)
+		logger.Warn("Failed to connect to preferred backend", "addr", preferredAddr, "error", err, "is_remotelookup", isRemoteLookupRoute, "ctx_err", ctx.Err(), "caller_done", callerDone, "server", cm.serverName)
 	} else if isRemoteLookupRoute {
-		// Track remote lookup backend failure (not in pool), same discriminator as above.
-		if ctx.Err() == nil {
+		// Track remote lookup backend failure (not in pool), same rule as above.
+		callerDone := shouldIgnoreDialFailure(ctx, err)
+		if !callerDone {
 			cm.RecordRemoteLookupFailure(preferredAddr)
 		}
-		logger.Warn("Failed to connect to remote lookup backend (not in pool)", "addr", preferredAddr, "error", err, "ctx_err", ctx.Err(), "server", cm.serverName)
+		logger.Warn("Failed to connect to remote lookup backend (not in pool)", "addr", preferredAddr, "error", err, "ctx_err", ctx.Err(), "caller_done", callerDone, "server", cm.serverName)
 	}
 
 	if isRemoteLookupRoute {
@@ -1778,7 +1828,8 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 		// Verified by the backend's configured name (or its address), not by the formatted
 		// dial target alone; see BackendClientTLS.
 		tlsConfig := cm.BackendClientTLS(cm.remoteTLSVerify, addr)
-		conn, err = tls.DialWithDialer(dialer, "tcp", resolvedAddr, tlsConfig)
+		tlsDialer := &tls.Dialer{NetDialer: dialer, Config: tlsConfig}
+		conn, err = tlsDialer.DialContext(ctx, "tcp", resolvedAddr)
 	} else {
 		// Plain connection (either no TLS, or TLS will be negotiated via StartTLS)
 		conn, err = dialer.DialContext(ctx, "tcp", resolvedAddr)
@@ -1838,9 +1889,14 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	logger.Debug("Attempting to connect to backend", "addr", resolvedAddr)
 
 	// Always establish plain TCP connection first
+	callerAlreadyDone := callerGaveUp(ctx)
+	tcpStart := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", resolvedAddr)
 	if err != nil {
 		logger.Warn("ConnectionManager: TCP dial failed", "addr", resolvedAddr, "original_addr", addr, "error", err, "server", cm.serverName)
+		if !callerAlreadyDone && cm.phaseExhaustedConnectTimeout(ctx, tcpStart) {
+			return nil, &backendConnectTimeoutError{err: err}
+		}
 		return nil, err
 	}
 
@@ -1899,28 +1955,35 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	// Now establish TLS if required (only for implicit TLS, not StartTLS)
 	// When StartTLS is enabled, the protocol layer will handle TLS upgrade
 	if remoteTLS && !remoteTLSUseStartTLS {
+		if callerGaveUp(ctx) {
+			conn.Close()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("TLS handshake failed: %w", ctxErr)
+			}
+			return nil, fmt.Errorf("TLS handshake failed: %w", context.DeadlineExceeded)
+		}
+
 		tlsConfig := route.TLSConfig(remoteTLSVerify, conn)
 		logger.Debug("Starting TLS handshake", "addr", addr, "InsecureSkipVerify", !remoteTLSVerify, "server_name", tlsConfig.ServerName)
 		tlsConn := tls.Client(conn, tlsConfig)
 
-		// Set a deadline for the TLS handshake
-		if err := conn.SetDeadline(time.Now().Add(cm.connectTimeout)); err != nil {
-			conn.Close()
-			logger.Debug("ConnectionManager: Failed to set TLS handshake deadline", "addr", addr, "error", err)
-			return nil, fmt.Errorf("failed to set TLS deadline: %w", err)
+		handshakeCtx := ctx
+		if cm.connectTimeout > 0 {
+			var cancel context.CancelFunc
+			handshakeCtx, cancel = context.WithTimeout(ctx, cm.connectTimeout)
+			defer cancel()
 		}
 
-		err = tlsConn.Handshake()
+		tlsStart := time.Now()
+		err = tlsConn.HandshakeContext(handshakeCtx)
 		if err != nil {
 			conn.Close()
-			logger.Debug("ConnectionManager: TLS handshake failed", "addr", addr, "error", err)
-			logger.Debug("ConnectionManager: TLS handshake was using InsecureSkipVerify=%t, no client certificates", !remoteTLSVerify)
-			return nil, fmt.Errorf("TLS handshake failed: %w", err)
-		}
-
-		// Clear the deadline after successful handshake
-		if err := conn.SetDeadline(time.Time{}); err != nil {
-			logger.Debug("ConnectionManager: Warning: failed to clear TLS deadline", "addr", addr, "error", err)
+			logger.Debug("ConnectionManager: TLS handshake failed", "addr", addr, "error", err, "verify", remoteTLSVerify)
+			wrapped := fmt.Errorf("TLS handshake failed: %w", err)
+			if cm.phaseExhaustedConnectTimeout(ctx, tlsStart) {
+				return nil, &backendConnectTimeoutError{err: wrapped}
+			}
+			return nil, wrapped
 		}
 
 		return tlsConn, nil
@@ -2065,35 +2128,59 @@ func (cm *ConnectionManager) GetConnectTimeout() time.Duration {
 }
 
 const (
-	// maxConnectAttempts caps how many dials one ConnectWithProxy call is given budget
-	// for, so a broadly dead pool cannot stretch a single login to len(pool) x connect_timeout.
-	maxConnectAttempts = 3
+	// maxConnectAttempts caps how many per-attempt connect budgets one ConnectWithProxy
+	// call is given (up to three full backend attempts plus one attempt of slack/preferred
+	// headroom), so a broadly dead pool cannot stretch a single login to len(pool) x connect_timeout.
+	maxConnectAttempts = 4
 
 	// defaultConnectBudgetPerDial bounds a manager configured without a connect timeout,
 	// where net.Dialer imposes no per-dial limit of its own.
 	defaultConnectBudgetPerDial = 30 * time.Second
 )
 
+func (cm *ConnectionManager) hasImplicitTLS() bool {
+	if cm.remoteTLS && !cm.remoteTLSUseStartTLS {
+		return true
+	}
+	for _, p := range cm.pools {
+		if p.settings.TLS && !p.settings.TLSUseStartTLS {
+			return true
+		}
+	}
+	return false
+}
+
 // ConnectBudget returns the overall deadline a caller should put around one
-// ConnectWithProxy call. connect_timeout is a per-dial budget (net.Dialer.Timeout) and
-// ConnectWithProxy dials the preferred backend and then falls back through the pool, so a
-// deadline of one connect_timeout lets a black-holed backend spend the whole budget and
-// leaves every fallback dial to fail instantly on an already-expired context.
+// ConnectWithProxy call. connect_timeout is a per-phase budget (TCP dial and, when
+// implicit TLS is used, TLS handshake) and ConnectWithProxy dials the preferred backend
+// and then falls back through the pool, so a deadline of one connect_timeout lets a
+// black-holed backend spend the whole budget and leaves every fallback dial to fail
+// instantly on an already-expired context.
 func (cm *ConnectionManager) ConnectBudget() time.Duration {
-	perDial := cm.connectTimeout
-	if perDial <= 0 {
-		perDial = defaultConnectBudgetPerDial
+	perAttempt := cm.connectTimeout
+	if perAttempt <= 0 {
+		perAttempt = defaultConnectBudgetPerDial
+	}
+	if cm.hasImplicitTLS() {
+		perAttempt *= 2
 	}
 
 	cm.healthMu.RLock()
 	attempts := len(cm.remoteAddrs) + 1 // preferred dial plus one round-robin dial per backend
 	cm.healthMu.RUnlock()
 
-	if attempts > maxConnectAttempts {
-		attempts = maxConnectAttempts
+	maxBudget := perAttempt * maxConnectAttempts
+	if attempts >= maxConnectAttempts {
+		return maxBudget
 	}
 
-	return perDial * time.Duration(attempts)
+	// Add half an attempt of inter-dial scheduling/teardown slack so the final dial
+	// of a small pool is not cut off slightly before its own connect_timeout expires.
+	budget := perAttempt*time.Duration(attempts) + perAttempt/2
+	if budget > maxBudget {
+		return maxBudget
+	}
+	return budget
 }
 
 // HasRouting returns true if a user routing lookup is configured.
@@ -2102,18 +2189,25 @@ func (cm *ConnectionManager) HasRouting() bool {
 }
 
 // LookupUserRoute performs a user routing lookup if configured.
-// Note: This is routing-only lookup, so password is empty.
-func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email string) (*UserRoutingInfo, error) {
+// Note: This is routing-only lookup, so password is empty. clientIP is the real
+// client's IP, the remotelookup URL's $ip placeholder.
+//
+// A user the lookup does not know (404/3xx), the only answer lookup_local_users applies
+// to, is (nil, nil). An account it refused (401/403) is ErrRemoteLookupRefused.
+func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email, clientIP string) (*UserRoutingInfo, error) {
 	if !cm.HasRouting() || email == "" {
 		return nil, nil
 	}
 	// Use routeOnly=true for LMTP routing lookups (no authentication, only routing info needed)
-	info, authResult, err := cm.routingLookup.LookupUserRouteWithOptions(ctx, email, "", true)
+	info, authResult, err := cm.routingLookup.LookupUserRouteWithClientIP(ctx, email, "", clientIP, true)
 	if err != nil {
 		return nil, err
 	}
-	if authResult == AuthUserNotFound {
+	switch authResult {
+	case AuthUserNotFound:
 		return nil, nil
+	case AuthFailed:
+		return nil, ErrRemoteLookupRefused
 	}
 	return info, nil
 }
@@ -2122,6 +2216,7 @@ func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email string) 
 type RouteParams struct {
 	Ctx                   context.Context
 	Username              string
+	ClientIP              string // Real client IP (PROXY header source when present), the lookup's $ip
 	Protocol              string // "imap", "pop3", "managesieve", "lmtp"
 	IsRemoteLookupAccount bool
 	RoutingInfo           *UserRoutingInfo
@@ -2160,11 +2255,12 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 		lookupTimeout := cm.GetRemoteLookupTimeout()
 		routingCtx, routingCancel := context.WithTimeout(params.Ctx, lookupTimeout)
 		var lookupErr error
-		result.RoutingInfo, lookupErr = cm.LookupUserRoute(routingCtx, params.Username)
+		result.RoutingInfo, lookupErr = cm.LookupUserRoute(routingCtx, params.Username, params.ClientIP)
 		routingCancel()
 		if lookupErr != nil && cm.HasNamedPools() {
-			// No answer is no pool: routing on would put the user in the default pool,
-			// where the account need not live, and drop their affinity in the real one.
+			// No answer, or a refusal of the account (ErrRemoteLookupRefused), is no pool:
+			// routing on would put the user in the default pool, where the account need
+			// not live, and drop their affinity in the real one.
 			logger.Warn("Routing lookup failed - refusing to route without a pool", "proxy", params.ProxyName, "user", params.Username, "error", lookupErr)
 			return result, fmt.Errorf("%w: %w", ErrRouteLookupFailed, lookupErr)
 		}

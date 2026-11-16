@@ -4,6 +4,7 @@ package imap_test
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -278,5 +279,111 @@ func TestIMAP_ListStatus(t *testing.T) {
 		// However, some servers might return more than requested? RFC 5819 says "The STATUS response ... MUST include ... specified data items".
 		// It doesn't strictly forbid others but usually minimal.
 		t.Logf("UIDValidity present: %d (was not requested)", inbox.Status.UIDValidity)
+	}
+}
+
+// TestIMAP_ListStatusLookupOnlySharedMailboxIsNoSelect verifies RFC 5819 §2 /
+// RFC 9051 §6.3.9.2: "If an attempted STATUS for a listed mailbox fails
+// because the mailbox can't be selected (e.g., if the "l" ACL right [ACL] is
+// granted to the mailbox and the "r" right is not granted ...), the STATUS
+// response MUST NOT be returned and the LIST response MUST include the
+// \NoSelect attribute." A shared mailbox granted "lr" in the same LIST keeps
+// its STATUS response and is not marked \NoSelect.
+func TestIMAP_ListStatusLookupOnlySharedMailboxIsNoSelect(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, owner := common.SetupIMAPServer(t)
+	defer server.Close()
+	user := common.CreateTestAccountWithEmail(t, server.ResilientDB,
+		fmt.Sprintf("lookup-only-%d@example.com", common.GetTimestamp()), "password2")
+
+	ts := common.GetTimestamp()
+	lookupOnly := fmt.Sprintf("Shared/LookupOnly-%d", ts)
+	readable := fmt.Sprintf("Shared/Readable-%d", ts)
+
+	oc, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer oc.Logout()
+	if err := oc.Login(owner.Email, owner.Password).Wait(); err != nil {
+		t.Fatalf("Owner login failed: %v", err)
+	}
+	for name, rights := range map[string]string{lookupOnly: "l", readable: "lr"} {
+		if err := oc.Create(name, nil).Wait(); err != nil {
+			t.Fatalf("CREATE %s failed: %v", name, err)
+		}
+		if err := oc.SetACL(name, imap.RightsIdentifier(user.Email), imap.RightModificationReplace, imap.RightSet(rights)).Wait(); err != nil {
+			t.Fatalf("SETACL %s %s failed: %v", name, rights, err)
+		}
+	}
+
+	uc, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer uc.Logout()
+	if err := uc.Login(user.Email, user.Password).Wait(); err != nil {
+		t.Fatalf("User login failed: %v", err)
+	}
+	for _, name := range []string{lookupOnly, readable} {
+		if err := uc.Subscribe(name).Wait(); err != nil {
+			t.Fatalf("SUBSCRIBE %s failed: %v", name, err)
+		}
+	}
+
+	hasNoSelect := func(d *imap.ListData) bool {
+		for _, a := range d.Attrs {
+			if strings.EqualFold(string(a), string(imap.MailboxAttrNoSelect)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, tc := range []struct {
+		name    string
+		options *imap.ListOptions
+	}{
+		{"LIST RETURN (STATUS)", &imap.ListOptions{
+			ReturnStatus: &imap.StatusOptions{NumMessages: true},
+		}},
+		{"LIST (SUBSCRIBED) RETURN (STATUS)", &imap.ListOptions{
+			SelectSubscribed: true,
+			ReturnStatus:     &imap.StatusOptions{NumMessages: true},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mboxes, err := uc.List("", "Shared/*", tc.options).Collect()
+			if err != nil {
+				t.Fatalf("LIST failed: %v", err)
+			}
+			byName := make(map[string]*imap.ListData, len(mboxes))
+			for _, m := range mboxes {
+				byName[m.Mailbox] = m
+			}
+
+			lo, ok := byName[lookupOnly]
+			if !ok {
+				t.Fatalf("%s not listed, got %d mailboxes", lookupOnly, len(mboxes))
+			}
+			if lo.Status != nil {
+				t.Errorf("%s (rights \"l\"): STATUS MUST NOT be returned, got %+v", lookupOnly, lo.Status)
+			}
+			if !hasNoSelect(lo) {
+				t.Errorf("%s (rights \"l\"): LIST MUST include \\Noselect, got attrs %v", lookupOnly, lo.Attrs)
+			}
+
+			rd, ok := byName[readable]
+			if !ok {
+				t.Fatalf("%s not listed, got %d mailboxes", readable, len(mboxes))
+			}
+			if rd.Status == nil {
+				t.Errorf("%s (rights \"lr\"): want STATUS, got none", readable)
+			}
+			if hasNoSelect(rd) {
+				t.Errorf("%s (rights \"lr\"): must not be \\Noselect, got attrs %v", readable, rd.Attrs)
+			}
+		})
 	}
 }

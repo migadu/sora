@@ -75,11 +75,14 @@ func ParseDuration(durationStr string) (time.Duration, error) {
 			return 0, fmt.Errorf("helpers.ParseDuration: invalid duration format, missing day value in '%s'", originalInput)
 		}
 
-		days, err := strconv.Atoi(daysPart)
+		days, err := strconv.ParseUint(daysPart, 10, 64)
 		if err == nil {
 			// Successfully parsed an integer number of days.
 			// This implies the input string was of the form "[<sign>]<number>d".
-			hours := days * 24
+			if days > uint64(math.MaxInt64/int64(24*time.Hour)) {
+				return 0, fmt.Errorf("helpers.ParseDuration: duration '%s' overflows time.Duration", originalInput)
+			}
+			hours := int64(days) * 24
 			if isNegative {
 				hours = -hours
 			}

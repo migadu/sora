@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,16 +17,18 @@ type MutexTimeoutHelper struct {
 	mutex *sync.RWMutex
 	ctx   context.Context
 	log   func(format string, args ...any)
-	name  string // Protocol name for logging
+	name  string // protocol label of the session lock metrics
 }
 
-// NewMutexTimeoutHelper creates a new helper for mutex timeout operations
+// NewMutexTimeoutHelper creates a new helper for mutex timeout operations. name is
+// the protocol ("imap", "pop3", ...); it labels the session lock metrics, lowercased
+// like the protocol label of the command, error and authentication metrics.
 func NewMutexTimeoutHelper(mutex *sync.RWMutex, ctx context.Context, name string, log func(format string, args ...any)) *MutexTimeoutHelper {
 	return &MutexTimeoutHelper{
 		mutex: mutex,
 		ctx:   ctx,
 		log:   log,
-		name:  name,
+		name:  strings.ToLower(name),
 	}
 }
 
@@ -59,11 +62,11 @@ func (h *MutexTimeoutHelper) AcquireReadLockWithTimeout(cmdCtx context.Context) 
 
 	select {
 	case <-lockChan:
-		metrics.MailboxLockDuration.WithLabelValues(h.name, "read", "success").Observe(time.Since(start).Seconds())
+		metrics.SessionLockDuration.WithLabelValues(h.name, "read", "success").Observe(time.Since(start).Seconds())
 		return true, h.mutex.RUnlock
 	case <-ctx.Done():
-		metrics.MailboxLockTimeouts.WithLabelValues(h.name, "read").Inc()
-		metrics.MailboxLockDuration.WithLabelValues(h.name, "read", "timeout").Observe(time.Since(start).Seconds())
+		metrics.SessionLockTimeouts.WithLabelValues(h.name, "read").Inc()
+		metrics.SessionLockDuration.WithLabelValues(h.name, "read", "timeout").Observe(time.Since(start).Seconds())
 		go func() {
 			// Wait for the lock attempt to complete to avoid leaking goroutines
 			<-lockChan
@@ -104,11 +107,11 @@ func (h *MutexTimeoutHelper) AcquireWriteLockWithTimeout(cmdCtx context.Context)
 
 	select {
 	case <-lockChan:
-		metrics.MailboxLockDuration.WithLabelValues(h.name, "write", "success").Observe(time.Since(start).Seconds())
+		metrics.SessionLockDuration.WithLabelValues(h.name, "write", "success").Observe(time.Since(start).Seconds())
 		return true, h.mutex.Unlock
 	case <-ctx.Done():
-		metrics.MailboxLockTimeouts.WithLabelValues(h.name, "write").Inc()
-		metrics.MailboxLockDuration.WithLabelValues(h.name, "write", "timeout").Observe(time.Since(start).Seconds())
+		metrics.SessionLockTimeouts.WithLabelValues(h.name, "write").Inc()
+		metrics.SessionLockDuration.WithLabelValues(h.name, "write", "timeout").Observe(time.Since(start).Seconds())
 		go func() {
 			// Wait for the lock attempt to complete to avoid leaking goroutines
 			<-lockChan

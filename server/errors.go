@@ -17,7 +17,8 @@ var (
 	// ErrServerShuttingDown indicates that authentication failed because the server is shutting down
 	ErrServerShuttingDown = errors.New("server is shutting down, please try again")
 
-	// ErrAuthServiceUnavailable indicates that an authentication service (e.g., remotelookup) is temporarily unavailable
+	// ErrAuthServiceUnavailable indicates that a service authentication depends on (the
+	// remote lookup, or the database holding the credentials) is temporarily unavailable
 	ErrAuthServiceUnavailable = errors.New("authentication service temporarily unavailable, please try again later")
 
 	// ErrUserNotFound indicates that the user was not found (permanent failure - 550)

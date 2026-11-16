@@ -235,6 +235,92 @@ func TestImporter_DryRunPreviewsTheImport(t *testing.T) {
 	}
 }
 
+// TestImporter_DovecotKeywordsPerFolder: the keyword letters in a maildir filename
+// index the dovecot-keywords file of that message's folder, and a folder without one
+// names none (Dovecot maildir-keywords.c clears the list on ENOENT). The dry-run
+// listing must show each message's flags as the import stores them, and neither may
+// read a folder's letters through INBOX's file at the maildir root.
+func TestImporter_DovecotKeywordsPerFolder(t *testing.T) {
+	rdb := setupTestDatabase(t)
+	defer rdb.Close()
+	ctx := context.Background()
+
+	const email = "keywords@example.com"
+	createSimpleTestAccount(t, rdb, email, "testpassword123")
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, email)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Every message carries keyword letter a (index 0), which INBOX's file names
+	// $Important, Work's file names Project, and Other has no file to name.
+	maildir := filepath.Join(t.TempDir(), "Maildir")
+	folders := []struct {
+		dir, mailbox, keywords, filename string
+		want                             []string
+	}{
+		{"", "INBOX", "0 $Important\n", "1700000001.M1P1.host", []string{`\Seen`, "$Important"}},
+		{".Work", "Work", "0 Project\n", "1700000002.M2P2.host", []string{`\Seen`, "Project"}},
+		{".Other", "Other", "", "1700000003.M3P3.host", []string{`\Seen`}},
+	}
+	for _, f := range folders {
+		path := filepath.Join(maildir, f.dir)
+		createMaildirFolder(t, path)
+		createMessagesInMaildir(t, path, []testMessage{{uid: 1, filename: f.filename, flags: "Sa",
+			subject: f.mailbox, from: "a@example.com", to: email, date: time.Now()}})
+		if f.keywords != "" {
+			if err := os.WriteFile(filepath.Join(path, "dovecot-keywords"), []byte(f.keywords), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	opts := ImporterOptions{Dovecot: true, PreserveFlags: true, TestMode: true, BatchSize: 10}
+	dryRun := opts
+	dryRun.DryRun = true
+	importer, err := NewImporter(ctx, maildir, email, 1, rdb, nil, dryRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	report := captureImporterStdout(t, func() { runErr = importer.Run() })
+	if runErr != nil {
+		t.Fatalf("dry run: %v", runErr)
+	}
+	for _, f := range folders {
+		want := fmt.Sprintf("Flags: %v", f.want)
+		_, entry, found := strings.Cut(report, "IMPORT "+f.filename)
+		entry, _, _ = strings.Cut(entry, "\n\n")
+		if !found || !strings.Contains(entry, want) {
+			t.Errorf("the dry run does not list the %s message with %q:\n%s", f.mailbox, want, report)
+		}
+	}
+
+	importer, err = NewImporter(ctx, maildir, email, 1, rdb, nil, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := importer.Run(); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	for _, f := range folders {
+		mailboxID, err := rdb.GetOwnedMailboxIDByNameWithRetry(ctx, accountID, f.mailbox)
+		if err != nil {
+			t.Fatalf("mailbox %s: %v", f.mailbox, err)
+		}
+		messages, err := rdb.ListMessagesWithRetry(ctx, mailboxID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(messages) != 1 {
+			t.Fatalf("%s has %d messages, want 1", f.mailbox, len(messages))
+		}
+		if got, want := fmt.Sprint(messages[0].CustomFlags), fmt.Sprint(f.want[1:]); got != want {
+			t.Errorf("the %s message was imported with keywords %s, want %s", f.mailbox, got, want)
+		}
+	}
+}
+
 // TestS3Importer_DryRunChangesNothing is TestImporter_DryRunChangesNothing for
 // `import s3 --dry-run`, whose analysis created the default mailboxes as well.
 func TestS3Importer_DryRunChangesNothing(t *testing.T) {
@@ -250,7 +336,7 @@ func TestS3Importer_DryRunChangesNothing(t *testing.T) {
 	}
 	before := accountMailboxState(t, rdb, accountID)
 
-	si, err := NewS3Importer(rdb, nil, S3ImporterOptions{Email: email, DryRun: true, CleanupDB: true})
+	si, err := NewS3Importer(ctx, rdb, nil, S3ImporterOptions{Email: email, DryRun: true, Workers: 1, CleanupDB: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,6 +347,9 @@ func TestS3Importer_DryRunChangesNothing(t *testing.T) {
 		VALUES (?, ?, ?, ?, ?, ?, ?)`, "example.com/dryrun-s3/"+hash, 100, "2026-11-01T12:00:00Z", "etag",
 		"example.com", "dryrun-s3", hash); err != nil {
 		t.Fatal(err)
+	}
+	if err := si.lookupAccount(); err != nil {
+		t.Fatalf("lookupAccount: %v", err)
 	}
 	if err := si.performDryRun(); err != nil {
 		t.Fatalf("dry run: %v", err)
@@ -293,4 +382,74 @@ func captureImporterStdout(t *testing.T, f func()) string {
 	}()
 	w.Close()
 	return <-out
+}
+
+// TestImporter_DryRunAfterAnImport: the dry run looks each mailbox up once, when the
+// (mailbox-ordered) rows reach it, and asks per message whether the import already
+// stored it in that mailbox. Re-run after an import, it reports what Sora holds as
+// SKIP and what is new as IMPORT, through every kind of switch between mailboxes: from
+// one Sora does not have yet to one it has (Clients to INBOX), back (INBOX to Notes),
+// and again (Notes to Work). Notes holds a copy of a message the import stored in
+// INBOX: it is new to Notes, so a lookup left over from INBOX would wrongly skip it.
+func TestImporter_DryRunAfterAnImport(t *testing.T) {
+	rdb := setupTestDatabase(t)
+	defer rdb.Close()
+	ctx := context.Background()
+
+	const email = "dryrun-rerun@example.com"
+	createSimpleTestAccount(t, rdb, email, "testpassword123")
+	message := func(n int) testMessage {
+		return testMessage{uid: uint32(n), filename: fmt.Sprintf("17000000%02d.M%dP1.host", n, n), flags: "S",
+			subject: fmt.Sprintf("message %d", n), from: "a@example.com", to: email,
+			date: time.Date(2026, 11, 1, 12, n, 0, 0, time.UTC)}
+	}
+
+	maildir := filepath.Join(t.TempDir(), "Maildir")
+	folder := func(dir string, msgs ...testMessage) {
+		path := filepath.Join(maildir, dir)
+		createMaildirFolder(t, path)
+		createMessagesInMaildir(t, path, msgs)
+	}
+	folder(".", message(1))
+	folder(".Work", message(2))
+	importer, err := NewImporter(ctx, maildir, email, 1, rdb, nil, ImporterOptions{TestMode: true, BatchSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := importer.Run(); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	// New since the import: a second INBOX message, and two folders Sora does not have.
+	folder(".", message(3))
+	folder(".Clients", message(4))
+	folder(".Notes", message(1))
+
+	importer, err = NewImporter(ctx, maildir, email, 1, rdb, nil, ImporterOptions{DryRun: true, TestMode: true, BatchSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	report := captureImporterStdout(t, func() { runErr = importer.Run() })
+	if runErr != nil {
+		t.Fatalf("dry run: %v\n%s", runErr, report)
+	}
+
+	for _, want := range []string{
+		"Mailbox: Clients\n   IMPORT " + message(4).filename,
+		"Mailbox: INBOX\n   IMPORT " + message(3).filename,
+		"   Summary: 1 would import, 1 would skip\n\nMailbox: Notes\n   IMPORT " + message(1).filename,
+		"Mailbox: Work\n   Summary: 0 would import, 1 would skip\n",
+		"Would import: 3 messages\nWould skip: 2 messages\n",
+	} {
+		if !strings.Contains(report, want) {
+			t.Errorf("the dry run report does not contain %q:\n%s", want, report)
+		}
+	}
+	if n := strings.Count(report, "IMPORT "+message(1).filename); n != 1 {
+		t.Errorf("the dry run reports %s %d times, want once (the copy in Notes):\n%s", message(1).filename, n, report)
+	}
+	if strings.Contains(report, message(2).filename) {
+		t.Errorf("the dry run reports %s, which the import already stored in Work:\n%s", message(2).filename, report)
+	}
 }

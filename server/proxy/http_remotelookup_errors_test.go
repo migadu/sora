@@ -150,6 +150,20 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 			description:      "200 with empty password_hash should return ErrRemoteLookupInvalidResponse",
 		},
 		{
+			name: "200_UnverifiableHashedPassword",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]any{
+					"address":       "user@example.com",
+					"password_hash": "{SHA512-CRYPT}$6$saltsaltsaltsalt$Uz0B733KLAcpeAFT5hlALRwUMzwqxSoBO9VG7Ph8v7auZDaXL8PutBQPqOVLMvwy0rORlpwlXHm83Z4uAhgLB0",
+					"server":        "backend:143",
+				})
+			},
+			expectAuthResult: AuthTemporarilyUnavailable,
+			expectErrorType:  ErrRemoteLookupInvalidResponse,
+			description:      "200 with a password_hash sora cannot verify says nothing about the password: an invalid answer, not a wrong password",
+		},
+		{
 			name: "200_MissingServerIP_AuthOnlyMode",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
@@ -277,6 +291,35 @@ func TestHTTPRemoteLookupNetworkError(t *testing.T) {
 	}
 
 	t.Logf("✓ Network error correctly returns AuthTemporarilyUnavailable with ErrRemoteLookupTransient: %v", err)
+}
+
+// TestHTTPRemoteLookupUnbuildableRequestIsUnavailable (#518): a lookup whose request
+// cannot be built gives no verdict on the user either. With $email in the host the
+// escaped address ("user%40example.com") is not a valid host, so every request fails
+// before it is sent. That was AuthFailed with an error the proxies did not classify,
+// and they fell back to the database. The startup check now rejects such a URL (#655);
+// this client is built without it.
+func TestHTTPRemoteLookupUnbuildableRequestIsUnavailable(t *testing.T) {
+	client := NewHTTPRemoteLookupClient(
+		"https://$email.lookup.example.com/lookup",
+		time.Second,
+		"",
+		143,
+		false, // remoteTLS
+		false, // remoteTLSUseStartTLS
+		false, // remoteTLSVerify
+		false, // remoteUseProxyProtocol
+		false, // remoteUseIDCommand
+		false, // remoteUseXCLIENT
+		false, // remoteUseUTF8
+		nil,   // circuit breaker settings (use defaults)
+		nil,   // transport settings (use defaults)
+	)
+
+	_, authResult, err := client.LookupUserRoute(context.Background(), "user@example.com", "secret")
+	if authResult != AuthTemporarilyUnavailable || !errors.Is(err, ErrRemoteLookupTransient) {
+		t.Fatalf("lookup with a request that cannot be built: %v, %v; want %v with ErrRemoteLookupTransient", authResult, err, AuthTemporarilyUnavailable)
+	}
 }
 
 // TestHTTPRemoteLookupCircuitBreaker verifies that circuit breaker open returns ErrRemoteLookupTransient

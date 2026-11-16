@@ -188,11 +188,17 @@ func mailboxIDOf(t *testing.T, rdb *resilient.ResilientDatabase, messageID int64
 	return id
 }
 
+// liveMailboxIDOf returns the mailbox of the message restored from the expunged row
+// messageID. A restore brings the message back as a new row (same body, so the same
+// content_hash) and leaves the expunged row in place, marked restored_at.
 func liveMailboxIDOf(t *testing.T, rdb *resilient.ResilientDatabase, messageID int64) int64 {
 	t.Helper()
 	var id *int64
-	err := rdb.QueryRowWithRetry(context.Background(),
-		`SELECT mailbox_id FROM messages WHERE id = $1 AND expunged_at IS NULL`, messageID).Scan(&id)
+	err := rdb.QueryRowWithRetry(context.Background(), `
+		SELECT n.mailbox_id
+		FROM messages o
+		JOIN messages n ON n.account_id = o.account_id AND n.content_hash = o.content_hash AND n.expunged_at IS NULL
+		WHERE o.id = $1 AND o.restored_at IS NOT NULL`, messageID).Scan(&id)
 	require.NoError(t, err, "message %d must be live after restore", messageID)
 	require.NotNil(t, id)
 	return *id

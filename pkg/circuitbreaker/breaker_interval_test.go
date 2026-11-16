@@ -124,3 +124,72 @@ func TestResultAfterStateChangeIsDropped(t *testing.T) {
 		t.Fatalf("half-open counts = %+v, want none", got)
 	}
 }
+
+// slowRequest is a request admitted by a breaker that blocks until fail is called.
+type slowRequest struct {
+	gate, done chan struct{}
+}
+
+// startSlow starts a request and returns once the breaker has admitted or refused it.
+func startSlow(cb *CircuitBreaker) *slowRequest {
+	r := &slowRequest{gate: make(chan struct{}), done: make(chan struct{})}
+	decided := make(chan struct{})
+	go func() {
+		defer close(r.done)
+		_, err := cb.Execute(func() (any, error) {
+			close(decided)
+			<-r.gate
+			return nil, errSlow
+		})
+		if errors.Is(err, ErrCircuitBreakerOpen) || errors.Is(err, ErrTooManyRequests) {
+			close(decided)
+		}
+	}()
+	<-decided
+	return r
+}
+
+// fail makes the request fail and waits until the breaker has counted the result.
+func (r *slowRequest) fail() {
+	close(r.gate)
+	<-r.done
+}
+
+// failSlowlyUnderSteadyTraffic models a hung service under steady traffic: n requests
+// are in flight when the counting window rolls over (after outlive), then each fails in
+// turn just after the request that replaces it (a client retrying, the next client) has
+// started. It returns the breaker's state and counts once those n results are in.
+func failSlowlyUnderSteadyTraffic(cb *CircuitBreaker, n int, outlive time.Duration) (State, Counts) {
+	inFlight := make([]*slowRequest, n)
+	for i := range inFlight {
+		inFlight[i] = startSlow(cb)
+	}
+	time.Sleep(outlive)
+
+	replacements := make([]*slowRequest, 0, n)
+	for _, r := range inFlight {
+		replacements = append(replacements, startSlow(cb))
+		r.fail()
+	}
+	state, counts := cb.State(), cb.Counts()
+	for _, r := range replacements {
+		r.fail()
+	}
+	return state, counts
+}
+
+// Under steady traffic against a hung service, as many requests start as fail in each
+// counting window, and those that started are still in flight. A failure ratio taken
+// over Requests counts them, so it stays at 0.5 while every result is a failure, and a
+// breaker with a higher threshold never opened while the traffic went on.
+func TestSlowFailuresUnderSteadyTrafficOpenBreaker(t *testing.T) {
+	settings := DefaultSettings("steady-slow-failures")
+	settings.Interval = 100 * time.Millisecond
+	settings.OnStateChange = nil
+	cb := NewCircuitBreaker(settings)
+
+	state, counts := failSlowlyUnderSteadyTraffic(cb, 10, settings.Interval+settings.Interval/2)
+	if state != StateOpen {
+		t.Fatalf("breaker is %s after 10 slow failures under steady traffic, want %s (counts %+v)", state, StateOpen, counts)
+	}
+}

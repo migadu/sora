@@ -31,8 +31,9 @@ type ResilientS3Storage struct {
 func NewResilientS3Storage(s3storage *storage.S3Storage) *ResilientS3Storage {
 	getSettings := circuitbreaker.DefaultSettings("s3_get")
 	getSettings.ReadyToTrip = func(counts circuitbreaker.Counts) bool {
-		failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-		return counts.Requests >= 5 && failureRatio >= 0.6
+		results := counts.Results()
+		failureRatio := float64(counts.TotalFailures) / float64(results)
+		return results >= 5 && failureRatio >= 0.6
 	}
 	getSettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Info("S3 GET circuit breaker changed", "name", name, "from", from, "to", to)
@@ -80,8 +81,9 @@ func NewResilientS3Storage(s3storage *storage.S3Storage) *ResilientS3Storage {
 	putSettings := circuitbreaker.DefaultSettings("s3_put")
 	putSettings.IsSuccessful = isSuccessfulFunc
 	putSettings.ReadyToTrip = func(counts circuitbreaker.Counts) bool {
-		failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-		return counts.Requests >= 3 && failureRatio >= 0.5
+		results := counts.Results()
+		failureRatio := float64(counts.TotalFailures) / float64(results)
+		return results >= 3 && failureRatio >= 0.5
 	}
 	putSettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Info("S3 PUT circuit breaker changed", "name", name, "from", from, "to", to)
@@ -89,8 +91,9 @@ func NewResilientS3Storage(s3storage *storage.S3Storage) *ResilientS3Storage {
 
 	deleteSettings := circuitbreaker.DefaultSettings("s3_delete")
 	deleteSettings.ReadyToTrip = func(counts circuitbreaker.Counts) bool {
-		failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-		return counts.Requests >= 3 && failureRatio >= 0.5
+		results := counts.Results()
+		failureRatio := float64(counts.TotalFailures) / float64(results)
+		return results >= 3 && failureRatio >= 0.5
 	}
 	deleteSettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Info("S3 DELETE circuit breaker changed", "name", name, "from", from, "to", to)
@@ -556,7 +559,13 @@ func (rs *ResilientS3Storage) StatObjectWithRetry(ctx context.Context, key strin
 // retried; client errors like 404 NoSuchKey fail immediately.
 func (rs *ResilientS3Storage) executeS3OperationWithRetry(ctx context.Context, breaker *circuitbreaker.CircuitBreaker, config retry.BackoffConfig, isRetryable func(error) bool, op func() (any, error), key string, operation string) (any, error) {
 	var result any
+	attempts := 0
 	err := retry.WithRetryAdvanced(ctx, func() error {
+		// Every attempt after the first repeats one that failed retryably. Counted
+		// here because sora_s3_operations_total counts the operation once.
+		if attempts++; attempts > 1 {
+			metrics.StorageRetries.WithLabelValues(operation).Inc()
+		}
 		res, cbErr := breaker.Execute(op)
 		if cbErr != nil {
 			retryable := isRetryable(cbErr)

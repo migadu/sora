@@ -3,6 +3,7 @@ package sieveengine
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"slices"
 	"testing"
 )
@@ -86,6 +87,17 @@ func TestResultDestinations(t *testing.T) {
 		want           []Destination
 	}{
 		{name: "keep", result: Result{Action: ActionKeep}, want: []Destination{inbox}},
+		{
+			name:   "legacy message flags",
+			result: Result{Action: ActionFileInto, Mailboxes: []string{"Archive"}, Copy: true, Flags: []string{"work"}},
+			want:   []Destination{{Mailbox: "Archive", Flags: []string{"work"}}, {Mailbox: "INBOX", Flags: []string{"work"}}},
+		},
+		{
+			name: "empty copy flags do not fall back to legacy flags",
+			result: Result{Action: ActionFileInto, Mailboxes: []string{"Archive"}, Copy: true,
+				MailboxFlags: map[string][]string{"Archive": nil}, Flags: []string{"stale"}},
+			want: []Destination{{Mailbox: "Archive"}, inbox},
+		},
 		{name: "discard", result: Result{Action: ActionDiscard}},
 		{name: "fileinto", result: Result{Action: ActionFileInto, Mailboxes: []string{"Archive"}}, want: []Destination{{Mailbox: "Archive"}}},
 		{
@@ -109,6 +121,31 @@ func TestResultDestinations(t *testing.T) {
 			result: Result{Action: ActionFileInto, Mailboxes: []string{"archive", "Archive"}, CreateMailboxes: []string{"Archive"}},
 			want:   []Destination{{Mailbox: "archive", Create: true}},
 		},
+		{
+			// Issue #457: "the name created is without the trailing hierarchy
+			// delimiter" (RFC 3501 §6.3.3), and the copy goes where it is created.
+			name:   "fileinto :create with a trailing delimiter",
+			result: Result{Action: ActionFileInto, Mailboxes: []string{"Foo/"}, CreateMailboxes: []string{"Foo/"}},
+			want:   []Destination{{Mailbox: "Foo", Create: true}},
+		},
+		{
+			name:   "fileinto :create of Foo/ and fileinto foo are one mailbox",
+			result: Result{Action: ActionFileInto, Mailboxes: []string{"Foo/", "foo"}, CreateMailboxes: []string{"Foo/"}},
+			want:   []Destination{{Mailbox: "Foo", Create: true}},
+		},
+		{
+			// A name that makes no mailbox is left as it is: creating it fails, and
+			// delivery keeps the message.
+			name:   "fileinto :create of a name with an empty level",
+			result: Result{Action: ActionFileInto, Mailboxes: []string{"x//y"}, CreateMailboxes: []string{"x//y"}},
+			want:   []Destination{{Mailbox: "x//y", Create: true}},
+		},
+		{
+			// Without :create the name is looked up as given.
+			name:   "fileinto with a trailing delimiter",
+			result: Result{Action: ActionFileInto, Mailboxes: []string{"Foo/"}},
+			want:   []Destination{{Mailbox: "Foo/"}},
+		},
 		{name: "redirect", result: Result{Action: ActionRedirect, RedirectTo: []string{"a@example.org"}}},
 		{
 			name:   "redirect :copy",
@@ -127,10 +164,43 @@ func TestResultDestinations(t *testing.T) {
 			redirectFailed: true,
 			want:           []Destination{{Mailbox: "Archive"}},
 		},
+		{
+			// Issue #453: each copy has the flags of the keep or fileinto that stores
+			// it (RFC 5232 §3, §5), not one list for every copy.
+			name: "each copy its own flags",
+			result: Result{Action: ActionFileInto, Mailboxes: []string{"Archive", "Projects"}, Copy: true,
+				MailboxFlags: map[string][]string{"Archive": {`\flagged`}, "Projects": {"work"}}, KeepFlags: []string{`\seen`}},
+			want: []Destination{
+				{Mailbox: "Archive", Flags: []string{`\flagged`}},
+				{Mailbox: "Projects", Flags: []string{"work"}},
+				{Mailbox: "INBOX", Flags: []string{`\seen`}},
+			},
+		},
+		{
+			name: "the flags of a :create copy follow its created name",
+			result: Result{Action: ActionFileInto, Mailboxes: []string{"Foo/"}, CreateMailboxes: []string{"Foo/"},
+				MailboxFlags: map[string][]string{"Foo/": {"work"}}},
+			want: []Destination{{Mailbox: "Foo", Create: true, Flags: []string{"work"}}},
+		},
+		{
+			// One copy, with the flags of the last action that names the mailbox.
+			name: "fileinto INBOX and keep are one copy",
+			result: Result{Action: ActionFileInto, Mailboxes: []string{"inbox"}, Copy: true,
+				MailboxFlags: map[string][]string{"inbox": {`\flagged`}}, KeepFlags: []string{`\seen`},
+				MailboxStoreOrder: map[string]uint64{"inbox": 1}, KeepStoreOrder: 2},
+			want: []Destination{{Mailbox: "inbox", Flags: []string{`\seen`}}},
+		},
+		{
+			name:           "failed redirect is kept with the keep's flags",
+			result:         Result{Action: ActionRedirect, RedirectTo: []string{"a@example.org"}, KeepFlags: []string{"work"}},
+			redirectFailed: true,
+			want:           []Destination{{Mailbox: "INBOX", Flags: []string{"work"}}},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.result.Destinations(tt.redirectFailed); !slices.Equal(got, tt.want) {
+			got := tt.result.Destinations(tt.redirectFailed)
+			if !slices.EqualFunc(got, tt.want, func(a, b Destination) bool { return reflect.DeepEqual(a, b) }) {
 				t.Errorf("Destinations(%v) = %v, want %v", tt.redirectFailed, got, tt.want)
 			}
 		})

@@ -84,6 +84,9 @@ func TestRecoverOrphanedSQLiteState_AllUploadedRows(t *testing.T) {
 		t.Fatalf("Failed to commit seed transaction: %v", err)
 	}
 
+	if err := importer.lookupAccount(); err != nil {
+		t.Fatalf("lookupAccount failed: %v", err)
+	}
 	if err := importer.recoverOrphanedSQLiteState(); err != nil {
 		t.Fatalf("recoverOrphanedSQLiteState failed: %v", err)
 	}

@@ -54,7 +54,10 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 	// Generate password hash or use provided hash
 	var hashedPassword string
 	if req.PasswordHash != "" {
-		// Use provided hash directly
+		// Use provided hash directly, if it is one VerifyPassword can check
+		if err = ValidatePasswordHash(req.PasswordHash); err != nil {
+			return 0, fmt.Errorf("%w: %w", ErrInvalidAccountRequest, err)
+		}
 		hashedPassword = req.PasswordHash
 	} else {
 		// Generate hash from password
@@ -126,7 +129,10 @@ func (db *Database) AddCredential(ctx context.Context, tx pgx.Tx, req AddCredent
 	// Generate password hash or use provided hash
 	var hashedPassword string
 	if req.NewPasswordHash != "" {
-		// Use provided hash directly
+		// Use provided hash directly, if it is one VerifyPassword can check
+		if err = ValidatePasswordHash(req.NewPasswordHash); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidAccountRequest, err)
+		}
 		hashedPassword = req.NewPasswordHash
 	} else {
 		// Generate hash from password
@@ -152,6 +158,10 @@ func (db *Database) AddCredential(ctx context.Context, tx pgx.Tx, req AddCredent
 
 	// If this should be the new primary identity, unset the current primary
 	if req.IsPrimary {
+		if err = lockPrimaryIdentityChanges(ctx, tx, req.AccountID); err != nil {
+			return err
+		}
+
 		// Guard: promoting a different-domain credential to primary on a populated account
 		// would split the account's message storage across two s3_domain prefixes.
 		if err = guardCrossDomainPrimaryChange(ctx, tx, req.AccountID, newAddress.Domain()); err != nil {
@@ -218,7 +228,10 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 	var hashedPassword string
 	var updatePassword bool
 	if req.PasswordHash != "" {
-		// Use provided hash directly
+		// Use provided hash directly, if it is one VerifyPassword can check
+		if err = ValidatePasswordHash(req.PasswordHash); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidAccountRequest, err)
+		}
 		hashedPassword = req.PasswordHash
 		updatePassword = true
 	} else if req.Password != "" {
@@ -242,6 +255,10 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 
 	// Begin transaction if we need to handle primary identity change
 	if req.MakePrimary {
+		if err = lockPrimaryIdentityChanges(ctx, tx, accountID); err != nil {
+			return err
+		}
+
 		// Guard: switching the primary to a different-domain credential on a populated
 		// account would split the account's message storage across two s3_domain prefixes.
 		if err = guardCrossDomainPrimaryChange(ctx, tx, accountID, address.Domain()); err != nil {
@@ -257,20 +274,28 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 		}
 
 		// Update password and/or set as primary
+		var tag pgconn.CommandTag
 		if updatePassword {
-			_, err = tx.Exec(ctx,
+			tag, err = tx.Exec(ctx,
 				"UPDATE credentials SET password = $1, primary_identity = true, updated_at = now() WHERE account_id = $2 AND LOWER(address) = $3",
 				hashedPassword, accountID, normalizedEmail)
 			if err != nil {
 				return fmt.Errorf("failed to update account password and set primary: %w", err)
 			}
 		} else {
-			_, err = tx.Exec(ctx,
+			tag, err = tx.Exec(ctx,
 				"UPDATE credentials SET primary_identity = true, updated_at = now() WHERE account_id = $1 AND LOWER(address) = $2",
 				accountID, normalizedEmail)
 			if err != nil {
 				return fmt.Errorf("failed to set credential as primary: %w", err)
 			}
+		}
+		// The credential was deleted after the lookup above, while this change waited
+		// for the primary-identity lock or for the delete's row lock. Committing now
+		// would leave the account without a primary identity; the caller rolls tx
+		// back, which restores the primary cleared above.
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("%w: account with email %s does not exist", consts.ErrUserNotFound, normalizedEmail)
 		}
 
 	} else {
@@ -319,7 +344,9 @@ func (db *Database) ListCredentials(ctx context.Context, email string) ([]Creden
 	}
 	defer rows.Close()
 
-	var credentials []Credential
+	// Never nil: an empty result is the JSON array [], not null. The account was found by
+	// one of its credentials, but in a separate query, so a purge in between leaves no rows.
+	credentials := []Credential{}
 	for rows.Next() {
 		var cred Credential
 		var createdAt, updatedAt any
@@ -355,9 +382,28 @@ func (db *Database) IsAddressOwnedByAccount(ctx context.Context, accountID int64
 	return exists, nil
 }
 
+// IsAnyAddressOwnedByAccount reports whether any of addresses is a credential of
+// accountID, matched as IsAddressOwnedByAccount matches one, in a single query. Used
+// by the SIEVE vacation personal message check (RFC 5230 §4.5), which asks about
+// every recipient of the original message.
+func (db *Database) IsAnyAddressOwnedByAccount(ctx context.Context, accountID int64, addresses []string) (bool, error) {
+	if len(addresses) == 0 {
+		return false, nil
+	}
+	var exists bool
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM credentials WHERE account_id = $1 AND LOWER(address) = ANY(SELECT LOWER(a) FROM unnest($2::text[]) AS a))`,
+		accountID, addresses).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check address ownership: %w", err)
+	}
+	return exists, nil
+}
+
 var (
-	ErrCannotDeletePrimaryCredential = errors.New("cannot delete the primary credential. Use update-account to make another credential primary first")
-	ErrCannotDeleteLastCredential    = errors.New("cannot delete the last credential for an account. Use delete-account to remove the entire account")
+	// The Admin API returns these to its clients as well, so they name no sora-admin command.
+	ErrCannotDeletePrimaryCredential = errors.New("cannot delete the primary credential: make another credential of the account primary first")
+	ErrCannotDeleteLastCredential    = errors.New("cannot delete the last credential of an account: delete the account instead")
 	// ErrCrossDomainPrimaryChange is returned when an operation would switch an account's
 	// primary identity to a different domain while the account already has messages. Message
 	// storage keys (s3_domain) are captured per-message from the then-current primary, so such
@@ -366,8 +412,9 @@ var (
 	// ErrInvalidAccountRequest wraps the errors CreateAccount, CreateAccountWithCredentials
 	// and UpdateAccount return for a request that cannot succeed as written (malformed
 	// address, no or several primaries, an address twice, unknown hash type, a password
-	// over bcrypt's 72 bytes, ...), so a caller can tell a bad request from a database
-	// failure.
+	// over bcrypt's 72 bytes, a password_hash VerifyPassword cannot check, ...), so a
+	// caller can tell a bad request from a database failure. AddCredential wraps it for
+	// a password_hash too.
 	ErrInvalidAccountRequest = errors.New("invalid account request")
 )
 
@@ -392,6 +439,23 @@ func getPrimaryDomainInTx(ctx context.Context, tx pgx.Tx, accountID int64) (stri
 		return "", fmt.Errorf("invalid primary address %q in database: %w", addr, err)
 	}
 	return parsed.Domain(), nil
+}
+
+// lockPrimaryIdentityChanges serialises the account's primary-identity changes for the
+// rest of tx. It is taken before guardCrossDomainPrimaryChange reads the current primary
+// and before the UPDATE that clears it. Without it, a change that starts while another is
+// uncommitted reads the old primary, waits for the other's row lock on it and then skips
+// it (already cleared), never seeing the other's new primary: it clears nothing, and
+// setting its own credential primary violates idx_credentials_account_id_one_primary
+// (23505). Once the lock is granted, the next statement takes a new snapshot under READ
+// COMMITTED and sees the primary the previous holder committed. The lock is
+// transaction-scoped (pgbouncer transaction mode) and precedes the row locks.
+func lockPrimaryIdentityChanges(ctx context.Context, tx pgx.Tx, accountID int64) error {
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int4, hashint8($2::int8))",
+		consts.SoraPrimaryIdentityLockClassID, accountID); err != nil {
+		return fmt.Errorf("failed to lock account primary identity changes: %w", err)
+	}
+	return nil
 }
 
 // guardCrossDomainPrimaryChange blocks switching an account's primary identity to newDomain
@@ -814,7 +878,9 @@ type AccountSummary struct {
 // GetAccountsByDomain returns a simplified list of the accounts whose primary address is
 // in domain, soft-deleted ones included. It is what the purge-domain command iterates
 // through, and a purge that failed leaves its account soft-deleted: leaving those out would
-// make a re-run skip exactly the accounts it has to finish.
+// make a re-run skip exactly the accounts it has to finish. The domain is matched exactly,
+// as ListAccountsByDomain matches it: never as a LIKE pattern, where % and _ would name
+// other domains in an irreversible purge.
 func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]AccountSummary, error) {
 	query := `
 		SELECT a.id,
@@ -825,7 +891,7 @@ func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]A
 			   0 as message_count
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id AND c.primary_identity = TRUE
-		WHERE LOWER(c.address) LIKE '%' || '@' || LOWER($1)
+		WHERE c.domain = LOWER($1)
 		ORDER BY c.address
 	`
 
@@ -857,18 +923,26 @@ func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]A
 }
 
 // GetAliasCredentialsByDomain returns the addresses of all NON-primary credentials whose
-// address is in the given domain, across active (non-deleted) accounts. Domain purge uses
-// this to find cross-domain aliases: addresses in the purged domain that hang off accounts
-// whose primary identity lives in a different domain (so the account is not itself purged).
-// Such aliases keep receiving mail for the purged domain unless explicitly removed.
+// address is in the given domain, on accounts whose primary identity lives in a different
+// domain. Domain purge uses this to find cross-domain aliases: addresses in the purged
+// domain that hang off accounts it does not purge. Such aliases keep receiving mail for the
+// purged domain unless explicitly removed. Soft-deleted accounts are included: restoring
+// one puts its aliases back in service. Accounts with their primary in the domain are left
+// out, soft-deleted or not, since the purge removes them whole. The domain is matched
+// exactly, as in GetAccountsByDomain.
 func (db *Database) GetAliasCredentialsByDomain(ctx context.Context, domain string) ([]string, error) {
 	rows, err := db.GetReadPool().Query(ctx, `
 		SELECT c.address
 		FROM credentials c
 		JOIN accounts a ON a.id = c.account_id
-		WHERE LOWER(c.address) LIKE '%' || '@' || LOWER($1)
+		WHERE c.domain = LOWER($1)
 		  AND c.primary_identity = FALSE
-		  AND a.deleted_at IS NULL
+		  AND NOT EXISTS (
+		      SELECT 1 FROM credentials p
+		      WHERE p.account_id = c.account_id
+		        AND p.primary_identity = TRUE
+		        AND p.domain = c.domain
+		  )
 		ORDER BY c.address
 	`, domain)
 	if err != nil {
@@ -893,9 +967,9 @@ func (db *Database) ListAccounts(ctx context.Context) ([]AccountSummary, error) 
 		WITH account_stats AS (
 			SELECT mb.account_id,
 				   COUNT(mb.id) as mailbox_count,
-				   -- Bulk all-accounts listing intentionally uses the mailbox_stats cache (kept accurate
-				   -- by the stats triggers + the admin recalculate-stats command) to avoid a full
-				   -- messages-table aggregate on every listing. Per-account quota lookups use live counts.
+				   -- Bulk all-accounts listing intentionally uses the mailbox_stats cache (maintained
+				   -- by the stats triggers) to avoid a full messages-table aggregate on every
+				   -- listing. Per-account quota lookups use live counts.
 				   COALESCE(SUM(ms.message_count), 0) as message_count,
 				   COALESCE(SUM(ms.total_size), 0) as storage_used
 			FROM mailboxes mb
@@ -1078,7 +1152,12 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 		}
 		if cred.Password != "" {
 			if err := ValidateNewHashType(req.Credentials[i].HashType); err != nil {
-				return 0, fmt.Errorf("credential %d: %w", i+1, err)
+				return 0, fmt.Errorf("%w: credential %d: %w", ErrInvalidAccountRequest, i+1, err)
+			}
+		}
+		if cred.PasswordHash != "" {
+			if err := ValidatePasswordHash(cred.PasswordHash); err != nil {
+				return 0, fmt.Errorf("%w: credential %d: %w", ErrInvalidAccountRequest, i+1, err)
 			}
 		}
 	}
@@ -1143,7 +1222,7 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 		// Generate password hash or use provided hash
 		var hashedPassword string
 		if cred.PasswordHash != "" {
-			// Use provided hash directly
+			// Use provided hash directly (validated above)
 			hashedPassword = cred.PasswordHash
 		} else {
 			// Generate hash from password

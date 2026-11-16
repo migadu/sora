@@ -15,10 +15,13 @@ import (
 	imapsrv "github.com/migadu/sora/server/imap"
 )
 
+// notifyTestPollInterval is the NOTIFY pump cadence of these tests: fast, so
+// asynchronous notifications arrive within test timeouts; production runs at
+// the IDLE cadence (15s).
+const notifyTestPollInterval = 300 * time.Millisecond
+
 func init() {
-	// Tick fast so asynchronous notifications arrive within test timeouts;
-	// production runs at the IDLE cadence (15s).
-	imapsrv.SetNotifyPollIntervalForTests(300 * time.Millisecond)
+	imapsrv.SetNotifyPollIntervalForTests(notifyTestPollInterval)
 }
 
 const notifyTestMessage = "From: sender@example.com\r\n" +

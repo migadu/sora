@@ -30,7 +30,13 @@ func TestMarkBatchInSQLiteNeverCommitsAfterReportingFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer importer.Close()
-	importer.accountID = 42
+	importer.rdb = newMockResilientDatabase()
+	if err := importer.lookupAccount(); err != nil {
+		t.Fatal(err)
+	}
+	if err := importer.recoverOrphanedSQLiteState(); err != nil {
+		t.Fatal(err)
+	}
 
 	const hash = "marktimeout000000000000000000000000000000000000000000000000000000"
 	if _, err := importer.sqliteDB.Exec(
