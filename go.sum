@@ -185,6 +185,8 @@ github.com/migadu/go-managesieve v0.1.5-0.20261115212706-bc72beba53a0 h1:gsZFJBu
 github.com/migadu/go-managesieve v0.1.5-0.20261115212706-bc72beba53a0/go.mod h1:E38XgVuCDYRSNz/9ku4Sc7CvVDmJ8FLqGc1udcxP9SE=
 github.com/migadu/go-managesieve v0.1.5 h1:oJi41X93PoYihSxYo/SkYQyIoR8G4Ln8Tv3f2A4qx7w=
 github.com/migadu/go-managesieve v0.1.5/go.mod h1:E38XgVuCDYRSNz/9ku4Sc7CvVDmJ8FLqGc1udcxP9SE=
+github.com/migadu/go-managesieve v0.1.6 h1:vXZzzPfWTL5bSWSa94EtehQHqZbJEEeNXoS1PKbqbdE=
+github.com/migadu/go-managesieve v0.1.6/go.mod h1:E38XgVuCDYRSNz/9ku4Sc7CvVDmJ8FLqGc1udcxP9SE=
 github.com/migadu/go-message v0.0.0-20261115010257-aa2abe055119 h1:5wZ36W5frh1ZaSuIIvw2Afyr8mNT4mfGcGSeAgSXAIQ=
 github.com/migadu/go-message v0.0.0-20261115010257-aa2abe055119/go.mod h1:XpJyL70LwRvq2a8rVbHXikPgKj8+aI0kGdHlg16ibYA=
 github.com/migadu/go-pop3 v0.1.5-0.20261114174148-24ad5702c60a h1:Xy5B3IMkUlQRYaL5sxKjjDrqL8FEh4oiGzBG7tNPPls=
