@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/logger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -65,19 +67,30 @@ func assertEmptyDir(t *testing.T, path string) {
 	assert.Empty(t, dirNames(t, path), "the export wrote into %s outside its destination", path)
 }
 
+// linkKinds are the links the destination's owner can put at the name of a file the
+// export reads back and replaces. A hard link is another name for the same file, which
+// the root cannot tell from a file an earlier run wrote (#1671): one on the same file
+// system as its target, where the system lets the owner link a file they cannot read
+// (BSD and macOS do, as Linux does with fs.protected_hardlinks = 0).
+var linkKinds = []struct {
+	name string
+	link func(t *testing.T, target, link string)
+}{
+	{"absolute link", func(t *testing.T, target, link string) { linkOut(t, target, link, false) }},
+	{"relative link", func(t *testing.T, target, link string) { linkOut(t, target, link, true) }},
+	{"hard link", func(t *testing.T, target, link string) { require.NoError(t, os.Link(target, link)) }},
+}
+
 func TestExportReplacesLinkedDovecotUIDList(t *testing.T) {
-	secret := []byte("root:secret-hash:19000:0:99999:7:::\n")
-	for _, tc := range []struct {
-		name string
-		link func(t *testing.T, target, link string)
-	}{
-		{"absolute link", func(t *testing.T, target, link string) { linkOut(t, target, link, false) }},
-		{"relative link", func(t *testing.T, target, link string) { linkOut(t, target, link, true) }},
-		{"hard link", func(t *testing.T, target, link string) { require.NoError(t, os.Link(target, link)) }},
-	} {
+	// An entry of the file the link names is merged when a file of its name is in cur/
+	// (mergeUIDMappings), which the owner can arrange: its UID would be written out.
+	const ownersFile = "1700000009.M9P9.host"
+	secret := []byte("3 V99 N6\n5 :" + ownersFile + "\n")
+	for _, tc := range linkKinds {
 		t.Run(tc.name, func(t *testing.T) {
 			outside := outsideFile(t, secret)
 			exporter, dest := newLinkTestExporter(t, nil, ExporterOptions{ExportUIDList: true})
+			require.NoError(t, os.WriteFile(filepath.Join(dest, "cur", ownersFile+":2,S"), nil, 0644))
 			uidlist := filepath.Join(dest, "dovecot-uidlist")
 			tc.link(t, outside, uidlist)
 
@@ -90,19 +103,20 @@ func TestExportReplacesLinkedDovecotUIDList(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, written)
 			assert.Equal(t, uint32(42), written.UIDValidity)
-			assert.Equal(t, map[string]uint32{"1700000001.M1P1.host": 7}, written.UIDMappings)
+			assert.Equal(t, map[string]uint32{"1700000001.M1P1.host": 7}, written.UIDMappings,
+				"an entry of the uidlist read through the link was carried into the export")
 		})
 	}
 }
 
 func TestExportReplacesLinkedDovecotKeywords(t *testing.T) {
 	secret := []byte("0 $Secret\n")
-	for _, relative := range []bool{false, true} {
-		t.Run(map[bool]string{false: "absolute link", true: "relative link"}[relative], func(t *testing.T) {
+	for _, tc := range linkKinds {
+		t.Run(tc.name, func(t *testing.T) {
 			outside := outsideFile(t, secret)
 			exporter, dest := newLinkTestExporter(t, nil, ExporterOptions{Dovecot: true})
 			keywords := filepath.Join(dest, "dovecot-keywords")
-			linkOut(t, outside, keywords, relative)
+			tc.link(t, outside, keywords)
 
 			require.NoError(t, exporter.prepareKeywords("INBOX", []db.Message{{UID: 1, CustomFlags: []string{"$Work"}}}))
 
@@ -218,4 +232,74 @@ func TestExportRefusesLinkedMailboxDirectory(t *testing.T) {
 			})
 		}
 	}
+}
+
+// A dovecot-keywords or dovecot-uidlist the export does not read back is replaced
+// without what it held: an earlier run's keyword letters may then name other keywords,
+// and Dovecot gives the files it listed new UIDs. A hard link can be there for a benign
+// reason (a copy made with cp -al, a deduplicating tool), so the export says so, as the
+// import does for a file it cannot read. A file that is not there is a first run.
+func TestExportWarnsWhenItDoesNotReadBackDovecotMetadata(t *testing.T) {
+	for _, tc := range linkKinds {
+		t.Run(tc.name, func(t *testing.T) {
+			exporter, dest := newLinkTestExporter(t, nil, ExporterOptions{Dovecot: true, ExportUIDList: true})
+			tc.link(t, outsideFile(t, []byte("0 $Other\n")), filepath.Join(dest, "dovecot-keywords"))
+			tc.link(t, outsideFile(t, []byte("3 V1 N2\n1 :1700000009.M9P9.host\n")), filepath.Join(dest, "dovecot-uidlist"))
+
+			logs := exportDovecotMetadataWarnings(t, exporter)
+
+			assert.Contains(t, logs, "Existing dovecot-keywords not read")
+			assert.Contains(t, logs, "Existing dovecot-uidlist not read")
+		})
+	}
+	t.Run("absent", func(t *testing.T) {
+		exporter, _ := newLinkTestExporter(t, nil, ExporterOptions{Dovecot: true, ExportUIDList: true})
+		assert.NotContains(t, exportDovecotMetadataWarnings(t, exporter), "not read")
+	})
+}
+
+// The export writes dovecot-keywords and dovecot-uidlist by renaming a new file over
+// the name (replaceFile), so each has one link and a later run reads it back: the
+// keyword numbering and the UIDs of the files an earlier run wrote are kept.
+func TestExportReadsBackItsOwnDovecotMetadata(t *testing.T) {
+	exporter, dest := newLinkTestExporter(t, nil, ExporterOptions{Dovecot: true, ExportUIDList: true})
+	require.NoError(t, os.WriteFile(filepath.Join(dest, "cur", "1700000001.M1P1.host:2,S"), nil, 0644))
+	exporter.uidMappings["INBOX"] = []UIDFileMapping{{UID: 7, Filename: "1700000001.M1P1.host"}}
+	require.NoError(t, exporter.prepareKeywords("INBOX", []db.Message{{UID: 7, CustomFlags: []string{"$Zed"}}}))
+	require.NoError(t, exporter.generateDovecotUIDLists([]*db.DBMailbox{{Name: "INBOX", UIDValidity: 42}}))
+
+	exporter.uidMappings["INBOX"] = []UIDFileMapping{{UID: 8, Filename: "1700000002.M2P1.host"}}
+	logs := &importLogBuffer{}
+	prev := logger.Swap(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	err := exporter.prepareKeywords("INBOX", []db.Message{{UID: 7, CustomFlags: []string{"$Zed"}}, {UID: 8, CustomFlags: []string{"$Alpha"}}})
+	if err == nil {
+		err = exporter.generateDovecotUIDLists([]*db.DBMailbox{{Name: "INBOX", UIDValidity: 42}})
+	}
+	logger.Swap(prev)
+	require.NoError(t, err)
+
+	got, err := os.ReadFile(filepath.Join(dest, "dovecot-keywords"))
+	require.NoError(t, err)
+	assert.Equal(t, "0 $Zed\n1 $Alpha\n", string(got))
+	written, err := ParseDovecotUIDList(dest)
+	require.NoError(t, err)
+	require.NotNil(t, written)
+	assert.Equal(t, map[string]uint32{"1700000001.M1P1.host": 7, "1700000002.M2P1.host": 8}, written.UIDMappings)
+	assert.NotContains(t, logs.String(), "not read")
+}
+
+// exportDovecotMetadataWarnings has the export write INBOX's dovecot-keywords and
+// dovecot-uidlist, and returns what it logged at warning level.
+func exportDovecotMetadataWarnings(t *testing.T, exporter *Exporter) string {
+	t.Helper()
+	exporter.uidMappings["INBOX"] = []UIDFileMapping{{UID: 7, Filename: "1700000001.M1P1.host"}}
+	logs := &importLogBuffer{}
+	prev := logger.Swap(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	err := exporter.prepareKeywords("INBOX", []db.Message{{UID: 7, CustomFlags: []string{"$Work"}}})
+	if err == nil {
+		err = exporter.generateDovecotUIDLists([]*db.DBMailbox{{Name: "INBOX", UIDValidity: 42}})
+	}
+	logger.Swap(prev)
+	require.NoError(t, err)
+	return logs.String()
 }
