@@ -89,7 +89,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Reject empty passwords immediately
 	if req.Password == "" {
-		s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+		s.writeLoginRefused(w)
 		return
 	}
 
@@ -126,7 +126,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			// attempt would turn the rate limiter into a CPU-amplification vector. The fast
 			// rejection is existence-independent, so it is not a user-enumeration oracle.)
 			logger.Debug("User API: Login rate limited", "name", s.name, "ip", clientIP, "email", req.Email, "error", err)
-			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+			s.writeLoginRefused(w)
 			return
 		}
 	}
@@ -145,7 +145,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		if s.authLimiter != nil {
 			s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
 		}
-		s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+		s.writeLoginRefused(w)
 		return
 	}
 	email := addr.FullAddress()
@@ -159,7 +159,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			if s.authLimiter != nil {
 				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
 			}
-			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+			s.writeLoginRefused(w)
 			return
 		}
 		if found {
@@ -192,7 +192,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
 			}
 			// Don't reveal whether user exists or not
-			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+			s.writeLoginRefused(w)
 			return
 		}
 		// The database could not be asked: a temporary failure, not counted as a
@@ -225,7 +225,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		if s.authLimiter != nil {
 			s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
 		}
-		s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+		s.writeLoginRefused(w)
 		return
 	}
 
@@ -250,7 +250,7 @@ generateToken:
 			// No active account any more: deleted since its credentials were cached
 			// (or since the lookup above). Refused, as the refresh refuses it.
 			logger.Info("HTTP Mail API: Refusing login for deleted/unknown account", "name", s.name, "email", email)
-			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+			s.writeLoginRefused(w)
 			return
 		}
 		logger.Warn("HTTP Mail API: Error fetching credential epoch", "name", s.name, "error", err)
@@ -303,13 +303,13 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	// Parse and validate existing token
 	claims, err := s.validateToken(req.Token)
 	if err != nil {
-		s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+		s.writeTokenRefused(w)
 		return
 	}
 
 	addr, err := server.NewAddress(strings.TrimSpace(claims.Email))
 	if err != nil || addr.HasSuffix() {
-		s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+		s.writeTokenRefused(w)
 		return
 	}
 	email := addr.FullAddress()
@@ -325,7 +325,7 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, consts.ErrUserNotFound) {
 			// Account soft-deleted or credential removed since the token was issued.
 			logger.Info("HTTP Mail API: Refusing refresh for deleted/unknown account", "name", s.name, "email", email)
-			s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+			s.writeTokenRefused(w)
 			return
 		}
 		logger.Warn("HTTP Mail API: Error revalidating account on refresh", "name", s.name, "error", err)
@@ -336,7 +336,7 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 		// Password changed after this token was issued (or the token predates the
 		// auth_epoch claim) — force a fresh login instead of renewing.
 		logger.Info("HTTP Mail API: Refusing refresh for stale token (password changed)", "name", s.name, "email", email)
-		s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+		s.writeTokenRefused(w)
 		return
 	}
 

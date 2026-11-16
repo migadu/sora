@@ -91,12 +91,23 @@ func (db *Database) ExpungeMessagesByIDs(ctx context.Context, tx pgx.Tx, message
 // message to unseen_count. The rows are locked in ascending id order, like the age-based
 // expunge and MOVE, which keeps this deadlock-free against them.
 func lockLiveMessageMailboxes(ctx context.Context, tx pgx.Tx, cond string, args ...any) ([]int64, error) {
+	return lockMailboxesOfLiveMessages(ctx, tx, "FOR UPDATE", cond, args...)
+}
+
+// lockIdleLiveMessageMailboxes is lockLiveMessageMailboxes for a caller that can leave
+// some of the messages for a later run: it locks only the mailboxes no other transaction
+// holds now (SKIP LOCKED), and never waits for one. The live messages of a mailbox it
+// skips stay live, so a hard delete leaves them alone (see notLiveInMailbox).
+func lockIdleLiveMessageMailboxes(ctx context.Context, tx pgx.Tx, cond string, args ...any) ([]int64, error) {
+	return lockMailboxesOfLiveMessages(ctx, tx, "FOR UPDATE SKIP LOCKED", cond, args...)
+}
+
+func lockMailboxesOfLiveMessages(ctx context.Context, tx pgx.Tx, locking, cond string, args ...any) ([]int64, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT id FROM mailboxes
 		WHERE id IN (SELECT m.mailbox_id FROM messages m WHERE m.expunged_at IS NULL AND (`+cond+`))
 		ORDER BY id
-		FOR UPDATE
-	`, args...)
+		`+locking, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to lock mailboxes: %w", err)
 	}

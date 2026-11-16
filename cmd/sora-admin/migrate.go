@@ -119,6 +119,19 @@ func handleMigrateDown(ctx context.Context) {
 		version, dirty, err := m.Version()
 		if err != nil {
 			if errors.Is(err, migrate.ErrNilVersion) {
+				// Migrate.Version returns ErrNilVersion before returning dirty, so a failed
+				// down migration of version 1 (version = -1, dirty = true) looks the same
+				// here as an empty schema. Down reads the driver directly and returns
+				// ErrDirty{-1} when dirty or ErrNoChange when nothing is applied.
+				if err := m.Down(); err != nil {
+					var dirtyErr migrate.ErrDirty
+					if errors.As(err, &dirtyErr) {
+						logger.Fatalf("Database is in a dirty state (version %d). Please fix manually with 'force' command.", dirtyErr.Version)
+					}
+					if !errors.Is(err, migrate.ErrNoChange) {
+						logger.Fatalf("Failed to revert all migrations: %v", err)
+					}
+				}
 				logger.Info("No migrations to revert.")
 				showVersion(m)
 				return
