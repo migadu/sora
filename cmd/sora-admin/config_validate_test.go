@@ -144,6 +144,18 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 			content: storageTOML + "[servers]\ntrusted_networks = [\"192.0.2.10\"]\n" + proxyProtocolImap,
 		},
 		{
+			// The issue's file: the IMAP server refused to be built with it (#1675).
+			name: "master_sasl_allowed_networks entry that is not an IP or CIDR",
+			content: storageTOML + imapBackend + "master_sasl_username = \"master\"\nmaster_sasl_password = \"secret\"\n" +
+				"master_sasl_allowed_networks = [\"proxy.example.com\"]\n",
+			wantErr: []string{"[FAIL] server 'imap':\n   server \"imap\": invalid master_sasl_allowed_networks: invalid trusted network 'proxy.example.com': not a valid IP address or CIDR"},
+		},
+		{
+			name: "master_sasl_allowed_networks the server starts with",
+			content: storageTOML + imapBackend + "master_sasl_username = \"master\"\nmaster_sasl_password = \"secret\"\n" +
+				"master_sasl_allowed_networks = [\"192.0.2.10\", \"2001:db8::/32\"]\n",
+		},
+		{
 			name: "pool declared twice",
 			content: "[[pool]]\nname = \"sora1\"\nbackends = [\"192.0.2.10:143\"]\ndefault = true\n\n" +
 				"[[pool]]\nname = \"sora1\"\nbackends = [\"192.0.2.11:143\"]\n" + imapProxy,
