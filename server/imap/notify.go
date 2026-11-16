@@ -276,8 +276,8 @@ func (watch *notifyWatch) eventsForMailbox(name, key string, subscribed bool, sh
 			continue
 		case imap.NotifyMailboxSpecPersonal:
 			// RFC 5465 §6.2: all selectable mailboxes in the personal
-			// namespace(s) — the shared namespace is excluded.
-			if sharedRoot == "" || !mailboxNameHasPrefix(name, sharedRoot) {
+			// namespace(s), as ESEARCH IN (PERSONAL) searches them.
+			if !inSharedNamespace(name, sharedRoot) {
 				add(item)
 			}
 		case imap.NotifyMailboxSpecInboxes:

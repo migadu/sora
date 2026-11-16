@@ -600,7 +600,9 @@ sora-admin --config config.toml messages restore --email user@example.com --ids 
 - Without `--confirm`, the command lists up to ten of the matching messages and asks
   `Continue with restoration? (yes/no)`. Only `yes` or `y` continues.
 - A mailbox that no longer exists is created again. Restored messages get new UIDs and new
-  mod-sequences, so IMAP clients are told of them as new messages.
+  mod-sequences, so IMAP clients are told of them as new messages. The expunge of the old UID
+  stays on record until the cleaner removes it, so a client not yet told of it still is.
+- A restored message has a new id: deleted again, `list-deleted` shows it under that id.
 - With sharing enabled in the config file you pass, a mailbox recreated in the shared namespace
   is a shared mailbox of the account, as `mailbox create` makes one, and so is a parent recreated
   there. Each one starts with owner-only rights: one entry, the owner's primary address with
@@ -1109,7 +1111,7 @@ upgrades.
 | Subcommand | Flags | What it does |
 |---|---|---|
 | `up` | | Applies every pending migration. |
-| `down` | `--limit N` (default `1`), `--all` | Reverts the last N migrations, or all of them. No prompt. |
+| `down` | `--limit N` (default `1`), `--all` | Reverts the last N migrations, or with `--all` every migration after 000001. 000001, the initial schema, is never reverted: a `--limit` that reaches it is refused. No prompt. |
 | `version` | | Prints the current version and whether it is dirty. Safe while servers run: a plain read of `schema_migrations`, no lock. |
 | `force VERSION` | | Records VERSION as the current version and clears the dirty flag, without running anything. |
 

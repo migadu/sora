@@ -723,7 +723,10 @@ be positive.
 Each message goes back to the mailbox it was expunged from. A mailbox that has since been
 deleted is created again, with its parents. Restored messages get new UIDs, in their original
 arrival order per mailbox, and new mod-sequences, so IMAP clients are told of them as new messages
-(the mailbox's HIGHESTMODSEQ rises). Messages already restored or already purged are skipped.
+(the mailbox's HIGHESTMODSEQ rises). The expunge of the old UID stays on record until the cleaner
+removes it, so a client not yet told of it still is (`EXPUNGE`, or `VANISHED (EARLIER)` to a QRESYNC
+client). A restored message has a new id: deleted again, it is listed under that id. Messages
+already restored or already purged are skipped.
 
 With `[shared_mailboxes]` enabled, a mailbox recreated in the shared namespace is a shared
 mailbox of the account, and so is a parent recreated there. Each one starts with owner-only

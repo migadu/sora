@@ -48,7 +48,7 @@ func TestRestoreMessages_RestoredMessageGetsAFreshModSeq(t *testing.T) {
 	require.NoError(t, db.GetReadPool().QueryRow(ctx, `
 		SELECT m.uid, m.created_modseq, GREATEST(m.created_modseq, COALESCE(ms.updated_modseq, 0))
 		FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-		WHERE m.id = $1`, restoredID).Scan(&newUID, &createdModSeq, &modSeq))
+		WHERE m.id = $1`, restoredCopyID(t, db, restoredID)).Scan(&newUID, &createdModSeq, &modSeq))
 	require.Greater(t, uint64(newUID), uint64(oldUID), "a restored message gets a UID above every UID the mailbox had")
 	require.Greater(t, createdModSeq, before.HighestModSeq,
 		"the restored message is created anew: its created_modseq must be above the mailbox's HIGHESTMODSEQ before the restore")
