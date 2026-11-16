@@ -55,12 +55,13 @@ type S3ImporterOptions struct {
 // s3ImportDB is the part of the database the S3 importer uses, satisfied by
 // *resilient.ResilientDatabase.
 type s3ImportDB interface {
+	GetOperationalDatabase() *db.Database
+	ExecuteWithSharedS3ObjectLocks(context.Context, int64, []string, func(context.Context) error) error
 	GetAccountIDByAddressWithRetry(ctx context.Context, address string) (int64, error)
 	CreateDefaultMailboxesWithRetry(ctx context.Context, accountID int64) error
 	QueryRowWithRetry(ctx context.Context, sql string, args ...any) pgx.Row
 	GetMailboxByNameWithRetry(ctx context.Context, accountID int64, name string) (*db.DBMailbox, error)
-	InsertMessageWithRetry(ctx context.Context, options *db.InsertMessageOptions, upload db.PendingUpload) (int64, int64, error)
-	CompleteS3UploadWithRetry(ctx context.Context, hash string, accountID int64, writtenKeys []string) error
+	InsertStoredMessageWithRetry(ctx context.Context, options *db.InsertMessageOptions, upload db.PendingUpload, writtenKeys []string) (int64, int64, error)
 }
 
 // S3Importer handles the S3 import process
@@ -436,13 +437,17 @@ func (si *S3Importer) importFromS3() error {
 		return nil
 	}
 
-	logger.Info("Processing S3 objects", "count", si.totalObjects, "workers", si.options.Workers)
+	workers, err := writePoolLockedJobs(si.rdb.GetOperationalDatabase(), si.options.Workers)
+	if err != nil {
+		return err
+	}
+	logger.Info("Processing S3 objects", "count", si.totalObjects, "workers", workers)
 
 	var wg sync.WaitGroup
 	jobs := make(chan S3ObjectInfo, 100) // Buffer for better performance
 
 	// Start workers
-	for w := 0; w < si.options.Workers; w++ {
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
@@ -570,10 +575,45 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 		return nil
 	}
 
+	var msgID, uid int64
+	err = si.rdb.ExecuteWithSharedS3ObjectLocks(ctx, user.AccountID(), []string{contentHash}, func(guarded context.Context) error {
+		var storeErr error
+		msgID, uid, storeErr = si.importStoredBody(guarded, obj, user, contentHash)
+		return storeErr
+	})
+	if errors.Is(err, consts.ErrMessageExists) {
+		si.skipExisting(obj.Key, "already in INBOX")
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	atomic.AddInt64(&si.importedMessages, 1)
+	logger.Info("Successfully imported message", "progress", si.getProgressPrefix(),
+		"msg_id", msgID, "uid", uid, "user", user.FullAddress())
+
+	si.markObjectProcessed(obj.Key, true, "imported successfully")
+
+	// Add delay if configured; an interrupt ends it
+	if si.options.ImportDelay > 0 {
+		select {
+		case <-time.After(si.options.ImportDelay):
+		case <-ctx.Done():
+		}
+	}
+
+	return nil
+}
+
+// importStoredBody runs under the shared body admission lock. The actual
+// uploaded-state transactions must also fence admission on their own connection.
+func (si *S3Importer) importStoredBody(ctx context.Context, obj S3ObjectInfo, user *server.User, contentHash string) (int64, int64, error) {
+	s3Key := helpers.NewS3Key(user.Domain(), user.LocalPart(), contentHash)
 	// Download message content from S3
 	reader, err := si.s3.GetWithRetry(ctx, obj.Key)
 	if err != nil {
-		return fmt.Errorf("failed to download from S3: %w", err)
+		return 0, 0, fmt.Errorf("failed to download from S3: %w", err)
 	}
 	defer reader.Close()
 
@@ -581,14 +621,14 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	// on, so its length is the message's size; the listed object size is not.
 	content, err := io.ReadAll(reader)
 	if err != nil {
-		return fmt.Errorf("failed to read S3 content: %w", err)
+		return 0, 0, fmt.Errorf("failed to read S3 content: %w", err)
 	}
 	size := int64(len(content))
 
 	// Parse message
 	messageContent, err := server.ParseMessage(bytes.NewReader(content))
 	if err != nil {
-		return fmt.Errorf("failed to parse message: %w", err)
+		return 0, 0, fmt.Errorf("failed to parse message: %w", err)
 	}
 
 	mailHeader := mail.Header{Header: messageContent.Header}
@@ -638,20 +678,20 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	// Default mailboxes should already be created at this point
 	mailbox, err := si.rdb.GetMailboxByNameWithRetry(ctx, user.AccountID(), consts.MailboxInbox)
 	if err != nil {
-		return fmt.Errorf("failed to get INBOX mailbox: %w", err)
+		return 0, 0, fmt.Errorf("failed to get INBOX mailbox: %w", err)
 	}
 
-	// The insert and marking the body uploaded run to the end even if an interrupt
-	// lands between or during them: cut there, the message would stay in
-	// pending_uploads, waiting for an upload of a body that is already in S3. An
-	// interrupt before the insert leaves the object for the next run.
+	// Admit the row and uploaded state in one transaction. An interrupt before
+	// admission leaves the object for another run; admitted completion retains its
+	// claim capability even while finishing under WithoutCancel. Any fence failure
+	// rolls back the pair instead of leaving a spool-less pending message.
 	if err := ctx.Err(); err != nil {
-		return err
+		return 0, 0, err
 	}
 	writeCtx := context.WithoutCancel(ctx)
 
 	// Insert message into database
-	msgID, uid, err := si.rdb.InsertMessageWithRetry(writeCtx,
+	msgID, uid, err := si.rdb.InsertStoredMessageWithRetry(writeCtx,
 		&db.InsertMessageOptions{
 			AccountID:           user.AccountID(),
 			MailboxID:           mailbox.ID,
@@ -678,38 +718,17 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 			ContentHash: contentHash,
 			Size:        size,
 			AccountID:   user.AccountID(),
-		})
+		}, []string{s3Key})
 
 	if errors.Is(err, consts.ErrMessageExists) {
 		// INBOX received the message since the check above.
-		si.skipExisting(obj.Key, "already in INBOX")
-		return nil
+		return msgID, uid, err
 	}
 	if err != nil {
-		return fmt.Errorf("failed to insert message into database: %w", err)
+		return 0, 0, fmt.Errorf("failed to insert message into database: %w", err)
 	}
 
-	// Since the content already exists in S3, mark the upload as complete
-	err = si.rdb.CompleteS3UploadWithRetry(writeCtx, contentHash, user.AccountID(), []string{s3Key})
-	if err != nil {
-		return fmt.Errorf("failed to mark S3 upload as complete: %w", err)
-	}
-
-	atomic.AddInt64(&si.importedMessages, 1)
-	logger.Info("Successfully imported message", "progress", si.getProgressPrefix(),
-		"msg_id", msgID, "uid", uid, "user", user.FullAddress())
-
-	si.markObjectProcessed(obj.Key, true, "imported successfully")
-
-	// Add delay if configured; an interrupt ends it
-	if si.options.ImportDelay > 0 {
-		select {
-		case <-time.After(si.options.ImportDelay):
-		case <-ctx.Done():
-		}
-	}
-
-	return nil
+	return msgID, uid, nil
 }
 
 // existingCopies counts the account's live messages with this content hash: in all of
