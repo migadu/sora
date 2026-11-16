@@ -31,8 +31,8 @@ type DBMailbox struct {
 
 	// NameKey is LOWER(name) as the database computes it: the mailbox's identity
 	// (unique per owner, migration 000041). lower() depends on the collation, and
-	// no Go case mapping matches it, so names are compared by this key. Set by
-	// GetMailboxes.
+	// no Go case mapping matches it, so names are compared by this key
+	// (MailboxNameKeys gives a client's names theirs). Set by GetMailboxes.
 	NameKey string
 }
 
@@ -157,6 +157,41 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 	}
 
 	return mailboxes, nil
+}
+
+// MailboxNameKeys returns, in order, the key of each of names: LOWER(name) as the
+// database computes it, the key a name resolves to a mailbox by (DBMailbox.NameKey).
+// lower() depends on the collation and no Go case mapping matches it, so a name a
+// client gives is compared with mailboxes by this key. A name PostgreSQL cannot hold
+// (helpers.MailboxNameStorable) names no mailbox and gets the empty key, which no
+// mailbox has.
+func (db *Database) MailboxNameKeys(ctx context.Context, names []string) ([]string, error) {
+	keys := make([]string, len(names))
+	storable := make([]string, 0, len(names))
+	for _, name := range names {
+		if helpers.MailboxNameStorable(name) {
+			storable = append(storable, name)
+		}
+	}
+	if len(storable) == 0 {
+		return keys, nil
+	}
+
+	var lowered []string
+	if err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT ARRAY(SELECT LOWER(n) FROM unnest($1::text[]) WITH ORDINALITY AS t(n, i) ORDER BY i)
+	`, storable).Scan(&lowered); err != nil {
+		return nil, fmt.Errorf("failed to compute mailbox name keys: %w", err)
+	}
+	if len(lowered) != len(storable) {
+		return nil, fmt.Errorf("computed %d mailbox name keys for %d names", len(lowered), len(storable))
+	}
+	for i, name := range names {
+		if helpers.MailboxNameStorable(name) {
+			keys[i], lowered = lowered[0], lowered[1:]
+		}
+	}
+	return keys, nil
 }
 
 // GetMailboxesCount returns the number of mailboxes for an account
