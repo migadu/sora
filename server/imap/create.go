@@ -71,15 +71,12 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 
 	// Prevent creating the shared namespace root explicitly
 	// Users should create "Shared/Something", not just "Shared"
-	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
-		sharedPrefix := strings.TrimSuffix(s.server.config.SharedMailboxes.NamespacePrefix, "/")
-		if strings.EqualFold(name, sharedPrefix) {
-			s.DebugLog("cannot create shared namespace root explicitly", "name", name)
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeCannot,
-				Text: "Cannot create the shared namespace root directly. Create mailboxes under it instead (e.g., Shared/FolderName)",
-			}
+	if s.server.config != nil && s.server.config.SharedMailboxes.IsNamespaceRoot(name) {
+		s.DebugLog("cannot create shared namespace root explicitly", "name", name)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeCannot,
+			Text: "Cannot create the shared namespace root directly. Create mailboxes under it instead (e.g., Shared/FolderName)",
 		}
 	}
 
@@ -362,7 +359,7 @@ func (s *IMAPSession) isRefusedSharedRoot(ctx context.Context, accountID int64, 
 			break
 		}
 		parent = parent[:separator]
-		if strings.EqualFold(parent, strings.TrimSuffix(shared.NamespacePrefix, "/")) || !shared.InNamespace(parent) {
+		if shared.IsNamespaceRoot(parent) || !shared.InNamespace(parent) {
 			break
 		}
 		mbox, err := s.server.rdb.GetSharedMailboxByNameForRightWithRetry(ctx, accountID, parent, db.ACLRightCreate)

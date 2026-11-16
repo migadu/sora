@@ -42,7 +42,7 @@ api_key = "a-long-random-token"   # optional bearer token
 | `addr` | string | required | Listen address. |
 | `path` | string | `"/metrics"` | URL path. Only this exact path serves metrics. Must begin with `/`. |
 | `allowed_hosts` | list of strings | empty (any host) | IP addresses or CIDR blocks allowed to scrape. Other peers get `403 forbidden`. |
-| `api_key` | string | none | When set, every request needs `Authorization: Bearer <key>`. Without the header the answer is `401 unauthorized`; with a wrong key, `403 forbidden`. |
+| `api_key` | string | none | When set, every request needs `Authorization: Bearer <key>`. Without the header or with a wrong key the answer is `401 unauthorized`, with `WWW-Authenticate: Bearer realm="metrics"` (plus `error="invalid_token"` for a wrong key). |
 | `enable_domain_metrics` | bool | `true` | Count activity per mail domain (see [3.18](#318-domain-and-user-metrics)). |
 | `enable_user_metrics` | bool | `false` | Give heavy users their own series (see [3.18](#318-domain-and-user-metrics)). |
 | `user_metrics_threshold` | integer | `1000` | Commands plus connections after which a user gets its own series. |

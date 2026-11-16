@@ -1078,8 +1078,14 @@ func TestErrorScenarios(t *testing.T) {
 			t.Fatalf("Failed to read response body: %v", err)
 		}
 
-		if resp.StatusCode != http.StatusForbidden {
-			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusForbidden, resp.StatusCode, string(body))
+		// RFC 6750 section 3.1, invalid_token: "The resource SHOULD respond with the HTTP
+		// 401 (Unauthorized) status code."
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusUnauthorized, resp.StatusCode, string(body))
+		}
+		const wantChallenge = `Bearer realm="admin-api", error="invalid_token"`
+		if got := resp.Header.Values("WWW-Authenticate"); len(got) != 1 || got[0] != wantChallenge {
+			t.Errorf("WWW-Authenticate = %q, want %q", got, wantChallenge)
 		}
 
 		server.expectError(t, body, "Invalid API key")

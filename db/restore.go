@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -342,7 +344,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	}
 
 	query, args := restoreCandidatesQuery(accountID, params,
-		"m.id, "+effectiveMailboxName+", m.message_id, m.content_hash")
+		"m.id, "+effectiveMailboxName+", m.message_id, m.delivery_hash, m.content_hash")
 	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("failed to query messages for restoration: %w", err)
@@ -351,10 +353,11 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 
 	// Collect messages and their target mailboxes
 	type msgToRestore struct {
-		id          int64
-		mailboxName string // effective name: live mailbox's current name, else the stored string
-		messageID   string
-		contentHash string // for the per-object lock shared with the cleaner
+		id           int64
+		mailboxName  string  // effective name: live mailbox's current name, else the stored string
+		messageID    string
+		deliveryHash *string // set by MTA delivery only; deduplicates headerless redeliveries per mailbox
+		contentHash  string  // for the per-object lock shared with the cleaner
 	}
 
 	var messagesToRestore []msgToRestore
@@ -363,7 +366,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	for rows.Next() {
 		var msg msgToRestore
 		var mailboxName *string
-		err := rows.Scan(&msg.id, &mailboxName, &msg.messageID, &msg.contentHash)
+		err := rows.Scan(&msg.id, &mailboxName, &msg.messageID, &msg.deliveryHash, &msg.contentHash)
 		if err != nil {
 			return 0, fmt.Errorf("failed to scan message for restoration: %w", err)
 		}
@@ -412,6 +415,30 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		mailboxIDMap[mailboxName] = mailboxID
 	}
 
+	// Lock all target mailbox rows up-front in ascending id order before taking per-object
+	// locks or touching messages / mailbox_stats. This preserves the global lock order
+	// (mailboxes -> advisory / messages -> mailbox_stats) instead of locking mailboxes
+	// ad-hoc via the per-message highest_uid UPDATE, and serializes reading each target
+	// mailbox's keyword registry against concurrent STORE, APPEND, COPY, and MOVE writes.
+	targetMailboxIDs := make([]int64, 0, len(mailboxIDMap))
+	for _, id := range mailboxIDMap {
+		targetMailboxIDs = append(targetMailboxIDs, id)
+	}
+	slices.Sort(targetMailboxIDs)
+	targetMailboxIDs = slices.Compact(targetMailboxIDs)
+	if _, err := tx.Exec(ctx, "SELECT id FROM mailboxes WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE", targetMailboxIDs); err != nil {
+		return 0, fmt.Errorf("failed to lock target mailboxes for restoration: %w", err)
+	}
+
+	canonicalByMailbox := make(map[int64]map[string]string, len(targetMailboxIDs))
+	for _, mailboxID := range targetMailboxIDs {
+		canonical, err := d.mailboxKeywordCanonicalMap(ctx, tx, mailboxID)
+		if err != nil {
+			return 0, fmt.Errorf("failed to read canonical keywords for mailbox %d: %w", mailboxID, err)
+		}
+		canonicalByMailbox[mailboxID] = canonical
+	}
+
 	// Restore each message as a new row in its target mailbox
 	var restoredCount int64
 	var skippedCount int64
@@ -419,12 +446,14 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		targetMailboxID := mailboxIDMap[msg.mailboxName]
 
 		// Re-check the row under this transaction, and look for a live copy of the same
-		// Message-ID in the TARGET mailbox. It is valid to have the same Message-ID in
-		// different mailboxes (e.g. INBOX + Sent), but restoring never produces a second
-		// live copy inside one mailbox — including a copy restored earlier in this run or
-		// in a previous chunk. The row itself may have vanished since the candidate list was
-		// built (already restored by a concurrent run, or purged by the cleaner); that is a
-		// skip, not an error, so a restore is always safe to re-run.
+		// Message-ID or non-empty delivery_hash in the TARGET mailbox (headerless MTA
+		// deliveries receive a fresh synthetic Message-ID per attempt and deduplicate on
+		// delivery_hash). It is valid to have the same message in different mailboxes
+		// (e.g. INBOX + Sent), but restoring never produces a second live copy inside one
+		// mailbox — including a copy restored earlier in this run or in a previous chunk.
+		// The row itself may have vanished since the candidate list was built (already
+		// restored by a concurrent run, or purged by the cleaner); that is a skip, not an
+		// error, so a restore is always safe to re-run.
 		// Hold the object's lock while the message comes back to life: the cleaner takes
 		// the same lock (session try-lock) around "confirm orphan → delete object",
 		// so a restore can no longer slip between its check and its delete and leave a
@@ -434,12 +463,21 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		}
 
 		var restorable bool
-		var existingCount int
+		var alreadyExists bool
+		var rawCustomFlags []byte
 		err := tx.QueryRow(ctx, `
 			SELECT EXISTS (SELECT 1 FROM messages WHERE id = $1 AND expunged_at IS NOT NULL AND restored_at IS NULL),
-			       (SELECT COUNT(*) FROM messages
-			         WHERE account_id = $2 AND mailbox_id = $3 AND message_id = $4 AND expunged_at IS NULL)
-		`, msg.id, accountID, targetMailboxID, msg.messageID).Scan(&restorable, &existingCount)
+			       EXISTS (
+			           SELECT 1 FROM messages
+			           WHERE account_id = $2 AND mailbox_id = $3 AND message_id = $4 AND expunged_at IS NULL
+			       ) OR (
+			           $5::text IS NOT NULL AND $5::text <> '' AND EXISTS (
+			               SELECT 1 FROM messages
+			               WHERE account_id = $2 AND mailbox_id = $3 AND delivery_hash IS NOT NULL AND delivery_hash = $5::text AND expunged_at IS NULL
+			           )
+			       ),
+			       (SELECT custom_flags FROM message_state WHERE message_id = $1)
+		`, msg.id, accountID, targetMailboxID, msg.messageID, msg.deliveryHash).Scan(&restorable, &alreadyExists, &rawCustomFlags)
 		if err != nil {
 			return 0, fmt.Errorf("failed to check restore preconditions for message %d: %w", msg.id, err)
 		}
@@ -450,11 +488,19 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 			continue
 		}
 
-		if existingCount > 0 {
+		if alreadyExists {
 			// A non-expunged copy already exists in the target mailbox, skip restoration
 			logger.Info("Database: skipping message restoration: message already exists in target mailbox", "id", msg.id, "mailbox", msg.mailboxName)
 			skippedCount++
 			continue
+		}
+
+		// Fold custom keywords onto the target mailbox's canonical case (RFC 9051 §2.3.2),
+		// sharing newly established canonical forms across the batch just as CopyMessages,
+		// MoveMessages, and InsertMessagesBatch do.
+		customFlagsJSON, err := canonicalizeRestoredCustomFlags(canonicalByMailbox[targetMailboxID], rawCustomFlags, msg.id)
+		if err != nil {
+			return 0, err
 		}
 
 		// Get next UID for the mailbox
@@ -508,10 +554,10 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 				RETURNING id
 			)
 			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
-			SELECT r.id, $2::bigint, COALESCE(ms.flags & ~8, 0), COALESCE(ms.custom_flags, '[]'::jsonb), now(), nextval('messages_modseq')
+			SELECT r.id, $2::bigint, COALESCE(ms.flags & ~8, 0), $5::jsonb, now(), nextval('messages_modseq')
 			FROM restored r
 			LEFT JOIN message_state ms ON ms.message_id = $1
-		`, msg.id, targetMailboxID, msg.mailboxName, nextUID)
+		`, msg.id, targetMailboxID, msg.mailboxName, nextUID, customFlagsJSON)
 		if err != nil {
 			return 0, fmt.Errorf("failed to restore message %d: %w", msg.id, err)
 		}
@@ -524,6 +570,36 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	}
 
 	return restoredCount, nil
+}
+
+// canonicalizeRestoredCustomFlags folds raw JSON-encoded custom_flags onto canonical
+// (the target mailbox's fold-key -> canonical-case map, mutated in place so keywords
+// new to the mailbox establish a single canonical case across the restore batch) and
+// returns a valid JSON array ("[]" when empty).
+func canonicalizeRestoredCustomFlags(canonical map[string]string, raw []byte, messageID int64) (string, error) {
+	if len(raw) == 0 {
+		return "[]", nil
+	}
+	var kws []string
+	if err := json.Unmarshal(raw, &kws); err != nil {
+		return "", fmt.Errorf("failed to unmarshal custom_flags for message %d: %w", messageID, err)
+	}
+	filtered := kws[:0]
+	for _, kw := range kws {
+		if kw == "" || strings.HasPrefix(kw, "\\") {
+			continue
+		}
+		filtered = append(filtered, kw)
+	}
+	folded := foldKeywordsWithMap(canonical, filtered)
+	if len(folded) == 0 {
+		return "[]", nil
+	}
+	encoded, err := json.Marshal(folded)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal canonical custom_flags for message %d: %w", messageID, err)
+	}
+	return string(encoded), nil
 }
 
 // restoreMailbox returns the id and path of the live mailbox called name, recreating it

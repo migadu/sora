@@ -1081,6 +1081,12 @@ the server creates it, and given to the owner of the directory it is created in:
 default `/var/lib/sora/certs`, the owner of `/var/lib/sora`, the server's user under
 `dist/sora.service`. A directory created in a sticky directory such as `/tmp` stays yours.
 
+`cache` counts a certificate that is not in S3 under `Not found` and goes on: a configured
+domain may not have been issued yet, and the RSA certificate exists only once a client has
+asked for one. With `--domain`, it exits `1` when neither certificate of that domain is in S3,
+as `delete --domain` does. A certificate that cannot be downloaded, does not parse, or cannot
+be written exits `1` as well; the others are still cached.
+
 ---
 
 ## 22. config
@@ -1097,6 +1103,15 @@ the `[tls]` certificate and key paths, the Let's Encrypt S3 keys, `[cluster] sec
 `[admin_cli] api_key`, `[relay] auth_token`, `[spam_training] auth_token`, and the `api_key`,
 `jwt_secret`, `master_password`, `master_sasl_password` and remote lookup `auth_token` of each
 `[[server]]`.
+
+In every other setting that holds a URL, such as `[relay] http_url`, `[spam_training] endpoint`
+or the remote lookup `url`, it masks the userinfo and the value of each query parameter, and keeps
+the scheme, host, port, path, fragment and parameter names. The remote lookup `$email` and `$ip`
+placeholders are shown. A query component that may be a bare token is masked whole, name
+included: one without `=`, and one whose value is empty or only `=` signs, as a base64 token
+ending in `=` padding looks like a name with such a value. A URL with userinfo or a query that
+does not parse is masked whole. The server's log lines and errors show these endpoints masked the
+same way. `--mask-secrets=false` prints every value as configured.
 
 See [CONFIGURATION.md](CONFIGURATION.md) for the file itself.
 

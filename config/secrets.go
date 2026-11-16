@@ -393,15 +393,17 @@ func isURLListSep(b byte) bool {
 // (server/proxy/http_remotelookup.go): placeholders, never credentials.
 var urlTemplates = map[string]bool{"$email": true, "$ip": true}
 
-// maskQueryValues masks every non-empty value of a raw query, as written, so a
-// percent-encoded value is masked whole. Only "&" separates parameters: a ";" stays
-// inside the masked value. A component without "=" is masked whole, since it may
-// be a bare token.
+// maskQueryValues masks every value of a raw query, as written, so a percent-encoded
+// value is masked whole. Only "&" separates parameters: a ";" stays inside the masked
+// value. A component that may be a bare token is masked whole, name included: one
+// without "=", and one whose value is empty or only "=" signs, since a base64 token
+// ends in "=" padding (RFC 4648 section 4) and "dGhpcw==" is no name "dGhpcw". So a
+// parameter with an empty value, such as "debug=", is shown masked too.
 func maskQueryValues(rawQuery string) string {
 	params := strings.Split(rawQuery, "&")
 	for i, param := range params {
 		prefix, value := "", param
-		if name, v, ok := strings.Cut(param, "="); ok {
+		if name, v, ok := strings.Cut(param, "="); ok && strings.Trim(v, "=") != "" {
 			prefix, value = name+"=", v
 		}
 		if value != "" && !urlTemplates[value] {
