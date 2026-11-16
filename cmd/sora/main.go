@@ -843,7 +843,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		redirectRateWindow := cfg.LongestRedirectRateWindow()
 
 		cleanupErrChan := make(chan error, 1)
-		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, redirectRateWindow, cfg.Uploader.MaxAttempts, instanceLiveness, cleanupErrChan)
+		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, redirectRateWindow, cfg.Uploader.MaxAttempts, instanceLiveness, cleanupErrChan, cfg.S3.BodyDeletionProtocol)
 		deps.ftsWorker = fts.NewWorker(deps.resilientDB)
 
 		// Start error listener for cleanup worker
@@ -865,7 +865,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 		// The purge worker performs account purges requested through the Admin API on
 		// any node; it runs here because this node has object storage.
-		deps.purgeWorker = cleaner.NewPurgeWorker(deps.resilientDB, deps.storage, cfg.Cleanup.GetPurgePollIntervalWithDefault())
+		deps.purgeWorker = cleaner.NewPurgeWorker(deps.resilientDB, deps.storage, cfg.Cleanup.GetPurgePollIntervalWithDefault(), cfg.S3.BodyDeletionProtocol)
 		if err := deps.purgeWorker.Start(ctx); err != nil {
 			errorHandler.FatalError("start purge worker", err)
 			os.Exit(errorHandler.WaitForExit())

@@ -32,7 +32,7 @@ func TestProxyProtocolIncoming(t *testing.T) {
 
 	t.Run("without_proxy_header", func(t *testing.T) {
 		// Start POP3 proxy WITH PROXY protocol incoming enabled
-		proxyAddr, stopProxy := setupPOP3ProxyWithPROXYIncoming(t, backendServer.ResilientDB, backendServer.Address)
+		proxyAddr, stopProxy := setupPOP3ProxyWithPROXYIncoming(t, backendServer.ResilientDB, backendServer.Address, false)
 		defer stopProxy()
 
 		// Give servers time to start
@@ -57,100 +57,102 @@ func TestProxyProtocolIncoming(t *testing.T) {
 		t.Logf("Expected failure: connection closed without PROXY header: %v", err)
 	})
 
-	t.Run("with_proxy_header", func(t *testing.T) {
-		// Start POP3 proxy WITH PROXY protocol incoming enabled
-		proxyAddr, stopProxy := setupPOP3ProxyWithPROXYIncoming(t, backendServer.ResilientDB, backendServer.Address)
-		defer stopProxy()
+	for _, skip := range []bool{false, true} {
+		t.Run(fmt.Sprintf("with_proxy_header_skip_%t", skip), func(t *testing.T) {
+			// Start POP3 proxy WITH PROXY protocol incoming enabled
+			proxyAddr, stopProxy := setupPOP3ProxyWithPROXYIncoming(t, backendServer.ResilientDB, backendServer.Address, skip)
+			defer stopProxy()
 
-		// Give servers time to start
-		time.Sleep(100 * time.Millisecond)
+			// Give servers time to start
+			time.Sleep(100 * time.Millisecond)
 
-		// Connect to proxy
-		conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
-		if err != nil {
-			t.Fatalf("Failed to connect to proxy: %v", err)
-		}
-		defer conn.Close()
+			// Connect to proxy
+			conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+			if err != nil {
+				t.Fatalf("Failed to connect to proxy: %v", err)
+			}
+			defer conn.Close()
 
-		// Send PROXY v2 header with real client IP
-		realClientIP := "203.0.113.42"
-		realClientPort := 54321
-		serverIP := "127.0.0.1"
-		serverPort := conn.LocalAddr().(*net.TCPAddr).Port
+			// Send PROXY v2 header with real client IP
+			realClientIP := "203.0.113.42"
+			realClientPort := 54321
+			serverIP := "127.0.0.1"
+			serverPort := conn.LocalAddr().(*net.TCPAddr).Port
 
-		header, err := server.GenerateProxyV2Header(realClientIP, realClientPort, serverIP, serverPort, "TCP4")
-		if err != nil {
-			t.Fatalf("Failed to generate PROXY header: %v", err)
-		}
+			header, err := server.GenerateProxyV2Header(realClientIP, realClientPort, serverIP, serverPort, "TCP4")
+			if err != nil {
+				t.Fatalf("Failed to generate PROXY header: %v", err)
+			}
 
-		_, err = conn.Write(header)
-		if err != nil {
-			t.Fatalf("Failed to send PROXY header: %v", err)
-		}
+			_, err = conn.Write(header)
+			if err != nil {
+				t.Fatalf("Failed to send PROXY header: %v", err)
+			}
 
-		// Now read greeting
-		reader := bufio.NewReader(conn)
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		greeting, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("Failed to read greeting after PROXY header: %v", err)
-		}
-		t.Logf("Greeting after PROXY header: %s", strings.TrimSpace(greeting))
+			// Now read greeting
+			reader := bufio.NewReader(conn)
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			greeting, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatalf("Failed to read greeting after PROXY header: %v", err)
+			}
+			t.Logf("Greeting after PROXY header: %s", strings.TrimSpace(greeting))
 
-		// Should get POP3 greeting
-		if !strings.HasPrefix(greeting, "+OK") {
-			t.Fatalf("Expected +OK greeting, got: %s", greeting)
-		}
+			// Should get POP3 greeting
+			if !strings.HasPrefix(greeting, "+OK") {
+				t.Fatalf("Expected +OK greeting, got: %s", greeting)
+			}
 
-		// Authenticate
-		_, err = conn.Write([]byte(fmt.Sprintf("USER %s\r\n", email)))
-		if err != nil {
-			t.Fatalf("Failed to send USER: %v", err)
-		}
+			// Authenticate
+			_, err = conn.Write([]byte(fmt.Sprintf("USER %s\r\n", email)))
+			if err != nil {
+				t.Fatalf("Failed to send USER: %v", err)
+			}
 
-		userResp, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("Failed to read USER response: %v", err)
-		}
-		t.Logf("USER response: %s", strings.TrimSpace(userResp))
+			userResp, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatalf("Failed to read USER response: %v", err)
+			}
+			t.Logf("USER response: %s", strings.TrimSpace(userResp))
 
-		_, err = conn.Write([]byte(fmt.Sprintf("PASS %s\r\n", password)))
-		if err != nil {
-			t.Fatalf("Failed to send PASS: %v", err)
-		}
+			_, err = conn.Write([]byte(fmt.Sprintf("PASS %s\r\n", password)))
+			if err != nil {
+				t.Fatalf("Failed to send PASS: %v", err)
+			}
 
-		passResp, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("Failed to read PASS response: %v", err)
-		}
-		t.Logf("PASS response: %s", strings.TrimSpace(passResp))
+			passResp, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatalf("Failed to read PASS response: %v", err)
+			}
+			t.Logf("PASS response: %s", strings.TrimSpace(passResp))
 
-		if !strings.HasPrefix(passResp, "+OK") {
-			t.Fatalf("Authentication failed: %s", passResp)
-		}
+			if !strings.HasPrefix(passResp, "+OK") {
+				t.Fatalf("Authentication failed: %s", passResp)
+			}
 
-		// QUIT
-		_, err = conn.Write([]byte("QUIT\r\n"))
-		if err != nil {
-			t.Fatalf("Failed to send QUIT: %v", err)
-		}
+			// QUIT
+			_, err = conn.Write([]byte("QUIT\r\n"))
+			if err != nil {
+				t.Fatalf("Failed to send QUIT: %v", err)
+			}
 
-		quitResp, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("Failed to read QUIT response: %v", err)
-		}
-		t.Logf("QUIT response: %s", strings.TrimSpace(quitResp))
+			quitResp, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatalf("Failed to read QUIT response: %v", err)
+			}
+			t.Logf("QUIT response: %s", strings.TrimSpace(quitResp))
 
-		t.Logf("SUCCESS: PROXY protocol incoming support is working for POP3!")
+			t.Logf("SUCCESS: PROXY protocol incoming support is working for POP3!")
 
-		// NOTE: To verify the real client IP reaches the backend, check the backend logs.
-		// The backend should log remote=203.0.113.42 instead of the proxy's IP. The
-		// proxy's own PROXY header to the backend carries it (no XCLIENT is sent next to
-		// a header: the backend would judge it by that client and refuse it).
-	})
+			// NOTE: To verify the real client IP reaches the backend, check the backend logs.
+			// PROXY carries the original address in both modes. Configured XCLIENT
+			// remains enabled by default; the backend can accept or refuse it by its
+			// trust policy. Only explicit skip opts out of the extra metadata.
+		})
+	}
 }
 
-func setupPOP3ProxyWithPROXYIncoming(t *testing.T, rdb *resilient.ResilientDatabase, backendAddr string) (string, func()) {
+func setupPOP3ProxyWithPROXYIncoming(t *testing.T, rdb *resilient.ResilientDatabase, backendAddr string, skipForwarding bool) (string, func()) {
 	t.Helper()
 
 	proxyAddr := common.GetRandomAddress(t)
@@ -159,20 +161,21 @@ func setupPOP3ProxyWithPROXYIncoming(t *testing.T, rdb *resilient.ResilientDatab
 	masterPassword := "proxypass"
 
 	opts := pop3proxy.POP3ProxyServerOptions{
-		Name:                   "test-pop3-proxy-protocol",
-		RemoteAddrs:            []string{backendAddr},
-		RemotePort:             110,
-		MasterSASLUsername:     masterUsername,
-		MasterSASLPassword:     masterPassword,
-		TLS:                    false,
-		TLSVerify:              false,
-		RemoteTLS:              false,
-		RemoteTLSVerify:        false,
-		RemoteUseProxyProtocol: true, // Enable PROXY protocol to backend
-		RemoteUseXCLIENT:       true, // Enable XCLIENT forwarding to backend
-		ConnectTimeout:         10 * time.Second,
-		AuthIdleTimeout:        30 * time.Minute,
-		EnableAffinity:         true,
+		Name:                                  "test-pop3-proxy-protocol",
+		RemoteAddrs:                           []string{backendAddr},
+		RemotePort:                            110,
+		MasterSASLUsername:                    masterUsername,
+		MasterSASLPassword:                    masterPassword,
+		TLS:                                   false,
+		TLSVerify:                             false,
+		RemoteTLS:                             false,
+		RemoteTLSVerify:                       false,
+		RemoteUseProxyProtocol:                true, // Enable PROXY protocol to backend
+		RemoteUseXCLIENT:                      true, // Enable XCLIENT forwarding to backend
+		RemoteSkipForwardingWithProxyProtocol: skipForwarding,
+		ConnectTimeout:                        10 * time.Second,
+		AuthIdleTimeout:                       30 * time.Minute,
+		EnableAffinity:                        true,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,
 		},

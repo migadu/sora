@@ -173,75 +173,96 @@ func tcpPair(t *testing.T) (dialed, accepted net.Conn) {
 	return dialed, accepted
 }
 
-// Next to a PROXY header a POP3 backend judges XCLIENT by the client the header names, not
-// by this proxy (server.ForwardingSourceIP), and refuses it: that client is not in its
-// trusted_networks. The header already carries the client's address and port, so XCLIENT
-// there is a wasted round trip and a WARN line on every login. The proxy sends it only on a
-// leg without a header, by the settings the dial uses: the server's, a lookup pin's, or the
-// named pool's (whose remote_use_xclient also covers LMTP, which still needs XCLIENT).
+// Forwarding remains enabled by default: PROXY does not carry every ID/XCLIENT
+// variable. Explicit suppression applies only when this exact backend leg sends
+// PROXY, using the pin/pool policy in preference to the opposite server policy.
 func TestConnectToBackendSkipsXCLIENTNextToProxyHeader(t *testing.T) {
-	for _, tc := range []struct {
-		name               string
-		route              string // "server" (remote_addrs), "pin" (remote lookup) or "pool"
-		proxyProtocol      bool   // the proxy server's remote_use_proxy_protocol
-		routeProxyProtocol bool   // the pin's or the pool's remote_use_proxy_protocol
-		wantSent           []string
-	}{
-		{"server settings, PROXY header", "server", true, false, []string{"PROXY", "AUTH"}},
-		{"server settings, no PROXY header", "server", false, false, []string{"XCLIENT", "AUTH"}},
-		{"lookup pin with PROXY header", "pin", false, true, []string{"PROXY", "AUTH"}},
-		{"lookup pin without PROXY header", "pin", true, false, []string{"XCLIENT", "AUTH"}},
-		{"pool with PROXY header", "pool", false, true, []string{"PROXY", "AUTH"}},
-		{"pool without PROXY header", "pool", true, false, []string{"XCLIENT", "AUTH"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			addr, commands := xclientBackend(t, 0, "-ERR Connection not from trusted proxy", "+OK logged in")
-			cm, err := proxy.NewConnectionManager([]string{addr}, 110, false, false, tc.proxyProtocol, 500*time.Millisecond)
-			if tc.route == "pool" {
-				cm, err = proxy.NewConnectionManagerWithPools([]proxy.PoolSpec{{
-					Name: "sora0", Backends: []string{addr}, Default: true,
-					Settings: proxy.BackendSettings{UseProxyProtocol: tc.routeProxyProtocol, UseXCLIENT: true},
-				}}, 110, 500*time.Millisecond, nil, "test", true)
+	for _, skip := range []bool{false, true} {
+		for _, tc := range []struct {
+			name               string
+			route              string // "server" (remote_addrs), "pin" (remote lookup) or "pool"
+			proxyProtocol      bool   // the proxy server's remote_use_proxy_protocol
+			routeProxyProtocol bool   // the pin's or the pool's remote_use_proxy_protocol
+			wantSent           []string
+		}{
+			{"server settings, PROXY header", "server", true, false, []string{"PROXY", "AUTH"}},
+			{"server settings, no PROXY header", "server", false, false, []string{"XCLIENT", "AUTH"}},
+			{"server PROXY configured but no TCP addresses", "invalid", true, false, []string{"XCLIENT", "AUTH"}},
+			{"lookup pin with PROXY header", "pin", false, true, []string{"PROXY", "AUTH"}},
+			{"lookup pin without PROXY header", "pin", true, false, []string{"XCLIENT", "AUTH"}},
+			{"pool with PROXY header", "pool", false, true, []string{"PROXY", "AUTH"}},
+			{"pool without PROXY header", "pool", true, false, []string{"XCLIENT", "AUTH"}},
+		} {
+			label := "default retains/"
+			if skip {
+				label = "explicit skip/"
 			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			// The routing info an uncached database login leaves (authenticate), or a pin.
-			route := &proxy.UserRoutingInfo{RemoteUseXCLIENT: true}
-			if tc.route == "pin" {
-				route = &proxy.UserRoutingInfo{
-					ServerAddress:          addr,
-					IsRemoteLookupAccount:  true,
-					RemoteUseProxyProtocol: tc.routeProxyProtocol,
-					RemoteUseXCLIENT:       true,
+			t.Run(label+tc.name, func(t *testing.T) {
+				globalSkip := skip
+				if tc.route == "pin" || tc.route == "pool" {
+					globalSkip = !skip
 				}
-			}
-			_, client := tcpPair(t)
-			sess := &POP3ProxySession{
-				server: &POP3ProxyServer{
-					name:             "test",
-					hostname:         "test-host",
-					connManager:      cm,
-					remoteUseXCLIENT: true,
-				},
-				clientConn:            client,
-				listenerConn:          client,
-				ctx:                   context.Background(),
-				username:              "user@example.com",
-				isRemoteLookupAccount: tc.route == "pin",
-				routingInfo:           route,
-			}
+				wantSent := tc.wantSent
+				if !skip && tc.route != "invalid" && (tc.route == "server" && tc.proxyProtocol || tc.route != "server" && tc.routeProxyProtocol) {
+					wantSent = []string{"PROXY", "XCLIENT", "AUTH"}
+				}
+				addr, commands := xclientBackend(t, 0, "-ERR Connection not from trusted proxy", "+OK logged in")
+				cm, err := proxy.NewConnectionManager([]string{addr}, 110, false, false, tc.proxyProtocol, 500*time.Millisecond)
+				if tc.route == "pool" {
+					cm, err = proxy.NewConnectionManagerWithPools([]proxy.PoolSpec{{
+						Name: "sora0", Backends: []string{addr}, Default: true,
+						Settings: proxy.BackendSettings{UseProxyProtocol: tc.routeProxyProtocol, UseXCLIENT: true, SkipForwardingWithProxyProtocol: skip},
+					}}, 110, 500*time.Millisecond, nil, "test", true)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				// The routing info an uncached database login leaves (authenticate), or a pin.
+				route := &proxy.UserRoutingInfo{RemoteUseXCLIENT: true}
+				if tc.route == "pin" {
+					route = &proxy.UserRoutingInfo{
+						ServerAddress:                         addr,
+						IsRemoteLookupAccount:                 true,
+						RemoteUseProxyProtocol:                tc.routeProxyProtocol,
+						RemoteSkipForwardingWithProxyProtocol: skip,
+						RemoteUseXCLIENT:                      true,
+					}
+				}
+				var client net.Conn
+				if tc.route == "invalid" {
+					var other net.Conn
+					client, other = net.Pipe()
+					t.Cleanup(func() { client.Close(); other.Close() })
+				} else {
+					_, client = tcpPair(t)
+				}
+				sess := &POP3ProxySession{
+					server: &POP3ProxyServer{
+						name:                                  "test",
+						hostname:                              "test-host",
+						connManager:                           cm,
+						remoteUseXCLIENT:                      true,
+						remoteSkipForwardingWithProxyProtocol: globalSkip,
+					},
+					clientConn:            client,
+					listenerConn:          client,
+					ctx:                   context.Background(),
+					username:              "user@example.com",
+					isRemoteLookupAccount: tc.route == "pin",
+					routingInfo:           route,
+				}
 
-			err = sess.connectToBackend()
-			if sess.backendConn != nil {
-				sess.backendConn.Close() // ends the fake backend's connection
-			}
-			if err != nil {
-				t.Errorf("connectToBackend: %v", err)
-			}
-			if sent := commands(); strings.Join(sent, " ") != strings.Join(tc.wantSent, " ") {
-				t.Errorf("the backend read %q, want %q", sent, tc.wantSent)
-			}
-		})
+				err = sess.connectToBackend()
+				if sess.backendConn != nil {
+					sess.backendConn.Close() // ends the fake backend's connection
+				}
+				if err != nil {
+					t.Errorf("connectToBackend: %v", err)
+				}
+				if sent := commands(); strings.Join(sent, " ") != strings.Join(wantSent, " ") {
+					t.Errorf("the backend read %q, want %q", sent, wantSent)
+				}
+			})
+		}
 	}
 }

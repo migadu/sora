@@ -157,6 +157,7 @@ func TestWarnUnusedConfigOptions_KeysOnlySomeServerTypesRead(t *testing.T) {
 		{"remote_health_checks", func(s *ServerConfig) { s.RemoteHealthChecks = &yes }, proxies},
 		{"enable_affinity", func(s *ServerConfig) { s.EnableAffinity = true }, proxies},
 		{"remote_use_id_command", func(s *ServerConfig) { s.RemoteUseIDCommand = true }, []string{"imap_proxy"}},
+		{"remote_skip_forwarding_with_proxy_protocol", func(s *ServerConfig) { s.RemoteSkipForwardingWithProxyProtocol = true }, []string{"imap_proxy", "pop3_proxy"}},
 		{"remote_use_xclient", func(s *ServerConfig) { s.RemoteUseXCLIENT = true }, []string{"pop3_proxy", "lmtp_proxy"}},
 		{"remote_use_utf8", func(s *ServerConfig) { s.RemoteUseUTF8 = true }, []string{"pop3_proxy"}},
 

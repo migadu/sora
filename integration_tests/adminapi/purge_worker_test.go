@@ -26,7 +26,7 @@ import (
 // rightly drains too, so a test asserts on its own account's state, never on the count.
 func (s *purgeStack) runWorker(t *testing.T) int {
 	t.Helper()
-	w := cleaner.NewPurgeWorker(s.rdb, s.st, time.Minute)
+	w := cleaner.NewPurgeWorker(s.rdb, s.st, time.Minute, "global-hash-v1")
 	total := 0
 	for i := 0; i < 50; i++ {
 		purged, err := w.RunOnce(context.Background())
@@ -313,5 +313,38 @@ func TestPurgeWorker_ReportsPending(t *testing.T) {
 	}
 	if after >= count {
 		t.Errorf("pending purges = %d after the cycle, want fewer than %d", after, count)
+	}
+}
+
+// A queued API request stays recoverable while deletion is paused. A newly
+// acknowledged worker resumes the same request after the deployment drain.
+func TestPurgeWorker_DefaultPausedRetainsThenResumes(t *testing.T) {
+	s := setupPurgeStack(t)
+	email, accountID := s.newMailAccount(t, "worker-protocol-pause", "worker-pass-pause")
+	key := s.addMessage(t, accountID, email, "retained", true)
+	s.requestPurge(t, email)
+	rowsBefore := s.count(t, "messages", accountID)
+	w := cleaner.NewPurgeWorker(s.rdb, s.st, time.Minute)
+	purged, err := w.RunOnce(context.Background())
+	if err != nil || purged != 0 {
+		t.Fatalf("paused worker purged=%d err=%v", purged, err)
+	}
+	s.requireStillThere(t, accountID)
+	if n := s.count(t, "messages", accountID); n != rowsBefore {
+		t.Fatalf("paused worker changed message rows: %d -> %d", rowsBefore, n)
+	}
+	if len(s.s3.Keys(key)) != 1 {
+		t.Fatal("paused worker deleted the body")
+	}
+	if s.purgeMark(t, accountID) == nil {
+		t.Fatal("paused worker dropped the retryable purge request")
+	}
+	if attempts, next := s.backoff(t, accountID); attempts != 0 || next != nil {
+		t.Fatalf("pause recorded a purge failure: attempts=%d next=%v", attempts, next)
+	}
+	s.runWorker(t)
+	s.requireGone(t, accountID, email)
+	if len(s.s3.Keys(key)) != 0 {
+		t.Fatal("acknowledged worker did not remove the body")
 	}
 }
