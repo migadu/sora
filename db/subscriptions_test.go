@@ -71,3 +71,85 @@ func TestSubscriptions_NameBased(t *testing.T) {
 	require.Equal(t, []string{"Ghost/Reports", "Ghost/Reports/2026"},
 		subNames(t, db, ctx, accountID))
 }
+
+// TestUnsubscribe_KeepsDefaultMailboxSubscriptions is issue #1584. Unsubscribe
+// keeps the subscription of a default mailbox under any name the database takes for
+// it, and removes that of a mailbox named like one ("ſent": lower() leaves U+017F as
+// it is, so the name matches only its own row).
+func TestUnsubscribe_KeepsDefaultMailboxSubscriptions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping database integration test")
+	}
+	db := setupTestDatabase(t)
+	ctx := context.Background()
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-subs-default-%d@example.com", time.Now().UnixNano()), "password")
+
+	tx := func(fn func(tx pgx.Tx) error) {
+		t.Helper()
+		wtx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer wtx.Rollback(ctx)
+		require.NoError(t, fn(wtx))
+		require.NoError(t, wtx.Commit(ctx))
+	}
+
+	tx(func(t2 pgx.Tx) error { return db.CreateDefaultMailboxes(ctx, t2, accountID) })
+	tx(func(t2 pgx.Tx) error { return db.Subscribe(ctx, t2, accountID, "ſent") })
+	defaults := []string{"Archive", "Drafts", "INBOX", "Junk", "Sent", "Trash"}
+	require.Equal(t, append(append([]string{}, defaults...), "ſent"), subNames(t, db, ctx, accountID))
+
+	for _, name := range []string{"sent", "INBOX", "trash", "Jun\u212A", "\u0130NBOX"} {
+		tx(func(t2 pgx.Tx) error { return db.Unsubscribe(ctx, t2, accountID, name) })
+	}
+	tx(func(t2 pgx.Tx) error { return db.Unsubscribe(ctx, t2, accountID, "ſent") })
+	require.Equal(t, defaults, subNames(t, db, ctx, accountID))
+}
+
+// TestSubscriptions_RenameOverlappingNamespace is issue #1722: RenameSubscriptions
+// must preserve and rewrite subscriptions in the moved subtree when the source and
+// destination namespaces overlap (case-only, shortening, or lengthening renames),
+// while still clearing unrelated destination collisions.
+func TestSubscriptions_RenameOverlappingNamespace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping database integration test")
+	}
+	db := setupTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	runTx := func(t *testing.T, fn func(tx pgx.Tx) error) {
+		t.Helper()
+		wtx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer wtx.Rollback(ctx)
+		require.NoError(t, fn(wtx))
+		require.NoError(t, wtx.Commit(ctx))
+	}
+
+	t.Run("case-only rename preserves and re-cases subscriptions", func(t *testing.T) {
+		accountID := createTestAccount(t, db, fmt.Sprintf("test-subs-case-%d@example.com", time.Now().UnixNano()), "password")
+		for _, name := range []string{"amazon", "amazon/subfolder"} {
+			runTx(t, func(tx pgx.Tx) error { return db.Subscribe(ctx, tx, accountID, name) })
+		}
+		runTx(t, func(tx pgx.Tx) error { return db.RenameSubscriptions(ctx, tx, accountID, "amazon", "Amazon", "/") })
+		require.Equal(t, []string{"Amazon", "Amazon/subfolder"}, subNames(t, db, ctx, accountID))
+	})
+
+	t.Run("ancestor-shortening rename clears destination orphans and keeps moved subtree", func(t *testing.T) {
+		accountID := createTestAccount(t, db, fmt.Sprintf("test-subs-shorten-%d@example.com", time.Now().UnixNano()), "password")
+		for _, name := range []string{"Ghost/Sub/Sub", "Ghost/Sub/Leaf", "Ghost/Sub", "Ghost", "Ghost/Old"} {
+			runTx(t, func(tx pgx.Tx) error { return db.Subscribe(ctx, tx, accountID, name) })
+		}
+		runTx(t, func(tx pgx.Tx) error { return db.RenameSubscriptions(ctx, tx, accountID, "Ghost/Sub", "Ghost", "/") })
+		require.Equal(t, []string{"Ghost", "Ghost/Leaf", "Ghost/Sub"}, subNames(t, db, ctx, accountID))
+	})
+
+	t.Run("descendant-lengthening rename shifts subtree without colliding with itself", func(t *testing.T) {
+		accountID := createTestAccount(t, db, fmt.Sprintf("test-subs-lengthen-%d@example.com", time.Now().UnixNano()), "password")
+		for _, name := range []string{"Ghost", "Ghost/Sub"} {
+			runTx(t, func(tx pgx.Tx) error { return db.Subscribe(ctx, tx, accountID, name) })
+		}
+		runTx(t, func(tx pgx.Tx) error { return db.RenameSubscriptions(ctx, tx, accountID, "Ghost", "Ghost/Sub", "/") })
+		require.Equal(t, []string{"Ghost/Sub", "Ghost/Sub/Sub"}, subNames(t, db, ctx, accountID))
+	})
+}

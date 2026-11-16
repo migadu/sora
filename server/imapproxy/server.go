@@ -506,6 +506,15 @@ func (s *Server) Start() error {
 	}
 	s.listenerMu.Unlock()
 
+	// Stop cancels s.ctx before it looks for a listener to close, so a Stop
+	// that ran before the listener existed (cmd/sora calls it from a context
+	// watcher that races Start) found none. Checked once the listener is set,
+	// either Stop closes it or this does: never serve after Stop.
+	if s.ctx.Err() != nil {
+		s.listener.Close()
+		return nil
+	}
+
 	// Start connection limiter cleanup if enabled
 	if s.limiter != nil {
 		s.limiter.StartCleanup(s.ctx)
@@ -617,6 +626,12 @@ func (s *Server) SetConnectionTracker(tracker *server.ConnectionTracker) {
 	}
 }
 
+// GetLookupCache returns the server's cache of logins (nil when disabled), so that a
+// changed account's cached logins can be dropped (see credchanges.Watcher).
+func (s *Server) GetLookupCache() *lookupcache.LookupCache {
+	return s.lookupCache
+}
+
 // GetConnectionTracker returns the connection tracker for testing
 func (s *Server) GetConnectionTracker() *server.ConnectionTracker {
 	return s.connTracker
@@ -676,6 +691,10 @@ func (s *Server) Stop() error {
 		if err := s.lookupCache.Stop(stopCtx); err != nil {
 			logger.Error("Error stopping auth cache", "proxy", s.name, "error", err)
 		}
+	}
+
+	if s.authLimiter != nil {
+		s.authLimiter.Stop()
 	}
 
 	return nil

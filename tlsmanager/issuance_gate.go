@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/migadu/sora/logger"
@@ -34,8 +35,10 @@ var errIssuanceDeferred = errors.New("certificate issuance deferred to the clust
 // be declined: autocert reads the cache for a certificate it does not hold in memory,
 // and orders one the moment that read reports the certificate absent.
 type issuanceGate struct {
-	underlying autocert.Cache
-	manager    *Manager
+	underlying    autocert.Cache
+	manager       *Manager
+	publicationMu sync.Mutex
+	publications  map[publicationExchange]publicationGeneration
 }
 
 func newIssuanceGate(cache autocert.Cache, m *Manager) *issuanceGate {
@@ -48,11 +51,12 @@ func (g *issuanceGate) Get(ctx context.Context, name string) ([]byte, error) {
 		return data, err
 	}
 
+	g.capturePublication(ctx, name)
 	domain, isCertificate := certificateDomain(name)
 	if !isCertificate {
 		return nil, err
 	}
-	if refusal := g.manager.refuseIssuance(domain); refusal != nil {
+	if refusal := g.manager.refuseKeyIssuance(ctx, domain, name); refusal != nil {
 		return nil, refusal
 	}
 
@@ -61,11 +65,13 @@ func (g *issuanceGate) Get(ctx context.Context, name string) ([]byte, error) {
 }
 
 func (g *issuanceGate) Put(ctx context.Context, name string, data []byte) error {
+	ctx = g.publicationContext(ctx, name)
 	err := g.underlying.Put(ctx, name, data)
 	// The order is finished either way - a failed Put does not mean it is still running -
-	// so the cluster-wide claim is given back regardless.
+	// so give back this variant's share of the cluster-wide claim regardless. ctx is the
+	// context of the exchange that ordered the certificate, which names its orders.
 	if domain, isCertificate := certificateDomain(name); isCertificate {
-		g.manager.releaseIssuance(domain)
+		g.manager.releaseKeyIssuance(domain, name, exchangeEnd(ctx))
 	}
 	return err
 }
@@ -101,6 +107,24 @@ func (m *Manager) mayIssue() bool {
 // refuseIssuance reports why this node must not order a certificate for domain now, or
 // nil if it may.
 func (m *Manager) refuseIssuance(domain string) error {
+	return m.refuseIssuanceWith(domain, "", time.Time{}, nil)
+}
+
+// refuseKeyIssuance is refuseIssuance for a cache miss on cacheKey, read under the
+// context of the autocert exchange that will order it.
+func (m *Manager) refuseKeyIssuance(ctx context.Context, domain, cacheKey string) error {
+	return m.refuseIssuanceWith(domain, cacheKey, exchangeEnd(ctx), nil)
+}
+
+// refuseOrderIssuance is refuseIssuance for a newOrder sent under ctx, the context of
+// its autocert exchange.
+func (m *Manager) refuseOrderIssuance(ctx context.Context, domain string) (issuanceOrderRef, error) {
+	var ref issuanceOrderRef
+	err := m.refuseIssuanceWith(domain, "", exchangeEnd(ctx), &ref)
+	return ref, err
+}
+
+func (m *Manager) refuseIssuanceWith(domain, cacheKey string, until time.Time, orderRef *issuanceOrderRef) error {
 	if !m.mayIssue() {
 		leader := m.clusterManager.GetLeaderID()
 		// Debug because a waiting handshake arrives here on every poll; the wait itself
@@ -117,7 +141,7 @@ func (m *Manager) refuseIssuance(domain string) error {
 	// Last: leadership above says this node SHOULD issue, the fence says whether it MAY.
 	// Under a partition the check above passes on both sides, because each side elected
 	// its own leader; only one of them can hold the claim.
-	return m.holdIssuance(domain)
+	return m.holdIssuanceWith(domain, cacheKey, until, orderRef)
 }
 
 // awaitIssuedCertificate waits, bounded, for a certificate ordered by the cluster leader
@@ -175,17 +199,36 @@ func (f *issuanceFence) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Every order takes the issuance claim, whichever path started it. A first issuance
 	// already holds it from the cache miss (the claim is re-entrant); a renewal reads a
 	// certificate that is still in the cache and reaches no miss, so this is where it
-	// takes the claim. It is given back when the certificate is stored.
+	// takes the claim. It is given back when the certificate is stored, or counted
+	// until the exchange that req's context belongs to ends.
 	domains, err := orderedDomains(req)
 	if err != nil {
 		return nil, err
 	}
+	var claimed []issuanceOrderRef
 	for _, domain := range domains {
-		if refusal := f.manager.refuseIssuance(domain); refusal != nil {
+		ref, refusal := f.manager.refuseOrderIssuance(req.Context(), domain)
+		if refusal != nil {
+			for _, d := range claimed {
+				f.manager.dropFailedOrderRef(d)
+			}
 			return nil, refusal
 		}
+		claimed = append(claimed, ref)
 	}
-	return f.base.RoundTrip(req)
+	if gate := findIssuanceGate(f.manager); gate != nil {
+		for _, domain := range domains {
+			gate.capturePublication(req.Context(), domain)
+			gate.capturePublication(req.Context(), domain+"+rsa")
+		}
+	}
+	resp, err := f.base.RoundTrip(req)
+	if err != nil || (resp != nil && resp.StatusCode >= 400) {
+		for _, d := range claimed {
+			f.manager.dropFailedOrderRef(d)
+		}
+	}
+	return resp, err
 }
 
 // orderedDomains returns the DNS identifiers that a newOrder request asks a certificate
@@ -230,4 +273,93 @@ func orderedDomains(req *http.Request) ([]string, error) {
 		}
 	}
 	return domains, nil
+}
+
+// The exchange's existing deadline identifies both admission and its final Put.
+// Production autocert handshakes/renewals retain that deadline throughout. A
+// recorded unknown generation stays unknown; Put must not refresh it after a delete.
+type publicationExchange struct {
+	name  string
+	until time.Time
+}
+
+func (g *issuanceGate) capturePublication(ctx context.Context, name string) {
+	until, ok := ctx.Deadline()
+	if !ok {
+		return
+	}
+	key := publicationExchange{name, until}
+	g.publicationMu.Lock()
+	if g.publications == nil {
+		g.publications = make(map[publicationExchange]publicationGeneration)
+	}
+	now := time.Now()
+	for key := range g.publications {
+		if !now.Before(key.until) {
+			delete(g.publications, key)
+		}
+	}
+	_, present := g.publications[key]
+	g.publicationMu.Unlock()
+	if present {
+		return
+	}
+	var generation publicationGeneration
+	if fc := extractFallbackCache(g.underlying); fc != nil {
+		generation, _ = fc.publicationSnapshot(ctx, name)
+	} else {
+		cache := g.underlying
+		for {
+			if p, ok := cache.(interface {
+				getSnapshot(context.Context, string) ([]byte, publicationGeneration, error)
+			}); ok {
+				_, generation, _ = p.getSnapshot(ctx, name)
+				break
+			}
+			if w, ok := cache.(cacheWrapper); ok {
+				cache = w.unwrap()
+			} else {
+				break
+			}
+		}
+	}
+	g.publicationMu.Lock()
+	if _, present := g.publications[key]; !present {
+		g.publications[key] = generation
+	}
+	g.publicationMu.Unlock()
+}
+func (g *issuanceGate) publicationContext(ctx context.Context, name string) context.Context {
+	if _, isCertificate := certificateDomain(name); !isCertificate {
+		g.capturePublication(ctx, name)
+	}
+	until, ok := ctx.Deadline()
+	if !ok {
+		return ctx
+	}
+	key := publicationExchange{name, until}
+	g.publicationMu.Lock()
+	generation, present := g.publications[key]
+	delete(g.publications, key)
+	g.publicationMu.Unlock()
+	if !present {
+		generation = publicationGeneration{}
+	}
+	return generationContext(ctx, generation)
+}
+func findIssuanceGate(m *Manager) *issuanceGate {
+	if m == nil || m.autocertMgr == nil {
+		return nil
+	}
+	cache := m.autocertMgr.Cache
+	for {
+		if gate, ok := cache.(*issuanceGate); ok {
+			return gate
+		}
+		if w, ok := cache.(cacheWrapper); ok {
+			cache = w.unwrap()
+		} else {
+			return nil
+		}
+	}
 }

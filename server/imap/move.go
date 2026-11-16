@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
@@ -18,7 +20,12 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 	}
 	ctx = s.pinnedContext(ctx)
 
+	// The client's numbering holds still while its numbers are resolved (seqViewMu).
+	s.seqViewMu.RLock()
+	defer s.seqViewMu.RUnlock()
+
 	// First, safely read necessary session state
+	var selectedMailbox *db.DBMailbox
 	var selectedMailboxID int64
 	var decodedNumSet imap.NumSet
 
@@ -42,11 +49,29 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 			Text: "No mailbox selected",
 		}
 	}
-	selectedMailboxID = s.selectedMailbox.ID
+	// RFC 6851 §3.3: MOVE has the effect of COPY, STORE +FLAGS.SILENT \Deleted and
+	// UID EXPUNGE, so a read-only selection refuses it as it refuses STORE and EXPUNGE
+	// (RFC 9051 §6.3.3: after EXAMINE "No changes to the permanent state of the
+	// mailbox ... are permitted").
+	if s.selectedReadOnly.Load() {
+		release()
+		s.DebugLog("move rejected: mailbox selected read-only")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCode("READ-ONLY"),
+			Text: "Mailbox is read-only",
+		}
+	}
+	selectedMailbox = s.selectedMailbox
+	selectedMailboxID = selectedMailbox.ID
 
-	// Use our helper method that assumes the mutex is held (read lock is sufficient)
-	decodedNumSet = s.decodeNumSetLocked(numSet)
+	view := s.seqViewLocked()
+	decodedNumSet = s.decodeNumSetLocked(view, numSet)
 	release() // Release read lock
+
+	if imapErr := s.sharedRootDestinationRefusal("MOVE", dest); imapErr != nil {
+		return imapErr
+	}
 
 	// Perform database operations outside of lock
 	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, s.AccountID(), dest)
@@ -92,7 +117,7 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		}
 	}
 
-	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet)
+	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(view.context(ctx), selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return s.internalError("failed to retrieve messages: %v", err)
 	}
@@ -181,8 +206,10 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		return s.server.s3.CopyWithRetry(ctx, obj.sourceKey, obj.destKey)
 	}
 
-	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname, sourceHashes, destHashes, ensureDestObject)
+	ownMessagesDone := s.beginOwnMessages(destMailbox.ID) // a MOVE within the selected mailbox
+	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.instanceID, sourceHashes, destHashes, ensureDestObject)
 	if err != nil {
+		ownMessagesDone()
 		var destErr *resilient.DestObjectError
 		if errors.As(err, &destErr) {
 			return s.crossAccountObjectError(destObjects[destErr.ContentHash].sourcePending, destErr.Err)
@@ -201,6 +228,7 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		}
 		return s.internalError("failed to move messages: %v", err)
 	}
+	ownMessagesDone(slices.Collect(maps.Values(messageUIDMap))...)
 
 	// Pin this session to the master DB (same rationale as APPEND, append.go).
 	// MOVE's RFC 6851 §3.3 inline EXPUNGE notifications are emitted by the
@@ -212,7 +240,7 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 
 	// Trigger spam training if configured and moving to/from Junk folder
 	if s.server.spamTraining != nil && len(messageUIDMap) > 0 {
-		s.triggerSpamTraining(s.selectedMailbox.Name, dest, messages, messageUIDMap, destMailbox.AccountID, destS3Domain, destS3Localpart)
+		s.triggerSpamTraining(selectedMailbox, destMailbox, messages, messageUIDMap, destS3Domain, destS3Localpart)
 	}
 
 	if len(messageUIDMap) > 0 {

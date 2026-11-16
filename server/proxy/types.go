@@ -232,6 +232,21 @@ type UserRoutingInfo struct {
 	ProxySessionID         string        // Proxy session ID for end-to-end tracing
 }
 
+// ForDial returns the routing info a proxy session dials its backend with: a copy of r (an
+// empty one when r is nil) carrying the client's connection, whose JA4 fingerprint the
+// PROXY v2 header forwards (TLV 0xE0), and the proxy's session ID, which it forwards for
+// the backend to log as proxy_session (TLV 0xE1). r is not modified, so a session without
+// routing info keeps meaning "no route looked up yet".
+func (r *UserRoutingInfo) ForDial(clientConn net.Conn, sessionID string) *UserRoutingInfo {
+	var info UserRoutingInfo
+	if r != nil {
+		info = *r
+	}
+	info.ClientConn = clientConn
+	info.ProxySessionID = sessionID
+	return &info
+}
+
 // LookupRouted reports whether addr is the backend the remote lookup named, the only one
 // its backend settings (the Remote* fields) are for. A user the proxy routes itself — in
 // auth-only mode, from the database, or around a remote-lookup route in maintenance —
@@ -263,13 +278,19 @@ func normalizeHostPort(addr string, defaultPort int) string {
 	if addr == "" {
 		return ""
 	}
-	// A complete IPv6 literal has no port, even when its last group is decimal.
-	// Trying the unbracketed host:port heuristic first silently changes the host.
-	if net.ParseIP(addr) != nil {
+	// A complete IPv6 literal (bare or bracketed without a port) has no port,
+	// even when its last group is decimal. Trying the unbracketed host:port
+	// heuristic first silently changes the host.
+	bare := addr
+	if strings.HasPrefix(addr, "[") && strings.HasSuffix(addr, "]") {
+		bare = addr[1 : len(addr)-1]
+	}
+	if ip := net.ParseIP(bare); ip != nil {
+		canonical := ip.String()
 		if defaultPort > 0 {
-			return net.JoinHostPort(addr, strconv.Itoa(defaultPort))
+			return net.JoinHostPort(canonical, strconv.Itoa(defaultPort))
 		}
-		return addr
+		return canonical
 	}
 
 	// net.SplitHostPort is the robust way to do this, as it correctly
@@ -303,10 +324,10 @@ func normalizeHostPort(addr string, defaultPort int) string {
 			portPart := addr[lastColon+1:]
 
 			// Check if the parts look like a valid IP and port.
-			if net.ParseIP(hostPart) != nil {
-				if _, pErr := strconv.Atoi(portPart); pErr == nil {
-					// This looks like a valid but malformed IPv6:port. Fix it.
-					fixedAddr := net.JoinHostPort(hostPart, portPart)
+			if ip := net.ParseIP(hostPart); ip != nil {
+				if portNum, pErr := strconv.Atoi(portPart); pErr == nil {
+					// This looks like a valid but malformed IPv6:port. Fix and canonicalize it.
+					fixedAddr := net.JoinHostPort(ip.String(), strconv.Itoa(portNum))
 					logger.Debug("Proxy: Corrected malformed IPv6 address", "original", addr, "corrected", fixedAddr)
 					return fixedAddr
 				}

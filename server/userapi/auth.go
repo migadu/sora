@@ -89,12 +89,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Reject empty passwords immediately
 	if req.Password == "" {
-		s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+		s.writeLoginRefused(w)
 		return
 	}
 
-	// Apply progressive authentication delay BEFORE any other checks
-	if err := server.ApplyAuthenticationDelay(ctx, s.authLimiter, remoteAddr, "USER-API-LOGIN"); err != nil {
+	// Apply progressive authentication delay BEFORE any other checks. It runs after
+	// net/http set the request's write deadline, so it moves that deadline past itself.
+	if err := server.ApplyHTTPAuthenticationDelay(ctx, w, s.authLimiter, remoteAddr, "userapi", writeTimeout); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
 			logger.Info("User API: Delay queue full, rejecting connection", "email", req.Email, "remote", remoteAddr)
@@ -106,14 +107,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var accountID int64
-	var hashedPassword string
-	var err error
-
-	// Check authentication rate limiting before the auth cache: a blocked address or
-	// IP+username pair is refused whether or not the answer is cached (the cache only
-	// saves the database work), and a cached success must not be recorded for an
-	// attempt the limiter would have refused.
+	// Check authentication rate limiting before credential work. A blocked address
+	// or IP+username pair must not reach the database or record a successful attempt.
 	if s.authLimiter != nil {
 		if err := s.authLimiter.CanAttemptAuth(ctx, remoteAddr, authKey); err != nil {
 			// Return the SAME response as a bad-credential failure (401 "Invalid credentials")
@@ -125,54 +120,44 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			// attempt would turn the rate limiter into a CPU-amplification vector. The fast
 			// rejection is existence-independent, so it is not a user-enumeration oracle.)
 			logger.Debug("User API: Login rate limited", "name", s.name, "ip", clientIP, "email", req.Email, "error", err)
-			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+			s.writeLoginRefused(w)
 			return
 		}
 	}
 
-	// Check cache (if enabled)
-	if s.authCache != nil {
-		cachedAccountID, found, cacheErr := s.authCache.Authenticate(req.Email, req.Password)
-		if cacheErr != nil {
-			// Cached failure (same wrong password)
-			logger.Debug("User API: Cache hit - authentication failed", "name", s.name, "email", req.Email)
-			if s.authLimiter != nil {
-				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
-			}
-			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
-			return
+	// Validate and canonicalise the submitted address (lowercased, trimmed, and U-label
+	// IDN domains folded to their Punycode A-label form, matching CreateAccount). An
+	// input that does not parse as a user address (or carries an @-suffix, which User
+	// API logins never use and NewAddress leaves unvalidated) names no account: answer
+	// it like an unknown user after one dummy verification and record the failed
+	// attempt, without touching PostgreSQL (where NUL bytes fail with
+	// SQLSTATE 22021 and used to answer 503 uncounted).
+	addr, err := server.NewAddress(strings.TrimSpace(req.Email))
+	if err != nil || addr.HasSuffix() {
+		logger.Debug("User API: Invalid login address", "name", s.name, "ip", clientIP, "error", err)
+		db.DummyVerifyPassword(req.Password)
+		if s.authLimiter != nil {
+			s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
 		}
-		if found {
-			// Cache hit - successful authentication
-			logger.Debug("User API: Cache hit - using cached auth", "name", s.name, "email", req.Email, "account_id", cachedAccountID)
-			accountID = cachedAccountID
-			if s.authLimiter != nil {
-				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, true)
-			}
-			// Skip database lookup - use cached account ID
-			goto generateToken
-		}
-		// Cache miss or revalidation needed - fall through to full auth
-		logger.Debug("User API: Cache miss - performing full authentication", "name", s.name, "email", req.Email)
+		s.writeLoginRefused(w)
+		return
 	}
+	email := addr.FullAddress()
 
-	// Authenticate user (full database lookup)
-	accountID, hashedPassword, err = s.rdb.GetCredentialForAuthWithRetry(ctx, req.Email)
+	// Read the hash and token epoch together from the primary. There is no login
+	// cache: a cached password verdict cannot supply the epoch of that same hash.
+	accountID, hashedPassword, epoch, err := s.rdb.GetCredentialForTokenWithRetry(ctx, email)
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
 			// Equalize response timing with the wrong-password path (which runs bcrypt) so
 			// response time can't reveal whether the account exists. (security-audit M14)
 			db.DummyVerifyPassword(req.Password)
-			// Cache negative result if cache enabled (result=1 for user not found)
-			if s.authCache != nil {
-				s.authCache.SetFailure(req.Email, 1)
-			}
 			// Record failed attempt
 			if s.authLimiter != nil {
 				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
 			}
 			// Don't reveal whether user exists or not
-			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+			s.writeLoginRefused(w)
 			return
 		}
 		// The database could not be asked: a temporary failure, not counted as a
@@ -189,46 +174,22 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			// one: the stored data is at fault, and only an administrator can repair it.
 			// Answered like a database outage, as the proxies and the backends do: a
 			// temporary failure, not counted as a failed login (a block earned on it
-			// would outlast the repair), nothing cached. A cached login this password
-			// missed was dropped before the database was asked (LookupCache.Authenticate),
-			// so it cannot answer the next guess. VerifyPassword logged why, without the
-			// address.
-			logger.Warn("User API: authentication unavailable", "name", s.name, "email", req.Email, "reason", "unverifiable_hash", "error", err)
+			// would outlast the repair). VerifyPassword logged why, without the address.
+			logger.Warn("User API: authentication unavailable", "name", s.name, "email", email, "reason", "unverifiable_hash", "error", err)
 			s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
 			return
-		}
-		// Cache negative result if cache enabled (result=2 for invalid password)
-		if s.authCache != nil {
-			s.authCache.SetFailure(req.Email, 2)
 		}
 		// Record failed attempt
 		if s.authLimiter != nil {
 			s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
 		}
-		s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+		s.writeLoginRefused(w)
 		return
-	}
-
-	// Cache positive result if cache enabled
-	if s.authCache != nil {
-		s.authCache.SetSuccess(req.Email, accountID, hashedPassword, req.Password)
 	}
 
 	// Record successful attempt
 	if s.authLimiter != nil {
 		s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, true)
-	}
-
-generateToken:
-
-	// Bind the token to the current password epoch so a later password change or
-	// account deletion invalidates it at refresh time (the cache fast-path above
-	// can skip the DB, so fetch it here for both paths).
-	_, epoch, err := s.rdb.GetCredentialEpochWithRetry(ctx, req.Email)
-	if err != nil {
-		logger.Warn("HTTP Mail API: Error fetching credential epoch", "name", s.name, "error", err)
-		s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
-		return
 	}
 
 	// Account creation makes no mailboxes: like an IMAP or POP3 login, this one
@@ -241,7 +202,7 @@ generateToken:
 	}
 
 	// Generate JWT token
-	token, expiresAt, err := s.generateToken(req.Email, accountID, epoch.Unix())
+	token, expiresAt, err := s.generateToken(email, accountID, epoch.Unix())
 	if err != nil {
 		logger.Warn("HTTP Mail API: Error generating token", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Token generation failed")
@@ -251,7 +212,7 @@ generateToken:
 	response := LoginResponse{
 		Token:     token,
 		ExpiresAt: expiresAt.Unix(),
-		Email:     req.Email,
+		Email:     email,
 		AccountID: accountID,
 	}
 
@@ -276,9 +237,16 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	// Parse and validate existing token
 	claims, err := s.validateToken(req.Token)
 	if err != nil {
-		s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+		s.writeTokenRefused(w)
 		return
 	}
+
+	addr, err := server.NewAddress(strings.TrimSpace(claims.Email))
+	if err != nil || addr.HasSuffix() {
+		s.writeTokenRefused(w)
+		return
+	}
+	email := addr.FullAddress()
 
 	ctx := r.Context()
 
@@ -286,12 +254,12 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	// otherwise non-revocable, so refresh is where we cut off sessions for accounts
 	// that have been deleted/disabled or had their password changed since the token
 	// was issued. This bounds a leaked token to at most one token_duration window.
-	accountID, epoch, err := s.rdb.GetCredentialEpochWithRetry(ctx, claims.Email)
+	accountID, epoch, err := s.rdb.GetCredentialEpochWithRetry(ctx, email)
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
 			// Account soft-deleted or credential removed since the token was issued.
-			logger.Info("HTTP Mail API: Refusing refresh for deleted/unknown account", "name", s.name, "email", claims.Email)
-			s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+			logger.Info("HTTP Mail API: Refusing refresh for deleted/unknown account", "name", s.name, "email", email)
+			s.writeTokenRefused(w)
 			return
 		}
 		logger.Warn("HTTP Mail API: Error revalidating account on refresh", "name", s.name, "error", err)
@@ -301,13 +269,13 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	if claims.AuthEpoch < epoch.Unix() {
 		// Password changed after this token was issued (or the token predates the
 		// auth_epoch claim) — force a fresh login instead of renewing.
-		logger.Info("HTTP Mail API: Refusing refresh for stale token (password changed)", "name", s.name, "email", claims.Email)
-		s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+		logger.Info("HTTP Mail API: Refusing refresh for stale token (password changed)", "name", s.name, "email", email)
+		s.writeTokenRefused(w)
 		return
 	}
 
 	// Generate new token with extended expiration, carrying the current epoch.
-	newToken, expiresAt, err := s.generateToken(claims.Email, accountID, epoch.Unix())
+	newToken, expiresAt, err := s.generateToken(email, accountID, epoch.Unix())
 	if err != nil {
 		logger.Warn("HTTP Mail API: Error generating refresh token", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Token generation failed")
@@ -317,7 +285,7 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	response := LoginResponse{
 		Token:     newToken,
 		ExpiresAt: expiresAt.Unix(),
-		Email:     claims.Email,
+		Email:     email,
 		AccountID: accountID,
 	}
 
@@ -388,7 +356,7 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 		// Validate JWT token from Authorization header
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
-			server.SetBearerChallenge(w.Header(), server.UserAPIRealm, false)
+			server.SetBearerChallenge(w.Header(), server.UserAPIRealm, "")
 			s.writeError(w, http.StatusUnauthorized, "Authorization header required")
 			return
 		}
@@ -396,7 +364,7 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 		// Extract token from "Bearer <token>"
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-			server.SetBearerChallenge(w.Header(), server.UserAPIRealm, false)
+			server.SetBearerChallenge(w.Header(), server.UserAPIRealm, "")
 			s.writeError(w, http.StatusUnauthorized, "Authorization header must be 'Bearer <token>'")
 			return
 		}

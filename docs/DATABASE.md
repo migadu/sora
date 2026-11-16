@@ -184,9 +184,15 @@ CPUs, whichever is larger).
   `[database.write]`. Repeat them, or the read endpoint uses the defaults above.
 - **An endpoint you do not write is not configured.** Without a `[database.write]` (or
   `[database.read]`) section in the file, Sora has no such endpoint. This is how a proxy-only node
-  runs without a database. A node that needs a database and has none refuses to start with
-  `database is required for configured servers but not configured in [database.write] or
-  [database.read]`.
+  runs without a database. A node that needs a database and has none refuses to start, and
+  `sora-admin config validate` refuses the file, with `[database]: server "<name>" (<type>) needs
+  the database, but it is not configured in [database.write] or [database.read]`.
+- **`[database.read]` alone is not enough.** The migrations and every write go to
+  `[database.write]`, so a node that needs a database needs `[database.write]` hosts, a proxy
+  that only checks passwords included. With `[database.read]` hosts and none in
+  `[database.write]`, Sora refuses to start, and `sora-admin config validate` refuses the file,
+  with `[database.write]: server "<name>" (<type>) needs the database, but [database.write] has
+  no hosts; ...`. Other `sora-admin` commands stop with `[database.write] has no hosts`.
 - **User name and password** may contain any characters. Sora escapes them in the connection URL.
 - **IPv6 addresses** go in brackets with a port: `hosts = ["[2001:db8::10]:5432"]`.
 
@@ -366,6 +372,32 @@ a DNS name your failover tooling updates, a virtual IP, or a pooler that follows
 can also list every server that may become primary. The check marks the standbys unhealthy, and
 writes move to the server that answers as primary within one check interval.
 
+### Advisory locks across a failover
+
+Sora orders the deletion of a message body in S3 (the cleaner, account purges, `import rekey`)
+against the writes that claim one (uploads, restores, cross-account copies and moves) with advisory locks
+on the write host. A lock excludes only what runs on the server that holds it. So when Sora stops
+writing through a server, it revokes the locks it holds there: the work they guard is cancelled
+(a cleanup batch or purge runs again in a later cycle; a copy or `import rekey` fails and can be
+retried). It does so when it switches to another write host, before it writes anything there, and
+when it reconnects its write host because the server answered read-only or in recovery, as soon
+as it has dropped the old connections. The log shows `Database: fencing advisory locks`.
+
+Each node notices a failover by itself, at its next health check or at its first write that
+fails. Until then, a node still connected to the old primary keeps its locks there, and they
+exclude nothing on the new one. Your failover tooling must therefore fence the old primary before
+the new one accepts writes: shut it down, or terminate every client session on it
+(`pg_terminate_backend`) and refuse new ones. Making it read-only is not enough, because a session
+that is already open keeps its locks.
+
+Fencing ends the locks, but not at once the work they guard. Sora notices that the session
+holding a lock is gone only at the lock's next keepalive, which runs at most a minute after the
+lock's last statement (twice the 30-second keepalive interval) and gives up on a server that does
+not answer after 5 seconds. Until then the guarded work goes on: an S3 delete that was already
+under way, and its retries, can still remove the body of a message the new primary has just
+accepted. So the new primary must not accept writes until more than 65 seconds after the old one
+was fenced.
+
 ### Retries
 
 Sora retries an operation that failed for a reason that usually passes:
@@ -435,7 +467,7 @@ These hold one server connection behind the pooler for as long as they run:
 |---|---|
 | The cleanup cycle | Two on the node running the cycle: one for the whole cycle, one during each batch of S3 deletes. |
 | An account purge | One per node while it purges an account. |
-| IMAP `COPY` into a folder owned by another account | One per copy in progress, across the S3 copy. |
+| IMAP `COPY` or `MOVE` into a folder owned by another account | One per command in progress: its own transaction, from the S3 check and copy until its rows commit. |
 | Migrations | Two on the node applying them, for the whole run: the leader lock and the connection the migrations run on. |
 
 S3 uploads hold no connection across the transfer. An upload uses the pool only for a few short
@@ -444,7 +476,7 @@ statements, so `[uploader] concurrency` is bounded by S3, not by the pool.
 Size the pooler's pool for Sora's database user with this in mind:
 
 ```
-pool_size >= 2 + headroom for interactive writes, cross-account copies and uploader statements
+pool_size >= 2 + headroom for interactive writes, cross-account copies and moves, and uploader statements
 ```
 
 A pool sized only for short IMAP and LMTP transactions can queue mail delivery behind the
@@ -522,7 +554,7 @@ sora-admin migrate force   --config /etc/sora/config.toml 49
 |---|---|
 | `version` | Prints the current version and whether it is dirty (`Dirty state: no`). A plain read: safe while Sora runs. |
 | `up` | Applies every pending migration. |
-| `down` | Reverts the last migration, or `--limit N` of them, or `--all`. |
+| `down` | Reverts the last migration, or `--limit N` of them, or with `--all` every one after 000001. It never reverts 000001 ([Rolling back](#rolling-back)). |
 | `force VERSION` | Sets the version and clears the dirty flag, without running anything. |
 
 The tool's help asks you to stop Sora before `up`, `down` and `force`. `migrate` connects through
@@ -597,6 +629,7 @@ pooler), off-peak. The migrations on `main` that need it on a large database:
 | 000050 | `messages_fts_v2`, the per-account search table, and `btree_gin`. | See [Migration 000050](#migration-000050) below. |
 | 000051 | Replaces seven indexes on `messages` with `idx_messages_mailbox_active`. | Create the new index with `CREATE INDEX CONCURRENTLY`, then drop the seven old ones with `DROP INDEX CONCURRENTLY`, one at a time. |
 | 000052 | `idx_messages_mailbox_headers`, the covering index for header search. | Fix over-long rows with [scripts/fix_oversized_header_columns.sql](../scripts/fix_oversized_header_columns.sql), then build the index with `CREATE INDEX CONCURRENTLY`, using exactly the definition in the file. |
+| 000062 | `idx_messages_mailbox_sent_date_unknown`, the messages without a usable `Date:` header, which SENTBEFORE, SENTON and SENTSINCE leave out. | Build the index with `CREATE INDEX CONCURRENTLY`, using exactly the definition in the file, and check that it is valid. On more than 25,000 messages the migration refuses to build it itself. |
 
 Older migrations (for example 000008, 000010, 000012, 000014, 000038 and 000039) carry the same
 kind of note. Copy index definitions exactly from the migration file: the migration only checks
@@ -736,7 +769,7 @@ transaction` for a long time are usually the lock holders of [section 8](#8-pgbo
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Startup fails with `database is required for configured servers but not configured` | `[database.write]` is missing. | Configure the write endpoint ([section 3](#3-connecting-the-write-and-read-endpoints)). |
+| Startup fails with `[database]: server "<name>" (<type>) needs the database, but it is not configured ...` | `[database.write]` is missing. | Configure the write endpoint ([section 3](#3-connecting-the-write-and-read-endpoints)). |
 | Startup fails with `Failed to initialize resilient database` | No write host could be reached. | Check the host, port, credentials and network. The line before it names the error. |
 | Startup fails with `dirty migration state` | A migration failed earlier. | See [A failed migration](#a-failed-migration). |
 | Nodes exit with `timed out waiting for another instance to complete migrations` | A long migration on another node. | Let it finish, then start them; for long migrations, run `sora-admin migrate up` first or raise `migration_timeout`. |

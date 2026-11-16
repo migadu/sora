@@ -34,7 +34,7 @@ func (s *LMTPSession) XCLIENT(session smtp.Session, attrs map[string]string) err
 		return &smtp.SMTPError{Code: 501, EnhancedCode: smtp.EnhancedCode{5, 5, 4}, Message: "Invalid XCLIENT attributes"}
 	}
 
-	s.DebugLog("processed xclient attributes", "client_ip", s.ForwardingParams.OriginatingIP, "client_port", s.ForwardingParams.OriginatingPort, "protocol", s.ForwardingParams.Protocol, "helo", s.ForwardingParams.HELO, "login", s.ForwardingParams.Login)
+	s.DebugLog("processed xclient attributes", "client_ip", s.ForwardingParams.OriginatingIP, "client_port", s.ForwardingParams.OriginatingPort, "xclient_proto", s.ForwardingParams.Protocol, "helo", s.ForwardingParams.HELO, "login", s.ForwardingParams.Login)
 
 	return nil
 }
@@ -153,8 +153,9 @@ func (s *LMTPSession) mayReplaceClientAddr() bool {
 // xclientTrustedProxies returns the CIDR blocks trusted to send XCLIENT/XRCPTFORWARD
 // source-IP overrides, using exactly the configured lists with no RFC1918 fallback.
 func (s *LMTPSession) xclientTrustedProxies() []string {
-	// With PROXY protocol enabled, honor the (possibly separate) proxy_protocol_trusted_proxies
-	// list, which itself falls back only to the configured trusted_networks — never to RFC1918.
+	// With PROXY protocol enabled, honor the PROXY reader's trust list: the
+	// ProxyProtocolTrustedProxies option, which no config key sets and which falls back
+	// only to the configured trusted_networks — never to RFC1918.
 	if s.backend.proxyReader != nil {
 		return s.backend.proxyReader.GetTrustedProxies()
 	}
@@ -164,6 +165,21 @@ func (s *LMTPSession) xclientTrustedProxies() []string {
 		trustedProxies = append(trustedProxies, network.String())
 	}
 	return trustedProxies
+}
+
+// unsupportedRcptParameter returns the keyword of an RCPT parameter in opts.Extensions
+// that the backend does not implement, or "" if there is none. XRCPTFORWARD is the only
+// one it takes; go-smtp upper-cases the keywords.
+func unsupportedRcptParameter(opts *smtp.RcptOptions) string {
+	if opts == nil {
+		return ""
+	}
+	for keyword := range opts.Extensions {
+		if keyword != "XRCPTFORWARD" {
+			return keyword
+		}
+	}
+	return ""
 }
 
 // ParseRCPTForward processes XRCPTFORWARD parameters from RCPT TO command
@@ -214,7 +230,7 @@ func (s *LMTPSession) ParseRCPTForward(rcptOptions *smtp.RcptOptions) {
 		// Don't update s.RemoteIP for XRCPTFORWARD, unlike XCLIENT
 		// XRCPTFORWARD is per-recipient forwarding, not session-level IP forwarding
 
-		s.InfoLog("xrcptforward set proxy information", "proxy", proxyIP)
+		s.InfoLog("xrcptforward set proxy information", "forwarded_proxy", proxyIP)
 	}
 
 	s.InfoLog("processed xrcptforward parameters", "variables_count", len(forwardParams.Variables))

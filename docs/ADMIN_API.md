@@ -132,12 +132,16 @@ Authorization: Bearer a-long-random-value-of-at-least-16-characters
 
 The word `Bearer` may be in any case. The key is compared in constant time.
 
-| Situation | Status | Body |
-|---|---|---|
-| No `Authorization` header | 401 | `{"error":"Authorization header required"}` |
-| Header is not `Bearer <key>` | 401 | `{"error":"Authorization header must be 'Bearer <token>'"}` |
-| Wrong key | 403 | `{"error":"Invalid API key"}` |
-| `read_only_api_key` with a method other than `GET` | 403 | `{"error":"API key is read-only"}` |
+| Situation | Status | Body | `WWW-Authenticate` |
+|---|---|---|---|
+| No `Authorization` header | 401 | `{"error":"Authorization header required"}` | `Bearer realm="admin-api"` |
+| Header is not `Bearer <key>` | 401 | `{"error":"Authorization header must be 'Bearer <token>'"}` | `Bearer realm="admin-api"` |
+| Wrong key | 401 | `{"error":"Invalid API key"}` | `Bearer realm="admin-api", error="invalid_token"` |
+| `read_only_api_key` with a method other than `GET` | 403 | `{"error":"API key is read-only"}` | `Bearer realm="admin-api", error="insufficient_scope"` |
+
+Every refusal of the key carries a Bearer challenge (RFC 6750 section 3); a key that was
+presented and refused also says why, with the error codes of RFC 6750 section 3.1, and gets the
+status that section gives the code: 401 for `invalid_token`, 403 for `insufficient_scope`.
 
 `api_key` grants every endpoint. `read_only_api_key`, when set, grants every `GET` endpoint and
 nothing else: every endpoint that changes something uses `POST`, `PUT` or `DELETE`. Give the
@@ -172,7 +176,7 @@ instead (`Address`, `TotalPending`, `ID`); the sections below name each one.
   `2026-03-01 09:30:00.123456 +0000 UTC`.
 - Nullable times in the upload queue are objects: `{"Time":"...","Valid":true}`.
 
-**Empty lists** are sometimes `[]` and sometimes `null`. Treat both as empty.
+**Empty lists** are `[]`, never `null`.
 
 **Errors** are JSON objects with one field:
 
@@ -180,13 +184,9 @@ instead (`Address`, `TotalPending`, `ID`); the sections below name each one.
 {"error": "Account not found"}
 ```
 
-There are exceptions where the body is plain text from Go's HTTP library:
-
-- `405` for a known path with the wrong method: `Method not allowed`.
-- `404` for a path that matches no route: `404 page not found`; and under `/admin/domains/`
-  for anything but `.../accounts`: `Not found`.
-- Some ACL and affinity errors (missing fields, the affinity `503`) have a JSON body but are
-  sent with `Content-Type: text/plain`.
+A method the path does not serve is `405 {"error":"Method not allowed"}` with an `Allow`
+header listing the methods it does serve; a path no endpoint has is
+`404 {"error":"Not found"}`.
 
 **Status codes** used across the API:
 
@@ -197,10 +197,10 @@ There are exceptions where the body is plain text from Go's HTTP library:
 | 202 | Accepted: an account purge was requested and runs in the background. |
 | 207 | Mail delivery to several recipients where at least one failed. |
 | 400 | The request is wrong: bad JSON, a missing field, a bad parameter, or a refused change. |
-| 401 | No or malformed `Authorization` header. |
-| 403 | Wrong key, or client address not in `allowed_hosts`. |
-| 404 | The account, credential, mailbox or record does not exist. |
-| 405 | Wrong method for the path. |
+| 401 | No or malformed `Authorization` header, or a wrong key. |
+| 403 | The read-only key on a write, or client address not in `allowed_hosts`. |
+| 404 | The account, credential, mailbox or record does not exist, or no endpoint has the path. |
+| 405 | Wrong method for the path; `Allow` lists the methods it serves. |
 | 409 | An address already exists. |
 | 500 | Server-side failure. |
 | 503 | A component this endpoint needs is not running on this node, or the backend is in maintenance. |
@@ -687,7 +687,7 @@ Newest expunge first. Response `200`; the message objects use Go field names:
     {
       "ID": 98321, "UID": 4410, "ContentHash": "4f1c...",
       "MailboxPath": "INBOX", "MailboxID": 5511,
-      "Subject": "Quarterly report", "MessageID": "<abc@example.com>",
+      "Subject": "Quarterly report", "MessageID": "abc@example.com",
       "InternalDate": "2026-03-04T10:11:12Z", "ExpungedAt": "2026-03-09T16:00:00Z",
       "Size": 48211
     }
@@ -696,9 +696,10 @@ Newest expunge first. Response `200`; the message objects use Go field names:
 }
 ```
 
-`MailboxID` is `null` when the mailbox itself has been deleted; `MailboxPath` is then the
-name recorded at deletion. A message with neither shows an empty `MailboxPath`; criteria-based
-restores skip it and it can only be named by id.
+`MessageID` is the bare `Message-ID` header without angle brackets, or `""` when the message had
+none that parsed. `MailboxID` is `null` when the mailbox itself has been deleted; `MailboxPath` is
+then the name recorded at deletion. A message with neither shows an empty `MailboxPath`;
+criteria-based restores skip it and it can only be named by id.
 
 Errors: `400` for a bad `since`, `until` or `limit`, or `since` after `until`;
 `404 Account not found`; `500` otherwise.
@@ -722,7 +723,18 @@ be positive.
 
 Each message goes back to the mailbox it was expunged from. A mailbox that has since been
 deleted is created again, with its parents. Restored messages get new UIDs, in their original
-arrival order per mailbox. Messages already restored or already purged are skipped.
+arrival order per mailbox, and new mod-sequences, so IMAP clients are told of them as new messages
+(the mailbox's HIGHESTMODSEQ rises). The expunge of the old UID stays on record until the cleaner
+removes it, so a client not yet told of it still is (`EXPUNGE`, or `VANISHED (EARLIER)` to a QRESYNC
+client). A restored message has a new id: deleted again, it is listed under that id. Messages
+already restored or already purged are skipped.
+
+With `[shared_mailboxes]` enabled, a mailbox recreated in the shared namespace is a shared
+mailbox of the account, and so is a parent recreated there. Each one starts with owner-only
+rights: one entry, the owner's primary address with `default_rights`. The ACL entries it had
+before it was deleted are not restored, and a shared parent's entries are not copied as they
+are for a new folder ([SHARED_MAILBOXES.md](SHARED_MAILBOXES.md)). The server logs a warning
+naming it. Grant other users access again with `POST /admin/mailboxes/acl/grant` (section 12.1).
 
 The restore runs in chunks, each in its own transaction. Response `200`:
 
@@ -1142,7 +1154,7 @@ node.
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `latest` | `false` | `true`: the latest record of each instance, and the other parameters are ignored. |
+| `latest` | `false` | `true`: the latest record of each `instance_id` and `server_hostname` pair, and the other parameters are ignored. |
 | `instance_id` | all | Only this instance. |
 | `since` | 24 hours ago | RFC 3339 only. |
 | `limit` | `100` | Most records. A value that is not a positive number means 100. |
@@ -1267,7 +1279,7 @@ Lists the blocks that the authentication rate limiters of **this node** currentl
 [AUTHENTICATION.md](AUTHENTICATION.md) for how blocks are made.
 
 `protocol` is optional and exact: `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`,
-`managesieve_proxy` or `userapi`.
+`managesieve_proxy`, `userapi` or `userapi_proxy`.
 
 ```json
 {

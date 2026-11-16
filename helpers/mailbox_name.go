@@ -2,7 +2,6 @@ package helpers
 
 import (
 	"strings"
-	"unicode/utf8"
 
 	"github.com/migadu/sora/consts"
 )
@@ -24,6 +23,44 @@ func CanonicalMailboxName(name string) string {
 		return consts.MailboxInbox
 	}
 	return name
+}
+
+// IsDefaultMailboxName reports whether stored, the name of a mailbox or subscription
+// as the database holds it, is one of consts.DefaultMailboxes in any case of its
+// ASCII letters. Give it the name the database resolved a client's name to, never
+// the client's name: which names are one mailbox is the database's LOWER(name), and
+// lower() depends on the collation. It maps U+212A KELVIN SIGN to "k" under libc and
+// ICU, U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE to "i" under libc only, and leaves
+// U+017F LATIN SMALL LETTER LONG S as it is under every one, so "ſent" is a mailbox of
+// its own while strings.EqualFold matches it with "Sent".
+func IsDefaultMailboxName(stored string) bool {
+	for _, def := range consts.DefaultMailboxes {
+		if equalFoldASCII(stored, def) {
+			return true
+		}
+	}
+	return false
+}
+
+// equalFoldASCII reports whether a and b are equal with their ASCII letters compared
+// case-insensitively and every other byte exactly.
+func equalFoldASCII(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		x, y := a[i], b[i]
+		if 'A' <= x && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if 'A' <= y && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
 }
 
 // MailboxNameHasTraversal reports whether an IMAP mailbox name contains a path
@@ -50,7 +87,7 @@ func MailboxNameHasTraversal(name string) bool {
 // valid UTF-8 without a NUL. No mailbox has any other name; querying with one fails
 // with SQLSTATE 22021 instead of finding nothing.
 func MailboxNameStorable(name string) bool {
-	return utf8.ValidString(name) && strings.IndexByte(name, 0) < 0
+	return TextStorable(name)
 }
 
 // MailboxNameToCreate returns the name of the mailbox that creating name makes, or
@@ -84,10 +121,4 @@ func MailboxNameToCreate(name string) (string, error) {
 func MailboxNameValid(name string) bool {
 	created, err := MailboxNameToCreate(name)
 	return err == nil && created == name
-}
-
-// MailboxNameIsBelow reports whether name is a descendant of ancestor in the
-// mailbox hierarchy. Mailbox names are case-insensitive.
-func MailboxNameIsBelow(name, ancestor string) bool {
-	return strings.HasPrefix(strings.ToLower(name), strings.ToLower(ancestor)+"/")
 }

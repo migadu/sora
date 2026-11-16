@@ -74,3 +74,28 @@ func TestPOP3DatabaseOutageDropsCachedLogin(t *testing.T) {
 		t.Errorf("PASS after the outage: %q, want +OK (the guesses were counted as failed logins)", reply)
 	}
 }
+
+// TestPOP3CachedLoginDuringDatabaseOutageIsLogged: a login answered from the lookup
+// cache during a database outage passes the password check and then cannot prepare
+// the session (default mailboxes, INBOX). That is the login's result: no success and
+// no wrong password, but a server fault the client is told to retry. The session logs
+// it at WARN, with the address and how the password was checked.
+func TestPOP3CachedLoginDuringDatabaseOutageIsLogged(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	rdb, outage := common.SetupTestDatabaseWithOutage(t)
+	account := common.CreateTestAccount(t, rdb)
+	address := startPOP3WithMasterSASL(t, rdb, common.DBOutageAuthRateLimit(), "", "")
+
+	if reply := pop3UserPass(t, address, account.Email, account.Password); !strings.HasPrefix(reply, "+OK") {
+		t.Fatalf("PASS before the outage: %q, want +OK", reply)
+	}
+
+	logs := common.CaptureLogs(t)
+	outage.Begin()
+	defer outage.End()
+	if reply := pop3UserPass(t, address, account.Email, account.Password); !strings.HasPrefix(reply, "-ERR [SYS/TEMP]") {
+		t.Errorf("cached PASS during a database outage: %q, want -ERR [SYS/TEMP] ...", reply)
+	}
+	logs.WaitForLine(t, "error creating default mailboxes", "address="+account.Email, "method=cache", "session=")
+}

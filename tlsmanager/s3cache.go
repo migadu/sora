@@ -10,12 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/migadu/sora/config"
@@ -44,7 +42,7 @@ type S3Cache struct {
 // Every value it stores is private key material - the certificate PEM bundles end
 // with the certificate key, and "acme_account+key" is the ACME account key - so the
 // write must not leave protection at rest to a bucket default nobody enforces.
-const defaultSSEAlgorithm = types.ServerSideEncryptionAes256
+const defaultSSEAlgorithm = types.ServerSideEncryption(config.CertificateSSEAES256)
 
 // S3CacheOption adjusts how the cache stores certificates.
 type S3CacheOption func(*S3Cache)
@@ -60,40 +58,19 @@ func WithServerSideEncryption(algorithm, kmsKeyID string) S3CacheOption {
 	}
 }
 
-// encryptionOptions turns the configured encryption settings into cache options.
-// A configuration that says nothing about encryption keeps defaultSSEAlgorithm; a
-// stray KMS key id with no algorithm is passed through rather than dropped, so
-// validateEncryption can reject it instead of the deployment believing it applies.
+// encryptionOptions turns the configured encryption settings into cache options. A
+// configuration that says nothing about encryption keeps the default; a stray KMS key id
+// with no algorithm is passed through rather than dropped, so validateEncryption can
+// reject it instead of the deployment believing it applies.
 func encryptionOptions(cfg config.TLSLetsEncryptS3Config) []S3CacheOption {
-	if cfg.ServerSideEncryption == nil && cfg.ServerSideEncryptionKMSKeyID == "" {
-		return nil
-	}
-	algorithm := string(defaultSSEAlgorithm)
-	if cfg.ServerSideEncryption != nil {
-		algorithm = *cfg.ServerSideEncryption
-	}
-	return []S3CacheOption{WithServerSideEncryption(algorithm, cfg.ServerSideEncryptionKMSKeyID)}
+	return []S3CacheOption{WithServerSideEncryption(cfg.CertificateSSE())}
 }
 
 // validateEncryption rejects settings that would not mean what they say, rather than
-// writing private keys under them.
+// writing private keys under them. config.TLSConfig.Validate refuses such a
+// [tls.letsencrypt.s3] with the file, by the same check.
 func (c *S3Cache) validateEncryption() error {
-	switch c.sseAlgorithm {
-	case "":
-		// No header: the store's own default applies.
-	case types.ServerSideEncryptionAes256, types.ServerSideEncryptionAwsKms:
-	default:
-		return fmt.Errorf("unsupported server-side encryption %q: use %q, %q or an empty value",
-			c.sseAlgorithm, types.ServerSideEncryptionAes256, types.ServerSideEncryptionAwsKms)
-	}
-	if c.sseAlgorithm == types.ServerSideEncryptionAwsKms && c.sseKMSKeyID == "" {
-		return fmt.Errorf("server-side encryption %q requires a KMS key id", c.sseAlgorithm)
-	}
-	if c.sseAlgorithm != types.ServerSideEncryptionAwsKms && c.sseKMSKeyID != "" {
-		return fmt.Errorf("a KMS key id is only used by server-side encryption %q, not %q",
-			types.ServerSideEncryptionAwsKms, c.sseAlgorithm)
-	}
-	return nil
+	return config.ValidateCertificateSSE(string(c.sseAlgorithm), c.sseKMSKeyID)
 }
 
 // OpenS3Cache opens the certificate cache cfg describes as the server does, with the
@@ -170,22 +147,8 @@ func (c *S3Cache) verifyBucketAccess(ctx context.Context) error {
 
 // Get retrieves a certificate data from S3.
 func (c *S3Cache) Get(ctx context.Context, key string) ([]byte, error) {
-	s3Key := S3ObjectKey(key)
-
-	logger.Debug("S3-Cache: Getting certificate", "key", key, "s3_key", s3Key)
-
-	data, err := c.getObject(ctx, s3Key)
-	if errors.Is(err, autocert.ErrCacheMiss) {
-		logger.Debug("S3-Cache: Certificate not found (cache miss)", "key", key)
-		return nil, err
-	}
-	if err != nil {
-		logger.Error("S3-Cache: Failed to get object from S3", "key", key, "error", err)
-		return nil, err
-	}
-
-	logger.Debug("S3-Cache: Successfully retrieved certificate", "key", key, "bytes", len(data))
-	return data, nil
+	data, _, err := c.getSnapshot(ctx, key)
+	return data, err
 }
 
 // getObject reads the object s3Key. A missing object is autocert.ErrCacheMiss.
@@ -204,11 +167,8 @@ func (c *S3Cache) getObject(ctx context.Context, s3Key string) ([]byte, error) {
 		// Only a 404 means the certificate is absent. Any other failure must surface as an
 		// error: reported as a cache miss it tells autocert the certificate does not exist,
 		// which orders a new one from Let's Encrypt for a domain that already has one.
-		var responseError *awshttp.ResponseError
-		if errors.As(err, &responseError) {
-			if responseError.HTTPStatusCode() == http.StatusNotFound {
-				return nil, autocert.ErrCacheMiss
-			}
+		if missingS3Object(err) {
+			return nil, autocert.ErrCacheMiss
 		}
 		return nil, fmt.Errorf("failed to get object from S3: %w", err)
 	}
@@ -224,20 +184,17 @@ func (c *S3Cache) getObject(ctx context.Context, s3Key string) ([]byte, error) {
 
 // Put stores certificate data in S3.
 func (c *S3Cache) Put(ctx context.Context, key string, data []byte) error {
-	s3Key := S3ObjectKey(key)
-
-	logger.Debug("S3-Cache: Putting certificate", "key", key, "s3_key", s3Key, "bytes", len(data))
-
-	if err := c.putObject(ctx, s3Key, data); err != nil {
-		// The algorithm is logged because a store that does not implement it rejects the
-		// write outright, and that reads as a plain upload failure otherwise.
-		logger.Error("S3-Cache: Failed to upload certificate to S3", "key", key,
-			"server_side_encryption", c.sseAlgorithm, "error", err)
-		return err
+	ctx, cancel := context.WithTimeout(ctx, s3OperationTimeout)
+	defer cancel()
+	g, present := ctx.Value(publicationContextKey{}).(publicationGeneration)
+	if !present {
+		_, current, err := c.getSnapshot(ctx, key)
+		if err != nil && !errors.Is(err, autocert.ErrCacheMiss) {
+			return err
+		}
+		g = current
 	}
-
-	logger.Debug("S3-Cache: Successfully stored certificate", "key", key)
-	return nil
+	return c.putGeneration(ctx, key, data, g)
 }
 
 // putObject writes data to the object s3Key with the configured server-side encryption.
@@ -266,6 +223,36 @@ func (c *S3Cache) putObject(ctx context.Context, s3Key string, data []byte) erro
 	return nil
 }
 
+func (c *S3Cache) putObjectConditional(ctx context.Context, s3Key string, data []byte, etag string, exists bool) error {
+	ctx, cancel := context.WithTimeout(ctx, s3OperationTimeout)
+	defer cancel()
+
+	contentType := "application/octet-stream"
+	input := &s3.PutObjectInput{
+		Bucket:      aws.String(c.bucket),
+		Key:         aws.String(s3Key),
+		Body:        bytes.NewReader(data),
+		ContentType: &contentType,
+	}
+	if exists {
+		input.IfMatch = aws.String(etag)
+	} else {
+		input.IfNoneMatch = aws.String("*")
+	}
+	if c.sseAlgorithm != "" {
+		input.ServerSideEncryption = c.sseAlgorithm
+		if c.sseKMSKeyID != "" {
+			input.SSEKMSKeyId = aws.String(c.sseKMSKeyID)
+		}
+	}
+
+	// Upload to S3
+	if _, err := c.client.PutObject(ctx, input); err != nil {
+		return fmt.Errorf("failed to upload to S3: %w", err)
+	}
+	return nil
+}
+
 // MarkDeleted records in the bucket that the certificate stored under the object key
 // certKey (see S3ObjectKey) was deleted, at the given time. sora-admin calls it before it
 // deletes the object: every node holds the certificate in its local fallback cache too,
@@ -277,10 +264,12 @@ func (c *S3Cache) MarkDeleted(ctx context.Context, certKey string, at time.Time)
 	if !ok {
 		return nil
 	}
-	if err := c.putObject(ctx, marker, []byte(at.UTC().Format(time.RFC3339Nano))); err != nil {
-		return fmt.Errorf("recording the deletion of %s: %w", certKey, err)
+	if err := c.revokeObject(ctx, certKey, at); err != nil {
+		return err
 	}
-	return nil
+	// Keep the old marker for diagnosing legacy local files during upgrade. It is
+	// not the publication fence; the CAS-protected entry above is authoritative.
+	return c.putObject(ctx, marker, []byte(at.UTC().Format(time.RFC3339Nano)))
 }
 
 // DeletedAt reports when the certificate cached under name was last deleted from the
@@ -303,35 +292,7 @@ func (c *S3Cache) DeletedAt(ctx context.Context, name string) (time.Time, error)
 
 // Delete removes certificate data from S3.
 func (c *S3Cache) Delete(ctx context.Context, key string) error {
-	s3Key := S3ObjectKey(key)
-
-	logger.Debug("S3-Cache: Deleting certificate", "key", key, "s3_key", s3Key)
-
-	ctx, cancel := context.WithTimeout(ctx, s3OperationTimeout)
-	defer cancel()
-
-	input := &s3.DeleteObjectInput{
-		Bucket: aws.String(c.bucket),
-		Key:    aws.String(s3Key),
-	}
-
-	// Delete from S3
-	_, err := c.client.DeleteObject(ctx, input)
-	if err != nil {
-		// Check if object doesn't exist (which is fine for Delete)
-		var responseError *awshttp.ResponseError
-		if errors.As(err, &responseError) {
-			if responseError.HTTPStatusCode() == http.StatusNotFound {
-				logger.Debug("S3-Cache: Certificate already deleted or doesn't exist", "key", key)
-				return nil
-			}
-		}
-		logger.Error("S3-Cache: Failed to delete certificate from S3", "error", err)
-		return fmt.Errorf("failed to delete from S3: %w", err)
-	}
-
-	logger.Debug("S3-Cache: Successfully deleted certificate", "key", key)
-	return nil
+	return c.MarkDeleted(ctx, S3ObjectKey(key), time.Now())
 }
 
 const (

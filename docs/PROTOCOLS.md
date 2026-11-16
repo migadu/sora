@@ -113,7 +113,8 @@ controls:
 
 - which peers may send a PROXY protocol header (section 3);
 - which peers may send forwarding data: XCLIENT on POP3 and LMTP, and the `x-` fields of the IMAP
-  `ID` command;
+  `ID` command. Behind a PROXY header, IMAP and POP3 judge the client the header names, not the
+  load balancer that sent it ([SECURITY.md](SECURITY.md#31-trusted_networks));
 - which peers skip the per-IP connection limit;
 - which peers skip auth rate limiting, unless `auth_rate_limit.exempt_networks` is set (see
   [AUTHENTICATION.md](AUTHENTICATION.md));
@@ -178,8 +179,8 @@ logs, rate limits and per-IP limits.
 - `proxy_protocol_timeout` (default `5s`) bounds the wait for the header.
 - On IMAP, a version 2 header may carry the client's JA4 TLS fingerprint and the proxy's session
   ID; Sora uses both (section 6).
-- With `proxy_protocol = true`, IMAP, POP3 and ManageSieve do not apply `max_connections_per_ip`:
-  every connection arrives from a proxy address.
+- `max_connections_per_ip` counts the client the header names. That client is exempt only when its
+  own address is in `trusted_networks`, not because the load balancer's is.
 
 The PROXY protocol and how Sora's own proxies use it are described in [PROXY.md](PROXY.md).
 
@@ -188,14 +189,18 @@ The PROXY protocol and how Sora's own proxies use it are described in [PROXY.md]
 | Key | Default | Applies to | Effect |
 |---|---|---|---|
 | `max_connections` | `0` (no limit); LMTP: `1000` | all four | Open connections on this listener. |
-| `max_connections_per_ip` | `0` (no limit) | IMAP, POP3, ManageSieve | Open connections from one address. Peers in `trusted_networks` are exempt. |
+| `max_connections_per_ip` | `0` (no limit) | IMAP, POP3, ManageSieve | Open connections from one client address: with `proxy_protocol`, the address the header names. A client whose own address is in `trusted_networks` is exempt. |
 | `max_connections_per_user` | `0` (no limit) | IMAP, POP3, ManageSieve | Logged-in sessions of one account on this server. |
 | `max_connections_per_user_per_ip` | `0` (no limit) | as above | Logged-in sessions of one account from one address on this server. |
 | `listen_backlog` | `1024` when `0` | all four | Kernel accept queue length. |
 
 A connection over `max_connections` or `max_connections_per_ip` is closed at once, without a
 greeting. On IMAP, a connection from an address that the auth rate limiter has blocked is closed
-the same way.
+the same way. The exception is a client a PROXY header names that is over `max_connections_per_ip`,
+or blocked on IMAP: it gets a refusal greeting, after the TLS handshake on an implicit-TLS
+listener (IMAP `* BYE`, POP3 `-ERR [SYS/TEMP]`, ManageSieve `NO (TRYLATER)`), so that a proxy in
+front fails only that client's login and does not count a backend failure. See
+[SECURITY.md](SECURITY.md#4-connection-limits).
 
 The per-user limits on a backend count sessions on that one server block only. A login over the
 limit is refused and the session stays unauthenticated: IMAP answers
@@ -331,7 +336,7 @@ list depends on the connection state:
 | `ESEARCH`, `SEARCHRES` | RFC 4731, RFC 5182 | |
 | `LIST-EXTENDED`, `LIST-STATUS` | RFC 5258, RFC 5819 | |
 | `STATUS=SIZE` | RFC 8438 | |
-| `CHILDREN` | RFC 3348 | |
+| `CHILDREN` | RFC 3348 | When removed (section 6), `\HasChildren` / `\HasNoChildren` are sent only for `LIST ... RETURN (CHILDREN)`, which `LIST-EXTENDED` keeps (RFC 5258 §4). |
 | `NAMESPACE` | RFC 2342 | Section 5.3. |
 | `MOVE` | RFC 6851 | |
 | `BINARY` | RFC 3516 | |
@@ -440,18 +445,28 @@ Moving a message into or out of `Junk` can submit it to an external spam filter 
 
 For an uploaded message, Sora reads the body from the local cache, then from S3, then from the local
 upload spool (useful while S3 is unreachable). For a message still waiting for upload, it reads the
-local spool first, then S3. Two replies are specific to Sora:
+local spool first, then S3. Three replies are specific to Sora:
 
 - `NO [UNAVAILABLE] Message body temporarily unavailable, please retry` when the body is staged
   for upload on another node and not yet in S3. Sora never sends an empty body in that case, so a
   client cannot mistake it for an empty message.
-- `NO [UNAVAILABLE] Message too large for the session memory limit` when the body does not fit the
-  session's remaining memory budget.
+- `NO [LIMIT] Message too large for the session memory limit` when the message can never be
+  fetched within the session memory budget: its body is larger than the whole budget, or a section
+  (`BODY[TEXT]`, `BODY[2]`, `BINARY[2]`) does not fit beside the body it is copied from. RFC 5530
+  defines LIMIT as "The operation ran up against an implementation limit of some kind"; a retry
+  cannot succeed, and a NOTIFY `MessageNew` fetch passes such a message over at once.
+- `NO [UNAVAILABLE] Session memory limit reached, please try again later` when the body or section
+  would fit the budget, but other data the session holds at the moment does not leave room for it.
+  A retry can succeed.
+
+In both memory cases the message is not marked `\Seen`, and nothing of its response is sent.
 
 `limits.session_memory_limit` (default `100mb`, `0` for no limit) bounds the memory one session
 may hold at once for FETCH bodies, APPEND data, SEARCH results and previews. Each refusal is counted
 in `sora_session_memory_limit_exceeded_total`, and the peak per session is observed in
-`sora_session_memory_peak_bytes`.
+`sora_session_memory_peak_bytes`. Start-up and a reload warn when the limit is below the
+`max_message_size` of an `lmtp` server in the same file: messages between the two sizes are
+delivered, but never fetched.
 
 ### 5.6 SEARCH, SORT, THREAD and MULTISEARCH
 
@@ -497,7 +512,8 @@ numbers for `STORE`, UIDs for `UID STORE`), per RFC 7162 §3.1.3.
 
 `GETMETADATA` and `SETMETADATA` store annotations per mailbox, and per account for the server
 entry (mailbox `""`). Entry names must start with `/private/` or `/shared/` and are
-case-insensitive. A wildcard mailbox name (`*` or `%`) gets `NO [CLIENTBUG]`. The size and count
+case-insensitive; a `SETMETADATA` naming one entry twice in different letter case gets
+`BAD [CLIENTBUG]`. A wildcard mailbox name (`*` or `%`) gets `NO [CLIENTBUG]`. The size and count
 limits come from the `[metadata]` section (64 KiB per entry, 100 entries per mailbox, 50 server
 entries per account, 1 MiB per account by default); see [STORAGE.md](STORAGE.md).
 
@@ -537,11 +553,14 @@ The server answers `ID` with:
 
 Some clients change behaviour by server name, so these keys let you present a different identity.
 
-The client's `name` and `version` are matched against `client_filters` (section 6). When the
-connection comes from a peer in `trusted_networks`, Sora also reads the proxy's forwarding fields
-(`x-originating-ip`, `x-originating-port`, `x-session-id`, `x-proxy-ttl`, `x-forward-ja4-fingerprint`
-and others) and uses them as the client's address and fingerprint. A forwarded TTL that has run out
-closes the connection to stop a proxy loop. The fields are described in [PROXY.md](PROXY.md).
+The client's `name` and `version` are matched against `client_filters` (section 6). Before login,
+when the connection comes from a peer in `trusted_networks` (behind a PROXY header, the client the
+header names; see [SECURITY.md](SECURITY.md#31-trusted_networks)), Sora also reads the proxy's
+forwarding fields (`x-originating-ip`, `x-originating-port`, `x-session-id`, `x-proxy-ttl`,
+`x-forward-ja4-fingerprint` and others) and uses them as the client's address and fingerprint.
+After login they are ignored: the peer is then relaying the client's own commands. A forwarded TTL
+that has run out closes the connection to stop a proxy loop. The fields are described in
+[PROXY.md](PROXY.md).
 
 ### 5.12 Per-command timeouts
 
@@ -616,18 +635,22 @@ Rules:
 
 - Only these names can be removed: `IMAP4rev1`, `IMAP4rev2`, `LITERAL+`, `MOVE`, `IDLE`,
   `UIDPLUS`, `ESEARCH`, `SEARCHRES`, `ESORT`, `SORT`, `SORT=DISPLAY`, `SPECIAL-USE`,
-  `CREATE-SPECIAL-USE`, `LIST-STATUS`, `STATUS=SIZE`, `BINARY`, `CONDSTORE`, `QRESYNC`, `NOTIFY`,
-  `CHILDREN`, `ID`, `NAMESPACE`, `METADATA`, `THREAD=REFERENCES`, `THREAD=REFS`,
-  `THREAD=ORDEREDSUBJECT`, `MULTISEARCH`, and `PREVIEW` when enabled. Any other name is ignored
-  (logged at debug level).
+  `CREATE-SPECIAL-USE`, `LIST-EXTENDED`, `LIST-STATUS`, `STATUS=SIZE`, `BINARY`, `CONDSTORE`,
+  `QRESYNC`, `NOTIFY`, `CHILDREN`, `ID`, `NAMESPACE`, `METADATA`, `THREAD=REFERENCES`,
+  `THREAD=REFS`, `THREAD=ORDEREDSUBJECT`, `MULTISEARCH`, and `PREVIEW` when enabled. Names are
+  case-insensitive (`idle` is `IDLE`). Any other name is ignored and logged at WARN when the
+  server starts.
 - `IMAP4rev2` includes `NAMESPACE`, `UNSELECT`, `UIDPLUS`, `ESEARCH`, `SEARCHRES`, `ENABLE`,
   `IDLE`, `SASL-IR`, `LIST-EXTENDED`, `LIST-STATUS`, `MOVE`, `LITERAL-`, `STATUS=SIZE` and
   `CHILDREN`. Removing one of these with `disabled_caps` also removes `IMAP4rev2`, so clients fall
   back to IMAP4rev1 and really lose the extension, and Sora logs it. `client_filters` follows the
   same rule (see below).
-- `SASL-IR`, `STARTTLS`, `LOGINDISABLED`, `AUTH=PLAIN`, `UNSELECT`, `ENABLE`, `UTF8=ACCEPT`,
-  `LIST-EXTENDED`, `ACL`, `RIGHTS=` and `APPENDLIMIT=` cannot be removed this way. The first four
-  follow `tls`, `tls_use_starttls` and `insecure_auth`.
+- With `IMAP4rev1`, `SASL-IR` is always advertised, and `LITERAL-` is offered until
+  `LITERAL+` replaces it after login. After login, `UNSELECT`, `ENABLE` and `UTF8=ACCEPT`
+  are also always advertised. These names cannot be removed this way; naming one of them
+  removes neither it nor `IMAP4rev2`. `STARTTLS`, `LOGINDISABLED` and
+  `AUTH=PLAIN` follow `tls`, `tls_use_starttls` and `insecure_auth`; `disabled_caps` does not
+  change them. `ACL`, `RIGHTS=` and `APPENDLIMIT=` cannot be removed either.
 - Do not remove both `IMAP4rev1` and `IMAP4rev2`.
 - Most commands and modifiers of a removed extension are also refused by the library, so a client
   that ignores the list cannot use them.
@@ -684,7 +707,13 @@ Matching:
   its name and version patterns both match the `ID` data. A name or version pattern that is left
   out counts as matching; a client that sent no `ID` never matches a name or version pattern.
 - Every matching filter applies; their `disable_caps` add up.
-- A filter whose pattern does not compile is skipped (logged at debug level). Check new patterns.
+- Patterns are Go regular expressions (RE2 syntax). A pattern that does not compile stops startup,
+  naming the entry, the key and the pattern; `sora-admin config validate` reports it too, and a
+  reload with it is skipped for that server.
+- An entry needs at least one of `client_name`, `client_version` and `ja4_fingerprints`; one
+  without, which would match no client, stops startup the same way. An empty `client_name` or
+  `client_version` counts as left out, but an empty `ja4_fingerprints` pattern would match every
+  fingerprint, so it stops startup too.
 - The key is `ja4_fingerprints`, a list. A single `ja4_fingerprint` key is unknown and ignored.
 
 Where the JA4 fingerprint comes from, in order of preference:
@@ -699,11 +728,21 @@ When filters apply:
   greeting's capability list is filtered.
 - A name and version match applies when the client sends `ID`. Clients usually send `ID` early,
   but anything they learned from an earlier `CAPABILITY` stays in their memory.
+- A filter never takes away what the connection has already enabled: an extension the client
+  named in `ENABLE` (`IMAP4rev2`, `CONDSTORE`, `QRESYNC`), `CONDSTORE` once the client has sent any
+  CONDSTORE enabling command such as `SELECT ... (CONDSTORE)` (RFC 7162 §3.1), and `IMAP4rev2` on
+  a server without `IMAP4rev1`. RFC 9051 §6.3.1: "Once enabled using ENABLE, each extension
+  remains active until the IMAP connection is closed." A filter matched by an `ID` sent after
+  `ENABLE IMAP4rev2` therefore leaves `IMAP4rev2` and every extension it includes in place, and
+  only removes the rest. The session logs `capability filters partly applied` with the names it
+  kept.
 
 As with `disabled_caps`, a filter that removes a capability included in `IMAP4rev2` also removes
-`IMAP4rev2` for that session, so the client falls back to IMAP4rev1 and really loses the
-extension. The same list of removable names applies as for `disabled_caps`. When a filter changes
-the list, the session logs `capability filters applied` with the client and the removed names.
+`IMAP4rev2` for that session, unless the connection has it enabled (above), so the client falls
+back to IMAP4rev1 and really loses the extension. The same list of removable names applies as for
+`disabled_caps`, case-insensitively, and any other name is logged at WARN when the server starts,
+with the entry number. When a filter changes the list, the session logs `capability filters applied`
+with the client and the removed names.
 
 ---
 
@@ -766,8 +805,11 @@ Errors while reading a body: `-ERR Message not available` when it is permanently
 the upload has not finished.
 
 `limits.session_memory_limit` (default `100mb`) bounds the memory of one session. A listing too
-large for it gets `-ERR [SYS/TEMP] Mailbox too large to open in this session`, and a body too large
-gets `-ERR [SYS/TEMP] Message too large to retrieve in this session`.
+large for it gets `-ERR [SYS/TEMP] Mailbox too large to open in this session`. A body that cannot
+fit beside the session's message list gets `-ERR [SYS/PERM] Message too large for the session
+memory limit`: RFC 3206 gives SYS/PERM to "problems which are unlikely to be resolved without
+intervention", here raising the limit. A body that would fit, but not beside what the session holds
+at the moment, gets `-ERR [SYS/TEMP] Session memory limit reached, please try again later`.
 
 ### 7.4 Login and errors
 
@@ -787,12 +829,13 @@ does not apply to the POP3 backend.
 
 ### 7.5 XCLIENT
 
-A peer in `trusted_networks` (or a trusted PROXY-protocol proxy) may send `XCLIENT` before login to
-pass the real client address. Attributes: `ADDR`, `PORT`, `SESSION`, `TTL` and `FORWARD`. It is
-allowed once per session and only before login. Replies: `+OK XCLIENT parameters accepted`,
-`-ERR Connection not from trusted proxy`, `-ERR Invalid XCLIENT parameters`, and
-`-ERR Proxy TTL expired` (which closes the connection). Sora's POP3 proxy uses it; see
-[PROXY.md](PROXY.md).
+A peer in `trusted_networks` may send `XCLIENT` before login to pass the real client address. Behind
+a PROXY header the peer is the client the header names, not the load balancer that sent it
+([SECURITY.md](SECURITY.md#31-trusted_networks)). Attributes: `ADDR`, `PORT`, `SESSION`, `TTL` and
+`FORWARD`. It is allowed once per session and only before login. Replies:
+`+OK XCLIENT parameters accepted`, `-ERR Connection not from trusted proxy`,
+`-ERR Invalid XCLIENT parameters`, and `-ERR Proxy TTL expired` (which closes the connection).
+Sora's POP3 proxy uses it; see [PROXY.md](PROXY.md).
 
 ### 7.6 Per-command timeouts
 
@@ -861,7 +904,11 @@ There is no `AUTH`, `DSN` or `BINARYMIME`.
   to its ASCII form. The local part may be up to 256 octets (longer than RFC 5321's 64, to allow SRS
   addresses), the domain up to 255, and the address up to 512. A non-ASCII address is accepted even
   when the MTA did not send the `SMTPUTF8` parameter.
-- Unknown `RCPT` parameters are ignored. `NOTIFY` and `ORCPT` get `504`.
+- A `MAIL` or `RCPT` parameter the server does not implement gets `555 5.5.4` (RFC 5321
+  §4.1.1.11), the DSN parameters `NOTIFY`, `ORCPT`, `RET` and `ENVID` among them, and `AUTH`, as
+  `LHLO` does not announce `AUTH`. `XRCPTFORWARD` is the only `RCPT` parameter taken. A malformed
+  parameter gets `501 5.5.4`: `SMTPUTF8` with a value (RFC 6531 §3.4), or any parameter written
+  with `=` and no value (RFC 5321 §4.1.2).
 - `VRFY` answers `252 2.5.0 Cannot VRFY user, but will accept message`.
 
 ### 8.4 Message size
@@ -896,9 +943,10 @@ Received: from <helo> ([<client-ip>])
 `<helo>` is the `HELO` value from XCLIENT if the MTA sent one, otherwise the `LHLO` name. The
 protocol word is `UTF8LMTP` for an internationalised transaction (RFC 6531 §3.7.3).
 
-The built-in default script files messages whose `X-Spam` header contains `Yes` into `Junk`. For an
-address with a detail, it files the message into a mailbox named after the detail, creating it if
-needed. Any sender can therefore create a folder in an account by writing to `user+name@`.
+The built-in default script files messages whose `X-Spam` header contains `Yes` into the
+account's personal mailbox with the `\Junk` special-use attribute, or into `Junk` if none has it.
+For an address with a detail, it files the message into a mailbox named after the detail, creating
+it if needed. Any sender can therefore create a folder in an account by writing to `user+name@`.
 
 A message that is already in the target mailbox (same Message-ID and content, or the same bytes
 delivered again after an MTA retry) is answered `250` and not stored a second time.
@@ -932,7 +980,10 @@ Redirected copies leave through `[relay]`; see [RELAY.md](RELAY.md) and [SIEVE.m
 
 Peers in `[servers] trusted_networks` may send `XCLIENT` with `ADDR`, `PORT`, `PROTO`, `HELO`,
 `LOGIN` and `NAME`. After it, the server greets again and the MTA must send `LHLO` again. Sora uses
-`ADDR` as the client address and `HELO` in the `Received:` header. From any other peer `XCLIENT`
+`ADDR` as the client address and `HELO` in the `Received:` header. On a listener with
+`proxy_protocol = true`, `ADDR` and `PORT` replace the address the PROXY header gave only when that
+address is itself in `trusted_networks`; otherwise they are ignored and the other attributes still
+apply ([SECURITY.md](SECURITY.md#31-trusted_networks)). From any other peer `XCLIENT`
 is not advertised and gets `550 5.7.1 XCLIENT denied`. The LMTP proxy uses XCLIENT; see
 [PROXY.md](PROXY.md).
 
@@ -1041,7 +1092,7 @@ plain number of bytes.
 | `type` | string | required | all | `imap`, `pop3`, `lmtp` or `managesieve`. |
 | `name` | string | required | all | Unique server name. |
 | `addr` | string | required | all | Listen address. |
-| `debug` | bool | `false` | IMAP, LMTP | IMAP: writes a raw protocol trace, with LOGIN and AUTHENTICATE passwords masked but message content included, to the log file when `[logging] output` is a file, otherwise to standard output. LMTP: logs each message's headers at debug level before Sieve runs. No effect on POP3 and ManageSieve. Needs a restart. |
+| `debug` | bool | `false` | IMAP, LMTP | IMAP: writes a raw protocol trace, with LOGIN and AUTHENTICATE passwords masked but message content included, to the log file when `[logging] output` is a file, otherwise to standard output. LMTP: logs each message's headers at debug level before Sieve runs. No effect on POP3 and ManageSieve, where it is ignored with a startup warning. Needs a restart. |
 
 ### 10.2 TLS
 

@@ -22,9 +22,16 @@ import (
 // MaxCustomKeywordsPerMessage, so it never pushes out a keyword the client or
 // script set, and never turns an APPEND into a [LIMIT] refusal.
 func WithAttachmentKeyword(flags []imap.Flag, data []byte, override bool) []imap.Flag {
+	keyword, known := helpers.AttachmentKeyword(data)
+	return WithClassifiedAttachmentKeyword(flags, keyword, known, override)
+}
+
+// WithClassifiedAttachmentKeyword is WithAttachmentKeyword for a message that
+// helpers.AttachmentKeyword has already classified as (keyword, known), so a
+// delivery storing copies with different flags walks the MIME tree once.
+func WithClassifiedAttachmentKeyword(flags []imap.Flag, keyword imap.Flag, known, override bool) []imap.Flag {
 	has := slices.ContainsFunc(flags, isHasAttachmentKeyword)
 	hasNo := slices.ContainsFunc(flags, isHasNoAttachmentKeyword)
-	keyword, known := helpers.AttachmentKeyword(data)
 
 	if known && (override || has == hasNo) {
 		flags = slices.DeleteFunc(slices.Clone(flags), isAttachmentKeyword)

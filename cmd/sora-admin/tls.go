@@ -11,11 +11,16 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/storage"
@@ -193,9 +198,14 @@ Options:
   --force               Skip confirmation prompt
   --config string       Path to TOML configuration file (required)
 
-This command deletes only expired certificates from both S3 and local cache. Running
-servers never write an expired certificate back to S3; each removes its own expired copy
-at its next certificate sync.
+This command deletes only expired certificates from both S3 and local cache.
+Running servers do not write expired certificates back to S3.
+A certificate a node renews while clean runs is kept: on a bucket that keeps
+versions (Backblaze B2 buckets always do) clean deletes only the versions it
+found expired, which needs the right to delete object versions. Without a usable
+version id, clean requires the object's ETag and conditional DELETE support.
+If the object changed it is kept; missing ETags or unsupported conditions fail
+safely, without falling back to an unconditional delete.
 
 Examples:
   # Clean expired certificates (with confirmation)
@@ -307,7 +317,8 @@ Use 'sora-admin tls <subcommand> --help' for detailed help.
 
 type CertificateInfo struct {
 	S3Key        string
-	Domain       string
+	Domain       string // display label, e.g. "mail.example.com (RSA)"
+	CacheName    string // autocert cache name, "<domain>" or "<domain>+rsa"; "" when unknown
 	CertType     string // "ECDSA", "RSA", or "Unknown"
 	InLocalCache bool
 	LocalPath    string
@@ -389,7 +400,7 @@ func listTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, 
 
 			// Try to determine domain from key
 			// Format: autocert/cert-<sha256(domain)> or autocert/cert-<sha256(domain+rsa)>
-			certInfo.Domain = tryDecodeDomain(obj.Key)
+			certInfo.Domain, certInfo.CacheName = tryDecodeDomain(obj.Key, cfg.TLS.LetsEncrypt.Domains)
 
 			// Download certificate from S3 to parse it
 			reader, err := s3store.Get(obj.Key)
@@ -397,20 +408,26 @@ func listTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, 
 				logger.Warn("Failed to download certificate from S3", "key", obj.Key, "error", err)
 				certInfo.CertType = "Error"
 			} else {
-				defer reader.Close()
 				// Read certificate data
 				certData, err := io.ReadAll(reader)
+				reader.Close()
 				if err != nil {
 					logger.Warn("Failed to read certificate from S3", "key", obj.Key, "error", err)
 					certInfo.CertType = "Error"
 				} else {
-					// Parse certificate
+					certData, absent, decodeErr := tlsmanager.DecodeCertificateCacheData(certData)
+					if decodeErr != nil {
+						return decodeErr
+					}
+					if absent {
+						continue
+					}
 					parseCertificateData(certData, &certInfo)
 				}
 			}
 
 			// Check if certificate exists in local cache
-			certInfo.InLocalCache, certInfo.LocalPath = checkLocalCache(cacheDir, certInfo.Domain)
+			certInfo.InLocalCache, certInfo.LocalPath = checkLocalCache(cacheDir, certInfo.CacheName)
 
 			certs = append(certs, certInfo)
 
@@ -442,35 +459,33 @@ func listTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, 
 	return displayCertificatesTable(certs, showDetails)
 }
 
-func tryDecodeDomain(s3Key string) string {
+// tryDecodeDomain names the object at s3Key by the configured domain (the
+// [tls.letsencrypt] domains, loaded as autocert names) whose ECDSA ("<domain>") or RSA
+// ("<domain>+rsa") cache entry the server's S3 cache keeps there. It returns the display
+// label and that entry's autocert cache name, which is also the name of its file in the
+// local fallback cache, so the copy is found even when the object holds no readable
+// certificate. The key is a hash of the entry name, so any other object, such as one of
+// a domain no longer configured, is labelled by a hash prefix, with no cache name.
+func tryDecodeDomain(s3Key string, domains []string) (label, cacheName string) {
 	// Extract hash from key: autocert/cert-<hash>
-	parts := strings.Split(s3Key, "cert-")
-	if len(parts) != 2 {
-		return "unknown"
+	hash, ok := strings.CutPrefix(s3Key, "autocert/cert-")
+	if !ok {
+		return "unknown", ""
 	}
 
-	hash := parts[1]
-
-	// Try common domains
-	commonDomains := []string{
-		"imap.migadu.com",
-		"pop.migadu.com",
-		"lmtp.migadu.com",
-		"smtp.migadu.com",
-		"mail.migadu.com",
-	}
-
-	for _, domain := range commonDomains {
-		// Try both ECDSA (domain) and RSA (domain+rsa)
+	for _, domain := range domains {
 		switch s3Key {
 		case tlsmanager.S3ObjectKey(domain):
-			return domain
+			return domain, domain
 		case tlsmanager.S3ObjectKey(domain + "+rsa"):
-			return domain + " (RSA)"
+			return domain + " (RSA)", domain + "+rsa"
 		}
 	}
 
-	return hash[:16] + "..." // Show first 16 chars of hash
+	// Show at most the first 16 characters. The "..." marks the name as not decoded,
+	// even when nothing was cut: parseCertificateData then takes the certificate's own
+	// name.
+	return hash[:min(len(hash), 16)] + "...", ""
 }
 
 // autocertName returns the name autocert caches a domain's certificates under, as the
@@ -486,11 +501,15 @@ func autocertName(domain string) (string, error) {
 }
 
 func parseCertificateData(data []byte, info *CertificateInfo) {
+	_ = parseCertificate(data, info)
+}
+
+func parseCertificate(data []byte, info *CertificateInfo) error {
 	// autocert stores: private key PEM + certificate PEM
 	// We need to skip the private key and parse the certificate
 
 	// Try to find certificate PEM block
-	var certPEM []byte
+	var certBlock *pem.Block
 	remaining := data
 
 	for {
@@ -500,29 +519,22 @@ func parseCertificateData(data []byte, info *CertificateInfo) {
 		}
 
 		if block.Type == "CERTIFICATE" {
-			certPEM = pem.EncodeToMemory(block)
+			certBlock = block
 			break
 		}
 
 		remaining = rest
 	}
 
-	if certPEM == nil {
+	if certBlock == nil {
 		info.CertType = "Invalid"
-		return
+		return errors.New("no CERTIFICATE PEM block found")
 	}
 
-	// Parse certificate
-	block, _ := pem.Decode(certPEM)
-	if block == nil {
-		info.CertType = "Invalid"
-		return
-	}
-
-	cert, err := x509.ParseCertificate(block.Bytes)
+	cert, err := x509.ParseCertificate(certBlock.Bytes)
 	if err != nil {
 		info.CertType = "Parse Error"
-		return
+		return err
 	}
 
 	// Extract information
@@ -533,6 +545,11 @@ func parseCertificateData(data []byte, info *CertificateInfo) {
 	info.SerialNumber = cert.SerialNumber.String()
 	info.KeyAlgorithm = cert.PublicKeyAlgorithm.String()
 	info.SigAlgorithm = cert.SignatureAlgorithm.String()
+	if info.CacheName == "" {
+		// Not a configured domain's entry: find the cache name among the certificate's
+		// own names. A configured one is the key's preimage already.
+		info.CacheName = autocertCacheName(info.S3Key, cert)
+	}
 
 	// Extract actual domain from certificate (if Domain is still a hash)
 	if strings.Contains(info.Domain, "...") || info.Domain == "unknown" {
@@ -561,43 +578,67 @@ func parseCertificateData(data []byte, info *CertificateInfo) {
 	default:
 		info.CertType = cert.PublicKeyAlgorithm.String()
 	}
+
+	if info.Expiry.IsZero() {
+		return errors.New("certificate has zero expiry")
+	}
+	return nil
 }
 
-func checkLocalCache(cacheDir string, domain string) (bool, string) {
-	// Check if cache directory exists
-	if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
+// autocertCacheName returns the autocert cache name ("<domain>" or "<domain>+rsa") that
+// the certificate stored at s3Key was cached under: the one, among the certificate's own
+// names, whose tlsmanager.S3ObjectKey is s3Key. It returns "" when there is none.
+func autocertCacheName(s3Key string, cert *x509.Certificate) string {
+	for _, domain := range append([]string{cert.Subject.CommonName}, cert.DNSNames...) {
+		name, err := config.AutocertName(domain)
+		if err != nil {
+			continue
+		}
+		for _, entry := range []string{name, name + "+rsa"} {
+			if tlsmanager.S3ObjectKey(entry) == s3Key {
+				return entry
+			}
+		}
+	}
+	return ""
+}
+
+// checkLocalCache reports whether the local fallback cache (an autocert.DirCache, which
+// names each file by its cache name) holds the entry cacheName, and its path.
+func checkLocalCache(cacheDir string, cacheName string) (bool, string) {
+	if cacheName == "" {
 		return false, ""
 	}
-
-	// Try to find the certificate in local cache
-	// autocert uses the domain name (or domain+rsa) as the filename
-
-	// Extract potential filename from domain
-	var filenames []string
-	if strings.Contains(domain, "(RSA)") {
-		baseDomain := strings.TrimSuffix(strings.TrimSpace(domain), " (RSA)")
-		filenames = []string{
-			baseDomain + "+rsa",
-			baseDomain,
-		}
-	} else if strings.HasSuffix(domain, "...") {
-		// Unknown domain, can't check local cache
+	localPath := filepath.Join(cacheDir, cacheName)
+	if _, err := os.Stat(localPath); err != nil {
 		return false, ""
-	} else {
-		filenames = []string{
-			domain,
-			domain + "+rsa",
-		}
 	}
+	return true, localPath
+}
 
-	for _, filename := range filenames {
-		localPath := filepath.Join(cacheDir, filename)
-		if _, err := os.Stat(localPath); err == nil {
-			return true, localPath
-		}
+// expiredLocalCopy returns the path of the local fallback cache's entry cacheName, or ""
+// when there is none or it holds a certificate still valid at now: the fallback cache
+// can hold a renewal that has not reached S3 yet, which clean must keep.
+func expiredLocalCopy(cacheDir, cacheName string, now time.Time) (string, error) {
+	if cacheName == "" {
+		return "", nil
 	}
-
-	return false, ""
+	localPath := filepath.Join(cacheDir, cacheName)
+	data, err := os.ReadFile(localPath)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to read local cache file %s: %w", localPath, err)
+	}
+	var local CertificateInfo
+	if err := parseCertificate(data, &local); err != nil {
+		return "", fmt.Errorf("failed to parse local cache file %s: %w", localPath, err)
+	}
+	if !local.Expiry.Before(now) {
+		return "", nil
+	}
+	return localPath, nil
 }
 
 func displayCertificatesTable(certs []CertificateInfo, showDetails bool) error {
@@ -751,6 +792,7 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 	var keysToDelete []string // S3 objects that exist
 	var localFiles []string   // local cache files that exist
 	var marks []string        // certificate keys to mark deleted
+	localSnapshots := make(map[string][]byte)
 
 	if domain != "" {
 		name, err := autocertName(domain)
@@ -767,7 +809,7 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 			// Marked even when S3 lacks it: a running node may hold a copy it has yet
 			// to write to S3, and the domain's certificates are what is being deleted.
 			marks = append(marks, key)
-			exists, _, err := s3store.ExistsContext(ctx, key)
+			exists, err := tlsObjectActive(ctx, s3store, key)
 			if err != nil {
 				return fmt.Errorf("failed to look up %s in S3: %w", key, err)
 			}
@@ -777,6 +819,13 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 
 			localPath := filepath.Join(cacheDir, entry)
 			if _, err := os.Lstat(localPath); err == nil {
+				if !dryRun {
+					data, readErr := tlsmanager.ReadLocalCertificateFile(ctx, localPath)
+					if readErr != nil {
+						return readErr
+					}
+					localSnapshots[localPath] = data
+				}
 				localFiles = append(localFiles, localPath)
 			} else if !os.IsNotExist(err) {
 				return fmt.Errorf("failed to check local cache file %s: %w", localPath, err)
@@ -795,21 +844,36 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 			fmt.Printf("  Local file: %s\n", localPath)
 		}
 	} else {
-		// Delete by specific S3 key or prefix
-		// Support full key, hash, or partial hash
+		// Delete by S3 key: a full key, a hash, or a prefix of either. A trailing "..."
+		// (as tls list truncates keys) marks a prefix. Any other value is looked up as
+		// a key first, so an existing key is deleted even when it is also the prefix
+		// of another key, and it is taken as a prefix only when it is not a key.
 		searchKey := s3Key
+		if strings.HasPrefix(searchKey, "autocert/") && !strings.HasPrefix(searchKey, "autocert/cert-") {
+			return fmt.Errorf("key is not a certificate cache entry")
+		}
 		if !strings.HasPrefix(searchKey, "autocert/") {
 			searchKey = "autocert/cert-" + searchKey
 		}
+		prefix, isPrefix := strings.CutSuffix(searchKey, "...")
 
-		// If the key looks partial (ends with ...), do a prefix search
-		needsPrefixSearch := strings.HasSuffix(s3Key, "...") || len(s3Key) < 64
+		if !isPrefix {
+			// storage.DeleteContext succeeds for a missing key, so look first: a key
+			// that is not there must not be reported as deleted.
+			exists, err := tlsObjectActive(ctx, s3store, searchKey)
+			if err != nil {
+				return fmt.Errorf("failed to look up %s in S3: %w", searchKey, err)
+			}
+			if exists {
+				keysToDelete = []string{searchKey}
+				fmt.Printf("Deleting certificate: %s\n", searchKey)
+			}
+		}
 
-		if needsPrefixSearch {
+		if len(keysToDelete) == 0 {
 			// Search for matching certificates by prefix
 			fmt.Printf("Searching for certificates matching prefix: %s\n", searchKey)
 
-			prefix := strings.TrimSuffix(searchKey, "...")
 			objChan, errChan := s3store.ListObjects(ctx, "autocert/", false)
 
 			var matches []string
@@ -825,7 +889,13 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 						continue
 					}
 					if strings.HasPrefix(obj.Key, prefix) {
-						matches = append(matches, obj.Key)
+						active, err := tlsObjectActive(ctx, s3store, obj.Key)
+						if err != nil {
+							return err
+						}
+						if active {
+							matches = append(matches, obj.Key)
+						}
 					}
 				case err, ok := <-errChan:
 					if !ok {
@@ -854,18 +924,6 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 
 			keysToDelete = matches
 			fmt.Printf("Found matching certificate: %s\n", matches[0])
-		} else {
-			// storage.DeleteContext succeeds for a missing key, so look first: a key
-			// that is not there must fail rather than be reported as deleted.
-			exists, _, err := s3store.ExistsContext(ctx, searchKey)
-			if err != nil {
-				return fmt.Errorf("failed to look up %s in S3: %w", searchKey, err)
-			}
-			if !exists {
-				return fmt.Errorf("certificate not found in S3: %s", searchKey)
-			}
-			keysToDelete = []string{searchKey}
-			fmt.Printf("Deleting certificate: %s\n", searchKey)
 		}
 	}
 
@@ -886,30 +944,22 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 	}
 
 	var failures []error
-	deleted := 0
+	deleted := len(keysToDelete)
 	for _, key := range keysToDelete {
-		if err := s3store.DeleteContext(ctx, key); err != nil {
-			logger.Warn("Failed to delete certificate from S3", "key", key, "error", err)
-			failures = append(failures, fmt.Errorf("S3 object %s: %w", key, err))
-			continue
-		}
-		logger.Info("Deleted certificate from S3", "key", key)
-		deleted++
+		logger.Info("Deleted certificate from S3 with a persistent revocation fence", "key", key)
 	}
 
 	removed := 0
 	for _, localPath := range localFiles {
-		if err := os.Remove(localPath); err != nil {
-			if !os.IsNotExist(err) {
-				logger.Warn("Failed to delete certificate from local cache", "path", localPath, "error", err)
-				failures = append(failures, fmt.Errorf("local file %s: %w", localPath, err))
-			}
+		didRemove, err := tlsmanager.RemoveLocalCertificateIfSame(ctx, localPath, localSnapshots[localPath])
+		if err != nil {
+			failures = append(failures, fmt.Errorf("local file %s: %w", localPath, err))
 			continue
 		}
-		logger.Info("Deleted certificate from local cache", "path", localPath)
-		removed++
+		if didRemove {
+			removed++
+		}
 	}
-	remarkDeleted(ctx, cache, marks)
 
 	fmt.Printf("\nDeleted %d certificate(s) from S3 and %d file(s) from the local cache\n", deleted, removed)
 	if len(failures) > 0 {
@@ -951,8 +1001,18 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	prefix := "autocert/"
 	objChan, errChan := s3store.ListObjects(ctx, prefix, false)
 
-	var expiredCerts []CertificateInfo
+	var expiredCerts []expiredCertificate
 	now := time.Now()
+
+	// clean fails if it could not read a certificate (it cannot tell whether that one
+	// expired) or delete an expired one; it still cleans everything else.
+	var failures []error
+	failed := func() error {
+		if len(failures) == 0 {
+			return nil
+		}
+		return fmt.Errorf("%d operation(s) failed: %w", len(failures), errors.Join(failures...))
+	}
 
 	// Read from channels
 	for {
@@ -975,27 +1035,51 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			certInfo := CertificateInfo{
 				S3Key: obj.Key,
 			}
-			certInfo.Domain = tryDecodeDomain(obj.Key)
+			certInfo.Domain, certInfo.CacheName = tryDecodeDomain(obj.Key, cfg.TLS.LetsEncrypt.Domains)
+
+			// autocert stores its ACME account key under "acme_account+key" (or legacy
+			// "acme_account.key"), which S3Cache hashes under autocert/cert- as a
+			// private-key-only PEM entry with no certificate.
+			if obj.Key == tlsmanager.S3ObjectKey("acme_account+key") || obj.Key == tlsmanager.S3ObjectKey("acme_account.key") {
+				continue
+			}
 
 			// Download and parse certificate to check expiry
-			reader, err := s3store.Get(obj.Key)
+			certData, version, etag, err := readTLSObject(ctx, s3store, obj.Key)
 			if err != nil {
 				logger.Warn("Failed to download certificate", "key", obj.Key, "error", err)
+				failures = append(failures, fmt.Errorf("read S3 object %s: %w", obj.Key, err))
 				continue
 			}
 
-			certData, err := io.ReadAll(reader)
-			reader.Close()
-			if err != nil {
-				logger.Warn("Failed to read certificate", "key", obj.Key, "error", err)
+			pending, expiry, pendingErr := tlsmanager.PendingCertificateCleanup(certData)
+			if pendingErr != nil {
+				failures = append(failures, pendingErr)
 				continue
 			}
-
-			parseCertificateData(certData, &certInfo)
+			if pending {
+				certInfo.Expiry = expiry
+				certInfo.CertType = "pending history"
+				expiredCerts = append(expiredCerts, expiredCertificate{CertificateInfo: certInfo, historyOnly: true})
+				continue
+			}
+			certData, absent, decodeErr := tlsmanager.DecodeCertificateCacheData(certData)
+			if decodeErr != nil {
+				failures = append(failures, decodeErr)
+				continue
+			}
+			if absent {
+				continue
+			}
+			if err := parseCertificate(certData, &certInfo); err != nil {
+				logger.Warn("Failed to parse certificate", "key", obj.Key, "error", err)
+				failures = append(failures, fmt.Errorf("parse S3 object %s: %w", obj.Key, err))
+				continue
+			}
 
 			// Check if expired
-			if !certInfo.Expiry.IsZero() && certInfo.Expiry.Before(now) {
-				expiredCerts = append(expiredCerts, certInfo)
+			if certInfo.Expiry.Before(now) {
+				expiredCerts = append(expiredCerts, expiredCertificate{CertificateInfo: certInfo, version: version, etag: etag})
 			}
 
 		case err, ok := <-errChan:
@@ -1014,7 +1098,27 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 
 	if len(expiredCerts) == 0 {
 		fmt.Println("No expired certificates found.")
-		return nil
+		return failed()
+	}
+
+	// The local fallback cache keeps a certificate under its autocert cache name.
+	for i := range expiredCerts {
+		cert := &expiredCerts[i]
+		if cert.historyOnly {
+			continue
+		}
+		if cert.CacheName == "" {
+			logger.Warn("Cannot tell the local cache name of an expired certificate, leaving the local cache alone for it", "key", cert.S3Key)
+			continue
+		}
+		localPath, err := expiredLocalCopy(cacheDir, cert.CacheName, now)
+		if err != nil {
+			logger.Warn("Failed to inspect local cache file, leaving it alone", "path", filepath.Join(cacheDir, cert.CacheName), "error", err)
+			failures = append(failures, err)
+			continue
+		}
+		cert.LocalPath = localPath
+		cert.InLocalCache = localPath != ""
 	}
 
 	// Display expired certificates
@@ -1022,11 +1126,14 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	for _, cert := range expiredCerts {
 		expiredDays := int(now.Sub(cert.Expiry).Hours() / 24)
 		fmt.Printf("  %s (%s) - expired %d days ago\n", cert.Domain, cert.CertType, expiredDays)
+		if cert.InLocalCache {
+			fmt.Printf("    local copy: %s\n", cert.LocalPath)
+		}
 	}
 
 	if dryRun {
 		fmt.Println("\nDRY RUN - No changes will be made")
-		return nil
+		return failed()
 	}
 
 	// Confirm deletion
@@ -1036,45 +1143,267 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		fmt.Scanln(&response)
 		if response != "y" && response != "Y" && response != "yes" {
 			fmt.Println("Cancelled.")
-			return nil
+			return failed()
 		}
 	}
 
-	// Delete expired certificates. No deletion marker: a node's certificate sync never
-	// writes an expired certificate back to S3, and a marker, which covers every copy of
-	// the name, would make a node drop a valid replacement that S3 has yet to receive.
-	deleted := 0
+	cache, err := tlsmanager.OpenS3Cache(s3cfg)
+	if err != nil {
+		return err
+	}
+	// Clean does not revoke the name: a node may hold a valid replacement that
+	// S3 has not received. Each delete is tied to the object found expired.
+	deleted, removed := 0, 0
 	for _, cert := range expiredCerts {
-		if err := s3store.Delete(cert.S3Key); err != nil {
+		gone := false
+		var err error
+		if !cert.historyOnly {
+			gone, err = cache.ExpireObject(ctx, cert.S3Key, cert.etag, now, cert.version)
+			if err == nil && !gone && cert.version != "" {
+				err = cache.QueueExpiredVersion(ctx, cert.S3Key, cert.version, cert.Expiry)
+			}
+		}
+		if err == nil && (cert.historyOnly || cert.version != "") {
+			cleaned, cleanErr := cache.CleanupExpiredVersions(ctx, cert.S3Key, now)
+			err = cleanErr
+			gone = gone || cleaned > 0
+		}
+
+		if err != nil {
 			logger.Warn("Failed to delete certificate from S3", "key", cert.S3Key, "error", err)
-		} else {
+			failures = append(failures, fmt.Errorf("delete S3 object %s: %w", cert.S3Key, err))
+		} else if gone {
 			logger.Info("Deleted expired certificate from S3", "key", cert.S3Key, "domain", cert.Domain)
 			deleted++
 		}
 
-		// Also delete from local cache if possible
-		if cert.Domain != "" && !strings.Contains(cert.Domain, "...") {
-			cacheFile := cert.Domain
-			if cert.CertType == "RSA" {
-				cacheFile += "+rsa"
-			}
-			localPath := filepath.Join(cacheDir, cacheFile)
-			if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
-				logger.Warn("Failed to delete from local cache", "path", localPath, "error", err)
-			}
+		if !cert.InLocalCache {
+			continue
+		}
+		gone, err = removeExpiredLocalCopy(cert.LocalPath, now)
+		if err != nil {
+			logger.Warn("Failed to delete certificate from local cache", "path", cert.LocalPath, "error", err)
+			failures = append(failures, fmt.Errorf("delete local file %s: %w", cert.LocalPath, err))
+			continue
+		}
+		if gone {
+			logger.Info("Deleted expired certificate from local cache", "path", cert.LocalPath)
+			removed++
 		}
 	}
 
-	fmt.Printf("\nDeleted %d expired certificate(s)\n", deleted)
-	return nil
+	fmt.Printf("\nDeleted %d expired certificate(s) from S3 and %d file(s) from the local cache\n", deleted, removed)
+	return failed()
 }
 
-// markDeleted records in the bucket that the certificates stored under keys are deleted
-// now (tlsmanager.S3Cache.MarkDeleted). Every running server holds its certificates in
-// its local fallback cache as well, and its certificate sync writes a certificate that S3
-// lacks back to S3 unless a marker shows that it was deleted after the server stored its
-// copy. Call it before deleting the objects, so that no server finds one missing without
-// a marker, and remarkDeleted after.
+// expiredCertificate identifies the S3 object clean read and found expired.
+type expiredCertificate struct {
+	CertificateInfo
+	version     string
+	etag        string
+	historyOnly bool
+}
+
+// readTLSObject downloads the object at key with its opaque ETag and the version the
+// bucket served, or "" when the bucket keeps no versions. A bucket whose versioning is
+// suspended names the version "null", which every write replaces in place: that does
+// not identify what was read, so it counts as none.
+func readTLSObject(ctx context.Context, s3store *storage.S3Storage, key string) ([]byte, string, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, s3store.Timeout)
+	defer cancel()
+	out, err := s3store.Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s3store.BucketName),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil, "", "", err
+	}
+	defer out.Body.Close()
+	data, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, "", "", err
+	}
+	version := aws.ToString(out.VersionId)
+	if version == "null" {
+		version = ""
+	}
+	return data, version, aws.ToString(out.ETag), nil
+}
+
+// removeExpiredLocalCopy inspects a regular local snapshot and removes it under
+// the shared entry lease only if its bytes still match. A concurrent replacement
+// remains canonical; no rename-aside window makes the entry temporarily missing.
+func removeExpiredLocalCopy(path string, now time.Time) (removed bool, err error) {
+	data, err := tlsmanager.ReadLocalCertificateFile(context.Background(), path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var info CertificateInfo
+	if err := parseCertificate(data, &info); err != nil {
+		return false, err
+	}
+	if !info.Expiry.Before(now) {
+		return false, nil
+	}
+	return tlsmanager.RemoveLocalCertificateIfSame(context.Background(), path, data)
+}
+
+// writeLocalCacheFile stores data as the local cache file path the way autocert.DirCache
+// does: it writes a temporary file in the same directory and renames it over path, so a
+// write that fails part-way (the disk fills) leaves no partial file under the cache name,
+// which a later run would skip as already cached and the server would read. The new file
+// keeps the permissions of the file it replaces, as writing in place would. It is given
+// to dirOwner, the owner of the cache directory when that is another user (see
+// cacheTLSCertificates), before it gets its name, so the server never sees a cache name
+// it cannot open. Without one it keeps the owner and group of the file it replaces, so
+// tls cache --force preserves the server's access to an existing cache.
+func writeLocalCacheFile(path string, data []byte, dirOwner *fileOwner) error {
+	return writeLocalCacheFileContext(context.Background(), path, data, dirOwner)
+}
+func writeLocalCacheFileContext(ctx context.Context, path string, data []byte, dirOwner *fileOwner) error {
+	return tlsmanager.WriteLocalCertificateFile(ctx, path, data, func(f *os.File, old os.FileInfo) error {
+		mode := fs.FileMode(0600)
+		if old != nil {
+			mode = old.Mode().Perm()
+		}
+		if dirOwner != nil {
+			if err := chownFile(f, dirOwner.uid, dirOwner.gid); err != nil {
+				return err
+			}
+		} else if old != nil {
+			if err := takeOwner(f, old); err != nil {
+				return err
+			}
+		}
+		return f.Chmod(mode)
+	})
+}
+
+// takeOwner gives f the owner and group of the file old, if it has others.
+func takeOwner(f *os.File, old os.FileInfo) error {
+	want, ok := old.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if have, ok := info.Sys().(*syscall.Stat_t); ok && have.Uid == want.Uid && have.Gid == want.Gid {
+		return nil
+	}
+	return chownFile(f, int(want.Uid), int(want.Gid))
+}
+
+// geteuid is os.Geteuid and chownFile (*os.File).Chown. Only root can give a file to
+// another user, so tests replace them to reach that path and record the hand-over.
+var (
+	geteuid   = os.Geteuid
+	chownFile = (*os.File).Chown
+)
+
+// fileOwner is the user and group tls cache gives a file or directory it creates.
+type fileOwner struct {
+	uid, gid int
+}
+
+// foreignOwner returns the owner of the file info describes when that is not the user
+// this process runs as, and nil when it is.
+func foreignOwner(info os.FileInfo) *fileOwner {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(st.Uid) == geteuid() {
+		return nil
+	}
+	return &fileOwner{uid: int(st.Uid), gid: int(st.Gid)}
+}
+
+// makeCacheDir creates dir, and each missing parent, with mode 0700, as the server
+// creates its fallback directory (tlsmanager.NewFallbackCache). Each directory it creates
+// is given the owner of the directory it is created in, when that is another user: run
+// as root on a node whose server runs as its own user, it would otherwise leave a
+// root-owned directory the server cannot write, where the default /var/lib/sora/certs
+// is made in the server's /var/lib/sora (the StateDirectory of dist/sora.service). In a
+// sticky directory such as /tmp each user's entries are their own, so what is made in
+// one stays its maker's.
+func makeCacheDir(dir string) error {
+	if info, err := os.Stat(dir); err == nil {
+		if !info.IsDir() {
+			return &fs.PathError{Op: "mkdir", Path: dir, Err: syscall.ENOTDIR}
+		}
+		return nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+
+	// Resolve configured parent symlinks once, then keep that directory open through
+	// creation and hand-over. Its owner may replace an ancestor after Mkdir; opening
+	// dir by its full path then could give an unrelated directory away instead.
+	// Split without cleaning the parent: a configured symlink followed by ".."
+	// must retain its filesystem meaning. Ignore trailing separators on a new leaf.
+	dir = strings.TrimRight(dir, string(filepath.Separator))
+	parentPath, name := filepath.Split(dir)
+	if parentPath == "" {
+		parentPath = "."
+	}
+	parent, err := os.OpenRoot(parentPath)
+	if errors.Is(err, fs.ErrNotExist) && parentPath != dir {
+		if err = makeCacheDir(parentPath); err == nil {
+			parent, err = os.OpenRoot(parentPath)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
+	if name == "." || name == ".." {
+		// Creating a missing prefix can make a terminal dot component resolve.
+		// It names an existing directory, so validate it without any hand-over.
+		_, err := os.Stat(dir)
+		return err
+	}
+	err = parent.Mkdir(name, 0700)
+	if errors.Is(err, fs.ErrExist) {
+		info, statErr := parent.Stat(name)
+		if statErr == nil && !info.IsDir() {
+			statErr = &fs.PathError{Op: "mkdir", Path: dir, Err: syscall.ENOTDIR}
+		}
+		return statErr
+	}
+	if err != nil {
+		return err
+	}
+
+	parentInfo, err := parent.Stat(".")
+	if err == nil && parentInfo.Mode()&fs.ModeSticky == 0 {
+		if owner := foreignOwner(parentInfo); owner != nil {
+			if err = giveDir(parent, name, owner); err != nil {
+				err = fmt.Errorf("give %s to the owner of %s (%d:%d): %w", dir, filepath.Dir(dir), owner.uid, owner.gid, err)
+			}
+		}
+	}
+	if err != nil {
+		parent.Remove(name)
+	}
+	return err
+}
+
+// giveDir gives the directory name, just created under the held parent, to owner.
+// Neither an ancestor replacement nor a leaf symlink may redirect the hand-over.
+func giveDir(parent *os.Root, name string, owner *fileOwner) error {
+	f, err := parent.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return chownFile(f, owner.uid, owner.gid)
+}
+
+// markDeleted atomically replaces each selected entry with its authoritative,
+// key-free revocation generation. The legacy timestamp is compatibility metadata;
+// no physical name deletion may subsequently erase the generation barrier.
 func markDeleted(ctx context.Context, cache *tlsmanager.S3Cache, keys []string) error {
 	at := time.Now()
 	for _, key := range keys {
@@ -1083,15 +1412,6 @@ func markDeleted(ctx context.Context, cache *tlsmanager.S3Cache, keys []string) 
 		}
 	}
 	return nil
-}
-
-// remarkDeleted moves the deletion markers past the deletion itself, so that a copy a
-// server downloaded while the objects were being deleted counts as deleted too. The
-// markers written before the deletion still stand if this fails.
-func remarkDeleted(ctx context.Context, cache *tlsmanager.S3Cache, keys []string) {
-	if err := markDeleted(ctx, cache, keys); err != nil {
-		logger.Warn("Failed to update the deletion markers after the delete", "error", err)
-	}
 }
 
 func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, specificDomain string, force bool) error {
@@ -1127,15 +1447,27 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		return fmt.Errorf("failed to initialize S3 storage: %w", err)
 	}
 
-	// Create cache directory if it doesn't exist
-	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+	// The server reads and writes the cache directory as its own user (User=sora in
+	// dist/sora.service), while tls cache is usually run as root: what it creates goes to
+	// the owner of the directory it is created in, when that is another user, or the
+	// server cannot read the certificates nor, in a directory created here, write its own.
+	if err := makeCacheDir(cacheDir); err != nil {
 		return fmt.Errorf("failed to create cache directory: %w", err)
 	}
+	dirInfo, err := os.Stat(cacheDir)
+	if err != nil {
+		return fmt.Errorf("failed to read the cache directory: %w", err)
+	}
+	dirOwner := foreignOwner(dirInfo)
 
 	// Determine which domains to cache
 	var domainsToCache []string
 	if specificDomain != "" {
-		domainsToCache = []string{specificDomain}
+		name, err := autocertName(specificDomain)
+		if err != nil {
+			return err
+		}
+		domainsToCache = []string{name}
 	} else {
 		domainsToCache = cfg.TLS.LetsEncrypt.Domains
 	}
@@ -1148,6 +1480,10 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	notFound := 0
 	now := time.Now()
 
+	// A certificate that could not be downloaded or written fails the command, so a
+	// script pre-warming a node's cache can tell; the others are still cached.
+	var failures []error
+
 	for _, configured := range domainsToCache {
 		// Honor cancellation between domains (each iteration may issue slow S3 downloads)
 		if err := ctx.Err(); err != nil {
@@ -1156,9 +1492,6 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 
 		domain, err := autocertName(configured)
 		if err != nil {
-			if specificDomain != "" {
-				return err
-			}
 			// autocert.HostWhitelist drops such a configured domain silently and the
 			// server serves the others, so skip it rather than stop syncing them.
 			logger.Warn("Skipping configured domain autocert cannot serve", "domain", configured, "error", err)
@@ -1180,11 +1513,17 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			// Download from S3
 			reader, err := s3store.Get(s3Key)
 			if err != nil {
-				if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), "not found") {
+				// Only NoSuchKey, S3's answer for an object that does not exist, means the
+				// variant is absent. The message is the provider's free text: matching it
+				// for "not found" passed a missing bucket or a refusal off as absent and
+				// exited 0 without caching anything.
+				var noSuchKey *types.NoSuchKey
+				if errors.As(err, &noSuchKey) {
 					logger.Info("Certificate not found in S3", "domain", domain, "type", variant.name)
 					notFound++
 				} else {
 					logger.Warn("Failed to download certificate from S3", "domain", domain, "type", variant.name, "error", err)
+					failures = append(failures, fmt.Errorf("download %s certificate for %s (S3 object %s): %w", variant.name, domain, s3Key, err))
 				}
 				continue
 			}
@@ -1193,12 +1532,27 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			reader.Close()
 			if err != nil {
 				logger.Warn("Failed to read certificate from S3", "domain", domain, "type", variant.name, "error", err)
+				failures = append(failures, fmt.Errorf("read %s certificate for %s (S3 object %s): %w", variant.name, domain, s3Key, err))
 				continue
 			}
 
+			objectData := certData
+			certData, absent, decodeErr := tlsmanager.DecodeCertificateCacheData(certData)
+			if decodeErr != nil {
+				failures = append(failures, decodeErr)
+				continue
+			}
+			if absent {
+				notFound++
+				continue
+			}
 			// Parse to check expiry
 			certInfo := CertificateInfo{}
-			parseCertificateData(certData, &certInfo)
+			if err := parseCertificate(certData, &certInfo); err != nil {
+				logger.Warn("Failed to parse certificate from S3", "domain", domain, "type", variant.name, "key", s3Key, "error", err)
+				failures = append(failures, fmt.Errorf("parse %s certificate for %s (S3 object %s): %w", variant.name, domain, s3Key, err))
+				continue
+			}
 
 			// Skip if expired
 			if !certInfo.Expiry.IsZero() && certInfo.Expiry.Before(now) {
@@ -1222,8 +1576,9 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			}
 
 			// Write to local cache
-			if err := os.WriteFile(localPath, certData, 0600); err != nil {
+			if err := writeLocalCacheFileContext(ctx, localPath, objectData, dirOwner); err != nil {
 				logger.Warn("Failed to write certificate to local cache", "path", localPath, "error", err)
+				failures = append(failures, fmt.Errorf("write %s certificate for %s to %s: %w", variant.name, domain, localPath, err))
 				continue
 			}
 
@@ -1244,6 +1599,32 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	if notFound > 0 {
 		fmt.Printf("  Not found: %d (not in S3)\n", notFound)
 	}
+	if len(failures) > 0 {
+		fmt.Printf("  Failed:    %d (not cached)\n", len(failures))
+		return fmt.Errorf("%d certificate(s) could not be cached: %w", len(failures), errors.Join(failures...))
+	}
+
+	// A configured domain with neither certificate in S3 has not been issued yet, which
+	// is normal in a run over all of them. A domain named with --domain that has none
+	// fails the command, as tls delete --domain does.
+	if specificDomain != "" && cached+skipped+expired == 0 {
+		return fmt.Errorf("no certificate found for %s in S3", domainsToCache[0])
+	}
 
 	return nil
+}
+
+// A logical tombstone remains as the publication fence but is not a certificate
+// available to delete/list. Preserve typed NoSuchKey versus service/bucket errors.
+func tlsObjectActive(ctx context.Context, store *storage.S3Storage, key string) (bool, error) {
+	raw, _, _, err := readTLSObject(ctx, store, key)
+	if err != nil {
+		var missing *types.NoSuchKey
+		if errors.As(err, &missing) {
+			return false, nil
+		}
+		return false, err
+	}
+	_, absent, err := tlsmanager.DecodeCertificateCacheData(raw)
+	return !absent, err
 }

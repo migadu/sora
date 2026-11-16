@@ -131,9 +131,10 @@ func TestExpiredCertificateIsNotWrittenBack(t *testing.T) {
 	shared := newStubS3Cache(t, endpoint)
 
 	expired := certCacheEntry(t, domain, 1, time.Now().Add(-91*24*time.Hour), time.Now().Add(-24*time.Hour))
-	if err := shared.Put(ctx, domain, expired); err != nil {
-		t.Fatalf("seeding S3: %v", err)
-	}
+	// Seed a historical expired object directly; current publishers reject it.
+	stub.mu.Lock()
+	stub.objects["/certs/"+S3ObjectKey(domain)] = expired
+	stub.mu.Unlock()
 	if err := m.syncCertificateFromS3(ctx, domain); err != nil {
 		t.Fatalf("initial sync: %v", err)
 	}

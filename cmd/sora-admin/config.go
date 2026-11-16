@@ -14,6 +14,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/server/sieveengine"
 )
 
 func handleConfigCommand(ctx context.Context) {
@@ -28,6 +29,9 @@ func handleConfigCommand(ctx context.Context) {
 		}
 		if os.Args[i] == "--config" {
 			skipNext = true
+			continue
+		}
+		if strings.HasPrefix(os.Args[i], "--config=") {
 			continue
 		}
 		if os.Args[i] == "config" {
@@ -93,7 +97,7 @@ func handleConfigValidate(_ context.Context) {
 
 	fmt.Printf("Validating configuration file: %s\n\n", configFile)
 
-	// Load full configuration as the server does - this will show all warnings
+	// Load the file as the server does, which reports unknown and duplicate keys.
 	var cfg config.Config
 	if err := config.LoadServerConfig(configFile, &cfg); err != nil {
 		fmt.Printf("[FAIL] Configuration validation FAILED:\n")
@@ -111,8 +115,36 @@ func handleConfigValidate(_ context.Context) {
 		os.Exit(1)
 	}
 
+	// Keep the Sieve capability diagnostics beside the engine's resolver. The other
+	// collected configuration warnings are returned by Config.Warnings.
+	if invalid := sieveengine.InvalidExtensions(cfg.Sieve.EnabledExtensions); len(invalid) > 0 {
+		fmt.Printf("[WARN] [sieve] enabled_extensions names extensions the engine does not support: %s; "+
+			"they are ignored, and the default set is used if none remain (effective: %s)\n",
+			strings.Join(invalid, ", "), strings.Join(sieveengine.EffectiveExtensions(cfg.Sieve.EnabledExtensions), ", "))
+	}
+	if config.TrustedNetworksHaveBroadPrivateRanges(cfg.Servers.TrustedNetworks) {
+		fmt.Printf("[WARN] [servers] trusted_networks includes whole private ranges (e.g. 10.0.0.0/8): every host on those " +
+			"networks is trusted to spoof client IPs via PROXY/XCLIENT and to bypass auth rate limiting. " +
+			"Narrow trusted_networks to your actual proxy IPs; use auth_rate_limit.exempt_networks to scope " +
+			"rate-limit exemption separately\n")
+	}
+	for _, w := range cfg.Warnings() {
+		fmt.Printf("[WARN] %s\n", w)
+	}
+	allServers := cfg.GetAllServers()
+	for _, server := range allServers {
+		if server.Type != "managesieve_proxy" {
+			continue
+		}
+		if invalid := sieveengine.InvalidExtensions(server.SupportedExtensions); len(invalid) > 0 {
+			fmt.Printf("[WARN] Server %s (type: %s) has supported_extensions the engine does not support: %s; "+
+				"they are ignored, and the default set is advertised if none remain (effective: %s)\n",
+				server.Name, server.Type, strings.Join(invalid, ", "),
+				strings.Join(sieveengine.EffectiveExtensions(server.SupportedExtensions), ", "))
+		}
+	}
 	fmt.Printf("[OK] Configuration is valid!\n")
-	if allServers := cfg.GetAllServers(); len(allServers) > 0 {
+	if len(allServers) > 0 {
 		fmt.Printf("\nConfigured servers:\n")
 		for _, server := range allServers {
 			fmt.Printf("  - %s listening on %s\n", server.Name, server.Addr)
@@ -121,32 +153,43 @@ func handleConfigValidate(_ context.Context) {
 }
 
 func handleConfigDump(_ context.Context) {
-	// Extract config path from os.Args (it was preserved for config subcommand)
-	// os.Args format: [prog, --config, PATH, config, dump, FLAGS...]
+	// Extract config path from os.Args (it was preserved for config subcommand;
+	// the first --config counts, matching handleConfigValidate) and collect any
+	// flags after "dump" with --config stripped.
 	var configFile string
 	var format string = "toml"
 	var maskSecrets bool = true
-	var flagsStartIndex int
+	var configSeen, missingConfigValue bool
 
-	// Look for --config flag and find where "dump" ends
-	skipNext := false
+	seenDump := false
+	var dumpArgs []string
 	for i := 1; i < len(os.Args); i++ {
-		if skipNext {
-			skipNext = false
+		if os.Args[i] == "--config" {
+			if i+1 < len(os.Args) {
+				if !configSeen {
+					configFile = os.Args[i+1]
+					configSeen = true
+				}
+				i++ // the value, even when it starts with "-" or is "dump"
+			} else {
+				missingConfigValue = true
+			}
 			continue
 		}
-		if os.Args[i] == "--config" && i+1 < len(os.Args) {
-			configFile = os.Args[i+1]
-			skipNext = true
-			continue
-		} else if strings.HasPrefix(os.Args[i], "--config=") {
-			configFile = strings.TrimPrefix(os.Args[i], "--config=")
+		if strings.HasPrefix(os.Args[i], "--config=") {
+			if !configSeen {
+				configFile = strings.TrimPrefix(os.Args[i], "--config=")
+				configSeen = true
+			}
 			continue
 		}
-		if os.Args[i] == "dump" {
-			flagsStartIndex = i + 1
-			break
+		if !seenDump {
+			if os.Args[i] == "dump" {
+				seenDump = true
+			}
+			continue
 		}
+		dumpArgs = append(dumpArgs, os.Args[i])
 	}
 
 	// Parse additional flags after the subcommand
@@ -170,8 +213,15 @@ Examples:
 `)
 	}
 
-	if flagsStartIndex > 0 && flagsStartIndex < len(os.Args) {
-		flagSet.Parse(os.Args[flagsStartIndex:])
+	if len(dumpArgs) > 0 {
+		flagSet.Parse(dumpArgs)
+	}
+	// Let an earlier --help retain flag.FlagSet's usual success behavior.
+	// Otherwise a stripped --config still needs its required argument.
+	if missingConfigValue {
+		fmt.Fprintln(os.Stderr, "flag needs an argument: -config")
+		flagSet.Usage()
+		os.Exit(2)
 	}
 
 	if configFile == "" {
@@ -223,13 +273,64 @@ Description:
   - Detecting duplicate keys (warns and uses first occurrence)
   - Detecting unknown/deprecated keys (warns)
   - Detecting common typos (e.g., 'f' instead of 'false')
-  - Running the shared checks the server makes before service setup: the [[server]]
-    blocks (at least one; no duplicate names or addresses), [[pool]], [relay],
-    trusted_networks, [shared_mailboxes], and [uploader] and [cleanup] when a
-    mail backend (imap, lmtp, pop3) runs. Every problem is reported.
+  - Running the shared checks the server makes before service setup, and
+    reporting every problem they find. What the node does not run is not
+    checked:
+      [[server]] blocks (at least one; no duplicate names or addresses),
+        [[pool]], [relay], trusted_networks, [shared_mailboxes] and
+        [timeout_scheduler]
+      [relay.queue] when [relay] is configured
+      [uploader], [cleanup] and [local_cache] when a mail backend (imap, lmtp,
+        pop3) runs
+      [database], [database.write] and [database.read] when a server queries
+        the database (imap, lmtp, pop3, managesieve, the HTTP APIs, and a
+        proxy that looks users up there)
+      [s3] (bucket, endpoint, timeout, access_key and secret_key set
+        together, encryption_key with encrypt = true) when the node connects
+        to S3 (a mail backend, or the User API when [s3] has an endpoint,
+        bucket or keys)
+      [cluster], [tls] and [auth_cache] when enabled, and [cluster.affinity]
+        when it and [cluster] are enabled
+  - Warning, as start-up does, about settings that do not do on this node
+    what they say:
+      [sieve] enabled_extensions and managesieve_proxy supported_extensions
+        the engine does not support, and broad [servers] trusted_networks
+      [[server]] keys the server type does not use
+      an imap or pop3 session_memory_limit below the largest lmtp
+        max_message_size
+      enable_affinity without [cluster] and [cluster.affinity], and per-user
+        proxy connection limits without [cluster]
+      a User API without [s3], an Admin API without an imap, pop3 or lmtp
+        server (no upload worker), and proxies without a database (backend
+        maintenance)
+      a [relay] in plaintext or without certificate verification
+      values start-up cannot parse and replaces with the default: the
+        [[server]] sizes, timeouts and durations (with [server.limits],
+        [server.timeouts] and [server.lookup_cache]) of each server that
+        reads them, and the [cluster.affinity], [backend_maintenance],
+        [relay.queue], [local_cache], [cleanup], [uploader], [auth_cache] and
+        [database] durations and sizes of a node that reads them
+      a [spam_training] value start-up cannot parse, which leaves spam
+        training out, and a max_message_size above the largest message Sora
+        can store
+      master SASL without master_sasl_allowed_networks; an imap append_limit
+        above the largest message Sora can store or above session_memory_limit,
+        an imap command_timeout of 35m or more, and imap capabilities
+        disabled_caps or client_filters cannot withdraw
+      a User API token_duration above 7 days, Admin and User API
+        allowed_hosts entries that are not an IP address or CIDR,
+        tls_cert_file or tls_key_file beside an enabled [tls], and
+        [tls.letsencrypt] enable_fallback = false
+      a [cluster] addr with a port beside the port key or on loopback, and
+        peers that leave no other node to join
+      [cleanup] wake_interval and purge_poll_interval below their minimum
 
-  This does not check required database/S3 settings, S3 timeout, connectivity,
-  or the node's disk. Those are still checked when services start.
+
+  It connects to nothing and does not look at the node's disk, so it does
+  not check connectivity. When services start, Sora connects to the database
+  and the certificate store and checks the node's disk. S3 and a remote
+  lookup are not reached until they are first used, so a clean start does
+  not show that they can be reached.
 
   Exit codes:
     0 - Configuration is valid (warnings OK)
