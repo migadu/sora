@@ -350,7 +350,8 @@ type plainServer struct {
 
 func (p *plainServer) Next(response []byte) ([]byte, bool, error) {
 	// nil means no initial response, answered with the empty challenge. A
-	// zero-length message ("=" or an empty reply) is malformed.
+	// zero-length message (an initial response of "=", or an empty reply) is
+	// malformed.
 	if response != nil && bytes.Count(response, []byte{0}) != 2 {
 		p.session.DebugLog("malformed SASL PLAIN message")
 		return nil, true, &imap.Error{
