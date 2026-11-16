@@ -217,6 +217,8 @@ github.com/migadu/go-managesieve v0.1.5-0.20261115212706-bc72beba53a0 h1:gsZFJBu
 github.com/migadu/go-managesieve v0.1.5-0.20261115212706-bc72beba53a0/go.mod h1:E38XgVuCDYRSNz/9ku4Sc7CvVDmJ8FLqGc1udcxP9SE=
 github.com/migadu/go-managesieve v0.1.5 h1:oJi41X93PoYihSxYo/SkYQyIoR8G4Ln8Tv3f2A4qx7w=
 github.com/migadu/go-managesieve v0.1.5/go.mod h1:E38XgVuCDYRSNz/9ku4Sc7CvVDmJ8FLqGc1udcxP9SE=
+github.com/migadu/go-managesieve v0.1.6-0.20261116162957-b8de7d82e6b6 h1:0gLcDOhWNyE5g+yAd3Idg+hPie37W1UAtLLHA5RayMw=
+github.com/migadu/go-managesieve v0.1.6-0.20261116162957-b8de7d82e6b6/go.mod h1:E38XgVuCDYRSNz/9ku4Sc7CvVDmJ8FLqGc1udcxP9SE=
 github.com/migadu/go-message v0.0.0-20261115010257-aa2abe055119 h1:5wZ36W5frh1ZaSuIIvw2Afyr8mNT4mfGcGSeAgSXAIQ=
 github.com/migadu/go-message v0.0.0-20261115010257-aa2abe055119/go.mod h1:XpJyL70LwRvq2a8rVbHXikPgKj8+aI0kGdHlg16ibYA=
 github.com/migadu/go-pop3 v0.1.5-0.20261114174148-24ad5702c60a h1:Xy5B3IMkUlQRYaL5sxKjjDrqL8FEh4oiGzBG7tNPPls=
@@ -225,6 +227,8 @@ github.com/migadu/go-pop3 v0.1.6-0.20261115212610-3451e4d02c5f h1:hTTrs8FrFttsBD
 github.com/migadu/go-pop3 v0.1.6-0.20261115212610-3451e4d02c5f/go.mod h1:TcqnbNVPK/1+Z1XbFE48L1zoLsakwvc4DzrHCJBMgxM=
 github.com/migadu/go-pop3 v0.1.6 h1:R54su0kh7ZqyIankvrK/nc8fx++R1+P/pjl6rDMllao=
 github.com/migadu/go-pop3 v0.1.6/go.mod h1:TcqnbNVPK/1+Z1XbFE48L1zoLsakwvc4DzrHCJBMgxM=
+github.com/migadu/go-pop3 v0.1.7-0.20261116162835-724935f22f02 h1:0q6598wEzAZH8/vS1U79DyDtUoeA1K4IWemWJkwJgK4=
+github.com/migadu/go-pop3 v0.1.7-0.20261116162835-724935f22f02/go.mod h1:TcqnbNVPK/1+Z1XbFE48L1zoLsakwvc4DzrHCJBMgxM=
 github.com/migadu/go-sieve v1.4.5-0.20261115114147-a3dca5dd79d9 h1:+OeNsZf6Fffa95DaoVHpP3gr046KXyoT0EYrgW6jSRY=
 github.com/migadu/go-sieve v1.4.5-0.20261115114147-a3dca5dd79d9/go.mod h1:xHAx5kMQ5hw/YJziHobNfLDpMK4jjxMJ5sZAHi3uFr8=
 github.com/migadu/go-sieve v1.4.5-0.20261115120903-65bf2094bfa6 h1:8Dd6Waq2Xg7UWRJomBnRqIlcw2q6AWaVs9dcYB5cOn8=
@@ -298,11 +302,11 @@ github.com/migadu/go-smtp v0.0.0-20261115213624-e2128ee885bd/go.mod h1:3DhKoQGRM
 github.com/migadu/go-smtp v0.0.0-20261115221208-dbc7824090f0 h1:BZ7Cj9szp+yjlLT6qN00wCh1lYphI0do5PWHNHOHssE=
 github.com/migadu/go-smtp v0.0.0-20261115221208-dbc7824090f0/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/migadu/go-smtp v0.24.0-migadu.1 h1:j6FYFCntMYAlEYsFfmKNnopvGcRJFdLnb9TQA+UBd5w=
+github.com/migadu/go-smtp v0.24.0-migadu.1/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116094727-0b0aaa23d4af h1:esW6dMERJsVDxQlLk7Ak/vycaGJ57Fw5odWKrppivJY=
 github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116094727-0b0aaa23d4af/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116103044-679096c1387b h1:qRJsYbDLZYRS5VaT0tpfhdk9+PVjmJqGrIKeAaEAvmo=
 github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116103044-679096c1387b/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
-github.com/migadu/go-smtp v0.24.0-migadu.1/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/moby/docker-image-spec v1.3.1 h1:jMKff3w6PgbfSa69GfNg+zN/XLhfXJGnEx3Nl2EsFP0=
 github.com/moby/docker-image-spec v1.3.1/go.mod h1:eKmb5VW8vQEh/BAr2yvVNvuiJuY6UIocYsFu/DxxRpo=
 github.com/moby/term v0.5.0 h1:xt8Q1nalod/v7BqbG21f8mQPqH+xAaC9C3N3wfWbVP0=
