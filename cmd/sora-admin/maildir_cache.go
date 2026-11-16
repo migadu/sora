@@ -10,6 +10,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/migadu/sora/pkg/sqlitefile"
@@ -24,6 +26,18 @@ const maildirCacheName = "sora-maildir.db"
 // database is waited for up to 5 seconds. The busy timeout comes first: the switch to
 // WAL needs the database lock, which another process may hold.
 const maildirCacheSettings = `PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL`
+
+// hardLinksProtected reports whether this system forbids a user to hard-link a file
+// they neither own nor may read and write: Linux with fs.protected_hardlinks = 1, the
+// default of most distributions. macOS and FreeBSD (by default) allow it. A variable,
+// so tests can turn the protection off.
+var hardLinksProtected = func() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	setting, err := os.ReadFile("/proc/sys/fs/protected_hardlinks")
+	return err == nil && strings.TrimSpace(string(setting)) == "1"
+}
 
 // openMaildirCache opens sora-maildir.db in dir (the maildir of an import, the
 // destination of an export), creating it if it is missing. dir is the operator's
