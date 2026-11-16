@@ -2,20 +2,25 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
@@ -29,7 +34,6 @@ type ExporterOptions struct {
 	StartDate      *time.Time
 	EndDate        *time.Time
 	MailboxFilter  []string
-	ShowProgress   bool
 	Dovecot        bool
 	OverwriteFlags bool          // Whether to overwrite flags on existing messages
 	ExportDelay    time.Duration // Delay between exports to control rate
@@ -38,15 +42,17 @@ type ExporterOptions struct {
 
 // Exporter handles the maildir export process.
 type Exporter struct {
-	ctx         context.Context // Context for cancellation support
-	maildirPath string
-	email       string
-	jobs        int
-	db          *sql.DB
-	dbPath      string // Path to the SQLite database file
-	rdb         *resilient.ResilientDatabase
-	s3          objectStorage
-	options     ExporterOptions
+	ctx             context.Context // Context for cancellation support
+	maildirPath     string
+	root            *os.Root // confines message/Dovecot contents and Maildir child directories; excludes the SQLite cache
+	email           string
+	jobs            int
+	db              *sql.DB
+	dbPath          string // Path to the SQLite database file
+	privateCacheDir string // Dry-run snapshot, removed after closing its SQLite connection
+	rdb             *resilient.ResilientDatabase
+	s3              objectStorage
+	options         ExporterOptions
 
 	totalMessages    int64
 	exportedMessages int64
@@ -67,27 +73,47 @@ type Exporter struct {
 
 // NewExporter creates a new Exporter instance.
 func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ExporterOptions) (*Exporter, error) {
+	// The export runs on exactly this many workers: with none it would write nothing.
+	if jobs < 1 {
+		return nil, fmt.Errorf("jobs must be at least 1, got %d", jobs)
+	}
+	// Preview never creates or migrates anything in the selected maildir.
+	if options.DryRun {
+		maildirPath = effectiveMaildirPath(maildirPath)
+		dbPath := filepath.Join(maildirPath, maildirCacheName)
+		cache, privateDir, err := openExportCacheForDryRun(ctx, dbPath)
+		if err != nil {
+			return nil, err
+		}
+		var root *os.Root
+		if cache != nil {
+			root, err = os.OpenRoot(filepath.Clean(maildirPath))
+			if err != nil {
+				cache.Close()
+				os.RemoveAll(privateDir)
+				return nil, fmt.Errorf("failed to open maildir path: %w", err)
+			}
+		}
+		return &Exporter{ctx: ctx, maildirPath: maildirPath, root: root, email: email,
+			jobs: jobs, db: cache, dbPath: dbPath, privateCacheDir: privateDir, rdb: rdb, s3: s3,
+			options: options, startTime: time.Now(), uidMappings: make(map[string][]UIDFileMapping),
+			keywordIndex: make(map[string]map[string]int)}, nil
+	}
+
 	// Ensure maildir path exists
 	if err := os.MkdirAll(maildirPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create maildir path: %w", err)
 	}
+	maildirPath = effectiveMaildirPath(maildirPath)
 
 	// Use the shared SQLite database in the maildir path
-	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
+	dbPath := filepath.Join(maildirPath, maildirCacheName)
 	logger.Info("Using maildir database", "path", dbPath)
 
-	// Open SQLite with proper settings for concurrent access
-	// WAL mode enables concurrent readers and writers
-	// _busy_timeout=5000 means wait up to 5 seconds if database is locked
-	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL")
+	db, err := openMaildirCache(maildirPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
+		return nil, err
 	}
-
-	// Configure connection pool for better concurrency
-	// SQLite works best with a single writer connection
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
 
 	// Create the same table structure as importer uses
 	// s3_uploaded tracks whether the message has been successfully uploaded to S3
@@ -154,9 +180,16 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		return nil, fmt.Errorf("failed to create s3_uploaded index: %w", err)
 	}
 
+	root, err := os.OpenRoot(filepath.Clean(maildirPath))
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to open maildir path: %w", err)
+	}
+
 	exporter := &Exporter{
 		ctx:          ctx,
 		maildirPath:  maildirPath,
+		root:         root,
 		email:        email,
 		jobs:         jobs,
 		db:           db,
@@ -174,11 +207,22 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 
 // Close cleans up resources used by the exporter.
 func (exporter *Exporter) Close() error {
+	var closeErr error
 	if exporter.db != nil {
-		exporter.db.Close()
-		logger.Info("Maildir database saved", "path", exporter.dbPath)
+		closeErr = errors.Join(closeErr, exporter.db.Close())
+		if !exporter.options.DryRun {
+			logger.Info("Maildir database saved", "path", exporter.dbPath)
+		}
 	}
-	return nil
+	if exporter.root != nil {
+		closeErr = errors.Join(closeErr, exporter.root.Close())
+		exporter.root = nil
+	}
+	if exporter.privateCacheDir != "" {
+		closeErr = errors.Join(closeErr, os.RemoveAll(exporter.privateCacheDir))
+		exporter.privateCacheDir = ""
+	}
+	return closeErr
 }
 
 // Run starts the export process.
@@ -235,30 +279,33 @@ func (exporter *Exporter) Run() error {
 	}
 
 	// Export Dovecot files if requested
+	var dovecotErr, uidListErr error
 	if exporter.options.Dovecot {
-		if err := exporter.exportDovecotFiles(accountID); err != nil {
-			logger.Info("Warning: Failed to export Dovecot files", "error", err)
+		if dovecotErr = exporter.exportDovecotFiles(accountID); dovecotErr != nil {
+			logger.Warn("Failed to export Dovecot files", "error", dovecotErr)
 		}
 	}
 
 	// Generate dovecot-uidlist files if requested
 	if exporter.options.ExportUIDList {
-		if err := exporter.generateDovecotUIDLists(mailboxes); err != nil {
-			logger.Info("Warning: Failed to generate dovecot-uidlist files", "error", err)
+		if uidListErr = exporter.generateDovecotUIDLists(mailboxes); uidListErr != nil {
+			logger.Warn("Failed to generate dovecot-uidlist files", "error", uidListErr)
 		}
 	}
 
-	if err := exporter.printSummary(); err != nil {
+	if err := exporter.printSummary(dovecotErr, uidListErr); err != nil {
 		return err
 	}
 	// An export that lost anything must not exit 0: an operator scripting a migration
-	// reads the exit code, not the log.
+	// reads the exit code, not the log. That includes the subscriptions and uidlist
+	// files: an import of an export without them loses the subscriptions or the UIDs.
+	filesErr := errors.Join(dovecotErr, uidListErr)
 	failedMsgs := atomic.LoadInt64(&exporter.failedMessages)
 	failedMboxes := atomic.LoadInt64(&exporter.failedMailboxes)
 	if failedMsgs > 0 || failedMboxes > 0 {
-		return fmt.Errorf("export incomplete: %d message(s) and %d mailbox(es) failed", failedMsgs, failedMboxes)
+		return errors.Join(fmt.Errorf("export incomplete: %d message(s) and %d mailbox(es) failed", failedMsgs, failedMboxes), filesErr)
 	}
-	return nil
+	return filesErr
 }
 
 // performDryRun analyzes what would be exported without making changes
@@ -437,39 +484,111 @@ func (exporter *Exporter) shouldExportMailbox(mailboxName string) bool {
 	return false
 }
 
-// mailboxDir resolves the on-disk maildir directory (the parent of cur/new/tmp)
-// for an IMAP mailbox name, guaranteeing the result stays within the export
-// root. A malicious or legacy mailbox name containing ".." path segments (e.g.
-// "../../etc") would otherwise let filepath.Join escape exporter.maildirPath and
-// write arbitrary files. This is defence-in-depth: mailbox creation, rename, and
-// import already reject such names (helpers.MailboxNameHasTraversal), but the
-// exporter must never trust a name already persisted in the database.
-func (exporter *Exporter) mailboxDir(mailboxName string) (string, error) {
+// mailboxDirName resolves the maildir directory (the parent of cur/new/tmp) for an
+// IMAP mailbox name to its name below the export directory, as exporter.root opens
+// it, guaranteeing the name stays within the export root. A malicious or legacy
+// mailbox name containing ".." path segments (e.g. "../../etc") would otherwise
+// escape the export directory and write arbitrary files. This is defence-in-depth:
+// mailbox creation, rename, and import already reject such names
+// (helpers.MailboxNameHasTraversal), but the exporter must never trust a name
+// already persisted in the database.
+//
+// Each level of the name is one directory (Dovecot's LAYOUT=fs), named by
+// maildirFolderName so that the importer's resolveMailboxName reads it back.
+func (exporter *Exporter) mailboxDirName(mailboxName string) (string, error) {
 	if mailboxName == "INBOX" {
-		return exporter.maildirPath, nil
+		return ".", nil
 	}
-	// Standard maildir uses folders without leading dots.
-	dir := filepath.Join(exporter.maildirPath, mailboxName)
-	rel, err := filepath.Rel(exporter.maildirPath, dir)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if helpers.MailboxNameHasTraversal(mailboxName) {
 		return "", fmt.Errorf("mailbox %q resolves outside the export directory", mailboxName)
 	}
-	return dir, nil
+	name := filepath.Clean(filepath.FromSlash(maildirFolderName(mailboxName)))
+	if name == "." || !filepath.IsLocal(name) {
+		return "", fmt.Errorf("mailbox %q resolves outside the export directory", mailboxName)
+	}
+	return name, nil
+}
+
+// maildirEscapeChar escapes a character in a folder's directory name as itself
+// followed by the character's value in two hex digits: "v1.2" is written "v1\2e2".
+// It is Dovecot's storage name escape character ('\', the 2.3 listescape plugin's
+// default; mailbox_list_storage_escape_char in 2.4), whose
+// mailbox_list_escape_name_params writes the same form.
+const maildirEscapeChar = '\\'
+
+// maildirFolderName is a mailbox's name on disk, its levels joined by '/', each named
+// by maildirFolderLevel: Dovecot's storage name. The export names both the folder's
+// directories and its entry in the subscriptions file so, as Dovecot names both by
+// the storage name, and the importer reads both back through importedFolderName.
+func maildirFolderName(mailboxName string) string {
+	delim := string(consts.MailboxDelimiter)
+	levels := strings.Split(mailboxName, delim)
+	for i, level := range levels {
+		levels[i] = maildirFolderLevel(level, i == 0)
+	}
+	return strings.Join(levels, delim)
+}
+
+// maildirFolderLevel is the directory name of one level of a mailbox name, top
+// telling whether it is the first level, whose directory is in the export root. It is
+// modified UTF-7, as Dovecot names folders on disk and as exportSubscriptions names
+// them, so the importer does not decode an '&' or a literal "&...-" of the name.
+// A level named after an entry of the directory that holds it (maildirDirectoryEntry)
+// escapes its first character, keeping the byte's case, so the two do not collide:
+// "cur" is \63ur and "subscriptions" \73ubscriptions. Dovecot escapes a level that
+// would clash with a name of its own storage the same way (need_escape_dirstart in
+// mailbox-list.c). A '.' is escaped because the importer reads it as the Maildir++
+// hierarchy separator, and so is the escape character, so
+// that unescapeMaildirLevel restores exactly the characters escaped here.
+func maildirFolderLevel(level string, top bool) string {
+	encoded := helpers.EncodeModifiedUTF7(level)
+	if maildirDirectoryEntry(encoded, top) {
+		return fmt.Sprintf(`\%02x%s`, encoded[0], encoded[1:])
+	}
+	if !strings.ContainsAny(encoded, ".\\") {
+		return encoded
+	}
+	var b strings.Builder
+	for i := 0; i < len(encoded); i++ {
+		if c := encoded[i]; c == '.' || c == maildirEscapeChar {
+			fmt.Fprintf(&b, "%c%02x", maildirEscapeChar, c)
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// maildirDirectoryEntry reports whether a level's directory name is an entry the
+// export writes in the directory that holds it, top telling whether that is the
+// export root: every mailbox directory holds a Maildir's cur/, new/ and tmp/ and the
+// dovecot-uidlist and dovecot-keywords files, and the export root, INBOX's directory,
+// also the subscriptions file. The names are compared without case for filesystems
+// that ignore it. sora-maildir.db and its -wal and -shm files, also in the root, need
+// no entry here: their '.' is escaped.
+func maildirDirectoryEntry(name string, top bool) bool {
+	switch strings.ToLower(name) {
+	case "cur", "new", "tmp", "dovecot-uidlist", "dovecot-keywords":
+		return true
+	case "subscriptions":
+		return top
+	}
+	return false
 }
 
 // createMailboxDirectory creates the maildir structure for a mailbox
 func (exporter *Exporter) createMailboxDirectory(mailboxName string) error {
 	// Convert IMAP mailbox name to a contained maildir path
-	dirName, err := exporter.mailboxDir(mailboxName)
+	dirName, err := exporter.mailboxDirName(mailboxName)
 	if err != nil {
 		return err
 	}
 
-	// Create cur, new, and tmp directories
+	// Create cur, new, and tmp directories. The root refuses a directory on the way
+	// that links out of the export directory.
 	for _, subdir := range []string{"cur", "new", "tmp"} {
-		path := filepath.Join(dirName, subdir)
-		if err := os.MkdirAll(path, 0755); err != nil {
-			return fmt.Errorf("failed to create directory %s: %w", path, err)
+		if err := exporter.root.MkdirAll(filepath.Join(dirName, subdir), 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", filepath.Join(exporter.maildirPath, dirName, subdir), err)
 		}
 	}
 
@@ -635,35 +754,36 @@ func (exporter *Exporter) exportMessage(msg *db.Message, mailboxName string) err
 	}
 
 	// Determine target directory (containment-checked against the export root)
-	mailboxDir, err := exporter.mailboxDir(mailboxName)
+	mailboxDir, err := exporter.mailboxDirName(mailboxName)
 	if err != nil {
 		return err
 	}
 	targetDir := filepath.Join(mailboxDir, "cur")
 
-	targetPath := filepath.Join(targetDir, filename)
+	targetName := filepath.Join(targetDir, filename)
 
 	// If updating flags on existing message, remove old file first
 	if alreadyExported && exporter.options.OverwriteFlags && existingFilename != "" {
-		oldPath := filepath.Join(targetDir, existingFilename)
-		if oldPath != targetPath {
-			os.Remove(oldPath)
+		oldName := filepath.Join(targetDir, existingFilename)
+		if oldName != targetName {
+			exporter.root.Remove(oldName)
 		}
 	}
 
 	// Write the message the maildir way: into tmp/, fsync, then rename into place. A
 	// crash or a full disk must never leave a truncated file where a maildir reader
 	// (Dovecot, or a re-import) would take it for the message.
-	if err := writeMaildirFile(targetPath, content); err != nil {
+	if err := writeMaildirFile(exporter.root, targetName, content); err != nil {
 		return fmt.Errorf("failed to write message file: %w", err)
 	}
 
 	// Set file modification time to internal date
-	if err := os.Chtimes(targetPath, msg.InternalDate, msg.InternalDate); err != nil {
+	if err := exporter.root.Chtimes(targetName, msg.InternalDate, msg.InternalDate); err != nil {
 		logger.Info("Warning: Failed to set file times", "error", err)
 	}
 
 	// Record export in database
+	targetPath := filepath.Join(exporter.maildirPath, targetName)
 	if err := exporter.recordExport(msg.ContentHash, mailboxName, filename, targetPath, int64(msg.Size)); err != nil {
 		logger.Info("Warning: Failed to record export", "error", err)
 	}
@@ -762,12 +882,21 @@ func (exporter *Exporter) buildMaildirFlags(msg *db.Message, mailboxName string)
 // Returns: (fileExists, filename, error)
 // - fileExists: true if file exists on disk, false if needs to be created
 // - filename: original filename from database (empty if not in database)
+//
+// The file is looked for in the directory this export writes the mailbox to
+// (mailboxDir), not at the path recorded with it: an older version named some
+// folders' directories differently (#1166), and a message left only in such a
+// directory is not in the folder the importer reads the mailbox from.
 func (exporter *Exporter) isMessageExported(contentHash, mailbox string) (bool, string, error) {
-	var filename, path string
+	if exporter.db == nil {
+		return false, "", nil
+	}
+
+	var filename string
 	err := exporter.db.QueryRow(
-		"SELECT filename, path FROM messages WHERE hash = ? AND mailbox = ?",
+		"SELECT filename FROM messages WHERE hash = ? AND mailbox = ?",
 		contentHash, mailbox,
-	).Scan(&filename, &path)
+	).Scan(&filename)
 
 	if err == sql.ErrNoRows {
 		return false, "", nil
@@ -776,8 +905,12 @@ func (exporter *Exporter) isMessageExported(contentHash, mailbox string) (bool, 
 		return false, "", err
 	}
 
+	dir, err := exporter.mailboxDirName(mailbox)
+	if err != nil {
+		return false, "", err
+	}
 	// Check if the file still exists on disk
-	if _, err := os.Stat(path); os.IsNotExist(err) {
+	if _, err := exporter.root.Stat(filepath.Join(dir, "cur", filename)); os.IsNotExist(err) {
 		logger.Info("File in database but not on disk - will recreate with original filename", "filename", filename)
 		return false, filename, nil // Return the original filename for reuse
 	}
@@ -808,8 +941,6 @@ func (exporter *Exporter) exportDovecotFiles(accountID int64) error {
 
 // exportSubscriptions exports the Dovecot subscriptions file
 func (exporter *Exporter) exportSubscriptions(accountID int64) error {
-	subscriptionsPath := filepath.Join(exporter.maildirPath, "subscriptions")
-
 	// Subscriptions are name-based and may reference folders that
 	// no longer exist, so export ALL subscribed names — not just the subset that
 	// still has a live mailbox — for a lossless Dovecot round-trip.
@@ -818,7 +949,16 @@ func (exporter *Exporter) exportSubscriptions(accountID int64) error {
 		return fmt.Errorf("failed to fetch subscriptions for export: %w", err)
 	}
 
-	return os.WriteFile(subscriptionsPath, []byte(formatDovecotSubscriptions(names)), 0644)
+	// Dovecot's subscriptions file holds storage names (index_storage_set_subscribed
+	// writes box->name), so each name is written as its folder's directories are named,
+	// modified UTF-7 and escaped (maildirFolderName). The import reads both back through
+	// importedFolderName, so a subscription names the mailbox its folder imports as.
+	encoded := make([]string, len(names))
+	for i, name := range names {
+		encoded[i] = maildirFolderName(name)
+	}
+
+	return replaceFile(exporter.root, ".", "subscriptions", []byte(formatDovecotSubscriptions(encoded)))
 }
 
 // getProgressPrefix returns a progress prefix for log messages
@@ -834,8 +974,10 @@ func (exporter *Exporter) getProgressPrefix() string {
 	return fmt.Sprintf("[%d/%d %.1f%%]", processed, total, percentage)
 }
 
-// printSummary prints a summary of the export process
-func (exporter *Exporter) printSummary() error {
+// printSummary prints a summary of the export process. dovecotErr and uidListErr are
+// the failures of the subscriptions file and of the dovecot-uidlist files, which the
+// summary must not report as written.
+func (exporter *Exporter) printSummary(dovecotErr, uidListErr error) error {
 	duration := time.Since(exporter.startTime)
 	fmt.Printf("\n\nExport Summary:\n")
 	fmt.Printf("  Total messages:    %d\n", exporter.totalMessages)
@@ -848,21 +990,32 @@ func (exporter *Exporter) printSummary() error {
 		fmt.Printf("  Export rate:       %.1f messages/sec\n", rate)
 	}
 	if exporter.options.Dovecot {
-		fmt.Printf("\nNote: Dovecot subscriptions file exported.\n")
+		if dovecotErr == nil {
+			fmt.Printf("\nNote: Dovecot subscriptions file exported.\n")
+		} else {
+			fmt.Printf("\nNote: Dovecot subscriptions file NOT exported.\n")
+		}
 	}
 	if exporter.options.ExportUIDList {
-		fmt.Printf("Note: Dovecot uidlist files generated.\n")
+		if uidListErr == nil {
+			fmt.Printf("Note: Dovecot uidlist files generated.\n")
+		} else {
+			fmt.Printf("Note: Some Dovecot uidlist files could NOT be written.\n")
+		}
 	}
 	return nil
 }
 
-// generateDovecotUIDLists generates dovecot-uidlist files for all exported mailboxes
+// generateDovecotUIDLists generates dovecot-uidlist files for all exported mailboxes.
+// A mailbox whose file cannot be written does not cost the others theirs: every
+// failure is returned, after all the others are written.
 func (exporter *Exporter) generateDovecotUIDLists(mailboxes []*db.DBMailbox) error {
 	logger.Info("Generating dovecot-uidlist files...")
 
 	exporter.mu.Lock()
 	defer exporter.mu.Unlock()
 
+	var errs []error
 	for mailboxName, mappings := range exporter.uidMappings {
 		if len(mappings) == 0 {
 			continue
@@ -883,8 +1036,8 @@ func (exporter *Exporter) generateDovecotUIDLists(mailboxes []*db.DBMailbox) err
 			logger.Info("Warning: No UIDVALIDITY found - using generated value", "mailbox", mailboxName, "uidvalidity", uidValidity)
 		}
 
-		// Determine maildir path for this mailbox (containment-checked)
-		maildirPath, err := exporter.mailboxDir(mailboxName)
+		// Determine maildir directory for this mailbox (containment-checked)
+		dir, err := exporter.mailboxDirName(mailboxName)
 		if err != nil {
 			logger.Info("Warning: Skipping dovecot-uidlist for unsafe mailbox name", "mailbox", mailboxName, "error", err)
 			continue
@@ -896,64 +1049,141 @@ func (exporter *Exporter) generateDovecotUIDLists(mailboxes []*db.DBMailbox) err
 		// Rewriting the file with only this run's delta would make Dovecot reassign
 		// UIDs to every other message, so merge: keep the existing entries whose file
 		// still exists, and let this run's entries win for the UIDs it wrote.
-		mappings = mergeUIDMappings(maildirPath, mappings)
+		mappings = mergeUIDMappings(exporter.root, dir, mappings)
 
 		// Create DovecotUIDList from mappings
 		uidList := CreateDovecotUIDListFromMessages(uidValidity, mappings)
 
 		// Write dovecot-uidlist file
-		if err := WriteDovecotUIDList(maildirPath, uidList); err != nil {
-			return fmt.Errorf("failed to write dovecot-uidlist for mailbox %s: %w", mailboxName, err)
+		if err := replaceFile(exporter.root, dir, filepath.Join(dir, "dovecot-uidlist"), formatDovecotUIDList(uidList)); err != nil {
+			errs = append(errs, fmt.Errorf("failed to write dovecot-uidlist for mailbox %s: %w", mailboxName, err))
+			continue
 		}
 
 		logger.Info("Generated dovecot-uidlist for mailbox", "mailbox", mailboxName,
 			"messages", len(mappings), "uidvalidity", uidValidity, "next_uid", uidList.NextUID)
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
-// writeMaildirFile stores content at targetPath (a file under a maildir's cur/ or new/)
-// the way maildir requires: written to the maildir's tmp/ directory, fsync'd, then
-// renamed into place, with the containing directory fsync'd afterwards. A reader of the
-// maildir (Dovecot, or a re-import) therefore never sees a partially written message,
-// and a crash or a full disk leaves at most a stray file in tmp/, which maildir readers
-// ignore.
-func writeMaildirFile(targetPath string, content []byte) error {
-	targetDir := filepath.Dir(targetPath)
-	tmpDir := filepath.Join(filepath.Dir(targetDir), "tmp")
-	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+// writeMaildirFile stores content as the file name (below root, under a maildir's cur/
+// or new/) the way maildir requires: written to the maildir's tmp/ directory, fsync'd,
+// then renamed into place (replaceFile). A reader of the maildir (Dovecot, or a
+// re-import) therefore never sees a partially written message, and a crash or a full
+// disk leaves at most a stray file in tmp/, which maildir readers ignore.
+func writeMaildirFile(root *os.Root, name string, content []byte) error {
+	tmpDir := filepath.Join(filepath.Dir(filepath.Dir(name)), "tmp")
+	if err := root.MkdirAll(tmpDir, 0755); err != nil {
 		return fmt.Errorf("failed to create maildir tmp directory: %w", err)
 	}
-	tmpPath := filepath.Join(tmpDir, filepath.Base(targetPath))
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	return replaceFile(root, tmpDir, name, content)
+}
+
+// replaceFile stores content as the file name below root, the export directory: it
+// writes a new file in tmpDir (a directory of the same filesystem), fsyncs it, renames
+// it over name and fsyncs name's directory. The export may be given a directory its
+// owner could write to, and it runs with privileges the owner lacks, so it never writes
+// into a file already there: the new file is created with O_EXCL under a random name,
+// so nothing at that name (a link included) is opened, and the rename replaces the
+// entry at name, a symbolic or hard link to a file elsewhere included, instead of
+// writing into the file it names. The root resolves every directory on the way, a link
+// to one included, only within the export directory, and refuses one that leaves it.
+// A reader of name sees the old file or the whole new one, never a partial one.
+func replaceFile(root *os.Root, tmpDir, name string, content []byte) error {
+	// The '.' keeps the name apart from every folder directory, whose levels have
+	// theirs escaped (maildirFolderLevel).
+	tmpName := filepath.Join(tmpDir, filepath.Base(name)+"."+rand.Text())
+	f, err := root.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(content); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return err
+	_, err = f.Write(content)
+	if err == nil {
+		if err = f.Sync(); err != nil {
+			err = fmt.Errorf("failed to fsync %s: %w", tmpName, err)
+		}
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("failed to fsync message file: %w", err)
+	if cerr := f.Close(); err == nil {
+		err = cerr
 	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmpPath)
-		return err
+	if err == nil {
+		err = root.Rename(tmpName, name)
 	}
-	if err := os.Rename(tmpPath, targetPath); err != nil {
-		os.Remove(tmpPath)
+	if err != nil {
+		root.Remove(tmpName)
 		return err
 	}
 	// Make the rename durable: fsync the directory that now holds the entry.
-	if dir, err := os.Open(targetDir); err == nil {
+	if dir, err := openExportEntry(root, filepath.Dir(name), true); err == nil {
 		_ = dir.Sync()
 		dir.Close()
 	}
 	return nil
+}
+
+// openExportEntry opens name below root, the export directory, for reading, and only
+// a regular file or, with dir, a directory. The export may be given a directory its
+// owner could write to (replaceFile), so whatever it reads back there (a file an
+// earlier run left, or a directory it created) may have been replaced by anything, a
+// FIFO included, and opening a FIFO for reading blocks until something opens it for
+// writing: the export would never finish.
+//
+// With dir, O_DIRECTORY makes the kernel reject anything that is not a directory with
+// ENOTDIR before opening it, so neither a FIFO nor a device node is opened, and real
+// directories open in normal blocking mode. Without dir, O_NONBLOCK prevents opening a
+// FIFO from waiting for a writer; the open descriptor is checked with Stat so nothing
+// can take its place afterwards, and O_NONBLOCK is cleared before returning so the
+// regular file is read in blocking mode (as os.Open reads it). The root follows no link
+// out of the export directory.
+//
+// The owner can also make the name a hard link, which the root cannot tell from the
+// file's first name, to a file elsewhere on the same file system, one they cannot read
+// where the system lets them link it (BSD and macOS do, as Linux does with
+// fs.protected_hardlinks = 0). The files the export reads back are created by renaming
+// a new file over the name, by the export (replaceFile) as by Dovecot, so they have one
+// link: a regular file with more is refused.
+func openExportEntry(root *os.Root, name string, dir bool) (*os.File, error) {
+	if dir {
+		f, err := root.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+		if err != nil {
+			if errors.Is(err, syscall.ENOTDIR) {
+				return nil, fmt.Errorf("refusing %s in the export directory: it is not a directory: %w", name, err)
+			}
+			return nil, err
+		}
+		return f, nil
+	}
+
+	f, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("refusing %s in the export directory: it is not a regular file", name)
+	}
+	if links := info.Sys().(*syscall.Stat_t).Nlink; links > 1 {
+		f.Close()
+		return nil, fmt.Errorf("refusing %s in the export directory: it is a hard link (%d links)", name, links)
+	}
+	conn, err := f.SyscallConn()
+	if err == nil {
+		var setErr error
+		if err = conn.Control(func(fd uintptr) { setErr = syscall.SetNonblock(int(fd), false) }); err == nil {
+			err = setErr
+		}
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 // maxMaildirKeywords is how many custom keywords a maildir folder can name: the info
@@ -966,7 +1196,9 @@ const maxMaildirKeywords = 26
 // re-import. Keywords are numbered in sorted order, deterministically, so repeated
 // exports of the same mailbox produce the same file. An existing file's numbering is
 // kept for the keywords it already names, so an incremental export does not renumber
-// files written by an earlier run.
+// files written by an earlier run. An existing file that cannot be read (one that is
+// not a regular file, or is larger than maxDovecotKeywordsSize) is named in a warning
+// and replaced.
 func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Message) error {
 	seen := make(map[string]struct{})
 	for i := range messages {
@@ -975,21 +1207,28 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 		}
 	}
 
-	dir, err := exporter.mailboxDir(mailboxName)
+	dir, err := exporter.mailboxDirName(mailboxName)
 	if err != nil {
 		return err
 	}
-	keywordsPath := filepath.Join(dir, "dovecot-keywords")
+	keywordsName := filepath.Join(dir, "dovecot-keywords")
 
 	index := make(map[string]int)
 	used := make(map[int]bool)
-	if existing, err := parseKeywordsFile(keywordsPath); err == nil {
+	unreadable := false
+	open := func(name string) (*os.File, error) { return openExportEntry(exporter.root, name, false) }
+	if existing, err := parseKeywordsFile(keywordsName, open); err == nil {
 		for idx, kw := range existing {
-			if idx >= 0 && idx < maxMaildirKeywords {
-				index[kw] = idx
-				used[idx] = true
-			}
+			index[kw] = idx
+			used[idx] = true
 		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		unreadable = true
+		// A file that is there but is not read (a link, a FIFO, a file with more than
+		// one link) is replaced without its numbering, so the letters of files an
+		// earlier run wrote may name other keywords now.
+		logger.Warn("Existing dovecot-keywords not read; it is replaced and its keyword numbering is not kept",
+			"mailbox", mailboxName, "path", filepath.Join(exporter.root.Name(), keywordsName), "error", err)
 	}
 
 	names := make([]string, 0, len(seen))
@@ -1018,10 +1257,12 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 	exporter.keywordIndex[mailboxName] = index
 	exporter.mu.Unlock()
 
-	if len(index) == 0 {
+	// A mailbox without keywords needs no file, but one that cannot be read is
+	// replaced all the same (with an empty one), as the warning says.
+	if len(index) == 0 && !unreadable {
 		return nil
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := exporter.root.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 	byIndex := make([]string, maxMaildirKeywords)
@@ -1034,16 +1275,25 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 			fmt.Fprintf(&b, "%d %s\n", idx, kw)
 		}
 	}
-	return os.WriteFile(keywordsPath, []byte(b.String()), 0644)
+	return replaceFile(exporter.root, dir, keywordsName, []byte(b.String()))
 }
 
 // mergeUIDMappings merges this run's UID → filename mappings with the dovecot-uidlist
-// already present in maildirPath (if any). Entries from the existing file are kept when
-// their file still exists in cur/ or new/ (matched on the base filename, ignoring the
-// ":2,flags" info part) and no entry of this run uses the same UID or filename.
-func mergeUIDMappings(maildirPath string, current []UIDFileMapping) []UIDFileMapping {
-	existing, err := ParseDovecotUIDList(maildirPath)
-	if err != nil || existing == nil || len(existing.UIDMappings) == 0 {
+// already present in the maildir directory dir below root (if any). Entries from the
+// existing file are kept when their file still exists in cur/ or new/ (matched on the
+// base filename, ignoring the ":2,flags" info part) and no entry of this run uses the
+// same UID or filename. The root reads no file through a link out of the export
+// directory, and a dovecot-uidlist, cur/ or new/ of another kind is not read
+// (openExportEntry).
+func mergeUIDMappings(root *os.Root, dir string, current []UIDFileMapping) []UIDFileMapping {
+	existing, err := parseDovecotUIDListFile(openExportEntry(root, filepath.Join(dir, "dovecot-uidlist"), false))
+	if err != nil {
+		// Dovecot then gives new UIDs to the files of earlier runs that the file listed.
+		logger.Warn("Existing dovecot-uidlist not read; it is replaced without the entries of earlier runs",
+			"path", filepath.Join(root.Name(), dir, "dovecot-uidlist"), "error", err)
+		return current
+	}
+	if existing == nil || len(existing.UIDMappings) == 0 {
 		return current
 	}
 	usedUID := make(map[uint32]bool, len(current))
@@ -1054,7 +1304,12 @@ func mergeUIDMappings(maildirPath string, current []UIDFileMapping) []UIDFileMap
 	}
 	present := make(map[string]bool)
 	for _, sub := range []string{"cur", "new"} {
-		entries, err := os.ReadDir(filepath.Join(maildirPath, sub))
+		d, err := openExportEntry(root, filepath.Join(dir, sub), true)
+		if err != nil {
+			continue
+		}
+		entries, err := d.ReadDir(-1)
+		d.Close()
 		if err != nil {
 			continue
 		}

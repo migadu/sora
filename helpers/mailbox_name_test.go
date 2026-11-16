@@ -60,6 +60,15 @@ func TestMailboxNameToCreate(t *testing.T) {
 		{"a/./b", "", false},
 		{"..", "", false},
 		{"Foo/.", "", false},
+		{"Jos\u00e9/\u00dcber", "Jos\u00e9/\u00dcber", true}, // non-ASCII UTF-8 is a name
+		// Characters PostgreSQL cannot store in text (NUL, invalid UTF-8) and the
+		// ones db.CreateMailbox refuses: a Sieve name taken from a header can hold
+		// any of them.
+		{"a\x00b", "", false},
+		{"caf\xe9", "", false},
+		{"a/\xff/b", "", false},
+		{"a\tb", "", false},
+		{"a\r\nb", "", false},
 	}
 	for _, tt := range tests {
 		got, err := MailboxNameToCreate(tt.name)
@@ -69,6 +78,43 @@ func TestMailboxNameToCreate(t *testing.T) {
 			}
 		} else if !errors.Is(err, consts.ErrMailboxInvalidName) {
 			t.Errorf("MailboxNameToCreate(%q) = %q, %v; want ErrMailboxInvalidName", tt.name, got, err)
+		}
+	}
+}
+
+func TestMailboxNameValid(t *testing.T) {
+	for _, name := range []string{"INBOX", "Archive/2024", "Foo.Bar/..baz", "José"} {
+		if !MailboxNameValid(name) {
+			t.Errorf("MailboxNameValid(%q) = false, want true", name)
+		}
+	}
+	// A stored name has no trailing delimiter: "Foo/" is the name CREATE makes "Foo".
+	for _, name := range []string{"", "/", "Foo/", "/Foo", "x//y", "a/../b", "a\tb", "caf\xe9"} {
+		if MailboxNameValid(name) {
+			t.Errorf("MailboxNameValid(%q) = true, want false", name)
+		}
+	}
+}
+
+// TestIsDefaultMailboxName is issue #1584: a stored name is a default mailbox's in
+// any case of its ASCII letters, and in no other spelling.
+func TestIsDefaultMailboxName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"Sent":       true,
+		"sent":       true,
+		"TRASH":      true,
+		"inbox":      true,
+		"Archive":    true,
+		"ſent":       false, // U+017F LATIN SMALL LETTER LONG S
+		"Draftſ":     false,
+		"Sent/Sub":   false,
+		"Sents":      false,
+		"":           false,
+		"Jun\u212A":  false, // U+212A KELVIN SIGN is no ASCII letter
+		"\u0130NBOX": false, // nor is U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE
+	} {
+		if got := IsDefaultMailboxName(name); got != want {
+			t.Errorf("IsDefaultMailboxName(%q) = %v, want %v", name, got, want)
 		}
 	}
 }

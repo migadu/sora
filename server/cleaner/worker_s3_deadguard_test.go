@@ -62,7 +62,7 @@ func TestCleanupWorker_S3HealthGuardIsDeadCode(t *testing.T) {
 		"precondition: S3 is demonstrably down for the cleaner's only S3 operation")
 
 	mockDB := new(mockDatabase)
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    resilientS3, // the production wiring, not &mockS3{}
 		cache:                 new(mockCache),
@@ -80,7 +80,7 @@ func TestCleanupWorker_S3HealthGuardIsDeadCode(t *testing.T) {
 	mockDB.On("CleanupOldRedirectsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.UserScopedObjectForCleanup{}, nil).Once()
-	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything).Return([]db.FTSKey{}, nil).Once()
+	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.FTSKey{}, db.FTSKey{}, nil).Once()
 	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	require.NoError(t, worker.runOnce(ctx))

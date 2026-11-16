@@ -8,7 +8,7 @@ import (
 
 // TestProxyMethods_GetSetRefresh tests the proxy-specific Get/Set/Refresh methods
 func TestProxyMethods_GetSetRefresh(t *testing.T) {
-	cache := New(5*time.Minute, 1*time.Minute, 100, 1*time.Minute, 30*time.Second)
+	cache := New("test", "test", 5*time.Minute, 1*time.Minute, 100, 1*time.Minute, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	serverName := "imap-proxy-1"
@@ -121,7 +121,7 @@ func TestProxyMethods_GetSetRefresh(t *testing.T) {
 
 // TestProxyMethods_ExpiredEntry tests that Get returns cache miss for expired entries
 func TestProxyMethods_ExpiredEntry(t *testing.T) {
-	cache := New(50*time.Millisecond, 50*time.Millisecond, 100, 1*time.Minute, 30*time.Second)
+	cache := New("test", "test", 50*time.Millisecond, 50*time.Millisecond, 100, 1*time.Minute, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	serverName := "proxy"
@@ -157,7 +157,7 @@ func TestProxyMethods_ExpiredEntry(t *testing.T) {
 
 // TestProxyMethods_NegativeCache tests negative caching in proxy methods
 func TestProxyMethods_NegativeCache(t *testing.T) {
-	cache := New(5*time.Minute, 1*time.Minute, 100, 1*time.Minute, 30*time.Second)
+	cache := New("test", "test", 5*time.Minute, 1*time.Minute, 100, 1*time.Minute, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	serverName := "proxy"
@@ -191,7 +191,7 @@ func TestProxyMethods_NegativeCache(t *testing.T) {
 
 // TestClear tests the Clear method
 func TestClear(t *testing.T) {
-	cache := New(5*time.Minute, 1*time.Minute, 100, 1*time.Minute, 30*time.Second)
+	cache := New("test", "test", 5*time.Minute, 1*time.Minute, 100, 1*time.Minute, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	// Add several entries
@@ -271,7 +271,7 @@ func TestMakeKey(t *testing.T) {
 // TestProxyMethods_MaxSizeEviction tests that Set respects max size
 func TestProxyMethods_MaxSizeEviction(t *testing.T) {
 	maxSize := 5
-	cache := New(5*time.Minute, 1*time.Minute, maxSize, 1*time.Minute, 30*time.Second)
+	cache := New("test", "test", 5*time.Minute, 1*time.Minute, maxSize, 1*time.Minute, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	// Add entries up to max size
@@ -328,7 +328,7 @@ func TestProxyMethods_MaxSizeEviction(t *testing.T) {
 func TestRefresh_TTLExtension(t *testing.T) {
 	positiveTTL := 100 * time.Millisecond
 	negativeTTL := 50 * time.Millisecond
-	cache := New(positiveTTL, negativeTTL, 100, 1*time.Minute, 30*time.Second)
+	cache := New("test", "test", positiveTTL, negativeTTL, 100, 1*time.Minute, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	serverName := "server"

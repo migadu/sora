@@ -33,6 +33,12 @@ func (q *captureRelayQueue) Enqueue(from, to, messageType string, messageBytes [
 	return nil
 }
 
+// Hold records the message when it is committed, which is when the relay worker
+// would first see it.
+func (q *captureRelayQueue) Hold(from, to, messageType string, messageBytes []byte) (func() error, func(), error) {
+	return func() error { return q.Enqueue(from, to, messageType, messageBytes) }, func() {}, nil
+}
+
 func (q *captureRelayQueue) snapshot() []relayItem {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -70,10 +76,11 @@ func TestDelivery_SieveVacation_AlongsideOtherActions(t *testing.T) {
 	executor := dctx.SieveExecutor.(*delivery.StandardSieveExecutor)
 	executor.RelayQueue = rq
 	executor.VacationHandler = &delivery.StandardVacationHandler{
-		Hostname:       "delivery-host",
-		RelayQueue:     rq,
-		Logger:         testLogger{t},
-		IsOwnedAddress: rdb.IsAddressOwnedByAccountWithRetry,
+		Hostname:          "delivery-host",
+		RelayQueue:        rq,
+		Logger:            testLogger{t},
+		IsOwnedAddress:    rdb.IsAddressOwnedByAccountWithRetry,
+		IsAnyOwnedAddress: rdb.IsAnyAddressOwnedByAccountWithRetry,
 	}
 
 	addr, err := server.NewAddress(account.Email)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -11,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go/logging"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 )
 
@@ -65,7 +67,8 @@ func NewClient(ctx context.Context, cfg ClientConfig, optFns ...func(*s3.Options
 		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")))
 	case cfg.AccessKey != "" || cfg.SecretKey != "":
-		return nil, errors.New("access_key and secret_key must be set together; leave both empty to use the AWS default credential chain")
+		// config.S3Config.Validate refuses such an [s3] pair with the file.
+		return nil, config.ErrS3KeysNotPaired
 	}
 	if cfg.Debug {
 		// ClientLogMode alone selects what to trace; without a logger the SDK discards it.
@@ -114,10 +117,18 @@ type debugLogger struct {
 	prefix string
 }
 
+// traceSecrets matches what a request trace carries that a reader of the log could
+// use: the SigV4 signature, with which S3 accepts the same request again while its
+// X-Amz-Date is recent (a GET of a message body or a certificate key), and the session
+// token of credentials from the default chain. The credential scope before the
+// signature stays readable, since it shows the key id and the signing region.
+var traceSecrets = regexp.MustCompile(`(Signature=)[0-9A-Fa-f]+|((?i)x-amz-security-token: )[^\r\n]+`)
+
 func (l debugLogger) Logf(classification logging.Classification, format string, v ...any) {
+	detail := traceSecrets.ReplaceAllString(fmt.Sprintf(format, v...), "${1}${2}[redacted]")
 	if classification == logging.Warn {
-		logger.Warn(l.prefix+": AWS SDK", "detail", fmt.Sprintf(format, v...))
+		logger.Warn(l.prefix+": AWS SDK", "detail", detail)
 		return
 	}
-	logger.Info(l.prefix+": AWS SDK trace", "detail", fmt.Sprintf(format, v...))
+	logger.Info(l.prefix+": AWS SDK trace", "detail", detail)
 }

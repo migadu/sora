@@ -21,10 +21,18 @@ import (
 
 // setupPOP3PerUserPerIPBehindProxy starts a POP3 backend that accepts PROXY
 // headers from 127.0.0.1 and tracks connections in the returned tracker, with
-// a per-user-per-IP limit of perIP. A refused registration is only logged on
-// this backend (#345), so the tests read the tracker instead of the login
-// response.
+// a per-user-per-IP limit of perIP.
 func setupPOP3PerUserPerIPBehindProxy(t *testing.T, perIP int) (string, common.TestAccount, *server.ConnectionTracker) {
+	t.Helper()
+	_, address, account, tracker := setupPOP3ConnLimitsBehindProxy(t, 100, perIP)
+	return address, account, tracker
+}
+
+// setupPOP3ConnLimitsBehindProxy starts a POP3 backend that accepts PROXY
+// headers from 127.0.0.1 and tracks connections in the returned tracker, with
+// max_connections_per_user perUser and max_connections_per_user_per_ip perIP
+// (0: no limit).
+func setupPOP3ConnLimitsBehindProxy(t *testing.T, perUser, perIP int) (*pop3.POP3Server, string, common.TestAccount, *server.ConnectionTracker) {
 	t.Helper()
 	rdb := common.SetupTestDatabase(t)
 	account := common.CreateTestAccount(t, rdb)
@@ -40,14 +48,14 @@ func setupPOP3PerUserPerIPBehindProxy(t *testing.T, perIP int) (string, common.T
 	if err != nil {
 		t.Fatalf("pop3.New: %v", err)
 	}
-	tracker := server.NewConnectionTracker("POP3", "test", "localhost", "test-instance", nil, 100, perIP, 0, false)
+	tracker := server.NewConnectionTracker("POP3", "test", "localhost", "test-instance", nil, perUser, perIP, 0, false)
 	srv.SetConnTracker(tracker)
 
 	errChan := make(chan error, 1)
 	go srv.Start(errChan)
 	t.Cleanup(srv.Close)
 	time.Sleep(100 * time.Millisecond)
-	return address, account, tracker
+	return srv, address, account, tracker
 }
 
 type proxiedPOP3Conn struct {
@@ -166,10 +174,12 @@ func TestPOP3_PerUserPerIPLimitCountsProxiedClientAddress(t *testing.T) {
 	waitTrackedEmpty(t, tracker)
 
 	// The limit still holds per client address: a second session from
-	// 198.51.100.1 is not counted (whether its login is refused is #345).
+	// 198.51.100.1 is refused and not counted.
 	dialProxiedPOP3(t, addr, "198.51.100.1").login(account)
 	over := dialProxiedPOP3(t, addr, "198.51.100.1")
-	over.tryLogin(account)
+	if resp := over.tryLogin(account); !strings.HasPrefix(resp, "-ERR [SYS/TEMP]") {
+		t.Fatalf("login over max_connections_per_user_per_ip = %q, want -ERR [SYS/TEMP]", resp)
+	}
 	expectTrackedPerIP(t, tracker, map[string]int{"198.51.100.1": 1})
 
 	// Closing the session that was not counted must not release the count
@@ -219,4 +229,23 @@ func TestPOP3_PerUserPerIPLimitCountsXCLIENTForwardedClientAddress(t *testing.T)
 		}
 	}
 	waitTrackedEmpty(t, tracker)
+}
+
+// Behind a layer-4 load balancer that sends PROXY headers, an XCLIENT is the
+// client's own: it cannot replace the address the header gave, so a client
+// cannot claim a fresh address for each connection and escape the per-IP
+// count (#540). It is still answered +OK, as for a pop3_proxy that sends a
+// PROXY header and XCLIENT together.
+func TestPOP3_PerUserPerIPLimitIgnoresXCLIENTFromProxiedClient(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	addr, account, tracker := setupPOP3PerUserPerIPBehindProxy(t, 1)
+
+	for i := 1; i <= 2; i++ {
+		c := dialProxiedPOP3(t, addr, "198.51.100.66")
+		if resp := c.do(fmt.Sprintf("XCLIENT ADDR=203.0.113.%d PORT=51000 TTL=5", i)); !strings.HasPrefix(resp, "+OK") {
+			t.Fatalf("XCLIENT from 198.51.100.66 behind the load balancer: %q", resp)
+		}
+		c.tryLogin(account)
+	}
+	expectTrackedPerIP(t, tracker, map[string]int{"198.51.100.66": 1})
 }

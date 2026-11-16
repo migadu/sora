@@ -28,7 +28,7 @@ func TestParseMaildirFlagsMatchesMaildirSpec(t *testing.T) {
 		{"1700000000.M1P1.host", nil},
 	}
 	for _, tc := range cases {
-		assert.ElementsMatch(t, tc.want, imp.parseMaildirFlags(tc.filename), tc.filename)
+		assert.ElementsMatch(t, tc.want, imp.parseMaildirFlagsWith(tc.filename, nil), tc.filename)
 	}
 }
 
@@ -39,7 +39,7 @@ func TestMaildirFlagRoundTrip(t *testing.T) {
 	exp := &Exporter{}
 	for _, flag := range []imap.Flag{imap.FlagSeen, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDeleted, imap.FlagDraft} {
 		info := exp.buildMaildirFlags(&db.Message{BitwiseFlags: db.FlagsToBitwise([]imap.Flag{flag})}, "INBOX")
-		got := imp.parseMaildirFlags("1700000000.M1P1.host:2," + info)
+		got := imp.parseMaildirFlagsWith("1700000000.M1P1.host:2,"+info, nil)
 		assert.Equal(t, []imap.Flag{flag}, got, "flag %s → info %q → %v", flag, info, got)
 	}
 }

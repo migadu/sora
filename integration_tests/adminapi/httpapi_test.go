@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/affinitycache"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
@@ -119,10 +120,6 @@ type testSourceDB struct {
 }
 
 func (t *testSourceDB) FindExistingContentHashesWithRetry(ctx context.Context, hashes []string) ([]string, error) {
-	return nil, nil // Not needed for HTTP API tests
-}
-
-func (t *testSourceDB) GetRecentMessagesForWarmupWithRetry(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
 	return nil, nil // Not needed for HTTP API tests
 }
 
@@ -1081,8 +1078,14 @@ func TestErrorScenarios(t *testing.T) {
 			t.Fatalf("Failed to read response body: %v", err)
 		}
 
-		if resp.StatusCode != http.StatusForbidden {
-			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusForbidden, resp.StatusCode, string(body))
+		// RFC 6750 section 3.1, invalid_token: "The resource SHOULD respond with the HTTP
+		// 401 (Unauthorized) status code."
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusUnauthorized, resp.StatusCode, string(body))
+		}
+		const wantChallenge = `Bearer realm="admin-api", error="invalid_token"`
+		if got := resp.Header.Values("WWW-Authenticate"); len(got) != 1 || got[0] != wantChallenge {
+			t.Errorf("WWW-Authenticate = %q, want %q", got, wantChallenge)
 		}
 
 		server.expectError(t, body, "Invalid API key")
@@ -1548,6 +1551,19 @@ func TestMessageRestoration(t *testing.T) {
 		t.Fatalf("Failed to insert message 3: %v", err)
 	}
 
+	// Every write path takes a message's UID from mailboxes.highest_uid, which therefore
+	// stays at or above every UID the mailbox holds. A restore takes the next one for the
+	// message it brings back, next to the expunged row that keeps the old UID.
+	syncHighestUID := func(t *testing.T) {
+		t.Helper()
+		if _, err := server.rdb.GetDatabase().GetWritePool().Exec(ctx, `
+			UPDATE mailboxes mb SET highest_uid = (SELECT COALESCE(MAX(uid), 0) FROM messages WHERE mailbox_id = mb.id)
+			WHERE mb.account_id = $1`, accountID); err != nil {
+			t.Fatalf("Failed to set highest_uid: %v", err)
+		}
+	}
+	syncHighestUID(t)
+
 	// 5. List all deleted messages
 	t.Run("ListAllDeletedMessages", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/admin/accounts/"+testEmail+"/messages/deleted", nil)
@@ -1670,6 +1686,7 @@ func TestMessageRestoration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to insert message 4: %v", err)
 		}
+		syncHighestUID(t)
 
 		// Now we have msg3 and msg4 deleted in Archive
 		restoreReq := map[string]any{
@@ -2416,39 +2433,44 @@ func TestACLManagementOneEntryPerAccount(t *testing.T) {
 // TestACLGrantAnyoneFollowsAllowAnyoneIdentifier covers the Admin API half of issue
 // #159: with [shared_mailboxes] allow_anyone_identifier false (its default), granting
 // to "anyone" is refused (400), as it is over IMAP; a user can still be granted.
+// The mailbox is shared by a server with sharing on, and the refusal holds also when
+// the Admin API's own config has sharing off (#350).
 func TestACLGrantAnyoneFollowsAllowAnyoneIdentifier(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	for _, allowed := range []bool{false, true} {
-		t.Run(fmt.Sprintf("allow_anyone_identifier=%t", allowed), func(t *testing.T) {
-			shared := config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/", AllowAnyoneIdentifier: allowed}
-			server := setupHTTPAPIServer(t, func(o *adminapi.ServerOptions) { o.SharedMailboxes = shared })
-			defer server.Close()
+	for _, enabled := range []bool{true, false} {
+		for _, allowed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("enabled=%t/allow_anyone_identifier=%t", enabled, allowed), func(t *testing.T) {
+				shared := config.SharedMailboxesConfig{Enabled: enabled, NamespacePrefix: "Shared/", AllowAnyoneIdentifier: allowed}
+				server := setupHTTPAPIServer(t, func(o *adminapi.ServerOptions) { o.SharedMailboxes = shared })
+				defer server.Close()
 
-			owner := common.CreateTestAccount(t, server.rdb)
-			member := common.CreateTestAccount(t, server.rdb)
-			ctx := context.WithValue(context.Background(), consts.ConfigContextKey, &config.Config{SharedMailboxes: shared})
-			ownerID, err := server.rdb.GetAccountIDByAddressWithRetry(ctx, owner.Email)
-			if err != nil {
-				t.Fatalf("Failed to resolve owner: %v", err)
-			}
-			mailbox := fmt.Sprintf("Shared/Anyone-%d", time.Now().UnixNano())
-			if err := server.rdb.CreateMailboxWithRetry(ctx, ownerID, mailbox, nil); err != nil {
-				t.Fatalf("Failed to create mailbox: %v", err)
-			}
-
-			want := http.StatusBadRequest
-			if allowed {
-				want = http.StatusOK
-			}
-			for identifier, status := range map[string]int{"anyone": want, member.Email: http.StatusOK} {
-				resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/grant",
-					map[string]any{"owner": owner.Email, "mailbox": mailbox, "identifier": identifier, "rights": "lr"})
-				if resp.StatusCode != status {
-					t.Errorf("grant to %s: got %d %s, want %d", identifier, resp.StatusCode, strings.TrimSpace(string(body)), status)
+				owner := common.CreateTestAccount(t, server.rdb)
+				member := common.CreateTestAccount(t, server.rdb)
+				creator := config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/"}
+				ctx := context.WithValue(context.Background(), consts.ConfigContextKey, &config.Config{SharedMailboxes: creator})
+				ownerID, err := server.rdb.GetAccountIDByAddressWithRetry(ctx, owner.Email)
+				if err != nil {
+					t.Fatalf("Failed to resolve owner: %v", err)
 				}
-			}
-		})
+				mailbox := fmt.Sprintf("Shared/Anyone-%d", time.Now().UnixNano())
+				if err := server.rdb.CreateMailboxWithRetry(ctx, ownerID, mailbox, nil); err != nil {
+					t.Fatalf("Failed to create mailbox: %v", err)
+				}
+
+				want := http.StatusBadRequest
+				if allowed {
+					want = http.StatusOK
+				}
+				for identifier, status := range map[string]int{"anyone": want, member.Email: http.StatusOK} {
+					resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/grant",
+						map[string]any{"owner": owner.Email, "mailbox": mailbox, "identifier": identifier, "rights": "lr"})
+					if resp.StatusCode != status {
+						t.Errorf("grant to %s: got %d %s, want %d", identifier, resp.StatusCode, strings.TrimSpace(string(body)), status)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -2493,6 +2515,17 @@ func (m *mockAffinityManager) GetStats(ctx context.Context) map[string]any {
 		"enabled":       true,
 		"total_entries": len(m.affinity),
 	}
+}
+
+func (m *mockAffinityManager) List() []affinitycache.AffinityEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var list []affinitycache.AffinityEntry
+	for key, backend := range m.affinity {
+		i := strings.LastIndex(key, ":")
+		list = append(list, affinitycache.AffinityEntry{Username: key[:i], Protocol: key[i+1:], Backend: backend})
+	}
+	return list
 }
 
 // TestAffinityManagement tests the affinity management endpoints

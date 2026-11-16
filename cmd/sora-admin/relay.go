@@ -3,13 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
-	"time"
 
 	"github.com/migadu/sora/server/relayqueue"
 )
@@ -41,6 +42,25 @@ func handleRelayCommand(ctx context.Context) {
 	}
 }
 
+// openExistingRelayQueue opens the relay queue at queuePath without creating any of its
+// directories. NewDiskQueue creates the missing ones, and created by `sudo sora-admin`
+// they would belong to root, where the server, running as its own user, cannot queue:
+// these commands only work on a queue the server has made. A missing directory is
+// reported as the *fs.PathError from os.Stat.
+func openExistingRelayQueue(queuePath string, maxAttempts int) (*relayqueue.DiskQueue, error) {
+	for _, dir := range []string{"failed", "pending", "processing"} {
+		path := filepath.Join(queuePath, dir)
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("%s is not a directory", path)
+		}
+	}
+	return relayqueue.NewDiskQueue(queuePath, maxAttempts, nil)
+}
+
 func handleRelayStats(_ context.Context) {
 	flags := flag.NewFlagSet("relay stats", flag.ExitOnError)
 	flags.Parse(os.Args[3:])
@@ -53,9 +73,16 @@ func handleRelayStats(_ context.Context) {
 		os.Exit(1)
 	}
 
-	// Create queue instance (just for stats, doesn't start worker)
+	// Open the queue just for stats (no worker). On a node whose server has not created it
+	// yet there is nothing to count, so say so, as list does.
 	queuePath := cfg.Relay.GetQueuePath()
-	queue, err := relayqueue.NewDiskQueue(queuePath, cfg.Relay.Queue.MaxAttempts, nil)
+	queue, err := openExistingRelayQueue(queuePath, cfg.Relay.Queue.MaxAttempts)
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) && errors.Is(err, fs.ErrNotExist) {
+		fmt.Printf("Queue directory does not exist: %s\n", pathErr.Path)
+		fmt.Println("The server creates the relay queue when it starts with [relay] configured.")
+		return
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error accessing relay queue: %v\n", err)
 		os.Exit(1)
@@ -68,7 +95,7 @@ func handleRelayStats(_ context.Context) {
 		os.Exit(1)
 	}
 
-	// Display stats
+	// Display stats. The settings are the ones the server runs with, defaults included.
 	fmt.Println("Relay Queue Statistics")
 	fmt.Println("======================")
 	fmt.Printf("Queue Path:       %s\n", queuePath)
@@ -76,8 +103,12 @@ func handleRelayStats(_ context.Context) {
 	fmt.Printf("Processing:       %d\n", processing)
 	fmt.Printf("Failed:           %d\n", failed)
 	fmt.Printf("Total:            %d\n", pending+processing+failed)
-	fmt.Printf("Max Attempts:     %d\n", cfg.Relay.Queue.MaxAttempts)
-	fmt.Printf("Worker Interval:  %s\n", cfg.Relay.Queue.WorkerInterval)
+	fmt.Printf("Max Attempts:     %d\n", queue.MaxAttempts())
+	if interval, err := cfg.Relay.Queue.GetWorkerInterval(); err != nil {
+		fmt.Printf("Worker Interval:  invalid (%v)\n", err)
+	} else {
+		fmt.Printf("Worker Interval:  %s\n", interval)
+	}
 }
 
 func handleRelayList(_ context.Context) {
@@ -165,14 +196,9 @@ func handleRelayList(_ context.Context) {
 			nextRetryStr = "N/A"
 		}
 
-		// Truncate ID for display
-		idShort := msg.ID
-		if len(idShort) > 8 {
-			idShort = idShort[:8]
-		}
-
+		// The full ID: show, delete and requeue take nothing shorter.
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
-			idShort, msg.Type, msg.From, msg.To, msg.Attempts, queuedStr, nextRetryStr)
+			msg.ID, msg.Type, msg.From, msg.To, msg.Attempts, queuedStr, nextRetryStr)
 	}
 	w.Flush()
 
@@ -290,51 +316,59 @@ func handleRelayDelete(_ context.Context) {
 	queueDir := filepath.Join(cfg.Relay.GetQueuePath(), *queueType)
 
 	if *messageID == "all" {
-		// Delete all messages in the queue
-		entries, err := os.ReadDir(queueDir)
+		deleted, err := deleteAllMessagesInQueueDir(queueDir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error reading queue directory: %v\n", err)
 			os.Exit(1)
 		}
 
-		deleted := 0
-		for _, entry := range entries {
-			name := entry.Name()
-			if filepath.Ext(name) == ".json" || filepath.Ext(name) == ".msg" {
-				if err := os.Remove(filepath.Join(queueDir, name)); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: Could not delete %s: %v\n", name, err)
-				} else {
-					if filepath.Ext(name) == ".json" {
-						deleted++
-					}
-				}
-			}
-		}
-
 		fmt.Printf("Deleted %d messages from %s queue\n", deleted, *queueType)
 	} else {
-		// Delete specific message
-		metadataPath := filepath.Join(queueDir, *messageID+".json")
-		messagePath := filepath.Join(queueDir, *messageID+".msg")
-
-		// Check if message exists
-		if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "Message ID %s not found in %s queue\n", *messageID, *queueType)
+		queue, err := openExistingRelayQueue(cfg.Relay.GetQueuePath(), cfg.Relay.Queue.MaxAttempts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error accessing relay queue: %v\n", err)
 			os.Exit(1)
 		}
-
-		// Delete both files
-		if err := os.Remove(metadataPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Error deleting metadata: %v\n", err)
+		if err := queue.Delete(*messageID, *queueType); err != nil {
+			fmt.Fprintf(os.Stderr, "Error deleting message %s from %s queue: %v\n", *messageID, *queueType, err)
 			os.Exit(1)
-		}
-
-		if err := os.Remove(messagePath); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: Error deleting message body: %v\n", err)
 		}
 
 		fmt.Printf("Deleted message %s from %s queue\n", *messageID, *queueType)
 	}
+}
+
+// deleteAllMessagesInQueueDir deletes committed messages through the same lease
+// and durable terminal journal as the worker. Busy messages and uncommitted holds
+// are left alone; only completed discards contribute to the returned count.
+func deleteAllMessagesInQueueDir(queueDir string) (int, error) {
+	queueType := filepath.Base(filepath.Clean(queueDir))
+	if queueType != "pending" && queueType != "processing" && queueType != "failed" {
+		return 0, fmt.Errorf("unknown relay queue %q", queueType)
+	}
+	queue, err := openExistingRelayQueue(filepath.Dir(filepath.Clean(queueDir)), 10)
+	if err != nil {
+		return 0, err
+	}
+	entries, err := os.ReadDir(queueDir)
+	if err != nil {
+		return 0, err
+	}
+	deleted := 0
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		if err := queue.Delete(id, queueType); err != nil {
+			if !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "Warning: Could not delete %s: %v\n", entry.Name(), err)
+			}
+			continue
+		}
+		deleted++
+	}
+	return deleted, nil
 }
 
 func handleRelayRequeue(_ context.Context) {
@@ -362,12 +396,18 @@ func handleRelayRequeue(_ context.Context) {
 		os.Exit(1)
 	}
 
-	failedDir := filepath.Join(cfg.Relay.GetQueuePath(), "failed")
-	pendingDir := filepath.Join(cfg.Relay.GetQueuePath(), "pending")
+	// The queue does the move, so requeue keeps the order its own writers rely on: a
+	// running server's worker picks the message up on its next resync of pending/.
+	queuePath := cfg.Relay.GetQueuePath()
+	queue, err := openExistingRelayQueue(queuePath, cfg.Relay.Queue.MaxAttempts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error accessing relay queue: %v\n", err)
+		os.Exit(1)
+	}
 
 	if *messageID == "all" {
 		// Requeue all failed messages
-		entries, err := os.ReadDir(failedDir)
+		entries, err := os.ReadDir(filepath.Join(queuePath, "failed"))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error reading failed queue: %v\n", err)
 			os.Exit(1)
@@ -380,7 +420,7 @@ func handleRelayRequeue(_ context.Context) {
 				id := name[:len(name)-5] // Remove .json extension
 
 				// Reset metadata
-				if err := requeueMessage(failedDir, pendingDir, id); err != nil {
+				if err := queue.Requeue(id); err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: Could not requeue %s: %v\n", id, err)
 				} else {
 					requeued++
@@ -391,67 +431,13 @@ func handleRelayRequeue(_ context.Context) {
 		fmt.Printf("Requeued %d messages from failed to pending queue\n", requeued)
 	} else {
 		// Requeue specific message
-		if err := requeueMessage(failedDir, pendingDir, *messageID); err != nil {
+		if err := queue.Requeue(*messageID); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 
 		fmt.Printf("Requeued message %s from failed to pending queue\n", *messageID)
 	}
-}
-
-func requeueMessage(failedDir, pendingDir, messageID string) error {
-	metadataPath := filepath.Join(failedDir, messageID+".json")
-	messagePath := filepath.Join(failedDir, messageID+".msg")
-
-	// Read metadata
-	data, err := os.ReadFile(metadataPath)
-	if err != nil {
-		return fmt.Errorf("could not read metadata: %w", err)
-	}
-
-	var msg relayqueue.QueuedMessage
-	if err := json.Unmarshal(data, &msg); err != nil {
-		return fmt.Errorf("could not parse metadata: %w", err)
-	}
-
-	// Reset for retry
-	msg.Attempts = 0
-	msg.LastAttempt = time.Time{}
-	msg.NextRetry = time.Now() // Ready for immediate processing
-	msg.Errors = []string{}
-
-	// Write updated metadata to pending
-	updatedData, err := json.MarshalIndent(msg, "", "  ")
-	if err != nil {
-		return fmt.Errorf("could not marshal metadata: %w", err)
-	}
-
-	newMetadataPath := filepath.Join(pendingDir, messageID+".json")
-	if err := os.WriteFile(newMetadataPath, updatedData, 0644); err != nil {
-		return fmt.Errorf("could not write metadata to pending: %w", err)
-	}
-
-	// Copy message body
-	messageBody, err := os.ReadFile(messagePath)
-	if err != nil {
-		// Clean up metadata if body read fails
-		os.Remove(newMetadataPath)
-		return fmt.Errorf("could not read message body: %w", err)
-	}
-
-	newMessagePath := filepath.Join(pendingDir, messageID+".msg")
-	if err := os.WriteFile(newMessagePath, messageBody, 0644); err != nil {
-		// Clean up metadata if body write fails
-		os.Remove(newMetadataPath)
-		return fmt.Errorf("could not write message body to pending: %w", err)
-	}
-
-	// Delete from failed queue
-	os.Remove(metadataPath)
-	os.Remove(messagePath)
-
-	return nil
 }
 
 func printRelayUsage() {
@@ -478,22 +464,22 @@ Examples:
   sora-admin relay list --config config.toml --queue failed --limit 50
 
   # Show details for a specific message
-  sora-admin relay show --config config.toml --id a1b2c3d4-e5f6 --queue failed
+  sora-admin relay show --config config.toml --id 3f2b9c1e-8d4a-4f6b-9a7e-2c5d1e0f4b8a --queue failed
 
   # Delete a specific failed message
-  sora-admin relay delete --config config.toml --id a1b2c3d4-e5f6 --queue failed --confirm
+  sora-admin relay delete --config config.toml --id 3f2b9c1e-8d4a-4f6b-9a7e-2c5d1e0f4b8a --queue failed --confirm
 
   # Delete all failed messages
   sora-admin relay delete --config config.toml --id all --queue failed --confirm
 
   # Requeue a single failed message
-  sora-admin relay requeue --config config.toml --id a1b2c3d4-e5f6 --confirm
+  sora-admin relay requeue --config config.toml --id 3f2b9c1e-8d4a-4f6b-9a7e-2c5d1e0f4b8a --confirm
 
   # Requeue all failed messages
   sora-admin relay requeue --config config.toml --id all --confirm
 
 Notes:
-  - The relay queue must be enabled in config.toml
+  - The relay queue is used whenever [relay] is configured (there is no separate switch)
   - Use --confirm flag for destructive operations (delete, requeue)
   - Queue types: pending, processing, failed
   - Requeue resets attempt count and clears error history

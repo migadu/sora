@@ -33,6 +33,7 @@ type FakeS3 struct {
 	mu          sync.Mutex
 	objects     map[string][]byte
 	hangGets    bool                // when set, GET holds the connection open until the client gives up
+	failPuts    bool                // when set, every PutObject is refused with AccessDenied
 	failDeletes bool                // when set, every delete is refused with AccessDenied
 	onDelete    func(keys []string) // called before a delete is applied, outside the lock
 	onGet       func(key string)    // called before a GET responds, outside the lock
@@ -61,6 +62,15 @@ func (f *FakeS3) HangGets(hang bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.hangGets = hang
+}
+
+// FailPuts makes every PutObject fail with AccessDenied, so uploads stall and bodies
+// stay in the uploader's staging directory. Server-side copies are not affected.
+// Pass false to restore.
+func (f *FakeS3) FailPuts(fail bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failPuts = fail
 }
 
 // FailDeletes makes every DeleteObject and every key of a DeleteObjects request fail
@@ -142,6 +152,11 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.mu.Lock()
+		if f.failPuts {
+			f.mu.Unlock()
+			writeS3Error(w, http.StatusForbidden, "AccessDenied", key)
+			return
+		}
 		f.objects[key] = body
 		f.mu.Unlock()
 		w.Header().Set("ETag", etag(body))

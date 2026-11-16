@@ -18,6 +18,11 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 	// anything. Sora persists at most one attribute per mailbox.
 	var specialUse string
 	if options != nil && len(options.SpecialUse) > 0 {
+		// RFC 6154 §3: "Clients MUST NOT use the "USE" parameter unless the
+		// server advertises the capability", CREATE-SPECIAL-USE.
+		if err := s.requireCapability(imap.CapCreateSpecialUse, "CREATE USE"); err != nil {
+			return err
+		}
 		var useErr *imap.Error
 		specialUse, useErr = validateSpecialUse(options.SpecialUse)
 		if useErr != nil {
@@ -40,32 +45,24 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
-	// Reject path-traversal segments ("." / "..") up front with a clean client
-	// error. These names would let the maildir exporter escape its target
-	// directory; db.CreateMailbox enforces this too, but checking here avoids a
-	// misleading SERVERBUG response and short-circuits parent auto-creation.
-	if helpers.MailboxNameHasTraversal(name) {
-		s.DebugLog("rejecting mailbox name with path traversal segment", "name", name)
+	// RFC 9051 §6.3.4: a trailing hierarchy separator is an intent marker, and
+	// "the name created is without the trailing hierarchy delimiter", so CREATE
+	// "foo/" creates the mailbox "foo". Trimmed before the existence check, the
+	// shared-namespace check and creation so the name is canonical. Each superior
+	// name CREATE makes is a level of the name, so an empty level ("x//y",
+	// "/lead") is refused up front with a clean client error before any parent is
+	// created, as is a "." / ".." level, which would let the maildir exporter
+	// escape its target directory. db.CreateMailbox refuses these names too.
+	created, err := helpers.MailboxNameToCreate(name)
+	if err != nil {
+		s.DebugLog("rejecting invalid mailbox name", "name", name)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeCannot,
 			Text: "Invalid mailbox name",
 		}
 	}
-
-	// RFC 3501 §6.3.3: a trailing hierarchy separator is an intent marker
-	// ("this mailbox may have inferiors"), not part of the stored name — so
-	// CREATE "foo/" creates the mailbox "foo". Trim it before the existence
-	// check, the shared-namespace check, and creation so the name is canonical.
-	name = strings.TrimRight(name, string(consts.MailboxDelimiter))
-	if name == "" {
-		s.DebugLog("rejecting empty mailbox name after trimming trailing separators")
-		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeCannot,
-			Text: "Invalid mailbox name",
-		}
-	}
+	name = created
 
 	// Add config to context for shared mailbox detection
 	if s.server.config != nil {
@@ -74,20 +71,17 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 
 	// Prevent creating the shared namespace root explicitly
 	// Users should create "Shared/Something", not just "Shared"
-	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
-		sharedPrefix := strings.TrimSuffix(s.server.config.SharedMailboxes.NamespacePrefix, "/")
-		if strings.EqualFold(name, sharedPrefix) {
-			s.DebugLog("cannot create shared namespace root explicitly", "name", name)
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeCannot,
-				Text: "Cannot create the shared namespace root directly. Create mailboxes under it instead (e.g., Shared/FolderName)",
-			}
+	if s.server.config != nil && s.server.config.SharedMailboxes.IsNamespaceRoot(name) {
+		s.DebugLog("cannot create shared namespace root explicitly", "name", name)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeCannot,
+			Text: "Cannot create the shared namespace root directly. Create mailboxes under it instead (e.g., Shared/FolderName)",
 		}
 	}
 
 	// Check if mailbox already exists
-	_, err := s.server.rdb.GetMailboxByNameForRightWithRetry(ctx, AccountID, name, db.ACLRightCreate)
+	_, err = s.server.rdb.GetMailboxByNameForRightWithRetry(ctx, AccountID, name, db.ACLRightCreate)
 	if err == nil {
 		s.DebugLog("mailbox already exists", "mailbox", name)
 		return &imap.Error{
@@ -319,11 +313,12 @@ func validateSpecialUse(attrs []imap.MailboxAttr) (string, *imap.Error) {
 // [shared_mailboxes] allow_user_create is false (the default). Administrators create
 // those (sora-admin mailbox create). Inside an existing shared mailbox the ACL's 'k'
 // right decides, as anywhere else. A personal mailbox found under a parent's name
-// does not count: the User API and Sieve fileinto :create make personal mailboxes
-// under the prefix, and personal ones in any case variant of it ("shared/Team")
-// predate case-insensitive namespace matching. accountID is the account whose view
-// resolves the parents; with ownedOnly only its own shared mailboxes count, as for
-// RENAME, which keeps a mailbox with its owner.
+// does not count: the User API, import maildir and Sieve fileinto :create made
+// personal mailboxes under the prefix before they refused or shared such names, and
+// personal ones in any case variant of it ("shared/Team") predate case-insensitive
+// namespace matching. accountID is the account whose view resolves the parents; with
+// ownedOnly only its own shared mailboxes count, as for RENAME, which keeps a mailbox
+// with its owner.
 func (s *IMAPSession) sharedCreateRefusal(ctx context.Context, accountID int64, name string, ownedOnly bool) error {
 	refused, err := s.isRefusedSharedRoot(ctx, accountID, name, ownedOnly)
 	if err != nil {
@@ -364,7 +359,7 @@ func (s *IMAPSession) isRefusedSharedRoot(ctx context.Context, accountID int64, 
 			break
 		}
 		parent = parent[:separator]
-		if strings.EqualFold(parent, strings.TrimSuffix(shared.NamespacePrefix, "/")) || !shared.InNamespace(parent) {
+		if shared.IsNamespaceRoot(parent) || !shared.InNamespace(parent) {
 			break
 		}
 		mbox, err := s.server.rdb.GetSharedMailboxByNameForRightWithRetry(ctx, accountID, parent, db.ACLRightCreate)

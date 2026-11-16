@@ -754,11 +754,24 @@ func TestWorkerCircuitBreakerErrorHandling(t *testing.T) {
 			}
 			defer worker.Stop()
 
-			// Wait for multiple processing cycles
-			// First cycle: CB error -> message released back to queue
-			// Second cycle: CB error again -> message released back to queue
-			// Third cycle: Success
-			time.Sleep(200 * time.Millisecond)
+			// Wait for both delivery and the durable queue transition. The first two
+			// cycles release the message after a breaker error; the third succeeds.
+			// Scheduling and disk writes may outlast a fixed number of tick intervals.
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				pending, processing, failed, err := queue.GetStats()
+				if err != nil {
+					t.Fatalf("Failed to check queue completion: %v", err)
+				}
+				if handler.getMessageCount() == 1 && pending == 0 && processing == 0 && failed == 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("Delivery did not complete: messages=%d calls=%d pending=%d processing=%d failed=%d",
+						handler.getMessageCount(), handler.getCallCount(), pending, processing, failed)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
 
 			// Verify message was eventually delivered
 			if handler.getMessageCount() != 1 {
@@ -854,6 +867,9 @@ func TestWorkerCircuitBreakerNoInfiniteLoop(t *testing.T) {
 	}
 
 success:
+	// A handler's success precedes durable local terminal cleanup. Join workers
+	// before asserting that all queue files have been removed.
+	worker.Stop()
 	t.Logf("All 8 messages delivered after %d total handler calls", handler.getCallCount())
 
 	// Verify queue is empty

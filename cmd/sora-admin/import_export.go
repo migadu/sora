@@ -50,9 +50,7 @@ func handleImportMaildir(ctx context.Context) {
 	batchTxMode := fs.Bool("batch-transaction", false, "Use single transaction per batch (20x faster but less resilient)")
 	dryRun := fs.Bool("dry-run", false, "Preview what would be imported without making changes")
 	preserveFlags := fs.Bool("preserve-flags", true, "Preserve maildir flags (Seen, Answered, etc)")
-	showProgress := fs.Bool("progress", true, "Show import progress")
-	delay := fs.Duration("delay", 0, "Delay between operations to control rate (e.g. 500ms)")
-	forceReimport := fs.Bool("force-reimport", false, "Force reimport of messages even if they already exist")
+	delay := fs.Duration("delay", 0, "Wait before each message, per job, to control the rate (e.g. 500ms)")
 	cleanupDB := fs.Bool("cleanup-db", false, "Remove the SQLite import database after successful import")
 	dovecot := fs.Bool("dovecot", false, "Process Dovecot-specific files (subscriptions, keywords, uidlist)")
 	sievePath := fs.String("sieve", "", "Path to Sieve script file to import for the user")
@@ -72,15 +70,13 @@ Usage:
 
 Options:
   --email string          Email address for the account to import mail to (required)
-  --maildir-path string   Path to the maildir root directory (must contain cur/, new/, tmp/) (required)
+  --maildir-path string   Path to the maildir root directory (must contain cur/ or new/) (required)
   --jobs int              Number of parallel import jobs (default: 4)
   --batch-size int        Number of messages to process in each batch (default: 20)
   --batch-transaction     Use single transaction per batch (20x faster but less resilient, default: false)
   --dry-run               Preview what would be imported without making changes
   --preserve-flags        Preserve maildir flags (default: true)
-  --progress              Show import progress (default: true)
-  --delay duration        Delay between operations to control rate (e.g. 500ms)
-  --force-reimport        Force reimport of messages even if they already exist
+  --delay duration        Wait before each message, per job, to control the rate (e.g. 500ms)
   --cleanup-db            Remove the SQLite import database after successful import
   --incremental           Skip messages already marked as imported in SQLite cache (default: false = read all)
   --dovecot               Process Dovecot-specific files (subscriptions, dovecot-keywords, dovecot-uidlist)
@@ -95,7 +91,7 @@ Options:
                           (default: [cleanup] fts_retention from the config; unset = index all)
   --config string        Path to TOML configuration file (required)
 
-IMPORTANT: --maildir-path must point to a maildir root directory (containing cur/, new/, tmp/ subdirectories),
+IMPORTANT: --maildir-path must point to a maildir root directory (containing cur/ or new/ subdirectories),
 not to a parent directory containing multiple maildirs.
 
 The --incremental flag controls whether to use the SQLite cache to skip already-imported messages:
@@ -154,6 +150,16 @@ Examples:
 	if *maildirPath == "" {
 		fmt.Printf("Error: --maildir-path is required\n\n")
 		fs.Usage()
+		os.Exit(1)
+	}
+
+	if *jobs < 1 {
+		fmt.Printf("Error: --jobs must be at least 1\n")
+		os.Exit(1)
+	}
+
+	if *batchSize < 1 {
+		fmt.Printf("Error: --batch-size must be at least 1\n")
 		os.Exit(1)
 	}
 
@@ -231,8 +237,6 @@ Examples:
 		EndDate:              endDateParsed,
 		MailboxFilter:        mailboxList,
 		PreserveFlags:        *preserveFlags,
-		ShowProgress:         *showProgress,
-		ForceReimport:        *forceReimport,
 		CleanupDB:            *cleanupDB,
 		Dovecot:              *dovecot,
 		ImportDelay:          *delay,
@@ -246,6 +250,7 @@ Examples:
 		MaxMessageSize:       globalConfig.GetImportMessageLimit(),
 		PathsFile:            *pathsFile,
 		FTSRetention:         ftsRetentionParsed,
+		SharedMailboxes:      globalConfig.SharedMailboxes,
 	}
 
 	importer, err := NewImporter(ctx, *maildirPath, *email, *jobs, rdb, s3, options)
@@ -269,8 +274,7 @@ func handleImportS3(ctx context.Context) {
 	maxObjects := fs.Int("max-objects", 0, "Maximum number of objects to process (0 = unlimited)")
 	workers := fs.Int("workers", 5, "Number of concurrent workers")
 	dryRun := fs.Bool("dry-run", false, "Show what would be imported without making changes")
-	showProgress := fs.Bool("show-progress", true, "Show import progress")
-	forceReimport := fs.Bool("force-reimport", false, "Force reimport even if message already exists")
+	forceReimport := fs.Bool("force-reimport", false, "Import into INBOX even when another mailbox of the account holds the message")
 	cleanupDB := fs.Bool("cleanup-db", true, "Cleanup temporary database when done")
 	importDelay := fs.Duration("import-delay", 0, "Delay between imports to control rate")
 	continuationToken := fs.String("continuation-token", "", "S3 continuation token to resume from")
@@ -285,6 +289,9 @@ func handleImportS3(ctx context.Context) {
 	// Validate required flags
 	if *email == "" {
 		logger.Fatal("--email is required (e.g., 'user@example.com')")
+	}
+	if *workers < 1 {
+		logger.Fatal("--workers must be at least 1")
 	}
 	ftsRetentionParsed, err := resolveImportFTSRetention(*ftsRetention)
 	if err != nil {
@@ -319,7 +326,6 @@ func handleImportS3(ctx context.Context) {
 		DryRun:            *dryRun,
 		BatchSize:         *batchSize,
 		MaxObjects:        *maxObjects,
-		ShowProgress:      *showProgress,
 		ForceReimport:     *forceReimport,
 		CleanupDB:         *cleanupDB,
 		ImportDelay:       *importDelay,
@@ -331,7 +337,7 @@ func handleImportS3(ctx context.Context) {
 		FTSRetention: ftsRetentionParsed,
 	}
 
-	importer, err := NewS3Importer(rdb, s3, options)
+	importer, err := NewS3Importer(ctx, rdb, s3, options)
 	if err != nil {
 		logger.Fatalf("Failed to create S3 importer: %v", err)
 	}
@@ -369,7 +375,6 @@ func handleExportMaildir(ctx context.Context) {
 	maildirPath := fs.String("maildir-path", "", "Path where the maildir will be created/updated (required)")
 	jobs := fs.Int("jobs", 4, "Number of parallel export jobs")
 	dryRun := fs.Bool("dry-run", false, "Preview what would be exported without making changes")
-	showProgress := fs.Bool("progress", true, "Show export progress")
 	delay := fs.Duration("delay", 0, "Delay between operations to control rate (e.g. 500ms)")
 	dovecot := fs.Bool("dovecot", false, "Export Dovecot-specific files (subscriptions and dovecot-uidlist)")
 	exportUIDList := fs.Bool("export-dovecot-uidlist", false, "Export dovecot-uidlist files with UID mappings")
@@ -389,7 +394,6 @@ Options:
   --maildir-path string   Path where the maildir will be created/updated (required)
   --jobs int              Number of parallel export jobs (default: 4)
   --dry-run               Preview what would be exported without making changes
-  --progress              Show export progress (default: true)
   --delay duration        Delay between operations to control rate (e.g. 500ms)
   --dovecot               Export Dovecot-specific files (subscriptions, dovecot-uidlist)
   --export-dovecot-uidlist Export dovecot-uidlist files with UID mappings (implied by --dovecot)
@@ -399,9 +403,10 @@ Options:
   --end-date string       Export only messages before this date (YYYY-MM-DD)
   --config string        Path to TOML configuration file (required)
 
-The exporter creates a SQLite database (sora-export.db) in the maildir path to track
-exported messages and avoid duplicates. If exporting to an existing maildir, messages
-with the same content hash will be skipped unless --overwrite-flags is specified.
+The exporter keeps a SQLite database (sora-maildir.db, the same file import maildir uses)
+in the maildir path to track exported messages and avoid duplicates. If exporting to an
+existing maildir, messages with the same content hash will be skipped unless
+--overwrite-flags is specified.
 
 Examples:
   # Export all mail to a new maildir
@@ -436,6 +441,11 @@ Examples:
 	if *maildirPath == "" {
 		fmt.Printf("Error: --maildir-path is required\n\n")
 		fs.Usage()
+		os.Exit(1)
+	}
+
+	if *jobs < 1 {
+		fmt.Printf("Error: --jobs must be at least 1\n")
 		os.Exit(1)
 	}
 
@@ -500,7 +510,6 @@ Examples:
 		StartDate:      startDateParsed,
 		EndDate:        endDateParsed,
 		MailboxFilter:  mailboxList,
-		ShowProgress:   *showProgress,
 		Dovecot:        *dovecot,
 		OverwriteFlags: *overwriteFlags,
 		ExportDelay:    *delay,
@@ -528,7 +537,6 @@ Subcommands:
   maildir        Import maildir data
   s3             Import messages from S3 storage (recovery scenario)
   rekey          Re-key bodies an older import stored under their SHA-256 digest
-  fix-subscriptions  Fix subscription status for default mailboxes
 
 Examples:
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir

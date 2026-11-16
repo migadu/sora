@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -57,7 +58,7 @@ type adminAPILogger struct {
 
 func (l *adminAPILogger) Log(format string, args ...any) {
 	// Log with prefix to identify HTTP delivery path
-	logger.Debug("Mail delivery", "msg", fmt.Sprintf(format, args...))
+	logger.Debug("Mail delivery", "detail", fmt.Sprintf(format, args...))
 }
 
 // defaultMaxMessageSize is used to cap the mail-injection body when the server's
@@ -176,7 +177,7 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Parse message to extract recipients if not provided
-	messageEntity, err := message.Read(bytes.NewReader(messageBytes))
+	messageEntity, err := server.ParseMessage(bytes.NewReader(messageBytes))
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid RFC822 message: %v", err))
 		return
@@ -291,11 +292,12 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 	// Create delivery context with relay queue
 	vacationOracle := &delivery.VacationOracle{RDB: s.rdb}
 	vacationHandler := &delivery.StandardVacationHandler{
-		Hostname:       s.hostname,
-		RelayQueue:     s.relayQueue,
-		Logger:         logger,
-		IsOwnedAddress: s.rdb.IsAddressOwnedByAccountWithRetry,
-		RelayNotify:    s.notifyRelayWorker,
+		Hostname:          s.hostname,
+		RelayQueue:        s.relayQueue,
+		Logger:            logger,
+		IsOwnedAddress:    s.rdb.IsAddressOwnedByAccountWithRetry,
+		IsAnyOwnedAddress: s.rdb.IsAnyAddressOwnedByAccountWithRetry,
+		RelayNotify:       s.notifyRelayWorker,
 	}
 
 	deliveryCtx := &delivery.DeliveryContext{
@@ -359,8 +361,9 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 		// Storage, the database, the staging limit, or a commit whose outcome is
 		// unknown: the message may land on a retry (or already has, and the retry is
 		// absorbed by the delivery-hash check). Never a 4xx the injector would honour
-		// by dropping the message.
-		status.Transient = true
+		// by dropping the message. A message too large to store never lands, so that
+		// one is the request's fault, as a body above max_message_size is.
+		status.Transient = !errors.Is(err, delivery.ErrMessageTooLarge)
 		return status
 	}
 

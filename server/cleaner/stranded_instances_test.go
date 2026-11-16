@@ -56,7 +56,7 @@ func expectRoutineCleanupCalls(mockDB *mockDatabase, ctx context.Context) {
 	mockDB.On("CleanupOldRedirectsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.UserScopedObjectForCleanup{}, nil).Once()
-	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything).Return([]db.FTSKey{}, nil).Once()
+	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.FTSKey{}, db.FTSKey{}, nil).Once()
 	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 }
 
@@ -70,7 +70,7 @@ func TestCleanupWorker_ReportsStrandedInstances(t *testing.T) {
 	mockCache := new(mockCache)
 	ctx := context.Background()
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,

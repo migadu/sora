@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -351,4 +352,28 @@ func TestMarkMessagesAsNotUploaded(t *testing.T) {
 	require.NoError(t, err)
 	_, err = db.GetWritePool().Exec(ctx, "DELETE FROM accounts WHERE id = $1", accountID)
 	require.NoError(t, err)
+}
+
+// TestDBMessageEmptyListsEncodeAsArrays: the User API documents flags and to as
+// arrays. A message with no system flag (every new unread one) and no To address must
+// encode them as [], not null, built the way the list, search and get-by-ID readers
+// build it (#688).
+func TestDBMessageEmptyListsEncodeAsArrays(t *testing.T) {
+	for name, recipientsJSON := range map[string][]byte{
+		"from only":          []byte(`[{"type":"from","email":"sender@example.com"}]`),
+		"no recipients_json": nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			msg := &DBMessage{}
+			msg.setRecipients(recipientsJSON)
+			msg.Flags = bitwiseFlagsToStrings(0)
+
+			encoded, err := json.Marshal(msg)
+			require.NoError(t, err)
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(encoded, &fields))
+			assert.Equal(t, "[]", string(fields["flags"]), "flags in %s", encoded)
+			assert.Equal(t, "[]", string(fields["to"]), "to in %s", encoded)
+		})
+	}
 }

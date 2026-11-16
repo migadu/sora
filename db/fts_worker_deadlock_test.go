@@ -114,7 +114,10 @@ func TestFTSLockConflictNeverPoisonsGoodBody(t *testing.T) {
 		t.Skip("Skipping database integration test in short mode")
 	}
 
-	db, _, accountID, _ := setupCleanerTestDatabase(t)
+	// A database of its own: worker A's one-row batch and the batches after it poll the whole
+	// FTS queue oldest first, so in the shared database an older queued row would take A's
+	// poll (the conflict below never happens) and 500 of them would leave a1 unindexed.
+	db, _, accountID, _ := setupCleanerTestDatabaseWithSuffix(t, "_ftsqueue")
 	t.Cleanup(db.Close) // registered first, so it runs after every other cleanup
 
 	ctx := context.Background()

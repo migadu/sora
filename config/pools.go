@@ -5,6 +5,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // PoolConfig is one named group of backend hosts, declared once per node as a `[[pool]]`
@@ -28,7 +29,7 @@ type PoolConfig struct {
 	Default bool `toml:"default"`
 
 	RemoteTLS              bool  `toml:"remote_tls"`
-	RemoteTLSUseStartTLS   bool  `toml:"remote_tls_use_starttls"` // LMTP/ManageSieve; IMAP/POP3/User API use implicit TLS
+	RemoteTLSUseStartTLS   bool  `toml:"remote_tls_use_starttls"` // IMAP/POP3/LMTP/ManageSieve; the User API proxy has no STARTTLS
 	RemoteTLSVerify        *bool `toml:"remote_tls_verify"`       // default true
 	RemoteUseProxyProtocol bool  `toml:"remote_use_proxy_protocol"`
 	RemoteUseIDCommand     bool  `toml:"remote_use_id_command"` // IMAP only
@@ -61,6 +62,7 @@ func (c *Config) DefaultPool() *PoolConfig {
 
 // ValidatePools checks the [[pool]] blocks and how the proxy servers relate to them:
 //   - every pool has a name without whitespace, unique among pools, and at least one backend;
+//   - no backend is empty or contains whitespace;
 //   - a backend belongs to exactly one pool and appears once, whatever letter case or IP
 //     spelling it is written with. A backend without a port stands for its host on every
 //     proxy's remote_port, so it clashes with any other entry for that host; entries with
@@ -102,6 +104,11 @@ func (c *Config) ValidatePools() error {
 			host, port := poolBackendHost(b)
 			if host == "" {
 				return fmt.Errorf("[[pool]] %q: empty backend address", p.Name)
+			}
+			// The loader trims the ends, and the proxy dials what is left as is: whitespace
+			// inside ("192.0.2.10 :143") is a name that never resolves.
+			if strings.ContainsFunc(b, unicode.IsSpace) {
+				return fmt.Errorf("[[pool]] %q: backend %q contains whitespace", p.Name, b)
 			}
 			other, clash := bareHosts[host]
 			if !clash {

@@ -49,7 +49,8 @@ func isTransientError(err error) bool {
 		errors.Is(err, db.ErrConnectionRefused) ||
 		errors.Is(err, db.ErrTooManyClients) ||
 		errors.Is(err, db.ErrMaxClientConn) ||
-		errors.Is(err, db.ErrFailedToConnect) {
+		errors.Is(err, db.ErrFailedToConnect) ||
+		errors.Is(err, db.ErrConnectionClosed) {
 		return true
 	}
 

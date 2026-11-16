@@ -67,7 +67,7 @@ type Server struct {
 	useStartTLS        bool        // The listener is plaintext and sessions upgrade it on STARTTLS
 	startTLSConfig     *tls.Config // What sessions upgrade with on STARTTLS (set by Start); nil when STARTTLS is not offered
 	enableAffinity     bool
-	wg                 sync.WaitGroup
+	sessions           server.SessionGroup // Session goroutines, which Stop drains
 	ctx                context.Context
 	cancel             context.CancelFunc
 	authLimiter        server.AuthLimiter
@@ -179,6 +179,7 @@ type ServerOptions struct {
 	RemoteTLS                bool
 	RemoteTLSUseStartTLS     bool // Dial the backend in plaintext and upgrade with STARTTLS after its greeting (requires RemoteTLS)
 	RemoteTLSVerify          bool
+	RemoteTLSCAFile          string // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
 	RemoteUseProxyProtocol   bool
 	ConnectTimeout           time.Duration
 	AuthIdleTimeout          time.Duration
@@ -198,7 +199,7 @@ type ServerOptions struct {
 	MaxConnections      int              // Maximum total connections per instance (0 = unlimited, local only)
 	MaxConnectionsPerIP int              // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
 	TrustedNetworks     []string         // CIDR blocks for trusted networks that bypass per-IP limits
-	ListenBacklog       int              // TCP listen backlog size (0 = system default; recommended: 4096-8192)
+	ListenBacklog       int              // TCP listen backlog size (0 = 1024; recommended: 4096-8192)
 	ClusterManager      *cluster.Manager // Optional: shares per-IP connection counts and auth rate limits with the cluster
 
 	ClusterRateLimitSync config.ClusterRateLimitSyncConfig // [cluster.rate_limit_sync]; read only with ClusterManager
@@ -254,17 +255,14 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	if opts.RemoteLookup.Enabled {
 		remotelookupClient, err := proxy.InitializeRemoteLookup("imap", opts.RemoteLookup, opts.RemotePort)
 		if err != nil {
-			logger.Error("Failed to initialize remotelookup client", "proxy", opts.Name, "error", err)
-			if !opts.RemoteLookup.ShouldLookupLocalUsers() {
-				cancel()
-				return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
-			}
-			logger.Warn("Continuing without remotelookup due to lookup_local_users=true", "proxy", opts.Name)
-		} else {
-			routingLookup = remotelookupClient
-			if opts.Debug {
-				logger.Debug("RemoteLookup client initialized successfully", "proxy", opts.Name)
-			}
+			// Also with lookup_local_users, which adds the database for the users the
+			// lookup does not know and does not make the lookup optional.
+			cancel()
+			return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
+		}
+		routingLookup = remotelookupClient
+		if opts.Debug {
+			logger.Debug("RemoteLookup client initialized successfully", "proxy", opts.Name)
 		}
 	}
 
@@ -274,6 +272,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		RemoteAddrs:        opts.RemoteAddrs,
 		RemotePort:         opts.RemotePort,
 		Settings:           proxy.BackendSettings{TLS: opts.RemoteTLS, TLSUseStartTLS: opts.RemoteTLSUseStartTLS, TLSVerify: opts.RemoteTLSVerify, UseProxyProtocol: opts.RemoteUseProxyProtocol},
+		RemoteTLSCAFile:    opts.RemoteTLSCAFile,
 		ConnectTimeout:     connectTimeout,
 		RoutingLookup:      routingLookup,
 		ServerName:         opts.Name,
@@ -381,7 +380,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(opts.Name)
 		maxSize := lookupCacheConfig.GetMaxSize()
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("imap_proxy", opts.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("IMAP Proxy: Lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	} else {
 		logger.Info("IMAP Proxy: Lookup cache disabled", "name", opts.Name)
@@ -470,40 +469,20 @@ func (s *Server) connConfig() server.SoraConnConfig {
 // Start starts the IMAP proxy server.
 func (s *Server) Start() error {
 
-	// Three TLS scenarios:
-	// 1. Per-server TLS: cert files provided
-	// 2. Global TLS: tls=true, no cert files, global TLS config provided
-	// 3. No TLS: tls=false
+	// The certificate source and tls_verify follow the rule every listener
+	// shares (server.ListenerTLS).
 	var tlsConfig *tls.Config
-	if s.tls && s.tlsCertFile != "" && s.tlsKeyFile != "" {
-		// Scenario 1: Per-server TLS with explicit cert files
-		cert, err := tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile)
+	if s.tls {
+		var err error
+		tlsConfig, err = server.ListenerTLS{
+			Protocol: "IMAP proxy", Name: s.name,
+			CertFile: s.tlsCertFile, KeyFile: s.tlsKeyFile, Verify: s.tlsVerify,
+			Global: s.tlsConfig, ALPN: []string{"imap"},
+		}.Config()
 		if err != nil {
 			s.cancel()
-			return fmt.Errorf("failed to load TLS certificate: %w", err)
+			return err
 		}
-
-		clientAuth := tls.NoClientCert
-		if s.tlsVerify {
-			clientAuth = tls.RequireAndVerifyClientCert
-		}
-
-		tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			ClientAuth:               clientAuth,
-			ServerName:               s.hostname,
-			PreferServerCipherSuites: true,
-			NextProtos:               []string{"imap"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-	} else if s.tls && s.tlsConfig != nil {
-		// Scenario 2: Global TLS manager
-		tlsConfig = s.tlsConfig
-	} else if s.tls {
-		// TLS enabled but no cert files and no global TLS config provided
-		s.cancel()
-		return fmt.Errorf("TLS enabled for IMAP proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", s.name)
 	}
 
 	s.listenerMu.Lock()
@@ -526,6 +505,15 @@ func (s *Server) Start() error {
 		}
 	}
 	s.listenerMu.Unlock()
+
+	// Stop cancels s.ctx before it looks for a listener to close, so a Stop
+	// that ran before the listener existed (cmd/sora calls it from a context
+	// watcher that races Start) found none. Checked once the listener is set,
+	// either Stop closes it or this does: never serve after Stop.
+	if s.ctx.Err() != nil {
+		s.listener.Close()
+		return nil
+	}
 
 	// Start connection limiter cleanup if enabled
 	if s.limiter != nil {
@@ -565,10 +553,11 @@ func (s *Server) acceptConnections() error {
 			}
 		}
 
-		// Check connection limits before processing
+		// Check connection limits before processing. Behind a PROXY-protocol load
+		// balancer the per-IP limit counts the client its header names.
 		var releaseConn func()
 		if s.limiter != nil {
-			releaseConn, err = s.limiter.AcceptWithRealIP(conn.RemoteAddr(), "")
+			releaseConn, err = s.limiter.AcceptWithRealIP(conn.RemoteAddr(), server.GetRealClientIP(conn, server.GetProxyProtocolInfo(conn)))
 			if err != nil {
 				logger.Info("Connection rejected", "proxy", s.name, "error", err)
 				conn.Close()
@@ -576,10 +565,7 @@ func (s *Server) acceptConnections() error {
 			}
 		}
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-
+		started := s.sessions.Go(func() {
 			// Track proxy connection
 			metrics.ConnectionsTotal.WithLabelValues("imap_proxy", s.name, s.hostname).Inc()
 			metrics.ConnectionsCurrent.WithLabelValues("imap_proxy", s.name, s.hostname).Inc()
@@ -595,6 +581,9 @@ func (s *Server) acceptConnections() error {
 			}
 			session.releaseConn = releaseConn // Set cleanup function on session
 			s.addSession(session)
+			if s.sessions.IsDraining() {
+				server.RawConn(conn).Close()
+			}
 
 			// CRITICAL: Panic recovery MUST call removeSession to prevent leak
 			defer func() {
@@ -616,7 +605,15 @@ func (s *Server) acceptConnections() error {
 			// Note: removeSession is called in session.close(), which is deferred in handleConnection()
 			// This ensures cleanup happens when the session ends, not when the goroutine exits
 			session.handleConnection()
-		}()
+		})
+		if !started {
+			// Stop is draining the sessions and no longer waits for new ones.
+			conn.Close()
+			if releaseConn != nil {
+				releaseConn()
+			}
+			return nil
+		}
 	}
 }
 
@@ -627,6 +624,12 @@ func (s *Server) SetConnectionTracker(tracker *server.ConnectionTracker) {
 	if tracker != nil && s.lookupCache != nil {
 		tracker.SetLookupCache(s.lookupCache)
 	}
+}
+
+// GetLookupCache returns the server's cache of logins (nil when disabled), so that a
+// changed account's cached logins can be dropped (see credchanges.Watcher).
+func (s *Server) GetLookupCache() *lookupcache.LookupCache {
+	return s.lookupCache
 }
 
 // GetConnectionTracker returns the connection tracker for testing
@@ -641,6 +644,7 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 
 // Stop stops the IMAP proxy server.
 func (s *Server) Stop() error {
+	s.sessions.BeginDrain()
 	logger.Info("Stopping proxy server", "proxy", s.name)
 
 	// Unregister rate limiter from global registry
@@ -664,16 +668,9 @@ func (s *Server) Stop() error {
 		listener.Close()
 	}
 
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(30 * time.Second) {
 		logger.Info("Proxy server stopped gracefully", "proxy", s.name)
-	case <-time.After(30 * time.Second):
+	} else {
 		logger.Warn("Proxy server stop timeout", "proxy", s.name)
 	}
 
@@ -694,6 +691,10 @@ func (s *Server) Stop() error {
 		if err := s.lookupCache.Stop(stopCtx); err != nil {
 			logger.Error("Error stopping auth cache", "proxy", s.name, "error", err)
 		}
+	}
+
+	if s.authLimiter != nil {
+		s.authLimiter.Stop()
 	}
 
 	return nil
@@ -821,15 +822,23 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 		next.maxAuthErrors = newVal
 		reloaded = append(reloaded, "max_auth_errors")
 	}
-	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != next.authIdleTimeout {
+	// A value that does not parse keeps the running one (start-up, which has none,
+	// uses the default).
+	if timeout, err := cfg.GetAuthIdleTimeout(); err != nil {
+		logger.Warn("IMAP proxy config reload: invalid auth_idle_timeout, keeping the running value", "name", s.name, "error", err, "running", next.authIdleTimeout)
+	} else if timeout != next.authIdleTimeout {
 		next.authIdleTimeout = timeout
 		reloaded = append(reloaded, "auth_idle_timeout")
 	}
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("IMAP proxy config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.commandTimeout)
+	} else if timeout != next.commandTimeout {
 		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("IMAP proxy config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}

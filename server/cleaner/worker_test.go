@@ -88,9 +88,9 @@ func (m *mockDatabase) PruneOldMessageVectorsWithRetry(ctx context.Context, rete
 	args := m.Called(ctx, retention)
 	return args.Get(0).(int64), args.Error(1)
 }
-func (m *mockDatabase) GetUnusedFTSKeysWithRetry(ctx context.Context, limit int) ([]db.FTSKey, error) {
-	args := m.Called(ctx, limit)
-	return args.Get(0).([]db.FTSKey), args.Error(1)
+func (m *mockDatabase) GetUnusedFTSKeysWithRetry(ctx context.Context, after db.FTSKey, limit int) ([]db.FTSKey, db.FTSKey, error) {
+	args := m.Called(ctx, after, limit)
+	return args.Get(0).([]db.FTSKey), args.Get(1).(db.FTSKey), args.Error(2)
 }
 func (m *mockDatabase) DeleteMessagesFTSByKeyBatchWithRetry(ctx context.Context, keys []db.FTSKey) (int64, error) {
 	args := m.Called(ctx, keys)
@@ -156,7 +156,7 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 	healthRetention := 30 * 24 * time.Hour
 	redirectRetention := time.Hour
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    mockS3,
 		cache:                 mockCache,
@@ -199,7 +199,7 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 
 	// Phase 2b: Global resource cleanup (FTS)
 	orphanKeys := []db.FTSKey{{ContentHash: "orphan1", AccountID: 1}, {ContentHash: "orphan2", AccountID: 2}}
-	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, db.BATCH_PURGE_SIZE).Return(orphanKeys, nil).Once()
+	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, db.FTSKey{}, db.BATCH_PURGE_SIZE).Return(orphanKeys, orphanKeys[1], nil).Once()
 	mockDB.On("DeleteMessagesFTSByKeyBatchWithRetry", ctx, orphanKeys).Return(int64(2), nil).Once()
 
 	// Phase 3: Final account deletion
@@ -225,7 +225,7 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 
 func TestCleanupWorker_RunOnce_LockNotAcquired(t *testing.T) {
 	mockDB := new(mockDatabase)
-	worker := &CleanupWorker{rdb: mockDB}
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1", rdb: mockDB}
 	ctx := context.Background()
 
 	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(false, nil).Once()
@@ -242,7 +242,7 @@ func TestCleanupWorker_RunOnce_PartialFailures(t *testing.T) {
 	mockS3 := &mockS3{healthy: true}
 	mockCache := new(mockCache)
 	ctx := context.Background()
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    mockS3,
 		cache:                 mockCache,
@@ -279,7 +279,7 @@ func TestCleanupWorker_RunOnce_S3DeleteFails(t *testing.T) {
 	mockDB := new(mockDatabase)
 	mockS3 := &mockS3{healthy: true}
 	ctx := context.Background()
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    mockS3,
 		maxAgeRestriction:     1 * time.Hour,
@@ -308,7 +308,7 @@ func TestCleanupWorker_RunOnce_S3DeleteFails(t *testing.T) {
 	// DB batch delete should not be called for the failed S3 key
 
 	// The rest of the cleanup should proceed
-	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything).Return([]db.FTSKey{}, nil).Once()
+	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.FTSKey{}, db.FTSKey{}, nil).Once()
 	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	err := worker.runOnce(ctx)
@@ -323,7 +323,7 @@ func TestCleanupWorker_RunOnce_NoOp(t *testing.T) {
 	mockDB := new(mockDatabase)
 	mockCache := new(mockCache)
 	ctx := context.Background()
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,
@@ -339,7 +339,7 @@ func TestCleanupWorker_RunOnce_NoOp(t *testing.T) {
 	mockDB.On("CleanupOldRedirectsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.UserScopedObjectForCleanup{}, nil).Once()
-	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything).Return([]db.FTSKey{}, nil).Once()
+	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.FTSKey{}, db.FTSKey{}, nil).Once()
 	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	err := worker.runOnce(ctx)
@@ -359,7 +359,7 @@ func TestCleanupWorker_RunOnce_VectorPruning(t *testing.T) {
 
 	ftsRetention := 1095 * 24 * time.Hour // 3 years
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,
@@ -380,7 +380,7 @@ func TestCleanupWorker_RunOnce_VectorPruning(t *testing.T) {
 	// Both pruning functions should be called
 	mockDB.On("PruneOldMessageVectorsWithRetry", ctx, ftsRetention).Return(int64(5), nil).Once()
 
-	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything).Return([]db.FTSKey{}, nil).Once()
+	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.FTSKey{}, db.FTSKey{}, nil).Once()
 	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	err := worker.runOnce(ctx)
@@ -395,7 +395,7 @@ func TestCleanupWorker_RunOnce_NoFTSPruningWhenBothZero(t *testing.T) {
 	mockCache := new(mockCache)
 	ctx := context.Background()
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,
@@ -416,7 +416,7 @@ func TestCleanupWorker_RunOnce_NoFTSPruningWhenBothZero(t *testing.T) {
 	// PruneOldMessageVectorsWithRetry should not be called (ftsRetention = 0)
 	// (no On() setup means test will fail if they're called)
 
-	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything).Return([]db.FTSKey{}, nil).Once()
+	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.FTSKey{}, db.FTSKey{}, nil).Once()
 	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	err := worker.runOnce(ctx)
@@ -433,7 +433,7 @@ func TestCleanupWorker_RunOnce_NoFTSRetention(t *testing.T) {
 	mockCache := new(mockCache)
 	ctx := context.Background()
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,
@@ -453,7 +453,7 @@ func TestCleanupWorker_RunOnce_NoFTSRetention(t *testing.T) {
 
 	// Vector pruning should NOT be called (ftsRetention = 0)
 
-	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything).Return([]db.FTSKey{}, nil).Once()
+	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.FTSKey{}, db.FTSKey{}, nil).Once()
 	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	err := worker.runOnce(ctx)
@@ -472,7 +472,7 @@ func TestCleanupWorker_RunOnce_SkipsFailedUploadCleanupWhenS3Unhealthy(t *testin
 	mockCache := new(mockCache)
 	ctx := context.Background()
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    mockS3,
 		cache:                 mockCache,
@@ -492,7 +492,7 @@ func TestCleanupWorker_RunOnce_SkipsFailedUploadCleanupWhenS3Unhealthy(t *testin
 	mockDB.On("CleanupOldRedirectsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.UserScopedObjectForCleanup{}, nil).Once()
-	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything).Return([]db.FTSKey{}, nil).Once()
+	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.FTSKey{}, db.FTSKey{}, nil).Once()
 	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	err := worker.runOnce(ctx)
@@ -512,7 +512,7 @@ func TestCleanupWorker_RunOnce_VectorOnlyPruning(t *testing.T) {
 
 	ftsRetention := 1095 * 24 * time.Hour // 3 years
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,
@@ -533,7 +533,7 @@ func TestCleanupWorker_RunOnce_VectorOnlyPruning(t *testing.T) {
 	// Vector pruning should be called when ftsRetention > 0
 	mockDB.On("PruneOldMessageVectorsWithRetry", ctx, ftsRetention).Return(int64(8), nil).Once()
 
-	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything).Return([]db.FTSKey{}, nil).Once()
+	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.FTSKey{}, db.FTSKey{}, nil).Once()
 	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	err := worker.runOnce(ctx)

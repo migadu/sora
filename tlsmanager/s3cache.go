@@ -34,7 +34,6 @@ const s3OperationTimeout = 5 * time.Second
 type S3Cache struct {
 	client *s3.Client
 	bucket string
-	prefix string // Key prefix for certificate storage (default: "autocert/")
 	// sseAlgorithm is the server-side encryption asked of the store on every write.
 	// Empty sends no header.
 	sseAlgorithm types.ServerSideEncryption
@@ -45,7 +44,7 @@ type S3Cache struct {
 // Every value it stores is private key material - the certificate PEM bundles end
 // with the certificate key, and "acme_account+key" is the ACME account key - so the
 // write must not leave protection at rest to a bucket default nobody enforces.
-const defaultSSEAlgorithm = types.ServerSideEncryptionAes256
+const defaultSSEAlgorithm = types.ServerSideEncryption(config.CertificateSSEAES256)
 
 // S3CacheOption adjusts how the cache stores certificates.
 type S3CacheOption func(*S3Cache)
@@ -61,40 +60,19 @@ func WithServerSideEncryption(algorithm, kmsKeyID string) S3CacheOption {
 	}
 }
 
-// encryptionOptions turns the configured encryption settings into cache options.
-// A configuration that says nothing about encryption keeps defaultSSEAlgorithm; a
-// stray KMS key id with no algorithm is passed through rather than dropped, so
-// validateEncryption can reject it instead of the deployment believing it applies.
+// encryptionOptions turns the configured encryption settings into cache options. A
+// configuration that says nothing about encryption keeps the default; a stray KMS key id
+// with no algorithm is passed through rather than dropped, so validateEncryption can
+// reject it instead of the deployment believing it applies.
 func encryptionOptions(cfg config.TLSLetsEncryptS3Config) []S3CacheOption {
-	if cfg.ServerSideEncryption == nil && cfg.ServerSideEncryptionKMSKeyID == "" {
-		return nil
-	}
-	algorithm := string(defaultSSEAlgorithm)
-	if cfg.ServerSideEncryption != nil {
-		algorithm = *cfg.ServerSideEncryption
-	}
-	return []S3CacheOption{WithServerSideEncryption(algorithm, cfg.ServerSideEncryptionKMSKeyID)}
+	return []S3CacheOption{WithServerSideEncryption(cfg.CertificateSSE())}
 }
 
 // validateEncryption rejects settings that would not mean what they say, rather than
-// writing private keys under them.
+// writing private keys under them. config.TLSConfig.Validate refuses such a
+// [tls.letsencrypt.s3] with the file, by the same check.
 func (c *S3Cache) validateEncryption() error {
-	switch c.sseAlgorithm {
-	case "":
-		// No header: the store's own default applies.
-	case types.ServerSideEncryptionAes256, types.ServerSideEncryptionAwsKms:
-	default:
-		return fmt.Errorf("unsupported server-side encryption %q: use %q, %q or an empty value",
-			c.sseAlgorithm, types.ServerSideEncryptionAes256, types.ServerSideEncryptionAwsKms)
-	}
-	if c.sseAlgorithm == types.ServerSideEncryptionAwsKms && c.sseKMSKeyID == "" {
-		return fmt.Errorf("server-side encryption %q requires a KMS key id", c.sseAlgorithm)
-	}
-	if c.sseAlgorithm != types.ServerSideEncryptionAwsKms && c.sseKMSKeyID != "" {
-		return fmt.Errorf("a KMS key id is only used by server-side encryption %q, not %q",
-			types.ServerSideEncryptionAwsKms, c.sseAlgorithm)
-	}
-	return nil
+	return config.ValidateCertificateSSE(string(c.sseAlgorithm), c.sseKMSKeyID)
 }
 
 // NewS3Cache creates a new S3-backed autocert cache using AWS SDK.
@@ -128,7 +106,6 @@ func NewS3Cache(cfg config.TLSLetsEncryptS3Config, opts ...S3CacheOption) (*S3Ca
 	cache := &S3Cache{
 		client:       client,
 		bucket:       cfg.Bucket,
-		prefix:       "autocert/",
 		sseAlgorithm: defaultSSEAlgorithm,
 	}
 	for _, opt := range opts {
@@ -166,7 +143,7 @@ func (c *S3Cache) verifyBucketAccess(ctx context.Context) error {
 
 // Get retrieves a certificate data from S3.
 func (c *S3Cache) Get(ctx context.Context, key string) ([]byte, error) {
-	s3Key := c.prefix + hashKey(key)
+	s3Key := S3ObjectKey(key)
 
 	logger.Debug("S3-Cache: Getting certificate", "key", key, "s3_key", s3Key)
 
@@ -209,7 +186,7 @@ func (c *S3Cache) Get(ctx context.Context, key string) ([]byte, error) {
 
 // Put stores certificate data in S3.
 func (c *S3Cache) Put(ctx context.Context, key string, data []byte) error {
-	s3Key := c.prefix + hashKey(key)
+	s3Key := S3ObjectKey(key)
 
 	logger.Debug("S3-Cache: Putting certificate", "key", key, "s3_key", s3Key, "bytes", len(data))
 
@@ -246,7 +223,7 @@ func (c *S3Cache) Put(ctx context.Context, key string, data []byte) error {
 
 // Delete removes certificate data from S3.
 func (c *S3Cache) Delete(ctx context.Context, key string) error {
-	s3Key := c.prefix + hashKey(key)
+	s3Key := S3ObjectKey(key)
 
 	logger.Debug("S3-Cache: Deleting certificate", "key", key, "s3_key", s3Key)
 
@@ -275,6 +252,17 @@ func (c *S3Cache) Delete(ctx context.Context, key string) error {
 
 	logger.Debug("S3-Cache: Successfully deleted certificate", "key", key)
 	return nil
+}
+
+// s3KeyPrefix is the bucket prefix every S3 cache entry is stored under.
+const s3KeyPrefix = "autocert/"
+
+// S3ObjectKey returns the bucket key the S3 cache stores the autocert cache entry name
+// under. autocert names a domain's ECDSA certificate "<domain>" and its RSA one
+// "<domain>+rsa" (lowercase, Punycode, no trailing dot). Tools that manage the bucket
+// use this so that they address exactly the objects the server reads and writes.
+func S3ObjectKey(name string) string {
+	return s3KeyPrefix + hashKey(name)
 }
 
 // hashKey creates a deterministic hash of the certificate key for S3 storage.

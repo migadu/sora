@@ -144,6 +144,30 @@ auth_rate_limit.exempt_networks = ["192.0.2.0/24"]
 	}
 }
 
+// The toml package matches a key to a field case-insensitively when no key
+// matches exactly, so IP_Block_Duration sets ip_block_duration. That spelling
+// takes the same syntax: days, and no unitless integer read as nanoseconds.
+func TestAuthRateLimitDurationKeyMatchedCaseInsensitively(t *testing.T) {
+	decode := func(line string) (*AuthRateLimiterConfig, error) {
+		var cfg Config
+		_, err := toml.Decode("[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \":143\"\n[server.auth_rate_limit]\n"+line+"\n", &cfg)
+		if err != nil {
+			return nil, err
+		}
+		return cfg.DynamicServers[0].AuthRateLimit, nil
+	}
+	if got, err := decode(`IP_Block_Duration = "2d"`); err != nil {
+		t.Errorf(`IP_Block_Duration = "2d": %v`, err)
+	} else if got.IPBlockDuration != twoDays {
+		t.Errorf(`IP_Block_Duration = "2d" decoded to %v, want %v`, got.IPBlockDuration, twoDays)
+	}
+	if got, err := decode("IP_Block_Duration = 900"); err == nil {
+		t.Errorf("IP_Block_Duration = 900: accepted as %v", got.IPBlockDuration)
+	} else if !strings.Contains(err.Error(), "IP_Block_Duration") {
+		t.Errorf("IP_Block_Duration = 900: error %q does not name the key", err)
+	}
+}
+
 // LoadConfigFromFile trims every string it decodes, so " 2d " is a valid
 // lookup_cache duration. The auth_rate_limit durations are parsed while the file
 // is decoded, before that trim, and take the same value.

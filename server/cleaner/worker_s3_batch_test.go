@@ -111,7 +111,7 @@ func TestCleanupWorker_S3DeletesAreBatchedAndOutsideTransactions(t *testing.T) {
 	probeS3 := &s3ProbeStorage{rdb: probeDB}
 	ctx := context.Background()
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   probeDB,
 		s3:                    probeS3,
 		cache:                 new(mockCache),
@@ -134,7 +134,7 @@ func TestCleanupWorker_S3DeletesAreBatchedAndOutsideTransactions(t *testing.T) {
 	mockDB.On("CleanupOldRedirectsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return(candidates, nil).Once()
-	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything).Return([]db.FTSKey{}, nil).Once()
+	mockDB.On("GetUnusedFTSKeysWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.FTSKey{}, db.FTSKey{}, nil).Once()
 	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	require.NoError(t, worker.runOnce(ctx))

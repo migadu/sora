@@ -3,6 +3,7 @@ package sieveengine
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/mail"
 	"runtime/debug"
@@ -12,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/emersion/go-message"
+	"github.com/emersion/go-message/textproto"
 	msieve "github.com/migadu/go-managesieve/managesieve"
 	"github.com/migadu/go-sieve"
 	"github.com/migadu/go-sieve/interp"
@@ -28,11 +30,10 @@ const (
 	ActionRedirect Action = "redirect"
 )
 
-// scriptExecutionTimeout bounds the total execution time of a single Sieve script
-// (CPU/resource-exhaustion guard). It is also passed to go-sieve as the per-match
-// regex soft-wait cap (Options.Interp.RegexLimits.MaxExecTime), so a large but
-// input-bounded body :matches/:regex completes within the script budget instead of
-// failing on go-sieve's tight 100ms default under load or race instrumentation.
+// scriptExecutionTimeout supplies the cooperative execution budget of a Sieve
+// script and the per-match regex deadline (Options.Interp.RegexLimits.MaxExecTime).
+// Inputs over 1 KB check it while matching; smaller matches and compilation run
+// inline under the input/pattern/program limits. It is not a strict wall-clock cap.
 // Configurable via SetScriptExecutionTimeout (from [sieve] max_execution_time).
 var scriptExecutionTimeout = 2 * time.Second
 
@@ -42,7 +43,7 @@ const (
 )
 
 // SetScriptExecutionTimeout overrides the Sieve script execution budget (and the
-// per-match regex soft-wait cap derived from it). The value is clamped to
+// large-input regex deadline derived from it). The value is clamped to
 // [100ms, 60s]; a non-positive value leaves the current setting unchanged. Call once
 // at startup before serving.
 func SetScriptExecutionTimeout(d time.Duration) {
@@ -112,13 +113,18 @@ func ValidateScript(content string, configured []string) error {
 	return err
 }
 
-// HeaderEdit represents a header modification from editheader extension
+// HeaderEdit represents a header modification from editheader extension.
+//
+// A delete removes fields named FieldName: with Index above 0 the one Index
+// counts to, from 1 (from the last with Last); else with ByValue the first
+// whose value is Value, which may be empty; else every one of them.
 type HeaderEdit struct {
 	Action    string // "add" or "delete"
 	FieldName string
 	Value     string
 	Last      bool // for addheader: add at end; for deleteheader: count from end
-	Index     int  // for deleteheader: specific index (0 means all)
+	Index     int  // for deleteheader: the field to delete, counted from 1, or 0
+	ByValue   bool // for deleteheader: select the field by Value, even an empty one
 }
 
 type Result struct {
@@ -131,10 +137,28 @@ type Result struct {
 	Mailboxes       []string          // every fileinto target, in script order, without repeats
 	CreateMailboxes []string          // RFC 5490 :create - the Mailboxes to create if missing
 	RedirectTo      []string          // every address to relay to, without repeats
-	Flags           []string          // flags to add to the message
 	Copy            bool              // with fileinto or redirect: the message is also kept (explicit keep, or every one used RFC 3894 :copy)
 	HeaderEdits     []HeaderEdit      // RFC5293 - editheader extension (addheader/deleteheader)
 	Additional      map[string]string // future-proofing
+
+	// imap4flags (RFC 5232) flags belong to one stored copy, not to the message.
+	// MailboxFlags holds those of each Mailboxes copy, by target: its fileinto's
+	// :flags, or else the script's flags as they were when it ran (§3, §5).
+	// KeepFlags are those of the copy kept in INBOX: an explicit keep's, chosen
+	// the same way, or else the implicit keep's, the script's flags at its end.
+	// Destinations gives every copy its own.
+	MailboxFlags map[string][]string
+	KeepFlags    []string
+
+	// Store order resolves actions naming the same physical mailbox, including
+	// case variants and fileinto INBOX alongside keep. The last flags win (RFC 5232 §3).
+	// An implicit keep has order zero and does not override an explicit action.
+	MailboxStoreOrder map[string]uint64
+	KeepStoreOrder    uint64
+
+	// Flags contains the kept copy's flags, for callers that predate per-copy flags.
+	// Deprecated: use KeepFlags or Destination.Flags instead.
+	Flags []string
 
 	// RecordRedirect charges one redirect against the account's redirect rate limit.
 	// Evaluation charges nothing, since only delivery knows whether a redirect went
@@ -162,7 +186,7 @@ type Result struct {
 // for this sender and response identity already checked.
 type VacationReply struct {
 	From    string // the :from address; delivery uses it only if the account owns it
-	Subject string // the :subject, or "Auto: " and the original subject (RFC 5230 §5.3)
+	Subject string // the :subject, even empty; without one the RFC 5230 §5.3 default
 	Body    string // the reason
 	IsMime  bool
 	// Addresses is the :addresses list: addresses of the recipient besides the
@@ -181,7 +205,9 @@ type Context struct {
 	EnvelopeTo   string
 	// Header is the parsed header block of Message. The body test reads the top-level
 	// Content-Type and Content-Transfer-Encoding from here and the body from Message,
-	// so the two must describe the same bytes.
+	// so the two must describe the same bytes. Build it with HeaderMap: keys that fold
+	// to one name under i;ascii-casemap are merged, but only HeaderMap keeps their
+	// fields in message order.
 	Header map[string][]string
 	// Message is the complete raw message as received, after any Received and
 	// Delivered-To headers delivery stamps and before any header edits this evaluation
@@ -273,11 +299,22 @@ type CompiledScript struct {
 // enabledExtensions is the set a require may name; nil enables none (go-sieve), so
 // callers pass EffectiveExtensions.
 func CompileScript(scriptContent string, enabledExtensions []string) (*CompiledScript, error) {
+	// RFC 5228 sections 1.1, 2.4.2.1 and 8.1 require Sieve scripts to be valid UTF-8 and
+	// forbid NUL octets (0x00) inside strings and comments; PostgreSQL text columns also
+	// reject both with SQLSTATE 22021. go-sieve's lexer only rejects NUL at top-level
+	// token boundaries and never validates UTF-8.
+	if !helpers.TextStorable(scriptContent) {
+		if !utf8.ValidString(scriptContent) {
+			return nil, errors.New("sieve: script is not valid UTF-8")
+		}
+		return nil, errors.New("sieve: script contains NUL byte")
+	}
 	options := sieve.DefaultOptions()
 	options.EnabledExtensions = enabledExtensions
-	// Raise the per-match regex soft-wait cap to the whole-script budget. The match
-	// input is already truncated to MaxInputLength, so a large body match is bounded;
-	// go-sieve's 100ms default can otherwise spuriously fail it under load or -race.
+	// Raise the large-input regex deadline to the whole-script budget: go-sieve's
+	// 100ms default can otherwise spuriously fail a body match under load or -race.
+	// Inputs over 1 KB check the deadline as they are read, then stop on timeout;
+	// short matches and compilation remain inline under the fixed size limits.
 	options.Interp.RegexLimits.MaxExecTime = scriptExecutionTimeout
 	script, err := sieve.Load(strings.NewReader(scriptContent), options)
 	if err != nil {
@@ -316,11 +353,17 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		To:   ctx.EnvelopeTo,
 	}
 
-	// RFC 5228 §2.6.2.1: Header field names are case-insensitive
-	// Normalize all header keys to lowercase to ensure consistent matching
+	// Header names compare under i;ascii-casemap (RFC 5228 §2.7): the map is
+	// keyed by the lower-cased name and HeaderGet lowers the name it looks up.
+	// Keys that fold to one name are that name's fields, so their values are
+	// merged rather than one key's replacing the other's.
 	normalizedHeaders := make(map[string][]string, len(ctx.Header))
 	for key, values := range ctx.Header {
-		normalizedHeaders[strings.ToLower(key)] = values
+		name := lowerASCII(key)
+		if prev, ok := normalizedHeaders[name]; ok {
+			values = append(slices.Clip(prev), values...)
+		}
+		normalizedHeaders[name] = values
 	}
 
 	message := &SieveMessage{
@@ -375,10 +418,21 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 
 	// Process the results
 	result := Result{
-		Action:     ActionKeep,
-		Additional: make(map[string]string),
-		Flags:      make([]string, 0),
+		Action:            ActionKeep,
+		Additional:        make(map[string]string),
+		MailboxFlags:      data.MailboxFlags,
+		KeepFlags:         data.Flags,
+		MailboxStoreOrder: data.MailboxStoreOrder,
+		KeepStoreOrder:    data.KeepStoreOrder,
 	}
+	// An explicit keep stands in for the implicit one (RFC 5228 §2.10.2: "if a
+	// fileinto, a keep, a redirect, or a discard is performed, an implicit keep
+	// is not"), so the kept copy has its flags rather than the internal
+	// variable's final value.
+	if data.Keep {
+		result.KeepFlags = data.KeepFlags
+	}
+	result.Flags = result.KeepFlags
 
 	// Every fileinto and every redirect the script ran is carried out, next to one
 	// another and to a keep: RFC 5228 §2.10.4 lets a site limit the actions, but a
@@ -442,11 +496,6 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		break
 	}
 
-	// Handle flags
-	if len(data.Flags) > 0 {
-		result.Flags = data.Flags
-	}
-
 	// Handle header edits (RFC 5293 - editheader extension)
 	if len(data.HeaderEdits) > 0 {
 		result.HeaderEdits = make([]HeaderEdit, len(data.HeaderEdits))
@@ -457,6 +506,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 				Value:     edit.Value,
 				Last:      edit.Last,
 				Index:     edit.Index,
+				ByValue:   edit.ByValue,
 			}
 		}
 	}
@@ -639,9 +689,49 @@ type SieveMessage struct {
 }
 
 func (m *SieveMessage) HeaderGet(key string) ([]string, error) {
-	// RFC 5228 §2.6.2.1: Header field names are case-insensitive
-	// Since LMTP normalizes headers to lowercase, we must do case-insensitive lookup
-	return m.Headers[strings.ToLower(key)], nil
+	return m.Headers[lowerASCII(key)], nil
+}
+
+// HeaderMap returns the fields of h for Context.Header, keyed by the name folded
+// under i;ascii-casemap (RFC 5228 §2.7), each name's values in message order.
+//
+// go-message's Header.Map keys a field by textproto.CanonicalMIMEHeaderKey, which
+// returns a name holding a byte that is not an RFC 7230 token character, such as
+// "(" or "/", as written, although RFC 5322 §3.6.8 allows those bytes in a field
+// name (ftext = %d33-57 / %d59-126). "X(a" and "x(A" are then two keys of one
+// field name, and a map cannot say which field came first, which :index counts
+// from (RFC 5260 §6) and the date test takes (RFC 5260 §4).
+func HeaderMap(h message.Header) map[string][]string {
+	m := make(map[string][]string, h.Len())
+	fields := h.Fields()
+	for fields.Next() {
+		name := lowerASCII(fields.Key())
+		m[name] = append(m[name], fields.Value())
+	}
+	return m
+}
+
+// lowerASCII lowers the US-ASCII letters of a header name and leaves every other
+// byte as it is. Header names compare under i;ascii-casemap (RFC 5228 §2.7), which
+// "treats US-ASCII letters case-insensitively" and under which "letters outside
+// ASCII are not treated case-insensitively" (RFC 4790 §9.2.1); strings.ToLower
+// would also lower U+212A KELVIN SIGN to "k" and U+0130 LATIN CAPITAL LETTER I
+// WITH DOT ABOVE to "i".
+func lowerASCII(s string) string {
+	i := 0
+	for i < len(s) && (s[i] < 'A' || s[i] > 'Z') {
+		i++
+	}
+	if i == len(s) {
+		return s
+	}
+	b := []byte(s)
+	for ; i < len(b); i++ {
+		if 'A' <= b[i] && b[i] <= 'Z' {
+			b[i] += 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 func (m *SieveMessage) MessageSize() int {
@@ -673,85 +763,185 @@ func messageBody(msg []byte) []byte {
 	return nil
 }
 
-// ApplyHeaderEdits applies header modifications to raw message bytes (RFC 5293)
-// Returns the modified message bytes with header edits applied
+// ApplyHeaderEdits applies a script's addheader/deleteheader edits (RFC 5293) to
+// the raw message, in order, each to the header the earlier ones left, as the
+// script saw it. It edits the header's list of fields and nothing else: every
+// field it does not add or delete and the whole body keep their bytes, so a DKIM
+// signature over them still verifies.
 func ApplyHeaderEdits(messageBytes []byte, edits []HeaderEdit) ([]byte, error) {
 	if len(edits) == 0 {
 		return messageBytes, nil
 	}
 
-	// Parse message using go-message
-	entity, err := message.Read(bytes.NewReader(messageBytes))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse message: %w", err)
+	end := headerEnd(messageBytes)
+	fields := parseHeaderFields(messageBytes[:end])
+
+	// Added fields end their lines as the message does, so a bare-LF message does
+	// not get mixed line breaks.
+	eol := "\r\n"
+	if n := bytes.IndexByte(messageBytes, '\n'); n == 0 || n > 0 && messageBytes[n-1] != '\r' {
+		eol = "\n"
 	}
 
-	// Apply header edits
 	for _, edit := range edits {
+		// RFC 5293 §5: "The field-name is mandatory and always matched as a
+		// case-insensitive US-ASCII string."
+		key := lowerASCII(edit.FieldName)
 		switch edit.Action {
 		case "add":
+			raw, err := formatAddedField(edit.FieldName, edit.Value, eol)
+			if err != nil {
+				return nil, err
+			}
+			f := headerField{key: key, value: edit.Value, raw: raw}
+			// RFC 5293 §4: "By default, the header field is inserted at the
+			// beginning of the existing message header.  If the optional flag
+			// ":last" is specified, it is appended at the end."
 			if edit.Last {
-				// Add at the end - go-message naturally adds to the end
-				entity.Header.Add(edit.FieldName, edit.Value)
+				fields = append(fields, f)
 			} else {
-				// Add at the beginning - need to preserve existing and prepend
-				existingValues := entity.Header.Values(edit.FieldName)
-				entity.Header.Del(edit.FieldName)
-				entity.Header.Add(edit.FieldName, edit.Value)
-				for _, v := range existingValues {
-					entity.Header.Add(edit.FieldName, v)
-				}
+				fields = slices.Insert(fields, 0, f)
 			}
 
 		case "delete":
-			if edit.Index > 0 {
-				// Delete specific index
-				values := entity.Header.Values(edit.FieldName)
-				if len(values) == 0 {
-					continue
+			switch {
+			case edit.Index > 0:
+				// RFC 5293 §5: :index counts the named fields "beginning at 1,
+				// the first named header field.  If :last is specified, the
+				// count is backwards; 1 denotes the last named header field".
+				var named []int
+				for i, f := range fields {
+					if f.key == key {
+						named = append(named, i)
+					}
 				}
-
-				idx := edit.Index - 1
+				n := edit.Index - 1
 				if edit.Last {
-					idx = len(values) - edit.Index
+					n = len(named) - edit.Index
 				}
-
-				if idx >= 0 && idx < len(values) {
-					entity.Header.Del(edit.FieldName)
-					for i, v := range values {
-						if i != idx {
-							entity.Header.Add(edit.FieldName, v)
-						}
-					}
+				if n >= 0 && n < len(named) {
+					fields = slices.Delete(fields, named[n], named[n]+1)
 				}
-
-			} else if edit.Value != "" {
-				// Delete first occurrence matching value
-				values := entity.Header.Values(edit.FieldName)
-				entity.Header.Del(edit.FieldName)
-				deleted := false
-				for _, v := range values {
-					if !deleted && v == edit.Value {
-						deleted = true
-						continue
-					}
-					entity.Header.Add(edit.FieldName, v)
+			case edit.ByValue:
+				// go-sieve records one edit for each field whose value matched
+				// the value-patterns, carrying that value, which may be empty.
+				if i := slices.IndexFunc(fields, func(f headerField) bool {
+					return f.key == key && f.value == edit.Value
+				}); i >= 0 {
+					fields = slices.Delete(fields, i, i+1)
 				}
-
-			} else {
-				// Delete all occurrences
-				entity.Header.Del(edit.FieldName)
+			default:
+				fields = slices.DeleteFunc(fields, func(f headerField) bool { return f.key == key })
 			}
 		}
 	}
 
-	// Write modified message back to bytes
-	var buf bytes.Buffer
-	if err := entity.WriteTo(&buf); err != nil {
-		return nil, fmt.Errorf("failed to write modified message: %w", err)
+	out := make([]byte, 0, len(messageBytes)+len(edits)*64)
+	for i, f := range fields {
+		out = append(out, f.raw...)
+		// Only the last line of a header with no body can lack a line break; a
+		// field may now follow it.
+		if i < len(fields)-1 && !bytes.HasSuffix(f.raw, []byte{'\n'}) {
+			out = append(out, eol...)
+		}
 	}
+	return append(out, messageBytes[end:]...), nil
+}
 
-	return buf.Bytes(), nil
+// headerField is one field of a message header: its bytes as the message has
+// them (the first line, any continuation lines and their line breaks), its name
+// lower-cased for i;ascii-casemap, and its value as the script's header map holds
+// it. A line with no colon is kept with an empty key and never matches an edit.
+type headerField struct {
+	key   string
+	value string
+	raw   []byte
+}
+
+// parseHeaderFields splits a header block into its fields. A line that starts
+// with SP or HT continues the field before it (RFC 5322 §2.2.3).
+func parseHeaderFields(header []byte) []headerField {
+	var fields []headerField
+	start := 0
+	for i := 0; i < len(header); {
+		next := len(header)
+		if n := bytes.IndexByte(header[i:], '\n'); n >= 0 {
+			next = i + n + 1
+		}
+		if i > start && header[i] != ' ' && header[i] != '\t' {
+			fields = append(fields, newHeaderField(header[start:i]))
+			start = i
+		}
+		i = next
+	}
+	if start < len(header) {
+		fields = append(fields, newHeaderField(header[start:]))
+	}
+	return fields
+}
+
+func newHeaderField(raw []byte) headerField {
+	f := headerField{raw: raw}
+	firstLine := raw
+	if n := bytes.IndexByte(raw, '\n'); n >= 0 {
+		firstLine = raw[:n]
+	}
+	colon := bytes.IndexByte(firstLine, ':')
+	if colon < 0 {
+		return f
+	}
+	// go-message, which built the script's header map, drops the SP/HT around
+	// the name and unfolds the value: each line without its line break and the
+	// SP/HT around it, the non-empty ones joined with a single space.
+	f.key = lowerASCII(string(bytes.Trim(raw[:colon], " \t")))
+	var value strings.Builder
+	for line := range bytes.Lines(raw[colon+1:]) {
+		if l, ok := bytes.CutSuffix(line, []byte{'\n'}); ok {
+			line = bytes.TrimSuffix(l, []byte{'\r'})
+		}
+		if line = bytes.Trim(line, " \t"); len(line) == 0 {
+			continue
+		}
+		if value.Len() > 0 {
+			value.WriteByte(' ')
+		}
+		value.Write(line)
+	}
+	f.value = value.String()
+	return f
+}
+
+// formatAddedField formats an addheader field as go-message writes a new field,
+// folded to RFC 5322 line lengths, with its lines ending in eol. A value holding
+// a CR or LF is refused.
+func formatAddedField(name, value, eol string) ([]byte, error) {
+	var h textproto.Header
+	h.Add(name, value)
+	var b bytes.Buffer
+	if err := textproto.WriteHeader(&b, h); err != nil {
+		return nil, fmt.Errorf("addheader %q: %w", name, err)
+	}
+	raw := b.Bytes()[:b.Len()-2] // WriteHeader ends the header with a blank line
+	if eol == "\n" {
+		raw = bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))
+	}
+	return raw, nil
+}
+
+// headerEnd returns the length of msg's header block: the octets before the blank
+// line that ends it, or all of msg when there is none.
+func headerEnd(msg []byte) int {
+	for i := 0; i < len(msg); {
+		if msg[i] == '\n' || msg[i] == '\r' && i+1 < len(msg) && msg[i+1] == '\n' {
+			return i
+		}
+		n := bytes.IndexByte(msg[i:], '\n')
+		if n < 0 {
+			break
+		}
+		i += n + 1
+	}
+	return len(msg)
 }
 
 // maxLoggedRejectReason bounds the reject reason in a log line. The reason is
@@ -776,31 +966,84 @@ func (r Result) RejectLogFields() (action, reason string) {
 	return action, reason
 }
 
+// FlagsForKeep returns the kept copy's flags. A legacy Result constructed with
+// only Flags retains those flags; per-copy fields take precedence, even if empty.
+func (r Result) FlagsForKeep() []string {
+	if r.hasCopyFlags() {
+		return r.KeepFlags
+	}
+	return r.Flags
+}
+
+// FlagsForMailbox returns the flags of one fileinto target, before :create name
+// normalization. It also accepts legacy Results that supplied only Flags.
+func (r Result) FlagsForMailbox(mailbox string) []string {
+	if r.hasCopyFlags() {
+		return r.MailboxFlags[mailbox]
+	}
+	return r.Flags
+}
+
+func (r Result) hasCopyFlags() bool {
+	return r.KeepFlags != nil || r.MailboxFlags != nil || r.KeepStoreOrder != 0 || r.MailboxStoreOrder != nil
+}
+
 // Destination is a mailbox delivery stores the message in.
 type Destination struct {
 	Mailbox string
-	Create  bool // RFC 5490 §3.2 fileinto :create: create the mailbox if it is missing
+	Create  bool     // RFC 5490 §3.2 fileinto :create: create the mailbox if it is missing
+	Flags   []string // the flags the script set on this copy (RFC 5232 §5)
 }
 
 // Destinations lists the mailboxes the message is stored in: every fileinto target,
 // then INBOX when the message is kept (RFC 5228 §2.10.2, §4.3), each mailbox once
-// (§2.10.3; mailbox names are case-insensitive here). redirectFailed reports a
-// redirect that could not be handed to the relay: a message then stored nowhere
-// else is kept in INBOX rather than lost (§4.2: "Any ignored redirect MUST NOT
-// cancel the implicit keep"). An empty list means nothing is stored.
+// (§2.10.3; mailbox names are case-insensitive here), each with the flags of the
+// fileinto or keep that stores it. redirectFailed reports a redirect that could not
+// be handed to the relay: a message then stored nowhere else is kept in INBOX rather
+// than lost (§4.2: "Any ignored redirect MUST NOT cancel the implicit keep"). An
+// empty list means nothing is stored.
 func (r Result) Destinations(redirectFailed bool) []Destination {
+	dests, _ := r.DestinationsByKey(redirectFailed, nil)
+	return dests
+}
+
+// DestinationsByKey groups copies by their resolved storage identity. resolve is
+// called before duplicate elimination, so database aliases and fallback targets
+// retain the last explicit action's flags. A nil resolver keeps the legacy name
+// comparison used by Destinations; storage callers supply a physical identity.
+func (r Result) DestinationsByKey(redirectFailed bool, resolve func(string, bool) (string, error)) ([]Destination, error) {
 	dests := make([]Destination, 0, len(r.Mailboxes)+1)
-	add := func(mailbox string, create bool) {
-		for i := range dests {
-			if strings.EqualFold(dests[i].Mailbox, mailbox) {
-				// One copy, but a :create on either spelling still creates it.
-				dests[i].Create = dests[i].Create || create
-				return
+	orders := make([]uint64, 0, len(r.Mailboxes)+1)
+	keys := make([]string, 0, len(r.Mailboxes)+1)
+	add := func(mailbox string, create bool, flags []string, order uint64) error {
+		key := ""
+		if resolve != nil {
+			var err error
+			key, err = resolve(mailbox, create)
+			if err != nil {
+				return err
 			}
 		}
-		dests = append(dests, Destination{Mailbox: mailbox, Create: create})
+		for i := range dests {
+			if resolve != nil && keys[i] == key || resolve == nil && strings.EqualFold(dests[i].Mailbox, mailbox) {
+				// Keep one copy in the first destination's position. A :create on
+				// any spelling creates it, and the last action supplies its flags.
+				dests[i].Create = dests[i].Create || create
+				if order > orders[i] {
+					dests[i].Flags = flags
+					orders[i] = order
+				}
+				return nil
+			}
+		}
+		dests = append(dests, Destination{Mailbox: mailbox, Create: create, Flags: flags})
+		orders = append(orders, order)
+		keys = append(keys, key)
+		return nil
 	}
 	for _, mailbox := range r.Mailboxes {
+		flags := r.FlagsForMailbox(mailbox)
+		order := r.MailboxStoreOrder[mailbox]
 		create := slices.Contains(r.CreateMailboxes, mailbox)
 		if create {
 			// The copy goes into the mailbox :create makes: "Foo" for "Foo/" (RFC 3501
@@ -810,12 +1053,16 @@ func (r Result) Destinations(redirectFailed bool) []Destination {
 				mailbox = name
 			}
 		}
-		add(mailbox, create)
+		if err := add(mailbox, create, flags, order); err != nil {
+			return nil, err
+		}
 	}
 	if r.Action == ActionKeep || r.Copy || (redirectFailed && len(dests) == 0) {
-		add(consts.MailboxInbox, false)
+		if err := add(consts.MailboxInbox, false, r.FlagsForKeep(), r.KeepStoreOrder); err != nil {
+			return nil, err
+		}
 	}
-	return dests
+	return dests, nil
 }
 
 // scriptRunner is what runScript needs of a compiled script; *sieve.Script

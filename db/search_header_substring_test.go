@@ -70,14 +70,15 @@ func TestHeaderSearchCriteriaBindLiteralTerms(t *testing.T) {
 		criteria *imap.SearchCriteria
 		exprs    []string
 	}{
-		{"FROM", header("From"), []string{"m.from_email_sort", "m.from_name_sort", `split_part(COALESCE(m.extra_addresses, ''), E'\n', 1)`}},
-		{"TO", header("To"), []string{"m.to_email_sort", "m.to_name_sort", `split_part(COALESCE(m.extra_addresses, ''), E'\n', 2)`}},
-		{"CC", header("Cc"), []string{"m.cc_email_sort", `split_part(COALESCE(m.extra_addresses, ''), E'\n', 3)`}},
+		// An empty address column means no such address, never a match (addressHeaderCond).
+		{"FROM", header("From"), []string{"m.from_email_sort", "m.from_name_sort", `split_part(m.extra_addresses, E'\n', 1)`}},
+		{"TO", header("To"), []string{"m.to_email_sort", "m.to_name_sort", `split_part(m.extra_addresses, E'\n', 2)`}},
+		{"CC", header("Cc"), []string{"m.cc_email_sort", `split_part(m.extra_addresses, E'\n', 3)`}},
 		{"SUBJECT", header("Subject"), []string{"LOWER(m.subject)"}},
 		{"HEADER References", header("References"), []string{`'<' || replace(LOWER(NULLIF(m."references", '')), ' ', '> <') || '>'`}},
 		{"HEADER In-Reply-To", header("In-Reply-To"), []string{`'<' || replace(LOWER(NULLIF(m.in_reply_to, '')), ' ', '> <') || '>'`}},
 		{"BCC", header("Bcc"), []string{"LOWER(r->>'email')", "LOWER(r->>'name')"}},
-		{"TEXT", &imap.SearchCriteria{Text: []string{"Support@Equishark.com"}}, []string{"LOWER(m.subject)", "m.from_email_sort", "m.to_name_sort", "m.cc_email_sort", "COALESCE(m.extra_addresses, '')"}},
+		{"TEXT", &imap.SearchCriteria{Text: []string{"Support@Equishark.com"}}, []string{"LOWER(m.subject)", "m.from_email_sort", "m.to_name_sort", "m.cc_email_sort", "m.extra_addresses"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -187,7 +188,7 @@ func headerIndex(t *testing.T) (name string, cols map[string]bool) {
 		}
 	}
 	require.NotNil(t, m, "no migration creates the header covering index")
-	require.Equal(t, "migrations/000059_messages_extra_addresses.up.sql", from, "harness check: the newest definition is 000059's")
+	require.Equal(t, "migrations/000070_messages_header_presence.up.sql", from, "harness check: the newest definition is migration70")
 	cols = map[string]bool{m[2]: true, m[4]: true}
 	for _, c := range strings.Split(m[3], ",") {
 		cols[strings.TrimSpace(c)] = true
@@ -376,6 +377,38 @@ func TestHeaderSearchIsIndexOnly(t *testing.T) {
 	assert.NotEmpty(t, indexOnly, "header SEARCH must read messages through an Index Only Scan on %s; plan:\n%s", indexName, string(raw))
 	assert.Empty(t, otherMessagesScans, "header SEARCH must not read messages any other way (heap filter or trigram GIN); plan:\n%s", string(raw))
 	t.Logf("messages access: %v", indexOnly)
+
+	// Exercise CASE legacy/known and NOT/OR against the actual emitted SQL,
+	// rather than only proving that a nonempty FROM still uses the index.
+	_, err = db.GetWritePool().Exec(ctx, "UPDATE messages SET header_presence=CASE WHEN uid%2=0 THEN 1::smallint ELSE NULL END WHERE mailbox_id=$1", mailboxID)
+	require.NoError(t, err)
+	_, err = db.GetWritePool().Exec(ctx, "VACUUM ANALYZE messages")
+	require.NoError(t, err)
+	h := imap.SearchCriteria{Header: []imap.SearchCriteriaHeaderField{{Key: "From", IsHeader: true}}}
+	for _, c := range []imap.SearchCriteria{h, {Not: []imap.SearchCriteria{h}}, {Or: [][2]imap.SearchCriteria{{h, {Not: []imap.SearchCriteria{h}}}}}} {
+		_, err = traced.SearchMessagesWithCriteria(ctx, mailboxID, accountID, &c, 0, rows)
+		require.NoError(t, err)
+		var statement *capturedQuery
+		for i, q := range tracer.captured() {
+			if strings.Contains(q.SQL, "header_presence") && strings.Contains(q.SQL, "FROM messages m") {
+				statement = &tracer.captured()[i]
+			}
+		}
+		require.NotNil(t, statement)
+		require.NoError(t, conn.QueryRow(ctx, "EXPLAIN (ANALYZE, FORMAT JSON) "+statement.SQL, statement.Args...).Scan(&raw))
+		require.NoError(t, json.Unmarshal(raw, &explained))
+		found := false
+		explained[0].Plan.walk(func(n hdrPlanNode) {
+			if n.RelationName == "messages" {
+				require.Equal(t, "Index Only Scan", n.NodeType, string(raw))
+				require.Equal(t, indexName, n.IndexName)
+				require.Zero(t, n.HeapFetches, string(raw))
+				found = true
+			}
+		})
+		require.True(t, found)
+		t.Logf("presence plan:%s", raw)
+	}
 }
 
 // TestHeaderSearchMatchesLiterally runs header searches against PostgreSQL and checks the
@@ -469,6 +502,10 @@ func incompressibleText(n int) string {
 // index's tuple limit. Without the bounds this INSERT fails with "index row size exceeds
 // btree version 4 maximum" once migration 000052 is applied (proved red 2026-10-01 with the
 // same incompressible fixture), and with extra_addresses unbounded once 000059 is.
+//
+// content_hash is an index column too, and a real one is 64 hex characters (BLAKE3): with a
+// shorter hash the tuple has that much slack, and a budget the production index cannot hold
+// (helpers.MaxAddressColumnsBytes = 1350 with a 10-byte hash) would still pass here.
 func TestInsertBoundsHeaderColumns(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -495,12 +532,13 @@ func TestInsertBoundsHeaderColumns(t *testing.T) {
 	for i := range 40 {
 		recipients = append(recipients, helpers.Recipient{AddressType: "cc", Name: incompressibleText(40), EmailAddress: fmt.Sprintf("%s%d@example.com", incompressibleText(30), i)})
 	}
+	contentHash := incompressibleText(64) // the length of a real BLAKE3 hex hash
 	_, _, err = db.InsertMessage(ctx, tx, &InsertMessageOptions{
 		AccountID: accountID, MailboxID: mailboxID, MailboxName: "INBOX",
-		S3Domain: "example.com", S3Localpart: "bounds", ContentHash: "boundshash",
+		S3Domain: "example.com", S3Localpart: "bounds", ContentHash: contentHash,
 		MessageID: "<bounds@example.com>", InternalDate: now, SentDate: now, Size: 1024,
 		Subject: longSubject, BodyStructure: &bs, Recipients: recipients,
-	}, PendingUpload{InstanceID: "test", ContentHash: "boundshash", Size: 1024, AccountID: accountID})
+	}, PendingUpload{InstanceID: "test", ContentHash: contentHash, Size: 1024, AccountID: accountID})
 	require.NoError(t, err, "a message with oversized headers must still be deliverable")
 	require.NoError(t, tx.Commit(ctx))
 
@@ -508,7 +546,7 @@ func TestInsertBoundsHeaderColumns(t *testing.T) {
 	err = db.GetReadPool().QueryRow(ctx, `
 		SELECT octet_length(subject), octet_length(subject_sort), octet_length(from_name_sort), octet_length(from_email_sort),
 		       octet_length(to_name_sort), octet_length(to_email_sort), octet_length(cc_email_sort), octet_length(extra_addresses)
-		FROM messages WHERE mailbox_id = $1 AND content_hash = 'boundshash'`, mailboxID).Scan(&subj, &subjSort, &fromName, &fromEmail, &toName, &toEmail, &ccEmail, &extra)
+		FROM messages WHERE mailbox_id = $1 AND content_hash = $2`, mailboxID, contentHash).Scan(&subj, &subjSort, &fromName, &fromEmail, &toName, &toEmail, &ccEmail, &extra)
 	require.NoError(t, err)
 	assert.LessOrEqual(t, subj, helpers.MaxSubjectBytes)
 	assert.LessOrEqual(t, subjSort, helpers.MaxSubjectBytes)
