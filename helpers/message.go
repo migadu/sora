@@ -53,14 +53,8 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 		} else if message.IsUnknownCharset(err) {
 			// The part comes with its body not converted from the charset, which
 			// is still its best text: it is read as the single-part form is, and
-			// as PREVIEW reads it. go-message reports only the charset when the
-			// transfer encoding is unknown too, so check that it was decoded.
-			switch transferEncodingMechanism(part.Header.Get("Content-Transfer-Encoding")) {
-			case "", "7bit", "8bit", "binary", "quoted-printable", "base64":
-			default:
-				skippedParts = append(skippedParts, fmt.Sprintf("NextPart error: %v", err))
-				continue
-			}
+			// as PREVIEW reads it. Its transfer encoding is checked below along
+			// with single-part messages.
 		} else if err != nil {
 			// After any other NextPart() error (a malformed part header or
 			// boundary) the multipart reader cannot yield more parts. Rather than
@@ -69,6 +63,18 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 			// This is acceptable because plaintext extraction is best-effort for FTS.
 			skippedParts = append(skippedParts, fmt.Sprintf("NextPart error: %v", err))
 			break
+		}
+
+		// mail.NewReader wraps a single-part message in an artificial multipart
+		// whose NextPart returns nil error, and go-message reports only the
+		// charset error when both charset and transfer encoding are unknown.
+		// Check every leaf part's transfer encoding so undecoded bytes are never
+		// indexed as text (RFC 2045 §6.4), matching the multipart form and PREVIEW.
+		switch transferEncodingMechanism(part.Header.Get("Content-Transfer-Encoding")) {
+		case "", "7bit", "8bit", "binary", "quoted-printable", "base64":
+		default:
+			skippedParts = append(skippedParts, fmt.Sprintf("unsupported Content-Transfer-Encoding: %q", part.Header.Get("Content-Transfer-Encoding")))
+			continue
 		}
 
 		header, ok := part.Header.(*mail.InlineHeader)
