@@ -60,3 +60,47 @@ if header :mime :anychild :is "X(A" "2" { fileinto "two"; }`,
 		})
 	}
 }
+
+// TestPartHeaderWhitespaceOnlyFold: a part header field folded across a line of
+// nothing but white space keeps that line's separator when it is unfolded. RFC
+// 5322 §4.2: obsolete folding white space makes it possible that "a line which
+// makes up a folded header field could be composed entirely of white space",
+// and §3.2.2: "Unfolding is accomplished by simply removing any CRLF that is
+// immediately followed by WSP". A quoted boundary folded that way names
+// "inner  boundary" (two spaces); reading it as "inner boundary" hides the
+// nested part from the body test and the :mime tests, as main's parser did not.
+func TestPartHeaderWhitespaceOnlyFold(t *testing.T) {
+	raw := "From: a@example.com\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/mixed; boundary=B\r\n" +
+		"\r\n" +
+		"--B\r\n" +
+		"Content-Type: multipart/mixed; boundary=\"inner\r\n" +
+		" \r\n" +
+		" boundary\"\r\n" +
+		"Subject: a\r\n" +
+		" \r\n" +
+		" b\r\n" +
+		"\r\n" +
+		"--inner  boundary\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"needle inside\r\n" +
+		"--inner  boundary--\r\n" +
+		"--B--\r\n"
+	script := `require ["body", "mime", "fileinto"];
+if body :text :contains "needle inside" { fileinto "body"; }
+if header :mime :anychild :contenttype "Content-Type" "text/plain" { fileinto "child"; }
+if header :mime :anychild :is "Subject" "a  b" { fileinto "subject"; }`
+	executor, err := NewSieveExecutorWithExtensions(script, DefaultSieveExtensions)
+	if err != nil {
+		t.Fatalf("compile: %v\n%s", err, script)
+	}
+	result, err := executor.Evaluate(context.Background(), rawContext(t, raw))
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if want := []string{"body", "child", "subject"}; !slices.Equal(result.Mailboxes, want) {
+		t.Errorf("%s\nmailboxes = %q, want %q", script, result.Mailboxes, want)
+	}
+}
