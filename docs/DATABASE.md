@@ -791,3 +791,25 @@ messages without state are left unchanged; their historical SEARCH UNSEEN,
 STATUS counts and flag-update inconsistencies are not repaired. There is no
 historical backfill, backfill migration or startup scan for this change. Older
 writers and transactions started before upgrade can still create missing rows.
+
+### Import body admission connections
+
+Maildir batches and S3 import workers hold one write-pool connection for shared
+body admission while their write transactions use another. These commands require
+at least two write-pool connections; S3 import limits workers to half the pool
+size to leave room for their inserts. Uploaded-state transactions also take the
+global body lock and check durable deletion intents before admitting references.
+A lost outer lock therefore cannot make an unrelated transaction a valid commit
+fence. Keep message-body deletion paused until the complete upgraded protocol is
+deployed, as described in [Operations](OPERATIONS.md#upgrading-the-s3-message-body-lock-protocol).
+
+The original storage holder and each actual write transaction must overlap: the
+write transaction takes its shared body locks, then synchronously pings the original
+holder for the exact hashes it is admitting. It keeps its own locks until commit.
+A delayed write cannot simply reacquire a free lock after an intervening DELETE
+finished and cleared its intent. A lost or retired original holder refuses that
+stale completion. These checks also cover same-account COPY and content deduplication,
+using a fresh source read after locking; delivery can still stage quarantined bytes
+without declaring them uploaded. S3 import inserts and marks a stored body uploaded
+in one transaction. Rekey old-body deletion uses the durable intent protocol, not
+just a held advisory lock. Historical inconsistent rows are not automatically repaired.

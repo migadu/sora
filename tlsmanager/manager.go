@@ -44,8 +44,11 @@ type Manager struct {
 	config         config.TLSConfig
 	autocertMgr    *autocert.Manager
 	tlsConfig      *tls.Config
-	clusterManager clusterCoordinator   // nil outside cluster mode
-	stopCertSync   chan struct{}        // Signal to stop certificate sync worker
+	clusterManager clusterCoordinator // nil outside cluster mode
+	stopCertSync   chan struct{}      // Signal to stop certificate sync worker
+	certSyncCancel context.CancelFunc
+	certSyncWG     sync.WaitGroup
+	shutdownOnce   sync.Once
 	rateLimitMap   map[string]time.Time // Track rate-limited domains and their retry-after times
 	rateLimitMu    sync.RWMutex         // Protect rateLimitMap
 	issuanceWait   time.Duration        // How long a handshake waits for a certificate issued elsewhere
@@ -456,7 +459,7 @@ func (m *Manager) initLetsEncryptProvider() error {
 	leCfg := m.config.LetsEncrypt
 
 	// Initialize S3 cache
-	s3cache, err := NewS3Cache(leCfg.S3, encryptionOptions(leCfg.S3)...)
+	s3cache, err := OpenS3Cache(leCfg.S3)
 	if err != nil {
 		return fmt.Errorf("failed to initialize S3 cache: %w", err)
 	}
@@ -830,8 +833,16 @@ func (m *Manager) StartRenewals() {
 
 // Shutdown gracefully stops the TLS manager and its background workers
 func (m *Manager) Shutdown() {
-	if m.stopCertSync != nil {
-		close(m.stopCertSync)
-	}
+	m.shutdownOnce.Do(func() {
+		if m.certSyncCancel != nil {
+			m.certSyncCancel()
+		}
+		if m.stopCertSync != nil {
+			close(m.stopCertSync)
+		}
+	})
+	// Join this periodic worker only. autocert handshakes and separately queued
+	// fallback retries have their own lifetimes and are not joined here.
+	m.certSyncWG.Wait()
 	logger.Info("TLS manager shutdown complete")
 }
