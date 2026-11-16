@@ -384,3 +384,87 @@ func mapKeys[V any](m map[string]V) []string {
 	slices.Sort(keys)
 	return keys
 }
+
+// TestIMAP_RenameChildConflictAndAncestorSubscriptions is issue #1722: IMAP RENAME
+// answers NO [ALREADYEXISTS] (not NO [SERVERBUG]) when a descendant collides with an
+// existing mailbox in any case, and preserves subtree subscriptions when renaming a
+// mailbox to its missing ancestor's name.
+func TestIMAP_RenameChildConflictAndAncestorSubscriptions(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+	ctx := context.Background()
+
+	accountID, err := server.ResilientDB.GetAccountIDByEmailWithRetry(ctx, account.Email)
+	if err != nil {
+		t.Fatalf("GetAccountIDByEmail: %v", err)
+	}
+
+	c := dialIdentityTestClient(t, server, account.Email, account.Password)
+
+	t.Run("child conflict answers ALREADYEXISTS", func(t *testing.T) {
+		for _, mb := range []string{"amazon", "amazon/subfolder"} {
+			if err := c.Create(mb, nil).Wait(); err != nil {
+				t.Fatalf("CREATE %q: %v", mb, err)
+			}
+		}
+		// Existing descendants without their top-level parent, in both differing and
+		// matching case: RENAME gets past the check of the target's own new name and
+		// must still answer NO [ALREADYEXISTS] instead of NO [SERVERBUG].
+		for _, conflictChild := range []string{"amazontest/SUBFOLDER", "amazontest2/subfolder"} {
+			if err := server.ResilientDB.CreateMailboxWithRetry(ctx, accountID, conflictChild, nil); err != nil {
+				t.Fatalf("CreateMailbox(%q): %v", conflictChild, err)
+			}
+		}
+
+		for _, target := range []string{"amazontest", "amazontest2"} {
+			err := c.Rename("amazon", target, nil).Wait()
+			if !isIMAPCode(err, imap.ResponseCodeAlreadyExists) {
+				t.Errorf("RENAME \"amazon\" %q: %v, want NO [ALREADYEXISTS]", target, err)
+			}
+		}
+
+		listed := listByName(t, c, "amazon*", nil)
+		for _, want := range []string{"amazon", "amazon/subfolder", "amazontest/SUBFOLDER", "amazontest2/subfolder"} {
+			if listed[want] == nil {
+				t.Errorf("after refused RENAMEs: %q not listed; listed %v", want, mapKeys(listed))
+			}
+		}
+	})
+
+	t.Run("renaming into missing ancestor name keeps subscriptions", func(t *testing.T) {
+		if err := server.ResilientDB.CreateMailboxWithRetry(ctx, accountID, "Ghost/Sub", nil); err != nil {
+			t.Fatalf("CreateMailbox(\"Ghost/Sub\"): %v", err)
+		}
+		ghostSub, err := server.ResilientDB.GetMailboxByNameWithRetry(ctx, accountID, "Ghost/Sub")
+		if err != nil {
+			t.Fatalf("GetMailboxByName(\"Ghost/Sub\"): %v", err)
+		}
+		if err := server.ResilientDB.CreateMailboxWithRetry(ctx, accountID, "Ghost/Sub/Leaf", &ghostSub.ID); err != nil {
+			t.Fatalf("CreateMailbox(\"Ghost/Sub/Leaf\"): %v", err)
+		}
+		for _, sub := range []string{"Ghost/Sub/Leaf", "Ghost/Sub", "Ghost/Old"} {
+			if err := c.Subscribe(sub).Wait(); err != nil {
+				t.Fatalf("SUBSCRIBE %q: %v", sub, err)
+			}
+		}
+
+		if err := c.Rename("Ghost/Sub", "Ghost", nil).Wait(); err != nil {
+			t.Fatalf("RENAME \"Ghost/Sub\" \"Ghost\": %v", err)
+		}
+
+		listed := listByName(t, c, "Ghost*", &imap.ListOptions{SelectSubscribed: true})
+		for _, want := range []string{"Ghost", "Ghost/Leaf"} {
+			got := listed[want]
+			if got == nil || !slices.Contains(got.Attrs, imap.MailboxAttrSubscribed) || slices.Contains(got.Attrs, imap.MailboxAttrNonExistent) {
+				t.Errorf("LIST (SUBSCRIBED) \"\" \"Ghost*\": want live %q listed \\Subscribed; got %+v; listed %v", want, got, mapKeys(listed))
+			}
+		}
+		for _, gone := range []string{"Ghost/Old", "Ghost/Sub", "Ghost/Sub/Leaf"} {
+			if listed[gone] != nil {
+				t.Errorf("LIST (SUBSCRIBED) \"\" \"Ghost*\": unexpected %q (%+v)", gone, listed[gone])
+			}
+		}
+	})
+}
