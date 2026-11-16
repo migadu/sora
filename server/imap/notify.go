@@ -6,8 +6,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
@@ -261,7 +259,7 @@ func (watch *notifyWatch) wantsNonSelectedItems() bool {
 // MAILBOXES and SUBTREE specifiers by its key, LOWER(name) as the database
 // computes it (see nameKeys).
 func (watch *notifyWatch) eventsForMailbox(name, key string, subscribed bool, sharedRoot string) map[imap.NotifyEvent]bool {
-	nonSelectable := notifySharedNamespaceRoot(name, sharedRoot)
+	nonSelectable := isSharedNamespaceRoot(name, sharedRoot)
 	var events map[imap.NotifyEvent]bool
 	add := func(item *imap.NotifyItem) {
 		for _, ev := range item.Events {
@@ -324,28 +322,6 @@ func (watch *notifyWatch) eventsForMailbox(name, key string, subscribed bool, sh
 // mailbox on every tick, so it does not build root plus delimiter.
 func notifyKeyBelow(key, root string) bool {
 	return len(key) > len(root) && key[len(root)] == consts.MailboxDelimiter && strings.HasPrefix(key, root)
-}
-
-// notifySharedNamespaceRoot reports whether name is the configured \Noselect
-// shared namespace root (sharedRoot == "" when shared mailboxes are disabled),
-// matching config.SharedMailboxesConfig.IsNamespaceRoot per rune without
-// allocating on every pump tick.
-func notifySharedNamespaceRoot(name, sharedRoot string) bool {
-	if sharedRoot == "" {
-		return false
-	}
-	for sharedRoot != "" {
-		if name == "" {
-			return false
-		}
-		n, nameSize := utf8.DecodeRuneInString(name)
-		r, rootSize := utf8.DecodeRuneInString(sharedRoot)
-		if unicode.ToLower(n) != unicode.ToLower(r) {
-			return false
-		}
-		name, sharedRoot = name[nameSize:], sharedRoot[rootSize:]
-	}
-	return name == ""
 }
 
 // resolveNotifyNames sets watch.nameKeys: the database computes the key of each
