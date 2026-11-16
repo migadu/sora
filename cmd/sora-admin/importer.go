@@ -117,6 +117,7 @@ type messageMetadata struct {
 	subject              string
 	plaintextBody        string
 	sentDate             time.Time
+	sentDateUnknownZone  bool
 	internalDate         time.Time // arrival time: maildir filename timestamp / file mtime
 	inReplyTo            []string
 	references           []string
@@ -2252,7 +2253,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date"))
+	sentDate, sentDateUnknownZone, _ := helpers.ParseDateHeaderWithZone(mailHeader.Get("Date"))
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
 
@@ -2318,6 +2319,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		subject:              subject,
 		plaintextBody:        plaintextBody,
 		sentDate:             sentDate,
+		sentDateUnknownZone:  sentDateUnknownZone,
 		internalDate:         maildirInternalDate(filename, path, sentDate),
 		inReplyTo:            inReplyTo,
 		references:           references,
@@ -2527,6 +2529,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 			Subject:              up.metadata.subject,
 			PlaintextBody:        up.metadata.plaintextBody,
 			SentDate:             up.metadata.sentDate,
+			SentDateUnknownZone:  up.metadata.sentDateUnknownZone,
 			InReplyTo:            up.metadata.inReplyTo,
 			References:           up.metadata.references,
 			BodyStructure:        up.metadata.bodyStructure,
@@ -2685,6 +2688,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 			Subject:              up.metadata.subject,
 			PlaintextBody:        up.metadata.plaintextBody,
 			SentDate:             up.metadata.sentDate,
+			SentDateUnknownZone:  up.metadata.sentDateUnknownZone,
 			InReplyTo:            up.metadata.inReplyTo,
 			References:           up.metadata.references,
 			BodyStructure:        up.metadata.bodyStructure,
