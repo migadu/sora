@@ -2,6 +2,8 @@ package tlsmanager
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -101,6 +103,7 @@ func (s *stubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
 			io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>`)
 		default:
+			w.Header().Set("ETag", fmt.Sprintf(`"%x"`, sha256.Sum256(data)))
 			w.Write(data)
 		}
 	case http.MethodPut:
@@ -114,6 +117,13 @@ func (s *stubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.mu.Lock()
+		current, exists := s.objects[r.URL.Path]
+		etag := fmt.Sprintf(`"%x"`, sha256.Sum256(current))
+		if (r.Header.Get("If-None-Match") == "*" && exists) || (r.Header.Get("If-Match") != "" && (!exists || r.Header.Get("If-Match") != etag)) {
+			s.mu.Unlock()
+			w.WriteHeader(http.StatusPreconditionFailed)
+			return
+		}
 		s.objects[r.URL.Path] = body
 		s.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
