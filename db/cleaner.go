@@ -596,7 +596,11 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 	// A reapable message may still be live in its mailbox. It is expunged first, under
 	// the mailbox lock, so that it leaves unseen_count (see notLiveInMailbox). One that a
 	// concurrent delivery makes recoverable in between stays expunged, not deleted.
-	locked, err := lockLiveMessageMailboxes(ctx, tx, reapable, threshold, maxAttempts, instanceLiveness)
+	// Nothing makes a reapable message urgent, so the reaper locks only the mailboxes no
+	// other transaction holds: waiting for a busy one, it would hold the mailboxes it had
+	// already locked. The messages of a skipped mailbox stay live, so the delete below
+	// leaves them, and a later cycle reaps them.
+	locked, err := lockIdleLiveMessageMailboxes(ctx, tx, reapable, threshold, maxAttempts, instanceLiveness)
 	if err != nil {
 		return 0, fmt.Errorf("failed to cleanup failed uploads: %w", err)
 	}

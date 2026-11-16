@@ -82,7 +82,8 @@ func TestUserAPIProxy_OwnErrorsAreJSON(t *testing.T) {
 
 // A token the proxy refuses is answered as the backend answers the same token: the same
 // status, Content-Type, WWW-Authenticate challenge and body, so a client cannot tell which
-// of the two refused it. RFC 9110 section 15.5.2 requires the challenge on every 401.
+// of the two refused it. RFC 9110 section 15.5.2 requires the challenge on every 401,
+// including the refusal of a refresh token (#790).
 func TestUserAPIProxy_RefusedTokenIsAnsweredAsTheBackendAnswersIt(t *testing.T) {
 	api, err := userapi.New(nil, userapi.ServerOptions{Name: "json-backend", JWTSecret: corsTestSecret})
 	if err != nil {
@@ -102,20 +103,29 @@ func TestUserAPIProxy_RefusedTokenIsAnsweredAsTheBackendAnswersIt(t *testing.T) 
 		t.Fatal(err)
 	}
 
+	expired := corsTestToken(t, -time.Hour)
 	for _, tc := range []struct {
 		name   string
 		header string // Authorization; "" sends none
+		body   string // a refresh body; "" sends GET /user/mailboxes instead
 	}{
-		{"no authorization header", ""},
-		{"not a bearer token", "Basic dXNlcjpwYXNz"},
-		{"bearer without a token", "Bearer"},
-		{"expired token", "Bearer " + corsTestToken(t, -time.Hour)},
-		{"token signed with another key", "Bearer " + otherKey},
-		{"malformed token", "Bearer not.a.jwt"},
+		{"no authorization header", "", ""},
+		{"not a bearer token", "Basic dXNlcjpwYXNz", ""},
+		{"bearer without a token", "Bearer", ""},
+		{"expired token", "Bearer " + expired, ""},
+		{"token signed with another key", "Bearer " + otherKey, ""},
+		{"malformed token", "Bearer not.a.jwt", ""},
+		{"refresh of an expired token", "", `{"token":"` + expired + `"}`},
+		{"refresh of a token signed with another key", "", `{"token":"` + otherKey + `"}`},
+		{"refresh of a malformed token", "", `{"token":"not.a.jwt"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			get := func(h http.Handler) *httptest.ResponseRecorder {
 				r := httptest.NewRequest(http.MethodGet, "/user/mailboxes", nil)
+				if tc.body != "" {
+					r = httptest.NewRequest(http.MethodPost, "/user/auth/refresh", strings.NewReader(tc.body))
+					r.Header.Set("Content-Type", "application/json")
+				}
 				if tc.header != "" {
 					r.Header.Set("Authorization", tc.header)
 				}
