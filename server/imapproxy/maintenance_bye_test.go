@@ -171,6 +171,30 @@ func withCloseGrace(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { maintenanceCloseGrace, maintenanceLinger = savedGrace, savedLinger })
 }
 
+// A test's session has ended before the cleanups the test registered ahead of
+// newProxiedSession run, among them withCloseGrace's restore of the variables the session
+// reads. This test returns with its session closing for maintenance: the session reaches
+// endForMaintenance, which reads maintenanceLinger, only once the backend's end closes.
+func TestProxiedSession_EndsBeforeEarlierCleanups(t *testing.T) {
+	withCloseGrace(t, 5*time.Second)
+	var srv *Server
+	t.Cleanup(func() {
+		if srv == nil {
+			return
+		}
+		srv.activeSessionsMu.RLock()
+		defer srv.activeSessionsMu.RUnlock()
+		if len(srv.activeSessions) != 0 {
+			t.Error("the session was still running when the test's earlier cleanups ran")
+		}
+	})
+	p := newProxiedSession(t)
+	srv = p.s.server
+	p.send(t, "* 1 FETCH (BODY[] {64}\r\n0123456789")
+
+	p.s.closeForMaintenance()
+}
+
 // A BYE never lands inside a response: with a literal under way it waits for the end of
 // the response. Complete responses still follow it until the backend closes.
 func TestMaintenanceBye_WaitsForTheEndOfTheResponse(t *testing.T) {
