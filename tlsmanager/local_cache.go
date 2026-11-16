@@ -65,8 +65,11 @@ func readLocalSnapshot(parent *os.Root, name string) ([]byte, publicationGenerat
 		return nil, publicationGeneration{}, err
 	}
 	raw, err := readLocalRegular(parent, localMetadataName(name))
-	if err != nil {
+	if os.IsNotExist(err) {
 		return data, publicationGeneration{}, nil
+	}
+	if err != nil {
+		return nil, publicationGeneration{}, err
 	}
 	var p localProvenance
 	if json.Unmarshal(raw, &p) != nil || p.Version != 1 || p.Fingerprint != localDataFingerprint(data) {
@@ -120,7 +123,7 @@ func writeLocalAtomic(ctx context.Context, parent *os.Root, name string, data []
 	return syncLocalDirectory(parent)
 }
 func writeLocalSnapshot(ctx context.Context, parent *os.Root, name string, data []byte, g publicationGeneration) error {
-	if current, currentGeneration, err := readLocalSnapshot(parent, name); err == nil && (!g.Known || currentGeneration == g) && olderCertificate(data, current) {
+	if current, currentGeneration, err := readLocalSnapshot(parent, name); err == nil && (!g.Known || currentGeneration == g) && isCertificateCacheKey(name) && olderCertificate(data, current) {
 		return nil
 	}
 	if err := writeLocalAtomic(ctx, parent, name, data); err != nil {

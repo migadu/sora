@@ -308,6 +308,58 @@ func TestReadLocalRegularRefusesSymlinksInsideCacheDir(t *testing.T) {
 	}
 }
 
+func TestReadLocalRegularClearsNonblockBeforeRead(t *testing.T) {
+	dir := t.TempDir()
+	const name = "mail.example.com"
+	want := []byte("blocking-read-payload")
+	if err := os.WriteFile(filepath.Join(dir, name), want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+
+	origReadAll := readLocalRegularAll
+	t.Cleanup(func() { readLocalRegularAll = origReadAll })
+
+	called := false
+	readLocalRegularAll = func(f *os.File) ([]byte, error) {
+		called = true
+		conn, err := f.SyscallConn()
+		if err != nil {
+			t.Fatalf("SyscallConn: %v", err)
+		}
+		var flags int
+		var fcntlErr error
+		if err := conn.Control(func(fd uintptr) {
+			flags, fcntlErr = unix.FcntlInt(fd, unix.F_GETFL, 0)
+		}); err != nil {
+			t.Fatalf("Control: %v", err)
+		}
+		if fcntlErr != nil {
+			t.Fatalf("FcntlInt(F_GETFL): %v", fcntlErr)
+		}
+		if flags&unix.O_NONBLOCK != 0 {
+			t.Fatalf("regular file left in non-blocking mode during read: flags=0x%x", flags)
+		}
+		return origReadAll(f)
+	}
+
+	got, err := readLocalRegular(root, name)
+	if err != nil {
+		t.Fatalf("readLocalRegular: %v", err)
+	}
+	if !called {
+		t.Fatal("readLocalRegularAll hook was not invoked")
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("readLocalRegular bytes=%q, want %q", got, want)
+	}
+}
+
 func TestReadLocalSnapshotPropagatesNonENOENTProvenanceErrors(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
