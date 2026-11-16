@@ -3,7 +3,10 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,12 +32,24 @@ import (
 //     [local_cache], [cleanup], [uploader], [auth_cache] and [database] values below
 //     ([database] timeouts are parsed by every query, not once); a [spam_training] value
 //     start-up cannot parse leaves spam training out;
-//   - a max_message_size above the largest message Sora can store, which start-up caps.
+//   - a max_message_size above the largest message Sora can store, which start-up caps;
+//   - what the servers, the cluster manager, the TLS manager and the cleaner log about
+//     their settings as they start: master SASL without master_sasl_allowed_networks;
+//     an imap append_limit above the largest message Sora can store or above
+//     session_memory_limit, an imap command_timeout at or above go-imap's own read
+//     deadline, and imap capabilities disabled_caps or client_filters cannot withdraw;
+//     a User API token_duration above MaxTokenDuration; Admin and User API
+//     allowed_hosts entries that match no client; tls_cert_file or tls_key_file
+//     beside an enabled [tls]; [tls.letsencrypt] enable_fallback = false; a [cluster]
+//     addr with a port beside the port key or on loopback, peers naming this node,
+//     and no peers to join; and [cleanup] intervals below their minimum.
 //
 // Start-up logs each where the part that uses the setting starts, so a new start-up
-// warning about the file can be added here as well. Additional package-specific and
-// host-dependent warnings remain at startup. Like start-up, Warnings assumes the file
-// passes Validate.
+// warning about the file can be added here as well. Warnings that depend on the host
+// (its addresses, names, disk and DNS) remain at start-up only: plaintext
+// authentication or metrics on a publicly reachable address, the instance id and
+// mail host name, and a peers entry that names this node by host name. Like
+// start-up, Warnings assumes the file passes Validate.
 func (c *Config) Warnings() []string {
 	var warnings []string
 	warn := func(format string, args ...any) {
@@ -59,6 +74,20 @@ func (c *Config) Warnings() []string {
 			}
 		case "http_user_api":
 			userAPI = true
+		}
+
+		switch s.Type {
+		case "imap", "pop3", "managesieve":
+			// These accept master SASL logins; a proxy presents the credentials to its
+			// backends instead.
+			if s.MasterSASLPassword != "" && len(s.MasterSASLAllowedNetworks) == 0 {
+				warn("Server %s (type: %s) has 'master_sasl_password' configured without 'master_sasl_allowed_networks': "+
+					"it accepts master SASL logins from any source that knows the secret; restrict its port to the proxy hosts or set master_sasl_allowed_networks",
+					s.Name, s.Type)
+			}
+			if s.Type == "imap" {
+				s.imapWarnings(warn)
+			}
 		}
 
 		switch s.Type {
@@ -90,6 +119,25 @@ func (c *Config) Warnings() []string {
 		if (s.Type == "http_admin_api" && s.APIKey == "") || ((s.Type == "http_user_api" || s.Type == "user_api_proxy") && s.JWTSecret == "") {
 			continue
 		}
+		switch s.Type {
+		case "http_admin_api", "http_user_api":
+			// The APIs log these as they install the list; the metrics endpoint's are
+			// WarnUnusedConfigOptions'.
+			for _, entry := range helpers.InvalidNetworkEntries(s.AllowedHosts) {
+				warn("Server %s (type: %s) has 'allowed_hosts' entry %q, which is not an IP address or CIDR and matches no client", s.Name, s.Type, entry)
+			}
+		}
+		if s.Type == "http_user_api" {
+			if d, err := s.GetTokenDuration(); err == nil && d > MaxTokenDuration {
+				warn("Server %s (type: %s) has token_duration %s, above the maximum %s: start-up uses %s", s.Name, s.Type, d, MaxTokenDuration, MaxTokenDuration)
+			}
+		}
+		// Every listener with tls = true takes the global [tls] certificate when there
+		// is one (server.ListenerTLS).
+		if c.TLS.Enabled && s.TLS && (s.TLSCertFile != "" || s.TLSKeyFile != "") && slices.Contains(listenerServerTypes, s.Type) {
+			warn("Server %s (type: %s) has 'tls_cert_file'/'tls_key_file' configured, but they are ignored: with [tls] enabled the listener uses the global [tls] certificate", s.Name, s.Type)
+		}
+
 		for _, v := range serverValues {
 			if !slices.Contains(v.types, s.Type) {
 				continue
@@ -126,6 +174,14 @@ func (c *Config) Warnings() []string {
 	if w := c.Relay.TransportWarning(); w != "" {
 		warn("%s", w)
 	}
+	// The TLS manager mirrors the Let's Encrypt certificates on local disk unless
+	// enable_fallback = false.
+	if le := c.TLS.LetsEncrypt; c.TLS.Enabled && c.TLS.Provider == "letsencrypt" && le != nil && le.EnableFallback != nil && !*le.EnableFallback {
+		warn("[tls.letsencrypt] enable_fallback = false: certificates are served from S3 only, so TLS handshakes fail while S3 is unavailable")
+	}
+	if c.Cluster.Enabled {
+		c.Cluster.warnings(warn)
+	}
 
 	// The section values, each parsed only on a node that runs what reads it. The
 	// [local_cache], [cleanup] and [uploader] getters fill in a value the file leaves
@@ -133,6 +189,17 @@ func (c *Config) Warnings() []string {
 	mailBackend := c.HasMailBackend()
 	imapServer := slices.ContainsFunc(servers, func(s ServerConfig) bool { return s.Type == "imap" })
 	localCache, cleanup, uploader := c.LocalCache, c.Cleanup, c.Uploader
+
+	// A mail backend's cleaner and purge worker raise a shorter interval to their
+	// minimum.
+	if mailBackend {
+		if d, err := cleanup.GetWakeInterval(); err == nil && d < MinCleanupWakeInterval {
+			warn("[cleanup] wake_interval %s is below the minimum %s: start-up uses %s", d, MinCleanupWakeInterval, MinCleanupWakeInterval)
+		}
+		if d, err := cleanup.GetPurgePollInterval(); err == nil && d < MinPurgePollInterval {
+			warn("[cleanup] purge_poll_interval %s is below the minimum %s: start-up uses %s", d, MinPurgePollInterval, MinPurgePollInterval)
+		}
+	}
 	// Reads take the query_timeout of [database.read], or of [database.write] without one.
 	endpoint, endpointSection := c.Database.Read, "[database.read]"
 	if endpoint == nil {
@@ -303,4 +370,85 @@ func positiveDuration(value string) error {
 		err = errors.New("must be positive")
 	}
 	return err
+}
+
+// imapWarnings are the warnings an IMAP server logs about its settings as it is built
+// (server/imap New).
+func (s *ServerConfig) imapWarnings(warn func(format string, args ...any)) {
+	// append_limit as the server resolves it: the default when it does not parse or is
+	// not positive, at most the largest message Sora can store.
+	appendLimit, err := s.GetAppendLimit()
+	if err != nil || appendLimit <= 0 {
+		appendLimit = defaultAppendLimit
+	}
+	if appendLimit > consts.MaxStoredMessageSize {
+		warn("Server %s (type: %s) has append_limit %d bytes, above the largest message Sora can store: start-up uses %d",
+			s.Name, s.Type, appendLimit, int64(consts.MaxStoredMessageSize))
+		appendLimit = consts.MaxStoredMessageSize
+	}
+	// APPEND reads the message into the session memory budget ("0" is none), so a
+	// session advertises and enforces the budget as its APPENDLIMIT.
+	sessionMemoryLimit, err := s.GetSessionMemoryLimit()
+	if err != nil {
+		sessionMemoryLimit = defaultSessionMemoryLimit
+	}
+	if sessionMemoryLimit > 0 && sessionMemoryLimit < appendLimit {
+		warn("Server %s (type: %s) has append_limit %d bytes, above its session_memory_limit %d bytes, which APPEND reads the message into: "+
+			"the server advertises and enforces session_memory_limit as its APPENDLIMIT", s.Name, s.Type, appendLimit, sessionMemoryLimit)
+	}
+
+	if timeout, err := s.GetCommandTimeout(); err == nil && timeout >= IMAPLibraryReadDeadline {
+		warn("Server %s (type: %s) has 'timeouts.command_timeout' %s, at or above the IMAP library's %s read deadline: idle sessions are closed silently at %s instead",
+			s.Name, s.Type, timeout, IMAPLibraryReadDeadline, IMAPLibraryReadDeadline)
+	}
+
+	caps := IMAPServerCaps(s.EnablePreview)
+	for i, filter := range s.ClientFilters {
+		for _, name := range filter.DisableCaps {
+			if why := IMAPCapNotWithdrawn(caps, name, true); why != "" {
+				warn("Server %s (type: %s) has %q in the disable_caps of client_filters entry %d, which cannot disable it: %s", s.Name, s.Type, name, i+1, why)
+			}
+		}
+	}
+	for _, name := range s.DisabledCaps {
+		if why := IMAPCapNotWithdrawn(caps, name, false); why != "" {
+			warn("Server %s (type: %s) has %q in 'disabled_caps', which cannot disable it: %s", s.Name, s.Type, name, why)
+		}
+	}
+}
+
+// warnings are the warnings the cluster manager (cluster.New) logs about an enabled
+// [cluster]'s addr, port and peers. It drops the peers entries that name this node and
+// joins the rest. An entry written as an IP address is compared with addr here; one
+// written as a host name is resolved at start-up, so it counts as another node.
+func (c *ClusterConfig) warnings(warn func(format string, args ...any)) {
+	if _, _, err := net.SplitHostPort(c.Addr); err == nil && c.Port > 0 {
+		warn("[cluster] addr %q includes a port and port = %d is also set: the port from addr is used and the port key is ignored; remove one of them", c.Addr, c.Port)
+	}
+	bindAddr, bindPort := c.GetBindAddr(), c.GetBindPort()
+	if bindAddr == "127.0.0.1" || bindAddr == "::1" {
+		warn("[cluster] addr %s is a loopback address: gossip only reaches nodes on this machine; use a network address the other nodes can reach", bindAddr)
+	}
+
+	// With port 0 the node binds a free port, which no entry can name in advance.
+	var own []string
+	self, err := netip.ParseAddr(bindAddr)
+	selfAddrPort := netip.AddrPortFrom(self.Unmap(), uint16(bindPort))
+	if err == nil && bindPort != 0 {
+		for _, peer := range c.Peers {
+			host, port, ok := SplitClusterPeer(peer, bindPort)
+			if !ok {
+				continue
+			}
+			if addr, err := netip.ParseAddr(host); err == nil && netip.AddrPortFrom(addr.Unmap(), port) == selfAddrPort {
+				own = append(own, strconv.Quote(peer))
+			}
+		}
+	}
+	if len(own) > 0 {
+		warn("[cluster] peers lists this node's own address %s (%s): it is ignored", selfAddrPort, strings.Join(own, ", "))
+	}
+	if len(own) == len(c.Peers) {
+		warn("[cluster] has no peers to join: this node runs as a standalone single-node cluster")
+	}
 }

@@ -598,21 +598,13 @@ func (m *Manager) excludeOwnAddress(peers []string, selfIP net.IP, selfPort, def
 // IPv6 address, and an optional port that defaults to the gossip bind port. A
 // name that does not resolve stands for nothing.
 func (m *Manager) resolvePeer(peer string, defaultPort int) []netip.AddrPort {
-	if i := strings.Index(peer, "/"); i >= 0 {
-		peer = peer[i+1:]
-	}
-
-	host, portStr, err := net.SplitHostPort(peer)
-	if err != nil {
-		host, portStr = strings.TrimSuffix(strings.TrimPrefix(peer, "["), "]"), strconv.Itoa(defaultPort)
-	}
-	port, err := strconv.ParseUint(portStr, 10, 16)
-	if err != nil {
+	host, port, ok := config.SplitClusterPeer(peer, defaultPort)
+	if !ok {
 		return nil
 	}
 
 	if addr, err := netip.ParseAddr(host); err == nil {
-		return []netip.AddrPort{netip.AddrPortFrom(addr.Unmap(), uint16(port))}
+		return []netip.AddrPort{netip.AddrPortFrom(addr.Unmap(), port)}
 	}
 
 	ctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
@@ -624,7 +616,7 @@ func (m *Manager) resolvePeer(peer string, defaultPort int) []netip.AddrPort {
 	}
 	resolved := make([]netip.AddrPort, len(addrs))
 	for i, a := range addrs {
-		resolved[i] = netip.AddrPortFrom(a.Unmap(), uint16(port))
+		resolved[i] = netip.AddrPortFrom(a.Unmap(), port)
 	}
 	return resolved
 }

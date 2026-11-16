@@ -413,7 +413,8 @@ redirect actions in one run make the run fail, and the message is then handled a
 - Envelope recipient: the redirect address.
 - Body and headers: the message as Sora stored it (with `Received:`, `Delivered-To:` and any
   header edits), plus two headers on top:
-  - `X-Sora-Loop: <n>`, the previous hop count plus one.
+  - `X-Sora-Loop: <n>`, the hop count the message arrived with plus one. It is counted before
+    the script's header edits, so a script that deletes `X-Sora-Loop` does not reset it.
   - `X-Redirected-By: <primary address of the account that owns the script>`. Any
     `X-Redirected-By` already in the message is removed first.
 

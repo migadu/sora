@@ -1,14 +1,39 @@
 package imap
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 )
 
+// testNameKey stands in for the database's LOWER(name) for the names of these
+// tests. The tests of names where Go's case mapping and lower() part ways set
+// the keys as the database computes them.
+func testNameKey(name string) string {
+	return strings.ToLower(name)
+}
+
+// keyedSnapshot gives each entry without a key its testNameKey.
+func keyedSnapshot(snapshot map[int64]notifySnapshotEntry) map[int64]notifySnapshotEntry {
+	for id, entry := range snapshot {
+		if entry.key == "" {
+			entry.key = testNameKey(entry.name)
+			snapshot[id] = entry
+		}
+	}
+	return snapshot
+}
+
+// newTestWatch builds the watch NOTIFY SET would install for items, the names
+// they give keyed by testNameKey.
 func newTestWatch(items ...imap.NotifyItem) *notifyWatch {
-	watch := &notifyWatch{options: &imap.NotifyOptions{Items: items}}
+	watch := &notifyWatch{
+		options:  &imap.NotifyOptions{Items: items},
+		nameKeys: map[string]string{consts.MailboxInbox: testNameKey(consts.MailboxInbox)},
+	}
 	for i := range watch.options.Items {
 		item := &watch.options.Items[i]
 		if item.MailboxSpec == imap.NotifyMailboxSpecSelected ||
@@ -16,8 +41,134 @@ func newTestWatch(items ...imap.NotifyItem) *notifyWatch {
 			watch.selected = item
 			watch.delayed = item.MailboxSpec == imap.NotifyMailboxSpecSelectedDelayed
 		}
+		for _, name := range item.Mailboxes {
+			watch.nameKeys[name] = testNameKey(name)
+		}
 	}
 	return watch
+}
+
+// TestNotifyEventsForMailboxMatchesKeys: the INBOXES, MAILBOXES and SUBTREE
+// specifiers match mailboxes by key, LOWER(name) as the database computes it,
+// never by a Go case mapping of the names (issue #1649). The keys are ICU's.
+func TestNotifyEventsForMailboxMatchesKeys(t *testing.T) {
+	events := []imap.NotifyEvent{imap.NotifyEventMessageNew}
+	watch := func(item imap.NotifyItem, keys map[string]string) *notifyWatch {
+		w := newTestWatch(item)
+		w.nameKeys = keys
+		return w
+	}
+	tests := []struct {
+		name      string
+		watch     *notifyWatch
+		mailbox   string
+		key       string
+		wantMatch bool
+	}{
+		{
+			// U+017F is lower case already: "ſx" and "sx" are two mailboxes
+			// under every collation, which strings.EqualFold matched.
+			name:    "MailboxesLongS",
+			watch:   watch(imap.NotifyItem{Mailboxes: []string{"sx"}, Events: events}, map[string]string{"sx": "sx"}),
+			mailbox: "ſx", key: "ſx",
+		},
+		{
+			// U+212A KELVIN SIGN is three bytes; its key's "k" one.
+			name:    "SubtreeKelvinSign",
+			watch:   watch(imap.NotifyItem{Mailboxes: []string{"Kx"}, Subtree: true, Events: events}, map[string]string{"Kx": "kx"}),
+			mailbox: "Kx/y", key: "kx/y", wantMatch: true,
+		},
+		{
+			// ICU writes a word-final sigma "ς": "ΑΣ" is "ας".
+			name:    "SubtreeFinalSigma",
+			watch:   watch(imap.NotifyItem{Mailboxes: []string{"ας"}, Subtree: true, Events: events}, map[string]string{"ας": "ας"}),
+			mailbox: "ΑΣ/y", key: "ας/y", wantMatch: true,
+		},
+		{
+			// Under ICU "İNBOX" is a mailbox next to the INBOX.
+			name:    "InboxesDottedCapitalI",
+			watch:   watch(imap.NotifyItem{MailboxSpec: imap.NotifyMailboxSpecInboxes, Events: events}, map[string]string{consts.MailboxInbox: "inbox"}),
+			mailbox: "İNBOX", key: "i̇nbox",
+		},
+		{
+			name:    "InboxesInbox",
+			watch:   watch(imap.NotifyItem{MailboxSpec: imap.NotifyMailboxSpecInboxes, Events: events}, map[string]string{consts.MailboxInbox: "inbox"}),
+			mailbox: "INBOX", key: "inbox", wantMatch: true,
+		},
+		{
+			// A name PostgreSQL cannot hold has the empty key and names no mailbox.
+			name:    "UnstorableName",
+			watch:   watch(imap.NotifyItem{Mailboxes: []string{"a\x00"}, Subtree: true, Events: events}, map[string]string{"a\x00": ""}),
+			mailbox: "a", key: "a",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.watch.eventsForMailbox(tc.mailbox, tc.key, false, "")[imap.NotifyEventMessageNew]
+			if got != tc.wantMatch {
+				t.Errorf("eventsForMailbox(%q, key %q) matched %v, want %v", tc.mailbox, tc.key, got, tc.wantMatch)
+			}
+		})
+	}
+}
+
+// TestNotifyEventsForMailboxSubtreeDoesNotAllocate: the pump matches every
+// mailbox of the account against the specifiers on each tick, so a SUBTREE that
+// does not match must cost no allocation, as the name match it replaced did not.
+// Building root+"/" per call allocated once a name is longer than the
+// compiler's 32-byte stack buffer for a concatenation.
+func TestNotifyEventsForMailboxSubtreeDoesNotAllocate(t *testing.T) {
+	root := "Archive/2024/Projects/Example Client"
+	watch := newTestWatch(imap.NotifyItem{Mailboxes: []string{root}, Subtree: true, Events: []imap.NotifyEvent{imap.NotifyEventMessageNew}})
+	name := "Archive/2024/Projects/Other Client/Reports"
+	key := testNameKey(name)
+	if n := testing.AllocsPerRun(100, func() {
+		_ = watch.eventsForMailbox(name, key, false, "")
+	}); n != 0 {
+		t.Errorf("eventsForMailbox for a mailbox outside SUBTREE %q allocates %v times per call, want 0", root, n)
+	}
+}
+
+// TestDiffNotifySnapshotsKeysNames: the diff compares names by key, as the
+// database does (issue #1649). The keys are ICU's, under which "İx" and "ix"
+// are two mailboxes and "ΑΣ" and "ας" one.
+func TestDiffNotifySnapshotsKeysNames(t *testing.T) {
+	dotted := notifySnapshotEntry{name: "İx", key: "i̇x"}
+	dottedChild := notifySnapshotEntry{name: "İx/a", key: "i̇x/a"}
+	ix := notifySnapshotEntry{name: "ix", key: "ix"}
+
+	t.Run("NoChildrenOfAnotherMailbox", func(t *testing.T) {
+		events := diffNotifySnapshots(
+			map[int64]notifySnapshotEntry{1: dotted, 2: dottedChild},
+			map[int64]notifySnapshotEntry{1: dotted, 2: dottedChild, 3: ix})
+		if len(events) != 1 || events[0].name != "ix" || events[0].hasChildren {
+			t.Errorf("creating ix next to İx/a: %+v, want ix without children", events)
+		}
+	})
+
+	t.Run("ParentIsTheMailboxOfItsKey", func(t *testing.T) {
+		child := notifySnapshotEntry{name: "ix/c", key: "ix/c"}
+		events := diffNotifySnapshots(
+			map[int64]notifySnapshotEntry{1: ix, 2: dotted},
+			map[int64]notifySnapshotEntry{1: ix, 2: dotted, 3: child})
+		names := make(map[string]notifyTreeEvent)
+		for _, ev := range events {
+			names[ev.name] = ev
+		}
+		if len(events) != 2 || names["ix/c"].name == "" || !names["ix"].hasChildren || names["ix"].deleted {
+			t.Errorf("creating ix/c next to İx: %+v, want ix/c and its parent ix with children", events)
+		}
+	})
+
+	t.Run("RenameCarriesChildOfAnotherSpelling", func(t *testing.T) {
+		// "ας/x" was created below "ΑΣ": RENAME ΑΣ New carries it along.
+		events := diffNotifySnapshots(
+			map[int64]notifySnapshotEntry{1: {name: "ΑΣ", key: "ας"}, 2: {name: "ας/x", key: "ας/x"}},
+			map[int64]notifySnapshotEntry{1: {name: "New", key: "new"}, 2: {name: "New/x", key: "new/x"}})
+		if len(events) != 1 || events[0].name != "New" || events[0].oldName != "ΑΣ" || !events[0].hasChildren {
+			t.Errorf("RENAME ΑΣ New: %+v, want only New (OLDNAME ΑΣ) with children", events)
+		}
+	})
 }
 
 func TestNotifyEventsForMailbox(t *testing.T) {
@@ -129,7 +280,7 @@ func TestNotifyEventsForMailbox(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			events := tc.watch.eventsForMailbox(tc.mailbox, tc.subscribed, tc.sharedRoot)
+			events := tc.watch.eventsForMailbox(tc.mailbox, testNameKey(tc.mailbox), tc.subscribed, tc.sharedRoot)
 			if len(events) != len(tc.want) {
 				t.Fatalf("eventsForMailbox(%q) = %v, want %v", tc.mailbox, events, tc.want)
 			}
@@ -157,7 +308,7 @@ func TestDiffNotifySnapshots(t *testing.T) {
 		// 3 deleted
 	}
 
-	events := diffNotifySnapshots(prev, cur)
+	events := diffNotifySnapshots(keyedSnapshot(prev), keyedSnapshot(cur))
 
 	byName := make(map[string]notifyTreeEvent)
 	for _, ev := range events {
@@ -312,7 +463,7 @@ func TestDiffNotifySnapshotsAffectedNames(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			events := diffNotifySnapshots(tc.prev, tc.cur)
+			events := diffNotifySnapshots(keyedSnapshot(tc.prev), keyedSnapshot(tc.cur))
 			got := make(map[string]want, len(events))
 			for _, ev := range events {
 				if _, dup := got[ev.name]; dup {

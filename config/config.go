@@ -384,6 +384,28 @@ func (c *ClusterAffinityConfig) GetCleanupInterval() (time.Duration, error) {
 	return helpers.ParseDuration(c.CleanupInterval)
 }
 
+// Validate refuses a negative cleanup_interval: it is the period of the affinity
+// manager's cleanup ticker, and time.NewTicker panics on it (see positiveInterval).
+// 0 is not refused: NewAffinityManagerWithStore runs the ticker at its 1h default
+// then, as it always has, so a file with 0 keeps starting.
+func (c *ClusterAffinityConfig) Validate() error {
+	if d, err := helpers.ParseDuration(c.CleanupInterval); err == nil && d < 0 {
+		return fmt.Errorf("cleanup_interval must not be negative, got %q", c.CleanupInterval)
+	}
+	return nil
+}
+
+// positiveInterval refuses a ticker period that parses to zero or less. time.NewTicker
+// panics on one, and the tickers these periods drive run in goroutines start-up starts,
+// so the panic stops the server. A value that does not parse takes its default with a
+// warning (Config.Warnings), and "" is the default.
+func positiveInterval(key, value string) error {
+	if d, err := helpers.ParseDuration(value); err == nil && d <= 0 {
+		return fmt.Errorf("%s must be positive, got %q", key, value)
+	}
+	return nil
+}
+
 // ClusterConfig holds cluster coordination configuration using gossip protocol
 type ClusterConfig struct {
 	Enabled           bool                       `toml:"enabled"`                  // Enable cluster mode
@@ -405,6 +427,25 @@ func splitClusterAddr(addr string) (host, port string) {
 		return h, p
 	}
 	return strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]"), ""
+}
+
+// SplitClusterPeer splits a peers entry the way memberlist's Join reads it: an
+// optional "name/" prefix, a host name or IPv4 or IPv6 address (bare or bracketed),
+// and an optional port that defaults to defaultPort, the gossip bind port. ok is
+// false when the port is not a number from 0 to 65535.
+func SplitClusterPeer(peer string, defaultPort int) (host string, port uint16, ok bool) {
+	if i := strings.Index(peer, "/"); i >= 0 {
+		peer = peer[i+1:]
+	}
+	host, portStr, err := net.SplitHostPort(peer)
+	if err != nil {
+		host, portStr = strings.TrimSuffix(strings.TrimPrefix(peer, "["), "]"), strconv.Itoa(defaultPort)
+	}
+	p, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return "", 0, false
+	}
+	return host, uint16(p), true
 }
 
 // GetBindAddr returns the bind address by parsing the addr field
@@ -724,6 +765,13 @@ type CleanupConfig struct {
 	PurgePollInterval string `toml:"purge_poll_interval"`
 }
 
+// The cleaner raises a shorter wake_interval, and the purge worker a shorter
+// purge_poll_interval, to these.
+const (
+	MinCleanupWakeInterval = time.Minute
+	MinPurgePollInterval   = 5 * time.Second
+)
+
 // GetPurgePollInterval parses the purge worker's poll interval.
 func (c *CleanupConfig) GetPurgePollInterval() (time.Duration, error) {
 	if c.PurgePollInterval == "" {
@@ -870,6 +918,16 @@ func (c *LocalCacheConfig) GetPurgeInterval() (time.Duration, error) {
 		c.PurgeInterval = "12h"
 	}
 	return helpers.ParseDuration(c.PurgeInterval)
+}
+
+// Validate refuses a purge_interval or metrics_interval of zero or less: they are the
+// periods of a mail backend's cache purge loop and cache metrics writer (see
+// positiveInterval).
+func (c *LocalCacheConfig) Validate() error {
+	if err := positiveInterval("purge_interval", c.PurgeInterval); err != nil {
+		return err
+	}
+	return positiveInterval("metrics_interval", c.MetricsInterval)
 }
 
 // GetOrphanCleanupAge parses the orphan cleanup age duration
@@ -1899,6 +1957,12 @@ func (a *AuthCacheConfig) GetCleanupInterval() (time.Duration, error) {
 	return helpers.ParseDuration(a.CleanupInterval)
 }
 
+// Validate refuses a cleanup_interval of zero or less: it is the period of the auth
+// cache's cleanup loop (see positiveInterval).
+func (a *AuthCacheConfig) Validate() error {
+	return positiveInterval("cleanup_interval", a.CleanupInterval)
+}
+
 // GetCleanupIntervalWithDefault returns cleanup_interval, or its default if the value cannot be parsed.
 func (a *AuthCacheConfig) GetCleanupIntervalWithDefault() time.Duration {
 	d, err := a.GetCleanupInterval()
@@ -2153,9 +2217,14 @@ func NewDefaultConfig() Config {
 }
 
 // Helper methods for ServerConfig
+
+// defaultAppendLimit is the imap append_limit when the key is absent, does not parse
+// or is not positive (server/imap DefaultAppendLimit).
+const defaultAppendLimit = 25 * 1024 * 1024
+
 func (s *ServerConfig) GetAppendLimit() (int64, error) {
 	if s.AppendLimit == "" {
-		return 25 * 1024 * 1024, nil // 25MB default
+		return defaultAppendLimit, nil
 	}
 	return helpers.ParseSize(s.AppendLimit)
 }
@@ -2267,6 +2336,14 @@ func (s *ServerConfig) GetAuthIdleTimeout() (time.Duration, error) {
 
 // defaultTokenDuration is the http_user_api JWT lifetime when token_duration is absent.
 const defaultTokenDuration = 24 * time.Hour
+
+// MaxTokenDuration caps how long a User API JWT may live; the server lowers a longer
+// token_duration to it. JWTs are validated statelessly, so a token cannot be revoked
+// before it expires — a password change or account deletion only stops *renewal* at
+// refresh time. Clamping the duration bounds the window in which a leaked or
+// post-revocation token remains usable. Seven days is generous for an access token
+// while keeping that window finite.
+const MaxTokenDuration = 7 * 24 * time.Hour
 
 // GetTokenDuration parses token_duration (http_user_api). It takes the same
 // syntax as the other duration keys, including days ("7d"); a negative value
@@ -2444,6 +2521,12 @@ func (s *ServerConfig) GetCommandTimeoutWithDefault() time.Duration {
 	}
 	return timeout
 }
+
+// IMAPLibraryReadDeadline is the read deadline go-imap arms on authenticated
+// connections itself (RFC 3501 §5.4 autologout floor + margin). When it expires the
+// library closes the connection silently: no BYE, no timeout metric. An imap
+// command_timeout at or above it is therefore capped by the library.
+const IMAPLibraryReadDeadline = 35 * time.Minute
 
 // defaultCommandTimeout is the protocol-specific command (idle) timeout.
 func (s *ServerConfig) defaultCommandTimeout() time.Duration {
@@ -2829,7 +2912,7 @@ func (s *ServerConfig) GetAppendLimitWithDefault() int64 {
 	limit, err := s.GetAppendLimit()
 	if err != nil {
 		warnf("Failed to parse append limit for server '%s': %v, using default (25MB)", s.Name, err)
-		return 25 * 1024 * 1024 // 25MB default
+		return defaultAppendLimit
 	}
 	return limit
 }
@@ -3603,9 +3686,10 @@ type Problem struct {
 // Validate runs the shared configuration checks used by sora before service setup and
 // by `sora-admin config validate`, returning every problem these checks find.
 //
-// What a node does not run is not checked: [uploader] and [cleanup] only with a mail
-// backend, [database] only with a server that queries it, [s3] only on a node that
-// connects to it, [cluster] and [tls] only when enabled. Validate connects to nothing and
+// What a node does not run is not checked: [uploader], [cleanup] and [local_cache] only
+// with a mail backend, [database] only with a server that queries it, [s3] only on a node
+// that connects to it, [cluster], [tls] and [auth_cache] only when enabled, and
+// [cluster.affinity] only when it and [cluster] are enabled. Validate connects to nothing and
 // does not look at the node's disk. Service setup connects to the database and the
 // certificate store and checks the disk; S3 and a remote lookup are first reached when
 // used, so neither passing Validate nor a clean start shows that they can be reached.
@@ -3676,6 +3760,12 @@ func (c *Config) Validate() []Problem {
 		add("[uploader]", c.Uploader.Validate())
 		// The cleaner takes [cleanup]; delivery takes its fts_retention too.
 		add("[cleanup]", c.Cleanup.Validate())
+		// The cache purge loop and the cache metrics writer.
+		add("[local_cache]", c.LocalCache.Validate())
+	}
+	// Any node with the auth cache enabled runs its cleanup loop.
+	if c.AuthCache.Enabled {
+		add("[auth_cache]", c.AuthCache.Validate())
 	}
 
 	if user := c.DatabaseUser(); user != nil {
@@ -3704,6 +3794,10 @@ func (c *Config) Validate() []Problem {
 		add("[s3]", c.S3.Validate())
 	}
 	add("[cluster]", c.Cluster.Validate())
+	// With [cluster.affinity] enabled = false there is no affinity manager.
+	if c.Cluster.Enabled && c.Cluster.Affinity.Enabled {
+		add("[cluster.affinity]", c.Cluster.Affinity.Validate())
+	}
 	add("[tls]", c.TLS.Validate())
 
 	return problems
