@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/migadu/sora/pkg/sqlitefile"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -54,10 +57,13 @@ func TestMaildirCacheRefusesLinks(t *testing.T) {
 					}
 					link := filepath.Join(dir, name)
 					require.NoError(t, os.Symlink(outside, link))
+					// The refusal names the file in the directory the cache is opened in.
+					realDir, err := filepath.EvalSymlinks(dir)
+					require.NoError(t, err)
 
-					err := o.open(t, dir)
+					err = o.open(t, dir)
 
-					assert.ErrorContains(t, err, link, "the link was not refused by name")
+					assert.ErrorContains(t, err, filepath.Join(realDir, name)+": it is a symbolic link", "the link was not refused by name")
 					want := []string{}
 					if existing {
 						want = []string{"outside"}
@@ -142,4 +148,86 @@ func TestMaildirCacheOpensThroughALinkedMaildirPath(t *testing.T) {
 	assert.FileExists(t, filepath.Join(real, "Maildir", maildirCacheName))
 	assert.FileExists(t, filepath.Join(root, "a", "Maildir", maildirCacheName), `"link/../Maildir" is a/Maildir, not ./Maildir`)
 	assert.NoFileExists(t, filepath.Join(root, "Maildir", maildirCacheName))
+}
+
+// A cache another process holds locked when an import or export opens it is waited
+// for up to the busy timeout, not refused: the journal mode is set on every new
+// connection and needs the lock, so the timeout must already be in force then.
+func TestMaildirCacheWaitsForALockedCache(t *testing.T) {
+	openers := []struct {
+		name string
+		open func(t *testing.T, dir string) error
+	}{
+		{"import", func(t *testing.T, dir string) error {
+			importer, err := NewImporter(context.Background(), dir, "user@example.com", 1, nil, nil, ImporterOptions{TestMode: true})
+			if err == nil {
+				t.Cleanup(func() { importer.Close() })
+			}
+			return err
+		}},
+		{"export", func(t *testing.T, dir string) error {
+			exporter, err := NewExporter(context.Background(), dir, "user@example.com", 1, nil, nil, ExporterOptions{})
+			if err == nil {
+				t.Cleanup(func() { exporter.Close() })
+			}
+			return err
+		}},
+	}
+	for _, o := range openers {
+		t.Run(o.name, func(t *testing.T) {
+			dir := newMaildirWith(t, nil)
+			dsn, err := sqlitefile.DSN(filepath.Join(dir, maildirCacheName), "")
+			require.NoError(t, err)
+			other, err := sql.Open("sqlite", dsn)
+			require.NoError(t, err)
+			defer other.Close()
+			ctx := context.Background()
+			conn, err := other.Conn(ctx)
+			require.NoError(t, err)
+			defer conn.Close()
+			_, err = conn.ExecContext(ctx, `CREATE TABLE held (n INTEGER)`)
+			require.NoError(t, err)
+			_, err = conn.ExecContext(ctx, `BEGIN EXCLUSIVE`)
+			require.NoError(t, err)
+
+			released := make(chan error, 1)
+			go func() {
+				time.Sleep(200 * time.Millisecond)
+				_, err := conn.ExecContext(ctx, `COMMIT`)
+				released <- err
+			}()
+			err = o.open(t, dir)
+			require.NoError(t, <-released)
+			require.NoError(t, err, "did not wait for the lock")
+		})
+	}
+}
+
+// The files beside the cache are checked in the directory the cache is opened in:
+// the maildir path as the OS resolves it, where "link/../Maildir" is a/Maildir when
+// link names a/b, not ./Maildir as a lexical join would take it.
+func TestMaildirCacheChecksTheDirectoryItIsOpenedIn(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	for _, d := range []string{filepath.Join("a", "b"), filepath.Join("a", "Maildir"), "Maildir"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(root, d), 0755))
+	}
+	require.NoError(t, os.Symlink(filepath.Join(root, "a", "b"), filepath.Join(root, "link")))
+	outside := filepath.Join(root, "outside")
+	t.Chdir(root)
+	maildirPath := "link" + string(filepath.Separator) + ".." + string(filepath.Separator) + "Maildir"
+
+	// A link beside ./Maildir is not beside the cache.
+	require.NoError(t, os.Symlink(outside, filepath.Join(root, "Maildir", maildirCacheName+"-wal")))
+	cache, err := openMaildirCache(maildirPath)
+	require.NoError(t, err, "refused a link in a directory the cache is not in")
+	require.NoError(t, cache.Close())
+	require.FileExists(t, filepath.Join(root, "a", "Maildir", maildirCacheName))
+
+	// A link beside the cache, in a/Maildir, is refused by its name.
+	link := filepath.Join(root, "a", "Maildir", maildirCacheName+"-shm")
+	require.NoError(t, os.Symlink(outside, link))
+	_, err = openMaildirCache(maildirPath)
+	assert.ErrorContains(t, err, link+": it is a symbolic link")
+	assert.NoFileExists(t, outside)
 }
