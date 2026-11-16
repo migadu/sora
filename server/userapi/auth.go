@@ -241,6 +241,11 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if claims.AccountID <= 0 {
+		s.writeTokenRefused(w)
+		return
+	}
+
 	addr, err := server.NewAddress(strings.TrimSpace(claims.Email))
 	if err != nil || addr.HasSuffix() {
 		s.writeTokenRefused(w)
@@ -252,8 +257,9 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 
 	// Refresh-gate: re-validate account state before renewing. A stateless JWT is
 	// otherwise non-revocable, so refresh is where we cut off sessions for accounts
-	// that have been deleted/disabled or had their password changed since the token
-	// was issued. This bounds a leaked token to at most one token_duration window.
+	// that have been deleted/disabled, reassigned to another account, or had their
+	// password changed since the token was issued. This bounds a leaked token to at
+	// most one token_duration window.
 	accountID, epoch, err := s.rdb.GetCredentialEpochWithRetry(ctx, email)
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
@@ -264,6 +270,13 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 		}
 		logger.Warn("HTTP Mail API: Error revalidating account on refresh", "name", s.name, "error", err)
 		s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
+		return
+	}
+	if accountID != claims.AccountID {
+		// Credential was reassigned to (or recreated on) a different account since
+		// this token was issued — never renew into another account's identity.
+		logger.Info("HTTP Mail API: Refusing refresh for reassigned credential", "name", s.name, "email", email, "token_account_id", claims.AccountID, "current_account_id", accountID)
+		s.writeTokenRefused(w)
 		return
 	}
 	if claims.AuthEpoch < epoch.Unix() {
