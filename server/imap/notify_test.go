@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/migadu/go-imap"
-	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 )
 
@@ -35,7 +34,7 @@ func keyedSnapshot(snapshot map[int64]notifySnapshotEntry) map[int64]notifySnaps
 func newTestWatch(items ...imap.NotifyItem) *notifyWatch {
 	watch := &notifyWatch{
 		options:  &imap.NotifyOptions{Items: items},
-		nameKeys: map[string]string{consts.MailboxInbox: testNameKey(consts.MailboxInbox)},
+		nameKeys: make(map[string]string),
 	}
 	for i := range watch.options.Items {
 		item := &watch.options.Items[i]
@@ -51,7 +50,7 @@ func newTestWatch(items ...imap.NotifyItem) *notifyWatch {
 	return watch
 }
 
-// TestNotifyEventsForMailboxMatchesKeys: the INBOXES, MAILBOXES and SUBTREE
+// TestNotifyEventsForMailboxMatchesKeys: the MAILBOXES and SUBTREE
 // specifiers match mailboxes by key, LOWER(name) as the database computes it,
 // never by a Go case mapping of the names (issue #1649). The keys are ICU's.
 func TestNotifyEventsForMailboxMatchesKeys(t *testing.T) {
@@ -86,17 +85,6 @@ func TestNotifyEventsForMailboxMatchesKeys(t *testing.T) {
 			name:    "SubtreeFinalSigma",
 			watch:   watch(imap.NotifyItem{Mailboxes: []string{"ας"}, Subtree: true, Events: events}, map[string]string{"ας": "ας"}),
 			mailbox: "ΑΣ/y", key: "ας/y", wantMatch: true,
-		},
-		{
-			// Under ICU "İNBOX" is a mailbox next to the INBOX.
-			name:    "InboxesDottedCapitalI",
-			watch:   watch(imap.NotifyItem{MailboxSpec: imap.NotifyMailboxSpecInboxes, Events: events}, map[string]string{consts.MailboxInbox: "inbox"}),
-			mailbox: "İNBOX", key: "i̇nbox",
-		},
-		{
-			name:    "InboxesInbox",
-			watch:   watch(imap.NotifyItem{MailboxSpec: imap.NotifyMailboxSpecInboxes, Events: events}, map[string]string{consts.MailboxInbox: "inbox"}),
-			mailbox: "INBOX", key: "inbox", wantMatch: true,
 		},
 		{
 			// A name PostgreSQL cannot hold has the empty key and names no mailbox.
@@ -216,16 +204,26 @@ func TestNotifyEventsForMailbox(t *testing.T) {
 			want:       msgEvents,
 		},
 		{
-			name:    "InboxesMatchesOnlyInbox",
+			// RFC 5465 §6.3: a server that does not compute the mailboxes an
+			// MDA may deliver to "MUST treat "inboxes" as equivalent to
+			// "personal"". Sieve fileinto delivers to "Lists" (issue #1744).
+			name:    "InboxesMatchesEveryPersonalMailbox",
 			watch:   newTestWatch(imap.NotifyItem{MailboxSpec: imap.NotifyMailboxSpecInboxes, Events: msgEvents}),
-			mailbox: "Archive",
-			want:    nil,
+			mailbox: "Lists",
+			want:    msgEvents,
 		},
 		{
-			name:    "InboxesMatchesInboxCaseInsensitive",
+			name:    "InboxesMatchesInbox",
 			watch:   newTestWatch(imap.NotifyItem{MailboxSpec: imap.NotifyMailboxSpecInboxes, Events: msgEvents}),
-			mailbox: "inbox",
+			mailbox: "INBOX",
 			want:    msgEvents,
+		},
+		{
+			name:       "InboxesExcludesSharedNamespace",
+			watch:      newTestWatch(imap.NotifyItem{MailboxSpec: imap.NotifyMailboxSpecInboxes, Events: msgEvents}),
+			mailbox:    "Shared/Team",
+			sharedRoot: "Shared",
+			want:       nil,
 		},
 		{
 			name:       "SubscribedRequiresSubscription",

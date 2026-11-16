@@ -8,10 +8,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/migadu/sora/db"
-	"github.com/migadu/sora/logger"
+	"slices"
 	"sync"
 	"time"
+
+	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/logger"
 )
 
 const (
@@ -45,8 +47,10 @@ type Watcher struct {
 	load      func(context.Context, int64) (db.CredentialChanges, error)
 	prune     func(context.Context, time.Time) (int64, error)
 	sinks     Sinks
+	wake      chan struct{}
 	mu        sync.Mutex
 	cursor    int64
+	applied   map[int64]int64
 	appliedAt time.Time
 	lastPrune time.Time
 	failing   bool
@@ -56,11 +60,23 @@ type Watcher struct {
 // lookback is retained for caller compatibility; it is not a clock overlap and
 // does not filter the feed. Persistent cache max_age must be at most Retention.
 func New(load func(context.Context, int64) (db.CredentialChanges, error), prune func(context.Context, time.Time) (int64, error), sinks Sinks, _ time.Duration) *Watcher {
-	w := &Watcher{load: load, prune: prune, sinks: sinks}
+	w := &Watcher{load: load, prune: prune, sinks: sinks, wake: make(chan struct{}, 1)}
 	if sinks.Suspend != nil {
 		sinks.Suspend()
 	}
 	return w
+}
+
+// Trigger requests an immediate Refresh on a running Watcher, coalescing bursts
+// while a refresh is already queued or running.
+func (w *Watcher) Trigger() {
+	if w == nil || w.wake == nil {
+		return
+	}
+	select {
+	case w.wake <- struct{}{}:
+	default:
+	}
 }
 
 // Refresh acknowledges a snapshot boundary only after every sink and lifecycle
@@ -103,19 +119,24 @@ func (w *Watcher) Refresh(ctx context.Context) (retErr error) {
 			errs = append(errs, fmt.Errorf("reset credential change sinks: %w", err))
 		}
 	}
-	if len(changes.Accounts) > 0 {
-		logger.Debug("Credential changes: dropping cached logins", "accounts", len(changes.Accounts), "removed", len(changes.Removed))
+	accounts := changes.Accounts
+	removed := changes.Removed
+	if len(changes.Events) > 0 {
+		accounts, removed = w.unappliedChanges(changes.Events, reset)
+	}
+	if len(accounts) > 0 {
+		logger.Debug("Credential changes: dropping cached logins", "accounts", len(accounts), "removed", len(removed))
 		if w.sinks.AuthCache != nil {
-			if err := w.sinks.AuthCache.InvalidateAccounts(ctx, changes.Accounts); err != nil {
+			if err := w.sinks.AuthCache.InvalidateAccounts(ctx, accounts); err != nil {
 				errs = append(errs, fmt.Errorf("invalidate persistent login cache: %w", err))
 			}
 		}
 		for _, c := range caches {
-			c.InvalidateAccounts(changes.Accounts)
+			c.InvalidateAccounts(accounts)
 		}
 	}
 	for _, s := range sessions {
-		for _, id := range changes.Removed {
+		for _, id := range removed {
 			s.EndLocalSessions(id)
 		}
 	}
@@ -138,12 +159,47 @@ func (w *Watcher) Refresh(ctx context.Context) (retErr error) {
 	}
 	// A full Reset covers all local state, including changes pruned during a long
 	// outage or below an old cursor after primary/time discontinuity.
+	if reset {
+		clear(w.applied)
+	}
+	for id, xid := range w.applied {
+		if xid < changes.NextCursor {
+			delete(w.applied, id)
+		}
+	}
+	for _, ev := range changes.Events {
+		if ev.WriterXID >= changes.NextCursor {
+			if w.applied == nil {
+				w.applied = make(map[int64]int64)
+			}
+			w.applied[ev.ID] = ev.WriterXID
+		}
+	}
 	w.cursor = changes.NextCursor
 	w.appliedAt = changes.ReadAt
 	if pruned {
 		w.lastPrune = changes.ReadAt
 	}
 	return nil
+}
+
+func (w *Watcher) unappliedChanges(events []db.CredentialChangeEvent, reset bool) (accounts, removed []int64) {
+	for _, ev := range events {
+		if !reset {
+			if xid, ok := w.applied[ev.ID]; ok && xid == ev.WriterXID {
+				continue
+			}
+		}
+		accounts = append(accounts, ev.AccountID)
+		if ev.Removed {
+			removed = append(removed, ev.AccountID)
+		}
+	}
+	slices.Sort(accounts)
+	accounts = slices.Compact(accounts)
+	slices.Sort(removed)
+	removed = slices.Compact(removed)
+	return accounts, removed
 }
 
 func (w *Watcher) Run(ctx context.Context, interval time.Duration) {
@@ -154,6 +210,10 @@ func (w *Watcher) Run(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		case <-w.wake:
+		}
+		if ctx.Err() != nil {
+			return
 		}
 		refreshCtx, cancel := context.WithTimeout(ctx, max(interval, 5*time.Second))
 		err := w.Refresh(refreshCtx)
