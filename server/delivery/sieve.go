@@ -299,10 +299,14 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	// Write every redirect to the relay queue now, but hand none to the relay worker
 	// before the caller has stored what this delivery stores: a target the queue cannot
 	// take keeps the message in INBOX when nothing else stores it, and a delivery that
-	// fails after a handoff would relay it again on every retry.
+	// fails after a handoff would relay it again on every retry. The hop count is the
+	// one the message arrived with, before the script's header edits, which
+	// RedirectAllowed checked: a count read after an editheader script deleted
+	// X-Sora-Loop would restart on every pass and never reach max_redirect_hops.
 	allHeld := true
 	if len(result.RedirectTo) > 0 {
-		outcome.Redirect, outcome.AbortRedirect, allHeld = s.holdRedirects(ctx, recipient, result, outcome.MessageBytes, outcome.MessageEntity)
+		arrivedHops := helpers.RedirectHopCount(helpers.HeaderGetter(sieveCtx.Header))
+		outcome.Redirect, outcome.AbortRedirect, allHeld = s.holdRedirects(ctx, recipient, result, outcome.MessageBytes, arrivedHops)
 	}
 
 	if result.Action == sieveengine.ActionDiscard && result.Rejected {
@@ -365,8 +369,10 @@ func (s *StandardSieveExecutor) sieveFlags(names []string) []imap.Flag {
 // handing it to the relay worker, and reports whether every target was held. commit
 // hands over every redirect still held, charges each one handed over against the rate
 // limit, and reports whether all of them went; abort drops the ones still held. A
-// direct relay handler cannot hold a message: its commit sends it.
-func (s *StandardSieveExecutor) holdRedirects(ctx context.Context, recipient RecipientInfo, result sieveengine.Result, messageBytes []byte, messageEntity *message.Entity) (commit func() bool, abort func(), allHeld bool) {
+// direct relay handler cannot hold a message: its commit sends it. arrivedHops is
+// the redirect hop count of the message before the script's header edits; every
+// outgoing copy is stamped one above it.
+func (s *StandardSieveExecutor) holdRedirects(ctx context.Context, recipient RecipientInfo, result sieveengine.Result, messageBytes []byte, arrivedHops int) (commit func() bool, abort func(), allHeld bool) {
 	type heldRedirect struct {
 		to     string
 		commit func() error
@@ -376,7 +382,7 @@ func (s *StandardSieveExecutor) holdRedirects(ctx context.Context, recipient Rec
 	allHeld = true
 	if recipient.FromAddress != nil && (s.RelayQueue != nil || s.RelayHandler != nil) {
 		// Stamp the outgoing copy with an incremented hop count (loop backstop).
-		relayBytes := helpers.PrependHeaderLine(messageBytes, helpers.RedirectLoopHeader, strconv.Itoa(helpers.RedirectHopCount(helpers.HeaderGetter(messageEntity.Header.Map()))+1))
+		relayBytes := helpers.PrependHeaderLine(messageBytes, helpers.RedirectLoopHeader, strconv.Itoa(arrivedHops+1))
 		// Attribute this redirect to the script owner, replacing any earlier or
 		// sender-supplied attribution. Aliases still use the account's primary address.
 		relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, recipient.Address.FullAddress())
