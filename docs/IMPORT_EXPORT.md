@@ -312,10 +312,12 @@ relative and its target is within that directory, as Pigeonhole's own
 `.dovecot.sieve -> sieve/<name>.sieve`. Any other link (one out of the directory, or any absolute
 link) is refused: nothing is stored, and the summary and the log name the file. Where Pigeonhole's script
 directory is not below the link's directory, its link is absolute; name the script it points to
-instead. As a hard link cannot be told apart from the file, a file others may not read is read
-only if the directory holding its name (the link's, for a link) belongs to the file's owner and
-its Unix mode grants neither group nor other write access; otherwise, as for a script only its owner may read in `/tmp`, it is
-refused in the same way.
+instead. A file larger than 65536 bytes, the limit of `sora-admin sieve put`, is refused the same
+way. At most 65537 bytes are read to detect a file above the limit. As a hard link cannot be told
+apart from the file, a file others may not read is read only if the directory holding its name
+(the link's, for a link) belongs to the file's owner and its Unix mode grants neither group nor
+other write access; otherwise, as for a script only its owner may read in `/tmp`, it is refused
+in the same way.
 
 | Situation | Result |
 |---|---|
@@ -323,7 +325,7 @@ refused in the same way.
 | The script compiles, no active script | Stored as `imported` and activated. |
 | The script does not compile | Stored as `imported-invalid`, inactive, so delivery keeps working. The import goes on. |
 | It does not compile, and an earlier run's `imported-invalid` compiles | The user fixed it; it is kept and the file is not stored. |
-| The file is a refused link or cannot be read, or the database fails | The `Sieve script:` line says `NOT imported` and why. The import goes on. |
+| The file is a refused link, over 65536 bytes or cannot be read, or the database fails | The `Sieve script:` line says `NOT imported` and why. The import goes on. |
 
 Compilation uses `[sieve] enabled_extensions` from the config file. The summary ends with a
 `Sieve script:` line that says what happened. Dovecot's global or `sieve_before` scripts are not
@@ -577,8 +579,14 @@ its name, so a symbolic or hard link at that name is replaced, and the file it p
 alone. A mailbox directory, `cur/`, `new/` or `tmp/` that is a link is followed only when the link
 is relative and its target is below the target directory; any other link makes the export fail
 before it writes a message, naming the path. An existing `dovecot-keywords` or `dovecot-uidlist`
-that is such a link is not read, and is replaced as if it were not there. The SQLite cache and
-its sidecars still use ordinary paths; their policy is unchanged ([section 8](#8-the-sqlite-cache-sora-maildirdb)).
+that is such a link is not read, and is replaced as if it were not there. Neither is one with more
+than one link: a hard link cannot be told apart from the file it names, while the export and
+Dovecot create these files by renaming a new file over the name, so theirs have one. A file that
+is there but not read is logged as a warning: the folder's keyword numbering, or the UIDs of the
+files an earlier run wrote, are then not kept. A copy of the target made with `cp -al`, or a tool
+that replaces identical files with hard links, gives these files a second link. The SQLite
+cache and its sidecars still use ordinary paths; their policy is unchanged
+([section 8](#8-the-sqlite-cache-sora-maildirdb)).
 
 **Re-runs.** The exporter keeps `sora-maildir.db` in the target directory, with the same schema
 as the importer's ([section 8](#8-the-sqlite-cache-sora-maildirdb)), and records each exported

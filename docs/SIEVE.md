@@ -95,7 +95,7 @@ delivery is refused up front.
 | ManageSieve (`managesieve` server) | `max_script_size` in the `[[server]]` block, default `16kb` | See [section 9](#9-managesieve). |
 | User API `/user/filters` | 64 KB, fixed | Names may use letters, digits, `-`, `_` and `.`, up to 128 characters. See [USER_API.md](USER_API.md). |
 | `sora-admin sieve put` | 64 KB, fixed | Reads the script from `--file` or standard input. See [ADMIN_CLI.md](ADMIN_CLI.md). |
-| Import from Dovecot (`--sieve`) | | See [IMPORT_EXPORT.md](IMPORT_EXPORT.md). |
+| Import from Dovecot (`--sieve`) | 64 KB, fixed | See [IMPORT_EXPORT.md](IMPORT_EXPORT.md). |
 
 `sora-admin sieve` also has `list`, `show`, `delete`, `activate`, `deactivate` and `rename`.
 

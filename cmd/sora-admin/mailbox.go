@@ -709,16 +709,12 @@ Examples:
 	// mailboxes_account_id_lower_name_unique. Unicode EqualFold is different
 	// from database LOWER (for example final sigma and dotted I). The arrays
 	// carry simulated successful renames, which a query of stored rows cannot see.
-	countConflicts := func(existing, proposed []string, fold bool) (int, error) {
-		comparison := "existing.name = proposed.name"
-		if fold {
-			comparison = "LOWER(existing.name) = LOWER(proposed.name)"
-		}
+	countConflicts := func(existing, proposed []string) (int, error) {
 		var conflicts int
 		err := opDB.WritePool.QueryRow(ctx, `
 			SELECT COUNT(*) FROM unnest($1::text[]) AS existing(name)
 			WHERE EXISTS (SELECT 1 FROM unnest($2::text[]) AS proposed(name)
-				WHERE `+comparison+`)`, existing, proposed).Scan(&conflicts)
+				WHERE LOWER(existing.name) = LOWER(proposed.name))`, existing, proposed).Scan(&conflicts)
 		if err != nil {
 			return 0, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 		}
@@ -770,7 +766,7 @@ Examples:
 		if !foundSelf {
 			return consts.ErrMailboxNotFound
 		}
-		conflicts, err := countConflicts(otherNames, []string{decoded}, true)
+		conflicts, err := countConflicts(otherNames, []string{decoded})
 		if err != nil {
 			return err
 		}
@@ -805,7 +801,7 @@ Examples:
 			if i := strings.LastIndex(decoded, string(consts.MailboxDelimiter)); i >= 0 {
 				decodedParent = decoded[:i]
 			}
-			matches, err := countConflicts([]string{parentName}, []string{decodedParent}, true)
+			matches, err := countConflicts([]string{parentName}, []string{decodedParent})
 			if err != nil {
 				return err
 			}
@@ -830,27 +826,18 @@ Examples:
 		}
 
 		if len(cascadedNames) > 0 {
-			allNames := make([]string, 0, len(mboxes))
 			var unaffectedNames []string
 			for _, existing := range mboxes {
-				allNames = append(allNames, existing.Name)
 				if existing.ID != r.MailboxID && !helpers.IsDescendantOf(existing.Path, r.Path) {
 					unaffectedNames = append(unaffectedNames, existing.Name)
 				}
 			}
-			exactConflicts, err := countConflicts(allNames, cascadedNames, false)
-			if err != nil {
-				return err
-			}
-			if exactConflicts > 0 {
-				return fmt.Errorf("rename would create conflicting mailbox names (%d conflicts)", exactConflicts)
-			}
-			conflicts, err := countConflicts(unaffectedNames, cascadedNames, true)
+			conflicts, err := countConflicts(unaffectedNames, cascadedNames)
 			if err != nil {
 				return err
 			}
 			if conflicts > 0 {
-				return consts.ErrMailboxAlreadyExists
+				return fmt.Errorf("rename would create conflicting mailbox names (%d conflicts): %w", conflicts, consts.ErrMailboxAlreadyExists)
 			}
 		}
 
