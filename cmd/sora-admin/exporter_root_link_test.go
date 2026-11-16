@@ -110,6 +110,29 @@ func TestNewExporterRefusesAUsersLinkToAnotherUsersMaildir(t *testing.T) {
 		assert.Error(t, err, "the export opened a directory it created through alice's link")
 		assert.Empty(t, treeNames(t, victimHome), "the export created entries in the tree the link leads to")
 	})
+
+	// A ".." after a directory that does not exist goes back to the directory that holds
+	// it, and on to a link that is refused: the refusal comes before anything is created.
+	t.Run("a link after a missing directory and dot-dot", func(t *testing.T) {
+		victimHome := t.TempDir()
+		ownedByUID(t, bob, victimHome)
+		home := t.TempDir()
+		link := filepath.Join(home, "x")
+		require.NoError(t, os.Symlink(victimHome, link))
+		ownedByUID(t, alice, link)
+		sep := string(filepath.Separator)
+		maildirPath := home + sep + "a" + sep + ".." + sep + "x" + sep + "Maildir"
+
+		exporter, err := NewExporter(context.Background(), maildirPath, "alice@example.com", 1, nil, nil, ExporterOptions{})
+		if exporter != nil {
+			exporter.Close()
+		}
+		if assert.Error(t, err, "another user's home was opened for the export through alice's link") {
+			assert.Contains(t, err.Error(), resolvedName(t, link), "the refusal does not name the link")
+		}
+		assert.Equal(t, []string{"x"}, treeNames(t, home), "the export created a directory before it refused the link")
+		assert.Empty(t, treeNames(t, victimHome), "the export created entries in the tree the link leads to")
+	})
 }
 
 func TestNewExporterFollowsALinkOfRootOrOfTheMaildirsOwner(t *testing.T) {
