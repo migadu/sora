@@ -855,10 +855,10 @@ func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID i
 
 	// Detach the mailbox's message_state rows in bounded batches, so the DELETE below
 	// has nothing to cascade into. They are detached (mailbox_id = NULL), not deleted:
-	// the ON DELETE CASCADE used to delete them, and RestoreMessages only UPDATEs this
-	// row, so a message restored after a purge came back with no state at all — unread,
-	// keyword-less, and every STORE on it silently updating nothing. Kept, its flags
-	// survive the round trip; the row still goes when the message row itself is reaped
+	// the ON DELETE CASCADE used to delete them, and RestoreMessages takes a restored
+	// message's flags from this row, so a message restored after a purge came back
+	// unread and keyword-less. Kept, its flags survive the round trip; the row still
+	// goes when the message row itself is reaped
 	// (message_state.message_id is ON DELETE CASCADE). The stats triggers skip rows
 	// whose mailbox_id is NULL, and these messages are all expunged by now anyway.
 	detachedState, err := tx.Exec(ctx, `

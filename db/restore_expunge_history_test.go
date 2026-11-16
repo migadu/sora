@@ -87,6 +87,16 @@ func TestRestoreMessages_KeepsTheExpungeOfTheOldUID(t *testing.T) {
 		require.Equal(t, []imap.UID{oldUID}, vanished)
 	})
 
+	t.Run("the mailbox's counts take the restored message", func(t *testing.T) {
+		require.Equal(t, 3, after.NumMessages)
+		var cached, live int
+		require.NoError(t, db.GetReadPool().QueryRow(ctx,
+			`SELECT unseen_count, `+liveUnseenCount("$1")+` FROM mailbox_stats WHERE mailbox_id = $1`,
+			inboxID).Scan(&cached, &live))
+		require.Equal(t, live, cached, "unseen_count must match the live unseen count")
+		require.Zero(t, cached, "every message, the restored one included, is \\Seen")
+	})
+
 	t.Run("a restored message is not deleted any more", func(t *testing.T) {
 		deleted, err := db.ListDeletedMessages(ctx, ListDeletedMessagesParams{Email: testEmail, MailboxPath: &inbox})
 		require.NoError(t, err)

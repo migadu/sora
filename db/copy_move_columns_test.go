@@ -20,9 +20,10 @@ import (
 // answers SEARCH, SORT and THREAD as a different message. "references" (migration 000036)
 // was lost that way.
 
-// perRowMessageColumns are the messages columns a COPY or MOVE does not take from the
-// source row, because they describe the row rather than the message. Every other column
-// must hold the same value on the new row as on the source row.
+// perRowMessageColumns are the messages columns a COPY, MOVE or restore does not take from
+// the source row, because they describe the row rather than the message, unless the path
+// names one it carries all the same. Every other column must hold the same value on the
+// new row as on the source row.
 var perRowMessageColumns = map[string]string{
 	"id":              "the new row's own key",
 	"uid":             "assigned by the destination mailbox",
@@ -37,6 +38,9 @@ var perRowMessageColumns = map[string]string{
 	// original delivery went to, NULL on every path that is not an MTA delivery. A COPY
 	// or MOVE is not one.
 	"delivery_hash": "set by MTA delivery only",
+	// Migration 000067: marks an expunged row whose message a restore brought back as a
+	// new row. Never set on a live row.
+	"restored_at": "set on the expunged row a restore copied",
 }
 
 func TestCopyMoveCarryEveryMessageColumn(t *testing.T) {
