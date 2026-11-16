@@ -124,6 +124,35 @@ func expungeMessage(t *testing.T, db *Database, mailboxID int64, uid imap.UID) {
 	require.NoError(t, err)
 }
 
+// restoredCopyID returns the id of the live row a restore created for the expunged row
+// expungedID. A restore brings the message back as a new row in the mailbox it was
+// expunged from (whose name the new row records), and leaves the expunged row in place,
+// marked restored_at (#1712).
+func restoredCopyID(t *testing.T, db *Database, expungedID int64) int64 {
+	t.Helper()
+	var n int
+	var id *int64
+	require.NoError(t, db.GetReadPool().QueryRow(context.Background(), `
+		SELECT COUNT(n.id), MIN(n.id)
+		FROM messages o
+		LEFT JOIN mailboxes mb ON mb.id = o.mailbox_id
+		JOIN messages n ON n.account_id = o.account_id AND n.content_hash = o.content_hash
+		 AND n.mailbox_path = COALESCE(mb.name, o.mailbox_path) AND n.expunged_at IS NULL
+		WHERE o.id = $1 AND o.expunged_at IS NOT NULL AND o.restored_at IS NOT NULL
+	`, expungedID).Scan(&n, &id))
+	require.Equal(t, 1, n, "message %d must have been restored as exactly one live row", expungedID)
+	return *id
+}
+
+// requireNotRestored checks that the message of the expunged row id is still deleted.
+func requireNotRestored(t *testing.T, db *Database, id int64) {
+	t.Helper()
+	var deleted bool
+	require.NoError(t, db.GetReadPool().QueryRow(context.Background(),
+		"SELECT expunged_at IS NOT NULL AND restored_at IS NULL FROM messages WHERE id = $1", id).Scan(&deleted))
+	require.True(t, deleted, "message %d must still be deleted", id)
+}
+
 // TestRestoreMessages_ByMessageIDs tests restoring specific messages by their IDs
 func TestRestoreMessages_ByMessageIDs(t *testing.T) {
 	if testing.Short() {
@@ -200,30 +229,27 @@ func TestRestoreMessages_ByMessageIDs(t *testing.T) {
 	err = tx.Commit(ctx)
 	require.NoError(t, err)
 
-	// Verify message 1 is restored (expunged_at is NULL)
-	var expungedAt *time.Time
-	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT expunged_at FROM messages WHERE id = $1", msgID1).Scan(&expungedAt)
-	require.NoError(t, err)
-	assert.Nil(t, expungedAt, "Message 1 should be restored (expunged_at should be NULL)")
+	// Verify message 1 is restored, as a new row
+	restored1 := restoredCopyID(t, db, msgID1)
 
 	// Verify message 2 is still deleted
-	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT expunged_at FROM messages WHERE id = $1", msgID2).Scan(&expungedAt)
-	require.NoError(t, err)
-	assert.NotNil(t, expungedAt, "Message 2 should still be deleted")
+	requireNotRestored(t, db, msgID2)
 
 	// Verify message 3 was never deleted
+	var expungedAt *time.Time
 	err = db.GetReadPool().QueryRow(ctx,
 		"SELECT expunged_at FROM messages WHERE id = $1", msgID3).Scan(&expungedAt)
 	require.NoError(t, err)
 	assert.Nil(t, expungedAt, "Message 3 should never have been deleted")
 
-	// Verify the restored message got a new UID
-	var newUID imap.UID
-	err = db.GetReadPool().QueryRow(ctx, "SELECT uid FROM messages WHERE id = $1", msgID1).Scan(&newUID)
+	// Verify the restored message got a new UID, and the expunged row kept the old one
+	var newUID, oldUID imap.UID
+	err = db.GetReadPool().QueryRow(ctx, "SELECT uid FROM messages WHERE id = $1", restored1).Scan(&newUID)
 	require.NoError(t, err)
 	assert.NotEqual(t, uid1, newUID, "Restored message should have a new UID")
+	err = db.GetReadPool().QueryRow(ctx, "SELECT uid FROM messages WHERE id = $1", msgID1).Scan(&oldUID)
+	require.NoError(t, err)
+	assert.Equal(t, uid1, oldUID, "the expunged row keeps the UID that was expunged")
 }
 
 // TestRestoreMessages_ByMailbox tests restoring all deleted messages from a specific mailbox
@@ -371,7 +397,7 @@ func TestRestoreMessages_RecreateMailbox(t *testing.T) {
 	var restoredMailboxID int64
 	var expungedAt *time.Time
 	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT mailbox_id, expunged_at FROM messages WHERE id = $1", msgID).Scan(&restoredMailboxID, &expungedAt)
+		"SELECT mailbox_id, expunged_at FROM messages WHERE id = $1", restoredCopyID(t, db, msgID)).Scan(&restoredMailboxID, &expungedAt)
 	require.NoError(t, err)
 	assert.Equal(t, recreatedInbox.ID, restoredMailboxID, "Message should be in the recreated mailbox")
 	assert.Nil(t, expungedAt, "Message should be restored (expunged_at should be NULL)")
@@ -432,14 +458,8 @@ func TestRestoreMessages_ByTimeRange(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify only message 2 is restored
-	var msg1ExpungedAt, msg2ExpungedAt *time.Time
-	err = db.GetReadPool().QueryRow(ctx, "SELECT expunged_at FROM messages WHERE id = $1", msgID1).Scan(&msg1ExpungedAt)
-	require.NoError(t, err)
-	err = db.GetReadPool().QueryRow(ctx, "SELECT expunged_at FROM messages WHERE id = $1", msgID2).Scan(&msg2ExpungedAt)
-	require.NoError(t, err)
-
-	assert.NotNil(t, msg1ExpungedAt, "Old message should still be deleted")
-	assert.Nil(t, msg2ExpungedAt, "Recent message should be restored")
+	requireNotRestored(t, db, msgID1)
+	restoredCopyID(t, db, msgID2)
 }
 
 // TestListDeletedMessages_WithFilters tests listing deleted messages with various filters
@@ -671,7 +691,7 @@ func TestRestoreMessages_PreservesFlags(t *testing.T) {
 	var restoredExpungedAt *time.Time
 	err = db.GetReadPool().QueryRow(ctx,
 		"SELECT m.uid, ms.flags, ms.custom_flags, m.expunged_at FROM messages m JOIN message_state ms ON m.id = ms.message_id WHERE id = $1",
-		msgID).Scan(&restoredUID, &restoredFlags, &restoredCustomFlags, &restoredExpungedAt)
+		restoredCopyID(t, db, msgID)).Scan(&restoredUID, &restoredFlags, &restoredCustomFlags, &restoredExpungedAt)
 	require.NoError(t, err)
 
 	// Assertions
@@ -786,7 +806,7 @@ func TestRestoreMessages_PreservesMessageMetadata(t *testing.T) {
 	err = db.GetReadPool().QueryRow(ctx, `
 		SELECT uid, subject, message_id, in_reply_to, sent_date, internal_date, size, content_hash
 		FROM messages WHERE id = $1
-	`, msgID).Scan(&restored.UID, &restored.Subject, &restored.MessageID,
+	`, restoredCopyID(t, db, msgID)).Scan(&restored.UID, &restored.Subject, &restored.MessageID,
 		&restored.InReplyTo, &restored.SentDate, &restored.InternalDate,
 		&restored.Size, &restored.ContentHash)
 	require.NoError(t, err)
@@ -871,7 +891,7 @@ func TestRestoreMessages_SameMessageIDInDifferentMailboxes(t *testing.T) {
 	defer tx3.Rollback(ctx)
 
 	uids := []imap.UID{imap.UID(inboxUID)}
-	copiedUIDs, _, err := db.CopyMessages(ctx, tx3, &uids, inboxID, trashID, accountID, "example.com", "user", "")
+	copiedUIDs, _, err := db.CopyMessages(ctx, tx3, &uids, inboxID, trashID, accountID, "example.com", "user", "", nil, nil)
 	require.NoError(t, err)
 	require.Len(t, copiedUIDs, 1)
 
@@ -948,11 +968,11 @@ func TestRestoreMessages_SameMessageIDInDifferentMailboxes(t *testing.T) {
 
 	err = db.GetReadPool().QueryRow(ctx,
 		"SELECT ms.flags, m.expunged_at IS NOT NULL, m.mailbox_id FROM messages m JOIN message_state ms ON m.id = ms.message_id WHERE id = $1",
-		inboxMsgID).Scan(&inboxRestoredFlags, &inboxRestoredExpunged, &inboxMailboxID)
+		restoredCopyID(t, db, inboxMsgID)).Scan(&inboxRestoredFlags, &inboxRestoredExpunged, &inboxMailboxID)
 	require.NoError(t, err)
 	err = db.GetReadPool().QueryRow(ctx,
 		"SELECT ms.flags, m.expunged_at IS NOT NULL, m.mailbox_id FROM messages m JOIN message_state ms ON m.id = ms.message_id WHERE id = $1",
-		trashMsgID).Scan(&trashRestoredFlags, &trashRestoredExpunged, &trashRestoredMailboxID)
+		restoredCopyID(t, db, trashMsgID)).Scan(&trashRestoredFlags, &trashRestoredExpunged, &trashRestoredMailboxID)
 	require.NoError(t, err)
 
 	// Both messages should be restored (expunged_at = NULL)
@@ -1218,10 +1238,10 @@ func TestDeleteMailbox_FullRestoreFlow(t *testing.T) {
 	var restoredMailboxID1, restoredMailboxID2 int64
 	var expungedAt1, expungedAt2 *time.Time
 	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT mailbox_id, expunged_at FROM messages WHERE id = $1", msgID1).Scan(&restoredMailboxID1, &expungedAt1)
+		"SELECT mailbox_id, expunged_at FROM messages WHERE id = $1", restoredCopyID(t, db, msgID1)).Scan(&restoredMailboxID1, &expungedAt1)
 	require.NoError(t, err)
 	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT mailbox_id, expunged_at FROM messages WHERE id = $1", msgID2).Scan(&restoredMailboxID2, &expungedAt2)
+		"SELECT mailbox_id, expunged_at FROM messages WHERE id = $1", restoredCopyID(t, db, msgID2)).Scan(&restoredMailboxID2, &expungedAt2)
 	require.NoError(t, err)
 
 	assert.Equal(t, recreatedArchive.ID, restoredMailboxID1, "Message 1 should be in recreated mailbox")
@@ -1304,12 +1324,13 @@ func TestRestoreMessages_DuplicateTombstonesSameMailbox(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, live, "exactly one live copy of the Message-ID in INBOX after restore")
 
-	// The restore must not hard-delete rows: the second tombstone stays for the cleaner
-	// (it is the cleaner, not restore, that owns physical deletion + S3 orphan checks).
-	var total int
+	// The restore must not hard-delete rows: both tombstones stay for the cleaner (it is
+	// the cleaner, not restore, that owns physical deletion + S3 orphan checks), the
+	// restored one as the record of its UID's expunge.
+	var tombstonesAfter int
 	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT COUNT(*) FROM messages WHERE mailbox_id = $1 AND message_id = $2",
-		inboxID, dupMessageID).Scan(&total)
+		"SELECT COUNT(*) FROM messages WHERE mailbox_id = $1 AND message_id = $2 AND expunged_at IS NOT NULL",
+		inboxID, dupMessageID).Scan(&tombstonesAfter)
 	require.NoError(t, err)
-	assert.Equal(t, 2, total, "restore must not physically delete the other tombstone")
+	assert.Equal(t, 2, tombstonesAfter, "restore must not physically delete a tombstone")
 }

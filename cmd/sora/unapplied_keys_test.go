@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -82,7 +84,7 @@ func startUnappliedKeysProxy(t *testing.T, deps *serverDependencies, start func(
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errChan := make(chan error, 1)
-	go start(ctx, deps, serverCfg, errChan)
+	deps.serverManager.Go(func() { start(ctx, deps, serverCfg, errChan) })
 	t.Cleanup(func() {
 		cancel()
 		deps.serverManager.Wait()
@@ -225,5 +227,84 @@ func TestUserAPIProxy_EnableAffinity(t *testing.T) {
 				t.Errorf("enable_affinity = %v: affinity written = %v", enabled, found)
 			}
 		})
+	}
+}
+
+// allowed_origins in a user_api_proxy's [[server]] block is the CORS policy of the
+// responses the proxy writes itself (#377): a 401 for a token it refuses has to carry
+// the headers a backend's own 401 would, or a browser page cannot read it.
+func TestUserAPIProxy_AllowedOrigins(t *testing.T) {
+	const origin = "https://app.example.com"
+	cfg := config.NewDefaultConfig()
+	cfg.Servers.TrustedNetworks = nil
+	healthChecks := false
+	serverCfg := config.ServerConfig{
+		Type:               "user_api_proxy",
+		Name:               "user-api-proxy-cors",
+		RemoteAddrs:        []string{"127.0.0.1:1"}, // never dialed: the token is refused first
+		RemoteHealthChecks: &healthChecks,
+		JWTSecret:          "a-jwt-secret-of-at-least-32-bytes!!",
+		AllowedOrigins:     []string{origin},
+	}
+	_, addr := startUnappliedKeysProxy(t, unappliedKeysDeps(cfg), startDynamicUserAPIProxyServer, serverCfg, "UserAPI-"+serverCfg.Name)
+
+	req, _ := http.NewRequest(http.MethodGet, "http://"+addr+"/user/mailboxes", nil)
+	req.Header.Set("Origin", origin)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("GET /user/mailboxes without a token: %s, want 401", resp.Status)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != origin {
+		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, origin)
+	}
+}
+
+// auth_rate_limit in a user_api_proxy's [[server]] block rate limits the logins through
+// the proxy (#895). The proxy took no such setting, and left every login to the backends'
+// limiters, which never see the logins the proxy refuses itself.
+func TestUserAPIProxy_AuthRateLimit(t *testing.T) {
+	var hits atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"Invalid credentials"}`))
+	}))
+	t.Cleanup(backend.Close)
+
+	limit := config.DefaultAuthRateLimiterConfig()
+	limit.Enabled = true
+	limit.MaxAttemptsPerIPUsername = 2
+	limit.DelayStartThreshold = 100
+	cfg := config.NewDefaultConfig()
+	cfg.Servers.TrustedNetworks = nil // the test client's address is not exempt
+	healthChecks := false
+	serverCfg := config.ServerConfig{
+		Type:               "user_api_proxy",
+		Name:               "user-api-proxy-895",
+		RemoteAddrs:        []string{backend.Listener.Addr().String()},
+		RemoteHealthChecks: &healthChecks,
+		JWTSecret:          "a-jwt-secret-of-at-least-32-bytes!!",
+		AuthRateLimit:      &limit,
+	}
+	_, addr := startUnappliedKeysProxy(t, unappliedKeysDeps(cfg), startDynamicUserAPIProxyServer, serverCfg, "UserAPI-"+serverCfg.Name)
+
+	for i := 1; i <= limit.MaxAttemptsPerIPUsername+1; i++ {
+		resp, err := http.Post("http://"+addr+"/user/auth/login", "application/json",
+			strings.NewReader(`{"email":"user@example.com","password":"wrong-password"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("login %d: %s, want 401", i, resp.Status)
+		}
+	}
+	if n := hits.Load(); n != int32(limit.MaxAttemptsPerIPUsername) {
+		t.Errorf("%d logins reached the backend, want %d: the one after max_attempts_per_ip_username is refused by the proxy", n, limit.MaxAttemptsPerIPUsername)
 	}
 }

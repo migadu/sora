@@ -59,11 +59,47 @@ func getPermanentFlags(rights string) []imap.Flag {
 	return flags
 }
 
-// GetDisplayFlags returns flags that are "defined" for this mailbox.
+// getDisplayFlags returns flags that are "defined" for this mailbox.
 // This includes standard system flags, common keywords, and any custom flags
 // found to be in use within this specific mailbox.
 // This is used for the FLAGS response in SELECT/EXAMINE.
 func getDisplayFlags(ctx context.Context, rdb *resilient.ResilientDatabase, dbMbox *db.DBMailbox, debugLog func(string, ...any)) []imap.Flag {
+	var customFlagsFromDB []string
+	if rdb != nil && dbMbox.ID > 0 {
+		var err error
+		customFlagsFromDB, err = rdb.GetUniqueCustomFlagsForMailboxWithRetry(ctx, dbMbox.ID)
+		if err != nil {
+			// Log the error, but don't fail the SELECT/EXAMINE.
+			// The client will still get the base set of flags.
+			debugLog("error fetching custom flags for mailbox", "mailbox_id", dbMbox.ID, "name", dbMbox.Name, "error", err)
+		}
+	}
+	return buildDisplayFlags(customFlagsFromDB)
+}
+
+// getDisplayFlagsInSnapshot is getDisplayFlags for a caller running inside
+// InReadSnapshotWithRetry: non-fatal statement errors roll back to a savepoint and
+// fall back to base flags, while fatal/retryable snapshot errors are returned so the
+// snapshot can be retried as a whole.
+func getDisplayFlagsInSnapshot(ctx context.Context, rdb *resilient.ResilientDatabase, dbMbox *db.DBMailbox, debugLog func(string, ...any)) ([]imap.Flag, error) {
+	var customFlagsFromDB []string
+	if rdb != nil && dbMbox.ID > 0 {
+		nonFatalErr, fatalErr := rdb.OptionalReadInSnapshot(ctx, func(spCtx context.Context) error {
+			var err error
+			customFlagsFromDB, err = rdb.GetUniqueCustomFlagsForMailboxWithRetry(spCtx, dbMbox.ID)
+			return err
+		})
+		if fatalErr != nil {
+			return nil, fatalErr
+		}
+		if nonFatalErr != nil {
+			debugLog("error fetching custom flags for mailbox", "mailbox_id", dbMbox.ID, "name", dbMbox.Name, "error", nonFatalErr)
+		}
+	}
+	return buildDisplayFlags(customFlagsFromDB), nil
+}
+
+func buildDisplayFlags(customFlagsFromDB []string) []imap.Flag {
 	// Keyword identity is case-insensitive (RFC 9051 §2.3.2), so we must never
 	// advertise two case-variants of the same keyword. Key the set by the folded
 	// (lower-cased) flag name and keep one representative case per identity.
@@ -95,20 +131,8 @@ func getDisplayFlags(ctx context.Context, rdb *resilient.ResilientDatabase, dbMb
 	for _, f := range baseFlags {
 		addFlag(f)
 	}
-
-	// Fetch custom flags actually used in this mailbox from the database
-	// m.DBMailbox is embedded, so m.ID gives the mailbox ID.
-	if rdb != nil && dbMbox.ID > 0 {
-		customFlagsFromDB, err := rdb.GetUniqueCustomFlagsForMailboxWithRetry(ctx, dbMbox.ID)
-		if err != nil {
-			// Log the error, but don't fail the SELECT/EXAMINE.
-			// The client will still get the base set of flags.
-			debugLog("error fetching custom flags for mailbox", "mailbox_id", dbMbox.ID, "name", dbMbox.Name, "error", err)
-		} else {
-			for _, cf := range customFlagsFromDB {
-				addFlag(imap.Flag(cf))
-			}
-		}
+	for _, cf := range customFlagsFromDB {
+		addFlag(imap.Flag(cf))
 	}
 
 	finalFlagsList := make([]imap.Flag, 0, len(flagsByFold))

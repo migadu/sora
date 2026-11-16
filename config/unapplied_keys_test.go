@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -76,6 +77,15 @@ func TestWarnUnusedConfigOptions_KeysTheServerTypeDoesNotApply(t *testing.T) {
 	}
 }
 
+// A ManageSieve backend advertises the [sieve] enabled_extensions, so the warning about
+// a supported_extensions it ignores names the setting that does apply there.
+func TestWarnUnusedConfigOptions_SupportedExtensionsNamesSieveEnabledExtensions(t *testing.T) {
+	warnings := warningsFor(ServerConfig{Type: "managesieve", Name: "sieve", SupportedExtensions: []string{"vacation"}})
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "'supported_extensions'") || !strings.Contains(warnings[0], "[sieve] enabled_extensions") {
+		t.Errorf("want one warning naming 'supported_extensions' and [sieve] enabled_extensions, got %v", warnings)
+	}
+}
+
 // The LMTP backend's command_timeout is its idle timeout. Absent, it is the 5
 // minutes the server has always used, which RFC 5321 section 4.5.3.2.7 sets as
 // the floor ("An SMTP server SHOULD have a timeout of at least 5 minutes while
@@ -123,5 +133,96 @@ max_message_size = "5mb"
 	}
 	if slices.Contains(ignored, "spam_training.max_message_size") {
 		t.Error("spam_training.max_message_size is applied but reported as ignored")
+	}
+}
+
+// limitsAppliedBy is every [server.limits] key with the server types whose start
+// functions read it (#619). The config accepts each key on every type.
+var limitsAppliedBy = map[string]struct {
+	set   func(*ServerLimitsConfig)
+	types []string
+}{
+	// IMAP backend: buildIMAPServerOptions and the FETCH PREVIEW budgets.
+	"search_rate_limit_per_min": {func(l *ServerLimitsConfig) { n := 30; l.SearchRateLimitPerMin = &n }, []string{"imap"}},
+	"search_rate_limit_window":  {func(l *ServerLimitsConfig) { l.SearchRateLimitWindow = "2m" }, []string{"imap"}},
+	"search_rate_limit_burst":   {func(l *ServerLimitsConfig) { n := 10; l.SearchRateLimitBurst = &n }, []string{"imap"}},
+	"thread_max_messages":       {func(l *ServerLimitsConfig) { l.ThreadMaxMessages = 1000 }, []string{"imap"}},
+	"preview_s3_per_min":        {func(l *ServerLimitsConfig) { n := 0; l.PreviewS3PerMin = &n }, []string{"imap"}},
+	"preview_s3_burst":          {func(l *ServerLimitsConfig) { n := 5; l.PreviewS3Burst = &n }, []string{"imap"}},
+	"preview_s3_node_per_min":   {func(l *ServerLimitsConfig) { n := 100; l.PreviewS3NodePerMin = &n }, []string{"imap"}},
+	"preview_s3_max_size":       {func(l *ServerLimitsConfig) { l.PreviewS3MaxSize = "5mb" }, []string{"imap"}},
+	// The session memory tracker exists in the IMAP and POP3 backends only.
+	"session_memory_limit": {func(l *ServerLimitsConfig) { l.SessionMemoryLimit = "50mb" }, []string{"imap", "pop3"}},
+	// The pre-authentication error counter exists in the three login proxies only.
+	"max_auth_errors": {func(l *ServerLimitsConfig) { l.MaxAuthErrors = 3 }, []string{"imap_proxy", "pop3_proxy", "managesieve_proxy"}},
+	// Sieve runs on delivery: LMTP and the Admin API's /admin/mail/deliver.
+	"redirect_rate_limit":  {func(l *ServerLimitsConfig) { n := 0; l.RedirectRateLimit = &n }, []string{"lmtp", "http_admin_api"}},
+	"redirect_rate_window": {func(l *ServerLimitsConfig) { l.RedirectRateWindow = "2h" }, []string{"lmtp", "http_admin_api"}},
+	"max_redirect_hops":    {func(l *ServerLimitsConfig) { n := 1; l.MaxRedirectHops = &n }, []string{"lmtp", "http_admin_api"}},
+}
+
+// TestLimitsAppliedByCoversEveryKey keeps limitsAppliedBy complete: a new
+// [server.limits] key needs a decision on which server types apply it.
+func TestLimitsAppliedByCoversEveryKey(t *testing.T) {
+	limitsType := reflect.TypeOf(ServerLimitsConfig{})
+	keys := map[string]bool{}
+	for i := range limitsType.NumField() {
+		key, _, _ := strings.Cut(limitsType.Field(i).Tag.Get("toml"), ",")
+		keys[key] = true
+		if _, ok := limitsAppliedBy[key]; !ok {
+			t.Errorf("limits.%s is not in limitsAppliedBy: say which server types apply it", key)
+		}
+	}
+	for key := range limitsAppliedBy {
+		if !keys[key] {
+			t.Errorf("limitsAppliedBy lists limits.%s, which ServerLimitsConfig does not have", key)
+		}
+	}
+}
+
+// Each [server.limits] key set on a server type that does not apply it is reported
+// at startup, naming the key and the server (#619); on a type that applies it,
+// nothing is reported.
+func TestWarnUnusedConfigOptions_LimitsTheServerTypeDoesNotApply(t *testing.T) {
+	for key, spec := range limitsAppliedBy {
+		for _, serverType := range ServerTypes {
+			t.Run(key+"/"+serverType, func(t *testing.T) {
+				var limits ServerLimitsConfig
+				spec.set(&limits)
+				s := ServerConfig{Type: serverType, Name: "server-619", Limits: &limits}
+				var named []string
+				s.WarnUnusedConfigOptions(func(format string, args ...any) {
+					if w := fmt.Sprintf(format, args...); strings.Contains(w, "'limits."+key+"'") {
+						named = append(named, w)
+					}
+				})
+				if slices.Contains(spec.types, serverType) {
+					if len(named) > 0 {
+						t.Errorf("limits.%s applies to %s but was warned about: %v", key, serverType, named)
+					}
+					return
+				}
+				if len(named) != 1 || !strings.Contains(named[0], "server-619") {
+					t.Errorf("limits.%s on %s (applied by %v only): want one warning naming it on server-619, got %v", key, serverType, spec.types, named)
+				}
+			})
+		}
+	}
+}
+
+// config.toml.example sets no key in a block whose server type does not apply it.
+func TestExampleConfigSetsNoUnappliedKey(t *testing.T) {
+	cfg := NewDefaultConfig()
+	if err := LoadConfigFromFile("../config.toml.example", &cfg); err != nil {
+		t.Fatalf("load config.toml.example: %v", err)
+	}
+	servers := cfg.GetAllServers()
+	if len(servers) == 0 {
+		t.Fatal("config.toml.example has no enabled [[server]] block")
+	}
+	for _, s := range servers {
+		s.WarnUnusedConfigOptions(func(format string, args ...any) {
+			t.Errorf("config.toml.example: %s", fmt.Sprintf(format, args...))
+		})
 	}
 }

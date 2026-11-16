@@ -18,7 +18,7 @@ import (
 // This is a simpler unit-style test that verifies the fix at the cache layer.
 func TestLookupCacheIsRemoteLookupAccountPreservation(t *testing.T) {
 	// Create a lookup cache
-	cache := lookupcache.New(
+	cache := lookupcache.New("test", "test",
 		5*time.Minute,
 		1*time.Minute,
 		10000,
@@ -75,7 +75,7 @@ func TestLookupCacheIsRemoteLookupAccountPreservation(t *testing.T) {
 
 // TestLookupCacheInvalidation tests cache invalidation functionality
 func TestLookupCacheInvalidation(t *testing.T) {
-	cache := lookupcache.New(
+	cache := lookupcache.New("test", "test",
 		5*time.Minute,
 		1*time.Minute,
 		10000,
@@ -141,7 +141,7 @@ func TestBackendRejectionScenario(t *testing.T) {
 	t.Log("  - Result: Consistent routing to remotelookup-specified backend")
 	t.Log("")
 
-	cache := lookupcache.New(5*time.Minute, 1*time.Minute, 10000, 30*time.Second, 30*time.Second)
+	cache := lookupcache.New("test", "test", 5*time.Minute, 1*time.Minute, 10000, 30*time.Second, 30*time.Second)
 
 	// Step 1: RemoteLookup returns backend A
 	t.Log("Step 1: RemoteLookup returns backend A, caching result")

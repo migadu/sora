@@ -13,16 +13,40 @@ import (
 )
 
 func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
-	// RFC 8438 §1: with LIST-STATUS, SIZE "can be queried for many mailboxes at
-	// once using just one LIST command", so it needs STATUS=SIZE here as well.
-	if options.ReturnStatus != nil && options.ReturnStatus.Size {
-		if err := s.requireCapability(imap.CapStatusSize, "STATUS SIZE"); err != nil {
+	// RFC 5258 §3: each LIST option is "enabled by a capability string", and "a
+	// client MUST NOT send an option for which the server has not advertised
+	// support". go-imap refuses the LIST-EXTENDED syntax itself; the SPECIAL-USE
+	// selection and return options are SPECIAL-USE's (RFC 6154 §2), the STATUS
+	// return option is LIST-STATUS's (RFC 5819 §2) and the METADATA return option
+	// LIST-METADATA's (RFC 9590 §1), which the default capabilities leave out.
+	if options.SelectSpecialUse || options.ReturnSpecialUse {
+		if err := s.requireCapability(imap.CapSpecialUse, "LIST SPECIAL-USE"); err != nil {
+			return err
+		}
+	}
+	if options.ReturnStatus != nil {
+		if err := s.requireCapability(imap.CapListStatus, "LIST RETURN (STATUS)"); err != nil {
+			return err
+		}
+		if err := s.checkStatusItems(options.ReturnStatus); err != nil {
+			return err
+		}
+	}
+	if options.ReturnMetadata != nil {
+		if err := s.requireCapability(imap.CapListMetadata, "LIST RETURN (METADATA)"); err != nil {
 			return err
 		}
 	}
 
-	// If no patterns, just return a simple response without any database operations
+	// go-imap omits "" from patterns for both plain LIST ref "" and extended LIST
+	// with selection or return options. Per RFC 5258 §3 and RFC 9051 §6.3.9.1, an
+	// empty "" mailbox name argument has no special meaning when any selection or
+	// return options are specified and returns no LIST responses because there is
+	// no mailbox with an empty name.
 	if len(patterns) == 0 {
+		if hasListOptions(options) {
+			return nil
+		}
 		return w.WriteList(&imap.ListData{
 			Attrs: []imap.MailboxAttr{imap.MailboxAttrNoSelect},
 			Delim: consts.MailboxDelimiter,
@@ -42,20 +66,6 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 		return s.internalError("failed to fetch mailboxes: %v", err)
 	}
 
-	// Each mbox.Subscribed is already sourced from the name-based subscriptions
-	// table (migration 000046) by GetMailboxes. We additionally fetch the full
-	// subscribed-name set here so LSUB / LIST (SUBSCRIBED) can also report
-	// subscribed names that have NO live mailbox (RFC 3501 §6.3.6 / RFC 9051
-	// §6.3.7). subscribedSet maps LOWER(name) -> the stored spelling.
-	subNames, err := s.server.rdb.GetSubscribedMailboxNamesWithRetry(readCtx, s.AccountID())
-	if err != nil {
-		return s.internalError("failed to fetch subscriptions: %v", err)
-	}
-	subscribedSet := make(map[string]string, len(subNames))
-	for _, n := range subNames {
-		subscribedSet[strings.ToLower(n)] = n
-	}
-
 	// Build name -> DBMailbox mapping for batch STATUS lookups
 	nameToMailbox := make(map[string]*db.DBMailbox, len(mboxes))
 	for _, mbox := range mboxes {
@@ -64,10 +74,11 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 
 	// Shared-namespace root (e.g. "Shared" for prefix "Shared/"), used to mark that
 	// root \Noselect. Empty when shared mailboxes are disabled.
-	sharedNamespaceRoot := ""
-	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
-		sharedNamespaceRoot = strings.TrimSuffix(s.server.config.SharedMailboxes.NamespacePrefix, string(consts.MailboxDelimiter))
-	}
+	sharedNamespaceRoot := s.sharedNamespaceRoot()
+
+	// The capability set cannot change during a command, so read its immutable
+	// snapshot once rather than per mailbox.
+	caps := s.GetCapabilities()
 
 	var l []imap.ListData
 	if options.SelectSubscribed {
@@ -75,13 +86,22 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 		// and non-existent subscribed names. LSUB arrives here too — the go-imap
 		// layer dispatches it as LIST (SUBSCRIBED RECURSIVEMATCH) and renders the
 		// CHILDINFO parents as \Noselect.
-		l = buildSubscribedList(ref, patterns, options, mboxes, subscribedSet, s.GetCapabilities(), sharedNamespaceRoot)
+		//
+		// Each mbox.Subscribed is already sourced from the name-based subscriptions
+		// table (migration 000046) by GetMailboxes. The full subscribed-name set is
+		// fetched as well so LSUB / LIST (SUBSCRIBED) can also report subscribed
+		// names that have NO live mailbox (RFC 3501 §6.3.6 / RFC 9051 §6.3.7).
+		subscribed, err := s.server.rdb.GetSubscribedMailboxNamesByKeyWithRetry(readCtx, s.AccountID())
+		if err != nil {
+			return s.internalError("failed to fetch subscriptions: %v", err)
+		}
+		l = buildSubscribedList(ref, patterns, options, mboxes, subscribed, caps, sharedNamespaceRoot)
 	} else {
 		for _, mbox := range mboxes {
 			if !matchesAnyPattern(mbox.Name, ref, patterns) {
 				continue
 			}
-			data := listMailbox(mbox, options, s.GetCapabilities(), sharedNamespaceRoot)
+			data := listMailbox(mbox, options, caps, sharedNamespaceRoot)
 			if data != nil {
 				l = append(l, *data)
 			}
@@ -92,53 +112,65 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 		return l[i].Mailbox < l[j].Mailbox
 	})
 
-	hasListStatusCap := s.GetCapabilities().Has(imap.CapListStatus)
-
 	// Now handle STATUS returns if needed - after we've processed all mailboxes
 	// Use batch query to fetch all summaries in a single database round-trip
 	// instead of N individual Status() calls (which each do 3 queries).
-	if options.ReturnStatus != nil && hasListStatusCap {
-		// Collect mailbox IDs for all listed mailboxes
+	if options.ReturnStatus != nil {
+		// Collect the listed entries that get a STATUS response: selectable
+		// mailboxes that matched the selection options and that this user may
+		// read (RFC 5819 §2 / RFC 9051 §6.3.9.2).
+		var wanted []int // indices into l
 		var mailboxIDs []int64
-		for _, data := range l {
-			if data.Mailbox == "" {
+		for i := range l {
+			data := &l[i]
+			if !listEntryWantsStatus(data, options) {
 				continue
 			}
-			if mbox, ok := nameToMailbox[data.Mailbox]; ok {
-				mailboxIDs = append(mailboxIDs, mbox.ID)
+			mbox, ok := nameToMailbox[data.Mailbox]
+			if !ok {
+				continue
 			}
+			// RFC 4314: STATUS data requires the 'r' (read) right. A shared mailbox can
+			// be listed with only 'l' (lookup); don't leak its counts via LIST-STATUS.
+			// Owned mailboxes (owner == this account) always have 'r', so only the few
+			// shared ones incur an ACL check — the batch fast path is preserved.
+			if mbox.AccountID != s.AccountID() {
+				hasRead, permErr := s.server.rdb.CheckMailboxPermissionWithRetry(readCtx, mbox.ID, s.AccountID(), 'r')
+				if permErr != nil {
+					// RFC 5819 §2: on unexpected problems the server "MAY drop the
+					// corresponding STATUS reply".
+					s.DebugLog("LIST-STATUS: skipping STATUS, ACL read-check failed", "mailbox", data.Mailbox, "error", permErr)
+					continue
+				}
+				if !hasRead {
+					// RFC 5819 §2: when STATUS fails because the mailbox can't be
+					// selected ("l" granted, "r" not), "the STATUS response MUST NOT
+					// be returned and the LIST response MUST include the \NoSelect
+					// attribute".
+					data.Attrs = append(data.Attrs, imap.MailboxAttrNoSelect)
+					continue
+				}
+			}
+			wanted = append(wanted, i)
+			mailboxIDs = append(mailboxIDs, mbox.ID)
 		}
 
 		if len(mailboxIDs) > 0 {
 			// Single batch query replaces N * 3 individual queries
 			summaries, err := s.server.rdb.GetMailboxSummariesBatchWithRetry(readCtx, mailboxIDs)
+			var deleted map[int64]uint32
+			if err == nil && options.ReturnStatus.NumDeleted {
+				deleted, err = s.server.rdb.CountDeletedMessagesWithRetry(readCtx, mailboxIDs)
+			}
 			if err != nil {
-				s.DebugLog("failed to get batch mailbox summaries", "error", err)
+				// RFC 5819 §2: on unexpected problems the server "MAY drop the
+				// corresponding STATUS reply".
+				s.DebugLog("failed to get batch mailbox status", "error", err)
 			} else {
 				// Populate STATUS data from batch results
-				for i := range l {
+				for _, i := range wanted {
 					data := &l[i]
-					if data.Mailbox == "" {
-						continue
-					}
-					mbox, ok := nameToMailbox[data.Mailbox]
-					if !ok {
-						continue
-					}
-					// RFC 4314: STATUS data requires the 'r' (read) right. A shared mailbox can
-					// be listed with only 'l' (lookup); don't leak its counts via LIST-STATUS.
-					// Owned mailboxes (owner == this account) always have 'r', so only the few
-					// shared ones incur an ACL check — the batch fast path is preserved.
-					if mbox.AccountID != s.AccountID() {
-						hasRead, permErr := s.server.rdb.CheckMailboxPermissionWithRetry(readCtx, mbox.ID, s.AccountID(), 'r')
-						if permErr != nil {
-							s.DebugLog("LIST-STATUS: skipping STATUS, ACL read-check failed", "mailbox", data.Mailbox, "error", permErr)
-							continue
-						}
-						if !hasRead {
-							continue
-						}
-					}
+					mbox := nameToMailbox[data.Mailbox]
 					summary, ok := summaries[mbox.ID]
 					if !ok {
 						continue
@@ -178,12 +210,16 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 						num := uint32(unseenCount)
 						statusData.NumUnseen = &num
 					}
-					if s.GetCapabilities().Has(imap.CapCondStore) && options.ReturnStatus.HighestModSeq {
+					if caps.Has(imap.CapCondStore) && options.ReturnStatus.HighestModSeq {
 						statusData.HighestModSeq = summary.HighestModSeq
 					}
 					if options.ReturnStatus.AppendLimit {
 						limit := s.AppendLimit()
 						statusData.AppendLimit = &limit
+					}
+					if options.ReturnStatus.NumDeleted {
+						num := deleted[mbox.ID]
+						statusData.NumDeleted = &num
 					}
 					if options.ReturnStatus.Size {
 						size := summary.TotalSize
@@ -216,6 +252,45 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 	return nil
 }
 
+// hasListOptions reports whether any LIST-EXTENDED selection or return option
+// is set on options. Empty option lists (() and RETURN ()) leave all fields
+// unset, which RFC 5258 §3 defines as equivalent to specifying no options.
+func hasListOptions(options *imap.ListOptions) bool {
+	if options == nil {
+		return false
+	}
+	return options.SelectSubscribed || options.SelectRemote ||
+		options.SelectRecursiveMatch || options.SelectSpecialUse ||
+		options.ReturnSubscribed || options.ReturnChildren ||
+		options.ReturnSpecialUse || options.ReturnStatus != nil ||
+		options.ReturnMetadata != nil
+}
+
+// listEntryWantsStatus reports whether LIST ... RETURN (STATUS (...)) should
+// emit a STATUS response for data. RFC 5819 §2 and RFC 9051 §6.3.9.2 require:
+//   - no STATUS response for mailboxes listed with \Noselect or \NonExistent;
+//   - STATUS responses only for mailboxes that themselves match the selection
+//     options (excluding unsubscribed parents returned solely via RECURSIVEMATCH).
+//
+// A mailbox matches the SUBSCRIBED selection when it is listed \Subscribed, which
+// it is when the database matched a subscription to it (DBMailbox.Subscribed).
+func listEntryWantsStatus(data *imap.ListData, options *imap.ListOptions) bool {
+	if data == nil || data.Mailbox == "" {
+		return false
+	}
+	subscribed := false
+	for _, attr := range data.Attrs {
+		if strings.EqualFold(string(attr), string(imap.MailboxAttrNoSelect)) ||
+			strings.EqualFold(string(attr), string(imap.MailboxAttrNonExistent)) {
+			return false
+		}
+		if strings.EqualFold(string(attr), string(imap.MailboxAttrSubscribed)) {
+			subscribed = true
+		}
+	}
+	return options == nil || !options.SelectSubscribed || subscribed
+}
+
 // matchesAnyPattern reports whether name matches any of the LIST patterns given
 // the reference name.
 func matchesAnyPattern(name, ref string, patterns []string) bool {
@@ -227,17 +302,25 @@ func matchesAnyPattern(name, ref string, patterns []string) bool {
 	return false
 }
 
-// hasSubscribedDescendant reports whether any subscribed name is a proper
-// descendant of lowerName (i.e. lives under "lowerName<delim>…"). The keys of
-// subscribedSet are already lower-cased, and lowerName must be lower-cased too.
-func hasSubscribedDescendant(lowerName, delim string, subscribedSet map[string]string) bool {
-	prefix := lowerName + delim
-	for s := range subscribedSet {
+// hasDescendant reports whether any key of names is a proper descendant of key
+// (i.e. lives under "key<delim>…"). The keys are names as the database keys them,
+// LOWER(name), never a Go case mapping of a name.
+func hasDescendant[V any](key, delim string, names map[string]V) bool {
+	prefix := key + delim
+	for s := range names {
 		if strings.HasPrefix(s, prefix) {
 			return true
 		}
 	}
 	return false
+}
+
+// childAttr is the RFC 5258 §4 child attribute for a mailbox name.
+func childAttr(hasChildren bool) imap.MailboxAttr {
+	if hasChildren {
+		return imap.MailboxAttrHasChildren
+	}
+	return imap.MailboxAttrHasNoChildren
 }
 
 // buildSubscribedList implements the SUBSCRIBED selection option (RFC 5258 §3.5),
@@ -255,58 +338,68 @@ func hasSubscribedDescendant(lowerName, delim string, subscribedSet map[string]s
 // Without RECURSIVEMATCH, only subscribed names are returned — plain
 // LIST (SUBSCRIBED) must NOT synthesize non-subscribed parents.
 //
-// subscribedSet maps LOWER(name) -> stored spelling.
+// Names are matched as the database matches them, by LOWER(name) under its
+// collation: mboxes carry it as NameKey, and subscribed maps it to the stored
+// spelling of each subscribed name (GetSubscribedMailboxNamesByKey). A Go case
+// mapping would part ways with it, e.g. strings.ToLower("İx") is "ix" while ICU's
+// lower() keeps the two names apart.
 func buildSubscribedList(ref string, patterns []string, options *imap.ListOptions,
-	mboxes []*db.DBMailbox, subscribedSet map[string]string,
+	mboxes []*db.DBMailbox, subscribed map[string]string,
 	serverCaps imap.CapSet, sharedNamespaceRoot string) []imap.ListData {
 
 	recursive := options.SelectRecursiveMatch
 	delim := string(consts.MailboxDelimiter)
 
-	liveByLower := make(map[string]*db.DBMailbox, len(mboxes))
+	liveByKey := make(map[string]*db.DBMailbox, len(mboxes))
 	for _, m := range mboxes {
-		liveByLower[strings.ToLower(m.Name)] = m
+		liveByKey[m.NameKey] = m
 	}
 
 	// Candidate universe, keyed by LOWER(name) -> display spelling: live
 	// mailboxes, subscribed names, and — for RECURSIVEMATCH — the ancestors of
 	// every subscribed name (so a non-existent parent of a subscribed child can
 	// still be reported with CHILDINFO).
-	candidates := make(map[string]string, len(mboxes)+len(subscribedSet))
+	candidates := make(map[string]string, len(mboxes)+len(subscribed))
 	for _, m := range mboxes {
-		candidates[strings.ToLower(m.Name)] = m.Name
+		candidates[m.NameKey] = m.Name
 	}
-	for lname, disp := range subscribedSet {
-		if _, ok := candidates[lname]; !ok {
-			candidates[lname] = disp
+	for key, name := range subscribed {
+		if _, ok := candidates[key]; !ok {
+			candidates[key] = name
 		}
 	}
 	if recursive {
-		for _, disp := range subscribedSet {
-			parts := strings.Split(disp, delim)
+		// An ancestor's key is the leading levels of the subscribed name's key:
+		// lower() leaves the hierarchy delimiter alone, as the database relies on
+		// when it matches descendants by LOWER(name) LIKE LOWER(prefix) || '%'.
+		for key, name := range subscribed {
+			keyParts := strings.Split(key, delim)
+			parts := strings.Split(name, delim)
+			if len(keyParts) != len(parts) {
+				continue
+			}
 			for i := 1; i < len(parts); i++ {
-				anc := strings.Join(parts[:i], delim)
-				la := strings.ToLower(anc)
-				if _, ok := candidates[la]; !ok {
-					candidates[la] = anc
+				ancKey := strings.Join(keyParts[:i], delim)
+				if _, ok := candidates[ancKey]; !ok {
+					candidates[ancKey] = strings.Join(parts[:i], delim)
 				}
 			}
 		}
 	}
 
 	var l []imap.ListData
-	for lname, name := range candidates {
+	for key, name := range candidates {
 		if !matchesAnyPattern(name, ref, patterns) {
 			continue
 		}
-		_, isSub := subscribedSet[lname]
-		hasSubChild := recursive && hasSubscribedDescendant(lname, delim, subscribedSet)
+		_, isSub := subscribed[key]
+		hasSubChild := recursive && hasDescendant(key, delim, subscribed)
 		if !isSub && !hasSubChild {
 			continue // not subscribed and no subscribed descendant → not in SUBSCRIBED response
 		}
 
 		var data imap.ListData
-		if m, ok := liveByLower[lname]; ok {
+		if m, ok := liveByKey[key]; ok {
 			md := listMailbox(m, options, serverCaps, sharedNamespaceRoot)
 			if md == nil {
 				continue // filtered out (e.g. SELECT SPECIAL-USE with no special-use)
@@ -328,6 +421,14 @@ func buildSubscribedList(ref string, patterns []string, options *imap.ListOption
 			if isSub {
 				data.Attrs = append(data.Attrs, imap.MailboxAttrSubscribed)
 			}
+			// RFC 5258 §4: "If the CHILDREN return option is present, the server
+			// MUST return these attributes". A name without a mailbox has
+			// children when a visible mailbox lives under it, e.g. a shared
+			// mailbox whose parent the user cannot see (§3.5: "\NonExistent
+			// \HasChildren").
+			if options.ReturnChildren {
+				data.Attrs = append(data.Attrs, childAttr(hasDescendant(key, delim, liveByKey)))
+			}
 		}
 
 		if hasSubChild {
@@ -343,19 +444,21 @@ func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.
 
 	// Add \Noselect for the shared-namespace root (e.g. "Shared" for prefix
 	// "Shared/", or the configured namespace_prefix). This prevents clients from
-	// trying to SELECT the namespace prefix itself. sharedNamespaceRoot is empty
-	// when shared mailboxes are disabled, so a personal folder that happens to be
-	// named like the prefix is not falsely marked \Noselect.
-	if sharedNamespaceRoot != "" && strings.EqualFold(mbox.Name, sharedNamespaceRoot) && mbox.HasChildren {
+	// trying to SELECT the namespace prefix itself (which SELECT always refuses
+	// with NO [CANNOT], even when no child mailboxes currently remain under it).
+	// sharedNamespaceRoot is empty when shared mailboxes are disabled, so a
+	// personal folder that happens to be named like the prefix is not falsely
+	// marked \Noselect.
+	if isSharedNamespaceRoot(mbox.Name, sharedNamespaceRoot) {
 		attributes = append(attributes, imap.MailboxAttrNoSelect)
 	}
 
-	if serverCaps.Has(imap.CapChildren) {
-		if mbox.HasChildren {
-			attributes = append(attributes, imap.MailboxAttrHasChildren)
-		} else {
-			attributes = append(attributes, imap.MailboxAttrHasNoChildren)
-		}
+	// RFC 5258 §4: "If the CHILDREN return option is present, the server MUST
+	// return these attributes even if their computation is expensive." The
+	// option belongs to LIST-EXTENDED, which stays advertised when CHILDREN is
+	// disabled; without it a disabled CHILDREN keeps them off.
+	if serverCaps.Has(imap.CapChildren) || options.ReturnChildren {
+		attributes = append(attributes, childAttr(mbox.HasChildren))
 	}
 
 	// RFC 6154 special-use is a persisted per-mailbox attribute (see the

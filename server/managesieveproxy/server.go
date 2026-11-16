@@ -66,7 +66,7 @@ type Server struct {
 	tlsConfig          *tls.Config // What the listener serves with (server.ListenerTLS); nil without tls
 	connManager        *proxy.ConnectionManager
 	connTracker        *server.ConnectionTracker
-	wg                 sync.WaitGroup
+	sessions           server.SessionGroup // Session goroutines, which Stop drains
 	ctx                context.Context
 	cancel             context.CancelFunc
 	enableAffinity     bool
@@ -145,7 +145,7 @@ type ServerOptions struct {
 	MaxConnections      int      // Maximum total connections per instance (0 = unlimited, local only)
 	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
 	TrustedNetworks     []string // CIDR blocks for trusted networks that bypass per-IP limits
-	ListenBacklog       int      // TCP listen backlog size (0 = system default; recommended: 4096-8192)
+	ListenBacklog       int      // TCP listen backlog size (0 = 1024; recommended: 4096-8192)
 
 	// Auth cache configuration
 	LookupCache *config.LookupCacheConfig
@@ -165,7 +165,7 @@ type ServerOptions struct {
 	Debug bool // Enable debug logging
 
 	// SIEVE extensions
-	SupportedExtensions []string // Additional SIEVE extensions beyond builtins (e.g., ["vacation", "regex"])
+	SupportedExtensions []string // Supported SIEVE names replace the default advertised set; nil, empty or entirely unsupported lists use the default set.
 }
 
 // New creates a new ManageSieve proxy server.
@@ -198,12 +198,10 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Initialize remotelookup client if configured
 	routingLookup, err := proxy.InitializeRemoteLookup("managesieve", opts.RemoteLookup, opts.RemotePort)
 	if err != nil {
-		logger.Debug("ManageSieve Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
-		if opts.RemoteLookup != nil && !opts.RemoteLookup.ShouldLookupLocalUsers() {
-			cancel()
-			return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
-		}
-		logger.Debug("ManageSieve Proxy: Continuing without remotelookup - local lookup enabled", "name", opts.Name)
+		// Also with lookup_local_users, which adds the database for the users the
+		// lookup does not know and does not make the lookup optional.
+		cancel()
+		return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
 	}
 	// Create connection manager with routing
 	connManager, err := proxy.NewConnectionManagerFromOptions(proxy.ManagerOptions{
@@ -312,7 +310,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		// Parse positive revalidation window from config (used for password change detection)
 		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(opts.Name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("managesieve_proxy", opts.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("ManageSieve Proxy: Lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	} else {
 		logger.Info("ManageSieve Proxy: Lookup cache disabled", "name", opts.Name)
@@ -415,12 +413,14 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 		StrictSessionErrors:             true, // Session errors are *managesieveserver.Error; mask anything else
 		NewSession: func(c *managesieveserver.Conn) (managesieveserver.Session, error) {
 			netConn := c.NetConn()
+			endInitialization := s.sessions.GuardInitialization(s.ctx, netConn)
+			defer endInitialization()
 			proxyInfo := server.GetProxyProtocolInfo(netConn)
 
 			var releaseConn func()
 			var err error
 			if s.limiter != nil {
-				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), "")
+				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), server.GetRealClientIP(netConn, proxyInfo))
 				if err != nil {
 					// DELIBERATE silent close, no banner: matches the previous
 					// accept-loop rejection (drop before any greeting), and a
@@ -569,6 +569,15 @@ func (s *Server) Start() error {
 		s.listenerMu.Unlock()
 	}
 
+	// Stop cancels s.ctx before it looks for a listener to close, so a Stop
+	// that ran before the listener existed (cmd/sora calls it from a context
+	// watcher that races Start) found none. Checked once the listener is set,
+	// either Stop closes it or this does: never serve after Stop.
+	if s.ctx.Err() != nil {
+		s.listener.Close()
+		return nil
+	}
+
 	// Start connection limiter cleanup if enabled
 	if s.limiter != nil {
 		s.limiter.StartCleanup(s.ctx)
@@ -613,16 +622,19 @@ func (s *Server) acceptConnections() error {
 		// inflate the gauges. PROXY protocol info is discovered there via
 		// the wrapper-chain walk.
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		started := s.sessions.Go(func() {
 			defer func() {
 				if r := recover(); r != nil {
 					logger.Error("ManageSieve Proxy: panic in connection handler", "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
 			s.msLibServer.Load().ServeConn(conn)
-		}()
+		})
+		if !started {
+			// Stop is draining the sessions and no longer waits for new ones.
+			conn.Close()
+			return nil
+		}
 	}
 }
 
@@ -633,6 +645,12 @@ func (s *Server) SetConnectionTracker(tracker *server.ConnectionTracker) {
 	if tracker != nil && s.lookupCache != nil {
 		tracker.SetLookupCache(s.lookupCache)
 	}
+}
+
+// GetLookupCache returns the server's cache of logins (nil when disabled), so that a
+// changed account's cached logins can be dropped (see credchanges.Watcher).
+func (s *Server) GetLookupCache() *lookupcache.LookupCache {
+	return s.lookupCache
 }
 
 // GetConnectionTracker returns the connection tracker for the server.
@@ -647,6 +665,7 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 
 // Stop stops the ManageSieve proxy server.
 func (s *Server) Stop() error {
+	s.sessions.BeginDrain()
 	logger.Debug("ManageSieve Proxy: Stopping", "name", s.name)
 
 	// Unregister rate limiter from global registry
@@ -670,16 +689,9 @@ func (s *Server) Stop() error {
 		listener.Close()
 	}
 
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(30 * time.Second) {
 		logger.Debug("ManageSieve Proxy: Server stopped gracefully", "name", s.name)
-	case <-time.After(30 * time.Second):
+	} else {
 		logger.Debug("ManageSieve Proxy: Server stop timeout", "name", s.name)
 	}
 
@@ -700,6 +712,10 @@ func (s *Server) Stop() error {
 		if err := s.lookupCache.Stop(stopCtx); err != nil {
 			logger.Error("Error stopping auth cache", "proxy", s.name, "error", err)
 		}
+	}
+
+	if s.authLimiter != nil {
+		s.authLimiter.Stop()
 	}
 
 	return nil
@@ -815,15 +831,23 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 		next.maxAuthErrors = newVal
 		reloaded = append(reloaded, "max_auth_errors")
 	}
-	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != next.authIdleTimeout {
+	// A value that does not parse keeps the running one (start-up, which has none,
+	// uses the default).
+	if timeout, err := cfg.GetAuthIdleTimeout(); err != nil {
+		logger.Warn("ManageSieve proxy config reload: invalid auth_idle_timeout, keeping the running value", "name", s.name, "error", err, "running", next.authIdleTimeout)
+	} else if timeout != next.authIdleTimeout {
 		next.authIdleTimeout = timeout
 		reloaded = append(reloaded, "auth_idle_timeout")
 	}
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("ManageSieve proxy config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.commandTimeout)
+	} else if timeout != next.commandTimeout {
 		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("ManageSieve proxy config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}

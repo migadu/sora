@@ -83,3 +83,61 @@ func TestRoutingLookupRefusalIsNotUserNotFound(t *testing.T) {
 		})
 	}
 }
+
+// 401/403 are the lookup contract's way to refuse an account (config.toml.example), a
+// verdict unlike 404's "not known here". A routing lookup must not read them as an unknown
+// user: LMTP would deliver through the local database (lookup_local_users), and with named
+// pools the user would be routed into the default pool. A 404 keeps meaning "not found".
+func TestRoutingLookupAccountRefusalIsNotUserNotFound(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			flat, err := NewConnectionManagerWithRouting([]string{"10.0.0.1:24"}, 24, false, false, false, time.Second, newStatusLookupClient(t, status), "lmtp-test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			info, err := flat.LookupUserRoute(context.Background(), "anna@example.com", "")
+			if err == nil || errors.Is(err, ErrRemoteLookupTransient) {
+				t.Errorf("LookupUserRoute after a %d: info %+v, err %v; want a refusal (not user-not-found, not an outage)", status, info, err)
+			}
+
+			pools, err := NewConnectionManagerWithPools(testPoolSpecs(), 143, time.Second, newStatusLookupClient(t, status), "pools-test", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := DetermineRoute(RouteParams{
+				Ctx: context.Background(), Username: "anna@example.com", Protocol: "lmtp",
+				ConnManager: pools, ProxyName: "test",
+			})
+			if !errors.Is(err, ErrRouteLookupFailed) {
+				t.Errorf("named pools, lookup answered %d: routed to %q (pool %q), err %v; want ErrRouteLookupFailed", status, res.PreferredAddr, res.Pool, err)
+			}
+
+			// A flat list is one pool, as on the User API proxy: routing goes on into it.
+			res, err = DetermineRoute(RouteParams{
+				Ctx: context.Background(), Username: "anna@example.com", Protocol: "lmtp",
+				ConnManager: flat, ProxyName: "test",
+			})
+			if err != nil || res.PreferredAddr != "10.0.0.1:24" {
+				t.Errorf("flat list, lookup answered %d: route %q, err %v; want the list's backend", status, res.PreferredAddr, err)
+			}
+		})
+	}
+
+	t.Run("Not Found", func(t *testing.T) {
+		pools, err := NewConnectionManagerWithPools(testPoolSpecs(), 143, time.Second, newStatusLookupClient(t, http.StatusNotFound), "pools-test", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := pools.LookupUserRoute(context.Background(), "anna@example.com", "")
+		if info != nil || err != nil {
+			t.Fatalf("LookupUserRoute after a 404: info %+v, err %v; want nil, nil (user not found)", info, err)
+		}
+		res, err := DetermineRoute(RouteParams{
+			Ctx: context.Background(), Username: "anna@example.com", Protocol: "lmtp",
+			ConnManager: pools, ProxyName: "test",
+		})
+		if err != nil || res.Pool != "sora0" {
+			t.Errorf("named pools, lookup answered 404: pool %q, err %v; want the default pool sora0", res.Pool, err)
+		}
+	})
+}

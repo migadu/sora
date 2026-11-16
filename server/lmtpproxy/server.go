@@ -54,7 +54,7 @@ type Server struct {
 	tlsUseStartTLS     bool
 	tlsConfig          *tls.Config // What the listener serves with (server.ListenerTLS); nil without tls
 	enableAffinity     bool
-	wg                 sync.WaitGroup
+	sessions           server.SessionGroup // Session goroutines, which Stop drains
 	ctx                context.Context
 	cancel             context.CancelFunc
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
@@ -122,7 +122,7 @@ type ServerOptions struct {
 
 	// Connection limiting (total connections only, no per-IP for LMTP)
 	MaxConnections int // Maximum total connections (0 = unlimited)
-	ListenBacklog  int // TCP listen backlog size (0 = system default; recommended: 4096-8192)
+	ListenBacklog  int // TCP listen backlog size (0 = 1024; recommended: 4096-8192)
 
 	// Routing cache configuration (for user lookups)
 	LookupCache *config.LookupCacheConfig
@@ -179,17 +179,14 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	if opts.RemoteLookup.Enabled {
 		remotelookupClient, err := proxy.InitializeRemoteLookup("lmtp", opts.RemoteLookup, opts.RemotePort)
 		if err != nil {
-			logger.Debug("LMTP Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
-			if !opts.RemoteLookup.ShouldLookupLocalUsers() {
-				cancel()
-				return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
-			}
-			logger.Debug("LMTP Proxy: Continuing without remotelookup - local lookup enabled", "name", opts.Name)
-		} else {
-			routingLookup = remotelookupClient
-			if opts.Debug {
-				logger.Debug("LMTP Proxy: RemoteLookup client initialized successfully", "name", opts.Name)
-			}
+			// Also with lookup_local_users, which adds the database for the users the
+			// lookup does not know and does not make the lookup optional.
+			cancel()
+			return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
+		}
+		routingLookup = remotelookupClient
+		if opts.Debug {
+			logger.Debug("LMTP Proxy: RemoteLookup client initialized successfully", "name", opts.Name)
 		}
 	}
 
@@ -285,7 +282,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// LMTP proxy doesn't do password validation, so positive revalidation window is not needed (use 0)
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, 0)
+		lookupCache = lookupcache.New("lmtp_proxy", opts.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, 0)
 		logger.Info("LMTP Proxy: Lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize)
 	} else {
 		logger.Info("LMTP Proxy: Lookup cache disabled", "name", opts.Name)
@@ -398,6 +395,15 @@ func (s *Server) Start() error {
 		s.listenerMu.Unlock()
 	}
 
+	// Stop cancels s.ctx before it looks for a listener to close, so a Stop
+	// that ran before the listener existed (cmd/sora calls it from a context
+	// watcher that races Start) found none. Checked once the listener is set,
+	// either Stop closes it or this does: never serve after Stop.
+	if s.ctx.Err() != nil {
+		s.listener.Close()
+		return nil
+	}
+
 	// Start connection limiter cleanup if enabled
 	if s.limiter != nil {
 		s.limiter.StartCleanup(s.ctx)
@@ -493,10 +499,7 @@ func (s *Server) acceptConnections() error {
 		// BEFORE the deferred TLS handshake in handleConnection.
 		proxyInfo := server.GetProxyProtocolInfo(conn)
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-
+		started := s.sessions.Go(func() {
 			// Track proxy connection
 			metrics.ConnectionsTotal.WithLabelValues("lmtp_proxy", s.name, s.hostname).Inc()
 			metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy", s.name, s.hostname).Inc()
@@ -504,6 +507,9 @@ func (s *Server) acceptConnections() error {
 			session := newSession(s, conn, proxyInfo)
 			session.releaseConn = releaseConn // Set cleanup function on session
 			s.registerSession(session)
+			if s.sessions.IsDraining() {
+				server.RawConn(conn).Close()
+			}
 
 			// CRITICAL: Panic recovery MUST clean up metrics and limiter
 			defer func() {
@@ -525,7 +531,15 @@ func (s *Server) acceptConnections() error {
 			// Note: releaseConn is called in session.close(), which is deferred in handleConnection()
 			// This ensures cleanup happens when the session ends, not when the goroutine exits
 			session.handleConnection()
-		}()
+		})
+		if !started {
+			// Stop is draining the sessions and no longer waits for new ones.
+			conn.Close()
+			if releaseConn != nil {
+				releaseConn()
+			}
+			return nil
+		}
 	}
 }
 
@@ -587,36 +601,58 @@ func (s *Server) sendGracefulShutdownMessage() {
 
 	logger.Info("Sending graceful shutdown messages to LMTP sessions", "name", s.name, "count", len(activeSessions))
 
-	// Step 1: Set gracefulShutdown flag on all sessions.
+	// Keep the existing one-second notice window, shared by every session.
+	// Closing the immutable accepted transport does not need session.mu or a
+	// TLS write lock, so it also interrupts a blocked notice or greeting.
+	deadline := time.Now().Add(time.Second)
+	closed := make(chan struct{})
+	time.AfterFunc(time.Until(deadline), func() {
+		for _, session := range activeSessions {
+			if raw := server.RawConn(session.listenerConn); raw != nil {
+				raw.Close()
+			}
+		}
+		close(closed)
+	})
+
+	// Notices run side by side: one greeted client that stops reading cannot
+	// delay everyone else. noticeMu orders them with the greeting and STARTTLS;
+	// session.mu is held only to snapshot state, never during network I/O.
+	var notices sync.WaitGroup
 	for _, session := range activeSessions {
-		session.mu.Lock()
-		session.gracefulShutdown = true
-		session.mu.Unlock()
+		notices.Add(1)
+		go func() {
+			defer notices.Done()
+			session.noticeMu.Lock()
+			defer session.noticeMu.Unlock()
+			session.mu.Lock()
+			session.gracefulShutdown = true
+			conn := session.clientConn
+			ready := session.greeted && !session.startTLSInProgress && !session.closingNoticeSent
+			session.closingNoticeSent = true
+			session.mu.Unlock()
+			if conn != nil && ready {
+				if err := conn.SetWriteDeadline(deadline); err == nil {
+					if _, err := fmt.Fprint(conn, "421 4.3.2 Service shutting down, please try again later\r\n"); err == nil {
+						// Let a responsive TLS client receive close_notify; the raw
+						// transport timer still bounds a blocked TLS Close.
+						conn.Close()
+					}
+				}
+			}
+		}()
 	}
+	<-closed
+	notices.Wait()
 
-	// Step 2: Write 421 shutdown message directly to clientConn: the TLS
-	// connection after STARTTLS, and nothing while STARTTLS is negotiating.
+	// The raw clients are already closed. Snapshot mutable wrapper/backend
+	// connections, then perform cleanup without holding the session mutex.
 	for _, session := range activeSessions {
 		session.mu.Lock()
-		if session.clientConn != nil && !session.startTLSInProgress {
-			_, _ = fmt.Fprint(session.clientConn, "421 4.3.2 Service shutting down, please try again later\r\n")
-		}
+		backend, client := session.backendConn, session.clientConn
 		session.mu.Unlock()
-	}
-
-	// Step 3: Give clients a moment to process the message before closing.
-	time.Sleep(1 * time.Second)
-
-	// Step 4: Close all connections.
-	for _, session := range activeSessions {
-		session.mu.Lock()
-		if session.backendConn != nil {
-			session.backendConn.Close()
-		}
-		if session.clientConn != nil {
-			session.clientConn.Close()
-		}
-		session.mu.Unlock()
+		closeSessionTransport(backend)
+		closeSessionTransport(client)
 	}
 
 	logger.Debug("LMTP Proxy: Proceeding with connection cleanup", "name", s.name)
@@ -629,11 +665,17 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	next := *s.loadSettings()
 
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	// A value that does not parse keeps the running one (start-up, which has none,
+	// uses the default).
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("LMTP proxy config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
-	if maxSize := cfg.GetMaxMessageSizeWithDefault(); maxSize != next.maxMessageSize {
+	if maxSize, err := cfg.GetMaxMessageSize(); err != nil {
+		logger.Warn("LMTP proxy config reload: invalid max_message_size, keeping the running value", "name", s.name, "error", err, "running", next.maxMessageSize)
+	} else if maxSize != next.maxMessageSize {
 		next.maxMessageSize = maxSize
 		reloaded = append(reloaded, "max_message_size")
 	}
@@ -647,6 +689,7 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 }
 
 func (s *Server) Stop() error {
+	s.sessions.BeginDrain()
 	logger.Info("Stopping LMTP proxy server", "name", s.name)
 
 	// Stop connection tracker first to prevent it from trying to access closed database
@@ -667,16 +710,9 @@ func (s *Server) Stop() error {
 		listener.Close()
 	}
 
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(30 * time.Second) {
 		logger.Debug("LMTP Proxy: Server stopped gracefully", "name", s.name)
-	case <-time.After(30 * time.Second):
+	} else {
 		logger.Debug("LMTP Proxy: Server stop timeout", "name", s.name)
 	}
 
@@ -736,3 +772,6 @@ func (s *Server) monitorActiveSessions() {
 func (s *Server) wrapProxyProtocol(l net.Listener) net.Listener {
 	return server.WrapProxyProtocol(l, s.proxyReader, "LMTP-PROXY")
 }
+
+// GetLookupCache exposes the recipient route cache for credential revocation/reset.
+func (s *Server) GetLookupCache() *lookupcache.LookupCache { return s.lookupCache }

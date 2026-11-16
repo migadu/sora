@@ -90,11 +90,21 @@ func failedRelayMessage(t *testing.T, queuePath string) (string, []byte) {
 	return msg.ID, body
 }
 
+// relayQueue creates an empty relay queue the way the server does and returns its path.
+func relayQueue(t *testing.T) string {
+	t.Helper()
+	queuePath := t.TempDir()
+	if _, err := relayqueue.NewDiskQueue(queuePath, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	return queuePath
+}
+
 // #328 item 1: with no max_attempts or worker_interval configured, stats printed the raw
 // zero values instead of the defaults the server runs with.
 func TestRelayStatsPrintsEffectiveSettings(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
-		out := runRelay(t, t.TempDir(), "", "stats")
+		out := runRelay(t, relayQueue(t), "", "stats")
 		for _, want := range []string{"Max Attempts:     10\n", "Worker Interval:  1m0s\n"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("stats output does not contain %q:\n%s", want, out)
@@ -103,7 +113,7 @@ func TestRelayStatsPrintsEffectiveSettings(t *testing.T) {
 	})
 
 	t.Run("configured", func(t *testing.T) {
-		out := runRelay(t, t.TempDir(), "max_attempts = 3\nworker_interval = \"30s\"\n", "stats")
+		out := runRelay(t, relayQueue(t), "max_attempts = 3\nworker_interval = \"30s\"\n", "stats")
 		for _, want := range []string{"Max Attempts:     3\n", "Worker Interval:  30s\n"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("stats output does not contain %q:\n%s", want, out)
@@ -219,5 +229,170 @@ func TestRelayRequeueWritesBodyBeforeMetadata(t *testing.T) {
 		if _, err := os.Lstat(filepath.Join(queuePath, "failed", name)); !os.IsNotExist(err) {
 			t.Errorf("failed/%s still exists after requeue (err %v)", name, err)
 		}
+	}
+}
+
+// requeue on a node whose relay queue the server never created must not create it:
+// made by `sudo sora-admin`, pending/ and failed/ would belong to root, and the server,
+// running as its own user, could not queue into them.
+func TestRelayRequeueDoesNotCreateTheQueue(t *testing.T) {
+	queuePath := filepath.Join(t.TempDir(), "relay")
+	for _, id := range []string{"all", "3f2b9c1e-8d4a-4f6b-9a7e-2c5d1e0f4b8a"} {
+		out, err := relayCommand(t, queuePath, "", "requeue", "--id", id, "--confirm").CombinedOutput()
+		if err == nil {
+			t.Errorf("requeue --id %s on a queue that does not exist succeeded:\n%s", id, out)
+		}
+		if _, err := os.Stat(queuePath); !os.IsNotExist(err) {
+			t.Fatalf("requeue --id %s created the relay queue at %s (stat: %v)\n%s", id, queuePath, err, out)
+		}
+	}
+}
+
+// Opening an incomplete existing queue must not create a root-owned processing directory.
+func TestRelayRequeueDoesNotRepairAnIncompleteQueue(t *testing.T) {
+	queuePath := t.TempDir()
+	for _, dir := range []string{"failed", "pending"} {
+		if err := os.Mkdir(filepath.Join(queuePath, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := relayCommand(t, queuePath, "", "requeue", "--id", "all", "--confirm").CombinedOutput()
+	if err == nil {
+		t.Errorf("requeue on an incomplete queue succeeded:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(queuePath, "processing")); !os.IsNotExist(err) {
+		t.Fatalf("requeue created processing/ (stat: %v)\n%s", err, out)
+	}
+}
+
+// stats only reads the queue, so on a node whose server has never created it, it must
+// not create it either (#643): made by `sudo sora-admin`, pending/ would belong to root,
+// and the server, running as its own user, could not queue into it. Like list, it says
+// the queue does not exist.
+func TestRelayStatsDoesNotCreateTheQueue(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		queuePath := filepath.Join(t.TempDir(), "relay")
+		out := runRelay(t, queuePath, "", "stats")
+		if _, err := os.Stat(queuePath); !os.IsNotExist(err) {
+			t.Fatalf("stats created the relay queue at %s (stat: %v)\n%s", queuePath, err, out)
+		}
+		if !strings.Contains(out, "does not exist") {
+			t.Errorf("stats does not say the queue does not exist:\n%s", out)
+		}
+	})
+
+	t.Run("incomplete", func(t *testing.T) {
+		queuePath := t.TempDir()
+		for _, dir := range []string{"failed", "pending"} {
+			if err := os.Mkdir(filepath.Join(queuePath, dir), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		out := runRelay(t, queuePath, "", "stats")
+		if _, err := os.Stat(filepath.Join(queuePath, "processing")); !os.IsNotExist(err) {
+			t.Fatalf("stats created processing/ (stat: %v)\n%s", err, out)
+		}
+		if !strings.Contains(out, "does not exist") {
+			t.Errorf("stats does not say the queue does not exist:\n%s", out)
+		}
+	})
+}
+
+// relay delete --queue pending --id all must delete only committed messages (paired with
+// <id>.json) and leave in-flight uncommitted holds (<id>.held + <id>.msg) intact so an
+// active delivery can still commit and relay its redirect body.
+func TestRelayDeleteAllLeavesHeldMessagesIntact(t *testing.T) {
+	queuePath := t.TempDir()
+	q, err := relayqueue.NewDiskQueue(queuePath, 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := q.Enqueue("committed@example.com", "drop@example.org", "redirect", []byte("committed body")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	wantBody := []byte("From: alice@example.com\r\nTo: keep@example.org\r\n\r\nHeld redirect body.\r\n")
+	commit, abort, err := q.Hold("alice@example.com", "keep@example.org", "redirect", wantBody)
+	if err != nil {
+		t.Fatalf("Hold: %v", err)
+	}
+	defer abort()
+
+	out := runRelay(t, queuePath, "", "delete", "--queue", "pending", "--id", "all", "--confirm")
+	if !strings.Contains(out, "Deleted 1 messages from pending queue\n") {
+		t.Errorf("unexpected delete output:\n%s", out)
+	}
+
+	entries, err := os.ReadDir(filepath.Join(queuePath, "pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if len(names) != 2 {
+		t.Fatalf("pending holds %v after delete --id all; want the held redirect's .held and .msg (2 files)", names)
+	}
+
+	if err := commit(); err != nil {
+		t.Fatalf("commit held redirect after delete --id all: %v", err)
+	}
+	msg, gotBody, err := q.AcquireNext()
+	if err != nil || msg == nil {
+		t.Fatalf("AcquireNext after committing held redirect = %v, %v; want the held message", msg, err)
+	}
+	if msg.To != "keep@example.org" || string(gotBody) != string(wantBody) {
+		t.Errorf("acquired To=%q body=%q; want To=%q body=%q", msg.To, gotBody, "keep@example.org", wantBody)
+	}
+}
+
+func TestDeleteAllMessagesInQueueDir(t *testing.T) {
+	queuePath := t.TempDir()
+	q, err := relayqueue.NewDiskQueue(queuePath, 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingDir := filepath.Join(queuePath, "pending")
+
+	if err := q.Enqueue("a@example.com", "b@example.org", "redirect", []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Enqueue("c@example.com", "d@example.org", "redirect", []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	_, abort, err := q.Hold("h@example.com", "k@example.org", "redirect", []byte("held"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer abort()
+	scratch := filepath.Join(pendingDir, ".tmp-scratch")
+	if err := os.WriteFile(scratch, []byte("scratch"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stagingMsg := filepath.Join(pendingDir, "unpaired-staging.msg")
+	if err := os.WriteFile(stagingMsg, []byte("staging"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := deleteAllMessagesInQueueDir(pendingDir)
+	if err != nil {
+		t.Fatalf("deleteAllMessagesInQueueDir: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", deleted)
+	}
+	for _, keep := range []string{scratch, stagingMsg} {
+		if _, err := os.Stat(keep); err != nil {
+			t.Errorf("expected %s to remain untouched: %v", filepath.Base(keep), err)
+		}
+	}
+	abort()
+	entries, err := os.ReadDir(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected only scratch and unpaired .msg to remain after abort, got %d entries", len(entries))
 	}
 }

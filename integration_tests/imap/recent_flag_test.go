@@ -11,7 +11,8 @@ import (
 )
 
 // TestIMAP_RecentFlag_NotPersistentAcrossSessions verifies that the \Recent flag
-// is NOT permanently stored and therefore not shown to a second session.
+// is NOT permanently stored: the first session to select the mailbox sees it,
+// the next one does not.
 //
 // RFC 3501 §2.3.2: "This session is the first session to have been notified about
 // this message; if the session is read-write, subsequent sessions will not see
@@ -52,57 +53,53 @@ func TestIMAP_RecentFlag_NotPersistentAcrossSessions(t *testing.T) {
 	t.Logf("session 1 appended UID %d", appendData.UID)
 	_ = c1.Logout()
 
-	// ── Session 2: completely independent connection ──────────────────────────
-	c2, err := imapclient.DialInsecure(server.Address, nil)
-	if err != nil {
-		t.Fatalf("failed to dial (session 2): %v", err)
-	}
-	defer c2.Logout()
-
-	if err := c2.Login(account.Email, account.Password).Wait(); err != nil {
-		t.Fatalf("session 2 login failed: %v", err)
-	}
-
-	mbox, err := c2.Select("INBOX", nil).Wait()
-	if err != nil {
-		t.Fatalf("session 2 SELECT INBOX failed: %v", err)
-	}
-	t.Logf("session 2 INBOX: %d messages, NumRecent=%d", mbox.NumMessages, mbox.NumRecent)
-
-	if mbox.NumMessages == 0 {
-		t.Fatal("expected at least 1 message in INBOX")
-	}
-
-	// FETCH FLAGS for the appended message (by UID so no seqnum ambiguity)
-	fetchResults, err := c2.Fetch(
-		imap.UIDSetNum(appendData.UID),
-		&imap.FetchOptions{Flags: true, UID: true},
-	).Collect()
-	if err != nil {
-		t.Fatalf("session 2 FETCH failed: %v", err)
-	}
-	if len(fetchResults) == 0 {
-		t.Fatal("session 2 FETCH returned no results")
-	}
-
-	flags := fetchResults[0].Flags
-	t.Logf("session 2 FETCH FLAGS: %v", flags)
-
-	// ── Assertion ─────────────────────────────────────────────────────────────
-	// RFC 3501 §2.3.2: subsequent sessions MUST NOT see \Recent.
-	// Before the fix: \Recent is stored permanently in the database bitfield, so
-	// this assertion fails.
-	recentFlag := imap.Flag("\\Recent")
-	if containsFlag(flags, recentFlag) {
-		t.Errorf("FAIL: \\Recent is set in session 2 – it must not be persistently stored in the database")
-		t.Errorf("RFC 3501 §2.3.2: 'subsequent sessions MUST NOT see \\Recent set for this message'")
-	} else {
-		t.Log("PASS: \\Recent is NOT set in session 2 (correct per RFC 3501)")
+	// ── Sessions 2 and 3: independent connections that SELECT INBOX in turn ──
+	// Session 1 never selected INBOX, so session 2 is the first session to be
+	// notified of the message and sees it \Recent. After its read-write SELECT,
+	// session 3 must not (RFC 3501 §2.3.2).
+	for _, tc := range []struct {
+		session    int
+		wantRecent bool
+	}{{2, true}, {3, false}} {
+		flags := selectAndFetchFlags(t, server.Address, account, "INBOX", appendData.UID)
+		t.Logf("session %d FETCH FLAGS: %v", tc.session, flags)
+		if got := containsFlag(flags, imap.Flag("\\Recent")); got != tc.wantRecent {
+			t.Errorf("session %d: \\Recent in FETCH FLAGS = %v, want %v (RFC 3501 §2.3.2)", tc.session, got, tc.wantRecent)
+		}
 	}
 }
 
+// selectAndFetchFlags logs in on a new connection, selects mbox read-write and
+// returns the FETCH FLAGS of message uid there. The connection stays open, with
+// mbox selected, until the test ends.
+func selectAndFetchFlags(t *testing.T, addr string, account common.TestAccount, mbox string, uid imap.UID) []imap.Flag {
+	t.Helper()
+	c, err := imapclient.DialInsecure(addr, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { c.Logout() })
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	if _, err := c.Select(mbox, nil).Wait(); err != nil {
+		t.Fatalf("SELECT %s: %v", mbox, err)
+	}
+	msgs, err := c.Fetch(imap.UIDSetNum(uid), &imap.FetchOptions{Flags: true, UID: true}).Collect()
+	if err != nil {
+		t.Fatalf("FETCH UID %d FLAGS in %s: %v", uid, mbox, err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("FETCH UID %d FLAGS in %s returned %d messages, want 1", uid, mbox, len(msgs))
+	}
+	return msgs[0].Flags
+}
+
 // TestIMAP_RecentFlag_CopyDoesNotStoreRecent verifies that messages copied to a
-// destination mailbox do NOT have \Recent stored as a persistent flag.
+// destination mailbox do NOT have \Recent stored as a persistent flag: the
+// session that selects the destination first sees the copy \Recent (RFC 3501
+// §6.4.7: "the Recent flag SHOULD be set, in the copy"), a later session
+// does not.
 //
 // The bug: CopyMessages in db/append.go ORs FlagRecent into the flags of every
 // copied message, making it a permanent stored flag.
@@ -183,13 +180,16 @@ func TestIMAP_RecentFlag_CopyDoesNotStoreRecent(t *testing.T) {
 	t.Logf("copied message flags in Sent: %v", flags)
 
 	// ── Assertions ────────────────────────────────────────────────────────────
-	// Before the fix: CopyMessages ORs FlagRecent into all copied messages, so
-	// the first assertion fails.
+	// This session is the first to select Sent since the copy arrived, so the
+	// copy is \Recent here; the next session must not see it \Recent. Before
+	// the fix: CopyMessages ORs FlagRecent into all copied messages, so the
+	// second session sees it too.
 	recentFlag := imap.Flag("\\Recent")
-	if containsFlag(flags, recentFlag) {
-		t.Errorf("FAIL: \\Recent is stored on copied message – RFC 3501: \\Recent must not be a persistent flag")
-	} else {
-		t.Log("PASS: \\Recent is NOT set on copied message (correct per RFC 3501)")
+	if !containsFlag(flags, recentFlag) {
+		t.Errorf("copied message is not \\Recent in the first session to select Sent: %v", flags)
+	}
+	if later := selectAndFetchFlags(t, server.Address, account, "Sent", destUID); containsFlag(later, recentFlag) {
+		t.Errorf("\\Recent is stored on copied message, a later session sees it: %v", later)
 	}
 
 	// Source \Seen flag must survive the COPY.

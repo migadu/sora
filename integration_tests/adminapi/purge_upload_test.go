@@ -253,13 +253,16 @@ func TestRestore_KeepsTheUploadInFlight(t *testing.T) {
 	s.request(t, "POST", "/admin/accounts/"+email+"/messages/restore", map[string]any{"message_ids": []int64{upload.messageID}}, http.StatusOK)
 
 	upload.finish(t)
-	var live, uploaded bool
-	if err := s.rdb.QueryRowWithRetry(context.Background(),
-		`SELECT expunged_at IS NULL, uploaded FROM messages WHERE id = $1`, upload.messageID).Scan(&live, &uploaded); err != nil {
+	// The message comes back as a new row with the same body (see db.RestoreMessages).
+	var live, uploaded int
+	if err := s.rdb.QueryRowWithRetry(context.Background(), `
+		SELECT COUNT(*), COUNT(*) FILTER (WHERE uploaded) FROM messages
+		WHERE account_id = $1 AND content_hash = $2 AND expunged_at IS NULL`,
+		accountID, upload.hash).Scan(&live, &uploaded); err != nil {
 		t.Fatal(err)
 	}
-	if !live || !uploaded {
-		t.Fatalf("the restored message is not readable: live=%v uploaded=%v", live, uploaded)
+	if live != 1 || uploaded != 1 {
+		t.Fatalf("the restored message is not readable: live=%d uploaded=%d", live, uploaded)
 	}
 	if len(s.s3.Keys(upload.keys[0])) != 1 {
 		t.Fatal("the restored message's body is not in S3")

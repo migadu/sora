@@ -12,7 +12,13 @@ import (
 
 // setupCleanerTestDatabase creates a test database and returns it along with test data
 func setupCleanerTestDatabase(t *testing.T) (*Database, string, int64, int64) {
-	db := setupTestDatabase(t)
+	return setupCleanerTestDatabaseWithSuffix(t, "")
+}
+
+// setupCleanerTestDatabaseWithSuffix is setupCleanerTestDatabase on the database that
+// setupTestDatabaseWithSuffix connects to for suffix.
+func setupCleanerTestDatabaseWithSuffix(t *testing.T, suffix string) (*Database, string, int64, int64) {
+	db := setupTestDatabaseWithSuffix(t, suffix)
 
 	// Use test name and timestamp to create unique email
 	testEmail := fmt.Sprintf("test_%s_%d@example.com", t.Name(), time.Now().UnixNano())

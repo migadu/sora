@@ -161,7 +161,8 @@ func (db *Database) GetAllHealthStatuses(ctx context.Context, hostname string) (
 	}
 	defer rows.Close()
 
-	var statuses []*HealthStatus
+	// Never nil: an empty result is the JSON array [], not null.
+	statuses := []*HealthStatus{}
 	for rows.Next() {
 		var h HealthStatus
 		var statusStr string

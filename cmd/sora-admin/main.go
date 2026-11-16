@@ -40,18 +40,14 @@ type AdminConfig struct {
 	TLS                       config.TLSConfig             `toml:"tls"` // TLS configuration for accessing Let's Encrypt S3 bucket
 	AdminCLI                  config.AdminCLIConfig        `toml:"admin_cli"`
 	DynamicServers            []config.ServerConfig        // Populated from full config
-	Server                    []map[string]any             `toml:"server"`                        // Ignore server config array, not needed for admin commands
-	HTTPAPIAddr               string                       `toml:"http_api_addr"`                 // HTTP API address for kick operations (e.g., "http://localhost:8080")
-	HTTPAPIKey                string                       `toml:"http_api_key"`                  // HTTP API key for authentication
-	HTTPAPIInsecureSkipVerify bool                         `toml:"http_api_insecure_skip_verify"` // Skip TLS cert verification. Default: auto (loopback addr -> skip; remote -> verify).
+	Server                    []map[string]any             `toml:"server"` // Ignore server config array, not needed for admin commands
+	HTTPAPIAddr               string                       `toml:"-"`      // Admin API address, from [admin_cli] addr (e.g., "http://localhost:8080")
+	HTTPAPIKey                string                       `toml:"-"`      // Admin API key, from [admin_cli] api_key
+	HTTPAPIInsecureSkipVerify bool                         `toml:"-"`      // From [admin_cli] insecure_skip_verify. Default: auto (loopback addr -> skip; remote -> verify).
 	Relay                     config.RelayConfig           `toml:"relay"`
 	// Sieve is read so scripts stored by the admin tools (sieve put, import-maildir
 	// --sieve-path) are validated against the same extension set delivery compiles with.
 	Sieve config.SieveConfig `toml:"sieve"`
-	// Cluster is decoded for display commands (config show masks its secret_key). It
-	// plays no part in instance identity: the upload lease key comes from
-	// uploader.instance_id, deliberately decoupled from the gossip node name.
-	Cluster config.ClusterConfig `toml:"cluster"`
 }
 
 // InstanceID returns the identity this host writes into pending_uploads.instance_id,
@@ -124,9 +120,14 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	if err := config.LoadServerConfig(configPath, fullCfg); err != nil {
 		return err
 	}
-	// `mailbox create` and `mailbox rename` classify names by namespace_prefix.
+	// `mailbox create`, `mailbox rename` and `import maildir` classify names by namespace_prefix.
 	if err := fullCfg.SharedMailboxes.Validate(); err != nil {
 		return fmt.Errorf("[shared_mailboxes]: %w", err)
+	}
+	// Imports index mail by [cleanup] fts_retention, as delivery does. The server refuses
+	// the other [cleanup] values Validate rejects too.
+	if err := fullCfg.Cleanup.Validate(); err != nil {
+		return fmt.Errorf("[cleanup]: %w", err)
 	}
 	// The server refuses to start with these; max_attempts <= 0 would count every pending
 	// upload as parked.
@@ -151,9 +152,6 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	cfg.HTTPAPIKey = fullCfg.AdminCLI.APIKey
 	cfg.Relay = fullCfg.Relay
 	cfg.Sieve = fullCfg.Sieve
-	// Needed for node_id: it resolves the instance identity this host writes into
-	// pending_uploads.instance_id, and an import must use the same one the server does.
-	cfg.Cluster = fullCfg.Cluster
 
 	// Default: verify the Admin API server's TLS certificate. Skip verification
 	// automatically only for loopback addresses (local admin use with self-signed
@@ -226,6 +224,7 @@ func main() {
 
 	// Determine the command first
 	command := ""
+	wantHelp := false
 	for i := 1; i < len(os.Args); i++ {
 		if !strings.HasPrefix(os.Args[i], "-") {
 			command = os.Args[i]
@@ -237,11 +236,16 @@ func main() {
 		} else if strings.HasPrefix(os.Args[i], "--config=") {
 			// Skip the --config=value flag entirely
 			continue
+		} else if os.Args[i] == "--help" || os.Args[i] == "-h" {
+			wantHelp = true
 		}
 	}
 
 	if command == "" {
 		printUsage()
+		if wantHelp {
+			os.Exit(0)
+		}
 		os.Exit(1)
 	}
 
@@ -370,11 +374,11 @@ Commands:
 
 Examples:
   sora-admin --config config.toml accounts create --email user@example.com --password mypassword
-  sora-admin --config config.toml accounts list
+  sora-admin --config config.toml accounts list --domain example.com
   sora-admin --config config.toml credentials add --primary admin@example.com --email alias@example.com --password mypassword
   sora-admin --config config.toml credentials list --email user@example.com
   sora-admin --config config.toml cache stats
-  sora-admin --config config.toml stats auth --window 1h
+  sora-admin --config config.toml stats blocked
   sora-admin --config config.toml connections kick --user user@example.com
   sora-admin --config config.toml affinity set --user user@example.com --protocol imap --backend 192.168.1.10:993
   sora-admin --config config.toml config validate

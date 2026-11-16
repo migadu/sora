@@ -93,7 +93,7 @@ func assertDryRunLeavesCache(t *testing.T, maildirPath, hash string, wantExporte
 	t.Helper()
 
 	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
-	namesBefore := dirNames(t, maildirPath)
+	namesBefore := exportDryRunDirNames(t, maildirPath)
 	cacheBefore, err := os.ReadFile(dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +111,7 @@ func assertDryRunLeavesCache(t *testing.T, maildirPath, hash string, wantExporte
 		t.Fatalf("Close: %v", err)
 	}
 
-	if namesAfter := dirNames(t, maildirPath); !slices.Equal(namesAfter, namesBefore) {
+	if namesAfter := exportDryRunDirNames(t, maildirPath); !slices.Equal(namesAfter, namesBefore) {
 		t.Errorf("dry run changed the maildir's files\nbefore: %v\nafter:  %v", namesBefore, namesAfter)
 	}
 	cacheAfter, err := os.ReadFile(dbPath)
@@ -123,7 +123,7 @@ func assertDryRunLeavesCache(t *testing.T, maildirPath, hash string, wantExporte
 	}
 }
 
-func dirNames(t *testing.T, dir string) []string {
+func exportDryRunDirNames(t *testing.T, dir string) []string {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
 	if err != nil {

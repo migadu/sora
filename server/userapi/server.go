@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -19,7 +20,6 @@ import (
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/helpers"
-	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/sieveengine"
@@ -38,26 +38,25 @@ type reloadableSettings struct {
 
 // Server represents the HTTP Mail API server for user operations
 type Server struct {
-	name                       string
-	addr                       string
-	settings                   atomic.Pointer[reloadableSettings] // the settings ReloadConfig replaces
-	tokenDuration              time.Duration
-	tokenIssuer                string
-	maxConnections             int // Max concurrent connections; 0 -> unlimited
-	rdb                        *resilient.ResilientDatabase
-	storage                    *storage.S3Storage
-	rs3                        *resilient.ResilientS3Storage // storage behind retries + breaker; nil when storage is
-	uploader                   *uploader.UploadWorker
-	uploadMaxAttempts          int // [uploader] max_attempts for a node without uploader; see ServerOptions
-	cache                      *cache.Cache
-	authCache                  *lookupcache.LookupCache
-	positiveRevalidationWindow time.Duration
-	authLimiter                *server.AuthRateLimiter
-	server                     *http.Server
-	tls                        bool
-	tlsConfig                  *tls.Config // What the listener serves with (server.ListenerTLS); nil without tls
-	proxyReader                *server.ProxyProtocolReader
-	sieveExtensions            []string
+	name              string
+	addr              string
+	settings          atomic.Pointer[reloadableSettings] // the settings ReloadConfig replaces
+	tokenDuration     time.Duration
+	tokenIssuer       string
+	maxConnections    int // Max concurrent connections; 0 -> unlimited
+	rdb               *resilient.ResilientDatabase
+	storage           *storage.S3Storage
+	rs3               *resilient.ResilientS3Storage // storage behind retries + breaker; nil when storage is
+	uploader          *uploader.UploadWorker
+	uploadMaxAttempts int // [uploader] max_attempts for a node without uploader; see ServerOptions
+	cache             *cache.Cache
+	authLimiter       *server.AuthRateLimiter
+	server            *http.Server
+	tls               bool
+	tlsConfig         *tls.Config // What the listener serves with (server.ListenerTLS); nil without tls
+	proxyReader       *server.ProxyProtocolReader
+	sieveExtensions   []string
+	sharedMailboxes   config.SharedMailboxesConfig // [shared_mailboxes]; see ServerOptions
 }
 
 // ServerOptions holds configuration options for the HTTP Mail API server
@@ -82,7 +81,7 @@ type ServerOptions struct {
 	// upload as on its way.
 	UploadMaxAttempts           int
 	AuthRateLimit               server.AuthRateLimiterConfig
-	LookupCache                 *config.LookupCacheConfig // Authentication cache configuration
+	LookupCache                 *config.LookupCacheConfig // Ignored: login reads the hash and token epoch together from the primary
 	TLS                         bool
 	TLSConfig                   *tls.Config // TLS config from manager (takes precedence over cert files)
 	TLSCertFile                 string
@@ -96,6 +95,10 @@ type ServerOptions struct {
 	// default set), the one delivery compiles a user's script with. The capabilities
 	// endpoint reports it, so a client offers only rules that will run.
 	SieveExtensions []string
+	// SharedMailboxes is the [shared_mailboxes] config. The User API does not create
+	// shared mailboxes, so mailbox creation refuses a name in the shared namespace
+	// rather than making a personal mailbox there.
+	SharedMailboxes config.SharedMailboxesConfig
 }
 
 // minJWTSecretLength is the minimum accepted JWT signing secret length. RFC 7518
@@ -103,12 +106,9 @@ type ServerOptions struct {
 // brute-forceable offline, allowing token forgery for any account.
 const minJWTSecretLength = 32
 
-// maxTokenDuration caps how long a User API JWT may live. JWTs are validated
-// statelessly, so a token cannot be revoked before it expires — a password change
-// or account deletion only stops *renewal* at refresh time. Clamping the duration
-// bounds the window in which a leaked or post-revocation token remains usable.
-// Seven days is generous for an access token while keeping that window finite.
-const maxTokenDuration = 7 * 24 * time.Hour
+// maxTokenDuration caps how long a User API JWT may live (config.MaxTokenDuration,
+// which config validate reports a longer token_duration against).
+const maxTokenDuration = config.MaxTokenDuration
 
 // checkJWTSecret refuses a JWT secret the server must not sign with, at start-up and
 // on a config reload alike.
@@ -163,23 +163,8 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 	authLimiter := server.NewAuthRateLimiter("user-api", options.Name, "", options.AuthRateLimit)
 	server.RegisterRateLimiter("userapi", options.Name, authLimiter)
 
-	// Initialize authentication cache if configured
-	var authCache *lookupcache.LookupCache
-	var positiveRevalidationWindow time.Duration
 	if options.LookupCache != nil && options.LookupCache.Enabled {
-		// Parse TTL and other config values
-		lookupCacheConfig := options.LookupCache
-
-		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault(options.Name)
-		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault(options.Name)
-		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(options.Name)
-
-		maxSize := lookupCacheConfig.GetMaxSize()
-
-		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(options.Name)
-
-		authCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
-		logger.Info("User API: Lookup cache enabled", "name", options.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
+		logger.Warn("User API: lookup_cache is ignored; each login reads its credential hash and token epoch from the primary", "name", options.Name)
 	}
 
 	// Initialize PROXY protocol reader if enabled
@@ -199,24 +184,23 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 	}
 
 	s := &Server{
-		name:                       options.Name,
-		addr:                       options.Addr,
-		sieveExtensions:            sieveengine.EffectiveExtensions(options.SieveExtensions),
-		maxConnections:             options.MaxConnections,
-		tokenDuration:              options.TokenDuration,
-		tokenIssuer:                options.TokenIssuer,
-		rdb:                        rdb,
-		storage:                    options.Storage,
-		rs3:                        newResilientStorage(options.Storage),
-		cache:                      options.Cache,
-		uploader:                   options.Uploader,
-		uploadMaxAttempts:          options.UploadMaxAttempts,
-		authCache:                  authCache,
-		positiveRevalidationWindow: positiveRevalidationWindow,
-		authLimiter:                authLimiter,
-		tls:                        options.TLS,
-		tlsConfig:                  tlsConfig,
-		proxyReader:                proxyReader,
+		name:              options.Name,
+		addr:              options.Addr,
+		sieveExtensions:   sieveengine.EffectiveExtensions(options.SieveExtensions),
+		maxConnections:    options.MaxConnections,
+		tokenDuration:     options.TokenDuration,
+		tokenIssuer:       options.TokenIssuer,
+		rdb:               rdb,
+		storage:           options.Storage,
+		rs3:               newResilientStorage(options.Storage),
+		cache:             options.Cache,
+		uploader:          options.Uploader,
+		uploadMaxAttempts: options.UploadMaxAttempts,
+		authLimiter:       authLimiter,
+		tls:               options.TLS,
+		tlsConfig:         tlsConfig,
+		proxyReader:       proxyReader,
+		sharedMailboxes:   options.SharedMailboxes,
 	}
 	s.settings.Store(&reloadableSettings{
 		jwtSecret:      options.JWTSecret,
@@ -272,45 +256,72 @@ func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options Server
 		errChan <- fmt.Errorf("failed to create HTTP Mail API server: %w", err)
 		return nil
 	}
-
-	protocol := "HTTP"
-	if options.TLS {
-		protocol = "HTTPS"
-	}
-	serverName := options.Name
-	if serverName == "" {
-		serverName = "default"
-	}
-	logger.Info("HTTP Mail API: Starting server", "name", serverName, "protocol", protocol, "addr", options.Addr)
 	go func() {
-		if err := server.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
+		if err := server.Run(ctx); err != nil && ctx.Err() == nil {
 			errChan <- fmt.Errorf("HTTP Mail API server failed: %w", err)
 		}
 	}()
 	return server
 }
 
-// start initializes and starts the HTTP server
-func (s *Server) start(ctx context.Context) error {
+// writeTimeout is the http.Server WriteTimeout: no answer later than this after a request
+// was read reaches its client, unless the handler moves the deadline (a delayed login,
+// server.ApplyHTTPAuthenticationDelay).
+const writeTimeout = 30 * time.Second
+
+// Run starts the HTTP Mail API server and blocks until it stops. It returns nil
+// when stopped via ctx cancellation.
+func (s *Server) Run(ctx context.Context) error {
+	defer server.UnregisterRateLimiter("userapi", s.name)
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	protocol := "HTTP"
+	if s.tls {
+		protocol = "HTTPS"
+	}
+	serverName := s.name
+	if serverName == "" {
+		serverName = "default"
+	}
+	logger.Info("HTTP Mail API: Starting server", "name", serverName, "protocol", protocol, "addr", s.addr)
+
 	router := s.SetupRoutes()
 
-	s.server = &http.Server{
+	httpServer := &http.Server{
 		Addr:              s.addr,
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second, // slowloris-on-headers defense
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       120 * time.Second,
 	}
+	if s.tls {
+		httpServer.TLSConfig = s.tlsConfig
+	}
+	s.server = httpServer
+
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	stopCtx, stopCancel := context.WithCancel(ctx)
+	defer stopCancel()
 
 	// Graceful shutdown
+	shutdownDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
+		defer close(shutdownDone)
+		<-stopCtx.Done()
+		if ctx.Err() == nil {
+			return
+		}
 		logger.Info("HTTP Mail API: Shutting down server...", "name", s.name)
 		server.UnregisterRateLimiter("userapi", s.name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if err := s.server.Shutdown(shutdownCtx); err != nil {
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			logger.Warn("HTTP Mail API: Error shutting down server", "name", s.name, "error", err)
 		}
 	}()
@@ -318,6 +329,8 @@ func (s *Server) start(ctx context.Context) error {
 	// Create listener
 	listener, err := net.Listen("tcp", s.addr)
 	if err != nil {
+		stopCancel()
+		<-shutdownDone
 		return fmt.Errorf("failed to create listener: %w", err)
 	}
 
@@ -336,13 +349,26 @@ func (s *Server) start(ctx context.Context) error {
 		listener = netutil.LimitListener(listener, s.maxConnections)
 	}
 
+	if ctx.Err() != nil {
+		listener.Close()
+		<-shutdownDone
+		return nil
+	}
+
 	// Start server with or without TLS. The certificate is in TLSConfig
 	// already, from the global [tls] manager or the certificate files.
 	if s.tls {
-		s.server.TLSConfig = s.tlsConfig
-		return s.server.ServeTLS(listener, "", "")
+		err = httpServer.ServeTLS(listener, "", "")
+	} else {
+		err = httpServer.Serve(listener)
 	}
-	return s.server.Serve(listener)
+	if errors.Is(err, http.ErrServerClosed) && ctx.Err() != nil {
+		<-shutdownDone
+		return nil
+	}
+	stopCancel()
+	<-shutdownDone
+	return err
 }
 
 // SetupRoutes configures all HTTP routes and middleware
@@ -350,11 +376,11 @@ func (s *Server) SetupRoutes() http.Handler {
 	mux := http.NewServeMux()
 
 	// Public routes (no authentication required)
-	mux.HandleFunc("/user/auth/login", routeHandler("POST", s.handleLogin))
-	mux.HandleFunc("/user/auth/refresh", routeHandler("POST", s.handleRefreshToken))
+	mux.HandleFunc("/user/auth/login", s.routeHandler("POST", s.handleLogin))
+	mux.HandleFunc("/user/auth/refresh", s.routeHandler("POST", s.handleRefreshToken))
 
 	// Mailbox operations
-	mux.Handle("/user/mailboxes", s.jwtAuthMiddleware(multiMethodHandler(map[string]http.HandlerFunc{
+	mux.Handle("/user/mailboxes", s.jwtAuthMiddleware(s.multiMethodHandler(map[string]http.HandlerFunc{
 		"GET":  s.handleListMailboxes,
 		"POST": s.handleCreateMailbox,
 	})))
@@ -364,8 +390,11 @@ func (s *Server) SetupRoutes() http.Handler {
 	mux.Handle("/user/messages/", s.jwtAuthMiddleware(http.HandlerFunc(s.handleMessageOperations)))
 
 	// Sieve filter operations
-	mux.Handle("/user/filters", s.jwtAuthMiddleware(routeHandler("GET", s.handleListFilters)))
+	mux.Handle("/user/filters", s.jwtAuthMiddleware(s.routeHandler("GET", s.handleListFilters)))
 	mux.Handle("/user/filters/", s.jwtAuthMiddleware(http.HandlerFunc(s.handleFilterOperations)))
+
+	// Every other path (ServeMux's own 404 is text/plain)
+	mux.HandleFunc("/", s.notFound)
 
 	// Wrap with middleware (in reverse order - last applied is outermost)
 	handler := s.loggingMiddleware(mux)
@@ -385,7 +414,7 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	// Check for subscribe/unsubscribe operations
 	if strings.HasSuffix(path, "/subscribe") {
 		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "POST")
 			return
 		}
 		s.handleSubscribeMailbox(w, r)
@@ -393,7 +422,7 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasSuffix(path, "/unsubscribe") {
 		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "POST")
 			return
 		}
 		s.handleUnsubscribeMailbox(w, r)
@@ -403,7 +432,7 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	// Check for message listing/search
 	if strings.HasSuffix(path, "/messages") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleListMessages(w, r)
@@ -411,20 +440,20 @@ func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasSuffix(path, "/search") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleSearchMessages(w, r)
 		return
 	}
 
-	// Otherwise it's a delete operation on the mailbox itself
+	// Otherwise it's the mailbox itself, which can only be deleted
 	if r.Method == "DELETE" {
 		s.handleDeleteMailbox(w, r)
 		return
 	}
 
-	http.Error(w, "Not found", http.StatusNotFound)
+	s.methodNotAllowed(w, "DELETE")
 }
 
 // handleMessageOperations routes message operations
@@ -434,7 +463,7 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 	// Check for body/raw endpoints
 	if strings.HasSuffix(path, "/body") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleGetMessageBody(w, r)
@@ -442,7 +471,7 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 	}
 	if strings.HasSuffix(path, "/raw") {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleGetMessageRaw(w, r)
@@ -458,7 +487,7 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 	case "DELETE":
 		s.handleDeleteMessage(w, r)
 	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		s.methodNotAllowed(w, "GET", "PATCH", "DELETE")
 	}
 }
 
@@ -471,7 +500,7 @@ func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) 
 	// Check for capabilities endpoint
 	if path == "capabilities" {
 		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "GET")
 			return
 		}
 		s.handleGetCapabilities(w, r)
@@ -481,7 +510,7 @@ func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) 
 	// Check for activate endpoint
 	if strings.HasSuffix(path, "/activate") {
 		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.methodNotAllowed(w, "POST")
 			return
 		}
 		s.handleActivateFilter(w, r)
@@ -497,7 +526,7 @@ func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) 
 	case "DELETE":
 		s.handleDeleteFilter(w, r)
 	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		s.methodNotAllowed(w, "GET", "PUT", "DELETE")
 	}
 }
 
@@ -514,52 +543,9 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-
-		// Check if origin is allowed
-		allowedOrigins := s.settings.Load().allowedOrigins
-		if len(allowedOrigins) > 0 {
-			// The first matching entry decides: "*" answers with a literal "*",
-			// a listed origin is reflected with credentials.
-			allowed := false
-			wildcard := false
-			for _, allowedOrigin := range allowedOrigins {
-				if allowedOrigin == "*" {
-					allowed = true
-					wildcard = true
-					break
-				}
-				if origin != "" && allowedOrigin == origin {
-					allowed = true
-					break
-				}
-			}
-			// Fetch Standard, "CORS protocol and HTTP caches": a "*" is sent on
-			// every response, CORS request or not, and needs no Vary; an answer
-			// that depends on the request's Origin needs Vary: Origin on every
-			// response, including the ones that do not reflect it, or a cache can
-			// answer one origin with a response stored for another. The answer is
-			// the same "*" for everyone only when "*" is the first entry.
-			if allowedOrigins[0] != "*" {
-				w.Header().Add("Vary", "Origin")
-			}
-
-			if allowed {
-				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-				w.Header().Set("Access-Control-Max-Age", "3600")
-				if wildcard {
-					// A wildcard origin must NOT be combined with credentials (CORS spec):
-					// reflecting a concrete origin + Allow-Credentials lets any site make
-					// credentialed cross-origin reads. Emit literal "*" without credentials.
-					w.Header().Set("Access-Control-Allow-Origin", "*")
-				} else {
-					// Specific configured origin: safe to reflect and allow credentials.
-					w.Header().Set("Access-Control-Allow-Origin", origin)
-					w.Header().Set("Access-Control-Allow-Credentials", "true")
-				}
-			}
-		}
+		// The CORS policy is shared with the User API proxy, which applies it to the
+		// responses it writes itself.
+		server.SetCORSHeaders(w.Header(), r.Header.Get("Origin"), s.settings.Load().allowedOrigins)
 
 		// Handle preflight requests
 		if r.Method == "OPTIONS" {
@@ -612,10 +598,8 @@ func isIPAllowed(clientIP string, allowedHosts []string) bool {
 // warnUnusableAllowedHosts logs the allowed_hosts entries that are not an IP address
 // or CIDR, when a list is configured (startup) or replaced (reload).
 func warnUnusableAllowedHosts(name string, allowedHosts []string) {
-	for _, entry := range allowedHosts {
-		if _, err := helpers.ParseTrustedNetworks([]string{entry}); err != nil {
-			logger.Warn("HTTP Mail API: allowed_hosts entry is not an IP address or CIDR and matches no client", "name", name, "entry", entry)
-		}
+	for _, entry := range helpers.InvalidNetworkEntries(allowedHosts) {
+		logger.Warn("HTTP Mail API: allowed_hosts entry is not an IP address or CIDR and matches no client", "name", name, "entry", entry)
 	}
 }
 
@@ -631,7 +615,31 @@ func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 	s.writeJSON(w, status, map[string]string{"error": message})
 }
 
-// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+// writeTokenRefused answers 401 for a bearer token the request presented and that was
+// refused: expired, malformed, badly signed, or no longer valid for its account, in the
+// Authorization header or as the token of a refresh. The challenge says
+// error="invalid_token" (RFC 6750 section 3.1), so a client can tell it apart from a
+// request that carried no token.
+func (s *Server) writeTokenRefused(w http.ResponseWriter) {
+	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, server.BearerInvalidToken)
+	s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+}
+
+// writeLoginRefused answers 401 {"error": "Invalid credentials"} for a refused login:
+// unknown address, deleted account, wrong password, or a client the rate limiter blocks,
+// all alike. RFC 9110 section 15.5.2 requires a challenge on every 401, and RFC 6750
+// section 3 lets a resource server send the Bearer one "in response to other conditions
+// as well": it is the realm's challenge, without an error code because a login presents
+// no token (section 3.1), the one a request without a token gets on every other endpoint.
+func (s *Server) writeLoginRefused(w http.ResponseWriter) {
+	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, "")
+	s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+}
+
+// getProxyProtocolTrustedProxies returns the hosts trusted to send PROXY headers: the
+// ProxyProtocolTrustedProxies option if set, otherwise trusted_networks. No config key
+// sets that option (there is no proxy_protocol_trusted_proxies, #542), so in a running
+// server PROXY trust is always [servers] trusted_networks.
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {
 		return proxyProtocolTrusted

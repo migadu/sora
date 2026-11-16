@@ -90,8 +90,8 @@ func newPreviewState(options PreviewOptions) *previewState {
 	}
 	return &previewState{
 		memo:         previewMemo{maxBytes: previewMemoBytes},
-		accountLimit: serverPkg.NewCommandRateLimiter("IMAP", "", options.S3PerMin, time.Minute, options.S3Burst),
-		nodeLimit:    serverPkg.NewCommandRateLimiter("IMAP", "", options.S3NodePerMin, time.Minute, 0),
+		accountLimit: serverPkg.NewCommandRateLimiter("imap", "", options.S3PerMin, time.Minute, options.S3Burst),
+		nodeLimit:    serverPkg.NewCommandRateLimiter("imap", "", options.S3NodePerMin, time.Minute, 0),
 		s3MaxSize:    maxSize,
 	}
 }

@@ -647,7 +647,7 @@ func TestPOP3ProxyIdleNoticeAfterSTLSIsReadableThroughTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the idle notice through TLS: %v", err)
 	}
-	if want := "-ERR [IN-USE] Idle timeout, please reconnect\r\n"; line != want {
+	if want := "-ERR Idle timeout, please reconnect\r\n"; line != want {
 		t.Fatalf("idle notice through TLS = %q, want %q", line, want)
 	}
 }
