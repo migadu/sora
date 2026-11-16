@@ -44,11 +44,28 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 		part, err := mr.NextPart()
 		if err == io.EOF {
 			break
+		} else if message.IsUnknownEncoding(err) {
+			// go-message reports an unknown Content-Transfer-Encoding (e.g.
+			// "7bit <center>") per part, without the part; the reader goes on
+			// to the next one.
+			skippedParts = append(skippedParts, fmt.Sprintf("NextPart error: %v", err))
+			continue
+		} else if message.IsUnknownCharset(err) {
+			// The part comes with its body not converted from the charset, which
+			// is still its best text: it is read as the single-part form is, and
+			// as PREVIEW reads it. go-message reports only the charset when the
+			// transfer encoding is unknown too, so check that it was decoded.
+			switch transferEncodingMechanism(part.Header.Get("Content-Transfer-Encoding")) {
+			case "", "7bit", "8bit", "binary", "quoted-printable", "base64":
+			default:
+				skippedParts = append(skippedParts, fmt.Sprintf("NextPart error: %v", err))
+				continue
+			}
 		} else if err != nil {
-			// Once NextPart() fails, the multipart reader cannot yield more parts.
-			// Malformed MIME parts (e.g., "Content-Transfer-Encoding: 7bit <center>")
-			// cause encoding errors here. Rather than failing the entire extraction,
-			// we keep whatever plaintext/HTML we collected from earlier parts.
+			// After any other NextPart() error (a malformed part header or
+			// boundary) the multipart reader cannot yield more parts. Rather than
+			// failing the entire extraction, we keep whatever plaintext/HTML we
+			// collected from earlier parts.
 			// This is acceptable because plaintext extraction is best-effort for FTS.
 			skippedParts = append(skippedParts, fmt.Sprintf("NextPart error: %v", err))
 			break

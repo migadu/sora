@@ -202,8 +202,8 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 //
 // Names are matched as the database matches them, by LOWER(name) under its
 // collation, which no Go case mapping matches (under ICU "İNBOX" is not the
-// INBOX): the mailboxes carry it as NameKey, and the names the source gives, and
-// INBOX, are resolved to theirs in one query. The selected mailbox is taken by ID.
+// INBOX): the mailboxes carry it as NameKey, and the names the source gives are
+// resolved to theirs in one query. The selected mailbox is taken by ID.
 func (s *IMAPSession) resolveSearchSource(ctx context.Context, source *imap.SearchSource, allMailboxes []*db.DBMailbox) ([]*db.DBMailbox, error) {
 	accountID := s.IMAPUser.AccountID()
 	delim := string(consts.MailboxDelimiter)
@@ -219,9 +219,6 @@ func (s *IMAPSession) resolveSearchSource(ctx context.Context, source *imap.Sear
 	release()
 
 	var names []string
-	if source.Inboxes {
-		names = append(names, consts.MailboxInbox)
-	}
 	names = append(names, source.Subtree...)
 	names = append(names, source.SubtreeOne...)
 	names = append(names, source.Mailboxes...)
@@ -269,12 +266,11 @@ func (s *IMAPSession) resolveSearchSource(ctx context.Context, source *imap.Sear
 		}
 		add(m)
 	}
-	if source.Inboxes {
-		add(byKey[nextKeys(1)[0]])
-	}
-	if source.Personal {
+	if source.Personal || source.Inboxes {
 		// RFC 5465 §6.2: all selectable mailboxes in the personal namespace(s), as
 		// NOTIFY's PERSONAL watches them. A shared mailbox the user owns is not one.
+		// INBOXES (§6.3) is PERSONAL too, as NOTIFY's INBOXES: sora does not compute
+		// the mailboxes an MDA may deliver to (see eventsForMailbox).
 		sharedRoot := s.sharedNamespaceRoot()
 		for _, m := range allMailboxes {
 			if !inSharedNamespace(m.Name, sharedRoot) {
