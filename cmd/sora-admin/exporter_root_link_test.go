@@ -16,9 +16,9 @@ import (
 // account into a user's maildir in place (#1597), the user can make ~/Maildir, or a
 // directory on the way to it, a symbolic link to another user's maildir or home, which
 // the account's mail, Dovecot metadata and cache would then be written into. A link on
-// the way is followed under the import's rule (#1729): only when root made it or it
-// belongs to the owner of the directory it leads to, and nothing is created before it
-// is checked (#1785).
+// the way is followed under the import's rule (#1729): only when root or the user
+// running the export made it, or it belongs to the owner of the directory it leads to,
+// and nothing is created before it is checked (#1785).
 
 // treeNames lists every entry below dir, by its path relative to dir.
 func treeNames(t *testing.T, dir string) []string {
@@ -179,6 +179,67 @@ func TestNewExporterFollowsALinkOfRootOrOfTheMaildirsOwner(t *testing.T) {
 			assert.FileExists(t, filepath.Join(real, maildirCacheName))
 		})
 	}
+}
+
+// A link that belongs to the user running the export can only lead where that user
+// could name directly, as root's links when the export runs as root: an operator who
+// is not root and made /srv/export/bob -> /var/vmail/bob, a directory of vmail, exports
+// there, with the missing directories below the link created. A third user's link on
+// the way is still refused. The links the test makes belong to the user running it;
+// run as root, they are root's links.
+func TestNewExporterFollowsALinkOfTheUserRunningTheExport(t *testing.T) {
+	alice, bob := rootLinkUIDs()
+
+	for _, below := range []string{"", filepath.Join("a", "Maildir")} {
+		name := "existing maildir"
+		if below != "" {
+			name = "missing maildir below the link"
+		}
+		t.Run(name, func(t *testing.T) {
+			target := t.TempDir()
+			ownedByUID(t, bob, target)
+			link := filepath.Join(t.TempDir(), "bob")
+			require.NoError(t, os.Symlink(target, link))
+			maildirPath, real := filepath.Join(link, below), filepath.Join(target, below)
+
+			exporter, err := NewExporter(context.Background(), maildirPath, "user@example.com", 1, nil, messageStorage{[]byte(linkTestMessageBody)}, ExporterOptions{})
+			require.NoError(t, err)
+			t.Cleanup(func() { exporter.Close() })
+			rootInfo, err := exporter.root.Stat(".")
+			require.NoError(t, err)
+			realInfo, err := os.Stat(real)
+			require.NoError(t, err)
+			assert.True(t, os.SameFile(realInfo, rootInfo), "the export does not write into the directory the link leads to")
+
+			msg := linkTestMessage()
+			filename := exporter.generateMaildirFilename(&msg, "INBOX")
+			require.NoError(t, exporter.createMailboxDirectory("INBOX"))
+			require.NoError(t, exporter.exportMessage(&msg, "INBOX"))
+			require.NoError(t, exporter.Close())
+			assert.FileExists(t, filepath.Join(real, "cur", filename))
+			assert.FileExists(t, filepath.Join(real, maildirCacheName))
+		})
+	}
+
+	// The running user's link is followed, but not a third user's link it leads to.
+	t.Run("the running user's link to a third user's link", func(t *testing.T) {
+		victimHome := t.TempDir()
+		ownedByUID(t, bob, victimHome)
+		aliceLink := filepath.Join(t.TempDir(), "x")
+		require.NoError(t, os.Symlink(victimHome, aliceLink))
+		ownedByUID(t, alice, aliceLink)
+		link := filepath.Join(t.TempDir(), "alice")
+		require.NoError(t, os.Symlink(aliceLink, link))
+
+		exporter, err := NewExporter(context.Background(), filepath.Join(link, "Maildir"), "alice@example.com", 1, nil, nil, ExporterOptions{})
+		if exporter != nil {
+			exporter.Close()
+		}
+		if assert.Error(t, err, "another user's home was opened for the export through alice's link") {
+			assert.Contains(t, err.Error(), resolvedName(t, aliceLink), "the refusal does not name alice's link")
+		}
+		assert.Empty(t, treeNames(t, victimHome), "the export created entries in the tree the link leads to")
+	})
 }
 
 // The directories missing on the way to --maildir-path are created, as os.MkdirAll

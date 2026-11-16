@@ -84,6 +84,9 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	}
 	// Preview never creates or migrates anything in the selected maildir.
 	if options.DryRun {
+		if exportRootOpened != nil {
+			exportRootOpened()
+		}
 		maildirPath = effectiveMaildirPath(maildirPath)
 		dbPath := filepath.Join(maildirPath, maildirCacheName)
 		cache, privateDir, err := openExportCacheForDryRun(ctx, dbPath)
