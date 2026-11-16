@@ -45,7 +45,7 @@ func LockS3ObjectsSharedInTx(ctx context.Context, tx pgx.Tx, accountID int64, co
 	if _, err := tx.Exec(ctx, sql); err != nil {
 		return fmt.Errorf("failed to lock S3 objects: %w", err)
 	}
-	return nil
+	return CheckS3BodyClaims(ctx, tx, contentHashes)
 }
 
 // ErrMoveSourceChanged is returned by MoveMessages when a source row owned by another
@@ -89,6 +89,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		logger.Info("Database: moving messages within the same mailbox, will assign new UIDs", "mailbox_id", srcMailboxID)
 	}
 
+	if err := lockS3SourceClaims(ctx, tx, srcMailboxID, ids); err != nil {
+		return nil, err
+	}
+
 	// Serialize unseen_count maintenance for both mailboxes by locking their
 	// mailbox rows in ascending id order (see lockMailboxStats). This both
 	// prevents the flag/expunge-vs-move trigger race from drifting the cache and
@@ -96,6 +100,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	// mailboxes cannot deadlock (A->B and B->A lock the same rows in the same order).
 	if err := lockMailboxStatsPair(ctx, tx, srcMailboxID, destMailboxID); err != nil {
 		return nil, fmt.Errorf("failed to lock mailbox stats for move on mailboxes %d and %d: %w", srcMailboxID, destMailboxID, err)
+	}
+	window := modSeqWindowFor(ctx, destMailboxID)
+	if err := window.begin(ctx, tx); err != nil {
+		return nil, err
 	}
 
 	// From here to the commit a rekey must not rename a source. The row locks below would
@@ -210,7 +218,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to, m."references",
 					m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown, m.internal_date, m.size,
 					m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
-					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses,
+					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses, m.header_presence,
 					m.id AS original_id,
 					d.new_uid
 				FROM messages m
@@ -221,14 +229,14 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
 					mailbox_id, mailbox_path, created_modseq, uid
 				)
 				SELECT
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
 					$1 AS mailbox_id,
 					$2 AS mailbox_path,
 					nextval('messages_modseq') AS created_modseq,
@@ -266,7 +274,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					m.content_hash, m.uploaded, m.message_id, m.in_reply_to, m."references",
 					m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown, m.internal_date, m.size,
 					m.body_structure, m.recipients_json,
-					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses,
+					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses, m.header_presence,
 					m.id AS original_id,
 					m.account_id AS src_account_id, m.s3_domain AS src_s3_domain, m.s3_localpart AS src_s3_localpart,
 					d.new_uid,
@@ -279,7 +287,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
 					mailbox_id, mailbox_path, created_modseq, uid
 				)
 				SELECT
@@ -294,7 +302,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					-- (destObjects, above).
 					CASE WHEN src_account_id = $6 THEN src_s3_domain ELSE $7 END AS s3_domain,
 					CASE WHEN src_account_id = $6 THEN src_s3_localpart ELSE $8 END AS s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
 					$1 AS mailbox_id,
 					$2 AS mailbox_path,
 					nextval('messages_modseq') AS created_modseq,
@@ -345,6 +353,9 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		}
 	}
 
+	if err := window.end(ctx, tx); err != nil {
+		return nil, err
+	}
 	return messageUIDMap, nil
 }
 

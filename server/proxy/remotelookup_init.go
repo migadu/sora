@@ -158,5 +158,7 @@ func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig, ser
 		transportSettings,
 	)
 
+	client.remoteSkipForwardingWithProxyProtocol = cfg.RemoteSkipForwardingWithProxyProtocol
+
 	return client, nil
 }

@@ -70,7 +70,7 @@ func TestCleanupWorker_ReportsStrandedInstances(t *testing.T) {
 	mockCache := new(mockCache)
 	ctx := context.Background()
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,

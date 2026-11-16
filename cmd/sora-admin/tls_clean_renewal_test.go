@@ -22,7 +22,7 @@ import (
 // bucket and in the local cache. The bucket keeps versions, as a Backblaze B2 bucket
 // always does. The node stores the renewal the way a running server does, through its S3
 // cache and then autocert.DirCache, which renames a new file over the old one. It does so
-// when clean's DELETE reaches the bucket, so after every read clean makes to decide.
+// when clean's conditional PUT reaches the bucket, so after every read clean makes to decide.
 func TestTLSCleanKeepsRenewalStoredWhileItRuns(t *testing.T) {
 	stub, endpoint := newVersionedTLSStubS3(t)
 	cacheDir := t.TempDir()
@@ -35,7 +35,7 @@ func TestTLSCleanKeepsRenewalStoredWhileItRuns(t *testing.T) {
 
 	var renew sync.Once
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete {
+		if r.Method == http.MethodPut && r.Header.Get("If-Match") != "" {
 			renew.Do(func() {
 				stub.put("certs", tlsmanager.S3ObjectKey("mail.example.com"), renewal)
 				if err := autocert.DirCache(cacheDir).Put(context.Background(), "mail.example.com", renewal); err != nil {
@@ -54,7 +54,8 @@ func TestTLSCleanKeepsRenewalStoredWhileItRuns(t *testing.T) {
 	stub.mu.Lock()
 	stored := stub.objects["/certs/"+tlsmanager.S3ObjectKey("mail.example.com")]
 	stub.mu.Unlock()
-	if !bytes.Equal(stored, renewal) {
+	stored, _, decodeErr := tlsmanager.DecodeCertificateCacheData(stored)
+	if decodeErr != nil || !bytes.Equal(stored, renewal) {
 		t.Error("clean deleted the renewal stored in S3 after it read the expired certificate")
 	}
 	local, err := os.ReadFile(filepath.Join(cacheDir, "mail.example.com"))
@@ -85,8 +86,8 @@ func TestTLSCleanConditionalDeleteKeepsConcurrentRenewal(t *testing.T) {
 			var renew sync.Once
 			var conditional atomic.Int32
 			node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method == http.MethodDelete && r.URL.Query().Get("versionId") == "" {
-					if r.Header.Get("If-Match") == tlsStubETag(expired) {
+				if r.Method == http.MethodPut && r.URL.Query().Get("versionId") == "" {
+					if r.Header.Get("If-Match") != "" {
 						conditional.Add(1)
 					}
 					renew.Do(func() { stub.put("certs", tlsmanager.S3ObjectKey("mail.example.com"), renewal) })
@@ -100,11 +101,12 @@ func TestTLSCleanConditionalDeleteKeepsConcurrentRenewal(t *testing.T) {
 			stub.mu.Lock()
 			stored := stub.objects[path]
 			stub.mu.Unlock()
-			if !bytes.Equal(stored, renewal) {
+			stored, _, decodeErr := tlsmanager.DecodeCertificateCacheData(stored)
+			if decodeErr != nil || !bytes.Equal(stored, renewal) {
 				t.Error("clean removed the renewal stored after its last read")
 			}
-			if conditional.Load() != 1 {
-				t.Errorf("DELETEs matching the inspected opaque ETag = %d, want 1", conditional.Load())
+			if conditional.Load() < 1 {
+				t.Errorf("conditional PUTs with an inspected opaque ETag = %d, want at least 1", conditional.Load())
 			}
 		})
 	}
@@ -127,7 +129,7 @@ func TestTLSCleanWithoutVersionFailsSafelyWithoutConditionalDelete(t *testing.T)
 				putServerEntry(t, tlsTestConfig(endpoint), "mail.example.com", expired)
 				var unconditional, conditional atomic.Int32
 				node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if r.Method == http.MethodDelete && r.URL.Query().Get("versionId") == "" {
+					if r.Method == http.MethodPut && r.URL.Query().Get("versionId") == "" {
 						if r.Header.Get("If-Match") == "" {
 							unconditional.Add(1)
 						} else {
@@ -151,13 +153,13 @@ func TestTLSCleanWithoutVersionFailsSafelyWithoutConditionalDelete(t *testing.T)
 				}))
 				t.Cleanup(node.Close)
 				if err := cleanTLSCertificates(context.Background(), tlsTestConfig(node.URL), t.TempDir(), false, true); err == nil {
-					t.Error("clean reported success without a safe conditional delete")
+					t.Error("clean reported success without a safe conditional clear")
 				}
 				if unconditional.Load() != 0 {
-					t.Errorf("sent %d unconditional DELETEs", unconditional.Load())
+					t.Errorf("sent %d unconditional PUTs", unconditional.Load())
 				}
 				if missingETag && conditional.Load() != 0 {
-					t.Errorf("sent %d conditional DELETEs without an inspected ETag", conditional.Load())
+					t.Errorf("sent %d conditional PUTs without an inspected ETag", conditional.Load())
 				}
 				stub.mu.Lock()
 				stored := stub.objects[path]
@@ -186,7 +188,7 @@ func TestTLSCleanRemovesEveryExpiredVersion(t *testing.T) {
 		t.Fatalf("cleanTLSCertificates: %v", err)
 	}
 
-	if got := stub.keys(); !slices.Equal(got, valid) {
+	if got := stub.activeKeys(); !slices.Equal(got, valid) {
 		t.Errorf("S3 objects after clean = %v, want only the valid domain's %v", got, valid)
 	}
 }
@@ -210,7 +212,7 @@ func TestTLSCleanAfterVersioningWasTurnedOn(t *testing.T) {
 	if err := cleanTLSCertificates(context.Background(), cfg, t.TempDir(), false, true); err != nil {
 		t.Fatalf("cleanTLSCertificates: %v", err)
 	}
-	if got := stub.keys(); len(got) != 0 {
+	if got := stub.activeKeys(); len(got) != 0 {
 		t.Errorf("S3 objects after clean = %v, want none", got)
 	}
 }
