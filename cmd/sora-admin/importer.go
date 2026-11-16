@@ -185,6 +185,10 @@ type Importer struct {
 	batchSize int // default: 20
 }
 
+// importRootOpened, when set, runs in NewImporter as soon as the root is open: a test
+// replaces --maildir-path there, as the maildir's owner can at any moment.
+var importRootOpened func()
+
 // NewImporter creates a new Importer instance.
 func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ImporterOptions) (*Importer, error) {
 	// The import runs on exactly this many workers: with none it would never drain its queue.
@@ -204,6 +208,9 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 			root.Close()
 		}
 	}()
+	if importRootOpened != nil {
+		importRootOpened()
+	}
 	maildirPath = effectiveMaildirPath(maildirPath)
 	// Always create SQLite database in the maildir path to persist maildir state
 	dbPath := filepath.Join(maildirPath, maildirCacheName)
